@@ -61,7 +61,7 @@ pub fn mock_opencode(dir: &Path, status: &str, echo_nonce: bool) -> PathBuf {
 pub fn mock_opencode_then(dir: &Path, status: &str, echo_nonce: bool, after: &str) -> PathBuf {
     let binary = dir.join("opencode");
     let nonce = if echo_nonce {
-        r#"$(sed -n 's/^Nonce: //p' "$dir/stdin")"#
+        r#"$(printf '%s\n' "$input" | sed -n 's/^Nonce: //p')"#
     } else {
         "wrong"
     };
@@ -72,7 +72,8 @@ pub fn mock_opencode_then(dir: &Path, status: &str, echo_nonce: bool, after: &st
 dir=$(dirname "$0")
 printf '%s\n' "$@" >"$dir/args"
 case "$OPENCODE_CONFIG_CONTENT" in *'"*":"deny"'*) ;; *) exit 8 ;; esac
-cat >"$dir/stdin"
+input=$(cat)
+printf '%s\n' "$input" >"$dir/stdin"
 nonce={nonce}
 reply="{{\"nonce\":\"$nonce\",\"status\":\"{status}\",\"summary\":\"mock\",\"findings\":[]}}"
 escaped=$(printf '%s' "$reply" | sed 's/"/\\"/g')
@@ -106,7 +107,8 @@ pub fn mock_opencode_output(dir: &Path, stdout: &str, code: i32) -> PathBuf {
 
 /// A fake `opencode` whose first `good_calls` calls answer clear with the
 /// right nonce; every later call runs the shell lines in `then` instead. The
-/// number of calls is kept in `count` next to it.
+/// number of calls is kept in `count` next to it; concurrent calls are
+/// counted under a lock.
 pub fn mock_opencode_counting(dir: &Path, good_calls: u32, then: &str) -> PathBuf {
     let binary = dir.join("opencode");
     write_script(
@@ -114,14 +116,13 @@ pub fn mock_opencode_counting(dir: &Path, good_calls: u32, then: &str) -> PathBu
         &format!(
             r#"#!/bin/sh
 dir=$(dirname "$0")
-cat >"$dir/stdin"
-count=$(( $(cat "$dir/count" 2>/dev/null || echo 0) + 1 ))
-echo "$count" >"$dir/count"
+input=$(cat)
+count=$(flock "$dir/count" sh -c 'c=$(( $(cat "$1" 2>/dev/null || echo 0) + 1 )); echo "$c" >"$1"; echo "$c"' sh "$dir/count")
 if [ "$count" -gt {good_calls} ]; then
 {then}
 exit 0
 fi
-nonce=$(sed -n 's/^Nonce: //p' "$dir/stdin")
+nonce=$(printf '%s\n' "$input" | sed -n 's/^Nonce: //p')
 reply="{{\"nonce\":\"$nonce\",\"status\":\"clear\",\"summary\":\"mock\",\"findings\":[]}}"
 escaped=$(printf '%s' "$reply" | sed 's/"/\\"/g')
 printf '{{"type":"text","part":{{"type":"text","text":"%s"}}}}\n' "$escaped"

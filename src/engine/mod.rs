@@ -11,8 +11,11 @@ pub mod request;
 pub mod store;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::agent::{self, AgentError, AgentReview, SourceFile};
 use crate::config::Settings;
@@ -199,17 +202,14 @@ pub fn review_group(
         group,
         opencode,
         memory,
-        binary: None,
-        unavailable: None,
         fresh: Vec::new(),
     };
-    for request in requests(group, &plan) {
-        match runner.run(&request, &mut review.notes) {
-            Ok(run) => review.runs.push(run),
-            Err(error) => {
-                review.invalid = Some(error);
-                return review;
-            }
+    match runner.run_all(&requests(group, &plan), &mut review.notes) {
+        Ok(runs) => review.runs = runs,
+        Err((runs, error)) => {
+            review.runs = runs;
+            review.invalid = Some(error);
+            return review;
         }
     }
     runner.save(&mut review.notes);
@@ -299,95 +299,149 @@ fn upgrade_note(manifest: &[ManifestEntry]) -> String {
     )
 }
 
-/// Runs a plan's requests in order and remembers what later chunks need.
+/// How many chunk reviews run at once, after the first.
+const PARALLEL_REVIEWS: usize = 3;
+
+/// The pause before retrying a review that found the AI unavailable.
+const RETRY_DELAY: Duration = if cfg!(test) {
+    Duration::ZERO
+} else {
+    Duration::from_secs(2)
+};
+
+/// A chunk's live review: the result, and the failure a retry recovered from.
+type Live = (Result<AgentReview, AgentError>, Option<String>);
+
+/// Runs a plan's requests and remembers the verdicts to cache.
 struct Runner<'a> {
     group: &'a Group<'a>,
     opencode: &'a OpenCode,
     memory: Option<&'a Memory>,
-    /// Resolved on the first request the cache cannot answer.
-    binary: Option<PathBuf>,
-    /// Set once a request finds the AI unavailable; later requests are not attempted.
-    unavailable: Option<String>,
     /// Live verdicts to cache once no chunk was invalid.
     fresh: Vec<(String, AgentReview)>,
 }
 
 impl Runner<'_> {
-    /// One chunk's run, or the invalid reply that blocks the whole review.
-    fn run(&mut self, request: &Request, notes: &mut Vec<String>) -> Result<AgentRun, Error> {
-        let (outcome, cached) = self.outcome(request, notes)?;
-        Ok(AgentRun {
-            files: request.paths(),
-            label: self.group.settings.label(),
-            chunk: (request.chunk.1 > 1).then_some(request.chunk),
-            cached,
-            outcome,
-        })
-    }
-
-    fn outcome(
+    /// One run per request, in order, or the runs before the first invalid
+    /// reply together with that reply's error. The cache answers what it
+    /// can; the first live request runs alone, so an unavailable AI costs
+    /// one call (and its retry), and the rest run `PARALLEL_REVIEWS` at a
+    /// time. Once a request finds the AI unavailable or invalid, requests
+    /// not yet started are not attempted.
+    fn run_all(
         &mut self,
-        request: &Request,
+        requests: &[Request],
         notes: &mut Vec<String>,
-    ) -> Result<(AgentOutcome, Option<String>), Error> {
-        if let Some(reason) = &self.unavailable {
-            let error = Error::Refused(format!(
-                "not attempted after an earlier chunk failed: {reason}"
-            ));
-            return Ok((AgentOutcome::Unavailable(error), None));
-        }
-
+    ) -> Result<Vec<AgentRun>, (Vec<AgentRun>, Error)> {
         let memory = self.memory.filter(|memory| memory.use_cache);
-        let key = memory.map(|_| cache::key(self.group.settings, self.group.class, request));
-        if let (Some(memory), Some(key)) = (memory, key.as_deref()) {
-            match cache::lookup(&memory.store, key, memory.now, memory.cache_max_age_secs) {
-                Ok(Some(hit)) => {
-                    let note = format!(
-                        "from cache: reviewed by {} {} day(s) ago",
-                        hit.model, hit.age_days
-                    );
-                    return Ok((AgentOutcome::Reviewed(hit.review), Some(note)));
+        let keys: Vec<Option<String>> = requests
+            .iter()
+            .map(|request| {
+                memory.map(|_| cache::key(self.group.settings, self.group.class, request))
+            })
+            .collect();
+        let mut outcomes: Vec<Option<(AgentOutcome, Option<String>)>> = keys
+            .iter()
+            .map(|key| self.cached(key.as_deref(), notes))
+            .collect();
+
+        let live: Vec<usize> = (0..requests.len())
+            .filter(|&index| outcomes[index].is_none())
+            .collect();
+        let mut results: Vec<Option<Live>> = requests.iter().map(|_| None).collect();
+        if let Some((&first, rest)) = live.split_first() {
+            match self.binary() {
+                Err(error) => {
+                    let reason = error.to_string();
+                    outcomes[first] = Some((AgentOutcome::Unavailable(error), None));
+                    for &index in rest {
+                        outcomes[index] = Some((not_attempted(&reason), None));
+                    }
                 }
-                Ok(None) => {}
-                Err(error) => notes.push(format!("verdict cache unavailable: {error}")),
+                Ok(binary) => {
+                    let settings = self.group.settings;
+                    let probe = review_with_retry(&binary, &requests[first], settings);
+                    let proceed = probe.0.is_ok();
+                    results[first] = Some(probe);
+                    if proceed {
+                        for (index, result) in review_parallel(&binary, requests, rest, settings) {
+                            results[index] = Some(result);
+                        }
+                    }
+                }
             }
         }
 
-        let binary = match self.binary() {
-            Ok(binary) => binary,
-            Err(error) => {
-                self.unavailable = Some(error.to_string());
-                return Ok((AgentOutcome::Unavailable(error), None));
-            }
-        };
-        match agent::review(
-            &binary,
-            &|nonce: &str| request.render(nonce),
-            self.group.settings,
-        ) {
-            Ok(review) => {
-                if let Some(key) = key {
-                    self.fresh.push((key, review.clone()));
+        let mut runs = Vec::with_capacity(requests.len());
+        let mut stopped: Option<String> = None;
+        for (index, request) in requests.iter().enumerate() {
+            let (outcome, cached) = match (outcomes[index].take(), results[index].take()) {
+                (Some(done), _) => done,
+                (None, Some((result, retried))) => {
+                    if let Some(reason) = retried {
+                        notes.push(format!(
+                            "the AI review failed once and was retried: {reason}"
+                        ));
+                    }
+                    match result {
+                        Ok(review) => {
+                            if let Some(key) = keys[index].clone() {
+                                self.fresh.push((key, review.clone()));
+                            }
+                            (AgentOutcome::Reviewed(review), None)
+                        }
+                        Err(AgentError::Unavailable(error)) => {
+                            stopped.get_or_insert_with(|| error.to_string());
+                            (AgentOutcome::Unavailable(error), None)
+                        }
+                        Err(AgentError::Invalid(error)) => return Err((runs, error)),
+                    }
                 }
-                Ok((AgentOutcome::Reviewed(review), None))
+                (None, None) => {
+                    let reason = stopped
+                        .clone()
+                        .unwrap_or_else(|| "an earlier chunk failed".into());
+                    (not_attempted(&reason), None)
+                }
+            };
+            runs.push(AgentRun {
+                files: request.paths(),
+                label: self.group.settings.label(),
+                chunk: (request.chunk.1 > 1).then_some(request.chunk),
+                cached,
+                outcome,
+            });
+        }
+        Ok(runs)
+    }
+
+    /// The cached verdict for `key`, if the cache has one.
+    fn cached(
+        &self,
+        key: Option<&str>,
+        notes: &mut Vec<String>,
+    ) -> Option<(AgentOutcome, Option<String>)> {
+        let memory = self.memory.filter(|memory| memory.use_cache)?;
+        match cache::lookup(&memory.store, key?, memory.now, memory.cache_max_age_secs) {
+            Ok(Some(hit)) => {
+                let note = format!(
+                    "from cache: reviewed by {} {} day(s) ago",
+                    hit.model, hit.age_days
+                );
+                Some((AgentOutcome::Reviewed(hit.review), Some(note)))
             }
-            Err(AgentError::Unavailable(error)) => {
-                self.unavailable = Some(error.to_string());
-                Ok((AgentOutcome::Unavailable(error), None))
+            Ok(None) => None,
+            Err(error) => {
+                notes.push(format!("verdict cache unavailable: {error}"));
+                None
             }
-            Err(AgentError::Invalid(error)) => Err(error),
         }
     }
 
-    /// The reviewer CLI's binary for this group's model, resolved once.
-    fn binary(&mut self) -> Result<PathBuf, Error> {
-        if let Some(binary) = &self.binary {
-            return Ok(binary.clone());
-        }
+    /// The reviewer CLI's binary for this group's model.
+    fn binary(&self) -> Result<PathBuf, Error> {
         let reviewer = Reviewer::for_model(self.group.settings.model.as_deref());
-        let binary = self.opencode.resolve_reviewer(reviewer)?;
-        self.binary = Some(binary.clone());
-        Ok(binary)
+        self.opencode.resolve_reviewer(reviewer)
     }
 
     /// Caches the live verdicts; only called when no chunk was invalid.
@@ -403,6 +457,68 @@ impl Runner<'_> {
             }
         }
     }
+}
+
+fn not_attempted(reason: &str) -> AgentOutcome {
+    AgentOutcome::Unavailable(Error::Refused(format!(
+        "not attempted after an earlier chunk failed: {reason}"
+    )))
+}
+
+/// One review, retried once after a short pause when the AI was unavailable
+/// for a reason a retry can fix: not a timeout, which would double a long
+/// wait, and not a reviewer that could not be started.
+fn review_with_retry(binary: &Path, request: &Request, settings: &AgentSettings) -> Live {
+    let review = || agent::review(binary, &|nonce: &str| request.render(nonce), settings);
+    match review() {
+        Err(AgentError::Unavailable(error)) if is_retryable(&error) => {
+            thread::sleep(RETRY_DELAY);
+            (review(), Some(error.to_string()))
+        }
+        result => (result, None),
+    }
+}
+
+fn is_retryable(error: &Error) -> bool {
+    match error {
+        Error::ToolFailed { detail, .. } => detail != "timed out",
+        Error::Spawn { .. } => false,
+        _ => true,
+    }
+}
+
+/// Reviews `requests[index]` for each of `indexes`, `PARALLEL_REVIEWS` at a
+/// time. A worker starts no new review once one was unavailable or invalid,
+/// so those requests have no result.
+fn review_parallel(
+    binary: &Path,
+    requests: &[Request],
+    indexes: &[usize],
+    settings: &AgentSettings,
+) -> Vec<(usize, Live)> {
+    let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let results = Mutex::new(Vec::new());
+    thread::scope(|scope| {
+        for _ in 0..PARALLEL_REVIEWS.min(indexes.len()) {
+            scope.spawn(|| {
+                while !stop.load(Ordering::SeqCst) {
+                    let Some(&index) = indexes.get(next.fetch_add(1, Ordering::SeqCst)) else {
+                        break;
+                    };
+                    let live = review_with_retry(binary, &requests[index], settings);
+                    if live.0.is_err() {
+                        stop.store(true, Ordering::SeqCst);
+                    }
+                    results
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push((index, live));
+                }
+            });
+        }
+    });
+    results.into_inner().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// After the whole review: keep `approved` as the baseline, bound to the
@@ -444,15 +560,16 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use super::{Group, Memory, remember, review_group};
+    use super::{Group, Memory, is_retryable, remember, review_group};
     use crate::agent::SourceFile;
     use crate::config::Settings;
     use crate::config::file::{AgentDefaults, PartialConfig};
     use crate::config::model::{AgentSettings, Profile, SourceClass, Thinking};
     use crate::engine::baseline::{self, Identity, Unit};
     use crate::engine::store::{Store, VERDICTS};
+    use crate::error::Error;
     use crate::report::AgentOutcome;
-    use crate::test_support::{TempDir, mock_opencode, mock_opencode_counting};
+    use crate::test_support::{TempDir, mock_opencode, mock_opencode_counting, write_script};
     use crate::tools::OpenCode;
 
     fn file(path: &str, content: &str) -> SourceFile {
@@ -589,10 +706,10 @@ mod tests {
     }
 
     #[test]
-    fn an_unavailable_chunk_stops_later_calls_and_keeps_earlier_verdicts() {
+    fn an_unavailable_first_chunk_is_retried_once_and_stops_later_calls() {
         let state = TempDir::new("engine-unavailable");
         let bin = TempDir::new("engine-unavailable-bin");
-        let opencode = OpenCode::At(mock_opencode_counting(bin.path(), 1, "exit 1"));
+        let opencode = OpenCode::At(mock_opencode_counting(bin.path(), 0, "exit 1"));
         let memory = memory(&state, Vec::new());
         let (settings, files) = three_chunks();
 
@@ -600,20 +717,87 @@ mod tests {
 
         assert!(review.invalid.is_none());
         assert_eq!(review.runs.len(), 3);
-        assert!(matches!(review.runs[0].outcome, AgentOutcome::Reviewed(_)));
+        assert!(
+            review
+                .runs
+                .iter()
+                .all(|run| matches!(run.outcome, AgentOutcome::Unavailable(_)))
+        );
         assert!(matches!(
-            review.runs[1].outcome,
-            AgentOutcome::Unavailable(_)
-        ));
-        assert!(matches!(
-            review.runs[2].outcome,
-            AgentOutcome::Unavailable(_)
+            &review.runs[2].outcome,
+            AgentOutcome::Unavailable(error) if error.to_string().contains("not attempted")
         ));
         assert_eq!(
             fs::read_to_string(bin.path().join("count")).unwrap().trim(),
             "2"
         );
+        assert!(memory.store.list(VERDICTS).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_later_unavailable_chunk_keeps_the_other_verdicts() {
+        let state = TempDir::new("engine-unavailable-later");
+        let bin = TempDir::new("engine-unavailable-later-bin");
+        let opencode = OpenCode::At(mock_opencode_counting(bin.path(), 1, "exit 1"));
+        let memory = memory(&state, Vec::new());
+        let (settings, files) = three_chunks();
+
+        let review = review_group(&group(&settings, &files), &opencode, Some(&memory));
+
+        assert!(review.invalid.is_none());
+        assert!(matches!(review.runs[0].outcome, AgentOutcome::Reviewed(_)));
+        assert!(
+            review.runs[1..]
+                .iter()
+                .all(|run| matches!(run.outcome, AgentOutcome::Unavailable(_)))
+        );
         assert_eq!(memory.store.list(VERDICTS).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_failure_the_retry_recovers_from_is_a_review_with_a_note() {
+        let bin = TempDir::new("engine-retry-bin");
+        let clear = mock_opencode(bin.path(), "clear", true);
+        let flaky = bin.path().join("flaky");
+        write_script(
+            &flaky,
+            &format!(
+                "#!/bin/sh\nif [ ! -e \"$0.failed\" ]; then : >\"$0.failed\"; cat >/dev/null; \
+                 echo 'rate limited' >&2; exit 1; fi\nexec {} \"$@\"\n",
+                clear.display()
+            ),
+        );
+        let settings = AgentSettings::default();
+        let files = [file("a.c", "int x;\n")];
+
+        let review = review_group(&group(&settings, &files), &OpenCode::At(flaky), None);
+
+        assert!(matches!(
+            review.runs.as_slice(),
+            [run] if matches!(run.outcome, AgentOutcome::Reviewed(_))
+        ));
+        assert!(
+            review
+                .notes
+                .iter()
+                .any(|note| note.contains("retried") && note.contains("rate limited")),
+            "{:?}",
+            review.notes
+        );
+    }
+
+    #[test]
+    fn a_timeout_is_not_retried() {
+        let timeout = Error::ToolFailed {
+            tool: "opencode".into(),
+            detail: "timed out".into(),
+        };
+        let provider = Error::ToolFailed {
+            tool: "opencode".into(),
+            detail: "rate limited".into(),
+        };
+        assert!(!is_retryable(&timeout));
+        assert!(is_retryable(&provider));
     }
 
     #[test]

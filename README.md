@@ -232,8 +232,11 @@ refused. Files are ranked by risk:
 2. Other code and runtime config follow.
 3. Everything else, with documentation last.
 
-Each chunk is its own OpenCode run with its own nonce, and every chunk carries
-the full file list, so the model knows what else exists. A source that needs
+Each chunk is its own reviewer run with its own nonce, and every chunk carries
+the full file list, so the model knows what else exists. The first chunk runs
+alone; the rest run three at a time. A run that finds the AI unavailable (a
+provider error, not a timeout) is retried once after two seconds; if it still
+fails, chunks not yet started are not attempted. A source that needs
 more than `max_chunks` chunks of `max_input_kib` is not reviewed at all
 (`INCOMPLETE`): a partial AI review is never presented as a review of the
 whole source.
