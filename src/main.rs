@@ -30,6 +30,7 @@ mod error;
 mod json;
 mod makepkg_gate;
 mod mask;
+mod notify;
 mod osv;
 mod pacman;
 mod payload;
