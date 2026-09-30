@@ -118,6 +118,8 @@ const BWRAP_ARGS: &[&str] = &[
     "--die-with-parent",
     "--new-session",
     "--unshare-all",
+    // --unshare-all only tries a user namespace; --disable-userns needs one.
+    "--unshare-user",
     "--disable-userns",
     "--assert-userns-disabled",
     "--cap-drop",
@@ -214,8 +216,14 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    use super::{Workspace, copy_tree};
+    use super::{BWRAP_ARGS, Workspace, copy_tree};
     use crate::test_support::TempDir;
+
+    #[test]
+    fn user_namespace_is_unshared_before_it_is_disabled() {
+        let position = |flag| BWRAP_ARGS.iter().position(|arg| *arg == flag).unwrap();
+        assert!(position("--unshare-user") < position("--disable-userns"));
+    }
 
     #[test]
     fn workspace_is_private_and_removed() {
