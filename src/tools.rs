@@ -235,6 +235,24 @@ pub fn run_in(
     run_with(program, args, None, env, limits, Some(directory))
 }
 
+/// Like `run`, with `file` as the child's standard input: an archive opened
+/// once is read by every pass, whatever happens to its path meanwhile.
+pub fn run_with_stdin_file(
+    program: &Path,
+    args: &[OsString],
+    file: fs::File,
+    env: &[(&str, &str)],
+    limits: Limits,
+) -> Result<Captured, Error> {
+    run_inner(program, args, Stdin::File(file), env, limits, None)
+}
+
+enum Stdin<'a> {
+    Null,
+    Bytes(&'a [u8]),
+    File(fs::File),
+}
+
 fn run_with(
     program: &Path,
     args: &[OsString],
@@ -243,6 +261,22 @@ fn run_with(
     limits: Limits,
     directory: Option<&Path>,
 ) -> Result<Captured, Error> {
+    let stdin = input.map_or(Stdin::Null, Stdin::Bytes);
+    run_inner(program, args, stdin, env, limits, directory)
+}
+
+fn run_inner(
+    program: &Path,
+    args: &[OsString],
+    stdin: Stdin<'_>,
+    env: &[(&str, &str)],
+    limits: Limits,
+    directory: Option<&Path>,
+) -> Result<Captured, Error> {
+    let input = match &stdin {
+        Stdin::Bytes(bytes) => Some(*bytes),
+        Stdin::Null | Stdin::File(_) => None,
+    };
     let tool = program.file_name().map_or_else(
         || program.display().to_string(),
         |name| name.to_string_lossy().into_owned(),
@@ -255,10 +289,10 @@ fn run_with(
         .arg(format!("{}s", limits.timeout_secs))
         .arg(program)
         .args(args)
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
+        .stdin(match stdin {
+            Stdin::Null => Stdio::null(),
+            Stdin::Bytes(_) => Stdio::piped(),
+            Stdin::File(file) => Stdio::from(file),
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

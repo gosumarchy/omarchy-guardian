@@ -64,6 +64,9 @@ pub struct AgentDefaults {
 pub struct PartialConfig {
     pub profile: Option<Profile>,
     pub official_repos: Option<Vec<String>>,
+    /// Packages allowed to provide the reviewer binaries from outside the
+    /// official repositories (system file only).
+    pub trusted_reviewer_packages: Option<Vec<String>>,
     pub agent: AgentDefaults,
     pub classes: Vec<(SourceClass, PartialPolicy)>,
 }
@@ -145,6 +148,9 @@ fn apply(
     match path {
         ["profile"] => config.profile = Some(field.named(value)?),
         ["official_repos"] => config.official_repos = Some(field.repo_list(value)?),
+        ["trusted_reviewer_packages"] => {
+            config.trusted_reviewer_packages = Some(field.package_list(value)?);
+        }
         ["agent", "model"] => config.agent.model = Some(field.model(value)?),
         ["agent", "max_input_kib"] => {
             config.agent.max_input_kib = Some(field.integer(&value, &INPUT_KIB_RANGE)?);
@@ -280,6 +286,21 @@ impl Field<'_> {
             Value::Bool(flag) => Ok(*flag),
             Value::String(_) | Value::Integer(_) | Value::StringArray(_) => {
                 Err(self.error("expected true or false"))
+            }
+        }
+    }
+
+    fn package_list(&self, value: Value) -> Result<Vec<String>, ConfigError> {
+        match value {
+            Value::StringArray(names)
+                if names
+                    .iter()
+                    .all(|name| crate::pacman::is_valid_package_name(name)) =>
+            {
+                Ok(names)
+            }
+            Value::StringArray(_) | Value::String(_) | Value::Integer(_) | Value::Bool(_) => {
+                Err(self.error("expected a list of pacman package names"))
             }
         }
     }

@@ -216,6 +216,19 @@ pub fn classify(rel: &str, executable: bool, force: bool, bytes: &[u8]) -> Conte
     }
 }
 
+/// Classifies a payload file that must be read as code, except that a
+/// recognised executable format (an ELF generator, a compiled program a
+/// hook runs) is reported as that binary, for the caller to allow or refuse.
+pub fn classify_payload(rel: &str, bytes: &[u8]) -> Content {
+    match classify(rel, false, true, bytes) {
+        Content::Undecodable => match magic(rel, bytes) {
+            Some(format) if format.executable() => Content::Binary(format),
+            _ => Content::Undecodable,
+        },
+        other => other,
+    }
+}
+
 /// Classifies a file too large to review from its first bytes.
 pub fn classify_prefix(rel: &str, executable: bool, head: &[u8]) -> Prefix {
     let probe = &head[..head.len().min(PROBE_SIZE)];
@@ -267,8 +280,8 @@ fn utf16(bytes: &[u8]) -> Option<String> {
         _ => {
             let probe = &bytes[..bytes.len().min(512)];
             let looks_le = bytes.len() >= 4
-                && bytes.len() % 2 == 0
-                && probe.chunks_exact(2).all(|pair| {
+                && bytes.len().is_multiple_of(2)
+                && probe.as_chunks::<2>().0.iter().all(|pair| {
                     pair[1] == 0
                         && (pair[0] == b'\n'
                             || pair[0] == b'\r'
@@ -281,10 +294,10 @@ fn utf16(bytes: &[u8]) -> Option<String> {
             (true, bytes)
         }
     };
-    if body.len() % 2 != 0 {
+    if !body.len().is_multiple_of(2) {
         return None;
     }
-    let units = body.chunks_exact(2).map(|pair| {
+    let units = body.as_chunks::<2>().0.iter().map(|pair| {
         if little {
             u16::from_le_bytes([pair[0], pair[1]])
         } else {

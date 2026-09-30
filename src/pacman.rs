@@ -16,11 +16,12 @@ use std::path::{Path, PathBuf};
 use crate::classify;
 use crate::config::Settings;
 use crate::config::model::{AiRequirement, Named, SourceClass};
+use crate::content::Content;
+use crate::engine::plan::HashOnly;
 use crate::error::{Error, IoContext};
 use crate::payload;
 use crate::report::{Gap, Report};
 use crate::review;
-use crate::scan::MAX_TEXT_FILE_SIZE;
 use crate::tools::{self, Limits, OpenCode, Reviewer};
 
 const ARCHIVE_EXTENSIONS: &[&str] = &[".pkg.tar.zst", ".pkg.tar.xz", ".pkg.tar.gz", ".pkg.tar"];
@@ -119,6 +120,7 @@ pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report
     report.profile = settings.system_profile().name().to_string();
     report.ai_off_classes = review::ai_off_classes(settings, &PRIVILEGED);
 
+    let trusted = settings.trusted_reviewer_packages();
     let (archives, classes) = match operation {
         Operation::Sync => sync_archives(&targets, settings)?,
         Operation::LocalUpgrade => {
@@ -145,15 +147,8 @@ pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report
         match archives.get(target) {
             Some(Ok(paths)) => {
                 for archive in paths {
-                    let scriptlet = match scan_install_script(archive, target, class, &mut report) {
-                        Ok(found) => found.is_some(),
-                        Err(error) => {
-                            report.gaps.push(Gap::Package(error));
-                            continue;
-                        }
-                    };
-                    match scan_payload(archive, target, class, &mut report) {
-                        Ok(summary) => summary.announce(target, scriptlet),
+                    match scan_package(archive, target, class, &trusted, &mut report) {
+                        Ok((scriptlet, summary)) => summary.announce(target, scriptlet),
                         Err(error) => report.gaps.push(Gap::Package(error)),
                     }
                 }
@@ -548,7 +543,7 @@ impl PayloadSummary {
                 .collect();
             let more = self.not_reviewed.len().saturating_sub(shown.len());
             outln!(
-                "Pacman package {target}: {} auto-run file(s) not reviewed (binary or AI off): {}{}",
+                "Pacman package {target}: {} auto-run file(s) not reviewed: {}{}",
                 self.not_reviewed.len(),
                 shown.join(", "),
                 if more > 0 {
@@ -561,24 +556,46 @@ impl PayloadSummary {
     }
 }
 
-/// Queues the payload files of `archive` that run or grant privileges on
-/// their own (see `payload`) for the AI review, tagged with `class`.
-fn scan_payload(
-    archive: &Path,
+/// Reviews one package archive through its exact model (see `payload`):
+/// the install scriptlet with the local rules and the AI, and the payload
+/// files that run or grant privileges on their own with the AI. Returns
+/// whether it had a scriptlet and what the payload held.
+fn scan_package(
+    archive_path: &Path,
     target: &str,
     class: SourceClass,
+    trusted: &[String],
     report: &mut Report,
-) -> Result<PayloadSummary, Error> {
-    let archive_name = archive
+) -> Result<(bool, PayloadSummary), Error> {
+    let archive = payload::Archive::open(archive_path)?;
+    let reviewed = payload::review(&archive, target, class, trusted)?;
+    let archive_name = archive_path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("package");
+
+    let scriptlet = match reviewed.install {
+        None => false,
+        Some(Content::Undecodable | Content::Binary(_)) => {
+            return Err(Error::Refused(format!(
+                "the install scriptlet of {} holds binary data and cannot be reviewed",
+                archive_path.display()
+            )));
+        }
+        Some(Content::Text(text) | Content::Lossy { text, .. }) => {
+            let rel = format!("{target}/{archive_name}/.INSTALL");
+            report.file_classes.insert(rel.clone(), class);
+            review::analyze_text(report, &rel, &text, false);
+            true
+        }
+    };
+
     let mut summary = PayloadSummary {
         reviewed: 0,
         unchanged: 0,
         not_reviewed: Vec::new(),
     };
-    for file in payload::auto_run_files(archive)? {
+    for file in reviewed.files {
         // An upgrade only brings in what changed; the rest is already active.
         if file.is_installed_unchanged(Path::new("/")) {
             summary.unchanged += 1;
@@ -586,59 +603,47 @@ fn scan_payload(
         }
         let rel = format!("{target}/{archive_name}/{}", file.path);
         report.file_classes.insert(rel.clone(), class);
-        match file.text {
-            Some(text) if review::analyze_payload(report, &rel, &text) => summary.reviewed += 1,
-            Some(_) | None => summary.not_reviewed.push(format!("/{}", file.path)),
+        match file.content {
+            Content::Text(text) | Content::Lossy { text, .. } => {
+                if review::analyze_payload(report, &rel, &text) {
+                    summary.reviewed += 1;
+                } else {
+                    summary
+                        .not_reviewed
+                        .push(format!("/{} (AI off)", file.path));
+                }
+            }
+            // Official packages ship ELF generators, and hooks and units
+            // run compiled programs: they cannot be read, but the AI is told
+            // they are there.
+            Content::Binary(format)
+                if format.executable()
+                    && (class == SourceClass::Official || file.run_by.is_some()) =>
+            {
+                summary
+                    .not_reviewed
+                    .push(format!("/{} ({})", file.path, format.label()));
+                report.hash_only.push(HashOnly {
+                    path: rel,
+                    bytes: 0,
+                    label: format.label(),
+                    media: false,
+                });
+            }
+            Content::Binary(format) if format.executable() => {
+                report.gaps.push(Gap::Package(Error::Refused(format!(
+                    "/{}: a {} in an auto-run location cannot be reviewed; only packages from an official repository may ship one",
+                    file.path,
+                    format.label()
+                ))));
+            }
+            Content::Binary(_) | Content::Undecodable => {
+                report.gaps.push(Gap::Undecodable(rel));
+            }
         }
     }
-    Ok(summary)
-}
-
-/// Extracts `.INSTALL` directly (no listing, which is unbounded for packages
-/// with many files). Returns the virtual path it was reviewed under, or
-/// `None` when the archive had no scriptlet.
-/// Tags the scriptlet with `class` before analyzing it, because whether it
-/// is queued for the AI review depends on its class.
-pub fn scan_install_script(
-    archive: &Path,
-    target: &str,
-    class: SourceClass,
-    report: &mut Report,
-) -> Result<Option<String>, Error> {
-    let captured = tools::run(
-        Path::new(tools::BSDTAR),
-        &["-xOqf".into(), archive.into(), ".INSTALL".into()],
-        None,
-        C_LOCALE,
-        Limits {
-            timeout_secs: 30,
-            max_output: usize::try_from(MAX_TEXT_FILE_SIZE).unwrap_or(usize::MAX),
-        },
-    )?;
-    if !captured.status.success() {
-        if String::from_utf8_lossy(&captured.stderr).contains("Not found in archive") {
-            return Ok(None);
-        }
-        return Err(Error::ToolFailed {
-            tool: "bsdtar".into(),
-            detail: format!("{}: {}", archive.display(), captured.failure_detail()),
-        });
-    }
-
-    let contents = String::from_utf8(captured.stdout).map_err(|_| {
-        Error::Refused(format!(
-            "package install script is not UTF-8: {}",
-            archive.display()
-        ))
-    })?;
-    let archive_name = archive
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("package");
-    let rel = format!("{target}/{archive_name}/.INSTALL");
-    report.file_classes.insert(rel.clone(), class);
-    review::analyze_text(report, &rel, &contents, false);
-    Ok(Some(rel))
+    archive.verify_unchanged()?;
+    Ok((scriptlet, summary))
 }
 
 #[cfg(test)]
@@ -649,7 +654,7 @@ mod tests {
 
     use super::{
         Archives, Operation, is_valid_package_name, local_archives, missing_targets,
-        parse_operation, parse_sync_info, read_targets, scan_install_script, split_cmdline,
+        parse_operation, parse_sync_info, read_targets, scan_package, split_cmdline,
     };
     use crate::agent::{AgentReview, Status};
     use crate::config::Settings;
@@ -878,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn install_scripts_are_read_without_extraction() {
+    fn install_scripts_are_reviewed_through_the_archive_model() {
         if !tool_available("/usr/bin/bsdtar") {
             return;
         }
@@ -886,12 +891,15 @@ mod tests {
         let archive = build_package(dir.path(), Some("post_install() { rm -rf /; }\n"));
 
         let mut report = Report::new("test");
-        assert_eq!(
-            scan_install_script(&archive, "sample", SourceClass::LocalPackage, &mut report)
-                .unwrap()
-                .as_deref(),
-            Some("sample/sample-1.0-1-any.pkg.tar/.INSTALL")
-        );
+        let (scriptlet, _) = scan_package(
+            &archive,
+            "sample",
+            SourceClass::LocalPackage,
+            &[],
+            &mut report,
+        )
+        .unwrap();
+        assert!(scriptlet);
         assert_eq!(
             report.class_of("sample/sample-1.0-1-any.pkg.tar/.INSTALL"),
             SourceClass::LocalPackage
@@ -904,17 +912,47 @@ mod tests {
         );
         assert!(!dir.path().join("sample").exists());
 
+        // A Latin-1 byte no longer refuses a scriptlet: it is reviewed.
+        let latin = TempDir::new("pacman-latin1");
+        fs::write(
+            latin.path().join(".INSTALL"),
+            b"# caf\xe9\npost_install() { true; }\n",
+        )
+        .unwrap();
+        let archive = build_package(latin.path(), None);
+        let status = Command::new("/usr/bin/bsdtar")
+            .arg("-rf")
+            .arg(&archive)
+            .arg(".INSTALL")
+            .current_dir(latin.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let mut report = Report::new("test");
+        assert!(
+            scan_package(
+                &archive,
+                "sample",
+                SourceClass::LocalPackage,
+                &[],
+                &mut report
+            )
+            .unwrap()
+            .0
+        );
+
         let plain_dir = TempDir::new("pacman-plain");
         let plain = build_package(plain_dir.path(), None);
-        assert_eq!(
-            scan_install_script(
+        assert!(
+            !scan_package(
                 &plain,
                 "sample",
                 SourceClass::LocalPackage,
+                &[],
                 &mut Report::default()
             )
-            .unwrap(),
-            None
+            .unwrap()
+            .0
         );
     }
 }
