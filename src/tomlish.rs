@@ -309,10 +309,11 @@ impl Reader<'_> {
         if from > end {
             (from, line) = (0, 1);
         }
+        // Splitting on newlines yields one more piece than there are newlines.
         line += self.bytes[from..end]
-            .iter()
-            .filter(|byte| **byte == b'\n')
-            .count();
+            .split(|byte| *byte == b'\n')
+            .count()
+            - 1;
         self.counted.set((end, line));
         line
     }

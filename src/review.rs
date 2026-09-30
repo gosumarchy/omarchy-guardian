@@ -168,8 +168,9 @@ pub fn analyze_text(report: &mut Report, rel: &str, text: &str, inspect_dependen
             if inventory_network {
                 record_network(report, rel, number, line, &view.quiet);
             }
-            let code = view.code.to_lowercase();
-            let quiet = view.quiet.to_lowercase();
+            // Tabs as spaces, so `sudo<TAB>x` matches like `sudo x`.
+            let code = view.code.to_lowercase().replace('\t', " ");
+            let quiet = view.quiet.to_lowercase().replace('\t', " ");
             for rule in rules::line_rules(&code, &quiet) {
                 push_finding(report, rel, number, line, rule);
             }
