@@ -95,7 +95,7 @@ impl fmt::Display for Gap {
             Self::NoReviewableFiles => {
                 f.write_str("no readable text source files were available for review")
             }
-            Self::Agent(error) => write!(f, "OpenCode review failed: {error}"),
+            Self::Agent(error) => write!(f, "AI review failed: {error}"),
             Self::Dependency(message) => f.write_str(message),
         }
     }
@@ -199,6 +199,8 @@ pub struct Report {
     pub profile: String,
     /// Review-memory lines: the upgrade summary and store problems. Never gaps.
     pub notes: Vec<String>,
+    /// Facts Guardian established for the AI review (see `Request::context`).
+    pub context: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -401,7 +403,7 @@ impl Report {
                 Decision::Blocked(Blocked::NotConfirmed) => "Not confirmed; nothing was run.",
                 Decision::Warned => "Proceeding with warnings; read them above.",
                 Decision::Limited => {
-                    "Scope: package payloads were not inspected by this scriptlet-only review."
+                    "Scope: install scriptlets and new or changed auto-run files are reviewed; the rest of each package's payload is not."
                 }
                 Decision::Clear =>
                     "Scope: this is a heuristic source review, not a safety guarantee.",
@@ -439,7 +441,8 @@ impl Report {
                 "33;1",
             ),
             Decision::Limited => (
-                "· LIMITED REVIEW — no text install scripts were available".to_string(),
+                "· LIMITED REVIEW — no install scriptlet or new auto-run file to review"
+                    .to_string(),
                 "36;1",
             ),
         };
@@ -559,7 +562,7 @@ impl Report {
                         Status::Inconclusive => "33;1",
                     };
                     outln!(
-                        "OpenCode: {} · {}{context} · profile {} — {}",
+                        "AI review: {} · {}{context} · profile {} — {}",
                         painter.paint(review.status.label(), color),
                         run.label,
                         self.profile,
@@ -567,7 +570,7 @@ impl Report {
                     );
                 }
                 AgentOutcome::Unavailable(error) => outln!(
-                    "OpenCode: {} · {}{context} · profile {} — {error}",
+                    "AI review: {} · {}{context} · profile {} — {error}",
                     painter.paint("UNAVAILABLE", "33;1"),
                     run.label,
                     self.profile

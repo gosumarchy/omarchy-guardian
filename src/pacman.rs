@@ -17,10 +17,11 @@ use crate::classify;
 use crate::config::Settings;
 use crate::config::model::{AiRequirement, Named, SourceClass};
 use crate::error::{Error, IoContext};
+use crate::payload;
 use crate::report::{Gap, Report};
 use crate::review;
 use crate::scan::MAX_TEXT_FILE_SIZE;
-use crate::tools::{self, Limits, OpenCode};
+use crate::tools::{self, Limits, OpenCode, Reviewer};
 
 const ARCHIVE_EXTENSIONS: &[&str] = &[".pkg.tar.zst", ".pkg.tar.xz", ".pkg.tar.gz", ".pkg.tar"];
 const DEFAULT_CACHE_DIR: &str = "/var/cache/pacman/pkg/";
@@ -61,9 +62,21 @@ pub fn classes_requiring_ai(settings: &Settings) -> Vec<SourceClass> {
         .collect()
 }
 
-/// Whether a root-owned OpenCode is installed where the gate looks for it.
-pub fn system_opencode_ready() -> bool {
-    OpenCode::SystemOnly.resolve().is_ok()
+/// Whether every pacman class that requires the AI review has a root-owned
+/// binary of the reviewer CLI its model selects.
+pub fn system_reviewer_ready(settings: &Settings) -> bool {
+    classes_requiring_ai(settings).iter().all(|class| {
+        let reviewer = Reviewer::for_model(settings.agent_settings(*class).model.as_deref());
+        OpenCode::SystemOnly.resolve_reviewer(reviewer).is_ok()
+    })
+}
+
+/// Whether the pacman classes that require the AI review use OpenCode, so a
+/// missing reviewer is fixed by installing `extra/opencode`.
+pub fn system_reviewer_is_opencode(settings: &Settings) -> bool {
+    classes_requiring_ai(settings).iter().all(|class| {
+        Reviewer::for_model(settings.agent_settings(*class).model.as_deref()) == Reviewer::OpenCode
+    })
 }
 
 /// Whether the pacman gate can review transactions with these settings.
@@ -79,8 +92,13 @@ pub fn preflight(settings: &Settings, opencode_ready: bool) -> Result<(), String
         return Ok(());
     }
     let names: Vec<&str> = requiring.iter().map(|class| class.name()).collect();
+    let fix = if system_reviewer_is_opencode(settings) {
+        "there is no root-owned OpenCode at /usr/bin/opencode or /usr/local/bin/opencode. Install it with: sudo pacman -S extra/opencode"
+    } else {
+        "the model set for them runs through the Claude Code CLI, and there is no root-owned `claude` at /usr/bin/claude or /usr/local/bin/claude. Install Claude Code system-wide, or set an OpenCode model for the pacman gate"
+    };
     Err(format!(
-        "there is no root-owned OpenCode at /usr/bin/opencode or /usr/local/bin/opencode, but {} packages require an AI review, so pacman would refuse every such install (including AUR packages yay installs with pacman -U). Install it with: sudo pacman -S extra/opencode",
+        "{} packages require an AI review, so pacman would refuse every such install (including AUR packages yay installs with pacman -U): {fix}",
         names.join(", ")
     ))
 }
@@ -127,11 +145,15 @@ pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report
         match archives.get(target) {
             Some(Ok(paths)) => {
                 for archive in paths {
-                    match scan_install_script(archive, target, class, &mut report) {
-                        Ok(Some(_)) => {}
-                        Ok(None) => {
-                            outln!("Pacman package {target}: no install scriptlet to review.");
+                    let scriptlet = match scan_install_script(archive, target, class, &mut report) {
+                        Ok(found) => found.is_some(),
+                        Err(error) => {
+                            report.gaps.push(Gap::Package(error));
+                            continue;
                         }
+                    };
+                    match scan_payload(archive, target, class, &mut report) {
+                        Ok(summary) => summary.announce(target, scriptlet),
                         Err(error) => report.gaps.push(Gap::Package(error)),
                     }
                 }
@@ -477,6 +499,89 @@ fn package_name(archive: &Path) -> Result<String, Error> {
             archive.display()
         )))
     }
+}
+
+/// What was found in one package's payload.
+struct PayloadSummary {
+    reviewed: usize,
+    /// Identical to what is already installed, so not reviewed again.
+    unchanged: usize,
+    /// Auto-run files that could not be reviewed: binaries, or anything
+    /// under `ai = off`.
+    not_reviewed: Vec<String>,
+}
+
+impl PayloadSummary {
+    fn announce(&self, target: &str, scriptlet: bool) {
+        let nothing = self.reviewed == 0 && self.unchanged == 0 && self.not_reviewed.is_empty();
+        if !scriptlet && nothing {
+            outln!("Pacman package {target}: no install scriptlet or auto-run files to review.");
+        }
+        if self.reviewed > 0 {
+            outln!(
+                "Pacman package {target}: {} new or changed auto-run file(s) reviewed.",
+                self.reviewed
+            );
+        }
+        if self.unchanged > 0 {
+            outln!(
+                "Pacman package {target}: {} auto-run file(s) identical to the installed ones, not reviewed again.",
+                self.unchanged
+            );
+        }
+        if !self.not_reviewed.is_empty() {
+            let shown: Vec<&str> = self
+                .not_reviewed
+                .iter()
+                .take(3)
+                .map(String::as_str)
+                .collect();
+            let more = self.not_reviewed.len().saturating_sub(shown.len());
+            outln!(
+                "Pacman package {target}: {} auto-run file(s) not reviewed (binary or AI off): {}{}",
+                self.not_reviewed.len(),
+                shown.join(", "),
+                if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                }
+            );
+        }
+    }
+}
+
+/// Queues the payload files of `archive` that run or grant privileges on
+/// their own (see `payload`) for the AI review, tagged with `class`.
+fn scan_payload(
+    archive: &Path,
+    target: &str,
+    class: SourceClass,
+    report: &mut Report,
+) -> Result<PayloadSummary, Error> {
+    let archive_name = archive
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("package");
+    let mut summary = PayloadSummary {
+        reviewed: 0,
+        unchanged: 0,
+        not_reviewed: Vec::new(),
+    };
+    for file in payload::auto_run_files(archive)? {
+        // An upgrade only brings in what changed; the rest is already active.
+        if file.is_installed_unchanged(Path::new("/")) {
+            summary.unchanged += 1;
+            continue;
+        }
+        let rel = format!("{target}/{archive_name}/{}", file.path);
+        report.file_classes.insert(rel.clone(), class);
+        match file.text {
+            Some(text) if review::analyze_payload(report, &rel, &text) => summary.reviewed += 1,
+            Some(_) | None => summary.not_reviewed.push(format!("/{}", file.path)),
+        }
+    }
+    Ok(summary)
 }
 
 /// Extracts `.INSTALL` directly (no listing, which is unbounded for packages

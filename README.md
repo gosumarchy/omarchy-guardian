@@ -69,7 +69,7 @@ has every setting:
 | Profiles | the profile for your own sources (user file) and for the pacman gate (system file) |
 | Sources | every knob of every source class; pacman-enforced classes in the system file, the rest in the user file |
 | AI | model, input size and call limits for your sources and for the pacman gate, review-memory limits, official repositories |
-| Integrations | turn the pacman hook, the yay AUR gate, the theme install gate and the Omarchy menu entry on or off |
+| Integrations | turn the pacman hook, the yay AUR gate, the theme & plugin gate and the Omarchy menu entry on or off |
 | Maintenance | show and check the effective settings, edit either file in `$EDITOR`, see or forget the review memory, run the guided setup |
 
 Unset values show what they inherit and from where. Keys: `↑↓` move,
@@ -94,7 +94,7 @@ loosened by the system file (but see the OpenCode caveat below).
 | `local-package` | `pacman -U` archives | pacman hook | yes |
 | `aur` | yay makepkg shim | user | no |
 | `theme` | Omarchy theme install/update handler | user | no |
-| `plugin` | reserved for the coverage sub-project's plugin gate | user | no |
+| `plugin` | Omarchy plugin gate (`omarchy plugin add` / `update`) | user | no |
 | `source` | explicit `scan` / `guard` / `sandbox` (default) | user | no |
 
 `official_repos` defaults to `core, extra, multilib, core-testing,
@@ -354,6 +354,31 @@ user-writable reviewer could be replaced by user-level malware. OpenCode must
 be configured with a working provider; source leaves the machine through that
 provider.
 
+## Using Claude Code as the reviewer
+
+A model written `claude-code/<model>` runs the review through the Claude Code
+CLI (`claude`) instead of OpenCode, with your existing Claude login:
+
+```toml
+[agent]
+model = "claude-code/claude-sonnet-5-5"
+```
+
+(or pick it in `omarchy-guardian tui` or `setup`, which list the Claude Code
+models when `claude` is installed). Guardian runs `claude --print` with every
+built-in tool disabled (`--tools ""`), no MCP servers (`--strict-mcp-config`),
+no user, project or local settings, hooks or plugins (`--setting-sources ""`),
+no slash commands and no saved session, from an empty private working
+directory; the request goes on stdin. A reply that took more than one turn
+or had a permission denial counts as a tool attempt and makes the review
+invalid, and the reply must echo the nonce like OpenCode's. `thinking`
+becomes `--effort` directly.
+
+For your own sources `claude` is found on `PATH`. The pacman gate, as with
+OpenCode, only accepts a root-owned `/usr/bin/claude` or
+`/usr/local/bin/claude`; a Claude Code installed in your home directory is
+not used for it, and `pacman-hook --preflight` says so.
+
 ## Install (Arch Linux / Omarchy)
 
 ```sh
@@ -384,8 +409,26 @@ user's OpenCode configuration and credentials.
 
 ### Pacman hook
 
-A pre-transaction hook (`AbortOnFail`) that reviews the `.INSTALL` scriptlets
-of the exact archives being installed:
+A pre-transaction hook (`AbortOnFail`) that reviews, for the exact archives
+being installed, their `.INSTALL` scriptlets and the payload files that run or
+grant privileges on their own:
+
+- pacman hooks (`usr/share/libalpm/hooks`, `etc/pacman.d/hooks`), sudoers,
+  polkit and PAM rules, `ld.so.preload` and `ld.so.conf.d`;
+- systemd units a package enables itself (`*.wants/`, `*.requires/`,
+  `*.upholds/`), generators and presets, and units in `etc/systemd`;
+- tmpfiles, sysusers, binfmt, udev, modprobe and environment.d entries;
+- login scripts (`etc/profile.d`, xinitrc.d), autostart entries, cron jobs and
+  D-Bus system services and policies.
+
+On an upgrade, an auto-run file identical to the installed one is not reviewed
+again, since it adds nothing new: a point release typically brings a handful of
+changed files, not every unit and rule. These files go to the AI review only;
+the local pattern rules are written for scripts and would match the ordinary
+content of these files. Binaries among them (generators, for example) are
+listed as not reviewed. The rest of the payload is not reviewed.
+
+Archives are located as follows:
 
 - For `pacman -S`, each target's sync-database version (`pacman -Si`) is
   located in the configured `CacheDir`s (`pacman-conf`), and each archive's
@@ -393,16 +436,19 @@ of the exact archives being installed:
 - For `pacman -U`, the archives named on pacman's command line are used,
   resolved against pacman's own working directory. Remote URLs are refused.
 
-The AI review is told that only the scriptlets are under review: routine
-packaging (setting capabilities or setuid on the package's own files, creating
-system users, copying the package's own files into place, managing its own
-services) is not by itself concerning, and files a scriptlet only mentions are
-not grounds for an inconclusive verdict. It still flags scriptlets that
-download or run code from elsewhere, write their own content into sudoers,
-PAM or other security configuration, add persistence the package does not own,
-or touch users' home directories or credentials. An inconclusive verdict
-blocks in every profile, since ambiguity is something an attacker can
-provoke.
+The AI review is told what is under review (the scriptlets and those payload
+files) and what routine packaging looks like: capabilities or setuid on the
+package's own files, system users, copying its own files into place, its own
+services, sockets and device rules, and privileges that only apply once an
+administrator opts in (a dedicated, initially empty group, or a boot
+credential). Files a scriptlet only mentions, and how the package's own
+programs authorize requests, are out of scope and not grounds for an
+inconclusive verdict. It still flags downloading or running code from
+elsewhere, sudoers, polkit or PAM rules that grant root broadly or without
+authentication, pacman hooks or login and autostart scripts that run unrelated
+code, preloaded libraries, persistence the package does not own, and access to
+users' home directories or credentials. An inconclusive verdict blocks in
+every profile, since ambiguity is something an attacker can provoke.
 
 libalpm runs hooks as children of pacman after `chroot` + `chdir("/")`, so the
 hook reads pacman's exact argv from `/proc/<pid>/cmdline` and its working
@@ -413,15 +459,53 @@ directly (for example pamac) are not supported and will be blocked.
 
 ### yay makepkg gate
 
-Runs `guard --class aur --thorough --exclude src --exclude pkg` on the AUR build directory
-before every `makepkg` invocation. The PKGBUILD, install scripts, patches and
-other AUR inputs are reviewed; makepkg's own `src/` and `pkg/` work
-directories (extracted upstream sources and build output) are not, so upstream
-sources and whatever `prepare()`/`build()` do with them are outside the review.
+The yay shim runs `omarchy-guardian makepkg-gate` in the AUR build directory
+before every `makepkg` call. yay calls makepkg several times per package; the
+gate does, in order:
+
+1. **AUR trust signals.** The package is looked up in the AUR RPC (only its
+   name is sent): its age, votes, maintainer and submitter are printed, and a
+   package first submitted under 30 days ago, with fewer than 5 votes,
+   orphaned, or changed in the last 14 days by a maintainer who did not
+   submit it is flagged. These are warnings, and are given to the AI review
+   as facts.
+2. **The recipe.** The PKGBUILD, install scripts, patches and other AUR files
+   are reviewed as `guard --class aur --thorough --exclude src --exclude pkg`
+   would. The AI is told that upstream sources are reviewed in the next
+   step, that prebuilt binaries cannot be reviewed by anyone, and what
+   routine packaging looks like. A PKGBUILD's `url=` and `source=` entries
+   are declarations, not network requests, for the local rules, unless they
+   run a command.
+3. **Sources**, for a call that runs PKGBUILD functions (not
+   `--verifysource`, `--packagelist`, `--nobuild --noprepare` and the like).
+   Only now, with the recipe reviewed, `makepkg --printsrcinfo` lists the
+   sources:
+   - an unverified download over `http://` or `ftp://` blocks the build,
+     since anyone on the network path can replace it;
+   - a git (or other VCS) source not pinned to a commit, or an unverified
+     download over HTTPS, is a warning.
+4. **Upstream code.** If the call extracts the sources, the gate first
+   fetches and extracts them itself with `makepkg --nobuild --noprepare
+   --nodeps`, so no PKGBUILD function has run yet. The AI then reviews the
+   upstream code under `src/`: all of it when its code is up to 1 MiB,
+   otherwise its build files and scripts (makefiles, CMake, meson,
+   `configure`, `setup.py`, `build.rs`, `package.json`, shell scripts…)
+   first, then other code by depth, up to 1 MiB. Data and documentation
+   (`.json`, `.md`, `.txt`…), version-control metadata, `node_modules` and
+   CI or development-container directories are left out. The review looks
+   for malicious intent in what runs during the build and in the program's
+   own code, not bugs or vulnerabilities, and is told whether the recipe
+   runs the test suite (`check()`). The upstream review is remembered as
+   `aur-src:<package>`, so a new version is reviewed as a diff.
+5. **makepkg** starts with the original arguments.
+
+What is not reviewed is reported: how many code files were left out, and
+that data files were skipped. Prebuilt binaries in `-bin` packages are not
+reviewable.
 
 ### Omarchy themes
 
-The theme gate routes theme installs and updates through Guardian from two
+The theme & plugin gate routes theme installs and updates through Guardian from two
 places: the Bash interceptor catches `omarchy theme install/update` typed in
 an interactive Bash, and overrides in your Omarchy menu file
 (`~/.config/omarchy/extensions/omarchy-menu.jsonc`) point Install › Style ›
@@ -435,6 +519,29 @@ Themes with local or ignored modifications, submodules, or unresolved Git LFS
 files are refused. Direct invocations of Omarchy's theme binaries from
 elsewhere (scripts, other shells) are not intercepted.
 
+### Omarchy plugins
+
+Omarchy shell plugins run as unsandboxed code inside the long-lived
+`omarchy-shell`, so `omarchy plugin add` (or `install`) and `omarchy plugin
+update` go through `guardian-plugin`:
+
+- **Add:** the repository is cloned to a hidden staging directory and checked
+  with Omarchy's own `omarchy-plugin-validate`. It is then reviewed with
+  `guard --class plugin --identity plugin:<id>`, and only after a clear review
+  is the exact reviewed checkout moved into place and, if asked, enabled.
+- **Update:** each installed plugin's new commits are fetched into a staged
+  copy, fast-forwarded and validated, then reviewed as an upgrade of the
+  approved version. The installed plugin is fast-forwarded to exactly the
+  reviewed commit, taken from the staged copy rather than fetched from the
+  remote again, so a push between review and apply is never installed.
+  Plugins with local changes, rewritten remote history or submodules are
+  refused.
+
+Both routes are gated: the Bash interceptor catches the commands in an
+interactive Bash, and the theme & plugin gate's menu overrides point Setup ›
+Plugins › Add Plugin at Guardian. `omarchy plugin clone` copies Omarchy's own
+built-in plugins and is not gated.
+
 ### Removal
 
 ```sh
@@ -445,9 +552,9 @@ sudo pacman -R omarchy-guardian
 Removing the package removes the hook link. A hook at the same path that was
 installed by hand and runs Guardian is moved to
 `/etc/pacman.d/hooks/omarchy-guardian.hook.pacsave`, which pacman ignores.
-Turn the theme gate off in the TUI (or delete the marked Guardian line from
-`~/.bashrc` and the `guardian-theme` lines from the Omarchy menu file) to stop
-theme interception.
+Turn the theme & plugin gate off in the TUI (or delete the marked Guardian line from
+`~/.bashrc` and the `guardian-theme` and `guardian-plugin` lines from the Omarchy
+menu file) to stop theme and plugin interception.
 
 If pacman fails every install or upgrade with `Review package install scripts
 with Omarchy Guardian` followed by `call to execv failed (No such file or

@@ -23,7 +23,7 @@ use crate::engine::request::Request;
 use crate::engine::store::Store;
 use crate::error::Error;
 use crate::report::{AgentOutcome, AgentRun, LocalFinding};
-use crate::tools::OpenCode;
+use crate::tools::{OpenCode, Reviewer};
 
 const SECONDS_PER_DAY: u64 = 86_400;
 
@@ -93,6 +93,8 @@ pub struct Group<'a> {
     /// The review's units, for ranking a unit-relative top-level path (spec
     /// §4); independent of whether memory is enabled for this review.
     pub units: &'a [Unit],
+    /// Trusted facts for every request (see `Request::context`).
+    pub context: &'a [String],
 }
 
 /// What reviewing one group produced.
@@ -233,6 +235,7 @@ fn requests(group: &Group<'_>, plan: &Plan) -> Vec<Request> {
                 .cloned()
                 .collect(),
             items: items.clone(),
+            context: group.context.to_vec(),
         })
         .collect()
 }
@@ -376,12 +379,13 @@ impl Runner<'_> {
         }
     }
 
-    /// OpenCode's binary, resolved once.
+    /// The reviewer CLI's binary for this group's model, resolved once.
     fn binary(&mut self) -> Result<PathBuf, Error> {
         if let Some(binary) = &self.binary {
             return Ok(binary.clone());
         }
-        let binary = self.opencode.resolve()?;
+        let reviewer = Reviewer::for_model(self.group.settings.model.as_deref());
+        let binary = self.opencode.resolve_reviewer(reviewer)?;
         self.binary = Some(binary.clone());
         Ok(binary)
     }
@@ -485,6 +489,7 @@ mod tests {
             files,
             findings: &[],
             units: &[],
+            context: &[],
         }
     }
 

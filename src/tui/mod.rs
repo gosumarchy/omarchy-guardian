@@ -91,8 +91,9 @@ fn load_files() -> Loaded {
 /// The integration paths, knowing whether the pacman gate lacks the
 /// root-owned OpenCode its settings require.
 fn paths(settings: &Settings) -> Option<Paths> {
-    let opencode_missing =
-        !pacman::classes_requiring_ai(settings).is_empty() && !pacman::system_opencode_ready();
+    let opencode_missing = !pacman::classes_requiring_ai(settings).is_empty()
+        && !pacman::system_reviewer_ready(settings)
+        && pacman::system_reviewer_is_opencode(settings);
     Paths::real(opencode_missing)
 }
 

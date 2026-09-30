@@ -27,6 +27,51 @@ pub const BWRAP: &str = "/usr/bin/bwrap";
 
 /// Locations accepted for OpenCode when the review gates a root action.
 const SYSTEM_OPENCODE: &[&str] = &["/usr/bin/opencode", "/usr/local/bin/opencode"];
+/// Locations accepted for the Claude Code CLI when the review gates a root
+/// action.
+const SYSTEM_CLAUDE: &[&str] = &["/usr/bin/claude", "/usr/local/bin/claude"];
+
+/// The CLI that runs a review: OpenCode, or the Claude Code CLI for models
+/// written `claude-code/<model>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reviewer {
+    OpenCode,
+    ClaudeCode,
+}
+
+impl Reviewer {
+    /// The model prefix that selects the Claude Code CLI.
+    pub const CLAUDE_CODE_PREFIX: &'static str = "claude-code/";
+
+    pub fn for_model(model: Option<&str>) -> Self {
+        if model.is_some_and(|model| model.starts_with(Self::CLAUDE_CODE_PREFIX)) {
+            Self::ClaudeCode
+        } else {
+            Self::OpenCode
+        }
+    }
+
+    const fn program(self) -> &'static str {
+        match self {
+            Self::OpenCode => "opencode",
+            Self::ClaudeCode => "claude",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::OpenCode => "OpenCode",
+            Self::ClaudeCode => "the Claude Code CLI",
+        }
+    }
+
+    const fn system_paths(self) -> &'static [&'static str] {
+        match self {
+            Self::OpenCode => SYSTEM_OPENCODE,
+            Self::ClaudeCode => SYSTEM_CLAUDE,
+        }
+    }
+}
 
 const MAX_STDERR: usize = 64 * 1024;
 
@@ -45,22 +90,33 @@ pub enum OpenCode {
 
 impl OpenCode {
     pub fn resolve(&self) -> Result<PathBuf, Error> {
+        self.resolve_reviewer(Reviewer::OpenCode)
+    }
+
+    /// The reviewer CLI's binary under this policy.
+    pub fn resolve_reviewer(&self, reviewer: Reviewer) -> Result<PathBuf, Error> {
         match self {
             Self::UserPath => {
                 let path = env::var_os("PATH").unwrap_or_default();
-                find_in_path("opencode", &path).ok_or_else(|| {
-                    Error::Refused("the OpenCode CLI (`opencode`) was not found on PATH".into())
+                find_in_path(reviewer.program(), &path).ok_or_else(|| {
+                    Error::Refused(format!(
+                        "{} (`{}`) was not found on PATH",
+                        reviewer.label(),
+                        reviewer.program()
+                    ))
                 })
             }
             Self::SystemOnly => {
-                let candidate = SYSTEM_OPENCODE
+                let paths = reviewer.system_paths();
+                let candidate = paths
                     .iter()
                     .map(Path::new)
                     .find(|path| path.is_file())
                     .ok_or_else(|| {
                         Error::Refused(format!(
-                            "the pacman gate requires a root-owned OpenCode at {}",
-                            SYSTEM_OPENCODE.join(" or ")
+                            "the pacman gate requires a root-owned {} at {}",
+                            reviewer.label(),
+                            paths.join(" or ")
                         ))
                     })?;
                 let resolved = fs::canonicalize(candidate).at(candidate)?;
@@ -153,6 +209,40 @@ pub fn run(
     env: &[(&str, &str)],
     limits: Limits,
 ) -> Result<Captured, Error> {
+    run_with(program, args, input, env, limits, None)
+}
+
+/// Like `run`, in `directory`.
+pub fn run_in_with_input(
+    program: &Path,
+    args: &[OsString],
+    input: &[u8],
+    directory: &Path,
+    env: &[(&str, &str)],
+    limits: Limits,
+) -> Result<Captured, Error> {
+    run_with(program, args, Some(input), env, limits, Some(directory))
+}
+
+/// Like `run`, in `directory` and without input.
+pub fn run_in(
+    program: &Path,
+    args: &[OsString],
+    directory: &Path,
+    env: &[(&str, &str)],
+    limits: Limits,
+) -> Result<Captured, Error> {
+    run_with(program, args, None, env, limits, Some(directory))
+}
+
+fn run_with(
+    program: &Path,
+    args: &[OsString],
+    input: Option<&[u8]>,
+    env: &[(&str, &str)],
+    limits: Limits,
+    directory: Option<&Path>,
+) -> Result<Captured, Error> {
     let tool = program.file_name().map_or_else(
         || program.display().to_string(),
         |name| name.to_string_lossy().into_owned(),
@@ -174,6 +264,9 @@ pub fn run(
         .stderr(Stdio::piped());
     for (key, value) in env {
         command.env(key, value);
+    }
+    if let Some(directory) = directory {
+        command.current_dir(directory);
     }
 
     let mut child = command.spawn().map_err(|source| Error::Spawn {

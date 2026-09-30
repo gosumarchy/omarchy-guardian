@@ -29,18 +29,13 @@ pub struct ReviewContext<'a> {
     pub units: &'a [Unit],
     /// The review-memory store; `None` reviews without it.
     pub state_root: Option<&'a Path>,
+    /// Facts for the AI review (see `Request::context`).
+    pub context: &'a [String],
 }
 
 /// Reviews a file or directory tree as one source class.
 pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
-    let mut report = Report::new(config.root.display().to_string());
-    report.class = context.class;
-    report.profile = context
-        .settings
-        .profile_for(context.class)
-        .name()
-        .to_string();
-    report.ai_off_classes = ai_off_classes(context.settings, &[context.class]);
+    let mut report = collected_report(config.root.display().to_string(), context);
 
     let (snapshot, walk_gaps) = scan::walk(config, &mut |file: TextFile<'_>| {
         analyze_text(&mut report, file.rel, file.text, true);
@@ -57,10 +52,30 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
     } else {
         context.units.to_vec()
     };
+    review_collected(report, context, &units)
+}
+
+/// A report for files collected outside a tree walk (see `review_collected`).
+pub fn collected_report(subject: impl Into<String>, context: &ReviewContext<'_>) -> Report {
+    let mut report = Report::new(subject);
+    report.class = context.class;
+    report.profile = context
+        .settings
+        .profile_for(context.class)
+        .name()
+        .to_string();
+    report.ai_off_classes = ai_off_classes(context.settings, &[context.class]);
+    report
+}
+
+/// Runs the AI review of what `report` has queued, with the review memory
+/// for `units`, and records an approved baseline.
+pub fn review_collected(mut report: Report, context: &ReviewContext<'_>, units: &[Unit]) -> Report {
+    report.context = context.context.to_vec();
     let memory = match Memory::open(
         context.settings,
         context.class,
-        units.clone(),
+        units.to_vec(),
         context.state_root.map(Path::to_path_buf),
     ) {
         Ok(memory) => memory,
@@ -75,7 +90,7 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
         &mut report,
         context.settings,
         context.opencode,
-        &units,
+        units,
         memory.as_ref(),
     );
     if let Some(memory) = &memory {
@@ -127,6 +142,20 @@ pub fn analyze_text(report: &mut Report, rel: &str, text: &str, inspect_dependen
     if inspect_dependencies {
         deps::inspect(&mut report.dependencies, &mut report.gaps, rel, text);
     }
+}
+
+/// Queues a package payload file that acts on its own (see `payload`) for
+/// the AI review only. The local rules are written for scripts and code;
+/// these files are where legitimate services, rules and privileges live, so
+/// the rules' matches on them are noise. Returns whether it was queued: a
+/// class with `ai = off` does not review payload files at all.
+pub fn analyze_payload(report: &mut Report, rel: &str, text: &str) -> bool {
+    if report.ai_off_classes.contains(&report.class_of(rel)) {
+        return false;
+    }
+    report.text_files_reviewed += 1;
+    queue_for_agent(report, rel, text);
+    true
 }
 
 fn queue_for_agent(report: &mut Report, rel: &str, text: &str) {
@@ -240,6 +269,7 @@ pub fn run_agents(
             files: &files,
             findings: &findings,
             units,
+            context: &report.context,
         };
         let reviewed = engine::review_group(&group, opencode, memory);
         report.notes.extend(reviewed.notes);
@@ -330,6 +360,7 @@ mod tests {
             opencode,
             units: &[],
             state_root: None,
+            context: &[],
         }
     }
 

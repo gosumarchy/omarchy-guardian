@@ -248,10 +248,14 @@ impl AgentSettings {
     /// variant is marked, because OpenCode never received it.
     pub fn label(&self) -> String {
         let model = self.model.as_deref().unwrap_or("default model");
-        match (self.thinking, &self.variant) {
+        // The Claude Code CLI takes the level itself (`--effort`); OpenCode
+        // only through a mapped provider variant.
+        let applied =
+            self.variant.is_some() || model.starts_with(crate::tools::Reviewer::CLAUDE_CODE_PREFIX);
+        match (self.thinking, applied) {
             (Thinking::Default, _) => format!("{model} · default thinking"),
-            (level, Some(_)) => format!("{model} · {}", level.name()),
-            (level, None) => format!("{model} · {} (provider default)", level.name()),
+            (level, true) => format!("{model} · {}", level.name()),
+            (level, false) => format!("{model} · {} (provider default)", level.name()),
         }
     }
 }
@@ -423,5 +427,8 @@ mod tests {
         );
         settings.variant = Some("high".into());
         assert_eq!(settings.label(), "anthropic/claude-sonnet-5 · high");
+        settings.variant = None;
+        settings.model = Some("claude-code/claude-sonnet-5-5".into());
+        assert_eq!(settings.label(), "claude-code/claude-sonnet-5-5 · high");
     }
 }

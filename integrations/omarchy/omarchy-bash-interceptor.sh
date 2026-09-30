@@ -22,6 +22,14 @@ omarchy() {
         fi
         shift 2
         /usr/lib/omarchy-guardian/guardian-theme update "$@"
+    elif [[ ${1-} == plugin && ( ${2-} == add || ${2-} == install || ${2-} == update ) ]]; then
+        if _omarchy_guardian_help_requested "$@"; then
+            command /usr/share/omarchy/bin/omarchy "$@"
+            return
+        fi
+        local action=$2
+        shift 2
+        /usr/lib/omarchy-guardian/guardian-plugin "$action" "$@"
     else
         command /usr/share/omarchy/bin/omarchy "$@"
     fi
@@ -41,4 +49,20 @@ omarchy-theme-update() {
         return
     fi
     /usr/lib/omarchy-guardian/guardian-theme update "$@"
+}
+
+omarchy-plugin-add() {
+    if _omarchy_guardian_help_requested "$@"; then
+        command /usr/share/omarchy/bin/omarchy-plugin-add --help
+        return
+    fi
+    /usr/lib/omarchy-guardian/guardian-plugin add "$@"
+}
+
+omarchy-plugin-update() {
+    if _omarchy_guardian_help_requested "$@"; then
+        command /usr/share/omarchy/bin/omarchy-plugin-update --help
+        return
+    fi
+    /usr/lib/omarchy-guardian/guardian-plugin update "$@"
 }

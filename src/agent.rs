@@ -1,4 +1,5 @@
-//! The OpenCode security review.
+//! The AI security review, run by OpenCode or by the Claude Code CLI (for
+//! models written `claude-code/<model>`).
 //!
 //! The untrusted source goes to OpenCode on stdin, never in argv: Linux caps a
 //! single argument at 128 KiB (`MAX_ARG_STRLEN`) and argv is readable by every
@@ -13,11 +14,12 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use crate::config::model::AgentSettings;
+use crate::config::model::{AgentSettings, Thinking};
 use crate::error::{Error, IoContext};
 use crate::json::Json;
 use crate::report::Severity;
-use crate::tools::{self, Limits};
+use crate::sandbox::Workspace;
+use crate::tools::{self, Limits, Reviewer};
 
 const MAX_OUTPUT: usize = 4 * 1024 * 1024;
 
@@ -122,13 +124,27 @@ impl AgentError {
     }
 }
 
+/// Runs one review with `binary`, the CLI that `settings.model` selects
+/// (see `Reviewer::for_model`).
 pub fn review(
-    opencode: &Path,
+    binary: &Path,
     render: &dyn Fn(&str) -> String,
     settings: &AgentSettings,
 ) -> Result<AgentReview, AgentError> {
     let nonce = random_nonce().map_err(AgentError::Unavailable)?;
     let request = render(&nonce);
+    match Reviewer::for_model(settings.model.as_deref()) {
+        Reviewer::OpenCode => opencode_review(binary, &request, &nonce, settings),
+        Reviewer::ClaudeCode => claude_review(binary, &request, &nonce, settings),
+    }
+}
+
+fn opencode_review(
+    opencode: &Path,
+    request: &str,
+    nonce: &str,
+    settings: &AgentSettings,
+) -> Result<AgentReview, AgentError> {
     let config = opencode_config().to_string();
 
     let mut args: Vec<OsString> = [
@@ -171,7 +187,127 @@ pub fn review(
     // tried a tool or answered and then failed is invalid, not absent.
     let events = scan_events(&String::from_utf8_lossy(&captured.stdout));
     let failure = (!captured.status.success()).then(|| captured.failure_detail());
-    verdict(events, failure, &nonce)
+    verdict(events, failure, nonce)
+}
+
+/// Runs the Claude Code CLI with every built-in tool, MCP server, setting
+/// source and slash command switched off, from an empty private directory
+/// (so no project files or CLAUDE.md are read), without keeping a session.
+/// The request goes on stdin like OpenCode's.
+fn claude_review(
+    claude: &Path,
+    request: &str,
+    nonce: &str,
+    settings: &AgentSettings,
+) -> Result<AgentReview, AgentError> {
+    let model = settings
+        .model
+        .as_deref()
+        .and_then(|model| model.strip_prefix(Reviewer::CLAUDE_CODE_PREFIX))
+        .unwrap_or_default();
+    let mut args: Vec<OsString> = [
+        "--print",
+        "--output-format",
+        "json",
+        "--tools",
+        "",
+        "--strict-mcp-config",
+        "--setting-sources",
+        "",
+        "--no-session-persistence",
+        "--disable-slash-commands",
+        "--system-prompt",
+        SYSTEM_PROMPT,
+        "--model",
+        model,
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    if let Some(effort) = claude_effort(settings.thinking) {
+        args.extend(["--effort".into(), effort.into()]);
+    }
+    args.push(MESSAGE.into());
+
+    let workspace = Workspace::create("review").map_err(AgentError::Unavailable)?;
+    let captured = tools::run_in_with_input(
+        claude,
+        &args,
+        request.as_bytes(),
+        workspace.path(),
+        &[("NO_COLOR", "1")],
+        Limits {
+            timeout_secs: settings.timeout_secs,
+            max_output: MAX_OUTPUT,
+        },
+    )
+    .map_err(|error| match error {
+        Error::OutputTooLarge { .. } => AgentError::Invalid(error),
+        other => AgentError::Unavailable(other),
+    })?;
+    let failure = (!captured.status.success()).then(|| captured.failure_detail());
+    claude_verdict(&String::from_utf8_lossy(&captured.stdout), failure, nonce)
+}
+
+/// Guardian's portable thinking levels as Claude Code efforts.
+const fn claude_effort(thinking: Thinking) -> Option<&'static str> {
+    match thinking {
+        Thinking::Default => None,
+        Thinking::Minimal | Thinking::Low => Some("low"),
+        Thinking::Medium => Some("medium"),
+        Thinking::High => Some("high"),
+        Thinking::Max => Some("max"),
+    }
+}
+
+/// Classifies a Claude Code `--output-format json` result. More than one
+/// turn or any permission denial means the model tried to use a tool.
+fn claude_verdict(
+    output: &str,
+    failure: Option<String>,
+    nonce: &str,
+) -> Result<AgentReview, AgentError> {
+    let unavailable = |detail: String| {
+        AgentError::Unavailable(Error::ToolFailed {
+            tool: "claude".into(),
+            detail,
+        })
+    };
+    let Ok(result) = Json::parse(output.trim()) else {
+        return Err(match failure {
+            Some(detail) => unavailable(detail),
+            None => {
+                AgentError::Invalid(Error::parse("the Claude Code result", "not a JSON result"))
+            }
+        });
+    };
+    let turns = result.get("num_turns").and_then(Json::as_u64).unwrap_or(0);
+    let denials = result
+        .get("permission_denials")
+        .and_then(Json::as_array)
+        .is_some_and(|denials| !denials.is_empty());
+    if turns > 1 || denials {
+        return Err(AgentError::Invalid(Error::Refused(
+            "the Claude Code CLI attempted to use a tool during source review".into(),
+        )));
+    }
+    let text = result
+        .get("result")
+        .and_then(Json::as_str)
+        .unwrap_or_default();
+    if result.get("is_error").and_then(Json::as_bool) == Some(true) {
+        return Err(unavailable(if text.is_empty() {
+            failure.unwrap_or_else(|| "reported an error".into())
+        } else {
+            text.chars().take(300).collect()
+        }));
+    }
+    if text.is_empty() {
+        return Err(AgentError::Invalid(Error::Refused(
+            "the Claude Code CLI returned no review text".into(),
+        )));
+    }
+    parse_review(text, nonce).map_err(AgentError::Invalid)
 }
 
 fn random_nonce() -> Result<String, Error> {
@@ -417,16 +553,73 @@ mod tests {
     use std::fs;
 
     use super::{
-        AgentError, SourceFile, Status, parse_review, review, review_from_json, review_to_json,
-        scan_events, verdict,
+        AgentError, SourceFile, Status, claude_effort, claude_verdict, parse_review, review,
+        review_from_json, review_to_json, scan_events, verdict,
     };
     use crate::config::model::SourceClass;
     use crate::config::model::{AgentSettings, Thinking};
     use crate::engine::request::Request;
+    use crate::json::Json;
     use crate::report::Severity;
     use crate::test_support::{
         TempDir, mock_opencode, mock_opencode_failing, mock_opencode_output, mock_opencode_then,
     };
+    use crate::tools::Reviewer;
+
+    fn claude_result(turns: u64, denials: &str, is_error: bool, result: &str) -> String {
+        format!(
+            r#"{{"type":"result","subtype":"success","is_error":{is_error},"num_turns":{turns},"permission_denials":{denials},"result":{}}}"#,
+            Json::from(result)
+        )
+    }
+
+    #[test]
+    fn claude_code_results_are_judged_like_opencode_ones() {
+        let reply = r#"{"nonce":"n1","status":"clear","summary":"ok","findings":[]}"#;
+        let review = claude_verdict(&claude_result(1, "[]", false, reply), None, "n1").unwrap();
+        assert_eq!(review.status, Status::Clear);
+
+        // A tool attempt is a wrong answer, not an absent reviewer.
+        for output in [
+            claude_result(2, "[]", false, reply),
+            claude_result(1, r#"[{"tool_name":"Read"}]"#, false, reply),
+        ] {
+            assert!(matches!(
+                claude_verdict(&output, None, "n1"),
+                Err(AgentError::Invalid(_))
+            ));
+        }
+        // A provider error or a crash is an unavailable reviewer.
+        assert!(matches!(
+            claude_verdict(&claude_result(1, "[]", true, "rate limited"), None, "n1"),
+            Err(AgentError::Unavailable(_))
+        ));
+        assert!(matches!(
+            claude_verdict("", Some("exited with 1".into()), "n1"),
+            Err(AgentError::Unavailable(_))
+        ));
+        // The nonce must be echoed.
+        assert!(matches!(
+            claude_verdict(&claude_result(1, "[]", false, reply), None, "other"),
+            Err(AgentError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn claude_code_is_chosen_by_the_model_prefix() {
+        assert_eq!(
+            Reviewer::for_model(Some("claude-code/claude-sonnet-5-5")),
+            Reviewer::ClaudeCode
+        );
+        assert_eq!(
+            Reviewer::for_model(Some("anthropic/claude-sonnet-5-5")),
+            Reviewer::OpenCode
+        );
+        assert_eq!(Reviewer::for_model(None), Reviewer::OpenCode);
+        assert_eq!(claude_effort(Thinking::Default), None);
+        assert_eq!(claude_effort(Thinking::Minimal), Some("low"));
+        assert_eq!(claude_effort(Thinking::Max), Some("max"));
+    }
 
     /// The render closure for a single whole-file request.
     fn render(files: &[SourceFile]) -> impl Fn(&str) -> String + use<> {

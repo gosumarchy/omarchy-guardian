@@ -273,6 +273,9 @@ struct Statement {
     /// It pipes, redirects, or substitutes a command, so what it "prints"
     /// may be consumed or executed rather than shown.
     consumed: bool,
+    /// It substitutes a command or pipes or redirects anything, so it runs
+    /// something beyond declaring values.
+    substitutes: bool,
 }
 
 impl Statement {
@@ -280,6 +283,7 @@ impl Statement {
         Self {
             start,
             consumed: false,
+            substitutes: false,
         }
     }
 }
@@ -471,10 +475,12 @@ impl Shell<'_> {
                         }
                         '`' => {
                             statement.consumed = true;
+                            statement.substitutes = true;
                             stack.push(Context::Backtick);
                         }
                         '$' if next == '(' => {
                             statement.consumed = true;
+                            statement.substitutes = true;
                             stack.push(Context::Paren);
                             index += 1;
                         }
@@ -497,6 +503,9 @@ impl Shell<'_> {
                 }
                 '$' | '(' if (character == '(' || next == '(') => {
                     statement.consumed = true;
+                    // A plain `(` opens an array or a subshell; `$(` runs a
+                    // command in place.
+                    statement.substitutes |= character == '$';
                     let opener = if character == '$' { index + 1 } else { index };
                     if self.at(opener + 1) == '(' {
                         stack.extend([Context::Arithmetic, Context::Arithmetic]);
@@ -516,6 +525,7 @@ impl Shell<'_> {
                 }
                 '`' => {
                     statement.consumed = true;
+                    statement.substitutes = true;
                     if top == Some(Context::Backtick) {
                         stack.pop();
                     } else {
@@ -530,6 +540,7 @@ impl Shell<'_> {
                 }
                 '<' if !arithmetic && next == '<' => {
                     statement.consumed = true;
+                    statement.substitutes = true;
                     if self.at(index + 2) == '<' {
                         index += 3;
                         continue;
@@ -552,25 +563,28 @@ impl Shell<'_> {
                 }
                 '>' if stack.is_empty() => {
                     // A message sent to the terminal's stderr is still only shown.
-                    match self.terminal_redirect(index + 1) {
-                        Some(end) => {
-                            index = end;
-                            continue;
-                        }
-                        None => statement.consumed = true,
+                    if let Some(end) = self.terminal_redirect(index + 1) {
+                        index = end;
+                        continue;
                     }
+                    statement.consumed = true;
+                    statement.substitutes = true;
                 }
                 '|' | '&' | ';' if stack.is_empty() => {
                     let doubled = next == character;
                     if character == '|' && !doubled {
                         statement.consumed = true;
+                        statement.substitutes = true;
                     }
                     self.finish(&statement, index);
                     index += if doubled { 2 } else { 1 };
                     statement = Statement::at(index);
                     continue;
                 }
-                '<' | '>' | '|' => statement.consumed = true,
+                '<' | '>' | '|' => {
+                    statement.consumed = true;
+                    statement.substitutes = true;
+                }
                 '{' | '}'
                     if stack.is_empty()
                         && self.is_word_start(index)
@@ -740,6 +754,31 @@ impl Shell<'_> {
 
     /// Blanks what a finished statement only prints.
     fn finish(&mut self, statement: &Statement, end: usize) {
+        // A PKGBUILD's homepage and source array only declare where things
+        // are: makepkg never fetches `url`, and every source is listed and
+        // checked by the gate's own source check. Both stay visible when
+        // they run anything.
+        if self.pkgbuild && !statement.substitutes {
+            let (word, _) = self.command_word(statement.start, end);
+            let declared = word.split_once('=').is_some_and(|(name, _)| {
+                name == "url"
+                    || name == "source"
+                    || name.strip_prefix("source_").is_some_and(|arch| {
+                        !arch.is_empty()
+                            && arch.chars().all(|character| {
+                                character.is_ascii_alphanumeric() || character == '_'
+                            })
+                    })
+            });
+            if declared {
+                let start = self
+                    .words(statement.start, end)
+                    .first()
+                    .map_or(statement.start, |(start, _)| *start);
+                self.blank_quiet(start, end);
+                return;
+            }
+        }
         if statement.consumed {
             return;
         }
@@ -757,14 +796,6 @@ impl Shell<'_> {
                 if first != "-v" {
                     self.blank_quiet(arguments, end);
                 }
-            }
-            // The PKGBUILD's project homepage, which makepkg never fetches.
-            _ if self.pkgbuild && word.starts_with("url=") => {
-                let start = self
-                    .words(statement.start, end)
-                    .first()
-                    .map_or(statement.start, |(start, _)| *start);
-                self.blank_quiet(start, end);
             }
             _ => {}
         }
@@ -918,14 +949,22 @@ mod tests {
     }
 
     #[test]
-    fn pkgbuild_homepage_is_quiet() {
+    fn pkgbuild_homepage_and_sources_are_quiet() {
         assert_eq!(
             quiet(
                 "PKGBUILD",
-                "url=\"http://a.test\"\nsource=(\"http://b.test/x\")\n"
+                "url=\"http://a.test\"\nsource=(\"x.deb::http://b.test/x\"\n        \"http://c.test/y\")\nsource_x86_64=(\"http://d.test/z\")\n"
             ),
-            ["", "source=(\"http://b.test/x\")"]
+            ["", "", "", ""]
         );
+        // Anything that runs a command stays visible.
+        for text in [
+            "source=(\"$(curl -s http://a.test/list)\")\n",
+            "url=`curl http://a.test`\n",
+            "source=(\"http://a.test/x\") > /tmp/x\n",
+        ] {
+            assert!(quiet("PKGBUILD", text)[0].contains("http://"), "{text:?}");
+        }
         assert_eq!(
             quiet("other.sh", "url=\"http://a.test\"\n")[0],
             "url=\"http://a.test\""

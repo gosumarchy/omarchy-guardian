@@ -542,7 +542,7 @@ impl App {
             }
             Some(Item::Model) => "The OpenCode model that reviews for you and for pacman.",
             Some(Item::ProtectEverything) => {
-                "Turns on the pacman hook, the AUR gate and the theme gate (asks for sudo)."
+                "Turns on the pacman hook, the AUR gate and the theme & plugin gate (asks for sudo)."
             }
             Some(Item::Defaults) => "Back to Balanced and OpenCode's default model.",
             None => "",
@@ -555,7 +555,7 @@ const fn gate_name(gate: Integration) -> &'static str {
     match gate {
         Integration::PacmanHook => "pacman",
         Integration::AurGate => "AUR",
-        Integration::ThemeInterceptor => "themes",
+        Integration::ThemeInterceptor => "themes & plugins",
         Integration::MenuEntry => "menu",
     }
 }
