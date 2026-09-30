@@ -8,6 +8,7 @@ use crate::config::Settings;
 use crate::config::model::{AgentSettings, AiRequirement, Named, SourceClass};
 use crate::deps;
 use crate::engine::baseline::{Identity, Unit};
+use crate::engine::plan::HashOnly;
 use crate::engine::{self, Group, Memory};
 use crate::mask;
 use crate::osv;
@@ -38,8 +39,23 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
     let mut report = collected_report(config.root.display().to_string(), context);
 
     let (snapshot, walk_gaps) = scan::walk(config, &mut |file: TextFile<'_>| {
+        if file.lossy {
+            report.lossy_files += 1;
+        }
         analyze_text(&mut report, file.rel, file.text, true);
     });
+    report.hash_only = snapshot
+        .files()
+        .iter()
+        .filter_map(|file| {
+            file.format.map(|format| HashOnly {
+                path: file.path.clone(),
+                bytes: file.bytes,
+                label: format.label(),
+                media: format.is_media(),
+            })
+        })
+        .collect();
     report.snapshot = snapshot;
     report.gaps.extend(walk_gaps);
     if report.text_files_reviewed == 0 {
@@ -270,6 +286,7 @@ pub fn run_agents(
             findings: &findings,
             units,
             context: &report.context,
+            hash_only: &report.hash_only,
         };
         let reviewed = engine::review_group(&group, opencode, memory);
         report.notes.extend(reviewed.notes);

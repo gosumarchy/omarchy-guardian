@@ -64,6 +64,14 @@ pub enum Gap {
     UnresolvedLfs(String),
     SensitiveWithheld(String),
     AgentInputTooLarge,
+    /// A script, build or config file (or an executable file of unknown
+    /// format) that holds binary data.
+    Undecodable(String),
+    /// The tree passed a whole-tree limit (see `scan::Limits`).
+    TreeTooLarge {
+        files: usize,
+        bytes: u64,
+    },
     NoReviewableFiles,
     Agent(Error),
     Dependency(String),
@@ -90,6 +98,18 @@ impl fmt::Display for Gap {
             Self::SensitiveWithheld(path) => write!(
                 f,
                 "{path}: withheld from the AI provider because it looks sensitive"
+            ),
+            Self::Undecodable(path) => write!(
+                f,
+                "{path}: a script, build or config file holds binary data and cannot be reviewed"
+            ),
+            Self::TreeTooLarge { files, bytes } => write!(
+                f,
+                "source tree too large to review (stopped at {files} files, {} MiB; limits: {} files, {} MiB text, {} MiB hashed)",
+                bytes / (1024 * 1024),
+                crate::scan::Limits::DEFAULT.files,
+                crate::scan::Limits::DEFAULT.text_bytes / (1024 * 1024),
+                crate::scan::Limits::DEFAULT.hashed_bytes / (1024 * 1024)
             ),
             Self::AgentInputTooLarge => {
                 f.write_str("source exceeds the AI review input limit (max_input_kib × max_chunks)")
@@ -181,6 +201,10 @@ pub struct Report {
     pub snapshot: Snapshot,
     pub gaps: Vec<Gap>,
     pub text_files_reviewed: usize,
+    /// Text files decoded with replacement characters (a legacy encoding).
+    pub lossy_files: usize,
+    /// Files hashed but not read, named to the AI.
+    pub hash_only: Vec<crate::engine::plan::HashOnly>,
     pub findings: Vec<LocalFinding>,
     pub network: Vec<NetworkRequest>,
     pub agent_input: Vec<SourceFile>,
@@ -458,8 +482,16 @@ impl Report {
     }
 
     fn print_coverage(&self, show_hashes: bool, painter: Painter) {
+        let lossy = if self.lossy_files > 0 {
+            format!(
+                " ({} decoded with replacement characters)",
+                self.lossy_files
+            )
+        } else {
+            String::new()
+        };
         outln!(
-            "Coverage: {} text file(s) reviewed · {} binary file(s) hashed only · {} oversized text file(s) skipped",
+            "Coverage: {} text file(s) reviewed{lossy} · {} binary file(s) hashed only · {} oversized text file(s) skipped",
             self.text_files_reviewed,
             self.snapshot.count(FileKind::Binary),
             self.oversized_count()
@@ -479,6 +511,7 @@ impl Report {
                         FileKind::Text => "reviewed-text",
                         FileKind::Symlink => "symlink",
                         FileKind::Binary | FileKind::OversizedText => "hash-only",
+                        FileKind::Undecodable => "undecodable",
                     };
                     outln!("  {}  {kind}  {}", file.sha256, file.path);
                 }

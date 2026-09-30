@@ -64,6 +64,8 @@ pub enum Sent {
     Diff,
     Unchanged,
     Removed,
+    /// A binary file Guardian hashed but did not send.
+    HashOnly,
 }
 
 impl Sent {
@@ -73,6 +75,7 @@ impl Sent {
             Self::Diff => "diff",
             Self::Unchanged => "unchanged",
             Self::Removed => "removed",
+            Self::HashOnly => "hash-only",
         }
     }
 }
@@ -82,6 +85,79 @@ pub struct ManifestEntry {
     pub path: String,
     pub bytes: usize,
     pub sent: Sent,
+    /// The detected format of hash-only files.
+    pub format: Option<String>,
+    /// How many files a grouped entry stands for.
+    pub files: Option<usize>,
+}
+
+/// A file the review hashed but did not read: named to the AI with its
+/// format, so a supplied file that runs, loads or unpacks it is judged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HashOnly {
+    pub path: String,
+    pub bytes: u64,
+    pub label: &'static str,
+    /// Images, audio, video and fonts: grouped per directory.
+    pub media: bool,
+}
+
+/// The most hash-only manifest rows; the rest are counted in one row.
+const MAX_HASH_ONLY_ROWS: usize = 64;
+
+/// Manifest rows for hash-only files: one per file, except media, which get
+/// one row per directory.
+pub fn hash_only_entries(files: &[HashOnly]) -> Vec<ManifestEntry> {
+    let mut entries: Vec<ManifestEntry> = Vec::new();
+    let mut media: BTreeMap<String, (usize, usize, BTreeSet<&str>)> = BTreeMap::new();
+    for file in files {
+        let bytes = usize::try_from(file.bytes).unwrap_or(usize::MAX);
+        if file.media {
+            let directory = file
+                .path
+                .rsplit_once('/')
+                .map_or_else(String::new, |(directory, _)| format!("{directory}/"));
+            let group = media.entry(directory).or_default();
+            group.0 += 1;
+            group.1 = group.1.saturating_add(bytes);
+            group.2.insert(file.label);
+        } else {
+            entries.push(ManifestEntry {
+                path: file.path.clone(),
+                bytes,
+                sent: Sent::HashOnly,
+                format: Some(file.label.to_string()),
+                files: None,
+            });
+        }
+    }
+    for (directory, (count, bytes, labels)) in media {
+        entries.push(ManifestEntry {
+            path: if directory.is_empty() {
+                "./".into()
+            } else {
+                directory
+            },
+            bytes,
+            sent: Sent::HashOnly,
+            format: Some(labels.into_iter().collect::<Vec<_>>().join(", ")),
+            files: Some(count),
+        });
+    }
+    if entries.len() > MAX_HASH_ONLY_ROWS {
+        let rest = entries.split_off(MAX_HASH_ONLY_ROWS - 1);
+        entries.push(ManifestEntry {
+            path: "(more hash-only files)".into(),
+            bytes: rest
+                .iter()
+                .map(|entry| entry.bytes)
+                .fold(0, usize::saturating_add),
+            sent: Sent::HashOnly,
+            format: Some("various".into()),
+            files: Some(rest.iter().map(|entry| entry.files.unwrap_or(1)).sum()),
+        });
+    }
+    entries
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,6 +184,8 @@ pub struct PlanInput<'a> {
     /// The review's unit prefixes (`Unit::prefix`), so a unit-relative path
     /// like `good/install.sh` still ranks as top-level under `--unit`.
     pub unit_prefixes: &'a [String],
+    /// Files hashed but not read, listed in the manifest.
+    pub hash_only: &'a [HashOnly],
 }
 
 /// 0: entry points that run at install, build or login time, and flagged
@@ -192,7 +270,16 @@ pub fn build(input: &PlanInput<'_>) -> Result<Plan, TooLarge> {
         .filter(|(path, _)| !current.contains(path.as_str()))
         .collect();
 
+    let hash_only = hash_only_entries(input.hash_only);
     let overhead = input.findings_bytes
+        + hash_only
+            .iter()
+            .map(|entry| {
+                entry.path.len()
+                    + entry.format.as_ref().map_or(0, String::len)
+                    + MANIFEST_ENTRY_OVERHEAD
+            })
+            .sum::<usize>()
         + input
             .files
             .iter()
@@ -231,6 +318,8 @@ pub fn build(input: &PlanInput<'_>) -> Result<Plan, TooLarge> {
             path: file.path.clone(),
             bytes: file.content.len(),
             sent,
+            format: None,
+            files: None,
         });
     }
     for (path, content) in removed {
@@ -238,8 +327,11 @@ pub fn build(input: &PlanInput<'_>) -> Result<Plan, TooLarge> {
             path: path.clone(),
             bytes: content.len(),
             sent: Sent::Removed,
+            format: None,
+            files: None,
         });
     }
+    manifest.extend(hash_only);
 
     let chunks = pack(items, capacity)?;
     if chunks.len() > input.max_chunks {
@@ -398,6 +490,7 @@ mod tests {
             max_input_bytes,
             max_chunks,
             unit_prefixes: &[],
+            hash_only: &[],
         })
     }
 
@@ -495,6 +588,7 @@ mod tests {
                 max_input_bytes: 37 + 205,
                 max_chunks: 2,
                 unit_prefixes: &[],
+                hash_only: &[],
             }),
             Err(TooLarge)
         );
@@ -596,6 +690,7 @@ mod tests {
             max_input_bytes: 64 * 1024,
             max_chunks: 8,
             unit_prefixes: &[],
+            hash_only: &[],
         })
         .unwrap();
 
@@ -609,5 +704,33 @@ mod tests {
             [Sent::Whole, Sent::Diff, Sent::Unchanged, Sent::Removed].map(Sent::name),
             ["whole", "diff", "unchanged", "removed"]
         );
+    }
+
+    #[test]
+    fn hash_only_files_are_named_and_media_grouped_per_directory() {
+        let file = |path: &str, label: &'static str, media: bool| super::HashOnly {
+            path: path.into(),
+            bytes: 100,
+            label,
+            media,
+        };
+        let entries = super::hash_only_entries(&[
+            file("bin/tool", "ELF executable", false),
+            file("backgrounds/a.jpg", "JPEG image", true),
+            file("backgrounds/b.png", "PNG image", true),
+        ]);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, "bin/tool");
+        assert_eq!(entries[0].format.as_deref(), Some("ELF executable"));
+        assert_eq!(entries[1].path, "backgrounds/");
+        assert_eq!(entries[1].files, Some(2));
+        assert_eq!(entries[1].format.as_deref(), Some("JPEG image, PNG image"));
+
+        let many: Vec<super::HashOnly> = (0..500)
+            .map(|index| file(&format!("icons/{index}/a.png"), "PNG image", true))
+            .collect();
+        let entries = super::hash_only_entries(&many);
+        assert_eq!(entries.len(), 64);
+        assert_eq!(entries.last().unwrap().files, Some(437));
     }
 }

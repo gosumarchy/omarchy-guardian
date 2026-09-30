@@ -21,7 +21,7 @@ use crate::agent::{self, AgentError, AgentReview, SourceFile};
 use crate::config::Settings;
 use crate::config::model::{AgentSettings, AiRequirement, SourceClass, Toggle};
 use crate::engine::baseline::Unit;
-use crate::engine::plan::{ManifestEntry, Plan, PlanInput, Previous, Sent};
+use crate::engine::plan::{HashOnly, ManifestEntry, Plan, PlanInput, Previous, Sent};
 use crate::engine::request::Request;
 use crate::engine::store::Store;
 use crate::error::Error;
@@ -98,6 +98,8 @@ pub struct Group<'a> {
     pub units: &'a [Unit],
     /// Trusted facts for every request (see `Request::context`).
     pub context: &'a [String],
+    /// Files hashed but not read, named in every request's manifest.
+    pub hash_only: &'a [HashOnly],
 }
 
 /// What reviewing one group produced.
@@ -142,6 +144,7 @@ pub fn review_group(
         max_input_bytes: group.settings.max_input_bytes,
         max_chunks: group.settings.max_chunks,
         unit_prefixes: &unit_prefixes,
+        hash_only: group.hash_only,
     };
     // A tree identical to its approved version may have been approved by a
     // first review (a first install, or yay's second makepkg pass over it):
@@ -607,6 +610,7 @@ mod tests {
             findings: &[],
             units: &[],
             context: &[],
+            hash_only: &[],
         }
     }
 

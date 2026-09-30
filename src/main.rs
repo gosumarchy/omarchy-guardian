@@ -25,6 +25,7 @@ mod aur;
 mod classify;
 mod cli;
 mod config;
+mod content;
 mod deps;
 mod engine;
 mod error;

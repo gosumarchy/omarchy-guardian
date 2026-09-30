@@ -87,6 +87,7 @@ pub fn run(command: &[OsString], settings: &Settings) -> ExitCode {
             root: build_dir.clone(),
             include_ignored_dirs: true,
             excluded_top_level: vec!["src".into(), "pkg".into()],
+            limits: scan::Limits::DEFAULT,
         },
         show_hashes: false,
         class: SourceClass::Aur,
