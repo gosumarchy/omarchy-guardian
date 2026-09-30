@@ -33,6 +33,8 @@ pub enum Item {
         first_line: usize,
         last_line: usize,
         total_lines: usize,
+        /// The previous piece's last lines (from this line), for reference.
+        context: Option<(usize, String)>,
     },
     /// A unified diff against the approved version.
     Diff {
@@ -50,9 +52,13 @@ impl Item {
 
     fn cost(&self) -> usize {
         match self {
-            Self::Whole { path, content } | Self::Piece { path, content, .. } => {
-                path.len() + content.len()
-            }
+            Self::Whole { path, content } => path.len() + content.len(),
+            Self::Piece {
+                path,
+                content,
+                context,
+                ..
+            } => path.len() + content.len() + context.as_ref().map_or(0, |(_, text)| text.len()),
             Self::Diff { path, diff } => path.len() + diff.len(),
         }
     }
@@ -181,9 +187,21 @@ pub struct Plan {
 }
 
 /// The plan needs more than `max_chunks` requests, or the manifest and
-/// findings every request repeats leave too little room for source.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TooLarge;
+/// findings every request repeats leave too little room for source, or an
+/// entry point does not fit one request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TooLarge {
+    /// An install or build entry point larger than one request: it runs as
+    /// a whole, so it is not reviewed in pieces.
+    pub entry_point: Option<String>,
+}
+
+impl TooLarge {
+    pub const INPUT: Self = Self { entry_point: None };
+}
+
+/// The most lines a piece repeats from the previous piece.
+const MAX_CONTEXT_LINES: usize = 200;
 
 pub struct PlanInput<'a> {
     pub files: &'a [SourceFile],
@@ -303,7 +321,7 @@ pub fn build(input: &PlanInput<'_>) -> Result<Plan, TooLarge> {
             .map(|(path, _)| path.len() + MANIFEST_ENTRY_OVERHEAD)
             .sum::<usize>();
     if overhead.saturating_mul(2) > input.max_input_bytes {
-        return Err(TooLarge);
+        return Err(TooLarge::INPUT);
     }
     let capacity = input.max_input_bytes - overhead;
 
@@ -311,6 +329,14 @@ pub fn build(input: &PlanInput<'_>) -> Result<Plan, TooLarge> {
     let mut items = Vec::new();
     for (tier, _, file) in ranked {
         let sent = match choose(file, tier == 0, input.previous, capacity) {
+            Choice::Whole
+                if file.path.len() + file.content.len() > capacity
+                    && is_entry_point(&file.path, &file.content, input.unit_prefixes) =>
+            {
+                return Err(TooLarge {
+                    entry_point: Some(file.path.clone()),
+                });
+            }
             Choice::Whole => {
                 items.push(Item::Whole {
                     path: file.path.clone(),
@@ -348,7 +374,7 @@ pub fn build(input: &PlanInput<'_>) -> Result<Plan, TooLarge> {
 
     let chunks = pack(items, capacity)?;
     if chunks.len() > input.max_chunks {
-        return Err(TooLarge);
+        return Err(TooLarge::INPUT);
     }
     Ok(Plan {
         chunks,
@@ -414,35 +440,49 @@ fn split(item: Item, capacity: usize) -> Result<Vec<Item>, TooLarge> {
     }
     // Diffs are only chosen when they fit, and pieces are made only here.
     let Item::Whole { path, content } = item else {
-        return Err(TooLarge);
+        return Err(TooLarge::INPUT);
     };
     let room = capacity
         .checked_sub(path.len())
         .filter(|room| *room >= MIN_PIECE)
-        .ok_or(TooLarge)?;
+        .ok_or(TooLarge::INPUT)?;
 
     let lines: Vec<&str> = content.split_inclusive('\n').collect();
     let total_lines = lines.len();
-    let piece = |text: String, first_line: usize, last_line: usize| Item::Piece {
+    let piece = |text: String, first_line: usize, last_line: usize, context| Item::Piece {
         path: path.clone(),
         content: text,
         first_line,
         last_line,
         total_lines,
+        context,
     };
 
+    // Each piece after the first repeats up to an eighth of its room from
+    // the end of the previous one, so logic across a cut is seen together.
+    let budget = room / 8;
     let mut pieces = Vec::new();
     let mut text = String::new();
     let mut first_line = 1;
+    let mut context: Option<(usize, String)> = None;
+    let mut available = room;
     for (index, line) in lines.iter().enumerate() {
         let number = index + 1;
-        if !text.is_empty() && text.len() + line.len() > room {
-            pieces.push(piece(mem::take(&mut text), first_line, number - 1));
+        if !text.is_empty() && text.len() + line.len() > available {
+            let done = mem::take(&mut text);
+            let next = tail(&done, first_line, budget);
+            pieces.push(piece(done, first_line, number - 1, context.take()));
             first_line = number;
+            context = next;
+            available = room - context.as_ref().map_or(0, |(_, text)| text.len());
+        }
+        if line.len() > available {
+            context = None;
+            available = room;
         }
         if line.len() > room {
             for part in cut(line, room) {
-                pieces.push(piece(part.to_string(), number, number));
+                pieces.push(piece(part.to_string(), number, number, None));
             }
             first_line = number + 1;
             continue;
@@ -450,9 +490,30 @@ fn split(item: Item, capacity: usize) -> Result<Vec<Item>, TooLarge> {
         text.push_str(line);
     }
     if !text.is_empty() {
-        pieces.push(piece(text, first_line, total_lines));
+        pieces.push(piece(text, first_line, total_lines, context));
     }
     Ok(pieces)
+}
+
+/// The last lines of `text` (which starts at line `first_line`) within
+/// `budget` bytes and `MAX_CONTEXT_LINES`, with the number of the first.
+fn tail(text: &str, first_line: usize, budget: usize) -> Option<(usize, String)> {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut bytes = 0;
+    let mut kept = 0;
+    for line in lines.iter().rev().take(MAX_CONTEXT_LINES) {
+        if bytes + line.len() > budget {
+            break;
+        }
+        bytes += line.len();
+        kept += 1;
+    }
+    (kept > 0).then(|| {
+        (
+            first_line + lines.len() - kept,
+            lines[lines.len() - kept..].concat(),
+        )
+    })
 }
 
 /// Cuts `line` into parts of at most `room` bytes at character boundaries.
@@ -603,7 +664,60 @@ mod tests {
                 unit_prefixes: &[],
                 hash_only: &[],
             }),
-            Err(TooLarge)
+            Err(TooLarge::INPUT)
+        );
+    }
+
+    #[test]
+    fn a_piece_carries_the_tail_of_the_previous_piece() {
+        // Lines of 10 bytes; room 200 gives a 25-byte context budget.
+        let line = format!("{}\n", "z".repeat(9));
+        let files = [file("big.c", &line.repeat(40))];
+        let plan = plan(&files, None, 37 + 205, 8).unwrap();
+        let pieces: Vec<_> = plan
+            .chunks
+            .iter()
+            .flatten()
+            .map(|item| match item {
+                Item::Piece {
+                    first_line,
+                    context,
+                    content,
+                    ..
+                } => (*first_line, context.clone(), content.len()),
+                Item::Whole { .. } | Item::Diff { .. } => panic!("expected pieces, got {item:?}"),
+            })
+            .collect();
+        assert_eq!(pieces[0], (1, None, 200));
+        assert_eq!(pieces[1], (21, Some((19, line.repeat(2))), 180));
+        assert!(plan.chunks.iter().flatten().all(|item| item.cost() <= 205));
+    }
+
+    #[test]
+    fn an_entry_point_larger_than_a_chunk_is_too_large() {
+        let line = format!("{}\n", "x".repeat(99));
+        let files = [file("guardian.install", &line.repeat(5))];
+        assert_eq!(
+            plan(&files, None, 48 + 205, 8),
+            Err(TooLarge {
+                entry_point: Some("guardian.install".into())
+            })
+        );
+        // A flagged file that is not an entry point is still split.
+        let files = [file("lib/big.js", &line.repeat(5))];
+        let flagged = BTreeSet::from(["lib/big.js".to_string()]);
+        assert!(
+            build(&PlanInput {
+                files: &files,
+                flagged: &flagged,
+                findings_bytes: 0,
+                previous: None,
+                max_input_bytes: 42 + 205,
+                max_chunks: 8,
+                unit_prefixes: &[],
+                hash_only: &[],
+            })
+            .is_ok()
         );
     }
 
@@ -634,7 +748,7 @@ mod tests {
             .map(|index| file(&format!("f{index:03}.txt"), "x"))
             .collect();
         // 200 × (8 + 32) = 8000 bytes of manifest against a 10000-byte limit.
-        assert_eq!(plan(&files, None, 10_000, 64), Err(TooLarge));
+        assert_eq!(plan(&files, None, 10_000, 64), Err(TooLarge::INPUT));
     }
 
     #[test]

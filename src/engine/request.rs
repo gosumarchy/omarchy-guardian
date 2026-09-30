@@ -153,7 +153,10 @@ such as a change that newly calls into it."
                 " This request is chunk {index} of {count}; the other chunks are reviewed \
 separately, and the manifest lists every file of the source. Files in the manifest whose \
 content is not supplied here are reviewed in the other chunks: judge only the files supplied \
-in this chunk, and do not return inconclusive because the others are not here."
+in this chunk, and do not return inconclusive because the others are not here. A file sent as \
+a piece continues in other chunks; its context (the previous piece's last lines) is shown only \
+for reference. Judge the piece's own lines, and report as a finding any line whose danger \
+depends on code outside the piece."
             )
         } else {
             String::new()
@@ -239,15 +242,26 @@ fn item_json(item: &Item) -> Json {
             first_line,
             last_line,
             total_lines,
-        } => Json::object([
-            ("path", Json::from(path.as_str())),
-            ("kind", Json::from("piece")),
-            (
-                "lines",
-                Json::from(format!("{first_line}-{last_line} of {total_lines}")),
-            ),
-            ("content", Json::from(content.as_str())),
-        ]),
+            context,
+        } => {
+            let mut members = vec![
+                ("path", Json::from(path.as_str())),
+                ("kind", Json::from("piece")),
+                (
+                    "lines",
+                    Json::from(format!("{first_line}-{last_line} of {total_lines}")),
+                ),
+            ];
+            if let Some((from, text)) = context {
+                members.push((
+                    "context_lines",
+                    Json::from(format!("{from}-{}", first_line - 1)),
+                ));
+                members.push(("context", Json::from(text.as_str())));
+            }
+            members.push(("content", Json::from(content.as_str())));
+            Json::object(members)
+        }
         Item::Diff { path, diff } => Json::object([
             ("path", Json::from(path.as_str())),
             ("kind", Json::from("diff")),
@@ -343,6 +357,7 @@ Manifest entries sent as hash-only"
                 first_line: 3,
                 last_line: 4,
                 total_lines: 9,
+                context: Some((2, "w\n".into())),
             }],
         };
         let text = request.render("n");
@@ -356,7 +371,10 @@ Manifest entries sent as hash-only"
         assert!(text.contains(r#""manifest":[{"path":"src/b.c","bytes":10,"sent":"unchanged"}]"#));
         assert!(text.contains(r#""file":"PKGBUILD","line":4"#));
         assert!(text.contains(r#""excerpt":"sudo x""#));
-        assert!(text.contains(r#""kind":"piece","lines":"3-4 of 9""#));
+        assert!(text.contains(
+            r#""kind":"piece","lines":"3-4 of 9","context_lines":"2-2","context":"w\n","content""#
+        ));
+        assert!(text.contains("its context (the previous piece's last lines)"));
         assert_eq!(request.paths(), ["big.c"]);
     }
 }

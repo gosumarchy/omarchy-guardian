@@ -65,6 +65,8 @@ pub enum Gap {
     UnresolvedLfs(String),
     SensitiveWithheld(String),
     AgentInputTooLarge,
+    /// An install or build entry point larger than one AI request.
+    EntryPointTooLarge(String),
     /// A script, build or config file (or an executable file of unknown
     /// format) that holds binary data.
     Undecodable(String),
@@ -115,6 +117,10 @@ impl fmt::Display for Gap {
             Self::AgentInputTooLarge => {
                 f.write_str("source exceeds the AI review input limit (max_input_kib × max_chunks)")
             }
+            Self::EntryPointTooLarge(path) => write!(
+                f,
+                "{path}: an install or build entry point is larger than one AI request (max_input_kib); it cannot be reviewed in pieces"
+            ),
             Self::NoReviewableFiles => {
                 f.write_str("no readable text source files were available for review")
             }

@@ -311,7 +311,10 @@ pub fn run_agents(
         };
         let reviewed = engine::review_group(&group, opencode, memory);
         report.notes.extend(reviewed.notes);
-        if reviewed.too_large && !report.agent_input_overflowed {
+        if let Some(path) = reviewed.entry_point_too_large {
+            report.agent_input_overflowed = true;
+            report.gaps.push(Gap::EntryPointTooLarge(path));
+        } else if reviewed.too_large && !report.agent_input_overflowed {
             report.agent_input_overflowed = true;
             report.gaps.push(Gap::AgentInputTooLarge);
         }
@@ -751,6 +754,35 @@ mod tests {
         assert_eq!(
             report.decide(&|class| settings.policy(class)),
             Decision::Blocked(Blocked::Incomplete)
+        );
+    }
+
+    #[test]
+    fn an_oversized_entry_point_is_a_named_gap() {
+        let dir = TempDir::new("big-entry-point");
+        let script = "echo installing the package now\n".repeat(1300);
+        fs::write(dir.path().join("guardian.install"), script).unwrap();
+        let system = PartialConfig {
+            agent: AgentDefaults {
+                max_input_kib: Some(16),
+                ..AgentDefaults::default()
+            },
+            ..PartialConfig::default()
+        };
+        let settings = Settings::from_parts(system, PartialConfig::default());
+
+        let report = review_tree(
+            &ScanConfig::new(dir.path()),
+            &context(&settings, SourceClass::Source, &unavailable()),
+        );
+
+        assert!(report.agent_runs.is_empty());
+        assert!(
+            report.gaps.iter().any(
+                |gap| matches!(gap, Gap::EntryPointTooLarge(path) if path == "guardian.install")
+            ),
+            "{:?}",
+            report.gaps
         );
     }
 

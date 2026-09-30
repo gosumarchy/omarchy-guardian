@@ -111,6 +111,8 @@ pub struct GroupReview {
     pub invalid: Option<Error>,
     /// The plan needed more than `max_chunks` requests; nothing was sent.
     pub too_large: bool,
+    /// An entry point larger than one request; nothing was sent.
+    pub entry_point_too_large: Option<String>,
     /// Lines for the report: the upgrade summary and memory problems.
     pub notes: Vec<String>,
 }
@@ -173,21 +175,26 @@ pub fn review_group(
         // limit; a full review may still fit, so retry once without them
         // before giving up (a diff-mode review must never be less complete
         // than a full one would be).
-        Err(_) if previous.is_some() => {
-            let Ok(plan) = plan::build(&PlanInput {
+        Err(too_large) if previous.is_some() && too_large.entry_point.is_none() => {
+            let plan = match plan::build(&PlanInput {
                 previous: None,
                 ..input
-            }) else {
-                review.too_large = true;
-                return review;
+            }) {
+                Ok(plan) => plan,
+                Err(too_large) => {
+                    review.too_large = true;
+                    review.entry_point_too_large = too_large.entry_point;
+                    return review;
+                }
             };
             review.notes.push(
                 "the diff-mode plan needed too many chunks; reviewing in full instead".to_string(),
             );
             plan
         }
-        Err(_) => {
+        Err(too_large) => {
             review.too_large = true;
+            review.entry_point_too_large = too_large.entry_point;
             return review;
         }
     };
