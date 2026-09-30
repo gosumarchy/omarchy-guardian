@@ -179,7 +179,8 @@ used by the pacman gate remain under the user's control; a root-owned
 OpenCode configuration would be needed to close that, and Guardian does not
 set one up yet.
 
-- `omarchy-guardian setup` — interactive wizard that detects OpenCode, lets
+- `omarchy-guardian setup` — interactive wizard that detects OpenCode and
+  Claude Code (suggesting Claude Sonnet when `claude` is installed), lets
   you choose a profile, model(s) and thinking level, runs a two-sample test
   review, then writes the user file and (with confirmation) the root-owned
   system file.
@@ -368,13 +369,15 @@ model = "claude-code/claude-sonnet-5-5"
 ```
 
 (or pick it in `omarchy-guardian tui` or `setup`, which list the Claude Code
-models when `claude` is installed). Guardian runs `claude --print` with every
+models when `claude` is installed and suggest `claude-code/claude-sonnet-5-5`). Guardian runs `claude --print` with every
 built-in tool disabled (`--tools ""`), no MCP servers (`--strict-mcp-config`),
 no user, project or local settings, hooks or plugins (`--setting-sources ""`),
 no slash commands and no saved session, from an empty private working
-directory; the request goes on stdin. A reply that took more than one turn
-or had a permission denial counts as a tool attempt and makes the review
-invalid, and the reply must echo the nonce like OpenCode's. `thinking`
+directory; the request goes on stdin, and the reply is read as a
+`stream-json` transcript. A `tool_use` block in any assistant message, or a
+permission denial, counts as a tool attempt and makes the review invalid;
+the extra turn the CLI adds to continue a reply its safety classifier
+interrupted does not. The reply must echo the nonce like OpenCode's. `thinking`
 becomes `--effort` directly.
 
 For your own sources `claude` is found on `PATH`. The pacman gate, as with
@@ -387,7 +390,7 @@ not used for it, and `pacman-hook --preflight` says so.
 ```sh
 cd packaging/arch
 makepkg -si
-sudo pacman -S --needed extra/opencode      # the pacman gate's reviewer
+sudo pacman -S --needed claude-code         # the pacman gate's reviewer (or extra/opencode)
 sudo /usr/lib/omarchy-guardian/enable-system-hook.sh
 yay --makepkg /usr/lib/omarchy-guardian/guardian-makepkg --save -P --stats
 ```
@@ -401,14 +404,14 @@ invoking user's `~/.bashrc`.
 
 The pacman hook refuses every transaction it cannot review. While any pacman
 class requires the AI review (`third-party-repo` and `local-package` under
-`standard`; every class under `strict`), that needs a root-owned OpenCode: an
-OpenCode installed in your home directory (for example with `mise` or `npm`)
-is not accepted. Without one, every `pacman -U` would be refused, including
+`standard`; every class under `strict`), that needs a root-owned reviewer
+for the configured model (`/usr/bin/claude` from `claude-code` for a
+`claude-code/` model, otherwise `/usr/bin/opencode`): one installed in your
+home directory (for example with `mise` or `npm`) is not accepted. Without one, every `pacman -U` would be refused, including
 each AUR package yay installs. `enable-system-hook.sh` therefore runs
 `omarchy-guardian pacman-hook --preflight` as the invoking user first and does
-not enable the hook until it passes; `extra/opencode` provides
-`/usr/bin/opencode`. The pacman hook reviews as the invoking user, with that
-user's OpenCode configuration and credentials.
+not enable the hook until it passes. The pacman hook reviews as the invoking
+user, with that user's Claude login or OpenCode configuration and credentials.
 
 ### Pacman hook
 

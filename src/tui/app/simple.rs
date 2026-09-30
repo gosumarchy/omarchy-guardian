@@ -610,6 +610,28 @@ mod tests {
     }
 
     #[test]
+    fn the_model_picker_suggests_claude_code_when_nothing_is_set() {
+        let mut app = App::new(files(None), Mode::Simple);
+        let effects = press(&mut app, &[Key::Down, Key::Down, Key::Down, Key::Enter]);
+        let [effect @ Effect::LoadModels(_)] = &effects[..] else {
+            panic!("{effects:?}");
+        };
+        app.finish(
+            effect,
+            Ok("claude-code/claude-sonnet-5-5\nclaude-code/claude-haiku-4-5\nopencode/free".into()),
+        );
+        press(&mut app, &[Key::Enter]);
+        assert_eq!(
+            app.user.agent.model.as_deref(),
+            Some("claude-code/claude-sonnet-5-5")
+        );
+        assert_eq!(
+            app.system.agent.model.as_deref(),
+            Some("claude-code/claude-sonnet-5-5")
+        );
+    }
+
+    #[test]
     fn t_tests_the_saved_reviewer_and_shows_the_result() {
         let mut app = App::new(files(None), Mode::Simple);
         let effects = press(&mut app, &[Key::Char('t')]);

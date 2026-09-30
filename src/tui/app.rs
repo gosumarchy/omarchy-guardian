@@ -8,7 +8,7 @@ use crate::config::Settings;
 use crate::config::file::PartialConfig;
 use crate::config::load::FileStatus;
 use crate::config::model::{Named, Profile, SourceClass};
-use crate::setup::line_diff;
+use crate::setup::{self, line_diff};
 use crate::tui::canvas::{Canvas, Style, color};
 use crate::tui::fields::{Field, Input, Knob, Scope, Setting, validate};
 use crate::tui::integrations::{Integration, Paths, Plan, State};
@@ -647,9 +647,22 @@ impl App {
         let mut options = vec![self.inherit_label(field)];
         options.extend(self.models.iter().flatten().cloned());
         options.push("Type a model…".into());
-        let selected = current
-            .and_then(|value| options.iter().position(|option| *option == value))
-            .unwrap_or(0);
+        // With nothing set, the Claude Code model is suggested when the
+        // claude CLI listed it.
+        let suggested = (field.setting == Setting::AgentModel)
+            .then(|| {
+                options
+                    .iter()
+                    .position(|option| option == setup::SUGGESTED_CLAUDE_MODEL)
+            })
+            .flatten();
+        let selected = match current {
+            Some(value) => options
+                .iter()
+                .position(|option| *option == value)
+                .unwrap_or(0),
+            None => suggested.unwrap_or(0),
+        };
         self.dialog = Some(Dialog::Choice {
             field,
             options,

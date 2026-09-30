@@ -17,7 +17,8 @@ post_install() {
     printf '%s\n' \
         "omarchy-guardian is installed but not active." \
         "Enable the pacman hook and theme interception with:" \
-        "  sudo pacman -S --needed extra/opencode   (the pacman gate's reviewer)" \
+        "  sudo pacman -S --needed claude-code      (the pacman gate's reviewer;" \
+        "                                           or extra/opencode)" \
         "  sudo /usr/lib/omarchy-guardian/enable-system-hook.sh" \
         "Choose a profile, model and thinking level with:" \
         "  omarchy-guardian setup" \

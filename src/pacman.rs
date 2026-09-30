@@ -93,9 +93,9 @@ pub fn preflight(settings: &Settings, opencode_ready: bool) -> Result<(), String
     }
     let names: Vec<&str> = requiring.iter().map(|class| class.name()).collect();
     let fix = if system_reviewer_is_opencode(settings) {
-        "there is no root-owned OpenCode at /usr/bin/opencode or /usr/local/bin/opencode. Install it with: sudo pacman -S extra/opencode"
+        "there is no root-owned OpenCode at /usr/bin/opencode or /usr/local/bin/opencode. Install it with: sudo pacman -S extra/opencode, or install Claude Code (sudo pacman -S claude-code) and set the model to claude-code/claude-sonnet-5-5 in omarchy-guardian tui"
     } else {
-        "the model set for them runs through the Claude Code CLI, and there is no root-owned `claude` at /usr/bin/claude or /usr/local/bin/claude. Install Claude Code system-wide, or set an OpenCode model for the pacman gate"
+        "the model set for them runs through the Claude Code CLI, and there is no root-owned `claude` at /usr/bin/claude or /usr/local/bin/claude. Install it with: sudo pacman -S claude-code"
     };
     Err(format!(
         "{} packages require an AI review, so pacman would refuse every such install (including AUR packages yay installs with pacman -U): {fix}",

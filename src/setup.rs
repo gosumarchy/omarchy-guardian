@@ -28,6 +28,10 @@ pub trait Terminal {
 pub trait Environment {
     fn user_opencode(&self) -> Option<PathBuf>;
     fn system_opencode(&self) -> bool;
+    /// Whether the Claude Code CLI is on PATH.
+    fn user_claude(&self) -> bool;
+    /// Whether a root-owned Claude Code CLI exists for the pacman gate.
+    fn system_claude(&self) -> bool;
     fn models(&self) -> Vec<String>;
     fn test_review(&self, settings: &AgentSettings) -> Result<Duration, String>;
     fn existing_system(&self) -> Option<String>;
@@ -144,12 +148,14 @@ fn yes(terminal: &mut dyn Terminal, question: &str) -> bool {
 
 /// Picks a model; `None` means `fallback`, the model used when this choice
 /// is left unset (OpenCode's default, or the review model for official
-/// packages, because `[agent] model` applies to every class).
+/// packages, because `[agent] model` applies to every class). `suggested`
+/// is the default answer when it is listed.
 fn choose_model(
     terminal: &mut dyn Terminal,
     environment: &dyn Environment,
     question: &str,
     fallback: &str,
+    suggested: Option<&str>,
 ) -> Result<Option<String>, String> {
     let models = environment.models();
     if models.is_empty() {
@@ -164,7 +170,10 @@ fn choose_model(
             .map(|(index, model)| (Some(index), model.clone())),
     );
 
-    let picked = pick(terminal, question, &options, 0)?;
+    let default = suggested
+        .and_then(|model| models.iter().position(|listed| listed == model))
+        .map_or(0, |index| index + 1);
+    let picked = pick(terminal, question, &options, default)?;
     Ok(picked.map(|index| models[index].clone()))
 }
 
@@ -199,7 +208,8 @@ pub fn run(terminal: &mut dyn Terminal, environment: &dyn Environment) -> Result
     terminal.say("Omarchy Guardian setup\n");
 
     let has_opencode = environment.user_opencode().is_some();
-    announce_opencode(terminal, environment, has_opencode);
+    let has_claude = environment.user_claude();
+    announce_reviewer(terminal, environment, has_opencode, has_claude);
 
     let profiles: Vec<(Profile, String)> = Profile::ALL
         .iter()
@@ -210,7 +220,7 @@ pub fn run(terminal: &mut dyn Terminal, environment: &dyn Environment) -> Result
             )
         })
         .collect();
-    let default_profile = if has_opencode { 0 } else { 2 };
+    let default_profile = if has_opencode || has_claude { 0 } else { 2 };
     let profile = pick(terminal, "Profile:", &profiles, default_profile)?;
 
     let mut choice = Choice {
@@ -234,13 +244,25 @@ pub fn run(terminal: &mut dyn Terminal, environment: &dyn Environment) -> Result
     Ok(())
 }
 
-/// Explains what an unreachable or missing OpenCode means for this run.
-fn announce_opencode(
+/// Explains which reviewers this run can use, and what a missing one means.
+fn announce_reviewer(
     terminal: &mut dyn Terminal,
     environment: &dyn Environment,
     has_opencode: bool,
+    has_claude: bool,
 ) {
-    if has_opencode {
+    if has_claude {
+        terminal.say(&format!(
+            "Claude Code found: reviews can run through the claude CLI with your Claude login \
+(suggested: {SUGGESTED_CLAUDE_MODEL})."
+        ));
+        if !environment.system_claude() {
+            terminal.say(
+                "Note: the pacman gate only uses a root-owned claude at /usr/bin/claude; \
+install it with: sudo pacman -S claude-code",
+            );
+        }
+    } else if has_opencode {
         if !environment.system_opencode() {
             terminal.say(
                 "Note: the pacman gate only uses a root-owned OpenCode at /usr/bin/opencode or \
@@ -250,7 +272,8 @@ third-party packages are blocked (standard profile).",
         }
     } else {
         terminal.say(
-            "OpenCode was not found. local-only keeps source on this machine and needs no AI.",
+            "Neither OpenCode nor Claude Code was found. local-only keeps source on this machine \
+and needs no AI.",
         );
     }
 }
@@ -269,6 +292,7 @@ fn tune_agent(
             environment,
             "Model for reviews:",
             "OpenCode's default model",
+            environment.user_claude().then_some(SUGGESTED_CLAUDE_MODEL),
         )?;
         let official_fallback = choice.model.as_ref().map_or_else(
             || "OpenCode's default model".to_string(),
@@ -279,6 +303,7 @@ fn tune_agent(
             environment,
             "Model for official Arch/Omarchy packages (a fast model keeps updates quick):",
             &official_fallback,
+            None,
         )?;
 
         let levels: Vec<(Thinking, String)> = Thinking::ALL
@@ -471,6 +496,10 @@ fn read_answer(mut reader: impl BufRead) -> Option<String> {
 
 pub struct RealEnvironment;
 
+/// The model setup and the settings app suggest when the Claude Code CLI is
+/// installed.
+pub const SUGGESTED_CLAUDE_MODEL: &str = "claude-code/claude-sonnet-5-5";
+
 /// Models offered for the Claude Code CLI, as `claude-code/<model>`.
 const CLAUDE_CODE_MODELS: &[&str] = &[
     "claude-sonnet-5-5",
@@ -491,12 +520,21 @@ impl Environment for RealEnvironment {
         OpenCode::SystemOnly.resolve().is_ok()
     }
 
-    fn models(&self) -> Vec<String> {
-        // The Claude Code CLI takes these without a provider list to ask.
-        let mut models: Vec<String> = if OpenCode::UserPath
+    fn user_claude(&self) -> bool {
+        OpenCode::UserPath
             .resolve_reviewer(Reviewer::ClaudeCode)
             .is_ok()
-        {
+    }
+
+    fn system_claude(&self) -> bool {
+        OpenCode::SystemOnly
+            .resolve_reviewer(Reviewer::ClaudeCode)
+            .is_ok()
+    }
+
+    fn models(&self) -> Vec<String> {
+        // The Claude Code CLI takes these without a provider list to ask.
+        let mut models: Vec<String> = if self.user_claude() {
             CLAUDE_CODE_MODELS
                 .iter()
                 .map(|model| format!("{}{model}", Reviewer::CLAUDE_CODE_PREFIX))
@@ -690,8 +728,14 @@ mod tests {
     }
 
     #[derive(Default)]
+    #[expect(
+        clippy::struct_excessive_bools,
+        reason = "independent switches of a test double"
+    )]
     struct Fake {
         opencode: bool,
+        /// The Claude Code CLI is on PATH.
+        claude: bool,
         test_passes: bool,
         /// `opencode models` listed nothing.
         no_models: bool,
@@ -710,14 +754,29 @@ mod tests {
         fn system_opencode(&self) -> bool {
             false
         }
+        fn user_claude(&self) -> bool {
+            self.claude
+        }
+        fn system_claude(&self) -> bool {
+            false
+        }
         fn models(&self) -> Vec<String> {
             if self.no_models {
                 return Vec::new();
             }
-            vec![
+            let mut models: Vec<String> = if self.claude {
+                vec![
+                    "claude-code/claude-sonnet-5-5".into(),
+                    "claude-code/claude-haiku-4-5".into(),
+                ]
+            } else {
+                Vec::new()
+            };
+            models.extend([
                 "anthropic/claude-sonnet-5".into(),
                 "anthropic/claude-haiku-4-5".into(),
-            ]
+            ]);
+            models
         }
         fn test_review(&self, settings: &AgentSettings) -> Result<Duration, String> {
             self.tested.borrow_mut().push(settings.clone());
@@ -786,6 +845,30 @@ mod tests {
         let tested = vec![(Thinking::High, "high".to_string())];
         assert_eq!(user_config.agent.variants, tested);
         assert_eq!(system_config.agent.variants, tested);
+    }
+
+    #[test]
+    fn with_claude_code_installed_setup_suggests_it() {
+        let environment = Fake {
+            claude: true,
+            test_passes: true,
+            ..Fake::default()
+        };
+        // Every answer is the default: profile, model, official model,
+        // thinking, then confirm the system write.
+        let mut terminal = script(&["", "", "", "", "y"]);
+
+        run(&mut terminal, &environment).unwrap();
+
+        let user = environment.user_written.borrow().clone().unwrap();
+        let user_config = parse(Path::new("user"), &user).unwrap();
+        assert_eq!(user_config.profile, Some(Profile::Standard));
+        assert_eq!(
+            user_config.agent.model.as_deref(),
+            Some("claude-code/claude-sonnet-5-5")
+        );
+        assert!(terminal.output.contains("Claude Code found"));
+        assert!(terminal.output.contains("sudo pacman -S claude-code"));
     }
 
     #[test]
