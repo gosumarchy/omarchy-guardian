@@ -5,7 +5,7 @@
 # to turn on the pacman hook and the theme interceptor.
 
 pkgname=omarchy-guardian
-pkgver=0.3.1
+pkgver=0.3.2
 pkgrel=1
 pkgdesc='Reviews downloaded source, AUR builds, pacman scriptlets and Omarchy themes before they run'
 arch=('x86_64' 'aarch64')
