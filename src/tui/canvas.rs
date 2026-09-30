@@ -17,6 +17,7 @@ pub mod color {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Style {
     pub fg: Option<u8>,
+    pub bg: Option<u8>,
     pub bold: bool,
     pub dim: bool,
     pub reverse: bool,
@@ -25,6 +26,7 @@ pub struct Style {
 impl Style {
     pub const PLAIN: Self = Self {
         fg: None,
+        bg: None,
         bold: false,
         dim: false,
         reverse: false,
@@ -37,9 +39,21 @@ impl Style {
         }
     }
 
+    #[cfg(test)]
+    pub fn code(self) -> String {
+        self.sgr()
+    }
+
     pub const fn with_fg(self, color: u8) -> Self {
         Self {
             fg: Some(color),
+            ..self
+        }
+    }
+
+    pub const fn with_bg(self, color: u8) -> Self {
+        Self {
+            bg: Some(color),
             ..self
         }
     }
@@ -66,12 +80,14 @@ impl Style {
         if self.reverse {
             codes.push("7".into());
         }
-        if let Some(color) = self.fg {
-            codes.push(if color < 8 {
-                format!("{}", 30 + u32::from(color))
-            } else {
-                format!("{}", 90 + u32::from(color - 8))
-            });
+        for (color, normal, bright) in [(self.fg, 30, 90), (self.bg, 40, 100)] {
+            if let Some(color) = color {
+                codes.push(if color < 8 {
+                    format!("{}", normal + u32::from(color))
+                } else {
+                    format!("{}", bright + u32::from(color - 8))
+                });
+            }
         }
         format!("\x1b[{}m", codes.join(";"))
     }
@@ -241,6 +257,12 @@ mod tests {
         let mut canvas = Canvas::new(6, 3);
         canvas.frame(0, 0, 6, 3, Style::PLAIN);
         assert_eq!(canvas.rows(), ["╭────╮", "│    │", "╰────╯"]);
+    }
+
+    #[test]
+    fn styles_use_palette_codes_for_both_colours() {
+        assert_eq!(Style::fg(12).with_bg(0).code(), "\x1b[0;94;40m");
+        assert_eq!(Style::fg(1).bold().code(), "\x1b[0;1;31m");
     }
 
     #[test]

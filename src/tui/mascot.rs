@@ -1,26 +1,34 @@
-//! The Guardian: a small shield-knight drawn in half-block pixels, two
-//! pixel rows per terminal row. Its colour and eyes follow the protection
-//! state, and it blinks now and then.
+//! The Guardian: a small knight with a plumed helmet, a visor with glowing
+//! eyes and a heater shield, drawn in half-block pixels. Each terminal
+//! cell holds two pixels, the top one in the foreground colour of `▀` and
+//! the bottom one in its background, so the art has proper colours.
+//! Colours are palette entries, so the knight follows the terminal theme;
+//! its eyes show the mood, and it blinks now and then.
 
-use crate::tui::canvas::{Canvas, Style, color};
+use crate::tui::canvas::{Canvas, Style};
 
-pub const WIDTH: usize = 16;
+pub const WIDTH: usize = 18;
 pub const HEIGHT: usize = PIXELS.len() / 2;
 
-/// `#` is filled, `o` an eye, `.` empty.
-const PIXELS: [&str; 12] = [
-    ".......##.......",
-    "......####......",
-    "..############..",
-    ".##############.",
-    "################",
-    "###oo######oo###",
-    "###oo######oo###",
-    "################",
-    ".##############.",
-    "..############..",
-    "....########....",
-    "......####......",
+/// One character per pixel; see `palette` for the colours. `.` is empty
+/// and `e` is an eye.
+const PIXELS: [&str; 16] = [
+    "...........rrr....",
+    ".........rrrrR....",
+    "........rrR..R....",
+    "......bbbbbb......",
+    "....bbwwbbbbbb....",
+    "...bbwbbbbbbbbb...",
+    "...bkkkkkkkkkkb...",
+    "...bkeekkkkeekb...",
+    "...dbbbbbbbbbbd...",
+    "....dddddddddd....",
+    ".sssss.bbbbbb.....",
+    ".sfxfsbbbbbbbbb...",
+    ".sxxxs.ssssssdb...",
+    ".sfxfs.bbbbbb.....",
+    "..sfs..bb..bb.....",
+    "...s...dd..dd.....",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,51 +44,54 @@ pub enum Mood {
 }
 
 impl Mood {
-    const fn color(self) -> u8 {
+    /// The colour of the eyes behind the visor.
+    const fn eyes(self) -> u8 {
         match self {
-            Self::Calm => color::ACCENT,
-            Self::Vigilant => color::GREEN,
-            Self::Private => color::CYAN,
-            Self::Worried => color::YELLOW,
+            Self::Calm => 15,
+            Self::Vigilant => 10,
+            Self::Private => 14,
+            Self::Worried => 11,
         }
     }
 }
 
-/// Whether the pixel at `(column, row)` is lit. Eyes are open gaps; a
-/// blink closes their upper row, a worried look their lower one.
-fn lit(column: usize, row: usize, mood: Mood, blink: bool) -> bool {
-    let Some(pixel) = PIXELS.get(row).and_then(|line| line.as_bytes().get(column)) else {
-        return false;
-    };
-    match pixel {
-        b'#' => true,
-        b'o' => (blink && row == 5) || (mood == Mood::Worried && row == 6),
-        _ => false,
-    }
+/// The palette colour of one pixel, or `None` for an empty one.
+fn palette(pixel: u8, mood: Mood, blink: bool) -> Option<u8> {
+    Some(match pixel {
+        b'b' => 12,
+        b'd' => 4,
+        b'w' => 15,
+        b'k' => 0,
+        b'r' => 9,
+        b'R' | b'x' => 1,
+        b's' => 3,
+        b'f' => 7,
+        b'e' if blink => 0,
+        b'e' => mood.eyes(),
+        _ => return None,
+    })
 }
 
+fn pixel(column: usize, row: usize, mood: Mood, blink: bool) -> Option<u8> {
+    let pixel = *PIXELS.get(row)?.as_bytes().get(column)?;
+    palette(pixel, mood, blink)
+}
+
+/// Draws the knight with its top-left corner at `(x, y)`. Empty pixels are
+/// left untouched, so it never paints over what is around it.
 pub fn draw(canvas: &mut Canvas, x: usize, y: usize, mood: Mood, blink: bool) {
-    let style = Style::fg(mood.color()).bold();
     for text_row in 0..HEIGHT {
-        let line: String = (0..WIDTH)
-            .map(|column| {
-                match (
-                    lit(column, text_row * 2, mood, blink),
-                    lit(column, text_row * 2 + 1, mood, blink),
-                ) {
-                    (true, true) => '█',
-                    (true, false) => '▀',
-                    (false, true) => '▄',
-                    (false, false) => ' ',
-                }
-            })
-            .collect();
-        // Blank cells are skipped so the mascot never paints over what is
-        // around it.
-        for (column, character) in line.chars().enumerate() {
-            if character != ' ' {
-                canvas.text(x + column, y + text_row, &character.to_string(), style, 1);
-            }
+        for column in 0..WIDTH {
+            let top = pixel(column, text_row * 2, mood, blink);
+            let bottom = pixel(column, text_row * 2 + 1, mood, blink);
+            let (character, style) = match (top, bottom) {
+                (None, None) => continue,
+                (Some(top), None) => ("▀", Style::fg(top)),
+                (None, Some(bottom)) => ("▄", Style::fg(bottom)),
+                (Some(top), Some(bottom)) if top == bottom => ("█", Style::fg(top)),
+                (Some(top), Some(bottom)) => ("▀", Style::fg(top).with_bg(bottom)),
+            };
+            canvas.text(x + column, y + text_row, character, style, 1);
         }
     }
 }
@@ -89,7 +100,7 @@ pub fn draw(canvas: &mut Canvas, x: usize, y: usize, mood: Mood, blink: bool) {
 /// already wrapped to fit `width - 4`.
 pub fn bubble(canvas: &mut Canvas, x: usize, y: usize, width: usize, lines: &[String], tone: u8) {
     let height = lines.len() + 2;
-    let border = Style::fg(color::MUTED);
+    let border = Style::fg(crate::tui::canvas::color::MUTED);
     canvas.frame(x + 1, y, width.saturating_sub(1), height, border);
     canvas.text(x, y + 1, "╴", border, 1);
     canvas.text(x + 1, y + 1, "┤", border, 1);
@@ -106,7 +117,7 @@ pub fn bubble(canvas: &mut Canvas, x: usize, y: usize, width: usize, lines: &[St
 
 #[cfg(test)]
 mod tests {
-    use super::{HEIGHT, Mood, WIDTH, draw};
+    use super::{HEIGHT, Mood, PIXELS, WIDTH, draw, palette};
     use crate::tui::canvas::Canvas;
 
     fn art(mood: Mood, blink: bool) -> Vec<String> {
@@ -116,32 +127,57 @@ mod tests {
     }
 
     #[test]
-    fn draws_a_shield_with_open_eyes() {
+    fn every_pixel_has_a_colour_and_rows_line_up() {
+        for row in PIXELS {
+            assert_eq!(row.len(), WIDTH, "{row}");
+            for pixel in row.bytes() {
+                assert!(
+                    pixel == b'.' || palette(pixel, Mood::Calm, false).is_some(),
+                    "{}",
+                    pixel as char
+                );
+            }
+        }
+        assert_eq!(PIXELS.len() % 2, 0);
+    }
+
+    /// The shapes as drawn; the colours were checked by rendering a
+    /// terminal capture back to pixels.
+    #[test]
+    fn draws_the_knight_in_half_blocks() {
         assert_eq!(
             art(Mood::Calm, false),
             [
-                "      ▄██▄",
-                " ▄████████████▄",
-                "███▀▀██████▀▀███",
-                "███▄▄██████▄▄███",
-                " ▀████████████▀",
-                "    ▀▀████▀▀",
+                "         ▄▄██▀",
+                "      ▄▄▀▀▀▄ ▀",
+                "   ▄█▀▀▀██████▄",
+                "   ██▀▀████▀▀██",
+                "   ▀▀▀▀▀▀▀▀▀▀▀▀",
+                " █▀▀▀█▄██████▄▄",
+                " █▀█▀█ ▀▀▀▀▀▀▀▀",
+                "  ▀▀▀  ▀▀  ▀▀",
             ]
         );
     }
 
     #[test]
-    fn blinking_and_worry_change_only_the_eyes() {
-        let open = art(Mood::Calm, false);
-        let blink = art(Mood::Calm, true);
-        let worried = art(Mood::Worried, false);
-        assert_ne!(open[2], blink[2]);
-        assert_eq!(open[3], blink[3]);
-        assert_eq!(open[2], worried[2]);
-        assert_ne!(open[3], worried[3]);
-        for row in [0, 1, 4, 5] {
-            assert_eq!(open[row], blink[row]);
-            assert_eq!(open[row], worried[row]);
+    fn moods_and_blinks_only_change_the_visor_row() {
+        let render = |mood, blink| {
+            let mut canvas = Canvas::new(WIDTH, HEIGHT);
+            draw(&mut canvas, 0, 0, mood, blink);
+            canvas
+                .render()
+                .split("\x1b[")
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let calm = art(Mood::Calm, false);
+        for (mood, blink) in [(Mood::Worried, false), (Mood::Calm, true)] {
+            let other = art(mood, blink);
+            for row in (0..HEIGHT).filter(|row| *row != 3) {
+                assert_eq!(calm[row], other[row], "{mood:?} {blink} row {row}");
+            }
+            assert_ne!(render(Mood::Calm, false), render(mood, blink));
         }
     }
 }
