@@ -9,6 +9,7 @@ use crate::config::model::{AgentSettings, AiRequirement, Named, SourceClass};
 use crate::deps;
 use crate::engine::baseline::{Identity, Unit};
 use crate::engine::{self, Group, Memory};
+use crate::mask;
 use crate::osv;
 use crate::report::{AgentOutcome, Decision, Gap, LocalFinding, NetworkRequest, Report};
 use crate::rules::{self, RuleId, Scheme};
@@ -107,15 +108,17 @@ pub fn analyze_text(report: &mut Report, rel: &str, text: &str, inspect_dependen
     queue_for_agent(report, rel, text);
 
     let documentation = rules::is_documentation(rel);
-    let inventory_network = rules::is_executable_or_runtime_config(rel);
-    for (index, line) in text.lines().enumerate() {
-        let number = index + 1;
-        if inventory_network {
-            record_network(report, rel, number, line);
-        }
-        if !documentation {
-            let lowered = line.to_lowercase();
-            for rule in rules::line_rules(&lowered) {
+    let inventory_network = !documentation && rules::is_executable_or_runtime_config(rel);
+    if !documentation {
+        let masked = mask::lines(rel, text);
+        for (index, (line, view)) in text.lines().zip(&masked).enumerate() {
+            let number = index + 1;
+            if inventory_network {
+                record_network(report, rel, number, line, &view.quiet);
+            }
+            let code = view.code.to_lowercase();
+            let quiet = view.quiet.to_lowercase();
+            for rule in rules::line_rules(&code, &quiet) {
                 push_finding(report, rel, number, line, rule);
             }
         }
@@ -140,8 +143,10 @@ fn queue_for_agent(report: &mut Report, rel: &str, text: &str) {
     });
 }
 
-fn record_network(report: &mut Report, rel: &str, number: usize, line: &str) {
-    for (scheme, host) in rules::extract_network_destinations(line) {
+/// Records the destinations in `active`, the line without comments and
+/// printed messages; `line` is the original, shown as the excerpt.
+fn record_network(report: &mut Report, rel: &str, number: usize, line: &str, active: &str) {
+    for (scheme, host) in rules::extract_network_destinations(active) {
         if !rules::is_local_host(&host) {
             if scheme == Scheme::Http {
                 push_finding(report, rel, number, line, RuleId::CleartextNetworkRequest);

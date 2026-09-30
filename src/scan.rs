@@ -66,6 +66,10 @@ pub enum FileKind {
     Binary,
     /// Text too large to review; makes the scan incomplete.
     OversizedText,
+    /// A relative symbolic link to a file or directory the review covers.
+    /// Its digest is over the link text, so retargeting it changes the
+    /// snapshot.
+    Symlink,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,15 +100,19 @@ impl Snapshot {
         self.files.iter().filter(|file| file.kind == kind).count()
     }
 
-    /// One digest over the whole manifest: path, NUL, hex digest and a
-    /// reviewed-text flag per file.
+    /// One digest over the whole manifest: path, NUL, hex digest and a kind
+    /// byte per file (1 reviewed text, 2 symbolic link, 0 otherwise).
     pub fn manifest_digest(&self) -> Digest {
         let mut hasher = Sha256::new();
         for file in &self.files {
             hasher.update(file.path.as_bytes());
             hasher.update(&[0]);
             hasher.update(file.sha256.to_string().as_bytes());
-            hasher.update(&[u8::from(file.kind == FileKind::Text)]);
+            hasher.update(&[match file.kind {
+                FileKind::Text => 1,
+                FileKind::Symlink => 2,
+                FileKind::Binary | FileKind::OversizedText => 0,
+            }]);
             hasher.update(b"\n");
         }
         hasher.finalize()
@@ -183,7 +191,7 @@ impl Walker<'_> {
         let shown = logical.display().to_string();
 
         if file_type.is_symlink() {
-            self.gaps.push(Gap::Symlink(shown));
+            self.symlink(access, logical, rel);
         } else if file_type.is_dir() {
             match open_verified(access, &metadata) {
                 Ok(directory) => self.directory(&directory, logical, &rel),
@@ -197,6 +205,81 @@ impl Walker<'_> {
         } else {
             self.gaps.push(Gap::SpecialFile(shown));
         }
+    }
+
+    /// Records a link that stays inside the reviewed tree; anything else is
+    /// a gap. Links are never followed: the file or directory they name is
+    /// reviewed where it is.
+    fn symlink(&mut self, access: &Path, logical: &Path, rel: String) {
+        if logical == self.config.root {
+            return self.gaps.push(Gap::Symlink(logical.display().to_string()));
+        }
+        let target = match fs::read_link(access) {
+            Ok(target) => target,
+            Err(error) => return self.io_gap(logical, error),
+        };
+        match target.to_str() {
+            Some(target) if self.is_in_tree_target(&rel, target) => {
+                let mut hasher = Sha256::new();
+                hasher.update(b"symlink\0");
+                hasher.update(target.as_bytes());
+                self.files.push(FileHash {
+                    path: rel,
+                    sha256: hasher.finalize(),
+                    kind: FileKind::Symlink,
+                });
+            }
+            Some(_) | None => self.gaps.push(Gap::Symlink(logical.display().to_string())),
+        }
+    }
+
+    /// Whether the link at `rel` names, relative to its own directory, an
+    /// existing regular file or directory that the walk reviews. `..` may
+    /// only lead the target and never climb above the root. The link's own
+    /// ancestors are real directories (the walk never follows links), and
+    /// every component after them must be too, so the lexical resolution
+    /// is the real one.
+    fn is_in_tree_target(&self, rel: &str, target: &str) -> bool {
+        if target.is_empty() || target.starts_with('/') {
+            return false;
+        }
+        let mut resolved: Vec<&str> = rel.split('/').collect();
+        resolved.pop();
+        let mut leading = true;
+        for component in target.split('/') {
+            match component {
+                "" | "." => {}
+                ".." if leading => {
+                    if resolved.pop().is_none() {
+                        return false;
+                    }
+                }
+                ".." => return false,
+                name => {
+                    leading = false;
+                    resolved.push(name);
+                }
+            }
+        }
+        if resolved.is_empty() {
+            return false;
+        }
+
+        let mut path = self.config.root.clone();
+        for (index, name) in resolved.iter().enumerate() {
+            if self.config.skips(name, index == 0) {
+                return false;
+            }
+            path.push(name);
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                return false;
+            };
+            let last = index + 1 == resolved.len();
+            if !(metadata.is_dir() || (last && metadata.is_file())) {
+                return false;
+            }
+        }
+        true
     }
 
     fn directory(&mut self, directory: &File, logical: &Path, rel: &str) {
@@ -411,6 +494,63 @@ mod tests {
         let (_, _, gaps) = walk_texts(&ScanConfig::new(dir.path()));
         assert!(gaps.iter().any(|gap| matches!(gap, Gap::Symlink(_))));
         assert!(gaps.iter().any(|gap| matches!(gap, Gap::NonUtf8Name(_))));
+    }
+
+    #[test]
+    fn relative_links_inside_the_tree_are_recorded_not_followed() {
+        let dir = TempDir::new("in-tree-links");
+        fs::create_dir_all(dir.path().join("LICENSES")).unwrap();
+        fs::create_dir_all(dir.path().join("docs")).unwrap();
+        fs::write(dir.path().join("LICENSE"), "0BSD\n").unwrap();
+        symlink("../LICENSE", dir.path().join("LICENSES/0BSD.txt")).unwrap();
+        symlink("docs", dir.path().join("documentation")).unwrap();
+        let config = ScanConfig::new(dir.path());
+
+        let (texts, snapshot, gaps) = walk_texts(&config);
+        assert!(gaps.is_empty(), "{gaps:?}");
+        assert_eq!(texts, ["LICENSE"]);
+        assert_eq!(snapshot.count(FileKind::Symlink), 2);
+
+        // Retargeting a link changes the snapshot.
+        fs::remove_file(dir.path().join("LICENSES/0BSD.txt")).unwrap();
+        symlink("../LICENSES", dir.path().join("LICENSES/0BSD.txt")).unwrap();
+        assert!(verify_unchanged(&config, &snapshot).is_err());
+    }
+
+    #[test]
+    fn links_leaving_or_hiding_from_the_review_are_refused() {
+        let outside = TempDir::new("link-outside");
+        fs::write(outside.path().join("secret"), "x\n").unwrap();
+
+        for (name, target) in [
+            (
+                "absolute",
+                outside.path().join("secret").display().to_string(),
+            ),
+            ("escapes", "../secret".to_string()),
+            ("climbs-back", "sub/../../secret".to_string()),
+            ("dangling", "missing".to_string()),
+            ("into-git", ".git/config".to_string()),
+            ("into-ignored", "node_modules/x.js".to_string()),
+            ("through-link", "alias/file".to_string()),
+        ] {
+            let dir = TempDir::new("link-refused");
+            fs::create_dir_all(dir.path().join(".git")).unwrap();
+            fs::create_dir_all(dir.path().join("node_modules")).unwrap();
+            fs::create_dir_all(dir.path().join("sub")).unwrap();
+            fs::write(dir.path().join(".git/config"), "x\n").unwrap();
+            fs::write(dir.path().join("node_modules/x.js"), "x\n").unwrap();
+            fs::write(dir.path().join("sub/file"), "x\n").unwrap();
+            symlink(outside.path(), dir.path().join("alias")).unwrap();
+            symlink(&target, dir.path().join(name)).unwrap();
+
+            let (_, _, gaps) = walk_texts(&ScanConfig::new(dir.path()));
+            assert!(
+                gaps.iter()
+                    .any(|gap| matches!(gap, Gap::Symlink(path) if path.ends_with(name))),
+                "{name} -> {target}: {gaps:?}"
+            );
+        }
     }
 
     #[test]

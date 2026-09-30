@@ -70,17 +70,27 @@ pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report
 
     let (archives, classes) = match operation {
         Operation::Sync => sync_archives(&targets, settings)?,
-        Operation::LocalUpgrade => (local_archives(&argv, &args.cwd)?, HashMap::new()),
+        Operation::LocalUpgrade => {
+            // `pacman -U` installs missing dependencies from the sync
+            // repositories in the same transaction; those are found and
+            // classed like `-S` targets.
+            let mut archives = local_archives(&argv, &args.cwd)?;
+            let dependencies = missing_targets(&targets, &archives);
+            if dependencies.is_empty() {
+                (archives, HashMap::new())
+            } else {
+                let (synced, classes) = sync_archives(&dependencies, settings)?;
+                archives.extend(synced);
+                (archives, classes)
+            }
+        }
     };
 
     for target in &targets {
-        let class = match operation {
-            Operation::Sync => classes
-                .get(target)
-                .copied()
-                .unwrap_or(SourceClass::ThirdPartyRepo),
+        let class = classes.get(target).copied().unwrap_or(match operation {
+            Operation::Sync => SourceClass::ThirdPartyRepo,
             Operation::LocalUpgrade => SourceClass::LocalPackage,
-        };
+        });
         match archives.get(target) {
             Some(Ok(paths)) => {
                 for archive in paths {
@@ -229,6 +239,15 @@ fn local_archives(argv: &[String], cwd: &Path) -> Result<Archives, Error> {
         ));
     }
     Ok(archives)
+}
+
+/// Transaction targets that no archive on the command line provides.
+fn missing_targets(targets: &[String], archives: &Archives) -> Vec<String> {
+    targets
+        .iter()
+        .filter(|target| !archives.contains_key(*target))
+        .cloned()
+        .collect()
 }
 
 /// One repository's offer of a package: the version pacman would install and
@@ -481,8 +500,8 @@ mod tests {
     use std::process::Command;
 
     use super::{
-        Operation, is_valid_package_name, local_archives, parse_operation, parse_sync_info,
-        read_targets, scan_install_script, split_cmdline,
+        Archives, Operation, is_valid_package_name, local_archives, missing_targets,
+        parse_operation, parse_sync_info, read_targets, scan_install_script, split_cmdline,
     };
     use crate::agent::{AgentReview, Status};
     use crate::config::Settings;
@@ -515,6 +534,14 @@ mod tests {
         for line in ["pacman -Rns foo", "pacman -Qs foo", "pacman -- -S"] {
             assert!(parse_operation(&argv(line)).is_err(), "{line}");
         }
+    }
+
+    #[test]
+    fn upgrade_dependencies_are_the_targets_without_a_local_archive() {
+        let mut archives = Archives::new();
+        archives.insert("built".into(), Ok(vec!["built-1-1-any.pkg.tar".into()]));
+        let targets = ["built".to_string(), "repo-dependency".to_string()];
+        assert_eq!(missing_targets(&targets, &archives), ["repo-dependency"]);
     }
 
     #[test]

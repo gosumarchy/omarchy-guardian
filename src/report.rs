@@ -482,10 +482,10 @@ impl Report {
             if show_hashes {
                 outln!("Per-file SHA-256:");
                 for file in files {
-                    let kind = if file.kind == FileKind::Text {
-                        "reviewed-text"
-                    } else {
-                        "hash-only"
+                    let kind = match file.kind {
+                        FileKind::Text => "reviewed-text",
+                        FileKind::Symlink => "symlink",
+                        FileKind::Binary | FileKind::OversizedText => "hash-only",
                     };
                     outln!("  {}  {kind}  {}", file.sha256, file.path);
                 }

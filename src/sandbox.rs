@@ -4,7 +4,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -154,8 +154,10 @@ const BWRAP_ARGS: &[&str] = &[
     "/home/guardian/.config",
 ];
 
-/// Copies regular files and directories, skipping `.git` like the review
-/// does, and refusing anything else.
+/// Copies regular files, directories and symbolic links (as links, never
+/// followed), skipping `.git` like the review does, and refusing anything
+/// else. The copy is verified against the reviewed snapshot afterwards, which
+/// only accepts links that stay inside the tree.
 fn copy_tree(source: &Path, destination: &Path, total: &mut u64) -> Result<(), Error> {
     let metadata = fs::symlink_metadata(source).at(source)?;
     if !metadata.is_dir() {
@@ -197,10 +199,8 @@ fn copy_tree(source: &Path, destination: &Path, total: &mut u64) -> Result<(), E
             }
             fs::copy(&from, &to).at(&from)?;
         } else if file_type.is_symlink() {
-            return Err(Error::Refused(format!(
-                "refusing to copy symbolic link {}",
-                from.display()
-            )));
+            let target = fs::read_link(&from).at(&from)?;
+            symlink(&target, &to).at(&to)?;
         } else {
             return Err(Error::Refused(format!(
                 "unsupported file type: {}",
@@ -215,6 +215,7 @@ fn copy_tree(source: &Path, destination: &Path, total: &mut u64) -> Result<(), E
 mod tests {
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::path::Path;
 
     use super::{BWRAP_ARGS, Workspace, copy_tree};
     use crate::test_support::TempDir;
@@ -237,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_omits_git_metadata_and_refuses_symlinks() {
+    fn copy_omits_git_metadata_and_keeps_symlinks_as_links() {
         let root = TempDir::new("sandbox-copy");
         let source = root.path().join("source");
         fs::create_dir_all(source.join(".git")).unwrap();
@@ -250,8 +251,16 @@ mod tests {
         assert!(!root.path().join("copied/.git").exists());
         assert_eq!(total, "fn main() {}\n".len() as u64);
 
-        symlink(source.join("main.rs"), source.join("linked.rs")).unwrap();
+        symlink("main.rs", source.join("linked.rs")).unwrap();
         let mut total = 0;
-        assert!(copy_tree(&source, &root.path().join("second"), &mut total).is_err());
+        copy_tree(&source, &root.path().join("second"), &mut total).unwrap();
+        let copied = root.path().join("second/linked.rs");
+        assert!(
+            fs::symlink_metadata(&copied)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&copied).unwrap(), Path::new("main.rs"));
     }
 }
