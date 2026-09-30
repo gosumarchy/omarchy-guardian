@@ -274,7 +274,17 @@ fn local_archives(argv: &[String], cwd: &Path) -> Result<Archives, Error> {
         }
 
         let path = cwd.join(argument);
-        let metadata = fs::symlink_metadata(&path).at(&path)?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound && Path::new(argument).is_relative() =>
+            {
+                return Err(Error::Refused(format!(
+                    "cannot find {argument} relative to pacman's working directory ({}); run pacman -U with an absolute path",
+                    cwd.display()
+                )));
+            }
+            other => other.at(&path)?,
+        };
         if !metadata.is_file() {
             return Err(Error::Refused(format!(
                 "not a regular package archive: {}",

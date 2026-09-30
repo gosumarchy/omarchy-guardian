@@ -243,9 +243,10 @@ pacman_gate() {
     mkdir -p "$packages" "$E2E/pkg" "$fakes"
 
     # Stand-ins for the process that runs the hook. The hook must stay a child
-    # (no exec), so its parent's argv and working directory are the fake's.
+    # (no exec), so its parent's argv is the fake's. Like libalpm, they keep
+    # the starting directory open and move to / before running the hook.
     for name in pacman yay; do
-        printf '#!/bin/sh\n/bin/sh %s\nstatus=$?\nexit "$status"\n' "'$hook'" >"$fakes/$name"
+        printf '#!/bin/sh\nexec 3<.\ncd /\n/bin/sh %s\nstatus=$?\nexit "$status"\n' "'$hook'" >"$fakes/$name"
         chmod +x "$fakes/$name"
     done
 
@@ -289,6 +290,8 @@ pacman_gate() {
     archive=$packages/guardian-plain-1-1-x86_64.pkg.tar.zst
     pacman_hook "$E2E/pkg" guardian-plain pacman -U "$archive" >/dev/null
     expect 'package without install script is limited' 0 "$?"
+    pacman_hook "$packages" guardian-plain pacman -U guardian-plain-1-1-x86_64.pkg.tar.zst >/dev/null
+    expect "a relative archive is found in the directory pacman started in" 0 "$?"
 
     pacman_hook "$E2E/pkg" does-not-exist pacman -U "$packages/does-not-exist.pkg.tar.zst" >/dev/null 2>&1
     expect 'missing archive is refused' 2 "$?"
