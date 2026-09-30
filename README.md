@@ -432,15 +432,35 @@ not used for it, and `pacman-hook --preflight` says so.
 ## Install (Arch Linux / Omarchy)
 
 ```sh
-cd packaging/arch
-makepkg -si
-sudo pacman -S --needed claude-code         # the pacman gate's reviewer (or extra/opencode)
-sudo /usr/lib/omarchy-guardian/enable-system-hook.sh
-yay --makepkg /usr/lib/omarchy-guardian/guardian-makepkg --save -P --stats
+git clone https://github.com/gosumarchy/omarchy-guardian
+cd omarchy-guardian
+./install.sh
 ```
 
-Or open `omarchy-guardian tui` and choose *Protect everything*, which does the
-same after showing each step.
+The installer checks for a Rust toolchain (rustup's `cargo` is fine), builds
+and tests the package, installs it with pacman, makes sure there is an AI
+reviewer (it offers `claude-code`), runs the guided setup on a first
+install, turns every gate on with `omarchy-guardian protect` after showing
+each step, and tests the reviewer with a malicious and a harmless sample.
+It asks for sudo only for the steps that need it, and skips what is already
+done. To upgrade: `git pull && ./install.sh`.
+
+By hand, the same steps are:
+
+```sh
+cd packaging/arch
+makepkg -fd                                   # -d: rustup's cargo is not a pacman package
+sudo pacman -U "$PWD"/omarchy-guardian-*-x86_64.pkg.tar.zst
+sudo pacman -S --needed claude-code           # the pacman gate's reviewer (or extra/opencode)
+omarchy-guardian setup
+omarchy-guardian protect                      # or: omarchy-guardian tui › Protect everything
+```
+
+`omarchy-guardian protect` turns on the pacman hook, the yay AUR gate, the
+theme & plugin gate and the Omarchy menu entry, showing each step and asking
+first (`--yes` skips the question). It leaves the pacman hook off when the
+pacman gate could not review with the current settings. `omarchy-guardian
+test` runs the two-sample reviewer test from the terminal.
 
 Installing the package activates nothing. `enable-system-hook.sh` links the
 pacman hook into `/etc/pacman.d/hooks/` and adds the theme interceptor to the

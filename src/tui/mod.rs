@@ -16,6 +16,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::cli::Confirm;
 use crate::config::Settings;
 use crate::config::load::{self, SYSTEM_PATH};
 use crate::config::model::{AgentSettings, Named, SourceClass};
@@ -28,7 +29,7 @@ use crate::setup::{self, Environment as _};
 use app::{App, Effect, Loaded, Mode, Task};
 use canvas::Canvas;
 use fields::{HEADER, Scope};
-use integrations::{Paths, Plan, Step};
+use integrations::{Integration, Paths, Plan, State, Step};
 use term::Terminal;
 
 pub fn run(expert: bool) -> Result<(), String> {
@@ -165,46 +166,116 @@ fn save_user(text: &str) -> Result<String, String> {
 
 fn integration(terminal: &mut Terminal, plan: &Plan) -> Result<String, String> {
     let paths = paths(&Settings::load()).ok_or("HOME is not set")?;
-    let run_steps = || -> Result<String, String> {
-        for step in &plan.steps {
-            match step {
-                Step::Command(argv) | Step::Optional(argv) => {
-                    let Some((program, args)) = argv.split_first() else {
-                        continue;
-                    };
-                    let mut command = Command::new(program);
-                    command.args(args);
-                    if matches!(step, Step::Optional(_)) {
-                        command
-                            .stdin(Stdio::null())
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null());
-                    }
-                    let status = command.status();
-                    let succeeded = status.as_ref().is_ok_and(std::process::ExitStatus::success);
-                    if !succeeded && matches!(step, Step::Command(_)) {
-                        return Err(match status {
-                            Ok(status) => format!("{} exited with {status}", argv.join(" ")),
-                            Err(error) => format!("{program}: {error}"),
-                        });
-                    }
+    if plan.needs_terminal() {
+        on_terminal(terminal, false, || run_plan(&paths, plan))
+    } else {
+        run_plan(&paths, plan)
+    }
+}
+
+/// Runs a plan's steps in order; a failed command stops it.
+fn run_plan(paths: &Paths, plan: &Plan) -> Result<String, String> {
+    for step in &plan.steps {
+        match step {
+            Step::Command(argv) | Step::Optional(argv) => {
+                let Some((program, args)) = argv.split_first() else {
+                    continue;
+                };
+                let mut command = Command::new(program);
+                command.args(args);
+                if matches!(step, Step::Optional(_)) {
+                    command
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null());
                 }
-                Step::RemoveInterceptor
-                | Step::AddMenuEntry
-                | Step::RemoveMenuEntry
-                | Step::AddThemeMenu
-                | Step::RemoveThemeMenu => {
-                    paths.edit(step)?;
+                let status = command.status();
+                let succeeded = status.as_ref().is_ok_and(std::process::ExitStatus::success);
+                if !succeeded && matches!(step, Step::Command(_)) {
+                    return Err(match status {
+                        Ok(status) => format!("{} exited with {status}", argv.join(" ")),
+                        Err(error) => format!("{program}: {error}"),
+                    });
+                }
+            }
+            Step::RemoveInterceptor
+            | Step::AddMenuEntry
+            | Step::RemoveMenuEntry
+            | Step::AddThemeMenu
+            | Step::RemoveThemeMenu => {
+                paths.edit(step)?;
+            }
+        }
+    }
+    Ok(format!("{}: done.", plan.summary))
+}
+
+/// The gates that protect installs, plus the menu entry: what
+/// `omarchy-guardian protect` and the installer turn on.
+const PROTECT: [Integration; 4] = [
+    Integration::PacmanHook,
+    Integration::AurGate,
+    Integration::ThemeInterceptor,
+    Integration::MenuEntry,
+];
+
+/// `omarchy-guardian protect`: turns on every gate that is off, after
+/// showing each step and, unless `yes`, asking. The pacman hook is left off
+/// when the pacman gate could not review with the current settings, since it
+/// would refuse every such install.
+pub fn protect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String> {
+    let settings = Settings::load();
+    let paths = paths(&settings).ok_or("HOME is not set")?;
+    let mut steps = Vec::new();
+    let mut notes = Vec::new();
+    for integration in PROTECT {
+        let state = paths.state(integration);
+        match &state {
+            State::On => notes.push(format!("✓ {} is on", integration.label())),
+            State::Unavailable(reason) => {
+                notes.push(format!("- {}: {reason}", integration.label()));
+            }
+            _ => {
+                if integration == Integration::PacmanHook
+                    && !paths.opencode_missing
+                    && let Err(reason) =
+                        pacman::preflight(&settings, pacman::system_reviewer_ready(&settings))
+                {
+                    notes.push(format!("✗ {} left off: {reason}", integration.label()));
+                    continue;
+                }
+                if let Some(plan) = paths.plan(integration, &state) {
+                    steps.extend(plan.steps);
                 }
             }
         }
-        Ok(format!("{}: done.", plan.summary))
-    };
-    if plan.needs_terminal() {
-        on_terminal(terminal, false, run_steps)
-    } else {
-        run_steps()
     }
+    for note in &notes {
+        println!("{note}");
+    }
+    if steps.is_empty() {
+        return Ok("Nothing to turn on.".into());
+    }
+    let plan = Plan {
+        summary: "Protect everything".into(),
+        steps,
+    };
+    println!("\nTo turn the rest on, Guardian will:");
+    for line in plan.describe(&paths) {
+        println!("  {line}");
+    }
+    if !yes && !confirm.confirm("Go ahead?") {
+        return Err("nothing was changed".into());
+    }
+    run_plan(&paths, &plan)
+}
+
+/// `omarchy-guardian test`: the settings app's reviewer test; false when a
+/// check failed.
+pub fn test() -> (String, bool) {
+    let report = test_reviewer(&Settings::load());
+    let passed = !report.lines().any(|line| line.starts_with('✗'));
+    (report, passed)
 }
 
 fn report(task: Task) -> String {
