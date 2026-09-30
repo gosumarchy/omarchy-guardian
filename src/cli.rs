@@ -20,6 +20,7 @@ use crate::sandbox;
 use crate::scan::{self, ScanConfig};
 use crate::setup;
 use crate::tools::OpenCode;
+use crate::tui;
 
 const USAGE: &str = "\
 Usage:
@@ -30,6 +31,7 @@ Usage:
   omarchy-guardian config show [--class CLASS] | check | path
   omarchy-guardian forget <identity> | --all
   omarchy-guardian setup
+  omarchy-guardian tui                              (settings, integrations and maintenance)
 
 CLASS: aur, theme, plugin, source (default). PROFILE: standard, strict, local-only.
 ID names what is reviewed for the review memory, e.g. aur:yay-bin.
@@ -61,6 +63,7 @@ enum Invocation {
     Config(ConfigCommand),
     Forget(Forget),
     Setup,
+    Tui,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -142,6 +145,13 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {
                 eprintln!("omarchy-guardian setup: {message}");
+                ExitCode::from(2)
+            }
+        },
+        Invocation::Tui => match tui::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("omarchy-guardian tui: {message}");
                 ExitCode::from(2)
             }
         },
@@ -446,6 +456,7 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
         Some("config") => parse_config(rest).map(Invocation::Config),
         Some("forget") => parse_forget(rest).map(Invocation::Forget),
         Some("setup") if rest.is_empty() => Ok(Invocation::Setup),
+        Some("tui" | "settings") if rest.is_empty() => Ok(Invocation::Tui),
         _ => Err(format!("unknown command {:?}", command.to_string_lossy())),
     }
 }
@@ -965,6 +976,9 @@ mod tests {
     fn parses_setup() {
         assert_eq!(parse(&args(&["setup"])).unwrap(), Invocation::Setup);
         assert!(parse(&args(&["setup", "extra"])).is_err());
+        assert_eq!(parse(&args(&["tui"])).unwrap(), Invocation::Tui);
+        assert_eq!(parse(&args(&["settings"])).unwrap(), Invocation::Tui);
+        assert!(parse(&args(&["tui", "extra"])).is_err());
     }
 
     #[test]

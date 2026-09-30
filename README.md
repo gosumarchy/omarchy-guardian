@@ -22,6 +22,8 @@ omarchy-guardian sandbox ./theme-checkout -- /usr/bin/true
   command (`exec`) only if the review was clear and nothing changed.
   `--exclude NAME` (repeatable) leaves a top-level directory out of both the
   review and the snapshot.
+- `tui` (or `settings`) opens the settings app: a full-screen terminal UI in
+  Omarchy's style (see [Settings app](#settings-app)).
 - `sandbox` reviews, copies the tree to a private temporary directory, proves
   the copy matches the reviewed snapshot, and runs the command in Bubblewrap
   with the network isolated, no host home directory and a read-only system.
@@ -38,6 +40,29 @@ under `ai = required`, a declined confirmation, or a usage error. Once `guard`
 or `sandbox` starts the command, the exit code is the command's own (128 +
 signal if it was killed). Guardian announces on stderr when it starts the
 command, so its own blocks can be told apart from the command's failures.
+
+## Settings app
+
+`omarchy-guardian tui` edits every setting without touching TOML by hand.
+It installs a launcher entry ("Omarchy Guardian") that opens as a floating
+window, and can add itself to the Omarchy menu under Setup › Guardian.
+
+| Tab | What it changes |
+|---|---|
+| Profiles | the profile for your own sources (user file) and for the pacman gate (system file) |
+| Sources | every knob of every source class; pacman-enforced classes in the system file, the rest in the user file |
+| AI | model, input size and call limits for your sources and for the pacman gate, review-memory limits, official repositories |
+| Integrations | turn the pacman hook, the yay AUR gate, the theme install gate and the Omarchy menu entry on or off |
+| Maintenance | show and check the effective settings, edit either file in `$EDITOR`, see or forget the review memory, run the guided setup |
+
+Unset values show what they inherit and from where. Keys: `↑↓` move,
+`Tab`/`1`–`5` switch tabs, `Enter` edit, `Space` cycle a choice, `x` reset to
+inherit, `u` undo, `s` save, `q` quit. Every edit is checked with the same
+parser that reads the files, so the app cannot save a file Guardian would
+reject. The user file is written directly (a hand-written one is kept as
+`config.toml.bak`, since comments are not preserved). The system file is
+saved only after showing a diff, with `sudo`, like `setup` does. A file that
+does not parse cannot be edited in the app; fix it with Maintenance › Edit.
 
 ## Profiles and settings
 
@@ -238,26 +263,36 @@ review it in full every time.
 ## What is checked
 
 - **Local rules** on every text file except prose (`*.md`, `*.rst`, `README`,
-  license texts such as `LICENSE.txt`, `COPYING.LESSER` or anything under
-  `LICENSES/`, ...): download-to-shell pipelines, encoded command execution,
+  license and legal texts such as `LICENSE.txt`, `COPYING.LESSER`,
+  `terms.html` or anything under `LICENSES/`, PKGBUILD `*.changelog` files, ...): download-to-shell pipelines, encoded command execution,
   credential file access, destructive commands (a recursive `rm` of `/` or
   `$HOME` itself, `mkfs`, raw-disk writes), persistence, shell execution,
   privilege escalation, disabled TLS verification and likely credential
   exfiltration. Identifier patterns respect word boundaries, so `retrieval(`
-  and `model.eval()` do not match `eval(`. Making Chromium's `chrome-sandbox` helper
-  setuid (`chmod 4755 .../chrome-sandbox`), which every Chromium and Electron
-  package does, is not a privilege-escalation finding. Comments are skipped (shell and
-  other `#` languages, `//` and `/* */` in C-like languages, Lua `--`), as are
-  the removed lines of a patch. In shell scripts, text that is only printed
+  and `model.eval()` do not match `eval(`. Making a Chromium-family sandbox
+  helper setuid root (`chmod 4755` or `chown root` of `chrome-sandbox`,
+  `msedge-sandbox`, `opera_sandbox`, ...), which every Chromium and Electron
+  package does, is not a privilege-escalation finding. A persistence path a
+  PKGBUILD writes into its own package (`"$pkgdir"/etc/profile.d/...`,
+  without `..`) is a package file, not persistence. A `mkfs.*` program that is
+  only installed, copied or linked is not run, so it is not a destructive
+  command. Comments are skipped (shell and
+  other `#` languages, `//` and `/* */` in C-like languages, Lua `--`, and
+  comment lines a patch adds to a file of one of those languages). Lines a
+  patch removes are skipped by the same checks as printed text below, since
+  `patch -R` would apply them. In shell scripts, text that is only printed
   (`echo` and `printf` arguments, `cat <<EOF` bodies, when nothing pipes,
   redirects or substitutes them) is skipped by the persistence, privilege,
   credential-file, TLS and network checks, so install notes like
   `echo "run: sudo systemctl enable foo"` are not findings; download-to-shell,
   encoded execution, destructive commands and shell execution still match
-  printed text. Prose, comments and messages are still sent to the AI review.
+  printed text. Nothing printed is skipped in a script that redefines `echo`,
+  `printf` or `cat`, enables aliases, pipes anything into an interpreter
+  (`f | sh`, `| sudo bash`, `| xargs`), or redirects its own output with
+  `exec` or a process substitution, since its messages may then run. Prose, comments and messages are still sent to the AI review.
 - **Network destinations:** literal HTTP(S) hosts in code and runtime config,
   flagging cleartext HTTP and hard-coded IP addresses. A PKGBUILD's `url=`
-  homepage (never fetched), XML namespace and DTD identifiers are not
+  homepage (never fetched), XML namespace, DTD and schema identifiers are not
   destinations. URL paths, queries and credentials are never printed.
 - **Dependencies:** `Cargo.lock`, npm lockfiles, `poetry.lock`, `go.sum` and
   exactly pinned `requirements*.txt` are checked with the public OSV API (only

@@ -51,7 +51,6 @@ const ENCODED_PIPES: &[&str] = &[
 ];
 
 const DESTRUCTIVE_COMMANDS: &[&str] = &[
-    "mkfs.",
     "shred /dev/",
     "dd if=/dev/zero of=/dev/",
     "dd if=/dev/urandom of=/dev/",
@@ -200,7 +199,7 @@ impl RuleId {
             Self::EncodedCommandExecution => Matcher::Custom(is_encoded_command_execution),
             Self::CredentialFileAccess => Matcher::Patterns(CREDENTIAL_FILES),
             Self::DestructiveSystemOperation => Matcher::Custom(is_destructive_operation),
-            Self::PersistenceModification => Matcher::Patterns(PERSISTENCE_PATHS),
+            Self::PersistenceModification => Matcher::Custom(is_persistence),
             Self::ShellCommandExecution => Matcher::Patterns(SHELL_EXECUTION),
             Self::PrivilegeEscalation => Matcher::Custom(is_privilege_escalation),
             Self::CredentialExfiltration => Matcher::Custom(looks_like_credential_exfiltration),
@@ -257,12 +256,42 @@ fn is_identifier_byte(byte: u8) -> bool {
 /// character must not continue an identifier or member access, so `eval(`
 /// matches `eval(x)` but not `retrieval(x)` or `model.eval()`.
 fn contains_pattern(haystack: &str, pattern: &str) -> bool {
+    pattern_starts(haystack, pattern).next().is_some()
+}
+
+/// Where `pattern` occurs in `haystack`, respecting identifier boundaries.
+fn pattern_starts<'a>(haystack: &'a str, pattern: &'a str) -> impl Iterator<Item = usize> + 'a {
     let needs_boundary = pattern.bytes().next().is_some_and(is_identifier_byte);
-    haystack.match_indices(pattern).any(|(start, _)| {
-        !needs_boundary
-            || haystack.as_bytes()[..start]
-                .last()
-                .is_none_or(|previous| !is_identifier_byte(*previous) && *previous != b'.')
+    haystack
+        .match_indices(pattern)
+        .map(|(start, _)| start)
+        .filter(move |start| {
+            !needs_boundary
+                || haystack.as_bytes()[..*start]
+                    .last()
+                    .is_none_or(|previous| !is_identifier_byte(*previous) && *previous != b'.')
+        })
+}
+
+/// A persistence path, unless it is a file a PKGBUILD puts in the package
+/// (`"$pkgdir"/etc/profile.d/x.sh`): pacman installs it as a listed package
+/// file, just like a unit under `/usr/lib/systemd/system`.
+fn is_persistence(line: &str) -> bool {
+    PERSISTENCE_PATHS.iter().any(|pattern| {
+        pattern_starts(line, pattern).any(|start| {
+            let before = &line[..start];
+            let word = before
+                .rfind(char::is_whitespace)
+                .map_or(before, |space| &before[space + 1..])
+                .trim_start_matches(['>', '<', '"', '\'', '(']);
+            let packaged = (word.starts_with("$pkgdir") || word.starts_with("${pkgdir}"))
+                && !line[start..]
+                    .split(char::is_whitespace)
+                    .next()
+                    .is_some_and(|rest| rest.contains(".."))
+                && !word.contains("..");
+            !packaged
+        })
     })
 }
 
@@ -302,41 +331,50 @@ pub fn is_encoded_data_executed(line: &str) -> bool {
 }
 
 fn is_privilege_escalation(line: &str) -> bool {
-    match without_chrome_sandbox_setuid(line) {
+    match without_sandbox_helper_setuid(line) {
         Some(rest) => contains_any(&rest, PRIVILEGE_ESCALATION),
         None => contains_any(line, PRIVILEGE_ESCALATION),
     }
 }
 
-/// The line with every `chmod 4755` / `chmod u+s` of a lone `chrome-sandbox`
-/// removed, or `None` when it has none. Chromium and Electron apps
-/// (Brave, Chrome, 1Password, Obsidian, ...) ship this helper and need it
-/// setuid root to sandbox their renderers, so their packages always do this.
-/// Any other privilege change on the line still matches.
-fn without_chrome_sandbox_setuid(line: &str) -> Option<String> {
-    let tokens: Vec<&str> = line.split_whitespace().collect();
-    let mut kept = Vec::with_capacity(tokens.len());
+/// The setuid sandbox helpers of Chromium-based browsers and Electron apps.
+/// They must be setuid root to sandbox their renderers, so every package of
+/// Chrome, Brave, Edge, Opera, Vivaldi or an Electron app sets them up.
+const SANDBOX_HELPERS: &[&str] = &[
+    "chrome-sandbox",
+    "chrome_sandbox",
+    "msedge-sandbox",
+    "opera_sandbox",
+    "vivaldi-sandbox",
+];
+
+/// The line with every `chmod 4755` / `chmod u+s` / `chown root` of a lone
+/// sandbox helper removed, or `None` when it has none. Any other privilege
+/// change on the line still matches.
+fn without_sandbox_helper_setuid(line: &str) -> Option<String> {
+    let words = shell_words(line);
+    let mut kept: Vec<&str> = Vec::with_capacity(words.len());
     let mut exempted = false;
     let mut index = 0;
-    while index < tokens.len() {
-        let is_setuid = tokens[index] == "chmod"
-            && matches!(tokens.get(index + 1), Some(&("4755" | "u+s")))
-            && tokens.get(index + 2).is_some_and(|target| {
-                target
-                    .trim_end_matches(';')
-                    .trim_matches(['"', '\''])
-                    .rsplit('/')
-                    .next()
-                    == Some("chrome-sandbox")
-            })
-            && tokens.get(index + 3).is_none_or(|next| {
-                matches!(*next, "||" | "&&" | ";" | "|") || tokens[index + 2].ends_with(';')
-            });
-        if is_setuid {
+    while index < words.len() {
+        let sets_up_helper = matches!(
+            (
+                words[index].as_str(),
+                words.get(index + 1).map(String::as_str)
+            ),
+            ("chmod", Some("4755" | "u+s")) | ("chown", Some("root" | "root:root"))
+        ) && words.get(index + 2).is_some_and(|target| {
+            let target = unquoted(target.trim_end_matches(';'));
+            SANDBOX_HELPERS.contains(&target.rsplit('/').next().unwrap_or_default())
+        }) && words.get(index + 3).is_none_or(|next| {
+            matches!(next.as_str(), "||" | "&&" | ";" | "|" | "2>/dev/null")
+                || words[index + 2].ends_with(';')
+        });
+        if sets_up_helper {
             exempted = true;
             index += 3;
         } else {
-            kept.push(tokens[index]);
+            kept.push(&words[index]);
             index += 1;
         }
     }
@@ -344,7 +382,93 @@ fn without_chrome_sandbox_setuid(line: &str) -> Option<String> {
 }
 
 fn is_destructive_operation(line: &str) -> bool {
-    contains_any(line, DESTRUCTIVE_COMMANDS) || removes_root_or_home(line)
+    contains_any(line, DESTRUCTIVE_COMMANDS)
+        || formats_filesystem(line)
+        || removes_root_or_home(line)
+}
+
+/// Commands that only handle a file by name, so a `mkfs.*` argument is a
+/// program being packaged or inspected rather than run.
+const FILE_COMMANDS: &[&str] = &[
+    "install",
+    "cp",
+    "mv",
+    "ln",
+    "chmod",
+    "chown",
+    "rm",
+    "strip",
+    "patchelf",
+    "touch",
+    "ls",
+    "stat",
+    "file",
+    "test",
+    "[",
+    "sha256sum",
+    "b2sum",
+    "md5sum",
+];
+
+/// A `mkfs.*` program that is run. Packaging one (`install -Dm755
+/// mkfs.erofs "$pkgdir/..."`, or its path alone on a continuation line) is
+/// not; every other mention is, including inside another language's string.
+fn formats_filesystem(line: &str) -> bool {
+    if !line.contains("mkfs.") {
+        return false;
+    }
+    line.split([';', '|', '&'])
+        .filter(|segment| segment.contains("mkfs."))
+        .any(|segment| {
+            // A path alone, as on a continuation line, runs nothing.
+            if segment
+                .split_whitespace()
+                .filter(|word| *word != "\\")
+                .count()
+                <= 1
+            {
+                return false;
+            }
+            let words = shell_words(segment);
+            let command = words
+                .iter()
+                .map(|word| unquoted(word))
+                .find(|word| !matches!(word.as_str(), "sudo" | "doas") && !word.starts_with('-'))
+                .unwrap_or_default();
+            !FILE_COMMANDS.contains(&command.rsplit('/').next().unwrap_or_default())
+        })
+}
+
+/// Splits a command line into words at whitespace outside quotes. Quote
+/// characters are kept in the words.
+fn shell_words(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote: Option<char> = None;
+    for character in line.chars() {
+        if quote.is_none() && character.is_whitespace() {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            continue;
+        }
+        match quote {
+            Some(open) if character == open => quote = None,
+            None if character == '"' || character == '\'' => quote = Some(character),
+            Some(_) | None => {}
+        }
+        word.push(character);
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+fn unquoted(word: &str) -> String {
+    word.chars()
+        .filter(|character| !matches!(character, '"' | '\''))
+        .collect()
 }
 
 /// Recursive `rm` of `/`, `/*`, `~` or `$HOME` itself. Removing paths below
@@ -459,6 +583,7 @@ const PROSE_NAMES: &[&str] = &[
     "authors",
     "notice",
     "eula",
+    "terms",
 ];
 
 /// Prose files are sent to the AI review but not matched by the local
@@ -479,7 +604,7 @@ pub fn is_documentation(rel: &str) -> bool {
 
     if matches!(
         extension.as_str(),
-        "md" | "markdown" | "rst" | "adoc" | "asciidoc" | "org"
+        "md" | "markdown" | "rst" | "adoc" | "asciidoc" | "org" | "changelog"
     ) {
         return true;
     }
@@ -626,18 +751,23 @@ pub fn extract_network_destinations(line: &str) -> Vec<(Scheme, String)> {
     let lower = line.to_ascii_lowercase();
     let mut result = Vec::new();
     let mut cursor = 0;
+    // A DTD reference names a vocabulary; nothing requests it.
+    let doctype = lower.contains("<!doctype");
 
     while cursor < lower.len() {
-        let next = [("https://", Scheme::Https), ("http://", Scheme::Http)]
-            .into_iter()
-            .filter_map(|(prefix, scheme)| {
-                lower[cursor..]
-                    .find(prefix)
-                    .map(|offset| (offset, prefix, scheme))
-            })
-            .min_by_key(|(offset, _, _)| *offset);
-        let Some((offset, prefix, scheme)) = next else {
+        // One search per candidate: finding each prefix separately rescans
+        // the rest of the line for the absent one every time, which is
+        // quadratic on a line of many `http://` URLs.
+        let Some(offset) = lower[cursor..].find("http") else {
             break;
+        };
+        let candidate = &lower[cursor + offset..];
+        let Some((prefix, scheme)) = [("https://", Scheme::Https), ("http://", Scheme::Http)]
+            .into_iter()
+            .find(|(prefix, _)| candidate.starts_with(prefix))
+        else {
+            cursor += offset + "http".len();
+            continue;
         };
 
         let start = cursor + offset;
@@ -659,6 +789,10 @@ pub fn extract_network_destinations(line: &str) -> Vec<(Scheme, String)> {
             .trim_end_matches(['.', ':', '?', '!', '\\']);
 
         if let Some(host) = url_host(&url[prefix.len().min(url.len())..])
+            && !doctype
+            && !Path::new(url)
+                .extension()
+                .is_some_and(|extension| extension == "dtd" || extension == "xsd")
             && !is_identifier_uri(&lower[..start])
         {
             result.push((scheme, host));
@@ -671,12 +805,9 @@ pub fn extract_network_destinations(line: &str) -> Vec<(Scheme, String)> {
     result
 }
 
-/// XML namespace, RDF and DTD URIs name a vocabulary; nothing requests them.
+/// XML namespace and RDF URIs name a vocabulary; nothing requests them.
 /// `before` is the lowercased text preceding the URL on its line.
 fn is_identifier_uri(before: &str) -> bool {
-    if before.contains("<!doctype") {
-        return true;
-    }
     let Some(before) = before.strip_suffix(['"', '\'']) else {
         return false;
     };
@@ -806,12 +937,16 @@ mod tests {
     }
 
     #[test]
-    fn chrome_sandbox_setuid_is_expected_packaging() {
+    fn sandbox_helper_setuid_is_expected_packaging() {
         for packaging in [
             "chmod 4755 \"${pkgdir}\"/opt/1password/chrome-sandbox",
             "chmod 4755 \"$pkgdir/opt/brave-bin/chrome-sandbox\";",
             "chmod 4755 '/opt/obsidian/chrome-sandbox' || true",
             "chmod u+s chrome-sandbox",
+            "chmod 4755 \"${pkgdir}/opt/grok bot/chrome-sandbox\"",
+            "chmod 4755 \"${pkgdir}/opt/microsoft/msedge/msedge-sandbox\"",
+            "chmod 4755 \"$pkgdir/usr/lib/opera-gx/opera_sandbox\"",
+            "chown root \"$pkgdir/usr/lib/chromium/chrome-sandbox\"",
         ] {
             assert!(
                 !rules_for(packaging).contains(&RuleId::PrivilegeEscalation),
@@ -824,10 +959,66 @@ mod tests {
             "chmod 4755 /opt/x/chrome-sandbox-helper",
             "chmod 4755 /opt/x/chrome-sandbox; chmod u+s /usr/bin/bash",
             "chmod u+s /usr/bin/bash",
+            "chown root /usr/bin/x",
         ] {
             assert!(
                 rules_for(escalation).contains(&RuleId::PrivilegeEscalation),
                 "{escalation}"
+            );
+        }
+    }
+
+    #[test]
+    fn packaging_a_mkfs_program_is_not_running_it() {
+        for packaging in [
+            "install -dm755 \"$srcdir/docker-sbx/mkfs.erofs\" \\",
+            "\"$pkgdir/usr/lib/${pkgname}/libexec/mkfs.erofs\"",
+            "sudo install -m755 mkfs.x /usr/bin/",
+            "ln -s mkfs.ext4 \"$pkgdir/usr/bin/mkfs.ext3\"",
+        ] {
+            assert!(
+                !rules_for(packaging).contains(&RuleId::DestructiveSystemOperation),
+                "{packaging}"
+            );
+        }
+        for running in [
+            "mkfs.ext4 /dev/sda",
+            "sudo mkfs.vfat -f32 \"$dev\"",
+            "os.system(\"mkfs.ext4 /dev/sda\")",
+            "install x mkfs.y; mkfs.ext4 /dev/sda",
+            "x=$(mkfs.btrfs -f /dev/sdb)",
+        ] {
+            assert!(
+                rules_for(running).contains(&RuleId::DestructiveSystemOperation),
+                "{running}"
+            );
+        }
+    }
+
+    #[test]
+    fn packaged_startup_files_are_not_persistence() {
+        for packaging in [
+            "install -dm644 x.sh \"${pkgdir}/etc/profile.d/x.sh\"",
+            "} >>\"${pkgdir}/etc/profile.d/x.sh\"",
+            "\"$pkgdir\"/etc/cron.daily/ \\",
+            "install -d -m644 x.timer \"$pkgdir/etc/systemd/system/x.timer\"",
+        ] {
+            assert!(
+                !rules_for(packaging).contains(&RuleId::PersistenceModification),
+                "{packaging}"
+            );
+        }
+        for persistence in [
+            "cp x.sh /etc/profile.d/",
+            "echo x >> ~/.bashrc",
+            "cp x \"$pkgdir/../../etc/cron.d\" /etc/cron.daily/x",
+            "install x \"$srcdir/etc/systemd/system/x\"",
+            "cat x >> \"$pkgdir/../../../../.bashrc\"",
+            "cp x \"${pkgdir}\"/../../.config/autostart/x.desktop",
+        ] {
+            assert!(
+                rules_for(persistence).contains(&RuleId::PersistenceModification),
+                "{persistence}"
             );
         }
     }
@@ -859,10 +1050,18 @@ mod tests {
             "COPYING.LESSER",
             "LICENSES/0BSD.txt",
             "eula_text.html",
+            "terms.html",
+            "aurutils.changelog",
         ] {
             assert!(is_documentation(prose), "{prose}");
         }
-        for code in ["license.sh", "LICENSES/check.py", "licensed.txt", "eula.js"] {
+        for code in [
+            "license.sh",
+            "LICENSES/check.py",
+            "licensed.txt",
+            "eula.js",
+            "terminal.sh",
+        ] {
             assert!(!is_documentation(code), "{code}");
         }
     }
@@ -901,6 +1100,17 @@ mod tests {
             ]
         );
         assert!(extract_network_destinations("see https:// for details").is_empty());
+        assert_eq!(
+            extract_network_destinations("httpx http:/ HTTPS://b.test http://a.test"),
+            vec![
+                (Scheme::Http, "a.test".to_string()),
+                (Scheme::Https, "b.test".to_string()),
+            ]
+        );
+        let many = "http://a ".repeat(250_000);
+        let started = std::time::Instant::now();
+        assert_eq!(extract_network_destinations(&many).len(), 1);
+        assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
         assert!(
             extract_network_destinations(
                 "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:dc='http://purl.org/dc/elements/1.1/'>"

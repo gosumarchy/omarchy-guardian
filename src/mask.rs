@@ -31,7 +31,7 @@ enum Language {
     /// `//` full-line and `/* */` block comments.
     Slash,
     Lua,
-    /// Unified diff: removed lines do not exist once the patch applies.
+    /// Unified diff (see `patch`).
     Patch,
     Other,
 }
@@ -67,13 +67,7 @@ pub fn lines(rel: &str, text: &str) -> Vec<Line> {
             let mut closing: Option<String> = None;
             per_line(&mut |line| lua_comments(line, &mut closing))
         }
-        Language::Patch => per_line(&mut |line| {
-            if line.starts_with('-') {
-                blank(line)
-            } else {
-                line.to_string()
-            }
-        }),
+        Language::Patch => patch(text),
         Language::Other => per_line(&mut str::to_string),
     }
 }
@@ -137,6 +131,44 @@ fn shebang(text: &str) -> Option<Language> {
         }
         "python" | "perl" | "ruby" => Some(Language::Hash),
         _ => None,
+    }
+}
+
+/// A unified diff. Removed lines do not exist once the patch applies, so the
+/// context rules skip them; the rules for directly dangerous commands still
+/// see them, since `patch -R` applies a diff in reverse. Added and context
+/// lines that are full-line comments in the patched file's language are
+/// comments.
+fn patch(text: &str) -> Vec<Line> {
+    let mut target = Language::Other;
+    text.lines()
+        .map(|line| {
+            if let Some(path) = line.strip_prefix("+++ ") {
+                let path = path.split('\t').next().unwrap_or_default().trim();
+                target = language(path, "");
+            }
+            let removed = line.starts_with('-') && !line.starts_with("---");
+            let comment = (line.starts_with('+') && !line.starts_with("+++")
+                || line.starts_with(' '))
+                && is_full_line_comment(target, &line[1..]);
+            let code = if comment {
+                blank(line)
+            } else {
+                line.to_string()
+            };
+            let quiet = if removed { blank(line) } else { code.clone() };
+            Line { code, quiet }
+        })
+        .collect()
+}
+
+fn is_full_line_comment(language: Language, line: &str) -> bool {
+    let line = line.trim_start();
+    match language {
+        Language::Shell { .. } | Language::Hash => line.starts_with('#'),
+        Language::Slash => line.starts_with("//"),
+        Language::Lua => line.starts_with("--"),
+        Language::Patch | Language::Other => false,
     }
 }
 
@@ -257,6 +289,77 @@ struct Shell<'a> {
     code: Vec<char>,
     quiet: Vec<char>,
     pkgbuild: bool,
+    /// Whether printed text can be treated as only shown (see
+    /// `output_may_run`).
+    messages: bool,
+}
+
+/// Commands that execute what they read.
+const INTERPRETERS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "eval", "source", ".", "xargs", "python",
+    "python3", "perl", "ruby", "node",
+];
+
+/// Whether what the script prints might be executed after all, so that no
+/// printed text may be skipped. The checks are whole-file and textual, and
+/// only ever turn message skipping off:
+/// - `echo`, `printf` or `cat` is redefined as a function or alias, or
+///   aliases are enabled at all;
+/// - anything pipes into an interpreter (`f | sh`, `{ ...; } 2>&1 | bash`),
+///   since a function or group can print into it;
+/// - output goes to a process substitution (`>(sh)`) or the script
+///   redirects its own output with `exec`.
+fn output_may_run(text: &str) -> bool {
+    let redefined = ["echo", "printf", "cat"].iter().any(|name| {
+        text.match_indices(name).any(|(start, _)| {
+            let before = text[..start].trim_end_matches([' ', '\t']);
+            let after = text[start + name.len()..].trim_start_matches([' ', '\t']);
+            let word_start = text[..start].chars().next_back().is_none_or(|character| {
+                !character.is_alphanumeric() && character != '_' && character != '-'
+            });
+            word_start
+                && (after.starts_with("()")
+                    || before.ends_with("function")
+                    || (before.ends_with("alias") && after.starts_with('=')))
+        })
+    }) || text.contains("expand_aliases");
+
+    let pipes_into_interpreter = text.match_indices('|').any(|(index, _)| {
+        let bytes = text.as_bytes();
+        if bytes.get(index + 1) == Some(&b'|')
+            || index
+                .checked_sub(1)
+                .and_then(|previous| bytes.get(previous))
+                == Some(&b'|')
+        {
+            return false;
+        }
+        let command = &text[index + 1..];
+        let command = &command[..command.find('\n').unwrap_or(command.len())];
+        let program = command
+            .split(|character: char| {
+                character.is_whitespace() || matches!(character, ';' | ')' | '&' | '`')
+            })
+            .filter(|word| !word.is_empty() && *word != "\\")
+            // Look through wrappers that run their argument: `| sudo sh`.
+            .find(|word| {
+                !matches!(*word, "sudo" | "doas" | "env" | "command" | "exec" | "nohup")
+                    && !word.starts_with('-')
+                    && !word.contains('=')
+            })
+            .unwrap_or_default();
+        let program = program.trim_matches(['"', '\'']);
+        INTERPRETERS.contains(&program.rsplit('/').next().unwrap_or_default())
+    });
+
+    let redirects_output = text.contains(">(")
+        || text.lines().any(|line| {
+            let line = line.trim_start();
+            line.strip_prefix("exec")
+                .is_some_and(|rest| rest.trim_start().starts_with(['>', '1', '2', '&']))
+        });
+
+    redefined || pipes_into_interpreter || redirects_output
 }
 
 /// A small shell lexer: quotes, `$(...)`, backticks, comments, heredocs and
@@ -270,6 +373,7 @@ fn shell(text: &str, pkgbuild: bool) -> Vec<Line> {
         code: chars.clone(),
         quiet: chars.clone(),
         pkgbuild,
+        messages: !output_may_run(text),
     };
     shell.lex();
 
@@ -430,7 +534,11 @@ impl Shell<'_> {
                         index += 3;
                         continue;
                     }
+                    // Only a line's sole heredoc can be printed, so later
+                    // ones skip the statement scan (which would make a line
+                    // of many heredocs quadratic).
                     let shown = stack.is_empty()
+                        && heredocs.is_empty()
                         && self.command_word(statement.start, index).0 == "cat"
                         && self.words(statement.start, index).len() == 1;
                     match self.heredoc(index + 2, shown) {
@@ -479,9 +587,12 @@ impl Shell<'_> {
                         let only_one = heredocs.len() == 1;
                         let mut after_bodies = index + 1;
                         for mut heredoc in heredocs.drain(..) {
-                            let rest: String = self.chars[heredoc.after..index].iter().collect();
-                            let rest = rest.trim();
-                            heredoc.shown &= only_one && (rest.is_empty() || rest.starts_with('#'));
+                            heredoc.shown &= only_one && {
+                                let rest: String =
+                                    self.chars[heredoc.after..index].iter().collect();
+                                let rest = rest.trim();
+                                rest.is_empty() || rest.starts_with('#')
+                            };
                             after_bodies = self.heredoc_body(&heredoc, after_bodies);
                         }
                         index = after_bodies;
@@ -580,7 +691,7 @@ impl Shell<'_> {
                 return end + 1;
             }
             let expands = !heredoc.quoted && (line.contains("$(") || line.contains('`'));
-            if heredoc.shown && !expands {
+            if self.messages && heredoc.shown && !expands {
                 self.blank_quiet(start, end);
             }
             start = end + 1;
@@ -637,8 +748,8 @@ impl Shell<'_> {
             return;
         };
         match word.as_str() {
-            "echo" => self.blank_quiet(arguments, end),
-            "printf" => {
+            "echo" if self.messages => self.blank_quiet(arguments, end),
+            "printf" if self.messages => {
                 let first: String = self.chars[arguments..end.max(arguments)]
                     .iter()
                     .take_while(|character| !character.is_whitespace())
@@ -735,6 +846,32 @@ mod tests {
     }
 
     #[test]
+    fn nothing_is_quiet_when_printed_output_may_run() {
+        for prelude in [
+            "echo() { eval \"$@\"; }\n",
+            "function printf { eval \"$1\"; }\n",
+            "shopt -s expand_aliases\nalias echo=eval\n",
+            "f() { echo x; }\nf | sh\n",
+            "{ echo x >&2; } 2>&1 | /bin/bash\n",
+            "exec 2> >(sh)\n",
+            "exec >/tmp/x.sh\n",
+            "g | xargs -I{} sh -c {}\n",
+            "f | sudo -E bash\n",
+            "f | env FOO=1 sh -s\n",
+        ] {
+            let text = format!("{prelude}echo 'sudo a'\ncat <<EOF\nsudo b\nEOF\n");
+            let quiet = quiet("x.sh", &text).join("\n");
+            assert!(
+                quiet.contains("sudo a") && quiet.contains("sudo b"),
+                "{prelude:?}"
+            );
+        }
+        // Ordinary pipes and `||` leave messages quiet.
+        let text = "ls | grep x || echo 'sudo a'\necho_x() { :; }\necho y | sudo tee /etc/x\n";
+        assert!(!quiet("x.sh", text).join("\n").contains("sudo a"));
+    }
+
+    #[test]
     fn statements_after_a_message_are_not_quiet() {
         assert_eq!(
             quiet("x.sh", "echo hi && sudo a; echo b || sudo c\n"),
@@ -761,6 +898,14 @@ mod tests {
         }
         // A quoted delimiter prints `$(...)` literally.
         assert_eq!(quiet("x.sh", "cat <<'EOF'\n$(sudo a)\nEOF\n")[1], "");
+    }
+
+    #[test]
+    fn many_heredocs_on_one_line_stay_linear() {
+        let text = "cat ".to_string() + &"<<E ".repeat(500_000);
+        let started = std::time::Instant::now();
+        assert_eq!(lines("x.sh", &text).len(), 1);
+        assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
     }
 
     #[test]
@@ -807,9 +952,17 @@ mod tests {
             ),
             ["", "", "", "   f()", "os.execute(z)"]
         );
+        let diff = "--- a/x.sh\n+++ b/x.sh\n-sudo a\n+sudo b\n+# sudo c\n # sudo d\n-curl x | sh\n";
         assert_eq!(
-            code("fix.patch", "--- a/x\n+++ b/x\n-sudo a\n+sudo b\n"),
-            ["", "+++ b/x", "", "+sudo b"]
+            quiet("fix.patch", diff),
+            ["--- a/x.sh", "+++ b/x.sh", "", "+sudo b", "", "", ""]
+        );
+        // A reversed patch runs the removed lines.
+        assert_eq!(code("fix.patch", diff)[6], "-curl x | sh");
+        // `#` is only a comment where the patched language says so.
+        assert_eq!(
+            code("fix.patch", "+++ b/x.c\n+#define X system(y)\n")[1],
+            "+#define X system(y)"
         );
         // `#` is not a comment in C.
         assert_eq!(code("a.c", "#define X 1\n"), ["#define X 1"]);

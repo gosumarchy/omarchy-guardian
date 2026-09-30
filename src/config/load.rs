@@ -315,6 +315,16 @@ impl Settings {
         &self.user_status
     }
 
+    /// The values set in the system file, as parsed.
+    pub fn system_config(&self) -> &PartialConfig {
+        &self.system
+    }
+
+    /// The values set in the user file, as parsed.
+    pub fn user_config(&self) -> &PartialConfig {
+        &self.user
+    }
+
     pub fn system_path(&self) -> &Path {
         &self.system_path
     }
