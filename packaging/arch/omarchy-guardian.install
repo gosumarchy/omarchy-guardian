@@ -15,18 +15,16 @@ _check_hook() {
 
 post_install() {
     printf '%s\n' \
-        "omarchy-guardian is installed but not active." \
-        "Enable the pacman hook and theme interception with:" \
-        "  sudo pacman -S --needed claude-code      (the pacman gate's reviewer;" \
-        "                                           or extra/opencode)" \
-        "  sudo /usr/lib/omarchy-guardian/enable-system-hook.sh" \
-        "Choose a profile, model and thinking level with:" \
-        "  omarchy-guardian setup" \
-        "or change any setting in the settings app: omarchy-guardian tui" \
+        "omarchy-guardian is installed but not active. (./install.sh does all of this.)" \
+        "1. The pacman gate's reviewer:" \
+        "     sudo pacman -S --needed claude-code   (or extra/opencode)" \
+        "2. Profile, model and thinking level:" \
+        "     omarchy-guardian setup" \
+        "3. Turn on the pacman hook, the AUR gate and the theme & plugin gate:" \
+        "     omarchy-guardian protect" \
+        "Change any setting later in the settings app: omarchy-guardian tui" \
         "The default 'standard' profile lets official Arch/Omarchy updates proceed" \
-        "with a warning when the AI review is unavailable; 'strict' blocks them." \
-        "Enable the AUR gate with:" \
-        "  yay --makepkg /usr/lib/omarchy-guardian/guardian-makepkg --save -P --stats"
+        "with a warning when the AI review is unavailable; 'strict' blocks them."
     _check_hook
 }
 

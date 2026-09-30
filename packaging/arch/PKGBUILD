@@ -1,8 +1,9 @@
-# Builds omarchy-guardian from this source checkout:
-#   cd packaging/arch && makepkg -si
-# Installing the package activates nothing; run
-#   sudo /usr/lib/omarchy-guardian/enable-system-hook.sh
-# to turn on the pacman hook and the theme interceptor.
+# Builds omarchy-guardian from this source checkout. The installer at the
+# top of the checkout builds, installs and turns protection on:
+#   ./install.sh
+# Installing the package alone activates nothing; run
+#   omarchy-guardian protect
+# to turn on the pacman hook, the AUR gate and the theme & plugin gate.
 
 pkgname=omarchy-guardian
 pkgver=0.4.1

@@ -35,6 +35,8 @@ Usage:
   omarchy-guardian config show [--class CLASS] | check | path
   omarchy-guardian forget <identity> | --all
   omarchy-guardian setup
+  omarchy-guardian protect [--yes]                  (turn on every gate that is off)
+  omarchy-guardian test                             (test the saved reviewer with two samples)
   omarchy-guardian tui [--expert]                   (settings app; --expert shows every setting)
 
 CLASS: aur, theme, plugin, source (default). PROFILE: standard, strict, local-only.
@@ -92,6 +94,12 @@ enum Invocation {
     Config(ConfigCommand),
     Forget(Forget),
     Setup,
+    /// `protect [--yes]`: turn on every gate that is off.
+    Protect {
+        yes: bool,
+    },
+    /// `test`: the two-sample reviewer test of the saved settings.
+    Test,
     Tui {
         expert: bool,
     },
@@ -192,6 +200,26 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Invocation::Protect { yes } => match tui::protect(yes, &mut TtyConfirm) {
+            Ok(message) => {
+                outln!("{message}");
+                ExitCode::SUCCESS
+            }
+            Err(message) => {
+                eprintln!("omarchy-guardian protect: {message}");
+                ExitCode::from(2)
+            }
+        },
+        Invocation::Test => {
+            outln!("Testing the reviewer with a malicious and a harmless sample...");
+            let (report, passed) = tui::test();
+            outln!("{report}");
+            if passed {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
         Invocation::Tui { expert } => match tui::run(expert) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {
@@ -516,6 +544,12 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
         Some("config") => parse_config(rest).map(Invocation::Config),
         Some("forget") => parse_forget(rest).map(Invocation::Forget),
         Some("setup") if rest.is_empty() => Ok(Invocation::Setup),
+        Some("protect") => match rest {
+            [] => Ok(Invocation::Protect { yes: false }),
+            [flag] if flag == "--yes" || flag == "-y" => Ok(Invocation::Protect { yes: true }),
+            _ => Err("usage: omarchy-guardian protect [--yes]".into()),
+        },
+        Some("test") if rest.is_empty() => Ok(Invocation::Test),
         Some("tui" | "settings") => match rest {
             [] => Ok(Invocation::Tui { expert: false }),
             [flag] if flag == "--expert" => Ok(Invocation::Tui { expert: true }),
@@ -1041,6 +1075,16 @@ mod tests {
     fn parses_setup() {
         assert_eq!(parse(&args(&["setup"])).unwrap(), Invocation::Setup);
         assert!(parse(&args(&["setup", "extra"])).is_err());
+        assert_eq!(
+            parse(&args(&["protect"])).unwrap(),
+            Invocation::Protect { yes: false }
+        );
+        assert_eq!(
+            parse(&args(&["protect", "--yes"])).unwrap(),
+            Invocation::Protect { yes: true }
+        );
+        assert!(parse(&args(&["protect", "--all"])).is_err());
+        assert_eq!(parse(&args(&["test"])).unwrap(), Invocation::Test);
         assert_eq!(
             parse(&args(&["tui"])).unwrap(),
             Invocation::Tui { expert: false }
