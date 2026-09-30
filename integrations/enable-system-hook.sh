@@ -46,4 +46,4 @@ else
 fi
 
 printf '%s\n' "Enable the AUR gate for your user with: yay --makepkg /usr/lib/omarchy-guardian/guardian-makepkg --save -P --stats"
-printf '%s\n' "Themes installed from the Omarchy menu are gated once you turn on the theme gate in: omarchy-guardian tui"
+printf '%s\n' "Themes and plugins added from the Omarchy menu are gated once you turn on the theme & plugin gate in: omarchy-guardian tui"

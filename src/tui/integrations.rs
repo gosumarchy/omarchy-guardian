@@ -17,9 +17,9 @@ pub const INTERCEPTOR_INSTALLER: &str = "/usr/lib/omarchy-guardian/install-user-
 const INTERCEPTOR_MARKER: &str = "# Omarchy Guardian theme command interception";
 const INTERCEPTOR_SOURCE: &str = "/usr/lib/omarchy-guardian/omarchy-bash-interceptor.sh";
 const MENU_ID: &str = "\"setup.guardian\"";
-/// Omarchy menu items that install or update themes, overridden so they run
-/// through Guardian. The menu keeps each item's other fields.
-const THEME_OVERRIDES: [(&str, &str); 2] = [
+/// Omarchy menu items that install or update themes and plugins, overridden
+/// so they run through Guardian. The menu keeps each item's other fields.
+const THEME_OVERRIDES: [(&str, &str); 3] = [
     (
         "\"install.style.theme\"",
         "\"install.style.theme\": {\"action\":\"omarchy-launch-floating-terminal-with-presentation /usr/lib/omarchy-guardian/guardian-theme install\"},",
@@ -28,8 +28,14 @@ const THEME_OVERRIDES: [(&str, &str); 2] = [
         "\"update.themes\"",
         "\"update.themes\": {\"action\":\"omarchy-launch-floating-terminal-with-presentation /usr/lib/omarchy-guardian/guardian-theme update\"},",
     ),
+    (
+        "\"setup.plugin.add\"",
+        "\"setup.plugin.add\": {\"action\":\"omarchy-launch-floating-terminal-with-presentation /usr/lib/omarchy-guardian/guardian-plugin add\"},",
+    ),
 ];
-const THEME_GATE: &str = "guardian-theme";
+/// What Guardian's own overrides run; a user's own override of these items
+/// does not contain it.
+const THEME_GATE: &str = "/usr/lib/omarchy-guardian/guardian-";
 /// Installs OpenCode from the official repos, root-owned, where the pacman
 /// gate looks for it.
 const INSTALL_OPENCODE: [&str; 4] = ["/usr/bin/pacman", "-S", "--needed", "extra/opencode"];
@@ -55,7 +61,7 @@ impl Integration {
         match self {
             Self::PacmanHook => "Pacman hook",
             Self::AurGate => "AUR gate (yay)",
-            Self::ThemeInterceptor => "Theme install gate",
+            Self::ThemeInterceptor => "Theme & plugin gate",
             Self::MenuEntry => "Omarchy menu entry",
         }
     }
@@ -67,7 +73,7 @@ impl Integration {
             }
             Self::AurGate => "Makes yay build AUR packages through Guardian's makepkg gate.",
             Self::ThemeInterceptor => {
-                "Routes theme installs and updates through Guardian, from Bash (new shells) and from the Omarchy menu."
+                "Routes theme and plugin installs and updates through Guardian, from Bash (new shells) and from the Omarchy menu."
             }
             Self::MenuEntry => "Adds Setup › Guardian to the Omarchy menu, opening this window.",
         }
@@ -124,11 +130,11 @@ impl Plan {
                     format!("edit {}: remove Setup › Guardian", paths.menu.display())
                 }
                 Step::AddThemeMenu => format!(
-                    "edit {}: route the menu's theme install and update through Guardian",
+                    "edit {}: route the menu's theme install and update and plugin add through Guardian",
                     paths.menu.display()
                 ),
                 Step::RemoveThemeMenu => format!(
-                    "edit {}: give the menu's theme install and update back to Omarchy",
+                    "edit {}: give the menu's theme and plugin items back to Omarchy",
                     paths.menu.display()
                 ),
             })
@@ -213,11 +219,13 @@ impl Paths {
                 match self.theme_parts() {
                     (true, None | Some(true)) => State::On,
                     (true, Some(false)) => State::Partial(
-                        "terminal only: themes from the Omarchy menu skip Guardian".into(),
+                        "terminal only: themes and plugins from the Omarchy menu skip Guardian"
+                            .into(),
                     ),
-                    (false, Some(true)) => {
-                        State::Partial("menu only: `omarchy theme` in Bash skips Guardian".into())
-                    }
+                    (false, Some(true)) => State::Partial(
+                        "menu only: `omarchy theme` and `omarchy plugin` in Bash skip Guardian"
+                            .into(),
+                    ),
                     (false, None | Some(false)) => State::Off,
                 }
             }
@@ -301,9 +309,9 @@ impl Paths {
             }
             (Integration::ThemeInterceptor, _) => (
                 if on {
-                    "Enable the theme install gate"
+                    "Enable the theme & plugin gate"
                 } else {
-                    "Disable the theme install gate"
+                    "Disable the theme & plugin gate"
                 },
                 self.theme_steps(on),
             ),
@@ -679,6 +687,7 @@ mod tests {
         let menu = fs::read_to_string(&paths.menu).unwrap();
         assert!(menu.contains("guardian-theme install"), "{menu}");
         assert!(menu.contains("guardian-theme update"), "{menu}");
+        assert!(menu.contains("guardian-plugin add"), "{menu}");
 
         fs::write(
             &paths.bashrc,

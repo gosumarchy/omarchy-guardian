@@ -69,7 +69,7 @@ has every setting:
 | Profiles | the profile for your own sources (user file) and for the pacman gate (system file) |
 | Sources | every knob of every source class; pacman-enforced classes in the system file, the rest in the user file |
 | AI | model, input size and call limits for your sources and for the pacman gate, review-memory limits, official repositories |
-| Integrations | turn the pacman hook, the yay AUR gate, the theme install gate and the Omarchy menu entry on or off |
+| Integrations | turn the pacman hook, the yay AUR gate, the theme & plugin gate and the Omarchy menu entry on or off |
 | Maintenance | show and check the effective settings, edit either file in `$EDITOR`, see or forget the review memory, run the guided setup |
 
 Unset values show what they inherit and from where. Keys: `↑↓` move,
@@ -94,7 +94,7 @@ loosened by the system file (but see the OpenCode caveat below).
 | `local-package` | `pacman -U` archives | pacman hook | yes |
 | `aur` | yay makepkg shim | user | no |
 | `theme` | Omarchy theme install/update handler | user | no |
-| `plugin` | reserved for the coverage sub-project's plugin gate | user | no |
+| `plugin` | Omarchy plugin gate (`omarchy plugin add` / `update`) | user | no |
 | `source` | explicit `scan` / `guard` / `sandbox` (default) | user | no |
 
 `official_repos` defaults to `core, extra, multilib, core-testing,
@@ -442,7 +442,7 @@ sources and whatever `prepare()`/`build()` do with them are outside the review.
 
 ### Omarchy themes
 
-The theme gate routes theme installs and updates through Guardian from two
+The theme & plugin gate routes theme installs and updates through Guardian from two
 places: the Bash interceptor catches `omarchy theme install/update` typed in
 an interactive Bash, and overrides in your Omarchy menu file
 (`~/.config/omarchy/extensions/omarchy-menu.jsonc`) point Install › Style ›
@@ -456,6 +456,29 @@ Themes with local or ignored modifications, submodules, or unresolved Git LFS
 files are refused. Direct invocations of Omarchy's theme binaries from
 elsewhere (scripts, other shells) are not intercepted.
 
+### Omarchy plugins
+
+Omarchy shell plugins run as unsandboxed code inside the long-lived
+`omarchy-shell`, so `omarchy plugin add` (or `install`) and `omarchy plugin
+update` go through `guardian-plugin`:
+
+- **Add:** the repository is cloned to a hidden staging directory and checked
+  with Omarchy's own `omarchy-plugin-validate`. It is then reviewed with
+  `guard --class plugin --identity plugin:<id>`, and only after a clear review
+  is the exact reviewed checkout moved into place and, if asked, enabled.
+- **Update:** each installed plugin's new commits are fetched into a staged
+  copy, fast-forwarded and validated, then reviewed as an upgrade of the
+  approved version. The installed plugin is fast-forwarded to exactly the
+  reviewed commit, taken from the staged copy rather than fetched from the
+  remote again, so a push between review and apply is never installed.
+  Plugins with local changes, rewritten remote history or submodules are
+  refused.
+
+Both routes are gated: the Bash interceptor catches the commands in an
+interactive Bash, and the theme & plugin gate's menu overrides point Setup ›
+Plugins › Add Plugin at Guardian. `omarchy plugin clone` copies Omarchy's own
+built-in plugins and is not gated.
+
 ### Removal
 
 ```sh
@@ -466,9 +489,9 @@ sudo pacman -R omarchy-guardian
 Removing the package removes the hook link. A hook at the same path that was
 installed by hand and runs Guardian is moved to
 `/etc/pacman.d/hooks/omarchy-guardian.hook.pacsave`, which pacman ignores.
-Turn the theme gate off in the TUI (or delete the marked Guardian line from
-`~/.bashrc` and the `guardian-theme` lines from the Omarchy menu file) to stop
-theme interception.
+Turn the theme & plugin gate off in the TUI (or delete the marked Guardian line from
+`~/.bashrc` and the `guardian-theme` and `guardian-plugin` lines from the Omarchy
+menu file) to stop theme and plugin interception.
 
 If pacman fails every install or upgrade with `Review package install scripts
 with Omarchy Guardian` followed by `call to execv failed (No such file or

@@ -1,0 +1,249 @@
+#!/usr/bin/bash
+# Gates Omarchy shell plugins: `omarchy plugin add` and `omarchy plugin
+# update` run arbitrary code inside the long-lived omarchy-shell, so the
+# plugin is cloned to a hidden staging directory, reviewed with
+# `omarchy-guardian guard --class plugin`, and only the exact reviewed
+# checkout is moved into place or merged.
+set -euo pipefail
+
+GUARDIAN=/usr/bin/omarchy-guardian
+OMARCHY_BIN_DIR=/usr/share/omarchy/bin
+PLUGINS_DIR="$HOME/.config/omarchy/plugins"
+MODE=${1:-}
+shift || true
+STAGE_ROOT=""
+SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
+
+cleanup_staging() {
+    if [[ -n $STAGE_ROOT && -d $STAGE_ROOT ]]; then
+        rm -rf -- "$STAGE_ROOT"
+    fi
+}
+trap cleanup_staging EXIT
+
+fail() {
+    printf 'omarchy-guardian plugin: %s\n' "$*" >&2
+    exit 2
+}
+
+interactive() {
+    [[ -t 0 && -t 1 ]]
+}
+
+[[ -x $GUARDIAN ]] || fail "Guardian is not installed at $GUARDIAN"
+[[ -x $OMARCHY_BIN_DIR/omarchy-plugin-validate ]] || fail "Omarchy plugin commands are unavailable"
+command -v git >/dev/null || fail "git is required"
+command -v jq >/dev/null || fail "jq is required"
+command -v flock >/dev/null || fail "flock is required"
+
+mkdir -p "$PLUGINS_DIR" "$HOME/.cache/omarchy-guardian"
+if [[ $MODE != --guardian-commit-add && $MODE != --guardian-commit-update ]]; then
+    exec 9>"$HOME/.cache/omarchy-guardian/plugin.lock"
+    flock 9
+fi
+
+# No system or global git configuration, so nothing there (hooks, helpers,
+# URL rewrites) takes part in fetching untrusted code.
+safe_git() {
+    env \
+        GIT_CONFIG_NOSYSTEM=1 \
+        GIT_CONFIG_GLOBAL=/dev/null \
+        GIT_TERMINAL_PROMPT=0 \
+        GIT_LFS_SKIP_SMUDGE=1 \
+        GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -oBatchMode=yes}" \
+        git "$@"
+}
+
+valid_plugin_id() {
+    [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $1 != *..* ]]
+}
+
+# Submodules are not fetched, so their code would never be reviewed.
+check_repo_complete() {
+    [[ ! -e $1/.gitmodules ]] || fail "submodules are not supported; refusing to review an incomplete plugin"
+}
+
+installed_manifest_for() {
+    "$OMARCHY_BIN_DIR/omarchy-plugin-catalog" | jq -r --arg id "$1" '
+        map(select(.id == $id))[0].manifestPath // empty
+    '
+}
+
+add_plugin() {
+    local url="" enable="" yes=0
+    while (( $# > 0 )); do
+        case "$1" in
+            --enable) enable=true ;;
+            --yes | -y) yes=1 ;;
+            -h | --help)
+                echo "Usage: omarchy plugin add [git-url] [--enable] [--yes]"
+                exit 0
+                ;;
+            -*) fail "unknown add option: $1" ;;
+            *)
+                [[ -z $url ]] || fail "unexpected argument: $1"
+                url=$1
+                ;;
+        esac
+        shift
+    done
+
+    if [[ -z $url ]]; then
+        interactive || fail "a git URL is required (omarchy plugin add <git-url>)"
+        url=$(gum input --prompt "Git URL of the plugin repo: ") || fail "cancelled"
+        [[ -n $url ]] || fail "a git URL is required"
+    fi
+    "$OMARCHY_BIN_DIR/omarchy-git-url-check" "$url" || fail "Omarchy rejected the repository URL"
+
+    STAGE_ROOT=$(mktemp -d "$PLUGINS_DIR/.guardian-add.XXXXXX") || fail "could not create staging directory"
+    local staged="$STAGE_ROOT/repo"
+    safe_git clone --quiet -- "$url" "$staged" || fail "could not clone $url"
+    check_repo_complete "$staged"
+    "$OMARCHY_BIN_DIR/omarchy-plugin-validate" "$staged" || fail "refusing to add: Omarchy's plugin validation failed"
+
+    local id
+    id=$(jq -r '.id' "$staged/manifest.json")
+    valid_plugin_id "$id" || fail "invalid plugin id in manifest: $id"
+
+    "$GUARDIAN" guard --class plugin --identity "plugin:$id" --thorough "$staged" -- \
+        /usr/bin/bash "$SCRIPT_PATH" --guardian-commit-add "$staged" "$id" "${enable:-ask}" "$yes"
+}
+
+# Runs after a clear review, from the reviewed and re-verified checkout.
+commit_add() {
+    (( $# == 4 )) || fail "invalid internal plugin add commit"
+    local staged=$1 id=$2 enable=$3 yes=$4
+    [[ $staged == "$PLUGINS_DIR"/.guardian-add.*/repo && -d $staged && ! -L $staged ]] || fail "invalid staged plugin path"
+    valid_plugin_id "$id" || fail "invalid plugin id"
+
+    local existing
+    existing=$(installed_manifest_for "$id") || fail "could not inspect installed plugin ids"
+    [[ -z $existing ]] || fail "plugin id '$id' is already used by $existing"
+    local target="$PLUGINS_DIR/$id"
+    [[ ! -e $target && ! -L $target ]] || fail "plugin '$id' is already installed; update it with: omarchy plugin update $id"
+
+    mv -- "$staged" "$target" || fail "could not move the reviewed plugin into place"
+    printf 'Added reviewed plugin %s into %s\n' "$id" "$target"
+    omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+
+    if [[ $enable == ask ]]; then
+        enable=false
+        if (( ! yes )) && interactive && gum confirm "Enable '$id' now?"; then
+            enable=true
+        fi
+    fi
+    if [[ $enable == true ]]; then
+        local attempt
+        for (( attempt = 0; attempt < 40; attempt++ )); do
+            "$OMARCHY_BIN_DIR/omarchy-plugin-list" --json | jq -e --arg id "$id" 'any(.[]; .id == $id)' >/dev/null && break
+            sleep 0.05
+        done
+        "$OMARCHY_BIN_DIR/omarchy-plugin-enable" "$id"
+    else
+        printf 'Enable it later with: omarchy plugin enable %s\n' "$id"
+    fi
+}
+
+update_plugins() {
+    local only="" yes=0
+    while (( $# > 0 )); do
+        case "$1" in
+            --yes | -y) yes=1 ;;
+            -h | --help)
+                echo "Usage: omarchy plugin update [id] [--yes]"
+                exit 0
+                ;;
+            -*) fail "unknown update option: $1" ;;
+            *)
+                [[ -z $only ]] || fail "unexpected argument: $1"
+                only=$1
+                ;;
+        esac
+        shift
+    done
+    [[ -d $PLUGINS_DIR ]] || fail "no plugins installed"
+
+    local -a ids=()
+    if [[ -n $only ]]; then
+        valid_plugin_id "$only" || fail "invalid plugin id '$only'"
+        [[ -d $PLUGINS_DIR/$only/.git ]] || fail "plugin '$only' is not an installed git checkout"
+        ids=("$only")
+    else
+        local dir
+        for dir in "$PLUGINS_DIR"/*/; do
+            [[ -d $dir/.git && ! -L ${dir%/} ]] || continue
+            ids+=("$(basename "$dir")")
+        done
+    fi
+    (( ${#ids[@]} > 0 )) || { echo "No git-managed plugins installed."; return 0; }
+
+    STAGE_ROOT=$(mktemp -d "$PLUGINS_DIR/.guardian-update.XXXXXX") || fail "could not create staging directory"
+    local id dir remote url staged
+    local -a changed=() unit_args=()
+    for id in "${ids[@]}"; do
+        dir="$PLUGINS_DIR/$id"
+        [[ -z $(safe_git -C "$dir" status --porcelain --untracked-files=all) ]] ||
+            fail "plugin $id has local changes; commit or stash them before updating"
+        remote=$(safe_git -C "$dir" remote get-url origin) || fail "plugin $id has no origin remote"
+        "$OMARCHY_BIN_DIR/omarchy-git-url-check" "$remote" || fail "Omarchy rejected the remote of $id"
+
+        staged="$STAGE_ROOT/$id"
+        safe_git clone --quiet --no-local -- "$dir" "$staged" || fail "could not stage $id"
+        safe_git -C "$staged" fetch --quiet -- "$remote" HEAD || fail "fetch failed for $id"
+        if [[ $(safe_git -C "$staged" rev-parse HEAD) == $(safe_git -C "$staged" rev-parse FETCH_HEAD) ]]; then
+            printf '%s is up to date.\n' "$id"
+            rm -rf -- "$staged"
+            continue
+        fi
+        safe_git -C "$staged" merge --quiet --ff-only FETCH_HEAD ||
+            fail "cannot fast-forward $id to its remote; the remote history was rewritten"
+        check_repo_complete "$staged"
+        "$OMARCHY_BIN_DIR/omarchy-plugin-validate" "$staged" || fail "update of $id failed Omarchy's plugin validation"
+        changed+=("$id")
+        unit_args+=(--unit "$id" "plugin:$id")
+    done
+    (( ${#changed[@]} > 0 )) || return 0
+
+    "$GUARDIAN" guard --class plugin --thorough "${unit_args[@]}" "$STAGE_ROOT" -- \
+        /usr/bin/bash "$SCRIPT_PATH" --guardian-commit-update "$STAGE_ROOT" "$yes" "${changed[@]}"
+}
+
+# Fast-forwards each installed plugin to exactly the commit that was reviewed,
+# fetched from the reviewed staging copy rather than from the remote again.
+commit_update() {
+    (( $# >= 3 )) || fail "invalid internal plugin update commit"
+    local stage_root=$1 yes=$2
+    shift 2
+    [[ $stage_root == "$PLUGINS_DIR"/.guardian-update.* ]] || fail "invalid staged update path"
+
+    local id dir staged commit updated=0
+    for id in "$@"; do
+        valid_plugin_id "$id" || fail "invalid plugin id in update commit"
+        dir="$PLUGINS_DIR/$id"
+        staged="$stage_root/$id"
+        commit=$(safe_git -C "$staged" rev-parse HEAD) || fail "reviewed checkout of $id is unreadable"
+        if (( ! yes )) && interactive && ! gum confirm "Apply the reviewed update of $id?"; then
+            printf 'Skipped %s.\n' "$id"
+            continue
+        fi
+        safe_git -C "$dir" fetch --quiet -- "$staged" HEAD || fail "could not bring the reviewed commit of $id in"
+        [[ $(safe_git -C "$dir" rev-parse FETCH_HEAD) == "$commit" ]] || fail "the staged checkout of $id changed after the review"
+        safe_git -C "$dir" merge --quiet --ff-only "$commit" ||
+            fail "cannot fast-forward $id; it changed after the review"
+        if ! "$OMARCHY_BIN_DIR/omarchy-plugin-validate" "$dir"; then
+            safe_git -C "$dir" reset --quiet --hard ORIG_HEAD
+            fail "update of $id failed validation; rolled back"
+        fi
+        printf 'Updated %s to the reviewed %s.\n' "$id" "${commit:0:12}"
+        updated=1
+    done
+    (( ! updated )) || omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+}
+
+case "$MODE" in
+    add | install) add_plugin "$@" ;;
+    update) update_plugins "$@" ;;
+    --guardian-commit-add) commit_add "$@" ;;
+    --guardian-commit-update) commit_update "$@" ;;
+    *) fail "usage: omarchy plugin {add [git-url] [--enable] [--yes]|update [id] [--yes]}" ;;
+esac

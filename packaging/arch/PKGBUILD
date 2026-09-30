@@ -46,6 +46,7 @@ package() {
     install -Dm755 integrations/pacman/guardian-pacman-hook "$lib/guardian-pacman-hook"
     install -Dm755 integrations/yay/guardian-makepkg "$lib/guardian-makepkg"
     install -Dm755 integrations/omarchy/guardian-theme "$lib/guardian-theme"
+    install -Dm755 integrations/omarchy/guardian-plugin "$lib/guardian-plugin"
     install -Dm644 integrations/omarchy/omarchy-bash-interceptor.sh "$lib/omarchy-bash-interceptor.sh"
     install -Dm755 integrations/omarchy/install-user-interceptor.sh "$lib/install-user-interceptor.sh"
     install -Dm755 integrations/enable-system-hook.sh "$lib/enable-system-hook.sh"
