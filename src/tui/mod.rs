@@ -8,6 +8,7 @@ mod canvas;
 mod fields;
 mod integrations;
 mod mascot;
+pub mod status;
 mod term;
 
 use std::env;
@@ -202,7 +203,11 @@ fn run_plan(paths: &Paths, plan: &Plan) -> Result<String, String> {
             | Step::AddMenuEntry
             | Step::RemoveMenuEntry
             | Step::AddThemeMenu
-            | Step::RemoveThemeMenu => {
+            | Step::RemoveThemeMenu
+            | Step::InstallBarWidget
+            | Step::RemoveBarWidget
+            | Step::AddWaybarModule
+            | Step::RemoveWaybarModule => {
                 paths.edit(step)?;
             }
         }
@@ -210,13 +215,15 @@ fn run_plan(paths: &Paths, plan: &Plan) -> Result<String, String> {
     Ok(format!("{}: done.", plan.summary))
 }
 
-/// The gates that protect installs, plus the menu entry: what
-/// `omarchy-guardian protect` and the installer turn on.
-const PROTECT: [Integration; 4] = [
+/// The gates that protect installs, plus the menu entry and the bar widgets:
+/// what `omarchy-guardian protect` and the installer turn on.
+const PROTECT: [Integration; 6] = [
     Integration::PacmanHook,
     Integration::AurGate,
     Integration::ThemeInterceptor,
     Integration::MenuEntry,
+    Integration::BarWidget,
+    Integration::WaybarModule,
 ];
 
 /// `omarchy-guardian protect`: turns on every gate that is off, after
@@ -265,6 +272,46 @@ pub fn protect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String> {
         println!("  {line}");
     }
     if !yes && !confirm.confirm("Go ahead?") {
+        return Err("nothing was changed".into());
+    }
+    run_plan(&paths, &plan)
+}
+
+/// `omarchy-guardian protect --off`: turns the three install gates off (the
+/// menu entry and the bar widget stay), after showing each step and, unless
+/// `yes`, asking. A hand-installed pacman hook is left alone.
+pub fn unprotect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String> {
+    let settings = Settings::load();
+    let paths = paths(&settings).ok_or("HOME is not set")?;
+    let mut steps = Vec::new();
+    for integration in [
+        Integration::PacmanHook,
+        Integration::AurGate,
+        Integration::ThemeInterceptor,
+    ] {
+        match paths.state(integration) {
+            State::On | State::Partial(_) => {
+                if let Some(plan) = paths.plan(integration, &State::On) {
+                    steps.extend(plan.steps);
+                }
+            }
+            State::Foreign(detail) => println!("- {} left as is: {detail}", integration.label()),
+            State::Off | State::Unavailable(_) => {}
+        }
+    }
+    if steps.is_empty() {
+        return Ok("Protection is already off.".into());
+    }
+    let plan = Plan {
+        summary: "Protection off".into(),
+        steps,
+    };
+    println!("To turn protection off, Guardian will:");
+    for line in plan.describe(&paths) {
+        println!("  {line}");
+    }
+    println!("Until you turn it back on, installs are not reviewed.");
+    if !yes && !confirm.confirm("Turn protection off?") {
         return Err("nothing was changed".into());
     }
     run_plan(&paths, &plan)

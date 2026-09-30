@@ -45,6 +45,14 @@ plugins, and reviews that code **before any of it runs**:
   button opens Claude Code (or OpenCode) in a terminal with the report and
   every tool switched off, so you can ask what was found and whether it is a
   false positive, and nothing in the report can make the agent act.
+- **In your bar.** The Guardian knight sits in the bar: calm when every gate
+  is on, red-eyed when something needs attention (a gate is off, a setting is
+  broken, or a block in the last day is unseen), dim when protection is off.
+  In Waybar its tooltip lists the gates, problems and last block; left-click
+  opens the settings app and right-click the last report. In Omarchy's shell
+  bar it opens a panel with the same details and tiles for the report,
+  turning protection on or off, and the settings. `omarchy-guardian protect`
+  adds it to whichever bar you run.
 - **Nothing to babysit.** The settings app (`omarchy-guardian tui`) turns
   every gate on with *Protect everything*, picks the protection level and the
   model, and tests the reviewer with a malicious and a harmless sample.
@@ -465,8 +473,9 @@ omarchy-guardian protect                      # or: omarchy-guardian tui › Pro
 ```
 
 `omarchy-guardian protect` turns on the pacman hook, the yay AUR gate, the
-theme & plugin gate and the Omarchy menu entry, showing each step and asking
-first (`--yes` skips the question). It leaves the pacman hook off when the
+theme & plugin gate, the Omarchy menu entry and the bar widget (Waybar and/or
+Omarchy's shell bar), showing each step and asking first (`--yes` skips the
+question); `protect --off` turns the three install gates off the same way. It leaves the pacman hook off when the
 pacman gate could not review with the current settings. `omarchy-guardian
 test` runs the two-sample reviewer test from the terminal.
 

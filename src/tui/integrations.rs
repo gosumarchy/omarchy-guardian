@@ -1,5 +1,6 @@
 //! The pieces that connect Guardian to the system: the pacman hook, the yay
-//! makepkg gate, the Bash theme interceptor and the Omarchy menu entry.
+//! makepkg gate, the Bash theme interceptor, the Omarchy menu entry and the
+//! bar widget.
 //! Each has a state read from disk and a plan to turn it on or off. Plans
 //! that need root or another program run as commands on the terminal (so
 //! `sudo` can ask for a password); the rest are small, exact file edits.
@@ -17,6 +18,18 @@ pub const INTERCEPTOR_INSTALLER: &str = "/usr/lib/omarchy-guardian/install-user-
 const INTERCEPTOR_MARKER: &str = "# Omarchy Guardian theme command interception";
 const INTERCEPTOR_SOURCE: &str = "/usr/lib/omarchy-guardian/omarchy-bash-interceptor.sh";
 const MENU_ID: &str = "\"setup.guardian\"";
+/// The bar widget plugin the package ships, and its Omarchy plugin id.
+pub const WIDGET_SOURCE: &str = "/usr/share/omarchy-guardian/bar-widget";
+const WIDGET_ID: &str = "omarchy-guardian";
+/// The Waybar module: an image module showing the Guardian knight (calm,
+/// alert or dimmed), its name in a modules list, its definition (one line, so
+/// it can be found and removed exactly), and the markers of its style block.
+const WAYBAR_MODULE: &str = "\"image#omarchy-guardian\"";
+const WAYBAR_DEFINITION: &str = "  \"image#omarchy-guardian\": {\"exec\": \"omarchy-guardian status --waybar\", \"size\": 18, \"interval\": 30, \"signal\": 9, \"tooltip\": true, \"on-click\": \"omarchy-launch-tui --app-id=TUI.float omarchy-guardian tui\", \"on-click-right\": \"omarchy-guardian status --open-report\"},";
+const WAYBAR_STYLE_BEGIN: &str = "/* Omarchy Guardian: begin */";
+const WAYBAR_STYLE_END: &str = "/* Omarchy Guardian: end */";
+/// Waybar's CSS name for `image#omarchy-guardian`.
+const WAYBAR_SELECTOR: &str = "#image.omarchy-guardian";
 /// Omarchy menu items that install or update themes and plugins, overridden
 /// so they run through Guardian. The menu keeps each item's other fields.
 const THEME_OVERRIDES: [(&str, &str); 3] = [
@@ -47,14 +60,18 @@ pub enum Integration {
     AurGate,
     ThemeInterceptor,
     MenuEntry,
+    BarWidget,
+    WaybarModule,
 }
 
 impl Integration {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 6] = [
         Self::PacmanHook,
         Self::AurGate,
         Self::ThemeInterceptor,
         Self::MenuEntry,
+        Self::BarWidget,
+        Self::WaybarModule,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -63,6 +80,8 @@ impl Integration {
             Self::AurGate => "AUR gate (yay)",
             Self::ThemeInterceptor => "Theme & plugin gate",
             Self::MenuEntry => "Omarchy menu entry",
+            Self::BarWidget => "Bar widget",
+            Self::WaybarModule => "Waybar module",
         }
     }
 
@@ -76,6 +95,12 @@ impl Integration {
                 "Routes theme and plugin installs and updates through Guardian, from Bash (new shells) and from the Omarchy menu."
             }
             Self::MenuEntry => "Adds Setup › Guardian to the Omarchy menu, opening this window.",
+            Self::BarWidget => {
+                "A shield in the Omarchy bar showing whether Guardian protects this machine, what needs attention and the last block."
+            }
+            Self::WaybarModule => {
+                "The Guardian knight in Waybar: calm, red-eyed when something needs attention, dim when protection is off; its tooltip has the details, left-click opens this window, right-click the last report."
+            }
         }
     }
 }
@@ -103,6 +128,10 @@ pub enum Step {
     RemoveMenuEntry,
     AddThemeMenu,
     RemoveThemeMenu,
+    InstallBarWidget,
+    RemoveBarWidget,
+    AddWaybarModule,
+    RemoveWaybarModule,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,6 +166,21 @@ impl Plan {
                     "edit {}: give the menu's theme and plugin items back to Omarchy",
                     paths.menu.display()
                 ),
+                Step::InstallBarWidget => format!(
+                    "copy the Guardian bar widget into {}",
+                    paths.widget_target.display()
+                ),
+                Step::RemoveBarWidget => format!("remove {}", paths.widget_target.display()),
+                Step::AddWaybarModule => format!(
+                    "edit {} and {}: add the Guardian module",
+                    paths.waybar_config.display(),
+                    paths.waybar_style.display()
+                ),
+                Step::RemoveWaybarModule => format!(
+                    "edit {} and {}: remove the Guardian module",
+                    paths.waybar_config.display(),
+                    paths.waybar_style.display()
+                ),
             })
             .collect()
     }
@@ -162,6 +206,11 @@ pub struct Paths {
     pub bashrc: PathBuf,
     pub omarchy: PathBuf,
     pub menu: PathBuf,
+    pub widget_source: PathBuf,
+    pub widget_target: PathBuf,
+    pub shell_config: PathBuf,
+    pub waybar_config: PathBuf,
+    pub waybar_style: PathBuf,
     /// The pacman gate needs a root-owned OpenCode and none is installed
     /// (see `pacman::preflight`).
     pub opencode_missing: bool,
@@ -185,6 +234,16 @@ impl Paths {
             bashrc: home.join(".bashrc"),
             omarchy: "/usr/share/omarchy".into(),
             menu: config.join("omarchy/extensions/omarchy-menu.jsonc"),
+            widget_source: WIDGET_SOURCE.into(),
+            widget_target: config.join("omarchy/plugins").join(WIDGET_ID),
+            shell_config: config.join("omarchy/shell.json"),
+            // Waybar reads `config.jsonc` before `config`.
+            waybar_config: ["waybar/config.jsonc", "waybar/config"]
+                .iter()
+                .map(|name| config.join(name))
+                .find(|path| path.is_file())
+                .unwrap_or_else(|| config.join("waybar/config.jsonc")),
+            waybar_style: config.join("waybar/style.css"),
             opencode_missing,
         })
     }
@@ -237,7 +296,78 @@ impl Paths {
                     fs::read_to_string(&self.menu).is_ok_and(|text| text.contains(MENU_ID));
                 if enabled { State::On } else { State::Off }
             }
+            Integration::BarWidget => self.widget_state(),
+            Integration::WaybarModule => self.waybar_state(),
         }
+    }
+
+    fn waybar_state(&self) -> State {
+        let Ok(config) = fs::read_to_string(&self.waybar_config) else {
+            return State::Unavailable("no Waybar configuration".into());
+        };
+        let defined = config
+            .lines()
+            .any(|line| line.trim_start().starts_with(&format!("{WAYBAR_MODULE}:")));
+        let placed = config.lines().any(|line| {
+            line.contains(WAYBAR_MODULE)
+                && !line.trim_start().starts_with(&format!("{WAYBAR_MODULE}:"))
+        });
+        let styled = fs::read_to_string(&self.waybar_style).is_ok_and(|style| {
+            style.contains(WAYBAR_STYLE_BEGIN) && style.contains(WAYBAR_STYLE_END)
+        });
+        match (defined, placed, styled) {
+            (true, true, true) => State::On,
+            (false, false, _) => State::Off,
+            _ => State::Partial("partly set up; turning it on completes it".into()),
+        }
+    }
+
+    fn widget_state(&self) -> State {
+        if !self.widget_source.is_dir() {
+            return State::Unavailable("the omarchy-guardian package is not installed".into());
+        }
+        if !self.omarchy.join("bin/omarchy-plugin-enable").exists() {
+            return State::Unavailable("this Omarchy has no shell plugins".into());
+        }
+        let installed = self.widget_target.join("manifest.json").is_file();
+        let current = installed && self.widget_is_current();
+        match (installed, self.widget_in_bar()) {
+            (true, true) if current => State::On,
+            (true, true) => State::Partial("an older copy; turning it on updates it".into()),
+            (true, false) => State::Partial("installed but not in the bar".into()),
+            (false, _) => State::Off,
+        }
+    }
+
+    /// Whether every packaged widget file is installed unchanged.
+    fn widget_is_current(&self) -> bool {
+        widget_files(&self.widget_source).iter().all(|name| {
+            fs::read(self.widget_source.join(name)).ok()
+                == fs::read(self.widget_target.join(name)).ok()
+        })
+    }
+
+    /// Whether the widget is placed in the bar (`bar.layout` of shell.json).
+    fn widget_in_bar(&self) -> bool {
+        let Some(config) = fs::read_to_string(&self.shell_config)
+            .ok()
+            .and_then(|text| Json::parse(&text).ok())
+        else {
+            return false;
+        };
+        let Some(layout) = config.get("bar").and_then(|bar| bar.get("layout")) else {
+            return false;
+        };
+        ["left", "center", "right"].iter().any(|section| {
+            layout
+                .get(section)
+                .and_then(Json::as_array)
+                .is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|entry| entry.get("id").and_then(Json::as_str) == Some(WIDGET_ID))
+                })
+        })
     }
 
     fn hook_state(&self) -> State {
@@ -315,6 +445,35 @@ impl Paths {
                 },
                 self.theme_steps(on),
             ),
+            (Integration::BarWidget, _) => (
+                if on {
+                    "Add the Guardian bar widget"
+                } else {
+                    "Remove the Guardian bar widget"
+                },
+                self.widget_steps(on),
+            ),
+            (Integration::WaybarModule, _) => (
+                if on {
+                    "Add the Guardian Waybar module"
+                } else {
+                    "Remove the Guardian Waybar module"
+                },
+                vec![
+                    if on {
+                        Step::AddWaybarModule
+                    } else {
+                        Step::RemoveWaybarModule
+                    },
+                    // SIGUSR2 makes a running Waybar reload its config and style.
+                    Step::Optional(vec![
+                        "pkill".into(),
+                        "-SIGUSR2".into(),
+                        "-x".into(),
+                        "waybar".into(),
+                    ]),
+                ],
+            ),
             (Integration::MenuEntry, _) => (
                 if on {
                     "Add the Omarchy menu entry"
@@ -360,6 +519,37 @@ impl Paths {
             ]));
         }
         steps
+    }
+
+    /// Installs (or updates) the widget and puts it in the bar, or takes it
+    /// out and removes it.
+    fn widget_steps(&self, on: bool) -> Vec<Step> {
+        let omarchy_bin = |name: &str| self.omarchy.join("bin").join(name).display().to_string();
+        if on {
+            let mut steps = vec![
+                Step::InstallBarWidget,
+                Step::Optional(vec![
+                    "omarchy-shell".into(),
+                    "shell".into(),
+                    "rescanPlugins".into(),
+                ]),
+            ];
+            if !self.widget_in_bar() {
+                steps.push(Step::Command(vec![
+                    omarchy_bin("omarchy-plugin-enable"),
+                    WIDGET_ID.into(),
+                ]));
+            }
+            steps
+        } else {
+            vec![
+                Step::Optional(vec![
+                    omarchy_bin("omarchy-plugin-disable"),
+                    WIDGET_ID.into(),
+                ]),
+                Step::RemoveBarWidget,
+            ]
+        }
     }
 
     /// Brings both halves of the theme gate, Bash and the Omarchy menu, to
@@ -415,6 +605,59 @@ impl Paths {
             Step::RemoveThemeMenu => self.remove_menu_lines(&|line| {
                 line.contains(THEME_GATE) && THEME_OVERRIDES.iter().any(|(id, _)| line.contains(id))
             }),
+            Step::InstallBarWidget => {
+                fs::create_dir_all(&self.widget_target).map_err(|error| error.to_string())?;
+                for name in widget_files(&self.widget_source) {
+                    fs::copy(
+                        self.widget_source.join(&name),
+                        self.widget_target.join(&name),
+                    )
+                    .map_err(|error| format!("{name}: {error}"))?;
+                }
+                Ok(())
+            }
+            // Only a folder holding Guardian's own widget is removed.
+            Step::RemoveBarWidget => {
+                let manifest = self.widget_target.join("manifest.json");
+                let ours = fs::read_to_string(&manifest)
+                    .ok()
+                    .and_then(|text| Json::parse(&text).ok())
+                    .is_some_and(|json| json.get("id").and_then(Json::as_str) == Some(WIDGET_ID));
+                if !ours {
+                    return Ok(());
+                }
+                fs::remove_dir_all(&self.widget_target).map_err(|error| error.to_string())
+            }
+            Step::AddWaybarModule => {
+                let config =
+                    fs::read_to_string(&self.waybar_config).map_err(|error| error.to_string())?;
+                fs::write(&self.waybar_config, with_waybar_module(&config)?)
+                    .map_err(|error| error.to_string())?;
+                let style = without_waybar_style(
+                    &fs::read_to_string(&self.waybar_style).unwrap_or_default(),
+                );
+                let separator = if style.is_empty() || style.ends_with('\n') {
+                    ""
+                } else {
+                    "\n"
+                };
+                fs::write(
+                    &self.waybar_style,
+                    format!("{style}{separator}\n{}", waybar_style(&style)),
+                )
+                .map_err(|error| error.to_string())
+            }
+            Step::RemoveWaybarModule => {
+                if let Ok(config) = fs::read_to_string(&self.waybar_config) {
+                    fs::write(&self.waybar_config, without_waybar_module(&config))
+                        .map_err(|error| error.to_string())?;
+                }
+                if let Ok(style) = fs::read_to_string(&self.waybar_style) {
+                    fs::write(&self.waybar_style, without_waybar_style(&style))
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            }
             Step::Command(_) | Step::Optional(_) => Ok(()),
         }
     }
@@ -442,6 +685,116 @@ impl Paths {
 }
 
 /// A command run with sudo on the terminal.
+/// `config` with the Guardian module defined (one line after the opening
+/// brace) and placed first in `modules-right`. Written in place, keeping every
+/// other line (and any comments) as it was.
+fn with_waybar_module(config: &str) -> Result<String, String> {
+    let config = without_waybar_module(config);
+    let mut lines: Vec<String> = config.lines().map(str::to_string).collect();
+    let opening = lines
+        .iter()
+        .position(|line| line.trim() == "{")
+        .ok_or("the Waybar config does not start with a single object")?;
+    let modules = lines
+        .iter()
+        .position(|line| line.contains("\"modules-right\"") && line.contains('['))
+        .ok_or("the Waybar config has no \"modules-right\" list")?;
+    let line = &lines[modules];
+    let at = line.find('[').map_or(line.len(), |index| index + 1);
+    let rest = line[at..].trim_start();
+    let comma = if rest.starts_with(']') { "" } else { ", " };
+    lines[modules] = format!("{}{WAYBAR_MODULE}{comma}{rest}", &line[..at]);
+    lines.insert(opening + 1, WAYBAR_DEFINITION.to_string());
+    Ok(lines.join("\n") + "\n")
+}
+
+/// `config` without the Guardian module's definition line or list entries.
+fn without_waybar_module(config: &str) -> String {
+    let definition = format!("{WAYBAR_MODULE}:");
+    let kept: Vec<String> = config
+        .lines()
+        .filter(|line| !line.trim_start().starts_with(&definition))
+        .map(|line| {
+            line.replace(&format!("{WAYBAR_MODULE}, "), "")
+                .replace(&format!(", {WAYBAR_MODULE}"), "")
+                .replace(WAYBAR_MODULE, "")
+        })
+        .collect();
+    let mut text = kept.join("\n");
+    if config.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
+/// The Guardian block for `style`: the knight takes the declarations of the
+/// user's own rule for `#battery` (else `#network`), so it sits in the bar
+/// like its neighbours.
+fn waybar_style(style: &str) -> String {
+    let base = ["#battery", "#network"]
+        .iter()
+        .find_map(|id| rule_declarations(style, id))
+        .unwrap_or_else(|| "padding: 0 8px;".to_string());
+    format!("{WAYBAR_STYLE_BEGIN}\n{WAYBAR_SELECTOR} {{ {base} }}\n{WAYBAR_STYLE_END}\n")
+}
+
+/// The declarations of the first rule whose selector list names `id`
+/// exactly (not `#battery.warning`), on one line.
+fn rule_declarations(style: &str, id: &str) -> Option<String> {
+    let mut rest = style;
+    while let Some(open) = rest.find('{') {
+        let close = open + rest[open..].find('}')?;
+        let selector = rest[..open].rsplit(['}', ';']).next().unwrap_or_default();
+        if selector.split(',').map(str::trim).any(|name| name == id) {
+            let body: Vec<&str> = rest[open + 1..close]
+                .split(';')
+                .map(str::trim)
+                .filter(|declaration| !declaration.is_empty() && !declaration.starts_with("/*"))
+                .collect();
+            return Some(format!("{};", body.join("; ")));
+        }
+        rest = &rest[close + 1..];
+    }
+    None
+}
+
+/// `style` without the Guardian block (and the blank line before it).
+fn without_waybar_style(style: &str) -> String {
+    let (Some(begin), Some(end)) = (style.find(WAYBAR_STYLE_BEGIN), style.find(WAYBAR_STYLE_END))
+    else {
+        return style.to_string();
+    };
+    if end < begin {
+        return style.to_string();
+    }
+    let after = end + WAYBAR_STYLE_END.len();
+    let tail = style[after..].strip_prefix('\n').unwrap_or(&style[after..]);
+    let head = style[..begin]
+        .strip_suffix("\n\n")
+        .map_or(&style[..begin], |head| head);
+    let head = if head.ends_with('\n') || head.is_empty() {
+        head.to_string()
+    } else {
+        format!("{head}\n")
+    };
+    format!("{head}{tail}")
+}
+
+/// The regular files of the packaged widget (it has no subfolders).
+fn widget_files(source: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(source)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
 fn sudo(args: &[&str]) -> Step {
     let mut argv = vec!["/usr/bin/sudo".to_string()];
     argv.extend(args.iter().map(ToString::to_string));
@@ -536,6 +889,11 @@ mod tests {
             bashrc: root.join("bashrc"),
             omarchy: root.join("omarchy"),
             menu: root.join("menu/omarchy-menu.jsonc"),
+            widget_source: root.join("share/bar-widget"),
+            widget_target: root.join("plugins/omarchy-guardian"),
+            shell_config: root.join("shell.json"),
+            waybar_config: root.join("waybar/config"),
+            waybar_style: root.join("waybar/style.css"),
             opencode_missing: false,
         }
     }
@@ -705,5 +1063,67 @@ mod tests {
         }
         assert_eq!(paths.state(Integration::ThemeInterceptor), State::Off);
         assert_eq!(fs::read_to_string(&paths.menu).unwrap(), own);
+    }
+
+    const WAYBAR_CONFIG: &str = "{\n  \"layer\": \"top\",\n  \"modules-left\": [\"custom/omarchy\"],\n  \"modules-right\": [\"network\", \"battery\"],\n  // a comment\n  \"clock\": {}\n}\n";
+
+    #[test]
+    fn the_waybar_module_is_added_and_removed_exactly() {
+        let added = super::with_waybar_module(WAYBAR_CONFIG).unwrap();
+        assert!(
+            added.contains(
+                "\"modules-right\": [\"image#omarchy-guardian\", \"network\", \"battery\"]"
+            )
+        );
+        assert_eq!(added.lines().nth(1).unwrap(), super::WAYBAR_DEFINITION);
+        assert!(added.contains("// a comment"));
+        // Adding twice keeps one copy.
+        assert_eq!(super::with_waybar_module(&added).unwrap(), added);
+        assert_eq!(super::without_waybar_module(&added), WAYBAR_CONFIG);
+
+        let empty = "{\n  \"modules-right\": [],\n}\n";
+        assert!(
+            super::with_waybar_module(empty)
+                .unwrap()
+                .contains("[\"image#omarchy-guardian\"]")
+        );
+        assert!(super::with_waybar_module("{\n}\n").is_err());
+    }
+
+    #[test]
+    fn the_waybar_integration_round_trips_config_and_style() {
+        let dir = TempDir::new("integrations-waybar");
+        let paths = paths(&dir);
+        assert!(matches!(
+            paths.state(Integration::WaybarModule),
+            State::Unavailable(_)
+        ));
+        fs::create_dir_all(dir.path().join("waybar")).unwrap();
+        fs::write(&paths.waybar_config, WAYBAR_CONFIG).unwrap();
+        let style = "* { font-size: 12px; }\n\n#network,\n#battery {\n  padding: 0 9px;\n  border-radius: 11px;\n}\n\n#battery.warning { color: red; }\n";
+        fs::write(&paths.waybar_style, style).unwrap();
+        assert_eq!(paths.state(Integration::WaybarModule), State::Off);
+
+        let on = paths.plan(Integration::WaybarModule, &State::Off).unwrap();
+        for step in &on.steps {
+            paths.edit(step).unwrap();
+        }
+        assert_eq!(paths.state(Integration::WaybarModule), State::On);
+        assert!(
+            fs::read_to_string(&paths.waybar_style)
+                .unwrap()
+                .contains("#image.omarchy-guardian { padding: 0 9px; border-radius: 11px; }")
+        );
+
+        let off = paths.plan(Integration::WaybarModule, &State::On).unwrap();
+        for step in &off.steps {
+            paths.edit(step).unwrap();
+        }
+        assert_eq!(paths.state(Integration::WaybarModule), State::Off);
+        assert_eq!(
+            fs::read_to_string(&paths.waybar_config).unwrap(),
+            WAYBAR_CONFIG
+        );
+        assert_eq!(fs::read_to_string(&paths.waybar_style).unwrap(), style);
     }
 }

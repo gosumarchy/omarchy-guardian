@@ -61,5 +61,11 @@ package() {
         "$pkgdir/usr/share/icons/hicolor/scalable/apps/omarchy-guardian.svg"
     install -Dm644 integrations/icons/omarchy-guardian-alert.svg \
         "$pkgdir/usr/share/icons/hicolor/scalable/apps/omarchy-guardian-alert.svg"
+    install -Dm644 integrations/icons/omarchy-guardian-off.svg \
+        "$pkgdir/usr/share/icons/hicolor/scalable/apps/omarchy-guardian-off.svg"
+    install -Dm644 integrations/omarchy/bar-widget/manifest.json \
+        "$pkgdir/usr/share/omarchy-guardian/bar-widget/manifest.json"
+    install -Dm644 integrations/omarchy/bar-widget/Widget.qml \
+        "$pkgdir/usr/share/omarchy-guardian/bar-widget/Widget.qml"
     install -Dm644 README.md "$pkgdir/usr/share/doc/omarchy-guardian/README.md"
 }

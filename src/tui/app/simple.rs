@@ -558,6 +558,8 @@ const fn gate_name(gate: Integration) -> &'static str {
         Integration::AurGate => "AUR",
         Integration::ThemeInterceptor => "themes & plugins",
         Integration::MenuEntry => "menu",
+        Integration::BarWidget => "bar widget",
+        Integration::WaybarModule => "Waybar module",
     }
 }
 
@@ -693,6 +695,11 @@ mod tests {
             bashrc: root.join("bashrc"),
             omarchy: root.join("omarchy"),
             menu: root.join("menu.jsonc"),
+            widget_source: root.join("widget"),
+            widget_target: root.join("plugins/omarchy-guardian"),
+            shell_config: root.join("shell.json"),
+            waybar_config: root.join("waybar/config"),
+            waybar_style: root.join("waybar/style.css"),
             opencode_missing: false,
         };
         let mut app = App::new(files(Some(paths)), Mode::Simple);

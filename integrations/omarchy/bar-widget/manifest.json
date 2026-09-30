@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "omarchy-guardian",
+  "name": "Omarchy Guardian",
+  "version": "1.0.0",
+  "author": "Omarchy Guardian",
+  "license": "MIT",
+  "description": "Guardian's protection status in the bar: gates, problems to fix and the last block.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Widget.qml" },
+  "barWidget": {
+    "displayName": "Guardian",
+    "description": "Shows whether Guardian protects this machine and anything that needs attention.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": { "refreshIntervalSec": 30 },
+    "schema": [
+      { "key": "refreshIntervalSec", "type": "integer", "label": "Refresh interval (seconds)",
+        "min": 10, "max": 3600, "step": 10, "defaultValue": 30 }
+    ]
+  }
+}
