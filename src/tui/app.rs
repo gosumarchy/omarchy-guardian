@@ -364,11 +364,12 @@ impl App {
     /// Called when no key arrived for a while; returns whether to redraw.
     pub fn tick(&mut self) -> bool {
         self.ticks += 1;
-        self.mode == Mode::Simple && (self.ticks.is_multiple_of(20) || self.ticks % 20 == 1)
+        self.mode == Mode::Simple && matches!(self.ticks % 20, 0 | 19)
     }
 
     fn blinking(&self) -> bool {
-        self.ticks.is_multiple_of(20)
+        // One 200 ms tick in twenty, never on the first frame.
+        self.ticks % 20 == 19
     }
 
     pub fn handle(&mut self, key: Key) -> Option<Effect> {

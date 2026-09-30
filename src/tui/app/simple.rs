@@ -299,10 +299,10 @@ impl App {
 
         self.simple_cursor = self.simple_cursor.min(self.simple_items().len() - 1);
         let (speech, tone) = self.speech();
-        let with_mascot = height >= 26;
+        let with_mascot = height >= 27;
         let mut y = 2;
         if with_mascot {
-            mascot::draw(canvas, 4, 2, self.mood(), self.blinking());
+            mascot::draw(canvas, 3, 1, self.mood(), self.blinking());
             let bubble_x = 4 + mascot::WIDTH + 2;
             let bubble_width = width.saturating_sub(bubble_x + 3).min(60);
             let lines = wrap(&speech, bubble_width.saturating_sub(5));
@@ -314,7 +314,7 @@ impl App {
                 &lines[..lines.len().min(4)],
                 tone,
             );
-            y += mascot::HEIGHT + 1;
+            y = 1 + mascot::HEIGHT + 1;
         }
         y = self.draw_levels(canvas, y);
         y = self.draw_model(canvas, y + 1);
@@ -580,7 +580,8 @@ mod tests {
     fn shows_the_mascot_levels_and_model() {
         let mut app = App::new(files(None), Mode::Simple);
         let text = screen(&mut app);
-        assert!(text.contains("▄████████████▄"), "{text}");
+        assert!(text.contains("▄█▀▀▀██████▄"), "{text}");
+        assert!(text.contains("██▀▀████▀▀██"), "open eyes: {text}");
         assert!(text.contains("● Balanced"));
         assert!(text.contains("Balanced protection is on"));
         assert!(text.contains("OpenCode default"));
