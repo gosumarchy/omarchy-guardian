@@ -310,10 +310,7 @@ impl Reader<'_> {
             (from, line) = (0, 1);
         }
         // Splitting on newlines yields one more piece than there are newlines.
-        line += self.bytes[from..end]
-            .split(|byte| *byte == b'\n')
-            .count()
-            - 1;
+        line += self.bytes[from..end].split(|byte| *byte == b'\n').count() - 1;
         self.counted.set((end, line));
         line
     }
