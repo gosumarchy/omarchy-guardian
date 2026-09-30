@@ -363,11 +363,14 @@ impl Runner<'_> {
                 }
                 Ok(binary) => {
                     let settings = self.group.settings;
-                    let probe = review_with_retry(&binary, &requests[first], settings);
+                    let isolated = matches!(self.opencode, OpenCode::SystemOnly);
+                    let probe = review_with_retry(&binary, &requests[first], settings, isolated);
                     let proceed = probe.0.is_ok();
                     results[first] = Some(probe);
                     if proceed {
-                        for (index, result) in review_parallel(&binary, requests, rest, settings) {
+                        for (index, result) in
+                            review_parallel(&binary, requests, rest, settings, isolated)
+                        {
                             results[index] = Some(result);
                         }
                     }
@@ -471,8 +474,20 @@ fn not_attempted(reason: &str) -> AgentOutcome {
 /// One review, retried once after a short pause when the AI was unavailable
 /// for a reason a retry can fix: not a timeout, which would double a long
 /// wait, and not a reviewer that could not be started.
-fn review_with_retry(binary: &Path, request: &Request, settings: &AgentSettings) -> Live {
-    let review = || agent::review(binary, &|nonce: &str| request.render(nonce), settings);
+fn review_with_retry(
+    binary: &Path,
+    request: &Request,
+    settings: &AgentSettings,
+    isolated: bool,
+) -> Live {
+    let review = || {
+        agent::review(
+            binary,
+            &|nonce: &str| request.render(nonce),
+            settings,
+            isolated,
+        )
+    };
     match review() {
         Err(AgentError::Unavailable(error)) if is_retryable(&error) => {
             thread::sleep(RETRY_DELAY);
@@ -498,6 +513,7 @@ fn review_parallel(
     requests: &[Request],
     indexes: &[usize],
     settings: &AgentSettings,
+    isolated: bool,
 ) -> Vec<(usize, Live)> {
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
@@ -509,7 +525,7 @@ fn review_parallel(
                     let Some(&index) = indexes.get(next.fetch_add(1, Ordering::SeqCst)) else {
                         break;
                     };
-                    let live = review_with_retry(binary, &requests[index], settings);
+                    let live = review_with_retry(binary, &requests[index], settings, isolated);
                     if live.0.is_err() {
                         stop.store(true, Ordering::SeqCst);
                     }

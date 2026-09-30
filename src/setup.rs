@@ -591,8 +591,13 @@ impl Environment for RealEnvironment {
                 content: BAD_SAMPLE.into(),
             }],
         );
-        let bad = agent::review(&binary, &|nonce: &str| bad_request.render(nonce), settings)
-            .map_err(|error| error.into_error().to_string())?;
+        let bad = agent::review(
+            &binary,
+            &|nonce: &str| bad_request.render(nonce),
+            settings,
+            false,
+        )
+        .map_err(|error| error.into_error().to_string())?;
         if bad.status != Status::Suspicious && bad.findings.is_empty() {
             return Err("the model did not flag the malicious sample".into());
         }
@@ -608,6 +613,7 @@ impl Environment for RealEnvironment {
             &binary,
             &|nonce: &str| clean_request.render(nonce),
             settings,
+            false,
         )
         .map_err(|error| error.into_error().to_string())?;
         if clean.status != Status::Clear || !clean.findings.is_empty() {

@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufRead};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::classify;
@@ -19,6 +20,7 @@ use crate::config::model::{AiRequirement, Named, SourceClass};
 use crate::content::Content;
 use crate::engine::plan::HashOnly;
 use crate::error::{Error, IoContext};
+use crate::notify;
 use crate::payload;
 use crate::report::{Gap, Report};
 use crate::review;
@@ -286,6 +288,7 @@ fn local_archives(argv: &[String], cwd: &Path) -> Result<Archives, Error> {
                 path.display()
             )));
         }
+        check_private(&path, notify::current_uid())?;
 
         let name = package_name(&path)?;
         if let Ok(paths) = archives.entry(name).or_insert_with(|| Ok(Vec::new())) {
@@ -438,6 +441,42 @@ pub fn parse_sync_info(output: &str) -> HashMap<String, Vec<SyncCandidate>> {
     versions
 }
 
+/// The archive and every directory above it may only be changed by root or
+/// the invoking user: pacman opens the path again after the review, so
+/// another user who could swap it would install unreviewed code.
+fn check_private(path: &Path, uid: Option<u32>) -> Result<(), Error> {
+    let mut current = Some(path);
+    while let Some(here) = current {
+        let metadata = fs::symlink_metadata(here).at(here)?;
+        let sticky = metadata.is_dir() && metadata.mode() & 0o1000 != 0;
+        let foreign_owner = metadata.uid() != 0 && Some(metadata.uid()) != uid;
+        let shared = metadata.mode() & 0o022 != 0 && !sticky;
+        if foreign_owner || shared {
+            return Err(Error::Refused(format!(
+                "{} can be changed by another user ({}), so the archive pacman installs may not be the one reviewed; move it to a directory only you can write",
+                path.display(),
+                here.display()
+            )));
+        }
+        current = here.parent();
+    }
+    Ok(())
+}
+
+/// A cache directory must be root's alone: `-S` packages are reviewed there
+/// after pacman verified them, and installed from there.
+fn check_cache_directory(directory: &Path) -> Result<(), Error> {
+    match fs::symlink_metadata(directory) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).at(directory),
+        Ok(metadata) if metadata.uid() == 0 && metadata.mode() & 0o022 == 0 => Ok(()),
+        Ok(_) => Err(Error::Refused(format!(
+            "the pacman cache directory {} is not root's alone",
+            directory.display()
+        ))),
+    }
+}
+
 fn cache_directories() -> Result<Vec<PathBuf>, Error> {
     let output = tools::run(
         Path::new(tools::PACMAN_CONF),
@@ -464,6 +503,7 @@ fn cache_directories() -> Result<Vec<PathBuf>, Error> {
 fn cache_index(directories: &[PathBuf]) -> Result<HashMap<String, PathBuf>, Error> {
     let mut index = HashMap::new();
     for directory in directories {
+        check_cache_directory(directory)?;
         let entries = match fs::read_dir(directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -880,6 +920,25 @@ mod tests {
         let archives =
             local_archives(&argv("pacman -U sample-1.0-1-any.pkg.tar"), dir.path()).unwrap();
         assert_eq!(archives["sample"], Ok(vec![archive]));
+    }
+
+    #[test]
+    fn archives_others_can_swap_are_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("pacman-private");
+        let shared = dir.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        fs::write(shared.join("x.pkg.tar.zst"), "x").unwrap();
+        let uid = std::os::unix::fs::MetadataExt::uid(&fs::metadata(dir.path()).unwrap());
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(super::check_private(&shared.join("x.pkg.tar.zst"), Some(uid)).is_ok());
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(super::check_private(&shared.join("x.pkg.tar.zst"), Some(uid)).is_err());
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(super::check_private(&shared.join("x.pkg.tar.zst"), Some(uid)).is_ok());
+        // Owned by someone else.
+        assert!(super::check_private(&shared.join("x.pkg.tar.zst"), Some(uid + 1)).is_err());
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
