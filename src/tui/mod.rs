@@ -7,6 +7,7 @@ mod app;
 mod canvas;
 mod fields;
 mod integrations;
+mod mascot;
 mod term;
 
 use std::env;
@@ -23,16 +24,17 @@ use crate::engine::baseline;
 use crate::engine::store::Store;
 use crate::setup::{self, Environment as _};
 
-use app::{App, Effect, Loaded, Task};
+use app::{App, Effect, Loaded, Mode, Task};
 use canvas::Canvas;
 use fields::{HEADER, Scope};
 use integrations::{Paths, Plan, Step};
 use term::Terminal;
 
-pub fn run() -> Result<(), String> {
+pub fn run(expert: bool) -> Result<(), String> {
     let mut terminal =
         Terminal::open().map_err(|error| format!("cannot use the terminal: {error}"))?;
-    let mut app = App::new(load_files());
+    let mode = if expert { Mode::Expert } else { Mode::Simple };
+    let mut app = App::new(load_files(), mode);
     let mut size = (0, 0);
     let mut dirty = true;
 
@@ -44,6 +46,9 @@ pub fn run() -> Result<(), String> {
             dirty = false;
         }
         let keys = terminal.keys().map_err(|error| error.to_string())?;
+        if keys.is_empty() && app.tick() {
+            dirty = true;
+        }
         for key in keys {
             dirty = true;
             let Some(effect) = app.handle(key) else {
@@ -110,7 +115,7 @@ fn perform(terminal: &mut Terminal, effect: &Effect) -> Result<String, String> {
         }),
         Effect::Edit(scope) => edit(terminal, *scope),
         Effect::LoadModels(_) => Ok(setup::RealEnvironment.models().join("\n")),
-        Effect::Quit => Ok(String::new()),
+        Effect::ResetDefaults | Effect::Quit => Ok(String::new()),
     }
 }
 

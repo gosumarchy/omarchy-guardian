@@ -14,6 +14,8 @@ use crate::tui::fields::{Field, Input, Knob, Scope, Setting, validate};
 use crate::tui::integrations::{Integration, Paths, Plan, State};
 use crate::tui::term::Key;
 
+mod simple;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
     Profiles,
@@ -124,6 +126,8 @@ pub enum Effect {
     GuidedSetup,
     Edit(Scope),
     LoadModels(Field),
+    /// Simple mode's reset: drafts only, nothing is written.
+    ResetDefaults,
     Quit,
 }
 
@@ -135,11 +139,15 @@ enum Dialog {
         selected: usize,
         /// Offer free text after the listed options (models).
         typed: bool,
+        /// A second field set to the same value (simple mode sets one model
+        /// for both files).
+        also: Option<Field>,
     },
     Input {
         field: Field,
         buffer: String,
         error: Option<String>,
+        also: Option<Field>,
     },
     Confirm {
         title: String,
@@ -151,6 +159,22 @@ enum Dialog {
         lines: Vec<String>,
         scroll: usize,
     },
+}
+
+/// An open choice list, taken apart for key handling.
+struct Choice {
+    field: Field,
+    options: Vec<String>,
+    selected: usize,
+    typed: bool,
+    also: Option<Field>,
+}
+
+/// Simple mode shows the essentials; expert mode every setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Simple,
+    Expert,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,11 +223,15 @@ pub struct App {
     /// Ask to save the system file once the user file is saved.
     system_after_user: bool,
     models: Option<Vec<String>>,
+    mode: Mode,
+    simple_cursor: usize,
+    /// Event-loop ticks, for the mascot's blink.
+    ticks: u64,
     pub quit: bool,
 }
 
 impl App {
-    pub fn new(files: Loaded) -> Self {
+    pub fn new(files: Loaded, mode: Mode) -> Self {
         let mut app = Self {
             tab: Tab::Profiles,
             cursors: [0; 5],
@@ -216,6 +244,9 @@ impl App {
             message: None,
             system_after_user: false,
             models: None,
+            mode,
+            simple_cursor: 0,
+            ticks: 0,
             quit: false,
         };
         app.refresh_integrations();
@@ -315,7 +346,9 @@ impl App {
                 Effect::LoadModels(field) => {
                     let models: Vec<String> = text.lines().map(str::to_string).collect();
                     self.models = Some(models);
-                    self.open_model_picker(*field);
+                    let also = (self.mode == Mode::Simple)
+                        .then_some(Field::new(Scope::System, Setting::AgentModel));
+                    self.open_model_picker(*field, also);
                 }
                 Effect::SaveUser(_) => {
                     self.message = Some((text, Tone::Good));
@@ -328,11 +361,31 @@ impl App {
         }
     }
 
+    /// Called when no key arrived for a while; returns whether to redraw.
+    pub fn tick(&mut self) -> bool {
+        self.ticks += 1;
+        self.mode == Mode::Simple && (self.ticks.is_multiple_of(20) || self.ticks % 20 == 1)
+    }
+
+    fn blinking(&self) -> bool {
+        self.ticks.is_multiple_of(20)
+    }
+
     pub fn handle(&mut self, key: Key) -> Option<Effect> {
         if self.dialog.is_some() {
             return self.handle_dialog(key);
         }
         self.message = None;
+        if key == Key::Char('e') {
+            self.mode = match self.mode {
+                Mode::Simple => Mode::Expert,
+                Mode::Expert => Mode::Simple,
+            };
+            return None;
+        }
+        if self.mode == Mode::Simple {
+            return self.handle_simple(key);
+        }
         match key {
             Key::Char('q') | Key::Escape | Key::Interrupt => self.request_quit(),
             Key::Tab | Key::Right | Key::Char('l') => self.switch_tab(1),
@@ -468,6 +521,7 @@ impl App {
                             options,
                             selected,
                             typed: false,
+                            also: None,
                         });
                         None
                     }
@@ -476,7 +530,7 @@ impl App {
                             self.say("Asking OpenCode for its models…");
                             return Some(Effect::LoadModels(field));
                         }
-                        self.open_model_picker(field);
+                        self.open_model_picker(field, None);
                         None
                     }
                     Input::Number(_) | Input::Repos => {
@@ -484,6 +538,7 @@ impl App {
                             field,
                             buffer: current.unwrap_or_default(),
                             error: None,
+                            also: None,
                         });
                         None
                     }
@@ -570,7 +625,7 @@ impl App {
         format!("inherit ({})", field.effective(&settings, &user, &system))
     }
 
-    fn open_model_picker(&mut self, field: Field) {
+    fn open_model_picker(&mut self, field: Field, also: Option<Field>) {
         let current = field.get(self.draft(field.scope));
         let mut options = vec![self.inherit_label(field)];
         options.extend(self.models.iter().flatten().cloned());
@@ -583,6 +638,7 @@ impl App {
             options,
             selected,
             typed: true,
+            also,
         });
     }
 
@@ -690,6 +746,10 @@ impl App {
                 effect,
             } => match key {
                 Key::Char('y' | 'Y') | Key::Enter => {
+                    if effect == Effect::ResetDefaults {
+                        self.reset_defaults();
+                        return None;
+                    }
                     if effect == Effect::Quit {
                         self.quit = true;
                     }
@@ -736,29 +796,40 @@ impl App {
                 options,
                 selected,
                 typed,
+                also,
             } => {
-                self.choice_key(field, options, selected, typed, key);
+                self.choice_key(
+                    Choice {
+                        field,
+                        options,
+                        selected,
+                        typed,
+                        also,
+                    },
+                    key,
+                );
                 None
             }
             Dialog::Input {
                 field,
                 buffer,
                 error,
+                also,
             } => {
-                self.input_key(field, buffer, error, key);
+                self.input_key(field, also, buffer, error, key);
                 None
             }
         }
     }
 
-    fn choice_key(
-        &mut self,
-        field: Field,
-        options: Vec<String>,
-        selected: usize,
-        typed: bool,
-        key: Key,
-    ) {
+    fn choice_key(&mut self, choice: Choice, key: Key) {
+        let Choice {
+            field,
+            options,
+            selected,
+            typed,
+            also,
+        } = choice;
         let last = options.len().saturating_sub(1);
         let selected = match key {
             Key::Escape | Key::Char('q') | Key::Interrupt => return,
@@ -772,11 +843,12 @@ impl App {
                         field,
                         buffer: field.get(self.draft(field.scope)).unwrap_or_default(),
                         error: None,
+                        also,
                     });
                     return;
                 }
                 let value = (selected > 0).then(|| options[selected].clone());
-                if let Err(error) = self.set(field, value.as_deref()) {
+                if let Err(error) = self.set_both(field, also, value.as_deref()) {
                     self.message = Some((error, Tone::Bad));
                 }
                 return;
@@ -788,16 +860,43 @@ impl App {
             options,
             selected,
             typed,
+            also,
         });
     }
 
-    fn input_key(&mut self, field: Field, mut buffer: String, mut error: Option<String>, key: Key) {
+    /// Sets `field`, and `also` when given, to one value; neither changes
+    /// unless both accept it.
+    fn set_both(
+        &mut self,
+        field: Field,
+        also: Option<Field>,
+        value: Option<&str>,
+    ) -> Result<(), String> {
+        let (user, system) = (self.user.clone(), self.system.clone());
+        let result = self
+            .set(field, value)
+            .and_then(|()| also.map_or(Ok(()), |also| self.set(also, value)));
+        if result.is_err() {
+            self.user = user;
+            self.system = system;
+        }
+        result
+    }
+
+    fn input_key(
+        &mut self,
+        field: Field,
+        also: Option<Field>,
+        mut buffer: String,
+        mut error: Option<String>,
+        key: Key,
+    ) {
         match key {
             Key::Escape | Key::Interrupt => return,
             Key::Enter => {
                 let value = buffer.trim();
                 let value = (!value.is_empty()).then_some(value);
-                match self.set(field, value) {
+                match self.set_both(field, also, value) {
                     Ok(()) => return,
                     Err(message) => error = Some(message),
                 }
@@ -816,6 +915,7 @@ impl App {
             field,
             buffer,
             error,
+            also,
         });
     }
 
@@ -823,6 +923,10 @@ impl App {
         let (width, height) = (canvas.width, canvas.height);
         if width < 48 || height < 14 {
             canvas.text_fit(0, 0, "Guardian: window too small", Style::PLAIN, width);
+            return;
+        }
+        if self.mode == Mode::Simple {
+            self.draw_simple(canvas);
             return;
         }
         let border = Style::fg(color::MUTED);
@@ -848,7 +952,7 @@ impl App {
         let keys = if self.dialog.is_some() {
             " enter select · esc close "
         } else {
-            " ↑↓ move  ⇥ tabs  enter edit  space cycle  x inherit  u undo  s save  q quit "
+            " ↑↓ move  ⇥ tabs  enter edit  space cycle  x inherit  u undo  s save  e simple  q quit "
         };
         canvas.text_fit(2, height - 1, keys, border, width - 4);
 
@@ -1136,6 +1240,7 @@ fn dialog_body(dialog: &Dialog, hint: &str) -> (String, Vec<(String, Style)>) {
             field,
             buffer,
             error,
+            ..
         } => {
             let mut body = vec![
                 (format!("› {buffer}█"), Style::fg(color::ACCENT).bold()),
@@ -1281,7 +1386,7 @@ fn rows(tab: Tab) -> Vec<Row> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{App, Effect, Loaded, Tab};
+    use super::{App, Effect, Loaded, Mode, Tab};
     use crate::config::file::PartialConfig;
     use crate::config::load::FileStatus;
     use crate::config::model::{AiRequirement, Profile, SourceClass};
@@ -1301,7 +1406,10 @@ mod tests {
     }
 
     fn app() -> App {
-        App::new(loaded(PartialConfig::default(), PartialConfig::default()))
+        App::new(
+            loaded(PartialConfig::default(), PartialConfig::default()),
+            Mode::Expert,
+        )
     }
 
     fn press(app: &mut App, keys: &[Key]) -> Vec<Effect> {
@@ -1413,7 +1521,10 @@ mod tests {
         assert_eq!(press(&mut app, &[Key::Char('y')]), [Effect::Quit]);
         assert!(app.quit);
 
-        let mut clean = App::new(loaded(PartialConfig::default(), PartialConfig::default()));
+        let mut clean = App::new(
+            loaded(PartialConfig::default(), PartialConfig::default()),
+            Mode::Expert,
+        );
         assert_eq!(press(&mut clean, &[Key::Char('q')]), [Effect::Quit]);
     }
 
@@ -1421,7 +1532,7 @@ mod tests {
     fn an_invalid_file_cannot_be_edited_here() {
         let mut files = loaded(PartialConfig::default(), PartialConfig::default());
         files.user_status = FileStatus::Invalid("line 3: unknown key".into());
-        let mut app = App::new(files);
+        let mut app = App::new(files, Mode::Expert);
         press(&mut app, &[Key::Enter]);
         assert!(screen(&mut app).contains("fix it under Maintenance"));
         assert_eq!(app.user, PartialConfig::default());
