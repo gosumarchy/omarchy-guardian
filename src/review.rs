@@ -10,6 +10,7 @@ use crate::deps;
 use crate::engine::baseline::{Identity, Unit};
 use crate::engine::plan::HashOnly;
 use crate::engine::{self, Group, Memory};
+use crate::git_state;
 use crate::mask;
 use crate::osv;
 use crate::report::{AgentOutcome, Decision, Gap, LocalFinding, NetworkRequest, Report};
@@ -53,8 +54,16 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
                 bytes: file.bytes,
                 label: format.label(),
                 media: format.is_media(),
+                skipped_files: None,
             })
         })
+        .chain(snapshot.skipped().iter().map(|skipped| HashOnly {
+            path: skipped.path.clone(),
+            bytes: 0,
+            label: "generated directory, not reviewed",
+            media: false,
+            skipped_files: Some(skipped.files),
+        }))
         .collect();
     report.snapshot = snapshot;
     report.gaps.extend(walk_gaps);
@@ -132,6 +141,18 @@ pub fn ai_off_classes(settings: &Settings, classes: &[SourceClass]) -> Vec<Sourc
 /// Applies the local checks to one text file and queues it for the AI review.
 pub fn analyze_text(report: &mut Report, rel: &str, text: &str, inspect_dependencies: bool) {
     report.text_files_reviewed += 1;
+
+    if git_state::is_git_config(rel) {
+        for (line, excerpt) in git_state::executing_keys(text) {
+            report.findings.push(LocalFinding {
+                path: rel.to_string(),
+                line,
+                rule: RuleId::GitConfigCommand,
+                excerpt: excerpt.chars().take(EXCERPT_CHARS).collect(),
+            });
+        }
+        return;
+    }
 
     if text.lines().next() == Some(LFS_POINTER) {
         report.gaps.push(Gap::UnresolvedLfs(rel.to_string()));
@@ -427,6 +448,21 @@ mod tests {
         );
         assert!(report.findings.is_empty());
         assert_eq!(report.agent_input.len(), 1);
+    }
+
+    #[test]
+    fn a_git_config_is_checked_locally_and_never_sent() {
+        let mut report = Report::new("test");
+        analyze_text(
+            &mut report,
+            ".git/config",
+            "[remote \"origin\"]\n\turl = https://me:tok@h/r\n[core]\n\tfsmonitor = sh x\n",
+            true,
+        );
+        assert!(report.agent_input.is_empty());
+        assert!(report.gaps.is_empty());
+        assert_eq!(rules_in(&report), [RuleId::GitConfigCommand]);
+        assert_eq!(report.findings[0].line, 4);
     }
 
     #[test]

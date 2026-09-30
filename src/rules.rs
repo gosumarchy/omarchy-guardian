@@ -21,6 +21,7 @@ pub enum RuleId {
     CleartextNetworkRequest,
     DirectIpNetworkRequest,
     DisabledTlsVerification,
+    GitConfigCommand,
 }
 
 /// How a rule decides whether a lowercased line matches.
@@ -29,8 +30,9 @@ enum Matcher {
     /// `contains_pattern`).
     Patterns(&'static [&'static str]),
     Custom(fn(&str) -> bool),
-    /// Reported from the network destination inventory instead of per line.
-    NetworkInventory,
+    /// Reported by a dedicated check (the network destination inventory, the
+    /// git config check) instead of per line.
+    Reported,
 }
 
 const CREDENTIAL_FILES: &[&str] = &[
@@ -111,7 +113,7 @@ const DISABLED_TLS: &[&str] = &[
 ];
 
 impl RuleId {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::DownloadAndExecute,
         Self::EncodedCommandExecution,
         Self::CredentialFileAccess,
@@ -123,6 +125,7 @@ impl RuleId {
         Self::CleartextNetworkRequest,
         Self::DirectIpNetworkRequest,
         Self::DisabledTlsVerification,
+        Self::GitConfigCommand,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -138,6 +141,7 @@ impl RuleId {
             Self::CleartextNetworkRequest => "cleartext-network-request",
             Self::DirectIpNetworkRequest => "direct-ip-network-request",
             Self::DisabledTlsVerification => "disabled-tls-verification",
+            Self::GitConfigCommand => "git-config-command",
         }
     }
 
@@ -153,7 +157,8 @@ impl RuleId {
             | Self::PrivilegeEscalation
             | Self::CleartextNetworkRequest
             | Self::DirectIpNetworkRequest
-            | Self::DisabledTlsVerification => Severity::Medium,
+            | Self::DisabledTlsVerification
+            | Self::GitConfigCommand => Severity::Medium,
         }
     }
 
@@ -190,6 +195,9 @@ impl RuleId {
             Self::DisabledTlsVerification => {
                 "Disables TLS certificate verification for network requests."
             }
+            Self::GitConfigCommand => {
+                "A git config in the tree names a command that git runs on later commands here (status, describe, diff)."
+            }
         }
     }
 
@@ -203,9 +211,9 @@ impl RuleId {
             Self::ShellCommandExecution => Matcher::Patterns(SHELL_EXECUTION),
             Self::PrivilegeEscalation => Matcher::Custom(is_privilege_escalation),
             Self::CredentialExfiltration => Matcher::Custom(looks_like_credential_exfiltration),
-            Self::CleartextNetworkRequest | Self::DirectIpNetworkRequest => {
-                Matcher::NetworkInventory
-            }
+            Self::CleartextNetworkRequest
+            | Self::DirectIpNetworkRequest
+            | Self::GitConfigCommand => Matcher::Reported,
             Self::DisabledTlsVerification => Matcher::Patterns(DISABLED_TLS),
         }
     }
@@ -227,7 +235,8 @@ impl RuleId {
             | Self::EncodedCommandExecution
             | Self::DestructiveSystemOperation
             | Self::ShellCommandExecution
-            | Self::CredentialExfiltration => false,
+            | Self::CredentialExfiltration
+            | Self::GitConfigCommand => false,
         }
     }
 
@@ -235,7 +244,7 @@ impl RuleId {
         match self.matcher() {
             Matcher::Patterns(patterns) => contains_any(lowered, patterns),
             Matcher::Custom(matches) => matches(lowered),
-            Matcher::NetworkInventory => false,
+            Matcher::Reported => false,
         }
     }
 }

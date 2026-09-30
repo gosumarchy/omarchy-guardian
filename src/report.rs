@@ -357,7 +357,8 @@ impl Report {
             Decision::Blocked(Blocked::AiUnavailable)
         } else if tally.blocked {
             Decision::Blocked(Blocked::Findings)
-        } else if tally.warned {
+        } else if tally.warned || !self.snapshot.skipped().is_empty() {
+            // A skipped directory's marker is easy to fake: never CLEAR.
             Decision::Warned
         } else if self.text_files_reviewed == 0 && self.agent_runs.is_empty() {
             Decision::Limited
@@ -497,6 +498,14 @@ impl Report {
             self.snapshot.count(FileKind::Binary),
             self.oversized_count()
         );
+
+        for skipped in self.snapshot.skipped() {
+            outln!(
+                "Not reviewed: {}/ ({} entries, generated); rerun with --thorough to include it",
+                shown(&skipped.path),
+                skipped.files
+            );
+        }
 
         let files = self.snapshot.files();
         if !files.is_empty() {

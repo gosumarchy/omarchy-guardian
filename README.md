@@ -416,9 +416,15 @@ non-UTF-8 file names, text files over 2 MiB, files over 512 MiB, unresolved
 Git LFS pointers and an invalid or inconclusive AI reply all make the review
 **incomplete**, never clear. An *unavailable* AI review (no OpenCode, a
 provider error, a timeout) follows the class's `ai` setting instead: `WARNED`
-for `official` under `standard`, blocked everywhere else. `.git` is always skipped; `target`,
-`node_modules`, `.venv`, `vendor`, `dist` and `build` are skipped unless
-`--thorough` is given.
+for `official` under `standard`, blocked everywhere else. In `.git`, only the
+`config` (checked locally for keys that make git run a command, such as
+`core.fsmonitor`, filters and `!` aliases, and never sent to the AI) and
+hooks other than git's `.sample` files are reviewed. A top-level `target`,
+`node_modules` or `.venv` that carries its tool's marker file
+(`CACHEDIR.TAG`, `.package-lock.json`, `pyvenv.cfg`…) is skipped unless
+`--thorough` is given; the skip is listed under "Not reviewed", its file
+count is part of the snapshot, and the review is then at best `WARNED`.
+`vendor`, `dist` and `build` are shipped code and always reviewed.
 
 External helpers are run by absolute path (`/usr/bin/curl`, `/usr/bin/bsdtar`,
 `/usr/bin/pacman`, ...) with a timeout and bounded output. OpenCode is looked
@@ -592,8 +598,9 @@ gate does, in order:
    otherwise its build files and scripts (makefiles, CMake, meson,
    `configure`, `setup.py`, `build.rs`, `package.json`, shell scripts…)
    first, then other code by depth, up to 1 MiB. Data and documentation
-   (`.json`, `.md`, `.txt`…), version-control metadata, `node_modules` and
-   CI or development-container directories are left out. The review looks
+   (`.json`, `.md`, `.txt`…) and version-control metadata are left out;
+   `node_modules`, `.venv`, CI and development-container directories are
+   reviewed last. The review looks
    for malicious intent in what runs during the build and in the program's
    own code, not bugs or vulnerabilities, and is told whether the recipe
    runs the test suite (`check()`). The upstream review is remembered as

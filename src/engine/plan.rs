@@ -66,6 +66,8 @@ pub enum Sent {
     Removed,
     /// A binary file Guardian hashed but did not send.
     HashOnly,
+    /// A generated directory Guardian did not review.
+    Skipped,
 }
 
 impl Sent {
@@ -76,6 +78,7 @@ impl Sent {
             Self::Unchanged => "unchanged",
             Self::Removed => "removed",
             Self::HashOnly => "hash-only",
+            Self::Skipped => "skipped",
         }
     }
 }
@@ -100,6 +103,8 @@ pub struct HashOnly {
     pub label: &'static str,
     /// Images, audio, video and fonts: grouped per directory.
     pub media: bool,
+    /// A skipped generated directory, with the entries it holds.
+    pub skipped_files: Option<usize>,
 }
 
 /// The most hash-only manifest rows; the rest are counted in one row.
@@ -112,7 +117,15 @@ pub fn hash_only_entries(files: &[HashOnly]) -> Vec<ManifestEntry> {
     let mut media: BTreeMap<String, (usize, usize, BTreeSet<&str>)> = BTreeMap::new();
     for file in files {
         let bytes = usize::try_from(file.bytes).unwrap_or(usize::MAX);
-        if file.media {
+        if let Some(count) = file.skipped_files {
+            entries.push(ManifestEntry {
+                path: format!("{}/", file.path),
+                bytes,
+                sent: Sent::Skipped,
+                format: Some(file.label.to_string()),
+                files: Some(count),
+            });
+        } else if file.media {
             let directory = file
                 .path
                 .rsplit_once('/')
@@ -713,6 +726,7 @@ mod tests {
             bytes: 100,
             label,
             media,
+            skipped_files: None,
         };
         let entries = super::hash_only_entries(&[
             file("bin/tool", "ELF executable", false),

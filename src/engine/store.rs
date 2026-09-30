@@ -549,7 +549,10 @@ mod tests {
         let uid = std::os::unix::fs::MetadataExt::uid(&fs::metadata(dir.path()).unwrap());
         let made = dir.path().join("a/b");
         private_dir(&made, uid).unwrap();
-        assert_eq!(fs::metadata(&made).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(&made).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         assert!(private_dir(&made, uid + 1).is_err());
 
         let open = dir.path().join("open");

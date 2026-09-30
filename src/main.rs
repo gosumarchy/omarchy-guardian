@@ -29,6 +29,7 @@ mod content;
 mod deps;
 mod engine;
 mod error;
+mod git_state;
 mod json;
 mod makepkg_gate;
 mod mask;

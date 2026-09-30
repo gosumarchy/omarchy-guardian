@@ -41,8 +41,18 @@ impl Limits {
     };
 }
 
-/// Directories skipped unless the scan is thorough. `.git` is always skipped.
-const IGNORED_DIRS: &[&str] = &["target", "node_modules", ".venv", "vendor", "dist", "build"];
+/// Top-level directories a tool generates, skipped unless the scan is
+/// thorough, and only when they carry the tool's marker file. The marker is
+/// easy to fake, so a skip is always reported and a review with one is at
+/// best WARNED. `vendor`, `dist` and `build` are shipped code and reviewed.
+const GENERATED_DIRS: &[(&str, &[&str])] = &[
+    ("target", &["CACHEDIR.TAG"]),
+    (
+        "node_modules",
+        &[".package-lock.json", ".modules.yaml", ".yarn-state.yml"],
+    ),
+    (".venv", &["pyvenv.cfg"]),
+];
 
 /// `O_NONBLOCK` in the Linux generic ABI (`x86_64`, `aarch64`, `arm`, `riscv64`). A path
 /// swapped for a FIFO between `lstat` and `open` then fails the identity check
@@ -68,15 +78,37 @@ impl ScanConfig {
         }
     }
 
+    /// Names left out of the walk. `.git` is walked separately (see
+    /// `Walker::git_directory`).
     fn skips(&self, name: &str, top_level: bool) -> bool {
         name == ".git"
-            || (!self.include_ignored_dirs && IGNORED_DIRS.contains(&name))
             || (top_level
-                && self
-                    .excluded_top_level
-                    .iter()
-                    .any(|excluded| excluded == name))
+                && (self.is_generated(name)
+                    || self
+                        .excluded_top_level
+                        .iter()
+                        .any(|excluded| excluded == name)))
     }
+
+    /// A top-level generated directory this scan skips.
+    fn is_generated(&self, name: &str) -> bool {
+        !self.include_ignored_dirs
+            && GENERATED_DIRS.iter().any(|(generated, markers)| {
+                *generated == name
+                    && markers.iter().any(|marker| {
+                        fs::symlink_metadata(self.root.join(name).join(marker))
+                            .is_ok_and(|metadata| metadata.is_file())
+                    })
+            })
+    }
+}
+
+/// A generated directory the walk skipped, with how many entries it held
+/// (counted without reading them, up to the file limit).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkippedDir {
+    pub path: String,
+    pub files: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,16 +145,22 @@ pub struct FileHash {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
     files: Vec<FileHash>,
+    skipped: Vec<SkippedDir>,
 }
 
 impl Snapshot {
-    fn from_files(mut files: Vec<FileHash>) -> Self {
+    fn from_files(mut files: Vec<FileHash>, skipped: Vec<SkippedDir>) -> Self {
         files.sort_by(|left, right| left.path.cmp(&right.path));
-        Self { files }
+        Self { files, skipped }
     }
 
     pub fn files(&self) -> &[FileHash] {
         &self.files
+    }
+
+    /// Generated directories left out of the review.
+    pub fn skipped(&self) -> &[SkippedDir] {
+        &self.skipped
     }
 
     pub fn count(&self, kind: FileKind) -> usize {
@@ -143,6 +181,11 @@ impl Snapshot {
                 FileKind::Binary | FileKind::OversizedText | FileKind::Undecodable => 0,
             }]);
             hasher.update(b"\n");
+        }
+        for skipped in &self.skipped {
+            hasher.update(b"skipped\0");
+            hasher.update(skipped.path.as_bytes());
+            hasher.update(format!("\0{}\n", skipped.files).as_bytes());
         }
         hasher.finalize()
     }
@@ -168,6 +211,7 @@ pub fn walk(config: &ScanConfig, on_text: &mut dyn FnMut(TextFile<'_>)) -> (Snap
         hashed_bytes: 0,
         stopped: false,
         links: HashMap::new(),
+        skipped: Vec::new(),
     };
 
     let root = &config.root;
@@ -181,7 +225,10 @@ pub fn walk(config: &ScanConfig, on_text: &mut dyn FnMut(TextFile<'_>)) -> (Snap
     };
     walker.entry(root, root, rel);
 
-    (Snapshot::from_files(walker.files), walker.gaps)
+    (
+        Snapshot::from_files(walker.files, walker.skipped),
+        walker.gaps,
+    )
 }
 
 /// Re-walks the tree and requires it to match `expected` exactly.
@@ -211,6 +258,7 @@ struct Walker<'a> {
     stopped: bool,
     /// Files with more than one link, by device and inode: read once.
     links: HashMap<(u64, u64), (Digest, Contents)>,
+    skipped: Vec<SkippedDir>,
 }
 
 impl Walker<'_> {
@@ -355,16 +403,91 @@ impl Walker<'_> {
                     .push(Gap::NonUtf8Name(child_logical.display().to_string()));
                 continue;
             };
-            if self.config.skips(name_text, rel.is_empty()) {
-                continue;
-            }
-
             let child_rel = if rel.is_empty() {
                 name_text.to_string()
             } else {
                 format!("{rel}/{name_text}")
             };
+            if name_text == ".git" {
+                self.git_directory(&handle.join(&name), &child_logical, &child_rel);
+                continue;
+            }
+            if rel.is_empty() && self.config.is_generated(name_text) {
+                let files = count_entries(&handle.join(&name), self.config.limits.files);
+                self.skipped.push(SkippedDir {
+                    path: child_rel,
+                    files,
+                });
+                continue;
+            }
+            if self.config.skips(name_text, rel.is_empty()) {
+                continue;
+            }
             self.entry(&handle.join(&name), &child_logical, child_rel);
+        }
+    }
+
+    /// A `.git` directory: its `config` (checked for keys that run commands,
+    /// never sent to the AI) and its hooks other than git's `.sample` files
+    /// are reviewed, and a submodule's git directory the same way. The
+    /// objects and index are not read. A `.git` file (a worktree or
+    /// submodule pointer) is left out.
+    fn git_directory(&mut self, access: &Path, logical: &Path, rel: &str) {
+        let Ok(metadata) = fs::symlink_metadata(access) else {
+            return;
+        };
+        if !metadata.is_dir() {
+            return;
+        }
+        let directory = match open_verified(access, &metadata) {
+            Ok(directory) => directory,
+            Err(error) => return self.io_gap(logical, error),
+        };
+        let handle = fd_path(&directory);
+        if fs::symlink_metadata(handle.join("config")).is_ok() {
+            self.entry(
+                &handle.join("config"),
+                &logical.join("config"),
+                format!("{rel}/config"),
+            );
+        }
+        for (name, hooks) in [("hooks", true), ("modules", false)] {
+            let Ok(metadata) = fs::symlink_metadata(handle.join(name)) else {
+                continue;
+            };
+            if !metadata.is_dir() {
+                continue;
+            }
+            let child = match open_verified(&handle.join(name), &metadata) {
+                Ok(child) => child,
+                Err(error) => {
+                    self.io_gap(&logical.join(name), error);
+                    continue;
+                }
+            };
+            let child_handle = fd_path(&child);
+            let mut names: Vec<String> = match fs::read_dir(&child_handle) {
+                Ok(listing) => listing
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .collect(),
+                Err(error) => {
+                    self.io_gap(&logical.join(name), error);
+                    continue;
+                }
+            };
+            names.sort();
+            for entry in names {
+                let entry_rel = format!("{rel}/{name}/{entry}");
+                let entry_logical = logical.join(name).join(&entry);
+                if hooks {
+                    if !entry.ends_with(".sample") {
+                        self.entry(&child_handle.join(&entry), &entry_logical, entry_rel);
+                    }
+                } else {
+                    self.git_directory(&child_handle.join(&entry), &entry_logical, &entry_rel);
+                }
+            }
         }
     }
 
@@ -439,6 +562,27 @@ impl Walker<'_> {
             bytes: metadata.len(),
         });
     }
+}
+
+/// Entries under `path`, not following links, counted up to `limit`.
+fn count_entries(path: &Path, limit: usize) -> usize {
+    let mut count = 0;
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(listing) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in listing.filter_map(Result::ok) {
+            count += 1;
+            if count >= limit {
+                return count;
+            }
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push(entry.path());
+            }
+        }
+    }
+    count
 }
 
 fn fd_path(file: &File) -> PathBuf {
@@ -546,18 +690,87 @@ mod tests {
     }
 
     #[test]
-    fn skips_git_and_generated_directories_unless_thorough() {
+    fn shipped_directories_are_reviewed_and_marked_generated_ones_skipped() {
         let dir = TempDir::new("ignored");
-        fs::create_dir_all(dir.path().join(".git")).unwrap();
-        fs::create_dir_all(dir.path().join("vendor/theme")).unwrap();
-        fs::write(dir.path().join(".git/config"), "x\n").unwrap();
-        fs::write(dir.path().join("vendor/theme/payload.lua"), "x\n").unwrap();
+        for directory in [
+            "vendor",
+            "dist",
+            "build",
+            "src/node_modules/x",
+            "node_modules/x",
+            "target",
+        ] {
+            fs::create_dir_all(dir.path().join(directory)).unwrap();
+        }
+        fs::write(dir.path().join("vendor/lib.sh"), "x\n").unwrap();
+        fs::write(dir.path().join("dist/app.js"), "x\n").unwrap();
+        fs::write(dir.path().join("build/install.sh"), "x\n").unwrap();
+        fs::write(dir.path().join("src/node_modules/x/i.js"), "x\n").unwrap();
+        fs::write(dir.path().join("node_modules/x/i.js"), "x\n").unwrap();
+        fs::write(dir.path().join("node_modules/.package-lock.json"), "{}\n").unwrap();
+        // No CACHEDIR.TAG: not generated-shaped, so reviewed.
+        fs::write(dir.path().join("target/run.sh"), "x\n").unwrap();
 
         let mut config = ScanConfig::new(dir.path());
-        assert!(walk_texts(&config).0.is_empty());
+        let (texts, snapshot, _) = walk_texts(&config);
+        assert_eq!(
+            texts,
+            [
+                "build/install.sh",
+                "dist/app.js",
+                "src/node_modules/x/i.js",
+                "target/run.sh",
+                "vendor/lib.sh"
+            ]
+        );
+        assert_eq!(
+            snapshot.skipped(),
+            [super::SkippedDir {
+                path: "node_modules".into(),
+                files: 3
+            }]
+        );
+
+        // A new file in a skipped directory changes the snapshot.
+        fs::write(dir.path().join("node_modules/x/j.js"), "x\n").unwrap();
+        assert!(verify_unchanged(&config, &snapshot).is_err());
 
         config.include_ignored_dirs = true;
-        assert_eq!(walk_texts(&config).0, ["vendor/theme/payload.lua"]);
+        assert!(
+            walk_texts(&config)
+                .0
+                .contains(&"node_modules/x/i.js".to_string())
+        );
+    }
+
+    #[test]
+    fn git_config_and_real_hooks_are_reviewed_and_samples_are_not() {
+        let dir = TempDir::new("git-state");
+        fs::create_dir_all(dir.path().join(".git/hooks")).unwrap();
+        fs::create_dir_all(dir.path().join(".git/objects/aa")).unwrap();
+        fs::create_dir_all(dir.path().join(".git/modules/lib/hooks")).unwrap();
+        fs::write(dir.path().join(".git/config"), "[core]\n").unwrap();
+        fs::write(dir.path().join(".git/HEAD"), "ref: x\n").unwrap();
+        fs::write(dir.path().join(".git/objects/aa/b"), "x\n").unwrap();
+        fs::write(dir.path().join(".git/hooks/pre-commit.sample"), "x\n").unwrap();
+        fs::write(dir.path().join(".git/hooks/post-checkout"), "x\n").unwrap();
+        fs::write(dir.path().join(".git/modules/lib/config"), "[core]\n").unwrap();
+        fs::write(dir.path().join(".git/modules/lib/hooks/pre-push"), "x\n").unwrap();
+
+        let config = ScanConfig::new(dir.path());
+        let (texts, snapshot, gaps) = walk_texts(&config);
+        assert!(gaps.is_empty(), "{gaps:?}");
+        assert_eq!(
+            texts,
+            [
+                ".git/config",
+                ".git/hooks/post-checkout",
+                ".git/modules/lib/config",
+                ".git/modules/lib/hooks/pre-push"
+            ]
+        );
+        fs::write(dir.path().join(".git/config"), "[core]\n\tfsmonitor = x\n").unwrap();
+        assert!(verify_unchanged(&config, &snapshot).is_err());
     }
 
     #[test]
@@ -630,6 +843,7 @@ mod tests {
             fs::create_dir_all(dir.path().join("sub")).unwrap();
             fs::write(dir.path().join(".git/config"), "x\n").unwrap();
             fs::write(dir.path().join("node_modules/x.js"), "x\n").unwrap();
+            fs::write(dir.path().join("node_modules/.package-lock.json"), "{}\n").unwrap();
             fs::write(dir.path().join("sub/file"), "x\n").unwrap();
             symlink(outside.path(), dir.path().join("alias")).unwrap();
             symlink(&target, dir.path().join(name)).unwrap();

@@ -692,6 +692,7 @@ fn scan_package(
                     bytes: 0,
                     label: format.label(),
                     media: false,
+                    skipped_files: None,
                 });
             }
             Content::Binary(format) if format.executable() => {
