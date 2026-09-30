@@ -7,9 +7,8 @@
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::agent::{self, SourceFile, Status};
@@ -638,15 +637,7 @@ impl Environment for RealEnvironment {
     }
 
     fn write_system(&self, text: &str) -> Result<(), String> {
-        let path = load::user_config_path().ok_or("cannot find the user config directory")?;
-        let directory = path.parent().ok_or("invalid user config path")?;
-        fs::create_dir_all(directory).map_err(|error| error.to_string())?;
-
-        let temporary = directory.join(format!(".system-config.{}.tmp", std::process::id()));
-        let result =
-            write_temporary(&temporary, text).and_then(|()| install_system_file(&temporary));
-        drop(fs::remove_file(&temporary));
-        result
+        install_system_file(text)
     }
 
     fn hook_enabled(&self) -> bool {
@@ -654,25 +645,15 @@ impl Environment for RealEnvironment {
     }
 }
 
-/// Creates `path` exclusively, in a directory only this user can write, so a
-/// local attacker cannot pre-create it (or a symlink at that name) to
-/// control what `sudo install` below copies into `/etc` — the pacman gate's
-/// trust root — then writes `text` with permissions only the owner can read.
-fn write_temporary(path: &Path, text: &str) -> Result<(), String> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|error| error.to_string())?;
-    file.write_all(text.as_bytes())
-        .map_err(|error| error.to_string())
-}
-
-/// Creates the directory explicitly with 0755: `install -D` would create it
-/// with sudo's umask, and a 0700 directory hides the file from the pacman
-/// hook, which runs as the user and would then block every transaction.
-fn install_system_file(temporary: &Path) -> Result<(), String> {
+/// Installs `text` as the system config, the pacman gate's trust root.
+/// The text goes to `install` on its standard input, so no file another
+/// process could rewrite during the password prompt stands between the
+/// diff the user approved and `/etc`; the installed file is then read back
+/// and compared. The directory is created explicitly with 0755: `install -D`
+/// would create it with sudo's umask, and a 0700 directory hides the file
+/// from the pacman hook, which runs as the user and would then block every
+/// transaction.
+fn install_system_file(text: &str) -> Result<(), String> {
     let directory = Path::new(SYSTEM_PATH)
         .parent()
         .ok_or("invalid system config path")?;
@@ -680,20 +661,37 @@ fn install_system_file(temporary: &Path) -> Result<(), String> {
     sudo_install(
         &["-d", "-m", "0755", "-o", "root", "-g", "root"],
         &[directory],
+        None,
     )?;
     sudo_install(
         &["-m", "0644", "-o", "root", "-g", "root"],
-        &[temporary, Path::new(SYSTEM_PATH)],
-    )
+        &[Path::new("/dev/stdin"), Path::new(SYSTEM_PATH)],
+        Some(text),
+    )?;
+    match fs::read_to_string(SYSTEM_PATH) {
+        Ok(installed) if installed == text => Ok(()),
+        Ok(_) => Err(format!(
+            "{SYSTEM_PATH} does not hold the config you approved; check it before relying on the gates"
+        )),
+        Err(error) => Err(format!("cannot read back {SYSTEM_PATH}: {error}")),
+    }
 }
 
-fn sudo_install(flags: &[&str], paths: &[&Path]) -> Result<(), String> {
-    let status = Command::new("/usr/bin/sudo")
-        .arg("install")
-        .args(flags)
-        .args(paths)
-        .status()
-        .map_err(|error| error.to_string())?;
+fn sudo_install(flags: &[&str], paths: &[&Path], input: Option<&str>) -> Result<(), String> {
+    let mut command = Command::new("/usr/bin/sudo");
+    command.arg("/usr/bin/install").args(flags).args(paths);
+    if input.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    if let Some(text) = input
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        // sudo prompts on the terminal, not on this pipe, so the text is
+        // written while it waits; a failed write shows in install's status.
+        drop(stdin.write_all(text.as_bytes()));
+    }
+    let status = child.wait().map_err(|error| error.to_string())?;
     if status.success() {
         Ok(())
     } else {

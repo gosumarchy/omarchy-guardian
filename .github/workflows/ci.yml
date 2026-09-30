@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+# The jobs only read the repository.
+permissions:
+  contents: read
+
 jobs:
   rust:
     runs-on: ubuntu-latest
@@ -13,7 +17,10 @@ jobs:
     steps:
       - name: Install toolchain and test tools
         run: pacman -Syu --noconfirm --needed rust git libarchive
-      - uses: actions/checkout@v4
+      # Pinned by commit: a tag can be moved.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: No dependencies
         run: |
           count=$(cargo tree --locked -e normal,build,dev --depth 1 --prefix none | grep -c .)
