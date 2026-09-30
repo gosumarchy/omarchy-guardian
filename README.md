@@ -22,6 +22,8 @@ omarchy-guardian sandbox ./theme-checkout -- /usr/bin/true
   command (`exec`) only if the review was clear and nothing changed.
   `--exclude NAME` (repeatable) leaves a top-level directory out of both the
   review and the snapshot.
+- `tui` (or `settings`) opens the settings app: a full-screen terminal UI in
+  Omarchy's style (see [Settings app](#settings-app)).
 - `sandbox` reviews, copies the tree to a private temporary directory, proves
   the copy matches the reviewed snapshot, and runs the command in Bubblewrap
   with the network isolated, no host home directory and a read-only system.
@@ -38,6 +40,29 @@ under `ai = required`, a declined confirmation, or a usage error. Once `guard`
 or `sandbox` starts the command, the exit code is the command's own (128 +
 signal if it was killed). Guardian announces on stderr when it starts the
 command, so its own blocks can be told apart from the command's failures.
+
+## Settings app
+
+`omarchy-guardian tui` edits every setting without touching TOML by hand.
+It installs a launcher entry ("Omarchy Guardian") that opens as a floating
+window, and can add itself to the Omarchy menu under Setup › Guardian.
+
+| Tab | What it changes |
+|---|---|
+| Profiles | the profile for your own sources (user file) and for the pacman gate (system file) |
+| Sources | every knob of every source class; pacman-enforced classes in the system file, the rest in the user file |
+| AI | model, input size and call limits for your sources and for the pacman gate, review-memory limits, official repositories |
+| Integrations | turn the pacman hook, the yay AUR gate, the theme install gate and the Omarchy menu entry on or off |
+| Maintenance | show and check the effective settings, edit either file in `$EDITOR`, see or forget the review memory, run the guided setup |
+
+Unset values show what they inherit and from where. Keys: `↑↓` move,
+`Tab`/`1`–`5` switch tabs, `Enter` edit, `Space` cycle a choice, `x` reset to
+inherit, `u` undo, `s` save, `q` quit. Every edit is checked with the same
+parser that reads the files, so the app cannot save a file Guardian would
+reject. The user file is written directly (a hand-written one is kept as
+`config.toml.bak`, since comments are not preserved). The system file is
+saved only after showing a diff, with `sudo`, like `setup` does. A file that
+does not parse cannot be edited in the app; fix it with Maintenance › Edit.
 
 ## Profiles and settings
 

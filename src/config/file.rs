@@ -78,7 +78,7 @@ impl PartialConfig {
             .unwrap_or_default()
     }
 
-    fn class_mut(&mut self, class: SourceClass) -> &mut PartialPolicy {
+    pub fn class_mut(&mut self, class: SourceClass) -> &mut PartialPolicy {
         if let Some(index) = self
             .classes
             .iter()

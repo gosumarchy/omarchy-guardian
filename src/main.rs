@@ -41,6 +41,7 @@ mod sha256;
 mod test_support;
 mod tomlish;
 mod tools;
+mod tui;
 #[cfg(test)]
 mod zero_deps;
 

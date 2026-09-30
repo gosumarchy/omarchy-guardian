@@ -51,5 +51,7 @@ package() {
     install -Dm755 integrations/enable-system-hook.sh "$lib/enable-system-hook.sh"
     install -Dm644 integrations/pacman/omarchy-guardian.hook \
         "$pkgdir/usr/share/omarchy-guardian/omarchy-guardian.hook"
+    install -Dm644 integrations/omarchy/omarchy-guardian.desktop \
+        "$pkgdir/usr/share/applications/omarchy-guardian.desktop"
     install -Dm644 README.md "$pkgdir/usr/share/doc/omarchy-guardian/README.md"
 }

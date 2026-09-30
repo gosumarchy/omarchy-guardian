@@ -414,7 +414,7 @@ fn write_files(
 }
 
 /// Lines only in the old text marked `-`, lines only in the new one `+`.
-fn line_diff(old: &str, new: &str) -> String {
+pub fn line_diff(old: &str, new: &str) -> String {
     let mut text = String::new();
 
     for line in old

@@ -20,6 +20,7 @@ post_install() {
         "  sudo /usr/lib/omarchy-guardian/enable-system-hook.sh" \
         "Choose a profile, model and thinking level with:" \
         "  omarchy-guardian setup" \
+        "or change any setting in the settings app: omarchy-guardian tui" \
         "The default 'standard' profile lets official Arch/Omarchy updates proceed" \
         "with a warning when the AI review is unavailable; 'strict' blocks them." \
         "Enable the AUR gate with:" \
