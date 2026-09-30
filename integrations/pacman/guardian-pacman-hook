@@ -16,6 +16,26 @@ if ! pacman_cwd=$(readlink -f "/proc/$pacman_pid/cwd"); then
     exit 2
 fi
 
+# libalpm also moves pacman itself to the root directory while hooks run, and
+# keeps its original working directory open to return to it afterwards; that
+# open directory is where relative `pacman -U` archive paths were resolved.
+# Only an unambiguous one is used; otherwise relative paths are not found
+# and the review refuses them.
+if [ "$pacman_cwd" = / ]; then
+    start_dir=
+    for fd in "/proc/$pacman_pid/fd/"*; do
+        target=$(readlink -f "$fd" 2>/dev/null) || continue
+        [ -d "$target" ] && [ "$target" != / ] || continue
+        if [ -z "$start_dir" ]; then
+            start_dir=$target
+        elif [ "$start_dir" != "$target" ]; then
+            start_dir=
+            break
+        fi
+    done
+    [ -z "$start_dir" ] || pacman_cwd=$start_dir
+fi
+
 if [ "$(id -u)" -eq 0 ]; then
     invoking_user=${SUDO_USER:-${DOAS_USER:-}}
     if [ -z "$invoking_user" ] || [ "$invoking_user" = root ]; then
