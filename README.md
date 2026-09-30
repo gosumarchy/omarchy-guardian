@@ -23,7 +23,8 @@ omarchy-guardian sandbox ./theme-checkout -- /usr/bin/true
   `--exclude NAME` (repeatable) leaves a top-level directory out of both the
   review and the snapshot.
 - `tui` (or `settings`) opens the settings app: a full-screen terminal UI in
-  Omarchy's style (see [Settings app](#settings-app)).
+  Omarchy's style, simple by default, with every setting under `--expert`
+  (see [Settings app](#settings-app)).
 - `sandbox` reviews, copies the tree to a private temporary directory, proves
   the copy matches the reviewed snapshot, and runs the command in Bubblewrap
   with the network isolated, no host home directory and a read-only system.
@@ -47,6 +48,22 @@ command, so its own blocks can be told apart from the command's failures.
 It installs a launcher entry ("Omarchy Guardian") that opens as a floating
 window, and can add itself to the Omarchy menu under Setup › Guardian.
 
+It opens in **simple mode**, where the Guardian (the app's mascot) tells you
+how you are protected. Here you choose a protection level, which sets the
+profile for your own sources and for pacman alike:
+
+| Level | Profile | |
+|---|---|---|
+| Balanced | `standard` | AI review for AUR builds, themes and third-party packages |
+| Maximum | `strict` | AI review for everything; any finding blocks |
+| Private | `local-only` | no AI: nothing leaves the machine; you confirm installs |
+
+You can also pick the OpenCode model used for both, turn on every install
+gate at once (*Protect everything*), or reset to the defaults.
+
+Press `e` for **expert mode** (or start there with `tui --expert`), which
+has every setting:
+
 | Tab | What it changes |
 |---|---|
 | Profiles | the profile for your own sources (user file) and for the pacman gate (system file) |
@@ -57,9 +74,9 @@ window, and can add itself to the Omarchy menu under Setup › Guardian.
 
 Unset values show what they inherit and from where. Keys: `↑↓` move,
 `Tab`/`1`–`5` switch tabs, `Enter` edit, `Space` cycle a choice, `x` reset to
-inherit, `u` undo, `s` save, `q` quit. Every edit is checked with the same
-parser that reads the files, so the app cannot save a file Guardian would
-reject. The user file is written directly (a hand-written one is kept as
+inherit, `u` undo, `s` save, `e` back to simple mode, `q` quit. Every edit
+is checked with the same parser that reads the files, so the app cannot save
+a file Guardian would reject. The user file is written directly (a hand-written one is kept as
 `config.toml.bak`, since comments are not preserved). The system file is
 saved only after showing a diff, with `sudo`, like `setup` does. A file that
 does not parse cannot be edited in the app; fix it with Maintenance › Edit.

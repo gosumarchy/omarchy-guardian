@@ -31,7 +31,7 @@ Usage:
   omarchy-guardian config show [--class CLASS] | check | path
   omarchy-guardian forget <identity> | --all
   omarchy-guardian setup
-  omarchy-guardian tui                              (settings, integrations and maintenance)
+  omarchy-guardian tui [--expert]                   (settings app; --expert shows every setting)
 
 CLASS: aur, theme, plugin, source (default). PROFILE: standard, strict, local-only.
 ID names what is reviewed for the review memory, e.g. aur:yay-bin.
@@ -63,7 +63,7 @@ enum Invocation {
     Config(ConfigCommand),
     Forget(Forget),
     Setup,
-    Tui,
+    Tui { expert: bool },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -148,7 +148,7 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
                 ExitCode::from(2)
             }
         },
-        Invocation::Tui => match tui::run() {
+        Invocation::Tui { expert } => match tui::run(expert) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {
                 eprintln!("omarchy-guardian tui: {message}");
@@ -456,7 +456,11 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
         Some("config") => parse_config(rest).map(Invocation::Config),
         Some("forget") => parse_forget(rest).map(Invocation::Forget),
         Some("setup") if rest.is_empty() => Ok(Invocation::Setup),
-        Some("tui" | "settings") if rest.is_empty() => Ok(Invocation::Tui),
+        Some("tui" | "settings") => match rest {
+            [] => Ok(Invocation::Tui { expert: false }),
+            [flag] if flag == "--expert" => Ok(Invocation::Tui { expert: true }),
+            _ => Err("usage: omarchy-guardian tui [--expert]".into()),
+        },
         _ => Err(format!("unknown command {:?}", command.to_string_lossy())),
     }
 }
@@ -976,8 +980,14 @@ mod tests {
     fn parses_setup() {
         assert_eq!(parse(&args(&["setup"])).unwrap(), Invocation::Setup);
         assert!(parse(&args(&["setup", "extra"])).is_err());
-        assert_eq!(parse(&args(&["tui"])).unwrap(), Invocation::Tui);
-        assert_eq!(parse(&args(&["settings"])).unwrap(), Invocation::Tui);
+        assert_eq!(
+            parse(&args(&["tui"])).unwrap(),
+            Invocation::Tui { expert: false }
+        );
+        assert_eq!(
+            parse(&args(&["settings", "--expert"])).unwrap(),
+            Invocation::Tui { expert: true }
+        );
         assert!(parse(&args(&["tui", "extra"])).is_err());
     }
 
