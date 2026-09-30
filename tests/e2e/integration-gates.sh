@@ -131,6 +131,7 @@ sandbox() {
     bwrap --ro-bind / / --overlay-src /usr --overlay-src "$E2E/usr-layer" --tmp-overlay /usr \
         --bind "$E2E" "$E2E" --proc /proc --dev /dev --tmpfs /tmp \
         --setenv HOME "$HOME" --setenv TMPDIR "$HOME/tmp" --setenv MOCK_LOG "$MOCK_LOG" \
+        --setenv OMARCHY_GUARDIAN_NO_NOTIFY 1 \
         --setenv XDG_CONFIG_HOME "$HOME/.config" \
         --setenv XDG_DATA_HOME "$HOME/.local/share" \
         --setenv XDG_CACHE_HOME "$HOME/.cache" \

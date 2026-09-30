@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Omarchy Guardian report agent
+Comment=Opens your AI agent on a saved Guardian block report
+Exec=omarchy-guardian ask %u
+Icon=omarchy-guardian
+Terminal=false
+NoDisplay=true
+MimeType=x-scheme-handler/omarchy-guardian;

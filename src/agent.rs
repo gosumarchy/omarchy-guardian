@@ -346,7 +346,7 @@ fn random_nonce() -> Result<String, Error> {
     }))
 }
 
-fn opencode_config() -> Json {
+pub(crate) fn opencode_config() -> Json {
     let permissions = Json::object(
         DENIED_PERMISSIONS
             .iter()

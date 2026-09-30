@@ -37,6 +37,14 @@ plugins, and reviews that code **before any of it runs**:
 - **Fail closed.** A review that cannot finish blocks. An unavailable AI
   blocks community sources; for official Arch/Omarchy updates the `standard`
   profile warns instead, `strict` blocks.
+- **Blocks you can read.** A block also raises a desktop notification with
+  the Guardian knight. Clicking it opens the full report as a page in your
+  browser, saved privately under `~/.cache/omarchy-guardian/reports` (the
+  newest 20 are kept). The page runs no scripts and loads nothing, and
+  everything quoted from the reviewed code is escaped. Its *Ask your AI agent*
+  button opens Claude Code (or OpenCode) in a terminal with the report and
+  every tool switched off, so you can ask what was found and whether it is a
+  false positive, and nothing in the report can make the agent act.
 - **Nothing to babysit.** The settings app (`omarchy-guardian tui`) turns
   every gate on with *Protect everything*, picks the protection level and the
   model, and tests the reviewer with a malicious and a harmless sample.

@@ -7,6 +7,7 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
+use crate::ask;
 use crate::config::Settings;
 use crate::config::model::{AiRequirement, Named, Profile, SourceClass};
 use crate::config::show;
@@ -37,6 +38,7 @@ Usage:
   omarchy-guardian setup
   omarchy-guardian protect [--yes]                  (turn on every gate that is off)
   omarchy-guardian test                             (test the saved reviewer with two samples)
+  omarchy-guardian ask <report-id>                  (open your AI agent on a saved block report)
   omarchy-guardian tui [--expert]                   (settings app; --expert shows every setting)
 
 CLASS: aur, theme, plugin, source (default). PROFILE: standard, strict, local-only.
@@ -100,6 +102,8 @@ enum Invocation {
     },
     /// `test`: the two-sample reviewer test of the saved settings.
     Test,
+    /// `ask <report-id | omarchy-guardian://ask/<id>>`, opened from a report.
+    Ask(String),
     Tui {
         expert: bool,
     },
@@ -219,6 +223,10 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
             } else {
                 ExitCode::from(1)
             }
+        }
+        Invocation::Ask(target) => {
+            eprintln!("omarchy-guardian ask: {}", ask::run(&target, &settings));
+            ExitCode::from(2)
         }
         Invocation::Tui { expert } => match tui::run(expert) {
             Ok(()) => ExitCode::SUCCESS,
@@ -550,6 +558,13 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
             _ => Err("usage: omarchy-guardian protect [--yes]".into()),
         },
         Some("test") if rest.is_empty() => Ok(Invocation::Test),
+        Some("ask") => match rest {
+            [target] => target
+                .to_str()
+                .map(|target| Invocation::Ask(target.to_string()))
+                .ok_or_else(|| "the report id must be UTF-8".to_string()),
+            _ => Err("usage: omarchy-guardian ask <report-id>".into()),
+        },
         Some("tui" | "settings") => match rest {
             [] => Ok(Invocation::Tui { expert: false }),
             [flag] if flag == "--expert" => Ok(Invocation::Tui { expert: true }),
