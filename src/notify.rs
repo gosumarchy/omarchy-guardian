@@ -10,6 +10,9 @@ use crate::report::Blocked;
 use crate::tools::{self, Limits};
 
 const NOTIFY_SEND: &str = "/usr/bin/notify-send";
+/// The knight with red eyes, installed by the package; a path, so it shows
+/// whatever the icon theme.
+const ALERT_ICON: &str = "/usr/share/icons/hicolor/scalable/apps/omarchy-guardian-alert.svg";
 
 /// Why a gate blocked, in a few words for the notification.
 pub const fn reason(blocked: Blocked) -> &'static str {
@@ -33,10 +36,15 @@ pub fn blocked(what: &str, detail: &str) {
     if let Some(bus) = &bus {
         env.push(("DBUS_SESSION_BUS_ADDRESS", bus.as_str()));
     }
+    let icon = if Path::new(ALERT_ICON).is_file() {
+        format!("--icon={ALERT_ICON}")
+    } else {
+        "--icon=security-high".to_string()
+    };
     let args: Vec<OsString> = [
         "--app-name=Omarchy Guardian",
         "--urgency=critical",
-        "--icon=security-high",
+        &icon,
         &format!("Guardian blocked {what}"),
         &format!("{detail}\nSee the terminal for the full report."),
     ]
