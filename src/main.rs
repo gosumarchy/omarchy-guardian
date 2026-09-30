@@ -16,6 +16,9 @@ compile_error!("omarchy-guardian is a Linux (Arch Linux / Omarchy) application")
 )))]
 compile_error!("scan.rs hard-codes O_NONBLOCK for the generic Linux ABI; check it for this target");
 
+#[macro_use]
+mod output;
+
 mod agent;
 mod classify;
 mod cli;

@@ -323,13 +323,13 @@ fn config_command(command: &ConfigCommand, settings: &Settings) -> ExitCode {
                 Some(class) => vec![*class],
                 None => SourceClass::ALL.to_vec(),
             };
-            print!("{}", show::render_show(settings, &classes));
-            print!("{}", show::render_memory(Store::default_root().as_deref()));
+            out!("{}", show::render_show(settings, &classes));
+            out!("{}", show::render_memory(Store::default_root().as_deref()));
             ExitCode::SUCCESS
         }
         ConfigCommand::Check => {
             let (text, valid) = show::render_check(settings);
-            print!("{text}");
+            out!("{text}");
             if valid {
                 ExitCode::SUCCESS
             } else {
@@ -337,9 +337,9 @@ fn config_command(command: &ConfigCommand, settings: &Settings) -> ExitCode {
             }
         }
         ConfigCommand::Path => {
-            println!("{}", settings.system_path().display());
+            outln!("{}", settings.system_path().display());
             if let Some(path) = settings.user_path() {
-                println!("{}", path.display());
+                outln!("{}", path.display());
             }
             ExitCode::SUCCESS
         }
@@ -369,7 +369,7 @@ fn forget_command(forget: &Forget, root: Option<PathBuf>) -> ExitCode {
         return ExitCode::from(2);
     };
     if !root.is_dir() {
-        println!("Nothing to forget: {} does not exist.", root.display());
+        outln!("Nothing to forget: {} does not exist.", root.display());
         return ExitCode::SUCCESS;
     }
     let store = match Store::open(root) {
@@ -381,7 +381,7 @@ fn forget_command(forget: &Forget, root: Option<PathBuf>) -> ExitCode {
     };
     match forget_in(forget, &store) {
         Ok(message) => {
-            println!("{message}");
+            outln!("{message}");
             ExitCode::SUCCESS
         }
         Err(error) => {

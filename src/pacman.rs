@@ -87,7 +87,7 @@ pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report
                     match scan_install_script(archive, target, class, &mut report) {
                         Ok(Some(_)) => {}
                         Ok(None) => {
-                            println!("Pacman package {target}: no install scriptlet to review.");
+                            outln!("Pacman package {target}: no install scriptlet to review.");
                         }
                         Err(error) => report.gaps.push(Gap::Package(error)),
                     }

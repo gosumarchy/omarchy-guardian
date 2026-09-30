@@ -373,11 +373,11 @@ impl Report {
     pub fn print(&self, show_hashes: bool, decision: Decision) {
         let painter = Painter::for_stdout();
 
-        println!("Omarchy Guardian  ·  {}", self.subject);
+        outln!("Omarchy Guardian  ·  {}", self.subject);
         self.print_headline(decision, painter);
         self.print_coverage(show_hashes, painter);
         for note in &self.notes {
-            println!("Review memory: {note}");
+            outln!("Review memory: {note}");
         }
         self.print_inventory();
         self.print_agent_summary(painter);
@@ -386,7 +386,7 @@ impl Report {
         for gap in &self.gaps {
             eprintln!("  ! {gap}");
         }
-        println!(
+        outln!(
             "\n{}",
             match decision {
                 Decision::Blocked(Blocked::Findings) => {
@@ -443,10 +443,10 @@ impl Report {
                 "36;1",
             ),
         };
-        println!("{}", painter.paint(&headline, color));
+        outln!("{}", painter.paint(&headline, color));
 
         if total > 0 {
-            println!(
+            outln!(
                 "Alerts: {} high · {} medium · {} low",
                 painter.paint(
                     &counts.high.to_string(),
@@ -465,7 +465,7 @@ impl Report {
     }
 
     fn print_coverage(&self, show_hashes: bool, painter: Painter) {
-        println!(
+        outln!(
             "Coverage: {} text file(s) reviewed · {} binary file(s) hashed only · {} oversized text file(s) skipped",
             self.text_files_reviewed,
             self.snapshot.count(FileKind::Binary),
@@ -474,27 +474,27 @@ impl Report {
 
         let files = self.snapshot.files();
         if !files.is_empty() {
-            println!(
+            outln!(
                 "Integrity: SHA-256 manifest {} ({} file(s) hashed)",
                 painter.paint(&self.snapshot.manifest_digest().to_string(), "36"),
                 files.len(),
             );
             if show_hashes {
-                println!("Per-file SHA-256:");
+                outln!("Per-file SHA-256:");
                 for file in files {
                     let kind = if file.kind == FileKind::Text {
                         "reviewed-text"
                     } else {
                         "hash-only"
                     };
-                    println!("  {}  {kind}  {}", file.sha256, file.path);
+                    outln!("  {}  {kind}  {}", file.sha256, file.path);
                 }
             }
         }
 
         let withheld = self.withheld_count();
         if withheld > 0 {
-            println!(
+            outln!(
                 "Privacy: {withheld} sensitive-looking file(s) withheld from the OpenCode provider"
             );
         }
@@ -505,9 +505,9 @@ impl Report {
             let mut endpoints = self.network.clone();
             endpoints.sort();
             endpoints.dedup();
-            println!("Network destinations observed: {}", endpoints.len());
+            outln!("Network destinations observed: {}", endpoints.len());
             for endpoint in endpoints.iter().take(20) {
-                println!(
+                outln!(
                     "  {}:{} → {}://{}",
                     endpoint.path,
                     endpoint.line,
@@ -516,7 +516,7 @@ impl Report {
                 );
             }
             if endpoints.len() > 20 {
-                println!("  … and {} more endpoint(s)", endpoints.len() - 20);
+                outln!("  … and {} more endpoint(s)", endpoints.len() - 20);
             }
         }
 
@@ -526,21 +526,21 @@ impl Report {
         }
         let packages = self.dependencies.packages().len();
         if packages == 0 {
-            println!("Dependencies: {lockfiles} lockfile(s) parsed; no registry packages found");
+            outln!("Dependencies: {lockfiles} lockfile(s) parsed; no registry packages found");
             return;
         }
         let (status, advisories) = match &self.audit {
             Some(audit) => ("checked against OSV", audit.advisories.len()),
             None => ("OSV audit incomplete", 0),
         };
-        println!(
+        outln!(
             "Dependencies: {packages} locked package/version(s) · {lockfiles} lockfile(s) · {status} · {advisories} known vulnerability advisory(ies)"
         );
     }
 
     fn print_agent_summary(&self, painter: Painter) {
         if self.agent_input_overflowed {
-            println!("OpenCode review: not run — source exceeds the AI input limit");
+            outln!("OpenCode review: not run — source exceeds the AI input limit");
         }
         for run in &self.agent_runs {
             let mut context = String::new();
@@ -558,7 +558,7 @@ impl Report {
                         Status::Suspicious => "31;1",
                         Status::Inconclusive => "33;1",
                     };
-                    println!(
+                    outln!(
                         "OpenCode: {} · {}{context} · profile {} — {}",
                         painter.paint(review.status.label(), color),
                         run.label,
@@ -566,7 +566,7 @@ impl Report {
                         review.summary
                     );
                 }
-                AgentOutcome::Unavailable(error) => println!(
+                AgentOutcome::Unavailable(error) => outln!(
                     "OpenCode: {} · {}{context} · profile {} — {error}",
                     painter.paint("UNAVAILABLE", "33;1"),
                     run.label,
@@ -579,22 +579,22 @@ impl Report {
     fn print_findings(&self, decision: Decision, painter: Painter) {
         if self.findings.is_empty() {
             if decision != Decision::Limited {
-                println!("Local checks: no matches");
+                outln!("Local checks: no matches");
             }
         } else {
-            println!("\nLocal checks:");
+            outln!("\nLocal checks:");
             for finding in &self.findings {
                 let severity = finding.rule.severity();
-                println!(
+                outln!(
                     "  [{}] {}:{} — {}",
                     painter.paint(severity.label(), severity.color()),
                     finding.path,
                     finding.line,
                     finding.rule.name()
                 );
-                println!("       {}", finding.rule.description());
+                outln!("       {}", finding.rule.description());
                 if !finding.excerpt.is_empty() {
-                    println!("       {}", finding.excerpt);
+                    outln!("       {}", finding.excerpt);
                 }
             }
         }
@@ -606,20 +606,20 @@ impl Report {
             };
             for finding in &review.findings {
                 if !findings_heading_printed {
-                    println!("\nOpenCode findings:");
+                    outln!("\nOpenCode findings:");
                     findings_heading_printed = true;
                 }
                 let line = finding
                     .line
                     .map(|line| format!(":{line}"))
                     .unwrap_or_default();
-                println!(
+                outln!(
                     "  [{}] {}{line} — {}",
                     painter.paint(finding.severity.label(), finding.severity.color()),
                     finding.file,
                     finding.title
                 );
-                println!("       {}", finding.reason);
+                outln!("       {}", finding.reason);
             }
         }
 
@@ -628,12 +628,12 @@ impl Report {
             .as_ref()
             .filter(|audit| !audit.advisories.is_empty())
         {
-            println!("\nKnown dependency vulnerabilities:");
+            outln!("\nKnown dependency vulnerabilities:");
             for advisory in &audit.advisories {
                 let (label, color) = advisory.severity.map_or(("UNRATED", "36;1"), |severity| {
                     (severity.label(), severity.color())
                 });
-                println!(
+                outln!(
                     "  [{}] {}@{} — {} ({})",
                     painter.paint(label, color),
                     advisory.package,
@@ -642,11 +642,11 @@ impl Report {
                     advisory.lockfile
                 );
                 if let Some(summary) = &advisory.summary {
-                    println!("       {summary}");
+                    outln!("       {summary}");
                 }
             }
             if audit.truncated {
-                println!("  … OSV reported more advisories than it returned in one page");
+                outln!("  … OSV reported more advisories than it returned in one page");
             }
         }
     }

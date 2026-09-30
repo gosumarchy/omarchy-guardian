@@ -71,7 +71,7 @@ pub fn run(
         Error::Refused("the sandbox copy does not match the reviewed source".into())
     })?;
 
-    println!(
+    outln!(
         "Sandbox: network isolated · no host home directory · read-only system · {} MiB disposable source copy",
         copied / (1024 * 1024)
     );
@@ -107,7 +107,7 @@ pub fn run(
         })?;
 
     if status.success() {
-        println!("Sandbox run completed with exit code 0.");
+        outln!("Sandbox run completed with exit code 0.");
     } else {
         eprintln!("Sandbox command exited with {status}.");
     }
