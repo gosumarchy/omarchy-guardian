@@ -62,13 +62,6 @@ impl Style {
         Self { bold: true, ..self }
     }
 
-    pub const fn reverse(self) -> Self {
-        Self {
-            reverse: true,
-            ..self
-        }
-    }
-
     fn sgr(self) -> String {
         let mut codes = vec!["0".to_string()];
         if self.bold {

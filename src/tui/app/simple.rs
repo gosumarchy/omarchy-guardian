@@ -2,7 +2,7 @@
 //! and a reset to defaults, with the Guardian mascot saying how things
 //! stand. Expert mode (`e`) has every other setting.
 
-use super::{App, Dialog, Effect, Tone, draw_dialog, value_hint, wrap};
+use super::{App, Dialog, Effect, Mode, Tone, draw_dialog, value_hint, wrap};
 use crate::config::file::AgentDefaults;
 use crate::config::file::PartialConfig;
 use crate::config::load::FileStatus;
@@ -18,6 +18,8 @@ enum Item {
     Level(Profile),
     Model,
     ProtectEverything,
+    Test,
+    Expert,
     Defaults,
 }
 
@@ -65,7 +67,7 @@ impl App {
         if !self.gates_off().is_empty() {
             items.push(Item::ProtectEverything);
         }
-        items.push(Item::Defaults);
+        items.extend([Item::Test, Item::Expert, Item::Defaults]);
         items
     }
 
@@ -277,6 +279,11 @@ impl App {
                 });
                 None
             }
+            Item::Test => Some(self.test_reviewer()),
+            Item::Expert => {
+                self.mode = Mode::Expert;
+                None
+            }
             Item::Defaults => {
                 self.dialog = Some(Dialog::Confirm {
                     title: "Reset to defaults?".into(),
@@ -319,79 +326,104 @@ impl App {
 
         self.simple_cursor = self.simple_cursor.min(self.simple_items().len() - 1);
         let (speech, tone) = self.speech();
-        let with_mascot = height >= 27;
+        let with_mascot = height >= 28;
         let mut y = 2;
         if with_mascot {
             mascot::draw(canvas, 3, 1, self.mood(), self.blinking());
-            let bubble_x = 4 + mascot::WIDTH + 2;
-            let bubble_width = width.saturating_sub(bubble_x + 3).min(60);
-            let lines = wrap(&speech, bubble_width.saturating_sub(5));
-            mascot::bubble(
-                canvas,
-                bubble_x,
-                2,
-                bubble_width,
-                &lines[..lines.len().min(4)],
-                tone,
-            );
-            y = 1 + mascot::HEIGHT + 1;
+            y = self.draw_hero(canvas, 4 + mascot::WIDTH + 2, &speech, tone);
+            y = y.max(1 + mascot::HEIGHT);
         }
         y = self.draw_levels(canvas, y);
-        y = self.draw_model(canvas, y + 1);
-        y = self.draw_gates(canvas, y + 1);
-        y = self.draw_actions(canvas, y);
+        y = self.draw_model(canvas, y);
+        y = self.draw_gates(canvas, y);
+        y = self.draw_actions(canvas, y, height - 5);
         let footer = height - 4;
-        if self.has_expert_settings() && y + 1 < footer {
+        if self.has_expert_settings() && y < footer {
             canvas.text_fit(
-                6,
-                y + 1,
+                3,
+                y,
                 "Some expert settings are set too; press e to see them.",
                 Style::fg(color::MUTED),
-                width - 10,
+                width - 6,
             );
         }
         self.draw_simple_footer(canvas, if with_mascot { None } else { Some(speech) });
     }
 
-    /// Highlights the row of item `index` when it has the cursor; returns
-    /// the style to draw it with.
+    /// Beside the knight: the name, the level and model as a dim uppercase
+    /// line, and what the knight has to say. Returns the next free row.
+    fn draw_hero(&self, canvas: &mut Canvas, x: usize, speech: &str, tone: u8) -> usize {
+        let inner = canvas.width.saturating_sub(x + 3);
+        let settings = self.settings();
+        canvas.text(x, 3, "Guardian", Style::PLAIN.bold(), inner);
+        let meta = format!(
+            "{} · {}",
+            self.level().map_or("Custom", level_name),
+            Field::new(Scope::User, Setting::AgentModel).effective(
+                &settings,
+                &self.user,
+                &self.system
+            )
+        )
+        .to_uppercase();
+        canvas.text_fit(x, 4, &meta, Style::fg(color::MUTED), inner);
+        let mut y = 6;
+        for line in wrap(speech, inner).iter().take(3) {
+            canvas.text(x, y, line, Style::fg(tone), inner);
+            y += 1;
+        }
+        y
+    }
+
+    /// A thin rule and a dim uppercase section name; returns the next row.
+    fn section(canvas: &mut Canvas, y: usize, title: &str) -> usize {
+        let rule = "─".repeat(canvas.width - 6);
+        canvas.text(3, y, &rule, Style::fg(color::MUTED), canvas.width - 6);
+        canvas.text(
+            3,
+            y + 1,
+            title,
+            Style::fg(color::MUTED).bold(),
+            canvas.width - 6,
+        );
+        y + 2
+    }
+
+    /// A status word right-aligned on row `y`, like the shell's panels.
+    fn status_word(canvas: &mut Canvas, y: usize, word: &str, style: Style) {
+        let x = canvas.width - 3 - word.chars().count();
+        canvas.text(x, y, word, style, word.chars().count());
+    }
+
+    /// Marks the row of item `index` when it has the cursor (an accent bar
+    /// and bold text); returns the style to draw it with.
     fn simple_row(&self, canvas: &mut Canvas, y: usize, index: usize) -> Style {
         if index == self.simple_cursor && self.dialog.is_none() {
-            canvas.fill(1, y, canvas.width - 2, Style::PLAIN.reverse());
-            Style::PLAIN.reverse()
+            canvas.text(1, y, "▌", Style::fg(color::ACCENT), 1);
+            Style::PLAIN.bold()
         } else {
             Style::PLAIN
         }
     }
 
-    fn draw_levels(&self, canvas: &mut Canvas, mut y: usize) -> usize {
-        let inner = canvas.width - 4;
+    fn draw_levels(&self, canvas: &mut Canvas, y: usize) -> usize {
+        let inner = canvas.width - 6;
         let current = self.level();
-        canvas.text(
-            2,
-            y,
-            "Protection level",
-            Style::fg(color::ACCENT).bold(),
-            inner,
-        );
-        y += 1;
+        let mut y = Self::section(canvas, y, "PROTECTION LEVEL");
         for (index, (profile, name, summary)) in LEVELS.iter().enumerate() {
             let base = self.simple_row(canvas, y, index);
             let chosen = current == Some(*profile);
-            let (mark, fg) = if chosen {
-                ("●", color::GREEN)
-            } else {
-                ("○", color::MUTED)
-            };
-            canvas.text(4, y, mark, base.with_fg(fg).bold(), 1);
-            canvas.text(6, y, name, if chosen { base.bold() } else { base }, 10);
+            canvas.text(3, y, name, base, 10);
             canvas.text_fit(
-                17,
+                14,
                 y,
                 summary,
-                base.with_fg(color::MUTED),
-                inner.saturating_sub(15),
+                Style::fg(color::MUTED),
+                inner.saturating_sub(20),
             );
+            if chosen {
+                Self::status_word(canvas, y, "ACTIVE", Style::fg(color::ACCENT).bold());
+            }
             y += 1;
         }
         if current.is_none() {
@@ -401,23 +433,16 @@ impl App {
                 level_name(settings.profile_for(SourceClass::Source)),
                 level_name(settings.system_profile())
             );
-            canvas.text_fit(6, y, &text, Style::fg(color::YELLOW), inner - 4);
+            canvas.text_fit(3, y, &text, Style::fg(color::YELLOW), inner);
             y += 1;
         }
         y
     }
 
-    fn draw_model(&self, canvas: &mut Canvas, mut y: usize) -> usize {
-        let inner = canvas.width - 4;
+    fn draw_model(&self, canvas: &mut Canvas, y: usize) -> usize {
+        let inner = canvas.width - 6;
         let settings = self.settings();
-        canvas.text(
-            2,
-            y,
-            "AI provider & model",
-            Style::fg(color::ACCENT).bold(),
-            inner,
-        );
-        y += 1;
+        let mut y = Self::section(canvas, y, "AI MODEL");
         let base = self.simple_row(canvas, y, LEVELS.len());
         let model = Field::new(Scope::User, Setting::AgentModel).effective(
             &settings,
@@ -429,76 +454,99 @@ impl App {
             &self.user,
             &self.system,
         );
-        canvas.text(6, y, "Model", base, 10);
-        canvas.text_fit(
-            17,
-            y,
-            &model,
-            base.with_fg(color::GREEN).bold(),
-            inner.saturating_sub(15),
-        );
+        canvas.text(3, y, "Model", base, 10);
+        canvas.text_fit(14, y, &model, base, inner.saturating_sub(12));
         y += 1;
         if pacman != model {
             canvas.text_fit(
-                17,
+                14,
                 y,
                 &format!("pacman uses {pacman}"),
                 Style::fg(color::MUTED),
-                inner.saturating_sub(15),
+                inner.saturating_sub(12),
             );
             y += 1;
         }
         y
     }
 
-    fn draw_gates(&self, canvas: &mut Canvas, mut y: usize) -> usize {
-        let inner = canvas.width - 4;
-        canvas.text(
-            2,
-            y,
-            "Where I watch",
-            Style::fg(color::ACCENT).bold(),
-            inner,
-        );
-        y += 1;
-        let mut x = 6;
+    fn draw_gates(&self, canvas: &mut Canvas, y: usize) -> usize {
+        let mut y = Self::section(canvas, y, "GATES");
         for gate in GATES {
             let state = self
                 .integrations
                 .iter()
                 .find(|(candidate, _)| *candidate == gate)
                 .map(|(_, state)| state);
-            let (label, fg) = match state {
-                Some(State::On) => ("● on", color::GREEN),
-                Some(State::Off | State::Foreign(_)) => ("○ off", color::YELLOW),
-                Some(State::Partial(_)) => ("◐ partly", color::YELLOW),
-                Some(State::Unavailable(_)) | None => ("– n/a", color::MUTED),
+            let (word, fg) = match state {
+                Some(State::On) => ("ON", color::ACCENT),
+                Some(State::Off | State::Foreign(_)) => ("OFF", color::RED),
+                Some(State::Partial(_)) => ("PARTLY", color::YELLOW),
+                Some(State::Unavailable(_)) | None => ("N/A", color::MUTED),
             };
-            x = canvas.text(x, y, gate_name(gate), Style::PLAIN, inner) + 1;
-            x = canvas.text(x, y, label, Style::fg(fg), inner) + 3;
-        }
-        y + 1
-    }
-
-    fn draw_actions(&self, canvas: &mut Canvas, mut y: usize) -> usize {
-        let items = self.simple_items();
-        for (index, item) in items.iter().enumerate().skip(LEVELS.len() + 1) {
-            match item {
-                Item::ProtectEverything => {
-                    let base = self.simple_row(canvas, y, index);
-                    canvas.text(4, y, "›", base.with_fg(color::YELLOW).bold(), 1);
-                    canvas.text(6, y, "Protect everything", base.bold(), 30);
-                }
-                Item::Defaults => {
-                    y += 1;
-                    let base = self.simple_row(canvas, y, index);
-                    canvas.text(6, y, "Reset to defaults", base, 30);
-                }
-                Item::Level(_) | Item::Model => {}
-            }
+            canvas.text(3, y, gate.label(), Style::PLAIN, canvas.width - 14);
+            Self::status_word(canvas, y, word, Style::fg(fg).bold());
             y += 1;
         }
         y
+    }
+
+    /// The actions as tiles (a glyph over a label) when there is room, else
+    /// as plain rows.
+    fn draw_actions(&self, canvas: &mut Canvas, y: usize, bottom: usize) -> usize {
+        let items = self.simple_items();
+        let actions: Vec<(usize, &str, &str)> = items
+            .iter()
+            .enumerate()
+            .skip(LEVELS.len() + 1)
+            .filter_map(|(index, item)| match item {
+                Item::ProtectEverything => Some((index, "\u{f0483}", "Protect everything")),
+                Item::Test => Some((index, "\u{f0668}", "Test reviewer")),
+                Item::Expert => Some((index, "\u{f0493}", "Expert mode")),
+                Item::Defaults => Some((index, "\u{f0450}", "Reset to defaults")),
+                Item::Level(_) | Item::Model => None,
+            })
+            .collect();
+        let y = y + 1;
+        let tile_width = ((canvas.width - 6).saturating_sub(2 * (actions.len().max(1) - 1))
+            / actions.len().max(1))
+        .min(24);
+        if y + 4 <= bottom {
+            let mut x = 3;
+            for (index, glyph, label) in &actions {
+                let selected = *index == self.simple_cursor && self.dialog.is_none();
+                let edge = if selected {
+                    Style::fg(color::ACCENT)
+                } else {
+                    Style::fg(color::MUTED)
+                };
+                canvas.frame(x, y, tile_width, 4, edge);
+                let center = |text: &str| x + (tile_width - text.chars().count()) / 2;
+                canvas.text(
+                    center(glyph),
+                    y + 1,
+                    glyph,
+                    Style::fg(color::ACCENT).bold(),
+                    2,
+                );
+                let style = if selected {
+                    Style::PLAIN.bold()
+                } else {
+                    Style::PLAIN
+                };
+                canvas.text(center(label), y + 2, label, style, tile_width - 2);
+                x += tile_width + 2;
+            }
+            y + 5
+        } else {
+            let mut y = y;
+            for (index, _, label) in &actions {
+                let base = self.simple_row(canvas, y, *index);
+                canvas.text(3, y, label, base, 30);
+                y += 1;
+            }
+            y
+        }
     }
 
     /// Help for the selected item (or, without the mascot, what it would
@@ -545,6 +593,10 @@ impl App {
             Some(Item::ProtectEverything) => {
                 "Turns on the pacman hook, the AUR gate and the theme & plugin gate (asks for sudo)."
             }
+            Some(Item::Test) => {
+                "Sends a malicious and a harmless sample to the saved model; both must be judged right."
+            }
+            Some(Item::Expert) => "Every setting, integration and maintenance task.",
             Some(Item::Defaults) => "Back to Balanced and OpenCode's default model.",
             None => "",
         }
@@ -599,13 +651,19 @@ mod tests {
         canvas.rows().join("\n")
     }
 
+    /// Whether the row for `level` carries the ACTIVE status word.
+    fn active_level(text: &str, level: &str) -> bool {
+        text.lines()
+            .any(|line| line.contains(&format!(" {level} ")) && line.contains("ACTIVE"))
+    }
+
     #[test]
     fn shows_the_mascot_levels_and_model() {
         let mut app = App::new(files(None), Mode::Simple);
         let text = screen(&mut app);
         assert!(text.contains("▄█▀▀▀██████▄"), "{text}");
         assert!(text.contains("██▀▀████▀▀██"), "open eyes: {text}");
-        assert!(text.contains("● Balanced"));
+        assert!(active_level(&text, "Balanced"), "{text}");
         assert!(text.contains("Balanced protection is on"));
         assert!(text.contains("OpenCode default"));
         assert!(!text.contains("Protect everything"));
@@ -675,7 +733,7 @@ mod tests {
             "{text}"
         );
         press(&mut app, &[Key::Char('1')]);
-        assert!(screen(&mut app).contains("● Balanced"));
+        assert!(active_level(&screen(&mut app), "Balanced"));
     }
 
     #[test]
@@ -726,7 +784,7 @@ mod tests {
         press(&mut app, &[Key::Char('e')]);
         assert!(screen(&mut app).contains("1 Profiles"));
         press(&mut app, &[Key::Char('e')]);
-        assert!(screen(&mut app).contains("Protection level"));
+        assert!(screen(&mut app).contains("PROTECTION LEVEL"));
     }
 
     #[test]

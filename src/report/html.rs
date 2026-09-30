@@ -8,7 +8,7 @@
 use std::fmt::Write as _;
 use std::sync::{Mutex, PoisonError};
 
-use super::{AgentOutcome, Decision, Report, Severity, recommendation};
+use super::{AgentOutcome, Blocked, Decision, Report, Severity, recommendation};
 use crate::agent::Status;
 use crate::scan::FileKind;
 
@@ -38,12 +38,13 @@ pub fn page(title: &str, detail: &str, when: &str, id: &str, fallback: &str) -> 
         .join("\n");
     let body = if sections.is_empty() {
         format!(
-            "<section class=\"card\"><h2>Output</h2><pre class=\"code\">{}</pre></section>",
+            "<section><h3>Output</h3><pre class=\"code\">{}</pre></section>",
             esc(&strip_ansi(fallback))
         )
     } else {
         sections
     };
+    let what = title.strip_prefix("Guardian blocked ").unwrap_or(title);
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -52,33 +53,35 @@ pub fn page(title: &str, detail: &str, when: &str, id: &str, fallback: &str) -> 
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title_text}</title>
-<style>{STYLE}</style>
+<style>:root{{{palette}}}{STYLE}</style>
 </head>
 <body>
-<input type="checkbox" id="light" class="theme-switch">
-<div class="page">
+<main>
 <header class="hero">
   <div class="knight">{KNIGHT}</div>
-  <div class="hero-text">
-    <div class="eyebrow">Omarchy Guardian · blocked</div>
-    <h1>{title_text}</h1>
-    <p class="detail">{detail_text}</p>
-    <p class="meta">{when_text}</p>
+  <div>
+    <h1>Guardian</h1>
+    <div class="meta">BLOCKED · {when_text}</div>
   </div>
-  <label for="light" class="toggle" title="Switch theme"><span class="to-light">☀ Light</span><span class="to-dark">☾ Dark</span></label>
 </header>
-<div class="banner">Nothing from this source ran: Guardian stopped it before any of its code could run.</div>
-<div class="ask-row">
-  <a class="ask" href="omarchy-guardian://ask/{id_text}">✦ Ask your AI agent about this report</a>
-  <span class="ask-note">Opens Claude Code (or OpenCode) in a terminal with this report and no tools, so nothing in the report can make it run anything.</span>
-</div>
+<hr>
+<div class="row lead"><span>Blocked {what_text}</span><span class="word red">BLOCKED</span></div>
+<p class="dim">{detail_text}. Nothing from this source ran: Guardian stopped it before any of its code could run.</p>
 {body}
-<footer>Omarchy Guardian {version} · this report is saved on your machine and was not sent anywhere · a clear review is not a safety guarantee</footer>
+<hr>
+<h3>Next</h3>
+<div class="tiles">
+  <a class="tile" href="omarchy-guardian://ask/{id_text}"><span class="glyph">✦</span><span>Ask your AI agent</span></a>
 </div>
+<p class="dim small">Opens Claude Code (or OpenCode) in a terminal with this report and no tools, so nothing in the report can make it run anything.</p>
+<footer>OMARCHY GUARDIAN {version} · SAVED ON THIS MACHINE ONLY · A CLEAR REVIEW IS NOT A SAFETY GUARANTEE</footer>
+</main>
 </body>
 </html>
 "#,
+        palette = palette(),
         title_text = esc(title),
+        what_text = esc(what),
         detail_text = esc(detail),
         when_text = esc(when),
         id_text = esc(id),
@@ -86,33 +89,78 @@ pub fn page(title: &str, detail: &str, when: &str, id: &str, fallback: &str) -> 
     )
 }
 
+/// The page's colours from the current Omarchy theme (the shell reads the
+/// same file), so the report looks like the rest of the desktop; dark
+/// defaults without one. Only `#rrggbb` values are used.
+fn palette() -> String {
+    let path = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/state"))
+        })
+        .map(|base| base.join("omarchy/current/theme/colors.toml"));
+    let theme = path
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    palette_from(&theme)
+}
+
+fn palette_from(theme: &str) -> String {
+    let color = |key: &str, fallback: &str| -> String {
+        theme
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once('=')?;
+                (name.trim() == key).then(|| value.trim().trim_matches('"').to_string())
+            })
+            .filter(|value| {
+                value.len() == 7
+                    && value.starts_with('#')
+                    && value[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            .unwrap_or_else(|| fallback.to_string())
+    };
+    format!(
+        "--bg:{};--fg:{};--accent:{};--red:{};--amber:{};--green:{};--cyan:{};",
+        color("background", "#111418"),
+        color("foreground", "#e6e1d6"),
+        color("accent", "#f08a3c"),
+        color("color1", "#e0604f"),
+        color("color3", "#e0af68"),
+        color("color2", "#9ece6a"),
+        color("color6", "#7dcfff"),
+    )
+}
+
+/// The verdict as one right-aligned word, like the shell's status words.
+fn verdict_word(report: &Report, decision: Decision) -> &'static str {
+    match decision {
+        Decision::Clear => "CLEAR",
+        Decision::Warned => "WARNED",
+        Decision::Limited => "LIMITED",
+        Decision::Blocked(Blocked::Findings) if report.counts().high > 0 => "HIGH RISK",
+        Decision::Blocked(Blocked::Findings) => "REVIEW REQUIRED",
+        Decision::Blocked(Blocked::Incomplete) => "INCOMPLETE",
+        Decision::Blocked(Blocked::AiUnavailable) => "AI UNAVAILABLE",
+        Decision::Blocked(Blocked::NotConfirmed) => "NOT CONFIRMED",
+    }
+}
+
 fn section(report: &Report, decision: Decision) -> String {
     let mut html = String::new();
-    let (headline, color) = report.headline(decision);
+    let (_, color) = report.headline(decision);
     let counts = report.counts();
     let _ = write!(
         html,
-        r#"<section class="card"><div class="verdict {tone}">{headline}</div><h2 class="subject">{subject}</h2><div class="chips">"#,
-        tone = tone(color),
-        headline = esc(&headline),
+        r#"<section><hr><div class="row"><span class="subject">{subject}</span><span class="word {tone}">{word}</span></div><div class="meta">{high} HIGH · {medium} MEDIUM · {low} LOW · {files} TEXT FILES REVIEWED · {binary} BINARY HASHED</div>"#,
         subject = esc(&report.subject),
-    );
-    for (label, count, class) in [
-        ("High", counts.high, "sev-high"),
-        ("Medium", counts.medium, "sev-medium"),
-        ("Low", counts.low, "sev-low"),
-    ] {
-        let class = if count > 0 { class } else { "muted" };
-        let _ = write!(
-            html,
-            r#"<span class="chip {class}"><b>{count}</b> {label}</span>"#
-        );
-    }
-    let _ = write!(
-        html,
-        r#"<span class="chip"><b>{}</b> text files reviewed</span><span class="chip"><b>{}</b> binary files hashed</span></div>"#,
-        report.text_files_reviewed,
-        report.snapshot.count(FileKind::Binary)
+        tone = tone(color),
+        word = verdict_word(report, decision),
+        high = counts.high,
+        medium = counts.medium,
+        low = counts.low,
+        files = report.text_files_reviewed,
+        binary = report.snapshot.count(FileKind::Binary),
     );
 
     ai_reviews(&mut html, report);
@@ -121,8 +169,10 @@ fn section(report: &Report, decision: Decision) -> String {
 
     let _ = write!(
         html,
-        r#"<div class="advice">{}</div></section>"#,
-        esc(recommendation(decision))
+        "<h3>Recommendation</h3><p>{}</p></section>",
+        esc(recommendation(decision)
+            .strip_prefix("Recommendation: ")
+            .unwrap_or(recommendation(decision)))
     );
     html
 }
@@ -133,7 +183,7 @@ fn ai_reviews(html: &mut String, report: &Report) {
     }
     html.push_str("<h3>AI review</h3>");
     if report.agent_input_overflowed {
-        html.push_str(r#"<div class="ai tone-amber"><p>Not run: the source exceeds the AI input limit.</p></div>"#);
+        html.push_str(r#"<div class="row"><span>Not run: the source exceeds the AI input limit</span><span class="word amber">SKIPPED</span></div>"#);
     }
     for run in &report.agent_runs {
         let mut meta = esc(&run.label);
@@ -148,17 +198,17 @@ fn ai_reviews(html: &mut String, report: &Report) {
             AgentOutcome::Reviewed(review) => (
                 review.status.label(),
                 match review.status {
-                    Status::Clear => "tone-green",
-                    Status::Suspicious => "tone-red",
-                    Status::Inconclusive => "tone-amber",
+                    Status::Clear => "green",
+                    Status::Suspicious => "red",
+                    Status::Inconclusive => "amber",
                 },
                 review.summary.clone(),
             ),
-            AgentOutcome::Unavailable(error) => ("UNAVAILABLE", "tone-amber", error.to_string()),
+            AgentOutcome::Unavailable(error) => ("UNAVAILABLE", "amber", error.to_string()),
         };
         let _ = write!(
             html,
-            r#"<div class="ai {tone}"><div class="ai-head"><span class="pill">{label}</span><span class="meta">{meta}</span></div><p>{text}</p></div>"#,
+            r#"<div class="item"><div class="row"><span>{meta}</span><span class="word {tone}">{label}</span></div><p>{text}</p></div>"#,
             text = esc(&text),
         );
     }
@@ -215,15 +265,16 @@ fn finding_card(
     reason: &str,
     excerpt: Option<&String>,
 ) {
-    let class = match severity {
-        Severity::High => "sev-high",
-        Severity::Medium => "sev-medium",
-        Severity::Low => "sev-low",
+    let tone = match severity {
+        Severity::High => "red",
+        Severity::Medium => "amber",
+        Severity::Low => "cyan",
     };
     let _ = write!(
         html,
-        r#"<article class="finding {class}"><div class="finding-head"><span class="sev">{sev}</span><span class="source">{source}</span><code class="loc">{location}</code></div><h4>{title}</h4><p>{reason}</p>"#,
+        r#"<div class="item"><div class="row"><span class="strong">{title}</span><span class="word {tone}">{sev}</span></div><div class="meta">{source} · {location}</div><p>{reason}</p>"#,
         sev = severity.label(),
+        source = esc(&source.to_uppercase()),
         location = esc(location),
         title = esc(title),
         reason = esc(reason),
@@ -231,7 +282,7 @@ fn finding_card(
     if let Some(excerpt) = excerpt {
         let _ = write!(html, r#"<pre class="code">{}</pre>"#, esc(excerpt));
     }
-    html.push_str("</article>");
+    html.push_str("</div>");
 }
 
 fn extras(html: &mut String, report: &Report) {
@@ -273,7 +324,7 @@ fn extras(html: &mut String, report: &Report) {
         html.push_str("</ul>");
     }
     if !report.gaps.is_empty() {
-        html.push_str(r#"<h3>Why the review is incomplete</h3><ul class="gaps">"#);
+        html.push_str(r#"<h3>Why the review is incomplete</h3><ul class="amber">"#);
         for gap in &report.gaps {
             let _ = write!(html, "<li>{}</li>", esc(&gap.to_string()));
         }
@@ -300,10 +351,10 @@ fn extras(html: &mut String, report: &Report) {
 
 const fn tone(color: &str) -> &'static str {
     match color.as_bytes() {
-        [b'3', b'1', ..] => "tone-red",
-        [b'3', b'2', ..] => "tone-green",
-        [b'3', b'6', ..] => "tone-cyan",
-        _ => "tone-amber",
+        [b'3', b'1', ..] => "red",
+        [b'3', b'2', ..] => "green",
+        [b'3', b'6', ..] => "cyan",
+        _ => "amber",
     }
 }
 
@@ -364,86 +415,50 @@ pub fn utc(seconds: u64) -> String {
 }
 
 const STYLE: &str = r#"
-:root{color-scheme:dark}
 *{box-sizing:border-box}
-html,body{margin:0;background:#16161e}
-.theme-switch{position:absolute;opacity:0;pointer-events:none}
-.page{
-  --bg:#16161e;--card:#1f2335;--card2:#24283b;--line:#2f3549;--text:#c0caf5;--muted:#7a85b0;
-  --red:#f7768e;--amber:#e0af68;--green:#9ece6a;--cyan:#7dcfff;--blue:#7aa2f7;--code:#13131a;
-  min-height:100vh;background:var(--bg);color:var(--text);
-  font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;padding:32px 20px 48px}
-.theme-switch:checked ~ .page{
-  --bg:#f3f4f8;--card:#ffffff;--card2:#f6f7fb;--line:#dde0ea;--text:#2b2f3f;--muted:#6b7190;
-  --red:#d20f39;--amber:#b35c00;--green:#2f7d32;--cyan:#0369a1;--blue:#3451b2;--code:#f1f2f6;color-scheme:light}
-.page>*{max-width:920px;margin-left:auto;margin-right:auto}
-.hero{display:flex;gap:24px;align-items:center;padding:24px 28px;background:linear-gradient(135deg,var(--card),var(--card2));
-  border:1px solid var(--line);border-radius:18px;position:relative}
-.knight svg{width:104px;height:104px;display:block;filter:drop-shadow(0 6px 18px rgba(247,118,142,.35))}
-.hero-text{flex:1;min-width:0}
-.eyebrow{text-transform:uppercase;letter-spacing:.14em;font-size:12px;color:var(--red);font-weight:700}
-h1{margin:6px 0 4px;font-size:26px;line-height:1.25;word-break:break-word}
-.detail{margin:0;font-size:16px}
-.meta{margin:6px 0 0;color:var(--muted);font-size:13px}
-.toggle{position:absolute;top:16px;right:18px;cursor:pointer;font-size:12px;color:var(--muted);border:1px solid var(--line);
-  border-radius:999px;padding:4px 12px;user-select:none}
-.toggle:hover{color:var(--text)}
-.to-dark{display:none}
-.theme-switch:checked ~ .page .to-dark{display:inline}
-.theme-switch:checked ~ .page .to-light{display:none}
-.banner{margin-top:16px;padding:12px 18px;border-radius:12px;background:color-mix(in srgb,var(--green) 14%,transparent);
-  border:1px solid color-mix(in srgb,var(--green) 40%,transparent);color:var(--green);font-weight:600}
-.card{margin-top:20px;padding:24px 28px;background:var(--card);border:1px solid var(--line);border-radius:18px}
-.verdict{display:inline-block;font-weight:800;letter-spacing:.02em;padding:6px 14px;border-radius:10px;font-size:14px}
-.tone-red.verdict{background:color-mix(in srgb,var(--red) 18%,transparent);color:var(--red)}
-.tone-amber.verdict{background:color-mix(in srgb,var(--amber) 18%,transparent);color:var(--amber)}
-.tone-green.verdict{background:color-mix(in srgb,var(--green) 18%,transparent);color:var(--green)}
-.tone-cyan.verdict{background:color-mix(in srgb,var(--cyan) 18%,transparent);color:var(--cyan)}
-.subject{margin:12px 0 14px;font-size:15px;font-weight:600;color:var(--muted);word-break:break-all}
-.chips{display:flex;flex-wrap:wrap;gap:8px}
-.chip{padding:5px 12px;border-radius:999px;background:var(--card2);border:1px solid var(--line);font-size:13px;color:var(--muted)}
-.chip b{color:var(--text)}
-.chip.sev-high{border-color:var(--red)}.chip.sev-high b{color:var(--red)}
-.chip.sev-medium{border-color:var(--amber)}.chip.sev-medium b{color:var(--amber)}
-.chip.sev-low{border-color:var(--cyan)}.chip.sev-low b{color:var(--cyan)}
-h3{margin:26px 0 10px;font-size:13px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted)}
-.ai{padding:14px 18px;border-radius:12px;background:var(--card2);border-left:4px solid var(--line);margin-bottom:10px}
-.ai.tone-red{border-left-color:var(--red)}.ai.tone-green{border-left-color:var(--green)}.ai.tone-amber{border-left-color:var(--amber)}
-.ai-head{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
-.ai p{margin:8px 0 0}
-.pill{font-weight:800;font-size:12px;letter-spacing:.06em;padding:2px 10px;border-radius:999px;background:var(--line)}
-.ai.tone-red .pill{color:var(--red)}.ai.tone-green .pill{color:var(--green)}.ai.tone-amber .pill{color:var(--amber)}
-.ai .meta{margin:0}
-.finding{padding:16px 18px;border-radius:12px;background:var(--card2);border:1px solid var(--line);border-left:4px solid var(--line);margin-bottom:12px}
-.finding.sev-high{border-left-color:var(--red)}.finding.sev-medium{border-left-color:var(--amber)}.finding.sev-low{border-left-color:var(--cyan)}
-.finding-head{display:flex;flex-wrap:wrap;gap:10px;align-items:center;font-size:12px}
-.sev{font-weight:800;letter-spacing:.08em}
-.sev-high .sev{color:var(--red)}.sev-medium .sev{color:var(--amber)}.sev-low .sev{color:var(--cyan)}
-.source{color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
-.loc{margin-left:auto;color:var(--blue)}
-.finding h4{margin:8px 0 4px;font-size:16px}
-.finding p{margin:0}
-code,pre{font-family:ui-monospace,"JetBrainsMono Nerd Font","JetBrains Mono",monospace;font-size:13px}
-pre.code{margin:10px 0 0;padding:12px 14px;background:var(--code);border:1px solid var(--line);border-radius:10px;
-  white-space:pre-wrap;word-break:break-all;overflow:auto}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
-th{color:var(--muted);font-weight:600}
-ul{margin:0;padding-left:20px}
-.gaps li{color:var(--amber)}
-details{margin-top:22px;padding:12px 16px;border-radius:12px;background:var(--card2);border:1px solid var(--line)}
-summary{cursor:pointer;color:var(--muted);font-weight:600}
+html,body{margin:0;background:var(--bg);color:var(--fg)}
+body{font:14px/1.6 "JetBrainsMono Nerd Font","JetBrains Mono",ui-monospace,monospace;padding:40px 20px 56px}
+main{max-width:760px;margin:0 auto;padding:28px 32px;border:1px solid color-mix(in srgb,var(--fg) 22%,transparent);
+  background:color-mix(in srgb,var(--bg) 92%,var(--fg))}
+.hero{display:flex;gap:22px;align-items:center}
+.knight svg{width:64px;height:64px;display:block}
+h1{margin:0;font-size:22px;font-weight:700;letter-spacing:.02em}
+hr{border:0;border-top:1px solid color-mix(in srgb,var(--fg) 16%,transparent);margin:22px 0}
+h3{margin:24px 0 12px;font-size:12px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
+  color:color-mix(in srgb,var(--fg) 55%,transparent)}
+.meta{font-size:12px;letter-spacing:.12em;color:color-mix(in srgb,var(--fg) 45%,transparent);word-break:break-word}
+.dim{color:color-mix(in srgb,var(--fg) 62%,transparent)}
+.small{font-size:12px}
+.row{display:flex;justify-content:space-between;align-items:baseline;gap:18px}
+.row>span:first-child{min-width:0;word-break:break-word}
+.lead{font-size:17px;font-weight:700}
+.subject{font-weight:700}
+.strong{font-weight:700}
+.word{flex:none;font-weight:700;letter-spacing:.1em;font-size:13px}
+.red{color:var(--red)}.amber{color:var(--amber)}.green{color:var(--green)}.cyan{color:var(--cyan)}.accent{color:var(--accent)}
+.item{padding:14px 0;border-bottom:1px solid color-mix(in srgb,var(--fg) 8%,transparent)}
+.item:last-child{border-bottom:0}
+.item p{margin:8px 0 0}
+p{margin:10px 0 0}
+pre.code{margin:12px 0 0;padding:12px 14px;background:color-mix(in srgb,var(--fg) 6%,transparent);
+  white-space:pre-wrap;word-break:break-all;font:inherit;font-size:13px}
+code{font:inherit}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:6px 0;border-bottom:1px solid color-mix(in srgb,var(--fg) 8%,transparent)}
+th{font-size:12px;letter-spacing:.12em;text-transform:uppercase;font-weight:700;color:color-mix(in srgb,var(--fg) 55%,transparent)}
+ul{margin:0;padding-left:18px}
+details{margin-top:22px}
+summary{cursor:pointer;font-size:12px;letter-spacing:.12em;text-transform:uppercase;font-weight:700;
+  color:color-mix(in srgb,var(--fg) 55%,transparent)}
 details ul{margin-top:10px}
-.integrity{margin:18px 0 0;color:var(--muted);font-size:12px;word-break:break-all}
-.advice{margin-top:20px;padding:14px 18px;border-radius:12px;background:color-mix(in srgb,var(--blue) 12%,transparent);
-  border:1px solid color-mix(in srgb,var(--blue) 35%,transparent);font-weight:600}
-.ask-row{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-top:16px}
-.ask{display:inline-block;padding:10px 18px;border-radius:12px;font-weight:700;text-decoration:none;color:#16161e;
-  background:linear-gradient(135deg,var(--blue),var(--cyan));box-shadow:0 6px 18px color-mix(in srgb,var(--blue) 35%,transparent)}
-.ask:hover{filter:brightness(1.08)}
-.ask-note{color:var(--muted);font-size:13px;flex:1;min-width:240px}
-footer{margin-top:28px;text-align:center;color:var(--muted);font-size:12px}
-@media (max-width:640px){.hero{flex-direction:column;text-align:center}.toggle{position:static}.loc{margin-left:0}}
+.integrity{font-size:12px;color:color-mix(in srgb,var(--fg) 45%,transparent);word-break:break-all}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+.tile{display:flex;flex-direction:column;align-items:center;gap:10px;padding:22px 12px;text-decoration:none;
+  color:var(--fg);font-weight:700;background:color-mix(in srgb,var(--fg) 6%,transparent)}
+.tile:hover{background:color-mix(in srgb,var(--fg) 12%,transparent)}
+.glyph{font-size:26px;color:var(--accent);line-height:1}
+footer{margin-top:28px;font-size:11px;letter-spacing:.12em;color:color-mix(in srgb,var(--fg) 40%,transparent)}
+@media (max-width:640px){main{padding:20px}.row{flex-direction:column;gap:4px}}
 "#;
 
 #[cfg(test)]
@@ -459,6 +474,17 @@ mod tests {
         let html = page("t", "<img src=x onerror=alert(1)>", "now", "1-2", "");
         assert!(!html.contains("<img src=x"));
         assert!(html.contains("default-src 'none'"));
+    }
+
+    #[test]
+    fn the_palette_comes_from_the_theme_and_only_takes_hex_colours() {
+        let palette = super::palette_from(
+            "accent = \"#a87692\"\nbackground = \"#14111a\"\ncolor1 = \"red;}body{x\"\n",
+        );
+        assert!(palette.contains("--accent:#a87692;"));
+        assert!(palette.contains("--bg:#14111a;"));
+        assert!(palette.contains("--red:#e0604f;"));
+        assert!(!palette.contains("body"));
     }
 
     #[test]

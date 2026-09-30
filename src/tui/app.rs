@@ -996,9 +996,9 @@ impl App {
         for (index, tab) in Tab::ALL.iter().enumerate() {
             let label = format!(" {} {} ", index + 1, tab.label());
             let style = if *tab == self.tab {
-                Style::fg(color::ACCENT).bold().reverse()
+                Style::fg(color::ACCENT).bold()
             } else {
-                Style::PLAIN
+                Style::fg(color::MUTED)
             };
             x = canvas.text(x, 1, &label, style, canvas.width.saturating_sub(x + 2)) + 1;
         }
@@ -1032,12 +1032,12 @@ impl App {
             let y = top + offset - scroll;
             let selected = offset == cursor && self.dialog.is_none();
             if selected {
-                canvas.fill(1, y, canvas.width - 2, Style::PLAIN.reverse());
+                canvas.text(1, y, "▌", Style::fg(color::ACCENT), 1);
             }
             let line = Line {
                 y,
                 base: if selected {
-                    Style::PLAIN.reverse()
+                    Style::PLAIN.bold()
                 } else {
                     Style::PLAIN
                 },
@@ -1046,7 +1046,13 @@ impl App {
             };
             match row {
                 Row::Header(text) => {
-                    canvas.text_fit(2, y, text, Style::fg(color::ACCENT).bold(), width);
+                    canvas.text_fit(
+                        2,
+                        y,
+                        &text.to_uppercase(),
+                        Style::fg(color::MUTED).bold(),
+                        width,
+                    );
                 }
                 Row::Info(text) => canvas.text_fit(4, y, text, Style::fg(color::MUTED), width - 2),
                 Row::Blank => {}
@@ -1125,8 +1131,8 @@ impl App {
             .find(|(candidate, _)| *candidate == integration)
             .map(|(_, state)| state.clone());
         match state {
-            Some(State::On) => ("● on".to_string(), color::GREEN),
-            Some(State::Off) => ("○ off".to_string(), color::MUTED),
+            Some(State::On) => ("ON".to_string(), color::ACCENT),
+            Some(State::Off) => ("OFF".to_string(), color::RED),
             Some(State::Foreign(reason)) => (format!("! {reason}"), color::YELLOW),
             Some(State::Partial(reason)) => (format!("◐ {reason}"), color::YELLOW),
             Some(State::Unavailable(reason)) => (format!("– {reason}"), color::MUTED),
