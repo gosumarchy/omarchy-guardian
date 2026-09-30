@@ -56,6 +56,7 @@ pub enum Task {
     ReviewMemory,
     ForgetMemory,
     GuidedSetup,
+    TestReviewer,
     EditUser,
     EditSystem,
 }
@@ -68,6 +69,7 @@ impl Task {
             Self::ReviewMemory => "Review memory usage",
             Self::ForgetMemory => "Forget all review memory",
             Self::GuidedSetup => "Run guided setup",
+            Self::TestReviewer => "Test the reviewer",
             Self::EditUser => "Edit user file in $EDITOR",
             Self::EditSystem => "Edit system file (sudoedit)",
         }
@@ -89,6 +91,9 @@ impl Task {
             }
             Self::GuidedSetup => {
                 "Pick a profile and model, run a two-sample test review, and write both files."
+            }
+            Self::TestReviewer => {
+                "Sends a malicious and a harmless sample to the saved models; both must be judged right."
             }
             Self::EditUser => {
                 "Open the user file in your editor. Unsaved changes here are discarded."
@@ -570,6 +575,16 @@ impl App {
         }
     }
 
+    /// Starts the two-sample test of the saved settings.
+    pub(super) fn test_reviewer(&mut self) -> Effect {
+        if self.dirty(Scope::User) || self.dirty(Scope::System) {
+            self.say("Testing the saved settings (unsaved changes are not tested)…");
+        } else {
+            self.say("Testing the reviewer with a malicious and a harmless sample…");
+        }
+        Effect::Report(Task::TestReviewer)
+    }
+
     fn start_task(&mut self, task: Task) -> Option<Effect> {
         let discards = self.dirty(Scope::User) || self.dirty(Scope::System);
         let confirm = |title: &str, lines: Vec<String>, effect: Effect| Dialog::Confirm {
@@ -579,6 +594,7 @@ impl App {
         };
         match task {
             Task::ShowConfig | Task::CheckConfig | Task::ReviewMemory => Some(Effect::Report(task)),
+            Task::TestReviewer => Some(self.test_reviewer()),
             Task::ForgetMemory => {
                 self.dialog = Some(confirm(
                     "Forget all review memory?",
@@ -1379,6 +1395,7 @@ fn rows(tab: Tab) -> Vec<Row> {
             Row::Task(Task::ForgetMemory),
             Row::Blank,
             Row::Header("Setup".into()),
+            Row::Task(Task::TestReviewer),
             Row::Task(Task::GuidedSetup),
         ],
     }

@@ -18,7 +18,7 @@ use std::process::{Command, Stdio};
 
 use crate::config::Settings;
 use crate::config::load::{self, SYSTEM_PATH};
-use crate::config::model::{Named, SourceClass};
+use crate::config::model::{AgentSettings, Named, SourceClass};
 use crate::config::show::{render_check, render_memory, render_show};
 use crate::engine::baseline;
 use crate::engine::store::Store;
@@ -214,8 +214,39 @@ fn report(task: Task) -> String {
         Task::ReviewMemory => render_memory(Store::default_root().as_deref())
             .trim()
             .to_string(),
+        Task::TestReviewer => test_reviewer(&settings),
         _ => render_show(&settings, SourceClass::ALL),
     }
+}
+
+/// Setup's two-sample test against the saved settings: the model for your
+/// sources, then the pacman gate's when it differs, and whether the pacman
+/// gate has the root-owned reviewer it needs.
+fn test_reviewer(settings: &Settings) -> String {
+    let test = |label: &str, agent: &AgentSettings| match setup::RealEnvironment.test_review(agent)
+    {
+        Ok(elapsed) => format!(
+            "✓ {label}: passed in {}s ({})",
+            elapsed.as_secs(),
+            agent.label()
+        ),
+        Err(reason) => format!("✗ {label}: {reason} ({})", agent.label()),
+    };
+    let user = settings.agent_settings(SourceClass::Aur);
+    let official = settings.agent_settings(SourceClass::Official);
+    let mut lines = vec![test("AUR, themes and plugins", &user)];
+    if official.model == user.model && official.variant == user.variant {
+        lines.push("  Official packages use the same model.".into());
+    } else {
+        lines.push(test("Official packages", &official));
+    }
+    if !pacman::classes_requiring_ai(settings).is_empty()
+        && !pacman::system_reviewer_ready(settings)
+    {
+        lines
+            .push("✗ The pacman gate has no root-owned reviewer in /usr/bin for its model.".into());
+    }
+    lines.join("\n")
 }
 
 fn forget_memory() -> Result<String, String> {
