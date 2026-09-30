@@ -5,6 +5,7 @@
 //! duplicate object keys instead of silently picking one, and keeps numbers as
 //! their source text so no precision is lost or invented.
 
+use std::collections::HashSet;
 use std::fmt::{self, Write as _};
 
 const MAX_DEPTH: usize = 128;
@@ -281,6 +282,8 @@ impl<'a> Parser<'a> {
     fn object(&mut self) -> Result<Json, ParseError> {
         self.expect_byte(b'{', "expected '{'")?;
         let mut members: Vec<(String, Json)> = Vec::new();
+        // A set, not a scan of `members`: a scan is quadratic in the keys.
+        let mut keys: HashSet<String> = HashSet::new();
 
         self.skip_whitespace();
         if self.peek() == Some(b'}') {
@@ -294,7 +297,7 @@ impl<'a> Parser<'a> {
                 return Err(self.error("expected an object key"));
             }
             let key = self.string()?;
-            if members.iter().any(|(existing, _)| *existing == key) {
+            if !keys.insert(key.clone()) {
                 return Err(self.error("duplicate object key"));
             }
 
