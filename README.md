@@ -238,26 +238,36 @@ review it in full every time.
 ## What is checked
 
 - **Local rules** on every text file except prose (`*.md`, `*.rst`, `README`,
-  license texts such as `LICENSE.txt`, `COPYING.LESSER` or anything under
-  `LICENSES/`, ...): download-to-shell pipelines, encoded command execution,
+  license and legal texts such as `LICENSE.txt`, `COPYING.LESSER`,
+  `terms.html` or anything under `LICENSES/`, PKGBUILD `*.changelog` files, ...): download-to-shell pipelines, encoded command execution,
   credential file access, destructive commands (a recursive `rm` of `/` or
   `$HOME` itself, `mkfs`, raw-disk writes), persistence, shell execution,
   privilege escalation, disabled TLS verification and likely credential
   exfiltration. Identifier patterns respect word boundaries, so `retrieval(`
-  and `model.eval()` do not match `eval(`. Making Chromium's `chrome-sandbox` helper
-  setuid (`chmod 4755 .../chrome-sandbox`), which every Chromium and Electron
-  package does, is not a privilege-escalation finding. Comments are skipped (shell and
-  other `#` languages, `//` and `/* */` in C-like languages, Lua `--`), as are
-  the removed lines of a patch. In shell scripts, text that is only printed
+  and `model.eval()` do not match `eval(`. Making a Chromium-family sandbox
+  helper setuid root (`chmod 4755` or `chown root` of `chrome-sandbox`,
+  `msedge-sandbox`, `opera_sandbox`, ...), which every Chromium and Electron
+  package does, is not a privilege-escalation finding. A persistence path a
+  PKGBUILD writes into its own package (`"$pkgdir"/etc/profile.d/...`,
+  without `..`) is a package file, not persistence. A `mkfs.*` program that is
+  only installed, copied or linked is not run, so it is not a destructive
+  command. Comments are skipped (shell and
+  other `#` languages, `//` and `/* */` in C-like languages, Lua `--`, and
+  comment lines a patch adds to a file of one of those languages). Lines a
+  patch removes are skipped by the same checks as printed text below, since
+  `patch -R` would apply them. In shell scripts, text that is only printed
   (`echo` and `printf` arguments, `cat <<EOF` bodies, when nothing pipes,
   redirects or substitutes them) is skipped by the persistence, privilege,
   credential-file, TLS and network checks, so install notes like
   `echo "run: sudo systemctl enable foo"` are not findings; download-to-shell,
   encoded execution, destructive commands and shell execution still match
-  printed text. Prose, comments and messages are still sent to the AI review.
+  printed text. Nothing printed is skipped in a script that redefines `echo`,
+  `printf` or `cat`, enables aliases, pipes anything into an interpreter
+  (`f | sh`, `| sudo bash`, `| xargs`), or redirects its own output with
+  `exec` or a process substitution, since its messages may then run. Prose, comments and messages are still sent to the AI review.
 - **Network destinations:** literal HTTP(S) hosts in code and runtime config,
   flagging cleartext HTTP and hard-coded IP addresses. A PKGBUILD's `url=`
-  homepage (never fetched), XML namespace and DTD identifiers are not
+  homepage (never fetched), XML namespace, DTD and schema identifiers are not
   destinations. URL paths, queries and credentials are never printed.
 - **Dependencies:** `Cargo.lock`, npm lockfiles, `poetry.lock`, `go.sum` and
   exactly pinned `requirements*.txt` are checked with the public OSV API (only
