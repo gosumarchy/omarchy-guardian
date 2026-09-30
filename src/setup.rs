@@ -16,6 +16,7 @@ use crate::agent::{self, SourceFile, Status};
 use crate::config::file::{is_model_name, parse};
 use crate::config::load::{self, SYSTEM_PATH};
 use crate::config::model::{AgentSettings, Named, Profile, SourceClass, Thinking, builtin};
+use crate::engine::request::Request;
 use crate::tools::{self, Limits, OpenCode};
 
 pub trait Terminal {
@@ -521,25 +522,29 @@ impl Environment for RealEnvironment {
         let binary = self.user_opencode().ok_or("OpenCode not found")?;
         let started = Instant::now();
 
-        let bad = agent::review(
-            &binary,
+        let bad_request = Request::for_files(
+            SourceClass::Aur,
             &[SourceFile {
                 path: "install.sh".into(),
                 content: BAD_SAMPLE.into(),
             }],
-            settings,
-        )
-        .map_err(|error| error.into_error().to_string())?;
+        );
+        let bad = agent::review(&binary, &|nonce: &str| bad_request.render(nonce), settings)
+            .map_err(|error| error.into_error().to_string())?;
         if bad.status != Status::Suspicious && bad.findings.is_empty() {
             return Err("the model did not flag the malicious sample".into());
         }
 
-        let clean = agent::review(
-            &binary,
+        let clean_request = Request::for_files(
+            SourceClass::Theme,
             &[SourceFile {
                 path: "theme.conf".into(),
                 content: CLEAN_SAMPLE.into(),
             }],
+        );
+        let clean = agent::review(
+            &binary,
+            &|nonce: &str| clean_request.render(nonce),
             settings,
         )
         .map_err(|error| error.into_error().to_string())?;

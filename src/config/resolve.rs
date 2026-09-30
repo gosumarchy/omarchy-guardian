@@ -6,7 +6,7 @@
 use crate::config::file::PartialPolicy;
 use crate::config::model::{Named, Policy, Profile, SourceClass, builtin};
 
-pub const KNOBS: [&str; 7] = [
+pub const KNOBS: [&str; 9] = [
     "ai",
     "on_findings",
     "on_ai_suspicious",
@@ -14,6 +14,8 @@ pub const KNOBS: [&str; 7] = [
     "model",
     "timeout_secs",
     "confirm",
+    "cache",
+    "diff",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +102,14 @@ impl Resolved {
             self.policy.confirm = confirm;
             self.mark("confirm", origin);
         }
+        if let Some(cache) = values.cache {
+            self.policy.cache = cache;
+            self.mark("cache", origin);
+        }
+        if let Some(diff) = values.diff {
+            self.policy.diff = diff;
+            self.mark("diff", origin);
+        }
     }
 
     /// Tighten-only override for privileged classes.
@@ -150,6 +160,16 @@ impl Resolved {
             self.ignored.push(format!(
                 "timeout_secs = {timeout} ignored ({source}): only the system file sets it for pacman-enforced classes"
             ));
+        }
+
+        // The review memory is never used for pacman-enforced classes.
+        for (knob, value) in [("cache", values.cache), ("diff", values.diff)] {
+            if let Some(value) = value {
+                self.ignored.push(format!(
+                    "{knob} = {} ignored ({source}): the review memory is never used for pacman-enforced classes",
+                    value.name()
+                ));
+            }
         }
     }
 }
@@ -215,6 +235,8 @@ fn as_partial(policy: &Policy) -> PartialPolicy {
         model: None,
         timeout_secs: None,
         confirm: None,
+        cache: None,
+        diff: None,
     }
 }
 
@@ -223,7 +245,7 @@ mod tests {
     use super::{Layers, Origin, resolve};
     use crate::config::file::PartialPolicy;
     use crate::config::model::{
-        Action, AiRequirement, Named, Policy, Profile, SourceClass, Thinking, builtin,
+        Action, AiRequirement, Named, Policy, Profile, SourceClass, Thinking, Toggle, builtin,
     };
 
     fn layers<'a>(
@@ -238,6 +260,44 @@ mod tests {
             user_profile,
             user,
         }
+    }
+
+    #[test]
+    fn review_memory_knobs_are_user_level_only() {
+        let empty = PartialPolicy::default();
+        let user = PartialPolicy {
+            cache: Some(Toggle::Off),
+            diff: Some(Toggle::Off),
+            ..PartialPolicy::default()
+        };
+
+        let theme = resolve(
+            SourceClass::Theme,
+            &layers(Profile::Standard, &empty, None, &user),
+        );
+        assert_eq!(
+            (theme.policy.cache, theme.policy.diff),
+            (Toggle::Off, Toggle::Off)
+        );
+        assert_eq!(theme.origin("cache"), Origin::User);
+
+        let loosen = PartialPolicy {
+            cache: Some(Toggle::On),
+            ..PartialPolicy::default()
+        };
+        let official = resolve(
+            SourceClass::Official,
+            &layers(Profile::Standard, &empty, None, &loosen),
+        );
+        assert_eq!(official.policy.cache, Toggle::Off);
+        assert!(
+            official
+                .ignored
+                .iter()
+                .any(|line| line.starts_with("cache = on ignored (user file)")),
+            "{:?}",
+            official.ignored
+        );
     }
 
     #[test]

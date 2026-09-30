@@ -10,6 +10,9 @@ use std::process::{Command, ExitCode};
 use crate::config::Settings;
 use crate::config::model::{AiRequirement, Named, Profile, SourceClass};
 use crate::config::show;
+use crate::engine::baseline::{self, Identity, Unit};
+use crate::engine::store::Store;
+use crate::error::Error;
 use crate::pacman::{self, HookArgs};
 use crate::report::{Blocked, Decision, Report};
 use crate::review::{self, ReviewContext};
@@ -20,14 +23,18 @@ use crate::tools::OpenCode;
 
 const USAGE: &str = "\
 Usage:
-  omarchy-guardian scan [--thorough] [--hashes] [--exclude NAME]... [--class CLASS] [--profile PROFILE] <file-or-directory>
-  omarchy-guardian guard [--thorough] [--hashes] [--exclude NAME]... [--class CLASS] [--profile PROFILE] <file-or-directory> -- <command> [args...]
-  omarchy-guardian sandbox [--hashes] [--profile PROFILE] <directory> -- <command> [args...]
+  omarchy-guardian scan [--thorough] [--hashes] [--exclude NAME]... [--class CLASS] [--profile PROFILE] [--identity ID | --unit DIR ID ...] <file-or-directory>
+  omarchy-guardian guard [--thorough] [--hashes] [--exclude NAME]... [--class CLASS] [--profile PROFILE] [--identity ID | --unit DIR ID ...] <file-or-directory> -- <command> [args...]
+  omarchy-guardian sandbox [--hashes] [--profile PROFILE] [--identity ID | --unit DIR ID ...] <directory> -- <command> [args...]
   omarchy-guardian pacman-hook --pacman-pid PID --cwd DIR   (run by the pacman hook)
   omarchy-guardian config show [--class CLASS] | check | path
+  omarchy-guardian forget <identity> | --all
   omarchy-guardian setup
 
 CLASS: aur, theme, plugin, source (default). PROFILE: standard, strict, local-only.
+ID names what is reviewed for the review memory, e.g. aur:yay-bin.
+forget ID drops that source's approved baselines; cached verdicts are kept
+(forget --all clears them too).
 Exit codes: 0 clear or warned, 1 findings, 2 incomplete review, AI unavailable,
 not confirmed, or usage error. guard and sandbox replace these with the
 command's own exit code once it starts.";
@@ -40,6 +47,9 @@ struct Target {
     show_hashes: bool,
     class: SourceClass,
     profile: Option<Profile>,
+    units: Vec<Unit>,
+    /// Filled in by `run`, so parsing stays free of the environment.
+    state_root: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -49,6 +59,7 @@ enum Invocation {
     Sandbox(Target, Vec<OsString>),
     PacmanHook(HookArgs),
     Config(ConfigCommand),
+    Forget(Forget),
     Setup,
 }
 
@@ -57,6 +68,12 @@ enum ConfigCommand {
     Show(Option<SourceClass>),
     Check,
     Path,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Forget {
+    All,
+    One(Identity),
 }
 
 /// Asks the person at the terminal. Anything but an explicit yes, and any
@@ -103,20 +120,24 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
     }
 
     match invocation {
-        Invocation::Scan(target) => scan_command(&target, &settings),
+        Invocation::Scan(target) => scan_command(&with_state_root(target), &settings),
         Invocation::Guard(target, command) => guard_command(
-            &target,
+            &with_state_root(target),
             &command,
             &settings,
             &OpenCode::UserPath,
             &mut TtyConfirm,
             &mut exec_command,
         ),
-        Invocation::Sandbox(target, command) => {
-            sandbox_command(&target, &command, &settings, &mut TtyConfirm)
-        }
+        Invocation::Sandbox(target, command) => sandbox_command(
+            &with_state_root(target),
+            &command,
+            &settings,
+            &mut TtyConfirm,
+        ),
         Invocation::PacmanHook(hook) => pacman_hook_command(&hook, &settings),
         Invocation::Config(command) => config_command(&command, &settings),
+        Invocation::Forget(forget) => forget_command(&forget, Store::default_root()),
         Invocation::Setup => match setup::run(&mut setup::TtyTerminal, &setup::RealEnvironment) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {
@@ -136,6 +157,12 @@ fn settings_for(target: &Target, settings: &Settings) -> Settings {
     }
 }
 
+/// Commands review with the user's review memory.
+fn with_state_root(mut target: Target) -> Target {
+    target.state_root = Store::default_root();
+    target
+}
+
 /// Reviews a target, applies confirmation, then prints the report once with
 /// the final decision — never a stale pre-confirmation headline.
 fn review_and_decide(
@@ -150,6 +177,8 @@ fn review_and_decide(
             settings,
             class: target.class,
             opencode,
+            units: &target.units,
+            state_root: target.state_root.as_deref(),
         },
     );
     let mut decision = report.decide(&|class| settings.policy(class));
@@ -295,6 +324,7 @@ fn config_command(command: &ConfigCommand, settings: &Settings) -> ExitCode {
                 None => SourceClass::ALL.to_vec(),
             };
             print!("{}", show::render_show(settings, &classes));
+            print!("{}", show::render_memory(Store::default_root().as_deref()));
             ExitCode::SUCCESS
         }
         ConfigCommand::Check => {
@@ -313,6 +343,65 @@ fn config_command(command: &ConfigCommand, settings: &Settings) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+    }
+}
+
+fn parse_forget(args: &[OsString]) -> Result<Forget, String> {
+    match args {
+        [arg] if arg == "--all" => Ok(Forget::All),
+        [arg] => match arg.to_str() {
+            Some(text) if text.starts_with('-') => Err(format!(
+                "unknown option {text:?}; forget takes one identity or --all"
+            )),
+            Some(text) => Identity::parse(text).map(Forget::One),
+            None => Err("the identity must be UTF-8".to_string()),
+        },
+        _ => Err("forget takes one identity or --all".into()),
+    }
+}
+
+/// Drops approved baselines (and with `--all`, every cached verdict; one
+/// identity's cached verdicts are kept, since verdicts are not keyed by
+/// identity).
+fn forget_command(forget: &Forget, root: Option<PathBuf>) -> ExitCode {
+    let Some(root) = root else {
+        eprintln!("omarchy-guardian: no state directory (set HOME or XDG_STATE_HOME)");
+        return ExitCode::from(2);
+    };
+    if !root.is_dir() {
+        println!("Nothing to forget: {} does not exist.", root.display());
+        return ExitCode::SUCCESS;
+    }
+    let store = match Store::open(root) {
+        Ok(store) => store,
+        Err(reason) => {
+            eprintln!("omarchy-guardian: {reason}");
+            return ExitCode::from(2);
+        }
+    };
+    match forget_in(forget, &store) {
+        Ok(message) => {
+            println!("{message}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("omarchy-guardian: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Forgets what `forget` names in `store`; returns the line to print.
+fn forget_in(forget: &Forget, store: &Store) -> Result<String, Error> {
+    match forget {
+        Forget::All => baseline::forget_all(store)
+            .map(|count| format!("Forgot {count} approved baseline(s) and every cached verdict.")),
+        Forget::One(identity) => baseline::forget(store, identity).map(|count| {
+            format!(
+                "Forgot {count} approved baseline(s) for {}. Cached verdicts are kept; use forget --all to clear them too.",
+                identity.as_str()
+            )
+        }),
     }
 }
 
@@ -355,6 +444,7 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
         }
         Some("pacman-hook") => parse_hook(rest).map(Invocation::PacmanHook),
         Some("config") => parse_config(rest).map(Invocation::Config),
+        Some("forget") => parse_forget(rest).map(Invocation::Forget),
         Some("setup") if rest.is_empty() => Ok(Invocation::Setup),
         _ => Err(format!("unknown command {:?}", command.to_string_lossy())),
     }
@@ -395,6 +485,7 @@ fn parse_target(args: &[OsString], allowed: Allowed) -> Result<Target, String> {
     let mut excluded_top_level = Vec::new();
     let mut class = SourceClass::Source;
     let mut profile = None;
+    let mut units: Vec<Unit> = Vec::new();
     let mut args = args.iter();
 
     while let Some(arg) = args.next() {
@@ -403,7 +494,7 @@ fn parse_target(args: &[OsString], allowed: Allowed) -> Result<Target, String> {
             Some("--thorough") if allowed.thorough => include_ignored_dirs = true,
             Some("--exclude") if allowed.exclude => {
                 let name = args.next().ok_or("--exclude needs a directory name")?;
-                excluded_top_level.push(parse_excluded_name(name)?);
+                excluded_top_level.push(parse_top_level_name("--exclude", name)?);
             }
             Some("--class") if allowed.class => {
                 let name = args
@@ -416,6 +507,32 @@ fn parse_target(args: &[OsString], allowed: Allowed) -> Result<Target, String> {
                         format!("--class takes one of: aur, theme, plugin, source (got {name:?})")
                     })?;
                 class = parsed;
+            }
+            Some("--identity") => {
+                if !units.is_empty() {
+                    return Err("--identity is given once and never with --unit".into());
+                }
+                units.push(Unit {
+                    prefix: String::new(),
+                    identity: parse_identity("--identity", args.next())?,
+                });
+            }
+            Some("--unit") => {
+                if units.iter().any(|unit| unit.prefix.is_empty()) {
+                    return Err("--unit cannot be combined with --identity".into());
+                }
+                let name = args
+                    .next()
+                    .ok_or("--unit needs a directory name and an identity")?;
+                let prefix = format!("{}/", parse_top_level_name("--unit", name)?);
+                let identity = parse_identity("--unit", args.next())?;
+                if units
+                    .iter()
+                    .any(|unit| unit.prefix == prefix || unit.identity == identity)
+                {
+                    return Err("--unit names each directory and each identity once".into());
+                }
+                units.push(Unit { prefix, identity });
             }
             Some("--profile") => {
                 let name = args
@@ -444,19 +561,28 @@ fn parse_target(args: &[OsString], allowed: Allowed) -> Result<Target, String> {
         show_hashes,
         class,
         profile,
+        units,
+        state_root: None,
     })
 }
 
-fn parse_excluded_name(name: &OsStr) -> Result<String, String> {
+fn parse_top_level_name(option: &str, name: &OsStr) -> Result<String, String> {
     match name.to_str() {
         Some(name) if !name.is_empty() && name != "." && name != ".." && !name.contains('/') => {
             Ok(name.to_string())
         }
         Some(_) | None => Err(format!(
-            "--exclude takes one top-level directory name, not {:?}",
+            "{option} takes one top-level directory name, not {:?}",
             name.to_string_lossy()
         )),
     }
+}
+
+fn parse_identity(option: &str, value: Option<&OsString>) -> Result<Identity, String> {
+    let text = value
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("{option} needs an identity"))?;
+    Identity::parse(text)
 }
 
 fn parse_hook(args: &[OsString]) -> Result<HookArgs, String> {
@@ -508,11 +634,15 @@ mod tests {
     use std::process::ExitCode;
 
     use super::{
-        ConfigCommand, Confirm, Invocation, Target, guard_command, parse, review_and_decide,
+        ConfigCommand, Confirm, Forget, Invocation, Target, forget_command, forget_in,
+        guard_command, parse, review_and_decide,
     };
+    use crate::agent::SourceFile;
     use crate::config::Settings;
     use crate::config::file::{PartialConfig, PartialPolicy};
-    use crate::config::model::{AiRequirement, Profile, SourceClass};
+    use crate::config::model::{AgentSettings, AiRequirement, Profile, SourceClass};
+    use crate::engine::baseline::{self, Identity, Unit};
+    use crate::engine::store::Store;
     use crate::report::{Blocked, Decision};
     use crate::scan::ScanConfig;
     use crate::test_support::{TempDir, mock_opencode};
@@ -602,6 +732,8 @@ mod tests {
             show_hashes: false,
             class: SourceClass::Source,
             profile: None,
+            units: Vec::new(),
+            state_root: None,
         }
     }
 
@@ -833,5 +965,111 @@ mod tests {
     fn parses_setup() {
         assert_eq!(parse(&args(&["setup"])).unwrap(), Invocation::Setup);
         assert!(parse(&args(&["setup", "extra"])).is_err());
+    }
+
+    #[test]
+    fn identity_and_unit_flags_parse() {
+        let Ok(Invocation::Scan(target)) = parse(&args(&["scan", "--identity", "aur:demo", "dir"]))
+        else {
+            panic!("expected scan");
+        };
+        assert_eq!(
+            target.units,
+            [Unit {
+                prefix: String::new(),
+                identity: Identity::parse("aur:demo").unwrap(),
+            }]
+        );
+
+        let Ok(Invocation::Guard(target, _)) = parse(&args(&[
+            "guard",
+            "--unit",
+            "good",
+            "theme:good",
+            "--unit",
+            "dark",
+            "theme:dark",
+            "staged",
+            "--",
+            "true",
+        ])) else {
+            panic!("expected guard");
+        };
+        let prefixes: Vec<&str> = target
+            .units
+            .iter()
+            .map(|unit| unit.prefix.as_str())
+            .collect();
+        assert_eq!(prefixes, ["good/", "dark/"]);
+
+        for bad in [
+            &["scan", "--identity", "a", "--identity", "b", "dir"][..],
+            &["scan", "--identity", "a", "--unit", "x", "b", "dir"],
+            &["scan", "--unit", "x", "b", "--identity", "a", "dir"],
+            &["scan", "--unit", "a/b", "id", "dir"],
+            &["scan", "--unit", "x"],
+            &["scan", "--identity", "", "dir"],
+            &["scan", "--unit", "a", "X", "--unit", "b", "X", "dir"],
+            &["scan", "--unit", "a", "X", "--unit", "a", "Y", "dir"],
+            &["scan", "--unit", "a", "X", "--unit", "a", "X", "dir"],
+        ] {
+            assert!(parse(&args(bad)).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn parses_forget() {
+        assert_eq!(
+            parse(&args(&["forget", "--all"])).unwrap(),
+            Invocation::Forget(Forget::All)
+        );
+        assert_eq!(
+            parse(&args(&["forget", "aur:demo"])).unwrap(),
+            Invocation::Forget(Forget::One(Identity::parse("aur:demo").unwrap()))
+        );
+        assert!(parse(&args(&["forget"])).is_err());
+        assert!(parse(&args(&["forget", "a", "b"])).is_err());
+        assert!(parse(&args(&["forget", "--al"])).is_err());
+        assert!(parse(&args(&["forget", "-x"])).is_err());
+    }
+
+    #[test]
+    fn forget_removes_baselines() {
+        let state = TempDir::new("forget");
+        let root = state.path().join("store");
+        let store = Store::open(root.clone()).unwrap();
+        let unit = Unit {
+            prefix: String::new(),
+            identity: Identity::parse("aur:demo").unwrap(),
+        };
+        let files = [SourceFile {
+            path: "PKGBUILD".into(),
+            content: "x\n".into(),
+        }];
+        baseline::record(
+            &store,
+            SourceClass::Aur,
+            std::slice::from_ref(&unit),
+            &files,
+            &AgentSettings::default(),
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(
+            forget_in(&Forget::One(unit.identity.clone()), &store).unwrap(),
+            "Forgot 1 approved baseline(s) for aur:demo. Cached verdicts are kept; use forget --all to clear them too."
+        );
+        assert_eq!(
+            forget_command(&Forget::One(unit.identity.clone()), Some(root.clone())),
+            ExitCode::SUCCESS
+        );
+        assert!(
+            baseline::load(&store, SourceClass::Aur, &[unit], &AgentSettings::default())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(forget_command(&Forget::All, Some(root)), ExitCode::SUCCESS);
+        assert_eq!(forget_command(&Forget::All, None), ExitCode::from(2));
     }
 }

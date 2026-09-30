@@ -5,6 +5,9 @@
 //! the strictness order the tighten-only rule relies on.
 
 pub const DEFAULT_MAX_INPUT_KIB: u32 = 256;
+pub const DEFAULT_MAX_CHUNKS: u32 = 8;
+pub const DEFAULT_CACHE_DAYS: u32 = 30;
+pub const DEFAULT_MAX_STORE_MIB: u32 = 256;
 
 /// An enum spelled in the config file by a fixed lowercase name.
 pub trait Named: Copy + 'static {
@@ -165,6 +168,25 @@ impl Named for Thinking {
     }
 }
 
+/// Whether a review-memory feature is used. `On` is the looser value: it lets
+/// an earlier review stand in for part of this one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Toggle {
+    On,
+    Off,
+}
+
+impl Named for Toggle {
+    const ALL: &'static [Self] = &[Self::On, Self::Off];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
 /// Everything that decides how one source class is reviewed and judged.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy {
@@ -179,6 +201,10 @@ pub struct Policy {
     pub timeout_secs: Option<u32>,
     /// With `ai = off`: ask the user before running anything.
     pub confirm: bool,
+    /// Reuse cached AI verdicts for identical requests. User-level only.
+    pub cache: Toggle,
+    /// Review upgrades of an approved source as diffs. User-level only.
+    pub diff: Toggle,
 }
 
 impl Policy {
@@ -200,6 +226,8 @@ pub struct AgentSettings {
     pub variant: Option<String>,
     pub timeout_secs: u32,
     pub max_input_bytes: usize,
+    /// AI calls one review may make; a source needing more is incomplete.
+    pub max_chunks: usize,
 }
 
 impl Default for AgentSettings {
@@ -210,6 +238,7 @@ impl Default for AgentSettings {
             variant: None,
             timeout_secs: 120,
             max_input_bytes: DEFAULT_MAX_INPUT_KIB as usize * 1024,
+            max_chunks: DEFAULT_MAX_CHUNKS as usize,
         }
     }
 }
@@ -227,6 +256,14 @@ impl AgentSettings {
     }
 }
 
+/// Limits of the user-level review memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoreSettings {
+    /// How long a cached verdict stays valid; 0 turns the cache off.
+    pub cache_days: u32,
+    pub max_store_mib: u32,
+}
+
 /// The built-in value of every knob for one profile and class (spec §5).
 pub fn builtin(profile: Profile, class: SourceClass) -> Policy {
     use Action::{Block, Warn};
@@ -242,6 +279,8 @@ pub fn builtin(profile: Profile, class: SourceClass) -> Policy {
         (Profile::LocalOnly, false) => (Off, Block, Thinking::Default),
     };
 
+    let privileged = class.is_privileged();
+
     Policy {
         ai,
         on_findings,
@@ -251,7 +290,15 @@ pub fn builtin(profile: Profile, class: SourceClass) -> Policy {
         timeout_secs: None,
         // The pacman hook has no reliable terminal, so only user-level
         // classes can ask.
-        confirm: profile == Profile::LocalOnly && !class.is_privileged(),
+        confirm: profile == Profile::LocalOnly && !privileged,
+        // The review memory lives in the user's home; the root pacman gate
+        // never uses it.
+        cache: if privileged { Toggle::Off } else { Toggle::On },
+        diff: if privileged || profile == Profile::Strict {
+            Toggle::Off
+        } else {
+            Toggle::On
+        },
     }
 }
 
@@ -259,7 +306,7 @@ pub fn builtin(profile: Profile, class: SourceClass) -> Policy {
 mod tests {
     use super::{
         Action, AgentSettings, AiRequirement, Named, Policy, Profile, SourceClass, Thinking,
-        builtin,
+        Toggle, builtin,
     };
 
     fn knobs(policy: &Policy) -> (AiRequirement, Action, Action, Thinking, bool) {
@@ -335,6 +382,33 @@ mod tests {
         assert_eq!(policy.timeout_secs(), 120);
         policy.timeout_secs = Some(45);
         assert_eq!(policy.timeout_secs(), 45);
+    }
+
+    #[test]
+    fn review_memory_is_user_level_only() {
+        for class in SourceClass::ALL.iter().copied() {
+            for profile in Profile::ALL.iter().copied() {
+                let policy = builtin(profile, class);
+                if class.is_privileged() {
+                    assert_eq!(
+                        (policy.cache, policy.diff),
+                        (Toggle::Off, Toggle::Off),
+                        "{class:?}"
+                    );
+                } else {
+                    assert_eq!(policy.cache, Toggle::On, "{class:?}");
+                    let diff = if profile == Profile::Strict {
+                        Toggle::Off
+                    } else {
+                        Toggle::On
+                    };
+                    assert_eq!(policy.diff, diff, "{class:?} {profile:?}");
+                }
+            }
+        }
+        assert!(Toggle::On < Toggle::Off);
+        assert_eq!(Toggle::parse("off"), Some(Toggle::Off));
+        assert_eq!(AgentSettings::default().max_chunks, 8);
     }
 
     #[test]

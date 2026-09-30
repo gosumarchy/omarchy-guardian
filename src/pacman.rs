@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use crate::classify;
 use crate::config::Settings;
-use crate::config::model::{DEFAULT_MAX_INPUT_KIB, Named, SourceClass};
+use crate::config::model::{Named, SourceClass};
 use crate::error::{Error, IoContext};
 use crate::report::{Gap, Report};
 use crate::review;
@@ -66,7 +66,6 @@ pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report
     // pacman class.
     report.class = SourceClass::ThirdPartyRepo;
     report.profile = settings.system_profile().name().to_string();
-    report.agent_input_limit = privileged_agent_input_limit(settings);
     report.ai_off_classes = review::ai_off_classes(settings, &PRIVILEGED);
 
     let (archives, classes) = match operation {
@@ -103,20 +102,8 @@ pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report
         }
     }
 
-    review::run_agents(&mut report, settings, &args.opencode);
+    review::run_agents(&mut report, settings, &args.opencode, &[], None);
     Ok(report)
-}
-
-/// The pacman hook's report spans a whole transaction, not one source
-/// class, so it takes the largest AI input limit among the privileged
-/// classes a target can resolve to: this is how a system-file
-/// `[agent] max_input_kib` takes effect in the hook.
-fn privileged_agent_input_limit(settings: &Settings) -> usize {
-    PRIVILEGED
-        .into_iter()
-        .map(|class| settings.agent_settings(class).max_input_bytes)
-        .max()
-        .unwrap_or(DEFAULT_MAX_INPUT_KIB as usize * 1024)
 }
 
 fn read_targets(input: impl BufRead) -> Result<Vec<String>, Error> {
@@ -495,11 +482,11 @@ mod tests {
 
     use super::{
         Operation, is_valid_package_name, local_archives, parse_operation, parse_sync_info,
-        privileged_agent_input_limit, read_targets, scan_install_script, split_cmdline,
+        read_targets, scan_install_script, split_cmdline,
     };
     use crate::agent::{AgentReview, Status};
     use crate::config::Settings;
-    use crate::config::file::{AgentDefaults, PartialConfig};
+    use crate::config::file::PartialConfig;
     use crate::config::model::SourceClass;
     use crate::report::{AgentOutcome, AgentRun, Blocked, Decision, Report};
     use crate::review::analyze_text;
@@ -563,26 +550,12 @@ mod tests {
         assert_eq!(versions["ttf-font"][0].repo, "chaotic-aur");
     }
 
-    #[test]
-    fn agent_input_limit_follows_the_system_files_agent_defaults() {
-        let settings = Settings::from_parts(PartialConfig::default(), PartialConfig::default());
-        assert_eq!(privileged_agent_input_limit(&settings), 256 * 1024);
-
-        let system = PartialConfig {
-            agent: AgentDefaults {
-                max_input_kib: Some(64),
-                ..AgentDefaults::default()
-            },
-            ..PartialConfig::default()
-        };
-        let settings = Settings::from_parts(system, PartialConfig::default());
-        assert_eq!(privileged_agent_input_limit(&settings), 64 * 1024);
-    }
-
     fn clear_run(files: &[&str]) -> AgentRun {
         AgentRun {
             files: files.iter().map(ToString::to_string).collect(),
             label: "m · low".into(),
+            chunk: None,
+            cached: None,
             outcome: AgentOutcome::Reviewed(AgentReview {
                 status: Status::Clear,
                 summary: "ok".into(),

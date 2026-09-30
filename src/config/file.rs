@@ -6,11 +6,14 @@ use std::fmt;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
-use crate::config::model::{Action, AiRequirement, Named, Profile, SourceClass, Thinking};
+use crate::config::model::{Action, AiRequirement, Named, Profile, SourceClass, Thinking, Toggle};
 use crate::tomlish::{self, Entry, Value};
 
 pub const TIMEOUT_RANGE: RangeInclusive<u32> = 10..=900;
 pub const INPUT_KIB_RANGE: RangeInclusive<u32> = 16..=1024;
+pub const CHUNKS_RANGE: RangeInclusive<u32> = 1..=64;
+pub const CACHE_DAYS_RANGE: RangeInclusive<u32> = 0..=365;
+pub const STORE_MIB_RANGE: RangeInclusive<u32> = 16..=4096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfigError {
@@ -42,12 +45,17 @@ pub struct PartialPolicy {
     pub model: Option<String>,
     pub timeout_secs: Option<u32>,
     pub confirm: Option<bool>,
+    pub cache: Option<Toggle>,
+    pub diff: Option<Toggle>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AgentDefaults {
     pub model: Option<String>,
     pub max_input_kib: Option<u32>,
+    pub max_chunks: Option<u32>,
+    pub cache_days: Option<u32>,
+    pub max_store_mib: Option<u32>,
     /// Portable thinking level to provider variant name.
     pub variants: Vec<(Thinking, String)>,
 }
@@ -141,6 +149,15 @@ fn apply(
         ["agent", "max_input_kib"] => {
             config.agent.max_input_kib = Some(field.integer(&value, &INPUT_KIB_RANGE)?);
         }
+        ["agent", "max_chunks"] => {
+            config.agent.max_chunks = Some(field.integer(&value, &CHUNKS_RANGE)?);
+        }
+        ["agent", "cache_days"] => {
+            config.agent.cache_days = Some(field.integer(&value, &CACHE_DAYS_RANGE)?);
+        }
+        ["agent", "max_store_mib"] => {
+            config.agent.max_store_mib = Some(field.integer(&value, &STORE_MIB_RANGE)?);
+        }
         ["agent", "variants", level] => {
             let level = Thinking::parse(level)
                 .filter(|level| *level != Thinking::Default)
@@ -175,6 +192,13 @@ fn apply_knob(
         "thinking" => policy.thinking = Some(field.named(value)?),
         "model" => policy.model = Some(field.model(value)?),
         "timeout_secs" => policy.timeout_secs = Some(field.integer(&value, &TIMEOUT_RANGE)?),
+        "cache" | "diff" if class.is_privileged() => {
+            return Err(field.error(
+                "cache and diff are not available for classes enforced by the pacman hook",
+            ));
+        }
+        "cache" => policy.cache = Some(field.named(value)?),
+        "diff" => policy.diff = Some(field.named(value)?),
         "confirm" if class.is_privileged() => {
             return Err(
                 field.error("confirm is not available for classes enforced by the pacman hook")
@@ -281,7 +305,7 @@ mod tests {
     use std::path::Path;
 
     use super::{PartialPolicy, parse};
-    use crate::config::model::{Action, AiRequirement, Profile, SourceClass, Thinking};
+    use crate::config::model::{Action, AiRequirement, Profile, SourceClass, Thinking, Toggle};
 
     const EXAMPLE: &str = r#"
 profile = "strict"
@@ -290,6 +314,9 @@ official_repos = ["core", "extra"]
 [agent]
 model = "anthropic/claude-sonnet-5"
 max_input_kib = 512
+max_chunks = 4
+cache_days = 7
+max_store_mib = 64
 
 [agent.variants]
 max = "xhigh"
@@ -305,6 +332,8 @@ on_ai_suspicious = "warn"
 thinking = "max"
 timeout_secs = 300
 confirm = true
+cache = "off"
+diff = "off"
 "#;
 
     fn parse_str(text: &str) -> Result<super::PartialConfig, super::ConfigError> {
@@ -325,6 +354,9 @@ confirm = true
             Some("anthropic/claude-sonnet-5")
         );
         assert_eq!(config.agent.max_input_kib, Some(512));
+        assert_eq!(config.agent.max_chunks, Some(4));
+        assert_eq!(config.agent.cache_days, Some(7));
+        assert_eq!(config.agent.max_store_mib, Some(64));
         assert_eq!(
             config.agent.variants,
             [(Thinking::Max, "xhigh".to_string())]
@@ -347,6 +379,8 @@ confirm = true
                 model: None,
                 timeout_secs: Some(300),
                 confirm: Some(true),
+                cache: Some(Toggle::Off),
+                diff: Some(Toggle::Off),
             }
         );
         assert_eq!(config.class(SourceClass::Theme), PartialPolicy::default());
@@ -392,6 +426,15 @@ confirm = true
                 "class.aur.ai",
             ),
             ("mystery = true\n", 1, "mystery"),
+            (
+                "[class.official]\ncache = \"on\"\n",
+                2,
+                "class.official.cache",
+            ),
+            ("[class.aur]\ndiff = \"sometimes\"\n", 2, "class.aur.diff"),
+            ("[agent]\nmax_chunks = 0\n", 2, "agent.max_chunks"),
+            ("[agent]\ncache_days = 400\n", 2, "agent.cache_days"),
+            ("[agent]\nmax_store_mib = 8\n", 2, "agent.max_store_mib"),
         ];
 
         for (text, line, key) in cases {

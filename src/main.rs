@@ -21,6 +21,7 @@ mod classify;
 mod cli;
 mod config;
 mod deps;
+mod engine;
 mod error;
 mod json;
 mod osv;

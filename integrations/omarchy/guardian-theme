@@ -112,7 +112,7 @@ install_theme() {
     staged="$STAGE_ROOT/repo"
 
     clone_theme "$url" "$staged"
-    if "$GUARDIAN" guard --class theme --thorough "$staged" -- /usr/bin/bash "$SCRIPT_PATH" \
+    if "$GUARDIAN" guard --class theme --identity "theme:$name" --thorough "$staged" -- /usr/bin/bash "$SCRIPT_PATH" \
         --guardian-commit-install "$name" "$staged"; then
         return 0
     else
@@ -167,7 +167,12 @@ update_themes() {
         return 0
     }
 
-    if "$GUARDIAN" guard --class theme --thorough "$STAGE_ROOT/staged" -- /usr/bin/bash "$SCRIPT_PATH" \
+    local -a unit_args=()
+    for name in "${theme_names[@]}"; do
+        unit_args+=(--unit "$name" "theme:$name")
+    done
+
+    if "$GUARDIAN" guard --class theme --thorough "${unit_args[@]}" "$STAGE_ROOT/staged" -- /usr/bin/bash "$SCRIPT_PATH" \
         --guardian-commit-update "$STAGE_ROOT" "${theme_names[@]}"; then
         return 0
     else

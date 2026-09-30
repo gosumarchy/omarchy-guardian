@@ -127,7 +127,6 @@ impl Sha256 {
         }
     }
 
-    #[cfg(test)]
     pub fn digest(bytes: &[u8]) -> Digest {
         let mut hasher = Self::new();
         hasher.update(bytes);

@@ -363,6 +363,62 @@ theme_gate() {
 }
 
 ###############################################################################
+# review engine: memory stays out of the pacman gate, cache, diffs, chunks
+###############################################################################
+memory_after_pacman_gate() {
+    printf '=== review memory after the pacman gate ===\n'
+    if [[ -e $HOME/.local/state/omarchy-guardian ]]; then
+        printf 'FAIL the pacman gate created the review memory\n'
+        FAILURES=$((FAILURES + 1))
+    else
+        printf 'ok   the pacman gate never touched the review memory\n'
+    fi
+}
+
+engine_gate() {
+    printf '=== review engine ===\n'
+    local output=$E2E/engine-output
+    local dir=$E2E/engine-build
+    local user_config=$HOME/.config/omarchy-guardian/config.toml
+
+    rm -rf -- "$dir"
+    make_pkgbuild 'make'
+    cp -a -- "$E2E/build" "$dir"
+    for line in $(seq 1 60); do
+        printf 'int helper_%s(void) { return %s; }\n' "$line" "$line"
+    done >"$dir/helpers.c"
+
+    run_shim "$dir" --noconfirm >"$output" 2>&1
+    expect 'first engine review is clear' 0 "$?"
+    expect_mock_run 'makepkg ran after the first review' 'makepkg --noconfirm'
+
+    # The first clear review became the approved baseline; an unchanged tree
+    # is sent as the same first-review request, so the second run (like
+    # yay's second makepkg pass) is answered from the cache.
+    run_shim "$dir" --noconfirm >"$output" 2>&1
+    expect 'an unchanged rerun is clear' 0 "$?"
+    expect_output 'an unchanged rerun comes from the cache' 'from cache' "$output"
+    expect_mock_run 'makepkg ran after the cached review' 'makepkg --noconfirm'
+
+    sed -i 's/return 30;/return 31;/' "$dir/helpers.c"
+    run_shim "$dir" --noconfirm >"$output" 2>&1
+    expect 'an upgraded build is clear' 0 "$?"
+    expect_output 'an upgraded build is reviewed as a diff' '1 file(s) sent as diffs' "$output"
+    expect_mock_run 'makepkg ran after the diff review' 'makepkg --noconfirm'
+
+    mkdir -p "${user_config%/*}"
+    printf '[agent]\nmax_input_kib = 16\nmax_chunks = 1\n' >"$user_config"
+    rm -rf -- "$E2E/engine-large"
+    cp -a -- "$E2E/build" "$E2E/engine-large"
+    head -c 40960 /dev/zero | tr '\0' 'a' >"$E2E/engine-large/data.txt"
+    run_shim "$E2E/engine-large" --noconfirm >"$output" 2>&1
+    expect 'a build over max_chunks is incomplete' 2 "$?"
+    expect_output 'the incomplete build names the input limit' 'exceeds the AI' "$output"
+    expect_no_mock_run 'makepkg'
+    rm -f -- "$user_config"
+}
+
+###############################################################################
 # settings and profiles
 ###############################################################################
 settings_gate() {
@@ -410,8 +466,10 @@ settings_gate() {
 }
 
 pacman_gate
+memory_after_pacman_gate
 yay_gate
 theme_gate
+engine_gate
 settings_gate
 
 printf '\n'

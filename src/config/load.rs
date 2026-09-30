@@ -7,7 +7,10 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::config::file::{AgentDefaults, PartialConfig, parse};
-use crate::config::model::{AgentSettings, DEFAULT_MAX_INPUT_KIB, Policy, Profile, SourceClass};
+use crate::config::model::{
+    AgentSettings, DEFAULT_CACHE_DAYS, DEFAULT_MAX_CHUNKS, DEFAULT_MAX_INPUT_KIB,
+    DEFAULT_MAX_STORE_MIB, Policy, Profile, SourceClass, StoreSettings,
+};
 use crate::config::resolve::{Layers, Resolved, resolve};
 
 pub const SYSTEM_PATH: &str = "/etc/omarchy-guardian/config.toml";
@@ -255,6 +258,11 @@ impl Settings {
             .rev()
             .find_map(|layer| layer.max_input_kib)
             .unwrap_or(DEFAULT_MAX_INPUT_KIB);
+        let max_chunks = layers
+            .iter()
+            .rev()
+            .find_map(|layer| layer.max_chunks)
+            .unwrap_or(DEFAULT_MAX_CHUNKS);
 
         AgentSettings {
             model,
@@ -262,6 +270,23 @@ impl Settings {
             variant,
             timeout_secs: policy.timeout_secs(),
             max_input_bytes: max_input_kib as usize * 1024,
+            max_chunks: max_chunks as usize,
+        }
+    }
+
+    /// Review-memory limits. The memory only serves user-level classes, so
+    /// the user file's values come first.
+    pub fn store_settings(&self) -> StoreSettings {
+        let layers = [&self.user.agent, &self.system.agent];
+        StoreSettings {
+            cache_days: layers
+                .iter()
+                .find_map(|layer| layer.cache_days)
+                .unwrap_or(DEFAULT_CACHE_DAYS),
+            max_store_mib: layers
+                .iter()
+                .find_map(|layer| layer.max_store_mib)
+                .unwrap_or(DEFAULT_MAX_STORE_MIB),
         }
     }
 
@@ -306,7 +331,7 @@ mod tests {
 
     use super::{FileStatus, Settings};
     use crate::config::file::{AgentDefaults, PartialConfig, PartialPolicy};
-    use crate::config::model::{AiRequirement, Profile, SourceClass, Thinking};
+    use crate::config::model::{AiRequirement, Profile, SourceClass, StoreSettings, Thinking};
     use crate::test_support::TempDir;
 
     #[expect(
@@ -394,6 +419,7 @@ mod tests {
                 model: Some("anthropic/claude-sonnet-5".into()),
                 max_input_kib: Some(512),
                 variants: vec![(Thinking::Max, "xhigh".into())],
+                ..AgentDefaults::default()
             },
             ..PartialConfig::default()
         };
@@ -402,6 +428,7 @@ mod tests {
                 model: Some("ollama/qwen3".into()),
                 max_input_kib: None,
                 variants: vec![(Thinking::High, "deep".into())],
+                ..AgentDefaults::default()
             },
             classes: vec![(
                 SourceClass::Aur,
@@ -433,6 +460,47 @@ mod tests {
 
         let unmapped = Settings::from_parts(PartialConfig::default(), PartialConfig::default());
         assert_eq!(unmapped.agent_settings(SourceClass::Aur).variant, None);
+    }
+
+    #[test]
+    fn store_settings_take_the_user_file_first() {
+        let system = PartialConfig {
+            agent: AgentDefaults {
+                cache_days: Some(10),
+                max_store_mib: Some(512),
+                ..AgentDefaults::default()
+            },
+            ..PartialConfig::default()
+        };
+        let user = PartialConfig {
+            agent: AgentDefaults {
+                cache_days: Some(0),
+                max_chunks: Some(3),
+                ..AgentDefaults::default()
+            },
+            ..PartialConfig::default()
+        };
+        let settings = Settings::from_parts(system, user);
+
+        assert_eq!(
+            settings.store_settings(),
+            StoreSettings {
+                cache_days: 0,
+                max_store_mib: 512
+            }
+        );
+        assert_eq!(settings.agent_settings(SourceClass::Aur).max_chunks, 3);
+        // Pacman classes take agent defaults from the system file only.
+        assert_eq!(settings.agent_settings(SourceClass::Official).max_chunks, 8);
+
+        let defaults = Settings::from_parts(PartialConfig::default(), PartialConfig::default());
+        assert_eq!(
+            defaults.store_settings(),
+            StoreSettings {
+                cache_days: 30,
+                max_store_mib: 256
+            }
+        );
     }
 
     #[test]

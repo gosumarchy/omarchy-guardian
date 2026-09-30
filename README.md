@@ -26,6 +26,11 @@ omarchy-guardian sandbox ./theme-checkout -- /usr/bin/true
   the copy matches the reviewed snapshot, and runs the command in Bubblewrap
   with the network isolated, no host home directory and a read-only system.
   It is a behaviour smoke test, not a dynamic malware detector.
+- `--identity ID` or `--unit DIR ID` (repeatable) on `scan`, `guard` and
+  `sandbox` name what is reviewed for the review memory (see
+  [How the review scales](#how-the-review-scales)); `omarchy-guardian forget
+  ID` drops that source's baselines (cached verdicts are kept) and `forget
+  --all` clears everything.
 
 Exit codes: `0` clear, warned or limited review (a scriptlet-free pacman
 transaction); `1` findings; `2` an incomplete review, an unavailable AI review
@@ -59,13 +64,17 @@ includes Omarchy's own `[omarchy]` repo when its `pacman.conf` entry uses
 `pacman-conf --repo=omarchy SigLevel`.
 
 A profile is a named preset for every knob (`ai`, `on_findings`,
-`on_ai_suspicious`, `thinking`, `confirm`) of every class:
+`on_ai_suspicious`, `thinking`, `confirm`, `cache`, `diff`) of every class:
 
 | Profile | `official` | other classes |
 |---|---|---|
 | `standard` (default) | `ai = optional`, `thinking = low`, `on_findings = warn`, `on_ai_suspicious = block` | `ai = required`, `thinking = high`, `on_findings = block`, `on_ai_suspicious = block` |
 | `strict` | `ai = required`, `thinking = medium`, `on_findings = block`, `on_ai_suspicious = block` | `ai = required`, `thinking = max`, `on_findings = block`, `on_ai_suspicious = block` |
 | `local-only` | `ai = off`, `on_findings = warn` | `ai = off`, `on_findings = block`, plus `confirm = true` for user-level classes |
+
+`cache` and `diff` are `on` for user-level classes (`diff` is `off` under
+`strict`) and always `off` for the pacman classes, where setting them is a
+config error.
 
 `confirm` only applies with `ai = off`, on the user-level classes (the pacman
 hook has no reliable terminal): after clean local checks it asks on
@@ -92,7 +101,10 @@ official_repos = ["core", "extra", "multilib", "omarchy"]   # system file only
 
 [agent]
 model = "anthropic/claude-sonnet-5"   # omit for OpenCode's default
-max_input_kib = 256                   # 16..=1024
+max_input_kib = 256                   # 16..=1024, per AI call
+max_chunks = 8                        # 1..=64 AI calls per review
+cache_days = 30                       # 0..=365; 0 turns the verdict cache off
+max_store_mib = 256                   # 16..=4096, review memory size cap
 
 [agent.variants]                      # portable level -> provider variant
 high = "high"
@@ -107,6 +119,8 @@ thinking = "max"
 on_findings = "block"
 ai = "required"
 timeout_secs = 300
+cache = "on"                          # user-level classes only
+diff = "on"                           # off under the strict profile
 ```
 
 A thinking level is only sent to OpenCode (as `--variant`) when
@@ -163,6 +177,64 @@ ai = "required"
 on_findings = "block"
 ```
 
+## How the review scales
+
+Large sources are reviewed in several AI calls (chunks) instead of being
+refused. Files are ranked by risk:
+
+1. Build and install entry points go first and are always sent whole:
+   `PKGBUILD`, `.install`, `Makefile`, `GNUmakefile`, `CMakeLists.txt`,
+   `meson.build`, `build.rs`, `setup.py`, `pyproject.toml`, `package.json`,
+   top-level `*.sh`, systemd units, `.desktop` files, Hyprland `exec`
+   config, plugin QML, and any file with a local finding.
+2. Other code and runtime config follow.
+3. Everything else, with documentation last.
+
+Each chunk is its own OpenCode run with its own nonce, and every chunk carries
+the full file list, so the model knows what else exists. A source that needs
+more than `max_chunks` chunks of `max_input_kib` is not reviewed at all
+(`INCOMPLETE`): a partial AI review is never presented as a review of the
+whole source.
+
+For user-level sources (AUR, themes, plugins and `scan`/`guard`/`sandbox`
+targets), Guardian keeps a review memory in
+`$XDG_STATE_HOME/omarchy-guardian`, default
+`~/.local/state/omarchy-guardian`, mode 0700. Guardian creates it (and any
+missing parents) only under an existing directory you own (a symlink counts
+as its target), so a run under
+`sudo -E` leaves nothing owned by root in your home; otherwise the report
+says the memory was not used and the review runs in full:
+
+- **Verdict cache.** A chunk already judged `clear` or `suspicious`, with the
+  same prompt, model, variant, thinking level and class, is not sent again
+  for `cache_days` (default 30). Reports mark such chunks `from cache`.
+- **Diff review of upgrades.** A review becomes the approved baseline of that
+  source when every chunk was `clear`, there were no gaps, and the decision
+  is `CLEAR`. The next review of the same source is then sent as follows:
+  changed files as unified diffs against the baseline, new files and entry
+  points whole, and unchanged files only as names in the file list. Local
+  rules and the dependency audit still read every file. A baseline only
+  counts under the prompt version, model, variant and thinking level that
+  approved it; after any of them changes, the next review is a full one. A
+  source identical to its baseline is answered from the cache when its first
+  review is still cached (yay's second `makepkg` pass); otherwise it is
+  reviewed as an upgrade like any other. The `strict` profile turns diff
+  review off.
+
+The AUR gate remembers a build by yay's build directory name, and the theme
+handler remembers a theme by its name. Other targets are remembered by their
+class and path. `omarchy-guardian forget ID` drops one source's baselines
+but keeps cached verdicts, so an unchanged rebuild can still be answered from
+the cache; `omarchy-guardian forget --all` also clears every cached verdict.
+`config show` prints the memory's location and size.
+
+The pacman gate never uses this memory: every scriptlet gets a fresh, full
+review. Because the memory lives in your home directory, malware already
+running as your user could plant a cached `clear` verdict. Such malware could
+equally edit your shell startup files, so the user-level gates never
+defended against it. Set `cache = "off"` and `diff = "off"` for a class to
+review it in full every time.
+
 ## What is checked
 
 - **Local rules** on every text file except prose (`*.md`, `*.rst`, `README`,
@@ -181,10 +253,11 @@ on_findings = "block"
   fetched per advisory; ones OSV does not rate are shown as `UNRATED`. Any
   advisory blocks a gate. Unsupported lockfiles, manifests with dependencies
   but no lockfile, or an unavailable OSV API make the review incomplete.
-- **AI review:** the reviewable text (up to `max_input_kib`, default 256 KiB)
-  is sent to the OpenCode CLI **on stdin** (never in argv, which is
-  size-limited and visible to other users) with every OpenCode tool and
-  permission denied. The reply must echo a
+- **AI review:** the reviewable text is sent, in chunks of up to
+  `max_input_kib` (default 256 KiB, at most `max_chunks` per review; see
+  [How the review scales](#how-the-review-scales)), to the OpenCode CLI **on
+  stdin** (never in argv, which is size-limited and visible to other users)
+  with every OpenCode tool and permission denied. The reply must echo a
   random per-run nonce that only exists in that input, so a reply that never
   saw the source is rejected. Files that look sensitive by path (`.env*`, SSH
   and cloud credentials, key files, names containing `secret`, `credential` or

