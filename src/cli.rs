@@ -150,7 +150,7 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
         Invocation::PacmanHook(hook) => pacman_hook_command(&hook, &settings),
         Invocation::MakepkgGate(command) => makepkg_gate::run(&command, &settings),
         Invocation::HookPreflight => {
-            match pacman::preflight(&settings, pacman::system_opencode_ready()) {
+            match pacman::preflight(&settings, pacman::system_reviewer_ready(&settings)) {
                 Ok(()) => {
                     outln!("The pacman gate can review transactions with these settings.");
                     ExitCode::SUCCESS

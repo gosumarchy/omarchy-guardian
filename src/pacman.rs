@@ -21,7 +21,7 @@ use crate::payload;
 use crate::report::{Gap, Report};
 use crate::review;
 use crate::scan::MAX_TEXT_FILE_SIZE;
-use crate::tools::{self, Limits, OpenCode};
+use crate::tools::{self, Limits, OpenCode, Reviewer};
 
 const ARCHIVE_EXTENSIONS: &[&str] = &[".pkg.tar.zst", ".pkg.tar.xz", ".pkg.tar.gz", ".pkg.tar"];
 const DEFAULT_CACHE_DIR: &str = "/var/cache/pacman/pkg/";
@@ -62,9 +62,21 @@ pub fn classes_requiring_ai(settings: &Settings) -> Vec<SourceClass> {
         .collect()
 }
 
-/// Whether a root-owned OpenCode is installed where the gate looks for it.
-pub fn system_opencode_ready() -> bool {
-    OpenCode::SystemOnly.resolve().is_ok()
+/// Whether every pacman class that requires the AI review has a root-owned
+/// binary of the reviewer CLI its model selects.
+pub fn system_reviewer_ready(settings: &Settings) -> bool {
+    classes_requiring_ai(settings).iter().all(|class| {
+        let reviewer = Reviewer::for_model(settings.agent_settings(*class).model.as_deref());
+        OpenCode::SystemOnly.resolve_reviewer(reviewer).is_ok()
+    })
+}
+
+/// Whether the pacman classes that require the AI review use OpenCode, so a
+/// missing reviewer is fixed by installing `extra/opencode`.
+pub fn system_reviewer_is_opencode(settings: &Settings) -> bool {
+    classes_requiring_ai(settings).iter().all(|class| {
+        Reviewer::for_model(settings.agent_settings(*class).model.as_deref()) == Reviewer::OpenCode
+    })
 }
 
 /// Whether the pacman gate can review transactions with these settings.
@@ -80,8 +92,13 @@ pub fn preflight(settings: &Settings, opencode_ready: bool) -> Result<(), String
         return Ok(());
     }
     let names: Vec<&str> = requiring.iter().map(|class| class.name()).collect();
+    let fix = if system_reviewer_is_opencode(settings) {
+        "there is no root-owned OpenCode at /usr/bin/opencode or /usr/local/bin/opencode. Install it with: sudo pacman -S extra/opencode"
+    } else {
+        "the model set for them runs through the Claude Code CLI, and there is no root-owned `claude` at /usr/bin/claude or /usr/local/bin/claude. Install Claude Code system-wide, or set an OpenCode model for the pacman gate"
+    };
     Err(format!(
-        "there is no root-owned OpenCode at /usr/bin/opencode or /usr/local/bin/opencode, but {} packages require an AI review, so pacman would refuse every such install (including AUR packages yay installs with pacman -U). Install it with: sudo pacman -S extra/opencode",
+        "{} packages require an AI review, so pacman would refuse every such install (including AUR packages yay installs with pacman -U): {fix}",
         names.join(", ")
     ))
 }

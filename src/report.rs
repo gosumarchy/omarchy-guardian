@@ -95,7 +95,7 @@ impl fmt::Display for Gap {
             Self::NoReviewableFiles => {
                 f.write_str("no readable text source files were available for review")
             }
-            Self::Agent(error) => write!(f, "OpenCode review failed: {error}"),
+            Self::Agent(error) => write!(f, "AI review failed: {error}"),
             Self::Dependency(message) => f.write_str(message),
         }
     }
@@ -562,7 +562,7 @@ impl Report {
                         Status::Inconclusive => "33;1",
                     };
                     outln!(
-                        "OpenCode: {} · {}{context} · profile {} — {}",
+                        "AI review: {} · {}{context} · profile {} — {}",
                         painter.paint(review.status.label(), color),
                         run.label,
                         self.profile,
@@ -570,7 +570,7 @@ impl Report {
                     );
                 }
                 AgentOutcome::Unavailable(error) => outln!(
-                    "OpenCode: {} · {}{context} · profile {} — {error}",
+                    "AI review: {} · {}{context} · profile {} — {error}",
                     painter.paint("UNAVAILABLE", "33;1"),
                     run.label,
                     self.profile

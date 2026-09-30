@@ -354,6 +354,31 @@ user-writable reviewer could be replaced by user-level malware. OpenCode must
 be configured with a working provider; source leaves the machine through that
 provider.
 
+## Using Claude Code as the reviewer
+
+A model written `claude-code/<model>` runs the review through the Claude Code
+CLI (`claude`) instead of OpenCode, with your existing Claude login:
+
+```toml
+[agent]
+model = "claude-code/claude-sonnet-5-5"
+```
+
+(or pick it in `omarchy-guardian tui` or `setup`, which list the Claude Code
+models when `claude` is installed). Guardian runs `claude --print` with every
+built-in tool disabled (`--tools ""`), no MCP servers (`--strict-mcp-config`),
+no user, project or local settings, hooks or plugins (`--setting-sources ""`),
+no slash commands and no saved session, from an empty private working
+directory; the request goes on stdin. A reply that took more than one turn
+or had a permission denial counts as a tool attempt and makes the review
+invalid, and the reply must echo the nonce like OpenCode's. `thinking`
+becomes `--effort` directly.
+
+For your own sources `claude` is found on `PATH`. The pacman gate, as with
+OpenCode, only accepts a root-owned `/usr/bin/claude` or
+`/usr/local/bin/claude`; a Claude Code installed in your home directory is
+not used for it, and `pacman-hook --preflight` says so.
+
 ## Install (Arch Linux / Omarchy)
 
 ```sh
