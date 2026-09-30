@@ -93,6 +93,8 @@ pub struct Group<'a> {
     /// The review's units, for ranking a unit-relative top-level path (spec
     /// §4); independent of whether memory is enabled for this review.
     pub units: &'a [Unit],
+    /// Trusted facts for every request (see `Request::context`).
+    pub context: &'a [String],
 }
 
 /// What reviewing one group produced.
@@ -233,6 +235,7 @@ fn requests(group: &Group<'_>, plan: &Plan) -> Vec<Request> {
                 .cloned()
                 .collect(),
             items: items.clone(),
+            context: group.context.to_vec(),
         })
         .collect()
 }
@@ -485,6 +488,7 @@ mod tests {
             files,
             findings: &[],
             units: &[],
+            context: &[],
         }
     }
 

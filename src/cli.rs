@@ -13,6 +13,7 @@ use crate::config::show;
 use crate::engine::baseline::{self, Identity, Unit};
 use crate::engine::store::Store;
 use crate::error::Error;
+use crate::makepkg_gate;
 use crate::pacman::{self, HookArgs};
 use crate::report::{Blocked, Decision, Report};
 use crate::review::{self, ReviewContext};
@@ -29,6 +30,7 @@ Usage:
   omarchy-guardian sandbox [--hashes] [--profile PROFILE] [--identity ID | --unit DIR ID ...] <directory> -- <command> [args...]
   omarchy-guardian pacman-hook --pacman-pid PID --cwd DIR   (run by the pacman hook)
   omarchy-guardian pacman-hook --preflight                  (can the pacman gate review?)
+  omarchy-guardian makepkg-gate -- <makepkg> [args...]      (run by the yay makepkg shim)
   omarchy-guardian config show [--class CLASS] | check | path
   omarchy-guardian forget <identity> | --all
   omarchy-guardian setup
@@ -45,14 +47,14 @@ command's own exit code once it starts.";
 const USAGE_ERROR: u8 = 2;
 
 #[derive(Debug, PartialEq, Eq)]
-struct Target {
-    config: ScanConfig,
-    show_hashes: bool,
-    class: SourceClass,
-    profile: Option<Profile>,
-    units: Vec<Unit>,
+pub(crate) struct Target {
+    pub(crate) config: ScanConfig,
+    pub(crate) show_hashes: bool,
+    pub(crate) class: SourceClass,
+    pub(crate) profile: Option<Profile>,
+    pub(crate) units: Vec<Unit>,
     /// Filled in by `run`, so parsing stays free of the environment.
-    state_root: Option<PathBuf>,
+    pub(crate) state_root: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -63,6 +65,8 @@ enum Invocation {
     PacmanHook(HookArgs),
     /// `pacman-hook --preflight`: can the gate review with these settings?
     HookPreflight,
+    /// `makepkg-gate -- <makepkg> [args...]`, run by the yay makepkg shim.
+    MakepkgGate(Vec<OsString>),
     Config(ConfigCommand),
     Forget(Forget),
     Setup,
@@ -144,6 +148,7 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
             &mut TtyConfirm,
         ),
         Invocation::PacmanHook(hook) => pacman_hook_command(&hook, &settings),
+        Invocation::MakepkgGate(command) => makepkg_gate::run(&command, &settings),
         Invocation::HookPreflight => {
             match pacman::preflight(&settings, pacman::system_opencode_ready()) {
                 Ok(()) => {
@@ -192,11 +197,12 @@ fn with_state_root(mut target: Target) -> Target {
 
 /// Reviews a target, applies confirmation, then prints the report once with
 /// the final decision — never a stale pre-confirmation headline.
-fn review_and_decide(
+pub(crate) fn review_and_decide(
     target: &Target,
     settings: &Settings,
     opencode: &OpenCode,
     confirm: Option<&mut dyn Confirm>,
+    context: &[String],
 ) -> (Report, Decision) {
     let report = review::review_tree(
         &target.config,
@@ -206,6 +212,7 @@ fn review_and_decide(
             opencode,
             units: &target.units,
             state_root: target.state_root.as_deref(),
+            context,
         },
     );
     let mut decision = report.decide(&|class| settings.policy(class));
@@ -237,7 +244,7 @@ fn review_and_decide(
 
 fn scan_command(target: &Target, settings: &Settings) -> ExitCode {
     let settings = settings_for(target, settings);
-    review_and_decide(target, &settings, &OpenCode::UserPath, None)
+    review_and_decide(target, &settings, &OpenCode::UserPath, None, &[])
         .1
         .exit_code()
 }
@@ -254,7 +261,7 @@ fn guard_command(
     launch: &mut dyn FnMut(&[OsString]) -> ExitCode,
 ) -> ExitCode {
     let settings = settings_for(target, settings);
-    let (report, decision) = review_and_decide(target, &settings, opencode, Some(confirm));
+    let (report, decision) = review_and_decide(target, &settings, opencode, Some(confirm), &[]);
 
     if !decision.allows_running() {
         if decision == Decision::Blocked(Blocked::NotConfirmed) {
@@ -285,7 +292,7 @@ fn guard_command(
 
 /// Replaces this process with the guarded command, so its exit status and
 /// signal behaviour are exactly the command's own.
-fn exec_command(command: &[OsString]) -> ExitCode {
+pub(crate) fn exec_command(command: &[OsString]) -> ExitCode {
     let Some((program, arguments)) = command.split_first() else {
         return ExitCode::from(USAGE_ERROR);
     };
@@ -308,7 +315,7 @@ fn sandbox_command(
 ) -> ExitCode {
     let settings = settings_for(target, settings);
     let (report, decision) =
-        review_and_decide(target, &settings, &OpenCode::UserPath, Some(confirm));
+        review_and_decide(target, &settings, &OpenCode::UserPath, Some(confirm), &[]);
 
     if !decision.allows_running() {
         if decision == Decision::Blocked(Blocked::NotConfirmed) {
@@ -473,6 +480,7 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
             Ok(Invocation::HookPreflight)
         }
         Some("pacman-hook") => parse_hook(rest).map(Invocation::PacmanHook),
+        Some("makepkg-gate") => makepkg_gate::parse(rest).map(Invocation::MakepkgGate),
         Some("config") => parse_config(rest).map(Invocation::Config),
         Some("forget") => parse_forget(rest).map(Invocation::Forget),
         Some("setup") if rest.is_empty() => Ok(Invocation::Setup),
@@ -927,7 +935,7 @@ mod tests {
 
         let mut declined = Scripted(Some(false), Vec::new());
         let (_, decision) =
-            review_and_decide(&target, &settings, &unavailable(), Some(&mut declined));
+            review_and_decide(&target, &settings, &unavailable(), Some(&mut declined), &[]);
         assert_eq!(decision, Decision::Blocked(Blocked::NotConfirmed));
 
         let mut declined = Scripted(Some(false), Vec::new());
@@ -972,7 +980,8 @@ mod tests {
 
         let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
         let mut confirm = Scripted(Some(true), Vec::new());
-        let (_, decision) = review_and_decide(&target, &settings, &opencode, Some(&mut confirm));
+        let (_, decision) =
+            review_and_decide(&target, &settings, &opencode, Some(&mut confirm), &[]);
 
         assert_eq!(decision, Decision::Clear);
         assert!(confirm.1.is_empty());

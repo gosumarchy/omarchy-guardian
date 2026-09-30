@@ -199,6 +199,8 @@ pub struct Report {
     pub profile: String,
     /// Review-memory lines: the upgrade summary and store problems. Never gaps.
     pub notes: Vec<String>,
+    /// Facts Guardian established for the AI review (see `Request::context`).
+    pub context: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -20,6 +20,7 @@ compile_error!("scan.rs hard-codes O_NONBLOCK for the generic Linux ABI; check i
 mod output;
 
 mod agent;
+mod aur;
 mod classify;
 mod cli;
 mod config;
@@ -27,6 +28,7 @@ mod deps;
 mod engine;
 mod error;
 mod json;
+mod makepkg_gate;
 mod mask;
 mod osv;
 mod pacman;

@@ -14,13 +14,12 @@ if [ ! -f PKGBUILD ]; then
     exit 2
 fi
 
-# yay calls makepkg several times per package. After the first call, makepkg's
-# own src/ and pkg/ work directories hold extracted upstream sources and build
-# output rather than AUR inputs, so they are left out of the review and the
-# snapshot; the PKGBUILD, install scripts and patches are still reviewed.
-#
-# yay names the build directory after the package base, so the review memory
-# remembers the build by that name. .SRCINFO is untrusted input and is not read.
-build_dir=$(pwd -P)
-exec "$GUARDIAN" guard --class aur --identity "aur:${build_dir##*/}" --thorough \
-    --exclude src --exclude pkg "$build_dir" -- "$REAL_MAKEPKG" "$@"
+# yay calls makepkg several times per package. The gate reviews the recipe
+# (PKGBUILD, install scripts, patches) on every call; makepkg's own src/ and
+# pkg/ work directories are left out of that review. For a call that runs
+# PKGBUILD functions, it also reads the source list, fetches and extracts the
+# sources without running any function, and reviews the upstream files that
+# run during the build, before handing over to makepkg. The review memory
+# remembers the build by the build directory's name (yay names it after the
+# package base). .SRCINFO is untrusted input and is not read.
+exec "$GUARDIAN" makepkg-gate -- "$REAL_MAKEPKG" "$@"

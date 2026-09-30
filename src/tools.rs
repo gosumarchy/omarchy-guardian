@@ -153,6 +153,28 @@ pub fn run(
     env: &[(&str, &str)],
     limits: Limits,
 ) -> Result<Captured, Error> {
+    run_with(program, args, input, env, limits, None)
+}
+
+/// Like `run`, in `directory` and without input.
+pub fn run_in(
+    program: &Path,
+    args: &[OsString],
+    directory: &Path,
+    env: &[(&str, &str)],
+    limits: Limits,
+) -> Result<Captured, Error> {
+    run_with(program, args, None, env, limits, Some(directory))
+}
+
+fn run_with(
+    program: &Path,
+    args: &[OsString],
+    input: Option<&[u8]>,
+    env: &[(&str, &str)],
+    limits: Limits,
+    directory: Option<&Path>,
+) -> Result<Captured, Error> {
     let tool = program.file_name().map_or_else(
         || program.display().to_string(),
         |name| name.to_string_lossy().into_owned(),
@@ -174,6 +196,9 @@ pub fn run(
         .stderr(Stdio::piped());
     for (key, value) in env {
         command.env(key, value);
+    }
+    if let Some(directory) = directory {
+        command.current_dir(directory);
     }
 
     let mut child = command.spawn().map_err(|source| Error::Spawn {

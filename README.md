@@ -434,11 +434,49 @@ directly (for example pamac) are not supported and will be blocked.
 
 ### yay makepkg gate
 
-Runs `guard --class aur --thorough --exclude src --exclude pkg` on the AUR build directory
-before every `makepkg` invocation. The PKGBUILD, install scripts, patches and
-other AUR inputs are reviewed; makepkg's own `src/` and `pkg/` work
-directories (extracted upstream sources and build output) are not, so upstream
-sources and whatever `prepare()`/`build()` do with them are outside the review.
+The yay shim runs `omarchy-guardian makepkg-gate` in the AUR build directory
+before every `makepkg` call. yay calls makepkg several times per package; the
+gate does, in order:
+
+1. **AUR trust signals.** The package is looked up in the AUR RPC (only its
+   name is sent): its age, votes, maintainer and submitter are printed, and a
+   package first submitted under 30 days ago, with fewer than 5 votes,
+   orphaned, or changed in the last 14 days by a maintainer who did not
+   submit it is flagged. These are warnings, and are given to the AI review
+   as facts.
+2. **The recipe.** The PKGBUILD, install scripts, patches and other AUR files
+   are reviewed as `guard --class aur --thorough --exclude src --exclude pkg`
+   would. The AI is told that upstream sources are reviewed in the next
+   step, that prebuilt binaries cannot be reviewed by anyone, and what
+   routine packaging looks like. A PKGBUILD's `url=` and `source=` entries
+   are declarations, not network requests, for the local rules, unless they
+   run a command.
+3. **Sources**, for a call that runs PKGBUILD functions (not
+   `--verifysource`, `--packagelist`, `--nobuild --noprepare` and the like).
+   Only now, with the recipe reviewed, `makepkg --printsrcinfo` lists the
+   sources:
+   - an unverified download over `http://` or `ftp://` blocks the build,
+     since anyone on the network path can replace it;
+   - a git (or other VCS) source not pinned to a commit, or an unverified
+     download over HTTPS, is a warning.
+4. **Upstream code.** If the call extracts the sources, the gate first
+   fetches and extracts them itself with `makepkg --nobuild --noprepare
+   --nodeps`, so no PKGBUILD function has run yet. The AI then reviews the
+   upstream code under `src/`: all of it when its code is up to 1 MiB,
+   otherwise its build files and scripts (makefiles, CMake, meson,
+   `configure`, `setup.py`, `build.rs`, `package.json`, shell scripts…)
+   first, then other code by depth, up to 1 MiB. Data and documentation
+   (`.json`, `.md`, `.txt`…), version-control metadata, `node_modules` and
+   CI or development-container directories are left out. The review looks
+   for malicious intent in what runs during the build and in the program's
+   own code, not bugs or vulnerabilities, and is told whether the recipe
+   runs the test suite (`check()`). The upstream review is remembered as
+   `aur-src:<package>`, so a new version is reviewed as a diff.
+5. **makepkg** starts with the original arguments.
+
+What is not reviewed is reported: how many code files were left out, and
+that data files were skipped. Prebuilt binaries in `-bin` packages are not
+reviewable.
 
 ### Omarchy themes
 

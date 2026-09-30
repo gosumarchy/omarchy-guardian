@@ -194,7 +194,7 @@ fn advisory_summary(record: &Json) -> Option<String> {
     (!line.is_empty()).then_some(line)
 }
 
-fn curl_args() -> Vec<OsString> {
+pub fn curl_args() -> Vec<OsString> {
     [
         "--disable",
         "--fail",
