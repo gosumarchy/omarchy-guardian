@@ -341,8 +341,20 @@ yay --makepkg /usr/bin/makepkg --save -P --stats
 sudo pacman -R omarchy-guardian
 ```
 
-Removing the package removes the hook link. Delete the marked Guardian line
-from `~/.bashrc` to stop theme interception.
+Removing the package removes the hook link. A hook at the same path that was
+installed by hand and runs Guardian is moved to
+`/etc/pacman.d/hooks/omarchy-guardian.hook.pacsave`, which pacman ignores.
+Delete the marked Guardian line from `~/.bashrc` to stop theme interception.
+
+If pacman fails every install or upgrade with `Review package install scripts
+with Omarchy Guardian` followed by `call to execv failed (No such file or
+directory)`, a Guardian hook is still active but the program it runs is gone,
+typically after a manual install. pacman runs the hook before any package
+script, so no install or removal can fix it; remove the hook first:
+
+```sh
+sudo rm /etc/pacman.d/hooks/omarchy-guardian.hook
+```
 
 ## Limitations
 
