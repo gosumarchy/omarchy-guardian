@@ -10,6 +10,7 @@ use std::sync::{Mutex, PoisonError};
 
 use super::{AgentOutcome, Blocked, Decision, Report, Severity, recommendation};
 use crate::agent::Status;
+use crate::notify::Ran;
 use crate::scan::FileKind;
 
 const KNIGHT: &str = include_str!("../../integrations/icons/omarchy-guardian-alert.svg");
@@ -31,7 +32,7 @@ pub fn collect(report: &Report, decision: Decision) {
 /// UTC time, `id` names the saved report for the ask link, and `fallback`
 /// is the printed output, shown when no report was collected (a gate that
 /// stopped before reviewing).
-pub fn page(title: &str, detail: &str, when: &str, id: &str, fallback: &str) -> String {
+pub fn page(title: &str, detail: &str, ran: Ran, when: &str, id: &str, fallback: &str) -> String {
     let sections = SECTIONS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -66,14 +67,14 @@ pub fn page(title: &str, detail: &str, when: &str, id: &str, fallback: &str) -> 
 </header>
 <hr>
 <div class="row lead"><span>Blocked {what_text}</span><span class="word red">BLOCKED</span></div>
-<p class="dim">{detail_text}. Nothing from this source ran: Guardian stopped it before any of its code could run.</p>
+<p class="dim">{detail_text}. {ran_text}</p>
 {body}
 <hr>
 <h3>Next</h3>
 <div class="tiles">
   <a class="tile" href="omarchy-guardian://ask/{id_text}"><span class="glyph">✦</span><span>Ask your AI agent</span></a>
 </div>
-<p class="dim small">Opens Claude Code (or OpenCode) in a terminal with this report and no tools, so nothing in the report can make it run anything.</p>
+<p class="dim small">Opens Claude Code (or OpenCode) in a terminal with this report and no tools. It can explain the report; do not run commands it quotes from the report.</p>
 <footer>OMARCHY GUARDIAN {version} · SAVED ON THIS MACHINE ONLY · A CLEAR REVIEW IS NOT A SAFETY GUARANTEE</footer>
 </main>
 </body>
@@ -83,10 +84,23 @@ pub fn page(title: &str, detail: &str, when: &str, id: &str, fallback: &str) -> 
         title_text = esc(title),
         what_text = esc(what),
         detail_text = esc(detail),
+        ran_text = ran_text(ran),
         when_text = esc(when),
         id_text = esc(id),
         version = env!("CARGO_PKG_VERSION"),
     )
+}
+
+/// What had run when the gate blocked, for the page's first lines.
+const fn ran_text(ran: Ran) -> &'static str {
+    match ran {
+        Ran::Nothing => {
+            "Nothing from this source ran: Guardian stopped it before any of its code could run."
+        }
+        Ran::RecipeToFetch => {
+            "Nothing was built or installed. The recipe (PKGBUILD) had passed review, and makepkg ran it to download and unpack the sources; Guardian stopped the build before any of the upstream code ran."
+        }
+    }
 }
 
 /// The page's colours from the current Omarchy theme (the shell reads the
@@ -358,7 +372,9 @@ const fn tone(color: &str) -> &'static str {
     }
 }
 
-/// Escapes text for HTML content and attribute values.
+/// Escapes text for HTML content and attribute values. A hidden character
+/// (a control, bidirectional override or invisible character) is shown as a
+/// visible code, so a file name cannot reorder or hide what the page says.
 pub fn esc(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for character in text.chars() {
@@ -368,28 +384,63 @@ pub fn esc(text: &str) -> String {
             '>' => escaped.push_str("&gt;"),
             '"' => escaped.push_str("&quot;"),
             '\'' => escaped.push_str("&#39;"),
+            '\n' | '\t' => escaped.push(character),
+            hidden if crate::text::is_hidden(hidden) => {
+                let _ = write!(
+                    escaped,
+                    "<span class=\"ctl\">\\u{{{:x}}}</span>",
+                    u32::from(hidden)
+                );
+            }
             _ => escaped.push(character),
         }
     }
     escaped
 }
 
-/// Drops terminal colour sequences from captured output.
+/// Drops terminal escape sequences (ECMA-48 CSI, OSC and other string
+/// controls, and two-character escapes) from captured output.
 pub fn strip_ansi(text: &str) -> String {
     let mut plain = String::with_capacity(text.len());
-    let mut characters = text.chars();
+    let mut characters = text.chars().peekable();
     while let Some(character) = characters.next() {
-        if character == '\x1b' {
-            for code in characters.by_ref() {
-                if code.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            plain.push(character);
+        match character {
+            '\x1b' => match characters.next() {
+                Some('[') => skip_csi(&mut characters),
+                Some(']' | 'P' | 'X' | '^' | '_') => skip_string(&mut characters),
+                _ => {}
+            },
+            '\u{9b}' => skip_csi(&mut characters),
+            '\u{9d}' | '\u{90}' | '\u{98}' | '\u{9e}' | '\u{9f}' => skip_string(&mut characters),
+            _ => plain.push(character),
         }
     }
     plain
+}
+
+/// Skips a CSI sequence's parameter and intermediate bytes and its final byte.
+fn skip_csi(characters: &mut impl Iterator<Item = char>) {
+    for code in characters {
+        if ('\u{40}'..='\u{7e}').contains(&code) || !('\u{20}'..='\u{7e}').contains(&code) {
+            break;
+        }
+    }
+}
+
+/// Skips a control string up to its terminator: BEL, ST (`ESC \\`) or C1 ST.
+fn skip_string(characters: &mut std::iter::Peekable<impl Iterator<Item = char>>) {
+    while let Some(code) = characters.next() {
+        match code {
+            '\u{7}' | '\u{9c}' => break,
+            '\x1b' => {
+                if characters.peek() == Some(&'\\') {
+                    characters.next();
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// `seconds` since the epoch as `YYYY-MM-DD HH:MM UTC`.
@@ -443,6 +494,7 @@ p{margin:10px 0 0}
 pre.code{margin:12px 0 0;padding:12px 14px;background:color-mix(in srgb,var(--fg) 6%,transparent);
   white-space:pre-wrap;word-break:break-all;font:inherit;font-size:13px}
 code{font:inherit}
+.ctl{color:var(--red);font-weight:700}
 table{width:100%;border-collapse:collapse}
 th,td{text-align:left;padding:6px 0;border-bottom:1px solid color-mix(in srgb,var(--fg) 8%,transparent)}
 th{font-size:12px;letter-spacing:.12em;text-transform:uppercase;font-weight:700;color:color-mix(in srgb,var(--fg) 55%,transparent)}
@@ -464,6 +516,16 @@ footer{margin-top:28px;font-size:11px;letter-spacing:.12em;color:color-mix(in sr
 #[cfg(test)]
 mod tests {
     use super::{esc, page, strip_ansi, utc};
+    use crate::notify::Ran;
+
+    #[test]
+    fn hidden_characters_are_shown_and_every_escape_is_dropped() {
+        assert_eq!(esc("a\u{202e}b"), "a<span class=\"ctl\">\\u{202e}</span>b");
+        assert_eq!(
+            strip_ansi("x\x1b]52;c;eA==\x07y\x1b]0;t\x1b\\z\x1b[1;31mw\u{9b}2Jv"),
+            "xyzwv"
+        );
+    }
 
     #[test]
     fn reviewed_content_is_escaped() {
@@ -471,9 +533,24 @@ mod tests {
             esc(r#"<script>alert("x")</script> & 'y'"#),
             "&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt; &amp; &#39;y&#39;"
         );
-        let html = page("t", "<img src=x onerror=alert(1)>", "now", "1-2", "");
+        let html = page(
+            "t",
+            "<img src=x onerror=alert(1)>",
+            Ran::Nothing,
+            "now",
+            "1-2",
+            "",
+        );
         assert!(!html.contains("<img src=x"));
         assert!(html.contains("default-src 'none'"));
+        assert!(html.contains("Nothing from this source ran"));
+    }
+
+    #[test]
+    fn the_page_says_when_the_recipe_ran_to_fetch() {
+        let html = page("t", "d", Ran::RecipeToFetch, "now", "1-2", "");
+        assert!(html.contains("had passed review"));
+        assert!(!html.contains("Nothing from this source ran"));
     }
 
     #[test]

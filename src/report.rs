@@ -14,6 +14,7 @@ use crate::error::Error;
 use crate::osv::Audit;
 use crate::rules::{RuleId, Scheme};
 use crate::scan::{FileKind, Snapshot};
+use crate::text::shown;
 
 pub mod html;
 
@@ -64,6 +65,16 @@ pub enum Gap {
     UnresolvedLfs(String),
     SensitiveWithheld(String),
     AgentInputTooLarge,
+    /// An install or build entry point larger than one AI request.
+    EntryPointTooLarge(String),
+    /// A script, build or config file (or an executable file of unknown
+    /// format) that holds binary data.
+    Undecodable(String),
+    /// The tree passed a whole-tree limit (see `scan::Limits`).
+    TreeTooLarge {
+        files: usize,
+        bytes: u64,
+    },
     NoReviewableFiles,
     Agent(Error),
     Dependency(String),
@@ -91,9 +102,25 @@ impl fmt::Display for Gap {
                 f,
                 "{path}: withheld from the AI provider because it looks sensitive"
             ),
+            Self::Undecodable(path) => write!(
+                f,
+                "{path}: a script, build or config file holds binary data and cannot be reviewed"
+            ),
+            Self::TreeTooLarge { files, bytes } => write!(
+                f,
+                "source tree too large to review (stopped at {files} files, {} MiB; limits: {} files, {} MiB text, {} MiB hashed)",
+                bytes / (1024 * 1024),
+                crate::scan::Limits::DEFAULT.files,
+                crate::scan::Limits::DEFAULT.text_bytes / (1024 * 1024),
+                crate::scan::Limits::DEFAULT.hashed_bytes / (1024 * 1024)
+            ),
             Self::AgentInputTooLarge => {
                 f.write_str("source exceeds the AI review input limit (max_input_kib × max_chunks)")
             }
+            Self::EntryPointTooLarge(path) => write!(
+                f,
+                "{path}: an install or build entry point is larger than one AI request (max_input_kib); it cannot be reviewed in pieces"
+            ),
             Self::NoReviewableFiles => {
                 f.write_str("no readable text source files were available for review")
             }
@@ -181,6 +208,10 @@ pub struct Report {
     pub snapshot: Snapshot,
     pub gaps: Vec<Gap>,
     pub text_files_reviewed: usize,
+    /// Text files decoded with replacement characters (a legacy encoding).
+    pub lossy_files: usize,
+    /// Files hashed but not read, named to the AI.
+    pub hash_only: Vec<crate::engine::plan::HashOnly>,
     pub findings: Vec<LocalFinding>,
     pub network: Vec<NetworkRequest>,
     pub agent_input: Vec<SourceFile>,
@@ -332,7 +363,8 @@ impl Report {
             Decision::Blocked(Blocked::AiUnavailable)
         } else if tally.blocked {
             Decision::Blocked(Blocked::Findings)
-        } else if tally.warned {
+        } else if tally.warned || !self.snapshot.skipped().is_empty() {
+            // A skipped directory's marker is easy to fake: never CLEAR.
             Decision::Warned
         } else if self.text_files_reviewed == 0 && self.agent_runs.is_empty() {
             Decision::Limited
@@ -377,18 +409,18 @@ impl Report {
     pub fn print(&self, show_hashes: bool, decision: Decision) {
         let painter = Painter::for_stdout();
 
-        outln!("Omarchy Guardian  ·  {}", self.subject);
+        outln!("Omarchy Guardian  ·  {}", shown(&self.subject));
         self.print_headline(decision, painter);
         self.print_coverage(show_hashes, painter);
         for note in &self.notes {
-            outln!("Review memory: {note}");
+            outln!("Review memory: {}", shown(note));
         }
         self.print_inventory();
         self.print_agent_summary(painter);
         self.print_findings(decision, painter);
 
         for gap in &self.gaps {
-            crate::output::stderr_line(format_args!("  ! {gap}"));
+            crate::output::stderr_line(format_args!("  ! {}", shown(&gap.to_string())));
         }
         outln!("\n{}", recommendation(decision));
         html::collect(self, decision);
@@ -458,12 +490,28 @@ impl Report {
     }
 
     fn print_coverage(&self, show_hashes: bool, painter: Painter) {
+        let lossy = if self.lossy_files > 0 {
+            format!(
+                " ({} decoded with replacement characters)",
+                self.lossy_files
+            )
+        } else {
+            String::new()
+        };
         outln!(
-            "Coverage: {} text file(s) reviewed · {} binary file(s) hashed only · {} oversized text file(s) skipped",
+            "Coverage: {} text file(s) reviewed{lossy} · {} binary file(s) hashed only · {} oversized text file(s) skipped",
             self.text_files_reviewed,
             self.snapshot.count(FileKind::Binary),
             self.oversized_count()
         );
+
+        for skipped in self.snapshot.skipped() {
+            outln!(
+                "Not reviewed: {}/ ({} entries, generated); rerun with --thorough to include it",
+                shown(&skipped.path),
+                skipped.files
+            );
+        }
 
         let files = self.snapshot.files();
         if !files.is_empty() {
@@ -479,8 +527,9 @@ impl Report {
                         FileKind::Text => "reviewed-text",
                         FileKind::Symlink => "symlink",
                         FileKind::Binary | FileKind::OversizedText => "hash-only",
+                        FileKind::Undecodable => "undecodable",
                     };
-                    outln!("  {}  {kind}  {}", file.sha256, file.path);
+                    outln!("  {}  {kind}  {}", file.sha256, shown(&file.path));
                 }
             }
         }
@@ -502,10 +551,10 @@ impl Report {
             for endpoint in endpoints.iter().take(20) {
                 outln!(
                     "  {}:{} → {}://{}",
-                    endpoint.path,
+                    shown(&endpoint.path),
                     endpoint.line,
                     endpoint.scheme.as_str(),
-                    endpoint.host
+                    shown(&endpoint.host)
                 );
             }
             if endpoints.len() > 20 {
@@ -556,14 +605,15 @@ impl Report {
                         painter.paint(review.status.label(), color),
                         run.label,
                         self.profile,
-                        review.summary
+                        shown(&review.summary)
                     );
                 }
                 AgentOutcome::Unavailable(error) => outln!(
-                    "AI review: {} · {}{context} · profile {} — {error}",
+                    "AI review: {} · {}{context} · profile {} — {}",
                     painter.paint("UNAVAILABLE", "33;1"),
                     run.label,
-                    self.profile
+                    self.profile,
+                    shown(&error.to_string())
                 ),
             }
         }
@@ -581,13 +631,13 @@ impl Report {
                 outln!(
                     "  [{}] {}:{} — {}",
                     painter.paint(severity.label(), severity.color()),
-                    finding.path,
+                    shown(&finding.path),
                     finding.line,
                     finding.rule.name()
                 );
                 outln!("       {}", finding.rule.description());
                 if !finding.excerpt.is_empty() {
-                    outln!("       {}", finding.excerpt);
+                    outln!("       {}", shown(&finding.excerpt));
                 }
             }
         }
@@ -609,10 +659,10 @@ impl Report {
                 outln!(
                     "  [{}] {}{line} — {}",
                     painter.paint(finding.severity.label(), finding.severity.color()),
-                    finding.file,
-                    finding.title
+                    shown(&finding.file),
+                    shown(&finding.title)
                 );
-                outln!("       {}", finding.reason);
+                outln!("       {}", shown(&finding.reason));
             }
         }
 
@@ -629,13 +679,13 @@ impl Report {
                 outln!(
                     "  [{}] {}@{} — {} ({})",
                     painter.paint(label, color),
-                    advisory.package,
-                    advisory.version,
-                    advisory.id,
-                    advisory.lockfile
+                    shown(&advisory.package),
+                    shown(&advisory.version),
+                    shown(&advisory.id),
+                    shown(&advisory.lockfile)
                 );
                 if let Some(summary) = &advisory.summary {
-                    outln!("       {summary}");
+                    outln!("       {}", shown(summary));
                 }
             }
             if audit.truncated {

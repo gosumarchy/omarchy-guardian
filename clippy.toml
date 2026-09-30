@@ -2,3 +2,9 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 doc-valid-idents = ["OpenCode", "KiB", "MiB", ".."]
+disallowed-macros = [
+    { path = "std::print", reason = "use out!: it tolerates a closed pipe and shows control sequences as codes" },
+    { path = "std::println", reason = "use outln!: it tolerates a closed pipe and shows control sequences as codes" },
+    { path = "std::eprint", reason = "use output::stderr: it shows control sequences as codes" },
+    { path = "std::eprintln", reason = "use errln!: it shows control sequences as codes" },
+]

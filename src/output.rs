@@ -1,10 +1,16 @@
-//! Standard output that tolerates a reader going away.
+//! Standard output that tolerates a reader going away and never passes a
+//! terminal control sequence from reviewed text.
 //!
 //! `print!` panics once stdout is a closed pipe, as under
 //! `omarchy-guardian scan x | head`. These macros drop the rest of the output
 //! instead, so the run finishes normally: cleanup still happens and the exit
 //! status still reports the review. Any other write error is reported once on
 //! stderr and the output is dropped the same way.
+//!
+//! Everything goes through `text::terminal_safe`: a file name or AI summary
+//! that holds an escape sequence is shown as codes, not run by the terminal.
+//! Clippy's `disallowed-macros` keeps the standard print macros out of the
+//! rest of the code.
 
 use std::fmt;
 use std::io::{self, ErrorKind, Write};
@@ -38,8 +44,30 @@ pub fn captured() -> String {
 
 /// Like `eprintln!`, and kept with the captured output.
 pub fn stderr_line(args: fmt::Arguments) {
-    eprintln!("{args}");
-    capture(format_args!("{args}\n"));
+    let line = format!("{args}\n");
+    let safe = crate::text::terminal_safe(&line);
+    // A failed write to stderr has nowhere to be reported.
+    let _ = io::stderr().lock().write_all(safe.as_bytes());
+    capture(format_args!("{safe}"));
+}
+
+/// Like `eprint!`, with terminal control sequences shown as codes.
+pub fn stderr(args: fmt::Arguments) {
+    let text = args.to_string();
+    // A failed write to stderr has nowhere to be reported.
+    let _ = io::stderr()
+        .lock()
+        .write_all(crate::text::terminal_safe(&text).as_bytes());
+}
+
+/// Like `eprintln!`, with terminal control sequences shown as codes.
+macro_rules! errln {
+    () => {
+        $crate::output::stderr(format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::output::stderr(format_args!("{}\n", format_args!($($arg)*)))
+    };
 }
 
 /// Like `print!`, but a closed stdout is not an error.
@@ -60,11 +88,15 @@ macro_rules! outln {
 }
 
 pub fn stdout(args: fmt::Arguments) {
-    capture(args);
-    if let Err(error) = write_ignoring_broken_pipe(&mut io::stdout().lock(), args)
+    let text = args.to_string();
+    let safe = crate::text::terminal_safe(&text);
+    capture(format_args!("{safe}"));
+    if let Err(error) = write_ignoring_broken_pipe(&mut io::stdout().lock(), format_args!("{safe}"))
         && !WARNED.swap(true, Ordering::Relaxed)
     {
-        eprintln!("omarchy-guardian: could not write to stdout: {error}");
+        stderr(format_args!(
+            "omarchy-guardian: could not write to stdout: {error}\n"
+        ));
     }
 }
 

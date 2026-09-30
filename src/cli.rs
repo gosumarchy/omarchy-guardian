@@ -169,14 +169,14 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
     let invocation = match parse(&args) {
         Ok(invocation) => invocation,
         Err(message) => {
-            eprintln!("omarchy-guardian: {message}\n\n{USAGE}");
+            errln!("omarchy-guardian: {message}\n\n{USAGE}");
             return ExitCode::from(USAGE_ERROR);
         }
     };
 
     let settings = Settings::load();
     for warning in settings.warnings() {
-        eprintln!("omarchy-guardian: {warning}");
+        errln!("omarchy-guardian: {warning}");
     }
 
     match invocation {
@@ -204,7 +204,7 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 Err(reason) => {
-                    eprintln!("omarchy-guardian: {reason}");
+                    errln!("omarchy-guardian: {reason}");
                     ExitCode::from(2)
                 }
             }
@@ -214,7 +214,7 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
         Invocation::Setup => match setup::run(&mut setup::TtyTerminal, &setup::RealEnvironment) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {
-                eprintln!("omarchy-guardian setup: {message}");
+                errln!("omarchy-guardian setup: {message}");
                 ExitCode::from(2)
             }
         },
@@ -228,7 +228,7 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(message) => {
-                eprintln!("omarchy-guardian protect: {message}");
+                errln!("omarchy-guardian protect: {message}");
                 ExitCode::from(2)
             }
         },
@@ -244,13 +244,13 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
         }
         Invocation::Status(mode) => status_command(mode),
         Invocation::Ask(target) => {
-            eprintln!("omarchy-guardian ask: {}", ask::run(&target, &settings));
+            errln!("omarchy-guardian ask: {}", ask::run(&target, &settings));
             ExitCode::from(2)
         }
         Invocation::Tui { expert } => match tui::run(expert) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {
-                eprintln!("omarchy-guardian tui: {message}");
+                errln!("omarchy-guardian tui: {message}");
                 ExitCode::from(2)
             }
         },
@@ -302,7 +302,7 @@ pub(crate) fn review_and_decide(
         && policy.confirm
         && policy.ai == AiRequirement::Off
     {
-        eprintln!(
+        errln!(
             "Local checks: {} text file(s), no blocking findings.",
             report.text_files_reviewed
         );
@@ -343,23 +343,27 @@ fn guard_command(
     if !decision.allows_running() {
         match decision {
             Decision::Blocked(Blocked::NotConfirmed) => {
-                eprintln!("Guardian did not start the command: not confirmed.");
+                errln!("Guardian did not start the command: not confirmed.");
             }
             Decision::Blocked(blocked) => {
-                eprintln!("Guardian blocked the command because the review did not allow it.");
-                notify::blocked(&target.subject(), notify::reason(blocked));
+                errln!("Guardian blocked the command because the review did not allow it.");
+                notify::blocked(
+                    &target.subject(),
+                    notify::reason(blocked),
+                    notify::Ran::Nothing,
+                );
             }
-            _ => eprintln!("Guardian blocked the command because the review did not allow it."),
+            _ => errln!("Guardian blocked the command because the review did not allow it."),
         }
         return decision.exit_code();
     }
     if let Err(error) = scan::verify_unchanged(&target.config, &report.snapshot) {
-        eprintln!("Guardian blocked the command because {error}.");
-        notify::blocked(&target.subject(), &format!("{error}"));
+        errln!("Guardian blocked the command because {error}.");
+        notify::blocked(&target.subject(), &format!("{error}"), notify::Ran::Nothing);
         return ExitCode::from(2);
     }
 
-    eprintln!(
+    errln!(
         "Guardian: review {}; starting {}",
         if decision == Decision::Warned {
             "passed with warnings"
@@ -383,7 +387,7 @@ pub(crate) fn exec_command(command: &[OsString]) -> ExitCode {
     drop(io::stdout().flush());
 
     let error = Command::new(program).args(arguments).exec();
-    eprintln!(
+    errln!(
         "Could not start guarded command {}: {error}",
         program.to_string_lossy()
     );
@@ -402,18 +406,16 @@ fn sandbox_command(
 
     if !decision.allows_running() {
         if decision == Decision::Blocked(Blocked::NotConfirmed) {
-            eprintln!("Guardian did not start the sandbox command: not confirmed.");
+            errln!("Guardian did not start the sandbox command: not confirmed.");
         } else {
-            eprintln!(
-                "Guardian did not run the sandbox command because the review did not allow it."
-            );
+            errln!("Guardian did not run the sandbox command because the review did not allow it.");
         }
         return decision.exit_code();
     }
     match sandbox::run(&target.config, &report.snapshot, command) {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("Guardian blocked the sandbox run because {error}.");
+            errln!("Guardian blocked the sandbox run because {error}.");
             ExitCode::from(2)
         }
     }
@@ -435,7 +437,7 @@ fn status_command(mode: StatusMode) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("omarchy-guardian status: {message}");
+            errln!("omarchy-guardian status: {message}");
             ExitCode::from(2)
         }
     }
@@ -447,13 +449,21 @@ fn pacman_hook_command(hook: &HookArgs, settings: &Settings) -> ExitCode {
             let decision = report.decide(&|class| settings.policy(class));
             report.print(false, decision);
             if let Decision::Blocked(blocked) = decision {
-                notify::blocked("a pacman transaction", notify::reason(blocked));
+                notify::blocked(
+                    "a pacman transaction",
+                    notify::reason(blocked),
+                    notify::Ran::Nothing,
+                );
             }
             decision.exit_code()
         }
         Err(error) => {
-            eprintln!("Guardian blocked the pacman transaction: {error}");
-            notify::blocked("a pacman transaction", &error.to_string());
+            errln!("Guardian blocked the pacman transaction: {error}");
+            notify::blocked(
+                "a pacman transaction",
+                &error.to_string(),
+                notify::Ran::Nothing,
+            );
             ExitCode::from(2)
         }
     }
@@ -508,7 +518,7 @@ fn parse_forget(args: &[OsString]) -> Result<Forget, String> {
 /// identity).
 fn forget_command(forget: &Forget, root: Option<PathBuf>) -> ExitCode {
     let Some(root) = root else {
-        eprintln!("omarchy-guardian: no state directory (set HOME or XDG_STATE_HOME)");
+        errln!("omarchy-guardian: no state directory (set HOME or XDG_STATE_HOME)");
         return ExitCode::from(2);
     };
     if !root.is_dir() {
@@ -518,7 +528,7 @@ fn forget_command(forget: &Forget, root: Option<PathBuf>) -> ExitCode {
     let store = match Store::open(root) {
         Ok(store) => store,
         Err(reason) => {
-            eprintln!("omarchy-guardian: {reason}");
+            errln!("omarchy-guardian: {reason}");
             return ExitCode::from(2);
         }
     };
@@ -528,7 +538,7 @@ fn forget_command(forget: &Forget, root: Option<PathBuf>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("omarchy-guardian: {error}");
+            errln!("omarchy-guardian: {error}");
             ExitCode::from(2)
         }
     }

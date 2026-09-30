@@ -332,7 +332,18 @@ SOURCE
 
 yay_gate() {
     printf '=== yay makepkg gate ===\n'
-    printf '#!/bin/sh\nprintf "makepkg %%s\\n" "$*" >>"$MOCK_LOG"\nexit 0\n' >"$HOME/mockbin/makepkg"
+    # The gate runs makepkg itself to read the source list and to extract
+    # the sources (from a hidden copy of the recipe): those go to the real
+    # makepkg; only the build call the gate starts is recorded.
+    cp /usr/bin/makepkg "$HOME/mockbin/makepkg.real"
+    cat >"$HOME/mockbin/makepkg" <<MOCK
+#!/bin/sh
+case " \$* " in
+*" --printsrcinfo "* | *" --nobuild "*) exec "$HOME/mockbin/makepkg.real" "\$@" ;;
+esac
+printf 'makepkg %s\\n' "\$*" >>"\$MOCK_LOG"
+exit 0
+MOCK
     chmod +x "$HOME/mockbin/makepkg"
 
     mkdir -p "$E2E/empty"
@@ -347,12 +358,13 @@ yay_gate() {
     make_pkgbuild 'make'
     run_shim "$E2E/build" --noconfirm --stats >/dev/null
     expect 'clean PKGBUILD is allowed' 0 "$?"
-    expect_mock_run 'makepkg ran with the original arguments' 'makepkg --noconfirm --stats'
+    # --holdver: the build uses exactly the sources fetched for the review.
+    expect_mock_run 'makepkg ran with the original arguments' 'makepkg --noconfirm --stats --holdver'
 
     # A later pass (yay's build call) finds upstream sources extracted into
     # src/: they are reviewed before makepkg runs any PKGBUILD function.
     mkdir -p "$E2E/build/src/upstream"
-    printf '#!/bin/sh\nmake\n' >"$E2E/build/src/upstream/build.sh"
+    printf '#!/bin/sh\nprintf "hello\\n" >hello.txt\n' >"$E2E/build/src/upstream/build.sh"
     run_shim "$E2E/build" --noconfirm --noextract >"$E2E/upstream.log"
     expect 'clean upstream sources are allowed' 0 "$?"
     grep -q '^Upstream: ' "$E2E/upstream.log"
@@ -458,7 +470,7 @@ engine_gate() {
 
     run_shim "$dir" --noconfirm >"$output" 2>&1
     expect 'first engine review is clear' 0 "$?"
-    expect_mock_run 'makepkg ran after the first review' 'makepkg --noconfirm'
+    expect_mock_run 'makepkg ran after the first review' 'makepkg --noconfirm --holdver'
 
     # The first clear review became the approved baseline; an unchanged tree
     # is sent as the same first-review request, so the second run (like
@@ -466,13 +478,13 @@ engine_gate() {
     run_shim "$dir" --noconfirm >"$output" 2>&1
     expect 'an unchanged rerun is clear' 0 "$?"
     expect_output 'an unchanged rerun comes from the cache' 'from cache' "$output"
-    expect_mock_run 'makepkg ran after the cached review' 'makepkg --noconfirm'
+    expect_mock_run 'makepkg ran after the cached review' 'makepkg --noconfirm --holdver'
 
     sed -i 's/return 30;/return 31;/' "$dir/helpers.c"
     run_shim "$dir" --noconfirm >"$output" 2>&1
     expect 'an upgraded build is clear' 0 "$?"
     expect_output 'an upgraded build is reviewed as a diff' '1 file(s) sent as diffs' "$output"
-    expect_mock_run 'makepkg ran after the diff review' 'makepkg --noconfirm'
+    expect_mock_run 'makepkg ran after the diff review' 'makepkg --noconfirm --holdver'
 
     write_user_config $'[agent]\nmax_input_kib = 16\nmax_chunks = 1\n'
     rm -rf -- "$E2E/engine-large"

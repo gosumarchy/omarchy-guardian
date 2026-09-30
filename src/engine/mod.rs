@@ -21,7 +21,7 @@ use crate::agent::{self, AgentError, AgentReview, SourceFile};
 use crate::config::Settings;
 use crate::config::model::{AgentSettings, AiRequirement, SourceClass, Toggle};
 use crate::engine::baseline::Unit;
-use crate::engine::plan::{ManifestEntry, Plan, PlanInput, Previous, Sent};
+use crate::engine::plan::{HashOnly, ManifestEntry, Plan, PlanInput, Previous, Sent};
 use crate::engine::request::Request;
 use crate::engine::store::Store;
 use crate::error::Error;
@@ -98,6 +98,8 @@ pub struct Group<'a> {
     pub units: &'a [Unit],
     /// Trusted facts for every request (see `Request::context`).
     pub context: &'a [String],
+    /// Files hashed but not read, named in every request's manifest.
+    pub hash_only: &'a [HashOnly],
 }
 
 /// What reviewing one group produced.
@@ -109,6 +111,8 @@ pub struct GroupReview {
     pub invalid: Option<Error>,
     /// The plan needed more than `max_chunks` requests; nothing was sent.
     pub too_large: bool,
+    /// An entry point larger than one request; nothing was sent.
+    pub entry_point_too_large: Option<String>,
     /// Lines for the report: the upgrade summary and memory problems.
     pub notes: Vec<String>,
 }
@@ -142,6 +146,7 @@ pub fn review_group(
         max_input_bytes: group.settings.max_input_bytes,
         max_chunks: group.settings.max_chunks,
         unit_prefixes: &unit_prefixes,
+        hash_only: group.hash_only,
     };
     // A tree identical to its approved version may have been approved by a
     // first review (a first install, or yay's second makepkg pass over it):
@@ -170,21 +175,26 @@ pub fn review_group(
         // limit; a full review may still fit, so retry once without them
         // before giving up (a diff-mode review must never be less complete
         // than a full one would be).
-        Err(_) if previous.is_some() => {
-            let Ok(plan) = plan::build(&PlanInput {
+        Err(too_large) if previous.is_some() && too_large.entry_point.is_none() => {
+            let plan = match plan::build(&PlanInput {
                 previous: None,
                 ..input
-            }) else {
-                review.too_large = true;
-                return review;
+            }) {
+                Ok(plan) => plan,
+                Err(too_large) => {
+                    review.too_large = true;
+                    review.entry_point_too_large = too_large.entry_point;
+                    return review;
+                }
             };
             review.notes.push(
                 "the diff-mode plan needed too many chunks; reviewing in full instead".to_string(),
             );
             plan
         }
-        Err(_) => {
+        Err(too_large) => {
             review.too_large = true;
+            review.entry_point_too_large = too_large.entry_point;
             return review;
         }
     };
@@ -360,11 +370,14 @@ impl Runner<'_> {
                 }
                 Ok(binary) => {
                     let settings = self.group.settings;
-                    let probe = review_with_retry(&binary, &requests[first], settings);
+                    let isolated = matches!(self.opencode, OpenCode::SystemOnly);
+                    let probe = review_with_retry(&binary, &requests[first], settings, isolated);
                     let proceed = probe.0.is_ok();
                     results[first] = Some(probe);
                     if proceed {
-                        for (index, result) in review_parallel(&binary, requests, rest, settings) {
+                        for (index, result) in
+                            review_parallel(&binary, requests, rest, settings, isolated)
+                        {
                             results[index] = Some(result);
                         }
                     }
@@ -468,8 +481,20 @@ fn not_attempted(reason: &str) -> AgentOutcome {
 /// One review, retried once after a short pause when the AI was unavailable
 /// for a reason a retry can fix: not a timeout, which would double a long
 /// wait, and not a reviewer that could not be started.
-fn review_with_retry(binary: &Path, request: &Request, settings: &AgentSettings) -> Live {
-    let review = || agent::review(binary, &|nonce: &str| request.render(nonce), settings);
+fn review_with_retry(
+    binary: &Path,
+    request: &Request,
+    settings: &AgentSettings,
+    isolated: bool,
+) -> Live {
+    let review = || {
+        agent::review(
+            binary,
+            &|nonce: &str| request.render(nonce),
+            settings,
+            isolated,
+        )
+    };
     match review() {
         Err(AgentError::Unavailable(error)) if is_retryable(&error) => {
             thread::sleep(RETRY_DELAY);
@@ -495,6 +520,7 @@ fn review_parallel(
     requests: &[Request],
     indexes: &[usize],
     settings: &AgentSettings,
+    isolated: bool,
 ) -> Vec<(usize, Live)> {
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
@@ -506,7 +532,7 @@ fn review_parallel(
                     let Some(&index) = indexes.get(next.fetch_add(1, Ordering::SeqCst)) else {
                         break;
                     };
-                    let live = review_with_retry(binary, &requests[index], settings);
+                    let live = review_with_retry(binary, &requests[index], settings, isolated);
                     if live.0.is_err() {
                         stop.store(true, Ordering::SeqCst);
                     }
@@ -607,6 +633,7 @@ mod tests {
             findings: &[],
             units: &[],
             context: &[],
+            hash_only: &[],
         }
     }
 

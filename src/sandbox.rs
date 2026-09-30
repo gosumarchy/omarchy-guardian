@@ -113,7 +113,7 @@ pub fn run(
     if status.success() {
         outln!("Sandbox run completed with exit code 0.");
     } else {
-        eprintln!("Sandbox command exited with {status}.");
+        errln!("Sandbox command exited with {status}.");
     }
     Ok(tools::exit_code_of(status))
 }

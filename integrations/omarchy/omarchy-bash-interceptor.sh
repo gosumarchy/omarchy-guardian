@@ -1,13 +1,23 @@
 # Sourced from the user's interactive Bash rc by the Guardian installer.
+# Help only before `--`, as omarchy itself decides: `omarchy theme install
+# URL -- -h` installs, so it must not pass through unreviewed.
 _omarchy_guardian_help_requested() {
     local arg
     for arg in "$@"; do
+        [[ $arg == -- ]] && return 1
         [[ $arg == --help || $arg == -h ]] && return 0
     done
     return 1
 }
 
 omarchy() {
+    # omarchy's dispatcher also accepts `omarchy theme-install URL` and the
+    # like: route them the same way.
+    case ${1-} in
+        theme-install | theme-update | plugin-add | plugin-install | plugin-update)
+            set -- "${1%%-*}" "${1#*-}" "${@:2}"
+            ;;
+    esac
     if [[ ${1-} == theme && ${2-} == install ]]; then
         if _omarchy_guardian_help_requested "$@"; then
             command /usr/share/omarchy/bin/omarchy "$@"

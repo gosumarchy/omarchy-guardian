@@ -9,6 +9,7 @@
 //! inline tables well enough to find where a value ends, and fails on anything
 //! it cannot delimit rather than guessing.
 
+use std::cell::Cell;
 use std::fmt;
 
 /// One `key = value` line.
@@ -61,6 +62,7 @@ pub fn entries(text: &str) -> Result<Vec<Entry>, ParseError> {
     let mut reader = Reader {
         bytes: text.as_bytes(),
         position: 0,
+        counted: Cell::new((0, 1)),
     };
     let mut entries = Vec::new();
     let mut table = Vec::new();
@@ -294,15 +296,23 @@ fn decode_literal(bytes: &[u8]) -> Option<(String, usize)> {
 struct Reader<'a> {
     bytes: &'a [u8],
     position: usize,
+    /// The last position a line was counted for, and its line: counting
+    /// on from there keeps a file of many entries linear.
+    counted: Cell<(usize, usize)>,
 }
 
 impl Reader<'_> {
     /// 1-based line of the current position.
     fn line(&self) -> usize {
-        // Splitting on newlines yields one piece per line up to the position.
-        self.bytes[..self.position.min(self.bytes.len())]
-            .split(|byte| *byte == b'\n')
-            .count()
+        let end = self.position.min(self.bytes.len());
+        let (mut from, mut line) = self.counted.get();
+        if from > end {
+            (from, line) = (0, 1);
+        }
+        // Splitting on newlines yields one more piece than there are newlines.
+        line += self.bytes[from..end].split(|byte| *byte == b'\n').count() - 1;
+        self.counted.set((end, line));
+        line
     }
 
     fn error(&self, message: &'static str) -> ParseError {

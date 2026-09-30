@@ -5,15 +5,16 @@
 
 use std::env;
 use std::ffi::OsString;
-use std::fs::{self, DirBuilder, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write as _;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::output;
 use crate::report::{Blocked, html};
+use crate::text;
 use crate::tools::{self, Limits};
 
 const NOTIFY_SEND: &str = "/usr/bin/notify-send";
@@ -32,9 +33,18 @@ const QUIET: &str = "OMARCHY_GUARDIAN_NO_NOTIFY";
 /// notify-send, `$2` icon, `$3` title, `$4` body, `$5` launcher, `$6` the
 /// report's file URL.
 const ON_CLICK: &str = r#"action=$(timeout 1d "$1" --app-name="Omarchy Guardian" --urgency=critical \
-    --icon="$2" --action=default="Open the report" "$3" "$4") || exit 0
+    --icon="$2" --action=default="Open the report" -- "$3" "$4") || exit 0
 [ "$action" = default ] || exit 0
 exec "$5" "$6""#;
+
+/// What of the blocked source had run when the gate stopped it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ran {
+    /// Nothing: the block came before any of it ran.
+    Nothing,
+    /// makepkg had run the reviewed recipe to fetch and unpack the sources.
+    RecipeToFetch,
+}
 
 /// Why a gate blocked, in a few words for the notification.
 pub const fn reason(blocked: Blocked) -> &'static str {
@@ -49,11 +59,12 @@ pub const fn reason(blocked: Blocked) -> &'static str {
 /// Shows "Guardian blocked `what`" with `detail`, best effort: nothing
 /// happens without `notify-send` or a session bus, and a failure is ignored,
 /// because the terminal already carries the full report.
-pub fn blocked(what: &str, detail: &str) {
+pub fn blocked(what: &str, detail: &str, ran: Ran) {
     if cfg!(test) || env::var_os(QUIET).is_some() || !Path::new(NOTIFY_SEND).is_file() {
         return;
     }
     let title = format!("Guardian blocked {what}");
+    let detail = &text::shown(detail);
     let icon = if Path::new(ALERT_ICON).is_file() {
         ALERT_ICON
     } else {
@@ -62,14 +73,16 @@ pub fn blocked(what: &str, detail: &str) {
     let env = session_env();
     let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
-    let report = save_report(&title, detail);
+    let report = crate::engine::store::effective_uid()
+        .ok()
+        .and_then(|uid| save_report(&title, detail, ran, uid));
     if let Some(report) = report.filter(|_| Path::new(LAUNCH_BROWSER).is_file()) {
         let body = format!("{detail}\nClick to open the full report.");
         let mut command = Command::new(SETSID);
         command
             .args(["-f", "/bin/sh", "-c", ON_CLICK, "sh", NOTIFY_SEND, icon])
-            .arg(&title)
-            .arg(&body)
+            .arg(pango(&title))
+            .arg(pango(&body))
             .arg(LAUNCH_BROWSER)
             .arg(format!("file://{}", report.display()))
             .stdin(Stdio::null())
@@ -85,16 +98,11 @@ pub fn blocked(what: &str, detail: &str) {
         }
     }
 
-    let args: Vec<OsString> = [
-        "--app-name=Omarchy Guardian".to_string(),
-        "--urgency=critical".to_string(),
-        format!("--icon={icon}"),
-        title,
-        format!("{detail}\nSee the terminal for the full report."),
-    ]
-    .into_iter()
-    .map(OsString::from)
-    .collect();
+    let args = notify_args(
+        &title,
+        &format!("{detail}\nSee the terminal for the full report."),
+        icon,
+    );
     drop(tools::run(
         Path::new(NOTIFY_SEND),
         &args,
@@ -107,15 +115,51 @@ pub fn blocked(what: &str, detail: &str) {
     ));
 }
 
+/// notify-send's arguments: the title and body after `--`, so neither can be
+/// read as an option, and escaped for the Pango markup notification daemons
+/// render.
+fn notify_args(title: &str, body: &str, icon: &str) -> Vec<OsString> {
+    [
+        "--app-name=Omarchy Guardian".to_string(),
+        "--urgency=critical".to_string(),
+        format!("--icon={icon}"),
+        "--".to_string(),
+        pango(title),
+        pango(body),
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect()
+}
+
+/// `text` for Pango markup, with hidden characters shown as codes and lines
+/// kept.
+fn pango(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text::shown_block(text).chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
 /// Writes what this run printed, and why it blocked, to a private file under
 /// `$XDG_CACHE_HOME/omarchy-guardian/reports`, keeping the newest few.
-fn save_report(title: &str, detail: &str) -> Option<PathBuf> {
+/// Root saves nothing: under `sudo -E` that directory is the user's, and
+/// root would leave files there the user cannot remove, so the terminal
+/// carries the report.
+fn save_report(title: &str, detail: &str, ran: Ran, uid: u32) -> Option<PathBuf> {
+    if uid == 0 {
+        return None;
+    }
     let directory = reports_dir()?;
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&directory)
-        .ok()?;
+    crate::engine::store::private_dir(&directory, uid).ok()?;
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
@@ -124,10 +168,10 @@ fn save_report(title: &str, detail: &str) -> Option<PathBuf> {
     // The page for people; the plain text for `omarchy-guardian ask`.
     let plain = format!("{title}: {detail}\n\n{}", html::strip_ansi(&captured));
     write_private(&directory.join(format!("{id}.txt")), &plain)?;
-    let page = html::page(title, detail, &html::utc(seconds), &id, &captured);
+    let page = html::page(title, detail, ran, &html::utc(seconds), &id, &captured);
     let path = directory.join(format!("{id}.html"));
     write_private(&path, &page)?;
-    prune(&directory);
+    prune(&directory, uid);
     Some(path)
 }
 
@@ -151,8 +195,9 @@ pub fn reports_dir() -> Option<PathBuf> {
 }
 
 /// Removes all but the newest `KEEP_REPORTS` reports, page and text alike
-/// (names start with the time, so they sort by age).
-fn prune(directory: &Path) {
+/// (names start with the time, so they sort by age). Only regular files
+/// owned by `uid` are removed; a symlink named like a report is left alone.
+fn prune(directory: &Path, uid: u32) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
     };
@@ -166,9 +211,16 @@ fn prune(directory: &Path) {
         .collect();
     pages.sort();
     let excess = pages.len().saturating_sub(KEEP_REPORTS);
+    let owned_file = |path: &Path| {
+        fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.file_type().is_file() && metadata.uid() == uid)
+    };
     for old in &pages[..excess] {
-        drop(fs::remove_file(old.with_extension("txt")));
-        drop(fs::remove_file(old));
+        for path in [old.with_extension("txt"), old.clone()] {
+            if owned_file(&path) {
+                drop(fs::remove_file(path));
+            }
+        }
     }
 }
 
@@ -222,7 +274,11 @@ fn real_uid(status: &str) -> Option<u32> {
 mod tests {
     use std::fs;
 
-    use super::{KEEP_REPORTS, prune, real_uid, reason};
+    use std::os::unix::fs::{MetadataExt, symlink};
+
+    use super::{
+        KEEP_REPORTS, ON_CLICK, Ran, notify_args, pango, prune, real_uid, reason, save_report,
+    };
     use crate::report::Blocked;
     use crate::test_support::TempDir;
 
@@ -247,7 +303,8 @@ mod tests {
             fs::write(dir.path().join(format!("{second:010}-1.txt")), "r").unwrap();
         }
         fs::write(dir.path().join("keep.log"), "other").unwrap();
-        prune(dir.path());
+        let uid = fs::metadata(dir.path()).unwrap().uid();
+        prune(dir.path(), uid);
         let mut left: Vec<String> = fs::read_dir(dir.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -257,5 +314,39 @@ mod tests {
         assert_eq!(left[0], "0000000003-1.html");
         assert_eq!(left[1], "0000000003-1.txt");
         assert!(left.contains(&"keep.log".to_string()));
+    }
+
+    #[test]
+    fn a_symlink_named_like_a_report_is_not_removed() {
+        let dir = TempDir::new("reports-link");
+        let target = TempDir::new("reports-target");
+        let victim = target.path().join("victim");
+        fs::write(&victim, "keep").unwrap();
+        symlink(&victim, dir.path().join("0000000000-1.html")).unwrap();
+        for second in 1..=KEEP_REPORTS + 1 {
+            fs::write(dir.path().join(format!("{second:010}-1.html")), "r").unwrap();
+        }
+        let uid = fs::metadata(dir.path()).unwrap().uid();
+        prune(dir.path(), uid);
+        assert!(dir.path().join("0000000000-1.html").is_symlink());
+        assert!(!dir.path().join("0000000001-1.html").exists());
+        assert!(victim.exists());
+    }
+
+    #[test]
+    fn root_saves_no_report() {
+        assert_eq!(save_report("t", "d", Ran::Nothing, 0), None);
+    }
+
+    #[test]
+    fn notification_text_is_never_an_option_or_markup() {
+        let args = notify_args("--version", "b", "i");
+        let position = args.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(args[position + 1], "--version");
+        assert_eq!(
+            pango("<b>x</b> & \x1b[1m\nnext"),
+            "&lt;b&gt;x&lt;/b&gt; &amp; \\u{1b}[1m\nnext"
+        );
+        assert!(ON_CLICK.contains(r#"-- "$3" "$4""#));
     }
 }

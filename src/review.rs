@@ -8,7 +8,9 @@ use crate::config::Settings;
 use crate::config::model::{AgentSettings, AiRequirement, Named, SourceClass};
 use crate::deps;
 use crate::engine::baseline::{Identity, Unit};
+use crate::engine::plan::HashOnly;
 use crate::engine::{self, Group, Memory};
+use crate::git_state;
 use crate::mask;
 use crate::osv;
 use crate::report::{AgentOutcome, Decision, Gap, LocalFinding, NetworkRequest, Report};
@@ -38,8 +40,31 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
     let mut report = collected_report(config.root.display().to_string(), context);
 
     let (snapshot, walk_gaps) = scan::walk(config, &mut |file: TextFile<'_>| {
+        if file.lossy {
+            report.lossy_files += 1;
+        }
         analyze_text(&mut report, file.rel, file.text, true);
     });
+    report.hash_only = snapshot
+        .files()
+        .iter()
+        .filter_map(|file| {
+            file.format.map(|format| HashOnly {
+                path: file.path.clone(),
+                bytes: file.bytes,
+                label: format.label(),
+                media: format.is_media(),
+                skipped_files: None,
+            })
+        })
+        .chain(snapshot.skipped().iter().map(|skipped| HashOnly {
+            path: skipped.path.clone(),
+            bytes: 0,
+            label: "generated directory, not reviewed",
+            media: false,
+            skipped_files: Some(skipped.files),
+        }))
+        .collect();
     report.snapshot = snapshot;
     report.gaps.extend(walk_gaps);
     if report.text_files_reviewed == 0 {
@@ -117,6 +142,18 @@ pub fn ai_off_classes(settings: &Settings, classes: &[SourceClass]) -> Vec<Sourc
 pub fn analyze_text(report: &mut Report, rel: &str, text: &str, inspect_dependencies: bool) {
     report.text_files_reviewed += 1;
 
+    if git_state::is_git_config(rel) {
+        for (line, excerpt) in git_state::executing_keys(text) {
+            report.findings.push(LocalFinding {
+                path: rel.to_string(),
+                line,
+                rule: RuleId::GitConfigCommand,
+                excerpt: excerpt.chars().take(EXCERPT_CHARS).collect(),
+            });
+        }
+        return;
+    }
+
     if text.lines().next() == Some(LFS_POINTER) {
         report.gaps.push(Gap::UnresolvedLfs(rel.to_string()));
     }
@@ -131,8 +168,9 @@ pub fn analyze_text(report: &mut Report, rel: &str, text: &str, inspect_dependen
             if inventory_network {
                 record_network(report, rel, number, line, &view.quiet);
             }
-            let code = view.code.to_lowercase();
-            let quiet = view.quiet.to_lowercase();
+            // Tabs as spaces, so `sudo<TAB>x` matches like `sudo x`.
+            let code = view.code.to_lowercase().replace('\t', " ");
+            let quiet = view.quiet.to_lowercase().replace('\t', " ");
             for rule in rules::line_rules(&code, &quiet) {
                 push_finding(report, rel, number, line, rule);
             }
@@ -270,10 +308,14 @@ pub fn run_agents(
             findings: &findings,
             units,
             context: &report.context,
+            hash_only: &report.hash_only,
         };
         let reviewed = engine::review_group(&group, opencode, memory);
         report.notes.extend(reviewed.notes);
-        if reviewed.too_large && !report.agent_input_overflowed {
+        if let Some(path) = reviewed.entry_point_too_large {
+            report.agent_input_overflowed = true;
+            report.gaps.push(Gap::EntryPointTooLarge(path));
+        } else if reviewed.too_large && !report.agent_input_overflowed {
             report.agent_input_overflowed = true;
             report.gaps.push(Gap::AgentInputTooLarge);
         }
@@ -410,6 +452,21 @@ mod tests {
         );
         assert!(report.findings.is_empty());
         assert_eq!(report.agent_input.len(), 1);
+    }
+
+    #[test]
+    fn a_git_config_is_checked_locally_and_never_sent() {
+        let mut report = Report::new("test");
+        analyze_text(
+            &mut report,
+            ".git/config",
+            "[remote \"origin\"]\n\turl = https://me:tok@h/r\n[core]\n\tfsmonitor = sh x\n",
+            true,
+        );
+        assert!(report.agent_input.is_empty());
+        assert!(report.gaps.is_empty());
+        assert_eq!(rules_in(&report), [RuleId::GitConfigCommand]);
+        assert_eq!(report.findings[0].line, 4);
     }
 
     #[test]
@@ -698,6 +755,35 @@ mod tests {
         assert_eq!(
             report.decide(&|class| settings.policy(class)),
             Decision::Blocked(Blocked::Incomplete)
+        );
+    }
+
+    #[test]
+    fn an_oversized_entry_point_is_a_named_gap() {
+        let dir = TempDir::new("big-entry-point");
+        let script = "echo installing the package now\n".repeat(1300);
+        fs::write(dir.path().join("guardian.install"), script).unwrap();
+        let system = PartialConfig {
+            agent: AgentDefaults {
+                max_input_kib: Some(16),
+                ..AgentDefaults::default()
+            },
+            ..PartialConfig::default()
+        };
+        let settings = Settings::from_parts(system, PartialConfig::default());
+
+        let report = review_tree(
+            &ScanConfig::new(dir.path()),
+            &context(&settings, SourceClass::Source, &unavailable()),
+        );
+
+        assert!(report.agent_runs.is_empty());
+        assert!(
+            report.gaps.iter().any(
+                |gap| matches!(gap, Gap::EntryPointTooLarge(path) if path == "guardian.install")
+            ),
+            "{:?}",
+            report.gaps
         );
     }
 

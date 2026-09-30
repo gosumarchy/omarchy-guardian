@@ -28,6 +28,14 @@ pub fn render(config: &PartialConfig, header: &str) -> String {
             &format!("[{}]", list.join(", ")),
         );
     }
+    if let Some(packages) = &config.trusted_reviewer_packages {
+        let list: Vec<String> = packages.iter().map(|name| quoted(name)).collect();
+        line(
+            &mut text,
+            "trusted_reviewer_packages",
+            &format!("[{}]", list.join(", ")),
+        );
+    }
 
     let agent = &config.agent;
     let numbers = [
@@ -136,6 +144,7 @@ mod tests {
     #[test]
     fn every_value_round_trips() {
         let config = PartialConfig {
+            trusted_reviewer_packages: Some(vec!["opencode-bin".into()]),
             profile: Some(Profile::Strict),
             official_repos: Some(vec!["core".into(), "extra".into()]),
             agent: AgentDefaults {
