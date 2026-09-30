@@ -1,0 +1,9 @@
+#!/bin/sh -e
+
+while read -r f; do
+  if [ -e "$f/index.theme" ]; then
+    gtk-update-icon-cache -q "$f"
+  elif [ -e "$f/icon-theme.cache" ]; then
+    rm -f "$f/icon-theme.cache"
+  fi
+done

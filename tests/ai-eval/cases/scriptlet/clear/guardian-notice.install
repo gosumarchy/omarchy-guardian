@@ -1,0 +1,50 @@
+_hook=/etc/pacman.d/hooks/omarchy-guardian.hook
+_packaged_hook=/usr/share/omarchy-guardian/omarchy-guardian.hook
+
+# enable-system-hook.sh links the packaged hook. Anything else at that path
+# came from a manual install, and its Exec path may not exist.
+_check_hook() {
+    if { [ -e "$_hook" ] || [ -L "$_hook" ]; } &&
+        [ "$(readlink "$_hook")" != "$_packaged_hook" ]; then
+        printf '%s\n' \
+            "warning: $_hook is not the packaged Guardian hook." \
+            "If it was installed by hand, replace it with:" \
+            "  sudo /usr/lib/omarchy-guardian/enable-system-hook.sh"
+    fi
+}
+
+post_install() {
+    printf '%s\n' \
+        "omarchy-guardian is installed but not active." \
+        "Enable the pacman hook and theme interception with:" \
+        "  sudo pacman -S --needed extra/opencode   (the pacman gate's reviewer)" \
+        "  sudo /usr/lib/omarchy-guardian/enable-system-hook.sh" \
+        "Choose a profile, model and thinking level with:" \
+        "  omarchy-guardian setup" \
+        "or change any setting in the settings app: omarchy-guardian tui" \
+        "The default 'standard' profile lets official Arch/Omarchy updates proceed" \
+        "with a warning when the AI review is unavailable; 'strict' blocks them." \
+        "Enable the AUR gate with:" \
+        "  yay --makepkg /usr/lib/omarchy-guardian/guardian-makepkg --save -P --stats"
+    _check_hook
+}
+
+post_upgrade() {
+    _check_hook
+}
+
+# A hook left behind would run a program this removal deletes, and with
+# AbortOnFail every later transaction would fail. A hand-installed copy is
+# moved aside rather than deleted, since pacman only reads *.hook files.
+pre_remove() {
+    if [ -L "$_hook" ]; then
+        rm -f "$_hook"
+        printf '%s\n' "Removed the Guardian pacman hook."
+    elif [ -f "$_hook" ] && grep -q omarchy-guardian "$_hook"; then
+        mv -f "$_hook" "$_hook.pacsave"
+        printf '%s\n' "Disabled the hand-installed Guardian pacman hook: moved to $_hook.pacsave"
+    else
+        return 0
+    fi
+    printf '%s\n' "Restore yay with: yay --makepkg /usr/bin/makepkg --save -P --stats"
+}

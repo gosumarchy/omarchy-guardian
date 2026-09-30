@@ -601,4 +601,21 @@ bash tests/e2e/integration-gates.sh
 
 It needs `bwrap` 0.9 or newer, `bsdtar`, `pacman`, `git`, `flock`, `curl` and a
 working `opencode`; it exits `77` when OpenCode cannot run, because every gate
-is fail-closed on a failed AI review.
+is fail-closed on a failed AI review. To review with the Claude Code CLI and
+your Claude login instead, set
+`GUARDIAN_E2E_MODEL=claude-code/claude-sonnet-5-5` (the pacman checks that need
+the AI are then skipped, because the pacman gate takes its model only from a
+root-owned system config).
+
+The AI review itself has an evaluation suite: install scriptlets, auto-run
+package files and AUR recipes that must come back clear, and attacks that must
+be caught. Run it after changing a prompt, a scope or the model:
+
+```sh
+cargo build --release
+RUNS=3 bash tests/ai-eval/run.sh          # or a filter: run.sh aur/block
+```
+
+Every run starts with an empty review memory, so no verdict comes from the
+cache. The pacman cases use the system config's model, the AUR cases the user
+config's.

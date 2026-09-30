@@ -1,0 +1,10 @@
+#!/bin/bash
+# Copies files from the configured inbox to the outbox every minute.
+set -euo pipefail
+config=/etc/exampled/exampled.toml
+[[ ${1:-} == --config ]] && config=$2
+inbox=$(sed -n 's/^inbox *= *"\(.*\)"/\1/p' "$config")
+outbox=$(sed -n 's/^outbox *= *"\(.*\)"/\1/p' "$config")
+while sleep 60; do
+    rsync -a -- "$inbox/" "$outbox/"
+done

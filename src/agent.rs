@@ -208,7 +208,8 @@ fn claude_review(
     let mut args: Vec<OsString> = [
         "--print",
         "--output-format",
-        "json",
+        "stream-json",
+        "--verbose",
         "--tools",
         "",
         "--strict-mcp-config",
@@ -260,8 +261,11 @@ const fn claude_effort(thinking: Thinking) -> Option<&'static str> {
     }
 }
 
-/// Classifies a Claude Code `--output-format json` result. More than one
-/// turn or any permission denial means the model tried to use a tool.
+/// Classifies a Claude Code `--output-format stream-json` transcript. A
+/// `tool_use` block in any assistant message, or a permission denial, means
+/// the model tried to use a tool. Extra turns alone do not: the CLI adds a
+/// synthetic turn to continue a reply its safety classifier interrupted, which
+/// happens when the model reasons about a credential-stealing payload.
 fn claude_verdict(
     output: &str,
     failure: Option<String>,
@@ -273,7 +277,12 @@ fn claude_verdict(
             detail,
         })
     };
-    let Ok(result) = Json::parse(output.trim()) else {
+    let events = Json::parse_stream(output).unwrap_or_default();
+    let Some(result) = events
+        .iter()
+        .rev()
+        .find(|event| event.get("type").and_then(Json::as_str) == Some("result"))
+    else {
         return Err(match failure {
             Some(detail) => unavailable(detail),
             None => {
@@ -281,12 +290,26 @@ fn claude_verdict(
             }
         });
     };
-    let turns = result.get("num_turns").and_then(Json::as_u64).unwrap_or(0);
+    let tool_use = events.iter().any(|event| {
+        event.get("type").and_then(Json::as_str) == Some("assistant")
+            && event
+                .get("message")
+                .and_then(|message| message.get("content"))
+                .and_then(Json::as_array)
+                .is_some_and(|content| {
+                    content.iter().any(|block| {
+                        block
+                            .get("type")
+                            .and_then(Json::as_str)
+                            .is_some_and(|kind| kind.ends_with("tool_use"))
+                    })
+                })
+    });
     let denials = result
         .get("permission_denials")
         .and_then(Json::as_array)
         .is_some_and(|denials| !denials.is_empty());
-    if turns > 1 || denials {
+    if tool_use || denials {
         return Err(AgentError::Invalid(Error::Refused(
             "the Claude Code CLI attempted to use a tool during source review".into(),
         )));
@@ -566,23 +589,43 @@ mod tests {
     };
     use crate::tools::Reviewer;
 
-    fn claude_result(turns: u64, denials: &str, is_error: bool, result: &str) -> String {
+    /// A stream-json transcript: `blocks` are the assistant's content blocks
+    /// before the result.
+    fn claude_result(blocks: &str, denials: &str, is_error: bool, result: &str) -> String {
         format!(
-            r#"{{"type":"result","subtype":"success","is_error":{is_error},"num_turns":{turns},"permission_denials":{denials},"result":{}}}"#,
+            "{{\"type\":\"system\",\"subtype\":\"init\"}}\n\
+             {{\"type\":\"assistant\",\"message\":{{\"content\":[{blocks}]}}}}\n\
+             {{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":{is_error},\
+             \"num_turns\":2,\"permission_denials\":{denials},\"result\":{}}}\n",
             Json::from(result)
         )
     }
 
+    const THINKING: &str = r#"{"type":"thinking","thinking":""}"#;
+
     #[test]
     fn claude_code_results_are_judged_like_opencode_ones() {
         let reply = r#"{"nonce":"n1","status":"clear","summary":"ok","findings":[]}"#;
-        let review = claude_verdict(&claude_result(1, "[]", false, reply), None, "n1").unwrap();
+        // A turn continued after a safety-classifier interruption is fine.
+        let review =
+            claude_verdict(&claude_result(THINKING, "[]", false, reply), None, "n1").unwrap();
         assert_eq!(review.status, Status::Clear);
 
         // A tool attempt is a wrong answer, not an absent reviewer.
         for output in [
-            claude_result(2, "[]", false, reply),
-            claude_result(1, r#"[{"tool_name":"Read"}]"#, false, reply),
+            claude_result(
+                r#"{"type":"tool_use","name":"Bash","input":{}}"#,
+                "[]",
+                false,
+                reply,
+            ),
+            claude_result(
+                r#"{"type":"server_tool_use","name":"web_search"}"#,
+                "[]",
+                false,
+                reply,
+            ),
+            claude_result(THINKING, r#"[{"tool_name":"Read"}]"#, false, reply),
         ] {
             assert!(matches!(
                 claude_verdict(&output, None, "n1"),
@@ -591,7 +634,11 @@ mod tests {
         }
         // A provider error or a crash is an unavailable reviewer.
         assert!(matches!(
-            claude_verdict(&claude_result(1, "[]", true, "rate limited"), None, "n1"),
+            claude_verdict(
+                &claude_result(THINKING, "[]", true, "rate limited"),
+                None,
+                "n1"
+            ),
             Err(AgentError::Unavailable(_))
         ));
         assert!(matches!(
@@ -600,7 +647,7 @@ mod tests {
         ));
         // The nonce must be echoed.
         assert!(matches!(
-            claude_verdict(&claude_result(1, "[]", false, reply), None, "other"),
+            claude_verdict(&claude_result(THINKING, "[]", false, reply), None, "other"),
             Err(AgentError::Invalid(_))
         ));
     }

