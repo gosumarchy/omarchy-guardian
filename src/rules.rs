@@ -93,7 +93,6 @@ const PERSISTENCE_PATHS: &[&str] = &[
     ".zprofile",
     ".config/fish/config.fish",
     ".config/omarchy/hooks/",
-    "/etc/pacman.d/hooks/",
     "/etc/xdg/autostart/",
     "/etc/udev/rules.d/",
     "exec-once",
