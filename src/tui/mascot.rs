@@ -96,25 +96,6 @@ pub fn draw(canvas: &mut Canvas, x: usize, y: usize, mood: Mood, blink: bool) {
     }
 }
 
-/// A speech bubble whose tail points left at `(x, y + 1)`. `lines` are
-/// already wrapped to fit `width - 4`.
-pub fn bubble(canvas: &mut Canvas, x: usize, y: usize, width: usize, lines: &[String], tone: u8) {
-    let height = lines.len() + 2;
-    let border = Style::fg(crate::tui::canvas::color::MUTED);
-    canvas.frame(x + 1, y, width.saturating_sub(1), height, border);
-    canvas.text(x, y + 1, "╴", border, 1);
-    canvas.text(x + 1, y + 1, "┤", border, 1);
-    for (index, line) in lines.iter().enumerate() {
-        canvas.text_fit(
-            x + 3,
-            y + 1 + index,
-            line,
-            Style::fg(tone),
-            width.saturating_sub(5),
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{HEIGHT, Mood, PIXELS, WIDTH, draw, palette};

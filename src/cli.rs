@@ -36,9 +36,11 @@ Usage:
   omarchy-guardian config show [--class CLASS] | check | path
   omarchy-guardian forget <identity> | --all
   omarchy-guardian setup
-  omarchy-guardian protect [--yes]                  (turn on every gate that is off)
+  omarchy-guardian protect [--off] [--yes]          (turn every gate on, or the install gates off)
   omarchy-guardian test                             (test the saved reviewer with two samples)
   omarchy-guardian ask <report-id>                  (open your AI agent on a saved block report)
+  omarchy-guardian status [--waybar | --dismiss | --open-report]
+                                                    (bar widget status; mark blocks seen; open the last report)
   omarchy-guardian tui [--expert]                   (settings app; --expert shows every setting)
 
 CLASS: aur, theme, plugin, source (default). PROFILE: standard, strict, local-only.
@@ -99,14 +101,26 @@ enum Invocation {
     /// `protect [--yes]`: turn on every gate that is off.
     Protect {
         yes: bool,
+        off: bool,
     },
     /// `test`: the two-sample reviewer test of the saved settings.
     Test,
     /// `ask <report-id | omarchy-guardian://ask/<id>>`, opened from a report.
     Ask(String),
+    /// `status [--waybar | --dismiss | --open-report]`.
+    Status(StatusMode),
     Tui {
         expert: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusMode {
+    /// JSON for the Omarchy shell widget.
+    Shell,
+    Waybar,
+    Dismiss,
+    OpenReport,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -204,7 +218,11 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
                 ExitCode::from(2)
             }
         },
-        Invocation::Protect { yes } => match tui::protect(yes, &mut TtyConfirm) {
+        Invocation::Protect { yes, off } => match if off {
+            tui::unprotect(yes, &mut TtyConfirm)
+        } else {
+            tui::protect(yes, &mut TtyConfirm)
+        } {
             Ok(message) => {
                 outln!("{message}");
                 ExitCode::SUCCESS
@@ -224,6 +242,7 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
                 ExitCode::from(1)
             }
         }
+        Invocation::Status(mode) => status_command(mode),
         Invocation::Ask(target) => {
             eprintln!("omarchy-guardian ask: {}", ask::run(&target, &settings));
             ExitCode::from(2)
@@ -400,6 +419,28 @@ fn sandbox_command(
     }
 }
 
+fn status_command(mode: StatusMode) -> ExitCode {
+    let result = match mode {
+        StatusMode::Shell => {
+            outln!("{}", tui::status::json());
+            Ok(())
+        }
+        StatusMode::Waybar => {
+            outln!("{}", tui::status::waybar());
+            Ok(())
+        }
+        StatusMode::Dismiss => tui::status::dismiss(),
+        StatusMode::OpenReport => tui::status::open_report(),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("omarchy-guardian status: {message}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn pacman_hook_command(hook: &HookArgs, settings: &Settings) -> ExitCode {
     match pacman::review_transaction(hook, settings) {
         Ok(report) => {
@@ -552,12 +593,33 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
         Some("config") => parse_config(rest).map(Invocation::Config),
         Some("forget") => parse_forget(rest).map(Invocation::Forget),
         Some("setup") if rest.is_empty() => Ok(Invocation::Setup),
-        Some("protect") => match rest {
-            [] => Ok(Invocation::Protect { yes: false }),
-            [flag] if flag == "--yes" || flag == "-y" => Ok(Invocation::Protect { yes: true }),
-            _ => Err("usage: omarchy-guardian protect [--yes]".into()),
-        },
+        Some("protect") => {
+            let mut yes = false;
+            let mut off = false;
+            for flag in rest {
+                match flag.to_str() {
+                    Some("--yes" | "-y") => yes = true,
+                    Some("--off") => off = true,
+                    _ => return Err("usage: omarchy-guardian protect [--off] [--yes]".into()),
+                }
+            }
+            Ok(Invocation::Protect { yes, off })
+        }
         Some("test") if rest.is_empty() => Ok(Invocation::Test),
+        Some("status") => match rest {
+            [] => Ok(Invocation::Status(StatusMode::Shell)),
+            [flag] => match flag.to_str() {
+                Some("--waybar") => Ok(Invocation::Status(StatusMode::Waybar)),
+                Some("--dismiss") => Ok(Invocation::Status(StatusMode::Dismiss)),
+                Some("--open-report") => Ok(Invocation::Status(StatusMode::OpenReport)),
+                _ => Err(
+                    "usage: omarchy-guardian status [--waybar | --dismiss | --open-report]".into(),
+                ),
+            },
+            _ => {
+                Err("usage: omarchy-guardian status [--waybar | --dismiss | --open-report]".into())
+            }
+        },
         Some("ask") => match rest {
             [target] => target
                 .to_str()
@@ -1092,11 +1154,17 @@ mod tests {
         assert!(parse(&args(&["setup", "extra"])).is_err());
         assert_eq!(
             parse(&args(&["protect"])).unwrap(),
-            Invocation::Protect { yes: false }
+            Invocation::Protect {
+                yes: false,
+                off: false
+            }
         );
         assert_eq!(
-            parse(&args(&["protect", "--yes"])).unwrap(),
-            Invocation::Protect { yes: true }
+            parse(&args(&["protect", "--off", "--yes"])).unwrap(),
+            Invocation::Protect {
+                yes: true,
+                off: true
+            }
         );
         assert!(parse(&args(&["protect", "--all"])).is_err());
         assert_eq!(parse(&args(&["test"])).unwrap(), Invocation::Test);
