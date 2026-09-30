@@ -961,8 +961,10 @@ mod tests {
         assert!(super::check_private(&shared.join("x.pkg.tar.zst"), Some(uid)).is_err());
         fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).unwrap();
         assert!(super::check_private(&shared.join("x.pkg.tar.zst"), Some(uid)).is_ok());
-        // Owned by someone else.
-        assert!(super::check_private(&shared.join("x.pkg.tar.zst"), Some(uid + 1)).is_err());
+        // Owned by someone else (root's files are trusted, so not as root).
+        if uid != 0 {
+            assert!(super::check_private(&shared.join("x.pkg.tar.zst"), Some(uid + 1)).is_err());
+        }
         fs::set_permissions(&shared, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
