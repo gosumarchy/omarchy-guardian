@@ -166,9 +166,11 @@ fn aur_facts(name: &str) -> Vec<String> {
                     .map(|warning| format!("Guardian's AUR check warns: {warning}.")),
             );
         }
-        Ok(None) => facts.push(format!(
-            "{name} is not a package in the AUR (a local or private PKGBUILD)."
-        )),
+        Ok(None) => {
+            let fact = format!("{name} is not a package in the AUR (a local or private PKGBUILD).");
+            outln!("{fact}");
+            facts.push(fact);
+        }
         Err(error) => eprintln!("Guardian: AUR metadata unavailable ({error})."),
     }
     facts
