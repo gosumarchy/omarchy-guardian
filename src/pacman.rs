@@ -17,6 +17,7 @@ use crate::classify;
 use crate::config::Settings;
 use crate::config::model::{AiRequirement, Named, SourceClass};
 use crate::error::{Error, IoContext};
+use crate::payload;
 use crate::report::{Gap, Report};
 use crate::review;
 use crate::scan::MAX_TEXT_FILE_SIZE;
@@ -127,11 +128,15 @@ pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report
         match archives.get(target) {
             Some(Ok(paths)) => {
                 for archive in paths {
-                    match scan_install_script(archive, target, class, &mut report) {
-                        Ok(Some(_)) => {}
-                        Ok(None) => {
-                            outln!("Pacman package {target}: no install scriptlet to review.");
+                    let scriptlet = match scan_install_script(archive, target, class, &mut report) {
+                        Ok(found) => found.is_some(),
+                        Err(error) => {
+                            report.gaps.push(Gap::Package(error));
+                            continue;
                         }
+                    };
+                    match scan_payload(archive, target, class, &mut report) {
+                        Ok(summary) => summary.announce(target, scriptlet),
                         Err(error) => report.gaps.push(Gap::Package(error)),
                     }
                 }
@@ -477,6 +482,89 @@ fn package_name(archive: &Path) -> Result<String, Error> {
             archive.display()
         )))
     }
+}
+
+/// What was found in one package's payload.
+struct PayloadSummary {
+    reviewed: usize,
+    /// Identical to what is already installed, so not reviewed again.
+    unchanged: usize,
+    /// Auto-run files that could not be reviewed: binaries, or anything
+    /// under `ai = off`.
+    not_reviewed: Vec<String>,
+}
+
+impl PayloadSummary {
+    fn announce(&self, target: &str, scriptlet: bool) {
+        let nothing = self.reviewed == 0 && self.unchanged == 0 && self.not_reviewed.is_empty();
+        if !scriptlet && nothing {
+            outln!("Pacman package {target}: no install scriptlet or auto-run files to review.");
+        }
+        if self.reviewed > 0 {
+            outln!(
+                "Pacman package {target}: {} new or changed auto-run file(s) reviewed.",
+                self.reviewed
+            );
+        }
+        if self.unchanged > 0 {
+            outln!(
+                "Pacman package {target}: {} auto-run file(s) identical to the installed ones, not reviewed again.",
+                self.unchanged
+            );
+        }
+        if !self.not_reviewed.is_empty() {
+            let shown: Vec<&str> = self
+                .not_reviewed
+                .iter()
+                .take(3)
+                .map(String::as_str)
+                .collect();
+            let more = self.not_reviewed.len().saturating_sub(shown.len());
+            outln!(
+                "Pacman package {target}: {} auto-run file(s) not reviewed (binary or AI off): {}{}",
+                self.not_reviewed.len(),
+                shown.join(", "),
+                if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                }
+            );
+        }
+    }
+}
+
+/// Queues the payload files of `archive` that run or grant privileges on
+/// their own (see `payload`) for the AI review, tagged with `class`.
+fn scan_payload(
+    archive: &Path,
+    target: &str,
+    class: SourceClass,
+    report: &mut Report,
+) -> Result<PayloadSummary, Error> {
+    let archive_name = archive
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("package");
+    let mut summary = PayloadSummary {
+        reviewed: 0,
+        unchanged: 0,
+        not_reviewed: Vec::new(),
+    };
+    for file in payload::auto_run_files(archive)? {
+        // An upgrade only brings in what changed; the rest is already active.
+        if file.is_installed_unchanged(Path::new("/")) {
+            summary.unchanged += 1;
+            continue;
+        }
+        let rel = format!("{target}/{archive_name}/{}", file.path);
+        report.file_classes.insert(rel.clone(), class);
+        match file.text {
+            Some(text) if review::analyze_payload(report, &rel, &text) => summary.reviewed += 1,
+            Some(_) | None => summary.not_reviewed.push(format!("/{}", file.path)),
+        }
+    }
+    Ok(summary)
 }
 
 /// Extracts `.INSTALL` directly (no listing, which is unbounded for packages

@@ -401,7 +401,7 @@ impl Report {
                 Decision::Blocked(Blocked::NotConfirmed) => "Not confirmed; nothing was run.",
                 Decision::Warned => "Proceeding with warnings; read them above.",
                 Decision::Limited => {
-                    "Scope: package payloads were not inspected by this scriptlet-only review."
+                    "Scope: install scriptlets and new or changed auto-run files are reviewed; the rest of each package's payload is not."
                 }
                 Decision::Clear =>
                     "Scope: this is a heuristic source review, not a safety guarantee.",
@@ -439,7 +439,8 @@ impl Report {
                 "33;1",
             ),
             Decision::Limited => (
-                "· LIMITED REVIEW — no text install scripts were available".to_string(),
+                "· LIMITED REVIEW — no install scriptlet or new auto-run file to review"
+                    .to_string(),
                 "36;1",
             ),
         };

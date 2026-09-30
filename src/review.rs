@@ -129,6 +129,20 @@ pub fn analyze_text(report: &mut Report, rel: &str, text: &str, inspect_dependen
     }
 }
 
+/// Queues a package payload file that acts on its own (see `payload`) for
+/// the AI review only. The local rules are written for scripts and code;
+/// these files are where legitimate services, rules and privileges live, so
+/// the rules' matches on them are noise. Returns whether it was queued: a
+/// class with `ai = off` does not review payload files at all.
+pub fn analyze_payload(report: &mut Report, rel: &str, text: &str) -> bool {
+    if report.ai_off_classes.contains(&report.class_of(rel)) {
+        return false;
+    }
+    report.text_files_reviewed += 1;
+    queue_for_agent(report, rel, text);
+    true
+}
+
 fn queue_for_agent(report: &mut Report, rel: &str, text: &str) {
     if report.ai_off_classes.contains(&report.class_of(rel)) {
         return;

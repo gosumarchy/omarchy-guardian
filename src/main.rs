@@ -30,6 +30,7 @@ mod json;
 mod mask;
 mod osv;
 mod pacman;
+mod payload;
 mod report;
 mod review;
 mod rules;

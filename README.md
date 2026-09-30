@@ -384,8 +384,26 @@ user's OpenCode configuration and credentials.
 
 ### Pacman hook
 
-A pre-transaction hook (`AbortOnFail`) that reviews the `.INSTALL` scriptlets
-of the exact archives being installed:
+A pre-transaction hook (`AbortOnFail`) that reviews, for the exact archives
+being installed, their `.INSTALL` scriptlets and the payload files that run or
+grant privileges on their own:
+
+- pacman hooks (`usr/share/libalpm/hooks`, `etc/pacman.d/hooks`), sudoers,
+  polkit and PAM rules, `ld.so.preload` and `ld.so.conf.d`;
+- systemd units a package enables itself (`*.wants/`, `*.requires/`,
+  `*.upholds/`), generators and presets, and units in `etc/systemd`;
+- tmpfiles, sysusers, binfmt, udev, modprobe and environment.d entries;
+- login scripts (`etc/profile.d`, xinitrc.d), autostart entries, cron jobs and
+  D-Bus system services and policies.
+
+On an upgrade, an auto-run file identical to the installed one is not reviewed
+again, since it adds nothing new: a point release typically brings a handful of
+changed files, not every unit and rule. These files go to the AI review only;
+the local pattern rules are written for scripts and would match the ordinary
+content of these files. Binaries among them (generators, for example) are
+listed as not reviewed. The rest of the payload is not reviewed.
+
+Archives are located as follows:
 
 - For `pacman -S`, each target's sync-database version (`pacman -Si`) is
   located in the configured `CacheDir`s (`pacman-conf`), and each archive's
@@ -393,16 +411,19 @@ of the exact archives being installed:
 - For `pacman -U`, the archives named on pacman's command line are used,
   resolved against pacman's own working directory. Remote URLs are refused.
 
-The AI review is told that only the scriptlets are under review: routine
-packaging (setting capabilities or setuid on the package's own files, creating
-system users, copying the package's own files into place, managing its own
-services) is not by itself concerning, and files a scriptlet only mentions are
-not grounds for an inconclusive verdict. It still flags scriptlets that
-download or run code from elsewhere, write their own content into sudoers,
-PAM or other security configuration, add persistence the package does not own,
-or touch users' home directories or credentials. An inconclusive verdict
-blocks in every profile, since ambiguity is something an attacker can
-provoke.
+The AI review is told what is under review (the scriptlets and those payload
+files) and what routine packaging looks like: capabilities or setuid on the
+package's own files, system users, copying its own files into place, its own
+services, sockets and device rules, and privileges that only apply once an
+administrator opts in (a dedicated, initially empty group, or a boot
+credential). Files a scriptlet only mentions, and how the package's own
+programs authorize requests, are out of scope and not grounds for an
+inconclusive verdict. It still flags downloading or running code from
+elsewhere, sudoers, polkit or PAM rules that grant root broadly or without
+authentication, pacman hooks or login and autostart scripts that run unrelated
+code, preloaded libraries, persistence the package does not own, and access to
+users' home directories or credentials. An inconclusive verdict blocks in
+every profile, since ambiguity is something an attacker can provoke.
 
 libalpm runs hooks as children of pacman after `chroot` + `chdir("/")`, so the
 hook reads pacman's exact argv from `/proc/<pid>/cmdline` and its working
