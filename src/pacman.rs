@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use crate::classify;
 use crate::config::Settings;
-use crate::config::model::{Named, SourceClass};
+use crate::config::model::{AiRequirement, Named, SourceClass};
 use crate::error::{Error, IoContext};
 use crate::report::{Gap, Report};
 use crate::review;
@@ -50,6 +50,39 @@ pub struct HookArgs {
 pub enum Operation {
     Sync,
     LocalUpgrade,
+}
+
+/// The pacman classes whose policy requires an AI review.
+pub fn classes_requiring_ai(settings: &Settings) -> Vec<SourceClass> {
+    PRIVILEGED
+        .iter()
+        .copied()
+        .filter(|class| settings.policy(*class).ai == AiRequirement::Required)
+        .collect()
+}
+
+/// Whether a root-owned OpenCode is installed where the gate looks for it.
+pub fn system_opencode_ready() -> bool {
+    OpenCode::SystemOnly.resolve().is_ok()
+}
+
+/// Whether the pacman gate can review transactions with these settings.
+/// Without a root-owned OpenCode, every transaction with a target whose
+/// class requires the AI review is refused; this says so before the hook
+/// is turned on rather than on the next install.
+pub fn preflight(settings: &Settings, opencode_ready: bool) -> Result<(), String> {
+    if let Some(reason) = settings.privileged_block() {
+        return Err(reason.to_string());
+    }
+    let requiring = classes_requiring_ai(settings);
+    if requiring.is_empty() || opencode_ready {
+        return Ok(());
+    }
+    let names: Vec<&str> = requiring.iter().map(|class| class.name()).collect();
+    Err(format!(
+        "there is no root-owned OpenCode at /usr/bin/opencode or /usr/local/bin/opencode, but {} packages require an AI review, so pacman would refuse every such install (including AUR packages yay installs with pacman -U). Install it with: sudo pacman -S extra/opencode",
+        names.join(", ")
+    ))
 }
 
 pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report, Error> {
@@ -542,6 +575,31 @@ mod tests {
         archives.insert("built".into(), Ok(vec!["built-1-1-any.pkg.tar".into()]));
         let targets = ["built".to_string(), "repo-dependency".to_string()];
         assert_eq!(missing_targets(&targets, &archives), ["repo-dependency"]);
+    }
+
+    #[test]
+    fn preflight_needs_a_system_opencode_only_when_a_class_requires_ai() {
+        use super::{classes_requiring_ai, preflight};
+        use crate::config::model::Profile;
+
+        let standard = Settings::from_parts(PartialConfig::default(), PartialConfig::default());
+        assert_eq!(
+            classes_requiring_ai(&standard),
+            [SourceClass::ThirdPartyRepo, SourceClass::LocalPackage]
+        );
+        let error = preflight(&standard, false).unwrap_err();
+        assert!(error.contains("third-party-repo, local-package"), "{error}");
+        assert!(error.contains("sudo pacman -S extra/opencode"), "{error}");
+        assert_eq!(preflight(&standard, true), Ok(()));
+
+        let private = Settings::from_parts(
+            PartialConfig {
+                profile: Some(Profile::LocalOnly),
+                ..PartialConfig::default()
+            },
+            PartialConfig::default(),
+        );
+        assert_eq!(preflight(&private, false), Ok(()));
     }
 
     #[test]

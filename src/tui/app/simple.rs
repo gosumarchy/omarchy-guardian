@@ -88,7 +88,8 @@ impl App {
         self.integrations
             .iter()
             .filter(|(integration, state)| {
-                GATES.contains(integration) && matches!(state, State::Off | State::Foreign(_))
+                GATES.contains(integration)
+                    && matches!(state, State::Off | State::Foreign(_) | State::Partial(_))
             })
             .map(|(integration, _)| *integration)
             .collect()
@@ -139,6 +140,24 @@ impl App {
         if self.dirty(Scope::User) || self.dirty(Scope::System) {
             return (
                 "You have unsaved changes. Press s to save them.".into(),
+                color::YELLOW,
+            );
+        }
+        // A gate that is on but not doing its whole job is the more
+        // surprising problem, so it is named first.
+        let partial = self
+            .integrations
+            .iter()
+            .find_map(|(gate, state)| match state {
+                State::Partial(reason) if GATES.contains(gate) => Some((*gate, reason.clone())),
+                _ => None,
+            });
+        if let Some((gate, reason)) = partial {
+            return (
+                format!(
+                    "My {} gate is {reason}. Choose Protect everything to fix it.",
+                    gate_name(gate)
+                ),
                 color::YELLOW,
             );
         }
@@ -451,6 +470,7 @@ impl App {
             let (label, fg) = match state {
                 Some(State::On) => ("● on", color::GREEN),
                 Some(State::Off | State::Foreign(_)) => ("○ off", color::YELLOW),
+                Some(State::Partial(_)) => ("◐ partly", color::YELLOW),
                 Some(State::Unavailable(_)) | None => ("– n/a", color::MUTED),
             };
             x = canvas.text(x, y, gate_name(gate), Style::PLAIN, inner) + 1;
@@ -635,6 +655,7 @@ mod tests {
             bashrc: root.join("bashrc"),
             omarchy: root.join("omarchy"),
             menu: root.join("menu.jsonc"),
+            opencode_missing: false,
         };
         let mut app = App::new(files(Some(paths)), Mode::Simple);
         assert!(screen(&mut app).contains("not watching pacman, AUR or themes"));

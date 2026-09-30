@@ -1099,6 +1099,7 @@ impl App {
             Some(State::On) => ("● on".to_string(), color::GREEN),
             Some(State::Off) => ("○ off".to_string(), color::MUTED),
             Some(State::Foreign(reason)) => (format!("! {reason}"), color::YELLOW),
+            Some(State::Partial(reason)) => (format!("◐ {reason}"), color::YELLOW),
             Some(State::Unavailable(reason)) => (format!("– {reason}"), color::MUTED),
             None => ("– unknown".to_string(), color::MUTED),
         }
