@@ -359,13 +359,28 @@ provider.
 ```sh
 cd packaging/arch
 makepkg -si
+sudo pacman -S --needed extra/opencode      # the pacman gate's reviewer
 sudo /usr/lib/omarchy-guardian/enable-system-hook.sh
 yay --makepkg /usr/lib/omarchy-guardian/guardian-makepkg --save -P --stats
 ```
 
+Or open `omarchy-guardian tui` and choose *Protect everything*, which does the
+same after showing each step.
+
 Installing the package activates nothing. `enable-system-hook.sh` links the
 pacman hook into `/etc/pacman.d/hooks/` and adds the theme interceptor to the
 invoking user's `~/.bashrc`.
+
+The pacman hook refuses every transaction it cannot review. While any pacman
+class requires the AI review (`third-party-repo` and `local-package` under
+`standard`; every class under `strict`), that needs a root-owned OpenCode: an
+OpenCode installed in your home directory (for example with `mise` or `npm`)
+is not accepted. Without one, every `pacman -U` would be refused, including
+each AUR package yay installs. `enable-system-hook.sh` therefore runs
+`omarchy-guardian pacman-hook --preflight` as the invoking user first and does
+not enable the hook until it passes; `extra/opencode` provides
+`/usr/bin/opencode`. The pacman hook reviews as the invoking user, with that
+user's OpenCode configuration and credentials.
 
 ### Pacman hook
 
@@ -395,13 +410,19 @@ sources and whatever `prepare()`/`build()` do with them are outside the review.
 
 ### Omarchy themes
 
-The Bash interceptor routes `omarchy theme install` and `omarchy theme update`
-through Guardian. Themes are cloned to a hidden staging directory and
+The theme gate routes theme installs and updates through Guardian from two
+places: the Bash interceptor catches `omarchy theme install/update` typed in
+an interactive Bash, and overrides in your Omarchy menu file
+(`~/.config/omarchy/extensions/omarchy-menu.jsonc`) point Install › Style ›
+Theme and Update › Extra Themes at Guardian, since the menu runs them in a
+non-interactive shell the interceptor never sees. Turn both on from the TUI's
+Integrations tab (or *Protect everything*); the gate shows as partial while
+only one is in place. Themes are cloned to a hidden staging directory and
 reviewed; only the exact reviewed checkout is moved into place and applied.
 Updates stage and review every Git-installed theme before replacing any.
 Themes with local or ignored modifications, submodules, or unresolved Git LFS
-files are refused. Direct invocations of Omarchy binaries outside the
-interactive Bash wrapper are not intercepted.
+files are refused. Direct invocations of Omarchy's theme binaries from
+elsewhere (scripts, other shells) are not intercepted.
 
 ### Removal
 
@@ -413,7 +434,9 @@ sudo pacman -R omarchy-guardian
 Removing the package removes the hook link. A hook at the same path that was
 installed by hand and runs Guardian is moved to
 `/etc/pacman.d/hooks/omarchy-guardian.hook.pacsave`, which pacman ignores.
-Delete the marked Guardian line from `~/.bashrc` to stop theme interception.
+Turn the theme gate off in the TUI (or delete the marked Guardian line from
+`~/.bashrc` and the `guardian-theme` lines from the Omarchy menu file) to stop
+theme interception.
 
 If pacman fails every install or upgrade with `Review package install scripts
 with Omarchy Guardian` followed by `call to execv failed (No such file or

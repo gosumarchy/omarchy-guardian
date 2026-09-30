@@ -28,6 +28,7 @@ Usage:
   omarchy-guardian guard [--thorough] [--hashes] [--exclude NAME]... [--class CLASS] [--profile PROFILE] [--identity ID | --unit DIR ID ...] <file-or-directory> -- <command> [args...]
   omarchy-guardian sandbox [--hashes] [--profile PROFILE] [--identity ID | --unit DIR ID ...] <directory> -- <command> [args...]
   omarchy-guardian pacman-hook --pacman-pid PID --cwd DIR   (run by the pacman hook)
+  omarchy-guardian pacman-hook --preflight                  (can the pacman gate review?)
   omarchy-guardian config show [--class CLASS] | check | path
   omarchy-guardian forget <identity> | --all
   omarchy-guardian setup
@@ -60,10 +61,14 @@ enum Invocation {
     Guard(Target, Vec<OsString>),
     Sandbox(Target, Vec<OsString>),
     PacmanHook(HookArgs),
+    /// `pacman-hook --preflight`: can the gate review with these settings?
+    HookPreflight,
     Config(ConfigCommand),
     Forget(Forget),
     Setup,
-    Tui { expert: bool },
+    Tui {
+        expert: bool,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -139,6 +144,18 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
             &mut TtyConfirm,
         ),
         Invocation::PacmanHook(hook) => pacman_hook_command(&hook, &settings),
+        Invocation::HookPreflight => {
+            match pacman::preflight(&settings, pacman::system_opencode_ready()) {
+                Ok(()) => {
+                    outln!("The pacman gate can review transactions with these settings.");
+                    ExitCode::SUCCESS
+                }
+                Err(reason) => {
+                    eprintln!("omarchy-guardian: {reason}");
+                    ExitCode::from(2)
+                }
+            }
+        }
         Invocation::Config(command) => config_command(&command, &settings),
         Invocation::Forget(forget) => forget_command(&forget, Store::default_root()),
         Invocation::Setup => match setup::run(&mut setup::TtyTerminal, &setup::RealEnvironment) {
@@ -451,6 +468,9 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
             // The sandbox copies everything but `.git`, so everything is reviewed.
             target.config.include_ignored_dirs = true;
             Ok(Invocation::Sandbox(target, command))
+        }
+        Some("pacman-hook") if rest.len() == 1 && rest[0] == "--preflight" => {
+            Ok(Invocation::HookPreflight)
         }
         Some("pacman-hook") => parse_hook(rest).map(Invocation::PacmanHook),
         Some("config") => parse_config(rest).map(Invocation::Config),
@@ -989,6 +1009,10 @@ mod tests {
             Invocation::Tui { expert: true }
         );
         assert!(parse(&args(&["tui", "extra"])).is_err());
+        assert_eq!(
+            parse(&args(&["pacman-hook", "--preflight"])).unwrap(),
+            Invocation::HookPreflight
+        );
     }
 
     #[test]

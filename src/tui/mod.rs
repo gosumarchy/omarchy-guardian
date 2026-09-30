@@ -22,6 +22,7 @@ use crate::config::model::{Named, SourceClass};
 use crate::config::show::{render_check, render_memory, render_show};
 use crate::engine::baseline;
 use crate::engine::store::Store;
+use crate::pacman;
 use crate::setup::{self, Environment as _};
 
 use app::{App, Effect, Loaded, Mode, Task};
@@ -84,7 +85,15 @@ fn draw(
 fn load_files() -> Loaded {
     let settings = Settings::load();
     let system_text = fs::read_to_string(SYSTEM_PATH).unwrap_or_default();
-    Loaded::from_settings(&settings, system_text, Paths::real())
+    Loaded::from_settings(&settings, system_text, paths(&settings))
+}
+
+/// The integration paths, knowing whether the pacman gate lacks the
+/// root-owned OpenCode its settings require.
+fn paths(settings: &Settings) -> Option<Paths> {
+    let opencode_missing =
+        !pacman::classes_requiring_ai(settings).is_empty() && !pacman::system_opencode_ready();
+    Paths::real(opencode_missing)
 }
 
 const fn reloads(effect: &Effect) -> bool {
@@ -154,7 +163,7 @@ fn save_user(text: &str) -> Result<String, String> {
 }
 
 fn integration(terminal: &mut Terminal, plan: &Plan) -> Result<String, String> {
-    let paths = Paths::real().ok_or("HOME is not set")?;
+    let paths = paths(&Settings::load()).ok_or("HOME is not set")?;
     let run_steps = || -> Result<String, String> {
         for step in &plan.steps {
             match step {
@@ -179,7 +188,11 @@ fn integration(terminal: &mut Terminal, plan: &Plan) -> Result<String, String> {
                         });
                     }
                 }
-                Step::RemoveInterceptor | Step::AddMenuEntry | Step::RemoveMenuEntry => {
+                Step::RemoveInterceptor
+                | Step::AddMenuEntry
+                | Step::RemoveMenuEntry
+                | Step::AddThemeMenu
+                | Step::RemoveThemeMenu => {
                     paths.edit(step)?;
                 }
             }
