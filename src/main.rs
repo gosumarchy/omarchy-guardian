@@ -27,6 +27,7 @@ mod deps;
 mod engine;
 mod error;
 mod json;
+mod mask;
 mod osv;
 mod pacman;
 mod report;

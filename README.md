@@ -238,15 +238,27 @@ review it in full every time.
 ## What is checked
 
 - **Local rules** on every text file except prose (`*.md`, `*.rst`, `README`,
-  `LICENSE`, ...): download-to-shell pipelines, encoded command execution,
+  license texts such as `LICENSE.txt`, `COPYING.LESSER` or anything under
+  `LICENSES/`, ...): download-to-shell pipelines, encoded command execution,
   credential file access, destructive commands (a recursive `rm` of `/` or
   `$HOME` itself, `mkfs`, raw-disk writes), persistence, shell execution,
   privilege escalation, disabled TLS verification and likely credential
   exfiltration. Identifier patterns respect word boundaries, so `retrieval(`
-  and `model.eval()` do not match `eval(`. Prose is still sent to the AI review.
+  and `model.eval()` do not match `eval(`. Making Chromium's `chrome-sandbox` helper
+  setuid (`chmod 4755 .../chrome-sandbox`), which every Chromium and Electron
+  package does, is not a privilege-escalation finding. Comments are skipped (shell and
+  other `#` languages, `//` and `/* */` in C-like languages, Lua `--`), as are
+  the removed lines of a patch. In shell scripts, text that is only printed
+  (`echo` and `printf` arguments, `cat <<EOF` bodies, when nothing pipes,
+  redirects or substitutes them) is skipped by the persistence, privilege,
+  credential-file, TLS and network checks, so install notes like
+  `echo "run: sudo systemctl enable foo"` are not findings; download-to-shell,
+  encoded execution, destructive commands and shell execution still match
+  printed text. Prose, comments and messages are still sent to the AI review.
 - **Network destinations:** literal HTTP(S) hosts in code and runtime config,
-  flagging cleartext HTTP and hard-coded IP addresses. URL paths, queries and
-  credentials are never printed.
+  flagging cleartext HTTP and hard-coded IP addresses. A PKGBUILD's `url=`
+  homepage (never fetched), XML namespace and DTD identifiers are not
+  destinations. URL paths, queries and credentials are never printed.
 - **Dependencies:** `Cargo.lock`, npm lockfiles, `poetry.lock`, `go.sum` and
   exactly pinned `requirements*.txt` are checked with the public OSV API (only
   package names and versions are sent). Advisory severities and summaries are
@@ -267,7 +279,12 @@ review it in full every time.
 
 The walk never follows symbolic links, including ones swapped in while it
 runs: directories are read through verified `/proc/self/fd` handles and every
-opened file is checked against its earlier `lstat`. Symlinks, special files,
+opened file is checked against its earlier `lstat`. A relative symlink to a
+file or directory inside the tree that the review covers (such as the
+`LICENSES/0BSD.txt -> ../LICENSE` many AUR packages carry) is recorded by its
+link text, so retargeting it changes the snapshot, and its target is reviewed
+where it is. Other symlinks (absolute, leaving the tree, dangling, through
+another link or into a skipped directory), special files,
 non-UTF-8 file names, text files over 2 MiB, files over 512 MiB, unresolved
 Git LFS pointers and an invalid or inconclusive AI reply all make the review
 **incomplete**, never clear. An *unavailable* AI review (no OpenCode, a
