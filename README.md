@@ -393,6 +393,17 @@ of the exact archives being installed:
 - For `pacman -U`, the archives named on pacman's command line are used,
   resolved against pacman's own working directory. Remote URLs are refused.
 
+The AI review is told that only the scriptlets are under review: routine
+packaging (setting capabilities or setuid on the package's own files, creating
+system users, copying the package's own files into place, managing its own
+services) is not by itself concerning, and files a scriptlet only mentions are
+not grounds for an inconclusive verdict. It still flags scriptlets that
+download or run code from elsewhere, write their own content into sudoers,
+PAM or other security configuration, add persistence the package does not own,
+or touch users' home directories or credentials. An inconclusive verdict
+blocks in every profile, since ambiguity is something an attacker can
+provoke.
+
 libalpm runs hooks as children of pacman after `chroot` + `chdir("/")`, so the
 hook reads pacman's exact argv from `/proc/<pid>/cmdline` and its working
 directory from `/proc/<pid>/cwd`, then drops to the invoking user (`sudo` or
