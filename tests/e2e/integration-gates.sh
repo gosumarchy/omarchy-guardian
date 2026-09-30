@@ -4,8 +4,8 @@
 # These tests exercise the real integration scripts and the real Guardian
 # binary. Nothing is installed and nothing touches the live system:
 #   * /usr is a throwaway overlay inside a bwrap sandbox, and the freshly
-#     built binary is bind-mounted at /usr/bin/omarchy-guardian, so no
-#     installed copy is used or changed
+#     built binary is added at /usr/bin/omarchy-guardian as an extra overlay
+#     layer, so no installed copy is used or changed
 #   * pacman is simulated by a parent process named "pacman", because the hook
 #     reads the transaction's argv and working directory from its parent
 #   * makepkg, omarchy-theme-set and omarchy-git-url-check are replaced by
@@ -68,6 +68,12 @@ mkdir -p "$HOME/tmp" "$HOME/mockbin" "$HOME/.config/opencode" \
     "$HOME/.local/share/opencode" "$HOME/.local/state" "$HOME/.cache"
 : >"$MOCK_LOG"
 
+# New paths under /usr and /etc come from extra overlay layers. Binding a file
+# onto a path the overlay does not already have fails, because bwrap cannot
+# create it in a root-owned directory from an unprivileged user namespace.
+mkdir -p "$E2E/usr-layer/bin" "$E2E/etc-layer/omarchy-guardian"
+cp -- "$BINARY" "$E2E/usr-layer/bin/omarchy-guardian"
+
 # sandbox <chdir> [bwrap options...] -- <command> [args...]
 #
 # Runs a command with the project binary in place of the installed Guardian and
@@ -82,15 +88,15 @@ sandbox() {
         shift
     done
     shift || true
-    bwrap --ro-bind / / --overlay-src /usr --tmp-overlay /usr \
+    bwrap --ro-bind / / --overlay-src /usr --overlay-src "$E2E/usr-layer" --tmp-overlay /usr \
         --bind "$E2E" "$E2E" --proc /proc --dev /dev --tmpfs /tmp \
         --setenv HOME "$HOME" --setenv TMPDIR "$HOME/tmp" --setenv MOCK_LOG "$MOCK_LOG" \
+        --setenv XDG_CONFIG_HOME "$HOME/.config" \
         --setenv XDG_DATA_HOME "$HOME/.local/share" \
         --setenv XDG_CACHE_HOME "$HOME/.cache" \
         --setenv XDG_STATE_HOME "$HOME/.local/state" \
         --ro-bind "$OPENCODE_CONFIG_DIR" "$HOME/.config/opencode" \
         --bind "$OPENCODE_DATA_DIR" "$HOME/.local/share/opencode" \
-        --ro-bind "$BINARY" /usr/bin/omarchy-guardian \
         --chdir "$chdir" \
         --share-net \
         --new-session \
@@ -425,7 +431,7 @@ settings_gate() {
     printf '=== settings and profiles ===\n'
     local user_config=$HOME/.config/omarchy-guardian/config.toml
     local output=$E2E/settings-output
-    mkdir -p "${user_config%/*}" "$E2E/etc-guardian"
+    mkdir -p "${user_config%/*}"
 
     # The official-package WARNED path is not covered here: the harness has no
     # signed sync database, so every pacman -S target would be refused before
@@ -456,10 +462,9 @@ settings_gate() {
     rm -f -- "$user_config"
 
     # A system file the user can write must not be trusted by the pacman gate.
-    printf 'profile = "local-only"\n' >"$E2E/etc-guardian/config.toml"
+    printf 'profile = "local-only"\n' >"$E2E/etc-layer/omarchy-guardian/config.toml"
     printf '%s\n' guardian-good | sandbox "$E2E/pkg" \
-        --overlay-src /etc --tmp-overlay /etc \
-        --ro-bind "$E2E/etc-guardian/config.toml" /etc/omarchy-guardian/config.toml -- \
+        --overlay-src /etc --overlay-src "$E2E/etc-layer" --tmp-overlay /etc -- \
         "$E2E/fakebin/pacman" -U "$E2E/packages/guardian-good-1-1-x86_64.pkg.tar.zst" >"$output" 2>&1
     expect 'an insecure system config blocks the pacman gate' 2 "$?"
     expect_output 'the pacman block points at config check' 'config check' "$output"
