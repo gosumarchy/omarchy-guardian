@@ -364,7 +364,7 @@ MOCK
     # A later pass (yay's build call) finds upstream sources extracted into
     # src/: they are reviewed before makepkg runs any PKGBUILD function.
     mkdir -p "$E2E/build/src/upstream"
-    printf '#!/bin/sh\nmake\n' >"$E2E/build/src/upstream/build.sh"
+    printf '#!/bin/sh\nprintf "hello\\n" >hello.txt\n' >"$E2E/build/src/upstream/build.sh"
     run_shim "$E2E/build" --noconfirm --noextract >"$E2E/upstream.log"
     expect 'clean upstream sources are allowed' 0 "$?"
     grep -q '^Upstream: ' "$E2E/upstream.log"

@@ -25,13 +25,19 @@ plugins, and reviews that code **before any of it runs**:
   execute, privilege escalation, persistence, credential access and
   exfiltration, encoded commands, destructive operations). An AI reviewer
   then reads the code with every tool switched off and must echo a one-time
-  nonce, so it cannot be skipped or faked by the code it reads.
+  nonce, so a reply that never saw the code cannot pass as a review. The
+  code can still try to talk the reviewer into a clean verdict, which is one
+  reason the local rules always run too and a clear result is not a
+  guarantee.
 - **What counts as auto-run.** For pacman packages: install scriptlets, and
   files that run without you starting them (pacman hooks, enabled systemd
   units, sudoers, polkit, PAM, udev, tmpfiles, profile scripts, autostart
   entries). Unchanged files are skipped on upgrade.
-- **AUR builds.** The recipe is reviewed before any of it runs; the sources
-  are then fetched without running a PKGBUILD function and reviewed too.
+- **AUR builds.** The recipe (PKGBUILD) is reviewed before any of it runs.
+  makepkg then runs the approved recipe only to download and unpack the
+  sources (its top-level code runs; `pkgver()`, `prepare()`, `verify()`,
+  `build()` and `package()` do not), and the unpacked sources are reviewed
+  before anything is built.
   Plain-HTTP sources without checksums block, and the AUR's own trust signals
   (age, votes, maintainer changes) are part of the review.
 - **Fail closed.** A review that cannot finish blocks. An unavailable AI
@@ -40,11 +46,16 @@ plugins, and reviews that code **before any of it runs**:
 - **Blocks you can read.** A block also raises a desktop notification with
   the Guardian knight. Clicking it opens the full report as a page in your
   browser, saved privately under `~/.cache/omarchy-guardian/reports` (the
-  newest 20 are kept). The page runs no scripts and loads nothing, and
-  everything quoted from the reviewed code is escaped. Its *Ask your AI agent*
-  button opens Claude Code (or OpenCode) in a terminal with the report and
-  every tool switched off, so you can ask what was found and whether it is a
-  false positive, and nothing in the report can make the agent act.
+  newest 20 are kept; nothing is saved when Guardian runs as root). The page
+  runs no scripts and loads nothing. Everything quoted from the reviewed code
+  is escaped, and control and invisible characters are shown as codes, in the
+  page and in the terminal alike. Its *Ask your AI agent* button opens Claude
+  Code (or OpenCode) in a terminal with the report. The agent runs with every
+  tool, MCP server and your own agent settings switched off, so it can only
+  talk. It is told to treat the report as untrusted, but treat its answer as
+  advice: never run a command because the report or the agent quotes it. The
+  report is passed on the agent's command line, which other local users can
+  read.
 - **In your bar.** The Guardian knight sits in the bar: calm when every gate
   is on, red-eyed when something needs attention (a gate is off, a setting is
   broken, or a block in the last day is unseen), dim when protection is off.
@@ -572,8 +583,11 @@ gate does, in order:
    - a git (or other VCS) source not pinned to a commit, or an unverified
      download over HTTPS, is a warning.
 4. **Upstream code.** If the call extracts the sources, the gate first
-   fetches and extracts them itself with `makepkg --nobuild --noprepare
-   --nodeps`, so no PKGBUILD function has run yet. The AI then reviews the
+   fetches and extracts them itself: makepkg runs a private copy of the
+   approved recipe with `--nobuild --noprepare --nodeps`, in which
+   `pkgver()`, `prepare()` and `verify()` are replaced with no-ops, so no
+   upstream code has run yet (the build then keeps the version with
+   `--holdver`). The AI then reviews the
    upstream code under `src/`: all of it when its code is up to 1 MiB,
    otherwise its build files and scripts (makefiles, CMake, meson,
    `configure`, `setup.py`, `build.rs`, `package.json`, shell scripts…)

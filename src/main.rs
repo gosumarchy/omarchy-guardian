@@ -45,6 +45,7 @@ mod setup;
 mod sha256;
 #[cfg(test)]
 mod test_support;
+mod text;
 mod tomlish;
 mod tools;
 mod tui;

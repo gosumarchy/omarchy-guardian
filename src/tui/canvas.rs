@@ -124,8 +124,10 @@ impl Canvas {
             if column >= end {
                 break;
             }
-            let character = if character.is_control() {
-                ' '
+            // Hidden characters in a file name or summary would reorder
+            // or hide what the screen shows.
+            let character = if crate::text::is_hidden(character) {
+                '\u{fffd}'
             } else {
                 character
             };

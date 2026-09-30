@@ -62,29 +62,7 @@ impl Store {
     pub fn open(root: PathBuf) -> Result<Self, String> {
         let describe = |path: &Path, error: io::Error| format!("{}: {error}", path.display());
         let uid = effective_uid()?;
-        match fs::symlink_metadata(&root) {
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => create_root(&root, uid)?,
-            Err(error) => return Err(describe(&root, error)),
-        }
-
-        let metadata = fs::symlink_metadata(&root).map_err(|error| describe(&root, error))?;
-        if !metadata.file_type().is_dir() {
-            return Err(format!("{} is not a directory", root.display()));
-        }
-        if metadata.uid() != uid {
-            return Err(format!(
-                "{} is owned by uid {}, not {uid}",
-                root.display(),
-                metadata.uid()
-            ));
-        }
-        if metadata.mode() & 0o077 != 0 {
-            return Err(format!(
-                "{} is accessible to group or others",
-                root.display()
-            ));
-        }
+        private_dir(&root, uid)?;
 
         for name in [BLOBS, BASELINES, VERDICTS] {
             let path = root.join(name);
@@ -258,6 +236,38 @@ impl Store {
     }
 }
 
+/// Makes sure `root` is a private directory of `uid`: creates it (and
+/// missing parents, mode 0700) only under an existing directory owned by
+/// `uid`, then requires a real directory (not a symlink) owned by `uid` with
+/// no access for group or others.
+pub fn private_dir(root: &Path, uid: u32) -> Result<(), String> {
+    let describe = |path: &Path, error: io::Error| format!("{}: {error}", path.display());
+    match fs::symlink_metadata(root) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => create_root(root, uid)?,
+        Err(error) => return Err(describe(root, error)),
+    }
+
+    let metadata = fs::symlink_metadata(root).map_err(|error| describe(root, error))?;
+    if !metadata.file_type().is_dir() {
+        return Err(format!("{} is not a directory", root.display()));
+    }
+    if metadata.uid() != uid {
+        return Err(format!(
+            "{} is owned by uid {}, not {uid}",
+            root.display(),
+            metadata.uid()
+        ));
+    }
+    if metadata.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{} is accessible to group or others",
+            root.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Creates the store directory and any missing parents (mode 0700), but only
 /// when the nearest existing ancestor is a directory (a symlink to one, such
 /// as a symlinked HOME, counts as its target) owned by `uid`. Under `sudo -E`
@@ -336,7 +346,7 @@ fn unix_secs(time: SystemTime) -> u64 {
 }
 
 /// The effective user id, from `/proc/self/status` (`Uid: real effective saved fs`).
-fn effective_uid() -> Result<u32, String> {
+pub fn effective_uid() -> Result<u32, String> {
     let status = fs::read_to_string("/proc/self/status")
         .map_err(|error| format!("/proc/self/status: {error}"))?;
     status
@@ -352,7 +362,9 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
-    use super::{BASELINES, BLOBS, Store, TEMP_PREFIX, VERDICTS, is_hex_digest, summary};
+    use super::{
+        BASELINES, BLOBS, Store, TEMP_PREFIX, VERDICTS, is_hex_digest, private_dir, summary,
+    };
     use crate::test_support::TempDir;
 
     #[test]
@@ -529,5 +541,24 @@ mod tests {
         if let Some(root) = Store::default_root() {
             assert!(root.ends_with("omarchy-guardian"));
         }
+    }
+
+    #[test]
+    fn a_private_directory_must_be_a_real_own_directory_closed_to_others() {
+        let dir = TempDir::new("private-dir");
+        let uid = std::os::unix::fs::MetadataExt::uid(&fs::metadata(dir.path()).unwrap());
+        let made = dir.path().join("a/b");
+        private_dir(&made, uid).unwrap();
+        assert_eq!(fs::metadata(&made).unwrap().permissions().mode() & 0o777, 0o700);
+        assert!(private_dir(&made, uid + 1).is_err());
+
+        let open = dir.path().join("open");
+        fs::create_dir(&open).unwrap();
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(private_dir(&open, uid).is_err());
+
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&made, &link).unwrap();
+        assert!(private_dir(&link, uid).is_err());
     }
 }

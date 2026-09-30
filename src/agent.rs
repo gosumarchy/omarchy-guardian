@@ -382,7 +382,7 @@ fn claude_verdict(
     parse_review(text, nonce).map_err(AgentError::Invalid)
 }
 
-fn random_nonce() -> Result<String, Error> {
+pub(crate) fn random_nonce() -> Result<String, Error> {
     let path = Path::new("/dev/urandom");
     let mut bytes = [0_u8; 16];
     File::open(path)
@@ -396,38 +396,74 @@ fn random_nonce() -> Result<String, Error> {
 }
 
 pub(crate) fn opencode_config() -> Json {
-    let permissions = Json::object(
+    locked_config(
+        [(
+            "guardian-review",
+            locked_agent(
+                "Reviews untrusted source code for security risks without using tools.",
+                SYSTEM_PROMPT,
+            ),
+        )],
+        None,
+    )
+}
+
+/// The OpenCode config for `omarchy-guardian ask`: one tool-less
+/// `guardian-ask` agent with `system` as its prompt, made the default, and
+/// the built-in agents disabled, since a user's config can give those tools
+/// that override the top-level denies.
+pub(crate) fn opencode_ask_config(system: &str) -> Json {
+    let disabled = || Json::object([("disable", Json::from(true))]);
+    locked_config(
+        [
+            (
+                "guardian-ask",
+                locked_agent("Explains a Guardian block report without tools.", system),
+            ),
+            ("build", disabled()),
+            ("plan", disabled()),
+            ("general", disabled()),
+            ("explore", disabled()),
+        ],
+        Some("guardian-ask"),
+    )
+}
+
+/// An agent with every permission denied, no tools and one step per message.
+fn locked_agent(description: &str, prompt: &str) -> Json {
+    Json::object([
+        ("description", Json::from(description)),
+        ("mode", Json::from("primary")),
+        ("prompt", Json::from(prompt)),
+        ("steps", Json::from(1_u64)),
+        ("permission", denied_permissions()),
+        ("tools", Json::object([("*", Json::from(false))])),
+    ])
+}
+
+fn denied_permissions() -> Json {
+    Json::object(
         DENIED_PERMISSIONS
             .iter()
             .map(|permission| (*permission, Json::from("deny"))),
-    );
-    let no_tools = Json::object([("*", Json::from(false))]);
+    )
+}
 
-    Json::object([
-        (
-            "agent",
-            Json::object([(
-                "guardian-review",
-                Json::object([
-                    (
-                        "description",
-                        Json::from(
-                            "Reviews untrusted source code for security risks without using tools.",
-                        ),
-                    ),
-                    ("mode", Json::from("primary")),
-                    ("prompt", Json::from(SYSTEM_PROMPT)),
-                    ("steps", Json::from(1_u64)),
-                    ("permission", permissions.clone()),
-                    ("tools", no_tools.clone()),
-                ]),
-            )]),
-        ),
-        ("permission", permissions),
-        ("tools", no_tools),
+fn locked_config<'a>(
+    agents: impl IntoIterator<Item = (&'a str, Json)>,
+    default_agent: Option<&str>,
+) -> Json {
+    let mut members = vec![
+        ("agent", Json::object(agents)),
+        ("permission", denied_permissions()),
+        ("tools", Json::object([("*", Json::from(false))])),
         ("instructions", Json::Array(Vec::new())),
         ("share", Json::from("disabled")),
-    ])
+    ];
+    if let Some(agent) = default_agent {
+        members.push(("default_agent", Json::from(agent)));
+    }
+    Json::object(members)
 }
 
 /// What OpenCode's JSON event stream contained, gathered in full before the

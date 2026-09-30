@@ -114,7 +114,7 @@ fn perform(terminal: &mut Terminal, effect: &Effect) -> Result<String, String> {
     match effect {
         Effect::SaveUser(text) => save_user(text),
         Effect::SaveSystem(text) => on_terminal(terminal, false, || {
-            println!("Installing {SYSTEM_PATH} with sudo…");
+            outln!("Installing {SYSTEM_PATH} with sudo…");
             setup::RealEnvironment.write_system(text)?;
             Ok(format!("Saved {SYSTEM_PATH}."))
         }),
@@ -142,7 +142,7 @@ fn on_terminal(
     terminal.suspend().map_err(|error| error.to_string())?;
     let outcome = work();
     if let Err(error) = &outcome {
-        eprintln!("\n{error}");
+        errln!("\n{error}");
     }
     if pause || outcome.is_err() {
         terminal.pause("Press Enter to return to Guardian.");
@@ -258,7 +258,7 @@ pub fn protect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String> {
         }
     }
     for note in &notes {
-        println!("{note}");
+        outln!("{note}");
     }
     if steps.is_empty() {
         return Ok("Nothing to turn on.".into());
@@ -267,9 +267,9 @@ pub fn protect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String> {
         summary: "Protect everything".into(),
         steps,
     };
-    println!("\nTo turn the rest on, Guardian will:");
+    outln!("\nTo turn the rest on, Guardian will:");
     for line in plan.describe(&paths) {
-        println!("  {line}");
+        outln!("  {line}");
     }
     if !yes && !confirm.confirm("Go ahead?") {
         return Err("nothing was changed".into());
@@ -295,7 +295,7 @@ pub fn unprotect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String>
                     steps.extend(plan.steps);
                 }
             }
-            State::Foreign(detail) => println!("- {} left as is: {detail}", integration.label()),
+            State::Foreign(detail) => outln!("- {} left as is: {detail}", integration.label()),
             State::Off | State::Unavailable(_) => {}
         }
     }
@@ -306,11 +306,11 @@ pub fn unprotect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String>
         summary: "Protection off".into(),
         steps,
     };
-    println!("To turn protection off, Guardian will:");
+    outln!("To turn protection off, Guardian will:");
     for line in plan.describe(&paths) {
-        println!("  {line}");
+        outln!("  {line}");
     }
-    println!("Until you turn it back on, installs are not reviewed.");
+    outln!("Until you turn it back on, installs are not reviewed.");
     if !yes && !confirm.confirm("Turn protection off?") {
         return Err("nothing was changed".into());
     }

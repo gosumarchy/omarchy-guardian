@@ -36,7 +36,7 @@ use crate::engine::baseline::{Identity, Unit};
 use crate::engine::store::Store;
 use crate::error::{Error, IoContext};
 use crate::json::Json;
-use crate::notify;
+use crate::notify::{self, Ran};
 use crate::osv;
 use crate::pacman;
 use crate::report::{Blocked, Decision, Gap};
@@ -84,25 +84,25 @@ fi
 
 pub fn run(command: &[OsString], settings: &Settings) -> ExitCode {
     let Some((makepkg, arguments)) = command.split_first() else {
-        eprintln!("omarchy-guardian makepkg-gate: no makepkg command was given");
+        errln!("omarchy-guardian makepkg-gate: no makepkg command was given");
         return ExitCode::from(2);
     };
     let mirrored = match mirrored_arguments(arguments) {
         Ok(mirrored) => mirrored,
         Err(message) => {
-            eprintln!("Guardian makepkg gate: {message}");
+            errln!("Guardian makepkg gate: {message}");
             return ExitCode::from(2);
         }
     };
     let build_dir = match env::current_dir().and_then(|dir| dir.canonicalize()) {
         Ok(dir) => dir,
         Err(error) => {
-            eprintln!("omarchy-guardian makepkg-gate: cannot use the working directory: {error}");
+            errln!("omarchy-guardian makepkg-gate: cannot use the working directory: {error}");
             return ExitCode::from(2);
         }
     };
     let Ok(recipe) = fs::read_to_string(build_dir.join("PKGBUILD")) else {
-        eprintln!("Guardian makepkg gate requires a readable PKGBUILD in the working directory.");
+        errln!("Guardian makepkg gate requires a readable PKGBUILD in the working directory.");
         return ExitCode::from(2);
     };
     remove_stale_copies(&build_dir);
@@ -133,13 +133,13 @@ pub fn run(command: &[OsString], settings: &Settings) -> ExitCode {
         &recipe_context,
     );
     if !decision.allows_running() {
-        eprintln!("Guardian blocked makepkg because the review of the recipe did not allow it.");
-        notify_block(&directory_name, decision, "the recipe");
+        errln!("Guardian blocked makepkg because the review of the recipe did not allow it.");
+        notify_block(&directory_name, decision, "the recipe", Ran::Nothing);
         return decision.exit_code();
     }
     if let Err(error) = scan::verify_unchanged(&target.config, &report.snapshot) {
-        eprintln!("Guardian blocked makepkg because {error}.");
-        notify::blocked(&subject(&directory_name), &error.to_string());
+        errln!("Guardian blocked makepkg because {error}.");
+        notify::blocked(&subject(&directory_name), &error.to_string(), Ran::Nothing);
         return ExitCode::from(2);
     }
 
@@ -169,8 +169,13 @@ pub fn run(command: &[OsString], settings: &Settings) -> ExitCode {
 
     // 4. The build: the recipe must be exactly what was reviewed.
     if let Err(error) = verify_recipe(&target.config, &report.snapshot, &downloads) {
-        eprintln!("Guardian blocked makepkg because {error}.");
-        notify::blocked(&subject(&directory_name), &error.to_string());
+        errln!("Guardian blocked makepkg because {error}.");
+        let ran = if invocation.runs_functions {
+            Ran::RecipeToFetch
+        } else {
+            Ran::Nothing
+        };
+        notify::blocked(&subject(&directory_name), &error.to_string(), ran);
         return ExitCode::from(2);
     }
     start_build(Path::new(makepkg), arguments, invocation.extracts, pinned)
@@ -182,15 +187,16 @@ fn refuse_moved_directories(recipe: &str, directory_name: &str) -> Option<ExitCo
     if moved.is_empty() {
         return None;
     }
-    eprintln!(
+    errln!(
         "Guardian blocked makepkg: the PKGBUILD sets makepkg's own directories, which moves the sources past the review:"
     );
     for line in &moved {
-        eprintln!("  ! {line}");
+        errln!("  ! {line}");
     }
     notify::blocked(
         &subject(directory_name),
         "the PKGBUILD moves makepkg's build or download directories",
+        Ran::Nothing,
     );
     Some(ExitCode::from(1))
 }
@@ -212,7 +218,7 @@ fn start_build(
     extracted: bool,
     pinned: Option<Probe>,
 ) -> ExitCode {
-    eprintln!("Guardian: review clear; starting {}", makepkg.display());
+    errln!("Guardian: review clear; starting {}", makepkg.display());
     let mut arguments = arguments.to_vec();
     if extracted && !arguments.iter().any(|arg| arg == "--holdver") {
         arguments.push("--holdver".into());
@@ -225,7 +231,7 @@ fn start_build(
         build.env("SRCDEST", &probe.srcdest);
     }
     let error = build.exec();
-    eprintln!("Could not start {}: {error}", makepkg.display());
+    errln!("Could not start {}: {error}", makepkg.display());
     ExitCode::from(2)
 }
 
@@ -366,7 +372,7 @@ fn aur_facts(base: Option<&str>, directory_name: &str, recipe: &str) -> Vec<Stri
             outln!("{fact}");
             facts.push(fact);
         }
-        Err(error) => eprintln!("Guardian: AUR metadata unavailable ({error})."),
+        Err(error) => errln!("Guardian: AUR metadata unavailable ({error})."),
     }
     facts
 }
@@ -504,8 +510,8 @@ fn probe(step: &UpstreamStep<'_>, copy: &RecipeCopy) -> Result<(Vec<aur::Source>
 /// Fetches and extracts the sources from the recipe copy, where
 /// `pkgver()`, `prepare()` and `verify()` do nothing.
 fn pre_extract(step: &UpstreamStep<'_>, copy: &RecipeCopy) -> Result<(), String> {
-    eprintln!(
-        "Guardian: fetching and extracting the sources for review (pkgver(), prepare() and verify() do not run)..."
+    errln!(
+        "Guardian: fetching and extracting the sources for review (makepkg runs the approved PKGBUILD only to download them; pkgver(), prepare() and verify() do not run and nothing is built)..."
     );
     let status = Command::new(step.makepkg)
         .current_dir(step.build_dir)
@@ -540,15 +546,25 @@ fn source_context(sources: &[aur::Source]) -> Result<Vec<String>, ()> {
         .collect())
 }
 
-/// Returns why makepkg must not start, as an exit code.
+/// How much upstream code the AI may be sent: the AUR class's input limit
+/// times its chunks, and at least a partial review's worth.
+fn upstream_budget(settings: &Settings) -> u64 {
+    let aur = settings.agent_settings(SourceClass::Aur);
+    u64::try_from(aur.max_input_bytes.saturating_mul(aur.max_chunks))
+        .unwrap_or(u64::MAX)
+        .max(aur::PARTIAL_REVIEW_BYTES)
+}
+
+/// Returns why makepkg must not start, as an exit code. A block notes that
+/// the recipe ran: makepkg sources the recipe copy from the first probe on.
 fn review_upstream(
     step: &UpstreamStep<'_>,
     settings: &Settings,
     facts: Vec<String>,
 ) -> Result<UpstreamOutcome, ExitCode> {
     let block = |message: String, why: &str, code: u8| {
-        eprintln!("Guardian blocked makepkg: {message}");
-        notify::blocked(&subject(step.name), why);
+        errln!("Guardian blocked makepkg: {message}");
+        notify::blocked(&subject(step.name), why, Ran::RecipeToFetch);
         ExitCode::from(code)
     };
     let copy = RecipeCopy::create(step.build_dir, step.recipe).map_err(|error| {
@@ -568,7 +584,7 @@ fn review_upstream(
     if let Some(base) = step.base
         && base != probe.pkgbase
     {
-        eprintln!(
+        errln!(
             "Guardian: the PKGBUILD's pkgbase {:?} differs from its AUR repository {base}.",
             probe.pkgbase
         );
@@ -597,14 +613,7 @@ fn review_upstream(
     }
     drop(copy);
 
-    let settings_aur = settings.agent_settings(SourceClass::Aur);
-    let budget = u64::try_from(
-        settings_aur
-            .max_input_bytes
-            .saturating_mul(settings_aur.max_chunks),
-    )
-    .unwrap_or(u64::MAX)
-    .max(aur::PARTIAL_REVIEW_BYTES);
+    let budget = upstream_budget(settings);
     let srcdir = probe.srcdir();
     let roots = Roots {
         build_dir: step.build_dir,
@@ -640,10 +649,15 @@ fn review_upstream(
             Ok(UpstreamOutcome { probe, downloads })
         }
         Decision::Blocked(_) => {
-            eprintln!(
+            errln!(
                 "Guardian blocked makepkg because the review of the upstream sources did not allow it."
             );
-            notify_block(step.name, decision, "the upstream sources");
+            notify_block(
+                step.name,
+                decision,
+                "the upstream sources",
+                Ran::RecipeToFetch,
+            );
             Err(decision.exit_code())
         }
     }
@@ -720,13 +734,14 @@ fn subject(name: &str) -> String {
 }
 
 /// Notifies a blocked review of `what`; a build the user declined is not news.
-fn notify_block(name: &str, decision: Decision, what: &str) {
+fn notify_block(name: &str, decision: Decision, what: &str, ran: Ran) {
     if let Decision::Blocked(blocked) = decision
         && blocked != Blocked::NotConfirmed
     {
         notify::blocked(
             &subject(name),
             &format!("{what}: {}", notify::reason(blocked)),
+            ran,
         );
     }
 }
