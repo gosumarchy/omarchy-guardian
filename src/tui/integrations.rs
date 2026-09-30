@@ -305,19 +305,27 @@ impl Paths {
         let Ok(config) = fs::read_to_string(&self.waybar_config) else {
             return State::Unavailable("no Waybar configuration".into());
         };
-        let defined = config
+        let key = format!("{WAYBAR_MODULE}:");
+        let definitions: Vec<&str> = config
             .lines()
-            .any(|line| line.trim_start().starts_with(&format!("{WAYBAR_MODULE}:")));
-        let placed = config.lines().any(|line| {
-            line.contains(WAYBAR_MODULE)
-                && !line.trim_start().starts_with(&format!("{WAYBAR_MODULE}:"))
-        });
+            .filter(|line| line.trim_start().starts_with(&key))
+            .collect();
+        let placed = config
+            .lines()
+            .any(|line| line.contains(WAYBAR_MODULE) && !line.trim_start().starts_with(&key));
         let styled = fs::read_to_string(&self.waybar_style).is_ok_and(|style| {
             style.contains(WAYBAR_STYLE_BEGIN) && style.contains(WAYBAR_STYLE_END)
         });
-        match (defined, placed, styled) {
-            (true, true, true) => State::On,
-            (false, false, _) => State::Off,
+        // Only Guardian's current line counts: an edited or older one (a
+        // different command, size or click action) is replaced by turning
+        // the module on.
+        let current = definitions.as_slice() == [WAYBAR_DEFINITION];
+        match (definitions.is_empty(), placed, styled) {
+            (true, false, _) => State::Off,
+            (false, true, true) if current => State::On,
+            (false, _, _) if !current => State::Partial(
+                "its config line is not Guardian's current one; turning it on replaces it".into(),
+            ),
             _ => State::Partial("partly set up; turning it on completes it".into()),
         }
     }
@@ -1125,5 +1133,42 @@ mod tests {
             WAYBAR_CONFIG
         );
         assert_eq!(fs::read_to_string(&paths.waybar_style).unwrap(), style);
+    }
+
+    #[test]
+    fn an_edited_waybar_line_is_repaired_by_turning_the_module_on() {
+        let dir = TempDir::new("integrations-waybar-repair");
+        let paths = paths(&dir);
+        fs::create_dir_all(dir.path().join("waybar")).unwrap();
+        fs::write(&paths.waybar_config, WAYBAR_CONFIG).unwrap();
+        fs::write(&paths.waybar_style, "#battery { padding: 0 9px; }\n").unwrap();
+        let on = paths.plan(Integration::WaybarModule, &State::Off).unwrap();
+        for step in &on.steps {
+            paths.edit(step).unwrap();
+        }
+        assert_eq!(paths.state(Integration::WaybarModule), State::On);
+
+        // A line pointing at another binary, as a hand edit or an older
+        // Guardian would leave it.
+        let config = fs::read_to_string(&paths.waybar_config).unwrap();
+        fs::write(
+            &paths.waybar_config,
+            config.replace(
+                "\"omarchy-guardian status --waybar\"",
+                "\"/tmp/other status --waybar\"",
+            ),
+        )
+        .unwrap();
+        let state = paths.state(Integration::WaybarModule);
+        assert!(matches!(state, State::Partial(_)), "{state:?}");
+
+        let repair = paths.plan(Integration::WaybarModule, &state).unwrap();
+        for step in &repair.steps {
+            paths.edit(step).unwrap();
+        }
+        assert_eq!(paths.state(Integration::WaybarModule), State::On);
+        let repaired = fs::read_to_string(&paths.waybar_config).unwrap();
+        assert!(!repaired.contains("/tmp/other"));
+        assert_eq!(repaired.matches("\"image#omarchy-guardian\"").count(), 2);
     }
 }
