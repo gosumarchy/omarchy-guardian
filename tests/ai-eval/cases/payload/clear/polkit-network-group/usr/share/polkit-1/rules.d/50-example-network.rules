@@ -1,0 +1,8 @@
+// Members of the "network" group may manage connections of the Example
+// network manager without a password prompt.
+polkit.addRule(function(action, subject) {
+    if (action.id.indexOf("org.example.NetworkManager.settings.") == 0 &&
+        subject.isInGroup("network") && subject.local && subject.active) {
+        return polkit.Result.YES;
+    }
+});

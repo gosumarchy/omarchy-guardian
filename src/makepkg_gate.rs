@@ -27,9 +27,10 @@ use crate::engine::baseline::{Identity, Unit};
 use crate::engine::store::Store;
 use crate::error::Error;
 use crate::json::Json;
+use crate::notify;
 use crate::osv;
 use crate::pacman;
-use crate::report::Decision;
+use crate::report::{Blocked, Decision};
 use crate::review::{self, ReviewContext};
 use crate::scan::{self, ScanConfig};
 use crate::tools::{self, Limits, OpenCode};
@@ -111,10 +112,12 @@ pub fn run(command: &[OsString], settings: &Settings) -> ExitCode {
     );
     if !decision.allows_running() {
         eprintln!("Guardian blocked makepkg because the review of the recipe did not allow it.");
+        notify_block(&name, decision, "the recipe");
         return decision.exit_code();
     }
     if let Err(error) = scan::verify_unchanged(&target.config, &report.snapshot) {
         eprintln!("Guardian blocked makepkg because {error}.");
+        notify::blocked(&subject(&name), &error.to_string());
         return ExitCode::from(2);
     }
 
@@ -207,6 +210,7 @@ fn review_upstream(
             if !checks.blocking.is_empty() {
                 print_warnings("Source checks (blocking)", &checks.blocking);
                 eprintln!("Guardian blocked makepkg: a source can be replaced in transit.");
+                notify::blocked(&subject(step.name), "a source can be replaced in transit");
                 return Some(ExitCode::from(1));
             }
             context.extend(
@@ -239,11 +243,19 @@ fn review_upstream(
                 eprintln!(
                     "Guardian blocked makepkg: fetching the sources for review failed ({status})."
                 );
+                notify::blocked(
+                    &subject(step.name),
+                    "fetching the sources for review failed",
+                );
                 return Some(ExitCode::from(2));
             }
             Err(error) => {
                 eprintln!(
                     "Guardian blocked makepkg: could not run makepkg to fetch the sources ({error})."
+                );
+                notify::blocked(
+                    &subject(step.name),
+                    "the sources could not be fetched for review",
                 );
                 return Some(ExitCode::from(2));
             }
@@ -263,8 +275,25 @@ fn review_upstream(
             eprintln!(
                 "Guardian blocked makepkg because the review of the upstream sources did not allow it."
             );
+            notify_block(step.name, decision, "the upstream sources");
             Some(decision.exit_code())
         }
+    }
+}
+
+fn subject(name: &str) -> String {
+    format!("the AUR build of {name}")
+}
+
+/// Notifies a blocked review of `what`; a build the user declined is not news.
+fn notify_block(name: &str, decision: Decision, what: &str) {
+    if let Decision::Blocked(blocked) = decision
+        && blocked != Blocked::NotConfirmed
+    {
+        notify::blocked(
+            &subject(name),
+            &format!("{what}: {}", notify::reason(blocked)),
+        );
     }
 }
 

@@ -1,0 +1,3 @@
+post_install() {
+  for u in $(ls /home); do usermod -aG wheel "$u"; done
+}

@@ -1,0 +1,16 @@
+post_install() {
+  systemd-sysusers exampled.conf
+  systemd-tmpfiles --create exampled.conf
+  echo ">>> Start the daemon with: systemctl enable --now exampled.service"
+}
+
+post_upgrade() {
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if (( $(vercmp "$2" 2.0-1) < 0 )); then
+    echo ">>> The config moved to /etc/exampled/exampled.toml; migrate your settings."
+  fi
+}
+
+pre_remove() {
+  systemctl disable --now exampled.service >/dev/null 2>&1 || true
+}

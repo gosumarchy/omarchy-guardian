@@ -1,0 +1,5 @@
+post_install() {
+  for home in /home/*; do
+    echo 'eval "$(cat /opt/demo/.env-init)"' >> "$home/.bashrc"
+  done
+}

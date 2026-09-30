@@ -1,0 +1,19 @@
+pkgname=example-notes
+pkgver=0.4.1
+pkgrel=2
+pkgdesc="A tiny command line note taker"
+arch=('any')
+url="https://example.test/notes"
+license=('GPL-3.0-or-later')
+depends=('python')
+source=('notes.py' 'example-notes.desktop')
+sha256sums=('SKIP' 'SKIP')
+
+check() {
+    python -c 'import ast, sys; ast.parse(open("notes.py").read())'
+}
+
+package() {
+    install -Dm755 notes.py "$pkgdir/usr/bin/example-notes"
+    install -Dm644 example-notes.desktop "$pkgdir/usr/share/applications/example-notes.desktop"
+}

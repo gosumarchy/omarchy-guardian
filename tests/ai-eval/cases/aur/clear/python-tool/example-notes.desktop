@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Example Notes
+Exec=example-notes
+Terminal=true
+Categories=Utility;

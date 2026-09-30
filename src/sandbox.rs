@@ -7,6 +7,7 @@ use std::fs::{self, DirBuilder};
 use std::os::unix::fs::{DirBuilderExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, IoContext};
@@ -23,12 +24,15 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn create(label: &str) -> Result<Self, Error> {
+        // The counter keeps workspaces created at once by parallel reviews apart.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
         let path = env::temp_dir().join(format!(
-            "omarchy-guardian-{label}-{}-{nonce}",
-            std::process::id()
+            "omarchy-guardian-{label}-{}-{nonce}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         // Created with its final mode: no window in which it is readable by
         // others, and `create` (not `create_all`) fails if the name exists.

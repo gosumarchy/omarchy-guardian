@@ -4,6 +4,48 @@ Omarchy Guardian inspects downloaded source code before you run or install it
 on Arch Linux / Omarchy. It is an early, heuristic tool: a clear result is not
 a safety guarantee.
 
+## How protection works
+
+Guardian sits in front of the ways Omarchy installs packages, themes and
+plugins, and reviews that code **before any of it runs**:
+
+```
+ pacman -S / -U / -Syu ──► pacman hook ─────► install scriptlets + auto-run files
+ yay (AUR)             ──► makepkg gate ────► PKGBUILD, then the upstream sources
+ omarchy theme install ──► theme gate ──────► the theme checkout
+ omarchy plugin add    ──► plugin gate ─────► the plugin checkout
+                                  │
+                   local rules + AI review (Claude Code or OpenCode)
+                                  │
+             clear ─► the install goes ahead
+             risk  ─► blocked, full report in the terminal + desktop notification
+```
+
+- **Two reviews.** Fast local rules flag known-bad patterns (download and
+  execute, privilege escalation, persistence, credential access and
+  exfiltration, encoded commands, destructive operations). An AI reviewer
+  then reads the code with every tool switched off and must echo a one-time
+  nonce, so it cannot be skipped or faked by the code it reads.
+- **What counts as auto-run.** For pacman packages: install scriptlets, and
+  files that run without you starting them (pacman hooks, enabled systemd
+  units, sudoers, polkit, PAM, udev, tmpfiles, profile scripts, autostart
+  entries). Unchanged files are skipped on upgrade.
+- **AUR builds.** The recipe is reviewed before any of it runs; the sources
+  are then fetched without running a PKGBUILD function and reviewed too.
+  Plain-HTTP sources without checksums block, and the AUR's own trust signals
+  (age, votes, maintainer changes) are part of the review.
+- **Fail closed.** A review that cannot finish blocks. An unavailable AI
+  blocks community sources; for official Arch/Omarchy updates the `standard`
+  profile warns instead, `strict` blocks.
+- **Nothing to babysit.** The settings app (`omarchy-guardian tui`) turns
+  every gate on with *Protect everything*, picks the protection level and the
+  model, and tests the reviewer with a malicious and a harmless sample.
+- **Not covered.** Programs you download and run yourself, `curl | sh`
+  pasted into a terminal, Flatpak, npm, pip, mise and other language package
+  managers, and the binaries inside a package (only what runs at install or
+  boot is reviewed). `omarchy-guardian guard` and `sandbox` cover a download
+  you start by hand.
+
 It is a single Rust binary with **no third-party crates**. SHA-256, JSON, and
 the small subset of TOML it needs are implemented in the crate so the whole
 gate can be audited in one place. It builds only for Linux.
@@ -58,8 +100,10 @@ profile for your own sources and for pacman alike:
 | Maximum | `strict` | AI review for everything; any finding blocks |
 | Private | `local-only` | no AI: nothing leaves the machine; you confirm installs |
 
-You can also pick the OpenCode model used for both, turn on every install
-gate at once (*Protect everything*), or reset to the defaults.
+You can also pick the model used for both (Claude Code models are listed and
+suggested when `claude` is installed, otherwise OpenCode's), turn on every
+install gate at once (*Protect everything*), test the reviewer (`t`), or reset
+to the defaults.
 
 Press `e` for **expert mode** (or start there with `tui --expert`), which
 has every setting:
@@ -70,7 +114,7 @@ has every setting:
 | Sources | every knob of every source class; pacman-enforced classes in the system file, the rest in the user file |
 | AI | model, input size and call limits for your sources and for the pacman gate, review-memory limits, official repositories |
 | Integrations | turn the pacman hook, the yay AUR gate, the theme & plugin gate and the Omarchy menu entry on or off |
-| Maintenance | show and check the effective settings, edit either file in `$EDITOR`, see or forget the review memory, run the guided setup |
+| Maintenance | show and check the effective settings, edit either file in `$EDITOR`, see or forget the review memory, test the reviewer, run the guided setup |
 
 Unset values show what they inherit and from where. Keys: `↑↓` move,
 `Tab`/`1`–`5` switch tabs, `Enter` edit, `Space` cycle a choice, `x` reset to
@@ -179,7 +223,8 @@ used by the pacman gate remain under the user's control; a root-owned
 OpenCode configuration would be needed to close that, and Guardian does not
 set one up yet.
 
-- `omarchy-guardian setup` — interactive wizard that detects OpenCode, lets
+- `omarchy-guardian setup` — interactive wizard that detects OpenCode and
+  Claude Code (suggesting Claude Sonnet when `claude` is installed), lets
   you choose a profile, model(s) and thinking level, runs a two-sample test
   review, then writes the user file and (with confirmation) the root-owned
   system file.
@@ -232,8 +277,11 @@ refused. Files are ranked by risk:
 2. Other code and runtime config follow.
 3. Everything else, with documentation last.
 
-Each chunk is its own OpenCode run with its own nonce, and every chunk carries
-the full file list, so the model knows what else exists. A source that needs
+Each chunk is its own reviewer run with its own nonce, and every chunk carries
+the full file list, so the model knows what else exists. The first chunk runs
+alone; the rest run three at a time. A run that finds the AI unavailable (a
+provider error, not a timeout) is retried once after two seconds; if it still
+fails, chunks not yet started are not attempted. A source that needs
 more than `max_chunks` chunks of `max_input_kib` is not reviewed at all
 (`INCOMPLETE`): a partial AI review is never presented as a review of the
 whole source.
@@ -365,13 +413,15 @@ model = "claude-code/claude-sonnet-5-5"
 ```
 
 (or pick it in `omarchy-guardian tui` or `setup`, which list the Claude Code
-models when `claude` is installed). Guardian runs `claude --print` with every
+models when `claude` is installed and suggest `claude-code/claude-sonnet-5-5`). Guardian runs `claude --print` with every
 built-in tool disabled (`--tools ""`), no MCP servers (`--strict-mcp-config`),
 no user, project or local settings, hooks or plugins (`--setting-sources ""`),
 no slash commands and no saved session, from an empty private working
-directory; the request goes on stdin. A reply that took more than one turn
-or had a permission denial counts as a tool attempt and makes the review
-invalid, and the reply must echo the nonce like OpenCode's. `thinking`
+directory; the request goes on stdin, and the reply is read as a
+`stream-json` transcript. A `tool_use` block in any assistant message, or a
+permission denial, counts as a tool attempt and makes the review invalid;
+the extra turn the CLI adds to continue a reply its safety classifier
+interrupted does not. The reply must echo the nonce like OpenCode's. `thinking`
 becomes `--effort` directly.
 
 For your own sources `claude` is found on `PATH`. The pacman gate, as with
@@ -384,7 +434,7 @@ not used for it, and `pacman-hook --preflight` says so.
 ```sh
 cd packaging/arch
 makepkg -si
-sudo pacman -S --needed extra/opencode      # the pacman gate's reviewer
+sudo pacman -S --needed claude-code         # the pacman gate's reviewer (or extra/opencode)
 sudo /usr/lib/omarchy-guardian/enable-system-hook.sh
 yay --makepkg /usr/lib/omarchy-guardian/guardian-makepkg --save -P --stats
 ```
@@ -398,14 +448,14 @@ invoking user's `~/.bashrc`.
 
 The pacman hook refuses every transaction it cannot review. While any pacman
 class requires the AI review (`third-party-repo` and `local-package` under
-`standard`; every class under `strict`), that needs a root-owned OpenCode: an
-OpenCode installed in your home directory (for example with `mise` or `npm`)
-is not accepted. Without one, every `pacman -U` would be refused, including
+`standard`; every class under `strict`), that needs a root-owned reviewer
+for the configured model (`/usr/bin/claude` from `claude-code` for a
+`claude-code/` model, otherwise `/usr/bin/opencode`): one installed in your
+home directory (for example with `mise` or `npm`) is not accepted. Without one, every `pacman -U` would be refused, including
 each AUR package yay installs. `enable-system-hook.sh` therefore runs
 `omarchy-guardian pacman-hook --preflight` as the invoking user first and does
-not enable the hook until it passes; `extra/opencode` provides
-`/usr/bin/opencode`. The pacman hook reviews as the invoking user, with that
-user's OpenCode configuration and credentials.
+not enable the hook until it passes. The pacman hook reviews as the invoking
+user, with that user's Claude login or OpenCode configuration and credentials.
 
 ### Pacman hook
 
@@ -601,4 +651,21 @@ bash tests/e2e/integration-gates.sh
 
 It needs `bwrap` 0.9 or newer, `bsdtar`, `pacman`, `git`, `flock`, `curl` and a
 working `opencode`; it exits `77` when OpenCode cannot run, because every gate
-is fail-closed on a failed AI review.
+is fail-closed on a failed AI review. To review with the Claude Code CLI and
+your Claude login instead, set
+`GUARDIAN_E2E_MODEL=claude-code/claude-sonnet-5-5` (the pacman checks that need
+the AI are then skipped, because the pacman gate takes its model only from a
+root-owned system config).
+
+The AI review itself has an evaluation suite: install scriptlets, auto-run
+package files and AUR recipes that must come back clear, and attacks that must
+be caught. Run it after changing a prompt, a scope or the model:
+
+```sh
+cargo build --release
+RUNS=3 bash tests/ai-eval/run.sh          # or a filter: run.sh aur/block
+```
+
+Every run starts with an empty review memory, so no verdict comes from the
+cache. The pacman cases use the system config's model, the AUR cases the user
+config's.

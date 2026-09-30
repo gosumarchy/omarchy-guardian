@@ -14,6 +14,7 @@ use crate::engine::baseline::{self, Identity, Unit};
 use crate::engine::store::Store;
 use crate::error::Error;
 use crate::makepkg_gate;
+use crate::notify;
 use crate::pacman::{self, HookArgs};
 use crate::report::{Blocked, Decision, Report};
 use crate::review::{self, ReviewContext};
@@ -55,6 +56,27 @@ pub(crate) struct Target {
     pub(crate) units: Vec<Unit>,
     /// Filled in by `run`, so parsing stays free of the environment.
     pub(crate) state_root: Option<PathBuf>,
+}
+
+impl Target {
+    /// What a notification says was blocked: the identities under review
+    /// (such as `theme:tokyo`), else the reviewed directory's name.
+    fn subject(&self) -> String {
+        let identities: Vec<&str> = self
+            .units
+            .iter()
+            .map(|unit| unit.identity.as_str())
+            .collect();
+        if identities.is_empty() {
+            let name = self.config.root.file_name().map_or_else(
+                || self.config.root.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            format!("{name} ({})", self.class.name())
+        } else {
+            identities.join(", ")
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -264,15 +286,21 @@ fn guard_command(
     let (report, decision) = review_and_decide(target, &settings, opencode, Some(confirm), &[]);
 
     if !decision.allows_running() {
-        if decision == Decision::Blocked(Blocked::NotConfirmed) {
-            eprintln!("Guardian did not start the command: not confirmed.");
-        } else {
-            eprintln!("Guardian blocked the command because the review did not allow it.");
+        match decision {
+            Decision::Blocked(Blocked::NotConfirmed) => {
+                eprintln!("Guardian did not start the command: not confirmed.");
+            }
+            Decision::Blocked(blocked) => {
+                eprintln!("Guardian blocked the command because the review did not allow it.");
+                notify::blocked(&target.subject(), notify::reason(blocked));
+            }
+            _ => eprintln!("Guardian blocked the command because the review did not allow it."),
         }
         return decision.exit_code();
     }
     if let Err(error) = scan::verify_unchanged(&target.config, &report.snapshot) {
         eprintln!("Guardian blocked the command because {error}.");
+        notify::blocked(&target.subject(), &format!("{error}"));
         return ExitCode::from(2);
     }
 
@@ -341,10 +369,14 @@ fn pacman_hook_command(hook: &HookArgs, settings: &Settings) -> ExitCode {
         Ok(report) => {
             let decision = report.decide(&|class| settings.policy(class));
             report.print(false, decision);
+            if let Decision::Blocked(blocked) = decision {
+                notify::blocked("a pacman transaction", notify::reason(blocked));
+            }
             decision.exit_code()
         }
         Err(error) => {
             eprintln!("Guardian blocked the pacman transaction: {error}");
+            notify::blocked("a pacman transaction", &error.to_string());
             ExitCode::from(2)
         }
     }

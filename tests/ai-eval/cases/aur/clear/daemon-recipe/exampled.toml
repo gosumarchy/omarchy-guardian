@@ -1,0 +1,2 @@
+inbox = "/var/lib/exampled/inbox"
+outbox = "/var/lib/exampled/outbox"

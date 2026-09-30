@@ -1,0 +1,19 @@
+[Unit]
+Description=Example sync daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=exampled
+Group=exampled
+ExecStart=/usr/bin/exampled --config /etc/exampled/exampled.toml
+Restart=on-failure
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+StateDirectory=exampled
+
+[Install]
+WantedBy=multi-user.target

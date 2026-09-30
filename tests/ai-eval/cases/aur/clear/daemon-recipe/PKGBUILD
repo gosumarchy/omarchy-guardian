@@ -1,0 +1,18 @@
+pkgname=exampled
+pkgver=2.1.0
+pkgrel=1
+pkgdesc="Example sync daemon"
+arch=('any')
+url="https://example.test/exampled"
+license=('Apache-2.0')
+depends=('bash')
+backup=('etc/exampled/exampled.toml')
+install=exampled.install
+source=('exampled' 'exampled.service' 'exampled.toml')
+sha256sums=('SKIP' 'SKIP' 'SKIP')
+
+package() {
+    install -Dm755 exampled "$pkgdir/usr/bin/exampled"
+    install -Dm644 exampled.service "$pkgdir/usr/lib/systemd/system/exampled.service"
+    install -Dm644 exampled.toml "$pkgdir/etc/exampled/exampled.toml"
+}

@@ -4,7 +4,7 @@ Name=Omarchy Guardian
 Comment=Guardian settings, integrations and maintenance
 Exec=xdg-terminal-exec --app-id=TUI.float -e omarchy-guardian tui
 TryExec=xdg-terminal-exec
-Icon=security-high
+Icon=omarchy-guardian
 Terminal=false
 Categories=Settings;Security;
 Keywords=guardian;security;aur;pacman;settings;

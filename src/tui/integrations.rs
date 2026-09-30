@@ -69,7 +69,7 @@ impl Integration {
     pub const fn help(self) -> &'static str {
         match self {
             Self::PacmanHook => {
-                "Reviews install scriptlets before every pacman transaction. Needs a root-owned OpenCode (extra/opencode) while pacman packages require AI; sudo to change."
+                "Reviews install scriptlets before every pacman transaction. Needs a root-owned reviewer (claude-code or extra/opencode, matching the model) while pacman packages require AI; sudo to change."
             }
             Self::AurGate => "Makes yay build AUR packages through Guardian's makepkg gate.",
             Self::ThemeInterceptor => {

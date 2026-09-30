@@ -219,6 +219,7 @@ impl App {
             }
             Key::Enter | Key::Char(' ') => self.activate_simple(),
             Key::Char('s') => self.save(),
+            Key::Char('t') => Some(self.test_reviewer()),
             _ => None,
         }
     }
@@ -527,7 +528,7 @@ impl App {
         let keys = if self.dialog.is_some() {
             " enter select · esc close "
         } else {
-            " ↑↓ move  enter choose  s save  e expert mode  q quit "
+            " ↑↓ move  enter choose  s save  t test  e expert mode  q quit "
         };
         canvas.text_fit(2, height - 1, keys, border, inner);
         if let Some(dialog) = &self.dialog {
@@ -565,7 +566,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use super::super::{App, Effect, Loaded, Mode};
+    use super::super::{App, Effect, Loaded, Mode, Task};
     use crate::config::file::PartialConfig;
     use crate::config::load::FileStatus;
     use crate::config::model::Profile;
@@ -606,6 +607,43 @@ mod tests {
         assert!(text.contains("Balanced protection is on"));
         assert!(text.contains("OpenCode default"));
         assert!(!text.contains("Protect everything"));
+    }
+
+    #[test]
+    fn the_model_picker_suggests_claude_code_when_nothing_is_set() {
+        let mut app = App::new(files(None), Mode::Simple);
+        let effects = press(&mut app, &[Key::Down, Key::Down, Key::Down, Key::Enter]);
+        let [effect @ Effect::LoadModels(_)] = &effects[..] else {
+            panic!("{effects:?}");
+        };
+        app.finish(
+            effect,
+            Ok("claude-code/claude-sonnet-5-5\nclaude-code/claude-haiku-4-5\nopencode/free".into()),
+        );
+        press(&mut app, &[Key::Enter]);
+        assert_eq!(
+            app.user.agent.model.as_deref(),
+            Some("claude-code/claude-sonnet-5-5")
+        );
+        assert_eq!(
+            app.system.agent.model.as_deref(),
+            Some("claude-code/claude-sonnet-5-5")
+        );
+    }
+
+    #[test]
+    fn t_tests_the_saved_reviewer_and_shows_the_result() {
+        let mut app = App::new(files(None), Mode::Simple);
+        let effects = press(&mut app, &[Key::Char('t')]);
+        assert_eq!(effects, [Effect::Report(Task::TestReviewer)]);
+        assert!(screen(&mut app).contains("malicious and a harmless sample"));
+
+        press(&mut app, &[Key::Char('2')]);
+        press(&mut app, &[Key::Char('t')]);
+        assert!(screen(&mut app).contains("unsaved changes are not tested"));
+
+        app.finish(&effects[0], Ok("✓ AUR, themes and plugins: passed".into()));
+        assert!(screen(&mut app).contains("AUR, themes and plugins: passed"));
     }
 
     #[test]
