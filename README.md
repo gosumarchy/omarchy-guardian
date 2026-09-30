@@ -4,6 +4,48 @@ Omarchy Guardian inspects downloaded source code before you run or install it
 on Arch Linux / Omarchy. It is an early, heuristic tool: a clear result is not
 a safety guarantee.
 
+## How protection works
+
+Guardian sits in front of the ways Omarchy installs packages, themes and
+plugins, and reviews that code **before any of it runs**:
+
+```
+ pacman -S / -U / -Syu ──► pacman hook ─────► install scriptlets + auto-run files
+ yay (AUR)             ──► makepkg gate ────► PKGBUILD, then the upstream sources
+ omarchy theme install ──► theme gate ──────► the theme checkout
+ omarchy plugin add    ──► plugin gate ─────► the plugin checkout
+                                  │
+                   local rules + AI review (Claude Code or OpenCode)
+                                  │
+             clear ─► the install goes ahead
+             risk  ─► blocked, full report in the terminal + desktop notification
+```
+
+- **Two reviews.** Fast local rules flag known-bad patterns (download and
+  execute, privilege escalation, persistence, credential access and
+  exfiltration, encoded commands, destructive operations). An AI reviewer
+  then reads the code with every tool switched off and must echo a one-time
+  nonce, so it cannot be skipped or faked by the code it reads.
+- **What counts as auto-run.** For pacman packages: install scriptlets, and
+  files that run without you starting them (pacman hooks, enabled systemd
+  units, sudoers, polkit, PAM, udev, tmpfiles, profile scripts, autostart
+  entries). Unchanged files are skipped on upgrade.
+- **AUR builds.** The recipe is reviewed before any of it runs; the sources
+  are then fetched without running a PKGBUILD function and reviewed too.
+  Plain-HTTP sources without checksums block, and the AUR's own trust signals
+  (age, votes, maintainer changes) are part of the review.
+- **Fail closed.** A review that cannot finish blocks. An unavailable AI
+  blocks community sources; for official Arch/Omarchy updates the `standard`
+  profile warns instead, `strict` blocks.
+- **Nothing to babysit.** The settings app (`omarchy-guardian tui`) turns
+  every gate on with *Protect everything*, picks the protection level and the
+  model, and tests the reviewer with a malicious and a harmless sample.
+- **Not covered.** Programs you download and run yourself, `curl | sh`
+  pasted into a terminal, Flatpak, npm, pip, mise and other language package
+  managers, and the binaries inside a package (only what runs at install or
+  boot is reviewed). `omarchy-guardian guard` and `sandbox` cover a download
+  you start by hand.
+
 It is a single Rust binary with **no third-party crates**. SHA-256, JSON, and
 the small subset of TOML it needs are implemented in the crate so the whole
 gate can be audited in one place. It builds only for Linux.
@@ -58,8 +100,10 @@ profile for your own sources and for pacman alike:
 | Maximum | `strict` | AI review for everything; any finding blocks |
 | Private | `local-only` | no AI: nothing leaves the machine; you confirm installs |
 
-You can also pick the OpenCode model used for both, turn on every install
-gate at once (*Protect everything*), or reset to the defaults.
+You can also pick the model used for both (Claude Code models are listed and
+suggested when `claude` is installed, otherwise OpenCode's), turn on every
+install gate at once (*Protect everything*), test the reviewer (`t`), or reset
+to the defaults.
 
 Press `e` for **expert mode** (or start there with `tui --expert`), which
 has every setting:
@@ -70,7 +114,7 @@ has every setting:
 | Sources | every knob of every source class; pacman-enforced classes in the system file, the rest in the user file |
 | AI | model, input size and call limits for your sources and for the pacman gate, review-memory limits, official repositories |
 | Integrations | turn the pacman hook, the yay AUR gate, the theme & plugin gate and the Omarchy menu entry on or off |
-| Maintenance | show and check the effective settings, edit either file in `$EDITOR`, see or forget the review memory, run the guided setup |
+| Maintenance | show and check the effective settings, edit either file in `$EDITOR`, see or forget the review memory, test the reviewer, run the guided setup |
 
 Unset values show what they inherit and from where. Keys: `↑↓` move,
 `Tab`/`1`–`5` switch tabs, `Enter` edit, `Space` cycle a choice, `x` reset to
