@@ -104,6 +104,8 @@ review() {
     name=eval-${name%.install}
     local dir=$WORK/runs/$run-${case//\//-}
     mkdir -p "$dir/state"
+    # Blocks are expected here; GUARDIAN_EVAL_NOTIFY=1 shows them anyway.
+    [[ -n ${GUARDIAN_EVAL_NOTIFY:-} ]] || export OMARCHY_GUARDIAN_NO_NOTIFY=1
     export XDG_STATE_HOME=$dir/state GUARDIAN
     case $kind in
     scriptlet | payload)

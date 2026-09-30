@@ -55,6 +55,8 @@ package() {
         "$pkgdir/usr/share/omarchy-guardian/omarchy-guardian.hook"
     install -Dm644 integrations/omarchy/omarchy-guardian.desktop \
         "$pkgdir/usr/share/applications/omarchy-guardian.desktop"
+    install -Dm644 integrations/omarchy/omarchy-guardian-ask.desktop \
+        "$pkgdir/usr/share/applications/omarchy-guardian-ask.desktop"
     install -Dm644 integrations/icons/omarchy-guardian.svg \
         "$pkgdir/usr/share/icons/hicolor/scalable/apps/omarchy-guardian.svg"
     install -Dm644 integrations/icons/omarchy-guardian-alert.svg \

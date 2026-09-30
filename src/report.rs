@@ -15,6 +15,8 @@ use crate::osv::Audit;
 use crate::rules::{RuleId, Scheme};
 use crate::scan::{FileKind, Snapshot};
 
+pub mod html;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Severity {
     High,
@@ -386,35 +388,17 @@ impl Report {
         self.print_findings(decision, painter);
 
         for gap in &self.gaps {
-            eprintln!("  ! {gap}");
+            crate::output::stderr_line(format_args!("  ! {gap}"));
         }
-        outln!(
-            "\n{}",
-            match decision {
-                Decision::Blocked(Blocked::Findings) => {
-                    "Recommendation: do not install or run this source until findings are resolved."
-                }
-                Decision::Blocked(Blocked::Incomplete) => {
-                    "Recommendation: do not proceed; complete the review first."
-                }
-                Decision::Blocked(Blocked::AiUnavailable) => {
-                    "Recommendation: fix the OpenCode setup (see `omarchy-guardian setup`) and retry."
-                }
-                Decision::Blocked(Blocked::NotConfirmed) => "Not confirmed; nothing was run.",
-                Decision::Warned => "Proceeding with warnings; read them above.",
-                Decision::Limited => {
-                    "Scope: install scriptlets and new or changed auto-run files are reviewed; the rest of each package's payload is not."
-                }
-                Decision::Clear =>
-                    "Scope: this is a heuristic source review, not a safety guarantee.",
-            }
-        );
+        outln!("\n{}", recommendation(decision));
+        html::collect(self, decision);
     }
 
-    fn print_headline(&self, decision: Decision, painter: Painter) {
+    /// The one-line verdict and its terminal colour.
+    fn headline(&self, decision: Decision) -> (String, &'static str) {
         let counts = self.counts();
         let total = counts.total();
-        let (headline, color) = match decision {
+        match decision {
             Decision::Clear => ("✓ CLEAR — no known concerns found".to_string(), "32"),
             Decision::Warned => (
                 format!("! WARNED — {total} alert(s); allowed by policy for this source"),
@@ -445,7 +429,13 @@ impl Report {
                     .to_string(),
                 "36;1",
             ),
-        };
+        }
+    }
+
+    fn print_headline(&self, decision: Decision, painter: Painter) {
+        let counts = self.counts();
+        let total = counts.total();
+        let (headline, color) = self.headline(decision);
         outln!("{}", painter.paint(&headline, color));
 
         if total > 0 {
@@ -652,6 +642,27 @@ impl Report {
                 outln!("  … OSV reported more advisories than it returned in one page");
             }
         }
+    }
+}
+
+/// What to do after a review with this decision.
+const fn recommendation(decision: Decision) -> &'static str {
+    match decision {
+        Decision::Blocked(Blocked::Findings) => {
+            "Recommendation: do not install or run this source until findings are resolved."
+        }
+        Decision::Blocked(Blocked::Incomplete) => {
+            "Recommendation: do not proceed; complete the review first."
+        }
+        Decision::Blocked(Blocked::AiUnavailable) => {
+            "Recommendation: fix the AI reviewer setup (see `omarchy-guardian setup`) and retry."
+        }
+        Decision::Blocked(Blocked::NotConfirmed) => "Not confirmed; nothing was run.",
+        Decision::Warned => "Proceeding with warnings; read them above.",
+        Decision::Limited => {
+            "Scope: install scriptlets and new or changed auto-run files are reviewed; the rest of each package's payload is not."
+        }
+        Decision::Clear => "Scope: this is a heuristic source review, not a safety guarantee.",
     }
 }
 

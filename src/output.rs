@@ -9,8 +9,38 @@
 use std::fmt;
 use std::io::{self, ErrorKind, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 static WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Everything written through these functions, kept so a blocked review's
+/// report can be saved for the notification to open.
+static CAPTURED: Mutex<String> = Mutex::new(String::new());
+
+/// At most this much output is kept; a report is far smaller.
+const MAX_CAPTURED: usize = 1024 * 1024;
+
+fn capture(args: fmt::Arguments) {
+    let mut captured = CAPTURED.lock().unwrap_or_else(PoisonError::into_inner);
+    if captured.len() < MAX_CAPTURED {
+        // Formatting into a String cannot fail.
+        let _ = fmt::Write::write_fmt(&mut *captured, args);
+    }
+}
+
+/// The output written so far.
+pub fn captured() -> String {
+    CAPTURED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+/// Like `eprintln!`, and kept with the captured output.
+pub fn stderr_line(args: fmt::Arguments) {
+    eprintln!("{args}");
+    capture(format_args!("{args}\n"));
+}
 
 /// Like `print!`, but a closed stdout is not an error.
 macro_rules! out {
@@ -30,6 +60,7 @@ macro_rules! outln {
 }
 
 pub fn stdout(args: fmt::Arguments) {
+    capture(args);
     if let Err(error) = write_ignoring_broken_pipe(&mut io::stdout().lock(), args)
         && !WARNED.swap(true, Ordering::Relaxed)
     {
