@@ -55,7 +55,8 @@ pub fn page(title: &str, detail: &str, ran: Ran, when: &str, id: &str, fallback:
         sections
     };
     let (verb, word, tone) = match ran {
-        Ran::AlreadyOnSystem | Ran::Swept { clear: false } => ("Found", "FOUND", "amber"),
+        Ran::AlreadyOnSystem => ("Found", "FOUND", "amber"),
+        Ran::Swept { clear: false } => ("Checked", "FOUND", "amber"),
         Ran::Swept { clear: true } => ("Checked", "CLEAR", "green"),
         Ran::Nothing | Ran::RecipeToFetch => ("Blocked", "BLOCKED", "red"),
     };
@@ -585,8 +586,16 @@ mod tests {
         );
         assert!(html.contains("Checked this system") && html.contains("CLEAR"));
         assert!(!html.contains("BLOCKED") && html.contains("You ran this sweep"));
-        let html = page("t", "d", Ran::Swept { clear: false }, "now", "1-2", "");
-        assert!(html.contains("FOUND") && !html.contains("BLOCKED"));
+        let html = page(
+            "Guardian checked this system",
+            "d",
+            Ran::Swept { clear: false },
+            "now",
+            "1-2",
+            "",
+        );
+        assert!(html.contains("Checked this system") && html.contains("FOUND"));
+        assert!(!html.contains("BLOCKED") && !html.contains("Found this system"));
     }
 
     #[test]

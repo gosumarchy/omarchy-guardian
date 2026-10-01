@@ -537,6 +537,10 @@ fn parse_sweep(args: &[OsString]) -> Result<sweep::Command, String> {
     if options.report && options.view == sweep::View::Json {
         return Err("sweep: --report saves the printed report; it does not go with --json".into());
     }
+    // The timer's run saves its own page when it notifies.
+    if options.report && options.scheduled {
+        return Err(USAGE.into());
+    }
     Ok(sweep::Command::Run(options))
 }
 
@@ -926,6 +930,7 @@ mod tests {
         };
         assert!(options.report);
         assert!(parse(&args(&["sweep", "--json", "--report"])).is_err());
+        assert!(parse(&args(&["sweep", "--scheduled", "--report"])).is_err());
     }
 
     #[test]
