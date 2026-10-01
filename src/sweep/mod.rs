@@ -288,6 +288,11 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
         Ok(found) => found,
         Err(message) => {
             errln!("omarchy-guardian sweep: {message}");
+            // The timer counts exit 2 as an incomplete sweep, not a failure,
+            // so a sweep that could not run at all says so itself.
+            if options.scheduled {
+                notify::found("that its daily system sweep could not run", &message);
+            }
             return ExitCode::from(2);
         }
     };
