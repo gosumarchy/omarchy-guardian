@@ -210,9 +210,38 @@ your own sweep could not read.
 
 Without root checks (declined, or not answered yet) every sweep is
 incomplete and says what it could not check, and the bar shows the sweep as
-not fully on. `sweep allow PATH` stops the sweep asking about an item you
-know; if the file changes, it is shown again. `protect --off` turns both
-timers off and keeps your answer.
+not fully on. `protect --off` turns both timers off and keeps your answer.
+
+**Working through what it finds.** A sweep flags what it cannot vouch for,
+and some of that will be yours on purpose: a wrapper in `~/.local/bin`, a
+keybinding that starts your own tool, an alias. Look at each one, then
+either fix it or tell Guardian you know it:
+
+```sh
+omarchy-guardian sweep                                 # what is flagged, and why
+omarchy-guardian sweep allow '~/.local/bin/claude'     # trust it as it is now
+omarchy-guardian sweep allow /root/.local/bin/claude   # root's items too
+omarchy-guardian sweep --all                           # allowed items show as "allowed"
+omarchy-guardian sweep forget '~/.local/bin/claude'    # stop trusting it (or: forget --all)
+omarchy-guardian status --dismiss                      # clear the bar's alert
+```
+
+- Use the path exactly as the sweep prints it, with `~/` for your home
+  (quoted, so the shell leaves the `~` alone).
+- An allow covers the file's current content and what the live checks saw
+  about it. If the file changes, or the same program starts reading the
+  keyboard, listening on the network or running with extra rights, it is
+  shown again and the daily sweep notifies about it.
+- Allowing a file stops its alerts, including the AI's, so a sweep with
+  only allowed items comes back clear. It does not change the file or make
+  what it runs safe: allow what you have read and meant to have.
+- Items only root can read (in `/root`, `/etc/sudoers.d`) can be allowed
+  once the daily root checks have run (root checks allowed in `protect`);
+  `sweep allow` uses their latest results.
+- What cannot be read at all (a program that exists only in memory, a
+  deleted file) cannot be allowed; it stays listed while it runs.
+- The list of allowed items lives with the review memory
+  (`~/.local/state/omarchy-guardian/sweep/allowed.json`, private to you).
 
 ## Settings app
 
