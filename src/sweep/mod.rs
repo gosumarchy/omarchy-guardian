@@ -32,7 +32,7 @@ use crate::config::Settings;
 use crate::config::model::{RootConsent, SourceClass};
 use crate::engine::store::{self, Store};
 use crate::notify;
-use crate::report::{Decision, Gap};
+use crate::report::{Blocked, Decision, Gap};
 use crate::review::ReviewContext;
 use crate::tools::OpenCode;
 use collect::{Collection, Origin, Scope};
@@ -298,6 +298,9 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
         decision => decision,
     };
 
+    let first = directory
+        .as_ref()
+        .is_some_and(|directory| !state::has_baseline(directory));
     let previous = directory
         .as_ref()
         .map(|directory| state::baseline(directory));
@@ -338,7 +341,16 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
             .iter()
             .filter(|(change, _)| *change != Change::Removed)
             .count();
-        if arrived > 0 {
+        // The first sweep has nothing to compare with: everything is "new".
+        // It says only whether it found something.
+        if first {
+            if matches!(decision, Decision::Blocked(Blocked::Findings)) {
+                notify::found(
+                    "something to look at in its first system sweep",
+                    "the first system sweep found startup items with alerts; run `omarchy-guardian sweep` for the full list",
+                );
+            }
+        } else if arrived > 0 {
             notify::found(
                 &format!("{arrived} new or changed startup item(s)"),
                 "the daily system sweep found something that runs on its own and that no package vouches for",

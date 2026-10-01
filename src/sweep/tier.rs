@@ -87,8 +87,12 @@ const SECURITY_BITS: u32 = 0o6022;
 
 /// The tier of `path` (relative to `/`).
 pub fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex) -> Tier {
+    // Guardian itself is installed with `pacman -U`, so it is foreign; its
+    // own files (which the pacman gate lets no other package ship) are as
+    // trusted as the sweep that reads them.
     let packaged = |index: &PackageIndex, package: &str| {
-        if index.is_foreign(package) {
+        if index.is_foreign(package) && !(package == GUARDIAN && path.contains("omarchy-guardian"))
+        {
             Tier::UserBuilt
         } else {
             Tier::Vendor
@@ -145,6 +149,8 @@ pub fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex) -> Tie
         Observed::File { .. } | Observed::Link { .. } => Tier::Unknown,
     }
 }
+
+const GUARDIAN: &str = "omarchy-guardian";
 
 /// Packaged units that give a root shell without a password when enabled.
 const ROOT_SHELL_UNITS: &[&str] = &["debug-shell.service", "emergency.service", "rescue.service"];
@@ -430,5 +436,31 @@ mod tests {
             ),
             Tier::Inert
         );
+    }
+
+    #[test]
+    fn guardians_own_files_are_trusted_though_installed_with_pacman_u() {
+        let abc = Sha256::digest(b"abc");
+        let mut index = PackageIndex::with_foreign(HashSet::from(["omarchy-guardian".to_string()]));
+        index.add_for_test(
+            "omarchy-guardian",
+            &format!("#mtree\n/set type=file mode=644\n./usr/lib/systemd/user/omarchy-guardian-sweep.timer sha256digest={abc}\n./usr/bin/other sha256digest={abc}\n"),
+            &[],
+        );
+        let file = Observed::File {
+            sha256: &abc,
+            mode: 0o644,
+            size: 3,
+        };
+        assert_eq!(
+            classify(
+                "usr/lib/systemd/user/omarchy-guardian-sweep.timer",
+                file,
+                &index
+            ),
+            Tier::Vendor
+        );
+        // Only under its own names.
+        assert_eq!(classify("usr/bin/other", file, &index), Tier::UserBuilt);
     }
 }

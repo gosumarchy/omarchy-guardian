@@ -374,15 +374,8 @@ impl Paths {
         let root = fs::symlink_metadata(&self.sweep_root_timer_link).is_ok();
         let mut steps = Vec::new();
         if on {
-            if !user {
-                steps.push(Step::Command(vec![
-                    "systemctl".into(),
-                    "--user".into(),
-                    "enable".into(),
-                    "--now".into(),
-                    SWEEP_TIMER.into(),
-                ]));
-            }
+            // The root question first, so the first daily sweep (started
+            // right away) already knows the answer.
             match self.sweep_consent {
                 Some(RootConsent::Allowed) if !root && self.sweep_group.is_some() => {
                     steps.push(sudo(&[
@@ -394,6 +387,15 @@ impl Paths {
                 }
                 Some(RootConsent::Allowed) => {}
                 None | Some(RootConsent::Declined) => steps.push(Step::AskSweepRoot),
+            }
+            if !user {
+                steps.push(Step::Command(vec![
+                    "systemctl".into(),
+                    "--user".into(),
+                    "enable".into(),
+                    "--now".into(),
+                    SWEEP_TIMER.into(),
+                ]));
             }
         } else {
             if user {
@@ -1050,10 +1052,11 @@ mod tests {
         fs::write(&paths.sweep_root_timer, "").unwrap();
         assert_eq!(paths.state(Integration::SystemSweep), State::Off);
         let plan = paths.plan(Integration::SystemSweep, &State::Off).unwrap();
+        // The question comes before the daily sweep starts.
+        assert_eq!(plan.steps[0], Step::AskSweepRoot);
         assert!(
-            matches!(&plan.steps[0], Step::Command(argv) if argv.contains(&"--user".to_string()))
+            matches!(&plan.steps[1], Step::Command(argv) if argv.contains(&"--user".to_string()))
         );
-        assert_eq!(plan.steps[1], Step::AskSweepRoot);
 
         fs::create_dir_all(paths.sweep_timer_link.parent().unwrap()).unwrap();
         fs::write(&paths.sweep_timer_link, "").unwrap();
