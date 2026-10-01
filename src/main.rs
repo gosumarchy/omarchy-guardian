@@ -22,6 +22,7 @@ mod output;
 mod agent;
 mod ask;
 mod aur;
+mod autorun;
 mod classify;
 mod cli;
 mod config;
@@ -44,6 +45,7 @@ mod sandbox;
 mod scan;
 mod setup;
 mod sha256;
+mod sweep;
 #[cfg(test)]
 mod test_support;
 mod text;

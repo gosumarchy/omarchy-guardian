@@ -27,103 +27,13 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+use crate::autorun::{executed_paths, is_auto_run};
 use crate::config::model::SourceClass;
 use crate::content::{self, Content};
 use crate::error::{Error, IoContext};
 use crate::sandbox::Workspace;
 use crate::scan::MAX_TEXT_FILE_SIZE;
 use crate::tools::{self, Limits};
-
-/// Single files that act on their own.
-const FILES: &[&str] = &[
-    "etc/sudoers",
-    "etc/sudo.conf",
-    "etc/ld.so.preload",
-    "etc/ld.so.conf",
-    "etc/nsswitch.conf",
-    "etc/bash.bashrc",
-    "etc/profile",
-    "etc/environment",
-];
-
-/// Directories whose every file acts on its own.
-const DIRECTORIES: &[&str] = &[
-    "usr/share/libalpm/hooks/",
-    "usr/share/libalpm/scripts/",
-    "etc/pacman.d/hooks/",
-    "etc/sudoers.d/",
-    "etc/polkit-1/rules.d/",
-    "usr/share/polkit-1/rules.d/",
-    "etc/pam.d/",
-    "usr/lib/pam.d/",
-    "etc/security/",
-    "etc/systemd/system/",
-    "etc/systemd/user/",
-    "etc/xdg/systemd/user/",
-    "usr/lib/systemd/system-preset/",
-    "usr/lib/systemd/user-preset/",
-    "usr/lib/systemd/system-generators/",
-    "usr/lib/systemd/user-generators/",
-    "usr/lib/systemd/system-environment-generators/",
-    "usr/lib/systemd/user-environment-generators/",
-    "etc/systemd/system-environment-generators/",
-    "etc/systemd/user-environment-generators/",
-    "usr/lib/systemd/system-sleep/",
-    "usr/lib/systemd/system-shutdown/",
-    "etc/systemd/system-sleep/",
-    "etc/systemd/system-shutdown/",
-    "usr/lib/tmpfiles.d/",
-    "etc/tmpfiles.d/",
-    "usr/lib/sysusers.d/",
-    "etc/sysusers.d/",
-    "usr/lib/sysctl.d/",
-    "etc/sysctl.d/",
-    "usr/lib/modules-load.d/",
-    "etc/modules-load.d/",
-    "usr/lib/binfmt.d/",
-    "etc/binfmt.d/",
-    "usr/lib/udev/rules.d/",
-    "etc/udev/rules.d/",
-    "usr/lib/modprobe.d/",
-    "etc/modprobe.d/",
-    "usr/lib/environment.d/",
-    "etc/environment.d/",
-    "usr/lib/initcpio/hooks/",
-    "usr/lib/initcpio/install/",
-    "etc/initcpio/",
-    "etc/mkinitcpio.conf.d/",
-    "etc/mkinitcpio.d/",
-    "usr/lib/kernel/install.d/",
-    "etc/kernel/install.d/",
-    "usr/lib/NetworkManager/dispatcher.d/",
-    "etc/NetworkManager/dispatcher.d/",
-    "etc/ld.so.conf.d/",
-    "etc/profile.d/",
-    "etc/zsh/",
-    "usr/share/fish/vendor_conf.d/",
-    "etc/ssh/sshd_config.d/",
-    "etc/ssh/ssh_config.d/",
-    "etc/xdg/autostart/",
-    "etc/X11/xinit/xinitrc.d/",
-    "etc/cron.d/",
-    "etc/cron.hourly/",
-    "etc/cron.daily/",
-    "etc/cron.weekly/",
-    "etc/cron.monthly/",
-    "usr/share/dbus-1/system-services/",
-    "usr/share/dbus-1/services/",
-    "usr/share/dbus-1/system.d/",
-    "etc/dbus-1/system.d/",
-];
-
-/// Unit directories where a package enables units itself (through
-/// `<target>.wants/`, `.requires/` or `.upholds/` links) or changes a unit
-/// with a drop-in (`<unit>.d/<file>.conf`, which can add `ExecStartPre=`).
-const UNIT_DIRECTORIES: &[&str] = &["usr/lib/systemd/system/", "usr/lib/systemd/user/"];
-const ENABLING: &[&str] = &[".wants", ".requires", ".upholds"];
-/// Where systemd managers read `<manager>.conf.d/` drop-ins
-/// (`DefaultEnvironment=LD_PRELOAD=...`).
-const MANAGER_DIRECTORIES: &[&str] = &["etc/systemd/", "usr/lib/systemd/"];
 
 /// The archive's own metadata; any other name starting with `.` is refused.
 const METADATA: &[&str] = &[".PKGINFO", ".BUILDINFO", ".MTREE", ".INSTALL", ".CHANGELOG"];
@@ -232,37 +142,6 @@ fn protected_violation(
     })
 }
 
-/// Whether the file at `path` (a canonical package path) runs or grants
-/// privileges on its own.
-pub fn is_auto_run(path: &str) -> bool {
-    if path
-        .split('/')
-        .any(|component| matches!(component, "" | "." | ".."))
-    {
-        return false;
-    }
-    FILES.contains(&path)
-        || DIRECTORIES
-            .iter()
-            .any(|directory| path.starts_with(directory))
-        || UNIT_DIRECTORIES.iter().any(|directory| {
-            path.strip_prefix(directory)
-                .and_then(|rest| rest.split_once('/'))
-                .is_some_and(|(parent, unit)| {
-                    !unit.contains('/')
-                        && (ENABLING.iter().any(|suffix| parent.ends_with(suffix))
-                            || Path::new(parent)
-                                .extension()
-                                .is_some_and(|extension| extension == "d"))
-                })
-        })
-        || MANAGER_DIRECTORIES.iter().any(|directory| {
-            path.strip_prefix(directory)
-                .and_then(|rest| rest.split_once('/'))
-                .is_some_and(|(parent, file)| parent.ends_with(".conf.d") && !file.contains('/'))
-        })
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Kind {
     File,
@@ -279,9 +158,10 @@ struct Entry {
     kind: Kind,
 }
 
-/// Undoes bsdtar's escaping of names (`\\`, `\n`, `\t` and octal `\ooo`);
-/// `None` for a name that is not UTF-8 or holds control characters.
-fn unescape(raw: &str) -> Option<String> {
+/// Undoes bsdtar's (and mtree's) escaping of names (`\\`, `\n`, `\t` and
+/// octal `\ooo`); `None` for a name that is not UTF-8 or holds control
+/// characters.
+pub fn unescape(raw: &str) -> Option<String> {
     let mut bytes = Vec::with_capacity(raw.len());
     let mut input = raw.bytes().peekable();
     while let Some(byte) = input.next() {
@@ -733,40 +613,6 @@ pub struct Review {
     pub files: Vec<PayloadFile>,
 }
 
-/// The paths a reviewed hook or unit runs (`Exec =`, `ExecStart=` and
-/// friends), without systemd's `-@:+!` prefixes.
-fn executed_paths(text: &str) -> Vec<String> {
-    text.lines()
-        .filter_map(|line| {
-            let (key, value) = line.split_once('=')?;
-            let key = key.trim();
-            let runs = key == "Exec"
-                || [
-                    "ExecStart",
-                    "ExecStartPre",
-                    "ExecStartPost",
-                    "ExecStop",
-                    "ExecStopPost",
-                    "ExecReload",
-                    "ExecCondition",
-                ]
-                .contains(&key);
-            if !runs {
-                return None;
-            }
-            let program = value
-                .trim()
-                .trim_start_matches(['-', '@', ':', '+', '!'])
-                .split_whitespace()
-                .next()?;
-            program
-                .strip_prefix('/')
-                .filter(|path| !path.is_empty())
-                .map(str::to_string)
-        })
-        .collect()
-}
-
 /// An auto-run entry and what its content is read from.
 type Source<'a> = (&'a Entry, Resolution);
 
@@ -1005,61 +851,11 @@ mod tests {
     use std::process::Command;
 
     use super::{
-        Archive, Entry, Kind, Resolution, executed_paths, is_auto_run, parse_model,
-        protected_violation, review, unescape,
+        Archive, Entry, Kind, Resolution, parse_model, protected_violation, review, unescape,
     };
     use crate::config::model::SourceClass;
     use crate::content::Content;
     use crate::test_support::{TempDir, tool_available};
-
-    #[test]
-    fn auto_run_locations() {
-        for path in [
-            "usr/share/libalpm/hooks/foo.hook",
-            "usr/share/libalpm/scripts/foo",
-            "etc/sudoers",
-            "etc/sudoers.d/foo",
-            "usr/share/polkit-1/rules.d/50-foo.rules",
-            "etc/pam.d/foo",
-            "usr/lib/systemd/system/multi-user.target.wants/foo.service",
-            "usr/lib/systemd/user/default.target.wants/foo.service",
-            "usr/lib/systemd/system/foo.service.d/override.conf",
-            "etc/systemd/system.conf.d/env.conf",
-            "usr/lib/systemd/system-generators/foo",
-            "usr/lib/systemd/system-sleep/foo",
-            "usr/lib/tmpfiles.d/foo.conf",
-            "usr/lib/sysctl.d/50-foo.conf",
-            "usr/lib/modules-load.d/foo.conf",
-            "usr/lib/initcpio/hooks/foo",
-            "usr/lib/kernel/install.d/50-foo.install",
-            "etc/NetworkManager/dispatcher.d/foo",
-            "usr/lib/udev/rules.d/99-foo.rules",
-            "etc/profile.d/foo.sh",
-            "etc/profile",
-            "etc/bash.bashrc",
-            "etc/xdg/autostart/foo.desktop",
-            "etc/cron.daily/foo",
-            "usr/share/dbus-1/system-services/org.foo.service",
-            "usr/share/dbus-1/services/org.foo.service",
-            "etc/ld.so.preload",
-            "etc/ssh/sshd_config.d/foo.conf",
-        ] {
-            assert!(is_auto_run(path), "{path}");
-        }
-        for path in [
-            "usr/bin/foo",
-            "usr/lib/systemd/system/foo.service",
-            "usr/share/doc/foo/README",
-            "usr/share/applications/foo.desktop",
-            "usr/lib/systemd/system/a.wants/b/c.service",
-            "usr/lib/systemd/system/a.service.d/b/c.conf",
-            "etc/sudoers.d/../../usr/bin/x",
-            "etc/skel/.bashrc",
-            "usr/share/bash-completion/completions/foo",
-        ] {
-            assert!(!is_auto_run(path), "{path}");
-        }
-    }
 
     #[test]
     fn names_are_unescaped_and_control_characters_refused() {
@@ -1184,15 +980,6 @@ mod tests {
             .is_some()
         );
         assert!(protected_violation("usr/bin/foo", "anything", local, &[]).is_none());
-    }
-
-    #[test]
-    fn executed_scripts_are_found_in_hooks_and_units() {
-        let text = "[Action]\nExec = /usr/share/foo/run.sh --all\n[Service]\nExecStartPre=-/usr/lib/foo/pre\nExecStart=@/usr/bin/foo foo\nEnvironment=X=1\n";
-        assert_eq!(
-            executed_paths(text),
-            ["usr/share/foo/run.sh", "usr/lib/foo/pre", "usr/bin/foo"]
-        );
     }
 
     fn build(root: &Path, archive: &Path, members: &[&str], extra: &[&str]) {
