@@ -77,6 +77,11 @@ pub enum Observed<'a> {
     },
 }
 
+/// The mode bits a change of matters: set-id bits, and write access for
+/// group and others. Read and execute bits change harmlessly (a package's
+/// own install step may relax them).
+const SECURITY_BITS: u32 = 0o6022;
+
 /// The tier of `path` (relative to `/`).
 pub fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex) -> Tier {
     let packaged = |index: &PackageIndex, package: &str| {
@@ -99,7 +104,7 @@ pub fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex) -> Tie
                     mode: actual,
                     ..
                 },
-            ) => recorded == sha256 && *mode == actual & 0o7777,
+            ) => recorded == sha256 && *mode & SECURITY_BITS == actual & SECURITY_BITS,
             (Recorded::Link(recorded), Observed::Link { target, .. }) => recorded == target,
             _ => false,
         };
@@ -172,6 +177,15 @@ mod tests {
         );
         assert_eq!(
             classify("usr/bin/demo", file(&other, 0o755), &index),
+            Tier::Modified
+        );
+        // Read and execute bits may differ; set-id and write bits may not.
+        assert_eq!(
+            classify("usr/bin/demo", file(&abc, 0o711), &index),
+            Tier::Vendor
+        );
+        assert_eq!(
+            classify("usr/bin/demo", file(&abc, 0o775), &index),
             Tier::Modified
         );
         // A set-id bit added or removed is a change.

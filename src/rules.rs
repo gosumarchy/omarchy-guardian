@@ -24,6 +24,12 @@ pub enum RuleId {
     GitConfigCommand,
     SshCommand,
     ModifiedPackageFile,
+    HiddenProgram,
+    RunningFromTemp,
+    PreloadedLibrary,
+    KeyboardReader,
+    UnknownKernelModule,
+    UnknownPrivilegedFile,
 }
 
 /// How a rule decides whether a lowercased line matches.
@@ -154,7 +160,7 @@ const DISABLED_TLS: &[&str] = &[
 ];
 
 impl RuleId {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 20] = [
         Self::DownloadAndExecute,
         Self::EncodedCommandExecution,
         Self::CredentialFileAccess,
@@ -169,7 +175,17 @@ impl RuleId {
         Self::GitConfigCommand,
         Self::SshCommand,
         Self::ModifiedPackageFile,
+        Self::HiddenProgram,
+        Self::RunningFromTemp,
+        Self::PreloadedLibrary,
+        Self::KeyboardReader,
+        Self::UnknownKernelModule,
+        Self::UnknownPrivilegedFile,
     ];
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|rule| rule.name() == name)
+    }
 
     pub const fn name(self) -> &'static str {
         match self {
@@ -187,6 +203,12 @@ impl RuleId {
             Self::GitConfigCommand => "git-config-command",
             Self::SshCommand => "ssh-command",
             Self::ModifiedPackageFile => "modified-package-file",
+            Self::HiddenProgram => "hidden-program",
+            Self::RunningFromTemp => "running-from-temp",
+            Self::PreloadedLibrary => "preloaded-library",
+            Self::KeyboardReader => "keyboard-reader",
+            Self::UnknownKernelModule => "unknown-kernel-module",
+            Self::UnknownPrivilegedFile => "unknown-privileged-file",
         }
     }
 
@@ -196,7 +218,11 @@ impl RuleId {
             | Self::EncodedCommandExecution
             | Self::DestructiveSystemOperation
             | Self::CredentialExfiltration
-            | Self::ModifiedPackageFile => Severity::High,
+            | Self::ModifiedPackageFile
+            | Self::HiddenProgram
+            | Self::PreloadedLibrary
+            | Self::UnknownKernelModule
+            | Self::UnknownPrivilegedFile => Severity::High,
             Self::CredentialFileAccess
             | Self::PersistenceModification
             | Self::ShellCommandExecution
@@ -205,7 +231,9 @@ impl RuleId {
             | Self::DirectIpNetworkRequest
             | Self::DisabledTlsVerification
             | Self::GitConfigCommand
-            | Self::SshCommand => Severity::Medium,
+            | Self::SshCommand
+            | Self::RunningFromTemp
+            | Self::KeyboardReader => Severity::Medium,
         }
     }
 
@@ -251,6 +279,22 @@ impl RuleId {
             Self::ModifiedPackageFile => {
                 "A file a package installed has been changed since; it is not what the package shipped."
             }
+            Self::HiddenProgram => {
+                "A running program has no file on disk: it was deleted, or lives only in memory."
+            }
+            Self::RunningFromTemp => {
+                "A program runs from a temporary or cache directory, where downloads land."
+            }
+            Self::PreloadedLibrary => {
+                "A library no package installed is preloaded into a running program (LD_PRELOAD)."
+            }
+            Self::KeyboardReader => {
+                "A program no package installed reads the keyboard device directly."
+            }
+            Self::UnknownKernelModule => "A loaded kernel module was not installed by a package.",
+            Self::UnknownPrivilegedFile => {
+                "A file no package vouches for runs with extra rights (setuid, setgid or capabilities)."
+            }
         }
     }
 
@@ -268,7 +312,13 @@ impl RuleId {
             | Self::DirectIpNetworkRequest
             | Self::GitConfigCommand
             | Self::SshCommand
-            | Self::ModifiedPackageFile => Matcher::Reported,
+            | Self::ModifiedPackageFile
+            | Self::HiddenProgram
+            | Self::RunningFromTemp
+            | Self::PreloadedLibrary
+            | Self::KeyboardReader
+            | Self::UnknownKernelModule
+            | Self::UnknownPrivilegedFile => Matcher::Reported,
             Self::DisabledTlsVerification => Matcher::Patterns(DISABLED_TLS),
         }
     }
@@ -293,7 +343,13 @@ impl RuleId {
             | Self::CredentialExfiltration
             | Self::GitConfigCommand
             | Self::SshCommand
-            | Self::ModifiedPackageFile => false,
+            | Self::ModifiedPackageFile
+            | Self::HiddenProgram
+            | Self::RunningFromTemp
+            | Self::PreloadedLibrary
+            | Self::KeyboardReader
+            | Self::UnknownKernelModule
+            | Self::UnknownPrivilegedFile => false,
         }
     }
 

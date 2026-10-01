@@ -43,16 +43,15 @@ pub fn label(item: &Item, home: Option<&str>) -> String {
 pub fn judge(collection: &Collection, home: Option<&str>, context: &ReviewContext<'_>) -> Report {
     let mut report = review::collected_report("system sweep", context);
     let mut facts = Vec::new();
-    for item in collection
-        .items
-        .iter()
-        .filter(|item| !is_trusted(item.tier))
-    {
+    for item in collection.items.iter().filter(|item| !item.is_trusted()) {
         let label = label(item, home);
         if item.tier == Tier::Modified {
             report
                 .findings
                 .push(finding(&label, 1, RuleId::ModifiedPackageFile, ""));
+        }
+        for (rule, seen) in &item.alerts {
+            report.findings.push(finding(&label, 1, *rule, seen));
         }
         match &item.body {
             Body::Text(text) if is_local_only(item, home) => {
@@ -239,6 +238,7 @@ mod tests {
             runs: Vec::new(),
             run_by: None,
             notes: Vec::new(),
+            alerts: Vec::new(),
         }
     }
 

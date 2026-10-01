@@ -15,11 +15,12 @@ use std::time::UNIX_EPOCH;
 
 use super::collect::{self, Body, Collection, Item, Origin, Scope};
 use super::index::{self, LOCAL_DB, PackageIndex};
-use super::judge::is_trusted;
+use super::live;
 use super::tier::Tier;
 use crate::autorun::Category;
 use crate::engine::store;
 use crate::json::Json;
+use crate::rules::RuleId;
 use crate::sha256::Digest;
 
 const SUDO: &str = "/usr/bin/sudo";
@@ -78,12 +79,14 @@ pub fn collect_command(out: bool, settings: &crate::config::Settings) -> ExitCod
             return ExitCode::from(2);
         }
     };
-    let collection = collect::collect(&Scope {
+    let scope = Scope {
         root: Path::new("/"),
         home: Some(ROOT_HOME),
         index: &index,
         origin: Origin::Root,
-    });
+    };
+    let mut collection = collect::collect(&scope);
+    collect::merge(&mut collection, live::check(&scope).items);
     let json = to_json(&collection).to_string();
     match group {
         None => {
@@ -197,7 +200,7 @@ fn to_json(collection: &Collection) -> Json {
     let items = collection
         .items
         .iter()
-        .filter(|item| !is_trusted(item.tier))
+        .filter(|item| !item.is_trusted())
         .take(MAX_ITEMS)
         .map(item_json);
     Json::object([
@@ -252,6 +255,20 @@ fn item_json(item: &Item) -> Json {
         ("body", body),
         ("runs", strings(&item.runs)),
         ("notes", strings(&item.notes)),
+        (
+            "alerts",
+            Json::Array(
+                item.alerts
+                    .iter()
+                    .map(|(rule, seen)| {
+                        Json::object([
+                            ("rule", Json::from(rule.name())),
+                            ("seen", Json::from(seen.as_str())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
     ];
     if let Some(digest) = &item.sha256 {
         members.push(("sha256", Json::from(digest.to_string())));
@@ -308,6 +325,17 @@ fn item_from_json(json: &Json) -> Option<Item> {
         runs: strings("runs")?,
         run_by: text("run_by").map(str::to_string),
         notes: strings("notes")?,
+        alerts: json
+            .get("alerts")?
+            .as_array()?
+            .iter()
+            .map(|alert| {
+                Some((
+                    RuleId::from_name(alert.get("rule")?.as_str()?)?,
+                    alert.get("seen")?.as_str()?.to_string(),
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?,
     })
 }
 
@@ -372,11 +400,8 @@ pub fn from_root() -> Result<RootPart, String> {
 pub fn merge(collection: &mut Collection, part: RootPart) {
     collection
         .items
-        .retain(|item| item.origin == Origin::User || is_trusted(item.tier));
-    collection.items.extend(part.items);
-    collection
-        .items
-        .sort_by(|left, right| left.path.cmp(&right.path));
+        .retain(|item| item.origin == Origin::User || item.is_trusted());
+    collect::merge(collection, part.items);
     collection.truncated.extend(part.truncated);
 }
 
@@ -399,6 +424,7 @@ mod tests {
             runs: vec!["/usr/bin/x".into()],
             run_by: Some("etc/y".into()),
             notes: vec!["a note".into()],
+            alerts: Vec::new(),
         }
     }
 
@@ -427,6 +453,10 @@ mod tests {
             ],
             truncated: vec!["/etc/x".into()],
         };
+        let mut collection = collection;
+        collection.items[1]
+            .alerts
+            .push((crate::rules::RuleId::HiddenProgram, "seen".into()));
         let part = from_json(&to_json(&collection).to_string()).unwrap();
         assert_eq!(part.items, collection.items[..2]);
         assert_eq!(part.truncated, ["/etc/x"]);
@@ -436,7 +466,7 @@ mod tests {
     fn malformed_or_foreign_output_is_refused() {
         assert!(from_json("not json").is_err());
         assert!(from_json(r#"{"version":2,"items":[]}"#).is_err());
-        let escaping = r#"{"version":1,"items":[{"path":"../etc/x","category":"sudo","tier":"unknown","body":{"kind":"undecodable"},"runs":[],"notes":[]}]}"#;
+        let escaping = r#"{"version":1,"items":[{"path":"../etc/x","category":"sudo","tier":"unknown","body":{"kind":"undecodable"},"runs":[],"notes":[],"alerts":[]}]}"#;
         assert!(from_json(escaping).is_err());
     }
 

@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
 use super::collect::{Body, Collection, Item, Origin};
-use super::judge::{is_trusted, label};
+use super::judge::label;
 use super::tier::Tier;
 use crate::agent::Status;
 use crate::json::Json;
@@ -45,12 +45,12 @@ pub fn print(collection: &Collection, report: &Report, home: Option<&str>, all: 
     let shown_items: Vec<&Item> = collection
         .items
         .iter()
-        .filter(|item| all || !is_trusted(item.tier))
+        .filter(|item| all || !item.is_trusted())
         .collect();
     let trusted = collection
         .items
         .iter()
-        .filter(|item| is_trusted(item.tier))
+        .filter(|item| item.is_trusted())
         .count();
     outln!(
         "Guardian sweep · {} item(s) · {trusted} trusted · {} to look at",

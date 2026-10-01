@@ -94,7 +94,7 @@ pub fn save_baseline(directory: &Path, current: &Remembered) -> Result<(), Strin
 /// Marks items the user allowed, while they are unchanged.
 pub fn apply_allowed(items: &mut [Item], allowed: &Remembered, label: impl Fn(&Item) -> String) {
     for item in items {
-        if matches!(item.tier, Tier::Vendor | Tier::Inert | Tier::Copied) {
+        if item.is_trusted() {
             continue;
         }
         if allowed
@@ -169,6 +169,7 @@ mod tests {
             runs: Vec::new(),
             run_by: None,
             notes: Vec::new(),
+            alerts: Vec::new(),
         }
     }
 

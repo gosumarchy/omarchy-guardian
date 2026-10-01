@@ -39,10 +39,17 @@ pub enum Category {
     Systemd,
     SystemdGenerator,
     Udev,
+    /// What runs now, found by the sweep's live checks.
+    Process,
+    Listener,
+    Input,
+    Camera,
+    KernelModule,
+    Setuid,
 }
 
 impl Category {
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 31] = [
         Self::Autostart,
         Self::Boot,
         Self::BootConfig,
@@ -68,6 +75,12 @@ impl Category {
         Self::Systemd,
         Self::SystemdGenerator,
         Self::Udev,
+        Self::Process,
+        Self::Listener,
+        Self::Input,
+        Self::Camera,
+        Self::KernelModule,
+        Self::Setuid,
     ];
 
     /// A stable machine name (`pam`, `systemd-generator`).
@@ -98,6 +111,12 @@ impl Category {
             Self::Systemd => "systemd",
             Self::SystemdGenerator => "systemd-generator",
             Self::Udev => "udev",
+            Self::Process => "process",
+            Self::Listener => "listener",
+            Self::Input => "input",
+            Self::Camera => "camera",
+            Self::KernelModule => "kernel-module",
+            Self::Setuid => "setuid",
         }
     }
 
@@ -135,6 +154,12 @@ impl Category {
             Self::Systemd => "systemd units",
             Self::SystemdGenerator => "systemd generators",
             Self::Udev => "udev rules",
+            Self::Process => "Running programs",
+            Self::Listener => "Programs listening on the network",
+            Self::Input => "Programs reading the keyboard",
+            Self::Camera => "Programs using a camera",
+            Self::KernelModule => "Loaded kernel modules",
+            Self::Setuid => "Programs with extra privileges",
         }
     }
 
@@ -161,6 +186,12 @@ impl Category {
             Self::Shell => "runs in every shell",
             Self::Systemd => "runs as a service",
             Self::Udev => "runs when a device appears",
+            Self::Process => "running now",
+            Self::Listener => "accepts connections from the network",
+            Self::Input => "can read every key you press",
+            Self::Camera => "can see through the camera",
+            Self::KernelModule => "runs inside the kernel",
+            Self::Setuid => "runs with more rights than whoever starts it",
         }
     }
 }
