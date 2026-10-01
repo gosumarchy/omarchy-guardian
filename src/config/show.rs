@@ -222,6 +222,7 @@ mod tests {
             SourceClass::Aur,
             &[unit],
             &files,
+            &baseline::Unread::new(),
             &AgentSettings::default(),
             1,
         )

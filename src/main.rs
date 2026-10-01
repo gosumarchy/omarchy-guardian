@@ -31,6 +31,7 @@ mod deps;
 mod engine;
 mod error;
 mod git_state;
+mod image;
 mod json;
 mod layout;
 mod makepkg_gate;

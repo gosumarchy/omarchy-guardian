@@ -14,8 +14,9 @@
 //!    sources are reported, sources anyone on the network can replace
 //!    block, and the AI reviews what runs during the build;
 //! 4. checks the recipe once more and starts makepkg with the original
-//!    arguments, plus `--holdver` after a pre-extraction so the build uses
-//!    exactly the fetched sources, and the probed directories pinned.
+//!    arguments, plus `--holdver` after a pre-extraction so the build does
+//!    not fetch newer VCS sources than were reviewed, and the probed
+//!    directories pinned.
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -72,15 +73,35 @@ const MIRRORED_SHORT: &[char] = &['A', 'C'];
 /// Ends the hidden recipe copy: the functions that run on downloaded
 /// sources before their review do nothing (`pkgver()` keeps the current
 /// version, so makepkg never rewrites the recipe), and the directories
-/// makepkg settled on are reported. Fixed text: nothing untrusted in it.
-const TRAILER: &str = "
-pkgver() { printf '%s\\n' \"$pkgver\"; }
-prepare() { :; }
-verify() { :; }
-if [[ -n ${GUARDIAN_PROBE:-} ]]; then
-  printf '%s\\0%s\\0%s\\0%s\\0' \"$BUILDDIR\" \"$SRCDEST\" \"${pkgbase:-${pkgname[0]}}\" \"$startdir\" >\"$GUARDIAN_PROBE\"
+/// makepkg settled on are reported. Nothing untrusted in it: `token` is the
+/// copy's random name, which only keeps it apart from the recipe's own
+/// names (a recipe can read it from its file name).
+///
+/// The recipe's own code ran first and may have made its functions
+/// read-only or aliased their names, so the replacements are checked by the
+/// token in their bodies (an assignment: no command a recipe could have
+/// redefined) and then made read-only themselves. The report is written
+/// only when they took, and the gate needs it from every run of the copy;
+/// otherwise makepkg stops. This is a check inside a shell the recipe has
+/// already run in, so it catches what a recipe can do in passing, not a
+/// recipe written to defeat it: that one has to get past its own review.
+fn trailer(token: &str) -> String {
+    format!(
+        "
+pkgver() {{ guardian_{token}=1; printf '%s\\n' \"$pkgver\"; }}
+prepare() {{ guardian_{token}=1; }}
+verify() {{ guardian_{token}=1; }}
+readonly -f pkgver prepare verify
+if [[ $(declare -f pkgver) == *guardian_{token}=1* && $(declare -f prepare) == *guardian_{token}=1* && $(declare -f verify) == *guardian_{token}=1* ]]; then
+  if [[ -n ${{GUARDIAN_PROBE:-}} ]]; then
+    printf '%s\\0%s\\0%s\\0%s\\0' \"$BUILDDIR\" \"$SRCDEST\" \"${{pkgbase:-${{pkgname[0]}}}}\" \"$startdir\" >\"$GUARDIAN_PROBE\"
+  fi
+else
+  exit 1
 fi
-";
+"
+    )
+}
 
 pub fn run(command: &[OsString], settings: &Settings) -> ExitCode {
     let Some((makepkg, arguments)) = command.split_first() else {
@@ -247,6 +268,7 @@ fn recipe_target(build_dir: &Path, key: &str, aur: bool) -> Target {
             root: build_dir.to_path_buf(),
             include_ignored_dirs: true,
             excluded_top_level: vec!["src".into(), "pkg".into()],
+            excluded_entries: Vec::new(),
             limits: scan::Limits::DEFAULT,
         },
         show_hashes: false,
@@ -458,7 +480,7 @@ impl RecipeCopy {
             .open(&path)
             .at(&path)?;
         file.write_all(recipe.as_bytes())
-            .and_then(|()| file.write_all(TRAILER.as_bytes()))
+            .and_then(|()| file.write_all(trailer(&suffix).as_bytes()))
             .at(&path)?;
         Ok(Self { path })
     }
@@ -508,8 +530,13 @@ fn probe(step: &UpstreamStep<'_>, copy: &RecipeCopy) -> Result<(Vec<aur::Source>
 }
 
 /// Fetches and extracts the sources from the recipe copy, where
-/// `pkgver()`, `prepare()` and `verify()` do nothing.
+/// `pkgver()`, `prepare()` and `verify()` do nothing. A run without the
+/// copy's report is one where that was not established: the recipe's own
+/// functions may have run on the downloads, and the build is blocked.
 fn pre_extract(step: &UpstreamStep<'_>, copy: &RecipeCopy) -> Result<(), String> {
+    let workspace = Workspace::create("fetch")
+        .map_err(|error| format!("could not prepare the sources ({error})."))?;
+    let report = workspace.path().join("probe");
     errln!(
         "Guardian: fetching and extracting the sources for review (makepkg runs the approved PKGBUILD only to download them; pkgver(), prepare() and verify() do not run and nothing is built)..."
     );
@@ -519,14 +546,20 @@ fn pre_extract(step: &UpstreamStep<'_>, copy: &RecipeCopy) -> Result<(), String>
         .arg(copy.name())
         .args(["--nobuild", "--noprepare", "--nodeps", "--noconfirm"])
         .args(step.mirrored)
+        .env("GUARDIAN_PROBE", &report)
         .status()
         .map_err(|error| format!("could not run makepkg to fetch the sources ({error})."))?;
-    if status.success() {
-        Ok(())
-    } else {
+    if !status.success() {
         Err(format!(
             "fetching the sources for review failed ({status})."
         ))
+    } else if fs::read(&report).is_ok_and(|bytes| Probe::parse(&bytes).is_some()) {
+        Ok(())
+    } else {
+        Err(
+            "the PKGBUILD kept its pkgver(), prepare() or verify() from being switched off for the fetch."
+                .into(),
+        )
     }
 }
 
@@ -697,7 +730,7 @@ fn verify_recipe(
     downloads: &[String],
 ) -> Result<(), Error> {
     let mut config = config.clone();
-    config.excluded_top_level.extend(downloads.iter().cloned());
+    config.excluded_entries.extend(downloads.iter().cloned());
     let excluded = |path: &str| {
         let top = path.split('/').next().unwrap_or_default();
         downloads.iter().any(|name| name == top)
@@ -826,6 +859,7 @@ fn review_upstream_files(
     for gap in &upstream.gaps {
         report.gaps.push(Gap::Package(Error::Refused(gap.clone())));
     }
+    report.unread.clone_from(&upstream.unread);
     let units: Vec<Unit> = Identity::parse(&format!("aur-src:{}", step.key))
         .map(|identity| {
             vec![Unit {
@@ -911,7 +945,11 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
-    use super::{Probe, TRAILER, aur, download_names, mirrored_arguments, parse};
+    use std::fs;
+    use std::process::Command;
+
+    use super::{Probe, aur, download_names, mirrored_arguments, parse, trailer};
+    use crate::test_support::TempDir;
 
     fn args(list: &[&str]) -> Vec<OsString> {
         list.iter().map(OsString::from).collect()
@@ -954,9 +992,50 @@ mod tests {
     }
 
     #[test]
-    fn the_probe_is_fixed_text_and_srcdir_follows_makepkg() {
-        assert!(TRAILER.contains("pkgver() { printf"));
-        assert!(TRAILER.contains("GUARDIAN_PROBE"));
+    fn the_recipe_copy_reports_only_when_its_functions_are_switched_off() {
+        // Sourced the way makepkg does, then pkgver() and prepare() run.
+        let run = |name: &str, recipe: &str| -> (bool, bool, String) {
+            let dir = TempDir::new(name);
+            let report = dir.path().join("report");
+            let script = format!("pkgver=1\npkgname=demo\n{recipe}\n{}", trailer("0011aabb"));
+            fs::write(dir.path().join("PKGBUILD"), script).unwrap();
+            let output = Command::new("/usr/bin/bash")
+                .args(["-c", "source ./PKGBUILD; pkgver; prepare; verify"])
+                .current_dir(dir.path())
+                .env("GUARDIAN_PROBE", &report)
+                .env("BUILDDIR", "/b")
+                .env("startdir", "/start")
+                .output()
+                .unwrap();
+            (
+                report.exists(),
+                dir.path().join("ran").exists(),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+            )
+        };
+        let own =
+            "pkgver() { touch ran; echo 2; }\nprepare() { touch ran; }\nverify() { touch ran; }";
+
+        assert_eq!(run("trailer-plain", own), (true, false, "1\n".to_string()));
+        assert_eq!(run("trailer-none", ""), (true, false, "1\n".to_string()));
+        // Once switched off, they stay off.
+        let late = format!("{own}\ntrap 'pkgver() {{ touch ran; }}' RETURN");
+        assert!(!run("trailer-late", &late).1);
+
+        for (name, trick) in [
+            ("readonly", "readonly -f pkgver"),
+            ("exit", "readonly -f prepare\nexit() { :; }"),
+            ("alias", "shopt -s expand_aliases\nalias pkgver=other"),
+            ("return", "return 0"),
+        ] {
+            let recipe = format!("{own}\n{trick}");
+            let (reported, _, _) = run(&format!("trailer-{name}"), &recipe);
+            assert!(!reported, "{name}");
+        }
+    }
+
+    #[test]
+    fn srcdir_follows_makepkg() {
         let probe = Probe::parse(b"/b\0\0demo\0/start\0").unwrap();
         assert_eq!(probe.srcdest, PathBuf::from("/start"));
         assert_eq!(probe.srcdir(), PathBuf::from("/b/demo/src"));

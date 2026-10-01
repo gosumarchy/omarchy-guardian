@@ -220,6 +220,8 @@ pub struct Report {
     pub lossy_files: usize,
     /// Files hashed but not read, named to the AI.
     pub hash_only: Vec<crate::engine::plan::HashOnly>,
+    /// What an approved version is bound to besides its text.
+    pub unread: crate::engine::baseline::Unread,
     pub findings: Vec<LocalFinding>,
     pub network: Vec<NetworkRequest>,
     pub agent_input: Vec<SourceFile>,

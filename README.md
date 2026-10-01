@@ -90,7 +90,8 @@ omarchy-guardian sweep
 - `scan` reviews a file or directory and prints a report.
 - `guard` reviews, then re-hashes the tree, then **replaces itself** with the
   command (`exec`) only if the review was clear and nothing changed.
-  `--exclude NAME` (repeatable) leaves a top-level directory out of both the
+  `--exclude NAME` (repeatable) leaves a top-level directory (never a file
+  or link of that name) out of both the
   review and the snapshot.
 - `tui` (or `settings`) opens the settings app: a full-screen terminal UI in
   Omarchy's style, simple by default, with every setting under `--expert`
@@ -470,7 +471,19 @@ says the memory was not used and the review runs in full:
   points whole, and unchanged files only as names in the file list. Local
   rules and the dependency audit still read every file. A baseline only
   counts under the prompt version, model, variant and thinking level that
-  approved it; after any of them changes, the next review is a full one. A
+  approved it; after any of them changes, the next review is a full one.
+  So is the review of a version in which a file Guardian does not read (a
+  binary, a link) was added, changed or removed, of a tree with a skipped
+  generated directory, and of a version in which files were removed and
+  nothing else changed: what the unchanged text runs may no longer be what
+  was approved. When binaries or links differ, the AI is told which. An
+  image is the exception, so a new wallpaper costs no AI call: the file
+  must be named as one (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`), not be
+  executable, and be one whole image from its first byte to its last by
+  that format's own structure (a file that only starts like an image, or
+  has anything after it, does not count). Guardian still does not look at
+  what an image shows, so this rests on the approved text not running
+  files it was not sent, which its review is asked to report. A
   source identical to its baseline is answered from the cache when its first
   review is still cached (yay's second `makepkg` pass); otherwise it is
   reviewed as an upgrade like any other. The `strict` profile turns diff
@@ -732,8 +745,12 @@ gate does, in order:
    fetches and extracts them itself: makepkg runs a private copy of the
    approved recipe with `--nobuild --noprepare --nodeps`, in which
    `pkgver()`, `prepare()` and `verify()` are replaced with no-ops, so no
-   upstream code has run yet (the build then keeps the version with
-   `--holdver`). The AI then reviews the
+   upstream code has run yet. A recipe that keeps them from being replaced
+   (by making them read-only, say) blocks the build; this is checked inside
+   the shell the recipe runs in, so the recipe's own review remains what
+   stands against a recipe written to defeat it. The build itself then
+   runs with `--holdver`, so it does not fetch newer VCS sources than were
+   reviewed; its `pkgver()` does run, on reviewed code. The AI then reviews the
    upstream code under `src/`: all of it when its code is up to 1 MiB,
    otherwise its build files and scripts (makefiles, CMake, meson,
    `configure`, `setup.py`, `build.rs`, `package.json`, shell scripts…)
@@ -744,7 +761,11 @@ gate does, in order:
    for malicious intent in what runs during the build and in the program's
    own code, not bugs or vulnerabilities, and is told whether the recipe
    runs the test suite (`check()`). The upstream review is remembered as
-   `aur-src:<package>`, so a new version is reviewed as a diff.
+   `aur-src:<package>`, so a new version is reviewed as a diff, unless a
+   binary file in the unpacked sources was added, changed or removed (they
+   are hashed; the downloaded archives themselves are not counted, since
+   their names change with every version): then the code is reviewed in
+   full and the AI is told which binaries differ.
 5. **makepkg** starts with the original arguments.
 
 What is not reviewed is reported: how many code files were left out, and

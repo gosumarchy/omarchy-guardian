@@ -1341,6 +1341,7 @@ mod tests {
             SourceClass::Aur,
             std::slice::from_ref(&unit),
             &files,
+            &baseline::Unread::new(),
             &AgentSettings::default(),
             1,
         )
