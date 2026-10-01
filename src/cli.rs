@@ -41,7 +41,7 @@ Usage:
   omarchy-guardian test                             (test the saved reviewer with two samples)
   omarchy-guardian sweep [--all] [--json] [--root] [--diff] [--report] | allow PATH | forget PATH|--all
                                                     (check what already runs on its own on this system)
-  omarchy-guardian ask <report-id>                  (open your AI agent on a saved block report)
+  omarchy-guardian ask <report-id>                  (open your AI agent on a saved report)
   omarchy-guardian status [--waybar | --dismiss | --open-report]
                                                     (bar widget status; mark blocks seen; open the last report)
   omarchy-guardian tui [--expert]                   (settings app; --expert shows every setting)
