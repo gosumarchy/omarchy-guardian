@@ -544,10 +544,9 @@ mod tests {
         assert!(!html.contains("<img src=x"));
         assert!(html.contains("default-src 'none'"));
         assert!(html.contains("Nothing from this source ran"));
-        // The ask button comes right after the verdict, before the details.
-        assert!(
-            html.find("omarchy-guardian://ask/").unwrap() < html.find("<h3>Output</h3>").unwrap()
-        );
+        // The ask button comes right after the verdict, before the details
+        // (the fallback output or the collected review sections).
+        assert!(html.find("omarchy-guardian://ask/").unwrap() < html.find("<section").unwrap());
     }
 
     #[test]
