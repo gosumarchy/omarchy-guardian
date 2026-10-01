@@ -173,13 +173,15 @@ fn pango(text: &str) -> String {
 /// `omarchy-guardian ask`. Nothing is saved as root.
 pub fn save_and_open(title: &str, detail: &str, ran: Ran) -> Option<(PathBuf, String)> {
     let uid = crate::engine::store::effective_uid().ok()?;
-    // Asked for and opened, it is seen; but an earlier alert still waiting
-    // keeps the bar's attention.
-    let caught_up = reports_dir().is_some_and(|directory| crate::tui::status::all_seen(&directory));
     let path = save_report(title, detail, ran, uid)?;
     let id = path.file_stem()?.to_str()?.to_string();
-    if caught_up && let Some(directory) = path.parent() {
-        crate::tui::status::mark_seen(directory, &id);
+    // Asked for and opened, it is seen; checked after saving, so an alert
+    // saved meanwhile still keeps the bar's attention.
+    if let Some(directory) = path.parent() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        crate::tui::status::mark_seen_unless_waiting(directory, &id, now);
     }
     if env::var_os(QUIET).is_none() && Path::new(LAUNCH_BROWSER).is_file() {
         let env = session_env();
