@@ -96,6 +96,22 @@ impl fmt::Display for Digest {
     }
 }
 
+impl Digest {
+    /// A digest from 64 hex digits (either case).
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        let bytes = hex.as_bytes();
+        if bytes.len() != 64 {
+            return None;
+        }
+        let mut digest = [0_u8; 32];
+        for (index, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
+            let text = std::str::from_utf8(pair).ok()?;
+            digest[index] = u8::from_str_radix(text, 16).ok()?;
+        }
+        Some(Self(digest))
+    }
+}
+
 impl fmt::Debug for Digest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Digest({self})")
@@ -228,7 +244,19 @@ fn compress(state: &mut [u32; 8], block: &[u8; BLOCK_LEN]) {
 
 #[cfg(test)]
 mod tests {
-    use super::Sha256;
+    use super::{Digest, Sha256};
+
+    #[test]
+    fn digests_round_trip_through_hex() {
+        let digest = Sha256::digest(b"abc");
+        assert_eq!(Digest::from_hex(&digest.to_string()), Some(digest));
+        assert_eq!(
+            Digest::from_hex(&digest.to_string().to_uppercase()),
+            Some(digest)
+        );
+        assert_eq!(Digest::from_hex("ab"), None);
+        assert_eq!(Digest::from_hex(&"g".repeat(64)), None);
+    }
 
     fn hex(bytes: &[u8]) -> String {
         Sha256::digest(bytes).to_string()
