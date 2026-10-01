@@ -39,7 +39,7 @@ Usage:
   omarchy-guardian setup
   omarchy-guardian protect [--off] [--yes]          (turn every gate on, or the install gates off)
   omarchy-guardian test                             (test the saved reviewer with two samples)
-  omarchy-guardian sweep [--all] [--json] [--root] [--diff] | allow PATH | forget PATH|--all
+  omarchy-guardian sweep [--all] [--json] [--root] [--diff] [--report] | allow PATH | forget PATH|--all
                                                     (check what already runs on its own on this system)
   omarchy-guardian ask <report-id>                  (open your AI agent on a saved block report)
   omarchy-guardian status [--waybar | --dismiss | --open-report]
@@ -509,7 +509,7 @@ fn config_command(command: &ConfigCommand, settings: &Settings) -> ExitCode {
 }
 
 fn parse_sweep(args: &[OsString]) -> Result<sweep::Command, String> {
-    const USAGE: &str = "usage: omarchy-guardian sweep [--all] [--json] [--root] [--diff] | allow PATH | forget PATH | forget --all";
+    const USAGE: &str = "usage: omarchy-guardian sweep [--all] [--json] [--root] [--diff] [--report] | allow PATH | forget PATH | forget --all";
     let text: Vec<&str> = args
         .iter()
         .map(|arg| arg.to_str().ok_or("arguments must be UTF-8"))
@@ -528,10 +528,14 @@ fn parse_sweep(args: &[OsString]) -> Result<sweep::Command, String> {
             "--json" => options.view = sweep::View::Json,
             "--diff" => options.view = sweep::View::Changes,
             "--root" => options.root = true,
+            "--report" => options.report = true,
             // Run by the user timer.
             "--scheduled" => options.scheduled = true,
             _ => return Err(USAGE.into()),
         }
+    }
+    if options.report && options.view == sweep::View::Json {
+        return Err("sweep: --report saves the printed report; it does not go with --json".into());
     }
     Ok(sweep::Command::Run(options))
 }
@@ -911,6 +915,17 @@ mod tests {
             self.1.push(question.to_string());
             self.0.unwrap_or(false)
         }
+    }
+
+    #[test]
+    fn sweep_report_parses_but_not_with_json() {
+        let Ok(Invocation::Sweep(crate::sweep::Command::Run(options))) =
+            parse(&args(&["sweep", "--report"]))
+        else {
+            panic!("sweep --report did not parse");
+        };
+        assert!(options.report);
+        assert!(parse(&args(&["sweep", "--json", "--report"])).is_err());
     }
 
     #[test]

@@ -46,6 +46,9 @@ pub enum Ran {
     RecipeToFetch,
     /// Nothing was blocked: the system sweep found these already in place.
     AlreadyOnSystem,
+    /// Nothing was blocked: the user ran the sweep and asked for its page
+    /// (`sweep --report`); `clear` when it found nothing to worry about.
+    Swept { clear: bool },
 }
 
 /// Why a gate blocked, in a few words for the notification.
@@ -163,6 +166,31 @@ fn pango(text: &str) -> String {
         }
     }
     escaped
+}
+
+/// Saves what this run printed as a report page and opens it in the
+/// browser (not under the test harnesses); returns the page and its id for
+/// `omarchy-guardian ask`. Nothing is saved as root.
+pub fn save_and_open(title: &str, detail: &str, ran: Ran) -> Option<(PathBuf, String)> {
+    let uid = crate::engine::store::effective_uid().ok()?;
+    let path = save_report(title, detail, ran, uid)?;
+    let id = path.file_stem()?.to_str()?.to_string();
+    if env::var_os(QUIET).is_none() && Path::new(LAUNCH_BROWSER).is_file() {
+        let env = session_env();
+        let mut command = Command::new(SETSID);
+        command
+            .arg("-f")
+            .arg(LAUNCH_BROWSER)
+            .arg(format!("file://{}", path.display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        for (key, value) in &env {
+            command.env(key, value);
+        }
+        drop(command.status());
+    }
+    Some((path, id))
 }
 
 /// Writes what this run printed, and why it blocked, to a private file under

@@ -60,6 +60,9 @@ pub struct Options {
     pub root: bool,
     /// Run by the timer: show what changed and notify about it.
     pub scheduled: bool,
+    /// Also save the report as a page, open it, and say how to ask an AI
+    /// agent about it.
+    pub report: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -281,6 +284,36 @@ fn notify_scheduled(first: bool, decision: Decision, changes: &[(Change, String)
     }
 }
 
+/// `sweep --report`: the page, opened in the browser, and how to ask about
+/// it.
+fn save_report(collection: &Collection, decision: Decision) {
+    let to_look_at = collection
+        .items
+        .iter()
+        .filter(|item| !item.is_trusted())
+        .count();
+    let detail = format!(
+        "{to_look_at} item(s) to look at; {}",
+        match decision {
+            Decision::Clear | Decision::Limited => "the review is clear",
+            Decision::Warned => "the review warned",
+            Decision::Blocked(blocked) => notify::reason(blocked),
+        }
+    );
+    let clear = matches!(decision, Decision::Clear | Decision::Limited);
+    match notify::save_and_open(
+        "Guardian checked this system",
+        &detail,
+        notify::Ran::Swept { clear },
+    ) {
+        Some((path, id)) => {
+            outln!("\nReport saved: {}", path.display());
+            outln!("Ask your AI agent about it: omarchy-guardian ask {id}");
+        }
+        None => errln!("omarchy-guardian sweep: could not save the report"),
+    }
+}
+
 /// `omarchy-guardian sweep`.
 fn run(options: Options, settings: &Settings) -> ExitCode {
     let home = home();
@@ -363,6 +396,9 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
         }
         output::print_notes(&notes);
         report.print(false, decision);
+        if options.report {
+            save_report(&collection, decision);
+        }
     }
     if let Some(directory) = &directory
         && let Err(reason) = state::save_baseline(directory, &current)

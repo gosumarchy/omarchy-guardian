@@ -2,6 +2,7 @@
 //! each area, before the usual report of the review; or one JSON document.
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write as _;
 
 use super::collect::{Body, Collection, Item, Origin};
 use super::judge::label;
@@ -9,6 +10,7 @@ use super::tier::Tier;
 use crate::agent::Status;
 use crate::json::Json;
 use crate::layout::{self, Painter, Span, Table};
+use crate::report::html::{self, esc};
 use crate::report::{AgentOutcome, Decision, Report};
 use crate::text::shown;
 
@@ -84,6 +86,73 @@ fn summary(shown_items: &[&Item], total: usize, trusted: usize, flagged: usize) 
     lines
 }
 
+/// A tier's colour on the report page.
+const fn tier_tone(tier: Tier) -> &'static str {
+    match tier {
+        Tier::Vendor | Tier::Allowed => "green",
+        Tier::Inert | Tier::Copied => "dim",
+        Tier::UserBuilt | Tier::Edited => "cyan",
+        Tier::Modified => "red",
+        Tier::Unknown => "amber",
+    }
+}
+
+/// The items for the report page: a table for each area.
+fn items_html(
+    groups: &BTreeMap<&'static str, Vec<&Item>>,
+    home: Option<&str>,
+    flagged: &HashSet<String>,
+) -> String {
+    let mut html = String::from("<section><hr><h3>What the sweep lists</h3>");
+    if groups.is_empty() {
+        html.push_str("<p class=\"dim\">Nothing to look at: every item is trusted.</p>");
+    }
+    for (heading, items) in groups {
+        let when = items.first().map_or("", |item| item.category.when());
+        let _ = write!(
+            html,
+            "<h3>{} <span class=\"dim small\">{}</span></h3><table><tr><th>Status</th><th>Item</th><th>Details</th></tr>",
+            esc(heading),
+            esc(when)
+        );
+        for item in items {
+            let label = label(item, home);
+            let (word, _) = tier_style(item.tier);
+            let (word, tone) = if flagged.contains(&label) {
+                (format!("✗ {word}"), "red")
+            } else {
+                (word.to_string(), tier_tone(item.tier))
+            };
+            let mut details = Vec::new();
+            match &item.body {
+                Body::Link(target) => details.push(format!("→ {}", esc(target))),
+                Body::Binary(format) => details.push(format!("[{}]", esc(format))),
+                Body::Unreadable(_) => details.push("[not readable]".to_string()),
+                Body::Text(_) | Body::Undecodable | Body::Oversized => {}
+            }
+            details.extend(
+                item.runs
+                    .iter()
+                    .map(|command| format!("runs <code>{}</code>", esc(command))),
+            );
+            details.extend(item.notes.iter().map(|note| esc(note)));
+            if item.origin == Origin::Root {
+                details.push("read as root".to_string());
+            }
+            let _ = write!(
+                html,
+                "<tr><td class=\"{tone}\">{}</td><td><code>{}</code></td><td>{}</td></tr>",
+                esc(&word),
+                esc(&label),
+                details.join("<br>")
+            );
+        }
+        html.push_str("</table>");
+    }
+    html.push_str("</section>");
+    html
+}
+
 /// One row of an area's table.
 fn item_row(item: &Item, home: Option<&str>, flagged: &HashSet<String>) -> Vec<Vec<Span>> {
     let label = label(item, home);
@@ -147,6 +216,7 @@ pub fn print(collection: &Collection, report: &Report, home: Option<&str>, all: 
     for item in shown_items {
         groups.entry(item.category.label()).or_default().push(item);
     }
+    html::collect_section(items_html(&groups, home, &flagged));
     let mut headings = Vec::new();
     let mut tables = Vec::new();
     for (heading, items) in groups {
@@ -213,6 +283,19 @@ pub fn print_changes(changes: &[(super::state::Change, String)]) {
         "{}",
         layout::boxed("Guardian sweep", &lines, width, "36", painter)
     );
+    let mut page = String::from(
+        "<section><hr><h3>What changed since the last sweep</h3><table><tr><th>Change</th><th>Item</th></tr>",
+    );
+    for (change, label) in changes {
+        let _ = write!(
+            page,
+            "<tr><td class=\"amber\">{}</td><td><code>{}</code></td></tr>",
+            esc(change.shown().0),
+            esc(label)
+        );
+    }
+    page.push_str("</table></section>");
+    html::collect_section(page);
     let mut table = Table::new(vec!["Change", "Item"]);
     for (change, label) in changes {
         let (word, color) = change.shown();
@@ -366,4 +449,40 @@ fn reviews_json(report: &Report) -> Json {
             AgentOutcome::Unavailable(_) => None,
         });
     Json::Array(reviews.collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, HashSet};
+
+    use super::items_html;
+    use crate::autorun::Category;
+    use crate::sweep::collect::{Body, Item, Origin};
+    use crate::sweep::tier::Tier;
+
+    #[test]
+    fn the_page_escapes_what_it_lists() {
+        let item = Item {
+            origin: Origin::Root,
+            category: Category::Shell,
+            path: "home/u/<b>evil</b>".into(),
+            tier: Tier::Unknown,
+            sha256: None,
+            body: Body::Link("<script>x</script>".into()),
+            runs: vec!["curl \"a\" & <x>".into()],
+            run_by: None,
+            notes: vec!["<i>note</i>".into()],
+            alerts: Vec::new(),
+        };
+        let mut groups = BTreeMap::new();
+        groups.insert(item.category.label(), vec![&item]);
+        let flagged: HashSet<String> = ["~/<b>evil</b>".to_string()].into();
+        let html = items_html(&groups, Some("home/u"), &flagged);
+        assert!(!html.contains("<b>") && !html.contains("<script>") && !html.contains("<i>"));
+        assert!(html.contains("&lt;b&gt;evil") && html.contains("✗ unknown"));
+        assert!(html.contains("read as root") && html.contains("&amp;"));
+        assert!(
+            items_html(&BTreeMap::new(), None, &HashSet::new()).contains("every item is trusted")
+        );
+    }
 }
