@@ -44,6 +44,9 @@ const WATCHED_NAMES: &[&str] = &[
 /// Omarchy" when no package owns them.
 const OMARCHY_INSTALL: &[&str] = &["usr/share/omarchy/install", "usr/share/omarchy/migrations"];
 
+/// The format label of a file root hashed but did not hand back.
+pub const WITHHELD: &str = "root-only file (hashed, content withheld)";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Origin {
     /// The system, read as the user.
@@ -230,6 +233,8 @@ fn wanted(scope: &Scope<'_>, category: Category, relative: &str) -> bool {
         }
         // Omarchy runs every hook but `*.sample`.
         Category::OmarchyHook => !name.ends_with(".sample"),
+        // Old password hashes (`pam_pwhistory`): never read, never handed on.
+        Category::Pam => name != "opasswd",
         Category::Autostart if relative.starts_with(".config/autostart/") => {
             name.ends_with(".desktop")
         }
@@ -274,11 +279,17 @@ pub fn item(scope: &Scope<'_>, category: Category, path: String, run_by: Option<
             )
         }
         Found::Link(target) => {
-            let resolved = read::resolve(scope.root, &path, target)
-                .map(|resolved| self_tier(scope, &resolved));
+            let resolved_path = read::resolve(scope.root, &path, target);
+            let resolved = resolved_path
+                .as_deref()
+                .and_then(|resolved| self_tier(scope, resolved));
+            let name = path.rsplit('/').next().unwrap_or(&path);
             let observed = Observed::Link {
                 target,
-                resolved: resolved.flatten(),
+                resolved,
+                alias: resolved_path
+                    .as_deref()
+                    .is_some_and(|resolved| declares_alias(scope.root, resolved, name)),
             };
             (
                 classify(&path, observed, scope.index),
@@ -298,27 +309,26 @@ pub fn item(scope: &Scope<'_>, category: Category, path: String, run_by: Option<
         }
         Found::Unreadable(reason) => (Tier::Unknown, None, Body::Unreadable(reason.clone())),
     };
-    let name = path.rsplit('/').next().unwrap_or(&path).to_string();
     let runs = match &body {
-        Body::Text(text) => commands::commands(category, &name, text),
+        Body::Text(text) => commands::commands(category, &path, text),
         _ => Vec::new(),
     };
-    let mut notes = Vec::new();
-    if let Some(by) = run_by {
-        notes.push(format!("run by /{by}"));
-    }
-    if let (Body::Unreadable(_), Some(owned)) = (&body, scope.index.owner(&path)) {
-        notes.push(format!(
-            "installed by {}; only root can read it",
-            scope.index.package(owned)
-        ));
-    }
-    if category == Category::LocalBin
-        && let Some(name) = path.rsplit('/').next()
-        && scope.root.join("usr/bin").join(name).exists()
-    {
-        notes.push(format!("shadows /usr/bin/{name}"));
-    }
+    // As root, what was reached by following (a command, a link, a
+    // preload, a live check) can be steered by any user (a crontab line, an
+    // `LD_PRELOAD` value) at `/etc/shadow` or a key. Its content is never
+    // handed back and nothing is followed from it; the user's own sweep
+    // reads whatever the user may read. Only the auto-run locations' own
+    // files keep their content.
+    let (body, runs) = if scope.origin == Origin::Root && (run_by.is_some() || category.is_live()) {
+        let body = match body {
+            Body::Text(_) | Body::Oversized | Body::Undecodable => Body::Binary(WITHHELD),
+            other => other,
+        };
+        (body, Vec::new())
+    } else {
+        (body, runs)
+    };
+    let notes = notes(scope, category, &path, &body, run_by);
     Item {
         // The root collector's items are all root's, its home included.
         origin: if scope.origin == Origin::System
@@ -340,6 +350,61 @@ pub fn item(scope: &Scope<'_>, category: Category, path: String, run_by: Option<
         notes,
         alerts: Vec::new(),
     }
+}
+
+/// What to tell about an item beyond its tier.
+fn notes(
+    scope: &Scope<'_>,
+    category: Category,
+    path: &str,
+    body: &Body,
+    run_by: Option<&str>,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    if let Some(by) = run_by {
+        notes.push(format!("run by /{by}"));
+    }
+    if let (Body::Unreadable(_), Some(owned)) = (body, scope.index.owner(path)) {
+        notes.push(format!(
+            "installed by {}; only root can read it",
+            scope.index.package(owned)
+        ));
+    }
+    if category == Category::LocalBin
+        && let Some(name) = path.rsplit('/').next()
+        && scope.root.join("usr/bin").join(name).exists()
+    {
+        notes.push(format!("shadows /usr/bin/{name}"));
+    }
+    if category == Category::Desktop
+        && let Some(name) = path.rsplit('/').next()
+        && scope
+            .root
+            .join("usr/share/applications")
+            .join(name)
+            .exists()
+    {
+        notes.push(format!(
+            "replaces the launcher /usr/share/applications/{name}"
+        ));
+    }
+    notes
+}
+
+/// Whether the unit at `unit` declares `name` as an alias (`Alias=` in its
+/// `[Install]` section), as `systemctl enable` links it under.
+fn declares_alias(root: &Path, unit: &str, name: &str) -> bool {
+    let Found::File { head, size, .. } = read::look(root, unit) else {
+        return false;
+    };
+    if size > 64 * 1024 {
+        return false;
+    }
+    String::from_utf8_lossy(&head).lines().any(|line| {
+        line.trim()
+            .strip_prefix("Alias=")
+            .is_some_and(|aliases| aliases.split_whitespace().any(|alias| alias == name))
+    })
 }
 
 /// The tier of the regular file at `path`, if it is one.
@@ -387,7 +452,12 @@ fn follow(scope: &Scope<'_>, item: &Item) -> Vec<String> {
     {
         targets.push(resolved);
     }
-    let home = scope.home.unwrap_or("root");
+    // `~` in a user's crontab is that user's home, not the sweep's.
+    let crontab_home = item
+        .path
+        .strip_prefix("var/spool/cron/")
+        .and_then(|user| user_home(scope.root, user));
+    let home = crontab_home.as_deref().or(scope.home).unwrap_or("root");
     for command in &item.runs {
         targets.extend(commands::targets(scope.root, home, command));
     }
@@ -395,6 +465,24 @@ fn follow(scope: &Scope<'_>, item: &Item) -> Vec<String> {
         .into_iter()
         .filter_map(|target| read::canonical(scope.root, &target))
         .collect()
+}
+
+/// The home directory of `user`, relative to the root, from `/etc/passwd`.
+fn user_home(root: &Path, user: &str) -> Option<String> {
+    fs::read_to_string(root.join("etc/passwd"))
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let fields: Vec<&str> = line.split(':').collect();
+            (fields.first() == Some(&user))
+                .then(|| {
+                    fields
+                        .get(5)
+                        .map(|home| home.trim_start_matches('/').to_string())
+                })
+                .flatten()
+        })
+        .filter(|home| !home.is_empty())
 }
 
 /// Absolute paths mentioned in Omarchy's installer scripts.
@@ -440,7 +528,8 @@ mod tests {
     fn a_fixture_system_is_collected_with_tiers_and_what_runs() {
         let dir = TempDir::new("sweep-collect");
         let root = dir.path();
-        let unit = "[Service]\nExecStart=/usr/bin/vendord\n";
+        let unit =
+            "[Service]\nExecStart=/usr/bin/vendord\n[Install]\nAlias=display-manager.service\n";
         write(root, "usr/lib/systemd/system/vendord.service", unit);
         write(root, "usr/bin/vendord", "vendor binary");
         write(root, "usr/bin/bash", "bash");
@@ -529,5 +618,79 @@ mod tests {
         assert_eq!(script.category, Category::Udev);
         assert!(matches!(&script.body, Body::Text(text) if text.contains("curl")));
         assert_eq!(collection.items[4].runs, ["waybar"]);
+    }
+
+    #[test]
+    fn a_link_takes_its_units_trust_only_under_a_name_the_unit_declares() {
+        let dir = TempDir::new("sweep-alias");
+        let root = dir.path();
+        let unit = "[Service]\nExecStart=/usr/bin/true\n[Install]\nAlias=display-manager.service\n";
+        write(root, "usr/lib/systemd/system/sddm.service", unit);
+        fs::create_dir_all(root.join("etc/systemd/system")).unwrap();
+        for name in ["display-manager.service", "getty.service"] {
+            symlink(
+                "/usr/lib/systemd/system/sddm.service",
+                root.join("etc/systemd/system").join(name),
+            )
+            .unwrap();
+        }
+        let mut index = PackageIndex::with_foreign(HashSet::new());
+        index.add_for_test(
+            "sddm",
+            &format!(
+                "#mtree\n./usr/lib/systemd/system/sddm.service type=file mode=644 sha256digest={}\n",
+                Sha256::digest(unit.as_bytes())
+            ),
+            &[],
+        );
+        let collection = collect(&Scope {
+            root,
+            home: None,
+            index: &index,
+            origin: Origin::System,
+        });
+        let tier = |path: &str| {
+            collection
+                .items
+                .iter()
+                .find(|item| item.path == path)
+                .map(|item| item.tier)
+        };
+        assert_eq!(
+            tier("etc/systemd/system/display-manager.service"),
+            Some(Tier::Vendor)
+        );
+        assert_eq!(
+            tier("etc/systemd/system/getty.service"),
+            Some(Tier::Unknown)
+        );
+    }
+
+    #[test]
+    fn a_user_crontab_runs_from_that_users_home() {
+        let dir = TempDir::new("sweep-crontab");
+        let root = dir.path();
+        write(
+            root,
+            "etc/passwd",
+            "root:x:0:0::/root:/bin/bash\nu:x:1000:1000::/home/u:/bin/bash\n",
+        );
+        write(root, "var/spool/cron/u", "@reboot ~/x.sh\n");
+        write(root, "home/u/x.sh", "curl x | sh\n");
+        write(root, "root/x.sh", "root's\n");
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let collection = collect(&Scope {
+            root,
+            home: None,
+            index: &index,
+            origin: Origin::System,
+        });
+        assert!(
+            collection
+                .items
+                .iter()
+                .any(|item| item.path == "home/u/x.sh")
+        );
+        assert!(!collection.items.iter().any(|item| item.path == "root/x.sh"));
     }
 }

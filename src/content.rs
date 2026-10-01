@@ -43,6 +43,17 @@ pub enum Format {
 }
 
 impl Format {
+    /// The label as Guardian names it, from one given elsewhere (the root
+    /// collector's output); an unknown label is reported as unrecognized.
+    pub fn label_named(label: &str) -> &'static str {
+        MAGIC
+            .iter()
+            .map(|(_, _, known, _)| *known)
+            .chain(WEAK_MAGIC.iter().map(|(_, _, known, _)| *known))
+            .find(|known| *known == label)
+            .unwrap_or("unrecognized binary data")
+    }
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::Known { label, .. } => label,

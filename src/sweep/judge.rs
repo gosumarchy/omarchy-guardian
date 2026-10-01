@@ -209,10 +209,15 @@ fn fact(item: &Item, label: &str) -> String {
             " Omarchy's installer writes a file at this path; its content is not verified.",
         );
     }
-    if let Some(note) = item.notes.iter().find(|note| note.starts_with("shadows ")) {
+    if let Some(command) = item
+        .notes
+        .iter()
+        .find_map(|note| note.strip_prefix("shadows "))
+    {
         let _ = write!(
             text,
-            " It {note}, so typing that command runs this instead."
+            " It shadows {:?}, so typing that command runs this instead.",
+            shown(command).as_ref()
         );
     }
     text

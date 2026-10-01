@@ -30,12 +30,26 @@ pub fn directory(store_root: &Path) -> Result<PathBuf, String> {
 /// An item's content hash as remembered: the file's SHA-256, or for a link
 /// its target, or `-` when it could not be read.
 pub fn fingerprint(item: &Item) -> String {
-    match (&item.sha256, &item.body) {
+    let content = match (&item.sha256, &item.body) {
         (Some(digest), _) => digest.to_string(),
         (None, super::collect::Body::Link(target)) => format!("link:{target}"),
-        (None, _) => "-".into(),
+        (None, _) => UNREAD.into(),
+    };
+    // What the live checks saw is part of it: allowing a program that
+    // autostarts does not allow it to start reading the keyboard.
+    let mut alerts: Vec<&str> = item.alerts.iter().map(|(rule, _)| rule.name()).collect();
+    alerts.sort_unstable();
+    alerts.dedup();
+    if alerts.is_empty() {
+        content
+    } else {
+        format!("{content}+{}", alerts.join(","))
     }
 }
+
+/// The fingerprint of an item that could not be read (and raised no
+/// alert): only this one carries over a previous fingerprint.
+pub const UNREAD: &str = "-";
 
 /// Label to fingerprint.
 pub type Remembered = BTreeMap<String, String>;

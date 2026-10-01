@@ -235,12 +235,17 @@ pub struct Paths {
     /// The sweep's root timer as packaged, and its enable link.
     pub sweep_root_timer: PathBuf,
     pub sweep_root_timer_link: PathBuf,
-    /// What the system configuration says about the root checks.
+    /// What the system configuration says about the root checks, and the
+    /// group allowed to read the daily results.
     pub sweep_consent: Option<RootConsent>,
+    pub sweep_group: Option<String>,
 }
 
 impl Paths {
-    pub fn real(opencode_missing: bool, sweep_consent: Option<RootConsent>) -> Option<Self> {
+    pub fn real(
+        opencode_missing: bool,
+        (sweep_consent, sweep_group): (Option<RootConsent>, Option<String>),
+    ) -> Option<Self> {
         let home = env::var_os("HOME")
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())?;
@@ -276,6 +281,7 @@ impl Paths {
             sweep_root_timer_link: Path::new("/etc/systemd/system/timers.target.wants")
                 .join(SWEEP_ROOT_TIMER),
             sweep_consent,
+            sweep_group,
         })
     }
 
@@ -340,8 +346,17 @@ impl Paths {
         let user = fs::symlink_metadata(&self.sweep_timer_link).is_ok();
         let root = fs::symlink_metadata(&self.sweep_root_timer_link).is_ok();
         match (user, self.sweep_consent, root) {
-            (false, _, _) => State::Off,
+            (false, _, true) => State::Partial(
+                "the daily root checks run, but the sweep itself is off".into(),
+            ),
+            (false, _, false) => State::Off,
             (true, Some(RootConsent::Allowed), true) => State::On,
+            (true, Some(RootConsent::Allowed), false) if self.sweep_group.is_none() => {
+                State::Partial(
+                    "root checks only with `sweep --root`: no private group to share daily results with"
+                        .into(),
+                )
+            }
             (true, Some(RootConsent::Allowed), false) => {
                 State::Partial("root checks allowed, but their timer is off".into())
             }
@@ -369,12 +384,14 @@ impl Paths {
                 ]));
             }
             match self.sweep_consent {
-                Some(RootConsent::Allowed) if !root => steps.push(sudo(&[
-                    "/usr/bin/systemctl",
-                    "enable",
-                    "--now",
-                    SWEEP_ROOT_TIMER,
-                ])),
+                Some(RootConsent::Allowed) if !root && self.sweep_group.is_some() => {
+                    steps.push(sudo(&[
+                        "/usr/bin/systemctl",
+                        "enable",
+                        "--now",
+                        SWEEP_ROOT_TIMER,
+                    ]));
+                }
                 Some(RootConsent::Allowed) => {}
                 None | Some(RootConsent::Declined) => steps.push(Step::AskSweepRoot),
             }
@@ -1015,6 +1032,7 @@ mod tests {
             sweep_root_timer: root.join("units/omarchy-guardian-sweep-collect.timer"),
             sweep_root_timer_link: root.join("system-wants/omarchy-guardian-sweep-collect.timer"),
             sweep_consent: None,
+            sweep_group: Some("u".into()),
         }
     }
 

@@ -96,7 +96,7 @@ fn paths(settings: &Settings) -> Option<Paths> {
     let opencode_missing = !pacman::classes_requiring_ai(settings).is_empty()
         && !pacman::system_reviewer_ready(settings)
         && pacman::system_reviewer_is_opencode(settings);
-    Paths::real(opencode_missing, settings.sweep_root().0)
+    Paths::real(opencode_missing, settings.sweep_root())
 }
 
 const fn reloads(effect: &Effect) -> bool {
@@ -240,9 +240,13 @@ for. Its daily results are kept readable by your group only."
     } else {
         RootConsent::Declined
     };
-    setup::set_sweep_root(consent, crate::sweep::root::primary_group())?;
+    let group = crate::sweep::root::primary_group();
+    setup::set_sweep_root(consent, group.clone())?;
     if !allowed {
         return Ok("Root checks declined; sweeps will say what they could not check.".into());
+    }
+    if group.is_none() {
+        return Ok("Root checks allowed with `omarchy-guardian sweep --root`. Your primary group is shared with other accounts, so the daily root results would be readable by them; the daily root timer stays off.".into());
     }
     let status = Command::new("/usr/bin/sudo")
         .args([

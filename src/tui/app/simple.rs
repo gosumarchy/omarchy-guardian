@@ -766,6 +766,7 @@ mod tests {
             sweep_root_timer: root.join("units/omarchy-guardian-sweep-collect.timer"),
             sweep_root_timer_link: root.join("system-wants/omarchy-guardian-sweep-collect.timer"),
             sweep_consent: None,
+            sweep_group: Some("u".into()),
         };
         let mut app = App::new(files(Some(paths)), Mode::Simple);
         assert!(screen(&mut app).contains("not watching pacman, AUR or themes"));

@@ -74,6 +74,9 @@ pub enum Observed<'a> {
         /// The tier of what the link points at, when it resolves to a file
         /// the sweep classified (an enabled unit's link to its unit).
         resolved: Option<Tier>,
+        /// What it points at declares the link's name as an alias (a unit's
+        /// `Alias=display-manager.service`).
+        alias: bool,
     },
 }
 
@@ -111,7 +114,7 @@ pub fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex) -> Tie
         return match observed {
             _ if unchanged => packaged(index, package),
             Observed::File { sha256, .. } if owned.backup => {
-                if index.copy_of(sha256).is_some() {
+                if index.copy_of(sha256, path).is_some() {
                     Tier::Copied
                 } else {
                     Tier::Edited
@@ -120,20 +123,75 @@ pub fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex) -> Tie
             Observed::File { .. } | Observed::Link { .. } => Tier::Modified,
         };
     }
+    let name = path.rsplit('/').next().unwrap_or(path);
     match observed {
-        Observed::File { size: 0, .. }
-        | Observed::Link {
+        Observed::File { size: 0, .. } => Tier::Inert,
+        // A mask disables what it names; disabling a defence, or a pacman
+        // hook a package ships, is worth seeing.
+        Observed::Link {
             target: "/dev/null",
             ..
-        } => Tier::Inert,
-        // A link no package made (`systemctl enable`) to a packaged file is
-        // as trusted as that file.
+        } if !masks_a_defence(path, name, index) => Tier::Inert,
+        // A link no package made (`systemctl enable`) to a packaged unit of
+        // the same name is as trusted as that unit. A link under another
+        // name (a packaged script linked in as a profile script) is not, nor
+        // is enabling a unit that opens a root shell.
         Observed::Link {
+            target,
             resolved: Some(tier @ (Tier::Vendor | Tier::UserBuilt | Tier::Inert)),
-            ..
-        } => tier,
-        Observed::File { sha256, .. } if index.copy_of(sha256).is_some() => Tier::Copied,
+            alias,
+        } if (alias || same_unit(name, target)) && !ROOT_SHELL_UNITS.contains(&name) => tier,
+        Observed::File { sha256, .. } if index.copy_of(sha256, path).is_some() => Tier::Copied,
         Observed::File { .. } | Observed::Link { .. } => Tier::Unknown,
+    }
+}
+
+/// Packaged units that give a root shell without a password when enabled.
+const ROOT_SHELL_UNITS: &[&str] = &["debug-shell.service", "emergency.service", "rescue.service"];
+
+/// Units whose mask turns off a defence.
+const DEFENCES: &[&str] = &[
+    "ufw",
+    "firewalld",
+    "nftables",
+    "iptables",
+    "ip6tables",
+    "apparmor",
+    "auditd",
+    "usbguard",
+    "fail2ban",
+    "systemd-journald",
+    "omarchy-guardian",
+];
+
+fn masks_a_defence(path: &str, name: &str, index: &PackageIndex) -> bool {
+    let unit = name.split('.').next().unwrap_or(name);
+    let unit = unit.split('@').next().unwrap_or(unit);
+    DEFENCES
+        .iter()
+        .any(|defence| unit == *defence || unit.starts_with(&format!("{defence}-")))
+        || (path.starts_with("etc/pacman.d/hooks/")
+            && index
+                .owner(&format!("usr/share/libalpm/hooks/{name}"))
+                .is_some())
+}
+
+/// Whether link `name` enables the unit at `target`: the same name, or an
+/// instance (`getty@tty1.service`) of a template (`getty@.service`).
+fn same_unit(name: &str, target: &str) -> bool {
+    let target_name = target.rsplit('/').next().unwrap_or(target);
+    if name == target_name {
+        return true;
+    }
+    match (name.split_once('@'), target_name.split_once('@')) {
+        (Some((prefix, instance)), Some((template, suffix))) => {
+            prefix == template
+                && suffix.starts_with('.')
+                && instance
+                    .rsplit_once('.')
+                    .is_some_and(|(_, extension)| suffix == format!(".{extension}"))
+        }
+        _ => false,
     }
 }
 
@@ -148,8 +206,9 @@ mod tests {
     fn index() -> PackageIndex {
         let abc = Sha256::digest(b"abc");
         let copy = Sha256::digest(b"override");
+        let example = Sha256::digest(b"example");
         let mtree = format!(
-            "#mtree\n/set type=file mode=644\n./usr/bin/demo mode=755 sha256digest={abc}\n./usr/bin/su mode=4755 sha256digest={abc}\n./usr/lib/x.so type=link link=x.so.1\n./etc/demo.conf sha256digest={abc}\n./usr/share/demo/override.conf sha256digest={copy}\n"
+            "#mtree\n/set type=file mode=644\n./usr/bin/demo mode=755 sha256digest={abc}\n./usr/bin/su mode=4755 sha256digest={abc}\n./usr/lib/x.so type=link link=x.so.1\n./etc/demo.conf sha256digest={abc}\n./usr/share/demo/demo.conf sha256digest={copy}\n./usr/share/doc/demo/examples/sudoers sha256digest={example}\n./usr/lib/systemd/system/debug-shell.service sha256digest={abc}\n./usr/lib/systemd/system/sshd.service sha256digest={abc}\n./usr/share/libalpm/hooks/demo.hook sha256digest={abc}\n"
         );
         let mut index = PackageIndex::with_foreign(HashSet::from(["aur-thing".to_string()]));
         index.add_for_test("demo", &mtree, &["etc/demo.conf"]);
@@ -205,20 +264,23 @@ mod tests {
             classify("usr/bin/new", file(&other, 0o755), &index),
             Tier::Unknown
         );
-        // The same content as a packaged file, somewhere else: a copy.
+        // The same content as a packaged file under another name is not a
+        // copy of it.
         assert_eq!(
             classify("usr/bin/new", file(&abc, 0o755), &index),
-            Tier::Copied
+            Tier::Unknown
         );
         // A file replaced by a link is a change.
         let link = Observed::Link {
             target: "/tmp/x",
             resolved: None,
+            alias: false,
         };
         assert_eq!(classify("usr/bin/demo", link, &index), Tier::Modified);
         let same = Observed::Link {
             target: "x.so.1",
             resolved: None,
+            alias: false,
         };
         assert_eq!(classify("usr/lib/x.so", same, &index), Tier::Vendor);
     }
@@ -240,7 +302,13 @@ mod tests {
         assert_eq!(classify("etc/demo.conf", file(&copy), &index), Tier::Copied);
         assert_eq!(
             classify("etc/other.conf", file(&copy), &index),
-            Tier::Copied
+            Tier::Unknown
+        );
+        // Documentation and examples vouch for nothing.
+        let example = Sha256::digest(b"example");
+        assert_eq!(
+            classify("etc/sudoers.d/sudoers", file(&example), &index),
+            Tier::Unknown
         );
         // A changed file that is not configuration is still a modification.
         assert_eq!(
@@ -258,9 +326,78 @@ mod tests {
     }
 
     #[test]
+    fn links_inherit_trust_only_by_name_and_never_for_a_root_shell() {
+        let index = index();
+        let link = |target, resolved| Observed::Link {
+            target,
+            resolved,
+            alias: false,
+        };
+        let vendor = Some(Tier::Vendor);
+        let wants = "etc/systemd/system/multi-user.target.wants";
+        assert_eq!(
+            classify(
+                &format!("{wants}/sshd.service"),
+                link("/usr/lib/systemd/system/sshd.service", vendor),
+                &index
+            ),
+            Tier::Vendor
+        );
+        assert_eq!(
+            classify(
+                &format!("{wants}/debug-shell.service"),
+                link("/usr/lib/systemd/system/debug-shell.service", vendor),
+                &index
+            ),
+            Tier::Unknown
+        );
+        assert_eq!(
+            classify("etc/profile.d/x.sh", link("/usr/bin/demo", vendor), &index),
+            Tier::Unknown
+        );
+        assert_eq!(
+            classify(
+                "etc/systemd/system/getty.target.wants/getty@tty1.service",
+                link("/usr/lib/systemd/system/getty@.service", vendor),
+                &index
+            ),
+            Tier::Vendor
+        );
+        // Masking a defence or a packaged pacman hook is shown.
+        assert_eq!(
+            classify(
+                "etc/systemd/system/ufw.service",
+                link("/dev/null", None),
+                &index
+            ),
+            Tier::Unknown
+        );
+        assert_eq!(
+            classify(
+                "etc/pacman.d/hooks/demo.hook",
+                link("/dev/null", None),
+                &index
+            ),
+            Tier::Unknown
+        );
+        assert_eq!(
+            classify(
+                "etc/systemd/system/NetworkManager-wait-online.service",
+                link("/dev/null", None),
+                &index
+            ),
+            Tier::Inert
+        );
+    }
+
+    #[test]
     fn masks_and_enable_links_take_their_targets_trust() {
         let index = index();
-        let link = |target, resolved| Observed::Link { target, resolved };
+        let link = |target, resolved| Observed::Link {
+            target,
+            resolved,
+            alias: false,
+        };
         let path = "etc/systemd/system/multi-user.target.wants/demo.service";
         assert_eq!(classify(path, link("/dev/null", None), &index), Tier::Inert);
         assert_eq!(

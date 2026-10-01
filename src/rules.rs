@@ -30,6 +30,7 @@ pub enum RuleId {
     KeyboardReader,
     UnknownKernelModule,
     UnknownPrivilegedFile,
+    NetworkListener,
 }
 
 /// How a rule decides whether a lowercased line matches.
@@ -160,7 +161,7 @@ const DISABLED_TLS: &[&str] = &[
 ];
 
 impl RuleId {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::DownloadAndExecute,
         Self::EncodedCommandExecution,
         Self::CredentialFileAccess,
@@ -181,6 +182,7 @@ impl RuleId {
         Self::KeyboardReader,
         Self::UnknownKernelModule,
         Self::UnknownPrivilegedFile,
+        Self::NetworkListener,
     ];
 
     pub fn from_name(name: &str) -> Option<Self> {
@@ -209,6 +211,7 @@ impl RuleId {
             Self::KeyboardReader => "keyboard-reader",
             Self::UnknownKernelModule => "unknown-kernel-module",
             Self::UnknownPrivilegedFile => "unknown-privileged-file",
+            Self::NetworkListener => "network-listener",
         }
     }
 
@@ -223,6 +226,7 @@ impl RuleId {
             | Self::PreloadedLibrary
             | Self::UnknownKernelModule
             | Self::UnknownPrivilegedFile => Severity::High,
+            Self::NetworkListener => Severity::Low,
             Self::CredentialFileAccess
             | Self::PersistenceModification
             | Self::ShellCommandExecution
@@ -295,6 +299,9 @@ impl RuleId {
             Self::UnknownPrivilegedFile => {
                 "A file no package vouches for runs with extra rights (setuid, setgid or capabilities)."
             }
+            Self::NetworkListener => {
+                "An interpreter (Python, a shell, Node) listens on the network, with no script on disk to look at."
+            }
         }
     }
 
@@ -318,7 +325,8 @@ impl RuleId {
             | Self::PreloadedLibrary
             | Self::KeyboardReader
             | Self::UnknownKernelModule
-            | Self::UnknownPrivilegedFile => Matcher::Reported,
+            | Self::UnknownPrivilegedFile
+            | Self::NetworkListener => Matcher::Reported,
             Self::DisabledTlsVerification => Matcher::Patterns(DISABLED_TLS),
         }
     }
@@ -349,7 +357,8 @@ impl RuleId {
             | Self::PreloadedLibrary
             | Self::KeyboardReader
             | Self::UnknownKernelModule
-            | Self::UnknownPrivilegedFile => false,
+            | Self::UnknownPrivilegedFile
+            | Self::NetworkListener => false,
         }
     }
 

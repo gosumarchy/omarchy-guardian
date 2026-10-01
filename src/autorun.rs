@@ -126,6 +126,19 @@ impl Category {
             .find(|category| category.name() == name)
     }
 
+    /// Found by the sweep's live checks, not in an auto-run location.
+    pub const fn is_live(self) -> bool {
+        matches!(
+            self,
+            Self::Process
+                | Self::Listener
+                | Self::Input
+                | Self::Camera
+                | Self::KernelModule
+                | Self::Setuid
+        )
+    }
+
     /// A short name for headings.
     pub const fn label(self) -> &'static str {
         match self {
