@@ -361,9 +361,7 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
                 options.view == View::All,
             );
         }
-        for note in &notes {
-            outln!("Note: {}", crate::text::shown(note));
-        }
+        output::print_notes(&notes);
         report.print(false, decision);
     }
     if let Some(directory) = &directory

@@ -241,12 +241,12 @@ changes_and_allow() {
     printf '=== changes and allow ===\n'
     # The program that ran from the cache has stopped, so only removals.
     sweep omarchy-guardian sweep --diff >"$E2E/diff.txt" 2>"$E2E/sweep.err"
-    grep -q '^Guardian sweep · ' "$E2E/diff.txt" && ! grep -qE '^  [+~] ' "$E2E/diff.txt"
+    grep -q 'Guardian sweep' "$E2E/diff.txt" && ! grep -qE '[+~] (new|changed) ' "$E2E/diff.txt"
     expect 'a second sweep finds nothing new or changed' "$?"
 
     plant "$HOME/.config/autostart/later.desktop" 644 $'[Desktop Entry]\nExec=/usr/local/bin/evil-run\n'
     sweep omarchy-guardian sweep --diff >"$E2E/diff.txt" 2>"$E2E/sweep.err"
-    grep -qF '+ ~/.config/autostart/later.desktop' "$E2E/diff.txt"
+    grep -qE '\+ new +│ ~/\.config/autostart/later\.desktop' "$E2E/diff.txt"
     expect 'a new autostart entry shows as new' "$?"
 
     sweep omarchy-guardian sweep allow '~/.local/bin/sudo' >/dev/null 2>&1
