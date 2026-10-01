@@ -120,14 +120,19 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
             continue;
         }
         if word_width <= width {
-            lines.push(std::mem::replace(&mut line, word.to_string()));
+            // It starts the next line, without the spaces before it.
+            if !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+            }
+            line.push_str(word);
             used = word_width;
             continue;
         }
-        // Too long for any line: it fills this one and goes on in pieces.
-        if used > 0 && used + 1 < width {
-            line.push(' ');
-            used += 1;
+        // Too long for any line: after its spaces, it fills this one and
+        // goes on in pieces.
+        if used + gap < width {
+            line.push_str(&" ".repeat(gap));
+            used += gap;
         } else if used > 0 {
             lines.push(std::mem::take(&mut line));
             used = 0;
@@ -487,6 +492,12 @@ mod tests {
         assert_eq!(wrap("x  y", 9), ["x  y"]);
         // Runs of spaces and indentation survive wrapping.
         assert_eq!(wrap("  rm  -rf   / now", 10), ["  rm  -rf", "/ now"]);
+        assert_eq!(
+            wrap("x = 1;    /a/bb/ccc/dddd/eeeee", 16),
+            ["x = 1;    /a/bb/", "ccc/dddd/eeeee"]
+        );
+        assert_eq!(wrap("    /a/bb/ccc/dddd", 12), ["    /a/bb/", "ccc/dddd"]);
+        assert_eq!(wrap("  b a", 2), ["b", "a"]);
         assert_eq!(
             wrap("→ /home/u/.config/systemd/user/v.service", 20),
             ["→ /home/u/.config/", "systemd/user/", "v.service"]
