@@ -1342,6 +1342,7 @@ fn class_header(class: SourceClass) -> String {
         SourceClass::Theme => ("Omarchy themes", "theme gate · user file"),
         SourceClass::Plugin => ("Plugins", "user file"),
         SourceClass::Source => ("Sources you scan or guard", "user file"),
+        SourceClass::System => ("What already runs on this system", "sweep · user file"),
     };
     format!("{name}  ·  {gate}")
 }

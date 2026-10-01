@@ -151,6 +151,7 @@ impl PackageIndex {
         self.foreign.contains(package)
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.owners.len()
     }

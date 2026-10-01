@@ -58,10 +58,10 @@ const C_LOCALE: &[(&str, &str)] = &[("LC_ALL", "C")];
 /// `O_NOFOLLOW` and `O_NONBLOCK` in the Linux generic ABI (`x86_64`,
 /// `aarch64` and friends differ only for `O_NOFOLLOW`).
 #[cfg(target_arch = "x86_64")]
-const O_NOFOLLOW: i32 = 0o400_000;
+pub const O_NOFOLLOW: i32 = 0o400_000;
 #[cfg(not(target_arch = "x86_64"))]
-const O_NOFOLLOW: i32 = 0o100_000;
-const O_NONBLOCK: i32 = 0o4000;
+pub const O_NOFOLLOW: i32 = 0o100_000;
+pub const O_NONBLOCK: i32 = 0o4000;
 
 /// Who may ship a protected path.
 #[derive(Clone, Copy, Debug)]

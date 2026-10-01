@@ -49,11 +49,12 @@ pub struct Choice {
 }
 
 const HEADER: &str = "# Written by `omarchy-guardian setup`. See `omarchy-guardian config show`.\n";
-const USER_CLASSES: [SourceClass; 4] = [
+const USER_CLASSES: [SourceClass; 5] = [
     SourceClass::Aur,
     SourceClass::Theme,
     SourceClass::Plugin,
     SourceClass::Source,
+    SourceClass::System,
 ];
 const PRIVILEGED_COMMUNITY: [SourceClass; 2] =
     [SourceClass::ThirdPartyRepo, SourceClass::LocalPackage];

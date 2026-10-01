@@ -30,6 +30,8 @@ pub enum SourceClass {
     Plugin,
     #[default]
     Source,
+    /// What already runs on its own on this machine (`sweep`).
+    System,
 }
 
 impl SourceClass {
@@ -37,7 +39,7 @@ impl SourceClass {
     pub const fn is_privileged(self) -> bool {
         match self {
             Self::Official | Self::ThirdPartyRepo | Self::LocalPackage => true,
-            Self::Aur | Self::Theme | Self::Plugin | Self::Source => false,
+            Self::Aur | Self::Theme | Self::Plugin | Self::Source | Self::System => false,
         }
     }
 }
@@ -51,6 +53,7 @@ impl Named for SourceClass {
         Self::Theme,
         Self::Plugin,
         Self::Source,
+        Self::System,
     ];
 
     fn name(self) -> &'static str {
@@ -62,6 +65,7 @@ impl Named for SourceClass {
             Self::Theme => "theme",
             Self::Plugin => "plugin",
             Self::Source => "source",
+            Self::System => "system",
         }
     }
 }

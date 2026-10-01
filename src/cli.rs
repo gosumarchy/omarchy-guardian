@@ -22,6 +22,7 @@ use crate::review::{self, ReviewContext};
 use crate::sandbox;
 use crate::scan::{self, ScanConfig};
 use crate::setup;
+use crate::sweep;
 use crate::tools::OpenCode;
 use crate::tui;
 
@@ -38,6 +39,7 @@ Usage:
   omarchy-guardian setup
   omarchy-guardian protect [--off] [--yes]          (turn every gate on, or the install gates off)
   omarchy-guardian test                             (test the saved reviewer with two samples)
+  omarchy-guardian sweep [--all] [--json] [--root]  (check what already runs on its own on this system)
   omarchy-guardian ask <report-id>                  (open your AI agent on a saved block report)
   omarchy-guardian status [--waybar | --dismiss | --open-report]
                                                     (bar widget status; mark blocks seen; open the last report)
@@ -105,6 +107,8 @@ enum Invocation {
     },
     /// `test`: the two-sample reviewer test of the saved settings.
     Test,
+    Sweep(sweep::Options),
+    SweepCollect,
     /// `ask <report-id | omarchy-guardian://ask/<id>>`, opened from a report.
     Ask(String),
     /// `status [--waybar | --dismiss | --open-report]`.
@@ -242,6 +246,8 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
                 ExitCode::from(1)
             }
         }
+        Invocation::Sweep(options) => sweep::run(options, &settings),
+        Invocation::SweepCollect => sweep::root::collect_command(),
         Invocation::Status(mode) => status_command(mode),
         Invocation::Ask(target) => {
             errln!("omarchy-guardian ask: {}", ask::run(&target, &settings));
@@ -499,6 +505,23 @@ fn config_command(command: &ConfigCommand, settings: &Settings) -> ExitCode {
     }
 }
 
+fn parse_sweep(args: &[OsString]) -> Result<sweep::Options, String> {
+    let mut options = sweep::Options {
+        all: false,
+        json: false,
+        root: false,
+    };
+    for arg in args {
+        match arg.to_str() {
+            Some("--all") => options.all = true,
+            Some("--json") => options.json = true,
+            Some("--root") => options.root = true,
+            _ => return Err("usage: omarchy-guardian sweep [--all] [--json] [--root]".into()),
+        }
+    }
+    Ok(options)
+}
+
 fn parse_forget(args: &[OsString]) -> Result<Forget, String> {
     match args {
         [arg] if arg == "--all" => Ok(Forget::All),
@@ -616,6 +639,9 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
             Ok(Invocation::Protect { yes, off })
         }
         Some("test") if rest.is_empty() => Ok(Invocation::Test),
+        Some("sweep") => parse_sweep(rest).map(Invocation::Sweep),
+        // Run as root by `sweep --root`; not listed in the usage.
+        Some("sweep-collect") if rest.is_empty() => Ok(Invocation::SweepCollect),
         Some("status") => match rest {
             [] => Ok(Invocation::Status(StatusMode::Shell)),
             [flag] => match flag.to_str() {

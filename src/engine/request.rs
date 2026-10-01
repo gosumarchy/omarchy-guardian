@@ -45,6 +45,23 @@ Return ONLY one JSON object in this exact shape: \
 \"reason\":\"specific evidence and impact\"}]}. Use status clear only if you found no \
 concerning behavior; use inconclusive if the source is insufficient or ambiguous.";
 
+/// For the system sweep: what the files are, that packaged files were set
+/// aside, and what ordinary configuration looks like, so the user's own
+/// shell and desktop settings are not flagged.
+const SYSTEM_SCOPE: &str = " These files are already on this machine and run on their own: \
+systemd units and drop-ins, pacman hooks, udev and modprobe rules, PAM, sudo and polkit \
+configuration, shell start-up files, autostart entries, Hyprland Lua configuration, Omarchy \
+hooks, and the scripts these run. Guardian has already set aside every file that is exactly \
+what a repository package installed; the files supplied are ones no package vouches for, \
+written by the administrator, by Omarchy's installer, by the user, or by something else. Judge \
+whether each looks malicious or hijacked: downloading or running code from elsewhere, \
+persistence that starts unexpected programs, broadening privileges (passwordless or \
+unauthenticated root, PAM modules that let anyone in), preloading libraries into other \
+programs, reading or sending credentials, or hiding what it does. Ordinary configuration is \
+not concerning: the user's aliases, prompt, PATH and environment, keybindings, theming, \
+monitors, starting the desktop's usual programs, and system tuning. Files listed in the \
+manifest but not supplied are unchanged package files or binaries Guardian hashed.";
+
 /// For the pacman classes only the install scriptlets are reviewed, so the
 /// model is told what is out of scope and what routine packaging looks
 /// like; without it, scriptlets that mention their own package's files
@@ -177,6 +194,8 @@ depends on code outside the piece."
         ]);
         let scriptlets = if self.class.is_privileged() {
             SCRIPTLET_SCOPE
+        } else if self.class == SourceClass::System {
+            SYSTEM_SCOPE
         } else {
             ""
         };
