@@ -22,18 +22,22 @@ pub enum Tier {
     /// A package's file whose content, mode or link target is not what the
     /// package installed.
     Modified,
+    /// Not vouched for by a package, but the user allowed it as it is
+    /// (`sweep allow`).
+    Allowed,
     /// No package installed it.
     Unknown,
 }
 
 impl Tier {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Vendor,
         Self::Inert,
         Self::Copied,
         Self::UserBuilt,
         Self::Edited,
         Self::Modified,
+        Self::Allowed,
         Self::Unknown,
     ];
 
@@ -46,6 +50,7 @@ impl Tier {
             Self::UserBuilt => "user-built",
             Self::Edited => "edited",
             Self::Modified => "modified",
+            Self::Allowed => "allowed",
             Self::Unknown => "unknown",
         }
     }

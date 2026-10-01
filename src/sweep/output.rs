@@ -20,6 +20,7 @@ const fn tier_word(tier: Tier) -> &'static str {
         Tier::UserBuilt => "user-built",
         Tier::Edited => "edited",
         Tier::Modified => "MODIFIED",
+        Tier::Allowed => "allowed",
         Tier::Unknown => "unknown",
     }
 }
@@ -93,12 +94,29 @@ pub fn print(collection: &Collection, report: &Report, home: Option<&str>, all: 
     outln!();
 }
 
+/// What changed since the last sweep, one line each.
+pub fn print_changes(changes: &[(super::state::Change, String)]) {
+    if changes.is_empty() {
+        outln!("Guardian sweep · nothing new or changed since the last sweep");
+        return;
+    }
+    outln!(
+        "Guardian sweep · {} change(s) since the last sweep",
+        changes.len()
+    );
+    for (change, label) in changes {
+        outln!("  {} {}", change.mark(), shown(label));
+    }
+    outln!();
+}
+
 /// The sweep as one JSON document.
 pub fn json(
     collection: &Collection,
     report: &Report,
     decision: Decision,
     home: Option<&str>,
+    notes: &[String],
 ) -> Json {
     let flagged = flagged(report);
     let items = collection.items.iter().map(|item| {
@@ -147,6 +165,10 @@ pub fn json(
         ("version", Json::from(1_u64)),
         ("decision", Json::from(decision_name(decision))),
         ("items", Json::Array(items.collect())),
+        (
+            "notes",
+            Json::Array(notes.iter().map(|note| Json::from(note.as_str())).collect()),
+        ),
         ("findings", findings_json(report)),
         ("ai", reviews_json(report)),
         (

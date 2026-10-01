@@ -20,6 +20,25 @@ pub trait Named: Copy + 'static {
     }
 }
 
+/// Whether the system sweep may run its read-only root collector (asked by
+/// `protect`; system file only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootConsent {
+    Allowed,
+    Declined,
+}
+
+impl Named for RootConsent {
+    const ALL: &'static [Self] = &[Self::Allowed, Self::Declined];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Declined => "declined",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SourceClass {
     Official,

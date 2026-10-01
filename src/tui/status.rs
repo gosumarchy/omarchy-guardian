@@ -28,10 +28,11 @@ pub const WAYBAR_SIGNAL: u8 = 9;
 
 /// The gates that protect installs; the menu entry and widgets are
 /// conveniences.
-const GATES: [Integration; 3] = [
+const GATES: [Integration; 4] = [
     Integration::PacmanHook,
     Integration::AurGate,
     Integration::ThemeInterceptor,
+    Integration::SystemSweep,
 ];
 
 struct Gate {

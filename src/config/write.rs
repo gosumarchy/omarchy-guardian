@@ -37,6 +37,16 @@ pub fn render(config: &PartialConfig, header: &str) -> String {
         );
     }
 
+    if config.sweep.root.is_some() || config.sweep.group.is_some() {
+        text.push_str("\n[sweep]\n");
+        if let Some(root) = config.sweep.root {
+            line(&mut text, "root", &quoted(root.name()));
+        }
+        if let Some(group) = &config.sweep.group {
+            line(&mut text, "group", &quoted(group));
+        }
+    }
+
     let agent = &config.agent;
     let numbers = [
         ("max_input_kib", agent.max_input_kib),
@@ -131,9 +141,9 @@ mod tests {
     use std::path::Path;
 
     use super::{quoted, render};
-    use crate::config::file::{AgentDefaults, PartialConfig, PartialPolicy, parse};
+    use crate::config::file::{AgentDefaults, PartialConfig, PartialPolicy, SweepSettings, parse};
     use crate::config::model::{
-        Action, AiRequirement, Named, Profile, SourceClass, Thinking, Toggle,
+        Action, AiRequirement, Named, Profile, RootConsent, SourceClass, Thinking, Toggle,
     };
 
     fn round_trip(config: &PartialConfig) -> PartialConfig {
@@ -145,6 +155,10 @@ mod tests {
     fn every_value_round_trips() {
         let config = PartialConfig {
             trusted_reviewer_packages: Some(vec!["opencode-bin".into()]),
+            sweep: SweepSettings {
+                root: Some(RootConsent::Allowed),
+                group: Some("wheel".into()),
+            },
             profile: Some(Profile::Strict),
             official_repos: Some(vec!["core".into(), "extra".into()]),
             agent: AgentDefaults {
@@ -184,6 +198,7 @@ mod tests {
         };
 
         let parsed = round_trip(&config);
+        assert_eq!(parsed.sweep, config.sweep);
         assert_eq!(parsed.profile, config.profile);
         assert_eq!(parsed.official_repos, config.official_repos);
         assert_eq!(parsed.agent, config.agent);

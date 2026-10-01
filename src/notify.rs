@@ -44,6 +44,8 @@ pub enum Ran {
     Nothing,
     /// makepkg had run the reviewed recipe to fetch and unpack the sources.
     RecipeToFetch,
+    /// Nothing was blocked: the system sweep found these already in place.
+    AlreadyOnSystem,
 }
 
 /// Why a gate blocked, in a few words for the notification.
@@ -60,10 +62,24 @@ pub const fn reason(blocked: Blocked) -> &'static str {
 /// happens without `notify-send` or a session bus, and a failure is ignored,
 /// because the terminal already carries the full report.
 pub fn blocked(what: &str, detail: &str, ran: Ran) {
+    alert(&format!("Guardian blocked {what}"), detail, ran);
+}
+
+/// Shows "Guardian found `what`" for what the scheduled system sweep found,
+/// with the same saved report and click-to-open as a block.
+pub fn found(what: &str, detail: &str) {
+    alert(
+        &format!("Guardian found {what}"),
+        detail,
+        Ran::AlreadyOnSystem,
+    );
+}
+
+fn alert(title: &str, detail: &str, ran: Ran) {
     if cfg!(test) || env::var_os(QUIET).is_some() || !Path::new(NOTIFY_SEND).is_file() {
         return;
     }
-    let title = format!("Guardian blocked {what}");
+    let title = title.to_string();
     let detail = &text::shown(detail);
     let icon = if Path::new(ALERT_ICON).is_file() {
         ALERT_ICON

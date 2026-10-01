@@ -20,7 +20,7 @@ use std::process::{Command, Stdio};
 use crate::cli::Confirm;
 use crate::config::Settings;
 use crate::config::load::{self, SYSTEM_PATH};
-use crate::config::model::{AgentSettings, Named, SourceClass};
+use crate::config::model::{AgentSettings, Named, RootConsent, SourceClass};
 use crate::config::show::{render_check, render_memory, render_show};
 use crate::engine::baseline;
 use crate::engine::store::Store;
@@ -96,7 +96,7 @@ fn paths(settings: &Settings) -> Option<Paths> {
     let opencode_missing = !pacman::classes_requiring_ai(settings).is_empty()
         && !pacman::system_reviewer_ready(settings)
         && pacman::system_reviewer_is_opencode(settings);
-    Paths::real(opencode_missing)
+    Paths::real(opencode_missing, settings.sweep_root().0)
 }
 
 const fn reloads(effect: &Effect) -> bool {
@@ -199,6 +199,7 @@ fn run_plan(paths: &Paths, plan: &Plan) -> Result<String, String> {
                     });
                 }
             }
+            Step::AskSweepRoot => outln!("{}", ask_sweep_root()?),
             Step::RemoveInterceptor
             | Step::AddMenuEntry
             | Step::RemoveMenuEntry
@@ -215,15 +216,62 @@ fn run_plan(paths: &Paths, plan: &Plan) -> Result<String, String> {
     Ok(format!("{}: done.", plan.summary))
 }
 
+/// What the root checks are, asked once on the terminal; the answer goes to
+/// the system configuration, and a yes enables their daily timer. Without a
+/// terminal nothing is recorded, so a non-interactive run is never a no.
+fn ask_sweep_root() -> Result<String, String> {
+    if OpenOptions::new().read(true).open("/dev/tty").is_err() {
+        return Ok(
+            "Root checks not set up: run `omarchy-guardian protect` in a terminal to answer."
+                .into(),
+        );
+    }
+    outln!(
+        "\nThe system sweep needs root to check what your user can't read: the sudoers\n\
+file and its drop-ins, polkit rules, root's crontab, shell files and SSH keys,\n\
+and programs only root can read. It only reads them (never /etc/shadow or\n\
+private keys), runs nothing it finds, and reports only what no package vouches\n\
+for. Its daily results are kept readable by your group only."
+    );
+    let allowed =
+        crate::cli::TtyConfirm.confirm("Allow Guardian to run the read-only root checks daily?");
+    let consent = if allowed {
+        RootConsent::Allowed
+    } else {
+        RootConsent::Declined
+    };
+    setup::set_sweep_root(consent, crate::sweep::root::primary_group())?;
+    if !allowed {
+        return Ok("Root checks declined; sweeps will say what they could not check.".into());
+    }
+    let status = Command::new("/usr/bin/sudo")
+        .args([
+            "/usr/bin/systemctl",
+            "enable",
+            "--now",
+            "omarchy-guardian-sweep-collect.timer",
+        ])
+        .status()
+        .map_err(|error| error.to_string())?;
+    if status.success() {
+        Ok("Root checks allowed; they run daily.".into())
+    } else {
+        Err(format!(
+            "enabling the root checks' timer exited with {status}"
+        ))
+    }
+}
+
 /// The gates that protect installs, plus the menu entry and the bar widgets:
 /// what `omarchy-guardian protect` and the installer turn on.
-const PROTECT: [Integration; 6] = [
+const PROTECT: [Integration; 7] = [
     Integration::PacmanHook,
     Integration::AurGate,
     Integration::ThemeInterceptor,
     Integration::MenuEntry,
     Integration::BarWidget,
     Integration::WaybarModule,
+    Integration::SystemSweep,
 ];
 
 /// `omarchy-guardian protect`: turns on every gate that is off, after
@@ -257,6 +305,14 @@ pub fn protect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String> {
             }
         }
     }
+    // Root consent is a question, never assumed: `--yes` leaves it unasked.
+    if yes && steps.contains(&Step::AskSweepRoot) {
+        steps.retain(|step| *step != Step::AskSweepRoot);
+        notes.push(
+            "- System sweep root checks: not answered (`--yes` never allows them); run `omarchy-guardian protect` to answer"
+                .into(),
+        );
+    }
     for note in &notes {
         outln!("{note}");
     }
@@ -277,9 +333,10 @@ pub fn protect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String> {
     run_plan(&paths, &plan)
 }
 
-/// `omarchy-guardian protect --off`: turns the three install gates off (the
-/// menu entry and the bar widget stay), after showing each step and, unless
-/// `yes`, asking. A hand-installed pacman hook is left alone.
+/// `omarchy-guardian protect --off`: turns the three install gates and the
+/// system sweep off (the menu entry and the bar widget stay), after showing
+/// each step and, unless `yes`, asking. A hand-installed pacman hook is left
+/// alone.
 pub fn unprotect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String> {
     let settings = Settings::load();
     let paths = paths(&settings).ok_or("HOME is not set")?;
@@ -288,6 +345,7 @@ pub fn unprotect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String>
         Integration::PacmanHook,
         Integration::AurGate,
         Integration::ThemeInterceptor,
+        Integration::SystemSweep,
     ] {
         match paths.state(integration) {
             State::On | State::Partial(_) => {

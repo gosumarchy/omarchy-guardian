@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily Omarchy Guardian system sweep
+
+[Timer]
+# A few minutes after login, then daily.
+OnStartupSec=10min
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target

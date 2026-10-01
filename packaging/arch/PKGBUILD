@@ -67,5 +67,11 @@ package() {
         "$pkgdir/usr/share/omarchy-guardian/bar-widget/manifest.json"
     install -Dm644 integrations/omarchy/bar-widget/Widget.qml \
         "$pkgdir/usr/share/omarchy-guardian/bar-widget/Widget.qml"
+    for unit in omarchy-guardian-sweep.service omarchy-guardian-sweep.timer; do
+        install -Dm644 "integrations/systemd/$unit" "$pkgdir/usr/lib/systemd/user/$unit"
+    done
+    for unit in omarchy-guardian-sweep-collect.service omarchy-guardian-sweep-collect.timer; do
+        install -Dm644 "integrations/systemd/$unit" "$pkgdir/usr/lib/systemd/system/$unit"
+    done
     install -Dm644 README.md "$pkgdir/usr/share/doc/omarchy-guardian/README.md"
 }

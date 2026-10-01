@@ -101,7 +101,9 @@ omarchy-guardian sweep
   It is a behaviour smoke test, not a dynamic malware detector.
 - `sweep` checks what already runs on its own on this machine (see
   [System sweep](#system-sweep)). `--root` also checks what only root can
-  read, `--all` lists trusted items too, `--json` prints one JSON document.
+  read now, `--all` lists trusted items too, `--diff` only what changed since
+  the last sweep, `--json` prints one JSON document. `sweep allow PATH`
+  trusts one item as it is now; `sweep forget PATH` (or `--all`) undoes it.
 - `--identity ID` or `--unit DIR ID` (repeatable) on `scan`, `guard` and
   `sandbox` name what is reviewed for the review memory (see
   [How the review scales](#how-the-review-scales)); `omarchy-guardian forget
@@ -154,6 +156,30 @@ sudo password and runs a root collector that only reads: it never runs what
 it finds, never reads `/etc/shadow` or private keys, makes no AI call and
 writes nothing; it hands the items no package vouches for back to your own
 sweep, which judges them with your settings.
+
+**On a schedule.** `protect` turns on two timers the package ships:
+
+- a user timer (`omarchy-guardian-sweep.timer`), a few minutes after login
+  and then daily, running `sweep --scheduled`: anything new or changed that
+  no package vouches for raises a notification ("Guardian found …") that
+  opens the saved report, and the bar knight needs attention until you
+  dismiss it;
+- a system timer (`omarchy-guardian-sweep-collect.timer`) for the root
+  checks, but only after `protect` asks you and you agree. The answer is
+  kept in the system file as `[sweep] root = "allowed"` (or `"declined"`)
+  with the group allowed to read the results; a user file cannot set it,
+  and `protect --yes` never answers it for you. The collector runs
+  sandboxed (no network, read-only system) and writes only
+  `/var/lib/omarchy-guardian/sweep/root.json` (root-owned, mode 0640, your
+  group). Your sweep uses it only while it is root's alone and less than 36
+  hours old. Note that this makes the root-only items it lists (a sudoers
+  drop-in no package installed, say) readable by your group.
+
+Without root checks (declined, or not answered yet) every sweep is
+incomplete and says what it could not check, and the bar shows the sweep as
+not fully on. `sweep allow PATH` stops the sweep asking about an item you
+know; if the file changes, it is shown again. `protect --off` turns both
+timers off and keeps your answer.
 
 ## Settings app
 
@@ -534,9 +560,11 @@ omarchy-guardian protect                      # or: omarchy-guardian tui › Pro
 ```
 
 `omarchy-guardian protect` turns on the pacman hook, the yay AUR gate, the
-theme & plugin gate, the Omarchy menu entry and the bar widget (Waybar and/or
-Omarchy's shell bar), showing each step and asking first (`--yes` skips the
-question); `protect --off` turns the three install gates off the same way. It leaves the pacman hook off when the
+theme & plugin gate, the Omarchy menu entry, the bar widget (Waybar and/or
+Omarchy's shell bar) and the daily [system sweep](#system-sweep), showing
+each step and asking first (`--yes` skips the question, but never answers
+whether the sweep's root checks may run); `protect --off` turns the three
+install gates and the system sweep off the same way. It leaves the pacman hook off when the
 pacman gate could not review with the current settings. `omarchy-guardian
 test` runs the two-sample reviewer test from the terminal.
 
