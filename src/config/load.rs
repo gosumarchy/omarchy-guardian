@@ -157,6 +157,12 @@ impl Settings {
             match read(user_path, None) {
                 Read::Missing => {}
                 Read::Parsed(config) => {
+                    if config.sweep != crate::config::file::SweepSettings::default() {
+                        settings.warnings.push(format!(
+                            "[sweep] in {} is ignored: only the system file decides whether the root checks run",
+                            user_path.display()
+                        ));
+                    }
                     settings.user = config;
                     settings.user_status = FileStatus::Loaded;
                 }
@@ -290,6 +296,13 @@ impl Settings {
         }
     }
 
+    /// Whether the system sweep may run its root collector, and the group
+    /// that may read what the scheduled one found; only the root-owned
+    /// system file says.
+    pub fn sweep_root(&self) -> (Option<crate::config::model::RootConsent>, Option<String>) {
+        (self.system.sweep.root, self.system.sweep.group.clone())
+    }
+
     /// Reviewer packages trusted from outside the official repositories;
     /// only the root-owned system file can name them.
     pub fn trusted_reviewer_packages(&self) -> Vec<String> {
@@ -350,7 +363,9 @@ mod tests {
 
     use super::{FileStatus, Settings};
     use crate::config::file::{AgentDefaults, PartialConfig, PartialPolicy};
-    use crate::config::model::{AiRequirement, Profile, SourceClass, StoreSettings, Thinking};
+    use crate::config::model::{
+        AiRequirement, Profile, RootConsent, SourceClass, StoreSettings, Thinking,
+    };
     use crate::test_support::TempDir;
 
     #[expect(
@@ -413,6 +428,23 @@ mod tests {
                 .privileged_block()
                 .unwrap()
                 .contains("config check")
+        );
+    }
+
+    #[test]
+    fn only_the_system_file_decides_the_sweeps_root_checks() {
+        let dir = TempDir::new("settings-sweep");
+        let system = dir.path().join("system.toml");
+        let user = dir.path().join("user.toml");
+        fs::write(&system, "[sweep]\nroot = \"declined\"\n").unwrap();
+        fs::write(&user, "[sweep]\nroot = \"allowed\"\ngroup = \"users\"\n").unwrap();
+        let settings = Settings::load_from(&system, Some(&user), &secure);
+        assert_eq!(settings.sweep_root(), (Some(RootConsent::Declined), None));
+        assert!(
+            settings
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("[sweep]"))
         );
     }
 

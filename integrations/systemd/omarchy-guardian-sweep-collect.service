@@ -1,0 +1,18 @@
+[Unit]
+Description=Omarchy Guardian system sweep: what only root can read
+Documentation=file:///usr/share/doc/omarchy-guardian/README.md
+
+[Service]
+Type=oneshot
+# Reads only; writes nothing but its results, and only when the system
+# configuration allows the root checks ([sweep] root = "allowed").
+ExecStart=/usr/bin/omarchy-guardian sweep-collect --out
+StateDirectory=omarchy-guardian
+StateDirectoryMode=0755
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateNetwork=yes
+NoNewPrivileges=yes
+Nice=10
+IOSchedulingClass=idle

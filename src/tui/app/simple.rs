@@ -44,10 +44,11 @@ const LEVELS: [(Profile, &str, &str); 3] = [
 
 /// The gates that protect installs. The menu entry is a convenience, not
 /// protection.
-const GATES: [Integration; 3] = [
+const GATES: [Integration; 4] = [
     Integration::PacmanHook,
     Integration::AurGate,
     Integration::ThemeInterceptor,
+    Integration::SystemSweep,
 ];
 
 fn level_name(profile: Profile) -> &'static str {
@@ -612,6 +613,7 @@ const fn gate_name(gate: Integration) -> &'static str {
         Integration::MenuEntry => "menu",
         Integration::BarWidget => "bar widget",
         Integration::WaybarModule => "Waybar module",
+        Integration::SystemSweep => "system sweep",
     }
 }
 
@@ -759,6 +761,11 @@ mod tests {
             waybar_config: root.join("waybar/config"),
             waybar_style: root.join("waybar/style.css"),
             opencode_missing: false,
+            sweep_timer: root.join("units/omarchy-guardian-sweep.timer"),
+            sweep_timer_link: root.join("user-wants/omarchy-guardian-sweep.timer"),
+            sweep_root_timer: root.join("units/omarchy-guardian-sweep-collect.timer"),
+            sweep_root_timer_link: root.join("system-wants/omarchy-guardian-sweep-collect.timer"),
+            sweep_consent: None,
         };
         let mut app = App::new(files(Some(paths)), Mode::Simple);
         assert!(screen(&mut app).contains("not watching pacman, AUR or themes"));

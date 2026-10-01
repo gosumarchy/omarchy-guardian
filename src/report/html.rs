@@ -45,7 +45,15 @@ pub fn page(title: &str, detail: &str, ran: Ran, when: &str, id: &str, fallback:
     } else {
         sections
     };
-    let what = title.strip_prefix("Guardian blocked ").unwrap_or(title);
+    let (verb, word, tone) = if ran == Ran::AlreadyOnSystem {
+        ("Found", "FOUND", "amber")
+    } else {
+        ("Blocked", "BLOCKED", "red")
+    };
+    let what = title
+        .strip_prefix("Guardian blocked ")
+        .or_else(|| title.strip_prefix("Guardian found "))
+        .unwrap_or(title);
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -62,11 +70,11 @@ pub fn page(title: &str, detail: &str, ran: Ran, when: &str, id: &str, fallback:
   <div class="knight">{KNIGHT}</div>
   <div>
     <h1>Guardian</h1>
-    <div class="meta">BLOCKED · {when_text}</div>
+    <div class="meta">{word} · {when_text}</div>
   </div>
 </header>
 <hr>
-<div class="row lead"><span>Blocked {what_text}</span><span class="word red">BLOCKED</span></div>
+<div class="row lead"><span>{verb} {what_text}</span><span class="word {tone}">{word}</span></div>
 <p class="dim">{detail_text}. {ran_text}</p>
 <h3>Next</h3>
 <div class="tiles">
@@ -99,6 +107,9 @@ const fn ran_text(ran: Ran) -> &'static str {
         }
         Ran::RecipeToFetch => {
             "Nothing was built or installed. The recipe (PKGBUILD) had passed review, and makepkg ran it to download and unpack the sources; Guardian stopped the build before any of the upstream code ran."
+        }
+        Ran::AlreadyOnSystem => {
+            "These are already on this system; the sweep found them and nothing was blocked. Look at each before you trust it; `omarchy-guardian sweep allow PATH` stops Guardian asking about one you know."
         }
     }
 }
@@ -547,6 +558,20 @@ mod tests {
         // The ask button comes right after the verdict, before the details
         // (the fallback output or the collected review sections).
         assert!(html.find("omarchy-guardian://ask/").unwrap() < html.find("<section").unwrap());
+    }
+
+    #[test]
+    fn a_sweep_page_says_found_not_blocked() {
+        let html = page(
+            "Guardian found 2 new startup items",
+            "d",
+            Ran::AlreadyOnSystem,
+            "now",
+            "1-2",
+            "",
+        );
+        assert!(html.contains("Found 2 new startup items") && html.contains("FOUND"));
+        assert!(!html.contains("BLOCKED") && html.contains("sweep allow"));
     }
 
     #[test]

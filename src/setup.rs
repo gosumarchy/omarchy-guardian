@@ -12,9 +12,12 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::agent::{self, SourceFile, Status};
-use crate::config::file::{is_model_name, parse};
+use crate::config::file::{SweepSettings, is_model_name, parse};
 use crate::config::load::{self, SYSTEM_PATH};
-use crate::config::model::{AgentSettings, Named, Profile, SourceClass, Thinking, builtin};
+use crate::config::model::{
+    AgentSettings, Named, Profile, RootConsent, SourceClass, Thinking, builtin,
+};
+use crate::config::write;
 use crate::engine::request::Request;
 use crate::tools::{self, Limits, OpenCode, Reviewer};
 
@@ -638,12 +641,74 @@ impl Environment for RealEnvironment {
     }
 
     fn write_system(&self, text: &str) -> Result<(), String> {
-        install_system_file(text)
+        let existing = fs::read_to_string(SYSTEM_PATH).unwrap_or_default();
+        install_system_file(&keep_system_only(text, &existing))
     }
 
     fn hook_enabled(&self) -> bool {
         Path::new("/etc/pacman.d/hooks/omarchy-guardian.hook").exists()
     }
+}
+
+/// `text` with the system-only settings no setup screen edits (the trusted
+/// reviewer packages and the sweep's root consent) carried over from
+/// `existing` when `text` does not set them, so saving the profile does not
+/// silently undo them.
+pub fn keep_system_only(text: &str, existing: &str) -> String {
+    let (Ok(mut new), Ok(old)) = (
+        parse(Path::new(SYSTEM_PATH), text),
+        parse(Path::new(SYSTEM_PATH), existing),
+    ) else {
+        return text.to_string();
+    };
+    let missing_trust =
+        new.trusted_reviewer_packages.is_none() && old.trusted_reviewer_packages.is_some();
+    let missing_sweep =
+        new.sweep == SweepSettings::default() && old.sweep != SweepSettings::default();
+    if !missing_trust && !missing_sweep {
+        return text.to_string();
+    }
+    if missing_trust {
+        new.trusted_reviewer_packages = old.trusted_reviewer_packages;
+    }
+    if missing_sweep {
+        new.sweep = old.sweep;
+    }
+    let header = comment_header(text);
+    write::render(&new, &header)
+}
+
+/// The comment lines a config file starts with.
+fn comment_header(text: &str) -> String {
+    text.lines()
+        .take_while(|line| line.starts_with('#'))
+        .fold(String::new(), |mut header, line| {
+            header.push_str(line);
+            header.push('\n');
+            header
+        })
+}
+
+/// Records whether the system sweep may run its root collector, and the
+/// group that may read what the daily one finds, in the system config.
+pub fn set_sweep_root(consent: RootConsent, group: Option<String>) -> Result<(), String> {
+    let existing = fs::read_to_string(SYSTEM_PATH).unwrap_or_default();
+    let mut config = if existing.trim().is_empty() {
+        crate::config::file::PartialConfig::default()
+    } else {
+        parse(Path::new(SYSTEM_PATH), &existing).map_err(|error| error.to_string())?
+    };
+    config.sweep = SweepSettings {
+        root: Some(consent),
+        group,
+    };
+    let header = comment_header(&existing);
+    let header = if header.is_empty() {
+        HEADER.to_string()
+    } else {
+        header
+    };
+    install_system_file(&write::render(&config, &header))
 }
 
 /// Installs `text` as the system config, the pacman gate's trust root.
@@ -816,6 +881,26 @@ mod tests {
             answers: answers.iter().copied().collect(),
             output: String::new(),
         }
+    }
+
+    #[test]
+    fn saving_setup_keeps_the_system_only_settings() {
+        let existing = "# old\ntrusted_reviewer_packages = [\"opencode-bin\"]\n\n[sweep]\nroot = \"allowed\"\ngroup = \"wheel\"\n";
+        let new = "# Written by setup\nprofile = \"strict\"\n";
+        let kept = super::keep_system_only(new, existing);
+        let parsed = parse(Path::new("s"), &kept).unwrap();
+        assert!(kept.starts_with("# Written by setup\n"));
+        assert_eq!(
+            parsed.trusted_reviewer_packages,
+            Some(vec!["opencode-bin".to_string()])
+        );
+        assert_eq!(parsed.sweep.group.as_deref(), Some("wheel"));
+        assert_eq!(parsed.profile, Some(Profile::Strict));
+        // Nothing to carry over: the text is installed as written.
+        assert_eq!(
+            super::keep_system_only(new, "profile = \"standard\"\n"),
+            new
+        );
     }
 
     #[test]

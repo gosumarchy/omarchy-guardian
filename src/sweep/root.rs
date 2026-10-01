@@ -6,9 +6,12 @@
 //! package vouches for as JSON on stdout, and the user's own sweep judges
 //! them with the user's settings.
 
-use std::io::Read;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write as _};
+use std::os::unix::fs::{self as unix_fs, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
+use std::time::UNIX_EPOCH;
 
 use super::collect::{self, Body, Collection, Item, Origin, Scope};
 use super::index::{self, LOCAL_DB, PackageIndex};
@@ -34,12 +37,38 @@ pub struct RootPart {
     pub truncated: Vec<String>,
 }
 
-/// `omarchy-guardian sweep-collect`: run as root by `sweep --root`.
-pub fn collect_command() -> ExitCode {
+/// Where the scheduled root collector leaves what it found.
+pub const RESULTS: &str = "/var/lib/omarchy-guardian/sweep/root.json";
+/// Older results are not used: the daily timer should have replaced them.
+const MAX_AGE_SECS: u64 = 36 * 60 * 60;
+
+/// `omarchy-guardian sweep-collect [--out]`: run as root, by `sweep --root`
+/// through sudo (printing to stdout), or by the daily system timer with
+/// `--out` (writing `RESULTS`, only when the system configuration allows
+/// it, readable by the configured group).
+pub fn collect_command(out: bool, settings: &crate::config::Settings) -> ExitCode {
     if !store::effective_uid().is_ok_and(|uid| uid == 0) {
-        errln!("omarchy-guardian sweep-collect: only `sweep --root` runs this, as root");
+        errln!(
+            "omarchy-guardian sweep-collect: only `sweep --root` and its timer run this, as root"
+        );
         return ExitCode::from(2);
     }
+    let (consent, group) = settings.sweep_root();
+    let group = if out {
+        if consent != Some(crate::config::model::RootConsent::Allowed) {
+            outln!("Root checks are not allowed in the system configuration; nothing collected.");
+            return ExitCode::SUCCESS;
+        }
+        let Some(gid) = group.as_deref().and_then(group_id) else {
+            errln!(
+                "omarchy-guardian sweep-collect: no valid [sweep] group in the system configuration"
+            );
+            return ExitCode::from(2);
+        };
+        Some(gid)
+    } else {
+        None
+    };
     let index = match index::foreign_packages()
         .and_then(|foreign| PackageIndex::load(Path::new(LOCAL_DB), foreign))
     {
@@ -55,8 +84,113 @@ pub fn collect_command() -> ExitCode {
         index: &index,
         origin: Origin::Root,
     });
-    outln!("{}", to_json(&collection));
-    ExitCode::SUCCESS
+    let json = to_json(&collection).to_string();
+    match group {
+        None => {
+            outln!("{json}");
+            ExitCode::SUCCESS
+        }
+        Some(gid) => match write_results(Path::new(RESULTS), &json, gid) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                errln!("omarchy-guardian sweep-collect: {error}");
+                ExitCode::from(2)
+            }
+        },
+    }
+}
+
+/// The name of this process's primary group, from `/proc/self/status` and
+/// `/etc/group`.
+pub fn primary_group() -> Option<String> {
+    let gid: u32 = fs::read_to_string("/proc/self/status")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("Gid:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    fs::read_to_string("/etc/group")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let fields: Vec<&str> = line.split(':').collect();
+            (fields.get(2)?.parse::<u32>().ok()? == gid)
+                .then(|| fields[0].to_string())
+                .filter(|name| crate::config::file::is_group_name(name))
+        })
+}
+
+/// The id of group `name`, from `/etc/group`.
+fn group_id(name: &str) -> Option<u32> {
+    fs::read_to_string("/etc/group")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split(':');
+            (fields.next()? == name)
+                .then(|| fields.nth(1)?.parse().ok())
+                .flatten()
+        })
+}
+
+/// Writes `json` to `path` (and its directory) owned by root and group
+/// `gid`: the directory 0750, the file 0640, replaced atomically.
+fn write_results(path: &Path, json: &str, gid: u32) -> Result<(), String> {
+    let describe = |path: &Path, error: std::io::Error| format!("{}: {error}", path.display());
+    let directory = path.parent().ok_or("no directory")?;
+    fs::create_dir_all(directory).map_err(|error| describe(directory, error))?;
+    unix_fs::chown(directory, Some(0), Some(gid)).map_err(|error| describe(directory, error))?;
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o750))
+        .map_err(|error| describe(directory, error))?;
+    let temporary = path.with_extension("json.tmp");
+    drop(fs::remove_file(&temporary));
+    let result = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .and_then(|mut file| file.write_all(json.as_bytes()))
+        .and_then(|()| unix_fs::chown(&temporary, Some(0), Some(gid)))
+        .and_then(|()| fs::set_permissions(&temporary, fs::Permissions::from_mode(0o640)))
+        .and_then(|()| fs::rename(&temporary, path));
+    if result.is_err() {
+        drop(fs::remove_file(&temporary));
+    }
+    result.map_err(|error| describe(path, error))
+}
+
+/// What the scheduled root collector found, if it is trustworthy and
+/// recent: owned by root and writable by no one else, file and directory,
+/// and at most `MAX_AGE_SECS` old.
+pub fn from_results(path: &Path, now: u64) -> Result<RootPart, String> {
+    let directory = path.parent().ok_or("no directory")?;
+    for checked in [directory, path] {
+        let metadata = fs::symlink_metadata(checked)
+            .map_err(|error| format!("{}: {error}", checked.display()))?;
+        if metadata.file_type().is_symlink() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0
+        {
+            return Err(format!(
+                "{} is not root's alone; ignoring it",
+                checked.display()
+            ));
+        }
+    }
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |elapsed| elapsed.as_secs());
+    if now.saturating_sub(modified) > MAX_AGE_SECS {
+        return Err("the daily root check has not run for more than a day".into());
+    }
+    if metadata.len() > MAX_OUTPUT {
+        return Err("the root check's results are too large".into());
+    }
+    let text = fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    from_json(&text)
 }
 
 fn to_json(collection: &Collection) -> Json {

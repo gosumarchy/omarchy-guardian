@@ -24,7 +24,10 @@ const IDENTITY: &str = "system:sweep";
 
 /// Whether an item is trusted and only counted.
 pub const fn is_trusted(tier: Tier) -> bool {
-    matches!(tier, Tier::Vendor | Tier::Inert | Tier::Copied)
+    matches!(
+        tier,
+        Tier::Vendor | Tier::Inert | Tier::Copied | Tier::Allowed
+    )
 }
 
 /// How an item is named to the user and the AI: absolute, with the home
@@ -184,7 +187,7 @@ fn fact(item: &Item, label: &str) -> String {
             "installed by a package but changed since (it is not what the package shipped)"
         }
         Tier::Unknown => "installed by no package",
-        Tier::Vendor | Tier::Inert | Tier::Copied => "trusted",
+        Tier::Vendor | Tier::Inert | Tier::Copied | Tier::Allowed => "trusted",
     };
     let mut text = format!(
         "{:?} is {what}; it {}.",

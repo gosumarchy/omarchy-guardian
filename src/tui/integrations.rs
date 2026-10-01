@@ -9,6 +9,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::config::model::RootConsent;
 use crate::json::Json;
 
 pub const HOOK_SOURCE: &str = "/usr/share/omarchy-guardian/omarchy-guardian.hook";
@@ -52,6 +53,10 @@ const THEME_GATE: &str = "/usr/lib/omarchy-guardian/guardian-";
 /// Installs OpenCode from the official repos, root-owned, where the pacman
 /// gate looks for it.
 const INSTALL_OPENCODE: [&str; 4] = ["/usr/bin/pacman", "-S", "--needed", "extra/opencode"];
+/// The system sweep's timers, as the package installs them, and the links
+/// `systemctl enable` makes for them.
+const SWEEP_TIMER: &str = "omarchy-guardian-sweep.timer";
+const SWEEP_ROOT_TIMER: &str = "omarchy-guardian-sweep-collect.timer";
 pub const MENU_ENTRY: &str = "\"setup.guardian\": {\"icon\":\"󰒃\",\"label\":\"Guardian\",\"description\":\"Omarchy Guardian settings\",\"action\":\"omarchy-launch-tui --app-id=TUI.float omarchy-guardian tui\"},";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,16 +67,18 @@ pub enum Integration {
     MenuEntry,
     BarWidget,
     WaybarModule,
+    SystemSweep,
 }
 
 impl Integration {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::PacmanHook,
         Self::AurGate,
         Self::ThemeInterceptor,
         Self::MenuEntry,
         Self::BarWidget,
         Self::WaybarModule,
+        Self::SystemSweep,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -82,6 +89,7 @@ impl Integration {
             Self::MenuEntry => "Omarchy menu entry",
             Self::BarWidget => "Bar widget",
             Self::WaybarModule => "Waybar module",
+            Self::SystemSweep => "System sweep",
         }
     }
 
@@ -97,6 +105,9 @@ impl Integration {
             Self::MenuEntry => "Adds Setup › Guardian to the Omarchy menu, opening this window.",
             Self::BarWidget => {
                 "A shield in the Omarchy bar showing whether Guardian protects this machine, what needs attention and the last block."
+            }
+            Self::SystemSweep => {
+                "Checks daily what already runs on its own on this machine, and notifies about anything new that no package vouches for. Asks once whether the read-only root checks may run too."
             }
             Self::WaybarModule => {
                 "The Guardian knight in Waybar: calm, red-eyed when something needs attention, dim when protection is off; its tooltip has the details, left-click opens this window, right-click the last report."
@@ -132,6 +143,9 @@ pub enum Step {
     RemoveBarWidget,
     AddWaybarModule,
     RemoveWaybarModule,
+    /// Asks whether the sweep's root checks may run, records the answer in
+    /// the system configuration and, when allowed, enables their timer.
+    AskSweepRoot,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,6 +195,7 @@ impl Plan {
                     paths.waybar_config.display(),
                     paths.waybar_style.display()
                 ),
+                Step::AskSweepRoot => "ask whether the daily read-only root checks may run, then record the answer in the system configuration (sudo)".into(),
             })
             .collect()
     }
@@ -190,7 +205,7 @@ impl Plan {
     pub fn needs_terminal(&self) -> bool {
         self.steps
             .iter()
-            .any(|step| matches!(step, Step::Command(_)))
+            .any(|step| matches!(step, Step::Command(_) | Step::AskSweepRoot))
     }
 }
 
@@ -214,10 +229,18 @@ pub struct Paths {
     /// The pacman gate needs a root-owned OpenCode and none is installed
     /// (see `pacman::preflight`).
     pub opencode_missing: bool,
+    /// The sweep's user timer as packaged, and its enable link.
+    pub sweep_timer: PathBuf,
+    pub sweep_timer_link: PathBuf,
+    /// The sweep's root timer as packaged, and its enable link.
+    pub sweep_root_timer: PathBuf,
+    pub sweep_root_timer_link: PathBuf,
+    /// What the system configuration says about the root checks.
+    pub sweep_consent: Option<RootConsent>,
 }
 
 impl Paths {
-    pub fn real(opencode_missing: bool) -> Option<Self> {
+    pub fn real(opencode_missing: bool, sweep_consent: Option<RootConsent>) -> Option<Self> {
         let home = env::var_os("HOME")
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())?;
@@ -245,6 +268,14 @@ impl Paths {
                 .unwrap_or_else(|| config.join("waybar/config.jsonc")),
             waybar_style: config.join("waybar/style.css"),
             opencode_missing,
+            sweep_timer: Path::new("/usr/lib/systemd/user").join(SWEEP_TIMER),
+            sweep_timer_link: config
+                .join("systemd/user/timers.target.wants")
+                .join(SWEEP_TIMER),
+            sweep_root_timer: Path::new("/usr/lib/systemd/system").join(SWEEP_ROOT_TIMER),
+            sweep_root_timer_link: Path::new("/etc/systemd/system/timers.target.wants")
+                .join(SWEEP_ROOT_TIMER),
+            sweep_consent,
         })
     }
 
@@ -298,7 +329,75 @@ impl Paths {
             }
             Integration::BarWidget => self.widget_state(),
             Integration::WaybarModule => self.waybar_state(),
+            Integration::SystemSweep => self.sweep_state(),
         }
+    }
+
+    fn sweep_state(&self) -> State {
+        if !self.sweep_timer.is_file() || !self.sweep_root_timer.is_file() {
+            return State::Unavailable("the omarchy-guardian package is not installed".into());
+        }
+        let user = fs::symlink_metadata(&self.sweep_timer_link).is_ok();
+        let root = fs::symlink_metadata(&self.sweep_root_timer_link).is_ok();
+        match (user, self.sweep_consent, root) {
+            (false, _, _) => State::Off,
+            (true, Some(RootConsent::Allowed), true) => State::On,
+            (true, Some(RootConsent::Allowed), false) => {
+                State::Partial("root checks allowed, but their timer is off".into())
+            }
+            (true, Some(RootConsent::Declined), _) => State::Partial(
+                "root checks declined: what only root can read is not checked".into(),
+            ),
+            (true, None, _) => State::Partial("root checks not set up yet".into()),
+        }
+    }
+
+    /// Turns the sweep on (asking about the root checks when they were never
+    /// answered, or were declined) or off (the answer is kept).
+    fn sweep_steps(&self, on: bool) -> Vec<Step> {
+        let user = fs::symlink_metadata(&self.sweep_timer_link).is_ok();
+        let root = fs::symlink_metadata(&self.sweep_root_timer_link).is_ok();
+        let mut steps = Vec::new();
+        if on {
+            if !user {
+                steps.push(Step::Command(vec![
+                    "systemctl".into(),
+                    "--user".into(),
+                    "enable".into(),
+                    "--now".into(),
+                    SWEEP_TIMER.into(),
+                ]));
+            }
+            match self.sweep_consent {
+                Some(RootConsent::Allowed) if !root => steps.push(sudo(&[
+                    "/usr/bin/systemctl",
+                    "enable",
+                    "--now",
+                    SWEEP_ROOT_TIMER,
+                ])),
+                Some(RootConsent::Allowed) => {}
+                None | Some(RootConsent::Declined) => steps.push(Step::AskSweepRoot),
+            }
+        } else {
+            if user {
+                steps.push(Step::Command(vec![
+                    "systemctl".into(),
+                    "--user".into(),
+                    "disable".into(),
+                    "--now".into(),
+                    SWEEP_TIMER.into(),
+                ]));
+            }
+            if root {
+                steps.push(sudo(&[
+                    "/usr/bin/systemctl",
+                    "disable",
+                    "--now",
+                    SWEEP_ROOT_TIMER,
+                ]));
+            }
+        }
+        steps
     }
 
     fn waybar_state(&self) -> State {
@@ -481,6 +580,14 @@ impl Paths {
                         "waybar".into(),
                     ]),
                 ],
+            ),
+            (Integration::SystemSweep, _) => (
+                if on {
+                    "Turn the system sweep on"
+                } else {
+                    "Turn the system sweep off"
+                },
+                self.sweep_steps(on),
             ),
             (Integration::MenuEntry, _) => (
                 if on {
@@ -666,7 +773,7 @@ impl Paths {
                 }
                 Ok(())
             }
-            Step::Command(_) | Step::Optional(_) => Ok(()),
+            Step::Command(_) | Step::Optional(_) | Step::AskSweepRoot => Ok(()),
         }
     }
 
@@ -903,7 +1010,63 @@ mod tests {
             waybar_config: root.join("waybar/config"),
             waybar_style: root.join("waybar/style.css"),
             opencode_missing: false,
+            sweep_timer: root.join("units/omarchy-guardian-sweep.timer"),
+            sweep_timer_link: root.join("user-wants/omarchy-guardian-sweep.timer"),
+            sweep_root_timer: root.join("units/omarchy-guardian-sweep-collect.timer"),
+            sweep_root_timer_link: root.join("system-wants/omarchy-guardian-sweep-collect.timer"),
+            sweep_consent: None,
         }
+    }
+
+    #[test]
+    fn the_system_sweep_needs_its_timer_and_an_answer_about_root() {
+        use crate::config::model::RootConsent;
+        let dir = TempDir::new("integrations-sweep");
+        let mut paths = paths(&dir);
+        assert!(matches!(
+            paths.state(Integration::SystemSweep),
+            State::Unavailable(_)
+        ));
+        fs::create_dir_all(dir.path().join("units")).unwrap();
+        fs::write(&paths.sweep_timer, "").unwrap();
+        fs::write(&paths.sweep_root_timer, "").unwrap();
+        assert_eq!(paths.state(Integration::SystemSweep), State::Off);
+        let plan = paths.plan(Integration::SystemSweep, &State::Off).unwrap();
+        assert!(
+            matches!(&plan.steps[0], Step::Command(argv) if argv.contains(&"--user".to_string()))
+        );
+        assert_eq!(plan.steps[1], Step::AskSweepRoot);
+
+        fs::create_dir_all(paths.sweep_timer_link.parent().unwrap()).unwrap();
+        fs::write(&paths.sweep_timer_link, "").unwrap();
+        assert!(matches!(
+            paths.state(Integration::SystemSweep),
+            State::Partial(_)
+        ));
+        paths.sweep_consent = Some(RootConsent::Declined);
+        let state = paths.state(Integration::SystemSweep);
+        assert!(matches!(&state, State::Partial(detail) if detail.contains("declined")));
+        assert_eq!(
+            paths.plan(Integration::SystemSweep, &state).unwrap().steps,
+            [Step::AskSweepRoot]
+        );
+
+        paths.sweep_consent = Some(RootConsent::Allowed);
+        let state = paths.state(Integration::SystemSweep);
+        let steps = paths.plan(Integration::SystemSweep, &state).unwrap().steps;
+        assert!(
+            matches!(&steps[..], [Step::Command(argv)] if argv.iter().any(|arg| arg == "enable"))
+        );
+        fs::create_dir_all(paths.sweep_root_timer_link.parent().unwrap()).unwrap();
+        fs::write(&paths.sweep_root_timer_link, "").unwrap();
+        assert_eq!(paths.state(Integration::SystemSweep), State::On);
+        // Off disables both timers and keeps the answer.
+        let off = paths
+            .plan(Integration::SystemSweep, &State::On)
+            .unwrap()
+            .steps;
+        assert_eq!(off.len(), 2);
+        assert!(!off.contains(&Step::AskSweepRoot));
     }
 
     #[test]

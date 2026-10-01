@@ -6,7 +6,9 @@ use std::fmt;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
-use crate::config::model::{Action, AiRequirement, Named, Profile, SourceClass, Thinking, Toggle};
+use crate::config::model::{
+    Action, AiRequirement, Named, Profile, RootConsent, SourceClass, Thinking, Toggle,
+};
 use crate::tomlish::{self, Entry, Value};
 
 pub const TIMEOUT_RANGE: RangeInclusive<u32> = 10..=900;
@@ -61,12 +63,22 @@ pub struct AgentDefaults {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SweepSettings {
+    /// Whether the root collector may run.
+    pub root: Option<RootConsent>,
+    /// The group that may read what the scheduled root collector found.
+    pub group: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PartialConfig {
     pub profile: Option<Profile>,
     pub official_repos: Option<Vec<String>>,
     /// Packages allowed to provide the reviewer binaries from outside the
     /// official repositories (system file only).
     pub trusted_reviewer_packages: Option<Vec<String>>,
+    /// The system sweep's root collector (system file only).
+    pub sweep: SweepSettings,
     pub agent: AgentDefaults,
     pub classes: Vec<(SourceClass, PartialPolicy)>,
 }
@@ -139,6 +151,18 @@ pub fn parse(file: &Path, text: &str) -> Result<PartialConfig, ConfigError> {
     Ok(config)
 }
 
+/// A Linux group name as `groupadd` accepts it.
+pub fn is_group_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    name.len() <= 32
+        && characters
+            .next()
+            .is_some_and(|first| first.is_ascii_lowercase() || first == '_')
+        && characters.all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || "_-".contains(character)
+        })
+}
+
 fn apply(
     config: &mut PartialConfig,
     path: &[&str],
@@ -150,6 +174,14 @@ fn apply(
         ["official_repos"] => config.official_repos = Some(field.repo_list(value)?),
         ["trusted_reviewer_packages"] => {
             config.trusted_reviewer_packages = Some(field.package_list(value)?);
+        }
+        ["sweep", "root"] => config.sweep.root = Some(field.named(value)?),
+        ["sweep", "group"] => {
+            let group = field.text(value)?;
+            if !is_group_name(&group) {
+                return Err(field.error("expected a group name"));
+            }
+            config.sweep.group = Some(group);
         }
         ["agent", "model"] => config.agent.model = Some(field.model(value)?),
         ["agent", "max_input_kib"] => {

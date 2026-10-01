@@ -36,6 +36,9 @@ post_upgrade() {
 # AbortOnFail every later transaction would fail. A hand-installed copy is
 # moved aside rather than deleted, since pacman only reads *.hook files.
 pre_remove() {
+    # The daily root check's timer would be left enabled for a unit this
+    # removal deletes.
+    systemctl disable --now omarchy-guardian-sweep-collect.timer >/dev/null 2>&1 || true
     if [ -L "$_hook" ]; then
         rm -f "$_hook"
         printf '%s\n' "Removed the Guardian pacman hook."
