@@ -80,7 +80,7 @@ pub fn command(command: &Command, settings: &Settings) -> ExitCode {
     }
     let result = match command {
         Command::Run(options) => return run(*options, settings),
-        Command::Allow(label) => allow(label),
+        Command::Allow(label) => allow(label, settings),
         Command::Forget(label) => forget(label.as_deref()),
     };
     match result {
@@ -131,9 +131,11 @@ fn state_directory() -> Result<std::path::PathBuf, String> {
     state::directory(&root)
 }
 
-fn allow(label: &str) -> Result<String, String> {
+fn allow(label: &str, settings: &Settings) -> Result<String, String> {
     let home = home();
-    let (collection, _, _) = collect_here(home.as_deref())?;
+    let (mut collection, _, mut notes) = collect_here(home.as_deref())?;
+    // Items only root can read come from root's latest results.
+    add_root_part(&mut collection, Options::default(), settings, &mut notes);
     let item = collection
         .items
         .iter()
@@ -223,6 +225,32 @@ fn add_root_part(
     }
 }
 
+/// The untrusted items' fingerprints, to remember for the next sweep.
+/// What could not be read this time (root's results missing or old) keeps
+/// its last fingerprint, rather than counting as changed now and again once
+/// root's results are back.
+fn remembered(
+    collection: &Collection,
+    previous: Option<&Remembered>,
+    label: impl Fn(&collect::Item) -> String,
+) -> Remembered {
+    collection
+        .items
+        .iter()
+        .filter(|item| !item.is_trusted())
+        .map(|item| {
+            let label = label(item);
+            let mut fingerprint = state::fingerprint(item);
+            if fingerprint == state::UNREAD
+                && let Some(known) = previous.and_then(|previous| previous.get(&label))
+            {
+                fingerprint.clone_from(known);
+            }
+            (label, fingerprint)
+        })
+        .collect()
+}
+
 /// `omarchy-guardian sweep`.
 fn run(options: Options, settings: &Settings) -> ExitCode {
     let home = home();
@@ -270,15 +298,13 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
         decision => decision,
     };
 
-    let current: Remembered = collection
-        .items
-        .iter()
-        .filter(|item| !item.is_trusted())
-        .map(|item| (label(item), state::fingerprint(item)))
-        .collect();
-    let changes = directory
+    let previous = directory
         .as_ref()
-        .map(|directory| state::diff(&state::baseline(directory), &current))
+        .map(|directory| state::baseline(directory));
+    let current = remembered(&collection, previous.as_ref(), label);
+    let changes = previous
+        .as_ref()
+        .map(|previous| state::diff(previous, &current))
         .unwrap_or_default();
 
     if options.view == View::Json {

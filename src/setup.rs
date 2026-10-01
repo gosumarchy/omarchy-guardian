@@ -428,10 +428,11 @@ fn write_files(
     terminal.say(&format!(
         "\nSystem file {SYSTEM_PATH} (settings for the pacman gate):"
     ));
-    terminal.say(&line_diff(
-        environment.existing_system().as_deref().unwrap_or(""),
-        &system_text,
-    ));
+    // The diff shows what will be installed: with the system-only settings
+    // setup keeps (the sweep's root consent), not as if it dropped them.
+    let existing = environment.existing_system().unwrap_or_default();
+    let system_text = keep_system_only(&system_text, &existing);
+    terminal.say(&line_diff(&existing, &system_text));
     if yes(terminal, "Install it with sudo?") {
         environment.write_system(&system_text)?;
         terminal.say(&format!("Wrote {SYSTEM_PATH}"));

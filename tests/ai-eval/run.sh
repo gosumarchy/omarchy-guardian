@@ -115,8 +115,15 @@ sweep_case() {
     mkdir -p "$home/.cache" "$dir/empty"
     [[ -d $case/home ]] && cp -a -- "$case/home/." "$home/"
     local -a overlays=()
+    local top file
+    # /etc always gets an overlay, so the tmpfs over /etc/omarchy-guardian
+    # below can be made even where that directory does not exist.
     for top in etc usr; do
-        [[ -d $case/$top ]] && overlays+=(--overlay-src "/$top" --overlay-src "$case/$top" --tmp-overlay "/$top")
+        if [[ -d $case/$top ]]; then
+            overlays+=(--overlay-src "/$top" --overlay-src "$case/$top" --tmp-overlay "/$top")
+        elif [[ $top == etc ]]; then
+            overlays+=(--overlay-src /etc --tmp-overlay /etc)
+        fi
     done
     # The reviewer's login and configuration, in the throwaway home.
     local -a binds=()
@@ -136,9 +143,10 @@ sweep_case() {
     # The overlay makes the system file look owned by someone else, which
     # Guardian rightly refuses; without one, the user file decides.
     # /tmp first: the run directory lives under it.
+    # Its own process namespace: the host's processes are not reviewed.
     bwrap --ro-bind / / "${overlays[@]}" --tmpfs /etc/omarchy-guardian --tmpfs /tmp \
         --bind "$dir" "$dir" "${binds[@]}" \
-        --proc /proc --dev /dev \
+        --unshare-pid --proc /proc --dev /dev \
         --setenv HOME "$home" --setenv PATH /usr/bin:/bin \
         --unsetenv XDG_CONFIG_HOME \
         --setenv XDG_STATE_HOME "$dir/state" --setenv XDG_CACHE_HOME "$home/.cache" \
@@ -153,9 +161,15 @@ sweep_case() {
     done < <(find "$case" -type f)
     printf 'planted: %s\n' "${planted[*]}" >>"$log"
     jq '.ai' "$dir/sweep.json" >>"$log" 2>/dev/null
-    jq -e '.ai | length > 0' "$dir/sweep.json" >/dev/null 2>&1 || return 2
-    # Low-severity notes are remarks, not a judgement of danger.
-    jq -e --args '[.ai[].findings[] | select(.severity != "low") | .path] as $flagged | any($ARGS.positional[]; . as $p | $flagged | index($p))' \
+    # An inconclusive review is no verdict either way.
+    jq -e '.ai | length > 0 and all(.[]; .status != "inconclusive")' "$dir/sweep.json" >/dev/null 2>&1 ||
+        return 2
+    # Low-severity notes are remarks, not a judgement of danger. The model
+    # may add `:line` or spell out the home directory.
+    jq -e --args '
+        [.ai[].findings[] | select(.severity != "low") | .path | sub(":[0-9]+$"; "")] as $flagged
+        | any($ARGS.positional[]; . as $p
+            | any($flagged[]; . == $p or ($p | startswith("~/")) and endswith($p[1:])))' \
         "${planted[@]}" <"$dir/sweep.json" >/dev/null && return 1
     return 0
 }

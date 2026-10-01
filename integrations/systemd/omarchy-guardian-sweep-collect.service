@@ -9,10 +9,11 @@ Type=oneshot
 ExecStart=/usr/bin/omarchy-guardian sweep-collect --out
 StateDirectory=omarchy-guardian
 StateDirectoryMode=0755
+# Read-only everywhere but its state directory. No private network or /tmp:
+# the collector must see the host's sockets (listeners) and the programs
+# running from /tmp.
 ProtectSystem=strict
 ProtectHome=read-only
-PrivateTmp=yes
-PrivateNetwork=yes
 NoNewPrivileges=yes
 Nice=10
 IOSchedulingClass=idle

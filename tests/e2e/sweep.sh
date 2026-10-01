@@ -22,14 +22,19 @@
 #   cargo build --release
 #   bash tests/e2e/sweep.sh
 #
-# Set GUARDIAN_E2E_ROOT to choose the scratch directory and GUARDIAN_E2E_KEEP=1
-# to keep it for inspection.
+# Set GUARDIAN_E2E_ROOT to choose where the scratch directory is created and
+# GUARDIAN_E2E_KEEP=1 to keep it for inspection.
 set -uo pipefail
 
 PROJECT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
 BINARY=$PROJECT/target/release/omarchy-guardian
 RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
-E2E=${GUARDIAN_E2E_ROOT:-$(mktemp -d -p "$RUNTIME_DIR" guardian-sweep-XXXXXX)}
+# Always a fresh directory (under GUARDIAN_E2E_ROOT when set), so cleanup
+# never removes anything the run did not create.
+E2E=$(mktemp -d -p "${GUARDIAN_E2E_ROOT:-$RUNTIME_DIR}" guardian-sweep-XXXXXX) || {
+    printf 'cannot create a scratch directory; set GUARDIAN_E2E_ROOT\n' >&2
+    exit 2
+}
 FAILURES=0
 
 if [[ ! -x $BINARY ]]; then
@@ -74,13 +79,14 @@ plant() {
 }
 
 # sweep [args...]: runs the project's sweep in the sandbox, from the home
-# directory, with the planted layers over /etc and /usr.
+# directory, with the planted layers over /etc and /usr, in its own process
+# namespace (the live checks see only the sandbox's processes).
 sweep() {
     bwrap --ro-bind / / \
         --overlay-src /usr --overlay-src "$USR" --tmp-overlay /usr \
         --overlay-src /etc --overlay-src "$ETC" --tmp-overlay /etc \
-        --tmpfs /etc/omarchy-guardian \
-        --bind "$E2E" "$E2E" --proc /proc --dev /dev --tmpfs /tmp \
+        --tmpfs /etc/omarchy-guardian --tmpfs /tmp \
+        --bind "$E2E" "$E2E" --unshare-pid --proc /proc --dev /dev \
         --setenv HOME "$HOME" --setenv TMPDIR "$HOME/tmp" \
         --setenv OMARCHY_GUARDIAN_NO_NOTIFY 1 \
         --setenv XDG_CONFIG_HOME "$HOME/.config" \
@@ -101,7 +107,7 @@ expect_listed() {
     tier=$(jq -r --arg path "$label" '[.items[] | select(.path == $path) | .tier][0] // "missing"' "$JSON")
     flagged=$(jq -r --arg path "$label" '[.items[] | select(.path == $path) | .flagged][0] // false' "$JSON")
     case $tier:$flagged in
-        unknown:* | modified:* | edited:* | user-built:* | *:true) expect "$label is listed ($tier)" 0 ;;
+        unknown:* | modified:* | edited:* | user-built:* | copy:true) expect "$label is listed ($tier)" 0 ;;
         *) expect "$label is listed (got: $tier)" 1 ;;
     esac
     if [[ -n $rule ]]; then
@@ -111,9 +117,20 @@ expect_listed() {
     fi
 }
 
+# require_json <what>: stops the suite when the sweep produced no report, so
+# no check can pass on a sweep that never ran.
+require_json() {
+    if ! jq -e '.items | length > 0' "$JSON" >/dev/null 2>&1; then
+        printf 'FAIL %s: the sweep produced no report\n' "$1"
+        sed -n '1,20p' "$E2E/sweep.err" >&2
+        exit 1
+    fi
+}
+
 clean_system() {
     printf '=== an untouched system ===\n'
-    sweep omarchy-guardian sweep --json >"$JSON" 2>/dev/null
+    sweep omarchy-guardian sweep --json >"$JSON" 2>"$E2E/sweep.err"
+    require_json 'an untouched system'
     jq -e '.items | length > 100' "$JSON" >/dev/null
     expect 'the sweep looks at the real auto-run locations' "$?"
     jq -e '[.items[] | select(.path | startswith("~/"))] | length == 0' "$JSON" >/dev/null
@@ -159,9 +176,10 @@ plant_home() {
     plant "$HOME/.config/hypr/autostart.lua" 644 $'local o = require("omarchy")\no.exec_on_start("~/.cache/payload.sh")\n'
     plant "$HOME/.config/omarchy/hooks/post-boot.d/evil" 755 $'#!/bin/sh\n~/.cache/payload.sh\n'
     plant "$HOME/.local/bin/sudo" 755 $'#!/bin/sh\nprintf "%s\\n" "$@" >>~/.cache/typed\nexec /usr/bin/sudo "$@"\n'
-    # An app launcher that replaces a system one's command.
+    # An app launcher that replaces a visible system one's command.
     local launcher
-    launcher=$(basename -- "$(find /usr/share/applications -maxdepth 1 -name '*.desktop' -print -quit)")
+    launcher=$(grep -L '^NoDisplay=true' /usr/share/applications/*.desktop 2>/dev/null | head -n 1)
+    launcher=$(basename -- "${launcher:-/usr/share/applications/none.desktop}")
     plant "$HOME/.local/share/applications/$launcher" 644 $'[Desktop Entry]\nType=Application\nExec=/usr/local/bin/evil-run\n'
     LAUNCHER=$launcher
     # A user service, shell start-up, git and SSH.
@@ -176,8 +194,9 @@ planted_system() {
     plant_system
     plant_home
     # A program running from the cache directory while the sweep looks.
-    sweep bash -c 'cp /usr/bin/sleep ~/.cache/sleeper && { ~/.cache/sleeper 30 & } && sleep 1 && omarchy-guardian sweep --json; status=$?; pkill -x sleeper; exit $status' >"$JSON" 2>/dev/null
+    sweep bash -c 'cp /usr/bin/sleep ~/.cache/sleeper && { ~/.cache/sleeper 30 & } && sleep 1 && omarchy-guardian sweep --json; status=$?; kill $! 2>/dev/null; exit $status' >"$JSON" 2>"$E2E/sweep.err"
     local status=$?
+    require_json 'planted persistence'
     [[ $status == 1 || $status == 2 ]]
     expect "the sweep does not pass a planted system (exit $status)" "$?"
 
@@ -202,6 +221,8 @@ planted_system() {
     expect_listed '~/.config/omarchy/hooks/post-boot.d/evil'
     expect_listed '~/.local/bin/sudo'
     expect_listed "~/.local/share/applications/$LAUNCHER"
+    jq -e --arg path "~/.local/share/applications/$LAUNCHER" '[.items[] | select(.path == $path) | .notes[]] | any(startswith("replaces the launcher"))' "$JSON" >/dev/null
+    expect 'the launcher is noted as replacing the system one' "$?"
     expect_listed '~/.config/systemd/user/evil.service'
     expect_listed '~/.bashrc' download-and-execute
     expect_listed '~/.gitconfig' git-config-command
@@ -219,22 +240,24 @@ planted_system() {
 changes_and_allow() {
     printf '=== changes and allow ===\n'
     # The program that ran from the cache has stopped, so only removals.
-    sweep omarchy-guardian sweep --diff >"$E2E/diff.txt" 2>/dev/null
-    ! grep -qE '^  [+~] ' "$E2E/diff.txt"
+    sweep omarchy-guardian sweep --diff >"$E2E/diff.txt" 2>"$E2E/sweep.err"
+    grep -q '^Guardian sweep · ' "$E2E/diff.txt" && ! grep -qE '^  [+~] ' "$E2E/diff.txt"
     expect 'a second sweep finds nothing new or changed' "$?"
 
     plant "$HOME/.config/autostart/later.desktop" 644 $'[Desktop Entry]\nExec=/usr/local/bin/evil-run\n'
-    sweep omarchy-guardian sweep --diff >"$E2E/diff.txt" 2>/dev/null
+    sweep omarchy-guardian sweep --diff >"$E2E/diff.txt" 2>"$E2E/sweep.err"
     grep -qF '+ ~/.config/autostart/later.desktop' "$E2E/diff.txt"
     expect 'a new autostart entry shows as new' "$?"
 
     sweep omarchy-guardian sweep allow '~/.local/bin/sudo' >/dev/null 2>&1
     expect 'an item can be allowed' "$?"
-    sweep omarchy-guardian sweep --json >"$JSON" 2>/dev/null
+    sweep omarchy-guardian sweep --json >"$JSON" 2>"$E2E/sweep.err"
+    require_json 'allow'
     jq -e '[.items[] | select(.path == "~/.local/bin/sudo") | .tier][0] == "allowed"' "$JSON" >/dev/null
     expect 'an allowed item is trusted' "$?"
     printf '#!/bin/sh\necho changed\n' >>"$HOME/.local/bin/sudo"
-    sweep omarchy-guardian sweep --json >"$JSON" 2>/dev/null
+    sweep omarchy-guardian sweep --json >"$JSON" 2>"$E2E/sweep.err"
+    require_json 'allow, then change'
     jq -e '[.items[] | select(.path == "~/.local/bin/sudo") | .tier][0] == "unknown"' "$JSON" >/dev/null
     expect 'an allowed item that changes is shown again' "$?"
 }

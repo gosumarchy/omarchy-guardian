@@ -30,7 +30,11 @@ const WRAPPERS: &[&str] = &[
 const SEARCH: &[&str] = &["~/.local/bin", "usr/local/bin", "usr/bin"];
 
 /// The command lines `text` (a file of `category` named `name`) runs.
-pub fn commands(category: Category, name: &str, text: &str) -> Vec<String> {
+pub fn commands(category: Category, path: &str, text: &str) -> Vec<String> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if category == Category::Cron {
+        return crontab(path, text);
+    }
     if category == Category::Hyprland {
         return if read::has_extension(name, "lua") {
             lua::startup_commands(text)
@@ -54,6 +58,44 @@ pub fn commands(category: Category, name: &str, text: &str) -> Vec<String> {
         found.extend(command);
     }
     found
+}
+
+/// The commands of a crontab: after five time fields (or `@reboot` and
+/// friends), and the user field the system crontabs (`/etc/crontab`,
+/// `/etc/cron.d/`) have. Environment lines run nothing; a script (in
+/// `cron.daily/` and the like) is reviewed as the file it is.
+fn crontab(path: &str, text: &str) -> Vec<String> {
+    if text.starts_with("#!") {
+        return Vec::new();
+    }
+    let system = path == "etc/crontab" || path.starts_with("etc/cron.d/");
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let time_fields = if words[0].starts_with('@') {
+            1
+        } else if words.len() > 5 && words[..5].iter().all(|field| is_time_field(field)) {
+            5
+        } else {
+            // `NAME=value` or something cron would reject.
+            continue;
+        };
+        let skip = time_fields + usize::from(system);
+        if words.len() > skip {
+            found.push(words[skip..].join(" "));
+        }
+    }
+    found
+}
+
+fn is_time_field(field: &str) -> bool {
+    field
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "*/,-".contains(character))
 }
 
 /// `Exec=`, `ExecStart=` and friends in units, hooks, D-Bus services and
@@ -341,6 +383,25 @@ mod tests {
             commands(Category::Hyprland, "a.conf", "exec-once = waybar\n$x = 1\n"),
             ["waybar"]
         );
+        // Crontabs: time fields, the system crontabs' user field, no
+        // `Key=value` reading.
+        assert_eq!(
+            commands(
+                Category::Cron,
+                "var/spool/cron/u",
+                "MAILTO=u\nExecStart=/etc/shadow\n*/5 * * * * /home/u/x.sh --now\n@reboot ~/y\n"
+            ),
+            ["/home/u/x.sh --now", "~/y"]
+        );
+        assert_eq!(
+            commands(
+                Category::Cron,
+                "etc/cron.d/x",
+                "0 3 * * mon root /usr/bin/z\n"
+            ),
+            ["/usr/bin/z"]
+        );
+        assert!(commands(Category::Cron, "etc/cron.daily/x", "#!/bin/sh\ncurl x\n").is_empty());
     }
 
     #[test]

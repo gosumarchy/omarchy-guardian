@@ -4,6 +4,9 @@
 //! `desc` names the package and `mtree` (gzip) lists every file it installed
 //! with its mode, SHA-256 and link target. A file that still matches its
 //! record is what its package shipped.
+//!
+//! The records are trusted as they are: root can rewrite them, so an
+//! attacker who already has root can make a changed file look packaged.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -50,9 +53,9 @@ pub struct PackageIndex {
     packages: Vec<String>,
     owners: HashMap<String, Owned>,
     foreign: HashSet<String>,
-    /// The first repository-package file with each content, for files
-    /// copied out of a package (Omarchy's `etc-overrides`).
-    copies: HashMap<Digest, String>,
+    /// Repository-package files by content, for files copied out of a
+    /// package (Omarchy's `etc-overrides`).
+    copies: HashMap<Digest, Vec<String>>,
     /// Packages whose record could not be read.
     pub problems: Vec<String>,
 }
@@ -95,10 +98,16 @@ impl PackageIndex {
                             .push("package records exceed the size limit".into());
                         break;
                     }
-                    let backup = fs::read_to_string(directory.join("files"))
-                        .map(|files| backup_paths(&files))
-                        .unwrap_or_default();
-                    index.add(&name, &text, &backup);
+                    match fs::read_to_string(directory.join("files")) {
+                        Ok(files) => index.add(&name, &text, &backup_paths(&files), true),
+                        // Without the list of its configuration files, the
+                        // package's edited configuration reads as modified,
+                        // and its content is not trusted elsewhere.
+                        Err(error) => {
+                            index.problems.push(format!("{name}: files: {error}"));
+                            index.add(&name, &text, &HashSet::new(), false);
+                        }
+                    }
                 }
                 Err(error) => index.problems.push(format!("{name}: {error}")),
             }
@@ -109,10 +118,10 @@ impl PackageIndex {
     /// Records `package`'s files from its decompressed `mtree`; `backup`
     /// lists its configuration files. A path another package already owns
     /// keeps its first owner.
-    fn add(&mut self, package: &str, mtree: &str, backup: &HashSet<String>) {
+    fn add(&mut self, package: &str, mtree: &str, backup: &HashSet<String>, sources: bool) {
         let number = self.packages.len();
         self.packages.push(package.to_string());
-        let repository = !self.is_foreign(package);
+        let repository = sources && !self.is_foreign(package);
         for (path, recorded) in parse_mtree(mtree) {
             if let Recorded::File {
                 sha256: Some(digest),
@@ -120,8 +129,12 @@ impl PackageIndex {
             } = &recorded
                 && repository
                 && !backup.contains(&path)
+                && is_copy_source(&path)
             {
-                self.copies.entry(*digest).or_insert_with(|| path.clone());
+                let paths = self.copies.entry(*digest).or_default();
+                if paths.len() < MAX_COPY_SOURCES {
+                    paths.push(path.clone());
+                }
             }
             let backup = backup.contains(&path);
             self.owners.entry(path).or_insert(Owned {
@@ -132,9 +145,17 @@ impl PackageIndex {
         }
     }
 
-    /// The repository-package file whose content is `digest`, if any.
-    pub fn copy_of(&self, digest: &Digest) -> Option<&str> {
-        self.copies.get(digest).map(String::as_str)
+    /// The repository-package file whose content is `digest` and whose name
+    /// is `path`'s, if any: Omarchy's `etc-overrides/nsswitch.conf` for
+    /// `/etc/nsswitch.conf`. A file with a different name (a packaged script
+    /// dropped into `/etc/profile.d/`) is not a copy of it.
+    pub fn copy_of(&self, digest: &Digest, path: &str) -> Option<&str> {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        self.copies
+            .get(digest)?
+            .iter()
+            .map(String::as_str)
+            .find(|source| source.rsplit('/').next() == Some(name))
     }
 
     /// The record for `path`, relative to `/` (`usr/bin/ssh`).
@@ -167,8 +188,23 @@ impl PackageIndex {
     #[cfg(test)]
     pub fn add_for_test(&mut self, package: &str, mtree: &str, backup: &[&str]) {
         let backup = backup.iter().map(|path| (*path).to_string()).collect();
-        self.add(package, mtree, &backup);
+        self.add(package, mtree, &backup, true);
     }
+}
+
+/// Paths with the same content kept per digest (empty files and the like
+/// are shipped by many packages).
+const MAX_COPY_SOURCES: usize = 16;
+
+/// Whether a packaged file can vouch for a copy of it elsewhere. Examples
+/// and documentation are templates, not configuration: a sample `sudoers`
+/// from `usr/share/doc` copied into `/etc` must not read as trusted.
+fn is_copy_source(path: &str) -> bool {
+    !path.starts_with("usr/share/doc/")
+        && !path.contains("/examples/")
+        && !path.contains("/example/")
+        && !path.contains("/test/")
+        && !path.contains("/tests/")
 }
 
 /// The `%BACKUP%` paths of a package's `files` record (`path<TAB>md5`).
@@ -380,6 +416,7 @@ mod tests {
         let directory = db.join(format!("{name}-1-1"));
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join("desc"), format!("%NAME%\n{name}\n")).unwrap();
+        fs::write(directory.join("files"), "%FILES%\n").unwrap();
         fs::write(directory.join("mtree.txt"), mtree).unwrap();
         let status = Command::new("/usr/bin/gzip")
             .args(["-n", "-c"])

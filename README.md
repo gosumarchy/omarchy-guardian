@@ -150,7 +150,12 @@ As a user only your own processes can be looked at; the root checks see
 all of them.
 
 Each item is judged against pacman's own records (no network, no hash
-lookups):
+lookups). Those records live in `/var/lib/pacman/local`, which root can
+rewrite, so the sweep assumes them intact: an attacker who already has root
+can make a changed file look packaged. A copy only counts as one when it
+has the same name as the packaged file (and never of documentation or
+examples), and a link only takes the trust of the unit it enables under that
+unit's own name, never for units that open a root shell:
 
 | Tier | Meaning | Shown |
 |---|---|---|
@@ -172,10 +177,16 @@ for are named to the AI by format and hash but never run or uploaded.
 Some files only root can read (the sudoers file and drop-ins, polkit rules,
 root's crontab, shell files and keys, the Limine config). Without root, the
 sweep lists them and is **incomplete** (exit 2). `sweep --root` asks for the
-sudo password and runs a root collector that only reads: it never runs what
-it finds, never reads `/etc/shadow` or private keys, makes no AI call and
-writes nothing; it hands the items no package vouches for back to your own
-sweep, which judges them with your settings.
+sudo password and runs the installed, root-owned Guardian as a collector
+that only reads: it never runs what it finds, makes no AI call and writes
+nothing; it hands the items no package vouches for back to your own sweep,
+which judges them with your settings. Only files of the auto-run locations
+themselves (a sudoers drop-in, root's crontab) come back with their
+content; anything root reached by following what they run or what a process
+preloads comes back as a hash only unless everyone may read it, so no user
+can point it at `/etc/shadow` or a key. Old password hashes
+(`/etc/security/opasswd`) are never read. Root's view only fills in what
+your own sweep could not read.
 
 **On a schedule.** `protect` turns on two timers the package ships:
 
@@ -189,11 +200,13 @@ sweep, which judges them with your settings.
   kept in the system file as `[sweep] root = "allowed"` (or `"declined"`)
   with the group allowed to read the results; a user file cannot set it,
   and `protect --yes` never answers it for you. The collector runs
-  sandboxed (no network, read-only system) and writes only
+  sandboxed (read-only system) and writes only
   `/var/lib/omarchy-guardian/sweep/root.json` (root-owned, mode 0640, your
   group). Your sweep uses it only while it is root's alone and less than 36
-  hours old. Note that this makes the root-only items it lists (a sudoers
-  drop-in no package installed, say) readable by your group.
+  hours old. This makes the root-only items it lists (a sudoers drop-in no
+  package installed, say) readable by your group, so it is only used when
+  your primary group is yours alone; if it is shared with other accounts,
+  root checks run only with `sweep --root`.
 
 Without root checks (declined, or not answered yet) every sweep is
 incomplete and says what it could not check, and the bar shows the sweep as
@@ -813,9 +826,9 @@ dynamic linker, PAM, profile scripts, autostart, generators, pacman hooks,
 NetworkManager dispatchers, initramfs hooks, a setuid shell copy, a replaced
 setuid binary, Hyprland Lua, Omarchy hooks, `~/.local/bin` shadowing, a
 launcher override, git and SSH, a program running from the cache) is planted
-into throwaway `/etc`, `/usr` and `HOME` overlays, and one sweep must list
-every planted item and flag the plainly malicious ones; `--diff` and
-`allow` are checked too. It needs `bwrap` 0.9 or newer and `jq`, and no AI
+into throwaway `/etc` and `/usr` overlays and a throwaway `HOME`, and one
+sweep must list every planted item and flag the plainly malicious ones;
+`--diff` and `allow` are checked too. It needs `bwrap` 0.9 or newer and `jq`, and no AI
 (the `system` class's AI review is off inside it):
 
 ```sh
@@ -837,4 +850,6 @@ Every run starts with an empty review memory, so no verdict comes from the
 cache. The pacman cases use the system config's model, the AUR and system
 cases the user config's. A system case is judged by the AI's own medium or
 high findings on its planted files, since the rest of the real system decides
-the sweep's exit code.
+the sweep's exit code; the host's own files no package vouches for are
+reviewed alongside (and sent to the provider), so results can differ from
+machine to machine.

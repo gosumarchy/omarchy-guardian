@@ -24,6 +24,7 @@ use crate::rules::RuleId;
 use crate::sha256::Digest;
 
 const SUDO: &str = "/usr/bin/sudo";
+const INSTALLED: &str = "/usr/bin/omarchy-guardian";
 /// Root's home, relative to `/`.
 const ROOT_HOME: &str = "root";
 /// The most output and items taken from the root collector.
@@ -114,15 +115,34 @@ pub fn primary_group() -> Option<String> {
         .next()?
         .parse()
         .ok()?;
-    fs::read_to_string("/etc/group")
-        .ok()?
+    private_group(
+        gid,
+        &fs::read_to_string("/etc/group").ok()?,
+        &fs::read_to_string("/etc/passwd").ok()?,
+    )
+}
+
+/// The name of group `gid` when it is one person's alone: no listed
+/// members, and the primary group of one account only. Root's results are
+/// readable by that group, so a shared one (`users`) would show them to
+/// everyone in it.
+fn private_group(gid: u32, group: &str, passwd: &str) -> Option<String> {
+    let (name, members) = group.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(':').collect();
+        (fields.get(2)?.parse::<u32>().ok()? == gid)
+            .then(|| (fields[0].to_string(), fields.get(3).copied().unwrap_or("")))
+    })?;
+    let primary_of = passwd
         .lines()
-        .find_map(|line| {
-            let fields: Vec<&str> = line.split(':').collect();
-            (fields.get(2)?.parse::<u32>().ok()? == gid)
-                .then(|| fields[0].to_string())
-                .filter(|name| crate::config::file::is_group_name(name))
+        .filter(|line| {
+            line.split(':')
+                .nth(3)
+                .and_then(|field| field.parse::<u32>().ok())
+                == Some(gid)
         })
+        .count();
+    (members.trim().is_empty() && primary_of == 1 && crate::config::file::is_group_name(&name))
+        .then_some(name)
 }
 
 /// The id of group `name`, from `/etc/group`.
@@ -202,7 +222,7 @@ fn to_json(collection: &Collection) -> Json {
         .iter()
         .filter(|item| !item.is_trusted())
         .take(MAX_ITEMS)
-        .map(item_json);
+        .map(|item| item_json(&withheld(item, Path::new("/"))));
     Json::object([
         ("version", Json::from(VERSION)),
         ("items", Json::Array(items.collect())),
@@ -217,6 +237,41 @@ fn to_json(collection: &Collection) -> Json {
             ),
         ),
     ])
+}
+
+/// The format label of a file root hashed but did not hand back.
+pub const WITHHELD: &str = "root-only file (hashed, content withheld)";
+
+/// What root may hand back of `item`. Root follows what files run and what
+/// processes preload, and those can be steered by any user (a crontab line,
+/// an `LD_PRELOAD` value) towards `/etc/shadow` or an SSH host key. So only
+/// what sits in the auto-run catalog itself (sudoers drop-ins, root's shell
+/// files) keeps its content; anything reached by following keeps only its
+/// hash, unless everyone may read it anyway.
+fn withheld(item: &Item, root: &Path) -> Item {
+    let followed = item.run_by.is_some()
+        || matches!(
+            item.category,
+            Category::Process
+                | Category::Listener
+                | Category::Input
+                | Category::Camera
+                | Category::KernelModule
+                | Category::Setuid
+        );
+    let world_readable =
+        fs::metadata(root.join(&item.path)).is_ok_and(|metadata| metadata.mode() & 0o004 != 0);
+    let mut item = item.clone();
+    if followed
+        && !world_readable
+        && matches!(
+            item.body,
+            Body::Text(_) | Body::Oversized | Body::Undecodable
+        )
+    {
+        item.body = Body::Binary(WITHHELD);
+    }
+    item
 }
 
 fn item_json(item: &Item) -> Json {
@@ -305,7 +360,14 @@ fn item_from_json(json: &Json) -> Option<Item> {
         "text" => Body::Text(body_text("text")?),
         // Binary formats are a short fixed list; a label from the JSON is
         // kept for the life of the run.
-        "binary" => Body::Binary(Box::leak(body_text("format")?.into_boxed_str())),
+        "binary" => {
+            let label = body_text("format")?;
+            Body::Binary(if label == WITHHELD {
+                WITHHELD
+            } else {
+                crate::content::Format::label_named(&label)
+            })
+        }
         "undecodable" => Body::Undecodable,
         "oversized" => Body::Oversized,
         "link" => Body::Link(body_text("target")?),
@@ -325,9 +387,11 @@ fn item_from_json(json: &Json) -> Option<Item> {
         runs: strings("runs")?,
         run_by: text("run_by").map(str::to_string),
         notes: strings("notes")?,
+        // Results from before alerts existed have none.
         alerts: json
-            .get("alerts")?
-            .as_array()?
+            .get("alerts")
+            .and_then(Json::as_array)
+            .unwrap_or_default()
             .iter()
             .map(|alert| {
                 Some((
@@ -350,8 +414,10 @@ fn from_json(text: &str) -> Result<RootPart, String> {
         .ok_or("no item list")?
         .iter()
         .take(MAX_ITEMS)
-        .map(|item| item_from_json(item).ok_or_else(|| "a malformed item".to_string()))
-        .collect::<Result<Vec<_>, _>>()?;
+        // One odd item (a process with a strange `LD_PRELOAD`, say) must not
+        // throw away everything else root found.
+        .filter_map(item_from_json)
+        .collect();
     let truncated = json
         .get("truncated")
         .and_then(Json::as_array)
@@ -368,12 +434,18 @@ fn from_json(text: &str) -> Result<RootPart, String> {
 /// Runs the root collector through sudo, which asks for the password on
 /// the terminal, and reads what it found.
 pub fn from_root() -> Result<RootPart, String> {
-    let program = std::env::current_exe().map_err(|error| error.to_string())?;
+    // Always the installed, root-owned Guardian: running the current
+    // executable would let a user-writable build run as root.
+    let program = Path::new(INSTALLED);
+    let metadata = fs::metadata(program).map_err(|error| format!("{INSTALLED}: {error}"))?;
+    if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return Err(format!("{INSTALLED} is not root's alone"));
+    }
     errln!(
         "Guardian needs root to check what your user can't read (sudoers, root's crontab, shell files and keys). It only reads them."
     );
     let mut child = Command::new(SUDO)
-        .arg(&program)
+        .arg(program)
         .arg("sweep-collect")
         .stdin(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -398,9 +470,11 @@ pub fn from_root() -> Result<RootPart, String> {
 /// Replaces what the user's sweep could not judge on the system side with
 /// what root found: the user's home items and trusted system items stay.
 pub fn merge(collection: &mut Collection, part: RootPart) {
+    // Root's view only fills in what the user could not read: root's
+    // results may be a day old, and what the user read now is newer.
     collection
         .items
-        .retain(|item| item.origin == Origin::User || item.is_trusted());
+        .retain(|item| item.origin == Origin::User || !matches!(item.body, Body::Unreadable(_)));
     collect::merge(collection, part.items);
     collection.truncated.extend(part.truncated);
 }
@@ -454,6 +528,8 @@ mod tests {
             truncated: vec!["/etc/x".into()],
         };
         let mut collection = collection;
+        // The drop-in is in the catalog itself: its content travels.
+        collection.items[0].run_by = None;
         collection.items[1]
             .alerts
             .push((crate::rules::RuleId::HiddenProgram, "seen".into()));
@@ -463,11 +539,63 @@ mod tests {
     }
 
     #[test]
+    fn only_a_private_group_may_read_roots_results() {
+        let passwd = "root:x:0:0::/root:/bin/bash\nu:x:1000:1000::/home/u:/bin/bash\nv:x:1001:100::/home/v:/bin/bash\nw:x:1002:100::/home/w:/bin/bash\n";
+        let group = "root:x:0:\nu:x:1000:\nusers:x:100:\nwheel:x:998:u\n";
+        assert_eq!(
+            super::private_group(1000, group, passwd).as_deref(),
+            Some("u")
+        );
+        assert_eq!(super::private_group(100, group, passwd), None);
+        assert_eq!(super::private_group(998, group, passwd), None);
+    }
+
+    #[test]
     fn malformed_or_foreign_output_is_refused() {
         assert!(from_json("not json").is_err());
         assert!(from_json(r#"{"version":2,"items":[]}"#).is_err());
         let escaping = r#"{"version":1,"items":[{"path":"../etc/x","category":"sudo","tier":"unknown","body":{"kind":"undecodable"},"runs":[],"notes":[],"alerts":[]}]}"#;
-        assert!(from_json(escaping).is_err());
+        // A bad item is left out; the rest of root's results still count.
+        assert!(from_json(escaping).unwrap().items.is_empty());
+    }
+
+    #[test]
+    fn what_root_reached_by_following_keeps_only_its_hash() {
+        let dir = crate::test_support::TempDir::new("root-withheld");
+        std::fs::write(dir.path().join("secret"), "root:$6$hash:\n").unwrap();
+        std::fs::set_permissions(
+            dir.path().join("secret"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("public"), "echo hi\n").unwrap();
+        std::fs::set_permissions(
+            dir.path().join("public"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+        )
+        .unwrap();
+        // Named by a crontab line: followed, so a private file stays home.
+        let secret = item(
+            "secret",
+            Origin::Root,
+            Tier::Edited,
+            Body::Text("root:$6$hash:\n".into()),
+        );
+        assert_eq!(
+            super::withheld(&secret, dir.path()).body,
+            Body::Binary(super::WITHHELD)
+        );
+        let public = item(
+            "public",
+            Origin::Root,
+            Tier::Unknown,
+            Body::Text("echo hi\n".into()),
+        );
+        assert_eq!(super::withheld(&public, dir.path()).body, public.body);
+        // A file of the catalog itself keeps its content.
+        let mut direct = secret.clone();
+        direct.run_by = None;
+        assert_eq!(super::withheld(&direct, dir.path()).body, direct.body);
     }
 
     #[test]
