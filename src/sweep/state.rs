@@ -150,8 +150,9 @@ pub fn diff(previous: &Remembered, current: &Remembered) -> Vec<(Change, String)
     for (label, fingerprint) in current {
         match previous.get(label) {
             None => changes.push((Change::New, label.clone())),
-            // What could not be read before is no change once it can be.
-            Some(old) if old != fingerprint && old != UNREAD => {
+            // What could not be read before is no change once it can be,
+            // unless it now raises an alert.
+            Some(old) if old != fingerprint && (old != UNREAD || fingerprint.contains('+')) => {
                 changes.push((Change::Changed, label.clone()));
             }
             Some(_) => {}
@@ -202,6 +203,7 @@ mod tests {
             ("b".into(), "2".into()),
             ("c".into(), "3".into()),
             ("e".into(), "-".into()),
+            ("f".into(), "-".into()),
         ]);
         let current = Remembered::from([
             ("a".into(), "1".into()),
@@ -209,13 +211,16 @@ mod tests {
             ("d".into(), "4".into()),
             // Unreadable before, read now (root's results arrived): no change.
             ("e".into(), "5".into()),
+            // ... unless it now raises an alert.
+            ("f".into(), "6+keyboard-reader".into()),
         ]);
         assert_eq!(
             diff(&previous, &current),
             [
                 (Change::Changed, "b".to_string()),
                 (Change::Removed, "c".to_string()),
-                (Change::New, "d".to_string())
+                (Change::New, "d".to_string()),
+                (Change::Changed, "f".to_string())
             ]
         );
     }

@@ -87,12 +87,10 @@ const SECURITY_BITS: u32 = 0o6022;
 
 /// The tier of `path` (relative to `/`).
 pub fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex) -> Tier {
-    // Guardian itself is installed with `pacman -U`, so it is foreign; its
-    // own files (which the pacman gate lets no other package ship) are as
-    // trusted as the sweep that reads them.
+    // Guardian itself is installed with `pacman -U`, so it is foreign; the
+    // files it ships, unchanged, are as trusted as the sweep that reads them.
     let packaged = |index: &PackageIndex, package: &str| {
-        if index.is_foreign(package) && !(package == GUARDIAN && path.contains("omarchy-guardian"))
-        {
+        if index.is_foreign(package) && !(package == GUARDIAN && is_guardians_own(path, observed)) {
             Tier::UserBuilt
         } else {
             Tier::Vendor
@@ -151,6 +149,37 @@ pub fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex) -> Tie
 }
 
 const GUARDIAN: &str = "omarchy-guardian";
+
+/// What the omarchy-guardian package ships (`packaging/arch/PKGBUILD`).
+const GUARDIANS_OWN: &[&str] = &[
+    "usr/bin/omarchy-guardian",
+    "usr/lib/omarchy-guardian/",
+    "usr/share/omarchy-guardian/",
+    "usr/share/doc/omarchy-guardian/",
+    "usr/lib/systemd/user/omarchy-guardian-sweep.service",
+    "usr/lib/systemd/user/omarchy-guardian-sweep.timer",
+    "usr/lib/systemd/system/omarchy-guardian-sweep-collect.service",
+    "usr/lib/systemd/system/omarchy-guardian-sweep-collect.timer",
+    "usr/share/applications/omarchy-guardian.desktop",
+    "usr/share/applications/omarchy-guardian-ask.desktop",
+    "usr/share/icons/hicolor/scalable/apps/omarchy-guardian.svg",
+    "usr/share/icons/hicolor/scalable/apps/omarchy-guardian-alert.svg",
+    "usr/share/icons/hicolor/scalable/apps/omarchy-guardian-off.svg",
+];
+
+/// Whether `path` is one Guardian ships, and not set-id: a package that
+/// merely takes Guardian's name gets no trust for anything else.
+fn is_guardians_own(path: &str, observed: Observed<'_>) -> bool {
+    let set_id = matches!(observed, Observed::File { mode, .. } if mode & 0o6000 != 0);
+    !set_id
+        && GUARDIANS_OWN.iter().any(|own| {
+            if own.ends_with('/') {
+                path.starts_with(own)
+            } else {
+                path == *own
+            }
+        })
+}
 
 /// Packaged units that give a root shell without a password when enabled.
 const ROOT_SHELL_UNITS: &[&str] = &["debug-shell.service", "emergency.service", "rescue.service"];
@@ -460,7 +489,23 @@ mod tests {
             ),
             Tier::Vendor
         );
-        // Only under its own names.
+        // Only what Guardian ships, and never set-id.
         assert_eq!(classify("usr/bin/other", file, &index), Tier::UserBuilt);
+        index.add_for_test(
+            "omarchy-guardian",
+            &format!(
+                "#mtree\n./usr/lib/omarchy-guardian/helper type=file mode=4755 sha256digest={abc}\n"
+            ),
+            &[],
+        );
+        let setuid = Observed::File {
+            sha256: &abc,
+            mode: 0o4755,
+            size: 3,
+        };
+        assert_eq!(
+            classify("usr/lib/omarchy-guardian/helper", setuid, &index),
+            Tier::UserBuilt
+        );
     }
 }
