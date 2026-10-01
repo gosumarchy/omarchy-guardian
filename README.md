@@ -84,6 +84,7 @@ omarchy-guardian scan ./downloaded-project
 omarchy-guardian scan --thorough --hashes ./theme-checkout
 omarchy-guardian guard --thorough ./aur-build-directory -- makepkg --noconfirm
 omarchy-guardian sandbox ./theme-checkout -- /usr/bin/true
+omarchy-guardian sweep
 ```
 
 - `scan` reviews a file or directory and prints a report.
@@ -98,6 +99,9 @@ omarchy-guardian sandbox ./theme-checkout -- /usr/bin/true
   the copy matches the reviewed snapshot, and runs the command in Bubblewrap
   with the network isolated, no host home directory and a read-only system.
   It is a behaviour smoke test, not a dynamic malware detector.
+- `sweep` checks what already runs on its own on this machine (see
+  [System sweep](#system-sweep)). `--root` also checks what only root can
+  read, `--all` lists trusted items too, `--json` prints one JSON document.
 - `--identity ID` or `--unit DIR ID` (repeatable) on `scan`, `guard` and
   `sandbox` name what is reviewed for the review memory (see
   [How the review scales](#how-the-review-scales)); `omarchy-guardian forget
@@ -110,6 +114,46 @@ under `ai = required`, a declined confirmation, or a usage error. Once `guard`
 or `sandbox` starts the command, the exit code is the command's own (128 +
 signal if it was killed). Guardian announces on stderr when it starts the
 command, so its own blocks can be told apart from the command's failures.
+
+## System sweep
+
+`omarchy-guardian sweep` looks at what already runs on its own, the way
+Objective-See's KnockKnock does on macOS: every auto-run location the pacman
+gate knows (systemd units and their enable links, drop-ins and generators,
+pacman hooks, udev, modprobe, PAM, sudo and polkit rules, shell start-up
+files, cron, autostart, D-Bus services, initcpio, the Limine config) and, in
+your home, user services, autostart entries, shell files, the Hyprland Lua
+configuration (and what `exec_on_start` starts), Omarchy hooks, SSH and git
+configuration, and programs in `~/.local/bin` named like system commands. It
+follows links and what each file runs, so a trusted service running a
+replaced binary, or an interpreter running a script, is checked too.
+
+Each item is judged against pacman's own records (no network, no hash
+lookups):
+
+| Tier | Meaning | Shown |
+|---|---|---|
+| package | Exactly what a repository package installed | with `--all` |
+| inert | A masked unit (link to `/dev/null`) or an empty file | with `--all` |
+| copy | Identical to a file a repository package ships (Omarchy's `etc-overrides`) | with `--all` |
+| user-built | From a package of no configured repository (AUR, `pacman -U`) | yes |
+| edited | A package's configuration file, changed as configuration is meant to be | yes |
+| modified | A package's file that is no longer what the package shipped | yes, and a high finding |
+| unknown | No package installed it | yes |
+
+Everything shown that holds text goes through the local rules and the AI
+review (class `system`), with the review memory, so a repeated sweep of an
+unchanged system makes no AI call. SSH and git files in a home directory are
+checked locally only and never sent to the AI. Binaries no package vouches
+for are named to the AI by format and hash but never run or uploaded.
+
+Some files only root can read (the sudoers file and drop-ins, polkit rules,
+root's crontab, shell files and keys, the Limine config). Without root, the
+sweep lists them and is **incomplete** (exit 2). `sweep --root` asks for the
+sudo password and runs a root collector that only reads: it never runs what
+it finds, never reads `/etc/shadow` or private keys, makes no AI call and
+writes nothing; it hands the items no package vouches for back to your own
+sweep, which judges them with your settings.
 
 ## Settings app
 

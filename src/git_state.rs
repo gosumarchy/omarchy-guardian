@@ -86,6 +86,10 @@ pub fn executing_keys(text: &str) -> Vec<(usize, String)> {
 
 fn runs_command(section: &str, has_subsection: bool, key: &str, value: &str) -> bool {
     let value = value.trim_matches('"');
+    // An empty value clears a list (`credential.helper =`); it runs nothing.
+    if value.is_empty() {
+        return false;
+    }
     if section == "alias" {
         return value.starts_with('!');
     }
@@ -168,6 +172,7 @@ mod tests {
         );
         assert!(keys("[remote \"origin\"]\n\turl = https://h/r.git\n").is_empty());
         assert!(keys("[core]\n\thooksPath = .husky/_\n").is_empty());
+        assert!(keys("[credential]\n\thelper =\n").is_empty());
         assert_eq!(
             keys("[core]\n\thooksPath = ../../x\n"),
             ["core.hookspath = ../../x"]

@@ -67,6 +67,10 @@ pub enum Gap {
     AgentInputTooLarge,
     /// An install or build entry point larger than one AI request.
     EntryPointTooLarge(String),
+    /// A file the sweep could not read as this user.
+    RootOnly(String),
+    /// Something else that kept the sweep from seeing everything.
+    Sweep(String),
     /// A script, build or config file (or an executable file of unknown
     /// format) that holds binary data.
     Undecodable(String),
@@ -117,6 +121,11 @@ impl fmt::Display for Gap {
             Self::AgentInputTooLarge => {
                 f.write_str("source exceeds the AI review input limit (max_input_kib × max_chunks)")
             }
+            Self::Sweep(reason) => write!(f, "sweep: {reason}"),
+            Self::RootOnly(path) => write!(
+                f,
+                "{path}: only root can read it; run `omarchy-guardian sweep --root` to check it"
+            ),
             Self::EntryPointTooLarge(path) => write!(
                 f,
                 "{path}: an install or build entry point is larger than one AI request (max_input_kib); it cannot be reviewed in pieces"

@@ -26,6 +26,35 @@ pub enum Tier {
     Unknown,
 }
 
+impl Tier {
+    pub const ALL: [Self; 7] = [
+        Self::Vendor,
+        Self::Inert,
+        Self::Copied,
+        Self::UserBuilt,
+        Self::Edited,
+        Self::Modified,
+        Self::Unknown,
+    ];
+
+    /// A stable machine name.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Vendor => "package",
+            Self::Inert => "inert",
+            Self::Copied => "copy",
+            Self::UserBuilt => "user-built",
+            Self::Edited => "edited",
+            Self::Modified => "modified",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|tier| tier.name() == name)
+    }
+}
+
 /// What is on disk at a path.
 #[derive(Clone, Copy, Debug)]
 pub enum Observed<'a> {

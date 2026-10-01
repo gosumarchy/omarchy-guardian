@@ -22,6 +22,8 @@ pub enum RuleId {
     DirectIpNetworkRequest,
     DisabledTlsVerification,
     GitConfigCommand,
+    SshCommand,
+    ModifiedPackageFile,
 }
 
 /// How a rule decides whether a lowercased line matches.
@@ -152,7 +154,7 @@ const DISABLED_TLS: &[&str] = &[
 ];
 
 impl RuleId {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 14] = [
         Self::DownloadAndExecute,
         Self::EncodedCommandExecution,
         Self::CredentialFileAccess,
@@ -165,6 +167,8 @@ impl RuleId {
         Self::DirectIpNetworkRequest,
         Self::DisabledTlsVerification,
         Self::GitConfigCommand,
+        Self::SshCommand,
+        Self::ModifiedPackageFile,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -181,6 +185,8 @@ impl RuleId {
             Self::DirectIpNetworkRequest => "direct-ip-network-request",
             Self::DisabledTlsVerification => "disabled-tls-verification",
             Self::GitConfigCommand => "git-config-command",
+            Self::SshCommand => "ssh-command",
+            Self::ModifiedPackageFile => "modified-package-file",
         }
     }
 
@@ -189,7 +195,8 @@ impl RuleId {
             Self::DownloadAndExecute
             | Self::EncodedCommandExecution
             | Self::DestructiveSystemOperation
-            | Self::CredentialExfiltration => Severity::High,
+            | Self::CredentialExfiltration
+            | Self::ModifiedPackageFile => Severity::High,
             Self::CredentialFileAccess
             | Self::PersistenceModification
             | Self::ShellCommandExecution
@@ -197,7 +204,8 @@ impl RuleId {
             | Self::CleartextNetworkRequest
             | Self::DirectIpNetworkRequest
             | Self::DisabledTlsVerification
-            | Self::GitConfigCommand => Severity::Medium,
+            | Self::GitConfigCommand
+            | Self::SshCommand => Severity::Medium,
         }
     }
 
@@ -237,6 +245,12 @@ impl RuleId {
             Self::GitConfigCommand => {
                 "A git config in the tree names a command that git runs on later commands here (status, describe, diff)."
             }
+            Self::SshCommand => {
+                "An SSH file runs a command when someone logs in (command= or environment= on a key, or ~/.ssh/rc)."
+            }
+            Self::ModifiedPackageFile => {
+                "A file a package installed has been changed since; it is not what the package shipped."
+            }
         }
     }
 
@@ -252,7 +266,9 @@ impl RuleId {
             Self::CredentialExfiltration => Matcher::Custom(looks_like_credential_exfiltration),
             Self::CleartextNetworkRequest
             | Self::DirectIpNetworkRequest
-            | Self::GitConfigCommand => Matcher::Reported,
+            | Self::GitConfigCommand
+            | Self::SshCommand
+            | Self::ModifiedPackageFile => Matcher::Reported,
             Self::DisabledTlsVerification => Matcher::Patterns(DISABLED_TLS),
         }
     }
@@ -275,7 +291,9 @@ impl RuleId {
             | Self::DestructiveSystemOperation
             | Self::ShellCommandExecution
             | Self::CredentialExfiltration
-            | Self::GitConfigCommand => false,
+            | Self::GitConfigCommand
+            | Self::SshCommand
+            | Self::ModifiedPackageFile => false,
         }
     }
 

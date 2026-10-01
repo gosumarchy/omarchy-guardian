@@ -41,11 +41,72 @@ pub enum Category {
     Udev,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "shown by the system sweep, which comes next")
-)]
 impl Category {
+    pub const ALL: [Self; 25] = [
+        Self::Autostart,
+        Self::Boot,
+        Self::BootConfig,
+        Self::Cron,
+        Self::Dbus,
+        Self::Desktop,
+        Self::Environment,
+        Self::Git,
+        Self::Hyprland,
+        Self::Initramfs,
+        Self::Kernel,
+        Self::Linker,
+        Self::LocalBin,
+        Self::NetworkHook,
+        Self::OmarchyHook,
+        Self::PacmanHook,
+        Self::Pam,
+        Self::Polkit,
+        Self::Power,
+        Self::Shell,
+        Self::Ssh,
+        Self::Sudo,
+        Self::Systemd,
+        Self::SystemdGenerator,
+        Self::Udev,
+    ];
+
+    /// A stable machine name (`pam`, `systemd-generator`).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Autostart => "autostart",
+            Self::Boot => "boot",
+            Self::BootConfig => "boot-config",
+            Self::Cron => "cron",
+            Self::Dbus => "dbus",
+            Self::Desktop => "desktop",
+            Self::Environment => "environment",
+            Self::Git => "git",
+            Self::Hyprland => "hyprland",
+            Self::Initramfs => "initramfs",
+            Self::Kernel => "kernel",
+            Self::Linker => "linker",
+            Self::LocalBin => "local-bin",
+            Self::NetworkHook => "network-hook",
+            Self::OmarchyHook => "omarchy-hook",
+            Self::PacmanHook => "pacman-hook",
+            Self::Pam => "pam",
+            Self::Polkit => "polkit",
+            Self::Power => "power",
+            Self::Shell => "shell",
+            Self::Ssh => "ssh",
+            Self::Sudo => "sudo",
+            Self::Systemd => "systemd",
+            Self::SystemdGenerator => "systemd-generator",
+            Self::Udev => "udev",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|category| category.name() == name)
+    }
+
     /// A short name for headings.
     pub const fn label(self) -> &'static str {
         match self {
@@ -331,10 +392,6 @@ pub const SYSTEM: &[Location] = &[
 ];
 
 /// System locations no package should ship into, looked at by the sweep only.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read by the system sweep, which comes next")
-)]
 pub const SYSTEM_SWEEP: &[Location] = &[
     // PAM modules: a `.so` every login loads.
     location("usr/lib/security/", Kind::Directory, Category::Pam),
@@ -344,10 +401,6 @@ pub const SYSTEM_SWEEP: &[Location] = &[
 ];
 
 /// Locations in a home directory, relative to it.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read by the system sweep, which comes next")
-)]
 pub const USER: &[Location] = &[
     location(".config/systemd/user/", Kind::Directory, Category::Systemd),
     location(
@@ -539,6 +592,9 @@ mod tests {
             assert!(seen.insert(location.path), "{}", location.path);
             assert!(!location.category.label().is_empty());
             assert!(!location.category.when().is_empty());
+        }
+        for category in Category::ALL {
+            assert_eq!(Category::from_name(category.name()), Some(category));
         }
         assert_eq!(
             system_location("etc/udev/rules.d/99-x.rules").map(|found| found.category),
