@@ -96,6 +96,11 @@ pub fn save_allowed(directory: &Path, allowed: &Remembered) -> Result<(), String
     write(&directory.join(ALLOWED), allowed)
 }
 
+/// Whether a sweep has remembered anything yet.
+pub fn has_baseline(directory: &Path) -> bool {
+    directory.join(BASELINE).is_file()
+}
+
 pub fn baseline(directory: &Path) -> Remembered {
     read(&directory.join(BASELINE))
 }
@@ -145,7 +150,11 @@ pub fn diff(previous: &Remembered, current: &Remembered) -> Vec<(Change, String)
     for (label, fingerprint) in current {
         match previous.get(label) {
             None => changes.push((Change::New, label.clone())),
-            Some(old) if old != fingerprint => changes.push((Change::Changed, label.clone())),
+            // What could not be read before is no change once it can be,
+            // unless it now raises an alert.
+            Some(old) if old != fingerprint && (old != UNREAD || fingerprint.contains('+')) => {
+                changes.push((Change::Changed, label.clone()));
+            }
             Some(_) => {}
         }
     }
@@ -193,18 +202,25 @@ mod tests {
             ("a".into(), "1".into()),
             ("b".into(), "2".into()),
             ("c".into(), "3".into()),
+            ("e".into(), "-".into()),
+            ("f".into(), "-".into()),
         ]);
         let current = Remembered::from([
             ("a".into(), "1".into()),
             ("b".into(), "9".into()),
             ("d".into(), "4".into()),
+            // Unreadable before, read now (root's results arrived): no change.
+            ("e".into(), "5".into()),
+            // ... unless it now raises an alert.
+            ("f".into(), "6+keyboard-reader".into()),
         ]);
         assert_eq!(
             diff(&previous, &current),
             [
                 (Change::Changed, "b".to_string()),
                 (Change::Removed, "c".to_string()),
-                (Change::New, "d".to_string())
+                (Change::New, "d".to_string()),
+                (Change::Changed, "f".to_string())
             ]
         );
     }

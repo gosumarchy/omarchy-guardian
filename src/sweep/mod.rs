@@ -32,7 +32,7 @@ use crate::config::Settings;
 use crate::config::model::{RootConsent, SourceClass};
 use crate::engine::store::{self, Store};
 use crate::notify;
-use crate::report::{Decision, Gap};
+use crate::report::{Blocked, Decision, Gap};
 use crate::review::ReviewContext;
 use crate::tools::OpenCode;
 use collect::{Collection, Origin, Scope};
@@ -251,6 +251,36 @@ fn remembered(
         .collect()
 }
 
+/// What a scheduled sweep tells the desktop: new or changed items, or
+/// for the first sweep (nothing to compare with) whether it found
+/// something or could not finish.
+fn notify_scheduled(first: bool, decision: Decision, changes: &[(Change, String)]) {
+    let arrived = changes
+        .iter()
+        .filter(|(change, _)| *change != Change::Removed)
+        .count();
+    // The first sweep has nothing to compare with: everything is "new".
+    // It says only whether it found something.
+    if first {
+        match decision {
+            Decision::Blocked(Blocked::Findings) => notify::found(
+                "something to look at in its first system sweep",
+                "the first system sweep found startup items with alerts; run `omarchy-guardian sweep` for the full list",
+            ),
+            Decision::Blocked(blocked) => notify::found(
+                "that its first system sweep could not finish",
+                notify::reason(blocked),
+            ),
+            Decision::Clear | Decision::Warned | Decision::Limited => {}
+        }
+    } else if arrived > 0 {
+        notify::found(
+            &format!("{arrived} new or changed startup item(s)"),
+            "the daily system sweep found something that runs on its own and that no package vouches for",
+        );
+    }
+}
+
 /// `omarchy-guardian sweep`.
 fn run(options: Options, settings: &Settings) -> ExitCode {
     let home = home();
@@ -298,6 +328,9 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
         decision => decision,
     };
 
+    let first = directory
+        .as_ref()
+        .is_some_and(|directory| !state::has_baseline(directory));
     let previous = directory
         .as_ref()
         .map(|directory| state::baseline(directory));
@@ -332,18 +365,16 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
         && let Err(reason) = state::save_baseline(directory, &current)
     {
         errln!("omarchy-guardian sweep: {reason}");
-    }
-    if options.scheduled {
-        let arrived = changes
-            .iter()
-            .filter(|(change, _)| *change != Change::Removed)
-            .count();
-        if arrived > 0 {
+        // Without it the next sweep would see nothing as new.
+        if options.scheduled {
             notify::found(
-                &format!("{arrived} new or changed startup item(s)"),
-                "the daily system sweep found something that runs on its own and that no package vouches for",
+                "that it cannot remember what it saw",
+                "the daily system sweep could not save what it found, so it cannot tell what is new",
             );
         }
+    }
+    if options.scheduled {
+        notify_scheduled(first, decision, &changes);
     }
     decision.exit_code()
 }

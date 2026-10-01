@@ -199,7 +199,14 @@ fn run_plan(paths: &Paths, plan: &Plan) -> Result<String, String> {
                     });
                 }
             }
-            Step::AskSweepRoot => outln!("{}", ask_sweep_root()?),
+            // A failed root setup (a cancelled sudo prompt) must not stop
+            // the rest of the plan, the daily sweep included.
+            Step::AskSweepRoot => match ask_sweep_root() {
+                Ok(message) => outln!("{message}"),
+                Err(reason) => outln!(
+                    "Root checks not set up ({reason}); run `omarchy-guardian protect` again to retry."
+                ),
+            },
             Step::RemoveInterceptor
             | Step::AddMenuEntry
             | Step::RemoveMenuEntry
