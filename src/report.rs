@@ -421,7 +421,7 @@ impl Report {
         outln!();
         outln!("{}", self.verdict_box(decision, width, painter));
         let mut rows = Vec::new();
-        self.coverage_fields(show_hashes, &mut rows);
+        self.coverage_fields(&mut rows);
         for note in &self.notes {
             rows.push(("Review memory", vec![Span::plain(shown(note))]));
         }
@@ -431,6 +431,9 @@ impl Report {
             rows.push(("Local checks", vec![Span::new("no matches", "32")]));
         }
         outln!("{}", layout::fields(&rows, width, painter));
+        if show_hashes {
+            self.print_hashes();
+        }
         self.print_findings(width, painter);
 
         for gap in &self.gaps {
@@ -495,7 +498,7 @@ impl Report {
         layout::boxed(&title, &lines, width, edge, painter)
     }
 
-    fn coverage_fields(&self, show_hashes: bool, rows: &mut Vec<(&'static str, Vec<Span>)>) {
+    fn coverage_fields(&self, rows: &mut Vec<(&'static str, Vec<Span>)>) {
         let lossy = if self.lossy_files > 0 {
             format!(
                 " ({} decoded with replacement characters)",
@@ -534,23 +537,11 @@ impl Report {
                 "SHA-256 manifest ({} file(s) hashed)",
                 files.len()
             ))];
-            spans.push(Span::new(self.snapshot.manifest_digest().to_string(), "36"));
+            spans.push(Span::whole(
+                self.snapshot.manifest_digest().to_string(),
+                "36",
+            ));
             rows.push(("Integrity", spans));
-            if show_hashes {
-                let hashes = files
-                    .iter()
-                    .map(|file| {
-                        let kind = match file.kind {
-                            FileKind::Text => "reviewed-text",
-                            FileKind::Symlink => "symlink",
-                            FileKind::Binary | FileKind::OversizedText => "hash-only",
-                            FileKind::Undecodable => "undecodable",
-                        };
-                        Span::plain(format!("{}  {kind}  {}", file.sha256, shown(&file.path)))
-                    })
-                    .collect();
-                rows.push(("Per-file SHA-256", hashes));
-            }
         }
 
         let withheld = self.withheld_count();
@@ -561,6 +552,20 @@ impl Report {
                     "{withheld} sensitive-looking file(s) withheld from the OpenCode provider"
                 ))],
             ));
+        }
+    }
+
+    /// One line per file, to copy or compare line by line.
+    fn print_hashes(&self) {
+        outln!("\nPer-file SHA-256:");
+        for file in self.snapshot.files() {
+            let kind = match file.kind {
+                FileKind::Text => "reviewed-text",
+                FileKind::Symlink => "symlink",
+                FileKind::Binary | FileKind::OversizedText => "hash-only",
+                FileKind::Undecodable => "undecodable",
+            };
+            outln!("  {}  {kind}  {}", file.sha256, shown(&file.path));
         }
     }
 

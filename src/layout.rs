@@ -105,13 +105,16 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut line = String::new();
     let mut used = 0;
-    for word in text.split(' ').filter(|word| !word.is_empty()) {
+    for (spaces, word) in words(text) {
+        // Spaces keep their run inside a line, and indent the first.
+        let gap = if used > 0 || lines.is_empty() {
+            spaces
+        } else {
+            0
+        };
         let word_width = text_width(word);
-        let gap = usize::from(used > 0);
         if used + gap + word_width <= width {
-            if gap == 1 {
-                line.push(' ');
-            }
+            line.push_str(&" ".repeat(gap));
             line.push_str(word);
             used += gap + word_width;
             continue;
@@ -151,6 +154,21 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// Each word of `text` and how many spaces come before it.
+fn words(text: &str) -> Vec<(usize, &str)> {
+    let mut words = Vec::new();
+    let mut spaces = 0;
+    for word in text.split(' ') {
+        if word.is_empty() {
+            spaces += 1;
+        } else {
+            words.push((spaces, word));
+            spaces = 1;
+        }
+    }
+    words
+}
+
 /// Where to cut `word` to fill `room` columns: after the last `/` that
 /// fits, when that fills at least half the room, or else as far as fits.
 /// Nothing fits is 0, unless `must` (a line of its own) takes one character.
@@ -186,6 +204,8 @@ fn pad(text: &str, width: usize) -> String {
 pub struct Span {
     pub text: String,
     pub color: &'static str,
+    /// Never wrapped (a digest someone copies): it overflows instead.
+    pub whole: bool,
 }
 
 impl Span {
@@ -193,6 +213,14 @@ impl Span {
         Self {
             text: text.into(),
             color,
+            whole: false,
+        }
+    }
+
+    pub fn whole(text: impl Into<String>, color: &'static str) -> Self {
+        Self {
+            whole: true,
+            ..Self::new(text, color)
         }
     }
 
@@ -206,9 +234,13 @@ fn wrap_spans(spans: &[Span], width: usize) -> Vec<Span> {
     spans
         .iter()
         .flat_map(|span| {
+            if span.whole {
+                return vec![span.clone()];
+            }
             wrap(&span.text, width)
                 .into_iter()
                 .map(|text| Span::new(text, span.color))
+                .collect()
         })
         .collect()
 }
@@ -365,10 +397,31 @@ impl Table {
     }
 }
 
+/// `text` cut to `width`, ending in `…` when cut.
+fn shorten(text: &str, width: usize) -> String {
+    if text_width(text) <= width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        let character_width = char_width(character);
+        if used + character_width + 1 > width {
+            break;
+        }
+        out.push(character);
+        used += character_width;
+    }
+    out.push('…');
+    out
+}
+
 /// A rounded box around `lines`, with `title` in its top edge; the edges
 /// take `color`.
 pub fn boxed(title: &str, lines: &[Span], width: usize, color: &str, painter: Painter) -> String {
     let inner = width.saturating_sub(4);
+    let title = shorten(title, width.saturating_sub(6));
+    let title = title.as_str();
     let title_width = text_width(title);
     let top_rest = width.saturating_sub(title_width + 5);
     let mut out = vec![format!(
@@ -432,6 +485,8 @@ mod tests {
             ["/a/", "very/", "long/", "path"]
         );
         assert_eq!(wrap("x  y", 9), ["x  y"]);
+        // Runs of spaces and indentation survive wrapping.
+        assert_eq!(wrap("  rm  -rf   / now", 10), ["  rm  -rf", "/ now"]);
         assert_eq!(
             wrap("→ /home/u/.config/systemd/user/v.service", 20),
             ["→ /home/u/.config/", "systemd/user/", "v.service"]
@@ -478,6 +533,17 @@ mod tests {
             Painter::plain(),
         );
         assert!(text.starts_with("  Key  a b c"));
+        let long = "x".repeat(50);
+        for line in boxed(&long, &[Span::plain("y")], 20, "", Painter::plain()).lines() {
+            assert_eq!(text_width(line), 20, "{line:?}");
+        }
+        let digest = "a".repeat(64);
+        let text = fields(
+            &[("Integrity", vec![Span::whole(digest.as_str(), "36")])],
+            60,
+            Painter::plain(),
+        );
+        assert!(text.contains(&digest));
         assert_eq!(bar(1, 2, 10), ("█".repeat(5), "░".repeat(5)));
         assert_eq!(bar(0, 0, 4).0, "█".repeat(4));
     }
