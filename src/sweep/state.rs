@@ -33,7 +33,7 @@ pub fn fingerprint(item: &Item) -> String {
     let content = match (&item.sha256, &item.body) {
         (Some(digest), _) => digest.to_string(),
         (None, super::collect::Body::Link(target)) => format!("link:{target}"),
-        (None, _) => return UNREAD.into(),
+        (None, _) => UNREAD.into(),
     };
     // What the live checks saw is part of it: allowing a program that
     // autostarts does not allow it to start reading the keyboard.
@@ -47,7 +47,8 @@ pub fn fingerprint(item: &Item) -> String {
     }
 }
 
-/// The fingerprint of an item that could not be read.
+/// The fingerprint of an item that could not be read (and raised no
+/// alert): only this one carries over a previous fingerprint.
 pub const UNREAD: &str = "-";
 
 /// Label to fingerprint.

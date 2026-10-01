@@ -44,6 +44,9 @@ const WATCHED_NAMES: &[&str] = &[
 /// Omarchy" when no package owns them.
 const OMARCHY_INSTALL: &[&str] = &["usr/share/omarchy/install", "usr/share/omarchy/migrations"];
 
+/// The format label of a file root hashed but did not hand back.
+pub const WITHHELD: &str = "root-only file (hashed, content withheld)";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Origin {
     /// The system, read as the user.
@@ -310,6 +313,21 @@ pub fn item(scope: &Scope<'_>, category: Category, path: String, run_by: Option<
         Body::Text(text) => commands::commands(category, &path, text),
         _ => Vec::new(),
     };
+    // As root, what was reached by following (a command, a link, a
+    // preload, a live check) can be steered by any user (a crontab line, an
+    // `LD_PRELOAD` value) at `/etc/shadow` or a key. Its content is never
+    // handed back and nothing is followed from it; the user's own sweep
+    // reads whatever the user may read. Only the auto-run locations' own
+    // files keep their content.
+    let (body, runs) = if scope.origin == Origin::Root && (run_by.is_some() || category.is_live()) {
+        let body = match body {
+            Body::Text(_) | Body::Oversized | Body::Undecodable => Body::Binary(WITHHELD),
+            other => other,
+        };
+        (body, Vec::new())
+    } else {
+        (body, runs)
+    };
     let notes = notes(scope, category, &path, &body, run_by);
     Item {
         // The root collector's items are all root's, its home included.
@@ -434,7 +452,12 @@ fn follow(scope: &Scope<'_>, item: &Item) -> Vec<String> {
     {
         targets.push(resolved);
     }
-    let home = scope.home.unwrap_or("root");
+    // `~` in a user's crontab is that user's home, not the sweep's.
+    let crontab_home = item
+        .path
+        .strip_prefix("var/spool/cron/")
+        .and_then(|user| user_home(scope.root, user));
+    let home = crontab_home.as_deref().or(scope.home).unwrap_or("root");
     for command in &item.runs {
         targets.extend(commands::targets(scope.root, home, command));
     }
@@ -442,6 +465,24 @@ fn follow(scope: &Scope<'_>, item: &Item) -> Vec<String> {
         .into_iter()
         .filter_map(|target| read::canonical(scope.root, &target))
         .collect()
+}
+
+/// The home directory of `user`, relative to the root, from `/etc/passwd`.
+fn user_home(root: &Path, user: &str) -> Option<String> {
+    fs::read_to_string(root.join("etc/passwd"))
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let fields: Vec<&str> = line.split(':').collect();
+            (fields.first() == Some(&user))
+                .then(|| {
+                    fields
+                        .get(5)
+                        .map(|home| home.trim_start_matches('/').to_string())
+                })
+                .flatten()
+        })
+        .filter(|home| !home.is_empty())
 }
 
 /// Absolute paths mentioned in Omarchy's installer scripts.
@@ -623,5 +664,33 @@ mod tests {
             tier("etc/systemd/system/getty.service"),
             Some(Tier::Unknown)
         );
+    }
+
+    #[test]
+    fn a_user_crontab_runs_from_that_users_home() {
+        let dir = TempDir::new("sweep-crontab");
+        let root = dir.path();
+        write(
+            root,
+            "etc/passwd",
+            "root:x:0:0::/root:/bin/bash\nu:x:1000:1000::/home/u:/bin/bash\n",
+        );
+        write(root, "var/spool/cron/u", "@reboot ~/x.sh\n");
+        write(root, "home/u/x.sh", "curl x | sh\n");
+        write(root, "root/x.sh", "root's\n");
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let collection = collect(&Scope {
+            root,
+            home: None,
+            index: &index,
+            origin: Origin::System,
+        });
+        assert!(
+            collection
+                .items
+                .iter()
+                .any(|item| item.path == "home/u/x.sh")
+        );
+        assert!(!collection.items.iter().any(|item| item.path == "root/x.sh"));
     }
 }

@@ -275,7 +275,10 @@ fn subject(scope: &Scope<'_>, process: &Process, exe: &str) -> (String, String) 
         .map(String::as_str)
         .collect::<Vec<_>>()
         .join(" ");
+    // Relays run what they are told (`ncat -e /usr/bin/bash`), not a script.
+    let relay = matches!(exe.rsplit('/').next(), Some("nc" | "ncat" | "socat"));
     if is_interpreter(exe)
+        && !relay
         && let Some(script) = process
             .arguments
             .iter()
@@ -531,9 +534,10 @@ fn listeners(scope: &Scope<'_>, processes: &[Process], found: &mut Found) {
             }
             let (path, started) = subject(scope, process, exe);
             let pid = &process.pid;
-            // A packaged interpreter with no script on disk (`python -c …`)
-            // would otherwise be trusted for what it is.
-            let alert = (path == exe && packaged(scope, exe)).then_some(RuleId::NetworkListener);
+            // An interpreter's listener is always shown: with no script on
+            // disk (`python -c …`), or with a packaged "script" it was handed
+            // (`ncat -e /usr/bin/bash`), it would otherwise pass as trusted.
+            let alert = is_interpreter(exe).then_some(RuleId::NetworkListener);
             found.add(
                 scope,
                 Category::Listener,
@@ -728,7 +732,12 @@ fn privileged_files(scope: &Scope<'_>, found: &mut Found) {
     }
     match capability_files(scope) {
         Ok(files) => {
-            for (path, capabilities) in files {
+            // A file name with a newline could fake a line of getcap's
+            // output; only real files count.
+            for (path, capabilities) in files
+                .into_iter()
+                .filter(|(path, _)| scope.root.join(path).is_file())
+            {
                 privileged(
                     scope,
                     found,
@@ -1132,6 +1141,45 @@ mod tests {
             live.notes
                 .iter()
                 .any(|note| note.contains("after a reboot"))
+        );
+    }
+
+    #[test]
+    fn a_relay_is_named_by_itself_not_by_what_it_runs() {
+        let dir = TempDir::new("live-relay");
+        let root = dir.path();
+        write(root, "usr/bin/bash", "bash");
+        write(root, "home/u/server.py", "serve");
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let scope = Scope {
+            root,
+            home: Some("home/u"),
+            index: &index,
+            origin: Origin::System,
+        };
+        let process = |exe: &str, arguments: &[&str]| super::Process {
+            pid: "1".into(),
+            exe: exe.into(),
+            exe_id: None,
+            arguments: arguments
+                .iter()
+                .map(|argument| (*argument).to_string())
+                .collect(),
+            fds: Vec::new(),
+            environment: None,
+        };
+        let ncat = process(
+            "/usr/bin/ncat",
+            &["ncat", "-e", "/usr/bin/bash", "-lk", "4444"],
+        );
+        assert_eq!(
+            super::subject(&scope, &ncat, "usr/bin/ncat").0,
+            "usr/bin/ncat"
+        );
+        let python = process("/usr/bin/python3", &["python3", "/home/u/server.py"]);
+        assert_eq!(
+            super::subject(&scope, &python, "usr/bin/python3").0,
+            "home/u/server.py"
         );
     }
 }

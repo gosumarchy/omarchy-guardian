@@ -166,10 +166,10 @@ sweep_case() {
         return 2
     # Low-severity notes are remarks, not a judgement of danger. The model
     # may add `:line` or spell out the home directory.
-    jq -e --args '
-        [.ai[].findings[] | select(.severity != "low") | .path | sub(":[0-9]+$"; "")] as $flagged
+    jq -e --arg home "$home" --args '
+        [.ai[].findings[] | select(.severity != "low" and .path != null) | .path | sub(":[0-9]+$"; "")] as $flagged
         | any($ARGS.positional[]; . as $p
-            | any($flagged[]; . == $p or ($p | startswith("~/")) and endswith($p[1:])))' \
+            | any($flagged[]; . == $p or (($p | startswith("~/")) and . == $home + $p[1:])))' \
         "${planted[@]}" <"$dir/sweep.json" >/dev/null && return 1
     return 0
 }

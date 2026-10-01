@@ -222,7 +222,7 @@ fn to_json(collection: &Collection) -> Json {
         .iter()
         .filter(|item| !item.is_trusted())
         .take(MAX_ITEMS)
-        .map(|item| item_json(&withheld(item, Path::new("/"))));
+        .map(item_json);
     Json::object([
         ("version", Json::from(VERSION)),
         ("items", Json::Array(items.collect())),
@@ -237,41 +237,6 @@ fn to_json(collection: &Collection) -> Json {
             ),
         ),
     ])
-}
-
-/// The format label of a file root hashed but did not hand back.
-pub const WITHHELD: &str = "root-only file (hashed, content withheld)";
-
-/// What root may hand back of `item`. Root follows what files run and what
-/// processes preload, and those can be steered by any user (a crontab line,
-/// an `LD_PRELOAD` value) towards `/etc/shadow` or an SSH host key. So only
-/// what sits in the auto-run catalog itself (sudoers drop-ins, root's shell
-/// files) keeps its content; anything reached by following keeps only its
-/// hash, unless everyone may read it anyway.
-fn withheld(item: &Item, root: &Path) -> Item {
-    let followed = item.run_by.is_some()
-        || matches!(
-            item.category,
-            Category::Process
-                | Category::Listener
-                | Category::Input
-                | Category::Camera
-                | Category::KernelModule
-                | Category::Setuid
-        );
-    let world_readable =
-        fs::metadata(root.join(&item.path)).is_ok_and(|metadata| metadata.mode() & 0o004 != 0);
-    let mut item = item.clone();
-    if followed
-        && !world_readable
-        && matches!(
-            item.body,
-            Body::Text(_) | Body::Oversized | Body::Undecodable
-        )
-    {
-        item.body = Body::Binary(WITHHELD);
-    }
-    item
 }
 
 fn item_json(item: &Item) -> Json {
@@ -362,8 +327,8 @@ fn item_from_json(json: &Json) -> Option<Item> {
         // kept for the life of the run.
         "binary" => {
             let label = body_text("format")?;
-            Body::Binary(if label == WITHHELD {
-                WITHHELD
+            Body::Binary(if label == collect::WITHHELD {
+                collect::WITHHELD
             } else {
                 crate::content::Format::label_named(&label)
             })
@@ -472,9 +437,11 @@ pub fn from_root() -> Result<RootPart, String> {
 pub fn merge(collection: &mut Collection, part: RootPart) {
     // Root's view only fills in what the user could not read: root's
     // results may be a day old, and what the user read now is newer.
-    collection
-        .items
-        .retain(|item| item.origin == Origin::User || !matches!(item.body, Body::Unreadable(_)));
+    collection.items.retain(|item| {
+        item.origin == Origin::User
+            || !item.alerts.is_empty()
+            || !matches!(item.body, Body::Unreadable(_))
+    });
     collect::merge(collection, part.items);
     collection.truncated.extend(part.truncated);
 }
@@ -561,41 +528,35 @@ mod tests {
 
     #[test]
     fn what_root_reached_by_following_keeps_only_its_hash() {
+        use crate::sweep::collect::{WITHHELD, item as collect_item};
         let dir = crate::test_support::TempDir::new("root-withheld");
-        std::fs::write(dir.path().join("secret"), "root:$6$hash:\n").unwrap();
-        std::fs::set_permissions(
-            dir.path().join("secret"),
-            std::os::unix::fs::PermissionsExt::from_mode(0o600),
-        )
-        .unwrap();
-        std::fs::write(dir.path().join("public"), "echo hi\n").unwrap();
-        std::fs::set_permissions(
-            dir.path().join("public"),
-            std::os::unix::fs::PermissionsExt::from_mode(0o644),
-        )
-        .unwrap();
-        // Named by a crontab line: followed, so a private file stays home.
-        let secret = item(
-            "secret",
-            Origin::Root,
-            Tier::Edited,
-            Body::Text("root:$6$hash:\n".into()),
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("var/spool/cron")).unwrap();
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::write(root.join("etc/shadow"), "root:$6$hash:\n").unwrap();
+        std::fs::write(root.join("var/spool/cron/u"), "* * * * * /etc/shadow\n").unwrap();
+        let index =
+            crate::sweep::index::PackageIndex::with_foreign(std::collections::HashSet::new());
+        let scope = crate::sweep::collect::Scope {
+            root,
+            home: Some("root"),
+            index: &index,
+            origin: Origin::Root,
+        };
+        // A crontab line names it: followed, so its content stays home,
+        // whoever may read it, and nothing is followed from it.
+        let followed = collect_item(
+            &scope,
+            Category::Cron,
+            "etc/shadow".into(),
+            Some("var/spool/cron/u"),
         );
-        assert_eq!(
-            super::withheld(&secret, dir.path()).body,
-            Body::Binary(super::WITHHELD)
-        );
-        let public = item(
-            "public",
-            Origin::Root,
-            Tier::Unknown,
-            Body::Text("echo hi\n".into()),
-        );
-        assert_eq!(super::withheld(&public, dir.path()).body, public.body);
-        // A file of the catalog itself keeps its content.
-        let mut direct = secret.clone();
-        direct.run_by = None;
-        assert_eq!(super::withheld(&direct, dir.path()).body, direct.body);
+        assert_eq!(followed.body, Body::Binary(WITHHELD));
+        assert!(followed.runs.is_empty());
+        // The crontab itself is an auto-run file: its content travels.
+        let direct = collect_item(&scope, Category::Cron, "var/spool/cron/u".into(), None);
+        assert!(matches!(direct.body, Body::Text(_)));
+        assert_eq!(direct.runs, ["/etc/shadow"]);
     }
 
     #[test]
@@ -623,6 +584,17 @@ mod tests {
             ],
             truncated: Vec::new(),
         };
+        // The user's own live alert (a program in memory) stays.
+        let mut memory = item(
+            "memfd:payload",
+            Origin::System,
+            Tier::Unknown,
+            Body::Unreadable("runs only in memory".into()),
+        );
+        memory
+            .alerts
+            .push((crate::rules::RuleId::HiddenProgram, "seen".into()));
+        collection.items.push(memory);
         let root = item(
             "etc/sudoers.d/evil",
             Origin::Root,
@@ -643,7 +615,12 @@ mod tests {
             .collect();
         assert_eq!(
             paths,
-            ["etc/pam.d/x", "etc/sudoers.d/evil", "home/u/.bashrc"]
+            [
+                "etc/pam.d/x",
+                "etc/sudoers.d/evil",
+                "home/u/.bashrc",
+                "memfd:payload"
+            ]
         );
     }
 }
