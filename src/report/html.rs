@@ -28,6 +28,15 @@ pub fn collect(report: &Report, decision: Decision) {
         .push(section);
 }
 
+/// Remembers a section built elsewhere (the sweep's items), already
+/// escaped, for the page.
+pub fn collect_section(section: String) {
+    SECTIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(section);
+}
+
 /// The whole page: `title` and `detail` say what was blocked, `when` is a
 /// UTC time, `id` names the saved report for the ask link, and `fallback`
 /// is the printed output, shown when no report was collected (a gate that
@@ -45,14 +54,16 @@ pub fn page(title: &str, detail: &str, ran: Ran, when: &str, id: &str, fallback:
     } else {
         sections
     };
-    let (verb, word, tone) = if ran == Ran::AlreadyOnSystem {
-        ("Found", "FOUND", "amber")
-    } else {
-        ("Blocked", "BLOCKED", "red")
+    let (verb, word, tone) = match ran {
+        Ran::AlreadyOnSystem => ("Found", "FOUND", "amber"),
+        Ran::Swept { clear: false } => ("Checked", "FOUND", "amber"),
+        Ran::Swept { clear: true } => ("Checked", "CLEAR", "green"),
+        Ran::Nothing | Ran::RecipeToFetch => ("Blocked", "BLOCKED", "red"),
     };
     let what = title
         .strip_prefix("Guardian blocked ")
         .or_else(|| title.strip_prefix("Guardian found "))
+        .or_else(|| title.strip_prefix("Guardian checked "))
         .unwrap_or(title);
     format!(
         r#"<!doctype html>
@@ -107,6 +118,9 @@ const fn ran_text(ran: Ran) -> &'static str {
         }
         Ran::RecipeToFetch => {
             "Nothing was built or installed. The recipe (PKGBUILD) had passed review, and makepkg ran it to download and unpack the sources; Guardian stopped the build before any of the upstream code ran."
+        }
+        Ran::Swept { .. } => {
+            "You ran this sweep; nothing was blocked. Look at each item before you trust it; `omarchy-guardian sweep allow PATH` stops Guardian asking about one you know."
         }
         Ran::AlreadyOnSystem => {
             "These are already on this system; the sweep found them and nothing was blocked. Look at each before you trust it; `omarchy-guardian sweep allow PATH` stops Guardian asking about one you know."
@@ -558,6 +572,30 @@ mod tests {
         // The ask button comes right after the verdict, before the details
         // (the fallback output or the collected review sections).
         assert!(html.find("omarchy-guardian://ask/").unwrap() < html.find("<section").unwrap());
+    }
+
+    #[test]
+    fn a_requested_sweep_page_says_clear_or_found() {
+        let html = page(
+            "Guardian checked this system",
+            "d",
+            Ran::Swept { clear: true },
+            "now",
+            "1-2",
+            "",
+        );
+        assert!(html.contains("Checked this system") && html.contains("CLEAR"));
+        assert!(!html.contains("BLOCKED") && html.contains("You ran this sweep"));
+        let html = page(
+            "Guardian checked this system",
+            "d",
+            Ran::Swept { clear: false },
+            "now",
+            "1-2",
+            "",
+        );
+        assert!(html.contains("Checked this system") && html.contains("FOUND"));
+        assert!(!html.contains("BLOCKED") && !html.contains("Found this system"));
     }
 
     #[test]

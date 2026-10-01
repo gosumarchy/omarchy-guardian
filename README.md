@@ -223,8 +223,14 @@ omarchy-guardian sweep allow '~/.local/bin/claude'     # trust it as it is now
 omarchy-guardian sweep allow /root/.local/bin/claude   # root's items too
 omarchy-guardian sweep --all                           # allowed items show as "allowed"
 omarchy-guardian sweep forget '~/.local/bin/claude'    # stop trusting it (or: forget --all)
+omarchy-guardian sweep --report                        # save the report page and open it
 omarchy-guardian status --dismiss                      # clear the bar's alert
 ```
+
+`sweep --report` saves the same page a notification opens, with the items
+listed by area and an **Ask your AI agent** button, and prints the
+`omarchy-guardian ask <id>` that opens your agent on it. Use it to go
+through the list with your agent without waiting for the daily sweep.
 
 - Use the path exactly as the sweep prints it, with `~/` for your home
   (quoted, so the shell leaves the `~` alone).
