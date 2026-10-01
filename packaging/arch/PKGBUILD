@@ -6,7 +6,7 @@
 # to turn on the pacman hook, the AUR gate and the theme & plugin gate.
 
 pkgname=omarchy-guardian
-pkgver=0.5.0
+pkgver=0.5.1
 pkgrel=1
 pkgdesc='Reviews downloaded source, AUR builds, pacman scriptlets and Omarchy themes before they run'
 arch=('x86_64' 'aarch64')
