@@ -251,8 +251,15 @@ fn last_block(directory: &Path, now: u64) -> Option<LastBlock> {
 
 /// The newest report id (`<seconds>-<pid>`); ids sort by time.
 fn newest_report(directory: &Path) -> Option<String> {
-    fs::read_dir(directory)
-        .ok()?
+    report_ids(directory).into_iter().max()
+}
+
+/// Every saved report's id.
+fn report_ids(directory: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    entries
         .filter_map(Result::ok)
         .filter_map(|entry| {
             entry
@@ -261,7 +268,33 @@ fn newest_report(directory: &Path) -> Option<String> {
                 .strip_suffix(".html")
                 .map(str::to_string)
         })
-        .max()
+        .collect()
+}
+
+/// Records `id`, a report the user asked for, as seen, so it raises no
+/// alert; returns whether it did. Not while another report the bar would
+/// show is still waiting to be seen (one saved at the same moment by the
+/// daily sweep or a gate, say): that keeps the bar's attention. Reports
+/// too old for the bar to show do not count, and what is seen never moves
+/// back.
+pub fn mark_seen_unless_waiting(directory: &Path, id: &str, now: u64) -> bool {
+    let seen = fs::read_to_string(directory.join(SEEN)).unwrap_or_default();
+    let seen = seen.trim();
+    let waiting = report_ids(directory).into_iter().any(|other| {
+        other != id
+            && other.as_str() > seen
+            && other
+                .split_once('-')
+                .and_then(|(seconds, _)| seconds.parse::<u64>().ok())
+                .is_some_and(|seconds| now.saturating_sub(seconds) < RECENT_SECS)
+    });
+    if waiting {
+        return false;
+    }
+    if seen < id {
+        drop(fs::write(directory.join(SEEN), id));
+    }
+    true
 }
 
 /// Marks every report so far as seen, and refreshes the Waybar module.
@@ -302,8 +335,49 @@ pub fn refresh_waybar() {
 mod tests {
     use std::fs;
 
-    use super::{RECENT_SECS, SEEN, age, last_block, markup_safe};
+    use super::{RECENT_SECS, SEEN, age, last_block, mark_seen_unless_waiting, markup_safe};
     use crate::test_support::TempDir;
+
+    #[test]
+    fn a_requested_report_is_seen_unless_an_alert_is_waiting() {
+        let dir = TempDir::new("status-seen");
+        let now = 1_000_000;
+        let seen = || fs::read_to_string(dir.path().join(SEEN)).unwrap_or_default();
+        let save = |id: &str| fs::write(dir.path().join(format!("{id}.html")), "").unwrap();
+
+        // Nothing waiting: the requested report is seen.
+        save("999000-1");
+        assert!(mark_seen_unless_waiting(dir.path(), "999000-1", now));
+        assert_eq!(seen(), "999000-1");
+
+        // A recent alert nobody has seen keeps the bar's attention.
+        save("999100-7");
+        save("999200-1");
+        assert!(!mark_seen_unless_waiting(dir.path(), "999200-1", now));
+        assert_eq!(seen(), "999000-1");
+
+        // One too old for the bar to show does not hold it back.
+        let dir = TempDir::new("status-seen-old");
+        fs::write(dir.path().join("1-1.html"), "").unwrap();
+        fs::write(dir.path().join("999200-1.html"), "").unwrap();
+        assert!(mark_seen_unless_waiting(
+            dir.path(),
+            "999200-1",
+            1 + RECENT_SECS
+        ));
+        assert_eq!(
+            fs::read_to_string(dir.path().join(SEEN)).unwrap(),
+            "999200-1"
+        );
+
+        // What is seen never moves back.
+        fs::write(dir.path().join(SEEN), "999300-1").unwrap();
+        assert!(mark_seen_unless_waiting(dir.path(), "999250-1", now));
+        assert_eq!(
+            fs::read_to_string(dir.path().join(SEEN)).unwrap(),
+            "999300-1"
+        );
+    }
 
     #[test]
     fn a_recent_block_needs_attention_until_dismissed() {

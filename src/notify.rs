@@ -175,6 +175,14 @@ pub fn save_and_open(title: &str, detail: &str, ran: Ran) -> Option<(PathBuf, St
     let uid = crate::engine::store::effective_uid().ok()?;
     let path = save_report(title, detail, ran, uid)?;
     let id = path.file_stem()?.to_str()?.to_string();
+    // Asked for and opened, it is seen; checked after saving, so an alert
+    // saved meanwhile still keeps the bar's attention.
+    if let Some(directory) = path.parent() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        crate::tui::status::mark_seen_unless_waiting(directory, &id, now);
+    }
     if env::var_os(QUIET).is_none() && Path::new(LAUNCH_BROWSER).is_file() {
         let env = session_env();
         let mut command = Command::new(SETSID);
