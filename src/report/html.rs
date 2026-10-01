@@ -68,13 +68,13 @@ pub fn page(title: &str, detail: &str, ran: Ran, when: &str, id: &str, fallback:
 <hr>
 <div class="row lead"><span>Blocked {what_text}</span><span class="word red">BLOCKED</span></div>
 <p class="dim">{detail_text}. {ran_text}</p>
-{body}
-<hr>
 <h3>Next</h3>
 <div class="tiles">
   <a class="tile" href="omarchy-guardian://ask/{id_text}"><span class="glyph">✦</span><span>Ask your AI agent</span></a>
 </div>
 <p class="dim small">Opens Claude Code (or OpenCode) in a terminal with this report and no tools. It can explain the report; do not run commands it quotes from the report.</p>
+{body}
+<hr>
 <footer>OMARCHY GUARDIAN {version} · SAVED ON THIS MACHINE ONLY · A CLEAR REVIEW IS NOT A SAFETY GUARANTEE</footer>
 </main>
 </body>
@@ -544,6 +544,9 @@ mod tests {
         assert!(!html.contains("<img src=x"));
         assert!(html.contains("default-src 'none'"));
         assert!(html.contains("Nothing from this source ran"));
+        // The ask button comes right after the verdict, before the details
+        // (the fallback output or the collected review sections).
+        assert!(html.find("omarchy-guardian://ask/").unwrap() < html.find("<section").unwrap());
     }
 
     #[test]
