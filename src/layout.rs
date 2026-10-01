@@ -130,7 +130,8 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
         }
         // Too long for any line: after its spaces, it fills this one and
         // goes on in pieces.
-        if used + gap < width {
+        let first = word.chars().next().map_or(1, char_width);
+        if used + gap + first <= width {
             line.push_str(&" ".repeat(gap));
             used += gap;
         } else if used > 0 {
@@ -498,6 +499,7 @@ mod tests {
         );
         assert_eq!(wrap("    /a/bb/ccc/dddd", 12), ["    /a/bb/", "ccc/dddd"]);
         assert_eq!(wrap("  b a", 2), ["b", "a"]);
+        assert_eq!(wrap("  😀é日éa", 3), ["😀é", "日é", "a"]);
         assert_eq!(
             wrap("→ /home/u/.config/systemd/user/v.service", 20),
             ["→ /home/u/.config/", "systemd/user/", "v.service"]
