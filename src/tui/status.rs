@@ -264,6 +264,17 @@ fn newest_report(directory: &Path) -> Option<String> {
         .max()
 }
 
+/// Whether every report in `directory` has been seen (or there is none).
+pub fn all_seen(directory: &Path) -> bool {
+    let seen = fs::read_to_string(directory.join(SEEN)).unwrap_or_default();
+    newest_report(directory).is_none_or(|newest| seen.trim() >= newest.as_str())
+}
+
+/// Records `id` as seen: a report the user asked for needs no alert.
+pub fn mark_seen(directory: &Path, id: &str) {
+    drop(fs::write(directory.join(SEEN), id));
+}
+
 /// Marks every report so far as seen, and refreshes the Waybar module.
 pub fn dismiss() -> Result<(), String> {
     let directory = notify::reports_dir().ok_or("no reports directory (set HOME)")?;
@@ -302,8 +313,21 @@ pub fn refresh_waybar() {
 mod tests {
     use std::fs;
 
-    use super::{RECENT_SECS, SEEN, age, last_block, markup_safe};
+    use super::{RECENT_SECS, SEEN, age, all_seen, last_block, mark_seen, markup_safe};
     use crate::test_support::TempDir;
+
+    #[test]
+    fn a_requested_report_is_seen_unless_an_alert_was_waiting() {
+        let dir = TempDir::new("status-seen");
+        assert!(all_seen(dir.path()));
+        fs::write(dir.path().join("100-1.html"), "").unwrap();
+        assert!(!all_seen(dir.path()));
+        mark_seen(dir.path(), "100-1");
+        assert!(all_seen(dir.path()));
+        fs::write(dir.path().join("200-1.html"), "").unwrap();
+        assert!(!all_seen(dir.path()));
+        assert_eq!(fs::read_to_string(dir.path().join(SEEN)).unwrap(), "100-1");
+    }
 
     #[test]
     fn a_recent_block_needs_attention_until_dismissed() {
