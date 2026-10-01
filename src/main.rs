@@ -32,6 +32,7 @@ mod engine;
 mod error;
 mod git_state;
 mod json;
+mod layout;
 mod makepkg_gate;
 mod mask;
 mod notify;

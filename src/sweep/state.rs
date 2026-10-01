@@ -134,11 +134,12 @@ pub enum Change {
 }
 
 impl Change {
-    pub const fn mark(self) -> char {
+    /// How the change is shown, and its colour.
+    pub const fn shown(self) -> (&'static str, &'static str) {
         match self {
-            Self::New => '+',
-            Self::Changed => '~',
-            Self::Removed => '-',
+            Self::New => ("+ new", "33;1"),
+            Self::Changed => ("~ changed", "33;1"),
+            Self::Removed => ("- removed", "2"),
         }
     }
 }

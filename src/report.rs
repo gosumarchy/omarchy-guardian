@@ -2,15 +2,14 @@
 //! policy, and their terminal rendering.
 
 use std::collections::HashMap;
-use std::env;
 use std::fmt::{self, Write as _};
-use std::io::{self, IsTerminal};
 use std::process::ExitCode;
 
 use crate::agent::{AgentReview, SourceFile, Status};
 use crate::config::model::{Action, AiRequirement, Policy, SourceClass};
 use crate::deps::Inventory;
 use crate::error::Error;
+use crate::layout::{self, Painter, Span, Table};
 use crate::osv::Audit;
 use crate::rules::{RuleId, Scheme};
 use crate::scan::{FileKind, Snapshot};
@@ -417,21 +416,30 @@ impl Report {
 
     pub fn print(&self, show_hashes: bool, decision: Decision) {
         let painter = Painter::for_stdout();
+        let width = layout::width();
 
-        outln!("Omarchy Guardian  ·  {}", shown(&self.subject));
-        self.print_headline(decision, painter);
-        self.print_coverage(show_hashes, painter);
+        outln!();
+        outln!("{}", self.verdict_box(decision, width, painter));
+        let mut rows = Vec::new();
+        self.coverage_fields(&mut rows);
         for note in &self.notes {
-            outln!("Review memory: {}", shown(note));
+            rows.push(("Review memory", vec![Span::plain(shown(note))]));
         }
-        self.print_inventory();
-        self.print_agent_summary(painter);
-        self.print_findings(decision, painter);
+        self.inventory_fields(&mut rows);
+        self.agent_fields(&mut rows);
+        if self.findings.is_empty() && decision != Decision::Limited {
+            rows.push(("Local checks", vec![Span::new("no matches", "32")]));
+        }
+        outln!("{}", layout::fields(&rows, width, painter));
+        if show_hashes {
+            self.print_hashes();
+        }
+        self.print_findings(width, painter);
 
         for gap in &self.gaps {
             crate::output::stderr_line(format_args!("  ! {}", shown(&gap.to_string())));
         }
-        outln!("\n{}", recommendation(decision));
+        outln!("\n{}", painter.paint(recommendation(decision), "2"));
         html::collect(self, decision);
     }
 
@@ -473,32 +481,24 @@ impl Report {
         }
     }
 
-    fn print_headline(&self, decision: Decision, painter: Painter) {
+    /// The verdict, and the alert counts when there are any, in a box the
+    /// verdict's colour.
+    fn verdict_box(&self, decision: Decision, width: usize, painter: Painter) -> String {
         let counts = self.counts();
-        let total = counts.total();
         let (headline, color) = self.headline(decision);
-        outln!("{}", painter.paint(&headline, color));
-
-        if total > 0 {
-            outln!(
+        let mut lines = vec![Span::new(headline, color)];
+        if counts.total() > 0 {
+            lines.push(Span::plain(format!(
                 "Alerts: {} high · {} medium · {} low",
-                painter.paint(
-                    &counts.high.to_string(),
-                    if counts.high > 0 { "31;1" } else { "2" }
-                ),
-                painter.paint(
-                    &counts.medium.to_string(),
-                    if counts.medium > 0 { "33;1" } else { "2" }
-                ),
-                painter.paint(
-                    &counts.low.to_string(),
-                    if counts.low > 0 { "36;1" } else { "2" }
-                ),
-            );
+                counts.high, counts.medium, counts.low
+            )));
         }
+        let title = format!("Omarchy Guardian · {}", shown(&self.subject));
+        let edge = color.split(';').next().unwrap_or(color);
+        layout::boxed(&title, &lines, width, edge, painter)
     }
 
-    fn print_coverage(&self, show_hashes: bool, painter: Painter) {
+    fn coverage_fields(&self, rows: &mut Vec<(&'static str, Vec<Span>)>) {
         let lossy = if self.lossy_files > 0 {
             format!(
                 " ({} decoded with replacement characters)",
@@ -507,68 +507,96 @@ impl Report {
         } else {
             String::new()
         };
-        outln!(
-            "Coverage: {} text file(s) reviewed{lossy} · {} binary file(s) hashed only · {} oversized text file(s) skipped",
-            self.text_files_reviewed,
-            self.snapshot.count(FileKind::Binary),
-            self.oversized_count()
-        );
+        rows.push((
+            "Coverage",
+            vec![Span::plain(format!(
+                "{} text file(s) reviewed{lossy} · {} binary file(s) hashed only · {} oversized text file(s) skipped",
+                self.text_files_reviewed,
+                self.snapshot.count(FileKind::Binary),
+                self.oversized_count()
+            ))],
+        ));
 
         for skipped in self.snapshot.skipped() {
-            outln!(
-                "Not reviewed: {}/ ({} entries, generated); rerun with --thorough to include it",
-                shown(&skipped.path),
-                skipped.files
-            );
+            rows.push((
+                "Not reviewed",
+                vec![Span::new(
+                    format!(
+                        "{}/ ({} entries, generated); rerun with --thorough to include it",
+                        shown(&skipped.path),
+                        skipped.files
+                    ),
+                    "33",
+                )],
+            ));
         }
 
         let files = self.snapshot.files();
         if !files.is_empty() {
-            outln!(
-                "Integrity: SHA-256 manifest {} ({} file(s) hashed)",
-                painter.paint(&self.snapshot.manifest_digest().to_string(), "36"),
-                files.len(),
-            );
-            if show_hashes {
-                outln!("Per-file SHA-256:");
-                for file in files {
-                    let kind = match file.kind {
-                        FileKind::Text => "reviewed-text",
-                        FileKind::Symlink => "symlink",
-                        FileKind::Binary | FileKind::OversizedText => "hash-only",
-                        FileKind::Undecodable => "undecodable",
-                    };
-                    outln!("  {}  {kind}  {}", file.sha256, shown(&file.path));
-                }
-            }
+            let mut spans = vec![Span::plain(format!(
+                "SHA-256 manifest ({} file(s) hashed)",
+                files.len()
+            ))];
+            spans.push(Span::whole(
+                self.snapshot.manifest_digest().to_string(),
+                "36",
+            ));
+            rows.push(("Integrity", spans));
         }
 
         let withheld = self.withheld_count();
         if withheld > 0 {
-            outln!(
-                "Privacy: {withheld} sensitive-looking file(s) withheld from the OpenCode provider"
-            );
+            rows.push((
+                "Privacy",
+                vec![Span::plain(format!(
+                    "{withheld} sensitive-looking file(s) withheld from the OpenCode provider"
+                ))],
+            ));
         }
     }
 
-    fn print_inventory(&self) {
+    /// One line per file, to copy or compare line by line.
+    fn print_hashes(&self) {
+        outln!("\nPer-file SHA-256:");
+        for file in self.snapshot.files() {
+            let kind = match file.kind {
+                FileKind::Text => "reviewed-text",
+                FileKind::Symlink => "symlink",
+                FileKind::Binary | FileKind::OversizedText => "hash-only",
+                FileKind::Undecodable => "undecodable",
+            };
+            outln!("  {}  {kind}  {}", file.sha256, shown(&file.path));
+        }
+    }
+
+    fn inventory_fields(&self, rows: &mut Vec<(&'static str, Vec<Span>)>) {
         if !self.network.is_empty() {
             let mut endpoints = self.network.clone();
             endpoints.sort();
             endpoints.dedup();
-            outln!("Network destinations observed: {}", endpoints.len());
+            let mut spans = vec![Span::plain(format!(
+                "{} destination(s) observed",
+                endpoints.len()
+            ))];
             for endpoint in endpoints.iter().take(20) {
-                outln!(
-                    "  {}:{} → {}://{}",
-                    shown(&endpoint.path),
-                    endpoint.line,
-                    endpoint.scheme.as_str(),
-                    shown(&endpoint.host)
-                );
+                spans.push(Span::new(
+                    format!(
+                        "{}:{} → {}://{}",
+                        shown(&endpoint.path),
+                        endpoint.line,
+                        endpoint.scheme.as_str(),
+                        shown(&endpoint.host)
+                    ),
+                    "36",
+                ));
             }
             if endpoints.len() > 20 {
-                outln!("  … and {} more endpoint(s)", endpoints.len() - 20);
+                spans.push(Span::new(
+                    format!("… and {} more endpoint(s)", endpoints.len() - 20),
+                    "2",
+                ));
             }
+            rows.push(("Network", spans));
         }
 
         let lockfiles = self.dependencies.lockfile_count();
@@ -576,22 +604,29 @@ impl Report {
             return;
         }
         let packages = self.dependencies.packages().len();
-        if packages == 0 {
-            outln!("Dependencies: {lockfiles} lockfile(s) parsed; no registry packages found");
-            return;
-        }
-        let (status, advisories) = match &self.audit {
-            Some(audit) => ("checked against OSV", audit.advisories.len()),
-            None => ("OSV audit incomplete", 0),
+        let text = if packages == 0 {
+            format!("{lockfiles} lockfile(s) parsed; no registry packages found")
+        } else {
+            let (status, advisories) = match &self.audit {
+                Some(audit) => ("checked against OSV", audit.advisories.len()),
+                None => ("OSV audit incomplete", 0),
+            };
+            format!(
+                "{packages} locked package/version(s) · {lockfiles} lockfile(s) · {status} · {advisories} known vulnerability advisory(ies)"
+            )
         };
-        outln!(
-            "Dependencies: {packages} locked package/version(s) · {lockfiles} lockfile(s) · {status} · {advisories} known vulnerability advisory(ies)"
-        );
+        rows.push(("Dependencies", vec![Span::plain(text)]));
     }
 
-    fn print_agent_summary(&self, painter: Painter) {
+    fn agent_fields(&self, rows: &mut Vec<(&'static str, Vec<Span>)>) {
         if self.agent_input_overflowed {
-            outln!("OpenCode review: not run — source exceeds the AI input limit");
+            rows.push((
+                "AI review",
+                vec![Span::new(
+                    "not run — source exceeds the AI input limit",
+                    "33;1",
+                )],
+            ));
         }
         for run in &self.agent_runs {
             let mut context = String::new();
@@ -601,78 +636,84 @@ impl Report {
             if let Some(note) = &run.cached {
                 let _ = write!(context, " · {note}");
             }
-
-            match &run.outcome {
+            let about = Span::new(
+                format!("{}{context} · profile {}", run.label, self.profile),
+                "2",
+            );
+            let spans = match &run.outcome {
                 AgentOutcome::Reviewed(review) => {
-                    let color = match review.status {
-                        Status::Clear => "32",
-                        Status::Suspicious => "31;1",
-                        Status::Inconclusive => "33;1",
+                    let (mark, color) = match review.status {
+                        Status::Clear => ("✓", "32"),
+                        Status::Suspicious => ("✗", "31;1"),
+                        Status::Inconclusive => ("!", "33;1"),
                     };
-                    outln!(
-                        "AI review: {} · {}{context} · profile {} — {}",
-                        painter.paint(review.status.label(), color),
-                        run.label,
-                        self.profile,
-                        shown(&review.summary)
-                    );
+                    vec![
+                        Span::new(format!("{mark} {}", review.status.label()), color),
+                        about,
+                        Span::plain(shown(&review.summary)),
+                    ]
                 }
-                AgentOutcome::Unavailable(error) => outln!(
-                    "AI review: {} · {}{context} · profile {} — {}",
-                    painter.paint("UNAVAILABLE", "33;1"),
-                    run.label,
-                    self.profile,
-                    shown(&error.to_string())
-                ),
-            }
+                AgentOutcome::Unavailable(error) => vec![
+                    Span::new("! UNAVAILABLE", "33;1"),
+                    about,
+                    Span::plain(shown(&error.to_string())),
+                ],
+            };
+            rows.push(("AI review", spans));
         }
     }
 
-    fn print_findings(&self, decision: Decision, painter: Painter) {
-        if self.findings.is_empty() {
-            if decision != Decision::Limited {
-                outln!("Local checks: no matches");
-            }
-        } else {
-            outln!("\nLocal checks:");
+    fn print_findings(&self, width: usize, painter: Painter) {
+        let severity = |severity: Severity| vec![Span::new(severity.label(), severity.color())];
+        if !self.findings.is_empty() {
+            let mut table = Table::new(vec!["Severity", "Where", "Local check"]);
             for finding in &self.findings {
-                let severity = finding.rule.severity();
-                outln!(
-                    "  [{}] {}:{} — {}",
-                    painter.paint(severity.label(), severity.color()),
-                    shown(&finding.path),
-                    finding.line,
-                    finding.rule.name()
-                );
-                outln!("       {}", finding.rule.description());
+                let mut what = vec![
+                    Span::new(finding.rule.name(), "1"),
+                    Span::plain(finding.rule.description()),
+                ];
                 if !finding.excerpt.is_empty() {
-                    outln!("       {}", shown(&finding.excerpt));
+                    what.push(Span::new(shown(&finding.excerpt), "2"));
                 }
+                table.row(vec![
+                    severity(finding.rule.severity()),
+                    vec![Span::plain(format!(
+                        "{}:{}",
+                        shown(&finding.path),
+                        finding.line
+                    ))],
+                    what,
+                ]);
             }
+            outln!("\n{}", painter.paint("  Local checks", "1"));
+            outln!("{}", table.render(width, 2, painter));
         }
 
-        let mut findings_heading_printed = false;
+        let mut table = Table::new(vec!["Severity", "Where", "AI finding"]);
+        let mut any = false;
         for run in &self.agent_runs {
             let AgentOutcome::Reviewed(review) = &run.outcome else {
                 continue;
             };
             for finding in &review.findings {
-                if !findings_heading_printed {
-                    outln!("\nOpenCode findings:");
-                    findings_heading_printed = true;
-                }
+                any = true;
                 let line = finding
                     .line
                     .map(|line| format!(":{line}"))
                     .unwrap_or_default();
-                outln!(
-                    "  [{}] {}{line} — {}",
-                    painter.paint(finding.severity.label(), finding.severity.color()),
-                    shown(&finding.file),
-                    shown(&finding.title)
-                );
-                outln!("       {}", shown(&finding.reason));
+                table.row(vec![
+                    severity(finding.severity),
+                    vec![Span::plain(format!("{}{line}", shown(&finding.file)))],
+                    vec![
+                        Span::new(shown(&finding.title), "1"),
+                        Span::plain(shown(&finding.reason)),
+                    ],
+                ]);
             }
+        }
+        if any {
+            outln!("\n{}", painter.paint("  AI findings", "1"));
+            outln!("{}", table.render(width, 2, painter));
         }
 
         if let Some(audit) = self
@@ -680,23 +721,33 @@ impl Report {
             .as_ref()
             .filter(|audit| !audit.advisories.is_empty())
         {
-            outln!("\nKnown dependency vulnerabilities:");
+            let mut table = Table::new(vec!["Severity", "Package", "Advisory"]);
             for advisory in &audit.advisories {
                 let (label, color) = advisory.severity.map_or(("UNRATED", "36;1"), |severity| {
                     (severity.label(), severity.color())
                 });
-                outln!(
-                    "  [{}] {}@{} — {} ({})",
-                    painter.paint(label, color),
-                    shown(&advisory.package),
-                    shown(&advisory.version),
-                    shown(&advisory.id),
-                    shown(&advisory.lockfile)
-                );
+                let mut what = vec![Span::new(
+                    format!("{} ({})", shown(&advisory.id), shown(&advisory.lockfile)),
+                    "1",
+                )];
                 if let Some(summary) = &advisory.summary {
-                    outln!("       {}", shown(summary));
+                    what.push(Span::plain(shown(summary)));
                 }
+                table.row(vec![
+                    vec![Span::new(label, color)],
+                    vec![Span::plain(format!(
+                        "{}@{}",
+                        shown(&advisory.package),
+                        shown(&advisory.version)
+                    ))],
+                    what,
+                ]);
             }
+            outln!(
+                "\n{}",
+                painter.paint("  Known dependency vulnerabilities", "1")
+            );
+            outln!("{}", table.render(width, 2, painter));
             if audit.truncated {
                 outln!("  … OSV reported more advisories than it returned in one page");
             }
@@ -725,35 +776,13 @@ const fn recommendation(decision: Decision) -> &'static str {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Painter {
-    enabled: bool,
-}
-
-impl Painter {
-    fn for_stdout() -> Self {
-        Self {
-            enabled: io::stdout().is_terminal()
-                && env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
-                && env::var("TERM").is_ok_and(|term| term != "dumb"),
-        }
-    }
-
-    fn paint(self, text: &str, color: &str) -> String {
-        if self.enabled {
-            format!("\x1b[{color}m{text}\x1b[0m")
-        } else {
-            text.to_string()
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{AgentOutcome, AgentRun, Blocked, Decision, Gap, LocalFinding, Painter, Report};
+    use super::{AgentOutcome, AgentRun, Blocked, Decision, Gap, LocalFinding, Report};
     use crate::agent::{AgentFinding, AgentReview, Status};
     use crate::config::model::{Profile, SourceClass, builtin};
     use crate::error::Error;
+    use crate::layout::Painter;
     use crate::osv::{Advisory, Audit};
     use crate::report::Severity;
     use crate::rules::RuleId;
@@ -1008,9 +1037,9 @@ mod tests {
 
     #[test]
     fn colors_can_be_disabled() {
-        assert_eq!(Painter { enabled: false }.paint("CLEAR", "32"), "CLEAR");
+        assert_eq!(Painter::plain().paint("CLEAR", "32"), "CLEAR");
         assert_eq!(
-            Painter { enabled: true }.paint("CLEAR", "32"),
+            Painter::colored().paint("CLEAR", "32"),
             "\x1b[32mCLEAR\x1b[0m"
         );
     }

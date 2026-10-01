@@ -1,27 +1,42 @@
-//! How a sweep is shown: a list of what isn't trusted, grouped by what it
-//! is, before the usual report of the review; or one JSON document.
+//! How a sweep is shown: a summary, then a table of what isn't trusted for
+//! each area, before the usual report of the review; or one JSON document.
 
 use std::collections::{BTreeMap, HashSet};
-use std::fmt::Write as _;
 
 use super::collect::{Body, Collection, Item, Origin};
 use super::judge::label;
 use super::tier::Tier;
 use crate::agent::Status;
 use crate::json::Json;
+use crate::layout::{self, Painter, Span, Table};
 use crate::report::{AgentOutcome, Decision, Report};
 use crate::text::shown;
 
-const fn tier_word(tier: Tier) -> &'static str {
+/// A tier's word in the list and its colour.
+const fn tier_style(tier: Tier) -> (&'static str, &'static str) {
     match tier {
-        Tier::Vendor => "package",
-        Tier::Inert => "inert",
-        Tier::Copied => "copy",
-        Tier::UserBuilt => "user-built",
-        Tier::Edited => "edited",
-        Tier::Modified => "MODIFIED",
-        Tier::Allowed => "allowed",
-        Tier::Unknown => "unknown",
+        Tier::Vendor => ("package", "32"),
+        Tier::Inert => ("inert", "2"),
+        Tier::Copied => ("copy", "2"),
+        Tier::UserBuilt => ("user-built", "34"),
+        Tier::Edited => ("edited", "36"),
+        Tier::Modified => ("MODIFIED", "31;1"),
+        Tier::Allowed => ("allowed", "32"),
+        Tier::Unknown => ("unknown", "33"),
+    }
+}
+
+/// What a tier means, for the legend.
+const fn tier_meaning(tier: Tier) -> &'static str {
+    match tier {
+        Tier::Vendor => "installed by a repository package, unchanged",
+        Tier::Inert => "does nothing (empty, or masked)",
+        Tier::Copied => "identical to a file a repository package ships",
+        Tier::UserBuilt => "installed by an AUR or local package, unchanged",
+        Tier::Edited => "a package's config file that was edited",
+        Tier::Modified => "a package's file that no longer matches what it installed",
+        Tier::Allowed => "you allowed it as it is",
+        Tier::Unknown => "no package installed it",
     }
 }
 
@@ -40,8 +55,73 @@ fn flagged(report: &Report) -> HashSet<String> {
     paths
 }
 
-/// The list of items, then the summary line.
+/// The summary card: how much is trusted, and what the rest is.
+fn summary(shown_items: &[&Item], total: usize, trusted: usize, flagged: usize) -> Vec<Span> {
+    let width = 40;
+    let (filled, empty) = layout::bar(trusted, total, width);
+    let percent = (trusted * 100).checked_div(total).unwrap_or(100);
+    let mut lines = vec![
+        Span::new(format!("{filled}{empty}  {percent}% trusted"), "32"),
+        Span::plain(format!(
+            "{total} item(s) checked · {trusted} trusted · {} to look at · {flagged} flagged",
+            total - trusted
+        )),
+    ];
+    let mut by_tier: BTreeMap<Tier, usize> = BTreeMap::new();
+    for item in shown_items {
+        *by_tier.entry(item.tier).or_default() += 1;
+    }
+    if !by_tier.is_empty() {
+        lines.push(Span::plain(""));
+    }
+    for (tier, count) in by_tier {
+        let (word, color) = tier_style(tier);
+        lines.push(Span::new(
+            format!("{count:>4}  {word:<10}  {}", tier_meaning(tier)),
+            color,
+        ));
+    }
+    lines
+}
+
+/// One row of an area's table.
+fn item_row(item: &Item, home: Option<&str>, flagged: &HashSet<String>) -> Vec<Vec<Span>> {
+    let label = label(item, home);
+    let (word, color) = tier_style(item.tier);
+    let mut status = if flagged.contains(&label) {
+        vec![Span::new(format!("✗ {word}"), "31;1")]
+    } else {
+        vec![Span::new(word, color)]
+    };
+    if item.origin == Origin::Root {
+        status.push(Span::new("as root", "2"));
+    }
+    let mut details = Vec::new();
+    match &item.body {
+        Body::Link(target) => details.push(Span::new(format!("→ {}", shown(target)), "36")),
+        Body::Binary(format) => details.push(Span::new(format!("[{format}]"), "35")),
+        Body::Unreadable(_) => details.push(Span::new("[not readable]", "33")),
+        Body::Text(_) | Body::Undecodable | Body::Oversized => {}
+    }
+    for command in item.runs.iter().take(3) {
+        details.push(Span::plain(format!("runs {}", shown(command))));
+    }
+    if item.runs.len() > 3 {
+        details.push(Span::new(
+            format!("… and {} more", item.runs.len() - 3),
+            "2",
+        ));
+    }
+    for note in &item.notes {
+        details.push(Span::new(shown(note), "2"));
+    }
+    vec![status, vec![Span::plain(shown(&label))], details]
+}
+
+/// The summary card, then a table of items for each area.
 pub fn print(collection: &Collection, report: &Report, home: Option<&str>, all: bool) {
+    let painter = Painter::for_stdout();
+    let width = layout::width();
     let shown_items: Vec<&Item> = collection
         .items
         .iter()
@@ -52,62 +132,96 @@ pub fn print(collection: &Collection, report: &Report, home: Option<&str>, all: 
         .iter()
         .filter(|item| item.is_trusted())
         .count();
-    outln!(
-        "Guardian sweep · {} item(s) · {trusted} trusted · {} to look at",
-        collection.items.len(),
-        collection.items.len() - trusted
-    );
     let flagged = flagged(report);
+    let flagged_count = shown_items
+        .iter()
+        .filter(|item| flagged.contains(&label(item, home)))
+        .count();
+    let lines = summary(&shown_items, collection.items.len(), trusted, flagged_count);
+    outln!(
+        "{}",
+        layout::boxed("Guardian sweep", &lines, width, "36", painter)
+    );
+
     let mut groups: BTreeMap<&'static str, Vec<&Item>> = BTreeMap::new();
     for item in shown_items {
         groups.entry(item.category.label()).or_default().push(item);
     }
+    let mut headings = Vec::new();
+    let mut tables = Vec::new();
     for (heading, items) in groups {
         let when = items.first().map_or("", |item| item.category.when());
-        outln!("\n{heading} — {when}");
+        headings.push(format!(
+            "\n{} {}  {}",
+            painter.paint("▌", "36"),
+            painter.paint(heading, "1"),
+            painter.paint(when, "2")
+        ));
+        let mut table = Table::new(vec!["Status", "Item", "Details"]);
         for item in items {
-            let label = label(item, home);
-            let mark = if flagged.contains(&label) { "✗" } else { " " };
-            let mut line = format!("  {mark} {:<10} {}", tier_word(item.tier), shown(&label));
-            if item.origin == Origin::Root {
-                line.push_str("  (root)");
-            }
-            match &item.body {
-                Body::Link(target) => {
-                    let _ = write!(line, " → {}", shown(target));
-                }
-                Body::Binary(format) => {
-                    let _ = write!(line, "  [{format}]");
-                }
-                Body::Unreadable(_) => line.push_str("  [not readable]"),
-                Body::Text(_) | Body::Undecodable | Body::Oversized => {}
-            }
-            outln!("{line}");
-            for command in item.runs.iter().take(3) {
-                outln!("        runs {}", shown(command));
-            }
-            for note in &item.notes {
-                outln!("        {}", shown(note));
-            }
+            table.row(item_row(item, home, &flagged));
         }
+        tables.push(table);
     }
-    outln!();
+    // One width for every area's table, so they line up.
+    for (heading, table) in headings
+        .iter()
+        .zip(Table::render_all(&tables, width, 2, painter))
+    {
+        outln!("{heading}");
+        outln!("{table}");
+    }
 }
 
-/// What changed since the last sweep, one line each.
-pub fn print_changes(changes: &[(super::state::Change, String)]) {
-    if changes.is_empty() {
-        outln!("Guardian sweep · nothing new or changed since the last sweep");
+/// Notes on what the sweep could not check, as a list.
+pub fn print_notes(notes: &[String]) {
+    if notes.is_empty() {
         return;
     }
-    outln!(
-        "Guardian sweep · {} change(s) since the last sweep",
-        changes.len()
-    );
-    for (change, label) in changes {
-        outln!("  {} {}", change.mark(), shown(label));
-    }
+    let painter = Painter::for_stdout();
+    let spans: Vec<Span> = notes
+        .iter()
+        .map(|note| Span::new(format!("• {}", shown(note)), "33"))
+        .collect();
     outln!();
+    outln!(
+        "{}",
+        layout::fields(&[("Notes", spans)], layout::width(), painter)
+    );
+}
+
+/// What changed since the last sweep, in a table.
+pub fn print_changes(changes: &[(super::state::Change, String)]) {
+    let painter = Painter::for_stdout();
+    let width = layout::width();
+    if changes.is_empty() {
+        let lines = [Span::new(
+            "✓ nothing new or changed since the last sweep",
+            "32",
+        )];
+        outln!(
+            "{}",
+            layout::boxed("Guardian sweep", &lines, width, "36", painter)
+        );
+        return;
+    }
+    let lines = [Span::new(
+        format!("{} change(s) since the last sweep", changes.len()),
+        "33;1",
+    )];
+    outln!(
+        "{}",
+        layout::boxed("Guardian sweep", &lines, width, "36", painter)
+    );
+    let mut table = Table::new(vec!["Change", "Item"]);
+    for (change, label) in changes {
+        let (word, color) = change.shown();
+        table.row(vec![
+            vec![Span::new(word, color)],
+            vec![Span::plain(shown(label))],
+        ]);
+    }
+    outln!("{}", table.render(width, 2, painter));
 }
 
 /// The sweep as one JSON document.
