@@ -807,9 +807,26 @@ your Claude login instead, set
 the AI are then skipped, because the pacman gate takes its model only from a
 root-owned system config).
 
+The system sweep has its own end-to-end suite: persistence the way PANIX and
+real Linux malware set it up (enabled services, cron, udev, modprobe, the
+dynamic linker, PAM, profile scripts, autostart, generators, pacman hooks,
+NetworkManager dispatchers, initramfs hooks, a setuid shell copy, a replaced
+setuid binary, Hyprland Lua, Omarchy hooks, `~/.local/bin` shadowing, a
+launcher override, git and SSH, a program running from the cache) is planted
+into throwaway `/etc`, `/usr` and `HOME` overlays, and one sweep must list
+every planted item and flag the plainly malicious ones; `--diff` and
+`allow` are checked too. It needs `bwrap` 0.9 or newer and `jq`, and no AI
+(the `system` class's AI review is off inside it):
+
+```sh
+cargo build --release
+bash tests/e2e/sweep.sh
+```
+
 The AI review itself has an evaluation suite: install scriptlets, auto-run
-package files and AUR recipes that must come back clear, and attacks that must
-be caught. Run it after changing a prompt, a scope or the model:
+package files, AUR recipes and files already on a system (found by `sweep`)
+that must come back clear, and attacks that must be caught. Run it after
+changing a prompt, a scope or the model:
 
 ```sh
 cargo build --release
@@ -817,5 +834,7 @@ RUNS=3 bash tests/ai-eval/run.sh          # or a filter: run.sh aur/block
 ```
 
 Every run starts with an empty review memory, so no verdict comes from the
-cache. The pacman cases use the system config's model, the AUR cases the user
-config's.
+cache. The pacman cases use the system config's model, the AUR and system
+cases the user config's. A system case is judged by the AI's own medium or
+high findings on its planted files, since the rest of the real system decides
+the sweep's exit code.

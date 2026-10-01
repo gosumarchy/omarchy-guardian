@@ -11,8 +11,17 @@
 #                                               polkit, ...), by the pacman gate
 #   cases/aur/{clear,block}/NAME/               a PKGBUILD and its local
 #                                               sources, by the yay makepkg gate
+#   cases/system/{clear,block}/NAME/{etc,usr,home}/  files already on a system,
+#                                               found by `sweep`: etc and usr
+#                                               overlay the real ones in a
+#                                               bwrap sandbox, home is the home
+#                                               directory
 # clear passes only on a clear or warned review that ran (exit 0), block only on
 # findings (exit 1). An incomplete or unavailable review fails either way.
+# A system case is judged by the AI's own medium or high findings on the
+# planted files only: the rest of the real system (and its root-only files)
+# would otherwise decide the sweep's exit code, and local rules would hide
+# whether the AI saw it.
 # Cases measure the AI review, so a clear case should not match a local rule:
 # the packages here are local (pacman -U), where a local finding blocks even
 # after a clear AI review.
@@ -47,7 +56,7 @@ if [[ ! -x $GUARDIAN ]]; then
     printf 'Build Guardian first: cargo build --release\n' >&2
     exit 2
 fi
-for tool in bsdtar makepkg; do
+for tool in bsdtar makepkg bwrap jq; do
     command -v "$tool" >/dev/null || {
         printf 'missing required tool: %s\n' "$tool" >&2
         exit 77
@@ -97,6 +106,60 @@ package() {
     rm -rf -- "$root"
 }
 
+# sweep_case <case-dir> <work-dir> <log>: sweeps a sandbox with the case's
+# files in place and returns 1 when the AI flagged a planted file, 0 when
+# the AI reviewed and flagged none, 2 when there was no AI review.
+sweep_case() {
+    local case=$1 dir=$2 log=$3
+    local home=$dir/home
+    mkdir -p "$home/.cache" "$dir/empty"
+    [[ -d $case/home ]] && cp -a -- "$case/home/." "$home/"
+    local -a overlays=()
+    for top in etc usr; do
+        [[ -d $case/$top ]] && overlays+=(--overlay-src "/$top" --overlay-src "$case/$top" --tmp-overlay "/$top")
+    done
+    # The reviewer's login and configuration, in the throwaway home.
+    local -a binds=()
+    [[ -d $HOME/.claude ]] && binds+=(--bind "$HOME/.claude" "$home/.claude")
+    [[ -f $HOME/.claude.json ]] && binds+=(--bind "$HOME/.claude.json" "$home/.claude.json")
+    [[ -d $HOME/.local/share/opencode ]] && binds+=(--bind "$HOME/.local/share/opencode" "$home/.local/share/opencode")
+    # Guardian's own settings (the model); XDG_CONFIG_HOME stays unset, since
+    # the Claude CLI then looks for its login under it.
+    local config=${XDG_CONFIG_HOME:-$HOME/.config}
+    for name in omarchy-guardian opencode; do
+        [[ -d $config/$name ]] && binds+=(--ro-bind "$config/$name" "$home/.config/$name")
+        mkdir -p "$home/.config/$name"
+    done
+    mkdir -p "$home/.local/share/opencode"
+    touch "$home/.claude.json"
+    mkdir -p "$home/.claude"
+    # The overlay makes the system file look owned by someone else, which
+    # Guardian rightly refuses; without one, the user file decides.
+    # /tmp first: the run directory lives under it.
+    bwrap --ro-bind / / "${overlays[@]}" --tmpfs /etc/omarchy-guardian --tmpfs /tmp \
+        --bind "$dir" "$dir" "${binds[@]}" \
+        --proc /proc --dev /dev \
+        --setenv HOME "$home" --setenv PATH /usr/bin:/bin \
+        --unsetenv XDG_CONFIG_HOME \
+        --setenv XDG_STATE_HOME "$dir/state" --setenv XDG_CACHE_HOME "$home/.cache" \
+        --new-session -- "$GUARDIAN" sweep --json </dev/null >"$dir/sweep.json" 2>"$log"
+    local -a planted=()
+    while IFS= read -r file; do
+        file=${file#"$case/"}
+        case $file in
+        home/*) planted+=("~/${file#home/}") ;;
+        *) planted+=("/$file") ;;
+        esac
+    done < <(find "$case" -type f)
+    printf 'planted: %s\n' "${planted[*]}" >>"$log"
+    jq '.ai' "$dir/sweep.json" >>"$log" 2>/dev/null
+    jq -e '.ai | length > 0' "$dir/sweep.json" >/dev/null 2>&1 || return 2
+    # Low-severity notes are remarks, not a judgement of danger.
+    jq -e --args '[.ai[].findings[] | select(.severity != "low") | .path] as $flagged | any($ARGS.positional[]; . as $p | $flagged | index($p))' \
+        "${planted[@]}" <"$dir/sweep.json" >/dev/null && return 1
+    return 0
+}
+
 # review <case-path> <run> <log>: prints the exit code of the gate
 review() {
     local case=$1 run=$2 log=$3
@@ -116,6 +179,10 @@ review() {
             package "$name" "" "$EVAL/cases/$case" "$archive"
         fi || return 2
         (cd "$dir" && TARGET=$name "$WORK/pacman" -U "$archive") </dev/null >"$log" 2>&1
+        ;;
+    system)
+        sweep_case "$EVAL/cases/$case" "$dir" "$log"
+        return
         ;;
     aur)
         cp -a -- "$EVAL/cases/$case" "$dir/$name"
