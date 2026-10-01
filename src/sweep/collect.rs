@@ -14,6 +14,7 @@ use super::read::{self, Found};
 use super::tier::{Observed, Tier, classify};
 use crate::autorun::{Category, Kind, Location, SYSTEM, SYSTEM_SWEEP, USER};
 use crate::content::{self, Content};
+use crate::rules::RuleId;
 use crate::scan::MAX_TEXT_FILE_SIZE;
 use crate::sha256::Digest;
 
@@ -83,6 +84,18 @@ pub struct Item {
     /// The item that runs or links to this one.
     pub run_by: Option<String>,
     pub notes: Vec<String>,
+    /// What the live checks established about it (a rule and what was seen).
+    pub alerts: Vec<(RuleId, String)>,
+}
+
+impl Item {
+    /// Trusted items are only counted. An item the live checks raised an
+    /// alert about is not trusted by its tier (a setuid copy of a packaged
+    /// program is still a copy), only by the user allowing it.
+    pub fn is_trusted(&self) -> bool {
+        self.tier == Tier::Allowed
+            || (super::judge::is_trusted(self.tier) && self.alerts.is_empty())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -141,6 +154,34 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
         .items
         .sort_by(|left, right| left.path.cmp(&right.path));
     collection
+}
+
+/// Adds `items` to `collection`; an item already there by path gains the
+/// new one's notes and alerts instead of appearing twice.
+pub fn merge(collection: &mut Collection, items: Vec<Item>) {
+    for item in items {
+        if let Some(existing) = collection
+            .items
+            .iter_mut()
+            .find(|existing| existing.path == item.path)
+        {
+            for note in item.notes {
+                if !existing.notes.contains(&note) {
+                    existing.notes.push(note);
+                }
+            }
+            for alert in item.alerts {
+                if !existing.alerts.contains(&alert) {
+                    existing.alerts.push(alert);
+                }
+            }
+        } else {
+            collection.items.push(item);
+        }
+    }
+    collection
+        .items
+        .sort_by(|left, right| left.path.cmp(&right.path));
 }
 
 /// Adds the files of `location` (under `prefix`, the home for user
@@ -212,7 +253,7 @@ fn wanted(scope: &Scope<'_>, category: Category, relative: &str) -> bool {
 }
 
 /// One item: what is at `path`, its tier and content, and what it runs.
-fn item(scope: &Scope<'_>, category: Category, path: String, run_by: Option<&str>) -> Item {
+pub fn item(scope: &Scope<'_>, category: Category, path: String, run_by: Option<&str>) -> Item {
     let found = read::look(scope.root, &path);
     let (tier, sha256, body) = match &found {
         Found::File {
@@ -297,6 +338,7 @@ fn item(scope: &Scope<'_>, category: Category, path: String, run_by: Option<&str
         runs,
         run_by: run_by.map(str::to_string),
         notes,
+        alerts: Vec::new(),
     }
 }
 

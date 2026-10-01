@@ -130,6 +130,25 @@ configuration, and programs in `~/.local/bin` named like system commands. It
 follows links and what each file runs, so a trusted service running a
 replaced binary, or an interpreter running a script, is checked too.
 
+It also looks at what runs **now**, listing only what does not add up, so a
+clean system shows nothing here:
+
+- a running program with no file on disk (deleted, or only in memory), or
+  running from a temporary or cache directory; a program an update replaced
+  while it runs is fine;
+- a library no repository package installed, preloaded into a running
+  program (`LD_PRELOAD`);
+- a program no repository package installed that listens on the network
+  (TCP, not loopback), reads the keyboard devices, or uses a camera;
+- a loaded kernel module no package installed (one built by DKMS is noted,
+  not flagged), and the kernel's taint flag;
+- setuid and setgid files, and files with capabilities, under `/usr`,
+  `/opt`, `/etc` and `/home` that no package vouches for; a setuid copy of a
+  packaged program counts as unknown.
+
+As a user only your own processes can be looked at; the root checks see
+all of them.
+
 Each item is judged against pacman's own records (no network, no hash
 lookups):
 
@@ -140,7 +159,8 @@ lookups):
 | copy | Identical to a file a repository package ships (Omarchy's `etc-overrides`) | with `--all` |
 | user-built | From a package of no configured repository (AUR, `pacman -U`) | yes |
 | edited | A package's configuration file, changed as configuration is meant to be | yes |
-| modified | A package's file that is no longer what the package shipped | yes, and a high finding |
+| allowed | Allowed with `sweep allow` while unchanged | with `--all` |
+| modified | A package's file that is no longer what the package shipped (content, link, set-id or write bits) | yes, and a high finding |
 | unknown | No package installed it | yes |
 
 Everything shown that holds text goes through the local rules and the AI

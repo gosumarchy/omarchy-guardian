@@ -15,6 +15,7 @@ pub mod collect;
 pub mod commands;
 pub mod index;
 pub mod judge;
+pub mod live;
 pub mod lua;
 pub mod output;
 pub mod read;
@@ -107,17 +108,22 @@ fn home() -> Option<String> {
 }
 
 /// Collects this system and the user's home.
-fn collect_here(home: Option<&str>) -> Result<(Collection, PackageIndex), String> {
+/// Collects this system and the user's home, and runs the live checks;
+/// returns the live checks' notes too.
+fn collect_here(home: Option<&str>) -> Result<(Collection, PackageIndex, Vec<String>), String> {
     let index = index::foreign_packages()
         .and_then(|foreign| PackageIndex::load(Path::new(LOCAL_DB), foreign))
         .map_err(|error| format!("cannot read the package database: {error}"))?;
-    let collection = collect::collect(&Scope {
+    let scope = Scope {
         root: Path::new("/"),
         home,
         index: &index,
         origin: Origin::System,
-    });
-    Ok((collection, index))
+    };
+    let mut collection = collect::collect(&scope);
+    let live = live::check(&scope);
+    collect::merge(&mut collection, live.items);
+    Ok((collection, index, live.notes))
 }
 
 fn state_directory() -> Result<std::path::PathBuf, String> {
@@ -127,7 +133,7 @@ fn state_directory() -> Result<std::path::PathBuf, String> {
 
 fn allow(label: &str) -> Result<String, String> {
     let home = home();
-    let (collection, _) = collect_here(home.as_deref())?;
+    let (collection, _, _) = collect_here(home.as_deref())?;
     let item = collection
         .items
         .iter()
@@ -135,7 +141,7 @@ fn allow(label: &str) -> Result<String, String> {
         .ok_or_else(|| {
             format!("{label} is not something the sweep lists; use the path as it shows it")
         })?;
-    if judge::is_trusted(item.tier) {
+    if item.is_trusted() {
         return Ok(format!(
             "{label} is already trusted ({}).",
             item.tier.name()
@@ -183,7 +189,12 @@ fn add_root_part(
 ) {
     if options.root {
         match root::from_root() {
-            Ok(part) => root::merge(collection, part),
+            Ok(part) => {
+                root::merge(collection, part);
+                // Root saw every process; the notes about those it could not
+                // see no longer apply.
+                notes.retain(|note| !note.contains("the root checks cover them"));
+            }
             Err(reason) => notes.push(format!("the root checks did not run ({reason})")),
         }
         return;
@@ -194,7 +205,12 @@ fn add_root_part(
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_secs());
             match root::from_results(Path::new(root::RESULTS), now) {
-                Ok(part) => root::merge(collection, part),
+                Ok(part) => {
+                root::merge(collection, part);
+                // Root saw every process; the notes about those it could not
+                // see no longer apply.
+                notes.retain(|note| !note.contains("the root checks cover them"));
+            }
                 Err(reason) => notes.push(format!("root checks: {reason}")),
             }
         }
@@ -210,14 +226,13 @@ fn add_root_part(
 /// `omarchy-guardian sweep`.
 fn run(options: Options, settings: &Settings) -> ExitCode {
     let home = home();
-    let (mut collection, index) = match collect_here(home.as_deref()) {
+    let (mut collection, index, mut notes) = match collect_here(home.as_deref()) {
         Ok(found) => found,
         Err(message) => {
             errln!("omarchy-guardian sweep: {message}");
             return ExitCode::from(2);
         }
     };
-    let mut notes = Vec::new();
     add_root_part(&mut collection, options, settings, &mut notes);
     let directory = state_directory()
         .map_err(|reason| notes.push(format!("nothing remembered between sweeps ({reason})")))
@@ -258,7 +273,7 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
     let current: Remembered = collection
         .items
         .iter()
-        .filter(|item| !judge::is_trusted(item.tier))
+        .filter(|item| !item.is_trusted())
         .map(|item| (label(item), state::fingerprint(item)))
         .collect();
     let changes = directory
