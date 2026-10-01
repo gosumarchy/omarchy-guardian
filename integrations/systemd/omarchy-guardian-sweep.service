@@ -5,5 +5,8 @@ Documentation=file:///usr/share/doc/omarchy-guardian/README.md
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/omarchy-guardian sweep --scheduled
+# 1 (findings) and 2 (incomplete) are the sweep doing its job, reported by
+# its notification and the bar; only anything else is a failure.
+SuccessExitStatus=1 2
 Nice=10
 IOSchedulingClass=idle
