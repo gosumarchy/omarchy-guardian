@@ -223,6 +223,36 @@ pub enum Kind {
     /// A systemd manager directory: `<manager>.conf.d/` drop-ins, which can
     /// set `DefaultEnvironment=LD_PRELOAD=...`.
     Manager,
+    /// Exactly the files this path matches, `*` standing for any run of
+    /// characters within one name (`usr/lib/python*/site-packages/*.pth`).
+    /// Only the sweep looks for these.
+    Glob,
+}
+
+/// Whether `name` (one path component) matches `pattern`, in which each
+/// `*` stands for any run of characters.
+pub fn name_matches(pattern: &str, name: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let Some(first) = parts.next() else {
+        return name.is_empty();
+    };
+    let Some(mut rest) = name.strip_prefix(first) else {
+        return false;
+    };
+    let mut parts = parts.peekable();
+    if parts.peek().is_none() {
+        return rest.is_empty();
+    }
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            return rest.ends_with(part);
+        }
+        match rest.find(part) {
+            Some(at) => rest = &rest[at + part.len()..],
+            None => return false,
+        }
+    }
+    true
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -489,6 +519,82 @@ pub const SYSTEM_SWEEP: &[Location] = &[
     location("usr/lib/security/", Kind::Directory, Category::Pam),
     location("boot/limine.conf", Kind::File, Category::Boot),
     location("etc/default/limine", Kind::File, Category::Boot),
+    location("etc/kernel/cmdline", Kind::File, Category::Boot),
+    // Libraries the dynamic linker prefers over the ones in `/usr/lib`.
+    location("usr/lib/glibc-hwcaps/", Kind::Directory, Category::Linker),
+    // Python runs every `import` line of a `.pth` file, and these two
+    // modules, at each start of the interpreter.
+    location(
+        "usr/lib/python*/site-packages/*.pth",
+        Kind::Glob,
+        Category::Linker,
+    ),
+    location(
+        "usr/lib/python*/site-packages/sitecustomize.py",
+        Kind::Glob,
+        Category::Linker,
+    ),
+    location(
+        "usr/lib/python*/site-packages/usercustomize.py",
+        Kind::Glob,
+        Category::Linker,
+    ),
+    location(
+        "usr/lib/python*/sitecustomize.py",
+        Kind::Glob,
+        Category::Linker,
+    ),
+    // DKMS runs a module's build scripts as root at every kernel update.
+    location("usr/src/*/dkms.conf", Kind::Glob, Category::Initramfs),
+    // The main files beside the drop-in directories.
+    location("etc/ssh/sshd_config", Kind::File, Category::Ssh),
+    location("etc/ssh/ssh_config", Kind::File, Category::Ssh),
+    location("etc/systemd/system.conf", Kind::File, Category::Systemd),
+    location("etc/systemd/user.conf", Kind::File, Category::Systemd),
+    location("etc/makepkg.conf", Kind::File, Category::Shell),
+    location("etc/bash.bash_logout", Kind::File, Category::Shell),
+    location("etc/fish/", Kind::Directory, Category::Shell),
+    // `HookDir`, `XferCommand` and the repositories packages come from.
+    location("etc/pacman.conf", Kind::File, Category::PacmanHook),
+    // Scripts logrotate runs as root (`postrotate`).
+    location("etc/logrotate.conf", Kind::File, Category::Cron),
+    location("etc/logrotate.d/", Kind::Directory, Category::Cron),
+    // The login screen: its session and display commands, and the sessions
+    // it offers.
+    location("etc/sddm.conf", Kind::File, Category::Autostart),
+    location("etc/sddm.conf.d/", Kind::Directory, Category::Autostart),
+    location(
+        "usr/lib/sddm/sddm.conf.d/",
+        Kind::Directory,
+        Category::Autostart,
+    ),
+    location(
+        "usr/share/sddm/scripts/",
+        Kind::Directory,
+        Category::Autostart,
+    ),
+    location("etc/greetd/", Kind::Directory, Category::Autostart),
+    location(
+        "usr/share/wayland-sessions/",
+        Kind::Directory,
+        Category::Autostart,
+    ),
+    location("usr/share/xsessions/", Kind::Directory, Category::Autostart),
+    location(
+        "usr/local/lib/systemd/user-generators/",
+        Kind::Directory,
+        Category::SystemdGenerator,
+    ),
+    location(
+        "usr/local/lib/systemd/system-environment-generators/",
+        Kind::Directory,
+        Category::SystemdGenerator,
+    ),
+    location(
+        "usr/local/lib/systemd/user-environment-generators/",
+        Kind::Directory,
+        Category::SystemdGenerator,
+    ),
 ];
 
 /// Locations in a home directory, relative to it.
@@ -530,6 +636,46 @@ pub const USER: &[Location] = &[
     location(".ssh/config", Kind::File, Category::Ssh),
     location(".gitconfig", Kind::File, Category::Git),
     location(".config/git/config", Kind::File, Category::Git),
+    // The other place systemd reads user units from.
+    location(
+        ".local/share/systemd/user/",
+        Kind::Directory,
+        Category::Systemd,
+    ),
+    // Services the session bus starts when their name is asked for.
+    location(
+        ".local/share/dbus-1/services/",
+        Kind::Directory,
+        Category::Dbus,
+    ),
+    // Functions fish loads by name: one called `ls` replaces the command.
+    location(".config/fish/functions/", Kind::Directory, Category::Shell),
+    // What uwsm sources before it starts the session.
+    location(".config/uwsm/", Kind::Directory, Category::Shell),
+    location(".makepkg.conf", Kind::File, Category::Shell),
+    location(".config/pacman/makepkg.conf", Kind::File, Category::Shell),
+    // The bar runs the commands of its custom modules.
+    location(
+        ".config/waybar/config.jsonc",
+        Kind::File,
+        Category::Autostart,
+    ),
+    location(".config/waybar/config", Kind::File, Category::Autostart),
+    location(
+        ".local/lib/python*/site-packages/*.pth",
+        Kind::Glob,
+        Category::Linker,
+    ),
+    location(
+        ".local/lib/python*/site-packages/sitecustomize.py",
+        Kind::Glob,
+        Category::Linker,
+    ),
+    location(
+        ".local/lib/python*/site-packages/usercustomize.py",
+        Kind::Glob,
+        Category::Linker,
+    ),
 ];
 
 const ENABLING: &[&str] = &[".wants", ".requires", ".upholds"];
@@ -554,6 +700,15 @@ impl Location {
                 .strip_prefix(self.path)
                 .and_then(|rest| rest.split_once('/'))
                 .is_some_and(|(parent, file)| parent.ends_with(".conf.d") && !file.contains('/')),
+            Kind::Glob => {
+                let (patterns, names): (Vec<&str>, Vec<&str>) =
+                    (self.path.split('/').collect(), path.split('/').collect());
+                patterns.len() == names.len()
+                    && patterns
+                        .iter()
+                        .zip(&names)
+                        .all(|(pattern, name)| name_matches(pattern, name))
+            }
         }
     }
 }
@@ -610,7 +765,8 @@ pub fn is_auto_run_directory(path: &str) -> bool {
                 .is_some_and(|extension| extension == "d")
     });
     SYSTEM.iter().any(|location| match location.kind {
-        Kind::File => false,
+        // No package location is a pattern: only the sweep has those.
+        Kind::File | Kind::Glob => false,
         Kind::Directory => {
             location.path.starts_with(&directory)
                 || (unit_directory
@@ -736,7 +892,13 @@ mod tests {
             assert!(!location.path.starts_with('/'), "{}", location.path);
             assert_eq!(
                 location.path.ends_with('/'),
-                location.kind != Kind::File,
+                !matches!(location.kind, Kind::File | Kind::Glob),
+                "{}",
+                location.path
+            );
+            assert_eq!(
+                location.path.contains('*'),
+                location.kind == Kind::Glob,
                 "{}",
                 location.path
             );
@@ -744,6 +906,16 @@ mod tests {
             assert!(!location.category.label().is_empty());
             assert!(!location.category.when().is_empty());
         }
+        // The package gate matches a path against every location: none
+        // of its own is a pattern.
+        assert!(SYSTEM.iter().all(|location| location.kind != Kind::Glob));
+        let pth = SYSTEM_SWEEP
+            .iter()
+            .find(|location| location.path.ends_with("*.pth"))
+            .unwrap();
+        assert!(pth.contains("usr/lib/python3.13/site-packages/evil.pth"));
+        assert!(!pth.contains("usr/lib/python3.13/site-packages/pkg/evil.pth"));
+        assert!(!pth.contains("usr/lib/python3.13/site-packages/evil.py"));
         for category in Category::ALL {
             assert_eq!(Category::from_name(category.name()), Some(category));
         }

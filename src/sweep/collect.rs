@@ -206,7 +206,20 @@ fn add_location(
     truncated: &mut Vec<String>,
 ) {
     let base = format!("{prefix}{}", location.path);
-    let candidates = if location.kind == Kind::File {
+    let candidates = if location.kind == Kind::Glob {
+        let matches = read::matching(scope.root, &base);
+        if matches.truncated {
+            truncated.push(format!("/{base}: more matches than were looked at"));
+        }
+        truncated.extend(matches.unnamed.iter().map(|name| not_utf8(name)));
+        truncated.extend(
+            matches
+                .unreadable
+                .iter()
+                .map(|directory| format!("/{directory}: could not be listed")),
+        );
+        matches.files
+    } else if location.kind == Kind::File {
         // A file behind a directory only root can list is still looked at,
         // and reported as unreadable.
         match fs::symlink_metadata(scope.root.join(&base)) {

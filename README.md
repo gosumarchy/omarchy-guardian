@@ -127,10 +127,17 @@ command, so its own blocks can be told apart from the command's failures.
 Objective-See's KnockKnock does on macOS: every auto-run location the pacman
 gate knows (systemd units and their enable links, drop-ins and generators,
 pacman hooks, udev, modprobe, PAM, sudo and polkit rules, shell start-up
-files, cron, autostart, D-Bus services, initcpio, the Limine config) and, in
-your home, user services, autostart entries, shell files, the Hyprland Lua
-configuration (and what `exec_on_start` starts), Omarchy hooks, SSH and git
-configuration, and programs in `~/.local/bin` named like system commands. It
+files, cron, autostart, D-Bus services, initcpio, the Limine config), a few
+more only the sweep reads (the pacman, makepkg, sshd, logrotate, systemd
+manager and login-screen configuration, the sessions the login screen
+offers, the kernel command line, DKMS build configuration, libraries in
+`glibc-hwcaps`, and Python's `.pth` and `sitecustomize` files, which every
+Python program runs at start) and, in your home, user services (in
+`~/.config` and `~/.local/share`), session D-Bus services, autostart
+entries, shell files and fish functions, what uwsm sources, the Waybar
+configuration, the Hyprland Lua configuration (and what `exec_on_start`
+starts), Omarchy hooks, SSH and git configuration, your own Python `.pth`
+files, and programs in `~/.local/bin` named like system commands. It
 follows links and what each file runs, so a trusted service running a
 replaced binary, or an interpreter running a script, is checked too.
 
@@ -143,10 +150,26 @@ clean system shows nothing here:
   where a deleted program can carry any name: what that one preloads, and
   whether it reads the keyboard or listens on the network, is checked as
   for a program no package installed;
-- a library no repository package installed, preloaded into a running
-  program (`LD_PRELOAD`);
+- a script an interpreter runs from a temporary or cache directory, and a
+  program the dynamic loader was handed from one. A script given by a
+  relative name is looked for where the process runs now. An AppImage's own
+  start script is noted, not flagged. Where an option may or may not take a
+  value, both the argument after it and the next are looked at, so a data
+  file in a temporary directory passed to a script can be flagged in its
+  place. Code given on the command line or on standard input (`python -c`,
+  a `bash -c` command string) has no file to look at, and Java classes
+  named by a class path are not followed;
+- a library no repository package installed, loaded into a running
+  program (`LD_PRELOAD`, `LD_AUDIT`), and a program told to look for its
+  libraries in a temporary directory or in one relative to where it runs
+  (`LD_LIBRARY_PATH`; the empty entry launchers leave behind is ignored).
+  This is what the process was started with: one that rewrites its own
+  environment afterwards is not caught by it;
 - a program no repository package installed that listens on the network
-  (TCP, not loopback), reads the keyboard devices, or uses a camera;
+  (TCP, not loopback), reads the keyboard devices, or uses a camera. Every
+  process sharing a listening socket is looked at, and a packaged tool that
+  runs what it is told (an interpreter, the loader, `awk`, `openssl`,
+  `busybox`) is judged by its script, or shown when it listens;
 - a loaded kernel module no package installed (one built by DKMS is noted,
   not flagged), and the kernel's taint flag;
 - setuid and setgid files, and files with capabilities, under `/usr`,

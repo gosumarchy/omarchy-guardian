@@ -33,6 +33,11 @@ const SEARCH: &[&str] = &["~/.local/bin", "usr/local/bin", "usr/bin"];
 /// The command lines `text` (a file of `category` named `name`) runs.
 pub fn commands(category: Category, path: &str, text: &str) -> Vec<String> {
     let name = path.rsplit('/').next().unwrap_or(path);
+    // logrotate's files are no crontabs: what their `postrotate` scripts
+    // run is reviewed as the text it is.
+    if path.starts_with("etc/logrotate") {
+        return Vec::new();
+    }
     if category == Category::Cron {
         return crontab(path, text);
     }
@@ -100,19 +105,27 @@ fn is_time_field(field: &str) -> bool {
 }
 
 /// `Exec=`, `ExecStart=` and friends in units, hooks, D-Bus services and
-/// desktop entries.
+/// desktop entries; and the `…Command=` keys of the login screen's and
+/// pacman's configuration (`SessionCommand`, `XferCommand`) and greetd's
+/// `command`.
 fn key_value(line: &str) -> Vec<String> {
     let Some((key, value)) = line.split_once('=') else {
         return Vec::new();
     };
     let key = key.trim();
+    let command = key == "command" || (key.len() > 7 && key.ends_with("Command"));
     let runs = key == "Exec"
-        || key == "TryExec"
+        || command
         || (key.starts_with("Exec") && key[4..].chars().all(|c| c.is_ascii_alphabetic()));
-    if !runs || key == "TryExec" {
+    if !runs {
         return Vec::new();
     }
-    let value = value.trim().trim_start_matches(['-', '@', ':', '+', '!']);
+    let value = value.trim();
+    let value = if command {
+        value.trim_matches('"')
+    } else {
+        value.trim_start_matches(['-', '@', ':', '+', '!'])
+    };
     // Desktop field codes (`%u`, `%F`…) are filled in at launch.
     let value: Vec<&str> = value
         .split_whitespace()
@@ -445,5 +458,41 @@ mod tests {
             ["home/u/.cache/x.sh"]
         );
         assert!(targets(root, "home/u", "missing").is_empty());
+    }
+
+    #[test]
+    fn configuration_commands_are_found_and_logrotate_is_no_crontab() {
+        assert_eq!(
+            commands(
+                Category::Autostart,
+                "etc/sddm.conf.d/x.conf",
+                "[X11]\nSessionCommand=/usr/share/sddm/scripts/Xsession\nSessionDir=/usr/share/xsessions\n"
+            ),
+            ["/usr/share/sddm/scripts/Xsession"]
+        );
+        assert_eq!(
+            commands(
+                Category::PacmanHook,
+                "etc/pacman.conf",
+                "#XferCommand = /usr/bin/curl -L -C - -f -o %o %u\nXferCommand = /usr/local/bin/fetch %u\nHookDir = /etc/pacman.d/hooks/\n"
+            ),
+            ["/usr/local/bin/fetch"]
+        );
+        assert_eq!(
+            commands(
+                Category::Autostart,
+                "etc/greetd/config.toml",
+                "[default_session]\ncommand = \"tuigreet --cmd Hyprland\"\n"
+            ),
+            ["tuigreet --cmd Hyprland"]
+        );
+        assert!(
+            commands(
+                Category::Cron,
+                "etc/logrotate.d/x",
+                "/var/log/x {\n  compress delaycompress missingok notifempty copytruncate sharedscripts\n}\n"
+            )
+            .is_empty()
+        );
     }
 }
