@@ -400,6 +400,7 @@ fn local_archives(operands: &[String], cwd: &Path) -> Result<Archives, Error> {
 /// (see `payload::Review::root_set_id`), unless the installed file already
 /// has it.
 fn grant_findings(
+    archive: &payload::Archive,
     grants: Vec<(String, &'static str)>,
     target: &str,
     archive_name: &str,
@@ -410,7 +411,10 @@ fn grant_findings(
         // Already installed that way: nothing new is being granted.
         let installed = fs::symlink_metadata(Path::new("/").join(&path))
             .is_ok_and(|metadata| payload::already_granted(what, &metadata))
-            || (what == payload::WITH_CAPABILITIES && has_capabilities(&path));
+            || (what == payload::WITH_CAPABILITIES
+                && archive
+                    .shipped_capability(&path)
+                    .is_some_and(|shipped| has_capabilities(&path, shipped)));
         if installed {
             continue;
         }
@@ -438,24 +442,38 @@ fn grant_findings(
     }
 }
 
-/// Whether the installed file at `path` (relative to `/`) carries file
-/// capabilities already: a package that ships them again grants nothing
-/// new. Any doubt counts as "no", and the finding is raised.
-fn has_capabilities(path: &str) -> bool {
+/// Whether the installed file at `path` (relative to `/`) already carries
+/// exactly the file capabilities `shipped` (the attribute's value as
+/// base64): a package that ships the same again grants nothing new. Any
+/// doubt, a missing tool included, counts as "no" and the finding is raised.
+fn has_capabilities(path: &str, shipped: &str) -> bool {
     let installed = Path::new("/").join(path);
     if !fs::symlink_metadata(&installed).is_ok_and(|metadata| metadata.is_file()) {
         return false;
     }
-    tools::run(
-        Path::new("/usr/bin/getcap"),
-        &[installed.into_os_string()],
+    let args: [OsString; 6] = [
+        "-n".into(),
+        "security.capability".into(),
+        "-e".into(),
+        "base64".into(),
+        "--absolute-names".into(),
+        installed.into_os_string(),
+    ];
+    let Ok(captured) = tools::run(
+        Path::new("/usr/bin/getfattr"),
+        &args,
         None,
         C_LOCALE,
         TOOL_LIMITS,
-    )
-    .is_ok_and(|captured| {
-        captured.status.success() && !String::from_utf8_lossy(&captured.stdout).trim().is_empty()
-    })
+    ) else {
+        return false;
+    };
+    let plain = |value: &str| value.trim().trim_end_matches('=').to_string();
+    captured.status.success()
+        && String::from_utf8_lossy(&captured.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("security.capability=0s"))
+            .is_some_and(|installed| !installed.is_empty() && plain(installed) == plain(shipped))
 }
 
 /// Transaction targets that no archive on the command line provides.
@@ -948,7 +966,14 @@ fn scan_package(
             }
         }
     }
-    grant_findings(reviewed.root_set_id, target, archive_name, class, report);
+    grant_findings(
+        &archive,
+        reviewed.root_set_id,
+        target,
+        archive_name,
+        class,
+        report,
+    );
     archive.verify_unchanged()?;
     Ok((scriptlet, summary))
 }

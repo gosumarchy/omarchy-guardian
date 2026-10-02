@@ -304,10 +304,10 @@ pub fn already_granted(what: &str, installed: &Metadata) -> bool {
 /// carries a `security.*` or `trusted.*` attribute (file capabilities:
 /// root-like rights for whoever runs the file) or an access control list
 /// (rights the mode does not show), with what to call them.
-fn attributes_in_tar(mut stream: impl Read) -> Result<Vec<(String, &'static str)>, String> {
+fn attributes_in_tar(mut stream: impl Read) -> Result<Vec<Attribute>, String> {
     let mut found = Vec::new();
     // What the extended header before the next entry said.
-    let mut pending: Option<&'static str> = None;
+    let mut pending: Option<(&'static str, Option<String>)> = None;
     let mut path_override: Option<String> = None;
     let mut header = [0_u8; 512];
     loop {
@@ -346,11 +346,13 @@ fn attributes_in_tar(mut stream: impl Read) -> Result<Vec<(String, &'static str)
                 .read_exact(&mut data)
                 .map_err(|error| error.to_string())?;
             data.truncate(usize::try_from(size).map_err(|_| "size")?);
-            let (what, path) = pax_records(&data);
+            let records = pax_records(&data);
             if kind == b'x' {
-                path_override = path;
+                path_override = records.path;
             }
-            pending = what.or(pending);
+            if let Some(what) = records.what {
+                pending = Some((what, records.capability));
+            }
             continue;
         }
         let name = path_override.take().unwrap_or_else(|| {
@@ -361,8 +363,8 @@ fn attributes_in_tar(mut stream: impl Read) -> Result<Vec<(String, &'static str)
                 format!("{prefix}/{name}")
             }
         });
-        if let Some(what) = pending.take() {
-            found.push((name.trim_end_matches('/').to_string(), what));
+        if let Some((what, capability)) = pending.take() {
+            found.push((name.trim_end_matches('/').to_string(), what, capability));
         }
         let mut left = blocks;
         let mut sink = [0_u8; 8192];
@@ -378,9 +380,11 @@ fn attributes_in_tar(mut stream: impl Read) -> Result<Vec<(String, &'static str)
 
 /// From a pax extended header's records (`<length> <key>=<value>\n`): what
 /// its attributes grant, if anything, and the entry's path if it gives one.
-fn pax_records(data: &[u8]) -> (Option<&'static str>, Option<String>) {
-    let mut what = None;
-    let mut path = None;
+fn pax_records(data: &[u8]) -> Records {
+    let mut found = Records::default();
+    // Another `security.*` or `trusted.*` attribute beside the capability:
+    // then the capability's value alone does not say what is granted.
+    let mut others = false;
     let mut rest = data;
     while let Some(space) = rest.iter().position(|byte| *byte == b' ') {
         let Some(length) = std::str::from_utf8(&rest[..space])
@@ -394,20 +398,47 @@ fn pax_records(data: &[u8]) -> (Option<&'static str>, Option<String>) {
         let record = record.strip_suffix(b"\n").unwrap_or(record);
         if let Some(equals) = record.iter().position(|byte| *byte == b'=') {
             let key = String::from_utf8_lossy(&record[..equals]);
+            let value = &record[equals + 1..];
             if key == "path" || key == "GNU.sparse.name" {
-                path = Some(String::from_utf8_lossy(&record[equals + 1..]).into_owned());
+                found.path = Some(String::from_utf8_lossy(value).into_owned());
             } else if key.contains(".xattr.security.") || key.contains(".xattr.trusted.") {
-                what = Some(WITH_CAPABILITIES);
+                found.what = Some(WITH_CAPABILITIES);
+                // bsdtar writes each attribute twice; the `LIBARCHIVE`
+                // record holds its value as base64.
+                if key == "LIBARCHIVE.xattr.security.capability" {
+                    found.capability = Some(String::from_utf8_lossy(value).into_owned());
+                } else if key != "SCHILY.xattr.security.capability" {
+                    others = true;
+                }
             } else if (key.contains(".acl.") || key.contains(".xattr.system.posix_acl"))
-                && what.is_none()
+                && found.what.is_none()
             {
-                what = Some(WITH_ACL);
+                found.what = Some(WITH_ACL);
             }
         }
         rest = &rest[length..];
     }
-    (what, path)
+    if others {
+        found.capability = None;
+    }
+    found
 }
+
+/// What a pax extended header says about the entry after it.
+#[derive(Default)]
+struct Records {
+    /// What its attributes grant, if anything.
+    what: Option<&'static str>,
+    /// The entry's path, if the header gives one.
+    path: Option<String>,
+    /// The value of its `security.capability` attribute as base64, when
+    /// that is its only attribute of the kind.
+    capability: Option<String>,
+}
+
+/// An entry's path, what its attributes grant, and the value of its file
+/// capabilities (see `Records::capability`).
+type Attribute = (String, &'static str, Option<String>);
 
 /// An entry under a symbolic-link directory is installed wherever that
 /// link points, not where it is listed: such an archive is refused.
@@ -546,6 +577,9 @@ pub struct Archive {
     identity: Identity,
     entries: Vec<Entry>,
     index: HashMap<String, usize>,
+    /// The file capabilities the archive gives its entries, by path, as
+    /// the base64 of the attribute's value.
+    capabilities: HashMap<String, String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -589,6 +623,7 @@ impl Archive {
             identity: Identity::of(&metadata),
             entries: Vec::new(),
             index: HashMap::new(),
+            capabilities: HashMap::new(),
         };
         let names = archive.bsdtar(&["-tf".into(), "-".into()], LISTING_LIMITS)?;
         let details = archive.bsdtar(
@@ -613,7 +648,7 @@ impl Archive {
             .collect();
         // What the listing does not show: file capabilities and access
         // control lists, which libalpm restores with the file.
-        for (path, what) in archive.attributes()? {
+        for (path, what, capability) in archive.attributes()? {
             let index = archive.index.get(&path).copied().ok_or_else(|| {
                 Error::Refused(format!(
                     "{}: its attributes name {path:?}, which its listing does not",
@@ -621,6 +656,9 @@ impl Archive {
                 ))
             })?;
             archive.entries[index].root_set_id.get_or_insert(what);
+            if let Some(capability) = capability {
+                archive.capabilities.insert(path, capability);
+            }
         }
         Ok(archive)
     }
@@ -629,7 +667,7 @@ impl Archive {
     /// archive rewritten as an uncompressed tar stream: there every such
     /// attribute stands in a header before its entry, whatever compression
     /// and tar dialect the package uses.
-    fn attributes(&self) -> Result<Vec<(String, &'static str)>, Error> {
+    fn attributes(&self) -> Result<Vec<Attribute>, Error> {
         let failed = |detail: String| Error::ToolFailed {
             tool: "bsdtar".into(),
             detail: format!("{}: {detail}", self.path.display()),
@@ -684,6 +722,12 @@ impl Archive {
                 detail: format!("{}: {}", self.path.display(), captured.failure_detail()),
             })
         }
+    }
+
+    /// The file capabilities the archive gives `path` (see
+    /// `capabilities`), when those are all its attributes grant.
+    pub fn shipped_capability(&self, path: &str) -> Option<&str> {
+        self.capabilities.get(path).map(String::as_str)
     }
 
     /// The path must still name the file that was reviewed.
@@ -1980,7 +2024,9 @@ mod tests {
         tar.extend(block(
             "PaxHeader/capped",
             b'x',
-            record("SCHILY.xattr.security.capability", "\u{1}").as_bytes(),
+            (record("LIBARCHIVE.xattr.security.capability", "AQAAAoAAAAA=")
+                + &record("SCHILY.xattr.security.capability", "\u{1}"))
+                .as_bytes(),
         ));
         tar.extend(block("usr/bin/capped", b'0', b"x\n"));
         tar.extend(block(
@@ -1995,8 +2041,12 @@ mod tests {
         assert_eq!(
             super::attributes_in_tar(tar.as_slice()).unwrap(),
             [
-                ("usr/bin/capped".to_string(), super::WITH_CAPABILITIES),
-                ("usr/share/a/long/name".to_string(), super::WITH_ACL)
+                (
+                    "usr/bin/capped".to_string(),
+                    super::WITH_CAPABILITIES,
+                    Some("AQAAAoAAAAA=".to_string())
+                ),
+                ("usr/share/a/long/name".to_string(), super::WITH_ACL, None)
             ]
         );
         // A stream that ends inside an entry is refused, not half read.

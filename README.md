@@ -810,8 +810,9 @@ capabilities or an access control list (read from the archive itself, since
 pacman restores them), a set-id file for another user or group, and a file
 or directory under `/usr`, `/etc` or `/opt` that everyone (a sticky
 directory aside), a user other than root, or a group other than root's may
-write. Each is passed over when the installed file is already that way
-(access lists are not read back, so those are said every time).
+write. Each is passed over when the installed file is already that way: for
+file capabilities, when it has exactly the ones the package ships (access
+lists are not read back, so those are said every time).
 
 A package that installs a file under `/run`, `/tmp`, `/dev`, `/proc`, `/sys`,
 `/root` or `/home`, or lists one under `/bin`, `/sbin`, `/lib` or `/lib64`
