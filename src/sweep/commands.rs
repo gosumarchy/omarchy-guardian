@@ -184,23 +184,35 @@ fn started(line: &str) -> Vec<String> {
     };
     let mut found = Vec::new();
     let statements = line.replace("&&", ";").replace("||", ";");
-    for statement in statements.split([';', '|']) {
-        let first = statement.split_whitespace().find(|word| {
+    for statement in statements.split([';', '|', '&']) {
+        // Past what comes before a command: keywords, wrappers that run
+        // it, assignments, a `case` pattern.
+        let first = split(statement).into_iter().find(|word| {
             !(matches!(
-                *word,
+                word.as_str(),
                 "exec"
                     | "nohup"
                     | "command"
                     | "setsid"
                     | "env"
+                    | "nice"
+                    | "time"
+                    | "sudo"
+                    | "doas"
+                    | "if"
+                    | "elif"
+                    | "while"
+                    | "until"
                     | "then"
                     | "do"
                     | "else"
+                    | "!"
                     | "{"
                     | "("
-            ) || (word.contains('=') && !is_path(word)))
+            ) || (word.contains('=') && !is_path(word))
+                || word.ends_with(')'))
         });
-        if let Some(word) = first.map(clean).filter(|word| is_path(word))
+        if let Some(word) = first.map(|word| clean(&word)).filter(|word| is_path(word))
             && !found.contains(&word)
         {
             found.push(word);
@@ -471,11 +483,11 @@ pub fn targets_where(home: &str, command: &str, exists: &dyn Fn(&str) -> bool) -
         if assignment || word == "--" || word.starts_with('-') {
             at += 1;
         } else if let Some(wrapper) = WRAPPERS.iter().find(|wrapper| wrapper.name == name) {
-            if let Some(path) =
-                locate(home, &word, exists).filter(|path| !path.starts_with("usr/bin/"))
-            {
-                found.push(path);
-            }
+            found.extend(
+                locate(home, &word, exists)
+                    .into_iter()
+                    .filter(|path| !path.starts_with("usr/bin/")),
+            );
             at += 1;
             while let Some(option) = words.get(at).filter(|word| word.starts_with('-')).cloned() {
                 at += 1;
@@ -518,9 +530,7 @@ pub fn targets_where(home: &str, command: &str, exists: &dyn Fn(&str) -> bool) -
     let Some(program) = words.next() else {
         return found;
     };
-    if let Some(path) = locate(home, program, exists) {
-        found.push(path);
-    }
+    found.extend(locate(home, program, exists));
     let name = program.rsplit('/').next().unwrap_or(program);
     let interpreter = INTERPRETERS.iter().any(|interpreter| {
         name == *interpreter
@@ -558,8 +568,8 @@ pub fn targets_where(home: &str, command: &str, exists: &dyn Fn(&str) -> bool) -
             if word.starts_with('-') {
                 continue;
             }
-            if let Some(path) = locate(home, word, exists).filter(|_| word.contains('/')) {
-                found.push(path);
+            if word.contains('/') {
+                found.extend(locate(home, word, exists));
             }
             break;
         }
@@ -600,13 +610,15 @@ fn inner_commands(code: &str) -> Vec<String> {
     commands
 }
 
-/// The path `word` names, relative to the root, if it exists there.
-fn locate(home: &str, word: &str, exists: &dyn Fn(&str) -> bool) -> Option<String> {
+/// The paths `word` may name, relative to the root, that exist there. A
+/// bare name gives every place it is found in: which of them a shell
+/// would take depends on a `PATH` that is not known here.
+fn locate(home: &str, word: &str, exists: &dyn Fn(&str) -> bool) -> Vec<String> {
     let expanded = expand(home, word);
     let candidates: Vec<String> = if let Some(absolute) = expanded.strip_prefix('/') {
         vec![absolute.to_string()]
     } else if expanded.contains('/') {
-        return None;
+        return Vec::new();
     } else {
         SEARCH
             .iter()
@@ -618,7 +630,10 @@ fn locate(home: &str, word: &str, exists: &dyn Fn(&str) -> bool) -> Option<Strin
             })
             .collect()
     };
-    candidates.into_iter().find(|candidate| exists(candidate))
+    candidates
+        .into_iter()
+        .filter(|candidate| exists(candidate))
+        .collect()
 }
 
 /// `~`, `$HOME`, `${HOME}` and systemd's `%h` as the home directory, and
@@ -751,18 +766,22 @@ mod tests {
             commands(
                 Category::Shell,
                 "home/u/.bashrc",
-                "export X=1\n~/bin/agent --daemon &\nexec /opt/x/run\neval \"$($HOME/bin/tool init)\"\nls -l\n[ -r ~/.x ] && . ~/.x\ncd /tmp && FOO=1 ~/bin/second\n",
+                "export X=1\n~/bin/agent --daemon &\nexec /opt/x/run\neval \"$($HOME/bin/tool init)\"\nls -l\n[ -r ~/.x ] && . ~/.x\ncd /tmp && FOO=1 ~/bin/second\ntrue & A=\"b c\" nice ~/bin/third\nif ! ~/bin/fourth; then :; fi\n",
             ),
             [
                 "~/bin/agent",
                 "/opt/x/run",
                 "$HOME/bin/tool",
                 "~/.x",
-                "~/bin/second"
+                "~/bin/second",
+                "~/bin/third",
+                "~/bin/fourth",
             ]
         );
         // A line of nothing but substitutions is read once, not once per
         // substitution.
+        let many = "$(/x1 $(/x2 ".repeat(100);
+        assert_eq!(commands(Category::Shell, "home/u/.bashrc", &many).len(), 2);
         let long = "$(/x ".repeat(400_000);
         let started = std::time::Instant::now();
         assert!(commands(Category::Shell, "home/u/.bashrc", &long).is_empty());

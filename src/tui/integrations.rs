@@ -795,7 +795,7 @@ impl Paths {
                 replace_file(&self.bashrc, &without_interceptor(&text))
             }
             Step::AddMenuEntry => self.add_menu_lines(&[MENU_ENTRY]),
-            Step::RemoveMenuEntry => self.remove_menu_lines(&|line| line.contains(MENU_ID)),
+            Step::RemoveMenuEntry => self.remove_menu_lines(&|line| names(line, MENU_ID)),
             Step::AddThemeMenu => {
                 let existing = fs::read_to_string(&self.menu).unwrap_or_default();
                 let missing: Vec<&str> = THEME_OVERRIDES
@@ -938,7 +938,7 @@ fn list_ends(mut text: &str) -> bool {
 /// a comment: before any `//` on it.
 fn names(line: &str, text: &str) -> bool {
     line.find(text)
-        .is_some_and(|at| line.find("//").is_none_or(|comment| at < comment))
+        .is_some_and(|at| comment_start(line).is_none_or(|comment| at < comment))
 }
 
 /// Replaces the file at `path` in one step, so a reader never sees it half
@@ -1113,7 +1113,10 @@ fn without_interceptor(text: &str) -> String {
             continue;
         }
         // The line that loads it, wherever it stands.
-        if lines[index].contains(INTERCEPTOR_SOURCE) && lines[index].contains("source ") {
+        if lines[index].contains(INTERCEPTOR_SOURCE)
+            && lines[index].contains("source ")
+            && !lines[index].trim_start().starts_with('#')
+        {
             index += 1;
             continue;
         }
@@ -1183,7 +1186,7 @@ fn with_menu_entries(text: &str, entries: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     use super::{
         INTERCEPTOR_MARKER, Integration, MENU_ENTRY, Paths, State, Step, with_menu_entries,
@@ -1529,6 +1532,11 @@ mod tests {
             "  \"image#omarchy-guardian\", // ours",
             super::WAYBAR_MODULE
         ));
+        // Slashes inside a string before it start no comment.
+        assert!(super::names(
+            "  \"x\": \"https://a.test\", \"image#omarchy-guardian\"",
+            super::WAYBAR_MODULE
+        ));
         // A line that loads the interceptor with no marker above it is
         // taken out all the same.
         let loads = format!("x=1\n[[ -r y ]] && source {}\n", super::INTERCEPTOR_SOURCE);
@@ -1572,6 +1580,21 @@ mod tests {
         assert_eq!(fs::read_to_string(&real).unwrap(), "new\n");
         // Nothing is left beside it.
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+        // Its mode stays what it was.
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o640)).unwrap();
+        super::replace_file(&real, "newer\n").unwrap();
+        assert_eq!(
+            fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        // A link that leads nowhere yet gets its file.
+        let dangling = dir.path().join("dangling.conf");
+        symlink(dir.path().join("made.conf"), &dangling).unwrap();
+        super::replace_file(&dangling, "made\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("made.conf")).unwrap(),
+            "made\n"
+        );
     }
 
     #[test]

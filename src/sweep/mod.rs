@@ -185,21 +185,23 @@ fn forget(label: Option<&str>) -> Result<String, String> {
     ))
 }
 
-/// Adds what root found: now through sudo (`--root`), or from the daily
-/// root timer when the system configuration allows the root checks.
+/// Merges what root found into the user's sweep, with what it says of
+/// the system as a whole (a tainted kernel, say).
 fn merge_root_part(collection: &mut Collection, mut part: root::RootPart, notes: &mut Vec<String>) {
     let seen_by_root = std::mem::take(&mut part.notes);
     root::merge(collection, part);
-    // Root saw every process; the notes about those it could not see no
-    // longer apply. What root says of the system as a whole is kept.
-    notes.retain(|note| !note.contains("the root checks cover them"));
     for note in seen_by_root {
         if !notes.contains(&note) {
             notes.push(note);
         }
     }
+    // Root saw every process; a note that leaves some to the root checks
+    // no longer applies, whichever side wrote it.
+    notes.retain(|note| !note.contains("the root checks cover them"));
 }
 
+/// Adds what root found: now through sudo (`--root`), or from the daily
+/// root timer when the system configuration allows the root checks.
 fn add_root_part(
     collection: &mut Collection,
     options: Options,
@@ -570,6 +572,27 @@ mod tests {
     use super::state::{LastRun, Outcome};
     use super::{is_news, record};
     use crate::test_support::TempDir;
+
+    #[test]
+    fn what_root_says_of_the_system_is_kept_and_what_it_covers_is_dropped() {
+        let covered = "3 process(es) of other users were not looked at; the root checks cover them";
+        let mut notes = vec![covered.to_string(), "the kernel is tainted".to_string()];
+        let part = super::root::RootPart {
+            items: Vec::new(),
+            truncated: Vec::new(),
+            notes: vec![
+                "the kernel is tainted".into(),
+                "1 module(s) no package installed".into(),
+                // Root's own note of the same kind does not come through.
+                covered.into(),
+            ],
+        };
+        super::merge_root_part(&mut super::Collection::default(), part, &mut notes);
+        assert_eq!(
+            notes,
+            ["the kernel is tainted", "1 module(s) no package installed"]
+        );
+    }
 
     #[test]
     fn an_unfinished_sweep_is_news_when_it_starts_or_its_kind_changes() {

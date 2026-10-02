@@ -58,18 +58,17 @@ const EXTRACT_LIMITS: Limits = Limits {
 };
 const C_LOCALE: &[(&str, &str)] = &[("LC_ALL", "C")];
 
-/// `O_NOFOLLOW` and `O_NONBLOCK` in the Linux generic ABI (`x86_64`,
-/// `aarch64` and friends differ only for `O_NOFOLLOW`).
-#[cfg(target_arch = "x86_64")]
+/// `O_NOFOLLOW`, `O_DIRECTORY` and `O_NONBLOCK`. The generic Linux ABI
+/// (`x86_64`, `riscv64`) and Arm's give the first two different bits.
+#[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
 pub const O_NOFOLLOW: i32 = 0o400_000;
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 pub const O_NOFOLLOW: i32 = 0o100_000;
-pub const O_NONBLOCK: i32 = 0o4000;
-/// `O_DIRECTORY`, which differs the same way.
-#[cfg(target_arch = "x86_64")]
+#[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
 pub const O_DIRECTORY: i32 = 0o200_000;
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 pub const O_DIRECTORY: i32 = 0o40_000;
+pub const O_NONBLOCK: i32 = 0o4000;
 
 /// Who may ship a protected path.
 #[derive(Clone, Copy, Debug)]

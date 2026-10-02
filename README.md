@@ -150,10 +150,10 @@ replaced binary, or an interpreter running a script, is checked too: past
 wrappers (`sudo -u`, `uwsm app --`, `systemd-run`, `env`, `timeout`,
 `flock`), into each command a shell is handed with `-c` (the first 32),
 into the files a shell start-up file reads in with `source` or `.` and
-the programs its statements start by a path, a unit's `EnvironmentFile=`, and a Hyprland `.conf`'s
+the programs its statements start by a path (on lines up to 4 KB), a unit's `EnvironmentFile=`, and a Hyprland `.conf`'s
 `source`, `plugin` and `bind … exec` lines. A bare command name is looked
 for in `~/.local/bin`, `~/.cargo/bin`, `~/bin`, `/usr/local` and
-`/usr/bin`; `~`, `$HOME`, `%h` and the XDG directories at their default
+`/usr/bin`, and every place it is found in is judged; `~`, `$HOME`, `%h` and the XDG directories at their default
 places are understood, other variables are not, and a Hyprland `source`
 with `*` in it is not followed. The file itself is always reviewed as
 text; what is not followed is only the extra look at the program it
