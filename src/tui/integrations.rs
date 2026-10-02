@@ -6,7 +6,9 @@
 //! `sudo` can ask for a password); the rest are small, exact file edits.
 
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::config::model::RootConsent;
@@ -358,8 +360,8 @@ impl Paths {
                 if !self.omarchy.is_dir() {
                     return State::Unavailable("Omarchy is not installed".into());
                 }
-                let enabled =
-                    fs::read_to_string(&self.menu).is_ok_and(|text| text.contains(MENU_ID));
+                let enabled = fs::read_to_string(&self.menu)
+                    .is_ok_and(|text| text.lines().any(|line| names(line, MENU_ID)));
                 if enabled { State::On } else { State::Off }
             }
             Integration::BarWidget => self.widget_state(),
@@ -496,7 +498,7 @@ impl Paths {
             .collect();
         let placed = config
             .lines()
-            .any(|line| line.contains(WAYBAR_MODULE) && !line.trim_start().starts_with(&key));
+            .any(|line| names(line, WAYBAR_MODULE) && !line.trim_start().starts_with(&key));
         let styled = fs::read_to_string(&self.waybar_style).is_ok_and(|style| {
             style.contains(WAYBAR_STYLE_BEGIN) && style.contains(WAYBAR_STYLE_END)
         });
@@ -582,13 +584,20 @@ impl Paths {
     /// Whether the Bash interceptor is in `~/.bashrc`, and whether the
     /// Omarchy menu's theme items are overridden (`None` without Omarchy).
     fn theme_parts(&self) -> (bool, Option<bool>) {
-        let bash = fs::read_to_string(&self.bashrc)
-            .is_ok_and(|text| text.lines().any(|line| line == INTERCEPTOR_MARKER));
+        // The line that loads the interceptor, not the marker above it:
+        // a marker left behind, or a line commented out, loads nothing.
+        let bash = fs::read_to_string(&self.bashrc).is_ok_and(|text| {
+            text.lines().any(|line| {
+                line.contains(INTERCEPTOR_SOURCE)
+                    && line.contains("source ")
+                    && !line.trim_start().starts_with('#')
+            })
+        });
         let menu = self.omarchy.is_dir().then(|| {
             fs::read_to_string(&self.menu).is_ok_and(|text| {
                 THEME_OVERRIDES.iter().all(|(id, _)| {
                     text.lines()
-                        .any(|line| line.contains(id) && line.contains(THEME_GATE))
+                        .any(|line| names(line, id) && line.contains(THEME_GATE))
                 })
             })
         });
@@ -781,9 +790,9 @@ impl Paths {
         match step {
             Step::RemoveInterceptor => {
                 let text = fs::read_to_string(&self.bashrc).map_err(|error| error.to_string())?;
-                // Written in place, so a symlinked ~/.bashrc stays a symlink.
-                fs::write(&self.bashrc, without_interceptor(&text))
-                    .map_err(|error| error.to_string())
+                // The file a symlinked ~/.bashrc names is replaced, so the
+                // link stays one.
+                replace_file(&self.bashrc, &without_interceptor(&text))
             }
             Step::AddMenuEntry => self.add_menu_lines(&[MENU_ENTRY]),
             Step::RemoveMenuEntry => self.remove_menu_lines(&|line| line.contains(MENU_ID)),
@@ -831,8 +840,7 @@ impl Paths {
             Step::AddWaybarModule => {
                 let config =
                     fs::read_to_string(&self.waybar_config).map_err(|error| error.to_string())?;
-                fs::write(&self.waybar_config, with_waybar_module(&config)?)
-                    .map_err(|error| error.to_string())?;
+                replace_file(&self.waybar_config, &with_waybar_module(&config)?)?;
                 let style = without_waybar_style(
                     &fs::read_to_string(&self.waybar_style).unwrap_or_default(),
                 );
@@ -841,20 +849,17 @@ impl Paths {
                 } else {
                     "\n"
                 };
-                fs::write(
+                replace_file(
                     &self.waybar_style,
-                    format!("{style}{separator}\n{}", waybar_style(&style)),
+                    &format!("{style}{separator}\n{}", waybar_style(&style)),
                 )
-                .map_err(|error| error.to_string())
             }
             Step::RemoveWaybarModule => {
                 if let Ok(config) = fs::read_to_string(&self.waybar_config) {
-                    fs::write(&self.waybar_config, without_waybar_module(&config))
-                        .map_err(|error| error.to_string())?;
+                    replace_file(&self.waybar_config, &without_waybar_module(&config))?;
                 }
                 if let Ok(style) = fs::read_to_string(&self.waybar_style) {
-                    fs::write(&self.waybar_style, without_waybar_style(&style))
-                        .map_err(|error| error.to_string())?;
+                    replace_file(&self.waybar_style, &without_waybar_style(&style))?;
                 }
                 Ok(())
             }
@@ -874,13 +879,13 @@ impl Paths {
             }
             with_menu_entries("{\n}\n", entries)?
         };
-        fs::write(&self.menu, text).map_err(|error| error.to_string())
+        replace_file(&self.menu, &text)
     }
 
     fn remove_menu_lines(&self, remove: &dyn Fn(&str) -> bool) -> Result<(), String> {
         let text = fs::read_to_string(&self.menu).map_err(|error| error.to_string())?;
         let kept: Vec<&str> = text.lines().filter(|line| !remove(line)).collect();
-        fs::write(&self.menu, kept.join("\n") + "\n").map_err(|error| error.to_string())
+        replace_file(&self.menu, &(kept.join("\n") + "\n"))
     }
 }
 
@@ -897,15 +902,91 @@ fn with_waybar_module(config: &str) -> Result<String, String> {
         .ok_or("the Waybar config does not start with a single object")?;
     let modules = lines
         .iter()
-        .position(|line| line.contains("\"modules-right\"") && line.contains('['))
+        .position(|line| names(line, "\"modules-right\"") && line.contains('['))
         .ok_or("the Waybar config has no \"modules-right\" list")?;
     let line = &lines[modules];
     let at = line.find('[').map_or(line.len(), |index| index + 1);
     let rest = line[at..].trim_start();
-    let comma = if rest.starts_with(']') { "" } else { ", " };
+    // No comma before the end of the list, wherever that is: on this
+    // line, on a later one, or after a comment.
+    let following = std::iter::once(rest)
+        .chain(lines[modules + 1..].iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let comma = if list_ends(&following) { "" } else { ", " };
     lines[modules] = format!("{}{WAYBAR_MODULE}{comma}{rest}", &line[..at]);
     lines.insert(opening + 1, WAYBAR_DEFINITION.to_string());
     Ok(lines.join("\n") + "\n")
+}
+
+/// Whether `text`, what follows a list's `[`, closes the list before any
+/// entry: blanks and comments aside.
+fn list_ends(mut text: &str) -> bool {
+    loop {
+        text = text.trim_start();
+        if let Some(comment) = text.strip_prefix("/*") {
+            text = comment.split_once("*/").map_or("", |(_, after)| after);
+        } else if let Some(comment) = text.strip_prefix("//") {
+            text = comment.split_once('\n').map_or("", |(_, after)| after);
+        } else {
+            return text.starts_with(']');
+        }
+    }
+}
+
+/// Whether a line of a JSON-with-comments file holds `text` as more than
+/// a comment: before any `//` on it.
+fn names(line: &str, text: &str) -> bool {
+    line.find(text)
+        .is_some_and(|at| line.find("//").is_none_or(|comment| at < comment))
+}
+
+/// Replaces the file at `path` in one step, so a reader never sees it half
+/// written and a failed write leaves the old one. A link is followed to
+/// the file it names, which is what is replaced: the link stays a link.
+/// Where a new file cannot be made beside it, it is written in place.
+fn replace_file(path: &Path, text: &str) -> Result<(), String> {
+    let in_place = |target: &Path| fs::write(target, text).map_err(|error| error.to_string());
+    // A link that leads nowhere yet: writing through it makes its file.
+    let Ok(real) = fs::canonicalize(path) else {
+        return in_place(path);
+    };
+    let (Some(directory), Some(name)) = (real.parent(), real.file_name()) else {
+        return Err(format!("{}: not a file path", path.display()));
+    };
+    let temporary = directory.join(format!(
+        ".{}.{}.guardian-tmp",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    drop(fs::remove_file(&temporary));
+    let Ok(mut file) = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+    else {
+        return in_place(&real);
+    };
+    // The old file's mode, whatever the umask says.
+    let mode = fs::metadata(&real).map(|metadata| metadata.permissions());
+    let written = file
+        .write_all(text.as_bytes())
+        .and_then(|()| mode.and_then(|mode| file.set_permissions(mode)))
+        .and_then(|()| file.sync_all());
+    // The new text could not be written (a full disk): the old file is
+    // left as it is.
+    if let Err(error) = written {
+        drop(fs::remove_file(&temporary));
+        return Err(error.to_string());
+    }
+    // A file that cannot be moved over (a bind mount, say) is written as
+    // before.
+    if fs::rename(&temporary, &real).is_err() {
+        drop(fs::remove_file(&temporary));
+        return in_place(&real);
+    }
+    Ok(())
 }
 
 /// `config` without the Guardian module's definition line or list entries.
@@ -915,7 +996,12 @@ fn without_waybar_module(config: &str) -> String {
         .lines()
         .filter(|line| !line.trim_start().starts_with(&definition))
         .map(|line| {
+            // A line that only mentions it in a comment is the user's.
+            if !names(line, WAYBAR_MODULE) {
+                return line.to_string();
+            }
             line.replace(&format!("{WAYBAR_MODULE}, "), "")
+                .replace(&format!("{WAYBAR_MODULE},"), "")
                 .replace(&format!(", {WAYBAR_MODULE}"), "")
                 .replace(WAYBAR_MODULE, "")
         })
@@ -1024,6 +1110,11 @@ fn without_interceptor(text: &str) -> String {
             {
                 index += 1;
             }
+            continue;
+        }
+        // The line that loads it, wherever it stands.
+        if lines[index].contains(INTERCEPTOR_SOURCE) && lines[index].contains("source ") {
+            index += 1;
             continue;
         }
         kept.push(lines[index]);
@@ -1404,6 +1495,83 @@ mod tests {
                 .contains("[\"image#omarchy-guardian\"]")
         );
         assert!(super::with_waybar_module("{\n}\n").is_err());
+
+        // An empty list over several lines, or with a comment in it,
+        // gets no comma after the module.
+        for empty in [
+            "{\n  \"modules-right\": [\n  ]\n}\n",
+            "{\n  \"modules-right\": [ /* none */ ]\n}\n",
+            "{\n  \"modules-right\": [\n    // none\n  ]\n}\n",
+        ] {
+            let added = super::with_waybar_module(empty).unwrap();
+            assert!(!added.contains("guardian\","), "{added}");
+            assert!(!super::without_waybar_module(&added).contains("guardian"));
+        }
+        // One per line: taking it out leaves no comma of its own.
+        let listed =
+            "{\n  \"modules-right\": [\n    \"image#omarchy-guardian\",\n    \"clock\"\n  ]\n}\n";
+        assert!(!super::without_waybar_module(listed).contains(','));
+    }
+
+    #[test]
+    fn a_line_that_is_commented_out_turns_nothing_on() {
+        let dir = TempDir::new("integrations-commented");
+        let paths = paths(&dir);
+        fs::create_dir_all(paths.menu.parent().unwrap()).unwrap();
+        fs::write(&paths.menu, format!("{{\n  // {MENU_ENTRY}\n}}\n")).unwrap();
+        assert_eq!(paths.state(Integration::MenuEntry), State::Off);
+        // Named only in a comment after something else.
+        assert!(!super::names(
+            "  \"clock\", // \"image#omarchy-guardian\"",
+            super::WAYBAR_MODULE
+        ));
+        assert!(super::names(
+            "  \"image#omarchy-guardian\", // ours",
+            super::WAYBAR_MODULE
+        ));
+        // A line that loads the interceptor with no marker above it is
+        // taken out all the same.
+        let loads = format!("x=1\n[[ -r y ]] && source {}\n", super::INTERCEPTOR_SOURCE);
+        assert_eq!(without_interceptor(&loads), "x=1\n");
+        // The marker alone, or the line after it commented out.
+        for bashrc in [
+            format!("{INTERCEPTOR_MARKER}\n"),
+            format!(
+                "{INTERCEPTOR_MARKER}\n# [[ -r x ]] && source {}\n",
+                super::INTERCEPTOR_SOURCE
+            ),
+        ] {
+            fs::write(&paths.bashrc, bashrc).unwrap();
+            assert!(!paths.theme_parts().0);
+        }
+        fs::write(
+            &paths.bashrc,
+            format!(
+                "{INTERCEPTOR_MARKER}\n[[ -r x ]] && source {}\n",
+                super::INTERCEPTOR_SOURCE
+            ),
+        )
+        .unwrap();
+        assert!(paths.theme_parts().0);
+    }
+
+    #[test]
+    fn a_file_is_replaced_whole_and_a_link_to_it_stays_a_link() {
+        let dir = TempDir::new("integrations-replace");
+        let real = dir.path().join("real.conf");
+        let link = dir.path().join("link.conf");
+        fs::write(&real, "old\n").unwrap();
+        symlink(&real, &link).unwrap();
+        super::replace_file(&link, "new\n").unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&real).unwrap(), "new\n");
+        // Nothing is left beside it.
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 
     #[test]

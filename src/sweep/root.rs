@@ -31,12 +31,17 @@ const ROOT_HOME: &str = "root";
 const MAX_OUTPUT: u64 = 64 * 1024 * 1024;
 const MAX_ITEMS: usize = 5000;
 const VERSION: u64 = 1;
+/// The most of one note that is kept.
+const MAX_NOTE_CHARS: usize = 400;
 
 /// What the root collector found.
 #[derive(Debug, Default)]
 pub struct RootPart {
     pub items: Vec<Item>,
     pub truncated: Vec<String>,
+    /// What the live checks say of the system as a whole (a tainted
+    /// kernel, modules no package installed).
+    pub notes: Vec<String>,
 }
 
 /// Where the scheduled root collector leaves what it found.
@@ -90,7 +95,7 @@ pub fn collect_command(out: bool, settings: &crate::config::Settings) -> ExitCod
     let live = live::check(&scope);
     collect::merge(&mut collection, live.items);
     collection.truncated.extend(live.unchecked);
-    let json = to_json(&collection).to_string();
+    let json = to_json(&collection, &live.notes).to_string();
     match group {
         // Written as it is, for the sweep that asked to parse: a path
         // with a hidden character must stay the path it is.
@@ -231,7 +236,7 @@ pub fn results_problem(path: &Path, now: u64) -> Option<String> {
     (metadata.len() > MAX_OUTPUT).then(|| "the root check's results are too large".into())
 }
 
-fn to_json(collection: &Collection) -> Json {
+fn to_json(collection: &Collection, notes: &[String]) -> Json {
     let untrusted = || collection.items.iter().filter(|item| !item.is_trusted());
     let mut truncated = collection.truncated.clone();
     let left_out = untrusted().count().saturating_sub(MAX_ITEMS);
@@ -250,6 +255,15 @@ fn to_json(collection: &Collection) -> Json {
             "truncated",
             Json::Array(
                 collect::bounded(truncated)
+                    .into_iter()
+                    .map(Json::from)
+                    .collect(),
+            ),
+        ),
+        (
+            "notes",
+            Json::Array(
+                collect::bounded(notes.to_vec())
                     .into_iter()
                     .map(Json::from)
                     .collect(),
@@ -406,22 +420,30 @@ fn from_json(text: &str) -> Result<RootPart, String> {
     // But it is said: what root found and this sweep could not read is
     // something that was not checked.
     let unread = listed.len() - items.len();
-    let mut truncated: Vec<String> = json
-        .get("truncated")
-        .and_then(Json::as_array)
-        .map(|locations| {
-            locations
-                .iter()
-                .filter_map(|location| location.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    let sentences = |key: &str| -> Vec<String> {
+        json.get(key)
+            .and_then(Json::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|entry| entry.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut truncated = sentences("truncated");
     if unread > 0 {
         truncated.push(format!(
             "{unread} item(s) of the root checks could not be read and were left out"
         ));
     }
-    Ok(RootPart { items, truncated })
+    Ok(RootPart {
+        items,
+        truncated,
+        notes: collect::bounded(sentences("notes"))
+            .into_iter()
+            .map(|note| note.chars().take(MAX_NOTE_CHARS).collect())
+            .collect(),
+    })
 }
 
 /// Runs the root collector through sudo, which asks for the password on
@@ -528,7 +550,9 @@ mod tests {
         collection.items[1]
             .alerts
             .push((crate::rules::RuleId::HiddenProgram, "seen".into()));
-        let part = from_json(&to_json(&collection).to_string()).unwrap();
+        let noted = vec!["the kernel is tainted (flags 4096)".to_string()];
+        let part = from_json(&to_json(&collection, &noted).to_string()).unwrap();
+        assert_eq!(part.notes, noted);
         assert_eq!(part.items, collection.items[..2]);
         assert_eq!(part.truncated, ["/etc/x"]);
     }
@@ -634,6 +658,7 @@ mod tests {
             super::RootPart {
                 items: vec![root],
                 truncated: Vec::new(),
+                notes: Vec::new(),
             },
         );
         let paths: Vec<&str> = collection

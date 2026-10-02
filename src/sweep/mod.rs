@@ -187,6 +187,19 @@ fn forget(label: Option<&str>) -> Result<String, String> {
 
 /// Adds what root found: now through sudo (`--root`), or from the daily
 /// root timer when the system configuration allows the root checks.
+fn merge_root_part(collection: &mut Collection, mut part: root::RootPart, notes: &mut Vec<String>) {
+    let seen_by_root = std::mem::take(&mut part.notes);
+    root::merge(collection, part);
+    // Root saw every process; the notes about those it could not see no
+    // longer apply. What root says of the system as a whole is kept.
+    notes.retain(|note| !note.contains("the root checks cover them"));
+    for note in seen_by_root {
+        if !notes.contains(&note) {
+            notes.push(note);
+        }
+    }
+}
+
 fn add_root_part(
     collection: &mut Collection,
     options: Options,
@@ -195,12 +208,7 @@ fn add_root_part(
 ) {
     if options.root {
         match root::from_root() {
-            Ok(part) => {
-                root::merge(collection, part);
-                // Root saw every process; the notes about those it could not
-                // see no longer apply.
-                notes.retain(|note| !note.contains("the root checks cover them"));
-            }
+            Ok(part) => merge_root_part(collection, part, notes),
             Err(reason) => notes.push(format!("the root checks did not run ({reason})")),
         }
         return;
@@ -211,12 +219,7 @@ fn add_root_part(
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_secs());
             match root::from_results(Path::new(root::RESULTS), now) {
-                Ok(part) => {
-                root::merge(collection, part);
-                // Root saw every process; the notes about those it could not
-                // see no longer apply.
-                notes.retain(|note| !note.contains("the root checks cover them"));
-            }
+                Ok(part) => merge_root_part(collection, part, notes),
                 Err(reason) => notes.push(format!("root checks: {reason}")),
             }
         }

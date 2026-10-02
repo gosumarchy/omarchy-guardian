@@ -202,6 +202,15 @@ fn local_only(settings: &Settings, integration: Integration) -> Option<String> {
     }) {
         notes.push(format!("findings only warn, and do not block, for {names}"));
     }
+    // The same for a review the AI could not give.
+    if let Some(names) = named(&|class| {
+        settings.policy(class).ai == AiRequirement::Optional
+            && builtin(settings.profile_for(class), class).ai == AiRequirement::Required
+    }) {
+        notes.push(format!(
+            "an AI review that cannot run only warns, and does not block, for {names}"
+        ));
+    }
     (!notes.is_empty()).then(|| notes.join("; "))
 }
 
@@ -357,23 +366,29 @@ pub fn waybar() -> String {
         "local-only" => "Private (no AI)",
         other => other,
     };
-    let mut tooltip = format!("<b>Guardian</b> · {headline}\n{level} · {}\n", status.model);
+    // What is not Guardian's own wording is escaped where it goes in, so
+    // a `<b>` in a title or a setting stays text.
+    let mut tooltip = format!(
+        "<b>Guardian</b> · {headline}\n{} · {}\n",
+        markup_safe(level),
+        markup_safe(&status.model)
+    );
     for gate in &status.gates {
         let mark = if gate.state == "on" { "●" } else { "○" };
         let _ = write!(
             tooltip,
             "\n{mark} {}  {}",
-            gate.label,
+            markup_safe(gate.label),
             gate.state.to_uppercase()
         );
         if !gate.detail.is_empty() {
-            let _ = write!(tooltip, "\n    {}", gate.detail);
+            let _ = write!(tooltip, "\n    {}", markup_safe(&gate.detail));
         }
     }
     if !status.issues.is_empty() {
         tooltip.push_str("\n\n<b>Needs fixing</b>");
         for issue in &status.issues {
-            let _ = write!(tooltip, "\n! {issue}");
+            let _ = write!(tooltip, "\n! {}", markup_safe(issue));
         }
     }
     if let Some(block) = &status.block {
@@ -381,23 +396,25 @@ pub fn waybar() -> String {
             tooltip,
             "\n\n<b>Last block</b> · {}\n{}",
             age(block.age_secs),
-            block.title
+            markup_safe(&block.title)
         );
     }
     tooltip.push_str("\n\nLeft-click: settings · right-click: last report");
+    // Waybar takes the tooltip from one line: its line breaks go as
+    // markup.
     format!(
         "/usr/share/icons/hicolor/scalable/apps/{icon}.svg\n{}",
-        markup_safe(&tooltip)
+        tooltip.replace('\n', "&#10;")
     )
 }
 
-/// Escapes text for Pango markup, keeping Guardian's own `<b>` tags.
+/// Escapes text for Pango markup; a line break or another control
+/// character in it (which markup cannot hold) becomes a space.
 fn markup_safe(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
-        .replace("&lt;b&gt;", "<b>")
-        .replace("&lt;/b&gt;", "</b>")
+        .replace(char::is_control, " ")
 }
 
 fn age(seconds: u64) -> String {
@@ -714,10 +731,10 @@ mod tests {
     }
 
     #[test]
-    fn tooltips_escape_everything_but_guardian_bold() {
+    fn what_goes_into_a_tooltip_is_text_on_one_line() {
         assert_eq!(
-            markup_safe("<b>Last</b> <script> & x"),
-            "<b>Last</b> &lt;script&gt; &amp; x"
+            markup_safe("<b>Last</b> <script> & x\ny\u{1}z"),
+            "&lt;b&gt;Last&lt;/b&gt; &lt;script&gt; &amp; x y z"
         );
         assert_eq!(age(30), "just now");
         assert_eq!(age(7200), "2 h ago");

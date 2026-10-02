@@ -223,7 +223,21 @@ fn masks_a_defence(path: &str, name: &str, index: &PackageIndex) -> bool {
 /// packaged sample linked in under the same name is not something a
 /// package means to run).
 fn enables_a_unit(path: &str, target: &str) -> bool {
-    let unit = path.split('/').any(|part| part == "systemd");
+    // A unit directory, not any directory of systemd's: what sits among
+    // its generators or sleep hooks is run as a program.
+    let extension = std::path::Path::new(target)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    // A drop-in directory (`x.service.d/`) holds settings, not units.
+    let drop_in = path.rsplit_once('/').is_some_and(|(directory, _)| {
+        std::path::Path::new(directory)
+            .extension()
+            .is_some_and(|extension| extension == "d")
+    });
+    let unit = (path.contains("/systemd/system/") || path.contains("/systemd/user/"))
+        && !drop_in
+        && UNIT_EXTENSIONS.contains(&extension);
     let hook = path.starts_with("etc/pacman.d/hooks/")
         && std::path::Path::new(target)
             .extension()
@@ -236,11 +250,34 @@ fn enables_a_unit(path: &str, target: &str) -> bool {
             .is_some_and(|extension| extension == "desktop");
     let program = (path.contains("/.local/bin/") || path.contains("/.cargo/bin/"))
         && (target.starts_with("/usr/bin/") || target.starts_with("/usr/lib/"));
+    // Named in full under a directory only root writes, so the text says
+    // where the link leads: not through `..` or another link of the
+    // user's.
+    let plain = ["/usr/", "/etc/", "/opt/"]
+        .iter()
+        .any(|root| target.starts_with(root))
+        && target.split('/').all(|part| part != ".." && part != ".");
     (unit || hook || launcher || program)
+        && plain
         && !["/doc/", "/docs/", "/examples/", "/example/", "/samples/"]
             .iter()
             .any(|sample| target.contains(sample))
 }
+
+/// What systemd reads as a unit.
+const UNIT_EXTENSIONS: &[&str] = &[
+    "service",
+    "socket",
+    "timer",
+    "target",
+    "path",
+    "mount",
+    "automount",
+    "swap",
+    "slice",
+    "device",
+    "scope",
+];
 
 /// Whether link `name` enables the unit at `target`: the same name, or an
 /// instance (`getty@tty1.service`) of a template (`getty@.service`).
@@ -389,6 +426,49 @@ mod tests {
             ),
             Tier::Modified
         );
+    }
+
+    #[test]
+    fn a_link_is_trusted_only_where_units_are_read_and_its_text_says_where_it_leads() {
+        let index = index();
+        let link = |target, resolved| Observed::Link {
+            target,
+            resolved,
+            alias: false,
+        };
+        let vendor = Some(Tier::Vendor);
+        // Not every directory of systemd's holds units, and a target not
+        // named in full under the system's own directories says nothing
+        // of where the link leads.
+        for (path, target) in [
+            ("etc/systemd/system-generators/demo", "/usr/bin/demo"),
+            (
+                "usr/lib/systemd/system-sleep/demo.service",
+                "/usr/lib/systemd/system/demo.service",
+            ),
+            (
+                "etc/systemd/system/demo.service",
+                "/usr/lib/systemd/system/../../share/demo/demo.service",
+            ),
+            (
+                "home/u/.config/systemd/user/demo.service",
+                "/home/u/d/demo.service",
+            ),
+            (
+                "etc/systemd/system/demo.service.d/demo.service",
+                "/usr/lib/systemd/system/demo.service",
+            ),
+            (
+                "home/u/.config/systemd/user/demo.service",
+                "../../../d/demo.service",
+            ),
+        ] {
+            assert_eq!(
+                classify(path, link(target, vendor), &index),
+                Tier::Unknown,
+                "{path} -> {target}"
+            );
+        }
     }
 
     #[test]

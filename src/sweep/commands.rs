@@ -11,8 +11,9 @@ use crate::autorun::Category;
 
 /// Programs that run the file they are given.
 const INTERPRETERS: &[&str] = &[
-    "sh", "bash", "dash", "zsh", "fish", "python", "python3", "perl", "ruby", "node", "lua",
-    "luajit", "php",
+    "sh", "bash", "dash", "zsh", "fish", "ksh", "python", "python3", "perl", "ruby", "node", "bun",
+    "deno", "lua", "luajit", "php", "tclsh", "wish", "expect", "Rscript", "pwsh", "julia", "guile",
+    "awk", "gawk", "mawk",
 ];
 
 /// A wrapper that runs the command after it: its name, its options that
@@ -86,7 +87,14 @@ const UWSM_RUNS: &[&str] = &["app", "start"];
 
 /// Where a bare command name is looked for, relative to the root; `~`
 /// stands for the home directory.
-const SEARCH: &[&str] = &["~/.local/bin", "usr/local/bin", "usr/bin"];
+const SEARCH: &[&str] = &[
+    "~/.local/bin",
+    "~/.cargo/bin",
+    "~/bin",
+    "usr/local/sbin",
+    "usr/local/bin",
+    "usr/bin",
+];
 
 /// The command lines `text` (a file of `category` named `name`) runs.
 pub fn commands(category: Category, path: &str, text: &str) -> Vec<String> {
@@ -117,7 +125,11 @@ pub fn commands(category: Category, path: &str, text: &str) -> Vec<String> {
             Category::Kernel => modprobe(line),
             Category::Pam => pam(line),
             Category::Ssh => ssh(line).map(|(_, value)| value).into_iter().collect(),
-            Category::Shell => sourced(line),
+            Category::Shell => {
+                let mut runs = sourced(line);
+                runs.extend(started(line));
+                runs
+            }
             _ => key_value(line),
         };
         found.extend(command);
@@ -145,6 +157,68 @@ fn sourced(line: &str) -> Vec<String> {
         .map(|(_, pair)| pair[1].trim_matches(['"', '\'', ';']).to_string())
         .filter(|file| !file.is_empty())
         .collect()
+}
+
+/// The longest line of a start-up file looked through for programs, and
+/// the most substitutions on it.
+const MAX_STARTED_LINE: usize = 4096;
+const MAX_SUBSTITUTIONS: usize = 16;
+
+/// The programs a line of a shell start-up file names by a path, as the
+/// command of a statement (`~/bin/agent &`, `cd x && exec /opt/x/run`) or
+/// inside a substitution (`eval "$(~/bin/tool init)"`). A bare name is not
+/// looked up: it is a shell builtin or an ordinary command far more often
+/// than not. A very long line is left to the review of the file's text.
+fn started(line: &str) -> Vec<String> {
+    if line.len() > MAX_STARTED_LINE {
+        return Vec::new();
+    }
+    let is_path = |word: &str| {
+        ["/", "~/", "$HOME/", "${HOME}/"]
+            .iter()
+            .any(|start| word.starts_with(start))
+    };
+    let clean = |word: &str| {
+        word.trim_matches(['"', '\'', ';', '&', ')', '(', '`'])
+            .to_string()
+    };
+    let mut found = Vec::new();
+    let statements = line.replace("&&", ";").replace("||", ";");
+    for statement in statements.split([';', '|']) {
+        let first = statement.split_whitespace().find(|word| {
+            !(matches!(
+                *word,
+                "exec"
+                    | "nohup"
+                    | "command"
+                    | "setsid"
+                    | "env"
+                    | "then"
+                    | "do"
+                    | "else"
+                    | "{"
+                    | "("
+            ) || (word.contains('=') && !is_path(word)))
+        });
+        if let Some(word) = first.map(clean).filter(|word| is_path(word))
+            && !found.contains(&word)
+        {
+            found.push(word);
+        }
+    }
+    for opener in ["$(", "`"] {
+        for (at, _) in line.match_indices(opener).take(MAX_SUBSTITUTIONS) {
+            let word = line[at + opener.len()..]
+                .split_whitespace()
+                .next()
+                .map(clean)
+                .unwrap_or_default();
+            if is_path(&word) && !found.contains(&word) {
+                found.push(word);
+            }
+        }
+    }
+    found
 }
 
 /// The commands of a crontab: after five time fields (or `@reboot` and
@@ -457,15 +531,17 @@ pub fn targets_where(home: &str, command: &str, exists: &dyn Fn(&str) -> bool) -
     if interpreter {
         while let Some(word) = words.next() {
             // `sh -c "command line"` (also `-lc`, `-ic`) runs that line:
-            // what it names by a path is found the same way, wrappers
-            // and all. A bare name in it is not looked up.
+            // each command in it is found the same way, wrappers and
+            // all. What `/usr/bin` holds is not listed again.
             if word.starts_with('-') && !word.starts_with("--") && word.ends_with('c') {
                 if let Some(code) = words.next() {
-                    found.extend(
-                        targets_where(home, code, exists)
-                            .into_iter()
-                            .filter(|path| !path.starts_with("usr/bin/")),
-                    );
+                    for command in inner_commands(code) {
+                        for path in targets_where(home, &command, exists) {
+                            if !path.starts_with("usr/bin/") && !found.contains(&path) {
+                                found.push(path);
+                            }
+                        }
+                    }
                 }
                 break;
             }
@@ -491,6 +567,39 @@ pub fn targets_where(home: &str, command: &str, exists: &dyn Fn(&str) -> bool) -
     found
 }
 
+/// The most commands of one `sh -c` line that are looked up.
+const MAX_INNER_COMMANDS: usize = 32;
+
+/// The commands of a `sh -c` line: split at `;`, `|`, `&` and line ends
+/// outside quotes, the first `MAX_INNER_COMMANDS` that are not empty.
+fn inner_commands(code: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+    let mut command = String::new();
+    let mut quote: Option<char> = None;
+    for character in code.chars() {
+        match quote {
+            Some(open) if character == open => quote = None,
+            None if matches!(character, '"' | '\'') => quote = Some(character),
+            None if matches!(character, ';' | '|' | '&' | '\n') => {
+                if !command.trim().is_empty() {
+                    commands.push(std::mem::take(&mut command));
+                    if commands.len() == MAX_INNER_COMMANDS {
+                        return commands;
+                    }
+                }
+                command.clear();
+                continue;
+            }
+            _ => {}
+        }
+        command.push(character);
+    }
+    if !command.trim().is_empty() {
+        commands.push(command);
+    }
+    commands
+}
+
 /// The path `word` names, relative to the root, if it exists there.
 fn locate(home: &str, word: &str, exists: &dyn Fn(&str) -> bool) -> Option<String> {
     let expanded = expand(home, word);
@@ -512,11 +621,22 @@ fn locate(home: &str, word: &str, exists: &dyn Fn(&str) -> bool) -> Option<Strin
     candidates.into_iter().find(|candidate| exists(candidate))
 }
 
-/// `~`, `$HOME`, `${HOME}` and systemd's `%h` as the home directory.
+/// `~`, `$HOME`, `${HOME}` and systemd's `%h` as the home directory, and
+/// the XDG directories where they are by default.
 fn expand(home: &str, word: &str) -> String {
     for prefix in ["~/", "$HOME/", "${HOME}/", "%h/"] {
         if let Some(rest) = word.strip_prefix(prefix) {
             return format!("/{home}/{rest}");
+        }
+    }
+    for (prefixes, directory) in [
+        (["$XDG_CONFIG_HOME/", "${XDG_CONFIG_HOME}/"], ".config"),
+        (["$XDG_DATA_HOME/", "${XDG_DATA_HOME}/"], ".local/share"),
+    ] {
+        for prefix in prefixes {
+            if let Some(rest) = word.strip_prefix(prefix) {
+                return format!("/{home}/{directory}/{rest}");
+            }
         }
     }
     word.to_string()
@@ -549,7 +669,7 @@ fn split(command: &str) -> Vec<String> {
 mod tests {
     use std::fs;
 
-    use super::{commands, targets};
+    use super::{commands, targets, targets_where};
     use crate::autorun::Category;
     use crate::test_support::TempDir;
 
@@ -622,6 +742,70 @@ mod tests {
             ["/usr/bin/z"]
         );
         assert!(commands(Category::Cron, "etc/cron.daily/x", "#!/bin/sh\ncurl x\n").is_empty());
+    }
+
+    #[test]
+    fn what_a_start_up_file_or_a_command_line_names_is_found() {
+        // A program a shell start-up file runs by its path.
+        assert_eq!(
+            commands(
+                Category::Shell,
+                "home/u/.bashrc",
+                "export X=1\n~/bin/agent --daemon &\nexec /opt/x/run\neval \"$($HOME/bin/tool init)\"\nls -l\n[ -r ~/.x ] && . ~/.x\ncd /tmp && FOO=1 ~/bin/second\n",
+            ),
+            [
+                "~/bin/agent",
+                "/opt/x/run",
+                "$HOME/bin/tool",
+                "~/.x",
+                "~/bin/second"
+            ]
+        );
+        // A line of nothing but substitutions is read once, not once per
+        // substitution.
+        let long = "$(/x ".repeat(400_000);
+        let started = std::time::Instant::now();
+        assert!(commands(Category::Shell, "home/u/.bashrc", &long).is_empty());
+        assert!(started.elapsed().as_secs() < 10);
+        let exists = |candidate: &str| {
+            [
+                "home/u/.cargo/bin/tool",
+                "home/u/.config/app/run.sh",
+                "home/u/.local/bin/first",
+                "home/u/.local/bin/second",
+                "usr/bin/sh",
+            ]
+            .contains(&candidate)
+        };
+        // A bare name where cargo installs, and the XDG directories.
+        assert_eq!(
+            targets_where("home/u", "tool --serve", &exists),
+            ["home/u/.cargo/bin/tool"]
+        );
+        assert_eq!(
+            targets_where("home/u", "$XDG_CONFIG_HOME/app/run.sh", &exists),
+            ["home/u/.config/app/run.sh"]
+        );
+        // Every command of a `-c` line, not only its first.
+        assert_eq!(
+            targets_where("home/u", "sh -c 'first && second; third | first'", &exists),
+            [
+                "usr/bin/sh",
+                "home/u/.local/bin/first",
+                "home/u/.local/bin/second"
+            ]
+        );
+        // A separator inside quotes separates nothing, and empty commands
+        // do not use up the limit.
+        assert_eq!(
+            targets_where("home/u", "sh -c 'x=\";\" second'", &exists),
+            ["usr/bin/sh", "home/u/.local/bin/second"]
+        );
+        let padded = format!("sh -c '{} second'", ";".repeat(100));
+        assert_eq!(
+            targets_where("home/u", &padded, &exists),
+            ["usr/bin/sh", "home/u/.local/bin/second"]
+        );
     }
 
     #[test]

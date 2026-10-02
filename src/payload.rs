@@ -65,6 +65,11 @@ pub const O_NOFOLLOW: i32 = 0o400_000;
 #[cfg(not(target_arch = "x86_64"))]
 pub const O_NOFOLLOW: i32 = 0o100_000;
 pub const O_NONBLOCK: i32 = 0o4000;
+/// `O_DIRECTORY`, which differs the same way.
+#[cfg(target_arch = "x86_64")]
+pub const O_DIRECTORY: i32 = 0o200_000;
+#[cfg(not(target_arch = "x86_64"))]
+pub const O_DIRECTORY: i32 = 0o40_000;
 
 /// Who may ship a protected path.
 #[derive(Clone, Copy, Debug)]
