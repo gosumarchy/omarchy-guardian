@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 
 use crate::content::{self, Content, Format, Prefix};
 use crate::error::Error;
+use crate::git_state;
+use crate::payload::O_NOFOLLOW;
 use crate::report::Gap;
 use crate::sha256::{Digest, Sha256};
 
@@ -255,6 +257,48 @@ pub fn verify_unchanged(config: &ScanConfig, expected: &Snapshot) -> Result<(), 
     Ok(())
 }
 
+/// Like `verify_unchanged`, for a copy made without git's own directories
+/// (the sandbox leaves them behind): those are not compared.
+pub fn verify_copy(config: &ScanConfig, expected: &Snapshot) -> Result<(), Error> {
+    let (current, gaps) = walk(config, &mut |_| {});
+    let kept = |snapshot: &Snapshot| -> Vec<FileHash> {
+        snapshot
+            .files
+            .iter()
+            .filter(|file| file.path.split('/').all(|part| part != ".git"))
+            .cloned()
+            .collect()
+    };
+    if !gaps.is_empty() || kept(&current) != kept(expected) || current.skipped != expected.skipped {
+        return Err(Error::Refused(
+            "the sandbox copy does not match the reviewed source".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The text of a regular file no larger than a reviewable one, opened
+/// without following a link or waiting on a pipe.
+fn read_small_file(path: &Path) -> Option<String> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_TEXT_FILE_SIZE {
+        return None;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_TEXT_FILE_SIZE + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= MAX_TEXT_FILE_SIZE).then(|| String::from_utf8_lossy(&bytes).into_owned())
+}
+
 struct Walker<'a> {
     config: &'a ScanConfig,
     on_text: &'a mut dyn FnMut(TextFile<'_>),
@@ -265,7 +309,7 @@ struct Walker<'a> {
     /// A limit was passed: the walk stops and the review is incomplete.
     stopped: bool,
     /// Files with more than one link, by device and inode: read once.
-    links: HashMap<(u64, u64), (Digest, Contents)>,
+    links: HashMap<LinkKey, (Digest, Contents)>,
     skipped: Vec<SkippedDir>,
 }
 
@@ -405,6 +449,23 @@ impl Walker<'_> {
         }
         names.sort();
 
+        // A directory laid out as a git repository without being called
+        // `.git` (a bare repository, or where a `commondir` points): git
+        // run in it takes its configuration from here all the same.
+        let has = |name: &str| names.iter().any(|entry| entry == name);
+        if has("HEAD") && has("objects") && has("refs") && has("config") {
+            let shown = if rel.is_empty() { "." } else { rel };
+            match read_small_file(&handle.join("config")) {
+                Some(text) if git_state::executing_keys(&text).is_empty() => {}
+                Some(_) => self.gaps.push(Gap::GitState(format!(
+                    "{shown}: laid out as a git repository, with a configuration that names a command git runs"
+                ))),
+                None => self.gaps.push(Gap::GitState(format!(
+                    "{shown}: laid out as a git repository, with a configuration that cannot be read"
+                ))),
+            }
+        }
+
         for name in names {
             let child_logical = logical.join(&name);
             let Some(name_text) = name.to_str() else {
@@ -439,6 +500,65 @@ impl Walker<'_> {
         }
     }
 
+    /// A submodule's git directory under `modules`, or, for a submodule
+    /// at a nested path (`vendor/lib`), the directories on the way to it.
+    fn git_module(&mut self, access: &Path, logical: &Path, rel: &str, depth: usize) {
+        if depth >= MAX_MODULE_DEPTH {
+            self.gaps.push(Gap::GitState(format!(
+                "{rel}: submodule directories nested too deep to review"
+            )));
+            return;
+        }
+        let is_directory = fs::symlink_metadata(access).is_ok_and(|metadata| metadata.is_dir());
+        // A submodule named `a/b` lives below the one named `a`, so a git
+        // directory is looked into as well.
+        let is_git = fs::symlink_metadata(access.join("HEAD")).is_ok()
+            || fs::symlink_metadata(access.join("config")).is_ok();
+        if is_git || !is_directory {
+            self.git_directory(access, logical, rel);
+        }
+        if !is_directory {
+            return;
+        }
+        let listing = match fs::read_dir(access) {
+            Ok(listing) => listing,
+            Err(error) => return self.io_gap(logical, error),
+        };
+        let mut names: Vec<String> = listing
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect();
+        names.sort();
+        for name in names {
+            let child = access.join(&name);
+            if is_git && git_state::OWN_DIRECTORIES.contains(&name.as_str()) {
+                continue;
+            }
+            let Ok(metadata) = fs::symlink_metadata(&child) else {
+                continue;
+            };
+            // Git follows a link to a submodule's directory; the walk
+            // does not.
+            if metadata.file_type().is_symlink() {
+                if fs::metadata(&child).is_ok_and(|target| target.is_dir()) {
+                    self.gaps
+                        .push(Gap::Symlink(format!("{rel}/{name} (a linked submodule)")));
+                }
+                continue;
+            }
+            // A file here is git's own state, not a submodule.
+            if !metadata.is_dir() {
+                continue;
+            }
+            self.git_module(
+                &child,
+                &logical.join(&name),
+                &format!("{rel}/{name}"),
+                depth + 1,
+            );
+        }
+    }
+
     /// A `.git` directory: its `config` (checked for keys that run commands,
     /// never sent to the AI) and its hooks other than git's `.sample` files
     /// are reviewed, and a submodule's git directory the same way. The
@@ -463,6 +583,13 @@ impl Walker<'_> {
             Err(error) => return self.io_gap(logical, error),
         };
         let handle = fd_path(&directory);
+        // With a `commondir`, git takes the configuration and hooks of
+        // the directory it names instead of this one's.
+        if fs::symlink_metadata(handle.join("commondir")).is_ok() {
+            self.gaps.push(Gap::GitState(format!(
+                "{rel}/commondir: git reads this repository's configuration and hooks from another directory"
+            )));
+        }
         for config in ["config", "config.worktree"] {
             match fs::symlink_metadata(handle.join(config)) {
                 // Git reads through a link here; the walk would only
@@ -517,7 +644,7 @@ impl Walker<'_> {
                         self.entry(&child_handle.join(&entry), &entry_logical, entry_rel);
                     }
                 } else {
-                    self.git_directory(&child_handle.join(&entry), &entry_logical, &entry_rel);
+                    self.git_module(&child_handle.join(&entry), &entry_logical, &entry_rel, 0);
                 }
             }
         }
@@ -546,7 +673,21 @@ impl Walker<'_> {
         }
 
         let executable = metadata.mode() & 0o111 != 0;
-        let key = (metadata.dev(), metadata.ino());
+        // How a file is read depends on its name and mode as well as on
+        // its bytes: a link under a script's name is not classed by what
+        // the same bytes were under a data file's.
+        let extension = rel
+            .rsplit('/')
+            .next()
+            .and_then(|name| name.rsplit_once('.'))
+            .map(|(_, extension)| extension.to_ascii_lowercase())
+            .unwrap_or_default();
+        let key = (
+            metadata.dev(),
+            metadata.ino(),
+            extension,
+            content::must_review(&rel, b""),
+        );
         let cached = (metadata.nlink() > 1)
             .then(|| self.links.get(&key).cloned())
             .flatten();
@@ -596,6 +737,13 @@ impl Walker<'_> {
         });
     }
 }
+
+/// How deep under `modules` a submodule's git directory is looked for.
+const MAX_MODULE_DEPTH: usize = 6;
+
+/// A file with several links, and how its name makes it be read (its
+/// extension, and whether it is one that must be reviewed).
+type LinkKey = (u64, u64, String, bool);
 
 /// Entries under `path`, not following links, counted up to `limit`.
 fn count_entries(path: &Path, limit: usize) -> usize {
@@ -703,6 +851,47 @@ mod tests {
         let mut texts = Vec::new();
         let (snapshot, gaps) = walk(config, &mut |file| texts.push(file.rel.to_string()));
         (texts, snapshot, gaps)
+    }
+
+    #[test]
+    fn a_repository_under_another_name_is_read_without_waiting_on_it() {
+        let dir = TempDir::new("bare-layout");
+        let bare = dir.path().join("b");
+        fs::create_dir_all(bare.join("objects")).unwrap();
+        fs::create_dir_all(bare.join("refs")).unwrap();
+        fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        // A configuration that is no regular file: a gap, not a read.
+        symlink("/dev/zero", bare.join("config")).unwrap();
+        let config = ScanConfig::new(dir.path().to_path_buf());
+        let (_, _, gaps) = walk_texts(&config);
+        assert!(
+            gaps.iter().any(|gap| matches!(gap, Gap::GitState(_))),
+            "{gaps:?}"
+        );
+
+        // A submodule kept below another one's git directory.
+        let dir = TempDir::new("nested-modules");
+        let modules = dir.path().join(".git/modules");
+        fs::create_dir_all(modules.join("a/b/hooks")).unwrap();
+        fs::write(modules.join("a/HEAD"), "ref: x\n").unwrap();
+        fs::write(modules.join("a/b/config"), "[core]\n").unwrap();
+        fs::write(modules.join("a/b/hooks/post-checkout"), "#!/bin/sh\n").unwrap();
+        // What git leaves behind in one is no submodule.
+        fs::create_dir_all(modules.join("a/rebase-merge")).unwrap();
+        fs::write(modules.join("a/rebase-merge/head-name"), "refs/heads/x\n").unwrap();
+        let config = ScanConfig::new(dir.path().to_path_buf());
+        let (texts, _, gaps) = walk_texts(&config);
+        assert!(gaps.is_empty(), "{gaps:?}");
+        for expected in [
+            ".git/modules/a/b/config",
+            ".git/modules/a/b/hooks/post-checkout",
+        ] {
+            assert!(texts.contains(&expected.to_string()), "{texts:?}");
+        }
+        // One reached through a link is not read, and says so.
+        symlink(dir.path(), modules.join("a/linked")).unwrap();
+        let (_, _, gaps) = walk_texts(&config);
+        assert!(matches!(gaps.as_slice(), [Gap::Symlink(_)]), "{gaps:?}");
     }
 
     #[test]
@@ -821,6 +1010,34 @@ mod tests {
         fs::write(dir.path().join("sub/.git"), "gitdir: ../.git/modules/lib\n").unwrap();
         let (_, _, gaps) = walk_texts(&config);
         assert_eq!(gaps.len(), 2, "{gaps:?}");
+
+        // A commondir, a submodule at a nested path, and a repository
+        // laid out under another name.
+        fs::write(dir.path().join(".git/commondir"), "../elsewhere\n").unwrap();
+        fs::create_dir_all(dir.path().join(".git/modules/vendor/lib/hooks")).unwrap();
+        fs::write(
+            dir.path().join(".git/modules/vendor/lib/config"),
+            "[core]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("bare/objects")).unwrap();
+        fs::create_dir_all(dir.path().join("bare/refs")).unwrap();
+        fs::write(dir.path().join("bare/HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(
+            dir.path().join("bare/config"),
+            "[core]\n\tfsmonitor = sh x\n",
+        )
+        .unwrap();
+        let (texts, _, gaps) = walk_texts(&config);
+        assert!(
+            texts.contains(&".git/modules/vendor/lib/config".to_string()),
+            "{texts:?}"
+        );
+        let states: Vec<&Gap> = gaps
+            .iter()
+            .filter(|gap| matches!(gap, Gap::GitState(_)))
+            .collect();
+        assert_eq!(states.len(), 2, "{gaps:?}");
     }
 
     #[test]
@@ -1031,6 +1248,23 @@ mod tests {
         fs::write(dir.path().join("big.sh"), bytes).unwrap();
         let (_, _, gaps) = walk_texts(&ScanConfig::new(dir.path()));
         assert!(matches!(gaps.as_slice(), [Gap::OversizedText(path)] if path == "big.sh"));
+    }
+
+    #[test]
+    fn a_link_is_read_as_its_own_name_makes_it() {
+        // The same bytes are an image under one name and text with a NUL
+        // in it under another.
+        let bytes = b"BM\nhelper() { true; }\n\0\nmore\n";
+        let alone = TempDir::new("scan-link-alone");
+        fs::write(alone.path().join("b.inc"), bytes).unwrap();
+        let (_, _, expected) = walk_texts(&ScanConfig::new(alone.path()));
+        assert_eq!(expected.len(), 1, "{expected:?}");
+
+        let dir = TempDir::new("scan-link-names");
+        fs::write(dir.path().join("a.bmp"), bytes).unwrap();
+        fs::hard_link(dir.path().join("a.bmp"), dir.path().join("b.inc")).unwrap();
+        let (_, _, gaps) = walk_texts(&ScanConfig::new(dir.path()));
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
     }
 
     #[test]

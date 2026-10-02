@@ -40,9 +40,15 @@ pub fn classify(args: &[OsString]) -> Invocation {
     let mut info_only = false;
     let mut source_only = false;
     let mut noextract = false;
+    // The value of an option that takes one is not an option itself.
+    let mut is_value = false;
     for arg in args {
+        if std::mem::take(&mut is_value) {
+            continue;
+        }
         let Some(arg) = arg.to_str() else { continue };
         match arg {
+            "--config" | "--key" => is_value = true,
             "--packagelist" | "--printsrcinfo" | "--version" | "--help" => info_only = true,
             "--verifysource" | "--source" | "--allsource" | "--geninteg" => source_only = true,
             "--noextract" => noextract = true,
@@ -51,11 +57,17 @@ pub fn classify(args: &[OsString]) -> Invocation {
                     .strip_prefix('-')
                     .filter(|flags| !flags.starts_with('-'))
                 {
-                    for flag in flags.chars() {
+                    for (index, flag) in flags.char_indices() {
                         match flag {
                             'V' | 'h' => info_only = true,
                             'S' | 'g' => source_only = true,
                             'e' => noextract = true,
+                            // `-p <file>`: the rest of the word is the
+                            // file, or the next word is.
+                            'p' => {
+                                is_value = index + 1 == flags.len();
+                                break;
+                            }
                             _ => {}
                         }
                     }
@@ -621,6 +633,38 @@ const SCRIPT_DEPTH: usize = 3;
 
 /// Version-control metadata, which a build does not run.
 const SKIPPED_DIRECTORIES: &[&str] = &[".git", ".hg", ".svn", ".bzr"];
+/// The files git itself keeps at the top of its directory.
+const GIT_OWN_FILES: &[&str] = &[
+    "HEAD",
+    "ORIG_HEAD",
+    "FETCH_HEAD",
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "AUTO_MERGE",
+    "COMMIT_EDITMSG",
+    "MERGE_MSG",
+    "config",
+    "config.worktree",
+    "commondir",
+    "gitdir",
+    "description",
+    "index",
+    "packed-refs",
+    "shallow",
+    "SQUASH_MSG",
+    "TAG_EDITMSG",
+    "MERGE_MODE",
+    "MERGE_RR",
+    "REBASE_HEAD",
+    "BISECT_LOG",
+    "BISECT_START",
+    "BISECT_TERMS",
+    "BISECT_EXPECTED_REV",
+    "BISECT_NAMES",
+    "gc.log",
+    "index.lock",
+];
 /// The most archives named one by one as not unpacked (a Java project
 /// ships dozens of jars).
 const MAX_ARCHIVES_NAMED: usize = 5;
@@ -967,9 +1011,44 @@ impl Walk<'_> {
     /// commands a build often runs (`git describe`, `git status`). A
     /// checkout makepkg made has neither; an unpacked archive can ship
     /// both.
-    fn version_control(&mut self, directory: &Path, child: &str, name: &str) {
+    fn version_control(&mut self, directory: &Path, child: &str, name: &str, depth: usize) {
         match name {
-            ".git" => self.git_directory(directory, child, 0),
+            ".git" => {
+                self.git_directory(directory, child, 0);
+                // A file git does not keep there is one a build put, or
+                // would read, there: it is reviewed like any other.
+                let mut extra: Vec<_> = fs::read_dir(directory)
+                    .map(|entries| entries.flatten().collect())
+                    .unwrap_or_default();
+                extra.sort_by_key(fs::DirEntry::file_name);
+                for entry in extra {
+                    if self.stopped {
+                        break;
+                    }
+                    let file_name = entry.file_name().to_string_lossy().into_owned();
+                    if GIT_OWN_FILES.contains(&file_name.as_str()) {
+                        continue;
+                    }
+                    self.visited += 1;
+                    if self.visited > self.max_entries {
+                        self.upstream.gaps.push(format!(
+                            "the sources have more than {} entries; the rest cannot be reviewed",
+                            self.max_entries
+                        ));
+                        self.stopped = true;
+                        break;
+                    }
+                    if fs::symlink_metadata(entry.path()).is_ok_and(|metadata| metadata.is_file()) {
+                        self.file(
+                            &entry.path(),
+                            &format!("{child}/{file_name}"),
+                            &file_name,
+                            depth + 1,
+                            false,
+                        );
+                    }
+                }
+            }
             ".hg" => {
                 let text = fs::read(directory.join("hgrc"))
                     .map(|bytes| String::from_utf8_lossy(&bytes).to_lowercase())
@@ -995,12 +1074,69 @@ impl Walk<'_> {
         }
     }
 
+    /// A submodule's git directory under `modules`, or, for a submodule at
+    /// a nested path (`vendor/lib`), the directories on the way to it.
+    fn git_module(&mut self, directory: &Path, child: &str, depth: usize) {
+        if depth >= MAX_DEPTH {
+            self.upstream.gaps.push(format!(
+                "src/{child}: submodule directories nested too deep to review"
+            ));
+            return;
+        }
+        // A submodule named `a/b` lives below the one named `a`, so a git
+        // directory is looked into as well.
+        let is_git = ["HEAD", "config"]
+            .iter()
+            .any(|part| fs::symlink_metadata(directory.join(part)).is_ok());
+        if is_git {
+            self.git_directory(directory, child, depth);
+        }
+        let Ok(entries) = fs::read_dir(directory) else {
+            self.upstream
+                .gaps
+                .push(format!("src/{child}: a submodule directory cannot be read"));
+            return;
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(fs::DirEntry::file_name);
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if is_git && git_state::OWN_DIRECTORIES.contains(&name.as_str()) {
+                continue;
+            }
+            let shown = format!("{child}/{}", name.escape_debug());
+            match fs::symlink_metadata(entry.path()) {
+                Ok(metadata) if metadata.is_dir() => {
+                    self.git_module(&entry.path(), &shown, depth + 1);
+                }
+                // Inside a git directory only a link to a directory can
+                // be a submodule (an old `HEAD` is a link to a file).
+                Ok(metadata)
+                    if metadata.file_type().is_symlink()
+                        && (!is_git
+                            || fs::metadata(entry.path()).is_ok_and(|target| target.is_dir())) =>
+                {
+                    self.upstream.gaps.push(format!(
+                        "src/{shown}: a linked submodule cannot be reviewed"
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// The checks of one git directory: `.git` itself, and each submodule
     /// kept under its `modules`, which git enters on `status` too.
     fn git_directory(&mut self, directory: &Path, child: &str, depth: usize) {
         let mut gap = |what: String| {
             self.upstream.gaps.push(format!("src/{child}: {what}"));
         };
+        if fs::symlink_metadata(directory.join("commondir")).is_ok() {
+            gap(
+                "its commondir makes git read the configuration and hooks of another directory"
+                    .into(),
+            );
+        }
         for config in ["config", "config.worktree"] {
             let path = directory.join(config);
             let Ok(metadata) = fs::symlink_metadata(&path) else {
@@ -1052,7 +1188,7 @@ impl Walk<'_> {
                         format!("{child}/modules/{}", name.to_string_lossy().escape_debug());
                     match fs::symlink_metadata(&submodule) {
                         Ok(metadata) if metadata.is_dir() => {
-                            self.git_directory(&submodule, &shown, depth + 1);
+                            self.git_module(&submodule, &shown, depth + 1);
                         }
                         // Git follows a link here; the checks do not.
                         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -1126,8 +1262,21 @@ impl Walk<'_> {
                     self.link(&entry.path(), &child, &name, depth, late);
                 } else if metadata.is_dir() {
                     if SKIPPED_DIRECTORIES.contains(&name.as_str()) {
-                        self.version_control(&entry.path(), &child, &name);
-                        continue;
+                        self.version_control(&entry.path(), &child, &name, depth);
+                        // git's own directory is its objects and state,
+                        // read above for what git would run from it. The
+                        // others are walked like any directory: a build
+                        // can read a file from there as from anywhere.
+                        if name == ".git" {
+                            continue;
+                        }
+                    } else if ["HEAD", "objects", "refs"]
+                        .iter()
+                        .all(|part| fs::symlink_metadata(entry.path().join(part)).is_ok())
+                    {
+                        // Laid out as a git repository under another name
+                        // (a bare one, or where a `commondir` points).
+                        self.git_directory(&entry.path(), &child, 0);
                     }
                     if depth + 1 >= MAX_DEPTH {
                         self.upstream
@@ -1135,7 +1284,11 @@ impl Walk<'_> {
                             .push(format!("src/{child}: nested too deep to review"));
                         continue;
                     }
-                    let late = late || LATE_DIRECTORIES.contains(&name.as_str());
+                    // Another tool's metadata holds a copy of every file:
+                    // it comes after the sources themselves.
+                    let late = late
+                        || LATE_DIRECTORIES.contains(&name.as_str())
+                        || SKIPPED_DIRECTORIES.contains(&name.as_str());
                     pending.push((entry.path(), child, depth + 1, late));
                 } else if metadata.is_file() {
                     self.file(&entry.path(), &child, &name, depth, late);
@@ -1736,6 +1889,106 @@ pkgname = demo
                 .gaps
                 .iter()
                 .any(|gap| gap.contains("more than 3 entries"))
+        );
+    }
+
+    #[test]
+    fn the_value_of_an_option_is_not_read_as_an_option() {
+        let args = |words: &[&str]| words.iter().map(OsString::from).collect::<Vec<_>>();
+        for words in [
+            &["--config", "--help"][..],
+            &["-p", "--version"],
+            &["-sp", "-V"],
+            &["--key", "-h", "-s"],
+            &["-pVh"],
+        ] {
+            assert!(classify(&args(words)).runs_functions, "{words:?}");
+        }
+        for words in [
+            &["--config", "x", "--help"][..],
+            &["-p", "x", "-V"],
+            &["-h"],
+        ] {
+            assert!(!classify(&args(words)).runs_functions, "{words:?}");
+        }
+    }
+
+    #[test]
+    fn a_git_layout_out_of_the_ordinary_is_checked_as_well() {
+        let dir = TempDir::new("upstream-vcs-layouts");
+        let src = dir.path().join("src");
+        let roots = Roots {
+            build_dir: dir.path(),
+            srcdest: None,
+        };
+        fs::create_dir_all(src.join("demo/.git/hooks")).unwrap();
+        // A commondir, hooks defined in the configuration, a submodule at
+        // a nested path, and a file git does not keep in its directory.
+        fs::write(
+            src.join("demo/.git/config"),
+            "[hook \"x\"]\n\tcommand = sh x\n",
+        )
+        .unwrap();
+        fs::write(src.join("demo/.git/commondir"), "../elsewhere\n").unwrap();
+        fs::create_dir_all(src.join("demo/.git/modules/vendor/lib")).unwrap();
+        fs::write(
+            src.join("demo/.git/modules/vendor/lib/config"),
+            "[core]\n\tfsmonitor = sh x\n",
+        )
+        .unwrap();
+        fs::write(src.join("demo/.git/rules.mk"), "all:\n\tcurl x | sh\n").unwrap();
+        // A submodule kept below another one's git directory.
+        fs::create_dir_all(src.join("demo/.git/modules/outer/inner")).unwrap();
+        fs::write(src.join("demo/.git/modules/outer/HEAD"), "ref: x\n").unwrap();
+        fs::write(
+            src.join("demo/.git/modules/outer/inner/config"),
+            "[core]\n\tfsmonitor = sh x\n",
+        )
+        .unwrap();
+        let upstream = collect_upstream(&src, &roots, "", 1024 * 1024);
+        let found = upstream.gaps.join("\n");
+        for expected in [
+            "its config names a command git runs",
+            "its commondir makes git read",
+            "src/demo/.git/modules/vendor/lib: its config names a command",
+            "src/demo/.git/modules/outer/inner: its config names a command",
+        ] {
+            assert!(found.contains(expected), "{expected}\n{found}");
+        }
+        assert!(
+            upstream
+                .files
+                .iter()
+                .any(|file| file.path == "src/demo/.git/rules.mk"),
+            "{:?}",
+            upstream
+                .files
+                .iter()
+                .map(|file| &file.path)
+                .collect::<Vec<_>>()
+        );
+        // A repository laid out under another name, and a file in another
+        // version-control system's directory.
+        fs::create_dir_all(src.join("bare/objects")).unwrap();
+        fs::create_dir_all(src.join("bare/refs")).unwrap();
+        fs::write(src.join("bare/HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(src.join("bare/config"), "[core]\n\tfsmonitor = sh x\n").unwrap();
+        fs::create_dir_all(src.join("demo/.svn")).unwrap();
+        fs::write(src.join("demo/.svn/rules.mk"), "all:\n").unwrap();
+        let upstream = collect_upstream(&src, &roots, "", 1024 * 1024);
+        assert!(
+            upstream
+                .gaps
+                .iter()
+                .any(|gap| gap.starts_with("src/bare: its config names a command")),
+            "{:?}",
+            upstream.gaps
+        );
+        assert!(
+            upstream
+                .files
+                .iter()
+                .any(|file| file.path == "src/demo/.svn/rules.mk")
         );
     }
 

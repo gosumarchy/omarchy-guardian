@@ -66,6 +66,9 @@ pub enum Gap {
     AgentInputTooLarge,
     /// An install or build entry point larger than one AI request.
     EntryPointTooLarge(String),
+    /// Git state the walk cannot stand for: a git directory whose
+    /// configuration or hooks git would take from somewhere else.
+    GitState(String),
     /// A file the sweep could not read as this user.
     RootOnly(String),
     /// Something else that kept the sweep from seeing everything.
@@ -121,6 +124,7 @@ impl fmt::Display for Gap {
                 f.write_str("source exceeds the AI review input limit (max_input_kib × max_chunks)")
             }
             Self::Sweep(reason) => write!(f, "sweep: {reason}"),
+            Self::GitState(what) => f.write_str(what),
             Self::RootOnly(path) => write!(
                 f,
                 "{path}: only root can read it; run `omarchy-guardian sweep --root` to check it"

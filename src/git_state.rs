@@ -7,6 +7,22 @@
 //! `core.fsmonitor` or a filter names. The config is checked here and never
 //! sent to the AI, since remote URLs can carry tokens.
 
+/// The directories git keeps in a git directory: no submodule is in one
+/// (those under `modules` are looked into by name).
+pub const OWN_DIRECTORIES: &[&str] = &[
+    "objects",
+    "refs",
+    "hooks",
+    "info",
+    "logs",
+    "modules",
+    "worktrees",
+    "branches",
+    "lfs",
+    "rr-cache",
+    "svn",
+];
+
 /// Keys that name a command git runs, as `section.key`, `section.*.key` for
 /// any subsection, or `section.*` for every key in the section.
 const EXECUTING_KEYS: &[&str] = &[
@@ -44,6 +60,8 @@ const EXECUTING_KEYS: &[&str] = &[
     "trailer.*.command",
     "trailer.*.cmd",
     "gpg.*.defaultkeycommand",
+    // Hooks defined in the configuration itself.
+    "hook.*.command",
 ];
 
 /// Whether `rel` is a git config file the walk reviews: a `.git/config`, or a

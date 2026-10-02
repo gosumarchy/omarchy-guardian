@@ -1269,6 +1269,9 @@ fn upstream_facts(upstream: &Upstream) -> Vec<String> {
     facts
 }
 
+/// The most left-out files named one by one in the summary.
+const MAX_LEFT_OUT_NAMED: usize = 40;
+
 /// The raw source entries and what was left out, as untrusted data.
 fn upstream_summary(upstream: &Upstream, sources: &[aur::Source]) -> String {
     let mut summary = String::from("Source entries:\n");
@@ -1283,8 +1286,15 @@ fn upstream_summary(upstream: &Upstream, sources: &[aur::Source]) -> String {
     }
     if !upstream.omitted.is_empty() {
         summary.push_str("\nLeft out:\n");
-        for (path, reason) in upstream.omitted.iter().take(40) {
+        for (path, reason) in upstream.omitted.iter().take(MAX_LEFT_OUT_NAMED) {
             let _ = writeln!(summary, "src/{path}: {reason}");
+        }
+        if upstream.omitted.len() > MAX_LEFT_OUT_NAMED {
+            let _ = writeln!(
+                summary,
+                "and {} more, not named here",
+                upstream.omitted.len() - MAX_LEFT_OUT_NAMED
+            );
         }
     }
     summary
