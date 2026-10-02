@@ -15,5 +15,28 @@ StateDirectoryMode=0755
 ProtectSystem=strict
 ProtectHome=read-only
 NoNewPrivileges=yes
+# It reads files and other users' processes, and hands its results to a
+# group: no other privilege of root is left to it. /dev and /proc stay the
+# host's, since programs running from /dev/shm and every process are what
+# it looks at; so does /usr/lib/modules, which it checks the loaded modules
+# against (ProtectKernelModules would hide it).
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_CHOWN
+RestrictAddressFamilies=none
+IPAddressDeny=any
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+UMask=0077
+# A sweep takes minutes; one that hangs is stopped, and the bar says the
+# results are old.
+TimeoutStartSec=30min
 Nice=10
 IOSchedulingClass=idle

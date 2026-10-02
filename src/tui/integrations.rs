@@ -1036,6 +1036,24 @@ fn without_interceptor(text: &str) -> String {
     out
 }
 
+/// Where a `//` comment starts in a JSONC line, outside of strings.
+fn comment_start(line: &str) -> Option<usize> {
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut previous = None;
+    for (index, character) in line.char_indices() {
+        match character {
+            _ if escaped => escaped = false,
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            '/' if !quoted && previous == Some('/') => return Some(index - 1),
+            _ => {}
+        }
+        previous = Some(character);
+    }
+    None
+}
+
 /// The menu file with `entries` added before its final `}`. A comma is
 /// added after the previous entry when it has none.
 fn with_menu_entries(text: &str, entries: &[&str]) -> Result<String, String> {
@@ -1051,9 +1069,18 @@ fn with_menu_entries(text: &str, entries: &[&str]) -> Result<String, String> {
         let line = lines[*index].trim();
         !line.is_empty() && !line.starts_with("//")
     }) {
+        // The comma belongs after the value, before a comment that
+        // follows it on the line.
         let line = out[previous].trim_end().to_string();
-        if !line.ends_with(',') && !line.ends_with('{') {
-            out[previous] = format!("{line},");
+        let code_end = comment_start(&line).unwrap_or(line.len());
+        let (code, comment) = line.split_at(code_end);
+        let value = code.trim_end();
+        if !value.ends_with(',') && !value.ends_with('{') {
+            out[previous] = if comment.is_empty() {
+                format!("{value},")
+            } else {
+                format!("{value}, {comment}")
+            };
         }
     }
     for (offset, entry) in entries.iter().enumerate() {
@@ -1451,5 +1478,18 @@ mod tests {
         let repaired = fs::read_to_string(&paths.waybar_config).unwrap();
         assert!(!repaired.contains("/tmp/other"));
         assert_eq!(repaired.matches("\"image#omarchy-guardian\"").count(), 2);
+    }
+
+    #[test]
+    fn a_comma_goes_before_a_comment_that_ends_the_line() {
+        let text = "{\n  \"a\": \"x // not a comment\" // the last one\n}\n";
+        let out = with_menu_entries(text, &["\"b\": 1"]).unwrap();
+        assert_eq!(
+            out,
+            "{\n  \"a\": \"x // not a comment\", // the last one\n  \"b\": 1\n}\n"
+        );
+        // Already ended, or nothing before it: nothing is added.
+        let out = with_menu_entries("{\n  \"a\": 1, // c\n}\n", &["\"b\": 1"]).unwrap();
+        assert_eq!(out, "{\n  \"a\": 1, // c\n  \"b\": 1\n}\n");
     }
 }

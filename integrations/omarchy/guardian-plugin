@@ -103,7 +103,8 @@ add_plugin() {
 
     local id
     id=$(jq -r '.id' "$staged/manifest.json")
-    valid_plugin_id "$id" || fail "invalid plugin id in manifest: $id"
+    # Shown without anything that could move the cursor, and not at length.
+    valid_plugin_id "$id" || fail "invalid plugin id in manifest: $(printf '%s' "${id:0:80}" | tr -c '[:alnum:]._@/ -' '?')"
 
     "$GUARDIAN" guard --class plugin --identity "plugin:$id" --thorough "$staged" -- \
         /usr/bin/bash "$SCRIPT_PATH" --guardian-commit-add "$staged" "$id" "${enable:-ask}" "$yes"

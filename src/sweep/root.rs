@@ -92,10 +92,12 @@ pub fn collect_command(out: bool, settings: &crate::config::Settings) -> ExitCod
     collection.truncated.extend(live.unchecked);
     let json = to_json(&collection).to_string();
     match group {
-        None => {
-            outln!("{json}");
-            ExitCode::SUCCESS
-        }
+        // Written as it is, for the sweep that asked to parse: a path
+        // with a hidden character must stay the path it is.
+        None => match writeln!(std::io::stdout(), "{json}") {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::from(2),
+        },
         Some(gid) => match write_results(Path::new(RESULTS), &json, gid) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
