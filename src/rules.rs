@@ -555,6 +555,11 @@ const SANDBOX_HELPERS: &[&str] = &[
     "vivaldi-sandbox",
 ];
 
+/// Whether `path` names one of those helpers.
+pub fn is_sandbox_helper(path: &str) -> bool {
+    SANDBOX_HELPERS.contains(&path.rsplit('/').next().unwrap_or_default())
+}
+
 /// The line with every `chmod 4755` / `chmod u+s` / `chown root` of a lone
 /// sandbox helper removed, or `None` when it has none. Any other privilege
 /// change on the line still matches.

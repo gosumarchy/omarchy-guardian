@@ -154,7 +154,7 @@ impl Category {
             Self::Initramfs => "Initramfs and kernel install hooks",
             Self::Kernel => "Kernel modules and parameters",
             Self::Linker => "Dynamic linker",
-            Self::LocalBin => "Programs in ~/.local/bin",
+            Self::LocalBin => "Programs ahead of the system's own (~/.local/bin, /usr/local/bin)",
             Self::NetworkHook => "Network hooks",
             Self::OmarchyHook => "Omarchy hooks",
             Self::PacmanHook => "Pacman hooks",
@@ -433,6 +433,54 @@ pub const SYSTEM: &[Location] = &[
     location("usr/lib/systemd/user/", Kind::Units, Category::Systemd),
     location("etc/systemd/", Kind::Manager, Category::Systemd),
     location("usr/lib/systemd/", Kind::Manager, Category::Systemd),
+    // What systemd and udev also read, ahead of /usr/lib.
+    location(
+        "etc/systemd/system-generators/",
+        Kind::Directory,
+        Category::SystemdGenerator,
+    ),
+    location(
+        "etc/systemd/user-generators/",
+        Kind::Directory,
+        Category::SystemdGenerator,
+    ),
+    location(
+        "usr/local/lib/systemd/system-generators/",
+        Kind::Directory,
+        Category::SystemdGenerator,
+    ),
+    location(
+        "usr/local/lib/systemd/system/",
+        Kind::Units,
+        Category::Systemd,
+    ),
+    location(
+        "usr/local/lib/systemd/user/",
+        Kind::Units,
+        Category::Systemd,
+    ),
+    location(
+        "usr/local/lib/udev/rules.d/",
+        Kind::Directory,
+        Category::Udev,
+    ),
+    location("etc/crontab", Kind::File, Category::Cron),
+    location("etc/anacrontab", Kind::File, Category::Cron),
+    location("var/spool/cron/", Kind::Directory, Category::Cron),
+    // What an action may do without a password is set by its policy.
+    location(
+        "usr/share/polkit-1/actions/",
+        Kind::Directory,
+        Category::Polkit,
+    ),
+    location("etc/doas.conf", Kind::File, Category::Sudo),
+    location("etc/gitconfig", Kind::File, Category::Git),
+    location("etc/ssh/sshrc", Kind::File, Category::Ssh),
+    location("etc/makepkg.conf.d/", Kind::Directory, Category::Shell),
+    // Ahead of /usr/bin on every PATH: a program here stands in for the
+    // system's own of that name.
+    location("usr/local/bin/", Kind::Directory, Category::LocalBin),
+    location("usr/local/sbin/", Kind::Directory, Category::LocalBin),
 ];
 
 /// System locations no package should ship into, looked at by the sweep only.
@@ -441,7 +489,6 @@ pub const SYSTEM_SWEEP: &[Location] = &[
     location("usr/lib/security/", Kind::Directory, Category::Pam),
     location("boot/limine.conf", Kind::File, Category::Boot),
     location("etc/default/limine", Kind::File, Category::Boot),
-    location("var/spool/cron/", Kind::Directory, Category::Cron),
 ];
 
 /// Locations in a home directory, relative to it.
@@ -528,6 +575,54 @@ pub fn is_auto_run(path: &str) -> bool {
     system_location(path).is_some()
 }
 
+/// Whether the directory `link` may be a link to the directory `target`:
+/// both are directories of auto-run files of the same kind, each exactly
+/// as catalogued, so every file is reviewed where it really is, as what it
+/// will be read as (systemd's `etc/xdg/systemd/user` for
+/// `etc/systemd/user`). A link to a directory of another kind would have
+/// its files read as something they were not reviewed as, and one to a
+/// directory below a catalogued one may itself be a link elsewhere.
+pub fn is_alias_of_reviewed_directory(link: &str, target: &str) -> bool {
+    let (link, target) = (format!("{link}/"), format!("{target}/"));
+    let directories = || {
+        SYSTEM
+            .iter()
+            .filter(|location| location.kind == Kind::Directory)
+    };
+    directories().any(|aliased| {
+        aliased.path == link
+            && directories()
+                .any(|reviewed| reviewed.path == target && reviewed.category == aliased.category)
+    })
+}
+
+/// Whether `path` names a directory of auto-run files or one above it (an
+/// `etc/cron.d`, a `<target>.wants`, a `usr/share/libalpm`): a link there
+/// stands in for the directory, and what it leads to is read as its files.
+pub fn is_auto_run_directory(path: &str) -> bool {
+    let directory = format!("{path}/");
+    // systemd reads `<target>.wants` and `<unit>.d` as directories
+    // wherever it reads units.
+    let unit_directory = path.rsplit_once('/').is_some_and(|(_, name)| {
+        ENABLING.iter().any(|suffix| name.ends_with(suffix))
+            || Path::new(name)
+                .extension()
+                .is_some_and(|extension| extension == "d")
+    });
+    SYSTEM.iter().any(|location| match location.kind {
+        Kind::File => false,
+        Kind::Directory => {
+            location.path.starts_with(&directory)
+                || (unit_directory
+                    && location.category == Category::Systemd
+                    && path.starts_with(location.path))
+        }
+        Kind::Units | Kind::Manager => {
+            location.path.starts_with(&directory) || location.contains(&format!("{directory}x"))
+        }
+    })
+}
+
 /// The paths a hook or unit runs (`Exec =`, `ExecStart=` and friends),
 /// without systemd's `-@:+!` prefixes, relative to `/`.
 pub fn executed_paths(text: &str) -> Vec<String> {
@@ -567,7 +662,8 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        Category, Kind, SYSTEM, SYSTEM_SWEEP, USER, executed_paths, is_auto_run, system_location,
+        Category, Kind, SYSTEM, SYSTEM_SWEEP, USER, executed_paths, is_auto_run,
+        is_auto_run_directory, system_location,
     };
 
     #[test]
@@ -601,6 +697,17 @@ mod tests {
             "usr/share/dbus-1/services/org.foo.service",
             "etc/ld.so.preload",
             "etc/ssh/sshd_config.d/foo.conf",
+            "etc/systemd/system-generators/foo",
+            "usr/local/lib/systemd/system/multi-user.target.wants/foo.service",
+            "usr/local/lib/udev/rules.d/99-foo.rules",
+            "etc/crontab",
+            "var/spool/cron/root",
+            "usr/share/polkit-1/actions/org.foo.policy",
+            "etc/doas.conf",
+            "etc/gitconfig",
+            "etc/ssh/sshrc",
+            "etc/makepkg.conf.d/foo.conf",
+            "usr/local/bin/sudo",
         ] {
             assert!(is_auto_run(path), "{path}");
         }
@@ -648,6 +755,52 @@ mod tests {
             system_location("usr/lib/systemd/system-generators/x").map(|found| found.category),
             Some(Category::SystemdGenerator)
         );
+    }
+
+    #[test]
+    fn a_directory_of_auto_run_files_is_told_from_a_file_in_one() {
+        for directory in [
+            "etc/cron.d",
+            "etc/systemd/system-sleep",
+            "usr/share/libalpm",
+            "usr/share/libalpm/hooks",
+            "usr/lib/systemd/system/multi-user.target.wants",
+            "usr/lib/systemd/system/foo.service.d",
+            "etc/systemd/system.conf.d",
+            "usr/local/bin",
+            "etc/systemd/system/multi-user.target.wants",
+            "etc/systemd/system/foo.service.d",
+            "etc/systemd/user/default.target.requires",
+        ] {
+            assert!(is_auto_run_directory(directory), "{directory}");
+        }
+        for other in [
+            "etc/sudoers.d/out",
+            "etc/cron.d/job",
+            "usr/lib/systemd/system/foo.service",
+            "usr/lib/systemd/system/multi-user.target.wants/foo.service",
+            "usr/share/doc",
+            "etc/systemd/system/display-manager.service",
+            "etc/cron.d/jobs.d",
+            "etc/sudoers",
+            "lib",
+        ] {
+            assert!(!is_auto_run_directory(other), "{other}");
+        }
+        let alias = super::is_alias_of_reviewed_directory;
+        assert!(alias("etc/xdg/systemd/user", "etc/systemd/user"));
+        assert!(alias("etc/cron.daily", "etc/cron.weekly"));
+        // Below a catalogued directory may be a link elsewhere.
+        assert!(!alias("etc/xdg/systemd/user", "etc/systemd/user/sub"));
+        assert!(!alias("etc/cron.d", "etc/cron.daily/sub"));
+        // Another kind of file, a directory that is not all auto-run, a
+        // directory above one, or somewhere else entirely.
+        assert!(!alias("etc/sudoers.d", "usr/local/bin"));
+        assert!(!alias("etc/cron.d", "usr/local/bin"));
+        assert!(!alias("etc/xdg/systemd/user", "usr/lib/systemd/system"));
+        assert!(!alias("etc/xdg/systemd", "etc/systemd/user"));
+        assert!(!alias("etc/cron.d", "usr/share/x/sleep"));
+        assert!(!alias("etc/cron.d", "etc"));
     }
 
     #[test]
