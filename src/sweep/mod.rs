@@ -32,12 +32,12 @@ use crate::config::Settings;
 use crate::config::model::{RootConsent, SourceClass};
 use crate::engine::store::{self, Store};
 use crate::notify;
-use crate::report::{Blocked, Decision, Gap};
+use crate::report::{AgentOutcome, Blocked, Decision, Gap, Report};
 use crate::review::ReviewContext;
 use crate::tools::OpenCode;
 use collect::{Collection, Origin, Scope};
 use index::{LOCAL_DB, PackageIndex};
-use state::{Change, Remembered};
+use state::{Change, LastRun, Outcome, Remembered};
 
 /// How a sweep is shown.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -258,7 +258,12 @@ fn remembered(
 /// What a scheduled sweep tells the desktop: new or changed items, or
 /// for the first sweep (nothing to compare with) whether it found
 /// something or could not finish.
-fn notify_scheduled(first: bool, decision: Decision, changes: &[(Change, String)]) {
+fn notify_scheduled(
+    first: bool,
+    decision: Decision,
+    changes: &[(Change, String)],
+    unfinished: Option<&str>,
+) {
     let arrived = changes
         .iter()
         .filter(|(change, _)| *change != Change::Removed)
@@ -277,12 +282,111 @@ fn notify_scheduled(first: bool, decision: Decision, changes: &[(Change, String)
             ),
             Decision::Clear | Decision::Warned | Decision::Limited => {}
         }
-    } else if arrived > 0 {
-        notify::found(
-            &format!("{arrived} new or changed startup item(s)"),
-            "the daily system sweep found something that runs on its own and that no package vouches for",
-        );
+    } else {
+        if arrived > 0 {
+            notify::found(
+                &format!("{arrived} new or changed startup item(s)"),
+                "the daily system sweep found something that runs on its own and that no package vouches for",
+            );
+        }
+        if let Some(reason) = unfinished {
+            notify::found("that its daily system sweep could not finish", reason);
+        }
     }
+}
+
+/// Seconds since the epoch.
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// Records how this scheduled sweep ended for the bar (see
+/// `state::LastRun`), and returns whether that is news: it did not end
+/// this way last time. Only the timer's sweeps are recorded: the bar tells
+/// whether those still work, and a sweep run by hand (with other options,
+/// or where no AI can be reached) says nothing about that. A record that
+/// cannot be written is the bar's to notice: it goes stale.
+fn record(directory: Option<&Path>, run: &LastRun) -> bool {
+    // Nothing remembered: nothing to tell news from, so nothing is said
+    // every day; the bar shows that no sweep is on record.
+    let Some(directory) = directory else {
+        return false;
+    };
+    let previous = state::last_run(directory);
+    if let Err(reason) = state::save_last_run(directory, run) {
+        errln!("omarchy-guardian sweep: {reason}");
+    }
+    is_news(previous.as_ref(), run)
+}
+
+/// Whether `run` did not finish, in a way the run before it had not
+/// already: by the kind of reason (its first), since the rest names files
+/// and counts that move from day to day.
+fn is_news(previous: Option<&LastRun>, run: &LastRun) -> bool {
+    run.outcome != Outcome::Complete
+        && previous.is_none_or(|previous| {
+            previous.outcome != run.outcome || previous.reasons.first() != run.reasons.first()
+        })
+}
+
+/// A sweep that could not even collect.
+fn could_not_run(options: Options, message: &str) -> ExitCode {
+    errln!("omarchy-guardian sweep: {message}");
+    // The timer counts exit 2 as an incomplete sweep, not a failure, so a
+    // sweep that could not run at all says so itself: when that starts, not
+    // every day it lasts (the bar keeps showing it).
+    if options.scheduled {
+        let run = LastRun::new(now(), Outcome::Failed, vec![message.to_string()]);
+        if record(state_directory().ok().as_deref(), &run) {
+            notify::found("that its daily system sweep could not run", message);
+        }
+    }
+    ExitCode::from(2)
+}
+
+/// Records how a scheduled sweep ended, and tells the desktop what it has
+/// to say.
+fn remember_run(
+    options: Options,
+    directory: Option<&Path>,
+    report: &Report,
+    decision: Decision,
+    first: bool,
+    changes: &[(Change, String)],
+) {
+    if !options.scheduled {
+        return;
+    }
+    // Findings are a sweep that did its job; anything else that blocks is
+    // one that could not see or review everything.
+    let reasons: Vec<String> = match decision {
+        Decision::Blocked(Blocked::Findings)
+        | Decision::Clear
+        | Decision::Warned
+        | Decision::Limited => Vec::new(),
+        Decision::Blocked(blocked) => std::iter::once(notify::reason(blocked).to_string())
+            .chain(
+                report
+                    .agent_runs
+                    .iter()
+                    .filter_map(|run| match &run.outcome {
+                        AgentOutcome::Unavailable(error) => Some(error.to_string()),
+                        AgentOutcome::Reviewed(_) => None,
+                    }),
+            )
+            .chain(report.gaps.iter().map(ToString::to_string))
+            .collect(),
+    };
+    let outcome = if reasons.is_empty() {
+        Outcome::Complete
+    } else {
+        Outcome::Incomplete
+    };
+    let last = LastRun::new(now(), outcome, reasons);
+    let unfinished = record(directory, &last).then(|| last.reasons.join("; "));
+    notify_scheduled(first, decision, changes, unfinished.as_deref());
 }
 
 /// `sweep --report`: the page, opened in the browser, and how to ask about
@@ -318,17 +422,15 @@ fn save_report(collection: &Collection, decision: Decision) {
 /// `omarchy-guardian sweep`.
 fn run(options: Options, settings: &Settings) -> ExitCode {
     let home = home();
+    if options.scheduled
+        && let Ok(directory) = state_directory()
+        && let Err(reason) = state::mark_started(&directory, now())
+    {
+        errln!("omarchy-guardian sweep: {reason}");
+    }
     let (mut collection, index, mut notes) = match collect_here(home.as_deref()) {
         Ok(found) => found,
-        Err(message) => {
-            errln!("omarchy-guardian sweep: {message}");
-            // The timer counts exit 2 as an incomplete sweep, not a failure,
-            // so a sweep that could not run at all says so itself.
-            if options.scheduled {
-                notify::found("that its daily system sweep could not run", &message);
-            }
-            return ExitCode::from(2);
-        }
+        Err(message) => return could_not_run(options, &message),
     };
     add_root_part(&mut collection, options, settings, &mut notes);
     let directory = state_directory()
@@ -412,8 +514,53 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
             );
         }
     }
-    if options.scheduled {
-        notify_scheduled(first, decision, &changes);
-    }
+    remember_run(
+        options,
+        directory.as_deref(),
+        &report,
+        decision,
+        first,
+        &changes,
+    );
     decision.exit_code()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::state::{LastRun, Outcome};
+    use super::{is_news, record};
+    use crate::test_support::TempDir;
+
+    #[test]
+    fn an_unfinished_sweep_is_news_when_it_starts_or_its_kind_changes() {
+        let run = |outcome, reasons: &[&str]| {
+            LastRun::new(
+                1,
+                outcome,
+                reasons.iter().map(|reason| (*reason).to_string()).collect(),
+            )
+        };
+        let complete = run(Outcome::Complete, &[]);
+        let no_ai = run(Outcome::Incomplete, &["the AI reviewer was unavailable"]);
+        let gaps = run(Outcome::Incomplete, &["the review was incomplete", "/a"]);
+        let other_gaps = run(Outcome::Incomplete, &["the review was incomplete", "/b"]);
+        let failed = run(Outcome::Failed, &["cannot read the package database"]);
+
+        assert!(!is_news(None, &complete));
+        assert!(!is_news(Some(&gaps), &complete));
+        assert!(is_news(None, &gaps));
+        assert!(is_news(Some(&complete), &gaps));
+        assert!(is_news(Some(&no_ai), &gaps));
+        // The same kind of trouble, with other files named: said already.
+        assert!(!is_news(Some(&gaps), &other_gaps));
+        assert!(is_news(Some(&gaps), &failed));
+        assert!(!is_news(Some(&failed), &failed));
+
+        // Recorded, and news only the first time.
+        let dir = TempDir::new("sweep-record");
+        assert!(record(Some(dir.path()), &failed));
+        assert!(!record(Some(dir.path()), &failed));
+        assert!(!record(Some(dir.path()), &complete));
+        assert_eq!(super::state::last_run(dir.path()), Some(complete));
+    }
 }

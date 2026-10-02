@@ -8,5 +8,7 @@ ExecStart=/usr/bin/omarchy-guardian sweep --scheduled
 # 1 (findings) and 2 (incomplete) are the sweep doing its job, reported by
 # its notification and the bar; only anything else is a failure.
 SuccessExitStatus=1 2
+# A sweep takes minutes; one that hangs is stopped, and the bar says so.
+TimeoutStartSec=1h
 Nice=10
 IOSchedulingClass=idle

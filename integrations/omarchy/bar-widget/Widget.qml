@@ -188,7 +188,7 @@ Panel {
             required property var modelData
             width: column.width
             label: modelData.label
-            detail: modelData.state === "on" ? "" : modelData.detail
+            detail: modelData.detail
             value: modelData.state === "on" ? "ON" : (modelData.state === "unavailable" ? "N/A" : modelData.state.toUpperCase())
             valueColor: modelData.state === "on" ? root.accent : (modelData.state === "unavailable" ? root.dim : root.urgent)
           }
