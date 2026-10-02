@@ -21,18 +21,20 @@ use crate::sha256::{Digest, Sha256};
 /// How one makepkg invocation uses the sources.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Invocation {
-    /// Runs PKGBUILD functions on downloaded sources: `verify()` on every
-    /// downloading call, `pkgver()` whenever it gets past extraction, and
-    /// prepare, build, check and package.
+    /// Downloads the sources, and (but for generating checksums) runs
+    /// PKGBUILD functions on them: `verify()` on every such call,
+    /// `pkgver()` whenever it gets past extraction, and prepare, build,
+    /// check and package.
     pub runs_functions: bool,
     /// Extracts the sources itself (no `--noextract`, not only verifying).
     pub extracts: bool,
 }
 
 /// Classifies makepkg's arguments. Only calls that print (the source list,
-/// the package list, help or the version) or generate checksums run
-/// nothing; `--verifysource`, `--source` and `--nobuild --noprepare` still
-/// run `verify()` and `pkgver()` on what they download.
+/// the package list, help or the version) touch nothing; generating
+/// checksums downloads the sources, and `--verifysource`, `--source` and
+/// `--nobuild --noprepare` also run `verify()` and `pkgver()` on what they
+/// download.
 pub fn classify(args: &[OsString]) -> Invocation {
     let mut info_only = false;
     let mut source_only = false;
@@ -40,10 +42,8 @@ pub fn classify(args: &[OsString]) -> Invocation {
     for arg in args {
         let Some(arg) = arg.to_str() else { continue };
         match arg {
-            "--packagelist" | "--printsrcinfo" | "--geninteg" | "--version" | "--help" => {
-                info_only = true;
-            }
-            "--verifysource" | "--source" | "--allsource" => source_only = true,
+            "--packagelist" | "--printsrcinfo" | "--version" | "--help" => info_only = true,
+            "--verifysource" | "--source" | "--allsource" | "--geninteg" => source_only = true,
             "--noextract" => noextract = true,
             _ => {
                 if let Some(flags) = arg
@@ -52,8 +52,8 @@ pub fn classify(args: &[OsString]) -> Invocation {
                 {
                     for flag in flags.chars() {
                         match flag {
-                            'g' | 'V' | 'h' => info_only = true,
-                            'S' => source_only = true,
+                            'V' | 'h' => info_only = true,
+                            'S' | 'g' => source_only = true,
                             'e' => noextract = true,
                             _ => {}
                         }
@@ -84,39 +84,98 @@ const PATH_VARIABLES: &[&str] = &[
     "MAKEPKG_CONF",
 ];
 
-/// Top-level assignments to makepkg's path variables (outside any
-/// function), as `line: text`.
+/// Commands that assign to a variable they are given by name.
+const ASSIGNING_COMMANDS: &[&str] = &[
+    "printf",
+    "read",
+    "eval",
+    "unset",
+    "mapfile",
+    "readarray",
+    "let",
+    "declare",
+    "typeset",
+    "local",
+    "export",
+    "readonly",
+];
+
+/// A line of shell without its comment, and its braces outside quotes: a
+/// `#` starts a comment only at the start of a word (`$#` and `${#x}` are
+/// not comments), and a brace in a string opens no block.
+fn code_and_braces(line: &str) -> (&str, i64) {
+    let mut quote = None;
+    let mut braces = 0;
+    let mut previous = ' ';
+    for (index, character) in line.char_indices() {
+        match (quote, character) {
+            (None, '#') if previous.is_whitespace() => return (&line[..index], braces),
+            (None, '\'' | '"') => quote = Some(character),
+            (Some(open), _) if open == character => quote = None,
+            (None, '{') if previous != '$' => braces += 1,
+            (None, '}') => braces -= 1,
+            _ => {}
+        }
+        previous = character;
+    }
+    (line, braces)
+}
+
+/// Top-level assignments (outside any function) to makepkg's path
+/// variables, as `line: text`: `NAME=`, or the build or download directory
+/// given by name to a command that assigns (`printf -v`, `read`, `eval`,
+/// ...). This reads lines, not shell: it names the plain cases before
+/// anything runs, and the listing run checks what the recipe really did.
 pub fn path_variable_assignments(pkgbuild: &str) -> Vec<String> {
     let mut found = Vec::new();
     let mut depth = 0_i64;
     for (index, line) in pkgbuild.lines().enumerate() {
-        let code = line.split('#').next().unwrap_or_default();
-        if depth == 0 {
-            for statement in code.split([';', '&', '|']) {
-                let mut words = statement.split_whitespace().peekable();
-                while let Some(word) = words.peek() {
-                    if matches!(
-                        *word,
-                        "export" | "declare" | "typeset" | "readonly" | "local"
-                    ) || word.starts_with('-')
-                    {
-                        words.next();
-                    } else {
-                        break;
-                    }
-                }
-                let Some(word) = words.next() else { continue };
-                let name = word.split(['=', '+']).next().unwrap_or_default();
-                if word.contains('=') && PATH_VARIABLES.contains(&name) {
-                    found.push(format!("line {}: {}", index + 1, line.trim()));
+        let (code, braces) = code_and_braces(line);
+        let moved = code.split([';', '&', '|']).any(|statement| {
+            let mut words = statement.split_whitespace().peekable();
+            let command = words.peek().copied().unwrap_or_default();
+            if depth == 0
+                && ASSIGNING_COMMANDS.contains(&command)
+                && ["BUILDDIR", "SRCDEST"]
+                    .iter()
+                    .any(|name| names_bare(statement, name))
+            {
+                return true;
+            }
+            while let Some(word) = words.peek() {
+                if matches!(
+                    *word,
+                    "export" | "declare" | "typeset" | "readonly" | "local"
+                ) || word.starts_with('-')
+                {
+                    words.next();
+                } else {
+                    break;
                 }
             }
+            let word = words.next().unwrap_or_default();
+            let name = word.split(['=', '+']).next().unwrap_or_default();
+            depth == 0 && word.contains('=') && PATH_VARIABLES.contains(&name)
+        });
+        if moved {
+            found.push(format!("line {}: {}", index + 1, line.trim()));
         }
-        let count = |brace: char| i64::try_from(code.matches(brace).count()).unwrap_or(0);
-        depth += count('{') - count('}');
-        depth = depth.max(0);
+        // `${x}` closes a brace it did not open here.
+        depth = (depth + braces).max(0);
     }
     found
+}
+
+/// Whether `code` holds `name` as a whole word that is not being expanded
+/// (`$NAME`, `${NAME...}`).
+fn names_bare(code: &str, name: &str) -> bool {
+    let word = |character: char| character.is_ascii_alphanumeric() || character == '_';
+    code.match_indices(name).any(|(index, _)| {
+        let before = code[..index].chars().next_back();
+        let after = code[index + name.len()..].chars().next();
+        !before.is_some_and(|character| word(character) || character == '$' || character == '{')
+            && !after.is_some_and(word)
+    })
 }
 
 /// One `source` entry with the checksums given for it.
@@ -126,19 +185,74 @@ pub struct Source {
     pub checksums: Vec<String>,
 }
 
+/// A source entry's protocol as makepkg reads it: `git`, `https`, ..., or
+/// `local` for a file beside the recipe.
+pub fn source_protocol(entry: &str) -> &str {
+    let after_name = entry.split_once("::").map_or(entry, |(_, rest)| rest);
+    if let Some((scheme, _)) = entry
+        .contains("://")
+        .then(|| after_name.split_once("://"))
+        .flatten()
+    {
+        scheme.split('+').next().unwrap_or(scheme)
+    } else if entry.contains("lp:") {
+        after_name
+            .find("+lp:")
+            .map_or(after_name, |index| &after_name[..index])
+    } else {
+        "local"
+    }
+}
+
+/// The name makepkg keeps a source under in the download directory,
+/// derived the way makepkg derives it.
+pub fn source_filename(entry: &str) -> String {
+    if let Some((name, _)) = entry.split_once("::") {
+        return name.to_string();
+    }
+    let protocol = source_protocol(entry);
+    if !VCS.contains(&protocol) {
+        return entry.rsplit('/').next().unwrap_or(entry).to_string();
+    }
+    let url = entry.split(['#', '?']).next().unwrap_or_default();
+    let url = url.strip_suffix('/').unwrap_or(url);
+    let mut name = url.rsplit('/').next().unwrap_or(url);
+    match protocol {
+        "bzr" => name = name.split_once("lp:").map_or(name, |(_, rest)| rest),
+        "fossil" => return format!("{name}.fossil"),
+        "git" => name = name.find(".git").map_or(name, |index| &name[..index]),
+        _ => {}
+    }
+    name.to_string()
+}
+
+/// The repository URL makepkg clones a git source from.
+pub fn git_source_url(entry: &str) -> &str {
+    let url = entry.split_once("::").map_or(entry, |(_, url)| url);
+    let url = url.strip_prefix("git+").unwrap_or(url);
+    url.split(['#', '?']).next().unwrap_or(url)
+}
+
+/// Whether a source is kept as a version-control checkout.
+pub fn is_vcs_source(entry: &str) -> bool {
+    VCS.contains(&source_protocol(entry))
+}
+
+/// The checksum arrays of a recipe, by makepkg's names.
+pub const CHECKSUMS: &[&str] = &[
+    "cksums",
+    "md5sums",
+    "sha1sums",
+    "sha224sums",
+    "sha256sums",
+    "sha384sums",
+    "sha512sums",
+    "b2sums",
+];
+
 /// The sources of `makepkg --printsrcinfo` output, each paired with its
 /// checksums of every algorithm, per architecture.
 pub fn parse_srcinfo(text: &str) -> Vec<Source> {
-    const ALGORITHMS: &[&str] = &[
-        "cksums",
-        "md5sums",
-        "sha1sums",
-        "sha224sums",
-        "sha256sums",
-        "sha384sums",
-        "sha512sums",
-        "b2sums",
-    ];
     // Keys are `source` or `sha256sums`, optionally with `_<arch>`.
     let mut sources: Vec<(String, Vec<String>)> = Vec::new();
     let mut sums: Vec<(String, Vec<String>)> = Vec::new();
@@ -156,7 +270,7 @@ pub fn parse_srcinfo(text: &str) -> Vec<Source> {
         };
         if base == "source" {
             push(&mut sources);
-        } else if ALGORITHMS.contains(&base) {
+        } else if CHECKSUMS.contains(&base) {
             push(&mut sums);
         }
     }
@@ -1051,7 +1165,17 @@ mod tests {
             }
         );
         assert!(!runs(&["--packagelist"]).runs_functions);
-        assert!(!runs(&["-g"]).runs_functions);
+        // Generating checksums downloads the sources and extracts nothing.
+        for generate in ["-g", "--geninteg", "-gf"] {
+            assert_eq!(
+                runs(&[generate]),
+                Invocation {
+                    runs_functions: true,
+                    extracts: false
+                },
+                "{generate}"
+            );
+        }
         // pkgver() runs after extraction even without prepare().
         assert!(runs(&["--nobuild", "--noprepare"]).extracts);
         assert!(!runs(&["--printsrcinfo"]).runs_functions);
@@ -1157,6 +1281,74 @@ pkgname = demo
                 .is_empty()
         );
         assert!(path_variable_assignments("pkgname=demo\nsource=(a)\n").is_empty());
+        // Given by name to a command that assigns; and neither a string's
+        // brace nor a `#` inside a word hides the rest.
+        for moved in [
+            "printf -v SRCDEST %s /x",
+            "read SRCDEST <<<x",
+            "eval \"SRCDEST=/x\"",
+            "unset BUILDDIR",
+            ": \"{\"\nBUILDDIR=/x",
+            "x=${#y}; SRCDEST=/x",
+            "echo $#; BUILDDIR=/x",
+            "echo \"#\"; SRCDEST=/x",
+            "declare -n ref=SRCDEST",
+        ] {
+            assert_eq!(path_variable_assignments(moved).len(), 1, "{moved}");
+        }
+        // Reading them, or handing a build tool a variable of that name,
+        // is not moving them.
+        for kept in [
+            "cp \"$SRCDEST/a\" .",
+            "x=${BUILDDIR:-/tmp}",
+            "MY_SRCDEST_DIR=1",
+            "build() {\n  make BUILDDIR=build\n  BUILDDIR=b make\n  export BUILDDIR=b\n}",
+            "msg \"BUILDDIR is set\"",
+            "pkgname=x # SRCDEST=/x",
+        ] {
+            assert!(path_variable_assignments(kept).is_empty(), "{kept}");
+        }
+    }
+
+    #[test]
+    fn source_names_follow_makepkg() {
+        for (entry, protocol, name) in [
+            (
+                "demo.tar.gz::https://example.org/v1.tar.gz",
+                "https",
+                "demo.tar.gz",
+            ),
+            (
+                "https://example.org/files/patch.diff?raw=1",
+                "https",
+                "patch.diff?raw=1",
+            ),
+            (
+                "git+https://github.com/someone/proj.git#commit=abc",
+                "git",
+                "proj",
+            ),
+            ("git+https://example.org/foo.github.io.git/", "git", "foo"),
+            ("name::git+ssh://git@example.org/r.git", "git", "name"),
+            ("hg+https://example.org/repo?x=1", "hg", "repo"),
+            ("fossil+https://example.org/repo", "fossil", "repo.fossil"),
+            ("bzr+lp:project", "bzr", "project"),
+            ("local.patch", "local", "local.patch"),
+            (
+                ".git/commondir::https://example.org/x",
+                "https",
+                ".git/commondir",
+            ),
+        ] {
+            assert_eq!(super::source_protocol(entry), protocol, "{entry}");
+            assert_eq!(super::source_filename(entry), name, "{entry}");
+        }
+        assert_eq!(
+            super::git_source_url("name::git+https://example.org/r.git?signed#tag=v1"),
+            "https://example.org/r.git"
+        );
+        assert!(super::is_vcs_source("svn+https://example.org/r"));
+        assert!(!super::is_vcs_source("https://example.org/a.tar.gz"));
     }
 
     #[test]

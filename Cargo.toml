@@ -35,6 +35,9 @@ print_stderr = "allow"
 # Pedantic relaxations (too noisy)
 module_name_repetitions = "allow"
 similar_names = "allow"
+# New in Rust 1.99; older toolchains warn that they do not know it. The tests
+# that check for emptiness already print the value on failure where it matters.
+assert_is_empty = "allow"
 
 [profile.release]
 lto = true

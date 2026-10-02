@@ -733,24 +733,63 @@ gate does, in order:
    routine packaging looks like. A PKGBUILD's `url=` and `source=` entries
    are declarations, not network requests, for the local rules, unless they
    run a command.
-3. **Sources**, for a call that runs PKGBUILD functions (not
-   `--verifysource`, `--packagelist`, `--nobuild --noprepare` and the like).
+3. **Sources**, for every call but one that only prints information
+   (`--packagelist`, `--printsrcinfo`, `--version`, `--help`); generating
+   checksums (`-g`) downloads the sources, so it is covered.
    Only now, with the recipe reviewed, `makepkg --printsrcinfo` lists the
    sources:
    - an unverified download over `http://` or `ftp://` blocks the build,
-     since anyone on the network path can replace it;
+     since anyone on the network path can replace it (a call that only
+     downloads, such as `-g` to generate the missing checksum, is warned);
    - a git (or other VCS) source not pinned to a commit, or an unverified
      download over HTTPS, is a warning.
 4. **Upstream code.** If the call extracts the sources, the gate first
-   fetches and extracts them itself: makepkg runs a private copy of the
-   approved recipe with `--nobuild --noprepare --nodeps`, in which
-   `pkgver()`, `prepare()` and `verify()` are replaced with no-ops, so no
-   upstream code has run yet. A recipe that keeps them from being replaced
-   (by making them read-only, say) blocks the build; this is checked inside
-   the shell the recipe runs in, so the recipe's own review remains what
-   stands against a recipe written to defeat it. The build itself then
-   runs with `--holdver`, so it does not fetch newer VCS sources than were
-   reviewed; its `pkgver()` does run, on reviewed code. The AI then reviews the
+   fetches and extracts them itself, in two makepkg runs inside a
+   Bubblewrap sandbox (the system read-only, your home directory empty
+   apart from makepkg's own configuration):
+   - *Listing the sources* (`makepkg --printsrcinfo`). This reads the
+     PKGBUILD, whose top-level code can run anything, so it gets no
+     network and nothing of yours to write to: the recipe's directory is
+     read-only. makepkg's build and download directories are given names
+     made up for the run, and a recipe that has changed either by the end
+     of it is refused.
+   - *Fetching them.* The PKGBUILD does not run here at all. makepkg is
+     given a recipe Guardian writes from that listing: the sources, their
+     checksums, what not to extract and the signing keys, each as quoted
+     text, and no code. It downloads, verifies and extracts as it would
+     for the real recipe, with the network on, a copy of your public gpg
+     keyring (for source signatures; never the private keys), and write
+     access only to the recipe's directory and the build and download
+     directories your makepkg configuration names. An existing `src/` is
+     removed first.
+
+   So before the review the recipe's code only runs where it has no
+   network and can write nothing but scratch files that are thrown away,
+   upstream code does not run at all, and what is reviewed is what makepkg
+   extracted from the downloads the build will use. Guardian refuses:
+   - a source kept under a name that is a path (`a/b::…`, `../x::…`),
+     which makepkg would write outside the downloads;
+   - a version-control source whose checkout already exists, in the
+     recipe's directory or the download directory, and is not a plain git
+     mirror as makepkg makes one (other configuration, hooks, or another
+     tool's checkout): makepkg would run that tool inside it. Remove the
+     directory to fetch the source afresh;
+   - a recipe of an AUR package whose `pkgbase` is not that package;
+   - fetching into a build directory that is, or contains, your home
+     directory, `/usr`, `/etc` or the temporary directory.
+
+   A source that needs your SSH keys (`git+ssh://`) cannot be fetched in
+   the sandbox: the fetch fails and the build is blocked.
+
+   Two limits remain. The fetch has the network, so it can reach services
+   on this machine and your local network like any download. And a recipe
+   can tell that it is only being listed: one written to list harmless
+   sources there and others when it is built, or to move `SRCDEST` in a
+   way the recipe checks do not recognise, gets its real sources past this
+   step. Only the review of the recipe's own text stands against that. The
+   build itself then runs with `--holdver`, so it does not fetch newer VCS
+   sources than were reviewed; its `pkgver()` does run, on reviewed code.
+   The AI then reviews the
    upstream code under `src/`: all of it when its code is up to 1 MiB,
    otherwise its build files and scripts (makefiles, CMake, meson,
    `configure`, `setup.py`, `build.rs`, `package.json`, shell scripts…)

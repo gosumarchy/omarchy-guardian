@@ -334,12 +334,14 @@ yay_gate() {
     printf '=== yay makepkg gate ===\n'
     # The gate runs makepkg itself to read the source list and to extract
     # the sources (from a hidden copy of the recipe): those go to the real
-    # makepkg; only the build call the gate starts is recorded.
-    cp /usr/bin/makepkg "$HOME/mockbin/makepkg.real"
+    # makepkg; only the build call the gate starts is recorded. The gate
+    # runs them in its fetch jail, where the home is empty, so the real
+    # makepkg is kept in the /usr layer.
+    cp /usr/bin/makepkg "$E2E/usr-layer/bin/makepkg.real"
     cat >"$HOME/mockbin/makepkg" <<MOCK
 #!/bin/sh
 case " \$* " in
-*" --printsrcinfo "* | *" --nobuild "*) exec "$HOME/mockbin/makepkg.real" "\$@" ;;
+*" --printsrcinfo "* | *" --nobuild "*) exec /usr/bin/makepkg.real "\$@" ;;
 esac
 printf 'makepkg %s\\n' "\$*" >>"\$MOCK_LOG"
 exit 0

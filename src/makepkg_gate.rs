@@ -6,27 +6,30 @@
 //!    whose trust signals (new, unvoted, orphaned, recently changed by
 //!    someone other than its submitter) then go to the AI review as facts;
 //! 2. reviews the recipe (PKGBUILD, install script, patches) as before;
-//! 3. for a call that runs PKGBUILD functions, runs makepkg from a hidden
-//!    copy of the recipe whose `pkgver()`, `prepare()` and `verify()` do
-//!    nothing: first to read the source list and where makepkg will put
-//!    the sources (`BUILDDIR`, `SRCDEST`), then to fetch and extract them.
-//!    No upstream code runs before its review. Unverified or unpinned
-//!    sources are reported, sources anyone on the network can replace
-//!    block, and the AI reviews what runs during the build;
+//! 3. for a call that runs PKGBUILD functions, has makepkg list the
+//!    recipe's sources and then fetch and extract them, both in a jail (see
+//!    `sandbox::FetchJail`). The listing sources the recipe, which can run
+//!    anything at its top level, so it gets no network and nothing to write
+//!    to. The fetch does not run the recipe at all: makepkg is given a
+//!    recipe Guardian writes from that listing, holding the sources and
+//!    their checksums and no code. No upstream code runs before its review,
+//!    and what is reviewed is what makepkg itself extracted. Unverified or
+//!    unpinned sources are reported, sources anyone on the network can
+//!    replace block, and the AI reviews what runs during the build;
 //! 4. checks the recipe once more and starts makepkg with the original
 //!    arguments, plus `--holdver` after a pre-extraction so the build does
-//!    not fetch newer VCS sources than were reviewed, and the probed
-//!    directories pinned.
+//!    not fetch newer VCS sources than were reviewed, and the build and
+//!    download directories pinned to the configured ones.
 
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Write as _};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::aur::{self, AurInfo, Roots, Upstream};
@@ -42,7 +45,7 @@ use crate::osv;
 use crate::pacman;
 use crate::report::{Blocked, Decision, Gap};
 use crate::review::{self, ReviewContext};
-use crate::sandbox::Workspace;
+use crate::sandbox::{self, FetchJail, Workspace};
 use crate::scan::{self, ScanConfig, Snapshot};
 use crate::sha256::Sha256;
 use crate::tools::{self, Limits, OpenCode};
@@ -70,37 +73,72 @@ const MIRRORED_FLAGS: &[&str] = &[
 /// Short flags mirrored out of a cluster like `-fCA`.
 const MIRRORED_SHORT: &[char] = &['A', 'C'];
 
-/// Ends the hidden recipe copy: the functions that run on downloaded
-/// sources before their review do nothing (`pkgver()` keeps the current
-/// version, so makepkg never rewrites the recipe), and the directories
-/// makepkg settled on are reported. Nothing untrusted in it: `token` is the
-/// copy's random name, which only keeps it apart from the recipe's own
-/// names (a recipe can read it from its file name).
-///
-/// The recipe's own code ran first and may have made its functions
-/// read-only or aliased their names, so the replacements are checked by the
-/// token in their bodies (an assignment: no command a recipe could have
-/// redefined) and then made read-only themselves. The report is written
-/// only when they took, and the gate needs it from every run of the copy;
-/// otherwise makepkg stops. This is a check inside a shell the recipe has
-/// already run in, so it catches what a recipe can do in passing, not a
-/// recipe written to defeat it: that one has to get past its own review.
-fn trailer(token: &str) -> String {
-    format!(
-        "
-pkgver() {{ guardian_{token}=1; printf '%s\\n' \"$pkgver\"; }}
-prepare() {{ guardian_{token}=1; }}
-verify() {{ guardian_{token}=1; }}
-readonly -f pkgver prepare verify
-if [[ $(declare -f pkgver) == *guardian_{token}=1* && $(declare -f prepare) == *guardian_{token}=1* && $(declare -f verify) == *guardian_{token}=1* ]]; then
-  if [[ -n ${{GUARDIAN_PROBE:-}} ]]; then
-    printf '%s\\0%s\\0%s\\0%s\\0' \"$BUILDDIR\" \"$SRCDEST\" \"${{pkgbase:-${{pkgname[0]}}}}\" \"$startdir\" >\"$GUARDIAN_PROBE\"
-  fi
-else
-  exit 1
-fi
-"
-    )
+/// Scalars and arrays of a source listing that a fetch needs, besides the
+/// sources and their checksums.
+const FETCH_SCALARS: &[&str] = &["pkgver", "pkgrel", "epoch"];
+const FETCH_ARRAYS: &[&str] = &["arch", "noextract", "validpgpkeys"];
+
+/// A pacman package name: what a `pkgbase` may be used as a path part for.
+fn is_package_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(['-', '.'])
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "@._+-".contains(character))
+}
+
+/// The `pkgbase` of a `makepkg --printsrcinfo` listing.
+fn listed_pkgbase(srcinfo: &str) -> Option<&str> {
+    srcinfo
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("pkgbase = "))
+        .filter(|name| is_package_name(name))
+}
+
+/// A recipe that fetches what `srcinfo` lists and does nothing else: the
+/// version, the sources with their checksums, what not to extract and the
+/// signing keys, each value quoted, and no code of the listed recipe.
+/// makepkg run on it downloads, verifies and extracts exactly as it would
+/// for that recipe, into the same `src/`. `None` without a usable `pkgbase`.
+fn fetch_recipe(srcinfo: &str) -> Option<String> {
+    let pkgbase = listed_pkgbase(srcinfo)?;
+    let quoted = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+    let mut scalars: Vec<(&str, &str)> = Vec::new();
+    let mut arrays: Vec<(&str, Vec<&str>)> = Vec::new();
+    // Per-package sections follow the first `pkgname`; sources are not there.
+    for line in srcinfo
+        .lines()
+        .take_while(|line| !line.starts_with("pkgname = "))
+    {
+        let Some((key, value)) = line.trim().split_once(" = ") else {
+            continue;
+        };
+        let base = key.split_once('_').map_or(key, |(base, _)| base);
+        // A key becomes a variable name, unquoted.
+        let named = key.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+        });
+        if FETCH_SCALARS.contains(&key) {
+            scalars.push((key, value));
+        } else if named
+            && (FETCH_ARRAYS.contains(&key) || base == "source" || aur::CHECKSUMS.contains(&base))
+        {
+            match arrays.iter_mut().find(|(name, _)| *name == key) {
+                Some((_, values)) => values.push(value),
+                None => arrays.push((key, vec![value])),
+            }
+        }
+    }
+    let mut recipe = format!("pkgbase={0}\npkgname=({0})\n", quoted(pkgbase));
+    for (key, value) in scalars {
+        let _ = writeln!(recipe, "{key}={}", quoted(value));
+    }
+    for (key, values) in arrays {
+        let values: Vec<String> = values.into_iter().map(quoted).collect();
+        let _ = writeln!(recipe, "{key}=({})", values.join(" "));
+    }
+    recipe.push_str("package() { :; }\n");
+    Some(recipe)
 }
 
 pub fn run(command: &[OsString], settings: &Settings) -> ExitCode {
@@ -166,9 +204,16 @@ pub fn run(command: &[OsString], settings: &Settings) -> ExitCode {
 
     // 3. The upstream sources, for a call that runs PKGBUILD functions.
     let invocation = aur::classify(arguments);
-    let mut pinned: Option<Probe> = None;
+    let mut pinned: Option<Dirs> = None;
     let mut downloads: Vec<String> = Vec::new();
     if invocation.runs_functions {
+        let configured = match Configured::read() {
+            Ok(configured) => configured,
+            Err(error) => {
+                errln!("Guardian blocked makepkg: {error}.");
+                return ExitCode::from(2);
+            }
+        };
         let step = UpstreamStep {
             makepkg: Path::new(makepkg),
             mirrored: &mirrored,
@@ -178,11 +223,12 @@ pub fn run(command: &[OsString], settings: &Settings) -> ExitCode {
             base: base.as_deref(),
             recipe: &recipe,
             extract: invocation.extracts,
+            configured: &configured,
         };
         match review_upstream(&step, settings, facts) {
             Ok(outcome) => {
                 downloads = outcome.downloads;
-                pinned = Some(outcome.probe);
+                pinned = Some(outcome.dirs);
             }
             Err(exit) => return exit,
         }
@@ -232,12 +278,12 @@ fn local_key(build_dir: &Path) -> String {
 
 /// Replaces this process with makepkg: the original arguments, plus
 /// `--holdver` after a pre-extraction (the build must not fetch different
-/// code than was reviewed), with the probed directories pinned.
+/// code than was reviewed), with the configured directories pinned.
 fn start_build(
     makepkg: &Path,
     arguments: &[OsString],
     extracted: bool,
-    pinned: Option<Probe>,
+    pinned: Option<Dirs>,
 ) -> ExitCode {
     errln!("Guardian: review clear; starting {}", makepkg.display());
     let mut arguments = arguments.to_vec();
@@ -247,9 +293,9 @@ fn start_build(
     drop(io::stdout().flush());
     let mut build = Command::new(makepkg);
     build.args(&arguments);
-    if let Some(probe) = pinned {
-        build.env("BUILDDIR", &probe.builddir);
-        build.env("SRCDEST", &probe.srcdest);
+    if let Some(dirs) = pinned {
+        build.env("BUILDDIR", &dirs.builddir);
+        build.env("SRCDEST", &dirs.srcdest);
     }
     let error = build.exec();
     errln!("Could not start {}: {error}", makepkg.display());
@@ -412,40 +458,20 @@ struct UpstreamStep<'a> {
     /// The call extracts the sources itself, so they are extracted here
     /// first, without running any PKGBUILD function.
     extract: bool,
+    configured: &'a Configured,
 }
 
-/// Where makepkg settles, as the recipe copy reports it.
+/// Where makepkg builds and keeps downloads for a recipe: the configured
+/// directories, or the recipe's own.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Probe {
+struct Dirs {
     builddir: PathBuf,
     srcdest: PathBuf,
     pkgbase: String,
     startdir: PathBuf,
 }
 
-impl Probe {
-    fn parse(bytes: &[u8]) -> Option<Self> {
-        let text = String::from_utf8(bytes.to_vec()).ok()?;
-        let mut fields = text.split('\0');
-        let builddir = fields.next()?.to_string();
-        let srcdest = fields.next()?.to_string();
-        let pkgbase = fields.next()?.to_string();
-        let startdir = fields.next()?.to_string();
-        if builddir.is_empty() || pkgbase.is_empty() || startdir.is_empty() {
-            return None;
-        }
-        Some(Self {
-            srcdest: if srcdest.is_empty() {
-                PathBuf::from(&startdir)
-            } else {
-                PathBuf::from(srcdest)
-            },
-            builddir: PathBuf::from(builddir),
-            pkgbase,
-            startdir: PathBuf::from(startdir),
-        })
-    }
-
+impl Dirs {
     /// `srcdir` exactly as makepkg computes it.
     fn srcdir(&self) -> PathBuf {
         let builddir = fs::canonicalize(&self.builddir).ok();
@@ -457,7 +483,8 @@ impl Probe {
     }
 }
 
-/// The hidden recipe copy makepkg runs from (`-p`), removed on drop.
+/// The hidden recipe makepkg fetches from (`-p`, which must be beside the
+/// real one), removed on drop.
 struct RecipeCopy {
     path: PathBuf,
 }
@@ -479,9 +506,7 @@ impl RecipeCopy {
             .mode(0o600)
             .open(&path)
             .at(&path)?;
-        file.write_all(recipe.as_bytes())
-            .and_then(|()| file.write_all(trailer(&suffix).as_bytes()))
-            .at(&path)?;
+        file.write_all(recipe.as_bytes()).at(&path)?;
         Ok(Self { path })
     }
 
@@ -499,78 +524,467 @@ impl Drop for RecipeCopy {
     }
 }
 
+/// Where the user's own makepkg configuration and environment put the
+/// build and the downloads, before any recipe is read. Only these, and the
+/// recipe's directory, are writable while Guardian fetches the sources.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Configured {
+    builddir: Option<PathBuf>,
+    srcdest: Option<PathBuf>,
+}
+
+/// Loads makepkg's configuration the way makepkg does and prints the two
+/// directories. Fixed text; the configuration is the user's own.
+const CONFIGURED_SCRIPT: &str = "source /usr/share/makepkg/util/message.sh && \
+source /usr/share/makepkg/util/util.sh && source /usr/share/makepkg/util/config.sh && \
+load_makepkg_config && printf '%s\\0%s\\0' \"$BUILDDIR\" \"$SRCDEST\"";
+
+impl Configured {
+    fn read() -> Result<Self, Error> {
+        let output = tools::run(
+            Path::new("/usr/bin/bash"),
+            &["-c".into(), CONFIGURED_SCRIPT.into()],
+            None,
+            &[],
+            SRCINFO_LIMITS,
+        )?
+        .into_success()?;
+        Self::parse(&output)
+            .ok_or_else(|| Error::Refused("makepkg's configuration could not be read".into()))
+    }
+
+    fn parse(output: &[u8]) -> Option<Self> {
+        let text = str::from_utf8(output).ok()?;
+        let mut fields = text.split('\0');
+        let mut directory = || {
+            let field = fields.next()?;
+            Some((!field.is_empty()).then(|| PathBuf::from(field)))
+        };
+        Some(Self {
+            builddir: directory()?,
+            srcdest: directory()?,
+        })
+    }
+
+    /// Where makepkg settles for the recipe in `build_dir`: unset, both
+    /// directories are the recipe's own.
+    fn dirs(&self, build_dir: &Path, pkgbase: &str) -> Dirs {
+        let or_recipe = |configured: &Option<PathBuf>| {
+            configured
+                .clone()
+                .unwrap_or_else(|| build_dir.to_path_buf())
+        };
+        Dirs {
+            builddir: or_recipe(&self.builddir),
+            srcdest: or_recipe(&self.srcdest),
+            pkgbase: pkgbase.to_string(),
+            startdir: build_dir.to_path_buf(),
+        }
+    }
+}
+
+/// Whether makepkg may be given `path` to write to in the jail: not a
+/// directory whose binding would bring back what the jail hides (the home,
+/// the system, the temporary directory, or anything above them).
+fn is_jailable(path: &Path, home: &Path) -> bool {
+    let Ok(path) = fs::canonicalize(path) else {
+        return false;
+    };
+    let hidden = [home, Path::new("/usr"), Path::new("/etc"), &env::temp_dir()];
+    !hidden.iter().any(|kept| {
+        fs::canonicalize(kept)
+            .unwrap_or_else(|_| kept.to_path_buf())
+            .starts_with(&path)
+    }) && !path.starts_with("/usr")
+        && !path.starts_with("/etc")
+}
+
+/// Environment variables a download may need, passed into the jail as set.
+const PASSED_VARIABLES: &[&str] = &[
+    "LANG",
+    "TERM",
+    "XDG_CONFIG_HOME",
+    "http_proxy",
+    "https_proxy",
+    "ftp_proxy",
+    "all_proxy",
+    "no_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "FTP_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+];
+
+/// The files of a gpg home directory that hold public keys and their trust.
+const PUBLIC_KEYRING: &[&str] = &[
+    "pubring.kbx",
+    "pubring.gpg",
+    "trustdb.gpg",
+    "gpg.conf",
+    "common.conf",
+    "public-keys.d/pubring.db",
+];
+
+/// Copies the public part of the user's keyring into `workspace`, so
+/// source signatures verify in the jail without the private keys being
+/// there. `None` without a keyring.
+fn public_keyring(home: &Path, workspace: &Path) -> Option<PathBuf> {
+    let source = env::var_os("GNUPGHOME").map_or_else(|| home.join(".gnupg"), PathBuf::from);
+    if !source.is_dir() {
+        return None;
+    }
+    let copy = workspace.join("gnupg");
+    let private = |path: &Path| DirBuilder::new().mode(0o700).create(path);
+    private(&copy).ok()?;
+    private(&copy.join("public-keys.d")).ok()?;
+    for name in PUBLIC_KEYRING {
+        let from = source.join(name);
+        if fs::metadata(&from).is_ok_and(|metadata| metadata.is_file()) {
+            fs::copy(&from, copy.join(name)).ok()?;
+        }
+    }
+    Some(copy)
+}
+
+/// One of Guardian's two makepkg runs in the jail, with the build and
+/// download directories makepkg is given in it.
+#[derive(Clone, Copy)]
+enum Run<'a> {
+    /// Listing the sources: directories inside the jail's temporary one.
+    List(&'a Dirs),
+    /// Fetching them: the real directories, writable.
+    Fetch(&'a Dirs),
+}
+
+/// The user's home, which the jail empties.
+fn home() -> Result<PathBuf, Error> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute() && home.parent().is_some())
+        .ok_or_else(|| Error::Refused("HOME is not set to a directory".into()))
+}
+
+/// The Bubblewrap command that runs makepkg with `arguments` in the jail,
+/// for one of two runs. Listing the sources sources the real recipe: no
+/// network, the recipe's directory read-only, and makepkg's build and
+/// download directories pointed at the jail's own temporary directory.
+/// Fetching (`fetch`) runs the generated recipe: the network, a copy of
+/// the public keyring, and the real directories writable. `workspace` is
+/// writable in both, for the listing's report and the keyring.
+fn jailed(
+    step: &UpstreamStep<'_>,
+    workspace: &Workspace,
+    run: Run<'_>,
+    arguments: &[OsString],
+) -> Result<Vec<OsString>, Error> {
+    let fetch = match run {
+        Run::Fetch(dirs) => Some(dirs),
+        Run::List(_) => None,
+    };
+    let home = home()?;
+    let configuration = env::var_os("XDG_CONFIG_HOME")
+        .map_or_else(|| home.join(".config"), PathBuf::from)
+        .join("pacman/makepkg.conf");
+    let mut readable = vec![configuration, home.join(".makepkg.conf")];
+    let mut writable: Vec<&Path> = vec![workspace.path()];
+    let report = workspace.path().join("report");
+    let mut keyring = None;
+    let (builddir, srcdest): (&Path, &Path) = if let Some(dirs) = fetch {
+        for directory in [step.build_dir, &dirs.builddir, &dirs.srcdest] {
+            // makepkg would create a configured one; a bind needs it.
+            fs::create_dir_all(directory).at(directory)?;
+            if !is_jailable(directory, &home) {
+                return Err(Error::Refused(format!(
+                    "{} holds more than a build, so the sources cannot be fetched into it in the sandbox",
+                    directory.display()
+                )));
+            }
+            if !writable.contains(&directory) {
+                writable.push(directory);
+            }
+        }
+        keyring = public_keyring(&home, workspace.path());
+        (&dirs.builddir, &dirs.srcdest)
+    } else {
+        readable.push(step.build_dir.to_path_buf());
+        let (Run::List(dirs) | Run::Fetch(dirs)) = run;
+        (&dirs.builddir, &dirs.srcdest)
+    };
+
+    // The listing has no network, and what it prints becomes requests: it
+    // is not told the proxies, which may hold credentials.
+    let passed: Vec<(&str, OsString)> = PASSED_VARIABLES
+        .iter()
+        .filter(|name| fetch.is_some() || !name.to_ascii_lowercase().ends_with("_proxy"))
+        .filter_map(|name| Some((*name, env::var_os(name)?)))
+        .collect();
+    let mut environment: Vec<(&str, &OsStr)> = vec![
+        ("HOME", home.as_os_str()),
+        ("PATH", "/usr/bin".as_ref()),
+        ("BUILDDIR", builddir.as_os_str()),
+        ("SRCDEST", srcdest.as_os_str()),
+        // Nothing is packaged or logged in the jail; these only have to
+        // be writable for makepkg to start.
+        ("PKGDEST", "/tmp".as_ref()),
+        ("SRCPKGDEST", "/tmp".as_ref()),
+        ("LOGDEST", "/tmp".as_ref()),
+    ];
+    environment.extend(
+        passed
+            .iter()
+            .map(|(name, value)| (*name, value.as_os_str())),
+    );
+    if fetch.is_none() {
+        // The listing is parsed.
+        environment.push(("LC_ALL", "C".as_ref()));
+        environment.push(("GUARDIAN_REPORT", report.as_os_str()));
+    }
+
+    let mut command = sandbox::fetch_jail(&FetchJail {
+        home: &home,
+        readable: &readable,
+        writable: &writable,
+        keyring: keyring.as_deref(),
+        network: fetch.is_some(),
+        environment: &environment,
+        directory: step.build_dir,
+    });
+    command.push(step.makepkg.into());
+    command.extend(arguments.iter().cloned());
+    Ok(command)
+}
+
 struct UpstreamOutcome {
-    probe: Probe,
+    dirs: Dirs,
     /// Top-level names makepkg downloads into the build directory.
     downloads: Vec<String>,
 }
 
-/// Runs makepkg from the recipe copy to read the source list and the
-/// directories it will use.
-fn probe(step: &UpstreamStep<'_>, copy: &RecipeCopy) -> Result<(Vec<aur::Source>, Probe), Error> {
+/// The recipe the listing runs: the real one, then a report of the two
+/// directories as it left them. Fixed text. It runs in the shell the recipe
+/// ran in, so it shows what a recipe did in passing (however it was
+/// written), not what one written to deceive it wants hidden.
+const LISTING_RECIPE: &str = "source \"$startdir/PKGBUILD\"
+printf '%s\\0%s\\0' \"$BUILDDIR\" \"$SRCDEST\" >\"$GUARDIAN_REPORT\"
+";
+
+/// The most a listing's report can hold: two paths.
+const MAX_REPORT_BYTES: u64 = 16 * 1024;
+
+/// What the listing run reported, if it left a plain file of a sane size:
+/// the recipe's shell wrote it, so it may be anything.
+fn listing_report(path: &Path) -> Option<Vec<u8>> {
+    fs::symlink_metadata(path)
+        .ok()
+        .filter(|metadata| metadata.is_file() && metadata.len() <= MAX_REPORT_BYTES)
+        .and_then(|_| fs::read(path).ok())
+}
+
+/// Has makepkg list the recipe's sources (`--printsrcinfo`), in the jail:
+/// the recipe's top-level code runs there, with no network and nothing of
+/// the user's to read or write. Its build and download directories are
+/// pointed at names made up for this run, inside the jail's own temporary
+/// directory. Returns the listing, unless the recipe did not leave those
+/// two as they were: it would move the real build's too.
+fn probe(step: &UpstreamStep<'_>) -> Result<String, Error> {
     let workspace = Workspace::create("probe")?;
-    let probe_file = workspace.path().join("probe");
-    let probe_text = probe_file.display().to_string();
+    let copy = RecipeCopy::create(step.build_dir, LISTING_RECIPE)?;
+    // The copy's name is random, so no recipe can assign these by rote.
+    let inside = Path::new("/tmp").join(copy.name());
+    let listing = Dirs {
+        builddir: inside.join("build"),
+        srcdest: inside.join("sources"),
+        pkgbase: String::new(),
+        startdir: step.build_dir.to_path_buf(),
+    };
     let mut args: Vec<OsString> = vec!["-p".into(), copy.name(), "--printsrcinfo".into()];
     args.extend(step.mirrored.iter().cloned());
+    let command = jailed(step, &workspace, Run::List(&listing), &args)?;
     let captured = tools::run_in(
-        step.makepkg,
-        &args,
+        Path::new(tools::BWRAP),
+        &command,
         step.build_dir,
-        &[("LC_ALL", "C"), ("GUARDIAN_PROBE", &probe_text)],
+        &[],
         SRCINFO_LIMITS,
     )?
     .into_success()?;
-    let sources = aur::parse_srcinfo(&String::from_utf8_lossy(&captured));
-    let probe = fs::read(&probe_file)
-        .ok()
-        .and_then(|bytes| Probe::parse(&bytes))
-        .ok_or_else(|| Error::Refused("makepkg did not report where it builds".into()))?;
-    Ok((sources, probe))
+    let mut expected = listing.builddir.as_os_str().as_encoded_bytes().to_vec();
+    expected.push(0);
+    expected.extend(listing.srcdest.as_os_str().as_encoded_bytes());
+    expected.push(0);
+    match listing_report(&workspace.path().join("report")) {
+        Some(report) if report == expected => Ok(String::from_utf8_lossy(&captured).into_owned()),
+        Some(_) => Err(Error::Refused(
+            "the PKGBUILD moves makepkg's build or download directory".into(),
+        )),
+        None => Err(Error::Refused(
+            "the PKGBUILD did not finish loading here (it stops or fails on this system)".into(),
+        )),
+    }
 }
 
-/// Fetches and extracts the sources from the recipe copy, where
-/// `pkgver()`, `prepare()` and `verify()` do nothing. A run without the
-/// copy's report is one where that was not established: the recipe's own
-/// functions may have run on the downloads, and the build is blocked.
-fn pre_extract(step: &UpstreamStep<'_>, copy: &RecipeCopy) -> Result<(), String> {
-    let workspace = Workspace::create("fetch")
-        .map_err(|error| format!("could not prepare the sources ({error})."))?;
-    let report = workspace.path().join("probe");
-    errln!(
-        "Guardian: fetching and extracting the sources for review (makepkg runs the approved PKGBUILD only to download them; pkgver(), prepare() and verify() do not run and nothing is built)..."
+/// Fetches and extracts the sources, in the jail with the network on, from
+/// `recipe`: the generated one, so none of the package's recipe runs. A
+/// source tree left by an earlier run is removed first (`--cleanbuild`).
+fn pre_extract(step: &UpstreamStep<'_>, dirs: &Dirs, recipe: &str) -> Result<(), String> {
+    let prepare = |error: Error| format!("could not prepare the sources ({error}).");
+    let workspace = Workspace::create("fetch").map_err(prepare)?;
+    let copy = RecipeCopy::create(step.build_dir, recipe).map_err(prepare)?;
+    let mut args: Vec<OsString> = vec!["-p".into(), copy.name()];
+    args.extend(
+        [
+            "--nobuild",
+            "--noprepare",
+            "--nodeps",
+            "--noconfirm",
+            "--cleanbuild",
+        ]
+        .map(Into::into),
     );
-    let status = Command::new(step.makepkg)
+    args.extend(step.mirrored.iter().cloned());
+    let command = jailed(step, &workspace, Run::Fetch(dirs), &args).map_err(prepare)?;
+    errln!(
+        "Guardian: fetching and extracting the sources for review, in a sandbox (makepkg downloads what the PKGBUILD lists; the PKGBUILD itself does not run and nothing is built)..."
+    );
+    let status = Command::new(tools::BWRAP)
         .current_dir(step.build_dir)
-        .arg("-p")
-        .arg(copy.name())
-        .args(["--nobuild", "--noprepare", "--nodeps", "--noconfirm"])
-        .args(step.mirrored)
-        .env("GUARDIAN_PROBE", &report)
+        .args(command)
+        .stdin(Stdio::null())
         .status()
         .map_err(|error| format!("could not run makepkg to fetch the sources ({error})."))?;
-    if !status.success() {
+    if status.success() {
+        Ok(())
+    } else {
         Err(format!(
             "fetching the sources for review failed ({status})."
         ))
-    } else if fs::read(&report).is_ok_and(|bytes| Probe::parse(&bytes).is_some()) {
-        Ok(())
-    } else {
-        Err(
-            "the PKGBUILD kept its pkgver(), prepare() or verify() from being switched off for the fetch."
-                .into(),
-        )
     }
+}
+
+/// The first source makepkg would keep under a name that is not a plain
+/// file name. makepkg takes the text before `::` as it is, so `a/b` or
+/// `../x` would be written somewhere else than among the downloads.
+fn misnamed_source(sources: &[aur::Source]) -> Option<&str> {
+    sources
+        .iter()
+        .map(|source| source.entry.as_str())
+        .find(|entry| {
+            let name = aur::source_filename(entry);
+            name.is_empty()
+                || name.contains('/')
+                || name.starts_with('-')
+                || [".", "..", ".git"].contains(&name.as_str())
+        })
+}
+
+/// Sections and keys (lowercase: git ignores their case) of the
+/// configuration `git clone --mirror` writes.
+const MIRROR_CONFIG: &[(&str, &[&str])] = &[
+    (
+        "[core]",
+        &[
+            "repositoryformatversion",
+            "filemode",
+            "bare",
+            "logallrefupdates",
+            "ignorecase",
+            "precomposeunicode",
+            "symlinks",
+        ],
+    ),
+    ("[remote \"origin\"]", &["url", "fetch", "mirror", "tagopt"]),
+];
+
+/// Whether `mirror` is a git mirror as makepkg makes one for `url`: its
+/// configuration holds nothing but what `git clone --mirror` writes, it has
+/// no hooks, and its configuration is its own. makepkg runs `git fetch`
+/// inside an existing mirror, and git does what a repository's
+/// configuration and hooks say.
+fn is_plain_mirror(mirror: &Path, url: &str) -> bool {
+    let is_dir = |path: &Path| fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir());
+    let Ok(config) = fs::read_to_string(mirror.join("config")) else {
+        return false;
+    };
+    let mut keys: &[&str] = &[];
+    let mut origin = None;
+    for line in config
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if let Some((_, allowed)) = MIRROR_CONFIG.iter().find(|(section, _)| *section == line) {
+            keys = allowed;
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return false;
+        };
+        let (key, value) = (key.trim().to_ascii_lowercase(), value.trim());
+        // git fetches from the first `url` and reports the last.
+        if !keys.contains(&key.as_str())
+            || value.ends_with('\\')
+            || (key == "url" && origin.is_some())
+        {
+            return false;
+        }
+        if key == "url" {
+            origin = Some(value);
+        }
+    }
+    let hooks = mirror.join("hooks");
+    let no_hooks = !hooks.exists()
+        || (is_dir(&hooks)
+            && fs::read_dir(&hooks).is_ok_and(|entries| {
+                entries.flatten().all(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.ends_with(".sample"))
+                })
+            }));
+    // makepkg takes a URL with or without the `.git` as the same one.
+    let bare = |url: &str| url.strip_suffix(".git").unwrap_or(url).to_string();
+    is_dir(mirror)
+        && origin.map(bare) == Some(bare(url))
+        && no_hooks
+        && !["commondir", "config.worktree", "gitdir"]
+            .iter()
+            .any(|name| mirror.join(name).exists())
+}
+
+/// The first version-control source whose checkout is already there, in
+/// the recipe's directory (where makepkg looks first) or the download
+/// directory, and is not a plain git mirror: makepkg would run that tool
+/// inside a directory someone else may have laid out.
+fn foreign_checkout<'a>(sources: &'a [aur::Source], dirs: &Dirs) -> Option<&'a str> {
+    sources
+        .iter()
+        .map(|source| source.entry.as_str())
+        .filter(|entry| aur::is_vcs_source(entry))
+        .find(|entry| {
+            [&dirs.startdir, &dirs.srcdest].iter().any(|directory| {
+                let checkout = directory.join(aur::source_filename(entry));
+                fs::symlink_metadata(&checkout).is_ok()
+                    && !(aur::source_protocol(entry) == "git"
+                        && is_plain_mirror(&checkout, aur::git_source_url(entry)))
+            })
+        })
 }
 
 /// The source checks: printed, blocking when a source can be replaced in
 /// transit, and otherwise facts for the AI in Guardian's own words.
-fn source_context(sources: &[aur::Source]) -> Result<Vec<String>, ()> {
+fn source_context(sources: &[aur::Source], extracts: bool) -> Result<Vec<String>, ()> {
     let checks = aur::check_sources(sources);
     print_warnings("Source checks", &checks.warnings);
     if !checks.blocking.is_empty() {
-        print_warnings("Source checks (blocking)", &checks.blocking);
-        return Err(());
+        // A call that only downloads (to verify, or to generate the very
+        // checksums that are missing) builds nothing from them.
+        if extracts {
+            print_warnings("Source checks (blocking)", &checks.blocking);
+            return Err(());
+        }
+        print_warnings("Source checks (these block a build)", &checks.blocking);
     }
     Ok(checks
         .context
@@ -588,8 +1002,43 @@ fn upstream_budget(settings: &Settings) -> u64 {
         .max(aur::PARTIAL_REVIEW_BYTES)
 }
 
+/// Why the listed sources must not be fetched, as a message and its short
+/// form: the recipe is not the package it sits in, a source would be
+/// written outside the downloads, or a checkout to update is not makepkg's.
+fn fetch_refusal(
+    step: &UpstreamStep<'_>,
+    pkgbase: &str,
+    sources: &[aur::Source],
+    dirs: &Dirs,
+) -> Option<(String, &'static str)> {
+    // The package base names the source tree under a shared build
+    // directory, which the fetch replaces.
+    if let Some(base) = step.base
+        && base != pkgbase
+    {
+        return Some((
+            format!("the PKGBUILD's pkgbase {pkgbase:?} is not its AUR repository's ({base})."),
+            "the PKGBUILD names another package as its base",
+        ));
+    }
+    if let Some(entry) = misnamed_source(sources) {
+        return Some((
+            format!("a source is kept under a name that is not a file name: {entry:?}."),
+            "a source is named as a path",
+        ));
+    }
+    // Whether Guardian fetches or the build does, makepkg updates it.
+    let entry = foreign_checkout(sources, dirs)?;
+    Some((
+        format!(
+            "there is already a checkout for {entry:?} that is not a plain git mirror of it; remove it to fetch the source afresh."
+        ),
+        "an existing source checkout is not a plain mirror",
+    ))
+}
+
 /// Returns why makepkg must not start, as an exit code. A block notes that
-/// the recipe ran: makepkg sources the recipe copy from the first probe on.
+/// the recipe ran: makepkg sources it, in the jail, to list the sources.
 fn review_upstream(
     step: &UpstreamStep<'_>,
     settings: &Settings,
@@ -600,27 +1049,21 @@ fn review_upstream(
         notify::blocked(&subject(step.name), why, Ran::RecipeToFetch);
         ExitCode::from(code)
     };
-    let copy = RecipeCopy::create(step.build_dir, step.recipe).map_err(|error| {
-        block(
-            format!("could not prepare the sources ({error})."),
-            "the sources could not be prepared for review",
-            2,
-        )
-    })?;
-    let (sources, probe) = probe(step, &copy).map_err(|error| {
+    let unreadable = |error: String| {
         block(
             format!("could not read the source list ({error})."),
             "the source list could not be read",
             2,
         )
-    })?;
-    if let Some(base) = step.base
-        && base != probe.pkgbase
-    {
-        errln!(
-            "Guardian: the PKGBUILD's pkgbase {:?} differs from its AUR repository {base}.",
-            probe.pkgbase
-        );
+    };
+    let srcinfo = probe(step).map_err(|error| unreadable(error.to_string()))?;
+    let (Some(pkgbase), Some(recipe)) = (listed_pkgbase(&srcinfo), fetch_recipe(&srcinfo)) else {
+        return Err(unreadable("it names no usable pkgbase".into()));
+    };
+    let sources = aur::parse_srcinfo(&srcinfo);
+    let dirs = step.configured.dirs(step.build_dir, pkgbase);
+    if let Some((message, why)) = fetch_refusal(step, pkgbase, &sources, &dirs) {
+        return Err(block(message, why, 1));
     }
 
     let mut context = vec![aur::UPSTREAM_SCOPE.to_string()];
@@ -630,7 +1073,7 @@ fn review_upstream(
         "The recipe defines no check(), so the upstream test suite does not run during this build."
             .into()
     });
-    let checked = source_context(&sources).map_err(|()| {
+    let checked = source_context(&sources, step.extract).map_err(|()| {
         block(
             "a source can be replaced in transit.".into(),
             "a source can be replaced in transit",
@@ -641,19 +1084,26 @@ fn review_upstream(
     context.extend(facts);
 
     if step.extract {
-        pre_extract(step, &copy)
+        pre_extract(step, &dirs, &recipe)
             .map_err(|message| block(message, "fetching the sources for review failed", 2))?;
     }
-    drop(copy);
 
     let budget = upstream_budget(settings);
-    let srcdir = probe.srcdir();
+    let srcdir = dirs.srcdir();
     let roots = Roots {
         build_dir: step.build_dir,
-        srcdest: Some(&probe.srcdest),
+        srcdest: Some(&dirs.srcdest),
     };
     let upstream = aur::collect_upstream(&srcdir, &roots, step.recipe, budget);
     let downloads = download_names(&sources);
+    if !sources.is_empty() && !upstream.found && !step.extract && upstream.gaps.is_empty() {
+        // A call that only downloads: there is nothing extracted to review
+        // yet, and it extracts nothing either.
+        // To stderr: such a call's output may be what the caller wants
+        // (`makepkg -g >>PKGBUILD`).
+        errln!("Upstream: no extracted sources yet; they are reviewed when they are extracted.");
+        return Ok(UpstreamOutcome { dirs, downloads });
+    }
     if !sources.is_empty() && !upstream.found {
         return Err(block(
             format!(
@@ -673,13 +1123,13 @@ fn review_upstream(
                 String::new()
             }
         );
-        return Ok(UpstreamOutcome { probe, downloads });
+        return Ok(UpstreamOutcome { dirs, downloads });
     }
     let decision = review_upstream_files(step, settings, &upstream, &context, &sources);
     match decision {
         // Nothing was sent to the AI (`ai = off`): the recipe decision stands.
         Decision::Limited | Decision::Clear | Decision::Warned => {
-            Ok(UpstreamOutcome { probe, downloads })
+            Ok(UpstreamOutcome { dirs, downloads })
         }
         Decision::Blocked(_) => {
             errln!(
@@ -697,25 +1147,14 @@ fn review_upstream(
 }
 
 /// The top-level names makepkg downloads a source list into when
-/// `SRCDEST` is the build directory: `name::` prefixes, or the last URL
-/// path segment (a repository's name without `.git`).
+/// `SRCDEST` is the build directory. Never `PKGBUILD`: makepkg keeps the
+/// one that is there, which must stay as reviewed.
 fn download_names(sources: &[aur::Source]) -> Vec<String> {
     let mut names: Vec<String> = sources
         .iter()
-        .filter(|source| source.entry.contains("://") || source.entry.contains("+lp:"))
-        .map(|source| {
-            if let Some((name, _)) = source.entry.split_once("::") {
-                return name.to_string();
-            }
-            let url = source.entry.split(['#', '?']).next().unwrap_or_default();
-            let last = url
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .unwrap_or_default();
-            last.strip_suffix(".git").unwrap_or(last).to_string()
-        })
-        .filter(|name| !name.is_empty())
+        .filter(|source| aur::source_protocol(&source.entry) != "local")
+        .map(|source| aur::source_filename(&source.entry))
+        .filter(|name| !name.is_empty() && name != "PKGBUILD")
         .collect();
     names.sort();
     names.dedup();
@@ -731,12 +1170,21 @@ fn verify_recipe(
 ) -> Result<(), Error> {
     let mut config = config.clone();
     config.excluded_entries.extend(downloads.iter().cloned());
+    // A partial download is makepkg's own file only when it was not there
+    // at the review: one that was is a recipe file like any other.
+    let reviewed_part = |top: &str| {
+        reviewed
+            .files()
+            .iter()
+            .any(|file| file.path.split('/').next() == Some(top))
+    };
     let excluded = |path: &str| {
         let top = path.split('/').next().unwrap_or_default();
         downloads.iter().any(|name| name == top)
-            || Path::new(top)
+            || (Path::new(top)
                 .extension()
                 .is_some_and(|extension| extension == "part")
+                && !reviewed_part(top))
             || (top.starts_with(".guardian-") && top.ends_with(".PKGBUILD"))
     };
     let (current, gaps) = scan::walk(&config, &mut |_| {});
@@ -943,12 +1391,16 @@ pub fn parse(args: &[OsString]) -> Result<Vec<OsString>, String> {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use std::fs;
     use std::process::Command;
 
-    use super::{Probe, aur, download_names, mirrored_arguments, parse, trailer};
+    use super::{
+        Configured, LISTING_RECIPE, aur, download_names, fetch_recipe, foreign_checkout,
+        is_jailable, is_plain_mirror, listing_report, mirrored_arguments, misnamed_source, parse,
+        public_keyring,
+    };
     use crate::test_support::TempDir;
 
     fn args(list: &[&str]) -> Vec<OsString> {
@@ -992,54 +1444,199 @@ mod tests {
     }
 
     #[test]
-    fn the_recipe_copy_reports_only_when_its_functions_are_switched_off() {
-        // Sourced the way makepkg does, then pkgver() and prepare() run.
-        let run = |name: &str, recipe: &str| -> (bool, bool, String) {
-            let dir = TempDir::new(name);
-            let report = dir.path().join("report");
-            let script = format!("pkgver=1\npkgname=demo\n{recipe}\n{}", trailer("0011aabb"));
-            fs::write(dir.path().join("PKGBUILD"), script).unwrap();
-            let output = Command::new("/usr/bin/bash")
-                .args(["-c", "source ./PKGBUILD; pkgver; prepare; verify"])
-                .current_dir(dir.path())
-                .env("GUARDIAN_PROBE", &report)
-                .env("BUILDDIR", "/b")
-                .env("startdir", "/start")
-                .output()
-                .unwrap();
-            (
-                report.exists(),
-                dir.path().join("ran").exists(),
-                String::from_utf8_lossy(&output.stdout).into_owned(),
-            )
-        };
-        let own =
-            "pkgver() { touch ran; echo 2; }\nprepare() { touch ran; }\nverify() { touch ran; }";
+    fn the_fetch_recipe_holds_the_listed_sources_and_no_code() {
+        let srcinfo = "pkgbase = demo
+\tpkgdesc = $(touch /tmp/x)
+\tpkgver = 1.2
+\tpkgrel = 3
+\tinstall = demo.install
+\tarch = x86_64
+\tarch = aarch64
+\tmakedepends = git
+\tnoextract = a.tar.gz
+\tsource = a.tar.gz::https://example.org/a.tar.gz
+\tsource = it's $(odd) `name`.txt
+\tvalidpgpkeys = ABCDEF
+\tsha256sums = abc
+\tsha256sums = SKIP
+\tsource_x86_64 = git+https://example.org/r.git#commit=abc
+\tb2sums_x86_64 = SKIP
+\tsource_x86-64;touch = x
+\tSOURCE_EVIL = x
 
-        assert_eq!(run("trailer-plain", own), (true, false, "1\n".to_string()));
-        assert_eq!(run("trailer-none", ""), (true, false, "1\n".to_string()));
-        // Once switched off, they stay off.
-        let late = format!("{own}\ntrap 'pkgver() {{ touch ran; }}' RETURN");
-        assert!(!run("trailer-late", &late).1);
-
-        for (name, trick) in [
-            ("readonly", "readonly -f pkgver"),
-            ("exit", "readonly -f prepare\nexit() { :; }"),
-            ("alias", "shopt -s expand_aliases\nalias pkgver=other"),
-            ("return", "return 0"),
-        ] {
-            let recipe = format!("{own}\n{trick}");
-            let (reported, _, _) = run(&format!("trailer-{name}"), &recipe);
-            assert!(!reported, "{name}");
+pkgname = demo-a
+\tsource = not-a-global-source
+";
+        assert_eq!(
+            fetch_recipe(srcinfo).unwrap(),
+            "pkgbase='demo'
+pkgname=('demo')
+pkgver='1.2'
+pkgrel='3'
+arch=('x86_64' 'aarch64')
+noextract=('a.tar.gz')
+source=('a.tar.gz::https://example.org/a.tar.gz' 'it'\\''s $(odd) `name`.txt')
+validpgpkeys=('ABCDEF')
+sha256sums=('abc' 'SKIP')
+source_x86_64=('git+https://example.org/r.git#commit=abc')
+b2sums_x86_64=('SKIP')
+package() { :; }
+"
+        );
+        for pkgbase in ["", "../x", "-x", ".x", "a b", "a/b", "$(x)", "a'b"] {
+            assert_eq!(
+                fetch_recipe(&format!("pkgbase = {pkgbase}\n")),
+                None,
+                "{pkgbase:?}"
+            );
         }
     }
 
     #[test]
-    fn srcdir_follows_makepkg() {
-        let probe = Probe::parse(b"/b\0\0demo\0/start\0").unwrap();
-        assert_eq!(probe.srcdest, PathBuf::from("/start"));
-        assert_eq!(probe.srcdir(), PathBuf::from("/b/demo/src"));
-        assert!(Probe::parse(b"/b\0").is_none());
+    fn the_fetch_recipe_runs_nothing_when_bash_reads_it() {
+        let dir = TempDir::new("fetch-recipe");
+        let srcinfo = format!(
+            "pkgbase = demo\n\tpkgver = 1\n\tsource = a'; touch {0}/ran; '\n\tsource = $(touch {0}/ran)\n\tsource = `touch {0}/ran`\n\tnoextract = \\'; touch {0}/ran #\n",
+            dir.path().display()
+        );
+        fs::write(dir.path().join("PKGBUILD"), fetch_recipe(&srcinfo).unwrap()).unwrap();
+        let output = Command::new("/usr/bin/bash")
+            .args([
+                "-c",
+                "source ./PKGBUILD && printf '%s\\n' \"${#source[@]}\" \"${source[0]}\"",
+            ])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            format!("3\na'; touch {}/ran; '\n", dir.path().display())
+        );
+        assert!(!dir.path().join("ran").exists());
+    }
+
+    #[test]
+    fn the_listing_reports_the_directories_as_the_recipe_left_them() {
+        // Sourced the way makepkg does, with the two directories set.
+        let report_of = |name: &str, recipe: &str| -> Option<Vec<u8>> {
+            let dir = TempDir::new(name);
+            let report = dir.path().join("report");
+            fs::write(dir.path().join("PKGBUILD"), recipe).unwrap();
+            fs::write(dir.path().join("listing"), LISTING_RECIPE).unwrap();
+            let status = Command::new("/usr/bin/bash")
+                .args(["-c", "source ./listing"])
+                .current_dir(dir.path())
+                .env("startdir", dir.path())
+                .env("BUILDDIR", "/tmp/r/build")
+                .env("SRCDEST", "/tmp/r/sources")
+                .env("GUARDIAN_REPORT", &report)
+                .status()
+                .unwrap();
+            assert!(status.success() || !report.exists(), "{name}");
+            listing_report(&report)
+        };
+        let kept: &[u8] = b"/tmp/r/build\0/tmp/r/sources\0";
+        for (name, recipe) in [
+            ("plain", "pkgname=demo\n"),
+            ("return", "pkgname=demo\nreturn 0\n"),
+            ("reads", "x=\"$SRCDEST/a\"\n"),
+        ] {
+            assert_eq!(report_of(name, recipe).as_deref(), Some(kept), "{name}");
+        }
+        for (name, recipe) in [
+            ("then", "if true; then SRCDEST=/x; fi\n"),
+            ("braces", ": {\nBUILDDIR=/x\n"),
+            ("function", "f() { SRCDEST=/x; }; f\n"),
+            ("printf", "printf -v BUILDDIR %s /x\n"),
+        ] {
+            let report = report_of(name, recipe);
+            assert!(
+                report.is_some() && report.as_deref() != Some(kept),
+                "{name}"
+            );
+        }
+        assert_eq!(report_of("exit", "exit 0\n"), None);
+
+        // Only a plain file of a sane size is a report.
+        let dir = TempDir::new("listing-report");
+        std::os::unix::fs::symlink("/etc/hostname", dir.path().join("link")).unwrap();
+        assert_eq!(listing_report(&dir.path().join("link")), None);
+        fs::write(dir.path().join("huge"), vec![0; 32 * 1024]).unwrap();
+        assert_eq!(listing_report(&dir.path().join("huge")), None);
+        assert_eq!(listing_report(&dir.path().join("missing")), None);
+    }
+
+    #[test]
+    fn the_configured_directories_or_the_recipes_own_are_used() {
+        assert_eq!(Configured::parse(b"\0\0"), Some(Configured::default()));
+        assert_eq!(Configured::parse(b"/b"), None);
+        let configured = Configured::parse(b"/b\0/dl\0").unwrap();
+        let dirs = configured.dirs(Path::new("/start"), "demo");
+        assert_eq!(dirs.builddir, PathBuf::from("/b"));
+        assert_eq!(dirs.srcdest, PathBuf::from("/dl"));
+        assert_eq!(dirs.srcdir(), PathBuf::from("/b/demo/src"));
+
+        let own = Configured::default().dirs(Path::new("/"), "demo");
+        assert_eq!(own.srcdest, PathBuf::from("/"));
+        assert_eq!(own.srcdir(), PathBuf::from("/src"));
+    }
+
+    #[test]
+    fn makepkg_is_not_let_into_what_the_jail_hides() {
+        let home = TempDir::new("jail-home");
+        let build = home.path().join(".cache/yay/demo");
+        fs::create_dir_all(&build).unwrap();
+        assert!(is_jailable(&build, home.path()));
+        assert!(!is_jailable(home.path(), home.path()));
+        assert!(!is_jailable(home.path().parent().unwrap(), home.path()));
+        assert!(!is_jailable(Path::new("/"), home.path()));
+        assert!(!is_jailable(Path::new("/usr/share"), home.path()));
+        assert!(!is_jailable(Path::new("/etc"), home.path()));
+        assert!(!is_jailable(&std::env::temp_dir(), home.path()));
+        assert!(!is_jailable(&home.path().join("missing"), home.path()));
+        // A link to the home is the home.
+        let link = build.join("link");
+        std::os::unix::fs::symlink(home.path(), &link).unwrap();
+        assert!(!is_jailable(&link, home.path()));
+    }
+
+    #[test]
+    fn the_jail_gets_the_public_keyring_only() {
+        let home = TempDir::new("keyring-home");
+        let work = TempDir::new("keyring-work");
+        assert_eq!(public_keyring(home.path(), work.path()), None);
+
+        let gnupg = home.path().join(".gnupg");
+        fs::create_dir_all(gnupg.join("private-keys-v1.d")).unwrap();
+        fs::create_dir_all(gnupg.join("public-keys.d")).unwrap();
+        for name in [
+            "pubring.kbx",
+            "trustdb.gpg",
+            "public-keys.d/pubring.db",
+            "private-keys-v1.d/secret.key",
+            "secring.gpg",
+        ] {
+            fs::write(gnupg.join(name), name).unwrap();
+        }
+        let copy = public_keyring(home.path(), work.path()).unwrap();
+        let mut copied: Vec<String> = Vec::new();
+        let mut pending = vec![copy.clone()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(&directory).unwrap().flatten() {
+                if entry.path().is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    let path = entry.path();
+                    copied.push(path.strip_prefix(&copy).unwrap().display().to_string());
+                }
+            }
+        }
+        copied.sort();
+        assert_eq!(
+            copied,
+            ["public-keys.d/pubring.db", "pubring.kbx", "trustdb.gpg"]
+        );
     }
 
     #[test]
@@ -1054,8 +1651,115 @@ mod tests {
                 source("git+https://github.com/someone/proj.git#commit=abc"),
                 source("https://example.org/files/patch.diff?raw=1"),
                 source("local.patch"),
+                source("PKGBUILD::https://example.org/PKGBUILD"),
             ]),
-            ["demo-1.0.tar.gz", "patch.diff", "proj"]
+            ["demo-1.0.tar.gz", "patch.diff?raw=1", "proj"]
+        );
+    }
+
+    #[test]
+    fn a_source_must_be_kept_under_a_file_name() {
+        let source = |entry: &str| aur::Source {
+            entry: entry.into(),
+            checksums: Vec::new(),
+        };
+        let plain = [
+            source("demo-1.0.tar.gz::https://example.org/v1.0.tar.gz"),
+            source("git+https://github.com/someone/proj.git"),
+            source(".gitignore"),
+        ];
+        assert_eq!(misnamed_source(&plain), None);
+        for entry in [
+            ".git/commondir::https://example.org/x",
+            "../PKGBUILD::https://example.org/x",
+            "a/b::https://example.org/x",
+            "..::https://example.org/x",
+            ".git::git+https://example.org/x",
+            "::https://example.org/x",
+            "-o::https://example.org/x",
+            "https://example.org/dir/",
+        ] {
+            assert_eq!(misnamed_source(&[source(entry)]), Some(entry), "{entry}");
+        }
+    }
+
+    #[test]
+    fn only_a_mirror_as_makepkg_makes_one_is_fetched_into() {
+        let dir = TempDir::new("mirror");
+        let url = "https://example.org/proj.git";
+        let mirror = dir.path().join("proj");
+        let made = Command::new("/usr/bin/git")
+            .args(["init", "--quiet", "--bare"])
+            .arg(&mirror)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let config = mirror.join("config");
+        let plain = format!(
+            "{}[remote \"origin\"]\n\turl = {url}\n\ttagOpt = --no-tags\n\tfetch = +refs/*:refs/*\n\tmirror = true\n",
+            fs::read_to_string(&config).unwrap()
+        );
+        fs::write(&config, &plain).unwrap();
+        assert!(is_plain_mirror(&mirror, url));
+        assert!(is_plain_mirror(&mirror, "https://example.org/proj"));
+        assert!(!is_plain_mirror(&mirror, "https://example.org/other.git"));
+        // git fetches from the first of two URLs.
+        let twice = plain.replace("\turl = ", "\turl = https://evil.example/x.git\n\turl = ");
+        fs::write(&config, twice).unwrap();
+        assert!(!is_plain_mirror(&mirror, url));
+        fs::write(&config, &plain).unwrap();
+
+        for extra in [
+            "\tuploadpack = touch x; git-upload-pack\n",
+            "[core]\n\tsshCommand = touch x\n",
+            "[core]\n\tgitProxy = touch x\n",
+            "[credential]\n\thelper = !touch x\n",
+            "[include]\n\tpath = ../evil\n",
+            "[url \"https://evil.example/\"]\n\tinsteadOf = https://example.org/\n",
+            "\tmirror = true \\\n",
+        ] {
+            fs::write(&config, format!("{plain}{extra}")).unwrap();
+            assert!(!is_plain_mirror(&mirror, url), "{extra:?}");
+        }
+        fs::write(&config, &plain).unwrap();
+        fs::write(mirror.join("hooks/reference-transaction"), "#!/bin/sh\n").unwrap();
+        assert!(!is_plain_mirror(&mirror, url));
+        fs::remove_file(mirror.join("hooks/reference-transaction")).unwrap();
+        fs::write(mirror.join("commondir"), "..\n").unwrap();
+        assert!(!is_plain_mirror(&mirror, url));
+        fs::remove_file(mirror.join("commondir")).unwrap();
+        assert!(is_plain_mirror(&mirror, url));
+
+        // In the download directory, any other checkout is foreign.
+        let source = |entry: &str| aur::Source {
+            entry: entry.into(),
+            checksums: Vec::new(),
+        };
+        let dirs = Configured::default().dirs(dir.path(), "demo");
+        let git = source("git+https://example.org/proj.git#commit=abc");
+        let other = source("git+https://example.org/new.git");
+        let hg = source("proj::hg+https://example.org/proj");
+        assert_eq!(foreign_checkout(&[git.clone(), other], &dirs), None);
+        assert_eq!(
+            foreign_checkout(std::slice::from_ref(&hg), &dirs),
+            Some(hg.entry.as_str())
+        );
+        // makepkg looks in the recipe's directory before the downloads.
+        let elsewhere = TempDir::new("mirror-downloads");
+        let configured = Configured {
+            srcdest: Some(elsewhere.path().to_path_buf()),
+            ..Configured::default()
+        };
+        let apart = configured.dirs(dir.path(), "demo");
+        assert_eq!(foreign_checkout(std::slice::from_ref(&git), &apart), None);
+        assert_eq!(
+            foreign_checkout(std::slice::from_ref(&hg), &apart),
+            Some(hg.entry.as_str())
+        );
+        fs::write(&config, format!("{plain}\tuploadpack = x\n")).unwrap();
+        assert_eq!(
+            foreign_checkout(std::slice::from_ref(&git), &dirs),
+            Some(git.entry.as_str())
         );
     }
 }
