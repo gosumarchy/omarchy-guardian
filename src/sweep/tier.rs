@@ -127,10 +127,11 @@ pub fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex) -> Tie
     }
     let name = path.rsplit('/').next().unwrap_or(path);
     match observed {
-        Observed::File { size: 0, .. } => Tier::Inert,
-        // A mask disables what it names; disabling a defence, or a pacman
-        // hook a package ships, is worth seeing.
-        Observed::Link {
+        // A mask (an empty file, a link to /dev/null) disables what it
+        // names; disabling a defence, or a pacman hook a package ships, is
+        // worth seeing.
+        Observed::File { size: 0, .. }
+        | Observed::Link {
             target: "/dev/null",
             ..
         } if !masks_a_defence(path, name, index) => Tier::Inert,
@@ -465,6 +466,25 @@ mod tests {
             ),
             Tier::Inert
         );
+        // An empty unit file masks like a link to /dev/null does: masking a
+        // defence is shown, in a home directory too.
+        for path in [
+            "home/u/.config/systemd/user/omarchy-guardian-sweep.timer",
+            "etc/systemd/system/ufw.service",
+            "etc/systemd/system/omarchy-guardian-sweep-collect.timer",
+        ] {
+            let observed = Observed::File {
+                sha256: &empty,
+                mode: 0o644,
+                size: 0,
+            };
+            assert_eq!(classify(path, observed, &index), Tier::Unknown, "{path}");
+            assert_eq!(
+                classify(path, link("/dev/null", None), &index),
+                Tier::Unknown,
+                "{path}"
+            );
+        }
     }
 
     #[test]

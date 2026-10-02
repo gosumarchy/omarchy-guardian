@@ -136,7 +136,10 @@ clean system shows nothing here:
 
 - a running program with no file on disk (deleted, or only in memory), or
   running from a temporary or cache directory; a program an update replaced
-  while it runs is fine;
+  while it runs is fine, unless it runs in a user namespace of its own,
+  where a deleted program can carry any name: what that one preloads, and
+  whether it reads the keyboard or listens on the network, is checked as
+  for a program no package installed;
 - a library no repository package installed, preloaded into a running
   program (`LD_PRELOAD`);
 - a program no repository package installed that listens on the network
@@ -150,6 +153,11 @@ clean system shows nothing here:
 As a user only your own processes can be looked at; the root checks see
 all of them.
 
+A file or directory whose name is not valid UTF-8 cannot be checked, and
+shells, udev and pacman read such names all the same: the sweep says so and
+is **incomplete** (exit 2), as it is when there are more files than it
+looks through for setuid programs.
+
 Each item is judged against pacman's own records (no network, no hash
 lookups). Those records live in `/var/lib/pacman/local`, which root can
 rewrite, so the sweep assumes them intact: an attacker who already has root
@@ -161,7 +169,7 @@ unit's own name, never for units that open a root shell:
 | Tier | Meaning | Shown |
 |---|---|---|
 | package | Exactly what a repository package installed | with `--all` |
-| inert | A masked unit (link to `/dev/null`) or an empty file | with `--all` |
+| inert | A masked unit (link to `/dev/null`, or an empty file) or another empty file; not when it masks a defence, Guardian's own sweep included | with `--all` |
 | copy | Identical to a file a repository package ships (Omarchy's `etc-overrides`) | with `--all` |
 | user-built | From a package of no configured repository (AUR, `pacman -U`) | yes |
 | edited | A package's configuration file, changed as configuration is meant to be | yes |
@@ -184,8 +192,16 @@ nothing; it hands the items no package vouches for back to your own sweep,
 which judges them with your settings. Only files of the auto-run locations
 themselves (a sudoers drop-in, root's crontab) come back with their
 content; anything root reached by following what they run or what a process
-preloads comes back as a hash only unless everyone may read it, so no user
-can point it at `/etc/shadow` or a key. Old password hashes
+preloads comes back as a hash only. Where a user decides what is named (a
+crontab or other file that is not root's alone, or any process, with the
+arguments and `LD_PRELOAD` it was given), root looks only at what everyone
+may read anyway: anything else is not followed, or is listed as not looked
+at, with no hash, no kind and no word on whether it exists, so no user can
+point the collector at `/etc/shadow` or a key and learn something about it.
+That holds through chains of links. And what the collector reads, in its
+own search for set-id files too, it reaches by entering each directory as
+it opened it, so one swapped for a link while it reads is not followed.
+Old password hashes
 (`/etc/security/opasswd`) are never read. Root's view only fills in what
 your own sweep could not read.
 

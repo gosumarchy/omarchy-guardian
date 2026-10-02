@@ -15,10 +15,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-use super::collect::{self, Body, Item, Scope};
+use super::collect::{self, Body, Item, Origin, Scope};
+use super::read::{self, View};
 use super::tier::Tier;
 use crate::autorun::Category;
 use crate::rules::RuleId;
@@ -26,7 +28,9 @@ use crate::tools::{self, Limits};
 
 const GETCAP: &str = "/usr/bin/getcap";
 /// Where setuid and capability files are looked for.
-const PRIVILEGED_ROOTS: &[&str] = &["usr", "opt", "etc", "home", "var", "srv", "root"];
+/// The home directories last: they hold the most files, and the walk stops
+/// at a limit.
+const PRIVILEGED_ROOTS: &[&str] = &["usr", "opt", "etc", "var", "srv", "root", "home"];
 /// Under those, what holds other systems' files (containers, snapshots).
 const PRIVILEGED_SKIPPED: &[&str] = &[
     "var/lib/docker",
@@ -64,6 +68,9 @@ const TEMPORARY: &[&str] = &["tmp/", "var/tmp/", "dev/shm/", "run/user/"];
 pub struct Live {
     pub items: Vec<Item>,
     pub notes: Vec<String>,
+    /// What was not looked at, each as a sentence (see
+    /// `Collection::truncated`).
+    pub unchecked: Vec<String>,
 }
 
 /// A running process, as far as it can be read.
@@ -77,6 +84,11 @@ struct Process {
     /// Where its open files lead.
     fds: Vec<String>,
     environment: Option<Vec<u8>>,
+    /// It runs in a user namespace of its own, where it can mount what it
+    /// likes over any path: the name of its program vouches for nothing.
+    own_namespace: bool,
+    /// Root's own process: nobody else chose what it is called.
+    of_root: bool,
 }
 
 /// Runs every live check against `scope` (its root holds `proc`).
@@ -97,6 +109,7 @@ pub fn check(scope: &Scope<'_>) -> Live {
     Live {
         items: found.items.into_values().collect(),
         notes: found.notes,
+        unchecked: found.unchecked,
     }
 }
 
@@ -104,6 +117,7 @@ pub fn check(scope: &Scope<'_>) -> Live {
 struct Found {
     items: BTreeMap<String, Item>,
     notes: Vec<String>,
+    unchecked: Vec<String>,
 }
 
 impl Found {
@@ -181,6 +195,8 @@ fn processes(proc: &Path) -> (Vec<Process>, usize) {
     };
     let mut processes = Vec::new();
     let mut hidden = 0;
+    let namespace = |directory: &Path| fs::read_link(directory.join("ns/user")).ok();
+    let ours = namespace(&proc.join("self"));
     for entry in listing.filter_map(Result::ok) {
         let Some(pid) = entry.file_name().to_str().map(str::to_string) else {
             continue;
@@ -189,6 +205,9 @@ fn processes(proc: &Path) -> (Vec<Process>, usize) {
             continue;
         }
         let directory = entry.path();
+        // Asked before and after the rest is read: a process number may
+        // pass to another process in between.
+        let root_before = of_root(&directory);
         let exe = match fs::read_link(directory.join("exe")) {
             Ok(exe) => exe.to_string_lossy().into_owned(),
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -219,6 +238,10 @@ fn processes(proc: &Path) -> (Vec<Process>, usize) {
                     .collect()
             })
             .unwrap_or_default();
+        // Unreadable for a process (an old kernel, a test tree) counts as
+        // ours.
+        let own_namespace =
+            namespace(&directory).is_some_and(|theirs| ours.as_ref() != Some(&theirs));
         processes.push(Process {
             pid,
             exe,
@@ -226,10 +249,28 @@ fn processes(proc: &Path) -> (Vec<Process>, usize) {
             arguments,
             fds,
             environment,
+            own_namespace,
+            of_root: root_before && of_root(&directory),
         });
     }
     processes.sort_by(|left, right| left.pid.cmp(&right.pid));
     (processes, hidden)
+}
+
+/// Whether the process at `directory` is root's in every respect (the
+/// real, effective, saved and filesystem user of its `status`). Who owns
+/// its `/proc` directory does not say: that is root for any process that
+/// made itself undumpable, where `/proc` hides other users' processes.
+fn of_root(directory: &Path) -> bool {
+    fs::read_to_string(directory.join("status")).is_ok_and(|status| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:"))
+            .is_some_and(|ids| {
+                let mut ids = ids.split_whitespace().peekable();
+                ids.peek().is_some() && ids.all(|id| id == "0")
+            })
+    })
 }
 
 /// Programs that run the script they are given: who they are says nothing
@@ -253,7 +294,7 @@ fn is_interpreter(path: &str) -> bool {
 /// the file at its path is the very file it runs (a bind mount or rename
 /// cannot borrow a packaged name) and it is not an interpreter.
 fn trusted_program(scope: &Scope<'_>, process: &Process, exe: &str) -> bool {
-    if !packaged(scope, exe) || is_interpreter(exe) {
+    if !packaged(scope, exe) || is_interpreter(exe) || replaced_in_own_namespace(process) {
         return false;
     }
     if scope.root != Path::new("/") {
@@ -263,6 +304,15 @@ fn trusted_program(scope: &Scope<'_>, process: &Process, exe: &str) -> bool {
         .ok()
         .map(|metadata| (metadata.dev(), metadata.ino()));
     on_disk.is_some() && on_disk == process.exe_id
+}
+
+/// Whether `process` runs a deleted program in a user namespace of its
+/// own. An update leaves the old program running under its name, which is
+/// fine; so does binding a directory of one's own over `/usr/bin` in such a
+/// namespace, running a program from it and deleting it, and the name is
+/// then a packaged one the program never came from.
+fn replaced_in_own_namespace(process: &Process) -> bool {
+    process.own_namespace && process.exe.ends_with(" (deleted)")
 }
 
 /// What to name for an untrusted process: the script an interpreter runs,
@@ -286,7 +336,7 @@ fn subject(scope: &Scope<'_>, process: &Process, exe: &str) -> (String, String) 
             .find(|argument| !argument.starts_with('-'))
             .and_then(|script| script.strip_prefix('/'))
             .and_then(normalize)
-            .filter(|script| scope.root.join(script).is_file())
+            .filter(|script| collect::is_file_there(scope, script, None))
     {
         return (script, started);
     }
@@ -311,7 +361,31 @@ fn program_checks(scope: &Scope<'_>, process: &Process, found: &mut Found) {
         return;
     }
     if let Some(path) = exe.strip_suffix(" (deleted)") {
-        if scope.root.join(path).is_file() {
+        // In a mount namespace of its own a process gives its program any
+        // name, a root-only path included: whether a file is there is asked
+        // as anyone could ask it, unless the process is root's.
+        let there = if process.of_root {
+            scope.root.join(path).is_file()
+        } else {
+            collect::is_file_there(scope, path, None)
+        };
+        if there && replaced_in_own_namespace(process) {
+            // Nothing says this is the program of that name: it is checked
+            // like one no package vouches for.
+            found.add(
+                scope,
+                Category::Process,
+                path,
+                format!(
+                    "process {pid} runs a deleted program under the name /{path}, in a user namespace of its own"
+                ),
+                None,
+            );
+            preload_checks(scope, process, path, found);
+            device_checks(scope, process, path, found);
+            return;
+        }
+        if there {
             // Replaced while it runs: an update of a package (fine), or of
             // anything else (worth a look, not an alarm).
             if !packaged(scope, path) {
@@ -340,6 +414,12 @@ fn program_checks(scope: &Scope<'_>, process: &Process, found: &mut Found) {
     if trusted_program(scope, process, exe) {
         return;
     }
+    device_checks(scope, process, exe, found);
+}
+
+/// Whether an untrusted process reads the keyboard or uses a camera.
+fn device_checks(scope: &Scope<'_>, process: &Process, exe: &str, found: &mut Found) {
+    let pid = &process.pid;
     let (path, started) = subject(scope, process, exe);
     if process.fds.iter().any(|fd| reads_keys(scope, fd)) {
         found.add(
@@ -525,19 +605,23 @@ fn listeners(scope: &Scope<'_>, processes: &[Process], found: &mut Found) {
             };
             let exe = process.exe.trim_start_matches('/');
             // Programs with no file on disk are reported by the program
-            // checks already.
-            if exe.ends_with(" (deleted)")
+            // checks already, but for one that only borrows a name.
+            let borrowed = replaced_in_own_namespace(process);
+            if (exe.ends_with(" (deleted)") && !borrowed)
                 || exe.starts_with("memfd:")
                 || trusted_program(scope, process, exe)
             {
                 continue;
             }
+            let exe = exe.trim_end_matches(" (deleted)");
             let (path, started) = subject(scope, process, exe);
             let pid = &process.pid;
             // An interpreter's listener is always shown: with no script on
             // disk (`python -c …`), or with a packaged "script" it was handed
             // (`ncat -e /usr/bin/bash`), it would otherwise pass as trusted.
-            let alert = is_interpreter(exe).then_some(RuleId::NetworkListener);
+            // So is one under a borrowed name, whose item is the packaged
+            // file of that name.
+            let alert = (is_interpreter(exe) || borrowed).then_some(RuleId::NetworkListener);
             found.add(
                 scope,
                 Category::Listener,
@@ -699,24 +783,45 @@ fn taint_flags(taint: u64) -> String {
 /// vouches for.
 fn privileged_files(scope: &Scope<'_>, found: &mut Found) {
     let mut looked_at = 0;
+    let root = scope.origin == Origin::Root;
     'walk: for start in PRIVILEGED_ROOTS {
         let mut pending = vec![(*start).to_string()];
         while let Some(directory) = pending.pop() {
-            let Ok(listing) = fs::read_dir(scope.root.join(&directory)) else {
+            // Listed through the directory as opened, link by no link: a
+            // directory swapped for a link elsewhere is not walked into.
+            let opened =
+                match read::seen(scope.root, &directory, View::Pinned).map(|seen| seen.what) {
+                    Some(read::Public::Directory(opened)) => opened,
+                    Some(read::Public::Link(_)) if directory == *start => {
+                        found.unchecked.push(format!(
+                            "/{directory} is a link: setuid programs were not looked for there"
+                        ));
+                        continue;
+                    }
+                    _ => continue,
+                };
+            let Ok(listing) = fs::read_dir(format!("/proc/self/fd/{}", opened.as_raw_fd())) else {
                 continue;
             };
             for entry in listing.filter_map(Result::ok) {
                 looked_at += 1;
                 if looked_at > MAX_WALK {
-                    found.notes.push(
-                        "too many files: setuid programs were not looked for everywhere".into(),
-                    );
+                    found.unchecked.push(format!(
+                        "more than {MAX_WALK} files: setuid programs were not looked for everywhere"
+                    ));
                     break 'walk;
                 }
-                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                let Ok(metadata) = entry.metadata() else {
                     continue;
                 };
-                let Ok(metadata) = entry.metadata() else {
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                    // A directory may hold set-id files; a file may be one.
+                    if metadata.is_dir() || (metadata.is_file() && metadata.mode() & 0o6000 != 0) {
+                        found.unchecked.push(collect::not_utf8(&format!(
+                            "{directory}/{}",
+                            entry.file_name().to_string_lossy()
+                        )));
+                    }
                     continue;
                 };
                 let path = format!("{directory}/{name}");
@@ -725,31 +830,82 @@ fn privileged_files(scope: &Scope<'_>, found: &mut Found) {
                         pending.push(path);
                     }
                 } else if metadata.is_file() && metadata.mode() & 0o6000 != 0 {
-                    privileged(scope, found, &path, "setuid or setgid", None);
+                    let looked = collect::look(scope, Category::Setuid, &path, None);
+                    // Root reports the file it opened, if that is the
+                    // set-id file the listing showed.
+                    let swapped = root
+                        && !matches!(&looked, read::Found::File { mode, .. } if mode & 0o6000 != 0)
+                        && !matches!(&looked, read::Found::Unreadable(reason) if reason == read::TOO_LARGE);
+                    if !swapped {
+                        privileged(scope, found, &path, &looked, "setuid or setgid", None);
+                    }
                 }
             }
         }
     }
     match capability_files(scope) {
         Ok(files) => {
-            // A file name with a newline could fake a line of getcap's
-            // output; only real files count.
-            for (path, capabilities) in files
-                .into_iter()
-                .filter(|(path, _)| scope.root.join(path).is_file())
-            {
+            // A name that is not UTF-8 comes out of getcap unreadable.
+            found.unchecked.extend(
+                files
+                    .iter()
+                    .filter(|(path, _)| path.contains('\u{fffd}'))
+                    .map(|(path, _)| collect::not_utf8(path)),
+            );
+            for (path, capabilities) in files {
+                // A name with a newline in it forges a line of getcap's
+                // output, naming any path; only real files count, and the
+                // file itself, not what a link of that name leads to.
+                let Some(looked) = capable(scope, &path, &mut found.unchecked) else {
+                    continue;
+                };
                 privileged(
                     scope,
                     found,
                     &path,
+                    &looked,
                     &format!("capabilities {capabilities}"),
                     Some(&capabilities),
                 );
             }
         }
         Err(reason) => found
-            .notes
-            .push(format!("file capabilities not checked ({reason})")),
+            .unchecked
+            .push(format!("file capabilities were not checked ({reason})")),
+    }
+}
+
+/// What is at `path`, which getcap named, if it is a regular file. Root
+/// looks at a path anyone can read as anyone would, and at one only root
+/// can read once getcap, asked about it by itself, names it again: a forged
+/// line then says nothing about a file its author cannot read.
+fn capable(scope: &Scope<'_>, path: &str, unchecked: &mut Vec<String>) -> Option<read::Found> {
+    let looked = if scope.origin == Origin::Root {
+        read::look_as(scope.root, path, View::Everyone).or_else(|| {
+            let Some(confirmed) = has_capabilities(path) else {
+                // Which file is not said: the line may be forged.
+                unchecked.push("a file getcap named could not be asked about again".into());
+                return None;
+            };
+            confirmed
+                .then(|| read::look_as(scope.root, path, View::Pinned))
+                .flatten()
+        })?
+    } else {
+        read::look(scope.root, path)
+    };
+    match looked {
+        read::Found::Link(_) | read::Found::Other => None,
+        // Root's pinned look says this only of a regular file; the user's
+        // own sweep asks again.
+        read::Found::Unreadable(_)
+            if scope.origin != Origin::Root
+                && !fs::symlink_metadata(scope.root.join(path))
+                    .is_ok_and(|metadata| metadata.is_file()) =>
+        {
+            None
+        }
+        looked => Some(looked),
     }
 }
 
@@ -757,10 +913,11 @@ fn privileged(
     scope: &Scope<'_>,
     found: &mut Found,
     path: &str,
+    looked: &read::Found,
     what: &str,
     capabilities: Option<&str>,
 ) {
-    let item = collect::item(scope, Category::Setuid, path.to_string(), None);
+    let item = collect::item_of(scope, Category::Setuid, path.to_string(), None, looked);
     // A package's set-id file only root can read cannot be hashed here; the
     // root checks hash it. Its owner and mode are what can be checked now.
     if matches!(item.body, Body::Unreadable(_)) && packaged(scope, path) {
@@ -795,6 +952,29 @@ fn privileged(
             Some(RuleId::UnknownPrivilegedFile),
         );
     }
+}
+
+/// Whether getcap, asked about `path` alone, reports capabilities on it.
+fn has_capabilities(path: &str) -> Option<bool> {
+    let limits = Limits {
+        timeout_secs: 30,
+        max_output: 64 * 1024,
+    };
+    let arguments = [OsString::from(format!("/{path}"))];
+    tools::run(
+        Path::new(GETCAP),
+        &arguments,
+        None,
+        &[("LC_ALL", "C")],
+        limits,
+    )
+    .ok()
+    .filter(|captured| captured.status.code() != Some(124))
+    .map(|captured| {
+        parse_getcap(&String::from_utf8_lossy(&captured.stdout))
+            .iter()
+            .any(|(reported, _)| reported == path)
+    })
 }
 
 /// Files with capabilities, from `getcap -r` (on the real system only).
@@ -1037,6 +1217,133 @@ mod tests {
     }
 
     #[test]
+    fn a_process_is_roots_by_its_ids_not_by_who_owns_its_directory() {
+        let dir = TempDir::new("sweep-of-root");
+        let status = |ids: &str| {
+            fs::write(
+                dir.path().join("status"),
+                format!("Name:\tx\nUid:\t{ids}\nGid:\t0\t0\t0\t0\n"),
+            )
+            .unwrap();
+            super::of_root(dir.path())
+        };
+        assert!(status("0\t0\t0\t0"));
+        assert!(!status("1000\t0\t0\t0"));
+        assert!(!status("1000\t1000\t1000\t1000"));
+        assert!(!status(""));
+        fs::remove_file(dir.path().join("status")).unwrap();
+        assert!(!super::of_root(dir.path()));
+    }
+
+    #[test]
+    fn a_deleted_program_in_its_own_namespace_borrows_a_name() {
+        let (dir, index) = fixture();
+        let root = dir.path();
+        let namespace = |pid: &str, id: &str| {
+            fs::create_dir_all(root.join("proc").join(pid).join("ns")).unwrap();
+            symlink(
+                format!("user:[{id}]"),
+                root.join("proc").join(pid).join("ns/user"),
+            )
+            .unwrap();
+        };
+        namespace("self", "1");
+        // An updated program still running, and one that only took the
+        // name: both listen and read the keyboard.
+        for (pid, id, socket) in [("20", "1", "444"), ("21", "2", "555")] {
+            process(
+                root,
+                pid,
+                "/usr/bin/updated (deleted)",
+                &[
+                    ("3", "/dev/input/event0"),
+                    ("4", &format!("socket:[{socket}]")),
+                ],
+                "LD_PRELOAD=/home/u/.evil.so;",
+            );
+            namespace(pid, id);
+        }
+        write(
+            root,
+            "proc/net/tcp",
+            "  sl  local_address rem_address   st\n   0: 00000000:1F90 00000000:0000 0A 0:0 0:0 0 1000 0 444 1\n   1: 00000000:1F91 00000000:0000 0A 0:0 0:0 0 1000 0 555 1\n",
+        );
+        let live = check(&Scope {
+            root,
+            home: Some("home/u"),
+            index: &index,
+            origin: Origin::System,
+        });
+        let about = |pid: &str| -> Vec<String> {
+            live.items
+                .iter()
+                .flat_map(|item| item.notes.iter())
+                .filter(|note| {
+                    note.contains(&format!("process {pid} "))
+                        || note.contains(&format!("(process {pid})"))
+                })
+                .cloned()
+                .collect()
+        };
+        assert!(about("20").is_empty(), "{:?}", about("20"));
+        let borrowed = about("21").join("\n");
+        assert!(
+            borrowed.contains("runs a deleted program under the name /usr/bin/updated"),
+            "{borrowed}"
+        );
+        assert!(borrowed.contains("reads the keyboard device"), "{borrowed}");
+        assert!(borrowed.contains("listens on TCP port 8081"), "{borrowed}");
+        assert!(
+            borrowed.contains("preloaded into /usr/bin/updated"),
+            "{borrowed}"
+        );
+        // The packaged file of that name is what the item shows; the
+        // listener and the keyboard are alerts on it, so it is not hidden.
+        let named = live
+            .items
+            .iter()
+            .find(|item| item.path == "usr/bin/updated")
+            .unwrap();
+        let alerts: Vec<RuleId> = named.alerts.iter().map(|(rule, _)| *rule).collect();
+        assert!(alerts.contains(&RuleId::NetworkListener), "{alerts:?}");
+        assert!(alerts.contains(&RuleId::KeyboardReader), "{alerts:?}");
+        assert!(!named.is_trusted());
+    }
+
+    #[test]
+    fn a_setuid_file_under_a_name_that_is_not_utf8_is_said() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = TempDir::new("sweep-live-unnamed");
+        let root = dir.path();
+        fs::create_dir_all(root.join("usr/local")).unwrap();
+        let shell = root.join("usr/local").join(OsStr::from_bytes(b"sh\xff"));
+        fs::write(&shell, "shell").unwrap();
+        fs::set_permissions(&shell, fs::Permissions::from_mode(0o4755)).unwrap();
+        fs::write(
+            root.join("usr/local").join(OsStr::from_bytes(b"plain\xff")),
+            "x",
+        )
+        .unwrap();
+        fs::create_dir(root.join("usr").join(OsStr::from_bytes(b"dir\xff"))).unwrap();
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let mut live = check(&Scope {
+            root,
+            home: None,
+            index: &index,
+            origin: Origin::System,
+        });
+        live.unchecked.sort();
+        assert_eq!(
+            live.unchecked,
+            [
+                "/usr/dir\u{fffd}: a name that is not UTF-8 was not checked",
+                "/usr/local/sh\u{fffd}: a name that is not UTF-8 was not checked",
+            ]
+        );
+    }
+
+    #[test]
     fn only_what_does_not_add_up_is_listed() {
         let (dir, index) = fixture();
         let root = dir.path();
@@ -1167,6 +1474,8 @@ mod tests {
                 .collect(),
             fds: Vec::new(),
             environment: None,
+            own_namespace: false,
+            of_root: false,
         };
         let ncat = process(
             "/usr/bin/ncat",
