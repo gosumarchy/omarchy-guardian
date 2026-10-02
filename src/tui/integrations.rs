@@ -239,6 +239,34 @@ pub struct Paths {
     /// group allowed to read the daily results.
     pub sweep_consent: Option<RootConsent>,
     pub sweep_group: Option<String>,
+    /// The name of the user's login shell (`bash`, `zsh`), if known.
+    pub login_shell: Option<String>,
+}
+
+/// The login shell's name: of the user's `/etc/passwd` entry, else of
+/// `SHELL`.
+fn login_shell() -> Option<String> {
+    let uid = crate::notify::current_uid();
+    let shell = fs::read_to_string("/etc/passwd")
+        .ok()
+        .and_then(|passwd| uid.and_then(|uid| shell_of(&passwd, uid)))
+        .or_else(|| env::var("SHELL").ok())?;
+    shell
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+/// The shell of `uid`'s entry in `passwd`, if it has one and names one.
+fn shell_of(passwd: &str, uid: u32) -> Option<String> {
+    let uid = uid.to_string();
+    passwd
+        .lines()
+        .map(|line| line.split(':').collect::<Vec<_>>())
+        .find(|fields| fields.get(2) == Some(&uid.as_str()))
+        .and_then(|fields| fields.get(6).map(|shell| (*shell).to_string()))
+        .filter(|shell| !shell.is_empty())
 }
 
 impl Paths {
@@ -282,6 +310,7 @@ impl Paths {
                 .join(SWEEP_ROOT_TIMER),
             sweep_consent,
             sweep_group,
+            login_shell: login_shell(),
         })
     }
 
@@ -337,6 +366,20 @@ impl Paths {
             Integration::WaybarModule => self.waybar_state(),
             Integration::SystemSweep => self.sweep_state(),
         }
+    }
+
+    /// What the theme & plugin gate does not cover while it is on: its
+    /// interceptor is a Bash file, so what is typed in another login shell
+    /// goes straight to Omarchy. Nothing here can turn that on, so it is
+    /// said beside the gate rather than counted as a fault.
+    pub fn theme_caveat(&self) -> Option<String> {
+        let shell = self
+            .login_shell
+            .as_deref()
+            .filter(|shell| !matches!(*shell, "bash" | "sh"))?;
+        Some(format!(
+            "Bash and the Omarchy menu only: `omarchy theme` and `omarchy plugin` typed in {shell} skip Guardian"
+        ))
     }
 
     fn sweep_state(&self) -> State {
@@ -1058,6 +1101,7 @@ mod tests {
             sweep_root_timer_link: root.join("system-wants/omarchy-guardian-sweep-collect.timer"),
             sweep_consent: None,
             sweep_group: Some("u".into()),
+            login_shell: Some("bash".into()),
         }
     }
 
@@ -1281,6 +1325,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(paths.state(Integration::ThemeInterceptor), State::On);
+
+        // In another login shell the Bash interceptor is never read.
+        let mut zsh = self::paths(&dir);
+        zsh.login_shell = Some("zsh".into());
+        assert_eq!(zsh.state(Integration::ThemeInterceptor), State::On);
+        assert!(
+            zsh.theme_caveat()
+                .is_some_and(|caveat| caveat.contains("typed in zsh skip Guardian"))
+        );
+        assert_eq!(paths.theme_caveat(), None);
+        let passwd = "root:x:0:0::/root:/usr/bin/bash\nu:x:1000:1000::/home/u:/usr/bin/zsh\nv:x:1001:1001::/home/v:\n";
+        assert_eq!(
+            super::shell_of(passwd, 1000).as_deref(),
+            Some("/usr/bin/zsh")
+        );
+        assert_eq!(super::shell_of(passwd, 1001), None);
+        assert_eq!(super::shell_of(passwd, 1002), None);
 
         // Turning it off removes only Guardian's overrides.
         let plan = paths

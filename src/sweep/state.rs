@@ -17,6 +17,13 @@ use crate::json::Json;
 
 const BASELINE: &str = "baseline.json";
 const ALLOWED: &str = "allowed.json";
+const LAST_RUN: &str = "last-run.json";
+const STARTED: &str = "started";
+/// The most reasons an unfinished sweep keeps.
+const MAX_REASONS: usize = 5;
+/// The longest reason, and the largest record, read back.
+const MAX_REASON_CHARS: usize = 300;
+const MAX_RECORD_BYTES: u64 = 64 * 1024;
 
 /// The sweep's directory in the review store.
 pub fn directory(store_root: &Path) -> Result<PathBuf, String> {
@@ -74,13 +81,17 @@ fn write(path: &Path, remembered: &Remembered) -> Result<(), String> {
             .iter()
             .map(|(label, value)| (label.as_str(), Json::from(value.as_str()))),
     );
+    write_text(path, &json.to_string())
+}
+
+fn write_text(path: &Path, text: &str) -> Result<(), String> {
     let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
     let result = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&temporary)
-        .and_then(|mut file| file.write_all(json.to_string().as_bytes()))
+        .and_then(|mut file| file.write_all(text.as_bytes()))
         .and_then(|()| fs::rename(&temporary, path));
     if result.is_err() {
         drop(fs::remove_file(&temporary));
@@ -122,6 +133,147 @@ pub fn apply_allowed(items: &mut [Item], allowed: &Remembered, label: impl Fn(&I
         {
             item.tier = Tier::Allowed;
         }
+    }
+}
+
+/// How the last sweep ended, as the bar tells it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// It saw everything it looks at (and may have found something).
+    Complete,
+    /// It could not see or review everything.
+    Incomplete,
+    /// It could not run at all.
+    Failed,
+}
+
+impl Outcome {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Incomplete => "incomplete",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// The last sweep: when it ran, how it ended and, unless it was complete,
+/// why. Written by every sweep, so that one which stops running, or keeps
+/// ending unfinished, shows in the bar instead of going quiet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastRun {
+    /// Seconds since the epoch.
+    pub at: u64,
+    pub outcome: Outcome,
+    pub reasons: Vec<String>,
+}
+
+impl LastRun {
+    pub fn new(at: u64, outcome: Outcome, mut reasons: Vec<String>) -> Self {
+        let more = reasons.len().saturating_sub(MAX_REASONS);
+        reasons.truncate(MAX_REASONS);
+        if more > 0 {
+            reasons.push(format!("and {more} more"));
+        }
+        Self {
+            at,
+            outcome,
+            reasons,
+        }
+    }
+}
+
+/// The last sweep's record in the store at `store_root`, without creating
+/// anything (the bar only reads). A sweep from before there was a record
+/// left what it remembered: that counts as a complete run of that time.
+pub fn last_run_in(store_root: &Path) -> Option<LastRun> {
+    let directory = store_root.join("sweep");
+    // Only where there is no record at all: one that cannot be read is
+    // not vouched for by what a sweep run by hand remembered.
+    if fs::symlink_metadata(directory.join(LAST_RUN)).is_ok() {
+        return last_run(&directory);
+    }
+    let at = fs::metadata(directory.join(BASELINE))
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(LastRun::new(at, Outcome::Complete, Vec::new()))
+}
+
+/// Notes that a scheduled sweep started at `now`; `save_last_run` takes the
+/// note away. One that stays is a sweep that was killed, crashed or hangs.
+pub fn mark_started(directory: &Path, now: u64) -> Result<(), String> {
+    write_text(&directory.join(STARTED), &now.to_string())
+}
+
+/// When the scheduled sweep that has not ended yet started, if there is
+/// one, in the store at `store_root`.
+pub fn started_in(store_root: &Path) -> Option<u64> {
+    let path = store_root.join("sweep").join(STARTED);
+    if fs::metadata(&path).ok()?.len() > 32 {
+        return None;
+    }
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// The record is a file anyone running as the user can write: it is read
+/// within bounds, and its text is shown as one plain line.
+pub fn last_run(directory: &Path) -> Option<LastRun> {
+    let path = directory.join(LAST_RUN);
+    if fs::metadata(&path).ok()?.len() > MAX_RECORD_BYTES {
+        return None;
+    }
+    let json = Json::parse(&fs::read_to_string(path).ok()?).ok()?;
+    let outcome = match json.get("outcome")?.as_str()? {
+        "complete" => Outcome::Complete,
+        "incomplete" => Outcome::Incomplete,
+        "failed" => Outcome::Failed,
+        _ => return None,
+    };
+    Some(LastRun {
+        at: json.get("at")?.as_u64()?,
+        outcome,
+        reasons: json
+            .get("reasons")
+            .and_then(Json::as_array)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(Json::as_str)
+            .take(MAX_REASONS + 1)
+            .map(|reason| {
+                crate::text::shown(reason)
+                    .chars()
+                    .filter(|character| !matches!(character, '<' | '>'))
+                    .take(MAX_REASON_CHARS)
+                    .collect()
+            })
+            .collect(),
+    })
+}
+
+pub fn save_last_run(directory: &Path, run: &LastRun) -> Result<(), String> {
+    let json = Json::object([
+        ("at", Json::from(run.at)),
+        ("outcome", Json::from(run.outcome.name())),
+        (
+            "reasons",
+            Json::Array(
+                run.reasons
+                    .iter()
+                    .map(|reason| Json::from(reason.as_str()))
+                    .collect(),
+            ),
+        ),
+    ]);
+    write_text(&directory.join(LAST_RUN), &json.to_string())?;
+    match fs::remove_file(directory.join(STARTED)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(format!("{}: {error}", directory.join(STARTED).display()))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -246,5 +398,60 @@ mod tests {
             fs::read_dir(dir.path()).unwrap().count() == 2,
             "no temporary files left"
         );
+    }
+
+    #[test]
+    fn the_last_run_is_remembered_with_why_it_did_not_finish() {
+        use super::{
+            LastRun, Outcome, last_run, last_run_in, mark_started, save_last_run, started_in,
+        };
+        let dir = TempDir::new("sweep-last-run");
+        let sweep = dir.path().join("sweep");
+        fs::create_dir_all(&sweep).unwrap();
+        assert_eq!(last_run_in(dir.path()), None);
+
+        // What an older sweep left counts as a run.
+        fs::write(sweep.join("baseline.json"), "{}").unwrap();
+        let from_baseline = last_run_in(dir.path()).unwrap();
+        assert_eq!(from_baseline.outcome, Outcome::Complete);
+        assert!(from_baseline.at > 0);
+
+        let reasons: Vec<String> = (0..8).map(|index| format!("reason {index}")).collect();
+        let run = LastRun::new(42, Outcome::Incomplete, reasons);
+        assert_eq!(run.reasons.len(), 6);
+        assert_eq!(run.reasons[5], "and 3 more");
+        // A sweep that started is known as such until it records its end.
+        assert_eq!(started_in(dir.path()), None);
+        mark_started(&sweep, 40).unwrap();
+        assert_eq!(started_in(dir.path()), Some(40));
+        save_last_run(&sweep, &run).unwrap();
+        assert_eq!(started_in(dir.path()), None);
+        assert_eq!(last_run(&sweep), Some(run.clone()));
+        assert_eq!(last_run_in(dir.path()), Some(run));
+
+        // What is read back is bounded and plain.
+        fs::write(
+            sweep.join("last-run.json"),
+            format!(
+                "{{\"at\":1,\"outcome\":\"failed\",\"reasons\":[\"<b>x\\ny\",\"{}\"]}}",
+                "z".repeat(1000)
+            ),
+        )
+        .unwrap();
+        let read = last_run(&sweep).unwrap();
+        assert_eq!(read.reasons[0], "bx\\ny");
+        assert_eq!(read.reasons[1].len(), 300);
+        fs::write(sweep.join("last-run.json"), " ".repeat(70 * 1024)).unwrap();
+        assert_eq!(last_run(&sweep), None);
+
+        // A record that does not parse is no record.
+        fs::write(
+            sweep.join("last-run.json"),
+            "{\"at\":1,\"outcome\":\"fine\"}",
+        )
+        .unwrap();
+        assert_eq!(last_run(&sweep), None);
+        // Nor does what a sweep by hand remembered stand in for it.
+        assert_eq!(last_run_in(dir.path()), None);
     }
 }

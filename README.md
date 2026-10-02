@@ -58,7 +58,10 @@ plugins, and reviews that code **before any of it runs**:
   read.
 - **In your bar.** The Guardian knight sits in the bar: calm when every gate
   is on, red-eyed when something needs attention (a gate is off, a setting is
-  broken, or a block in the last day is unseen), dim when protection is off.
+  broken, the daily sweep stopped running or could not finish, or a block in
+  the last day is unseen), dim when protection is off. A gate that is on
+  with the AI review turned off for what it reviews says "local checks only"
+  beside it.
   In Waybar its tooltip lists the gates, problems and last block; left-click
   opens the settings app and right-click the last report. In Omarchy's shell
   bar it opens a panel with the same details and tiles for the report,
@@ -228,6 +231,21 @@ your own sweep could not read.
 Without root checks (declined, or not answered yet) every sweep is
 incomplete and says what it could not check, and the bar shows the sweep as
 not fully on. `protect --off` turns both timers off and keeps your answer.
+
+A sweep that only spoke up about what it found would go quiet exactly when it
+broke, so every scheduled sweep records when it ran and how it ended (a sweep
+you run by hand does not: it says nothing about whether the timer works). A
+scheduled sweep that could not run or could not finish (the AI review
+unavailable, something it could not check) raises a notification when that
+starts or its kind changes, and the bar keeps saying so until a scheduled
+sweep finishes. The bar also needs attention when the sweep is on and no
+scheduled sweep has run for three days, one started more than two hours ago
+and never ended (its unit stops it after an hour), or root checks are on and
+their daily results are missing, older than 36 hours or not root's alone (an
+hour after boot or login at the earliest, so the timers get their turn first;
+after a long suspend it can show for the half hour the timers take to catch
+up). The record is a file of yours: it catches a sweep that broke, not a
+program running as you that sets out to fake it.
 
 **Working through what it finds.** A sweep flags what it cannot vouch for,
 and some of that will be yours on purpose: a wrapper in `~/.local/bin`, a
@@ -868,7 +886,10 @@ an interactive Bash, and overrides in your Omarchy menu file
 Theme and Update › Extra Themes at Guardian, since the menu runs them in a
 non-interactive shell the interceptor never sees. Turn both on from the TUI's
 Integrations tab (or *Protect everything*); the gate shows as partial while
-only one is in place. Themes are cloned to a hidden staging directory and
+only one is in place. The interceptor is a Bash file: when your login shell
+is another one (zsh, fish), `omarchy theme` and `omarchy plugin` typed there
+reach Omarchy directly, and the bar says so beside the gate. Themes are
+cloned to a hidden staging directory and
 reviewed; only the exact reviewed checkout is moved into place and applied.
 Updates stage and review every Git-installed theme before replacing any.
 Themes with local or ignored modifications, submodules, or unresolved Git LFS

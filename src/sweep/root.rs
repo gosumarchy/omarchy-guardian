@@ -190,32 +190,43 @@ fn write_results(path: &Path, json: &str, gid: u32) -> Result<(), String> {
 /// recent: owned by root and writable by no one else, file and directory,
 /// and at most `MAX_AGE_SECS` old.
 pub fn from_results(path: &Path, now: u64) -> Result<RootPart, String> {
-    let directory = path.parent().ok_or("no directory")?;
+    if let Some(problem) = results_problem(path, now) {
+        return Err(problem);
+    }
+    let text = fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    from_json(&text)
+}
+
+/// Why the results at `path` are not used, as far as that shows without
+/// reading them (the bar asks this too).
+pub fn results_problem(path: &Path, now: u64) -> Option<String> {
+    let directory = path.parent()?;
     for checked in [directory, path] {
-        let metadata = fs::symlink_metadata(checked)
-            .map_err(|error| format!("{}: {error}", checked.display()))?;
+        let metadata = match fs::symlink_metadata(checked) {
+            Ok(metadata) => metadata,
+            Err(error) => return Some(format!("{}: {error}", checked.display())),
+        };
         if metadata.file_type().is_symlink() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0
         {
-            return Err(format!(
+            return Some(format!(
                 "{} is not root's alone; ignoring it",
                 checked.display()
             ));
         }
     }
-    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => return Some(error.to_string()),
+    };
     let modified = metadata
         .modified()
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |elapsed| elapsed.as_secs());
     if now.saturating_sub(modified) > MAX_AGE_SECS {
-        return Err("the daily root check has not run for more than a day".into());
+        return Some("the daily root check has not run for more than a day".into());
     }
-    if metadata.len() > MAX_OUTPUT {
-        return Err("the root check's results are too large".into());
-    }
-    let text = fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    from_json(&text)
+    (metadata.len() > MAX_OUTPUT).then(|| "the root check's results are too large".into())
 }
 
 fn to_json(collection: &Collection) -> Json {
