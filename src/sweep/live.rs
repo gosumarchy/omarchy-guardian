@@ -718,7 +718,15 @@ fn searched(environment: Option<&[u8]>) -> Vec<Option<String>> {
         .flat_map(|value| {
             String::from_utf8_lossy(value)
                 .split([':', ';'])
-                .filter(|directory| !directory.is_empty() && !directory.starts_with('$'))
+                .filter(|directory| !directory.is_empty() && *directory != "/")
+                // The linker's own tokens stand for where the program or
+                // its libraries are; with `..` they lead anywhere.
+                .filter(|directory| {
+                    let token = ["$ORIGIN", "${ORIGIN}", "$LIB", "${LIB}", "$PLATFORM", "${PLATFORM}"]
+                        .iter()
+                        .any(|token| directory.starts_with(token));
+                    !token || directory.split('/').any(|part| part == "..")
+                })
                 .map(|directory| directory.strip_prefix('/').and_then(normalize))
                 .collect::<Vec<_>>()
         })
@@ -737,7 +745,15 @@ fn listeners(scope: &Scope<'_>, processes: &[Process], found: &mut Found) {
                 .strip_prefix("socket:[")
                 .and_then(|rest| rest.strip_suffix(']'))
             {
-                holders.entry(inode.to_string()).or_default().push(process);
+                // Once per process, however many copies of the socket it
+                // holds.
+                let sharing = holders.entry(inode.to_string()).or_default();
+                if sharing
+                    .last()
+                    .is_none_or(|last: &&Process| last.pid != process.pid)
+                {
+                    sharing.push(process);
+                }
             }
         }
     }
@@ -1613,7 +1629,13 @@ mod tests {
         let (dir, index) = fixture();
         let root = dir.path();
         // The program that opened it, and a packaged one it handed it to.
-        process(root, "30", "/home/u/server", &[("3", "socket:[777]")], "");
+        process(
+            root,
+            "30",
+            "/home/u/server",
+            &[("3", "socket:[777]"), ("4", "socket:[777]")],
+            "",
+        );
         process(
             root,
             "31",
@@ -1641,6 +1663,15 @@ mod tests {
             "{notes:?}"
         );
         assert!(!notes.iter().any(|note| note.contains("process 31 ")));
+        // A second copy of the socket in one process says nothing twice.
+        assert_eq!(
+            notes
+                .iter()
+                .filter(|note| note.contains("process 30 "))
+                .count(),
+            1,
+            "{notes:?}"
+        );
     }
 
     /// A process as the checks read it.
@@ -1864,7 +1895,12 @@ mod tests {
             [Some("a/b".to_string()), None]
         );
         // What every launcher leaves behind says nothing.
-        assert!(super::searched(Some(b"LD_LIBRARY_PATH=:$ORIGIN/lib::${LIB}\0")).is_empty());
+        assert!(super::searched(Some(b"LD_LIBRARY_PATH=:$ORIGIN/lib::${LIB}:/\0")).is_empty());
+        // A token followed by `..`, or an unknown one, is not one of those.
+        assert_eq!(
+            super::searched(Some(b"LD_LIBRARY_PATH=$ORIGIN/../../tmp/x:$HOME/lib\0")),
+            [None, None]
+        );
         let launcher = running(
             "/usr/bin/python3",
             &["python3"],

@@ -158,7 +158,9 @@ clean system shows nothing here:
   file in a temporary directory passed to a script can be flagged in its
   place. Code given on the command line or on standard input (`python -c`,
   a `bash -c` command string) has no file to look at, and Java classes
-  named by a class path are not followed;
+  named by a class path are not followed. Where the first argument is not
+  the script (`bash -o pipefail x.sh`, `deno run x.ts`), the script is not
+  found;
 - a library no repository package installed, loaded into a running
   program (`LD_PRELOAD`, `LD_AUDIT`), and a program told to look for its
   libraries in a temporary directory or in one relative to where it runs
