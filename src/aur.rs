@@ -1096,8 +1096,16 @@ impl Walk<'_> {
                 self.upstream.found = true;
                 // A name that is not UTF-8 is read all the same, as a build
                 // reads it, and shown with the bytes that are no text
-                // replaced: nothing under such a name is passed over.
-                let name = entry.file_name().to_string_lossy().into_owned();
+                // written out (`caf\xe9.c`), so that two such names stay
+                // two: nothing under such a name is passed over.
+                let name = match entry.file_name().to_str() {
+                    Some(name) => name.to_string(),
+                    None => entry
+                        .file_name()
+                        .as_encoded_bytes()
+                        .escape_ascii()
+                        .to_string(),
+                };
                 let child = if rel.is_empty() {
                     name.clone()
                 } else {
@@ -1800,7 +1808,7 @@ pkgname = demo
             upstream
                 .files
                 .iter()
-                .any(|file| file.path == "src/caf\u{fffd}.c"),
+                .any(|file| file.path == "src/caf\\xe9.c"),
             "{:?}",
             upstream
                 .files

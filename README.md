@@ -959,8 +959,8 @@ reviewable. On a call that only verifies sources (`--verifysource`), the
 real makepkg runs the recipe's `verify()` on the downloads before any
 upstream review: only the review of the recipe covers that function. The
 gate refuses `--file` and `--dir` in any spelling makepkg accepts (with the
-value attached, or shortened), since it reviews the recipe in the working
-directory.
+value attached, or shortened), and a shortened `--config`, since it reviews
+the recipe in the working directory with the configuration it was given.
 
 ### Omarchy themes
 

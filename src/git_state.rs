@@ -57,8 +57,9 @@ pub fn is_git_config(rel: &str) -> bool {
 /// The lines of `text` that set a key running a command, as (line number,
 /// `key = value` with any URL credentials masked).
 pub fn executing_keys(text: &str) -> Vec<(usize, String)> {
-    let mut section = String::new();
-    let mut subsection: Option<String> = None;
+    // The sections a key may belong to. Usually one; after a header that
+    // may itself be the tail of a continued value, also the ones before.
+    let mut sections: Vec<(String, Option<String>)> = vec![(String::new(), None)];
     let mut hits: Vec<(usize, String)> = Vec::new();
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let lines: Vec<&str> = text.lines().collect();
@@ -66,8 +67,10 @@ pub fn executing_keys(text: &str) -> Vec<(usize, String)> {
         // Where git continues a line onto the next depends on quotes,
         // comments and how many backslashes end it. Rather than repeat
         // those rules, a line ending in a backslash is read both ways, on
-        // its own and joined with what follows: a key that runs a command
-        // in either reading is reported.
+        // its own and joined with what follows, and what comes after it is
+        // read both as a line of its own and as more of that value: a key
+        // that runs a command in any reading is reported.
+        let continued = index > 0 && lines[index - 1].ends_with('\\');
         let mut readings = vec![(*raw).to_string()];
         if raw.ends_with('\\') {
             let mut joined = (*raw).to_string();
@@ -82,20 +85,30 @@ pub fn executing_keys(text: &str) -> Vec<(usize, String)> {
             }
             readings.push(joined);
         }
-        for reading in readings {
+        for (reading_index, reading) in readings.into_iter().enumerate() {
             let mut line = reading.trim();
             if let Some(header) = line.strip_prefix('[') {
                 let (header, rest) = split_header(header);
                 let header = header.trim();
-                if let Some((name, sub)) = header.split_once(char::is_whitespace) {
-                    section = name.to_lowercase();
-                    subsection = Some(sub.trim().trim_matches('"').to_string());
+                let found = if let Some((name, sub)) = header.split_once(char::is_whitespace) {
+                    (
+                        name.to_lowercase(),
+                        Some(sub.trim().trim_matches('"').to_string()),
+                    )
                 } else if let Some((name, sub)) = header.split_once('.') {
-                    section = name.to_lowercase();
-                    subsection = Some(sub.to_string());
+                    (name.to_lowercase(), Some(sub.to_string()))
                 } else {
-                    section = header.to_lowercase();
-                    subsection = None;
+                    (header.to_lowercase(), None)
+                };
+                // Only the line as it stands opens a section; if it may be
+                // the rest of a value, the sections before stay too.
+                if reading_index == 0 {
+                    if !continued {
+                        sections.clear();
+                    }
+                    if !sections.contains(&found) {
+                        sections.push(found);
+                    }
                 }
                 // A key may follow its section on the same line.
                 line = rest.trim();
@@ -107,16 +120,18 @@ pub fn executing_keys(text: &str) -> Vec<(usize, String)> {
                 .split_once('=')
                 .map_or((line, "true"), |(key, value)| (key.trim(), value.trim()));
             let key = key.to_lowercase();
-            if !runs_command(&section, subsection.is_some(), &key, value) {
-                continue;
-            }
-            let full = subsection.as_ref().map_or_else(
-                || format!("{section}.{key}"),
-                |sub| format!("{section}.{sub}.{key}"),
-            );
-            let hit = (index + 1, format!("{full} = {}", mask_credentials(value)));
-            if !hits.contains(&hit) {
-                hits.push(hit);
+            for (section, subsection) in &sections {
+                if !runs_command(section, subsection.is_some(), &key, value) {
+                    continue;
+                }
+                let full = subsection.as_ref().map_or_else(
+                    || format!("{section}.{key}"),
+                    |sub| format!("{section}.{sub}.{key}"),
+                );
+                let hit = (index + 1, format!("{full} = {}", mask_credentials(value)));
+                if !hits.contains(&hit) {
+                    hits.push(hit);
+                }
             }
         }
     }
@@ -141,7 +156,10 @@ fn split_header(header: &str) -> (&str, &str) {
 }
 
 fn runs_command(section: &str, has_subsection: bool, key: &str, value: &str) -> bool {
-    let value = value.trim_matches('"');
+    // As git takes a value: quotes group and are dropped (`"" !x` is
+    // `!x`), and blanks around it do not count.
+    let value = value.replace('"', "");
+    let value = value.trim();
     // An empty value clears a list (`credential.helper =`); it runs nothing.
     if value.is_empty() {
         return false;
@@ -278,6 +296,17 @@ mod tests {
         assert_eq!(
             keys("[remote \"a]b\"] uploadpack = sh x\n"),
             ["1:remote.a]b.uploadpack = sh x"]
+        );
+        // A header that may be the rest of a continued value does not
+        // take the keys after it out of the section before.
+        assert_eq!(
+            keys("[core]\n\tx = a\\\n[alias]\n\tfsmonitor = sh x\n"),
+            ["4:core.fsmonitor = sh x"]
+        );
+        // Quotes around nothing do not hide what a value starts with.
+        assert_eq!(
+            keys("[alias]\n\tx = \"\" !sh x\n\ty = \"\" \"!sh y\"\n\tz = status\n").len(),
+            2
         );
         // A comment ending in a backslash does not swallow the next line.
         assert_eq!(
