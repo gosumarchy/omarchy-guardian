@@ -956,9 +956,27 @@ pub fn is_sensitive_path(rel: &str) -> bool {
         || name
             .split(|character: char| !character.is_ascii_alphanumeric())
             .any(|word| word == "token" || word == "tokens")
-        || [".pem", ".key", ".p12", ".pfx", ".keystore"]
-            .iter()
-            .any(|extension| name.ends_with(extension))
+        || [
+            ".pem",
+            ".key",
+            ".p12",
+            ".pfx",
+            ".keystore",
+            ".jks",
+            ".kdbx",
+            ".tfstate",
+        ]
+        .iter()
+        .any(|extension| name.ends_with(extension))
+        // Files that hold a login by their purpose. `.npmrc` and `.envrc`
+        // are not among them: projects ship those as plain settings, and
+        // withholding one makes a review incomplete.
+        || matches!(
+            name,
+            ".pypirc" | ".netrc" | "id_rsa" | "id_ed25519" | "id_ecdsa" | "id_dsa"
+        )
+        || lower.ends_with(".kube/config")
+        || lower.ends_with(".docker/config.json")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1383,6 +1401,20 @@ mod tests {
         assert!(is_sensitive_path(".env.production"));
         assert!(is_sensitive_path("config/private.pem"));
         assert!(is_sensitive_path(".aws/credentials"));
+        for path in [
+            ".pypirc",
+            "deploy/.netrc",
+            "keys/id_ed25519",
+            "home/.kube/config",
+            "store.kdbx",
+            "infra/terraform.tfstate",
+        ] {
+            assert!(is_sensitive_path(path), "{path}");
+        }
+        assert!(!is_sensitive_path(".npmrc"));
+        assert!(!is_sensitive_path("id_ed25519.pub"));
+        assert!(!is_sensitive_path("kube/config.yaml"));
+
         assert!(is_sensitive_path("secrets/app.conf"));
         assert!(!is_sensitive_path("src/tokenizer.rs"));
         assert!(!is_sensitive_path("hyprland.lua"));

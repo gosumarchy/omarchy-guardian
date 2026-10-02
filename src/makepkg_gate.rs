@@ -332,6 +332,19 @@ fn recipe_target(build_dir: &Path, key: &str, aur: bool) -> Target {
     }
 }
 
+/// Whether `text` is a long option the gate cannot go along with, in a
+/// form the exact match above does not see: `--file` or `--dir` with their
+/// value attached (`--dir=/x`), or any of them and `--config` shortened,
+/// which makepkg takes as that option.
+fn is_abbreviated(text: &str) -> bool {
+    let name = text.split('=').next().unwrap_or(text);
+    name.len() > 2
+        && (["--file", "--dir"]
+            .iter()
+            .any(|option| option.starts_with(name))
+            || ("--config".starts_with(name) && name != "--config"))
+}
+
 /// The arguments every Guardian makepkg run mirrors from the call:
 /// `MIRRORED_FLAGS` (also out of short clusters like `-fCA`), `--config
 /// <file>`, and makepkg's trailing `NAME=value` settings. A call that picks
@@ -358,6 +371,9 @@ fn mirrored_arguments(arguments: &[OsString]) -> Result<Vec<OsString>, String> {
             _ if text.starts_with("--config=") || MIRRORED_FLAGS.contains(&text) => {
                 mirrored.push(arg.clone());
             }
+            // makepkg takes a long option by any unambiguous beginning:
+            // `--fil x` is `--file x`.
+            _ if is_abbreviated(text) => return Err(unsupported(text)),
             _ if text.starts_with("--") => {}
             _ if text.starts_with('-') => {
                 let cluster = &text[1..];
@@ -1441,6 +1457,14 @@ mod tests {
         assert!(mirrored_arguments(&args(&["-p", "other"])).is_err());
         assert!(mirrored_arguments(&args(&["-D", "/elsewhere"])).is_err());
         assert!(mirrored_arguments(&args(&["-sp", "other"])).is_err());
+        // A shortened long option is the option makepkg takes it for.
+        for shortened in ["--fil", "--di", "--dir=/x", "--conf", "--f"] {
+            assert!(
+                mirrored_arguments(&args(&[shortened, "x"])).is_err(),
+                "{shortened}"
+            );
+        }
+        assert!(mirrored_arguments(&args(&["--force", "--clean"])).is_ok());
     }
 
     #[test]

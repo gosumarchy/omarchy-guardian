@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use crate::content::{self, Content};
 use crate::engine::baseline::Unread;
+use crate::git_state;
 use crate::image;
 use crate::json::Json;
 use crate::scan::{Limits, MAX_HASHED_FILE_SIZE, MAX_TEXT_FILE_SIZE};
@@ -620,6 +621,9 @@ const SCRIPT_DEPTH: usize = 3;
 
 /// Version-control metadata, which a build does not run.
 const SKIPPED_DIRECTORIES: &[&str] = &[".git", ".hg", ".svn", ".bzr"];
+/// The most archives named one by one as not unpacked (a Java project
+/// ships dozens of jars).
+const MAX_ARCHIVES_NAMED: usize = 5;
 /// Directories whose code rarely runs during a build: reviewed, but after
 /// everything else.
 const LATE_DIRECTORIES: &[&str] = &[
@@ -764,6 +768,8 @@ struct Walk<'a> {
     hashed_bytes: u64,
     /// The file being read is a top-level link to a downloaded source.
     download: bool,
+    /// Archives named as not unpacked, so far.
+    archives_named: usize,
     all: Vec<UpstreamFile>,
     upstream: Upstream,
 }
@@ -872,6 +878,20 @@ impl Walk<'_> {
                 (None, None) => false,
             };
         let archive = self.download && format.label().contains("archive");
+        // An archive makepkg was told not to unpack, or one inside the
+        // sources, is opened by the build itself if at all: what is in it
+        // is not reviewed, and the review says so.
+        let name = child.rsplit('/').next().unwrap_or(child);
+        if format.label().contains("archive")
+            && (!self.download || self.not_extracted(name))
+            && self.archives_named < MAX_ARCHIVES_NAMED
+        {
+            self.archives_named += 1;
+            self.upstream.omitted.push((
+                child.to_string(),
+                "an archive that is not unpacked for review: what the build takes from it is not reviewed",
+            ));
+        }
         if !(image || archive) {
             self.upstream.unread.insert(
                 format!("src/{child}"),
@@ -884,6 +904,16 @@ impl Walk<'_> {
                 .executables
                 .push(format!("src/{child} ({})", format.label()));
         }
+    }
+
+    /// Whether the recipe's `noextract` names `name`, or names something
+    /// through a variable, which could be any download.
+    fn not_extracted(&self, name: &str) -> bool {
+        self.recipe.split("noextract").skip(1).any(|rest| {
+            rest.split(')')
+                .next()
+                .is_some_and(|list| list.contains(name) || list.contains('$'))
+        })
     }
 
     /// The hash of a large binary, within the limits a scan hashes under.
@@ -932,6 +962,113 @@ impl Walk<'_> {
         }
     }
 
+    /// A version-control directory in the sources is not source, but git
+    /// and Mercurial run what its configuration and hooks say on the
+    /// commands a build often runs (`git describe`, `git status`). A
+    /// checkout makepkg made has neither; an unpacked archive can ship
+    /// both.
+    fn version_control(&mut self, directory: &Path, child: &str, name: &str) {
+        match name {
+            ".git" => self.git_directory(directory, child, 0),
+            ".hg" => {
+                let text = fs::read(directory.join("hgrc"))
+                    .map(|bytes| String::from_utf8_lossy(&bytes).to_lowercase())
+                    .unwrap_or_default();
+                if text.lines().map(str::trim).any(|line| {
+                    [
+                        "[hooks]",
+                        "[extensions]",
+                        "[alias]",
+                        "[extdiff]",
+                        "[merge-tools]",
+                        "%include",
+                    ]
+                    .iter()
+                    .any(|section| line.starts_with(section))
+                }) {
+                    self.upstream.gaps.push(format!(
+                        "src/{child}: its hgrc sets hooks, extensions or aliases Mercurial runs, or includes another file"
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The checks of one git directory: `.git` itself, and each submodule
+    /// kept under its `modules`, which git enters on `status` too.
+    fn git_directory(&mut self, directory: &Path, child: &str, depth: usize) {
+        let mut gap = |what: String| {
+            self.upstream.gaps.push(format!("src/{child}: {what}"));
+        };
+        for config in ["config", "config.worktree"] {
+            let path = directory.join(config);
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let text = (metadata.is_file() && metadata.len() <= MAX_TEXT_FILE_SIZE)
+                .then(|| fs::read(&path).ok())
+                .flatten()
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+            match text {
+                Some(text) => {
+                    if let Some((line, _)) = git_state::executing_keys(&text).first() {
+                        gap(format!(
+                            "its {config} names a command git runs (line {line})"
+                        ));
+                    }
+                }
+                None => gap(format!(
+                    "its {config} cannot be read as a git configuration"
+                )),
+            }
+        }
+        let hooks = directory.join("hooks");
+        match fs::symlink_metadata(&hooks) {
+            Ok(metadata) if metadata.is_dir() => {
+                let live = fs::read_dir(&hooks).map(|entries| {
+                    entries
+                        .flatten()
+                        .any(|entry| !entry.file_name().to_string_lossy().ends_with(".sample"))
+                });
+                if live.unwrap_or(true) {
+                    gap("it holds hooks git runs (a checkout gets them from a git template directory, an archive brings its own)".into());
+                }
+            }
+            Ok(_) => gap("its hooks are not a directory".into()),
+            Err(_) => {}
+        }
+        let modules = directory.join("modules");
+        match fs::symlink_metadata(&modules) {
+            Ok(metadata) if metadata.is_dir() && depth < MAX_DEPTH => {
+                let Ok(entries) = fs::read_dir(&modules) else {
+                    return gap("its submodules cannot be listed".into());
+                };
+                let mut names: Vec<_> = entries.flatten().map(|entry| entry.file_name()).collect();
+                names.sort();
+                for name in names {
+                    let submodule = modules.join(&name);
+                    let shown =
+                        format!("{child}/modules/{}", name.to_string_lossy().escape_debug());
+                    match fs::symlink_metadata(&submodule) {
+                        Ok(metadata) if metadata.is_dir() => {
+                            self.git_directory(&submodule, &shown, depth + 1);
+                        }
+                        // Git follows a link here; the checks do not.
+                        Ok(metadata) if metadata.file_type().is_symlink() => {
+                            self.upstream.gaps.push(format!(
+                                "src/{shown}: a linked submodule cannot be reviewed"
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(_) => gap("its submodules are not a directory, or are nested too deep".into()),
+            Err(_) => {}
+        }
+    }
+
     fn walk(&mut self) {
         let mut pending = vec![(self.src.clone(), String::new(), 0_usize, false)];
         while let Some((directory, rel, depth, late)) = pending.pop() {
@@ -957,11 +1094,17 @@ impl Walk<'_> {
                     return;
                 }
                 self.upstream.found = true;
-                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                    self.upstream
-                        .omitted
-                        .push((rel.clone(), "a name that is not UTF-8"));
-                    continue;
+                // A name that is not UTF-8 is read all the same, as a build
+                // reads it, and shown with the bytes that are no text
+                // written out (`caf\xe9.c`), so that two such names stay
+                // two: nothing under such a name is passed over.
+                let name = match entry.file_name().to_str() {
+                    Some(name) => name.to_string(),
+                    None => entry
+                        .file_name()
+                        .as_encoded_bytes()
+                        .escape_ascii()
+                        .to_string(),
                 };
                 let child = if rel.is_empty() {
                     name.clone()
@@ -971,10 +1114,19 @@ impl Walk<'_> {
                 let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
                     continue;
                 };
+                // A `.git` that is a file or a link points git at a
+                // directory of its own choosing, wherever that is.
+                if name == ".git" && !metadata.is_dir() {
+                    self.upstream.gaps.push(format!(
+                        "src/{child}: a git directory given as a file or a link cannot be reviewed"
+                    ));
+                    continue;
+                }
                 if metadata.file_type().is_symlink() {
                     self.link(&entry.path(), &child, &name, depth, late);
                 } else if metadata.is_dir() {
                     if SKIPPED_DIRECTORIES.contains(&name.as_str()) {
+                        self.version_control(&entry.path(), &child, &name);
                         continue;
                     }
                     if depth + 1 >= MAX_DEPTH {
@@ -1018,6 +1170,7 @@ fn collect_with_cap(
         stopped: false,
         hashed_bytes: 0,
         download: false,
+        archives_named: 0,
         all: Vec::new(),
         upstream: Upstream::default(),
     };
@@ -1584,6 +1737,117 @@ pkgname = demo
                 .iter()
                 .any(|gap| gap.contains("more than 3 entries"))
         );
+    }
+
+    #[test]
+    fn version_control_metadata_in_the_sources_is_checked_for_what_it_runs() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new("upstream-vcs");
+        let src = dir.path().join("src");
+        let roots = Roots {
+            build_dir: dir.path(),
+            srcdest: None,
+        };
+        let gaps = |src: &std::path::Path| collect_upstream(src, &roots, "", 1024 * 1024).gaps;
+
+        // A checkout as makepkg makes it: nothing to say.
+        fs::create_dir_all(src.join("demo/.git/hooks")).unwrap();
+        fs::write(
+            src.join("demo/.git/config"),
+            "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = https://x.example/r\n",
+        )
+        .unwrap();
+        fs::write(src.join("demo/.git/hooks/pre-commit.sample"), "#!/bin/sh\n").unwrap();
+        fs::write(src.join("demo/Makefile"), "all:\n").unwrap();
+        assert!(gaps(&src).is_empty(), "{:?}", gaps(&src));
+
+        // A configuration that runs a command, and a live hook.
+        fs::write(
+            src.join("demo/.git/config"),
+            "[core]\n\tfsmonitor = sh -c x\n",
+        )
+        .unwrap();
+        fs::write(src.join("demo/.git/hooks/post-checkout"), "#!/bin/sh\n").unwrap();
+        // A submodule kept inside it is a git directory too.
+        fs::create_dir_all(src.join("demo/.git/modules/lib")).unwrap();
+        fs::write(
+            src.join("demo/.git/modules/lib/config"),
+            "[core]\n\tsshCommand = sh x\n",
+        )
+        .unwrap();
+        let found = gaps(&src).join("\n");
+        assert!(
+            found.contains("src/demo/.git/modules/lib: its config names a command"),
+            "{found}"
+        );
+        assert!(
+            found.contains("src/demo/.git: its config names a command git runs"),
+            "{found}"
+        );
+        assert!(
+            found.contains("src/demo/.git: it holds hooks git runs"),
+            "{found}"
+        );
+
+        // A git directory given as a file or a link, a Mercurial hook, and
+        // a name that is not UTF-8.
+        fs::remove_dir_all(src.join("demo/.git")).unwrap();
+        fs::write(src.join("demo/.git"), "gitdir: ../elsewhere\n").unwrap();
+        fs::create_dir_all(src.join("other/.hg")).unwrap();
+        fs::write(src.join("other/.hg/hgrc"), "[hooks]\nupdate = sh x\n").unwrap();
+        symlink("../demo", src.join("other/.git")).unwrap();
+        // A name that is not UTF-8 is reviewed like any other.
+        fs::write(
+            src.join(std::ffi::OsStr::from_bytes(b"caf\xe9.c")),
+            "int main(void) { return 0; }\n",
+        )
+        .unwrap();
+        let upstream = collect_upstream(&src, &roots, "", 1024 * 1024);
+        assert!(
+            upstream
+                .files
+                .iter()
+                .any(|file| file.path == "src/caf\\xe9.c"),
+            "{:?}",
+            upstream
+                .files
+                .iter()
+                .map(|file| &file.path)
+                .collect::<Vec<_>>()
+        );
+        let found = gaps(&src).join("\n");
+        for expected in [
+            "src/demo/.git: a git directory given as a file or a link",
+            "src/other/.git: a git directory given as a file or a link",
+            "src/other/.hg: its hgrc sets hooks",
+        ] {
+            assert!(found.contains(expected), "{expected}\n{found}");
+        }
+    }
+
+    #[test]
+    fn an_archive_the_build_opens_itself_is_named() {
+        let dir = TempDir::new("upstream-large");
+        let src = dir.path().join("src");
+        fs::create_dir_all(src.join("demo/deep/er/still")).unwrap();
+        let roots = Roots {
+            build_dir: dir.path(),
+            srcdest: None,
+        };
+        let mut archive = b"\x1f\x8b\x08\0".to_vec();
+        archive.resize(64, 7);
+        fs::write(src.join("demo/payload.tar.gz"), &archive).unwrap();
+        let upstream = collect_upstream(&src, &roots, "", 1024 * 1024);
+        assert!(
+            upstream
+                .omitted
+                .iter()
+                .any(|(path, why)| path == "demo/payload.tar.gz" && why.contains("not unpacked")),
+            "{:?}",
+            upstream.omitted
+        );
+        assert!(!upstream.whole);
     }
 
     #[test]

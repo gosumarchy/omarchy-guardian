@@ -671,8 +671,11 @@ Git LFS pointers and an invalid or inconclusive AI reply all make the review
 provider error, a timeout) follows the class's `ai` setting instead: `WARNED`
 for `official` under `standard`, blocked everywhere else. In `.git`, only the
 `config` (checked locally for keys that make git run a command, such as
-`core.fsmonitor`, filters and `!` aliases, and never sent to the AI) and
-hooks other than git's `.sample` files are reviewed. A top-level `target`,
+`core.fsmonitor`, filters and `!` aliases, and never sent to the AI; also
+`config.worktree`) and hooks other than git's `.sample` files are reviewed.
+A `.git` given as a file or a link, a linked `config`, and hooks or
+submodules behind a link make the review incomplete: git would read them
+and the review cannot. A top-level `target`,
 `node_modules` or `.venv` that carries its tool's marker file
 (`CACHEDIR.TAG`, `.package-lock.json`, `pyvenv.cfg`…) is skipped unless
 `--thorough` is given; the skip is listed under "Not reviewed", its file
@@ -928,9 +931,18 @@ gate does, in order:
    otherwise its build files and scripts (makefiles, CMake, meson,
    `configure`, `setup.py`, `build.rs`, `package.json`, shell scripts…)
    first, then other code by depth, up to 1 MiB. Data and documentation
-   (`.json`, `.md`, `.txt`…) and version-control metadata are left out;
-   `node_modules`, `.venv`, CI and development-container directories are
-   reviewed last. The review looks
+   (`.json`, `.md`, `.txt`…) are left out; `node_modules`, `.venv`, CI and
+   development-container directories are reviewed last. Version-control
+   metadata is not source, but git and Mercurial run what it says on the
+   commands a build often uses (`git describe`): a `.git` whose
+   configuration names a command or that holds live hooks (its submodules
+   under `.git/modules` included), one given as a file or a link, and an
+   `hgrc` with hooks or extensions make the review incomplete (a checkout
+   makepkg made has none of these, unless your own git template directory
+   installs hooks). A file or directory whose name is not UTF-8 is read
+   and reviewed like any other. An
+   archive the build opens itself (listed in `noextract`, or found inside
+   the sources) is named as not reviewed, up to five of them. The review looks
    for malicious intent in what runs during the build and in the program's
    own code, not bugs or vulnerabilities, and is told whether the recipe
    runs the test suite (`check()`). The upstream review is remembered as
@@ -943,7 +955,12 @@ gate does, in order:
 
 What is not reviewed is reported: how many code files were left out, and
 that data files were skipped. Prebuilt binaries in `-bin` packages are not
-reviewable.
+reviewable. On a call that only verifies sources (`--verifysource`), the
+real makepkg runs the recipe's `verify()` on the downloads before any
+upstream review: only the review of the recipe covers that function. The
+gate refuses `--file` and `--dir` in any spelling makepkg accepts (with the
+value attached, or shortened), and a shortened `--config`, since it reviews
+the recipe in the working directory with the configuration it was given.
 
 ### Omarchy themes
 
