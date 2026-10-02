@@ -268,13 +268,14 @@ pub fn save_last_run(directory: &Path, run: &LastRun) -> Result<(), String> {
             ),
         ),
     ]);
-    write_text(&directory.join(LAST_RUN), &json.to_string())?;
-    match fs::remove_file(directory.join(STARTED)) {
+    // The sweep ended, whether or not that can be written down.
+    let unmarked = match fs::remove_file(directory.join(STARTED)) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
             Err(format!("{}: {error}", directory.join(STARTED).display()))
         }
         _ => Ok(()),
-    }
+    };
+    write_text(&directory.join(LAST_RUN), &json.to_string()).and(unmarked)
 }
 
 /// How an item changed since the last sweep.

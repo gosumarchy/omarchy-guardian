@@ -582,7 +582,6 @@ mod tests {
         };
         let fresh = ran(3600, Outcome::Complete, &[]);
         assert!(sweep_health(now, up, Some(&fresh), None, None).is_empty());
-        assert!(sweep_health(now, up, Some(&fresh), None, None).is_empty());
 
         // Stopped: only once the timers have had their time after boot.
         let old = ran(STALE_SECS + 86_400, Outcome::Complete, &[]);
@@ -617,10 +616,10 @@ mod tests {
         );
 
         // Root's daily results, when they are on and not usable.
-        let problem = Some("the daily root check has not run for more than a day");
+        let problem = Some("their results are more than 36 hours old");
         assert_eq!(
             sweep_health(now, up, Some(&fresh), None, problem),
-            ["the daily root checks: the daily root check has not run for more than a day"]
+            ["the daily root checks: their results are more than 36 hours old"]
         );
         assert!(sweep_health(now, 0, Some(&fresh), None, problem).is_empty());
     }

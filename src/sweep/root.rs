@@ -224,7 +224,7 @@ pub fn results_problem(path: &Path, now: u64) -> Option<String> {
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |elapsed| elapsed.as_secs());
     if now.saturating_sub(modified) > MAX_AGE_SECS {
-        return Some("the daily root check has not run for more than a day".into());
+        return Some("the daily root check has not run for more than 36 hours".into());
     }
     (metadata.len() > MAX_OUTPUT).then(|| "the root check's results are too large".into())
 }
