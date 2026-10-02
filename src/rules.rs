@@ -508,20 +508,24 @@ pub fn fetched_file(line: &str) -> Option<String> {
         match word.as_str() {
             ";" | "&&" | "||" | "|" => break,
             "-O" | "--remote-name" if fetcher == "curl" => by_address = true,
-            // To standard output: nothing is saved.
+            // wget's `-o` names its log.
+            "-o" if fetcher == "wget" => {
+                rest.next();
+            }
+            ">" | ">>" => return rest.next().and_then(|name| as_file(name)),
+            "-o" | "-O" | "--output" | "--output-document" | "--out" => {
+                match rest.next().map(String::as_str) {
+                    // Standard output: only a redirection saves it.
+                    Some("-") => by_address = false,
+                    name => return name.and_then(as_file),
+                }
+            }
             _ if fetcher == "wget"
                 && word.starts_with('-')
                 && !word.starts_with("--")
                 && word.ends_with("O-") =>
             {
-                return None;
-            }
-            // wget's `-o` names its log.
-            "-o" if fetcher == "wget" => {
-                rest.next();
-            }
-            "-o" | "-O" | "--output" | "--output-document" | "--out" | ">" | ">>" => {
-                return rest.next().and_then(|name| as_file(name));
+                by_address = false;
             }
             // Short options given together: `-fsSLo x`, `-qO x`.
             _ if word.len() > 2
@@ -533,15 +537,26 @@ pub fn fetched_file(line: &str) -> Option<String> {
                 if word.ends_with('O') && fetcher == "curl" {
                     by_address = true;
                 } else {
-                    return rest.next().and_then(|name| as_file(name));
+                    match rest.next().map(String::as_str) {
+                        Some("-") => by_address = false,
+                        name => return name.and_then(as_file),
+                    }
                 }
             }
             _ => {
-                let named = ["--output=", "--output-document=", "--out=", ">>", ">"]
+                if let Some(name) = [">>", ">"]
                     .iter()
-                    .find_map(|option| word.strip_prefix(option));
-                if let Some(name) = named {
+                    .find_map(|option| word.strip_prefix(option))
+                {
                     return as_file(name);
+                }
+                match ["--output=", "--output-document=", "--out="]
+                    .iter()
+                    .find_map(|option| word.strip_prefix(option))
+                {
+                    Some("-") => by_address = false,
+                    Some(name) => return as_file(name),
+                    None => {}
                 }
                 if word.contains("://") {
                     address = Some(word);
@@ -1391,6 +1406,15 @@ mod tests {
         assert_eq!(fetched_file("curl https://x.example/i.sh"), None);
         assert_eq!(fetched_file("wget -qO- https://x.example/i.sh"), None);
         assert_eq!(fetched_file("wget -O- https://x.example/i.sh"), None);
+        assert_eq!(fetched_file("wget -O - https://x.example/i.sh"), None);
+        for line in [
+            "wget -qO- https://x.example/i.sh > i.sh",
+            "wget -q https://x.example/i.sh -O - >> i.sh",
+            "wget --output-document=- https://x.example/i.sh >i.sh",
+            "curl -o - https://x.example/i.sh > i.sh",
+        ] {
+            assert_eq!(fetched_file(line).as_deref(), Some("i.sh"), "{line}");
+        }
         assert_eq!(fetched_file("echo saved > out.txt"), None);
 
         for line in [

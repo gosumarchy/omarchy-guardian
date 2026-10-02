@@ -640,7 +640,7 @@ review it in full every time.
   `printf` or `cat`, enables aliases, pipes anything into an interpreter
   (`f | sh`, `| sudo bash`, `| xargs`), or redirects its own output with
   `exec` or a process substitution, sends what a loop, a block or one of
-  its own functions prints to a file (by a redirection, `tee` or `dd`, whatever the file is called), or
+  its own functions prints to a file (by a redirection, `tee` or `dd`), or
   runs a command's output (`eval "$(…)"`, `source <(…)`), since its
   messages may then run. A
   command continued over several lines (a trailing backslash, pipe or `&&`,

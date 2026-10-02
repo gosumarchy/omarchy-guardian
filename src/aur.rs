@@ -1038,10 +1038,7 @@ impl Walk<'_> {
                         self.stopped = true;
                         break;
                     }
-                    if !GIT_OWN_FILES.contains(&file_name.as_str())
-                        && fs::symlink_metadata(entry.path())
-                            .is_ok_and(|metadata| metadata.is_file())
-                    {
+                    if fs::symlink_metadata(entry.path()).is_ok_and(|metadata| metadata.is_file()) {
                         self.file(
                             &entry.path(),
                             &format!("{child}/{file_name}"),

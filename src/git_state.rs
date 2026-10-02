@@ -7,7 +7,6 @@
 //! `core.fsmonitor` or a filter names. The config is checked here and never
 //! sent to the AI, since remote URLs can carry tokens.
 
-/// Keys that name a command git runs, as `section.key`, `section.*.key` for
 /// The directories git keeps in a git directory: no submodule is in one
 /// (those under `modules` are looked into by name).
 pub const OWN_DIRECTORIES: &[&str] = &[
@@ -24,6 +23,7 @@ pub const OWN_DIRECTORIES: &[&str] = &[
     "svn",
 ];
 
+/// Keys that name a command git runs, as `section.key`, `section.*.key` for
 /// any subsection, or `section.*` for every key in the section.
 const EXECUTING_KEYS: &[&str] = &[
     "core.fsmonitor",
