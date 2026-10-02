@@ -8,6 +8,22 @@
 //! sent to the AI, since remote URLs can carry tokens.
 
 /// Keys that name a command git runs, as `section.key`, `section.*.key` for
+/// The directories git keeps in a git directory: no submodule is in one
+/// (those under `modules` are looked into by name).
+pub const OWN_DIRECTORIES: &[&str] = &[
+    "objects",
+    "refs",
+    "hooks",
+    "info",
+    "logs",
+    "modules",
+    "worktrees",
+    "branches",
+    "lfs",
+    "rr-cache",
+    "svn",
+];
+
 /// any subsection, or `section.*` for every key in the section.
 const EXECUTING_KEYS: &[&str] = &[
     "core.fsmonitor",

@@ -299,22 +299,6 @@ fn read_small_file(path: &Path) -> Option<String> {
     (bytes.len() as u64 <= MAX_TEXT_FILE_SIZE).then(|| String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// The directories git keeps in a git directory: no submodule is in one
-/// (those under `modules` are read by `git_directory`).
-const GIT_OWN_DIRECTORIES: &[&str] = &[
-    "objects",
-    "refs",
-    "hooks",
-    "info",
-    "logs",
-    "modules",
-    "worktrees",
-    "branches",
-    "lfs",
-    "rr-cache",
-    "svn",
-];
-
 struct Walker<'a> {
     config: &'a ScanConfig,
     on_text: &'a mut dyn FnMut(TextFile<'_>),
@@ -470,12 +454,15 @@ impl Walker<'_> {
         // run in it takes its configuration from here all the same.
         let has = |name: &str| names.iter().any(|entry| entry == name);
         if has("HEAD") && has("objects") && has("refs") && has("config") {
-            let text = read_small_file(&handle.join("config"));
-            if text.is_none_or(|text| !git_state::executing_keys(&text).is_empty()) {
-                self.gaps.push(Gap::GitState(format!(
-                    "{}: laid out as a git repository, with a configuration that names a command git runs",
-                    if rel.is_empty() { "." } else { rel }
-                )));
+            let shown = if rel.is_empty() { "." } else { rel };
+            match read_small_file(&handle.join("config")) {
+                Some(text) if git_state::executing_keys(&text).is_empty() => {}
+                Some(_) => self.gaps.push(Gap::GitState(format!(
+                    "{shown}: laid out as a git repository, with a configuration that names a command git runs"
+                ))),
+                None => self.gaps.push(Gap::GitState(format!(
+                    "{shown}: laid out as a git repository, with a configuration that cannot be read"
+                ))),
             }
         }
 
@@ -544,7 +531,7 @@ impl Walker<'_> {
         names.sort();
         for name in names {
             let child = access.join(&name);
-            if is_git && GIT_OWN_DIRECTORIES.contains(&name.as_str()) {
+            if is_git && git_state::OWN_DIRECTORIES.contains(&name.as_str()) {
                 continue;
             }
             let Ok(metadata) = fs::symlink_metadata(&child) else {
@@ -689,10 +676,16 @@ impl Walker<'_> {
         // How a file is read depends on its name and mode as well as on
         // its bytes: a link under a script's name is not classed by what
         // the same bytes were under a data file's.
+        let extension = rel
+            .rsplit('/')
+            .next()
+            .and_then(|name| name.rsplit_once('.'))
+            .map(|(_, extension)| extension.to_ascii_lowercase())
+            .unwrap_or_default();
         let key = (
             metadata.dev(),
             metadata.ino(),
-            executable,
+            extension,
             content::must_review(&rel, b""),
         );
         let cached = (metadata.nlink() > 1)
@@ -748,8 +741,9 @@ impl Walker<'_> {
 /// How deep under `modules` a submodule's git directory is looked for.
 const MAX_MODULE_DEPTH: usize = 6;
 
-/// A file with several links, and how its name and mode make it be read.
-type LinkKey = (u64, u64, bool, bool);
+/// A file with several links, and how its name makes it be read (its
+/// extension, and whether it is one that must be reviewed).
+type LinkKey = (u64, u64, String, bool);
 
 /// Entries under `path`, not following links, counted up to `limit`.
 fn count_entries(path: &Path, limit: usize) -> usize {
@@ -1254,6 +1248,23 @@ mod tests {
         fs::write(dir.path().join("big.sh"), bytes).unwrap();
         let (_, _, gaps) = walk_texts(&ScanConfig::new(dir.path()));
         assert!(matches!(gaps.as_slice(), [Gap::OversizedText(path)] if path == "big.sh"));
+    }
+
+    #[test]
+    fn a_link_is_read_as_its_own_name_makes_it() {
+        // The same bytes are an image under one name and text with a NUL
+        // in it under another.
+        let bytes = b"BM\nhelper() { true; }\n\0\nmore\n";
+        let alone = TempDir::new("scan-link-alone");
+        fs::write(alone.path().join("b.inc"), bytes).unwrap();
+        let (_, _, expected) = walk_texts(&ScanConfig::new(alone.path()));
+        assert_eq!(expected.len(), 1, "{expected:?}");
+
+        let dir = TempDir::new("scan-link-names");
+        fs::write(dir.path().join("a.bmp"), bytes).unwrap();
+        fs::hard_link(dir.path().join("a.bmp"), dir.path().join("b.inc")).unwrap();
+        let (_, _, gaps) = walk_texts(&ScanConfig::new(dir.path()));
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
     }
 
     #[test]

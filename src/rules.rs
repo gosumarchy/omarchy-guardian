@@ -508,6 +508,18 @@ pub fn fetched_file(line: &str) -> Option<String> {
         match word.as_str() {
             ";" | "&&" | "||" | "|" => break,
             "-O" | "--remote-name" if fetcher == "curl" => by_address = true,
+            // To standard output: nothing is saved.
+            _ if fetcher == "wget"
+                && word.starts_with('-')
+                && !word.starts_with("--")
+                && word.ends_with("O-") =>
+            {
+                return None;
+            }
+            // wget's `-o` names its log.
+            "-o" if fetcher == "wget" => {
+                rest.next();
+            }
             "-o" | "-O" | "--output" | "--output-document" | "--out" | ">" | ">>" => {
                 return rest.next().and_then(|name| as_file(name));
             }
@@ -515,7 +527,8 @@ pub fn fetched_file(line: &str) -> Option<String> {
             _ if word.len() > 2
                 && word.starts_with('-')
                 && !word.starts_with("--")
-                && word.ends_with(['o', 'O']) =>
+                && word.ends_with(['o', 'O'])
+                && !(fetcher == "wget" && word.ends_with('o')) =>
             {
                 if word.ends_with('O') && fetcher == "curl" {
                     by_address = true;
@@ -1370,11 +1383,14 @@ mod tests {
             ("curl -O https://x.example/a/i.sh?x=1", "i.sh"),
             ("sudo wget -q https://x.example/a/i.sh", "i.sh"),
             ("wget -O \"$tmp\" https://x.example/a/i.sh", "$tmp"),
+            ("wget -o fetch.log https://x.example/a/i.sh", "i.sh"),
             ("aria2c --out=i.sh https://x.example/a", "i.sh"),
         ] {
             assert_eq!(fetched_file(line).as_deref(), Some(file), "{line}");
         }
         assert_eq!(fetched_file("curl https://x.example/i.sh"), None);
+        assert_eq!(fetched_file("wget -qO- https://x.example/i.sh"), None);
+        assert_eq!(fetched_file("wget -O- https://x.example/i.sh"), None);
         assert_eq!(fetched_file("echo saved > out.txt"), None);
 
         for line in [

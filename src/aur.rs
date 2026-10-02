@@ -633,21 +633,6 @@ const SCRIPT_DEPTH: usize = 3;
 
 /// Version-control metadata, which a build does not run.
 const SKIPPED_DIRECTORIES: &[&str] = &[".git", ".hg", ".svn", ".bzr"];
-/// The directories git keeps in a git directory: no submodule is in one
-/// (those under `modules` are read by `git_directory`).
-const GIT_OWN_DIRECTORIES: &[&str] = &[
-    "objects",
-    "refs",
-    "hooks",
-    "info",
-    "logs",
-    "modules",
-    "worktrees",
-    "branches",
-    "lfs",
-    "rr-cache",
-    "svn",
-];
 /// The files git itself keeps at the top of its directory.
 const GIT_OWN_FILES: &[&str] = &[
     "HEAD",
@@ -667,6 +652,18 @@ const GIT_OWN_FILES: &[&str] = &[
     "index",
     "packed-refs",
     "shallow",
+    "SQUASH_MSG",
+    "TAG_EDITMSG",
+    "MERGE_MODE",
+    "MERGE_RR",
+    "REBASE_HEAD",
+    "BISECT_LOG",
+    "BISECT_START",
+    "BISECT_TERMS",
+    "BISECT_EXPECTED_REV",
+    "BISECT_NAMES",
+    "gc.log",
+    "index.lock",
 ];
 /// The most archives named one by one as not unpacked (a Java project
 /// ships dozens of jars).
@@ -1025,7 +1022,22 @@ impl Walk<'_> {
                     .unwrap_or_default();
                 extra.sort_by_key(fs::DirEntry::file_name);
                 for entry in extra {
+                    if self.stopped {
+                        break;
+                    }
                     let file_name = entry.file_name().to_string_lossy().into_owned();
+                    if GIT_OWN_FILES.contains(&file_name.as_str()) {
+                        continue;
+                    }
+                    self.visited += 1;
+                    if self.visited > self.max_entries {
+                        self.upstream.gaps.push(format!(
+                            "the sources have more than {} entries; the rest cannot be reviewed",
+                            self.max_entries
+                        ));
+                        self.stopped = true;
+                        break;
+                    }
                     if !GIT_OWN_FILES.contains(&file_name.as_str())
                         && fs::symlink_metadata(entry.path())
                             .is_ok_and(|metadata| metadata.is_file())
@@ -1092,7 +1104,7 @@ impl Walk<'_> {
         entries.sort_by_key(fs::DirEntry::file_name);
         for entry in entries {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if is_git && GIT_OWN_DIRECTORIES.contains(&name.as_str()) {
+            if is_git && git_state::OWN_DIRECTORIES.contains(&name.as_str()) {
                 continue;
             }
             let shown = format!("{child}/{}", name.escape_debug());

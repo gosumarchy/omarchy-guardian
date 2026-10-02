@@ -167,8 +167,7 @@ pub fn check_coverage(inventory: &Inventory, gaps: &mut Vec<Gap>) {
             .collect();
         // A lockfile that names nothing the audit can look up covers
         // nothing.
-        let names_packages =
-            |lockfile: &&String| inventory.listed.iter().any(|listed| listed == *lockfile);
+        let names_packages = |lockfile: &&String| inventory.listed.contains(*lockfile);
         if covering.is_empty() {
             gaps.push(Gap::Dependency(format!(
                 "{manifest}: {} dependencies are declared but no supported matching lockfile was found",

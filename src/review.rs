@@ -317,10 +317,16 @@ fn apply_rules(report: &mut Report, rel: &str, text: &str, inventory_network: bo
                 }
             }
         }
-        if fetched.len() < MAX_FETCHED_FILES
-            && let Some(file) = rules::fetched_file(&joined(&mut written[start..end].iter()))
-        {
-            fetched.push(file.to_lowercase());
+        if let Some(file) = rules::fetched_file(&joined(&mut written[start..end].iter())) {
+            let file = file.to_lowercase();
+            if !fetched.contains(&file) {
+                // Past the limit the oldest is let go: a download is run
+                // soon after it is made.
+                if fetched.len() == MAX_FETCHED_FILES {
+                    fetched.remove(0);
+                }
+                fetched.push(file);
+            }
         }
         if !found.contains(&RuleId::DownloadAndExecute)
             && fetched
