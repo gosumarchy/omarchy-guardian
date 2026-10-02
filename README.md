@@ -25,8 +25,8 @@ plugins, and reviews that code **before any of it runs**:
   execute, privilege escalation, persistence, credential access and
   exfiltration, encoded commands, destructive operations). An AI reviewer
   then reads the code with every tool switched off and must echo a one-time
-  nonce, half of it given after the code, so a reply that never read to the
-  end of the code cannot pass as a review. The
+  nonce given after the code, so a reply that never read to the end of the
+  code cannot pass as a review. The
   code can still try to talk the reviewer into a clean verdict, which is one
   reason the local rules always run too and a clear result is not a
   guarantee.
@@ -617,9 +617,9 @@ review it in full every time.
   [How the review scales](#how-the-review-scales)), to the OpenCode CLI **on
   stdin** (never in argv, which is size-limited and visible to other users)
   with every OpenCode tool and permission denied. The reply must echo a
-  random per-run nonce that only exists in that input, its first half given
-  before the source and its second half after it, so a reply that never saw
-  the source, or stopped reading part-way, is rejected. The nonce shows the
+  random per-run nonce that only exists in that input and is given after
+  the source, so a reply that never saw the source, or stopped reading
+  part-way, is rejected. The nonce shows the
   reply came from a model that was given this request; it cannot show how
   carefully the source was read. Files that look sensitive by path (`.env*`, SSH
   and cloud credentials, key files, names containing `secret`, `credential` or
