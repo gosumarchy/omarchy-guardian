@@ -183,7 +183,12 @@ fn started(line: &str) -> Vec<String> {
             .to_string()
     };
     let mut found = Vec::new();
-    let statements = line.replace("&&", ";").replace("||", ";");
+    // `>&` and `&>` are redirections, not the end of a statement.
+    let statements = line
+        .replace("&&", ";")
+        .replace("||", ";")
+        .replace(">&", "> ")
+        .replace("&>", " >");
     for statement in statements.split([';', '|', '&']) {
         // Past what comes before a command: keywords, wrappers that run
         // it, assignments, a `case` pattern.
@@ -210,7 +215,9 @@ fn started(line: &str) -> Vec<String> {
                     | "{"
                     | "("
             ) || (word.contains('=') && !is_path(word))
-                || word.ends_with(')'))
+                || word.ends_with(')')
+                || word.starts_with(['>', '<'])
+                || word.starts_with('-'))
         });
         if let Some(word) = first.map(|word| clean(&word)).filter(|word| is_path(word))
             && !found.contains(&word)
@@ -766,7 +773,7 @@ mod tests {
             commands(
                 Category::Shell,
                 "home/u/.bashrc",
-                "export X=1\n~/bin/agent --daemon &\nexec /opt/x/run\neval \"$($HOME/bin/tool init)\"\nls -l\n[ -r ~/.x ] && . ~/.x\ncd /tmp && FOO=1 ~/bin/second\ntrue & A=\"b c\" nice ~/bin/third\nif ! ~/bin/fourth; then :; fi\n",
+                "export X=1\n~/bin/agent --daemon &\nexec /opt/x/run\neval \"$($HOME/bin/tool init)\"\nls -l\n[ -r ~/.x ] && . ~/.x\ncd /tmp && FOO=1 ~/bin/second\ntrue & A=\"b c\" nice ~/bin/third\nif ! ~/bin/fourth; then :; fi\nls >& /dev/null\nls &>/tmp/log\n",
             ),
             [
                 "~/bin/agent",

@@ -190,14 +190,15 @@ fn forget(label: Option<&str>) -> Result<String, String> {
 fn merge_root_part(collection: &mut Collection, mut part: root::RootPart, notes: &mut Vec<String>) {
     let seen_by_root = std::mem::take(&mut part.notes);
     root::merge(collection, part);
+    // Root saw every process; the user's notes that leave some to the
+    // root checks no longer apply. What root itself could not see, it
+    // says in its own words, and that is kept.
+    notes.retain(|note| !note.contains("the root checks cover them"));
     for note in seen_by_root {
         if !notes.contains(&note) {
             notes.push(note);
         }
     }
-    // Root saw every process; a note that leaves some to the root checks
-    // no longer applies, whichever side wrote it.
-    notes.retain(|note| !note.contains("the root checks cover them"));
 }
 
 /// Adds what root found: now through sudo (`--root`), or from the daily
@@ -583,14 +584,17 @@ mod tests {
             notes: vec![
                 "the kernel is tainted".into(),
                 "1 module(s) no package installed".into(),
-                // Root's own note of the same kind does not come through.
-                covered.into(),
+                "2 listening socket(s) have no process that can be found".into(),
             ],
         };
         super::merge_root_part(&mut super::Collection::default(), part, &mut notes);
         assert_eq!(
             notes,
-            ["the kernel is tainted", "1 module(s) no package installed"]
+            [
+                "the kernel is tainted",
+                "1 module(s) no package installed",
+                "2 listening socket(s) have no process that can be found"
+            ]
         );
     }
 
