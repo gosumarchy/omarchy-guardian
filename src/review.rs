@@ -985,7 +985,8 @@ mod tests {
         let dir = TempDir::new("memory-upgrade");
         let bin = TempDir::new("memory-upgrade-bin");
         let state = TempDir::new("memory-upgrade-state");
-        let library: String = (1..=40)
+        // Large enough that a change to it is sent as a diff.
+        let library: String = (1..=4000)
             .map(|line| format!("int value_{line} = {line};\n"))
             .collect();
         fs::write(dir.path().join("PKGBUILD"), "pkgname=demo\n").unwrap();

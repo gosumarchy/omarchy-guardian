@@ -309,18 +309,6 @@ fn claude_verdict(
         })
     };
     let events = Json::parse_stream(output).unwrap_or_default();
-    let Some(result) = events
-        .iter()
-        .rev()
-        .find(|event| event.get("type").and_then(Json::as_str) == Some("result"))
-    else {
-        return Err(match failure {
-            Some(detail) => unavailable(detail),
-            None => {
-                AgentError::Invalid(Error::parse("the Claude Code result", "not a JSON result"))
-            }
-        });
-    };
     let tool_use = events.iter().any(|event| {
         event.get("type").and_then(Json::as_str) == Some("assistant")
             && event
@@ -336,6 +324,32 @@ fn claude_verdict(
                     })
                 })
     });
+    let delivered = events
+        .iter()
+        .any(|event| event.get("type").and_then(Json::as_str) == Some("assistant"));
+    let Some(result) = events
+        .iter()
+        .rev()
+        .find(|event| event.get("type").and_then(Json::as_str) == Some("result"))
+    else {
+        // A run that ended without a result after the model used a tool, or
+        // after it had started to answer, is not an absent reviewer: content
+        // crafted to break the run must not turn a review into a warning.
+        if tool_use {
+            return Err(AgentError::Invalid(Error::Refused(
+                "the Claude Code CLI attempted to use a tool during source review".into(),
+            )));
+        }
+        return Err(match failure {
+            Some(detail) if delivered => AgentError::Invalid(Error::Refused(format!(
+                "the AI saw the source and the review then failed ({detail}); retry"
+            ))),
+            Some(detail) => unavailable(detail),
+            None => {
+                AgentError::Invalid(Error::parse("the Claude Code result", "not a JSON result"))
+            }
+        });
+    };
     let denials = result
         .get("permission_denials")
         .and_then(Json::as_array)
@@ -358,9 +372,7 @@ fn claude_verdict(
         // A model that saw the source and then declined or failed is not an
         // absent reviewer: content crafted to trigger a refusal must not
         // turn a review into a warning.
-        let delivered = events
-            .iter()
-            .any(|event| event.get("type").and_then(Json::as_str) == Some("assistant"))
+        let delivered = delivered
             || result
                 .get("usage")
                 .and_then(|usage| usage.get("output_tokens"))
@@ -753,6 +765,19 @@ mod tests {
         assert!(matches!(
             claude_verdict("", Some("exited with 1".into()), "n1"),
             Err(AgentError::Unavailable(_))
+        ));
+        // A run cut short after the model used a tool, or after it began
+        // to answer, is no absent reviewer.
+        let tool =
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#;
+        assert!(matches!(
+            claude_verdict(tool, Some("timed out".into()), "n1"),
+            Err(AgentError::Invalid(_))
+        ));
+        let began = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"{"}]}}"#;
+        assert!(matches!(
+            claude_verdict(began, Some("timed out".into()), "n1"),
+            Err(AgentError::Invalid(_))
         ));
         // The nonce must be echoed.
         assert!(matches!(

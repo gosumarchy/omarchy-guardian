@@ -107,12 +107,23 @@ impl PartialConfig {
     }
 }
 
-/// A model is spelled `provider/model`, both parts non-empty, without
-/// whitespace.
+/// A model is spelled `provider/model`, both parts non-empty, of
+/// characters model names are made of. It becomes an argument of the
+/// reviewer's command, so it may not look like an option.
 pub fn is_model_name(text: &str) -> bool {
     text.split_once('/')
         .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty())
-        && !text.contains(char::is_whitespace)
+        && is_plain_argument(text)
+}
+
+/// Whether `text` is safe as one argument of the reviewer's command: no
+/// leading `-`, and only letters, digits and `._:/@-[]+=~`.
+pub fn is_plain_argument(text: &str) -> bool {
+    !text.is_empty()
+        && !text.starts_with('-')
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._:/@-[]+=~".contains(c))
 }
 
 pub fn parse(file: &Path, text: &str) -> Result<PartialConfig, ConfigError> {
@@ -200,7 +211,13 @@ fn apply(
             let level = Thinking::parse(level)
                 .filter(|level| *level != Thinking::Default)
                 .ok_or_else(|| field.error("variants map minimal, low, medium, high or max"))?;
-            config.agent.variants.push((level, field.text(value)?));
+            let variant = field.text(value)?;
+            if !is_plain_argument(&variant) {
+                return Err(field.error(
+                    "a variant name is letters, digits and ._:/@-[]+=~ and does not start with -",
+                ));
+            }
+            config.agent.variants.push((level, variant));
         }
         ["class", name, knob] => {
             let class = SourceClass::parse(name).ok_or_else(|| {
@@ -437,6 +454,20 @@ diff = "off"
             }
         );
         assert_eq!(config.class(SourceClass::Theme), PartialPolicy::default());
+    }
+
+    #[test]
+    fn names_that_become_arguments_cannot_look_like_options() {
+        use super::{is_model_name, is_plain_argument};
+        assert!(is_model_name("claude-code/claude-sonnet-5-5"));
+        assert!(is_model_name("openrouter/anthropic/claude:beta@1"));
+        assert!(is_model_name("claude-code/claude-sonnet-4-5[1m]"));
+        for bad in ["claude-code/--x y", "-p/x", "a/b;c", "a/", "/b", "a/b\n"] {
+            assert!(!is_model_name(bad), "{bad:?}");
+        }
+        assert!(is_plain_argument("high"));
+        assert!(!is_plain_argument("--dangerously"));
+        assert!(parse(Path::new("c.toml"), "[agent.variants]\nhigh = \"--x\"\n").is_err());
     }
 
     #[test]

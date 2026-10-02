@@ -61,7 +61,7 @@ pub fn mock_opencode(dir: &Path, status: &str, echo_nonce: bool) -> PathBuf {
 pub fn mock_opencode_then(dir: &Path, status: &str, echo_nonce: bool, after: &str) -> PathBuf {
     let binary = dir.join("opencode");
     let nonce = if echo_nonce {
-        r#"$(printf '%s\n' "$input" | sed -n 's/^Nonce: //p')"#
+        r#"$(printf '%s\n' "$input" | sed -n 's/^Nonce: //p' | tr -d '\n')"#
     } else {
         "wrong"
     };
@@ -122,7 +122,7 @@ if [ "$count" -gt {good_calls} ]; then
 {then}
 exit 0
 fi
-nonce=$(printf '%s\n' "$input" | sed -n 's/^Nonce: //p')
+nonce=$(printf '%s\n' "$input" | sed -n 's/^Nonce: //p' | tr -d '\n')
 reply="{{\"nonce\":\"$nonce\",\"status\":\"clear\",\"summary\":\"mock\",\"findings\":[]}}"
 escaped=$(printf '%s' "$reply" | sed 's/"/\\"/g')
 printf '{{"type":"text","part":{{"type":"text","text":"%s"}}}}\n' "$escaped"

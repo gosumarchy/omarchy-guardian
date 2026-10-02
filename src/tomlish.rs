@@ -354,9 +354,15 @@ impl Reader<'_> {
         }
     }
 
+    /// A comment ends at the end of its line, and at any control character
+    /// but a tab: a carriage return would let a terminal show what follows
+    /// as a line of its own while it was read as part of the comment.
     fn skip_comment(&mut self) {
         if self.peek() == Some(b'#') {
-            while !matches!(self.peek(), None | Some(b'\n')) {
+            while self
+                .peek()
+                .is_some_and(|byte| byte == b'\t' || !byte.is_ascii_control())
+            {
                 self.position += 1;
             }
         }
@@ -574,6 +580,16 @@ multi "line" ]
         assert!(is_empty_container("{ }"));
         assert!(!is_empty_container(r#"["requests"]"#));
         assert!(!is_empty_container("\"[]\""));
+    }
+
+    #[test]
+    fn a_comment_ends_at_a_control_character() {
+        // Shown by a terminal as a line of its own, and read as one.
+        let found = entries("#\rprofile = \"strict\"\n").unwrap();
+        assert_eq!(found.len(), 1);
+        // Anything else that moves the cursor is refused.
+        assert!(entries("# note\u{1b}[2K\nkey = 1\n").is_err());
+        assert!(entries("# a\ttab is fine\nkey = 1\n").is_ok());
     }
 
     #[test]

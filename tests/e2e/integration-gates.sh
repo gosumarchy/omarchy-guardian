@@ -485,8 +485,9 @@ engine_gate() {
     sed -i 's/return 30;/return 31;/' "$dir/helpers.c"
     run_shim "$dir" --noconfirm >"$output" 2>&1
     expect 'an upgraded build is clear' 0 "$?"
-    expect_output 'an upgraded build is reviewed as a diff' '1 file(s) sent as diffs' "$output"
-    expect_mock_run 'makepkg ran after the diff review' 'makepkg --noconfirm --holdver'
+    # A small changed file goes whole, beside the unchanged one.
+    expect_output 'an upgraded build is reviewed as an upgrade' 'upgrade of the approved version: 0 file(s) sent as diffs, 1 unchanged' "$output"
+    expect_mock_run 'makepkg ran after the upgrade review' 'makepkg --noconfirm --holdver'
 
     write_user_config $'[agent]\nmax_input_kib = 16\nmax_chunks = 1\n'
     rm -rf -- "$E2E/engine-large"

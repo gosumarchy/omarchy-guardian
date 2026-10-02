@@ -409,7 +409,7 @@ fn aur_facts(base: Option<&str>, directory_name: &str, recipe: &str) -> Vec<Stri
     let mut facts = Vec::new();
     let Some(base) = base else {
         let fact = format!(
-            "{directory_name} is not a clone of an AUR package (a local or private PKGBUILD); no AUR facts apply."
+            "The build directory {directory_name:?} is not a clone of an AUR package (a local or private PKGBUILD); no AUR facts apply."
         );
         outln!("{fact}");
         facts.push(fact);
