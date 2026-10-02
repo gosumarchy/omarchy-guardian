@@ -442,13 +442,20 @@ impl Walker<'_> {
     /// A `.git` directory: its `config` (checked for keys that run commands,
     /// never sent to the AI) and its hooks other than git's `.sample` files
     /// are reviewed, and a submodule's git directory the same way. The
-    /// objects and index are not read. A `.git` file (a worktree or
-    /// submodule pointer) is left out.
+    /// objects and index are not read. A `.git` file or link (a worktree
+    /// or submodule pointer), a linked `config` and linked hooks or
+    /// submodules are gaps: git reads them and the walk cannot.
     fn git_directory(&mut self, access: &Path, logical: &Path, rel: &str) {
         let Ok(metadata) = fs::symlink_metadata(access) else {
             return;
         };
         if !metadata.is_dir() {
+            // A `.git` that is a file or a link points git at a directory
+            // of its own choosing, whose configuration and hooks are then
+            // not the ones read here.
+            self.gaps.push(Gap::Symlink(format!(
+                "{rel} (a git directory given as a file or a link)"
+            )));
             return;
         }
         let directory = match open_verified(access, &metadata) {
@@ -456,18 +463,31 @@ impl Walker<'_> {
             Err(error) => return self.io_gap(logical, error),
         };
         let handle = fd_path(&directory);
-        if fs::symlink_metadata(handle.join("config")).is_ok() {
-            self.entry(
-                &handle.join("config"),
-                &logical.join("config"),
-                format!("{rel}/config"),
-            );
+        for config in ["config", "config.worktree"] {
+            match fs::symlink_metadata(handle.join(config)) {
+                // Git reads through a link here; the walk would only
+                // record where it points.
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    self.gaps.push(Gap::Symlink(format!("{rel}/{config}")));
+                }
+                Ok(_) => self.entry(
+                    &handle.join(config),
+                    &logical.join(config),
+                    format!("{rel}/{config}"),
+                ),
+                Err(_) => {}
+            }
         }
         for (name, hooks) in [("hooks", true), ("modules", false)] {
             let Ok(metadata) = fs::symlink_metadata(handle.join(name)) else {
                 continue;
             };
             if !metadata.is_dir() {
+                // Hooks or submodules behind a link are read by git and
+                // not by the walk.
+                if metadata.file_type().is_symlink() {
+                    self.gaps.push(Gap::Symlink(format!("{rel}/{name}")));
+                }
                 continue;
             }
             let child = match open_verified(&handle.join(name), &metadata) {
@@ -784,6 +804,23 @@ mod tests {
         );
         fs::write(dir.path().join(".git/config"), "[core]\n\tfsmonitor = x\n").unwrap();
         assert!(verify_unchanged(&config, &snapshot).is_err());
+
+        // What git would read and the walk cannot is said, not passed over:
+        // hooks behind a link, a linked config, a git directory given as a
+        // file.
+        fs::remove_dir_all(dir.path().join(".git/hooks")).unwrap();
+        symlink("../elsewhere", dir.path().join(".git/hooks")).unwrap();
+        fs::write(dir.path().join(".git/config.worktree"), "[core]\n").unwrap();
+        let (texts, _, gaps) = walk_texts(&config);
+        assert!(
+            texts.contains(&".git/config.worktree".to_string()),
+            "{texts:?}"
+        );
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        fs::create_dir_all(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/.git"), "gitdir: ../.git/modules/lib\n").unwrap();
+        let (_, _, gaps) = walk_texts(&config);
+        assert_eq!(gaps.len(), 2, "{gaps:?}");
     }
 
     #[test]

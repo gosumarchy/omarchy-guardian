@@ -178,12 +178,13 @@ update_plugins() {
     (( ${#ids[@]} > 0 )) || { echo "No git-managed plugins installed."; return 0; }
 
     STAGE_ROOT=$(mktemp -d "$PLUGINS_DIR/.guardian-update.XXXXXX") || fail "could not create staging directory"
-    local id dir remote url staged
+    local id dir remote url staged status
     local -a changed=() unit_args=()
     for id in "${ids[@]}"; do
         dir="$PLUGINS_DIR/$id"
-        [[ -z $(safe_git -C "$dir" status --porcelain --untracked-files=all) ]] ||
-            fail "plugin $id has local changes; commit or stash them before updating"
+        status=$(safe_git -C "$dir" status --porcelain --ignored --untracked-files=all) ||
+            fail "could not inspect installed plugin $id"
+        [[ -z $status ]] || fail "plugin $id has local changes or untracked or ignored files; commit, stash or remove them before updating"
         remote=$(safe_git -C "$dir" remote get-url origin) || fail "plugin $id has no origin remote"
         "$OMARCHY_BIN_DIR/omarchy-git-url-check" "$remote" || fail "Omarchy rejected the remote of $id"
 

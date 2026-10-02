@@ -34,13 +34,24 @@ const EXECUTING_KEYS: &[&str] = &[
     "uploadpack.packobjectshook",
     "protocol.ext.allow",
     "pager.*",
+    "core.alternaterefscommand",
+    "submodule.*.update",
+    "remote.*.uploadpack",
+    "remote.*.receivepack",
+    "remote.*.vcs",
+    "difftool.*.cmd",
+    "mergetool.*.cmd",
+    "trailer.*.command",
+    "trailer.*.cmd",
+    "gpg.*.defaultkeycommand",
 ];
 
 /// Whether `rel` is a git config file the walk reviews: a `.git/config`, or a
 /// submodule's under `.git/modules/`.
 pub fn is_git_config(rel: &str) -> bool {
     let mut components = rel.split('/').rev();
-    components.next() == Some("config") && rel.split('/').any(|component| component == ".git")
+    matches!(components.next(), Some("config" | "config.worktree"))
+        && rel.split('/').any(|component| component == ".git")
 }
 
 /// The lines of `text` that set a key running a command, as (line number,
@@ -48,40 +59,85 @@ pub fn is_git_config(rel: &str) -> bool {
 pub fn executing_keys(text: &str) -> Vec<(usize, String)> {
     let mut section = String::new();
     let mut subsection: Option<String> = None;
-    let mut hits = Vec::new();
-    for (index, raw) in text.lines().enumerate() {
-        let line = raw.trim();
-        if let Some(header) = line.strip_prefix('[') {
-            let header = header.split(']').next().unwrap_or_default().trim();
-            if let Some((name, sub)) = header.split_once(char::is_whitespace) {
-                section = name.to_lowercase();
-                subsection = Some(sub.trim().trim_matches('"').to_string());
-            } else if let Some((name, sub)) = header.split_once('.') {
-                section = name.to_lowercase();
-                subsection = Some(sub.to_string());
-            } else {
-                section = header.to_lowercase();
-                subsection = None;
+    let mut hits: Vec<(usize, String)> = Vec::new();
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let lines: Vec<&str> = text.lines().collect();
+    for (index, raw) in lines.iter().enumerate() {
+        // Where git continues a line onto the next depends on quotes,
+        // comments and how many backslashes end it. Rather than repeat
+        // those rules, a line ending in a backslash is read both ways, on
+        // its own and joined with what follows: a key that runs a command
+        // in either reading is reported.
+        let mut readings = vec![(*raw).to_string()];
+        if raw.ends_with('\\') {
+            let mut joined = (*raw).to_string();
+            let mut next = index + 1;
+            while joined.ends_with('\\') {
+                joined.pop();
+                match lines.get(next) {
+                    Some(line) => joined.push_str(line),
+                    None => break,
+                }
+                next += 1;
             }
-            continue;
+            readings.push(joined);
         }
-        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-            continue;
+        for reading in readings {
+            let mut line = reading.trim();
+            if let Some(header) = line.strip_prefix('[') {
+                let (header, rest) = split_header(header);
+                let header = header.trim();
+                if let Some((name, sub)) = header.split_once(char::is_whitespace) {
+                    section = name.to_lowercase();
+                    subsection = Some(sub.trim().trim_matches('"').to_string());
+                } else if let Some((name, sub)) = header.split_once('.') {
+                    section = name.to_lowercase();
+                    subsection = Some(sub.to_string());
+                } else {
+                    section = header.to_lowercase();
+                    subsection = None;
+                }
+                // A key may follow its section on the same line.
+                line = rest.trim();
+            }
+            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+                continue;
+            }
+            let (key, value) = line
+                .split_once('=')
+                .map_or((line, "true"), |(key, value)| (key.trim(), value.trim()));
+            let key = key.to_lowercase();
+            if !runs_command(&section, subsection.is_some(), &key, value) {
+                continue;
+            }
+            let full = subsection.as_ref().map_or_else(
+                || format!("{section}.{key}"),
+                |sub| format!("{section}.{sub}.{key}"),
+            );
+            let hit = (index + 1, format!("{full} = {}", mask_credentials(value)));
+            if !hits.contains(&hit) {
+                hits.push(hit);
+            }
         }
-        let (key, value) = line
-            .split_once('=')
-            .map_or((line, "true"), |(key, value)| (key.trim(), value.trim()));
-        let key = key.to_lowercase();
-        if !runs_command(&section, subsection.is_some(), &key, value) {
-            continue;
-        }
-        let full = subsection.as_ref().map_or_else(
-            || format!("{section}.{key}"),
-            |sub| format!("{section}.{sub}.{key}"),
-        );
-        hits.push((index + 1, format!("{full} = {}", mask_credentials(value))));
     }
     hits
+}
+
+/// A section header (without its `[`) and what follows its closing `]`,
+/// which a quoted subsection may itself contain (`[remote "a]b"]`).
+fn split_header(header: &str) -> (&str, &str) {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in header.char_indices() {
+        match character {
+            _ if escaped => escaped = false,
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ']' if !quoted => return (&header[..index], &header[index + 1..]),
+            _ => {}
+        }
+    }
+    (header, "")
 }
 
 fn runs_command(section: &str, has_subsection: bool, key: &str, value: &str) -> bool {
@@ -91,6 +147,11 @@ fn runs_command(section: &str, has_subsection: bool, key: &str, value: &str) -> 
         return false;
     }
     if section == "alias" {
+        return value.starts_with('!');
+    }
+    // `submodule.<name>.update` is a mode (`checkout`, `rebase`, `none`),
+    // or a command behind `!`.
+    if section == "submodule" && key == "update" {
         return value.starts_with('!');
     }
     // `core.fsmonitor = true/false` switches the built-in daemon.
@@ -122,12 +183,15 @@ fn runs_command(section: &str, has_subsection: bool, key: &str, value: &str) -> 
     })
 }
 
-/// A relative path that stays inside the working tree.
+/// A relative path that stays inside the working tree, and outside the
+/// git directory, whose files the walk reads only in part.
 fn is_in_tree(path: &str) -> bool {
     !path.is_empty()
         && !path.starts_with(['/', '~'])
         && !path.contains('$')
-        && path.split('/').all(|component| component != "..")
+        && path
+            .split('/')
+            .all(|component| component != ".." && component != ".git")
 }
 
 /// `scheme://user:secret@host` becomes `scheme://***@host`.
@@ -177,6 +241,58 @@ mod tests {
             keys("[core]\n\thooksPath = ../../x\n"),
             ["core.hookspath = ../../x"]
         );
+    }
+
+    #[test]
+    fn the_config_is_read_the_way_git_reads_it() {
+        let keys = |text: &str| -> Vec<String> {
+            executing_keys(text)
+                .into_iter()
+                .map(|(line, excerpt)| format!("{line}:{excerpt}"))
+                .collect()
+        };
+        // A key on its section's line, a byte-order mark, a continued line.
+        assert_eq!(
+            keys("[core] fsmonitor = sh x\n"),
+            ["1:core.fsmonitor = sh x"]
+        );
+        assert_eq!(
+            keys("\u{feff}[core]\n\tfsmonitor = sh x\n"),
+            ["2:core.fsmonitor = sh x"]
+        );
+        assert_eq!(
+            keys("[core]\n\tfsmoni\\\ntor = sh x\n\tbare = false\n"),
+            ["2:core.fsmonitor = sh x"]
+        );
+        // A value ending in an escaped backslash, or in a comment that
+        // ends in one, does not swallow the next line either; and a `]`
+        // inside a quoted subsection does not end the header.
+        assert_eq!(
+            keys("[core]\n\tbare = x\\\\\n\tfsmonitor = sh x\n"),
+            ["3:core.fsmonitor = sh x"]
+        );
+        assert_eq!(
+            keys("[core]\n\tbare = x # c \\\n\tfsmonitor = sh x\n"),
+            ["3:core.fsmonitor = sh x"]
+        );
+        assert_eq!(
+            keys("[remote \"a]b\"] uploadpack = sh x\n"),
+            ["1:remote.a]b.uploadpack = sh x"]
+        );
+        // A comment ending in a backslash does not swallow the next line.
+        assert_eq!(
+            keys("[core]\n# note \\\n\tfsmonitor = sh x\n"),
+            ["3:core.fsmonitor = sh x"]
+        );
+        assert!(keys("[submodule \"a\"]\n\tupdate = rebase\n").is_empty());
+        // Hooks kept inside the git directory are not files the walk reads.
+        assert_eq!(
+            keys("[core]\n\thooksPath = .git/x\n\thooksPath = .husky/_\n"),
+            ["2:core.hookspath = .git/x"]
+        );
+        // More keys that name a command.
+        let text = "[submodule \"a\"]\n\tupdate = !sh x\n[remote \"origin\"]\n\tuploadpack = sh x\n\turl = https://x.example/r\n[difftool \"d\"]\n\tcmd = sh x\n[gpg \"ssh\"]\n\tdefaultKeyCommand = sh x\n";
+        assert_eq!(keys(text).len(), 4, "{:?}", keys(text));
     }
 
     #[test]
