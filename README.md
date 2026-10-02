@@ -25,7 +25,8 @@ plugins, and reviews that code **before any of it runs**:
   execute, privilege escalation, persistence, credential access and
   exfiltration, encoded commands, destructive operations). An AI reviewer
   then reads the code with every tool switched off and must echo a one-time
-  nonce, so a reply that never saw the code cannot pass as a review. The
+  nonce, half of it given after the code, so a reply that never read to the
+  end of the code cannot pass as a review. The
   code can still try to talk the reviewer into a clean verdict, which is one
   reason the local rules always run too and a clear result is not a
   guarantee.
@@ -503,7 +504,11 @@ refused. Files are ranked by risk:
 3. Everything else, with documentation last.
 
 Each chunk is its own reviewer run with its own nonce, and every chunk carries
-the full file list, so the model knows what else exists. The first chunk runs
+the full file list, so the model knows what else exists. A file is charged
+what it takes in the request (a control character takes six bytes there). A
+file larger than a chunk is split on line boundaries, each piece repeating
+the end of the one before; a single line longer than a chunk is cut the same
+way, so nothing is hidden by sitting exactly on a cut. The first chunk runs
 alone; the rest run three at a time. A run that finds the AI unavailable (a
 provider error, not a timeout) is retried once after two seconds; if it still
 fails, chunks not yet started are not attempted. A source that needs
@@ -526,8 +531,11 @@ says the memory was not used and the review runs in full:
 - **Diff review of upgrades.** A review becomes the approved baseline of that
   source when every chunk was `clear`, there were no gaps, and the decision
   is `CLEAR`. The next review of the same source is then sent as follows:
-  changed files as unified diffs against the baseline, new files and entry
-  points whole, and unchanged files only as names in the file list. Local
+  changed files whole when they are small (up to 48 KiB: what a changed
+  line switches on may be anywhere in the file) and as unified diffs with
+  twenty lines of context against the baseline when they are larger, new
+  files and entry points whole, and unchanged files only as names in the
+  file list. Local
   rules and the dependency audit still read every file. A baseline only
   counts under the prompt version, model, variant and thinking level that
   approved it; after any of them changes, the next review is a full one.
@@ -607,8 +615,11 @@ review it in full every time.
   [How the review scales](#how-the-review-scales)), to the OpenCode CLI **on
   stdin** (never in argv, which is size-limited and visible to other users)
   with every OpenCode tool and permission denied. The reply must echo a
-  random per-run nonce that only exists in that input, so a reply that never
-  saw the source is rejected. Files that look sensitive by path (`.env*`, SSH
+  random per-run nonce that only exists in that input, its first half given
+  before the source and its second half after it, so a reply that never saw
+  the source, or stopped reading part-way, is rejected. The nonce shows the
+  reply came from a model that was given this request; it cannot show how
+  carefully the source was read. Files that look sensitive by path (`.env*`, SSH
   and cloud credentials, key files, names containing `secret`, `credential` or
   `token`) are withheld and make the review incomplete.
 - **Integrity:** a SHA-256 manifest of every scanned file. `guard` and

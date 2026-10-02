@@ -9,7 +9,12 @@ use crate::engine::diff;
 use crate::rules;
 
 /// Unchanged lines shown around each change in an upgrade diff.
-const DIFF_CONTEXT: usize = 3;
+const DIFF_CONTEXT: usize = 20;
+
+/// A changed file up to this size goes whole on an upgrade: a diff shows
+/// the lines around a change, and what a changed line switches on may sit
+/// anywhere in the file (a guard flipped far above a dormant body).
+const WHOLE_ON_UPGRADE: usize = 48 * 1024;
 
 /// Bytes charged for each manifest entry on top of its path.
 pub const MANIFEST_ENTRY_OVERHEAD: usize = 32;
@@ -52,15 +57,32 @@ impl Item {
 
     fn cost(&self) -> usize {
         match self {
-            Self::Whole { path, content } => path.len() + content.len(),
+            Self::Whole { path, content } => path.len() + weight(content),
             Self::Piece {
                 path,
                 content,
                 context,
                 ..
-            } => path.len() + content.len() + context.as_ref().map_or(0, |(_, text)| text.len()),
-            Self::Diff { path, diff } => path.len() + diff.len(),
+            } => {
+                path.len() + weight(content) + context.as_ref().map_or(0, |(_, text)| weight(text))
+            }
+            Self::Diff { path, diff } => path.len() + weight(diff),
         }
+    }
+}
+
+/// The bytes `text` takes in the request, where it is a JSON string: a
+/// control character is written as six, so a file of them is six times its
+/// size there.
+fn weight(text: &str) -> usize {
+    text.chars().map(char_weight).sum()
+}
+
+fn char_weight(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\n' | '\r' | '\t' => 2,
+        control if u32::from(control) < 0x20 => 6,
+        other => other.len_utf8(),
     }
 }
 
@@ -400,9 +422,15 @@ fn choose(
     if *old == file.content {
         return Choice::Unchanged;
     }
+    // Whole only where it is seen whole: split into pieces, it would be
+    // judged piece by piece, and a diff shows the change better.
+    if file.content.len() <= WHOLE_ON_UPGRADE && file.path.len() + weight(&file.content) <= capacity
+    {
+        return Choice::Whole;
+    }
     match diff::unified(old, &file.content, DIFF_CONTEXT) {
         Some(diff)
-            if diff.len() < file.content.len() && file.path.len() + diff.len() <= capacity =>
+            if diff.len() < file.content.len() && file.path.len() + weight(&diff) <= capacity =>
         {
             Choice::Diff(diff)
         }
@@ -463,31 +491,45 @@ fn split(item: Item, capacity: usize) -> Result<Vec<Item>, TooLarge> {
     let budget = room / 8;
     let mut pieces = Vec::new();
     let mut text = String::new();
+    let mut used = 0;
     let mut first_line = 1;
     let mut context: Option<(usize, String)> = None;
     let mut available = room;
     for (index, line) in lines.iter().enumerate() {
         let number = index + 1;
-        if !text.is_empty() && text.len() + line.len() > available {
+        let line_weight = weight(line);
+        if !text.is_empty() && used + line_weight > available {
             let done = mem::take(&mut text);
+            used = 0;
             let next = tail(&done, first_line, budget);
             pieces.push(piece(done, first_line, number - 1, context.take()));
             first_line = number;
             context = next;
-            available = room - context.as_ref().map_or(0, |(_, text)| text.len());
+            available = room - context.as_ref().map_or(0, |(_, text)| weight(text));
         }
-        if line.len() > available {
+        if line_weight > available {
             context = None;
             available = room;
         }
-        if line.len() > room {
-            for part in cut(line, room) {
-                pieces.push(piece(part.to_string(), number, number, None));
+        if line_weight > room {
+            // A line longer than a piece is cut; each part after the first
+            // repeats the end of the one before, so nothing is hidden by
+            // being split exactly at a cut.
+            let overlap = budget.max(MIN_PIECE);
+            let mut before: Option<&str> = None;
+            for part in cut(line, room - overlap) {
+                let context = before
+                    .map(|before| end(before, overlap))
+                    .filter(|text| !text.is_empty())
+                    .map(|text| (number, text.to_string()));
+                pieces.push(piece(part.to_string(), number, number, context));
+                before = Some(part);
             }
             first_line = number + 1;
             continue;
         }
         text.push_str(line);
+        used += line_weight;
     }
     if !text.is_empty() {
         pieces.push(piece(text, first_line, total_lines, context));
@@ -502,10 +544,10 @@ fn tail(text: &str, first_line: usize, budget: usize) -> Option<(usize, String)>
     let mut bytes = 0;
     let mut kept = 0;
     for line in lines.iter().rev().take(MAX_CONTEXT_LINES) {
-        if bytes + line.len() > budget {
+        if bytes + weight(line) > budget {
             break;
         }
-        bytes += line.len();
+        bytes += weight(line);
         kept += 1;
     }
     (kept > 0).then(|| {
@@ -516,22 +558,38 @@ fn tail(text: &str, first_line: usize, budget: usize) -> Option<(usize, String)>
     })
 }
 
-/// Cuts `line` into parts of at most `room` bytes at character boundaries.
-/// `room` is at least `MIN_PIECE`, so every part holds one character.
+/// The end of `text` within `budget` bytes of the request.
+fn end(text: &str, budget: usize) -> &str {
+    let mut used = 0;
+    let mut start = text.len();
+    for (index, character) in text.char_indices().rev() {
+        used += char_weight(character);
+        if used > budget {
+            break;
+        }
+        start = index;
+    }
+    &text[start..]
+}
+
+/// Cuts `line` into parts of at most `room` bytes of the request, at
+/// character boundaries. `room` is at least `MIN_PIECE`, so every part
+/// holds one character.
 fn cut(line: &str, room: usize) -> Vec<&str> {
     let mut parts = Vec::new();
-    let mut rest = line;
-    while rest.len() > room {
-        let mut end = room;
-        while !rest.is_char_boundary(end) {
-            end -= 1;
+    let mut start = 0;
+    let mut used = 0;
+    for (index, character) in line.char_indices() {
+        let size = char_weight(character);
+        if used + size > room && index > start {
+            parts.push(&line[start..index]);
+            start = index;
+            used = 0;
         }
-        let (head, tail) = rest.split_at(end);
-        parts.push(head);
-        rest = tail;
+        used += size;
     }
-    if !rest.is_empty() {
-        parts.push(rest);
+    if start < line.len() {
+        parts.push(&line[start..]);
     }
     parts
 }
@@ -632,7 +690,8 @@ mod tests {
 
     #[test]
     fn a_large_file_is_split_on_line_boundaries() {
-        let line = format!("{}\n", "x".repeat(99));
+        // A line takes 100 bytes of the request: its newline is two there.
+        let line = format!("{}\n", "x".repeat(98));
         let files = [file("big.c", &line.repeat(5))];
         // Overhead 5 + 32 = 37; capacity 205 leaves 200 bytes of text per piece.
         let plan = plan(&files, None, 37 + 205, 8).unwrap();
@@ -670,8 +729,9 @@ mod tests {
 
     #[test]
     fn a_piece_carries_the_tail_of_the_previous_piece() {
-        // Lines of 10 bytes; room 200 gives a 25-byte context budget.
-        let line = format!("{}\n", "z".repeat(9));
+        // Lines of 10 bytes in the request; room 200 gives a 25-byte
+        // context budget.
+        let line = format!("{}\n", "z".repeat(8));
         let files = [file("big.c", &line.repeat(40))];
         let plan = plan(&files, None, 37 + 205, 8).unwrap();
         let pieces: Vec<_> = plan
@@ -688,8 +748,8 @@ mod tests {
                 Item::Whole { .. } | Item::Diff { .. } => panic!("expected pieces, got {item:?}"),
             })
             .collect();
-        assert_eq!(pieces[0], (1, None, 200));
-        assert_eq!(pieces[1], (21, Some((19, line.repeat(2))), 180));
+        assert_eq!(pieces[0], (1, None, 180));
+        assert_eq!(pieces[1], (21, Some((19, line.repeat(2))), 162));
         assert!(plan.chunks.iter().flatten().all(|item| item.cost() <= 205));
     }
 
@@ -739,7 +799,30 @@ mod tests {
                 Item::Whole { .. } | Item::Diff { .. } => panic!("expected pieces, got {item:?}"),
             })
             .collect();
-        assert_eq!(sizes, [(200, 1), (200, 1), (50, 1)]);
+        // Each part after the first repeats the last 25 bytes of the one
+        // before: what straddles a cut is seen whole in one of them.
+        assert_eq!(sizes, [(175, 1), (175, 1), (100, 1)]);
+        let contexts: Vec<Option<usize>> = plan
+            .chunks
+            .iter()
+            .flatten()
+            .map(|item| match item {
+                Item::Piece { context, .. } => context.as_ref().map(|(_, text)| text.len()),
+                Item::Whole { .. } | Item::Diff { .. } => None,
+            })
+            .collect();
+        assert_eq!(contexts, [None, Some(25), Some(25)]);
+        assert!(plan.chunks.iter().flatten().all(|item| item.cost() <= 206));
+    }
+
+    #[test]
+    fn a_file_is_budgeted_by_what_it_takes_in_the_request() {
+        // Control characters are written as six bytes each.
+        let files = [file("blob.js", &"\u{1}".repeat(100))];
+        let plan = plan(&files, None, 39 + 207, 16).unwrap();
+        assert!(plan.chunks.len() >= 3, "{}", plan.chunks.len());
+        assert!(plan.chunks.iter().flatten().all(|item| item.cost() <= 207));
+        assert_eq!(super::weight("a\"\n\u{1}é"), 1 + 2 + 2 + 6 + 2);
     }
 
     #[test]
@@ -755,7 +838,8 @@ mod tests {
     fn upgrades_send_diffs_and_list_unchanged_and_removed_files() {
         use std::fmt::Write as _;
 
-        let library = (1..=20).fold(String::new(), |mut acc, line| {
+        // Past the size a changed file still goes whole at.
+        let library = (1..=4000).fold(String::new(), |mut acc, line| {
             let _ = writeln!(acc, "int v{line} = {line};");
             acc
         });
@@ -763,6 +847,7 @@ mod tests {
             ("PKGBUILD".to_string(), "pkgver=1\n".to_string()),
             ("src/a.c".to_string(), "same\n".to_string()),
             ("src/b.c".to_string(), library.clone()),
+            ("src/small.c".to_string(), "if (0) run();\n".to_string()),
             ("gone.c".to_string(), "old\n".to_string()),
         ]
         .into_iter()
@@ -771,10 +856,11 @@ mod tests {
             file("PKGBUILD", "pkgver=2\n"),
             file("src/a.c", "same\n"),
             file("src/b.c", &library.replace("v10 = 10", "v10 = 11")),
+            file("src/small.c", "if (1) run();\n"),
             file("new.c", "fresh\n"),
         ];
 
-        let plan = plan(&files, Some(&previous), 64 * 1024, 8).unwrap();
+        let plan = plan(&files, Some(&previous), 256 * 1024, 8).unwrap();
 
         assert!(plan.upgrade);
         let manifest: Vec<(&str, Sent)> = plan
@@ -789,13 +875,24 @@ mod tests {
                 ("new.c", Sent::Whole),
                 ("src/a.c", Sent::Unchanged),
                 ("src/b.c", Sent::Diff),
+                // A small changed file goes whole: what the change
+                // switches on may be anywhere in it.
+                ("src/small.c", Sent::Whole),
                 ("gone.c", Sent::Removed),
             ]
         );
-        assert_eq!(paths(&plan.chunks[0]), ["PKGBUILD", "new.c", "src/b.c"]);
-        assert!(
-            matches!(&plan.chunks[0][2], Item::Diff { diff, .. } if diff.contains("-int v10 = 10;\n+int v10 = 11;\n"))
-        );
+        let diff = plan
+            .chunks
+            .iter()
+            .flatten()
+            .find_map(|item| match item {
+                Item::Diff { path, diff } if path == "src/b.c" => Some(diff),
+                _ => None,
+            })
+            .unwrap();
+        assert!(diff.contains("-int v10 = 10;\n+int v10 = 11;\n"));
+        // Twenty lines either side of the change.
+        assert!(diff.contains("int v30 = 30;") && !diff.contains("int v31 = 31;"));
     }
 
     #[test]
