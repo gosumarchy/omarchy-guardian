@@ -349,6 +349,13 @@ fn local_archives(operands: &[String], cwd: &Path) -> Result<Archives, Error> {
     let mut archives: Archives = HashMap::new();
 
     for argument in operands {
+        // pacman reads `-` as "archives named on standard input".
+        if argument == "-" {
+            return Err(Error::Refused(
+                "package archives named on standard input are not supported; name them as arguments"
+                    .into(),
+            ));
+        }
         if argument.contains("://") {
             return Err(Error::Refused(format!(
                 "remote package URLs are not supported: {argument}"
@@ -387,6 +394,86 @@ fn local_archives(operands: &[String], cwd: &Path) -> Result<Archives, Error> {
         ));
     }
     Ok(archives)
+}
+
+/// A finding for each right a package hands out without a scriptlet
+/// (see `payload::Review::root_set_id`), unless the installed file already
+/// has it.
+fn grant_findings(
+    archive: &payload::Archive,
+    grants: Vec<(String, &'static str)>,
+    target: &str,
+    archive_name: &str,
+    class: SourceClass,
+    report: &mut Report,
+) {
+    for (path, what) in grants {
+        // Already installed that way: nothing new is being granted.
+        let installed = fs::symlink_metadata(Path::new("/").join(&path))
+            .is_ok_and(|metadata| payload::already_granted(what, &metadata))
+            || (what == payload::WITH_CAPABILITIES
+                && archive
+                    .shipped_capability(&path)
+                    .is_some_and(|shipped| has_capabilities(&path, shipped)));
+        if installed {
+            continue;
+        }
+        let rel = format!("{target}/{archive_name}/{path}");
+        report.file_classes.insert(rel.clone(), class);
+        report.findings.push(LocalFinding {
+            path: rel,
+            line: 1,
+            rule: RuleId::PrivilegeEscalation,
+            excerpt: format!(
+                "/{path} is installed {what}: {}",
+                match what {
+                    payload::WITH_CAPABILITIES => "it has root-like rights for whoever starts it",
+                    payload::WITH_ACL => "it grants rights its mode does not show",
+                    payload::WRITABLE_BY_ALL
+                    | payload::OWNED_BY_OTHER
+                    | payload::WRITABLE_BY_GROUP =>
+                        "someone other than root can replace what it holds",
+                    payload::SETUID_OTHER | payload::SETGID_OTHER =>
+                        "it runs with that user's or group's rights for whoever starts it",
+                    _ => "it runs as root for whoever starts it",
+                }
+            ),
+        });
+    }
+}
+
+/// Whether the installed file at `path` (relative to `/`) already carries
+/// exactly the file capabilities `shipped` (the attribute's value as
+/// base64): a package that ships the same again grants nothing new. Any
+/// doubt, a missing tool included, counts as "no" and the finding is raised.
+fn has_capabilities(path: &str, shipped: &str) -> bool {
+    let installed = Path::new("/").join(path);
+    if !fs::symlink_metadata(&installed).is_ok_and(|metadata| metadata.is_file()) {
+        return false;
+    }
+    let args: [OsString; 6] = [
+        "-n".into(),
+        "security.capability".into(),
+        "-e".into(),
+        "base64".into(),
+        "--absolute-names".into(),
+        installed.into_os_string(),
+    ];
+    let Ok(captured) = tools::run(
+        Path::new("/usr/bin/getfattr"),
+        &args,
+        None,
+        C_LOCALE,
+        TOOL_LIMITS,
+    ) else {
+        return false;
+    };
+    let plain = |value: &str| value.trim().trim_end_matches('=').to_string();
+    captured.status.success()
+        && String::from_utf8_lossy(&captured.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("security.capability=0s"))
+            .is_some_and(|installed| !installed.is_empty() && plain(installed) == plain(shipped))
 }
 
 /// Transaction targets that no archive on the command line provides.
@@ -431,15 +518,32 @@ fn sync_archives(
         // The archive pacman installs is the one its database names, not
         // one that merely looks like the package's name and version.
         let mut found = Vec::new();
+        let mut unknown = None;
         for candidate in candidates {
             let key = (
                 candidate.repo.clone(),
                 target.clone(),
                 candidate.version.clone(),
             );
-            if let Some(path) = filenames.get(&key).and_then(|name| cache.get(name)) {
-                found.push(path.clone());
+            match filenames.get(&key) {
+                Some(name) => {
+                    if let Some(path) = cache.get(name) {
+                        found.push(path.clone());
+                    }
+                }
+                // Which file this repository would install is not known:
+                // another repository's archive must not stand in for it.
+                None => unknown = Some(candidate.repo.clone()),
             }
+        }
+        if let Some(repo) = unknown {
+            archives.insert(
+                target.clone(),
+                Err(format!(
+                    "pacman did not say which file the repository {repo:?} installs for it"
+                )),
+            );
+            continue;
         }
         for path in &found {
             let name = package_name(path)?;
@@ -862,34 +966,14 @@ fn scan_package(
             }
         }
     }
-    for (path, what) in reviewed.root_set_id {
-        // Already installed that way: nothing new is being granted.
-        let installed = fs::symlink_metadata(Path::new("/").join(&path)).is_ok_and(|metadata| {
-            let as_root = if what == payload::WRITABLE_BY_ALL {
-                metadata.mode() & 0o002 != 0
-            } else if what == "setuid root" {
-                metadata.mode() & 0o4000 != 0 && metadata.uid() == 0
-            } else {
-                metadata.mode() & 0o2000 != 0 && metadata.gid() == 0
-            };
-            metadata.is_file() && as_root
-        });
-        if installed {
-            continue;
-        }
-        let rel = format!("{target}/{archive_name}/{path}");
-        report.file_classes.insert(rel.clone(), class);
-        report.findings.push(LocalFinding {
-            path: rel,
-            line: 1,
-            rule: RuleId::PrivilegeEscalation,
-            excerpt: if what == payload::WRITABLE_BY_ALL {
-                format!("/{path} is installed {what}: any user can replace what it holds")
-            } else {
-                format!("/{path} is installed {what}: it runs as root for whoever starts it")
-            },
-        });
-    }
+    grant_findings(
+        &archive,
+        reviewed.root_set_id,
+        target,
+        archive_name,
+        class,
+        report,
+    );
     archive.verify_unchanged()?;
     Ok((scriptlet, summary))
 }

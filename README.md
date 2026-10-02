@@ -130,12 +130,12 @@ command, so its own blocks can be told apart from the command's failures.
 Objective-See's KnockKnock does on macOS: every auto-run location the pacman
 gate knows (systemd units and their enable links, drop-ins and generators,
 pacman hooks, udev, modprobe, PAM, sudo and polkit rules, shell start-up
-files, cron, autostart, D-Bus services, initcpio, the Limine config), a few
-more only the sweep reads (the pacman, makepkg, sshd, logrotate, systemd
-manager and login-screen configuration, the sessions the login screen
-offers, the kernel command line, DKMS build configuration, libraries in
-`glibc-hwcaps`, and Python's `.pth` and `sitecustomize` files, which every
-Python program runs at start) and, in your home, user services (in
+files, cron, autostart, D-Bus services, initcpio, the pacman, makepkg, sshd,
+logrotate, systemd manager and login-screen configuration, the sessions the
+login screen offers, the kernel command line, DKMS build configuration, and
+Python's `.pth` and `sitecustomize` files, which every Python program runs
+at start), a few more only the sweep reads (PAM modules, libraries in
+`glibc-hwcaps`, the Limine config) and, in your home, user services (in
 `~/.config` and `~/.local/share`), session D-Bus services, autostart
 entries, shell files and fish functions, what uwsm sources, the Waybar
 configuration, the Hyprland Lua configuration (and what `exec_on_start`
@@ -804,8 +804,21 @@ way, or is the sandbox helper of a Chromium-based program (by its name, with
 that program's runtime files beside it, outside the command directories;
 like every compiled program, its content is not reviewed): it blocks a
 package from a third-party repository or a local archive, and is a warning
-for an official one under the `standard` profile. So is a file under `/usr`,
-`/etc` or `/opt` installed writable by everyone.
+for an official one under the `standard` profile. The same goes for the
+other ways a package hands out rights without a scriptlet: a file with file
+capabilities or an access control list (read from the archive itself, since
+pacman restores them), a set-id file for another user or group, and a file
+or directory under `/usr`, `/etc` or `/opt` that everyone (a sticky
+directory aside), a user other than root, or a group other than root's may
+write. Each is passed over when the installed file is already that way: for
+file capabilities, when it has exactly the ones the package ships (access
+lists are not read back, so those are said every time).
+
+A package that installs a file under `/run`, `/tmp`, `/dev`, `/proc`, `/sys`,
+`/root` or `/home`, or lists one under `/bin`, `/sbin`, `/lib` or `/lib64`
+(links into `/usr` on this system), is refused: no package's files belong
+there, and a unit under `/run/systemd` or a key under `/root/.ssh` would act
+with nothing looking at it.
 
 What the gate does not see: a package's other files are installed as shipped
 and acted on by what is already on the system (a pacman hook, DKMS or a
@@ -838,8 +851,10 @@ Archives are located as follows:
 Guardian's own program, hook and scripts may only come from the
 `omarchy-guardian` package installed from a local archive (as `install.sh`
 does) or an official repository, never from a third-party repository that
-offers a package of that name. A local archive of that name is still taken
-at its word: build Guardian only from a source you trust.
+offers a package of that name. A package that declares it replaces,
+conflicts with or provides `omarchy-guardian` is refused, since pacman would
+remove Guardian for it. A local archive of that name is still taken at its
+word: build Guardian only from a source you trust.
 
 The AI review is told what is under review (the scriptlets and those payload
 files) and what routine packaging looks like: capabilities or setuid on the

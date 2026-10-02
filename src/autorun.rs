@@ -225,7 +225,6 @@ pub enum Kind {
     Manager,
     /// Exactly the files this path matches, `*` standing for any run of
     /// characters within one name (`usr/lib/python*/site-packages/*.pth`).
-    /// Only the sweep looks for these.
     Glob,
 }
 
@@ -511,17 +510,23 @@ pub const SYSTEM: &[Location] = &[
     // system's own of that name.
     location("usr/local/bin/", Kind::Directory, Category::LocalBin),
     location("usr/local/sbin/", Kind::Directory, Category::LocalBin),
-];
-
-/// System locations no package should ship into, looked at by the sweep only.
-pub const SYSTEM_SWEEP: &[Location] = &[
-    // PAM modules: a `.so` every login loads.
-    location("usr/lib/security/", Kind::Directory, Category::Pam),
-    location("boot/limine.conf", Kind::File, Category::Boot),
-    location("etc/default/limine", Kind::File, Category::Boot),
-    location("etc/kernel/cmdline", Kind::File, Category::Boot),
-    // Libraries the dynamic linker prefers over the ones in `/usr/lib`.
-    location("usr/lib/glibc-hwcaps/", Kind::Directory, Category::Linker),
+    // Where systemd also reads units and generators from.
+    location(
+        "etc/systemd/system.control/",
+        Kind::Directory,
+        Category::Systemd,
+    ),
+    location(
+        "etc/systemd/system.attached/",
+        Kind::Directory,
+        Category::Systemd,
+    ),
+    // Scripts mkinitcpio runs after it built an image.
+    location(
+        "usr/lib/initcpio/post/",
+        Kind::Directory,
+        Category::Initramfs,
+    ),
     // Python runs every `import` line of a `.pth` file, and these two
     // modules, at each start of the interpreter.
     location(
@@ -596,6 +601,17 @@ pub const SYSTEM_SWEEP: &[Location] = &[
         Kind::Directory,
         Category::SystemdGenerator,
     ),
+];
+
+/// System locations no package should ship into, looked at by the sweep only.
+pub const SYSTEM_SWEEP: &[Location] = &[
+    // PAM modules: a `.so` every login loads.
+    location("usr/lib/security/", Kind::Directory, Category::Pam),
+    location("boot/limine.conf", Kind::File, Category::Boot),
+    location("etc/default/limine", Kind::File, Category::Boot),
+    location("etc/kernel/cmdline", Kind::File, Category::Boot),
+    // Libraries the dynamic linker prefers over the ones in `/usr/lib`.
+    location("usr/lib/glibc-hwcaps/", Kind::Directory, Category::Linker),
 ];
 
 /// Locations in a home directory, relative to it.
@@ -777,7 +793,7 @@ pub fn is_auto_run_directory(path: &str) -> bool {
                 .is_some_and(|extension| extension == "d")
     });
     SYSTEM.iter().any(|location| match location.kind {
-        // No package location is a pattern: only the sweep has those.
+        // A pattern names files, never a directory.
         Kind::File | Kind::Glob => false,
         Kind::Directory => {
             location.path.starts_with(&directory)
@@ -918,10 +934,7 @@ mod tests {
             assert!(!location.category.label().is_empty());
             assert!(!location.category.when().is_empty());
         }
-        // The package gate matches a path against every location: none
-        // of its own is a pattern.
-        assert!(SYSTEM.iter().all(|location| location.kind != Kind::Glob));
-        let pth = SYSTEM_SWEEP
+        let pth = SYSTEM
             .iter()
             .find(|location| location.path.ends_with("*.pth"))
             .unwrap();
