@@ -126,6 +126,7 @@ fn collect_here(home: Option<&str>) -> Result<(Collection, PackageIndex, Vec<Str
     let mut collection = collect::collect(&scope);
     let live = live::check(&scope);
     collect::merge(&mut collection, live.items);
+    collection.truncated.extend(live.unchecked);
     Ok((collection, index, live.notes))
 }
 
@@ -355,10 +356,9 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
             .map(|problem| Gap::Sweep(format!("package record {problem}"))),
     );
     report.gaps.extend(
-        collection
-            .truncated
-            .iter()
-            .map(|location| Gap::Sweep(format!("{location}: more entries than were looked at"))),
+        collect::bounded(collection.truncated.clone())
+            .into_iter()
+            .map(Gap::Sweep),
     );
     // Nothing to review is a clean sweep, not a limited one.
     let decision = match report.decide(&|class| settings.policy(class)) {

@@ -3,6 +3,7 @@
 //! judge the files it runs too (a trusted interpreter is judged by the
 //! script it is given).
 
+#[cfg(test)]
 use std::path::Path;
 
 use super::{lua, read};
@@ -225,7 +226,16 @@ fn hyprland_conf(text: &str) -> Vec<String> {
 /// name is looked up in `SEARCH`) and, for an interpreter, the script it is
 /// given. `home` is the home directory relative to the root. Only paths
 /// that exist under `root` are returned.
+#[cfg(test)]
 pub fn targets(root: &Path, home: &str, command: &str) -> Vec<String> {
+    targets_where(home, command, &|candidate| {
+        std::fs::symlink_metadata(root.join(candidate)).is_ok()
+    })
+}
+
+/// `targets`, with the caller saying which candidate paths are there: as
+/// root, a path only root can read is not looked for at a user's word.
+pub fn targets_where(home: &str, command: &str, exists: &dyn Fn(&str) -> bool) -> Vec<String> {
     let words = split(command);
     let mut words = words.iter().map(String::as_str).peekable();
     // Leading assignments and wrappers.
@@ -242,7 +252,7 @@ pub fn targets(root: &Path, home: &str, command: &str) -> Vec<String> {
         return Vec::new();
     };
     let mut found = Vec::new();
-    if let Some(path) = locate(root, home, program) {
+    if let Some(path) = locate(home, program, exists) {
         found.push(path);
     }
     let name = program.rsplit('/').next().unwrap_or(program);
@@ -260,7 +270,7 @@ pub fn targets(root: &Path, home: &str, command: &str) -> Vec<String> {
             if word.starts_with('-') {
                 continue;
             }
-            if let Some(path) = locate(root, home, word).filter(|_| word.contains('/')) {
+            if let Some(path) = locate(home, word, exists).filter(|_| word.contains('/')) {
                 found.push(path);
             }
             break;
@@ -270,7 +280,7 @@ pub fn targets(root: &Path, home: &str, command: &str) -> Vec<String> {
 }
 
 /// The path `word` names, relative to the root, if it exists there.
-fn locate(root: &Path, home: &str, word: &str) -> Option<String> {
+fn locate(home: &str, word: &str, exists: &dyn Fn(&str) -> bool) -> Option<String> {
     let expanded = expand(home, word);
     let candidates: Vec<String> = if let Some(absolute) = expanded.strip_prefix('/') {
         vec![absolute.to_string()]
@@ -287,9 +297,7 @@ fn locate(root: &Path, home: &str, word: &str) -> Option<String> {
             })
             .collect()
     };
-    candidates
-        .into_iter()
-        .find(|candidate| std::fs::symlink_metadata(root.join(candidate)).is_ok())
+    candidates.into_iter().find(|candidate| exists(candidate))
 }
 
 /// `~`, `$HOME`, `${HOME}` and systemd's `%h` as the home directory.

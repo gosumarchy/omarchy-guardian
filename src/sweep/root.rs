@@ -87,7 +87,9 @@ pub fn collect_command(out: bool, settings: &crate::config::Settings) -> ExitCod
         origin: Origin::Root,
     };
     let mut collection = collect::collect(&scope);
-    collect::merge(&mut collection, live::check(&scope).items);
+    let live = live::check(&scope);
+    collect::merge(&mut collection, live.items);
+    collection.truncated.extend(live.unchecked);
     let json = to_json(&collection).to_string();
     match group {
         None => {
@@ -229,10 +231,9 @@ fn to_json(collection: &Collection) -> Json {
         (
             "truncated",
             Json::Array(
-                collection
-                    .truncated
+                collect::bounded(collection.truncated.clone())
                     .iter()
-                    .map(|location| Json::from(location.as_str()))
+                    .map(|unchecked| Json::from(unchecked.as_str()))
                     .collect(),
             ),
         ),

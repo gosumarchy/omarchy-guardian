@@ -345,6 +345,29 @@ impl Paths {
         }
         let user = fs::symlink_metadata(&self.sweep_timer_link).is_ok();
         let root = fs::symlink_metadata(&self.sweep_root_timer_link).is_ok();
+        // A file of the unit's own name beside the `timers.target.wants`
+        // directory replaces or masks the packaged unit: the link is there
+        // and the sweep does not run.
+        let overridden = |link: &Path, unit: &str| {
+            let directory = link.parent().and_then(Path::parent);
+            ["timer", "service"].iter().any(|kind| {
+                directory.is_some_and(|directory| {
+                    fs::symlink_metadata(directory.join(format!("{unit}.{kind}"))).is_ok()
+                })
+            })
+        };
+        if (user && overridden(&self.sweep_timer_link, "omarchy-guardian-sweep"))
+            || (root
+                && overridden(
+                    &self.sweep_root_timer_link,
+                    "omarchy-guardian-sweep-collect",
+                ))
+        {
+            return State::Partial(
+                "a unit file of the sweep's own name overrides or masks the packaged one, so it may not run"
+                    .into(),
+            );
+        }
         match (user, self.sweep_consent, root) {
             (false, _, true) => State::Partial(
                 "the daily root checks run, but the sweep itself is off".into(),
@@ -1064,6 +1087,19 @@ mod tests {
             paths.state(Integration::SystemSweep),
             State::Partial(_)
         ));
+        // A unit file of the sweep's own name beside the links masks it,
+        // whatever it holds.
+        let mask = paths
+            .sweep_timer_link
+            .parent()
+            .and_then(std::path::Path::parent)
+            .unwrap()
+            .join("omarchy-guardian-sweep.timer");
+        fs::write(&mask, "").unwrap();
+        let state = paths.state(Integration::SystemSweep);
+        assert!(matches!(&state, State::Partial(detail) if detail.contains("overrides or masks")));
+        fs::remove_file(&mask).unwrap();
+
         paths.sweep_consent = Some(RootConsent::Declined);
         let state = paths.state(Integration::SystemSweep);
         assert!(matches!(&state, State::Partial(detail) if detail.contains("declined")));
