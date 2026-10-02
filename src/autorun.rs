@@ -552,6 +552,7 @@ pub const SYSTEM_SWEEP: &[Location] = &[
     location("etc/systemd/system.conf", Kind::File, Category::Systemd),
     location("etc/systemd/user.conf", Kind::File, Category::Systemd),
     location("etc/makepkg.conf", Kind::File, Category::Shell),
+    location("etc/mkinitcpio.conf", Kind::File, Category::Initramfs),
     location("etc/bash.bash_logout", Kind::File, Category::Shell),
     location("etc/fish/", Kind::Directory, Category::Shell),
     // `HookDir`, `XferCommand` and the repositories packages come from.
@@ -636,6 +637,17 @@ pub const USER: &[Location] = &[
     location(".ssh/config", Kind::File, Category::Ssh),
     location(".gitconfig", Kind::File, Category::Git),
     location(".config/git/config", Kind::File, Category::Git),
+    location(".zlogout", Kind::File, Category::Shell),
+    // The user manager's own configuration (`DefaultEnvironment=`).
+    location(".config/systemd/user.conf", Kind::File, Category::Systemd),
+    location(
+        ".config/systemd/user.conf.d/",
+        Kind::Directory,
+        Category::Systemd,
+    ),
+    // Where cargo installs programs; ahead of `/usr/bin` in many setups.
+    location(".cargo/bin/", Kind::Directory, Category::LocalBin),
+    location(".ssh/config.d/", Kind::Directory, Category::Ssh),
     // The other place systemd reads user units from.
     location(
         ".local/share/systemd/user/",

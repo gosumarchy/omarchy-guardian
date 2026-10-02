@@ -17,6 +17,7 @@ use crate::json::Json;
 
 const BASELINE: &str = "baseline.json";
 const ALLOWED: &str = "allowed.json";
+const TOLD: &str = "told.json";
 const LAST_RUN: &str = "last-run.json";
 const STARTED: &str = "started";
 /// The most reasons an unfinished sweep keeps.
@@ -53,6 +54,9 @@ pub fn fingerprint(item: &Item) -> String {
         format!("{content}+{}", alerts.join(","))
     }
 }
+
+/// The mark on the remembered fingerprint of an item with a finding.
+pub const FLAGGED: &str = "+finding";
 
 /// The fingerprint of an item that could not be read (and raised no
 /// alert): only this one carries over a previous fingerprint.
@@ -114,6 +118,27 @@ pub fn has_baseline(directory: &Path) -> bool {
 
 pub fn baseline(directory: &Path) -> Remembered {
     read(&directory.join(BASELINE))
+}
+
+/// What the scheduled sweeps have told about so far: what the next one's
+/// notification is measured against. A sweep run by hand does not write it,
+/// so running one says nothing on the timer's behalf (what it finds would
+/// otherwise never be notified). Installs from before it existed fall back
+/// to what the last sweep remembered.
+pub fn told(directory: &Path) -> Remembered {
+    if directory.join(TOLD).is_file() {
+        read(&directory.join(TOLD))
+    } else {
+        baseline(directory)
+    }
+}
+
+pub fn has_told(directory: &Path) -> bool {
+    directory.join(TOLD).is_file() || has_baseline(directory)
+}
+
+pub fn save_told(directory: &Path, current: &Remembered) -> Result<(), String> {
+    write(&directory.join(TOLD), current)
 }
 
 /// Remembers the untrusted items of this sweep for the next `--diff`.
@@ -305,8 +330,14 @@ pub fn diff(previous: &Remembered, current: &Remembered) -> Vec<(Change, String)
         match previous.get(label) {
             None => changes.push((Change::New, label.clone())),
             // What could not be read before is no change once it can be,
-            // unless it now raises an alert.
-            Some(old) if old != fingerprint && (old != UNREAD || fingerprint.contains('+')) => {
+            // unless it now raises an alert. A finding that is gone from
+            // a file that did not change is none either: the AI was not
+            // reached this time, or judged it differently.
+            Some(old)
+                if old != fingerprint
+                    && (old != UNREAD || fingerprint.contains('+'))
+                    && old.strip_suffix(FLAGGED) != Some(fingerprint.as_str()) =>
+            {
                 changes.push((Change::Changed, label.clone()));
             }
             Some(_) => {}
@@ -376,6 +407,47 @@ mod tests {
                 (Change::New, "d".to_string()),
                 (Change::Changed, "f".to_string())
             ]
+        );
+    }
+
+    #[test]
+    fn what_the_timer_told_about_is_kept_apart_from_what_was_last_seen() {
+        use super::{has_told, save_told, told};
+        let dir = TempDir::new("sweep-told");
+        assert!(!has_told(dir.path()));
+        // An install from before: the last sweep stands in.
+        let seen: Remembered = [("/etc/a".to_string(), "1".to_string())]
+            .into_iter()
+            .collect();
+        save_baseline(dir.path(), &seen).unwrap();
+        assert!(has_told(dir.path()));
+        assert_eq!(told(dir.path()), seen);
+        // Once the timer has told, a sweep by hand no longer moves it.
+        save_told(dir.path(), &seen).unwrap();
+        let more: Remembered = [
+            ("/etc/a".to_string(), "1".to_string()),
+            ("/etc/new".to_string(), "2".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        save_baseline(dir.path(), &more).unwrap();
+        assert_eq!(told(dir.path()), seen);
+        assert_eq!(baseline(dir.path()), more);
+        // A finding that appears is a change; one that goes is not.
+        let plain: Remembered = [("/etc/a".to_string(), "1".to_string())]
+            .into_iter()
+            .collect();
+        let flagged: Remembered = [("/etc/a".to_string(), "1+finding".to_string())]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            diff(&plain, &flagged),
+            [(Change::Changed, "/etc/a".to_string())]
+        );
+        assert!(diff(&flagged, &plain).is_empty());
+        assert_eq!(
+            diff(&told(dir.path()), &more),
+            [(Change::New, "/etc/new".to_string())]
         );
     }
 
