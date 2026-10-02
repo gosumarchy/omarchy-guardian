@@ -111,8 +111,10 @@ impl PartialConfig {
 /// characters model names are made of. It becomes an argument of the
 /// reviewer's command, so it may not look like an option.
 pub fn is_model_name(text: &str) -> bool {
+    // Each part by itself too: one reviewer is given the part after the
+    // provider as an argument of its own.
     text.split_once('/')
-        .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty())
+        .is_some_and(|(provider, model)| is_plain_argument(provider) && is_plain_argument(model))
         && is_plain_argument(text)
 }
 
@@ -462,7 +464,16 @@ diff = "off"
         assert!(is_model_name("claude-code/claude-sonnet-5-5"));
         assert!(is_model_name("openrouter/anthropic/claude:beta@1"));
         assert!(is_model_name("claude-code/claude-sonnet-4-5[1m]"));
-        for bad in ["claude-code/--x y", "-p/x", "a/b;c", "a/", "/b", "a/b\n"] {
+        for bad in [
+            "claude-code/--x y",
+            "claude-code/--x",
+            "claude-code/-p",
+            "-p/x",
+            "a/b;c",
+            "a/",
+            "/b",
+            "a/b\n",
+        ] {
             assert!(!is_model_name(bad), "{bad:?}");
         }
         assert!(is_plain_argument("high"));

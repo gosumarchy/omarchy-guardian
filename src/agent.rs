@@ -128,8 +128,11 @@ impl AgentError {
 /// (see `Reviewer::for_model`).
 /// With `isolated` (the pacman gate), OpenCode runs with private, empty
 /// configuration and cache directories: the user's own OpenCode settings
-/// (a provider `baseURL`, plugins) cannot redirect the review of a root
-/// transaction. Credentials still come from OpenCode's data directory.
+/// (a provider `baseURL`, plugins) do not shape the review of a root
+/// transaction. Its credentials still come from the OpenCode data
+/// directory of the user the review runs as (the one who called pacman
+/// through sudo), which that user can write: the review is isolated from
+/// their configuration, not from the account itself.
 pub fn review(
     binary: &Path,
     render: &dyn Fn(&str) -> String,
@@ -382,6 +385,10 @@ fn claude_verdict(
             AgentError::Invalid(Error::Refused(format!(
                 "the AI saw the source and then declined or failed to review it ({detail}); retry"
             )))
+        } else if rejects_input(&detail) {
+            AgentError::Invalid(Error::Refused(format!(
+                "the AI could not take this source in one request ({detail}); lower max_input_kib or use a model with a larger context"
+            )))
         } else {
             unavailable(detail)
         });
@@ -392,6 +399,46 @@ fn claude_verdict(
         )));
     }
     parse_review(text, nonce).map_err(AgentError::Invalid)
+}
+
+/// Whether a provider's error says the request itself was too much for
+/// the model. That is the source's doing, not an absent reviewer: a file
+/// made to overflow the model must not turn a review into a warning.
+fn rejects_input(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    // A provider asking to slow down speaks of tokens too.
+    if [
+        "rate limit",
+        "rate_limit",
+        "throttl",
+        "please wait",
+        "try again",
+        "quota",
+    ]
+    .iter()
+    .any(|sign| message.contains(sign))
+    {
+        return false;
+    }
+    [
+        "prompt is too long",
+        "prompt too long",
+        "context length",
+        "context_length",
+        "maximum context",
+        "input is too long",
+        "maximum prompt length",
+        "exceeds the maximum number of tokens",
+        "request too large",
+        "request entity too large",
+        "request_too_large",
+        "reduce the length",
+        "exceeds the context window",
+        "exceeds the available context size",
+        "exceeded model token limit",
+    ]
+    .iter()
+    .any(|sign| message.contains(sign))
 }
 
 pub(crate) fn random_nonce() -> Result<String, Error> {
@@ -564,6 +611,17 @@ fn verdict(
     {
         return Err(AgentError::Invalid(Error::Refused(format!(
             "the AI saw the source and then declined or failed to review it ({message}); retry"
+        ))));
+    }
+    // Wherever it is said: as an error event, or as the reason the run
+    // failed.
+    if let Some(message) = [events.error.as_deref(), failure.as_deref()]
+        .into_iter()
+        .flatten()
+        .find(|message| rejects_input(message))
+    {
+        return Err(AgentError::Invalid(Error::Refused(format!(
+            "the AI could not take this source in one request ({message}); lower max_input_kib or use a model with a larger context"
         ))));
     }
     if let Some(detail) = events.error.or(failure) {
@@ -847,6 +905,39 @@ mod tests {
             Err(AgentError::Invalid(_))
         ));
         assert!(matches!(judge("not json"), Err(AgentError::Invalid(_))));
+        // A request the model cannot take is the source's doing, not an
+        // absent reviewer.
+        assert!(matches!(
+            judge(
+                r#"{"type":"error","error":{"data":{"message":"prompt is too long: 250000 tokens > 200000 maximum"}}}"#
+            ),
+            Err(AgentError::Invalid(_))
+        ));
+        assert!(matches!(
+            claude_verdict(
+                r#"{"type":"result","is_error":true,"result":"Prompt is too long"}"#,
+                None,
+                "n"
+            ),
+            Err(AgentError::Invalid(_))
+        ));
+        // A provider asking to slow down is an absent reviewer.
+        assert!(matches!(
+            claude_verdict(
+                r#"{"type":"result","is_error":true,"result":"Too many tokens, please wait before trying again"}"#,
+                None,
+                "n"
+            ),
+            Err(AgentError::Unavailable(_))
+        ));
+        assert!(matches!(
+            claude_verdict(
+                r#"{"type":"result","is_error":true,"result":"Invalid API key"}"#,
+                None,
+                "n"
+            ),
+            Err(AgentError::Unavailable(_))
+        ));
     }
 
     #[test]

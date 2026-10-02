@@ -348,7 +348,7 @@ fn is_identical(previous: &Previous, files: &[SourceFile]) -> bool {
 fn upgrade_note(manifest: &[ManifestEntry]) -> String {
     let count = |sent: Sent| manifest.iter().filter(|entry| entry.sent == sent).count();
     format!(
-        "upgrade of the approved version: {} file(s) sent as diffs, {} unchanged, {} removed; entry points, new files and small changed files are reviewed whole",
+        "upgrade of the approved version: {} file(s) sent as diffs, {} unchanged, {} removed; entry points and new files are reviewed whole, and so are changed files and the code they name where that fits",
         count(Sent::Diff),
         count(Sent::Unchanged),
         count(Sent::Removed)
@@ -890,7 +890,7 @@ mod tests {
         let memory = memory(&state, units("aur:demo"));
         let settings = AgentSettings::default();
         // Large enough that a change to it is sent as a diff.
-        let library: String = (1..=4000)
+        let library: String = (1..=6000)
             .map(|line| format!("int value_{line} = {line};\n"))
             .collect();
 
@@ -968,7 +968,7 @@ mod tests {
         let memory = memory(&state, units("aur:demo"));
         let settings = AgentSettings::default();
         // Large enough that a change to it is sent as a diff.
-        let library: String = (1..=4000)
+        let library: String = (1..=6000)
             .map(|line| format!("int value_{line} = {line};\n"))
             .collect();
         let v1 = [
