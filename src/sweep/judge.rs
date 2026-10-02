@@ -66,13 +66,21 @@ pub fn judge(collection: &Collection, home: Option<&str>, context: &ReviewContex
                 drop_rule(&mut report, before, RuleId::PersistenceModification);
                 facts.push(fact(item, &label));
             }
-            Body::Binary(format) => report.hash_only.push(HashOnly {
-                path: label,
-                bytes: 0,
-                label: format,
-                media: false,
-                skipped_files: None,
-            }),
+            Body::Binary(format) => {
+                // One without a hash is never recorded as approved, so
+                // every sweep that finds it is reviewed in full.
+                let digest = item.sha256.as_ref().map(ToString::to_string);
+                report
+                    .unread
+                    .insert(label.clone(), digest.unwrap_or_default());
+                report.hash_only.push(HashOnly {
+                    path: label,
+                    bytes: 0,
+                    label: format,
+                    media: false,
+                    skipped_files: None,
+                });
+            }
             Body::Undecodable => report.gaps.push(Gap::Undecodable(label)),
             Body::Oversized => report.gaps.push(Gap::OversizedText(label)),
             Body::Unreadable(_) => report.gaps.push(Gap::RootOnly(label)),

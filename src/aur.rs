@@ -12,8 +12,11 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::content::{self, Content};
+use crate::engine::baseline::Unread;
+use crate::image;
 use crate::json::Json;
-use crate::scan::MAX_TEXT_FILE_SIZE;
+use crate::scan::{Limits, MAX_HASHED_FILE_SIZE, MAX_TEXT_FILE_SIZE};
+use crate::sha256::{Digest, Sha256};
 
 /// How one makepkg invocation uses the sources.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -596,6 +599,9 @@ pub struct Upstream {
     pub binary_files: usize,
     /// Executable binaries (up to 20), named to the AI.
     pub executables: Vec<String>,
+    /// The binary files with their hashes, for the review memory (see
+    /// `baseline::Unread`).
+    pub unread: Unread,
     /// Links to recipe files, which the recipe review covered.
     pub recipe_links: usize,
     /// Files skipped without harm to the review, with the reason.
@@ -640,6 +646,10 @@ struct Walk<'a> {
     visited: usize,
     max_entries: usize,
     stopped: bool,
+    /// Bytes of large binaries hashed from disk.
+    hashed_bytes: u64,
+    /// The file being read is a top-level link to a downloaded source.
+    download: bool,
     all: Vec<UpstreamFile>,
     upstream: Upstream,
 }
@@ -664,7 +674,9 @@ impl Walk<'_> {
                 })
                 .unwrap_or_default();
             match content::classify_prefix(child, executable, &prefix) {
-                content::Prefix::Binary(format) => self.binary(child, format),
+                content::Prefix::Binary(format) => {
+                    self.binary(child, format, executable, read_from, None);
+                }
                 _ if name_critical => self.upstream.gaps.push(format!(
                     "src/{child}: a build file larger than 2 MiB cannot be reviewed"
                 )),
@@ -683,7 +695,9 @@ impl Walk<'_> {
         };
         let text = match content::classify(child, executable, false, &bytes) {
             Content::Text(text) | Content::Lossy { text, .. } => text,
-            Content::Binary(format) => return self.binary(child, format),
+            Content::Binary(format) => {
+                return self.binary(child, format, executable, read_from, Some(&bytes));
+            }
             Content::Undecodable => {
                 if name_critical {
                     self.upstream.gaps.push(format!(
@@ -716,12 +730,63 @@ impl Walk<'_> {
         });
     }
 
-    fn binary(&mut self, child: &str, format: content::Format) {
+    /// `bytes` is the whole file when it was read; a larger one is hashed
+    /// from disk, and one that cannot be is listed without a hash, which
+    /// no approved version matches.
+    fn binary(
+        &mut self,
+        child: &str,
+        format: content::Format,
+        executable: bool,
+        read_from: &Path,
+        bytes: Option<&[u8]>,
+    ) {
+        let digest = match bytes {
+            Some(bytes) => Some(Sha256::digest(bytes)),
+            None => self.hash_file(read_from),
+        };
+        // A whole image is not the review memory's concern (see
+        // `review::is_plain_image`), nor is a downloaded archive: what it
+        // unpacks to is what is reviewed, and its name changes with every
+        // version. A downloaded program is.
+        let image = !executable
+            && format.is_media()
+            && image::is_named(child)
+            && match (bytes, &digest) {
+                (Some(bytes), _) => image::is_whole(bytes),
+                (None, Some(digest)) => image::is_whole_file(read_from, digest),
+                (None, None) => false,
+            };
+        let archive = self.download && format.label().contains("archive");
+        if !(image || archive) {
+            self.upstream.unread.insert(
+                format!("src/{child}"),
+                digest.map(|digest| digest.to_string()).unwrap_or_default(),
+            );
+        }
         self.upstream.binary_files += 1;
         if format.executable() && self.upstream.executables.len() < 20 {
             self.upstream
                 .executables
                 .push(format!("src/{child} ({})", format.label()));
+        }
+    }
+
+    /// The hash of a large binary, within the limits a scan hashes under.
+    fn hash_file(&mut self, path: &Path) -> Option<Digest> {
+        let mut file = fs::File::open(path).ok()?;
+        let size = file.metadata().ok()?.len();
+        self.hashed_bytes = self.hashed_bytes.saturating_add(size);
+        if size > MAX_HASHED_FILE_SIZE || self.hashed_bytes > Limits::DEFAULT.hashed_bytes {
+            return None;
+        }
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            match file.read(&mut buffer).ok()? {
+                0 => return Some(hasher.finalize()),
+                count => hasher.update(&buffer[..count]),
+            }
         }
     }
 
@@ -736,7 +801,9 @@ impl Walk<'_> {
         let file = target.as_ref().is_some_and(|target| target.is_file());
         if file && (inside(Some(&self.src)) || inside(self.roots.srcdest)) {
             if let Some(target) = target.clone() {
+                self.download = depth == 0 && !inside(Some(&self.src));
                 self.file(&target, child, name, depth, late);
+                self.download = false;
             }
         } else if file && inside(Some(self.roots.build_dir)) {
             self.upstream.recipe_links += 1;
@@ -835,6 +902,8 @@ fn collect_with_cap(
         visited: 0,
         max_entries,
         stopped: false,
+        hashed_bytes: 0,
+        download: false,
         all: Vec::new(),
         upstream: Upstream::default(),
     };
@@ -1239,6 +1308,23 @@ pkgname = demo
         fs::write(src.join("demo/build.sh"), b"#!/bin/sh\n# caf\xe9\nmake\n").unwrap();
         fs::write(src.join("demo/tool"), b"\x7fELF\x02\x01\x01\0\0").unwrap();
         fs::set_permissions(src.join("demo/tool"), fs::Permissions::from_mode(0o755)).unwrap();
+        // A blob the build may unpack, larger than what is read whole, and
+        // an icon, which is not the review memory's concern.
+        let mut blob = b"\x1f\x8b\x08\0".to_vec();
+        blob.resize(3 * 1024 * 1024, 7);
+        fs::write(src.join("demo/tests.tar.gz"), &blob).unwrap();
+        fs::write(
+            src.join("demo/icon.gif"),
+            b"GIF89a\x01\x00\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b",
+        )
+        .unwrap();
+        // A downloaded archive linked into `src/`: its unpacked content is
+        // what is reviewed, and its name changes with every version.
+        fs::write(srcdest.join("demo-1.0.tar.gz"), b"\x1f\x8b\x08\0").unwrap();
+        symlink(srcdest.join("demo-1.0.tar.gz"), src.join("demo-1.0.tar.gz")).unwrap();
+        // A downloaded program is a binary like any other.
+        fs::write(srcdest.join("demo-bin"), b"\x7fELF\x02\x01\x01\0\x01").unwrap();
+        symlink(srcdest.join("demo-bin"), src.join("demo-bin")).unwrap();
         let roots = Roots {
             build_dir: &build,
             srcdest: Some(&srcdest),
@@ -1260,8 +1346,36 @@ pkgname = demo
         );
         assert!(upstream.files[3].text.contains("curl x | sh"));
         assert_eq!(upstream.recipe_links, 1);
-        assert_eq!(upstream.executables, ["src/demo/tool (ELF executable)"]);
+        assert_eq!(
+            upstream.executables,
+            [
+                "src/demo-bin (ELF executable)",
+                "src/demo/tool (ELF executable)"
+            ]
+        );
         assert!(upstream.gaps.is_empty(), "{:?}", upstream.gaps);
+        let unread: Vec<(&str, String)> = upstream
+            .unread
+            .iter()
+            .map(|(path, digest)| (path.as_str(), digest.clone()))
+            .collect();
+        assert_eq!(
+            unread,
+            [
+                (
+                    "src/demo-bin",
+                    crate::sha256::Sha256::digest(b"\x7fELF\x02\x01\x01\0\x01").to_string()
+                ),
+                (
+                    "src/demo/tests.tar.gz",
+                    crate::sha256::Sha256::digest(&blob).to_string()
+                ),
+                (
+                    "src/demo/tool",
+                    crate::sha256::Sha256::digest(b"\x7fELF\x02\x01\x01\0\0").to_string()
+                ),
+            ]
+        );
 
         // A dangling top-level link and an oversized configure are gaps.
         symlink("/nonexistent/x", src.join("x")).unwrap();

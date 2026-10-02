@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::agent::{self, AgentError, AgentReview, SourceFile};
 use crate::config::Settings;
 use crate::config::model::{AgentSettings, AiRequirement, SourceClass, Toggle};
-use crate::engine::baseline::Unit;
+use crate::engine::baseline::{Approved, Unit, Unread};
 use crate::engine::plan::{HashOnly, ManifestEntry, Plan, PlanInput, Previous, Sent};
 use crate::engine::request::Request;
 use crate::engine::store::Store;
@@ -100,6 +100,9 @@ pub struct Group<'a> {
     pub context: &'a [String],
     /// Files hashed but not read, named in every request's manifest.
     pub hash_only: &'a [HashOnly],
+    /// What the review cannot read (see `Unread`): an upgrade is reviewed
+    /// as one only while these are what the approved version had.
+    pub unread: &'a Unread,
 }
 
 /// What reviewing one group produced.
@@ -126,7 +129,14 @@ pub fn review_group(
     // the store) must hold here too, not only via `Memory::open`.
     let memory = memory.filter(|_| !group.class.is_privileged());
     let mut review = GroupReview::default();
-    let previous = previous_version(memory, group.settings, &mut review.notes);
+    let (previous, facts, unapproved) = match previous_version(memory, group, &mut review.notes) {
+        Approval::Diff(approved) => {
+            let unapproved = group.unread.keys().any(|path| !approved.covers(path));
+            (Some(approved.files), Vec::new(), unapproved)
+        }
+        Approval::Changed(fact) => (None, vec![fact], false),
+        Approval::None => (None, Vec::new(), false),
+    };
     let flagged: BTreeSet<String> = group
         .findings
         .iter()
@@ -169,29 +179,35 @@ pub fn review_group(
         Some(first) => Ok(first),
         None => plan::build(&input),
     };
+    // A diff-mode review must never be less complete than a full one would
+    // be, so two outcomes are reviewed in full instead. Nothing to send,
+    // yet files are gone or unread files no approval covers are here: the
+    // tree is not the approved one, and is not passed without a review. Or
+    // the plan is too large: removed baseline paths alone can push the
+    // manifest over the limit, and a full review may still fit.
+    let full_instead = match &built {
+        Ok(plan)
+            if plan.upgrade && plan.chunks.is_empty() && (unapproved || has_removals(plan)) =>
+        {
+            Some(
+                "nothing changed in the approved text, but the tree is not the approved one (files were removed, or unread files have no approval); reviewing in full instead",
+            )
+        }
+        Err(too_large) if previous.is_some() && too_large.entry_point.is_none() => {
+            Some("the diff-mode plan needed too many chunks; reviewing in full instead")
+        }
+        _ => None,
+    };
+    let built = match full_instead {
+        Some(note) => plan::build(&PlanInput {
+            previous: None,
+            ..input
+        })
+        .inspect(|_| review.notes.push(note.to_string())),
+        None => built,
+    };
     let plan = match built {
         Ok(plan) => plan,
-        // Removed baseline paths alone can push the manifest over the
-        // limit; a full review may still fit, so retry once without them
-        // before giving up (a diff-mode review must never be less complete
-        // than a full one would be).
-        Err(too_large) if previous.is_some() && too_large.entry_point.is_none() => {
-            let plan = match plan::build(&PlanInput {
-                previous: None,
-                ..input
-            }) {
-                Ok(plan) => plan,
-                Err(too_large) => {
-                    review.too_large = true;
-                    review.entry_point_too_large = too_large.entry_point;
-                    return review;
-                }
-            };
-            review.notes.push(
-                "the diff-mode plan needed too many chunks; reviewing in full instead".to_string(),
-            );
-            plan
-        }
         Err(too_large) => {
             review.too_large = true;
             review.entry_point_too_large = too_large.entry_point;
@@ -214,7 +230,7 @@ pub fn review_group(
         memory,
         fresh: Vec::new(),
     };
-    match runner.run_all(&requests(group, &plan), &mut review.notes) {
+    match runner.run_all(&requests(group, &plan, &facts), &mut review.notes) {
         Ok(runs) => review.runs = runs,
         Err((runs, error)) => {
             review.runs = runs;
@@ -227,8 +243,8 @@ pub fn review_group(
 }
 
 /// One request per chunk of `plan`, each carrying the local findings for
-/// the files it sends.
-fn requests(group: &Group<'_>, plan: &Plan) -> Vec<Request> {
+/// the files it sends, and `facts` after the group's own.
+fn requests(group: &Group<'_>, plan: &Plan, facts: &[String]) -> Vec<Request> {
     let count = plan.chunks.len();
     plan.chunks
         .iter()
@@ -245,7 +261,7 @@ fn requests(group: &Group<'_>, plan: &Plan) -> Vec<Request> {
                 .cloned()
                 .collect(),
             items: items.clone(),
-            context: group.context.to_vec(),
+            context: group.context.iter().chain(facts).cloned().collect(),
         })
         .collect()
 }
@@ -257,7 +273,7 @@ fn is_fully_cached(group: &Group<'_>, plan: &Plan, memory: Option<&Memory>) -> b
         return false;
     };
     !plan.chunks.is_empty()
-        && requests(group, plan).iter().all(|request| {
+        && requests(group, plan, &[]).iter().all(|request| {
             let key = cache::key(group.settings, group.class, request);
             matches!(
                 cache::lookup(&memory.store, &key, memory.now, memory.cache_max_age_secs),
@@ -266,21 +282,51 @@ fn is_fully_cached(group: &Group<'_>, plan: &Plan, memory: Option<&Memory>) -> b
         })
 }
 
-/// The approved version to diff against, when this review uses diffs and
-/// the baseline was approved under these agent settings.
+fn has_removals(plan: &Plan) -> bool {
+    plan.manifest
+        .iter()
+        .any(|entry| entry.sent == Sent::Removed)
+}
+
+/// What an earlier approval means for this review.
+enum Approval {
+    /// The approved version to diff against.
+    Diff(Approved),
+    /// Not the approved version: what differs, as a fact for the AI.
+    Changed(String),
+    None,
+}
+
+/// The approved version to diff against, when this review uses diffs, the
+/// baseline was approved under these agent settings, and what the review
+/// does not read is what that version had: a binary or link that was
+/// added, changed or removed may be what the unchanged text now runs, so
+/// the text is then reviewed in full, and told what changed beside it.
 fn previous_version(
     memory: Option<&Memory>,
-    settings: &AgentSettings,
+    group: &Group<'_>,
     notes: &mut Vec<String>,
-) -> Option<Previous> {
-    let memory = memory.filter(|memory| memory.use_diff)?;
-    match baseline::load(&memory.store, memory.class, &memory.units, settings) {
-        Ok(previous) => previous,
+) -> Approval {
+    let Some(memory) = memory.filter(|memory| memory.use_diff) else {
+        return Approval::None;
+    };
+    match baseline::load(&memory.store, memory.class, &memory.units, group.settings) {
+        Ok(Some(approved)) => match baseline::unread_changes(&approved, group.unread) {
+            Some(fact) => {
+                notes.push(
+                    "what Guardian does not read here (binaries, links, skipped directories) cannot be matched to the approved version; reviewing in full"
+                        .to_string(),
+                );
+                Approval::Changed(fact)
+            }
+            None => Approval::Diff(approved),
+        },
+        Ok(None) => Approval::None,
         Err(error) => {
             notes.push(format!(
                 "approved baseline unavailable, reviewing in full: {error}"
             ));
-            None
+            Approval::None
         }
     }
 }
@@ -547,12 +593,17 @@ fn review_parallel(
     results.into_inner().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// After the whole review: keep `approved` as the baseline, bound to the
-/// agent settings every file was reviewed with (the caller passes it only
+/// After the whole review: keep `approved` as the baseline, with the
+/// `unread` files beside it, bound to the agent settings every file was
+/// reviewed with (the caller passes it only
 /// after every chunk was clear, with no gaps and a clear decision, and all
 /// files shared one set of settings), then prune the store. Returns notes
 /// for the report.
-pub fn remember(memory: &Memory, approved: Option<(&[SourceFile], &AgentSettings)>) -> Vec<String> {
+pub fn remember(
+    memory: &Memory,
+    approved: Option<(&[SourceFile], &AgentSettings)>,
+    unread: &Unread,
+) -> Vec<String> {
     let mut notes = Vec::new();
     if let Some((files, settings)) = approved.filter(|_| memory.use_diff)
         && let Err(error) = baseline::record(
@@ -560,6 +611,7 @@ pub fn remember(memory: &Memory, approved: Option<(&[SourceFile], &AgentSettings
             memory.class,
             &memory.units,
             files,
+            unread,
             settings,
             memory.now,
         )
@@ -591,12 +643,14 @@ mod tests {
     use crate::config::Settings;
     use crate::config::file::{AgentDefaults, PartialConfig};
     use crate::config::model::{AgentSettings, Profile, SourceClass, Thinking};
-    use crate::engine::baseline::{self, Identity, Unit};
+    use crate::engine::baseline::{self, Identity, Unit, Unread};
     use crate::engine::store::{Store, VERDICTS};
     use crate::error::Error;
     use crate::report::AgentOutcome;
     use crate::test_support::{TempDir, mock_opencode, mock_opencode_counting, write_script};
     use crate::tools::OpenCode;
+
+    static NOTHING_UNREAD: Unread = Unread::new();
 
     fn file(path: &str, content: &str) -> SourceFile {
         SourceFile {
@@ -634,6 +688,7 @@ mod tests {
             units: &[],
             context: &[],
             hash_only: &[],
+            unread: &NOTHING_UNREAD,
         }
     }
 
@@ -848,7 +903,7 @@ mod tests {
                 .len(),
             1
         );
-        assert!(remember(&memory, Some((&first, &settings))).is_empty());
+        assert!(remember(&memory, Some((&first, &settings)), &NOTHING_UNREAD).is_empty());
 
         let upgraded = [
             file("PKGBUILD", "pkgname=demo\n"),
@@ -887,7 +942,7 @@ mod tests {
 
         let first = review_group(&group(&settings, &files), &opencode, Some(&memory));
         assert!(matches!(first.runs.as_slice(), [run] if run.cached.is_none()));
-        assert!(remember(&memory, Some((&files, &settings))).is_empty());
+        assert!(remember(&memory, Some((&files, &settings)), &NOTHING_UNREAD).is_empty());
         fs::remove_file(bin.path().join("stdin")).unwrap();
 
         let second = review_group(&group(&settings, &files), &opencode, Some(&memory));
@@ -918,7 +973,7 @@ mod tests {
             file("PKGBUILD", "pkgname=demo\n"),
             file("src/lib.c", &library),
         ];
-        assert!(remember(&memory, Some((&v1, &settings))).is_empty());
+        assert!(remember(&memory, Some((&v1, &settings)), &NOTHING_UNREAD).is_empty());
 
         // Pass 1 of v2: an upgrade (src/lib.c as a diff), approved.
         let v2 = [
@@ -932,7 +987,7 @@ mod tests {
                 .unwrap()
                 .contains(r#""kind":"diff""#)
         );
-        assert!(remember(&memory, Some((&v2, &settings))).is_empty());
+        assert!(remember(&memory, Some((&v2, &settings)), &NOTHING_UNREAD).is_empty());
         fs::remove_file(bin.path().join("stdin")).unwrap();
 
         // Pass 2 over the identical v2 tree: no first review of v2 is
@@ -962,19 +1017,18 @@ mod tests {
         let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
         let memory = memory(&state, units("aur:demo"));
         let settings = AgentSettings::default();
+        // No entry point, and nothing changed.
         let approved = [file("src/lib.c", "int a;\n"), file("src/old.c", "int b;\n")];
-        assert!(remember(&memory, Some((&approved, &settings))).is_empty());
+        assert!(remember(&memory, Some((&approved, &settings)), &NOTHING_UNREAD).is_empty());
 
-        // Only a non-entry file is left, unchanged; the other was removed.
-        let current = [file("src/lib.c", "int a;\n")];
-        let review = review_group(&group(&settings, &current), &opencode, Some(&memory));
+        let review = review_group(&group(&settings, &approved), &opencode, Some(&memory));
 
         assert!(review.runs.is_empty() && !review.too_large && review.invalid.is_none());
         assert!(
             review
                 .notes
                 .iter()
-                .any(|note| note.contains("0 file(s) sent as diffs, 1 unchanged, 1 removed")),
+                .any(|note| note.contains("0 file(s) sent as diffs, 2 unchanged, 0 removed")),
             "{:?}",
             review.notes
         );
@@ -985,6 +1039,155 @@ mod tests {
             review.notes
         );
         assert!(!bin.path().join("stdin").exists());
+    }
+
+    #[test]
+    fn an_upgrade_that_only_removes_files_is_reviewed_in_full() {
+        let state = TempDir::new("engine-only-removed");
+        let bin = TempDir::new("engine-only-removed-bin");
+        let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
+        let memory = memory(&state, units("aur:demo"));
+        let settings = AgentSettings::default();
+        let approved = [file("src/lib.c", "int a;\n"), file("src/old.c", "int b;\n")];
+        assert!(remember(&memory, Some((&approved, &settings)), &NOTHING_UNREAD).is_empty());
+
+        let current = [file("src/lib.c", "int a;\n")];
+        let review = review_group(&group(&settings, &current), &opencode, Some(&memory));
+
+        assert_eq!(review.runs.len(), 1);
+        assert!(
+            review
+                .notes
+                .iter()
+                .any(|note| note.contains("the tree is not the approved one")),
+            "{:?}",
+            review.notes
+        );
+        let sent = fs::read_to_string(bin.path().join("stdin")).unwrap();
+        assert!(!sent.contains("This is an upgrade"));
+        assert!(sent.contains(r#""path":"src/lib.c","kind":"whole""#));
+    }
+
+    #[test]
+    fn a_unit_without_a_baseline_does_not_undo_another_units() {
+        let settings = AgentSettings::default();
+        let unit = |prefix: &str, identity: &str| Unit {
+            prefix: prefix.into(),
+            identity: Identity::parse(identity).unwrap(),
+        };
+        let unread = |entries: &[&str]| -> Unread {
+            entries
+                .iter()
+                .map(|path| ((*path).to_string(), "a".repeat(64)))
+                .collect()
+        };
+        let state = TempDir::new("engine-two-units");
+        let bin = TempDir::new("engine-two-units-bin");
+        let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
+        // Only `a/` was ever approved.
+        let approved = Memory {
+            units: vec![unit("a/", "theme:a")],
+            ..memory(&state, Vec::new())
+        };
+        let a = [file("a/init.lua", "print(1)\n")];
+        let a_unread = unread(&["a/helper.so"]);
+        assert!(remember(&approved, Some((&a, &settings)), &a_unread).is_empty());
+
+        let both = Memory {
+            units: vec![unit("a/", "theme:a"), unit("b/", "theme:b")],
+            ..memory(&state, Vec::new())
+        };
+        // `b/` has text: it is sent whole, `a/` stays approved.
+        let files = [
+            file("a/init.lua", "print(1)\n"),
+            file("b/init.lua", "print(2)\n"),
+        ];
+        let all_unread = unread(&["a/helper.so", "b/helper.so"]);
+        let with_b = Group {
+            unread: &all_unread,
+            ..group(&settings, &files)
+        };
+        let review = review_group(&with_b, &opencode, Some(&both));
+        assert_eq!(review.runs.len(), 1, "{:?}", review.notes);
+        let sent = fs::read_to_string(bin.path().join("stdin")).unwrap();
+        assert!(sent.contains("This is an upgrade"));
+        assert!(sent.contains(r#""path":"b/init.lua","kind":"whole""#));
+        assert!(!sent.contains(r#""path":"a/init.lua","kind""#));
+
+        // `b/` is only a binary: nothing to send, and nobody approved it.
+        fs::remove_file(bin.path().join("stdin")).unwrap();
+        let only_binary = Group {
+            unread: &all_unread,
+            ..group(&settings, &a)
+        };
+        let review = review_group(&only_binary, &opencode, Some(&both));
+        assert_eq!(review.runs.len(), 1, "{:?}", review.notes);
+        assert!(
+            review
+                .notes
+                .iter()
+                .any(|note| note.contains("the tree is not the approved one")),
+            "{:?}",
+            review.notes
+        );
+        let sent = fs::read_to_string(bin.path().join("stdin")).unwrap();
+        assert!(sent.contains(r#""path":"a/init.lua","kind":"whole""#));
+    }
+
+    #[test]
+    fn a_new_or_changed_binary_makes_an_upgrade_a_full_review() {
+        let digest = |fill: &str| fill.repeat(64);
+        let unread = |entries: &[(&str, &str)]| -> Unread {
+            entries
+                .iter()
+                .map(|(path, fill)| ((*path).to_string(), digest(fill)))
+                .collect()
+        };
+        let settings = AgentSettings::default();
+        let files = [file("main.lua", "require('lib.helper')\n")];
+        let approved = unread(&[("lib/helper.so", "a")]);
+        for (name, current) in [
+            (
+                "added",
+                unread(&[("lib/helper.so", "a"), ("lib/extra.so", "b")]),
+            ),
+            ("changed", unread(&[("lib/helper.so", "b")])),
+            ("removed", unread(&[])),
+        ] {
+            let state = TempDir::new(&format!("engine-binary-{name}"));
+            let bin = TempDir::new(&format!("engine-binary-{name}-bin"));
+            let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
+            let memory = memory(&state, units("aur:demo"));
+            assert!(remember(&memory, Some((&files, &settings)), &approved).is_empty());
+
+            let same = Group {
+                unread: &approved,
+                ..group(&settings, &files)
+            };
+            let review = review_group(&same, &opencode, Some(&memory));
+            assert!(review.runs.is_empty(), "{name}: {:?}", review.notes);
+
+            let group = Group {
+                unread: &current,
+                ..group(&settings, &files)
+            };
+            let review = review_group(&group, &opencode, Some(&memory));
+            assert_eq!(review.runs.len(), 1, "{name}: {:?}", review.notes);
+            assert!(
+                review
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("cannot be matched to the approved version")),
+                "{name}: {:?}",
+                review.notes
+            );
+            let sent = fs::read_to_string(bin.path().join("stdin")).unwrap();
+            assert!(!sent.contains("This is an upgrade"), "{name}");
+            assert!(
+                sent.contains(r#""path":"main.lua","kind":"whole""#),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -1002,7 +1205,7 @@ mod tests {
             file("PKGBUILD", "pkgname=demo\n"),
             file("src/lib.c", "int a;\n"),
         ];
-        assert!(remember(&memory, Some((&approved, &weaker))).is_empty());
+        assert!(remember(&memory, Some((&approved, &weaker)), &NOTHING_UNREAD).is_empty());
 
         let upgraded = [
             file("PKGBUILD", "pkgname=demo\n"),
@@ -1062,6 +1265,7 @@ mod tests {
             SourceClass::Aur,
             &memory.units,
             &removed_files,
+            &NOTHING_UNREAD,
             &settings,
             memory.now,
         )
@@ -1113,14 +1317,14 @@ mod tests {
         let settings = AgentSettings::default();
         let files = [file("PKGBUILD", "pkgname=demo\n")];
 
-        assert!(remember(&memory, None).is_empty());
+        assert!(remember(&memory, None, &NOTHING_UNREAD).is_empty());
         assert!(
             baseline::load(&memory.store, SourceClass::Aur, &memory.units, &settings)
                 .unwrap()
                 .is_none()
         );
 
-        assert!(remember(&memory, Some((&files, &settings))).is_empty());
+        assert!(remember(&memory, Some((&files, &settings)), &NOTHING_UNREAD).is_empty());
         assert!(
             baseline::load(&memory.store, SourceClass::Aur, &memory.units, &settings)
                 .unwrap()

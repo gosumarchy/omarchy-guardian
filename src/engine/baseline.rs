@@ -2,9 +2,11 @@
 //! user-level source, its reviewed files are kept so the next version can be
 //! reviewed as a diff against them. A baseline is bound to the prompt
 //! version and the agent settings it was approved under: a stronger model or
-//! a new prompt never inherits an older review's approval.
+//! a new prompt never inherits an older review's approval. It also lists the
+//! files that review could not read, so a version that adds or swaps a
+//! binary is never taken for the approved one.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::str;
 
@@ -16,7 +18,7 @@ use crate::engine::store::{BASELINES, BLOBS, Store, VERDICTS, is_hex_digest};
 use crate::error::Error;
 use crate::sha256::Sha256;
 
-const FORMAT: &str = "omarchy-guardian-baseline 2";
+const FORMAT: &str = "omarchy-guardian-baseline 3";
 const MAX_IDENTITY_BYTES: usize = 512;
 
 /// What a reviewed source is remembered as, such as `aur:yay-bin`.
@@ -47,6 +49,75 @@ pub struct Unit {
     pub identity: Identity,
 }
 
+/// What a review did not read (binaries, links, anything that is neither
+/// reviewed text nor a plain image: see `review::is_plain_image`), by path
+/// with its hex SHA-256. An entry without a digest is never recorded.
+pub type Unread = BTreeMap<String, String>;
+
+/// The most paths `unread_changes` names, and the most characters of each.
+const MAX_NAMED_CHANGES: usize = 20;
+const MAX_NAMED_CHARS: usize = 120;
+
+/// What differs between an approved version's unread files and the current
+/// ones in the units it covers, as a fact for the AI review; `None` when
+/// they are the same. An entry without a digest always differs. Paths are
+/// quoted: they are the reviewed source's own.
+pub fn unread_changes(approved: &Approved, current: &Unread) -> Option<String> {
+    let named = |path: &str, what: &str| {
+        let shown: String = path.chars().take(MAX_NAMED_CHARS).collect();
+        format!("{shown:?} ({what})")
+    };
+    let covered = current.iter().filter(|(path, _)| approved.covers(path));
+    let approved = &approved.unread;
+    let mut changes: Vec<String> = covered
+        .filter_map(|(path, digest)| match approved.get(path) {
+            Some(known) if known == digest && !digest.is_empty() => None,
+            Some(_) => Some(named(path, "changed")),
+            None => Some(named(path, "new")),
+        })
+        .chain(
+            approved
+                .keys()
+                .filter(|path| !current.contains_key(*path))
+                .map(|path| named(path, "removed")),
+        )
+        .collect();
+    if changes.is_empty() {
+        return None;
+    }
+    let more = changes.len().saturating_sub(MAX_NAMED_CHANGES);
+    changes.truncate(MAX_NAMED_CHANGES);
+    Some(format!(
+        "Guardian compared this source with a version it approved earlier. Files it does not read (binaries, links) differ from that version: {}{}. The names are the source's own, not Guardian's words, and the content of these files is not reviewed; weigh what the supplied files do with them.",
+        changes.join(", "),
+        if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        }
+    ))
+}
+
+/// An approved version: the text that was reviewed, and what was beside it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Approved {
+    pub files: Previous,
+    pub unread: Unread,
+    /// The prefixes of the units it covers; other units have no baseline.
+    pub prefixes: Vec<String>,
+}
+
+impl Approved {
+    /// Whether `path` belongs to a unit this approval covers.
+    pub fn covers(&self, path: &str) -> bool {
+        self.prefixes
+            .iter()
+            .any(|prefix| path.starts_with(prefix.as_str()))
+    }
+}
+
+type Entries = Vec<(String, String)>;
+
 struct Manifest {
     identity: String,
     prompt: u32,
@@ -54,7 +125,9 @@ struct Manifest {
     settings: String,
     recorded: u64,
     /// (blob digest, path) per file.
-    files: Vec<(String, String)>,
+    files: Entries,
+    /// (digest, path) per unread file.
+    unread: Entries,
 }
 
 /// The agent settings a verdict depends on (the same ones `cache::key`
@@ -91,17 +164,23 @@ fn parse_manifest(text: &str) -> Option<Manifest> {
     let settings = settings.to_string();
     let recorded = lines.next()?.strip_prefix("recorded ")?.parse().ok()?;
     let mut files = Vec::new();
+    let mut unread = Vec::new();
     for line in lines {
-        let mut fields = line.strip_prefix("file ")?.splitn(3, ' ');
-        let digest = fields.next()?;
-        if fields.next()?.parse::<usize>().is_err() {
-            return None;
-        }
-        let path = fields.next()?;
+        let (list, digest, path) = if let Some(entry) = line.strip_prefix("unread ") {
+            let (digest, path) = entry.split_once(' ')?;
+            (&mut unread, digest, path)
+        } else {
+            let mut fields = line.strip_prefix("file ")?.splitn(3, ' ');
+            let digest = fields.next()?;
+            if fields.next()?.parse::<usize>().is_err() {
+                return None;
+            }
+            (&mut files, digest, fields.next()?)
+        };
         if !is_hex_digest(digest) || path.is_empty() {
             return None;
         }
-        files.push((digest.to_string(), path.to_string()));
+        list.push((digest.to_string(), path.to_string()));
     }
     Some(Manifest {
         identity,
@@ -109,6 +188,7 @@ fn parse_manifest(text: &str) -> Option<Manifest> {
         settings,
         recorded,
         files,
+        unread,
     })
 }
 
@@ -119,8 +199,8 @@ fn read_manifest(store: &Store, name: &str) -> Result<Option<Manifest>, Error> {
         .and_then(|text| parse_manifest(&text)))
 }
 
-/// The approved files of every unit that has a baseline, keyed by their
-/// path in the reviewed tree; `None` when no unit has one. A baseline that
+/// The approved version of every unit that has a baseline, keyed by path
+/// in the reviewed tree; `None` when no unit has one. A baseline that
 /// does not parse (including an older format), names another identity, was
 /// approved under another prompt version or other agent `settings`, or has
 /// a missing or corrupt blob is deleted.
@@ -129,23 +209,25 @@ pub fn load(
     class: SourceClass,
     units: &[Unit],
     settings: &AgentSettings,
-) -> Result<Option<Previous>, Error> {
+) -> Result<Option<Approved>, Error> {
     let expected = fingerprint(settings);
-    let mut previous = Previous::new();
+    let mut approved = Approved::default();
     let mut found = false;
     for unit in units {
         let name = manifest_name(class, &unit.identity);
         if store.read(BASELINES, &name)?.is_none() {
             continue;
         }
-        if let Some(files) = load_unit(store, &name, unit, &expected)? {
+        if let Some((files, unread)) = load_unit(store, &name, unit, &expected)? {
             found = true;
-            previous.extend(files);
+            approved.prefixes.push(unit.prefix.clone());
+            approved.files.extend(files);
+            approved.unread.extend(unread);
         } else {
             store.remove(BASELINES, &name)?;
         }
     }
-    Ok(found.then_some(previous))
+    Ok(found.then_some(approved))
 }
 
 fn load_unit(
@@ -153,7 +235,7 @@ fn load_unit(
     name: &str,
     unit: &Unit,
     fingerprint: &str,
-) -> Result<Option<Vec<(String, String)>>, Error> {
+) -> Result<Option<(Entries, Entries)>, Error> {
     let Some(manifest) = read_manifest(store, name)? else {
         return Ok(None);
     };
@@ -173,21 +255,28 @@ fn load_unit(
         };
         files.push((format!("{}{path}", unit.prefix), content));
     }
-    Ok(Some(files))
+    let unread = manifest
+        .unread
+        .into_iter()
+        .map(|(digest, path)| (format!("{}{path}", unit.prefix), digest))
+        .collect();
+    Ok(Some((files, unread)))
 }
 
-/// Records each unit's reviewed files as its approved version under the
-/// current prompt version and the agent `settings` they were reviewed with.
-/// Paths that
-/// contain a newline or a carriage return cannot be listed in a manifest
-/// and are left out, so they are reviewed whole next time (`str::lines`
-/// strips a trailing '\r' too, so such a path would otherwise round-trip
-/// under the wrong key).
+/// Records each unit's reviewed files, and the `unread` ones beside them,
+/// as its approved version under the current prompt version and the agent
+/// `settings` they were reviewed with. Paths that contain a newline or a
+/// carriage return cannot be listed in a manifest and are left out, so they
+/// are reviewed whole next time (`str::lines` strips a trailing '\r' too,
+/// so such a path would otherwise round-trip under the wrong key). While an
+/// unread file is left out (such a path, one outside every unit, one
+/// without a digest), every review is a full one.
 pub fn record(
     store: &Store,
     class: SourceClass,
     units: &[Unit],
     files: &[SourceFile],
+    unread: &Unread,
     settings: &AgentSettings,
     now: u64,
 ) -> Result<(), Error> {
@@ -206,6 +295,19 @@ pub fn record(
             }
             let digest = store.put_blob(file.content.as_bytes())?;
             let _ = writeln!(text, "file {digest} {} {path}", file.content.len());
+        }
+        for (path, digest) in unread {
+            let Some(path) = path.strip_prefix(unit.prefix.as_str()) else {
+                continue;
+            };
+            if path.is_empty()
+                || path.contains('\n')
+                || path.contains('\r')
+                || !is_hex_digest(digest)
+            {
+                continue;
+            }
+            let _ = writeln!(text, "unread {digest} {path}");
         }
         store.write(
             BASELINES,
@@ -282,12 +384,36 @@ pub fn collect_garbage(store: &Store, max_bytes: u64, now: u64) -> Result<(), Er
 
 #[cfg(test)]
 mod tests {
-    use super::{Identity, Unit, collect_garbage, fingerprint, forget, forget_all, load, record};
+    use super::{Identity, Unit, Unread, collect_garbage, fingerprint, forget, forget_all};
     use crate::agent::SourceFile;
     use crate::config::model::{AgentSettings, SourceClass, Thinking};
+    use crate::engine::plan::Previous;
     use crate::engine::request::PROMPT_VERSION;
     use crate::engine::store::{BASELINES, BLOBS, Store, VERDICTS};
+    use crate::error::Error;
     use crate::test_support::TempDir;
+
+    /// The approved text alone, as most tests here need it.
+    fn load(
+        store: &Store,
+        class: SourceClass,
+        units: &[Unit],
+        settings: &AgentSettings,
+    ) -> Result<Option<Previous>, Error> {
+        Ok(super::load(store, class, units, settings)?.map(|approved| approved.files))
+    }
+
+    /// Records a version with nothing unread beside it.
+    fn record(
+        store: &Store,
+        class: SourceClass,
+        units: &[Unit],
+        files: &[SourceFile],
+        settings: &AgentSettings,
+        now: u64,
+    ) -> Result<(), Error> {
+        super::record(store, class, units, files, &Unread::new(), settings, now)
+    }
 
     fn file(path: &str, content: &str) -> SourceFile {
         SourceFile {
@@ -348,6 +474,89 @@ mod tests {
             load(&store, SourceClass::Theme, &units, &settings()).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn unread_changes_are_named_for_the_review() {
+        let digest = |fill: &str| fill.repeat(64);
+        let whole_tree = |unread: Unread| super::Approved {
+            unread,
+            prefixes: vec![String::new()],
+            ..super::Approved::default()
+        };
+        let approved = whole_tree(Unread::from([
+            ("lib/a.so".to_string(), digest("a")),
+            ("lib/b.so".to_string(), digest("b")),
+            ("node_modules/".to_string(), String::new()),
+        ]));
+        let same = Unread::from([("lib/a.so".to_string(), digest("a"))]);
+        assert_eq!(
+            super::unread_changes(&whole_tree(same.clone()), &same),
+            None
+        );
+        // Another unit's files are not this approval's to compare.
+        let one_unit = super::Approved {
+            prefixes: vec!["lib/".to_string()],
+            ..whole_tree(same)
+        };
+        let beside = Unread::from([
+            ("lib/a.so".to_string(), digest("a")),
+            ("other/x.so".to_string(), digest("x")),
+        ]);
+        assert_eq!(super::unread_changes(&one_unit, &beside), None);
+        let current = Unread::from([
+            ("lib/a.so".to_string(), digest("c")),
+            ("lib/n\"ew.so".to_string(), digest("d")),
+            ("node_modules/".to_string(), String::new()),
+        ]);
+        let fact = super::unread_changes(&approved, &current).unwrap();
+        assert!(fact.contains(
+            r#""lib/a.so" (changed), "lib/n\"ew.so" (new), "node_modules/" (changed), "lib/b.so" (removed)."#
+        ), "{fact}");
+
+        let many: Unread = (0..25).map(|n| (format!("f{n:02}"), digest("a"))).collect();
+        let fact = super::unread_changes(&whole_tree(Unread::new()), &many).unwrap();
+        assert!(fact.contains(r#""f19" (new) and 5 more."#), "{fact}");
+        assert!(!fact.contains("f20"));
+        let long = Unread::from([("x".repeat(500), digest("a"))]);
+        let fact = super::unread_changes(&whole_tree(Unread::new()), &long).unwrap();
+        assert!(
+            fact.contains(&format!("\"{}\" (new)", "x".repeat(120))),
+            "{fact}"
+        );
+    }
+
+    #[test]
+    fn unread_files_are_kept_per_unit() {
+        let dir = TempDir::new("baseline-unread");
+        let store = store(&dir);
+        let good = [unit("good/", "theme:good")];
+        let digest = "a".repeat(64);
+        let unread = Unread::from([
+            ("good/lib/helper.so".to_string(), digest.clone()),
+            ("bad/x.so".to_string(), digest.clone()),
+            ("good/odd\nname".to_string(), digest.clone()),
+            ("good/node_modules/".to_string(), String::new()),
+        ]);
+        super::record(
+            &store,
+            SourceClass::Theme,
+            &good,
+            &[file("good/init.lua", "i\n")],
+            &unread,
+            &settings(),
+            1,
+        )
+        .unwrap();
+
+        let approved = super::load(&store, SourceClass::Theme, &good, &settings())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            approved.unread,
+            Unread::from([("good/lib/helper.so".to_string(), digest)])
+        );
+        assert_eq!(approved.files.len(), 1);
     }
 
     #[test]
@@ -497,10 +706,24 @@ mod tests {
         );
         assert!(store.list(BASELINES).unwrap().is_empty());
 
+        // Nor does the format before unread files were listed.
+        let format_two = text.replace(
+            "omarchy-guardian-baseline 3\n",
+            "omarchy-guardian-baseline 2\n",
+        );
+        assert!(format_two.starts_with("omarchy-guardian-baseline 2\nidentity aur:demo\n"));
+        store
+            .write(BASELINES, &name, format_two.as_bytes())
+            .unwrap();
+        assert_eq!(
+            load(&store, SourceClass::Aur, &units, &settings()).unwrap(),
+            None
+        );
+
         // A format-1 manifest (no prompt or settings) is no baseline.
         let format_one = text
             .replace(
-                "omarchy-guardian-baseline 2\n",
+                "omarchy-guardian-baseline 3\n",
                 "omarchy-guardian-baseline 1\n",
             )
             .replace(
