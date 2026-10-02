@@ -601,10 +601,16 @@ says the memory was not used and the review runs in full:
   source when every chunk was `clear`, there were no gaps, and the decision
   is `CLEAR`. The next review of the same source is then sent as follows:
   changed files whole when they are small (up to 48 KiB: what a changed
-  line switches on may be anywhere in the file) and as unified diffs with
-  twenty lines of context against the baseline when they are larger, new
-  files and entry points whole, and unchanged files only as names in the
-  file list. Local
+  line switches on may be anywhere in the file), larger changed files
+  whole too while together they fit half a request, and the rest as
+  unified diffs with twenty lines of context against the baseline; new
+  files and entry points whole; and unchanged files only as names in the
+  file list, except the code files a new or changed file names (`payload.c`, or
+  `helper` for `helper.py`, in a changed `main.c`), which are sent along
+  while they fit half a request. If all that does not fit in
+  `max_chunks`, the changes alone are sent. What a
+  change switches on in a file that is neither shown nor named this way
+  is not seen in that review: it was reviewed when it was approved. Local
   rules and the dependency audit still read every file. A baseline only
   counts under the prompt version, model, variant and thinking level that
   approved it; after any of them changes, the next review is a full one.
@@ -717,7 +723,13 @@ non-UTF-8 file names, text files over 2 MiB, files over 512 MiB, unresolved
 Git LFS pointers and an invalid or inconclusive AI reply all make the review
 **incomplete**, never clear. An *unavailable* AI review (no OpenCode, a
 provider error, a timeout) follows the class's `ai` setting instead: `WARNED`
-for `official` under `standard`, blocked everywhere else. In `.git`, only the
+for `official` under `standard`, blocked everywhere else. A provider that
+answers that the request is too long for the model is not unavailable:
+that review is incomplete. A timeout cannot be told from a slow provider,
+so a source written to keep the reviewer busy until it runs out of time
+is let through with a warning wherever an unavailable review only warns
+(`official` under `standard`, and any class you set to `ai = optional`);
+that setting is for sources you already trust. In `.git`, only the
 `config` (checked locally for keys that make git run a command, such as
 `core.fsmonitor`, filters and `!` aliases, and never sent to the AI; also
 `config.worktree`) and hooks other than git's `.sample` files are reviewed.

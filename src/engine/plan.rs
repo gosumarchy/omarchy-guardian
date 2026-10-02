@@ -1,7 +1,7 @@
 //! Turns the files queued for the AI review into chunked requests: rank by
 //! risk, choose what each file is sent as on an upgrade, and pack.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::mem;
 
 use crate::agent::SourceFile;
@@ -11,10 +11,20 @@ use crate::rules;
 /// Unchanged lines shown around each change in an upgrade diff.
 const DIFF_CONTEXT: usize = 20;
 
-/// A changed file up to this size goes whole on an upgrade: a diff shows
-/// the lines around a change, and what a changed line switches on may sit
-/// anywhere in the file (a guard flipped far above a dormant body).
+/// A changed file up to this size always goes whole on an upgrade: a diff
+/// shows the lines around a change, and what a changed line switches on
+/// may sit anywhere in the file (a guard flipped far above a dormant body).
 const WHOLE_ON_UPGRADE: usize = 48 * 1024;
+/// Larger changed files go whole too while together they fit this share
+/// of one request, the riskiest first; past it they are sent as diffs.
+const WHOLE_SHARE: usize = 2;
+
+/// Unchanged files named by a changed one are sent along with it, up to
+/// this share of one request: what a change switches on may sit in a file
+/// that did not change.
+const NAMED_SHARE: usize = 2;
+/// The shortest file name looked for in the changed files.
+const MIN_NAMED: usize = 5;
 
 /// Bytes charged for each manifest entry on top of its path.
 pub const MANIFEST_ENTRY_OVERHEAD: usize = 32;
@@ -138,9 +148,44 @@ pub struct HashOnly {
 /// The most hash-only manifest rows; the rest are counted in one row.
 const MAX_HASH_ONLY_ROWS: usize = 64;
 
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// A file name without its extension, as code names a module (`import
+/// helper` for `helper.py`).
+fn stem(name: &str) -> Option<&str> {
+    name.rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .filter(|stem| !stem.is_empty())
+}
+
+/// Which of `names` the texts hold as a word: a file name they mention.
+fn named_in<'a>(
+    names: &HashSet<&'a str>,
+    texts: &mut dyn Iterator<Item = &str>,
+) -> HashSet<&'a str> {
+    let mut found = HashSet::new();
+    if names.is_empty() {
+        return found;
+    }
+    for text in texts {
+        for word in text.split(|character: char| {
+            !(character.is_alphanumeric() || matches!(character, '.' | '_' | '-' | '+'))
+        }) {
+            // `see payload.c.` names it too.
+            if let Some(name) = names.get(word.trim_end_matches(['.', '-', '+'])) {
+                found.insert(*name);
+            }
+        }
+    }
+    found
+}
+
 /// Manifest rows for hash-only files: one per file, except media, which get
-/// one row per directory.
-pub fn hash_only_entries(files: &[HashOnly]) -> Vec<ManifestEntry> {
+/// one row per directory. Past the limit, the files a reviewed text names
+/// (`named`) come first.
+pub fn hash_only_entries(files: &[HashOnly], named: &HashSet<&str>) -> Vec<ManifestEntry> {
     let mut entries: Vec<ManifestEntry> = Vec::new();
     let mut media: BTreeMap<String, (usize, usize, BTreeSet<&str>)> = BTreeMap::new();
     for file in files {
@@ -186,6 +231,8 @@ pub fn hash_only_entries(files: &[HashOnly]) -> Vec<ManifestEntry> {
         });
     }
     if entries.len() > MAX_HASH_ONLY_ROWS {
+        // What a reviewed file names keeps its row.
+        entries.sort_by_key(|entry| !named.contains(file_name(&entry.path)));
         let rest = entries.split_off(MAX_HASH_ONLY_ROWS - 1);
         entries.push(ManifestEntry {
             path: "(more hash-only files)".into(),
@@ -298,7 +345,8 @@ enum Choice {
     Unchanged,
 }
 
-pub fn build(input: &PlanInput<'_>) -> Result<Plan, TooLarge> {
+/// The files by risk: tier, then code before documentation, then path.
+fn ranked<'a>(input: &'a PlanInput<'_>) -> Vec<(u8, bool, &'a SourceFile)> {
     let mut ranked: Vec<(u8, bool, &SourceFile)> = input
         .files
         .iter()
@@ -314,6 +362,47 @@ pub fn build(input: &PlanInput<'_>) -> Result<Plan, TooLarge> {
     ranked.sort_by(|left, right| {
         (left.0, left.1, &left.2.path).cmp(&(right.0, right.1, &right.2.path))
     });
+    ranked
+}
+
+/// The manifest rows of the files that were hashed and not read.
+fn hash_only_rows(input: &PlanInput<'_>) -> Vec<ManifestEntry> {
+    // Which of them a reviewed file names only matters past the limit.
+    let names: HashSet<&str> = if input.hash_only.len() > MAX_HASH_ONLY_ROWS {
+        input
+            .hash_only
+            .iter()
+            .map(|file| file_name(&file.path))
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    hash_only_entries(
+        input.hash_only,
+        &named_in(
+            &names,
+            &mut input.files.iter().map(|file| file.content.as_str()),
+        ),
+    )
+}
+
+pub fn build(input: &PlanInput<'_>) -> Result<Plan, TooLarge> {
+    // An upgrade shows more than the changes while that fits; where it
+    // does not, the changes alone are still an upgrade review.
+    build_with(input, true).or_else(|too_large| {
+        if input.previous.is_some() && too_large.entry_point.is_none() {
+            build_with(input, false)
+        } else {
+            Err(too_large)
+        }
+    })
+}
+
+/// `build`, with or without what an upgrade sends beyond its changes
+/// (`extras`): larger changed files whole, and unchanged files a change
+/// names.
+fn build_with(input: &PlanInput<'_>, extras: bool) -> Result<Plan, TooLarge> {
+    let ranked = ranked(input);
 
     let current: BTreeSet<&str> = input.files.iter().map(|file| file.path.as_str()).collect();
     let removed: Vec<(&String, &String)> = input
@@ -323,7 +412,7 @@ pub fn build(input: &PlanInput<'_>) -> Result<Plan, TooLarge> {
         .filter(|(path, _)| !current.contains(path.as_str()))
         .collect();
 
-    let hash_only = hash_only_entries(input.hash_only);
+    let hash_only = hash_only_rows(input);
     let overhead = input.findings_bytes
         + hash_only
             .iter()
@@ -347,12 +436,23 @@ pub fn build(input: &PlanInput<'_>) -> Result<Plan, TooLarge> {
     }
     let capacity = input.max_input_bytes - overhead;
 
+    let mut whole_room = if extras { capacity / WHOLE_SHARE } else { 0 };
+    let mut choices: Vec<Choice> = ranked
+        .iter()
+        .map(|(tier, _, file)| choose(file, *tier == 0, input.previous, capacity, &mut whole_room))
+        .collect();
+    if let Some(previous) = input.previous.filter(|_| extras) {
+        send_what_a_change_names(&ranked, &mut choices, previous, capacity);
+    }
+
     let mut manifest = Vec::with_capacity(ranked.len() + removed.len());
     let mut items = Vec::new();
-    for (tier, _, file) in ranked {
-        let sent = match choose(file, tier == 0, input.previous, capacity) {
+    for ((_, _, file), choice) in ranked.into_iter().zip(choices) {
+        let sent = match choice {
+            // Measured as it is packed: an entry point runs as a whole,
+            // so it is not reviewed in pieces.
             Choice::Whole
-                if file.path.len() + file.content.len() > capacity
+                if file.path.len() + weight(&file.content) > capacity
                     && is_entry_point(&file.path, &file.content, input.unit_prefixes) =>
             {
                 return Err(TooLarge {
@@ -405,13 +505,64 @@ pub fn build(input: &PlanInput<'_>) -> Result<Plan, TooLarge> {
     })
 }
 
-/// What an upgrade sends for one file. Entry points always go whole; a diff
-/// is used only when it is smaller than the file and fits one chunk.
+/// On an upgrade, turns the unchanged files a changed one names into
+/// whole ones, code first, while they fit `NAMED_SHARE` of a request: a
+/// change that only switches on what another file already held is then
+/// seen with that file.
+fn send_what_a_change_names(
+    ranked: &[(u8, bool, &SourceFile)],
+    choices: &mut [Choice],
+    previous: &Previous,
+    capacity: usize,
+) {
+    let names: HashSet<&str> = ranked
+        .iter()
+        .zip(choices.iter())
+        .filter(|((tier, documentation, _), choice)| {
+            matches!(choice, Choice::Unchanged) && *tier <= 1 && !documentation
+        })
+        .flat_map(|((_, _, file), _)| {
+            let name = file_name(&file.path);
+            [Some(name), stem(name)]
+        })
+        .flatten()
+        .filter(|name| name.len() >= MIN_NAMED)
+        .collect();
+    let named = named_in(
+        &names,
+        // The files that are new or changed: an entry point sent whole
+        // as it was names nothing new.
+        &mut ranked
+            .iter()
+            .filter(|(_, _, file)| previous.get(&file.path) != Some(&file.content))
+            .map(|(_, _, file)| file.content.as_str()),
+    );
+    let mut room = capacity / NAMED_SHARE;
+    for ((_, _, file), choice) in ranked.iter().zip(choices.iter_mut()) {
+        let name = file_name(&file.path);
+        if !matches!(choice, Choice::Unchanged)
+            || !(named.contains(name) || stem(name).is_some_and(|stem| named.contains(stem)))
+        {
+            continue;
+        }
+        let cost = file.path.len() + weight(&file.content);
+        if cost <= room {
+            room -= cost;
+            *choice = Choice::Whole;
+        }
+    }
+}
+
+/// What an upgrade sends for one file. Entry points always go whole, and
+/// so does a small changed file, and a larger one while `whole_room`
+/// lasts. A diff is used past that, when it is smaller than the file and
+/// fits one chunk.
 fn choose(
     file: &SourceFile,
     entry_point: bool,
     previous: Option<&Previous>,
     capacity: usize,
+    whole_room: &mut usize,
 ) -> Choice {
     let Some(old) = previous
         .filter(|_| !entry_point)
@@ -424,8 +575,12 @@ fn choose(
     }
     // Whole only where it is seen whole: split into pieces, it would be
     // judged piece by piece, and a diff shows the change better.
-    if file.content.len() <= WHOLE_ON_UPGRADE && file.path.len() + weight(&file.content) <= capacity
-    {
+    let cost = file.path.len() + weight(&file.content);
+    if file.content.len() <= WHOLE_ON_UPGRADE && cost <= capacity {
+        return Choice::Whole;
+    }
+    if cost <= *whole_room {
+        *whole_room -= cost;
         return Choice::Whole;
     }
     match diff::unified(old, &file.content, DIFF_CONTEXT) {
@@ -507,9 +662,13 @@ fn split(item: Item, capacity: usize) -> Result<Vec<Item>, TooLarge> {
             context = next;
             available = room - context.as_ref().map_or(0, |(_, text)| weight(text));
         }
+        // A line that does not fit beside the repeated lines keeps as
+        // many of them as it leaves room for.
         if line_weight > available {
-            context = None;
-            available = room;
+            context = context
+                .take()
+                .and_then(|(first, text)| tail(&text, first, room.saturating_sub(line_weight)));
+            available = room - context.as_ref().map_or(0, |(_, text)| weight(text));
         }
         if line_weight > room {
             // A line longer than a piece is cut; each part after the first
@@ -628,6 +787,130 @@ mod tests {
 
     fn paths(chunk: &[Item]) -> Vec<&str> {
         chunk.iter().map(Item::path).collect()
+    }
+
+    #[test]
+    fn an_upgrade_shows_what_a_change_may_switch_on() {
+        let big = |seed: &str| format!("// {seed}\n{}", "int v = 1;\n".repeat(9000));
+        let previous: Previous = [
+            ("src/a.c".to_string(), big("one")),
+            ("src/b.c".to_string(), big("one")),
+            ("src/main.c".to_string(), "run();\n".to_string()),
+            (
+                "src/payload.c".to_string(),
+                "void payload(void);\n".to_string(),
+            ),
+            ("src/other.c".to_string(), "void other(void);\n".to_string()),
+            ("src/helper.py".to_string(), "def run(): pass\n".to_string()),
+            ("PKGBUILD".to_string(), "source=(listed.c)\n".to_string()),
+            (
+                "src/listed.c".to_string(),
+                "void listed(void);\n".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let files = [
+            // Two changed files past the size that always goes whole: the
+            // first still does, the second no longer fits beside it.
+            file("src/a.c", &big("two")),
+            file("src/b.c", &big("two")),
+            // A change that names a file which did not change.
+            file(
+                "src/main.c",
+                "#include \"payload.c\"\nimport helper\nrun();\n",
+            ),
+            file("src/payload.c", "void payload(void);\n"),
+            file("src/other.c", "void other(void);\n"),
+            file("src/helper.py", "def run(): pass\n"),
+            // An entry point goes whole as it was; what it names is not
+            // sent for that.
+            file("PKGBUILD", "source=(listed.c)\n"),
+            file("src/listed.c", "void listed(void);\n"),
+        ];
+        let plan = plan(&files, Some(&previous), 256 * 1024, 8).unwrap();
+        let sent: Vec<(&str, Sent)> = plan
+            .manifest
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.sent))
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                ("PKGBUILD", Sent::Whole),
+                ("src/a.c", Sent::Whole),
+                ("src/b.c", Sent::Diff),
+                // Named without its extension, as a module is.
+                ("src/helper.py", Sent::Whole),
+                ("src/listed.c", Sent::Unchanged),
+                ("src/main.c", Sent::Whole),
+                ("src/other.c", Sent::Unchanged),
+                ("src/payload.c", Sent::Whole),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_upgrade_that_cannot_show_more_still_shows_its_changes() {
+        let body =
+            |seed: &str, lines: usize| format!("// {seed}\n{}", "int v = 1;\n".repeat(lines));
+        let previous: Previous = [("src/a.c".to_string(), body("one", 9000))]
+            .into_iter()
+            .collect();
+        // A changed file that would go whole, and a new one beside which
+        // it no longer fits one request.
+        let files = [
+            file("src/a.c", &body("two", 9000)),
+            file("src/new.c", &body("new", 14_000)),
+        ];
+        let sent = |max_chunks| {
+            plan(&files, Some(&previous), 256 * 1024, max_chunks).map(|plan| {
+                plan.manifest
+                    .iter()
+                    .map(|entry| (entry.path.clone(), entry.sent))
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(sent(8).unwrap()[0], ("src/a.c".to_string(), Sent::Whole));
+        assert_eq!(sent(1).unwrap()[0], ("src/a.c".to_string(), Sent::Diff));
+    }
+
+    #[test]
+    fn an_entry_point_is_measured_as_it_is_sent() {
+        // Small on disk, six times that in the request: not one piece.
+        let files = [file("PKGBUILD", &"\u{1}".repeat(60_000))];
+        assert_eq!(
+            plan(&files, None, 256 * 1024, 8),
+            Err(TooLarge {
+                entry_point: Some("PKGBUILD".into())
+            })
+        );
+    }
+
+    #[test]
+    fn a_long_line_keeps_what_it_can_of_the_lines_before_it() {
+        // Short lines, then one that leaves little room beside it.
+        let mut content = "short();\n".repeat(400);
+        content.push_str(&"x".repeat(3000));
+        content.push('\n');
+        content.push_str(&"short();\n".repeat(400));
+        let plan = plan(&[file("src/a.c", &content)], None, 4096, 64).unwrap();
+        let pieces: Vec<&Item> = plan.chunks.iter().flatten().collect();
+        assert!(pieces.len() > 2);
+        // None is larger than a request has room for.
+        assert!(pieces.iter().all(|piece| piece.cost() <= 4096));
+        for piece in &pieces[1..] {
+            assert!(
+                matches!(
+                    piece,
+                    Item::Piece {
+                        context: Some(_),
+                        ..
+                    }
+                ),
+                "{piece:?}"
+            );
+        }
     }
 
     #[test]
@@ -858,7 +1141,7 @@ mod tests {
         use std::fmt::Write as _;
 
         // Past the size a changed file still goes whole at.
-        let library = (1..=4000).fold(String::new(), |mut acc, line| {
+        let library = (1..=8000).fold(String::new(), |mut acc, line| {
             let _ = writeln!(acc, "int v{line} = {line};");
             acc
         });
@@ -958,11 +1241,15 @@ mod tests {
             media,
             skipped_files: None,
         };
-        let entries = super::hash_only_entries(&[
-            file("bin/tool", "ELF executable", false),
-            file("backgrounds/a.jpg", "JPEG image", true),
-            file("backgrounds/b.png", "PNG image", true),
-        ]);
+        let none = std::collections::HashSet::new();
+        let entries = super::hash_only_entries(
+            &[
+                file("bin/tool", "ELF executable", false),
+                file("backgrounds/a.jpg", "JPEG image", true),
+                file("backgrounds/b.png", "PNG image", true),
+            ],
+            &none,
+        );
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].path, "bin/tool");
         assert_eq!(entries[0].format.as_deref(), Some("ELF executable"));
@@ -973,8 +1260,23 @@ mod tests {
         let many: Vec<super::HashOnly> = (0..500)
             .map(|index| file(&format!("icons/{index}/a.png"), "PNG image", true))
             .collect();
-        let entries = super::hash_only_entries(&many);
+        let entries = super::hash_only_entries(&many, &none);
         assert_eq!(entries.len(), 64);
         assert_eq!(entries.last().unwrap().files, Some(437));
+
+        // Past the limit, a file a reviewed text names keeps its row.
+        let mut binaries: Vec<super::HashOnly> = (0..200)
+            .map(|index| file(&format!("lib/p{index}.so"), "ELF shared object", false))
+            .collect();
+        binaries.push(file("lib/loaded.so", "ELF shared object", false));
+        let named = std::collections::HashSet::from(["loaded.so"]);
+        let entries = super::hash_only_entries(&binaries, &named);
+        assert_eq!(entries.len(), 64);
+        assert_eq!(entries[0].path, "lib/loaded.so");
+        assert!(
+            !super::hash_only_entries(&binaries, &none)
+                .iter()
+                .any(|entry| entry.path == "lib/loaded.so")
+        );
     }
 }
