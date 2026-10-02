@@ -129,9 +129,10 @@ impl AgentError {
 /// With `isolated` (the pacman gate), OpenCode runs with private, empty
 /// configuration and cache directories: the user's own OpenCode settings
 /// (a provider `baseURL`, plugins) do not shape the review of a root
-/// transaction. Its credentials still come from that user's OpenCode data
-/// directory, which the user can write: the review is isolated from their
-/// configuration, not from the account itself.
+/// transaction. Its credentials still come from the OpenCode data
+/// directory of the user the review runs as (the one who called pacman
+/// through sudo), which that user can write: the review is isolated from
+/// their configuration, not from the account itself.
 pub fn review(
     binary: &Path,
     render: &dyn Fn(&str) -> String,
@@ -386,7 +387,7 @@ fn claude_verdict(
             )))
         } else if rejects_input(&detail) {
             AgentError::Invalid(Error::Refused(format!(
-                "the AI could not take this source in one request ({detail}); lower max_input_kib"
+                "the AI could not take this source in one request ({detail}); lower max_input_kib or use a model with a larger context"
             )))
         } else {
             unavailable(detail)
@@ -612,13 +613,15 @@ fn verdict(
             "the AI saw the source and then declined or failed to review it ({message}); retry"
         ))));
     }
-    if let Some(message) = events
-        .error
-        .as_deref()
-        .filter(|message| rejects_input(message))
+    // Wherever it is said: as an error event, or as the reason the run
+    // failed.
+    if let Some(message) = [events.error.as_deref(), failure.as_deref()]
+        .into_iter()
+        .flatten()
+        .find(|message| rejects_input(message))
     {
         return Err(AgentError::Invalid(Error::Refused(format!(
-            "the AI could not take this source in one request ({message}); lower max_input_kib"
+            "the AI could not take this source in one request ({message}); lower max_input_kib or use a model with a larger context"
         ))));
     }
     if let Some(detail) = events.error.or(failure) {

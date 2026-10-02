@@ -173,9 +173,15 @@ fn named_in<'a>(
         for word in text.split(|character: char| {
             !(character.is_alphanumeric() || matches!(character, '.' | '_' | '-' | '+'))
         }) {
-            // `see payload.c.` names it too.
-            if let Some(name) = names.get(word.trim_end_matches(['.', '-', '+'])) {
-                found.insert(*name);
+            // As written, without what may only end a sentence (`see
+            // payload.c.`), and each part between dots (`pkg.helper`).
+            for candidate in [word, word.trim_end_matches(['.', '-', '+'])]
+                .into_iter()
+                .chain(word.split('.'))
+            {
+                if let Some(name) = names.get(candidate) {
+                    found.insert(*name);
+                }
             }
         }
     }
@@ -818,7 +824,7 @@ mod tests {
             // A change that names a file which did not change.
             file(
                 "src/main.c",
-                "#include \"payload.c\"\nimport helper\nrun();\n",
+                "#include \"payload.c\"\nfrom pkg.helper import run\nrun();\n",
             ),
             file("src/payload.c", "void payload(void);\n"),
             file("src/other.c", "void other(void);\n"),
