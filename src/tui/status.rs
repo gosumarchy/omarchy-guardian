@@ -279,7 +279,7 @@ fn sweep_health(
 /// The Omarchy shell widget's JSON.
 pub fn json() -> String {
     let status = collect();
-    Json::object([
+    let rendered = Json::object([
         ("version", Json::from(env!("CARGO_PKG_VERSION"))),
         ("state", Json::from(status.state)),
         ("profile", Json::from(status.profile)),
@@ -317,11 +317,15 @@ pub fn json() -> String {
             }),
         ),
     ])
-    .to_string()
-    .chars()
-    .fold(String::new(), |mut out, character| {
-        // Still JSON, and nothing a terminal acts on when it is printed:
-        // the title of a report saved long ago may hold anything.
+    .to_string();
+    escape_hidden(&rendered)
+}
+
+/// `json` (rendered JSON) with every hidden character written as a JSON
+/// escape: still JSON, and nothing a terminal acts on when it is printed.
+/// The title of a report saved long ago may hold anything.
+fn escape_hidden(json: &str) -> String {
+    json.chars().fold(String::new(), |mut out, character| {
         if crate::text::is_hidden(character) {
             let mut units = [0; 2];
             for unit in character.encode_utf16(&mut units) {
@@ -334,8 +338,6 @@ pub fn json() -> String {
     })
 }
 
-/// The Waybar image module's output: the knight for the state (calm,
-/// red-eyed, or dimmed when protection is off), then a tooltip with the
 /// details.
 pub fn waybar() -> String {
     let status = collect();
@@ -700,6 +702,15 @@ mod tests {
         let text = super::json();
         assert!(crate::json::Json::parse(&text).is_ok(), "{text}");
         assert!(!text.chars().any(crate::text::is_hidden), "{text}");
+        // Hidden characters become escapes that parse back to themselves.
+        let title = "a\u{202e}b\u{e0041}\u{85}";
+        let rendered = crate::json::Json::from(title).to_string();
+        let escaped = super::escape_hidden(&rendered);
+        assert!(!escaped.chars().any(crate::text::is_hidden), "{escaped}");
+        assert_eq!(
+            crate::json::Json::parse(&escaped).unwrap().as_str(),
+            Some(title)
+        );
     }
 
     #[test]
