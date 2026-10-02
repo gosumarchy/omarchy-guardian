@@ -505,7 +505,9 @@ refused. Files are ranked by risk:
 
 Each chunk is its own reviewer run with its own nonce, and every chunk carries
 the full file list, so the model knows what else exists. A file is charged
-what it takes in the request (a control character takes six bytes there). A
+what it takes in the request (a newline or a quote takes two bytes there and
+a control character six, a few percent more than the file's size for
+ordinary code). A
 file larger than a chunk is split on line boundaries, each piece repeating
 the end of the one before; a single line longer than a chunk is cut the same
 way, so nothing is hidden by sitting exactly on a cut. The first chunk runs

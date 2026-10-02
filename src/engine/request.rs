@@ -433,4 +433,22 @@ Manifest entries sent as hash-only"
         assert_eq!(before.matches("\nNonce: ").count(), 1, "{before}");
         assert!(before.contains("\nNonce: 01\n"));
     }
+
+    #[test]
+    fn a_part_of_a_cut_line_says_where_its_context_is_from() {
+        let mut request = Request::for_files(SourceClass::Source, &[]);
+        request.items = vec![Item::Piece {
+            path: "min.js".into(),
+            content: "tail".into(),
+            first_line: 5,
+            last_line: 5,
+            total_lines: 9,
+            context: Some((5, "head".into())),
+        }];
+        let text = request.render("0123");
+        assert!(
+            text.contains(r#""context_lines":"5 (the end of the previous part of this line)""#),
+            "{text}"
+        );
+    }
 }

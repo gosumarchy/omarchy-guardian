@@ -816,6 +816,25 @@ mod tests {
     }
 
     #[test]
+    fn a_small_changed_file_too_heavy_for_a_chunk_is_not_sent_whole() {
+        // 600 control characters: small, but 3600 bytes in the request.
+        let old = "\u{1}".repeat(600);
+        let new = format!("{old}\nrun();\n");
+        let previous: Previous = [("lib/blob.js".to_string(), old)].into_iter().collect();
+        let files = [file("lib/blob.js", &new)];
+        let plan = plan(&files, Some(&previous), 2 * (43 + 1000), 16).unwrap();
+        // A diff or pieces of it, never the file as one item over the room.
+        assert!(
+            plan.chunks
+                .iter()
+                .flatten()
+                .all(|item| !matches!(item, Item::Whole { .. })),
+            "{:?}",
+            plan.chunks
+        );
+    }
+
+    #[test]
     fn a_file_is_budgeted_by_what_it_takes_in_the_request() {
         // Control characters are written as six bytes each.
         let files = [file("blob.js", &"\u{1}".repeat(100))];
