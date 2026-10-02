@@ -3,6 +3,9 @@
 # omarchy-guardian package is installed. Installing the package alone changes
 # no system behaviour.
 set -eu
+# Run as root: only the system's own tools, whatever PATH it was started with.
+PATH=/usr/bin
+export PATH
 
 HOOK_SOURCE=/usr/share/omarchy-guardian/omarchy-guardian.hook
 HOOK_TARGET=/etc/pacman.d/hooks/omarchy-guardian.hook

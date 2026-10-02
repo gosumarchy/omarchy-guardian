@@ -105,7 +105,28 @@ const PROTECTED: &[(&str, Owner)] = &[
     ("usr/bin/runuser", Owner::Official),
     ("usr/bin/env", Owner::Official),
     ("usr/bin/sudo", Owner::Official),
+    // What the root half of the hook script runs.
+    ("usr/bin/sh", Owner::Official),
+    ("usr/bin/bash", Owner::Official),
+    ("usr/bin/readlink", Owner::Official),
+    ("usr/bin/id", Owner::Official),
+    ("usr/bin/getent", Owner::Official),
+    ("usr/bin/cut", Owner::Official),
 ];
+
+/// Top-level directories no package installs files into: runtime and
+/// temporary file systems, and the home directories. A unit or generator
+/// under `/run/systemd`, or a key in `/root/.ssh`, would act like any
+/// auto-run file with nothing here looking at it.
+const NOT_FOR_PACKAGES: &[&str] = &["run/", "tmp/", "dev/", "proc/", "sys/", "root/", "home/"];
+
+/// The directory links every system has (`/bin` is `usr/bin`): an entry
+/// listed under one would replace the link with a directory of its own.
+const ROOT_LINKS: &[&str] = &["bin/", "sbin/", "lib/", "lib64/"];
+
+/// What other packages a `.PKGINFO` may not claim to replace, conflict
+/// with or provide: pacman would then remove Guardian for it.
+const NOT_REPLACEABLE: &str = "omarchy-guardian";
 
 /// Whether `package` (of `class`) may ship `path`; `trusted` names extra
 /// reviewer packages the root-owned system configuration allows.
@@ -207,32 +228,185 @@ pub fn unescape(raw: &str) -> Option<String> {
     (!text.chars().any(char::is_control)).then_some(text)
 }
 
-/// Whether a listed mode (`-rwsr-xr-x`) with its numeric owner and group is
-/// setuid or setgid root.
+/// What a listed mode (`-rwsr-xr-x`) with its numeric owner and group
+/// grants beyond an ordinary root-owned file: set-id bits, for root or for
+/// anyone else.
 fn root_set_id(mode: &str, owner: &str, group: &str) -> Option<&'static str> {
-    let set = |position: usize, id: &str| {
-        matches!(mode.as_bytes().get(position), Some(b's' | b'S')) && id == "0"
-    };
-    if set(3, owner) {
-        Some("setuid root")
-    } else if set(6, group) {
-        Some("setgid root")
+    let set = |position: usize| matches!(mode.as_bytes().get(position), Some(b's' | b'S'));
+    match (set(3), set(6)) {
+        (true, _) if owner == "0" => Some(SETUID_ROOT),
+        (_, true) if group == "0" => Some(SETGID_ROOT),
+        (true, _) => Some(SETUID_OTHER),
+        (_, true) => Some(SETGID_OTHER),
+        _ => None,
+    }
+}
+
+pub const SETUID_ROOT: &str = "setuid root";
+pub const SETGID_ROOT: &str = "setgid root";
+/// It runs as its owner, or with its group (`disk`, `shadow`, `kmem` reach
+/// far), for whoever starts it.
+pub const SETUID_OTHER: &str = "setuid for a user other than root";
+pub const SETGID_OTHER: &str = "setgid for a group other than root";
+/// What to call an entry that carries file capabilities, and one with an
+/// access control list.
+pub const WITH_CAPABILITIES: &str = "with file capabilities";
+pub const WITH_ACL: &str = "with an access control list";
+/// What to call a file or directory anyone may write, where the system's
+/// own files are, and one that is somebody else's to write.
+pub const WRITABLE_BY_ALL: &str = "writable by everyone";
+pub const OWNED_BY_OTHER: &str = "owned by a user other than root";
+pub const WRITABLE_BY_GROUP: &str = "writable by a group other than root";
+
+/// Whether a listed entry under `/usr`, `/etc` or `/opt` can be written by
+/// someone other than root: by everyone, by its owner, or by its group.
+/// Whoever writes a file there decides what the next one to run or read it
+/// gets; whoever writes a directory decides what is in it (a drop-in for a
+/// root service, say).
+fn open_to_others(mode: &str, owner: &str, group: &str, path: &str) -> Option<&'static str> {
+    if !["usr/", "etc/", "opt/"]
+        .iter()
+        .any(|system| path.starts_with(system))
+    {
+        return None;
+    }
+    let bytes = mode.as_bytes();
+    if bytes.get(8) == Some(&b'w') && !matches!(bytes.get(9), Some(b't' | b'T')) {
+        Some(WRITABLE_BY_ALL)
+    } else if owner != "0" {
+        Some(OWNED_BY_OTHER)
+    } else if bytes.get(5) == Some(&b'w') && group != "0" {
+        Some(WRITABLE_BY_GROUP)
     } else {
         None
     }
 }
 
-/// What to call a file anyone may write, where the system's own files are.
-pub const WRITABLE_BY_ALL: &str = "writable by everyone";
+/// Whether what `what` names is how the installed file already is: then a
+/// package that ships it that way again grants nothing new. Capabilities
+/// and access lists are not read back, so those are said every time.
+pub fn already_granted(what: &str, installed: &Metadata) -> bool {
+    let mode = installed.mode();
+    let (uid, gid) = (installed.uid(), installed.gid());
+    match what {
+        SETUID_ROOT => installed.is_file() && mode & 0o4000 != 0 && uid == 0,
+        SETGID_ROOT => installed.is_file() && mode & 0o2000 != 0 && gid == 0,
+        SETUID_OTHER => installed.is_file() && mode & 0o4000 != 0 && uid != 0,
+        SETGID_OTHER => installed.is_file() && mode & 0o2000 != 0 && gid != 0,
+        WRITABLE_BY_ALL => !installed.file_type().is_symlink() && mode & 0o002 != 0,
+        OWNED_BY_OTHER => !installed.file_type().is_symlink() && uid != 0,
+        WRITABLE_BY_GROUP => !installed.file_type().is_symlink() && mode & 0o020 != 0 && gid != 0,
+        _ => false,
+    }
+}
 
-/// Whether a listed mode (`-rwxrwxrwx`) lets everyone write a file under
-/// `/usr`, `/etc` or `/opt`.
-fn open_to_all(mode: &str, path: &str) -> Option<&'static str> {
-    (mode.as_bytes().get(8) == Some(&b'w')
-        && ["usr/", "etc/", "opt/"]
-            .iter()
-            .any(|system| path.starts_with(system)))
-    .then_some(WRITABLE_BY_ALL)
+/// The entries of an uncompressed pax tar stream whose extended header
+/// carries a `security.*` or `trusted.*` attribute (file capabilities:
+/// root-like rights for whoever runs the file) or an access control list
+/// (rights the mode does not show), with what to call them.
+fn attributes_in_tar(mut stream: impl Read) -> Result<Vec<(String, &'static str)>, String> {
+    let mut found = Vec::new();
+    // What the extended header before the next entry said.
+    let mut pending: Option<&'static str> = None;
+    let mut path_override: Option<String> = None;
+    let mut header = [0_u8; 512];
+    loop {
+        if let Err(error) = stream.read_exact(&mut header) {
+            return if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                Ok(found)
+            } else {
+                Err(error.to_string())
+            };
+        }
+        if header.iter().all(|byte| *byte == 0) {
+            continue;
+        }
+        // Up to the first NUL, and otherwise as written: a name may end
+        // in a blank.
+        let field = |range: std::ops::Range<usize>| {
+            let bytes = &header[range];
+            let end = bytes
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(bytes.len());
+            String::from_utf8_lossy(&bytes[..end]).into_owned()
+        };
+        let size = u64::from_str_radix(field(124..136).trim(), 8)
+            .map_err(|_| "an entry size that is not a number".to_string())?;
+        let blocks = size.div_ceil(512) * 512;
+        // A pax extended header for the next entry (`x`) or for all that
+        // follow (`g`).
+        let kind = header[156];
+        if matches!(kind, b'x' | b'g') {
+            if size > 1 << 20 {
+                return Err("an extended header larger than 1 MiB".into());
+            }
+            let mut data = vec![0_u8; usize::try_from(blocks).map_err(|_| "size")?];
+            stream
+                .read_exact(&mut data)
+                .map_err(|error| error.to_string())?;
+            data.truncate(usize::try_from(size).map_err(|_| "size")?);
+            let (what, path) = pax_records(&data);
+            if kind == b'x' {
+                path_override = path;
+            }
+            pending = what.or(pending);
+            continue;
+        }
+        let name = path_override.take().unwrap_or_else(|| {
+            let (prefix, name) = (field(345..500), field(0..100));
+            if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            }
+        });
+        if let Some(what) = pending.take() {
+            found.push((name.trim_end_matches('/').to_string(), what));
+        }
+        let mut left = blocks;
+        let mut sink = [0_u8; 8192];
+        while left > 0 {
+            let take = usize::try_from(left.min(8192)).unwrap_or(8192);
+            stream
+                .read_exact(&mut sink[..take])
+                .map_err(|error| error.to_string())?;
+            left -= take as u64;
+        }
+    }
+}
+
+/// From a pax extended header's records (`<length> <key>=<value>\n`): what
+/// its attributes grant, if anything, and the entry's path if it gives one.
+fn pax_records(data: &[u8]) -> (Option<&'static str>, Option<String>) {
+    let mut what = None;
+    let mut path = None;
+    let mut rest = data;
+    while let Some(space) = rest.iter().position(|byte| *byte == b' ') {
+        let Some(length) = std::str::from_utf8(&rest[..space])
+            .ok()
+            .and_then(|digits| digits.parse::<usize>().ok())
+            .filter(|length| *length > space + 1 && *length <= rest.len())
+        else {
+            break;
+        };
+        let record = &rest[space + 1..length];
+        let record = record.strip_suffix(b"\n").unwrap_or(record);
+        if let Some(equals) = record.iter().position(|byte| *byte == b'=') {
+            let key = String::from_utf8_lossy(&record[..equals]);
+            if key == "path" || key == "GNU.sparse.name" {
+                path = Some(String::from_utf8_lossy(&record[equals + 1..]).into_owned());
+            } else if key.contains(".xattr.security.") || key.contains(".xattr.trusted.") {
+                what = Some(WITH_CAPABILITIES);
+            } else if (key.contains(".acl.") || key.contains(".xattr.system.posix_acl"))
+                && what.is_none()
+            {
+                what = Some(WITH_ACL);
+            }
+        }
+        rest = &rest[length..];
+    }
+    (what, path)
 }
 
 /// An entry under a symbolic-link directory is installed wherever that
@@ -341,8 +515,9 @@ fn parse_model(names: &str, details: &str) -> Result<Vec<Entry>, String> {
         }
         let root_set_id = match kind {
             Kind::File | Kind::HardLink(_) => root_set_id(fields[0], fields[2], fields[3])
-                .or_else(|| open_to_all(fields[0], &path)),
-            Kind::Directory | Kind::Symlink(_) => None,
+                .or_else(|| open_to_others(fields[0], fields[2], fields[3], &path)),
+            Kind::Directory => open_to_others(fields[0], fields[2], fields[3], &path),
+            Kind::Symlink(_) => None,
         };
         entries.push(Entry {
             path,
@@ -436,7 +611,63 @@ impl Archive {
             .enumerate()
             .map(|(index, entry)| (entry.path.clone(), index))
             .collect();
+        // What the listing does not show: file capabilities and access
+        // control lists, which libalpm restores with the file.
+        for (path, what) in archive.attributes()? {
+            let index = archive.index.get(&path).copied().ok_or_else(|| {
+                Error::Refused(format!(
+                    "{}: its attributes name {path:?}, which its listing does not",
+                    archive.path.display()
+                ))
+            })?;
+            archive.entries[index].root_set_id.get_or_insert(what);
+        }
         Ok(archive)
+    }
+
+    /// The entries that carry rights beside their mode, read from the
+    /// archive rewritten as an uncompressed tar stream: there every such
+    /// attribute stands in a header before its entry, whatever compression
+    /// and tar dialect the package uses.
+    fn attributes(&self) -> Result<Vec<(String, &'static str)>, Error> {
+        let failed = |detail: String| Error::ToolFailed {
+            tool: "bsdtar".into(),
+            detail: format!("{}: {detail}", self.path.display()),
+        };
+        let stdin = File::open(format!("/proc/self/fd/{}", self.file.as_raw_fd())).at(&self.path)?;
+        let mut child = std::process::Command::new(tools::TIMEOUT)
+            .arg("--signal=TERM")
+            .arg("--kill-after=5s")
+            .arg(format!("{}s", LISTING_LIMITS.timeout_secs))
+            .arg(tools::BSDTAR)
+            .args(["-cf", "-", "--format=pax", "@-"])
+            .env("LC_ALL", "C")
+            .stdin(stdin)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|source| Error::Spawn {
+                tool: "bsdtar".into(),
+                source,
+            })?;
+        let found = child
+            .stdout
+            .take()
+            .ok_or_else(|| failed("no output".into()))
+            .and_then(|stdout| {
+                attributes_in_tar(std::io::BufReader::with_capacity(1 << 16, stdout))
+                    .map_err(failed)
+            });
+        let status = child
+            .wait()
+            .map_err(|error| failed(format!("could not wait for exit: {error}")))?;
+        let found = found?;
+        if !status.success() {
+            return Err(failed(
+                "could not be read through for its attributes".into(),
+            ));
+        }
+        Ok(found)
     }
 
     /// Runs bsdtar on the opened file (a fresh descriptor each time, so each
@@ -505,6 +736,21 @@ impl Archive {
                     }
                     name => {
                         parts.push(name.to_string());
+                        // `/lib` is `usr/lib` where it is the usual link
+                        // and the package does not ship it as something
+                        // else: what follows is looked for there, `..`
+                        // included.
+                        if parts.len() == 1
+                            && ROOT_LINKS.contains(&format!("{name}/").as_str())
+                            && self.entry(name).is_none()
+                        {
+                            let leads = if name.starts_with("lib") {
+                                "lib"
+                            } else {
+                                "bin"
+                            };
+                            parts = vec!["usr".to_string(), leads.to_string()];
+                        }
                         let last = components[index + 1..]
                             .iter()
                             .all(|rest| matches!(*rest, "" | "."));
@@ -703,6 +949,26 @@ pub fn review(
         if let Some(reason) = protected_violation(&entry.path, package, class, trusted) {
             return Err(refuse(reason));
         }
+        if !matches!(entry.kind, Kind::Directory)
+            && let Some(place) = NOT_FOR_PACKAGES.iter().find(|place| {
+                entry.path.starts_with(**place) || entry.path == place.trim_end_matches('/')
+            })
+        {
+            return Err(refuse(format!(
+                "{package} installs /{} under /{place} where no package's files belong",
+                entry.path
+            )));
+        }
+        if let Some(link) = ROOT_LINKS
+            .iter()
+            .find(|link| entry.path.starts_with(**link))
+        {
+            return Err(refuse(format!(
+                "{package} lists /{} under /{}, which is a link to a directory in /usr on this system",
+                entry.path,
+                link.trim_end_matches('/')
+            )));
+        }
     }
 
     let (wanted, sources) = plan_reads(archive).map_err(refuse)?;
@@ -734,6 +1000,22 @@ pub fn review(
         return Err(refuse(format!(
             ".PKGINFO names {:?}, not the transaction target {package}",
             declared.unwrap_or_default()
+        )));
+    }
+    if package != NOT_REPLACEABLE
+        && let Some(claim) = pkginfo.lines().find(|line| {
+            ["replaces = ", "conflict = ", "provides = "]
+                .iter()
+                .filter_map(|key| line.strip_prefix(key))
+                .any(|value| {
+                    value.trim().split(['<', '>', '=']).next().map(str::trim)
+                        == Some(NOT_REPLACEABLE)
+                })
+        })
+    {
+        return Err(refuse(format!(
+            "{package} declares `{}`: installing it would remove or stand in for Guardian",
+            claim.trim()
         )));
     }
 
@@ -1025,16 +1307,43 @@ mod tests {
         assert_eq!(root_set_id("-rwSr--r--", "0", "100"), Some("setuid root"));
         assert_eq!(root_set_id("-rwxr-sr-x", "0", "0"), Some("setgid root"));
         // To another user or group, or not set at all.
-        assert_eq!(root_set_id("-rwsr-xr-x", "1000", "0"), None);
-        assert_eq!(root_set_id("-rwxr-sr-x", "0", "5"), None);
+        assert_eq!(
+            root_set_id("-rwsr-xr-x", "1000", "0"),
+            Some(super::SETUID_OTHER)
+        );
+        assert_eq!(
+            root_set_id("-rwxr-sr-x", "0", "5"),
+            Some(super::SETGID_OTHER)
+        );
         assert_eq!(root_set_id("-rwxr-xr-x", "0", "0"), None);
         assert_eq!(root_set_id("-rwxr-xr-t", "0", "0"), None);
+        let open = super::open_to_others;
         assert_eq!(
-            super::open_to_all("-rwxrwxrwx", "usr/bin/tool"),
+            open("-rwxrwxrwx", "0", "0", "usr/bin/tool"),
             Some(super::WRITABLE_BY_ALL)
         );
-        assert_eq!(super::open_to_all("-rwxrwxr-x", "usr/bin/tool"), None);
-        assert_eq!(super::open_to_all("-rw-rw-rw-", "var/lib/x/state"), None);
+        assert_eq!(open("-rwxrwxr-x", "0", "0", "usr/bin/tool"), None);
+        assert_eq!(open("-rw-rw-rw-", "0", "0", "var/lib/x/state"), None);
+        // A directory anyone, its owner or its group may write into.
+        assert_eq!(
+            open(
+                "drwxrwxrwx",
+                "0",
+                "0",
+                "usr/lib/systemd/system/sshd.service.d"
+            ),
+            Some(super::WRITABLE_BY_ALL)
+        );
+        assert_eq!(open("drwxrwxrwt", "0", "0", "opt/app/tmp"), None);
+        assert_eq!(
+            open("-rwxr-xr-x", "1000", "0", "usr/bin/tool"),
+            Some(super::OWNED_BY_OTHER)
+        );
+        assert_eq!(
+            open("-rw-rw-r--", "0", "983", "etc/app.conf"),
+            Some(super::WRITABLE_BY_GROUP)
+        );
+        assert_eq!(open("-rw-r-----", "0", "983", "etc/app.conf"), None);
 
         let names = ".PKGINFO\nusr/bin/x\nusr/bin/dir/\n";
         let details = [
@@ -1070,7 +1379,8 @@ mod tests {
                 path: "etc/sudoers.d/a -> b".into(),
                 size: 2,
                 kind: Kind::File,
-                root_set_id: None
+                // Owned by uid 1000, under `/etc`.
+                root_set_id: Some(super::OWNED_BY_OTHER)
             }
         );
         assert_eq!(model[3].kind, Kind::Symlink("../x".into()));
@@ -1427,6 +1737,35 @@ mod tests {
             matches!(&reviewed.files[0].content, Content::Text(text) if text.contains("does not ship"))
         );
 
+        // Through `/lib` (a link to `usr/lib` on the system) the file the
+        // package ships there is what the link leads to, `..` included.
+        let root = dir.path().join("root3");
+        fs::create_dir_all(root.join("etc/sudoers.d")).unwrap();
+        fs::create_dir_all(root.join("usr/lib/pkg")).unwrap();
+        fs::create_dir_all(root.join("usr/share")).unwrap();
+        fs::write(root.join(".PKGINFO"), "pkgname = x\n").unwrap();
+        fs::write(
+            root.join("usr/lib/pkg/data"),
+            "ALL ALL=(ALL) NOPASSWD: ALL\n",
+        )
+        .unwrap();
+        fs::write(root.join("usr/share/rule"), "x\n").unwrap();
+        let archive = dir.path().join("x3-1-1-any.pkg.tar");
+        build(&root, &archive, &[".PKGINFO", "etc", "usr"], &[]);
+        let opened = Archive::open(&archive).unwrap();
+        for (target, leads) in [
+            ("/lib/pkg/data", "usr/lib/pkg/data"),
+            ("/lib64/pkg/data", "usr/lib/pkg/data"),
+            ("/lib/../share/rule", "usr/share/rule"),
+            ("../../lib/pkg/data", "usr/lib/pkg/data"),
+        ] {
+            assert_eq!(
+                opened.resolve("etc/sudoers.d/x", target),
+                Ok(Resolution::Regular(leads.into())),
+                "{target}"
+            );
+        }
+
         // d -> /etc and e -> d/passwd: through a link, refused, host never read.
         let root = dir.path().join("root2");
         fs::create_dir_all(root.join("etc/sudoers.d")).unwrap();
@@ -1489,5 +1828,179 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.to_string().contains("disarm Guardian"), "{error}");
+    }
+
+    /// Misplaced files, a root link, a claim on Guardian's place, and the
+    /// newer auto-run places.
+    #[test]
+    fn what_a_package_grants_or_misplaces_is_seen_without_a_scriptlet() {
+        if !tool_available("/usr/bin/bsdtar") {
+            return;
+        }
+        let dir = TempDir::new("payload-grants");
+        let as_root = ["--uid", "0", "--gid", "0"];
+        let package = |name: &str, info: &str, files: &[(&str, &str)]| {
+            let root = dir.path().join(name);
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join(".PKGINFO"), format!("pkgname = {name}\n{info}")).unwrap();
+            let mut members = vec![".PKGINFO".to_string()];
+            for (path, text) in files {
+                fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+                fs::write(root.join(path), text).unwrap();
+                let top = path.split('/').next().unwrap().to_string();
+                if !members.contains(&top) {
+                    members.push(top);
+                }
+            }
+            (root, members)
+        };
+        let open = |root: &Path, members: &[String], name: &str| {
+            let archive = dir.path().join(format!("{name}-1-1-any.pkg.tar"));
+            let members: Vec<&str> = members.iter().map(String::as_str).collect();
+            build(root, &archive, &members, &as_root);
+            Archive::open(&archive).unwrap()
+        };
+        let refused = |archive: &Archive, name: &str| {
+            review(archive, name, SourceClass::ThirdPartyRepo, &[])
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default()
+        };
+
+        for (name, path, expected) in [
+            (
+                "a",
+                "run/systemd/system-generators/x",
+                "where no package's files belong",
+            ),
+            (
+                "b",
+                "root/.ssh/authorized_keys",
+                "where no package's files belong",
+            ),
+            ("c", "lib/modules/x", "is a link to a directory in /usr"),
+        ] {
+            let (root, members) = package(name, "", &[(path, "x\n")]);
+            let error = refused(&open(&root, &members, name), name);
+            assert!(error.contains(expected), "{path}: {error}");
+        }
+
+        let (root, members) = package(
+            "d",
+            "replaces = omarchy-guardian\n",
+            &[("usr/bin/d", "x\n")],
+        );
+        let error = refused(&open(&root, &members, "d"), "d");
+        assert!(error.contains("remove or stand in for Guardian"), "{error}");
+        let (root, members) = package(
+            "e",
+            "",
+            &[
+                ("etc/systemd/system.control/x.service", "[Service]\n"),
+                ("usr/lib/initcpio/post/x", "#!/bin/sh\n"),
+                ("usr/lib/python3.13/site-packages/x.pth", "import os\n"),
+                ("etc/logrotate.d/x", "/var/log/x {}\n"),
+            ],
+        );
+        let reviewed = review(
+            &open(&root, &members, "e"),
+            "e",
+            SourceClass::ThirdPartyRepo,
+            &[],
+        )
+        .unwrap();
+        let paths: Vec<&str> = reviewed
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(paths.len(), 4, "{paths:?}");
+    }
+
+    #[test]
+    fn a_directory_anyone_may_write_into_is_a_grant() {
+        use std::os::unix::fs::PermissionsExt;
+        if !tool_available("/usr/bin/bsdtar") {
+            return;
+        }
+        let dir = TempDir::new("payload-open-directory");
+        let root = dir.path().join("root");
+        let drop_ins = root.join("usr/lib/systemd/system/x.service.d");
+        fs::create_dir_all(&drop_ins).unwrap();
+        fs::write(root.join(".PKGINFO"), "pkgname = f\n").unwrap();
+        fs::write(drop_ins.join("a.conf"), "[Service]\n").unwrap();
+        fs::set_permissions(&drop_ins, fs::Permissions::from_mode(0o777)).unwrap();
+        let archive = dir.path().join("f-1-1-any.pkg.tar");
+        build(
+            &root,
+            &archive,
+            &[".PKGINFO", "usr"],
+            &["--uid", "0", "--gid", "0"],
+        );
+        let reviewed = review(
+            &Archive::open(&archive).unwrap(),
+            "f",
+            SourceClass::ThirdPartyRepo,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            reviewed.root_set_id.contains(&(
+                "usr/lib/systemd/system/x.service.d".to_string(),
+                super::WRITABLE_BY_ALL
+            )),
+            "{:?}",
+            reviewed.root_set_id
+        );
+    }
+
+    #[test]
+    fn capabilities_and_access_lists_are_read_from_the_archive_headers() {
+        fn block(name: &str, kind: u8, data: &[u8]) -> Vec<u8> {
+            let mut header = vec![0_u8; 512];
+            header[..name.len()].copy_from_slice(name.as_bytes());
+            let size = format!("{:011o}", data.len());
+            header[124..135].copy_from_slice(size.as_bytes());
+            header[156] = kind;
+            let mut out = header;
+            out.extend_from_slice(data);
+            out.resize(out.len().div_ceil(512) * 512, 0);
+            out
+        }
+        fn record(key: &str, value: &str) -> String {
+            let body = format!(" {key}={value}\n");
+            let mut length = body.len() + 1;
+            while format!("{length}{body}").len() != length {
+                length = format!("{length}{body}").len();
+            }
+            format!("{length}{body}")
+        }
+        let mut tar = Vec::new();
+        tar.extend(block("usr/bin/plain", b'0', b"x\n"));
+        tar.extend(block(
+            "PaxHeader/capped",
+            b'x',
+            record("SCHILY.xattr.security.capability", "\u{1}").as_bytes(),
+        ));
+        tar.extend(block("usr/bin/capped", b'0', b"x\n"));
+        tar.extend(block(
+            "PaxHeader/long",
+            b'x',
+            (record("path", "usr/share/a/long/name") + &record("SCHILY.acl.access", "user::rwx"))
+                .as_bytes(),
+        ));
+        tar.extend(block("short", b'0', b""));
+        tar.extend(block("usr/bin/after", b'0', b"y\n"));
+        tar.extend(vec![0_u8; 1024]);
+        assert_eq!(
+            super::attributes_in_tar(tar.as_slice()).unwrap(),
+            [
+                ("usr/bin/capped".to_string(), super::WITH_CAPABILITIES),
+                ("usr/share/a/long/name".to_string(), super::WITH_ACL)
+            ]
+        );
+        // A stream that ends inside an entry is refused, not half read.
+        let cut = &tar[..700];
+        assert!(super::attributes_in_tar(cut).is_err());
     }
 }
