@@ -14,7 +14,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::integrations::{Integration, State};
 use super::paths;
 use crate::config::Settings;
-use crate::config::model::{AiRequirement, Named, Profile, RootConsent, SourceClass};
+use crate::config::model::{
+    Action, AiRequirement, Named, Profile, RootConsent, SourceClass, builtin,
+};
 use crate::engine::store::Store;
 use crate::json::Json;
 use crate::notify;
@@ -86,7 +88,12 @@ fn collect() -> Status {
             };
             match &state {
                 State::On => on += 1,
-                State::Unavailable(_) => {}
+                // Without yay there is nothing for its gate to guard. Any
+                // other gate that cannot be there is protection missing.
+                State::Unavailable(_) if integration == Integration::AurGate => {}
+                State::Unavailable(detail) => {
+                    issues.push(format!("{} is unavailable: {detail}", integration.label()));
+                }
                 _ => issues.push(format!("{} is not fully on", integration.label())),
             }
             // On, and reviewing with the local checks alone: said beside
@@ -170,20 +177,32 @@ fn local_only(settings: &Settings, integration: Integration) -> Option<String> {
         Integration::SystemSweep => &[(SourceClass::System, "the sweep")],
         _ => &[],
     };
-    let off: Vec<&str> = classes
-        .iter()
-        .filter(|(class, _)| {
-            settings.profile_for(*class) != Profile::LocalOnly
-                && settings.policy(*class).ai == AiRequirement::Off
-        })
-        .map(|(_, name)| *name)
-        .collect();
-    (!off.is_empty()).then(|| {
-        format!(
-            "local checks only: AI review is off for {}",
-            off.join(" and ")
-        )
-    })
+    let named = |weak: &dyn Fn(SourceClass) -> bool| -> Option<String> {
+        let names: Vec<&str> = classes
+            .iter()
+            .filter(|(class, _)| weak(*class))
+            .map(|(_, name)| *name)
+            .collect();
+        (!names.is_empty()).then(|| names.join(" and "))
+    };
+    let mut notes = Vec::new();
+    if let Some(names) = named(&|class| {
+        settings.profile_for(class) != Profile::LocalOnly
+            && settings.policy(class).ai == AiRequirement::Off
+    }) {
+        notes.push(format!("local checks only: AI review is off for {names}"));
+    }
+    // A class set to warn where its protection level blocks lets through
+    // what the level would stop.
+    if let Some(names) = named(&|class| {
+        let policy = settings.policy(class);
+        let level = builtin(settings.profile_for(class), class);
+        (policy.on_findings == Action::Warn && level.on_findings == Action::Block)
+            || (policy.on_ai_suspicious == Action::Warn && level.on_ai_suspicious == Action::Block)
+    }) {
+        notes.push(format!("findings only warn, and do not block, for {names}"));
+    }
+    (!notes.is_empty()).then(|| notes.join("; "))
 }
 
 /// Seconds the sweep's timers have had: since boot, or since the user's
@@ -260,7 +279,7 @@ fn sweep_health(
 /// The Omarchy shell widget's JSON.
 pub fn json() -> String {
     let status = collect();
-    Json::object([
+    let rendered = Json::object([
         ("version", Json::from(env!("CARGO_PKG_VERSION"))),
         ("state", Json::from(status.state)),
         ("profile", Json::from(status.profile)),
@@ -298,11 +317,27 @@ pub fn json() -> String {
             }),
         ),
     ])
-    .to_string()
+    .to_string();
+    escape_hidden(&rendered)
 }
 
-/// The Waybar image module's output: the knight for the state (calm,
-/// red-eyed, or dimmed when protection is off), then a tooltip with the
+/// `json` (rendered JSON) with every hidden character written as a JSON
+/// escape: still JSON, and nothing a terminal acts on when it is printed.
+/// The title of a report saved long ago may hold anything.
+fn escape_hidden(json: &str) -> String {
+    json.chars().fold(String::new(), |mut out, character| {
+        if crate::text::is_hidden(character) {
+            let mut units = [0; 2];
+            for unit in character.encode_utf16(&mut units) {
+                let _ = write!(out, "\\u{unit:04x}");
+            }
+        } else {
+            out.push(character);
+        }
+        out
+    })
+}
+
 /// details.
 pub fn waybar() -> String {
     let status = collect();
@@ -648,10 +683,34 @@ mod tests {
             Some("local checks only: AI review is off for themes")
         );
         assert_eq!(local_only(&settings, Integration::AurGate), None);
+        // A class that only warns where its level blocks says so.
+        let mut user = PartialConfig::default();
+        user.class_mut(SourceClass::Aur).on_findings = Some(crate::config::model::Action::Warn);
+        let settings = Settings::from_parts(PartialConfig::default(), user);
+        assert_eq!(
+            local_only(&settings, Integration::AurGate).as_deref(),
+            Some("findings only warn, and do not block, for AUR builds")
+        );
         // The level as a whole already says "no AI".
         let private = Settings::from_parts(PartialConfig::default(), PartialConfig::default())
             .with_profile(Profile::LocalOnly);
         assert_eq!(local_only(&private, Integration::AurGate), None);
+    }
+
+    #[test]
+    fn the_status_is_json_with_nothing_hidden_in_it() {
+        let text = super::json();
+        assert!(crate::json::Json::parse(&text).is_ok(), "{text}");
+        assert!(!text.chars().any(crate::text::is_hidden), "{text}");
+        // Hidden characters become escapes that parse back to themselves.
+        let title = "a\u{202e}b\u{e0041}\u{85}";
+        let rendered = crate::json::Json::from(title).to_string();
+        let escaped = super::escape_hidden(&rendered);
+        assert!(!escaped.chars().any(crate::text::is_hidden), "{escaped}");
+        assert_eq!(
+            crate::json::Json::parse(&escaped).unwrap().as_str(),
+            Some(title)
+        );
     }
 
     #[test]

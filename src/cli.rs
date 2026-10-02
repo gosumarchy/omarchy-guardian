@@ -156,7 +156,9 @@ impl Confirm for TtyConfirm {
         let Ok(mut tty) = OpenOptions::new().read(true).write(true).open("/dev/tty") else {
             return false;
         };
-        if write!(tty, "{question} [y/N] ")
+        // The question names what is being reviewed: nothing in a name
+        // may move the cursor or hide part of the line.
+        if write!(tty, "{} [y/N] ", crate::text::shown(question))
             .and_then(|()| tty.flush())
             .is_err()
         {
@@ -432,9 +434,10 @@ fn sandbox_command(
 
 fn status_command(mode: StatusMode) -> ExitCode {
     let result = match mode {
+        // Written as it is: the terminal-safe output would rewrite a
+        // hidden character inside a string into something that is no JSON.
         StatusMode::Shell => {
-            outln!("{}", tui::status::json());
-            Ok(())
+            writeln!(io::stdout(), "{}", tui::status::json()).map_err(|error| error.to_string())
         }
         StatusMode::Waybar => {
             outln!("{}", tui::status::waybar());

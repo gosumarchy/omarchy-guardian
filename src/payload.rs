@@ -164,8 +164,10 @@ struct Entry {
     path: String,
     size: u64,
     kind: Kind,
-    /// A regular file installed setuid or setgid root: it runs as root for
-    /// whoever starts it, with no scriptlet involved.
+    /// A regular file installed setuid or setgid root (it runs as root for
+    /// whoever starts it, with no scriptlet involved), or one under `/usr`,
+    /// `/etc` or `/opt` that everyone may write (whoever writes it decides
+    /// what the next one to run or read it gets).
     root_set_id: Option<&'static str>,
 }
 
@@ -218,6 +220,19 @@ fn root_set_id(mode: &str, owner: &str, group: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// What to call a file anyone may write, where the system's own files are.
+pub const WRITABLE_BY_ALL: &str = "writable by everyone";
+
+/// Whether a listed mode (`-rwxrwxrwx`) lets everyone write a file under
+/// `/usr`, `/etc` or `/opt`.
+fn open_to_all(mode: &str, path: &str) -> Option<&'static str> {
+    (mode.as_bytes().get(8) == Some(&b'w')
+        && ["usr/", "etc/", "opt/"]
+            .iter()
+            .any(|system| path.starts_with(system)))
+    .then_some(WRITABLE_BY_ALL)
 }
 
 /// An entry under a symbolic-link directory is installed wherever that
@@ -325,7 +340,8 @@ fn parse_model(names: &str, details: &str) -> Result<Vec<Entry>, String> {
             return Err(format!("{path} appears more than once"));
         }
         let root_set_id = match kind {
-            Kind::File | Kind::HardLink(_) => root_set_id(fields[0], fields[2], fields[3]),
+            Kind::File | Kind::HardLink(_) => root_set_id(fields[0], fields[2], fields[3])
+                .or_else(|| open_to_all(fields[0], &path)),
             Kind::Directory | Kind::Symlink(_) => None,
         };
         entries.push(Entry {
@@ -1013,6 +1029,12 @@ mod tests {
         assert_eq!(root_set_id("-rwxr-sr-x", "0", "5"), None);
         assert_eq!(root_set_id("-rwxr-xr-x", "0", "0"), None);
         assert_eq!(root_set_id("-rwxr-xr-t", "0", "0"), None);
+        assert_eq!(
+            super::open_to_all("-rwxrwxrwx", "usr/bin/tool"),
+            Some(super::WRITABLE_BY_ALL)
+        );
+        assert_eq!(super::open_to_all("-rwxrwxr-x", "usr/bin/tool"), None);
+        assert_eq!(super::open_to_all("-rw-rw-rw-", "var/lib/x/state"), None);
 
         let names = ".PKGINFO\nusr/bin/x\nusr/bin/dir/\n";
         let details = [

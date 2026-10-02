@@ -865,7 +865,9 @@ fn scan_package(
     for (path, what) in reviewed.root_set_id {
         // Already installed that way: nothing new is being granted.
         let installed = fs::symlink_metadata(Path::new("/").join(&path)).is_ok_and(|metadata| {
-            let as_root = if what == "setuid root" {
+            let as_root = if what == payload::WRITABLE_BY_ALL {
+                metadata.mode() & 0o002 != 0
+            } else if what == "setuid root" {
                 metadata.mode() & 0o4000 != 0 && metadata.uid() == 0
             } else {
                 metadata.mode() & 0o2000 != 0 && metadata.gid() == 0
@@ -881,7 +883,11 @@ fn scan_package(
             path: rel,
             line: 1,
             rule: RuleId::PrivilegeEscalation,
-            excerpt: format!("/{path} is installed {what}: it runs as root for whoever starts it"),
+            excerpt: if what == payload::WRITABLE_BY_ALL {
+                format!("/{path} is installed {what}: any user can replace what it holds")
+            } else {
+                format!("/{path} is installed {what}: it runs as root for whoever starts it")
+            },
         });
     }
     archive.verify_unchanged()?;

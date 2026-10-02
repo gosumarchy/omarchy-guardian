@@ -7,6 +7,7 @@
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -470,7 +471,7 @@ impl Terminal for TtyTerminal {
     fn say(&mut self, text: &str) {
         if let Ok(mut tty) = OpenOptions::new().write(true).open("/dev/tty") {
             // A write failure leaves nothing better to report to.
-            let _ = writeln!(tty, "{text}");
+            let _ = writeln!(tty, "{}", crate::text::shown_block(text));
         }
     }
 
@@ -480,7 +481,7 @@ impl Terminal for TtyTerminal {
             .write(true)
             .open("/dev/tty")
             .ok()?;
-        write!(tty, "{question} ").ok()?;
+        write!(tty, "{} ", crate::text::shown_block(question)).ok()?;
         tty.flush().ok()?;
 
         read_answer(BufReader::new(tty))
@@ -635,9 +636,24 @@ impl Environment for RealEnvironment {
         let directory = path.parent().ok_or("invalid user config path")?;
         fs::create_dir_all(directory).map_err(|error| error.to_string())?;
 
-        let temporary = directory.join(".config.toml.tmp");
-        fs::write(&temporary, text).map_err(|error| error.to_string())?;
-        fs::rename(&temporary, &path).map_err(|error| error.to_string())?;
+        // A file of its own, made new (never written through a link
+        // somebody left under a fixed name), then moved into place.
+        let temporary = directory.join(format!(".config.toml.{}.tmp", std::process::id()));
+        drop(fs::remove_file(&temporary));
+        let written = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(&temporary)
+            .and_then(|mut file| {
+                file.write_all(text.as_bytes())?;
+                file.sync_all()
+            })
+            .and_then(|()| fs::rename(&temporary, &path));
+        if let Err(error) = written {
+            drop(fs::remove_file(&temporary));
+            return Err(error.to_string());
+        }
         Ok(path)
     }
 

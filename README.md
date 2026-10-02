@@ -60,9 +60,11 @@ plugins, and reviews that code **before any of it runs**:
 - **In your bar.** The Guardian knight sits in the bar: calm when every gate
   is on, red-eyed when something needs attention (a gate is off, a setting is
   broken, the daily sweep stopped running or could not finish, or a block in
-  the last day is unseen), dim when protection is off. A gate that is on
-  with the AI review turned off for what it reviews says "local checks only"
-  beside it.
+  the last day is unseen), dim when protection is off. A gate that cannot
+  be there (the package's files are missing) counts as a problem; the AUR
+  gate without yay installed does not. A gate that is on with the AI review
+  turned off for what it reviews says "local checks only" beside it, and one
+  whose findings only warn where the protection level would block says that.
   In Waybar its tooltip lists the gates, problems and last block; left-click
   opens the settings app and right-click the last report. In Omarchy's shell
   bar it opens a panel with the same details and tiles for the report,
@@ -276,7 +278,9 @@ your own sweep could not read.
   kept in the system file as `[sweep] root = "allowed"` (or `"declined"`)
   with the group allowed to read the results; a user file cannot set it,
   and `protect --yes` never answers it for you. The collector runs
-  sandboxed (read-only system) and writes only
+  sandboxed (a read-only system, no network, and of root's privileges only
+  those to read files, look at other users' processes and hand its results
+  to your group; it is stopped after half an hour) and writes only
   `/var/lib/omarchy-guardian/sweep/root.json` (root-owned, mode 0640, your
   group). Your sweep uses it only while it is root's alone and less than 36
   hours old. This makes the root-only items it lists (a sudoers drop-in no
@@ -800,7 +804,14 @@ way, or is the sandbox helper of a Chromium-based program (by its name, with
 that program's runtime files beside it, outside the command directories;
 like every compiled program, its content is not reviewed): it blocks a
 package from a third-party repository or a local archive, and is a warning
-for an official one under the `standard` profile.
+for an official one under the `standard` profile. So is a file under `/usr`,
+`/etc` or `/opt` installed writable by everyone.
+
+What the gate does not see: a package's other files are installed as shipped
+and acted on by what is already on the system (a pacman hook, DKMS or a
+systemd generator installed earlier reads the new package's files without a
+review of them), a removal is not reviewed, and a unit a package ships but
+that you enable yourself later is not reviewed then (the sweep lists it).
 
 On an upgrade, an auto-run file identical to the installed one is not reviewed
 again, since it adds nothing new: a point release typically brings a handful of
