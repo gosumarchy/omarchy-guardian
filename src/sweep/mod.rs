@@ -235,9 +235,23 @@ fn add_root_part(
 /// root's results are back.
 fn remembered(
     collection: &Collection,
+    report: &Report,
     previous: Option<&Remembered>,
     label: impl Fn(&collect::Item) -> String,
 ) -> Remembered {
+    // A finding on a file is part of what is remembered about it: one that
+    // appears later on a file that did not change (the AI was unavailable
+    // the day it arrived) is then news.
+    let mut flagged: std::collections::HashSet<&str> = report
+        .findings
+        .iter()
+        .map(|finding| finding.path.as_str())
+        .collect();
+    for run in &report.agent_runs {
+        if let AgentOutcome::Reviewed(review) = &run.outcome {
+            flagged.extend(review.findings.iter().map(|finding| finding.file.as_str()));
+        }
+    }
     collection
         .items
         .iter()
@@ -249,10 +263,38 @@ fn remembered(
                 && let Some(known) = previous.and_then(|previous| previous.get(&label))
             {
                 fingerprint.clone_from(known);
+            } else if flagged.contains(label.as_str()) && !fingerprint.ends_with(state::FLAGGED) {
+                fingerprint.push_str(state::FLAGGED);
             }
             (label, fingerprint)
         })
         .collect()
+}
+
+/// What this sweep is measured against, and whether there is nothing yet
+/// (a first sweep): for the timer's sweep, what the timer's sweeps told
+/// about; for a sweep by hand, the last sweep of any kind.
+fn before(directory: Option<&Path>, scheduled: bool) -> (bool, Option<Remembered>) {
+    let Some(directory) = directory else {
+        return (false, None);
+    };
+    if scheduled {
+        (!state::has_told(directory), Some(state::told(directory)))
+    } else {
+        (
+            !state::has_baseline(directory),
+            Some(state::baseline(directory)),
+        )
+    }
+}
+
+/// Remembers what this sweep saw; the timer's sweep also as told about.
+fn remember(directory: &Path, current: &Remembered, scheduled: bool) -> Result<(), String> {
+    state::save_baseline(directory, current)?;
+    if scheduled {
+        state::save_told(directory, current)?;
+    }
+    Ok(())
 }
 
 /// What a scheduled sweep tells the desktop: new or changed items, or
@@ -468,13 +510,8 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
         decision => decision,
     };
 
-    let first = directory
-        .as_ref()
-        .is_some_and(|directory| !state::has_baseline(directory));
-    let previous = directory
-        .as_ref()
-        .map(|directory| state::baseline(directory));
-    let current = remembered(&collection, previous.as_ref(), label);
+    let (first, previous) = before(directory.as_deref(), options.scheduled);
+    let current = remembered(&collection, &report, previous.as_ref(), label);
     let changes = previous
         .as_ref()
         .map(|previous| state::diff(previous, &current))
@@ -503,7 +540,7 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
         }
     }
     if let Some(directory) = &directory
-        && let Err(reason) = state::save_baseline(directory, &current)
+        && let Err(reason) = remember(directory, &current, options.scheduled)
     {
         errln!("omarchy-guardian sweep: {reason}");
         // Without it the next sweep would see nothing as new.

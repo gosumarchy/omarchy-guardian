@@ -15,16 +15,74 @@ const INTERPRETERS: &[&str] = &[
     "luajit", "php",
 ];
 
-/// Wrappers that run the command after them.
-const WRAPPERS: &[&str] = &[
-    "env",
-    "uwsm-app",
-    "uwsm",
-    "systemd-run",
-    "setsid",
-    "nohup",
-    "exec",
+/// A wrapper that runs the command after it: its name, its options that
+/// take the next word as their value, and how many words of its own come
+/// before the command (`timeout 5 prog`, `flock file prog`).
+struct Wrapper {
+    name: &'static str,
+    value_options: &'static [&'static str],
+    own_words: usize,
+}
+
+const fn wrapper(
+    name: &'static str,
+    value_options: &'static [&'static str],
+    own_words: usize,
+) -> Wrapper {
+    Wrapper {
+        name,
+        value_options,
+        own_words,
+    }
+}
+
+const WRAPPERS: &[Wrapper] = &[
+    wrapper("env", &["-u", "--unset", "-C", "--chdir"], 0),
+    wrapper("uwsm-app", &["-t", "-a", "-u", "-s", "-p"], 0),
+    wrapper("uwsm", &["-t", "-a", "-u", "-s", "-p"], 0),
+    wrapper(
+        "systemd-run",
+        &[
+            "-p",
+            "--property",
+            "-u",
+            "--unit",
+            "--uid",
+            "--gid",
+            "-E",
+            "--setenv",
+            "--slice",
+            "--working-directory",
+            "-M",
+            "--machine",
+            "-H",
+            "--host",
+            "--description",
+        ],
+        0,
+    ),
+    wrapper("setsid", &[], 0),
+    wrapper("nohup", &[], 0),
+    wrapper("exec", &["-a"], 0),
+    wrapper(
+        "sudo",
+        &[
+            "-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T", "-U", "-r", "-t",
+        ],
+        0,
+    ),
+    wrapper("doas", &["-u", "-C"], 0),
+    wrapper("timeout", &["-s", "--signal", "-k", "--kill-after"], 1),
+    wrapper("nice", &["-n", "--adjustment"], 0),
+    wrapper("ionice", &["-c", "-n", "-p"], 0),
+    wrapper("flock", &["-w", "--timeout", "-E"], 1),
+    wrapper("chrt", &[], 1),
+    wrapper("taskset", &[], 1),
+    wrapper("stdbuf", &["-i", "-o", "-e"], 0),
 ];
+
+/// Subcommands of `uwsm` that run the command after them.
+const UWSM_RUNS: &[&str] = &["app", "start"];
 
 /// Where a bare command name is looked for, relative to the root; `~`
 /// stands for the home directory.
@@ -58,12 +116,35 @@ pub fn commands(category: Category, path: &str, text: &str) -> Vec<String> {
             Category::Udev => udev(line),
             Category::Kernel => modprobe(line),
             Category::Pam => pam(line),
-            Category::Ssh => ssh(line),
+            Category::Ssh => ssh(line).map(|(_, value)| value).into_iter().collect(),
+            Category::Shell => sourced(line),
             _ => key_value(line),
         };
         found.extend(command);
     }
     found
+}
+
+/// The files a line of a shell start-up file reads in: `source file` and
+/// `. file`, also behind a test (`[ -r file ] && . file`). The file runs as
+/// part of the one that names it.
+fn sourced(line: &str) -> Vec<String> {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    words
+        .windows(2)
+        .enumerate()
+        .filter(|(index, pair)| {
+            matches!(pair[0], "source" | ".")
+                && (*index == 0
+                    || matches!(
+                        words[index - 1],
+                        "&&" | "||" | "then" | "do" | "else" | "{" | "("
+                    )
+                    || words[index - 1].ends_with(';'))
+        })
+        .map(|(_, pair)| pair[1].trim_matches(['"', '\'', ';']).to_string())
+        .filter(|file| !file.is_empty())
+        .collect()
 }
 
 /// The commands of a crontab: after five time fields (or `@reboot` and
@@ -113,6 +194,16 @@ fn key_value(line: &str) -> Vec<String> {
         return Vec::new();
     };
     let key = key.trim();
+    // A file of `NAME=value` lines a unit reads into its environment; a
+    // leading `-` only says it may be missing.
+    if key == "EnvironmentFile" {
+        let file = value.trim().trim_start_matches('-');
+        return if file.is_empty() {
+            Vec::new()
+        } else {
+            vec![file.to_string()]
+        };
+    }
     let command = key == "command" || (key.len() > 7 && key.ends_with("Command"));
     let runs = key == "Exec"
         || command
@@ -199,38 +290,83 @@ fn pam(line: &str) -> Vec<String> {
     found
 }
 
-/// SSH client and server keys that run a command.
-fn ssh(line: &str) -> Vec<String> {
-    let Some((key, value)) = line.split_once(char::is_whitespace) else {
-        return Vec::new();
-    };
-    let key = key.trim_end_matches('=').to_ascii_lowercase();
-    if matches!(
-        key.as_str(),
+/// An SSH client or server line that runs a command or loads a library:
+/// its key (lower case) and what it runs or loads. The key and its value
+/// are separated by blanks or by `=`. `Match … exec "command"` runs its
+/// command to decide whether the block applies.
+pub fn ssh(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    let end = line.find(|c: char| c.is_whitespace() || c == '=')?;
+    let key = line[..end].to_ascii_lowercase();
+    let value = line[end..]
+        .trim_start_matches(|c: char| c.is_whitespace() || c == '=')
+        .trim();
+    let unquoted = |text: &str| text.trim_matches('"').to_string();
+    let runs = match key.as_str() {
         "proxycommand"
-            | "localcommand"
-            | "knownhostscommand"
-            | "authorizedkeyscommand"
-            | "forcecommand"
-    ) {
-        vec![value.trim().trim_start_matches('=').trim().to_string()]
-    } else {
-        Vec::new()
-    }
+        | "localcommand"
+        | "knownhostscommand"
+        | "authorizedkeyscommand"
+        | "authorizedprincipalscommand"
+        | "forcecommand"
+        | "pkcs11provider"
+        | "securitykeyprovider" => unquoted(value),
+        // The first file: it is read as more of this configuration.
+        "include" => unquoted(value.split_whitespace().next().unwrap_or_default()),
+        // `Subsystem name command`.
+        "subsystem" => value
+            .split_once(char::is_whitespace)
+            .map(|(_, command)| unquoted(command.trim()))?,
+        "match" => {
+            let lower = value.to_ascii_lowercase();
+            let at = lower
+                .split_whitespace()
+                .position(|word| word == "exec" || word == "!exec")?;
+            let rest: Vec<&str> = value.split_whitespace().skip(at + 1).collect();
+            // The command is one word, quoted when it holds blanks.
+            let command = rest.join(" ");
+            match command.strip_prefix('"') {
+                Some(quoted) => quoted.split('"').next().unwrap_or_default().to_string(),
+                None => rest.first().copied().unwrap_or_default().to_string(),
+            }
+        }
+        _ => return None,
+    };
+    // What the programs do themselves runs nothing.
+    (!runs.is_empty() && !matches!(runs.as_str(), "none" | "internal" | "internal-sftp"))
+        .then_some((key, runs))
 }
 
-/// `exec`, `exec-once`, `execr`, `execr-once` and `exec-shutdown` in a
-/// Hyprland `.conf`.
+/// What a Hyprland `.conf` runs or loads: `exec` and its variants, the
+/// command of a `bind… = MODS, key, exec, command`, a `plugin` (a library
+/// loaded into the compositor) and a `source`d file (one with `*` in its
+/// name is not looked up).
 fn hyprland_conf(text: &str) -> Vec<String> {
     text.lines()
         .filter_map(|line| {
             let (key, value) = line.trim().split_once('=')?;
-            matches!(
-                key.trim(),
-                "exec" | "exec-once" | "execr" | "execr-once" | "exec-shutdown"
-            )
-            .then(|| value.trim().to_string())
-            .filter(|value| !value.is_empty())
+            let (key, value) = (key.trim(), value.trim());
+            let runs = match key {
+                "exec" | "exec-once" | "execr" | "execr-once" | "exec-shutdown" | "plugin" => {
+                    Some(value.to_string())
+                }
+                "source" => (!value.contains('*')).then(|| value.to_string()),
+                key if key.starts_with("bind") => {
+                    // `bindd` and its like carry a description before the
+                    // dispatcher.
+                    let described = key["bind".len()..].contains('d');
+                    let mut parts = value.splitn(4 + usize::from(described), ',').map(str::trim);
+                    let (_mods, _key) = (parts.next()?, parts.next()?);
+                    if described {
+                        parts.next()?;
+                    }
+                    let (dispatcher, argument) = (parts.next()?, parts.next());
+                    matches!(dispatcher, "exec" | "execr")
+                        .then(|| argument.unwrap_or_default().to_string())
+                }
+                _ => None,
+            };
+            runs.filter(|value| !value.is_empty())
         })
         .collect()
 }
@@ -249,22 +385,65 @@ pub fn targets(root: &Path, home: &str, command: &str) -> Vec<String> {
 /// `targets`, with the caller saying which candidate paths are there: as
 /// root, a path only root can read is not looked for at a user's word.
 pub fn targets_where(home: &str, command: &str, exists: &dyn Fn(&str) -> bool) -> Vec<String> {
-    let words = split(command);
-    let mut words = words.iter().map(String::as_str).peekable();
-    // Leading assignments and wrappers.
-    while let Some(word) = words.peek() {
-        let name = word.rsplit('/').next().unwrap_or(word);
+    let mut words = split(command);
+    let mut found = Vec::new();
+    // Leading assignments and wrappers, with the wrappers' own options and
+    // words: what runs is the command after them. A wrapper found anywhere
+    // but in `/usr/bin` (a `sudo` in `~/.local/bin`) is what runs first.
+    let mut at = 0;
+    while let Some(word) = words.get(at).cloned() {
+        let name = word.rsplit('/').next().unwrap_or(&word);
         let assignment = word.contains('=') && !word.starts_with('/') && !word.starts_with('-');
-        if assignment || WRAPPERS.contains(&name) || *word == "--" || word.starts_with('-') {
-            words.next();
+        if assignment || word == "--" || word.starts_with('-') {
+            at += 1;
+        } else if let Some(wrapper) = WRAPPERS.iter().find(|wrapper| wrapper.name == name) {
+            if let Some(path) =
+                locate(home, &word, exists).filter(|path| !path.starts_with("usr/bin/"))
+            {
+                found.push(path);
+            }
+            at += 1;
+            while let Some(option) = words.get(at).filter(|word| word.starts_with('-')).cloned() {
+                at += 1;
+                if option == "--" {
+                    break;
+                }
+                // `env -S "program arguments"`: the command is in one word.
+                if name == "env" && matches!(option.as_str(), "-S" | "--split-string") {
+                    if let Some(inner) = words.get(at).cloned() {
+                        words.splice(at..=at, split(&inner));
+                    }
+                    break;
+                }
+                if wrapper.value_options.contains(&option.as_str()) {
+                    at += 1;
+                }
+            }
+            at += wrapper.own_words;
+            if name == "uwsm"
+                && words
+                    .get(at)
+                    .is_some_and(|word| UWSM_RUNS.contains(&word.as_str()))
+            {
+                at += 1;
+                // The subcommand's own options.
+                while let Some(option) = words.get(at).filter(|word| word.starts_with('-')) {
+                    let takes_value = wrapper.value_options.contains(&option.as_str());
+                    let end = option == "--";
+                    at += 1 + usize::from(takes_value);
+                    if end {
+                        break;
+                    }
+                }
+            }
         } else {
             break;
         }
     }
+    let mut words = words.iter().skip(at).map(String::as_str);
     let Some(program) = words.next() else {
-        return Vec::new();
+        return found;
     };
-    let mut found = Vec::new();
     if let Some(path) = locate(home, program, exists) {
         found.push(path);
     }
@@ -276,9 +455,29 @@ pub fn targets_where(home: &str, command: &str, exists: &dyn Fn(&str) -> bool) -
                 .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit() || c == '.'))
     });
     if interpreter {
-        for word in words {
-            if word == "-c" || word == "-e" {
+        while let Some(word) = words.next() {
+            // `sh -c "command line"` (also `-lc`, `-ic`) runs that line:
+            // what it names by a path is found the same way, wrappers
+            // and all. A bare name in it is not looked up.
+            if word.starts_with('-') && !word.starts_with("--") && word.ends_with('c') {
+                if let Some(code) = words.next() {
+                    found.extend(
+                        targets_where(home, code, exists)
+                            .into_iter()
+                            .filter(|path| !path.starts_with("usr/bin/")),
+                    );
+                }
                 break;
+            }
+            if word == "-e" {
+                break;
+            }
+            // `bash -o pipefail …`: for a shell the option's name is not
+            // the script. For Python `-O` is a plain flag.
+            let shell = matches!(name, "sh" | "bash" | "dash" | "zsh");
+            if shell && matches!(word, "-o" | "-O" | "+o" | "+O") {
+                words.next();
+                continue;
             }
             if word.starts_with('-') {
                 continue;
@@ -494,5 +693,127 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn what_runs_is_found_past_wrappers_and_in_files_that_are_read_in() {
+        let dir = TempDir::new("sweep-wrappers");
+        let root = dir.path();
+        for path in [
+            "usr/bin/bash",
+            "usr/bin/sudo",
+            "usr/bin/waybar",
+            "home/u/.cache/x.sh",
+            "home/u/.local/bin/timeout",
+        ] {
+            fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            fs::write(root.join(path), "").unwrap();
+        }
+        let payload = ["home/u/.cache/x.sh"];
+        for command in [
+            "uwsm app -- ~/.cache/x.sh",
+            "sudo -u nobody ~/.cache/x.sh --flag",
+            "systemd-run --user --unit x -p Restart=no ~/.cache/x.sh",
+            "env -u DISPLAY A=1 ~/.cache/x.sh",
+            "env -S \"~/.cache/x.sh --flag\"",
+            "nice -n 5 ionice -c 3 ~/.cache/x.sh",
+            "flock /tmp/lock ~/.cache/x.sh",
+            "setsid nohup ~/.cache/x.sh",
+        ] {
+            assert_eq!(targets(root, "home/u", command), payload, "{command}");
+        }
+        // A wrapper that is not the system's own is what runs first.
+        assert_eq!(
+            targets(root, "home/u", "timeout 5 ~/.cache/x.sh"),
+            ["home/u/.local/bin/timeout", "home/u/.cache/x.sh"]
+        );
+        // The program a shell is handed as its command line.
+        for command in [
+            "bash -c '~/.cache/x.sh --now'",
+            "bash -lc 'nohup ~/.cache/x.sh'",
+            "bash -c 'A=1 sudo ~/.cache/x.sh'",
+            "bash -o pipefail -c '~/.cache/x.sh'",
+        ] {
+            assert_eq!(
+                targets(root, "home/u", command),
+                ["usr/bin/bash", "home/u/.cache/x.sh"],
+                "{command}"
+            );
+        }
+        assert_eq!(
+            targets(root, "home/u", "uwsm app -s b -- ~/.cache/x.sh"),
+            payload
+        );
+        // `-O` is a plain flag there: the script is what follows.
+        fs::write(root.join("usr/bin/python3"), "").unwrap();
+        assert_eq!(
+            targets(root, "home/u", "python3 -O ~/.cache/x.sh"),
+            ["usr/bin/python3", "home/u/.cache/x.sh"]
+        );
+        assert_eq!(
+            targets(root, "home/u", "bash -c 'echo hi'"),
+            ["usr/bin/bash"]
+        );
+
+        // Files a shell start-up file reads in.
+        assert_eq!(
+            commands(
+                Category::Shell,
+                "home/u/.bashrc",
+                "source ~/.cache/x.sh\n[ -r /etc/x ] && . /etc/x\n# source /no\necho source of truth\nexport A=1\ntrue; . /etc/y\necho . done\n"
+            ),
+            ["~/.cache/x.sh", "/etc/x", "/etc/y"]
+        );
+        // What a unit reads into its environment.
+        assert_eq!(
+            commands(
+                Category::Systemd,
+                "etc/systemd/system/x.service",
+                "[Service]\nEnvironmentFile=-/etc/x.env\nExecStart=/usr/bin/waybar\n"
+            ),
+            ["/etc/x.env", "/usr/bin/waybar"]
+        );
+        // Hyprland: binds, plugins and files it is told to read.
+        assert_eq!(
+            commands(
+                Category::Hyprland,
+                "home/u/.config/hypr/hyprland.conf",
+                "exec-once = waybar\nbind = SUPER, Return, exec, ~/.cache/x.sh\nbindl = , XF86AudioMute, exec, wpctl set-mute\nbind = SUPER, Q, killactive\nbindd = SUPER, T, Open a terminal, exec, uwsm-app -- foot\nplugin = /tmp/evil.so\nsource = ~/.config/hypr/extra.txt\nsource = ~/.config/hypr/conf.d/*\n"
+            ),
+            [
+                "waybar",
+                "~/.cache/x.sh",
+                "wpctl set-mute",
+                "uwsm-app -- foot",
+                "/tmp/evil.so",
+                "~/.config/hypr/extra.txt"
+            ]
+        );
+        // SSH: `=` or blanks, commands and libraries.
+        for (line, runs) in [
+            ("ProxyCommand=/tmp/x %h", Some("/tmp/x %h")),
+            ("proxycommand   /tmp/x", Some("/tmp/x")),
+            ("ProxyCommand none", None),
+            (
+                "Subsystem sftp /usr/lib/ssh/sftp-server",
+                Some("/usr/lib/ssh/sftp-server"),
+            ),
+            ("Match user git exec \"/tmp/y %h\"", Some("/tmp/y %h")),
+            ("Match host x", None),
+            ("SecurityKeyProvider /tmp/sk.so", Some("/tmp/sk.so")),
+            ("ProxyJump bastion", None),
+            ("Subsystem sftp internal-sftp", None),
+            ("SecurityKeyProvider internal", None),
+            (
+                "Include ~/.orbstack/ssh/config",
+                Some("~/.orbstack/ssh/config"),
+            ),
+        ] {
+            assert_eq!(
+                super::ssh(line).map(|(_, value)| value).as_deref(),
+                runs,
+                "{line}"
+            );
+        }
     }
 }

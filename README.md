@@ -140,7 +140,16 @@ configuration, the Hyprland Lua configuration (and what `exec_on_start`
 starts), Omarchy hooks, SSH and git configuration, your own Python `.pth`
 files, and programs in `~/.local/bin` named like system commands. It
 follows links and what each file runs, so a trusted service running a
-replaced binary, or an interpreter running a script, is checked too.
+replaced binary, or an interpreter running a script, is checked too: past
+wrappers (`sudo -u`, `uwsm app --`, `systemd-run`, `env`, `timeout`,
+`flock`), into the program a shell is handed with `-c`, into the files a
+shell start-up file reads in with `source` or `.`, a unit's
+`EnvironmentFile=`, and a Hyprland `.conf`'s `source`, `plugin` and `bind …
+exec` lines. A link of the same name to a packaged file is trusted only
+where that is how the thing is enabled (a unit in a systemd directory, a
+hook in pacman's, a launcher in an autostart directory, a program of
+`/usr/bin` or `/usr/lib` in `~/.local/bin` or `~/.cargo/bin`), never to
+documentation or an example.
 
 It also looks at what runs **now**, listing only what does not add up, so a
 clean system shows nothing here:
@@ -208,9 +217,26 @@ unit's own name, never for units that open a root shell:
 
 Everything shown that holds text goes through the local rules and the AI
 review (class `system`), with the review memory, so a repeated sweep of an
-unchanged system makes no AI call. SSH and git files in a home directory are
-checked locally only and never sent to the AI. Binaries no package vouches
-for are named to the AI by format and hash but never run or uploaded.
+unchanged system makes no AI call. Before a file is reviewed, the value of
+any assignment whose name has a part that says secret (`KEY`, `APIKEY`,
+`TOKEN`, `AUTHTOKEN`, `PAT`, `SECRET`, `PASSWORD`, `PASSWD`, `PASSPHRASE`,
+`AUTH`, `CREDENTIAL(S)`, as in `OPENAI_API_KEY`) is taken out when it is a plain literal, in shell,
+`NAME=value` (with or without blanks around the `=`), unit `Environment=`
+and fish `set` forms: start-up files are
+where exported keys live, and the sweep runs on a timer. A value that says
+where something is (a path, a URL) stays, since that is what a review needs
+to see. A secret under another name, or written some other way, still goes
+with the file.
+SSH and git files in a home directory are checked locally only and never
+sent to the AI: an SSH line that runs a command or loads a library
+(`ProxyCommand`, `Match … exec`, `PKCS11Provider`, with blanks or `=`), a
+key with a `command=` or `environment=` option, and git keys that run a
+command. A file an SSH `Include` names is followed and checked the same
+way (a pattern with `*` is not). A credential helper
+is expected and passes, unless it is a shell line of its own or a program
+from a temporary directory; `url.*.insteadOf` rewrites are not judged.
+Binaries no package vouches for are named to the AI by format and hash but
+never run or uploaded.
 
 Some files only root can read (the sudoers file and drop-ins, polkit rules,
 root's crontab, shell files and keys, the Limine config). Without root, the
@@ -240,7 +266,11 @@ your own sweep could not read.
   and then daily, running `sweep --scheduled`: anything new or changed that
   no package vouches for raises a notification ("Guardian found …") that
   opens the saved report, and the bar knight needs attention until you
-  dismiss it;
+  dismiss it. Once the timer has run, new is measured against what its own
+  sweeps have told about: a sweep run by hand (by you, or by a program that hopes to have
+  its files taken as seen) does not count, so you may be notified of
+  something you already looked at. A finding that appears on a file that
+  did not change counts as a change; one that goes away does not;
 - a system timer (`omarchy-guardian-sweep-collect.timer`) for the root
   checks, but only after `protect` asks you and you agree. The answer is
   kept in the system file as `[sweep] root = "allowed"` (or `"declined"`)

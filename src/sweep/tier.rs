@@ -143,7 +143,12 @@ pub fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex) -> Tie
             target,
             resolved: Some(tier @ (Tier::Vendor | Tier::UserBuilt | Tier::Inert)),
             alias,
-        } if (alias || same_unit(name, target)) && !ROOT_SHELL_UNITS.contains(&name) => tier,
+        } if (alias || same_unit(name, target))
+            && enables_a_unit(path, target)
+            && !ROOT_SHELL_UNITS.contains(&name) =>
+        {
+            tier
+        }
         Observed::File { sha256, .. } if index.copy_of(sha256, path).is_some() => Tier::Copied,
         Observed::File { .. } | Observed::Link { .. } => Tier::Unknown,
     }
@@ -210,6 +215,31 @@ fn masks_a_defence(path: &str, name: &str, index: &PackageIndex) -> bool {
             && index
                 .owner(&format!("usr/share/libalpm/hooks/{name}"))
                 .is_some())
+}
+
+/// Whether a link at `path` to `target` is one that enables what a
+/// package ships to be enabled that way: a unit in a systemd directory or
+/// a hook in pacman's, and nothing that is documentation or an example (a
+/// packaged sample linked in under the same name is not something a
+/// package means to run).
+fn enables_a_unit(path: &str, target: &str) -> bool {
+    let unit = path.split('/').any(|part| part == "systemd");
+    let hook = path.starts_with("etc/pacman.d/hooks/")
+        && std::path::Path::new(target)
+            .extension()
+            .is_some_and(|extension| extension == "hook");
+    // A packaged launcher linked into autostart, or a packaged program
+    // linked under its own name where the user's programs are.
+    let launcher = path.contains("/autostart/")
+        && std::path::Path::new(target)
+            .extension()
+            .is_some_and(|extension| extension == "desktop");
+    let program = (path.contains("/.local/bin/") || path.contains("/.cargo/bin/"))
+        && (target.starts_with("/usr/bin/") || target.starts_with("/usr/lib/"));
+    (unit || hook || launcher || program)
+        && !["/doc/", "/docs/", "/examples/", "/example/", "/samples/"]
+            .iter()
+            .any(|sample| target.contains(sample))
 }
 
 /// Whether link `name` enables the unit at `target`: the same name, or an
@@ -395,6 +425,42 @@ mod tests {
             classify(
                 "etc/systemd/system/getty.target.wants/getty@tty1.service",
                 link("/usr/lib/systemd/system/getty@.service", vendor),
+                &index
+            ),
+            Tier::Vendor
+        );
+        // A link of the same name is only an enabled unit where systemd
+        // reads units, and never to documentation or an example.
+        assert_eq!(
+            classify(
+                "etc/sudoers.d/sudoers",
+                link("/usr/share/doc/sudo/examples/sudoers", vendor),
+                &index
+            ),
+            Tier::Unknown
+        );
+        assert_eq!(
+            classify(
+                "etc/profile.d/demo.sh",
+                link("/usr/share/demo/demo.sh", vendor),
+                &index
+            ),
+            Tier::Unknown
+        );
+        assert_eq!(
+            classify(
+                "etc/systemd/system/demo.service",
+                link("/usr/share/doc/demo/examples/demo.service", vendor),
+                &index
+            ),
+            Tier::Unknown
+        );
+        // A packaged hook linked into pacman's directory is enabled the
+        // way hooks are.
+        assert_eq!(
+            classify(
+                "etc/pacman.d/hooks/demo.hook",
+                link("/usr/share/demo/demo.hook", vendor),
                 &index
             ),
             Tier::Vendor

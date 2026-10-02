@@ -387,10 +387,10 @@ pub fn look(scope: &Scope<'_>, category: Category, path: &str, run_by: Option<&s
 fn wanted(scope: &Scope<'_>, category: Category, relative: &str) -> bool {
     let name = relative.rsplit('/').next().unwrap_or(relative);
     match category {
-        Category::Hyprland => {
-            (read::has_extension(name, "lua") || read::has_extension(name, "conf"))
-                && !name.contains(".bak")
-        }
+        // A backup Omarchy left (`hyprland.conf.bak.1700000000`) ends in
+        // neither; a file Hyprland is told to `source` is followed from
+        // the one that names it, whatever it is called.
+        Category::Hyprland => read::has_extension(name, "lua") || read::has_extension(name, "conf"),
         // Omarchy runs every hook but `*.sample`.
         Category::OmarchyHook => !name.ends_with(".sample"),
         // Old password hashes (`pam_pwhistory`): never read, never handed on.

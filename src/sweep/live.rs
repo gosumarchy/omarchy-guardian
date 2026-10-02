@@ -353,6 +353,9 @@ const VALUE_OPTIONS: &[&str] = &[
     "-classpath",
     "--class-path",
     "--module-path",
+    // `bash -o pipefail script`.
+    "-o",
+    "-O",
 ];
 
 /// The arguments that may be the script (or, for the loader, the program)
@@ -408,8 +411,16 @@ fn subject(scope: &Scope<'_>, process: &Process, exe: &str) -> (String, String) 
         .map(String::as_str)
         .collect::<Vec<_>>()
         .join(" ");
-    if let Some(script) = scripts(scope, process, exe).into_iter().next() {
-        return (script, started);
+    // Where an option's value may stand before the script, the file no
+    // package vouches for is the one to name: a packaged file given as
+    // that value must not take the script's place.
+    let scripts = scripts(scope, process, exe);
+    if let Some(script) = scripts
+        .iter()
+        .find(|script| !packaged(scope, script))
+        .or_else(|| scripts.first())
+    {
+        return (script.clone(), started);
     }
     (exe.to_string(), started)
 }

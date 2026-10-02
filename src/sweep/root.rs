@@ -230,21 +230,26 @@ pub fn results_problem(path: &Path, now: u64) -> Option<String> {
 }
 
 fn to_json(collection: &Collection) -> Json {
-    let items = collection
-        .items
-        .iter()
-        .filter(|item| !item.is_trusted())
-        .take(MAX_ITEMS)
-        .map(item_json);
+    let untrusted = || collection.items.iter().filter(|item| !item.is_trusted());
+    let mut truncated = collection.truncated.clone();
+    let left_out = untrusted().count().saturating_sub(MAX_ITEMS);
+    if left_out > 0 {
+        truncated.push(format!(
+            "the root checks found more than {MAX_ITEMS} items: {left_out} were left out"
+        ));
+    }
     Json::object([
         ("version", Json::from(VERSION)),
-        ("items", Json::Array(items.collect())),
+        (
+            "items",
+            Json::Array(untrusted().take(MAX_ITEMS).map(item_json).collect()),
+        ),
         (
             "truncated",
             Json::Array(
-                collect::bounded(collection.truncated.clone())
-                    .iter()
-                    .map(|unchecked| Json::from(unchecked.as_str()))
+                collect::bounded(truncated)
+                    .into_iter()
+                    .map(Json::from)
                     .collect(),
             ),
         ),
@@ -385,17 +390,21 @@ fn from_json(text: &str) -> Result<RootPart, String> {
     if json.get("version").and_then(Json::as_u64) != Some(VERSION) {
         return Err("the root collector is a different version; reinstall Guardian".into());
     }
-    let items = json
+    let listed = json
         .get("items")
         .and_then(Json::as_array)
-        .ok_or("no item list")?
+        .ok_or("no item list")?;
+    let items: Vec<Item> = listed
         .iter()
         .take(MAX_ITEMS)
         // One odd item (a process with a strange `LD_PRELOAD`, say) must not
         // throw away everything else root found.
         .filter_map(item_from_json)
         .collect();
-    let truncated = json
+    // But it is said: what root found and this sweep could not read is
+    // something that was not checked.
+    let unread = listed.len() - items.len();
+    let mut truncated: Vec<String> = json
         .get("truncated")
         .and_then(Json::as_array)
         .map(|locations| {
@@ -405,6 +414,11 @@ fn from_json(text: &str) -> Result<RootPart, String> {
                 .collect()
         })
         .unwrap_or_default();
+    if unread > 0 {
+        truncated.push(format!(
+            "{unread} item(s) of the root checks could not be read and were left out"
+        ));
+    }
     Ok(RootPart { items, truncated })
 }
 
