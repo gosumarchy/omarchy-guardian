@@ -221,7 +221,8 @@ unchanged system makes no AI call. Before a file is reviewed, the value of
 any assignment whose name has a part that says secret (`KEY`, `APIKEY`,
 `TOKEN`, `AUTHTOKEN`, `PAT`, `SECRET`, `PASSWORD`, `PASSWD`, `PASSPHRASE`,
 `AUTH`, `CREDENTIAL(S)`, as in `OPENAI_API_KEY`) is taken out when it is a plain literal, in shell,
-`NAME=value`, unit `Environment=` and fish `set` forms: start-up files are
+`NAME=value` (with or without blanks around the `=`), unit `Environment=`
+and fish `set` forms: start-up files are
 where exported keys live, and the sweep runs on a timer. A value that says
 where something is (a path, a URL) stays, since that is what a review needs
 to see. A secret under another name, or written some other way, still goes

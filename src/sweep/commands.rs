@@ -472,8 +472,10 @@ pub fn targets_where(home: &str, command: &str, exists: &dyn Fn(&str) -> bool) -
             if word == "-e" {
                 break;
             }
-            // `bash -o pipefail …`: the option's name is not the script.
-            if matches!(word, "-o" | "-O") {
+            // `bash -o pipefail …`: for a shell the option's name is not
+            // the script. For Python `-O` is a plain flag.
+            let shell = matches!(name, "sh" | "bash" | "dash" | "zsh");
+            if shell && matches!(word, "-o" | "-O" | "+o" | "+O") {
                 words.next();
                 continue;
             }
@@ -741,6 +743,12 @@ mod tests {
         assert_eq!(
             targets(root, "home/u", "uwsm app -s b -- ~/.cache/x.sh"),
             payload
+        );
+        // `-O` is a plain flag there: the script is what follows.
+        fs::write(root.join("usr/bin/python3"), "").unwrap();
+        assert_eq!(
+            targets(root, "home/u", "python3 -O ~/.cache/x.sh"),
+            ["usr/bin/python3", "home/u/.cache/x.sh"]
         );
         assert_eq!(
             targets(root, "home/u", "bash -c 'echo hi'"),

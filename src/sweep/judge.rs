@@ -145,7 +145,14 @@ const SECRET_NAMES: &[&str] = &[
 ];
 
 /// Directories nothing lasting runs from.
-const TEMPORARY: &[&str] = &["/tmp/", "/var/tmp/", "/dev/shm/", "/run/user/", "/.cache/"];
+const TEMPORARY: &[&str] = &[
+    "/tmp/",
+    "/var/tmp/",
+    "/dev/shm/",
+    "/run/user/",
+    "/run/media/",
+    "/.cache/",
+];
 
 /// What stands where a value was taken out.
 const REDACTED: &str = "<redacted-by-guardian>";
