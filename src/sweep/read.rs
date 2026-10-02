@@ -360,6 +360,79 @@ pub fn entries(root: &Path, rel: &str) -> Listing {
     }
 }
 
+/// What a pattern matched.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Matches {
+    /// The paths that match, sorted.
+    pub files: Vec<String>,
+    /// More matched than are kept.
+    pub truncated: bool,
+    /// Entries whose name is not UTF-8 where a match was looked for.
+    pub unnamed: Vec<String>,
+    /// Directories that exist but could not be listed.
+    pub unreadable: Vec<String>,
+}
+
+/// The most paths one pattern may match.
+const MAX_MATCHES: usize = 500;
+
+/// Every path under `root` that `pattern` matches: in each name of it, `*`
+/// stands for any run of characters. Directories are listed only where a
+/// name has one; linked directories are not entered.
+pub fn matching(root: &Path, pattern: &str) -> Matches {
+    let mut found = Matches::default();
+    let mut bases = vec![String::new()];
+    let names: Vec<&str> = pattern.split('/').collect();
+    for (index, name) in names.iter().enumerate() {
+        let last = index + 1 == names.len();
+        let mut next = Vec::new();
+        for base in bases {
+            let under = |name: &str| {
+                if base.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{base}/{name}")
+                }
+            };
+            if !name.contains('*') {
+                next.push(under(name));
+                continue;
+            }
+            let listing = match fs::read_dir(root.join(&base)) {
+                Ok(listing) => listing,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    found.unreadable.push(base.clone());
+                    continue;
+                }
+            };
+            for entry in listing.filter_map(Result::ok) {
+                let Some(entry_name) = entry.file_name().to_str().map(str::to_string) else {
+                    found
+                        .unnamed
+                        .push(under(&entry.file_name().to_string_lossy()));
+                    continue;
+                };
+                let directory = entry.file_type().is_ok_and(|kind| kind.is_dir());
+                if crate::autorun::name_matches(name, &entry_name) && last != directory {
+                    next.push(under(&entry_name));
+                }
+            }
+        }
+        if next.len() > MAX_MATCHES {
+            next.sort();
+            next.truncate(MAX_MATCHES);
+            found.truncated = true;
+        }
+        bases = next;
+    }
+    bases.retain(|path| fs::symlink_metadata(root.join(path)).is_ok());
+    bases.sort();
+    found.unnamed.sort();
+    found.files = bases;
+    found
+}
+
 /// Where the link at `rel` with text `target` finally points, relative to
 /// `root`, following further links; `None` when it leaves `root`, loops or
 /// points at nothing.
@@ -450,7 +523,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    use super::{Found, entries, look, resolve};
+    use super::{Found, entries, look, matching, resolve};
     use crate::sha256::Sha256;
     use crate::test_support::TempDir;
 
@@ -642,5 +715,72 @@ mod tests {
             Some("usr/lib/systemd/system/a.service")
         );
         assert_eq!(super::canonical(root, "etc/systemd/system/escape/x"), None);
+    }
+
+    #[test]
+    fn a_pattern_matches_names_one_directory_at_a_time() {
+        use crate::autorun::name_matches;
+        for (pattern, name, matches) in [
+            ("*.pth", "x.pth", true),
+            ("*.pth", ".pth", true),
+            ("*.pth", "x.pth.bak", false),
+            ("python*", "python3.13", true),
+            ("python*", "pypy", false),
+            ("a*b*c", "aXbYc", true),
+            ("a*b*c", "aXc", false),
+            ("plain", "plain", true),
+            ("plain", "plainer", false),
+        ] {
+            assert_eq!(name_matches(pattern, name), matches, "{pattern} {name}");
+        }
+
+        let dir = TempDir::new("sweep-matching");
+        let root = dir.path();
+        for path in [
+            "lib/python3.13/site-packages/a.pth",
+            "lib/python3.13/site-packages/pkg/deep.pth",
+            "lib/python3.13/site-packages/b.py",
+            "lib/python3.12/site-packages/c.pth",
+            "lib/perl/site-packages/d.pth",
+        ] {
+            fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            fs::write(root.join(path), "import x\n").unwrap();
+        }
+        // A linked directory is not entered.
+        symlink("python3.13", root.join("lib/python3")).unwrap();
+        let found = matching(root, "lib/python*/site-packages/*.pth");
+        assert_eq!(
+            found.files,
+            [
+                "lib/python3.12/site-packages/c.pth",
+                "lib/python3.13/site-packages/a.pth"
+            ]
+        );
+        assert!(!found.truncated);
+        // A directory is not a file of that name.
+        fs::create_dir_all(root.join("lib/python3.13/site-packages/dir.pth")).unwrap();
+        assert_eq!(
+            matching(root, "lib/python*/site-packages/*.pth")
+                .files
+                .len(),
+            2
+        );
+        for (pattern, name, matches) in [
+            ("a*a", "a", false),
+            ("a*a", "aa", true),
+            ("*", "anything", true),
+            ("**", "", true),
+            ("*a*a", "a", false),
+            ("", "", true),
+            ("", "x", false),
+        ] {
+            assert_eq!(name_matches(pattern, name), matches, "{pattern:?} {name:?}");
+        }
+        assert!(
+            matching(root, "lib/python*/site-packages/sitecustomize.py")
+                .files
+                .is_empty()
+        );
+        assert!(matching(root, "none/*/x").files.is_empty());
     }
 }

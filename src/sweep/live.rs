@@ -84,6 +84,9 @@ struct Process {
     /// Where its open files lead.
     fds: Vec<String>,
     environment: Option<Vec<u8>>,
+    /// Its working directory, relative to `/`: what a script given by a
+    /// relative name is relative to.
+    cwd: Option<String>,
     /// It runs in a user namespace of its own, where it can mount what it
     /// likes over any path: the name of its program vouches for nothing.
     own_namespace: bool,
@@ -249,6 +252,10 @@ fn processes(proc: &Path) -> (Vec<Process>, usize) {
             arguments,
             fds,
             environment,
+            cwd: fs::read_link(directory.join("cwd")).ok().and_then(|cwd| {
+                cwd.to_str()
+                    .map(|cwd| cwd.trim_start_matches('/').to_string())
+            }),
             own_namespace,
             of_root: root_before && of_root(&directory),
         });
@@ -277,17 +284,26 @@ fn of_root(directory: &Path) -> bool {
 /// about what they run.
 const INTERPRETERS: &[&str] = &[
     "python", "python3", "perl", "ruby", "node", "bun", "deno", "php", "lua", "luajit", "bash",
-    "sh", "dash", "zsh", "fish", "java", "socat", "nc", "ncat",
+    "sh", "dash", "zsh", "fish", "java", "socat", "nc", "ncat", "awk", "gawk", "mawk", "busybox",
+    "openssl", "tclsh", "wish", "expect", "Rscript", "pwsh", "erl", "julia", "dotnet", "mono",
+    "guile",
 ];
+
+/// The dynamic loader run as a program (`ld-linux-x86-64.so.2 ./program`):
+/// it runs the program it is given, as an interpreter runs a script.
+fn is_loader(name: &str) -> bool {
+    name == "ld.so" || name.starts_with("ld-linux") || name.starts_with("ld-musl")
+}
 
 fn is_interpreter(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
-    INTERPRETERS.iter().any(|interpreter| {
-        name == *interpreter
-            || name
-                .strip_prefix(interpreter)
-                .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit() || c == '.'))
-    })
+    is_loader(name)
+        || INTERPRETERS.iter().any(|interpreter| {
+            name == *interpreter
+                || name
+                    .strip_prefix(interpreter)
+                    .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit() || c == '.'))
+        })
 }
 
 /// Whether `process` runs a repository package's program and nothing else:
@@ -315,6 +331,73 @@ fn replaced_in_own_namespace(process: &Process) -> bool {
     process.own_namespace && process.exe.ends_with(" (deleted)")
 }
 
+/// Options that take the next argument as their value in some interpreter
+/// or in the loader (`python3 -W ignore x.py`, `ld-linux --library-path d
+/// prog`). In another they are plain flags (`python3 -I x.py`), so what
+/// follows one may be the script or may be a value before it.
+const VALUE_OPTIONS: &[&str] = &[
+    "--library-path",
+    "--preload",
+    "--audit",
+    "--argv0",
+    "--glibc-hwcaps-prepend",
+    "--glibc-hwcaps-mask",
+    "-W",
+    "-X",
+    "-r",
+    "--require",
+    "--import",
+    "--loader",
+    "-I",
+    "-cp",
+    "-classpath",
+    "--class-path",
+    "--module-path",
+];
+
+/// The arguments that may be the script (or, for the loader, the program)
+/// of a process: the first that is no option, and, where that one follows
+/// an option that may have taken it as its value, the next one too. Code
+/// given on the command line (`python3 -c …`) comes out as one, and is
+/// dropped where it names no file; `bash -e x.sh`, where `-e` is a plain
+/// flag, keeps its script.
+fn script_arguments(arguments: &[String]) -> Vec<&str> {
+    let mut candidates = Vec::new();
+    let mut may_be_value = false;
+    for argument in arguments.iter().skip(1).map(String::as_str) {
+        if argument.starts_with('-') {
+            may_be_value = VALUE_OPTIONS.contains(&argument);
+            continue;
+        }
+        candidates.push(argument);
+        if !may_be_value {
+            break;
+        }
+        may_be_value = false;
+    }
+    candidates
+}
+
+/// The files on disk an interpreter (or the loader) may be running as its
+/// script, most likely first; none for a program that is not one, and for
+/// a relay, which runs what it is told (`ncat -e /usr/bin/bash`), not a
+/// script.
+fn scripts(scope: &Scope<'_>, process: &Process, exe: &str) -> Vec<String> {
+    let relay = matches!(exe.rsplit('/').next(), Some("nc" | "ncat" | "socat"));
+    if !is_interpreter(exe) || relay {
+        return Vec::new();
+    }
+    script_arguments(&process.arguments)
+        .into_iter()
+        .filter_map(|script| match script.strip_prefix('/') {
+            Some(absolute) => normalize(absolute),
+            // A relative name is relative to where the process runs.
+            None => normalize(&format!("{}/{script}", process.cwd.as_deref()?)),
+        })
+        .filter(|script| collect::is_file_there(scope, script, None))
+        .collect()
+}
+
 /// What to name for an untrusted process: the script an interpreter runs,
 /// if there is one on disk, else the program; and how it was started.
 fn subject(scope: &Scope<'_>, process: &Process, exe: &str) -> (String, String) {
@@ -325,19 +408,7 @@ fn subject(scope: &Scope<'_>, process: &Process, exe: &str) -> (String, String) 
         .map(String::as_str)
         .collect::<Vec<_>>()
         .join(" ");
-    // Relays run what they are told (`ncat -e /usr/bin/bash`), not a script.
-    let relay = matches!(exe.rsplit('/').next(), Some("nc" | "ncat" | "socat"));
-    if is_interpreter(exe)
-        && !relay
-        && let Some(script) = process
-            .arguments
-            .iter()
-            .skip(1)
-            .find(|argument| !argument.starts_with('-'))
-            .and_then(|script| script.strip_prefix('/'))
-            .and_then(normalize)
-            .filter(|script| collect::is_file_there(scope, script, None))
-    {
+    if let Some(script) = scripts(scope, process, exe).into_iter().next() {
         return (script, started);
     }
     (exe.to_string(), started)
@@ -441,14 +512,42 @@ fn device_checks(scope: &Scope<'_>, process: &Process, exe: &str, found: &mut Fo
     }
 }
 
+/// Whether `path` is in a temporary or cache directory.
+fn is_temporary(scope: &Scope<'_>, path: &str) -> bool {
+    TEMPORARY
+        .iter()
+        .any(|directory| path.starts_with(directory))
+        || scope
+            .home
+            .is_some_and(|home| path.starts_with(&format!("{home}/.cache/")))
+}
+
 fn temporary_checks(scope: &Scope<'_>, process: &Process, exe: &str, found: &mut Found) {
     let pid = &process.pid;
-    let cache = scope.home.map(|home| format!("{home}/.cache/"));
-    if !(TEMPORARY.iter().any(|directory| exe.starts_with(directory))
-        || cache
-            .as_ref()
-            .is_some_and(|cache| exe.starts_with(cache.as_str())))
-    {
+    if !is_temporary(scope, exe) {
+        // An interpreter is as trustworthy as the script it runs.
+        let started = subject(scope, process, exe).1;
+        for script in scripts(scope, process, exe) {
+            if !is_temporary(scope, &script) {
+                continue;
+            }
+            // An AppImage's own start script, under its mount.
+            let appimage = script.starts_with("tmp/.mount_");
+            let note = if appimage {
+                format!("process {pid} ({started}) runs this script from an AppImage")
+            } else {
+                format!(
+                    "process {pid} ({started}) runs this script from a temporary or cache directory"
+                )
+            };
+            found.add(
+                scope,
+                Category::Process,
+                &script,
+                note,
+                (!appimage).then_some(RuleId::RunningFromTemp),
+            );
+        }
         return;
     }
     // An AppImage runs from its own mount under /tmp.
@@ -473,6 +572,29 @@ fn temporary_checks(scope: &Scope<'_>, process: &Process, exe: &str, found: &mut
 
 fn preload_checks(scope: &Scope<'_>, process: &Process, exe: &str, found: &mut Found) {
     let pid = &process.pid;
+    for directory in searched(process.environment.as_deref()) {
+        // An AppImage adds its own mount under /tmp.
+        let suspect = match &directory {
+            Some(directory) => {
+                is_temporary(scope, &format!("{directory}/"))
+                    && !directory.starts_with("tmp/.mount_")
+            }
+            None => true,
+        };
+        if suspect {
+            let shown = directory.map_or_else(
+                || "a directory relative to where it runs".to_string(),
+                |directory| format!("/{directory}"),
+            );
+            found.add(
+                scope,
+                Category::Process,
+                exe,
+                format!("process {pid} looks for its libraries in {shown} first (LD_LIBRARY_PATH)"),
+                Some(RuleId::PreloadedLibrary),
+            );
+        }
+    }
     for library in preloaded(process.environment.as_deref()) {
         match library {
             Preload::Path(library) if !packaged(scope, &library) => {
@@ -555,14 +677,19 @@ enum Preload {
     Searched(String),
 }
 
-/// The libraries in a process's `LD_PRELOAD`.
+/// The libraries a process has the dynamic linker load into it: its
+/// `LD_PRELOAD` and `LD_AUDIT`.
 fn preloaded(environment: Option<&[u8]>) -> Vec<Preload> {
     let Some(environment) = environment else {
         return Vec::new();
     };
     environment
         .split(|byte| *byte == 0)
-        .filter_map(|entry| entry.strip_prefix(b"LD_PRELOAD="))
+        .filter_map(|entry| {
+            entry
+                .strip_prefix(b"LD_PRELOAD=")
+                .or_else(|| entry.strip_prefix(b"LD_AUDIT="))
+        })
         .flat_map(|value| {
             String::from_utf8_lossy(value)
                 .split([':', ' '])
@@ -576,17 +703,57 @@ fn preloaded(environment: Option<&[u8]>) -> Vec<Preload> {
         .collect()
 }
 
+/// The directories of a process's `LD_LIBRARY_PATH`, relative to `/`;
+/// `None` for one that is relative to wherever the process runs. An empty
+/// entry is left out, though it means that too: `X:$LD_LIBRARY_PATH` with
+/// nothing set before leaves one in every launcher's environment. So are
+/// the linker's own `$ORIGIN`, `$LIB` and `$PLATFORM`.
+fn searched(environment: Option<&[u8]>) -> Vec<Option<String>> {
+    let Some(environment) = environment else {
+        return Vec::new();
+    };
+    environment
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| entry.strip_prefix(b"LD_LIBRARY_PATH="))
+        .flat_map(|value| {
+            String::from_utf8_lossy(value)
+                .split([':', ';'])
+                .filter(|directory| !directory.is_empty() && *directory != "/")
+                // The linker's own tokens stand for where the program or
+                // its libraries are; with `..` they lead anywhere.
+                .filter(|directory| {
+                    let token = ["$ORIGIN", "${ORIGIN}", "$LIB", "${LIB}", "$PLATFORM", "${PLATFORM}"]
+                        .iter()
+                        .any(|token| directory.starts_with(token));
+                    !token || directory.split('/').any(|part| part == "..")
+                })
+                .map(|directory| directory.strip_prefix('/').and_then(normalize))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// TCP sockets listening on anything but the loopback interface, by the
 /// program that holds them.
 fn listeners(scope: &Scope<'_>, processes: &[Process], found: &mut Found) {
-    let mut holders: HashMap<String, &Process> = HashMap::new();
+    // A socket is shared by every process that inherited it: each one can
+    // accept on it, so each is looked at, not just one of them.
+    let mut holders: HashMap<String, Vec<&Process>> = HashMap::new();
     for process in processes {
         for fd in &process.fds {
             if let Some(inode) = fd
                 .strip_prefix("socket:[")
                 .and_then(|rest| rest.strip_suffix(']'))
             {
-                holders.insert(inode.to_string(), process);
+                // Once per process, however many copies of the socket it
+                // holds.
+                let sharing = holders.entry(inode.to_string()).or_default();
+                if sharing
+                    .last()
+                    .is_none_or(|last: &&Process| last.pid != process.pid)
+                {
+                    sharing.push(process);
+                }
             }
         }
     }
@@ -599,36 +766,13 @@ fn listeners(scope: &Scope<'_>, processes: &[Process], found: &mut Found) {
             if is_loopback(&address) {
                 continue;
             }
-            let Some(process) = holders.get(&inode) else {
+            let Some(sharing) = holders.get(&inode) else {
                 unattributed += 1;
                 continue;
             };
-            let exe = process.exe.trim_start_matches('/');
-            // Programs with no file on disk are reported by the program
-            // checks already, but for one that only borrows a name.
-            let borrowed = replaced_in_own_namespace(process);
-            if (exe.ends_with(" (deleted)") && !borrowed)
-                || exe.starts_with("memfd:")
-                || trusted_program(scope, process, exe)
-            {
-                continue;
+            for process in sharing {
+                listener(scope, process, port, found);
             }
-            let exe = exe.trim_end_matches(" (deleted)");
-            let (path, started) = subject(scope, process, exe);
-            let pid = &process.pid;
-            // An interpreter's listener is always shown: with no script on
-            // disk (`python -c …`), or with a packaged "script" it was handed
-            // (`ncat -e /usr/bin/bash`), it would otherwise pass as trusted.
-            // So is one under a borrowed name, whose item is the packaged
-            // file of that name.
-            let alert = (is_interpreter(exe) || borrowed).then_some(RuleId::NetworkListener);
-            found.add(
-                scope,
-                Category::Listener,
-                &path,
-                format!("process {pid} ({started}) listens on TCP port {port} from the network"),
-                alert,
-            );
         }
     }
     if unattributed > 0 {
@@ -636,6 +780,35 @@ fn listeners(scope: &Scope<'_>, processes: &[Process], found: &mut Found) {
             "{unattributed} listening socket(s) belong to processes of other users; the root checks cover them"
         ));
     }
+}
+
+/// What to say about `process`, which holds a socket listening on `port`.
+fn listener(scope: &Scope<'_>, process: &Process, port: u16, found: &mut Found) {
+    let exe = process.exe.trim_start_matches('/');
+    // Programs with no file on disk are reported by the program checks
+    // already, but for one that only borrows a name.
+    let borrowed = replaced_in_own_namespace(process);
+    if (exe.ends_with(" (deleted)") && !borrowed)
+        || exe.starts_with("memfd:")
+        || trusted_program(scope, process, exe)
+    {
+        return;
+    }
+    let exe = exe.trim_end_matches(" (deleted)");
+    let (path, started) = subject(scope, process, exe);
+    let pid = &process.pid;
+    // An interpreter's listener is always shown: with no script on disk
+    // (`python -c …`), or with a packaged "script" it was handed (`ncat -e
+    // /usr/bin/bash`), it would otherwise pass as trusted. So is one under
+    // a borrowed name, whose item is the packaged file of that name.
+    let alert = (is_interpreter(exe) || borrowed).then_some(RuleId::NetworkListener);
+    found.add(
+        scope,
+        Category::Listener,
+        &path,
+        format!("process {pid} ({started}) listens on TCP port {port} from the network"),
+        alert,
+    );
 }
 
 /// A listening TCP socket from a `/proc/net/tcp{,6}` line: its local
@@ -1452,6 +1625,292 @@ mod tests {
     }
 
     #[test]
+    fn a_socket_is_looked_at_for_every_process_that_shares_it() {
+        let (dir, index) = fixture();
+        let root = dir.path();
+        // The program that opened it, and a packaged one it handed it to.
+        process(
+            root,
+            "30",
+            "/home/u/server",
+            &[("3", "socket:[777]"), ("4", "socket:[777]")],
+            "",
+        );
+        process(
+            root,
+            "31",
+            "/usr/bin/hyprland",
+            &[("3", "socket:[777]")],
+            "",
+        );
+        write(
+            root,
+            "proc/net/tcp",
+            "  sl  local_address rem_address   st\n   0: 00000000:2328 00000000:0000 0A 0:0 0:0 0 1000 0 777 1\n",
+        );
+        let live = check(&Scope {
+            root,
+            home: Some("home/u"),
+            index: &index,
+            origin: Origin::System,
+        });
+        let notes: Vec<&String> = live.items.iter().flat_map(|item| &item.notes).collect();
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("process 30 ")
+                    && note.contains("listens on TCP port 9000")),
+            "{notes:?}"
+        );
+        assert!(!notes.iter().any(|note| note.contains("process 31 ")));
+        // A second copy of the socket in one process says nothing twice.
+        assert_eq!(
+            notes
+                .iter()
+                .filter(|note| note.contains("process 30 "))
+                .count(),
+            1,
+            "{notes:?}"
+        );
+    }
+
+    /// A process as the checks read it.
+    fn running(
+        exe: &str,
+        arguments: &[&str],
+        cwd: Option<&str>,
+        environment: &str,
+    ) -> super::Process {
+        super::Process {
+            pid: "7".into(),
+            exe: exe.into(),
+            exe_id: None,
+            arguments: arguments
+                .iter()
+                .map(|argument| (*argument).to_string())
+                .collect(),
+            fds: Vec::new(),
+            environment: Some(environment.replace(';', "\0").into_bytes()),
+            own_namespace: false,
+            of_root: false,
+            cwd: cwd.map(str::to_string),
+        }
+    }
+
+    /// What the temporary and preload checks say about `process`: each
+    /// item's path, alerts and notes.
+    fn said(
+        scope: &Scope<'_>,
+        process: &super::Process,
+        exe: &str,
+    ) -> Vec<(String, Vec<RuleId>, Vec<String>)> {
+        let mut found = super::Found::default();
+        super::temporary_checks(scope, process, exe, &mut found);
+        super::preload_checks(scope, process, exe, &mut found);
+        found
+            .items
+            .into_values()
+            .map(|item| {
+                (
+                    item.path,
+                    item.alerts.iter().map(|(rule, _)| *rule).collect(),
+                    item.notes,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_script_is_looked_for_past_an_options_value() {
+        // After an option that takes a value in one interpreter and none
+        // in another, both readings are looked at; code on the command
+        // line names no file.
+        let candidates = |arguments: &[&str]| {
+            let owned: Vec<String> = arguments
+                .iter()
+                .map(|argument| (*argument).to_string())
+                .collect();
+            super::script_arguments(&owned)
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            candidates(&["python3", "-W", "ignore", "/tmp/evil.py", "argument"]),
+            ["ignore", "/tmp/evil.py"]
+        );
+        assert_eq!(
+            candidates(&["python3", "-I", "/tmp/evil.py"]),
+            ["/tmp/evil.py"]
+        );
+        assert_eq!(
+            candidates(&[
+                "ld-linux-x86-64.so.2",
+                "--library-path",
+                "/tmp",
+                "/tmp/evil"
+            ]),
+            ["/tmp", "/tmp/evil"]
+        );
+        assert_eq!(candidates(&["bash", "-x", "a.sh", "b.sh"]), ["a.sh"]);
+        // `-e`, `-c` and `-m` are plain flags in a shell, and take code or
+        // a module elsewhere: what follows is looked at as a file either
+        // way, and code names none.
+        assert_eq!(candidates(&["bash", "-e", "/tmp/x.sh"]), ["/tmp/x.sh"]);
+        assert_eq!(candidates(&["sh", "-c", "/tmp/x"]), ["/tmp/x"]);
+        assert_eq!(candidates(&["python3", "-c", "import os"]), ["import os"]);
+        assert_eq!(
+            candidates(&["python3", "-m", "http.server"]),
+            ["http.server"]
+        );
+    }
+
+    #[test]
+    fn what_an_interpreter_or_the_loader_runs_is_what_is_judged() {
+        let dir = TempDir::new("live-scripts");
+        let root = dir.path();
+        for path in ["tmp/evil.py", "tmp/evil", "home/u/work/tool.py"] {
+            write(root, path, "x");
+        }
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let scope = Scope {
+            root,
+            home: Some("home/u"),
+            index: &index,
+            origin: Origin::System,
+        };
+        // A script by a relative name is found where the process runs.
+        let relative = running("/usr/bin/python3", &["python3", "evil.py"], Some("tmp"), "");
+        assert_eq!(
+            super::subject(&scope, &relative, "usr/bin/python3").0,
+            "tmp/evil.py"
+        );
+        let elsewhere = running(
+            "/usr/bin/python3",
+            &["python3", "evil.py"],
+            Some("home/u"),
+            "",
+        );
+        assert_eq!(
+            super::subject(&scope, &elsewhere, "usr/bin/python3").0,
+            "usr/bin/python3"
+        );
+        // The loader runs the program it is given.
+        let loader = "usr/lib/ld-linux-x86-64.so.2";
+        assert!(super::is_interpreter(loader));
+        assert!(super::is_interpreter("usr/bin/gawk"));
+        assert!(!super::is_interpreter("usr/bin/ldd"));
+        let loaded = running(&format!("/{loader}"), &[loader, "/tmp/evil"], None, "");
+        assert_eq!(super::subject(&scope, &loaded, loader).0, "tmp/evil");
+
+        // Either one, run from a temporary directory, is said; a script
+        // elsewhere is not.
+        for (process, exe, script) in [
+            (&relative, "usr/bin/python3", "tmp/evil.py"),
+            (&loaded, loader, "tmp/evil"),
+        ] {
+            let found = said(&scope, process, exe);
+            assert!(
+                matches!(found.as_slice(), [(path, alerts, _)]
+                    if path == script && alerts == &[RuleId::RunningFromTemp]),
+                "{found:?}"
+            );
+        }
+        // Whichever reading names a file in a temporary directory, it is
+        // said: a harmless file given as the "value" hides nothing.
+        write(root, "tmp/ignore", "x");
+        for arguments in [
+            &["python3", "-W", "ignore", "/tmp/evil.py"][..],
+            &["python3", "-I", "/tmp/evil.py", "/home/u/work/tool.py"][..],
+        ] {
+            let process = running("/usr/bin/python3", arguments, Some("tmp"), "");
+            let found = said(&scope, &process, "usr/bin/python3");
+            assert!(
+                found.iter().any(|(path, alerts, _)| path == "tmp/evil.py"
+                    && alerts == &[RuleId::RunningFromTemp]),
+                "{arguments:?} {found:?}"
+            );
+        }
+        // An AppImage's own start script is noted, not flagged.
+        write(root, "tmp/.mount_app/AppRun", "x");
+        let appimage = running(
+            "/usr/bin/bash",
+            &["bash", "/tmp/.mount_app/AppRun"],
+            None,
+            "",
+        );
+        let found = said(&scope, &appimage, "usr/bin/bash");
+        assert!(
+            matches!(found.as_slice(), [(path, alerts, _)]
+                if path == "tmp/.mount_app/AppRun" && alerts.is_empty()),
+            "{found:?}"
+        );
+        let fine = running(
+            "/usr/bin/python3",
+            &["python3", "work/tool.py"],
+            Some("home/u"),
+            "LD_LIBRARY_PATH=/opt/app/lib:/tmp/.mount_app/usr/lib",
+        );
+        assert!(said(&scope, &fine, "usr/bin/python3").is_empty());
+    }
+
+    #[test]
+    fn libraries_from_a_temporary_directory_and_audit_libraries_are_said() {
+        let dir = TempDir::new("live-libraries");
+        let root = dir.path();
+        write(root, "home/u/.audit.so", "x");
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let scope = Scope {
+            root,
+            home: Some("home/u"),
+            index: &index,
+            origin: Origin::System,
+        };
+        let searching = running(
+            "/usr/bin/python3",
+            &["python3"],
+            None,
+            "LD_LIBRARY_PATH=/usr/lib:/tmp/libs:lib:;LD_AUDIT=/home/u/.audit.so",
+        );
+        let found = said(&scope, &searching, "usr/bin/python3");
+        let about = |path: &str| found.iter().find(|(found, _, _)| found == path).unwrap();
+        let (_, alerts, notes) = about("usr/bin/python3");
+        assert_eq!(alerts, &[RuleId::PreloadedLibrary]);
+        assert!(
+            notes.iter().any(|note| note.contains("in /tmp/libs first")),
+            "{notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("relative to where it runs first")),
+            "{notes:?}"
+        );
+        assert!(!notes.iter().any(|note| note.contains("in /usr/lib first")));
+        // An audit library is loaded into the program like a preload.
+        let (_, alerts, _) = about("home/u/.audit.so");
+        assert_eq!(alerts, &[RuleId::PreloadedLibrary]);
+        assert_eq!(
+            super::searched(Some(b"LD_LIBRARY_PATH=/a//b/:rel\0")),
+            [Some("a/b".to_string()), None]
+        );
+        // What every launcher leaves behind says nothing.
+        assert!(super::searched(Some(b"LD_LIBRARY_PATH=:$ORIGIN/lib::${LIB}:/\0")).is_empty());
+        // A token followed by `..`, or an unknown one, is not one of those.
+        assert_eq!(
+            super::searched(Some(b"LD_LIBRARY_PATH=$ORIGIN/../../tmp/x:$HOME/lib\0")),
+            [None, None]
+        );
+        let launcher = running(
+            "/usr/bin/python3",
+            &["python3"],
+            None,
+            "LD_LIBRARY_PATH=/opt/app/lib:",
+        );
+        assert!(said(&scope, &launcher, "usr/bin/python3").is_empty());
+    }
+
+    #[test]
     fn a_relay_is_named_by_itself_not_by_what_it_runs() {
         let dir = TempDir::new("live-relay");
         let root = dir.path();
@@ -1476,6 +1935,7 @@ mod tests {
             environment: None,
             own_namespace: false,
             of_root: false,
+            cwd: None,
         };
         let ncat = process(
             "/usr/bin/ncat",
