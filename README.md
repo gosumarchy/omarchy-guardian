@@ -148,13 +148,21 @@ files, and programs in `~/.local/bin` named like system commands. It
 follows links and what each file runs, so a trusted service running a
 replaced binary, or an interpreter running a script, is checked too: past
 wrappers (`sudo -u`, `uwsm app --`, `systemd-run`, `env`, `timeout`,
-`flock`), into the program a shell is handed with `-c`, into the files a
-shell start-up file reads in with `source` or `.`, a unit's
-`EnvironmentFile=`, and a Hyprland `.conf`'s `source`, `plugin` and `bind …
-exec` lines. A link of the same name to a packaged file is trusted only
-where that is how the thing is enabled (a unit in a systemd directory, a
-hook in pacman's, a launcher in an autostart directory, a program of
-`/usr/bin` or `/usr/lib` in `~/.local/bin` or `~/.cargo/bin`), never to
+`flock`), into each command a shell is handed with `-c` (the first 32),
+into the files a shell start-up file reads in with `source` or `.` and
+the programs its statements start by a path (on lines up to 4 KB), a unit's `EnvironmentFile=`, and a Hyprland `.conf`'s
+`source`, `plugin` and `bind … exec` lines. A bare command name is looked
+for in `~/.local/bin`, `~/.cargo/bin`, `~/bin`, `/usr/local` and
+`/usr/bin`, and every place it is found in is judged; `~`, `$HOME`, `%h` and the XDG directories at their default
+places are understood, other variables are not, and a Hyprland `source`
+with `*` in it is not followed. The file itself is always reviewed as
+text; what is not followed is only the extra look at the program it
+names. A link of the same name to a packaged file is trusted only
+where that is how the thing is enabled (a unit in a systemd unit
+directory, a hook in pacman's, a launcher in an autostart directory, a
+program of `/usr/bin` or `/usr/lib` in `~/.local/bin` or `~/.cargo/bin`)
+and the link names its target in full under `/usr`, `/etc` or `/opt`,
+never to
 documentation or an example.
 
 It also looks at what runs **now**, listing only what does not add up, so a
@@ -191,8 +199,13 @@ clean system shows nothing here:
 - a loaded kernel module no package installed (one built by DKMS is noted,
   not flagged), and the kernel's taint flag;
 - setuid and setgid files, and files with capabilities, under `/usr`,
-  `/opt`, `/etc` and `/home` that no package vouches for; a setuid copy of a
-  packaged program counts as unknown.
+  `/opt`, `/etc`, `/var`, `/srv`, `/root` and `/home` that no package
+  vouches for; a setuid copy of a packaged program counts as unknown. The
+  search for setuid and setgid files leaves out what holds other systems'
+  files: container, machine and Flatpak stores under `/var/lib`,
+  `/var/cache`, and snapshot directories (`.snapshots`). Other mounted
+  filesystems (`/mnt`, `/media`, `/run/media`) are not looked through at
+  all.
 
 As a user only your own processes can be looked at; the root checks see
 all of them.
@@ -264,7 +277,13 @@ own search for set-id files too, it reaches by entering each directory as
 it opened it, so one swapped for a link while it reads is not followed.
 Old password hashes
 (`/etc/security/opasswd`) are never read. Root's view only fills in what
-your own sweep could not read.
+your own sweep could not read. Those root-only files include the crontabs
+of other accounts on the machine: whoever may read the results reads
+those too. In what is sent for review, the values of assignments that look
+like secrets and the passwords of addresses (`https://user:password@…`)
+are taken out, where they are written as plain characters: one with `$`,
+a backtick or the like in it could be code a shell runs, and stays to be
+read.
 
 **On a schedule.** `protect` turns on two timers the package ships:
 
@@ -282,7 +301,8 @@ your own sweep could not read.
   kept in the system file as `[sweep] root = "allowed"` (or `"declined"`)
   with the group allowed to read the results; a user file cannot set it,
   and `protect --yes` never answers it for you. The collector runs
-  sandboxed (a read-only system, no network, and of root's privileges only
+  sandboxed (a read-only system, no network, no devices beyond the standard
+  ones, and of root's privileges only
   those to read files, look at other users' processes and hand its results
   to your group; it is stopped after half an hour) and writes only
   `/var/lib/omarchy-guardian/sweep/root.json` (root-owned, mode 0640, your
@@ -346,7 +366,16 @@ through the list with your agent without waiting for the daily sweep.
 - What cannot be read at all (a program that exists only in memory, a
   deleted file) cannot be allowed; it stays listed while it runs.
 - The list of allowed items lives with the review memory
-  (`~/.local/state/omarchy-guardian/sweep/allowed.json`, private to you).
+  (`~/.local/state/omarchy-guardian/sweep/allowed.json`, private to you),
+  and so does what the scheduled sweeps have already told you about
+  (`told.json`). Both are your own files: a program already running as
+  you can add to them and so quiet a notification or an alert. The sweep
+  is there to show what was put on the machine, not to hold against code
+  that already runs as you with your rights.
+- `--diff` compares with the last sweep. An item that could not be read
+  then and can be now (the root checks arrived) is not a change by
+  itself, unless it now raises an alert; it is judged like any other in
+  the full sweep.
 
 ## Settings app
 

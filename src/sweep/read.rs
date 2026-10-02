@@ -11,7 +11,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
-use crate::payload::{O_NOFOLLOW, O_NONBLOCK};
+use crate::payload::{O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK};
 use crate::scan::{MAX_HASHED_FILE_SIZE, MAX_TEXT_FILE_SIZE};
 use crate::sha256::{Digest, Sha256};
 
@@ -111,6 +111,13 @@ pub struct Seen {
     pub kept: bool,
 }
 
+/// Opens what is at `path` itself (no link followed, no waiting on a
+/// pipe), as a directory only when it is expected to be one.
+fn open_entry(path: &Path, directory: bool) -> io::Result<File> {
+    let flags = O_NOFOLLOW | O_NONBLOCK | if directory { O_DIRECTORY } else { 0 };
+    OpenOptions::new().read(true).custom_flags(flags).open(path)
+}
+
 /// What is at `rel` under `root`. `None` for a path that is not there or
 /// that `view` does not show, and for `/proc` and `/sys`, where the kernel
 /// decides per reader.
@@ -122,12 +129,7 @@ pub struct Seen {
 /// root alone could have put it (`/bin`, `/usr/sbin`): it is theirs, and
 /// nobody else may write the directory it sits in or any above that.
 pub fn seen(root: &Path, rel: &str, view: View) -> Option<Seen> {
-    let open = |path: &Path| {
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(O_NOFOLLOW | O_NONBLOCK)
-            .open(path)
-    };
+    let open = |path: &Path| open_entry(path, false);
     let allowed = |metadata: &fs::Metadata, bit: u32, kept: bool| match view {
         View::Pinned => true,
         View::Trusted if kept => true,
@@ -192,7 +194,13 @@ pub fn seen(root: &Path, rel: &str, view: View) -> Option<Seen> {
                     kept: kept_here,
                 });
             }
-            let next = open(&here).ok()?;
+            // Only a directory is passed through, and it is opened as
+            // one: opening a device or a pipe on the way can itself do
+            // something, whatever is checked afterwards.
+            if !last && !found.is_dir() {
+                return None;
+            }
+            let next = open_entry(&here, found.is_dir()).ok()?;
             let opened = next.metadata().ok()?;
             if !same(&opened, &found) {
                 return None;

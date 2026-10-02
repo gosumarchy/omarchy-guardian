@@ -14,6 +14,7 @@ mod term;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -158,8 +159,17 @@ fn save_user(text: &str) -> Result<String, String> {
     if let Ok(existing) = fs::read_to_string(&path)
         && !existing.starts_with(HEADER)
     {
+        // Made new: whatever sits under that name (a link somebody left
+        // there) is removed, never written through.
         let backup = path.with_extension("toml.bak");
-        fs::write(&backup, existing).map_err(|error| error.to_string())?;
+        drop(fs::remove_file(&backup));
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&backup)
+            .and_then(|mut file| file.write_all(existing.as_bytes()))
+            .map_err(|error| error.to_string())?;
     }
     let written = setup::RealEnvironment.write_user(text)?;
     Ok(format!("Saved {}.", written.display()))

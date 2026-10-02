@@ -98,10 +98,16 @@ struct Process {
 pub fn check(scope: &Scope<'_>) -> Live {
     let mut found = Found::default();
     let (processes, hidden) = processes(&scope.root.join("proc"));
+    // As a user that is what root's checks are for. Root saying so has
+    // nothing behind it to cover them.
     if hidden > 0 {
-        found.notes.push(format!(
-            "{hidden} running process(es) of other users could not be looked at; the root checks cover them"
-        ));
+        found.notes.push(if scope.origin == Origin::Root {
+            format!("{hidden} running process(es) could not be looked at, even as root")
+        } else {
+            format!(
+                "{hidden} running process(es) of other users could not be looked at; the root checks cover them"
+            )
+        });
     }
     for process in &processes {
         program_checks(scope, process, &mut found);
@@ -787,9 +793,15 @@ fn listeners(scope: &Scope<'_>, processes: &[Process], found: &mut Found) {
         }
     }
     if unattributed > 0 {
-        found.notes.push(format!(
-            "{unattributed} listening socket(s) belong to processes of other users; the root checks cover them"
-        ));
+        found.notes.push(if scope.origin == Origin::Root {
+            format!(
+                "{unattributed} listening socket(s) have no process that can be found: the kernel's own, or one that is hidden"
+            )
+        } else {
+            format!(
+                "{unattributed} listening socket(s) belong to processes of other users; the root checks cover them"
+            )
+        });
     }
 }
 

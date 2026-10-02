@@ -12,7 +12,9 @@ marker="# Omarchy Guardian theme command interception"
 }
 
 touch "$bashrc"
-if ! grep -Fq "$marker" "$bashrc"; then
+# The line that loads it, not the marker: a marker left behind, or a line
+# commented out, loads nothing.
+if ! grep -Fxq "$source_line" "$bashrc"; then
     {
         printf '\n%s\n' "$marker"
         printf '%s\n' "$source_line"

@@ -100,7 +100,11 @@ pub fn page(title: &str, detail: &str, ran: Ran, when: &str, id: &str, fallback:
 </html>
 "#,
         palette = palette(),
-        title_text = esc(title),
+        // Markup is text in a title: a hidden character is shown as its
+        // code there too, without the element around it.
+        title_text = esc(title)
+            .replace("<span class=\"ctl\">", "")
+            .replace("</span>", ""),
         what_text = esc(what),
         detail_text = esc(detail),
         ran_text = ran_text(ran),

@@ -185,6 +185,22 @@ fn forget(label: Option<&str>) -> Result<String, String> {
     ))
 }
 
+/// Merges what root found into the user's sweep, with what it says of
+/// the system as a whole (a tainted kernel, say).
+fn merge_root_part(collection: &mut Collection, mut part: root::RootPart, notes: &mut Vec<String>) {
+    let seen_by_root = std::mem::take(&mut part.notes);
+    root::merge(collection, part);
+    // Root saw every process; the user's notes that leave some to the
+    // root checks no longer apply. What root itself could not see, it
+    // says in its own words, and that is kept.
+    notes.retain(|note| !note.contains("the root checks cover them"));
+    for note in seen_by_root {
+        if !notes.contains(&note) {
+            notes.push(note);
+        }
+    }
+}
+
 /// Adds what root found: now through sudo (`--root`), or from the daily
 /// root timer when the system configuration allows the root checks.
 fn add_root_part(
@@ -195,12 +211,7 @@ fn add_root_part(
 ) {
     if options.root {
         match root::from_root() {
-            Ok(part) => {
-                root::merge(collection, part);
-                // Root saw every process; the notes about those it could not
-                // see no longer apply.
-                notes.retain(|note| !note.contains("the root checks cover them"));
-            }
+            Ok(part) => merge_root_part(collection, part, notes),
             Err(reason) => notes.push(format!("the root checks did not run ({reason})")),
         }
         return;
@@ -211,12 +222,7 @@ fn add_root_part(
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_secs());
             match root::from_results(Path::new(root::RESULTS), now) {
-                Ok(part) => {
-                root::merge(collection, part);
-                // Root saw every process; the notes about those it could not
-                // see no longer apply.
-                notes.retain(|note| !note.contains("the root checks cover them"));
-            }
+                Ok(part) => merge_root_part(collection, part, notes),
                 Err(reason) => notes.push(format!("root checks: {reason}")),
             }
         }
@@ -567,6 +573,30 @@ mod tests {
     use super::state::{LastRun, Outcome};
     use super::{is_news, record};
     use crate::test_support::TempDir;
+
+    #[test]
+    fn what_root_says_of_the_system_is_kept_and_what_it_covers_is_dropped() {
+        let covered = "3 process(es) of other users were not looked at; the root checks cover them";
+        let mut notes = vec![covered.to_string(), "the kernel is tainted".to_string()];
+        let part = super::root::RootPart {
+            items: Vec::new(),
+            truncated: Vec::new(),
+            notes: vec![
+                "the kernel is tainted".into(),
+                "1 module(s) no package installed".into(),
+                "2 listening socket(s) have no process that can be found".into(),
+            ],
+        };
+        super::merge_root_part(&mut super::Collection::default(), part, &mut notes);
+        assert_eq!(
+            notes,
+            [
+                "the kernel is tainted",
+                "1 module(s) no package installed",
+                "2 listening socket(s) have no process that can be found"
+            ]
+        );
+    }
 
     #[test]
     fn an_unfinished_sweep_is_news_when_it_starts_or_its_kind_changes() {

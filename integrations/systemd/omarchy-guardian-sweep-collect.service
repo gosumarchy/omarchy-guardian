@@ -21,6 +21,8 @@ NoNewPrivileges=yes
 # it looks at; so does /usr/lib/modules, which it checks the loaded modules
 # against (ProtectKernelModules would hide it).
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_CHOWN
+# It opens no device beyond the standard ones (/dev/null and the like).
+DevicePolicy=closed
 RestrictAddressFamilies=none
 IPAddressDeny=any
 ProtectKernelTunables=yes
