@@ -1,8 +1,8 @@
 //! Running a command against a disposable, verified copy of reviewed source
-//! inside Bubblewrap.
+//! inside Bubblewrap, and makepkg's source fetch inside a jail of its own.
 
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder};
 use std::os::unix::fs::{DirBuilderExt, symlink};
 use std::path::{Path, PathBuf};
@@ -81,7 +81,8 @@ pub fn run(
     );
     let status = Command::new(tools::TIMEOUT)
         .args(["--signal=TERM", "--kill-after=5s", TIMEOUT, tools::BWRAP])
-        .args(BWRAP_ARGS)
+        .args(ISOLATION)
+        .args(GUEST_HOME)
         .arg("--bind")
         .arg(&source)
         .args([
@@ -118,7 +119,9 @@ pub fn run(
     Ok(tools::exit_code_of(status))
 }
 
-const BWRAP_ARGS: &[&str] = &[
+/// What every sandbox starts from: its own namespaces (no network), no
+/// capabilities, an empty environment and a read-only system.
+const ISOLATION: &[&str] = &[
     "--die-with-parent",
     "--new-session",
     "--unshare-all",
@@ -150,6 +153,10 @@ const BWRAP_ARGS: &[&str] = &[
     "/dev",
     "--tmpfs",
     "/tmp",
+];
+
+/// An empty home for the `sandbox` command.
+const GUEST_HOME: &[&str] = &[
     "--dir",
     "/home",
     "--dir",
@@ -157,6 +164,72 @@ const BWRAP_ARGS: &[&str] = &[
     "--dir",
     "/home/guardian/.config",
 ];
+
+/// What makepkg may reach while Guardian has it list or fetch a recipe's
+/// sources. The recipe's own code runs in that makepkg, and a recipe can
+/// make it run more than it should, so it gets the system read-only, an
+/// empty home, and nothing to write to but the build's own directories.
+pub struct FetchJail<'a> {
+    /// The user's home: empty inside, apart from what is bound below.
+    pub home: &'a Path,
+    /// makepkg's own configuration files under the home, read-only.
+    pub readable: &'a [PathBuf],
+    /// The build, download and report directories.
+    pub writable: &'a [&'a Path],
+    /// A copy of the public keyring, to verify source signatures with.
+    pub keyring: Option<&'a Path>,
+    /// Downloading needs the network; listing the sources does not.
+    pub network: bool,
+    pub environment: &'a [(&'a str, &'a OsStr)],
+    pub directory: &'a Path,
+}
+
+/// The Bubblewrap arguments for `jail`, up to and including `--`.
+pub fn fetch_jail(jail: &FetchJail<'_>) -> Vec<OsString> {
+    let mut arguments: Vec<OsString> = ISOLATION.iter().map(Into::into).collect();
+    let mut push = |items: &[&OsStr]| arguments.extend(items.iter().map(Into::into));
+    if jail.network {
+        push(&["--share-net".as_ref()]);
+        // The resolver's configuration is usually a link out of /etc (into
+        // /run on systemd): that one file, not the sockets beside it.
+        if let Ok(resolver) = fs::canonicalize("/etc/resolv.conf")
+            && !resolver.starts_with("/etc")
+            && !resolver.starts_with("/usr")
+        {
+            push(&[
+                "--ro-bind".as_ref(),
+                resolver.as_os_str(),
+                resolver.as_os_str(),
+            ]);
+        }
+    }
+    // Mounted in order: the empty home first, then what shows through it.
+    push(&["--tmpfs".as_ref(), jail.home.as_os_str()]);
+    for path in jail.readable {
+        push(&["--ro-bind-try".as_ref(), path.as_os_str(), path.as_os_str()]);
+    }
+    if let Some(keyring) = jail.keyring {
+        let inside = jail.home.join(".gnupg");
+        push(&["--bind".as_ref(), keyring.as_os_str(), inside.as_os_str()]);
+        push(&[
+            "--setenv".as_ref(),
+            "GNUPGHOME".as_ref(),
+            inside.as_os_str(),
+        ]);
+    }
+    for path in jail.writable {
+        push(&["--bind".as_ref(), path.as_os_str(), path.as_os_str()]);
+    }
+    for (name, value) in jail.environment {
+        push(&["--setenv".as_ref(), name.as_ref(), value]);
+    }
+    push(&[
+        "--chdir".as_ref(),
+        jail.directory.as_os_str(),
+        "--".as_ref(),
+    ]);
+    arguments
+}
 
 /// Copies regular files, directories and symbolic links (as links, never
 /// followed), skipping `.git` like the review does, and refusing anything
@@ -221,13 +294,58 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::Path;
 
-    use super::{BWRAP_ARGS, Workspace, copy_tree};
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+
+    use super::{FetchJail, ISOLATION, Workspace, copy_tree, fetch_jail};
     use crate::test_support::TempDir;
 
     #[test]
     fn user_namespace_is_unshared_before_it_is_disabled() {
-        let position = |flag| BWRAP_ARGS.iter().position(|arg| *arg == flag).unwrap();
+        let position = |flag| ISOLATION.iter().position(|arg| *arg == flag).unwrap();
         assert!(position("--unshare-user") < position("--disable-userns"));
+    }
+
+    #[test]
+    fn the_fetch_jail_empties_the_home_before_binding_into_it() {
+        let readable = [PathBuf::from("/home/u/.config/pacman/makepkg.conf")];
+        let jail = FetchJail {
+            home: Path::new("/home/u"),
+            readable: &readable,
+            writable: &[
+                Path::new("/home/u/.cache/yay/demo"),
+                Path::new("/tmp/report"),
+            ],
+            keyring: Some(Path::new("/tmp/keys")),
+            network: false,
+            environment: &[("HOME", OsStr::new("/home/u"))],
+            directory: Path::new("/home/u/.cache/yay/demo"),
+        };
+        let arguments: Vec<String> = fetch_jail(&jail)
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        let text = arguments.join(" ");
+        let position = |part: &str| text.find(part).unwrap_or_else(|| panic!("{part}: {text}"));
+
+        assert!(position("--tmpfs /tmp") < position("--tmpfs /home/u"));
+        assert!(position("--tmpfs /home/u") < position("--ro-bind-try /home/u/.config/pacman"));
+        assert!(position("--tmpfs /home/u") < position("--bind /tmp/keys /home/u/.gnupg"));
+        assert!(
+            position("--tmpfs /home/u")
+                < position("--bind /home/u/.cache/yay/demo /home/u/.cache/yay/demo")
+        );
+        assert!(text.contains("--bind /tmp/report /tmp/report"));
+        assert!(text.contains("--setenv GNUPGHOME /home/u/.gnupg"));
+        assert!(text.contains("--unshare-all") && text.contains("--clearenv"));
+        assert!(!text.contains("--share-net"));
+        assert!(text.ends_with("--setenv HOME /home/u --chdir /home/u/.cache/yay/demo --"));
+
+        let online = fetch_jail(&FetchJail {
+            network: true,
+            ..jail
+        });
+        assert!(online.iter().any(|argument| argument == "--share-net"));
     }
 
     #[test]
