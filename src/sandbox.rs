@@ -71,9 +71,7 @@ pub fn run(
 
     let mut copy_config = config.clone();
     copy_config.root.clone_from(&source);
-    scan::verify_unchanged(&copy_config, reviewed).map_err(|_| {
-        Error::Refused("the sandbox copy does not match the reviewed source".into())
-    })?;
+    scan::verify_copy(&copy_config, reviewed)?;
 
     outln!(
         "Sandbox: network isolated · no host home directory · read-only system · {} MiB disposable source copy",

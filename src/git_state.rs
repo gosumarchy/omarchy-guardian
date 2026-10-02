@@ -44,6 +44,8 @@ const EXECUTING_KEYS: &[&str] = &[
     "trailer.*.command",
     "trailer.*.cmd",
     "gpg.*.defaultkeycommand",
+    // Hooks defined in the configuration itself.
+    "hook.*.command",
 ];
 
 /// Whether `rel` is a git config file the walk reviews: a `.git/config`, or a

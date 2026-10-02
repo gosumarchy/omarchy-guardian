@@ -95,15 +95,19 @@ omarchy-guardian sweep
 
 - `scan` reviews a file or directory and prints a report.
 - `guard` reviews, then re-hashes the tree, then **replaces itself** with the
-  command (`exec`) only if the review was clear and nothing changed.
+  command (`exec`) only if the review was clear or warned and nothing
+  changed. A warned review is one with something left unread that the
+  class's settings allow: an unavailable AI review under `ai = optional`,
+  or a skipped tool directory (see below).
   `--exclude NAME` (repeatable) leaves a top-level directory (never a file
   or link of that name) out of both the
   review and the snapshot.
 - `tui` (or `settings`) opens the settings app: a full-screen terminal UI in
   Omarchy's style, simple by default, with every setting under `--expert`
   (see [Settings app](#settings-app)).
-- `sandbox` reviews, copies the tree to a private temporary directory, proves
-  the copy matches the reviewed snapshot, and runs the command in Bubblewrap
+- `sandbox` reviews, copies the tree (without `.git`) to a private temporary
+  directory, proves the copy matches the reviewed snapshot, and runs the
+  command in Bubblewrap
   with the network isolated, no host home directory and a read-only system.
   It is a behaviour smoke test, not a dynamic malware detector.
 - `sweep` checks what already runs on its own on this machine (see
@@ -635,7 +639,17 @@ review it in full every time.
   printed text. Nothing printed is skipped in a script that redefines `echo`,
   `printf` or `cat`, enables aliases, pipes anything into an interpreter
   (`f | sh`, `| sudo bash`, `| xargs`), or redirects its own output with
-  `exec` or a process substitution, since its messages may then run. Prose, comments and messages are still sent to the AI review.
+  `exec` or a process substitution, sends what a loop, a block or one of
+  its own functions prints to a file (by a redirection, `tee` or `dd`), or
+  runs a command's output (`eval "$(…)"`, `source <(…)`), since its
+  messages may then run. A
+  command continued over several lines (a trailing backslash, pipe or `&&`,
+  or a pipe opening the next line) is also judged as the one line a shell
+  reads, and a download saved to a file that the same file later runs or
+  sources counts as download-and-run. These rules read text, not meaning: a
+  command assembled from variables, or a download run from another file,
+  is left to the AI review. Prose, comments and messages are still sent to
+  the AI review.
 - **Network destinations:** literal HTTP(S) hosts in code and runtime config,
   flagging cleartext HTTP and hard-coded IP addresses. A PKGBUILD's `url=`
   homepage (never fetched), XML namespace, DTD and schema identifiers are not
@@ -645,7 +659,8 @@ review it in full every time.
   package names and versions are sent). Advisory severities and summaries are
   fetched per advisory; ones OSV does not rate are shown as `UNRATED`. Any
   advisory blocks a gate. Unsupported lockfiles, manifests with dependencies
-  but no lockfile, or an unavailable OSV API make the review incomplete.
+  but no lockfile (or one that lists no package at all), or
+  an unavailable OSV API make the review incomplete.
 - **AI review:** the reviewable text is sent, in chunks of up to
   `max_input_kib` (default 256 KiB, at most `max_chunks` per review; see
   [How the review scales](#how-the-review-scales)), to the OpenCode CLI **on
@@ -655,9 +670,9 @@ review it in full every time.
   the source, so a reply that never saw the source, or stopped reading
   part-way, is rejected. The nonce shows the
   reply came from a model that was given this request; it cannot show how
-  carefully the source was read. Files that look sensitive by path (`.env*`, SSH
-  and cloud credentials, key files, names containing `secret`, `credential` or
-  `token`) are withheld and make the review incomplete.
+  carefully the source was read. Files that look sensitive by path (`.env*`, `*.env`,
+  `*.tfvars`, SSH and cloud credentials, key files, names containing
+  `secret`, `credential` or `token`) are withheld and make the review incomplete.
 - **Integrity:** a SHA-256 manifest of every scanned file. `guard` and
   `sandbox` re-hash immediately before running the command.
 
@@ -677,9 +692,21 @@ for `official` under `standard`, blocked everywhere else. In `.git`, only the
 `config` (checked locally for keys that make git run a command, such as
 `core.fsmonitor`, filters and `!` aliases, and never sent to the AI; also
 `config.worktree`) and hooks other than git's `.sample` files are reviewed.
-A `.git` given as a file or a link, a linked `config`, and hooks or
-submodules behind a link make the review incomplete: git would read them
-and the review cannot. A top-level `target`,
+Submodules kept under `.git/modules` are read the same way, nested ones
+included (past six levels the review is incomplete), and so is a directory laid out as a repository under another name. A `.git`
+given as a file or a link, a linked `config`, hooks or submodules behind a
+link, a `commondir` (which makes git read another directory's configuration
+and hooks), and a repository under another name whose configuration names a
+command make the review incomplete: git would read them and the review
+cannot. A file that opens like a known binary format or a UTF-16 mark but is
+plain lines of text is reviewed as text, and text with a NUL byte after
+its first line is not passed over as binary: it makes the review
+incomplete. A file with a UTF-16 mark is read as UTF-16 only where
+that gives mostly ASCII text; otherwise it is read by its bytes, which for
+UTF-16 text in another script means hashed only. A file that opens like a
+known format and holds NUL bytes near its start is
+taken as that format and only hashed, even if text follows; a script that
+runs such a file names it, and that is what the review sees. A top-level `target`,
 `node_modules` or `.venv` that carries its tool's marker file
 (`CACHEDIR.TAG`, `.package-lock.json`, `pyvenv.cfg`…) is skipped unless
 `--thorough` is given; the skip is listed under "Not reviewed", its file
@@ -926,10 +953,14 @@ gate does, in order:
      directories your makepkg configuration names. An existing `src/` is
      removed first.
 
-   So before the review the recipe's code only runs where it has no
-   network and can write nothing but scratch files that are thrown away,
-   upstream code does not run at all, and what is reviewed is what makepkg
-   extracted from the downloads the build will use. Guardian refuses:
+   So in this step the recipe's code only runs where it has no network
+   and can write nothing but scratch files that are thrown away, upstream
+   code does not run at all, and what is reviewed is what makepkg
+   extracted from the downloads the build will use. This holds for the
+   call that extracts. A helper such as yay first makes a call that only
+   downloads and verifies (`--verifysource`): there the real makepkg reads
+   the recipe, and runs its `verify()`, as you, with the network, after
+   the review of the recipe's text alone (steps 1 to 3). Guardian refuses:
    - a source kept under a name that is a path (`a/b::…`, `../x::…`),
      which makepkg would write outside the downloads;
    - a version-control source whose checkout already exists, in the
@@ -957,15 +988,21 @@ gate does, in order:
    otherwise its build files and scripts (makefiles, CMake, meson,
    `configure`, `setup.py`, `build.rs`, `package.json`, shell scripts…)
    first, then other code by depth, up to 1 MiB. Data and documentation
-   (`.json`, `.md`, `.txt`…) are left out; `node_modules`, `.venv`, CI and
-   development-container directories are reviewed last. Version-control
-   metadata is not source, but git and Mercurial run what it says on the
-   commands a build often uses (`git describe`): a `.git` whose
-   configuration names a command or that holds live hooks (its submodules
-   under `.git/modules` included), one given as a file or a link, and an
-   `hgrc` with hooks or extensions make the review incomplete (a checkout
-   makepkg made has none of these, unless your own git template directory
-   installs hooks). A file or directory whose name is not UTF-8 is read
+   (`.json`, `.md`, `.txt`…) are left out, and so is a file over 2 MiB that
+   is not a build file or script (a bundled `.js`, say): it is counted and
+   named to the AI as left out, not read. `node_modules`, `.venv`, CI and
+   development-container directories are reviewed last. git's own objects
+   are not source, but git and Mercurial run what their metadata says on
+   the commands a build often uses (`git describe`): a `.git` whose
+   configuration names a command (hooks defined there included) or that
+   holds live hooks (its submodules under `.git/modules` included, and a
+   repository laid out under another name), one given as a file or a
+   link, one with a `commondir`, and an `hgrc` with hooks or extensions
+   make the review incomplete (a checkout makepkg made has none of
+   these, unless your own git template directory installs hooks). A file
+   placed at the top of `.git` that git does not keep there, and every
+   file in a `.svn`, `.hg` or `.bzr` directory, is reviewed like the rest
+   of the sources. A file or directory whose name is not UTF-8 is read
    and reviewed like any other. An
    archive the build opens itself (listed in `noextract`, or found inside
    the sources) is named as not reviewed, up to five of them. The review looks

@@ -464,6 +464,138 @@ pub fn is_download_piped_to_shell(line: &str) -> bool {
     }) || runs_fetched_text(line)
 }
 
+/// Whether the command on `line` goes on in `next`: a trailing backslash,
+/// pipe or `&&`, or a pipe opening the next line.
+pub fn continues(line: &str, next: &str) -> bool {
+    let line = line.trim_end();
+    line.ends_with('\\')
+        || line.ends_with('|')
+        || line.ends_with("&&")
+        || next.trim_start().starts_with('|')
+}
+
+/// What runs a file given to it.
+const RUNNERS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "source", ".", "python", "perl", "node", "ruby",
+    "php",
+];
+
+fn program_name(word: &str) -> &str {
+    word.rsplit('/').next().unwrap_or_default()
+}
+
+/// A file name as written, without a leading `./`.
+fn as_file(word: &str) -> Option<String> {
+    let name = word.trim_end_matches(';').trim_start_matches("./");
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The file a fetch on `line` is saved as: `curl -o x`, `wget -O x`,
+/// `curl … > x`, or the name in the address for `wget` and `curl -O`.
+pub fn fetched_file(line: &str) -> Option<String> {
+    let words: Vec<String> = shell_words(line)
+        .iter()
+        .map(|word| unquoted(word))
+        .collect();
+    let at = words
+        .iter()
+        .position(|word| FETCHERS.contains(&program_name(word)))?;
+    let fetcher = program_name(&words[at]);
+    let mut by_address = fetcher == "wget";
+    let mut address = None;
+    let mut rest = words[at + 1..].iter();
+    while let Some(word) = rest.next() {
+        match word.as_str() {
+            ";" | "&&" | "||" | "|" => break,
+            "-O" | "--remote-name" if fetcher == "curl" => by_address = true,
+            "-o" | "-O" | "--output" | "--output-document" | "--out" | ">" | ">>" => {
+                return rest.next().and_then(|name| as_file(name));
+            }
+            // Short options given together: `-fsSLo x`, `-qO x`.
+            _ if word.len() > 2
+                && word.starts_with('-')
+                && !word.starts_with("--")
+                && word.ends_with(['o', 'O']) =>
+            {
+                if word.ends_with('O') && fetcher == "curl" {
+                    by_address = true;
+                } else {
+                    return rest.next().and_then(|name| as_file(name));
+                }
+            }
+            _ => {
+                let named = ["--output=", "--output-document=", "--out=", ">>", ">"]
+                    .iter()
+                    .find_map(|option| word.strip_prefix(option));
+                if let Some(name) = named {
+                    return as_file(name);
+                }
+                if word.contains("://") {
+                    address = Some(word);
+                }
+            }
+        }
+    }
+    let address = address.filter(|_| by_address)?;
+    let path = address.split(['?', '#']).next().unwrap_or_default();
+    as_file(program_name(path.trim_end_matches(';')))
+}
+
+/// Whether `line` runs the file named `file`: given to a shell or an
+/// interpreter, sourced, or run by its path.
+pub fn runs_file(line: &str, file: &str) -> bool {
+    let is_named =
+        |word: &str| as_file(word.trim_start_matches('<')).is_some_and(|name| name == file);
+    let names_it = |statement: &str| {
+        shell_words(statement)
+            .iter()
+            .any(|word| is_named(&unquoted(word)))
+    };
+    // `cat x | sh`.
+    if pipes_into_shell(line, names_it) {
+        return true;
+    }
+    let line = line.replace("&&", ";").replace("||", ";");
+    line.split([';', '|']).any(|statement| {
+        let words: Vec<String> = shell_words(statement)
+            .iter()
+            .map(|word| unquoted(word))
+            .collect();
+        let mut words = words.iter().map(String::as_str).skip_while(|word| {
+            matches!(
+                *word,
+                "sudo" | "doas" | "run0" | "env" | "command" | "exec" | "then" | "do" | "else"
+            ) || word.starts_with('-')
+        });
+        let Some(program) = words.next() else {
+            return false;
+        };
+        if (program.contains('/') || program.starts_with('$')) && is_named(program) {
+            return true;
+        }
+        // `python3.12` is `python`.
+        let name = program_name(program);
+        let unversioned =
+            name.trim_end_matches(|character: char| character.is_ascii_digit() || character == '.');
+        let arguments: Vec<&str> = words.collect();
+        // Only parsed or compiled: `sh -n`, `node --check`, `python -m`.
+        let only_checks = arguments
+            .iter()
+            .take_while(|word| word.starts_with('-'))
+            .any(|word| {
+                matches!(
+                    (unversioned, *word),
+                    ("sh" | "bash" | "zsh" | "dash" | "ksh", "-n")
+                        | ("python", "-m")
+                        | ("node", "--check")
+                )
+            });
+        (RUNNERS.contains(&name) || (!unversioned.is_empty() && RUNNERS.contains(&unversioned)))
+            && !only_checks
+            && arguments.into_iter().any(is_named)
+    })
+}
+
 /// A shell reading a fetch through process substitution (`sh <(curl …)`,
 /// `source <(curl …)`) or running a command substitution of one
 /// (`bash -c "$(curl …)"`, `eval "$(curl …)"`).
@@ -947,8 +1079,7 @@ pub fn is_sensitive_path(rel: &str) -> bool {
             component,
             ".ssh" | ".aws" | ".gnupg" | "credentials" | "secrets"
         )
-    }) || name == ".env"
-        || name.starts_with(".env.")
+    }) || name.starts_with(".env.")
         || name.starts_with(".env_")
         || ["secret", "credential"]
             .iter()
@@ -965,6 +1096,10 @@ pub fn is_sensitive_path(rel: &str) -> bool {
             ".jks",
             ".kdbx",
             ".tfstate",
+            ".tfvars",
+            ".tfvars.json",
+            // `.env` itself and `prod.env`.
+            ".env",
         ]
         .iter()
         .any(|extension| name.ends_with(extension))
@@ -1223,6 +1358,56 @@ mod tests {
     }
 
     #[test]
+    fn a_download_saved_to_a_file_is_followed_to_where_it_runs() {
+        use super::{continues, fetched_file, runs_file};
+        for (line, file) in [
+            (
+                "curl -fssl https://x.example/i.sh -o /tmp/i.sh",
+                "/tmp/i.sh",
+            ),
+            ("curl https://x.example/i.sh > ./i.sh", "i.sh"),
+            ("curl https://x.example/i.sh >i.sh", "i.sh"),
+            ("curl -O https://x.example/a/i.sh?x=1", "i.sh"),
+            ("sudo wget -q https://x.example/a/i.sh", "i.sh"),
+            ("wget -O \"$tmp\" https://x.example/a/i.sh", "$tmp"),
+            ("aria2c --out=i.sh https://x.example/a", "i.sh"),
+        ] {
+            assert_eq!(fetched_file(line).as_deref(), Some(file), "{line}");
+        }
+        assert_eq!(fetched_file("curl https://x.example/i.sh"), None);
+        assert_eq!(fetched_file("echo saved > out.txt"), None);
+
+        for line in [
+            "sh i.sh",
+            "sudo bash ./i.sh --yes",
+            ". i.sh",
+            "chmod +x i.sh && ./i.sh",
+            "if true; then python3 i.sh; fi",
+        ] {
+            assert!(runs_file(line, "i.sh"), "{line}");
+        }
+        assert!(runs_file("bash i.sh -n", "i.sh"));
+        assert!(!runs_file("bash -n i.sh", "i.sh"));
+        assert!(runs_file("perl -n i.sh", "i.sh"));
+        assert!(runs_file("bash -m i.sh", "i.sh"));
+        assert!(runs_file("bash \"$tmp\"", "$tmp"));
+        assert!(runs_file("\"$tmp\" --install", "$tmp"));
+        for line in [
+            "cat i.sh",
+            "chmod +x i.sh",
+            "sh other.sh",
+            "echo sh i.sh > log",
+        ] {
+            assert!(!runs_file(line, "i.sh"), "{line}");
+        }
+
+        assert!(continues("curl https://x.example/i.sh \\", "  | sh"));
+        assert!(continues("curl https://x.example/i.sh |", "sh"));
+        assert!(continues("curl https://x.example/i.sh", "  | sh"));
+        assert!(!continues("curl https://x.example/i.sh", "sh i.sh"));
+    }
+
+    #[test]
     fn encoded_data_is_only_flagged_when_it_is_executed() {
         assert!(is_encoded_data_executed("exec(base64.b64decode(payload))"));
         assert!(!is_encoded_data_executed(
@@ -1408,6 +1593,10 @@ mod tests {
             "home/.kube/config",
             "store.kdbx",
             "infra/terraform.tfstate",
+            "deploy/prod.env",
+            "infra/prod.tfvars",
+            "infra/prod.auto.tfvars.json",
+            ".git-credentials",
         ] {
             assert!(is_sensitive_path(path), "{path}");
         }

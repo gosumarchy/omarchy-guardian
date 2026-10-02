@@ -46,6 +46,9 @@ pub struct Inventory {
     seen: HashSet<(Ecosystem, String, String)>,
     manifests: Vec<(String, Ecosystem)>,
     lockfiles: Vec<(String, Ecosystem)>,
+    /// The lockfiles that listed at least one package, local ones
+    /// included.
+    listed: HashSet<String>,
 }
 
 impl Inventory {
@@ -63,6 +66,7 @@ impl Inventory {
         if name.is_empty() || version.is_empty() {
             return;
         }
+        self.listed.insert(lockfile.to_string());
         if self
             .seen
             .insert((ecosystem, name.to_string(), version.to_string()))
@@ -150,15 +154,29 @@ pub fn inspect(inventory: &mut Inventory, gaps: &mut Vec<Gap>, rel: &str, conten
 pub fn check_coverage(inventory: &Inventory, gaps: &mut Vec<Gap>) {
     for (manifest, ecosystem) in &inventory.manifests {
         let directory = Path::new(manifest).parent().unwrap_or(Path::new(""));
-        let covered = inventory.lockfiles.iter().any(|(lockfile, locked)| {
-            locked == ecosystem
-                && Path::new(lockfile)
-                    .parent()
-                    .is_some_and(|lock_directory| directory.starts_with(lock_directory))
-        });
-        if !covered {
+        let covering: Vec<&String> = inventory
+            .lockfiles
+            .iter()
+            .filter(|(lockfile, locked)| {
+                locked == ecosystem
+                    && Path::new(lockfile)
+                        .parent()
+                        .is_some_and(|lock_directory| directory.starts_with(lock_directory))
+            })
+            .map(|(lockfile, _)| lockfile)
+            .collect();
+        // A lockfile that names nothing the audit can look up covers
+        // nothing.
+        let names_packages =
+            |lockfile: &&String| inventory.listed.iter().any(|listed| listed == *lockfile);
+        if covering.is_empty() {
             gaps.push(Gap::Dependency(format!(
                 "{manifest}: {} dependencies are declared but no supported matching lockfile was found",
+                ecosystem.osv_name()
+            )));
+        } else if !covering.iter().any(names_packages) {
+            gaps.push(Gap::Dependency(format!(
+                "{manifest}: {} dependencies are declared but its lockfile lists none to audit",
                 ecosystem.osv_name()
             )));
         }
@@ -242,6 +260,7 @@ fn parse_cargo_lock(
     };
 
     for package in tomlish::array_table_items(&entries, "package") {
+        inventory.listed.insert(rel.to_string());
         let (Some(name), Some(version)) = (
             tomlish::string_field(&package, "name"),
             tomlish::string_field(&package, "version"),
@@ -289,8 +308,11 @@ fn parse_npm_lock(
 
     if let Some(packages) = lockfile.get("packages").and_then(Json::as_object) {
         for (package_path, package) in packages {
-            if package_path.is_empty() || package.get("link").and_then(Json::as_bool) == Some(true)
-            {
+            if package_path.is_empty() {
+                continue;
+            }
+            inventory.listed.insert(rel.to_string());
+            if package.get("link").and_then(Json::as_bool) == Some(true) {
                 continue;
             }
             if let Some(resolved) = package.get("resolved").and_then(Json::as_str)
@@ -568,9 +590,34 @@ mod tests {
 
     #[test]
     fn a_workspace_lockfile_covers_member_manifests() {
+        let lock = "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+        let (_, gaps) = run(&[
+            ("Cargo.lock", lock),
+            ("crates/a/Cargo.toml", "[dependencies]\nserde = \"1\"\n"),
+        ]);
+        assert!(gaps.is_empty(), "{gaps:?}");
+
+        // A lockfile that lists nothing covers nothing.
         let (_, gaps) = run(&[
             ("Cargo.lock", "version = 4\n"),
             ("crates/a/Cargo.toml", "[dependencies]\nserde = \"1\"\n"),
+        ]);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(
+            gaps[0].to_string().contains("lists none to audit"),
+            "{gaps:?}"
+        );
+
+        // One that lists only the tree's own crates covers them.
+        let (_, gaps) = run(&[
+            (
+                "Cargo.lock",
+                "version = 4\n\n[[package]]\nname = \"b\"\nversion = \"0.1.0\"\n",
+            ),
+            (
+                "crates/a/Cargo.toml",
+                "[dependencies]\nb = { path = \"../b\" }\n",
+            ),
         ]);
         assert!(gaps.is_empty(), "{gaps:?}");
 
