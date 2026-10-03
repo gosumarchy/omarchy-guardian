@@ -938,7 +938,14 @@ fn scan_package(
     };
     for mut file in reviewed.files {
         // An upgrade only brings in what changed; the rest is already active.
-        if file.is_installed_unchanged(Path::new("/")) {
+        // A link that did not change still leads somewhere new when this
+        // transaction replaces what it leads to.
+        if file.is_installed_unchanged(Path::new("/"))
+            && !file
+                .leads_outside
+                .as_deref()
+                .is_some_and(|leads| replaced_by_transaction(leads, others))
+        {
             summary.unchanged += 1;
             continue;
         }
@@ -1085,6 +1092,26 @@ fn follow_outside_link(
     }
 }
 
+/// Whether this transaction puts something at `leads` other than what is
+/// there now.
+fn replaced_by_transaction(leads: &str, others: &dyn Fn(&str) -> payload::InArchive) -> bool {
+    let rel = leads.trim_start_matches('/');
+    match others(rel) {
+        payload::InArchive::Absent => false,
+        payload::InArchive::Other => true,
+        // Only a small regular file is compared; anything else counts as
+        // replaced, and is looked at.
+        payload::InArchive::File(bytes) => {
+            let path = Path::new("/").join(rel);
+            !fs::symlink_metadata(&path).is_ok_and(|metadata| {
+                metadata.is_file()
+                    && metadata.len() <= MAX_TEXT_FILE_SIZE
+                    && fs::read(&path).is_ok_and(|now| now == bytes)
+            })
+        }
+    }
+}
+
 /// How many links are followed to the file a package's link leads to.
 const MAX_LINKED_HOPS: usize = 8;
 
@@ -1110,27 +1137,26 @@ fn linked_file(
                 .iter()
                 .any(|top| rel.starts_with(top))
     };
-    if special(&rel) {
-        return Ok(None);
-    }
-    match others(&rel) {
-        payload::InArchive::File(bytes) => {
-            return Ok(Some((
-                "another package of this transaction ships it",
-                bytes,
-            )));
-        }
-        payload::InArchive::Other => {
-            return Err(
-                "this transaction puts there as something other than a file that can be read"
-                    .into(),
-            );
-        }
-        payload::InArchive::Absent => {}
-    }
     for _ in 0..MAX_LINKED_HOPS {
         if special(&rel) {
             return Ok(None);
+        }
+        // At every step: what the transaction puts there is what will be
+        // there, even part-way along a chain of the system's links.
+        match others(&rel) {
+            payload::InArchive::File(bytes) => {
+                return Ok(Some((
+                    "another package of this transaction ships it",
+                    bytes,
+                )));
+            }
+            payload::InArchive::Other => {
+                return Err(
+                    "this transaction puts there as something other than a file that can be read"
+                        .into(),
+                );
+            }
+            payload::InArchive::Absent => {}
         }
         let seen = read::seen(root, &rel, View::Pinned).ok_or("is not on this system")?;
         if !seen.kept {
@@ -1766,6 +1792,42 @@ mod tests {
             shipped.lookup(&asking, "usr/lib/other/rule"),
             crate::payload::InArchive::Other
         );
+    }
+
+    #[test]
+    fn a_link_chain_ends_at_what_the_transaction_puts_there() {
+        use crate::payload::InArchive;
+        // `/etc/localtime` is root's link into the zone database: when the
+        // transaction replaces that file, its new content is what the
+        // chain leads to.
+        let Ok(target) = fs::read_link("/etc/localtime") else {
+            return;
+        };
+        let Some(target) = target.to_str().and_then(|target| target.strip_prefix('/')) else {
+            return;
+        };
+        let target = target.to_string();
+        let others = |path: &str| {
+            if path == target {
+                InArchive::File(b"TZif-new".to_vec())
+            } else {
+                InArchive::Absent
+            }
+        };
+        assert_eq!(
+            super::linked_file(Path::new("/"), "/etc/localtime", &others),
+            Ok(Some((
+                "another package of this transaction ships it",
+                b"TZif-new".to_vec()
+            )))
+        );
+        // An unchanged link to it counts as changed, and one to a file the
+        // transaction leaves alone does not.
+        assert!(super::replaced_by_transaction(
+            &format!("/{target}"),
+            &others
+        ));
+        assert!(!super::replaced_by_transaction("/etc/hostname", &others));
     }
 
     #[test]

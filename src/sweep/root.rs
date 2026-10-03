@@ -95,7 +95,25 @@ pub fn collect_command(out: bool, settings: &crate::config::Settings) -> ExitCod
     let live = live::check(&scope);
     collect::merge(&mut collection, live.items);
     collection.truncated.extend(live.unchecked);
-    let json = to_json(&collection, &live.notes).to_string();
+    // Who reads these results: the group the system configuration names,
+    // or the user who ran `sweep --root`. Other accounts' crontabs are
+    // theirs: only that one is there is said.
+    let readers = match group {
+        Some(gid) => accounts_in_group(
+            gid,
+            &fs::read_to_string("/etc/passwd").unwrap_or_default(),
+            &fs::read_to_string("/etc/group").unwrap_or_default(),
+        ),
+        None => std::env::var("SUDO_USER").into_iter().collect(),
+    };
+    let withheld = withhold_other_crontabs(&mut collection.items, &readers);
+    let mut notes = live.notes;
+    if withheld > 0 {
+        notes.push(format!(
+            "{withheld} crontab(s) of other accounts were left out: they are theirs to see"
+        ));
+    }
+    let json = to_json(&collection, &notes).to_string();
     match group {
         // Written as it is, for the sweep that asked to parse: a path
         // with a hidden character must stay the path it is.
@@ -152,6 +170,48 @@ fn private_group(gid: u32, group: &str, passwd: &str) -> Option<String> {
         .count();
     (members.trim().is_empty() && primary_of == 1 && crate::config::file::is_group_name(&name))
         .then_some(name)
+}
+
+/// The accounts whose primary group is `gid`, or that `/etc/group` lists
+/// as its members.
+fn accounts_in_group(gid: u32, passwd: &str, group: &str) -> Vec<String> {
+    let mut accounts: Vec<String> = passwd
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split(':').collect();
+            (fields.get(3)?.parse::<u32>().ok()? == gid).then(|| fields[0].to_string())
+        })
+        .collect();
+    for line in group.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.get(2).and_then(|id| id.parse::<u32>().ok()) == Some(gid) {
+            accounts.extend(
+                fields
+                    .get(3)
+                    .into_iter()
+                    .flat_map(|members| members.split(','))
+                    .filter(|member| !member.is_empty())
+                    .map(str::to_string),
+            );
+        }
+    }
+    accounts.sort();
+    accounts.dedup();
+    accounts
+}
+
+/// Leaves the crontabs of root and of `readers` in `items`, and takes out
+/// those of other accounts: they are theirs. Returns how many.
+fn withhold_other_crontabs(items: &mut Vec<Item>, readers: &[String]) -> usize {
+    let others = |path: &str| {
+        path.strip_prefix("var/spool/cron/").is_some_and(|account| {
+            account != "root" && !readers.iter().any(|reader| reader == account)
+        })
+    };
+    let withheld = items.iter().filter(|item| others(&item.path)).count();
+    // And what was found by following them: their scripts are theirs too.
+    items.retain(|item| !others(&item.path) && !item.run_by.as_deref().is_some_and(others));
+    withheld
 }
 
 /// The id of group `name`, from `/etc/group`.
@@ -446,16 +506,78 @@ fn from_json(text: &str) -> Result<RootPart, String> {
     })
 }
 
-/// Runs the root collector through sudo, which asks for the password on
-/// the terminal, and reads what it found.
-pub fn from_root() -> Result<RootPart, String> {
-    // Always the installed, root-owned Guardian: running the current
-    // executable would let a user-writable build run as root.
+/// The installed Guardian, when it is root's alone: the only program run
+/// as root on the user's behalf.
+fn installed() -> Result<&'static Path, String> {
     let program = Path::new(INSTALLED);
     let metadata = fs::metadata(program).map_err(|error| format!("{INSTALLED}: {error}"))?;
     if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
         return Err(format!("{INSTALLED} is not root's alone"));
     }
+    Ok(program)
+}
+
+/// Changes the system's list of allowed items through sudo (see
+/// `system_allow_command`).
+pub fn system_allow(arguments: &[&str]) -> Result<(), String> {
+    let program = installed()?;
+    errln!("Guardian needs root to change what this system allows; it asks for your password.");
+    let status = Command::new(SUDO)
+        .arg(program)
+        .arg("sweep-allow-system")
+        .args(arguments)
+        .stdin(Stdio::inherit())
+        .status()
+        .map_err(|error| format!("cannot start sudo: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "changing the system's allowed items failed ({status})"
+        ))
+    }
+}
+
+/// `omarchy-guardian sweep-allow-system --add LABEL FINGERPRINT | --remove
+/// LABEL | --clear`, run as root through sudo by `sweep allow` and `sweep
+/// forget`: the system's own list of allowed items, which only root writes.
+pub fn system_allow_command(arguments: &[String]) -> ExitCode {
+    if !store::effective_uid().is_ok_and(|uid| uid == 0) {
+        errln!("omarchy-guardian sweep-allow-system: only `sweep allow` runs this, as root");
+        return ExitCode::from(2);
+    }
+    let path = Path::new(super::state::SYSTEM_ALLOWED);
+    let mut allowed = super::state::system_allowed(path);
+    match arguments {
+        [flag, label, fingerprint] if flag == "--add" && !super::state::is_home_label(label) => {
+            allowed.insert(label.clone(), fingerprint.clone());
+        }
+        [flag, label] if flag == "--remove" => {
+            allowed.remove(label);
+        }
+        [flag] if flag == "--clear" => allowed.clear(),
+        _ => {
+            errln!(
+                "usage: omarchy-guardian sweep-allow-system --add LABEL FINGERPRINT | --remove LABEL | --clear"
+            );
+            return ExitCode::from(2);
+        }
+    }
+    match super::state::save_system_allowed(path, &allowed) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            errln!("omarchy-guardian sweep-allow-system: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Runs the root collector through sudo, which asks for the password on
+/// the terminal, and reads what it found.
+pub fn from_root() -> Result<RootPart, String> {
+    // Always the installed, root-owned Guardian: running the current
+    // executable would let a user-writable build run as root.
+    let program = installed()?;
     errln!(
         "Guardian needs root to check what your user can't read (sudoers, root's crontab, shell files and keys). It only reads them."
     );
@@ -498,6 +620,37 @@ pub fn merge(collection: &mut Collection, part: RootPart) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn other_accounts_crontabs_are_withheld() {
+        use super::{accounts_in_group, withhold_other_crontabs};
+        let passwd = "root:x:0:0::/root:/bin/bash\nu:x:1000:1000::/home/u:/bin/bash\nv:x:1001:1001::/home/v:/bin/bash\n";
+        let group = "wheel:x:998:u\nu:x:1000:\nshared:x:2000:v,u\n";
+        assert_eq!(accounts_in_group(1000, passwd, group), ["u"]);
+        assert_eq!(accounts_in_group(2000, passwd, group), ["u", "v"]);
+        let crontab = |account: &str| {
+            let mut item = item(
+                &format!("var/spool/cron/{account}"),
+                Origin::Root,
+                Tier::Unknown,
+                Body::Text("* * * * * /x\n".into()),
+            );
+            item.runs = vec!["/x".into()];
+            item
+        };
+        let mut items = vec![crontab("root"), crontab("u"), crontab("v")];
+        let mut followed = item(
+            "home/v/bin/job",
+            Origin::Root,
+            Tier::Unknown,
+            Body::Text("#!/bin/sh\n".into()),
+        );
+        followed.run_by = Some("var/spool/cron/v".into());
+        items.push(followed);
+        assert_eq!(withhold_other_crontabs(&mut items, &["u".to_string()]), 1);
+        let paths: Vec<&str> = items.iter().map(|item| item.path.as_str()).collect();
+        assert_eq!(paths, ["var/spool/cron/root", "var/spool/cron/u"]);
+    }
+
     use super::{from_json, merge, to_json};
     use crate::autorun::Category;
     use crate::sha256::Sha256;

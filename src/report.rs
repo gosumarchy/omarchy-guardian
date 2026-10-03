@@ -85,6 +85,9 @@ pub enum Gap {
     Agent(Error),
     Dependency(String),
     Package(Error),
+    /// A file a reviewed one runs or reads in as code, which Guardian could
+    /// not read as text.
+    RunsUnread(String),
 }
 
 impl fmt::Display for Gap {
@@ -108,6 +111,7 @@ impl fmt::Display for Gap {
                 f,
                 "{path}: withheld from the AI provider because it looks sensitive"
             ),
+            Self::RunsUnread(text) => write!(f, "{text}"),
             Self::Undecodable(path) => write!(
                 f,
                 "{path}: a script, build or config file holds binary data and cannot be reviewed"
@@ -248,6 +252,23 @@ pub struct Report {
     pub notes: Vec<String>,
     /// Facts Guardian established for the AI review (see `Request::context`).
     pub context: Vec<String>,
+    /// What each reviewed file runs or reads in as code, by line (see
+    /// `review::check_runs`).
+    pub runs: Vec<RunRef>,
+    /// The files each reviewed file downloads to, lowercased.
+    pub fetches: Vec<(String, String)>,
+    /// More were found than are recorded (see `review::MAX_RUNS`).
+    pub runs_overflowed: bool,
+}
+
+/// A file one reviewed file runs or reads in as code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunRef {
+    pub rel: String,
+    pub line: usize,
+    pub excerpt: String,
+    /// As written on the line (`./data/x.png`).
+    pub target: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

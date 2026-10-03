@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
+use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
@@ -639,12 +640,48 @@ fn follow(scope: &Scope<'_>, item: &Item) -> Vec<String> {
         .strip_prefix("var/spool/cron/")
         .and_then(|user| user_home(scope.root, user));
     let home = crontab_home.as_deref().or(scope.home).unwrap_or("root");
+    let view = view(scope, by);
+    // What a directory holds, as the walk may see it.
+    let list = |directory: &str| -> Vec<String> {
+        let names = |entries: fs::ReadDir| {
+            entries
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .collect()
+        };
+        match view {
+            Some(view) => match read::seen(scope.root, directory, view).map(|seen| seen.what) {
+                Some(read::Public::Directory(handle)) => {
+                    fs::read_dir(format!("/proc/self/fd/{}", handle.as_raw_fd()))
+                        .map(names)
+                        .unwrap_or_default()
+                }
+                _ => Vec::new(),
+            },
+            None => fs::read_dir(scope.root.join(directory))
+                .map(names)
+                .unwrap_or_default(),
+        }
+    };
     for command in &item.runs {
+        // A pattern alone (a Hyprland `source`) names the files it
+        // matches; anything else with a `*` in it (a command line, however
+        // it is written) still runs its program.
+        let bare = command.trim();
+        let bare = ["$HOME/", "${HOME}/"]
+            .iter()
+            .find_map(|home| bare.strip_prefix(home))
+            .unwrap_or(bare);
+        let pattern = command.contains(['*', '?'])
+            && !bare.contains(|c: char| c.is_whitespace() || ";|&$()<>`'\"\\".contains(c));
+        if pattern {
+            targets.extend(commands::glob_targets(home, command, &list));
+            continue;
+        }
         targets.extend(commands::targets_where(home, command, &|candidate| {
             is_there(scope, candidate, by)
         }));
     }
-    let view = view(scope, by);
     targets
         .into_iter()
         .filter_map(|target| match view {
@@ -868,6 +905,27 @@ mod tests {
             super::bounded(names)[0],
             "more than 5 files: not looked for everywhere"
         );
+    }
+
+    #[test]
+    fn a_star_on_a_command_line_does_not_stop_its_program_being_followed() {
+        let dir = TempDir::new("sweep-starred");
+        let root = dir.path();
+        write(root, "etc/open", "public\n");
+        write(
+            root,
+            "var/spool/cron/w",
+            "* * * * * /etc/open *\n* * * * * /bin/true;/etc/open;*\n",
+        );
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let scope = Scope {
+            root,
+            home: Some("root"),
+            index: &index,
+            origin: Origin::System,
+        };
+        let starred = super::item(&scope, Category::Cron, "var/spool/cron/w".into(), None);
+        assert!(super::follow(&scope, &starred).contains(&"etc/open".to_string()));
     }
 
     #[test]

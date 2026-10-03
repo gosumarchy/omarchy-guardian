@@ -112,6 +112,8 @@ enum Invocation {
     SweepCollect {
         out: bool,
     },
+    /// Run as root by `sweep allow` and `sweep forget` through sudo.
+    SweepAllowSystem(Vec<String>),
     /// `ask <report-id | omarchy-guardian://ask/<id>>`, opened from a report.
     Ask(String),
     /// `status [--waybar | --dismiss | --open-report]`.
@@ -253,6 +255,7 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
         }
         Invocation::Sweep(command) => sweep::command(&command, &settings),
         Invocation::SweepCollect { out } => sweep::root::collect_command(out, &settings),
+        Invocation::SweepAllowSystem(arguments) => sweep::root::system_allow_command(&arguments),
         Invocation::Status(mode) => status_command(mode),
         Invocation::Ask(target) => {
             errln!("omarchy-guardian ask: {}", ask::run(&target, &settings));
@@ -671,6 +674,17 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
             [flag] if flag == "--out" => Ok(Invocation::SweepCollect { out: true }),
             _ => Err("usage: omarchy-guardian sweep-collect [--out]".into()),
         },
+        // Run as root by `sweep allow` and `sweep forget`; not listed.
+        Some("sweep-allow-system") => rest
+            .iter()
+            .map(|argument| {
+                argument
+                    .to_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| "sweep-allow-system: arguments must be UTF-8".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Invocation::SweepAllowSystem),
         Some("status") => match rest {
             [] => Ok(Invocation::Status(StatusMode::Shell)),
             [flag] => match flag.to_str() {

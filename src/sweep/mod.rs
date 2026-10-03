@@ -158,6 +158,14 @@ fn allow(label: &str, settings: &Settings) -> Result<String, String> {
             "{label} cannot be read, so it cannot be allowed as it is"
         ));
     }
+    // Something outside the home is allowed in root's list, through sudo:
+    // a program running as you cannot quiet it.
+    if !state::is_home_label(label) {
+        root::system_allow(&["--add", label, &state::fingerprint(item)])?;
+        return Ok(format!(
+            "Allowed {label} for this system as it is now; if it changes, the sweep shows it again."
+        ));
+    }
     let directory = state_directory()?;
     let mut allowed = state::allowed(&directory);
     allowed.insert(label.to_string(), state::fingerprint(item));
@@ -168,6 +176,16 @@ fn allow(label: &str, settings: &Settings) -> Result<String, String> {
 }
 
 fn forget(label: Option<&str>) -> Result<String, String> {
+    if let Some(label) = label.filter(|label| !state::is_home_label(label)) {
+        if !state::system_allowed(Path::new(state::SYSTEM_ALLOWED)).contains_key(label) {
+            return Err(format!("{label} was not allowed"));
+        }
+        root::system_allow(&["--remove", label])?;
+        return Ok(format!("{label} is no longer allowed."));
+    }
+    if label.is_none() && !state::system_allowed(Path::new(state::SYSTEM_ALLOWED)).is_empty() {
+        root::system_allow(&["--clear"])?;
+    }
     let directory = state_directory()?;
     let mut allowed = state::allowed(&directory);
     match label {
@@ -486,7 +504,8 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
         .ok();
     let label = |item: &collect::Item| judge::label(item, home.as_deref());
     if let Some(directory) = &directory {
-        state::apply_allowed(&mut collection.items, &state::allowed(directory), label);
+        let allowed = state::all_allowed(directory, Path::new(state::SYSTEM_ALLOWED));
+        state::apply_allowed(&mut collection.items, &allowed, label);
     }
 
     let state_root = Store::default_root();

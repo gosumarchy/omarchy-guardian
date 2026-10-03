@@ -348,10 +348,11 @@ fn is_identical(previous: &Previous, files: &[SourceFile]) -> bool {
 fn upgrade_note(manifest: &[ManifestEntry]) -> String {
     let count = |sent: Sent| manifest.iter().filter(|entry| entry.sent == sent).count();
     format!(
-        "upgrade of the approved version: {} file(s) sent as diffs, {} unchanged, {} removed; entry points and new files are reviewed whole, and so are changed files and the code they name where that fits",
+        "upgrade of the approved version: {} file(s) sent as diffs, {} unchanged, {} removed, {} unchanged sent because a change names them; entry points and new files are reviewed whole, and so are changed files where that fits",
         count(Sent::Diff),
         count(Sent::Unchanged),
-        count(Sent::Removed)
+        count(Sent::Removed),
+        count(Sent::Named)
     )
 }
 
@@ -453,7 +454,18 @@ impl Runner<'_> {
                             stopped.get_or_insert_with(|| error.to_string());
                             (AgentOutcome::Unavailable(error), None)
                         }
-                        Err(AgentError::Invalid(error)) => return Err((runs, error)),
+                        // The official repositories' content is not chosen
+                        // by whoever could write a source to keep the
+                        // reviewer busy: there it is a slow provider.
+                        Err(AgentError::OutOfTime(error))
+                            if self.group.class == SourceClass::Official =>
+                        {
+                            stopped.get_or_insert_with(|| error.to_string());
+                            (AgentOutcome::Unavailable(error), None)
+                        }
+                        Err(AgentError::Invalid(error) | AgentError::OutOfTime(error)) => {
+                            return Err((runs, error));
+                        }
                     }
                 }
                 (None, None) => {
@@ -544,6 +556,12 @@ fn review_with_retry(
     match review() {
         Err(AgentError::Unavailable(error)) if is_retryable(&error) => {
             thread::sleep(RETRY_DELAY);
+            (review(), Some(error.to_string()))
+        }
+        // A reply that missed this run's nonce is asked for once more: a
+        // model now and then drops it, and the next reply must carry its
+        // own new nonce.
+        Err(AgentError::Invalid(error)) if error.to_string().contains("nonce") => {
             (review(), Some(error.to_string()))
         }
         result => (result, None),
@@ -866,6 +884,53 @@ mod tests {
             "{:?}",
             review.notes
         );
+    }
+
+    #[test]
+    fn a_reply_that_misses_the_nonce_is_asked_for_once_more() {
+        let bin = TempDir::new("engine-nonce-retry");
+        // The first reply echoes another nonce; the second is right.
+        let then = r#"if [ "$count" -eq 1 ]; then nonce=wrong; else nonce=$(printf '%s\n' "$input" | sed -n 's/^Nonce: //p' | tr -d '\n'); fi
+reply="{\"nonce\":\"$nonce\",\"status\":\"clear\",\"summary\":\"mock\",\"findings\":[]}"
+escaped=$(printf '%s' "$reply" | sed 's/"/\\"/g')
+printf '{"type":"text","part":{"type":"text","text":"%s"}}\n' "$escaped""#;
+        let opencode = OpenCode::At(mock_opencode_counting(bin.path(), 0, then));
+        let settings = AgentSettings::default();
+        let files = [file("install.sh", "echo hi\n")];
+        let review = review_group(&group(&settings, &files), &opencode, None);
+        assert!(review.invalid.is_none(), "{:?}", review.invalid);
+        assert!(
+            review.notes.iter().any(|note| note.contains("retried")),
+            "{:?}",
+            review.notes
+        );
+    }
+
+    #[test]
+    fn running_out_of_time_on_the_source_blocks_except_for_official_packages() {
+        let bin = TempDir::new("engine-out-of-time");
+        let opencode = OpenCode::At(mock_opencode_counting(
+            bin.path(),
+            0,
+            "printf '{\"type\":\"step_start\"}\\n'\nsleep 5",
+        ));
+        let settings = AgentSettings {
+            timeout_secs: 1,
+            ..AgentSettings::default()
+        };
+        let files = [file("install.sh", "echo hi\n")];
+        let aur = review_group(&group(&settings, &files), &opencode, None);
+        assert!(aur.invalid.is_some(), "{:?}", aur.runs);
+        let official = Group {
+            class: SourceClass::Official,
+            ..group(&settings, &files)
+        };
+        let official = review_group(&official, &opencode, None);
+        assert!(official.invalid.is_none());
+        assert!(matches!(
+            official.runs.as_slice(),
+            [run] if matches!(run.outcome, AgentOutcome::Unavailable(_))
+        ));
     }
 
     #[test]

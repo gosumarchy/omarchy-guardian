@@ -43,8 +43,9 @@ use crate::json::Json;
 use crate::notify::{self, Ran};
 use crate::osv;
 use crate::pacman;
-use crate::report::{Blocked, Decision, Gap};
+use crate::report::{Blocked, Decision, Gap, Report, RunRef};
 use crate::review::{self, ReviewContext};
+use crate::rules;
 use crate::sandbox::{self, FetchJail, Workspace};
 use crate::scan::{self, ScanConfig, Snapshot};
 use crate::sha256::Sha256;
@@ -1053,6 +1054,22 @@ fn fetch_refusal(
     ))
 }
 
+/// Where the recipe writes its sources out plainly, listing it must give
+/// the same ones: a recipe that lists other sources than it says has told
+/// the listing something else than the build. True when they agree, or the
+/// recipe computes its sources.
+fn listed_as_written(recipe: &str, srcinfo: &str, sources: &[aur::Source]) -> bool {
+    let Some(mut written) = aur::literal_sources(recipe, srcinfo) else {
+        return true;
+    };
+    let mut listed: Vec<String> = sources.iter().map(|source| source.entry.clone()).collect();
+    written.sort();
+    written.dedup();
+    listed.sort();
+    listed.dedup();
+    written == listed
+}
+
 /// Returns why makepkg must not start, as an exit code. A block notes that
 /// the recipe ran: makepkg sources it, in the jail, to list the sources.
 fn review_upstream(
@@ -1077,6 +1094,13 @@ fn review_upstream(
         return Err(unreadable("it names no usable pkgbase".into()));
     };
     let sources = aur::parse_srcinfo(&srcinfo);
+    if !listed_as_written(step.recipe, &srcinfo, &sources) {
+        return Err(block(
+            "listing the recipe gave other sources than it writes out; what it builds with cannot be known.".into(),
+            "the recipe lists other sources than it writes out",
+            2,
+        ));
+    }
     let dirs = step.configured.dirs(step.build_dir, pkgbase);
     if let Some((message, why)) = fetch_refusal(step, pkgbase, &sources, &dirs) {
         return Err(block(message, why, 1));
@@ -1300,6 +1324,40 @@ fn upstream_summary(upstream: &Upstream, sources: &[aur::Source]) -> String {
     summary
 }
 
+/// A file the upstream code runs or reads in as code that was not reviewed
+/// as text (a binary, or one left out) leaves the review incomplete: the
+/// build runs it.
+fn upstream_runs(report: &mut Report, upstream: &Upstream) {
+    for file in &upstream.files {
+        for (index, line) in file.text.lines().enumerate() {
+            for target in rules::run_targets(line) {
+                if report.runs.len() >= review::MAX_RUNS {
+                    report.runs_overflowed = true;
+                    break;
+                }
+                report.runs.push(RunRef {
+                    rel: file.path.clone(),
+                    line: index + 1,
+                    excerpt: line.trim().chars().take(200).collect(),
+                    target,
+                });
+            }
+        }
+    }
+    let unread: Vec<(String, String)> = upstream
+        .omitted
+        .iter()
+        .map(|(path, why)| (format!("src/{path}"), (*why).to_string()))
+        .chain(
+            upstream
+                .unread
+                .keys()
+                .map(|path| (path.clone(), "binary".to_string())),
+        )
+        .collect();
+    review::check_runs(report, &unread);
+}
+
 fn review_upstream_files(
     step: &UpstreamStep<'_>,
     settings: &Settings,
@@ -1333,6 +1391,7 @@ fn review_upstream_files(
     for gap in &upstream.gaps {
         report.gaps.push(Gap::Package(Error::Refused(gap.clone())));
     }
+    upstream_runs(&mut report, upstream);
     report.unread.clone_from(&upstream.unread);
     let units: Vec<Unit> = Identity::parse(&format!("aur-src:{}", step.key))
         .map(|identity| {
@@ -1433,6 +1492,28 @@ mod tests {
         list.iter().map(OsString::from).collect()
     }
 
+    #[test]
+    fn a_binary_the_upstream_code_runs_leaves_the_review_incomplete() {
+        let dir = TempDir::new("gate-upstream-runs");
+        let src = dir.path().join("src");
+        fs::create_dir_all(src.join("demo")).unwrap();
+        fs::write(src.join("demo/helper.bin"), b"\x7fELF\x02\x01\x01\0\0\0").unwrap();
+        fs::write(src.join("demo/build.sh"), "#!/bin/sh\nsh ./helper.bin\n").unwrap();
+        let roots = aur::Roots {
+            build_dir: dir.path(),
+            srcdest: None,
+        };
+        let upstream = aur::collect_upstream(&src, &roots, "", 1024 * 1024);
+        let mut report = crate::report::Report::new("test");
+        super::upstream_runs(&mut report, &upstream);
+        let gaps: Vec<String> = report.gaps.iter().map(ToString::to_string).collect();
+        assert!(
+            gaps.iter()
+                .any(|gap| gap
+                    .starts_with("src/demo/build.sh:2 runs or reads in src/demo/helper.bin")),
+            "{gaps:?}"
+        );
+    }
     #[test]
     fn parses_the_wrapped_command() {
         assert_eq!(
