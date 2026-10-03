@@ -508,17 +508,39 @@ fn apply_allowed(
     label: &dyn Fn(&collect::Item) -> String,
     notes: &mut Vec<String>,
 ) {
+    let system = state::system_allowed(Path::new(state::SYSTEM_ALLOWED));
     let allowed = state::all_allowed(directory, Path::new(state::SYSTEM_ALLOWED));
     state::apply_allowed(items, &allowed, label);
-    let left = state::allowed(directory)
-        .keys()
-        .filter(|label| !state::is_home_label(label))
-        .count();
-    if left > 0 {
+    // An entry an older Guardian kept in the user's list that the system's
+    // list now holds is done with; the rest are said.
+    let mut own = state::allowed(directory);
+    let (dropped, left) = migrate_own_list(&mut own, &system);
+    if dropped {
+        drop(state::save_allowed(directory, &own));
+    }
+    if !left.is_empty() {
+        let named: Vec<&str> = left.iter().take(3).map(String::as_str).collect();
         notes.push(format!(
-            "{left} system item(s) you allowed before are no longer allowed from your own list: allow them again with `sweep allow` (it asks for the sudo password), or drop them with `sweep forget`"
+            "{} system item(s) you allowed before are no longer allowed from your own list ({}{}): allow one again with `sweep allow LABEL` (it asks for the sudo password), or drop it with `sweep forget LABEL`",
+            left.len(),
+            named.join(", "),
+            if left.len() > named.len() { ", ..." } else { "" }
         ));
     }
+}
+
+/// Takes out of the user's own list the system entries an older Guardian
+/// kept there that the system's list now holds. Returns whether any went,
+/// and the system entries left in it, which count for nothing.
+fn migrate_own_list(own: &mut Remembered, system: &Remembered) -> (bool, Vec<String>) {
+    let before = own.len();
+    own.retain(|label, _| state::is_home_label(label) || !system.contains_key(label));
+    let left = own
+        .keys()
+        .filter(|label| !state::is_home_label(label))
+        .cloned()
+        .collect();
+    (own.len() < before, left)
 }
 
 /// `omarchy-guardian sweep`.
@@ -624,6 +646,24 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn old_system_entries_in_the_users_list_go_once_root_holds_them() {
+        let entry = |labels: &[&str]| -> super::state::Remembered {
+            labels
+                .iter()
+                .map(|label| ((*label).to_string(), "x".to_string()))
+                .collect()
+        };
+        let mut own = entry(&["~/.bashrc", "/root/a", "/root/b"]);
+        let system = entry(&["/root/a"]);
+        let (dropped, left) = super::migrate_own_list(&mut own, &system);
+        assert!(dropped);
+        assert_eq!(left, ["/root/b"]);
+        assert_eq!(own.keys().collect::<Vec<_>>(), ["/root/b", "~/.bashrc"]);
+        let (dropped, _) = super::migrate_own_list(&mut own, &system);
+        assert!(!dropped);
+    }
+
     use super::state::{LastRun, Outcome};
     use super::{is_news, record};
     use crate::test_support::TempDir;
