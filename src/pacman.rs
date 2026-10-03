@@ -7,17 +7,18 @@
 //! (`/proc/<pid>/cwd`, readable only by root), and this module reads pacman's
 //! exact argv from `/proc/<pid>/cmdline` instead of re-parsing a shell string.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::classify;
 use crate::config::Settings;
 use crate::config::model::{AiRequirement, Named, SourceClass};
-use crate::content::Content;
+use crate::content::{self, Content};
 use crate::engine::plan::HashOnly;
 use crate::error::{Error, IoContext};
 use crate::notify;
@@ -25,6 +26,8 @@ use crate::payload;
 use crate::report::{Gap, LocalFinding, Report};
 use crate::review;
 use crate::rules::RuleId;
+use crate::scan::MAX_TEXT_FILE_SIZE;
+use crate::sweep::read::{self, Public, View};
 use crate::tools::{self, Limits, OpenCode, Reviewer};
 
 const DEFAULT_CACHE_DIR: &str = "/var/cache/pacman/pkg/";
@@ -146,6 +149,16 @@ pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report
         }
     };
 
+    let everything: Vec<PathBuf> = archives
+        .values()
+        .filter_map(|paths| paths.as_ref().ok())
+        .flatten()
+        .cloned()
+        .collect();
+    let shipped = Shipped {
+        archives: &everything,
+        index: RefCell::new(None),
+    };
     for target in &targets {
         let class = classes.get(target).copied().unwrap_or(match operation {
             Operation::Sync => SourceClass::ThirdPartyRepo,
@@ -154,7 +167,11 @@ pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report
         match archives.get(target) {
             Some(Ok(paths)) => {
                 for archive in paths {
-                    match scan_package(archive, target, class, &trusted, &mut report) {
+                    // What another archive of the transaction ships, for a
+                    // link in this one that leads there: each archive is
+                    // opened once, and only when such a link is met.
+                    let others = |path: &str| shipped.lookup(archive, path);
+                    match scan_package(archive, target, class, &trusted, &others, &mut report) {
                         Ok((scriptlet, summary)) => summary.announce(target, scriptlet),
                         Err(error) => report.gaps.push(Gap::Package(error)),
                     }
@@ -888,6 +905,7 @@ fn scan_package(
     target: &str,
     class: SourceClass,
     trusted: &[String],
+    others: &dyn Fn(&str) -> payload::InArchive,
     report: &mut Report,
 ) -> Result<(bool, PayloadSummary), Error> {
     let archive = payload::Archive::open(archive_path)?;
@@ -918,13 +936,16 @@ fn scan_package(
         unchanged: 0,
         not_reviewed: Vec::new(),
     };
-    for file in reviewed.files {
+    for mut file in reviewed.files {
         // An upgrade only brings in what changed; the rest is already active.
         if file.is_installed_unchanged(Path::new("/")) {
             summary.unchanged += 1;
             continue;
         }
         let rel = format!("{target}/{archive_name}/{}", file.path);
+        if !follow_outside_link(&mut file, others, report) {
+            continue;
+        }
         report.file_classes.insert(rel.clone(), class);
         match file.content {
             Content::Text(text) | Content::Lossy { text, .. } => {
@@ -976,6 +997,171 @@ fn scan_package(
     );
     archive.verify_unchanged()?;
     Ok((scriptlet, summary))
+}
+
+/// What the archives of a transaction ship, for a link in one of them that
+/// leads to a file another one brings. Which archive ships which path is
+/// read once, the first time it is asked; no archive is kept open.
+struct Shipped<'a> {
+    archives: &'a [PathBuf],
+    /// Each path with the archives that ship it, and whether an archive
+    /// could not be read.
+    index: RefCell<Option<(ShippedPaths, bool)>>,
+}
+
+/// Each path with the archives that ship it.
+type ShippedPaths = HashMap<String, Vec<PathBuf>>;
+
+impl Shipped<'_> {
+    fn lookup(&self, asking: &Path, path: &str) -> payload::InArchive {
+        let mut index = self.index.borrow_mut();
+        let (paths, unreadable) = index.get_or_insert_with(|| {
+            let mut paths = ShippedPaths::new();
+            let mut unreadable = false;
+            for archive in self.archives {
+                match payload::Archive::open(archive) {
+                    Ok(opened) => {
+                        for shipped in opened.paths() {
+                            paths
+                                .entry(shipped.to_string())
+                                .or_default()
+                                .push(archive.clone());
+                        }
+                    }
+                    Err(_) => unreadable = true,
+                }
+            }
+            (paths, unreadable)
+        });
+        for archive in paths.get(path).into_iter().flatten() {
+            if archive == asking {
+                continue;
+            }
+            return payload::Archive::open(archive).map_or(payload::InArchive::Other, |opened| {
+                opened.shipped_file(path)
+            });
+        }
+        // An archive that could not be read may be the one that ships it.
+        if *unreadable {
+            payload::InArchive::Other
+        } else {
+            payload::InArchive::Absent
+        }
+    }
+}
+
+/// A link to a file this package does not ship is reviewed as that file:
+/// as the transaction brings it, or as root alone keeps it on this system
+/// now. Returns false, with a gap, when it cannot be.
+fn follow_outside_link(
+    file: &mut payload::PayloadFile,
+    others: &dyn Fn(&str) -> payload::InArchive,
+    report: &mut Report,
+) -> bool {
+    let Some(leads) = file.leads_outside.take() else {
+        return true;
+    };
+    match linked_file(Path::new("/"), &leads, others) {
+        // A device (`/dev/null`, which masks a unit) or the kernel's own
+        // files: nothing to read, the note says what it is.
+        Ok(None) => true,
+        Ok(Some((whence, bytes))) => {
+            file.content = payload::annotated(
+                content::classify_payload(&file.path, &bytes),
+                &format!(
+                    "# /{} is a symbolic link to {leads}, which this package does not ship; below is that file as {whence}.\n",
+                    file.path
+                ),
+            );
+            true
+        }
+        Err(reason) => {
+            report.gaps.push(Gap::Package(Error::Refused(format!(
+                "/{} links to {leads}, which {reason}: what it holds cannot be reviewed",
+                file.path
+            ))));
+            false
+        }
+    }
+}
+
+/// How many links are followed to the file a package's link leads to.
+const MAX_LINKED_HOPS: usize = 8;
+
+/// The file at `leads` (an absolute path): as another archive of the
+/// transaction ships it, or as it is under `root` when root alone controls
+/// the way to it and the file itself. Says where it came from, or why it
+/// cannot be used.
+fn linked_file(
+    root: &Path,
+    leads: &str,
+    others: &dyn Fn(&str) -> payload::InArchive,
+) -> Result<Option<(&'static str, Vec<u8>)>, String> {
+    let mut rel = leads.trim_start_matches('/').to_string();
+    let special = |rel: &str| {
+        ["dev/", "proc/", "sys/"]
+            .iter()
+            .any(|top| rel.starts_with(top))
+    };
+    if special(&rel) {
+        return Ok(None);
+    }
+    match others(&rel) {
+        payload::InArchive::File(bytes) => {
+            return Ok(Some((
+                "another package of this transaction ships it",
+                bytes,
+            )));
+        }
+        payload::InArchive::Other => {
+            return Err(
+                "this transaction puts there as something other than a file that can be read"
+                    .into(),
+            );
+        }
+        payload::InArchive::Absent => {}
+    }
+    for _ in 0..MAX_LINKED_HOPS {
+        if special(&rel) {
+            return Ok(None);
+        }
+        let seen = read::seen(root, &rel, View::Pinned).ok_or("is not on this system")?;
+        if !seen.kept {
+            return Err("lies where someone other than root can change it".into());
+        }
+        match seen.what {
+            Public::File(file) => {
+                let unreadable = |error: io::Error| format!("cannot be read ({error})");
+                let metadata = file.metadata().map_err(unreadable)?;
+                if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+                    return Err("is a file someone other than root can change".into());
+                }
+                let mut bytes = Vec::new();
+                file.take(MAX_TEXT_FILE_SIZE + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(unreadable)?;
+                if bytes.len() as u64 > MAX_TEXT_FILE_SIZE {
+                    return Err("is too large to review".into());
+                }
+                return Ok(Some(("it is on this system now", bytes)));
+            }
+            Public::Link(target) => {
+                let base = Path::new(&seen.path)
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default();
+                let next = if target.starts_with('/') {
+                    PathBuf::from(target.trim_start_matches('/'))
+                } else {
+                    base.join(&target)
+                };
+                rel = read::normalize(&next).ok_or("leads out of the system's root")?;
+            }
+            Public::Other => return Ok(None),
+            Public::Directory(_) => return Err("is a directory".into()),
+        }
+    }
+    Err("is behind too many links".into())
 }
 
 #[cfg(test)]
@@ -1391,6 +1577,7 @@ mod tests {
             "sample",
             SourceClass::LocalPackage,
             &[],
+            &|_| crate::payload::InArchive::Absent,
             &mut report,
         )
         .unwrap();
@@ -1431,6 +1618,147 @@ mod tests {
     }
 
     #[test]
+    fn a_link_to_a_file_the_package_does_not_ship_is_reviewed_as_that_file() {
+        if !tool_available("/usr/bin/bsdtar") {
+            return;
+        }
+        let dir = TempDir::new("pacman-outside-link");
+        let root = dir.path().join("root");
+        fs::create_dir_all(root.join("etc/sudoers.d")).unwrap();
+        fs::write(root.join(".PKGINFO"), "pkgname = sample\n").unwrap();
+        // One to a file another package of the transaction ships, one to a
+        // file root keeps on every system, one to nothing at all.
+        for (name, target) in [
+            ("shipped", "/usr/lib/other/rule"),
+            ("system", "/etc/passwd"),
+            ("missing", "/usr/lib/guardian-test-nowhere/rule"),
+            ("masked", "/dev/null"),
+        ] {
+            std::os::unix::fs::symlink(target, root.join("etc/sudoers.d").join(name)).unwrap();
+        }
+        let archive = dir.path().join("sample-1-1-any.pkg.tar");
+        let status = Command::new("/usr/bin/bsdtar")
+            .args(["--uid", "0", "--gid", "0", "-cf"])
+            .arg(&archive)
+            .args([".PKGINFO", "etc"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let others = |path: &str| {
+            if path == "usr/lib/other/rule" {
+                crate::payload::InArchive::File(b"ALL ALL=(ALL) NOPASSWD: ALL\n".to_vec())
+            } else {
+                crate::payload::InArchive::Absent
+            }
+        };
+        let mut report = Report::new("test");
+        scan_package(
+            &archive,
+            "sample",
+            SourceClass::LocalPackage,
+            &[],
+            &others,
+            &mut report,
+        )
+        .unwrap();
+        let sent = |name: &str| {
+            report
+                .agent_input
+                .iter()
+                .find(|file| file.path.ends_with(&format!("etc/sudoers.d/{name}")))
+                .map(|file| file.content.clone())
+        };
+        assert!(
+            sent("shipped").is_some_and(|text| text.contains("NOPASSWD")
+                && text.contains("another package of this transaction")),
+            "{:?}",
+            sent("shipped")
+        );
+        if fs::metadata("/etc/passwd")
+            .is_ok_and(|metadata| std::os::unix::fs::MetadataExt::uid(&metadata) == 0)
+        {
+            assert!(
+                sent("system").is_some_and(|text| text.contains("on this system now")),
+                "{:?}",
+                sent("system")
+            );
+        }
+        assert!(sent("missing").is_none());
+        // A link to /dev/null masks; it is said, not a gap.
+        assert!(sent("masked").is_some_and(|text| text.contains("does not ship")));
+        assert_eq!(report.gaps.len(), 1, "{:?}", report.gaps);
+        assert!(
+            report.gaps.iter().any(|gap| gap
+                .to_string()
+                .contains("/etc/sudoers.d/missing links to /usr/lib/guardian-test-nowhere/rule")),
+            "{:?}",
+            report.gaps
+        );
+    }
+
+    #[test]
+    fn a_file_another_archive_ships_is_found_whichever_archive_comes_first() {
+        if !tool_available("/usr/bin/bsdtar") {
+            return;
+        }
+        let dir = TempDir::new("pacman-shipped");
+        let pack = |name: &str, files: &[(&str, &str)]| {
+            let root = dir.path().join(name);
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join(".PKGINFO"), format!("pkgname = {name}\n")).unwrap();
+            let mut members = vec![".PKGINFO".to_string()];
+            for (path, text) in files {
+                fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+                fs::write(root.join(path), text).unwrap();
+                members.push((*path).to_string());
+            }
+            let archive = dir.path().join(format!("{name}-1-1-any.pkg.tar"));
+            let status = Command::new("/usr/bin/bsdtar")
+                .args(["--uid", "0", "--gid", "0", "-cf"])
+                .arg(&archive)
+                .args(&members)
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            archive
+        };
+        let asking = pack("a", &[("etc/a.conf", "x\n")]);
+        let other = pack("b", &[("usr/lib/b/data", "y\n")]);
+        let shipping = pack("c", &[("usr/lib/other/rule", "ALL ALL=(ALL) ALL\n")]);
+        let archives = [asking.clone(), other, shipping];
+        let shipped = super::Shipped {
+            archives: &archives,
+            index: std::cell::RefCell::new(None),
+        };
+        assert_eq!(
+            shipped.lookup(&asking, "usr/lib/other/rule"),
+            crate::payload::InArchive::File(b"ALL ALL=(ALL) ALL\n".to_vec())
+        );
+        assert_eq!(
+            shipped.lookup(&asking, "usr/lib/nowhere"),
+            crate::payload::InArchive::Absent
+        );
+        // An archive asks no question of itself.
+        assert_eq!(
+            shipped.lookup(&asking, "etc/a.conf"),
+            crate::payload::InArchive::Absent
+        );
+        // One that cannot be read may be the one that ships it.
+        let broken = [asking.clone(), dir.path().join("missing-1-1-any.pkg.tar")];
+        let shipped = super::Shipped {
+            archives: &broken,
+            index: std::cell::RefCell::new(None),
+        };
+        assert_eq!(
+            shipped.lookup(&asking, "usr/lib/other/rule"),
+            crate::payload::InArchive::Other
+        );
+    }
+
+    #[test]
     fn install_scripts_are_reviewed_through_the_archive_model() {
         if !tool_available("/usr/bin/bsdtar") {
             return;
@@ -1444,6 +1772,7 @@ mod tests {
             "sample",
             SourceClass::LocalPackage,
             &[],
+            &|_| crate::payload::InArchive::Absent,
             &mut report,
         )
         .unwrap();
@@ -1483,6 +1812,7 @@ mod tests {
                 "sample",
                 SourceClass::LocalPackage,
                 &[],
+                &|_| crate::payload::InArchive::Absent,
                 &mut report
             )
             .unwrap()
@@ -1497,6 +1827,7 @@ mod tests {
                 "sample",
                 SourceClass::LocalPackage,
                 &[],
+                &|_| crate::payload::InArchive::Absent,
                 &mut Report::default()
             )
             .unwrap()

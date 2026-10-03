@@ -45,7 +45,15 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
         if file.lossy {
             report.lossy_files += 1;
         }
-        analyze_text(&mut report, file.rel, file.text, true);
+        if file.git_config {
+            // Checked as git reads it, and reviewed like any file (it may
+            // be run as something else) without the tokens it may hold.
+            git_config_findings(&mut report, file.rel, file.text);
+            let masked = git_state::without_url_credentials(file.text);
+            analyze_text(&mut report, file.rel, &masked, true);
+        } else {
+            analyze_text(&mut report, file.rel, file.text, true);
+        }
     });
     report.hash_only = snapshot
         .files()
@@ -168,21 +176,31 @@ pub fn ai_off_classes(settings: &Settings, classes: &[SourceClass]) -> Vec<Sourc
         .collect()
 }
 
+/// Checks a git configuration for keys that make git run a command. It is
+/// never sent to the AI: remote addresses can carry tokens.
+pub fn analyze_git_config(report: &mut Report, rel: &str, text: &str) {
+    report.text_files_reviewed += 1;
+    git_config_findings(report, rel, text);
+}
+
+/// The keys of a git configuration that make git run a command, as findings.
+fn git_config_findings(report: &mut Report, rel: &str, text: &str) {
+    for (line, excerpt) in git_state::executing_keys(text) {
+        report.findings.push(LocalFinding {
+            path: rel.to_string(),
+            line,
+            rule: RuleId::GitConfigCommand,
+            excerpt: excerpt.chars().take(EXCERPT_CHARS).collect(),
+        });
+    }
+}
+
 /// Applies the local checks to one text file and queues it for the AI review.
 pub fn analyze_text(report: &mut Report, rel: &str, text: &str, inspect_dependencies: bool) {
-    report.text_files_reviewed += 1;
-
     if git_state::is_git_config(rel) {
-        for (line, excerpt) in git_state::executing_keys(text) {
-            report.findings.push(LocalFinding {
-                path: rel.to_string(),
-                line,
-                rule: RuleId::GitConfigCommand,
-                excerpt: excerpt.chars().take(EXCERPT_CHARS).collect(),
-            });
-        }
-        return;
+        return analyze_git_config(report, rel, text);
     }
+    report.text_files_reviewed += 1;
 
     if text.lines().next() == Some(LFS_POINTER) {
         report.gaps.push(Gap::UnresolvedLfs(rel.to_string()));
@@ -595,6 +613,36 @@ mod tests {
         // Saved and only unpacked, or two unrelated lines.
         assert!(download("curl -LO https://x.example/a.tar.gz\ntar xf a.tar.gz\n").is_empty());
         assert!(download("curl -fsSL https://x.example/i -o i.txt\nsh build.sh\n").is_empty());
+    }
+
+    #[test]
+    fn a_repository_under_another_name_keeps_its_tokens_to_itself() {
+        let dir = TempDir::new("review-bare-config");
+        let bare = dir.path().join("mirror.git");
+        fs::create_dir_all(bare.join("objects")).unwrap();
+        fs::create_dir_all(bare.join("refs")).unwrap();
+        fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(
+            bare.join("config"),
+            "[remote \"origin\"]\n\turl = https://user:s3cret@x.example/r\n[core]\n\tfsmonitor = sh x\n",
+        )
+        .unwrap();
+        let settings = default_settings();
+        let opencode = unavailable();
+        let report = review_tree(
+            &ScanConfig::new(dir.path()),
+            &context(&settings, SourceClass::Source, &opencode),
+        );
+        assert!(rules_in(&report).contains(&RuleId::GitConfigCommand));
+        // Reviewed like any file, without the token in its address.
+        let sent = report
+            .agent_input
+            .iter()
+            .find(|file| file.path.ends_with("config"))
+            .map(|file| file.content.clone())
+            .unwrap_or_default();
+        assert!(sent.contains("https://***@x.example/r"), "{sent}");
+        assert!(!sent.contains("s3cret"), "{sent}");
     }
 
     #[test]
