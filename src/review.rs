@@ -176,9 +176,9 @@ pub fn ai_off_classes(settings: &Settings, classes: &[SourceClass]) -> Vec<Sourc
         .collect()
 }
 
-/// Checks a git configuration for keys that make git run a command. It is
+/// Checks a `.git/config` for keys that make git run a command. It is
 /// never sent to the AI: remote addresses can carry tokens.
-pub fn analyze_git_config(report: &mut Report, rel: &str, text: &str) {
+fn analyze_git_config(report: &mut Report, rel: &str, text: &str) {
     report.text_files_reviewed += 1;
     git_config_findings(report, rel, text);
 }

@@ -738,8 +738,9 @@ checked the same way, and is also reviewed like any other file (a build
 could run it as something else) with the user and password of every
 address in it taken out. Other values are kept whatever their key is
 called, since a value can be code or name what a file runs: a token
-written there (an `extraHeader`, say) is seen by the AI provider. A
-`.git` given as a file or a link, a linked `config`, hooks or submodules behind a link, a
+written there (an `extraHeader`, say) is seen by the AI provider, and so
+is a password with characters other than letters, digits and `._~%+=-:`.
+A `.git` given as a file or a link, a linked `config`, hooks or submodules behind a link, a
 `commondir` (which makes git read another directory's configuration and
 hooks), and such a `config` that cannot be read make the review
 incomplete: git would read them and the review cannot. A file that opens like a known binary format or a UTF-16 mark but is

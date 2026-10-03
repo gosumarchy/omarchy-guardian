@@ -87,7 +87,7 @@ fn is_plain_secret(text: &str) -> bool {
     !text.is_empty()
         && text
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "._~%+=-:/ ".contains(c))
+            .all(|c| c.is_ascii_alphanumeric() || "._~%+=-:".contains(c))
 }
 
 fn without_line_credentials(line: &str) -> String {

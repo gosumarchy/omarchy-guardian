@@ -1098,10 +1098,17 @@ fn linked_file(
     others: &dyn Fn(&str) -> payload::InArchive,
 ) -> Result<Option<(&'static str, Vec<u8>)>, String> {
     let mut rel = leads.trim_start_matches('/').to_string();
+    // Devices and the kernel's own files, which hold nothing to read; not
+    // what anyone may write under /dev (`shm`, `mqueue`, `pts`), which is
+    // looked at like any other place.
     let special = |rel: &str| {
-        ["dev/", "proc/", "sys/"]
+        let shared = ["dev/shm/", "dev/mqueue/", "dev/pts/"]
             .iter()
-            .any(|top| rel.starts_with(top))
+            .any(|place| rel.starts_with(place));
+        !shared
+            && ["dev/", "proc/", "sys/"]
+                .iter()
+                .any(|top| rel.starts_with(top))
     };
     if special(&rel) {
         return Ok(None);
@@ -1633,6 +1640,7 @@ mod tests {
             ("system", "/etc/passwd"),
             ("missing", "/usr/lib/guardian-test-nowhere/rule"),
             ("masked", "/dev/null"),
+            ("shared", "/dev/shm/guardian-test"),
         ] {
             std::os::unix::fs::symlink(target, root.join("etc/sudoers.d").join(name)).unwrap();
         }
@@ -1688,7 +1696,9 @@ mod tests {
         assert!(sent("missing").is_none());
         // A link to /dev/null masks; it is said, not a gap.
         assert!(sent("masked").is_some_and(|text| text.contains("does not ship")));
-        assert_eq!(report.gaps.len(), 1, "{:?}", report.gaps);
+        // What anyone may write under /dev is no device: a gap.
+        assert!(sent("shared").is_none());
+        assert_eq!(report.gaps.len(), 2, "{:?}", report.gaps);
         assert!(
             report.gaps.iter().any(|gap| gap
                 .to_string()

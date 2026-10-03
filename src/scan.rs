@@ -459,8 +459,8 @@ impl Walker<'_> {
         // A directory laid out as a git repository without being called
         // `.git` (a bare repository, or where a `commondir` points): git
         // run in it takes its configuration from here all the same. That
-        // configuration is checked as `.git/config` is, and kept from the
-        // AI review the same way: remote addresses can carry tokens.
+        // configuration is checked as `.git/config` is, and reviewed like
+        // any file with the credentials in its addresses taken out.
         let has = |name: &str| names.iter().any(|entry| entry == name);
         if has("HEAD") && has("objects") && has("refs") {
             for config in ["config", "config.worktree"] {
