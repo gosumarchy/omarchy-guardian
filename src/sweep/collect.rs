@@ -319,10 +319,17 @@ fn view(scope: &Scope<'_>, run_by: Option<&str>) -> Option<View> {
 
 /// Whether there is something at `path` that `run_by` may lead the
 /// collector to.
+/// A directory is not: a command that names one (`find /etc/x`) does not
+/// run it.
 pub fn is_there(scope: &Scope<'_>, path: &str, run_by: Option<&str>) -> bool {
     match view(scope, run_by) {
-        Some(view) => read::seen(scope.root, path, view).is_some(),
-        None => fs::symlink_metadata(scope.root.join(path)).is_ok(),
+        Some(view) => read::seen(scope.root, path, view)
+            .is_some_and(|seen| !matches!(seen.what, read::Public::Directory(_))),
+        // A link is there, as in the pinned view; where it leads is
+        // looked at when it is followed.
+        None => {
+            fs::symlink_metadata(scope.root.join(path)).is_ok_and(|metadata| !metadata.is_dir())
+        }
     }
 }
 
@@ -948,6 +955,14 @@ mod tests {
 
         assert!(super::is_there(&as_root, "etc/open", by));
         assert!(!super::is_there(&as_root, "etc/secret", by));
+        // A directory a command names is not a program it runs.
+        fs::create_dir_all(root.join("etc/named.d")).unwrap();
+        assert!(!super::is_there(&as_root, "etc/named.d", by));
+        assert!(!super::is_there(
+            &scope(Origin::System),
+            "etc/named.d",
+            None
+        ));
         // A link is not the file it leads to, in the guarded view.
         symlink("open", root.join("etc/beside")).unwrap();
         assert!(!super::is_file_there(&as_root, "etc/beside", None));

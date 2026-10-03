@@ -192,7 +192,22 @@ fn started(line: &str) -> Vec<String> {
     for statement in statements.split([';', '|', '&']) {
         // Past what comes before a command: keywords, wrappers that run
         // it, assignments, a `case` pattern.
-        let first = split(statement).into_iter().find(|word| {
+        // The words inside a substitution (`X=$(find /etc/x)`) are not the
+        // statement's command: the substitution is read below. What comes
+        // after it (`X=$(date) ~/bin/y`) still is.
+        let mut depth = 0_usize;
+        let mut ticked = false;
+        let words: Vec<String> = split(statement)
+            .into_iter()
+            .filter(|word| {
+                let inside = depth > 0 || ticked || word.contains("$(") || word.contains('`');
+                depth =
+                    (depth + word.matches('(').count()).saturating_sub(word.matches(')').count());
+                ticked ^= word.matches('`').count() % 2 == 1;
+                !inside
+            })
+            .collect();
+        let first = words.into_iter().find(|word| {
             !(matches!(
                 word.as_str(),
                 "exec"
@@ -773,7 +788,7 @@ mod tests {
             commands(
                 Category::Shell,
                 "home/u/.bashrc",
-                "export X=1\n~/bin/agent --daemon &\nexec /opt/x/run\neval \"$($HOME/bin/tool init)\"\nls -l\n[ -r ~/.x ] && . ~/.x\ncd /tmp && FOO=1 ~/bin/second\ntrue & A=\"b c\" nice ~/bin/third\nif ! ~/bin/fourth; then :; fi\nls >& /dev/null\nls &>/tmp/log\n",
+                "export X=1\n~/bin/agent --daemon &\nexec /opt/x/run\neval \"$($HOME/bin/tool init)\"\nls -l\n[ -r ~/.x ] && . ~/.x\ncd /tmp && FOO=1 ~/bin/second\ntrue & A=\"b c\" nice ~/bin/third\nif ! ~/bin/fourth; then :; fi\nls >& /dev/null\nls &>/tmp/log\nX=$(find \"/etc/conf.d\" -name x)\nX=$(date) ~/bin/fifth\n",
             ),
             [
                 "~/bin/agent",
@@ -783,7 +798,16 @@ mod tests {
                 "~/bin/second",
                 "~/bin/third",
                 "~/bin/fourth",
+                "~/bin/fifth",
             ]
+        );
+        // A packaged start-up file that only reads a directory names no
+        // program (`find` in an assignment's substitution).
+        let debuginfod = "prefix=\"/usr\"\nif [ -z \"${DEBUGINFOD_URLS:-}\" ]; then\n    DEBUGINFOD_URLS=$(find \"/etc/debuginfod\" -name \"*.urls\" -print0 2>/dev/null | xargs -0 cat 2>/dev/null | tr '\\n' ' ' || :)\n    [ -n \"$DEBUGINFOD_URLS\" ] && export DEBUGINFOD_URLS || unset DEBUGINFOD_URLS\nfi\n";
+        assert!(
+            commands(Category::Shell, "etc/profile.d/debuginfod.sh", debuginfod).is_empty(),
+            "{:?}",
+            commands(Category::Shell, "etc/profile.d/debuginfod.sh", debuginfod)
         );
         // A line of nothing but substitutions is read once, not once per
         // substitution.
