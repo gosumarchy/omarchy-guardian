@@ -574,6 +574,15 @@ enum Resolution {
     Outside(String),
 }
 
+/// What an archive ships at a path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InArchive {
+    Absent,
+    /// A directory, a link, or a file that could not be read.
+    Other,
+    File(Vec<u8>),
+}
+
 /// A package archive opened once and modelled exactly.
 pub struct Archive {
     path: PathBuf,
@@ -840,6 +849,27 @@ impl Archive {
         Err(format!("{link}: too many symbolic links"))
     }
 
+    /// The paths of everything this archive ships (no leading `/`).
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|entry| entry.path.as_str())
+    }
+
+    /// What this archive ships at `path` (no leading `/`).
+    pub fn shipped_file(&self, path: &str) -> InArchive {
+        let Some(entry) = self.entry(path) else {
+            return InArchive::Absent;
+        };
+        let path = match &entry.kind {
+            Kind::File => path.to_string(),
+            Kind::HardLink(original) => original.clone(),
+            Kind::Directory | Kind::Symlink(_) => return InArchive::Other,
+        };
+        self.extract(std::slice::from_ref(&path))
+            .ok()
+            .and_then(|mut read| read.remove(&path))
+            .map_or(InArchive::Other, InArchive::File)
+    }
+
     /// Extracts exactly `paths` (regular files of the model) and reads them
     /// back without following links, checking each has its listed size.
     fn extract(&self, paths: &[String]) -> Result<HashMap<String, Vec<u8>>, Error> {
@@ -922,6 +952,9 @@ pub struct PayloadFile {
     pub content: Content,
     /// For a program a reviewed hook or unit runs: that file.
     pub run_by: Option<String>,
+    /// For a link to a file this package does not ship: that file's path,
+    /// for the caller to find where the transaction or the system has it.
+    pub leads_outside: Option<String>,
     /// The file as shipped: its bytes, or its link target for a symbolic
     /// link, to compare with what is installed.
     shipped: Shipped,
@@ -1082,6 +1115,7 @@ pub fn review(
             ),
             path: program,
             run_by: Some(by),
+            leads_outside: None,
             shipped: Shipped::Unknown,
         });
     }
@@ -1278,6 +1312,10 @@ fn payload_files(sources: &[Source<'_>], read: &HashMap<String, Vec<u8>>) -> Vec
                 path: entry.path.clone(),
                 content,
                 run_by: None,
+                leads_outside: match (&entry.kind, source) {
+                    (Kind::Symlink(_), Resolution::Outside(resolved)) => Some(resolved.clone()),
+                    _ => None,
+                },
                 shipped,
             }
         })
@@ -1285,7 +1323,7 @@ fn payload_files(sources: &[Source<'_>], read: &HashMap<String, Vec<u8>>) -> Vec
 }
 
 /// `content` with `header` before its text.
-fn annotated(content: Content, header: &str) -> Content {
+pub fn annotated(content: Content, header: &str) -> Content {
     match content {
         Content::Text(text) => Content::Text(format!("{header}{text}")),
         Content::Lossy { text, replaced } => Content::Lossy {

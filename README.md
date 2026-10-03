@@ -732,12 +732,18 @@ so it counts as unavailable and follows the class's `ai` setting; set
 `core.fsmonitor`, filters and `!` aliases, and never sent to the AI; also
 `config.worktree`) and hooks other than git's `.sample` files are reviewed.
 Submodules kept under `.git/modules` are read the same way, nested ones
-included (past six levels the review is incomplete), and so is a directory laid out as a repository under another name. A `.git`
-given as a file or a link, a linked `config`, hooks or submodules behind a
-link, a `commondir` (which makes git read another directory's configuration
-and hooks), and a repository under another name whose configuration names a
-command make the review incomplete: git would read them and the review
-cannot. A file that opens like a known binary format or a UTF-16 mark but is
+included (past six levels the review is incomplete), and so is a
+directory laid out as a repository under another name: its `config` is
+checked the same way, and is also reviewed like any other file (a build
+could run it as something else) with the user and password of every
+address in it taken out. Other values are kept whatever their key is
+called, since a value can be code or name what a file runs: a token
+written there (an `extraHeader`, say) is seen by the AI provider, and so
+is a password with characters other than letters, digits and `._~%+=-:`.
+A `.git` given as a file or a link, a linked `config`, hooks or submodules behind a link, a
+`commondir` (which makes git read another directory's configuration and
+hooks), and such a `config` that cannot be read make the review
+incomplete: git would read them and the review cannot. A file that opens like a known binary format or a UTF-16 mark but is
 plain lines of text is reviewed as text, and text with a NUL byte after
 its first line is not passed over as binary: it makes the review
 incomplete. A file with a UTF-16 mark is read as UTF-16 only where
@@ -885,6 +891,15 @@ A package that installs a file under `/run`, `/tmp`, `/dev`, `/proc`, `/sys`,
 (links into `/usr` on this system), is refused: no package's files belong
 there, and a unit under `/run/systemd` or a key under `/root/.ssh` would act
 with nothing looking at it.
+
+An auto-run file that is a symbolic link to a file the package does not
+ship (a sudoers drop-in linked to `/usr/lib/other/rule`) is reviewed as
+the file it leads to: as another package of the same transaction ships
+it, or as it is on this system now when root alone could have put it
+there and may change it. A link to a device (`/dev/null`, which masks a
+unit) or the kernel's own files is only noted. A link to a file that
+neither has, one someone else can change, or one the transaction puts
+there as something else, makes the review incomplete.
 
 What the gate does not see: a package's other files are installed as shipped
 and acted on by what is already on the system (a pacman hook, DKMS or a

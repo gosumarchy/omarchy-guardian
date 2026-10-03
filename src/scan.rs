@@ -7,7 +7,7 @@
 //! re-resolving a path an attacker could change. Every opened file gets the
 //! same device/inode check.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read};
@@ -207,6 +207,10 @@ pub struct TextFile<'a> {
     pub text: &'a str,
     /// Decoded with replacement characters from a legacy encoding.
     pub lossy: bool,
+    /// A git configuration in a directory laid out as a repository under
+    /// another name: checked like `.git/config` as well, and reviewed with
+    /// the credentials in its addresses taken out.
+    pub git_config: bool,
 }
 
 /// Walks the tree, calling `on_text` for each reviewable text file. Returns
@@ -222,6 +226,7 @@ pub fn walk(config: &ScanConfig, on_text: &mut dyn FnMut(TextFile<'_>)) -> (Snap
         stopped: false,
         links: HashMap::new(),
         skipped: Vec::new(),
+        git_configs: HashSet::new(),
     };
 
     let root = &config.root;
@@ -311,6 +316,8 @@ struct Walker<'a> {
     /// Files with more than one link, by device and inode: read once.
     links: HashMap<LinkKey, (Digest, Contents)>,
     skipped: Vec<SkippedDir>,
+    /// The git configurations of directories laid out as repositories.
+    git_configs: HashSet<String>,
 }
 
 impl Walker<'_> {
@@ -451,18 +458,26 @@ impl Walker<'_> {
 
         // A directory laid out as a git repository without being called
         // `.git` (a bare repository, or where a `commondir` points): git
-        // run in it takes its configuration from here all the same.
+        // run in it takes its configuration from here all the same. That
+        // configuration is checked as `.git/config` is, and reviewed like
+        // any file with the credentials in its addresses taken out.
         let has = |name: &str| names.iter().any(|entry| entry == name);
-        if has("HEAD") && has("objects") && has("refs") && has("config") {
-            let shown = if rel.is_empty() { "." } else { rel };
-            match read_small_file(&handle.join("config")) {
-                Some(text) if git_state::executing_keys(&text).is_empty() => {}
-                Some(_) => self.gaps.push(Gap::GitState(format!(
-                    "{shown}: laid out as a git repository, with a configuration that names a command git runs"
-                ))),
-                None => self.gaps.push(Gap::GitState(format!(
-                    "{shown}: laid out as a git repository, with a configuration that cannot be read"
-                ))),
+        if has("HEAD") && has("objects") && has("refs") {
+            for config in ["config", "config.worktree"] {
+                if !has(config) {
+                    continue;
+                }
+                let config_rel = if rel.is_empty() {
+                    config.to_string()
+                } else {
+                    format!("{rel}/{config}")
+                };
+                if read_small_file(&handle.join(config)).is_none() {
+                    self.gaps.push(Gap::GitState(format!(
+                        "{config_rel}: the configuration of a directory laid out as a git repository cannot be read"
+                    )));
+                }
+                self.git_configs.insert(config_rel);
             }
         }
 
@@ -713,6 +728,7 @@ impl Walker<'_> {
                     rel: &rel,
                     text,
                     lossy: *lossy,
+                    git_config: self.git_configs.contains(&rel),
                 });
                 (FileKind::Text, None, *lossy)
             }
@@ -1037,7 +1053,25 @@ mod tests {
             .iter()
             .filter(|gap| matches!(gap, Gap::GitState(_)))
             .collect();
-        assert_eq!(states.len(), 2, "{gaps:?}");
+        assert_eq!(states.len(), 1, "{gaps:?}");
+        // The repository under another name has its configuration handed
+        // on as one, to be checked like `.git/config` and not sent on.
+        let mut configs = Vec::new();
+        walk(&config, &mut |file| {
+            if file.git_config {
+                configs.push(file.rel.to_string());
+            }
+        });
+        assert_eq!(configs, ["bare/config"]);
+        // One that cannot be read says so.
+        fs::remove_file(dir.path().join("bare/config")).unwrap();
+        symlink("/dev/zero", dir.path().join("bare/config")).unwrap();
+        let (_, _, gaps) = walk_texts(&config);
+        assert!(
+            gaps.iter()
+                .any(|gap| matches!(gap, Gap::GitState(text) if text.starts_with("bare/config"))),
+            "{gaps:?}"
+        );
     }
 
     #[test]

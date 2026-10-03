@@ -512,7 +512,7 @@ pub fn canonical(root: &Path, rel: &str) -> Option<String> {
 }
 
 /// `path` without `.` and `..`, refusing to climb above the root.
-fn normalize(path: &Path) -> Option<String> {
+pub fn normalize(path: &Path) -> Option<String> {
     let mut parts: Vec<&str> = Vec::new();
     for component in path.components() {
         match component {

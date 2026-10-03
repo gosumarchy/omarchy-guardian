@@ -5,6 +5,7 @@
 //! Parsing and selection are pure functions; the few steps that touch the
 //! network or run makepkg live in `cli::makepkg_gate`.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
@@ -816,6 +817,8 @@ struct Walk<'a> {
     archives_named: usize,
     all: Vec<UpstreamFile>,
     upstream: Upstream,
+    /// Directories laid out as git repositories under another name.
+    git_dirs: HashSet<PathBuf>,
 }
 
 impl Walk<'_> {
@@ -1277,6 +1280,7 @@ impl Walk<'_> {
                         // Laid out as a git repository under another name
                         // (a bare one, or where a `commondir` points).
                         self.git_directory(&entry.path(), &child, 0);
+                        self.git_dirs.insert(entry.path());
                     }
                     if depth + 1 >= MAX_DEPTH {
                         self.upstream
@@ -1291,7 +1295,18 @@ impl Walk<'_> {
                         || SKIPPED_DIRECTORIES.contains(&name.as_str());
                     pending.push((entry.path(), child, depth + 1, late));
                 } else if metadata.is_file() {
+                    // Such a directory's configuration, checked above as
+                    // git reads it, is reviewed like any file without the
+                    // tokens its remote addresses may carry.
+                    let git_config = matches!(name.as_str(), "config" | "config.worktree")
+                        && self.git_dirs.contains(&directory);
+                    let before = self.all.len();
                     self.file(&entry.path(), &child, &name, depth, late);
+                    if git_config {
+                        for file in &mut self.all[before..] {
+                            file.text = git_state::without_url_credentials(&file.text);
+                        }
+                    }
                 }
             }
         }
@@ -1326,6 +1341,7 @@ fn collect_with_cap(
         archives_named: 0,
         all: Vec::new(),
         upstream: Upstream::default(),
+        git_dirs: HashSet::new(),
     };
     if src.is_dir() {
         walk.walk();
@@ -1983,6 +1999,13 @@ pkgname = demo
                 .any(|gap| gap.starts_with("src/bare: its config names a command")),
             "{:?}",
             upstream.gaps
+        );
+        // Its configuration is reviewed too, without tokens.
+        assert!(
+            upstream
+                .files
+                .iter()
+                .any(|file| file.path == "src/bare/config")
         );
         assert!(
             upstream
