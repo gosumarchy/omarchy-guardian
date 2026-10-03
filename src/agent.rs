@@ -668,14 +668,16 @@ fn strip_code_fence(text: &str) -> &str {
     body.strip_suffix("```").map_or(trimmed, str::trim)
 }
 
+/// Why a reply without this run's nonce is refused; the engine asks once
+/// more when it sees it.
+pub const NONCE_MISSING: &str =
+    "the reply does not echo this run's nonce, so it was not based on the supplied source";
+
 pub fn parse_review(text: &str, nonce: &str) -> Result<AgentReview, Error> {
     let value = Json::parse(strip_code_fence(text))
         .map_err(|error| Error::parse("the OpenCode security report", error))?;
     if value.get("nonce").and_then(Json::as_str) != Some(nonce) {
-        return Err(Error::parse(
-            "the OpenCode security report",
-            "the reply does not echo this run's nonce, so it was not based on the supplied source",
-        ));
+        return Err(Error::parse("the OpenCode security report", NONCE_MISSING));
     }
     review_from_json(&value)
 }

@@ -97,7 +97,7 @@ pub fn collect_command(out: bool, settings: &crate::config::Settings) -> ExitCod
     collection.truncated.extend(live.unchecked);
     // Who reads these results: the group the system configuration names,
     // or the user who ran `sweep --root`. Other accounts' crontabs are
-    // theirs: only that one is there is said.
+    // theirs: only how many were left out is noted.
     let readers = match group {
         Some(gid) => accounts_in_group(
             gid,
@@ -510,9 +510,13 @@ fn from_json(text: &str) -> Result<RootPart, String> {
 /// as root on the user's behalf.
 fn installed() -> Result<&'static Path, String> {
     let program = Path::new(INSTALLED);
-    let metadata = fs::metadata(program).map_err(|error| format!("{INSTALLED}: {error}"))?;
+    let metadata = fs::metadata(program).map_err(|error| {
+        format!("{INSTALLED}: {error}; root's part needs the installed Guardian (./install.sh)")
+    })?;
     if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-        return Err(format!("{INSTALLED} is not root's alone"));
+        return Err(format!(
+            "{INSTALLED} is not root's alone; root's part needs the installed Guardian (./install.sh)"
+        ));
     }
     Ok(program)
 }
@@ -533,7 +537,7 @@ pub fn system_allow(arguments: &[&str]) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "changing the system's allowed items failed ({status})"
+            "changing the system's allowed items failed ({status}); nothing was changed. If the installed Guardian is older than this one, run ./install.sh"
         ))
     }
 }

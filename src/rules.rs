@@ -762,8 +762,8 @@ pub fn command_variables(text: &str) -> Vec<(String, String)> {
 /// The most such variables one file keeps.
 const MAX_COMMAND_VARIABLES: usize = 32;
 
-/// `code` (lowercased) with `$name` and `${name}` of `variables` written
-/// out.
+/// `code` with `$name` and `${name}` of `variables` written out. Names are
+/// matched as given: a caller that wants it case-blind lowercases both.
 pub fn with_variables(code: &str, variables: &[(String, String)]) -> String {
     if variables.is_empty() || !code.contains('$') {
         return code.to_string();

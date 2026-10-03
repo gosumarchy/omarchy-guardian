@@ -159,7 +159,8 @@ puts in a variable of its own (`TOOLS=~/opt/tools`, then `$TOOLS/run`)
 are understood, other variables are not. A Hyprland `source` with `*` or
 `?` in its last part is followed to the files it matches (up to 64). The
 file itself is always reviewed as text; what is not followed is only the
-extra look at the program it names. A link of the same name to a packaged file is trusted only
+extra look at the program it names. A link of the same name to a
+packaged file is trusted only
 where that is how the thing is enabled (a unit in a systemd unit
 directory, a hook in pacman's, a launcher in an autostart directory, a
 program of `/usr/bin` or `/usr/lib` in `~/.local/bin` or `~/.cargo/bin`)
@@ -373,7 +374,8 @@ through the list with your agent without waiting for the daily sweep.
   you). Anything else is allowed in the system's own list
   (`/var/lib/omarchy-guardian/sweep/allowed.json`), which only root
   writes: `sweep allow` and `sweep forget` ask for the sudo password for
-  those, and an entry for a system item in your own list does not count.
+  those, and an entry for a system item in your own list does not count
+  (a sweep says how many such entries an older Guardian left there).
   A program running as you cannot quiet an alert about the system that
   way.
 - What the scheduled sweeps have already told you about (`told.json`) is

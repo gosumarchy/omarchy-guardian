@@ -561,7 +561,7 @@ fn review_with_retry(
         // A reply that missed this run's nonce is asked for once more: a
         // model now and then drops it, and the next reply must carry its
         // own new nonce.
-        Err(AgentError::Invalid(error)) if error.to_string().contains("nonce") => {
+        Err(AgentError::Invalid(error)) if error.to_string().ends_with(agent::NONCE_MISSING) => {
             (review(), Some(error.to_string()))
         }
         result => (result, None),
@@ -912,10 +912,10 @@ printf '{"type":"text","part":{"type":"text","text":"%s"}}\n' "$escaped""#;
         let opencode = OpenCode::At(mock_opencode_counting(
             bin.path(),
             0,
-            "printf '{\"type\":\"step_start\"}\\n'\nsleep 5",
+            "printf '{\"type\":\"step_start\"}\\n'\nexec sleep 10",
         ));
         let settings = AgentSettings {
-            timeout_secs: 1,
+            timeout_secs: 3,
             ..AgentSettings::default()
         };
         let files = [file("install.sh", "echo hi\n")];
