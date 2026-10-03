@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use super::collect::Item;
@@ -89,11 +89,16 @@ fn write(path: &Path, remembered: &Remembered) -> Result<(), String> {
 }
 
 fn write_text(path: &Path, text: &str) -> Result<(), String> {
+    write_text_mode(path, text, 0o600)
+}
+
+fn write_text_mode(path: &Path, text: &str, mode: u32) -> Result<(), String> {
     let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
+    drop(fs::remove_file(&temporary));
     let result = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
+        .mode(mode)
         .open(&temporary)
         .and_then(|mut file| file.write_all(text.as_bytes()))
         .and_then(|()| fs::rename(&temporary, path));
@@ -105,6 +110,68 @@ fn write_text(path: &Path, text: &str) -> Result<(), String> {
 
 pub fn allowed(directory: &Path) -> Remembered {
     read(&directory.join(ALLOWED))
+}
+
+/// Where system items allowed with sudo are kept: a list only root
+/// writes, so a program running as the user cannot add to it.
+pub const SYSTEM_ALLOWED: &str = "/var/lib/omarchy-guardian/sweep/allowed.json";
+
+/// Whether a label names something in the user's own home.
+pub fn is_home_label(label: &str) -> bool {
+    label.starts_with("~/")
+}
+
+/// The system list at `path`, while it and the directories above it up to
+/// `/var/lib` are root's and nobody else may write them; empty otherwise.
+pub fn system_allowed(path: &Path) -> Remembered {
+    let root_alone = |path: &Path| {
+        fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.uid() == 0 && metadata.mode() & 0o022 == 0)
+    };
+    let mut directory = path.parent();
+    while let Some(current) = directory {
+        if !root_alone(current) {
+            return Remembered::new();
+        }
+        if current == Path::new("/var/lib") {
+            break;
+        }
+        directory = current.parent();
+    }
+    let regular = fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= MAX_RECORD_BYTES * 16);
+    if !(regular && root_alone(path)) {
+        return Remembered::new();
+    }
+    read(path)
+}
+
+/// What counts as allowed: the user's own list for items in the home, and
+/// the system list, which only root writes, for the rest.
+pub fn all_allowed(directory: &Path, system: &Path) -> Remembered {
+    let mut allowed = allowed(directory);
+    allowed.retain(|label, _| is_home_label(label));
+    allowed.extend(
+        system_allowed(system)
+            .into_iter()
+            .filter(|(label, _)| !is_home_label(label)),
+    );
+    allowed
+}
+
+/// Writes the system list, as root: readable by everyone, written only by
+/// root.
+pub fn save_system_allowed(path: &Path, allowed: &Remembered) -> Result<(), String> {
+    if let Some(directory) = path.parent() {
+        fs::create_dir_all(directory)
+            .map_err(|error| format!("{}: {error}", directory.display()))?;
+    }
+    let json = Json::object(
+        allowed
+            .iter()
+            .map(|(label, value)| (label.as_str(), Json::from(value.as_str()))),
+    );
+    write_text_mode(path, &json.to_string(), 0o644)
 }
 
 pub fn save_allowed(directory: &Path, allowed: &Remembered) -> Result<(), String> {
@@ -381,6 +448,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn system_items_count_as_allowed_only_from_roots_list() {
+        let dir = TempDir::new("sweep-allowed-system");
+        let mut own = Remembered::new();
+        own.insert("~/.bashrc".into(), "a".into());
+        own.insert("/etc/profile.d/x.sh".into(), "b".into());
+        save_allowed(dir.path(), &own).unwrap();
+        // A list in a directory that is not root's counts for nothing, and
+        // the user's own entry for a system item does not count either.
+        let system = dir.path().join("system.json");
+        super::save_system_allowed(&system, &own).unwrap();
+        let allowed = super::all_allowed(dir.path(), &system);
+        assert_eq!(allowed.keys().collect::<Vec<_>>(), ["~/.bashrc"]);
+        assert!(super::system_allowed(&system).is_empty());
+        assert!(super::is_home_label("~/x") && !super::is_home_label("/root/x"));
+    }
     #[test]
     fn changes_are_new_changed_or_removed() {
         let previous = Remembered::from([

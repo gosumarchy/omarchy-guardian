@@ -77,8 +77,65 @@ pub fn is_git_config(rel: &str) -> bool {
 /// can carry tokens, and the rest of it is what a review needs to see.
 pub fn without_url_credentials(text: &str) -> String {
     text.split_inclusive('\n')
-        .map(without_line_credentials)
+        .map(|line| without_basic_credential(&without_line_credentials(line)))
         .collect()
+}
+
+/// An `extraHeader = Authorization: basic <base64>` line with the base64
+/// taken out, when it decodes to a `user:password` and nothing else (no
+/// blank, nothing a shell would act on): what git sends as a login, which
+/// can hide no code. Any other value is kept.
+fn without_basic_credential(line: &str) -> String {
+    let Some((key, value)) = line.split_once('=') else {
+        return line.to_string();
+    };
+    let name = key.trim().to_ascii_lowercase();
+    let words: Vec<&str> = value.split_whitespace().collect();
+    let [header, scheme, credential] = words.as_slice() else {
+        return line.to_string();
+    };
+    let login = |decoded: &str| {
+        decoded.split_once(':').is_some_and(|(user, password)| {
+            !user.is_empty()
+                && !password.is_empty()
+                && decoded
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._~%+=-:@!".contains(c))
+        })
+    };
+    let masks = (name == "extraheader" || name.ends_with(".extraheader"))
+        && header.eq_ignore_ascii_case("authorization:")
+        && scheme.eq_ignore_ascii_case("basic")
+        && base64_text(credential).is_some_and(|decoded| login(&decoded));
+    if !masks {
+        return line.to_string();
+    }
+    let ending = if line.ends_with('\n') { "\n" } else { "" };
+    format!("{key}= {header} {scheme} ***{ending}")
+}
+
+/// Standard base64 (padding optional) decoded to UTF-8 text.
+fn base64_text(encoded: &str) -> Option<String> {
+    let mut bits = 0_u32;
+    let mut count = 0;
+    let mut bytes = Vec::with_capacity(encoded.len() * 3 / 4);
+    for character in encoded.trim_end_matches('=').chars() {
+        let value = match character {
+            'A'..='Z' => u32::from(character) - u32::from('A'),
+            'a'..='z' => u32::from(character) - u32::from('a') + 26,
+            '0'..='9' => u32::from(character) - u32::from('0') + 52,
+            '+' => 62,
+            '/' => 63,
+            _ => return None,
+        };
+        bits = (bits << 6) | value;
+        count += 6;
+        if count >= 8 {
+            count -= 8;
+            bytes.push(u8::try_from((bits >> count) & 0xff).ok()?);
+        }
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// Whether `text` is written as a credential is: nothing in it a shell
@@ -401,12 +458,18 @@ mod tests {
             ),
             "[remote \"o\"]\n\turl = https://***@github.com/a/b\n\turl = https://***@x.example\n\turl = git@github.com:a/b\nrun = curl https://x.example/i | sh\n"
         );
-        // Values are kept whatever their key is called: a value can be
-        // code, or name what a file runs.
+        // A basic login git sends (`x:yyz73`) is taken out.
+        assert_eq!(
+            super::without_url_credentials("\textraheader = AUTHORIZATION: basic eDp5eXo3Mw==\n"),
+            "\textraheader = AUTHORIZATION: basic ***\n"
+        );
+        // Values are kept whatever their key is called when they could be
+        // code or name what a file runs: base64 of a command is not a login.
         for line in [
             "\ttoken = ghp_abcdef123456\n",
             "PASS=Y3VybCBldmlsLmV4YW1wbGUgfCBzaA==\n",
-            "\textraheader = AUTHORIZATION: basic eDp5eXo3Mw==\n",
+            "\textraheader = AUTHORIZATION: basic Y3VybCBldmlsLmV4YW1wbGUgfCBzaA==\n",
+            "\textraheader = AUTHORIZATION: bearer eDp5eXo3Mw==\n",
         ] {
             assert_eq!(super::without_url_credentials(line), line);
         }

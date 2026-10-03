@@ -153,11 +153,14 @@ into the files a shell start-up file reads in with `source` or `.` and
 the programs its statements start by a path (on lines up to 4 KB), a unit's `EnvironmentFile=`, and a Hyprland `.conf`'s
 `source`, `plugin` and `bind … exec` lines. A bare command name is looked
 for in `~/.local/bin`, `~/.cargo/bin`, `~/bin`, `/usr/local` and
-`/usr/bin`, and every place it is found in is judged; `~`, `$HOME`, `%h` and the XDG directories at their default
-places are understood, other variables are not, and a Hyprland `source`
-with `*` in it is not followed. The file itself is always reviewed as
-text; what is not followed is only the extra look at the program it
-names. A link of the same name to a packaged file is trusted only
+`/usr/bin`, and every place it is found in is judged; `~`, `$HOME`, `%h`,
+the XDG directories at their default places and a path a start-up file
+puts in a variable of its own (`TOOLS=~/opt/tools`, then `$TOOLS/run`)
+are understood, other variables are not. A Hyprland `source` with `*` or
+`?` in its last part is followed to the files it matches (up to 64). The
+file itself is always reviewed as text; what is not followed is only the
+extra look at the program it names. A link of the same name to a
+packaged file is trusted only
 where that is how the thing is enabled (a unit in a systemd unit
 directory, a hook in pacman's, a launcher in an autostart directory, a
 program of `/usr/bin` or `/usr/lib` in `~/.local/bin` or `~/.cargo/bin`)
@@ -277,9 +280,10 @@ own search for set-id files too, it reaches by entering each directory as
 it opened it, so one swapped for a link while it reads is not followed.
 Old password hashes
 (`/etc/security/opasswd`) are never read. Root's view only fills in what
-your own sweep could not read. Those root-only files include the crontabs
-of other accounts on the machine: whoever may read the results reads
-those too. In what is sent for review, the values of assignments that look
+your own sweep could not read. Crontabs of other accounts are left out of
+the results (a note says how many): only root's, and those of the
+accounts in the group allowed to read them (or, for `sweep --root`, yours)
+come back. In what is sent for review, the values of assignments that look
 like secrets and the passwords of addresses (`https://user:password@…`)
 are taken out, where they are written as plain characters: one with `$`,
 a backtick or the like in it could be code a shell runs, and stays to be
@@ -365,13 +369,20 @@ through the list with your agent without waiting for the daily sweep.
   `sweep allow` uses their latest results.
 - What cannot be read at all (a program that exists only in memory, a
   deleted file) cannot be allowed; it stays listed while it runs.
-- The list of allowed items lives with the review memory
-  (`~/.local/state/omarchy-guardian/sweep/allowed.json`, private to you),
-  and so does what the scheduled sweeps have already told you about
-  (`told.json`). Both are your own files: a program already running as
-  you can add to them and so quiet a notification or an alert. The sweep
-  is there to show what was put on the machine, not to hold against code
-  that already runs as you with your rights.
+- Items in your home are allowed in a list that lives with the review
+  memory (`~/.local/state/omarchy-guardian/sweep/allowed.json`, private to
+  you). Anything else is allowed in the system's own list
+  (`/var/lib/omarchy-guardian/sweep/allowed.json`), which only root
+  writes: `sweep allow` and `sweep forget` ask for the sudo password for
+  those, and an entry for a system item in your own list does not count
+  (a sweep says how many such entries an older Guardian left there).
+  A program running as you cannot quiet an alert about the system that
+  way.
+- What the scheduled sweeps have already told you about (`told.json`) is
+  your own file too, since the sweep that writes it runs as you: a
+  program already running as you can add to it and so quiet a
+  notification for something new in your home or the system. The alert
+  itself, and the bar, still show it.
 - `--diff` compares with the last sweep. An item that could not be read
   then and can be now (the root checks arrived) is not a change by
   itself, unless it now raises an alert; it is judged like any other in
@@ -579,8 +590,9 @@ file larger than a chunk is split on line boundaries, each piece repeating
 the end of the one before; a single line longer than a chunk is cut the same
 way, so nothing is hidden by sitting exactly on a cut. The first chunk runs
 alone; the rest run three at a time. A run that finds the AI unavailable (a
-provider error, not a timeout) is retried once after two seconds; if it still
-fails, chunks not yet started are not attempted. A source that needs
+provider error, not a timeout) is retried once after two seconds, and so is
+a reply that does not echo the run's nonce (models drop it now and then);
+if it still fails, chunks not yet started are not attempted. A source that needs
 more than `max_chunks` chunks of `max_input_kib` is not reviewed at all
 (`INCOMPLETE`): a partial AI review is never presented as a review of the
 whole source.
@@ -681,10 +693,14 @@ review it in full every time.
   command continued over several lines (a trailing backslash, pipe or `&&`,
   or a pipe opening the next line) is also judged as the one line a shell
   reads, and a download saved to a file that the same file later runs or
-  sources counts as download-and-run. These rules read text, not meaning: a
-  command assembled from variables, or a download run from another file,
-  is left to the AI review. Prose, comments and messages are still sent to
-  the AI review.
+  sources counts as download-and-run, also when one file downloads and
+  another runs what it saved. A fetcher or a shell kept in a variable
+  (`F=curl` … `$F … | $S`) is read as what it is. These rules read text,
+  not meaning: a command assembled any other way is left to the AI
+  review. A file a reviewed script runs or reads in (`sh ./data/x.png`,
+  `. ./lib`, `python3 tool.py`) that Guardian could only hash makes the
+  review incomplete: it runs, and nobody read it. Prose, comments and
+  messages are still sent to the AI review.
 - **Network destinations:** literal HTTP(S) hosts in code and runtime config,
   flagging cleartext HTTP and hard-coded IP addresses. A PKGBUILD's `url=`
   homepage (never fetched), XML namespace, DTD and schema identifiers are not
@@ -725,9 +741,12 @@ Git LFS pointers and an invalid or inconclusive AI reply all make the review
 provider error, a timeout) follows the class's `ai` setting instead: `WARNED`
 for `official` under `standard`, blocked everywhere else. A provider that
 answers that the request is too long for the model is not unavailable:
-that review is incomplete. A timeout cannot be told from a slow provider,
-so it counts as unavailable and follows the class's `ai` setting; set
-`ai = optional` only for sources you already trust. In `.git`, only the
+that review is incomplete. A run that times out before the model starts
+on the source is unavailable. One that times out after the model had it
+is not, since a source can be written to keep a reviewer busy: that
+review is invalid and blocks, except for the `official` class, whose
+content nobody writing such a source chooses, where it counts as
+unavailable. In `.git`, only the
 `config` (checked locally for keys that make git run a command, such as
 `core.fsmonitor`, filters and `!` aliases, and never sent to the AI; also
 `config.worktree`) and hooks other than git's `.sample` files are reviewed.
@@ -736,10 +755,12 @@ included (past six levels the review is incomplete), and so is a
 directory laid out as a repository under another name: its `config` is
 checked the same way, and is also reviewed like any other file (a build
 could run it as something else) with the user and password of every
-address in it taken out. Other values are kept whatever their key is
-called, since a value can be code or name what a file runs: a token
-written there (an `extraHeader`, say) is seen by the AI provider, and so
-is a password with characters other than letters, digits and `._~%+=-:`.
+address in it taken out, and so is an `extraHeader` login
+(`Authorization: basic …` that decodes to a plain `user:password`). Other
+values are kept whatever their key is called, since a value can be code
+or name what a file runs: another token written there (a bearer token,
+say) is seen by the AI provider, and so is a password with characters
+other than letters, digits and `._~%+=-:`.
 A `.git` given as a file or a link, a linked `config`, hooks or submodules behind a link, a
 `commondir` (which makes git read another directory's configuration and
 hooks), and such a `config` that cannot be read make the review
@@ -749,9 +770,9 @@ its first line is not passed over as binary: it makes the review
 incomplete. A file with a UTF-16 mark is read as UTF-16 only where
 that gives mostly ASCII text; otherwise it is read by its bytes, which for
 UTF-16 text in another script means hashed only. A file that opens like a
-known format and holds NUL bytes near its start is
-taken as that format and only hashed, even if text follows; a script that
-runs such a file names it, and that is what the review sees. A top-level `target`,
+known format and holds NUL bytes near its start is taken as that format
+and only hashed, even if text follows; if a reviewed script runs or reads
+it in, the review is incomplete (see above). A top-level `target`,
 `node_modules` or `.venv` that carries its tool's marker file
 (`CACHEDIR.TAG`, `.package-lock.json`, `pyvenv.cfg`…) is skipped unless
 `--thorough` is given; the skip is listed under "Not reviewed", its file
@@ -896,10 +917,13 @@ An auto-run file that is a symbolic link to a file the package does not
 ship (a sudoers drop-in linked to `/usr/lib/other/rule`) is reviewed as
 the file it leads to: as another package of the same transaction ships
 it, or as it is on this system now when root alone could have put it
-there and may change it. A link to a device (`/dev/null`, which masks a
-unit) or the kernel's own files is only noted. A link to a file that
-neither has, one someone else can change, or one the transaction puts
-there as something else, makes the review incomplete.
+there and may change it; at every link on the way there, what the
+transaction puts in that place counts. An unchanged link is reviewed
+again when the transaction replaces the file it leads to. A link to a
+device (`/dev/null`, which masks a unit) or the kernel's own files is
+only noted. A link to a file that neither has, one someone else can
+change, or one the transaction puts there as something else, makes the
+review incomplete.
 
 What the gate does not see: a package's other files are installed as shipped
 and acted on by what is already on the system (a pacman hook, DKMS or a
@@ -1034,7 +1058,11 @@ gate does, in order:
    can tell that it is only being listed: one written to list harmless
    sources there and others when it is built, or to move `SRCDEST` in a
    way the recipe checks do not recognise, gets its real sources past this
-   step. Only the review of the recipe's own text stands against that. The
+   step. Where the recipe writes its `source` arrays out plainly (with at
+   most makepkg's own `$pkgname`, `$pkgbase`, `$pkgver`, `$pkgrel`), the
+   listing must give exactly those, or the build is blocked as
+   incomplete; a recipe that computes its sources is left to the review
+   of its own text. The
    build itself then runs with `--holdver`, so it does not fetch newer VCS
    sources than were reviewed; its `pkgver()` does run, on reviewed code.
    The AI then reviews the
@@ -1044,7 +1072,9 @@ gate does, in order:
    first, then other code by depth, up to 1 MiB. Data and documentation
    (`.json`, `.md`, `.txt`…) are left out, and so is a file over 2 MiB that
    is not a build file or script (a bundled `.js`, say): it is counted and
-   named to the AI as left out, not read. `node_modules`, `.venv`, CI and
+   named to the AI as left out, not read; if the upstream code runs or
+   reads in such a file, or a binary (`sh ./tool.bin`, `node big.js`),
+   the review is incomplete. `node_modules`, `.venv`, CI and
    development-container directories are reviewed last. git's own objects
    are not source, but git and Mercurial run what their metadata says on
    the commands a build often uses (`git describe`): a `.git` whose

@@ -158,6 +158,14 @@ fn allow(label: &str, settings: &Settings) -> Result<String, String> {
             "{label} cannot be read, so it cannot be allowed as it is"
         ));
     }
+    // Something outside the home is allowed in root's list, through sudo:
+    // a program running as you cannot quiet it.
+    if !state::is_home_label(label) {
+        root::system_allow(&["--add", label, &state::fingerprint(item)])?;
+        return Ok(format!(
+            "Allowed {label} for this system as it is now; if it changes, the sweep shows it again."
+        ));
+    }
     let directory = state_directory()?;
     let mut allowed = state::allowed(&directory);
     allowed.insert(label.to_string(), state::fingerprint(item));
@@ -168,6 +176,30 @@ fn allow(label: &str, settings: &Settings) -> Result<String, String> {
 }
 
 fn forget(label: Option<&str>) -> Result<String, String> {
+    if let Some(label) = label.filter(|label| !state::is_home_label(label)) {
+        // An entry an older Guardian kept in the user's own list counted
+        // for nothing; it goes either way.
+        let directory = state_directory()?;
+        let mut own = state::allowed(&directory);
+        let stale = own.remove(label).is_some();
+        if stale {
+            state::save_allowed(&directory, &own)?;
+        }
+        if !state::system_allowed(Path::new(state::SYSTEM_ALLOWED)).contains_key(label) {
+            return if stale {
+                Ok(format!("{label} is no longer allowed."))
+            } else {
+                Err(format!(
+                    "{label} is not in the system's list of allowed items"
+                ))
+            };
+        }
+        root::system_allow(&["--remove", label])?;
+        return Ok(format!("{label} is no longer allowed."));
+    }
+    if label.is_none() && !state::system_allowed(Path::new(state::SYSTEM_ALLOWED)).is_empty() {
+        root::system_allow(&["--clear"])?;
+    }
     let directory = state_directory()?;
     let mut allowed = state::allowed(&directory);
     match label {
@@ -467,6 +499,28 @@ fn save_report(collection: &Collection, decision: Decision) {
     }
 }
 
+/// Marks the items allowed in the user's list (home) and the system's
+/// (everything else), and says how many system entries an older Guardian
+/// left in the user's own list, which count for nothing now.
+fn apply_allowed(
+    items: &mut [collect::Item],
+    directory: &Path,
+    label: &dyn Fn(&collect::Item) -> String,
+    notes: &mut Vec<String>,
+) {
+    let allowed = state::all_allowed(directory, Path::new(state::SYSTEM_ALLOWED));
+    state::apply_allowed(items, &allowed, label);
+    let left = state::allowed(directory)
+        .keys()
+        .filter(|label| !state::is_home_label(label))
+        .count();
+    if left > 0 {
+        notes.push(format!(
+            "{left} system item(s) you allowed before are no longer allowed from your own list: allow them again with `sweep allow` (it asks for the sudo password), or drop them with `sweep forget`"
+        ));
+    }
+}
+
 /// `omarchy-guardian sweep`.
 fn run(options: Options, settings: &Settings) -> ExitCode {
     let home = home();
@@ -486,7 +540,7 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
         .ok();
     let label = |item: &collect::Item| judge::label(item, home.as_deref());
     if let Some(directory) = &directory {
-        state::apply_allowed(&mut collection.items, &state::allowed(directory), label);
+        apply_allowed(&mut collection.items, directory, &label, &mut notes);
     }
 
     let state_root = Store::default_root();

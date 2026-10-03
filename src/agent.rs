@@ -114,12 +114,18 @@ pub enum AgentError {
     Unavailable(Error),
     /// Malformed events or reply, missing nonce, tool use, oversized output.
     Invalid(Error),
+    /// The model had the source and ran out of time reviewing it. A source
+    /// can be written to keep a reviewer busy, so this is no absent
+    /// reviewer either: the caller treats it as invalid, except for the
+    /// official repositories, whose content is not chosen by whoever could
+    /// write such a source.
+    OutOfTime(Error),
 }
 
 impl AgentError {
     pub fn into_error(self) -> Error {
         match self {
-            Self::Unavailable(error) | Self::Invalid(error) => error,
+            Self::Unavailable(error) | Self::Invalid(error) | Self::OutOfTime(error) => error,
         }
     }
 }
@@ -344,6 +350,9 @@ fn claude_verdict(
             )));
         }
         return Err(match failure {
+            Some(detail) if delivered && detail == TIMED_OUT => {
+                AgentError::OutOfTime(out_of_time())
+            }
             Some(detail) if delivered => AgentError::Invalid(Error::Refused(format!(
                 "the AI saw the source and the review then failed ({detail}); retry"
             ))),
@@ -399,6 +408,16 @@ fn claude_verdict(
         )));
     }
     parse_review(text, nonce).map_err(AgentError::Invalid)
+}
+
+/// What a run stopped by the timeout reports as its failure.
+const TIMED_OUT: &str = "timed out";
+
+fn out_of_time() -> Error {
+    Error::Refused(
+        "the AI saw the source and ran out of time reviewing it; retry, or raise timeout_secs"
+            .into(),
+    )
 }
 
 /// Whether a provider's error says the request itself was too much for
@@ -613,6 +632,9 @@ fn verdict(
             "the AI saw the source and then declined or failed to review it ({message}); retry"
         ))));
     }
+    if events.delivered && failure.as_deref() == Some(TIMED_OUT) {
+        return Err(AgentError::OutOfTime(out_of_time()));
+    }
     // Wherever it is said: as an error event, or as the reason the run
     // failed.
     if let Some(message) = [events.error.as_deref(), failure.as_deref()]
@@ -646,14 +668,16 @@ fn strip_code_fence(text: &str) -> &str {
     body.strip_suffix("```").map_or(trimmed, str::trim)
 }
 
+/// Why a reply without this run's nonce is refused; the engine asks once
+/// more when it sees it.
+pub const NONCE_MISSING: &str =
+    "the reply does not echo this run's nonce, so it was not based on the supplied source";
+
 pub fn parse_review(text: &str, nonce: &str) -> Result<AgentReview, Error> {
     let value = Json::parse(strip_code_fence(text))
         .map_err(|error| Error::parse("the OpenCode security report", error))?;
     if value.get("nonce").and_then(Json::as_str) != Some(nonce) {
-        return Err(Error::parse(
-            "the OpenCode security report",
-            "the reply does not echo this run's nonce, so it was not based on the supplied source",
-        ));
+        return Err(Error::parse("the OpenCode security report", NONCE_MISSING));
     }
     review_from_json(&value)
 }
@@ -835,7 +859,7 @@ mod tests {
         let began = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"{"}]}}"#;
         assert!(matches!(
             claude_verdict(began, Some("timed out".into()), "n1"),
-            Err(AgentError::Invalid(_))
+            Err(AgentError::OutOfTime(_))
         ));
         // The nonce must be echoed.
         assert!(matches!(
@@ -905,6 +929,20 @@ mod tests {
             Err(AgentError::Invalid(_))
         ));
         assert!(matches!(judge("not json"), Err(AgentError::Invalid(_))));
+        // Out of time after the model had the source: not an absent
+        // reviewer; before it, a slow provider.
+        assert!(matches!(
+            verdict(
+                scan_events(r#"{"type":"step_start"}"#),
+                Some("timed out".into()),
+                "n"
+            ),
+            Err(AgentError::OutOfTime(_))
+        ));
+        assert!(matches!(
+            verdict(scan_events(""), Some("timed out".into()), "n"),
+            Err(AgentError::Unavailable(_))
+        ));
         // A request the model cannot take is the source's doing, not an
         // absent reviewer.
         assert!(matches!(

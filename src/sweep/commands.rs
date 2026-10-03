@@ -114,12 +114,24 @@ pub fn commands(category: Category, path: &str, text: &str) -> Vec<String> {
             hyprland_conf(text)
         };
     }
+    let variables = if category == Category::Shell {
+        path_variables(text)
+    } else {
+        Vec::new()
+    };
     let mut found = Vec::new();
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('#') || line.starts_with(';') {
             continue;
         }
+        let expanded = crate::rules::with_variables(line, &variables);
+        // A line that grew past what is looked at is read as written.
+        let line = if expanded.len() > MAX_STARTED_LINE {
+            line
+        } else {
+            expanded.as_str()
+        };
         let command = match category {
             Category::Udev => udev(line),
             Category::Kernel => modprobe(line),
@@ -135,6 +147,105 @@ pub fn commands(category: Category, path: &str, text: &str) -> Vec<String> {
         found.extend(command);
     }
     found
+}
+
+/// Variables a shell start-up file sets to a path (`TOOLS=~/opt/tools`,
+/// `export BIN="$HOME/bin"`), so `$TOOLS/run` is looked at as that path.
+fn path_variables(text: &str) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim_matches(['"', '\'']);
+        let is_name = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        let is_path = ["/", "~/", "$HOME/", "${HOME}/"]
+            .iter()
+            .any(|start| value.starts_with(start));
+        // No other variable in it: written out once, a path never grows
+        // into more paths.
+        let rest = value
+            .strip_prefix("$HOME")
+            .or_else(|| value.strip_prefix("${HOME}"))
+            .unwrap_or(value);
+        if is_name
+            && name != "HOME"
+            && is_path
+            && !value.contains(char::is_whitespace)
+            && !rest.contains(['$', '`'])
+        {
+            found.retain(|(known, _)| known != name);
+            found.push((name.to_string(), value.to_string()));
+            if found.len() > MAX_PATH_VARIABLES {
+                found.remove(0);
+            }
+        }
+    }
+    found
+}
+
+/// The most path variables one start-up file keeps.
+const MAX_PATH_VARIABLES: usize = 32;
+
+/// The files a pattern (`~/.config/hypr/conf.d/*.conf`) names: `*` and `?`
+/// in its last part only, matched against what `list` says the directory
+/// holds, at most `MAX_GLOB` of them.
+pub fn glob_targets(home: &str, pattern: &str, list: &dyn Fn(&str) -> Vec<String>) -> Vec<String> {
+    let expanded = expand(home, pattern.trim());
+    let Some(absolute) = expanded.strip_prefix('/') else {
+        return Vec::new();
+    };
+    let (directory, last) = absolute.rsplit_once('/').unwrap_or(("", absolute));
+    if directory.contains(['*', '?'])
+        || !last.contains(['*', '?'])
+        || absolute.contains(char::is_whitespace)
+    {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = list(directory)
+        .into_iter()
+        .filter(|name| glob_match(last, name))
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .take(MAX_GLOB)
+        .map(|name| format!("{directory}/{name}"))
+        .collect()
+}
+
+/// The most files one pattern stands for.
+const MAX_GLOB: usize = 64;
+
+/// Whether `name` matches `pattern` (`*` any run, `?` one character). A
+/// name starting with `.` matches only a pattern that does, as in a shell.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    if name.starts_with('.') && !pattern.starts_with('.') {
+        return false;
+    }
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    let (mut p, mut n) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while n < name.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == name[n]) {
+            p += 1;
+            n += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some((p, n));
+            p += 1;
+        } else if let Some((star_at, matched)) = star {
+            p = star_at + 1;
+            n = matched + 1;
+            star = Some((star_at, matched + 1));
+        } else {
+            return false;
+        }
+    }
+    pattern[p..].iter().all(|character| *character == '*')
 }
 
 /// The files a line of a shell start-up file reads in: `source file` and
@@ -235,7 +346,8 @@ fn started(line: &str) -> Vec<String> {
                     | "{"
                     | "("
             ) || (word.contains('=') && !is_path(word))
-                || word.ends_with(')')
+                // A `case` pattern (`x)`), not a subshell's last program.
+                || (word.ends_with(')') && !is_path(word.trim_end_matches(')')))
                 || word.starts_with(['>', '<'])
                 || word.starts_with('-'))
         });
@@ -463,7 +575,7 @@ fn hyprland_conf(text: &str) -> Vec<String> {
                 "exec" | "exec-once" | "execr" | "execr-once" | "exec-shutdown" | "plugin" => {
                     Some(value.to_string())
                 }
-                "source" => (!value.contains('*')).then(|| value.to_string()),
+                "source" => Some(value.to_string()),
                 key if key.starts_with("bind") => {
                     // `bindd` and its like carry a description before the
                     // dispatcher.
@@ -787,6 +899,53 @@ mod tests {
     }
 
     #[test]
+    fn patterns_variables_and_subshells_lead_to_their_files() {
+        use super::glob_targets;
+        let list = |directory: &str| {
+            assert_eq!(directory, "home/u/.config/hypr/conf.d");
+            vec![
+                "a.conf".to_string(),
+                "b.conf".to_string(),
+                "notes.md".to_string(),
+                ".hidden.conf".to_string(),
+            ]
+        };
+        assert_eq!(
+            glob_targets("home/u", "~/.config/hypr/conf.d/*.conf", &list),
+            [
+                "home/u/.config/hypr/conf.d/a.conf",
+                "home/u/.config/hypr/conf.d/b.conf"
+            ]
+        );
+        assert!(glob_targets("home/u", "~/x/*/y.conf", &|_| Vec::new()).is_empty());
+        assert_eq!(
+            commands(
+                Category::Hyprland,
+                "home/u/.config/hypr/hyprland.conf",
+                "source = ~/.config/hypr/conf.d/*.conf\n"
+            ),
+            ["~/.config/hypr/conf.d/*.conf"]
+        );
+        // A variable that names others is not written out: no growth.
+        let mut grow = (0..32)
+            .map(|index| format!("V{index}=/x{}", format!("$V{}", index + 1).repeat(20)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        grow.push('\n');
+        grow.push_str("$V0/run\n");
+        assert!(commands(Category::Shell, "home/u/.bashrc", &grow).len() <= 1);
+        // A path in a variable, and a subshell's last program.
+        assert_eq!(
+            commands(
+                Category::Shell,
+                "home/u/.bashrc",
+                "TOOLS=~/opt/tools\n$TOOLS/agent &\n(cd /tmp && ~/bin/y)\n",
+            ),
+            ["~/opt/tools/agent", "~/bin/y"]
+        );
+    }
+
+    #[test]
     fn what_a_start_up_file_or_a_command_line_names_is_found() {
         // A program a shell start-up file runs by its path.
         assert_eq!(
@@ -1026,7 +1185,9 @@ mod tests {
                 "wpctl set-mute",
                 "uwsm-app -- foot",
                 "/tmp/evil.so",
-                "~/.config/hypr/extra.txt"
+                "~/.config/hypr/extra.txt",
+                // A pattern is listed; the collector looks it up.
+                "~/.config/hypr/conf.d/*"
             ]
         );
         // SSH: `=` or blanks, commands and libraries.

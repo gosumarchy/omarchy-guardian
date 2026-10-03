@@ -101,6 +101,8 @@ pub enum Sent {
     Whole,
     Diff,
     Unchanged,
+    /// An unchanged file sent whole because a changed one names it.
+    Named,
     Removed,
     /// A binary file Guardian hashed but did not send.
     HashOnly,
@@ -114,6 +116,7 @@ impl Sent {
             Self::Whole => "whole",
             Self::Diff => "diff",
             Self::Unchanged => "unchanged",
+            Self::Named => "unchanged-sent",
             Self::Removed => "removed",
             Self::HashOnly => "hash-only",
             Self::Skipped => "skipped",
@@ -347,6 +350,8 @@ fn is_top_level(path: &str, unit_prefixes: &[String]) -> bool {
 
 enum Choice {
     Whole,
+    /// Unchanged, and sent whole because a change names it.
+    Named,
     Diff(String),
     Unchanged,
 }
@@ -465,12 +470,16 @@ fn build_with(input: &PlanInput<'_>, extras: bool) -> Result<Plan, TooLarge> {
                     entry_point: Some(file.path.clone()),
                 });
             }
-            Choice::Whole => {
+            Choice::Whole | Choice::Named => {
                 items.push(Item::Whole {
                     path: file.path.clone(),
                     content: file.content.clone(),
                 });
-                Sent::Whole
+                if matches!(choice, Choice::Named) {
+                    Sent::Named
+                } else {
+                    Sent::Whole
+                }
             }
             Choice::Diff(diff) => {
                 items.push(Item::Diff {
@@ -554,7 +563,7 @@ fn send_what_a_change_names(
         let cost = file.path.len() + weight(&file.content);
         if cost <= room {
             room -= cost;
-            *choice = Choice::Whole;
+            *choice = Choice::Named;
         }
     }
 }
@@ -847,11 +856,11 @@ mod tests {
                 ("src/a.c", Sent::Whole),
                 ("src/b.c", Sent::Diff),
                 // Named without its extension, as a module is.
-                ("src/helper.py", Sent::Whole),
+                ("src/helper.py", Sent::Named),
                 ("src/listed.c", Sent::Unchanged),
                 ("src/main.c", Sent::Whole),
                 ("src/other.c", Sent::Unchanged),
-                ("src/payload.c", Sent::Whole),
+                ("src/payload.c", Sent::Named),
             ]
         );
     }

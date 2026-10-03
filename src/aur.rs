@@ -264,6 +264,116 @@ pub const CHECKSUMS: &[&str] = &[
     "b2sums",
 ];
 
+/// The recipe's source entries as written, when every one is plain text
+/// once makepkg's own `pkgname`, `pkgbase`, `pkgver` and `pkgrel` (from
+/// the listing) are put in: `None` when any is computed, when an array is
+/// set more than once, added to, set inside a block (indented), or is for
+/// an architecture the listing does not name, since the text then says
+/// nothing sure.
+pub fn literal_sources(recipe: &str, srcinfo: &str) -> Option<Vec<String>> {
+    let value = |key: &str| {
+        srcinfo.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix(key)
+                .and_then(|rest| rest.strip_prefix(" = "))
+                .map(str::to_string)
+        })
+    };
+    let known: Vec<(String, String)> = ["pkgname", "pkgbase", "pkgver", "pkgrel"]
+        .iter()
+        .filter_map(|name| Some(((*name).to_string(), value(name)?)))
+        .collect();
+    let arches: Vec<&str> = srcinfo
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("arch = "))
+        .collect();
+    let lines: Vec<&str> = recipe.lines().collect();
+    let mut entries = Vec::new();
+    let mut arrays: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        index += 1;
+        let trimmed = line.trim_start();
+        let Some(after) = trimmed.strip_prefix("source") else {
+            continue;
+        };
+        let name_end = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(after.len());
+        let (suffix, tail) = after.split_at(name_end);
+        if !(suffix.is_empty() || suffix.starts_with('_')) {
+            continue;
+        }
+        if tail.starts_with("+=") {
+            return None;
+        }
+        let Some(list) = tail.strip_prefix("=(") else {
+            continue;
+        };
+        // Set inside a block, or for an architecture the listing leaves
+        // out: what the build uses is not plain from the text.
+        let arch = suffix.trim_start_matches('_');
+        if trimmed.len() != line.len() || (!arch.is_empty() && !arches.contains(&arch)) {
+            return None;
+        }
+        let name = format!("source{suffix}");
+        if arrays.contains(&name) {
+            return None;
+        }
+        arrays.push(name);
+        // The array runs to the first `)` outside a comment.
+        let mut part = list;
+        loop {
+            // A comment starts at a `#` after a blank, or at the start.
+            let code = part
+                .char_indices()
+                .find(|&(at, character)| {
+                    character == '#' && (at == 0 || part[..at].ends_with(char::is_whitespace))
+                })
+                .map_or(part, |(at, _)| &part[..at]);
+            let (words, closed) = match code.find(')') {
+                Some(end) => (&code[..end], true),
+                None => (code, false),
+            };
+            for word in words.split_whitespace() {
+                if word == "\\" {
+                    continue;
+                }
+                // Quoted as a whole, or not at all: anything else (a blank
+                // inside quotes, `"a"::b`) is not read as plain text.
+                let quoted = word.len() >= 2
+                    && ((word.starts_with('"') && word.ends_with('"'))
+                        || (word.starts_with('\'') && word.ends_with('\'')));
+                let inner = if quoted {
+                    &word[1..word.len() - 1]
+                } else {
+                    word
+                };
+                if inner.contains(['"', '\'', '\\']) {
+                    return None;
+                }
+                // In single quotes nothing is expanded.
+                let word = if word.starts_with('\'') {
+                    inner.to_string()
+                } else {
+                    crate::rules::with_variables(inner, &known)
+                };
+                if word.contains(['$', '`']) {
+                    return None;
+                }
+                entries.push(word);
+            }
+            if closed {
+                break;
+            }
+            part = lines.get(index)?;
+            index += 1;
+        }
+    }
+    (!arrays.is_empty()).then_some(entries)
+}
+
 /// The sources of `makepkg --printsrcinfo` output, each paired with its
 /// checksums of every algorithm, per architecture.
 pub fn parse_srcinfo(text: &str) -> Vec<Source> {
@@ -1445,7 +1555,7 @@ mod tests {
 
     use super::{
         AurInfo, Invocation, Roots, Source, check_sources, classify, collect_upstream,
-        parse_rpc_info, parse_srcinfo, trust_signals,
+        literal_sources, parse_rpc_info, parse_srcinfo, trust_signals,
     };
     use crate::json::Json;
     use crate::test_support::TempDir;
@@ -1906,6 +2016,60 @@ pkgname = demo
                 .iter()
                 .any(|gap| gap.contains("more than 3 entries"))
         );
+    }
+
+    #[test]
+    fn sources_written_out_plainly_are_read_from_the_recipe() {
+        let srcinfo =
+            "pkgbase = demo\n\tpkgver = 1.2\n\tpkgrel = 1\n\tarch = x86_64\npkgname = demo\n";
+        assert_eq!(
+            literal_sources(
+                "pkgname=demo\npkgver=1.2\nsource=(\"https://x.example/$pkgname-${pkgver}.tar.gz\" # the code\n        local.patch)\nsource_x86_64=(bin.tar)\n",
+                srcinfo
+            ),
+            Some(vec![
+                "https://x.example/demo-1.2.tar.gz".to_string(),
+                "local.patch".to_string(),
+                "bin.tar".to_string()
+            ])
+        );
+        // A comment after a tab holding `)`.
+        assert_eq!(
+            literal_sources("source=(a.tgz\n\tb.patch\t# note )\n\tc.patch)\n", srcinfo),
+            Some(vec![
+                "a.tgz".to_string(),
+                "b.patch".to_string(),
+                "c.patch".to_string()
+            ])
+        );
+        // A continued line, a comment holding `)`, and an array for an
+        // architecture the listing names.
+        assert_eq!(
+            literal_sources(
+                "arch=(x86_64)\nsource=(\"a.tar\" \\\n  # second (optional)\n  \"b.patch\")\nsource_x86_64=(c.tar)\n",
+                "pkgbase = demo\n\tarch = x86_64\n"
+            ),
+            Some(vec![
+                "a.tar".to_string(),
+                "b.patch".to_string(),
+                "c.tar".to_string()
+            ])
+        );
+        for recipe in [
+            "source=(a.tar)\nif true; then\n  source+=(b.patch)\nfi\n",
+            "if true; then\n  source=(b.patch)\nfi\n",
+            "source_i686=(old.tar)\n",
+            "source=(\"a b.tgz\")\n",
+            "source=(\"a\"::https://x.example/a)\n",
+            "source=(\"$pkgver_x\")\n",
+            "source=(\"$_url/x\")\n",
+            "source=(a)\nsource+=(b)\n",
+            "source=(a)\nsource=(b)\n",
+            "source=(`echo x`)\n",
+            "pkgname=x\n",
+        ] {
+            assert_eq!(literal_sources(recipe, srcinfo), None, "{recipe}");
+        }
     }
 
     #[test]

