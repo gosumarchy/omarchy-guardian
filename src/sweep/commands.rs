@@ -200,9 +200,14 @@ fn started(line: &str) -> Vec<String> {
         let words: Vec<String> = split(statement)
             .into_iter()
             .filter(|word| {
-                let inside = depth > 0 || ticked || word.contains("$(") || word.contains('`');
-                depth =
-                    (depth + word.matches('(').count()).saturating_sub(word.matches(')').count());
+                let opens = word.contains("$(");
+                let inside = depth > 0 || ticked || opens || word.contains('`');
+                // Only a substitution's own brackets count: a subshell
+                // `( ~/bin/y )` hides nothing.
+                if depth > 0 || opens {
+                    depth = (depth + word.matches('(').count())
+                        .saturating_sub(word.matches(')').count());
+                }
                 ticked ^= word.matches('`').count() % 2 == 1;
                 !inside
             })
@@ -788,7 +793,7 @@ mod tests {
             commands(
                 Category::Shell,
                 "home/u/.bashrc",
-                "export X=1\n~/bin/agent --daemon &\nexec /opt/x/run\neval \"$($HOME/bin/tool init)\"\nls -l\n[ -r ~/.x ] && . ~/.x\ncd /tmp && FOO=1 ~/bin/second\ntrue & A=\"b c\" nice ~/bin/third\nif ! ~/bin/fourth; then :; fi\nls >& /dev/null\nls &>/tmp/log\nX=$(find \"/etc/conf.d\" -name x)\nX=$(date) ~/bin/fifth\n",
+                "export X=1\n~/bin/agent --daemon &\nexec /opt/x/run\neval \"$($HOME/bin/tool init)\"\nls -l\n[ -r ~/.x ] && . ~/.x\ncd /tmp && FOO=1 ~/bin/second\ntrue & A=\"b c\" nice ~/bin/third\nif ! ~/bin/fourth; then :; fi\nls >& /dev/null\nls &>/tmp/log\nX=$(find \"/etc/conf.d\" -name x)\nX=$(date) ~/bin/fifth\n( ~/bin/sixth ) &\n",
             ),
             [
                 "~/bin/agent",
@@ -799,6 +804,7 @@ mod tests {
                 "~/bin/third",
                 "~/bin/fourth",
                 "~/bin/fifth",
+                "~/bin/sixth",
             ]
         );
         // A packaged start-up file that only reads a directory names no
