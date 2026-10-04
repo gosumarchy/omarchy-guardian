@@ -584,10 +584,20 @@ refused. Files are ranked by risk:
 3. Everything else, with documentation last.
 
 Each chunk is its own reviewer run with its own nonce, and every chunk carries
-the full file list, so the model knows what else exists. A file is charged
-what it takes in the request (a newline or a quote takes two bytes there and
-a control character six, a few percent more than the file's size for
-ordinary code). A
+the full file list, so the model knows what else exists. A chunk is judged
+on its own files, so a source that needs several is packed to keep together
+what belongs together: the files of one directory, and a file with the
+files it names, share a chunk where that takes no more chunks than packing
+by rank would. Each chunk is also told which local rules matched in the
+files of the other chunks (the rule, the file and the line, not the text),
+and the report lists the files that name a file sent in another chunk. That
+is the limit of it: a payload split over two files that land in different
+chunks is seen by no single request, and Guardian does not ask the model
+to report every call into another chunk, because any AI finding blocks and
+large honest sources are full of such calls. A file is charged
+what it takes in the request (a newline or a quote takes two bytes there, a
+control or invisible character six and one outside the basic plane twelve,
+a few percent more than the file's size for ordinary code). A
 file larger than a chunk is split on line boundaries, each piece repeating
 the end of the one before; a single line longer than a chunk is cut the same
 way, so nothing is hidden by sitting exactly on a cut. The first chunk runs
@@ -610,7 +620,10 @@ says the memory was not used and the review runs in full:
 
 - **Verdict cache.** A chunk already judged `clear` or `suspicious`, with the
   same prompt, model, variant, thinking level and class, is not sent again
-  for `cache_days` (default 30). Reports mark such chunks `from cache`.
+  for `cache_days` (default 30). Reports mark such chunks `from cache`. "The
+  same prompt" means its text: the key covers the system prompt, the
+  message and the whole request with its instructions, so a reworded prompt
+  never reuses an old verdict, whatever its version number says.
 - **Diff review of upgrades.** A review becomes the approved baseline of that
   source when every chunk was `clear`, there were no gaps, and the decision
   is `CLEAR`. The next review of the same source is then sent as follows:
@@ -619,25 +632,45 @@ says the memory was not used and the review runs in full:
   whole too while together they fit half a request, and the rest as
   unified diffs with twenty lines of context against the baseline; new
   files and entry points whole; and unchanged files only as names in the
-  file list, except the code files a new or changed file names
-  (`payload.c`, or `helper` for `helper.py`, in a changed `main.c`),
-  which are sent along while they fit half a request. If all that does
-  not fit in `max_chunks`, the changes alone are sent. What a
+  file list, except the files a new or changed file names, which are sent
+  along while they fit half a request. Any unchanged text file counts,
+  whatever it is (a test fixture, a build helper, a document), named by
+  its name (`payload.c`, or `helper` for `helper.py`), by a path
+  (`build-aux/run`), or by a glob or directory that covers it
+  (`tests/*.dat`, `hooks.d/`); a short name without an extension, such as
+  `run`, counts only as part of a path. When a named file does not fit,
+  the review is done in full if that fits `max_chunks`; if not, it stays
+  an upgrade review, and the model and the report are told which named
+  files were not sent. If the upgrade does not fit in `max_chunks` with
+  these extras, the changes alone are sent. What a
   change switches on in a file that is neither shown nor named this way
   is not seen in that review: it was reviewed when it was approved. Local
   rules and the dependency audit still read every file. A baseline only
-  counts under the prompt version, model, variant and thinking level that
-  approved it; after any of them changes, the next review is a full one.
+  counts under the prompt (its version and its wording), model, variant
+  and thinking level that approved it; after any of them changes, the
+  next review is a full one. A baseline also ages: after five upgrades
+  approved as diffs, or thirty days, since the source was last reviewed in
+  full, the next review is a full one, and so is the first review after an
+  update of Guardian from a version that did not keep that count.
   So is the review of a version in which a file Guardian does not read (a
   binary, a link) was added, changed or removed, of a tree with a skipped
-  generated directory, and of a version in which files were removed and
-  nothing else changed: what the unchanged text runs may no longer be what
+  generated directory, and of a version in which a file other than a
+  document was removed (or any file, when nothing else changed): what the
+  unchanged text runs may no longer be what
   was approved. When binaries or links differ, the AI is told which. An
   image is the exception, so a new wallpaper costs no AI call: the file
   must be named as one (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`), not be
   executable, and be one whole image from its first byte to its last by
   that format's own structure (a file that only starts like an image, or
-  has anything after it, does not count). Guardian still does not look at
+  has anything after it, does not count). It must also be plausibly
+  nothing but a picture: only the chunks and segments its format defines,
+  text and comments of at most 1 KiB each and 4 KiB together, other
+  metadata of at most 64 KiB, a colour profile of at most 1 MiB and an XMP
+  packet of at most 16 KiB, no block of text lines in its metadata, and no
+  line anywhere that a shell would act on (a shell asked to run a PNG does
+  run it). That last test is a heuristic over the file's bytes: now and
+  then it takes a real picture for one, which costs a full review, and it
+  cannot rule out every line a shell could run. Guardian still does not look at
   what an image shows, so this rests on the approved text not running
   files it was not sent, which its review is asked to report. A
   source identical to its baseline is answered from the cache when its first
@@ -723,7 +756,18 @@ review it in full every time.
   the source, so a reply that never saw the source, or stopped reading
   part-way, is rejected. The nonce shows the
   reply came from a model that was given this request; it cannot show how
-  carefully the source was read. Files that look sensitive by path (`.env*`, `*.env`,
+  carefully the source was read. In the request, every invisible or
+  text-reordering character of a file or a file name (control characters,
+  zero-width and bidirectional marks, variation selectors, Unicode tag
+  characters) is written as a `\u` escape: the model sees which character
+  was there, none reaches it raw, and none can draw a line that looks like
+  the end of the data. Nothing is removed or masked. The reply may also say
+  that the content speaks to its reviewer (an instruction, a verdict, a
+  nonce, a reason to stop reading, in a comment, a string, a document or a
+  file name). Guardian then adds a high finding of its own and the review
+  is not clear, even if the same reply says `clear`: a model that was
+  talked into a verdict is not taken at its word. A reply without that
+  field is read as before. Files that look sensitive by path (`.env*`, `*.env`,
   `*.tfvars`, SSH and cloud credentials, key files, names containing
   `secret`, `credential` or `token`) are withheld and make the review incomplete.
 - **Integrity:** a SHA-256 manifest of every scanned file. `guard` and
@@ -743,7 +787,11 @@ Git LFS pointers and an invalid or inconclusive AI reply all make the review
 provider error, a timeout) follows the class's `ai` setting instead: `WARNED`
 for `official` under `standard`, blocked everywhere else. A provider that
 answers that the request is too long for the model is not unavailable:
-that review is incomplete. A run that times out before the model starts
+that review is incomplete. Nor is one that refuses what it was sent (a
+usage-policy or safety refusal, a content filter, a guardrail): a source
+can be written to be refused, so that review is invalid and blocks in
+every class. A network or login error, a rate limit and an overloaded
+provider stay unavailable. A run that times out before the model starts
 on the source is unavailable. One that times out after the model had it
 is not, since a source can be written to keep a reviewer busy: that
 review is invalid and blocks, except for the `official` class, whose
@@ -786,9 +834,49 @@ External helpers are run by absolute path (`/usr/bin/curl`, `/usr/bin/bsdtar`,
 up in the absolute entries of `PATH` for `scan`, `guard` and `sandbox`. The
 pacman hook only accepts a root-owned `/usr/bin/opencode` or
 `/usr/local/bin/opencode`, because it gates a root transaction and a
-user-writable reviewer could be replaced by user-level malware. OpenCode must
+user-writable reviewer could be replaced by user-level malware. A reviewer
+found on `PATH` is refused, with the reason, when it or its directory can be
+written by group or others, or when it lies under `/tmp`, `/var/tmp`,
+`/dev/shm` or your cache directory (also behind a link). OpenCode must
 be configured with a working provider; source leaves the machine through that
 provider.
+
+The reviewer is given as little besides the request as its CLI allows.
+OpenCode runs from a new, empty, private directory (not from `/usr`, which
+packages write under), with the switches that stop it reading `AGENTS.md`,
+`CLAUDE.md`, `CONTEXT.md` and `opencode.json` from its directory and the
+ones above it, `~/.claude/CLAUDE.md` and Claude Code's skills, skills from
+other tools' directories and its default plugins
+(`OPENCODE_DISABLE_PROJECT_CONFIG`, `OPENCODE_DISABLE_CLAUDE_CODE` and its
+`_PROMPT` and `_SKILLS` forms, `OPENCODE_DISABLE_EXTERNAL_SKILLS`,
+`OPENCODE_DISABLE_DEFAULT_PLUGINS`), and without updating itself or
+downloading language servers. Neither reviewer inherits `NODE_OPTIONS`,
+`BUN_OPTIONS`, `NODE_TLS_REJECT_UNAUTHORIZED`, `LD_PRELOAD`,
+`LD_LIBRARY_PATH`, `LD_AUDIT` or `OPENCODE_PERMISSION`: they load code into
+the reviewer, switch off its TLS checks or lift the tool denials, and a
+review has no use for them. Variables that people do use, for a proxy,
+Bedrock or Vertex, are kept, and the report names the ones that were set
+(names only): `ANTHROPIC_BASE_URL`, `ANTHROPIC_BEDROCK_BASE_URL`,
+`ANTHROPIC_VERTEX_BASE_URL`, `CLAUDE_CONFIG_DIR`, `OPENCODE_CONFIG`,
+`OPENCODE_CONFIG_DIR`, `HTTPS_PROXY`, `ALL_PROXY`, `NODE_EXTRA_CA_CERTS`
+and `SSL_CERT_FILE`.
+
+What stays yours, and so in the hands of anything running as you: for
+your own sources, OpenCode's global configuration in `~/.config/opencode`
+(a provider's `baseURL`, a global `AGENTS.md`), and for every review the
+credentials in OpenCode's data directory, including "wellknown" logins,
+through which OpenCode fetches and merges configuration from that
+server. System-wide settings cannot be switched off either: Claude Code
+applies `/etc/claude-code/managed-settings.json` and
+`managed-settings.d/*.json` whatever `--setting-sources` says, and
+OpenCode merges `/etc/opencode/opencode.json` over the configuration
+Guardian passes. When such a file exists the report says the reviewer
+loads it. For the pacman gate, a file that sets an endpoint or base URL,
+a key or credential helper, environment, hooks or plugins (Claude Code),
+or providers, plugins, MCP servers, permissions, tools, agents,
+instructions or commands (OpenCode), or that Guardian cannot read as plain
+JSON, makes the review unavailable with that reason: Guardian cannot tell
+an administrator's policy from a file a package left there.
 
 ## Using Claude Code as the reviewer
 
@@ -810,7 +898,10 @@ directory; the request goes on stdin, and the reply is read as a
 permission denial, counts as a tool attempt and makes the review invalid;
 the extra turn the CLI adds to continue a reply its safety classifier
 interrupted does not. The reply must echo the nonce like OpenCode's. `thinking`
-becomes `--effort` directly.
+becomes `--effort` directly. Claude Code has no flag that leaves out the
+administrator's managed settings (`--setting-sources` covers user, project
+and local settings only), so those still apply; see above for what Guardian
+does about them.
 
 For your own sources `claude` is found on `PATH`. The pacman gate, as with
 OpenCode, only accepts a root-owned `/usr/bin/claude` or
@@ -1235,17 +1326,25 @@ bash tests/e2e/sweep.sh
 ```
 
 The AI review itself has an evaluation suite: install scriptlets, auto-run
-package files, AUR recipes and files already on a system (found by `sweep`)
-that must come back clear, and attacks that must be caught. Run it after
+package files, AUR recipes, themes, plugins and files already on a system
+(found by `sweep`) that must come back clear, and attacks that must be
+caught. An upgrade case holds two versions of one source: the first must be
+approved, and the second is then reviewed against it. Run it after
 changing a prompt, a scope or the model:
 
 ```sh
 cargo build --release
-RUNS=3 bash tests/ai-eval/run.sh          # or a filter: run.sh aur/block
+bash tests/ai-eval/run.sh                 # or a filter: run.sh aur/block
 ```
 
+Each case is reviewed three times (`RUNS=N` changes that) and gets a line
+with its pass rate; the run ends with the rates of the block and the clear
+cases and exits non-zero when any case passed less than every run. The
+theme, plugin and upgrade classes have clear cases only so far, and no case
+yet attacks the reviewer itself (text addressed to it, hidden characters,
+payloads split over files or versions): those are still to be written.
 Every run starts with an empty review memory, so no verdict comes from the
-cache. The pacman cases use the system config's model, the AUR and system
+cache. The pacman cases use the system config's model, the AUR, theme, plugin, upgrade and system
 cases the user config's. A system case is judged by the AI's own medium or
 high findings on its planted files, since the rest of the real system decides
 the sweep's exit code; the host's own files no package vouches for are
