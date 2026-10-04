@@ -73,6 +73,14 @@ package() {
         "$pkgdir/usr/share/omarchy-guardian/bar-widget/manifest.json"
     install -Dm644 integrations/omarchy/bar-widget/Widget.qml \
         "$pkgdir/usr/share/omarchy-guardian/bar-widget/Widget.qml"
+    # The keys release tags are signed with (SECURITY.md). install.sh holds
+    # the next checkout against the copy an installed Guardian carries,
+    # never against the checkout's own. Without the file nothing is
+    # installed, and install.sh says the signature was not checked.
+    if [[ -f packaging/allowed_signers ]]; then
+        install -Dm644 packaging/allowed_signers \
+            "$pkgdir/usr/share/omarchy-guardian/allowed_signers"
+    fi
     for unit in omarchy-guardian-sweep.service omarchy-guardian-sweep.timer; do
         install -Dm644 "integrations/systemd/$unit" "$pkgdir/usr/lib/systemd/user/$unit"
     done

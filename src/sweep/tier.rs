@@ -286,6 +286,8 @@ const GUARDIAN: &str = "omarchy-guardian";
 const GUARDIANS_OWN: &[&str] = &[
     "usr/bin/omarchy-guardian",
     "usr/lib/omarchy-guardian/",
+    // The hook pacman always loads; it reviews only once root turned it on.
+    "usr/share/libalpm/hooks/omarchy-guardian.hook",
     "usr/share/omarchy-guardian/",
     "usr/share/doc/omarchy-guardian/",
     "usr/lib/systemd/user/omarchy-guardian-sweep.service",
@@ -807,6 +809,36 @@ mod tests {
                 Tier::Unknown,
                 "{path}"
             );
+        }
+    }
+
+    #[test]
+    fn everything_the_package_installs_is_known_as_guardians_own() {
+        use super::GUARDIANS_OWN;
+
+        // Every destination the PKGBUILD's package() writes, up to the
+        // first variable in it (`$unit`, `$wrapper`).
+        let pkgbuild = include_str!("../../packaging/arch/PKGBUILD");
+        let mut installed: Vec<String> = Vec::new();
+        for line in pkgbuild.lines() {
+            for (marker, prefix) in [("\"$pkgdir/", ""), ("\"$lib/", "usr/lib/omarchy-guardian/")] {
+                if let Some((_, rest)) = line.split_once(marker) {
+                    let path = rest.split(['"', '$']).next().unwrap_or_default();
+                    installed.push(format!("{prefix}{path}"));
+                }
+            }
+        }
+        assert!(installed.len() > 15, "{installed:?}");
+        assert!(installed.contains(&"usr/share/libalpm/hooks/omarchy-guardian.hook".to_string()));
+        for path in &installed {
+            // A destination cut at a variable is a prefix of what is known.
+            let known = GUARDIANS_OWN.iter().any(|own| {
+                path == own
+                    || own.strip_suffix('/') == Some(path.as_str())
+                    || (own.ends_with('/') && path.starts_with(own))
+                    || (path.ends_with(['/', '-']) && own.starts_with(path.as_str()))
+            });
+            assert!(known, "{path} is installed by the package and not listed");
         }
     }
 
