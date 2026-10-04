@@ -330,13 +330,9 @@ own_package() {
     whole() { ! grep -qF 'does not ship' "$OUT"; }
     check 'it is taken for a whole Guardian package' whole
     local_checks_pass() { grep -qE 'Local checks +no matches' "$OUT"; }
-    known "the local rules find nothing in Guardian's own package" \
-        "protection-disabled matches the install script's pre_remove (systemctl disable of the sweep's root timer)" \
-        local_checks_pass
+    check "the local rules find nothing in Guardian's own package" local_checks_pass
     all_followed() { ! grep -qF 'were not followed' "$OUT"; }
-    known "every file of Guardian's own package is followed" \
-        'guardian-plugin and guardian-theme are more than 3 files away from what runs on its own' \
-        all_followed
+    check "every file of Guardian's own package is followed" all_followed
 }
 
 ###############################################################################

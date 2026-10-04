@@ -54,8 +54,9 @@ const MAX_TOTAL: u64 = 32 * 1024 * 1024;
 const MAX_HOPS: usize = 40;
 /// How far the package's own files are followed from its scriptlet and
 /// auto-run files (a hook names a script, which sources another), and how
-/// many of them: past either, the review is incomplete.
-const MAX_NAMED_DEPTH: usize = 3;
+/// many of them: past either, the review is incomplete. Guardian's own
+/// package is five deep (hook, script, interceptor, theme gate, program).
+const MAX_NAMED_DEPTH: usize = 8;
 const MAX_NAMED_FILES: usize = 500;
 
 const LISTING_LIMITS: Limits = Limits {
@@ -199,7 +200,7 @@ pub fn through_root_links(path: &str) -> String {
 /// Guardian's own package. What other packages a `.PKGINFO` may not claim
 /// to replace, conflict with or provide: pacman would then remove Guardian
 /// for it.
-const GUARDIAN: &str = "omarchy-guardian";
+pub const GUARDIAN_PACKAGE: &str = "omarchy-guardian";
 /// What a package of that name must ship to be Guardian: an "upgrade" to
 /// one without its program or hook script takes the gate away.
 const GUARDIAN_FILES: &[&str] = &[
@@ -213,7 +214,7 @@ const REVIEWERS: &[&str] = &["opencode", "claude-code"];
 /// a package of Guardian's name, or of its reviewer's, replaces the
 /// installed one whatever it ships, an empty one included.
 fn name_violation(package: &str, class: SourceClass, trusted: &[String]) -> Option<String> {
-    if package == GUARDIAN && class == SourceClass::ThirdPartyRepo {
+    if package == GUARDIAN_PACKAGE && class == SourceClass::ThirdPartyRepo {
         return Some(format!(
             "{package} is offered by a third-party repository: Guardian is installed from a local archive or an official repository only, and a package of its name would replace it"
         ));
@@ -251,7 +252,7 @@ fn claim_violation<'a>(
             .map(str::trim)?;
         if claimed == package {
             None
-        } else if claimed == GUARDIAN {
+        } else if claimed == GUARDIAN_PACKAGE {
             Some((line.trim(), "Guardian"))
         } else if (REVIEWERS.contains(&claimed) || trusted.iter().any(|name| name == claimed))
             && !may_ship_reviewer
@@ -1475,7 +1476,7 @@ pub fn review(
     if let Some(reason) = name_violation(package, class, trusted) {
         return Err(refuse(reason));
     }
-    if package == GUARDIAN
+    if package == GUARDIAN_PACKAGE
         && let Some(missing) = GUARDIAN_FILES.iter().find(|path| {
             !archive
                 .entry(path)

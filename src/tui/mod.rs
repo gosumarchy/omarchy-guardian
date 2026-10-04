@@ -183,11 +183,15 @@ fn save_user(text: &str) -> Result<String, String> {
 
 fn integration(terminal: &mut Terminal, plan: &Plan) -> Result<String, String> {
     let paths = paths(&Settings::load()).ok_or("HOME is not set")?;
-    if plan.needs_terminal() {
+    let done = if plan.needs_terminal() {
         on_terminal(terminal, false, || run_plan(&paths, plan))
     } else {
         run_plan(&paths, plan)
+    };
+    if done.is_ok() {
+        crate::audit::gate_changed(&plan.summary, "", "changed in the settings app");
     }
+    done
 }
 
 /// Runs a plan's steps in order; a failed command stops it.
@@ -467,10 +471,15 @@ fn forget_memory() -> Result<String, String> {
     if !root.is_dir() {
         return Ok("The review memory is already empty.".into());
     }
-    let store = Store::open(root)?;
-    baseline::forget_all(&store)
-        .map(|count| format!("Forgot {count} approved baseline(s) and every cached verdict."))
-        .map_err(|error| error.to_string())
+    let store = Store::open(root.clone())?;
+    let count = baseline::forget_all(&store).map_err(|error| error.to_string())?;
+    // What the AUR gate remembers on its own (answers, program hashes) goes
+    // with the rest.
+    crate::makepkg_gate::forget_all(&root)?;
+    crate::audit::forgot("everything (settings app)");
+    Ok(format!(
+        "Forgot {count} approved baseline(s) and every cached verdict."
+    ))
 }
 
 fn editor() -> String {
@@ -529,6 +538,7 @@ fn edit(terminal: &mut Terminal, scope: Scope) -> Result<String, String> {
                 })
                 .map_err(|error| error.to_string())?;
             if status.success() {
+                crate::audit::settings_changed("the system settings file was edited");
                 Ok(format!("Edited {SYSTEM_PATH}; reloaded."))
             } else {
                 Err(format!("sudoedit exited with {status}"))

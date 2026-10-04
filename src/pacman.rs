@@ -1206,6 +1206,17 @@ fn scan_package(
             let rel = format!("{target}/{archive_name}/.INSTALL");
             report.file_classes.insert(rel.clone(), class);
             review::analyze_text(report, &rel, &text, false);
+            if target == payload::GUARDIAN_PACKAGE {
+                // Guardian's own removal turns its own units and hook off.
+                // The name is Guardian's only from a local archive or an
+                // official repository (`payload::review` refused the rest),
+                // and the scriptlet still goes to the AI review.
+                report.findings.retain(|finding| {
+                    !(finding.path == rel
+                        && finding.rule == RuleId::ProtectionDisabled
+                        && finding.excerpt.contains(payload::GUARDIAN_PACKAGE))
+                });
+            }
             true
         }
     };
