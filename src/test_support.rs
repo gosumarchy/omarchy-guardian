@@ -131,3 +131,72 @@ printf '{{"type":"text","part":{{"type":"text","text":"%s"}}}}\n' "$escaped"
     );
     binary
 }
+
+/// A small deterministic generator (xorshift64*) for property tests: the
+/// same seed gives the same cases on every run and every machine, so a
+/// failure can be run again.
+pub struct Rng(u64);
+
+impl Rng {
+    pub const fn new(seed: u64) -> Self {
+        // The state must never be zero.
+        Self(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1)
+    }
+
+    pub const fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    /// A number below `bound`, which must not be zero.
+    pub fn below(&mut self, bound: usize) -> usize {
+        usize::try_from(self.next() % u64::try_from(bound).unwrap()).unwrap()
+    }
+
+    /// True once in `one_in` times.
+    pub fn chance(&mut self, one_in: usize) -> bool {
+        self.below(one_in) == 0
+    }
+
+    pub fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+        &items[self.below(items.len())]
+    }
+
+    /// Up to `most` pieces of `alphabet`, joined: text made of the pieces
+    /// a format is written with reaches far more of a parser than bytes
+    /// drawn evenly.
+    pub fn text(&mut self, alphabet: &[&str], most: usize) -> String {
+        (0..self.below(most + 1))
+            .map(|_| *self.pick(alphabet))
+            .collect()
+    }
+
+    /// `text` with a few of its bytes dropped, repeated, swapped for one
+    /// of `alphabet`'s or cut short, as text again (a broken sequence
+    /// becomes the replacement character).
+    pub fn mutated(&mut self, text: &str, alphabet: &[&str]) -> String {
+        let mut bytes = text.as_bytes().to_vec();
+        for _ in 0..=self.below(4) {
+            if bytes.is_empty() {
+                break;
+            }
+            let at = self.below(bytes.len());
+            match self.below(5) {
+                0 => drop(bytes.remove(at)),
+                1 => bytes.insert(at, bytes[at]),
+                2 => bytes.truncate(at),
+                3 => {
+                    let other = self.below(bytes.len());
+                    bytes.swap(at, other);
+                }
+                _ => {
+                    let piece = self.pick(alphabet).as_bytes().to_vec();
+                    bytes.splice(at..at, piece);
+                }
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
