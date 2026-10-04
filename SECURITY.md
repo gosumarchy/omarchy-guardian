@@ -60,9 +60,12 @@ listed there. `./install.sh` says which commit and tag it is about to build. Whe
 installed Guardian carries a list of release signing keys
 (`/usr/share/omarchy-guardian/allowed_signers`, installed by the package
 from `packaging/allowed_signers`), the installer checks that the checkout is
-a release tag signed by one of them before building, and asks before going
-on when it is not; `--yes` does not answer that question. The keys are
-taken from the installed package, never from the checkout being built.
+exactly a release tag signed by one of them, with no file changed and none
+added, before building, and asks before going on when it is not (a
+directory that is not a git checkout included); `--yes` does not answer
+that question. The keys are taken from the installed package, never from
+the checkout being built, and the checkout's own git configuration does not
+choose the keys or the program the signature is verified with.
 
 A first install has no installed keys, and a package built from a release
 without the key file installs none: the installer then says that the
