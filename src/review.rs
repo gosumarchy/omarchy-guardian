@@ -355,6 +355,32 @@ fn apply_rules(report: &mut Report, rel: &str, text: &str, inventory_network: bo
         written.push(as_written);
     }
 
+    // A value followed across lines from where it is made to where it runs.
+    let code_lines: Vec<String> = views.iter().map(|(code, _)| code.clone()).collect();
+    for (number, rule) in rules::flow::findings(&code_lines) {
+        push_finding(
+            report,
+            rel,
+            number,
+            lines.get(number - 1).copied().unwrap_or(""),
+            rule,
+        );
+    }
+
+    apply_command_groups(report, rel, &lines, &views, &written);
+}
+
+/// Each command of `text`, as the one line a shell reads it as (continued
+/// over several source lines), matched by the rules, recorded as what it
+/// runs and downloads, and checked for running a file fetched or decoded
+/// earlier (download-and-run within one file).
+fn apply_command_groups(
+    report: &mut Report,
+    rel: &str,
+    lines: &[&str],
+    views: &[(String, String)],
+    written: &[String],
+) {
     let joined = |parts: &mut dyn Iterator<Item = &String>| {
         parts
             .map(|part| part.trim_end().trim_end_matches('\\'))
@@ -397,7 +423,13 @@ fn apply_rules(report: &mut Report, rel: &str, text: &str, inventory_network: bo
         }
         let as_written = joined(&mut written[start..end].iter());
         record_runs(report, rel, start + 1, lines[start], &as_written);
-        if let Some(file) = rules::fetched_file(&as_written) {
+        // A fetch or a decoder that writes a file: a file run later is
+        // download-and-run / encoded execution just as a piped one is.
+        let lowered = as_written.to_lowercase();
+        let brought_in = rules::fetched_files(&as_written)
+            .into_iter()
+            .chain(rules::encoded::decoded_file(&lowered));
+        for file in brought_in {
             let file = file.to_lowercase();
             if report.fetches.len() < MAX_RUNS {
                 report.fetches.push((rel.to_string(), file.clone()));

@@ -9,8 +9,14 @@ use std::path::Path;
 use crate::report::Severity;
 
 pub mod addressed;
+pub mod encoded;
+pub mod exfil;
+pub mod fetch;
+pub mod flow;
 pub mod hidden;
 pub mod hosts;
+pub mod persist;
+pub mod shell;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RuleId {
@@ -57,6 +63,7 @@ pub enum RuleId {
     TracedProcess,
     TracedSecrets,
     KernelTap,
+    RemoteCodeInstall,
 }
 
 /// How a rule decides whether a lowercased line matches.
@@ -201,7 +208,7 @@ const PRIVILEGE_ESCALATION: &[&str] = &[
 ];
 
 impl RuleId {
-    pub const ALL: [Self; 43] = [
+    pub const ALL: [Self; 44] = [
         Self::DownloadAndExecute,
         Self::EncodedCommandExecution,
         Self::CredentialFileAccess,
@@ -245,6 +252,7 @@ impl RuleId {
         Self::TracedProcess,
         Self::TracedSecrets,
         Self::KernelTap,
+        Self::RemoteCodeInstall,
     ];
 
     pub fn from_name(name: &str) -> Option<Self> {
@@ -296,6 +304,7 @@ impl RuleId {
             Self::TracedProcess => "traced-process",
             Self::TracedSecrets => "traced-secrets",
             Self::KernelTap => "kernel-tap",
+            Self::RemoteCodeInstall => "remote-code-install",
         }
     }
 
@@ -343,154 +352,209 @@ impl RuleId {
             | Self::UnexpectedCapability
             | Self::NetworkRelay
             | Self::TracedProcess
-            | Self::KernelTap => Severity::Medium,
+            | Self::KernelTap
+            | Self::RemoteCodeInstall => Severity::Medium,
         }
     }
+
+    /// What each rule reports, in the order of `ALL`. A table rather than a
+    /// match so that it stays one item however many rules there are; the
+    /// test below holds it to `ALL`.
+    const DESCRIPTIONS: [(Self, &'static str); 44] = [
+        (
+            Self::DownloadAndExecute,
+            "Fetches code from the network and runs it without it being reviewed: piped into a shell or an interpreter, run from a substitution, or saved and then run.",
+        ),
+        (
+            Self::EncodedCommandExecution,
+            "Encoded or dynamically evaluated data appears to be executed as a command.",
+        ),
+        (
+            Self::CredentialFileAccess,
+            "References a commonly sensitive credential or private-key file; inspect how it is used.",
+        ),
+        (
+            Self::DestructiveSystemOperation,
+            "Contains a command associated with destructive disk or filesystem changes.",
+        ),
+        (
+            Self::PersistenceModification,
+            "May install persistence: writes a startup, scheduled-task or SSH authorization file, runs a command on its own from a temporary or cache directory, or arranges for something to keep running.",
+        ),
+        (
+            Self::ShellCommandExecution,
+            "Starts a shell or dynamically evaluates a command; review how input is constructed.",
+        ),
+        (
+            Self::PrivilegeEscalation,
+            "Requests elevated privileges or changes privilege-related system configuration.",
+        ),
+        (
+            Self::CredentialExfiltration,
+            "Combines access to sensitive data with an outbound network request.",
+        ),
+        (
+            Self::CleartextNetworkRequest,
+            "Sends a network request over unencrypted HTTP.",
+        ),
+        (
+            Self::DirectIpNetworkRequest,
+            "Sends a request to a hard-coded IP address instead of a named host.",
+        ),
+        (
+            Self::DisabledTlsVerification,
+            "Disables TLS certificate verification for network requests.",
+        ),
+        (
+            Self::GitConfigCommand,
+            "A git config in the tree names a command git runs, or another address for git to fetch from, on later commands here (status, describe, diff, fetch).",
+        ),
+        (
+            Self::SshCommand,
+            "An SSH file runs a command when someone logs in (command= or environment= on a key, or ~/.ssh/rc).",
+        ),
+        (
+            Self::ModifiedPackageFile,
+            "A file a package installed has been changed since; it is not what the package shipped.",
+        ),
+        (
+            Self::HiddenProgram,
+            "A running program has no file on disk: it was deleted, or lives only in memory.",
+        ),
+        (
+            Self::RunningFromTemp,
+            "A program runs from a temporary or cache directory, where downloads land.",
+        ),
+        (
+            Self::PreloadedLibrary,
+            "A library no package installed is preloaded into a running program (LD_PRELOAD).",
+        ),
+        (
+            Self::KeyboardReader,
+            "A program no package installed reads the keyboard device directly.",
+        ),
+        (
+            Self::UnknownKernelModule,
+            "A loaded kernel module was not installed by a package.",
+        ),
+        (
+            Self::UnknownPrivilegedFile,
+            "A file no package vouches for runs with extra rights (setuid, setgid or capabilities).",
+        ),
+        (
+            Self::NetworkListener,
+            "A program listens on the network that nothing installed accounts for: an interpreter (Python, a shell, Node), or a packaged program no packaged service runs.",
+        ),
+        (
+            Self::ReviewerInstruction,
+            "Text addressed to a reviewer or an AI model, telling it what to conclude; software has no reason to carry it.",
+        ),
+        (
+            Self::ReorderedText,
+            "Holds bidirectional control characters: the text is shown in another order than it is read by a compiler, a shell or the AI review.",
+        ),
+        (
+            Self::InvisibleText,
+            "Holds Unicode tag characters: text no person sees, which an AI model reads as instructions.",
+        ),
+        (
+            Self::HiddenCharacter,
+            "An invisible character sits inside a name, a command or a path: it is not the name it reads as, to a person or to the AI review.",
+        ),
+        (
+            Self::LookalikeHost,
+            "A host name mixes alphabets or is written in punycode, so it can read as another name than the one requested.",
+        ),
+        (
+            Self::DataDropHost,
+            "Sends to or fetches from a host commonly used to deliver or receive stolen data (a paste site, a chat webhook, a tunnel, a link shortener).",
+        ),
+        (
+            Self::RemoteShell,
+            "A shell is connected to the network, so someone elsewhere types the commands (a reverse or bind shell): in code that sets one up, or in a running shell or interpreter with a network socket for its input and output.",
+        ),
+        (
+            Self::CryptoMiner,
+            "Names a cryptocurrency miner, a mining pool or a mining protocol.",
+        ),
+        (
+            Self::ProtectionDisabled,
+            "Turns off a protection of this system: a firewall, a security service, or Guardian's own gates.",
+        ),
+        (
+            Self::TraceRemoval,
+            "Erases shell history or system logs, which is how traces of other commands are removed.",
+        ),
+        (
+            Self::GuardianOverride,
+            "A unit file or drop-in changes what Guardian's own sweep runs; allowing the file does not quiet this.",
+        ),
+        (
+            Self::PathHijack,
+            "A program or directory a user can write comes ahead of the system's own on PATH and takes over a command's name.",
+        ),
+        (
+            Self::NewTrust,
+            "Something that was not there at the last sweep may now log in, administer or vouch here: an account, a member of an administrator group, an SSH key or a certificate authority.",
+        ),
+        (
+            Self::PrivilegedAccount,
+            "An account has rights no ordinary system gives it: a second account with user id 0, or a system account someone can log in to.",
+        ),
+        (
+            Self::BootTampering,
+            "The running kernel was started with a parameter that turns off a defence or replaces init and that the reviewed boot configuration does not hold, or a kernel image in /boot is not the one its package ships.",
+        ),
+        (
+            Self::RiskyConfiguration,
+            "A configuration file redirects where programs, packages or web pages come from, or loads code into a program at every start.",
+        ),
+        (
+            Self::UnexpectedCapability,
+            "A packaged program holds file capabilities its package does not set (pacman does not record them, so the file itself is unchanged).",
+        ),
+        (
+            Self::NetworkRelay,
+            "A tool that runs or forwards what it is told over the network (netcat, socat, a tunnel) listens or is connected.",
+        ),
+        (
+            Self::RootkitSign,
+            "The kernel's own lists disagree (a process, module or socket that exists is not listed), or a program wears a kernel thread's name: what something hiding itself looks like.",
+        ),
+        (
+            Self::TracedProcess,
+            "Another process is attached to this one the way a debugger is, and can read and change its memory.",
+        ),
+        (
+            Self::TracedSecrets,
+            "A process is attached, the way a debugger is, to a program that holds secrets (a shell, SSH, sudo, a key agent, a browser, a password manager).",
+        ),
+        (
+            Self::KernelTap,
+            "Something no package explains taps the kernel's network or tracing path: a raw packet socket, or a pinned eBPF object.",
+        ),
+        (
+            Self::RemoteCodeInstall,
+            "Installs and runs code from an address, not from this source: a package manager is given a URL or a repository, or told to fetch and run a package at whatever its newest version is.",
+        ),
+    ];
 
     pub const fn description(self) -> &'static str {
-        match self {
-            Self::DownloadAndExecute => {
-                "Downloads are piped directly into a shell; inspect the remote script before running it."
+        let mut index = 0;
+        while index < Self::DESCRIPTIONS.len() {
+            if Self::DESCRIPTIONS[index].0 as usize == self as usize {
+                return Self::DESCRIPTIONS[index].1;
             }
-            Self::EncodedCommandExecution => {
-                "Encoded or dynamically evaluated data appears to be executed as a command."
-            }
-            Self::CredentialFileAccess => {
-                "References a commonly sensitive credential or private-key file; inspect how it is used."
-            }
-            Self::DestructiveSystemOperation => {
-                "Contains a command associated with destructive disk or filesystem changes."
-            }
-            Self::PersistenceModification => {
-                "May install persistence through a startup, scheduled-task, or SSH authorization file."
-            }
-            Self::ShellCommandExecution => {
-                "Starts a shell or dynamically evaluates a command; review how input is constructed."
-            }
-            Self::PrivilegeEscalation => {
-                "Requests elevated privileges or changes privilege-related system configuration."
-            }
-            Self::CredentialExfiltration => {
-                "Combines access to sensitive data with an outbound network request."
-            }
-            Self::CleartextNetworkRequest => "Sends a network request over unencrypted HTTP.",
-            Self::DirectIpNetworkRequest => {
-                "Sends a request to a hard-coded IP address instead of a named host."
-            }
-            Self::DisabledTlsVerification => {
-                "Disables TLS certificate verification for network requests."
-            }
-            Self::GitConfigCommand => {
-                "A git config in the tree names a command that git runs on later commands here (status, describe, diff)."
-            }
-            Self::SshCommand => {
-                "An SSH file runs a command when someone logs in (command= or environment= on a key, or ~/.ssh/rc)."
-            }
-            Self::ReviewerInstruction => {
-                "Text addressed to a reviewer or an AI model, telling it what to conclude; software has no reason to carry it."
-            }
-            Self::ReorderedText => {
-                "Holds bidirectional control characters: the text is shown in another order than it is read by a compiler, a shell or the AI review."
-            }
-            Self::InvisibleText => {
-                "Holds Unicode tag characters: text no person sees, which an AI model reads as instructions."
-            }
-            Self::HiddenCharacter => {
-                "An invisible character sits inside a name, a command or a path: it is not the name it reads as, to a person or to the AI review."
-            }
-            Self::LookalikeHost => {
-                "A host name mixes alphabets or is written in punycode, so it can read as another name than the one requested."
-            }
-            Self::DataDropHost => {
-                "Sends to or fetches from a host commonly used to deliver or receive stolen data (a paste site, a chat webhook, a tunnel, a link shortener)."
-            }
-            Self::RemoteShell => {
-                "A shell is connected to the network, so someone elsewhere types the commands (a reverse or bind shell): in code that sets one up, or in a running shell or interpreter with a network socket for its input and output."
-            }
-            Self::CryptoMiner => {
-                "Names a cryptocurrency miner, a mining pool or a mining protocol."
-            }
-            Self::ProtectionDisabled => {
-                "Turns off a protection of this system: a firewall, a security service, or Guardian's own gates."
-            }
-            Self::TraceRemoval => {
-                "Erases shell history or system logs, which is how traces of other commands are removed."
-            }
-            _ => self.state_description(),
+            index += 1;
         }
-    }
-
-    /// What the sweep reports about the system as it is now, where
-    /// `description` covers what the rules read in text.
-    const fn state_description(self) -> &'static str {
-        match self {
-            Self::ModifiedPackageFile => {
-                "A file a package installed has been changed since; it is not what the package shipped."
-            }
-            Self::HiddenProgram => {
-                "A running program has no file on disk: it was deleted, or lives only in memory."
-            }
-            Self::RunningFromTemp => {
-                "A program runs from a temporary or cache directory, where downloads land."
-            }
-            Self::PreloadedLibrary => {
-                "A library no package installed is preloaded into a running program (LD_PRELOAD)."
-            }
-            Self::KeyboardReader => {
-                "A program no package installed reads the keyboard device directly."
-            }
-            Self::UnknownKernelModule => "A loaded kernel module was not installed by a package.",
-            Self::UnknownPrivilegedFile => {
-                "A file no package vouches for runs with extra rights (setuid, setgid or capabilities)."
-            }
-            Self::NetworkListener => {
-                "A program listens on the network that nothing installed accounts for: an interpreter (Python, a shell, Node), or a packaged program no packaged service runs."
-            }
-            Self::UnexpectedCapability => {
-                "A packaged program holds file capabilities its package does not set (pacman does not record them, so the file itself is unchanged)."
-            }
-            Self::NetworkRelay => {
-                "A tool that runs or forwards what it is told over the network (netcat, socat, a tunnel) listens or is connected."
-            }
-            Self::RootkitSign => {
-                "The kernel's own lists disagree (a process, module or socket that exists is not listed), or a program wears a kernel thread's name: what something hiding itself looks like."
-            }
-            Self::TracedProcess => {
-                "Another process is attached to this one the way a debugger is, and can read and change its memory."
-            }
-            Self::TracedSecrets => {
-                "A process is attached, the way a debugger is, to a program that holds secrets (a shell, SSH, sudo, a key agent, a browser, a password manager)."
-            }
-            Self::KernelTap => {
-                "Something no package explains taps the kernel's network or tracing path: a raw packet socket, or a pinned eBPF object."
-            }
-            Self::GuardianOverride => {
-                "A unit file or drop-in changes what Guardian's own sweep runs; allowing the file does not quiet this."
-            }
-            Self::PathHijack => {
-                "A program or directory a user can write comes ahead of the system's own on PATH and takes over a command's name."
-            }
-            Self::NewTrust => {
-                "Something that was not there at the last sweep may now log in, administer or vouch here: an account, a member of an administrator group, an SSH key or a certificate authority."
-            }
-            Self::PrivilegedAccount => {
-                "An account has rights no ordinary system gives it: a second account with user id 0, or a system account someone can log in to."
-            }
-            Self::BootTampering => {
-                "The running kernel was started with a parameter that turns off a defence or replaces init and that the reviewed boot configuration does not hold, or a kernel image in /boot is not the one its package ships."
-            }
-            Self::RiskyConfiguration => {
-                "A configuration file redirects where programs, packages or web pages come from, or loads code into a program at every start."
-            }
-            _ => "",
-        }
+        ""
     }
 
     const fn matcher(self) -> Matcher {
         match self {
             Self::DownloadAndExecute => Matcher::Custom(is_download_piped_to_shell),
             Self::EncodedCommandExecution => Matcher::Custom(is_encoded_command_execution),
-            Self::CredentialFileAccess => Matcher::Patterns(CREDENTIAL_FILES),
+            Self::CredentialFileAccess => Matcher::Custom(references_credential),
             Self::DestructiveSystemOperation => Matcher::Custom(is_destructive_operation),
             Self::PersistenceModification => Matcher::Custom(is_persistence),
             Self::ShellCommandExecution => Matcher::Patterns(SHELL_EXECUTION),
@@ -531,6 +595,7 @@ impl RuleId {
             Self::CryptoMiner => Matcher::Custom(is_crypto_mining),
             Self::ProtectionDisabled => Matcher::Custom(disables_protection),
             Self::TraceRemoval => Matcher::Custom(removes_traces),
+            Self::RemoteCodeInstall => Matcher::Custom(fetch::installs_remote_code),
         }
     }
 
@@ -550,7 +615,8 @@ impl RuleId {
             | Self::LookalikeHost
             | Self::DataDropHost
             | Self::ProtectionDisabled
-            | Self::TraceRemoval => true,
+            | Self::TraceRemoval
+            | Self::RemoteCodeInstall => true,
             Self::DownloadAndExecute
             | Self::EncodedCommandExecution
             | Self::DestructiveSystemOperation
@@ -629,10 +695,16 @@ fn pattern_starts<'a>(haystack: &'a str, pattern: &'a str) -> impl Iterator<Item
         })
 }
 
+/// A persistence path (see `names_persistence_path`), or one of the other
+/// ways of persisting that `persist` reads.
+fn is_persistence(line: &str) -> bool {
+    names_persistence_path(line) || persist::matches(line)
+}
+
 /// A persistence path, unless it is a file a PKGBUILD puts in the package
 /// (`"$pkgdir"/etc/profile.d/x.sh`): pacman installs it as a listed package
 /// file, just like a unit under `/usr/lib/systemd/system`.
-fn is_persistence(line: &str) -> bool {
+fn names_persistence_path(line: &str) -> bool {
     PERSISTENCE_PATHS.iter().any(|pattern| {
         pattern_starts(line, pattern).any(|start| {
             let before = &line[..start];
@@ -674,6 +746,11 @@ fn contains_any(haystack: &str, patterns: &[&str]) -> bool {
 const FETCHERS: &[&str] = &["curl", "wget", "aria2c"];
 
 pub fn is_download_piped_to_shell(line: &str) -> bool {
+    is_fetch_piped_to_shell(line) || fetch::matches(line)
+}
+
+/// curl, wget or aria2c piped into a shell or run from a substitution.
+fn is_fetch_piped_to_shell(line: &str) -> bool {
     // Bash's own network redirection: a reverse shell or a fetch without
     // any fetcher.
     if line.contains("/dev/tcp/") || line.contains("/dev/udp/") {
@@ -702,7 +779,7 @@ pub fn continues(line: &str, next: &str) -> bool {
 /// What runs a file given to it.
 const RUNNERS: &[&str] = &[
     "sh", "bash", "zsh", "dash", "ksh", "fish", "source", ".", "python", "perl", "node", "ruby",
-    "php",
+    "php", "lua",
 ];
 
 fn program_name(word: &str) -> &str {
@@ -792,6 +869,19 @@ pub fn fetched_file(line: &str) -> Option<String> {
     let address = address.filter(|_| by_address)?;
     let path = address.split(['?', '#']).next().unwrap_or_default();
     as_file(program_name(path.trim_end_matches(';')))
+}
+
+/// Every file a fetch on `line` is saved as: what `fetched_file` names,
+/// and what `fetch::saved_files` adds (through `tee`, into a directory, by
+/// another fetcher).
+pub fn fetched_files(line: &str) -> Vec<String> {
+    let mut found: Vec<String> = fetched_file(line).into_iter().collect();
+    for file in fetch::saved_files(line) {
+        if !found.contains(&file) {
+            found.push(file);
+        }
+    }
+    found
 }
 
 /// Whether `line` runs the file named `file`: given to a shell or an
@@ -952,7 +1042,166 @@ pub fn run_targets(line: &str) -> Vec<String> {
             }
         }
     }
+    for name in extra_run_targets(line) {
+        add(&name);
+    }
     found
+}
+
+/// Files a line runs or reads in that `run_targets`' shell reading does not
+/// reach: make's includes, an interpreter given a file to read in on its
+/// command line, a script sourced next to the running one, an archive read
+/// in, and the commands in a `package.json`. Each name is returned as
+/// written, for `run_targets` to clean.
+fn extra_run_targets(line: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    make_includes(line, &mut found);
+    reads_in_file(line, &mut found);
+    sourced_sibling(line, &mut found);
+    unpacked_file(line, &mut found);
+    package_json_runs(line, &mut found);
+    found
+}
+
+/// make's `include x`, `-include x`, `sinclude x`, and `$(shell cat x)`.
+fn make_includes(line: &str, found: &mut Vec<String>) {
+    let mut words = line.split_whitespace();
+    if let Some(first) = words.next()
+        && matches!(first.trim_start_matches('-'), "include" | "sinclude")
+    {
+        found.extend(words.map(ToString::to_string));
+    }
+    if let Some(at) = line.find("$(shell cat ") {
+        let rest = &line[at + "$(shell cat ".len()..];
+        found.extend(
+            rest.split(')')
+                .next()
+                .and_then(|inside| inside.split_whitespace().next())
+                .map(ToString::to_string),
+        );
+    }
+}
+
+/// An interpreter told on its command line to read a file in: `sh -c
+/// "$(cat x)"`, `python -c "exec(open('x').read())"`, `node -e
+/// "require('./x')"`.
+fn reads_in_file(line: &str, found: &mut Vec<String>) {
+    // `$(cat x)` / `` `cat x` `` whose output a shell runs (`sh -c
+    // "$(cat x)"`, `eval "$(cat x)"`), not one only captured in a value.
+    for substitution in shell::substitutions(line) {
+        if shell::is_run(line, &substitution)
+            && let Some(command) = shell::command(substitution.body)
+            && command.program == "cat"
+        {
+            found.extend(command.operands().next().map(ToString::to_string));
+        }
+    }
+    // `open('x')` inside an `exec`/`eval` argument.
+    for argument in encoded::run_arguments(line) {
+        for opener in ["open('", "open(\"", "read_text('", "read_text(\""] {
+            if let Some(at) = argument.find(opener) {
+                let rest = &argument[at + opener.len()..];
+                found.extend(rest.split(['\'', '"']).next().map(ToString::to_string));
+            }
+        }
+    }
+}
+
+/// A script read in beside the running one: `. "$(dirname "$0")/x"`,
+/// `source "${BASH_SOURCE%/*}/x"`.
+fn sourced_sibling(line: &str, found: &mut Vec<String>) {
+    let statement = line.trim_start();
+    let Some(rest) = statement
+        .strip_prefix(". ")
+        .or_else(|| statement.strip_prefix("source "))
+    else {
+        return;
+    };
+    let argument = rest.trim().trim_matches(['"', '\'']);
+    if argument.contains("dirname ") || argument.contains("bash_source") || argument.contains("${0")
+    {
+        found.extend(as_file(program_name(argument)));
+    }
+}
+
+/// Archives read in: `tar xf x`, `tar -xf x`, `bsdtar -xf x`, `unzip x`,
+/// `7z x x`. Reported like a run, since an extract step feeds a build.
+fn unpacked_file(line: &str, found: &mut Vec<String>) {
+    for statement in shell::statements(line) {
+        let Some(command) = shell::command(statement) else {
+            continue;
+        };
+        let operands: Vec<String> = command.operands().map(ToString::to_string).collect();
+        // The archive is the value of `-f`, or the first operand that is
+        // not the mode word (`x`, `xf`, the 7z verb).
+        let file_option = command
+            .arguments
+            .iter()
+            .position(|word| word == "-f" || word == "--file")
+            .and_then(|at| command.arguments.get(at + 1))
+            .or_else(|| {
+                command
+                    .arguments
+                    .iter()
+                    .find_map(|word| word.strip_prefix("--file=").map(|_| word))
+            });
+        let archive = match command.program.as_str() {
+            "tar" | "bsdtar"
+                if command.has_short('x')
+                    || operands.first().is_some_and(|word| word.contains('x')) =>
+            {
+                file_option
+                    .map(|word| word.trim_start_matches("--file=").to_string())
+                    .or_else(|| {
+                        operands
+                            .iter()
+                            .find(|word| !word.chars().all(|c| "xfvzjJ-".contains(c)))
+                            .cloned()
+                    })
+            }
+            "unzip" => operands.into_iter().next(),
+            "7z" | "7za" | "7zr"
+                if operands
+                    .first()
+                    .is_some_and(|word| matches!(word.as_str(), "x" | "e")) =>
+            {
+                operands.into_iter().nth(1)
+            }
+            _ => None,
+        };
+        found.extend(archive.as_deref().and_then(as_file));
+    }
+}
+
+/// The commands a `package.json` script line runs: `"postinstall": "node
+/// scripts/x.js"`, and any `"scripts"` entry.
+fn package_json_runs(line: &str, found: &mut Vec<String>) {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with('"') {
+        return;
+    }
+    let Some((key, value)) = trimmed[1..].split_once("\":") else {
+        return;
+    };
+    // A key naming a lifecycle script or any entry of the scripts map.
+    let script_key = key.ends_with("install")
+        || key.ends_with("prepare")
+        || key.ends_with("prepublish")
+        || matches!(
+            key,
+            "start" | "build" | "postinstall" | "preinstall" | "prestart"
+        );
+    if !script_key && !trimmed.contains("script") {
+        // Only recognised script keys, to stay off ordinary JSON strings.
+        return;
+    }
+    let value = value.trim().trim_end_matches(',');
+    if let Some(command) = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        found.extend(run_targets(&command.replace("\\\"", "\"")));
+    }
 }
 
 /// Variables a file sets to a fetcher or a shell (`F=curl`, `S="bash"`),
@@ -1079,7 +1328,10 @@ fn skip_pipe_wrappers<'a>(words: &mut impl Iterator<Item = &'a str>) -> Option<&
 /// a shell or another interpreter, `source`/`.`, a `$SHELL` variable, or
 /// `busybox sh`.
 fn consumes_pipe<'a>(word: &str, mut rest: impl Iterator<Item = &'a str>, spaced: bool) -> bool {
-    let cleaned = word.trim_matches(['(', '{', ')', '}', ';', '&', '"', '\'', '`', ' ']);
+    // In a JSON or QML string the command ends at `",` or `"]`.
+    let cleaned = word
+        .trim_end_matches([',', ']'])
+        .trim_matches(['(', '{', ')', '}', ';', '&', '"', '\'', '`', ' ']);
     let program = program_name(cleaned);
     // `source /dev/stdin`, `. /dev/stdin`.
     if matches!(program, "source" | ".") {
@@ -1146,6 +1398,7 @@ fn is_encoded_command_execution(line: &str) -> bool {
             .any(|decoder| segment.contains(decoder))
         })
         || is_encoded_data_executed(line)
+        || encoded::matches(line)
 }
 
 pub fn is_encoded_data_executed(line: &str) -> bool {
@@ -1216,8 +1469,60 @@ fn without_sandbox_helper_setuid(line: &str) -> Option<String> {
 fn is_destructive_operation(line: &str) -> bool {
     contains_any(line, DESTRUCTIVE_COMMANDS)
         || writes_a_device(line)
+        || redirects_onto_device(line)
+        || relabels_partition_table(line)
         || formats_filesystem(line)
         || removes_root_or_home(line)
+}
+
+/// Raw block devices, by the prefix their names share. A redirection onto
+/// one overwrites the disk: `: > /dev/sda`, `cat x > /dev/nvme0n1`.
+const BLOCK_DEVICES: &[&str] = &[
+    "/dev/sd",
+    "/dev/nvme",
+    "/dev/vd",
+    "/dev/hd",
+    "/dev/mmcblk",
+    "/dev/loop",
+    "/dev/xvd",
+];
+
+/// A `>`/`>>` onto a whole block device.
+fn redirects_onto_device(line: &str) -> bool {
+    shell_words(line)
+        .iter()
+        .map(|word| unquoted(word))
+        .filter_map(|word| {
+            word.strip_prefix(">>")
+                .or_else(|| word.strip_prefix('>'))
+                .map(ToString::to_string)
+        })
+        .chain(
+            // `> /dev/sda` with a space: the device is the next word.
+            line.split('>')
+                .skip(1)
+                .filter_map(|rest| rest.split_whitespace().next().map(unquoted)),
+        )
+        .any(|target| {
+            BLOCK_DEVICES.iter().any(|device| {
+                target
+                    .strip_prefix(device)
+                    .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_alphanumeric()))
+            })
+        })
+}
+
+/// `parted … mklabel` / `mktable`, which replaces a disk's partition table.
+fn relabels_partition_table(line: &str) -> bool {
+    shell::statements(line).iter().any(|statement| {
+        shell::command(statement).is_some_and(|command| {
+            command.program == "parted"
+                && command
+                    .arguments
+                    .iter()
+                    .any(|word| matches!(word.as_str(), "mklabel" | "mktable"))
+        })
+    })
 }
 
 /// `dd` writing to a block device, in either argument order.
@@ -1368,7 +1673,17 @@ fn is_root_or_home(target: &str) -> bool {
     (target.starts_with('/') && base.is_empty()) || matches!(base, "~" | "$home" | "${home}")
 }
 
+/// A credential file named in the plain list, or a credential store handed
+/// to a command that takes it (see `exfil::takes_credential`).
+fn references_credential(line: &str) -> bool {
+    contains_any(line, CREDENTIAL_FILES)
+        || (exfil::mentions_credential(line) && exfil::takes_credential(line))
+}
+
 pub fn looks_like_credential_exfiltration(line: &str) -> bool {
+    if exfil::sends_secret(line) {
+        return true;
+    }
     let sends_data = [
         "curl ",
         "wget ",
@@ -2030,6 +2345,25 @@ mod tests {
     fn rules_for(line: &str) -> Vec<RuleId> {
         let lowered = line.to_lowercase();
         line_rules(&lowered, &lowered).collect()
+    }
+
+    #[test]
+    fn every_rule_has_a_unique_name_and_a_description() {
+        let mut names = std::collections::HashSet::new();
+        for rule in RuleId::ALL {
+            assert!(!rule.name().is_empty(), "{rule:?} has no name");
+            assert!(
+                names.insert(rule.name()),
+                "{rule:?} repeats the name {}",
+                rule.name()
+            );
+            assert!(
+                !rule.description().is_empty(),
+                "{} has no description",
+                rule.name()
+            );
+            assert_eq!(RuleId::from_name(rule.name()), Some(rule), "{rule:?}");
+        }
     }
 
     #[test]
