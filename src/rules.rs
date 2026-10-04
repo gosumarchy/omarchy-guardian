@@ -31,6 +31,12 @@ pub enum RuleId {
     UnknownKernelModule,
     UnknownPrivilegedFile,
     NetworkListener,
+    GuardianOverride,
+    PathHijack,
+    NewTrust,
+    PrivilegedAccount,
+    BootTampering,
+    RiskyConfiguration,
 }
 
 /// How a rule decides whether a lowercased line matches.
@@ -161,7 +167,7 @@ const DISABLED_TLS: &[&str] = &[
 ];
 
 impl RuleId {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 27] = [
         Self::DownloadAndExecute,
         Self::EncodedCommandExecution,
         Self::CredentialFileAccess,
@@ -183,6 +189,12 @@ impl RuleId {
         Self::UnknownKernelModule,
         Self::UnknownPrivilegedFile,
         Self::NetworkListener,
+        Self::GuardianOverride,
+        Self::PathHijack,
+        Self::NewTrust,
+        Self::PrivilegedAccount,
+        Self::BootTampering,
+        Self::RiskyConfiguration,
     ];
 
     pub fn from_name(name: &str) -> Option<Self> {
@@ -212,6 +224,12 @@ impl RuleId {
             Self::UnknownKernelModule => "unknown-kernel-module",
             Self::UnknownPrivilegedFile => "unknown-privileged-file",
             Self::NetworkListener => "network-listener",
+            Self::GuardianOverride => "guardian-override",
+            Self::PathHijack => "path-hijack",
+            Self::NewTrust => "new-trust",
+            Self::PrivilegedAccount => "privileged-account",
+            Self::BootTampering => "boot-tampering",
+            Self::RiskyConfiguration => "risky-configuration",
         }
     }
 
@@ -225,7 +243,12 @@ impl RuleId {
             | Self::HiddenProgram
             | Self::PreloadedLibrary
             | Self::UnknownKernelModule
-            | Self::UnknownPrivilegedFile => Severity::High,
+            | Self::UnknownPrivilegedFile
+            | Self::GuardianOverride
+            | Self::PathHijack
+            | Self::NewTrust
+            | Self::PrivilegedAccount
+            | Self::BootTampering => Severity::High,
             Self::NetworkListener => Severity::Low,
             Self::CredentialFileAccess
             | Self::PersistenceModification
@@ -237,7 +260,8 @@ impl RuleId {
             | Self::GitConfigCommand
             | Self::SshCommand
             | Self::RunningFromTemp
-            | Self::KeyboardReader => Severity::Medium,
+            | Self::KeyboardReader
+            | Self::RiskyConfiguration => Severity::Medium,
         }
     }
 
@@ -302,6 +326,24 @@ impl RuleId {
             Self::NetworkListener => {
                 "An interpreter (Python, a shell, Node) listens on the network, with no script on disk to look at."
             }
+            Self::GuardianOverride => {
+                "A unit file or drop-in changes what Guardian's own sweep runs; allowing the file does not quiet this."
+            }
+            Self::PathHijack => {
+                "A program or directory a user can write comes ahead of the system's own on PATH and takes over a command's name."
+            }
+            Self::NewTrust => {
+                "Something that was not there at the last sweep may now log in, administer or vouch here: an account, a member of an administrator group, an SSH key or a certificate authority."
+            }
+            Self::PrivilegedAccount => {
+                "An account has rights no ordinary system gives it: a second account with user id 0, or a system account someone can log in to."
+            }
+            Self::BootTampering => {
+                "The running kernel was started with a parameter that turns off a defence or replaces init and that the reviewed boot configuration does not hold, or a kernel image in /boot is not the one its package ships."
+            }
+            Self::RiskyConfiguration => {
+                "A configuration file redirects where programs, packages or web pages come from, or loads code into a program at every start."
+            }
         }
     }
 
@@ -326,7 +368,13 @@ impl RuleId {
             | Self::KeyboardReader
             | Self::UnknownKernelModule
             | Self::UnknownPrivilegedFile
-            | Self::NetworkListener => Matcher::Reported,
+            | Self::NetworkListener
+            | Self::GuardianOverride
+            | Self::PathHijack
+            | Self::NewTrust
+            | Self::PrivilegedAccount
+            | Self::BootTampering
+            | Self::RiskyConfiguration => Matcher::Reported,
             Self::DisabledTlsVerification => Matcher::Patterns(DISABLED_TLS),
         }
     }
@@ -358,7 +406,13 @@ impl RuleId {
             | Self::KeyboardReader
             | Self::UnknownKernelModule
             | Self::UnknownPrivilegedFile
-            | Self::NetworkListener => false,
+            | Self::NetworkListener
+            | Self::GuardianOverride
+            | Self::PathHijack
+            | Self::NewTrust
+            | Self::PrivilegedAccount
+            | Self::BootTampering
+            | Self::RiskyConfiguration => false,
         }
     }
 
