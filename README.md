@@ -1010,7 +1010,7 @@ long after the one install they were for.
 A permit can overrule findings of the local rules and the AI (exit 1), an
 incomplete review (a binary the recipe runs, an oversized or binary
 script, an inconclusive or invalid AI reply), an unavailable AI under
-`ai = required`, and a question nobody answered. For a pacman transaction
+`ai = required`, and a `confirm = true` question nobody answered. For a pacman transaction
 the incomplete reviews it can overrule are those about bytes inside an
 archive that was read and fingerprinted: an install scriptlet or auto-run
 file over 2 MiB or of binary data, more auto-run files than are reviewed,
@@ -1036,6 +1036,9 @@ No permit is offered, and none is honoured, for:
 - the AUR gate's refusals: a recipe that moves makepkg's directories or
   lists other sources than it writes out, a source that can be replaced in
   transit, sources that are not the ones Guardian fetched;
+- a question the AUR gate asked and got no yes to (prebuilt programs, a
+  recipe whose sources it cannot follow): that no is yours, and the way to
+  say yes is to run the build again from a terminal and answer it;
 - any block where part of the content has no digest: a file that could
   not be read or hashed, a link leading out of the tree, a tree over the
   size limits, upstream sources with unread parts.
@@ -2301,7 +2304,10 @@ anyone; step 5 makes that your decision instead of a silent pass.
 The upstream code of step 4 is judged by the AI: the local rules read the
 recipe and the files beside it (step 2), and a source tree is full of
 ordinary uses of what they name (a program that starts another, an install
-script quoted in the project's own tooling). With the AI review off for AUR
+script quoted in the project's own tooling). Two local checks read the
+upstream code even so, since they are about what the reviewer and you are
+shown: invisible tag characters and text reordered with bidirectional
+controls block the build. With the AI review off for AUR
 builds (`ai = "off"`, or the `local-only` level) the upstream code would
 pass unread, so there the local rules read it too, keeping their high
 findings only (download and run, encoded commands, a remote shell, text
