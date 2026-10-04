@@ -574,14 +574,17 @@ fn installed() -> Result<&'static Path, String> {
     Ok(program)
 }
 
-/// Changes the system's list of allowed items through sudo (see
-/// `system_allow_command`).
-pub fn system_allow(arguments: &[&str]) -> Result<(), String> {
+/// Runs the installed Guardian's `command` with `arguments` as root,
+/// through sudo, which asks for the password on the terminal, to do
+/// `what` ("changing ..."), which is said first. What only root may write
+/// is written this way: by the installed, root-owned program, never by the
+/// one that is running.
+pub fn as_root(command: &str, arguments: &[&str], what: &str) -> Result<(), String> {
     let program = installed()?;
-    errln!("Guardian needs root to change what this system allows; it asks for your password.");
+    errln!("Guardian needs root for {what}; it asks for your password.");
     let status = Command::new(SUDO)
         .arg(program)
-        .arg("sweep-allow-system")
+        .arg(command)
         .args(arguments)
         .stdin(Stdio::inherit())
         .status()
@@ -590,9 +593,19 @@ pub fn system_allow(arguments: &[&str]) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "changing the system's allowed items failed ({status}); nothing was changed. If the installed Guardian is older than this one, run ./install.sh"
+            "{what} failed ({status}); nothing was changed. If the installed Guardian is older than this one, run ./install.sh"
         ))
     }
+}
+
+/// Changes the system's list of allowed items through sudo (see
+/// `system_allow_command`).
+pub fn system_allow(arguments: &[&str]) -> Result<(), String> {
+    as_root(
+        "sweep-allow-system",
+        arguments,
+        "changing the system's allowed items",
+    )
 }
 
 /// The longest label and fingerprint the system's list takes.

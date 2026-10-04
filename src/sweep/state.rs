@@ -93,7 +93,9 @@ fn write_text(path: &Path, text: &str) -> Result<(), String> {
     write_text_mode(path, text, 0o600)
 }
 
-fn write_text_mode(path: &Path, text: &str, mode: u32) -> Result<(), String> {
+/// Writes `text` to `path` through a new file and a rename, so a reader
+/// never sees half of it.
+pub fn write_text_mode(path: &Path, text: &str, mode: u32) -> Result<(), String> {
     let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
     drop(fs::remove_file(&temporary));
     let result = OpenOptions::new()
@@ -178,26 +180,37 @@ pub fn is_home_label(label: &str) -> bool {
     label.starts_with("~/")
 }
 
-/// The system list at `path`, while it and the directories above it up to
-/// `/var/lib` are root's and nobody else may write them; empty otherwise.
-pub fn system_allowed(path: &Path) -> Remembered {
-    let root_alone = |path: &Path| {
+/// The directory above everything Guardian's root halves write.
+pub const ROOT_STATE_ANCHOR: &str = "/var/lib";
+
+/// Whether the file at `path` is `owner`'s alone to write: a regular file
+/// of at most `max_bytes`, which, like every directory above it up to
+/// `anchor`, is owned by `owner` and not writable by a group or by
+/// everyone. For root's state, `owner` is 0 and `anchor` is `/var/lib`.
+pub fn owned_alone(path: &Path, owner: u32, anchor: &Path, max_bytes: u64) -> bool {
+    let alone = |path: &Path| {
         fs::symlink_metadata(path)
-            .is_ok_and(|metadata| metadata.uid() == 0 && metadata.mode() & 0o022 == 0)
+            .is_ok_and(|metadata| metadata.uid() == owner && metadata.mode() & 0o022 == 0)
     };
     let mut directory = path.parent();
     while let Some(current) = directory {
-        if !root_alone(current) {
-            return Remembered::new();
+        if !alone(current) {
+            return false;
         }
-        if current == Path::new("/var/lib") {
+        if current == anchor {
             break;
         }
         directory = current.parent();
     }
     let regular = fs::symlink_metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= MAX_SYSTEM_LIST_BYTES);
-    if !(regular && root_alone(path)) {
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= max_bytes);
+    regular && alone(path)
+}
+
+/// The system list at `path`, while it and the directories above it up to
+/// `/var/lib` are root's and nobody else may write them; empty otherwise.
+pub fn system_allowed(path: &Path) -> Remembered {
+    if !owned_alone(path, 0, Path::new(ROOT_STATE_ANCHOR), MAX_SYSTEM_LIST_BYTES) {
         return Remembered::new();
     }
     read(path)
