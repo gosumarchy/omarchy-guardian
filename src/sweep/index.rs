@@ -53,6 +53,9 @@ pub struct PackageIndex {
     packages: Vec<String>,
     owners: HashMap<String, Owned>,
     foreign: HashSet<String>,
+    /// Packages a repository carries by name but that were installed from
+    /// a file nothing vouched for (`pacman -U`): they are in `foreign` too.
+    pub unverified: Vec<String>,
     /// Repository-package files by content, for files copied out of a
     /// package (Omarchy's `etc-overrides`).
     copies: HashMap<Digest, Vec<String>>,
@@ -82,13 +85,16 @@ impl PackageIndex {
         let mut total = 0;
         for directory in directories {
             let shown = directory.display().to_string();
-            let Some(name) = fs::read_to_string(directory.join("desc"))
-                .ok()
-                .and_then(|desc| package_name(&desc))
-            else {
+            let desc = fs::read_to_string(directory.join("desc")).unwrap_or_default();
+            let Some(name) = package_name(&desc) else {
                 index.problems.push(format!("{shown}: no package name"));
                 continue;
             };
+            // A repository package of the same name says nothing about a
+            // package file installed by hand.
+            if !was_verified(&desc) && index.foreign.insert(name.clone()) {
+                index.unverified.push(name.clone());
+            }
             match read_mtree(&directory.join("mtree")) {
                 Ok(text) => {
                     total += text.len();
@@ -230,6 +236,32 @@ fn package_name(desc: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The lines of field `field` (`%VALIDATION%`) of a package's `desc`.
+fn desc_field<'a>(desc: &'a str, field: &str) -> Vec<&'a str> {
+    desc.lines()
+        .skip_while(|line| *line != field)
+        .skip(1)
+        .take_while(|line| !line.is_empty() && !line.starts_with('%'))
+        .map(str::trim)
+        .collect()
+}
+
+/// Whether pacman checked the package against anything when it installed
+/// it, from `%VALIDATION%` in its `desc`: `pgp` is a signature, `sha256`
+/// and `md5` the checksum a sync database gave for it, which only a
+/// package that came through a repository has. `none` is what `pacman -U`
+/// leaves for a package file without a signature: it may carry the name
+/// of a repository package and be anything.
+///
+/// The version is not compared with the sync databases': a file installed
+/// by hand can take any version, and a repository package that waits for
+/// an update would read as built by the user.
+fn was_verified(desc: &str) -> bool {
+    desc_field(desc, "%VALIDATION%")
+        .iter()
+        .any(|how| matches!(*how, "pgp" | "sha256" | "md5"))
+}
+
 fn read_mtree(path: &Path) -> Result<String, Error> {
     let captured = tools::run(
         Path::new(GZIP),
@@ -245,8 +277,9 @@ fn read_mtree(path: &Path) -> Result<String, Error> {
     String::from_utf8(bytes).map_err(|_| Error::Refused(format!("{}: not UTF-8", path.display())))
 }
 
-/// The packages from no configured repository (`pacman -Qmq`). pacman exits
-/// 1 when there are none.
+/// The packages no configured repository carries by name (`pacman -Qmq`);
+/// `PackageIndex::load` adds the ones installed from an unverified file.
+/// pacman exits 1 when there are none.
 pub fn foreign_packages() -> Result<HashSet<String>, Error> {
     let captured = tools::run(
         Path::new(PACMAN),
@@ -406,6 +439,18 @@ mod tests {
             Some("openssh")
         );
         assert_eq!(package_name("%VERSION%\n1\n"), None);
+        for (validation, verified) in [
+            ("pgp", true),
+            ("sha256\npgp", true),
+            ("sha256", true),
+            ("md5\nsha256", true),
+            ("none", false),
+            ("", false),
+        ] {
+            let desc = format!("%NAME%\nx\n\n%VALIDATION%\n{validation}\n\n%XDATA%\npkgtype=pkg\n");
+            assert_eq!(super::was_verified(&desc), verified, "{validation}");
+        }
+        assert!(!super::was_verified("%NAME%\nx\n"));
         assert_eq!(
             parse_names(b"yay-bin\nomarchy-guardian\n"),
             HashSet::from(["yay-bin".to_string(), "omarchy-guardian".to_string()])
@@ -415,7 +460,13 @@ mod tests {
     fn write_package(db: &Path, name: &str, mtree: &str) {
         let directory = db.join(format!("{name}-1-1"));
         fs::create_dir_all(&directory).unwrap();
-        fs::write(directory.join("desc"), format!("%NAME%\n{name}\n")).unwrap();
+        // `local` stands for a package file installed with `pacman -U`.
+        let validation = if name == "local" { "none" } else { "sha256" };
+        fs::write(
+            directory.join("desc"),
+            format!("%NAME%\n{name}\n\n%VERSION%\n1-1\n\n%VALIDATION%\n{validation}\n\n"),
+        )
+        .unwrap();
         fs::write(directory.join("files"), "%FILES%\n").unwrap();
         fs::write(directory.join("mtree.txt"), mtree).unwrap();
         let status = Command::new("/usr/bin/gzip")
@@ -459,8 +510,17 @@ mod tests {
             "#mtree\n./usr/bin/demo time=1.0 mode=755 size=1 sha256digest=00\n./usr/bin/other time=1.0 mode=755\n",
         );
         fs::create_dir(db.path().join("broken-1-1")).unwrap();
+        write_package(
+            db.path(),
+            "local",
+            "#mtree\n./usr/bin/local time=1.0 mode=755\n",
+        );
 
         let index = PackageIndex::load(db.path(), HashSet::from(["other".to_string()])).unwrap();
+        // Installed from a file nothing vouched for: as foreign as one no
+        // repository knows, whatever its name.
+        assert!(index.is_foreign("local"));
+        assert_eq!(index.unverified, ["local"]);
         let demo = index.owner("usr/bin/demo").unwrap();
         assert_eq!(index.package(demo), "demo");
         assert_eq!(
@@ -469,7 +529,7 @@ mod tests {
         );
         assert!(index.owner("usr/bin/missing").is_none());
         assert!(index.is_foreign("other") && !index.is_foreign("demo"));
-        assert_eq!(index.len(), 6);
+        assert_eq!(index.len(), 7);
         assert_eq!(index.problems.len(), 1, "{:?}", index.problems);
     }
 }

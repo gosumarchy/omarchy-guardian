@@ -45,6 +45,12 @@ pub enum RuleId {
     CryptoMiner,
     ProtectionDisabled,
     TraceRemoval,
+    GuardianOverride,
+    PathHijack,
+    NewTrust,
+    PrivilegedAccount,
+    BootTampering,
+    RiskyConfiguration,
 }
 
 /// How a rule decides whether a lowercased line matches.
@@ -189,7 +195,7 @@ const PRIVILEGE_ESCALATION: &[&str] = &[
 ];
 
 impl RuleId {
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 37] = [
         Self::DownloadAndExecute,
         Self::EncodedCommandExecution,
         Self::CredentialFileAccess,
@@ -221,6 +227,12 @@ impl RuleId {
         Self::CryptoMiner,
         Self::ProtectionDisabled,
         Self::TraceRemoval,
+        Self::GuardianOverride,
+        Self::PathHijack,
+        Self::NewTrust,
+        Self::PrivilegedAccount,
+        Self::BootTampering,
+        Self::RiskyConfiguration,
     ];
 
     pub fn from_name(name: &str) -> Option<Self> {
@@ -260,6 +272,12 @@ impl RuleId {
             Self::CryptoMiner => "crypto-miner",
             Self::ProtectionDisabled => "protection-disabled",
             Self::TraceRemoval => "trace-removal",
+            Self::GuardianOverride => "guardian-override",
+            Self::PathHijack => "path-hijack",
+            Self::NewTrust => "new-trust",
+            Self::PrivilegedAccount => "privileged-account",
+            Self::BootTampering => "boot-tampering",
+            Self::RiskyConfiguration => "risky-configuration",
         }
     }
 
@@ -279,7 +297,12 @@ impl RuleId {
             | Self::InvisibleText
             | Self::RemoteShell
             | Self::CryptoMiner
-            | Self::ProtectionDisabled => Severity::High,
+            | Self::ProtectionDisabled
+            | Self::GuardianOverride
+            | Self::PathHijack
+            | Self::NewTrust
+            | Self::PrivilegedAccount
+            | Self::BootTampering => Severity::High,
             Self::NetworkListener => Severity::Low,
             Self::CredentialFileAccess
             | Self::PersistenceModification
@@ -295,7 +318,8 @@ impl RuleId {
             | Self::HiddenCharacter
             | Self::LookalikeHost
             | Self::DataDropHost
-            | Self::TraceRemoval => Severity::Medium,
+            | Self::TraceRemoval
+            | Self::RiskyConfiguration => Severity::Medium,
         }
     }
 
@@ -390,6 +414,24 @@ impl RuleId {
             Self::TraceRemoval => {
                 "Erases shell history or system logs, which is how traces of other commands are removed."
             }
+            Self::GuardianOverride => {
+                "A unit file or drop-in changes what Guardian's own sweep runs; allowing the file does not quiet this."
+            }
+            Self::PathHijack => {
+                "A program or directory a user can write comes ahead of the system's own on PATH and takes over a command's name."
+            }
+            Self::NewTrust => {
+                "Something that was not there at the last sweep may now log in, administer or vouch here: an account, a member of an administrator group, an SSH key or a certificate authority."
+            }
+            Self::PrivilegedAccount => {
+                "An account has rights no ordinary system gives it: a second account with user id 0, or a system account someone can log in to."
+            }
+            Self::BootTampering => {
+                "The running kernel was started with a parameter that turns off a defence or replaces init and that the reviewed boot configuration does not hold, or a kernel image in /boot is not the one its package ships."
+            }
+            Self::RiskyConfiguration => {
+                "A configuration file redirects where programs, packages or web pages come from, or loads code into a program at every start."
+            }
         }
     }
 
@@ -420,7 +462,13 @@ impl RuleId {
             | Self::InvisibleText
             | Self::HiddenCharacter
             | Self::LookalikeHost
-            | Self::DataDropHost => Matcher::Reported,
+            | Self::DataDropHost
+            | Self::GuardianOverride
+            | Self::PathHijack
+            | Self::NewTrust
+            | Self::PrivilegedAccount
+            | Self::BootTampering
+            | Self::RiskyConfiguration => Matcher::Reported,
             Self::DisabledTlsVerification => Matcher::Custom(disables_tls_verification),
             Self::RemoteShell => Matcher::Custom(is_remote_shell),
             Self::CryptoMiner => Matcher::Custom(is_crypto_mining),
@@ -466,7 +514,13 @@ impl RuleId {
             | Self::InvisibleText
             | Self::HiddenCharacter
             | Self::RemoteShell
-            | Self::CryptoMiner => false,
+            | Self::CryptoMiner
+            | Self::GuardianOverride
+            | Self::PathHijack
+            | Self::NewTrust
+            | Self::PrivilegedAccount
+            | Self::BootTampering
+            | Self::RiskyConfiguration => false,
         }
     }
 

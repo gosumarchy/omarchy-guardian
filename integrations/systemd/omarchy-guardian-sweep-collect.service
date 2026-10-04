@@ -36,6 +36,22 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
+# The system calls of an ordinary service: files, processes, pipes and
+# timers for itself and the helpers it runs (pacman, gzip, getcap, each
+# under timeout), and chown for its results. Reading another process
+# through /proc is a file read, checked against CAP_SYS_PTRACE; the ptrace
+# call itself is not needed and is in none of the groups let through. The
+# groups named again after ~ are left out of @system-service already;
+# naming them keeps them out should that group ever grow. A call outside
+# the list fails with "not permitted" instead of killing the collector, so
+# that a helper that asks for something unusual costs one check, not all.
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @module @reboot @swap @raw-io @clock @cpu-emulation @debug @obsolete
+SystemCallErrorNumber=EPERM
+# No keys of root's session, and no System V or POSIX message queues of
+# the host's.
+KeyringMode=private
+PrivateIPC=yes
 UMask=0077
 # A sweep takes minutes; one that hangs is stopped, and the bar says the
 # results are old.

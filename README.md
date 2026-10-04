@@ -158,29 +158,136 @@ logrotate, systemd manager and login-screen configuration, the sessions the
 login screen offers, the kernel command line, DKMS build configuration, and
 Python's `.pth` and `sitecustomize` files, which every Python program runs
 at start), a few more only the sweep reads (PAM modules, libraries in
-`glibc-hwcaps`, the Limine config) and, in your home, user services (in
-`~/.config` and `~/.local/share`), session D-Bus services, autostart
-entries, shell files and fish functions, what uwsm sources, the Waybar
+`glibc-hwcaps`, the Limine config, `/etc/fstab` and `/etc/crypttab`, Podman
+quadlets in `/etc/containers/systemd`, `at` jobs, browser policies and
+native-messaging hosts, system-wide Flatpak overrides, added certificate
+authorities and `/etc/hosts`) and, in your home, user services (in
+`~/.config`, `~/.config/systemd/user.control` and `~/.local/share`) and
+Podman quadlets, session D-Bus services, autostart
+entries, shell files, fish functions, completions and saved variables,
+`~/.inputrc`, `~/.pam_environment`, the X session files, what uwsm sources,
+the Waybar
 configuration, the Hyprland Lua configuration (and what `exec_on_start`
 starts), Omarchy hooks, SSH and git configuration, your own Python `.pth`
-files, and programs in `~/.local/bin` named like system commands. It
+files, and what the list further down adds. It
 follows links and what each file runs, so a trusted service running a
 replaced binary, or an interpreter running a script, is checked too: past
 wrappers (`sudo -u`, `uwsm app --`, `systemd-run`, `env`, `timeout`,
 `flock`), into each command a shell is handed with `-c`, and each command of a
 line a shell runs joined with `;`, `&`, `|` or a line break (a crontab's,
-say), the first 32 of each,
+say), the first 1024 of each,
 into the files a shell start-up file reads in with `source` or `.` and
-the programs its statements start by a path (on lines up to 4 KB), a unit's `EnvironmentFile=`, and a Hyprland `.conf`'s
-`source`, `plugin` and `bind … exec` lines. A bare command name is looked
-for in `~/.local/bin`, `~/.cargo/bin`, `~/bin`, `/usr/local` and
-`/usr/bin`, and every place it is found in is judged; `~`, `$HOME`, `%h`,
+the programs its statements start by a path (on lines up to 64 KB), the
+start-up files zsh reads from the directory a `ZDOTDIR=` line names, a
+unit's `EnvironmentFile=`, the files and directories a sudoers file
+includes, and a Hyprland `.conf`'s
+`source`, `plugin` and `bind … exec` lines, with the commands hypridle,
+hyprlock and their like run (`on-timeout`, `on-resume`, `lock_cmd`,
+`before_sleep_cmd` and so on). A unit's command that runs over several
+lines (ending in `\`) is read as one, and `%h`, `%E`, `%S`, `%C` and `%L`
+(and `%t` in a system unit) are written out. `~`, `$HOME`,
 the XDG directories at their default places and a path a start-up file
 puts in a variable of its own (`TOOLS=~/opt/tools`, then `$TOOLS/run`)
 are understood, other variables are not. A Hyprland `source` with `*` or
-`?` in its last part is followed to the files it matches (up to 64). The
+`?` in its last part is followed to the files it matches (up to 1024). The
 file itself is always reviewed as text; what is not followed is only the
-extra look at the program it names. A link of the same name to a
+extra look at the program it names. Where one of these limits is reached
+(or a chain of more than 8 links), the item says so in its notes and
+cannot be allowed, since an allow would vouch for commands nobody
+followed; and where the item's text is not reviewed either (a file kept
+from the AI), the sweep is **incomplete**.
+
+**Programs ahead of the system's own.** A program in a directory that
+comes before `/usr/bin` on `PATH` runs whenever its name is typed. Which
+directories those are is read from the real `PATH`s: the one the sweep
+runs with, the systemd user manager's (`systemctl --user
+show-environment`), and the `PATH` lines of your shell start-up files
+(bash, zsh and fish forms, where they are written out), with the usual ones
+(`~/.local/bin`, `~/.cargo/bin`, `~/bin`, mise's shims, the Go, Bun, Deno,
+pnpm, npm and Nix directories) added where no `PATH` that was read puts
+them behind `/usr/bin`. A bare command name in an auto-run file is looked
+for along that same list, first where a shell would look first, and every
+place it is found in is judged. In each directory on it that someone other
+than root can write, the programs named like a command in `/usr/bin` are
+listed. One named like a command that asks for a password, fetches or
+installs (`sudo`, `su`, `doas`, `pkexec`, `run0`, `ssh`, `scp`, `git`,
+`gpg`, `pacman`, `yay`, `paru`, `makepkg`, `systemctl`, `loginctl`,
+`passwd`, `curl`, `wget`, a shell, `omarchy-guardian`) is a high finding
+wherever it is; `python`, `node`, `claude`, `opencode` and the `omarchy-*`
+commands are one too, unless a version manager put them there: a mise shim
+(a link to mise itself, as trusted as that mise) or a program in mise's
+install directory or `~/.cargo/bin` is shown as `user-built` at most. A
+start-up file that puts the working directory (`.`, or an empty entry) or
+a temporary or cache directory on `PATH` is a finding on that file.
+
+**More that decides what runs.** These run nothing by themselves, so each
+has a plain local rule besides the review of its text:
+
+- browser flags (`~/.config/chromium-flags.conf`, `chrome-`, `brave-`,
+  `code-` and `electron*-flags.conf`): an extension loaded from outside
+  `/usr` and `/opt`, a remote-debugging port, a proxy, switched-off web
+  security; browser policies in `/etc` that force an extension, a proxy or
+  certificates; native-messaging hosts (Chromium, Chrome, Brave, Firefox),
+  whose program is followed like any command;
+- the shell or command a terminal or prompt starts each time (alacritty,
+  kitty with its `startup_session` and `watcher`, ghostty, foot, the
+  `command` and `when` of a starship custom module, tmux's `run-shell`,
+  `default-command` and `source-file`), followed like any command;
+- `mimeapps.list` and the launchers it names in
+  `~/.local/share/applications`: one that opens web links (`http`, `https`,
+  `text/html`) without a namesake in `/usr/share/applications` is a
+  finding;
+- Flatpak overrides that open the sandbox to the home or the host, or let
+  an app talk to `org.freedesktop.Flatpak`;
+- editor start-up files (`~/.config/nvim/init.lua` and `init.vim`,
+  `plugin/`, `after/plugin/` and `lua/`, `~/.vimrc`, `~/.vim/plugin`), and
+  the two VS Code settings that run a folder's tasks unasked (the list of
+  installed extensions is not read);
+- mise's configuration (what it sources, its hooks and tasks) and cargo's
+  (`rustc-wrapper`, `linker`, `runner`, a replaced source), whose commands
+  are followed; `~/.npmrc`, pip's, gem's, yarn's, bun's and Go's
+  configuration, where a registry other than the usual one, a
+  `script-shell`, a `trusted-host`, `-toolexec` or switched-off checks are
+  findings. These hold registry tokens, so like the SSH and git files they
+  are checked locally and never sent to the AI (mise's and cargo's are
+  reviewed, with secret-looking values taken out); so are an editor's
+  `settings.json` and fish's saved variables;
+- `/etc/hosts`: a line for a host that updates, packages or the AI review
+  come from (archlinux.org, omarchy.org, github.com, anthropic.com, the
+  package registries) is a finding; a `keyscript=` in `/etc/crypttab` is
+  one too.
+
+**Accounts, keys and trust anchors.** Each of these is an item of its own,
+checked locally and never sent to the AI: every account with a login shell
+(a second account with user id 0, and a system account with a login shell
+and a password that works, are high findings), every member of a group
+that amounts to root (`wheel`, `sudo`, `root`, `docker`, `lxd`,
+`incus-admin`, `libvirt`, `disk`, `shadow`), every key in your
+`~/.ssh/authorized_keys` and `authorized_keys2` and in the files
+`AuthorizedKeysFile` in the server's configuration names (shown by type,
+SHA-256 fingerprint and comment, as `ssh-keygen -l` prints them, never the
+key), and every certificate authority added in
+`/etc/ca-certificates/trust-source/anchors` or
+`/usr/local/share/ca-certificates`. The files `TrustedUserCAKeys` and
+`AuthorizedPrincipalsFile` name are followed like a command. Once a sweep
+has looked at these, one that is new or changed at the next sweep is a
+high finding ("a key that may log in as you"), not only a line in
+`--diff`; allow the ones you know. The first sweep that sees them has
+nothing to compare with and only lists them.
+
+**Guardian's own units.** The daily sweep is a user unit, so a file in
+your home can replace it or change any line of it: a drop-in in
+`~/.config/systemd/user/omarchy-guardian-sweep.service.d/` that sets
+`HOME=`, `XDG_STATE_HOME=` or `ExecStart=`, a unit of the same name earlier
+on systemd's search path, a mask, or the same in
+`~/.config/systemd/user.control/`, `~/.local/share/systemd/user`,
+`/run/user/<uid>/systemd`, `/etc/systemd/user` and for the root checks'
+units in the system's unit directories. Any of these (also a drop-in for
+every `omarchy-…` unit or for every service) is a high finding of its own
+that cannot be allowed. The root checks report the ones in your home too,
+so the finding does not rest on a sweep the override may have redirected.
+
+A link of the same name to a
 packaged file is trusted only
 where that is how the thing is enabled (a unit in a systemd unit
 directory, a hook in pacman's, a launcher in an autostart directory, a
@@ -234,6 +341,21 @@ clean system shows nothing here:
 As a user only your own processes can be looked at; the root checks see
 all of them.
 
+It also looks at how the machine was started. The command line of the
+running kernel (`/proc/cmdline`) is compared with the boot configuration
+(Limine's, `/etc/kernel/cmdline`, and GRUB's and systemd-boot's where they
+are used): a parameter that replaces init or the unit to start, opens a
+shell (`init=`, `rdinit=`, `systemd.unit=`, `rd.break`), or turns a defence
+off (`module.sig_enforce=0`, `lockdown=none`, `selinux=0`, `apparmor=0`,
+`audit=0`, `mitigations=off`) and that the configuration does not hold was
+typed at the boot menu or put there by something that is not reviewed, and
+is a high finding. Every `vmlinuz` under `/boot` is compared by SHA-256
+with the ones the installed kernel packages ship in `/usr/lib/modules`; one
+that matches none is a high finding. `/boot` is usually root's alone, so
+this is the root checks' to do, and your own sweep says so in a note. A
+note also says whether Secure Boot is on. The EFI programs (the boot loader
+itself) and what is inside the initramfs image are not looked at.
+
 A file or directory whose name is not valid UTF-8 cannot be checked, and
 shells, udev and pacman read such names all the same: the sweep says so and
 is **incomplete** (exit 2), as it is when there are more files than it
@@ -252,11 +374,29 @@ unit's own name, never for units that open a root shell:
 | package | Exactly what a repository package installed | with `--all` |
 | inert | A masked unit (link to `/dev/null`, or an empty file) or another empty file; not when it masks a defence, Guardian's own sweep included | with `--all` |
 | copy | Identical to a file a repository package ships (Omarchy's `etc-overrides`) | with `--all` |
-| user-built | From a package of no configured repository (AUR, `pacman -U`) | yes |
+| user-built | From a package of no configured repository (AUR), or from a package file nothing checked (`pacman -U`), whatever its name; or put there by a version manager (mise) | yes |
 | edited | A package's configuration file, changed as configuration is meant to be | yes |
 | allowed | Allowed with `sweep allow` while unchanged | with `--all` |
 | modified | A package's file that is no longer what the package shipped (content, link, set-id or write bits) | yes, and a high finding |
 | unknown | No package installed it | yes |
+
+A package counts as a repository's when a repository carries its name
+and pacman checked it on the way in: by its signature, or by the checksum
+the sync database gave for it (`%VALIDATION%` in the local database says
+which). A package file installed by hand with `pacman -U` has neither
+(`none`), so its files are `user-built` and reviewed even when it takes the
+name of a repository package, and they never vouch for a copy elsewhere; a
+note names such packages. The version is not compared with the sync
+database: a file can take any version, and a repository package that waits
+for an update would read as built by the user.
+
+The defences whose mask is shown are firewalls (`ufw`, `firewalld`,
+`nftables`, `iptables`, `ip6tables`, `opensnitchd`), `apparmor`, `auditd`
+and `audit-rules`, `usbguard`, `fail2ban`, `sshguard`, `crowdsec`, the
+ClamAV, AIDE and rkhunter units, the snapshot timers a rollback needs
+(`snapper-*`, `grub-btrfsd`, `limine-snapper-sync`), `systemd-journald` and
+Guardian's own. Masking `systemd-resolved` or `systemd-coredump` is common
+and stays `inert`.
 
 Everything shown that holds text goes through the local rules and the AI
 review (class `system`), with the review memory, so a repeated sweep of an
@@ -301,10 +441,27 @@ own search for set-id files too, it reaches by entering each directory as
 it opened it, so one swapped for a link while it reads is not followed.
 Old password hashes
 (`/etc/security/opasswd`) are never read. Root's view only fills in what
-your own sweep could not read. Crontabs of other accounts are left out of
-the results (a note says how many): only root's, and those of the
-accounts in the group allowed to read them (or, for `sweep --root`, yours)
-come back. In what is sent for review, the values of assignments that look
+your own sweep could not read. Crontabs and `at` jobs of other accounts are
+left out of the results (a note says how many): only root's, and those of
+the accounts in the group allowed to read them (or, for `sweep --root`,
+yours) come back. An `at` job starts with the whole environment of whoever
+queued it, so it comes back as a hash only.
+
+For the accounts the results go to, the collector also looks into their
+home: at what overrides Guardian's user units there (by path and hash, the
+content stays), and at the keys that may log in as them. It looks as that
+account could look itself: no link is followed, every directory on the way
+must be one the account may enter and the file one it may read, as its
+owner or as anyone, so a key file that is a link to a file of root's shows
+nothing and the account learns nothing it could not have read. Of every
+other account with a home under `/home` only the number of keys comes back,
+with a hash of the list so that a change shows: whose keys they are is that
+account's to see, like its crontab. Root's own keys come back one by one.
+`/etc/shadow` is read for one thing, by its fixed name: whether a system
+account that has a login shell also has a password that works, yes or no.
+No hash leaves the collector.
+
+In what is sent for review, the values of assignments that look
 like secrets and the passwords of addresses (`https://user:password@…`)
 are taken out, where they are written as plain characters: one with `$`,
 a backtick or the like in it could be code a shell runs, and stays to be
@@ -329,13 +486,27 @@ read.
   sandboxed (a read-only system, no network, no devices beyond the standard
   ones, and of root's privileges only
   those to read files, look at other users' processes and hand its results
-  to your group; it is stopped after half an hour) and writes only
+  to your group; only the system calls of an ordinary service, without
+  mounting, modules, raw I/O, the clock or tracing; no keys of root's
+  session; it is stopped after half an hour) and writes only
   `/var/lib/omarchy-guardian/sweep/root.json` (root-owned, mode 0640, your
   group). Your sweep uses it only while it is root's alone and less than 36
   hours old. This makes the root-only items it lists (a sudoers drop-in no
   package installed, say) readable by your group, so it is only used when
   your primary group is yours alone; if it is shared with other accounts,
-  root checks run only with `sweep --root`.
+  root checks run only with `sweep --root`. The sandbox limits what a bug
+  in the collector could change; it does not contain it: a process that is
+  root and may read every file and every other process's memory
+  (`CAP_DAC_READ_SEARCH`, `CAP_SYS_PTRACE`) has the secrets of the whole
+  machine within reach if it is taken over.
+
+The user unit gives up what the sweep and the AI reviewer it starts do not
+need (gaining privileges, making set-id files, real-time priority, another
+system-call interface). It cannot be given a read-only system the way the
+collector is: in a user unit that puts the sweep into a user namespace of
+its own, where every file of root's reads as nobody's, and the sweep could
+no longer tell root's files (the list of allowed items, the root checks'
+results) from anyone's.
 
 Without root checks (declined, or not answered yet) every sweep is
 incomplete and says what it could not check, and the bar shows the sweep as
@@ -363,10 +534,11 @@ either fix it or tell Guardian you know it:
 
 ```sh
 omarchy-guardian sweep                                 # what is flagged, and why
-omarchy-guardian sweep allow '~/.local/bin/claude'     # trust it as it is now
+omarchy-guardian sweep allow '~/.local/bin/claude'     # trust it as it is now (asks for sudo)
 omarchy-guardian sweep allow /root/.local/bin/claude   # root's items too
 omarchy-guardian sweep --all                           # allowed items show as "allowed"
 omarchy-guardian sweep forget '~/.local/bin/claude'    # stop trusting it (or: forget --all)
+omarchy-guardian sweep allow --migrate                 # move what an older Guardian allowed
 omarchy-guardian sweep --report                        # save the report page and open it
 omarchy-guardian status --dismiss                      # clear the bar's alert
 ```
@@ -389,16 +561,26 @@ through the list with your agent without waiting for the daily sweep.
   once the daily root checks have run (root checks allowed in `protect`);
   `sweep allow` uses their latest results.
 - What cannot be read at all (a program that exists only in memory, a
-  deleted file) cannot be allowed; it stays listed while it runs.
-- Items in your home are allowed in a list that lives with the review
-  memory (`~/.local/state/omarchy-guardian/sweep/allowed.json`, private to
-  you). Anything else is allowed in the system's own list
-  (`/var/lib/omarchy-guardian/sweep/allowed.json`), which only root
-  writes: `sweep allow` and `sweep forget` ask for the sudo password for
-  those, and an entry for a system item in your own list does not count
-  (a sweep says how many such entries an older Guardian left there).
-  A program running as you cannot quiet an alert about the system that
-  way.
+  deleted file) cannot be allowed; it stays listed while it runs. Nor can
+  what overrides Guardian's own units, or an item whose commands were not
+  all followed.
+- Every allow is kept in one list only root writes
+  (`/var/lib/omarchy-guardian/sweep/allowed.json`), so `sweep allow` and
+  `sweep forget` ask for the sudo password, for items in your home too. A
+  program running as you can write any file of yours: were the list one of
+  them, it could drop an autostart entry and allow it in the same breath.
+  An item in a home is kept under the user id it was allowed for, so what
+  you allow in your home says nothing about another account's file of the
+  same name; `forget --all` drops the system's items and yours, not other
+  accounts'.
+- Guardian up to 0.7.18 kept the allows for your home in a file of your
+  own (`~/.local/state/omarchy-guardian/sweep/allowed.json`). It no longer
+  counts, and a sweep says how many entries it holds. `sweep allow
+  --migrate` lists them and, after you say yes and give the sudo password,
+  moves the ones whose files are still exactly what you allowed; the rest
+  (changed, gone, or not allowable) are named and dropped with the old
+  list. Read the list before you say yes: anything running as you could
+  have added to it.
 - What the scheduled sweeps have already told you about (`told.json`) is
   your own file too, since the sweep that writes it runs as you: a
   program already running as you can add to it and so quiet a

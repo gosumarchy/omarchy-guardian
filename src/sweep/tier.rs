@@ -190,17 +190,34 @@ fn is_guardians_own(path: &str, observed: Observed<'_>) -> bool {
 /// Packaged units that give a root shell without a password when enabled.
 const ROOT_SHELL_UNITS: &[&str] = &["debug-shell.service", "emergency.service", "rescue.service"];
 
-/// Units whose mask turns off a defence.
+/// Units whose mask turns off a defence: firewalls, access control and
+/// auditing, malware and intrusion scanners, what blocks repeated logins,
+/// the journal, the snapshots a rollback needs, and Guardian's own. A name
+/// stands for itself and for the units that start with it and a dash
+/// (`clamav-daemon`, `snapper-timeline.timer`). `systemd-resolved` and
+/// `systemd-coredump` are left out: masking them is common and harmless.
 const DEFENCES: &[&str] = &[
     "ufw",
     "firewalld",
     "nftables",
     "iptables",
     "ip6tables",
+    "opensnitchd",
     "apparmor",
     "auditd",
+    "audit-rules",
     "usbguard",
     "fail2ban",
+    "sshguard",
+    "crowdsec",
+    "clamav",
+    "aide",
+    "aidecheck",
+    "rkhunter",
+    "snapper",
+    "grub-btrfsd",
+    "limine-snapper-sync",
+    "btrfs-scrub",
     "systemd-journald",
     "omarchy-guardian",
 ];
@@ -582,6 +599,23 @@ mod tests {
         };
         let path = "etc/systemd/system/multi-user.target.wants/demo.service";
         assert_eq!(classify(path, link("/dev/null", None), &index), Tier::Inert);
+        // Masking the resolver or the core dumps is common and no defence
+        // lost; a unit that only starts like a defence is not one.
+        for unit in [
+            "systemd-resolved.service",
+            "systemd-coredump.socket",
+            "snapperd-x.service",
+        ] {
+            assert_eq!(
+                classify(
+                    &format!("etc/systemd/system/{unit}"),
+                    link("/dev/null", None),
+                    &index
+                ),
+                Tier::Inert,
+                "{unit}"
+            );
+        }
         assert_eq!(
             classify(
                 path,
@@ -618,6 +652,18 @@ mod tests {
             "home/u/.config/systemd/user/omarchy-guardian-sweep.timer",
             "etc/systemd/system/ufw.service",
             "etc/systemd/system/omarchy-guardian-sweep-collect.timer",
+            "etc/systemd/system/clamav-daemon.service",
+            "etc/systemd/system/clamav-clamonacc.service",
+            "etc/systemd/system/clamav-freshclam.service",
+            "etc/systemd/system/opensnitchd.service",
+            "etc/systemd/system/sshguard.service",
+            "etc/systemd/system/crowdsec.service",
+            "etc/systemd/system/audit-rules.service",
+            "etc/systemd/system/aidecheck.timer",
+            "etc/systemd/system/rkhunter.timer",
+            "etc/systemd/system/snapper-timeline.timer",
+            "etc/systemd/system/snapper-cleanup.timer",
+            "etc/systemd/system/systemd-journald.service",
         ] {
             let observed = Observed::File {
                 sha256: &empty,

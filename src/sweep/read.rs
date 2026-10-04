@@ -20,7 +20,7 @@ const MAX_DEPTH: usize = 6;
 /// Entries one location may hold before the rest is reported, not read.
 pub const MAX_ENTRIES: usize = 20_000;
 /// Links followed when resolving one.
-const MAX_HOPS: usize = 8;
+pub const MAX_HOPS: usize = 8;
 
 /// Why a file past the hash limit was not read.
 pub const TOO_LARGE: &str = "larger than the hash limit";
@@ -98,6 +98,12 @@ pub enum View {
     /// else owns or may write: the view of a path that root named but that
     /// leads through somebody else's directory, who decides what is there.
     Trusted,
+    /// What the account with this user id may see by itself: a directory
+    /// it may enter and a file it may read as their owner, or as anyone.
+    /// The view the root collector takes of an account's own files (its
+    /// keys, its units) when the results go to that account: it learns
+    /// nothing it could not have read.
+    Owner(u32),
 }
 
 /// What a pinned walk reached, and the path it really took.
@@ -134,6 +140,11 @@ pub fn seen(root: &Path, rel: &str, view: View) -> Option<Seen> {
         View::Pinned => true,
         View::Trusted if kept => true,
         View::Trusted | View::Everyone => metadata.mode() & bit != 0,
+        // Group rights are left out: who is in which group is not asked.
+        View::Owner(uid) => {
+            metadata.mode() & bit != 0
+                || (metadata.uid() == uid && metadata.mode() & (bit << 6) != 0)
+        }
     };
     let same = |left: &fs::Metadata, right: &fs::Metadata| {
         (left.dev(), left.ino()) == (right.dev(), right.ino())
@@ -476,24 +487,42 @@ pub fn public_hop(root: &Path, hop: &str) -> Hop {
 /// `resolve`, with the caller looking at each hop: a chain through a hop
 /// it does not show leads nowhere.
 pub fn resolve_where(rel: &str, target: &str, look: &dyn Fn(&str) -> Hop) -> Option<String> {
+    walk_links(rel, target, look).ok().flatten()
+}
+
+/// Whether the chain of links from `rel` is longer than is followed (or
+/// goes in a circle): where it ends was not looked at, which is not the
+/// same as it leading nowhere.
+pub fn chain_too_long(rel: &str, target: &str, look: &dyn Fn(&str) -> Hop) -> bool {
+    walk_links(rel, target, look).is_err()
+}
+
+/// `resolve_where`; `Err` when the chain did not end within `MAX_HOPS`.
+fn walk_links(rel: &str, target: &str, look: &dyn Fn(&str) -> Hop) -> Result<Option<String>, ()> {
     let mut current = rel.to_string();
     let mut target = target.to_string();
     for _ in 0..MAX_HOPS {
         let base = if target.starts_with('/') {
             PathBuf::new()
         } else {
-            Path::new(&current).parent()?.to_path_buf()
+            match Path::new(&current).parent() {
+                Some(parent) => parent.to_path_buf(),
+                None => return Ok(None),
+            }
         };
-        let next = normalize(&base.join(target.trim_start_matches('/')))?;
-        match look(&next)? {
-            Some(further) => {
+        let Some(next) = normalize(&base.join(target.trim_start_matches('/'))) else {
+            return Ok(None);
+        };
+        match look(&next) {
+            Some(Some(further)) => {
                 target = further;
                 current = next;
             }
-            None => return Some(next),
+            Some(None) => return Ok(Some(next)),
+            None => return Ok(None),
         }
     }
-    None
+    Err(())
 }
 
 /// `rel` with every directory link on the way resolved (`bin/sh` is

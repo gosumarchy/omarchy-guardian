@@ -49,10 +49,14 @@ pub enum Category {
     Camera,
     KernelModule,
     Setuid,
+    /// Looked at by the sweep only: no package ships into these.
+    Account,
+    Terminal,
+    Toolchain,
 }
 
 impl Category {
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 37] = [
         Self::Autostart,
         Self::Boot,
         Self::BootConfig,
@@ -87,6 +91,9 @@ impl Category {
         Self::Camera,
         Self::KernelModule,
         Self::Setuid,
+        Self::Account,
+        Self::Terminal,
+        Self::Toolchain,
     ];
 
     /// A stable machine name (`pam`, `systemd-generator`).
@@ -126,6 +133,9 @@ impl Category {
             Self::Camera => "camera",
             Self::KernelModule => "kernel-module",
             Self::Setuid => "setuid",
+            Self::Account => "account",
+            Self::Terminal => "terminal",
+            Self::Toolchain => "toolchain",
         }
     }
 
@@ -154,7 +164,6 @@ impl Category {
             Self::Autostart => "Autostart entries",
             Self::Boot => "Boot loader",
             Self::BootConfig => "Boot-time files (tmpfiles, sysusers)",
-            Self::Browser => "Browser policy and helper programs",
             Self::Cron => "Scheduled jobs (cron)",
             Self::Dbus => "D-Bus services and policy",
             Self::Desktop => "App launchers",
@@ -165,7 +174,7 @@ impl Category {
             Self::Initramfs => "Initramfs and kernel install hooks",
             Self::Kernel => "Kernel modules and parameters",
             Self::Linker => "Dynamic linker",
-            Self::LocalBin => "Programs ahead of the system's own (~/.local/bin, /usr/local/bin)",
+            Self::LocalBin => "Programs ahead of the system's own on PATH",
             Self::NetworkHook => "Network hooks",
             Self::OmarchyHook => "Omarchy hooks",
             Self::PacmanHook => "Pacman hooks",
@@ -177,7 +186,7 @@ impl Category {
             Self::Sudo => "sudo",
             Self::Systemd => "systemd units",
             Self::SystemdGenerator => "systemd generators",
-            Self::Trust => "Trusted certificate authorities",
+            Self::Trust => "Trust anchors and name resolution",
             Self::Udev => "udev rules",
             Self::Process => "Running programs",
             Self::Listener => "Programs listening on the network",
@@ -185,6 +194,10 @@ impl Category {
             Self::Camera => "Programs using a camera",
             Self::KernelModule => "Loaded kernel modules",
             Self::Setuid => "Programs with extra privileges",
+            Self::Account => "Accounts and who may log in",
+            Self::Browser => "Browser flags, policies and native hosts",
+            Self::Terminal => "Terminal and prompt configuration",
+            Self::Toolchain => "Developer tool configuration (npm, pip, cargo, mise)",
         }
     }
 
@@ -220,6 +233,9 @@ impl Category {
             Self::Camera => "can see through the camera",
             Self::KernelModule => "runs inside the kernel",
             Self::Setuid => "runs with more rights than whoever starts it",
+            Self::Account => "lets someone log in or administer",
+            Self::Terminal => "runs in every terminal",
+            Self::Toolchain => "decides what builds and installs run and fetch",
         }
     }
 }
@@ -833,6 +849,45 @@ pub const SYSTEM_SWEEP: &[Location] = &[
     location("etc/kernel/cmdline", Kind::File, Category::Boot),
     // Libraries the dynamic linker prefers over the ones in `/usr/lib`.
     location("usr/lib/glibc-hwcaps/", Kind::Directory, Category::Linker),
+    // Podman turns the quadlets here into units at every boot.
+    location(
+        "etc/containers/systemd/",
+        Kind::Directory,
+        Category::Systemd,
+    ),
+    // What mounts and unlocks at boot, with the options that run a helper.
+    location("etc/fstab", Kind::File, Category::BootConfig),
+    location("etc/crypttab", Kind::File, Category::BootConfig),
+    // Certificate authorities added to the system's own, and names that
+    // resolve without asking DNS.
+    location(
+        "etc/ca-certificates/trust-source/anchors/",
+        Kind::Directory,
+        Category::Trust,
+    ),
+    location(
+        "usr/local/share/ca-certificates/",
+        Kind::Directory,
+        Category::Trust,
+    ),
+    location("etc/hosts", Kind::File, Category::Trust),
+    // Browser policies (forced extensions, proxies) and the programs a
+    // browser extension may start.
+    location(
+        "usr/lib/firefox/distribution/policies.json",
+        Kind::File,
+        Category::Browser,
+    ),
+    // What every Flatpak app may reach outside its sandbox.
+    location(
+        "var/lib/flatpak/overrides/",
+        Kind::Directory,
+        Category::Desktop,
+    ),
+    location("etc/npmrc", Kind::File, Category::Toolchain),
+    location("etc/pip.conf", Kind::File, Category::Toolchain),
+    location("etc/tmux.conf", Kind::File, Category::Terminal),
+    location("etc/inputrc", Kind::File, Category::Shell),
 ];
 
 /// Locations in a home directory, relative to it.
@@ -925,6 +980,135 @@ pub const USER: &[Location] = &[
         Kind::Glob,
         Category::Linker,
     ),
+    // Units `systemctl --user set-property` and its like write.
+    location(
+        ".config/systemd/user.control/",
+        Kind::Directory,
+        Category::Systemd,
+    ),
+    // Podman turns the quadlets here into user units.
+    location(
+        ".config/containers/systemd/",
+        Kind::Directory,
+        Category::Systemd,
+    ),
+    // Flags every start of the browser or an Electron app takes: an
+    // extension to load, a debugging port, a proxy.
+    location(".config/chromium-flags.conf", Kind::File, Category::Browser),
+    location(".config/chrome-flags.conf", Kind::File, Category::Browser),
+    location(".config/brave-flags.conf", Kind::File, Category::Browser),
+    location(".config/code-flags.conf", Kind::File, Category::Browser),
+    location(
+        ".config/electron*-flags.conf",
+        Kind::Glob,
+        Category::Browser,
+    ),
+    // Programs a browser extension may start.
+    location(
+        ".config/chromium/NativeMessagingHosts/",
+        Kind::Directory,
+        Category::Browser,
+    ),
+    location(
+        ".config/google-chrome/NativeMessagingHosts/",
+        Kind::Directory,
+        Category::Browser,
+    ),
+    location(
+        ".config/BraveSoftware/Brave-Browser/NativeMessagingHosts/",
+        Kind::Directory,
+        Category::Browser,
+    ),
+    location(
+        ".mozilla/native-messaging-hosts/",
+        Kind::Directory,
+        Category::Browser,
+    ),
+    // The shell or command a terminal, a prompt or tmux starts each time.
+    location(
+        ".config/alacritty/alacritty.toml",
+        Kind::File,
+        Category::Terminal,
+    ),
+    location(".alacritty.toml", Kind::File, Category::Terminal),
+    location(".config/kitty/kitty.conf", Kind::File, Category::Terminal),
+    location(".config/ghostty/config", Kind::File, Category::Terminal),
+    location(".config/foot/foot.ini", Kind::File, Category::Terminal),
+    location(".config/starship.toml", Kind::File, Category::Terminal),
+    location(".tmux.conf", Kind::File, Category::Terminal),
+    location(".config/tmux/tmux.conf", Kind::File, Category::Terminal),
+    // Which launcher opens a link or a file; the launchers it names in the
+    // home are followed from it.
+    location(".config/mimeapps.list", Kind::File, Category::Desktop),
+    location(
+        ".local/share/applications/mimeapps.list",
+        Kind::File,
+        Category::Desktop,
+    ),
+    // What a Flatpak app may reach outside its sandbox.
+    location(
+        ".local/share/flatpak/overrides/",
+        Kind::Directory,
+        Category::Desktop,
+    ),
+    // Environment, hooks and tasks mise applies on entering a directory.
+    location(".config/mise/config.toml", Kind::File, Category::Toolchain),
+    location(".mise.toml", Kind::File, Category::Toolchain),
+    // Where package managers fetch from and what they run on the way.
+    location(".npmrc", Kind::File, Category::Toolchain),
+    location(".config/pip/pip.conf", Kind::File, Category::Toolchain),
+    location(".pydistutils.cfg", Kind::File, Category::Toolchain),
+    location(".cargo/config.toml", Kind::File, Category::Toolchain),
+    location(".cargo/config", Kind::File, Category::Toolchain),
+    location(".gemrc", Kind::File, Category::Toolchain),
+    location(".yarnrc", Kind::File, Category::Toolchain),
+    location(".yarnrc.yml", Kind::File, Category::Toolchain),
+    location(".bunfig.toml", Kind::File, Category::Toolchain),
+    location(".config/go/env", Kind::File, Category::Toolchain),
+    // What an editor runs at every start.
+    location(".config/nvim/init.lua", Kind::File, Category::Editor),
+    location(".config/nvim/init.vim", Kind::File, Category::Editor),
+    location(".config/nvim/plugin/", Kind::Directory, Category::Editor),
+    location(
+        ".config/nvim/after/plugin/",
+        Kind::Directory,
+        Category::Editor,
+    ),
+    location(".config/nvim/lua/", Kind::Directory, Category::Editor),
+    location(".vimrc", Kind::File, Category::Editor),
+    location(".vim/plugin/", Kind::Directory, Category::Editor),
+    location(
+        ".config/Code/User/settings.json",
+        Kind::File,
+        Category::Editor,
+    ),
+    location(
+        ".config/Code - OSS/User/settings.json",
+        Kind::File,
+        Category::Editor,
+    ),
+    location(
+        ".config/VSCodium/User/settings.json",
+        Kind::File,
+        Category::Editor,
+    ),
+    location(
+        ".config/Cursor/User/settings.json",
+        Kind::File,
+        Category::Editor,
+    ),
+    // More of what a shell or a login reads.
+    location(".config/fish/fish_variables", Kind::File, Category::Shell),
+    location(
+        ".config/fish/completions/",
+        Kind::Directory,
+        Category::Shell,
+    ),
+    location(".inputrc", Kind::File, Category::Shell),
+    location(".pam_environment", Kind::File, Category::Environment),
+    location(".xsession", Kind::File, Category::Autostart),
+    location(".xsessionrc", Kind::File, Category::Autostart),
+    location(".ssh/authorized_keys2", Kind::File, Category::Ssh),
 ];
 
 const ENABLING: &[&str] = &[".wants", ".requires", ".upholds"];
