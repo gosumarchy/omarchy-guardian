@@ -780,6 +780,8 @@ mod tests {
             manager_path: None,
             wrappers: root.join("wrappers"),
             session_env: root.join("uwsm/env.d/90-omarchy-guardian"),
+            hypr_config: root.join("hypr/hyprland.lua"),
+            hypr_path: root.join("hyprland-path.lua"),
         };
         let mut app = App::new(files(Some(paths)), Mode::Simple);
         assert!(screen(&mut app).contains("not watching pacman, AUR or themes"));

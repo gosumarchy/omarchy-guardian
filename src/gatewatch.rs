@@ -71,6 +71,12 @@ pub struct Gate {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub gates: Vec<Gate>,
+    /// The gates (by key) whose state could not be read the way every
+    /// caller reads it: the state of one that depends on the session's
+    /// PATH, seen from a shell with no session to ask. Their record is
+    /// left as it is, so two callers with different PATHs cannot take
+    /// turns raising and clearing the same alert.
+    pub unknown: Vec<String>,
     /// Settings weaker than their level and not accepted: the system
     /// file's key for each, and the line that says it.
     pub weak: Vec<(String, String)>,
@@ -252,16 +258,18 @@ fn compare(
             .find(|gate| gate.key == key)
             .map(|gate| gate.level)
     };
-    // What was raised stays until it is repaired: the gate back on.
+    let known = |key: &str| !snapshot.unknown.iter().any(|unknown| unknown == key);
+    // What was raised stays until it is repaired: the gate back on. What
+    // could not be read this time stays as it was.
     let mut alerts: Vec<(String, String)> = previous
         .map(|previous| previous.alerts.clone())
         .unwrap_or_default()
         .into_iter()
-        .filter(|(key, _)| level_now(key).is_some_and(|level| level != Level::On))
+        .filter(|(key, _)| !known(key) || level_now(key).is_some_and(|level| level != Level::On))
         .collect();
     let mut news = Vec::new();
     if let (Some(previous), Observer::Watching) = (previous, observer) {
-        for gate in &snapshot.gates {
+        for gate in snapshot.gates.iter().filter(|gate| known(&gate.key)) {
             let before = previous
                 .gates
                 .iter()
@@ -283,11 +291,25 @@ fn compare(
                 .map(|(_, line)| line.clone()),
         );
     }
+    let recorded = |key: &str| {
+        previous?
+            .gates
+            .iter()
+            .find(|(recorded, _)| recorded == key)
+            .map(|(_, level)| *level)
+    };
     let record = Record {
         gates: snapshot
             .gates
             .iter()
-            .map(|gate| (gate.key.clone(), gate.level))
+            .filter_map(|gate| {
+                let level = if known(&gate.key) {
+                    Some(gate.level)
+                } else {
+                    recorded(&gate.key)
+                };
+                Some((gate.key.clone(), level?))
+            })
             .collect(),
         weak: snapshot.weak.iter().map(|(key, _)| key.clone()).collect(),
         alerts,
@@ -447,6 +469,7 @@ mod tests {
     fn snapshot(gates: &[(&str, Level)], weak: &[&str]) -> Snapshot {
         Snapshot {
             gates: gates.iter().map(|(key, level)| gate(key, *level)).collect(),
+            unknown: Vec::new(),
             weak: weak
                 .iter()
                 .map(|key| ((*key).to_string(), format!("{key} is weaker")))
@@ -456,6 +479,51 @@ mod tests {
 
     fn lines(standing: &[(String, String)]) -> Vec<&str> {
         standing.iter().map(|(key, _)| key.as_str()).collect()
+    }
+
+    #[test]
+    fn a_state_only_one_caller_can_read_is_not_put_on_record() {
+        let dir = TempDir::new("gatewatch-unknown");
+        // The bar, in the session: both on.
+        let session = snapshot(&[("aur", Level::On), ("path", Level::On)], &[]);
+        observe_in(dir.path(), &session, Observer::Watching);
+        // `status` from a shell with another PATH and no session to ask:
+        // it reads both as dropped, and knows it cannot tell.
+        let mut remote = snapshot(&[("aur", Level::Partial), ("path", Level::Off)], &[]);
+        remote.unknown = vec!["aur".into(), "path".into()];
+        for _ in 0..2 {
+            assert_eq!(
+                observe_in(dir.path(), &remote, Observer::Watching),
+                (Vec::new(), None)
+            );
+            // The bar's next poll finds its record as it left it.
+            assert_eq!(
+                observe_in(dir.path(), &session, Observer::Watching),
+                (Vec::new(), None)
+            );
+        }
+        // Without that mark the same two callers take turns: a pop-up for
+        // each such `status`, cleared by the bar's next poll.
+        remote.unknown.clear();
+        let (standing, news) = observe_in(dir.path(), &remote, Observer::Watching);
+        assert_eq!(lines(&standing), ["aur", "path"]);
+        assert!(news.is_some());
+
+        // A drop the session itself saw stays on record, alert and all,
+        // through a look that could not read it; and comes off when the
+        // session sees the gate back on.
+        let dropped = snapshot(&[("aur", Level::On), ("path", Level::Off)], &[]);
+        observe_in(dir.path(), &session, Observer::Watching);
+        let (standing, _) = observe_in(dir.path(), &dropped, Observer::Watching);
+        assert_eq!(lines(&standing), ["path"]);
+        let mut blind = session.clone();
+        blind.unknown = vec!["path".into()];
+        let (standing, news) = observe_in(dir.path(), &blind, Observer::Watching);
+        assert_eq!((lines(&standing), news), (vec!["path"], None));
+        let record = Record::parse(&fs::read_to_string(dir.path().join(RECORD)).unwrap()).unwrap();
+        assert!(record.gates.contains(&("path".to_string(), Level::Off)));
+        let (standing, _) = observe_in(dir.path(), &session, Observer::Watching);
+        assert!(standing.is_empty());
     }
 
     #[test]
@@ -533,7 +601,7 @@ mod tests {
         let dir = TempDir::new("gatewatch-reviewer");
         let with = |gate: Gate| Snapshot {
             gates: vec![gate],
-            weak: Vec::new(),
+            ..Snapshot::default()
         };
         observe_in(dir.path(), &with(none.clone()), Observer::Watching);
         let (standing, news) = observe_in(dir.path(), &with(loaded.clone()), Observer::Watching);

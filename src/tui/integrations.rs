@@ -1,6 +1,12 @@
 //! The pieces that connect Guardian to the system: the pacman hook, the yay
 //! makepkg gate, the Bash theme interceptor, the session PATH wrappers, the
 //! Omarchy menu entry and the bar widget.
+//!
+//! What depends on a PATH (which `yay` is found, whether the wrappers come
+//! first) is read from the session's own: the one its service manager
+//! hands to what it starts. Every caller sees the same one there, whatever
+//! PATH its own shell made; the calling process's is only what is left
+//! when there is no manager to ask.
 //! Each has a state read from disk and a plan to turn it on or off. Plans
 //! that need root or another program run as commands on the terminal (so
 //! `sudo` can ask for a password); the rest are small, exact file edits.
@@ -11,6 +17,7 @@ use std::io::Write as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+use super::luascan;
 use super::menufile;
 use super::shellscan::{self, Loads};
 use crate::config::model::RootConsent;
@@ -38,6 +45,16 @@ const WRAPPED: [&str; 5] = [
     "omarchy-plugin-add",
     "omarchy-plugin-update",
 ];
+/// The file Hyprland's configuration loads to put the wrappers first: a
+/// root-owned file of the package, so the line in the user's file never
+/// has to change.
+pub const HYPR_PATH: &str = "/usr/lib/omarchy-guardian/hyprland-path.lua";
+/// The lines `protect` adds at the end of `~/.config/hypr/hyprland.lua`:
+/// after Omarchy's defaults, whose `envs.lua` puts Omarchy's own commands
+/// first on PATH, and before Hyprland starts anything. Only the second,
+/// exactly, counts as loading the file; a missing file is passed over.
+const HYPR_MARKER: &str = "-- Omarchy Guardian: its theme and plugin commands first on PATH. Keep this after Omarchy's defaults.";
+const HYPR_LINE: &str = "pcall(dofile, \"/usr/lib/omarchy-guardian/hyprland-path.lua\")";
 /// The file uwsm sources for the graphical session, after Omarchy's own
 /// (`10-omarchy`), and the line in it that counts.
 const SESSION_ENV_NAME: &str = "90-omarchy-guardian";
@@ -135,7 +152,7 @@ impl Integration {
                 "Routes theme and plugin installs and updates through Guardian, from Bash (new shells) and from the Omarchy menu."
             }
             Self::SessionPath => {
-                "Puts Guardian's own `omarchy`, `omarchy-theme-install`, `omarchy-theme-update`, `omarchy-plugin-add` and `omarchy-plugin-update` first on the session's PATH, so scripts, other shells, launchers and key bindings go through Guardian too. Applies from the next login."
+                "Puts Guardian's own `omarchy`, `omarchy-theme-install`, `omarchy-theme-update`, `omarchy-plugin-add` and `omarchy-plugin-update` first on the session's PATH, ahead of Omarchy's own (a line at the end of ~/.config/hypr/hyprland.lua and a file in ~/.config/uwsm/env.d), so scripts, other shells, launchers and key bindings go through Guardian too. Applies from the next login."
             }
             Self::MenuEntry => "Adds Setup › Guardian to the Omarchy menu, opening this window.",
             Self::BarWidget => {
@@ -233,11 +250,24 @@ impl Plan {
                     paths.waybar_style.display()
                 ),
                 Step::AddSessionPath => format!(
-                    "write {}: put {} first on the session's PATH (from the next login)",
+                    "write {}{}: put {} first on the session's PATH (from the next login)",
                     paths.session_env.display(),
+                    if paths.hypr_config.is_file() {
+                        format!(" and add a line to {}", paths.hypr_config.display())
+                    } else {
+                        String::new()
+                    },
                     paths.wrappers.display()
                 ),
-                Step::RemoveSessionPath => format!("remove {}", paths.session_env.display()),
+                Step::RemoveSessionPath => format!(
+                    "remove {}{}",
+                    paths.session_env.display(),
+                    if paths.hypr_config.is_file() {
+                        format!(" and Guardian's line from {}", paths.hypr_config.display())
+                    } else {
+                        String::new()
+                    }
+                ),
                 Step::AskSweepRoot => "ask whether the daily read-only root checks may run, then record the answer in the system configuration (sudo)".into(),
             })
             .collect()
@@ -305,6 +335,10 @@ pub struct Paths {
     /// them first on PATH.
     pub wrappers: PathBuf,
     pub session_env: PathBuf,
+    /// The user's Hyprland Lua configuration, which gets Guardian's line,
+    /// and the packaged file that line loads.
+    pub hypr_config: PathBuf,
+    pub hypr_path: PathBuf,
 }
 
 /// The directories of a PATH value.
@@ -440,6 +474,8 @@ impl Paths {
             manager_path: manager_path(),
             wrappers: WRAPPERS.into(),
             session_env: config.join("uwsm/env.d").join(SESSION_ENV_NAME),
+            hypr_config: config.join("hypr/hyprland.lua"),
+            hypr_path: HYPR_PATH.into(),
         })
     }
 
@@ -807,9 +843,40 @@ impl Paths {
             .map(PathBuf::as_path)
     }
 
-    /// The first program called `name` on this process's PATH, resolved.
+    /// The PATH the session finds commands on: its service manager's, the
+    /// same for every caller. Only without a manager to ask is it this
+    /// process's own.
+    fn session_path(&self) -> &[PathBuf] {
+        self.manager_path.as_deref().unwrap_or(&self.path_dirs)
+    }
+
+    /// The integrations whose state hangs on a PATH, when the session's
+    /// own could not be asked: what they read here is this caller's view,
+    /// which another caller need not share, so it is not put on record
+    /// (see `gatewatch`).
+    pub fn unsettled(&self) -> Vec<Integration> {
+        if self.manager_path.is_some() {
+            Vec::new()
+        } else {
+            vec![Integration::AurGate, Integration::SessionPath]
+        }
+    }
+
+    /// Whether there is anything on this machine for `integration` to
+    /// guard or attach to: the AUR gate needs yay, the PATH wrappers and
+    /// the menu entry need Omarchy. One that does not apply is not
+    /// protection missing.
+    pub fn applies(&self, integration: Integration) -> bool {
+        match integration {
+            Integration::AurGate => self.yay.exists(),
+            Integration::SessionPath | Integration::MenuEntry => self.omarchy.is_dir(),
+            _ => true,
+        }
+    }
+
+    /// The first program called `name` on the session's PATH, resolved.
     fn first_on_path(&self, name: &str) -> Option<PathBuf> {
-        self.path_dirs
+        self.session_path()
             .iter()
             .filter(|directory| directory.is_absolute())
             .map(|directory| directory.join(name))
@@ -835,10 +902,10 @@ impl Paths {
         Ok(())
     }
 
-    /// The wrappers on the session's PATH: on when the session file holds
-    /// Guardian's line, the wrappers are root's, and the PATH of this
-    /// process and of the session's service manager both find them before
-    /// any other command of those names.
+    /// The wrappers on the session's PATH: on when Guardian's line is in
+    /// the Hyprland configuration where it runs, the uwsm session file
+    /// holds Guardian's line, the wrappers are root's, and the session's
+    /// PATH finds them before any other command of those names.
     fn session_state(&self) -> State {
         if !self.wrappers.is_dir() {
             return State::Unavailable("the omarchy-guardian package is not installed".into());
@@ -846,7 +913,7 @@ impl Paths {
         if !self.omarchy.is_dir() {
             return State::Unavailable("Omarchy is not installed".into());
         }
-        let written = fs::read_to_string(&self.session_env).is_ok_and(|text| {
+        let env = fs::read_to_string(&self.session_env).is_ok_and(|text| {
             let code: Vec<&str> = text
                 .lines()
                 .map(str::trim)
@@ -854,26 +921,67 @@ impl Paths {
                 .collect();
             code == [SESSION_ENV_LINE]
         });
-        if !written {
-            return State::Off;
+        // Without a Hyprland Lua configuration nothing reorders what the
+        // session file set, and there is no line to write.
+        let hypr = fs::read_to_string(&self.hypr_config)
+            .ok()
+            .map(|text| luascan::loads(&text, HYPR_LINE, HYPR_PATH));
+        match (env, &hypr) {
+            (false, None | Some(Loads::Missing)) => return State::Off,
+            (_, Some(Loads::Ineffective(why))) => {
+                return State::Partial(format!(
+                    "not effective: Guardian's line is in {}, but {why}",
+                    self.hypr_config.display()
+                ));
+            }
+            (false, Some(Loads::Effective)) => {
+                return State::Partial(format!(
+                    "half set up: {} is not Guardian's; turning it on completes it",
+                    self.session_env.display()
+                ));
+            }
+            (true, Some(Loads::Missing)) => {
+                return State::Partial(format!(
+                    "half set up: Guardian's line is not in {}, so Omarchy's own PATH line puts its commands first; turning it on completes it",
+                    self.hypr_config.display()
+                ));
+            }
+            (true, None | Some(Loads::Effective)) => {}
         }
-        for name in WRAPPED {
-            if let Err(why) = self.installed_file(&self.wrappers.join(name)) {
+        let installed = WRAPPED
+            .iter()
+            .map(|name| self.wrappers.join(name))
+            .chain(hypr.is_some().then(|| self.hypr_path.clone()));
+        for file in installed {
+            if let Err(why) = self.installed_file(&file) {
                 return State::Partial(format!("set up but not to be trusted: {why}"));
             }
         }
-        let lists = [
-            ("this session", Some(&self.path_dirs)),
-            ("the session's service manager", self.manager_path.as_ref()),
-        ];
-        for (whose, directories) in lists {
-            if let Some(why) = directories.and_then(|directories| self.path_problem(directories)) {
-                return State::Partial(format!(
-                    "set up, but not in effect for {whose}: {why}. Log out and back in; if it stays, something else reorders PATH"
-                ));
-            }
+        if let Some(why) = self.path_problem(self.session_path()) {
+            let whose = if self.manager_path.is_some() {
+                "the session"
+            } else {
+                "this shell (the session's service manager did not answer)"
+            };
+            return State::Partial(format!(
+                "set up, but not in effect for {whose}: {why}. It applies from the next login; if it stays after one, something else reorders PATH"
+            ));
         }
         State::On
+    }
+
+    /// What to say beside the wrappers while they are on for the session
+    /// and this caller's own shell finds something else first: its start-up
+    /// files reorder PATH. Said to this caller only, never put on record.
+    pub fn path_caveat(&self) -> Option<String> {
+        self.manager_path.as_ref()?;
+        if self.path_dirs.is_empty() || self.session_state() != State::On {
+            return None;
+        }
+        let why = self.path_problem(&self.path_dirs)?;
+        Some(format!(
+            "on for the session, not for the shell this was asked from: {why}"
+        ))
     }
 
     /// Why the wrappers are not what `directories` (a PATH) finds first.
@@ -1219,16 +1327,33 @@ impl Paths {
                 if let Some(directory) = self.session_env.parent() {
                     fs::create_dir_all(directory).map_err(|error| error.to_string())?;
                 }
-                replace_file(&self.session_env, SESSION_ENV)
+                replace_file(&self.session_env, SESSION_ENV)?;
+                // A line where it runs is left where it is; one that does
+                // not is written anew at the end of the file. A Hyprland
+                // configuration is never made here: only one that is there
+                // has Omarchy's PATH line to get behind.
+                match fs::read_to_string(&self.hypr_config) {
+                    Ok(text) if luascan::loads(&text, HYPR_LINE, HYPR_PATH) != Loads::Effective => {
+                        edit_file(&self.hypr_config, &with_hypr_line(&text))
+                    }
+                    Ok(_) | Err(_) => Ok(()),
+                }
             }
             // Only Guardian's own file: one of that name holding
             // something else is the user's.
-            Step::RemoveSessionPath => match fs::read_to_string(&self.session_env) {
-                Ok(text) if text.contains(SESSION_ENV_LINE) => {
-                    fs::remove_file(&self.session_env).map_err(|error| error.to_string())
+            Step::RemoveSessionPath => {
+                if fs::read_to_string(&self.session_env)
+                    .is_ok_and(|text| text.contains(SESSION_ENV_LINE))
+                {
+                    fs::remove_file(&self.session_env).map_err(|error| error.to_string())?;
                 }
-                Ok(_) | Err(_) => Ok(()),
-            },
+                match fs::read_to_string(&self.hypr_config) {
+                    Ok(text) if without_hypr_line(&text) != text => {
+                        edit_file(&self.hypr_config, &without_hypr_line(&text))
+                    }
+                    Ok(_) | Err(_) => Ok(()),
+                }
+            }
             Step::Command(_) | Step::Optional(_) | Step::AskSweepRoot => Ok(()),
         }
     }
@@ -1529,6 +1654,41 @@ fn without_interceptor(text: &str) -> String {
     out
 }
 
+/// A Hyprland Lua configuration without the lines `protect` adds: the
+/// marker, the line that loads Guardian's PATH file wherever it stands, and
+/// the blank line before them.
+fn without_hypr_line(text: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let code = line.trim();
+        let loads = code.contains(HYPR_PATH) && code.contains("dofile") && !code.starts_with("--");
+        if code == HYPR_MARKER {
+            if kept.last().is_some_and(|last| last.trim().is_empty()) {
+                kept.pop();
+            }
+        } else if !loads {
+            kept.push(line);
+        }
+    }
+    let mut out = kept.join("\n");
+    if text.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// The configuration with Guardian's lines at its end, once.
+fn with_hypr_line(text: &str) -> String {
+    let mut out = without_hypr_line(text);
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    format!("{out}{HYPR_MARKER}\n{HYPR_LINE}\n")
+}
+
 /// Where a `//` comment starts in a JSONC line, outside of strings.
 fn comment_start(line: &str) -> Option<usize> {
     let mut quoted = false;
@@ -1588,8 +1748,9 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use super::{
-        INTERCEPTOR_LINE, INTERCEPTOR_MARKER, Integration, MENU_ENTRY, Part, Paths, SESSION_ENV,
-        State, Step, THEME_OVERRIDES, WRAPPED, with_menu_entries, without_interceptor,
+        HYPR_LINE, HYPR_MARKER, INTERCEPTOR_LINE, INTERCEPTOR_MARKER, Integration, MENU_ENTRY,
+        Part, Paths, SESSION_ENV, State, Step, THEME_OVERRIDES, WRAPPED, with_menu_entries,
+        without_interceptor,
     };
     use crate::test_support::TempDir;
 
@@ -1632,6 +1793,8 @@ mod tests {
             manager_path: None,
             wrappers: root.join("wrappers"),
             session_env: root.join("uwsm/env.d/90-omarchy-guardian"),
+            hypr_config: root.join("hypr/hyprland.lua"),
+            hypr_path: root.join("hyprland-path.lua"),
         }
     }
 
@@ -1946,6 +2109,27 @@ mod tests {
         assert_eq!(THEME_OVERRIDES.len(), 3);
     }
 
+    /// A home as `protect` finds it on Omarchy: the packaged wrappers and
+    /// PATH file, and a Hyprland configuration that loads Omarchy's
+    /// defaults. Returns the directory standing for Omarchy's own commands.
+    fn omarchy_session(dir: &TempDir, paths: &Paths) -> std::path::PathBuf {
+        fs::create_dir_all(&paths.wrappers).unwrap();
+        for name in WRAPPED {
+            fs::write(paths.wrappers.join(name), "").unwrap();
+        }
+        fs::write(&paths.hypr_path, "").unwrap();
+        fs::create_dir_all(paths.hypr_config.parent().unwrap()).unwrap();
+        fs::write(
+            &paths.hypr_config,
+            "require(\"default.hypr.omarchy\")\nrequire(\"hypr.autostart\")\n\n-- Add any other personal Hyprland configuration below.\n",
+        )
+        .unwrap();
+        let stock = dir.path().join("stock");
+        fs::create_dir_all(&stock).unwrap();
+        fs::write(stock.join("omarchy-theme-install"), "").unwrap();
+        stock
+    }
+
     #[test]
     fn the_session_path_is_on_only_where_the_wrappers_are_found_first() {
         let dir = TempDir::new("integrations-session");
@@ -1954,79 +2138,245 @@ mod tests {
             paths.state(Integration::SessionPath),
             State::Unavailable(_)
         ));
-        fs::create_dir_all(&paths.wrappers).unwrap();
-        for name in WRAPPED {
-            fs::write(paths.wrappers.join(name), "").unwrap();
-        }
+        let stock = omarchy_session(&dir, &paths);
         assert_eq!(paths.state(Integration::SessionPath), State::Off);
 
         let on = paths.plan(Integration::SessionPath, &State::Off).unwrap();
         assert_eq!(on.steps, [Step::AddSessionPath]);
+        assert!(on.describe(&paths)[0].contains("add a line to"));
         paths.edit(&Step::AddSessionPath).unwrap();
         assert_eq!(fs::read_to_string(&paths.session_env).unwrap(), SESSION_ENV);
-        // Written, and not on this PATH yet: the next login's.
+        // The line goes after everything Omarchy's defaults did, and the
+        // file as it was is kept.
+        let config = fs::read_to_string(&paths.hypr_config).unwrap();
+        assert!(
+            config.ends_with(&format!("below.\n\n{HYPR_MARKER}\n{HYPR_LINE}\n")),
+            "{config}"
+        );
+        let backup = paths.hypr_config.with_extension("lua.guardian-bak");
+        assert!(!fs::read_to_string(&backup).unwrap().contains("Guardian"));
+
+        // Written, and as Omarchy's own PATH line leaves the session until
+        // the next login: its commands first. That is not on.
+        paths.manager_path = Some(vec![stock.clone(), paths.wrappers.clone()]);
         let state = paths.state(Integration::SessionPath);
         assert!(
-            matches!(&state, State::Partial(why) if why.contains("not in effect for this session")),
+            matches!(&state, State::Partial(why)
+                if why.contains("not in effect for the session") && why.contains("comes before it on PATH")),
             "{state:?}"
         );
-
-        let stock = dir.path().join("stock");
-        fs::create_dir_all(&stock).unwrap();
-        fs::write(stock.join("omarchy-theme-install"), "").unwrap();
-        paths.path_dirs = vec![
-            dir.path().join("tools"),
+        paths.login_shell = Some("zsh".into());
+        assert!(paths.theme_caveat().is_some());
+        // After it: Guardian's first, then Omarchy's.
+        paths.manager_path = Some(vec![
             paths.wrappers.clone(),
             stock.clone(),
-        ];
+            dir.path().join("tools"),
+        ]);
         assert_eq!(paths.state(Integration::SessionPath), State::On);
         // In another shell the Bash interceptor is not needed for it.
-        paths.login_shell = Some("zsh".into());
         assert_eq!(paths.theme_caveat(), None);
+        // Turning it on again changes nothing.
+        paths.edit(&Step::AddSessionPath).unwrap();
+        assert_eq!(fs::read_to_string(&paths.hypr_config).unwrap(), config);
 
-        // The stock command found first, here or by what the session starts.
-        paths.path_dirs = vec![stock.clone(), paths.wrappers.clone()];
+        // Not on the session's PATH at all.
+        paths.manager_path = Some(vec![stock.clone()]);
         let state = paths.state(Integration::SessionPath);
         assert!(
-            matches!(&state, State::Partial(why) if why.contains("comes before it on PATH")),
+            matches!(&state, State::Partial(why) if why.contains("is not on PATH")),
             "{state:?}"
         );
-        assert!(paths.theme_caveat().is_some());
-        paths.path_dirs = vec![paths.wrappers.clone(), stock.clone()];
-        paths.manager_path = Some(vec![stock]);
-        let state = paths.state(Integration::SessionPath);
-        assert!(
-            matches!(&state, State::Partial(why) if why.contains("the session's service manager")),
-            "{state:?}"
-        );
-        paths.manager_path = Some(paths.path_dirs.clone());
-        assert_eq!(paths.state(Integration::SessionPath), State::On);
+        paths.manager_path = Some(vec![paths.wrappers.clone(), stock.clone()]);
 
-        // A wrapper anyone can rewrite is no gate.
-        let wrapper = paths.wrappers.join("omarchy");
-        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(matches!(
-            paths.state(Integration::SessionPath),
-            State::Partial(why) if why.contains("not to be trusted")
-        ));
-        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        // A wrapper, or the PATH file, anyone can rewrite is no gate.
+        for file in [paths.wrappers.join("omarchy"), paths.hypr_path.clone()] {
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(matches!(
+                paths.state(Integration::SessionPath),
+                State::Partial(why) if why.contains("not to be trusted")
+            ));
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        }
 
-        // A line added to the file, or the line changed, is not Guardian's file.
+        // A line added to the session file, or the line changed, is not
+        // Guardian's file.
         fs::write(
             &paths.session_env,
             format!("{SESSION_ENV}export PATH=/tmp:$PATH\n"),
         )
         .unwrap();
-        assert_eq!(paths.state(Integration::SessionPath), State::Off);
+        let state = paths.state(Integration::SessionPath);
+        assert!(
+            matches!(&state, State::Partial(why) if why.contains("half set up")),
+            "{state:?}"
+        );
         paths.edit(&Step::AddSessionPath).unwrap();
         assert_eq!(paths.state(Integration::SessionPath), State::On);
 
-        // Off removes Guardian's file, and only that.
+        // Off removes Guardian's file and its line, and only those.
         paths.edit(&Step::RemoveSessionPath).unwrap();
         assert!(!paths.session_env.exists());
+        assert_eq!(
+            fs::read_to_string(&paths.hypr_config).unwrap(),
+            fs::read_to_string(&backup).unwrap()
+        );
+        assert_eq!(paths.state(Integration::SessionPath), State::Off);
         fs::write(&paths.session_env, "export X=1\n").unwrap();
         paths.edit(&Step::RemoveSessionPath).unwrap();
         assert!(paths.session_env.exists());
+    }
+
+    #[test]
+    fn guardians_hyprland_line_counts_only_where_it_runs_last() {
+        let dir = TempDir::new("integrations-hypr");
+        let mut paths = paths(&dir);
+        let stock = omarchy_session(&dir, &paths);
+        paths.manager_path = Some(vec![paths.wrappers.clone(), stock]);
+        paths.edit(&Step::AddSessionPath).unwrap();
+        assert_eq!(paths.state(Integration::SessionPath), State::On);
+        let written = fs::read_to_string(&paths.hypr_config).unwrap();
+
+        // The session file alone: Omarchy's `envs.lua` puts its own
+        // commands first again, which is the state that never went calm.
+        fs::write(&paths.hypr_config, "require(\"default.hypr.omarchy\")\n").unwrap();
+        let state = paths.state(Integration::SessionPath);
+        assert!(
+            matches!(&state, State::Partial(why) if why.contains("Omarchy's own PATH line")),
+            "{state:?}"
+        );
+        // Turning it on is the way out of every partial state.
+        let plan = paths.plan(Integration::SessionPath, &state).unwrap();
+        assert_eq!(plan.steps, [Step::AddSessionPath]);
+
+        // Commented out, in a block that does not run, or undone below.
+        for broken in [
+            format!("if false then\n{HYPR_LINE}\nend\n"),
+            format!("--[[\n{HYPR_LINE}\n]]\n"),
+            format!("{HYPR_LINE}\nhl.env(\"PATH\", \"/usr/share/omarchy/bin:/usr/bin\")\n"),
+        ] {
+            fs::write(&paths.hypr_config, &broken).unwrap();
+            let state = paths.state(Integration::SessionPath);
+            assert!(
+                matches!(&state, State::Partial(why) if why.contains("not effective")),
+                "{state:?} for {broken}"
+            );
+            // Written anew at the end, once.
+            paths.edit(&Step::AddSessionPath).unwrap();
+            let repaired = fs::read_to_string(&paths.hypr_config).unwrap();
+            assert_eq!(repaired.matches(HYPR_LINE).count(), 1, "{repaired}");
+            assert!(repaired.ends_with(&format!("{HYPR_MARKER}\n{HYPR_LINE}\n")));
+        }
+        // What a user adds below Guardian's line leaves it in effect.
+        fs::write(
+            &paths.hypr_config,
+            format!("{written}o.window(\"qemu\", {{ workspace = \"5\" }})\n"),
+        )
+        .unwrap();
+        assert_eq!(paths.state(Integration::SessionPath), State::On);
+
+        // Without a Hyprland Lua configuration nothing reorders PATH: the
+        // session file is the whole of it, and no configuration is made.
+        fs::remove_file(&paths.hypr_config).unwrap();
+        assert_eq!(paths.state(Integration::SessionPath), State::On);
+        paths.edit(&Step::AddSessionPath).unwrap();
+        assert!(!paths.hypr_config.exists());
+        let plan = paths.plan(Integration::SessionPath, &State::Off).unwrap();
+        assert!(!plan.describe(&paths)[0].contains("add a line"));
+    }
+
+    #[test]
+    fn two_callers_with_different_paths_read_the_same_state() {
+        let dir = TempDir::new("integrations-callers");
+        let mut bar = paths(&dir);
+        let stock = omarchy_session(&dir, &bar);
+        let gate = bar.makepkg_gate.display().to_string();
+        fs::write(&bar.yay_config, format!("{{\"makepkgbin\": \"{gate}\"}}")).unwrap();
+        fs::write(&bar.makepkg_gate, "").unwrap();
+        bar.edit(&Step::AddSessionPath).unwrap();
+        // Another yay, and Omarchy's commands, in directories only the
+        // second caller's shell has in front.
+        let front = dir.path().join("front");
+        fs::create_dir_all(&front).unwrap();
+        fs::write(front.join("yay"), "").unwrap();
+        bar.manager_path = Some(vec![bar.wrappers.clone(), stock.clone()]);
+        bar.path_dirs = vec![bar.wrappers.clone(), stock.clone()];
+        let mut remote = bar.clone();
+        remote.path_dirs = vec![front, stock.clone()];
+
+        // Both read the session's PATH, so both read the same.
+        for integration in [Integration::SessionPath, Integration::AurGate] {
+            assert_eq!(bar.state(integration), State::On);
+            assert_eq!(remote.state(integration), State::On);
+        }
+        assert!(bar.unsettled().is_empty() && remote.unsettled().is_empty());
+        // The second caller is told about its own shell, beside the gate.
+        assert_eq!(bar.path_caveat(), None);
+        assert!(
+            remote
+                .path_caveat()
+                .is_some_and(|caveat| caveat.contains("is not on PATH"))
+        );
+
+        // With no session to ask, each reads its own PATH, and says that
+        // what it read is not to be put on record.
+        bar.manager_path = None;
+        remote.manager_path = None;
+        assert_eq!(bar.state(Integration::SessionPath), State::On);
+        assert!(matches!(
+            remote.state(Integration::SessionPath),
+            State::Partial(why) if why.contains("this shell")
+        ));
+        assert!(matches!(
+            remote.state(Integration::AurGate),
+            State::Partial(why) if why.contains("another yay")
+        ));
+        assert_eq!(
+            remote.unsettled(),
+            [Integration::AurGate, Integration::SessionPath]
+        );
+        assert_eq!(remote.path_caveat(), None);
+    }
+
+    #[test]
+    fn what_has_nothing_to_guard_on_this_machine_is_not_a_problem() {
+        use super::super::status::gate_issue;
+        let dir = TempDir::new("integrations-applies");
+        let paths = paths(&dir);
+        fs::create_dir_all(&paths.wrappers).unwrap();
+        // Plain Arch: no yay, no Omarchy.
+        fs::remove_file(&paths.yay).unwrap();
+        fs::remove_dir_all(&paths.omarchy).unwrap();
+        for integration in [
+            Integration::AurGate,
+            Integration::SessionPath,
+            Integration::MenuEntry,
+        ] {
+            let state = paths.state(integration);
+            assert!(matches!(state, State::Unavailable(_)), "{state:?}");
+            assert!(!paths.applies(integration));
+            assert_eq!(gate_issue(&paths, integration, &state), None);
+        }
+        // A gate that does apply and cannot be there is protection missing.
+        fs::remove_file(&paths.hook_source).unwrap();
+        let state = paths.state(Integration::PacmanHook);
+        assert!(
+            gate_issue(&paths, Integration::PacmanHook, &state)
+                .is_some_and(|issue| issue.contains("is unavailable"))
+        );
+        // With Omarchy there, wrappers the package did not bring are one too.
+        fs::create_dir_all(&paths.omarchy).unwrap();
+        fs::remove_dir_all(&paths.wrappers).unwrap();
+        let state = paths.state(Integration::SessionPath);
+        assert!(gate_issue(&paths, Integration::SessionPath, &state).is_some());
+        assert!(
+            gate_issue(&paths, Integration::SessionPath, &State::Off)
+                .is_some_and(|issue| issue.contains("not fully on"))
+        );
+        assert_eq!(
+            gate_issue(&paths, Integration::SessionPath, &State::On),
+            None
+        );
     }
 
     #[test]

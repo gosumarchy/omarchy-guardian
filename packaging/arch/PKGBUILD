@@ -52,6 +52,8 @@ package() {
     install -Dm755 integrations/omarchy/guardian-plugin "$lib/guardian-plugin"
     install -Dm644 integrations/omarchy/omarchy-bash-interceptor.sh "$lib/omarchy-bash-interceptor.sh"
     install -Dm755 integrations/omarchy/install-user-interceptor.sh "$lib/install-user-interceptor.sh"
+    # Loaded by the line `protect` adds to ~/.config/hypr/hyprland.lua.
+    install -Dm644 integrations/omarchy/hyprland-path.lua "$lib/hyprland-path.lua"
     install -Dm755 integrations/enable-system-hook.sh "$lib/enable-system-hook.sh"
     install -Dm644 integrations/pacman/omarchy-guardian.hook \
         "$pkgdir/usr/share/libalpm/hooks/omarchy-guardian.hook"
