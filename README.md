@@ -1965,26 +1965,46 @@ gate does, in order:
      give exactly those arrays, or the build is blocked as incomplete.
    - *Worked out the same way everywhere*: an expansion Guardian does not
      repeat (`${pkgver%.*}`), `+=`, an element set by its number
-     (`sha256sums[2]=SKIP`), a `case` or test on `$CARCH` only, a loop over
-     a written-out list. Nothing more is asked.
-   - *Not followed*: set under any other condition (`[[ -w . ]] &&
-     source=(…)`), in a function the top level calls, through `eval`,
-     `printf -v`, `read`, `mapfile`, `declare`/`typeset`/`local`/`export`
-     (`-n` included), `${name:=…}`, from a command's output or a variable
-     the recipe does not set; or the recipe sources another file, sets a
-     trap or an alias, exits early, sets `DLAGENTS`, defines a function
-     named like a command, or uses quoting Guardian is not sure it reads
-     as bash does. The reasons are printed with their lines, the AI is
-     told as a fact, and you are asked on the terminal whether to go on.
-     No terminal, or no yes, blocks the build (exit 2, NOT CONFIRMED). A
-     yes is remembered for that exact PKGBUILD, so yay's further makepkg
-     calls and a rebuild do not ask again; a changed PKGBUILD does.
+     (`sha256sums[2]=SKIP`), a `case`, an `if` or a test that compares
+     `$CARCH` or values the recipe writes out (`[[ $pkgver == *rc* ]]`), a
+     loop over a written-out list. Nothing more is asked.
+   - *Not followed*: everything else. A source, or anything a source is
+     built from or depends on, that can differ between two runs: a test
+     that looks at a file (`[[ -w . ]] && source=(…)`), a command's result
+     or output, a pattern for file names (`*.patch`), `~`, a variable the
+     recipe does not set (`$HOME`, `$DISPLAY`, an option read from the
+     environment) or that bash fills in (`$RANDOM`, `$PWD`), arithmetic on
+     anything but a plain number, a variable set in a subshell, a pipe or
+     for one command only. A watched variable set in a function the top
+     level calls, or through `eval`, `printf -v`, `read`, `mapfile`,
+     `getopts`, `let`, `((…))`, a `for` loop, `declare`/`typeset`/`local`/
+     `export` (`-n` and `-i` included) or `${name:=…}`, however the name
+     is quoted. A command named in quotes, with a backslash or by a
+     variable; one of makepkg's own functions; `source`, `.`, `trap`,
+     `alias`, `exec`; an early `exit` or `return`; `DLAGENTS`; a function
+     named like a command; a process substitution; a here-document whose
+     text bash expands; a line of `package()` that sets an attribute and
+     something else beside it (makepkg runs such lines while it loads the
+     recipe); and quoting Guardian is not sure it reads as bash does. The
+     reasons are printed with their lines, the AI is told as a fact, and
+     you are asked on the terminal whether to go on. No terminal, or no
+     yes, blocks the build (exit 2, NOT CONFIRMED); with no terminal
+     Guardian says that it needed one and raises a desktop notification,
+     so a build started from a graphical front end does not just stop.
+     A yes is remembered for that exact recipe (the PKGBUILD and every
+     file beside it, which it could read its sources from), so yay's
+     further makepkg calls and a rebuild do not ask again; a changed
+     recipe does. The values of the `pkgver=` and `pkgrel=` lines are
+     left out of that: a `pkgver()` function has makepkg rewrite them
+     between two calls of one install.
 
-   In a sample of 700 AUR recipes about 3 to 4 in 100 are asked about
-   (sources set per architecture with `if`, checksums taken from a
-   command, `eval`, `DLAGENTS`). This reading is not a shell: text that
+   In a sample of 400 AUR recipes 14 are asked about (sources or
+   checksums taken from a command's output or from options read out of the
+   environment, `eval`, `DLAGENTS`). This reading is not a shell: text that
    bash reads otherwise than Guardian does could still hide an assignment,
-   and the recipe is reviewed by the AI as well.
+   and the recipe is reviewed by the AI as well. Nothing stands between
+   the listing and the build beside it: the real makepkg loads the recipe
+   again, outside the sandbox, and fetches what the recipe tells it then.
 
    What Guardian extracted is remembered (every file and download with
    its hash). A later call for the same build that does not extract
@@ -2023,7 +2043,8 @@ gate does, in order:
    registry, version-control and unencrypted addresses, install scripts
    and lines that point a dependency elsewhere, prints what it found and
    tells the AI in its own words; the file itself is sent too when it is
-   up to 64 KiB (a larger one would use up the review). `node_modules`, `.venv`, CI and
+   up to 64 KiB (a larger one would use up the review); one over 64 MiB is
+   not read, and the review is incomplete. `node_modules`, `.venv`, CI and
    development-container directories are reviewed last. git's own objects
    are not source, but git and Mercurial run what their metadata says on
    the commands a build often uses (`git describe`): a `.git` whose
@@ -2064,13 +2085,19 @@ gate does, in order:
    the recipe's functions or install scripts name or run a program from
    the sources, Guardian says so plainly, for example `this package
    installs 3 prebuilt program(s) nobody reviewed, downloaded from
-   github.com`, names them, and asks on the terminal. No terminal, or no
-   yes, blocks the build (exit 2, NOT CONFIRMED). A yes is remembered for
-   exactly those programs (their hashes) from those hosts, so yay's
-   further makepkg calls and a rebuild of the same version do not ask
-   again; a new version does. A source tree that is built and only carries
-   a binary among its test data is not asked about. The question is asked
-   on `/dev/tty`, after the review, and never replaces it.
+   github.com`, names them, and asks on the terminal. A program here is
+   machine code or bytecode, and also code that comes packed and is
+   installed as it is: a Java archive, an Electron `app.asar`, a browser
+   extension, a `.deb`, `.rpm` or pacman package that Guardian did not
+   unpack for review. No terminal, or no yes, blocks the build (exit 2,
+   NOT CONFIRMED), and no permit overrules a question you declined: the
+   way to say yes is to answer it. A yes is remembered for exactly those
+   programs (their hashes) from those hosts, and for which of them the
+   recipe runs, so yay's further makepkg calls and a rebuild of the same
+   version do not ask again; a new version does. A source tree that is
+   built and only carries a binary among its test data is not asked about.
+   The question is asked on `/dev/tty`, after the review, and never
+   replaces it.
 6. **makepkg** starts with the original arguments.
 
 What is not reviewed is reported: how many code files were left out, and
