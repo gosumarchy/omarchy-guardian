@@ -719,9 +719,15 @@ through the list with your agent without waiting for the daily sweep.
   deleted file) cannot be allowed; it stays listed while it runs. Nor can
   what overrides Guardian's own units, or an item whose commands were not
   all followed.
-- Every allow is kept in one list only root writes
-  (`/var/lib/omarchy-guardian/sweep/allowed.json`), so `sweep allow` and
-  `sweep forget` ask for the sudo password, for items in your home too. A
+- Every allow is kept in one list only root writes and everyone reads
+  (`/var/lib/omarchy-guardian/allowed.json`, mode 0644 in a root-owned
+  0755 directory), so `sweep allow` and
+  `sweep forget` ask for the sudo password, for items in your home too.
+  Guardian up to 0.7.18 kept it beside root's results, in
+  `/var/lib/omarchy-guardian/sweep/`, which only the configured group may
+  enter: a second user's allow was written and never read. The root half
+  moves the old list on its next run (an allow, a forget or the daily root
+  check); until then a sweep that can reach the old one reads it. A
   program running as you can write any file of yours: were the list one of
   them, it could drop an autostart entry and allow it in the same breath.
   An item in a home is kept under the user id it was allowed for, so what

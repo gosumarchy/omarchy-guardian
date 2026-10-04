@@ -67,6 +67,13 @@ pub fn collect_command(out: bool, settings: &crate::config::Settings) -> ExitCod
         );
         return ExitCode::from(2);
     }
+    // The list of allowed items an older Guardian kept beside the results
+    // moves to where every user can read it. Not being able to is no reason
+    // to collect nothing: the next allow says why.
+    drop(state::move_legacy_allowed(
+        Path::new(state::SYSTEM_ALLOWED),
+        Path::new(state::LEGACY_SYSTEM_ALLOWED),
+    ));
     let (consent, group) = settings.sweep_root();
     let group = if out {
         if consent != Some(crate::config::model::RootConsent::Allowed) {
@@ -709,6 +716,10 @@ pub fn system_allow_command(arguments: &[String]) -> ExitCode {
         .and_then(|uid| uid.parse::<u32>().ok())
         .filter(|uid| *uid != 0);
     let path = Path::new(state::SYSTEM_ALLOWED);
+    if let Err(error) = state::move_legacy_allowed(path, Path::new(state::LEGACY_SYSTEM_ALLOWED)) {
+        errln!("omarchy-guardian sweep-allow-system: {error}");
+        return ExitCode::from(2);
+    }
     let mut allowed = state::system_allowed(path);
     if let Err(reason) = change_allowed(&mut allowed, arguments, invoker) {
         errln!("omarchy-guardian sweep-allow-system: {reason}");

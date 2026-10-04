@@ -214,7 +214,7 @@ fn migrate(settings: &Settings) -> Result<String, String> {
         return Ok("Nothing to move: no list of an older Guardian is left.".into());
     }
     let uid = store::effective_uid()?;
-    let current = state::all_allowed(Path::new(state::SYSTEM_ALLOWED), uid);
+    let current = state::allowed_here(uid);
     let (collection, home) = collect_for_allow(settings)?;
     let (movable, stale) = movable(&old, &current, &collection.items, &|item| {
         judge::label(item, home.as_deref())
@@ -297,7 +297,7 @@ fn movable(
 
 fn forget(label: Option<&str>) -> Result<String, String> {
     let uid = store::effective_uid()?;
-    let allowed = state::all_allowed(Path::new(state::SYSTEM_ALLOWED), uid);
+    let allowed = state::allowed_here(uid);
     // What an older Guardian kept in the user's own list counted for
     // nothing; it goes either way.
     let directory = state_directory()?;
@@ -670,7 +670,7 @@ fn apply_allowed(
     notes: &mut Vec<String>,
 ) {
     let allowed = match store::effective_uid() {
-        Ok(uid) => state::all_allowed(Path::new(state::SYSTEM_ALLOWED), uid),
+        Ok(uid) => state::allowed_here(uid),
         Err(reason) => {
             notes.push(format!("allowed items do not count this time ({reason})"));
             return;
