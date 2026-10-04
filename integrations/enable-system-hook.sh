@@ -1,7 +1,10 @@
 #!/bin/sh
 # Activates the Guardian pacman hook and the Bash theme interceptor after the
 # omarchy-guardian package is installed. Installing the package alone changes
-# no system behaviour.
+# no system behaviour: its hook is in libalpm's own directory and runs in
+# every transaction, but lets each one through until the link made here
+# exists. With the link, pacman runs the hook once: a hook of the same name
+# in a later directory takes the place of the earlier one.
 set -eu
 # Run as root: only the system's own tools, whatever PATH it was started with.
 PATH=/usr/bin

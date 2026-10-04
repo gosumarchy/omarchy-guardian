@@ -1,8 +1,10 @@
 _hook=/etc/pacman.d/hooks/omarchy-guardian.hook
 _packaged_hook=/usr/share/omarchy-guardian/omarchy-guardian.hook
 
-# enable-system-hook.sh links the packaged hook. Anything else at that path
-# came from a manual install, and its Exec path may not exist.
+# The hook pacman always loads is /usr/share/libalpm/hooks/omarchy-guardian.hook;
+# it lets every transaction through until $_hook exists. enable-system-hook.sh
+# links the packaged hook there. Anything else at that path came from a manual
+# install, and its Exec path may not exist.
 _check_hook() {
     if { [ -e "$_hook" ] || [ -L "$_hook" ]; } &&
         [ "$(readlink "$_hook")" != "$_packaged_hook" ]; then
@@ -35,6 +37,7 @@ post_upgrade() {
 # A hook left behind would run a program this removal deletes, and with
 # AbortOnFail every later transaction would fail. A hand-installed copy is
 # moved aside rather than deleted, since pacman only reads *.hook files.
+# The hook in /usr/share/libalpm/hooks goes with the package's files.
 pre_remove() {
     # The daily root check's timer would be left enabled for a unit this
     # removal deletes.

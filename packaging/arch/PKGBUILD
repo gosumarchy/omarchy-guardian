@@ -4,6 +4,8 @@
 # Installing the package alone activates nothing; run
 #   omarchy-guardian protect
 # to turn on the pacman hook, the AUR gate and the theme & plugin gate.
+# The hook is in libalpm's own hook directory, which pacman always reads,
+# and lets every transaction through until it is turned on.
 
 pkgname=omarchy-guardian
 pkgver=0.7.18
@@ -51,6 +53,10 @@ package() {
     install -Dm644 integrations/omarchy/omarchy-bash-interceptor.sh "$lib/omarchy-bash-interceptor.sh"
     install -Dm755 integrations/omarchy/install-user-interceptor.sh "$lib/install-user-interceptor.sh"
     install -Dm755 integrations/enable-system-hook.sh "$lib/enable-system-hook.sh"
+    install -Dm644 integrations/pacman/omarchy-guardian.hook \
+        "$pkgdir/usr/share/libalpm/hooks/omarchy-guardian.hook"
+    # What enable-system-hook.sh links into /etc/pacman.d/hooks to turn the
+    # hook on.
     install -Dm644 integrations/pacman/omarchy-guardian.hook \
         "$pkgdir/usr/share/omarchy-guardian/omarchy-guardian.hook"
     install -Dm644 integrations/omarchy/omarchy-guardian.desktop \
