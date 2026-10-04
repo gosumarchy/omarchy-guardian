@@ -50,24 +50,56 @@ assumes is still welcome.
 ## Supported versions
 
 Only the latest release is supported. Upgrade with
+`git pull && /usr/lib/omarchy-guardian/upgrade` in your checkout; while the
+installed Guardian has no release keys or no such file yet, with
 `git pull && ./install.sh`.
 
 ## Verifying what you install
 
 Releases are annotated git tags (`vX.Y.Z`); from the release that adds the
 key file `packaging/allowed_signers` on, they are signed with an SSH key
-listed there. `./install.sh` says which commit and tag it is about to build. Where the
-installed Guardian carries a list of release signing keys
-(`/usr/share/omarchy-guardian/allowed_signers`, installed by the package
-from `packaging/allowed_signers`), the installer checks that the checkout is
-exactly a release tag signed by one of them, with no file changed and none
-added, before building, and asks before going on when it is not (a
-directory that is not a git checkout included); `--yes` does not answer
-that question. The keys are taken from the installed package, never from
-the checkout being built, and the checkout's own git configuration does not
-choose the keys or the program the signature is verified with.
+listed there, and the package installs that list as
+`/usr/share/omarchy-guardian/allowed_signers`.
 
-A first install has no installed keys, and a package built from a release
-without the key file installs none: the installer then says that the
-signature was not checked. The README's Install section shows how to verify
-a tag by hand, and its Development section how a release is signed.
+**Upgrades** are verified by the Guardian already installed, with
+`/usr/lib/omarchy-guardian/upgrade`, not by anything in the checkout. It
+reads the release tag and its objects out of the checkout as data, without
+running git in the checkout, so the checkout's configuration, index, hooks
+and working tree have no say; copies them into a fresh repository, where
+every object is hashed again; verifies the tag's SSH signature there
+against the installed keys and requires the signed tag to carry the name it
+is stored under; exports exactly the signed tree into an empty directory;
+refuses a release older than the installed one unless told otherwise; and
+only then builds, with the signed release's own installer. Without
+installed keys it builds nothing.
+
+`./install.sh` has a check of its own: that `HEAD` is the commit of a
+release tag signed by an installed key and that the working tree is exactly
+that commit's tree, file by file, with nothing added. It asks before going
+on when that is not so, and `--yes` does not answer the question. This
+check is part of the checkout it checks. It catches mistakes (the wrong
+commit, a changed file); it is no defence against a checkout that was
+tampered with, whose installer could have been changed along with it.
+
+What remains trusted, and is therefore in scope when it can be subverted:
+
+- the installed Guardian, its upgrade check and its key list (root-owned,
+  and paths the pacman gate protects);
+- `git`, `ssh-keygen` and `tar` as installed on the system (git reads the
+  checkout's object files, and a flaw in how it parses them is not
+  something the upgrade check can make up for);
+- the maintainer's release key.
+
+Known limits:
+
+- A first install has no installed keys: it is trust on first use, unless
+  you verify the tag by hand against a key you have reason to trust (the
+  README's Install section shows how). The same holds for the upgrade to
+  the first release that carries the key list.
+- A package built from a release without the key file installs none, and
+  from then on nothing can be verified until one with keys is installed.
+- Someone who controls where you pull from can withhold a newer release.
+  They cannot forge one, and cannot pass an older one off as an upgrade.
+- A new signing key takes effect one release after it is added.
+
+The README's Development section says how a release is signed.
