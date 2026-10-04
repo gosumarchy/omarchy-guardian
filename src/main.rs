@@ -30,6 +30,7 @@ mod content;
 mod deps;
 mod engine;
 mod error;
+mod gatewatch;
 mod git_state;
 mod image;
 mod json;

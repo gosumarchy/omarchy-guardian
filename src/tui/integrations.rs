@@ -1,6 +1,6 @@
 //! The pieces that connect Guardian to the system: the pacman hook, the yay
-//! makepkg gate, the Bash theme interceptor, the Omarchy menu entry and the
-//! bar widget.
+//! makepkg gate, the Bash theme interceptor, the session PATH wrappers, the
+//! Omarchy menu entry and the bar widget.
 //! Each has a state read from disk and a plan to turn it on or off. Plans
 //! that need root or another program run as commands on the terminal (so
 //! `sudo` can ask for a password); the rest are small, exact file edits.
@@ -8,9 +8,11 @@
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+use super::menufile;
+use super::shellscan::{self, Loads};
 use crate::config::model::RootConsent;
 use crate::json::Json;
 
@@ -20,6 +22,30 @@ pub const MAKEPKG_GATE: &str = "/usr/lib/omarchy-guardian/guardian-makepkg";
 pub const INTERCEPTOR_INSTALLER: &str = "/usr/lib/omarchy-guardian/install-user-interceptor.sh";
 const INTERCEPTOR_MARKER: &str = "# Omarchy Guardian theme command interception";
 const INTERCEPTOR_SOURCE: &str = "/usr/lib/omarchy-guardian/omarchy-bash-interceptor.sh";
+/// The line `install-user-interceptor.sh` writes. Only this exact line
+/// counts as loading the interceptor.
+const INTERCEPTOR_LINE: &str = "[[ -r /usr/lib/omarchy-guardian/omarchy-bash-interceptor.sh ]] && source /usr/lib/omarchy-guardian/omarchy-bash-interceptor.sh";
+/// Root-owned commands with the names of Omarchy's theme and plugin
+/// installers (and of its dispatcher), which go through Guardian. First on
+/// the session's PATH, they catch every caller that finds those commands
+/// by name: scripts, other shells, launchers, key bindings.
+pub const WRAPPERS: &str = "/usr/lib/omarchy-guardian/bin";
+const WRAPPED: [&str; 5] = [
+    "omarchy",
+    "omarchy-theme-install",
+    "omarchy-theme-update",
+    "omarchy-plugin-add",
+    "omarchy-plugin-update",
+];
+/// The file uwsm sources for the graphical session, after Omarchy's own
+/// (`10-omarchy`), and the line in it that counts.
+const SESSION_ENV_NAME: &str = "90-omarchy-guardian";
+const SESSION_ENV_LINE: &str = "export PATH=\"/usr/lib/omarchy-guardian/bin:$PATH\"";
+const SESSION_ENV: &str = "# Omarchy Guardian: theme and plugin installs found on PATH go through Guardian.\n# Written by `omarchy-guardian protect`, removed by `omarchy-guardian protect --off`.\nexport PATH=\"/usr/lib/omarchy-guardian/bin:$PATH\"\n";
+/// AUR helpers Guardian has no gate for.
+const UNGATED_HELPERS: [&str; 3] = ["pikaur", "aura", "trizen"];
+/// What is left of a file as it was before Guardian first edited it.
+const BACKUP_SUFFIX: &str = ".guardian-bak";
 const MENU_ID: &str = "\"setup.guardian\"";
 /// The bar widget plugin the package ships, and its Omarchy plugin id.
 pub const WIDGET_SOURCE: &str = "/usr/share/omarchy-guardian/bar-widget";
@@ -66,6 +92,7 @@ pub enum Integration {
     PacmanHook,
     AurGate,
     ThemeInterceptor,
+    SessionPath,
     MenuEntry,
     BarWidget,
     WaybarModule,
@@ -73,10 +100,11 @@ pub enum Integration {
 }
 
 impl Integration {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::PacmanHook,
         Self::AurGate,
         Self::ThemeInterceptor,
+        Self::SessionPath,
         Self::MenuEntry,
         Self::BarWidget,
         Self::WaybarModule,
@@ -88,6 +116,7 @@ impl Integration {
             Self::PacmanHook => "Pacman hook",
             Self::AurGate => "AUR gate (yay)",
             Self::ThemeInterceptor => "Theme & plugin gate",
+            Self::SessionPath => "Theme & plugin commands (PATH)",
             Self::MenuEntry => "Omarchy menu entry",
             Self::BarWidget => "Bar widget",
             Self::WaybarModule => "Waybar module",
@@ -103,6 +132,9 @@ impl Integration {
             Self::AurGate => "Makes yay build AUR packages through Guardian's makepkg gate.",
             Self::ThemeInterceptor => {
                 "Routes theme and plugin installs and updates through Guardian, from Bash (new shells) and from the Omarchy menu."
+            }
+            Self::SessionPath => {
+                "Puts Guardian's own `omarchy`, `omarchy-theme-install`, `omarchy-theme-update`, `omarchy-plugin-add` and `omarchy-plugin-update` first on the session's PATH, so scripts, other shells, launchers and key bindings go through Guardian too. Applies from the next login."
             }
             Self::MenuEntry => "Adds Setup › Guardian to the Omarchy menu, opening this window.",
             Self::BarWidget => {
@@ -145,6 +177,8 @@ pub enum Step {
     RemoveBarWidget,
     AddWaybarModule,
     RemoveWaybarModule,
+    AddSessionPath,
+    RemoveSessionPath,
     /// Asks whether the sweep's root checks may run, records the answer in
     /// the system configuration and, when allowed, enables their timer.
     AskSweepRoot,
@@ -197,6 +231,12 @@ impl Plan {
                     paths.waybar_config.display(),
                     paths.waybar_style.display()
                 ),
+                Step::AddSessionPath => format!(
+                    "write {}: put {} first on the session's PATH (from the next login)",
+                    paths.session_env.display(),
+                    paths.wrappers.display()
+                ),
+                Step::RemoveSessionPath => format!("remove {}", paths.session_env.display()),
                 Step::AskSweepRoot => "ask whether the daily read-only root checks may run, then record the answer in the system configuration (sudo)".into(),
             })
             .collect()
@@ -243,6 +283,59 @@ pub struct Paths {
     pub sweep_group: Option<String>,
     /// The name of the user's login shell (`bash`, `zsh`), if known.
     pub login_shell: Option<String>,
+    /// Guardian's makepkg shim, which yay is pointed at.
+    pub makepkg_gate: PathBuf,
+    /// Who must own the files Guardian installs: root. Tests, which cannot
+    /// make root's files, name their own user.
+    pub owner: u32,
+    /// Where other AUR helpers are installed.
+    pub system_bin: PathBuf,
+    pub paru_config: PathBuf,
+    /// The shell start-up files an alias or function could be in.
+    pub shell_startup: Vec<PathBuf>,
+    /// This process's PATH, and the session service manager's if it can
+    /// be asked.
+    pub path_dirs: Vec<PathBuf>,
+    pub manager_path: Option<Vec<PathBuf>>,
+    /// The wrapper commands as packaged, and the session file that puts
+    /// them first on PATH.
+    pub wrappers: PathBuf,
+    pub session_env: PathBuf,
+}
+
+/// The directories of a PATH value.
+fn path_list(path: &std::ffi::OsStr) -> Vec<PathBuf> {
+    env::split_paths(path).collect()
+}
+
+/// The PATH the session's service manager gives what it starts, if there
+/// is a manager to ask.
+fn manager_path() -> Option<Vec<PathBuf>> {
+    let shown = crate::tools::run(
+        Path::new("/usr/bin/systemctl"),
+        &["--user".into(), "show-environment".into()],
+        None,
+        &[],
+        crate::tools::Limits {
+            timeout_secs: 5,
+            max_output: 256 * 1024,
+        },
+    )
+    .ok()
+    .filter(|shown| shown.status.success())?;
+    String::from_utf8_lossy(&shown.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("PATH="))
+        .map(|path| path_list(std::ffi::OsStr::new(path)))
+}
+
+/// One half of the theme & plugin gate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Part {
+    On,
+    Off,
+    /// Written, and not in effect: why.
+    Broken(String),
 }
 
 /// The login shell's name: of the user's `/etc/passwd` entry, else of
@@ -291,7 +384,9 @@ impl Paths {
             interceptor_installer: INTERCEPTOR_INSTALLER.into(),
             bashrc: home.join(".bashrc"),
             omarchy: "/usr/share/omarchy".into(),
-            menu: config.join("omarchy/extensions/omarchy-menu.jsonc"),
+            // Where the menu itself looks: under HOME, whatever
+            // XDG_CONFIG_HOME says.
+            menu: home.join(".config/omarchy/extensions/omarchy-menu.jsonc"),
             widget_source: WIDGET_SOURCE.into(),
             widget_target: config.join("omarchy/plugins").join(WIDGET_ID),
             shell_config: config.join("omarchy/shell.json"),
@@ -313,30 +408,37 @@ impl Paths {
             sweep_consent,
             sweep_group,
             login_shell: login_shell(),
+            makepkg_gate: MAKEPKG_GATE.into(),
+            owner: 0,
+            system_bin: "/usr/bin".into(),
+            paru_config: config.join("paru/paru.conf"),
+            shell_startup: [
+                ".bashrc",
+                ".bash_profile",
+                ".bash_login",
+                ".profile",
+                ".bash_aliases",
+                ".zshrc",
+                ".zshenv",
+                ".zprofile",
+            ]
+            .iter()
+            .map(|name| home.join(name))
+            .chain([config.join("fish/config.fish")])
+            .collect(),
+            path_dirs: env::var_os("PATH")
+                .map(|path| path_list(&path))
+                .unwrap_or_default(),
+            manager_path: manager_path(),
+            wrappers: WRAPPERS.into(),
+            session_env: config.join("uwsm/env.d").join(SESSION_ENV_NAME),
         })
     }
 
     pub fn state(&self, integration: Integration) -> State {
         match integration {
             Integration::PacmanHook => self.hook_state(),
-            Integration::AurGate => {
-                if !self.yay.exists() {
-                    return State::Unavailable("yay is not installed".into());
-                }
-                let makepkg = fs::read_to_string(&self.yay_config)
-                    .ok()
-                    .and_then(|text| Json::parse(&text).ok())
-                    .and_then(|config| {
-                        config
-                            .get("makepkgbin")
-                            .and_then(Json::as_str)
-                            .map(str::to_string)
-                    });
-                match makepkg.as_deref() {
-                    Some(MAKEPKG_GATE) => State::On,
-                    _ => State::Off,
-                }
-            }
+            Integration::AurGate => self.aur_state(),
             Integration::ThemeInterceptor => {
                 if !self.interceptor_installer.exists() {
                     return State::Unavailable(
@@ -344,25 +446,43 @@ impl Paths {
                     );
                 }
                 match self.theme_parts() {
-                    (true, None | Some(true)) => State::On,
-                    (true, Some(false)) => State::Partial(
+                    (Part::Broken(why), _) | (_, Some(Part::Broken(why))) => State::Partial(why),
+                    (Part::On, None | Some(Part::On)) => State::On,
+                    (Part::On, Some(Part::Off)) => State::Partial(
                         "terminal only: themes and plugins from the Omarchy menu skip Guardian"
                             .into(),
                     ),
-                    (false, Some(true)) => State::Partial(
+                    (Part::Off, Some(Part::On)) => State::Partial(
                         "menu only: `omarchy theme` and `omarchy plugin` in Bash skip Guardian"
                             .into(),
                     ),
-                    (false, None | Some(false)) => State::Off,
+                    (Part::Off, None | Some(Part::Off)) => State::Off,
                 }
             }
+            Integration::SessionPath => self.session_state(),
             Integration::MenuEntry => {
                 if !self.omarchy.is_dir() {
                     return State::Unavailable("Omarchy is not installed".into());
                 }
-                let enabled = fs::read_to_string(&self.menu)
-                    .is_ok_and(|text| text.lines().any(|line| names(line, MENU_ID)));
-                if enabled { State::On } else { State::Off }
+                let Ok(text) = fs::read_to_string(&self.menu) else {
+                    return State::Off;
+                };
+                let written = text.lines().any(|line| names(line, MENU_ID));
+                match menufile::items(&text) {
+                    Ok(items)
+                        if menufile::action(&items, MENU_ID.trim_matches('"'))
+                            == menu_action(MENU_ENTRY).as_deref() =>
+                    {
+                        State::On
+                    }
+                    Ok(_) if written => State::Partial(
+                        "in the menu file, but a later entry of the same name replaces it".into(),
+                    ),
+                    Err(why) if written => State::Partial(format!(
+                        "in the menu file, but the Omarchy menu ignores that file: {why}"
+                    )),
+                    Ok(_) | Err(_) => State::Off,
+                }
             }
             Integration::BarWidget => self.widget_state(),
             Integration::WaybarModule => self.waybar_state(),
@@ -375,6 +495,10 @@ impl Paths {
     /// goes straight to Omarchy. Nothing here can turn that on, so it is
     /// said beside the gate rather than counted as a fault.
     pub fn theme_caveat(&self) -> Option<String> {
+        // With Guardian's commands first on PATH every shell finds them.
+        if self.session_state() == State::On {
+            return None;
+        }
         let shell = self
             .login_shell
             .as_deref()
@@ -581,27 +705,238 @@ impl Paths {
         }
     }
 
-    /// Whether the Bash interceptor is in `~/.bashrc`, and whether the
-    /// Omarchy menu's theme items are overridden (`None` without Omarchy).
-    fn theme_parts(&self) -> (bool, Option<bool>) {
-        // The line that loads the interceptor, not the marker above it:
-        // a marker left behind, or a line commented out, loads nothing.
-        let bash = fs::read_to_string(&self.bashrc).is_ok_and(|text| {
-            text.lines().any(|line| {
-                line.contains(INTERCEPTOR_SOURCE)
-                    && line.contains("source ")
-                    && !line.trim_start().starts_with('#')
-            })
-        });
-        let menu = self.omarchy.is_dir().then(|| {
-            fs::read_to_string(&self.menu).is_ok_and(|text| {
-                THEME_OVERRIDES.iter().all(|(id, _)| {
-                    text.lines()
-                        .any(|line| names(line, id) && line.contains(THEME_GATE))
+    /// The yay gate: on when yay's saved configuration builds through
+    /// Guardian's shim, the shim is root's, and nothing in front of yay
+    /// (another yay on PATH, an alias or function passing `--makepkg`)
+    /// takes the build elsewhere.
+    fn aur_state(&self) -> State {
+        if !self.yay.exists() {
+            return State::Unavailable("yay is not installed".into());
+        }
+        let makepkg = fs::read_to_string(&self.yay_config)
+            .ok()
+            .and_then(|text| Json::parse(&text).ok())
+            .and_then(|config| {
+                config
+                    .get("makepkgbin")
+                    .and_then(Json::as_str)
+                    .map(str::to_string)
+            });
+        match makepkg.as_deref() {
+            Some(gate) if Path::new(gate) == self.makepkg_gate => {}
+            None | Some("" | "makepkg" | "/usr/bin/makepkg") => return State::Off,
+            Some(other) => {
+                return State::Partial(format!(
+                    "not on: yay builds with {other}, which is not Guardian's gate"
+                ));
+            }
+        }
+        if let Err(why) = self.installed_file(&self.makepkg_gate) {
+            return State::Partial(format!("configured but not to be trusted: {why}"));
+        }
+        if let Some(first) = self.first_on_path("yay")
+            && fs::canonicalize(&self.yay).ok().as_ref() != Some(&first)
+        {
+            return State::Partial(format!(
+                "configured but bypassed: another yay comes first on PATH ({})",
+                first.display()
+            ));
+        }
+        if let Some(file) = self.makepkg_override("yay") {
+            return State::Partial(format!(
+                "configured but bypassed: an alias or function named yay in {} passes --makepkg",
+                file.display()
+            ));
+        }
+        State::On
+    }
+
+    /// AUR helpers on this machine that build without Guardian: one line
+    /// each, for the bar's list of problems.
+    pub fn helper_issues(&self) -> Vec<String> {
+        let mut issues = Vec::new();
+        if self.system_bin.join("paru").exists() {
+            // paru.conf: `Makepkg = <command>` under `[bin]`.
+            let routed = fs::read_to_string(&self.paru_config).is_ok_and(|text| {
+                let mut section = "";
+                text.lines().map(str::trim).any(|line| {
+                    if line.starts_with('[') {
+                        section = line;
+                    }
+                    section == "[bin]"
+                        && line.split_once('=').is_some_and(|(key, value)| {
+                            key.trim() == "Makepkg" && Path::new(value.trim()) == self.makepkg_gate
+                        })
                 })
+            });
+            if !routed {
+                issues.push(format!(
+                    "paru builds AUR packages without Guardian (set `Makepkg = {}` under `[bin]` in {})",
+                    self.makepkg_gate.display(),
+                    self.paru_config.display()
+                ));
+            } else if let Some(file) = self.makepkg_override("paru") {
+                issues.push(format!(
+                    "paru builds AUR packages without Guardian: an alias or function named paru in {} passes --makepkg",
+                    file.display()
+                ));
+            }
+        }
+        for helper in UNGATED_HELPERS {
+            if self.system_bin.join(helper).exists() {
+                issues.push(format!("{helper} builds AUR packages without Guardian"));
+            }
+        }
+        issues
+    }
+
+    /// The start-up file in which an alias or function called `helper`
+    /// passes `--makepkg`.
+    fn makepkg_override(&self, helper: &str) -> Option<&Path> {
+        self.shell_startup
+            .iter()
+            .find(|file| {
+                fs::read_to_string(file)
+                    .is_ok_and(|text| shellscan::overrides_makepkg(&text, helper))
             })
+            .map(PathBuf::as_path)
+    }
+
+    /// The first program called `name` on this process's PATH, resolved.
+    fn first_on_path(&self, name: &str) -> Option<PathBuf> {
+        self.path_dirs
+            .iter()
+            .filter(|directory| directory.is_absolute())
+            .map(|directory| directory.join(name))
+            .find(|candidate| candidate.is_file())
+            .and_then(|candidate| fs::canonicalize(candidate).ok())
+    }
+
+    /// Checks that `path` is a file Guardian's package installed: a
+    /// regular file owned by root that only root can write, in such a
+    /// directory. Anything else could be replaced by the user's programs.
+    fn installed_file(&self, path: &Path) -> Result<(), String> {
+        let metadata =
+            fs::symlink_metadata(path).map_err(|_| format!("{} is missing", path.display()))?;
+        if !metadata.file_type().is_file() {
+            return Err(format!("{} is not a regular file", path.display()));
+        }
+        let directory = path.parent().and_then(|parent| fs::metadata(parent).ok());
+        for metadata in std::iter::once(metadata).chain(directory) {
+            if metadata.uid() != self.owner || metadata.mode() & 0o022 != 0 {
+                return Err(format!("{} is not root's alone to write", path.display()));
+            }
+        }
+        Ok(())
+    }
+
+    /// The wrappers on the session's PATH: on when the session file holds
+    /// Guardian's line, the wrappers are root's, and the PATH of this
+    /// process and of the session's service manager both find them before
+    /// any other command of those names.
+    fn session_state(&self) -> State {
+        if !self.wrappers.is_dir() {
+            return State::Unavailable("the omarchy-guardian package is not installed".into());
+        }
+        if !self.omarchy.is_dir() {
+            return State::Unavailable("Omarchy is not installed".into());
+        }
+        let written = fs::read_to_string(&self.session_env).is_ok_and(|text| {
+            let code: Vec<&str> = text
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .collect();
+            code == [SESSION_ENV_LINE]
         });
+        if !written {
+            return State::Off;
+        }
+        for name in WRAPPED {
+            if let Err(why) = self.installed_file(&self.wrappers.join(name)) {
+                return State::Partial(format!("set up but not to be trusted: {why}"));
+            }
+        }
+        let lists = [
+            ("this session", Some(&self.path_dirs)),
+            ("the session's service manager", self.manager_path.as_ref()),
+        ];
+        for (whose, directories) in lists {
+            if let Some(why) = directories.and_then(|directories| self.path_problem(directories)) {
+                return State::Partial(format!(
+                    "set up, but not in effect for {whose}: {why}. Log out and back in; if it stays, something else reorders PATH"
+                ));
+            }
+        }
+        State::On
+    }
+
+    /// Why the wrappers are not what `directories` (a PATH) finds first.
+    fn path_problem(&self, directories: &[PathBuf]) -> Option<String> {
+        let Some(position) = directories
+            .iter()
+            .position(|directory| *directory == self.wrappers)
+        else {
+            return Some(format!("{} is not on PATH", self.wrappers.display()));
+        };
+        directories[..position]
+            .iter()
+            .flat_map(|directory| WRAPPED.iter().map(move |name| directory.join(name)))
+            .find(|candidate| candidate.is_file())
+            .map(|candidate| format!("{} comes before it on PATH", candidate.display()))
+    }
+
+    /// The Bash interceptor in `~/.bashrc`, and the Omarchy menu's theme
+    /// and plugin items (`None` without Omarchy).
+    fn theme_parts(&self) -> (Part, Option<Part>) {
+        // Guardian's own line where it runs, not the marker above it or a
+        // line that merely names the file.
+        let bash = match fs::read_to_string(&self.bashrc)
+            .map(|text| shellscan::interceptor(&text, INTERCEPTOR_LINE, INTERCEPTOR_SOURCE))
+        {
+            Ok(Loads::Effective) => Part::On,
+            Ok(Loads::Ineffective(why)) => Part::Broken(format!(
+                "not effective in Bash: the interceptor's line is in {}, but {why}",
+                self.bashrc.display()
+            )),
+            Ok(Loads::Missing) | Err(_) => Part::Off,
+        };
+        let menu = self.omarchy.is_dir().then(|| self.menu_part());
         (bash, menu)
+    }
+
+    /// Whether the menu's theme and plugin items run Guardian: by the
+    /// entry in effect for each, as the menu reads its file.
+    fn menu_part(&self) -> Part {
+        let Ok(text) = fs::read_to_string(&self.menu) else {
+            return Part::Off;
+        };
+        let written = THEME_OVERRIDES
+            .iter()
+            .filter(|(id, _)| {
+                text.lines()
+                    .any(|line| names(line, id) && line.contains(THEME_GATE))
+            })
+            .count();
+        let items = match menufile::items(&text) {
+            Ok(items) => items,
+            Err(_) if written == 0 => return Part::Off,
+            Err(why) => {
+                return Part::Broken(format!(
+                    "not effective in the Omarchy menu, which ignores its user file: {why}"
+                ));
+            }
+        };
+        let replaced = THEME_OVERRIDES.iter().find(|(id, entry)| {
+            menufile::action(&items, id.trim_matches('"')) != menu_action(entry).as_deref()
+        });
+        match replaced {
+            None => Part::On,
+            Some(_) if written == 0 => Part::Off,
+            Some((id, _)) => Part::Broken(format!(
+                "not effective in the Omarchy menu: the entry in effect for {id} is not Guardian's"
+            )),
+        }
     }
 
     /// The plan that flips `integration` from `state`; `None` when it
@@ -620,24 +955,16 @@ impl Paths {
                 "Disable the pacman hook",
                 vec![sudo(&["/usr/bin/rm", "-f", &text(&self.hook_target)])],
             ),
-            (Integration::AurGate, _) => {
-                let makepkg = if on { MAKEPKG_GATE } else { "makepkg" };
-                (
-                    if on {
-                        "Enable the AUR gate"
-                    } else {
-                        "Disable the AUR gate"
-                    },
-                    vec![Step::Command(vec![
-                        text(&self.yay),
-                        "--makepkg".into(),
-                        makepkg.into(),
-                        "--save".into(),
-                        "-P".into(),
-                        "--stats".into(),
-                    ])],
-                )
-            }
+            (Integration::SessionPath, true) => (
+                "Put Guardian's theme & plugin commands first on PATH",
+                vec![Step::AddSessionPath],
+            ),
+            (Integration::SessionPath, false) => (
+                "Take Guardian's theme & plugin commands off PATH",
+                vec![Step::RemoveSessionPath],
+            ),
+            (Integration::AurGate, true) => ("Enable the AUR gate", self.aur_steps(on)),
+            (Integration::AurGate, false) => ("Disable the AUR gate", self.aur_steps(on)),
             (Integration::ThemeInterceptor, _) => (
                 if on {
                     "Enable the theme & plugin gate"
@@ -705,6 +1032,24 @@ impl Paths {
         })
     }
 
+    /// Points yay's saved configuration at Guardian's shim, or back at
+    /// makepkg.
+    fn aur_steps(&self, on: bool) -> Vec<Step> {
+        let makepkg = if on {
+            self.makepkg_gate.display().to_string()
+        } else {
+            "makepkg".into()
+        };
+        vec![Step::Command(vec![
+            self.yay.display().to_string(),
+            "--makepkg".into(),
+            makepkg,
+            "--save".into(),
+            "-P".into(),
+            "--stats".into(),
+        ])]
+    }
+
     /// Turns the hook on. Without OpenCode it would refuse every package
     /// that needs the AI review, so OpenCode is installed first.
     fn hook_steps(&self, state: &State) -> Vec<Step> {
@@ -762,25 +1107,27 @@ impl Paths {
     }
 
     /// Brings both halves of the theme gate, Bash and the Omarchy menu, to
-    /// `on`.
+    /// `on`. A half that is written and not in effect is written anew, at
+    /// the end of its file, where nothing after it undoes it.
     fn theme_steps(&self, on: bool) -> Vec<Step> {
         let (bash, menu) = self.theme_parts();
+        let install = Step::Command(vec![self.interceptor_installer.display().to_string()]);
         let mut steps = Vec::new();
-        if on && !bash {
-            steps.push(Step::Command(vec![
-                self.interceptor_installer.display().to_string(),
-            ]));
+        match (on, bash) {
+            (true, Part::Off) => steps.push(install),
+            (true, Part::Broken(_)) => steps.extend([Step::RemoveInterceptor, install]),
+            (false, Part::On | Part::Broken(_)) => steps.push(Step::RemoveInterceptor),
+            (true, Part::On) | (false, Part::Off) => {}
         }
-        if !on && bash {
-            steps.push(Step::RemoveInterceptor);
-        }
-        if menu == Some(!on) {
-            steps.push(if on {
-                Step::AddThemeMenu
-            } else {
-                Step::RemoveThemeMenu
-            });
-            steps.push(refresh());
+        match (on, menu) {
+            (true, Some(Part::Off)) => steps.extend([Step::AddThemeMenu, refresh()]),
+            (true, Some(Part::Broken(_))) => {
+                steps.extend([Step::RemoveThemeMenu, Step::AddThemeMenu, refresh()]);
+            }
+            (false, Some(Part::On | Part::Broken(_))) => {
+                steps.extend([Step::RemoveThemeMenu, refresh()]);
+            }
+            (true, Some(Part::On) | None) | (false, Some(Part::Off) | None) => {}
         }
         steps
     }
@@ -792,7 +1139,7 @@ impl Paths {
                 let text = fs::read_to_string(&self.bashrc).map_err(|error| error.to_string())?;
                 // The file a symlinked ~/.bashrc names is replaced, so the
                 // link stays one.
-                replace_file(&self.bashrc, &without_interceptor(&text))
+                edit_file(&self.bashrc, &without_interceptor(&text))
             }
             Step::AddMenuEntry => self.add_menu_lines(&[MENU_ENTRY]),
             Step::RemoveMenuEntry => self.remove_menu_lines(&|line| names(line, MENU_ID)),
@@ -840,7 +1187,7 @@ impl Paths {
             Step::AddWaybarModule => {
                 let config =
                     fs::read_to_string(&self.waybar_config).map_err(|error| error.to_string())?;
-                replace_file(&self.waybar_config, &with_waybar_module(&config)?)?;
+                edit_file(&self.waybar_config, &with_waybar_module(&config)?)?;
                 let style = without_waybar_style(
                     &fs::read_to_string(&self.waybar_style).unwrap_or_default(),
                 );
@@ -849,20 +1196,34 @@ impl Paths {
                 } else {
                     "\n"
                 };
-                replace_file(
+                edit_file(
                     &self.waybar_style,
                     &format!("{style}{separator}\n{}", waybar_style(&style)),
                 )
             }
             Step::RemoveWaybarModule => {
                 if let Ok(config) = fs::read_to_string(&self.waybar_config) {
-                    replace_file(&self.waybar_config, &without_waybar_module(&config))?;
+                    edit_file(&self.waybar_config, &without_waybar_module(&config))?;
                 }
                 if let Ok(style) = fs::read_to_string(&self.waybar_style) {
-                    replace_file(&self.waybar_style, &without_waybar_style(&style))?;
+                    edit_file(&self.waybar_style, &without_waybar_style(&style))?;
                 }
                 Ok(())
             }
+            Step::AddSessionPath => {
+                if let Some(directory) = self.session_env.parent() {
+                    fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+                }
+                replace_file(&self.session_env, SESSION_ENV)
+            }
+            // Only Guardian's own file: one of that name holding
+            // something else is the user's.
+            Step::RemoveSessionPath => match fs::read_to_string(&self.session_env) {
+                Ok(text) if text.contains(SESSION_ENV_LINE) => {
+                    fs::remove_file(&self.session_env).map_err(|error| error.to_string())
+                }
+                Ok(_) | Err(_) => Ok(()),
+            },
             Step::Command(_) | Step::Optional(_) | Step::AskSweepRoot => Ok(()),
         }
     }
@@ -879,13 +1240,13 @@ impl Paths {
             }
             with_menu_entries("{\n}\n", entries)?
         };
-        replace_file(&self.menu, &text)
+        edit_file(&self.menu, &text)
     }
 
     fn remove_menu_lines(&self, remove: &dyn Fn(&str) -> bool) -> Result<(), String> {
         let text = fs::read_to_string(&self.menu).map_err(|error| error.to_string())?;
         let kept: Vec<&str> = text.lines().filter(|line| !remove(line)).collect();
-        replace_file(&self.menu, &(kept.join("\n") + "\n"))
+        edit_file(&self.menu, &(kept.join("\n") + "\n"))
     }
 }
 
@@ -939,6 +1300,39 @@ fn list_ends(mut text: &str) -> bool {
 fn names(line: &str, text: &str) -> bool {
     line.find(text)
         .is_some_and(|at| comment_start(line).is_none_or(|comment| at < comment))
+}
+
+/// The `action` of a menu entry line Guardian writes.
+fn menu_action(entry: &str) -> Option<String> {
+    let items = menufile::items(&format!("{{{entry}}}")).ok()?;
+    let (id, _) = items.first()?;
+    menufile::action(&items, id).map(str::to_string)
+}
+
+/// Replaces one of the user's own files (`~/.bashrc`, the menu file, the
+/// Waybar config), keeping a copy of it as it was before Guardian's first
+/// edit beside it, as `<name>.guardian-bak`. Later edits leave that copy
+/// alone: it is the way back to the file as the user had it.
+fn edit_file(path: &Path, text: &str) -> Result<(), String> {
+    if let Ok(real) = fs::canonicalize(path)
+        && let Ok(before) = fs::read(&real)
+    {
+        let mut name = real.clone().into_os_string();
+        name.push(BACKUP_SUFFIX);
+        // Made new: an existing copy, or anything else under that name, is
+        // never written over or through.
+        if let Ok(mut backup) = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(PathBuf::from(name))
+        {
+            backup
+                .write_all(&before)
+                .map_err(|error| format!("could not keep a copy of {}: {error}", path.display()))?;
+        }
+    }
+    replace_file(path, text)
 }
 
 /// Replaces the file at `path` in one step, so a reader never sees it half
@@ -1189,8 +1583,8 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use super::{
-        INTERCEPTOR_MARKER, Integration, MENU_ENTRY, Paths, State, Step, with_menu_entries,
-        without_interceptor,
+        INTERCEPTOR_LINE, INTERCEPTOR_MARKER, Integration, MENU_ENTRY, Part, Paths, SESSION_ENV,
+        State, Step, THEME_OVERRIDES, WRAPPED, with_menu_entries, without_interceptor,
     };
     use crate::test_support::TempDir;
 
@@ -1223,6 +1617,15 @@ mod tests {
             sweep_consent: None,
             sweep_group: Some("u".into()),
             login_shell: Some("bash".into()),
+            makepkg_gate: root.join("guardian-makepkg"),
+            owner: std::os::unix::fs::MetadataExt::uid(&fs::metadata(root).unwrap()),
+            system_bin: root.join("bin"),
+            paru_config: root.join("paru.conf"),
+            shell_startup: vec![root.join("bashrc"), root.join("zshrc")],
+            path_dirs: Vec::new(),
+            manager_path: None,
+            wrappers: root.join("wrappers"),
+            session_env: root.join("uwsm/env.d/90-omarchy-guardian"),
         }
     }
 
@@ -1329,14 +1732,311 @@ mod tests {
         let dir = TempDir::new("integrations-yay");
         let paths = paths(&dir);
         assert_eq!(paths.state(Integration::AurGate), State::Off);
-        fs::write(
-            &paths.yay_config,
-            r#"{"makepkgbin": "/usr/lib/omarchy-guardian/guardian-makepkg"}"#,
-        )
-        .unwrap();
+        let configure = |makepkg: &str| {
+            fs::write(
+                &paths.yay_config,
+                format!("{{\"makepkgbin\": \"{makepkg}\"}}"),
+            )
+            .unwrap();
+        };
+        let gate = paths.makepkg_gate.display().to_string();
+        fs::write(&paths.makepkg_gate, "").unwrap();
+        configure(&gate);
         assert_eq!(paths.state(Integration::AurGate), State::On);
         let plan = paths.plan(Integration::AurGate, &State::On).unwrap();
         assert!(matches!(&plan.steps[..], [Step::Command(argv)] if argv[2] == "makepkg"));
+        let plan = paths.plan(Integration::AurGate, &State::Off).unwrap();
+        assert!(matches!(&plan.steps[..], [Step::Command(argv)] if argv[2] == gate));
+
+        // makepkg itself is off; any other program is not Guardian's gate.
+        configure("/usr/bin/makepkg");
+        assert_eq!(paths.state(Integration::AurGate), State::Off);
+        configure("/tmp/guardian-makepkg");
+        let state = paths.state(Integration::AurGate);
+        assert!(matches!(&state, State::Partial(why) if why.contains("not Guardian's gate")));
+    }
+
+    #[test]
+    fn a_configured_aur_gate_that_is_bypassed_is_not_on() {
+        let dir = TempDir::new("integrations-yay-bypass");
+        let mut paths = paths(&dir);
+        let gate = paths.makepkg_gate.display().to_string();
+        fs::write(&paths.yay_config, format!("{{\"makepkgbin\": \"{gate}\"}}")).unwrap();
+        let partial = |paths: &Paths, expected: &str| {
+            let state = paths.state(Integration::AurGate);
+            assert!(
+                matches!(&state, State::Partial(why) if why.contains(expected)),
+                "{state:?}"
+            );
+        };
+
+        // The shim is not there, or is not one only its owner can write.
+        partial(&paths, "is missing");
+        fs::write(&paths.makepkg_gate, "").unwrap();
+        fs::set_permissions(&paths.makepkg_gate, fs::Permissions::from_mode(0o666)).unwrap();
+        partial(&paths, "not root's alone to write");
+        fs::set_permissions(&paths.makepkg_gate, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(paths.state(Integration::AurGate), State::On);
+        // Owned by somebody else than the installer.
+        paths.owner += 1;
+        partial(&paths, "not root's alone to write");
+        paths.owner -= 1;
+
+        // Another yay earlier on PATH.
+        let front = dir.path().join("front");
+        fs::create_dir_all(&front).unwrap();
+        paths.path_dirs = vec![front.clone(), dir.path().to_path_buf()];
+        assert_eq!(paths.state(Integration::AurGate), State::On);
+        fs::write(front.join("yay"), "").unwrap();
+        partial(&paths, "another yay comes first on PATH");
+        fs::remove_file(front.join("yay")).unwrap();
+
+        // An alias or function in front of it that names its own makepkg.
+        fs::write(
+            dir.path().join("zshrc"),
+            "alias yay='yay --makepkg /usr/bin/makepkg'\n",
+        )
+        .unwrap();
+        partial(&paths, "an alias or function named yay");
+        fs::write(dir.path().join("zshrc"), "alias yay='yay --noconfirm'\n").unwrap();
+        assert_eq!(paths.state(Integration::AurGate), State::On);
+    }
+
+    #[test]
+    fn other_aur_helpers_without_the_gate_are_issues() {
+        let dir = TempDir::new("integrations-helpers");
+        let paths = paths(&dir);
+        assert!(paths.helper_issues().is_empty());
+        fs::create_dir_all(&paths.system_bin).unwrap();
+        fs::write(paths.system_bin.join("paru"), "").unwrap();
+        fs::write(paths.system_bin.join("pikaur"), "").unwrap();
+        let issues = paths.helper_issues();
+        assert_eq!(issues.len(), 2, "{issues:?}");
+        assert!(issues[0].starts_with("paru builds AUR packages without Guardian"));
+        assert_eq!(issues[1], "pikaur builds AUR packages without Guardian");
+
+        // paru pointed at the gate by hand counts, in its own section only.
+        let gate = paths.makepkg_gate.display();
+        fs::write(&paths.paru_config, format!("[options]\nMakepkg = {gate}\n")).unwrap();
+        assert_eq!(paths.helper_issues().len(), 2);
+        fs::write(
+            &paths.paru_config,
+            format!("[options]\nBottomUp\n[bin]\nMakepkg = {gate}\n"),
+        )
+        .unwrap();
+        assert_eq!(paths.helper_issues().len(), 1);
+        fs::write(
+            dir.path().join("bashrc"),
+            "paru() {\n  command paru --makepkg makepkg \"$@\"\n}\n",
+        )
+        .unwrap();
+        assert!(paths.helper_issues()[0].contains("an alias or function named paru"));
+    }
+
+    #[test]
+    fn an_interceptor_line_that_cannot_take_effect_is_partial_and_repaired_at_the_end() {
+        let dir = TempDir::new("integrations-bashrc-broken");
+        let paths = paths(&dir);
+        for bashrc in [
+            ": source /usr/lib/omarchy-guardian/omarchy-bash-interceptor.sh\n".to_string(),
+            format!("{INTERCEPTOR_LINE}\nunset -f omarchy\n"),
+            format!("never() {{\n{INTERCEPTOR_LINE}\n}}\n"),
+        ] {
+            fs::write(&paths.bashrc, &bashrc).unwrap();
+            let state = paths.state(Integration::ThemeInterceptor);
+            assert!(
+                matches!(&state, State::Partial(why) if why.starts_with("not effective in Bash")),
+                "{state:?} for {bashrc}"
+            );
+            // Taken out, then written again by the installer, at the end.
+            let steps = paths
+                .plan(Integration::ThemeInterceptor, &state)
+                .unwrap()
+                .steps;
+            assert_eq!(steps[0], Step::RemoveInterceptor);
+            assert!(matches!(&steps[1], Step::Command(_)), "{steps:?}");
+            // Off takes it out too.
+            let off = paths
+                .plan(Integration::ThemeInterceptor, &State::On)
+                .unwrap()
+                .steps;
+            assert!(off.contains(&Step::RemoveInterceptor));
+        }
+    }
+
+    #[test]
+    fn a_menu_override_counts_only_when_it_is_the_entry_in_effect() {
+        let dir = TempDir::new("integrations-menu-effective");
+        let paths = paths(&dir);
+        fs::write(&paths.bashrc, format!("{INTERCEPTOR_LINE}\n")).unwrap();
+        paths.edit(&Step::AddThemeMenu).unwrap();
+        paths.edit(&Step::AddMenuEntry).unwrap();
+        assert_eq!(paths.state(Integration::ThemeInterceptor), State::On);
+        assert_eq!(paths.state(Integration::MenuEntry), State::On);
+        let written = fs::read_to_string(&paths.menu).unwrap();
+
+        // A later entry of the same name wins when the menu reads the file.
+        let later = written.replace(
+            "\n}\n",
+            "\n  \"update.themes\": {\"action\":\"omarchy-theme-update\"},\n  \"setup.guardian\": {\"action\":\"true\"},\n}\n",
+        );
+        fs::write(&paths.menu, &later).unwrap();
+        let state = paths.state(Integration::ThemeInterceptor);
+        assert!(
+            matches!(&state, State::Partial(why) if why.contains("\"update.themes\" is not Guardian's")),
+            "{state:?}"
+        );
+        assert!(matches!(
+            paths.state(Integration::MenuEntry),
+            State::Partial(_)
+        ));
+        // Turning it on writes Guardian's entries anew, after the other.
+        for step in paths
+            .plan(Integration::ThemeInterceptor, &state)
+            .unwrap()
+            .steps
+        {
+            paths.edit(&step).unwrap();
+        }
+        assert_eq!(paths.state(Integration::ThemeInterceptor), State::On);
+
+        // A file the menu cannot parse is ignored by it, whatever it holds.
+        fs::write(&paths.menu, written.replace("\n}\n", "\n  oops\n}\n")).unwrap();
+        let state = paths.state(Integration::ThemeInterceptor);
+        assert!(
+            matches!(&state, State::Partial(why) if why.contains("ignores its user file")),
+            "{state:?}"
+        );
+        assert!(matches!(
+            paths.state(Integration::MenuEntry),
+            State::Partial(_)
+        ));
+        // Guardian's path in an entry for something else proves nothing.
+        fs::write(
+            &paths.menu,
+            "{\n  \"x\": {\"action\":\"/usr/lib/omarchy-guardian/guardian-theme install\"},\n}\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            paths.state(Integration::ThemeInterceptor),
+            State::Partial(why) if why.starts_with("terminal only")
+        ));
+        assert_eq!(THEME_OVERRIDES.len(), 3);
+    }
+
+    #[test]
+    fn the_session_path_is_on_only_where_the_wrappers_are_found_first() {
+        let dir = TempDir::new("integrations-session");
+        let mut paths = paths(&dir);
+        assert!(matches!(
+            paths.state(Integration::SessionPath),
+            State::Unavailable(_)
+        ));
+        fs::create_dir_all(&paths.wrappers).unwrap();
+        for name in WRAPPED {
+            fs::write(paths.wrappers.join(name), "").unwrap();
+        }
+        assert_eq!(paths.state(Integration::SessionPath), State::Off);
+
+        let on = paths.plan(Integration::SessionPath, &State::Off).unwrap();
+        assert_eq!(on.steps, [Step::AddSessionPath]);
+        paths.edit(&Step::AddSessionPath).unwrap();
+        assert_eq!(fs::read_to_string(&paths.session_env).unwrap(), SESSION_ENV);
+        // Written, and not on this PATH yet: the next login's.
+        let state = paths.state(Integration::SessionPath);
+        assert!(
+            matches!(&state, State::Partial(why) if why.contains("not in effect for this session")),
+            "{state:?}"
+        );
+
+        let stock = dir.path().join("stock");
+        fs::create_dir_all(&stock).unwrap();
+        fs::write(stock.join("omarchy-theme-install"), "").unwrap();
+        paths.path_dirs = vec![
+            dir.path().join("tools"),
+            paths.wrappers.clone(),
+            stock.clone(),
+        ];
+        assert_eq!(paths.state(Integration::SessionPath), State::On);
+        // In another shell the Bash interceptor is not needed for it.
+        paths.login_shell = Some("zsh".into());
+        assert_eq!(paths.theme_caveat(), None);
+
+        // The stock command found first, here or by what the session starts.
+        paths.path_dirs = vec![stock.clone(), paths.wrappers.clone()];
+        let state = paths.state(Integration::SessionPath);
+        assert!(
+            matches!(&state, State::Partial(why) if why.contains("comes before it on PATH")),
+            "{state:?}"
+        );
+        assert!(paths.theme_caveat().is_some());
+        paths.path_dirs = vec![paths.wrappers.clone(), stock.clone()];
+        paths.manager_path = Some(vec![stock]);
+        let state = paths.state(Integration::SessionPath);
+        assert!(
+            matches!(&state, State::Partial(why) if why.contains("the session's service manager")),
+            "{state:?}"
+        );
+        paths.manager_path = Some(paths.path_dirs.clone());
+        assert_eq!(paths.state(Integration::SessionPath), State::On);
+
+        // A wrapper anyone can rewrite is no gate.
+        let wrapper = paths.wrappers.join("omarchy");
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(matches!(
+            paths.state(Integration::SessionPath),
+            State::Partial(why) if why.contains("not to be trusted")
+        ));
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A line added to the file, or the line changed, is not Guardian's file.
+        fs::write(
+            &paths.session_env,
+            format!("{SESSION_ENV}export PATH=/tmp:$PATH\n"),
+        )
+        .unwrap();
+        assert_eq!(paths.state(Integration::SessionPath), State::Off);
+        paths.edit(&Step::AddSessionPath).unwrap();
+        assert_eq!(paths.state(Integration::SessionPath), State::On);
+
+        // Off removes Guardian's file, and only that.
+        paths.edit(&Step::RemoveSessionPath).unwrap();
+        assert!(!paths.session_env.exists());
+        fs::write(&paths.session_env, "export X=1\n").unwrap();
+        paths.edit(&Step::RemoveSessionPath).unwrap();
+        assert!(paths.session_env.exists());
+    }
+
+    #[test]
+    fn the_file_as_it_was_before_the_first_edit_is_kept_once() {
+        let dir = TempDir::new("integrations-backup");
+        let paths = paths(&dir);
+        let original = format!("alias ll='ls -l'\n\n{INTERCEPTOR_MARKER}\n{INTERCEPTOR_LINE}\n");
+        fs::write(&paths.bashrc, &original).unwrap();
+        paths.edit(&Step::RemoveInterceptor).unwrap();
+        let backup = dir.path().join("bashrc.guardian-bak");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+        assert_eq!(
+            fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // A later edit leaves the first copy alone.
+        fs::write(&paths.bashrc, format!("export X=1\n{INTERCEPTOR_LINE}\n")).unwrap();
+        paths.edit(&Step::RemoveInterceptor).unwrap();
+        assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+        assert_eq!(fs::read_to_string(&paths.bashrc).unwrap(), "export X=1\n");
+
+        // A file Guardian makes itself has nothing to keep.
+        paths.edit(&Step::AddMenuEntry).unwrap();
+        let menu_backup = dir.path().join("menu/omarchy-menu.jsonc.guardian-bak");
+        assert!(!menu_backup.exists());
+        paths.edit(&Step::AddThemeMenu).unwrap();
+        assert!(
+            fs::read_to_string(&menu_backup)
+                .unwrap()
+                .contains("setup.guardian")
+        );
     }
 
     #[test]
@@ -1442,7 +2142,7 @@ mod tests {
 
         fs::write(
             &paths.bashrc,
-            format!("{INTERCEPTOR_MARKER}\n[[ -r x ]] && source /usr/lib/omarchy-guardian/omarchy-bash-interceptor.sh\n"),
+            format!("{INTERCEPTOR_MARKER}\n{INTERCEPTOR_LINE}\n"),
         )
         .unwrap();
         assert_eq!(paths.state(Integration::ThemeInterceptor), State::On);
@@ -1550,17 +2250,14 @@ mod tests {
             ),
         ] {
             fs::write(&paths.bashrc, bashrc).unwrap();
-            assert!(!paths.theme_parts().0);
+            assert_eq!(paths.theme_parts().0, Part::Off);
         }
         fs::write(
             &paths.bashrc,
-            format!(
-                "{INTERCEPTOR_MARKER}\n[[ -r x ]] && source {}\n",
-                super::INTERCEPTOR_SOURCE
-            ),
+            format!("{INTERCEPTOR_MARKER}\n{INTERCEPTOR_LINE}\n"),
         )
         .unwrap();
-        assert!(paths.theme_parts().0);
+        assert_eq!(paths.theme_parts().0, Part::On);
     }
 
     #[test]

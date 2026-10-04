@@ -11,6 +11,7 @@ use crate::ask;
 use crate::config::Settings;
 use crate::config::model::{AiRequirement, Named, Profile, SourceClass};
 use crate::config::show;
+use crate::config::weaker;
 use crate::engine::baseline::{self, Identity, Unit};
 use crate::engine::store::Store;
 use crate::error::Error;
@@ -34,7 +35,8 @@ Usage:
   omarchy-guardian pacman-hook --pacman-pid PID --cwd DIR   (run by the pacman hook)
   omarchy-guardian pacman-hook --preflight                  (can the pacman gate review?)
   omarchy-guardian makepkg-gate -- <makepkg> [args...]      (run by the yay makepkg shim)
-  omarchy-guardian config show [--class CLASS] | check | path
+  omarchy-guardian config show [--class CLASS] | check | path | acknowledge
+                                                    (acknowledge: accept, with sudo, settings weaker than the level)
   omarchy-guardian forget <identity> | --all
   omarchy-guardian setup
   omarchy-guardian protect [--off] [--yes]          (turn every gate on, or the install gates off)
@@ -137,6 +139,9 @@ enum ConfigCommand {
     Show(Option<SourceClass>),
     Check,
     Path,
+    /// Accepts the user file's weaker-than-the-level settings in the
+    /// system file.
+    Acknowledge,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -188,6 +193,12 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
     let settings = Settings::load();
     for warning in settings.warnings() {
         errln!("omarchy-guardian: {warning}");
+    }
+    // A user file that does not parse is not reviewed around: its settings
+    // (a stricter level, say) would be gone without a word.
+    if reviews_for_the_user(&invocation) && settings.user_block().is_some() {
+        errln!("omarchy-guardian: nothing was reviewed or run: the user settings file is invalid.");
+        return ExitCode::from(2);
     }
 
     match invocation {
@@ -269,6 +280,20 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
             }
         },
     }
+}
+
+/// Whether `invocation` reviews with the user file's settings: the gates
+/// and reviews that are not the pacman hook's. Settings commands are not, so
+/// a broken file can still be shown and fixed.
+const fn reviews_for_the_user(invocation: &Invocation) -> bool {
+    matches!(
+        invocation,
+        Invocation::Scan(_)
+            | Invocation::Guard(..)
+            | Invocation::Sandbox(..)
+            | Invocation::MakepkgGate(_)
+            | Invocation::Sweep(sweep::Command::Run(_))
+    )
 }
 
 /// A one-run profile override (`--profile`) applies on top of the loaded
@@ -367,9 +392,9 @@ fn guard_command(
                     notify::Ran::Nothing,
                 );
             }
-            _ => errln!("Guardian blocked the command because the review did not allow it."),
+            _ => errln!("Guardian did not start the command: there was nothing to review."),
         }
-        return decision.exit_code();
+        return not_started(decision);
     }
     if let Err(error) = scan::verify_unchanged(&target.config, &report.snapshot) {
         errln!("Guardian blocked the command because {error}.");
@@ -389,6 +414,15 @@ fn guard_command(
             .into_owned())
     );
     launch(command)
+}
+
+/// The exit code of a `guard` or `sandbox` that did not start its command:
+/// never 0, which a caller reads as "the command ran".
+fn not_started(decision: Decision) -> ExitCode {
+    match decision {
+        Decision::Blocked(_) => decision.exit_code(),
+        Decision::Clear | Decision::Warned | Decision::Limited => ExitCode::from(2),
+    }
 }
 
 /// Replaces this process with the guarded command, so its exit status and
@@ -424,7 +458,7 @@ fn sandbox_command(
         } else {
             errln!("Guardian did not run the sandbox command because the review did not allow it.");
         }
-        return decision.exit_code();
+        return not_started(decision);
     }
     match sandbox::run(&target.config, &report.snapshot, command) {
         Ok(code) => code,
@@ -459,6 +493,17 @@ fn status_command(mode: StatusMode) -> ExitCode {
 }
 
 fn pacman_hook_command(hook: &HookArgs, settings: &Settings) -> ExitCode {
+    // A reviewer from PATH is for the end-to-end tests, whose pacman is a
+    // script of the user's. In front of a real transaction (pacman runs as
+    // root) it is refused, however it came to be asked for.
+    if hook.opencode == OpenCode::UserPath
+        && process_owner(hook.pacman_pid).is_none_or(|owner| owner == 0)
+    {
+        errln!(
+            "Guardian blocked the pacman transaction: --opencode-from-path is for tests and is refused for a pacman run by root."
+        );
+        return ExitCode::from(2);
+    }
     match pacman::review_transaction(hook, settings) {
         Ok(report) => {
             let decision = report.decide(&|class| settings.policy(class));
@@ -484,6 +529,52 @@ fn pacman_hook_command(hook: &HookArgs, settings: &Settings) -> ExitCode {
     }
 }
 
+/// The user a process runs as, from the owner of its `/proc` entry.
+fn process_owner(pid: u32) -> Option<u32> {
+    std::fs::metadata(format!("/proc/{pid}"))
+        .ok()
+        .map(|metadata| std::os::unix::fs::MetadataExt::uid(&metadata))
+}
+
+/// `config acknowledge`: writes the weaker-than-the-level settings of the
+/// user file into the system file's `[acknowledged]` list, after showing
+/// them and the change, with sudo. Only root can write that file, so a
+/// program running as the user cannot accept its own weakening.
+fn acknowledge_command(settings: &Settings, confirm: &mut dyn Confirm) -> Result<String, String> {
+    if settings.user_block().is_some() || settings.privileged_block().is_some() {
+        return Err("fix the settings files first (see `omarchy-guardian config check`)".into());
+    }
+    let keys = weaker::to_acknowledge(settings);
+    if keys == settings.acknowledged_weaker() {
+        return Ok(if keys.is_empty() {
+            "Nothing in your settings is weaker than the protection level.".into()
+        } else {
+            "Every weaker setting is already acknowledged.".into()
+        });
+    }
+    for weakening in weaker::weakenings(settings) {
+        if keys.contains(&weakening.key()) {
+            outln!(
+                "  {}: {} = {} (the {} level has {})",
+                weaker::subject(weakening.class),
+                weakening.knob,
+                weakening.value,
+                weakening.profile,
+                weakening.level
+            );
+        }
+    }
+    let (text, existing) = setup::with_accepted(keys)?;
+    outln!("\nSystem file {}:", settings.system_path().display());
+    outln!("{}", setup::line_diff(&existing, &text));
+    if !confirm.confirm("Accept these weaker settings and install the file with sudo?") {
+        return Err("nothing was changed".into());
+    }
+    setup::install_accepted(&text)?;
+    tui::status::chosen();
+    Ok("Acknowledged; the bar no longer counts them as a problem.".into())
+}
+
 fn config_command(command: &ConfigCommand, settings: &Settings) -> ExitCode {
     match command {
         ConfigCommand::Show(class) => {
@@ -504,6 +595,16 @@ fn config_command(command: &ConfigCommand, settings: &Settings) -> ExitCode {
                 ExitCode::from(2)
             }
         }
+        ConfigCommand::Acknowledge => match acknowledge_command(settings, &mut TtyConfirm) {
+            Ok(message) => {
+                outln!("{message}");
+                ExitCode::SUCCESS
+            }
+            Err(message) => {
+                errln!("omarchy-guardian config acknowledge: {message}");
+                ExitCode::from(2)
+            }
+        },
         ConfigCommand::Path => {
             outln!("{}", settings.system_path().display());
             if let Some(path) = settings.user_path() {
@@ -727,7 +828,8 @@ fn parse_config(args: &[OsString]) -> Result<ConfigCommand, String> {
             .ok_or_else(|| format!("unknown class {name:?}")),
         ["check"] => Ok(ConfigCommand::Check),
         ["path"] => Ok(ConfigCommand::Path),
-        _ => Err("config takes show [--class CLASS], check or path".into()),
+        ["acknowledge"] => Ok(ConfigCommand::Acknowledge),
+        _ => Err("config takes show [--class CLASS], check, path or acknowledge".into()),
     }
 }
 
@@ -766,8 +868,10 @@ fn parse_target(args: &[OsString], allowed: Allowed) -> Result<Target, String> {
                     .next()
                     .and_then(|name| name.to_str())
                     .unwrap_or_default();
+                // `system` is the sweep's own class, not one to review a
+                // directory as.
                 let parsed = SourceClass::parse(name)
-                    .filter(|class| !class.is_privileged())
+                    .filter(|class| !class.is_privileged() && *class != SourceClass::System)
                     .ok_or_else(|| {
                         format!("--class takes one of: aur, theme, plugin, source (got {name:?})")
                     })?;
@@ -900,7 +1004,8 @@ mod tests {
 
     use super::{
         ConfigCommand, Confirm, Forget, Invocation, Target, forget_command, forget_in,
-        guard_command, parse, review_and_decide,
+        guard_command, not_started, pacman_hook_command, parse, review_and_decide,
+        reviews_for_the_user,
     };
     use crate::agent::SourceFile;
     use crate::config::Settings;
@@ -1086,6 +1191,70 @@ mod tests {
     }
 
     #[test]
+    fn guard_never_returns_success_without_starting_the_command() {
+        // Nothing to review (an empty directory): not started, and not 0,
+        // which a caller reads as "the command ran".
+        let dir = TempDir::new("guard-empty");
+        let bin = TempDir::new("guard-empty-bin");
+        let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
+        let mut confirm = Scripted(Some(true), Vec::new());
+        let status = guard_command(
+            &target(&dir),
+            &args(&["true"]),
+            &default_settings(),
+            &opencode,
+            &mut confirm,
+            &mut |_| panic!("launched with nothing reviewed"),
+        );
+        assert_eq!(status, ExitCode::from(2));
+        assert_eq!(not_started(Decision::Limited), ExitCode::from(2));
+        assert_eq!(
+            not_started(Decision::Blocked(Blocked::Findings)),
+            ExitCode::from(1)
+        );
+    }
+
+    #[test]
+    fn only_reviews_for_the_user_stop_on_a_broken_user_file() {
+        for (line, reviews) in [
+            (&["scan", "dir"][..], true),
+            (&["guard", "dir", "--", "true"], true),
+            (&["sandbox", "dir", "--", "true"], true),
+            (&["makepkg-gate", "--", "/usr/bin/makepkg"], true),
+            (&["sweep"], true),
+            (&["sweep", "--scheduled"], true),
+            // What shows and repairs the settings still runs.
+            (&["config", "check"], false),
+            (&["config", "show"], false),
+            (&["tui"], false),
+            (&["setup"], false),
+            (&["status"], false),
+            (&["sweep", "forget", "--all"], false),
+        ] {
+            let invocation = parse(&args(line)).unwrap();
+            assert_eq!(reviews_for_the_user(&invocation), reviews, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_reviewer_from_path_is_refused_for_a_pacman_run_by_root() {
+        use crate::pacman::HookArgs;
+        // Process 1 is root's, as a real pacman is; one that is not there
+        // cannot be shown to be the user's.
+        for pacman_pid in [1, u32::MAX] {
+            let hook = HookArgs {
+                pacman_pid,
+                cwd: PathBuf::from("/"),
+                opencode: OpenCode::UserPath,
+            };
+            assert_eq!(
+                pacman_hook_command(&hook, &default_settings()),
+                ExitCode::from(2)
+            );
+        }
+    }
+
+    #[test]
     fn local_only_asks_before_running() {
         let dir = TempDir::new("confirm-yes");
         fs::write(dir.path().join("theme.conf"), "name = \"good\"\n").unwrap();
@@ -1150,6 +1319,9 @@ mod tests {
 
         for bad in [
             &["scan", "--class", "official", "dir"][..],
+            // The sweep's own class, not one a directory is reviewed as.
+            &["scan", "--class", "system", "dir"],
+            &["guard", "--class", "system", "dir", "--", "true"],
             &["scan", "--class", "nope", "dir"],
             &["scan", "--profile", "paranoid", "dir"],
         ] {
@@ -1235,6 +1407,11 @@ mod tests {
             parse(&args(&["config", "show", "--class", "official"])).unwrap(),
             Invocation::Config(ConfigCommand::Show(Some(SourceClass::Official)))
         );
+        assert_eq!(
+            parse(&args(&["config", "acknowledge"])).unwrap(),
+            Invocation::Config(ConfigCommand::Acknowledge)
+        );
+        assert!(parse(&args(&["config", "acknowledge", "aur.ai"])).is_err());
         assert!(parse(&args(&["config"])).is_err());
         assert!(parse(&args(&["config", "edit"])).is_err());
     }
