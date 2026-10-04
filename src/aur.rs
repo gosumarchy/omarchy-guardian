@@ -1214,6 +1214,10 @@ struct Walk<'a> {
     upstream: Upstream,
     /// Directories laid out as git repositories under another name.
     git_dirs: HashSet<PathBuf>,
+    /// Where files are run in the sources (see `Collected::surroundings`).
+    surroundings: image::Surroundings,
+    /// The whole images, with their hashes (see `Collected::images`).
+    images: Vec<(String, String)>,
 }
 
 impl Walk<'_> {
@@ -1298,6 +1302,8 @@ impl Walk<'_> {
             return;
         };
         let executable = metadata.mode() & 0o111 != 0;
+        self.surroundings
+            .note_file(&format!("src/{child}"), executable);
         let name_critical = is_critical(name, depth, "", executable, self.recipe);
         if !late
             && depth <= MANIFEST_DEPTH
@@ -1396,8 +1402,9 @@ impl Walk<'_> {
             Some(bytes) => Some(Sha256::digest(bytes)),
             None => self.hash_file(read_from),
         };
-        // A whole image is not the review memory's concern (see
-        // `review::is_plain_image`), nor is a downloaded archive: what it
+        // A whole image away from where files are run is not the review
+        // memory's concern (see `review::is_plain_image_among`), nor is a
+        // downloaded archive: what it
         // unpacks to is what is reviewed, and its name changes with every
         // version. A downloaded program is.
         let image = !executable
@@ -1443,7 +1450,11 @@ impl Walk<'_> {
                 .programs
                 .insert(format!("src/{child}"), digest.clone());
         }
-        if !(image || archive) {
+        if image && !archive {
+            // Whether it is passed over is known once the walk has seen
+            // what stands around it (see `Collected::settle_images`).
+            self.images.push((format!("src/{child}"), digest));
+        } else if !archive {
             self.upstream.unread.insert(format!("src/{child}"), digest);
         }
         self.upstream.binary_files += 1;
@@ -2040,6 +2051,13 @@ pub struct Collected {
     archives: Vec<Archive>,
     upstream: Upstream,
     max_entries: usize,
+    /// Where files are run in the whole source tree, what Guardian
+    /// unpacked included: the scripts every walk came by.
+    surroundings: image::Surroundings,
+    /// The images that are whole by their own bytes, with their hashes:
+    /// kept until every walk is done, since a script beside one may be
+    /// read after it.
+    images: Vec<(String, String)>,
 }
 
 impl Collected {
@@ -2070,10 +2088,14 @@ impl Collected {
             all: std::mem::take(&mut self.all),
             upstream: std::mem::take(&mut self.upstream),
             git_dirs: HashSet::new(),
+            surroundings: std::mem::take(&mut self.surroundings),
+            images: std::mem::take(&mut self.images),
         };
         if src.is_dir() {
             walk.walk();
         }
+        self.surroundings = walk.surroundings;
+        self.images = walk.images;
         self.all = walk.all;
         self.data = walk.data;
         self.archives = walk.archives;
@@ -2186,6 +2208,21 @@ impl Collected {
         }
     }
 
+    /// A whole image is passed over only away from where files are run
+    /// (see `image::Surroundings`): one beside a script, or in a directory
+    /// whose files a reviewed line runs, is an unread file like any other,
+    /// so a new or changed one makes the review a full one.
+    fn settle_images(&mut self) {
+        for file in &self.all {
+            self.surroundings.note_text(&file.path, &file.text);
+        }
+        for (path, digest) in std::mem::take(&mut self.images) {
+            if !self.surroundings.leaves_alone(&path) {
+                self.upstream.unread.insert(path, digest);
+            }
+        }
+    }
+
     /// An archive left packed: the review says that what the build takes
     /// from it is not reviewed, and it is incomplete when the recipe
     /// certainly opens it.
@@ -2211,6 +2248,7 @@ impl Collected {
     pub fn select(mut self, budget: u64) -> Upstream {
         self.settle_named();
         self.settle_archives();
+        self.settle_images();
         let Self {
             mut all,
             mut upstream,
@@ -2292,6 +2330,8 @@ fn walk_with_cap(
         archives: Vec::new(),
         upstream: Upstream::default(),
         max_entries,
+        surroundings: image::Surroundings::default(),
+        images: Vec::new(),
     };
     collected.walk(src, String::new(), roots, recipe, noextract);
     collected
@@ -3006,6 +3046,7 @@ pkgname = demo
         let srcdest = dir.path().join("downloads");
         let src = build.join("src");
         fs::create_dir_all(src.join("demo/m4")).unwrap();
+        fs::create_dir_all(src.join("demo/icons")).unwrap();
         fs::create_dir_all(&srcdest).unwrap();
         fs::write(build.join("fix.patch"), "--- a\n+++ b\n").unwrap();
         fs::write(srcdest.join("install.sh"), "#!/bin/sh\ncurl x | sh\n").unwrap();
@@ -3017,12 +3058,12 @@ pkgname = demo
         fs::write(src.join("demo/tool"), b"\x7fELF\x02\x01\x01\0\0").unwrap();
         fs::set_permissions(src.join("demo/tool"), fs::Permissions::from_mode(0o755)).unwrap();
         // A blob the build may unpack, larger than what is read whole, and
-        // an icon, which is not the review memory's concern.
+        // an icon among icons, which is not the review memory's concern.
         let mut blob = b"\x1f\x8b\x08\0".to_vec();
         blob.resize(3 * 1024 * 1024, 7);
         fs::write(src.join("demo/tests.tar.gz"), &blob).unwrap();
         fs::write(
-            src.join("demo/icon.gif"),
+            src.join("demo/icons/icon.gif"),
             b"GIF89a\x01\x00\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b",
         )
         .unwrap();
@@ -3100,6 +3141,73 @@ pkgname = demo
                 .iter()
                 .any(|gap| gap.contains("more than 3 entries"))
         );
+    }
+
+    #[test]
+    fn an_upstream_image_is_passed_over_only_away_from_where_files_run() {
+        use std::os::unix::fs::PermissionsExt;
+        const GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b";
+        let dir = TempDir::new("upstream-images");
+        let build = dir.path().join("build");
+        let src = build.join("src");
+        for directory in ["assets", "scripts", "hooks.d", "parts", "bin", "plugin"] {
+            fs::create_dir_all(src.join("demo").join(directory)).unwrap();
+            fs::write(src.join("demo").join(directory).join("a.gif"), GIF).unwrap();
+        }
+        // Sorted after the image beside it: the walk reads the image first.
+        fs::write(src.join("demo/scripts/z.sh"), "echo hi\n").unwrap();
+        fs::write(src.join("demo/plugin/main"), "#!/bin/sh\necho hi\n").unwrap();
+        fs::write(src.join("demo/bin/tool"), b"\x7fELF\x02\x01\x01\0\0").unwrap();
+        fs::set_permissions(src.join("demo/bin/tool"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(
+            src.join("demo/Makefile"),
+            "all:\n\trun-parts ./parts\n\tfor h in hooks.d/*; do . \"$$h\"; done\n",
+        )
+        .unwrap();
+        let roots = Roots {
+            build_dir: &build,
+            srcdest: None,
+        };
+        let upstream = collect_upstream(&src, &roots, "", 1024 * 1024);
+        let digest = crate::sha256::Sha256::digest(GIF).to_string();
+        let unread: Vec<&str> = upstream
+            .unread
+            .iter()
+            .filter(|(_, found)| **found == digest)
+            .map(|(path, _)| path.as_str())
+            .collect();
+        assert_eq!(
+            unread,
+            [
+                "src/demo/bin/a.gif",
+                "src/demo/hooks.d/a.gif",
+                "src/demo/parts/a.gif",
+                "src/demo/plugin/a.gif",
+                "src/demo/scripts/a.gif",
+            ]
+        );
+        // Alone among assets it stays what it was: seen, and not unread.
+        assert!(upstream.seen.contains_key("src/demo/assets/a.gif"));
+        assert!(!upstream.unread.contains_key("src/demo/assets/a.gif"));
+
+        // A script in an archive Guardian unpacked counts for the images
+        // of that archive, whichever walk read them.
+        let unpacked = dir.path().join("unpacked");
+        fs::create_dir_all(unpacked.join("run")).unwrap();
+        fs::write(unpacked.join("run/a.gif"), GIF).unwrap();
+        fs::write(unpacked.join("run/go.py"), "print(1)\n").unwrap();
+        fs::write(unpacked.join("logo.gif"), GIF).unwrap();
+        let mut collected = super::walk_upstream(&src, &roots, "", &[]);
+        let archive = super::Archive {
+            rel: "data.tar".to_string(),
+            file: dir.path().join("data.tar"),
+            named: true,
+        };
+        collected.add_unpacked(&archive, &unpacked, &roots, "");
+        let upstream = collected.select(1024 * 1024);
+        assert!(upstream.unread.contains_key("src/data.tar!/run/a.gif"));
+        assert!(!upstream.unread.contains_key("src/data.tar!/logo.gif"));
+        assert!(!upstream.unread.contains_key("src/demo/assets/a.gif"));
     }
 
     #[test]

@@ -2289,7 +2289,10 @@ gate does, in order:
    extension, a `.deb`, `.rpm` or pacman package that Guardian did not
    unpack for review. No terminal, or no yes, blocks the build (exit 2,
    NOT CONFIRMED), and no permit overrules a question you declined: the
-   way to say yes is to answer it. A yes is remembered for exactly those
+   way to say yes is to answer it. A permit that overrules the review of
+   the sources does not answer it either: it is for the review's verdict,
+   and the question is asked all the same before the build goes on. A yes
+   is remembered for exactly those
    programs (their hashes) from those hosts, and for which of them the
    recipe runs, so yay's further makepkg calls and a rebuild of the same
    version do not ask again; a new version does. A source tree that is
