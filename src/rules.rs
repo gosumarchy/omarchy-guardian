@@ -463,7 +463,7 @@ impl RuleId {
         ),
         (
             Self::LookalikeHost,
-            "A host name mixes alphabets or is written in punycode, so it can read as another name than the one requested.",
+            "A host name mixes alphabets, in letters or in the punycode that spells them, or begins with a well-known host's name but belongs to another domain, so it can read as another name than the one requested.",
         ),
         (
             Self::DataDropHost,
@@ -2195,7 +2195,8 @@ pub fn extract_network_destinations(line: &str) -> Vec<(Scheme, String)> {
 /// decides it is used but never stored (see `Report::network`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostConcern {
-    /// A host made to read as another name (mixed scripts, punycode).
+    /// A host made to read as another name (mixed scripts, a well-known
+    /// host's name in front of another domain).
     pub lookalike: bool,
     /// A host commonly used to drop off or pick up stolen data.
     pub drop: bool,
@@ -2208,12 +2209,39 @@ pub fn host_concerns(line: &str) -> Vec<(String, HostConcern)> {
         .into_iter()
         .filter_map(|(_, host, path)| {
             let concern = HostConcern {
-                lookalike: hidden::is_lookalike_host(&host),
+                lookalike: reads_as_another_host(&host),
                 drop: hosts::is_drop_destination(&host, &path),
             };
             (concern.lookalike || concern.drop).then_some((host, concern))
         })
         .collect()
+}
+
+/// A host named to be taken for another: by its letters (see
+/// `hidden::is_lookalike_host`), or by beginning with a well-known code
+/// host's name while belonging to another domain.
+fn reads_as_another_host(host: &str) -> bool {
+    hidden::is_lookalike_host(host) || hosts::embeds_code_host(host)
+}
+
+/// Whether `code` names a host made to read as another that `quiet` does
+/// not show: one in a recipe's `source=` or `url=`, which are declarations
+/// and so no network requests of the recipe's own. Cleartext and bare
+/// addresses there are makepkg's to fetch and check, but a source host
+/// that passes for a forge is the typosquat itself.
+pub fn declares_lookalike_host(code: &str, quiet: &str) -> bool {
+    if code == quiet {
+        return false;
+    }
+    let requested: Vec<String> = destinations_with_path(quiet)
+        .into_iter()
+        .map(|(_, host, _)| host)
+        .collect();
+    destinations_with_path(code)
+        .into_iter()
+        .any(|(_, host, _)| {
+            !requested.contains(&host) && !is_local_host(&host) && reads_as_another_host(&host)
+        })
 }
 
 /// The literal HTTP(S) destinations of a line as `(scheme, host, path)`.
@@ -2348,6 +2376,42 @@ mod tests {
     fn rules_for(line: &str) -> Vec<RuleId> {
         let lowered = line.to_lowercase();
         line_rules(&lowered, &lowered).collect()
+    }
+
+    #[test]
+    fn a_host_that_passes_for_a_forge_is_a_lookalike() {
+        let requested = |line: &str| {
+            super::host_concerns(line)
+                .iter()
+                .any(|(_, concern)| concern.lookalike)
+        };
+        for (address, flagged) in [
+            ("https://github.com/x/y", false),
+            ("https://api.github.com/repos/x/y", false),
+            ("https://mygithub.com", false),
+            ("https://xn--mnchen-3ya.example/x.tar.gz", false),
+            ("https://github.com.evil.test/x", true),
+            (
+                "https://raw.githubusercontent.com.example-drop.test/x/y/i.sh",
+                true,
+            ),
+            ("https://xn--pypal-4ve.com/x", true),
+        ] {
+            assert_eq!(
+                requested(&format!("curl -fsSL {address}")),
+                flagged,
+                "{address}"
+            );
+            // Declared in a recipe: in the code, not among its requests.
+            let source = format!("source=(\"x.tar.gz::{address}\")");
+            assert_eq!(
+                super::declares_lookalike_host(&source, ""),
+                flagged,
+                "{address}"
+            );
+            // A request is reported as one, not twice.
+            assert!(!super::declares_lookalike_host(&source, &source));
+        }
     }
 
     #[test]

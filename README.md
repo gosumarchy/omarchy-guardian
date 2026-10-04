@@ -1370,15 +1370,24 @@ review it in full every time.
   human and the AI reader without changing what a program does (writing
   systems that need these characters, such as right-to-left text and
   translation files, stay quiet). Prose, comments and messages are still
-  sent to the AI review.
+  sent to the AI review. Of an AUR build's upstream code, which the AI
+  judges, these local checks keep two findings: tag characters and
+  reordering controls, which no source code needs.
 - **Network destinations:** literal HTTP(S) hosts in code and runtime config,
   flagging cleartext HTTP and hard-coded IP addresses. A host is also flagged
   when it is one commonly used to deliver or receive stolen data (a paste
   site, a chat webhook such as a Discord or Slack webhook path, a tunnel or
   request catcher, dynamic DNS, a `.onion` address or a link shortener), or
-  when its name is made to read as another — a label mixing alphabets, or a
-  punycode (`xn--`) label. A PKGBUILD's `url=` homepage (never fetched), XML
-  namespace, DTD and schema identifiers are not destinations. URL paths,
+  when its name is made to read as another — a label mixing alphabets or
+  written only in look-alikes of Latin letters, judged the same in its
+  punycode (`xn--`) spelling (a name wholly in one other script is just a
+  name; an `xn--` label that does not decode is flagged), or a name that
+  begins with a well-known code host's but belongs to another domain
+  (`github.com.example.test`). A PKGBUILD's `url=` homepage (never fetched)
+  and `source=` entries (fetched and checked by makepkg), XML
+  namespace, DTD and schema identifiers are not destinations; a recipe's
+  homepage and sources are still checked for a host that reads as another.
+  URL paths,
   queries and credentials are never printed: the host reputation is judged
   from the path internally, without recording it.
 - **Dependencies:** `Cargo.lock`, npm lockfiles, `poetry.lock`, `go.sum` and

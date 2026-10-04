@@ -98,9 +98,66 @@ pub fn is_drop_destination(host: &str, path: &str) -> bool {
     })
 }
 
+/// Hosts that code is fetched from, whose names people trust on sight.
+const CODE_HOSTS: &[&str] = &[
+    "github.com",
+    "raw.githubusercontent.com",
+    "gitlab.com",
+    "codeberg.org",
+    "sourceforge.net",
+    "archlinux.org",
+    "pypi.org",
+    "npmjs.org",
+    "crates.io",
+];
+
+/// Whether `host` (lowercased) begins with a well-known code host's name
+/// but belongs to another domain: `github.com.example.test`, which reads
+/// as GitHub up to where a glance stops. The name must be whole labels
+/// with more after them; `mygithub.com` and `github.com` itself are not
+/// that.
+pub fn embeds_code_host(host: &str) -> bool {
+    let host = format!(".{}.", host.trim_end_matches('.'));
+    CODE_HOSTS.iter().any(|known| {
+        let embedded = format!(".{known}.");
+        // Not at the end: there it is the host, or its own subdomain.
+        host.contains(&embedded) && !host.ends_with(&embedded)
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_drop_destination;
+    use super::{embeds_code_host, is_drop_destination};
+
+    #[test]
+    fn a_host_that_begins_with_a_code_hosts_name_is_named() {
+        for host in [
+            "github.com.evil.test",
+            "raw.githubusercontent.com.example-drop.test",
+            "www.gitlab.com.x.test",
+            "codeberg.org.test",
+            "crates.io.cdn.example.test.",
+            "pypi.org.files.example.test",
+        ] {
+            assert!(embeds_code_host(host), "{host}");
+        }
+        for host in [
+            "github.com",
+            "github.com.",
+            "api.github.com",
+            "objects.githubusercontent.com",
+            "raw.githubusercontent.com",
+            "mygithub.com",
+            "mygithub.com.example.test",
+            "github.community",
+            "aur.archlinux.org",
+            "downloads.sourceforge.net",
+            "files.pythonhosted.org",
+            "example.test",
+        ] {
+            assert!(!embeds_code_host(host), "{host}");
+        }
+    }
 
     #[test]
     fn hosts_that_take_data_from_anyone_are_named() {
