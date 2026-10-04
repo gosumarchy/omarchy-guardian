@@ -3293,6 +3293,100 @@ mod tests {
     }
 
     #[test]
+    fn a_packaged_program_closed_to_readers_is_still_compared() {
+        use std::os::unix::fs::MetadataExt;
+        let (dir, mut index) = system(
+            "live-closed",
+            &[("usr/bin/shut", "shut"), ("usr/bin/same", "same")],
+        );
+        let root = dir.path();
+        // Root reads everything: there is no closed file to play.
+        if fs::metadata(root).unwrap().uid() == 0 {
+            return;
+        }
+        // One its package installs for root alone, as `cupsd` is.
+        index.add_for_test(
+            "own",
+            &format!(
+                "#mtree\n./usr/bin/private type=file mode=700 sha256digest={}\n",
+                Sha256::digest(b"private")
+            ),
+            &[],
+        );
+        write(root, "usr/bin/private", "private");
+        write(root, "usr/bin/shut", "trojan");
+        let close = |path: &str, mode: u32| {
+            fs::set_permissions(root.join(path), fs::Permissions::from_mode(mode)).unwrap();
+        };
+        for (pid, name) in [("60", "shut"), ("61", "same"), ("62", "private")] {
+            close(&format!("usr/bin/{name}"), 0o700);
+            let exe = format!("/usr/bin/{name}");
+            process(root, pid, &exe, &[("3", "/dev/input/event0")], "");
+        }
+        let live = look(root, &index, Origin::Root);
+        let keys = vec![RuleId::KeyboardReader];
+        // The changed one is not trusted for its path, and neither is one
+        // somebody closed; what the package ships closed is compared too,
+        // and is as installed.
+        assert_eq!(
+            listed(&live),
+            [
+                ("usr/bin/same", keys.clone()),
+                ("usr/bin/shut", keys.clone())
+            ]
+        );
+        for item in &live.items {
+            assert_eq!(item.tier.name(), "modified", "{}", item.path);
+            // Nothing of the content of a file not everyone may read.
+            assert_eq!(item.sha256, None, "{}", item.path);
+            assert_eq!(item.body, Body::Binary(crate::sweep::collect::COMPARED));
+            assert!(
+                item.notes
+                    .contains(&crate::sweep::collect::CLOSED.to_string()),
+                "{:?}",
+                item.notes
+            );
+        }
+        // The path must be the package's own, reached with no link on the
+        // way: anything else a process names stays unseen.
+        let scope = Scope {
+            root,
+            home: None,
+            index: &index,
+            origin: Origin::Root,
+        };
+        symlink("usr/bin", root.join("bin")).unwrap();
+        let item = crate::sweep::collect::packaged_item;
+        assert!(item(&scope, Category::Process, "usr/bin/shut").is_some());
+        assert!(item(&scope, Category::Process, "bin/shut").is_none());
+        write(root, "usr/bin/unowned", "x");
+        close("usr/bin/unowned", 0o700);
+        assert!(item(&scope, Category::Process, "usr/bin/unowned").is_none());
+        fs::remove_file(root.join("usr/bin/unowned")).unwrap();
+
+        // The user's own sweep cannot read a closed file. One its package
+        // ships readable is told as closed; one shipped closed is taken on
+        // its path's word, as before.
+        for name in ["shut", "same", "private"] {
+            close(&format!("usr/bin/{name}"), 0o000);
+        }
+        let live = look(root, &index, Origin::System);
+        assert_eq!(
+            listed(&live),
+            [("usr/bin/same", keys.clone()), ("usr/bin/shut", keys)]
+        );
+        assert!(live.items.iter().all(|item| {
+            item.tier.name() == "modified"
+                && item
+                    .notes
+                    .contains(&crate::sweep::collect::CLOSED.to_string())
+        }));
+        for name in ["shut", "same", "private"] {
+            close(&format!("usr/bin/{name}"), 0o700);
+        }
+    }
+
+    #[test]
     fn what_no_package_owns_where_programs_are_loaded_from_is_listed() {
         let (dir, mut index) = system(
             "live-installed",

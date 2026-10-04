@@ -85,9 +85,28 @@ pub enum Observed<'a> {
 }
 
 /// The mode bits a change of matters: set-id bits, and write access for
-/// group and others. Read and execute bits change harmlessly (a package's
-/// own install step may relax them).
+/// group and others. Execute bits change harmlessly, and so does a read
+/// bit that was added (a package's own install step may relax them); a
+/// read bit taken away is told by `is_closed`.
 const SECURITY_BITS: u32 = 0o6022;
+
+/// Read access for everyone.
+const WORLD_READ: u32 = 0o004;
+
+/// Whether the file at `path`, of mode `actual`, is one its package
+/// installs readable by everyone and that no longer is. Nothing a package
+/// does closes its own programs afterwards, and a closed one cannot be
+/// compared with its package by anyone but root: that is how a changed
+/// program would be kept from the comparison. A configuration file
+/// (`backup=`) is left out: closing one that holds a password is the
+/// administrator's good sense.
+pub fn is_closed(path: &str, actual: u32, index: &PackageIndex) -> bool {
+    index.owner(path).is_some_and(|owned| {
+        !owned.backup
+            && matches!(owned.recorded, Recorded::File { mode, .. }
+                if mode & WORLD_READ != 0 && actual & WORLD_READ == 0)
+    })
+}
 
 /// The tier of `path` (relative to `/`).
 pub fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex) -> Tier {
@@ -113,7 +132,11 @@ pub fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex) -> Tie
                     mode: actual,
                     ..
                 },
-            ) => recorded == sha256 && *mode & SECURITY_BITS == actual & SECURITY_BITS,
+            ) => {
+                recorded == sha256
+                    && *mode & SECURITY_BITS == actual & SECURITY_BITS
+                    && !is_closed(path, actual, index)
+            }
             (Recorded::Link(recorded), Observed::Link { target, .. }) => recorded == target,
             _ => false,
         };
@@ -128,8 +151,9 @@ pub fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex) -> Tie
             }
             // Omarchy rewrites the first line of the packaged
             // `powerprofilesctl` on every install. Proven from the content,
-            // not excused by the path: shown as edited, and still read as
-            // text.
+            // not excused by the path: shown as edited, with a note, and
+            // read no more than any other file its package installed (see
+            // `collect::item_of`).
             Observed::File {
                 mode,
                 content: Some(content),
@@ -487,11 +511,19 @@ mod tests {
             classify("usr/bin/demo", file(&other, 0o755), &index),
             Tier::Modified
         );
-        // Read and execute bits may differ; set-id and write bits may not.
+        // Execute bits may differ, and a read bit may be added; set-id
+        // and write bits may not, and nobody's read access is taken away.
         assert_eq!(
-            classify("usr/bin/demo", file(&abc, 0o711), &index),
+            classify("usr/bin/demo", file(&abc, 0o744), &index),
             Tier::Vendor
         );
+        assert_eq!(
+            classify("usr/bin/demo", file(&abc, 0o711), &index),
+            Tier::Modified
+        );
+        assert!(super::is_closed("usr/bin/demo", 0o750, &index));
+        assert!(!super::is_closed("usr/bin/demo", 0o705, &index));
+        assert!(!super::is_closed("usr/bin/nobody-owns", 0o700, &index));
         assert_eq!(
             classify("usr/bin/demo", file(&abc, 0o775), &index),
             Tier::Modified

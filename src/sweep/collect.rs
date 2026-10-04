@@ -57,6 +57,14 @@ const NOT_REACHED: &str = "gone, or behind a link that is not root's alone: not 
 /// The format label of a file root hashed but did not hand back.
 pub const WITHHELD: &str = "root-only file (hashed, content withheld)";
 
+/// The format label of a packaged file only root can read that a process
+/// led the root collector to: compared with its package, and no more told.
+pub const COMPARED: &str = "root-only packaged file (compared with its package, hash withheld)";
+
+/// What is said of a packaged file that its package installs readable by
+/// everyone and that no longer is.
+pub const CLOSED: &str = "its package installs it readable by everyone, and it no longer is";
+
 /// How a note starts that says a limit was reached while looking for what
 /// an item runs. Such an item cannot be allowed (an allow would vouch for
 /// commands nobody followed), and where its text is not reviewed either,
@@ -450,6 +458,67 @@ pub fn look(scope: &Scope<'_>, category: Category, path: &str, run_by: Option<&s
     read::look_as(scope.root, path, view).unwrap_or_else(|| Found::Unreadable(unseen.into()))
 }
 
+/// The item of a packaged file that a process led the root collector to
+/// and that not everyone may read (a running program's `exe`, a preloaded
+/// library), for the one question the live checks ask of it: is it still
+/// what its package installed?
+///
+/// A user decides which path this is, by running the program or naming the
+/// library, so the rule for such paths applies: nothing of a file they
+/// cannot read is told. Three things keep that rule here. The path must be
+/// one the package index holds: the index is root's, pacman's database is
+/// readable by everyone, and so is every package, so that a file is
+/// installed at this path, and what it holds as installed, is already
+/// public. The way to it must be root's alone, with no link followed
+/// (`kept`, and the path the walk took is the path asked for), so the file
+/// looked at is the one root's package manager put there and not one a
+/// user moved or linked in. And what comes back is one bit: the file is as
+/// its package installed it, or it is not. "It is" tells the user they
+/// hold its content already (the package); "it is not" tells them a
+/// packaged program was changed, which is what the sweep is for, and no
+/// more than the size and time `pacman -Qkk` compares as any user. The
+/// hash of a changed file is withheld: it could confirm a guess at content
+/// only root may read. A package's configuration file (`backup=`), which
+/// is meant to be edited and may hold secrets, never comes out as changed
+/// here (see `tier::classify`), so nothing is told of those at all.
+///
+/// `None` where there is no such file to compare: the caller then treats
+/// the path as not vouched for.
+pub fn packaged_item(scope: &Scope<'_>, category: Category, path: &str) -> Option<Item> {
+    scope.index.owner(path)?;
+    let seen = read::seen(scope.root, path, View::Pinned)?;
+    if !seen.kept || seen.path != path || !matches!(seen.what, read::Public::File(_)) {
+        return None;
+    }
+    let found = read::look_pinned(seen)?;
+    if !matches!(found, Found::File { .. }) {
+        return None;
+    }
+    let mut item = item_of(scope, category, path.to_string(), None, &found);
+    item.sha256 = None;
+    item.body = Body::Binary(COMPARED);
+    item.runs.clear();
+    Some(item)
+}
+
+/// The tier of a packaged file the sweep could not read: modified when its
+/// package installs it readable by everyone, since then somebody closed
+/// it; unknown otherwise. Asked as the sweep's user only: root reads such
+/// a file where it may look at all, and tells nothing of one it may not.
+fn unread_tier(scope: &Scope<'_>, path: &str) -> Tier {
+    if scope.origin == Origin::Root {
+        return Tier::Unknown;
+    }
+    let closed = fs::symlink_metadata(scope.root.join(path)).is_ok_and(|metadata| {
+        metadata.is_file() && tier::is_closed(path, metadata.mode(), scope.index)
+    });
+    if closed {
+        Tier::Modified
+    } else {
+        Tier::Unknown
+    }
+}
+
 /// Whether a file in a user location is one that runs on its own.
 fn wanted(scope: &Scope<'_>, category: Category, relative: &str) -> bool {
     let name = relative.rsplit('/').next().unwrap_or(relative);
@@ -551,7 +620,11 @@ pub fn item_of(
             };
             (Tier::Unknown, None, Body::Unreadable(reason.into()))
         }
-        Found::Unreadable(reason) => (Tier::Unknown, None, Body::Unreadable(reason.clone())),
+        Found::Unreadable(reason) => (
+            unread_tier(scope, &path),
+            None,
+            Body::Unreadable(reason.clone()),
+        ),
     };
     let runs = match &body {
         Body::Text(text) => commands::commands(category, &path, text),
@@ -588,6 +661,15 @@ pub fn item_of(
     };
     let mut notes = notes(scope, category, &path, &body, run_by);
     notes.extend(limits(scope, category, &path, &body, found));
+    let closed = match found {
+        Found::File { mode, .. } => tier::is_closed(&path, *mode, scope.index),
+        // Only a closed file gives this tier to one that was not read.
+        Found::Unreadable(_) => tier == Tier::Modified,
+        Found::Link(_) | Found::Other => false,
+    };
+    if closed {
+        notes.push(CLOSED.to_string());
+    }
     notes.extend(rewritten.map(str::to_string));
     let alerts = settings_alerts(scope, category, &path, tier, &body);
     Item {
