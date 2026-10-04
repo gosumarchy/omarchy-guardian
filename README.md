@@ -833,25 +833,27 @@ A review can be wrong. When a gate blocks on something you may reasonably
 overrule, its report ends with:
 
 ```
-To install this exact content anyway: omarchy-guardian permit 41c9a07d2e556f10
+To install this exact content anyway: omarchy-guardian permit 41c9a07d2e556f10b3a8e4d2c7f09a15
+  content SHA-256 41c9a07d2e556f10b3a8e4d2c7f09a15c2d7e61f0a9b3c48d5e6f7a8b9c0d1e2  (permit shows it again before it asks: the two must be the same)
 ```
 
 ```sh
-omarchy-guardian permit                    # blocked installs waiting, and permits in force
-omarchy-guardian permit 41c9a07d2e556f10   # show what is overruled, ask, store the permit
-omarchy-guardian permit --revoke 41c9a07d2e556f10
+omarchy-guardian permit                                    # blocked installs waiting, and permits in force
+omarchy-guardian permit 41c9a07d2e556f10b3a8e4d2c7f09a15   # show what is overruled, ask, store the permit
+omarchy-guardian permit --revoke 41c9a07d2e556f10b3a8e4d2c7f09a15
 ```
 
-`permit ID` shows the decision and the review's reasons again, shows what
-root will store, and asks you to type `permit` on the terminal (there is no
-`--yes`; without a terminal it refuses). Then it asks for the sudo
-password and stores the permit. Run the install again: the gate reviews
+`permit ID` shows the decision and the review's reasons again, shows the
+content SHA-256 root will store, and asks you to type `permit` on the
+terminal (there is no `--yes`; without a terminal it refuses). Compare that
+SHA-256 with the one the gate printed under its permit line before you
+type the word. Then it asks for the sudo password and stores the permit. Run the install again: the gate reviews
 again, finds the permit, prints `PERMITTED` and which decision your permit
 overruled, and goes on. This is meant to replace the coarse ways out
 (`protect --off`, `yay --makepkg makepkg`, `ai = "off"`), which stay on
 long after the one install they were for.
 
-- **Bound to the bytes.** The ID is the first 16 hex characters of a
+- **Bound to the bytes.** The ID is the first 32 hex characters of a
   SHA-256 over the gate, the class and the digests of exactly what was
   reviewed: for pacman every archive of the transaction by its SHA-256;
   for a theme, a plugin or a `guard` the manifest digest of the tree (file
@@ -881,8 +883,13 @@ long after the one install they were for.
   root's alone, for the user who asked. What a gate blocked is kept in
   your own state directory until you permit it, and a program running as
   you could write such a record: it still cannot get a permit without
-  your typed word and password, and the screen shows the SHA-256 root
-  will store. Permit only an ID a blocked gate printed itself.
+  your typed word and password. Such a program could also put other
+  content under an ID a gate printed, if it found some whose SHA-256
+  starts with the same 32 characters; that takes more work than anyone
+  can do, and the check does not rest on it: the gate prints the whole
+  SHA-256 of what it blocked, `permit` shows the SHA-256 root will store,
+  and the two must be the same. Permit only an ID a blocked gate printed
+  itself.
 - **In the trail.** The grant, each permitted run and a revoke are in
   `omarchy-guardian log`.
 
