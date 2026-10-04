@@ -666,9 +666,17 @@ review it in full every time.
   `terms.html` or anything under `LICENSES/`, PKGBUILD `*.changelog` files, ...): download-to-shell pipelines, encoded command execution,
   credential file access, destructive commands (a recursive `rm` of `/` or
   `$HOME` itself, `mkfs`, raw-disk writes), persistence, shell execution,
-  privilege escalation, disabled TLS verification and likely credential
-  exfiltration. Identifier patterns respect word boundaries, so `retrieval(`
-  and `model.eval()` do not match `eval(`. Making a Chromium-family sandbox
+  privilege escalation, disabled TLS verification (`curl -k`, `git
+  http.sslVerify false`, `--no-check-certificate`, an unverified SSL context,
+  ...) and likely credential exfiltration. Also reverse and bind shells (a
+  shell wired to a socket, in a shell one-liner or built in Python, Perl, PHP,
+  Ruby or awk), cryptocurrency miners and mining pools, turning off a
+  protection of the system (a firewall, a security service, SELinux, or one
+  of Guardian's own gates), and erasing shell history or system logs.
+  Download-to-shell also covers a fetch piped into another interpreter
+  (`| python`, `| perl`, `| node`, ...), behind a wrapper (`| timeout 5 sh`,
+  `| xargs sh -c`) or grouped (`| { sh; }`). Identifier patterns respect word
+  boundaries, so `retrieval(` and `model.eval()` do not match `eval(`. Making a Chromium-family sandbox
   helper setuid root (`chmod 4755` or `chown root` of `chrome-sandbox`,
   `msedge-sandbox`, `opera_sandbox`, ...), which every Chromium and Electron
   package does, is not a privilege-escalation finding. A persistence path a
@@ -701,12 +709,30 @@ review it in full every time.
   not meaning: a command assembled any other way is left to the AI
   review. A file a reviewed script runs or reads in (`sh ./data/x.png`,
   `. ./lib`, `python3 tool.py`) that Guardian could only hash makes the
-  review incomplete: it runs, and nobody read it. Prose, comments and
-  messages are still sent to the AI review.
+  review incomplete: it runs, and nobody read it. A prose file a reviewed
+  line runs (`sh ./README`) is checked by the command rules after all, even
+  though prose is otherwise exempt. Two further checks read **every** text
+  file, prose included: text addressed to a reviewer or an AI model that
+  tells it what to conclude (an injected "ignore previous instructions", a
+  made-up verdict, a chat-template control token), reported with an excerpt
+  so a human can judge, while ordinary writing about AI tools stays quiet;
+  and hidden or reordering characters — bidirectional controls that reorder
+  text (the Trojan Source technique), invisible Unicode tag characters, and
+  zero-width characters inside a name, command or path — which deceive the
+  human and the AI reader without changing what a program does (writing
+  systems that need these characters, such as right-to-left text and
+  translation files, stay quiet). Prose, comments and messages are still
+  sent to the AI review.
 - **Network destinations:** literal HTTP(S) hosts in code and runtime config,
-  flagging cleartext HTTP and hard-coded IP addresses. A PKGBUILD's `url=`
-  homepage (never fetched), XML namespace, DTD and schema identifiers are not
-  destinations. URL paths, queries and credentials are never printed.
+  flagging cleartext HTTP and hard-coded IP addresses. A host is also flagged
+  when it is one commonly used to deliver or receive stolen data (a paste
+  site, a chat webhook such as a Discord or Slack webhook path, a tunnel or
+  request catcher, dynamic DNS, a `.onion` address or a link shortener), or
+  when its name is made to read as another — a label mixing alphabets, or a
+  punycode (`xn--`) label. A PKGBUILD's `url=` homepage (never fetched), XML
+  namespace, DTD and schema identifiers are not destinations. URL paths,
+  queries and credentials are never printed: the host reputation is judged
+  from the path internally, without recording it.
 - **Dependencies:** `Cargo.lock`, npm lockfiles, `poetry.lock`, `go.sum` and
   exactly pinned `requirements*.txt` are checked with the public OSV API (only
   package names and versions are sent). Advisory severities and summaries are
