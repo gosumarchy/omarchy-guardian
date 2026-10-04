@@ -44,6 +44,7 @@ safe_git() {
         GIT_CONFIG_GLOBAL=/dev/null \
         GIT_TERMINAL_PROMPT=0 \
         GIT_LFS_SKIP_SMUDGE=1 \
+        GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -oBatchMode=yes}" \
         git "$@"
 }
 

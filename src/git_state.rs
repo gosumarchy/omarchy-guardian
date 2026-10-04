@@ -23,8 +23,10 @@ pub const OWN_DIRECTORIES: &[&str] = &[
     "svn",
 ];
 
-/// Keys that name a command git runs, as `section.key`, `section.*.key` for
-/// any subsection, or `section.*` for every key in the section.
+/// Keys that name a command git runs, or send it to another address than
+/// the one written, as `section.key`, `section.*.key` for any subsection,
+/// or `section.*` for every key in the section. Checked against
+/// git-config(1) and git-archive(1).
 const EXECUTING_KEYS: &[&str] = &[
     "core.fsmonitor",
     "core.hookspath",
@@ -62,6 +64,23 @@ const EXECUTING_KEYS: &[&str] = &[
     "gpg.*.defaultkeycommand",
     // Hooks defined in the configuration itself.
     "hook.*.command",
+    // What `git archive` pipes its output through.
+    "tar.*.command",
+    "interactive.difffilter",
+    "imap.tunnel",
+    "browser.*.cmd",
+    "man.*.cmd",
+    "guitool.*.cmd",
+    "sendemail.sendmailcmd",
+    "sendemail.tocmd",
+    "sendemail.cccmd",
+    "sendemail.headercmd",
+    "instaweb.httpd",
+    // No command, but another address than the one written: a later
+    // `git fetch` or `git submodule update` in the tree gets its code
+    // from wherever these point.
+    "url.*.insteadof",
+    "url.*.pushinsteadof",
 ];
 
 /// Whether `rel` is a git config file the walk reviews: a `.git/config`, or a
@@ -371,6 +390,26 @@ mod tests {
             ["filter.lfs.smudge = git-lfs smudge -- %f"]
         );
         assert!(keys("[remote \"origin\"]\n\turl = https://h/r.git\n").is_empty());
+        // What `git archive` pipes through, and an address that stands in
+        // for the one a submodule or remote is written with.
+        assert_eq!(
+            keys("[tar \"tar.xz\"]\n\tcommand = sh -c 'touch x; xz -c'\n\tremote = true\n"),
+            ["tar.tar.xz.command = sh -c 'touch x; xz -c'"]
+        );
+        assert!(keys("[tar]\n\tumask = 022\n").is_empty());
+        assert_eq!(
+            keys(
+                "[url \"https://evil.example/\"]\n\tinsteadOf = https://github.com/\n\tpushInsteadOf = git@github.com:\n"
+            ),
+            [
+                "url.https://evil.example/.insteadof = https://github.com/",
+                "url.https://evil.example/.pushinsteadof = git@github.com:"
+            ]
+        );
+        assert_eq!(
+            keys("[interactive]\n\tdiffFilter = sh x\n[man \"x\"]\n\tcmd = sh x\n").len(),
+            2
+        );
         assert!(keys("[core]\n\thooksPath = .husky/_\n").is_empty());
         assert!(keys("[credential]\n\thelper =\n").is_empty());
         assert_eq!(
