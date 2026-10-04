@@ -21,16 +21,23 @@
 #
 # Requirements: bsdtar, pacman (for pacman-conf), setsid. Optional: bwrap
 # with user namespaces, for the hook's "not turned on" branch when the suite
-# does not run as root; bwrap with overlays and makepkg, as a user, for the
-# makepkg gate's jail; and an installed omarchy-guardian package plus jq,
-# for the interceptor's presence check. A case whose requirement is missing
-# is reported as skipped. A check that is known to fail today is run and
-# shown as KNOWN with the reason, and counted apart from the failures.
+# does not run as root, and for the pacman gate's cases as root when it
+# does not; bwrap with overlays and makepkg, as a
+# user, for the makepkg gate's jail; lua, for the Hyprland PATH file; git
+# and ssh-keygen, for the installer's release check; and an installed
+# omarchy-guardian package plus jq, for the interceptor's presence check. A
+# case whose requirement is missing is reported as skipped. A check that is
+# known to fail today is run and shown as KNOWN with the reason, and counted
+# apart from the failures.
 #
-# Run as root (a CI container), a reviewer from PATH is refused for the
-# stand-in pacman, which is the first check; the other pacman cases then run
-# with the reviewer the gate would really use, and are skipped when one is
-# installed, so that none is ever asked.
+# The pacman gate's cases run twice: with the stand-in reviewers from PATH,
+# as a user, and as root, where a reviewer from PATH is refused (the first
+# check) and the gate looks for the reviewer it would really use. As root
+# means really root (a CI container) or, run as a user, root of a user
+# namespace. Either way a reviewer installed on this system is hidden from
+# those cases behind a private mount, so they run whatever is installed and
+# none is ever asked; in a user namespace the gate would not take it for
+# root's anyway.
 #
 # Usage:
 #   cargo build --release
@@ -42,10 +49,18 @@ set -uo pipefail
 
 PROJECT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
 BINARY=${GUARDIAN:-$PROJECT/target/release/omarchy-guardian}
-E2E=$(mktemp -d -p "${GUARDIAN_E2E_ROOT:-${TMPDIR:-/tmp}}" guardian-offline-XXXXXX) || {
-    printf 'cannot create a scratch directory; set GUARDIAN_E2E_ROOT\n' >&2
-    exit 2
-}
+# Set by the suite itself when it runs the pacman gate's cases again as root
+# of a user namespace: the scratch directory to use.
+AS_ROOT=${GUARDIAN_E2E_AS_ROOT:-}
+if [[ -n $AS_ROOT ]]; then
+    E2E=$AS_ROOT
+    mkdir -p -- "$E2E" || exit 2
+else
+    E2E=$(mktemp -d -p "${GUARDIAN_E2E_ROOT:-${TMPDIR:-/tmp}}" guardian-offline-XXXXXX) || {
+        printf 'cannot create a scratch directory; set GUARDIAN_E2E_ROOT\n' >&2
+        exit 2
+    }
+fi
 FAILURES=0
 SKIPPED=0
 KNOWN=0
@@ -62,7 +77,7 @@ for tool in bsdtar pacman-conf setsid; do
 done
 
 cleanup() {
-    [[ -n ${GUARDIAN_E2E_KEEP:-} ]] || rm -rf -- "$E2E"
+    [[ -n ${GUARDIAN_E2E_KEEP:-} || -n $AS_ROOT ]] || rm -rf -- "$E2E"
 }
 trap cleanup EXIT
 
@@ -163,6 +178,7 @@ hook_script() {
     local hook=$PROJECT/integrations/pacman/guardian-pacman-hook
     local enabled=/etc/pacman.d/hooks/omarchy-guardian.hook
     local packaged=/usr/share/omarchy-guardian/omarchy-guardian.hook
+    local installed=/usr/bin/omarchy-guardian
     local -a as_root=()
     local -a turned_on=()
     if ((IS_ROOT)); then
@@ -173,15 +189,26 @@ hook_script() {
         printf 'some-package\n' | /bin/sh "$hook" >"$OUT" 2>&1
         expect 'a hook that is installed and not turned on lets the transaction through' 0 "$?"
         check 'and says nothing' test ! -s "$OUT"
-        # Only in a throwaway CI container is the switch made for real.
-        if [[ ${CI:-} == true ]]; then
+        # Only in a throwaway CI container is the switch made for real,
+        # and Guardian put where the hook looks for it.
+        if [[ ${CI:-} == true ]] && absent "$installed"; then
             mkdir -p /etc/pacman.d/hooks && ln -s "$packaged" "$enabled"
             printf 'some-package\n' | /bin/sh "$hook" >"$OUT" 2>&1
+            expect 'with the link the hook stops a transaction: Guardian is not installed' 2 "$?"
+            expect_output 'and says so' "omarchy-guardian is not installed at $installed"
+            install -m 755 -- "$BINARY" "$installed"
+            printf 'some-package\n' | /bin/sh "$hook" >"$OUT" 2>&1
+            expect 'with Guardian installed it stops one it cannot tell the user of' 2 "$?"
+            expect_output 'and says so' 'Cannot run the Guardian package review as the invoking user'
+            # The review itself, as the hook starts it: unprivileged, and
+            # refusing a transaction whose parent is not pacman.
+            printf 'some-package\n' | SUDO_USER=nobody /bin/sh "$hook" >"$OUT" 2>&1
             local status=$?
-            rm -f -- "$enabled"
-            expect 'with the link the hook reviews, and refuses what it cannot review' 2 "$status"
+            rm -f -- "$enabled" "$installed"
+            expect 'with the link the hook hands the transaction to the review, which refuses it' 2 "$status"
+            expect_output 'the review says why' 'not pacman'
         else
-            skip 'hook script turned on as root: only in CI, where /etc is throwaway'
+            skip 'hook script turned on as root: only in CI, where /etc and /usr/bin are throwaway'
         fi
         return
     fi
@@ -195,9 +222,22 @@ hook_script() {
     printf 'some-package\n' | "${as_root[@]}" /bin/sh "$hook" >"$OUT" 2>&1
     expect 'a hook that is installed and not turned on lets the transaction through' 0 "$?"
     check 'and says nothing' test ! -s "$OUT"
+    # With the link the hook no longer lets the transaction through. It
+    # does not get as far as a review here: without an installed Guardian
+    # it stops there, and with one at what a user namespace keeps from it
+    # (its parent's working directory, a user to review as). The review
+    # itself is reached as real root only (above, in CI).
     turned_on=("${as_root[@]}" --dir /etc/pacman.d/hooks --symlink "$packaged" "$enabled")
     printf 'some-package\n' | "${turned_on[@]}" /bin/sh "$hook" >"$OUT" 2>&1
-    expect 'with the link the hook reviews, and refuses what it cannot review' 2 "$?"
+    expect 'with the link the hook stops a transaction it cannot hand to a review' 2 "$?"
+    if [[ -x $installed ]]; then
+        own_refusal() {
+            grep -qE 'Cannot read the working directory of pacman|Cannot run the Guardian package review as the invoking user' "$OUT"
+        }
+        check 'and says what it could not do' own_refusal
+    else
+        expect_output 'because Guardian is not installed' "omarchy-guardian is not installed at $installed"
+    fi
 }
 
 ###############################################################################
@@ -236,25 +276,41 @@ pacman_gate() {
             >"$fakes/$name"
         chmod 755 "$fakes/$name"
     done
+    # As root the gate looks for a root-owned reviewer in these places. One
+    # that is installed is hidden behind a private mount for each case, so
+    # the cases run on any system and no reviewer is ever asked.
+    local -a hide=() installed=()
+    local reviewer
+    for reviewer in /usr/bin/opencode /usr/local/bin/opencode /usr/bin/claude /usr/local/bin/claude; do
+        [[ -e $reviewer ]] && installed+=("$reviewer")
+    done
+    if ((IS_ROOT)) && ((${#installed[@]})); then
+        hide=(unshare --mount -- /bin/sh -c
+            'for reviewer in $REVIEWERS; do mount --bind /dev/null "$reviewer" || exit 97; done; exec "$@"' sh)
+    fi
     # gate <stand-in> <target> [pacman args...]
     gate() {
         local parent=$1 target=$2
         shift 2
-        (cd "$packages" && TARGET=$target GUARDIAN_BINARY=$BINARY HOOK_FLAGS=${flags[*]} \
-            setsid -w "$fakes/$parent" "$@" </dev/null >"$OUT" 2>&1)
+        (cd "$packages" && REVIEWERS=${installed[*]} TARGET=$target GUARDIAN_BINARY=$BINARY \
+            HOOK_FLAGS=${flags[*]} "${hide[@]}" setsid -w "$fakes/$parent" "$@" </dev/null >"$OUT" 2>&1)
     }
 
     if ((IS_ROOT)); then
         gate pacman some-package -U /x-1-1-any.pkg.tar.zst
         expect "a reviewer from PATH is refused for root's pacman" 2 "$?"
         expect_output 'the refusal names the option' '--opencode-from-path is for tests'
-        local reviewer
-        for reviewer in /usr/bin/opencode /usr/local/bin/opencode /usr/bin/claude /usr/local/bin/claude; do
-            if [[ -e $reviewer ]]; then
-                skip "pacman gate cases as root: $reviewer could be asked for a review"
-                return
-            fi
-        done
+        if ((${#hide[@]})) && ! (REVIEWERS=${installed[*]} "${hide[@]}" /usr/bin/true) 2>/dev/null; then
+            skip "pacman gate cases as root: ${installed[*]} could be asked for a review and cannot be hidden (no mount namespace)"
+            return
+        fi
+        hidden() {
+            local reviewer
+            for reviewer in "${installed[@]}"; do
+                (REVIEWERS=${installed[*]} "${hide[@]}" /usr/bin/test ! -f "$reviewer") || return 1
+            done
+        }
+        check 'an installed reviewer is hidden from the cases as root' hidden
         flags=()
     fi
 
@@ -291,6 +347,35 @@ pacman_gate() {
     expect_output 'the report names the path' 'etc/claude-code'
 
     own_package
+    ((IS_ROOT)) || pacman_gate_as_root
+}
+
+# The same cases again as root of a user namespace, where the gate behaves
+# as it does in front of a real transaction: no reviewer from PATH. The
+# suite runs itself for that, with this section only, in a root directory
+# of its own: to the gate, root's real files read as somebody else's in a
+# user namespace, and an archive below a directory of somebody else's is
+# refused before any case. So the scratch directory is all that is this
+# root's own, the system is there to read, and this system's Guardian
+# settings in /etc (root's, so refused in here) are left out, as on a
+# system that has none.
+pacman_gate_as_root() {
+    local inner=$E2E/as-root
+    local -a as_root=(bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --cap-add ALL
+        --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/bin /sbin
+        --symlink usr/lib /lib --symlink usr/lib /lib64
+        --ro-bind /etc /etc --ro-bind /var /var --dev /dev --proc /proc
+        --ro-bind "$PROJECT" "$PROJECT" --ro-bind "$BINARY" "$BINARY" --bind "$E2E" "$E2E")
+    [[ -d /etc/omarchy-guardian ]] && as_root+=(--tmpfs /etc/omarchy-guardian)
+    if ! command -v bwrap >/dev/null || ! "${as_root[@]}" /usr/bin/true 2>/dev/null; then
+        skip 'pacman gate cases as root: needs root, or bwrap with user namespaces'
+        return
+    fi
+    if ! GUARDIAN_E2E_AS_ROOT=$inner GUARDIAN=$BINARY "${as_root[@]}" /usr/bin/bash "${BASH_SOURCE[0]}"; then
+        printf 'FAIL the pacman gate cases as root of a user namespace\n'
+        FAILURES=$((FAILURES + 1))
+    fi
+    SKIPPED=$((SKIPPED + $(cat "$inner/skipped" 2>/dev/null || printf 0)))
 }
 
 # Guardian's own package through its own gate: `./install.sh` upgrades with
@@ -582,6 +667,50 @@ in_bash() {
         'source "$1" && shift && "$@"' _ "$E2E/lib/omarchy-bash-interceptor.sh" "$@"
 }
 
+# The `omarchy` wrapper finds Omarchy's own dispatcher by full path, in
+# either place Omarchy keeps it, and never by a PATH lookup.
+dispatcher() {
+    local wrapper=$E2E/lib/bin/omarchy-moved planted=$E2E/planted url=https://example.test/theme.git
+    mkdir -p "$E2E/usr-bin" "$planted"
+    sed -e "s|/usr/bin/omarchy|$E2E/usr-bin/omarchy|g" -e "s|/etc/omarchy.conf|$E2E/omarchy.conf|g" \
+        -- "$E2E/lib/bin/omarchy" >"$wrapper"
+    chmod 755 "$wrapper"
+    printf '#!/bin/sh\nprintf "%%s\\n" "moved-omarchy $*" >>%q\n' "$ROUTE_LOG" >"$E2E/usr-bin/omarchy"
+    printf '#!/bin/sh\nprintf "%%s\\n" "planted-omarchy $*" >>%q\n' "$ROUTE_LOG" >"$planted/omarchy"
+    chmod 755 "$E2E/usr-bin/omarchy" "$planted/omarchy"
+    planted_first() { PATH="$planted:/usr/bin:/bin" "$@"; }
+
+    expect_route 'the dispatcher in its usual place is the one run' 'omarchy update --yes' \
+        planted_first "$wrapper" update --yes
+    mv -- "$E2E/omarchy-bin/omarchy" "$E2E/omarchy-bin/omarchy.away"
+    expect_route 'a dispatcher that moved to the other place is still found' 'moved-omarchy update --yes' \
+        planted_first "$wrapper" update --yes
+    rm -f -- "$E2E/usr-bin/omarchy"
+    : >"$ROUTE_LOG"
+    planted_first "$wrapper" update --yes >"$OUT" 2>&1 </dev/null
+    expect 'with no dispatcher in either place the wrapper stops' 127 "$?"
+    expect_output 'and says so in one line' "Omarchy's own omarchy command is not at"
+    check 'an omarchy planted on PATH is never run instead' test ! -s "$ROUTE_LOG"
+    expect_route 'a theme install still goes to Guardian then' "guardian-theme install $url" \
+        planted_first "$wrapper" theme install "$url"
+
+    # `omarchy dev link` names its checkout in /etc/omarchy.conf: only
+    # root's file is believed.
+    mkdir -p "$E2E/linked/bin"
+    printf '#!/bin/sh\nprintf "%%s\\n" "linked-omarchy $*" >>%q\n' "$ROUTE_LOG" >"$E2E/linked/bin/omarchy"
+    chmod 755 "$E2E/linked/bin/omarchy"
+    mv -- "$E2E/omarchy-bin/omarchy.away" "$E2E/omarchy-bin/omarchy"
+    printf 'export OMARCHY_PATH=%q\n' "$E2E/linked" >"$E2E/omarchy.conf"
+    if ((IS_ROOT)); then
+        expect_route "a checkout linked in root's file is the one run" 'linked-omarchy update --yes' \
+            planted_first "$wrapper" update --yes
+    else
+        expect_route "a link file that is not root's is not believed" 'omarchy update --yes' \
+            planted_first "$wrapper" update --yes
+    fi
+    rm -f -- "$E2E/omarchy.conf"
+}
+
 theme_commands() {
     printf '=== theme and plugin commands ===\n'
     local name
@@ -600,6 +729,7 @@ theme_commands() {
         "$E2E/lib/omarchy-bash-interceptor.sh"
     routing on_path
     routing in_bash
+    dispatcher
 
     # The installer adds the line that loads the interceptor once, and keeps
     # the file as it was before its first edit.
@@ -654,12 +784,182 @@ interceptor_state() {
         not_effective 'echo /usr/lib/omarchy-guardian/omarchy-bash-interceptor.sh'
 }
 
+###############################################################################
+# The file Hyprland loads to put Guardian's commands first on PATH
+###############################################################################
+hyprland_path() {
+    printf '=== the Hyprland PATH file ===\n'
+    local file=$PROJECT/integrations/omarchy/hyprland-path.lua lua
+    local guardian=/usr/lib/omarchy-guardian/bin omarchy=/usr/share/omarchy/bin
+    lua=$(command -v lua || command -v luajit) || {
+        skip 'the Hyprland PATH file: needs lua'
+        return
+    }
+    # path_after <PATH Hyprland was started with> [OMARCHY_PATH]: what the
+    # file sets PATH to, with Hyprland's `hl.env` standing in as a print.
+    path_after() {
+        /usr/bin/env -i PATH="$1" ${2:+OMARCHY_PATH="$2"} "$lua" \
+            -e 'hl = { env = function(name, value) print(name .. "=" .. value) end }' "$file" 2>&1
+    }
+    # As Omarchy's envs.lua leaves it: its own commands first, Guardian's
+    # (from the uwsm session file) behind them.
+    check "Guardian's commands come first, Omarchy's right behind" test \
+        "$(path_after "$omarchy:$guardian:/usr/local/bin:/usr/bin")" = \
+        "PATH=$guardian:$omarchy:/usr/local/bin:/usr/bin"
+    # As Hyprland itself was started, should it not hand its own setting
+    # back: Omarchy's directory is placed all the same.
+    check "the same from the PATH Hyprland was started with" test \
+        "$(path_after "$guardian:/usr/local/bin:/usr/bin")" = \
+        "PATH=$guardian:$omarchy:/usr/local/bin:/usr/bin"
+    check 'and with neither on it' test "$(path_after /usr/bin)" = "PATH=$guardian:$omarchy:/usr/bin"
+    check 'a linked Omarchy checkout keeps its place behind Guardian' test \
+        "$(path_after "/x/omarchy/bin:/usr/bin" /x/omarchy/)" = "PATH=$guardian:/x/omarchy/bin:/usr/bin"
+    # The line `protect` writes passes over a file that is not there (the
+    # package removed, the line left behind) without an error.
+    missing_file() {
+        [[ $("$lua" -e 'print(pcall(dofile, "/nonexistent/hyprland-path.lua"))' 2>&1) == false* ]]
+    }
+    check "the line that loads it passes over a missing file" missing_file
+}
+
+###############################################################################
+# install.sh: what counts as a signed release
+###############################################################################
+release_check_cases() {
+    printf '=== the installer: what counts as a signed release ===\n'
+    if ! command -v git >/dev/null || [[ ! -x /usr/bin/ssh-keygen ]]; then
+        skip "the installer's release check: needs git and ssh-keygen"
+        return
+    fi
+    local repo=$E2E/release/checkout keys=$E2E/release/keys signers=$E2E/release/allowed_signers
+    local -a git=(git -C "$repo" -c user.name=Tester -c user.email=tester@example.test -c gpg.format=ssh
+        -c init.defaultBranch=main -c commit.gpgsign=false)
+    mkdir -p "$repo" "$keys"
+    # The function as install.sh has it, and nothing else of the installer.
+    # shellcheck disable=SC1090
+    source <(sed -n '/^release_check() {$/,/^}$/p' "$PROJECT/install.sh")
+    if ! declare -F release_check >/dev/null; then
+        printf 'FAIL install.sh has no release_check to test\n'
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    ssh-keygen -q -t ed25519 -N '' -C release -f "$keys/release" &&
+        ssh-keygen -q -t ed25519 -N '' -C other -f "$keys/other" || {
+        printf 'FAIL could not make test keys\n'
+        FAILURES=$((FAILURES + 1))
+        return
+    }
+    printf 'release@example.test namespaces="git" %s\n' "$(cat "$keys/release.pub")" >"$signers"
+    printf 'other@example.test namespaces="git" %s\n' "$(cat "$keys/other.pub")" >"$keys/other_signers"
+    {
+        "${git[@]}" init -q &&
+            cp -- "$PROJECT/.gitignore" "$repo/.gitignore" &&
+            printf 'fn main() {}\n' >"$repo/main.rs" &&
+            "${git[@]}" add .gitignore main.rs &&
+            "${git[@]}" commit -q -m release &&
+            "${git[@]}" -c user.signingkey="$keys/release.pub" tag -s -m v1 v1
+    } >"$OUT" 2>&1 || {
+        printf 'FAIL could not make a signed test release: %s\n' "$(tail -n 3 "$OUT" | tr '\n' ';')"
+        FAILURES=$((FAILURES + 1))
+        return
+    }
+    # is <label> <what release_check must start with> [keys file]
+    is() {
+        local label=$1 want=$2 got
+        got=$(release_check "$repo" "${3-$signers}")
+        if [[ $got == "$want"* ]]; then
+            printf 'ok   %s\n' "$label"
+        else
+            printf 'FAIL %s: release_check said "%s", expected "%s..."\n' "$label" "$got" "$want"
+            FAILURES=$((FAILURES + 1))
+        fi
+    }
+
+    is 'a release tag signed by a known key, nothing changed or added' 'signed v1'
+    is 'without keys the tag is named and not called signed' 'unchecked v1' ''
+    # What the build makes is not an added file.
+    mkdir -p "$repo/target/release" "$repo/packaging/arch/pkg" "$repo/packaging/arch/src"
+    : >"$repo/target/release/x"
+    : >"$repo/packaging/arch/pkg/x"
+    : >"$repo/packaging/arch/src/x"
+    : >"$repo/packaging/arch/omarchy-guardian-1-1-x86_64.pkg.tar.zst"
+    is "the build's own output does not make it unsigned" 'signed v1'
+
+    # Files that are not part of the tag: cargo runs the first two, and the
+    # package installs the last as the next keys.
+    local added
+    for added in build.rs .cargo/config.toml rust-toolchain.toml packaging/allowed_signers; do
+        mkdir -p "$(dirname -- "$repo/$added")"
+        : >"$repo/$added"
+        is "an added $added makes it unsigned" 'unsigned this checkout has files that are not part of v1'
+        # Hidden from `git status` by the checkout's own exclude file.
+        printf '/%s\n/.cargo/\n' "$added" >>"$repo/.git/info/exclude"
+        is "and so does one the checkout's exclude file hides" 'unsigned this checkout has files that are not part of v1'
+        rm -rf -- "$repo/$added" "$repo/.cargo"
+        : >"$repo/.git/info/exclude"
+    done
+    is 'with them gone it is signed again' 'signed v1'
+
+    printf '// changed\n' >>"$repo/main.rs"
+    is 'a changed file makes it unsigned' 'unsigned this checkout has local changes'
+    "${git[@]}" checkout -q -- main.rs
+
+    # A tag signed by a key Guardian does not know, in a checkout whose own
+    # configuration answers the verification: its own keys file, and a
+    # program standing in for ssh-keygen that calls every signature good.
+    "${git[@]}" tag -d v1 >/dev/null 2>&1
+    "${git[@]}" -c user.signingkey="$keys/other.pub" tag -s -m v1 v1 >"$OUT" 2>&1
+    is 'a tag signed by an unknown key is unsigned' 'unsigned v1 is not signed by a release key'
+    "${git[@]}" config gpg.ssh.allowedSignersFile "$keys/other_signers"
+    fooled() { "${git[@]}" verify-tag v1 >/dev/null 2>&1; }
+    check "(the checkout's own keys file does answer a plain git verify-tag)" fooled
+    is "the checkout's own keys file is not asked" 'unsigned v1 is not signed by a release key'
+    "${git[@]}" config --unset gpg.ssh.allowedSignersFile
+    printf '#!/bin/sh\ncase " $* " in\n*" find-principals "*) printf "release@example.test\\n" ;;\n*" verify "*) printf "Good \\"git\\" signature for release@example.test with ED25519 key SHA256:x\\n" ;;\nesac\nexit 0\n' \
+        >"$keys/yes-keygen"
+    chmod 755 "$keys/yes-keygen"
+    "${git[@]}" config gpg.ssh.program "$keys/yes-keygen"
+    plain_verify() { "${git[@]}" -c gpg.ssh.allowedSignersFile="$signers" verify-tag v1 >/dev/null 2>&1; }
+    check "(the checkout's own verifying program does answer a plain git verify-tag)" plain_verify
+    is "the checkout's own verifying program is not asked" 'unsigned v1 is not signed by a release key'
+    "${git[@]}" config --unset gpg.ssh.program
+
+    # A commit on top of the release, and a directory that is no checkout.
+    "${git[@]}" tag -d v1 >/dev/null 2>&1
+    "${git[@]}" -c user.signingkey="$keys/release.pub" tag -s -m v1 v1 >"$OUT" 2>&1
+    is 'the release tag signed anew is signed' 'signed v1'
+    printf '// more\n' >>"$repo/main.rs"
+    "${git[@]}" commit -q -a -m more
+    is 'a commit after the tag is unsigned' 'unsigned commit'
+    mkdir -p "$E2E/release/tarball"
+    cp -- "$repo/main.rs" "$E2E/release/tarball/"
+    repo=$E2E/release/tarball
+    # Above the scratch directory there may be a checkout: git must not
+    # find one from inside a tarball's directory.
+    GIT_CEILING_DIRECTORIES=$E2E/release is 'a directory that is not a git checkout is unsigned' \
+        'unsigned this is not a git checkout'
+}
+
+if [[ -n $AS_ROOT ]]; then
+    # The pacman gate's cases as root of a user namespace, for the suite
+    # that started this one (see pacman_gate_as_root).
+    pacman_gate
+    printf '%d\n' "$SKIPPED" >"$E2E/skipped"
+    if [[ -e $AI_CALLED ]]; then
+        printf 'FAIL a reviewer was started as root: %s\n' "$(tr '\n' ';' <"$AI_CALLED")"
+        FAILURES=$((FAILURES + 1))
+    fi
+    exit $((FAILURES > 0))
+fi
+
 hook_script
 pacman_gate
 user_gates
 makepkg_jail
 theme_commands
 interceptor_state
+hyprland_path
+release_check_cases
 
 printf '\n'
 if [[ -e $AI_CALLED ]]; then
