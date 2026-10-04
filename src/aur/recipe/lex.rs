@@ -79,6 +79,12 @@ const BEFORE_COMMAND: &[&str] = &[
     "if", "then", "else", "elif", "do", "while", "until", "!", "time", "{",
 ];
 
+/// Whether bash splits words at `character`: a space, a tab or a new line,
+/// and no other character that only looks like one.
+fn is_blank(character: char) -> bool {
+    matches!(character, ' ' | '\t' | '\n')
+}
+
 /// Whether `text` is the left side of an assignment up to and including
 /// its `=`: `name=`, `name+=`, `name[3]=`.
 fn is_assignment_start(text: &str) -> bool {
@@ -190,7 +196,7 @@ impl Lexer<'_> {
 
     /// One character inside quotes or a substitution: kept in the word.
     fn quoted(&mut self, inside: Inside, character: char) {
-        let boundary = |last: char| last.is_whitespace() || "(;|&".contains(last);
+        let boundary = |last: char| is_blank(last) || "(;|&".contains(last);
         if let Inside::Substitution(_, kind @ (Kind::Code | Kind::Arithmetic)) = inside {
             // A comment: its quotes open nothing.
             if character == '#' && self.word.ends_with(boundary) {
@@ -212,7 +218,7 @@ impl Lexer<'_> {
                 self.unsure();
             }
             // A `case` has patterns that close with `)`.
-            if character.is_whitespace()
+            if is_blank(character)
                 && self
                     .word
                     .strip_suffix("case")
@@ -327,7 +333,7 @@ impl Lexer<'_> {
             match quote {
                 Some(open) if next == open => quote = None,
                 Some(_) if next == '\n' => break,
-                None if next.is_whitespace() || ";&|<>()".contains(next) => break,
+                None if is_blank(next) || ";&|<>()".contains(next) => break,
                 None if next == '\'' || next == '"' => {
                     quote = Some(next);
                     quoted = true;
@@ -549,7 +555,7 @@ impl Lexer<'_> {
                 self.open(Inside::Brace, '{');
             }
             '\n' => self.new_line(),
-            _ if character.is_whitespace() => self.end_word(),
+            ' ' | '\t' => self.end_word(),
             // `]];` ends the test: the `;` is no part of it.
             '(' | ')' | ';' | '&' | '|' | '<' | '>' if self.in_test && self.word != "]]" => {
                 self.test(character);

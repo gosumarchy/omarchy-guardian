@@ -2478,6 +2478,12 @@ sha256sums=('abc'\n            SKIP 'SKIP')\nbuild() {\n  local source=x\n  eval
             sources("build() {\n  x=${CFLAGS/-g }\n  y=${v/a/&b}\n  eval z\n}\nsource=(a)\n"),
             Sources::Written(vec![("source".into(), vec!["a".into()])])
         );
+        // A space bash does not split at splits nothing: this is one
+        // word, and a command of that name.
+        assert!(not_followed("eval\u{a0}'source=(evil)'\n"));
+        assert!(not_followed(
+            "x=1\u{2003}eval 'source=(evil)'\nsource=(\"$x\")\n"
+        ));
         // `[[` is bash's own only where a command starts; `#` is no
         // comment in a pattern list or in arithmetic; a quote inside a
         // substitution inside quotes is a quote.
