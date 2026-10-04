@@ -735,16 +735,16 @@ journalctl -t omarchy-guardian -o verbose   # the entries as journald keeps them
 ```
 
 ```
-2026-10-04 16:14 UTC  CLEAR            pacman    ripgrep-14.1.1-1-x86_64  5f0c2a9e41b7
-2026-10-04 16:14 UTC  PASSED           pacman    the hook's root half: how the review ended  for user 1000  [root]
-2026-10-04 16:20 UTC  INCOMPLETE       aur       aur:demo-bin  9be2f4c01a77
-2026-10-04 16:21 UTC  GRANTED          aur       permit 41c9a07d2e556f10  for user 1000  41c9a07d2e55  [root]
-2026-10-04 16:22 UTC  PERMITTED        aur       aur:demo-bin  permit 41c9a07d2e556f10  overrules INCOMPLETE  9be2f4c01a77
+2026-10-04 16:14 UTC  you       CLEAR            pacman    ripgrep-14.1.1-1-x86_64  5f0c2a9e41b7
+2026-10-04 16:14 UTC  root      PASSED           pacman    the hook's root half: how the review ended  for user 1000
+2026-10-04 16:20 UTC  you       INCOMPLETE       aur       aur:demo-bin  9be2f4c01a77
+2026-10-04 16:21 UTC  root      GRANTED          aur       permit 41c9a07d2e556f10b3a8e4d2c7f09a15  for user 1000  41c9a07d2e55
+2026-10-04 16:22 UTC  you       PERMITTED        aur       aur:demo-bin  permit 41c9a07d2e556f10b3a8e4d2c7f09a15  overrules INCOMPLETE  9be2f4c01a77
 
-Each line is the time, the decision, the gate, what it was about, and the
-first 12 hex characters of the SHA-256 of what was reviewed (`+N` when
-there are more, as in a transaction of several archives; `--json` and
-`journalctl` have them in full).
+Each line is the time, who wrote the entry, the decision, the gate, what it
+was about, and the first 12 hex characters of the SHA-256 of what was
+reviewed (`+N` when there are more, as in a transaction of several
+archives; `--json` and `journalctl` have them in full).
 ```
 
 What is recorded:
@@ -789,21 +789,27 @@ What an entry proves, and what it does not:
 - No user process can change or remove an entry: the journal files are
   root's, and journald stamps each entry with the user id of the process
   that sent it (`_UID`), which a sender cannot set.
+- The column after the time says who wrote the entry: `you`, `root`,
+  `uid N` for another user, or `?` when the journal names nobody. `log`
+  makes it from journald's own `_UID` and from nothing the sender wrote,
+  and it stands before everything the sender wrote. What the sender wrote
+  (a subject, a decision's name) is shown on one line with every run of
+  blanks as a single one, so it cannot hold the two blanks that part the
+  columns: nothing further along a line can pass for that column.
 - Guardian's reviews run as you, in the pacman hook too, so their entries
   carry your user id, and **any program running as you can write an entry
-  that looks the same**. An unmarked line in `log` means "written by your
-  user", not "written by Guardian". A program that ran as you can add false
-  lines; it cannot take a true one away.
-- Entries marked `[root]` were written by Guardian's root halves: the
-  pacman hook script records how each review ended (`PASSED`, `PERMITTED`
-  or `BLOCKED`) after the review process, which runs as you, has exited,
-  and permits and the sweep's allow list are written through sudo. No user
-  process can write those. A pacman install with a `[root]` line and no
+  that looks the same**. A `you` line means "written by your user", not
+  "written by Guardian". A program that ran as you can add false lines; it
+  cannot take a true one away, and it cannot write a `root` line.
+- `root` lines were written by Guardian's root halves: the pacman hook
+  script records how each review ended (`PASSED`, `PERMITTED` or
+  `BLOCKED`) after the review process, which runs as you, has exited, and
+  permits and the sweep's allow list are written through sudo. No user
+  process can write those. A pacman install with a `root` line and no
   review line beside it, or the reverse, is worth a look.
-- `log` marks an entry sent by another user (`[! written by user N]`) and
-  one that did not arrive the way Guardian sends them (through
-  `/usr/bin/logger` to journald's own socket). Entries written under the
-  test harnesses are marked `[test]`.
+- At the end of a line, `log` marks an entry that did not arrive the way
+  Guardian sends them (through `/usr/bin/logger` to journald's own
+  socket), and one written under the test harnesses (`[test]`).
 - Entries written by root are in the system journal, which only root and
   members of the `systemd-journal`, `adm` or `wheel` group can read; run
   `sudo omarchy-guardian log` otherwise.
