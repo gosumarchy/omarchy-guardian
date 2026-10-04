@@ -13,7 +13,7 @@ use std::path::Path;
 use super::index::PackageIndex;
 use super::path::Search;
 use super::read::{self, Found, View};
-use super::tier::{Observed, Tier, classify};
+use super::tier::{self, Observed, Tier, classify};
 use super::{access, boot, commands, config, own, path};
 use crate::autorun::{Category, Kind, Location, SYSTEM, SYSTEM_SWEEP, USER};
 use crate::content::{self, Content};
@@ -62,6 +62,10 @@ pub const WITHHELD: &str = "root-only file (hashed, content withheld)";
 /// commands nobody followed), and where its text is not reviewed either,
 /// the sweep counts as incomplete.
 pub const NOT_ALL_FOLLOWED: &str = "not all of what it runs was followed: ";
+
+/// What stands for the content of a packaged script whose interpreter line
+/// alone was rewritten.
+const PACKAGED_SCRIPT: &str = "packaged script (not read again)";
 
 /// Where `at` keeps its jobs.
 const AT_SPOOL: &str = "var/spool/atd/";
@@ -508,6 +512,7 @@ pub fn item_of(
                 sha256,
                 mode: *mode,
                 size: *size,
+                content: whole(*size, head),
             };
             (
                 classify(&path, observed, scope.index),
@@ -558,6 +563,14 @@ pub fn item_of(
         Body::Text(_) if path.starts_with(AT_SPOOL) => (Body::Binary(WITHHELD), Vec::new()),
         body => (body, runs),
     };
+    // A packaged script whose interpreter line alone was rewritten is its
+    // package's content from the second line on (see `tier`): it is said,
+    // and read no more than any other file a package installed.
+    let rewritten = tier::interpreter_note(&path, tier, scope.index);
+    let body = match body {
+        Body::Text(_) if rewritten.is_some() => Body::Binary(PACKAGED_SCRIPT),
+        body => body,
+    };
     // As root, what was reached by following (a command, a link, a
     // preload, a live check) can be steered by any user (a crontab line, an
     // `LD_PRELOAD` value) at `/etc/shadow` or a key. Its content is never
@@ -575,6 +588,7 @@ pub fn item_of(
     };
     let mut notes = notes(scope, category, &path, &body, run_by);
     notes.extend(limits(scope, category, &path, &body, found));
+    notes.extend(rewritten.map(str::to_string));
     let alerts = settings_alerts(scope, category, &path, tier, &body);
     Item {
         // The root collector's items are all root's, its home included.
@@ -710,18 +724,28 @@ fn declares_alias(scope: &Scope<'_>, unit: &str, name: &str) -> bool {
 fn self_tier(scope: &Scope<'_>, path: &str) -> Option<Tier> {
     match look_past_link(scope, path) {
         Found::File {
-            sha256, mode, size, ..
+            sha256,
+            mode,
+            size,
+            head,
         } => Some(classify(
             path,
             Observed::File {
                 sha256: &sha256,
                 mode,
                 size,
+                content: whole(size, &head),
             },
             scope.index,
         )),
         Found::Link(_) | Found::Other | Found::Unreadable(_) => None,
     }
+}
+
+/// The whole content of a file of `size` bytes, when `head` (the first
+/// bytes kept while it was hashed) holds all of it.
+fn whole(size: u64, head: &[u8]) -> Option<&[u8]> {
+    (head.len() as u64 == size).then_some(head)
 }
 
 fn body_of(path: &str, size: u64, head: &[u8]) -> Body {

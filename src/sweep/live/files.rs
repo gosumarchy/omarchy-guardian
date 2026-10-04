@@ -23,7 +23,7 @@ use crate::autorun::Category;
 use crate::sweep::collect::{Body, Item, Origin, Scope};
 use crate::sweep::index::Recorded;
 use crate::sweep::read::{self, View};
-use crate::sweep::tier::Tier;
+use crate::sweep::tier::{self, Tier};
 
 /// The most bytes read to compare the files the live checks vouch for
 /// (running programs, preloads, loaded modules) with their packages.
@@ -47,7 +47,7 @@ struct Place {
 const PLACES: &[Place] = &[
     Place {
         directory: "usr/bin",
-        category: Category::LocalBin,
+        category: Category::Program,
         wanted: |_| true,
     },
     Place {
@@ -189,7 +189,13 @@ pub(super) fn check(scope: &Scope<'_>, found: &mut Found) {
         found.cut_short = true;
     }
     for item in changed(scope, &candidates) {
-        keep(found, item);
+        if item.tier == Tier::Modified {
+            keep(found, item);
+        } else {
+            // Its package's content under a rewritten interpreter line:
+            // listed as that, with no alert.
+            found.items.entry(item.path.clone()).or_insert(item);
+        }
     }
 }
 
@@ -306,7 +312,11 @@ fn changed(scope: &Scope<'_>, candidates: &[Candidate]) -> Vec<Item> {
         let mut changed = Vec::new();
         while let Some(candidate) = candidates.get(next.fetch_add(1, Ordering::Relaxed)) {
             let item = item_at(scope, candidate.category, &candidate.path);
-            if item.tier == Tier::Modified {
+            let rewritten = item
+                .notes
+                .iter()
+                .any(|note| tier::is_interpreter_note(note));
+            if item.tier == Tier::Modified || rewritten {
                 changed.push(item);
             }
         }
