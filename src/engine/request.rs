@@ -62,17 +62,24 @@ not concerning: the user's aliases, prompt, PATH and environment, keybindings, t
 monitors, starting the desktop's usual programs, and system tuning. Files listed in the \
 manifest but not supplied are unchanged package files or binaries Guardian hashed.";
 
-/// For the pacman classes only the install scriptlets are reviewed, so the
-/// model is told what is out of scope and what routine packaging looks
-/// like; without it, scriptlets that mention their own package's files
-/// came back inconclusive, and ones that set capabilities on their own
-/// helpers suspicious.
+/// For the pacman classes only the install scriptlets, the payload files
+/// that act on their own and the package's text files those name are
+/// reviewed, so the model is told what is out of scope and what routine
+/// packaging looks like; without it, scriptlets that mention their own
+/// package's files came back inconclusive, and ones that set capabilities
+/// on their own helpers suspicious.
 const SCRIPTLET_SCOPE: &str = " These are pacman packages about to be installed as root. For \
 each package you get its install scriptlet (paths ending in .INSTALL) and the files in its \
 payload that act on their own (named by their package path: pacman hooks, sudoers, polkit and \
 PAM rules, systemd units the package enables and generators, tmpfiles, sysusers, udev, \
-modprobe and binfmt rules, login scripts, autostart entries, cron jobs, D-Bus system services). \
-The packages' other files are installed as shipped and are not supplied. Judge what each \
+modprobe and binfmt rules, login scripts, autostart entries, cron jobs, D-Bus system services, \
+and from a package outside the official repositories also shell completions and certificate \
+authorities). A text file of the package that a scriptlet or one of those payload files names \
+by its path (a script it runs or hands to an interpreter, a file it sources or reads) is \
+supplied too; its first line says which file names it. Judge it as part of what that file \
+does. A named file that is a compiled program or other binary data is listed in the manifest \
+as not reviewed. The packages' other files are installed as shipped and are not supplied. \
+Judge what each \
 scriptlet does when pacman runs its functions (pre_install, post_install, pre_upgrade, \
 post_upgrade, pre_remove, post_remove), and what each payload file makes the system do. \
 Routine packaging is not concerning by itself: printing notes or instructions, creating system \
@@ -83,8 +90,9 @@ rules for its own devices, tmpfiles for its own directories, D-Bus and polkit po
 to its own service, sockets, D-Bus or varlink endpoints of its own services that local users \
 may connect to, and running programs the package itself installs. How the package's own \
 programs authorize what they are asked to do is not visible here and is out of scope: neither \
-flag it nor call it inconclusive. Files a scriptlet only \
-mentions, copies from its own package, or tells the user to run are out of scope; their \
+flag it nor call it inconclusive. Files that are not supplied are out of scope: a compiled \
+program of the package, a file another package or the system provides, or one the scriptlet \
+only tells the user to run; their \
 content not being supplied is not grounds for inconclusive. Return inconclusive only if what \
 the supplied files themselves do cannot be determined. Report suspicious behavior that reaches \
 beyond the package itself: downloading or executing code from elsewhere, obfuscated payloads, \

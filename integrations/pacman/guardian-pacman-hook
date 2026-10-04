@@ -9,6 +9,18 @@ export PATH
 
 GUARDIAN=/usr/bin/omarchy-guardian
 
+# The hook file is in libalpm's own hook directory, which pacman reads
+# whatever --hookdir it is given, so this script runs in every transaction
+# from the moment the package is installed. It reviews only once root has
+# turned protection on: enable-system-hook.sh leaves this link, in a
+# directory only root writes and at a path no package may ship. Until then
+# it reads the targets pacman hands it and lets the transaction go on.
+ENABLED=/etc/pacman.d/hooks/omarchy-guardian.hook
+if [ "$(id -u)" -eq 0 ] && [ ! -e "$ENABLED" ] && [ ! -L "$ENABLED" ]; then
+    while read -r _; do :; done
+    exit 0
+fi
+
 if [ ! -x "$GUARDIAN" ]; then
     printf '%s\n' "omarchy-guardian is not installed at $GUARDIAN" >&2
     exit 2

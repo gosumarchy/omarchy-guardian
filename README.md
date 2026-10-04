@@ -853,9 +853,13 @@ install gates and the system sweep off the same way. It leaves the pacman hook o
 pacman gate could not review with the current settings. `omarchy-guardian
 test` runs the two-sample reviewer test from the terminal.
 
-Installing the package activates nothing. `enable-system-hook.sh` links the
-pacman hook into `/etc/pacman.d/hooks/` and adds the theme interceptor to the
-invoking user's `~/.bashrc`.
+Installing the package activates nothing. The package ships its hook in
+libalpm's own hook directory (`/usr/share/libalpm/hooks/`), which pacman
+reads whatever `--hookdir` it is given, but the hook lets every transaction
+through until root has turned it on: `enable-system-hook.sh` links the hook
+into `/etc/pacman.d/hooks/` (the link is what turns it on; a hook of the same
+name there takes the place of the packaged one, so it still runs once) and
+adds the theme interceptor to the invoking user's `~/.bashrc`.
 
 The pacman hook refuses every transaction it cannot review. While any pacman
 class requires the AI review (`third-party-repo` and `local-package` under
@@ -878,15 +882,56 @@ grant privileges on their own:
   `doas.conf`, polkit rules and action policies, PAM rules, `ld.so.preload`
   and `ld.so.conf.d`;
 - systemd units a package enables itself (`*.wants/`, `*.requires/`,
-  `*.upholds/`), generators and presets, and units in `etc/systemd`, also
-  under `usr/local/lib`;
+  `*.upholds/`), generators and presets, and every unit in a directory
+  systemd reads ahead of `usr/lib/systemd`, where a unit stands in for the
+  system's own of that name: `etc/systemd`, `usr/local/lib/systemd/system`
+  and `user`, `usr/share/systemd/user` and `usr/local/share/systemd/user`;
 - tmpfiles, sysusers, binfmt, udev, modprobe and environment.d entries;
 - login scripts (`etc/profile.d`, xinitrc.d), autostart entries, cron jobs
   (`etc/crontab`, `var/spool/cron` and the `cron.*` directories) and D-Bus
   system services and policies;
 - `etc/gitconfig`, `etc/ssh/sshrc`, `etc/makepkg.conf.d`, and anything in
   `usr/local/bin` or `usr/local/sbin`, which comes before the system's own
-  programs on every `PATH`.
+  programs on every `PATH`;
+- what other programs read in at every start, where a package can add a file
+  without a file conflict: what uwsm sources at a graphical login
+  (`usr/share/uwsm/env.d` and `plugins`, `etc/xdg/uwsm`), Vim and Neovim
+  plugins (`plugin/`, `after/plugin/` and `ftdetect/` under
+  `usr/share/vim/vimfiles` and `usr/share/nvim/site`, `plugin/` of a
+  `pack/*/start/` package, `usr/share/nvim/runtime/plugin`, `etc/xdg/nvim`,
+  `etc/vimrc`; `autoload/`, `ftplugin/` and `syntax/` are read only when a
+  file or a command asks for them, and are not reviewed), makepkg's shell
+  library (`usr/share/makepkg`, sourced by every build, the AUR gate's
+  included), git's template hooks, PipeWire and WirePlumber configuration
+  (`etc/pipewire`, `*.conf.d` drop-ins), browser policy, preferences and
+  native-messaging hosts (Chromium, Chrome, Brave, Firefox), `at` jobs, and
+  the boot entry and kernel command line drop-ins (`limine-entry-tool.d`,
+  `etc/cmdline.d`);
+- certificate authorities in `etc/ca-certificates/trust-source`;
+- in `etc/skel`, the files that would run on their own in a new user's home
+  (`.bashrc`, `.config/hypr`, `.config/autostart` and the rest of the sweep's
+  user locations), not the whole tree.
+
+For a package that is not from an official repository, shell completions and
+functions (`usr/share/bash-completion/completions`, `etc/bash_completion.d`,
+`usr/share/zsh/site-functions`, fish's `vendor_completions.d` and
+`vendor_functions.d`) and `usr/share/ca-certificates/trust-source` are
+reviewed too: an interactive shell, root's included, reads them in. For
+official packages they are not, since hundreds ship a completion file and
+the Mozilla trust bundle is a megabyte of certificates.
+
+A text file of the package that the scriptlet or one of those files names is
+reviewed with it: the script a hook hands to an interpreter
+(`Exec = /usr/bin/sh /usr/share/pkg/run.sh`), a program a scriptlet calls
+(`post_install() { /usr/lib/pkg/setup.sh; }`, or by a bare name the package
+ships in `usr/bin`), a file a login script sources, a udev `RUN+=` program,
+a cron command. Every word of the file is looked at, not only the first of
+a command, and what the named files name is followed in turn, three files
+deep and 500 files per package at most. A named file that is a compiled
+program or other binary data is not read: it is listed as not reviewed, to
+you and to the AI. A named text file over 2 MiB, or more files or steps than
+those bounds, makes the review incomplete. A path a script builds at run
+time (`cd /usr/lib/pkg && ./setup.sh`) is not found.
 
 A package that ships a symbolic link in place of one of those directories
 (`etc/cron.d -> /usr/share/x`) is refused: what the link leads to would be
@@ -907,13 +952,18 @@ or directory under `/usr`, `/etc` or `/opt` that everyone (a sticky
 directory aside), a user other than root, or a group other than root's may
 write. Each is passed over when the installed file is already that way: for
 file capabilities, when it has exactly the ones the package ships (access
-lists are not read back, so those are said every time).
+lists are not read back, so those are said every time). A package that is
+not from an official repository and brings a new file into a place whose
+content cannot be reviewed and that every login, program or boot uses (a PAM
+module in `usr/lib/security`, a library in `usr/lib/glibc-hwcaps`,
+`etc/default/limine`, `etc/kernel/cmdline`, `boot/limine.conf`) gets the
+same finding; official packages ship PAM modules, so those are let through.
 
 A package that installs a file under `/run`, `/tmp`, `/dev`, `/proc`, `/sys`,
-`/root` or `/home`, or lists one under `/bin`, `/sbin`, `/lib` or `/lib64`
-(links into `/usr` on this system), is refused: no package's files belong
-there, and a unit under `/run/systemd` or a key under `/root/.ssh` would act
-with nothing looking at it.
+`/root` or `/home`, or lists one under `/bin`, `/sbin`, `/lib`, `/lib64`,
+`/usr/sbin` or `/usr/lib64` (links into `/usr` on this system), is refused:
+no package's files belong there, and a unit under `/run/systemd` or a key
+under `/root/.ssh` would act with nothing looking at it.
 
 An auto-run file that is a symbolic link to a file the package does not
 ship (a sudoers drop-in linked to `/usr/lib/other/rule`) is reviewed as
@@ -927,11 +977,21 @@ only noted. A link to a file that neither has, one someone else can
 change, or one the transaction puts there as something else, makes the
 review incomplete.
 
+The other way round counts too: when a package replaces a file that a
+symbolic link already in one of those locations leads to (another package's
+`etc/sudoers.d/a -> /usr/share/b/rule`, or a unit you enabled with
+`systemctl enable`), the new content is reviewed as that link's file, unless
+it is identical to what is installed. The links are read from the system
+itself; in a directory only root can list (`/etc/sudoers.d`,
+`/etc/polkit-1/rules.d`) they are read from pacman's record of the packages
+that ship into it, so a link root made there by hand is not seen.
+
 What the gate does not see: a package's other files are installed as shipped
 and acted on by what is already on the system (a pacman hook, DKMS or a
 systemd generator installed earlier reads the new package's files without a
 review of them), a removal is not reviewed, and a unit a package ships but
-that you enable yourself later is not reviewed then (the sweep lists it).
+that you enable yourself later is not reviewed then (the sweep lists it; its
+later upgrades are reviewed, through the link that enables it).
 
 On an upgrade, an auto-run file identical to the installed one is not reviewed
 again, since it adds nothing new: a point release typically brings a handful of
@@ -939,7 +999,10 @@ changed files, not every unit and rule. A link that enables a unit counts as
 identical only while the unit it leads to is. These files go to the AI review only;
 the local pattern rules are written for scripts and would match the ordinary
 content of these files. Binaries among them (generators, for example) are
-listed as not reviewed. The rest of the payload is not reviewed.
+listed as not reviewed. A file the reviewed ones name is passed over the
+same way when it did not change and every file that names it is passed over;
+one the scriptlet names is reviewed every time, since the scriptlet runs
+anew. The rest of the payload is not reviewed.
 
 Archives are located as follows:
 
@@ -953,24 +1016,52 @@ Archives are located as follows:
 - A transaction given `--root`, `--dbpath`, `--cachedir`, `--sysroot`,
   `--hookdir` or `--gpgdir` (or `-r`, `-b`), or a `--config` other than
   `/etc/pacman.conf` (which yay names on every call), is refused: it runs
-  against another system than the one Guardian reads.
+  against another system than the one Guardian reads. With `--hookdir`
+  pacman leaves out `/etc/pacman.d/hooks`, so the refusal comes from the
+  hook in libalpm's own directory, which it always reads.
 
-Guardian's own program, hook and scripts may only come from the
+Each archive must still be the reviewed one when the review is over. Its
+path must name the same file, with the size and the times of last write and
+last change (the kernel's own, to the nanosecond) it had when it was first
+read, and unless the file and every directory above it are root's alone
+(pacman's cache), its SHA-256, taken before anything is read from it, must
+match again after the AI review has returned: an archive in your own
+directory rewritten in place during the AI's minutes blocks the transaction.
+Hashing runs at about 175 MiB per second, so a 1 GiB archive adds some
+twelve seconds for the two passes. What no hook can close is the moment
+between the hook's exit and pacman opening the file again: keep archives you
+install with `pacman -U` where only you and root can write, which the hook
+also checks.
+
+Guardian's own program, hooks and scripts may only come from the
 `omarchy-guardian` package installed from a local archive (as `install.sh`
 does) or an official repository, never from a third-party repository that
-offers a package of that name. A package that declares it replaces,
-conflicts with or provides `omarchy-guardian` is refused, since pacman would
-remove Guardian for it. A local archive of that name is still taken at its
-word: build Guardian only from a source you trust.
+offers a package of that name: such a package is refused by its name alone,
+whatever it ships, and so is one of that name from anywhere that no longer
+ships Guardian's program and hook script (an empty "upgrade" would delete
+the gate). A package named `claude-code` or `opencode` is refused the same
+way unless it comes from an official repository or is named in `[pacman]
+trusted_reviewer_packages`. A package that declares it replaces, conflicts
+with or provides `omarchy-guardian` is refused, since pacman would remove
+Guardian for it; one that claims the place of a reviewer package is refused
+unless it could ship the reviewer itself. No package may ship what the
+reviewer would read as its own instructions or settings: `etc/opencode`,
+`etc/claude-code`, and `AGENTS.md`, `CLAUDE.md`, `CONTEXT.md`,
+`opencode.json`, `.opencode` or `.claude` in `/usr` or `/`. A local archive
+named `omarchy-guardian` is still taken at its word: build Guardian only
+from a source you trust.
 
 The AI review is told what is under review (the scriptlets and those payload
 files) and what routine packaging looks like: capabilities or setuid on the
 package's own files, system users, copying its own files into place, its own
 services, sockets and device rules, and privileges that only apply once an
 administrator opts in (a dedicated, initially empty group, or a boot
-credential). Files a scriptlet only mentions, and how the package's own
-programs authorize requests, are out of scope and not grounds for an
-inconclusive verdict. It still flags downloading or running code from
+credential). The package's text files that a scriptlet or payload file
+names are supplied and judged with it. Files that are not supplied (a
+compiled program, a file another package provides, one the scriptlet only
+tells you to run), and how the package's own programs authorize requests,
+are out of scope and not grounds for an inconclusive verdict. It still flags
+downloading or running code from
 elsewhere, sudoers, polkit or PAM rules that grant root broadly or without
 authentication, pacman hooks or login and autostart scripts that run unrelated
 code, preloaded libraries, persistence the package does not own, and access to
@@ -1160,9 +1251,13 @@ yay --makepkg /usr/bin/makepkg --save -P --stats
 sudo pacman -R omarchy-guardian
 ```
 
-Removing the package removes the hook link. A hook at the same path that was
+Removing the package removes the hook link, and with the package's files
+the hook in `/usr/share/libalpm/hooks/`. A hook at the link's path that was
 installed by hand and runs Guardian is moved to
 `/etc/pacman.d/hooks/omarchy-guardian.hook.pacsave`, which pacman ignores.
+To turn the pacman gate off without removing the package, remove the link
+(`omarchy-guardian protect --off` does): the packaged hook then lets every
+transaction through.
 Turn the theme & plugin gate off in the TUI (or delete the marked Guardian line from
 `~/.bashrc` and the `guardian-theme` and `guardian-plugin` lines from the Omarchy
 menu file) to stop theme and plugin interception.

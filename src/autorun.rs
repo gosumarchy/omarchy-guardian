@@ -17,9 +17,11 @@ pub enum Category {
     Autostart,
     Boot,
     BootConfig,
+    Browser,
     Cron,
     Dbus,
     Desktop,
+    Editor,
     Environment,
     Git,
     Hyprland,
@@ -38,6 +40,7 @@ pub enum Category {
     Sudo,
     Systemd,
     SystemdGenerator,
+    Trust,
     Udev,
     /// What runs now, found by the sweep's live checks.
     Process,
@@ -49,13 +52,15 @@ pub enum Category {
 }
 
 impl Category {
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 34] = [
         Self::Autostart,
         Self::Boot,
         Self::BootConfig,
+        Self::Browser,
         Self::Cron,
         Self::Dbus,
         Self::Desktop,
+        Self::Editor,
         Self::Environment,
         Self::Git,
         Self::Hyprland,
@@ -74,6 +79,7 @@ impl Category {
         Self::Sudo,
         Self::Systemd,
         Self::SystemdGenerator,
+        Self::Trust,
         Self::Udev,
         Self::Process,
         Self::Listener,
@@ -89,9 +95,11 @@ impl Category {
             Self::Autostart => "autostart",
             Self::Boot => "boot",
             Self::BootConfig => "boot-config",
+            Self::Browser => "browser",
             Self::Cron => "cron",
             Self::Dbus => "dbus",
             Self::Desktop => "desktop",
+            Self::Editor => "editor",
             Self::Environment => "environment",
             Self::Git => "git",
             Self::Hyprland => "hyprland",
@@ -110,6 +118,7 @@ impl Category {
             Self::Sudo => "sudo",
             Self::Systemd => "systemd",
             Self::SystemdGenerator => "systemd-generator",
+            Self::Trust => "trust",
             Self::Udev => "udev",
             Self::Process => "process",
             Self::Listener => "listener",
@@ -145,9 +154,11 @@ impl Category {
             Self::Autostart => "Autostart entries",
             Self::Boot => "Boot loader",
             Self::BootConfig => "Boot-time files (tmpfiles, sysusers)",
+            Self::Browser => "Browser policy and helper programs",
             Self::Cron => "Scheduled jobs (cron)",
             Self::Dbus => "D-Bus services and policy",
             Self::Desktop => "App launchers",
+            Self::Editor => "Editor plugins and start-up files",
             Self::Environment => "Session environment",
             Self::Git => "Git configuration",
             Self::Hyprland => "Hyprland configuration",
@@ -166,6 +177,7 @@ impl Category {
             Self::Sudo => "sudo",
             Self::Systemd => "systemd units",
             Self::SystemdGenerator => "systemd generators",
+            Self::Trust => "Trusted certificate authorities",
             Self::Udev => "udev rules",
             Self::Process => "Running programs",
             Self::Listener => "Programs listening on the network",
@@ -182,9 +194,11 @@ impl Category {
             Self::Autostart | Self::Hyprland => "runs when you log in",
             Self::Boot => "runs before the system starts",
             Self::BootConfig | Self::SystemdGenerator => "runs at every boot",
+            Self::Browser => "applies to every browser started",
             Self::Cron => "runs on a schedule",
             Self::Dbus => "runs when a program asks for it over D-Bus",
             Self::Desktop => "runs when you open the app",
+            Self::Editor => "runs when the editor starts",
             Self::Environment | Self::Linker => "applies to every program started",
             Self::Git => "runs on git commands",
             Self::Initramfs => "runs at every kernel update and boot",
@@ -198,6 +212,7 @@ impl Category {
             Self::Power => "runs on sleep, resume and shutdown",
             Self::Shell => "runs in every shell",
             Self::Systemd => "runs as a service",
+            Self::Trust => "decides which servers every program trusts",
             Self::Udev => "runs when a device appears",
             Self::Process => "running now",
             Self::Listener => "accepts connections from the network",
@@ -478,14 +493,26 @@ pub const SYSTEM: &[Location] = &[
         Kind::Directory,
         Category::SystemdGenerator,
     ),
+    // Ahead of /usr/lib/systemd in systemd's search path: a unit here
+    // stands in for the system's own of that name, enabled or not.
     location(
         "usr/local/lib/systemd/system/",
-        Kind::Units,
+        Kind::Directory,
         Category::Systemd,
     ),
     location(
         "usr/local/lib/systemd/user/",
-        Kind::Units,
+        Kind::Directory,
+        Category::Systemd,
+    ),
+    location(
+        "usr/local/share/systemd/user/",
+        Kind::Directory,
+        Category::Systemd,
+    ),
+    location(
+        "usr/share/systemd/user/",
+        Kind::Directory,
         Category::Systemd,
     ),
     location(
@@ -601,9 +628,203 @@ pub const SYSTEM: &[Location] = &[
         Kind::Directory,
         Category::SystemdGenerator,
     ),
+    // What uwsm sources before it starts the graphical session.
+    location("usr/share/uwsm/env.d/", Kind::Directory, Category::Shell),
+    location("usr/share/uwsm/plugins/", Kind::Directory, Category::Shell),
+    location("etc/xdg/uwsm/", Kind::Directory, Category::Shell),
+    // What Vim and Neovim read at every start: `plugin/` (also under
+    // `after/` and in a `pack/*/start/` package) and `ftdetect/`. The
+    // other runtime directories (`autoload/`, `ftplugin/`, `syntax/`) are
+    // read only once a file or a command asks for them, like any program a
+    // package ships.
+    location(
+        "usr/share/nvim/site/plugin/",
+        Kind::Directory,
+        Category::Editor,
+    ),
+    location(
+        "usr/share/nvim/site/after/plugin/",
+        Kind::Directory,
+        Category::Editor,
+    ),
+    location(
+        "usr/share/nvim/site/ftdetect/",
+        Kind::Directory,
+        Category::Editor,
+    ),
+    location(
+        "usr/share/nvim/site/pack/*/start/*/plugin/*",
+        Kind::Glob,
+        Category::Editor,
+    ),
+    location(
+        "usr/share/nvim/runtime/plugin/",
+        Kind::Directory,
+        Category::Editor,
+    ),
+    location("usr/share/nvim/sysinit.vim", Kind::File, Category::Editor),
+    location("etc/xdg/nvim/", Kind::Directory, Category::Editor),
+    location(
+        "usr/share/vim/vimfiles/plugin/",
+        Kind::Directory,
+        Category::Editor,
+    ),
+    location(
+        "usr/share/vim/vimfiles/after/plugin/",
+        Kind::Directory,
+        Category::Editor,
+    ),
+    location(
+        "usr/share/vim/vimfiles/ftdetect/",
+        Kind::Directory,
+        Category::Editor,
+    ),
+    location(
+        "usr/share/vim/vimfiles/pack/*/start/*/plugin/*",
+        Kind::Glob,
+        Category::Editor,
+    ),
+    location("etc/vimrc", Kind::File, Category::Editor),
+    // What the boot entries and the kernel command line are built from.
+    location(
+        "usr/share/limine-entry-tool.d/",
+        Kind::Directory,
+        Category::Boot,
+    ),
+    location("etc/limine-entry-tool.d/", Kind::Directory, Category::Boot),
+    location("etc/cmdline.d/", Kind::Directory, Category::Boot),
+    // Certificate authorities every program then trusts.
+    location(
+        "usr/share/ca-certificates/trust-source/",
+        Kind::Directory,
+        Category::Trust,
+    ),
+    location(
+        "etc/ca-certificates/trust-source/",
+        Kind::Directory,
+        Category::Trust,
+    ),
+    // Hooks git copies into every repository it creates or clones.
+    location(
+        "usr/share/git-core/templates/hooks/",
+        Kind::Directory,
+        Category::Git,
+    ),
+    // The shell library every makepkg run sources, Guardian's AUR gate
+    // included.
+    location("usr/share/makepkg/", Kind::Directory, Category::Shell),
+    // Completions and functions an interactive shell reads in, root's too.
+    location("etc/bash_completion.d/", Kind::Directory, Category::Shell),
+    location(
+        "usr/share/bash-completion/completions/",
+        Kind::Directory,
+        Category::Shell,
+    ),
+    location(
+        "usr/share/zsh/site-functions/",
+        Kind::Directory,
+        Category::Shell,
+    ),
+    location(
+        "usr/share/fish/vendor_functions.d/",
+        Kind::Directory,
+        Category::Shell,
+    ),
+    location(
+        "usr/share/fish/vendor_completions.d/",
+        Kind::Directory,
+        Category::Shell,
+    ),
+    // The sound server's configuration can start programs
+    // (`context.exec`) and load modules.
+    location(
+        "usr/share/pipewire/*.conf.d/*",
+        Kind::Glob,
+        Category::Autostart,
+    ),
+    location("etc/pipewire/", Kind::Directory, Category::Autostart),
+    location(
+        "usr/share/wireplumber/*.conf.d/*",
+        Kind::Glob,
+        Category::Autostart,
+    ),
+    location("etc/wireplumber/", Kind::Directory, Category::Autostart),
+    // Browser policy (extensions to install, a proxy, certificates),
+    // start-up preferences, and the programs a browser starts for an
+    // extension.
+    location("etc/chromium/policies/", Kind::Directory, Category::Browser),
+    location(
+        "etc/opt/chrome/policies/",
+        Kind::Directory,
+        Category::Browser,
+    ),
+    location("etc/brave/policies/", Kind::Directory, Category::Browser),
+    location(
+        "etc/chromium/native-messaging-hosts/",
+        Kind::Directory,
+        Category::Browser,
+    ),
+    location(
+        "etc/opt/chrome/native-messaging-hosts/",
+        Kind::Directory,
+        Category::Browser,
+    ),
+    location(
+        "usr/share/chromium/extensions/",
+        Kind::Directory,
+        Category::Browser,
+    ),
+    location("etc/firefox/policies/", Kind::Directory, Category::Browser),
+    location(
+        "usr/lib/firefox/distribution/",
+        Kind::Directory,
+        Category::Browser,
+    ),
+    location(
+        "usr/lib/firefox/defaults/pref/",
+        Kind::Directory,
+        Category::Browser,
+    ),
+    location(
+        "usr/lib/firefox/browser/defaults/preferences/",
+        Kind::Directory,
+        Category::Browser,
+    ),
+    location(
+        "usr/lib/mozilla/native-messaging-hosts/",
+        Kind::Directory,
+        Category::Browser,
+    ),
+    location(
+        "usr/lib/mozilla/extensions/",
+        Kind::Directory,
+        Category::Browser,
+    ),
+    // Jobs handed to `at`.
+    location("var/spool/atd/", Kind::Directory, Category::Cron),
+    location("var/spool/at/", Kind::Directory, Category::Cron),
 ];
 
-/// System locations no package should ship into, looked at by the sweep only.
+/// Locations in `SYSTEM` that the pacman gate reviews only for a package
+/// that is not from an official repository. Hundreds of official packages
+/// ship a completion file, and the Mozilla trust bundle is a megabyte of
+/// certificates: reviewing those tells nothing, while a third-party or
+/// locally built package that drops a file there is the case to look at.
+/// The sweep looks at all of them either way.
+const UNOFFICIAL_ONLY: &[&str] = &[
+    "etc/bash_completion.d/",
+    "usr/share/bash-completion/completions/",
+    "usr/share/zsh/site-functions/",
+    "usr/share/fish/vendor_functions.d/",
+    "usr/share/fish/vendor_completions.d/",
+    "usr/share/ca-certificates/trust-source/",
+];
+
+/// System locations the sweep looks at and the pacman gate does not review:
+/// what is in them is a compiled library or the boot loader's own
+/// configuration. A package from an official repository ships some of them
+/// (`pam` its modules); for any other package a new file here is a finding
+/// (see `sweep_only_location`).
 pub const SYSTEM_SWEEP: &[Location] = &[
     // PAM modules: a `.so` every login loads.
     location("usr/lib/security/", Kind::Directory, Category::Pam),
@@ -741,7 +962,13 @@ impl Location {
     }
 }
 
-/// The system location a canonical package path falls under, if any.
+/// What every new user's home directory is copied from.
+const SKEL: &str = "etc/skel/";
+
+/// The system location a canonical package path falls under, if any. A
+/// file under `/etc/skel` is what it will be in a new user's home: the
+/// start-up files and directories of `USER` there, not the whole tree
+/// (Omarchy ships thousands of editor plugin files in it).
 pub fn system_location(path: &str) -> Option<&'static Location> {
     if path
         .split('/')
@@ -749,13 +976,40 @@ pub fn system_location(path: &str) -> Option<&'static Location> {
     {
         return None;
     }
-    SYSTEM.iter().find(|location| location.contains(path))
+    SYSTEM
+        .iter()
+        .find(|location| location.contains(path))
+        .or_else(|| {
+            let home = path.strip_prefix(SKEL)?;
+            USER.iter().find(|location| location.contains(home))
+        })
 }
 
 /// Whether the file at `path` (a canonical package path) runs or grants
 /// privileges on its own.
 pub fn is_auto_run(path: &str) -> bool {
     system_location(path).is_some()
+}
+
+/// Whether the pacman gate reviews the file at `path` for a package that
+/// is (`official`), or is not, from an official repository (see
+/// `UNOFFICIAL_ONLY`).
+pub fn is_reviewed(path: &str, official: bool) -> bool {
+    system_location(path)
+        .is_some_and(|location| !(official && UNOFFICIAL_ONLY.contains(&location.path)))
+}
+
+/// The sweep-only location a canonical package path falls under, if any:
+/// where a package that is not from an official repository has no
+/// business shipping a file.
+pub fn sweep_only_location(path: &str) -> Option<&'static Location> {
+    if path
+        .split('/')
+        .any(|component| matches!(component, "" | "." | ".."))
+    {
+        return None;
+    }
+    SYSTEM_SWEEP.iter().find(|location| location.contains(path))
 }
 
 /// Whether the directory `link` may be a link to the directory `target`:
@@ -807,38 +1061,19 @@ pub fn is_auto_run_directory(path: &str) -> bool {
     })
 }
 
-/// The paths a hook or unit runs (`Exec =`, `ExecStart=` and friends),
-/// without systemd's `-@:+!` prefixes, relative to `/`.
-pub fn executed_paths(text: &str) -> Vec<String> {
-    text.lines()
-        .filter_map(|line| {
-            let (key, value) = line.split_once('=')?;
-            let key = key.trim();
-            let runs = key == "Exec"
-                || [
-                    "ExecStart",
-                    "ExecStartPre",
-                    "ExecStartPost",
-                    "ExecStop",
-                    "ExecStopPost",
-                    "ExecReload",
-                    "ExecCondition",
-                ]
-                .contains(&key);
-            if !runs {
-                return None;
-            }
-            let program = value
-                .trim()
-                .trim_start_matches(['-', '@', ':', '+', '!'])
-                .split_whitespace()
-                .next()?;
-            program
-                .strip_prefix('/')
-                .filter(|path| !path.is_empty())
-                .map(str::to_string)
-        })
-        .collect()
+/// What ends a word in a script, unit, rule or configuration file: blanks,
+/// quotes and the punctuation of a shell and of `Key=value` lines.
+const WORD_BREAKS: &str = "\"'`;|&()<>=,:${}[]\\!*?#";
+
+/// The words of `text` that may name a file: every run of characters
+/// between blanks, quotes and punctuation, wherever it stands on a line.
+/// An interpreter's script (`Exec = /usr/bin/sh /usr/share/pkg/run.sh`), a
+/// sourced file, a udev `RUN+=` program and a cron command are all words
+/// of their line; so is a path in a comment, which costs one more file
+/// read and misses nothing.
+pub fn named_words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|character: char| character.is_whitespace() || WORD_BREAKS.contains(character))
+        .filter(|word| !word.is_empty())
 }
 
 #[cfg(test)]
@@ -846,8 +1081,8 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        Category, Kind, SYSTEM, SYSTEM_SWEEP, USER, executed_paths, is_auto_run,
-        is_auto_run_directory, system_location,
+        Category, Kind, SYSTEM, SYSTEM_SWEEP, USER, is_auto_run, is_auto_run_directory,
+        is_reviewed, named_words, sweep_only_location, system_location,
     };
 
     #[test]
@@ -892,6 +1127,39 @@ mod tests {
             "etc/ssh/sshrc",
             "etc/makepkg.conf.d/foo.conf",
             "usr/local/bin/sudo",
+            // A unit ahead of the system's own stands in for it.
+            "usr/local/lib/systemd/system/sshd.service",
+            "usr/local/lib/systemd/user/pipewire.service",
+            "usr/local/share/systemd/user/pipewire.service",
+            "usr/share/systemd/user/pipewire.service",
+            "usr/share/uwsm/env.d/20-x",
+            "usr/share/uwsm/plugins/hyprland.sh",
+            "etc/xdg/uwsm/env",
+            "usr/share/nvim/site/plugin/x.lua",
+            "usr/share/nvim/site/pack/dist/start/x/plugin/x.vim",
+            "usr/share/vim/vimfiles/plugin/x.vim",
+            "usr/share/vim/vimfiles/after/plugin/x.vim",
+            "usr/share/vim/vimfiles/ftdetect/x.vim",
+            "etc/xdg/nvim/sysinit.vim",
+            "usr/share/limine-entry-tool.d/10-x.conf",
+            "etc/cmdline.d/x.conf",
+            "etc/ca-certificates/trust-source/anchors/x.crt",
+            "usr/share/ca-certificates/trust-source/x.p11-kit",
+            "usr/share/git-core/templates/hooks/post-checkout",
+            "usr/share/makepkg/tidy/x.sh",
+            "etc/bash_completion.d/x",
+            "usr/share/bash-completion/completions/foo",
+            "usr/share/zsh/site-functions/_foo",
+            "usr/share/fish/vendor_functions.d/ls.fish",
+            "etc/skel/.bashrc",
+            "etc/skel/.config/hypr/hyprland.conf",
+            "etc/skel/.config/autostart/x.desktop",
+            "usr/share/pipewire/pipewire.conf.d/x.conf",
+            "etc/pipewire/pipewire.conf",
+            "etc/chromium/policies/managed/x.json",
+            "usr/lib/mozilla/native-messaging-hosts/x.json",
+            "usr/lib/firefox/distribution/policies.json",
+            "var/spool/atd/a0000101",
         ] {
             assert!(is_auto_run(path), "{path}");
         }
@@ -903,14 +1171,67 @@ mod tests {
             "usr/lib/systemd/system/a.wants/b/c.service",
             "usr/lib/systemd/system/a.service.d/b/c.conf",
             "etc/sudoers.d/../../usr/bin/x",
-            "etc/skel/.bashrc",
-            "usr/share/bash-completion/completions/foo",
+            // Read once a file or a command asks for them, not at start.
+            "usr/share/vim/vimfiles/autoload/x.vim",
+            "usr/share/vim/vimfiles/ftplugin/x.vim",
+            "usr/share/nvim/site/pack/dist/opt/x/plugin/x.vim",
+            "usr/share/pipewire/pipewire.conf",
+            // Only what runs on its own in a new home, not all of it.
+            "etc/skel/.local/share/nvim/lazy/x/README.md",
+            "etc/skel/.config/app/settings.json",
             // Sweep-only locations are not part of the gate's review.
             "usr/lib/security/pam_x.so",
             "boot/limine.conf",
         ] {
             assert!(!is_auto_run(path), "{path}");
         }
+    }
+
+    #[test]
+    fn completions_and_the_trust_bundle_are_reviewed_for_other_than_official_packages() {
+        for path in [
+            "usr/share/bash-completion/completions/foo",
+            "usr/share/zsh/site-functions/_foo",
+            "usr/share/fish/vendor_completions.d/foo.fish",
+            "usr/share/fish/vendor_functions.d/ls.fish",
+            "etc/bash_completion.d/foo",
+            "usr/share/ca-certificates/trust-source/mozilla.trust.p11-kit",
+        ] {
+            assert!(is_reviewed(path, false), "{path}");
+            assert!(!is_reviewed(path, true), "{path}");
+        }
+        // Everything else is reviewed whoever ships it.
+        for path in [
+            "etc/sudoers.d/x",
+            "etc/skel/.bashrc",
+            "etc/ca-certificates/trust-source/anchors/x.crt",
+            "usr/share/vim/vimfiles/plugin/x.vim",
+        ] {
+            assert!(
+                is_reviewed(path, true) && is_reviewed(path, false),
+                "{path}"
+            );
+        }
+        assert!(!is_reviewed("usr/bin/foo", false));
+    }
+
+    #[test]
+    fn sweep_only_locations_are_known_to_the_gate() {
+        for (path, category) in [
+            ("usr/lib/security/pam_x.so", Category::Pam),
+            ("usr/lib/glibc-hwcaps/x86-64-v3/libc.so.6", Category::Linker),
+            ("etc/default/limine", Category::Boot),
+            ("etc/kernel/cmdline", Category::Boot),
+            ("boot/limine.conf", Category::Boot),
+        ] {
+            assert_eq!(
+                sweep_only_location(path).map(|found| found.category),
+                Some(category),
+                "{path}"
+            );
+        }
+        assert!(sweep_only_location("usr/lib/libc.so.6").is_none());
+        assert!(sweep_only_location("usr/lib/security/../x").is_none());
     }
 
     #[test]
@@ -1001,11 +1322,43 @@ mod tests {
     }
 
     #[test]
-    fn executed_scripts_are_found_in_hooks_and_units() {
-        let text = "[Action]\nExec = /usr/share/foo/run.sh --all\n[Service]\nExecStartPre=-/usr/lib/foo/pre\nExecStart=@/usr/bin/foo foo\nEnvironment=X=1\n";
+    fn every_word_of_a_line_may_name_a_file() {
+        let words = |text: &'static str| named_words(text).collect::<Vec<_>>();
+        // A program, with systemd's prefixes, and an interpreter's script.
         assert_eq!(
-            executed_paths(text),
-            ["usr/share/foo/run.sh", "usr/lib/foo/pre", "usr/bin/foo"]
+            words(
+                "ExecStartPre=-/usr/lib/foo/pre\nExec = /usr/bin/sh /usr/share/pkg/run.sh --all\n"
+            ),
+            [
+                "ExecStartPre",
+                "-/usr/lib/foo/pre",
+                "Exec",
+                "/usr/bin/sh",
+                "/usr/share/pkg/run.sh",
+                "--all"
+            ]
+        );
+        // Quotes, a variable before a path, a sourced file, a udev rule
+        // and a cron line.
+        assert_eq!(
+            words(
+                "post_install() { \"${pkgdir}/usr/lib/pkg/setup.sh\"; . /usr/share/pkg/env.sh; }"
+            ),
+            [
+                "post_install",
+                "pkgdir",
+                "/usr/lib/pkg/setup.sh",
+                ".",
+                "/usr/share/pkg/env.sh"
+            ]
+        );
+        assert_eq!(
+            words("ACTION==\"add\", RUN+=\"/usr/lib/pkg/plug %k\"\n"),
+            ["ACTION", "add", "RUN+", "/usr/lib/pkg/plug", "%k"]
+        );
+        assert_eq!(
+            words("*/5 * * * * root python3 /usr/lib/pkg/x.py"),
+            ["/5", "root", "python3", "/usr/lib/pkg/x.py"]
         );
     }
 }
