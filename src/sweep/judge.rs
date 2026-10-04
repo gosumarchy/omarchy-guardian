@@ -59,7 +59,8 @@ pub fn judge(
                 .push(finding(&label, 1, RuleId::ModifiedPackageFile, ""));
         }
         for (rule, seen) in &item.alerts {
-            report.findings.push(finding(&label, 1, *rule, seen));
+            let (line, seen) = located(seen);
+            report.findings.push(finding(&label, line, *rule, seen));
         }
         if news.contains(&label) {
             report.findings.push(finding(
@@ -450,6 +451,16 @@ fn is_key_type(word: &str) -> bool {
     word.starts_with("ssh-") || word.starts_with("ecdsa-") || word.starts_with("sk-")
 }
 
+/// The line an alert names (`line 4: …`, as `config::alerts` writes it)
+/// and what was seen there, so the finding points at the line and not at
+/// the top of the file; line 1 for an alert about the file as a whole.
+fn located(seen: &str) -> (usize, &str) {
+    seen.strip_prefix("line ")
+        .and_then(|rest| rest.split_once(": "))
+        .and_then(|(line, seen)| Some((line.parse().ok()?, seen)))
+        .unwrap_or((1, seen))
+}
+
 fn finding(path: &str, line: usize, rule: RuleId, excerpt: &str) -> LocalFinding {
     LocalFinding {
         path: path.to_string(),
@@ -520,7 +531,7 @@ fn fact(item: &Item, label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{fact, is_local_only, label, local_checks};
+    use super::{fact, is_local_only, label, local_checks, located};
     use crate::autorun::Category;
     use crate::report::Report;
     use crate::rules::RuleId;
@@ -595,6 +606,17 @@ mod tests {
             "Include /tmp/x\nProxyCommand /tmp/y\n",
         );
         assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn an_alert_is_reported_at_the_line_it_names() {
+        assert_eq!(
+            located("line 14: linker: every build runs a program"),
+            (14, "linker: every build runs a program")
+        );
+        // One about the file as a whole, or one that only reads like it.
+        assert_eq!(located("a drop-in overrides"), (1, "a drop-in overrides"));
+        assert_eq!(located("line x: y"), (1, "line x: y"));
     }
 
     #[test]

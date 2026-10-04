@@ -277,13 +277,17 @@ than root can write, the programs named like a command in `/usr/bin` are
 listed. One named like a command that asks for a password, fetches or
 installs (`sudo`, `su`, `doas`, `pkexec`, `run0`, `ssh`, `scp`, `git`,
 `gpg`, `pacman`, `yay`, `paru`, `makepkg`, `systemctl`, `loginctl`,
-`passwd`, `curl`, `wget`, a shell, `omarchy-guardian`) is a high finding
+`passwd`, `curl`, `wget`, a shell, `omarchy`, `omarchy-guardian`) is a high finding
 wherever it is; `python`, `node`, `claude`, `opencode` and the `omarchy-*`
 commands are one too, unless a version manager put them there: a mise shim
 (a link to mise itself, as trusted as that mise) or a program in mise's
 install directory or `~/.cargo/bin` is shown as `user-built` at most. A
 start-up file that puts the working directory (`.`, or an empty entry) or
-a temporary or cache directory on `PATH` is a finding on that file.
+a temporary or cache directory on `PATH` is a finding on that file. The
+file `protect` writes for the graphical session
+(`~/.config/uwsm/env.d/90-omarchy-guardian`) is Guardian's own while it is
+byte for byte what `protect` wrote, and shown only with `--all`; with
+anything else in it, it is a file like any other.
 
 **More that decides what runs.** These run nothing by themselves, so each
 has a plain local rule besides the review of its text:
@@ -312,7 +316,13 @@ has a plain local rule besides the review of its text:
   `profiles`, `automationProfile`, `shellArgs`), `git.path`, a proxy,
   switched-off certificate checks and a program it is told to run from a
   temporary or cache directory (the list of installed extensions is not
-  read);
+  read). Of the terminal's environment only the variables that change what
+  runs or is loaded count (`PATH`, `LD_PRELOAD`, `NODE_OPTIONS`,
+  `PYTHONPATH`, `BASH_ENV`, `GIT_SSH_COMMAND`, `GIT_CONFIG_*`, a proxy and
+  the like, or a compiler from outside the system's directories), not
+  `EDITOR`, `PAGER` or an app's own; and a Python interpreter in a virtual
+  environment a tool keeps under `~/.cache` (Poetry, uv, pre-commit) or
+  `~/.local/share/virtualenvs` is a project's ordinary one;
 - mise's configuration (what it sources, its hooks and tasks) and cargo's
   (`rustc-wrapper`, `linker`, `runner`, a credential provider, a replaced
   source or crate, a proxy, variables such as `LD_PRELOAD` under `[env]`),
@@ -323,8 +333,16 @@ has a plain local rule besides the review of its text:
   `node-options --require`, `yarnPath`, `plugins`, `preload`, `-toolexec`,
   `CC`), a proxy, certificate authorities of the file's own or switched-off
   checks (`strict-ssl`, `trusted-host`, `insecure`, `GOINSECURE`, a wide
-  `GOPRIVATE`). One that names a path in a temporary or cache directory,
-  or an `http://` address, says so. These hold registry tokens, so like
+  `GOPRIVATE`). What developers set every day is not one: a compiler or
+  linker by its name or from the system's directories (`linker = "clang"`,
+  the same in `rustflags`, `CC = "clang"` under `[env]`), the system's own
+  certificate bundle (`/etc/ssl`, `/etc/ca-certificates`,
+  `/usr/share/ca-certificates`), and for pip an index of a project's or a
+  company's own over HTTPS (`download.pytorch.org`): a pip index is a
+  finding when it is plain `http://`, a bare address, a name made to read
+  as another, or a host data is dropped off at. One that names a path in a
+  temporary or cache directory, or an `http://` address, says so, and each
+  finding names its line. These hold registry tokens, so like
   the SSH and git files they are checked locally and never sent to the AI
   (mise's and cargo's are reviewed, with secret-looking values taken out),
   and what is shown is the key, never the value; so are an editor's
@@ -348,7 +366,11 @@ SHA-256 fingerprint and comment, as `ssh-keygen -l` prints them, never the
 key), and every certificate authority added in
 `/etc/ca-certificates/trust-source/anchors` or
 `/usr/local/share/ca-certificates`. The files `TrustedUserCAKeys` and
-`AuthorizedPrincipalsFile` name are followed like a command. Once a sweep
+`AuthorizedPrincipalsFile` name are followed like a command. Past 200
+keys of one account the rest are one item ("N more keys", with a hash that
+moves when they do), and a key file over 1 MiB, which the SSH server reads
+all the same, is an item saying its keys are not listed: both are
+findings, since neither is how a key file looks. Once a sweep
 has looked at these, one that is new or changed at the next sweep is a
 high finding ("a key that may log in as you"), not only a line in
 `--diff`; allow the ones you know. The first sweep that sees them has
@@ -357,7 +379,9 @@ report (root's keys, the accounts, another account's key count), the
 daily root collector keeps its own record beside its results, where only
 root writes, and says itself which are new, for two days from when it
 first saw them: what your sweep remembers is a file of yours, and a
-program running as you could write a label into it ahead of time.
+program running as you could write a label into it ahead of time. The
+collector's very first run has no record to compare with and says so by
+sending no list; for that one run your sweep's own memory stands in.
 
 **Guardian's own units.** The daily sweep is a user unit, so a file in
 your home can replace it or change any line of it: a drop-in in
@@ -512,7 +536,8 @@ clean system shows nothing here:
   and every number a process may have, up to the kernel's limit (numbers
   start over when it is reached, so the last one handed out says little);
   were there ever more than can be tried, the newest are and the sweep says
-  so. A program named like a kernel thread (`[kworker/0:1]`); and, as
+  so, as it does of a share of the numbers its search did not get through.
+  A program named like a kernel thread (`[kworker/0:1]`); and, as
   root, a process root cannot read. Root also says when it cannot list the
   pinned eBPF objects;
 - a process attached to another the way a debugger is: high when the
@@ -647,7 +672,13 @@ is still what its package installed. The path must be one pacman's
 database holds, reached with no link on the way through directories that
 are root's alone, and the answer is that one bit, never the hash; what the
 package installed there is public anyway, and a package's configuration
-file is never reported this way. Without it, a changed program made
+file is never reported this way. Where such a path, in a directory not
+everyone may enter, holds no regular file at all, nothing is said either:
+"missing" would be a second thing told. So what a user can learn there by
+naming a path is that one bit, "a packaged file differs from its
+package", and a packaged file that is gone or is something else is left
+to the look through the system's own directories, which no user steers.
+Without it, a changed program made
 unreadable (`chmod o-r`) would pass for the packaged one. A packaged file
 that lost the read access its package gives everyone is `modified` in
 itself, for root and for your own sweep. And what the collector reads, in its
@@ -677,7 +708,12 @@ alone: root wrote the configuration that names it, and what comes back is
 what a home's key file gives. Of every
 other account with a home under `/home` only the number of keys comes back,
 with a hash of the list so that a change shows: whose keys they are is that
-account's to see, like its crontab. Root's own keys come back one by one.
+account's to see, like its crontab (a key file of theirs too large to
+read is said in that same line, and no more of it). Root's own keys come
+back one by one. Where there are more items than the results hold, root's
+own and the system's are kept first and what the accounts keep under
+`/home` after them, so an account that fills its home cannot push root's
+keys out.
 `/etc/shadow` is read for one thing, by its fixed name: whether a system
 account that has a login shell also has a password that works, yes or no.
 No hash leaves the collector.
@@ -789,7 +825,11 @@ through the list with your agent without waiting for the daily sweep.
   moment. It prints the fingerprint it allows, and where that is not what
   the last sweep showed you (the file changed since, or no sweep has
   listed it), it says so and asks on the terminal first; without a
-  terminal it allows nothing.
+  terminal it allows nothing. What the last sweep showed is read from the
+  sweep's own record, a file of yours: the question catches a file that
+  changed between your reading the sweep and allowing it, and nothing
+  more. A program running as you can rewrite that record to match, so the
+  fingerprint printed is what to go by.
 - Run `sweep allow` and `sweep forget` as yourself, without sudo: they ask
   for the password themselves. Run as root they stop with that advice,
   since an item in a home is allowed for the user who asks.

@@ -116,20 +116,42 @@ fn trust_seen_json(seen: &TrustSeen) -> String {
     .to_string()
 }
 
+/// Whether `item` is one an account keeps under `/home`, or was reached
+/// from one: that account decides how many of those there are.
+fn of_an_account(item: &Item) -> bool {
+    let at_home = |path: &str| path.starts_with("home/");
+    at_home(&item.path) || item.run_by.as_deref().is_some_and(at_home)
+}
+
+/// The items no package vouches for, in the order they are kept where
+/// there is room for only so many: root's own and the system's first, and
+/// what the accounts keep under `/home` after them. An account that fills
+/// its home with thousands of lines then crowds out its own, and never
+/// root's keys or a unit in `/etc`.
+fn in_keeping_order(items: &[Item]) -> impl Iterator<Item = &Item> {
+    let untrusted = |of_account: bool| {
+        items
+            .iter()
+            .filter(move |item| !item.is_trusted() && of_an_account(item) == of_account)
+    };
+    untrusted(false).chain(untrusted(true))
+}
+
 /// The paths among `items` of the accounts, group members, keys and trust
 /// anchors that are new to the collector at `now`: not in `seen`, or there
 /// with other content, for `NEW_FOR_SECS` from when that was first so.
-/// `seen` is brought up to date; with none yet (`None`), everything is
-/// remembered and nothing is news, as for any first look. What is gone is
-/// forgotten, so that one put back is new again.
-fn news(items: &[Item], seen: Option<TrustSeen>, now: u64) -> (Vec<String>, TrustSeen) {
+/// `seen` is brought up to date. With none yet, everything is remembered
+/// and the collector has nothing to say of what is new (`None`): the sweep
+/// that reads the results then goes by what it remembers itself, rather
+/// than hearing "nothing new" from a collector that could not know. What
+/// is gone is forgotten, so that one put back is new again.
+fn news(items: &[Item], seen: Option<TrustSeen>, now: u64) -> (Option<Vec<String>>, TrustSeen) {
     let first_look = seen.is_none();
     let before = seen.unwrap_or_default();
     let mut after = TrustSeen::new();
     let mut new = Vec::new();
-    for item in items
-        .iter()
-        .filter(|item| super::is_trust(item) && !item.is_trusted())
+    for item in in_keeping_order(items)
+        .filter(|item| super::is_trust(item))
         .take(MAX_TRUST_SEEN)
     {
         let fingerprint = state::fingerprint(item);
@@ -144,7 +166,7 @@ fn news(items: &[Item], seen: Option<TrustSeen>, now: u64) -> (Vec<String>, Trus
         }
         after.insert(item.path.clone(), (content, first));
     }
-    (new, after)
+    ((!first_look).then_some(new), after)
 }
 
 /// Where the scheduled root collector leaves what it found.
@@ -236,14 +258,14 @@ pub fn collect_command(out: bool, settings: &crate::config::Settings) -> ExitCod
     // What is new among the accounts, members, keys and trust anchors is
     // told from the collector's own record. Only the timer's run keeps
     // one; a run through sudo reads it where there is one and writes
-    // nothing, as it writes nothing else.
+    // nothing, as it writes nothing else. Without a record yet (the
+    // timer's first run too) the results carry no list.
     let now = std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
     let seen = read_trust_seen(Path::new(TRUST_SEEN));
-    let tracked = seen.is_some() || group.is_some();
     let (new, seen) = news(&collection.items, seen, now);
-    let json = to_json(&collection, &notes, tracked.then_some(new.as_slice())).to_string();
+    let json = to_json(&collection, &notes, new.as_deref()).to_string();
     match group {
         // Written as it is, for the sweep that asked to parse: a path
         // with a hidden character must stay the path it is.
@@ -465,7 +487,7 @@ pub fn results_problem(path: &Path, now: u64) -> Option<String> {
 }
 
 fn to_json(collection: &Collection, notes: &[String], news: Option<&[String]>) -> Json {
-    let untrusted = || collection.items.iter().filter(|item| !item.is_trusted());
+    let untrusted = || in_keeping_order(&collection.items);
     let mut truncated = collection.truncated.clone();
     let left_out = untrusted().count().saturating_sub(MAX_ITEMS);
     if left_out > 0 {
@@ -1309,6 +1331,60 @@ mod tests {
     }
 
     #[test]
+    fn an_accounts_flood_of_items_leaves_roots_and_the_systems_in() {
+        // More lines in a home than the results hold: sorted by path they
+        // would come before `root/`, `usr/` and `var/`.
+        let mut items: Vec<Item> = (0..super::MAX_ITEMS + 10)
+            .map(|index| {
+                let mut key = item(
+                    &format!("home/u/.ssh/authorized_keys#{index:06}"),
+                    Origin::Root,
+                    Tier::Unknown,
+                    Body::Text("junk".into()),
+                );
+                key.category = Category::Account;
+                key.run_by = None;
+                key
+            })
+            .collect();
+        let mut followed = item(
+            "opt/x/run",
+            Origin::Root,
+            Tier::Unknown,
+            Body::Text("x".into()),
+        );
+        followed.run_by = Some("home/u/.bashrc".into());
+        items.push(followed);
+        for path in ["root/.ssh/authorized_keys#aa", "var/spool/cron/root"] {
+            let mut own = item(path, Origin::Root, Tier::Unknown, Body::Text("x".into()));
+            own.category = Category::Account;
+            own.run_by = None;
+            items.push(own);
+        }
+        let collection = Collection {
+            items,
+            ..Collection::default()
+        };
+        let part = from_json(&to_json(&collection, &[], None).to_string()).unwrap();
+        assert_eq!(part.items.len(), super::MAX_ITEMS);
+        assert_eq!(part.items[0].path, "root/.ssh/authorized_keys#aa");
+        assert_eq!(part.items[1].path, "var/spool/cron/root");
+        assert!(
+            part.items[2..]
+                .iter()
+                .all(|item| item.path.starts_with("home/u/"))
+        );
+        assert!(
+            part.truncated[0].ends_with("13 were left out"),
+            "{:?}",
+            part.truncated
+        );
+        // The collector's record keeps the same order.
+        let (_, seen) = super::news(&collection.items, None, 1);
+        assert!(seen.contains_key("root/.ssh/authorized_keys#aa"));
+    }
+
+    #[test]
     fn the_collector_tells_what_is_new_from_its_own_record() {
         use crate::autorun::Category;
         let key = |name: &str, text: &str| {
@@ -1329,9 +1405,10 @@ mod tests {
             Body::Text("[Service]".into()),
         );
         let hour = 60 * 60;
-        // The first look remembers everything and calls nothing new.
+        // The first look remembers everything and has no list of what is
+        // new: the sweep that reads the results goes by its own memory.
         let (new, seen) = super::news(&[key("a", "one"), unit.clone()], None, 1000);
-        assert!(new.is_empty());
+        assert_eq!(new, None);
         assert_eq!(
             seen.keys().collect::<Vec<_>>(),
             ["root/.ssh/authorized_keys#a"]
@@ -1340,18 +1417,22 @@ mod tests {
         // so for two days, whatever the sweeps that read the results
         // remember.
         let items = [key("a", "other"), key("b", "two"), unit];
-        let (new, seen) = super::news(&items, Some(seen), 2000);
+        let news = |items: &[Item], seen, now| {
+            let (new, seen) = super::news(items, Some(seen), now);
+            (new.unwrap(), seen)
+        };
+        let (new, seen) = news(&items, seen, 2000);
         assert_eq!(
             new,
             ["root/.ssh/authorized_keys#a", "root/.ssh/authorized_keys#b"]
         );
-        let (new, seen) = super::news(&items, Some(seen), 2000 + 47 * hour);
+        let (new, seen) = news(&items, seen, 2000 + 47 * hour);
         assert_eq!(new.len(), 2);
-        let (new, seen) = super::news(&items, Some(seen), 2000 + 49 * hour);
+        let (new, seen) = news(&items, seen, 2000 + 49 * hour);
         assert!(new.is_empty());
         // One that went and came back is new again.
-        let (_, seen) = super::news(&items[..1], Some(seen), 2000 + 50 * hour);
-        let (new, seen) = super::news(&items, Some(seen), 2000 + 51 * hour);
+        let (_, seen) = news(&items[..1], seen, 2000 + 50 * hour);
+        let (new, seen) = news(&items, seen, 2000 + 51 * hour);
         assert_eq!(new, ["root/.ssh/authorized_keys#b"]);
         // The record is written and read back as it is; the results carry
         // the list only where a record was kept.
@@ -1363,6 +1444,10 @@ mod tests {
         };
         let part = from_json(&to_json(&collection, &[], Some(&new)).to_string()).unwrap();
         assert_eq!(part.news, Some(new));
+        // Without a record the results carry none, and the reader's own
+        // memory stands in.
+        let untracked = from_json(&to_json(&collection, &[], None).to_string()).unwrap();
+        assert_eq!(untracked.news, None);
         let mut merged = Collection::default();
         merge(&mut merged, part);
         assert_eq!(

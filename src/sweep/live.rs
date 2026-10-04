@@ -882,10 +882,17 @@ fn module_of(scope: &Scope<'_>, process: &Process, exe: &str) -> Option<Module> 
     }
     // Anything else of the module's first name where the process was
     // started may take its place in ways not followed here.
+    // The directory is the process's choice: where root may not look into
+    // it as everyone may, nothing is resolved, so that a module's file
+    // being named or not says nothing of what the directory holds.
     let top = module.split('.').next().unwrap_or(module);
-    let in_the_way = [format!("{cwd}/{top}"), format!("{cwd}/{top}.py")]
-        .iter()
-        .any(|path| fs::symlink_metadata(scope.root.join(path)).is_ok());
+    let mut in_the_way = false;
+    for name in [top.to_string(), format!("{top}.py")] {
+        match collect::holds(scope, cwd, &name, None) {
+            Some(held) => in_the_way |= held,
+            None => return Some(unresolved()),
+        }
+    }
     Some(Module {
         name: module.to_string(),
         file: packaged.filter(|_| !in_the_way),
@@ -3273,6 +3280,38 @@ mod tests {
             "",
         );
         assert_eq!(super::module_of(&scope, &script, "usr/bin/python3"), None);
+
+        // Root, led by a process into a directory not everyone may enter,
+        // names no file whether or not the module's name is in there: the
+        // answer would tell the process's user what the directory holds.
+        let as_root = Scope {
+            origin: Origin::Root,
+            ..scope
+        };
+        let rooted = |cwd: &str| {
+            let python = running(
+                "/usr/bin/python3",
+                &["python3", "-m", "http.server"],
+                Some(cwd),
+                "",
+            );
+            super::module_of(&as_root, &python, "usr/bin/python3")
+                .unwrap()
+                .file
+        };
+        fs::create_dir_all(root.join("home/u/open")).unwrap();
+        assert_eq!(rooted("home/u/open").as_deref(), Some(server));
+        for closed in ["home/u/closed", "home/u/closed-with"] {
+            fs::create_dir_all(root.join(closed)).unwrap();
+        }
+        write(root, "home/u/closed-with/http.py", "in the way");
+        for closed in ["home/u/closed", "home/u/closed-with"] {
+            fs::set_permissions(root.join(closed), fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(rooted(closed), None, "{closed}");
+        }
+        // One everyone may enter is looked into, directories included.
+        fs::create_dir_all(root.join("home/u/open/http")).unwrap();
+        assert_eq!(rooted("home/u/open"), None);
     }
 
     #[test]
@@ -3750,6 +3789,81 @@ mod tests {
     }
 
     #[test]
+    fn a_packaged_path_in_a_closed_directory_tells_one_bit_or_nothing() {
+        use std::os::unix::fs::MetadataExt;
+        let (dir, mut index) = system("live-out-of-sight", &[("usr/bin/same", "same")]);
+        let root = dir.path();
+        if fs::metadata(root).unwrap().uid() == 0 {
+            return;
+        }
+        // A package's libraries in a directory of root's alone: one that
+        // is as installed, one changed, one missing, one that is a
+        // directory now. And a missing one where everyone may look.
+        let entry = |path: &str, text: &str| {
+            format!(
+                "./{path} type=file mode=600 sha256digest={}\n",
+                Sha256::digest(text.as_bytes())
+            )
+        };
+        let closed =
+            ["same", "changed", "gone", "odd"].map(|name| format!("usr/lib/shut/{name}.so"));
+        let mut mtree = String::from("#mtree\n");
+        for path in &closed {
+            mtree.push_str(&entry(path, "library"));
+        }
+        mtree.push_str(&entry("usr/lib/open.so", "library"));
+        index.add_for_test("libs", &mtree, &[]);
+        write(root, "usr/lib/shut/same.so", "library");
+        write(root, "usr/lib/shut/changed.so", "trojan");
+        fs::create_dir_all(root.join("usr/lib/shut/odd.so")).unwrap();
+        for file in ["same", "changed"] {
+            let path = root.join(format!("usr/lib/shut/{file}.so"));
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        fs::set_permissions(root.join("usr/lib/shut"), fs::Permissions::from_mode(0o700)).unwrap();
+        let preload = format!(
+            "LD_PRELOAD=/{}:/usr/lib/open.so:/usr/lib/shut/unowned.so",
+            closed.join(":/")
+        );
+        process(root, "70", "/usr/bin/same", &[], &preload);
+        let live = look(root, &index, Origin::Root);
+        let named: Vec<(&str, &str)> = live
+            .items
+            .iter()
+            .filter(|item| item.path.starts_with("usr/lib/"))
+            .map(|item| (item.path.as_str(), item.tier.name()))
+            .collect();
+        // The changed one is told, the intact one is not, and neither are
+        // the two that would say what the closed directory holds. A path
+        // no package owns, and one in a directory anyone may list, are
+        // told as before.
+        assert_eq!(
+            named.iter().map(|(path, _)| *path).collect::<Vec<_>>(),
+            [
+                "usr/lib/open.so",
+                "usr/lib/shut/changed.so",
+                "usr/lib/shut/unowned.so"
+            ],
+            "{named:?}"
+        );
+        assert_eq!(named[1].1, "modified");
+        let scope = Scope {
+            root,
+            home: None,
+            index: &index,
+            origin: Origin::Root,
+        };
+        let unseen = crate::sweep::collect::packaged_out_of_sight;
+        assert!(unseen(&scope, "usr/lib/shut/gone.so"));
+        assert!(!unseen(&scope, "usr/lib/shut/unowned.so"));
+        assert!(!unseen(&scope, "usr/lib/open.so"));
+        // A directory somebody else may write is not root's alone.
+        fs::set_permissions(root.join("usr/lib/shut"), fs::Permissions::from_mode(0o720)).unwrap();
+        assert!(!unseen(&scope, "usr/lib/shut/gone.so"));
+        fs::set_permissions(root.join("usr/lib/shut"), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
     fn what_no_package_owns_where_programs_are_loaded_from_is_listed() {
         let (dir, mut index) = system(
             "live-installed",
@@ -3926,8 +4040,18 @@ mod tests {
         };
         assert_eq!(
             super::kernel::unlisted_among(&listed, 1..=400_000, &answers),
-            [(300_123, "hidden".to_string())]
+            (vec![(300_123, "hidden".to_string())], vec![])
         );
+        // A searcher that dies takes its share of the numbers with it:
+        // that share is named, not passed over as searched.
+        let dying = |pid: u32| {
+            assert!(pid != 300_500, "a searcher dies");
+            None
+        };
+        let (suspects, not_searched) = super::kernel::unlisted_among(&listed, 1..=400_000, &dying);
+        assert!(suspects.is_empty());
+        assert_eq!(not_searched.len(), 1);
+        assert!(not_searched[0].contains(&300_500));
         // The numbers go up to the kernel's limit, whatever is listed.
         let dir = TempDir::new("live-numbers");
         let root = dir.path();
@@ -3969,6 +4093,16 @@ mod tests {
         );
         let (notes, unchecked) = search(Origin::Root, 100);
         assert!(notes.is_empty() && unchecked.len() == 1, "{unchecked:?}");
+        let said = |origin| {
+            let mut found = super::Found::default();
+            super::kernel::say_not_searched(&scope(origin), &not_searched, &mut found);
+            (found.notes, found.unchecked)
+        };
+        let (notes, unchecked) = said(Origin::Root);
+        assert!(notes.is_empty() && unchecked.len() == 1);
+        assert!(unchecked[0].ends_with("that part of the search failed"));
+        let (notes, unchecked) = said(Origin::System);
+        assert!(unchecked.is_empty() && notes.len() == 1);
     }
 
     #[test]

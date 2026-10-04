@@ -152,11 +152,27 @@ pub fn commands(category: Category, path: &str, text: &str) -> Vec<String> {
         text
     };
     let mut found = Vec::new();
+    let mut cases = Vec::new();
     for line in text.lines() {
         let line = line.trim();
-        if line.starts_with('#') || line.starts_with(';') {
+        if line.starts_with('#') {
             continue;
         }
+        // A line of `;;` alone ends a `case` branch: the next is a pattern.
+        if line.starts_with(';') {
+            if category == Category::Shell && line.len() <= MAX_STARTED_LINE {
+                without_case_patterns(line, &mut cases);
+            }
+            continue;
+        }
+        // A `case` branch's pattern (`/*)`) is matched, not run.
+        let branches;
+        let line = if category == Category::Shell && line.len() <= MAX_STARTED_LINE {
+            branches = without_case_patterns(line, &mut cases);
+            branches.as_str()
+        } else {
+            line
+        };
         let expanded = crate::rules::with_variables(line, &variables);
         // A line that grew past what is looked at is read as written.
         let line = if expanded.len() > MAX_STARTED_LINE {
@@ -678,6 +694,130 @@ fn sourced(line: &str) -> Vec<String> {
         .map(|(_, pair)| pair[1].trim_matches(['"', '\'', ';']).to_string())
         .filter(|file| !file.is_empty())
         .collect()
+}
+
+/// `line` of a shell file without the patterns of its `case` branches
+/// (`pat)`, `a|b)`, `(pat)`), which are matched against a word and run
+/// nothing: `/*)` is no program, and neither are the directories it would
+/// name as a pattern of files. `cases` carries, from line to line and for
+/// each `case` that is open, whether a pattern comes next.
+///
+/// Only a pattern where the shell reads one is taken out (after `in` and
+/// after `;;` of a `case` that starts a statement), so a line that merely
+/// looks like one (`( ~/bin/x )` on its own, a subshell) stays a command.
+fn without_case_patterns(line: &str, cases: &mut Vec<bool>) -> String {
+    let mut kept = String::new();
+    for (index, piece) in line.split(";;").enumerate() {
+        if index > 0 {
+            kept.push_str(" ; ");
+            if let Some(next) = cases.last_mut() {
+                *next = true;
+            }
+        }
+        let mut rest = piece;
+        loop {
+            if cases.last() == Some(&true) {
+                let branch = rest
+                    .trim_start()
+                    .trim_start_matches(['&', ';'])
+                    .trim_start();
+                if is_word_at(branch, "esac") {
+                    cases.pop();
+                    rest = &branch["esac".len()..];
+                    continue;
+                }
+                // A comment after `;;` is not the next pattern.
+                if !branch.is_empty() && !branch.starts_with('#') {
+                    if let Some(end) = case_pattern_end(branch) {
+                        rest = &branch[end..];
+                    }
+                    if let Some(next) = cases.last_mut() {
+                        *next = false;
+                    }
+                }
+            }
+            // A `case` among this branch's commands (or the first one),
+            // and where one ends.
+            let opened = case_opening(rest);
+            let closed = word_position(rest, "esac").filter(|_| !cases.is_empty());
+            match (opened, closed) {
+                (Some(after), closed) if closed.is_none_or(|closed| after < closed) => {
+                    // What follows the patterns is a statement of its own.
+                    kept.push_str(&rest[..after]);
+                    kept.push_str(" ; ");
+                    rest = &rest[after..];
+                    cases.push(true);
+                }
+                (_, Some(closed)) => {
+                    kept.push_str(&rest[..closed]);
+                    rest = &rest[closed + "esac".len()..];
+                    cases.pop();
+                }
+                _ => break,
+            }
+        }
+        kept.push_str(rest);
+    }
+    kept
+}
+
+/// Whether `text` starts with the shell word `word`.
+fn is_word_at(text: &str, word: &str) -> bool {
+    text.strip_prefix(word).is_some_and(|rest| {
+        rest.chars()
+            .next()
+            .is_none_or(|next| next.is_whitespace() || ";&|)".contains(next))
+    })
+}
+
+/// Where the shell word `word` starts in `text`, as a word of its own.
+fn word_position(text: &str, word: &str) -> Option<usize> {
+    text.match_indices(word).map(|(at, _)| at).find(|at| {
+        is_word_at(&text[*at..], word)
+            && text[..*at]
+                .chars()
+                .next_back()
+                .is_none_or(|before| before.is_whitespace() || ";&|(".contains(before))
+    })
+}
+
+/// Where the patterns begin after a `case WORD in` in `text`. The `case`
+/// must start a statement: the word in an `echo` opens nothing, and so
+/// cannot make the lines after it read as patterns.
+fn case_opening(text: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(at) = word_position(&text[from..], "case").map(|at| at + from) {
+        from = at + "case".len();
+        let before = text[..at].trim_end();
+        let starts = before.is_empty()
+            || before.ends_with([';', '&', '|', '{', '(', ')'])
+            || ["then", "do", "else"].iter().any(|keyword| {
+                before.ends_with(keyword)
+                    && word_position(before, keyword) == Some(before.len() - keyword.len())
+            });
+        if !starts {
+            continue;
+        }
+        if let Some(after) = word_position(&text[from..], "in") {
+            return Some(from + after + "in".len());
+        }
+    }
+    None
+}
+
+/// Where a `case` pattern at the start of `branch` ends (past its `)`):
+/// alternatives with no blank in them, and no substitution or statement
+/// before the bracket.
+fn case_pattern_end(branch: &str) -> Option<usize> {
+    let open = usize::from(branch.starts_with('('));
+    let close = branch[open..].find(')')? + open;
+    let pattern = &branch[open..close];
+    let plain = !pattern.trim().is_empty()
+        && !pattern.contains(['(', ';', '&', '`'])
+        && pattern
+            .split('|')
+            .all(|alternative| !alternative.trim().contains(char::is_whitespace));
+    plain.then_some(close + 1)
 }
 
 /// The longest line of a start-up file looked through for programs, and
@@ -1695,6 +1835,23 @@ mod tests {
                 "~/bin/fifth",
                 "~/bin/sixth",
             ]
+        );
+        // A `case` branch's pattern is matched, not run (the shape of a
+        // packaged completion file): what its branches run still is.
+        let completion = "case \"$prev\" in\n--bundle | -b)\n\tcase \"$cur\" in\n\t*:*) ;; # TODO somehow (see above)\n\t'')\n\t\tCOMPREPLY=($(compgen -W '/' -- \"$cur\"))\n\t\t;;\n\t/*)\n\t\t_filedir\n\t\t;;\n\t/opt/* | /srv/*)\n\t\t/opt/tool/run\n\t\t;;\n\t(/var/*)\n\t\t;;\n\tesac\n\treturn\n\t;;\n/etc/*) ~/bin/branch ;; /usr/*) ;;\nesac\ncase $1 in /*) ~/bin/inline ;; esac\n";
+        assert_eq!(
+            commands(Category::Shell, "usr/share/completions/x", completion),
+            ["/opt/tool/run", "~/bin/branch", "~/bin/inline"]
+        );
+        // Only where a shell reads a pattern: a subshell that looks like
+        // one, and a `case` that is a word of another command, hide nothing.
+        assert_eq!(
+            commands(
+                Category::Shell,
+                "home/u/.bashrc",
+                "( ~/bin/first )\necho in case of doubt, look in\n( ~/bin/second )\ncase x in\nx) ( ~/bin/third ) ;;\nesac\n( ~/bin/fourth )\n",
+            ),
+            ["~/bin/first", "~/bin/second", "~/bin/third", "~/bin/fourth"]
         );
         // A packaged start-up file that only reads a directory names no
         // program (`find` in an assignment's substitution).

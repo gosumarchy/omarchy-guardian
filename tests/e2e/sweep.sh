@@ -158,6 +158,12 @@ clean_system() {
     expect 'no device or kernel file is followed as a program' "$?"
     jq -e '[.items[] | select(.tier == "allowed")] | length == 0' "$JSON" >/dev/null
     expect 'nothing this machine'"'"'s own list allows counts in the sandbox' "$?"
+    # A `case` branch such as `/*)` in a packaged completion file is a
+    # pattern: read as a command it would name every top-level directory.
+    jq -e '[.items[] | select(.path | test("^/[^/]+$"))] | length == 0' "$JSON" >/dev/null
+    expect 'no top-level directory is listed as something that runs' "$?"
+    ! jq -r '.gaps[] | tostring' "$JSON" | grep -Eq '^"?/[^/]+: only root can read it'
+    expect 'and none is a gap' "$?"
 }
 
 plant_system() {
@@ -264,6 +270,17 @@ plant_home() {
     plant "$HOME/.config/shell/extra" 644 $'if true; then PATH=$HOME/sourced/bin:$PATH; fi\nexport PATH=$(tool path):$PATH\n'
     plant "$HOME/later/bin/ssh" 755 $'#!/bin/sh\nexec /usr/bin/ssh "$@"\n'
     plant "$HOME/sourced/bin/gpg" 755 $'#!/bin/sh\nexec /usr/bin/gpg "$@"\n'
+    # What a developer's machine holds and nobody should hear about: a
+    # project's package index, a system compiler and linker by name, the
+    # system's certificate bundle, a `case` over paths in a start-up file,
+    # and the session file `protect` writes, byte for byte.
+    plant "$HOME/.config/pip/pip.conf" 644 $'[global]\nextra-index-url = https://download.pytorch.org/whl/cpu\ncert = /etc/ssl/certs/ca-certificates.crt\n'
+    printf '[target.x86_64-unknown-linux-gnu]\nlinker = "clang"\nrustflags = ["-C", "linker=clang"]\n[env]\nCC = "clang"\n' >>"$HOME/.cargo/config.toml"
+    printf 'case "$1" in\n/*)\n\t: ;;\nesac\n' >>"$HOME/.profile"
+    plant "$HOME/.config/uwsm/env.d/90-omarchy-guardian" 644 $'# Omarchy Guardian: theme and plugin installs found on PATH go through Guardian.\n# Written by `omarchy-guardian protect`, removed by `omarchy-guardian protect --off`.\nexport PATH="/usr/lib/omarchy-guardian/bin:$PATH"\n'
+    # The dispatcher Guardian's own wrapper stands in front of, taken over
+    # (only where Omarchy is installed is there one to take over).
+    [[ ! -e /usr/bin/omarchy ]] || plant "$HOME/tools/bin/omarchy" 755 $'#!/bin/sh\nexec /usr/bin/omarchy "$@"\n'
 }
 
 # expect_flagged <label> <rule>: a finding of that rule on the item.
@@ -379,6 +396,17 @@ planted_system() {
     ! grep -q 'curl_0123456789SECRET' "$JSON"
     expect 'a proxy password is in nothing the sweep prints' "$?"
     expect_run_by '~/.cache/hook.js' '/.npmrc'
+    jq -e '[.findings[] | select(.path == "~/.npmrc") | .line] | sort == [1, 3, 4]' "$JSON" >/dev/null
+    expect 'each finding on a settings file names its line' "$?"
+    jq -e '[.findings[] | select((.path == "~/.config/pip/pip.conf" or .path == "~/.cargo/config.toml") and .rule == "risky-configuration")] | length == 0' "$JSON" >/dev/null
+    expect 'ordinary developer settings are no finding' "$?"
+    jq -e '[.items[] | select(.path | test("^/[^/]+$"))] | length == 0' "$JSON" >/dev/null
+    expect 'a case branch in a start-up file names no directory' "$?"
+    jq -e '[.items[] | select(.path == "~/.config/uwsm/env.d/90-omarchy-guardian") | .tier] == ["package"]' "$JSON" >/dev/null
+    expect 'the session file protect writes is Guardian'"'"'s own' "$?"
+    if [[ -e /usr/bin/omarchy ]]; then
+        expect_listed '~/tools/bin/omarchy' path-hijack
+    fi
 
     # PATH lines behind a test, in an `if`, and in a sourced file.
     expect_listed '~/later/bin/ssh' path-hijack
