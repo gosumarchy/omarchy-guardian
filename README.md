@@ -284,16 +284,28 @@ has a plain local rule besides the review of its text:
   an app talk to `org.freedesktop.Flatpak`;
 - editor start-up files (`~/.config/nvim/init.lua` and `init.vim`,
   `plugin/`, `after/plugin/` and `lua/`, `~/.vimrc`, `~/.vim/plugin`), and
-  the two VS Code settings that run a folder's tasks unasked (the list of
-  installed extensions is not read);
+  in VS Code's `settings.json` the settings that run a folder's tasks
+  unasked, the environment and shell of its terminal
+  (`terminal.integrated.env.*` with `LD_PRELOAD`, `PATH` and the like,
+  `profiles`, `automationProfile`, `shellArgs`), `git.path`, a proxy,
+  switched-off certificate checks and a program it is told to run from a
+  temporary or cache directory (the list of installed extensions is not
+  read);
 - mise's configuration (what it sources, its hooks and tasks) and cargo's
-  (`rustc-wrapper`, `linker`, `runner`, a replaced source), whose commands
-  are followed; `~/.npmrc`, pip's, gem's, yarn's, bun's and Go's
-  configuration, where a registry other than the usual one, a
-  `script-shell`, a `trusted-host`, `-toolexec` or switched-off checks are
-  findings. These hold registry tokens, so like the SSH and git files they
-  are checked locally and never sent to the AI (mise's and cargo's are
-  reviewed, with secret-looking values taken out); so are an editor's
+  (`rustc-wrapper`, `linker`, `runner`, a credential provider, a replaced
+  source or crate, a proxy, variables such as `LD_PRELOAD` under `[env]`),
+  whose commands are followed; `~/.npmrc`, pip's, gem's, yarn's, bun's,
+  conda's and Go's configuration, `~/.curlrc` and `~/.wgetrc`, where a
+  finding is: a registry other than the usual one, a program the tool is
+  told to run or code it is told to load (`script-shell`, `git`,
+  `node-options --require`, `yarnPath`, `plugins`, `preload`, `-toolexec`,
+  `CC`), a proxy, certificate authorities of the file's own or switched-off
+  checks (`strict-ssl`, `trusted-host`, `insecure`, `GOINSECURE`, a wide
+  `GOPRIVATE`). One that names a path in a temporary or cache directory,
+  or an `http://` address, says so. These hold registry tokens, so like
+  the SSH and git files they are checked locally and never sent to the AI
+  (mise's and cargo's are reviewed, with secret-looking values taken out),
+  and what is shown is the key, never the value; so are an editor's
   `settings.json` and fish's saved variables;
 - `/etc/hosts`: a line for a host that updates, packages or the AI review
   come from (archlinux.org, omarchy.org, github.com, anthropic.com, the

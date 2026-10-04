@@ -490,7 +490,7 @@ pub fn packaged_item(scope: &Scope<'_>, category: Category, path: &str) -> Optio
     if !seen.kept || seen.path != path || !matches!(seen.what, read::Public::File(_)) {
         return None;
     }
-    let found = read::look_pinned(seen)?;
+    let found = read::look_pinned(seen);
     if !matches!(found, Found::File { .. }) {
         return None;
     }
@@ -644,30 +644,10 @@ pub fn item_of(
         Body::Text(_) if rewritten.is_some() => Body::Binary(PACKAGED_SCRIPT),
         body => body,
     };
-    // As root, what was reached by following (a command, a link, a
-    // preload, a live check) can be steered by any user (a crontab line, an
-    // `LD_PRELOAD` value) at `/etc/shadow` or a key. Its content is never
-    // handed back and nothing is followed from it; the user's own sweep
-    // reads whatever the user may read. Only the auto-run locations' own
-    // files keep their content.
-    let (body, runs) = if scope.origin == Origin::Root && (run_by.is_some() || category.is_live()) {
-        let body = match body {
-            Body::Text(_) | Body::Oversized | Body::Undecodable => Body::Binary(WITHHELD),
-            other => other,
-        };
-        (body, Vec::new())
-    } else {
-        (body, runs)
-    };
+    let (body, runs) = handed_back(scope, category, run_by, body, runs);
     let mut notes = notes(scope, category, &path, &body, run_by);
     notes.extend(limits(scope, category, &path, &body, found));
-    let closed = match found {
-        Found::File { mode, .. } => tier::is_closed(&path, *mode, scope.index),
-        // Only a closed file gives this tier to one that was not read.
-        Found::Unreadable(_) => tier == Tier::Modified,
-        Found::Link(_) | Found::Other => false,
-    };
-    if closed {
+    if is_closed(scope, &path, tier, found) {
         notes.push(CLOSED.to_string());
     }
     notes.extend(rewritten.map(str::to_string));
@@ -692,6 +672,42 @@ pub fn item_of(
         run_by: run_by.map(str::to_string),
         notes,
         alerts,
+    }
+}
+
+/// The content of an item and what it runs, as the collector hands them
+/// back. As root, what was reached by following (a command, a link, a
+/// preload, a live check) can be steered by any user (a crontab line, an
+/// `LD_PRELOAD` value) at `/etc/shadow` or a key. Its content is never
+/// handed back and nothing is followed from it; the user's own sweep reads
+/// whatever the user may read. Only the auto-run locations' own files keep
+/// their content.
+fn handed_back(
+    scope: &Scope<'_>,
+    category: Category,
+    run_by: Option<&str>,
+    body: Body,
+    runs: Vec<String>,
+) -> (Body, Vec<String>) {
+    if scope.origin == Origin::Root && (run_by.is_some() || category.is_live()) {
+        let body = match body {
+            Body::Text(_) | Body::Oversized | Body::Undecodable => Body::Binary(WITHHELD),
+            other => other,
+        };
+        (body, Vec::new())
+    } else {
+        (body, runs)
+    }
+}
+
+/// Whether what `look` found at `path` is a packaged file somebody took
+/// everyone's read access from (see `tier::is_closed`).
+fn is_closed(scope: &Scope<'_>, path: &str, tier: Tier, found: &Found) -> bool {
+    match found {
+        Found::File { mode, .. } => tier::is_closed(path, *mode, scope.index),
+        // Only a closed file gives this tier to one that was not read.
+        Found::Unreadable(_) => tier == Tier::Modified,
+        Found::Link(_) | Found::Other => false,
     }
 }
 

@@ -402,16 +402,68 @@ fn terminal(name: &str, line: &str) -> Vec<String> {
     found
 }
 
+/// The files a `node-options` value has Node.js load before anything
+/// else (`--require /x.js`, `--import=/x.mjs`).
+fn node_loaded(value: &str) -> Vec<String> {
+    let words: Vec<&str> = value
+        .split_whitespace()
+        .map(|word| word.trim_matches(['"', '\'']))
+        .collect();
+    let mut found = Vec::new();
+    for (index, word) in words.iter().enumerate() {
+        let loaded = match word.split_once('=') {
+            Some(("--require" | "--import" | "--loader" | "--experimental-loader", file)) => {
+                Some(file)
+            }
+            None if matches!(*word, "--require" | "-r" | "--import" | "--loader") => {
+                words.get(index + 1).copied()
+            }
+            _ => None,
+        };
+        found.extend(loaded.filter(|file| !file.is_empty()).map(str::to_string));
+    }
+    found
+}
+
+/// The script a yarn settings file has every yarn command run
+/// (`yarnPath: x`, `yarn-path "x"`); a relative one is beside the file,
+/// which is in the home.
+fn yarn_path(line: &str) -> Vec<String> {
+    let Some((key, value)) = line.split_once([':', ' ', '\t']) else {
+        return Vec::new();
+    };
+    let value = value.trim().trim_matches(['"', '\'']);
+    if !matches!(key.trim_matches('"'), "yarnPath" | "yarn-path") || value.is_empty() {
+        return Vec::new();
+    }
+    if value.starts_with(['/', '~', '$']) {
+        vec![value.to_string()]
+    } else {
+        vec![format!("~/{}", value.trim_start_matches("./"))]
+    }
+}
+
 /// What a package manager's or mise's configuration makes it run:
-/// npm's `script-shell`, cargo's wrappers, linker and runner, Go's
-/// `-toolexec`, and mise's sourced files, hooks and task commands.
+/// npm's shells, `git` and loaded scripts, yarn's `yarnPath`, cargo's
+/// wrappers, linker, runner and credential provider, Go's `-toolexec` and
+/// compilers, and mise's sourced files, hooks and task commands.
 fn toolchain(name: &str, line: &str) -> Vec<String> {
+    if matches!(name, ".yarnrc" | ".yarnrc.yml") {
+        return yarn_path(line);
+    }
     let Some((key, value)) = line.split_once('=') else {
         return Vec::new();
     };
     let key = key.trim().trim_matches('"');
     let runs = match name {
-        "npmrc" | ".npmrc" => key == "script-shell",
+        "npmrc" | ".npmrc" if key.eq_ignore_ascii_case("node-options") => {
+            return node_loaded(value);
+        }
+        "npmrc" | ".npmrc" => matches!(
+            key,
+            "script-shell" | "shell" | "git" | "onload-script" | "init-module"
+        ),
+        "env" if matches!(key, "CC" | "CXX") => true,
         "env" => {
             return value
                 .split_whitespace()
@@ -427,6 +479,7 @@ fn toolchain(name: &str, line: &str) -> Vec<String> {
                 | "rustdoc"
                 | "linker"
                 | "runner"
+                | "credential-provider"
                 | "_.source"
                 | "_.file"
                 | "run"
@@ -1440,12 +1493,35 @@ mod tests {
             ),
             ["/tmp/sh"]
         );
+    }
+
+    #[test]
+    fn package_managers_manifests_and_handlers_name_what_they_run() {
+        let tool = |path: &str, text: &str| commands(Category::Toolchain, path, text);
+        assert_eq!(
+            tool(
+                "home/u/.npmrc",
+                "node-options=--max-old-space-size=4096 --require /home/u/a.js --import=/home/u/b.mjs\ngit=/home/u/bin/git\nonload-script=~/c.js\nprefix=/home/u/.npm-global\n"
+            ),
+            ["/home/u/a.js", "/home/u/b.mjs", "/home/u/bin/git", "~/c.js"]
+        );
+        assert_eq!(
+            tool(
+                "home/u/.yarnrc.yml",
+                "nodeLinker: node-modules\nyarnPath: .yarn/releases/yarn.cjs\n"
+            ),
+            ["~/.yarn/releases/yarn.cjs"]
+        );
+        assert_eq!(
+            tool("home/u/.yarnrc", "yarn-path \"/home/u/yarn.js\"\n"),
+            ["/home/u/yarn.js"]
+        );
         assert_eq!(
             tool(
                 "home/u/.config/go/env",
-                "GOFLAGS=-mod=mod -toolexec=/tmp/x\nGOPATH=/home/u/go\n"
+                "GOFLAGS=-mod=mod -toolexec=/tmp/x\nGOPATH=/home/u/go\nCC=/home/u/cc\n"
             ),
-            ["/tmp/x"]
+            ["/tmp/x", "/home/u/cc"]
         );
         assert_eq!(
             commands(

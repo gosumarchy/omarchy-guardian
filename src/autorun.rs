@@ -1072,6 +1072,12 @@ pub const USER: &[Location] = &[
     location(".yarnrc.yml", Kind::File, Category::Toolchain),
     location(".bunfig.toml", Kind::File, Category::Toolchain),
     location(".config/go/env", Kind::File, Category::Toolchain),
+    location(".pip/pip.conf", Kind::File, Category::Toolchain),
+    location(".condarc", Kind::File, Category::Toolchain),
+    // Where every `curl` and `wget` sends its traffic, and whether they
+    // still check certificates: install scripts run both.
+    location(".curlrc", Kind::File, Category::Toolchain),
+    location(".wgetrc", Kind::File, Category::Toolchain),
     // What an editor runs at every start.
     location(".config/nvim/init.lua", Kind::File, Category::Editor),
     location(".config/nvim/init.vim", Kind::File, Category::Editor),

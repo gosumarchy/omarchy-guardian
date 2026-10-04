@@ -27,6 +27,7 @@ pub mod read;
 pub mod root;
 pub mod state;
 pub mod tier;
+pub mod tools;
 
 use std::env;
 use std::path::Path;

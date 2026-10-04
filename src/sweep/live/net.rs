@@ -516,6 +516,12 @@ const JOB_RUNNERS: &[&str] = &[
     "atd.service",
 ];
 
+/// Whether a control group is a slice, which only groups units.
+fn is_slice(name: &str) -> bool {
+    name.strip_suffix("slice")
+        .is_some_and(|rest| rest.ends_with('.'))
+}
+
 /// Whether `name` is a user's manager as the system manager runs it
 /// (`user@1000.service`).
 fn is_user_manager(name: &str) -> bool {
@@ -536,12 +542,12 @@ pub(super) fn starter(cgroup: &str) -> Option<Starter<'_>> {
     let mut names = cgroup
         .split('/')
         .filter(|name| !name.is_empty())
-        .skip_while(|name| name.ends_with(".slice"));
+        .skip_while(|name| is_slice(name));
     let unit = names.next()?;
     if !is_user_manager(unit) {
         return unit.ends_with(".service").then_some(Starter::System(unit));
     }
-    let unit = names.find(|name| !name.ends_with(".slice"))?;
+    let unit = names.find(|name| !is_slice(name))?;
     unit.ends_with(".service").then_some(Starter::User(unit))
 }
 
