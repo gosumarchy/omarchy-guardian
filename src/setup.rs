@@ -654,6 +654,7 @@ impl Environment for RealEnvironment {
             drop(fs::remove_file(&temporary));
             return Err(error.to_string());
         }
+        crate::audit::settings_changed("the user settings file was saved");
         Ok(path)
     }
 
@@ -786,7 +787,10 @@ fn install_system_file(text: &str) -> Result<(), String> {
         Some(text),
     )?;
     match fs::read_to_string(SYSTEM_PATH) {
-        Ok(installed) if installed == text => Ok(()),
+        Ok(installed) if installed == text => {
+            crate::audit::settings_changed("the system settings file was saved");
+            Ok(())
+        }
         Ok(_) => Err(format!(
             "{SYSTEM_PATH} does not hold the config you approved; check it before relying on the gates"
         )),

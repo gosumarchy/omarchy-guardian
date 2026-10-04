@@ -671,6 +671,30 @@ fn change_allowed(
     Ok(())
 }
 
+/// The changes `arguments` ask for as the audit trail keeps them: the
+/// labels, without their fingerprints.
+fn changes_asked(arguments: &[String]) -> String {
+    let mut asked = Vec::new();
+    let mut rest = arguments;
+    while let Some((flag, tail)) = rest.split_first() {
+        rest = match (flag.as_str(), tail) {
+            ("--add", [label, _, tail @ ..]) => {
+                asked.push(format!("allow {label}"));
+                tail
+            }
+            ("--remove", [label, tail @ ..]) => {
+                asked.push(format!("forget {label}"));
+                tail
+            }
+            (_, tail) => {
+                asked.push("forget everything".to_string());
+                tail
+            }
+        };
+    }
+    asked.join("; ")
+}
+
 /// `omarchy-guardian sweep-allow-system (--add LABEL FINGERPRINT | --remove
 /// LABEL | --clear)...`, run as root through sudo by `sweep allow` and
 /// `sweep forget`: the list of allowed items, which only root writes. The
@@ -691,7 +715,10 @@ pub fn system_allow_command(arguments: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
     match state::save_system_allowed(path, &allowed) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            crate::audit::allow_list_changed(&changes_asked(arguments), invoker);
+            ExitCode::SUCCESS
+        }
         Err(error) => {
             errln!("omarchy-guardian sweep-allow-system: {error}");
             ExitCode::from(2)

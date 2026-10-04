@@ -21,6 +21,7 @@ mod output;
 
 mod agent;
 mod ask;
+mod audit;
 mod aur;
 mod autorun;
 mod classify;
