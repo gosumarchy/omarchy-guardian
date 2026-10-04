@@ -1051,6 +1051,96 @@ pub fn run_targets(line: &str) -> Vec<String> {
     found
 }
 
+/// The directories and globs `line` names where what is in them is run or
+/// read in as code, as written: the words of a loop (`for h in hooks.d/*`),
+/// a glob given to a shell, an interpreter or `source`, a glob read into a
+/// pipe (`cat dir/* | sh`), and the directory of `run-parts` and of a
+/// `find` that runs or passes on what it finds. `run_targets` names single
+/// files; which files these reach is known only where they run. What a
+/// loop does with its words is on later lines, so every loop over paths
+/// counts.
+pub fn run_globs(line: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    if !(line.contains(['*', '?'])
+        || ["for ", "run-parts", "find "]
+            .iter()
+            .any(|sign| line.contains(sign)))
+    {
+        return found;
+    }
+    let is_glob = |word: &str| word.contains(['*', '?', '[']);
+    let piped = line.contains('|');
+    let flat = line.replace("&&", ";").replace("||", ";");
+    for statement in flat.split([';', '|']).take(MAX_STATEMENTS) {
+        // A command as a configuration's value (`exec = run-parts d`) is
+        // read from after the key when the line does not start with one.
+        let after_key = statement.split_once('=').map(|(_, value)| value);
+        for statement in std::iter::once(statement).chain(after_key) {
+            let named = globs_run_by(statement, piped, &is_glob);
+            let known = !named.is_empty();
+            for word in named {
+                let word = word.trim_end_matches(')').to_string();
+                if !word.is_empty() && !found.contains(&word) {
+                    found.push(word);
+                }
+            }
+            if known {
+                break;
+            }
+        }
+    }
+    found
+}
+
+/// `run_globs` for one statement; `piped` says its line has a pipe.
+fn globs_run_by(statement: &str, piped: bool, is_glob: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let words: Vec<String> = shell_words(statement)
+        .iter()
+        .map(|word| unquoted(word))
+        .collect();
+    let mut words = words.iter().map(String::as_str).skip_while(|word| {
+        matches!(
+            *word,
+            "sudo" | "doas" | "run0" | "env" | "command" | "exec" | "then" | "do" | "else" | "!"
+        ) || word.starts_with('-')
+    });
+    let Some(program) = words.next() else {
+        return Vec::new();
+    };
+    let name = program_name(program);
+    let unversioned =
+        name.trim_end_matches(|character: char| character.is_ascii_digit() || character == '.');
+    let arguments: Vec<&str> = words.collect();
+    let operands = arguments
+        .iter()
+        .copied()
+        .filter(|word| !word.starts_with('-'));
+    let named: Vec<&str> = match name {
+        "for" | "select" => operands
+            .skip_while(|word| *word != "in")
+            .skip(1)
+            .take_while(|word| *word != "do")
+            .filter(|word| word.contains('/') || is_glob(word))
+            .collect(),
+        "run-parts" => operands.collect(),
+        // The places searched come before the first test.
+        "find" if piped || statement.contains("-exec") || statement.contains("-ok") => arguments
+            .iter()
+            .copied()
+            .take_while(|word| !word.starts_with(['-', '(', '!', '\\']))
+            .collect(),
+        "cat" if !piped => Vec::new(),
+        _ if name == "cat"
+            || RUNNERS.contains(&name)
+            || (!unversioned.is_empty() && RUNNERS.contains(&unversioned)) =>
+        {
+            operands.filter(|word| is_glob(word)).collect()
+        }
+        _ => Vec::new(),
+    };
+    named.into_iter().map(ToString::to_string).collect()
+}
+
 /// Files a line runs or reads in that `run_targets`' shell reading does not
 /// reach: make's includes, an interpreter given a file to read in on its
 /// command line, a script sourced next to the running one, an archive read
@@ -3107,5 +3197,46 @@ mod tests {
         assert!(!looks_like_credential_exfiltration(
             "requests.get(public_url)"
         ));
+    }
+
+    #[test]
+    fn directories_and_globs_that_are_run_are_named() {
+        for (line, globs) in [
+            ("for h in hooks.d/*; do . \"$h\"; done", &["hooks.d/*"][..]),
+            ("for f in \"$dir\"/a/*.sh b/ c; do", &["$dir/a/*.sh", "b/"]),
+            ("source lib/*.sh", &["lib/*.sh"]),
+            ("  . ./conf.d/*", &["./conf.d/*"]),
+            ("sudo bash scripts/*", &["scripts/*"]),
+            ("python3.12 plugins/*.py", &["plugins/*.py"]),
+            (
+                "exec-once = run-parts ~/.config/x/start.d",
+                &["~/.config/x/start.d"],
+            ),
+            ("cat parts/* extra/?.txt | sh", &["parts/*", "extra/?.txt"]),
+            ("run-parts --verbose /etc/x.d", &["/etc/x.d"]),
+            ("test -d d && run-parts d", &["d"]),
+            (
+                "find hooks \"$x/more\" -type f -exec sh {} \\;",
+                &["hooks", "$x/more"],
+            ),
+            ("find scripts -name '*.sh' | xargs -n1 sh", &["scripts"]),
+        ] {
+            assert_eq!(super::run_globs(line), globs, "{line}");
+        }
+        for line in [
+            // Named files are `run_targets`' to report.
+            "sh ./install.sh",
+            ". lib/common.sh",
+            // Looked at, listed or counted: nothing is run.
+            "for i in 1 2 3; do",
+            "for arg in \"$@\"; do",
+            "cat notes/*.txt",
+            "find backgrounds -name '*.png'",
+            "ls backgrounds/*",
+            "cp -r backgrounds/* \"$out\"",
+            "x = 2 * 3",
+        ] {
+            assert!(super::run_globs(line).is_empty(), "{line}");
+        }
     }
 }

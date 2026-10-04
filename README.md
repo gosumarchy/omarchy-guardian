@@ -1239,10 +1239,24 @@ says the memory was not used and the review runs in full:
   metadata of at most 64 KiB, a colour profile of at most 1 MiB and an XMP
   packet of at most 16 KiB, no block of text lines in its metadata, and no
   line anywhere that a shell would act on (a shell asked to run a PNG does
-  run it). That last test is a heuristic over the file's bytes: now and
+  run it). A line counts by the text it starts with, whatever bytes end
+  it: a shell reads past them, or stops at a `#`. That last test is a
+  heuristic over the file's bytes: now and
   then it takes a real picture for one, which costs a full review, and it
-  cannot rule out every line a shell could run. Guardian still does not look at
-  what an image shows, so this rests on the approved text not running
+  cannot rule out every line a shell could run. So the exception does not
+  rest on the bytes alone. It holds only away from where files are run: an
+  image in a directory that also holds a script (a file with a shebang,
+  the execute bit, or a `.sh`, `.bash`, `.zsh`, `.fish`, `.py`, `.pl`,
+  `.rb`, `.lua` or `.js` name), or in one whose files a reviewed line runs
+  (`for h in hooks.d/*`, `source dir/*`, `run-parts dir`, `find dir
+  -exec`, `cat dir/* | sh`), is a file Guardian does not read like any
+  other, and a new or changed one means a full review. A wallpaper among
+  wallpapers, or a preview beside configuration files, stays the
+  exception. And a reviewed line that runs, sources or reads in a file
+  named as an image makes the review incomplete, whatever the image holds.
+  Guardian still does not look at what an image shows, and a loop written
+  in another language than shell is not followed to its directory, so
+  what is left rests on the approved text not running
   files it was not sent, which its review is asked to report. A
   source identical to its baseline is answered from the cache when its first
   review is still cached (yay's second `makepkg` pass); otherwise it is
