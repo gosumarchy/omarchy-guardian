@@ -185,6 +185,23 @@ pub fn path_variable_assignments(pkgbuild: &str) -> Vec<String> {
         // `${x}` closes a brace it did not open here.
         depth = (depth + braces).max(0);
     }
+    // The same read as commands, which sees a name through its quoting
+    // (`declare BUILD''DIR=/x`) and a command over several lines.
+    let names = recipe::Naming {
+        set: PATH_VARIABLES,
+        given: &["BUILDDIR", "SRCDEST"],
+        assigners: ASSIGNING_COMMANDS,
+    };
+    let lines: Vec<&str> = pkgbuild.lines().collect();
+    for line in recipe::top_level_naming(pkgbuild, &names).unwrap_or_default() {
+        let text = lines
+            .get(line.saturating_sub(1))
+            .map_or("", |text| text.trim());
+        let entry = format!("line {line}: {text}");
+        if !found.contains(&entry) {
+            found.push(entry);
+        }
+    }
     found
 }
 

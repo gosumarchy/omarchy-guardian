@@ -7,10 +7,17 @@
 //! recipe again outside it. A recipe can tell the two apart, so the listing
 //! alone proves nothing about the build: the text has to show that the
 //! recipe has no way to give the two different answers. This is not a
-//! shell. It reads statements and words as bash splits them, knows the
-//! plain forms, and counts everything else as not followed.
+//! shell. It reads the commands bash runs while it loads the recipe, knows
+//! the plain forms, and counts everything else as not followed: a value
+//! that can differ from one run to the next (a file that is there, the
+//! environment, a command's output) may reach nothing Guardian watches.
 
-use std::collections::HashMap;
+mod lex;
+mod parse;
+
+use lex::Word;
+use parse::{Command, Item, Join};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// What a recipe may not set where Guardian cannot follow: what is fetched,
 /// how it is verified, and where makepkg works.
@@ -34,13 +41,96 @@ const STANDARD_FUNCTIONS: &[&str] = &["prepare", "build", "check", "package", "p
 /// same in the listing and in the build.
 const CONFIGURED: &[&str] = &["CARCH", "CHOST", "srcdir", "pkgdir", "startdir"];
 
-/// Commands that change how the rest of the recipe is read.
+/// Variables bash itself fills in, with what differs from run to run,
+/// whatever the recipe sets them to.
+const DYNAMIC: &[&str] = &[
+    "RANDOM",
+    "SRANDOM",
+    "SECONDS",
+    "LINENO",
+    "PPID",
+    "UID",
+    "EUID",
+    "GROUPS",
+    "HOSTNAME",
+    "PWD",
+    "OLDPWD",
+    "SHLVL",
+    "REPLY",
+    "MAPFILE",
+    "COPROC",
+    "OPTARG",
+    "OPTIND",
+    "FUNCNAME",
+    "PIPESTATUS",
+    "DIRSTACK",
+];
+
+/// Commands that run or read in code, or change how the rest of the recipe
+/// is read.
 const CONTROL: &[&str] = &[
-    "eval", "source", ".", "trap", "alias", "exec", "enable", "coproc",
+    "eval", "source", ".", "trap", "alias", "enable", "coproc", "bind", "complete", "compgen",
+    "compopt", "caller", "fc", "history", "jobs", "bg", "fg", "suspend", "logout",
 ];
 
 /// Commands that declare the variables they are given.
 const DECLARING: &[&str] = &["declare", "typeset", "local", "export", "readonly"];
+
+/// The `shopt` options that change how patterns match and nothing else.
+const PATTERN_OPTIONS: &[&str] = &[
+    "-s",
+    "-u",
+    "-q",
+    "extglob",
+    "nullglob",
+    "globstar",
+    "dotglob",
+    "nocasematch",
+    "nocaseglob",
+    "failglob",
+];
+
+/// What `set` may be given: how bash treats failures and what it prints.
+const SET_OPTIONS: &[&str] = &[
+    "-e", "+e", "-u", "+u", "-x", "+x", "-o", "+o", "-eu", "-euo", "-ex", "errexit", "nounset",
+    "xtrace", "pipefail",
+];
+
+/// makepkg's functions that print a message and do nothing else.
+const MESSAGES: &[&str] = &["msg", "msg2", "warning", "error", "plain"];
+
+/// The variables makepkg reads out of `package()` functions by running
+/// the lines that set them (`extract_function_variable`), beside the
+/// checksum arrays.
+const ATTRIBUTES: &[&str] = &[
+    "arch",
+    "backup",
+    "checkdepends",
+    "conflicts",
+    "depends",
+    "groups",
+    "license",
+    "makedepends",
+    "noextract",
+    "optdepends",
+    "options",
+    "provides",
+    "replaces",
+    "source",
+    "validpgpkeys",
+    "xdata",
+    "changelog",
+    "epoch",
+    "install",
+    "pkgbase",
+    "pkgdesc",
+    "pkgrel",
+    "pkgver",
+    "url",
+];
+
+/// Why a word with `*`, `?` or `[` in it is not the same everywhere.
+const PATTERN: &str = "a pattern for file names, which depends on the files there";
 
 /// The most reasons kept; a recipe needs one to be asked about.
 const MAX_REASONS: usize = 8;
@@ -63,310 +153,179 @@ fn is_standard(function: &str) -> bool {
     STANDARD_FUNCTIONS.contains(&function) || function.starts_with("package_")
 }
 
-/// How one statement follows the one before it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Separator {
-    /// A new line, `;`, `|` or `&`.
-    Plain,
-    /// `&&` or `||`: runs depending on the statement before.
-    Chained,
+/// Whether makepkg runs the lines of `function` that set a package's
+/// attributes while it loads the recipe.
+fn is_package(function: &str) -> bool {
+    function == "package" || function.starts_with("package_")
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Statement {
-    line: usize,
-    /// Words as written, quotes included. An array assignment is one
-    /// statement: `name=(` first, then its elements.
-    words: Vec<String>,
-    separator: Separator,
+fn is_attribute(name: &str) -> bool {
+    let base = name.split_once('_').map_or(name, |(base, _)| base);
+    ATTRIBUTES.contains(&name) || ATTRIBUTES.contains(&base) || super::CHECKSUMS.contains(&base)
 }
 
-/// What the lexer is inside of.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Inside {
-    Single,
-    /// `$'...'`, where a backslash keeps the next character.
-    Ansi,
-    Double,
-    Backtick,
-    /// `${ ... }`, which may hold blanks and `&` (`${x/-g }`, `${x/a/&b}`).
-    Brace,
-    /// `$( ... )`, `<( ... )` or `(( ... ))`, with its open parentheses.
-    Substitution(usize),
+/// Whether `text` is a whole number as written.
+fn is_number(text: &str) -> bool {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    !digits.is_empty() && digits.len() < 18 && digits.chars().all(|c| c.is_ascii_digit())
 }
 
-struct Lexer<'a> {
-    characters: std::iter::Peekable<std::str::Chars<'a>>,
-    line: usize,
-    stack: Vec<Inside>,
-    word: String,
-    words: Vec<String>,
-    started: usize,
-    in_array: bool,
-    /// Between `[[` and `]]`, where `&&` and `||` end no statement.
-    in_test: bool,
-    separator: Separator,
-    /// The end marker of a here-document that starts after this line.
-    here_document: Option<String>,
-    /// Lines Guardian may split otherwise than bash does.
-    unsure: Vec<usize>,
-    statements: Vec<Statement>,
+/// Whether a word is written with no quoting and no expansion: a name bash
+/// takes as it stands.
+fn is_plain(text: &str) -> bool {
+    text == "["
+        || (!text.is_empty()
+            && text
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_-./+:@%,^=".contains(c)))
 }
 
-impl Lexer<'_> {
-    fn end_word(&mut self) {
-        if self.word.is_empty() {
-            return;
-        }
-        if self.words.is_empty() {
-            self.started = self.line;
-        }
-        match self.word.as_str() {
-            "[[" => self.in_test = true,
-            "]]" => self.in_test = false,
-            _ => {}
-        }
-        self.words.push(std::mem::take(&mut self.word));
-    }
+fn after(text: &str, at: usize) -> Option<char> {
+    text.get(at..).and_then(|rest| rest.chars().next())
+}
 
-    fn end_statement(&mut self, next: Separator) {
-        self.end_word();
-        if !self.words.is_empty() {
-            self.statements.push(Statement {
-                line: self.started,
-                words: std::mem::take(&mut self.words),
-                separator: self.separator,
-            });
-        }
-        self.separator = next;
-        self.in_array = false;
-        self.in_test = false;
-    }
+/// Where the backtick that ends a command substitution is in `text`.
+fn backtick_end(text: &str) -> Option<usize> {
+    escaped_end(text, '`')
+}
 
-    /// Skips the lines of a here-document: text, not code.
-    fn skip_here_document(&mut self, marker: &str) {
-        let mut current = String::new();
-        for character in self.characters.by_ref() {
-            if character != '\n' {
-                current.push(character);
-                continue;
-            }
-            self.line += 1;
-            if current.trim_start_matches('\t') == marker {
-                return;
-            }
-            current.clear();
-        }
-    }
-
-    /// One character inside quotes or a substitution: kept in the word.
-    fn quoted(&mut self, inside: Inside, character: char) {
-        let substitution = matches!(inside, Inside::Substitution(_));
-        // A comment in a substitution: its quotes open nothing.
-        if substitution
-            && character == '#'
-            && self
-                .word
-                .ends_with(|last: char| last.is_whitespace() || last == '(')
-        {
-            while self.characters.next_if(|next| *next != '\n').is_some() {}
-            return;
-        }
-        // Where a here-document inside a substitution ends, and so which
-        // of its quotes count, is not followed.
-        if substitution && character == '<' && self.word.ends_with('<') {
-            self.unsure.push(self.line);
-        }
-        self.word.push(character);
-        if character == '\n' {
-            self.line += 1;
-        }
-        match (inside, character) {
-            (Inside::Single | Inside::Ansi, '\'')
-            | (Inside::Double, '"')
-            | (Inside::Backtick, '`')
-            | (Inside::Brace, '}') => {
-                self.stack.pop();
-            }
-            (Inside::Single, _) => {}
-            (_, '\\') => {
-                if let Some(next) = self.characters.next() {
-                    self.word.push(next);
-                }
-            }
-            (Inside::Double | Inside::Substitution(_) | Inside::Brace, '$')
-                if matches!(self.characters.peek(), Some('(' | '{')) =>
-            {
-                let opened = self.characters.next();
-                self.word.extend(opened);
-                self.stack.push(if opened == Some('{') {
-                    Inside::Brace
-                } else {
-                    Inside::Substitution(1)
-                });
-            }
-            (Inside::Double | Inside::Substitution(_) | Inside::Brace, '`') => {
-                self.stack.push(Inside::Backtick);
-            }
-            // Inside double quotes a single quote is a character.
-            (Inside::Substitution(_) | Inside::Brace, '\'')
-                if !self.stack.contains(&Inside::Double) =>
-            {
-                self.stack.push(Inside::Single);
-            }
-            (Inside::Substitution(_) | Inside::Brace, '"') => self.stack.push(Inside::Double),
-            (Inside::Substitution(depth), '(') => {
-                self.stack.pop();
-                self.stack.push(Inside::Substitution(depth + 1));
-            }
-            (Inside::Substitution(depth), ')') => {
-                self.stack.pop();
-                if depth > 1 {
-                    self.stack.push(Inside::Substitution(depth - 1));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// `<<` after the word so far: notes the end marker of the
-    /// here-document (not for `<<<`, which takes a word).
-    fn here_marker(&mut self) {
-        self.word.push_str("<<");
-        if self.characters.peek() == Some(&'<') {
-            return;
-        }
-        let mut marker = String::new();
-        while let Some(&next) = self.characters.peek() {
-            if next == '\n' || (next.is_whitespace() && !marker.is_empty()) {
-                break;
-            }
-            self.characters.next();
-            if !(next.is_whitespace() || "-'\"\\".contains(next)) {
-                marker.push(next);
-            }
-        }
-        self.end_word();
-        self.here_document = Some(marker).filter(|marker| !marker.is_empty());
-    }
-
-    fn open(&mut self, inside: Inside, character: char) {
-        self.word.push(character);
-        self.stack.push(inside);
-    }
-
-    /// `&&`, `||`, `|`, `&`, or the `&` of a redirection (`2>&1`, `&>x`).
-    fn operator(&mut self, character: char, next: Option<char>) {
-        if next == Some(character) {
-            self.characters.next();
-            self.end_statement(Separator::Chained);
-        } else if character == '&' && (self.word.ends_with('>') || next == Some('>')) {
-            self.word.push(character);
-        } else {
-            self.end_statement(Separator::Plain);
-        }
-    }
-
-    fn new_line(&mut self) {
-        if self.in_array {
-            self.end_word();
-            self.line += 1;
-            return;
-        }
-        self.end_statement(Separator::Plain);
-        self.line += 1;
-        if let Some(marker) = self.here_document.take() {
-            self.skip_here_document(&marker);
-        }
-    }
-
-    /// One character outside any quote.
-    fn plain(&mut self, character: char) {
-        let next = self.characters.peek().copied();
-        let splits = !(self.in_array || self.in_test);
+/// Where the first `close` that no backslash keeps is in `text`.
+fn escaped_end(text: &str, close: char) -> Option<usize> {
+    let mut at = 0;
+    while let Some(character) = after(text, at) {
         match character {
-            '\\' => match self.characters.next() {
-                Some('\n') => self.line += 1,
-                Some(escaped) => {
-                    self.word.push('\\');
-                    self.word.push(escaped);
-                }
-                None => {}
-            },
-            '\'' if self.word.ends_with('$') => self.open(Inside::Ansi, character),
-            '\'' => self.open(Inside::Single, character),
-            '"' => self.open(Inside::Double, character),
-            '`' => self.open(Inside::Backtick, character),
-            '#' if self.word.is_empty() => {
-                while self.characters.next_if(|next| *next != '\n').is_some() {}
-            }
-            '$' | '<' | '>' if next == Some('(') => {
-                self.characters.next();
-                self.word.push(character);
-                self.open(Inside::Substitution(1), '(');
-            }
-            '$' if next == Some('{') => {
-                self.characters.next();
-                self.word.push(character);
-                self.open(Inside::Brace, '{');
-            }
-            '<' if next == Some('<') => {
-                self.characters.next();
-                self.here_marker();
-            }
-            // `(( ... ))`: arithmetic, where `&&` ends no statement.
-            '(' if self.word.is_empty() && next == Some('(') => {
-                self.characters.next();
-                self.word.push('(');
-                self.open(Inside::Substitution(2), '(');
-            }
-            '(' if self.word.ends_with('=') && !self.in_array => {
-                self.word.push('(');
-                self.end_word();
-                self.in_array = true;
-            }
-            ')' if self.in_array => {
-                self.end_word();
-                self.in_array = false;
-            }
-            '\n' => self.new_line(),
-            _ if character.is_whitespace() => self.end_word(),
-            ';' if splits => self.end_statement(Separator::Plain),
-            '&' | '|' if splits => self.operator(character, next),
-            _ => self.word.push(character),
+            _ if character == close => return Some(at),
+            '\\' => at += 1 + after(text, at + 1).map_or(0, char::len_utf8),
+            _ => at += character.len_utf8(),
         }
     }
+    None
 }
 
-/// The statements of `recipe`, split the way bash splits them, and the
-/// lines where Guardian is not sure it reads them as bash does.
-fn statements(recipe: &str) -> (Vec<Statement>, Vec<usize>) {
-    let mut lexer = Lexer {
-        characters: recipe.chars().peekable(),
-        line: 1,
-        stack: Vec::new(),
-        word: String::new(),
-        words: Vec::new(),
-        started: 1,
-        in_array: false,
-        in_test: false,
-        separator: Separator::Plain,
-        here_document: None,
-        unsure: Vec::new(),
-        statements: Vec::new(),
-    };
-    while let Some(character) = lexer.characters.next() {
-        match lexer.stack.last().copied() {
-            Some(inside) => lexer.quoted(inside, character),
-            None => lexer.plain(character),
+/// Where the double quote that ends a quotation is in `text`.
+fn quote_end(text: &str) -> Option<usize> {
+    let mut at = 0;
+    while let Some(character) = after(text, at) {
+        let rest = text.get(at + 1..)?;
+        match character {
+            '"' => return Some(at),
+            '\\' => at += 1 + after(rest, 0).map_or(0, char::len_utf8),
+            '`' => at += backtick_end(rest)? + 2,
+            '$' if rest.starts_with('(') => at += closing(rest.get(1..)?, ')', false)? + 3,
+            '$' if rest.starts_with('{') => at += closing(rest.get(1..)?, '}', true)? + 3,
+            _ => at += character.len_utf8(),
         }
     }
-    // A quote or substitution still open at the end was read too far.
-    if !lexer.stack.is_empty() || lexer.in_array {
-        lexer.unsure.push(lexer.line);
+    None
+}
+
+/// Where the `close` is that ends what was opened just before `text`
+/// (`$(`, `${`, `[`), past the quotes and substitutions inside it.
+/// `in_double`: within double quotes, where a single quote in `${...}` is
+/// a character.
+fn closing(text: &str, close: char, in_double: bool) -> Option<usize> {
+    let open = match close {
+        ')' => '(',
+        ']' => '[',
+        _ => '\0',
+    };
+    let mut depth = 0_usize;
+    let mut at = 0;
+    while let Some(character) = after(text, at) {
+        let rest = text.get(at + 1..)?;
+        match character {
+            '\\' => at += 1 + after(rest, 0).map_or(0, char::len_utf8),
+            '\'' if !(in_double && close == '}') => at += rest.find('\'')? + 2,
+            '"' => at += quote_end(rest)? + 2,
+            '`' => at += backtick_end(rest)? + 2,
+            '$' if rest.starts_with('(') => at += closing(rest.get(1..)?, ')', false)? + 3,
+            '$' if rest.starts_with('{') => at += closing(rest.get(1..)?, '}', in_double)? + 3,
+            _ if character == close && depth == 0 => return Some(at),
+            _ => {
+                if character == open {
+                    depth += 1;
+                } else if character == close {
+                    depth -= 1;
+                }
+                at += character.len_utf8();
+            }
+        }
     }
-    lexer.end_statement(Separator::Plain);
-    (lexer.statements, lexer.unsure)
+    None
+}
+
+/// `word` with its quotes taken off, when it holds nothing bash expands:
+/// what a command given this word as a name gets.
+fn literal(word: &str) -> Option<String> {
+    let mut text = String::new();
+    let mut characters = word.chars();
+    let mut double = false;
+    while let Some(character) = characters.next() {
+        match character {
+            '\'' if !double => text.extend(characters.by_ref().take_while(|next| *next != '\'')),
+            '"' => double = !double,
+            '\\' => text.extend(characters.next()),
+            '$' | '`' => return None,
+            '*' | '?' | '[' | '{' | '~' | '<' | '>' | '(' if !double => {
+                // A subscript is part of a name; anything else is a pattern.
+                if character != '[' || text.is_empty() {
+                    return None;
+                }
+                text.push(character);
+            }
+            _ => text.push(character),
+        }
+    }
+    Some(text)
+}
+
+/// `word` without its quotes and backslashes, whatever else it holds.
+fn unquoted(word: &str) -> String {
+    let mut text = String::new();
+    let mut characters = word.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '\'' | '"' => {}
+            '\\' => text.extend(characters.next()),
+            _ => text.push(character),
+        }
+    }
+    text
+}
+
+/// A word that assigns: `name=value`, `name+=value`, `name[3]=value`.
+struct Assignment<'a> {
+    name: &'a str,
+    subscript: Option<&'a str>,
+    append: bool,
+    value: &'a str,
+}
+
+impl<'a> Assignment<'a> {
+    /// `text` as an assignment, the way bash sees one: the name and the
+    /// `=` written without quotes.
+    fn of(text: &'a str) -> Option<Self> {
+        let length = text
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .count();
+        let name = text.get(..length).filter(|name| is_name(name))?;
+        let mut rest = text.get(length..)?;
+        let mut subscript = None;
+        if let Some(inner) = rest.strip_prefix('[') {
+            let end = closing(inner, ']', false)?;
+            subscript = inner.get(..end);
+            rest = inner.get(end + 1..)?;
+        }
+        let append = rest.starts_with('+');
+        let value = rest.get(usize::from(append)..)?.strip_prefix('=')?;
+        Some(Self {
+            name,
+            subscript,
+            append,
+            value,
+        })
+    }
 }
 
 /// What Guardian knows of a variable's value.
@@ -377,7 +336,7 @@ enum Value {
     /// Worked out from written-out values in a way Guardian does not
     /// repeat (`${pkgver%.*}`), with the same result wherever it is loaded.
     Derived,
-    /// Depends on something Guardian cannot follow, named here.
+    /// Depends on something that can differ between two runs, named here.
     Unknown(String),
 }
 
@@ -389,103 +348,28 @@ impl Value {
             _ => Self::Derived,
         }
     }
+
+    /// The value of something worked out from this one and `other`.
+    fn mixed(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unknown(why), _) | (_, Self::Unknown(why)) => Self::Unknown(why),
+            _ => Self::Derived,
+        }
+    }
+
+    fn unknown(&self) -> Option<&str> {
+        match self {
+            Self::Unknown(why) => Some(why),
+            _ => None,
+        }
+    }
+
+    fn empty() -> Self {
+        Self::Literal(String::new())
+    }
 }
 
 type Variables = HashMap<String, Value>;
-
-/// The value of the variable `name` where it is expanded.
-fn lookup(name: &str, variables: &Variables) -> Value {
-    match variables.get(name) {
-        Some(value) => value.clone(),
-        // makepkg takes the package base from the first package name.
-        None if name == "pkgbase" && variables.contains_key("pkgname") => {
-            lookup("pkgname", variables)
-        }
-        None if CONFIGURED.contains(&name) => Value::Derived,
-        None => Value::Unknown(format!("${name}, which the recipe does not set")),
-    }
-}
-
-/// `word` as bash expands it, as far as Guardian follows: quotes removed
-/// and plain variables put in.
-fn expand(word: &str, variables: &Variables) -> Value {
-    let mut value = Value::Literal(String::new());
-    let mut push = |part: Value| value = std::mem::replace(&mut value, Value::Derived).join(part);
-    let mut characters = word.chars().peekable();
-    let mut double = false;
-    while let Some(character) = characters.next() {
-        match character {
-            '\'' if !double => {
-                let text: String = characters
-                    .by_ref()
-                    .take_while(|next| *next != '\'')
-                    .collect();
-                push(Value::Literal(text));
-            }
-            '"' => double = !double,
-            '\\' => push(Value::Literal(characters.next().into_iter().collect())),
-            '`' => push(Value::Unknown("a command's output".into())),
-            '$' => match characters.peek().copied() {
-                Some('(') => push(Value::Unknown("a command's output".into())),
-                Some('{') => {
-                    characters.next();
-                    let inner: String = characters
-                        .by_ref()
-                        .take_while(|next| *next != '}')
-                        .collect();
-                    push(braced(&inner, variables));
-                }
-                Some(first) if first.is_ascii_alphabetic() || first == '_' => {
-                    let mut name = String::new();
-                    while let Some(next) =
-                        characters.next_if(|next| next.is_ascii_alphanumeric() || *next == '_')
-                    {
-                        name.push(next);
-                    }
-                    push(lookup(&name, variables));
-                }
-                _ => push(Value::Unknown("a shell parameter".into())),
-            },
-            // A pattern, a list in braces or the home directory: bash
-            // makes other words of these.
-            '*' | '?' | '[' | '{' | '~' | '<' | '>' if !double => push(Value::Derived),
-            _ => push(Value::Literal(character.to_string())),
-        }
-    }
-    value
-}
-
-/// The value of `${inner}`.
-fn braced(inner: &str, variables: &Variables) -> Value {
-    if is_name(inner) {
-        return lookup(inner, variables);
-    }
-    // `${!name}` reads a variable whose name is itself a value.
-    if inner.starts_with('!') || inner.contains('`') || inner.contains("$(") {
-        return Value::Unknown("an indirect expansion or a command's output".into());
-    }
-    let named = |text: &str| -> String {
-        text.chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect()
-    };
-    // The variable it expands, and every other one it reads on the way
-    // (`${list[@]/#/$url/}`).
-    let mut names = vec![named(inner.trim_start_matches('#'))];
-    names.extend(
-        inner
-            .match_indices('$')
-            .map(|(at, _)| named(inner[at + 1..].trim_start_matches('{')))
-            .filter(|name| !name.is_empty()),
-    );
-    names
-        .iter()
-        .find_map(|name| match lookup(name, variables) {
-            Value::Unknown(why) => Some(Value::Unknown(why)),
-            _ => None,
-        })
-        .unwrap_or(Value::Derived)
-}
 
 /// Whether a watched array is one a listing shows (sources, checksums and
 /// the like). The others (`DLAGENTS`, makepkg's directories) change how or
@@ -577,22 +461,14 @@ fn makepkg_functions() -> Option<Vec<String>> {
     Some(names)
 }
 
-/// Whether a function named `name` stands in for something makepkg runs
-/// between loading the recipe and fetching its sources: one of bash's
-/// commands, one of makepkg's own functions, or a program. Where makepkg's
-/// functions (`makepkg`) could not be read, any name may be one.
-fn shadows_command(name: &str, makepkg: Option<&[String]>) -> bool {
-    BUILTINS.contains(&name)
-        || std::path::Path::new("/usr/bin").join(name).exists()
-        || makepkg.is_none_or(|known| known.iter().any(|known| known == name))
-}
-
-/// How a statement depends on what ran before it.
+/// How a command depends on what ran before it, and what its own result
+/// depends on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Condition {
     Always,
-    /// On the machine's architecture only, which is the same in the
-    /// listing and the build, or once for each of a written-out list.
+    /// On values that are the same in the listing and the build (the
+    /// machine's architecture, what the recipe wrote out), or once for
+    /// each of a written-out list.
     Fixed,
     /// On anything else: the listing and the build may differ.
     Open,
@@ -607,188 +483,24 @@ impl Condition {
         }
     }
 
-    fn fixed_if(fixed: bool) -> Self {
-        if fixed { Self::Fixed } else { Self::Open }
-    }
-}
-
-/// Whether `word` reads the architecture and nothing else.
-fn is_arch(word: &str) -> bool {
-    matches!(word.trim_matches('"'), "$CARCH" | "${CARCH}")
-}
-
-/// Whether `words` are a test of the architecture against written-out
-/// names: `[[ $CARCH == x86_64 ]]`. A test of anything else (a file, the
-/// environment) can come out differently in the listing and the build.
-fn is_arch_test(words: &[String]) -> bool {
-    let Some((first, rest)) = words.split_first() else {
-        return false;
-    };
-    matches!(first.as_str(), "[[" | "[" | "test")
-        && rest.iter().any(|word| is_arch(word))
-        && rest.iter().all(|word| {
-            is_arch(word)
-                || matches!(
-                    word.as_str(),
-                    "]]" | "]" | "==" | "=" | "!=" | "!" | "||" | "&&"
-                )
-                || word
-                    .trim_matches(['"', '\''])
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "_*?".contains(c))
-        })
-}
-
-/// One statement with where it stands in the recipe.
-#[derive(Clone, Debug)]
-struct Placed {
-    statement: Statement,
-    /// The function it is in, if any.
-    function: Option<String>,
-    condition: Condition,
-}
-
-/// The name a statement's first words define as a function, how many words
-/// that takes, and whether they open its body too: `name()`, `name ()`,
-/// `function name`, `name(){`.
-fn function_definition(words: &[String]) -> Option<(String, usize, bool)> {
-    let first = words.first()?;
-    let (first, opens) = match first.strip_suffix('{') {
-        Some(rest) if rest.ends_with("()") => (rest, true),
-        _ => (first.as_str(), false),
-    };
-    let (name, mut used) = if first == "function" {
-        (words.get(1)?.trim_end_matches("()").to_string(), 2)
-    } else if let Some(name) = first.strip_suffix("()") {
-        (name.to_string(), 1)
-    } else if words.get(1).map(String::as_str) == Some("()") {
-        (first.to_string(), 2)
-    } else {
-        return None;
-    };
-    if !opens && words.get(used).map(String::as_str) == Some("()") {
-        used += 1;
-    }
-    (!name.is_empty() && !name.contains(['=', '$', '"', '\''])).then_some((name, used, opens))
-}
-
-/// Places every statement: in which function, and under which condition.
-#[derive(Default)]
-struct Placer {
-    /// The open `{` blocks: a function's name, or `None` for a group.
-    blocks: Vec<Option<String>>,
-    /// The open `if`, `case` and loops, and whether each is a `case`.
-    conditions: Vec<(Condition, bool)>,
-    /// A function named on a line that has not opened its body yet.
-    pending: Option<String>,
-    /// What an `a && b` chain's tests so far make of what follows.
-    chain: Option<Condition>,
-    placed: Vec<Placed>,
-    functions: Vec<String>,
-    /// A `}` that closed nothing: the braces are not read as bash does.
-    unbalanced: bool,
-}
-
-impl Placer {
-    fn of(recipe: &str) -> (Self, Vec<usize>) {
-        let (statements, unsure) = statements(recipe);
-        let mut placer = Self::default();
-        for statement in &statements {
-            placer.place(statement);
-        }
-        (placer, unsure)
-    }
-
-    fn condition(&self) -> Condition {
-        self.conditions
-            .iter()
-            .fold(Condition::Always, |all, (condition, _)| all.and(*condition))
-    }
-
-    /// Takes the keywords and braces that open and close blocks off the
-    /// front of `words`, and returns what is left: a command.
-    fn structure<'a>(&mut self, mut words: &'a [String]) -> &'a [String] {
-        loop {
-            if let Some((name, used, opens)) = function_definition(words) {
-                self.functions.push(name.clone());
-                if opens {
-                    self.blocks.push(Some(name));
-                } else {
-                    self.pending = Some(name);
-                }
-                words = &words[used..];
-                continue;
-            }
-            let Some(first) = words.first().map(String::as_str) else {
-                return words;
-            };
-            let in_case = self.conditions.last().is_some_and(|(_, case)| *case);
-            match first {
-                "{" => {
-                    let name = self.pending.take();
-                    self.blocks.push(name);
-                }
-                "then" | "do" | "else" | "!" | "time" => {}
-                "fi" | "esac" | "done" => {
-                    self.conditions.pop();
-                }
-                "if" | "elif" => {
-                    if first == "elif" {
-                        self.conditions.pop();
-                    }
-                    let fixed = Condition::fixed_if(is_arch_test(&words[1..]));
-                    self.conditions.push((fixed, false));
-                }
-                "case" => {
-                    let fixed = Condition::fixed_if(words.get(1).is_some_and(|word| is_arch(word)));
-                    self.conditions.push((fixed, true));
-                    let after = words.iter().position(|word| word == "in");
-                    words = &words[after.map_or(words.len(), |at| at + 1)..];
-                    continue;
-                }
-                "for" | "select" => {
-                    // What it runs over is looked at where it is read.
-                    self.conditions.push((Condition::Fixed, false));
-                    return words;
-                }
-                "while" | "until" => self.conditions.push((Condition::Open, false)),
-                // A pattern of a `case` comes before its commands.
-                _ if in_case && first.ends_with(')') && !first.contains('(') => {}
-                _ => return words,
-            }
-            words = &words[1..];
+    /// The result of a command that read `value`.
+    fn of(value: &Value) -> Self {
+        match value {
+            Value::Unknown(_) => Self::Open,
+            _ => Self::Fixed,
         }
     }
+}
 
-    fn place(&mut self, statement: &Statement) {
-        let chained = match statement.separator {
-            Separator::Chained => self.chain.unwrap_or(Condition::Open),
-            Separator::Plain => Condition::Always,
-        };
-        let words = self.structure(&statement.words).to_vec();
-        // What follows a test in a chain runs only when the test holds.
-        self.chain = Some(chained.and(Condition::fixed_if(is_arch_test(&words))));
-        // A `}` closes a block wherever bash takes it as one (`(x) }`);
-        // taking one too many only shows more of the recipe as top level.
-        let closes = words.iter().filter(|word| *word == "}").count();
-        let function = self.blocks.iter().rev().find_map(Clone::clone);
-        let condition = self.condition().and(chained);
-        for _ in 0..closes {
-            self.unbalanced |= self.blocks.pop().is_none();
-        }
-        let words: Vec<String> = words.into_iter().filter(|word| word != "}").collect();
-        if !words.is_empty() {
-            self.placed.push(Placed {
-                function,
-                condition,
-                statement: Statement {
-                    words,
-                    line: statement.line,
-                    separator: statement.separator,
-                },
-            });
-        }
-    }
+/// Which of bash's expansions a word goes through where it stands.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// A command's word or an array's element: patterns match file names.
+    Words,
+    /// The value of a plain assignment: `~` is the home directory.
+    Value,
+    /// Text compared or cut (`[[ ... ]]`, `case`, `${x#...}`): neither.
+    Text,
 }
 
 /// How a recipe arrives at what makepkg fetches.
@@ -804,199 +516,995 @@ pub enum Sources {
     NotFollowed(Vec<String>),
 }
 
-struct Reader {
+/// A function the recipe defines: its name, its body, and the lines the
+/// body spans.
+type Defined<'a> = (&'a str, &'a [Item], usize, usize);
+
+/// Every function the recipe defines anywhere.
+fn functions<'a>(items: &'a [Item], found: &mut Vec<Defined<'a>>) {
+    for item in items {
+        match &item.command {
+            Command::Function { name, body, end } => {
+                found.push((name, body, item.line(), *end));
+                functions(body, found);
+            }
+            Command::Group(body)
+            | Command::Subshell(body)
+            | Command::For { body, .. }
+            | Command::Other(_, body) => functions(body, found),
+            Command::While(condition, body) => {
+                functions(condition, found);
+                functions(body, found);
+            }
+            Command::If(clauses, otherwise) => {
+                for (condition, body) in clauses {
+                    functions(condition, found);
+                    functions(body, found);
+                }
+                functions(otherwise, found);
+            }
+            Command::Case(_, arms) => arms.iter().for_each(|(_, body)| functions(body, found)),
+            Command::Simple(_) | Command::Test(_) | Command::Arithmetic(_) => {}
+        }
+    }
+}
+
+struct Reader<'a> {
     variables: Variables,
+    /// Variables that hold a whole number, whatever it is: arithmetic on
+    /// anything else can run what the value says.
+    numbers: HashSet<String>,
+    /// Arrays declared with names for keys, which are text, not arithmetic.
+    keyed: HashSet<String>,
     /// The watched arrays written in plain words.
     arrays: Vec<(String, Vec<String>)>,
     derived: bool,
     reasons: Vec<String>,
-    functions: Vec<String>,
-    bodies: Vec<Placed>,
+    functions: HashMap<&'a str, Vec<&'a [Item]>>,
+    /// makepkg's own functions, read when a command's name is first looked
+    /// up.
+    makepkg: std::cell::OnceCell<Option<Vec<String>>>,
+    /// What the command being read depends on.
+    condition: Condition,
+    /// In a function the top level calls, or on a line of `package()` that
+    /// makepkg runs after the recipe is loaded.
+    late: bool,
+    depth: usize,
+    /// For each function being called, what its local variables held.
+    locals: Vec<Vec<(String, Option<Value>)>>,
+    /// Whether the recipe runs a program while it is loaded, which can
+    /// make files.
+    runs: bool,
+    /// The first line with a pattern that reads as an address.
+    address_pattern: Option<usize>,
 }
 
-impl Reader {
+impl<'a> Reader<'a> {
+    fn new(items: &'a [Item]) -> (Self, Vec<Defined<'a>>) {
+        let mut found = Vec::new();
+        functions(items, &mut found);
+        let mut defined: HashMap<&str, Vec<&[Item]>> = HashMap::new();
+        for (name, body, ..) in &found {
+            defined.entry(name).or_default().push(body);
+        }
+        let reader = Self {
+            variables: Variables::new(),
+            numbers: HashSet::new(),
+            keyed: HashSet::new(),
+            arrays: Vec::new(),
+            derived: false,
+            reasons: Vec::new(),
+            functions: defined,
+            makepkg: std::cell::OnceCell::new(),
+            condition: Condition::Always,
+            late: false,
+            depth: 0,
+            locals: Vec::new(),
+            runs: false,
+            address_pattern: None,
+        };
+        (reader, found)
+    }
+
     fn not_followed(&mut self, line: usize, why: &str) {
-        if self.reasons.len() < MAX_REASONS {
-            self.reasons.push(format!("line {line}: {why}"));
+        let reason = format!("line {line}: {why}");
+        if self.reasons.len() < MAX_REASONS && !self.reasons.contains(&reason) {
+            self.reasons.push(reason);
         }
     }
 
-    /// An array assignment: `name=(` or `name+=(`, then its elements.
-    fn array(&mut self, placed: &Placed, name: &str, append: bool, in_call: bool) {
-        let line = placed.statement.line;
-        let open = placed.condition == Condition::Open || in_call;
-        let elements: Vec<Value> = placed.statement.words[1..]
+    fn set(&mut self, name: &str, value: Value) {
+        self.numbers.remove(name);
+        self.variables.insert(name.to_string(), value);
+    }
+
+    /// The value of the variable `name` where it is expanded.
+    fn lookup(&self, name: &str) -> Value {
+        if DYNAMIC.contains(&name) || name.starts_with("BASH") || name.starts_with("EPOCH") {
+            return Value::Unknown(format!("${name}, which differs from one run to the next"));
+        }
+        match self.variables.get(name) {
+            Some(value) => value.clone(),
+            // makepkg takes the package base from the first package name.
+            None if name == "pkgbase" && self.variables.contains_key("pkgname") => {
+                self.lookup("pkgname")
+            }
+            None if CONFIGURED.contains(&name) => Value::Derived,
+            None => Value::Unknown(format!("${name}, which the recipe does not set")),
+        }
+    }
+
+    fn holds_number(&self, name: &str) -> bool {
+        self.numbers.contains(name)
+            || matches!(self.variables.get(name), Some(Value::Literal(text)) if is_number(text))
+    }
+
+    /// `word` as bash expands it, as far as Guardian follows: quotes
+    /// removed and plain variables put in. What it sets or runs on the way
+    /// is noted.
+    fn expand(&mut self, line: usize, word: &str, mode: Mode) -> Value {
+        let mut value = Value::empty();
+        let mut double = false;
+        // Whether the word is a pattern, and one that reads as an address.
+        let mut pattern = None;
+        let mut at = 0;
+        while let Some(character) = after(word, at) {
+            let start = at;
+            at += character.len_utf8();
+            let rest = word.get(at..).unwrap_or_default();
+            let part = match character {
+                '\'' if !double => {
+                    let end = rest.find('\'').unwrap_or(rest.len());
+                    at += end + 1;
+                    Value::Literal(rest.get(..end).unwrap_or_default().to_string())
+                }
+                '"' => {
+                    double = !double;
+                    continue;
+                }
+                '\\' => {
+                    let Some(next) = after(rest, 0) else { break };
+                    at += next.len_utf8();
+                    match next {
+                        '\n' => continue,
+                        _ if double && !"$`\"\\".contains(next) => {
+                            Value::Literal(format!("\\{next}"))
+                        }
+                        _ => Value::Literal(next.to_string()),
+                    }
+                }
+                '`' => {
+                    at += backtick_end(rest).map_or(rest.len(), |end| end + 1);
+                    self.runs = true;
+                    Value::Unknown("a command's output".into())
+                }
+                '$' => {
+                    let (part, used) = self.dollar(line, rest, double);
+                    at += used;
+                    part
+                }
+                '<' | '>' if !double && rest.starts_with('(') => {
+                    self.not_followed(
+                        line,
+                        "a process substitution runs a command while the recipe is read",
+                    );
+                    at += closing(rest.get(1..).unwrap_or_default(), ')', false)
+                        .map_or(rest.len(), |end| end + 2);
+                    Value::Unknown("a command's output".into())
+                }
+                '*' | '?' | '[' if !double && mode == Mode::Words => {
+                    let address = matches!(&value, Value::Literal(text) if text.contains("://"));
+                    pattern = Some(pattern.unwrap_or(true) && address);
+                    Value::Literal(character.to_string())
+                }
+                '~' if !double
+                    && mode != Mode::Text
+                    && (start == 0
+                        || word.get(..start).is_some_and(|b| b.ends_with([':', '=']))) =>
+                {
+                    Value::Unknown("the home directory".into())
+                }
+                // A list in braces makes several words of one, always the
+                // same ones.
+                '{' if !double && mode == Mode::Words && rest.contains('}') => Value::Derived,
+                _ => Value::Literal(character.to_string()),
+            };
+            value = value.join(part);
+        }
+        match pattern {
+            // `git+https://host/repo?signed` matches a file only under a
+            // directory named `git+https:`, which is there for the listing
+            // as for the build unless the recipe makes it while it loads.
+            Some(true) => {
+                self.address_pattern.get_or_insert(line);
+                value
+            }
+            Some(false) if value.unknown().is_none() => Value::Unknown(PATTERN.into()),
+            _ => value,
+        }
+    }
+
+    /// What follows a `$`: the value, and how much of `rest` it took.
+    fn dollar(&mut self, line: usize, rest: &str, double: bool) -> (Value, usize) {
+        let lost = || {
+            (
+                Value::Unknown("quoting Guardian does not follow".into()),
+                rest.len(),
+            )
+        };
+        let inner = rest.get(1..).unwrap_or_default();
+        match after(rest, 0) {
+            Some('(') => {
+                let Some(end) = closing(inner, ')', false) else {
+                    return lost();
+                };
+                let inside = inner.get(..end).unwrap_or_default();
+                let arithmetic = inside
+                    .strip_prefix('(')
+                    .and_then(|text| text.strip_suffix(')'));
+                let value = if let Some(arithmetic) = arithmetic {
+                    self.arithmetic(line, arithmetic)
+                } else {
+                    self.runs = true;
+                    Value::Unknown("a command's output".into())
+                };
+                (value, end + 2)
+            }
+            Some('{') => {
+                let Some(end) = closing(inner, '}', double) else {
+                    return lost();
+                };
+                let value = self.braced(line, inner.get(..end).unwrap_or_default());
+                (value, end + 2)
+            }
+            Some('\'') if !double => {
+                let end = escaped_end(inner, '\'').unwrap_or(inner.len());
+                let text = inner.get(..end).unwrap_or_default();
+                let value = if text.contains('\\') {
+                    Value::Derived
+                } else {
+                    Value::Literal(text.to_string())
+                };
+                (value, (end + 2).min(rest.len()))
+            }
+            Some('"') if !double => (Value::Unknown("a translated text".into()), 0),
+            Some('[') => {
+                self.not_followed(line, "arithmetic in a form Guardian does not follow");
+                let end = inner.find(']').map_or(rest.len(), |end| end + 2);
+                (
+                    Value::Unknown("arithmetic Guardian does not follow".into()),
+                    end,
+                )
+            }
+            Some(first) if first.is_ascii_alphabetic() || first == '_' => {
+                let length = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .count();
+                (self.lookup(rest.get(..length).unwrap_or_default()), length)
+            }
+            Some(first) if first.is_ascii_digit() || "@*#?$!-".contains(first) => {
+                (Value::Unknown("a shell parameter".into()), 1)
+            }
+            _ => (Value::Literal("$".into()), 0),
+        }
+    }
+
+    /// The value of `${inner}`.
+    fn braced(&mut self, line: usize, inner: &str) -> Value {
+        if is_name(inner) {
+            return self.lookup(inner);
+        }
+        let indirect = inner.starts_with('!');
+        let length = inner.starts_with('#') && inner.len() > 1;
+        let body = inner
+            .get(usize::from(indirect || length)..)
+            .unwrap_or_default();
+        let named = body
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .count();
+        let name = body.get(..named).unwrap_or_default();
+        let mut rest = body.get(named..).unwrap_or_default();
+        let mut value = if is_name(name) {
+            self.lookup(name)
+        } else {
+            Value::Unknown("a shell parameter".into())
+        };
+        let mut all = false;
+        if let Some(inside) = rest.strip_prefix('[') {
+            let Some(end) = closing(inside, ']', false) else {
+                return Value::Unknown("quoting Guardian does not follow".into());
+            };
+            let subscript = inside.get(..end).unwrap_or_default();
+            all = matches!(subscript, "@" | "*");
+            value = value.mixed(self.subscript(line, name, subscript));
+            rest = inside.get(end + 1..).unwrap_or_default();
+        }
+        if indirect {
+            // `${!list[@]}` gives a list's positions; `${!name}` reads a
+            // variable whose name is itself a value.
+            return if all && rest.is_empty() {
+                value
+            } else {
+                Value::Unknown("an indirect expansion".into())
+            };
+        }
+        if length || rest.is_empty() {
+            return value;
+        }
+        self.operation(line, name, rest, value)
+    }
+
+    /// `${name<rest>}` where `rest` cuts, replaces or supplies a value.
+    fn operation(&mut self, line: usize, name: &str, rest: &str, value: Value) -> Value {
+        let sets = rest.strip_prefix(":=").or_else(|| rest.strip_prefix('='));
+        if let Some(given) = sets {
+            let given = self.expand(line, given, Mode::Text);
+            if is_watched(name) {
+                self.not_followed(line, &format!("{name} is set inside an expansion"));
+            }
+            if matches!(&value, Value::Literal(text) if !text.is_empty()) || !is_name(name) {
+                return value;
+            }
+            let mixed = value.mixed(given);
+            self.set(name, mixed.clone());
+            return mixed;
+        }
+        let supplies = [":-", "-", ":+", "+", ":?", "?"]
             .iter()
-            .map(|word| expand(word, &self.variables))
+            .find_map(|operator| rest.strip_prefix(operator));
+        if let Some(given) = supplies {
+            return value.mixed(self.expand(line, given, Mode::Text));
+        }
+        match after(rest, 0) {
+            Some('#' | '%' | '/' | '^' | ',') => {
+                value.mixed(self.expand(line, rest.get(1..).unwrap_or_default(), Mode::Text))
+            }
+            Some(':') => {
+                let mut value = value.mixed(Value::Derived);
+                for part in rest.split(':').filter(|part| !part.trim().is_empty()) {
+                    value = value.mixed(self.arithmetic(line, part));
+                }
+                value
+            }
+            Some('@') if matches!(rest, "@Q" | "@E" | "@U" | "@u" | "@L" | "@K" | "@k") => {
+                value.mixed(Value::Derived)
+            }
+            _ => {
+                self.not_followed(line, "an expansion in a form Guardian does not follow");
+                Value::Unknown("an expansion Guardian does not follow".into())
+            }
+        }
+    }
+
+    /// What reading `name[subscript]` depends on.
+    fn subscript(&mut self, line: usize, name: &str, subscript: &str) -> Value {
+        if matches!(subscript, "@" | "*") {
+            Value::empty()
+        } else if self.keyed.contains(name) {
+            self.expand(line, subscript, Mode::Text)
+        } else {
+            self.arithmetic(line, subscript)
+        }
+    }
+
+    /// The names an arithmetic expression reads or sets, and whether it
+    /// sets any. `None` where it holds a form Guardian does not follow.
+    fn arithmetic_names(text: &str) -> Option<(Vec<&str>, bool)> {
+        let mut names = Vec::new();
+        let mut assigns = false;
+        let mut at = 0;
+        let mut previous = ' ';
+        while let Some(character) = after(text, at) {
+            let rest = text.get(at..)?;
+            let mut length = character.len_utf8();
+            match character {
+                '`' | '\\' | '[' | ']' | '@' | '#' | '{' | '}' | '\'' => return None,
+                '$' => {
+                    let name = rest.get(1..)?;
+                    if !name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+                        return None;
+                    }
+                }
+                '=' => {
+                    let compares = "=!<>".contains(previous)
+                        && !text.get(..at)?.ends_with("<<")
+                        && !text.get(..at)?.ends_with(">>");
+                    if rest.starts_with("==") {
+                        length = 2;
+                    } else if !compares {
+                        assigns = true;
+                    }
+                }
+                '+' | '-' if rest.get(1..)?.starts_with(character) => {
+                    assigns = true;
+                    length = 2;
+                }
+                _ if character.is_ascii_alphabetic() || character == '_' => {
+                    length = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .count();
+                    if !previous.is_ascii_digit() {
+                        names.push(rest.get(..length)?);
+                    }
+                }
+                _ => {}
+            }
+            previous = character;
+            at += length;
+        }
+        Some((names, assigns))
+    }
+
+    /// What an arithmetic expression gives. It may hold whole numbers and
+    /// variables that hold one: bash evaluates any other value as an
+    /// expression of its own, which can set a variable or run a command.
+    fn arithmetic(&mut self, line: usize, text: &str) -> Value {
+        let text = text.trim().trim_matches('"');
+        if text.contains("$(") || text.contains('`') {
+            self.runs = true;
+            self.not_followed(
+                line,
+                "arithmetic on a command's output, which bash evaluates",
+            );
+            return Value::Unknown("a command's output".into());
+        }
+        // `${#list[@]}` is a count, and `${name}` is `$name`.
+        let mut value = Value::Derived;
+        let mut plain = String::new();
+        let mut rest = text;
+        while let Some((before, more)) = rest.split_once("${") {
+            let (inner, more) = more.split_once('}').unwrap_or((more, ""));
+            plain.push_str(before);
+            let counted = inner
+                .strip_prefix('#')
+                .map(|name| name.trim_end_matches("[@]").trim_end_matches("[*]"));
+            match counted {
+                Some(name) if is_name(name) => {
+                    plain.push('0');
+                    value = value.mixed(self.lookup(name));
+                }
+                None if is_name(inner) => {
+                    plain.push('$');
+                    plain.push_str(inner);
+                }
+                _ => plain.push('{'),
+            }
+            rest = more;
+        }
+        plain.push_str(rest);
+        let Some((names, assigns)) = Self::arithmetic_names(&plain) else {
+            self.not_followed(line, "arithmetic in a form Guardian does not follow");
+            return Value::Unknown("arithmetic Guardian does not follow".into());
+        };
+        for name in &names {
+            if is_watched(name) {
+                self.not_followed(line, &format!("{name} is used in arithmetic"));
+            } else if self.holds_number(name) {
+                value = value.mixed(self.lookup(name));
+            } else {
+                self.not_followed(
+                    line,
+                    &format!("arithmetic on ${name}, which is not a plain number"),
+                );
+                value = Value::Unknown(format!("arithmetic on ${name}"));
+            }
+        }
+        if assigns {
+            for name in names {
+                let set = if self.condition == Condition::Open {
+                    Value::Unknown(format!("${name}, set under a condition"))
+                } else {
+                    value.clone()
+                };
+                self.set(name, set);
+                self.numbers.insert(name.to_string());
+            }
+        }
+        value
+    }
+
+    /// `[[ ... ]]`, `[ ... ]` or `test`: what its result depends on. A
+    /// comparison of written-out values is the same everywhere; a look at
+    /// a file is not.
+    fn test(&mut self, line: usize, words: &[Word], mode: Mode) -> Condition {
+        let mut status = Condition::Fixed;
+        for (index, word) in words.iter().enumerate() {
+            let text = word.text.as_str();
+            let operator = text.len() <= 3
+                && text.starts_with('-')
+                && text.len() > 1
+                && text.chars().skip(1).all(|c| c.is_ascii_alphabetic());
+            match text {
+                // `[[` evaluates what it compares as numbers; `[` only
+                // reads them.
+                "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" if mode == Mode::Text => {
+                    let before = index.checked_sub(1).and_then(|at| words.get(at));
+                    for operand in before.into_iter().chain(words.get(index + 1)) {
+                        let value = self.arithmetic(line, &operand.text);
+                        status = status.and(Condition::of(&value));
+                    }
+                }
+                "]" | "==" | "=" | "!=" | "!" | "&&" | "||" | "(" | ")" | "<" | ">" | "=~"
+                | "-z" | "-n" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" => {}
+                _ if operator => status = Condition::Open,
+                _ => {
+                    let value = self.expand(line, text, mode);
+                    status = status.and(Condition::of(&value));
+                }
+            }
+        }
+        status
+    }
+
+    /// An array assignment: `name=(` or `name+=(`, then its elements.
+    fn array(&mut self, word: &Word) -> Condition {
+        let line = word.line;
+        let target = word.text.strip_suffix("=(").unwrap_or(&word.text);
+        let (target, append) = match target.strip_suffix('+') {
+            Some(target) => (target, true),
+            None => (target, false),
+        };
+        let name = target.split('[').next().unwrap_or(target);
+        let open = self.condition == Condition::Open || self.late;
+        let elements: Vec<Value> = word
+            .elements
+            .iter()
+            .flatten()
+            .map(|element| self.expand(element.line, &element.text, Mode::Words))
             .collect();
-        let unknown = elements.iter().find_map(|value| match value {
-            Value::Unknown(why) => Some(why.clone()),
-            _ => None,
-        });
+        let unknown = elements
+            .iter()
+            .find_map(|value| value.unknown().map(str::to_string));
+        let status = if unknown.is_some() {
+            Condition::Open
+        } else {
+            Condition::Fixed
+        };
+        // What is added to a value that can differ can differ too.
+        let before = self.variables.get(name).filter(|_| append).cloned();
         if !is_watched(name) {
-            let value = match (unknown, elements.first()) {
-                (Some(why), _) => Value::Unknown(why),
-                (None, _) if open => Value::Unknown(format!("${name}, set under a condition")),
+            let value = match (unknown, before, elements.first()) {
+                (Some(why), ..) | (None, Some(Value::Unknown(why)), _) => Value::Unknown(why),
+                (None, ..) if open => Value::Unknown(format!("${name}, set under a condition")),
                 // `$name` is the array's first element.
-                (None, Some(Value::Literal(first)))
-                    if !append && placed.condition == Condition::Always =>
+                (None, None, Some(Value::Literal(first)))
+                    if !append && target == name && self.condition == Condition::Always =>
                 {
                     Value::Literal(first.clone())
                 }
                 _ => Value::Derived,
             };
-            self.variables.insert(name.to_string(), value);
-            return;
+            self.set(name, value);
+            return status;
         }
         // Later words may read it (`noextract=("${source[@]##*/}")`).
-        self.variables.insert(
-            name.to_string(),
-            unknown.clone().map_or(Value::Derived, Value::Unknown),
-        );
+        let unknown =
+            unknown.or_else(|| before.and_then(|value| value.unknown().map(str::to_string)));
+        self.set(name, unknown.clone().map_or(Value::Derived, Value::Unknown));
         if !is_listed(name) {
-            return self.not_followed(
+            self.not_followed(
                 line,
                 &format!("{name} is set, which changes how or where makepkg fetches"),
             );
-        }
-        if let Some(why) = unknown {
-            return self.not_followed(line, &format!("{name} is built from {why}"));
-        }
-        if open {
-            return self.not_followed(
+        } else if let Some(why) = unknown {
+            self.not_followed(line, &format!("{name} is built from {why}"));
+        } else if open {
+            self.not_followed(
                 line,
                 &format!("{name} is set under a condition or inside a function"),
             );
-        }
-        let literal: Option<Vec<String>> = elements
-            .into_iter()
-            .map(|value| match value {
-                Value::Literal(text) => Some(text),
-                _ => None,
-            })
-            .collect();
-        let again = self.arrays.iter().any(|(known, _)| known == name);
-        match literal {
-            Some(words) if !append && !again && placed.condition == Condition::Always => {
-                self.arrays.push((name.to_string(), words));
+        } else {
+            let written: Option<Vec<String>> = elements
+                .into_iter()
+                .map(|value| match value {
+                    Value::Literal(text) => Some(text),
+                    _ => None,
+                })
+                .collect();
+            let again = self.arrays.iter().any(|(known, _)| known == name);
+            match written {
+                Some(words) if !append && !again && self.condition == Condition::Always => {
+                    self.arrays.push((name.to_string(), words));
+                }
+                _ => self.derived = true,
             }
-            _ => self.derived = true,
         }
+        status
     }
 
-    /// A plain assignment, `name=value`: true when the word was one.
-    fn scalar(&mut self, placed: &Placed, word: &str, in_call: bool) -> bool {
-        let Some((target, value)) = word.split_once('=') else {
-            return false;
-        };
-        let append = target.ends_with('+');
-        let target = target.strip_suffix('+').unwrap_or(target);
-        let name = target.split('[').next().unwrap_or(target);
-        if !is_name(name) {
-            return false;
-        }
+    /// A plain assignment, `name=value`.
+    fn scalar(&mut self, line: usize, assignment: &Assignment<'_>) -> Condition {
+        let name = assignment.name;
+        let given = self.expand(line, assignment.value, Mode::Value);
+        let status = Condition::of(&given);
         if is_watched(name) {
             // One element set by its number, always and to a value that is
             // the same everywhere (`sha256sums[2]=SKIP`), is worked out
             // like any other; nothing else is followed.
-            let index = target.strip_prefix(name).unwrap_or_default();
-            let numbered = index.len() > 2
-                && index.starts_with('[')
-                && index.ends_with(']')
-                && index[1..index.len() - 1]
-                    .chars()
-                    .all(|c| c.is_ascii_digit());
+            let numbered = assignment
+                .subscript
+                .is_some_and(|subscript| !subscript.is_empty() && is_number(subscript));
             let fixed = numbered
                 && is_listed(name)
-                && !append
-                && !in_call
-                && placed.condition != Condition::Open
-                && !matches!(expand(value, &self.variables), Value::Unknown(_));
+                && !assignment.append
+                && !self.late
+                && self.condition != Condition::Open
+                && given.unknown().is_none();
             if fixed {
                 self.derived = true;
             } else {
                 self.not_followed(
-                    placed.statement.line,
+                    line,
                     &format!("{name} is set in a form other than a plain array"),
                 );
             }
-            return true;
+            return status;
         }
-        let value = match expand(value, &self.variables) {
+        let mut value = given;
+        if let Some(subscript) = assignment.subscript {
+            value = value.mixed(self.subscript(line, name, subscript));
+        }
+        if assignment.append {
+            value = value.mixed(self.lookup(name));
+        }
+        let plain = self.condition == Condition::Always && !self.late;
+        let value = match value {
             Value::Unknown(why) => Value::Unknown(why),
-            _ if placed.condition == Condition::Open || in_call => {
+            _ if self.condition == Condition::Open || self.late => {
                 Value::Unknown(format!("${name}, set under a condition"))
             }
-            Value::Literal(text)
-                if placed.condition == Condition::Always && target == name && !append =>
-            {
-                Value::Literal(text)
-            }
+            Value::Literal(text) if plain => Value::Literal(text),
             _ => Value::Derived,
         };
-        self.variables.insert(name.to_string(), value);
-        true
+        self.set(name, value);
+        // A count or a sum is a number, whatever it comes to.
+        let text = assignment.value.trim_matches('"');
+        let whole = |open: &str, close: char| {
+            text.strip_prefix(open)
+                .is_some_and(|rest| closing(rest, close, false) == Some(rest.len() - 1))
+        };
+        let summed = text.starts_with("$((") && text.ends_with("))") && whole("$(", ')');
+        if (whole("${#", '}') || summed) && !text[1..].contains("$(") {
+            self.numbers.insert(name.to_string());
+        }
+        status
     }
 
-    /// A command that assigns to the variables it is given by name.
-    fn assigner(&mut self, placed: &Placed, command: &str, operands: &[String]) {
-        let line = placed.statement.line;
-        let declares = DECLARING.contains(&command);
-        let flags = operands.iter().filter(|word| word.starts_with('-'));
-        if declares && flags.clone().any(|flag| flag.contains('n')) {
-            return self.not_followed(line, "a variable is made a reference to another");
+    /// A plain command: the assignments before it, then the command with
+    /// its words.
+    fn simple(&mut self, words: &[Word]) -> Condition {
+        let mut status = Condition::Fixed;
+        let mut set = Vec::new();
+        let mut rest = words;
+        while let Some((word, more)) = rest.split_first() {
+            if word.elements.is_some() {
+                status = status.and(self.array(word));
+                set.push(word.text.split(['=', '+', '[']).next().unwrap_or_default());
+            } else if let Some(assignment) = Assignment::of(&word.text) {
+                status = status.and(self.scalar(word.line, &assignment));
+                set.push(assignment.name);
+            } else {
+                break;
+            }
+            rest = more;
         }
-        let targets: Vec<&str> = match command {
-            // Only the word after `-v` is assigned.
-            "printf" => operands
-                .iter()
-                .enumerate()
-                .find_map(|(at, word)| match word.strip_prefix("-v") {
-                    Some("") => operands.get(at + 1).map(String::as_str),
-                    Some(name) => Some(name),
-                    None => None,
-                })
-                .into_iter()
-                .collect(),
-            _ => operands
-                .iter()
-                .take_while(|word| !word.starts_with(['<', '>']))
-                .filter(|word| !word.starts_with('-'))
-                .map(String::as_str)
-                .collect(),
+        let Some((command, operands)) = rest.split_first() else {
+            return status;
         };
-        for target in targets {
-            let bare = target.trim_matches(['"', '\'']);
-            let name = bare.split(['=', '+', '[']).next().unwrap_or(bare);
-            if name.contains(['$', '`']) {
+        // Set before a command, they last as long as it runs.
+        for name in set {
+            if is_watched(name) {
+                self.not_followed(command.line, &format!("{name} is set for one command only"));
+            } else {
+                self.set(
+                    name,
+                    Value::Unknown(format!("${name}, set for one command only")),
+                );
+            }
+        }
+        self.run(command, operands, true)
+    }
+
+    fn expand_all(&mut self, words: &[Word]) {
+        for word in words {
+            match &word.elements {
+                Some(_) => {
+                    self.array(word);
+                }
+                None => {
+                    self.expand(word.line, &word.text, Mode::Words);
+                }
+            }
+        }
+    }
+
+    /// The command `command` with its `operands`: what its result depends
+    /// on. `functions`: whether a function of the recipe may answer to the
+    /// name (not after `command` or `builtin`).
+    fn run(&mut self, command: &Word, operands: &[Word], functions: bool) -> Condition {
+        let line = command.line;
+        let name = command.text.as_str();
+        if !is_plain(name) || name.contains('=') {
+            self.not_followed(
+                line,
+                "a command is named by a variable or in quotes, which Guardian does not follow",
+            );
+            return Condition::Open;
+        }
+        if functions && self.functions.contains_key(name) {
+            self.call(line, name);
+            return Condition::Open;
+        }
+        match name {
+            ":" | "true" | "false" => {
+                self.expand_all(operands);
+                return Condition::Fixed;
+            }
+            "[" | "test" => return self.test(line, operands, Mode::Words),
+            "shopt" | "set" => {
+                let known = if name == "set" {
+                    SET_OPTIONS
+                } else {
+                    PATTERN_OPTIONS
+                };
+                if operands
+                    .iter()
+                    .any(|word| !known.contains(&word.text.as_str()))
+                {
+                    self.not_followed(line, &format!("`{name}` changes how bash reads the recipe"));
+                }
+                return Condition::Fixed;
+            }
+            "command" | "builtin" => return self.prefixed(name, operands),
+            "unset" => self.unset(line, operands),
+            "let" => {
+                for word in operands {
+                    self.arithmetic(line, &unquoted(&word.text));
+                }
+            }
+            "printf" | "wait" | "read" | "mapfile" | "readarray" | "getopts" => {
+                self.assigner(line, name, operands);
+            }
+            "exit" | "return" | "break" | "continue" => self.leaves(line, name),
+            "exec" if operands.is_empty() => {}
+            _ if DECLARING.contains(&name) => self.declare(line, name, operands),
+            _ if CONTROL.contains(&name) || name == "exec" => self.not_followed(
+                line,
+                &format!("`{name}` runs or reads in code Guardian does not follow"),
+            ),
+            _ => {
+                self.runs = true;
+                self.expand_all(operands);
+                if !(BUILTINS.contains(&name) || MESSAGES.contains(&name) || name.contains('/'))
+                    && self.is_makepkg_function(name)
+                {
+                    self.not_followed(
+                        line,
+                        &format!("{name}() is one of makepkg's own functions, which Guardian does not follow"),
+                    );
+                }
+            }
+        }
+        Condition::Open
+    }
+
+    fn is_makepkg_function(&self, name: &str) -> bool {
+        self.makepkg
+            .get_or_init(makepkg_functions)
+            .as_ref()
+            .is_none_or(|known| known.iter().any(|known| known == name))
+    }
+
+    /// `command name ...` or `builtin name ...`: the command itself, past
+    /// any function of that name.
+    fn prefixed(&mut self, prefix: &str, operands: &[Word]) -> Condition {
+        let mut rest = operands;
+        while let Some((first, more)) = rest.split_first() {
+            match first.text.as_str() {
+                // Asks whether a command is there.
+                "-v" | "-V" if prefix == "command" => {
+                    self.expand_all(more);
+                    return Condition::Open;
+                }
+                "-p" | "--" => rest = more,
+                _ => return self.run(first, more, false),
+            }
+        }
+        Condition::Open
+    }
+
+    /// `exit`, `return`, `break` or `continue`: what follows it does not
+    /// run.
+    fn leaves(&mut self, line: usize, name: &str) {
+        let stops = matches!(name, "exit" | "return");
+        if stops && !self.late {
+            self.not_followed(line, &format!("`{name}` stops the recipe before its end"));
+        } else if self.condition == Condition::Open {
+            self.not_followed(
+                line,
+                &format!("`{name}` under a condition leaves out what follows it"),
+            );
+        }
+    }
+
+    /// `unset`: the variables it is given are gone.
+    fn unset(&mut self, line: usize, operands: &[Word]) {
+        for word in operands {
+            if matches!(word.text.as_str(), "-v" | "-f" | "-n") {
+                continue;
+            }
+            let Some(plain) = literal(&word.text) else {
+                self.not_followed(line, "unset is given a name Guardian cannot read");
+                continue;
+            };
+            let name = plain.split('[').next().unwrap_or_default();
+            if is_watched(name) {
+                self.not_followed(line, &format!("unset sets {name}"));
+            } else if self.functions.contains_key(name) {
+                self.not_followed(line, &format!("unset removes the function {name}()"));
+            } else if is_name(name) {
+                let value = match self.condition {
+                    Condition::Always if name == plain => Value::empty(),
+                    Condition::Open => Value::Unknown(format!("${name}, set under a condition")),
+                    _ => Value::Derived,
+                };
+                self.set(name, value);
+            }
+        }
+    }
+
+    /// `declare`, `local`, `export` and the like: each word after the
+    /// options is a name, or an assignment.
+    fn declare(&mut self, line: usize, command: &str, operands: &[Word]) {
+        let local = matches!(command, "local" | "declare" | "typeset");
+        let (mut global, mut keyed, mut functions) = (false, false, false);
+        for word in operands {
+            let text = word.text.as_str();
+            if text.starts_with(['-', '+']) && word.elements.is_none() {
+                if !is_plain(text) {
+                    self.not_followed(
+                        line,
+                        &format!("{command} is given options Guardian cannot read"),
+                    );
+                } else if local && text.contains('n') {
+                    self.not_followed(line, "a variable is made a reference to another");
+                } else if local && text.contains('i') {
+                    self.not_followed(line, "a variable is made to evaluate what it is given");
+                }
+                global |= text.contains('g');
+                keyed |= text.contains('A');
+                functions |= text.contains(['f', 'F']);
+                continue;
+            }
+            let assignment = Assignment::of(text);
+            let name = match (&word.elements, &assignment) {
+                (Some(_), _) => text.split(['=', '+', '[']).next().unwrap_or_default(),
+                (None, Some(assignment)) => assignment.name,
+                (None, None) => text,
+            };
+            if functions {
+                continue;
+            }
+            if !is_name(name) {
                 self.not_followed(
                     line,
                     &format!("{command} assigns to a variable named by another"),
                 );
-            } else if is_watched(name) {
+                continue;
+            }
+            if local
+                && !global
+                && let Some(frame) = self.locals.last_mut()
+            {
+                frame.push((name.to_string(), self.variables.get(name).cloned()));
+            }
+            if keyed {
+                self.keyed.insert(name.to_string());
+            }
+            match (&word.elements, assignment) {
+                // Declared without a value, it keeps the one it has.
+                (Some(_), _) | (None, None) if is_watched(name) => {
+                    self.not_followed(line, &format!("{command} sets {name}"));
+                }
+                (Some(_), _) => {
+                    self.array(word);
+                }
+                (None, Some(assignment)) => {
+                    self.scalar(line, &assignment);
+                }
+                (None, None) => {}
+            }
+        }
+    }
+
+    /// A command that assigns to the variables it is given by name
+    /// (`read`, `printf -v`, `mapfile`, `getopts`, `wait -p`).
+    fn assigner(&mut self, line: usize, command: &str, operands: &[Word]) {
+        // The options that take a value, the one whose value is a variable
+        // to set, and whether the words after the options are variables.
+        let (valued, naming, named) = match command {
+            "read" => ("adinNptu", Some('a'), true),
+            "mapfile" | "readarray" => ("dnOsuCc", None, true),
+            "printf" => ("v", Some('v'), false),
+            "wait" => ("p", Some('p'), false),
+            _ => ("", None, false),
+        };
+        let mut targets: Vec<&Word> = Vec::new();
+        let mut glued: Vec<String> = Vec::new();
+        let mut others: Vec<&Word> = Vec::new();
+        let mut words = operands.iter();
+        let mut options = true;
+        while let Some(word) = words.next() {
+            let text = word.text.as_str();
+            if !(options && text.len() > 1 && text.starts_with('-')) {
+                options = false;
+                if named {
+                    targets.push(word);
+                } else {
+                    others.push(word);
+                }
+                continue;
+            }
+            if !is_plain(text) {
+                return self.not_followed(
+                    line,
+                    &format!("{command} is given options Guardian cannot read"),
+                );
+            }
+            if text == "--" {
+                options = false;
+                continue;
+            }
+            if matches!(command, "mapfile" | "readarray") && text.contains('C') {
+                return self
+                    .not_followed(line, &format!("{command} runs a command for what it reads"));
+            }
+            // An option that takes a value takes the rest of its word, or
+            // the next word.
+            let Some(at) = text.find(|c: char| valued.contains(c)) else {
+                continue;
+            };
+            let names = text.get(at..).and_then(|rest| rest.chars().next()) == naming;
+            match (text.get(at + 1..).filter(|rest| !rest.is_empty()), names) {
+                (Some(rest), true) => glued.push(rest.to_string()),
+                (Some(_), false) => {}
+                (None, true) => targets.extend(words.next()),
+                (None, false) => others.extend(words.next()),
+            }
+        }
+        if command == "getopts" {
+            targets.extend(others.get(1).copied());
+        }
+        for word in others {
+            self.expand(word.line, &word.text, Mode::Words);
+        }
+        let targets = targets
+            .into_iter()
+            .map(|word| word.text.clone())
+            .chain(glued);
+        for target in targets.collect::<Vec<_>>() {
+            let plain = literal(&target).unwrap_or_default();
+            let name = plain.split('[').next().unwrap_or_default();
+            if is_watched(name) {
                 self.not_followed(line, &format!("{command} sets {name}"));
             } else if is_name(name) {
-                let given = bare
-                    .split_once('=')
-                    .map(|(_, value)| expand(value, &self.variables));
-                let value = match given {
-                    Some(Value::Unknown(why)) => Value::Unknown(why),
-                    _ if !declares || placed.condition == Condition::Open => {
-                        Value::Unknown(format!("${name}, set by {command}"))
-                    }
-                    Some(_) => Value::Derived,
-                    // Declared without a value: it keeps the one it has.
-                    None => continue,
-                };
-                self.variables.insert(name.to_string(), value);
+                self.set(name, Value::Unknown(format!("${name}, set by {command}")));
+            } else {
+                self.not_followed(
+                    line,
+                    &format!("{command} assigns to a variable named by another"),
+                );
             }
         }
     }
 
     /// A call of a function the recipe defines: its body is read as part
     /// of the top level.
-    fn call(&mut self, line: usize, name: &str, depth: usize) {
-        if depth >= 4 {
+    fn call(&mut self, line: usize, name: &str) {
+        if self.depth >= 4 {
             return self.not_followed(line, "functions call each other too deep to follow");
         }
         if is_standard(name) {
@@ -1005,160 +1513,356 @@ impl Reader {
                 &format!("{name}() is called while the recipe is loaded"),
             );
         }
-        let body: Vec<Placed> = self
-            .bodies
-            .iter()
-            .filter(|placed| placed.function.as_deref() == Some(name))
-            .cloned()
-            .collect();
-        for statement in &body {
-            self.read(statement, true, depth + 1);
-        }
-    }
-
-    /// A `for` loop's variable takes each of the words it runs over.
-    fn for_loop(&mut self, line: usize, operands: &[String]) {
-        let Some((name, list)) = operands.split_first() else {
-            return;
+        let bodies = self.functions.get(name).cloned().unwrap_or_default();
+        let [body] = bodies.as_slice() else {
+            return self.not_followed(line, &format!("{name}() is defined more than once"));
         };
-        let unknown = list
-            .iter()
-            .skip_while(|word| *word != "in")
-            .skip(1)
-            .find_map(|word| match expand(word, &self.variables) {
-                Value::Unknown(why) => Some(why),
-                _ => None,
-            });
-        if let Some(why) = &unknown {
-            self.not_followed(line, &format!("a loop runs over {why}"));
-        }
-        if is_name(name) {
-            self.variables.insert(name.clone(), Value::Derived);
-        }
-    }
-
-    /// One statement at the top level, or (`in_call`) in a function the
-    /// top level calls.
-    fn read(&mut self, placed: &Placed, in_call: bool, depth: usize) {
-        let words = &placed.statement.words;
-        let line = placed.statement.line;
-        if let Some(name) = words.first().and_then(|first| first.strip_suffix("=(")) {
-            let (name, append) = match name.strip_suffix('+') {
-                Some(name) => (name, true),
-                None => (name, false),
-            };
-            if is_name(name) {
-                return self.array(placed, name, append, in_call);
-            }
-        }
-        // `${name:=value}` assigns where it is expanded.
-        for word in words {
-            for (at, _) in word.match_indices("${") {
-                let inner = &word[at + 2..];
-                let name: String = inner
-                    .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .collect();
-                let after = &inner[name.len()..];
-                if (after.starts_with(":=") || after.starts_with('=')) && is_watched(&name) {
-                    self.not_followed(line, &format!("{name} is set inside an expansion"));
+        let late = std::mem::replace(&mut self.late, true);
+        self.depth += 1;
+        self.locals.push(Vec::new());
+        self.list(body, self.condition);
+        // What it declared for itself is gone when it returns.
+        for (local, before) in self.locals.pop().unwrap_or_default().into_iter().rev() {
+            match before {
+                Some(value) => self.set(&local, value),
+                None => {
+                    self.variables.remove(&local);
                 }
             }
         }
-        let mut rest = words.as_slice();
-        while let Some(word) = rest.first() {
-            if !(matches!(word.as_str(), "builtin" | "command")
-                || self.scalar(placed, word, in_call))
-            {
-                break;
+        self.depth -= 1;
+        self.late = late;
+    }
+
+    /// What every variable is known as, to see whether a loop's next round
+    /// reads other values than the one before.
+    fn known(&self) -> BTreeMap<String, u8> {
+        self.variables
+            .iter()
+            .map(|(name, value)| {
+                let kind = match value {
+                    Value::Literal(_) => 0,
+                    Value::Derived => 1,
+                    Value::Unknown(_) => 2,
+                };
+                (name.clone(), kind)
+            })
+            .collect()
+    }
+
+    /// Reads a loop's commands until another round changes nothing: what
+    /// one round sets, the next one reads.
+    fn rounds(&mut self, line: usize, mut round: impl FnMut(&mut Self)) {
+        for _ in 0..6 {
+            let before = self.known();
+            round(self);
+            if self.known() == before {
+                return;
             }
-            rest = &rest[1..];
         }
-        let Some((command, operands)) = rest.split_first() else {
-            return;
+        self.not_followed(line, "a loop Guardian does not follow to its end");
+    }
+
+    /// A `for` loop: its variable takes each of the words it runs over.
+    fn for_loop(&mut self, name: &Word, list: Option<&[Word]>, body: &[Item]) {
+        let line = name.line;
+        let mut under = self.condition.and(Condition::Fixed);
+        // Without a list it runs over the arguments.
+        let mut value = match list {
+            Some(_) => Value::Derived,
+            None => Value::Unknown("a shell parameter".into()),
         };
-        let command = command.as_str();
-        // A watched name given to a command as `name=` may be set by it.
-        for word in operands {
-            let name = word.split(['=', '+', '[']).next().unwrap_or_default();
-            if word.contains('=') && is_watched(name) && !DECLARING.contains(&command) {
+        for word in list.into_iter().flatten() {
+            value = value.mixed(self.expand(word.line, &word.text, Mode::Words));
+        }
+        under = under.and(Condition::of(&value));
+        if is_watched(&name.text) {
+            self.not_followed(line, &format!("a loop sets {}", name.text));
+        } else if !is_name(&name.text) {
+            self.not_followed(line, "a loop sets a variable named by another");
+        }
+        let numbers = list.is_some_and(|list| {
+            list.iter().all(|word| {
+                let text = word.text.trim_matches('"');
+                let positions = text
+                    .strip_prefix("${!")
+                    .and_then(|rest| rest.strip_suffix("[@]}"))
+                    .is_some_and(|array| is_name(array) && !self.keyed.contains(array));
+                is_number(text) || positions
+            })
+        });
+        self.rounds(line, |reader| {
+            reader.set(&name.text, value.clone());
+            if numbers {
+                reader.numbers.insert(name.text.clone());
+            }
+            reader.list(body, under);
+        });
+    }
+
+    fn command(&mut self, command: &Command, line: usize) -> Condition {
+        match command {
+            Command::Simple(words) => return self.simple(words),
+            Command::Test(words) => return self.test(line, words, Mode::Text),
+            Command::Arithmetic(word) => {
+                let inner = word
+                    .text
+                    .strip_prefix("((")
+                    .and_then(|text| text.strip_suffix("))"));
+                let Some(inner) = inner else {
+                    self.not_followed(line, "arithmetic in a form Guardian does not follow");
+                    return Condition::Open;
+                };
+                return Condition::of(&self.arithmetic(line, inner));
+            }
+            Command::Group(items) => {
+                self.list(items, self.condition);
+            }
+            // What a subshell sets is gone when it ends.
+            Command::Subshell(items) => {
+                self.list(items, Condition::Open);
+            }
+            Command::If(clauses, otherwise) => {
+                let mut under = self.condition;
+                for (condition, body) in clauses {
+                    let result = self.list(condition, under);
+                    under = under.and(Condition::Fixed).and(result);
+                    self.list(body, under);
+                }
+                self.list(otherwise, under);
+            }
+            Command::While(condition, body) => {
+                let under = self.condition;
+                self.rounds(line, |reader| {
+                    let result = reader.list(condition, under);
+                    reader.list(body, under.and(Condition::Fixed).and(result));
+                });
+            }
+            Command::For { name, list, body } => self.for_loop(name, list.as_deref(), body),
+            Command::Case(word, arms) => {
+                let value = self.expand(word.line, &word.text, Mode::Text);
+                let mut under = self.condition.and(Condition::of(&value));
+                for (patterns, body) in arms {
+                    for pattern in patterns {
+                        let value = self.expand(pattern.line, &pattern.text, Mode::Text);
+                        under = under.and(Condition::of(&value));
+                    }
+                    self.list(body, under);
+                }
+            }
+            Command::Function { .. } => return Condition::Fixed,
+            Command::Other(what, _) => {
                 self.not_followed(
                     line,
-                    &format!("{name} is set in a form other than a plain array"),
+                    &format!("`{what}` is a form Guardian does not follow"),
                 );
             }
         }
-        let assigns = |word: &String| word.starts_with("-v");
-        match command {
-            _ if CONTROL.contains(&command) => self.not_followed(
-                line,
-                &format!("`{command}` runs or reads in code Guardian does not follow"),
-            ),
-            "exit" | "return" if !in_call => self.not_followed(
-                line,
-                &format!("`{command}` stops the recipe before its end"),
-            ),
-            "printf" if !operands.iter().any(assigns) => {}
-            "printf" | "read" | "mapfile" | "readarray" | "unset" | "let" => {
-                self.assigner(placed, command, operands);
+        Condition::Open
+    }
+
+    /// Reads `items` under `condition`. What comes back is what their
+    /// results depend on, taken together.
+    fn list(&mut self, items: &[Item], condition: Condition) -> Condition {
+        let mut all = Condition::Fixed;
+        let mut chain = Condition::Fixed;
+        for (index, item) in items.iter().enumerate() {
+            let piped = item.join == Join::Pipe
+                || items
+                    .get(index + 1)
+                    .is_some_and(|next| next.join == Join::Pipe);
+            let mut under = if item.join == Join::Sequence {
+                chain = Condition::Fixed;
+                condition
+            } else {
+                condition.and(chain)
+            };
+            // Beside the shell that reads the recipe: what it sets is gone.
+            if piped || item.background {
+                under = Condition::Open;
             }
-            _ if DECLARING.contains(&command) => self.assigner(placed, command, operands),
-            "for" | "select" => self.for_loop(line, operands),
-            _ if self.functions.iter().any(|function| function == command) => {
-                self.call(line, command, depth);
+            let saved = std::mem::replace(&mut self.condition, under);
+            for (target, expands) in &item.redirects {
+                if *expands {
+                    self.not_followed(target.line, "a here-document holds what bash expands");
+                }
+                self.expand(target.line, &target.text, Mode::Words);
             }
-            _ => {}
+            let status = self.command(&item.command, item.line());
+            self.condition = saved;
+            chain = chain.and(status);
+            all = all.and(status);
         }
+        all
+    }
+
+    /// The lines of a `package()` function that makepkg runs while it
+    /// loads the recipe: those that start by setting one of a package's
+    /// attributes. It runs each whole line, so what else stands on it is
+    /// read as top-level code. `started` gets the lines read this way.
+    fn attribute_lines(&mut self, items: &[Item], started: &mut HashSet<usize>) {
+        let mut index = 0;
+        while let Some(item) = items.get(index) {
+            let end = items
+                .iter()
+                .skip(index + 1)
+                .position(|next| next.join == Join::Sequence)
+                .map_or(items.len(), |more| index + 1 + more);
+            if let Command::Simple(words) = &item.command
+                && let Some((first, rest)) = words.split_first()
+                && is_attribute(first.text.split(['=', '+', '[']).next().unwrap_or_default())
+                && (first.elements.is_some() || Assignment::of(&first.text).is_some())
+            {
+                started.insert(first.line);
+                let late = std::mem::replace(&mut self.late, true);
+                let saved = std::mem::replace(&mut self.condition, Condition::Fixed);
+                // makepkg puts the attribute itself in a variable of its
+                // own; the rest of the line runs as written.
+                match (&first.elements, Assignment::of(&first.text)) {
+                    (Some(elements), _) => self.expand_all(elements),
+                    (None, Some(assignment)) => {
+                        self.expand(first.line, assignment.value, Mode::Value);
+                    }
+                    (None, None) => {}
+                }
+                self.simple(rest);
+                for (target, _) in &item.redirects {
+                    self.expand(target.line, &target.text, Mode::Words);
+                }
+                self.list(
+                    items.get(index + 1..end).unwrap_or_default(),
+                    Condition::Open,
+                );
+                self.condition = saved;
+                self.late = late;
+            }
+            index = end;
+        }
+        for item in items {
+            match &item.command {
+                Command::Group(body)
+                | Command::Subshell(body)
+                | Command::For { body, .. }
+                | Command::Function { body, .. }
+                | Command::Other(_, body) => self.attribute_lines(body, started),
+                Command::While(condition, body) => {
+                    self.attribute_lines(condition, started);
+                    self.attribute_lines(body, started);
+                }
+                Command::If(clauses, otherwise) => {
+                    for (condition, body) in clauses {
+                        self.attribute_lines(condition, started);
+                        self.attribute_lines(body, started);
+                    }
+                    self.attribute_lines(otherwise, started);
+                }
+                Command::Case(_, arms) => {
+                    for (_, body) in arms {
+                        self.attribute_lines(body, started);
+                    }
+                }
+                Command::Simple(_) | Command::Test(_) | Command::Arithmetic(_) => {}
+            }
+        }
+    }
+
+    /// The lines of text inside `package()` that makepkg takes for an
+    /// attribute though no command starts there: a line of a
+    /// here-document or of a text over several lines. It finds them in
+    /// the function as bash prints it, where such text stands as written.
+    fn attribute_text(&mut self, recipe: &str, from: usize, to: usize, started: &HashSet<usize>) {
+        let lines = recipe
+            .lines()
+            .enumerate()
+            .skip(from)
+            .take(to.saturating_sub(from));
+        for (index, text) in lines {
+            let line = index + 1;
+            let trimmed = text.trim_start();
+            let name = trimmed.split(['=', '+']).next().unwrap_or_default();
+            let sets = trimmed
+                .get(name.len()..)
+                .is_some_and(|rest| rest.starts_with('=') || rest.starts_with("+="));
+            if started.contains(&line)
+                || trimmed.len() == text.len()
+                || !is_attribute(name)
+                || !sets
+            {
+                continue;
+            }
+            let (tokens, unsure) = lex::tokens(text);
+            match parse::commands(tokens) {
+                Ok(items) if unsure.is_empty() => {
+                    let before = self.reasons.len();
+                    self.attribute_lines(&items, &mut HashSet::new());
+                    // The line numbers inside the piece count from one.
+                    for reason in self.reasons.iter_mut().skip(before) {
+                        let why = reason.split_once(": ").map_or("", |(_, why)| why);
+                        *reason = format!("line {line}: {why}");
+                    }
+                }
+                _ => self.not_followed(
+                    line,
+                    "a line inside package() that makepkg runs while it loads the recipe",
+                ),
+            }
+        }
+    }
+}
+
+/// A recipe read as commands, or the reason it is not followed.
+fn commands(recipe: &str) -> Result<(Vec<Item>, Vec<usize>), String> {
+    let (tokens, unsure) = lex::tokens(recipe);
+    match parse::commands(tokens) {
+        Ok(items) => Ok((items, unsure)),
+        Err(line) => Err(format!(
+            "line {line}: Guardian does not read the recipe's shell as bash does from here"
+        )),
     }
 }
 
 /// Classifies how `recipe` arrives at its sources (see `Sources`).
 pub fn sources(recipe: &str) -> Sources {
-    let (placer, unsure) = Placer::of(recipe);
-    let (top, bodies): (Vec<Placed>, Vec<Placed>) = placer
-        .placed
-        .into_iter()
-        .partition(|placed| placed.function.is_none());
-    let mut reader = Reader {
-        variables: Variables::new(),
-        arrays: Vec::new(),
-        derived: false,
-        reasons: Vec::new(),
-        functions: placer.functions,
-        bodies,
+    let (items, unsure) = match commands(recipe) {
+        Ok(read) => read,
+        Err(why) => return Sources::NotFollowed(vec![why]),
     };
+    let (mut reader, defined) = Reader::new(&items);
     for line in unsure {
         reader.not_followed(
             line,
             "quoting Guardian may read otherwise than the shell does",
         );
     }
-    if placer.unbalanced || !placer.blocks.is_empty() {
-        reader.reasons.push(
-            "the recipe's braces do not pair up as Guardian reads them, so where its functions end is not sure"
-                .into(),
-        );
-    }
     // A function under another name can stand in for a command makepkg
     // itself runs between loading the recipe and fetching the sources.
-    let helpers: Vec<String> = reader
-        .functions
-        .iter()
-        .filter(|name| !is_standard(name))
-        .cloned()
-        .collect();
-    if !helpers.is_empty() {
-        let makepkg = makepkg_functions();
-        for name in helpers {
-            if shadows_command(&name, makepkg.as_deref()) {
-                reader.reasons.push(format!(
-                    "the recipe defines {name}(), which stands in for a command makepkg runs"
-                ));
+    for (name, ..) in &defined {
+        // One of bash's commands, a program, or one of makepkg's own
+        // functions; where those cannot be read, any name may be one.
+        let shadows = BUILTINS.contains(name)
+            || std::path::Path::new("/usr/bin").join(name).exists()
+            || reader.is_makepkg_function(name);
+        if !is_standard(name) && shadows {
+            let reason =
+                format!("the recipe defines {name}(), which stands in for a command makepkg runs");
+            if !reader.reasons.contains(&reason) {
+                reader.reasons.push(reason);
             }
         }
     }
-    for placed in &top {
-        reader.read(placed, false, 0);
+    reader.list(&items, Condition::Always);
+    for (name, body, from, to) in defined {
+        if is_package(name) {
+            let mut started = HashSet::new();
+            reader.attribute_lines(body, &mut started);
+            reader.attribute_text(recipe, from, to, &started);
+        }
+    }
+    if let Some(line) = reader.address_pattern.filter(|_| reader.runs) {
+        reader.not_followed(
+            line,
+            &format!("a source is {PATTERN}, and the recipe runs commands"),
+        );
     }
     if !reader.reasons.is_empty() {
         reader.reasons.truncate(MAX_REASONS);
@@ -1174,32 +1878,13 @@ pub fn sources(recipe: &str) -> Sources {
 /// first, for reading its functions' commands as they will run
 /// (`./$_binary`).
 pub fn written_variables(recipe: &str) -> Vec<(String, String)> {
-    let (placer, _) = Placer::of(recipe);
-    let mut variables = Variables::new();
-    let top = placer
-        .placed
-        .iter()
-        .filter(|placed| placed.function.is_none());
-    for placed in top {
-        let words = &placed.statement.words;
-        let Some((name, value)) = words.first().and_then(|word| word.split_once('=')) else {
-            continue;
-        };
-        if !is_name(name) {
-            continue;
-        }
-        let value = if placed.condition != Condition::Always {
-            Value::Derived
-        } else if value == "(" {
-            words
-                .get(1)
-                .map_or(Value::Derived, |first| expand(first, &variables))
-        } else {
-            expand(value, &variables)
-        };
-        variables.insert(name.to_string(), value);
-    }
-    let mut written: Vec<(String, String)> = variables
+    let Ok((items, _)) = commands(recipe) else {
+        return Vec::new();
+    };
+    let (mut reader, _) = Reader::new(&items);
+    reader.list(&items, Condition::Always);
+    let mut written: Vec<(String, String)> = reader
+        .variables
         .into_iter()
         .filter_map(|(name, value)| match value {
             Value::Literal(text) => Some((name, text)),
@@ -1211,9 +1896,101 @@ pub fn written_variables(recipe: &str) -> Vec<(String, String)> {
     written
 }
 
+/// Whether `text` holds `name` as a whole word that is not being expanded
+/// (`$NAME`, `${NAME...}`).
+fn names_bare(text: &str, name: &str) -> bool {
+    let word = |character: char| character.is_ascii_alphanumeric() || character == '_';
+    text.match_indices(name).any(|(index, _)| {
+        let before = text[..index].chars().next_back();
+        let after = text[index + name.len()..].chars().next();
+        !before.is_some_and(|character| word(character) || character == '$' || character == '{')
+            && !after.is_some_and(word)
+    })
+}
+
+/// The names `top_level_naming` looks for.
+pub struct Naming<'a> {
+    /// Variables that may not be assigned.
+    pub set: &'a [&'a str],
+    /// Variables that may not be given by name to one of `assigners`.
+    pub given: &'a [&'a str],
+    pub assigners: &'a [&'a str],
+}
+
+/// The lines outside any function where `items` name what `names` holds.
+fn naming_lines(items: &[Item], names: &Naming<'_>, found: &mut Vec<usize>) {
+    for item in items {
+        match &item.command {
+            Command::Simple(words) => {
+                let texts: Vec<String> = words.iter().map(|word| unquoted(&word.text)).collect();
+                let assigned = texts.iter().any(|text| {
+                    let name = text.split(['=', '+', '[']).next().unwrap_or_default();
+                    text.contains('=') && names.set.contains(&name)
+                });
+                // A name given to a command that assigns (`printf -v`,
+                // `read`), or to one named by a variable.
+                let mut command = texts
+                    .iter()
+                    .skip_while(|text| Assignment::of(text).is_some() || text.ends_with("=("))
+                    .skip_while(|text| {
+                        matches!(text.as_str(), "command" | "builtin" | "-p" | "--")
+                    });
+                let assigns = command.next().is_some_and(|text| {
+                    names.assigners.contains(&text.as_str()) || text.contains(['$', '`'])
+                });
+                let given = assigns
+                    && command.any(|text| names.given.iter().any(|name| names_bare(text, name)));
+                if assigned || given {
+                    found.extend(words.first().map(|word| word.line));
+                }
+            }
+            Command::For { name, body, .. } => {
+                if names.set.contains(&unquoted(&name.text).as_str()) {
+                    found.push(name.line);
+                }
+                naming_lines(body, names, found);
+            }
+            Command::Group(body) | Command::Subshell(body) | Command::Other(_, body) => {
+                naming_lines(body, names, found);
+            }
+            Command::While(condition, body) => {
+                naming_lines(condition, names, found);
+                naming_lines(body, names, found);
+            }
+            Command::If(clauses, otherwise) => {
+                for (condition, body) in clauses {
+                    naming_lines(condition, names, found);
+                    naming_lines(body, names, found);
+                }
+                naming_lines(otherwise, names, found);
+            }
+            Command::Case(_, arms) => {
+                for (_, body) in arms {
+                    naming_lines(body, names, found);
+                }
+            }
+            Command::Function { .. } | Command::Test(_) | Command::Arithmetic(_) => {}
+        }
+    }
+}
+
+/// The lines of `recipe`, outside its functions, that set one of the
+/// variables in `names` or give one to a command that assigns, however the
+/// name is quoted (`declare BUILD''DIR=x`, `printf -v "SRCDEST"`). `None`
+/// where the recipe is not read as commands.
+pub fn top_level_naming(recipe: &str, names: &Naming<'_>) -> Option<Vec<usize>> {
+    let (items, _) = commands(recipe).ok()?;
+    let mut found = Vec::new();
+    naming_lines(&items, names, &mut found);
+    found.sort_unstable();
+    found.dedup();
+    Some(found)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Sources, sources, statements, written_variables};
+    use super::lex::{Token, tokens};
+    use super::{Naming, Sources, sources, top_level_naming, written_variables};
 
     fn written(recipe: &str) -> Vec<(String, Vec<String>)> {
         match sources(recipe) {
@@ -1222,20 +1999,38 @@ mod tests {
         }
     }
 
+    /// The words of each command, an array's elements after its name.
     fn words(recipe: &str) -> Vec<Vec<String>> {
-        statements(recipe)
-            .0
-            .into_iter()
-            .map(|statement| statement.words)
-            .collect()
+        let mut commands = vec![Vec::new()];
+        for token in tokens(recipe).0 {
+            match token {
+                Token::Word(word) => {
+                    let elements = word.elements.unwrap_or_default();
+                    let last = commands.last_mut().unwrap();
+                    last.push(word.text);
+                    last.extend(elements.into_iter().map(|element| element.text));
+                }
+                Token::Operator(..) => commands.push(Vec::new()),
+                Token::Redirect { target, .. } => {
+                    let last = commands.last_mut().unwrap();
+                    last.push(format!("> {}", target.text));
+                }
+            }
+        }
+        commands.retain(|command| !command.is_empty());
+        commands
     }
 
     fn list(words: &[&str]) -> Vec<String> {
         words.iter().map(ToString::to_string).collect()
     }
 
+    fn not_followed(recipe: &str) -> bool {
+        matches!(sources(recipe), Sources::NotFollowed(ref why) if !why.is_empty())
+    }
+
     #[test]
-    fn statements_are_split_as_bash_splits_them() {
+    fn words_are_split_as_bash_splits_them() {
         assert_eq!(
             words("a=1; b=\"x ; y\" # c=3\nsource=(one\n  'two three' # note\n  four)\n"),
             [
@@ -1245,12 +2040,12 @@ mod tests {
             ]
         );
         // A substitution, a redirection and a here-document are no
-        // statement ends; `${#x}` and `$#` are no comments.
+        // command ends; `${#x}` and `$#` are no comments.
         assert_eq!(
             words("x=$(a; b | c) y=${#z} 2>&1\ncat <<EOF\nsource=(evil)\nEOF\nz=1\n"),
             [
-                list(&["x=$(a; b | c)", "y=${#z}", "2>&1"]),
-                list(&["cat", "<<"]),
+                list(&["x=$(a; b | c)", "y=${#z}", "> 1"]),
+                list(&["cat", "> "]),
                 list(&["z=1"]),
             ]
         );
@@ -1264,7 +2059,29 @@ mod tests {
                 list(&["z=2"]),
             ]
         );
-        assert_eq!(statements("a\n\nb && c\n").0[2].line, 3);
+        // Two arrays set by one command are two arrays.
+        assert_eq!(
+            words("depends=(a) source=(b c)\n"),
+            [list(&["depends=(", "a", "source=(", "b", "c"])]
+        );
+    }
+
+    #[test]
+    fn a_here_document_ends_at_its_marker_however_it_is_written() {
+        for recipe in [
+            "cat <<X>/dev/null\ntext\nX\nsource=(a)\n",
+            "cat <<X;:\ntext\nX\nsource=(a)\n",
+            "cat <<'X'|cat\n$(text)\nX\nsource=(a)\n",
+            "cat <<-X\n\ttext\n\tX\nsource=(a)\n",
+            "cat << \"X Y\"\ntext\nX Y\nsource=(a)\n",
+            "cat <<\\X\n`text`\nX\nsource=(a)\n",
+            "cat <<A <<B\none\nA\ntwo\nB\nsource=(a)\n",
+        ] {
+            assert_eq!(written(recipe)[0].1, ["a"], "{recipe}");
+        }
+        // One that never ends, or whose text bash expands, hides code.
+        assert!(not_followed("source=(a)\ncat <<X\ntext\n"));
+        assert!(not_followed("source=(a)\ncat <<X\n${source:=evil}\nX\n"));
     }
 
     #[test]
@@ -1286,10 +2103,28 @@ sha256sums=('abc'\n            SKIP 'SKIP')\nbuild() {\n  local source=x\n  eval
                 ("sha256sums".to_string(), list(&["abc", "SKIP", "SKIP"])),
             ]
         );
+        // A signed checkout's `?` matches no file: no directory is named
+        // like an address, unless the recipe makes one while it loads.
+        let signed = "url=https://example.org/x\nsource=(git+$url.git?signed#tag=v1)\n";
+        assert_eq!(
+            written(signed)[0].1,
+            ["git+https://example.org/x.git?signed#tag=v1"]
+        );
+        assert!(not_followed(&format!(
+            "mkdir -p git+https:/example.org\n{signed}"
+        )));
+        assert!(not_followed(&format!(
+            "_x=$(mkdir -p git+https:)\n{signed}"
+        )));
+        assert!(not_followed("source=(x?signed::https://example.org/x)\n"));
         // The package base is the first package name.
         assert_eq!(
             written("pkgname=(one two)\nsource=($pkgbase.tar)\n")[0].1,
             ["one.tar"]
+        );
+        assert_eq!(
+            written("export _x=1\nsource=(\"$_x.tar\")\n")[0].1,
+            ["1.tar"]
         );
     }
 
@@ -1303,14 +2138,18 @@ sha256sums=('abc'\n            SKIP 'SKIP')\nbuild() {\n  local source=x\n  eval
             "[[ $CARCH == x86_64 ]] && source+=(a)\n",
             "[[ $CARCH == x86_64 || $CARCH == i686 ]] && source+=(a)\n",
             "if [ \"$CARCH\" = aarch64 ]; then\n  source=(b)\nelse\n  source=(c)\nfi\n",
+            // Both ways set a written-out value.
+            "if [[ $CARCH == x86_64 ]]; then _a=amd64; else _a=arm64; fi\nsource=(\"x-$_a.tar\")\n",
+            "[[ $CARCH == x86_64 ]] && _a=amd64 || _a=arm64\nsource=(\"x-$_a.tar\")\n",
+            "pkgver=1.2rc1\nif [[ $pkgver == *rc* ]]; then _d=testing; else _d=stable; fi\nsource=(\"$_d/x.tar\")\n",
             "_langs=(de fr)\nsource=()\nfor _l in \"${_langs[@]}\"; do\n  source+=(\"$_l.xpi\")\ndone\n",
             "source=({a,b}.tar)\n",
-            "export _x=1\nsource=(\"$_x.tar\")\n",
             // An element set by its number, always (pacman-contrib#119).
             "source=(a b)\nsha256sums=(x y)\nsha256sums[1]='SKIP'\n",
             "source=(a/b.tar c)\nnoextract=(\"${source[@]##*/}\")\n",
             "_names=(a b)\n_url=https://example.org\nsource=(\"${_names[@]/#/$_url/}\")\n",
             "create_links() { :; }\nsource=(a)\nsource+=(b)\n",
+            "_n=$(nproc)\nif test \"$_n\" -ge 4; then _j=4; fi\nsource=(a)\nsource+=(b)\n",
         ] {
             assert_eq!(sources(recipe), Sources::Derived, "{recipe}");
         }
@@ -1339,7 +2178,7 @@ sha256sums=('abc'\n            SKIP 'SKIP')\nbuild() {\n  local source=x\n  eval
             "readarray -t sha256sums < list\n",
             "if [ -e /.dockerenv ]; then source=(a); fi\n",
             "case $HOME in /home/*) source=(a) ;; esac\n",
-            "while true; do source+=(a); break; done\n",
+            "while read -r _l; do source+=(a); done < list\n",
             "for x in $(ls); do source+=(a); done\n",
             "_f() { source=(evil); }\n_f\n",
             "_f() { eval \"$1\"; }\n_f x\n",
@@ -1370,38 +2209,290 @@ sha256sums=('abc'\n            SKIP 'SKIP')\nbuild() {\n  local source=x\n  eval
             "_f() {\n  :\nsource=(a)\n",
             "x=\"unclosed\nsource=(a)\n",
         ] {
-            assert!(
-                matches!(sources(recipe), Sources::NotFollowed(ref why) if !why.is_empty()),
-                "{recipe}: {:?}",
-                sources(recipe)
-            );
+            assert!(not_followed(recipe), "{recipe}: {:?}", sources(recipe));
+        }
+    }
+
+    /// Each of these gave another answer in the listing than in the build
+    /// while reading as plain: the guard looks at something the listing's
+    /// jail changes.
+    #[test]
+    fn a_guard_bash_applies_is_one_guardian_sees() {
+        let guard = "[[ -w PKGBUILD ]]";
+        for body in [
+            // A new line after `&&` ends no chain.
+            "G &&\nsource=(evil)\n",
+            "G ||\n\n  source=(evil)\n",
+            // A group, a subshell or a compound command under a chain.
+            "G && {\n  :\n  source=(evil)\n}\n",
+            "G && { :; source+=(evil); }\n",
+            "G || if true; then source=(evil); fi\n",
+            "G && for _x in a; do source=(evil); done\n",
+            "G && case a in a) source=(evil) ;; esac\n",
+            "if G; then :; else source=(evil); fi\n",
+            "if true; then G || source=(evil); fi\n",
+            "G && _v=evil\nsource=(\"$_v\")\n",
+            "G && { _v=evil; }\nsource=(\"good$_v\")\n",
+            "! G || source=(evil)\n",
+            "G; (( $? )) && source=(evil)\n",
+            "G && x=(a) source=(evil)\n",
+            "G && return\nsource+=(evil)\n",
+            "_f() { G && return; source=(evil); }\n_f\n",
+            "for _x in a b; do G && break; source=(evil); done\n",
+        ] {
+            let recipe = format!("source=(good)\n{}", body.replace('G', guard));
+            assert!(not_followed(&recipe), "{recipe}: {:?}", sources(&recipe));
+        }
+    }
+
+    #[test]
+    fn a_command_named_in_quotes_or_by_a_variable_is_not_followed() {
+        for recipe in [
+            "_f() { source=(evil); }\n\"_f\"\n",
+            "_f() { source=(evil); }\n_f''\n",
+            "_f() { source=(evil); }\n_g=_f\n$_g\n",
+            "\\eval 'source=(evil)'\n",
+            "'eval' 'source=(evil)'\n",
+            "_e=eval\n$_e 'source=(evil)'\n",
+            "\\. ./more.sh\n",
+            "\"source\" ./more.sh\n",
+            "command eval 'source=(evil)'\n",
+            "builtin source ./more.sh\n",
+            "command -p builtin eval x\n",
+            "e\"\"val x\n",
+            "${_x:-eval} x\n",
+            // A function makepkg itself defines.
+            "array_build source _x\n",
+            "source_safe ./more.sh\n",
+            "_f() { :; }\n_f() { source=(evil); }\n_f\n",
+            "_f() { :; }\nunset -f _f\n_f\n",
+        ] {
+            assert!(not_followed(recipe), "{recipe}: {:?}", sources(recipe));
+        }
+    }
+
+    #[test]
+    fn a_watched_name_given_to_a_command_in_any_quoting_is_seen() {
+        for recipe in [
+            "printf -v s''ource %s evil\n",
+            "printf -vsource %s evil\n",
+            "read sou\\rce\n",
+            "read -r \"source\" < f\n",
+            "read -rasource < f\n",
+            "declare s\"ource\"=x\n",
+            "declare 'source=x'\n",
+            "local sou\\rce=x\n",
+            "typeset \"$_n\"=x\n",
+            "export \"source\"\n",
+            "readonly 's'ource\n",
+            "mapfile -t 'source' < f\n",
+            "readarray \"source\" < f\n",
+            "mapfile -C 'source=(evil);:' -c 1 _x < f\n",
+            "getopts a source\n",
+            "getopts a \"sou\"rce\n",
+            "let source=1\n",
+            "let 'BUILDDIR = 5'\n",
+            "(( source = 1 ))\n",
+            "(( BUILDDIR++ ))\n",
+            "_e='source=1'\n(( _e ))\n",
+            "_e='source[0]=1'\n_v=$(( _e ))\n",
+            "_e='x[$(id)]'\n[[ $_e -eq 1 ]] && :\n",
+            "[[ $(cat f) -eq 1 ]] && :\n",
+            "_v=$(cat f)\n[[ $_v -ge 0 ]] && :\n",
+            "_e='x[$(id)]'\n_a=(1 2)\n_v=${_a[$_e]}\n",
+            ": ${source:=x}\n",
+            ": \"${source=x}\"\n",
+            "_v=${noextract:=x}\n",
+            "echo ${_a:-${source:=x}}\n",
+            "coproc source { :; }\n",
+            "declare -n _r=source\n_r=(evil)\n",
+            "declare -n _r\n",
+            "declare -i _i\n_i='source=1'\n",
+            "for source in evil; do :; done\n",
+            "for sha256sums in a; do :; done\n",
+            "select source in evil; do :; done\n",
+            "while read source; do :; done < f\n",
+            "while read -r _x source; do :; done < f\n",
+            "wait -p source\n",
+            "exec {source}>f\n",
+            "unset 'source'\n",
+            "unset sou\\rce\n",
+            "_x=1 source=(evil) true\n",
+        ] {
+            assert!(not_followed(recipe), "{recipe}: {:?}", sources(recipe));
+        }
+    }
+
+    #[test]
+    fn what_can_differ_between_two_runs_reaches_no_source() {
+        for value in [
+            "/home/*/.bash_history",
+            "*.patch",
+            "x?.tar",
+            "[ab].tar",
+            "~/x.tar",
+            "~user/x",
+            "$HOME/x",
+            "$USER",
+            "$PWD",
+            "$RANDOM",
+            "$SECONDS",
+            "$EPOCHSECONDS",
+            "$$",
+            "$PPID",
+            "$HOSTNAME",
+            "$UID",
+            "$EUID",
+            "$BASHPID",
+            "${BASH_VERSION}",
+            "$SHLVL",
+            "$TERM",
+            "$DISPLAY",
+            "$WAYLAND_DISPLAY",
+            "$XDG_RUNTIME_DIR",
+            "$PATH",
+            "$1",
+            "$@",
+            "$?",
+            "$(id -u)",
+            "`id -u`",
+            "$((RANDOM % 2))",
+            "$(( $(id -u) + 1 ))",
+            "${_unset:-x}",
+            "${HOME:+x}",
+            "${HOME##*/}",
+            "${#HOME}",
+            "<(echo x)",
+            ">(cat)",
+            "$\"text\"",
+            "$[1+1]",
+        ] {
+            // In a source, in a variable a source reads, and in what a
+            // condition or a loop depends on.
+            for recipe in [
+                format!("source=(good {value})\n"),
+                format!("_x=({value})\nsource=(good ${{_x[0]:+evil}})\n"),
+                format!("_x=({value})\nsource=(good)\n[[ -n $_x ]] && source+=(evil)\n"),
+                format!("source=(good)\nfor _f in {value}; do source+=(evil); done\n"),
+                format!(
+                    "_x=({value})\nsource=(good)\ncase ${{_x[0]}} in ?*) source+=(evil) ;; esac\n"
+                ),
+                format!("_x=({value})\n_y=a\n_y+=$_x\nsource=(\"$_y\")\n"),
+            ] {
+                assert!(not_followed(&recipe), "{recipe}: {:?}", sources(&recipe));
+            }
+        }
+        // Looking at a file, or asking whether a command is there.
+        for test in [
+            "[[ -e /x ]]",
+            "[[ -f x ]]",
+            "[[ -d x ]]",
+            "[[ -w . ]]",
+            "[[ -r x ]]",
+            "[[ -x x ]]",
+            "[[ -s x ]]",
+            "[[ -t 1 ]]",
+            "[[ (-e x) ]]",
+            "[[ a == a && -e x ]]",
+            "[ -e x ]",
+            "test -e x",
+            "[ x = * ]",
+            "type git",
+            "command -v git",
+            "hash git",
+            "git --version",
+            "cd /x",
+            "{ true; }",
+            "(true)",
+            "ls | grep -q x",
+            "[[ a < $HOME ]]",
+        ] {
+            for recipe in [
+                format!("source=(good)\n{test} && source+=(evil)\n"),
+                format!("source=(good)\nif {test}; then source+=(evil); fi\n"),
+                format!("source=(good)\nwhile {test}; do source+=(evil); done\n"),
+                format!("_v=good\n{test} || _v=evil\nsource=($_v)\n"),
+            ] {
+                assert!(not_followed(&recipe), "{recipe}: {:?}", sources(&recipe));
+            }
+        }
+        // What one round of a loop sets, the next one reads.
+        assert!(not_followed(
+            "_c=a\nfor _i in 1 2 3; do source+=($_c); _c=$_b; _b=$_a; _a=$(id); done\n"
+        ));
+        // A variable set beside the shell, or for a function only, keeps
+        // what the environment gave it.
+        for recipe in [
+            "(_v=good)\nsource=($_v)\n",
+            "_v=good | true\nsource=($_v)\n",
+            "_v=good &\nsource=($_v)\n",
+            "_v=good true\nsource=($_v)\n",
+            "_f() { local HOME=good; }\n_f\nsource=($HOME)\n",
+        ] {
+            assert!(not_followed(recipe), "{recipe}: {:?}", sources(recipe));
+        }
+    }
+
+    #[test]
+    fn lines_of_package_that_makepkg_runs_are_read_as_top_level() {
+        for recipe in [
+            "source=(a)\npackage() {\n  depends=(foo) source=($([[ -w PKGBUILD ]] && echo evil || echo good))\n}\n",
+            "source=(a)\npackage() { depends=(foo) source=(evil); }\n",
+            "source=(a)\npackage_demo() {\n  pkgdesc=x source=(evil)\n}\n",
+            "source=(a)\npackage() {\n  if true; then\n    depends+=(foo) && source=(evil)\n  fi\n}\n",
+            "source=(a)\npackage() {\n  depends=(foo) BUILDDIR=/x\n}\n",
+            "source=(a)\npackage() {\n  depends=(${source:=evil})\n}\n",
+            "source=(a)\npackage() {\n  depends=(foo) && eval x\n}\n",
+            "source=(a)\npackage() {\n  depends=(>(printf x))\n}\n",
+            "source=(a)\npackage() {\n  options=(a) sha256sums=(evil)\n}\n",
+            // Text that bash prints back as a line of its own.
+            "source=(a)\npackage() {\n  cat <<E\n depends=(h) source=(evil)\nE\n}\n",
+            "source=(a)\npackage() {\n  echo \"x\n depends=(s) source=(evil)\"\n}\n",
+        ] {
+            assert!(not_followed(recipe), "{recipe}: {:?}", sources(recipe));
+        }
+        // An attribute alone on its line sets nothing else.
+        for recipe in [
+            "source=(a)\npackage() {\n  depends=(foo\n    bar)\n  pkgdesc=\"x $pkgname\"\n  provides=(\"x=$pkgver\")\n  source=(evil)\n}\n",
+            "source=(a)\npackage() {\n  depends=($(echo x))\n  install -Dm644 a b\n  cat <<E\n url=https://example.org\nE\n}\n",
+            "source=(a)\nbuild() {\n  depends=(foo) source=(evil)\n}\n",
+        ] {
+            assert_eq!(written(recipe)[0].1, ["a"], "{recipe}");
         }
     }
 
     #[test]
     fn quoting_that_bash_reads_as_one_word_hides_nothing() {
         // `$'\''` is one quote character; what follows is code.
-        assert!(matches!(
-            sources("x=$'\\''; eval evil #'\n"),
-            Sources::NotFollowed(_)
-        ));
+        assert!(not_followed("x=$'\\''; eval evil #'\n"));
         // A comment inside a substitution opens no quote.
-        assert!(matches!(
-            sources("_x=$(echo a # it's\n)\neval evil # '\n"),
-            Sources::NotFollowed(_)
-        ));
-        // A `}` given to a command closes nothing in bash; reading it as a
-        // close shows more as top level, never less.
-        assert!(matches!(
-            sources("_f() { echo }; eval evil; }\n"),
-            Sources::NotFollowed(_)
-        ));
+        assert!(not_followed("_x=$(echo a # it's\n)\neval evil # '\n"));
+        // A `}` given to a command closes nothing.
+        assert_eq!(
+            written("_g() { echo }; }\nbuild() { _g; }\nsource=(a)\n")[0].1,
+            ["a"]
+        );
         // `${ ... }` holds blanks and `&` without ending a statement, so
         // the function's closing brace is the one bash takes.
         assert_eq!(
             sources("build() {\n  x=${CFLAGS/-g }\n  y=${v/a/&b}\n  eval z\n}\nsource=(a)\n"),
             Sources::Written(vec![("source".into(), vec!["a".into()])])
         );
+        // `[[` is bash's own only where a command starts; `#` is no
+        // comment in a pattern list or in arithmetic; a quote inside a
+        // substitution inside quotes is a quote.
+        for recipe in [
+            "echo [[ ; source=(evil); : ]]\n",
+            "echo @(a|#b) ; source=(evil)\n: )\n",
+            ": $(( 1 #) )); source=(evil)\n: ) )\n",
+            "_x=\"$(echo ')' ; echo \" )\"; source=(evil) #\"\n",
+        ] {
+            assert!(
+                !matches!(sources(recipe), Sources::Written(ref arrays) if arrays.is_empty()),
+                "{recipe}: {:?}",
+                sources(recipe)
+            );
+        }
     }
 
     #[test]
@@ -1416,6 +2507,11 @@ sha256sums=('abc'\n            SKIP 'SKIP')\nbuild() {\n  local source=x\n  eval
             "build() {\n  if true; then\n    make\n  fi\n  for x in a; do :; done\n}\nsource=(a)\n",
             "package(){\n  install -Dm755 x \"${pkgdir}/usr/bin/x\"\n}\nsource=(a)\n",
             "function _f {\n  :\n}\nsource=(a)\n",
+            // Shell that only a function runs is read past, whatever it is.
+            "source=(a)\nbuild() {\n  case $x in\n    a|b) make ;;\n    (c) : ;&\n    *) rm !(keep) ;;\n  esac\n  while read -r l; do :; done < <(ls)\n  for ((i=0; i<3; i++)); do :; done\n  [[ $x =~ ^(a|b)$ ]] && (cd x && make) |& tee log &>/dev/null\n  cat > f <<-EOF\n\t$x )\n\tEOF\n  x=$(( 1 << 2 ))\n  y=$(sed s/a/b/ <<< \"$x\")\n}\n",
+            // Programs and what they are given depend on the run; they set
+            // nothing in the shell that reads the recipe.
+            "source=(a)\necho \"$HOME\" *.c > /dev/null\n[[ -e x ]] && msg hello\n",
         ] {
             assert_eq!(written(recipe)[0].1, ["a"], "{recipe}");
         }
@@ -1433,6 +2529,24 @@ sha256sums=('abc'\n            SKIP 'SKIP')\nbuild() {\n  local source=x\n  eval
                 ("_bin".into(), "tool".into()),
             ]
         );
+    }
+
+    #[test]
+    fn a_path_variable_is_found_however_its_name_is_quoted() {
+        let names = Naming {
+            set: &["BUILDDIR", "srcdir"],
+            given: &["BUILDDIR"],
+            assigners: &["printf", "read", "declare"],
+        };
+        let lines = |recipe: &str| top_level_naming(recipe, &names).unwrap();
+        assert_eq!(lines("pkgname=x\ndeclare BUILD''DIR=/x\n"), [2]);
+        assert_eq!(lines("export \"BUILDDIR\"=/x\n"), [1]);
+        assert_eq!(lines("printf -v BUILD\\DIR %s /x\n"), [1]);
+        assert_eq!(lines("command printf -v 'BUILDDIR' %s /x\n"), [1]);
+        assert_eq!(lines("true &&\n  srcdir=/x\n"), [2]);
+        assert_eq!(lines("for BUILDDIR in /x; do :; done\n"), [1]);
+        assert_eq!(lines("$_c BUILDDIR\n"), [1]);
+        assert!(lines("build() { BUILDDIR=/x; }\necho \"$BUILDDIR\" BUILDDIR\n").is_empty());
     }
 
     /// Run with `GUARDIAN_RECIPE_SAMPLES=<dir of package dirs> cargo test
