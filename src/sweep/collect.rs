@@ -148,6 +148,10 @@ pub struct Collection {
     pub truncated: Vec<String>,
     /// What is said of the system as a whole (Secure Boot is off).
     pub notes: Vec<String>,
+    /// The paths of root's accounts, members, keys and trust anchors that
+    /// the root collector says are new, when it kept track itself (see
+    /// `root::news`); `None` when it did not.
+    pub root_news: Option<Vec<String>>,
 }
 
 /// What a collection runs against.

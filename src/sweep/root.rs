@@ -37,7 +37,13 @@ const ROOT_HOME: &str = "root";
 /// The most output and items taken from the root collector.
 const MAX_OUTPUT: u64 = 64 * 1024 * 1024;
 const MAX_ITEMS: usize = 5000;
-const VERSION: u64 = 1;
+/// The version of the results. 2: the collector compares packaged programs
+/// only root can read, reports what it could not check in the kernel's own
+/// accounts, and keeps track of new accounts, members and keys itself.
+const VERSION: u64 = 2;
+/// The oldest version still read. Its results are kept, and count as those
+/// of a collector that does not run every check (see `RootPart::outdated`).
+const OLDEST_VERSION: u64 = 1;
 /// The most of one note that is kept.
 const MAX_NOTE_CHARS: usize = 400;
 
@@ -49,6 +55,96 @@ pub struct RootPart {
     /// What the live checks say of the system as a whole (a tainted
     /// kernel, modules no package installed).
     pub notes: Vec<String>,
+    /// Written by an older collector, which did not run every check this
+    /// one does: what the user's own sweep leaves to the root checks is not
+    /// covered by these results.
+    pub outdated: bool,
+    /// The paths of the accounts, members, keys and trust anchors that are
+    /// new to the collector, when it kept track (see `news`).
+    pub news: Option<Vec<String>>,
+}
+
+/// Where the collector remembers the accounts, group members, keys and
+/// trust anchors it reported, beside its results: root's alone to write,
+/// so nothing running as a user can make a new one look known.
+const TRUST_SEEN: &str = "/var/lib/omarchy-guardian/sweep/trust-seen.json";
+
+/// How long one of those counts as new after the collector first saw it:
+/// longer than results are used for, so that a sweep which missed a day
+/// still hears of it.
+const NEW_FOR_SECS: u64 = 48 * 60 * 60;
+
+/// The most the collector remembers.
+const MAX_TRUST_SEEN: usize = 20_000;
+
+/// What the collector remembers of one of them: its content, and when it
+/// first had that content (0 for what was there when tracking started,
+/// which is news to nobody).
+type TrustSeen = std::collections::BTreeMap<String, (String, u64)>;
+
+fn read_trust_seen(path: &Path) -> Option<TrustSeen> {
+    if !state::owned_alone(path, 0, Path::new(state::ROOT_STATE_ANCHOR), MAX_OUTPUT) {
+        return None;
+    }
+    let json = Json::parse(&fs::read_to_string(path).ok()?).ok()?;
+    Some(
+        json.as_object()?
+            .iter()
+            .filter_map(|(label, entry)| {
+                Some((
+                    label.clone(),
+                    (
+                        entry.get("content")?.as_str()?.to_string(),
+                        entry.get("first")?.as_u64()?,
+                    ),
+                ))
+            })
+            .collect(),
+    )
+}
+
+fn trust_seen_json(seen: &TrustSeen) -> String {
+    Json::object(seen.iter().map(|(label, (content, first))| {
+        (
+            label.as_str(),
+            Json::object([
+                ("content", Json::from(content.as_str())),
+                ("first", Json::from(*first)),
+            ]),
+        )
+    }))
+    .to_string()
+}
+
+/// The paths among `items` of the accounts, group members, keys and trust
+/// anchors that are new to the collector at `now`: not in `seen`, or there
+/// with other content, for `NEW_FOR_SECS` from when that was first so.
+/// `seen` is brought up to date; with none yet (`None`), everything is
+/// remembered and nothing is news, as for any first look. What is gone is
+/// forgotten, so that one put back is new again.
+fn news(items: &[Item], seen: Option<TrustSeen>, now: u64) -> (Vec<String>, TrustSeen) {
+    let first_look = seen.is_none();
+    let before = seen.unwrap_or_default();
+    let mut after = TrustSeen::new();
+    let mut new = Vec::new();
+    for item in items
+        .iter()
+        .filter(|item| super::is_trust(item) && !item.is_trusted())
+        .take(MAX_TRUST_SEEN)
+    {
+        let fingerprint = state::fingerprint(item);
+        let content = state::content_of(&fingerprint).to_string();
+        let first = match before.get(&item.path) {
+            Some((known, first)) if *known == content => *first,
+            _ if first_look => 0,
+            _ => now.max(1),
+        };
+        if first != 0 && now.saturating_sub(first) < NEW_FOR_SECS {
+            new.push(item.path.clone());
+        }
+        after.insert(item.path.clone(), (content, first));
+    }
+    (new, after)
 }
 
 /// Where the scheduled root collector leaves what it found.
@@ -137,7 +233,17 @@ pub fn collect_command(out: bool, settings: &crate::config::Settings) -> ExitCod
             "{withheld} crontab(s) or at job(s) of other accounts were left out: they are theirs to see"
         ));
     }
-    let json = to_json(&collection, &notes).to_string();
+    // What is new among the accounts, members, keys and trust anchors is
+    // told from the collector's own record. Only the timer's run keeps
+    // one; a run through sudo reads it where there is one and writes
+    // nothing, as it writes nothing else.
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let seen = read_trust_seen(Path::new(TRUST_SEEN));
+    let tracked = seen.is_some() || group.is_some();
+    let (new, seen) = news(&collection.items, seen, now);
+    let json = to_json(&collection, &notes, tracked.then_some(new.as_slice())).to_string();
     match group {
         // Written as it is, for the sweep that asked to parse: a path
         // with a hidden character must stay the path it is.
@@ -145,7 +251,9 @@ pub fn collect_command(out: bool, settings: &crate::config::Settings) -> ExitCod
             Ok(()) => ExitCode::SUCCESS,
             Err(_) => ExitCode::from(2),
         },
-        Some(gid) => match write_results(Path::new(RESULTS), &json, gid) {
+        Some(gid) => match write_results(Path::new(RESULTS), &json, gid).and_then(|()| {
+            state::write_text_mode(Path::new(TRUST_SEEN), &trust_seen_json(&seen), 0o600)
+        }) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 errln!("omarchy-guardian sweep-collect: {error}");
@@ -356,7 +464,7 @@ pub fn results_problem(path: &Path, now: u64) -> Option<String> {
     (metadata.len() > MAX_OUTPUT).then(|| "the root check's results are too large".into())
 }
 
-fn to_json(collection: &Collection, notes: &[String]) -> Json {
+fn to_json(collection: &Collection, notes: &[String], news: Option<&[String]>) -> Json {
     let untrusted = || collection.items.iter().filter(|item| !item.is_trusted());
     let mut truncated = collection.truncated.clone();
     let left_out = untrusted().count().saturating_sub(MAX_ITEMS);
@@ -365,12 +473,22 @@ fn to_json(collection: &Collection, notes: &[String]) -> Json {
             "the root checks found more than {MAX_ITEMS} items: {left_out} were left out"
         ));
     }
-    Json::object([
+    let mut members = vec![
         ("version", Json::from(VERSION)),
         (
             "items",
             Json::Array(untrusted().take(MAX_ITEMS).map(item_json).collect()),
         ),
+    ];
+    // Only where the collector kept track: without the list, the sweep
+    // that reads this tells what is new from what it remembers itself.
+    if let Some(news) = news {
+        members.push((
+            "new_trust",
+            Json::Array(news.iter().map(|path| Json::from(path.as_str())).collect()),
+        ));
+    }
+    members.extend([
         (
             "truncated",
             Json::Array(
@@ -389,7 +507,8 @@ fn to_json(collection: &Collection, notes: &[String]) -> Json {
                     .collect(),
             ),
         ),
-    ])
+    ]);
+    Json::object(members)
 }
 
 fn item_json(item: &Item) -> Json {
@@ -523,7 +642,8 @@ fn item_from_json(json: &Json) -> Option<Item> {
 
 fn from_json(text: &str) -> Result<RootPart, String> {
     let json = Json::parse(text.trim()).map_err(|error| format!("unreadable output: {error}"))?;
-    if json.get("version").and_then(Json::as_u64) != Some(VERSION) {
+    let version = json.get("version").and_then(Json::as_u64);
+    if !version.is_some_and(|version| (OLDEST_VERSION..=VERSION).contains(&version)) {
         return Err("the root collector is a different version; reinstall Guardian".into());
     }
     let listed = json
@@ -563,6 +683,13 @@ fn from_json(text: &str) -> Result<RootPart, String> {
             .into_iter()
             .map(|note| note.chars().take(MAX_NOTE_CHARS).collect())
             .collect(),
+        outdated: version != Some(VERSION),
+        news: json.get("new_trust").and_then(Json::as_array).map(|list| {
+            list.iter()
+                .filter_map(|path| path.as_str().map(str::to_string))
+                .take(MAX_ITEMS)
+                .collect()
+        }),
     })
 }
 
@@ -781,6 +908,7 @@ pub fn merge(collection: &mut Collection, part: RootPart) {
     });
     collect::merge(collection, part.items);
     collection.truncated.extend(part.truncated);
+    collection.root_news = part.news;
 }
 
 #[cfg(test)]
@@ -1015,6 +1143,7 @@ mod tests {
             ],
             truncated: vec!["/etc/x".into()],
             notes: Vec::new(),
+            root_news: None,
         };
         let mut collection = collection;
         // The drop-in is in the catalog itself: its content travels.
@@ -1023,7 +1152,7 @@ mod tests {
             .alerts
             .push((crate::rules::RuleId::HiddenProgram, "seen".into()));
         let noted = vec!["the kernel is tainted (flags 4096)".to_string()];
-        let part = from_json(&to_json(&collection, &noted).to_string()).unwrap();
+        let part = from_json(&to_json(&collection, &noted, None).to_string()).unwrap();
         assert_eq!(part.notes, noted);
         assert_eq!(part.items, collection.items[..2]);
         assert_eq!(part.truncated, ["/etc/x"]);
@@ -1048,7 +1177,7 @@ mod tests {
             items: vec![fact],
             ..Collection::default()
         };
-        let part = from_json(&to_json(&collection, &[]).to_string()).unwrap();
+        let part = from_json(&to_json(&collection, &[], None).to_string()).unwrap();
         assert_eq!(part.items, collection.items);
     }
 
@@ -1067,7 +1196,15 @@ mod tests {
     #[test]
     fn malformed_or_foreign_output_is_refused() {
         assert!(from_json("not json").is_err());
-        assert!(from_json(r#"{"version":2,"items":[]}"#).is_err());
+        assert!(from_json(r#"{"version":3,"items":[]}"#).is_err());
+        assert!(from_json(r#"{"items":[]}"#).is_err());
+        // An older collector's results are read, and known as that.
+        assert!(from_json(r#"{"version":1,"items":[]}"#).unwrap().outdated);
+        let current =
+            from_json(r#"{"version":2,"items":[],"new_trust":["etc/passwd#x"]}"#).unwrap();
+        assert!(!current.outdated);
+        assert_eq!(current.news, Some(vec!["etc/passwd#x".to_string()]));
+        assert_eq!(from_json(r#"{"version":2,"items":[]}"#).unwrap().news, None);
         let escaping = r#"{"version":1,"items":[{"path":"../etc/x","category":"sudo","tier":"unknown","body":{"kind":"undecodable"},"runs":[],"notes":[],"alerts":[]}]}"#;
         // A bad item is left out; the rest of root's results still count.
         assert!(from_json(escaping).unwrap().items.is_empty());
@@ -1129,8 +1266,7 @@ mod tests {
                     Body::Text(String::new()),
                 ),
             ],
-            truncated: Vec::new(),
-            notes: Vec::new(),
+            ..Collection::default()
         };
         // The user's own live alert (a program in memory) stays.
         let mut memory = item(
@@ -1153,8 +1289,7 @@ mod tests {
             &mut collection,
             super::RootPart {
                 items: vec![root],
-                truncated: Vec::new(),
-                notes: Vec::new(),
+                ..super::RootPart::default()
             },
         );
         let paths: Vec<&str> = collection
@@ -1170,6 +1305,69 @@ mod tests {
                 "home/u/.bashrc",
                 "memfd:payload"
             ]
+        );
+    }
+
+    #[test]
+    fn the_collector_tells_what_is_new_from_its_own_record() {
+        use crate::autorun::Category;
+        let key = |name: &str, text: &str| {
+            let mut key = item(
+                &format!("root/.ssh/authorized_keys#{name}"),
+                Origin::Root,
+                Tier::Unknown,
+                Body::Text(text.into()),
+            );
+            key.category = Category::Account;
+            key.sha256 = Some(Sha256::digest(text.as_bytes()));
+            key
+        };
+        let unit = item(
+            "etc/systemd/system/x.service",
+            Origin::Root,
+            Tier::Unknown,
+            Body::Text("[Service]".into()),
+        );
+        let hour = 60 * 60;
+        // The first look remembers everything and calls nothing new.
+        let (new, seen) = super::news(&[key("a", "one"), unit.clone()], None, 1000);
+        assert!(new.is_empty());
+        assert_eq!(
+            seen.keys().collect::<Vec<_>>(),
+            ["root/.ssh/authorized_keys#a"]
+        );
+        // A key that was not there, and one that changed, are new, and stay
+        // so for two days, whatever the sweeps that read the results
+        // remember.
+        let items = [key("a", "other"), key("b", "two"), unit];
+        let (new, seen) = super::news(&items, Some(seen), 2000);
+        assert_eq!(
+            new,
+            ["root/.ssh/authorized_keys#a", "root/.ssh/authorized_keys#b"]
+        );
+        let (new, seen) = super::news(&items, Some(seen), 2000 + 47 * hour);
+        assert_eq!(new.len(), 2);
+        let (new, seen) = super::news(&items, Some(seen), 2000 + 49 * hour);
+        assert!(new.is_empty());
+        // One that went and came back is new again.
+        let (_, seen) = super::news(&items[..1], Some(seen), 2000 + 50 * hour);
+        let (new, seen) = super::news(&items, Some(seen), 2000 + 51 * hour);
+        assert_eq!(new, ["root/.ssh/authorized_keys#b"]);
+        // The record is written and read back as it is; the results carry
+        // the list only where a record was kept.
+        let text = super::trust_seen_json(&seen);
+        assert!(text.contains("\"first\":"));
+        let collection = Collection {
+            items: items.to_vec(),
+            ..Collection::default()
+        };
+        let part = from_json(&to_json(&collection, &[], Some(&new)).to_string()).unwrap();
+        assert_eq!(part.news, Some(new));
+        let mut merged = Collection::default();
+        merge(&mut merged, part);
+        assert_eq!(
+            merged.root_news,
+            Some(vec!["root/.ssh/authorized_keys#b".to_string()])
         );
     }
 }

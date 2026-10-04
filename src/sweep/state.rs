@@ -94,8 +94,11 @@ fn write_text(path: &Path, text: &str) -> Result<(), String> {
 }
 
 /// Writes `text` to `path` through a new file and a rename, so a reader
-/// never sees half of it.
+/// never sees half of it. The file has exactly `mode`, whatever the umask
+/// of the process: the root collector runs with one that would close a
+/// list everyone is meant to read.
 pub fn write_text_mode(path: &Path, text: &str, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
     let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
     drop(fs::remove_file(&temporary));
     let result = OpenOptions::new()
@@ -103,7 +106,10 @@ pub fn write_text_mode(path: &Path, text: &str, mode: u32) -> Result<(), String>
         .create_new(true)
         .mode(mode)
         .open(&temporary)
-        .and_then(|mut file| file.write_all(text.as_bytes()))
+        .and_then(|mut file| {
+            file.set_permissions(fs::Permissions::from_mode(mode))?;
+            file.write_all(text.as_bytes())
+        })
         .and_then(|()| fs::rename(&temporary, path));
     if result.is_err() {
         drop(fs::remove_file(&temporary));

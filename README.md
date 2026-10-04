@@ -342,7 +342,12 @@ key), and every certificate authority added in
 has looked at these, one that is new or changed at the next sweep is a
 high finding ("a key that may log in as you"), not only a line in
 `--diff`; allow the ones you know. The first sweep that sees them has
-nothing to compare with and only lists them.
+nothing to compare with and only lists them. For what the root checks
+report (root's keys, the accounts, another account's key count), the
+daily root collector keeps its own record beside its results, where only
+root writes, and says itself which are new, for two days from when it
+first saw them: what your sweep remembers is a file of yours, and a
+program running as you could write a label into it ahead of time.
 
 **Guardian's own units.** The daily sweep is a user unit, so a file in
 your home can replace it or change any line of it: a drop-in in
@@ -473,13 +478,20 @@ clean system shows nothing here:
   not flagged), one the kernel marks out-of-tree or unsigned under an
   in-tree module's name or from a package not known to ship such modules,
   and the kernel's taint flag. A taint only a module sets, with no loaded
-  module that carries it, is a hidden module (noted instead where an
-  installed out-of-tree module is not loaded now and may have set it);
+  module that carries it, is a hidden module. It is noted instead only
+  where a module that would have set that very taint is installed for the
+  running kernel outside its own tree, is there as a file and is not
+  loaded now: out-of-tree and unsigned for any such module, proprietary
+  only for one with such a licence (NVIDIA's, ZFS), never a forced load or
+  a live patch;
 - what hides: a process that answers under its number and is missing from
-  the list of processes (the numbers the control groups name are tried,
-  and every number while the system has handed out fewer than 250,000); a
-  program named like a kernel thread (`[kworker/0:1]`); and, as root, a
-  process root cannot read;
+  the list of processes. The numbers the control groups name are tried,
+  and every number a process may have, up to the kernel's limit (numbers
+  start over when it is reached, so the last one handed out says little);
+  were there ever more than can be tried, the newest are and the sweep says
+  so. A program named like a kernel thread (`[kworker/0:1]`); and, as
+  root, a process root cannot read. Root also says when it cannot list the
+  pinned eBPF objects;
 - a process attached to another the way a debugger is: high when the
   other holds secrets (a shell, `ssh`, `sudo`, a key agent, a keyring, a
   browser, a password manager), else medium. A program started under its
@@ -512,12 +524,19 @@ shell (`init=`, `rdinit=`, `systemd.unit=`, `rd.break`), or turns a defence
 off (`module.sig_enforce=0`, `lockdown=none`, `selinux=0`, `apparmor=0`,
 `audit=0`, `mitigations=off`) and that the configuration does not hold was
 typed at the boot menu or put there by something that is not reviewed, and
-is a high finding. Every `vmlinuz` under `/boot` is compared by SHA-256
-with the ones the installed kernel packages ship in `/usr/lib/modules`; one
-that matches none is a high finding. `/boot` is usually root's alone, so
+is a high finding. Every `vmlinuz` under `/boot` (the first 32; more is
+said) is compared by SHA-256
+with the ones the installed kernel packages ship in `/usr/lib/modules`. One
+that matches none is a high finding where it is an image the machine
+starts by default or runs now: it goes by an installed kernel package's
+name (`vmlinuz-linux`), or its header says it is the running release. Any
+other is listed with a note and no alert: Limine with snapper keeps older
+kernels for its snapshot entries, and no installed package can vouch for
+those. `/boot` is usually root's alone, so
 this is the root checks' to do, and your own sweep says so in a note. A
-note also says whether Secure Boot is on. The EFI programs (the boot loader
-itself) and what is inside the initramfs image are not looked at.
+note also says whether Secure Boot is on; that it is off is said once, and
+after that only with `--all`, until it changes. The EFI programs (the boot
+loader itself) and what is inside the initramfs image are not looked at.
 
 A file or directory whose name is not valid UTF-8 cannot be checked, and
 shells, udev and pacman read such names all the same: the sweep says so and
@@ -653,8 +672,12 @@ read.
   mounting, modules, raw I/O, the clock or tracing; no keys of root's
   session; it is stopped after half an hour) and writes only
   `/var/lib/omarchy-guardian/sweep/root.json` (root-owned, mode 0640, your
-  group). Your sweep uses it only while it is root's alone and less than 36
-  hours old. This makes the root-only items it lists (a sudoers drop-in no
+  group) and, beside it, its record of the accounts and keys it has seen
+  (`trust-seen.json`, root's alone). Your sweep uses the results only while
+  they are root's alone and less than 36
+  hours old. Results written by an older Guardian are still read, but
+  count for less: what your own sweep leaves to the root checks stays
+  marked as not covered, with a note, until the collector has run again. This makes the root-only items it lists (a sudoers drop-in no
   package installed, say) readable by your group, so it is only used when
   your primary group is yours alone; if it is shared with other accounts,
   root checks run only with `sweep --root`. The sandbox limits what a bug
@@ -723,6 +746,14 @@ through the list with your agent without waiting for the daily sweep.
 - Items only root can read (in `/root`, `/etc/sudoers.d`) can be allowed
   once the daily root checks have run (root checks allowed in `protect`);
   `sweep allow` uses their latest results.
+- `sweep allow` looks at the item again and allows it as it is at that
+  moment. It prints the fingerprint it allows, and where that is not what
+  the last sweep showed you (the file changed since, or no sweep has
+  listed it), it says so and asks on the terminal first; without a
+  terminal it allows nothing.
+- Run `sweep allow` and `sweep forget` as yourself, without sudo: they ask
+  for the password themselves. Run as root they stop with that advice,
+  since an item in a home is allowed for the user who asks.
 - What cannot be read at all (a program that exists only in memory, a
   deleted file) cannot be allowed; it stays listed while it runs. Nor can
   what overrides Guardian's own units, or an item whose commands were not
