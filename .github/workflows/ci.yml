@@ -37,9 +37,20 @@ jobs:
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --locked
+      # What the gates decide before a review, or with no reviewer to ask:
+      # the real binary and scripts, no AI and no sandbox. The job runs as
+      # root in a throwaway container, so the hook's "installed, not turned
+      # on" branch runs for real here. The two suites that need Bubblewrap
+      # with overlays (tests/e2e/sweep.sh, and the makepkg jail part of this
+      # one, which skips itself) do not run in a hosted container, and
+      # tests/e2e/integration-gates.sh and tests/ai-eval need a reviewer.
+      - name: Offline gate tests
+        run: |
+          cargo build --locked --release
+          bash tests/e2e/gates-offline.sh
       - name: Shell syntax
         run: |
-          for script in install.sh integrations/*.sh integrations/*/guardian-* integrations/omarchy/*.sh tests/e2e/*.sh tests/ai-eval/*.sh; do
+          for script in install.sh integrations/*.sh integrations/*/guardian-* integrations/omarchy/*.sh integrations/omarchy/bin/* packaging/arch/PKGBUILD packaging/arch/*.install tests/e2e/*.sh tests/ai-eval/*.sh; do
             bash -n "$script"
           done
       # Errors only: these scripts gate installs, so a real mistake (an
@@ -49,4 +60,4 @@ jobs:
         run: |
           shellcheck --severity=error --shell=bash \
             install.sh integrations/*.sh integrations/*/guardian-* integrations/omarchy/*.sh \
-            tests/e2e/*.sh tests/ai-eval/*.sh
+            integrations/omarchy/bin/* tests/e2e/*.sh tests/ai-eval/*.sh
