@@ -2465,6 +2465,23 @@ fn review_upstream_files(
     (report, decision)
 }
 
+/// Forgets what the gate remembers of the source `identity` names
+/// (`aur:<pkg>`, `aur-src:<pkg>`, or a local build's own key) under the
+/// review memory's `root`: the questions answered, the binaries and what
+/// was extracted. Returns how many records went.
+pub fn forget(root: &Path, identity: &str) -> Result<usize, String> {
+    let key = identity
+        .strip_prefix("aur:")
+        .or_else(|| identity.strip_prefix("aur-src:"))
+        .unwrap_or(identity);
+    state::forget(root, key)
+}
+
+/// Forgets everything the gate remembers under `root`.
+pub fn forget_all(root: &Path) -> Result<usize, String> {
+    state::forget_all(root)
+}
+
 /// The AUR's record of the package base `base`, looked up by `names`.
 fn aur_info(base: &str, names: &[String]) -> Result<Option<AurInfo>, Error> {
     let query: Vec<String> = names

@@ -55,8 +55,8 @@ Usage:
 
 CLASS: aur, theme, plugin, source (default). PROFILE: standard, strict, local-only.
 ID names what is reviewed for the review memory, e.g. aur:yay-bin.
-forget ID drops that source's approved baselines; cached verdicts are kept
-(forget --all clears them too).
+forget ID drops that source's approved baselines and what the AUR gate
+remembers of it; cached verdicts are kept (forget --all clears them too).
 Exit codes: 0 clear, warned or permitted, 1 findings, 2 incomplete review, AI
 unavailable, not confirmed, or usage error. guard and sandbox replace these
 with the command's own exit code once it starts.";
@@ -887,7 +887,8 @@ fn parse_forget(args: &[OsString]) -> Result<Forget, String> {
 
 /// Drops approved baselines (and with `--all`, every cached verdict; one
 /// identity's cached verdicts are kept, since verdicts are not keyed by
-/// identity).
+/// identity), and what the AUR gate remembers: the builds it was told to
+/// go on with, their binaries and what it extracted.
 fn forget_command(forget: &Forget, root: Option<PathBuf>) -> ExitCode {
     let Some(root) = root else {
         errln!("omarchy-guardian: no state directory (set HOME or XDG_STATE_HOME)");
@@ -897,7 +898,7 @@ fn forget_command(forget: &Forget, root: Option<PathBuf>) -> ExitCode {
         outln!("Nothing to forget: {} does not exist.", root.display());
         return ExitCode::SUCCESS;
     }
-    let store = match Store::open(root) {
+    let store = match Store::open(root.clone()) {
         Ok(store) => store,
         Err(reason) => {
             errln!("omarchy-guardian: {reason}");
@@ -907,10 +908,22 @@ fn forget_command(forget: &Forget, root: Option<PathBuf>) -> ExitCode {
     match forget_in(forget, &store) {
         Ok(message) => {
             outln!("{message}");
-            audit::forgot(match forget {
-                Forget::All => "everything",
-                Forget::One(identity) => identity.as_str(),
-            });
+            let (gate, what) = match forget {
+                Forget::All => (makepkg_gate::forget_all(&root), "everything".to_string()),
+                Forget::One(identity) => (
+                    makepkg_gate::forget(&root, identity.as_str()),
+                    identity.as_str().to_string(),
+                ),
+            };
+            match gate {
+                Ok(0) => {}
+                Ok(count) => outln!("Forgot {count} record(s) of the AUR gate."),
+                Err(reason) => {
+                    errln!("omarchy-guardian: {reason}");
+                    return ExitCode::from(2);
+                }
+            }
+            audit::forgot(&what);
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -1939,7 +1952,32 @@ mod tests {
             .unwrap()
             .is_none()
         );
-        assert_eq!(forget_command(&Forget::All, Some(root)), ExitCode::SUCCESS);
+        // What the AUR gate remembers of the package goes with it.
+        let confirmed = |key: &str| crate::makepkg_gate::forget(&root, key).unwrap();
+        fs::create_dir_all(root.join("aur-gate")).unwrap();
+        let record = |key: &str| {
+            root.join("aur-gate").join(format!(
+                "{}.confirmed",
+                crate::sha256::Sha256::digest(key.as_bytes())
+            ))
+        };
+        fs::write(record("demo"), "sources abc\n").unwrap();
+        fs::write(record("other"), "sources abc\n").unwrap();
+        audit::taken();
+        assert_eq!(
+            forget_command(&Forget::One(unit.identity.clone()), Some(root.clone())),
+            ExitCode::SUCCESS
+        );
+        assert!(!record("demo").exists());
+        assert!(record("other").exists());
+        assert!(audit::taken()[0].contains("GUARDIAN_SUBJECT=aur:demo"));
+        assert_eq!(confirmed("aur-src:other"), 1);
+        fs::write(record("other"), "sources abc\n").unwrap();
+        assert_eq!(
+            forget_command(&Forget::All, Some(root.clone())),
+            ExitCode::SUCCESS
+        );
+        assert!(!record("other").exists());
         assert_eq!(forget_command(&Forget::All, None), ExitCode::from(2));
     }
 }
