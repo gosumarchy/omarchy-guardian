@@ -7,6 +7,7 @@ mod app;
 mod canvas;
 mod fields;
 mod integrations;
+mod luascan;
 mod mascot;
 mod menufile;
 mod shellscan;

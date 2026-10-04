@@ -73,14 +73,24 @@ plugins, and reviews that code **before any of it runs**:
   is on, red-eyed when something needs attention (a gate is off, a setting is
   broken, the daily sweep stopped running or could not finish, or a block in
   the last day is unseen), dim when protection is off. A gate that cannot
-  be there (the package's files are missing) counts as a problem; the AUR
-  gate without yay installed does not. A gate counts as on only when it is
+  be there (the package's files are missing) counts as a problem; a gate
+  with nothing on this machine to guard does not: the AUR gate without yay
+  installed, and, without Omarchy (plain Arch), the theme and plugin
+  commands on PATH. A gate counts as on only when it is
   in effect, not when a line that looks like it is in a file: the Bash
   interceptor's exact line where Bash runs it and with nothing after it that
   unsets or replaces its functions, the menu entries that are in effect when
   the menu reads its file, yay building through Guardian's root-owned shim
-  with no alias, function or other `yay` in front of it, and Guardian's
-  theme and plugin commands first on the session's PATH. Anything less
+  with no alias or function in front of it that itself passes another
+  `--makepkg` and no other `yay` before it, and Guardian's
+  theme and plugin commands first on the session's PATH: its line in
+  `~/.config/hypr/hyprland.lua` where Hyprland runs it, after Omarchy's own
+  `envs.lua` has put Omarchy's commands first, and the PATH the session
+  really has. Which `yay` and which theme commands are found is read from
+  the session's own PATH (`systemctl --user show-environment`), the same
+  for the bar and for a `status` typed over SSH or in a shell that
+  rearranged its PATH; where a shell's own PATH differs, `status` says so
+  beside the gate without calling it a change. Anything less
   reads "partly on" with the reason. The pacman hook counts as on by its
   link in `/etc/pacman.d/hooks`, not by the hook file the package always
   ships. The sweep reads "partly on", naming the file, when a unit or
@@ -704,7 +714,7 @@ through the list with your agent without waiting for the daily sweep.
   you allow in your home says nothing about another account's file of the
   same name; `forget --all` drops the system's items and yours, not other
   accounts'.
-- Guardian up to 0.7.18 kept the allows for your home in a file of your
+- Earlier versions of Guardian kept the allows for your home in a file of your
   own (`~/.local/state/omarchy-guardian/sweep/allowed.json`). It no longer
   counts, and a sweep says how many entries it holds. `sweep allow
   --migrate` lists them and, after you say yes and give the sudo password,
@@ -1612,7 +1622,11 @@ reviewer (it offers `claude-code`), runs the guided setup on a first
 install, turns every gate on with `omarchy-guardian protect` after showing
 each step, and tests the reviewer with a malicious and a harmless sample.
 It asks for sudo only for the steps that need it, and skips what is already
-done. To upgrade: `git pull && ./install.sh`. With the pacman hook on, the
+done: when the version of this checkout is the one already installed, it
+does not build or install again and goes on with the reviewer, the settings
+and `protect`. `./install.sh --reinstall` builds and installs it anyway
+(after changing the source without a new version, say). To upgrade: `git
+pull && ./install.sh`. With the pacman hook on, the
 installed Guardian reviews the new package like any other local archive
 before pacman installs it.
 
@@ -1627,14 +1641,27 @@ git fetch --tags && git checkout vX.Y.Z
 ./install.sh
 ```
 
-The installer says which commit and tag it is about to build. When the
+The installer says what it is about to build. When the
 Guardian already installed carries the release keys
 (`/usr/share/omarchy-guardian/allowed_signers`, root-owned, installed by
 the package), it verifies the tag's signature against them with `git
-verify-tag` before building, and asks before going on when the checkout is
-not a signed release tag or has local changes; `--yes` never answers that
-question. The keys come from the installed package, never from the
-checkout being built, which could bring its own. Two limits: a first
+verify-tag` before building, and asks before going on unless the checkout
+is exactly a release tag signed by one of those keys, with no tracked file
+changed and no file added. A file that is not part of the tag counts
+(cargo would run an added `build.rs` or `.cargo/config.toml`, and an added
+`packaging/allowed_signers` would be installed as the keys the next upgrade
+is checked against); only what the tag's own top-level `.gitignore` names,
+the build's output, is passed over. A directory that is not a git checkout
+(an unpacked tarball) cannot be checked and is asked about too. `--yes`
+never answers that question. The keys come from the installed package,
+never from the checkout being built, which could bring its own; and git is
+asked with the verifying program (`/usr/bin/ssh-keygen`), the signature
+format and the keys file given on its command line and without the system's
+or your own git configuration, so the checkout's `.git/config` cannot name
+another program or other keys to verify with. This check is no defence
+against someone who can rewrite the checkout's `.git` directory in other
+ways (its index, say): it tells a release from a changed or unsigned tree,
+and the tree's history is only as good as where you cloned it from. Two limits: a first
 install has no installed keys to check against, so the installer says the
 signature was not checked (verify the tag yourself, below); and a package
 built from a release that ships no key file installs none. To check a tag
@@ -2175,25 +2202,65 @@ Theme installs and updates are routed through Guardian in three places.
 - **Commands on PATH** (*Theme & plugin commands (PATH)* in the Integrations
   tab). The package ships root-owned commands named `omarchy`,
   `omarchy-theme-install`, `omarchy-theme-update`, `omarchy-plugin-add` and
-  `omarchy-plugin-update` in `/usr/lib/omarchy-guardian/bin`. `protect`
-  writes `~/.config/uwsm/env.d/90-omarchy-guardian`, which uwsm reads after
-  Omarchy's own session file and which puts that directory first on PATH for
-  the whole graphical session and its service manager. Every caller that
-  finds those commands by name then goes through Guardian: scripts,
-  `bash -c`, zsh and fish, launchers, key bindings, the stock menu entries
-  and AI agents. Guardian's `omarchy` hands theme and plugin installs and
-  updates to Guardian and passes everything else straight to the real
-  `omarchy` by its full path (which finds its commands in its own directory,
-  not on PATH, so wrapping the four commands alone would miss `omarchy theme
-  install`). It applies from the next login. Until then, and whenever the
-  running session's PATH or its service manager's (`systemctl --user
-  show-environment`) finds a stock command first, it reads "partly on".
+  `omarchy-plugin-update` in `/usr/lib/omarchy-guardian/bin`. Every caller
+  that finds those commands by name goes through Guardian once that
+  directory comes first on PATH: scripts, `bash -c`, zsh and fish, launchers,
+  key bindings, the stock menu entries and AI agents. Guardian's `omarchy`
+  hands theme and plugin installs and updates to Guardian and passes
+  everything else straight to Omarchy's own `omarchy` by its full path
+  (which finds its commands in its own directory, not on PATH, so wrapping
+  the four commands alone would miss `omarchy theme install`). It looks for
+  that one in `/usr/share/omarchy/bin`, then in `/usr/bin`, or in the
+  checkout that `omarchy dev link` named in the root-owned
+  `/etc/omarchy.conf`; never on PATH, where it would find itself or a
+  planted file.
+
+  Getting that directory first takes two things, because Omarchy sets PATH
+  twice. uwsm reads `~/.config/uwsm/env.d/90-omarchy-guardian`, which
+  `protect` writes, after Omarchy's own session file. Then Omarchy's
+  Hyprland defaults (`/usr/share/omarchy/default/hypr/envs.lua`) rewrite
+  PATH with Omarchy's command directory in front for everything Hyprland
+  starts, and its autostart hands that PATH to the systemd user manager and
+  to D-Bus; with the session file alone, Omarchy's commands would be found
+  first by every key binding, launcher, the menu, the bar and zsh or fish.
+  So `protect` also adds one line at the end of
+  `~/.config/hypr/hyprland.lua`, the place Omarchy keeps for your own
+  configuration, read after its defaults and before Hyprland starts
+  anything:
+
+  ```lua
+  -- Omarchy Guardian: its theme and plugin commands first on PATH. Keep this after Omarchy's defaults.
+  pcall(dofile, "/usr/lib/omarchy-guardian/hyprland-path.lua")
+  ```
+
+  The file it loads is root-owned and part of the package: it puts
+  Guardian's directory first and Omarchy's right behind it. The line passes
+  over a file that is not there. Nothing under `/usr/share/omarchy` is
+  edited, so an Omarchy update changes none of it; `omarchy refresh` of the
+  Hyprland configuration replaces `hyprland.lua` and with it the line,
+  which the bar then shows and notifies about, and `protect` puts back. A
+  Hyprland configuration that is not Lua (no `hyprland.lua`) gets no line.
+
+  It applies from the next login. It reads "partly on", with the reason,
+  until then; when the line is commented out, inside a block, or followed
+  by another line that sets PATH; when the session file or the line is
+  missing while the other is there; and whenever the session's PATH
+  (`systemctl --user show-environment`) finds a stock command before
+  Guardian's. Turning it on again writes what is missing, at the end of the
+  file.
 - **The Bash interceptor** catches `omarchy theme install/update` typed in an
   interactive Bash, also in a shell whose PATH was reordered or that was not
   started from the graphical session (SSH, a console). It counts only as
   the exact line Guardian writes in `~/.bashrc`, at the top level, with no
-  `return` or `exit` before it other than the usual "not interactive" line
-  and nothing after it that unsets, redefines or aliases its functions.
+  command before it that leaves the file and nothing after it that unsets,
+  redefines or aliases its functions. A `return` or `exit` before it counts
+  as leaving, except in the usual "stop unless this shell is interactive"
+  line in its common spellings: `[[ $- != *i* ]] && return`, `[[ $- == *i*
+  ]] || return`, `[ -z "$PS1" ] && return`, `[ -n "$PS1" ] || return`, and
+  `case $- in *i*) ;; *) return;; esac`. The words `return` and `exit` in a
+  comment, in a quoted string or inside a function or block are not
+  commands; `<<` in `$(( ))` or `(( ))` is a shift and `<<<` a here-string,
+  neither starts a here-document.
   Guardian reads `~/.bashrc` line by line, not as a shell would: what a file
   sourced from it does is not seen.
 - **Overrides in your Omarchy menu file**
@@ -2212,11 +2279,13 @@ fish) reach Omarchy directly, and the bar says so beside the gate.
 
 Not covered: a caller that names the stock command by its full path
 (`/usr/share/omarchy/bin/omarchy-theme-install`, `/usr/bin/omarchy-theme-install`),
-a program that resets PATH or puts another directory in front, a session not
-started through uwsm (SSH and console logins have the Bash interceptor
-only), and a theme copied into `~/.config/omarchy/themes` by hand. The
-session file is your own: a program running as you can remove it, which the
-bar then shows and notifies about.
+a program that resets PATH or puts another directory in front (a shell
+whose start-up files do: `status` typed there says so beside the gate), a
+session not started through uwsm and Hyprland (SSH and console logins have
+the Bash interceptor only), and a theme copied into
+`~/.config/omarchy/themes` by hand. The session file and the line in
+`hyprland.lua` are your own: a program running as you can remove them,
+which the bar then shows and notifies about.
 
 Themes are
 cloned to a hidden staging directory and
@@ -2263,6 +2332,7 @@ sudo pacman -R omarchy-guardian
 `protect --off` removes the hook link, points yay back at `makepkg`, takes
 the Guardian line out of `~/.bashrc` and the theme and plugin entries out of
 the Omarchy menu file, removes `~/.config/uwsm/env.d/90-omarchy-guardian`
+and Guardian's line from `~/.config/hypr/hyprland.lua`,
 and turns the sweep's two timers off, showing each step first. It leaves the
 menu entry and the bar widget (remove those in the TUI's Integrations tab)
 and a pacman hook that was installed by hand. With the link gone the
@@ -2279,9 +2349,11 @@ A removal is not reviewed by the gate.
 If you removed the package without `protect --off`, undo the rest by hand:
 `yay --makepkg /usr/bin/makepkg --save -P --stats`, delete the marked
 Guardian line from `~/.bashrc`, the `guardian-theme` and `guardian-plugin`
-lines from the Omarchy menu file and
+lines from the Omarchy menu file,
 `~/.config/uwsm/env.d/90-omarchy-guardian` (left behind, it only names a
-directory that no longer exists), and `systemctl --user disable
+directory that no longer exists) and the two Guardian lines at the end of
+`~/.config/hypr/hyprland.lua` (left behind, the line passes over its
+missing file), and `systemctl --user disable
 omarchy-guardian-sweep.timer`. Until then yay fails on the missing shim and
 the menu's theme and plugin items name a handler that is gone; the line in
 `~/.bashrc` loads nothing once its file is gone.
@@ -2292,7 +2364,7 @@ list of allowed sweep items and the root checks' last results
 (`/var/lib/omarchy-guardian/`), the review memory
 (`~/.local/state/omarchy-guardian/`) and the saved reports
 (`~/.cache/omarchy-guardian/`). The `<name>.guardian-bak` copies beside
-`~/.bashrc`, the menu file and the Waybar config are the files as they were
+`~/.bashrc`, the menu file, `hyprland.lua` and the Waybar config are the files as they were
 before Guardian's first edit; delete them when you no longer want them.
 
 If pacman fails every install or upgrade with `Review package install scripts
@@ -2323,7 +2395,7 @@ that matter most:
 - **A program already running as you** can change what you own: the user
   settings file (a weaker setting is shown by the bar until root accepts
   it), the review memory, the record of what the sweep already told you
-  about, the session's PATH file, `~/.bashrc`. The pacman gate, the list of
+  about, the session's PATH file and Guardian's line in `hyprland.lua`, `~/.bashrc`. The pacman gate, the list of
   allowed sweep items and the accepted weaker settings are root's and are
   not in its reach. The reviewer's login and, for your own sources,
   OpenCode's configuration are yours too.
@@ -2377,7 +2449,7 @@ none installs anything or touches the real home.
 
 | Suite | Calls the AI | Needs | In CI |
 |---|---|---|---|
-| `tests/e2e/gates-offline.sh` | no | `bsdtar`, `pacman-conf`, `setsid`; `bwrap` and `makepkg` for some cases | yes |
+| `tests/e2e/gates-offline.sh` | no | `bsdtar`, `pacman-conf`, `setsid`; `bwrap`, `makepkg`, `lua`, `git` and `ssh-keygen` for some cases | yes |
 | `tests/e2e/sweep.sh` | no | `bwrap` 0.9 or newer (overlays), `jq` | no: it needs user namespaces, which a hosted container does not give |
 | `tests/e2e/integration-gates.sh` | yes | `bwrap` 0.9 or newer, `bsdtar`, `pacman`, `git`, `flock`, `curl`, a reviewer | no |
 | `tests/ai-eval/run.sh` | yes, several times per case | `bsdtar`, `makepkg`, `bwrap`, `jq`, a reviewer | no |
@@ -2391,22 +2463,40 @@ bash tests/e2e/integration-gates.sh
 
 **`gates-offline.sh`** covers what the gates decide before a review, or
 with no reviewer to ask, with the real binary and scripts: the pacman hook
-script letting transactions through until it is turned on; the refusals of
-the pacman gate that need no review (a removal, a parent that is not
-pacman, a missing or mismatched archive, files in `/usr/sbin`, the
-reviewer's settings shipped by a local package, a reviewer from `PATH` for
-root's pacman); Guardian's own package, put together by its PKGBUILD's
-`package()`, through its own gate; `guard`, `scan`, `sandbox` and the
-makepkg gate stopping on a broken user settings file, on a question nobody
-can answer, and never exiting 0 without starting the command; the makepkg
-gate's own jail with the AI off (listing, fetching, `--holdver`, the later
-call held against what was extracted, the two questions); the commands on
-PATH and the Bash interceptor routing every spelling of a theme or plugin
-install to Guardian and help to Omarchy; and the bar's check that the
-interceptor's line is in effect. `opencode` and `claude` on its `PATH` are
-stand-ins, and the suite fails if either is ever started. A case whose
-requirement is missing is reported as skipped, and one known to fail today
-is run, shown as `KNOWN` with the reason and counted apart.
+script letting transactions through until it is turned on, and stopping
+them once it is; the refusals of the pacman gate that need no review (a
+removal, a parent that is not pacman, a missing or mismatched archive,
+files in `/usr/sbin`, the reviewer's settings shipped by a local package, a
+reviewer from `PATH` for root's pacman); Guardian's own package, put
+together by its PKGBUILD's `package()`, through its own gate; `guard`,
+`scan`, `sandbox` and the makepkg gate stopping on a broken user settings
+file, on a question nobody can answer, and never exiting 0 without starting
+the command; the makepkg gate's own jail with the AI off (listing,
+fetching, `--holdver`, the later call held against what was extracted, the
+two questions); the commands on PATH and the Bash interceptor routing every
+spelling of a theme or plugin install to Guardian and help to Omarchy; the
+`omarchy` wrapper finding Omarchy's own dispatcher in either place and
+never on PATH; the file Hyprland loads putting Guardian's commands first
+whatever PATH it starts from; what the installer takes for a signed release
+(an added file, a file the checkout's own exclude list hides, a changed
+file, an unknown key, and a checkout whose `.git/config` names its own keys
+file or verifying program); and the bar's check that the interceptor's line
+is in effect. `opencode` and `claude` on its `PATH` are stand-ins, and the
+suite fails if either is ever started. A case whose requirement is missing
+is reported as skipped, and one known to fail today is run, shown as
+`KNOWN` with the reason and counted apart.
+
+The pacman gate's cases run twice: as a user with the stand-in reviewers,
+and as root, where the gate looks for the root-owned reviewer it would
+really use. Run as a user, "as root" is root of a user namespace
+(Bubblewrap) with a root directory of its own; a reviewer installed on the
+system is hidden from those cases behind a private mount, so they run
+whatever is installed and none is asked. In CI the suite runs as real root
+in a throwaway container, and there, and only there (`CI=true`, as root),
+it changes the system for the length of two checks: it creates and removes
+the link `/etc/pacman.d/hooks/omarchy-guardian.hook`, and installs and
+removes `/usr/bin/omarchy-guardian`, to run the hook script turned on as
+pacman would. As root anywhere else those checks are skipped.
 
 **`integration-gates.sh`** runs the real hook, shim and theme handler in a
 Bubblewrap sandbox with a throwaway `/usr` overlay, mock `makepkg` and

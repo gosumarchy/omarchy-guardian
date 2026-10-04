@@ -105,39 +105,93 @@ step "Checking what this checkout is"
 # releases are signed with come from the Guardian already installed, not
 # from this checkout: a checkout that was tampered with could bring its own.
 SIGNERS=/usr/share/omarchy-guardian/allowed_signers
-if ! git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-    note "Not a git checkout: its origin cannot be checked."
-else
-    commit=$(git -C "$ROOT" rev-parse --short=12 HEAD)
-    tag=$(git -C "$ROOT" describe --exact-match --tags HEAD 2>/dev/null || true)
-    if [[ -n $(git -C "$ROOT" status --porcelain --untracked-files=no) ]]; then
-        note "This checkout has local changes on top of commit $commit."
-        dirty=1
-    else
-        dirty=0
+
+# release_check <checkout> <keys file, or nothing>: says in one line what
+# the checkout is.
+#   signed <tag>       exactly a release tag signed by one of the keys, with
+#                      no file changed and none added
+#   unchecked <tag>    exactly a tag with nothing changed or added; no keys
+#                      were given to check its signature with
+#   unsigned <why>     anything else
+# Files that are not part of the tag count: cargo runs an added build.rs or
+# .cargo/config.toml, and an added packaging/allowed_signers would be
+# installed as the keys the next upgrade is checked against. Only what the
+# tag's own top-level .gitignore names (the build's output) is passed over,
+# whatever the checkout's .git/info/exclude says.
+# Git is asked with the settings given here and nobody's configuration
+# file deciding: the checkout's own .git/config could name another program
+# to "verify" with, or another keys file.
+release_check() {
+    local root=$1 signers=${2-} tag commit added
+    local -a git=(
+        /usr/bin/env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1
+        git -C "$root"
+        -c core.fsmonitor=false -c core.hooksPath=/dev/null
+        -c gpg.format=ssh -c gpg.ssh.program=/usr/bin/ssh-keygen
+        -c "gpg.ssh.allowedSignersFile=$signers" -c gpg.ssh.revocationFile=/dev/null
+        -c gpg.program=/usr/bin/false -c gpg.openpgp.program=/usr/bin/false
+        -c gpg.x509.program=/usr/bin/false
+    )
+    if ! "${git[@]}" rev-parse --git-dir >/dev/null 2>&1; then
+        printf 'unsigned %s\n' 'this is not a git checkout, so its origin cannot be checked'
+        return
     fi
-    if [[ -n $tag ]]; then
-        ok "Commit $commit, release tag $tag"
-    else
-        note "Commit $commit is not a release tag."
+    commit=$("${git[@]}" rev-parse --short=12 HEAD 2>/dev/null)
+    if ! tag=$("${git[@]}" describe --exact-match --tags HEAD 2>/dev/null) || [[ -z $tag ]]; then
+        printf 'unsigned commit %s is not a release tag\n' "$commit"
+        return
     fi
-    if [[ -f $SIGNERS && $(stat -c %u -- "$SIGNERS") == 0 ]]; then
-        if [[ -n $tag ]] && ((!dirty)) &&
-            git -C "$ROOT" -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$SIGNERS" \
-                verify-tag "$tag" >/dev/null 2>&1; then
-            ok "$tag is signed by a release key your installed Guardian knows"
-        else
+    if [[ -n $("${git[@]}" status --porcelain --untracked-files=no 2>&1) ]]; then
+        printf 'unsigned this checkout has local changes on top of %s\n' "$tag"
+        return
+    fi
+    if ! added=$("${git[@]}" ls-files --others --directory --no-empty-directory --exclude-from="$root/.gitignore" 2>&1) ||
+        [[ -n $added ]]; then
+        printf 'unsigned this checkout has files that are not part of %s: %s\n' "$tag" \
+            "$(printf '%s' "$added" | head -n 3 | tr '\n' ' ')"
+        return
+    fi
+    if [[ -z $signers ]]; then
+        printf 'unchecked %s\n' "$tag"
+        return
+    fi
+    if [[ ! -x /usr/bin/ssh-keygen ]]; then
+        printf 'unsigned the signature of %s cannot be checked without ssh-keygen (pacman -S openssh)\n' "$tag"
+        return
+    fi
+    # A signature of another kind would be checked by another program.
+    if ! "${git[@]}" cat-file tag "$tag" 2>/dev/null | grep -q -- '-----BEGIN SSH SIGNATURE-----' ||
+        ! "${git[@]}" verify-tag "$tag" >/dev/null 2>&1; then
+        printf 'unsigned %s is not signed by a release key your installed Guardian knows\n' "$tag"
+        return
+    fi
+    printf 'signed %s\n' "$tag"
+}
+
+keys=''
+[[ -f $SIGNERS && $(stat -c %u -- "$SIGNERS") == 0 ]] && keys=$SIGNERS
+state=$(release_check "$ROOT" "$keys")
+case $state in
+    signed\ *) ok "${state#signed } is signed by a release key your installed Guardian knows, with nothing changed or added" ;;
+    unchecked\ *)
+        ok "Release tag ${state#unchecked }, with nothing changed or added"
+        note "The installed Guardian carries no release keys, so the signature is not checked."
+        ;;
+    *)
+        why=${state#unsigned }
+        note "${why^}."
+        if [[ -n $keys ]]; then
             note "This is not a release signed by a key your installed Guardian knows."
             # Never answered by --yes: an unattended run must not wave an
             # unsigned build through.
             answer=''
             read -r -p "  Build and install it anyway? [y/N] " answer </dev/tty || true
             [[ $answer == [Yy]* ]] || fail "Not installed. Check out a signed release tag (git tag -l 'v*')."
+        else
+            note "The installed Guardian carries no release keys, so the signature is not checked."
         fi
-    else
-        note "The installed Guardian carries no release keys, so the signature is not checked."
-    fi
-fi
+        ;;
+esac
 
 ###############################################################################
 if [[ $installed == "$version" ]] && ((!REINSTALL)); then

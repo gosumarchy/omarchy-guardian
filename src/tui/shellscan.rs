@@ -59,21 +59,139 @@ fn nesting(code: &str) -> (usize, usize) {
     (opened, closed)
 }
 
-/// The word that ends a here-document started on this line, if one is.
-fn here_document(code: &str) -> Option<String> {
-    let at = code.find("<<")?;
-    let rest = &code[at + 2..];
-    if rest.starts_with('<') {
-        return None;
+/// A line of code as the scanner reads it.
+struct Scanned {
+    /// The line without its comment and without what is inside quotes: a
+    /// word in a string or after `#` is not a command.
+    bare: String,
+    /// The word that ends a here-document started on this line, if one is.
+    document: Option<String>,
+}
+
+/// Reads one line: drops quoted text and the comment, and finds a
+/// here-document's end word. `<<` inside `(( ))` or `$(( ))` is a shift,
+/// and `<<<` a here-string: neither starts a document.
+fn scan(code: &str) -> Scanned {
+    let characters: Vec<char> = code.chars().collect();
+    let mut bare = String::new();
+    let mut document = None;
+    let mut arithmetic = 0_usize;
+    let mut index = 0;
+    while index < characters.len() {
+        let character = characters[index];
+        let next = characters.get(index + 1).copied();
+        match character {
+            // The escaped character is text.
+            '\\' => {
+                bare.push(' ');
+                index += 1;
+            }
+            '\'' | '"' => {
+                index = closing_quote(&characters, index);
+                bare.push(' ');
+            }
+            '#' if index == 0 || characters[index - 1].is_whitespace() => break,
+            '(' if next == Some('(') => {
+                arithmetic += 1;
+                bare.push_str("((");
+                index += 1;
+            }
+            ')' if next == Some(')') && arithmetic > 0 => {
+                arithmetic -= 1;
+                bare.push_str("))");
+                index += 1;
+            }
+            '<' if next == Some('<') && arithmetic == 0 => {
+                if characters.get(index + 2) == Some(&'<') {
+                    index += 2;
+                } else {
+                    if document.is_none() {
+                        document = end_word(&characters[index + 2..]);
+                    }
+                    index += 1;
+                }
+                bare.push(' ');
+            }
+            _ => bare.push(character),
+        }
+        index += 1;
     }
+    Scanned { bare, document }
+}
+
+/// The index of the quote that closes the one at `open` (the last
+/// character when it is never closed). Inside double quotes a backslash
+/// keeps the next character.
+fn closing_quote(characters: &[char], open: usize) -> usize {
+    let quote = characters[open];
+    let mut index = open + 1;
+    while index < characters.len() {
+        if characters[index] == '\\' && quote == '"' {
+            index += 2;
+            continue;
+        }
+        if characters[index] == quote {
+            return index;
+        }
+        index += 1;
+    }
+    characters.len().saturating_sub(1)
+}
+
+/// The end word of a here-document, from what follows its `<<`.
+fn end_word(rest: &[char]) -> Option<String> {
     let word: String = rest
-        .trim_start_matches('-')
-        .trim_start()
-        .chars()
-        .take_while(|character| !character.is_whitespace() && *character != ';')
+        .iter()
+        .skip_while(|character| **character == '-')
+        .skip_while(|character| character.is_whitespace())
+        .take_while(|character| !character.is_whitespace() && **character != ';')
         .filter(|character| !matches!(character, '\'' | '"' | '\\'))
         .collect();
     (!word.is_empty()).then_some(word)
+}
+
+/// Whether a line is the usual "stop here unless this shell is
+/// interactive" guard, the one place a `return` before Guardian's line is
+/// fine (the interceptor is for interactive shells): a test of `$-` for
+/// `i`, or of `$PS1` for being empty, that returns when the shell is not
+/// interactive, or a one-line `case $- in`.
+fn interactive_guard(code: &str) -> bool {
+    let plain: String = code
+        .chars()
+        .filter(|character| !matches!(character, '"' | '\''))
+        .collect();
+    let words: Vec<&str> = plain.split_whitespace().collect();
+    if words.starts_with(&["case", "$-", "in"]) {
+        return plain.contains("*i*") && words.last() == Some(&"esac");
+    }
+    let Some(at) = words.iter().position(|word| matches!(*word, "&&" | "||")) else {
+        return false;
+    };
+    let action: Vec<&str> = words[at + 1..]
+        .iter()
+        .map(|word| word.trim_end_matches(';'))
+        .filter(|word| !word.is_empty())
+        .collect();
+    let returns = match action.as_slice() {
+        ["return"] => true,
+        ["return", code] => code.parse::<u8>().is_ok(),
+        _ => false,
+    };
+    let (["[", inner @ .., "]"] | ["[[", inner @ .., "]]"] | ["test", inner @ ..]) = &words[..at]
+    else {
+        return false;
+    };
+    let prompt = |word: &str| matches!(word, "$PS1" | "${PS1}" | "${PS1-}" | "${PS1:-}");
+    // What the test is true for: a shell that is not interactive, or one
+    // that is.
+    let (not_interactive, interactive) = match inner {
+        ["-z", word] => (prompt(word), false),
+        ["-n", word] | [word] => (false, prompt(word)),
+        ["$-" | "${-}", "!=", "*i*"] | ["!", "$-" | "${-}", "=~", "i"] => (true, false),
+        ["$-" | "${-}", "==" | "=", "*i*"] | ["$-" | "${-}", "=~", "i"] => (false, true),
+        _ => (false, false),
+    };
+    returns && ((not_interactive && words[at] == "&&") || (interactive && words[at] == "||"))
 }
 
 /// Whether a line defines a function called `name`.
@@ -150,24 +268,23 @@ pub fn interceptor(text: &str, source_line: &str, path: &str) -> Loads {
             continued = false;
             continue;
         }
-        // The usual "stop here unless interactive" line is the one place
-        // a `return` before it is fine: the interceptor is for
-        // interactive shells.
-        let interactive_guard = code.contains("$-") && code.contains("*i*");
-        let (opened, closed) = nesting(code);
+        let scanned = scan(code);
+        let (opened, closed) = nesting(&scanned.bare);
         // Not inside a block, and not in one written on this line (a
-        // one-line function).
+        // one-line function). What is quoted or in a comment is no
+        // command, and the "stop here unless interactive" line is the one
+        // `return` before it that is fine.
         if depth == 0
             && opened == 0
-            && !interactive_guard
-            && words(code)
+            && !interactive_guard(code)
+            && words(&scanned.bare)
                 .iter()
                 .any(|word| matches!(*word, "return" | "exit"))
         {
             returned = true;
         }
         depth = (depth + opened).saturating_sub(closed);
-        document = here_document(code);
+        document = scanned.document;
         continued = code.ends_with('\\') && !code.ends_with("\\\\");
     }
 
@@ -208,11 +325,68 @@ pub fn interceptor(text: &str, source_line: &str, path: &str) -> Loads {
 }
 
 /// Whether `text` (a shell start-up file) has an alias or function called
-/// `helper` and passes `--makepkg` somewhere: the helper then builds with
-/// whatever that names, whatever its saved configuration says.
-pub fn overrides_makepkg(text: &str, helper: &str) -> bool {
-    code_lines(text).any(|line| defines_alias(line, helper) || defines_function(line, helper))
-        && code_lines(text).any(|line| line.contains("--makepkg"))
+/// `helper` that itself passes `--makepkg` with something other than `gate`
+/// (Guardian's own shim): the helper then builds with whatever that names,
+/// whatever its saved configuration says. `--makepkg` on another command
+/// of the file is not an override of this helper.
+pub fn overrides_makepkg(text: &str, helper: &str, gate: &str) -> bool {
+    let lines: Vec<&str> = code_lines(text).collect();
+    lines.iter().enumerate().any(|(index, line)| {
+        if defines_alias(line, helper) {
+            passes_other_makepkg(line, gate)
+        } else if defines_function(line, helper) {
+            function_body(&lines[index..])
+                .iter()
+                .any(|line| passes_other_makepkg(line, gate))
+        } else {
+            false
+        }
+    })
+}
+
+/// The lines of the function that starts on the first of `lines`: to the
+/// `}` that closes it, or (fish, which has no braces) to its `end`.
+fn function_body<'a>(lines: &'a [&'a str]) -> &'a [&'a str] {
+    let braces = lines.iter().take(2).any(|line| line.contains('{'));
+    let mut depth = 0_usize;
+    for (index, line) in lines.iter().enumerate() {
+        let (opened, closed) = if braces {
+            nesting(&scan(line).bare)
+        } else {
+            let first = line.split_whitespace().next().unwrap_or_default();
+            (
+                usize::from(matches!(
+                    first,
+                    "function" | "if" | "for" | "while" | "switch" | "begin"
+                )),
+                usize::from(first == "end"),
+            )
+        };
+        depth = (depth + opened).saturating_sub(closed);
+        if depth == 0 && (index > 0 || opened > 0) {
+            return &lines[..=index];
+        }
+    }
+    lines
+}
+
+/// Whether a line passes `--makepkg` with a value that is not `gate`.
+fn passes_other_makepkg(line: &str, gate: &str) -> bool {
+    let plain: String = line
+        .chars()
+        .map(|character| {
+            if matches!(character, '"' | '\'' | ';' | '=') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let words: Vec<&str> = plain.split_whitespace().collect();
+    words
+        .iter()
+        .enumerate()
+        .any(|(index, word)| *word == "--makepkg" && words.get(index + 1) != Some(&gate))
 }
 
 #[cfg(test)]
@@ -306,27 +480,130 @@ mod tests {
     }
 
     #[test]
+    fn the_usual_bashrc_lines_before_it_do_not_make_it_ineffective() {
+        // Each of these once read "a `return` or `exit` comes before it",
+        // which turning the gate on again could not repair.
+        for before in [
+            "[ -z \"$PS1\" ] && return",
+            "[[ -z $PS1 ]] && return",
+            "[ -n \"${PS1-}\" ] || return 0",
+            "[[ $- != *i* ]] && return",
+            "[[ \"$-\" == *i* ]] || return;",
+            "[[ $- =~ i ]] || return",
+            "case $- in *i*) ;; *) return;; esac",
+            "echo \"type exit to leave\"",
+            "echo 'return here'",
+            "export FOO=bar # exit code of last",
+            "# exit",
+            "alias e='exit'",
+            // A shift and a here-string start no here-document, which
+            // would swallow the rest of the file.
+            "x=$(( 1 << 3 ))",
+            "(( y = 1 << 2 ))",
+            "read -r first <<< \"$line\"",
+        ] {
+            assert_eq!(
+                loads(&format!("{before}\n{LINE}\n")),
+                Loads::Effective,
+                "{before}"
+            );
+        }
+    }
+
+    #[test]
+    fn what_really_keeps_it_from_running_still_reads_ineffective() {
+        for before in [
+            "return",
+            "exit 0",
+            "true && exit",
+            "[ -f ~/.x ] && return",
+            // Returns when the shell *is* interactive.
+            "[[ $- == *i* ]] && return",
+            "[ -n \"$PS1\" ] && return",
+            "[ -z \"$PS1\" ] && return; return",
+            "echo \"a\" ; exit",
+        ] {
+            assert!(
+                why(&format!("{before}\n{LINE}\n")).contains("`return` or `exit`"),
+                "{before}"
+            );
+        }
+        assert!(why(&format!("if false; then\n  {LINE}\nfi\n")).contains("function or block"));
+        assert!(why(&format!("cat <<EOF\n{LINE}\nEOF\n")).contains("here-document"));
+        assert!(why(&format!("cat << 'END' # note\n{LINE}\nEND\n")).contains("here-document"));
+        assert!(why(&format!("{LINE}\nunset -f omarchy\n")).contains("unsets `omarchy`"));
+    }
+
+    const GATE: &str = "/usr/lib/omarchy-guardian/guardian-makepkg";
+
+    #[test]
     fn an_alias_or_function_in_front_of_a_helper_that_passes_makepkg_is_found() {
         assert!(overrides_makepkg(
             "alias yay='yay --makepkg /usr/bin/makepkg'\n",
-            "yay"
+            "yay",
+            GATE
         ));
         assert!(overrides_makepkg(
             "yay() {\n  command yay --makepkg makepkg \"$@\"\n}\n",
-            "yay"
+            "yay",
+            GATE
         ));
         assert!(overrides_makepkg(
-            "function paru\n  command paru --makepkg makepkg $argv\nend\n",
-            "paru"
+            "yay() { command yay --makepkg=/tmp/x \"$@\"; }\n",
+            "yay",
+            GATE
         ));
-        assert!(!overrides_makepkg("alias yay='yay --noconfirm'\n", "yay"));
+        assert!(overrides_makepkg(
+            "function paru\n  if true\n    command paru --makepkg makepkg $argv\n  end\nend\n",
+            "paru",
+            GATE
+        ));
+        assert!(!overrides_makepkg(
+            "alias yay='yay --noconfirm'\n",
+            "yay",
+            GATE
+        ));
         assert!(!overrides_makepkg(
             "# alias yay='yay --makepkg makepkg'\n",
-            "yay"
+            "yay",
+            GATE
         ));
         assert!(!overrides_makepkg(
             "alias y='yay --makepkg makepkg'\n",
-            "paru"
+            "paru",
+            GATE
+        ));
+    }
+
+    #[test]
+    fn makepkg_on_another_line_or_guardians_own_shim_is_no_override() {
+        // An alias of the helper's name, and `--makepkg` on some other
+        // command of the file.
+        assert!(!overrides_makepkg(
+            "alias yay='yay --noconfirm'\nalias p='paru --makepkg /usr/bin/makepkg'\n",
+            "yay",
+            GATE
+        ));
+        assert!(!overrides_makepkg(
+            "yay() {\n  command yay \"$@\"\n}\nbuild() {\n  paru --makepkg makepkg\n}\n",
+            "yay",
+            GATE
+        ));
+        assert!(!overrides_makepkg(
+            "function yay\n  command yay $argv\nend\nfunction b\n  paru --makepkg makepkg\nend\n",
+            "yay",
+            GATE
+        ));
+        // Passing Guardian's own shim keeps the build in the gate.
+        assert!(!overrides_makepkg(
+            &format!("alias yay='yay --makepkg {GATE}'\n"),
+            "yay",
+            GATE
+        ));
+        assert!(!overrides_makepkg(
+            &format!("yay() {{\n  command yay --makepkg=\"{GATE}\" \"$@\"\n}}\n"),
+            "yay",
+            GATE
         ));
     }
 }

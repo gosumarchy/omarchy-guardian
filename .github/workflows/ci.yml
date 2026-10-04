@@ -18,7 +18,9 @@ jobs:
     container: archlinux:base-devel@sha256:51dd3d24f7fba779e7c471caeee7804c50e8c134ad948e19685a1c83a42facc3
     steps:
       - name: Install toolchain and test tools
-        run: pacman -Syu --noconfirm --needed rust git libarchive shellcheck
+        # lua and openssh: the offline suite runs the Hyprland PATH file and
+        # the installer's release check (ssh-keygen) with them.
+        run: pacman -Syu --noconfirm --needed rust git libarchive shellcheck lua openssh
       # Pinned by commit: a tag can be moved.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -39,8 +41,11 @@ jobs:
         run: cargo test --locked
       # What the gates decide before a review, or with no reviewer to ask:
       # the real binary and scripts, no AI and no sandbox. The job runs as
-      # root in a throwaway container, so the hook's "installed, not turned
-      # on" branch runs for real here. The two suites that need Bubblewrap
+      # root in a throwaway container, so the hook script runs for real here,
+      # not turned on and turned on: for the latter the suite creates and
+      # removes /etc/pacman.d/hooks/omarchy-guardian.hook and
+      # /usr/bin/omarchy-guardian (only with CI=true, as root). The pacman
+      # gate's cases run as real root too. The two suites that need Bubblewrap
       # with overlays (tests/e2e/sweep.sh, and the makepkg jail part of this
       # one, which skips itself) do not run in a hosted container, and
       # tests/e2e/integration-gates.sh and tests/ai-eval need a reviewer.

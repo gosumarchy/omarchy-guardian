@@ -93,22 +93,19 @@ fn collect() -> Status {
                 State::Partial(detail) => ("partial", detail.clone()),
                 State::Unavailable(detail) => ("unavailable", detail.clone()),
             };
-            match &state {
-                State::On => on += 1,
-                // Without yay there is nothing for its gate to guard. Any
-                // other gate that cannot be there is protection missing.
-                State::Unavailable(_) if integration == Integration::AurGate => {}
-                State::Unavailable(detail) => {
-                    issues.push(format!("{} is unavailable: {detail}", integration.label()));
-                }
-                _ => issues.push(format!("{} is not fully on", integration.label())),
+            if state == State::On {
+                on += 1;
             }
+            issues.extend(gate_issue(paths, integration, &state));
             // On, and reviewing with the local checks alone: said beside
             // the gate, as a choice and not a fault.
             let caveats: Vec<String> = [
                 local_only(&settings, integration),
                 (integration == Integration::ThemeInterceptor)
                     .then(|| paths.theme_caveat())
+                    .flatten(),
+                (integration == Integration::SessionPath)
+                    .then(|| paths.path_caveat())
                     .flatten(),
             ]
             .into_iter()
@@ -166,6 +163,21 @@ fn collect() -> Status {
         gates,
         issues,
         block,
+    }
+}
+
+/// The bar's problem line for a gate that is not on, if it is one. A gate
+/// with nothing on this machine to guard (the AUR gate without yay, the
+/// PATH wrappers without Omarchy) is not protection missing; any other
+/// gate that cannot be there is.
+pub(super) fn gate_issue(paths: &Paths, integration: Integration, state: &State) -> Option<String> {
+    match state {
+        State::On => None,
+        State::Unavailable(_) if !paths.applies(integration) => None,
+        State::Unavailable(detail) => {
+            Some(format!("{} is unavailable: {detail}", integration.label()))
+        }
+        _ => Some(format!("{} is not fully on", integration.label())),
     }
 }
 
@@ -321,6 +333,14 @@ fn snapshot_of(settings: &Settings, paths: Option<&Paths>) -> gatewatch::Snapsho
     ));
     gatewatch::Snapshot {
         gates,
+        // Read from this caller's own PATH, for want of the session's:
+        // another caller would read them otherwise.
+        unknown: paths
+            .map(Paths::unsettled)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|integration| integration.label().to_string())
+            .collect(),
         weak: weaker::weakenings(settings)
             .iter()
             .filter(|weakening| !weakening.acknowledged)
