@@ -14,9 +14,17 @@ pkgdesc='Reviews downloaded source, AUR builds, pacman scriptlets and Omarchy th
 arch=('x86_64' 'aarch64')
 url='https://github.com/gosumarchy/omarchy-guardian'
 license=('unknown')
-depends=('bubblewrap' 'coreutils' 'curl' 'git' 'glibc' 'libarchive' 'pacman' 'util-linux')
+# jq: the plugin gate (guardian-plugin) reads plugin manifests with it and
+# stops without it.
+depends=('bubblewrap' 'coreutils' 'curl' 'git' 'glibc' 'jq' 'libarchive' 'pacman' 'util-linux')
 makedepends=('cargo')
-optdepends=('opencode: AI source review; without it no review can come out clear')
+# One of the two reviewers is needed for any review to come out clear; the
+# pacman gate only runs a root-owned one, which these packages install.
+optdepends=('claude-code: the default AI reviewer (models written claude-code/...)'
+            'opencode: the AI reviewer for every other model'
+            'gum: the theme and plugin gates ask for a missing URL and for confirmation with it; without it, give the URL and --yes'
+            'libnotify: desktop notifications about blocks and about protection that went off'
+            'openssh: ssh-keygen, with which install.sh checks the release tag signature of the next upgrade')
 install=omarchy-guardian.install
 
 _root="$startdir/../.."
