@@ -16,6 +16,17 @@
 #                                               overlay the real ones in a
 #                                               bwrap sandbox, home is the home
 #                                               directory
+#   cases/theme/{clear,block}/NAME/             an Omarchy theme, and
+#   cases/plugin/{clear,block}/NAME/            an Omarchy shell plugin, each
+#                                               by `guard --class`, as the
+#                                               theme and plugin handlers do
+#   cases/upgrade/{clear,block}/NAME/{class,v1/,v2/}  two versions of one
+#                                               source of the class named in
+#                                               the file `class`: v1 is
+#                                               reviewed and must be approved,
+#                                               then v2 is reviewed against it
+#                                               with the same review memory;
+#                                               v2's review is the verdict
 # clear passes only on a clear or warned review that ran (exit 0), block only on
 # findings (exit 1). An incomplete or unavailable review fails either way.
 # A system case is judged by the AI's own medium or high findings on the
@@ -28,8 +39,10 @@
 #
 # Nothing is installed or built: the pacman gate is run by a stand-in parent
 # named pacman, and the makepkg gate by a makepkg that runs only the
-# --printsrcinfo and source extraction steps for real. Every run starts with an
-# empty review memory, so no verdict comes from the cache.
+# --printsrcinfo and source extraction steps for real; the command `guard`
+# would start only leaves a marker. Every run starts with an empty review
+# memory, so no verdict comes from the cache (an upgrade case keeps its own
+# between its two versions).
 #
 # The pacman gate reviews with the system config and a root-owned reviewer
 # (/usr/bin/opencode or /usr/bin/claude), as it does for real; the makepkg gate
@@ -40,15 +53,18 @@
 #   bash tests/ai-eval/run.sh [FILTER...]
 #
 # FILTER selects the cases whose path (e.g. aur/block/base64-prepare)
-# contains it. RUNS=N repeats each case (default 1), JOBS=N sets how many
+# contains it. RUNS=N repeats each case (default 3: one run says little about
+# a model that answers differently now and then), JOBS=N sets how many
 # reviews run at once (default 3), GUARDIAN picks the binary and
-# GUARDIAN_EVAL_KEEP=1 keeps the logs.
+# GUARDIAN_EVAL_KEEP=1 keeps the logs. Each case gets a line with its pass
+# rate, and the run ends with the rates of the block and the clear cases.
+# The exit status is 1 when any case passed less than every run.
 set -uo pipefail
 
 EVAL=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 PROJECT=$(cd -- "$EVAL/../.." && pwd -P)
 GUARDIAN=${GUARDIAN:-$PROJECT/target/release/omarchy-guardian}
-RUNS=${RUNS:-1}
+RUNS=${RUNS:-3}
 JOBS=${JOBS:-3}
 WORK=$(mktemp -d -t guardian-eval-XXXXXX)
 
@@ -207,7 +223,37 @@ review() {
         ((status != 0)) || [[ -e $dir/built ]] || status=2
         return "$status"
         ;;
+    theme | plugin)
+        cp -a -- "$EVAL/cases/$case" "$dir/$name"
+        guard_case "$kind" "$name" "$dir" >"$log" 2>&1
+        ;;
+    upgrade)
+        local class
+        class=$(<"$EVAL/cases/$case/class") || return 2
+        cp -a -- "$EVAL/cases/$case/v1" "$dir/$name"
+        # The first version must be approved, or there is nothing to
+        # upgrade from.
+        guard_case "$class" "$name" "$dir" >"$log.v1" 2>&1 || {
+            printf 'v1 was not approved; see %s\n' "$log.v1" >"$log"
+            return 2
+        }
+        rm -rf -- "$dir/$name" "$dir/ran"
+        cp -a -- "$EVAL/cases/$case/v2" "$dir/$name"
+        guard_case "$class" "$name" "$dir" >"$log" 2>&1
+        ;;
     esac
+}
+
+# guard_case <class> <name> <dir>: reviews <dir>/<name> as the theme and
+# plugin handlers do, with a command that only leaves a marker.
+guard_case() {
+    local class=$1 name=$2 dir=$3
+    "$GUARDIAN" guard --class "$class" --identity "$class:$name" --thorough "$dir/$name" -- \
+        /usr/bin/touch "$dir/ran" </dev/null
+    local status=$?
+    # A gate that exits 0 without starting the command did not allow it.
+    ((status != 0)) || [[ -e $dir/ran ]] || status=2
+    return "$status"
 }
 
 cases=()
@@ -244,6 +290,7 @@ done
 wait
 
 failed=0
+block_passes=0 block_runs=0 clear_passes=0 clear_runs=0
 for case in "${cases[@]}"; do
     want=0
     [[ $case == */block/* ]] && want=1
@@ -257,15 +304,28 @@ for case in "${cases[@]}"; do
         esac
         [[ $status == "$want" ]] && passes=$((passes + 1))
     done
-    if ((passes == RUNS)); then
-        printf 'ok   %-45s %s\n' "$case" "$verdicts"
+    if ((want == 1)); then
+        block_passes=$((block_passes + passes)) block_runs=$((block_runs + RUNS))
     else
-        printf 'FAIL %-45s %s  (%d/%d)\n' "$case" "$verdicts" "$passes" "$RUNS"
+        clear_passes=$((clear_passes + passes)) clear_runs=$((clear_runs + RUNS))
+    fi
+    mark=ok
+    if ((passes < RUNS)); then
+        mark=FAIL
         failed=$((failed + 1))
     fi
+    printf '%-4s %-45s %-6s %d/%d (%d%%)\n' "$mark" "$case" "$verdicts" \
+        "$passes" "$RUNS" $((100 * passes / RUNS))
 done
 
+# rate <passes> <runs>: a percentage, or "none" when no such case ran.
+rate() {
+    if (($2 > 0)); then printf '%d/%d (%d%%)' "$1" "$2" $((100 * $1 / $2)); else printf 'none'; fi
+}
 printf '\nC clear  F findings  I incomplete or unavailable\n'
+printf 'pass rate: block %s  clear %s  overall %s\n' \
+    "$(rate "$block_passes" "$block_runs")" "$(rate "$clear_passes" "$clear_runs")" \
+    "$(rate $((block_passes + clear_passes)) $((block_runs + clear_runs)))"
 if ((failed > 0)); then
     GUARDIAN_EVAL_KEEP=1
     printf '%d case(s) failed; logs in %s/logs\n' "$failed" "$WORK"

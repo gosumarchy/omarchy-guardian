@@ -12,8 +12,9 @@ use std::str;
 
 use crate::agent::SourceFile;
 use crate::config::model::{AgentSettings, Named, SourceClass};
+use crate::engine::cache;
 use crate::engine::plan::Previous;
-use crate::engine::request::PROMPT_VERSION;
+use crate::engine::request::{PROMPT_VERSION, Request};
 use crate::engine::store::{BASELINES, BLOBS, Store, VERDICTS, is_hex_digest};
 use crate::error::Error;
 use crate::sha256::Sha256;
@@ -124,20 +125,57 @@ struct Manifest {
     /// `fingerprint` of the agent settings the files were approved under.
     settings: String,
     recorded: u64,
+    /// When this source last passed a review of all of it, and how many
+    /// changed versions were approved as diffs since. A manifest written
+    /// before these were kept has neither, and is due (see `due`).
+    full: Option<u64>,
+    diffs: Option<u32>,
     /// (blob digest, path) per file.
     files: Entries,
     /// (digest, path) per unread file.
     unread: Entries,
 }
 
-/// The agent settings a verdict depends on (the same ones `cache::key`
-/// hashes besides the class and request), as a hex SHA-256.
-pub fn fingerprint(settings: &AgentSettings) -> String {
+/// A baseline rolls forward with every approved upgrade, so what the AI
+/// last saw whole falls further behind. After this many upgrades approved
+/// as diffs, or this many days, the next review is a full one.
+pub const MAX_DIFF_REVIEWS: u32 = 5;
+pub const MAX_DAYS_SINCE_FULL: u64 = 30;
+
+const SECONDS_PER_DAY: u64 = 86_400;
+
+/// Why a baseline is no longer diffed against, or `None` while it is.
+fn due(manifest: &Manifest, now: u64) -> Option<String> {
+    let (Some(full), Some(diffs)) = (manifest.full, manifest.diffs) else {
+        return Some("it does not say when the source was last reviewed in full".into());
+    };
+    if diffs >= MAX_DIFF_REVIEWS {
+        return Some(format!(
+            "{diffs} upgrades were approved as diffs since the last full review"
+        ));
+    }
+    match now.checked_sub(full) {
+        // A clock set back must not keep a baseline young.
+        None => Some("its last full review is dated in the future".into()),
+        Some(age) if age >= MAX_DAYS_SINCE_FULL * SECONDS_PER_DAY => Some(format!(
+            "the last full review was {} days ago",
+            age / SECONDS_PER_DAY
+        )),
+        Some(_) => None,
+    }
+}
+
+/// What a verdict depends on besides the source: the agent settings (the
+/// same ones `cache::key` hashes) and the wording of the prompts and of a
+/// request of `class`, as a hex SHA-256. A prompt changed without a new
+/// `PROMPT_VERSION` still retires the baselines approved under the old one.
+pub fn fingerprint(settings: &AgentSettings, class: SourceClass) -> String {
     let text = format!(
-        "omarchy-guardian-baseline-settings\0{}\0{}\0{}\0",
+        "omarchy-guardian-baseline-settings\0{}\0{}\0{}\0{}\0",
         settings.model.as_deref().unwrap_or_default(),
         settings.variant.as_deref().unwrap_or_default(),
-        settings.thinking.name()
+        settings.thinking.name(),
+        cache::prompt_digest(&Request::fixed_text(class))
     );
     Sha256::digest(text.as_bytes()).to_string()
 }
@@ -163,9 +201,21 @@ fn parse_manifest(text: &str) -> Option<Manifest> {
     }
     let settings = settings.to_string();
     let recorded = lines.next()?.strip_prefix("recorded ")?.parse().ok()?;
+    let mut full = None;
+    let mut diffs = None;
     let mut files = Vec::new();
     let mut unread = Vec::new();
     for line in lines {
+        // Optional, so a manifest from before they existed still parses
+        // (and is then due for a full review).
+        if let Some(when) = line.strip_prefix("full ") {
+            full = Some(when.parse().ok()?);
+            continue;
+        }
+        if let Some(count) = line.strip_prefix("diffs ") {
+            diffs = Some(count.parse().ok()?);
+            continue;
+        }
         let (list, digest, path) = if let Some(entry) = line.strip_prefix("unread ") {
             let (digest, path) = entry.split_once(' ')?;
             (&mut unread, digest, path)
@@ -187,6 +237,8 @@ fn parse_manifest(text: &str) -> Option<Manifest> {
         prompt,
         settings,
         recorded,
+        full,
+        diffs,
         files,
         unread,
     })
@@ -203,31 +255,87 @@ fn read_manifest(store: &Store, name: &str) -> Result<Option<Manifest>, Error> {
 /// in the reviewed tree; `None` when no unit has one. A baseline that
 /// does not parse (including an older format), names another identity, was
 /// approved under another prompt version or other agent `settings`, or has
-/// a missing or corrupt blob is deleted.
+/// a missing or corrupt blob is deleted. This one does not ask how old the
+/// baseline is; a review uses `load_fresh`.
+#[cfg(test)]
 pub fn load(
     store: &Store,
     class: SourceClass,
     units: &[Unit],
     settings: &AgentSettings,
 ) -> Result<Option<Approved>, Error> {
-    let expected = fingerprint(settings);
+    load_with(store, class, units, settings, None).map(|loaded| loaded.approved)
+}
+
+/// What `load_fresh` found.
+#[derive(Debug, Default)]
+pub struct Loaded {
+    pub approved: Option<Approved>,
+    /// Why a unit's baseline was retired as due for a full review, as a
+    /// line for the report.
+    pub due: Vec<String>,
+}
+
+/// `load` for a review at time `now`: a baseline that is due for a full
+/// review (see `MAX_DIFF_REVIEWS`, `MAX_DAYS_SINCE_FULL`) is deleted like
+/// any other that no longer counts, so that review is a full one and the
+/// baseline it records starts again.
+pub fn load_fresh(
+    store: &Store,
+    class: SourceClass,
+    units: &[Unit],
+    settings: &AgentSettings,
+    now: u64,
+) -> Result<Loaded, Error> {
+    load_with(store, class, units, settings, Some(now))
+}
+
+fn load_with(
+    store: &Store,
+    class: SourceClass,
+    units: &[Unit],
+    settings: &AgentSettings,
+    now: Option<u64>,
+) -> Result<Loaded, Error> {
+    let expected = fingerprint(settings, class);
     let mut approved = Approved::default();
+    let mut loaded = Loaded::default();
     let mut found = false;
     for unit in units {
         let name = manifest_name(class, &unit.identity);
         if store.read(BASELINES, &name)?.is_none() {
             continue;
         }
-        if let Some((files, unread)) = load_unit(store, &name, unit, &expected)? {
-            found = true;
-            approved.prefixes.push(unit.prefix.clone());
-            approved.files.extend(files);
-            approved.unread.extend(unread);
-        } else {
-            store.remove(BASELINES, &name)?;
+        match load_unit(store, &name, unit, &expected, now)? {
+            UnitBaseline::Approved(files, unread) => {
+                found = true;
+                approved.prefixes.push(unit.prefix.clone());
+                approved.files.extend(files);
+                approved.unread.extend(unread);
+            }
+            UnitBaseline::Stale => store.remove(BASELINES, &name)?,
+            UnitBaseline::Due(reason) => {
+                loaded.due.push(format!(
+                    "the approved version of {} is due for a full review: {reason}",
+                    unit.identity.as_str()
+                ));
+                store.remove(BASELINES, &name)?;
+            }
         }
     }
-    Ok(found.then_some(approved))
+    loaded.approved = found.then_some(approved);
+    Ok(loaded)
+}
+
+/// What one unit's stored baseline is worth to a review.
+enum UnitBaseline {
+    /// Its files and unread files, by path in the reviewed tree.
+    Approved(Entries, Entries),
+    /// Unreadable, another identity's, or approved under another prompt or
+    /// other settings.
+    Stale,
+    /// Good, but due for a full review, with the reason.
+    Due(String),
 }
 
 fn load_unit(
@@ -235,15 +343,19 @@ fn load_unit(
     name: &str,
     unit: &Unit,
     fingerprint: &str,
-) -> Result<Option<(Entries, Entries)>, Error> {
+    now: Option<u64>,
+) -> Result<UnitBaseline, Error> {
     let Some(manifest) = read_manifest(store, name)? else {
-        return Ok(None);
+        return Ok(UnitBaseline::Stale);
     };
     if manifest.identity != unit.identity.as_str()
         || manifest.prompt != PROMPT_VERSION
         || manifest.settings != fingerprint
     {
-        return Ok(None);
+        return Ok(UnitBaseline::Stale);
+    }
+    if let Some(reason) = now.and_then(|now| due(&manifest, now)) {
+        return Ok(UnitBaseline::Due(reason));
     }
     let mut files = Vec::with_capacity(manifest.files.len());
     for (digest, path) in manifest.files {
@@ -251,7 +363,7 @@ fn load_unit(
             .get_blob(&digest)?
             .and_then(|bytes| String::from_utf8(bytes).ok())
         else {
-            return Ok(None);
+            return Ok(UnitBaseline::Stale);
         };
         files.push((format!("{}{path}", unit.prefix), content));
     }
@@ -260,7 +372,17 @@ fn load_unit(
         .into_iter()
         .map(|(digest, path)| (format!("{}{path}", unit.prefix), digest))
         .collect();
-    Ok(Some((files, unread)))
+    Ok(UnitBaseline::Approved(files, unread))
+}
+
+/// Deletes the baselines of `units`: the engine does so when a review that
+/// had one is done in full instead, so what that review approves starts
+/// again from a full review.
+pub fn retire(store: &Store, class: SourceClass, units: &[Unit]) -> Result<(), Error> {
+    for unit in units {
+        store.remove(BASELINES, &manifest_name(class, &unit.identity))?;
+    }
+    Ok(())
 }
 
 /// Records each unit's reviewed files, and the `unread` ones beside them,
@@ -271,6 +393,12 @@ fn load_unit(
 /// so such a path would otherwise round-trip under the wrong key). While an
 /// unread file is left out (such a path, one outside every unit, one
 /// without a digest), every review is a full one.
+///
+/// A unit that still has a baseline was reviewed against it (the engine
+/// deletes the baseline of a review it does in full): when the files
+/// differ, that was one more upgrade approved as a diff since the last
+/// full review, and when they are the same, nothing new was approved.
+/// Without one, this review was a full one.
 pub fn record(
     store: &Store,
     class: SourceClass,
@@ -280,12 +408,10 @@ pub fn record(
     settings: &AgentSettings,
     now: u64,
 ) -> Result<(), Error> {
-    let approved_under = fingerprint(settings);
+    let approved_under = fingerprint(settings, class);
     for unit in units {
-        let mut text = format!(
-            "{FORMAT}\nidentity {}\nprompt {PROMPT_VERSION}\nsettings {approved_under}\nrecorded {now}\n",
-            unit.identity.as_str()
-        );
+        let mut kept_files: Entries = Vec::new();
+        let mut entries = String::new();
         for file in files {
             let Some(path) = file.path.strip_prefix(unit.prefix.as_str()) else {
                 continue;
@@ -294,8 +420,10 @@ pub fn record(
                 continue;
             }
             let digest = store.put_blob(file.content.as_bytes())?;
-            let _ = writeln!(text, "file {digest} {} {path}", file.content.len());
+            let _ = writeln!(entries, "file {digest} {} {path}", file.content.len());
+            kept_files.push((digest, path.to_string()));
         }
+        let mut kept_unread: Entries = Vec::new();
         for (path, digest) in unread {
             let Some(path) = path.strip_prefix(unit.prefix.as_str()) else {
                 continue;
@@ -307,13 +435,34 @@ pub fn record(
             {
                 continue;
             }
-            let _ = writeln!(text, "unread {digest} {path}");
+            let _ = writeln!(entries, "unread {digest} {path}");
+            kept_unread.push((digest.clone(), path.to_string()));
         }
-        store.write(
-            BASELINES,
-            &manifest_name(class, &unit.identity),
-            text.as_bytes(),
-        )?;
+
+        let name = manifest_name(class, &unit.identity);
+        let reviewed_against = read_manifest(store, &name)?.filter(|manifest| {
+            manifest.identity == unit.identity.as_str()
+                && manifest.prompt == PROMPT_VERSION
+                && manifest.settings == approved_under
+        });
+        let (full, diffs) = match reviewed_against {
+            Some(Manifest {
+                full: Some(full),
+                diffs: Some(diffs),
+                files,
+                unread,
+                ..
+            }) => {
+                let same = files == kept_files && unread == kept_unread;
+                (full, diffs.saturating_add(u32::from(!same)))
+            }
+            Some(_) | None => (now, 0),
+        };
+        let text = format!(
+            "{FORMAT}\nidentity {}\nprompt {PROMPT_VERSION}\nsettings {approved_under}\nrecorded {now}\nfull {full}\ndiffs {diffs}\n{entries}",
+            unit.identity.as_str()
+        );
+        store.write(BASELINES, &name, text.as_bytes())?;
     }
     Ok(())
 }
@@ -729,10 +878,11 @@ mod tests {
             .replace(
                 &format!(
                     "prompt {PROMPT_VERSION}\nsettings {}\n",
-                    fingerprint(&settings())
+                    fingerprint(&settings(), SourceClass::Aur)
                 ),
                 "",
-            );
+            )
+            .replace("full 1\ndiffs 0\n", "");
         assert!(
             format_one
                 .starts_with("omarchy-guardian-baseline 1\nidentity aur:demo\nrecorded 1\nfile ")
@@ -745,6 +895,204 @@ mod tests {
             None
         );
         assert!(store.list(BASELINES).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_baseline_is_bound_to_the_wording_of_the_prompts() {
+        // The same settings under another class's request wording, or
+        // under other prompt text, are another fingerprint: a wording
+        // change without a new prompt version still retires a baseline.
+        let aur = fingerprint(&settings(), SourceClass::Aur);
+        assert_eq!(aur, fingerprint(&settings(), SourceClass::Aur));
+        assert_ne!(aur, fingerprint(&settings(), SourceClass::System));
+        assert_ne!(
+            crate::engine::cache::prompt_digest("one wording"),
+            crate::engine::cache::prompt_digest("another wording")
+        );
+        // A manifest whose fingerprint was made under other wording.
+        let dir = TempDir::new("baseline-wording");
+        let store = store(&dir);
+        let units = [unit("", "aur:demo")];
+        record(
+            &store,
+            SourceClass::Aur,
+            &units,
+            &[file("PKGBUILD", "p\n")],
+            &settings(),
+            1,
+        )
+        .unwrap();
+        let name = store.list(BASELINES).unwrap().remove(0);
+        let text = String::from_utf8(store.read(BASELINES, &name).unwrap().unwrap()).unwrap();
+        let reworded = text.replace(&aur, &fingerprint(&settings(), SourceClass::Theme));
+        assert_ne!(reworded, text);
+        store.write(BASELINES, &name, reworded.as_bytes()).unwrap();
+        assert_eq!(
+            load(&store, SourceClass::Aur, &units, &settings()).unwrap(),
+            None
+        );
+    }
+
+    const DAY: u64 = 86_400;
+
+    /// What `load_fresh` gives at `now`: whether there is a baseline, and
+    /// why not when it was due.
+    fn fresh(store: &Store, units: &[Unit], now: u64) -> (bool, Vec<String>) {
+        let loaded = super::load_fresh(store, SourceClass::Aur, units, &settings(), now).unwrap();
+        (loaded.approved.is_some(), loaded.due)
+    }
+
+    #[test]
+    fn a_baseline_is_due_for_a_full_review_after_five_upgrades() {
+        let dir = TempDir::new("baseline-generations");
+        let store = store(&dir);
+        let units = [unit("", "aur:demo")];
+        let version = |number: u32| {
+            [
+                file("PKGBUILD", &format!("pkgver={number}\n")),
+                file("a", "a\n"),
+            ]
+        };
+        let approve = |number: u32, now: u64| {
+            record(
+                &store,
+                SourceClass::Aur,
+                &units,
+                &version(number),
+                &settings(),
+                now,
+            )
+            .unwrap();
+        };
+        // A full review, then five upgrades approved as diffs against it.
+        approve(0, 100);
+        for upgrade in 1..=5 {
+            assert_eq!(fresh(&store, &units, 100), (true, Vec::new()), "{upgrade}");
+            approve(upgrade, 100 + u64::from(upgrade));
+        }
+        let name = store.list(BASELINES).unwrap().remove(0);
+        let text = String::from_utf8(store.read(BASELINES, &name).unwrap().unwrap()).unwrap();
+        assert!(
+            text.contains("\nrecorded 105\nfull 100\ndiffs 5\n"),
+            "{text}"
+        );
+
+        // The sixth review is a full one: the baseline is retired.
+        let (found, due) = fresh(&store, &units, 200);
+        assert!(!found);
+        assert!(
+            matches!(due.as_slice(), [reason] if reason.contains("aur:demo") && reason.contains("5 upgrades")),
+            "{due:?}"
+        );
+        assert!(store.list(BASELINES).unwrap().is_empty());
+        // What it approves starts again.
+        approve(6, 300);
+        let text = String::from_utf8(store.read(BASELINES, &name).unwrap().unwrap()).unwrap();
+        assert!(
+            text.contains("\nrecorded 300\nfull 300\ndiffs 0\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_same_version_approved_again_is_no_upgrade() {
+        let dir = TempDir::new("baseline-same");
+        let store = store(&dir);
+        let units = [unit("", "aur:demo")];
+        let files = [file("PKGBUILD", "p\n")];
+        // yay's second pass, a reinstall: nothing new was approved.
+        for now in [100, 200, 300, 400, 500, 600, 700] {
+            record(&store, SourceClass::Aur, &units, &files, &settings(), now).unwrap();
+        }
+        let name = store.list(BASELINES).unwrap().remove(0);
+        let text = String::from_utf8(store.read(BASELINES, &name).unwrap().unwrap()).unwrap();
+        assert!(
+            text.contains("\nrecorded 700\nfull 100\ndiffs 0\n"),
+            "{text}"
+        );
+        assert_eq!(fresh(&store, &units, 700), (true, Vec::new()));
+        // A file Guardian does not read that changed is a new version.
+        let unread = Unread::from([("lib.so".to_string(), "a".repeat(64))]);
+        super::record(
+            &store,
+            SourceClass::Aur,
+            &units,
+            &files,
+            &unread,
+            &settings(),
+            800,
+        )
+        .unwrap();
+        let text = String::from_utf8(store.read(BASELINES, &name).unwrap().unwrap()).unwrap();
+        assert!(text.contains("\nfull 100\ndiffs 1\n"), "{text}");
+    }
+
+    #[test]
+    fn a_baseline_is_due_for_a_full_review_after_thirty_days() {
+        let dir = TempDir::new("baseline-age");
+        let store = store(&dir);
+        let units = [unit("", "aur:demo")];
+        let files = [file("PKGBUILD", "p\n")];
+        let approve =
+            || record(&store, SourceClass::Aur, &units, &files, &settings(), 1000).unwrap();
+
+        approve();
+        assert_eq!(
+            fresh(&store, &units, 1000 + 30 * DAY - 1),
+            (true, Vec::new())
+        );
+        let (found, due) = fresh(&store, &units, 1000 + 30 * DAY);
+        assert!(!found);
+        assert!(due[0].contains("30 days ago"), "{due:?}");
+        assert!(store.list(BASELINES).unwrap().is_empty());
+
+        // A clock set back does not keep a baseline young.
+        approve();
+        let (found, due) = fresh(&store, &units, 999);
+        assert!(!found && due[0].contains("in the future"), "{due:?}");
+
+        // A manifest written before the age was kept says nothing about
+        // it: it parses, and is due.
+        approve();
+        let name = store.list(BASELINES).unwrap().remove(0);
+        let text = String::from_utf8(store.read(BASELINES, &name).unwrap().unwrap()).unwrap();
+        let older = text.replace("full 1000\ndiffs 0\n", "");
+        assert_ne!(older, text);
+        store.write(BASELINES, &name, older.as_bytes()).unwrap();
+        assert!(
+            load(&store, SourceClass::Aur, &units, &settings())
+                .unwrap()
+                .is_some()
+        );
+        let (found, due) = fresh(&store, &units, 1000);
+        assert!(!found && due[0].contains("does not say"), "{due:?}");
+        // And a version approved on top of one is not counted as a diff.
+        store.write(BASELINES, &name, older.as_bytes()).unwrap();
+        record(
+            &store,
+            SourceClass::Aur,
+            &units,
+            &[file("PKGBUILD", "q\n")],
+            &settings(),
+            2000,
+        )
+        .unwrap();
+        let text = String::from_utf8(store.read(BASELINES, &name).unwrap().unwrap()).unwrap();
+        assert!(text.contains("\nfull 2000\ndiffs 0\n"), "{text}");
+
+        // Retiring deletes the units' baselines and nothing else.
+        record(
+            &store,
+            SourceClass::Aur,
+            &[unit("", "aur:other")],
+            &files,
+            &settings(),
+            1,
+        )
+        .unwrap();
+        super::retire(&store, SourceClass::Aur, &units).unwrap();
+        assert_eq!(store.list(BASELINES).unwrap().len(), 1);
+        super::retire(&store, SourceClass::Aur, &units).unwrap();
     }
 
     #[test]

@@ -180,6 +180,54 @@ impl fmt::Display for Json {
     }
 }
 
+/// Characters written as `\uXXXX` although JSON allows most of them raw:
+/// the ones that are invisible or reorder text. A reader of the request,
+/// the model included, then sees which code point was there, and nothing in
+/// a reviewed file can draw what looks like a line of the request around
+/// it. Nothing is removed: the escape names the character.
+pub const fn is_escaped(character: char) -> bool {
+    matches!(
+        character,
+        '\u{0}'..='\u{1f}'
+            | '\u{7f}'..='\u{9f}'
+            | '\u{ad}'
+            | '\u{34f}'
+            | '\u{61c}'
+            | '\u{115f}'
+            | '\u{1160}'
+            | '\u{17b4}'
+            | '\u{17b5}'
+            | '\u{180b}'..='\u{180f}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{202f}'
+            | '\u{205f}'..='\u{206f}'
+            | '\u{2800}'
+            | '\u{3164}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{feff}'
+            | '\u{ffa0}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0000}'..='\u{e0fff}'
+    )
+}
+
+/// The bytes `character` takes inside a JSON string as written here.
+pub const fn written_len(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\n' | '\r' | '\t' => 2,
+        // Past the basic plane an escape is a surrogate pair.
+        other if is_escaped(other) => {
+            if other as u32 > 0xffff {
+                12
+            } else {
+                6
+            }
+        }
+        other => other.len_utf8(),
+    }
+}
+
 fn write_string(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
     f.write_char('"')?;
     for character in text.chars() {
@@ -189,7 +237,12 @@ fn write_string(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
             '\n' => f.write_str("\\n")?,
             '\r' => f.write_str("\\r")?,
             '\t' => f.write_str("\\t")?,
-            control if u32::from(control) < 0x20 => write!(f, "\\u{:04x}", u32::from(control))?,
+            hidden if is_escaped(hidden) => {
+                let mut units = [0_u16; 2];
+                for unit in hidden.encode_utf16(&mut units) {
+                    write!(f, "\\u{unit:04x}")?;
+                }
+            }
             other => f.write_char(other)?,
         }
     }
@@ -511,6 +564,47 @@ mod tests {
             r#"{"text":"line\n\"quoted\"\\ \u0001","flag":false,"count":7,"items":[null,"é"]}"#
         );
         assert_eq!(Json::parse(&text).unwrap(), value);
+    }
+
+    #[test]
+    fn invisible_characters_are_written_as_escapes_and_read_back() {
+        // One of each kind: a C1 control, a soft hyphen, a bidi override, a
+        // zero-width space, a line separator, a variation selector, a
+        // byte-order mark, a blank Braille cell, and two past the basic
+        // plane (a musical format character and a tag letter).
+        let hidden =
+            "a\u{9b}\u{ad}\u{202e}\u{200b}\u{2028}\u{fe0f}\u{feff}\u{2800}\u{1d173}\u{e0041}z";
+        let text = Json::from(hidden).to_string();
+        // The sixteen-bit units in hex, each after a backslash and a `u`.
+        let mut escapes = String::new();
+        for unit in [
+            "009b", "00ad", "202e", "200b", "2028", "fe0f", "feff", "2800", "d834", "dd73", "db40",
+            "dc41",
+        ] {
+            escapes.push('\\');
+            escapes.push('u');
+            escapes.push_str(unit);
+        }
+        assert_eq!(text, format!("\"a{escapes}z\""));
+        assert!(text.is_ascii());
+        assert_eq!(Json::parse(&text).unwrap(), Json::from(hidden));
+        // Ordinary text of any script, and emoji, stay as they are.
+        let plain = "é 中 ✓ \u{1f600} \u{2026}";
+        assert_eq!(Json::from(plain).to_string(), format!("\"{plain}\""));
+    }
+
+    #[test]
+    fn the_written_length_is_what_is_written() {
+        for character in (0..=0x0011_0000_u32).filter_map(char::from_u32) {
+            let mut buffer = [0_u8; 4];
+            let text = Json::from(&*character.encode_utf8(&mut buffer)).to_string();
+            assert_eq!(
+                text.len() - 2,
+                super::written_len(character),
+                "{:x}",
+                u32::from(character)
+            );
+        }
     }
 
     #[test]
