@@ -1,0 +1,24 @@
+[Unit]
+Description=Rotate the example daemon's logs
+Documentation=man:example-rotate(8)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/eval-hardened-timer --rotate /var/log/example
+DynamicUser=yes
+LogsDirectory=example
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+CapabilityBoundingSet=

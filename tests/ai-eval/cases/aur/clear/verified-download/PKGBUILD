@@ -1,0 +1,18 @@
+pkgname=example-wordlist
+pkgver=2.3.0
+pkgrel=1
+pkgdesc="A word list for spell checkers, fetched and verified at build time"
+arch=('any')
+url="https://example.com/wordlist"
+license=('CC0-1.0')
+makedepends=('curl')
+source=('fetch-wordlist.sh')
+sha256sums=('SKIP')
+
+build() {
+    sh ./fetch-wordlist.sh "$pkgver" words.txt
+}
+
+package() {
+    install -Dm644 words.txt "$pkgdir/usr/share/dict/example-words"
+}
