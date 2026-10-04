@@ -5,6 +5,11 @@
 //! finds, makes no AI call and writes nothing. It prints the items no
 //! package vouches for as JSON on stdout, and the user's own sweep judges
 //! them with the user's settings.
+//!
+//! It also looks, for the accounts its results go to, at what would make
+//! their own sweep lie (an override of Guardian's user units) and at the
+//! keys that may log in as them, as those accounts could look themselves;
+//! of other accounts' keys it says only how many there are.
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write as _};
@@ -13,10 +18,12 @@ use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 use std::time::UNIX_EPOCH;
 
+use super::access::{self, Account, Detail};
 use super::collect::{self, Body, Collection, Item, Origin, Scope};
 use super::index::{self, LOCAL_DB, PackageIndex};
-use super::live;
+use super::state::{self, Remembered};
 use super::tier::Tier;
+use super::{live, own};
 use crate::autorun::Category;
 use crate::engine::store;
 use crate::json::Json;
@@ -96,21 +103,31 @@ pub fn collect_command(out: bool, settings: &crate::config::Settings) -> ExitCod
     collect::merge(&mut collection, live.items);
     collection.truncated.extend(live.unchecked);
     // Who reads these results: the group the system configuration names,
-    // or the user who ran `sweep --root`. Other accounts' crontabs are
-    // theirs: only how many were left out is noted.
+    // or the user who ran `sweep --root`. Other accounts' crontabs and
+    // `at` jobs are theirs: only how many were left out is noted.
+    let passwd = fs::read_to_string("/etc/passwd").unwrap_or_default();
     let readers = match group {
         Some(gid) => accounts_in_group(
             gid,
-            &fs::read_to_string("/etc/passwd").unwrap_or_default(),
+            &passwd,
             &fs::read_to_string("/etc/group").unwrap_or_default(),
         ),
         None => std::env::var("SUDO_USER").into_iter().collect(),
     };
-    let withheld = withhold_other_crontabs(&mut collection.items, &readers);
+    let accounts = access::accounts(&passwd);
+    collect::merge(&mut collection, of_accounts(&scope, &accounts, &readers));
+    let withheld = withhold_others_jobs(&mut collection.items, &readers, &|job| {
+        let uid = fs::symlink_metadata(Path::new("/").join(job)).ok()?.uid();
+        accounts
+            .iter()
+            .find(|account| account.uid == uid)
+            .map(|account| account.name.clone())
+    });
     let mut notes = live.notes;
+    notes.append(&mut collection.notes);
     if withheld > 0 {
         notes.push(format!(
-            "{withheld} crontab(s) of other accounts were left out: they are theirs to see"
+            "{withheld} crontab(s) or at job(s) of other accounts were left out: they are theirs to see"
         ));
     }
     let json = to_json(&collection, &notes).to_string();
@@ -200,13 +217,49 @@ fn accounts_in_group(gid: u32, passwd: &str, group: &str) -> Vec<String> {
     accounts
 }
 
-/// Leaves the crontabs of root and of `readers` in `items`, and takes out
-/// those of other accounts: they are theirs. Returns how many.
-fn withhold_other_crontabs(items: &mut Vec<Item>, readers: &[String]) -> usize {
+/// The most accounts with a home under `/home` whose keys are looked at.
+const MAX_ACCOUNTS: usize = 200;
+
+/// What root reports about the accounts with a home under `/home`, each
+/// looked at as that account could look itself (no link followed, nothing
+/// read that it could not read): for the accounts the results go to
+/// (`readers`), what overrides Guardian's user units in their home and
+/// each key that may log in as them; for every other account only how many
+/// keys there are, and a hash of the list so that a change shows. Whose
+/// keys those are is that account's business, like its crontab.
+fn of_accounts(scope: &Scope<'_>, accounts: &[Account], readers: &[String]) -> Vec<Item> {
+    let mut items = Vec::new();
+    for account in accounts
+        .iter()
+        .filter(|account| account.uid != 0 && account.home.starts_with("home/"))
+        .take(MAX_ACCOUNTS)
+    {
+        let reader = readers.contains(&account.name);
+        if reader {
+            items.extend(own::of_account(scope, &account.home, account.uid));
+        }
+        let detail = if reader { Detail::Keys } else { Detail::Count };
+        items.extend(access::keys_of(scope, account, detail));
+    }
+    items
+}
+
+/// Leaves the crontabs and `at` jobs of root and of `readers` in `items`,
+/// and takes out those of other accounts: they are theirs. A crontab is
+/// named after its account; `owner` says whose an `at` job is (one nobody
+/// can tell is somebody else's). Returns how many were taken out.
+fn withhold_others_jobs(
+    items: &mut Vec<Item>,
+    readers: &[String],
+    owner: &dyn Fn(&str) -> Option<String>,
+) -> usize {
     let others = |path: &str| {
-        path.strip_prefix("var/spool/cron/").is_some_and(|account| {
-            account != "root" && !readers.iter().any(|reader| reader == account)
-        })
+        let account = match path.strip_prefix("var/spool/cron/") {
+            Some(account) => account.to_string(),
+            None if path.starts_with("var/spool/atd/") => owner(path).unwrap_or_default(),
+            None => return false,
+        };
+        account != "root" && !readers.contains(&account)
     };
     let withheld = items.iter().filter(|item| others(&item.path)).count();
     // And what was found by following them: their scripts are theirs too.
@@ -542,32 +595,89 @@ pub fn system_allow(arguments: &[&str]) -> Result<(), String> {
     }
 }
 
-/// `omarchy-guardian sweep-allow-system --add LABEL FINGERPRINT | --remove
-/// LABEL | --clear`, run as root through sudo by `sweep allow` and `sweep
-/// forget`: the system's own list of allowed items, which only root writes.
+/// The longest label and fingerprint the system's list takes.
+const MAX_LABEL: usize = 4096;
+const MAX_FINGERPRINT: usize = 8192;
+
+const ALLOW_USAGE: &str = "usage: omarchy-guardian sweep-allow-system (--add LABEL FINGERPRINT | --remove LABEL | --clear)...";
+
+/// Applies the changes `arguments` ask for to the system's list. A label
+/// in a home (`~/…`) is kept for `invoker`, the user who ran sudo, and for
+/// nobody else: root, who has no such user, cannot add one. `--clear`
+/// drops the system's items and that user's, and leaves other users' home
+/// items alone.
+fn change_allowed(
+    allowed: &mut Remembered,
+    arguments: &[String],
+    invoker: Option<u32>,
+) -> Result<(), String> {
+    let key = |label: &str| -> Result<String, String> {
+        let plain = label.len() <= MAX_LABEL && !label.chars().any(char::is_control);
+        if state::is_home_label(label) && plain {
+            invoker.map(|uid| state::system_key(label, uid)).ok_or_else(|| {
+                "an item in a home is allowed for the user who asks: run `sweep allow` as that user".to_string()
+            })
+        } else if label.starts_with('/') && plain {
+            Ok(label.to_string())
+        } else {
+            Err(format!("{label:?} is not a label the sweep shows"))
+        }
+    };
+    if arguments.is_empty() {
+        return Err(ALLOW_USAGE.into());
+    }
+    let mut rest = arguments;
+    while let Some((flag, tail)) = rest.split_first() {
+        rest = match (flag.as_str(), tail) {
+            ("--add", [label, fingerprint, tail @ ..]) => {
+                if fingerprint.is_empty()
+                    || fingerprint.len() > MAX_FINGERPRINT
+                    || fingerprint.chars().any(char::is_control)
+                {
+                    return Err(format!("{label}: not a fingerprint"));
+                }
+                allowed.insert(key(label)?, fingerprint.clone());
+                tail
+            }
+            ("--remove", [label, tail @ ..]) => {
+                allowed.remove(&key(label)?);
+                tail
+            }
+            ("--clear", tail) => {
+                allowed.retain(|key, _| {
+                    key.split_once(':').is_some_and(|(owner, label)| {
+                        state::is_home_label(label)
+                            && owner.parse::<u32>().is_ok_and(|uid| Some(uid) != invoker)
+                    })
+                });
+                tail
+            }
+            _ => return Err(ALLOW_USAGE.into()),
+        };
+    }
+    Ok(())
+}
+
+/// `omarchy-guardian sweep-allow-system (--add LABEL FINGERPRINT | --remove
+/// LABEL | --clear)...`, run as root through sudo by `sweep allow` and
+/// `sweep forget`: the list of allowed items, which only root writes. The
+/// user it acts for is the one sudo says ran it (`SUDO_UID`).
 pub fn system_allow_command(arguments: &[String]) -> ExitCode {
     if !store::effective_uid().is_ok_and(|uid| uid == 0) {
         errln!("omarchy-guardian sweep-allow-system: only `sweep allow` runs this, as root");
         return ExitCode::from(2);
     }
-    let path = Path::new(super::state::SYSTEM_ALLOWED);
-    let mut allowed = super::state::system_allowed(path);
-    match arguments {
-        [flag, label, fingerprint] if flag == "--add" && !super::state::is_home_label(label) => {
-            allowed.insert(label.clone(), fingerprint.clone());
-        }
-        [flag, label] if flag == "--remove" => {
-            allowed.remove(label);
-        }
-        [flag] if flag == "--clear" => allowed.clear(),
-        _ => {
-            errln!(
-                "usage: omarchy-guardian sweep-allow-system --add LABEL FINGERPRINT | --remove LABEL | --clear"
-            );
-            return ExitCode::from(2);
-        }
+    let invoker = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|uid| uid.parse::<u32>().ok())
+        .filter(|uid| *uid != 0);
+    let path = Path::new(state::SYSTEM_ALLOWED);
+    let mut allowed = state::system_allowed(path);
+    if let Err(reason) = change_allowed(&mut allowed, arguments, invoker) {
+        errln!("omarchy-guardian sweep-allow-system: {reason}");
+        return ExitCode::from(2);
     }
-    match super::state::save_system_allowed(path, &allowed) {
+    match state::save_system_allowed(path, &allowed) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             errln!("omarchy-guardian sweep-allow-system: {error}");
@@ -626,7 +736,7 @@ pub fn merge(collection: &mut Collection, part: RootPart) {
 mod tests {
     #[test]
     fn other_accounts_crontabs_are_withheld() {
-        use super::{accounts_in_group, withhold_other_crontabs};
+        use super::{accounts_in_group, withhold_others_jobs};
         let passwd = "root:x:0:0::/root:/bin/bash\nu:x:1000:1000::/home/u:/bin/bash\nv:x:1001:1001::/home/v:/bin/bash\n";
         let group = "wheel:x:998:u\nu:x:1000:\nshared:x:2000:v,u\n";
         assert_eq!(accounts_in_group(1000, passwd, group), ["u"]);
@@ -650,9 +760,149 @@ mod tests {
         );
         followed.run_by = Some("var/spool/cron/v".into());
         items.push(followed);
-        assert_eq!(withhold_other_crontabs(&mut items, &["u".to_string()]), 1);
+        // `at` jobs are told apart by who owns the file.
+        for job in ["a0001", "a0002", "a0003", "a0004"] {
+            items.push(item(
+                &format!("var/spool/atd/{job}"),
+                Origin::Root,
+                Tier::Unknown,
+                Body::Binary(crate::sweep::collect::WITHHELD),
+            ));
+        }
+        let owner = |job: &str| match job {
+            "var/spool/atd/a0001" => Some("root".to_string()),
+            "var/spool/atd/a0002" => Some("u".to_string()),
+            "var/spool/atd/a0003" => Some("v".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            withhold_others_jobs(&mut items, &["u".to_string()], &owner),
+            3
+        );
         let paths: Vec<&str> = items.iter().map(|item| item.path.as_str()).collect();
-        assert_eq!(paths, ["var/spool/cron/root", "var/spool/cron/u"]);
+        assert_eq!(
+            paths,
+            [
+                "var/spool/cron/root",
+                "var/spool/cron/u",
+                "var/spool/atd/a0001",
+                "var/spool/atd/a0002"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_list_of_allowed_items_keeps_a_home_for_the_user_who_asked() {
+        use super::change_allowed;
+        let arguments = |words: &[&str]| -> Vec<String> {
+            words.iter().map(|word| (*word).to_string()).collect()
+        };
+        let mut allowed = crate::sweep::state::Remembered::new();
+        change_allowed(
+            &mut allowed,
+            &arguments(&["--add", "/etc/x", "a", "--add", "~/.bashrc", "b"]),
+            Some(1000),
+        )
+        .unwrap();
+        change_allowed(
+            &mut allowed,
+            &arguments(&["--add", "~/.bashrc", "c"]),
+            Some(1001),
+        )
+        .unwrap();
+        assert_eq!(
+            allowed.keys().collect::<Vec<_>>(),
+            ["/etc/x", "1000:~/.bashrc", "1001:~/.bashrc"]
+        );
+        // Root has no home of a user to speak for, and nothing else is a
+        // label.
+        for (words, invoker) in [
+            (&["--add", "~/.bashrc", "b"][..], None),
+            (&["--add", "1000:~/.bashrc", "b"][..], Some(1000)),
+            (&["--add", "relative", "b"][..], Some(1000)),
+            (&["--add", "/etc/x\n/etc/y", "b"][..], Some(1000)),
+            (&["--add", "/etc/x", ""][..], Some(1000)),
+            (&["--add", "/etc/x"][..], Some(1000)),
+            (&["--allow-everything"][..], Some(1000)),
+            (&[][..], Some(1000)),
+        ] {
+            let mut copy = allowed.clone();
+            assert!(
+                change_allowed(&mut copy, &arguments(words), invoker).is_err(),
+                "{words:?}"
+            );
+        }
+        // One user's forget leaves the other's home alone.
+        change_allowed(
+            &mut allowed,
+            &arguments(&["--remove", "~/.bashrc"]),
+            Some(1001),
+        )
+        .unwrap();
+        assert_eq!(
+            allowed.keys().collect::<Vec<_>>(),
+            ["/etc/x", "1000:~/.bashrc"]
+        );
+        change_allowed(&mut allowed, &arguments(&["--clear"]), Some(1001)).unwrap();
+        assert_eq!(allowed.keys().collect::<Vec<_>>(), ["1000:~/.bashrc"]);
+    }
+
+    #[test]
+    fn root_reports_on_each_home_as_its_account_could_look_itself() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = crate::test_support::TempDir::new("root-accounts");
+        let root = dir.path();
+        let uid = std::fs::metadata(root).unwrap().uid();
+        let write = |path: &str, text: &str| {
+            std::fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            std::fs::write(root.join(path), text).unwrap();
+        };
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGuardianTestKeyMaterial0123456789abcdefghi";
+        write("home/u/.ssh/authorized_keys", &format!("{key} u@laptop\n"));
+        write(
+            "home/v/.ssh/authorized_keys",
+            &format!("{key} v@laptop\n{key} v@other\n"),
+        );
+        write(
+            "home/u/.config/systemd/user/omarchy-guardian-sweep.service.d/x.conf",
+            "[Service]\nEnvironment=HOME=/tmp/x\n",
+        );
+        write(
+            "home/v/.config/systemd/user/omarchy-guardian-sweep.service.d/x.conf",
+            "[Service]\nEnvironment=HOME=/tmp/x\n",
+        );
+        // A key file that is a link (to a file of root's, say) shows nothing.
+        write("home/w/.ssh/real", &format!("{key} w\n"));
+        std::os::unix::fs::symlink("real", root.join("home/w/.ssh/authorized_keys")).unwrap();
+        let passwd = format!(
+            "root:x:0:0::/root:/bin/bash\nu:x:{uid}:{uid}::/home/u:/bin/bash\nv:x:{uid}:{uid}::/home/v:/bin/bash\nw:x:{uid}:{uid}::/home/w:/bin/bash\nsvc:x:{uid}:{uid}::/srv/svc:/bin/bash\n"
+        );
+        let index =
+            crate::sweep::index::PackageIndex::with_foreign(std::collections::HashSet::new());
+        let scope = crate::sweep::collect::Scope {
+            root,
+            home: Some("root"),
+            index: &index,
+            origin: Origin::Root,
+        };
+        let items = super::of_accounts(
+            &scope,
+            &crate::sweep::access::accounts(&passwd),
+            &["u".to_string()],
+        );
+        let paths: Vec<&str> = items.iter().map(|item| item.path.as_str()).collect();
+        assert_eq!(paths.len(), 3, "{paths:?}");
+        // The reader's own: the override of Guardian's unit, and each key.
+        assert_eq!(
+            paths[0],
+            "home/u/.config/systemd/user/omarchy-guardian-sweep.service.d/x.conf"
+        );
+        assert_eq!(items[0].alerts[0].0, crate::rules::RuleId::GuardianOverride);
+        assert!(paths[1].starts_with("home/u/.ssh/authorized_keys#"));
+        // Another account's: how many keys, and nothing of its units.
+        assert_eq!(paths[2], "home/v/.ssh/authorized_keys#keys");
+        assert!(items[2].notes[0].starts_with("2 key(s) may log in as v"));
+        assert!(!format!("{items:?}").contains("v@laptop"));
     }
 
     use super::{from_json, merge, to_json};
@@ -700,6 +950,7 @@ mod tests {
                 ),
             ],
             truncated: vec!["/etc/x".into()],
+            notes: Vec::new(),
         };
         let mut collection = collection;
         // The drop-in is in the catalog itself: its content travels.
@@ -712,6 +963,29 @@ mod tests {
         assert_eq!(part.notes, noted);
         assert_eq!(part.items, collection.items[..2]);
         assert_eq!(part.truncated, ["/etc/x"]);
+    }
+
+    #[test]
+    fn facts_that_are_no_files_travel_like_any_item() {
+        // An account, a member, a key: named with a `#`, kept as text.
+        let mut fact = item(
+            "etc/passwd#toor",
+            Origin::Root,
+            Tier::Unknown,
+            Body::Text("account toor uid 0 shell /bin/bash".into()),
+        );
+        fact.category = Category::Account;
+        fact.run_by = None;
+        fact.alerts.push((
+            crate::rules::RuleId::PrivilegedAccount,
+            "toor has user id 0".into(),
+        ));
+        let collection = Collection {
+            items: vec![fact],
+            ..Collection::default()
+        };
+        let part = from_json(&to_json(&collection, &[]).to_string()).unwrap();
+        assert_eq!(part.items, collection.items);
     }
 
     #[test]
@@ -792,6 +1066,7 @@ mod tests {
                 ),
             ],
             truncated: Vec::new(),
+            notes: Vec::new(),
         };
         // The user's own live alert (a program in memory) stays.
         let mut memory = item(

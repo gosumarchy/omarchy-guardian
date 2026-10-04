@@ -39,7 +39,7 @@ Usage:
   omarchy-guardian setup
   omarchy-guardian protect [--off] [--yes]          (turn every gate on, or the install gates off)
   omarchy-guardian test                             (test the saved reviewer with two samples)
-  omarchy-guardian sweep [--all] [--json] [--root] [--diff] [--report] | allow PATH | forget PATH|--all
+  omarchy-guardian sweep [--all] [--json] [--root] [--diff] [--report] | allow PATH|--migrate | forget PATH|--all
                                                     (check what already runs on its own on this system)
   omarchy-guardian ask <report-id>                  (open your AI agent on a saved report)
   omarchy-guardian status [--waybar | --dismiss | --open-report]
@@ -515,12 +515,13 @@ fn config_command(command: &ConfigCommand, settings: &Settings) -> ExitCode {
 }
 
 fn parse_sweep(args: &[OsString]) -> Result<sweep::Command, String> {
-    const USAGE: &str = "usage: omarchy-guardian sweep [--all] [--json] [--root] [--diff] [--report] | allow PATH | forget PATH | forget --all";
+    const USAGE: &str = "usage: omarchy-guardian sweep [--all] [--json] [--root] [--diff] [--report] | allow PATH | allow --migrate | forget PATH | forget --all";
     let text: Vec<&str> = args
         .iter()
         .map(|arg| arg.to_str().ok_or("arguments must be UTF-8"))
         .collect::<Result<_, _>>()?;
     match text.as_slice() {
+        ["allow", "--migrate"] => return Ok(sweep::Command::Migrate),
         ["allow", path] => return Ok(sweep::Command::Allow((*path).to_string())),
         ["forget", "--all"] => return Ok(sweep::Command::Forget(None)),
         ["forget", path] => return Ok(sweep::Command::Forget(Some((*path).to_string()))),

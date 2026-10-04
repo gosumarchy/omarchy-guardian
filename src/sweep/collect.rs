@@ -10,10 +10,11 @@ use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-use super::commands;
 use super::index::PackageIndex;
+use super::path::Search;
 use super::read::{self, Found, View};
 use super::tier::{Observed, Tier, classify};
+use super::{access, boot, commands, config, own, path};
 use crate::autorun::{Category, Kind, Location, SYSTEM, SYSTEM_SWEEP, USER};
 use crate::content::{self, Content};
 use crate::rules::RuleId;
@@ -55,6 +56,15 @@ const NOT_REACHED: &str = "gone, or behind a link that is not root's alone: not 
 
 /// The format label of a file root hashed but did not hand back.
 pub const WITHHELD: &str = "root-only file (hashed, content withheld)";
+
+/// How a note starts that says a limit was reached while looking for what
+/// an item runs. Such an item cannot be allowed (an allow would vouch for
+/// commands nobody followed), and where its text is not reviewed either,
+/// the sweep counts as incomplete.
+pub const NOT_ALL_FOLLOWED: &str = "not all of what it runs was followed: ";
+
+/// Where `at` keeps its jobs.
+const AT_SPOOL: &str = "var/spool/atd/";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Origin {
@@ -116,6 +126,8 @@ pub struct Collection {
     /// What was not looked at, each as a sentence: a location with more
     /// entries than the limit, a name that cannot be read.
     pub truncated: Vec<String>,
+    /// What is said of the system as a whole (Secure Boot is off).
+    pub notes: Vec<String>,
 }
 
 /// What a collection runs against.
@@ -146,6 +158,20 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
         }
     }
 
+    // Programs that take a system command's name, wherever a `PATH` puts
+    // a directory someone can write ahead of `/usr/bin`.
+    let search = path::search(scope);
+    let (shadowing, unlisted) = path::shadowing_programs(scope, &search);
+    for path in shadowing {
+        paths.entry(path).or_insert(Category::LocalBin);
+    }
+    collection.truncated.extend(unlisted);
+    // What stands in for Guardian's own units, in the unit directories the
+    // catalog does not walk.
+    for path in own::paths(scope) {
+        paths.entry(path).or_insert(Category::Systemd);
+    }
+
     let mut seen: HashSet<String> = paths.keys().cloned().collect();
     let mut pending: Vec<Item> = paths
         .into_iter()
@@ -153,20 +179,49 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
         .collect();
     let omarchy = omarchy_paths(scope.root);
     while let Some(mut item) = pending.pop() {
-        for target in follow(scope, &item) {
+        let followed = follow(scope, &item, &search);
+        for target in followed.targets {
             if seen.insert(target.clone()) {
                 pending.push(self::item(scope, item.category, target, Some(&item.path)));
             }
         }
+        item.notes.extend(
+            followed
+                .unfollowed
+                .into_iter()
+                .map(|limit| format!("{NOT_ALL_FOLLOWED}{limit}")),
+        );
         if item.tier == Tier::Unknown && omarchy.contains(&format!("/{}", item.path)) {
             item.notes.push("a path Omarchy's installer writes".into());
         }
         collection.items.push(item);
     }
+    path::mark(scope, &search, &mut collection.items);
+    for item in &mut collection.items {
+        // The package's own directory may hold a drop-in a repository
+        // package ships for every unit; nothing else there is spared.
+        let shipped = item.tier == Tier::Vendor && item.path.starts_with("usr/lib/systemd/");
+        if own::is_override(scope.home, &item.path) && !shipped {
+            own::mark(item);
+        }
+    }
     collection
         .items
         .sort_by(|left, right| left.path.cmp(&right.path));
+    merge(&mut collection, access::items(scope));
+    let boot = boot::check(scope);
+    merge(&mut collection, boot.items);
+    collection.truncated.extend(boot.unchecked);
+    collection.notes.extend(boot.notes);
     collection
+}
+
+/// Whether nobody looked for everything `item` runs (see
+/// `NOT_ALL_FOLLOWED`).
+pub fn is_capped(item: &Item) -> bool {
+    item.notes
+        .iter()
+        .any(|note| note.starts_with(NOT_ALL_FOLLOWED))
 }
 
 /// Adds `items` to `collection`; an item already there by path gains the
@@ -406,15 +461,18 @@ fn wanted(scope: &Scope<'_>, category: Category, relative: &str) -> bool {
         Category::Autostart if relative.starts_with(".config/autostart/") => {
             name.ends_with(".desktop")
         }
-        // Only launchers that replace a system app's.
-        Category::Desktop => {
-            name.ends_with(".desktop")
-                && scope
-                    .root
-                    .join("usr/share/applications")
-                    .join(name)
-                    .exists()
+        // Only launchers that replace a system app's; one `mimeapps.list`
+        // names is followed from there.
+        Category::Desktop if relative.starts_with(".local/share/applications/") => {
+            name == "mimeapps.list"
+                || (name.ends_with(".desktop")
+                    && scope
+                        .root
+                        .join("usr/share/applications")
+                        .join(name)
+                        .exists())
         }
+        Category::Browser if relative.contains("essaging") => read::has_extension(name, "json"),
         // Only programs named like a system command.
         Category::LocalBin => {
             WATCHED_NAMES.contains(&name)
@@ -494,6 +552,12 @@ pub fn item_of(
         Body::Text(text) => commands::commands(category, &path, text),
         _ => Vec::new(),
     };
+    // An `at` job starts with the whole environment of whoever queued it,
+    // tokens and all: it is told by its hash, and never handed on.
+    let (body, runs) = match body {
+        Body::Text(_) if path.starts_with(AT_SPOOL) => (Body::Binary(WITHHELD), Vec::new()),
+        body => (body, runs),
+    };
     // As root, what was reached by following (a command, a link, a
     // preload, a live check) can be steered by any user (a crontab line, an
     // `LD_PRELOAD` value) at `/etc/shadow` or a key. Its content is never
@@ -509,7 +573,9 @@ pub fn item_of(
     } else {
         (body, runs)
     };
-    let notes = notes(scope, category, &path, &body, run_by);
+    let mut notes = notes(scope, category, &path, &body, run_by);
+    notes.extend(limits(scope, category, &path, &body, found));
+    let alerts = settings_alerts(scope, category, &path, tier, &body);
     Item {
         // The root collector's items are all root's, its home included.
         origin: if scope.origin == Origin::System
@@ -529,8 +595,60 @@ pub fn item_of(
         runs,
         run_by: run_by.map(str::to_string),
         notes,
-        alerts: Vec::new(),
+        alerts,
     }
+}
+
+/// What the local checks of configuration files say of an item's text
+/// (see `config::alerts`). What a package ships, or a copy of it, is the
+/// distribution's choice of settings and is left alone.
+fn settings_alerts(
+    scope: &Scope<'_>,
+    category: Category,
+    path: &str,
+    tier: Tier,
+    body: &Body,
+) -> Vec<(RuleId, String)> {
+    match body {
+        Body::Text(text) if !matches!(tier, Tier::Vendor | Tier::Copied | Tier::Inert) => {
+            let home = scope.home.unwrap_or("root");
+            config::alerts(category, path, text, &|file| {
+                is_there(
+                    scope,
+                    commands::expand(home, file).trim_start_matches('/'),
+                    Some(path),
+                )
+            })
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The notes for the limits reached while looking at an item: a line too
+/// long to look through for programs, a chain of links too long to follow.
+fn limits(
+    scope: &Scope<'_>,
+    category: Category,
+    path: &str,
+    body: &Body,
+    found: &Found,
+) -> Vec<String> {
+    let mut reached = match body {
+        Body::Text(text) => commands::unfollowed(category, text),
+        _ => Vec::new(),
+    };
+    if let Found::Link(target) = found
+        && read::chain_too_long(path, target, &|next| hop(scope, next))
+    {
+        reached.push(format!(
+            "a chain of more than {} links, or one that goes in a circle",
+            read::MAX_HOPS
+        ));
+    }
+    reached
+        .into_iter()
+        .map(|limit| format!("{NOT_ALL_FOLLOWED}{limit}"))
+        .collect()
 }
 
 /// What to tell about an item beyond its tier.
@@ -622,12 +740,51 @@ fn body_of(path: &str, size: u64, head: &[u8]) -> Body {
 }
 
 /// The longest command line split into its commands.
-const MAX_SPLIT_LINE: usize = 4096;
+const MAX_SPLIT_LINE: usize = 64 * 1024;
+
+/// What a directory holds, as the walk may see it.
+fn listed(scope: &Scope<'_>, view: Option<View>, directory: &str) -> Vec<String> {
+    let names = |entries: fs::ReadDir| {
+        entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect()
+    };
+    match view {
+        Some(view) => match read::seen(scope.root, directory, view).map(|seen| seen.what) {
+            Some(read::Public::Directory(handle)) => {
+                fs::read_dir(format!("/proc/self/fd/{}", handle.as_raw_fd()))
+                    .map(names)
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        },
+        None => fs::read_dir(scope.root.join(directory))
+            .map(names)
+            .unwrap_or_default(),
+    }
+}
+
+/// What following an item gave.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Followed {
+    /// The paths it leads to.
+    targets: Vec<String>,
+    /// The limits that were reached, each as the rest of a sentence.
+    unfollowed: Vec<String>,
+}
 
 /// The paths `item` leads to that need judging too: a link's target, and
-/// the programs and scripts its commands run.
-fn follow(scope: &Scope<'_>, item: &Item) -> Vec<String> {
+/// the programs and scripts its commands run. A bare command name is
+/// looked up in `search`.
+fn follow(scope: &Scope<'_>, item: &Item, search: &Search) -> Followed {
     let mut targets = Vec::new();
+    let mut unfollowed: Vec<String> = Vec::new();
+    let mut limit = |sentence: String| {
+        if !unfollowed.contains(&sentence) {
+            unfollowed.push(sentence);
+        }
+    };
     // Only a link to a regular file leads anywhere to judge (a masked
     // unit's `/dev/null` does not).
     let by = Some(item.path.as_str());
@@ -644,28 +801,7 @@ fn follow(scope: &Scope<'_>, item: &Item) -> Vec<String> {
         .and_then(|user| user_home(scope.root, user));
     let home = crontab_home.as_deref().or(scope.home).unwrap_or("root");
     let view = view(scope, by);
-    // What a directory holds, as the walk may see it.
-    let list = |directory: &str| -> Vec<String> {
-        let names = |entries: fs::ReadDir| {
-            entries
-                .flatten()
-                .filter_map(|entry| entry.file_name().into_string().ok())
-                .collect()
-        };
-        match view {
-            Some(view) => match read::seen(scope.root, directory, view).map(|seen| seen.what) {
-                Some(read::Public::Directory(handle)) => {
-                    fs::read_dir(format!("/proc/self/fd/{}", handle.as_raw_fd()))
-                        .map(names)
-                        .unwrap_or_default()
-                }
-                _ => Vec::new(),
-            },
-            None => fs::read_dir(scope.root.join(directory))
-                .map(names)
-                .unwrap_or_default(),
-        }
-    };
+    let list = |directory: &str| listed(scope, view, directory);
     for command in &item.runs {
         // A pattern alone (a Hyprland `source`) names the files it
         // matches; anything else with a `*` in it (a command line, however
@@ -678,7 +814,14 @@ fn follow(scope: &Scope<'_>, item: &Item) -> Vec<String> {
         let pattern = command.contains(['*', '?'])
             && !bare.contains(|c: char| c.is_whitespace() || ";|&$()<>`'\"\\".contains(c));
         if pattern {
-            targets.extend(commands::glob_targets(home, command, &list));
+            let (matched, more) = commands::glob_targets(home, command, &list);
+            targets.extend(matched);
+            if more {
+                limit(format!(
+                    "only the first {} files a pattern names",
+                    commands::MAX_GLOB
+                ));
+            }
             continue;
         }
         // Each command of a line a shell runs (`a; b && c | d`) runs its
@@ -689,31 +832,52 @@ fn follow(scope: &Scope<'_>, item: &Item) -> Vec<String> {
             item.category,
             Category::Cron | Category::Shell | Category::Hyprland
         );
+        let lookup = commands::Lookup {
+            home,
+            search: &search.directories,
+            exists: &|candidate| is_there(scope, candidate, by),
+            capped: std::cell::Cell::new(false),
+        };
         let parts = if command.len() > MAX_SPLIT_LINE {
+            limit(format!(
+                "a command line longer than {MAX_SPLIT_LINE} bytes was taken as one command"
+            ));
             vec![command.clone()]
         } else if shell_line {
-            commands::inner_commands(command)
+            let (parts, more) = commands::split_commands(command);
+            if more {
+                lookup.capped.set(true);
+            }
+            parts
         } else {
             command.split(" ; ").map(str::to_string).collect()
         };
         for part in parts {
-            for target in
-                commands::targets_where(home, &part, &|candidate| is_there(scope, candidate, by))
-            {
+            for target in lookup.targets(&part) {
                 if !targets.contains(&target) {
                     targets.push(target);
                 }
             }
         }
+        if lookup.capped.get() {
+            limit(format!(
+                "only the first {} commands of a line",
+                commands::MAX_INNER_COMMANDS
+            ));
+        }
     }
-    targets
+    let targets = targets
         .into_iter()
         .filter_map(|target| match view {
             // The path the pinned walk took, not one resolved again.
             Some(view) => read::seen(scope.root, &target, view).map(|seen| seen.path),
             None => read::canonical(scope.root, &target),
         })
-        .collect()
+        .collect();
+    Followed {
+        targets,
+        unfollowed,
+    }
 }
 
 /// The home directory of `user`, relative to the root, from `/etc/passwd`.
@@ -948,8 +1112,10 @@ mod tests {
             index: &index,
             origin: Origin::System,
         };
+        let search = crate::sweep::path::search(&scope);
+        let follow = |item: &super::Item| super::follow(&scope, item, &search).targets;
         let starred = super::item(&scope, Category::Cron, "var/spool/cron/w".into(), None);
-        assert!(super::follow(&scope, &starred).contains(&"etc/open".to_string()));
+        assert!(follow(&starred).contains(&"etc/open".to_string()));
         // Each command of a line, however they are joined.
         write(root, "etc/second", "x\n");
         write(root, "etc/third", "x\n");
@@ -959,10 +1125,33 @@ mod tests {
             "* * * * * /bin/true;/etc/second && /etc/third | cat\n",
         );
         let joined = super::item(&scope, Category::Cron, "var/spool/cron/x".into(), None);
-        let followed = super::follow(&scope, &joined);
+        let followed = follow(&joined);
         for path in ["etc/second", "etc/third"] {
             assert!(followed.contains(&path.to_string()), "{followed:?}");
         }
+        // A line with more commands than are looked up says so, and so
+        // does a file with a line too long to look through.
+        let many = format!(
+            "* * * * * {}/etc/second\n",
+            "true;".repeat(crate::sweep::commands::MAX_INNER_COMMANDS)
+        );
+        write(root, "var/spool/cron/y", &many);
+        let long = super::item(&scope, Category::Cron, "var/spool/cron/y".into(), None);
+        let followed = super::follow(&scope, &long, &search);
+        assert!(!followed.targets.contains(&"etc/second".to_string()));
+        assert_eq!(
+            followed.unfollowed,
+            ["only the first 1024 commands of a line"]
+        );
+        write(
+            root,
+            "home/u/.bashrc",
+            &format!("true {}\n~/bin/agent &\n", "x".repeat(70 * 1024)),
+        );
+        let shell = super::item(&scope, Category::Shell, "home/u/.bashrc".into(), None);
+        assert!(super::is_capped(&shell), "{:?}", shell.notes);
+        assert_eq!(shell.runs, ["~/bin/agent"]);
+        assert!(!super::is_capped(&joined));
     }
 
     #[test]
@@ -994,26 +1183,29 @@ mod tests {
         };
         let by = Some("var/spool/cron/u");
         let as_root = scope(Origin::Root);
+        let follow_as = |scope: &Scope<'_>, item: &super::Item| {
+            super::follow(scope, item, &crate::sweep::path::search(scope)).targets
+        };
         // What the crontab line leads to is not even looked for.
         let crontab = super::item(&as_root, Category::Cron, "var/spool/cron/u".into(), None);
         assert_eq!(crontab.runs, ["/etc/secret"]);
-        assert!(super::follow(&as_root, &crontab).is_empty());
+        assert!(follow_as(&as_root, &crontab).is_empty());
         write(root, "var/spool/cron/v", "* * * * * /etc/open\n");
         let open_crontab = super::item(&as_root, Category::Cron, "var/spool/cron/v".into(), None);
-        assert_eq!(super::follow(&as_root, &open_crontab), ["etc/open"]);
+        assert_eq!(follow_as(&as_root, &open_crontab), ["etc/open"]);
         // Nor where a user's link leads, directly or through a link only
         // root can see.
         let user_link = super::item(&as_root, Category::Cron, "etc/link".into(), by);
-        assert!(super::follow(&as_root, &user_link).is_empty());
+        assert!(follow_as(&as_root, &user_link).is_empty());
         symlink("/etc/open", root.join("root/private/hop")).unwrap();
         symlink("/root/private/hop", root.join("etc/chain")).unwrap();
         let chain = super::item(&as_root, Category::Cron, "etc/chain".into(), by);
         assert_eq!(chain.body, Body::Link("/root/private/hop".into()));
-        assert!(super::follow(&as_root, &chain).is_empty());
-        assert_eq!(super::follow(&scope(Origin::System), &chain), ["etc/open"]);
+        assert!(follow_as(&as_root, &chain).is_empty());
+        assert_eq!(follow_as(&scope(Origin::System), &chain), ["etc/open"]);
         // The user's own sweep follows both.
         let as_user = scope(Origin::System);
-        assert_eq!(super::follow(&as_user, &crontab), ["etc/secret"]);
+        assert_eq!(follow_as(&as_user, &crontab), ["etc/secret"]);
 
         // Named by a user's crontab: what only root can read is not looked
         // at, and one that is not there looks the same.
@@ -1079,7 +1271,7 @@ mod tests {
             "* * * * * /conf/open\n* * * * * /tmp/conf/open\n",
         );
         let through = super::item(&as_root, Category::Cron, "var/spool/cron/w".into(), None);
-        assert_eq!(super::follow(&as_root, &through), ["etc/open"]);
+        assert_eq!(follow_as(&as_root, &through), ["etc/open"]);
         assert!(!super::is_there(&as_root, "tmp/conf/open", by));
         assert!(super::user_steered(root, None));
         // Not root's file: whoever owns it decides what it names.
