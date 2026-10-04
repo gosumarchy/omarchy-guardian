@@ -177,8 +177,9 @@ impl Snapshot {
         self.files.iter().filter(|file| file.kind == kind).count()
     }
 
-    /// One digest over the whole manifest: path, NUL, hex digest and a kind
-    /// byte per file (1 reviewed text, 2 symbolic link, 0 otherwise).
+    /// One digest over the whole manifest: path, NUL, hex digest, a kind
+    /// byte (1 reviewed text, 2 symbolic link, 0 otherwise) and the execute
+    /// bit per file: a file made executable is not the same tree.
     pub fn manifest_digest(&self) -> Digest {
         let mut hasher = Sha256::new();
         for file in &self.files {
@@ -190,6 +191,7 @@ impl Snapshot {
                 FileKind::Symlink => 2,
                 FileKind::Binary | FileKind::OversizedText | FileKind::Undecodable => 0,
             }]);
+            hasher.update(&[u8::from(file.executable)]);
             hasher.update(b"\n");
         }
         for skipped in &self.skipped {
@@ -857,6 +859,7 @@ mod tests {
     use std::ffi::OsStr;
     use std::fs;
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
 
     use super::{FileKind, MAX_TEXT_FILE_SIZE, ScanConfig, verify_unchanged, walk};
@@ -1231,6 +1234,11 @@ mod tests {
         fs::write(dir.path().join("a"), "2").unwrap();
         let second = walk_texts(&config).1.manifest_digest();
         assert_ne!(first, second);
+
+        // The same bytes, now marked to run.
+        fs::set_permissions(dir.path().join("a"), fs::Permissions::from_mode(0o755)).unwrap();
+        let third = walk_texts(&config).1.manifest_digest();
+        assert_ne!(second, third);
     }
 
     #[test]

