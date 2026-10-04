@@ -24,7 +24,8 @@
 # does not run as root, and for the pacman gate's cases as root when it
 # does not; bwrap with overlays and makepkg, as a
 # user, for the makepkg gate's jail; lua, for the Hyprland PATH file; git
-# and ssh-keygen, for the installer's release check; and an installed
+# and ssh-keygen, for the installer's release check and the installed
+# upgrade check (which also needs tar and vercmp); and an installed
 # omarchy-guardian package plus jq, for the interceptor's presence check. A
 # case whose requirement is missing is reported as skipped. A check that is
 # known to fail today is run and shown as KNOWN with the reason, and counted
@@ -855,7 +856,14 @@ release_check_cases() {
         "${git[@]}" init -q &&
             cp -- "$PROJECT/.gitignore" "$repo/.gitignore" &&
             printf 'fn main() {}\n' >"$repo/main.rs" &&
-            "${git[@]}" add .gitignore main.rs &&
+            mkdir -p "$repo/packaging/arch" &&
+            printf 'pkgver=1\npkgrel=1\n' >"$repo/packaging/arch/PKGBUILD" &&
+            # What the upgrade check starts once the release is verified:
+            # here it only says how it was started, and from where.
+            printf '#!/bin/bash\n# takes --verified-by-installed\nprintf "installer in %%s without .git: %%s\\n" "$PWD" "$*"\n[[ ! -e .git ]]\n' \
+                >"$repo/install.sh" &&
+            chmod 755 "$repo/install.sh" &&
+            "${git[@]}" add .gitignore main.rs install.sh packaging/arch/PKGBUILD &&
             "${git[@]}" commit -q -m release &&
             "${git[@]}" -c user.signingkey="$keys/release.pub" tag -s -m v1 v1
     } >"$OUT" 2>&1 || {
@@ -866,7 +874,7 @@ release_check_cases() {
     # is <label> <what release_check must start with> [keys file]
     is() {
         local label=$1 want=$2 got
-        got=$(release_check "$repo" "${3-$signers}")
+        got=$(release_check "$repo" "${3-$signers}" 2>/dev/null)
         if [[ $got == "$want"* ]]; then
             printf 'ok   %s\n' "$label"
         else
@@ -927,7 +935,8 @@ release_check_cases() {
     # A commit on top of the release, and a directory that is no checkout.
     "${git[@]}" tag -d v1 >/dev/null 2>&1
     "${git[@]}" -c user.signingkey="$keys/release.pub" tag -s -m v1 v1 >"$OUT" 2>&1
-    is 'the release tag signed anew is signed' 'signed v1'
+    is 'the release tag signed anew is signed' 'signed v1 release@example.test'
+    release_tampered_cases
     printf '// more\n' >>"$repo/main.rs"
     "${git[@]}" commit -q -a -m more
     is 'a commit after the tag is unsigned' 'unsigned commit'
@@ -938,6 +947,267 @@ release_check_cases() {
     # find one from inside a tarball's directory.
     GIT_CEILING_DIRECTORIES=$E2E/release is 'a directory that is not a git checkout is unsigned' \
         'unsigned this is not a git checkout'
+}
+
+# A checkout that was tampered with, against both checks: install.sh's own
+# (release_check) and the installed Guardian's upgrade check, which is the
+# one that does not rely on the checkout. Called by release_check_cases
+# with a clean checkout of the signed release v1 in $repo.
+release_tampered_cases() {
+    printf '=== a checkout that was tampered with ===\n'
+    local upgrade=$PROJECT/integrations/upgrade.sh clean=$repo case_dir tag_id blob other canary export
+    if [[ ! -x /usr/bin/tar || ! -x /usr/bin/vercmp || ! -x /usr/bin/pacman ]]; then
+        skip "the installed upgrade check: needs tar, vercmp and pacman"
+        return
+    fi
+    # at <directory> <git arguments>
+    at() {
+        local dir=$1
+        shift
+        git -C "$dir" -c user.name=Tester -c user.email=tester@example.test -c gpg.format=ssh \
+            -c commit.gpgsign=false "$@"
+    }
+    # tampered <name>: a fresh copy of the clean checkout to change.
+    tampered() {
+        repo=$E2E/release/$1
+        cp -a -- "$clean" "$repo"
+    }
+    # up <arguments>: the upgrade check as a copy that is not installed, so
+    # it takes the test's key file and installed version. The installed
+    # version is 0.5.0-1 unless INSTALLED says otherwise.
+    up() {
+        GUARDIAN_UPGRADE_TEST_SIGNERS=${SIGNERS_FILE-$signers} \
+            GUARDIAN_UPGRADE_TEST_INSTALLED=${INSTALLED-0.5.0-1} \
+            GUARDIAN_UPGRADE_TEST_AS_ROOT=1 bash "$upgrade" "$@" >"$OUT" 2>&1
+    }
+    # exported <file>: the path of <file> in the export the last `up
+    # --check --keep` made.
+    exported() {
+        printf '%s/%s\n' "$(sed -n 's/^Export: //p' "$OUT")" "$1"
+    }
+    signed_main() { [[ $(cat -- "$(exported main.rs)") == 'fn main() {}' ]]; }
+    tag_id=$(at "$clean" rev-parse refs/tags/v1)
+
+    # The genuine release.
+    up --check --keep "$clean"
+    expect 'upgrade: a release tag signed by a known key is verified' 0 $?
+    expect_output 'it names the tag' 'Verified release v1'
+    expect_output 'the signer' 'signer  release@example.test (SHA256:'
+    expect_output 'and the commit' "commit  $(at "$clean" rev-parse 'v1^{commit}')"
+    check 'the export is the signed tree' signed_main
+    export=$(exported '')
+    no_extras() { [[ ! -e $export/target && ! -e $export/.git && -x $export/install.sh ]]; }
+    check "without the checkout's build output or its .git" no_extras
+    up "$clean" v1
+    expect 'upgrade: the verified release is handed to its own installer' 0 $?
+    expect_output 'which is told what was verified' \
+        "without .git: --verified-by-installed=v1:$(at "$clean" rev-parse 'v1^{commit}')"
+    expect_output 'and runs in the export, not in the checkout' "installer in $XDG_CACHE_HOME/omarchy-guardian/upgrade."
+    up --yes --reinstall "$clean"
+    expect_output "the installer's own options are passed on" 'without .git: --yes --reinstall --verified-by-installed=v1:'
+    only_kept() { [[ $(find "$XDG_CACHE_HOME/omarchy-guardian" -maxdepth 1 -name 'upgrade.*' | wc -l) == 1 ]]; }
+    check 'the private directory is removed afterwards (one was kept on request)' only_kept
+    if ((IS_ROOT)); then
+        GUARDIAN_UPGRADE_TEST_SIGNERS=$signers bash "$upgrade" --check "$clean" >"$OUT" 2>&1
+        expect 'upgrade: refuses to run as root' 1 $?
+    fi
+    bash "$PROJECT/install.sh" --verified-by-installed=v1 >"$OUT" 2>&1
+    expect "install.sh: --verified-by-installed without a commit is refused" 2 $?
+
+    # No installed keys: nothing is verified and nothing is built.
+    SIGNERS_FILE=$E2E/release/no-such-keys up "$clean"
+    expect 'upgrade: without installed keys nothing is built' 1 $?
+    expect_output 'and it says why' 'carries no release keys'
+    # An older release than the installed one.
+    INSTALLED=2-1 up "$clean"
+    expect 'upgrade: a release older than the installed one is refused' 1 $?
+    expect_output 'and it says why' 'is older than the installed 2-1'
+    INSTALLED=2-1 up --allow-downgrade --check "$clean"
+    expect 'unless --allow-downgrade is given' 0 $?
+    INSTALLED=1-1 up --check "$clean"
+    expect 'the installed version itself is not a downgrade' 0 $?
+    INSTALLED='' up --check "$clean"
+    expect 'and neither is a first install' 0 $?
+    up --check "$clean" 'v1;x'
+    expect 'upgrade: a tag name that is not a release name is refused' 1 $?
+
+    # Changed code committed, a plain tag v1 on it, and the genuine signed
+    # tag object behind refs/v1, which git looks up before refs/tags/v1.
+    tampered shadow
+    printf '// changed\n' >>"$repo/main.rs"
+    at "$repo" commit -q -a -m changed
+    at "$repo" update-ref -d refs/tags/v1
+    at "$repo" tag v1
+    at "$repo" update-ref refs/v1 "$tag_id"
+    shadow_fools() {
+        [[ $(at "$repo" describe --exact-match --tags HEAD 2>/dev/null) == v1 ]] &&
+            at "$repo" -c gpg.ssh.allowedSignersFile="$signers" verify-tag v1 >/dev/null 2>&1
+    }
+    check '(a plain tag at HEAD with refs/v1 behind it does answer git describe and git verify-tag v1)' shadow_fools
+    is 'install.sh: a plain tag with the signed tag behind refs/<name> is unsigned' 'unsigned commit'
+    up --check "$repo" v1
+    expect 'upgrade: and is refused' 1 $?
+    expect_output 'as not a signed tag' 'v1 is not a signed tag'
+    up --check "$repo"
+    expect 'upgrade: with no tag named, too' 1 $?
+
+    # The genuine signed tag of v1 stored under the name of a newer release.
+    tampered renamed
+    at "$repo" update-ref refs/tags/v9 "$tag_id"
+    is 'install.sh: a signed tag stored under another name is unsigned' 'unsigned the tag stored as v9'
+    up --check "$repo" v9
+    expect 'upgrade: a signed tag stored under another name is refused' 1 $?
+    expect_output 'and it says what the tag really is' "the tag stored as v9 is really the tag 'v1'"
+    up --check "$repo"
+    expect 'upgrade: with no tag named it is passed over for the genuine one' 0 $?
+    expect_output 'which is v1' 'Verified release v1'
+
+    # A tag signed by a key the installed Guardian does not know.
+    tampered stranger
+    at "$repo" tag -d v1 >/dev/null 2>&1
+    at "$repo" -c user.signingkey="$keys/other.pub" tag -s -m v1 v1 >/dev/null 2>&1
+    up --check "$repo"
+    expect 'upgrade: a tag signed by an unknown key is refused' 1 $?
+    up --check "$repo" v1
+    expect_output 'and it says why' 'v1 is not signed by a release key the installed Guardian knows'
+
+    # core.worktree names a clean copy inside .git: git status looks there,
+    # while the build would use the directory the installer is in.
+    tampered elsewhere
+    mkdir -p "$repo/.git/clean"
+    cp -a -- "$repo/main.rs" "$repo/.gitignore" "$repo/install.sh" "$repo/packaging" "$repo/.git/clean/"
+    at "$repo" config core.worktree "$repo/.git/clean"
+    printf '// changed\n' >>"$repo/main.rs"
+    looks_clean() { [[ -z $(at "$repo" status --porcelain 2>/dev/null) ]]; }
+    check '(with core.worktree pointing at a clean copy, git status sees no change)' looks_clean
+    is 'install.sh: a changed file behind core.worktree is found' 'unsigned this checkout has local changes on top of v1: main.rs'
+    at "$repo" --work-tree="$repo" checkout -q -- main.rs
+    : >"$repo/build.rs"
+    is 'install.sh: and so is an added one' 'unsigned this checkout has files that are not part of v1: build.rs'
+    printf '// changed\n' >>"$repo/main.rs"
+    up --check --keep "$repo"
+    expect 'upgrade: the release is verified whatever core.worktree says' 0 $?
+    check 'and the export has the signed file, not the changed one' signed_main
+    export=$(exported '')
+    check 'and not the added one' test ! -e "$export/build.rs"
+
+    # A changed file the index is told to pass over, and an added file the
+    # index lists, so that it is not "untracked".
+    tampered index
+    at "$repo" update-index --skip-worktree main.rs
+    printf '// changed\n' >>"$repo/main.rs"
+    check '(a changed file marked skip-worktree is not in git status)' looks_clean
+    is 'install.sh: a changed file marked skip-worktree is found' 'unsigned this checkout has local changes on top of v1: main.rs'
+    at "$repo" update-index --no-skip-worktree main.rs
+    at "$repo" checkout -q -- main.rs
+    : >"$repo/build.rs"
+    at "$repo" add build.rs
+    not_untracked() { [[ -z $(at "$repo" ls-files --others --exclude-standard 2>/dev/null) ]]; }
+    check '(an added file the index lists is not untracked)' not_untracked
+    is 'install.sh: an added file the index lists is found' 'unsigned this checkout has files that are not part of v1: build.rs'
+    at "$repo" update-index --skip-worktree main.rs
+    printf '// changed\n' >>"$repo/main.rs"
+    up --check --keep "$repo"
+    expect 'upgrade: the release is verified whatever the index says' 0 $?
+    check 'and the export has the signed file' signed_main
+    export=$(exported '')
+    check 'and not the added one' test ! -e "$export/build.rs"
+
+    # A file whose mode changed, and a file replaced by a link to itself
+    # elsewhere: neither changes a byte of content.
+    tampered modes
+    chmod 755 "$repo/main.rs"
+    is 'install.sh: a file made executable is found' 'unsigned this checkout has local changes on top of v1: main.rs'
+    chmod 644 "$repo/main.rs"
+    cp -- "$repo/main.rs" "$E2E/release/main-elsewhere.rs"
+    ln -sf -- "$E2E/release/main-elsewhere.rs" "$repo/main.rs"
+    is 'install.sh: a file replaced by a link is found' 'unsigned this checkout has local changes on top of v1: main.rs'
+
+    # A checkout whose configuration runs programs: each would leave the
+    # canary behind. The release itself is untouched.
+    tampered hostile
+    canary=$E2E/release/canary
+    mkdir -p "$repo/.git/evil-hooks"
+    printf '#!/bin/sh\n: >%q\nexit 0\n' "$canary" >"$repo/.git/evil"
+    chmod 755 "$repo/.git/evil"
+    for other in reference-transaction post-checkout pre-auto-gc post-index-change; do
+        cp -- "$repo/.git/evil" "$repo/.git/evil-hooks/$other"
+    done
+    cat >"$repo/.git/evil.inc" <<EOF
+[gpg "ssh"]
+	program = $repo/.git/evil
+[gpg]
+	program = $repo/.git/evil
+[filter "evil"]
+	clean = $repo/.git/evil
+	smudge = $repo/.git/evil
+	process = $repo/.git/evil
+EOF
+    cat >>"$repo/.git/config" <<EOF
+[uploadpack]
+	packObjectsHook = $repo/.git/evil
+[core]
+	fsmonitor = $repo/.git/evil
+	hooksPath = $repo/.git/evil-hooks
+	sshCommand = $repo/.git/evil
+	pager = $repo/.git/evil
+	alternateRefsCommand = $repo/.git/evil
+[include]
+	path = $repo/.git/evil.inc
+[alias]
+	rev-parse = !$repo/.git/evil
+	cat-file = !$repo/.git/evil
+	fetch = !$repo/.git/evil
+	verify-tag = !$repo/.git/evil
+EOF
+    printf '* filter=evil\n' >"$repo/.git/info/attributes"
+    at "$repo" status >/dev/null 2>&1
+    check "(the checkout's configuration does run its program for a plain git status)" test -e "$canary"
+    rm -f -- "$canary"
+    is "install.sh: the release is still told apart" 'signed v1 release@example.test'
+    check "install.sh: and nothing the checkout's configuration names was run" test ! -e "$canary"
+    rm -f -- "$canary"
+    up --check "$repo"
+    expect "upgrade: a checkout with a hostile configuration is verified as the release it is" 0 $?
+    up "$repo" v1
+    expect 'upgrade: and handed to the signed installer' 0 $?
+    check "upgrade: and nothing the checkout's configuration names was run" test ! -e "$canary"
+
+    # An object file that is not what its name says: the signed tree names
+    # main.rs by its id, and the file stored under that id holds other
+    # content.
+    tampered forged
+    blob=$(at "$repo" rev-parse 'v1:main.rs')
+    other=$(at "$repo" rev-parse 'v1:.gitignore')
+    if [[ -f $repo/.git/objects/${blob:0:2}/${blob:2} && -f $repo/.git/objects/${other:0:2}/${other:2} ]]; then
+        chmod u+w "$repo/.git/objects/${blob:0:2}/${blob:2}"
+        cp -- "$repo/.git/objects/${other:0:2}/${other:2}" "$repo/.git/objects/${blob:0:2}/${blob:2}"
+        up --check "$repo" v1
+        expect 'upgrade: an object stored under the id of another is refused' 1 $?
+        expect_output 'because it could not be copied intact' 'could not be copied intact'
+    else
+        skip 'a forged object: the test checkout has no loose objects'
+    fi
+
+    # The same release with its objects and refs packed.
+    tampered packed
+    at "$repo" gc -q >/dev/null 2>&1
+    packed_refs() { [[ ! -e $repo/.git/refs/tags/v1 ]] && grep -q ' refs/tags/v1$' "$repo/.git/packed-refs"; }
+    check '(git gc packed the tag)' packed_refs
+    up --check "$repo"
+    expect 'upgrade: a packed checkout is verified too' 0 $?
+
+    # A linked worktree: its .git is a file that names another directory.
+    mkdir -p "$E2E/release/linked"
+    printf 'gitdir: %s/.git\n' "$clean" >"$E2E/release/linked/.git"
+    repo=$E2E/release/linked
+    is 'install.sh: a .git that is a file is unsigned' 'unsigned its .git is not a directory'
+    up --check "$repo"
+    expect 'upgrade: a .git that is a file is refused' 1 $?
+    expect_output 'and it says why' 'is not a directory'
+    up --check "$E2E/release/keys"
+    expect 'upgrade: a directory that is no checkout is refused' 1 $?
+    repo=$clean
 }
 
 if [[ -n $AS_ROOT ]]; then
