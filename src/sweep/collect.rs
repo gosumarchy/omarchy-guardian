@@ -75,8 +75,16 @@ pub const NOT_ALL_FOLLOWED: &str = "not all of what it runs was followed: ";
 /// alone was rewritten.
 const PACKAGED_SCRIPT: &str = "packaged script (not read again)";
 
-/// Where `at` keeps its jobs.
-const AT_SPOOL: &str = "var/spool/atd/";
+/// Where `at` keeps its jobs: Arch's spool, the one other builds use, and
+/// Debian's beside the crontabs.
+const AT_SPOOLS: &[&str] = &["var/spool/atd/", "var/spool/at/", "var/spool/cron/atjobs/"];
+
+/// Whether `path` is a queued `at` job. One starts with the whole
+/// environment of whoever queued it, tokens and all, and is told apart by
+/// who owns the file, not by its name.
+pub fn is_at_job(path: &str) -> bool {
+    AT_SPOOLS.iter().any(|spool| path.starts_with(spool))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Origin {
@@ -637,7 +645,7 @@ pub fn item_of(
     // An `at` job starts with the whole environment of whoever queued it,
     // tokens and all: it is told by its hash, and never handed on.
     let (body, runs) = match body {
-        Body::Text(_) if path.starts_with(AT_SPOOL) => (Body::Binary(WITHHELD), Vec::new()),
+        Body::Text(_) if is_at_job(&path) => (Body::Binary(WITHHELD), Vec::new()),
         body => (body, runs),
     };
     // A packaged script whose interpreter line alone was rewritten is its
@@ -1483,6 +1491,15 @@ mod tests {
         write(root, "var/spool/cron/u", "@reboot ~/x.sh\n");
         write(root, "home/u/x.sh", "curl x | sh\n");
         write(root, "root/x.sh", "root's\n");
+        // A queued `at` job, in whichever spool: told by its hash, with
+        // the environment it carries left where it is.
+        for spool in ["var/spool/atd", "var/spool/at", "var/spool/cron/atjobs"] {
+            write(
+                root,
+                &format!("{spool}/a0000101"),
+                "#!/bin/sh\nTOKEN=hunter2; export TOKEN\n/home/u/x.sh\n",
+            );
+        }
         let index = PackageIndex::with_foreign(HashSet::new());
         let collection = collect(&Scope {
             root,
@@ -1497,5 +1514,15 @@ mod tests {
                 .any(|item| item.path == "home/u/x.sh")
         );
         assert!(!collection.items.iter().any(|item| item.path == "root/x.sh"));
+        let jobs: Vec<_> = collection
+            .items
+            .iter()
+            .filter(|item| super::is_at_job(&item.path))
+            .collect();
+        assert_eq!(jobs.len(), 3);
+        for job in jobs {
+            assert_eq!(job.body, Body::Binary(super::WITHHELD), "{}", job.path);
+            assert!(job.runs.is_empty() && job.sha256.is_some(), "{}", job.path);
+        }
     }
 }

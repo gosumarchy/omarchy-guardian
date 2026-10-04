@@ -262,8 +262,8 @@ fn withhold_others_jobs(
 ) -> usize {
     let others = |path: &str| {
         let account = match path.strip_prefix("var/spool/cron/") {
+            _ if collect::is_at_job(path) => owner(path).unwrap_or_default(),
             Some(account) => account.to_string(),
-            None if path.starts_with("var/spool/atd/") => owner(path).unwrap_or_default(),
             None => return false,
         };
         account != "root" && !readers.contains(&account)
@@ -812,23 +812,34 @@ mod tests {
         followed.run_by = Some("var/spool/cron/v".into());
         items.push(followed);
         // `at` jobs are told apart by who owns the file.
-        for job in ["a0001", "a0002", "a0003", "a0004"] {
+        let jobs = [
+            "var/spool/atd/a0001",
+            "var/spool/atd/a0002",
+            "var/spool/atd/a0003",
+            "var/spool/atd/a0004",
+            // The other spools `at` is built with.
+            "var/spool/at/a0002",
+            "var/spool/at/a0003",
+            "var/spool/cron/atjobs/a0002",
+            "var/spool/cron/atjobs/a0003",
+        ];
+        for job in jobs {
             items.push(item(
-                &format!("var/spool/atd/{job}"),
+                job,
                 Origin::Root,
                 Tier::Unknown,
                 Body::Binary(crate::sweep::collect::WITHHELD),
             ));
         }
-        let owner = |job: &str| match job {
-            "var/spool/atd/a0001" => Some("root".to_string()),
-            "var/spool/atd/a0002" => Some("u".to_string()),
-            "var/spool/atd/a0003" => Some("v".to_string()),
+        let owner = |job: &str| match job.rsplit('/').next() {
+            Some("a0001") => Some("root".to_string()),
+            Some("a0002") => Some("u".to_string()),
+            Some("a0003") => Some("v".to_string()),
             _ => None,
         };
         assert_eq!(
             withhold_others_jobs(&mut items, &["u".to_string()], &owner),
-            3
+            5
         );
         let paths: Vec<&str> = items.iter().map(|item| item.path.as_str()).collect();
         assert_eq!(
@@ -837,7 +848,9 @@ mod tests {
                 "var/spool/cron/root",
                 "var/spool/cron/u",
                 "var/spool/atd/a0001",
-                "var/spool/atd/a0002"
+                "var/spool/atd/a0002",
+                "var/spool/at/a0002",
+                "var/spool/cron/atjobs/a0002"
             ]
         );
     }
