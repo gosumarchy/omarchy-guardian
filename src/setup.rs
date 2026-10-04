@@ -684,8 +684,12 @@ pub fn keep_system_only(text: &str, existing: &str) -> String {
     let missing_sweep =
         new.sweep == SweepSettings::default() && old.sweep != SweepSettings::default();
     let missing_accepted = new.acknowledged_weaker.is_none() && old.acknowledged_weaker.is_some();
-    if !missing_trust && !missing_sweep && !missing_accepted {
+    let missing_permit = new.permit_strict.is_none() && old.permit_strict.is_some();
+    if !missing_trust && !missing_sweep && !missing_accepted && !missing_permit {
         return text.to_string();
+    }
+    if missing_permit {
+        new.permit_strict = old.permit_strict;
     }
     if missing_trust {
         new.trusted_reviewer_packages = old.trusted_reviewer_packages;

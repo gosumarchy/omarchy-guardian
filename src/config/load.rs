@@ -127,6 +127,12 @@ impl Settings {
         )
     }
 
+    /// The root-owned system file alone, for Guardian's root halves: the
+    /// user's file is not read.
+    pub fn system_only() -> Self {
+        Self::load_from(Path::new(SYSTEM_PATH), None, &check_root_owned)
+    }
+
     pub fn load_from(
         system_path: &Path,
         user_path: Option<&Path>,
@@ -167,6 +173,12 @@ impl Settings {
                     if config.acknowledged_weaker.is_some() {
                         settings.warnings.push(format!(
                             "[acknowledged] in {} is ignored: only the system file can accept a weaker setting",
+                            user_path.display()
+                        ));
+                    }
+                    if config.permit_strict.is_some() {
+                        settings.warnings.push(format!(
+                            "[permit] in {} is ignored: only the system file says whether permits are given under the strict level",
                             user_path.display()
                         ));
                     }
@@ -358,6 +370,12 @@ impl Settings {
             .unwrap_or_default()
     }
 
+    /// Whether a blocked install can be permitted under the strict level:
+    /// only when the root-owned system file says so.
+    pub fn permits_under_strict(&self) -> bool {
+        self.system.permit_strict == Some(true)
+    }
+
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }
@@ -522,6 +540,7 @@ mod tests {
         fs::write(&user, "[acknowledged]\nweaker = [\"theme.ai=off\"]\n").unwrap();
         let settings = Settings::load_from(&system, Some(&user), &secure);
         assert_eq!(settings.acknowledged_weaker(), ["aur.ai=off"]);
+        assert!(!settings.permits_under_strict());
         assert!(
             settings
                 .warnings()
