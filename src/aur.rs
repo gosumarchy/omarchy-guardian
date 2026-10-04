@@ -9,7 +9,7 @@ pub mod lockfile;
 pub mod recipe;
 
 use std::collections::{BTreeMap, HashSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
@@ -1131,6 +1131,36 @@ pub struct Upstream {
     pub changed: (usize, usize),
 }
 
+impl Upstream {
+    /// Whether the file at `path` came out of an archive Guardian unpacked
+    /// itself. A directory of the sources whose own name ends in `!` is
+    /// not one.
+    pub fn is_unpacked(&self, path: &str) -> bool {
+        self.unpacked.iter().any(|archive| {
+            path.strip_prefix(archive.as_str())
+                .is_some_and(|inside| inside.starts_with("!/"))
+        })
+    }
+}
+
+/// File names of what is installed and run as it comes, whatever its
+/// bytes look like: an archive of code (a Java archive, an Electron
+/// application, a browser extension) or a package for another packager.
+const CODE_ARCHIVES: &[&str] = &[
+    "jar", "war", "ear", "aar", "apk", "asar", "deb", "rpm", "whl", "egg", "gem", "nupkg", "phar",
+    "pex", "pyz", "xpi", "crx", "vsix", "appimage", "snap", "flatpak", "msi",
+];
+
+/// Whether the file `name` is code nobody reviewed by its name alone (see
+/// `CODE_ARCHIVES`), or a built pacman package.
+fn carries_code(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains(".pkg.tar")
+        || lower
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| CODE_ARCHIVES.contains(&extension))
+}
+
 /// Where makepkg keeps what a build uses: the recipe directory, and the
 /// download directory (`SRCDEST`), which `src/` links into.
 pub struct Roots<'a> {
@@ -1402,7 +1432,13 @@ impl Walk<'_> {
         }
         self.note(child, read_from, digest.as_ref());
         let digest = digest.map(|digest| digest.to_string()).unwrap_or_default();
-        if format.executable() {
+        // A download makepkg unpacks is reviewed as what comes out of it.
+        let packaged = name
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| matches!(extension, "deb" | "rpm"));
+        let unpacked_by_makepkg =
+            self.download && !self.not_extracted(name) && (is_archive || packaged);
+        if format.executable() || (carries_code(name) && !unpacked_by_makepkg) {
             self.upstream
                 .programs
                 .insert(format!("src/{child}"), digest.clone());
@@ -1459,7 +1495,14 @@ impl Walk<'_> {
         let file = target.as_ref().is_some_and(|target| target.is_file());
         if file && (inside(Some(&self.src)) || inside(self.roots.srcdest)) {
             if let Some(target) = target.clone() {
-                self.download = depth == 0 && !inside(Some(&self.src));
+                // makepkg links a source under its own name, by its full
+                // path. Any other link at the top (one `prepare()` made to
+                // a file beside the recipe) is a file of the sources, not
+                // a download.
+                let as_makepkg = fs::read_link(path).is_ok_and(|written| {
+                    written.is_absolute() && written.file_name() == Some(OsStr::new(name))
+                });
+                self.download = depth == 0 && !inside(Some(&self.src)) && as_makepkg;
                 self.file(&target, child, name, depth, late);
                 self.download = false;
             }
@@ -2059,7 +2102,25 @@ impl Collected {
         recipe: &str,
     ) {
         self.archives.retain(|known| known.rel != archive.rel);
-        self.upstream.unpacked.push(format!("src/{}", archive.rel));
+        // Its files are named `archive!/...`: a directory of that very
+        // name beside it would have its files taken for the archive's.
+        let inside = format!("src/{}!/", archive.rel);
+        if self
+            .upstream
+            .seen
+            .keys()
+            .any(|path| path.starts_with(&inside))
+        {
+            self.upstream.gaps.push(format!(
+                "src/{}: the recipe opens this archive itself, and a directory beside it has its name followed by `!`, so its files cannot be told apart for review",
+                archive.rel
+            ));
+            return;
+        }
+        let path = format!("src/{}", archive.rel);
+        // Reviewed as what came out of it, not as one program.
+        self.upstream.programs.remove(&path);
+        self.upstream.unpacked.push(path);
         self.walk(unpacked, format!("{}!", archive.rel), roots, recipe, &[]);
     }
 
@@ -2822,6 +2883,30 @@ pkgname = demo
             ecosystems,
             [Ecosystem::Npm, Ecosystem::Cargo, Ecosystem::Go]
         );
+    }
+
+    #[test]
+    fn a_link_a_build_made_beside_the_sources_is_no_download() {
+        let dir = TempDir::new("upstream-own-link");
+        let build = dir.path();
+        let src = build.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(build.join("demo.conf"), "key = value\n").unwrap();
+        fs::write(build.join("fix.patch"), "--- a\n+++ b\n").unwrap();
+        // As makepkg links a source: by its full path, under its name.
+        std::os::unix::fs::symlink(build.join("fix.patch"), src.join("fix.patch")).unwrap();
+        // As a `prepare()` links a file of the recipe.
+        std::os::unix::fs::symlink("../demo.conf", src.join("demo.conf")).unwrap();
+        std::os::unix::fs::symlink(build.join("demo.conf"), src.join("settings")).unwrap();
+        // With makepkg's defaults the downloads lie beside the recipe.
+        let roots = Roots {
+            build_dir: build,
+            srcdest: Some(build),
+        };
+        let upstream = collect_upstream(&src, &roots, "", 1024 * 1024);
+        assert_eq!(upstream.downloads.keys().collect::<Vec<_>>(), ["fix.patch"]);
+        // All three are files of the sources, seen and reviewed.
+        assert_eq!(upstream.seen.len(), 3, "{:?}", upstream.seen);
     }
 
     #[test]
