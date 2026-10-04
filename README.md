@@ -62,9 +62,28 @@ plugins, and reviews that code **before any of it runs**:
   broken, the daily sweep stopped running or could not finish, or a block in
   the last day is unseen), dim when protection is off. A gate that cannot
   be there (the package's files are missing) counts as a problem; the AUR
-  gate without yay installed does not. A gate that is on with the AI review
-  turned off for what it reviews says "local checks only" beside it, and one
-  whose findings only warn where the protection level would block says that.
+  gate without yay installed does not. A gate counts as on only when it is
+  in effect, not when a line that looks like it is in a file: the Bash
+  interceptor's exact line where Bash runs it and with nothing after it that
+  unsets or replaces its functions, the menu entries that are in effect when
+  the menu reads its file, yay building through Guardian's root-owned shim
+  with no alias, function or other `yay` in front of it, and Guardian's
+  theme and plugin commands first on the session's PATH. Anything less
+  reads "partly on" with the reason. paru, pikaur, aura or trizen installed
+  without the gate is a problem too. A class set weaker than its protection
+  level (the AI review lowered or off, findings that only warn, the no-AI
+  level's question taken away) is a problem until you set it back or accept
+  it with `omarchy-guardian config acknowledge`; accepted, it says "local
+  checks only" or "findings only warn" beside the gate. When a gate that
+  was on goes off or partly off without you turning it off through
+  Guardian, or a class becomes weaker, you get one notification
+  ("Guardian protection changed"), from the bar's own check or the daily
+  sweep; a gate that dropped stays listed until it is back on or
+  `omarchy-guardian status --dismiss`. That record is a file of your own,
+  like the list of dismissed blocks: it catches things breaking and crude
+  tampering (a line removed from `~/.bashrc`), not a program running as you
+  that also rewrites the record. A dismissed-blocks mark that names a
+  report newer than any saved one is not believed.
   In Waybar its tooltip lists the gates, problems and last block; left-click
   opens the settings app and right-click the last report. In Omarchy's shell
   bar it opens a panel with the same details and tiles for the report,
@@ -419,7 +438,7 @@ has every setting:
 | Profiles | the profile for your own sources (user file) and for the pacman gate (system file) |
 | Sources | every knob of every source class; pacman-enforced classes in the system file, the rest in the user file |
 | AI | model, input size and call limits for your sources and for the pacman gate, review-memory limits, official repositories |
-| Integrations | turn the pacman hook, the yay AUR gate, the theme & plugin gate and the Omarchy menu entry on or off |
+| Integrations | turn the pacman hook, the yay AUR gate, the theme & plugin gate, the theme & plugin commands on PATH, the Omarchy menu entry, the bar widgets and the system sweep on or off |
 | Maintenance | show and check the effective settings, edit either file in `$EDITOR`, see or forget the review memory, test the reviewer, run the guided setup |
 
 Unset values show what they inherit and from where. Keys: `↑↓` move,
@@ -430,6 +449,11 @@ a file Guardian would reject. The user file is written directly (a hand-written 
 `config.toml.bak`, since comments are not preserved). The system file is
 saved only after showing a diff, with `sudo`, like `setup` does. A file that
 does not parse cannot be edited in the app; fix it with Maintenance › Edit.
+Before Guardian first edits `~/.bashrc`, the Omarchy menu file or the Waybar
+config and style, it keeps the file as it was beside it, as
+`<name>.guardian-bak`; later edits leave that copy alone. What you turn on
+or off here is recorded as your choice, so it raises no "protection
+changed" notification.
 
 ## Profiles and settings
 
@@ -486,6 +510,35 @@ for those classes. For the user-level classes, the
 user file's values apply directly, since those commands never reach the
 privileged pacman gate.
 
+That file is yours, so any program running as you can write it. Two things
+keep that from quietly switching a gate off:
+
+- A user file that is there and does not parse is not skipped. While it is
+  broken, `makepkg-gate`, `guard`, `scan`, `sandbox` and `sweep` refuse with
+  exit 2 and name the file and line, as the pacman gate does for the system
+  file. (Skipping it would review at `standard` whatever stricter profile it
+  holds.) `config check`, `config show`, `tui` and `setup` still work, to
+  fix it.
+- A user-level class set weaker than its profile (`ai` lower, `on_findings`
+  or `on_ai_suspicious` on `warn` where the profile blocks, `confirm = false`
+  under `local-only` with the AI off) still applies, and the bar counts it
+  as a problem. To keep it, run `omarchy-guardian config acknowledge`: it
+  lists those settings, shows the change to the system file and installs it
+  with `sudo`:
+
+  ```toml
+  [acknowledged]                        # system file only
+  weaker = ["aur.ai=off"]               # class.knob=value, as accepted
+  ```
+
+  Only root can write that file, so a program running as you cannot accept
+  its own change, and an accepted value does not cover a lower one later.
+  `cache`, `diff`, the model and the thinking level are choices, not
+  weakenings. A weaker value in the system file itself needs no
+  acknowledgement. Choosing the `local-only` profile in the user file is a
+  protection level, not a weakening: it turns the AI review off for your own
+  sources and asks before each install.
+
 ```toml
 profile = "standard"             # standard | strict | local-only
 
@@ -540,6 +593,8 @@ set one up yet.
 - `omarchy-guardian config check` — validates both files and the system
   file's ownership; exit 0 valid, 2 invalid.
 - `omarchy-guardian config path` — prints both file paths.
+- `omarchy-guardian config acknowledge` — accepts, in the system file and
+  with `sudo`, the user file's settings that are weaker than the profile.
 
 `scan` and `guard` take `--class NAME` (default `source`; one of the
 user-level classes `aur`, `theme`, `plugin`, `source`) to tag the review with
@@ -553,7 +608,7 @@ The yay shim passes `--class aur`; the Omarchy theme handler passes
 |---|---|---|
 | `CLEAR` | 0 | nothing found, review complete |
 | `WARNED` | 0 | only findings whose policy is `warn`, or the AI review was unavailable under `ai = optional` |
-| `LIMITED REVIEW` | 0 | nothing reviewable (a scriptlet-free pacman transaction) |
+| `LIMITED REVIEW` | 0 | nothing reviewable (a scriptlet-free pacman transaction); `guard` and `sandbox`, which start nothing then, exit 2 |
 | `HIGH RISK` / `REVIEW REQUIRED` | 1 | any finding whose policy is `block` |
 | `INCOMPLETE` | 2 | any non-AI gap, or an invalid AI reply (malformed, missing nonce, tool use, `inconclusive`), in every profile |
 | `AI REVIEW UNAVAILABLE` | 2 | the AI review was unavailable under `ai = required` |
@@ -1204,22 +1259,60 @@ the recipe in the working directory with the configuration it was given.
 
 ### Omarchy themes
 
-The theme & plugin gate routes theme installs and updates through Guardian from two
-places: the Bash interceptor catches `omarchy theme install/update` typed in
-an interactive Bash, and overrides in your Omarchy menu file
-(`~/.config/omarchy/extensions/omarchy-menu.jsonc`) point Install › Style ›
-Theme and Update › Extra Themes at Guardian, since the menu runs them in a
-non-interactive shell the interceptor never sees. Turn both on from the TUI's
-Integrations tab (or *Protect everything*); the gate shows as partial while
-only one is in place. The interceptor is a Bash file: when your login shell
-is another one (zsh, fish), `omarchy theme` and `omarchy plugin` typed there
-reach Omarchy directly, and the bar says so beside the gate. Themes are
+Theme installs and updates are routed through Guardian in three places.
+
+- **Commands on PATH** (*Theme & plugin commands (PATH)* in the Integrations
+  tab). The package ships root-owned commands named `omarchy`,
+  `omarchy-theme-install`, `omarchy-theme-update`, `omarchy-plugin-add` and
+  `omarchy-plugin-update` in `/usr/lib/omarchy-guardian/bin`. `protect`
+  writes `~/.config/uwsm/env.d/90-omarchy-guardian`, which uwsm reads after
+  Omarchy's own session file and which puts that directory first on PATH for
+  the whole graphical session and its service manager. Every caller that
+  finds those commands by name then goes through Guardian: scripts,
+  `bash -c`, zsh and fish, launchers, key bindings, the stock menu entries
+  and AI agents. Guardian's `omarchy` hands theme and plugin installs and
+  updates to Guardian and passes everything else straight to the real
+  `omarchy` by its full path (which finds its commands in its own directory,
+  not on PATH, so wrapping the four commands alone would miss `omarchy theme
+  install`). It applies from the next login. Until then, and whenever the
+  running session's PATH or its service manager's (`systemctl --user
+  show-environment`) finds a stock command first, it reads "partly on".
+- **The Bash interceptor** catches `omarchy theme install/update` typed in an
+  interactive Bash, also in a shell whose PATH was reordered or that was not
+  started from the graphical session (SSH, a console). It counts only as
+  the exact line Guardian writes in `~/.bashrc`, at the top level, with no
+  `return` or `exit` before it other than the usual "not interactive" line
+  and nothing after it that unsets, redefines or aliases its functions.
+  Guardian reads `~/.bashrc` line by line, not as a shell would: what a file
+  sourced from it does is not seen.
+- **Overrides in your Omarchy menu file**
+  (`~/.config/omarchy/extensions/omarchy-menu.jsonc`, under your home
+  whatever `XDG_CONFIG_HOME` says, as the menu reads it) point Install ›
+  Style › Theme and Update › Extra Themes at Guardian by its full path.
+  They count when they are the entries in effect: the menu takes the last
+  entry of an item named twice, and ignores the whole file when it does not
+  parse.
+
+Turn them on from the TUI's Integrations tab (or *Protect everything*); the
+theme & plugin gate shows as partial while only one of the interceptor and
+the menu overrides is in place or in effect. Without the commands on PATH,
+`omarchy theme` and `omarchy plugin` typed in another login shell (zsh,
+fish) reach Omarchy directly, and the bar says so beside the gate.
+
+Not covered: a caller that names the stock command by its full path
+(`/usr/share/omarchy/bin/omarchy-theme-install`, `/usr/bin/omarchy-theme-install`),
+a program that resets PATH or puts another directory in front, a session not
+started through uwsm (SSH and console logins have the Bash interceptor
+only), and a theme copied into `~/.config/omarchy/themes` by hand. The
+session file is your own: a program running as you can remove it, which the
+bar then shows and notifies about.
+
+Themes are
 cloned to a hidden staging directory and
 reviewed; only the exact reviewed checkout is moved into place and applied.
 Updates stage and review every Git-installed theme before replacing any.
 Themes with local or ignored modifications, submodules, or unresolved Git LFS
-files are refused. Direct invocations of Omarchy's theme binaries from
-elsewhere (scripts, other shells) are not intercepted.
+files are refused.
 
 ### Omarchy plugins
 
@@ -1239,9 +1332,14 @@ update` go through `guardian-plugin`:
   Plugins with local changes, rewritten remote history or submodules are
   refused.
 
-Both routes are gated: the Bash interceptor catches the commands in an
-interactive Bash, and the theme & plugin gate's menu overrides point Setup ›
-Plugins › Add Plugin at Guardian. `omarchy plugin clone` copies Omarchy's own
+Both are gated the same three ways as themes: Guardian's `omarchy`,
+`omarchy-plugin-add` and `omarchy-plugin-update` first on the session's PATH
+(every caller that finds them by name), the Bash interceptor in an
+interactive Bash, and the menu override that points Setup › Plugins › Add
+Plugin at Guardian. The same limits apply: a caller using the stock
+command's full path, or a program that resets PATH, is not caught, and a
+plugin copied into `~/.config/omarchy/plugins` by hand is not reviewed by
+this gate. `omarchy plugin clone` copies Omarchy's own
 built-in plugins and is not gated.
 
 ### Removal
@@ -1258,9 +1356,15 @@ installed by hand and runs Guardian is moved to
 To turn the pacman gate off without removing the package, remove the link
 (`omarchy-guardian protect --off` does): the packaged hook then lets every
 transaction through.
-Turn the theme & plugin gate off in the TUI (or delete the marked Guardian line from
-`~/.bashrc` and the `guardian-theme` and `guardian-plugin` lines from the Omarchy
-menu file) to stop theme and plugin interception.
+Turn the theme & plugin gate and the theme & plugin commands on PATH off in
+the TUI or with `omarchy-guardian protect --off` before removing the package
+(or delete the marked Guardian line from `~/.bashrc`, the `guardian-theme`
+and `guardian-plugin` lines from the Omarchy menu file, and
+`~/.config/uwsm/env.d/90-omarchy-guardian`) to stop theme and plugin
+interception. The session file left behind after removal only names a
+directory that no longer exists. The `<name>.guardian-bak` copies beside
+`~/.bashrc`, the menu file and the Waybar config are the files as they were
+before Guardian's first edit; delete them when you no longer want them.
 
 If pacman fails every install or upgrade with `Review package install scripts
 with Omarchy Guardian` followed by `call to execv failed (No such file or
@@ -1304,6 +1408,13 @@ parent process and a throwaway `HOME`:
 cargo build --release
 bash tests/e2e/integration-gates.sh
 ```
+
+The harnesses set `OMARCHY_GUARDIAN_NO_NOTIFY`, since their blocks are
+expected: with it set no notification is shown and no browser opened. It
+silences nothing else: the report of a block is saved and the bar shows it
+all the same. The pacman hook's `--opencode-from-path` is for these
+harnesses too, whose pacman is a script of yours; it is refused when the
+pacman process belongs to root.
 
 It needs `bwrap` 0.9 or newer, `bsdtar`, `pacman`, `git`, `flock`, `curl` and a
 working `opencode`; it exits `77` when OpenCode cannot run, because every gate

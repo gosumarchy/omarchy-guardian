@@ -1,0 +1,41 @@
+#!/usr/bin/bash
+# Stands in front of Omarchy's `omarchy` on the session's PATH. The real one
+# finds its commands in its own directory, not on PATH, so `omarchy theme
+# install` would never reach Guardian's `omarchy-theme-install` beside this
+# file: theme and plugin installs and updates are routed here, exactly as the
+# Bash interceptor does, and everything else goes straight through.
+REAL=/usr/share/omarchy/bin/omarchy
+LIB=/usr/lib/omarchy-guardian
+
+# Help only before `--`, as omarchy itself decides: `omarchy theme install
+# URL -- -h` installs, so it must not pass through unreviewed.
+help_requested() {
+    local arg
+    for arg in "$@"; do
+        [[ $arg == -- ]] && return 1
+        [[ $arg == --help || $arg == -h ]] && return 0
+    done
+    return 1
+}
+
+# omarchy also accepts `omarchy theme-install URL` and the like.
+case ${1-} in
+    theme-install | theme-update | plugin-add | plugin-install | plugin-update)
+        set -- "${1%%-*}" "${1#*-}" "${@:2}"
+        ;;
+esac
+
+if ! help_requested "$@"; then
+    if [[ ${1-} == theme && ( ${2-} == install || ${2-} == update ) ]]; then
+        action=$2
+        shift 2
+        exec "$LIB/guardian-theme" "$action" "$@"
+    elif [[ ${1-} == plugin && ( ${2-} == add || ${2-} == install || ${2-} == update ) ]]; then
+        action=$2
+        shift 2
+        exec "$LIB/guardian-plugin" "$action" "$@"
+    fi
+fi
+
+# By its full path, so this file is never found again.
+exec "$REAL" "$@"

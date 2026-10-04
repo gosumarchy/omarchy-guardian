@@ -42,6 +42,7 @@ pub struct Settings {
     user_status: FileStatus,
     profile_override: Option<Profile>,
     privileged_block: Option<String>,
+    user_block: Option<String>,
     warnings: Vec<String>,
 }
 
@@ -163,13 +164,30 @@ impl Settings {
                             user_path.display()
                         ));
                     }
+                    if config.acknowledged_weaker.is_some() {
+                        settings.warnings.push(format!(
+                            "[acknowledged] in {} is ignored: only the system file can accept a weaker setting",
+                            user_path.display()
+                        ));
+                    }
                     settings.user = config;
                     settings.user_status = FileStatus::Loaded;
                 }
+                // Not carried on with the defaults: the file may hold a
+                // stricter profile, and one typo would quietly undo it.
                 Read::Failed(reason) => {
-                    settings
-                        .warnings
-                        .push(format!("ignoring {}: {reason}", user_path.display()));
+                    // A parse error names the file and line itself.
+                    let file = user_path.display().to_string();
+                    let named = if reason.starts_with(&file) {
+                        reason.clone()
+                    } else {
+                        format!("{file}: {reason}")
+                    };
+                    let block = format!(
+                        "{named}; fix it (see `omarchy-guardian config check`) before AUR builds, themes, plugins, scans and the sweep can be reviewed"
+                    );
+                    settings.warnings.push(block.clone());
+                    settings.user_block = Some(block);
                     settings.user_status = FileStatus::Invalid(reason);
                 }
             }
@@ -187,6 +205,7 @@ impl Settings {
             user_status: FileStatus::Missing,
             profile_override: None,
             privileged_block: None,
+            user_block: None,
             warnings: Vec::new(),
         }
     }
@@ -325,6 +344,20 @@ impl Settings {
         self.privileged_block.as_deref()
     }
 
+    /// Why no user-level review can run: the user file is there and does
+    /// not parse.
+    pub fn user_block(&self) -> Option<&str> {
+        self.user_block.as_deref()
+    }
+
+    /// The weaker settings accepted in the root-owned system file.
+    pub fn acknowledged_weaker(&self) -> &[String] {
+        self.system
+            .acknowledged_weaker
+            .as_deref()
+            .unwrap_or_default()
+    }
+
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }
@@ -449,14 +482,61 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_user_file_is_ignored_with_a_warning() {
+    fn an_invalid_user_file_blocks_user_level_reviews() {
         let dir = TempDir::new("settings-user");
         let user = dir.path().join("user.toml");
-        fs::write(&user, "[class.aur]\nai = \"sometimes\"\n").unwrap();
+        // A stricter level and one typo: not reviewed at the default.
+        fs::write(
+            &user,
+            "profile = \"strict\"\n[class.aur]\nai = \"sometimes\"\n",
+        )
+        .unwrap();
 
         let settings = Settings::load_from(&dir.path().join("none.toml"), Some(&user), &secure);
         assert!(matches!(settings.user_status(), FileStatus::Invalid(_)));
         assert_eq!(settings.warnings().len(), 1);
+        let block = settings.user_block().unwrap();
+        // It names the file and the line.
+        assert!(block.contains(&format!("{}:3:", user.display())), "{block}");
+        assert!(block.contains("config check"), "{block}");
+        assert_eq!(settings.privileged_block(), None);
+
+        // A file that is not there, or parses, blocks nothing.
+        let missing = Settings::load_from(
+            &dir.path().join("none.toml"),
+            Some(&dir.path().join("no-user.toml")),
+            &secure,
+        );
+        assert_eq!(missing.user_block(), None);
+        fs::write(&user, "profile = \"strict\"\n").unwrap();
+        let valid = Settings::load_from(&dir.path().join("none.toml"), Some(&user), &secure);
+        assert_eq!(valid.user_block(), None);
+    }
+
+    #[test]
+    fn only_the_system_file_accepts_a_weaker_setting() {
+        let dir = TempDir::new("settings-accepted");
+        let system = dir.path().join("system.toml");
+        let user = dir.path().join("user.toml");
+        fs::write(&system, "[acknowledged]\nweaker = [\"aur.ai=off\"]\n").unwrap();
+        fs::write(&user, "[acknowledged]\nweaker = [\"theme.ai=off\"]\n").unwrap();
+        let settings = Settings::load_from(&system, Some(&user), &secure);
+        assert_eq!(settings.acknowledged_weaker(), ["aur.ai=off"]);
+        assert!(
+            settings
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("[acknowledged]"))
+        );
+    }
+
+    #[test]
+    fn an_invalid_user_file_leaves_the_defaults_for_what_shows_settings() {
+        let dir = TempDir::new("settings-user-defaults");
+        let user = dir.path().join("user.toml");
+        fs::write(&user, "[class.aur]\nai = \"sometimes\"\n").unwrap();
+
+        let settings = Settings::load_from(&dir.path().join("none.toml"), Some(&user), &secure);
         assert_eq!(
             settings.policy(SourceClass::Aur).ai,
             AiRequirement::Required

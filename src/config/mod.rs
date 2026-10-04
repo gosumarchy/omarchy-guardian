@@ -6,6 +6,7 @@ pub mod load;
 pub mod model;
 pub mod resolve;
 pub mod show;
+pub mod weaker;
 pub mod write;
 
 pub use load::Settings;

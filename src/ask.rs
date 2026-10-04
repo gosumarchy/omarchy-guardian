@@ -29,6 +29,14 @@ use crate::tools::{OpenCode, Reviewer};
 
 const SCHEME: &str = "omarchy-guardian://ask/";
 const LAUNCH_TUI: &str = "/usr/share/omarchy/bin/omarchy-launch-tui";
+/// Run in the new terminal when a link asked for the agent: names the
+/// report (`$1`) and waits for Enter before starting the agent (the rest).
+/// Any web page can open the link; none can press the key, so none can
+/// spend tokens unseen.
+const CONFIRM_LINK: &str = r#"printf 'Omarchy Guardian: a link asked to open your AI agent on saved report %s.\nPress Enter to start it, or close this window.\n' "$1"
+read -r _ || exit 1
+shift
+exec "$@""#;
 /// Kept well under the kernel's 128 KiB limit for one argument.
 const MAX_REPORT_BYTES: usize = 64 * 1024;
 /// Of a longer report, this much of its start is kept; the rest comes from
@@ -205,15 +213,15 @@ pub fn run(target: &str, settings: &Settings) -> String {
 
         let mut command = if Path::new(LAUNCH_TUI).is_file() {
             let mut command = Command::new(LAUNCH_TUI);
-            command
-                .arg("--app-id=org.omarchy.guardian-ask")
-                .arg(&binary);
+            command.arg("--app-id=org.omarchy.guardian-ask");
             command
         } else {
-            let mut command = Command::new("xdg-terminal-exec");
-            command.arg(&binary);
-            command
+            Command::new("xdg-terminal-exec")
         };
+        if target.starts_with(SCHEME) {
+            command.args(["/bin/sh", "-c", CONFIRM_LINK, "sh", id]);
+        }
+        command.arg(&binary);
         // An empty folder of its own: nothing for the agent to pick up, and
         // Claude Code's trust question is asked once, not for every report.
         let workspace = directory.with_file_name("agent");
@@ -236,6 +244,14 @@ mod tests {
     };
     use crate::test_support::TempDir;
     use crate::tools::Reviewer;
+
+    #[test]
+    fn a_link_waits_for_a_key_before_the_agent_starts() {
+        let script = super::CONFIRM_LINK;
+        let (before, after) = script.split_once("read -r _ || exit 1").unwrap();
+        assert!(before.contains("\"$1\"") && !before.contains("exec"));
+        assert!(after.trim_end().ends_with("exec \"$@\""));
+    }
 
     #[test]
     fn only_report_ids_are_accepted() {

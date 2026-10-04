@@ -1,0 +1,11 @@
+#!/usr/bin/bash
+# Found before Omarchy's `omarchy-theme-install` on the session's PATH, so a
+# script, another shell, a launcher or a key binding that runs it by name
+# goes through Guardian. Help (only before `--`) is Omarchy's own.
+for arg in "$@"; do
+    [[ $arg == -- ]] && break
+    if [[ $arg == --help || $arg == -h ]]; then
+        exec /usr/share/omarchy/bin/omarchy theme install --help
+    fi
+done
+exec /usr/lib/omarchy-guardian/guardian-theme install "$@"

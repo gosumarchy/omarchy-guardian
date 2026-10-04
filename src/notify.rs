@@ -26,7 +26,9 @@ const LAUNCH_BROWSER: &str = "/usr/share/omarchy/bin/omarchy-launch-browser";
 const SETSID: &str = "/usr/bin/setsid";
 /// Saved reports kept; older ones are removed.
 const KEEP_REPORTS: usize = 20;
-/// Set (to anything) by the test harnesses, whose blocks are expected.
+/// Set (to anything) by the test harnesses, whose blocks are expected: no
+/// pop-up is shown and no browser opened. The report is saved all the same,
+/// so a line in a shell start-up file cannot hide a block from the bar.
 const QUIET: &str = "OMARCHY_GUARDIAN_NO_NOTIFY";
 
 /// Waits for a click in the background, then opens the report. `$1`
@@ -78,23 +80,66 @@ pub fn found(what: &str, detail: &str) {
     );
 }
 
+/// Shows "Guardian protection changed" with `detail`: a gate that was on
+/// is not, or a setting became weaker. Only a pop-up: there is no review
+/// to save a report of.
+pub fn changed(detail: &str) {
+    if !popups() {
+        return;
+    }
+    let env = session_env();
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let args = notify_args(
+        "Guardian protection changed",
+        &format!(
+            "{}\nOpen Guardian's settings to see why.",
+            text::shown(detail)
+        ),
+        alert_icon(),
+    );
+    drop(tools::run(
+        Path::new(NOTIFY_SEND),
+        &args,
+        None,
+        &env,
+        Limits {
+            timeout_secs: 5,
+            max_output: 4096,
+        },
+    ));
+}
+
+/// Whether pop-ups are shown: not under the test harnesses, and not
+/// without `notify-send`.
+fn popups() -> bool {
+    !cfg!(test) && env::var_os(QUIET).is_none() && Path::new(NOTIFY_SEND).is_file()
+}
+
+fn alert_icon() -> &'static str {
+    if Path::new(ALERT_ICON).is_file() {
+        ALERT_ICON
+    } else {
+        "security-high"
+    }
+}
+
 fn alert(title: &str, detail: &str, ran: Ran) {
-    if cfg!(test) || env::var_os(QUIET).is_some() || !Path::new(NOTIFY_SEND).is_file() {
+    if cfg!(test) {
         return;
     }
     let title = title.to_string();
     let detail = &text::shown(detail);
-    let icon = if Path::new(ALERT_ICON).is_file() {
-        ALERT_ICON
-    } else {
-        "security-high"
-    };
-    let env = session_env();
-    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
-
+    // Saved whether or not a pop-up can be shown: the bar's last block
+    // comes from here.
     let report = crate::engine::store::effective_uid()
         .ok()
         .and_then(|uid| save_report(&title, detail, ran, uid));
+    if !popups() {
+        return;
+    }
+    let icon = alert_icon();
+    let env = session_env();
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
     if let Some(report) = report.filter(|_| Path::new(LAUNCH_BROWSER).is_file()) {
         let body = format!("{detail}\nClick to open the full report.");
         let mut command = Command::new(SETSID);
@@ -246,22 +291,36 @@ pub fn reports_dir() -> Option<PathBuf> {
     Some(base.join("omarchy-guardian/reports"))
 }
 
-/// Removes all but the newest `KEEP_REPORTS` reports, page and text alike
-/// (names start with the time, so they sort by age). Only regular files
-/// owned by `uid` are removed; a symlink named like a report is left alone.
+/// The time and process of a report id, `<seconds>-<pid>` in digits only:
+/// the one shape Guardian saves. Anything else under that name is not a
+/// report.
+pub fn report_id(id: &str) -> Option<(u64, u64)> {
+    let (seconds, pid) = id.split_once('-')?;
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    if !digits(seconds) || !digits(pid) {
+        return None;
+    }
+    Some((seconds.parse().ok()?, pid.parse().ok()?))
+}
+
+/// Removes all but the newest `KEEP_REPORTS` reports, page and text alike,
+/// by the time in their names. Only regular files owned by `uid` are
+/// removed; a symlink named like a report is left alone, and so is a file
+/// that is not named like one.
 fn prune(directory: &Path, uid: u32) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
     };
-    let mut pages: Vec<PathBuf> = entries
+    let mut pages: Vec<((u64, u64), PathBuf)> = entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "html")
+        .filter_map(|path| {
+            let id = path.file_name()?.to_str()?.strip_suffix(".html")?;
+            Some((report_id(id)?, path.clone()))
         })
         .collect();
     pages.sort();
+    let pages: Vec<PathBuf> = pages.into_iter().map(|(_, path)| path).collect();
     let excess = pages.len().saturating_sub(KEEP_REPORTS);
     let owned_file = |path: &Path| {
         fs::symlink_metadata(path)
@@ -383,6 +442,33 @@ mod tests {
         assert!(dir.path().join("0000000000-1.html").is_symlink());
         assert!(!dir.path().join("0000000001-1.html").exists());
         assert!(victim.exists());
+    }
+
+    #[test]
+    fn only_names_guardian_writes_are_report_ids() {
+        use super::report_id;
+        assert_eq!(
+            report_id("1790792730-953463"),
+            Some((1_790_792_730, 953_463))
+        );
+        assert!(report_id("999999-10") > report_id("999999-9"));
+        for bad in [
+            "zzz", "1-", "-2", "12", "1-2-3", "+1-2", "1-2 ", "1.5-2", "",
+        ] {
+            assert_eq!(report_id(bad), None, "{bad}");
+        }
+        // A name that is no report is never pruned as the oldest one.
+        let dir = TempDir::new("reports-names");
+        for second in 0..=KEEP_REPORTS {
+            fs::write(dir.path().join(format!("{second}-1.html")), "r").unwrap();
+        }
+        fs::write(dir.path().join("zzz.html"), "other").unwrap();
+        let uid = fs::metadata(dir.path()).unwrap().uid();
+        prune(dir.path(), uid);
+        assert!(dir.path().join("zzz.html").exists());
+        // By number: 0 is older than 10, whatever the text order says.
+        assert!(!dir.path().join("0-1.html").exists());
+        assert!(dir.path().join("10-1.html").exists());
     }
 
     #[test]

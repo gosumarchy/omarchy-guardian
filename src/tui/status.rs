@@ -11,13 +11,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::integrations::{Integration, State};
+use super::integrations::{Integration, Paths, State};
 use super::paths;
 use crate::config::Settings;
 use crate::config::model::{
     Action, AiRequirement, Named, Profile, RootConsent, SourceClass, builtin,
 };
+use crate::config::weaker;
 use crate::engine::store::Store;
+use crate::gatewatch::{self, Level, Observer};
 use crate::json::Json;
 use crate::notify;
 use crate::pacman;
@@ -42,10 +44,11 @@ const UNFINISHED_SECS: u64 = 2 * 60 * 60;
 
 /// The gates that protect installs; the menu entry and widgets are
 /// conveniences.
-const GATES: [Integration; 4] = [
+const GATES: [Integration; 5] = [
     Integration::PacmanHook,
     Integration::AurGate,
     Integration::ThemeInterceptor,
+    Integration::SessionPath,
     Integration::SystemSweep,
 ];
 
@@ -74,9 +77,10 @@ fn collect() -> Status {
         issues.push(reason.to_string());
     }
 
+    let paths = paths(&settings);
     let mut gates = Vec::new();
     let mut on = 0;
-    if let Some(paths) = paths(&settings) {
+    if let Some(paths) = &paths {
         for integration in GATES {
             let state = paths.state(integration);
             let (name, detail) = match &state {
@@ -122,7 +126,8 @@ fn collect() -> Status {
     if let Err(reason) = pacman::preflight(&settings, pacman::system_reviewer_ready(&settings)) {
         issues.push(reason);
     }
-    if let Some(paths) = paths(&settings) {
+    issues.extend(quiet_weakenings(&settings, paths.as_ref()));
+    if let Some(paths) = &paths {
         let enabled = |link: &Path| fs::symlink_metadata(link).is_ok();
         if enabled(&paths.sweep_timer_link) {
             let root_problem = (paths.sweep_consent == Some(RootConsent::Allowed)
@@ -158,6 +163,117 @@ fn collect() -> Status {
         issues,
         block,
     }
+}
+
+/// What makes protection less than the gates' states say, each a problem
+/// for the bar: a class reviewed more weakly than its level, an AUR helper
+/// with no gate, and what was on when Guardian last looked and is not now.
+fn quiet_weakenings(settings: &Settings, paths: Option<&Paths>) -> Vec<String> {
+    // A weaker class makes its gate do less than it reads, or nothing: a
+    // problem until the root-owned system file accepts it. (Accepted ones
+    // stay beside the gate.)
+    let mut issues: Vec<String> = weaker::weakenings(settings)
+        .iter()
+        .filter(|weakening| !weakening.acknowledged)
+        .map(weaker::Weakening::issue)
+        .collect();
+    if let Some(paths) = paths {
+        issues.extend(paths.helper_issues());
+    }
+    // A gate that is off is already listed with the gates: this adds the
+    // rest (the menu entry, the bar widgets, the pacman gate's reviewer,
+    // the settings files). Tests keep no record in the real home.
+    if !cfg!(test) {
+        issues.extend(
+            gatewatch::observe(&snapshot_of(settings, paths), Observer::Watching)
+                .into_iter()
+                .filter(|(key, _)| !GATES.iter().any(|gate| gate.label() == key))
+                .map(|(_, line)| line),
+        );
+    }
+    issues
+}
+
+/// Every gate, integration and weaker setting as it is now, for the record
+/// that tells when one of them drops (see `gatewatch`).
+pub fn snapshot(settings: &Settings) -> gatewatch::Snapshot {
+    snapshot_of(settings, paths(settings).as_ref())
+}
+
+fn snapshot_of(settings: &Settings, paths: Option<&Paths>) -> gatewatch::Snapshot {
+    let mut gates = Vec::new();
+    if let Some(paths) = paths {
+        for integration in Integration::ALL {
+            let label = integration.label();
+            let (level, now) = match paths.state(integration) {
+                State::On => (Level::On, format!("{label} is on")),
+                State::Off => (Level::Off, format!("{label} is off")),
+                State::Partial(detail) => (
+                    Level::Partial,
+                    format!("{label} is only partly on ({detail})"),
+                ),
+                State::Foreign(detail) => (
+                    Level::Off,
+                    format!("{label} is not Guardian's own ({detail})"),
+                ),
+                State::Unavailable(detail) => {
+                    (Level::Off, format!("{label} is unavailable ({detail})"))
+                }
+            };
+            gates.push(gatewatch::Gate {
+                key: label.to_string(),
+                level,
+                now,
+            });
+        }
+    }
+    // The pacman gate reviews with a root-owned program; one that went
+    // away, or stopped being root's, leaves it refusing or unreviewed.
+    let reviewer = pacman::classes_requiring_ai(settings).is_empty()
+        || pacman::system_reviewer_ready(settings);
+    gates.push(gatewatch::Gate {
+        key: "pacman reviewer".into(),
+        level: if reviewer { Level::On } else { Level::Off },
+        now: "the pacman gate's root-owned reviewer is gone".into(),
+    });
+    let usable = settings.user_block().is_none() && settings.privileged_block().is_none();
+    gates.push(gatewatch::Gate {
+        key: "settings".into(),
+        level: if usable { Level::On } else { Level::Off },
+        now: "a Guardian settings file cannot be used".into(),
+    });
+    gatewatch::Snapshot {
+        gates,
+        weak: weaker::weakenings(settings)
+            .iter()
+            .filter(|weakening| !weakening.acknowledged)
+            .map(|weakening| {
+                (
+                    weakening.key(),
+                    format!(
+                        "{}: {} = {} is weaker than the {} level",
+                        weaker::subject(weakening.class),
+                        weakening.knob,
+                        weakening.value,
+                        weakening.profile
+                    ),
+                )
+            })
+            .collect(),
+    }
+}
+
+/// Records the gates as they are after the user changed one through
+/// Guardian (`protect`, the settings app): known, so not news.
+pub fn chosen() {
+    gatewatch::observe(&snapshot(&Settings::load()), Observer::Chosen);
+}
+
+/// Looks at the gates before the user changes one through Guardian, so
+/// what dropped by itself until now is told as news and not recorded as
+/// the user's choice along with the change.
+pub fn watched() {
+    gatewatch::observe(&snapshot(&Settings::load()), Observer::Watching);
 }
 
 /// What to say beside a gate that is on while the AI review is off for
@@ -436,14 +552,12 @@ struct LastBlock {
 
 /// The newest saved report, and whether it is recent and not yet dismissed.
 fn last_block(directory: &Path, now: u64) -> Option<LastBlock> {
-    let newest = newest_report(directory)?;
-    let seconds: u64 = newest.split_once('-')?.0.parse().ok()?;
+    let (newest, id) = newest_report(directory, now)?;
     let text = fs::read_to_string(directory.join(format!("{newest}.txt"))).unwrap_or_default();
     let title = text.lines().next().unwrap_or_default().to_string();
-    let seen = fs::read_to_string(directory.join(SEEN)).unwrap_or_default();
-    let age_secs = now.saturating_sub(seconds);
+    let age_secs = now.saturating_sub(id.0);
     Some(LastBlock {
-        unseen: age_secs < RECENT_SECS && seen.trim() < newest.as_str(),
+        unseen: age_secs < RECENT_SECS && seen(directory, id, now) != Some(id),
         report: directory
             .join(format!("{newest}.html"))
             .display()
@@ -454,26 +568,39 @@ fn last_block(directory: &Path, now: u64) -> Option<LastBlock> {
     })
 }
 
-/// The newest report id (`<seconds>-<pid>`); ids sort by time.
-fn newest_report(directory: &Path) -> Option<String> {
-    report_ids(directory).into_iter().max()
+/// The newest report: its name and its id (`<seconds>-<pid>`, compared as
+/// numbers). One dated after `now` is not a report Guardian saved: left
+/// in, it would be "the newest" for ever and hide every real one.
+fn newest_report(directory: &Path, now: u64) -> Option<(String, (u64, u64))> {
+    report_ids(directory)
+        .into_iter()
+        .filter(|(_, id)| id.0 <= now)
+        .max_by_key(|(_, id)| *id)
 }
 
-/// Every saved report's id.
-fn report_ids(directory: &Path) -> Vec<String> {
+/// Every saved report: its name and id. Only names of the shape Guardian
+/// writes count; any other `.html` file in the directory is not a report.
+fn report_ids(directory: &Path) -> Vec<(String, (u64, u64))> {
     let Ok(entries) = fs::read_dir(directory) else {
         return Vec::new();
     };
     entries
         .filter_map(Result::ok)
         .filter_map(|entry| {
-            entry
-                .file_name()
-                .to_str()?
-                .strip_suffix(".html")
-                .map(str::to_string)
+            let name = entry.file_name();
+            let name = name.to_str()?.strip_suffix(".html")?;
+            Some((name.to_string(), notify::report_id(name)?))
         })
         .collect()
+}
+
+/// The report id the user last dismissed, when `.seen` holds one that can
+/// be true: a report id no newer than the `newest` report or the clock. A
+/// file that says more has been seen than was ever saved is not believed,
+/// and nothing counts as seen.
+fn seen(directory: &Path, newest: (u64, u64), now: u64) -> Option<(u64, u64)> {
+    let text = fs::read_to_string(directory.join(SEEN)).ok()?;
+    notify::report_id(text.trim()).filter(|seen| *seen <= newest && seen.0 <= now)
 }
 
 /// Records `id`, a report the user asked for, as seen, so it raises no
@@ -483,32 +610,37 @@ fn report_ids(directory: &Path) -> Vec<String> {
 /// too old for the bar to show do not count, and what is seen never moves
 /// back.
 pub fn mark_seen_unless_waiting(directory: &Path, id: &str, now: u64) -> bool {
-    let seen = fs::read_to_string(directory.join(SEEN)).unwrap_or_default();
-    let seen = seen.trim();
-    let waiting = report_ids(directory).into_iter().any(|other| {
-        other != id
-            && other.as_str() > seen
-            && other
-                .split_once('-')
-                .and_then(|(seconds, _)| seconds.parse::<u64>().ok())
-                .is_some_and(|seconds| now.saturating_sub(seconds) < RECENT_SECS)
+    let Some(asked) = notify::report_id(id) else {
+        return false;
+    };
+    let newest = newest_report(directory, now).map_or(asked, |(_, newest)| newest.max(asked));
+    let seen = seen(directory, newest, now);
+    let waiting = report_ids(directory).into_iter().any(|(_, other)| {
+        other != asked
+            && other.0 <= now
+            && seen.is_none_or(|seen| other > seen)
+            && now.saturating_sub(other.0) < RECENT_SECS
     });
     if waiting {
         return false;
     }
-    if seen < id {
+    if seen.is_none_or(|seen| seen < asked) {
         drop(fs::write(directory.join(SEEN), id));
     }
     true
 }
 
-/// Marks every report so far as seen, and refreshes the Waybar module.
+/// Marks every report so far as seen and every gate that dropped as
+/// known, and refreshes the Waybar module.
 pub fn dismiss() -> Result<(), String> {
+    gatewatch::dismiss();
     let directory = notify::reports_dir().ok_or("no reports directory (set HOME)")?;
-    let Some(newest) = newest_report(&directory) else {
-        return Ok(());
-    };
-    fs::write(directory.join(SEEN), newest).map_err(|error| error.to_string())?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    if let Some((newest, _)) = newest_report(&directory, now) {
+        fs::write(directory.join(SEEN), newest).map_err(|error| error.to_string())?;
+    }
     refresh_waybar();
     Ok(())
 }
@@ -516,7 +648,10 @@ pub fn dismiss() -> Result<(), String> {
 /// Opens the last block's report in the browser and marks it seen.
 pub fn open_report() -> Result<(), String> {
     let directory = notify::reports_dir().ok_or("no reports directory (set HOME)")?;
-    let newest = newest_report(&directory).ok_or("no block reports yet")?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let (newest, _) = newest_report(&directory, now).ok_or("no block reports yet")?;
     let page = directory.join(format!("{newest}.html"));
     Command::new("omarchy-launch-browser")
         .arg(format!("file://{}", page.display()))
@@ -576,6 +711,7 @@ mod tests {
         );
 
         // What is seen never moves back.
+        fs::write(dir.path().join("999300-1.html"), "").unwrap();
         fs::write(dir.path().join(SEEN), "999300-1").unwrap();
         assert!(mark_seen_unless_waiting(dir.path(), "999250-1", now));
         assert_eq!(
@@ -617,6 +753,54 @@ mod tests {
                 .unwrap()
                 .unseen
         );
+    }
+
+    #[test]
+    fn a_seen_mark_or_a_file_name_cannot_hide_a_block() {
+        let now = 1_000_000;
+        let dir = TempDir::new("status-seen-forged");
+        fs::write(dir.path().join("999500-8.html"), "page").unwrap();
+        let unseen = || last_block(dir.path(), now).unwrap().unseen;
+        assert!(unseen());
+
+        // A mark ahead of every report, or of the clock, is not believed;
+        // one that is no report id is no mark.
+        for forged in [
+            "9999999999-9",
+            "999500-9",
+            "999501-1",
+            "zzz",
+            "999500-8x",
+            "-",
+            "",
+        ] {
+            fs::write(dir.path().join(SEEN), forged).unwrap();
+            assert!(unseen(), "{forged}");
+        }
+        fs::write(dir.path().join(SEEN), "999500-8\n").unwrap();
+        assert!(!unseen());
+
+        // Names Guardian never writes are not reports, and neither is one
+        // dated after now: none of them is "the newest".
+        for planted in [
+            "zzz.html",
+            "9999999999-9.html",
+            "999600-x.html",
+            "-.html",
+            ".html",
+        ] {
+            fs::write(dir.path().join(planted), "").unwrap();
+        }
+        assert_eq!(last_block(dir.path(), now).unwrap().id, "999500-8");
+        // Ids compare as numbers, not as text.
+        fs::write(dir.path().join("999999-10.html"), "").unwrap();
+        fs::write(dir.path().join("999999-9.html"), "").unwrap();
+        fs::write(dir.path().join("99-99999999.html"), "").unwrap();
+        let block = last_block(dir.path(), now).unwrap();
+        assert_eq!(block.id, "999999-10");
+        assert!(block.unseen);
+        // Asking for a planted name marks nothing seen.
+        assert!(!mark_seen_unless_waiting(dir.path(), "zzz", now));
     }
 
     #[test]

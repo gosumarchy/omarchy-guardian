@@ -1,0 +1,481 @@
+//! Tells the desktop when protection goes away by itself: a gate that was
+//! on and no longer is, or a setting that became weaker than its level.
+//!
+//! Each `status` run (the bar asks every half minute) and each scheduled
+//! sweep reads every gate's state and compares it with the last record. A
+//! drop raises one notification and stays among the bar's problems until
+//! the gate is back on or `status --dismiss`. What the user turns off
+//! through Guardian itself is recorded without a notification.
+//!
+//! The record is a file in the user's own state directory. It catches
+//! things breaking and crude tampering (a line removed from `~/.bashrc`);
+//! a program that also rewrites the record is not caught.
+
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+use crate::config::Settings;
+use crate::engine::store::{self, Store};
+use crate::json::Json;
+use crate::notify;
+
+const RECORD: &str = "gatewatch.json";
+const LOCK: &str = "gatewatch.lock";
+/// A lock older than this was left by a run that died.
+const STALE_LOCK: Duration = Duration::from_secs(60);
+
+/// How much of its job a gate does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Level {
+    Off,
+    Partial,
+    On,
+}
+
+impl Level {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Partial => "partial",
+            Self::On => "on",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        [Self::Off, Self::Partial, Self::On]
+            .into_iter()
+            .find(|level| level.name() == name)
+    }
+}
+
+/// One gate as it is now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Gate {
+    /// Its name in the record, which stays the same between versions.
+    pub key: String,
+    pub level: Level,
+    /// What a notification says when it dropped: "the AUR gate is off".
+    pub now: String,
+}
+
+/// Everything watched, as it is now.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Snapshot {
+    pub gates: Vec<Gate>,
+    /// Settings weaker than their level and not accepted: the system
+    /// file's key for each, and the line that says it.
+    pub weak: Vec<(String, String)>,
+}
+
+/// Who is looking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Observer {
+    /// The bar or the scheduled sweep: a drop is news.
+    Watching,
+    /// The user just changed something through Guardian: recorded, and
+    /// not news.
+    Chosen,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Record {
+    gates: Vec<(String, Level)>,
+    weak: Vec<String>,
+    /// Drops not yet dismissed or repaired: the gate or setting, and the
+    /// line the bar shows.
+    alerts: Vec<(String, String)>,
+}
+
+impl Record {
+    fn parse(text: &str) -> Option<Self> {
+        let json = Json::parse(text).ok()?;
+        let gates = json
+            .get("gates")?
+            .as_object()?
+            .iter()
+            .map(|(key, level)| Some((key.clone(), Level::parse(level.as_str()?)?)))
+            .collect::<Option<_>>()?;
+        let weak = json
+            .get("weak")?
+            .as_array()?
+            .iter()
+            .map(|key| key.as_str().map(str::to_string))
+            .collect::<Option<_>>()?;
+        let alerts = json
+            .get("alerts")?
+            .as_array()?
+            .iter()
+            .map(|alert| {
+                Some((
+                    alert.get("key")?.as_str()?.to_string(),
+                    alert.get("text")?.as_str()?.to_string(),
+                ))
+            })
+            .collect::<Option<_>>()?;
+        Some(Self {
+            gates,
+            weak,
+            alerts,
+        })
+    }
+
+    fn render(&self) -> String {
+        let gates = Json::Object(
+            self.gates
+                .iter()
+                .map(|(key, level)| (key.clone(), Json::from(level.name())))
+                .collect(),
+        );
+        let weak = Json::Array(
+            self.weak
+                .iter()
+                .map(|key| Json::from(key.as_str()))
+                .collect(),
+        );
+        let alerts = Json::Array(
+            self.alerts
+                .iter()
+                .map(|(key, text)| {
+                    Json::object([
+                        ("key", Json::from(key.as_str())),
+                        ("text", Json::from(text.as_str())),
+                    ])
+                })
+                .collect(),
+        );
+        Json::object([("gates", gates), ("weak", weak), ("alerts", alerts)]).to_string()
+    }
+}
+
+/// What the bar says of a drop until it is repaired or dismissed.
+const SINCE: &str =
+    "it was on when Guardian last looked; `omarchy-guardian status --dismiss` marks this seen";
+
+/// The record after seeing `snapshot`, and what is news in it: the lines
+/// of the drops since `previous`. Without a previous record nothing is
+/// news: there is nothing to have dropped from.
+fn compare(
+    previous: Option<&Record>,
+    snapshot: &Snapshot,
+    observer: Observer,
+) -> (Record, Vec<String>) {
+    let level_now = |key: &str| {
+        snapshot
+            .gates
+            .iter()
+            .find(|gate| gate.key == key)
+            .map(|gate| gate.level)
+    };
+    // What was raised stays until it is repaired: the gate back on.
+    let mut alerts: Vec<(String, String)> = previous
+        .map(|previous| previous.alerts.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(key, _)| level_now(key).is_some_and(|level| level != Level::On))
+        .collect();
+    let mut news = Vec::new();
+    if let (Some(previous), Observer::Watching) = (previous, observer) {
+        for gate in &snapshot.gates {
+            let before = previous
+                .gates
+                .iter()
+                .find(|(key, _)| *key == gate.key)
+                .map(|(_, level)| *level);
+            if before.is_some_and(|before| gate.level < before) {
+                alerts.retain(|(key, _)| *key != gate.key);
+                alerts.push((gate.key.clone(), format!("{} ({SINCE})", gate.now)));
+                news.push(gate.now.clone());
+            }
+        }
+        // A weaker setting is a problem of the bar's for as long as it
+        // lasts (see `status`), so it is only news here.
+        news.extend(
+            snapshot
+                .weak
+                .iter()
+                .filter(|(key, _)| !previous.weak.contains(key))
+                .map(|(_, line)| line.clone()),
+        );
+    }
+    let record = Record {
+        gates: snapshot
+            .gates
+            .iter()
+            .map(|gate| (gate.key.clone(), gate.level))
+            .collect(),
+        weak: snapshot.weak.iter().map(|(key, _)| key.clone()).collect(),
+        alerts,
+    };
+    (record, news)
+}
+
+/// One notification's text for every drop found at once.
+fn headline(news: &[String]) -> Option<String> {
+    let (first, rest) = news.split_first()?;
+    Some(if rest.is_empty() {
+        first.clone()
+    } else {
+        format!("{first}, and {} more change(s)", rest.len())
+    })
+}
+
+/// Compares `snapshot` with the record in `directory`, saves it, and
+/// returns the drops still standing (the gate and the bar's line for it)
+/// and the notification to show, if any. Two runs at once (the bar and the sweep) must not both
+/// call the same drop news: only the one holding the lock compares, the
+/// other reports what is on record.
+fn observe_in(
+    directory: &Path,
+    snapshot: &Snapshot,
+    observer: Observer,
+) -> (Vec<(String, String)>, Option<String>) {
+    let path = directory.join(RECORD);
+    let text = fs::read_to_string(&path).ok();
+    let previous = text.as_deref().and_then(Record::parse);
+    let standing = |record: &Record| record.alerts.clone();
+    let Some(_lock) = Lock::take(directory.join(LOCK)) else {
+        return (previous.as_ref().map(standing).unwrap_or_default(), None);
+    };
+    let (record, news) = compare(previous.as_ref(), snapshot, observer);
+    let rendered = record.render();
+    // The bar asks every half minute: the file is only written when
+    // something changed. A record that cannot be saved raises nothing, or
+    // the same drop would be news on every run.
+    if text.as_deref() != Some(rendered.as_str()) && write(&path, &rendered).is_err() {
+        return (standing(&record), None);
+    }
+    (standing(&record), headline(&news))
+}
+
+fn write(path: &Path, text: &str) -> std::io::Result<()> {
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    drop(fs::remove_file(&temporary));
+    let written = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .and_then(|mut file| file.write_all(text.as_bytes()))
+        .and_then(|()| fs::rename(&temporary, path));
+    if written.is_err() {
+        drop(fs::remove_file(&temporary));
+    }
+    written
+}
+
+/// A lock file, removed when dropped.
+struct Lock(PathBuf);
+
+impl Lock {
+    fn take(path: PathBuf) -> Option<Self> {
+        let stale = fs::symlink_metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| {
+                SystemTime::now()
+                    .duration_since(modified)
+                    .is_ok_and(|age| age > STALE_LOCK)
+            });
+        if stale {
+            drop(fs::remove_file(&path));
+        }
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .ok()
+            .map(|_| Self(path))
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        drop(fs::remove_file(&self.0));
+    }
+}
+
+/// The user's private state directory, made if missing. Root keeps no
+/// record: under `sudo -E` the directory is the user's.
+fn directory() -> Option<PathBuf> {
+    let uid = store::effective_uid().ok().filter(|uid| *uid != 0)?;
+    let root = Store::default_root()?;
+    store::private_dir(&root, uid).ok()?;
+    Some(root)
+}
+
+/// Records `snapshot`, notifies about what dropped since the last record
+/// (unless the user chose it), and returns the drops still standing (the
+/// gate's key and the line that says it), for the bar's list of problems.
+pub fn observe(snapshot: &Snapshot, observer: Observer) -> Vec<(String, String)> {
+    let Some(directory) = directory() else {
+        return Vec::new();
+    };
+    let (standing, news) = observe_in(&directory, snapshot, observer);
+    if let Some(news) = news {
+        notify::changed(&news);
+    }
+    standing
+}
+
+/// `status --dismiss`: the drops on record are seen.
+pub fn dismiss() {
+    let Some(path) = directory().map(|directory| directory.join(RECORD)) else {
+        return;
+    };
+    let Some(mut record) = fs::read_to_string(&path)
+        .ok()
+        .as_deref()
+        .and_then(Record::parse)
+    else {
+        return;
+    };
+    if !record.alerts.is_empty() {
+        record.alerts.clear();
+        drop(write(&path, &record.render()));
+    }
+}
+
+/// Run at the end of a scheduled sweep, so a gate that went off is told
+/// within a day even where no bar asks for the status.
+pub fn after_sweep(scheduled: bool, settings: &Settings) {
+    if scheduled {
+        observe(&crate::tui::status::snapshot(settings), Observer::Watching);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::{Gate, Level, Observer, RECORD, Record, Snapshot, compare, headline, observe_in};
+    use crate::test_support::TempDir;
+
+    fn gate(key: &str, level: Level) -> Gate {
+        Gate {
+            key: key.into(),
+            level,
+            now: format!("the {key} gate is {}", level.name()),
+        }
+    }
+
+    fn snapshot(gates: &[(&str, Level)], weak: &[&str]) -> Snapshot {
+        Snapshot {
+            gates: gates.iter().map(|(key, level)| gate(key, *level)).collect(),
+            weak: weak
+                .iter()
+                .map(|key| ((*key).to_string(), format!("{key} is weaker")))
+                .collect(),
+        }
+    }
+
+    fn lines(standing: &[(String, String)]) -> Vec<&str> {
+        standing.iter().map(|(key, _)| key.as_str()).collect()
+    }
+
+    #[test]
+    fn a_gate_that_was_on_and_is_not_is_news_once_and_stays_until_it_is_back() {
+        let dir = TempDir::new("gatewatch");
+        let on = snapshot(&[("aur", Level::On), ("theme", Level::Off)], &[]);
+        // The first record has nothing to compare with.
+        assert_eq!(
+            observe_in(dir.path(), &on, Observer::Watching),
+            (Vec::new(), None)
+        );
+
+        let off = snapshot(&[("aur", Level::Off), ("theme", Level::Off)], &[]);
+        let (standing, news) = observe_in(dir.path(), &off, Observer::Watching);
+        assert_eq!(lines(&standing), ["aur"]);
+        assert!(standing[0].1.starts_with("the aur gate is off (it was on"));
+        assert_eq!(news.as_deref(), Some("the aur gate is off"));
+        // Not news again, and still a problem.
+        let (standing, news) = observe_in(dir.path(), &off, Observer::Watching);
+        assert_eq!(lines(&standing), ["aur"]);
+        assert_eq!(news, None);
+
+        // Back on: gone.
+        assert_eq!(
+            observe_in(dir.path(), &on, Observer::Watching),
+            (Vec::new(), None)
+        );
+        // On to partly on is a drop too.
+        let partial = snapshot(&[("aur", Level::Partial), ("theme", Level::Off)], &[]);
+        let (standing, news) = observe_in(dir.path(), &partial, Observer::Watching);
+        assert_eq!(lines(&standing), ["aur"]);
+        assert!(news.is_some());
+        // A gate that came on, or was never on, is not.
+        let more = snapshot(&[("aur", Level::Partial), ("theme", Level::On)], &[]);
+        assert_eq!(observe_in(dir.path(), &more, Observer::Watching).1, None);
+    }
+
+    #[test]
+    fn what_the_user_turned_off_is_recorded_without_a_notification() {
+        let dir = TempDir::new("gatewatch-chosen");
+        let on = snapshot(&[("aur", Level::On)], &[]);
+        let off = snapshot(&[("aur", Level::Off)], &[]);
+        observe_in(dir.path(), &on, Observer::Watching);
+        assert_eq!(
+            observe_in(dir.path(), &off, Observer::Chosen),
+            (Vec::new(), None)
+        );
+        // The bar's next look finds it as recorded.
+        assert_eq!(
+            observe_in(dir.path(), &off, Observer::Watching),
+            (Vec::new(), None)
+        );
+    }
+
+    #[test]
+    fn a_setting_that_became_weaker_is_news_once() {
+        let dir = TempDir::new("gatewatch-weak");
+        observe_in(dir.path(), &snapshot(&[], &[]), Observer::Watching);
+        let weak = snapshot(&[], &["aur.ai=off"]);
+        let (standing, news) = observe_in(dir.path(), &weak, Observer::Watching);
+        // The bar lists it itself for as long as it lasts.
+        assert!(standing.is_empty());
+        assert_eq!(news.as_deref(), Some("aur.ai=off is weaker"));
+        assert_eq!(observe_in(dir.path(), &weak, Observer::Watching).1, None);
+        // Set back and weakened again: news again. Through the settings
+        // app: not.
+        observe_in(dir.path(), &snapshot(&[], &[]), Observer::Watching);
+        assert!(
+            observe_in(dir.path(), &weak, Observer::Watching)
+                .1
+                .is_some()
+        );
+        observe_in(dir.path(), &snapshot(&[], &[]), Observer::Watching);
+        assert_eq!(observe_in(dir.path(), &weak, Observer::Chosen).1, None);
+        assert_eq!(observe_in(dir.path(), &weak, Observer::Watching).1, None);
+    }
+
+    #[test]
+    fn several_drops_make_one_notification_and_a_broken_record_starts_over() {
+        assert_eq!(headline(&[]), None);
+        assert_eq!(
+            headline(&["a is off".into(), "b is off".into(), "c".into()]).as_deref(),
+            Some("a is off, and 2 more change(s)")
+        );
+        let previous = Record {
+            gates: vec![("a".into(), Level::On), ("b".into(), Level::On)],
+            ..Record::default()
+        };
+        let now = snapshot(&[("a", Level::Off), ("b", Level::Off)], &[]);
+        let (record, news) = compare(Some(&previous), &now, Observer::Watching);
+        assert_eq!(news.len(), 2);
+        assert_eq!(Record::parse(&record.render()), Some(record));
+
+        // A record that is not one is replaced, and raises nothing.
+        let dir = TempDir::new("gatewatch-broken");
+        fs::write(dir.path().join(RECORD), "{\"gates\": 7}").unwrap();
+        assert_eq!(
+            observe_in(dir.path(), &now, Observer::Watching),
+            (Vec::new(), None)
+        );
+        let saved = fs::read_to_string(dir.path().join(RECORD)).unwrap();
+        assert!(Record::parse(&saved).is_some(), "{saved}");
+        // The lock is gone after each run.
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+}
