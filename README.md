@@ -1014,7 +1014,48 @@ review it in full every time.
   of Guardian's own gates), and erasing shell history or system logs.
   Download-to-shell also covers a fetch piped into another interpreter
   (`| python`, `| perl`, `| node`, ...), behind a wrapper (`| timeout 5 sh`,
-  `| xargs sh -c`) or grouped (`| { sh; }`). Identifier patterns respect word
+  `| xargs sh -c`) or grouped (`| { sh; }`), a fetch run from a substitution
+  or a here-string (`eval "$(curl ...)"`, `bash <<< "$(curl ...)"`), other
+  fetchers (`http`/`https` with an address, `fetch`, `lwp-download`, `nc`,
+  `scp`/`rsync`, a Python one-liner that reads a URL), and a value held in a
+  variable from a fetch and later run (`x=$(curl ...)` … `eval "$x"`).
+  Encoded command execution covers the same shapes for a decoder — `base32`,
+  `basenc`, `xxd -r` in any flag order, `openssl enc -d`, `rev`, a `tr` or a
+  `gunzip`/`xz -d`/`zstd -d` of a literal, a `printf '\xNN'` of four or more
+  escapes — and a decode run in a language (`exec(b64decode(...))`,
+  `eval(atob(...))`, `new Function(atob(...))`, Lua `load(string.char(...))`,
+  PowerShell `IEX`/`-enc`), including a decode saved to a variable and then
+  run, or saved to a file and then run. A separate **remote-code-install**
+  finding (medium) marks a package manager told to install and so run code
+  from an address rather than from this source: `pip install` of a URL or
+  `git+` repository, `npm install` of a URL/tarball/git or `npx` of an
+  unpinned remote package, `go install …@latest`, `cargo install --git`;
+  an ordinary `pip install -r requirements.txt`, `npm ci` with a lockfile or
+  `go build` stays quiet. Persistence now also covers an auto-run directive
+  (a `.desktop` `Exec=`, a systemd `ExecStart=`, a waybar `on-click`, a
+  Hyprland `exec-once`/`bind … exec`, a cron line, a udev `RUN+=`) whose
+  command lives where no installed program does (`/tmp`, `/dev/shm`,
+  `~/.cache`, a hidden dot-file in `$HOME`) — a command in `/usr/bin`,
+  `~/.local/bin` or beside its own config stays quiet; a startup file a
+  script writes (`~/.zshenv`, `~/.config/fish/conf.d`, `~/.config/hypr/*.conf`,
+  a `~/.local/bin/` wrapper named for `sudo`/`ssh`/`git`/...); and a command
+  that keeps something running (`loginctl enable-linger`, `systemd-run --user
+  --on-calendar`, `at`, `chattr +i`, `git config --global core.hooksPath` or
+  `credential.helper`, a `sudo`/`ssh` alias, `export LD_PRELOAD=`, a `PATH`
+  rooted in a temp directory, `useradd -o -u 0`). Likely credential
+  exfiltration now also covers a credential store or home file given to an
+  upload flag (`curl -T`/`-F @`/`--data-binary @`, `wget --post-file=`), an
+  archive of a home path piped to a sender, the environment or machine
+  identity (`env`, `id`, `$(hostname)`) put into a request, DNS exfiltration
+  (`dig "$(...).host"`), and the clipboard read into a sender; and a
+  credential store (`.gnupg`, `.ssh`, a browser profile, `.password-store`,
+  `*.kdbx`, shell history) handed to an archiver or copier (`tar`, `cp`,
+  `scp`, `base64`, ...) is a credential-file finding. Destructive commands
+  also cover `rm -rf "$VAR"/*` where `VAR` is set nowhere in the file or only
+  from a command substitution and nothing guards it (no `set -u`, no
+  `${VAR:?}`, and not a build directory such as `$pkgdir`/`$srcdir` or a
+  `mktemp` path), a redirection onto a whole block device, and `parted
+  mklabel`. Identifier patterns respect word
   boundaries, so `retrieval(` and `model.eval()` do not match `eval(`. Making a Chromium-family sandbox
   helper setuid root (`chmod 4755` or `chown root` of `chrome-sandbox`,
   `msedge-sandbox`, `opera_sandbox`, ...), which every Chromium and Electron
@@ -1047,7 +1088,10 @@ review it in full every time.
   (`F=curl` … `$F … | $S`) is read as what it is. These rules read text,
   not meaning: a command assembled any other way is left to the AI
   review. A file a reviewed script runs or reads in (`sh ./data/x.png`,
-  `. ./lib`, `python3 tool.py`) that Guardian could only hash makes the
+  `. ./lib`, `python3 tool.py`, `lua x`, `node x`, a make `include`, a
+  `package.json` `"scripts"` command, a `sh -c "$(cat x)"`, a `.
+  "$(dirname "$0")/x"` sibling, or an archive read in with `tar xf`/`unzip`)
+  that Guardian could only hash makes the
   review incomplete: it runs, and nobody read it. A prose file a reviewed
   line runs (`sh ./README`) is checked by the command rules after all, even
   though prose is otherwise exempt. Two further checks read **every** text
