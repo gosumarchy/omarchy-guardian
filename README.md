@@ -1545,10 +1545,11 @@ bash tests/ai-eval/run.sh                 # or a filter: run.sh aur/block
 
 Each case is reviewed three times (`RUNS=N` changes that) and gets a line
 with its pass rate; the run ends with the rates of the block and the clear
-cases and exits non-zero when any case passed less than every run. The
-theme, plugin and upgrade classes have clear cases only so far, and no case
-yet attacks the reviewer itself (text addressed to it, hidden characters,
-payloads split over files or versions): those are still to be written.
+cases and exits non-zero when any case passed less than every run. Some
+block cases attack the reviewer itself: text addressed to it in a comment
+or a README (with and without a harmful action beside it), an instruction
+in invisible characters, a command put together from two files, and an
+upgrade that switches on a file the approved version already had.
 Every run starts with an empty review memory, so no verdict comes from the
 cache. The pacman cases use the system config's model, the AUR, theme, plugin, upgrade and system
 cases the user config's. A system case is judged by the AI's own medium or

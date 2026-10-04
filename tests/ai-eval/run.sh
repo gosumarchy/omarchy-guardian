@@ -199,7 +199,9 @@ review() {
     mkdir -p "$dir/state"
     # Blocks are expected here; GUARDIAN_EVAL_NOTIFY=1 shows them anyway.
     [[ -n ${GUARDIAN_EVAL_NOTIFY:-} ]] || export OMARCHY_GUARDIAN_NO_NOTIFY=1
-    export XDG_STATE_HOME=$dir/state GUARDIAN
+    # Reports of the expected blocks stay with the run, out of the real
+    # reports directory and the bar.
+    export XDG_STATE_HOME=$dir/state XDG_CACHE_HOME=$dir/cache GUARDIAN
     case $kind in
     scriptlet | payload)
         local archive=$dir/$name-1-1-x86_64.pkg.tar.zst

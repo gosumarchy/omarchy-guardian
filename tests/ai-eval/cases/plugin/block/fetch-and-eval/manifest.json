@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "example-quotes",
+  "name": "Example Quotes",
+  "version": "1.0.0",
+  "author": "Example Author",
+  "license": "MIT",
+  "description": "A quote of the day in the bar.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Widget.qml" },
+  "barWidget": {
+    "displayName": "Clock",
+    "description": "Shows the time, and the date on hover.",
+    "category": "System",
+    "allowMultiple": true,
+    "defaultSection": "center",
+    "defaults": { "showSeconds": false },
+    "schema": [
+      { "key": "showSeconds", "type": "boolean", "label": "Show seconds", "defaultValue": false }
+    ]
+  }
+}
