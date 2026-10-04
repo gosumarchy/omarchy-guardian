@@ -2913,6 +2913,114 @@ mod tests {
     }
 
     #[test]
+    fn only_the_service_a_process_is_in_vouches_for_it() {
+        use super::net::{Starter, started_by_packaged_unit, starter};
+        let user = "/user.slice/user-1000.slice/user@1000.service";
+        for (cgroup, expected) in [
+            (
+                "/system.slice/sshd.service".to_string(),
+                Some(Starter::System("sshd.service")),
+            ),
+            (
+                "/system.slice/system-getty.slice/getty@tty1.service".into(),
+                Some(Starter::System("getty@tty1.service")),
+            ),
+            // Below a system service the groups are that service's.
+            (
+                "/system.slice/docker.service/workers".into(),
+                Some(Starter::System("docker.service")),
+            ),
+            (
+                format!("{user}/app.slice/mpd.service"),
+                Some(Starter::User("mpd.service")),
+            ),
+            (
+                format!("{user}/session.slice/wayland-wm@hyprland.desktop.service"),
+                Some(Starter::User("wayland-wm@hyprland.desktop.service")),
+            ),
+            // An app or terminal the desktop started, and whatever its
+            // user makes below one.
+            (
+                format!(
+                    "{user}/app.slice/app-graphical.slice/app-Hyprland-xdg\\x2dterminal\\x2dexec-3dbb5f0d.scope"
+                ),
+                None,
+            ),
+            (format!("{user}/app.slice/run-u55.scope/mpd.service"), None),
+            (format!("{user}/app.slice/odd/mpd.service"), None),
+            // The managers' own groups and a login session.
+            (format!("{user}/init.scope"), None),
+            (user.to_string(), None),
+            ("/user.slice/user-1000.slice/session-2.scope".into(), None),
+            ("/init.scope".into(), None),
+            (String::new(), None),
+        ] {
+            assert_eq!(starter(&cgroup), expected, "{cgroup}");
+        }
+
+        let (dir, index) = system(
+            "live-starter",
+            &[
+                ("usr/bin/mpd", "mpd"),
+                ("usr/bin/nginx", "nginx"),
+                ("usr/bin/crond", "crond"),
+                (
+                    "usr/lib/systemd/system/user@.service",
+                    "[Service]\nExecStart=/usr/lib/systemd/systemd --user\n",
+                ),
+                (
+                    "usr/lib/systemd/system/nginx.service",
+                    "[Service]\nExecStart=/usr/bin/nginx\n",
+                ),
+                (
+                    "usr/lib/systemd/system/cronie.service",
+                    "[Service]\nExecStart=/usr/bin/crond -n\n",
+                ),
+                (
+                    "usr/lib/systemd/user/mpd.service",
+                    "[Service]\nExecStart=/usr/bin/mpd --systemd\n",
+                ),
+            ],
+        );
+        let scope = Scope {
+            root: dir.path(),
+            home: None,
+            index: &index,
+            origin: Origin::System,
+        };
+        let vouched = |exe: &str, cgroup: &str| {
+            started_by_packaged_unit(
+                &scope,
+                &super::Process {
+                    exe: exe.to_string(),
+                    cgroup: cgroup.to_string(),
+                    ..Default::default()
+                },
+            )
+        };
+        let app = format!("{user}/app.slice/app-Hyprland-kitty-77.scope");
+        // The user manager's packaged template vouches for nothing that
+        // runs in a session, and a group named like a unit below a scope
+        // is the user's own making.
+        assert!(!vouched("/usr/bin/nginx", &app));
+        assert!(!vouched("/usr/bin/mpd", &format!("{app}/mpd.service")));
+        assert!(!vouched("/usr/bin/nginx", &format!("{user}/init.scope")));
+        assert!(vouched("/usr/bin/nginx", "/system.slice/nginx.service"));
+        assert!(vouched(
+            "/usr/bin/mpd",
+            "/system.slice/nginx.service/workers"
+        ));
+        // A user's unit must name the program, in its own group or below.
+        let mpd = format!("{user}/app.slice/mpd.service");
+        assert!(vouched("/usr/bin/mpd", &mpd));
+        assert!(vouched("/usr/bin/mpd", &format!("{mpd}/sub")));
+        assert!(!vouched("/usr/bin/nginx", &mpd));
+        // What cron runs for a user is in cron's group, and is not cron.
+        assert!(vouched("/usr/bin/crond", "/system.slice/cronie.service"));
+        assert!(!vouched("/usr/bin/nginx", "/system.slice/cronie.service"));
+    }
+
+    #[test]
     fn a_listening_socket_no_process_holds_is_a_finding_for_root() {
         let (dir, index) = listening_system();
         let root = dir.path();
