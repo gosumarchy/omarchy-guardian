@@ -42,6 +42,7 @@ mod notify;
 mod osv;
 mod pacman;
 mod payload;
+mod permit;
 mod report;
 mod review;
 mod rules;
