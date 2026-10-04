@@ -796,8 +796,13 @@ impl Paths {
         self.shell_startup
             .iter()
             .find(|file| {
-                fs::read_to_string(file)
-                    .is_ok_and(|text| shellscan::overrides_makepkg(&text, helper))
+                fs::read_to_string(file).is_ok_and(|text| {
+                    shellscan::overrides_makepkg(
+                        &text,
+                        helper,
+                        &self.makepkg_gate.to_string_lossy(),
+                    )
+                })
             })
             .map(PathBuf::as_path)
     }
