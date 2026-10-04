@@ -29,36 +29,54 @@ const SYSTEM_UNITS: &[&str] = &[
     "omarchy-guardian-sweep-collect.timer",
 ];
 
+/// Why an override root found has no hash.
+const NOT_READ: &str =
+    "there, and not read: too large, not a regular file, or closed to its account";
+
 /// Where systemd reads user units from besides the package's own
-/// directory, relative to the home.
+/// directory, relative to the home: every directory of its search path
+/// (`systemd-analyze --user unit-paths`), all of which but the late
+/// generators' outrank the package's, and the data directory Flatpak adds
+/// to the user manager's `XDG_DATA_DIRS`.
 const HOME_DIRECTORIES: &[&str] = &[
     ".config/systemd/user",
     ".config/systemd/user.control",
+    ".config/systemd/user.attached",
     ".local/share/systemd/user",
+    ".local/share/flatpak/exports/share/systemd/user",
 ];
 /// The same below `/run/user/<uid>`.
 const RUNTIME_DIRECTORIES: &[&str] = &[
     "systemd/user",
     "systemd/user.control",
+    "systemd/user.attached",
     "systemd/transient",
     "systemd/generator",
     "systemd/generator.early",
     "systemd/generator.late",
 ];
-/// The same for every user, relative to the root.
+/// The same for every user, relative to the root. The two under `share`
+/// are the system's `XDG_DATA_DIRS`: systemd looks there before
+/// `/usr/lib/systemd/user`, so a unit of the same name there replaces the
+/// package's.
 const SHARED_USER_DIRECTORIES: &[&str] = &[
     "etc/systemd/user",
     "etc/xdg/systemd/user",
     "run/systemd/user",
+    "usr/local/share/systemd/user",
+    "usr/share/systemd/user",
+    "var/lib/flatpak/exports/share/systemd/user",
     "usr/local/lib/systemd/user",
 ];
-/// Where systemd reads system units from besides the package's own.
+/// Where systemd reads system units from besides the package's own
+/// (`systemd-analyze --system unit-paths`).
 const SYSTEM_DIRECTORIES: &[&str] = &[
     "etc/systemd/system",
     "etc/systemd/system.control",
     "etc/systemd/system.attached",
     "run/systemd/system",
     "run/systemd/system.control",
+    "run/systemd/system.attached",
     "run/systemd/transient",
     "run/systemd/generator",
     "run/systemd/generator.early",
@@ -261,11 +279,35 @@ pub fn mark(item: &mut Item) {
     }
 }
 
+/// Whether there is anything at `path`, as account `view` could tell
+/// itself: it may enter the directory the name is in.
+fn is_there(scope: &Scope<'_>, path: &str, view: View) -> bool {
+    let Some((directory, name)) = path.rsplit_once('/') else {
+        return false;
+    };
+    match read::seen(scope.root, directory, view).map(|seen| seen.what) {
+        Some(read::Public::Directory(handle)) => {
+            fs::symlink_metadata(format!("/proc/self/fd/{}/{name}", handle.as_raw_fd())).is_ok()
+        }
+        _ => false,
+    }
+}
+
 /// The overrides of the user sweep's units in the home of account `uid`
 /// (`home`, relative to the root) and its runtime directory, as the root
 /// collector may report them: looked at as that account could itself, with
 /// no link followed, and with the content left where it is. So the finding
 /// does not rest on that account's own sweep being honest.
+///
+/// What is there and cannot be hashed (a drop-in padded past the read
+/// limit, a file closed to its own account, something that is no file) is
+/// reported all the same, without a hash: root's report is for the case
+/// where the account's own sweep was turned away, and dropping what could
+/// not be read would be the way to turn root away too. That something is
+/// there tells the account nothing it cannot see: the path is one Guardian
+/// chose, not one a user named, it lies in the account's own home or
+/// runtime directory, and it is looked for only through directories the
+/// account may enter itself.
 pub fn of_account(scope: &Scope<'_>, home: &str, uid: u32) -> Vec<Item> {
     let view = View::Owner(uid);
     let list = |directory: &str| -> Vec<String> {
@@ -298,10 +340,14 @@ pub fn of_account(scope: &Scope<'_>, home: &str, uid: u32) -> Vec<Item> {
     paths
         .into_iter()
         .filter_map(|path| {
-            let (sha256, body) = match read::look_as(scope.root, &path, view)? {
-                Found::File { sha256, .. } => (Some(sha256), Body::Binary(WITHHELD)),
-                Found::Link(target) => (None, Body::Link(target)),
-                Found::Other | Found::Unreadable(_) => return None,
+            let (sha256, body) = match read::look_as(scope.root, &path, view) {
+                Some(Found::File { sha256, .. }) => (Some(sha256), Body::Binary(WITHHELD)),
+                Some(Found::Link(target)) => (None, Body::Link(target)),
+                Some(Found::Other | Found::Unreadable(_)) => {
+                    (None, Body::Unreadable(NOT_READ.into()))
+                }
+                None if is_there(scope, &path, view) => (None, Body::Unreadable(NOT_READ.into())),
+                None => return None,
             };
             let mut item = Item {
                 origin: Origin::Root,
@@ -347,6 +393,15 @@ mod tests {
             "home/u/.local/share/systemd/user/omarchy-guardian-sweep.service",
             "run/user/1000/systemd/transient/omarchy-guardian-sweep.service",
             "etc/systemd/user/omarchy-guardian-sweep.timer",
+            // Ahead of the package's own directory on systemd's path.
+            "usr/share/systemd/user/omarchy-guardian-sweep.service",
+            "usr/local/share/systemd/user/omarchy-guardian-sweep.timer",
+            "usr/share/systemd/user/service.d/x.conf",
+            "var/lib/flatpak/exports/share/systemd/user/omarchy-guardian-sweep.service",
+            "home/u/.local/share/flatpak/exports/share/systemd/user/omarchy-guardian-sweep.service",
+            "home/u/.config/systemd/user.attached/omarchy-guardian-sweep.service",
+            "run/user/1000/systemd/user.attached/omarchy-guardian-sweep.service.d/x.conf",
+            "run/systemd/system.attached/omarchy-guardian-sweep-collect.service",
             "etc/systemd/system/omarchy-guardian-sweep-collect.service.d/x.conf",
             "etc/systemd/system/omarchy-guardian-sweep-collect.timer",
             "usr/lib/systemd/user/omarchy-guardian-sweep.service.d/x.conf",
@@ -364,6 +419,7 @@ mod tests {
             "home/u/.config/systemd/user/omarchy-guardian-sweep.service.d/sub/x.conf",
             "home/v/.config/systemd/user/omarchy-guardian-sweep.service",
             "etc/systemd/system/omarchy-guardian-sweep.service",
+            "usr/share/systemd/user/other.service",
         ] {
             assert!(!is_override(home, path), "{path}");
         }
@@ -445,6 +501,87 @@ mod tests {
         // nothing about it.
         if uid != 0 {
             assert!(of_account(&as_root, "home/u", uid + 1).len() <= 2);
+            fs::set_permissions(root.join("home/u"), fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(of_account(&as_root, "home/u", uid + 1).is_empty());
+        }
+    }
+    #[test]
+    fn a_unit_where_systemd_looks_before_the_packages_directory_is_an_override() {
+        let dir = TempDir::new("sweep-own-ahead");
+        let root = dir.path();
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let scope = Scope {
+            root,
+            home: Some("home/u"),
+            index: &index,
+            origin: Origin::System,
+        };
+        let ahead = "usr/share/systemd/user/omarchy-guardian-sweep.service";
+        fs::create_dir_all(root.join(ahead).parent().unwrap()).unwrap();
+        fs::write(root.join(ahead), "[Service]\nExecStart=/usr/bin/true\n").unwrap();
+        assert_eq!(standing(root, None), [ahead]);
+        let replaced = collect(&scope);
+        assert!(replaced.items.iter().any(|item| {
+            item.path == ahead
+                && item
+                    .alerts
+                    .iter()
+                    .any(|(rule, _)| *rule == RuleId::GuardianOverride)
+        }));
+    }
+
+    #[test]
+    fn root_reports_an_override_it_cannot_hash_by_its_path() {
+        let dir = TempDir::new("sweep-own-unread");
+        let root = dir.path();
+        let uid = fs::metadata(root).unwrap().uid();
+        let drop_ins = root.join("home/u/.config/systemd/user/omarchy-guardian-sweep.service.d");
+        fs::create_dir_all(&drop_ins).unwrap();
+        fs::write(drop_ins.join("read.conf"), "[Service]\n").unwrap();
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let as_root = Scope {
+            root,
+            home: Some("root"),
+            index: &index,
+            origin: Origin::Root,
+        };
+        // What is there and cannot be hashed is reported too, without a
+        // hash: a drop-in closed to its own account, one that is no file,
+        // and one padded past the read limit.
+        fs::write(drop_ins.join("closed.conf"), "[Service]\nExecStart=\n").unwrap();
+        fs::set_permissions(
+            drop_ins.join("closed.conf"),
+            fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        fs::create_dir(drop_ins.join("odd.conf")).unwrap();
+        let padded = fs::File::create(drop_ins.join("padded.conf")).unwrap();
+        padded
+            .set_len(crate::scan::MAX_HASHED_FILE_SIZE + 1)
+            .unwrap();
+        let reported = of_account(&as_root, "home/u", uid);
+        let unread: Vec<&str> = reported
+            .iter()
+            .filter(|item| matches!(item.body, Body::Unreadable(_)))
+            .map(|item| {
+                assert_eq!(item.sha256, None);
+                assert!(
+                    item.alerts
+                        .iter()
+                        .any(|(rule, _)| *rule == RuleId::GuardianOverride)
+                );
+                item.path.rsplit('/').next().unwrap()
+            })
+            .collect();
+        // Root reads a closed file anyway: there is none to play as root.
+        if uid == 0 {
+            assert_eq!(unread, ["odd.conf", "padded.conf"]);
+        } else {
+            assert_eq!(unread, ["closed.conf", "odd.conf", "padded.conf"]);
+        }
+        assert_eq!(reported.len(), 4);
+        // An account that may not enter the directory is told nothing.
+        if uid != 0 {
             fs::set_permissions(root.join("home/u"), fs::Permissions::from_mode(0o700)).unwrap();
             assert!(of_account(&as_root, "home/u", uid + 1).is_empty());
         }

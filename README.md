@@ -346,13 +346,19 @@ nothing to compare with and only lists them.
 your home can replace it or change any line of it: a drop-in in
 `~/.config/systemd/user/omarchy-guardian-sweep.service.d/` that sets
 `HOME=`, `XDG_STATE_HOME=` or `ExecStart=`, a unit of the same name earlier
-on systemd's search path, a mask, or the same in
-`~/.config/systemd/user.control/`, `~/.local/share/systemd/user`,
-`/run/user/<uid>/systemd`, `/etc/systemd/user` and for the root checks'
-units in the system's unit directories. Any of these (also a drop-in for
-every `omarchy-…` unit or for every service) is a high finding of its own
-that cannot be allowed. The root checks report the ones in your home too,
-so the finding does not rest on a sweep the override may have redirected.
+on systemd's search path, a mask, or the same in any other directory of
+that path (`systemd-analyze --user unit-paths`): `user.control` and
+`user.attached` under `~/.config/systemd`, `~/.local/share/systemd/user`,
+`/run/user/<uid>/systemd`, `/etc/systemd/user`, `/etc/xdg/systemd/user`,
+`/usr/share/systemd/user` and `/usr/local/share/systemd/user` (both come
+before `/usr/lib/systemd/user`), Flatpak's exported data directories, and
+for the root checks' units the system's unit directories. Any of these
+(also a drop-in for every `omarchy-…` unit or for every service) is a high
+finding of its own that cannot be allowed. The root checks report the ones
+in your home too, so the finding does not rest on a sweep the override may
+have redirected; one that root cannot hash (padded past the read limit,
+closed to your own account, not a regular file) is reported by its path
+alone.
 The bar looks for the same files every time it is asked (all but drop-ins
 beside the package's own units in `/usr/lib/systemd`, which only the sweep
 can tell from one a repository package ships), shows the sweep as partly

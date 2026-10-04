@@ -210,9 +210,13 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
     }
     path::mark(scope, &search, &mut collection.items);
     for item in &mut collection.items {
-        // The package's own directory may hold a drop-in a repository
-        // package ships for every unit; nothing else there is spared.
-        let shipped = item.tier == Tier::Vendor && item.path.starts_with("usr/lib/systemd/");
+        // The package's own directory, and the one for shared data, may
+        // hold a drop-in a repository package ships for every unit;
+        // nothing else there is spared.
+        let shipped = item.tier == Tier::Vendor
+            && ["usr/lib/systemd/", "usr/share/systemd/"]
+                .iter()
+                .any(|packaged| item.path.starts_with(packaged));
         if own::is_override(scope.home, &item.path) && !shipped {
             own::mark(item);
         }
