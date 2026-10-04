@@ -331,7 +331,9 @@ and a password that works, are high findings), every member of a group
 that amounts to root (`wheel`, `sudo`, `root`, `docker`, `lxd`,
 `incus-admin`, `libvirt`, `disk`, `shadow`), every key in your
 `~/.ssh/authorized_keys` and `authorized_keys2` and in the files
-`AuthorizedKeysFile` in the server's configuration names (shown by type,
+`AuthorizedKeysFile` in the server's configuration names, in your home or
+anywhere else (`/etc/ssh/keys/%u`, with `%u`, `%U`, `%h` and `%%` written
+out for the account; shown by type,
 SHA-256 fingerprint and comment, as `ssh-keygen -l` prints them, never the
 key), and every certificate authority added in
 `/etc/ca-certificates/trust-source/anchors` or

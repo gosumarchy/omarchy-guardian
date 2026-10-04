@@ -358,13 +358,42 @@ pub fn keys(text: &str) -> (Vec<Key>, usize) {
     (found, odd)
 }
 
-/// The key files of an account, relative to its home: SSH's defaults and
-/// what `AuthorizedKeysFile` in the server's configuration names (`%h` and
-/// a relative path are the home, `%u` the account).
-fn key_files(config: &[String], account: &str) -> Vec<String> {
+/// An `AuthorizedKeysFile` pattern written out for `account`, as the
+/// server does it: `%u` is the account's name, `%U` its user id, `%h` its
+/// home and `%%` a percent sign. `None` for a token the server does not
+/// know there.
+fn written_out(pattern: &str, account: &Account) -> Option<String> {
+    let mut out = String::new();
+    let mut characters = pattern.chars();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            out.push(character);
+            continue;
+        }
+        match characters.next()? {
+            'u' => out.push_str(&account.name),
+            'U' => out.push_str(&account.uid.to_string()),
+            'h' => {
+                out.push('/');
+                out.push_str(&account.home);
+            }
+            '%' => out.push('%'),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// The key files of an account, relative to the root: SSH's defaults in
+/// its home and what `AuthorizedKeysFile` in the server's configuration
+/// names. A relative name is in the home; one written in full
+/// (`/etc/ssh/keys/%u`) is where it says, and holds the keys that open the
+/// account all the same.
+fn key_files(config: &[String], account: &Account) -> Vec<String> {
+    let home = &account.home;
     let mut files = vec![
-        ".ssh/authorized_keys".to_string(),
-        ".ssh/authorized_keys2".to_string(),
+        format!("{home}/.ssh/authorized_keys"),
+        format!("{home}/.ssh/authorized_keys2"),
     ];
     for text in config {
         for line in text.lines() {
@@ -375,20 +404,17 @@ fn key_files(config: &[String], account: &str) -> Vec<String> {
             {
                 continue;
             }
-            for file in words {
-                let file = file.replace("%u", account);
-                // A file outside the home is an item of the SSH
-                // configuration that names it, not this account's.
-                let relative = match file.strip_prefix("%h/") {
-                    Some(relative) => relative.to_string(),
-                    None if file.starts_with('/') || file == "none" => continue,
-                    None => file,
+            for pattern in words.filter(|pattern| *pattern != "none") {
+                let Some(file) = written_out(pattern.trim_matches('"'), account) else {
+                    continue;
                 };
-                let plain = relative
-                    .split('/')
-                    .all(|part| !matches!(part, "" | "." | ".."));
-                if plain && !relative.contains('%') && !files.contains(&relative) {
-                    files.push(relative);
+                let file = match file.strip_prefix('/') {
+                    Some(absolute) => absolute.to_string(),
+                    None => format!("{home}/{file}"),
+                };
+                let plain = file.split('/').all(|part| !matches!(part, "" | "." | ".."));
+                if plain && !files.contains(&file) {
+                    files.push(file);
                 }
             }
         }
@@ -439,9 +465,8 @@ fn key_items(
 ) -> Vec<Item> {
     let mut items = Vec::new();
     let mut all: Vec<String> = Vec::new();
-    for file in files {
-        let path = format!("{}/{file}", account.home);
-        let Some(Found::File { head, size, .. }) = look(&path) else {
+    for path in files {
+        let Some(Found::File { head, size, .. }) = look(path) else {
             continue;
         };
         if usize::try_from(size).unwrap_or(usize::MAX) > MAX_KEY_FILE {
@@ -529,15 +554,28 @@ pub fn items(scope: &Scope<'_>) -> Vec<Item> {
                 || home.rsplit('/').next().unwrap_or(home).to_string(),
                 |account| account.name.clone(),
             );
+        // The user id is what `%U` in the server's configuration stands
+        // for: the account's, or whose the home is.
+        let uid = passwd
+            .iter()
+            .find(|account| account.home == home)
+            .map(|account| account.uid)
+            .or_else(|| {
+                use std::os::unix::fs::MetadataExt as _;
+                fs::metadata(scope.root.join(home))
+                    .ok()
+                    .map(|metadata| metadata.uid())
+            })
+            .unwrap_or(0);
         let own = Account {
             name,
             password: String::new(),
-            uid: 0,
+            uid,
             gid: 0,
             home: home.to_string(),
             shell: String::new(),
         };
-        let files = key_files(&sshd_configuration(scope), &own.name);
+        let files = key_files(&sshd_configuration(scope), &own);
         // A user's sweep reads its own home; the root collector's home is
         // root's.
         let origin = if scope.origin == Origin::System {
@@ -556,9 +594,27 @@ pub fn items(scope: &Scope<'_>) -> Vec<Item> {
 /// The keys of `account`, as the root collector may report them: read as
 /// that account could read them itself, no link followed (a key file that
 /// is a link to a file of root's shows nothing).
+///
+/// A key file the server's configuration puts outside the home
+/// (`AuthorizedKeysFile /etc/ssh/keys/%u`) is read as root reads it where
+/// the whole way to it is root's alone: root wrote the configuration that
+/// names the path, the account's name and user id in it come from
+/// `/etc/passwd`, and nobody else can put another file there. What comes
+/// out of it is what the keys of a home give: for the account the results
+/// go to, the fingerprints of the keys that open that very account; for
+/// any other, how many and a hash of the list. Where somebody else may
+/// write a directory on the way, the file is whatever they put there, and
+/// it is read as the account could read it.
 pub fn keys_of(scope: &Scope<'_>, account: &Account, detail: Detail) -> Vec<Item> {
-    let files = key_files(&sshd_configuration(scope), &account.name);
+    let files = key_files(&sshd_configuration(scope), account);
+    let home = format!("{}/", account.home);
     key_items(Origin::Root, account, &files, detail, &|path| {
+        if !path.starts_with(&home)
+            && let Some(seen) = read::seen(scope.root, path, View::Pinned)
+            && seen.kept
+        {
+            return Some(read::look_pinned(seen));
+        }
         read::look_as(scope.root, path, View::Owner(account.uid))
     })
 }
@@ -674,7 +730,7 @@ mod tests {
                 head: text.clone().into_bytes(),
             })
         };
-        let files = key_files(&[], "u");
+        let files = key_files(&[], &account);
         let items = key_items(Origin::System, &account, &files, Detail::Keys, &look);
         assert_eq!(items.len(), 3);
         assert!(items[0].path.starts_with("home/u/.ssh/authorized_keys#"));
@@ -704,13 +760,106 @@ mod tests {
             "# AuthorizedKeysFile no\nAuthorizedKeysFile .ssh/authorized_keys %h/.ssh/extra /etc/ssh/keys/%u ../../etc/shadow none\n"
                 .to_string(),
         ];
+        let account = Account {
+            name: "u".into(),
+            password: "x".into(),
+            uid: 1000,
+            gid: 1000,
+            home: "home/u".into(),
+            shell: "/bin/zsh".into(),
+        };
+        // A file written in full is where it says, for this account.
         assert_eq!(
-            key_files(&config, "u"),
+            key_files(&config, &account),
             [
-                ".ssh/authorized_keys",
-                ".ssh/authorized_keys2",
-                ".ssh/extra"
+                "home/u/.ssh/authorized_keys",
+                "home/u/.ssh/authorized_keys2",
+                "home/u/.ssh/extra",
+                "etc/ssh/keys/u",
             ]
         );
+        let tokens = vec![
+            "AuthorizedKeysFile /var/keys/%U/%%/%u %h/.keys/%u /etc/keys/%x /etc/keys/%"
+                .to_string(),
+        ];
+        assert_eq!(
+            key_files(&tokens, &account)[2..],
+            ["var/keys/1000/%/u", "home/u/.keys/u"]
+        );
+    }
+
+    #[test]
+    fn keys_the_server_keeps_outside_the_home_are_read_for_their_account() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        use crate::sweep::collect::Scope;
+        use crate::sweep::index::PackageIndex;
+        use crate::test_support::TempDir;
+        let dir = TempDir::new("sweep-keys-elsewhere");
+        let root = dir.path();
+        let uid = std::fs::metadata(root).unwrap().uid();
+        // Root reads every file: there is no closed one to play.
+        if uid == 0 {
+            return;
+        }
+        let write = |path: &str, text: &str| {
+            std::fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            std::fs::write(root.join(path), text).unwrap();
+        };
+        let mode = |path: &str, mode: u32| {
+            std::fs::set_permissions(root.join(path), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        };
+        let blob = "AAAAC3NzaC1lZDI1NTE5AAAAIGuardianTestKeyMaterial0123456789abcdefghi";
+        write(
+            "etc/ssh/sshd_config",
+            "AuthorizedKeysFile /etc/ssh/keys/%u .ssh/authorized_keys\n",
+        );
+        write("etc/ssh/keys/v", &format!("ssh-ed25519 {blob} elsewhere\n"));
+        mode("etc/ssh/keys/v", 0o600);
+        write("etc/passwd", "v:x:1001:1001::/home/v:/bin/bash\n");
+        std::fs::create_dir_all(root.join("home/v")).unwrap();
+        let index = PackageIndex::with_foreign(std::collections::HashSet::new());
+        let as_root = Scope {
+            root,
+            home: Some("root"),
+            index: &index,
+            origin: Origin::Root,
+        };
+        // Another account than the one that owns the fixture: it could not
+        // read the file itself, and the way to it is the root owner's.
+        let account = Account {
+            name: "v".into(),
+            password: "x".into(),
+            uid: uid + 1,
+            gid: uid + 1,
+            home: "home/v".into(),
+            shell: "/bin/bash".into(),
+        };
+        let keys = super::keys_of(&as_root, &account, Detail::Keys);
+        assert_eq!(keys.len(), 1, "{keys:?}");
+        assert!(keys[0].path.starts_with("etc/ssh/keys/v#"));
+        assert!(keys[0].notes[0].contains("may log in as v"));
+        assert!(!format!("{keys:?}").contains(blob));
+        let counted = super::keys_of(&as_root, &account, Detail::Count);
+        assert_eq!(counted.len(), 1);
+        assert!(counted[0].notes[0].starts_with("1 key(s) may log in as v"));
+        // The user's own sweep finds the same file from its home.
+        let own = super::items(&Scope {
+            root,
+            home: Some("home/v"),
+            index: &index,
+            origin: Origin::System,
+        });
+        assert!(
+            own.iter()
+                .any(|item| item.path.starts_with("etc/ssh/keys/v#"))
+        );
+        // Where somebody else may write the directory, the file is whatever
+        // they put there: looked at as the account could, which here is
+        // not at all.
+        mode("etc/ssh/keys", 0o777);
+        assert!(super::keys_of(&as_root, &account, Detail::Keys).is_empty());
+        mode("etc/ssh/keys", 0o755);
     }
 }
