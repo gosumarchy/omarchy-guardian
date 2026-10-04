@@ -110,6 +110,9 @@ const PROTECTED: &[(&str, Owner)] = &[
     ("usr/bin/omarchy-guardian", Owner::Guardian),
     ("usr/lib/omarchy-guardian/", Owner::Guardian),
     ("usr/share/omarchy-guardian/", Owner::Guardian),
+    // What only root's halves write: the user's permits and the sweep's
+    // allow list. A file a package put there would be root's as well.
+    ("var/lib/omarchy-guardian/", Owner::Nobody),
     ("usr/bin/opencode", Owner::Packages(&["opencode"])),
     ("usr/local/bin/opencode", Owner::Packages(&["opencode"])),
     ("usr/bin/claude", Owner::Packages(&["claude-code"])),
@@ -156,6 +159,9 @@ const PROTECTED: &[(&str, Owner)] = &[
     ("usr/bin/cut", Owner::Official),
     // Reads what pacman recorded of the installed packages' links.
     ("usr/bin/gzip", Owner::Official),
+    // Write and read the audit trail.
+    ("usr/bin/logger", Owner::Official),
+    ("usr/bin/journalctl", Owner::Official),
 ];
 
 /// Top-level directories no package installs files into: runtime and
@@ -747,21 +753,24 @@ impl Identity {
 /// What an archive was when its review began: the file its path named and
 /// the SHA-256 of its bytes. The AI review takes minutes, and an archive
 /// given to `pacman -U` may lie where its owner can rewrite it in place
-/// meanwhile; `verify` is asked again once the review is over.
+/// meanwhile; `verify` is asked again once the review is over. The digest
+/// is also what the audit trail records and a permit is bound to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fingerprint {
     path: PathBuf,
     identity: Identity,
-    /// Not taken of a file only root can write (see `root_alone`).
-    digest: Option<Digest>,
+    digest: Digest,
+    /// Whether `verify` hashes the bytes again: not for a file only root
+    /// can write (see `root_alone`).
+    rehash: bool,
 }
 
 /// Whether only root can write the file at `path` or put another in its
 /// place: it and every directory above it are root's, and not writable by
 /// a group or by everyone. That is pacman's own cache, where a system
 /// upgrade keeps gigabytes of archives: whoever rewrites one of those is
-/// root already, so they are told apart by the file and its change time
-/// alone, without hashing each twice.
+/// root already, so once hashed they are told apart by the file and its
+/// change time alone, without hashing each twice.
 fn root_alone(path: &Path, file: &Metadata) -> bool {
     let roots = |metadata: &Metadata| metadata.uid() == 0 && metadata.mode() & 0o022 == 0;
     roots(file)
@@ -773,6 +782,24 @@ fn root_alone(path: &Path, file: &Metadata) -> bool {
 }
 
 impl Fingerprint {
+    /// The SHA-256 of the archive's bytes as they were reviewed.
+    pub const fn digest(&self) -> &Digest {
+        &self.digest
+    }
+
+    /// The archive by its file name without `.pkg.tar.*`: the package's
+    /// name, version, build and architecture.
+    pub fn name(&self) -> String {
+        let name = self
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        name.split_once(".pkg.tar")
+            .map_or(name.as_str(), |(stem, _)| stem)
+            .to_string()
+    }
+
     /// The path must still name the same file, unchanged, holding the same
     /// bytes.
     pub fn verify(&self) -> Result<(), Error> {
@@ -792,11 +819,7 @@ impl Fingerprint {
                 metadata.is_file() && Identity::of(&metadata) == self.identity
             })
         };
-        if !same(file.metadata())
-            || self
-                .digest
-                .is_some_and(|digest| digest_of(&file).ok() != Some(digest))
-        {
+        if !same(file.metadata()) || (self.rehash && digest_of(&file).ok() != Some(self.digest)) {
             return Err(changed());
         }
         // Hashing took its time too: still that file, not written since.
@@ -1037,20 +1060,16 @@ impl Archive {
     }
 
     /// The archive as it is now, to compare with once the review is over.
-    /// Unless the file is root's alone, the whole of it is hashed, through
-    /// the descriptor it was opened with.
+    /// The whole of it is hashed, through the descriptor it was opened
+    /// with; unless the file is root's alone, it is hashed again then.
     pub fn fingerprint(&self) -> Result<Fingerprint, Error> {
-        let digest = if root_alone(&self.path, &self.file.metadata().at(&self.path)?) {
-            None
-        } else {
-            let file =
-                File::open(format!("/proc/self/fd/{}", self.file.as_raw_fd())).at(&self.path)?;
-            Some(digest_of(&file).at(&self.path)?)
-        };
+        let rehash = !root_alone(&self.path, &self.file.metadata().at(&self.path)?);
+        let file = File::open(format!("/proc/self/fd/{}", self.file.as_raw_fd())).at(&self.path)?;
         Ok(Fingerprint {
             path: self.path.clone(),
             identity: self.identity,
-            digest,
+            digest: digest_of(&file).at(&self.path)?,
+            rehash,
         })
     }
 
@@ -2123,6 +2142,25 @@ mod tests {
             .is_some()
         );
         assert!(protected_violation("usr/bin/foo", "anything", local, &[]).is_none());
+        // A permit or an allow list a package shipped would be root's file
+        // like the real ones: no package ships one, Guardian's included.
+        for package in ["evil", "omarchy-guardian"] {
+            for path in [
+                "var/lib/omarchy-guardian/permits/1000-pacman-abc",
+                "var/lib/omarchy-guardian/sweep/allowed.json",
+                "var/lib/omarchy-guardian",
+            ] {
+                assert!(
+                    protected_violation(path, package, official, &[]).is_some(),
+                    "{package} {path}"
+                );
+            }
+        }
+        // The audit trail's tools are the official packages' alone.
+        for tool in ["usr/bin/logger", "usr/bin/journalctl"] {
+            assert!(protected_violation(tool, "evil", local, &[]).is_some());
+            assert!(protected_violation(tool, "util-linux", official, &[]).is_none());
+        }
         // The gate itself comes from the user's own build or an official
         // repository, not from whichever repository offers that name.
         for path in [
@@ -3225,11 +3263,13 @@ mod tests {
         let opened = Archive::open(&archive).unwrap();
         let fingerprint = opened.fingerprint().unwrap();
         assert_eq!(
-            fingerprint.digest,
-            Some(crate::sha256::Sha256::digest(&fs::read(&archive).unwrap()))
+            *fingerprint.digest(),
+            crate::sha256::Sha256::digest(&fs::read(&archive).unwrap())
         );
+        assert!(fingerprint.rehash);
+        assert_eq!(fingerprint.name(), "pkg-1-1-any");
         fingerprint.verify().unwrap();
-        // Only a file nobody but root can touch goes unhashed.
+        // Only a file nobody but root can touch is not hashed a second time.
         assert!(!super::root_alone(
             &archive,
             &fs::metadata(&archive).unwrap()
@@ -3243,7 +3283,7 @@ mod tests {
 
         // The same file, the same bytes, but not what was hashed.
         let forged = super::Fingerprint {
-            digest: Some(crate::sha256::Sha256::digest(b"something else")),
+            digest: crate::sha256::Sha256::digest(b"something else"),
             ..fingerprint.clone()
         };
         assert!(forged.verify().is_err());
