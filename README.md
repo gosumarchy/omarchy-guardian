@@ -631,7 +631,16 @@ arguments and `LD_PRELOAD` it was given), root looks only at what everyone
 may read anyway: anything else is not followed, or is listed as not looked
 at, with no hash, no kind and no word on whether it exists, so no user can
 point the collector at `/etc/shadow` or a key and learn something about it.
-That holds through chains of links. And what the collector reads, in its
+That holds through chains of links. One thing is told of a file not
+everyone may read: whether a packaged program a process runs or preloads
+is still what its package installed. The path must be one pacman's
+database holds, reached with no link on the way through directories that
+are root's alone, and the answer is that one bit, never the hash; what the
+package installed there is public anyway, and a package's configuration
+file is never reported this way. Without it, a changed program made
+unreadable (`chmod o-r`) would pass for the packaged one. A packaged file
+that lost the read access its package gives everyone is `modified` in
+itself, for root and for your own sweep. And what the collector reads, in its
 own search for set-id files too, it reaches by entering each directory as
 it opened it, so one swapped for a link while it reads is not followed.
 Old password hashes
@@ -648,7 +657,14 @@ content stays), and at the keys that may log in as them. It looks as that
 account could look itself: no link is followed, every directory on the way
 must be one the account may enter and the file one it may read, as its
 owner or as anyone, so a key file that is a link to a file of root's shows
-nothing and the account learns nothing it could not have read. Of every
+nothing and the account learns nothing it could not have read. Two things
+go past what the account could read. An override of Guardian's units that
+cannot be hashed is reported by its path, since that it is there is
+something the account can see itself. And a key file the SSH server's
+configuration keeps outside the home (`AuthorizedKeysFile
+/etc/ssh/keys/%u`) is read as root where the whole way to it is root's
+alone: root wrote the configuration that names it, and what comes back is
+what a home's key file gives. Of every
 other account with a home under `/home` only the number of keys comes back,
 with a hash of the list so that a change shows: whose keys they are is that
 account's to see, like its crontab. Root's own keys come back one by one.
