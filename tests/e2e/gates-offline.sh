@@ -298,13 +298,14 @@ pacman_gate() {
     }
 
     if ((IS_ROOT)); then
-        gate pacman some-package -U /x-1-1-any.pkg.tar.zst
-        expect "a reviewer from PATH is refused for root's pacman" 2 "$?"
-        expect_output 'the refusal names the option' '--opencode-from-path is for tests'
+        # Before the first case: every case below runs behind the mount.
         if ((${#hide[@]})) && ! (REVIEWERS=${installed[*]} "${hide[@]}" /usr/bin/true) 2>/dev/null; then
             skip "pacman gate cases as root: ${installed[*]} could be asked for a review and cannot be hidden (no mount namespace)"
             return
         fi
+        gate pacman some-package -U /x-1-1-any.pkg.tar.zst
+        expect "a reviewer from PATH is refused for root's pacman" 2 "$?"
+        expect_output 'the refusal names the option' '--opencode-from-path is for tests'
         hidden() {
             local reviewer
             for reviewer in "${installed[@]}"; do
