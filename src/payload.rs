@@ -31,7 +31,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::autorun::{
-    is_alias_of_reviewed_directory, is_auto_run_directory, is_reviewed, named_words,
+    Location, is_alias_of_reviewed_directory, is_auto_run_directory, is_reviewed, named_words,
     sweep_only_location,
 };
 use crate::config::model::SourceClass;
@@ -855,6 +855,9 @@ pub enum Replacement {
     File(Vec<u8>),
     /// A larger file that is no text, by what it is.
     Binary(&'static str),
+    /// Text of this archive over the review limit: unread, but its bytes
+    /// are the archive's.
+    TooLarge,
     /// Something that cannot be read, and why.
     Unreadable(&'static str),
 }
@@ -1096,6 +1099,25 @@ impl Archive {
     fn named_in(&self, text: &str) -> Vec<String> {
         let mut found = Vec::new();
         let mut seen = HashSet::new();
+        let links = self
+            .entries
+            .iter()
+            .any(|entry| matches!(entry.kind, Kind::Symlink(_)));
+        // A path as written, or else as the system walks it: only one
+        // with `.`, `..` or `//` in it, or in a package that ships links,
+        // can be another path than it says.
+        let shipped = |tail: &str| {
+            self.regular_at(&through_root_links(tail)).or_else(|| {
+                let indirect = links
+                    || tail
+                        .split('/')
+                        .any(|component| matches!(component, "" | "." | ".."));
+                indirect
+                    .then(|| self.walked(tail))
+                    .flatten()
+                    .and_then(|path| self.regular_at(&path))
+            })
+        };
         for word in named_words(text) {
             // The end of a sentence, or of a directory's name.
             let word = word.trim_end_matches(['.', '/']);
@@ -1105,7 +1127,7 @@ impl Archive {
                 std::iter::once(word)
                     .chain(word.match_indices('/').map(|(at, _)| &word[at + 1..]))
                     .filter(|tail| tail.contains('/'))
-                    .find_map(|tail| self.regular_at(&through_root_links(tail)))
+                    .find_map(shipped)
             } else {
                 self.regular_at(&format!("usr/bin/{word}"))
             };
@@ -1116,6 +1138,56 @@ impl Archive {
             }
         }
         found
+    }
+
+    /// `path` (relative to `/`) as the system walks it: `.` and `..` taken
+    /// out, and the usual root links (`/lib`) and the directory links this
+    /// package ships followed, so `usr/lib/../share/x` and `opt/pkg/current/x`
+    /// (with `current -> releases/1`) name the file that is run. The last
+    /// name is left as it is. `None` for a path that climbs above the root
+    /// or goes through more links than are followed.
+    fn walked(&self, path: &str) -> Option<String> {
+        let reversed =
+            |text: &str| -> Vec<String> { text.split('/').rev().map(str::to_string).collect() };
+        let mut pending = reversed(path);
+        let mut parts: Vec<String> = Vec::new();
+        let mut hops = 0;
+        while let Some(component) = pending.pop() {
+            match component.as_str() {
+                "" | "." => continue,
+                ".." => {
+                    parts.pop()?;
+                    continue;
+                }
+                name => parts.push(name.to_string()),
+            }
+            if pending.iter().all(|rest| matches!(rest.as_str(), "" | ".")) {
+                continue;
+            }
+            let here = parts.join("/");
+            let target = match self.entry(&here).map(|entry| &entry.kind) {
+                Some(Kind::Symlink(target)) => target.clone(),
+                Some(_) => continue,
+                None => {
+                    let directory = format!("{here}/");
+                    let leads = through_root_links(&directory);
+                    if leads == directory {
+                        continue;
+                    }
+                    format!("/{leads}")
+                }
+            };
+            hops += 1;
+            if hops > MAX_HOPS {
+                return None;
+            }
+            parts.pop();
+            if target.starts_with('/') {
+                parts.clear();
+            }
+            pending.extend(reversed(&target));
+        }
+        Some(parts.join("/"))
     }
 
     /// What this archive installs at `path` (no leading `/`), for a link
@@ -1151,9 +1223,7 @@ impl Archive {
         Some(
             match head.map(|head| content::classify_prefix(path, false, head)) {
                 Some(Prefix::Binary(format)) => Replacement::Binary(format.label()),
-                Some(Prefix::Text | Prefix::Undecodable) => {
-                    Replacement::Unreadable("is text over the 2 MiB review limit")
-                }
+                Some(Prefix::Text | Prefix::Undecodable) => Replacement::TooLarge,
                 None => Replacement::Unreadable("could not be read from the archive"),
             },
         )
@@ -1446,12 +1516,14 @@ pub struct Review {
     /// Files installed setuid or setgid root, with which of the two, but
     /// for the sandbox helper of a Chromium-based program.
     pub root_set_id: Vec<(String, &'static str)>,
-    /// What the scriptlet or an auto-run file names and could not be
-    /// followed to, each as a sentence: the review is incomplete.
+    /// What of the package was not read, each as a sentence: a scriptlet
+    /// or auto-run file over the limits, and what the scriptlet or an
+    /// auto-run file names and could not be followed to. The review is
+    /// incomplete; the bytes are still the archive's.
     pub unfollowed: Vec<String>,
     /// For a package that is not from an official repository: its files
     /// where only the sweep looks (a PAM module, the boot loader's
-    /// configuration), with when what is there runs.
+    /// configuration, `/etc/hosts`), with what a file there does.
     pub misplaced: Vec<(String, &'static str)>,
     /// The regular files read as auto-run files: those themselves, and
     /// what the package's auto-run links lead to inside it.
@@ -1515,7 +1587,11 @@ pub fn review(
     }
 
     let official = class == SourceClass::Official;
-    let (wanted, sources) = plan_reads(archive, official).map_err(refuse)?;
+    let Plan {
+        wanted,
+        sources,
+        unread,
+    } = plan_reads(archive, official).map_err(refuse)?;
     let mut read = archive.extract(&wanted)?;
 
     let pkginfo =
@@ -1539,6 +1615,7 @@ pub fn review(
     // The package's own files that the scriptlet and the auto-run files
     // name are reviewed with them (read in further, bounded passes).
     let (named, unfollowed) = named_files(archive, &sources, &wanted, &mut read)?;
+    let unfollowed = unread.into_iter().chain(unfollowed).collect();
 
     let install = read
         .get(".INSTALL")
@@ -1558,7 +1635,7 @@ pub fn review(
         .filter(|entry| !official && !matches!(entry.kind, Kind::Directory))
         .filter_map(|entry| {
             let location = sweep_only_location(&entry.path)?;
-            Some((entry.path.clone(), location.category.when()))
+            Some((entry.path.clone(), sweep_only_effect(location)))
         })
         .collect();
     Ok(Review {
@@ -1619,11 +1696,42 @@ fn is_chromium_helper(archive: &Archive, path: &str) -> bool {
     rules::is_sandbox_helper(path) && !on_path && beside("icudtl.dat") && beside("resources.pak")
 }
 
-/// The files to extract (`.PKGINFO`, `.INSTALL`, the auto-run entries and
-/// what their links resolve to), within the limits, and each auto-run
-/// entry's source.
-fn plan_reads(archive: &Archive, official: bool) -> Result<(Vec<String>, Vec<Source<'_>>), String> {
+/// What a file in a sweep-only location does, for the finding a package
+/// that is not from an official repository gets for shipping one. The
+/// category says it for most; these are not what their category's other
+/// files are.
+fn sweep_only_effect(location: &Location) -> &'static str {
+    match location.path {
+        "var/lib/flatpak/overrides/" => {
+            "decides what every Flatpak app may reach outside its sandbox"
+        }
+        "etc/containers/systemd/" => "becomes a systemd unit at every boot",
+        "etc/fstab" | "etc/crypttab" => "decides what is mounted and unlocked at every boot",
+        "etc/hosts" => "decides which address a name leads to, without asking DNS",
+        "usr/local/share/ca-certificates/" => "adds a certificate authority to the system's own",
+        _ => location.category.when(),
+    }
+}
+
+/// What `review` reads from an archive.
+struct Plan<'a> {
+    /// The files to extract: `.PKGINFO`, `.INSTALL`, the auto-run entries
+    /// and what their links resolve to.
+    wanted: Vec<String>,
+    /// Each auto-run entry that is read, with its source.
+    sources: Vec<Source<'a>>,
+    /// What is over the limits and so left unread, each as a sentence.
+    unread: Vec<String>,
+}
+
+/// Plans the reads within the limits, from the model, before anything is
+/// extracted. A scriptlet or auto-run file over a limit is left out and
+/// said (`unread`) rather than refused: the checks that refuse a package
+/// still run on the rest, and the archive's digest covers what was not
+/// read.
+fn plan_reads(archive: &Archive, official: bool) -> Result<Plan<'_>, String> {
     let mut wanted: Vec<String> = Vec::new();
+    let mut unread = Vec::new();
     match archive.entry(".PKGINFO") {
         Some(entry) if entry.size <= MAX_TEXT_FILE_SIZE => wanted.push(".PKGINFO".into()),
         Some(_) => return Err(".PKGINFO is too large".into()),
@@ -1631,9 +1739,10 @@ fn plan_reads(archive: &Archive, official: bool) -> Result<(Vec<String>, Vec<Sou
     }
     if let Some(entry) = archive.entry(".INSTALL") {
         if entry.size > MAX_TEXT_FILE_SIZE {
-            return Err("the install scriptlet exceeds the 2 MiB review limit".into());
+            unread.push("the install scriptlet exceeds the 2 MiB review limit".into());
+        } else {
+            wanted.push(".INSTALL".into());
         }
-        wanted.push(".INSTALL".into());
     }
     let mut sources = Vec::new();
     for entry in &archive.entries {
@@ -1662,14 +1771,39 @@ fn plan_reads(archive: &Archive, official: bool) -> Result<(Vec<String>, Vec<Sou
             _ => Resolution::Regular(archive.regular_source(&entry.path)),
         };
         if let Resolution::Regular(path) = &source {
+            let size = archive.entry(path).map_or(0, |entry| entry.size);
+            if size > MAX_TEXT_FILE_SIZE {
+                unread.push(format!(
+                    "auto-run file /{} exceeds the 2 MiB review limit",
+                    entry.path
+                ));
+                continue;
+            }
             wanted.push(path.clone());
         }
         sources.push((entry, source));
     }
     wanted.sort();
     wanted.dedup();
-    check_limits(archive, &wanted, sources.len())?;
-    Ok((wanted, sources))
+    let total: u64 = wanted
+        .iter()
+        .filter_map(|path| archive.entry(path))
+        .map(|entry| entry.size)
+        .sum();
+    if sources.len() > MAX_FILES || total > MAX_TOTAL {
+        unread.push(format!(
+            "{} auto-run files ({} KiB) exceed the review limits: none of them was reviewed",
+            sources.len(),
+            total / 1024
+        ));
+        sources.clear();
+        wanted.retain(|path| METADATA.contains(&path.as_str()));
+    }
+    Ok(Plan {
+        wanted,
+        sources,
+        unread,
+    })
 }
 
 /// The package's own files that its scriptlet and auto-run files name, and
@@ -1919,32 +2053,6 @@ pub fn annotated(content: Content, header: &str) -> Content {
         },
         other => other,
     }
-}
-
-/// Counts and sizes, from the model, before anything is extracted.
-fn check_limits(archive: &Archive, wanted: &[String], auto_run: usize) -> Result<(), String> {
-    let total: u64 = wanted
-        .iter()
-        .filter_map(|path| archive.entry(path))
-        .map(|entry| entry.size)
-        .sum();
-    if auto_run > MAX_FILES || total > MAX_TOTAL {
-        return Err(format!(
-            "{auto_run} auto-run files ({} KiB) exceed the review limits",
-            total / 1024
-        ));
-    }
-    if let Some(entry) = wanted
-        .iter()
-        .filter_map(|path| archive.entry(path))
-        .find(|entry| entry.size > MAX_TEXT_FILE_SIZE)
-    {
-        return Err(format!(
-            "auto-run file /{} exceeds the 2 MiB review limit",
-            entry.path
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -3222,6 +3330,13 @@ mod tests {
                 ("usr/lib/security/pam_pkg.so", ELF),
                 ("usr/lib/glibc-hwcaps/x86-64-v3/libc.so.6", ELF),
                 ("etc/kernel/cmdline", b"quiet init=/bin/sh\n"),
+                ("etc/hosts", b"203.0.113.7 archlinux.org\n"),
+                ("var/lib/flatpak/overrides/global", b"[Context]\n"),
+                (
+                    "etc/ca-certificates/trust-source/anchors/x.crt",
+                    b"-----BEGIN CERTIFICATE-----\n",
+                ),
+                ("etc/tmux.conf", b"run-shell /usr/bin/x\n"),
             ],
         );
         let opened = Archive::open(&archive).unwrap();
@@ -3234,7 +3349,10 @@ mod tests {
         assert_eq!(
             third,
             [
+                // Reviewed, so not also called unreviewed below.
+                "etc/ca-certificates/trust-source/anchors/x.crt",
                 "etc/skel/.bashrc",
+                "etc/tmux.conf",
                 "usr/local/lib/systemd/system/sshd.service",
                 "usr/share/bash-completion/completions/pkg",
                 "usr/share/systemd/user/pipewire.service",
@@ -3254,14 +3372,25 @@ mod tests {
                     "usr/lib/glibc-hwcaps/x86-64-v3/libc.so.6",
                     "applies to every program started"
                 ),
+                (
+                    "etc/hosts",
+                    "decides which address a name leads to, without asking DNS"
+                ),
                 ("etc/kernel/cmdline", "runs before the system starts"),
+                (
+                    "var/lib/flatpak/overrides/global",
+                    "decides what every Flatpak app may reach outside its sandbox"
+                ),
             ]
         );
+
         let (official, misplaced) = paths(SourceClass::Official);
         assert_eq!(
             official,
             [
+                "etc/ca-certificates/trust-source/anchors/x.crt",
                 "etc/skel/.bashrc",
+                "etc/tmux.conf",
                 "usr/local/lib/systemd/system/sshd.service",
                 "usr/share/systemd/user/pipewire.service",
                 "usr/share/vim/vimfiles/plugin/pkg.vim",
@@ -3366,14 +3495,147 @@ mod tests {
             opened.replacement("usr/share/pkg/program"),
             Some(Replacement::Binary("ELF executable"))
         );
-        assert!(matches!(
+        assert_eq!(
             opened.replacement("usr/share/pkg/long-rule"),
-            Some(Replacement::Unreadable(_))
-        ));
+            Some(Replacement::TooLarge)
+        );
         assert_eq!(opened.replacement("usr/share/pkg"), None);
         assert_eq!(opened.replacement("usr/share/other/rule"), None);
         assert_eq!(super::through_root_links("sbin/x"), "usr/bin/x");
         assert_eq!(super::through_root_links("usr/lib64/x/y"), "usr/lib/x/y");
         assert_eq!(super::through_root_links("usr/share/x"), "usr/share/x");
+    }
+
+    #[test]
+    fn no_sweep_only_place_is_said_to_be_what_it_is_not() {
+        // No Flatpak override is an app launcher, and a table the system
+        // is set up by (or a quadlet) is not a program that runs.
+        for location in crate::autorun::SYSTEM_SWEEP {
+            let effect = super::sweep_only_effect(location);
+            assert!(!effect.contains("open the app"), "{}", location.path);
+            let table = matches!(
+                location.path,
+                "etc/fstab" | "etc/crypttab" | "etc/hosts" | "etc/containers/systemd/"
+            );
+            assert!(
+                !table || !effect.starts_with("runs"),
+                "{}: {effect}",
+                location.path
+            );
+        }
+    }
+
+    #[test]
+    fn a_named_path_is_followed_as_the_system_walks_it() {
+        if !tool_available("/usr/bin/bsdtar") {
+            return;
+        }
+        let dir = TempDir::new("payload-walked");
+        let root = dir.path().join("pkg-root");
+        for directory in ["usr/share/pkg", "usr/lib/pkg", "opt/pkg/releases/1"] {
+            fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        fs::write(root.join(".PKGINFO"), "pkgname = pkg\n").unwrap();
+        fs::write(
+            root.join(".INSTALL"),
+            "post_install() {\n  sh /usr/lib/../share/pkg/dots.sh\n  sh /lib/../share/pkg//slashes.sh\n  /opt/pkg/current/run.sh\n  /opt/pkg/again/run2.sh\n  sh $dir/var.sh /usr/lib/pkg/../../../../etc/above.sh\n}\n",
+        )
+        .unwrap();
+        for file in ["dots.sh", "slashes.sh", "var.sh", "above.sh"] {
+            fs::write(root.join("usr/share/pkg").join(file), "echo x\n").unwrap();
+        }
+        fs::write(root.join("opt/pkg/releases/1/run.sh"), "echo run\n").unwrap();
+        fs::write(root.join("opt/pkg/releases/1/run2.sh"), "echo run\n").unwrap();
+        // A directory link the package ships, and one that leads to it.
+        symlink("releases/1", root.join("opt/pkg/current")).unwrap();
+        symlink("/opt/pkg/current", root.join("opt/pkg/again")).unwrap();
+        // Links in a circle lead nowhere, and end.
+        symlink("b", root.join("opt/pkg/a")).unwrap();
+        symlink("a", root.join("opt/pkg/b")).unwrap();
+        let archive = dir.path().join("pkg-1-1-any.pkg.tar");
+        build(
+            &root,
+            &archive,
+            &[".PKGINFO", ".INSTALL", "usr", "opt"],
+            &["--uid", "0", "--gid", "0"],
+        );
+        let opened = Archive::open(&archive).unwrap();
+        assert_eq!(
+            opened.walked("usr/lib/../share/x").as_deref(),
+            Some("usr/share/x")
+        );
+        // `/lib` is `usr/lib`, so the step back from it ends in `/usr`.
+        assert_eq!(
+            opened.walked("lib/../share/x").as_deref(),
+            Some("usr/share/x")
+        );
+        assert_eq!(
+            opened.walked("opt/pkg/again/x").as_deref(),
+            Some("opt/pkg/releases/1/x")
+        );
+        assert_eq!(opened.walked("usr/../../etc/x"), None);
+        assert_eq!(opened.walked("opt/pkg/a/x"), None);
+
+        let reviewed = review(&opened, "pkg", SourceClass::LocalPackage, &[]).unwrap();
+        let named: Vec<&str> = reviewed
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        // A path behind a variable and one above the root are not found.
+        assert_eq!(
+            named,
+            [
+                "opt/pkg/releases/1/run.sh",
+                "opt/pkg/releases/1/run2.sh",
+                "usr/share/pkg/dots.sh",
+                "usr/share/pkg/slashes.sh",
+            ]
+        );
+    }
+
+    #[test]
+    fn what_is_over_a_limit_is_left_unread_and_a_refusal_still_refuses() {
+        if !tool_available("/usr/bin/bsdtar") {
+            return;
+        }
+        let dir = TempDir::new("payload-unread");
+        let mut big = b"#!/bin/sh\n".to_vec();
+        big.resize(2 * 1024 * 1024 + 1, b'#');
+        let script = String::from_utf8(big.clone()).unwrap();
+        let files: &[(&str, &[u8])] = &[
+            ("etc/profile.d/big.sh", &big),
+            ("etc/profile.d/small.sh", b"export X=1\n"),
+        ];
+        let archive = pack(dir.path(), "pkg", "", Some(&script), files);
+        let opened = Archive::open(&archive).unwrap();
+        let reviewed = review(&opened, "pkg", SourceClass::LocalPackage, &[]).unwrap();
+        assert!(reviewed.install.is_none());
+        let read: Vec<&str> = reviewed
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(read, ["etc/profile.d/small.sh"]);
+        assert_eq!(
+            reviewed.unfollowed,
+            [
+                "the install scriptlet exceeds the 2 MiB review limit",
+                "auto-run file /etc/profile.d/big.sh exceeds the 2 MiB review limit"
+            ]
+        );
+
+        // The same package claiming Guardian's place is refused all the
+        // same: what is unread does not come before what is refused.
+        let claiming = TempDir::new("payload-unread-claim");
+        let archive = pack(
+            claiming.path(),
+            "pkg",
+            "replaces = omarchy-guardian\n",
+            Some(&script),
+            files,
+        );
+        let opened = Archive::open(&archive).unwrap();
+        assert!(review(&opened, "pkg", SourceClass::LocalPackage, &[]).is_err());
     }
 }

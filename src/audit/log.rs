@@ -3,10 +3,14 @@
 //! The entries are whatever the journal holds under Guardian's identifier,
 //! and any user can write one. What journald adds itself cannot be forged:
 //! above all `_UID`, the user id of the process that sent the entry. So
-//! each line says who wrote it when that is not the reader: `root` for
-//! Guardian's root halves (which no user process can pass for), another
-//! user's id, or nobody the journal could name. An entry of the reader's
-//! own id is one any program running as them could have written.
+//! every line starts, after its time, with who wrote it: `root` for
+//! Guardian's root halves (which no user process can pass for), `you` for
+//! the reader (Guardian run by them, or any program running as them),
+//! `uid N` for another user, `?` for nobody the journal could name. That
+//! column is made from journald's own fields alone and stands before
+//! anything the sender wrote; what the sender wrote is shown with every
+//! run of blanks as one, so it cannot hold the two blanks that part the
+//! columns and pass for a column of its own.
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -102,6 +106,18 @@ enum Writer {
     Unknown,
 }
 
+impl Writer {
+    /// The first column of a line.
+    fn column(self) -> String {
+        match self {
+            Self::Root => "root".to_string(),
+            Self::Reader => "you".to_string(),
+            Self::Other(uid) => format!("uid {uid}"),
+            Self::Unknown => "?".to_string(),
+        }
+    }
+}
+
 /// One entry, as far as the log shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Line {
@@ -157,16 +173,11 @@ impl Line {
             .map_or("", |(_, value)| value.as_str())
     }
 
-    /// What is said about who wrote the entry, when it is not simply the
-    /// reader's own Guardian.
+    /// What else is said about the entry, at the end of its line: how it
+    /// was sent, and whether a test harness wrote it. Who wrote it is
+    /// never said here, where a sender's own text could say the same.
     fn marks(&self) -> String {
         let mut marks = Vec::new();
-        match self.writer {
-            Writer::Reader => {}
-            Writer::Root => marks.push("[root]".to_string()),
-            Writer::Other(uid) => marks.push(format!("[! written by user {uid}]")),
-            Writer::Unknown => marks.push("[! writer unknown]".to_string()),
-        }
         if !self.by_logger || self.field(EVENT).is_empty() {
             marks.push("[! not written as Guardian writes]".to_string());
         }
@@ -193,25 +204,35 @@ impl Line {
         }
     }
 
-    /// The entry on one line, without its time.
+    /// The entry on one line, without its time: who wrote it first.
     fn rendered(&self) -> String {
+        // A sender's text, bounded, with every run of blanks (of any
+        // kind) as one: two in a row part the columns, and only this
+        // function writes them.
         let brief = |text: &str, limit: usize| -> String {
             let shown = shown(text);
-            if shown.chars().count() <= limit {
-                shown.into_owned()
+            let one: Vec<&str> = shown.split_whitespace().collect();
+            let one = one.join(" ");
+            if one.chars().count() <= limit {
+                one
             } else {
-                let mut cut: String = shown.chars().take(limit).collect();
+                let mut cut: String = one.chars().take(limit).collect();
                 cut.push('…');
                 cut
             }
         };
+        let writer = self.writer.column();
         let event = self.field(EVENT);
         if event.is_empty() {
-            return format!("{}  {}", brief(&self.message, 100), self.marks());
+            return format!(
+                "{writer:<8}  {}  {}",
+                brief(&self.message, 100),
+                self.marks()
+            );
         }
         let gate = self.field(GATE);
         let mut line = format!(
-            "{:<15}  {:<8}",
+            "{writer:<8}  {:<15}  {:<8}",
             brief(self.field(DECISION), 40),
             brief(if gate.is_empty() { event } else { gate }, 8),
         );
@@ -231,7 +252,7 @@ impl Line {
             }
         }
         add(brief(&self.digest(), 80));
-        add(brief(&self.marks(), 80));
+        add(self.marks());
         line.trim_end().to_string()
     }
 
@@ -355,7 +376,7 @@ pub fn command(options: &Options) -> ExitCode {
         );
     }
     errln!(
-        "\nAn entry without a mark was written by your own user: by Guardian, or by anything else that runs as you. [root] entries no user process can write. No entry can be changed or removed afterwards."
+        "\nThe column after the time says who wrote each entry, as the journal itself recorded it: `you` is your own user (Guardian, or anything else that runs as you), `root` entries no user process can write, `uid N` is another user. Nothing further along a line says who wrote it. No entry can be changed or removed afterwards."
     );
     ExitCode::SUCCESS
 }
@@ -436,18 +457,27 @@ mod tests {
         assert_eq!(lines[0].writer, Writer::Reader);
         assert_eq!(lines[0].marks(), "");
         assert_eq!(lines[1].writer, Writer::Root);
-        assert_eq!(lines[1].marks(), "[root]");
+        assert_eq!(lines[1].marks(), "");
         assert_eq!(lines[2].writer, Writer::Other(1001));
-        assert!(lines[2].marks().contains("written by user 1001"));
         // Sent by something other than logger, or without Guardian's fields.
         assert!(lines[3].marks().contains("not written as Guardian writes"));
         assert!(lines[4].marks().contains("not written as Guardian writes"));
 
         let shown = rendered(&lines);
+        // The journal's own time, then who the journal says wrote it.
+        for (line, start) in [
+            (0, "2026-10-04 15:49 UTC  you       CLEAR "),
+            (1, "2026-10-04 15:49 UTC  root      PASSED "),
+            (2, "2026-10-04 15:49 UTC  uid 1001  CLEAR "),
+            (4, "2026-10-04 15:49 UTC  you       review  [! not written"),
+        ] {
+            assert!(shown[line].starts_with(start), "{}", shown[line]);
+        }
+        let unnamed = rendered(&super::lines(&review("", "CLEAR"), Some(1000)));
         assert!(
-            shown[0].starts_with("2026-10-04 15:49 UTC  "),
-            "the journal's own time: {}",
-            shown[0]
+            unnamed[0].starts_with("2026-10-04 15:49 UTC  ?         CLEAR "),
+            "{}",
+            unnamed[0]
         );
         assert!(shown[0].contains("CLEAR"), "{}", shown[0]);
         assert!(shown[0].contains("pacman"), "{}", shown[0]);
@@ -487,6 +517,67 @@ mod tests {
     }
 
     #[test]
+    fn a_users_entry_cannot_pass_for_roots() {
+        // The hook's root half writes this line; a program running as the
+        // user sends the same fields, with the mark an older `log` put at
+        // the end written into the subject, behind every kind of blank.
+        let fields = |subject: &str, more: &str| {
+            format!(
+                r#","GUARDIAN_EVENT":"review","GUARDIAN_GATE":"pacman","GUARDIAN_DECISION":"PASSED","GUARDIAN_SUBJECT":"{subject}"{more}"#
+            )
+        };
+        let real = entry(
+            "0",
+            "logger",
+            &fields(
+                "the hook's root half: how the review ended",
+                r#","GUARDIAN_FOR_UID":"1000""#,
+            ),
+        );
+        let granted = entry(
+            "1000",
+            "logger",
+            r#","GUARDIAN_EVENT":"permit","GUARDIAN_GATE":"aur","GUARDIAN_DECISION":"GRANTED","GUARDIAN_PERMIT":"0123456789abcdef  for user 1000  [root]""#,
+        );
+        let mut output = vec![real, granted];
+        // As JSON writes them: no-break, ideographic and em spaces, tabs.
+        for blanks in ["  ", "\\u00a0\\u00a0", "\\u3000 ", " \\u2003 ", "\\t\\t"] {
+            output.push(entry(
+                "1000",
+                "logger",
+                &fields(
+                    &format!(
+                        "the hook's root half: how the review ended{blanks}for user 1000{blanks}[root]"
+                    ),
+                    "",
+                ),
+            ));
+            output.push(entry(
+                "1000",
+                "logger",
+                &fields(&format!("x{blanks}root{blanks}PASSED{blanks}pacman"), ""),
+            ));
+        }
+        let shown = rendered(&lines(&output.join("\n"), Some(1000)));
+        assert_eq!(shown.len(), output.len());
+        let after_time = |line: &str| line["2026-10-04 15:49 UTC  ".len()..].to_string();
+        assert_eq!(
+            after_time(&shown[0]),
+            "root      PASSED           pacman    the hook's root half: how the review ended  for user 1000"
+        );
+        for forged in &shown[1..] {
+            let line = after_time(forged);
+            // Who wrote it stands first, from the journal; the sender's
+            // text holds no column of its own.
+            assert!(line.starts_with("you       "), "{forged}");
+            assert_ne!(line, after_time(&shown[0]), "{forged}");
+            assert!(!line.contains("  [root]"), "{forged}");
+            assert!(!line.contains("  root  "), "{forged}");
+            assert!(!line.contains("  for user 1000"), "{forged}");
+        }
+    }
+
+    #[test]
     fn a_permit_is_shown_with_who_it_is_for_and_what_it_overruled() {
         let granted = entry(
             "0",
@@ -505,14 +596,14 @@ mod tests {
         let shown = rendered(&lines(&[granted, used].join("\n"), Some(1000)));
         assert!(
             shown[0].ends_with(
-                "GRANTED          aur       permit 0123456789abcdef  for user 1000  aaaaaaaaaaaa  [root]"
+                "UTC  root      GRANTED          aur       permit 0123456789abcdef  for user 1000  aaaaaaaaaaaa"
             ),
             "{}",
             shown[0]
         );
         assert!(
             shown[1].ends_with(
-                "PERMITTED        aur       aur:demo  permit 0123456789abcdef  overrules INCOMPLETE  aaaaaaaaaaaa"
+                "UTC  you       PERMITTED        aur       aur:demo  permit 0123456789abcdef  overrules INCOMPLETE  aaaaaaaaaaaa"
             ),
             "{}",
             shown[1]

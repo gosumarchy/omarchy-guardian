@@ -735,16 +735,16 @@ journalctl -t omarchy-guardian -o verbose   # the entries as journald keeps them
 ```
 
 ```
-2026-10-04 16:14 UTC  CLEAR            pacman    ripgrep-14.1.1-1-x86_64  5f0c2a9e41b7
-2026-10-04 16:14 UTC  PASSED           pacman    the hook's root half: how the review ended  for user 1000  [root]
-2026-10-04 16:20 UTC  INCOMPLETE       aur       aur:demo-bin  9be2f4c01a77
-2026-10-04 16:21 UTC  GRANTED          aur       permit 41c9a07d2e556f10  for user 1000  41c9a07d2e55  [root]
-2026-10-04 16:22 UTC  PERMITTED        aur       aur:demo-bin  permit 41c9a07d2e556f10  overrules INCOMPLETE  9be2f4c01a77
+2026-10-04 16:14 UTC  you       CLEAR            pacman    ripgrep-14.1.1-1-x86_64  5f0c2a9e41b7
+2026-10-04 16:14 UTC  root      PASSED           pacman    the hook's root half: how the review ended  for user 1000
+2026-10-04 16:20 UTC  you       INCOMPLETE       aur       aur:demo-bin  9be2f4c01a77
+2026-10-04 16:21 UTC  root      GRANTED          aur       permit 41c9a07d2e556f10b3a8e4d2c7f09a15  for user 1000  41c9a07d2e55
+2026-10-04 16:22 UTC  you       PERMITTED        aur       aur:demo-bin  permit 41c9a07d2e556f10b3a8e4d2c7f09a15  overrules INCOMPLETE  9be2f4c01a77
 
-Each line is the time, the decision, the gate, what it was about, and the
-first 12 hex characters of the SHA-256 of what was reviewed (`+N` when
-there are more, as in a transaction of several archives; `--json` and
-`journalctl` have them in full).
+Each line is the time, who wrote the entry, the decision, the gate, what it
+was about, and the first 12 hex characters of the SHA-256 of what was
+reviewed (`+N` when there are more, as in a transaction of several
+archives; `--json` and `journalctl` have them in full).
 ```
 
 What is recorded:
@@ -789,21 +789,27 @@ What an entry proves, and what it does not:
 - No user process can change or remove an entry: the journal files are
   root's, and journald stamps each entry with the user id of the process
   that sent it (`_UID`), which a sender cannot set.
+- The column after the time says who wrote the entry: `you`, `root`,
+  `uid N` for another user, or `?` when the journal names nobody. `log`
+  makes it from journald's own `_UID` and from nothing the sender wrote,
+  and it stands before everything the sender wrote. What the sender wrote
+  (a subject, a decision's name) is shown on one line with every run of
+  blanks as a single one, so it cannot hold the two blanks that part the
+  columns: nothing further along a line can pass for that column.
 - Guardian's reviews run as you, in the pacman hook too, so their entries
   carry your user id, and **any program running as you can write an entry
-  that looks the same**. An unmarked line in `log` means "written by your
-  user", not "written by Guardian". A program that ran as you can add false
-  lines; it cannot take a true one away.
-- Entries marked `[root]` were written by Guardian's root halves: the
-  pacman hook script records how each review ended (`PASSED`, `PERMITTED`
-  or `BLOCKED`) after the review process, which runs as you, has exited,
-  and permits and the sweep's allow list are written through sudo. No user
-  process can write those. A pacman install with a `[root]` line and no
+  that looks the same**. A `you` line means "written by your user", not
+  "written by Guardian". A program that ran as you can add false lines; it
+  cannot take a true one away, and it cannot write a `root` line.
+- `root` lines were written by Guardian's root halves: the pacman hook
+  script records how each review ended (`PASSED`, `PERMITTED` or
+  `BLOCKED`) after the review process, which runs as you, has exited, and
+  permits and the sweep's allow list are written through sudo. No user
+  process can write those. A pacman install with a `root` line and no
   review line beside it, or the reverse, is worth a look.
-- `log` marks an entry sent by another user (`[! written by user N]`) and
-  one that did not arrive the way Guardian sends them (through
-  `/usr/bin/logger` to journald's own socket). Entries written under the
-  test harnesses are marked `[test]`.
+- At the end of a line, `log` marks an entry that did not arrive the way
+  Guardian sends them (through `/usr/bin/logger` to journald's own
+  socket), and one written under the test harnesses (`[test]`).
 - Entries written by root are in the system journal, which only root and
   members of the `systemd-journal`, `adm` or `wheel` group can read; run
   `sudo omarchy-guardian log` otherwise.
@@ -833,25 +839,27 @@ A review can be wrong. When a gate blocks on something you may reasonably
 overrule, its report ends with:
 
 ```
-To install this exact content anyway: omarchy-guardian permit 41c9a07d2e556f10
+To install this exact content anyway: omarchy-guardian permit 41c9a07d2e556f10b3a8e4d2c7f09a15
+  content SHA-256 41c9a07d2e556f10b3a8e4d2c7f09a15c2d7e61f0a9b3c48d5e6f7a8b9c0d1e2  (permit shows it again before it asks: the two must be the same)
 ```
 
 ```sh
-omarchy-guardian permit                    # blocked installs waiting, and permits in force
-omarchy-guardian permit 41c9a07d2e556f10   # show what is overruled, ask, store the permit
-omarchy-guardian permit --revoke 41c9a07d2e556f10
+omarchy-guardian permit                                    # blocked installs waiting, and permits in force
+omarchy-guardian permit 41c9a07d2e556f10b3a8e4d2c7f09a15   # show what is overruled, ask, store the permit
+omarchy-guardian permit --revoke 41c9a07d2e556f10b3a8e4d2c7f09a15
 ```
 
-`permit ID` shows the decision and the review's reasons again, shows what
-root will store, and asks you to type `permit` on the terminal (there is no
-`--yes`; without a terminal it refuses). Then it asks for the sudo
-password and stores the permit. Run the install again: the gate reviews
+`permit ID` shows the decision and the review's reasons again, shows the
+content SHA-256 root will store, and asks you to type `permit` on the
+terminal (there is no `--yes`; without a terminal it refuses). Compare that
+SHA-256 with the one the gate printed under its permit line before you
+type the word. Then it asks for the sudo password and stores the permit. Run the install again: the gate reviews
 again, finds the permit, prints `PERMITTED` and which decision your permit
 overruled, and goes on. This is meant to replace the coarse ways out
 (`protect --off`, `yay --makepkg makepkg`, `ai = "off"`), which stay on
 long after the one install they were for.
 
-- **Bound to the bytes.** The ID is the first 16 hex characters of a
+- **Bound to the bytes.** The ID is the first 32 hex characters of a
   SHA-256 over the gate, the class and the digests of exactly what was
   reviewed: for pacman every archive of the transaction by its SHA-256;
   for a theme, a plugin or a `guard` the manifest digest of the tree (file
@@ -881,15 +889,27 @@ long after the one install they were for.
   root's alone, for the user who asked. What a gate blocked is kept in
   your own state directory until you permit it, and a program running as
   you could write such a record: it still cannot get a permit without
-  your typed word and password, and the screen shows the SHA-256 root
-  will store. Permit only an ID a blocked gate printed itself.
+  your typed word and password. Such a program could also put other
+  content under an ID a gate printed, if it found some whose SHA-256
+  starts with the same 32 characters; that takes more work than anyone
+  can do, and the check does not rest on it: the gate prints the whole
+  SHA-256 of what it blocked, `permit` shows the SHA-256 root will store,
+  and the two must be the same. Permit only an ID a blocked gate printed
+  itself.
 - **In the trail.** The grant, each permitted run and a revoke are in
   `omarchy-guardian log`.
 
 A permit can overrule findings of the local rules and the AI (exit 1), an
 incomplete review (a binary the recipe runs, an oversized or binary
 script, an inconclusive or invalid AI reply), an unavailable AI under
-`ai = required`, and a question nobody answered.
+`ai = required`, and a question nobody answered. For a pacman transaction
+the incomplete reviews it can overrule are those about bytes inside an
+archive that was read and fingerprinted: an install scriptlet or auto-run
+file over 2 MiB or of binary data, more auto-run files than are reviewed,
+a file the scriptlet or an auto-run file names that is over 2 MiB, past
+500 files or more than eight files away, a compiled program in an
+auto-run location of a package that is not from an official repository,
+and a file over 2 MiB that a link on this system leads to.
 
 No permit is offered, and none is honoured, for:
 
@@ -899,6 +919,12 @@ No permit is offered, and none is honoured, for:
   cannot attribute or that is redirected (`--root`, `--dbpath`,
   `--hookdir`, ...), an archive that changed during the review, an invalid
   system config;
+- what the pacman gate could not look at outside the archives: a link
+  that leads to a file no archive of the transaction ships and root does
+  not keep alone, an auto-run location with more entries than are looked
+  through, pacman's record of an installed package that does not say what
+  its entry in a directory only root lists is (the message names what to
+  remove or reinstall);
 - the AUR gate's refusals: a recipe that moves makepkg's directories or
   lists other sources than it writes out, a source that can be replaced in
   transit, sources that are not the ones Guardian fetched;
@@ -1705,7 +1731,9 @@ grant privileges on their own:
   native-messaging hosts (Chromium, Chrome, Brave, Firefox), `at` jobs, and
   the boot entry and kernel command line drop-ins (`limine-entry-tool.d`,
   `etc/cmdline.d`);
-- certificate authorities in `etc/ca-certificates/trust-source`;
+- certificate authorities in `etc/ca-certificates/trust-source` (its
+  `anchors` included), and `etc/tmux.conf` and `etc/inputrc`, which tmux and
+  every readline program read at each start;
 - in `etc/skel`, the files that would run on their own in a new user's home
   (`.bashrc`, `.config/hypr`, `.config/autostart` and the rest of the sweep's
   user locations), not the whole tree.
@@ -1724,12 +1752,20 @@ reviewed with it: the script a hook hands to an interpreter
 (`post_install() { /usr/lib/pkg/setup.sh; }`, or by a bare name the package
 ships in `usr/bin`), a file a login script sources, a udev `RUN+=` program,
 a cron command. Every word of the file is looked at, not only the first of
-a command, and what the named files name is followed in turn, three files
-deep and 500 files per package at most. A named file that is a compiled
-program or other binary data is not read: it is listed as not reviewed, to
-you and to the AI. A named text file over 2 MiB, or more files or steps than
-those bounds, makes the review incomplete. A path a script builds at run
-time (`cd /usr/lib/pkg && ./setup.sh`) is not found.
+a command, and what the named files name is followed in turn, eight files
+deep and 500 files per package at most. A path is taken as the system
+walks it: `/usr/lib/../share/pkg/run.sh` is `/usr/share/pkg/run.sh`, and a
+path through a directory link the package itself ships
+(`/opt/pkg/current/run.sh` with `current -> releases/1`) is the file it
+leads to. A named file that is a compiled program or other binary data is
+not read: it is listed as not reviewed, to you and to the AI. A named text
+file over 2 MiB, or more files or steps than those bounds, makes the review
+incomplete; so does an install scriptlet or an auto-run file over 2 MiB or
+of binary data. Those are about the archive's own bytes, so a permit can
+overrule them (see [After a block](#after-a-block)). A path a script
+builds at run time (`cd /usr/lib/pkg && ./setup.sh`), or one behind a
+variable with nothing of the path before the file's name (`"$dir/setup.sh"`;
+`"$pkgdir/usr/lib/pkg/setup.sh"` is found), is not found.
 
 A package that ships a symbolic link in place of one of those directories
 (`etc/cron.d -> /usr/share/x`) is refused: what the link leads to would be
@@ -1753,16 +1789,20 @@ file capabilities, when it has exactly the ones the package ships (access
 lists are not read back, so those are said every time). A package that is
 not from an official repository and brings a new file into one of the
 places only the sweep reads, which every login, program or boot uses and
-whose content this gate does not review, gets the same finding: a PAM
-module in `usr/lib/security`, a library in `usr/lib/glibc-hwcaps`,
-`etc/default/limine`, `etc/kernel/cmdline`, `boot/limine.conf`,
-`etc/fstab`, `etc/crypttab`, `etc/hosts`, a certificate authority in
-`etc/ca-certificates/trust-source/anchors` or
+whose content this gate does not review, gets the same finding, which says
+what a file in that place does: a PAM module in `usr/lib/security`, a
+library in `usr/lib/glibc-hwcaps`, the boot loader's configuration and the
+kernel command line (`etc/default/limine`, `etc/kernel/cmdline`,
+`boot/limine.conf`), the tables the system is set up by (`etc/fstab`,
+`etc/crypttab`, `etc/hosts`), a certificate authority in
 `usr/local/share/ca-certificates`, a Podman quadlet in
-`etc/containers/systemd`, Firefox's `distribution/policies.json`, a
-system-wide Flatpak override, `etc/npmrc`, `etc/pip.conf`, `etc/tmux.conf`
-and `etc/inputrc`. A file that is already there is passed over. Official
-packages ship PAM modules and some of the others, so those are let through.
+`etc/containers/systemd` (it becomes a unit at boot), a system-wide Flatpak
+override, `etc/npmrc` and `etc/pip.conf`. A file that is already there is
+passed over. Official packages ship PAM modules and some of the others
+(`filesystem` the tables), so those are let through. What lies under a
+reviewed location is reviewed instead and gets no such finding: a
+certificate authority in `etc/ca-certificates/trust-source/anchors`,
+Firefox's `distribution/policies.json`.
 
 A package that installs a file under `/run`, `/tmp`, `/dev`, `/proc`, `/sys`,
 `/root` or `/home`, or lists one under `/bin`, `/sbin`, `/lib`, `/lib64`,
@@ -1787,9 +1827,16 @@ symbolic link already in one of those locations leads to (another package's
 `etc/sudoers.d/a -> /usr/share/b/rule`, or a unit you enabled with
 `systemctl enable`), the new content is reviewed as that link's file, unless
 it is identical to what is installed. The links are read from the system
-itself; in a directory only root can list (`/etc/sudoers.d`,
+itself, however deep a directory lies; a location with more than 20,000
+entries makes the review incomplete, and the message names the directory
+and how many it holds. In a directory only root can list (`/etc/sudoers.d`,
 `/etc/polkit-1/rules.d`) they are read from pacman's record of the packages
-that ship into it, so a link root made there by hand is not seen.
+that ship into it, so a link root made there by hand is not seen. Which
+paths a package has there comes from the file list pacman wrote itself;
+what each is comes from the `mtree` the package brought. A listed path the
+`mtree` does not describe may be a link to anywhere: the review is
+incomplete, naming the package, until a transaction replaces that path or
+the package is removed.
 
 What the gate does not see: a package's other files are installed as shipped
 and acted on by what is already on the system (a pacman hook, DKMS or a

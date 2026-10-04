@@ -2,11 +2,11 @@
 //!
 //! A gate that blocks on something a person may reasonably overrule (the
 //! review's findings, an incomplete review, an unavailable AI, a question
-//! nobody answered) ends its report with `omarchy-guardian permit <ID>`.
-//! The ID is the start of a SHA-256 over the gate, the class and the
-//! digests of exactly what was reviewed, so a permit stands for those
-//! bytes and for nothing else: a changed archive, recipe or source has
-//! another ID, and is blocked as before.
+//! nobody answered) ends its report with `omarchy-guardian permit <ID>`
+//! and the SHA-256 the ID is the start of. That SHA-256 is over the gate,
+//! the class and the digests of exactly what was reviewed, so a permit
+//! stands for those bytes and for nothing else: a changed archive, recipe
+//! or source has another ID, and is blocked as before.
 //!
 //! What the gate blocked is kept in the user's own state directory, to be
 //! shown again when the user permits it. The permit itself is a small file
@@ -16,6 +16,11 @@
 //! typed on the terminal and the password. The root half is given the
 //! gate, the class and the content's SHA-256 and stores those, the user
 //! sudo names and when the permit ends; it reads no file of the user's.
+//! Since the record is the user's to write, a program running as them
+//! could put other content under an ID a gate printed, if it found some
+//! whose SHA-256 starts the same: the ID is long enough (128 bits) that
+//! none is found, and the gate prints the whole SHA-256 for the user to
+//! compare with the one `permit` shows before it asks.
 //!
 //! A permit ends 30 minutes after it was given. The gates run as the user
 //! and cannot remove root's file, so until then it lets the same bytes
@@ -57,8 +62,10 @@ pub const PERMITTED_EXIT: u8 = 10;
 /// Set by the hook script's root half for the review it starts.
 pub const ROOT_HOOK: &str = "OMARCHY_GUARDIAN_ROOT_HOOK";
 
-/// Hex characters of the content's SHA-256 that make the ID.
-const ID_CHARS: usize = 16;
+/// Hex characters of the content's SHA-256 that make the ID: 128 bits,
+/// so that no second content with the same ID can be searched for (the
+/// record a permit is given from is the user's own file, see `Pending`).
+const ID_CHARS: usize = 32;
 /// The most digests one permit's content may be made of (a system upgrade
 /// is a few hundred archives).
 const MAX_PARTS: usize = 4096;
@@ -180,6 +187,13 @@ impl Content {
         self.key()[..ID_CHARS].to_string()
     }
 
+    fn offer(&self) -> Offer {
+        Offer {
+            id: self.id(),
+            key: self.key(),
+        }
+    }
+
     pub fn class(&self) -> &str {
         &self.class
     }
@@ -210,6 +224,20 @@ pub fn enabled(settings: &Settings, class: &str) -> bool {
     !strict || settings.permits_under_strict()
 }
 
+/// The permit a block is offered: its ID, and the whole SHA-256 of the
+/// content that ID is the start of. Shown as the ID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Offer {
+    id: String,
+    key: String,
+}
+
+impl std::fmt::Display for Offer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.id)
+    }
+}
+
 /// How a blocked review stands with permits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Standing {
@@ -217,8 +245,8 @@ pub enum Standing {
     None,
     /// A permit of this ID lets it through.
     Permitted(String),
-    /// The block can be permitted under this ID.
-    Offered(String),
+    /// The block can be permitted under this offer's ID.
+    Offered(Offer),
 }
 
 impl Standing {
@@ -231,17 +259,25 @@ impl Standing {
 
     pub fn offered(&self) -> Option<&str> {
         match self {
-            Self::Offered(id) => Some(id),
+            Self::Offered(offer) => Some(&offer.id),
             Self::None | Self::Permitted(_) => None,
         }
     }
 
-    /// The line a block that can be permitted ends with, kept with the
-    /// saved report.
+    /// The lines a block that can be permitted ends with, kept with the
+    /// saved report: the command, and the whole SHA-256 a permit would be
+    /// for. `permit` reads what it asks about from a file any program
+    /// running as the user can write; this is the gate's own word for
+    /// what it blocked, to hold against what `permit` shows.
     pub fn say(&self) {
-        if let Self::Offered(id) = self {
+        if let Self::Offered(offer) = self {
             crate::output::stderr_line(format_args!(
-                "To install this exact content anyway: omarchy-guardian permit {id}"
+                "To install this exact content anyway: omarchy-guardian permit {}",
+                offer.id
+            ));
+            crate::output::stderr_line(format_args!(
+                "  content SHA-256 {}  (permit shows it again before it asks: the two must be the same)",
+                offer.key
             ));
         }
     }
@@ -528,7 +564,7 @@ fn standing_at(
         at: now,
     };
     match keep_pending(state_root, &block) {
-        Ok(()) => Standing::Offered(content.id()),
+        Ok(()) => Standing::Offered(content.offer()),
         Err(reason) => {
             errln!("omarchy-guardian: this block cannot be offered a permit ({reason}).");
             Standing::None
@@ -623,7 +659,12 @@ fn show(block: &Pending, uid: u32) {
         content.class,
         LIFETIME_SECS / 60
     );
+    outln!();
     outln!("  content SHA-256 {}", content.key());
+    outln!();
+    outln!(
+        "Compare this SHA-256 with the one the blocked gate printed under its permit line: they must be the same, character for character. Everything else shown here is from a record in your own state directory, which any program running as you can write; the SHA-256 is what root stores, and what the gate will let through."
+    );
     outln!(
         "The gate lets content with this SHA-256 through until the permit ends{}. Anything else, a changed file included, is reviewed and blocked as before.",
         if content.gate == Gate::Pacman {
@@ -631,9 +672,6 @@ fn show(block: &Pending, uid: u32) {
         } else {
             ""
         }
-    );
-    outln!(
-        "The lines above the SHA-256 are from a record in your own state directory, which any program running as you can write. The ID is the start of that SHA-256: permit only an ID the blocked gate itself printed."
     );
 }
 
@@ -1018,9 +1056,20 @@ mod tests {
     #[test]
     fn the_id_is_bound_to_gate_class_and_every_digest() {
         let content = theme(A);
-        assert_eq!(content.id().len(), 16);
+        // Long enough that no other content with the same ID is found.
+        assert_eq!(content.id().len(), 32);
+        assert_eq!(content.key().len(), 64);
         assert!(content.key().starts_with(&content.id()));
         assert_eq!(content.key(), theme(A).key());
+        // A block is offered under the ID, with the whole SHA-256 for the
+        // gate to print beside it.
+        let offer = content.offer();
+        assert_eq!(offer.to_string(), content.id());
+        assert_eq!(offer.key, content.key());
+        assert_eq!(
+            Standing::Offered(offer).offered(),
+            Some(content.id().as_str())
+        );
         // Another digest, gate or class is another permit.
         assert_ne!(content.key(), theme(B).key());
         let as_plugin = Content::tree(Gate::Plugin, SourceClass::Plugin, "theme:demo", A).unwrap();
@@ -1236,7 +1285,7 @@ mod tests {
 
         assert_eq!(
             ask(std::slice::from_ref(&content), &report, blocked, &settings),
-            Standing::Offered(content.id())
+            Standing::Offered(content.offer())
         );
         let kept = pending_blocks(state.path(), now);
         assert_eq!(kept.len(), 1);
@@ -1260,7 +1309,7 @@ mod tests {
         let other = theme(B);
         assert_eq!(
             ask(std::slice::from_ref(&other), &report, blocked, &settings),
-            Standing::Offered(other.id())
+            Standing::Offered(other.offer())
         );
         // What was reviewed may go by several names (a recipe before and
         // after makepkg downloaded into its directory): a permit for any
@@ -1277,7 +1326,7 @@ mod tests {
         let third = theme(&"c".repeat(64));
         assert_eq!(
             ask(&[third.clone(), other.clone()], &report, blocked, &settings),
-            Standing::Offered(third.id())
+            Standing::Offered(third.offer())
         );
         // A review that passed has nothing to do with permits.
         assert_eq!(
@@ -1406,7 +1455,11 @@ mod tests {
         .unwrap();
         assert!(pending_blocks(state.path(), 600).is_empty());
         // An honest record under another ID's name.
-        fs::write(directory.join("0123456789abcdef.json"), &honest).unwrap();
+        fs::write(
+            directory.join("0123456789abcdef0123456789abcdef.json"),
+            &honest,
+        )
+        .unwrap();
         assert!(pending_blocks(state.path(), 600).is_empty());
         assert!(Pending::parse("{}").is_none());
         assert!(Pending::parse("not json").is_none());
@@ -1466,7 +1519,14 @@ mod tests {
         assert!(attempt(&id, &standard, None).is_err());
         assert!(attempt(&id, &standard, Some("y")).is_err());
         assert!(attempt(&id, &standard, Some("")).is_err());
-        assert!(attempt("0123456789abcdef", &standard, Some("permit")).is_err());
+        assert!(
+            attempt(
+                "0123456789abcdef0123456789abcdef",
+                &standard,
+                Some("permit")
+            )
+            .is_err()
+        );
         assert!(attempt(&id, &settings(Profile::Strict, None), Some("permit")).is_err());
         assert!(asked.borrow().is_empty());
         assert_eq!(pending_blocks(state.path(), super::now()).len(), 1);
@@ -1492,19 +1552,21 @@ mod tests {
         };
         assert_eq!(parse(&args(&[])), Ok(Command::List));
         assert_eq!(
-            parse(&args(&["0123456789abcdef"])),
-            Ok(Command::Grant("0123456789abcdef".into()))
+            parse(&args(&["0123456789abcdef0123456789abcdef"])),
+            Ok(Command::Grant("0123456789abcdef0123456789abcdef".into()))
         );
         assert_eq!(
-            parse(&args(&["--revoke", "0123456789abcdef"])),
-            Ok(Command::Revoke("0123456789abcdef".into()))
+            parse(&args(&["--revoke", "0123456789abcdef0123456789abcdef"])),
+            Ok(Command::Revoke("0123456789abcdef0123456789abcdef".into()))
         );
         for bad in [
             &["--yes"][..],
-            &["0123456789abcdef", "--yes"],
-            &["--yes", "0123456789abcdef"],
+            &["0123456789abcdef0123456789abcdef", "--yes"],
+            &["--yes", "0123456789abcdef0123456789abcdef"],
             &["0123"],
-            &["0123456789ABCDEF"],
+            // The short ID of earlier versions, and one in capitals.
+            &["0123456789abcdef"],
+            &["0123456789ABCDEF0123456789ABCDEF"],
             &["../../../etc/pwd"],
             &["--revoke"],
         ] {
