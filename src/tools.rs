@@ -98,13 +98,25 @@ impl OpenCode {
         match self {
             Self::UserPath => {
                 let path = env::var_os("PATH").unwrap_or_default();
-                find_in_path(reviewer.program(), &path).ok_or_else(|| {
+                let found = find_in_path(reviewer.program(), &path).ok_or_else(|| {
                     Error::Refused(format!(
                         "{} (`{}`) was not found on PATH",
                         reviewer.label(),
                         reviewer.program()
                     ))
-                })
+                })?;
+                let scratch = scratch_directories(
+                    env::var_os("HOME").as_deref(),
+                    env::var_os("XDG_CACHE_HOME").as_deref(),
+                );
+                refuse_planted(&found, &scratch).map_err(|reason| {
+                    Error::Refused(format!(
+                        "{} at {} is not used: {reason}; anything running as another user, or anything that writes a cache or temporary file, could have put it there. Install it in a directory only you or root can write, or fix PATH",
+                        reviewer.label(),
+                        found.display()
+                    ))
+                })?;
+                Ok(found)
             }
             Self::SystemOnly => {
                 let paths = reviewer.system_paths();
@@ -141,6 +153,60 @@ pub fn find_in_path(name: &str, path: &OsStr) -> Option<PathBuf> {
                 metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
             })
         })
+}
+
+/// Where temporary and cached files go: no place for the program that
+/// judges what may be installed. `home` and `cache` are `$HOME` and
+/// `$XDG_CACHE_HOME`.
+fn scratch_directories(home: Option<&OsStr>, cache: Option<&OsStr>) -> Vec<PathBuf> {
+    let mut directories: Vec<PathBuf> = ["/tmp", "/var/tmp", "/dev/shm"]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    directories.extend(
+        home.filter(|home| !home.is_empty())
+            .map(|home| Path::new(home).join(".cache")),
+    );
+    directories.extend(
+        cache
+            .filter(|cache| Path::new(cache).is_absolute())
+            .map(PathBuf::from),
+    );
+    directories
+}
+
+/// Why a reviewer found on `PATH` at `found` is not trusted to be the one
+/// the user installed: it, or the directory it is in, can be written by
+/// group or others, or it lies under one of the `scratch` directories.
+/// Both the place `PATH` names and the place a link there leads to are
+/// checked.
+fn refuse_planted(found: &Path, scratch: &[PathBuf]) -> Result<(), String> {
+    let resolved =
+        fs::canonicalize(found).map_err(|error| format!("it cannot be resolved ({error})"))?;
+    for path in [found, resolved.as_path()] {
+        if let Some(directory) = scratch.iter().find(|directory| path.starts_with(directory)) {
+            return Err(format!(
+                "{} is under {}, a temporary or cache directory",
+                path.display(),
+                directory.display()
+            ));
+        }
+        let directory = path.parent().unwrap_or(path);
+        for (what, entry) in [("the directory", directory), ("the file", path)] {
+            let writable = fs::metadata(entry)
+                .map_err(|error| format!("{} cannot be read ({error})", entry.display()))?
+                .mode()
+                & 0o022
+                != 0;
+            if writable {
+                return Err(format!(
+                    "{what} {} is writable by other users",
+                    entry.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Requires `path` and every directory above it to be owned by root and not
@@ -212,16 +278,26 @@ pub fn run(
     run_with(program, args, input, env, limits, None)
 }
 
-/// Like `run`, in `directory`.
-pub fn run_in_with_input(
+/// Like `run`, in `directory`, for a child that is fed `input` and must
+/// not inherit the variables named in `unset`.
+pub fn run_in_without(
     program: &Path,
     args: &[OsString],
     input: &[u8],
     directory: &Path,
     env: &[(&str, &str)],
+    unset: &[&str],
     limits: Limits,
 ) -> Result<Captured, Error> {
-    run_with(program, args, Some(input), env, limits, Some(directory))
+    run_inner(
+        program,
+        args,
+        Stdin::Bytes(input),
+        env,
+        unset,
+        limits,
+        Some(directory),
+    )
 }
 
 /// Like `run`, in `directory` and without input.
@@ -244,7 +320,7 @@ pub fn run_with_stdin_file(
     env: &[(&str, &str)],
     limits: Limits,
 ) -> Result<Captured, Error> {
-    run_inner(program, args, Stdin::File(file), env, limits, None)
+    run_inner(program, args, Stdin::File(file), env, &[], limits, None)
 }
 
 enum Stdin<'a> {
@@ -262,7 +338,7 @@ fn run_with(
     directory: Option<&Path>,
 ) -> Result<Captured, Error> {
     let stdin = input.map_or(Stdin::Null, Stdin::Bytes);
-    run_inner(program, args, stdin, env, limits, directory)
+    run_inner(program, args, stdin, env, &[], limits, directory)
 }
 
 fn run_inner(
@@ -270,6 +346,7 @@ fn run_inner(
     args: &[OsString],
     stdin: Stdin<'_>,
     env: &[(&str, &str)],
+    unset: &[&str],
     limits: Limits,
     directory: Option<&Path>,
 ) -> Result<Captured, Error> {
@@ -296,6 +373,9 @@ fn run_inner(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for key in unset {
+        command.env_remove(key);
+    }
     for (key, value) in env {
         command.env(key, value);
     }
@@ -506,6 +586,119 @@ mod tests {
             exit_code_of(ExitStatus::from_raw(3 << 8)),
             ExitCode::from(3)
         );
+    }
+
+    #[test]
+    fn a_child_can_be_run_without_some_of_the_environment() {
+        // PATH is set wherever tests run; the child is started by its
+        // absolute path and does not need it.
+        let seen = |unset: &[&str]| {
+            let captured = super::run_in_without(
+                Path::new("/usr/bin/env"),
+                &[],
+                b"",
+                Path::new("/"),
+                &[("GUARDIAN_TEST_KEPT", "1")],
+                unset,
+                Limits {
+                    timeout_secs: 30,
+                    max_output: 1024 * 1024,
+                },
+            )
+            .unwrap();
+            String::from_utf8_lossy(&captured.stdout).into_owned()
+        };
+        let all = seen(&[]);
+        assert!(all.lines().any(|line| line.starts_with("PATH=")), "{all}");
+        let without = seen(&["PATH", "GUARDIAN_TEST_NOT_SET"]);
+        assert!(
+            !without.lines().any(|line| line.starts_with("PATH=")),
+            "{without}"
+        );
+        assert!(without.contains("GUARDIAN_TEST_KEPT=1"));
+    }
+
+    #[test]
+    fn a_reviewer_in_a_place_others_can_write_is_refused() {
+        use std::fs;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        use super::{refuse_planted, scratch_directories};
+
+        let dir = TempDir::new("reviewer-place");
+        let mode = |path: &Path, mode: u32| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let install = dir.path().join("opt/bin");
+        fs::create_dir_all(&install).unwrap();
+        mode(&install, 0o755);
+        let binary = install.join("claude");
+        write_script(&binary, "#!/bin/sh\n");
+        mode(&binary, 0o755);
+        // Nothing here is a scratch directory for this check.
+        let nowhere = [dir.path().join("cache")];
+        assert_eq!(refuse_planted(&binary, &nowhere), Ok(()));
+
+        // The directory, or the file, writable by group or by everyone.
+        for writable in [0o775, 0o757, 0o1777] {
+            mode(&install, writable);
+            let reason = refuse_planted(&binary, &nowhere).unwrap_err();
+            assert!(
+                reason.contains("the directory") && reason.contains("writable"),
+                "{reason}"
+            );
+        }
+        mode(&install, 0o755);
+        mode(&binary, 0o775);
+        let reason = refuse_planted(&binary, &nowhere).unwrap_err();
+        assert!(reason.contains("the file"), "{reason}");
+        mode(&binary, 0o755);
+
+        // Under a temporary or cache directory, however it is protected.
+        let cached = dir.path().join("cache/tool/bin");
+        fs::create_dir_all(&cached).unwrap();
+        mode(&cached, 0o700);
+        write_script(&cached.join("claude"), "#!/bin/sh\n");
+        let reason = refuse_planted(&cached.join("claude"), &nowhere).unwrap_err();
+        assert!(reason.contains("temporary or cache directory"), "{reason}");
+        // A link from a good directory into one is followed.
+        let linked = install.join("opencode");
+        symlink(cached.join("claude"), &linked).unwrap();
+        assert!(refuse_planted(&linked, &nowhere).is_err());
+        // And one that leads to a directory others can write.
+        let shared = dir.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        mode(&shared, 0o777);
+        write_script(&shared.join("real"), "#!/bin/sh\n");
+        mode(&shared.join("real"), 0o755);
+        let via = install.join("via");
+        symlink(shared.join("real"), &via).unwrap();
+        assert!(refuse_planted(&via, &nowhere).is_err());
+        // A dangling link resolves to nothing.
+        let dangling = install.join("dangling");
+        symlink(dir.path().join("gone"), &dangling).unwrap();
+        assert!(refuse_planted(&dangling, &nowhere).is_err());
+
+        // The places that count: the temporary directories, the user's
+        // cache, and a cache directory named in the environment.
+        let scratch = scratch_directories(Some("/home/u".as_ref()), Some("/var/cache/u".as_ref()));
+        for directory in [
+            "/tmp",
+            "/var/tmp",
+            "/dev/shm",
+            "/home/u/.cache",
+            "/var/cache/u",
+        ] {
+            assert!(
+                scratch.contains(&Path::new(directory).to_path_buf()),
+                "{directory}"
+            );
+        }
+        assert_eq!(
+            scratch_directories(None, Some("relative".as_ref())).len(),
+            3
+        );
+        assert_eq!(scratch_directories(Some("".as_ref()), None).len(), 3);
     }
 
     #[test]
