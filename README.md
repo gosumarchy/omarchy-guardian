@@ -1239,10 +1239,24 @@ says the memory was not used and the review runs in full:
   metadata of at most 64 KiB, a colour profile of at most 1 MiB and an XMP
   packet of at most 16 KiB, no block of text lines in its metadata, and no
   line anywhere that a shell would act on (a shell asked to run a PNG does
-  run it). That last test is a heuristic over the file's bytes: now and
+  run it). A line counts by the text it starts with, whatever bytes end
+  it: a shell reads past them, or stops at a `#`. That last test is a
+  heuristic over the file's bytes: now and
   then it takes a real picture for one, which costs a full review, and it
-  cannot rule out every line a shell could run. Guardian still does not look at
-  what an image shows, so this rests on the approved text not running
+  cannot rule out every line a shell could run. So the exception does not
+  rest on the bytes alone. It holds only away from where files are run: an
+  image in a directory that also holds a script (a file with a shebang,
+  the execute bit, or a `.sh`, `.bash`, `.zsh`, `.fish`, `.py`, `.pl`,
+  `.rb`, `.lua` or `.js` name), or in one whose files a reviewed line runs
+  (`for h in hooks.d/*`, `source dir/*`, `run-parts dir`, `find dir
+  -exec`, `cat dir/* | sh`), is a file Guardian does not read like any
+  other, and a new or changed one means a full review. A wallpaper among
+  wallpapers, or a preview beside configuration files, stays the
+  exception. And a reviewed line that runs, sources or reads in a file
+  named as an image makes the review incomplete, whatever the image holds.
+  Guardian still does not look at what an image shows, and a loop written
+  in another language than shell is not followed to its directory, so
+  what is left rests on the approved text not running
   files it was not sent, which its review is asked to report. A
   source identical to its baseline is answered from the cache when its first
   review is still cached (yay's second `makepkg` pass); otherwise it is
@@ -1370,15 +1384,24 @@ review it in full every time.
   human and the AI reader without changing what a program does (writing
   systems that need these characters, such as right-to-left text and
   translation files, stay quiet). Prose, comments and messages are still
-  sent to the AI review.
+  sent to the AI review. Of an AUR build's upstream code, which the AI
+  judges, these local checks keep two findings: tag characters and
+  reordering controls, which no source code needs.
 - **Network destinations:** literal HTTP(S) hosts in code and runtime config,
   flagging cleartext HTTP and hard-coded IP addresses. A host is also flagged
   when it is one commonly used to deliver or receive stolen data (a paste
   site, a chat webhook such as a Discord or Slack webhook path, a tunnel or
   request catcher, dynamic DNS, a `.onion` address or a link shortener), or
-  when its name is made to read as another — a label mixing alphabets, or a
-  punycode (`xn--`) label. A PKGBUILD's `url=` homepage (never fetched), XML
-  namespace, DTD and schema identifiers are not destinations. URL paths,
+  when its name is made to read as another — a label mixing alphabets or
+  written only in look-alikes of Latin letters, judged the same in its
+  punycode (`xn--`) spelling (a name wholly in one other script is just a
+  name; an `xn--` label that does not decode is flagged), or a name that
+  begins with a well-known code host's but belongs to another domain
+  (`github.com.example.test`). A PKGBUILD's `url=` homepage (never fetched)
+  and `source=` entries (fetched and checked by makepkg), XML
+  namespace, DTD and schema identifiers are not destinations; a recipe's
+  homepage and sources are still checked for a host that reads as another.
+  URL paths,
   queries and credentials are never printed: the host reputation is judged
   from the path internally, without recording it.
 - **Dependencies:** `Cargo.lock`, npm lockfiles, `poetry.lock`, `go.sum` and

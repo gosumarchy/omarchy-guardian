@@ -288,7 +288,7 @@ impl<'a> Mentions<'a> {
 
 /// Whether `name` matches a shell pattern of literal characters, `*` and
 /// `?`.
-fn glob_matches(pattern: &str, name: &str) -> bool {
+pub(crate) fn glob_matches(pattern: &str, name: &str) -> bool {
     let pattern: Vec<char> = pattern.chars().collect();
     let name: Vec<char> = name.chars().collect();
     let (mut at, mut seen) = (0, 0);

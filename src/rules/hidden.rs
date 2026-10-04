@@ -251,34 +251,109 @@ const fn is_cyrillic_or_greek(character: char) -> bool {
     matches!(character, '\u{370}'..='\u{3ff}' | '\u{400}'..='\u{52f}')
 }
 
+/// The letters a punycode label (`xn--` and then `encoded`) spells, by the
+/// decoding of RFC 3492; `None` for one that is not punycode at all.
+fn punycode(encoded: &str) -> Option<String> {
+    const BASE: u32 = 36;
+    const T_MIN: u32 = 1;
+    const T_MAX: u32 = 26;
+    // A DNS label is at most 63 bytes: more is no host name.
+    const MAX_LABEL: usize = 63;
+    if encoded.is_empty() || encoded.len() > MAX_LABEL {
+        return None;
+    }
+    // The ASCII letters come first, as written, before the last hyphen.
+    let (basic, digits) = encoded.rsplit_once('-').unwrap_or(("", encoded));
+    let mut output: Vec<char> = basic.chars().collect();
+    if !basic.is_ascii() || digits.is_empty() {
+        return None;
+    }
+    let mut digits = digits.bytes().peekable();
+    let (mut point, mut at, mut bias) = (128_u32, 0_u32, 72_u32);
+    while digits.peek().is_some() {
+        let before = at;
+        let mut weight = 1_u32;
+        let mut k = BASE;
+        // One number, written in digits whose base changes with `bias`:
+        // how far to step through the output and the code points.
+        loop {
+            let digit = match digits.next()? {
+                letter @ b'a'..=b'z' => u32::from(letter - b'a'),
+                letter @ b'A'..=b'Z' => u32::from(letter - b'A'),
+                number @ b'0'..=b'9' => u32::from(number - b'0') + 26,
+                _ => return None,
+            };
+            at = at.checked_add(digit.checked_mul(weight)?)?;
+            let threshold = k.saturating_sub(bias).clamp(T_MIN, T_MAX);
+            if digit < threshold {
+                break;
+            }
+            weight = weight.checked_mul(BASE - threshold)?;
+            k += BASE;
+        }
+        let length = u32::try_from(output.len()).ok()? + 1;
+        bias = punycode_bias(at - before, length, before == 0);
+        point = point.checked_add(at / length)?;
+        at %= length;
+        output.insert(usize::try_from(at).ok()?, char::from_u32(point)?);
+        at += 1;
+    }
+    Some(output.into_iter().collect())
+}
+
+/// RFC 3492's bias adaptation: the next number's digits are sized by how
+/// large the last one was.
+fn punycode_bias(delta: u32, length: u32, first: bool) -> u32 {
+    let mut delta = if first { delta / 700 } else { delta / 2 };
+    delta += delta / length;
+    let mut k = 0;
+    while delta > (35 * 26) / 2 {
+        delta /= 35;
+        k += 36;
+    }
+    k + (36 * delta) / (delta + 38)
+}
+
+/// Whether one label of a host name mixes Latin letters with Cyrillic or
+/// Greek ones, or is written only with look-alikes of Latin letters.
+fn is_lookalike_label(label: &str) -> bool {
+    let foreign = label.chars().any(is_cyrillic_or_greek);
+    let latin = label
+        .chars()
+        .any(|character| character.is_ascii_alphabetic());
+    foreign
+        && (latin
+            || label
+                .chars()
+                .filter(|character| character.is_alphabetic())
+                .all(|character| LOOKALIKES.contains(&character)))
+}
+
 /// A host name made to read as another: a label that mixes Latin letters
-/// with Cyrillic or Greek ones, a label written only with look-alikes of
-/// Latin letters, or a punycode label (`xn--…`), which hides what it
-/// spells. A name written wholly in one other script is just a name.
+/// with Cyrillic or Greek ones, or a label written only with look-alikes
+/// of Latin letters. A punycode label (`xn--…`) is judged by the letters
+/// it spells, and one that spells nothing is no name anyone registered in
+/// good faith. A name written wholly in one other script is just a name,
+/// in either spelling.
 pub fn is_lookalike_host(host: &str) -> bool {
     host.split('.').any(|label| {
-        if label.starts_with("xn--") {
-            return true;
+        let ascii_form = label
+            .get(..4)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("xn--"))
+            .map(|_| &label[4..]);
+        match ascii_form {
+            Some(encoded) => punycode(encoded).is_none_or(|spelled| {
+                // Punycode of plain ASCII is not what any registry issues.
+                spelled.is_ascii() || is_lookalike_label(&spelled)
+            }),
+            None => is_lookalike_label(label),
         }
-        let foreign: Vec<char> = label
-            .chars()
-            .filter(|character| is_cyrillic_or_greek(*character))
-            .collect();
-        let latin = label
-            .chars()
-            .any(|character| character.is_ascii_alphabetic());
-        !foreign.is_empty()
-            && (latin
-                || label
-                    .chars()
-                    .filter(|character| character.is_alphabetic())
-                    .all(|character| LOOKALIKES.contains(&character)))
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{RuleId, findings, is_lookalike_host};
+    use super::{RuleId, findings, is_lookalike_host, punycode};
 
     fn rules_in(rel: &str, text: &str) -> Vec<RuleId> {
         findings(rel, text)
@@ -400,12 +475,23 @@ mod tests {
             // Every letter a look-alike: reads as `apple`.
             "\u{430}\u{440}\u{440}\u{4cf}\u{435}.com",
             "g\u{3bf}\u{3bf}gle.com",
+            // Labels that are not punycode, or spell only ASCII.
+            "xn--.com",
+            "xn--example-.com",
+            "xn--99999999999999.com",
         ] {
             assert!(is_lookalike_host(host), "{host}");
         }
         for host in [
             "example.com",
             "xn.example.com",
+            // The same names as a resolver and most build files write them.
+            "xn--d1acpjx3f.xn--p1ai",
+            "xn--e1afmkfd.com",
+            "xn--mnchen-3ya.de",
+            "XN--MNCHEN-3YA.de",
+            "xn--r8jz45g.jp",
+            "xn--hxargifdar.gr",
             "яндекс.рф",
             "пример.com",
             "münchen.de",
@@ -413,6 +499,62 @@ mod tests {
             "ελληνικά.gr",
         ] {
             assert!(!is_lookalike_host(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn punycode_is_decoded_as_the_rfc_says() {
+        // The sample strings of RFC 3492, section 7.1.
+        for (encoded, spelled) in [
+            (
+                "egbpdaj6bu4bxfgehfvwxn",
+                "\u{644}\u{64a}\u{647}\u{645}\u{627}\u{628}\u{62a}\u{643}\u{644}\u{645}\u{648}\u{634}\u{639}\u{631}\u{628}\u{64a}\u{61f}",
+            ),
+            (
+                "ihqwcrb4cv8a8dqg056pqjye",
+                "\u{4ed6}\u{4eec}\u{4e3a}\u{4ec0}\u{4e48}\u{4e0d}\u{8bf4}\u{4e2d}\u{6587}",
+            ),
+            (
+                "b1abfaaepdrnnbgefbaDotcwatmq2g4l",
+                "почемужеонинеговорятпорусски",
+            ),
+            (
+                "PorqunopuedensimplementehablarenEspaol-fmd56a",
+                "Porqu\u{e9}nopuedensimplementehablarenEspa\u{f1}ol",
+            ),
+            (
+                "3B-ww4c5e180e575a65lsy2b",
+                "3\u{5e74}B\u{7d44}\u{91d1}\u{516b}\u{5148}\u{751f}",
+            ),
+            (
+                "MajiKoi5-783gue6qz075azm5e",
+                "Maji\u{3067}Koi\u{3059}\u{308b}5\u{79d2}\u{524d}",
+            ),
+            (
+                "d9juau41awczczp",
+                "\u{305d}\u{306e}\u{30b9}\u{30d4}\u{30fc}\u{30c9}\u{3067}",
+            ),
+            // Names as registries hold them.
+            ("mnchen-3ya", "münchen"),
+            ("bcher-kva", "bücher"),
+            ("pypal-4ve", "p\u{430}ypal"),
+            ("80ak6aa92e", "\u{430}\u{440}\u{440}\u{4cf}\u{435}"),
+            ("p1ai", "рф"),
+        ] {
+            assert_eq!(punycode(encoded).as_deref(), Some(spelled), "{encoded}");
+        }
+        // The RFC's one sample of plain ASCII ends in the delimiter.
+        assert_eq!(punycode("-> $1.00 <--").as_deref(), None);
+        for bad in [
+            "",
+            "abc-",
+            "a_b",
+            "é-kva",
+            // A step past the last code point, and past a number's size.
+            "99999999999999",
+            &"a".repeat(64),
+        ] {
+            assert_eq!(punycode(bad), None, "{bad:?}");
         }
     }
 }
