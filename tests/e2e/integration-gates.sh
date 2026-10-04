@@ -15,8 +15,15 @@
 # Requirements: bwrap (0.9 or newer, for --tmp-overlay), bsdtar, pacman, git,
 # flock, curl, and a reviewer: opencode with an OpenCode configuration that can
 # complete a review, or claude with a login when GUARDIAN_E2E_MODEL names a
-# claude-code/ model. Exits 77 (skip) when the reviewer is missing, because
-# every gate is fail-closed on a failed AI review.
+# claude-code/ model. Exits 77 (skip) when the reviewer is missing, or is in
+# a place Guardian refuses to run one from, because every gate is fail-closed
+# on a failed AI review.
+#
+# No case here needs an answer on the terminal: the gates run in a new
+# session without one, where a question (the level without AI, a build of
+# prebuilt programs, a recipe whose sources cannot be followed) is answered
+# no and ends as NOT CONFIRMED (exit 2). What the gates decide without a
+# review is in gates-offline.sh, which calls no reviewer.
 #
 # Usage:
 #   cargo build --release
@@ -60,6 +67,27 @@ done
 if [[ $reviewer == opencode && ( ! -f $OPENCODE_CONFIG_DIR/opencode.json || ! -d $OPENCODE_DATA_DIR ) ]]; then
     printf 'OpenCode is not configured (looked for %s/opencode.json); skipping\n' \
         "$OPENCODE_CONFIG_DIR" >&2
+    exit 77
+fi
+# Guardian does not run a reviewer it finds on PATH in a place other users
+# can write, or under a temporary directory: every review here would come
+# out unavailable. Said once, instead of as twenty failures. (The user's
+# cache directory is refused too, but not in the sandbox, whose home is
+# another.)
+reviewer_refused() {
+    local found path
+    found=$(command -v "$reviewer")
+    for path in "$found" "$(readlink -f -- "$found")"; do
+        case $path in
+            /tmp/* | /var/tmp/* | /dev/shm/*) return 0 ;;
+        esac
+        [[ -z $(find -L "$path" "$(dirname -- "$path")" -maxdepth 0 -perm /022 2>/dev/null) ]] || return 0
+    done
+    return 1
+}
+if reviewer_refused; then
+    printf '%s is in a temporary directory or one other users can write; Guardian would refuse it. Skipping\n' \
+        "$(command -v "$reviewer")" >&2
     exit 77
 fi
 
@@ -356,6 +384,10 @@ MOCK
     run_shim "$E2E/build" --noconfirm >/dev/null
     expect 'malicious PKGBUILD is blocked' 1 "$?"
     expect_no_mock_run 'makepkg'
+    # OMARCHY_GUARDIAN_NO_NOTIFY only keeps the pop-up away: the report of
+    # the block is saved, here in the sandbox's own cache directory.
+    compgen -G "$HOME/.cache/omarchy-guardian/reports/*.html" >/dev/null
+    expect 'the block is saved as a report' 0 "$?"
 
     make_pkgbuild 'make'
     run_shim "$E2E/build" --noconfirm --stats >/dev/null

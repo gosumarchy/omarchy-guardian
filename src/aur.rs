@@ -3334,4 +3334,88 @@ pkgname = demo
         // They are still all sent: none is dropped.
         assert_eq!(upstream.files.len(), 3);
     }
+
+    #[test]
+    fn no_listing_makes_its_readers_panic_and_an_accepted_one_is_makepkgs_shape() {
+        use super::{base_section, check_listing, written_mismatch};
+        use crate::test_support::Rng;
+
+        const PIECES: &[&str] = &[
+            "pkgbase = demo\n",
+            "pkgname = demo\n",
+            "\tpkgver = 1\n",
+            "\tsource = a.tar.gz\n",
+            "\tsource_x86_64 = https://example.test/x\n",
+            "\tsha256sums = SKIP\n",
+            "\tsha256sums_x86_64 = abc\n",
+            "\tb2sums = SKIP\n",
+            "\tnoextract = a.tar.gz\n",
+            "\t",
+            " = ",
+            "=",
+            "pkgbase",
+            "pkgname",
+            "source",
+            "_",
+            "\n",
+            "\r",
+            " ",
+            "x",
+            "é",
+            "::",
+            "\u{1b}[2K",
+            "\u{0}",
+            "\u{202e}",
+            "echo hello\n",
+            "\tpkgbase = other\n",
+        ];
+        let listing = "pkgbase = demo\n\tpkgver = 1\n\tsource = a.tar.gz\n\tsource = b::https://example.test/b\n\tsource_x86_64 = c\n\tsha256sums = SKIP\n\tsha256sums = abc\n\tsha256sums_x86_64 = def\n\npkgname = demo\n\tdepends = glibc\n";
+        assert_eq!(check_listing(listing), Ok(()));
+        assert_eq!(parse_srcinfo(listing).len(), 3);
+
+        let check = |text: &str| {
+            let sources = parse_srcinfo(text);
+            // One source for each `source` line of the base section.
+            let listed = base_section(text)
+                .filter(|(key, _)| key.split_once('_').map_or(*key, |(base, _)| base) == "source")
+                .count();
+            assert_eq!(sources.len(), listed, "{text:?}");
+            drop(written_mismatch(
+                &[("source".into(), vec!["a".into()])],
+                text,
+            ));
+            if check_listing(text).is_ok() {
+                let mut lines = text.lines();
+                assert!(
+                    lines
+                        .next()
+                        .is_some_and(|line| line.starts_with("pkgbase = "))
+                );
+                for line in lines.filter(|line| !line.is_empty()) {
+                    assert!(
+                        line.starts_with("pkgname = ") || line.starts_with('\t'),
+                        "{text:?}"
+                    );
+                    assert!(!line.trim_start().starts_with("pkgbase ="), "{text:?}");
+                    assert!(
+                        !line.chars().any(|c| c.is_control() && c != '\t'),
+                        "{text:?}"
+                    );
+                }
+            }
+        };
+        let mut rng = Rng::new(21);
+        let mut accepted = 0;
+        for _ in 0..8_000 {
+            let text = rng.text(PIECES, 12);
+            check(&text);
+            let mutated = rng.mutated(listing, PIECES);
+            accepted += usize::from(check_listing(&mutated).is_ok());
+            check(&mutated);
+            // Anything the recipe printed before makepkg's first line.
+            let before = format!("{}{listing}", rng.pick(PIECES));
+            assert!(check_listing(&before).is_err(), "{before:?}");
+        }
+        assert!(accepted > 20, "{accepted}");
+    }
 }

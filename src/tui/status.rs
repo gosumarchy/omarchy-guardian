@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::integrations::{Integration, Paths, State};
 use super::paths;
+use crate::agent;
 use crate::config::Settings;
 use crate::config::model::{
     Action, AiRequirement, Named, Profile, RootConsent, SourceClass, builtin,
@@ -23,8 +24,10 @@ use crate::gatewatch::{self, Level, Observer};
 use crate::json::Json;
 use crate::notify;
 use crate::pacman;
-use crate::sweep::root::{RESULTS, results_problem};
+use crate::rules::RuleId;
+use crate::sweep::root::{RESULTS, RootPart, from_results, results_problem};
 use crate::sweep::state::{self, LastRun, Outcome};
+use crate::tools::Reviewer;
 
 /// A block younger than this needs attention until it is dismissed.
 const RECENT_SECS: u64 = 24 * 60 * 60;
@@ -128,6 +131,7 @@ fn collect() -> Status {
     }
     issues.extend(quiet_weakenings(&settings, paths.as_ref()));
     if let Some(paths) = &paths {
+        issues.extend(overrides_issue(&root_overrides(paths)));
         let enabled = |link: &Path| fs::symlink_metadata(link).is_ok();
         if enabled(&paths.sweep_timer_link) {
             let root_problem = (paths.sweep_consent == Some(RootConsent::Allowed)
@@ -165,6 +169,59 @@ fn collect() -> Status {
     }
 }
 
+/// Root's results are a few kilobytes; past this the bar leaves them to
+/// the sweep, which reads them whole.
+const MAX_ROOT_RESULTS: u64 = 4 * 1024 * 1024;
+
+/// The files the daily root checks reported standing in for one of the
+/// sweep's own units (a unit or a drop-in in another account-wide or
+/// per-user unit directory), absolute, without those the bar found itself
+/// and names beside the sweep's gate. Empty when the root checks are off
+/// or their results are not usable: that is a problem of its own.
+fn root_overrides(paths: &Paths) -> Vec<String> {
+    let enabled = |link: &Path| fs::symlink_metadata(link).is_ok();
+    if paths.sweep_consent != Some(RootConsent::Allowed) || !enabled(&paths.sweep_root_timer_link) {
+        return Vec::new();
+    }
+    let results = Path::new(RESULTS);
+    if fs::metadata(results).map_or(true, |metadata| metadata.len() > MAX_ROOT_RESULTS) {
+        return Vec::new();
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    from_results(results, now)
+        .map(|part| reported_overrides(&part, &paths.sweep_overrides))
+        .unwrap_or_default()
+}
+
+/// The items among root's that carry the alert, without the `known` ones.
+fn reported_overrides(part: &RootPart, known: &[String]) -> Vec<String> {
+    part.items
+        .iter()
+        .filter(|item| {
+            item.alerts
+                .iter()
+                .any(|(rule, _)| *rule == RuleId::GuardianOverride)
+        })
+        .filter(|item| !known.contains(&item.path))
+        .map(|item| format!("/{}", item.path))
+        .collect()
+}
+
+/// The bar's line for them.
+fn overrides_issue(found: &[String]) -> Option<String> {
+    let (first, rest) = found.split_first()?;
+    Some(format!(
+        "the root checks found {first}{} standing in for, or changing, one of Guardian's own sweep units: the sweep may not run as packaged (see `omarchy-guardian sweep`)",
+        if rest.is_empty() {
+            String::new()
+        } else {
+            format!(" and {} more", rest.len())
+        }
+    ))
+}
+
 /// What makes protection less than the gates' states say, each a problem
 /// for the bar: a class reviewed more weakly than its level, an AUR helper
 /// with no gate, and what was on when Guardian last looked and is not now.
@@ -187,7 +244,12 @@ fn quiet_weakenings(settings: &Settings, paths: Option<&Paths>) -> Vec<String> {
         issues.extend(
             gatewatch::observe(&snapshot_of(settings, paths), Observer::Watching)
                 .into_iter()
-                .filter(|(key, _)| !GATES.iter().any(|gate| gate.label() == key))
+                // What the root checks saw standing in for the sweep's
+                // units is listed for as long as it is there (`collect`).
+                .filter(|(key, _)| {
+                    key != gatewatch::SWEEP_UNITS
+                        && !GATES.iter().any(|gate| gate.label() == key)
+                })
                 .map(|(_, line)| line),
         );
     }
@@ -242,6 +304,21 @@ fn snapshot_of(settings: &Settings, paths: Option<&Paths>) -> gatewatch::Snapsho
         level: if usable { Level::On } else { Level::Off },
         now: "a Guardian settings file cannot be used".into(),
     });
+    // A settings file of the reviewer's own in /etc applies to every
+    // review, whatever Guardian passes the reviewer.
+    let mut reviewers: Vec<Reviewer> = [SourceClass::Aur, SourceClass::Official]
+        .iter()
+        .map(|class| Reviewer::for_model(settings.agent_settings(*class).model.as_deref()))
+        .collect();
+    reviewers.dedup();
+    let exposures: Vec<agent::Exposure> = reviewers
+        .into_iter()
+        .map(|reviewer| agent::exposure(reviewer, true))
+        .collect();
+    gates.push(gatewatch::reviewer_settings(&exposures));
+    gates.push(gatewatch::sweep_units(
+        &paths.map(root_overrides).unwrap_or_default(),
+    ));
     gatewatch::Snapshot {
         gates,
         weak: weaker::weakenings(settings)
@@ -677,6 +754,66 @@ mod tests {
 
     use super::{RECENT_SECS, SEEN, age, last_block, mark_seen_unless_waiting, markup_safe};
     use crate::test_support::TempDir;
+
+    #[test]
+    fn what_root_saw_standing_in_for_the_sweeps_units_is_a_problem_of_the_bars() {
+        use super::{overrides_issue, reported_overrides};
+        use crate::autorun::Category;
+        use crate::rules::RuleId;
+        use crate::sweep::collect::{Body, Item, Origin};
+        use crate::sweep::root::RootPart;
+        use crate::sweep::tier::Tier;
+
+        let item = |path: &str, rule: Option<RuleId>| Item {
+            origin: Origin::Root,
+            category: Category::Systemd,
+            path: path.into(),
+            tier: Tier::Unknown,
+            sha256: None,
+            body: Body::Link("/dev/null".into()),
+            runs: Vec::new(),
+            run_by: None,
+            notes: Vec::new(),
+            alerts: rule
+                .map(|rule| (rule, "seen".to_string()))
+                .into_iter()
+                .collect(),
+        };
+        let part = RootPart {
+            items: vec![
+                item("etc/systemd/system/other.service", None),
+                item(
+                    "etc/systemd/user/omarchy-guardian-sweep.timer",
+                    Some(RuleId::GuardianOverride),
+                ),
+                item(
+                    "home/u/.config/systemd/user/omarchy-guardian-sweep.service.d/x.conf",
+                    Some(RuleId::GuardianOverride),
+                ),
+                item("etc/ld.so.preload", Some(RuleId::ModifiedPackageFile)),
+            ],
+            ..RootPart::default()
+        };
+        // The one the bar found itself is named beside the sweep's gate.
+        let known =
+            ["home/u/.config/systemd/user/omarchy-guardian-sweep.service.d/x.conf".to_string()];
+        let found = reported_overrides(&part, &known);
+        assert_eq!(found, ["/etc/systemd/user/omarchy-guardian-sweep.timer"]);
+        let issue = overrides_issue(&found).unwrap();
+        assert!(
+            issue.starts_with(
+                "the root checks found /etc/systemd/user/omarchy-guardian-sweep.timer standing in"
+            ),
+            "{issue}"
+        );
+        assert_eq!(reported_overrides(&part, &[]).len(), 2);
+        assert!(
+            overrides_issue(&reported_overrides(&part, &[]))
+                .unwrap()
+                .contains(" and 1 more ")
+        );
+        assert_eq!(overrides_issue(&[]), None);
+    }
 
     #[test]
     fn a_requested_report_is_seen_unless_an_alert_is_waiting() {

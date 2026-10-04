@@ -3351,9 +3351,9 @@ mod tests {
         assert_eq!(
             seen,
             [
-                ("usr/bin/awk", Category::LocalBin, "modified"),
-                ("usr/bin/cat", Category::LocalBin, "modified"),
-                ("usr/bin/stray", Category::LocalBin, "unknown"),
+                ("usr/bin/awk", Category::Program, "modified"),
+                ("usr/bin/cat", Category::Program, "modified"),
+                ("usr/bin/stray", Category::Program, "unknown"),
                 ("usr/lib/libstray.so", Category::Linker, "unknown"),
                 ("usr/lib/libz.so.1", Category::Linker, "modified"),
                 (
@@ -3615,5 +3615,62 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn no_getcap_output_makes_its_reader_panic_and_what_is_read_is_a_path_with_clauses() {
+        use crate::test_support::Rng;
+
+        const PIECES: &[&str] = &[
+            "/usr/bin/demo",
+            "/usr/bin/a b",
+            "/",
+            " ",
+            "  ",
+            "\n",
+            "\r",
+            "=ep",
+            "+ep",
+            "-ep",
+            "cap_net_raw",
+            "cap_kill,cap_chown",
+            "41",
+            "=",
+            "+",
+            "-",
+            "e",
+            "i",
+            "p",
+            ",",
+            " [rootid=1000]",
+            "[rootid=",
+            "]",
+            "é",
+            "\u{1f600}",
+            "\u{0}",
+            "\t",
+            "x",
+        ];
+        let output = "/usr/bin/python3 =ep\n/usr/bin/a b cap_kill+ep cap_chown+i\n/usr/bin/x cap_net_raw=ep [rootid=1000]\nno clause here\n";
+        assert_eq!(parse_getcap(output).len(), 3);
+
+        let check = |text: &str| {
+            let lines = text.lines().count();
+            let found = parse_getcap(text);
+            // At most one file for each line, never one without clauses.
+            assert!(found.len() <= lines, "{text:?}");
+            for (path, capabilities) in found {
+                assert!(!path.contains('\n') && !capabilities.is_empty(), "{text:?}");
+                assert!(
+                    capabilities.split(' ').all(super::is_clause),
+                    "{text:?}: {capabilities:?}"
+                );
+            }
+        };
+        let mut rng = Rng::new(41);
+        for _ in 0..10_000 {
+            check(&rng.text(PIECES, 14));
+            check(&rng.mutated(output, PIECES));
+        }
     }
 }

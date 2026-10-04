@@ -53,10 +53,13 @@ pub enum Category {
     Account,
     Terminal,
     Toolchain,
+    /// The system's own program directory, which the sweep compares with
+    /// the packages: a changed or unowned file there.
+    Program,
 }
 
 impl Category {
-    pub const ALL: [Self; 37] = [
+    pub const ALL: [Self; 38] = [
         Self::Autostart,
         Self::Boot,
         Self::BootConfig,
@@ -94,6 +97,7 @@ impl Category {
         Self::Account,
         Self::Terminal,
         Self::Toolchain,
+        Self::Program,
     ];
 
     /// A stable machine name (`pam`, `systemd-generator`).
@@ -136,6 +140,7 @@ impl Category {
             Self::Account => "account",
             Self::Terminal => "terminal",
             Self::Toolchain => "toolchain",
+            Self::Program => "program",
         }
     }
 
@@ -198,6 +203,7 @@ impl Category {
             Self::Browser => "Browser flags, policies and native hosts",
             Self::Terminal => "Terminal and prompt configuration",
             Self::Toolchain => "Developer tool configuration (npm, pip, cargo, mise)",
+            Self::Program => "The system's own programs",
         }
     }
 
@@ -236,6 +242,7 @@ impl Category {
             Self::Account => "lets someone log in or administer",
             Self::Terminal => "runs in every terminal",
             Self::Toolchain => "decides what builds and installs run and fetch",
+            Self::Program => "runs when anything starts it by name",
         }
     }
 }

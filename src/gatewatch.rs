@@ -7,6 +7,11 @@
 //! the gate is back on or `status --dismiss`. What the user turns off
 //! through Guardian itself is recorded without a notification.
 //!
+//! Watched the same way, beside the gates: the wrappers on the session's
+//! PATH, the pacman gate's root-owned reviewer, the settings files, a
+//! system-wide settings file of the reviewer's appearing in `/etc`, and a
+//! file standing in for one of the sweep's own units.
+//!
 //! The record is a file in the user's own state directory. It catches
 //! things breaking and crude tampering (a line removed from `~/.bashrc`);
 //! a program that also rewrites the record is not caught.
@@ -17,6 +22,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use crate::agent::Exposure;
 use crate::config::Settings;
 use crate::engine::store::{self, Store};
 use crate::json::Json;
@@ -68,6 +74,83 @@ pub struct Snapshot {
     /// Settings weaker than their level and not accepted: the system
     /// file's key for each, and the line that says it.
     pub weak: Vec<(String, String)>,
+}
+
+/// The record's name for the reviewer's system-wide settings.
+pub const REVIEWER_SETTINGS: &str = "reviewer settings";
+/// The record's name for what the root checks saw standing in for the
+/// sweep's own units.
+pub const SWEEP_UNITS: &str = "sweep units";
+
+/// How `agent::exposure` words a system-wide settings file the reviewer
+/// loads; the file's path follows.
+const LOADS_SETTINGS: &str = "the reviewer loads system-wide settings from ";
+
+/// The reviewer's system-wide settings as something to watch: a file in
+/// `/etc/claude-code` or `/etc/opencode` applies to every review whatever
+/// Guardian passes the reviewer, and one that appears was put there by root
+/// or by a package. On with none, partly on with one that sets nothing
+/// that could redirect a review, off with one the pacman gate refuses to
+/// review through. `exposures` holds what `agent::exposure` says of each
+/// reviewer in use, asked as for a root transaction.
+pub fn reviewer_settings(exposures: &[Exposure]) -> Gate {
+    let mut files: Vec<&str> = exposures
+        .iter()
+        .flat_map(|exposure| &exposure.notes)
+        .filter_map(|note| note.strip_prefix(LOADS_SETTINGS))
+        .collect();
+    files.sort_unstable();
+    files.dedup();
+    let refused = exposures.iter().any(|exposure| exposure.refusal.is_some());
+    let (level, now) = match (files.is_empty(), refused) {
+        (true, false) => (
+            Level::On,
+            "the reviewer loads no system-wide settings".to_string(),
+        ),
+        (_, true) => (
+            Level::Off,
+            format!(
+                "the reviewer's system-wide settings ({}) could send a review elsewhere or run commands during it; the pacman gate does not review through them",
+                files.join(", ")
+            ),
+        ),
+        (false, false) => (
+            Level::Partial,
+            format!(
+                "the reviewer now loads system-wide settings ({}), which apply to every review",
+                files.join(", ")
+            ),
+        ),
+    };
+    Gate {
+        key: REVIEWER_SETTINGS.into(),
+        level,
+        now,
+    }
+}
+
+/// What the root checks saw standing in for one of the sweep's own units
+/// (`paths`, absolute), as something to watch: on with none.
+pub fn sweep_units(paths: &[String]) -> Gate {
+    Gate {
+        key: SWEEP_UNITS.into(),
+        level: if paths.is_empty() {
+            Level::On
+        } else {
+            Level::Off
+        },
+        now: match paths {
+            [] => "nothing stands in for the sweep's own units".into(),
+            [first, rest @ ..] => format!(
+                "the root checks found {first}{} standing in for one of the sweep's own units",
+                if rest.is_empty() {
+                    String::new()
+                } else {
+                    format!(" and {} more", rest.len())
+                }
+            ),
+        },
+    }
 }
 
 /// Who is looking.
@@ -408,6 +491,68 @@ mod tests {
         // A gate that came on, or was never on, is not.
         let more = snapshot(&[("aur", Level::Partial), ("theme", Level::On)], &[]);
         assert_eq!(observe_in(dir.path(), &more, Observer::Watching).1, None);
+    }
+
+    #[test]
+    fn a_reviewer_settings_file_appearing_is_a_drop() {
+        use super::{REVIEWER_SETTINGS, SWEEP_UNITS, reviewer_settings, sweep_units};
+        use crate::agent::Exposure;
+
+        let exposed = |notes: &[&str], refusal: Option<&str>| Exposure {
+            notes: notes.iter().map(ToString::to_string).collect(),
+            refusal: refusal.map(str::to_string),
+        };
+        // The variables a reviewer ran with are not this gate's.
+        let none = reviewer_settings(&[
+            exposed(&["removed from the reviewer's environment: X"], None),
+            Exposure::default(),
+        ]);
+        assert_eq!(
+            (none.key.as_str(), none.level),
+            (REVIEWER_SETTINGS, Level::On)
+        );
+
+        let file =
+            "the reviewer loads system-wide settings from /etc/claude-code/managed-settings.json";
+        let loaded = reviewer_settings(&[exposed(&[file], None), exposed(&[file], None)]);
+        assert_eq!(loaded.level, Level::Partial);
+        assert_eq!(
+            loaded
+                .now
+                .matches("/etc/claude-code/managed-settings.json")
+                .count(),
+            1,
+            "{}",
+            loaded.now
+        );
+        let refused = reviewer_settings(&[exposed(&[file], Some("sets hooks"))]);
+        assert_eq!(refused.level, Level::Off);
+        assert!(refused.now.contains("pacman gate"), "{}", refused.now);
+
+        // Appearing is news once, and stays until it is gone or dismissed.
+        let dir = TempDir::new("gatewatch-reviewer");
+        let with = |gate: Gate| Snapshot {
+            gates: vec![gate],
+            weak: Vec::new(),
+        };
+        observe_in(dir.path(), &with(none.clone()), Observer::Watching);
+        let (standing, news) = observe_in(dir.path(), &with(loaded.clone()), Observer::Watching);
+        assert_eq!(lines(&standing), [REVIEWER_SETTINGS]);
+        assert_eq!(news, Some(loaded.now));
+        assert_eq!(
+            observe_in(dir.path(), &with(none), Observer::Watching),
+            (Vec::new(), None)
+        );
+
+        let clear = sweep_units(&[]);
+        assert_eq!((clear.key.as_str(), clear.level), (SWEEP_UNITS, Level::On));
+        let found = sweep_units(&["/etc/systemd/user/a.timer".into(), "/b".into()]);
+        assert_eq!(found.level, Level::Off);
+        assert!(
+            found.now.contains("/etc/systemd/user/a.timer and 1 more"),
+            "{}",
+            found.now
+        );
     }
 
     #[test]

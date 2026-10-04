@@ -532,4 +532,68 @@ mod tests {
         assert_eq!(index.len(), 7);
         assert_eq!(index.problems.len(), 1, "{:?}", index.problems);
     }
+
+    #[test]
+    fn no_record_makes_its_readers_panic_and_what_is_read_is_a_plain_path() {
+        use crate::test_support::Rng;
+
+        const PIECES: &[&str] = &[
+            "#mtree\n",
+            "/set type=file uid=0 gid=0 mode=644\n",
+            "/unset mode\n",
+            "./usr/bin/demo",
+            "./etc/demo.conf",
+            "./.PKGINFO",
+            "./",
+            ".",
+            "/",
+            " ",
+            "\n",
+            "\t",
+            "time=1.0",
+            "mode=755",
+            "mode=+755",
+            "mode=99999999999",
+            "size=3",
+            "type=file",
+            "type=link",
+            "type=dir",
+            "link=x.so.1",
+            "link=",
+            "sha256digest=",
+            "\\040",
+            "\\012",
+            "\\777",
+            "\\",
+            "\\x",
+            "=",
+            "é",
+            "\u{0}",
+            "..",
+            "//",
+        ];
+        let digest = Sha256::digest(b"abc");
+        let record = format!(
+            "#mtree\n/set type=file uid=0 gid=0 mode=644\n./usr/bin/demo time=1.0 mode=755 size=3 sha256digest={digest}\n./usr/lib/x\\040y.so type=link link=x.so.1\n./usr/share type=dir\n./.PKGINFO size=1\n"
+        );
+        assert_eq!(parse_mtree(&record).len(), 2);
+
+        let check = |text: &str| {
+            for (path, recorded) in parse_mtree(text) {
+                assert!(!path.is_empty() && !path.starts_with('.'), "{text:?}");
+                assert!(!path.chars().any(char::is_control), "{text:?}");
+                if let Recorded::Link(target) = recorded {
+                    assert!(!target.chars().any(char::is_control), "{text:?}");
+                }
+            }
+            drop(backup_paths(text));
+            drop(package_name(text));
+            drop(parse_names(text.as_bytes()));
+        };
+        let mut rng = Rng::new(31);
+        for _ in 0..8_000 {
+            check(&rng.text(PIECES, 16));
+            check(&rng.mutated(&record, PIECES));
+        }
+    }
 }

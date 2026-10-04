@@ -39,10 +39,17 @@
 #
 # Nothing is installed or built: the pacman gate is run by a stand-in parent
 # named pacman, and the makepkg gate by a makepkg that runs only the
-# --printsrcinfo and source extraction steps for real; the command `guard`
-# would start only leaves a marker. Every run starts with an empty review
-# memory, so no verdict comes from the cache (an upgrade case keeps its own
-# between its two versions).
+# --printsrcinfo and source extraction steps for real (in a bwrap sandbox
+# where it is /usr/bin/makepkg, since the gate's own jail shows nothing of
+# this run's directory); the command `guard` would start only leaves a
+# marker. Every run starts with an empty review memory, so no verdict comes
+# from the cache (an upgrade case keeps its own between its two versions).
+# Reports of the blocks are saved in the run's own directory, not in the
+# real reports directory, and no pop-up is shown.
+#
+# No case here may need an answer on the terminal: a build of prebuilt
+# programs, or a recipe whose sources the gate cannot follow, ends as
+# NOT CONFIRMED (exit 2) and is counted incomplete.
 #
 # The pacman gate reviews with the system config and a root-owned reviewer
 # (/usr/bin/opencode or /usr/bin/claude), as it does for real; the makepkg gate
@@ -93,11 +100,29 @@ EOF
 cat >"$WORK/makepkg" <<'EOF'
 #!/bin/sh
 case " $* " in
-*" --printsrcinfo "* | *" --nobuild "*) exec /usr/bin/makepkg "$@" ;;
+*" --printsrcinfo "* | *" --nobuild "*) exec /usr/bin/makepkg.real "$@" ;;
 esac
 printf 'built\n' >"$BUILT"
 EOF
 chmod 755 "$WORK/pacman" "$WORK/makepkg"
+mkdir -p "$WORK/usr-layer/bin"
+cp -- /usr/bin/makepkg "$WORK/usr-layer/bin/makepkg.real"
+
+# makepkg_sandbox <command...>: runs the makepkg gate where /usr/bin/makepkg
+# is the stand-in and the real one is beside it as makepkg.real.
+#
+# The gate lists and fetches the sources by running the makepkg it is given
+# inside its own jail, which shows /usr and the build directory and nothing
+# else of this run's directory: a stand-in kept there would not be found,
+# and every aur case would end incomplete. Everything else is the host's,
+# writable as it is (the reviewer keeps its login and session state in the
+# home). In this sandbox the system settings file does not look root-owned
+# and is ignored, which the gate says: the user file decides.
+makepkg_sandbox() {
+    bwrap --dev-bind / / \
+        --overlay-src /usr --overlay-src "$WORK/usr-layer" --tmp-overlay /usr \
+        --ro-bind "$WORK/makepkg" /usr/bin/makepkg -- "$@"
+}
 
 # package <name> <install-script-or-empty> <tree-or-empty> <archive>
 package() {
@@ -218,8 +243,8 @@ review() {
         ;;
     aur)
         cp -a -- "$EVAL/cases/$case" "$dir/$name"
-        (cd "$dir/$name" && BUILT=$dir/built "$GUARDIAN" makepkg-gate -- "$WORK/makepkg" -s --noconfirm) \
-            </dev/null >"$log" 2>&1
+        (cd "$dir/$name" && BUILT=$dir/built makepkg_sandbox \
+            "$GUARDIAN" makepkg-gate -- /usr/bin/makepkg -s --noconfirm) </dev/null >"$log" 2>&1
         local status=$?
         # A gate that exits 0 without starting the build did not allow it.
         ((status != 0)) || [[ -e $dir/built ]] || status=2
@@ -281,6 +306,9 @@ for case in "${cases[@]}"; do
             review "$case" "$run" "$log"
             status=$?
             grep -q 'UNAVAILABLE' "$log" && status=2
+            # A gate that found nothing it reviews (a unit no link enables,
+            # say) lets the case through without asking the AI: no verdict.
+            [[ $case != system/* ]] && grep -q 'LIMITED REVIEW' "$log" && status=2
             printf '%s\n' "$status" >"$WORK/results/${case//\//-}.$run"
         ) &
         if ((++running >= JOBS)); then
