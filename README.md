@@ -121,8 +121,8 @@ plugins, and reviews that code **before any of it runs**:
   npm packages) are not reviewed. A theme or plugin copied into place by
   hand, or installed by a caller that names Omarchy's command by its full
   path or resets `PATH`, does not pass a gate. With the AI review off for
-  AUR builds, the upstream sources are not checked at all: the local rules
-  read the recipe's own files only. Each section below says what its gate
+  AUR builds, the upstream sources are read only by the local rules' high
+  checks. Each section below says what its gate
   does not see. `omarchy-guardian guard` and `sandbox` cover a download you
   start by hand.
 
@@ -2076,12 +2076,16 @@ gate does, in order:
 What is not reviewed is reported: how many code files were left out, and
 that data files were skipped. Prebuilt programs cannot be reviewed by
 anyone; step 5 makes that your decision instead of a silent pass.
-The upstream code of step 4 is judged by the AI alone: the local rules,
-written for scripts, read the recipe and the files beside it (step 2), not
-what the sources unpack to. With the AI review off for AUR builds (`ai =
-"off"`, or the `local-only` level) the upstream code is therefore not
-checked at all; the sources are still fetched in the sandbox, held against
-what was extracted, and the two questions of steps 4 and 5 are still asked.
+The upstream code of step 4 is judged by the AI: the local rules read the
+recipe and the files beside it (step 2), and a source tree is full of
+ordinary uses of what they name (a program that starts another, an install
+script quoted in the project's own tooling). With the AI review off for AUR
+builds (`ai = "off"`, or the `local-only` level) the upstream code would
+pass unread, so there the local rules read it too, keeping their high
+findings only (download and run, encoded commands, a remote shell, text
+for a reviewer, hidden characters and the like): much less than a review.
+The sources are still fetched in the sandbox, held against what was
+extracted, and the two questions of steps 4 and 5 are still asked.
 Dependencies a build downloads on its own during `prepare()` or `build()`
 (cargo crates into `~/.cargo`, npm packages into `~/.npm`, Go modules into
 `~/go`, pip, and the like) are **not reviewed**: they are not among the
@@ -2263,7 +2267,8 @@ that matter most:
 - **AUR builds:** yay's download-and-verify call runs the reviewed recipe
   as you before the sources are reviewed; dependencies a build downloads
   itself are not reviewed; prebuilt programs are your decision, not a
-  review; with the AI off, the upstream code is not checked at all.
+  review; with the AI off, the upstream code is read only by the local
+  rules' high checks.
 - **Themes and plugins:** only installs and updates that reach Guardian's
   commands are reviewed (see [Omarchy themes](#omarchy-themes) for the
   callers that do not).

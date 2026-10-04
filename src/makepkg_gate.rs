@@ -2409,7 +2409,7 @@ fn review_upstream_files(
         &review_context,
     );
     for file in &upstream.files {
-        review::analyze_payload(&mut report, &file.path, &file.text);
+        review::analyze_upstream(&mut report, &file.path, &file.text);
     }
     review::analyze_payload(&mut report, "upstream-summary", &upstream_summary(review));
     for gap in &upstream.gaps {

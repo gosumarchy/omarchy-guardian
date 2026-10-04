@@ -293,14 +293,16 @@ const STRONG: &[&[Step]] = &[
             "jailbroken",
         ]),
     ],
-    // Guardian named beside what its reviewer returns.
+    // Guardian named beside what its reviewer returns. Not beside the word
+    // "reviewer" alone: install notes say which program Guardian reviews
+    // with.
     &[
         Word(&["guardian", "guardian's"]),
         Gap(6),
-        Word(&["reviewer", "verdict", "nonce"]),
+        Word(&["verdict", "nonce"]),
     ],
     &[
-        Word(&["reviewer", "verdict", "nonce"]),
+        Word(&["verdict", "nonce"]),
         Gap(6),
         Word(&["guardian", "guardian's"]),
     ],

