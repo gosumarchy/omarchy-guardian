@@ -708,9 +708,12 @@ fn names_persistence_path(line: &str) -> bool {
     PERSISTENCE_PATHS.iter().any(|pattern| {
         pattern_starts(line, pattern).any(|start| {
             let before = &line[..start];
+            // The last word; `rsplit` cuts after the whole whitespace
+            // character, which may be longer than one byte.
             let word = before
-                .rfind(char::is_whitespace)
-                .map_or(before, |space| &before[space + 1..])
+                .rsplit(char::is_whitespace)
+                .next()
+                .unwrap_or(before)
                 .trim_start_matches(['>', '<', '"', '\'', '(']);
             let packaged = is_pkgdir_prefix(word)
                 && !line[start..]
