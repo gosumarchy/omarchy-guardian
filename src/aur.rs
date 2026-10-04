@@ -1243,6 +1243,11 @@ impl Walk<'_> {
                 self.lockfile(child, ecosystem, &String::from_utf8_lossy(&bytes));
                 return;
             }
+            // Not read at all: where it fetches from is not known.
+            self.upstream.gaps.push(format!(
+                "src/{child}: a lockfile too large to read (over 64 MiB) says where dependencies come from"
+            ));
+            return;
         }
         if critical {
             self.upstream.gaps.push(format!(
@@ -2816,6 +2821,37 @@ pkgname = demo
         assert_eq!(
             ecosystems,
             [Ecosystem::Npm, Ecosystem::Cargo, Ecosystem::Go]
+        );
+    }
+
+    #[test]
+    fn a_lockfile_too_large_to_read_is_a_gap() {
+        let dir = TempDir::new("upstream-huge-lockfile");
+        let src = dir.path().join("src");
+        fs::create_dir_all(src.join("demo")).unwrap();
+        // Text at its start, and past the scanned size without taking the
+        // space: the rest is a hole.
+        let lock = src.join("demo/package-lock.json");
+        fs::write(&lock, "{\n".repeat(8192)).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_len(super::lockfile::MAX_SCANNED_BYTES + 1)
+            .unwrap();
+        let roots = Roots {
+            build_dir: dir.path(),
+            srcdest: None,
+        };
+        let upstream = collect_upstream(&src, &roots, "", 1024 * 1024);
+        assert!(upstream.lockfiles.is_empty());
+        assert!(
+            upstream
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("src/demo/package-lock.json: a lockfile too large")),
+            "{:?}",
+            upstream.gaps
         );
     }
 

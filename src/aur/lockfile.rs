@@ -125,6 +125,12 @@ impl Scan {
             == 0
     }
 
+    fn note_host(&mut self, host: String) {
+        if !self.hosts.contains(&host) && self.hosts.len() < MAX_HOSTS {
+            self.hosts.push(host);
+        }
+    }
+
     /// The scan in Guardian's own words: counts and validated host names,
     /// nothing of the file's own text.
     pub fn summary(&self, ecosystem: Ecosystem) -> String {
@@ -175,6 +181,9 @@ impl Scan {
     }
 }
 
+/// What a host is named as when its text is not a host name.
+const UNPARSEABLE: &str = "an unparseable host";
+
 /// Lines that send a dependency somewhere other than where its name says.
 fn is_redirect(ecosystem: Ecosystem, line: &str) -> bool {
     let line = line.trim_start();
@@ -197,15 +206,36 @@ fn is_redirect(ecosystem: Ecosystem, line: &str) -> bool {
     }
 }
 
+/// How often `text` holds `key`, a colon and `true`, however they are
+/// spaced: a lockfile written on one line counts like one written on many.
+fn count_true(text: &str, key: &str) -> usize {
+    text.match_indices(key)
+        .filter(|(at, _)| {
+            text[at + key.len()..]
+                .trim_start()
+                .strip_prefix(':')
+                .is_some_and(|value| value.trim_start().starts_with("true"))
+        })
+        .count()
+}
+
 /// Scans a lockfile's text. It looks for addresses wherever they stand
 /// rather than parsing each format: a format it knows less well is then
 /// read too broadly, never too narrowly.
 pub fn scan(ecosystem: Ecosystem, text: &str) -> Scan {
     let mut scan = Scan::default();
     let registries = ecosystem.registries();
+    scan.install_scripts =
+        count_true(text, "\"hasInstallScript\"") + count_true(text, "requiresBuild");
     for line in text.lines() {
-        if line.contains("\"hasInstallScript\": true") || line.contains("requiresBuild: true") {
-            scan.install_scripts += 1;
+        // JSON may write `/` as `\/`, and any character by its number: an
+        // address written that way is one all the same.
+        let unescaped = line.replace("\\/", "/");
+        let line = unescaped.as_str();
+        if line.contains("\\u00") {
+            scan.addresses += 1;
+            scan.foreign += 1;
+            scan.note_host(UNPARSEABLE.to_string());
         }
         if is_redirect(ecosystem, line) {
             scan.redirects += 1;
@@ -233,12 +263,14 @@ pub fn scan(ecosystem: Ecosystem, text: &str) -> Scan {
             if scheme.is_empty() {
                 continue;
             }
+            // Where the client that fetches it ends the host: a `?` or a
+            // `\` ends it like a `/`, so nothing after one is the host.
             let authority: &str = rest
-                .split(|c: char| c == '/' || c == '"' || c == '\'' || c == '#' || c.is_whitespace())
+                .split(|c: char| "/\"'#?\\".contains(c) || c.is_whitespace())
                 .next()
                 .unwrap_or_default();
-            let host = authority
-                .rsplit_once('@')
+            let user = authority.rsplit_once('@');
+            let host = user
                 .map_or(authority, |(_, host)| host)
                 .split(':')
                 .next()
@@ -254,7 +286,9 @@ pub fn scan(ecosystem: Ecosystem, text: &str) -> Scan {
             if matches!(transport, "http" | "ftp" | "git") {
                 scan.unencrypted += 1;
             }
-            let registry = registries.contains(&host.as_str())
+            // An address with a user part is never the registry's own:
+            // what stands before the `@` can read as its host.
+            let registry = user.is_none() && registries.contains(&host.as_str())
                 || (ecosystem == Ecosystem::Cargo
                     && scheme.starts_with("registry+")
                     && rest.starts_with("github.com/rust-lang/crates.io-index"))
@@ -270,14 +304,7 @@ pub fn scan(ecosystem: Ecosystem, text: &str) -> Scan {
                 && host
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
-            let host = if valid {
-                host
-            } else {
-                "an unparseable host".to_string()
-            };
-            if !scan.hosts.contains(&host) && scan.hosts.len() < MAX_HOSTS {
-                scan.hosts.push(host);
-            }
+            scan.note_host(if valid { host } else { UNPARSEABLE.to_string() });
         }
     }
     scan.hosts.sort();
@@ -365,5 +392,73 @@ mod tests {
         assert_eq!(odd.hosts, ["ev"]);
         let odd = scan(Ecosystem::Npm, "\"resolved\": \"https://$(x)/a\"\n");
         assert_eq!(odd.hosts, ["an unparseable host"]);
+    }
+
+    #[test]
+    fn a_foreign_host_does_not_read_as_the_registry() {
+        // What stands after a `?`, a `\` or a user's `@` is not the host
+        // the client fetches from.
+        for (address, host) in [
+            (
+                "https://evil.example?@registry.npmjs.org/x.tgz",
+                "evil.example",
+            ),
+            (
+                "https://evil.example\\@registry.npmjs.org/x.tgz",
+                "evil.example",
+            ),
+            (
+                "https://evil.example#@registry.npmjs.org/x.tgz",
+                "evil.example",
+            ),
+            (
+                "https://registry.npmjs.org@evil.example/x.tgz",
+                "evil.example",
+            ),
+            (
+                "https://user:registry.npmjs.org@evil.example/x.tgz",
+                "evil.example",
+            ),
+            (
+                "https://evil.example@registry.npmjs.org/x.tgz",
+                "registry.npmjs.org",
+            ),
+            ("https:\\/\\/evil.example\\/x.tgz", "evil.example"),
+            (
+                "https:\\u002f\\u002fevil.example/x.tgz",
+                "an unparseable host",
+            ),
+            (
+                "https://registry.npmjs.org.evil.example/x.tgz",
+                "registry.npmjs.org.evil.example",
+            ),
+        ] {
+            let found = scan(Ecosystem::Npm, &format!("\"resolved\": \"{address}\"\n"));
+            assert_eq!(
+                (found.foreign, found.addresses),
+                (1, 1),
+                "{address}: {found:?}"
+            );
+            assert_eq!(found.hosts, [host], "{address}");
+            assert!(
+                !found
+                    .summary(Ecosystem::Npm)
+                    .contains("all on its registry")
+            );
+        }
+        let plain = scan(
+            Ecosystem::Npm,
+            "\"resolved\":\"https:\\/\\/registry.npmjs.org\\/a.tgz\"",
+        );
+        assert!(plain.is_plain(), "{plain:?}");
+    }
+
+    #[test]
+    fn install_scripts_are_counted_however_the_file_is_spaced() {
+        let minified = r#"{"a":{"hasInstallScript":true},"b":{"hasInstallScript" :  true},"c":{"hasInstallScript":false},"d":{"hasInstallScript":
+true}}"#;
+        assert_eq!(scan(Ecosystem::Npm, minified).install_scripts, 3);
+        let pnpm = "  a:\n    requiresBuild: true\n  b:\n    requiresBuild:   true\n  c:\n    requiresBuild: false\n";
+        assert_eq!(scan(Ecosystem::Npm, pnpm).install_scripts, 2);
     }
 }
