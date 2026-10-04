@@ -31,6 +31,13 @@ pub enum RuleId {
     UnknownKernelModule,
     UnknownPrivilegedFile,
     NetworkListener,
+    UnexpectedCapability,
+    RemoteShell,
+    NetworkRelay,
+    RootkitSign,
+    TracedProcess,
+    TracedSecrets,
+    KernelTap,
 }
 
 /// How a rule decides whether a lowercased line matches.
@@ -161,7 +168,7 @@ const DISABLED_TLS: &[&str] = &[
 ];
 
 impl RuleId {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 28] = [
         Self::DownloadAndExecute,
         Self::EncodedCommandExecution,
         Self::CredentialFileAccess,
@@ -183,6 +190,13 @@ impl RuleId {
         Self::UnknownKernelModule,
         Self::UnknownPrivilegedFile,
         Self::NetworkListener,
+        Self::UnexpectedCapability,
+        Self::RemoteShell,
+        Self::NetworkRelay,
+        Self::RootkitSign,
+        Self::TracedProcess,
+        Self::TracedSecrets,
+        Self::KernelTap,
     ];
 
     pub fn from_name(name: &str) -> Option<Self> {
@@ -212,6 +226,13 @@ impl RuleId {
             Self::UnknownKernelModule => "unknown-kernel-module",
             Self::UnknownPrivilegedFile => "unknown-privileged-file",
             Self::NetworkListener => "network-listener",
+            Self::UnexpectedCapability => "unexpected-capability",
+            Self::RemoteShell => "remote-shell",
+            Self::NetworkRelay => "network-relay",
+            Self::RootkitSign => "rootkit-sign",
+            Self::TracedProcess => "traced-process",
+            Self::TracedSecrets => "traced-secrets",
+            Self::KernelTap => "kernel-tap",
         }
     }
 
@@ -225,7 +246,10 @@ impl RuleId {
             | Self::HiddenProgram
             | Self::PreloadedLibrary
             | Self::UnknownKernelModule
-            | Self::UnknownPrivilegedFile => Severity::High,
+            | Self::UnknownPrivilegedFile
+            | Self::RemoteShell
+            | Self::RootkitSign
+            | Self::TracedSecrets => Severity::High,
             Self::NetworkListener => Severity::Low,
             Self::CredentialFileAccess
             | Self::PersistenceModification
@@ -237,7 +261,11 @@ impl RuleId {
             | Self::GitConfigCommand
             | Self::SshCommand
             | Self::RunningFromTemp
-            | Self::KeyboardReader => Severity::Medium,
+            | Self::KeyboardReader
+            | Self::UnexpectedCapability
+            | Self::NetworkRelay
+            | Self::TracedProcess
+            | Self::KernelTap => Severity::Medium,
         }
     }
 
@@ -300,7 +328,28 @@ impl RuleId {
                 "A file no package vouches for runs with extra rights (setuid, setgid or capabilities)."
             }
             Self::NetworkListener => {
-                "An interpreter (Python, a shell, Node) listens on the network, with no script on disk to look at."
+                "A program listens on the network that nothing installed accounts for: an interpreter (Python, a shell, Node), or a packaged program no packaged service runs."
+            }
+            Self::UnexpectedCapability => {
+                "A packaged program holds file capabilities its package does not set (pacman does not record them, so the file itself is unchanged)."
+            }
+            Self::RemoteShell => {
+                "A shell or interpreter has its input and output, or a connection of its own, on a network socket: what a remote shell looks like."
+            }
+            Self::NetworkRelay => {
+                "A tool that runs or forwards what it is told over the network (netcat, socat, a tunnel) listens or is connected."
+            }
+            Self::RootkitSign => {
+                "The kernel's own lists disagree (a process, module or socket that exists is not listed), or a program wears a kernel thread's name: what something hiding itself looks like."
+            }
+            Self::TracedProcess => {
+                "Another process is attached to this one the way a debugger is, and can read and change its memory."
+            }
+            Self::TracedSecrets => {
+                "A process is attached, the way a debugger is, to a program that holds secrets (a shell, SSH, sudo, a key agent, a browser, a password manager)."
+            }
+            Self::KernelTap => {
+                "Something no package explains taps the kernel's network or tracing path: a raw packet socket, or a pinned eBPF object."
             }
         }
     }
@@ -326,7 +375,14 @@ impl RuleId {
             | Self::KeyboardReader
             | Self::UnknownKernelModule
             | Self::UnknownPrivilegedFile
-            | Self::NetworkListener => Matcher::Reported,
+            | Self::NetworkListener
+            | Self::UnexpectedCapability
+            | Self::RemoteShell
+            | Self::NetworkRelay
+            | Self::RootkitSign
+            | Self::TracedProcess
+            | Self::TracedSecrets
+            | Self::KernelTap => Matcher::Reported,
             Self::DisabledTlsVerification => Matcher::Patterns(DISABLED_TLS),
         }
     }
@@ -358,7 +414,14 @@ impl RuleId {
             | Self::KeyboardReader
             | Self::UnknownKernelModule
             | Self::UnknownPrivilegedFile
-            | Self::NetworkListener => false,
+            | Self::NetworkListener
+            | Self::UnexpectedCapability
+            | Self::RemoteShell
+            | Self::NetworkRelay
+            | Self::RootkitSign
+            | Self::TracedProcess
+            | Self::TracedSecrets
+            | Self::KernelTap => false,
         }
     }
 
