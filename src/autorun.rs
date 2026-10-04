@@ -826,6 +826,10 @@ pub const SYSTEM: &[Location] = &[
     // Jobs handed to `at`.
     location("var/spool/atd/", Kind::Directory, Category::Cron),
     location("var/spool/at/", Kind::Directory, Category::Cron),
+    // Text an ordinary configuration package may ship: the commands tmux
+    // runs at every start, and the keys readline binds in every shell.
+    location("etc/tmux.conf", Kind::File, Category::Terminal),
+    location("etc/inputrc", Kind::File, Category::Shell),
 ];
 
 /// Locations in `SYSTEM` that the pacman gate reviews only for a package
@@ -844,10 +848,12 @@ const UNOFFICIAL_ONLY: &[&str] = &[
 ];
 
 /// System locations the sweep looks at and the pacman gate does not review:
-/// what is in them is a compiled library or the boot loader's own
-/// configuration. A package from an official repository ships some of them
-/// (`pam` its modules); for any other package a new file here is a finding
-/// (see `sweep_only_location`).
+/// a compiled library, the boot loader's own configuration, or a file the
+/// whole system is set up by (`/etc/fstab`, `/etc/hosts`). A package from
+/// an official repository ships some of them (`pam` its modules,
+/// `filesystem` the tables); for any other package a new file here is a
+/// finding (see `sweep_only_location`). No row lies under a `SYSTEM`
+/// location: what is there is reviewed, and would be called unreviewed.
 pub const SYSTEM_SWEEP: &[Location] = &[
     // PAM modules: a `.so` every login loads.
     location("usr/lib/security/", Kind::Directory, Category::Pam),
@@ -868,23 +874,11 @@ pub const SYSTEM_SWEEP: &[Location] = &[
     // Certificate authorities added to the system's own, and names that
     // resolve without asking DNS.
     location(
-        "etc/ca-certificates/trust-source/anchors/",
-        Kind::Directory,
-        Category::Trust,
-    ),
-    location(
         "usr/local/share/ca-certificates/",
         Kind::Directory,
         Category::Trust,
     ),
     location("etc/hosts", Kind::File, Category::Trust),
-    // Browser policies (forced extensions, proxies) and the programs a
-    // browser extension may start.
-    location(
-        "usr/lib/firefox/distribution/policies.json",
-        Kind::File,
-        Category::Browser,
-    ),
     // What every Flatpak app may reach outside its sandbox.
     location(
         "var/lib/flatpak/overrides/",
@@ -893,8 +887,6 @@ pub const SYSTEM_SWEEP: &[Location] = &[
     ),
     location("etc/npmrc", Kind::File, Category::Toolchain),
     location("etc/pip.conf", Kind::File, Category::Toolchain),
-    location("etc/tmux.conf", Kind::File, Category::Terminal),
-    location("etc/inputrc", Kind::File, Category::Shell),
 ];
 
 /// Locations in a home directory, relative to it.
@@ -1420,6 +1412,26 @@ mod tests {
                 Some(category),
                 "{path}"
             );
+        }
+        // What the gate reviews is not also called unreviewed: no
+        // sweep-only row lies under a reviewed location.
+        for location in SYSTEM_SWEEP {
+            let inside = format!("{}x", location.path);
+            let path = if location.kind == Kind::File {
+                location.path
+            } else {
+                inside.as_str()
+            };
+            assert!(!is_auto_run(path), "{}", location.path);
+        }
+        for reviewed in [
+            "etc/ca-certificates/trust-source/anchors/x.crt",
+            "usr/lib/firefox/distribution/policies.json",
+            "etc/tmux.conf",
+            "etc/inputrc",
+        ] {
+            assert!(sweep_only_location(reviewed).is_none(), "{reviewed}");
+            assert!(is_reviewed(reviewed, false), "{reviewed}");
         }
         assert!(sweep_only_location("usr/lib/libc.so.6").is_none());
         assert!(sweep_only_location("usr/lib/security/../x").is_none());

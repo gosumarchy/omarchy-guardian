@@ -84,7 +84,16 @@ pub enum Gap {
     NoReviewableFiles,
     Agent(Error),
     Dependency(String),
+    /// What the pacman gate refuses or cannot stand for: a package it will
+    /// not take, an archive it could not read or attribute, system state
+    /// it could not look at. Nothing a digest of the reviewed content
+    /// covers, so no permit overrules it.
     Package(Error),
+    /// A part of a package archive the pacman gate could not review, while
+    /// the archive itself was read and fingerprinted: a named file over the
+    /// size or count limits, an oversized or binary scriptlet, a compiled
+    /// program in an auto-run location.
+    PackageUnread(String),
     /// A file a reviewed one runs or reads in as code, which Guardian could
     /// not read as text.
     RunsUnread(String),
@@ -108,6 +117,7 @@ impl Gap {
             | Self::NoReviewableFiles
             | Self::Agent(_)
             | Self::Dependency(_)
+            | Self::PackageUnread(_)
             | Self::RunsUnread(_) => true,
             Self::Io(_)
             | Self::Symlink(_)
@@ -144,7 +154,7 @@ impl fmt::Display for Gap {
                 f,
                 "{path}: withheld from the AI provider because it looks sensitive"
             ),
-            Self::RunsUnread(text) => write!(f, "{text}"),
+            Self::RunsUnread(text) | Self::PackageUnread(text) => write!(f, "{text}"),
             Self::Undecodable(path) => write!(
                 f,
                 "{path}: a script, build or config file holds binary data and cannot be reviewed"
@@ -1053,6 +1063,7 @@ mod tests {
             Gap::Agent(refused()),
             Gap::Dependency("x".into()),
             Gap::RunsUnread("x".into()),
+            Gap::PackageUnread("x".into()),
         ] {
             assert!(gap.content_hashed(), "{gap}");
         }
