@@ -15,6 +15,7 @@ use std::io::{self, BufRead, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use crate::audit::Gate;
 use crate::autorun::{self, Kind};
 use crate::classify;
 use crate::config::Settings;
@@ -24,7 +25,8 @@ use crate::engine::plan::HashOnly;
 use crate::error::{Error, IoContext};
 use crate::notify;
 use crate::payload;
-use crate::report::{Gap, LocalFinding, Report};
+use crate::permit;
+use crate::report::{Gap, LocalFinding, Report, ReviewedArchive};
 use crate::review;
 use crate::rules::RuleId;
 use crate::scan::MAX_TEXT_FILE_SIZE;
@@ -194,6 +196,18 @@ pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report
                     ) {
                         Ok((scriptlet, summary, fingerprint)) => {
                             summary.announce(target, scriptlet);
+                            // In pacman's output, and so in its log: the
+                            // exact bytes this review is of.
+                            outln!(
+                                "Pacman package {target}: sha256 {} {}",
+                                fingerprint.digest(),
+                                fingerprint.name()
+                            );
+                            report.archives.push(ReviewedArchive {
+                                name: fingerprint.name(),
+                                class,
+                                sha256: fingerprint.digest().to_string(),
+                            });
                             fingerprints.push(fingerprint);
                         }
                         Err(error) => report.gaps.push(Gap::Package(error)),
@@ -219,6 +233,55 @@ pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report
         }
     }
     Ok(report)
+}
+
+/// The classes of the archives `report` reviewed, joined by `+`.
+pub fn reviewed_classes(report: &Report) -> String {
+    let mut classes: Vec<&str> = report
+        .archives
+        .iter()
+        .map(|archive| archive.class.name())
+        .collect();
+    classes.sort_unstable();
+    classes.dedup();
+    classes.join("+")
+}
+
+/// The archives `report` reviewed, by name.
+pub fn reviewed_names(report: &Report) -> String {
+    let names: Vec<&str> = report
+        .archives
+        .iter()
+        .map(|archive| archive.name.as_str())
+        .collect();
+    names.join(" ")
+}
+
+/// The archives `report` reviewed, each with its SHA-256.
+pub fn reviewed_digests(report: &Report) -> String {
+    let digests: Vec<String> = report
+        .archives
+        .iter()
+        .map(|archive| format!("{}={}", archive.name, archive.sha256))
+        .collect();
+    digests.join(" ")
+}
+
+/// The transaction `report` reviewed as a permit names it: every archive
+/// by its class and the SHA-256 of its bytes. `None` when no archive was
+/// read; a transaction with one that was refused has a gap no permit
+/// overrules (see `Gap::content_hashed`).
+pub fn reviewed_content(report: &Report) -> Option<permit::Content> {
+    permit::Content::new(
+        Gate::Pacman,
+        &reviewed_classes(report),
+        &reviewed_names(report),
+        report
+            .archives
+            .iter()
+            .map(|archive| format!("{}:{}", archive.class.name(), archive.sha256))
+            .collect(),
+    )
 }
 
 /// The local database of installed packages (`DBPath`/local).
@@ -1563,6 +1626,58 @@ fn linked_file(
         }
     }
     Err("is behind too many links".into())
+}
+
+#[cfg(test)]
+mod content_tests {
+    use super::{reviewed_classes, reviewed_content, reviewed_digests, reviewed_names};
+    use crate::config::model::SourceClass;
+    use crate::report::{Report, ReviewedArchive};
+
+    #[test]
+    fn a_transaction_is_named_by_every_archive_it_was_reviewed_from() {
+        let mut report = Report::new("pacman transaction");
+        // Nothing was read: nothing a permit could stand for.
+        assert!(reviewed_content(&report).is_none());
+        let archive = |name: &str, class, byte: &str| ReviewedArchive {
+            name: name.to_string(),
+            class,
+            sha256: byte.repeat(64),
+        };
+        report.archives = vec![
+            archive("demo-1-1-any", SourceClass::LocalPackage, "b"),
+            archive("lib-2-1-x86_64", SourceClass::Official, "a"),
+        ];
+        assert_eq!(reviewed_classes(&report), "local-package+official");
+        assert_eq!(reviewed_names(&report), "demo-1-1-any lib-2-1-x86_64");
+        assert_eq!(
+            reviewed_digests(&report),
+            format!(
+                "demo-1-1-any={} lib-2-1-x86_64={}",
+                "b".repeat(64),
+                "a".repeat(64)
+            )
+        );
+        let key = reviewed_content(&report).unwrap().key();
+
+        // The order of the targets and the archives' names say nothing.
+        report.archives.reverse();
+        report.archives[0].name = "renamed".into();
+        assert_eq!(reviewed_content(&report).unwrap().key(), key);
+        // Other bytes, or the same bytes as another kind of package, do.
+        report.archives[0].sha256 = "c".repeat(64);
+        assert_ne!(reviewed_content(&report).unwrap().key(), key);
+        report.archives[0].sha256 = "a".repeat(64);
+        assert_eq!(reviewed_content(&report).unwrap().key(), key);
+        report.archives[0].class = SourceClass::ThirdPartyRepo;
+        assert_ne!(reviewed_content(&report).unwrap().key(), key);
+        // An archive more is another transaction.
+        report.archives[0].class = SourceClass::Official;
+        report
+            .archives
+            .push(archive("extra-1-1-any", SourceClass::Official, "d"));
+        assert_ne!(reviewed_content(&report).unwrap().key(), key);
+    }
 }
 
 #[cfg(test)]

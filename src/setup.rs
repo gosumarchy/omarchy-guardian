@@ -654,6 +654,7 @@ impl Environment for RealEnvironment {
             drop(fs::remove_file(&temporary));
             return Err(error.to_string());
         }
+        crate::audit::settings_changed("the user settings file was saved");
         Ok(path)
     }
 
@@ -684,8 +685,12 @@ pub fn keep_system_only(text: &str, existing: &str) -> String {
     let missing_sweep =
         new.sweep == SweepSettings::default() && old.sweep != SweepSettings::default();
     let missing_accepted = new.acknowledged_weaker.is_none() && old.acknowledged_weaker.is_some();
-    if !missing_trust && !missing_sweep && !missing_accepted {
+    let missing_permit = new.permit_strict.is_none() && old.permit_strict.is_some();
+    if !missing_trust && !missing_sweep && !missing_accepted && !missing_permit {
         return text.to_string();
+    }
+    if missing_permit {
+        new.permit_strict = old.permit_strict;
     }
     if missing_trust {
         new.trusted_reviewer_packages = old.trusted_reviewer_packages;
@@ -782,7 +787,10 @@ fn install_system_file(text: &str) -> Result<(), String> {
         Some(text),
     )?;
     match fs::read_to_string(SYSTEM_PATH) {
-        Ok(installed) if installed == text => Ok(()),
+        Ok(installed) if installed == text => {
+            crate::audit::settings_changed("the system settings file was saved");
+            Ok(())
+        }
         Ok(_) => Err(format!(
             "{SYSTEM_PATH} does not hold the config you approved; check it before relying on the gates"
         )),

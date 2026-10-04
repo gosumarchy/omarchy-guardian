@@ -276,6 +276,48 @@ impl State {
     }
 }
 
+/// The records a `State` keeps of one package.
+const RECORDS: [&str; 3] = ["confirmed", "binaries", "extraction"];
+
+/// Removes what is remembered of the package `key` under the review
+/// memory's `root`; returns how many records there were.
+pub fn forget(root: &Path, key: &str) -> Result<usize, String> {
+    let name = Sha256::digest(key.as_bytes()).to_string();
+    let mut removed = 0;
+    for what in RECORDS {
+        let path = root.join(DIRECTORY).join(format!("{name}.{what}"));
+        match fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        }
+    }
+    Ok(removed)
+}
+
+/// Removes everything the gate remembers under `root`: the files of its
+/// directory, which stays. Returns how many there were. A directory that
+/// is a link somewhere is left alone.
+pub fn forget_all(root: &Path) -> Result<usize, String> {
+    let directory = root.join(DIRECTORY);
+    let describe = |error: std::io::Error| format!("{}: {error}", directory.display());
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err(format!("{} is not a directory", directory.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(describe(error)),
+    }
+    let mut removed = 0;
+    for entry in fs::read_dir(&directory).map_err(describe)? {
+        let path = entry.map_err(describe)?.path();
+        if fs::symlink_metadata(&path).is_ok_and(|metadata| !metadata.is_dir()) {
+            fs::remove_file(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 /// How the binaries now differ from the ones remembered, as names for the
 /// user: `(new or changed, gone)`.
 pub fn binary_changes(
@@ -301,6 +343,49 @@ pub fn binary_changes(
         .cloned()
         .collect();
     (changed, gone)
+}
+
+#[cfg(test)]
+mod forget_tests {
+    use std::collections::BTreeMap;
+    use std::fs;
+
+    use super::{State, forget, forget_all};
+    use crate::test_support::TempDir;
+
+    #[test]
+    fn forgetting_a_package_takes_its_records_and_leaves_the_others() {
+        let dir = TempDir::new("gate-forget");
+        let root = dir.path().join("state");
+        let binaries: BTreeMap<String, String> =
+            [("src/demo/tool".to_string(), "a".repeat(64))].into();
+        for key in ["demo", "other"] {
+            let state = State::open(Some(&root), key);
+            state.remember_confirmed("sources abc");
+            state.record_binaries(&binaries);
+        }
+        assert_eq!(forget(&root, "demo"), Ok(2));
+        let demo = State::open(Some(&root), "demo");
+        assert!(!demo.is_confirmed("sources abc"));
+        assert_eq!(demo.binaries(), None);
+        assert!(State::open(Some(&root), "other").is_confirmed("sources abc"));
+        assert_eq!(forget(&root, "demo"), Ok(0));
+
+        assert_eq!(forget_all(&root), Ok(2));
+        assert!(!State::open(Some(&root), "other").is_confirmed("sources abc"));
+        // The directory stays, for the next build.
+        assert!(root.join("aur-gate").is_dir());
+        assert_eq!(forget_all(&dir.path().join("none")), Ok(0));
+        // A link in the directory's place is not followed.
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir_all(elsewhere.join("aur-gate")).unwrap();
+        fs::write(elsewhere.join("aur-gate/kept"), "x").unwrap();
+        let linked = dir.path().join("linked");
+        fs::create_dir(&linked).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("aur-gate"), linked.join("aur-gate")).unwrap();
+        assert!(forget_all(&linked).is_err());
+        assert!(elsewhere.join("aur-gate/kept").exists());
+    }
 }
 
 #[cfg(test)]

@@ -21,6 +21,7 @@ mod output;
 
 mod agent;
 mod ask;
+mod audit;
 mod aur;
 mod autorun;
 mod classify;
@@ -41,6 +42,7 @@ mod notify;
 mod osv;
 mod pacman;
 mod payload;
+mod permit;
 mod report;
 mod review;
 mod rules;

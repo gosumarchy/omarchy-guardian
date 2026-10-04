@@ -90,6 +90,39 @@ pub enum Gap {
     RunsUnread(String),
 }
 
+impl Gap {
+    /// Whether what the gap is about is still covered by the SHA-256 of
+    /// what was reviewed: the review could not read or judge it, but a
+    /// permit bound to that digest is bound to it too. Anything else (a
+    /// file that could not be opened or hashed, a link leading elsewhere, a
+    /// package Guardian refused) is content nobody put a digest on, which
+    /// no permit can stand for.
+    pub const fn content_hashed(&self) -> bool {
+        match self {
+            Self::OversizedText(_)
+            | Self::UnresolvedLfs(_)
+            | Self::SensitiveWithheld(_)
+            | Self::AgentInputTooLarge
+            | Self::EntryPointTooLarge(_)
+            | Self::Undecodable(_)
+            | Self::NoReviewableFiles
+            | Self::Agent(_)
+            | Self::Dependency(_)
+            | Self::RunsUnread(_) => true,
+            Self::Io(_)
+            | Self::Symlink(_)
+            | Self::SpecialFile(_)
+            | Self::NonUtf8Name(_)
+            | Self::HashLimit(_)
+            | Self::GitState(_)
+            | Self::RootOnly(_)
+            | Self::Sweep(_)
+            | Self::TreeTooLarge { .. }
+            | Self::Package(_) => false,
+        }
+    }
+}
+
 impl fmt::Display for Gap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -165,11 +198,16 @@ pub enum Decision {
 
 impl Decision {
     pub fn exit_code(self) -> ExitCode {
+        ExitCode::from(self.exit_status())
+    }
+
+    /// The exit code as a number, for the audit trail.
+    pub const fn exit_status(self) -> u8 {
         match self {
-            Self::Clear | Self::Warned | Self::Limited => ExitCode::SUCCESS,
-            Self::Blocked(Blocked::Findings) => ExitCode::from(1),
+            Self::Clear | Self::Warned | Self::Limited => 0,
+            Self::Blocked(Blocked::Findings) => 1,
             Self::Blocked(Blocked::Incomplete | Blocked::AiUnavailable | Blocked::NotConfirmed) => {
-                ExitCode::from(2)
+                2
             }
         }
     }
@@ -259,6 +297,24 @@ pub struct Report {
     pub fetches: Vec<(String, String)>,
     /// More were found than are recorded (see `review::MAX_RUNS`).
     pub runs_overflowed: bool,
+    /// The package archives a pacman transaction was reviewed from, each
+    /// with the SHA-256 of its bytes: what the audit trail records and a
+    /// permit is bound to.
+    pub archives: Vec<ReviewedArchive>,
+    /// The permit of the user's that overrules this report's decision
+    /// (see `permit`): it is printed as PERMITTED.
+    pub permit: Option<String>,
+}
+
+/// One archive of a reviewed pacman transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewedArchive {
+    /// The archive's file name without `.pkg.tar.*`: name, version, build
+    /// and architecture.
+    pub name: String,
+    pub class: SourceClass,
+    /// Hex SHA-256 of the archive's bytes.
+    pub sha256: String,
 }
 
 /// A file one reviewed file runs or reads in as code.
@@ -408,6 +464,133 @@ impl Report {
         }
     }
 
+    /// The decision as one word or two, as the saved report and the audit
+    /// trail name it.
+    pub fn decision_name(&self, decision: Decision) -> &'static str {
+        match decision {
+            Decision::Clear => "CLEAR",
+            Decision::Warned => "WARNED",
+            Decision::Limited => "LIMITED",
+            Decision::Blocked(Blocked::Findings) if self.counts().high > 0 => "HIGH RISK",
+            Decision::Blocked(Blocked::Findings) => "REVIEW REQUIRED",
+            Decision::Blocked(Blocked::Incomplete) => "INCOMPLETE",
+            Decision::Blocked(Blocked::AiUnavailable) => "AI UNAVAILABLE",
+            Decision::Blocked(Blocked::NotConfirmed) => "NOT CONFIRMED",
+        }
+    }
+
+    /// Whether a permit could stand for this report's content: every gap
+    /// is about something the digest of what was reviewed still covers.
+    pub fn content_hashed(&self) -> bool {
+        self.gaps.iter().all(Gap::content_hashed)
+    }
+
+    /// What was found, for the audit trail: the alert counts, the local
+    /// rules that matched and how many reasons left the review incomplete.
+    /// Numbers and rule ids only: nothing of the reviewed text.
+    pub fn audit_findings(&self) -> String {
+        let counts = self.counts();
+        let mut text = format!(
+            "high={} medium={} low={} incomplete={}",
+            counts.high,
+            counts.medium,
+            counts.low,
+            self.gaps.len()
+        );
+        let mut rules: Vec<&str> = self
+            .findings
+            .iter()
+            .map(|finding| finding.rule.name())
+            .collect();
+        rules.sort_unstable();
+        rules.dedup();
+        if !rules.is_empty() {
+            let _ = write!(text, " rules={}", rules.join(","));
+        }
+        text
+    }
+
+    /// The AI review in numbers, for the audit trail: the model and
+    /// thinking level, how many calls there were and how each ended.
+    pub fn audit_ai(&self) -> String {
+        if self.agent_runs.is_empty() {
+            return "none".into();
+        }
+        let mut labels: Vec<&str> = self
+            .agent_runs
+            .iter()
+            .map(|run| run.label.as_str())
+            .collect();
+        labels.sort_unstable();
+        labels.dedup();
+        let count = |wanted: &dyn Fn(&AgentRun) -> bool| {
+            self.agent_runs.iter().filter(|run| wanted(run)).count()
+        };
+        let ended = |status: Status| move |run: &AgentRun| matches!(&run.outcome, AgentOutcome::Reviewed(review) if review.status == status);
+        format!(
+            "{} chunks={} clear={} suspicious={} inconclusive={} unavailable={} from-cache={}",
+            labels.join(","),
+            self.agent_runs.len(),
+            count(&ended(Status::Clear)),
+            count(&ended(Status::Suspicious)),
+            count(&ended(Status::Inconclusive)),
+            count(&|run| matches!(run.outcome, AgentOutcome::Unavailable(_))),
+            count(&|run| run.cached.is_some()),
+        )
+    }
+
+    /// What a permit for this report would overrule, a line each and at
+    /// most `limit` of them: the alerts by where they are, and why the
+    /// review is incomplete. Shown to the user before they permit.
+    pub fn overruled_summary(&self, limit: usize) -> Vec<String> {
+        let mut lines: Vec<String> = self
+            .findings
+            .iter()
+            .map(|finding| {
+                format!(
+                    "{} {}:{} {}",
+                    finding.rule.severity().label(),
+                    finding.path,
+                    finding.line,
+                    finding.rule.name()
+                )
+            })
+            .collect();
+        for run in &self.agent_runs {
+            match &run.outcome {
+                AgentOutcome::Reviewed(review) => {
+                    lines.extend(review.findings.iter().map(|finding| {
+                        format!(
+                            "{} {} (AI) {}",
+                            finding.severity.label(),
+                            finding.file,
+                            finding.title
+                        )
+                    }));
+                    if review.status != Status::Clear && review.findings.is_empty() {
+                        lines.push(format!("AI review: {}", review.status.label()));
+                    }
+                }
+                AgentOutcome::Unavailable(error) => {
+                    lines.push(format!("AI review unavailable: {error}"));
+                }
+            }
+        }
+        for advisory in self.audit.iter().flat_map(|audit| &audit.advisories) {
+            lines.push(format!(
+                "known vulnerability {} in {}@{}",
+                advisory.id, advisory.package, advisory.version
+            ));
+        }
+        lines.extend(self.gaps.iter().map(|gap| format!("not reviewed: {gap}")));
+        let more = lines.len().saturating_sub(limit);
+        lines.truncate(limit);
+        if more > 0 {
+            lines.push(format!("and {more} more"));
+        }
+        lines
+    }
+
     /// Dependency advisories without a known severity count as medium.
     fn counts(&self) -> Counts {
         let mut counts = Counts::default();
@@ -466,7 +649,11 @@ impl Report {
         for gap in &self.gaps {
             crate::output::stderr_line(format_args!("  ! {}", shown(&gap.to_string())));
         }
-        outln!("\n{}", painter.paint(recommendation(decision), "2"));
+        let advice = match (&self.permit, decision) {
+            (Some(_), Decision::Blocked(_)) => PERMITTED_ADVICE,
+            _ => recommendation(decision),
+        };
+        outln!("\n{}", painter.paint(advice, "2"));
         html::collect(self, decision);
     }
 
@@ -474,6 +661,15 @@ impl Report {
     fn headline(&self, decision: Decision) -> (String, &'static str) {
         let counts = self.counts();
         let total = counts.total();
+        if let (Some(permit), Decision::Blocked(_)) = (&self.permit, decision) {
+            return (
+                format!(
+                    "! PERMITTED — your permit {permit} overrules {} for exactly this content",
+                    self.decision_name(decision)
+                ),
+                "33;1",
+            );
+        }
         match decision {
             Decision::Clear => ("✓ CLEAR — no known concerns found".to_string(), "32"),
             Decision::Warned => (
@@ -782,6 +978,10 @@ impl Report {
     }
 }
 
+/// Said under a report that a permit let through.
+const PERMITTED_ADVICE: &str = "Proceeding on your permit: the review did not clear this content, you did. \
+The permit ends on its own and covers only these exact bytes.";
+
 /// What to do after a review with this decision.
 const fn recommendation(decision: Decision) -> &'static str {
     match decision {
@@ -816,6 +1016,116 @@ mod tests {
 
     fn standard(class: SourceClass) -> crate::config::model::Policy {
         builtin(Profile::Standard, class)
+    }
+
+    #[test]
+    fn a_permitted_report_says_so_and_names_what_it_overruled() {
+        let mut report = Report::new("theme:demo");
+        report.gaps.push(Gap::Undecodable("install.sh".into()));
+        let blocked = Decision::Blocked(Blocked::Incomplete);
+        assert!(report.headline(blocked).0.contains("INCOMPLETE"));
+        assert_eq!(blocked.exit_status(), 2);
+
+        report.permit = Some("0123456789abcdef".into());
+        let (headline, _) = report.headline(blocked);
+        assert!(headline.contains("PERMITTED"), "{headline}");
+        assert!(
+            headline.contains("permit 0123456789abcdef overrules INCOMPLETE"),
+            "{headline}"
+        );
+        // A permit says nothing about a review that passed on its own.
+        assert!(report.headline(Decision::Clear).0.contains("CLEAR"));
+        // The decision itself is what it was: only the gate goes on.
+        assert_eq!(report.decision_name(blocked), "INCOMPLETE");
+    }
+
+    #[test]
+    fn a_permit_needs_every_gap_to_be_about_hashed_content() {
+        let refused = || Error::Refused("x".into());
+        for gap in [
+            Gap::OversizedText("x".into()),
+            Gap::UnresolvedLfs("x".into()),
+            Gap::SensitiveWithheld("x".into()),
+            Gap::AgentInputTooLarge,
+            Gap::EntryPointTooLarge("x".into()),
+            Gap::Undecodable("x".into()),
+            Gap::NoReviewableFiles,
+            Gap::Agent(refused()),
+            Gap::Dependency("x".into()),
+            Gap::RunsUnread("x".into()),
+        ] {
+            assert!(gap.content_hashed(), "{gap}");
+        }
+        for gap in [
+            Gap::Io(refused()),
+            Gap::Symlink("x".into()),
+            Gap::SpecialFile("x".into()),
+            Gap::NonUtf8Name("x".into()),
+            Gap::HashLimit("x".into()),
+            Gap::GitState("x".into()),
+            Gap::RootOnly("x".into()),
+            Gap::Sweep("x".into()),
+            Gap::TreeTooLarge { files: 1, bytes: 1 },
+            Gap::Package(refused()),
+        ] {
+            assert!(!gap.content_hashed(), "{gap}");
+            let mut report = Report::new("x");
+            report.gaps.push(Gap::NoReviewableFiles);
+            assert!(report.content_hashed());
+            report.gaps.push(gap);
+            assert!(!report.content_hashed());
+        }
+    }
+
+    #[test]
+    fn the_audit_trail_gets_numbers_and_the_user_gets_the_reasons() {
+        let mut report = Report::new("x");
+        assert_eq!(report.audit_ai(), "none");
+        assert_eq!(
+            report.audit_findings(),
+            "high=0 medium=0 low=0 incomplete=0"
+        );
+        report.agent_runs.push(reviewed(Status::Clear, &["a"]));
+        let mut suspicious = reviewed(Status::Suspicious, &["b"]);
+        suspicious.cached = Some("from cache: 1 day old".into());
+        report.agent_runs.push(suspicious);
+        report.agent_runs.push(AgentRun {
+            files: vec!["c".into()],
+            label: "m · high".into(),
+            chunk: None,
+            cached: None,
+            outcome: AgentOutcome::Unavailable(Error::Refused("no network".into())),
+        });
+        assert_eq!(
+            report.audit_ai(),
+            "m · high chunks=3 clear=1 suspicious=1 inconclusive=0 unavailable=1 from-cache=1"
+        );
+        report.findings.push(LocalFinding {
+            path: "install.sh".into(),
+            line: 3,
+            rule: RuleId::DownloadAndExecute,
+            excerpt: "curl x | sh".into(),
+        });
+        report.gaps.push(Gap::Undecodable("blob".into()));
+        let summary = report.overruled_summary(10);
+        assert!(
+            summary[0].ends_with("install.sh:3 download-and-execute"),
+            "{summary:?}"
+        );
+        assert!(summary.iter().any(|line| line == "AI review: SUSPICIOUS"));
+        assert!(
+            summary
+                .iter()
+                .any(|line| line.starts_with("AI review unavailable"))
+        );
+        assert!(
+            summary
+                .iter()
+                .any(|line| line.starts_with("not reviewed: blob"))
+        );
+        // Bounded, and it says what it left out.
+        assert_eq!(report.overruled_summary(2).len(), 3);
+        assert_eq!(report.overruled_summary(2)[2], "and 2 more");
     }
 
     fn reviewed(status: Status, files: &[&str]) -> AgentRun {

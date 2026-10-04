@@ -574,14 +574,17 @@ fn installed() -> Result<&'static Path, String> {
     Ok(program)
 }
 
-/// Changes the system's list of allowed items through sudo (see
-/// `system_allow_command`).
-pub fn system_allow(arguments: &[&str]) -> Result<(), String> {
+/// Runs the installed Guardian's `command` with `arguments` as root,
+/// through sudo, which asks for the password on the terminal, to do
+/// `what` ("changing ..."), which is said first. What only root may write
+/// is written this way: by the installed, root-owned program, never by the
+/// one that is running.
+pub fn as_root(command: &str, arguments: &[&str], what: &str) -> Result<(), String> {
     let program = installed()?;
-    errln!("Guardian needs root to change what this system allows; it asks for your password.");
+    errln!("Guardian needs root for {what}; it asks for your password.");
     let status = Command::new(SUDO)
         .arg(program)
-        .arg("sweep-allow-system")
+        .arg(command)
         .args(arguments)
         .stdin(Stdio::inherit())
         .status()
@@ -590,9 +593,19 @@ pub fn system_allow(arguments: &[&str]) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "changing the system's allowed items failed ({status}); nothing was changed. If the installed Guardian is older than this one, run ./install.sh"
+            "{what} failed ({status}); nothing was changed. If the installed Guardian is older than this one, run ./install.sh"
         ))
     }
+}
+
+/// Changes the system's list of allowed items through sudo (see
+/// `system_allow_command`).
+pub fn system_allow(arguments: &[&str]) -> Result<(), String> {
+    as_root(
+        "sweep-allow-system",
+        arguments,
+        "changing the system's allowed items",
+    )
 }
 
 /// The longest label and fingerprint the system's list takes.
@@ -658,6 +671,30 @@ fn change_allowed(
     Ok(())
 }
 
+/// The changes `arguments` ask for as the audit trail keeps them: the
+/// labels, without their fingerprints.
+fn changes_asked(arguments: &[String]) -> String {
+    let mut asked = Vec::new();
+    let mut rest = arguments;
+    while let Some((flag, tail)) = rest.split_first() {
+        rest = match (flag.as_str(), tail) {
+            ("--add", [label, _, tail @ ..]) => {
+                asked.push(format!("allow {label}"));
+                tail
+            }
+            ("--remove", [label, tail @ ..]) => {
+                asked.push(format!("forget {label}"));
+                tail
+            }
+            (_, tail) => {
+                asked.push("forget everything".to_string());
+                tail
+            }
+        };
+    }
+    asked.join("; ")
+}
+
 /// `omarchy-guardian sweep-allow-system (--add LABEL FINGERPRINT | --remove
 /// LABEL | --clear)...`, run as root through sudo by `sweep allow` and
 /// `sweep forget`: the list of allowed items, which only root writes. The
@@ -678,7 +715,10 @@ pub fn system_allow_command(arguments: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
     match state::save_system_allowed(path, &allowed) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            crate::audit::allow_list_changed(&changes_asked(arguments), invoker);
+            ExitCode::SUCCESS
+        }
         Err(error) => {
             errln!("omarchy-guardian sweep-allow-system: {error}");
             ExitCode::from(2)

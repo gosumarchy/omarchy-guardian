@@ -82,6 +82,9 @@ pub struct PartialConfig {
     /// Weaker-than-the-level settings of user-level classes the owner of
     /// this machine has accepted, as `class.knob=value` (system file only).
     pub acknowledged_weaker: Option<Vec<String>>,
+    /// Whether a blocked install can be permitted under the strict level
+    /// (`[permit] strict = "allowed"`; system file only).
+    pub permit_strict: Option<bool>,
     pub agent: AgentDefaults,
     pub classes: Vec<(SourceClass, PartialPolicy)>,
 }
@@ -219,6 +222,13 @@ fn apply(
         }
         ["acknowledged", "weaker"] => {
             config.acknowledged_weaker = Some(field.weaker_list(value)?);
+        }
+        ["permit", "strict"] => {
+            config.permit_strict = Some(match field.text(value)?.as_str() {
+                "allowed" => true,
+                "off" => false,
+                _ => return Err(field.error("expected \"allowed\" or \"off\"")),
+            });
         }
         ["agent", "model"] => config.agent.model = Some(field.model(value)?),
         ["agent", "max_input_kib"] => {
@@ -412,6 +422,21 @@ mod tests {
     use std::path::Path;
 
     use super::{PartialPolicy, is_weaker_key, parse};
+
+    #[test]
+    fn permits_under_the_strict_level_are_allowed_or_off() {
+        let strict =
+            |text: &str| parse(Path::new("system"), text).map(|config| config.permit_strict);
+        assert_eq!(
+            strict("[permit]\nstrict = \"allowed\"\n").unwrap(),
+            Some(true)
+        );
+        assert_eq!(strict("[permit]\nstrict = \"off\"\n").unwrap(), Some(false));
+        assert_eq!(strict("profile = \"strict\"\n").unwrap(), None);
+        assert!(strict("[permit]\nstrict = \"yes\"\n").is_err());
+        assert!(strict("[permit]\nstrict = true\n").is_err());
+        assert!(strict("[permit]\nstandard = \"off\"\n").is_err());
+    }
 
     #[test]
     fn accepted_weaker_settings_name_a_user_level_class_a_knob_and_a_value() {

@@ -46,11 +46,12 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use self::state::{Drift, Extraction, State};
+use crate::audit::{self, Gate};
 use crate::aur::recipe::{self, Sources};
 use crate::aur::{self, AurInfo, Roots, Upstream};
-use crate::cli::{Confirm, Target, TtyConfirm, review_and_decide};
+use crate::cli::{Confirm, Target, TtyConfirm, Verdict, passed, review_and_decide};
 use crate::config::Settings;
-use crate::config::model::SourceClass;
+use crate::config::model::{Named, SourceClass};
 use crate::engine::baseline::{Identity, Unit};
 use crate::engine::store::Store;
 use crate::error::{Error, IoContext};
@@ -58,6 +59,7 @@ use crate::json::Json;
 use crate::notify::{self, Ran};
 use crate::osv;
 use crate::pacman;
+use crate::permit::{self, Content, Standing};
 use crate::report::{Blocked, Decision, Gap, Report, RunRef};
 use crate::review::{self, ReviewContext};
 use crate::rules;
@@ -201,23 +203,12 @@ pub fn run(command: &[OsString], settings: &Settings) -> ExitCode {
     // 2. The recipe.
     let target = recipe_target(&build_dir, &key, base.is_some());
     let recipe_context = recipe_context(&facts, &recipe);
-    let (report, decision) = review_and_decide(
-        &target,
-        settings,
-        &OpenCode::UserPath,
-        Some(&mut TtyConfirm),
-        &recipe_context,
-    );
-    if !decision.allows_running() {
-        errln!("Guardian blocked makepkg because the review of the recipe did not allow it.");
-        notify_block(&directory_name, decision, "the recipe", Ran::Nothing);
-        return decision.exit_code();
-    }
-    if let Err(error) = scan::verify_unchanged(&target.config, &report.snapshot) {
-        errln!("Guardian blocked makepkg because {error}.");
-        notify::blocked(&subject(&directory_name), &error.to_string(), Ran::Nothing);
-        return ExitCode::from(2);
-    }
+    let verdict = match review_recipe(&target, settings, &recipe_context, &recipe) {
+        Ok(verdict) => verdict,
+        Err(exit) => return exit,
+    };
+    let report = &verdict.report;
+    let recipe_digest = recipe_digest(&report.snapshot, &written_downloads(&recipe));
 
     // 3. The upstream sources, for a call that runs PKGBUILD functions.
     let invocation = aur::classify(arguments);
@@ -238,6 +229,7 @@ pub fn run(command: &[OsString], settings: &Settings) -> ExitCode {
             key: &key,
             base: base.as_deref(),
             recipe: &recipe,
+            recipe_digest: &recipe_digest,
             functions: &functions,
             extract: invocation.extracts,
             uses_sources: invocation.uses_sources,
@@ -261,10 +253,207 @@ pub fn run(command: &[OsString], settings: &Settings) -> ExitCode {
         } else {
             Ran::Nothing
         };
+        audit::refused(Gate::Aur, &format!("{}: {error}", target.subject()), 2);
         notify::blocked(&subject(&directory_name), &error.to_string(), ran);
         return ExitCode::from(2);
     }
+    errln!(
+        "Guardian: {}; starting {}",
+        passed(&verdict),
+        Path::new(makepkg).display()
+    );
     start_build(Path::new(makepkg), arguments, invocation.extracts, pinned)
+}
+
+/// The top-level names makepkg downloads into the build directory, as far
+/// as the recipe writes its sources out: files that are not there when a
+/// build is first reviewed and are there at every call after.
+fn written_downloads(recipe: &str) -> Vec<String> {
+    let Sources::Written(arrays) = recipe::sources(recipe) else {
+        return Vec::new();
+    };
+    arrays
+        .iter()
+        .filter(|(name, _)| name == "source" || name.starts_with("source_"))
+        .flat_map(|(_, entries)| entries)
+        .filter(|entry| aur::source_protocol(entry) != "local")
+        .map(|entry| aur::source_filename(entry))
+        .filter(|name| !name.is_empty() && name != "PKGBUILD")
+        .collect()
+}
+
+/// One SHA-256 over the recipe as reviewed: every file of the build
+/// directory by path, hash and execute bit, but for those under the
+/// top-level names in `left_out` (and their partial downloads).
+fn recipe_digest(snapshot: &Snapshot, left_out: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    for file in snapshot.files() {
+        let top = file.path.split('/').next().unwrap_or_default();
+        if left_out
+            .iter()
+            .any(|name| name == top || top.strip_suffix(".part") == Some(name))
+        {
+            continue;
+        }
+        hasher.update(file.path.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(file.sha256.to_string().as_bytes());
+        hasher.update(&[u8::from(file.executable), b'\n']);
+    }
+    hasher.finalize().to_string()
+}
+
+/// The recipe as a permit names it. A permit is offered for the build
+/// directory as it is; one given before makepkg downloaded the sources
+/// into that directory still stands for the recipe once they are there,
+/// so the second form leaves those files out. A file that was already
+/// there when the permit was given is part of the first form only: one
+/// changed since has no permit.
+fn recipe_contents(target: &Target, snapshot: &Snapshot, recipe: &str) -> Vec<Content> {
+    if snapshot.files().is_empty() {
+        return Vec::new();
+    }
+    let mut digests = vec![
+        recipe_digest(snapshot, &[]),
+        recipe_digest(snapshot, &written_downloads(recipe)),
+    ];
+    digests.dedup();
+    digests
+        .iter()
+        .filter_map(|digest| {
+            Content::new(
+                Gate::Aur,
+                SourceClass::Aur.name(),
+                &target.subject(),
+                vec![format!("recipe:{digest}")],
+            )
+        })
+        .collect()
+}
+
+/// Version-control sources: what makepkg fetches of them has no one hash.
+const VCS: &[&str] = &["git", "hg", "svn", "bzr", "fossil"];
+
+/// The upstream sources of a build as a permit names them: the recipe, and
+/// the downloaded files by their hashes, which are the same at every
+/// makepkg call of one build. Sources that are no plain downloads (a
+/// checkout) are named by every file the walk read instead, which a
+/// build's own `prepare()` changes. `None` when a file among them has no
+/// SHA-256: nothing can stand for it.
+fn upstream_content(
+    step: &UpstreamStep<'_>,
+    upstream: &Upstream,
+    sources: &[aur::Source],
+) -> Option<Content> {
+    let plain = !upstream.downloads.is_empty()
+        && sources
+            .iter()
+            .all(|source| !VCS.contains(&aur::source_protocol(&source.entry)));
+    let files = if plain {
+        &upstream.downloads
+    } else {
+        &upstream.seen
+    };
+    let mut hasher = Sha256::new();
+    for (path, digest) in files {
+        if digest.len() != 64 {
+            return None;
+        }
+        hasher.update(path.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(digest.as_bytes());
+        hasher.update(b"\n");
+    }
+    Content::new(
+        Gate::Aur,
+        SourceClass::Aur.name(),
+        &format!("aur:{} upstream sources", step.key),
+        vec![
+            format!("recipe:{}", step.recipe_digest),
+            format!("sources:{}", hasher.finalize()),
+        ],
+    )
+}
+
+/// How the upstream review stands with permits, printed and recorded: the
+/// report (when there was text to review) with its final decision.
+fn settle_upstream(
+    step: &UpstreamStep<'_>,
+    settings: &Settings,
+    content: Option<Content>,
+    report: Option<Report>,
+    decision: Decision,
+) -> Standing {
+    let printed = report.is_some();
+    let mut report =
+        report.unwrap_or_else(|| Report::new(format!("{} · upstream sources", step.name)));
+    let contents: Vec<Content> = content.into_iter().collect();
+    let standing = permit::standing(
+        &contents,
+        &report,
+        decision,
+        settings,
+        Store::default_root().as_deref(),
+    );
+    report.permit = standing.permitted().map(str::to_string);
+    if printed {
+        report.print(false, decision);
+    }
+    let permitted = standing.permitted().is_some();
+    audit::review(
+        &audit::Reviewed {
+            gate: Gate::Aur,
+            class: SourceClass::Aur.name(),
+            subject: &format!("aur:{} upstream sources", step.key),
+            digest: &contents.first().map(Content::digest).unwrap_or_default(),
+            decision,
+            permit: standing.permitted(),
+            offered: standing.offered(),
+            exit: if permitted { 0 } else { decision.exit_status() },
+        },
+        &report,
+    )
+    .record();
+    standing
+}
+
+/// Reviews the recipe in `target`. `Err` is the exit code of a gate that
+/// goes no further: the review did not allow it and no permit of the
+/// user's overrules it, or the recipe changed meanwhile.
+fn review_recipe(
+    target: &Target,
+    settings: &Settings,
+    context: &[String],
+    recipe: &str,
+) -> Result<Verdict, ExitCode> {
+    let name = target
+        .config
+        .root
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default();
+    let verdict = review_and_decide(
+        target,
+        settings,
+        &OpenCode::UserPath,
+        Some(&mut TtyConfirm),
+        context,
+        Gate::Aur,
+        Some(&|report| recipe_contents(target, &report.snapshot, recipe)),
+    );
+    if !verdict.allows_running() {
+        errln!("Guardian blocked makepkg because the review of the recipe did not allow it.");
+        verdict.standing.say();
+        notify_block(name, verdict.decision, "the recipe", Ran::Nothing);
+        return Err(verdict.decision.exit_code());
+    }
+    if let Err(error) = scan::verify_unchanged(&target.config, &verdict.report.snapshot) {
+        errln!("Guardian blocked makepkg because {error}.");
+        audit::refused(Gate::Aur, &format!("{}: {error}", target.subject()), 2);
+        notify::blocked(&subject(name), &error.to_string(), Ran::Nothing);
+        return Err(ExitCode::from(2));
+    }
+    Ok(verdict)
 }
 
 /// What the AI is told beside the recipe it reviews: the scope, the AUR's
@@ -297,6 +486,11 @@ fn refuse_moved_directories(recipe: &str, directory_name: &str) -> Option<ExitCo
         "the PKGBUILD moves makepkg's build or download directories",
         Ran::Nothing,
     );
+    audit::refused(
+        Gate::Aur,
+        &format!("{directory_name}: the PKGBUILD moves makepkg's directories"),
+        1,
+    );
     Some(ExitCode::from(1))
 }
 
@@ -317,7 +511,6 @@ fn start_build(
     extracted: bool,
     pinned: Option<Dirs>,
 ) -> ExitCode {
-    errln!("Guardian: review clear; starting {}", makepkg.display());
     let mut arguments = arguments.to_vec();
     if extracted && !arguments.iter().any(|arg| arg == "--holdver") {
         arguments.push("--holdver".into());
@@ -561,6 +754,8 @@ struct UpstreamStep<'a> {
     /// The confirmed AUR package base.
     base: Option<&'a str>,
     recipe: &'a str,
+    /// The recipe as reviewed, in one SHA-256 (see `recipe_digest`).
+    recipe_digest: &'a str,
     /// The recipe's files whose commands run during the build or install.
     functions: &'a Functions,
     /// The call extracts the sources itself, so they are extracted here
@@ -1686,6 +1881,7 @@ fn dependency_facts(upstream: &Upstream) -> Vec<String> {
 /// list the sources.
 fn block(step: &UpstreamStep<'_>, message: &str, why: &str, code: u8) -> ExitCode {
     errln!("Guardian blocked makepkg: {message}");
+    audit::refused(Gate::Aur, &format!("aur:{}: {why}", step.key), code);
     notify::blocked(&subject(step.name), why, Ran::RecipeToFetch);
     ExitCode::from(code)
 }
@@ -1861,23 +2057,39 @@ fn review_upstream(
         sources,
         prebuilt: &prebuilt,
     };
-    let decision = if upstream.files.is_empty() && upstream.gaps.is_empty() {
-        unreviewable_sources(step, &review, confirm)
+    let (report, decision) = if upstream.files.is_empty() && upstream.gaps.is_empty() {
+        (None, unreviewable_sources(step, &review, confirm))
     } else {
-        review_upstream_files(step, settings, &review, &context, confirm)
+        let (report, decision) = review_upstream_files(step, settings, &review, &context, confirm);
+        (Some(report), decision)
     };
+    let content = upstream_content(step, &upstream, sources);
+    let standing = settle_upstream(step, settings, content, report, decision);
     match decision {
+        Decision::Blocked(_) if standing.permitted().is_some() => {
+            errln!(
+                "Guardian: your permit {} overrules the review of the upstream sources.",
+                standing.permitted().unwrap_or_default()
+            );
+            step.state.record_binaries(&all_binaries(&upstream));
+            Ok(UpstreamOutcome { dirs, downloads })
+        }
         // Nothing was sent to the AI (`ai = off`): the recipe decision stands.
         Decision::Limited | Decision::Clear | Decision::Warned => {
             // What a later build's binaries are held against.
             step.state.record_binaries(&all_binaries(&upstream));
             Ok(UpstreamOutcome { dirs, downloads })
         }
-        Decision::Blocked(Blocked::NotConfirmed) => Err(not_confirmed()),
+        Decision::Blocked(Blocked::NotConfirmed) => {
+            let exit = not_confirmed();
+            standing.say();
+            Err(exit)
+        }
         Decision::Blocked(_) => {
             errln!(
                 "Guardian blocked makepkg because the review of the upstream sources did not allow it."
             );
+            standing.say();
             notify_block(
                 step.name,
                 decision,
@@ -2171,13 +2383,15 @@ fn upstream_runs(report: &mut Report, step: &UpstreamStep<'_>, upstream: &Upstre
     }
 }
 
+/// Reviews the upstream files; the report is the caller's to print, once
+/// it knows how the decision stands with permits (see `settle_upstream`).
 fn review_upstream_files(
     step: &UpstreamStep<'_>,
     settings: &Settings,
     review: &UpstreamReview<'_>,
     context: &[String],
     confirm: &mut dyn Confirm,
-) -> Decision {
+) -> (Report, Decision) {
     let upstream = review.upstream;
     let state_root = Store::default_root();
     let mut context = context.to_vec();
@@ -2248,9 +2462,26 @@ fn review_upstream_files(
     if passes && !confirm_prebuilt(step, review.prebuilt, confirm) {
         decision = Decision::Blocked(Blocked::NotConfirmed);
     }
-    report.print(false, decision);
-    decision
+    (report, decision)
 }
+
+/// Forgets what the gate remembers of the source `identity` names
+/// (`aur:<pkg>`, `aur-src:<pkg>`, or a local build's own key) under the
+/// review memory's `root`: the questions answered, the binaries and what
+/// was extracted. Returns how many records went.
+pub fn forget(root: &Path, identity: &str) -> Result<usize, String> {
+    let key = identity
+        .strip_prefix("aur:")
+        .or_else(|| identity.strip_prefix("aur-src:"))
+        .unwrap_or(identity);
+    state::forget(root, key)
+}
+
+/// Forgets everything the gate remembers under `root`.
+pub fn forget_all(root: &Path) -> Result<usize, String> {
+    state::forget_all(root)
+}
+
 /// The AUR's record of the package base `base`, looked up by `names`.
 fn aur_info(base: &str, names: &[String]) -> Result<Option<AurInfo>, Error> {
     let query: Vec<String> = names
@@ -2312,6 +2543,97 @@ mod tests {
     }
 
     #[test]
+    fn a_recipe_permit_outlasts_the_downloads_makepkg_adds() {
+        use super::{recipe_contents, recipe_target, written_downloads};
+        let dir = TempDir::new("gate-recipe-content");
+        let recipe = "pkgname=demo\nsource=(https://example.org/demo-1.tar.gz fix.patch)\nsha256sums=(SKIP SKIP)\nbuild() { :; }\n";
+        fs::write(dir.path().join("PKGBUILD"), recipe).unwrap();
+        fs::write(dir.path().join("fix.patch"), "--- a\n+++ b\n").unwrap();
+        assert_eq!(written_downloads(recipe), ["demo-1.tar.gz"]);
+        let target = recipe_target(dir.path(), "demo", true);
+        let keys = || -> Vec<String> {
+            let (snapshot, _) = crate::scan::walk(&target.config, &mut |_| {});
+            recipe_contents(&target, &snapshot, recipe)
+                .iter()
+                .map(crate::permit::Content::key)
+                .collect()
+        };
+        // Before anything is downloaded the recipe has one name.
+        let before = keys();
+        assert_eq!(before.len(), 1);
+
+        // makepkg downloads into the build directory: the directory as it
+        // is has another name, the recipe without its downloads the same.
+        fs::write(dir.path().join("demo-1.tar.gz"), [0x1f, 0x8b, 0, 1, 2]).unwrap();
+        fs::write(dir.path().join("demo-1.tar.gz.part"), [0x1f, 0x8b]).unwrap();
+        let after = keys();
+        assert_eq!(after.len(), 2);
+        assert_ne!(after[0], before[0]);
+        assert_eq!(after[1], before[0]);
+
+        // A recipe file that changed is another recipe by every name.
+        fs::write(dir.path().join("fix.patch"), "--- a\n+++ c\n").unwrap();
+        assert!(keys().iter().all(|key| !after.contains(key)));
+        // So is one that became executable.
+        fs::write(dir.path().join("fix.patch"), "--- a\n+++ b\n").unwrap();
+        assert_eq!(keys(), after);
+        let mode = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+        fs::set_permissions(dir.path().join("fix.patch"), mode).unwrap();
+        assert!(keys().iter().all(|key| !after.contains(key)));
+    }
+
+    #[test]
+    fn upstream_sources_are_named_by_their_downloads_or_by_every_file() {
+        use super::upstream_content;
+        let fixture = Fixture::new("gate-upstream-content", "pkgname=demo\nbuild() { :; }\n");
+        let step = fixture.step();
+        let hash = |character: &str| character.repeat(64);
+        let mut upstream = Upstream::default();
+        upstream.downloads.insert("demo.tar.gz".into(), hash("a"));
+        upstream.seen.insert("src/demo.tar.gz".into(), hash("a"));
+        upstream.seen.insert("src/demo/main.c".into(), hash("b"));
+        let tarball = sources(&["https://example.org/demo.tar.gz"]);
+        let key = |step: &UpstreamStep<'_>, upstream: &Upstream, listed: &[aur::Source]| {
+            upstream_content(step, upstream, listed).map(|content| content.key())
+        };
+        let named = key(&step, &upstream, &tarball).unwrap();
+
+        // A build's own prepare() patches a file: the downloads are the
+        // same, and so is the name, at every makepkg call of the build.
+        let mut patched = upstream.clone();
+        patched.seen.insert("src/demo/main.c".into(), hash("c"));
+        assert_eq!(key(&step, &patched, &tarball).unwrap(), named);
+        // Another download, or another recipe, is other content.
+        let mut other = upstream.clone();
+        other.downloads.insert("demo.tar.gz".into(), hash("d"));
+        assert_ne!(key(&step, &other, &tarball).unwrap(), named);
+        let other_recipe = hash("d");
+        let moved = UpstreamStep {
+            recipe_digest: &other_recipe,
+            ..fixture.step()
+        };
+        assert_ne!(key(&moved, &upstream, &tarball).unwrap(), named);
+
+        // A checkout has no one hash: every file names it.
+        let checkout = sources(&["git+https://example.org/demo.git"]);
+        let by_files = key(&step, &upstream, &checkout).unwrap();
+        assert_ne!(by_files, named);
+        assert_ne!(key(&step, &patched, &checkout).unwrap(), by_files);
+
+        // A file without a hash: nothing can stand for the sources.
+        let mut unhashed = upstream.clone();
+        unhashed
+            .downloads
+            .insert("demo.tar.gz".into(), "size-1-2-3".into());
+        assert_eq!(key(&step, &unhashed, &tarball), None);
+        upstream
+            .seen
+            .insert("src/demo/big.bin".into(), String::new());
+        assert_eq!(key(&step, &upstream, &checkout), None);
+        assert!(key(&step, &upstream, &tarball).is_some());
+    }
+
+    #[test]
     fn a_binary_the_upstream_code_runs_leaves_the_review_incomplete() {
         let fixture = Fixture::new("gate-upstream-runs", "pkgname=demo\nbuild() { :; }\n");
         let src = fixture.dir.path().join("src");
@@ -2360,6 +2682,8 @@ mod tests {
     }
 
     /// A build directory with a recipe, and what a step needs beside it.
+    const RECIPE_DIGEST: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
     struct Fixture {
         dir: TempDir,
         recipe: String,
@@ -2392,6 +2716,7 @@ mod tests {
                 key: "demo",
                 base: None,
                 recipe: &self.recipe,
+                recipe_digest: RECIPE_DIGEST,
                 functions: &self.functions,
                 extract: false,
                 uses_sources: true,
@@ -2564,7 +2889,7 @@ mod tests {
                 sources: &listed,
                 prebuilt: &found,
             };
-            super::review_upstream_files(&step, &settings, &review, &context, confirm)
+            super::review_upstream_files(&step, &settings, &review, &context, confirm).1
         };
         let mut no = answer(false);
         assert_eq!(review_of(&mut no), Decision::Blocked(Blocked::NotConfirmed));

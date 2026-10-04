@@ -53,6 +53,15 @@ pub fn render(config: &PartialConfig, header: &str) -> String {
         line(&mut text, "weaker", &format!("[{}]", list.join(", ")));
     }
 
+    if let Some(allowed) = config.permit_strict {
+        text.push_str("\n[permit]\n");
+        line(
+            &mut text,
+            "strict",
+            &quoted(if allowed { "allowed" } else { "off" }),
+        );
+    }
+
     let agent = &config.agent;
     let numbers = [
         ("max_input_kib", agent.max_input_kib),
@@ -166,6 +175,7 @@ mod tests {
                 group: Some("wheel".into()),
             },
             acknowledged_weaker: Some(vec!["aur.ai=off".into(), "theme.confirm=false".into()]),
+            permit_strict: Some(true),
             profile: Some(Profile::Strict),
             official_repos: Some(vec!["core".into(), "extra".into()]),
             agent: AgentDefaults {
@@ -207,6 +217,7 @@ mod tests {
         let parsed = round_trip(&config);
         assert_eq!(parsed.sweep, config.sweep);
         assert_eq!(parsed.acknowledged_weaker, config.acknowledged_weaker);
+        assert_eq!(parsed.permit_strict, Some(true));
         assert_eq!(parsed.profile, config.profile);
         assert_eq!(parsed.official_repos, config.official_repos);
         assert_eq!(parsed.agent, config.agent);
