@@ -11,6 +11,7 @@
 use std::fs;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 
 use super::collect::{Body, Item, Origin, Scope, WITHHELD};
 use super::read::{self, Found, View};
@@ -171,18 +172,20 @@ fn names_in(entries: fs::ReadDir) -> Vec<String> {
 }
 
 /// The id of the user whose directory `home` is.
-fn owner(scope: &Scope<'_>, home: &str) -> Option<u32> {
-    fs::symlink_metadata(scope.root.join(home))
+fn owner(root: &Path, home: &str) -> Option<u32> {
+    fs::symlink_metadata(root.join(home))
         .ok()
         .map(|metadata| metadata.uid())
 }
 
-/// The paths of what may override Guardian's units and `scope` can look
-/// at as itself: in the system's unit directories and, with a home, in
-/// that home's and its runtime directory's.
-pub fn paths(scope: &Scope<'_>) -> Vec<String> {
+/// The paths under `root` of what may override Guardian's units outside
+/// the package's own directories: in the system's other unit directories
+/// and, with a home (relative to the root), in that home's and its runtime
+/// directory's. With `packaged`, the drop-ins beside the package's own
+/// units as well.
+fn candidates_under(root: &Path, home: Option<&str>, packaged: bool) -> Vec<String> {
     let list = |directory: &str| -> Vec<String> {
-        fs::read_dir(scope.root.join(directory))
+        fs::read_dir(root.join(directory))
             .map(names_in)
             .unwrap_or_default()
     };
@@ -193,12 +196,11 @@ pub fn paths(scope: &Scope<'_>) -> Vec<String> {
     for directory in SYSTEM_DIRECTORIES {
         paths.extend(candidates(directory, SYSTEM_UNITS, true, &list));
     }
-    paths.extend(candidates(PACKAGE_USER, USER_UNITS, false, &list));
-    paths.extend(candidates(PACKAGE_SYSTEM, SYSTEM_UNITS, false, &list));
-    // The root collector looks at root's own home here; the homes of the
-    // accounts its results go to are looked at as those accounts
-    // (`of_account`).
-    if let Some(home) = scope.home {
+    if packaged {
+        paths.extend(candidates(PACKAGE_USER, USER_UNITS, false, &list));
+        paths.extend(candidates(PACKAGE_SYSTEM, SYSTEM_UNITS, false, &list));
+    }
+    if let Some(home) = home {
         for directory in HOME_DIRECTORIES {
             paths.extend(candidates(
                 &format!("{home}/{directory}"),
@@ -207,7 +209,7 @@ pub fn paths(scope: &Scope<'_>) -> Vec<String> {
                 &list,
             ));
         }
-        if let Some(uid) = owner(scope, home) {
+        if let Some(uid) = owner(root, home) {
             for directory in RUNTIME_DIRECTORIES {
                 paths.extend(candidates(
                     &format!("run/user/{uid}/{directory}"),
@@ -220,7 +222,29 @@ pub fn paths(scope: &Scope<'_>) -> Vec<String> {
     }
     paths
         .into_iter()
-        .filter(|path| fs::symlink_metadata(scope.root.join(path)).is_ok())
+        .filter(|path| fs::symlink_metadata(root.join(path)).is_ok())
+        .collect()
+}
+
+/// The paths of what may override Guardian's units and `scope` can look
+/// at as itself: in the system's unit directories and, with a home, in
+/// that home's and its runtime directory's. The root collector looks at
+/// root's own home here; the homes of the accounts its results go to are
+/// looked at as those accounts (`of_account`).
+pub fn paths(scope: &Scope<'_>) -> Vec<String> {
+    candidates_under(scope.root, scope.home, true)
+}
+
+/// What stands in for Guardian's units right now, for the bar: the same
+/// files the sweep alerts on (`is_override`), found without the package
+/// index, which is too much to load every half minute. Drop-ins in the
+/// package's own directories are therefore left to the sweep: only it
+/// can tell the one a repository package ships for every unit from one
+/// put there by hand.
+pub fn standing(root: &Path, home: Option<&str>) -> Vec<String> {
+    candidates_under(root, home, false)
+        .into_iter()
+        .filter(|path| is_override(home, path))
         .collect()
 }
 
@@ -303,7 +327,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
-    use super::{is_override, of_account};
+    use super::{is_override, of_account, standing};
     use crate::rules::RuleId;
     use crate::sweep::collect::{Body, Origin, Scope, WITHHELD, collect};
     use crate::sweep::index::PackageIndex;
@@ -393,6 +417,16 @@ mod tests {
                 .iter()
                 .any(|item| { item.path.ends_with("other.service") && item.alerts.is_empty() })
         );
+
+        // The bar finds the same two without a package index. A drop-in
+        // beside the package's own units is left to the sweep, which can
+        // tell whether a repository package ships it.
+        let beside = root.join("usr/lib/systemd/user/omarchy-guardian-sweep.service.d");
+        fs::create_dir_all(&beside).unwrap();
+        fs::write(beside.join("x.conf"), "[Service]\n").unwrap();
+        assert_eq!(standing(root, Some("home/u")), paths);
+        assert!(standing(root, None).is_empty());
+        assert_eq!(super::paths(&scope).len(), 3);
 
         // Root, for the account the results go to: the same files, by
         // hash, without their content.

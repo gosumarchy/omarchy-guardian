@@ -769,6 +769,7 @@ mod tests {
             sweep_root_timer_link: root.join("system-wants/omarchy-guardian-sweep-collect.timer"),
             sweep_consent: None,
             sweep_group: Some("u".into()),
+            sweep_overrides: Vec::new(),
             login_shell: None,
             makepkg_gate: root.join("guardian-makepkg"),
             owner: std::os::unix::fs::MetadataExt::uid(&fs::metadata(root).unwrap()),

@@ -15,6 +15,7 @@ use super::menufile;
 use super::shellscan::{self, Loads};
 use crate::config::model::RootConsent;
 use crate::json::Json;
+use crate::sweep::own;
 
 pub const HOOK_SOURCE: &str = "/usr/share/omarchy-guardian/omarchy-guardian.hook";
 pub const HOOK_TARGET: &str = "/etc/pacman.d/hooks/omarchy-guardian.hook";
@@ -281,6 +282,9 @@ pub struct Paths {
     /// group allowed to read the daily results.
     pub sweep_consent: Option<RootConsent>,
     pub sweep_group: Option<String>,
+    /// The files that stand in for, or change, one of the sweep's own
+    /// units (see `sweep::own`), relative to the root.
+    pub sweep_overrides: Vec<String>,
     /// The name of the user's login shell (`bash`, `zsh`), if known.
     pub login_shell: Option<String>,
     /// Guardian's makepkg shim, which yay is pointed at.
@@ -407,6 +411,10 @@ impl Paths {
                 .join(SWEEP_ROOT_TIMER),
             sweep_consent,
             sweep_group,
+            sweep_overrides: own::standing(
+                Path::new("/"),
+                home.to_str().map(|home| home.trim_matches('/')),
+            ),
             login_shell: login_shell(),
             makepkg_gate: MAKEPKG_GATE.into(),
             owner: 0,
@@ -514,28 +522,20 @@ impl Paths {
         }
         let user = fs::symlink_metadata(&self.sweep_timer_link).is_ok();
         let root = fs::symlink_metadata(&self.sweep_root_timer_link).is_ok();
-        // A file of the unit's own name beside the `timers.target.wants`
-        // directory replaces or masks the packaged unit: the link is there
-        // and the sweep does not run.
-        let overridden = |link: &Path, unit: &str| {
-            let directory = link.parent().and_then(Path::parent);
-            ["timer", "service"].iter().any(|kind| {
-                directory.is_some_and(|directory| {
-                    fs::symlink_metadata(directory.join(format!("{unit}.{kind}"))).is_ok()
-                })
-            })
-        };
-        if (user && overridden(&self.sweep_timer_link, "omarchy-guardian-sweep"))
-            || (root
-                && overridden(
-                    &self.sweep_root_timer_link,
-                    "omarchy-guardian-sweep-collect",
-                ))
+        // A unit file of the sweep's own name, or a drop-in for it, in a
+        // directory systemd reads before the package's: the link is there
+        // and the sweep may not run, or not look at this home. The same
+        // files the sweep itself alerts on.
+        if (user || root)
+            && let Some(first) = self.sweep_overrides.first()
         {
-            return State::Partial(
-                "a unit file of the sweep's own name overrides or masks the packaged one, so it may not run"
-                    .into(),
-            );
+            let more = match self.sweep_overrides.len() - 1 {
+                0 => String::new(),
+                more => format!(" and {more} more"),
+            };
+            return State::Partial(format!(
+                "/{first}{more} overrides or masks the sweep's own unit, so it may not run as packaged"
+            ));
         }
         match (user, self.sweep_consent, root) {
             (false, _, true) => State::Partial(
@@ -1616,6 +1616,7 @@ mod tests {
             sweep_root_timer_link: root.join("system-wants/omarchy-guardian-sweep-collect.timer"),
             sweep_consent: None,
             sweep_group: Some("u".into()),
+            sweep_overrides: Vec::new(),
             login_shell: Some("bash".into()),
             makepkg_gate: root.join("guardian-makepkg"),
             owner: std::os::unix::fs::MetadataExt::uid(&fs::metadata(root).unwrap()),
@@ -1655,18 +1656,21 @@ mod tests {
             paths.state(Integration::SystemSweep),
             State::Partial(_)
         ));
-        // A unit file of the sweep's own name beside the links masks it,
-        // whatever it holds.
-        let mask = paths
-            .sweep_timer_link
-            .parent()
-            .and_then(std::path::Path::parent)
-            .unwrap()
-            .join("omarchy-guardian-sweep.timer");
-        fs::write(&mask, "").unwrap();
+        // What stands in for one of the sweep's units (a unit file of its
+        // name, a drop-in: `sweep::own` finds them) is named, whatever it
+        // holds.
+        paths.sweep_overrides = vec![
+            "home/u/.config/systemd/user/omarchy-guardian-sweep.service.d/home.conf".into(),
+            "home/u/.config/systemd/user.control/omarchy-guardian-sweep.timer".into(),
+        ];
         let state = paths.state(Integration::SystemSweep);
-        assert!(matches!(&state, State::Partial(detail) if detail.contains("overrides or masks")));
-        fs::remove_file(&mask).unwrap();
+        assert!(
+            matches!(&state, State::Partial(detail) if detail.starts_with(
+                "/home/u/.config/systemd/user/omarchy-guardian-sweep.service.d/home.conf and 1 more overrides or masks"
+            )),
+            "{state:?}"
+        );
+        paths.sweep_overrides.clear();
 
         paths.sweep_consent = Some(RootConsent::Declined);
         let state = paths.state(Integration::SystemSweep);
@@ -1703,8 +1707,21 @@ mod tests {
         fs::create_dir_all(dir.path().join("hooks")).unwrap();
         symlink(&paths.hook_source, &paths.hook_target).unwrap();
         assert_eq!(paths.state(Integration::PacmanHook), State::On);
+        // Off takes the link away and nothing else: the hook pacman always
+        // loads from libalpm's own directory stays with the package, and
+        // lets every transaction through once the link is gone.
         let plan = paths.plan(Integration::PacmanHook, &State::On).unwrap();
-        assert!(matches!(&plan.steps[..], [Step::Command(argv)] if argv[1] == "/usr/bin/rm"));
+        let link = paths.hook_target.display().to_string();
+        assert!(
+            matches!(&plan.steps[..], [Step::Command(argv)]
+                if argv[1..] == ["/usr/bin/rm".to_string(), "-f".to_string(), link.clone()]),
+            "{plan:?}"
+        );
+        // The packaged hook file alone is not the hook turned on.
+        fs::remove_file(&paths.hook_target).unwrap();
+        assert!(paths.hook_source.exists());
+        assert_eq!(paths.state(Integration::PacmanHook), State::Off);
+        symlink(&paths.hook_source, &paths.hook_target).unwrap();
 
         fs::remove_file(&paths.hook_target).unwrap();
         fs::write(&paths.hook_target, "[Trigger]\n").unwrap();
