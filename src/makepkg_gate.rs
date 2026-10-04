@@ -454,26 +454,58 @@ fn only_downloads(step: &UpstreamStep<'_>, sources: &[aur::Source], upstream: &U
     !sources.is_empty() && !upstream.found && !step.uses_sources && upstream.gaps.is_empty()
 }
 
+/// What is left to ask once a permit overrules the review. A permit says
+/// yes to the review's verdict on the very bytes it read; whether to
+/// install programs nobody reviewed is another question, which a review
+/// that did not pass never came to ask (see `review_upstream_files`). It is
+/// asked here as on a review that passed, and a no is the user's own
+/// (`NOT CONFIRMED`), which the permit does not overrule.
+fn asked_under_permit(
+    step: &UpstreamStep<'_>,
+    prebuilt: &Prebuilt,
+    decision: Decision,
+    permitted: bool,
+    confirm: &mut dyn Confirm,
+) -> Decision {
+    let overruled =
+        permitted && matches!(decision, Decision::Blocked(why) if why != Blocked::NotConfirmed);
+    if overruled && !confirm_prebuilt(step, prebuilt, confirm) {
+        Decision::Blocked(Blocked::NotConfirmed)
+    } else {
+        decision
+    }
+}
+
 /// How the upstream review stands with permits, printed and recorded: the
-/// report (when there was text to review) with its final decision.
+/// report (when there was text to review) with its final decision, which
+/// is returned beside the standing. A permit that overrules the review
+/// still leaves the prebuilt programs to be asked about.
 fn settle_upstream(
     step: &UpstreamStep<'_>,
     settings: &Settings,
     content: Option<Content>,
-    report: Option<Report>,
-    decision: Decision,
-) -> Standing {
+    reviewed: (Option<Report>, Decision),
+    prebuilt: &Prebuilt,
+    confirm: &mut dyn Confirm,
+) -> (Standing, Decision) {
+    let (report, reviewed) = reviewed;
     let printed = report.is_some();
     let mut report =
         report.unwrap_or_else(|| Report::new(format!("{} · upstream sources", step.name)));
     let contents: Vec<Content> = content.into_iter().collect();
-    let standing = permit::standing(
-        permittable(decision, &contents),
+    let mut standing = permit::standing(
+        permittable(reviewed, &contents),
         &report,
-        decision,
+        reviewed,
         settings,
         Store::default_root().as_deref(),
     );
+    let permitted = standing.permitted().is_some();
+    let decision = asked_under_permit(step, prebuilt, reviewed, permitted, confirm);
+    if decision != reviewed {
+        // Declined: the run is not one the permit let through.
+        standing = Standing::None;
+    }
     report.permit = standing.permitted().map(str::to_string);
     if printed {
         report.print(false, decision);
@@ -493,7 +525,7 @@ fn settle_upstream(
         &report,
     )
     .record();
-    standing
+    (standing, decision)
 }
 
 /// Reviews the recipe in `target`. `Err` is the exit code of a gate that
@@ -2217,17 +2249,19 @@ fn review_upstream(
         sources,
         prebuilt: &prebuilt,
     };
-    let (report, decision) = if upstream.files.is_empty() && upstream.gaps.is_empty() {
+    let reviewed = if upstream.files.is_empty() && upstream.gaps.is_empty() {
         (None, unreviewable_sources(step, &review, confirm))
     } else {
         let (report, decision) = review_upstream_files(step, settings, &review, &context, confirm);
         (Some(report), decision)
     };
     let content = upstream_content(step, &upstream, sources);
-    let standing = settle_upstream(step, settings, content, report, decision);
+    let (standing, decision) =
+        settle_upstream(step, settings, content, reviewed, &prebuilt, confirm);
     match decision {
         // The user's own no: no permit overrules it, and none is offered.
         Decision::Blocked(Blocked::NotConfirmed) => Err(not_confirmed()),
+        // The prebuilt programs were asked about in `settle_upstream`.
         Decision::Blocked(_) if standing.permitted().is_some() => {
             errln!(
                 "Guardian: your permit {} overrules the review of the upstream sources.",
@@ -3498,6 +3532,70 @@ mod tests {
             Decision::Blocked(Blocked::NotConfirmed)
         );
         assert_eq!(no.asked, 1);
+    }
+
+    #[test]
+    fn a_permit_that_overrules_the_review_does_not_answer_the_prebuilt_question() {
+        use super::asked_under_permit;
+        let recipe =
+            "pkgname=demo-bin\npackage() {\n  install -Dm755 demo \"$pkgdir/usr/bin/demo\"\n}\n";
+        let fixture = Fixture::new("gate-permitted", recipe);
+        let src = fixture.dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("demo"), ELF).unwrap();
+        fs::write(src.join("run.sh"), "#!/bin/sh\necho hi\n").unwrap();
+        let listed = sources(&["https://example.org/demo.tar.gz"]);
+        let step = fixture.step();
+        let found = prebuilt(&step, &fixture.upstream(), &listed);
+        assert_eq!(found.programs.len(), 1);
+        let blocked = Decision::Blocked(Blocked::Findings);
+        let declined = Decision::Blocked(Blocked::NotConfirmed);
+
+        // A block no permit overrules stays what it is, unasked: a yes
+        // never stands in for the review.
+        let mut unasked = answer(true);
+        assert_eq!(
+            asked_under_permit(&step, &found, blocked, false, &mut unasked),
+            blocked
+        );
+        assert_eq!(unasked.asked, 0);
+
+        // The permit lets the review's block through, not the programs:
+        // a no is the user's own, and no permit stands for it.
+        let mut no = answer(false);
+        assert_eq!(
+            asked_under_permit(&step, &found, blocked, true, &mut no),
+            declined
+        );
+        assert_eq!(no.asked, 1);
+        let incomplete = Decision::Blocked(Blocked::Incomplete);
+        assert_eq!(
+            asked_under_permit(&step, &found, incomplete, true, &mut no),
+            declined
+        );
+        assert_eq!(no.asked, 2);
+        assert!(permittable(declined, &[]).is_empty());
+
+        // A yes goes on as permitted and is remembered for these programs,
+        // as on a review that passed.
+        let mut yes = answer(true);
+        assert_eq!(
+            asked_under_permit(&step, &found, blocked, true, &mut yes),
+            blocked
+        );
+        assert_eq!(
+            asked_under_permit(&step, &found, blocked, true, &mut yes),
+            blocked
+        );
+        assert_eq!(yes.asked, 1);
+
+        // Nothing prebuilt, nothing to ask.
+        let mut none = answer(false);
+        assert_eq!(
+            asked_under_permit(&step, &Prebuilt::default(), blocked, true, &mut none),
+            blocked
+        );
+        assert_eq!(none.asked, 0);
     }
 
     #[test]
