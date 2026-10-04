@@ -38,8 +38,11 @@ const WATCHED: &[&str] = &[
 const STANDARD_FUNCTIONS: &[&str] = &["prepare", "build", "check", "package", "pkgver", "verify"];
 
 /// Variables makepkg's configuration sets before the recipe is loaded: the
-/// same in the listing and in the build.
-const CONFIGURED: &[&str] = &["CARCH", "CHOST", "srcdir", "pkgdir", "startdir"];
+/// same in the listing and in the build. `srcdir` and `pkgdir` are not
+/// among them: they are empty while a recipe loads today, but they are made
+/// from the build directory, which the listing does not share, so a makepkg
+/// that set them earlier would make them differ.
+const CONFIGURED: &[&str] = &["CARCH", "CHOST", "startdir"];
 
 /// Variables bash itself fills in, with what differs from run to run,
 /// whatever the recipe sets them to.
