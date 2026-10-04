@@ -788,8 +788,30 @@ fn rejects_content(message: &str) -> bool {
     ]
     .iter()
     .any(|sign| message.contains(sign))
-        // A provider asking to slow down is absent, whatever else it says.
-        && !asks_to_slow_down(&message)
+        // A refusal that also says "try again" is still a refusal: the
+        // words of a slow-down do not undo it. Only an error the provider
+        // itself marks as a rate limit or an overload is an absent one.
+        && !is_marked_slow_down(&message)
+}
+
+/// Whether a lowercased provider error carries the status code or the
+/// error type of a rate limit or an overload (429, 529, `rate_limit_error`,
+/// `overloaded_error`), rather than only words a refusal may use too.
+fn is_marked_slow_down(message: &str) -> bool {
+    let has_status = |code: &str| {
+        message.match_indices(code).any(|(at, _)| {
+            let digit_at = |index: Option<usize>| {
+                index
+                    .and_then(|index| message.as_bytes().get(index))
+                    .is_some_and(u8::is_ascii_digit)
+            };
+            !digit_at(at.checked_sub(1)) && !digit_at(Some(at + code.len()))
+        })
+    };
+    message.contains("rate_limit_error")
+        || message.contains("overloaded_error")
+        || has_status("429")
+        || has_status("529")
 }
 
 fn content_rejected(detail: &str) -> Error {
@@ -1936,6 +1958,12 @@ exit 1"#,
             "Request blocked by the safety monitor",
             "Candidate was blocked due to PROHIBITED_CONTENT",
             "Blocked by guardrail: GUARDRAIL_INTERVENED",
+            // A refusal that speaks of retrying, of waiting or of a quota
+            // is a refusal: those words alone do not make it a slow-down.
+            "Your prompt was flagged as violating our usage policy. Please try again with a different prompt.",
+            "content_filter: the request was blocked. Please wait and try again later.",
+            "Rejected by our safety system (request 4290 of your quota was not charged)",
+            "The model is overloaded with requests like this one, which violate the content policy",
         ] {
             assert!(super::rejects_content(refused), "{refused}");
             let claude = format!(
@@ -1978,6 +2006,13 @@ exit 1"#,
             "API Error: 429 rate_limit_error: This request would exceed your rate limit",
             "API Error: 529 Overloaded",
             "overloaded_error: the usage policy service is overloaded",
+            // Marked as a rate limit or an overload by its status or type,
+            // whatever service it names.
+            "429 Too Many Requests: the content moderation endpoint is rate limited, try again",
+            "status 529: the safety system is overloaded",
+            "rate_limit_error: too many requests to the content filter",
+            "Rate limit reached, please try again in 20s",
+            "You exceeded your current quota, please check your plan",
             "Credit balance is too low",
             "ProviderModelNotFoundError: no such model",
             "API Error: 500 Internal server error",
