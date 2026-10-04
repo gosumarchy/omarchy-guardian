@@ -160,6 +160,50 @@ fn fetch_recipe(srcinfo: &str) -> Option<String> {
     Some(recipe)
 }
 
+/// Asks at the terminal, and notes when there was none to ask on: that is
+/// a no the user never gave, and never saw being asked for.
+struct Asker {
+    path: &'static str,
+    missing: bool,
+}
+
+impl Asker {
+    const fn new() -> Self {
+        Self {
+            path: "/dev/tty",
+            missing: false,
+        }
+    }
+
+    /// Says that a question went unasked, on the terminal's stand-in and
+    /// on the desktop: a build started from a graphical front end or a
+    /// timer shows nothing else of it.
+    fn say_if_missing(&self, name: &str, ran: Ran) {
+        if self.missing {
+            errln!("{NO_TERMINAL}.");
+            notify::blocked(&subject(name), NO_TERMINAL, ran);
+        }
+    }
+}
+
+const NO_TERMINAL: &str =
+    "Guardian needed to ask you something and found no terminal: run this build from a terminal";
+
+impl Confirm for Asker {
+    fn confirm(&mut self, question: &str) -> bool {
+        let reachable = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.path)
+            .is_ok();
+        if !reachable {
+            self.missing = true;
+            return false;
+        }
+        TtyConfirm.confirm(question)
+    }
+}
+
 pub fn run(command: &[OsString], settings: &Settings) -> ExitCode {
     let Some((makepkg, arguments)) = command.split_first() else {
         errln!("omarchy-guardian makepkg-gate: no makepkg command was given");
@@ -203,12 +247,14 @@ pub fn run(command: &[OsString], settings: &Settings) -> ExitCode {
     // 2. The recipe.
     let target = recipe_target(&build_dir, &key, base.is_some());
     let recipe_context = recipe_context(&facts, &recipe);
-    let verdict = match review_recipe(&target, settings, &recipe_context, &recipe) {
+    let mut terminal = Asker::new();
+    let verdict = match review_recipe(&target, settings, &recipe_context, &recipe, &mut terminal) {
         Ok(verdict) => verdict,
         Err(exit) => return exit,
     };
     let report = &verdict.report;
     let recipe_digest = recipe_digest(&report.snapshot, &written_downloads(&recipe));
+    let recipe_files = recipe_files(&report.snapshot);
 
     // 3. The upstream sources, for a call that runs PKGBUILD functions.
     let invocation = aur::classify(arguments);
@@ -230,13 +276,14 @@ pub fn run(command: &[OsString], settings: &Settings) -> ExitCode {
             base: base.as_deref(),
             recipe: &recipe,
             recipe_digest: &recipe_digest,
+            recipe_files: &recipe_files,
             functions: &functions,
             extract: invocation.extracts,
             uses_sources: invocation.uses_sources,
             configured: &configured,
             state: &state,
         };
-        match review_upstream(&step, settings, facts, &mut TtyConfirm) {
+        match upstream_step(&step, settings, facts, &mut terminal) {
             Ok(outcome) => {
                 downloads = outcome.downloads;
                 pinned = Some(outcome.dirs);
@@ -301,6 +348,20 @@ fn recipe_digest(snapshot: &Snapshot, left_out: &[String]) -> String {
         hasher.update(&[u8::from(file.executable), b'\n']);
     }
     hasher.finalize().to_string()
+}
+
+/// Every file of the recipe but the PKGBUILD, by path, with its hash and
+/// execute bit.
+fn recipe_files(snapshot: &Snapshot) -> Vec<(String, String)> {
+    snapshot
+        .files()
+        .iter()
+        .filter(|file| file.path != "PKGBUILD")
+        .map(|file| {
+            let state = format!("{} {}", file.sha256, u8::from(file.executable));
+            (file.path.clone(), state)
+        })
+        .collect()
 }
 
 /// The recipe as a permit names it. A permit is offered for the build
@@ -375,6 +436,24 @@ fn upstream_content(
     )
 }
 
+/// What of `contents` a permit can stand for under `decision`. A question
+/// the user declined is the user's own no, and the way to say yes is to
+/// answer it: a permit neither overrules it nor is offered for it.
+fn permittable(decision: Decision, contents: &[Content]) -> &[Content] {
+    if decision == Decision::Blocked(Blocked::NotConfirmed) {
+        &[]
+    } else {
+        contents
+    }
+}
+
+/// Whether the call only downloads, with nothing extracted to review yet
+/// and nothing it extracts itself. One that builds from a tree extracted
+/// earlier (`--noextract`) is not such a call: it must find that tree.
+fn only_downloads(step: &UpstreamStep<'_>, sources: &[aur::Source], upstream: &Upstream) -> bool {
+    !sources.is_empty() && !upstream.found && !step.uses_sources && upstream.gaps.is_empty()
+}
+
 /// How the upstream review stands with permits, printed and recorded: the
 /// report (when there was text to review) with its final decision.
 fn settle_upstream(
@@ -389,7 +468,7 @@ fn settle_upstream(
         report.unwrap_or_else(|| Report::new(format!("{} · upstream sources", step.name)));
     let contents: Vec<Content> = content.into_iter().collect();
     let standing = permit::standing(
-        &contents,
+        permittable(decision, &contents),
         &report,
         decision,
         settings,
@@ -425,6 +504,7 @@ fn review_recipe(
     settings: &Settings,
     context: &[String],
     recipe: &str,
+    terminal: &mut Asker,
 ) -> Result<Verdict, ExitCode> {
     let name = target
         .config
@@ -436,7 +516,7 @@ fn review_recipe(
         target,
         settings,
         &OpenCode::UserPath,
-        Some(&mut TtyConfirm),
+        Some(terminal),
         context,
         Gate::Aur,
         Some(&|report| recipe_contents(target, &report.snapshot, recipe)),
@@ -444,6 +524,7 @@ fn review_recipe(
     if !verdict.allows_running() {
         errln!("Guardian blocked makepkg because the review of the recipe did not allow it.");
         verdict.standing.say();
+        terminal.say_if_missing(name, Ran::Nothing);
         notify_block(name, verdict.decision, "the recipe", Ran::Nothing);
         return Err(verdict.decision.exit_code());
     }
@@ -756,6 +837,8 @@ struct UpstreamStep<'a> {
     recipe: &'a str,
     /// The recipe as reviewed, in one SHA-256 (see `recipe_digest`).
     recipe_digest: &'a str,
+    /// The recipe's other files as reviewed (see `recipe_files`).
+    recipe_files: &'a [(String, String)],
     /// The recipe's files whose commands run during the build or install.
     functions: &'a Functions,
     /// The call extracts the sources itself, so they are extracted here
@@ -767,8 +850,9 @@ struct UpstreamStep<'a> {
     state: &'a State,
 }
 
-/// The most install scripts read beside a PKGBUILD.
-const MAX_INSTALL_SCRIPTS: usize = 8;
+/// The most install scripts read beside a PKGBUILD; a recipe has one for
+/// each of its packages at most.
+const MAX_INSTALL_SCRIPTS: usize = 64;
 
 /// The recipe's own code as the build and the install run it: the PKGBUILD
 /// and its install scripts, with the variables the PKGBUILD writes out
@@ -780,6 +864,9 @@ struct Functions {
     /// All of them as one text with the variables put in: what names a
     /// file of the sources.
     written: String,
+    /// Install scripts that were not read: past the most that are, too
+    /// large, or not plain files.
+    unread: usize,
 }
 
 fn recipe_functions(build_dir: &Path, recipe: &str) -> Functions {
@@ -788,20 +875,26 @@ fn recipe_functions(build_dir: &Path, recipe: &str) -> Functions {
         .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
         .unwrap_or_default();
     scripts.sort();
+    let mut unread = 0;
     for path in scripts {
+        if path
+            .extension()
+            .is_none_or(|extension| extension != "install")
+        {
+            continue;
+        }
         let plain = fs::symlink_metadata(&path)
             .is_ok_and(|found| found.is_file() && found.len() <= scan::MAX_TEXT_FILE_SIZE);
         if files.len() <= MAX_INSTALL_SCRIPTS
             && plain
-            && path
-                .extension()
-                .is_some_and(|extension| extension == "install")
             && let Ok(text) = fs::read_to_string(&path)
         {
             let name = path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned());
             files.push((name.unwrap_or_default(), text));
+        } else {
+            unread += 1;
         }
     }
     let variables = recipe::written_variables(recipe);
@@ -814,6 +907,7 @@ fn recipe_functions(build_dir: &Path, recipe: &str) -> Functions {
         files,
         variables,
         written,
+        unread,
     }
 }
 
@@ -1498,19 +1592,60 @@ function, through eval or a command that assigns). Guardian fetches and reviews 
 recipe lists in a sandbox without network; the build loads the recipe again and may arrive at \
 others. Weigh whether the recipe's top-level code can tell the two apart or act on it.";
 
+/// `recipe` without what its `pkgver=` and `pkgrel=` lines are set to,
+/// where those are plain values: a `pkgver()` function has makepkg rewrite
+/// them between two calls of one install, and nothing else of the recipe.
+fn without_version(recipe: &str) -> String {
+    let plain = |value: &str| {
+        value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._+~:-'\"".contains(c))
+    };
+    let mut text = String::with_capacity(recipe.len());
+    for line in recipe.lines() {
+        let kept = ["pkgver=", "pkgrel="].into_iter().find(|name| {
+            line.strip_prefix(name)
+                .is_some_and(|value| plain(value.trim_end()))
+        });
+        text.push_str(kept.unwrap_or(line));
+        text.push('\n');
+    }
+    text
+}
+
+/// What a yes to a recipe whose sources are not followed is remembered by:
+/// the PKGBUILD (see `without_version`) and every other file of the
+/// recipe, which it can read its sources from (`. ./sources.inc`), but for
+/// the `downloads` makepkg puts beside them.
+fn sources_asked(step: &UpstreamStep<'_>, downloads: &[String]) -> String {
+    let recipe = without_version(step.recipe);
+    let mut parts = vec![recipe.as_str()];
+    for (path, state) in step.recipe_files {
+        let top = path.split('/').next().unwrap_or_default();
+        let downloaded = downloads
+            .iter()
+            .any(|name| name == top || top.strip_suffix(".part") == Some(name));
+        if !downloaded {
+            parts.extend([path.as_str(), state.as_str()]);
+        }
+    }
+    confirmation("sources", &parts)
+}
+
 /// Asks about a recipe whose sources Guardian cannot follow, unless the
 /// user said yes to this very recipe before. False when the build must not
 /// go on.
 fn confirm_not_followed(
     step: &UpstreamStep<'_>,
     reasons: &[String],
+    downloads: &[String],
     confirm: &mut dyn Confirm,
 ) -> bool {
     outln!("Source listing: the recipe sets what it fetches where Guardian cannot follow:");
     for reason in reasons {
         outln!("  ! {reason}");
     }
-    let asked = confirmation("sources", &[step.recipe]);
+    let asked = sources_asked(step, downloads);
     if step.state.is_confirmed(&asked) {
         outln!("  You confirmed this recipe as it is before.");
         return true;
@@ -1576,6 +1711,10 @@ impl Prebuilt {
         }
         parts.push("from");
         parts.extend(self.hosts.iter().map(String::as_str));
+        // A recipe that comes to run one of them asks for more than one
+        // that installs them.
+        parts.push("run");
+        parts.extend(self.run.iter().map(String::as_str));
         Some(confirmation("prebuilt", &parts))
     }
 }
@@ -1605,7 +1744,7 @@ fn prebuilt(step: &UpstreamStep<'_>, upstream: &Upstream, sources: &[aur::Source
     let builds = aur::defines_function(step.recipe, "build");
     let named = |path: &str| {
         let name = path.rsplit('/').next().unwrap_or(path);
-        path.contains("!/") || (name.len() >= 5 && functions.written.contains(name))
+        upstream.is_unpacked(path) || (name.len() >= 5 && functions.written.contains(name))
     };
     let mut programs: BTreeMap<String, String> = upstream
         .programs
@@ -1933,7 +2072,8 @@ fn list_sources(step: &UpstreamStep<'_>, confirm: &mut dyn Confirm) -> Result<Li
             ));
         }
         Followed::No(reasons) => {
-            if !confirm_not_followed(step, &reasons, confirm) {
+            let downloads = download_names(&aur::parse_srcinfo(&srcinfo));
+            if !confirm_not_followed(step, &reasons, &downloads, confirm) {
                 return Err(not_confirmed());
             }
             Some(NOT_FOLLOWED_FACT)
@@ -1988,6 +2128,21 @@ fn collect_sources(
     Ok(upstream)
 }
 
+/// Reviews the upstream sources (see `review_upstream`), and says so when
+/// a question it had went unasked for want of a terminal.
+fn upstream_step(
+    step: &UpstreamStep<'_>,
+    settings: &Settings,
+    facts: Vec<String>,
+    terminal: &mut Asker,
+) -> Result<UpstreamOutcome, ExitCode> {
+    let outcome = review_upstream(step, settings, facts, terminal);
+    if outcome.is_err() {
+        terminal.say_if_missing(step.name, Ran::RecipeToFetch);
+    }
+    outcome
+}
+
 /// Returns why makepkg must not start, as an exit code.
 fn review_upstream(
     step: &UpstreamStep<'_>,
@@ -2030,9 +2185,7 @@ fn review_upstream(
     let budget = upstream_budget(settings);
     let upstream = collect_sources(step, &listed, &dirs, budget, &mut context)?;
     let downloads = download_names(sources);
-    if !sources.is_empty() && !upstream.found && !step.extract && upstream.gaps.is_empty() {
-        // A call that only downloads: there is nothing extracted to review
-        // yet, and it extracts nothing either.
+    if only_downloads(step, sources, &upstream) {
         // To stderr: such a call's output may be what the caller wants
         // (`makepkg -g >>PKGBUILD`).
         errln!("Upstream: no extracted sources yet; they are reviewed when they are extracted.");
@@ -2047,6 +2200,13 @@ fn review_upstream(
             ),
             "the extracted sources could not be found for review",
             2,
+        ));
+    }
+    let mut upstream = upstream;
+    if step.functions.unread > 0 {
+        upstream.gaps.push(format!(
+            "{} install script(s) beside the PKGBUILD could not be read for what they run",
+            step.functions.unread
         ));
     }
     context.extend(dependency_facts(&upstream));
@@ -2066,6 +2226,8 @@ fn review_upstream(
     let content = upstream_content(step, &upstream, sources);
     let standing = settle_upstream(step, settings, content, report, decision);
     match decision {
+        // The user's own no: no permit overrules it, and none is offered.
+        Decision::Blocked(Blocked::NotConfirmed) => Err(not_confirmed()),
         Decision::Blocked(_) if standing.permitted().is_some() => {
             errln!(
                 "Guardian: your permit {} overrules the review of the upstream sources.",
@@ -2079,11 +2241,6 @@ fn review_upstream(
             // What a later build's binaries are held against.
             step.state.record_binaries(&all_binaries(&upstream));
             Ok(UpstreamOutcome { dirs, downloads })
-        }
-        Decision::Blocked(Blocked::NotConfirmed) => {
-            let exit = not_confirmed();
-            standing.say();
-            Err(exit)
         }
         Decision::Blocked(_) => {
             errln!(
@@ -2528,13 +2685,14 @@ mod tests {
     use std::process::Command;
 
     use super::{
-        Blocked, Configured, Confirm, Decision, Followed, Functions, Prebuilt, State, Upstream,
-        UpstreamReview, UpstreamStep, all_binaries, aur, binary_changes, confirm_not_followed,
-        confirm_prebuilt, download_names, fetch_recipe, followed, foreign_checkout,
-        hold_against_extraction, is_jailable, is_plain_mirror, listing_recipe, listing_report,
-        mirrored_arguments, misnamed_source, parse, prebuilt, public_keyring, recipe_functions,
-        record_extraction, source_context, state, tools, unpack, unreviewable_sources,
-        upstream_facts, upstream_runs, upstream_summary, with_mounts,
+        Asker, Blocked, Configured, Confirm, Decision, Followed, Functions, Prebuilt, State,
+        Upstream, UpstreamReview, UpstreamStep, all_binaries, aur, binary_changes,
+        confirm_not_followed, confirm_prebuilt, download_names, fetch_recipe, followed,
+        foreign_checkout, hold_against_extraction, is_jailable, is_plain_mirror, listing_recipe,
+        listing_report, mirrored_arguments, misnamed_source, only_downloads, parse, permittable,
+        prebuilt, public_keyring, recipe_functions, record_extraction, source_context, state,
+        tools, unpack, unreviewable_sources, upstream_facts, upstream_runs, upstream_summary,
+        with_mounts,
     };
     use crate::test_support::TempDir;
 
@@ -2691,6 +2849,8 @@ mod tests {
         configured: Configured,
         state: State,
         mirrored: Vec<OsString>,
+        /// The recipe's other files, as `recipe_files` gives them.
+        files: Vec<(String, String)>,
     }
 
     impl Fixture {
@@ -2703,6 +2863,7 @@ mod tests {
                 recipe: recipe.to_string(),
                 configured: Configured::default(),
                 mirrored: args(&["-C"]),
+                files: Vec::new(),
                 dir,
             }
         }
@@ -2717,6 +2878,7 @@ mod tests {
                 base: None,
                 recipe: &self.recipe,
                 recipe_digest: RECIPE_DIGEST,
+                recipe_files: &self.files,
                 functions: &self.functions,
                 extract: false,
                 uses_sources: true,
@@ -2978,18 +3140,125 @@ mod tests {
 
         let fixture = Fixture::new("gate-not-followed", hidden);
         let mut no = answer(false);
-        assert!(!confirm_not_followed(&fixture.step(), &reasons, &mut no));
+        assert!(!confirm_not_followed(
+            &fixture.step(),
+            &reasons,
+            &[],
+            &mut no
+        ));
         let mut yes = answer(true);
-        assert!(confirm_not_followed(&fixture.step(), &reasons, &mut yes));
+        assert!(confirm_not_followed(
+            &fixture.step(),
+            &reasons,
+            &[],
+            &mut yes
+        ));
         // The same recipe is not asked about again; a changed one is.
-        assert!(confirm_not_followed(&fixture.step(), &reasons, &mut no));
+        assert!(confirm_not_followed(
+            &fixture.step(),
+            &reasons,
+            &[],
+            &mut no
+        ));
         assert_eq!((no.asked, yes.asked), (1, 1));
         let other = Fixture {
             recipe: format!("{hidden}# changed\n"),
             ..fixture
         };
-        assert!(!confirm_not_followed(&other.step(), &reasons, &mut no));
+        assert!(!confirm_not_followed(&other.step(), &reasons, &[], &mut no));
         assert_eq!(no.asked, 2);
+    }
+
+    #[test]
+    fn a_yes_to_sources_not_followed_covers_every_file_the_recipe_reads() {
+        let recipe =
+            "pkgname=demo-git\npkgver=r1.abc\npkgrel=1\n. ./sources.inc\npkgver() { echo r2; }\n";
+        let reasons = ["line 4: `.` runs or reads in code".to_string()];
+        let state = |hash: &str| format!("{hash} 0");
+        let fixture = Fixture {
+            files: vec![("sources.inc".into(), state("aa"))],
+            ..Fixture::new("gate-sources-asked", recipe)
+        };
+        let mut yes = answer(true);
+        let mut no = answer(false);
+        assert!(confirm_not_followed(
+            &fixture.step(),
+            &reasons,
+            &[],
+            &mut yes
+        ));
+        assert!(confirm_not_followed(
+            &fixture.step(),
+            &reasons,
+            &[],
+            &mut no
+        ));
+        assert_eq!((yes.asked, no.asked), (1, 0));
+
+        // makepkg rewrote the version between two calls of one install,
+        // and downloaded a source beside the recipe: the same question.
+        let downloaded = Fixture {
+            recipe: recipe.replace("pkgver=r1.abc", "pkgver=r2.def"),
+            files: vec![
+                ("demo.tar.gz".into(), state("cc")),
+                ("demo.tar.gz.part".into(), state("dd")),
+                ("sources.inc".into(), state("aa")),
+            ],
+            ..fixture
+        };
+        let downloads = ["demo.tar.gz".to_string()];
+        assert!(confirm_not_followed(
+            &downloaded.step(),
+            &reasons,
+            &downloads,
+            &mut no
+        ));
+        assert_eq!(no.asked, 0);
+
+        // The file the sources come from changed: asked again. So is a
+        // version that is no plain value, and any other line.
+        let changed = Fixture {
+            files: vec![("sources.inc".into(), state("bb"))],
+            ..downloaded
+        };
+        assert!(!confirm_not_followed(
+            &changed.step(),
+            &reasons,
+            &[],
+            &mut no
+        ));
+        for other in [
+            recipe.replace("pkgver=r1.abc", "pkgver=$(curl x)"),
+            recipe.replace("pkgver=r1.abc", "pkgver=1; source=(evil)"),
+            recipe.replace("pkgrel=1", " pkgrel=2"),
+            recipe.replace("pkgname=demo-git", "pkgname=other-git"),
+        ] {
+            let other = Fixture {
+                recipe: other,
+                files: vec![("sources.inc".into(), state("aa"))],
+                ..Fixture::new("gate-sources-asked-other", recipe)
+            };
+            let other = Fixture {
+                state: State::open(Some(&changed.dir.path().join("state")), "demo"),
+                ..other
+            };
+            assert!(
+                !confirm_not_followed(&other.step(), &reasons, &[], &mut no),
+                "{}",
+                other.recipe
+            );
+        }
+    }
+
+    #[test]
+    fn a_question_with_no_terminal_to_ask_on_is_noted() {
+        let mut terminal = Asker {
+            path: "/nonexistent/guardian-test/tty",
+            missing: false,
+        };
+        assert!(!terminal.confirm("Go on?"));
+        assert!(terminal.missing);
+        assert!(!Asker::new().missing);
     }
 
     #[test]
@@ -3118,8 +3387,13 @@ mod tests {
             .unwrap();
         assert!(made.success());
         fs::remove_dir_all(&tree).unwrap();
-        // An archive nothing in the recipe names stays packed.
+        // An archive nothing in the recipe names stays packed. A Java
+        // archive is code all the same: the recipe builds nothing, so it
+        // is one of the programs the package is made of.
         fs::write(src.join("vendored.jar"), b"PK\x03\x04\x14\0\0\0").unwrap();
+        // A directory that only looks like an unpacked archive is not one.
+        fs::create_dir_all(src.join("other.tar!")).unwrap();
+        fs::write(src.join("other.tar!/notes.txt"), "notes\n").unwrap();
 
         // Left packed, the review is incomplete: the recipe opens it.
         let packed = fixture.upstream();
@@ -3160,8 +3434,11 @@ mod tests {
         );
         assert_eq!(
             found.programs.keys().collect::<Vec<_>>(),
-            ["src/data.tar.gz!/opt/demo/demo"]
+            ["src/data.tar.gz!/opt/demo/demo", "src/vendored.jar"]
         );
+        assert!(upstream.is_unpacked("src/data.tar.gz!/opt/demo/demo"));
+        assert!(!upstream.is_unpacked("src/other.tar!/notes.txt"));
+        assert!(!upstream.is_unpacked("src/data.tar.gz"));
         let facts = upstream_facts(&UpstreamReview {
             upstream: &upstream,
             sources: &[],
@@ -3170,8 +3447,119 @@ mod tests {
         .join("\n");
         assert!(facts.contains("Guardian unpacked 1 archive(s)"), "{facts}");
         assert!(
-            facts.contains("installs 1 prebuilt program(s) nobody reviewed"),
+            facts.contains("installs 2 prebuilt program(s) nobody reviewed"),
             "{facts}"
+        );
+    }
+
+    #[test]
+    fn a_directory_named_like_an_unpacked_archive_is_no_archive() {
+        let recipe = "pkgname=demo\nbuild() {\n  make\n}\n";
+        let fixture = Fixture::new("gate-bang-directory", recipe);
+        let src = fixture.dir.path().join("src");
+        fs::create_dir_all(src.join("tests.tar!/bin")).unwrap();
+        fs::write(src.join("tests.tar!/bin/sample"), ELF).unwrap();
+        fs::write(src.join("Makefile"), "all:\n\tcc main.c\n").unwrap();
+        let upstream = fixture.upstream();
+        assert!(upstream.programs.contains_key("src/tests.tar!/bin/sample"));
+        // The recipe builds, and neither names nor runs the binary: it is
+        // test data among the sources, not what the package installs.
+        let found = prebuilt(&fixture.step(), &upstream, &sources(&["demo.tar.gz"]));
+        assert!(found.programs.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn code_that_is_no_program_file_is_asked_about_too() {
+        // A package made of a Java archive: no text, and no file bash
+        // would call a program.
+        let recipe = "pkgname=demo-bin\npackage() {\n  install -Dm644 -t \"$pkgdir/usr/share/java\" */*.jar\n}\n";
+        let fixture = Fixture::new("gate-jar-only", recipe);
+        let src = fixture.dir.path().join("src");
+        fs::create_dir_all(src.join("demo")).unwrap();
+        fs::write(src.join("demo/app.jar"), b"PK\x03\x04\x14\0\0\0").unwrap();
+        fs::write(src.join("demo/app.asar"), b"\x04\0\0\0\x10\0\0\0").unwrap();
+        fs::write(src.join("demo/logo.png"), [0x89, b'P', b'N', b'G', 0, 1]).unwrap();
+        let upstream = fixture.upstream();
+        assert!(upstream.files.is_empty() && upstream.gaps.is_empty());
+        let listed = sources(&["https://example.org/demo.tar.gz"]);
+        let found = prebuilt(&fixture.step(), &upstream, &listed);
+        assert_eq!(
+            found.programs.keys().collect::<Vec<_>>(),
+            ["src/demo/app.asar", "src/demo/app.jar"]
+        );
+        let review = UpstreamReview {
+            upstream: &upstream,
+            sources: &listed,
+            prebuilt: &found,
+        };
+        let mut no = answer(false);
+        assert_eq!(
+            unreviewable_sources(&fixture.step(), &review, &mut no),
+            Decision::Blocked(Blocked::NotConfirmed)
+        );
+        assert_eq!(no.asked, 1);
+    }
+
+    #[test]
+    fn a_declined_question_is_no_block_a_permit_overrules() {
+        use super::upstream_content;
+        let fixture = Fixture::new("gate-declined", "pkgname=demo\n");
+        let mut upstream = Upstream::default();
+        let hash = "d".repeat(64);
+        upstream.downloads.insert("demo.tar.gz".into(), hash);
+        let content =
+            upstream_content(&fixture.step(), &upstream, &sources(&["demo.tar.gz"])).unwrap();
+        let contents = [content];
+        let declined = Decision::Blocked(Blocked::NotConfirmed);
+        assert!(permittable(declined, &contents).is_empty());
+        assert_eq!(
+            permittable(Decision::Blocked(Blocked::Findings), &contents).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_build_from_an_extracted_tree_must_find_it() {
+        let fixture = Fixture::new("gate-noextract-empty", "pkgname=demo\n");
+        let listed = sources(&["https://example.org/demo.tar.gz"]);
+        let empty = Upstream::default();
+        // `--verifysource`: downloads and stops.
+        let downloads = UpstreamStep {
+            uses_sources: false,
+            ..fixture.step()
+        };
+        assert!(only_downloads(&downloads, &listed, &empty));
+        // `--noextract` (it extracts nothing, and uses the sources): an
+        // empty `src/` is not something to review later.
+        let builds = UpstreamStep {
+            extract: false,
+            uses_sources: true,
+            ..fixture.step()
+        };
+        assert!(!only_downloads(&builds, &listed, &empty));
+    }
+
+    #[test]
+    fn install_scripts_that_are_not_read_are_counted() {
+        let fixture = Fixture::new("gate-install-scripts", "pkgname=demo\n");
+        let build = fixture.dir.path();
+        for index in 0..70 {
+            fs::write(
+                build.join(format!("p{index:02}.install")),
+                "post_install() { :; }\n",
+            )
+            .unwrap();
+        }
+        std::os::unix::fs::symlink("p00.install", build.join("linked.install")).unwrap();
+        fs::write(build.join("notes.txt"), "notes\n").unwrap();
+        let functions = recipe_functions(build, "pkgname=demo\n");
+        // The PKGBUILD and the most scripts that are read; the rest, and
+        // the link, are counted.
+        assert_eq!(functions.files.len(), 1 + 64);
+        assert_eq!(functions.unread, 6 + 1);
+        assert_eq!(
+            recipe_functions(fixture.dir.path().join("state").as_path(), "").unread,
+            0
         );
     }
 
