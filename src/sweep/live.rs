@@ -776,6 +776,131 @@ fn told(process: &Process, exe: &str) -> Option<String> {
     })
 }
 
+/// The module a Python process was told to run (`python3 -m http.server`),
+/// and where Python finds it.
+#[derive(Debug, PartialEq, Eq)]
+struct Module {
+    name: String,
+    /// The file Python runs for it, relative to the root, where that is
+    /// certain.
+    file: Option<String>,
+    /// That file is in the directory the process was started in, and the
+    /// interpreter's own library has a module of the same name.
+    shadows: bool,
+}
+
+/// The name after `-m` on a Python command line (also `-um`, `-Im`), if it
+/// comes before any script.
+fn module_argument(arguments: &[String]) -> Option<&str> {
+    let mut arguments = arguments.iter().skip(1).map(String::as_str);
+    while let Some(argument) = arguments.next() {
+        if !argument.starts_with('-') || argument == "-" || argument == "-c" {
+            return None;
+        }
+        if !argument.starts_with("--") && argument.ends_with('m') {
+            return arguments.next();
+        }
+    }
+    None
+}
+
+/// The directory of the standard library of the Python at `exe`
+/// (`usr/lib/python3.14` for `usr/bin/python3.14`, or for `usr/bin/python3`
+/// where that is a link to it).
+fn python_library(scope: &Scope<'_>, exe: &str) -> Option<String> {
+    let versioned = |name: &str| {
+        name.strip_prefix("python3.")
+            .filter(|minor| !minor.is_empty() && minor.chars().all(|c| c.is_ascii_digit()))
+            .map(|_| format!("usr/lib/{name}"))
+    };
+    let name = exe.strip_prefix("usr/bin/")?;
+    versioned(name).or_else(|| {
+        let target = fs::read_link(scope.root.join(exe)).ok()?;
+        versioned(target.to_str()?)
+    })
+}
+
+/// The module `process`, a Python at `exe`, was told to run, with the file
+/// it is: looked for as Python does, first in the directory the process
+/// was started in, then in the interpreter's own library and the packages
+/// installed beside it. Where that cannot be told for certain (a search
+/// path of the process's own, a virtual environment, a package in the
+/// started-in directory that holds only part of the name), no file is
+/// named.
+fn module_of(scope: &Scope<'_>, process: &Process, exe: &str) -> Option<Module> {
+    let name = exe.rsplit('/').next().unwrap_or(exe);
+    if !["python", "pypy"]
+        .iter()
+        .any(|python| name.starts_with(python))
+    {
+        return None;
+    }
+    let module = module_argument(&process.arguments)?;
+    let plain_name = !module.is_empty()
+        && module.split('.').all(|part| {
+            !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+    let unresolved = || Module {
+        name: module.to_string(),
+        file: None,
+        shadows: false,
+    };
+    if !plain_name {
+        return Some(unresolved());
+    }
+    let relative = module.replace('.', "/");
+    let there = |path: &str| collect::is_file_there(scope, path, None);
+    let found_in = |directory: &str| {
+        [
+            format!("{directory}/{relative}/__main__.py"),
+            format!("{directory}/{relative}.py"),
+        ]
+        .into_iter()
+        .filter_map(|path| normalize(&path))
+        .find(|path| there(path))
+    };
+    let own_search_path = process.environment.as_deref().is_some_and(|environment| {
+        environment.split(|byte| *byte == 0).any(|entry| {
+            entry.starts_with(b"PYTHONPATH=")
+                || entry.starts_with(b"PYTHONHOME=")
+                || entry.starts_with(b"VIRTUAL_ENV=")
+        })
+    });
+    let library = python_library(scope, exe).filter(|_| !own_search_path);
+    let packaged = library.as_deref().and_then(|library| {
+        found_in(library).or_else(|| found_in(&format!("{library}/site-packages")))
+    });
+    let Some(cwd) = process.cwd.as_deref() else {
+        return Some(unresolved());
+    };
+    if let Some(local) = found_in(cwd) {
+        return Some(Module {
+            name: module.to_string(),
+            file: Some(local),
+            shadows: packaged.is_some(),
+        });
+    }
+    // Anything else of the module's first name where the process was
+    // started may take its place in ways not followed here.
+    let top = module.split('.').next().unwrap_or(module);
+    let in_the_way = [format!("{cwd}/{top}"), format!("{cwd}/{top}.py")]
+        .iter()
+        .any(|path| fs::symlink_metadata(scope.root.join(path)).is_ok());
+    Some(Module {
+        name: module.to_string(),
+        file: packaged.filter(|_| !in_the_way),
+        shadows: false,
+    })
+}
+
+/// A mark of the directory a process was started in, as part of an item's
+/// name: what `python3 -m name` runs depends on it.
+fn started_in(process: &Process) -> Option<String> {
+    let cwd = process.cwd.as_deref()?;
+    let digest = crate::sha256::Sha256::digest(cwd.as_bytes()).to_string();
+    Some(format!("cwd-{}", &digest[..12]))
+}
+
 /// The checks on one process: its program, what it preloads, and whether
 /// it reads the keyboard or uses a camera.
 fn program_checks(scope: &Scope<'_>, process: &Process, found: &mut Found) {
@@ -3018,6 +3143,136 @@ mod tests {
         // What cron runs for a user is in cron's group, and is not cron.
         assert!(vouched("/usr/bin/crond", "/system.slice/cronie.service"));
         assert!(!vouched("/usr/bin/nginx", "/system.slice/cronie.service"));
+    }
+
+    #[test]
+    fn a_listening_module_is_named_by_the_file_python_runs_for_it() {
+        let server = "usr/lib/python3.14/http/server.py";
+        let (dir, index) = system(
+            "live-module",
+            &[("usr/bin/python3.14", "python"), (server, "stdlib")],
+        );
+        let root = dir.path();
+        symlink("python3.14", root.join("usr/bin/python3")).unwrap();
+        fs::create_dir_all(root.join("home/u/work")).unwrap();
+        // A module of the same name where the process was started.
+        write(root, "tmp/x/http/server.py", "not the stdlib's");
+        let any = "00000000";
+        let none = "00000000:0000";
+        let mut sockets = Vec::new();
+        for (pid, cwd, arguments, inode, port) in [
+            (
+                "30",
+                "/home/u/work",
+                "python3 -m http.server 8000",
+                "800",
+                "1F40",
+            ),
+            ("31", "/tmp/x", "python3 -m http.server 8000", "801", "1F41"),
+            (
+                "32",
+                "/home/u/work",
+                "python3 -um other 8002",
+                "802",
+                "1F42",
+            ),
+            ("33", "/home/u", "python3 -m other 8003", "803", "1F43"),
+        ] {
+            let socket = format!("socket:[{inode}]");
+            process(
+                root,
+                pid,
+                "/usr/bin/python3.14",
+                &[("0", "/dev/null"), ("3", &socket)],
+                "",
+            );
+            detail(root, pid, "cmdline", &arguments.replace(' ', "\0"));
+            symlink(cwd, root.join("proc").join(pid).join("cwd")).unwrap();
+            sockets.push((format!("{any}:{port}"), inode));
+        }
+        let rows: Vec<(&str, &str, &str, &str)> = sockets
+            .iter()
+            .map(|(local, inode)| (local.as_str(), none, "0A", *inode))
+            .collect();
+        table(root, "tcp", &rows);
+        let live = look(root, &index, Origin::System);
+        let found = listed(&live);
+        let listener = RuleId::NetworkListener;
+        // The interpreter's own module is the item, by its file: what is
+        // allowed is that file's content on that port.
+        assert!(
+            found.contains(&("usr/lib/python3.14/http/server.py:tcp-8000", vec![listener])),
+            "{found:?}"
+        );
+        let own = live
+            .items
+            .iter()
+            .find(|item| item.path.starts_with(server))
+            .unwrap();
+        assert_eq!(own.sha256, Some(Sha256::digest(b"stdlib")));
+        // The same command line where a module of that name lies beside
+        // it is another item, and says what it takes the place of.
+        assert!(
+            found.contains(&("tmp/x/http/server.py:tcp-8001", vec![listener])),
+            "{found:?}"
+        );
+        assert!(
+            found.contains(&(
+                "tmp/x/http/server.py",
+                vec![RuleId::PathHijack, RuleId::RunningFromTemp]
+            )),
+            "{found:?}"
+        );
+        // A module that cannot be found is named with where the process
+        // was started: the same name elsewhere is another item.
+        let unresolved: Vec<&str> = found
+            .iter()
+            .map(|(path, _)| *path)
+            .filter(|path| path.contains(":other:cwd-"))
+            .collect();
+        assert_eq!(unresolved.len(), 2, "{found:?}");
+        assert_ne!(unresolved[0], unresolved[1]);
+        assert!(unresolved[0].starts_with("usr/bin/python3.14:tcp-8002:other:cwd-"));
+    }
+
+    #[test]
+    fn a_module_is_named_only_where_the_file_python_runs_is_certain() {
+        let server = "usr/lib/python3.14/http/server.py";
+        let (dir, index) = system(
+            "live-module-certain",
+            &[("usr/bin/python3.14", "python"), (server, "stdlib")],
+        );
+        let root = dir.path();
+        symlink("python3.14", root.join("usr/bin/python3")).unwrap();
+        fs::create_dir_all(root.join("home/u/work")).unwrap();
+        let scope = Scope {
+            root,
+            home: None,
+            index: &index,
+            origin: Origin::System,
+        };
+        let module = |cwd: &str, environment: &str| {
+            let python = running(
+                "/usr/bin/python3",
+                &["python3", "-m", "http.server"],
+                Some(cwd),
+                environment,
+            );
+            super::module_of(&scope, &python, "usr/bin/python3")
+                .unwrap()
+                .file
+        };
+        assert_eq!(module("home/u/work", "").as_deref(), Some(server));
+        assert_eq!(module("home/u/work", "PYTHONPATH=/tmp/x;"), None);
+        write(root, "home/u/work/http/other.py", "part of the name");
+        assert_eq!(module("home/u/work", ""), None);
+        let script = running(
+            "/usr/bin/python3",
+            &["python3", "x.py", "-m", "y"],
+            None,
+            "",
+        );
+        assert_eq!(super::module_of(&scope, &script, "usr/bin/python3"), None);
     }
 
     #[test]

@@ -21,8 +21,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
 use super::{
-    Found, Process, Running, is_interpreter, is_named, is_updated, packaged, plain,
-    replaced_in_own_namespace, subject, told, trusted_program,
+    Found, Process, Running, is_interpreter, is_named, is_temporary, is_updated, module_of,
+    packaged, plain, replaced_in_own_namespace, started_in, subject, told, trusted_program,
 };
 use crate::autorun::Category;
 use crate::rules::RuleId;
@@ -470,14 +470,34 @@ fn listener(
         }
         return;
     }
-    let (path, _) = subject(scope, process, exe);
+    let (mut path, _) = subject(scope, process, exe);
     // What an allowed item is allowed for: this script, or this code
     // handed to the interpreter, on this port.
     let mut name = format!("{path}:{port_name}");
-    if path == exe
-        && let Some(told) = told(process, exe)
-    {
-        name = format!("{name}:{told}");
+    if path == exe {
+        match module_of(scope, process, exe) {
+            // The module's own file is the item: its content is what the
+            // allow is bound to, so a module of the same name somewhere
+            // else is another item.
+            Some(module) if module.file.is_some() => {
+                path = module.file.clone().unwrap_or(path);
+                name = format!("{path}:{port_name}");
+                local_module(scope, process, &module, &path, found);
+            }
+            // Which file runs under that name depends on where the
+            // process was started: that is part of the name.
+            Some(module) => {
+                name = format!("{name}:{}", plain(&module.name));
+                if let Some(mark) = started_in(process) {
+                    name = format!("{name}:{mark}");
+                }
+            }
+            None => {
+                if let Some(told) = told(process, exe) {
+                    name = format!("{name}:{told}");
+                }
+            }
+        }
     }
     // An interpreter's listener is always flagged: with no script on disk
     // (`python -c …`), or with a packaged "script" it was handed, it
@@ -485,6 +505,45 @@ fn listener(
     // whose item is the packaged file of that name.
     let alert = (is_interpreter(exe) || borrowed).then_some(RuleId::NetworkListener);
     found.add_as(scope, Category::Listener, &name, &path, note, alert);
+}
+
+/// What is odd about where the module of a listening interpreter comes
+/// from: a file in a temporary or cache directory, or one in the directory
+/// the process was started in that takes the name of a module of the
+/// interpreter's own (`http/server.py` beside where `python3 -m
+/// http.server` was typed).
+fn local_module(
+    scope: &Scope<'_>,
+    process: &Process,
+    module: &super::Module,
+    file: &str,
+    found: &mut Found,
+) {
+    let pid = &process.pid;
+    let started = process.started();
+    if module.shadows {
+        found.add(
+            scope,
+            Category::Process,
+            file,
+            format!(
+                "process {pid} ({started}) runs this file as the module {}: the directory it was started in comes before the interpreter's own module of that name",
+                plain(&module.name)
+            ),
+            Some(RuleId::PathHijack),
+        );
+    }
+    if is_temporary(scope, file) {
+        found.add(
+            scope,
+            Category::Process,
+            file,
+            format!(
+                "process {pid} ({started}) runs this module from a temporary or cache directory"
+            ),
+            Some(RuleId::RunningFromTemp),
+        );
+    }
 }
 
 /// Whether a packaged program that listens is one expected to: a desktop

@@ -443,9 +443,22 @@ clean system shows nothing here:
 - a program that listens on the network (TCP, not loopback), by every
   process that shares the socket. The item is named by the program and the
   port, and for an interpreter with no script on disk by what it was told
-  to run too (`/usr/bin/python3:tcp-8000:http.server`), so allowing one
+  to run too, so allowing one
   does not allow another script or port; a port the kernel picked reads
-  `listens`. A packaged program a packaged service runs, or a desktop
+  `listens`. For `python3 -m module` the item is the file Python runs for
+  that module (`/usr/lib/python3.14/http/server.py:tcp-8000`), looked for
+  as Python does, first where the process was started and then in the
+  interpreter's own library, so the allow is bound to that file's content:
+  a module of the same name beside where the command was typed is another
+  item, a high finding where it takes the place of the interpreter's own,
+  and one more when it runs from a temporary or cache directory. Where
+  the file cannot be told for certain, the name carries the module and a
+  mark of the directory the process was started in
+  (`/usr/bin/python3:tcp-8000:other:cwd-…`). Only a service the process is
+  itself in vouches for it: a packaged unit's own control group for the
+  system's services, and for your own services a packaged user unit that
+  names the program; an app or terminal scope of your session vouches for
+  nothing. A packaged program a packaged service runs, or a desktop
   program known to listen (a browser, Syncthing, KDE Connect, Docker), is
   listed with the trusted items. Any other packaged program that listens
   is shown and flagged low, so a new listener shows in `--diff` and in the
