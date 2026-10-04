@@ -776,6 +776,131 @@ fn told(process: &Process, exe: &str) -> Option<String> {
     })
 }
 
+/// The module a Python process was told to run (`python3 -m http.server`),
+/// and where Python finds it.
+#[derive(Debug, PartialEq, Eq)]
+struct Module {
+    name: String,
+    /// The file Python runs for it, relative to the root, where that is
+    /// certain.
+    file: Option<String>,
+    /// That file is in the directory the process was started in, and the
+    /// interpreter's own library has a module of the same name.
+    shadows: bool,
+}
+
+/// The name after `-m` on a Python command line (also `-um`, `-Im`), if it
+/// comes before any script.
+fn module_argument(arguments: &[String]) -> Option<&str> {
+    let mut arguments = arguments.iter().skip(1).map(String::as_str);
+    while let Some(argument) = arguments.next() {
+        if !argument.starts_with('-') || argument == "-" || argument == "-c" {
+            return None;
+        }
+        if !argument.starts_with("--") && argument.ends_with('m') {
+            return arguments.next();
+        }
+    }
+    None
+}
+
+/// The directory of the standard library of the Python at `exe`
+/// (`usr/lib/python3.14` for `usr/bin/python3.14`, or for `usr/bin/python3`
+/// where that is a link to it).
+fn python_library(scope: &Scope<'_>, exe: &str) -> Option<String> {
+    let versioned = |name: &str| {
+        name.strip_prefix("python3.")
+            .filter(|minor| !minor.is_empty() && minor.chars().all(|c| c.is_ascii_digit()))
+            .map(|_| format!("usr/lib/{name}"))
+    };
+    let name = exe.strip_prefix("usr/bin/")?;
+    versioned(name).or_else(|| {
+        let target = fs::read_link(scope.root.join(exe)).ok()?;
+        versioned(target.to_str()?)
+    })
+}
+
+/// The module `process`, a Python at `exe`, was told to run, with the file
+/// it is: looked for as Python does, first in the directory the process
+/// was started in, then in the interpreter's own library and the packages
+/// installed beside it. Where that cannot be told for certain (a search
+/// path of the process's own, a virtual environment, a package in the
+/// started-in directory that holds only part of the name), no file is
+/// named.
+fn module_of(scope: &Scope<'_>, process: &Process, exe: &str) -> Option<Module> {
+    let name = exe.rsplit('/').next().unwrap_or(exe);
+    if !["python", "pypy"]
+        .iter()
+        .any(|python| name.starts_with(python))
+    {
+        return None;
+    }
+    let module = module_argument(&process.arguments)?;
+    let plain_name = !module.is_empty()
+        && module.split('.').all(|part| {
+            !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+    let unresolved = || Module {
+        name: module.to_string(),
+        file: None,
+        shadows: false,
+    };
+    if !plain_name {
+        return Some(unresolved());
+    }
+    let relative = module.replace('.', "/");
+    let there = |path: &str| collect::is_file_there(scope, path, None);
+    let found_in = |directory: &str| {
+        [
+            format!("{directory}/{relative}/__main__.py"),
+            format!("{directory}/{relative}.py"),
+        ]
+        .into_iter()
+        .filter_map(|path| normalize(&path))
+        .find(|path| there(path))
+    };
+    let own_search_path = process.environment.as_deref().is_some_and(|environment| {
+        environment.split(|byte| *byte == 0).any(|entry| {
+            entry.starts_with(b"PYTHONPATH=")
+                || entry.starts_with(b"PYTHONHOME=")
+                || entry.starts_with(b"VIRTUAL_ENV=")
+        })
+    });
+    let library = python_library(scope, exe).filter(|_| !own_search_path);
+    let packaged = library.as_deref().and_then(|library| {
+        found_in(library).or_else(|| found_in(&format!("{library}/site-packages")))
+    });
+    let Some(cwd) = process.cwd.as_deref() else {
+        return Some(unresolved());
+    };
+    if let Some(local) = found_in(cwd) {
+        return Some(Module {
+            name: module.to_string(),
+            file: Some(local),
+            shadows: packaged.is_some(),
+        });
+    }
+    // Anything else of the module's first name where the process was
+    // started may take its place in ways not followed here.
+    let top = module.split('.').next().unwrap_or(module);
+    let in_the_way = [format!("{cwd}/{top}"), format!("{cwd}/{top}.py")]
+        .iter()
+        .any(|path| fs::symlink_metadata(scope.root.join(path)).is_ok());
+    Some(Module {
+        name: module.to_string(),
+        file: packaged.filter(|_| !in_the_way),
+        shadows: false,
+    })
+}
+
+/// A mark of the directory a process was started in, as part of an item's
+/// name: what `python3 -m name` runs depends on it.
+fn started_in(process: &Process) -> Option<String> {
+    let cwd = process.cwd.as_deref()?;
+    let digest = crate::sha256::Sha256::digest(cwd.as_bytes()).to_string();
+    Some(format!("cwd-{}", &digest[..12]))
+}
+
 /// The checks on one process: its program, what it preloads, and whether
 /// it reads the keyboard or uses a camera.
 fn program_checks(scope: &Scope<'_>, process: &Process, found: &mut Found) {
@@ -2913,6 +3038,244 @@ mod tests {
     }
 
     #[test]
+    fn only_the_service_a_process_is_in_vouches_for_it() {
+        use super::net::{Starter, started_by_packaged_unit, starter};
+        let user = "/user.slice/user-1000.slice/user@1000.service";
+        for (cgroup, expected) in [
+            (
+                "/system.slice/sshd.service".to_string(),
+                Some(Starter::System("sshd.service")),
+            ),
+            (
+                "/system.slice/system-getty.slice/getty@tty1.service".into(),
+                Some(Starter::System("getty@tty1.service")),
+            ),
+            // Below a system service the groups are that service's.
+            (
+                "/system.slice/docker.service/workers".into(),
+                Some(Starter::System("docker.service")),
+            ),
+            (
+                format!("{user}/app.slice/mpd.service"),
+                Some(Starter::User("mpd.service")),
+            ),
+            (
+                format!("{user}/session.slice/wayland-wm@hyprland.desktop.service"),
+                Some(Starter::User("wayland-wm@hyprland.desktop.service")),
+            ),
+            // An app or terminal the desktop started, and whatever its
+            // user makes below one.
+            (
+                format!(
+                    "{user}/app.slice/app-graphical.slice/app-Hyprland-xdg\\x2dterminal\\x2dexec-3dbb5f0d.scope"
+                ),
+                None,
+            ),
+            (format!("{user}/app.slice/run-u55.scope/mpd.service"), None),
+            (format!("{user}/app.slice/odd/mpd.service"), None),
+            // The managers' own groups and a login session.
+            (format!("{user}/init.scope"), None),
+            (user.to_string(), None),
+            ("/user.slice/user-1000.slice/session-2.scope".into(), None),
+            ("/init.scope".into(), None),
+            (String::new(), None),
+        ] {
+            assert_eq!(starter(&cgroup), expected, "{cgroup}");
+        }
+
+        let (dir, index) = system(
+            "live-starter",
+            &[
+                ("usr/bin/mpd", "mpd"),
+                ("usr/bin/nginx", "nginx"),
+                ("usr/bin/crond", "crond"),
+                (
+                    "usr/lib/systemd/system/user@.service",
+                    "[Service]\nExecStart=/usr/lib/systemd/systemd --user\n",
+                ),
+                (
+                    "usr/lib/systemd/system/nginx.service",
+                    "[Service]\nExecStart=/usr/bin/nginx\n",
+                ),
+                (
+                    "usr/lib/systemd/system/cronie.service",
+                    "[Service]\nExecStart=/usr/bin/crond -n\n",
+                ),
+                (
+                    "usr/lib/systemd/user/mpd.service",
+                    "[Service]\nExecStart=/usr/bin/mpd --systemd\n",
+                ),
+            ],
+        );
+        let scope = Scope {
+            root: dir.path(),
+            home: None,
+            index: &index,
+            origin: Origin::System,
+        };
+        let vouched = |exe: &str, cgroup: &str| {
+            started_by_packaged_unit(
+                &scope,
+                &super::Process {
+                    exe: exe.to_string(),
+                    cgroup: cgroup.to_string(),
+                    ..Default::default()
+                },
+            )
+        };
+        let app = format!("{user}/app.slice/app-Hyprland-kitty-77.scope");
+        // The user manager's packaged template vouches for nothing that
+        // runs in a session, and a group named like a unit below a scope
+        // is the user's own making.
+        assert!(!vouched("/usr/bin/nginx", &app));
+        assert!(!vouched("/usr/bin/mpd", &format!("{app}/mpd.service")));
+        assert!(!vouched("/usr/bin/nginx", &format!("{user}/init.scope")));
+        assert!(vouched("/usr/bin/nginx", "/system.slice/nginx.service"));
+        assert!(vouched(
+            "/usr/bin/mpd",
+            "/system.slice/nginx.service/workers"
+        ));
+        // A user's unit must name the program, in its own group or below.
+        let mpd = format!("{user}/app.slice/mpd.service");
+        assert!(vouched("/usr/bin/mpd", &mpd));
+        assert!(vouched("/usr/bin/mpd", &format!("{mpd}/sub")));
+        assert!(!vouched("/usr/bin/nginx", &mpd));
+        // What cron runs for a user is in cron's group, and is not cron.
+        assert!(vouched("/usr/bin/crond", "/system.slice/cronie.service"));
+        assert!(!vouched("/usr/bin/nginx", "/system.slice/cronie.service"));
+    }
+
+    #[test]
+    fn a_listening_module_is_named_by_the_file_python_runs_for_it() {
+        let server = "usr/lib/python3.14/http/server.py";
+        let (dir, index) = system(
+            "live-module",
+            &[("usr/bin/python3.14", "python"), (server, "stdlib")],
+        );
+        let root = dir.path();
+        symlink("python3.14", root.join("usr/bin/python3")).unwrap();
+        fs::create_dir_all(root.join("home/u/work")).unwrap();
+        // A module of the same name where the process was started.
+        write(root, "tmp/x/http/server.py", "not the stdlib's");
+        let any = "00000000";
+        let none = "00000000:0000";
+        let mut sockets = Vec::new();
+        for (pid, cwd, arguments, inode, port) in [
+            (
+                "30",
+                "/home/u/work",
+                "python3 -m http.server 8000",
+                "800",
+                "1F40",
+            ),
+            ("31", "/tmp/x", "python3 -m http.server 8000", "801", "1F41"),
+            (
+                "32",
+                "/home/u/work",
+                "python3 -um other 8002",
+                "802",
+                "1F42",
+            ),
+            ("33", "/home/u", "python3 -m other 8003", "803", "1F43"),
+        ] {
+            let socket = format!("socket:[{inode}]");
+            process(
+                root,
+                pid,
+                "/usr/bin/python3.14",
+                &[("0", "/dev/null"), ("3", &socket)],
+                "",
+            );
+            detail(root, pid, "cmdline", &arguments.replace(' ', "\0"));
+            symlink(cwd, root.join("proc").join(pid).join("cwd")).unwrap();
+            sockets.push((format!("{any}:{port}"), inode));
+        }
+        let rows: Vec<(&str, &str, &str, &str)> = sockets
+            .iter()
+            .map(|(local, inode)| (local.as_str(), none, "0A", *inode))
+            .collect();
+        table(root, "tcp", &rows);
+        let live = look(root, &index, Origin::System);
+        let found = listed(&live);
+        let listener = RuleId::NetworkListener;
+        // The interpreter's own module is the item, by its file: what is
+        // allowed is that file's content on that port.
+        assert!(
+            found.contains(&("usr/lib/python3.14/http/server.py:tcp-8000", vec![listener])),
+            "{found:?}"
+        );
+        let own = live
+            .items
+            .iter()
+            .find(|item| item.path.starts_with(server))
+            .unwrap();
+        assert_eq!(own.sha256, Some(Sha256::digest(b"stdlib")));
+        // The same command line where a module of that name lies beside
+        // it is another item, and says what it takes the place of.
+        assert!(
+            found.contains(&("tmp/x/http/server.py:tcp-8001", vec![listener])),
+            "{found:?}"
+        );
+        assert!(
+            found.contains(&(
+                "tmp/x/http/server.py",
+                vec![RuleId::PathHijack, RuleId::RunningFromTemp]
+            )),
+            "{found:?}"
+        );
+        // A module that cannot be found is named with where the process
+        // was started: the same name elsewhere is another item.
+        let unresolved: Vec<&str> = found
+            .iter()
+            .map(|(path, _)| *path)
+            .filter(|path| path.contains(":other:cwd-"))
+            .collect();
+        assert_eq!(unresolved.len(), 2, "{found:?}");
+        assert_ne!(unresolved[0], unresolved[1]);
+        assert!(unresolved[0].starts_with("usr/bin/python3.14:tcp-8002:other:cwd-"));
+    }
+
+    #[test]
+    fn a_module_is_named_only_where_the_file_python_runs_is_certain() {
+        let server = "usr/lib/python3.14/http/server.py";
+        let (dir, index) = system(
+            "live-module-certain",
+            &[("usr/bin/python3.14", "python"), (server, "stdlib")],
+        );
+        let root = dir.path();
+        symlink("python3.14", root.join("usr/bin/python3")).unwrap();
+        fs::create_dir_all(root.join("home/u/work")).unwrap();
+        let scope = Scope {
+            root,
+            home: None,
+            index: &index,
+            origin: Origin::System,
+        };
+        let module = |cwd: &str, environment: &str| {
+            let python = running(
+                "/usr/bin/python3",
+                &["python3", "-m", "http.server"],
+                Some(cwd),
+                environment,
+            );
+            super::module_of(&scope, &python, "usr/bin/python3")
+                .unwrap()
+                .file
+        };
+        assert_eq!(module("home/u/work", "").as_deref(), Some(server));
+        assert_eq!(module("home/u/work", "PYTHONPATH=/tmp/x;"), None);
+        write(root, "home/u/work/http/other.py", "part of the name");
+        assert_eq!(module("home/u/work", ""), None);
+        let script = running(
+            "/usr/bin/python3",
+            &["python3", "x.py", "-m", "y"],
+            None,
+            "",
+        );
+        assert_eq!(super::module_of(&scope, &script, "usr/bin/python3"), None);
+    }
+
+    #[test]
     fn a_listening_socket_no_process_holds_is_a_finding_for_root() {
         let (dir, index) = listening_system();
         let root = dir.path();
@@ -3293,6 +3656,100 @@ mod tests {
     }
 
     #[test]
+    fn a_packaged_program_closed_to_readers_is_still_compared() {
+        use std::os::unix::fs::MetadataExt;
+        let (dir, mut index) = system(
+            "live-closed",
+            &[("usr/bin/shut", "shut"), ("usr/bin/same", "same")],
+        );
+        let root = dir.path();
+        // Root reads everything: there is no closed file to play.
+        if fs::metadata(root).unwrap().uid() == 0 {
+            return;
+        }
+        // One its package installs for root alone, as `cupsd` is.
+        index.add_for_test(
+            "own",
+            &format!(
+                "#mtree\n./usr/bin/private type=file mode=700 sha256digest={}\n",
+                Sha256::digest(b"private")
+            ),
+            &[],
+        );
+        write(root, "usr/bin/private", "private");
+        write(root, "usr/bin/shut", "trojan");
+        let close = |path: &str, mode: u32| {
+            fs::set_permissions(root.join(path), fs::Permissions::from_mode(mode)).unwrap();
+        };
+        for (pid, name) in [("60", "shut"), ("61", "same"), ("62", "private")] {
+            close(&format!("usr/bin/{name}"), 0o700);
+            let exe = format!("/usr/bin/{name}");
+            process(root, pid, &exe, &[("3", "/dev/input/event0")], "");
+        }
+        let live = look(root, &index, Origin::Root);
+        let keys = vec![RuleId::KeyboardReader];
+        // The changed one is not trusted for its path, and neither is one
+        // somebody closed; what the package ships closed is compared too,
+        // and is as installed.
+        assert_eq!(
+            listed(&live),
+            [
+                ("usr/bin/same", keys.clone()),
+                ("usr/bin/shut", keys.clone())
+            ]
+        );
+        for item in &live.items {
+            assert_eq!(item.tier.name(), "modified", "{}", item.path);
+            // Nothing of the content of a file not everyone may read.
+            assert_eq!(item.sha256, None, "{}", item.path);
+            assert_eq!(item.body, Body::Binary(crate::sweep::collect::COMPARED));
+            assert!(
+                item.notes
+                    .contains(&crate::sweep::collect::CLOSED.to_string()),
+                "{:?}",
+                item.notes
+            );
+        }
+        // The path must be the package's own, reached with no link on the
+        // way: anything else a process names stays unseen.
+        let scope = Scope {
+            root,
+            home: None,
+            index: &index,
+            origin: Origin::Root,
+        };
+        symlink("usr/bin", root.join("bin")).unwrap();
+        let item = crate::sweep::collect::packaged_item;
+        assert!(item(&scope, Category::Process, "usr/bin/shut").is_some());
+        assert!(item(&scope, Category::Process, "bin/shut").is_none());
+        write(root, "usr/bin/unowned", "x");
+        close("usr/bin/unowned", 0o700);
+        assert!(item(&scope, Category::Process, "usr/bin/unowned").is_none());
+        fs::remove_file(root.join("usr/bin/unowned")).unwrap();
+
+        // The user's own sweep cannot read a closed file. One its package
+        // ships readable is told as closed; one shipped closed is taken on
+        // its path's word, as before.
+        for name in ["shut", "same", "private"] {
+            close(&format!("usr/bin/{name}"), 0o000);
+        }
+        let live = look(root, &index, Origin::System);
+        assert_eq!(
+            listed(&live),
+            [("usr/bin/same", keys.clone()), ("usr/bin/shut", keys)]
+        );
+        assert!(live.items.iter().all(|item| {
+            item.tier.name() == "modified"
+                && item
+                    .notes
+                    .contains(&crate::sweep::collect::CLOSED.to_string())
+        }));
+        for name in ["shut", "same", "private"] {
+            close(&format!("usr/bin/{name}"), 0o700);
+        }
+    }
+
+    #[test]
     fn what_no_package_owns_where_programs_are_loaded_from_is_listed() {
         let (dir, mut index) = system(
             "live-installed",
@@ -3428,6 +3885,112 @@ mod tests {
             alerts.is_empty() && notes.len() == 1,
             "{alerts:?} {notes:?}"
         );
+        // Such a module explains only the taints it would have set: not a
+        // module loaded by force (2), and a proprietary one (1) only where
+        // the module that is not loaded has such a licence.
+        for taint in ["4098\n", "4097\n"] {
+            write(root, "proc/sys/kernel/tainted", taint);
+            let (alerts, notes) = hidden(root);
+            assert_eq!(alerts, [RuleId::RootkitSign], "{taint}");
+            assert!(notes.is_empty(), "{taint} {notes:?}");
+        }
+        let modules = "usr/lib/modules/6.1-test";
+        write(root, &format!("{modules}/extramodules/nvidia.ko.zst"), "nv");
+        write(
+            root,
+            &format!("{modules}/modules.dep"),
+            "kernel/a.ko.zst:\nextramodules/nvidia.ko.zst:\n",
+        );
+        let (alerts, notes) = hidden(root);
+        assert!(
+            alerts.is_empty() && notes.len() == 1,
+            "{alerts:?} {notes:?}"
+        );
+        // One that is in the index of modules and not there as a file
+        // could not have been loaded: it explains nothing.
+        fs::remove_file(root.join(format!("{modules}/extramodules/nvidia.ko.zst"))).unwrap();
+        assert_eq!(hidden(root).0, [RuleId::RootkitSign]);
+    }
+
+    #[test]
+    fn every_process_number_is_tried_and_what_was_not_is_said() {
+        use super::Status;
+        // A hidden process far above the listed ones is found.
+        let listed: HashSet<u32> = [1, 2, 700].into_iter().collect();
+        let answers = |pid: u32| {
+            (pid == 300_123).then(|| Status {
+                name: "hidden".into(),
+                group: pid,
+                ..Status::default()
+            })
+        };
+        assert_eq!(
+            super::kernel::unlisted_among(&listed, 1..=400_000, &answers),
+            [(300_123, "hidden".to_string())]
+        );
+        // The numbers go up to the kernel's limit, whatever is listed.
+        let dir = TempDir::new("live-numbers");
+        let root = dir.path();
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let scope = |origin| Scope {
+            root,
+            home: None,
+            index: &index,
+            origin,
+        };
+        process(root, "7", "/usr/bin/x", &[], "");
+        assert_eq!(super::kernel::highest_number(&scope(Origin::System), 7), 7);
+        write(root, "proc/sys/kernel/ns_last_pid", "900\n");
+        assert_eq!(
+            super::kernel::highest_number(&scope(Origin::System), 7),
+            900
+        );
+        write(root, "proc/sys/kernel/pid_max", "5000\n");
+        assert_eq!(
+            super::kernel::highest_number(&scope(Origin::System), 7),
+            4999
+        );
+        // Within what is tried nothing is said; past it, a user's sweep
+        // notes it and root's counts it as not checked.
+        let running = super::processes(&root.join("proc"));
+        let search = |origin, most| {
+            let mut found = super::Found::default();
+            super::kernel::hidden_processes(&scope(origin), &running, most, &mut found);
+            (found.notes, found.unchecked)
+        };
+        assert_eq!(search(Origin::Root, 5000), (vec![], vec![]));
+        let (notes, unchecked) = search(Origin::System, 100);
+        assert!(unchecked.is_empty());
+        assert_eq!(
+            notes,
+            [
+                "process numbers go up to 4999: only the newest 100 and those the control groups name were tried in the search for hidden processes"
+            ]
+        );
+        let (notes, unchecked) = search(Origin::Root, 100);
+        assert!(notes.is_empty() && unchecked.len() == 1, "{unchecked:?}");
+    }
+
+    #[test]
+    fn root_says_when_it_cannot_list_the_pinned_ebpf_objects() {
+        let dir = TempDir::new("live-bpf");
+        let root = dir.path();
+        let index = PackageIndex::with_foreign(HashSet::new());
+        // No such filesystem: nothing to say.
+        assert!(look(root, &index, Origin::Root).unchecked.is_empty());
+        fs::create_dir_all(root.join("sys/fs/bpf")).unwrap();
+        fs::set_permissions(root.join("sys/fs/bpf"), fs::Permissions::from_mode(0o000)).unwrap();
+        let closed = fs::read_dir(root.join("sys/fs/bpf")).is_err();
+        let as_root = look(root, &index, Origin::Root);
+        let as_user = look(root, &index, Origin::System);
+        fs::set_permissions(root.join("sys/fs/bpf"), fs::Permissions::from_mode(0o755)).unwrap();
+        // Run as root, nothing is closed to the test.
+        if !closed {
+            return;
+        }
+        assert_eq!(as_root.unchecked.len(), 1, "{:?}", as_root.unchecked);
+        assert!(as_root.unchecked[0].starts_with("/sys/fs/bpf: could not be listed"));
+        assert!(as_user.unchecked.is_empty());
     }
 
     #[test]

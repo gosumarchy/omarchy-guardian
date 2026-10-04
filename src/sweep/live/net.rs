@@ -21,8 +21,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
 use super::{
-    Found, Process, Running, is_interpreter, is_named, is_updated, packaged, plain,
-    replaced_in_own_namespace, subject, told, trusted_program,
+    Found, Process, Running, is_interpreter, is_named, is_temporary, is_updated, module_of,
+    packaged, plain, replaced_in_own_namespace, started_in, subject, told, trusted_program,
 };
 use crate::autorun::Category;
 use crate::rules::RuleId;
@@ -470,14 +470,34 @@ fn listener(
         }
         return;
     }
-    let (path, _) = subject(scope, process, exe);
+    let (mut path, _) = subject(scope, process, exe);
     // What an allowed item is allowed for: this script, or this code
     // handed to the interpreter, on this port.
     let mut name = format!("{path}:{port_name}");
-    if path == exe
-        && let Some(told) = told(process, exe)
-    {
-        name = format!("{name}:{told}");
+    if path == exe {
+        match module_of(scope, process, exe) {
+            // The module's own file is the item: its content is what the
+            // allow is bound to, so a module of the same name somewhere
+            // else is another item.
+            Some(module) if module.file.is_some() => {
+                path = module.file.clone().unwrap_or(path);
+                name = format!("{path}:{port_name}");
+                local_module(scope, process, &module, &path, found);
+            }
+            // Which file runs under that name depends on where the
+            // process was started: that is part of the name.
+            Some(module) => {
+                name = format!("{name}:{}", plain(&module.name));
+                if let Some(mark) = started_in(process) {
+                    name = format!("{name}:{mark}");
+                }
+            }
+            None => {
+                if let Some(told) = told(process, exe) {
+                    name = format!("{name}:{told}");
+                }
+            }
+        }
     }
     // An interpreter's listener is always flagged: with no script on disk
     // (`python -c …`), or with a packaged "script" it was handed, it
@@ -485,6 +505,45 @@ fn listener(
     // whose item is the packaged file of that name.
     let alert = (is_interpreter(exe) || borrowed).then_some(RuleId::NetworkListener);
     found.add_as(scope, Category::Listener, &name, &path, note, alert);
+}
+
+/// What is odd about where the module of a listening interpreter comes
+/// from: a file in a temporary or cache directory, or one in the directory
+/// the process was started in that takes the name of a module of the
+/// interpreter's own (`http/server.py` beside where `python3 -m
+/// http.server` was typed).
+fn local_module(
+    scope: &Scope<'_>,
+    process: &Process,
+    module: &super::Module,
+    file: &str,
+    found: &mut Found,
+) {
+    let pid = &process.pid;
+    let started = process.started();
+    if module.shadows {
+        found.add(
+            scope,
+            Category::Process,
+            file,
+            format!(
+                "process {pid} ({started}) runs this file as the module {}: the directory it was started in comes before the interpreter's own module of that name",
+                plain(&module.name)
+            ),
+            Some(RuleId::PathHijack),
+        );
+    }
+    if is_temporary(scope, file) {
+        found.add(
+            scope,
+            Category::Process,
+            file,
+            format!(
+                "process {pid} ({started}) runs this module from a temporary or cache directory"
+            ),
+            Some(RuleId::RunningFromTemp),
+        );
+    }
 }
 
 /// Whether a packaged program that listens is one expected to: a desktop
@@ -496,29 +555,81 @@ fn explained(scope: &Scope<'_>, process: &Process) -> bool {
         || started_by_packaged_unit(scope, process)
 }
 
-/// Whether `process` runs in the control group of a service a repository
-/// package ships. The system's control groups are root's to make, so being
-/// in one is enough there. A user moves their own processes between the
-/// groups of their session as they like: there the unit must also name the
-/// program.
+/// The service a control group path says a process belongs to.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Starter<'a> {
+    /// A unit of the system manager (`/system.slice/sshd.service`).
+    System(&'a str),
+    /// A unit of a user's own manager
+    /// (`/user.slice/user-1000.slice/user@1000.service/app.slice/mpd.service`).
+    User(&'a str),
+}
+
+/// Units that run what users hand them (a crontab line, an `at` job): the
+/// jobs run in the unit's own control group, as whoever queued them.
+const JOB_RUNNERS: &[&str] = &[
+    "cronie.service",
+    "crond.service",
+    "cron.service",
+    "fcron.service",
+    "atd.service",
+];
+
+/// Whether a control group is a slice, which only groups units.
+fn is_slice(name: &str) -> bool {
+    name.strip_suffix("slice")
+        .is_some_and(|rest| rest.ends_with('.'))
+}
+
+/// Whether `name` is a user's manager as the system manager runs it
+/// (`user@1000.service`).
+fn is_user_manager(name: &str) -> bool {
+    name.strip_prefix("user@")
+        .and_then(|rest| rest.strip_suffix(".service"))
+        .is_some_and(|uid| !uid.is_empty() && uid.chars().all(|digit| digit.is_ascii_digit()))
+}
+
+/// The service that `cgroup` (`/system.slice/sshd.service`) puts a process
+/// in: the first name under the slices, which is the unit the manager made
+/// the group for; what lies below it is the unit's own to arrange. A scope
+/// (a login session, an app or terminal the desktop started, `run-*.scope`)
+/// is no service, and nothing below one is: a user makes groups of any name
+/// under a scope of theirs. Under `user@UID.service` the same holds once
+/// more for that user's own manager; the manager's group itself (its
+/// `init.scope`) starts nothing.
+pub(super) fn starter(cgroup: &str) -> Option<Starter<'_>> {
+    let mut names = cgroup
+        .split('/')
+        .filter(|name| !name.is_empty())
+        .skip_while(|name| is_slice(name));
+    let unit = names.next()?;
+    if !is_user_manager(unit) {
+        return unit.ends_with(".service").then_some(Starter::System(unit));
+    }
+    let unit = names.find(|name| !is_slice(name))?;
+    unit.ends_with(".service").then_some(Starter::User(unit))
+}
+
+/// Whether a service a repository package ships started `process`: it is
+/// in that unit's own control group (see `starter`), and the unit's file is
+/// a package's.
+///
+/// The system's control groups are root's to make, so being in one is
+/// enough there, except in the group of a unit that runs users' jobs. A
+/// user arranges the groups under their own manager as they like (makes one
+/// named after a packaged unit, moves a process into a real one): there the
+/// unit must also name the program. What is left to somebody who is already
+/// the user: starting the very program a packaged user unit names, with
+/// arguments of their own, in a group of that unit's name. The program is
+/// then an intact packaged one that is no interpreter, and it is listed
+/// with what it listens on.
 pub(super) fn started_by_packaged_unit(scope: &Scope<'_>, process: &Process) -> bool {
-    let Some(unit) = process
-        .cgroup
-        .rsplit('/')
-        .find(|part| part.ends_with(".service"))
-    else {
+    let Some(starter) = starter(&process.cgroup) else {
         return false;
     };
-    // The session manager's own group is not a unit of the session.
-    let of_user = process
-        .cgroup
-        .split('/')
-        .take_while(|part| *part != unit)
-        .any(|part| part.starts_with("user@"));
-    let directory = if of_user {
-        "usr/lib/systemd/user"
-    } else {
-        "usr/lib/systemd/system"
+    let (unit, directory, named) = match starter {
+        Starter::System(unit) => (unit, "usr/lib/systemd/system", JOB_RUNNERS.contains(&unit)),
+        Starter::User(unit) => (unit, "usr/lib/systemd/user", true),
     };
     // An instance (`getty@tty1.service`) is its template's.
     let template = unit
@@ -528,7 +639,7 @@ pub(super) fn started_by_packaged_unit(scope: &Scope<'_>, process: &Process) -> 
         .into_iter()
         .flatten()
         .map(|name| format!("{directory}/{name}"))
-        .any(|path| packaged(scope, &path) && (!of_user || unit_runs(scope, &path, process.path())))
+        .any(|path| packaged(scope, &path) && (!named || unit_runs(scope, &path, process.path())))
 }
 
 /// Whether the unit file at `unit` starts the program at `exe`.

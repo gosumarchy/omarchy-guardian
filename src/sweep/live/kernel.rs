@@ -11,6 +11,8 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::ops::RangeInclusive;
+use std::thread;
 
 use super::{
     Found, Listed, Process, Running, Status, is_named, parse_status, plain, subject,
@@ -30,10 +32,21 @@ const MODULE_TAINTS: &[(u32, char, &str)] = &[
     (15, 'K', "a live patch"),
 ];
 
-/// The highest process number up to which every number is tried in the
-/// search for hidden processes: trying one takes about a microsecond, and
-/// a system that has run for weeks has handed out millions.
-const MAX_TRIED: u32 = 250_000;
+/// The most process numbers tried in the search for hidden processes: as
+/// many as a 64-bit kernel hands out at all. Trying one takes about a
+/// microsecond, so all of them take some seconds of work, shared between a
+/// few threads.
+const MAX_TRIED: u32 = 4_194_304;
+
+/// The most threads that try process numbers at once.
+const MAX_SEARCHERS: u32 = 8;
+
+/// Modules whose licence the kernel counts as proprietary, by the start of
+/// their name: loading one sets that taint.
+const PROPRIETARY_MODULES: &[&str] = &[
+    "nvidia", "wl", "zfs", "zcommon", "znvpair", "zunicode", "zavl", "zlua", "zzstd", "icp", "spl",
+    "fglrx", "vmmon", "vmnet",
+];
 
 /// The most control groups whose members are read.
 const MAX_CONTROL_GROUPS: usize = 20_000;
@@ -114,7 +127,7 @@ pub(super) fn taint(scope: &Scope<'_>) -> u64 {
 /// Runs the checks.
 pub(super) fn check(scope: &Scope<'_>, running: &Running, found: &mut Found) {
     hidden_module(scope, found);
-    hidden_processes(scope, running, found);
+    hidden_processes(scope, running, MAX_TRIED, found);
     posing_as_kernel(scope, running, found);
     tracers(scope, running, found);
     pinned_bpf(scope, found);
@@ -131,19 +144,30 @@ fn hidden_module(scope: &Scope<'_>, found: &mut Found) {
         .filter_map(Result::ok)
         .filter_map(|module| fs::read_to_string(module.path().join("taint")).ok())
         .collect();
-    let unexplained: Vec<&str> = MODULE_TAINTS
+    let unexplained: Vec<(char, &str)> = MODULE_TAINTS
         .iter()
         .filter(|(bit, letter, _)| taint & (1 << bit) != 0 && !carried.contains(*letter))
-        .map(|(_, _, what)| *what)
+        .map(|(_, letter, what)| (*letter, *what))
         .collect();
     if unexplained.is_empty() {
         return;
     }
-    let what = unexplained.join(", ");
-    // A module that was unloaded leaves its taint behind. Where one that
-    // sets such a taint is installed and not loaded now, that is the
-    // likely story.
-    if out_of_tree_module_not_loaded(scope) {
+    let what = unexplained
+        .iter()
+        .map(|(_, what)| *what)
+        .collect::<Vec<_>>()
+        .join(", ");
+    // A module that was unloaded leaves its taint behind. Where a module
+    // that would have set this very taint is installed for the running
+    // kernel and not loaded now, that is the likely story. A machine with
+    // any DKMS module has such a module all the time, so it explains only
+    // what it would set: a forced load or a live patch it does not, and a
+    // proprietary taint only one with such a licence does.
+    let would_set = unloaded_taints(scope);
+    if unexplained
+        .iter()
+        .all(|(letter, _)| would_set.contains(*letter))
+    {
         found.notes.push(format!(
             "the kernel says a module tainted it ({what}) and no loaded module accounts for it; a module installed outside the kernel's own tree is not loaded now and may have been"
         ));
@@ -161,29 +185,47 @@ fn hidden_module(scope: &Scope<'_>, found: &mut Found) {
     );
 }
 
-/// Whether a module from outside the kernel's own tree is installed for
-/// the running kernel and not loaded.
-fn out_of_tree_module_not_loaded(scope: &Scope<'_>) -> bool {
+/// The taint letters the modules would have set that are installed for the
+/// running kernel from outside its own tree, are there as files (so they
+/// could have been loaded since it started) and are not loaded now: `O`
+/// for any of them, `E` since such builds are not signed with the kernel's
+/// key, and `P` for one whose licence the kernel counts as proprietary.
+fn unloaded_taints(scope: &Scope<'_>) -> String {
     let Some(release) = super::kernel_release(scope) else {
-        return false;
+        return String::new();
     };
+    let directory = scope.root.join("usr/lib/modules").join(release);
     let loaded: HashSet<String> = fs::read_to_string(scope.root.join("proc/modules"))
         .unwrap_or_default()
         .lines()
         .filter_map(|line| line.split_whitespace().next())
         .map(str::to_string)
         .collect();
-    fs::read_to_string(
-        scope
-            .root
-            .join("usr/lib/modules")
-            .join(release)
-            .join("modules.dep"),
-    )
-    .unwrap_or_default()
-    .lines()
-    .filter_map(|line| line.split(':').next())
-    .any(|file| !file.starts_with("kernel/") && !loaded.contains(&super::module_name(file)))
+    let mut letters = String::new();
+    for file in fs::read_to_string(directory.join("modules.dep"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.split(':').next())
+        .filter(|file| !file.starts_with("kernel/"))
+    {
+        let name = super::module_name(file);
+        if loaded.contains(&name) || !directory.join(file).is_file() {
+            continue;
+        }
+        for letter in ['O', 'E'] {
+            if !letters.contains(letter) {
+                letters.push(letter);
+            }
+        }
+        if PROPRIETARY_MODULES
+            .iter()
+            .any(|known| name.starts_with(known))
+            && !letters.contains('P')
+        {
+            letters.push('P');
+        }
+    }
+    letters
 }
 
 /// The process numbers among `numbers` that are not in `listed` and still
@@ -193,7 +235,7 @@ fn out_of_tree_module_not_loaded(scope: &Scope<'_>) -> bool {
 pub(super) fn unlisted(
     listed: &HashSet<u32>,
     numbers: impl Iterator<Item = u32>,
-    answers: &dyn Fn(u32) -> Option<Status>,
+    answers: &(dyn Fn(u32) -> Option<Status> + Sync),
 ) -> Vec<(u32, String)> {
     numbers
         .filter(|pid| *pid != 0 && !listed.contains(pid))
@@ -249,12 +291,58 @@ pub(super) fn members_of_control_groups(scope: &Scope<'_>) -> Vec<u32> {
     members
 }
 
+/// The highest process number there may be on `scope`'s system: one below
+/// the kernel's limit (numbers start over when it is reached, so a process
+/// may hold any number below it, whatever was handed out last), or without
+/// a limit to read, the last number handed out; and never less than the
+/// highest one listed.
+pub(super) fn highest_number(scope: &Scope<'_>, listed: u32) -> u32 {
+    let read = |name: &str| -> Option<u32> {
+        fs::read_to_string(scope.root.join("proc/sys/kernel").join(name))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    };
+    read("pid_max")
+        .map(|limit| limit.saturating_sub(1))
+        .or_else(|| read("ns_last_pid"))
+        .unwrap_or(0)
+        .max(listed)
+}
+
+/// `unlisted` over every number of `range`, shared between a few threads.
+pub(super) fn unlisted_among(
+    listed: &HashSet<u32>,
+    range: RangeInclusive<u32>,
+    answers: &(dyn Fn(u32) -> Option<Status> + Sync),
+) -> Vec<(u32, String)> {
+    let (first, last) = (*range.start(), *range.end());
+    let searchers = thread::available_parallelism()
+        .map_or(1, |cores| u32::try_from(cores.get()).unwrap_or(1))
+        .min(MAX_SEARCHERS);
+    let share = (last.saturating_sub(first) / searchers).saturating_add(1);
+    thread::scope(|threads| {
+        let searches: Vec<_> = (0..searchers)
+            .map(|searcher| {
+                let from = first.saturating_add(share.saturating_mul(searcher));
+                let to = from.saturating_add(share - 1).min(last);
+                threads.spawn(move || unlisted(listed, from..=to, answers))
+            })
+            .collect();
+        searches
+            .into_iter()
+            .flat_map(|search| search.join().unwrap_or_default())
+            .collect()
+    })
+}
+
 /// Processes that exist (their `status` opens under their number) and are
 /// missing from the list of processes. The numbers tried are those the
-/// control groups name, and, while the system has not handed out more
-/// numbers than can be tried in a moment, every number below the highest
-/// one listed.
-fn hidden_processes(scope: &Scope<'_>, running: &Running, found: &mut Found) {
+/// control groups name and every number a process may have (see
+/// `highest_number`). Where that is more than `most` numbers, the newest
+/// `most` are tried and the sweep says the rest were not.
+pub(super) fn hidden_processes(scope: &Scope<'_>, running: &Running, most: u32, found: &mut Found) {
     let listed: HashSet<u32> = running.listed.iter().map(|listed| listed.pid).collect();
     let Some(highest) = listed.iter().max().copied() else {
         return;
@@ -265,13 +353,24 @@ fn hidden_processes(scope: &Scope<'_>, running: &Running, found: &mut Found) {
             .ok()
             .map(|text| parse_status(&text))
     };
-    let every = if highest <= MAX_TRIED {
-        1..highest
-    } else {
-        0..0
-    };
-    let numbers = members_of_control_groups(scope).into_iter().chain(every);
-    let mut suspects = unlisted(&listed, numbers, &answers);
+    let top = highest_number(scope, highest);
+    let first = top.saturating_sub(most.saturating_sub(1)).max(1);
+    if first > 1 {
+        let sentence = format!(
+            "process numbers go up to {top}: only the newest {most} and those the control groups name were tried in the search for hidden processes"
+        );
+        if scope.origin == Origin::Root {
+            found.unchecked.push(sentence);
+        } else {
+            found.notes.push(sentence);
+        }
+    }
+    let mut suspects = unlisted(
+        &listed,
+        members_of_control_groups(scope).into_iter(),
+        &answers,
+    );
+    suspects.extend(unlisted_among(&listed, first..=top, &answers));
     if suspects.is_empty() {
         return;
     }
@@ -471,10 +570,22 @@ fn is_debugger(scope: &Scope<'_>, tracer: &Process, found: &mut Found) -> bool {
 }
 
 /// eBPF objects pinned under `/sys/fs/bpf`, which stay loaded in the
-/// kernel with no process holding them. Only root can list them.
+/// kernel with no process holding them. Only root can list them: a user's
+/// sweep leaves them to the root checks, and root, which nothing stands
+/// behind, says so when it cannot.
 fn pinned_bpf(scope: &Scope<'_>, found: &mut Found) {
-    let Ok(pins) = fs::read_dir(scope.root.join("sys/fs/bpf")) else {
-        return;
+    let pins = match fs::read_dir(scope.root.join("sys/fs/bpf")) {
+        Ok(pins) => pins,
+        // No such filesystem: nothing is pinned.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            if scope.origin == Origin::Root {
+                found.unchecked.push(format!(
+                    "/sys/fs/bpf: could not be listed ({error}); pinned eBPF objects were not checked"
+                ));
+            }
+            return;
+        }
     };
     let mut names: Vec<String> = pins
         .filter_map(Result::ok)

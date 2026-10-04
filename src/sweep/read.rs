@@ -250,7 +250,12 @@ pub fn public(root: &Path, rel: &str) -> Option<Public> {
 
 /// `look` through a pinned walk: `None` where `seen` shows nothing.
 pub fn look_as(root: &Path, rel: &str, view: View) -> Option<Found> {
-    Some(match seen(root, rel, view)?.what {
+    seen(root, rel, view).map(look_pinned)
+}
+
+/// `look` at what a pinned walk reached.
+pub fn look_pinned(seen: Seen) -> Found {
+    match seen.what {
         Public::Link(target) => Found::Link(target),
         Public::Directory(_) | Public::Other => Found::Other,
         Public::File(file) => match file.metadata() {
@@ -262,7 +267,7 @@ pub fn look_as(root: &Path, rel: &str, view: View) -> Option<Found> {
             }
             Err(error) => Found::Unreadable(error.to_string()),
         },
-    })
+    }
 }
 
 fn read_file(path: &Path, expected: &fs::Metadata) -> io::Result<Found> {

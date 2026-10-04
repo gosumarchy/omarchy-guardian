@@ -4,7 +4,7 @@
 //! resolves to. Each is a plain rule on the file's lines, so it also covers
 //! the files that are never sent to the AI because they hold tokens.
 
-use super::path;
+use super::{path, tools};
 use crate::autorun::Category;
 use crate::rules::RuleId;
 
@@ -44,6 +44,8 @@ const USUAL_REGISTRIES: &[&str] = &[
     "static.crates.io",
     "crates.io",
     "github.com",
+    "anaconda.org",
+    "anaconda.com",
 ];
 
 /// Browser switches that load code, open the browser to other programs or
@@ -84,7 +86,7 @@ const MAX_ALERTS: usize = 20;
 
 /// The host of a URL-like value (`https://user:pw@host:8080/x`), in lower
 /// case; `None` when there is no host to tell.
-fn host(value: &str) -> Option<String> {
+pub(super) fn host(value: &str) -> Option<String> {
     let value = value.trim().trim_matches(['"', '\'', ',']);
     let rest = value.split_once("://").map_or(value, |(_, rest)| rest);
     let authority = rest.split(['/', '?', '#']).next()?;
@@ -92,14 +94,14 @@ fn host(value: &str) -> Option<String> {
     (!host.is_empty() && host.contains('.')).then(|| host.to_ascii_lowercase())
 }
 
-fn is_usual(host: &str) -> bool {
+pub(super) fn is_usual(host: &str) -> bool {
     USUAL_REGISTRIES
         .iter()
         .any(|usual| host == *usual || host.ends_with(&format!(".{usual}")))
 }
 
 /// The key and value of a `key = value`, `key: value` or `key value` line.
-fn key_value(line: &str) -> Option<(&str, &str)> {
+pub(super) fn key_value(line: &str) -> Option<(&str, &str)> {
     // An `=` that is not part of an address comes first: npm scopes a key
     // with a colon (`@scope:registry=`).
     let equals = line
@@ -132,70 +134,6 @@ fn browser_flags(line: &str) -> Option<String> {
         .iter()
         .find(|switch| line.starts_with(*switch))
         .map(|switch| format!("starts the browser with {switch}"))
-}
-
-fn toolchain(name: &str, line: &str) -> Option<String> {
-    // A gem source is a list entry, not a key.
-    if name == ".gemrc" {
-        let odd = line
-            .split_whitespace()
-            .filter(|word| word.contains("://"))
-            .filter_map(host)
-            .find(|host| !is_usual(host))?;
-        return Some(format!("packages are fetched from {odd}"));
-    }
-    let (key, value) = key_value(line)?;
-    let key = key.to_ascii_lowercase();
-    let key = key.trim_start_matches("--");
-    // Where packages are fetched from.
-    let registry = match name {
-        "npmrc" | ".npmrc" | ".yarnrc" | ".yarnrc.yml" | ".bunfig.toml" => {
-            key == "registry" || key.ends_with(":registry") || key == "npmregistryserver"
-        }
-        "pip.conf" | ".pydistutils.cfg" => {
-            matches!(
-                key,
-                "index-url" | "extra-index-url" | "index_url" | "find-links"
-            )
-        }
-        "config.toml" | "config" => key == "registry" || key == "index",
-        "env" => key == "goproxy",
-        _ => false,
-    };
-    if registry {
-        let odd: Vec<String> = value
-            .split([',', '|', ' '])
-            .filter(|entry| !matches!(entry.trim_matches(['"', '\'']), "direct" | "off" | ""))
-            .filter_map(host)
-            .filter(|host| !is_usual(host))
-            .collect();
-        if !odd.is_empty() {
-            return Some(format!("packages are fetched from {}", odd.join(", ")));
-        }
-    }
-    let said = |what: &str| Some(format!("{key}: {what}"));
-    match (name, key) {
-        ("npmrc" | ".npmrc", "script-shell") => {
-            said("install scripts run through a shell of its choosing")
-        }
-        ("pip.conf" | ".pydistutils.cfg", "trusted-host") => {
-            said("a host's certificate is not checked")
-        }
-        ("config.toml" | "config", "replace-with") => said("crates come from another source"),
-        ("env", "goflags") if value.contains("-toolexec") || value.contains("-overlay") => {
-            said("every Go build runs through a program of its choosing")
-        }
-        ("env", "goinsecure" | "gonosumdb" | "gonosumcheck" | "gosumdb")
-            if !matches!(value.trim_matches(['"', '\'']), "sum.golang.org") =>
-        {
-            said("Go modules are fetched without the usual checks")
-        }
-        (_, "strict-ssl" | "ssl_verify" | "cafile" | "ca") if name.contains("rc") => {
-            matches!(value.trim_matches(['"', '\'']), "false" | "0")
-                .then(|| format!("{key}: certificates are not checked"))
-        }
-        _ => None,
-    }
 }
 
 fn hosts(line: &str) -> Option<String> {
@@ -235,17 +173,6 @@ fn flatpak(line: &str) -> Option<String> {
             Some("the app may start programs outside its sandbox (org.freedesktop.Flatpak)".into())
         }
         _ => None,
-    }
-}
-
-fn editor(line: &str) -> Option<String> {
-    let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-    if compact.starts_with("\"security.workspace.trust.enabled\":false") {
-        Some("every folder opened is trusted to run its tasks and extensions".into())
-    } else if compact.starts_with("\"task.allowAutomaticTasks\":\"on\"") {
-        Some("a folder's tasks run as soon as it is opened".into())
-    } else {
-        None
     }
 }
 
@@ -305,6 +232,18 @@ pub fn alerts(
                 .map(|(line, what)| (RuleId::PathHijack, format!("line {line}: {what}"))),
         );
     }
+    // The settings of developer tools and of an editor are read whole: a
+    // key means what its section or table makes of it.
+    let whole = match category {
+        Category::Toolchain => tools::alerts(path, text),
+        Category::Editor if name == "settings.json" => tools::editor(text),
+        _ => Vec::new(),
+    };
+    found.extend(
+        whole
+            .into_iter()
+            .map(|(line, seen)| (RuleId::RiskyConfiguration, format!("line {line}: {seen}"))),
+    );
     let policy = category == Category::Browser && path.contains("/policies");
     for (index, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -317,11 +256,9 @@ pub fn alerts(
                 .iter()
                 .find(|key| line.contains(*key))
                 .map(|key| format!("the policy sets {}", key.trim_matches('"'))),
-            Category::Toolchain => toolchain(name, line),
             Category::Trust if name == "hosts" => hosts(line),
             Category::Desktop if name == "mimeapps.list" => handlers(line, there),
             Category::Desktop if path.contains("/flatpak/overrides/") => flatpak(line),
-            Category::Editor if name == "settings.json" => editor(line),
             Category::BootConfig if name == "crypttab" && line.contains("keyscript=") => {
                 Some("a script is run to unlock a disk (keyscript=)".into())
             }

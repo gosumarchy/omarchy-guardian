@@ -94,8 +94,11 @@ fn write_text(path: &Path, text: &str) -> Result<(), String> {
 }
 
 /// Writes `text` to `path` through a new file and a rename, so a reader
-/// never sees half of it.
+/// never sees half of it. The file has exactly `mode`, whatever the umask
+/// of the process: the root collector runs with one that would close a
+/// list everyone is meant to read.
 pub fn write_text_mode(path: &Path, text: &str, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
     let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
     drop(fs::remove_file(&temporary));
     let result = OpenOptions::new()
@@ -103,7 +106,10 @@ pub fn write_text_mode(path: &Path, text: &str, mode: u32) -> Result<(), String>
         .create_new(true)
         .mode(mode)
         .open(&temporary)
-        .and_then(|mut file| file.write_all(text.as_bytes()))
+        .and_then(|mut file| {
+            file.set_permissions(fs::Permissions::from_mode(mode))?;
+            file.write_all(text.as_bytes())
+        })
         .and_then(|()| fs::rename(&temporary, path));
     if result.is_err() {
         drop(fs::remove_file(&temporary));
@@ -119,8 +125,17 @@ pub fn old_allowed(directory: &Path) -> Remembered {
 
 /// Where allowed items are kept: a list only root writes (through sudo),
 /// so a program running as the user cannot add to it. A home's items are
-/// kept under the user id they were allowed for.
-pub const SYSTEM_ALLOWED: &str = "/var/lib/omarchy-guardian/sweep/allowed.json";
+/// kept under the user id they were allowed for, and every user reads it:
+/// it sits where everyone may, not beside root's results, whose directory
+/// only one group may enter.
+pub const SYSTEM_ALLOWED: &str = "/var/lib/omarchy-guardian/allowed.json";
+
+/// Where Guardian up to 0.7.18 kept that list: in the directory of root's
+/// results. A user outside that directory's group could add to the list
+/// through sudo and never read it back, so nothing they allowed counted.
+/// Root moves it on its next write (`move_legacy_allowed`); until then a
+/// sweep that can still reach it reads it there.
+pub const LEGACY_SYSTEM_ALLOWED: &str = "/var/lib/omarchy-guardian/sweep/allowed.json";
 
 /// The most the system list may hold; one that grew past it would read as
 /// empty.
@@ -210,23 +225,92 @@ pub fn owned_alone(path: &Path, owner: u32, anchor: &Path, max_bytes: u64) -> bo
 /// The system list at `path`, while it and the directories above it up to
 /// `/var/lib` are root's and nobody else may write them; empty otherwise.
 pub fn system_allowed(path: &Path) -> Remembered {
-    if !owned_alone(path, 0, Path::new(ROOT_STATE_ANCHOR), MAX_SYSTEM_LIST_BYTES) {
-        return Remembered::new();
+    roots().list(path)
+}
+
+/// Whose a list of allowed items must be to count, and below which
+/// directory: root's, below `/var/lib`. A test plays root with its own
+/// user and directory.
+#[derive(Clone, Copy)]
+struct Keeper<'a> {
+    owner: u32,
+    anchor: &'a Path,
+}
+
+fn roots() -> Keeper<'static> {
+    Keeper {
+        owner: 0,
+        anchor: Path::new(ROOT_STATE_ANCHOR),
     }
-    read(path)
+}
+
+impl Keeper<'_> {
+    /// The list at `path` while it is the keeper's alone; empty otherwise.
+    fn list(self, path: &Path) -> Remembered {
+        if !owned_alone(path, self.owner, self.anchor, MAX_SYSTEM_LIST_BYTES) {
+            return Remembered::new();
+        }
+        read(path)
+    }
+
+    /// The list at `system`, or where there is none yet, the one an older
+    /// Guardian left at `legacy`.
+    fn current(self, system: &Path, legacy: &Path) -> Remembered {
+        if fs::symlink_metadata(system).is_ok() {
+            self.list(system)
+        } else {
+            self.list(legacy)
+        }
+    }
+
+    /// See `move_legacy_allowed`.
+    fn move_legacy(self, path: &Path, legacy: &Path) -> Result<(), String> {
+        if fs::symlink_metadata(legacy).is_err() {
+            return Ok(());
+        }
+        if fs::symlink_metadata(path).is_err() {
+            let old = self.list(legacy);
+            if !old.is_empty() {
+                save_system_allowed(path, &old)?;
+            }
+        }
+        fs::remove_file(legacy).map_err(|error| format!("{}: {error}", legacy.display()))
+    }
 }
 
 /// What counts as allowed for user `uid`: only what the system list at
-/// `system` holds, which only root writes.
-pub fn all_allowed(system: &Path, uid: u32) -> Remembered {
-    allowed_for(&system_allowed(system), uid)
+/// `system` holds, which only root writes. Where root has not written that
+/// one yet, the list an older Guardian left at `legacy` stands in.
+pub fn all_allowed(system: &Path, legacy: &Path, uid: u32) -> Remembered {
+    allowed_for(&roots().current(system, legacy), uid)
+}
+
+/// `all_allowed` of this system's list.
+pub fn allowed_here(uid: u32) -> Remembered {
+    all_allowed(
+        Path::new(SYSTEM_ALLOWED),
+        Path::new(LEGACY_SYSTEM_ALLOWED),
+        uid,
+    )
+}
+
+/// Moves the list an older Guardian kept at `legacy` to `path`, as root:
+/// taken over as it is where there is no list at `path` yet and the old one
+/// is root's alone, and removed either way, so that one list counts.
+pub fn move_legacy_allowed(path: &Path, legacy: &Path) -> Result<(), String> {
+    roots().move_legacy(path, legacy)
 }
 
 /// Writes the system list, as root: readable by everyone, written only by
-/// root.
+/// root, in a directory everyone may enter.
 pub fn save_system_allowed(path: &Path, allowed: &Remembered) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
     if let Some(directory) = path.parent() {
         fs::create_dir_all(directory)
+            .map_err(|error| format!("{}: {error}", directory.display()))?;
+        // Whatever umask root's shell had: a list its users cannot reach
+        // allows nothing.
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o755))
             .map_err(|error| format!("{}: {error}", directory.display()))?;
     }
     let json = Json::object(
@@ -557,6 +641,7 @@ mod tests {
 
     #[test]
     fn items_count_as_allowed_only_from_roots_list_and_a_home_only_for_its_user() {
+        use std::os::unix::fs::PermissionsExt as _;
         let dir = TempDir::new("sweep-allowed-system");
         let mut own = Remembered::new();
         own.insert("~/.bashrc".into(), "a".into());
@@ -570,9 +655,40 @@ mod tests {
         super::save_system_allowed(&system, &own).unwrap();
         assert!(super::system_allowed(&system).is_empty());
         if std::os::unix::fs::MetadataExt::uid(&fs::metadata(dir.path()).unwrap()) != 0 {
-            assert!(super::all_allowed(&system, 1000).is_empty());
+            assert!(super::all_allowed(&system, &system, 1000).is_empty());
         }
         assert!(super::is_home_label("~/x") && !super::is_home_label("/root/x"));
+
+        // Root's list is one every user can reach: beside the results it
+        // sat in a directory only one group may enter. The old one is read
+        // until root moves it, then the new one alone counts.
+        let keeper = super::Keeper {
+            owner: std::os::unix::fs::MetadataExt::uid(&fs::metadata(dir.path()).unwrap()),
+            anchor: dir.path(),
+        };
+        let state = dir.path().join("guardian");
+        let (list, legacy) = (state.join("allowed.json"), state.join("sweep/allowed.json"));
+        fs::create_dir_all(state.join("sweep")).unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(state.join("sweep"), fs::Permissions::from_mode(0o750)).unwrap();
+        super::save_system_allowed(&legacy, &own).unwrap();
+        assert_eq!(keeper.current(&list, &legacy), own);
+        keeper.move_legacy(&list, &legacy).unwrap();
+        assert!(!legacy.exists());
+        assert_eq!(keeper.list(&list), own);
+        assert_eq!(keeper.current(&list, &legacy), own);
+        let mode =
+            |path: &std::path::Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode(&state), mode(&list)), (0o755, 0o644));
+        // A list written again where the new one stands does not take its
+        // place.
+        let mut other = own.clone();
+        other.insert("/etc/stale".into(), "c".into());
+        super::save_system_allowed(&legacy, &other).unwrap();
+        assert_eq!(keeper.current(&list, &legacy), own);
+        keeper.move_legacy(&list, &legacy).unwrap();
+        assert!(!legacy.exists());
+        assert_eq!(keeper.list(&list), own);
 
         // In root's list a home's label is bound to a user id.
         assert_eq!(super::system_key("~/.bashrc", 1000), "1000:~/.bashrc");

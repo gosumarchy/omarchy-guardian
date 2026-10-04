@@ -85,6 +85,12 @@ fn is_module(name: &str) -> bool {
 /// installed. One that is not becomes an item (a modified package file).
 /// Each path is read once per sweep; past the bound the rest are taken
 /// on their path's word, and the sweep says so.
+///
+/// Only a file whose content was read and compared counts as looked at.
+/// One that could not be read is no item here and is not remembered, so
+/// the look through the directories still comes to it: as root it is not
+/// vouched for; as a user it is taken on its path's word, which is what
+/// the root checks are behind.
 pub(super) fn intact(scope: &Scope<'_>, found: &mut Found, category: Category, path: &str) -> bool {
     if let Some(known) = found.verified.get(path) {
         return *known;
@@ -95,13 +101,28 @@ pub(super) fn intact(scope: &Scope<'_>, found: &mut Found, category: Category, p
         return true;
     }
     found.hashed += size;
-    let item = collect::item(scope, category, path.to_string(), None);
-    let intact = item.tier != Tier::Modified;
-    if !intact {
-        keep(found, item);
+    let mut item = collect::item(scope, category, path.to_string(), None);
+    let mut compared = item.sha256.is_some();
+    // Root sees what a process names as everyone does. A packaged program
+    // only root can read (`cupsd`) is none the less compared: see
+    // `collect::packaged_item` for why that tells nobody anything.
+    if !compared
+        && scope.origin == Origin::Root
+        && let Some(closed) = collect::packaged_item(scope, category, path)
+    {
+        item = closed;
+        compared = true;
     }
-    found.verified.insert(path.to_string(), intact);
-    intact
+    if item.tier == Tier::Modified {
+        keep(found, item);
+        found.verified.insert(path.to_string(), false);
+        return false;
+    }
+    if compared {
+        found.verified.insert(path.to_string(), true);
+        return true;
+    }
+    scope.origin != Origin::Root
 }
 
 /// Keeps `item`, a file that is not what its package installed.
@@ -271,16 +292,25 @@ fn file(
     metadata: &fs::Metadata,
     budget: &mut u64,
 ) -> bool {
-    // Seen by another check already, as it is.
-    if found.items.contains_key(path) || found.verified.contains_key(path) {
+    // Compared by another check already.
+    if found.verified.contains_key(path) {
         return false;
     }
+    // An item another check made says what a process did with the file,
+    // seen as that check may see it: of a packaged file that is not yet
+    // the comparison, unless its content was read for it.
+    let seen = found.items.get(path).map(|item| item.sha256.is_some());
     let Some(owned) = scope.index.owner(path) else {
-        found
-            .items
-            .insert(path.to_string(), item_at(scope, category, path));
+        if seen.is_none() {
+            found
+                .items
+                .insert(path.to_string(), item_at(scope, category, path));
+        }
         return false;
     };
+    if seen == Some(true) {
+        return false;
+    }
     if metadata.file_type().is_symlink() {
         // A link is what its package made it while it leads where the
         // package said.

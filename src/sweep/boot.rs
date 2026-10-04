@@ -174,11 +174,14 @@ fn command_line(scope: &Scope<'_>, boot: &mut Boot) {
 
 /// The kernel images under `/boot`, as paths relative to the root: files
 /// whose name starts with `vmlinuz`, up to three directories down (Limine's
-/// entry tool keeps them in a directory for each machine and kernel).
-/// `Err` when `/boot` cannot be listed.
-fn images(scope: &Scope<'_>) -> Result<Vec<String>, ()> {
+/// entry tool keeps them in a directory for each machine and kernel); and
+/// whether there were more than are compared. `Err` when `/boot` cannot be
+/// listed.
+fn images(scope: &Scope<'_>) -> Result<(Vec<String>, bool), ()> {
     match fs::read_dir(scope.root.join("boot")) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), false));
+        }
         Err(_) => return Err(()),
         Ok(_) => {}
     }
@@ -186,7 +189,7 @@ fn images(scope: &Scope<'_>) -> Result<Vec<String>, ()> {
     if !listing.unreadable.is_empty() {
         return Err(());
     }
-    Ok(listing
+    let mut images: Vec<String> = listing
         .files
         .into_iter()
         .filter(|path| {
@@ -196,13 +199,66 @@ fn images(scope: &Scope<'_>) -> Result<Vec<String>, ()> {
                     .next()
                     .is_some_and(|name| name.starts_with("vmlinuz"))
         })
-        .take(MAX_IMAGES)
-        .collect())
+        .collect();
+    let more = images.len() > MAX_IMAGES;
+    images.truncate(MAX_IMAGES);
+    Ok((images, more))
+}
+
+/// The release a kernel image says it is (`6.12.1-arch1-1`), from the
+/// header every Linux image for x86 starts with: the text its setup code
+/// points at, up to the first blank. `None` for anything else.
+fn image_release(head: &[u8]) -> Option<String> {
+    if head.get(0x202..0x206)? != b"HdrS" {
+        return None;
+    }
+    let pointer = u16::from_le_bytes([*head.get(0x20e)?, *head.get(0x20f)?]);
+    let text = head.get(usize::from(pointer) + 0x200..)?;
+    let end = text
+        .iter()
+        .take(128)
+        .position(|byte| *byte == 0 || *byte == b' ')?;
+    let release = std::str::from_utf8(&text[..end]).ok()?;
+    (!release.is_empty()).then(|| release.to_string())
+}
+
+/// The names the installed kernel packages' images go by in `/boot`
+/// (`vmlinuz-linux` for the package whose `pkgbase` is `linux`): what the
+/// default boot entries start.
+fn default_names(scope: &Scope<'_>) -> Vec<String> {
+    read::matching(scope.root, "usr/lib/modules/*/pkgbase")
+        .files
+        .into_iter()
+        .filter_map(|path| fs::read_to_string(scope.root.join(path)).ok())
+        .map(|base| format!("vmlinuz-{}", base.trim()))
+        .collect()
+}
+
+/// Whether the image at `path`, which is not what any installed kernel
+/// package ships, is one the machine starts by default or runs now: it
+/// goes by an installed kernel package's name, or says it is the release
+/// that is running. Any other is most likely an older kernel kept for a
+/// snapshot's boot entry (Limine with snapper keeps those after every
+/// kernel update), which no installed package can vouch for any more.
+fn is_started(scope: &Scope<'_>, path: &str, defaults: &[String]) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if defaults.iter().any(|default| default == name) {
+        return true;
+    }
+    let running = fs::read_to_string(scope.root.join("proc/sys/kernel/osrelease"))
+        .map(|release| release.trim().to_string())
+        .unwrap_or_default();
+    match collect::look(scope, Category::Boot, path, None) {
+        Found::File { head, .. } => {
+            image_release(&head).is_some_and(|release| !running.is_empty() && release == running)
+        }
+        _ => false,
+    }
 }
 
 fn kernel_images(scope: &Scope<'_>, boot: &mut Boot) {
     let as_root = scope.origin == collect::Origin::Root;
-    let Ok(images) = images(scope) else {
+    let Ok((images, more)) = images(scope) else {
         if as_root {
             boot.unchecked
                 .push("/boot: could not be listed; the kernel images were not compared".into());
@@ -216,6 +272,16 @@ fn kernel_images(scope: &Scope<'_>, boot: &mut Boot) {
     if images.is_empty() {
         return;
     }
+    if more {
+        let sentence =
+            format!("/boot: more than {MAX_IMAGES} kernel images; the rest were not compared");
+        if as_root {
+            boot.unchecked.push(sentence);
+        } else {
+            boot.notes.push(sentence);
+        }
+    }
+    let defaults = default_names(scope);
     // What the kernel packages ship, where it is still what they shipped.
     let shipped: Vec<_> = read::matching(scope.root, "usr/lib/modules/*/vmlinuz")
         .files
@@ -232,11 +298,18 @@ fn kernel_images(scope: &Scope<'_>, boot: &mut Boot) {
         match (&item.body, item.sha256) {
             (Body::Link(_), _) => {}
             (_, Some(digest)) if shipped.contains(&digest) => {}
-            (_, Some(_)) => {
+            (_, Some(_)) if is_started(scope, &item.path, &defaults) => {
                 item.alerts.push((
                     RuleId::BootTampering,
                     "not the kernel image any installed kernel package ships".into(),
                 ));
+                boot.items.push(item);
+            }
+            (_, Some(_)) => {
+                item.notes.push(
+                    "a kernel image no installed kernel package ships: an older kernel kept for a snapshot's boot entry, or one put there"
+                        .into(),
+                );
                 boot.items.push(item);
             }
             (_, None) if as_root => boot
@@ -348,8 +421,20 @@ mod tests {
         write("proc/cmdline", "root=/dev/x quiet init=/bin/sh\n");
         write("boot/limine.conf", "cmdline: root=/dev/x quiet\n");
         write("usr/lib/modules/6.1-arch/vmlinuz", "kernel");
+        write("usr/lib/modules/6.1-arch/pkgbase", "linux\n");
         write("boot/vmlinuz-linux", "kernel");
         write("boot/abc/linux/vmlinuz-linux", "another kernel");
+        // An older kernel kept for a snapshot's entry, and an image under
+        // any name that says it is the kernel now running.
+        write("boot/abc/old/vmlinuz-6.0-old", "an older kernel");
+        let mut running = vec![0_u8; 0x300];
+        running[0x202..0x206].copy_from_slice(b"HdrS");
+        running[0x20e..0x210].copy_from_slice(&0x80_u16.to_le_bytes());
+        running[0x280..0x28f].copy_from_slice(b"6.1-arch (x@y) ");
+        assert_eq!(super::image_release(&running).as_deref(), Some("6.1-arch"));
+        assert_eq!(super::image_release(b"another kernel"), None);
+        fs::write(root.join("boot/abc/old/vmlinuz-snapshot"), &running).unwrap();
+        write("proc/sys/kernel/osrelease", "6.1-arch\n");
         write("boot/initramfs-linux.img", "not compared");
         write(
             "sys/firmware/efi/efivars/SecureBoot-8be4df61",
@@ -374,6 +459,7 @@ mod tests {
         let found: Vec<(&str, RuleId)> = boot
             .items
             .iter()
+            .filter(|item| !item.alerts.is_empty())
             .map(|item| (item.path.as_str(), item.alerts[0].0))
             .collect();
         assert_eq!(
@@ -381,8 +467,22 @@ mod tests {
             [
                 ("proc/cmdline", RuleId::BootTampering),
                 ("boot/abc/linux/vmlinuz-linux", RuleId::BootTampering),
+                ("boot/abc/old/vmlinuz-snapshot", RuleId::BootTampering),
             ]
         );
+        // The older kernel is listed, with a note and no alert.
+        let old = boot
+            .items
+            .iter()
+            .find(|item| item.path == "boot/abc/old/vmlinuz-6.0-old")
+            .unwrap();
+        assert!(old.alerts.is_empty() && old.notes[0].starts_with("a kernel image no installed"));
+        for kept in [
+            "boot/abc/old/vmlinuz-6.0-old",
+            "boot/abc/old/vmlinuz-snapshot",
+        ] {
+            fs::remove_file(root.join(kept)).unwrap();
+        }
         assert!(boot.items[0].alerts[0].1.contains("init=/bin/sh"));
         assert_eq!(boot.notes.len(), 1);
         assert!(boot.notes[0].starts_with("Secure Boot is off"));
@@ -407,5 +507,43 @@ mod tests {
             ["boot/abc/linux/vmlinuz-linux", "boot/vmlinuz-linux"]
         );
         assert_eq!(boot.notes, ["Secure Boot is on"]);
+    }
+
+    #[test]
+    fn more_kernel_images_than_are_compared_is_said() {
+        let dir = TempDir::new("sweep-boot-many");
+        let root = dir.path();
+        let write = |path: &str, text: &str| {
+            fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            fs::write(root.join(path), text).unwrap();
+        };
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let scope = Scope {
+            root,
+            home: None,
+            index: &index,
+            origin: Origin::System,
+        };
+        for number in 0..=super::MAX_IMAGES {
+            write(&format!("boot/many/vmlinuz-{number:02}"), "kernel");
+        }
+        // Said, and for root not checked.
+        let boot = check(&scope);
+        assert!(
+            boot.notes
+                .iter()
+                .any(|note| note.starts_with("/boot: more than 32 kernel images")),
+            "{:?}",
+            boot.notes
+        );
+        assert!(boot.unchecked.is_empty());
+        let as_root = check(&Scope {
+            origin: Origin::Root,
+            ..scope
+        });
+        assert_eq!(
+            as_root.unchecked,
+            ["/boot: more than 32 kernel images; the rest were not compared"]
+        );
     }
 }
