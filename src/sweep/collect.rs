@@ -54,6 +54,21 @@ pub const NOT_LOOKED_AT: &str =
 /// Why root did not look at a path nobody chose.
 const NOT_REACHED: &str = "gone, or behind a link that is not root's alone: not looked at";
 
+/// Where the kernel keeps what is no program on disk: device nodes and its
+/// own files. A command that names one (`--list-file /dev/stdout`) names
+/// where its output goes, and `/dev/stdout` leads to whatever the sweep
+/// itself writes to: nothing there is followed.
+const NOT_FOLLOWED: &[&str] = &["dev/", "proc/", "sys/"];
+
+/// Memory a user fills with files like any directory (`/dev/shm`), and
+/// what lives until the next boot (`/run`, `/run/user/<uid>`): a program
+/// run from there is followed like any other, but only a regular file is
+/// one. The sockets and pipes services keep there are not.
+const FILES_ONLY: &[&str] = &["dev/shm/", "run/"];
+
+/// The variables a locale file sets.
+const LOCALE_VARIABLES: &[&str] = &["LANG", "LANGUAGE"];
+
 /// The format label of a file root hashed but did not hand back.
 pub const WITHHELD: &str = "root-only file (hashed, content withheld)";
 
@@ -218,6 +233,10 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
         if item.tier == Tier::Unknown && omarchy.contains(&format!("/{}", item.path)) {
             item.notes.push("a path Omarchy's installer writes".into());
         }
+        if item.tier == Tier::Unknown && sets_only_the_locale(&item) {
+            item.tier = Tier::Inert;
+            item.notes.push("sets the locale and nothing else".into());
+        }
         collection.items.push(item);
     }
     path::mark(scope, &search, &mut collection.items);
@@ -242,6 +261,31 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
     collection.truncated.extend(boot.unchecked);
     collection.notes.extend(boot.notes);
     collection
+}
+
+/// Whether `item` is the system's or a home's `locale.conf`, which the
+/// profile script of every login shell reads in, and holds nothing but the
+/// locale: `LANG=`, `LANGUAGE=` and `LC_…=` with plain values. No package
+/// owns the file (the installer writes it), and one that only says which
+/// language to speak runs nothing. Any other line, or a value a shell
+/// would expand, leaves it an item to look at.
+fn sets_only_the_locale(item: &Item) -> bool {
+    let named = item.path == "etc/locale.conf" || item.path.ends_with("/.config/locale.conf");
+    let Body::Text(text) = &item.body else {
+        return false;
+    };
+    named
+        && text.lines().map(str::trim).all(|line| {
+            line.is_empty()
+                || line.starts_with('#')
+                || line.split_once('=').is_some_and(|(name, value)| {
+                    (LOCALE_VARIABLES.contains(&name) || name.starts_with("LC_"))
+                        && value.chars().all(|c| {
+                            c.is_ascii_alphanumeric()
+                                || matches!(c, '_' | '-' | '.' | '@' | ':' | '"')
+                        })
+                })
+        })
 }
 
 /// Whether nobody looked for everything `item` runs (see
@@ -824,8 +868,11 @@ fn notes(
     {
         notes.push(format!("shadows /usr/bin/{name}"));
     }
+    // A launcher of the same name; `mimeapps.list` is a list of handlers,
+    // which the home's and the system's both add to.
     if category == Category::Desktop
         && let Some(name) = path.rsplit('/').next()
+        && read::has_extension(name, "desktop")
         && scope
             .root
             .join("usr/share/applications")
@@ -1025,8 +1072,17 @@ fn follow(scope: &Scope<'_>, item: &Item, search: &Search) -> Followed {
             ));
         }
     }
+    let under =
+        |places: &[&str], target: &str| places.iter().any(|place| target.starts_with(place));
     let targets = targets
         .into_iter()
+        .filter(|target| {
+            if under(FILES_ONLY, target) {
+                is_file_there(scope, target, by)
+            } else {
+                !under(NOT_FOLLOWED, target)
+            }
+        })
         .filter_map(|target| match view {
             // The path the pinned walk took, not one resolved again.
             Some(view) => read::seen(scope.root, &target, view).map(|seen| seen.path),
@@ -1481,6 +1537,82 @@ mod tests {
             tier("etc/systemd/system/getty.service"),
             Some(Tier::Unknown)
         );
+    }
+
+    #[test]
+    fn devices_and_kernel_files_are_not_followed_and_a_plain_locale_file_is_quiet() {
+        let dir = TempDir::new("sweep-not-followed");
+        let root = dir.path();
+        // What a command writes to is no program it runs.
+        write(
+            root,
+            "etc/profile.d/tidy.sh",
+            "strip --list-file /dev/stdout \"$1\"\ncat /proc/version /sys/x </run/sock >/dev/null\n/dev/shm/payload\n/run/user/1000/payload\n. /etc/locale.conf\n",
+        );
+        for path in [
+            "dev/stdout",
+            "dev/shm/payload",
+            "proc/version",
+            "sys/x",
+            "run/user/1000/payload",
+        ] {
+            write(root, path, "x\n");
+        }
+        std::os::unix::net::UnixListener::bind(root.join("run/sock")).unwrap();
+        write(
+            root,
+            "etc/locale.conf",
+            "# the locale\nLANG=en_US.UTF-8\nLC_TIME=\"de_DE.UTF-8\"\n",
+        );
+        write(
+            root,
+            "home/u/.config/mimeapps.list",
+            "[Default Applications]\n",
+        );
+        write(
+            root,
+            "usr/share/applications/mimeapps.list",
+            "[Default Applications]\n",
+        );
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let scope = Scope {
+            root,
+            home: Some("home/u"),
+            index: &index,
+            origin: Origin::System,
+        };
+        let collection = collect(&scope);
+        let find = |path: &str| collection.items.iter().find(|item| item.path == path);
+        for path in ["dev/stdout", "proc/version", "sys/x", "run/sock"] {
+            assert!(find(path).is_none(), "{path}");
+        }
+        // A program in memory a user fills, or in a runtime directory, is
+        // a program all the same.
+        for path in ["dev/shm/payload", "run/user/1000/payload"] {
+            assert!(find(path).is_some(), "{path}");
+        }
+        // The locale file is listed, and not as something to look at.
+        let locale = find("etc/locale.conf").unwrap();
+        assert_eq!(locale.tier, Tier::Inert);
+        assert!(locale.is_trusted());
+        // The list of handlers replaces no launcher.
+        let handlers = find("home/u/.config/mimeapps.list").unwrap();
+        assert!(handlers.notes.is_empty(), "{:?}", handlers.notes);
+        // One that does more than name a language is an item like any.
+        for text in [
+            "LANG=en_US.UTF-8\nPATH=/tmp/x:$PATH\n",
+            "LANG=$(curl x)\n",
+            "LANG=C; /tmp/x\n",
+        ] {
+            write(root, "etc/locale.conf", text);
+            let collection = collect(&scope);
+            let locale = collection
+                .items
+                .iter()
+                .find(|item| item.path == "etc/locale.conf")
+                .unwrap();
+            assert_eq!(locale.tier, Tier::Unknown, "{text}");
+        }
     }
 
     #[test]
