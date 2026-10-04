@@ -12,3 +12,18 @@ SuccessExitStatus=1 2
 TimeoutStartSec=1h
 Nice=10
 IOSchedulingClass=idle
+# The sweep reads, and runs the AI reviewer as you, with your network and
+# your home: neither needs to gain a privilege, make a set-id file, switch
+# to another system-call interface or take real-time priority.
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+UMask=0077
+# Not here, on purpose: ProtectSystem=, ReadWritePaths=, ProtectKernelTunables=,
+# ProtectKernelModules= and ProtectControlGroups=. In a user unit they put
+# the sweep into a user namespace of its own, where every file of root's
+# reads as nobody's: the sweep could then no longer tell root's files (the
+# list of allowed items, the root checks' results, the system's own
+# directories) from anyone's, and would trust none of them.
