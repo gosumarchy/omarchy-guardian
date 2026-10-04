@@ -43,6 +43,15 @@ const FIRST_USER_ID: u32 = 1000;
 const MAX_FACTS: usize = 500;
 /// The largest key file read.
 const MAX_KEY_FILE: usize = 1024 * 1024;
+/// The most keys of one account that become an item each: past these the
+/// rest are one item, so an account with thousands of lines cannot crowd
+/// every other account's (and root's own) keys out of the results.
+const MAX_ACCOUNT_KEYS: usize = 200;
+/// What is seen of a key file too large to read, and of keys past
+/// `MAX_ACCOUNT_KEYS`.
+const TOO_LARGE: &str =
+    "a key file larger than 1 MiB: the server reads it, and its keys are not listed here";
+const NOT_LISTED: &str = "more keys than are listed one by one";
 
 /// One line of `/etc/passwd`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -465,11 +474,21 @@ fn key_items(
 ) -> Vec<Item> {
     let mut items = Vec::new();
     let mut all: Vec<String> = Vec::new();
+    // The keys past `MAX_ACCOUNT_KEYS`, and the files too large to read.
+    let mut unlisted: Vec<String> = Vec::new();
+    let mut too_large = 0_usize;
+    let mut listed = 0_usize;
     for path in files {
         let Some(Found::File { head, size, .. }) = look(path) else {
             continue;
         };
+        // Padding a key file past what is read must not hide its keys:
+        // the server reads all of it. Nobody's key file is that size.
         if usize::try_from(size).unwrap_or(usize::MAX) > MAX_KEY_FILE {
+            too_large += 1;
+            if detail == Detail::Keys {
+                items.push(too_large_item(origin, account, path));
+            }
             continue;
         }
         let (found, odd) = keys(&String::from_utf8_lossy(&head));
@@ -478,6 +497,11 @@ fn key_items(
             if detail == Detail::Count {
                 continue;
             }
+            if listed >= MAX_ACCOUNT_KEYS {
+                unlisted.push(key.hex);
+                continue;
+            }
+            listed += 1;
             let options = if key.options.is_empty() {
                 String::new()
             } else {
@@ -511,24 +535,87 @@ fn key_items(
             ));
         }
     }
-    if detail == Detail::Count && !all.is_empty() {
-        all.sort();
-        items.push(fact(
-            origin,
-            format!("{}/.ssh/authorized_keys#keys", account.home),
-            format!(
-                "{} key(s): {}",
-                all.len(),
-                Sha256::digest(all.join("\n").as_bytes())
-            ),
-            format!(
-                "{} key(s) may log in as {}; whose they are is that account's to see",
-                all.len(),
-                account.name
-            ),
-        ));
+    if !unlisted.is_empty() {
+        items.push(unlisted_item(origin, account, unlisted));
+    }
+    if detail == Detail::Count && (!all.is_empty() || too_large > 0) {
+        items.push(counted_item(origin, account, all, too_large > 0));
     }
     items
+}
+
+/// The item for a key file of `account` at `path` that is too large to
+/// read.
+fn too_large_item(origin: Origin, account: &Account, path: &str) -> Item {
+    let mut item = fact(
+        origin,
+        format!("{path}#too-large"),
+        "larger than is read".into(),
+        format!(
+            "a key file of {} that is too large to read: the keys in it are not listed",
+            account.name
+        ),
+    );
+    item.alerts
+        .push((RuleId::RiskyConfiguration, TOO_LARGE.into()));
+    item
+}
+
+/// The one item for the keys of `account` past `MAX_ACCOUNT_KEYS`, with a
+/// hash that moves when they do.
+fn unlisted_item(origin: Origin, account: &Account, mut unlisted: Vec<String>) -> Item {
+    unlisted.sort();
+    let mut item = fact(
+        origin,
+        format!("{}/.ssh/authorized_keys#more", account.home),
+        format!(
+            "{} more key(s): {}",
+            unlisted.len(),
+            Sha256::digest(unlisted.join("\n").as_bytes())
+        ),
+        format!(
+            "{} more key(s) that may log in as {} are not listed one by one",
+            unlisted.len(),
+            account.name
+        ),
+    );
+    item.alerts
+        .push((RuleId::RiskyConfiguration, NOT_LISTED.into()));
+    item
+}
+
+/// The one line told of another account's keys (`all`, by their hashes).
+/// It says so when a file of theirs was too large to count, and no more of
+/// that file than that.
+fn counted_item(origin: Origin, account: &Account, mut all: Vec<String>, too_large: bool) -> Item {
+    all.sort();
+    let (uncounted, beside) = if too_large {
+        (
+            ", and a key file too large to read",
+            "; a key file too large to read is not counted",
+        )
+    } else {
+        ("", "")
+    };
+    let mut item = fact(
+        origin,
+        format!("{}/.ssh/authorized_keys#keys", account.home),
+        format!(
+            "{} key(s): {}{uncounted}",
+            all.len(),
+            Sha256::digest(all.join("\n").as_bytes())
+        ),
+        format!(
+            "{} key(s) may log in as {}; whose they are is that account's to see{beside}",
+            all.len(),
+            account.name
+        ),
+    );
+    if too_large {
+        item.alerts
+            .push((RuleId::RiskyConfiguration, TOO_LARGE.into()));
+    }
+    item
 }
 
 /// What `scope` sees of accounts, groups and its own home's keys.
@@ -752,6 +839,76 @@ mod tests {
         assert_eq!(counted[0].path, "home/u/.ssh/authorized_keys#keys");
         assert!(counted[0].notes[0].starts_with("2 key(s) may log in as u"));
         assert!(!format!("{counted:?}").contains("me@laptop"));
+    }
+
+    #[test]
+    fn a_padded_key_file_and_a_flood_of_keys_are_told_not_dropped() {
+        let account = Account {
+            name: "u".into(),
+            password: "x".into(),
+            uid: 1000,
+            gid: 1000,
+            home: "home/u".into(),
+            shell: "/bin/zsh".into(),
+        };
+        let files = key_files(&[], &account);
+        // Comment lines past what is read, around one key: the server
+        // still reads it.
+        let padded = |path: &str| {
+            (path == "home/u/.ssh/authorized_keys").then(|| Found::File {
+                sha256: Sha256::digest(b"x"),
+                mode: 0o600,
+                size: (super::MAX_KEY_FILE + 1) as u64,
+                head: Vec::new(),
+            })
+        };
+        let items = key_items(Origin::Root, &account, &files, Detail::Keys, &padded);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].path, "home/u/.ssh/authorized_keys#too-large");
+        assert_eq!(items[0].alerts[0].0, RuleId::RiskyConfiguration);
+        // Of another account's: the one counted line, saying it is short.
+        let counted = key_items(Origin::Root, &account, &files, Detail::Count, &padded);
+        assert_eq!(counted.len(), 1);
+        assert_eq!(counted[0].path, "home/u/.ssh/authorized_keys#keys");
+        assert!(counted[0].notes[0].starts_with("0 key(s) may log in as u"));
+        assert!(counted[0].notes[0].ends_with("too large to read is not counted"));
+        assert_eq!(counted[0].alerts.len(), 1);
+
+        // More keys than become items: the rest are one item, with a hash
+        // that moves when they do.
+        let lines = |count: usize| -> String {
+            let mut text = String::new();
+            for index in 0..count {
+                let blob = super::to_base64(format!("key number {index:06}").as_bytes());
+                for part in ["ssh-ed25519 ", blob.as_str(), " key\n"] {
+                    text.push_str(part);
+                }
+            }
+            text
+        };
+        let flood = |count: usize| {
+            let text = lines(count);
+            key_items(Origin::Root, &account, &files, Detail::Keys, &|path| {
+                (path == "home/u/.ssh/authorized_keys").then(|| Found::File {
+                    sha256: Sha256::digest(text.as_bytes()),
+                    mode: 0o600,
+                    size: text.len() as u64,
+                    head: text.clone().into_bytes(),
+                })
+            })
+        };
+        let many = flood(super::MAX_ACCOUNT_KEYS + 50);
+        assert_eq!(many.len(), super::MAX_ACCOUNT_KEYS + 1);
+        let more = &many[super::MAX_ACCOUNT_KEYS];
+        assert_eq!(more.path, "home/u/.ssh/authorized_keys#more");
+        assert!(more.notes[0].starts_with("50 more key(s)"));
+        assert_eq!(more.alerts[0].0, RuleId::RiskyConfiguration);
+        let other = flood(super::MAX_ACCOUNT_KEYS + 51);
+        assert_ne!(other[super::MAX_ACCOUNT_KEYS].sha256, more.sha256);
+        assert_eq!(
+            flood(super::MAX_ACCOUNT_KEYS).len(),
+            super::MAX_ACCOUNT_KEYS
+        );
     }
 
     #[test]

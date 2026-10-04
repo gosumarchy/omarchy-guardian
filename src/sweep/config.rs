@@ -344,11 +344,12 @@ mod tests {
         assert!(found[2].contains("strict-ssl"));
         // A token is never part of what is shown.
         assert!(!found.join(" ").contains("SECRET"));
-        let pip = "[global]\nindex-url = https://user:hunter2hunter2@pypi.evil.example/simple\nextra-index-url = https://pypi.org/simple\ntrusted-host = pypi.evil.example\n";
+        let pip = "[global]\nindex-url = http://user:hunter2hunter2@pypi.evil.example/simple\nextra-index-url = https://pypi.org/simple\ntrusted-host = pypi.evil.example\n";
         let found = seen(Category::Toolchain, "home/u/.config/pip/pip.conf", pip);
         assert_eq!(found.len(), 2, "{found:?}");
         assert!(
-            found[0].ends_with("fetched from pypi.evil.example") && !found[0].contains("hunter2")
+            found[0].starts_with("line 2: packages are fetched from pypi.evil.example")
+                && !found[0].contains("hunter2")
         );
         let cargo = "[build]\nrustc-wrapper = \"/usr/bin/sccache\"\n[source.crates-io]\nreplace-with = \"mirror\"\n[source.mirror]\nregistry = \"sparse+https://crates.evil.example/index/\"\n[registries.ok]\nindex = \"https://github.com/rust-lang/crates.io-index\"\n";
         let found = seen(Category::Toolchain, "home/u/.cargo/config.toml", cargo);

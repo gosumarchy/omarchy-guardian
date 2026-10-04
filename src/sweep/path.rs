@@ -49,6 +49,9 @@ const ALWAYS_WATCHED: &[&str] = &[
     "sh",
     "zsh",
     "fish",
+    // The dispatcher every `omarchy …` command goes through, which is
+    // what Guardian's own wrapper stands in front of.
+    "omarchy",
     "omarchy-guardian",
 ];
 
@@ -1175,11 +1178,12 @@ mod tests {
             fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
             fs::write(root.join(path), text).unwrap();
         };
-        for name in ["sudo", "node", "ls", "mise", "omarchy-menu"] {
+        for name in ["sudo", "node", "ls", "mise", "omarchy-menu", "omarchy"] {
             write(&format!("usr/bin/{name}"), "system");
         }
         write("home/u/.bashrc", "export PATH=\"$HOME/tools/bin:$PATH\"\n");
         write("home/u/tools/bin/sudo", "#!/bin/sh\n");
+        write("home/u/tools/bin/omarchy", "#!/bin/sh\n");
         write("home/u/tools/bin/ls", "#!/bin/sh\n");
         write("home/u/tools/bin/mine", "#!/bin/sh\n");
         // A version manager's: shims that are links to mise, and what it
@@ -1223,6 +1227,7 @@ mod tests {
             paths,
             [
                 "home/u/tools/bin/ls",
+                "home/u/tools/bin/omarchy",
                 "home/u/tools/bin/sudo",
                 "home/u/.local/share/mise/shims/ls",
                 "home/u/.local/share/mise/shims/node",
@@ -1247,6 +1252,8 @@ mod tests {
         // `sudo` is an alert wherever it is, a mise shim or not; `ls` is
         // listed; a shim for `node` is what mise is for.
         assert!(alerted("home/u/tools/bin/sudo"));
+        // The bare dispatcher, not only the `omarchy-*` commands.
+        assert!(alerted("home/u/tools/bin/omarchy"));
         assert!(alerted("home/u/.local/share/mise/shims/sudo"));
         assert!(!alerted("home/u/tools/bin/ls"));
         assert!(!alerted("home/u/.local/share/mise/shims/node"));

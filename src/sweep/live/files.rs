@@ -89,8 +89,8 @@ fn is_module(name: &str) -> bool {
 /// Only a file whose content was read and compared counts as looked at.
 /// One that could not be read is no item here and is not remembered, so
 /// the look through the directories still comes to it: as root it is not
-/// vouched for; as a user it is taken on its path's word, which is what
-/// the root checks are behind.
+/// vouched for (but see `collect::packaged_out_of_sight`); as a user it
+/// is taken on its path's word, which is what the root checks are behind.
 pub(super) fn intact(scope: &Scope<'_>, found: &mut Found, category: Category, path: &str) -> bool {
     if let Some(known) = found.verified.get(path) {
         return *known;
@@ -120,6 +120,16 @@ pub(super) fn intact(scope: &Scope<'_>, found: &mut Found, category: Category, p
     }
     if compared {
         found.verified.insert(path.to_string(), true);
+        return true;
+    }
+    // A process chose this path. Where saying "not vouched for" would
+    // tell its user what a directory closed to them holds, nothing is
+    // said, as for a file that is as installed; it is not remembered as
+    // compared, because it was not.
+    if scope.origin == Origin::Root
+        && category == Category::Process
+        && collect::packaged_out_of_sight(scope, path)
+    {
         return true;
     }
     scope.origin != Origin::Root

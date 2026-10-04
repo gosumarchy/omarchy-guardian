@@ -61,6 +61,44 @@ const LOADING_VARIABLES: &[&str] = &[
     "PAGER",
 ];
 
+/// The variables among them whose value is the program to run: a compiler
+/// by its name, or one of the system's by its path, is how these are set
+/// on any developer's machine.
+const PROGRAM_VARIABLES: &[&str] = &[
+    "RUSTC",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "RUSTDOC",
+    "CC",
+    "CXX",
+    "GIT_SSH",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+    "SUDO_ASKPASS",
+    "EDITOR",
+    "VISUAL",
+    "PAGER",
+];
+
+/// Where the distribution keeps the certificate authorities, in files only
+/// root writes: naming one of them picks no authority of the file's own.
+const SYSTEM_AUTHORITIES: &[&str] = &[
+    "/etc/ssl/",
+    "/etc/ca-certificates/",
+    "/usr/share/ca-certificates/",
+];
+
+/// Where tools keep the Python environments they make, below a home's
+/// cache and data directories: an interpreter there is the ordinary one of
+/// a project, not a download.
+const VIRTUALENVS: &[&str] = &[
+    "/.cache/pypoetry/virtualenvs/",
+    "/.cache/uv/",
+    "/.cache/pre-commit/",
+    "/.local/share/virtualenvs/",
+    "/.venv/",
+];
+
 /// The hosts Go modules, which are named by where they live, mostly come
 /// from: leaving one of them unchecked leaves most modules unchecked.
 const MODULE_HOSTS: &[&str] = &[
@@ -174,6 +212,17 @@ fn is_own_program(value: &str) -> bool {
     (program.contains('/') && !system) || is_temporary(value)
 }
 
+/// Whether setting the variable `name` to `value` changes what runs or is
+/// loaded: any of `LOADING_VARIABLES`, except one that names a program and
+/// names a system one.
+fn sets_what_runs(name: &str, value: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    if PROGRAM_VARIABLES.contains(&name.as_str()) {
+        return is_own_program(value);
+    }
+    LOADING_VARIABLES.contains(&name.as_str()) || name.starts_with("GIT_CONFIG")
+}
+
 fn runs(key: &str, value: &str) -> String {
     graded(
         format!("{key}: the tool runs a program of this file's choosing"),
@@ -189,14 +238,24 @@ fn proxied(key: &str, value: &str) -> String {
     )
 }
 
-fn authorities(key: &str, value: &str) -> String {
+/// What naming the certificate authorities does; nothing when they are the
+/// system's own.
+fn authorities(key: &str, value: &str) -> Option<String> {
     if is_off(value) {
-        return unchecked(key);
+        return Some(unchecked(key));
     }
-    graded(
+    let file = bare(value);
+    if !file.contains("..")
+        && SYSTEM_AUTHORITIES
+            .iter()
+            .any(|system| file.starts_with(system))
+    {
+        return None;
+    }
+    Some(graded(
         format!("{key}: certificates are checked against authorities of this file's choosing"),
         value,
-    )
+    ))
 }
 
 fn unchecked(key: &str) -> String {
@@ -207,12 +266,41 @@ fn unchecked(key: &str) -> String {
 /// Only what is written as an address counts: a token beside it is never
 /// taken for a host.
 fn fetched(value: &str) -> Option<String> {
+    fetched_where(value, &|host, entry| !is_usual(host) || is_cleartext(entry))
+}
+
+/// A Python package index is set to a company's own, or to a project's
+/// (the wheels of `PyTorch`), on many machines, so a host is told only when the
+/// address itself is odd: plain HTTP, a bare address, a name made to read
+/// as another, or a place data is dropped off.
+fn index(value: &str) -> Option<String> {
+    fetched_where(value, &|host, entry| {
+        is_cleartext(entry)
+            || host == IPV6
+            || crate::rules::is_ip_host(host)
+            || host.split('.').any(|label| label.starts_with("xn--"))
+            || !crate::rules::host_concerns(entry).is_empty()
+    })
+}
+
+/// What stands for the host of an address in brackets (`https://[::1]/`).
+const IPV6: &str = "an IPv6 address";
+
+/// `fetched`, for the addresses `is_odd` (asked with the host and the
+/// address) picks.
+fn fetched_where(value: &str, is_odd: &dyn Fn(&str, &str) -> bool) -> Option<String> {
     let odd: Vec<String> = value
         .split([',', '|', ' ', '{', '}', '='])
-        .map(|entry| entry.trim_matches(['"', '\'', '[', ']']))
+        .map(|entry| entry.trim_matches(['"', '\'']))
         .filter(|entry| entry.contains("://"))
-        .filter_map(|entry| host(entry).map(|host| (host, entry)))
-        .filter(|(host, entry)| !is_usual(host) || is_cleartext(entry))
+        .filter_map(|entry| {
+            if entry.contains("://[") {
+                return Some((IPV6.to_string(), entry));
+            }
+            let entry = entry.trim_matches(['[', ']']);
+            host(entry).map(|host| (host, entry))
+        })
+        .filter(|(host, entry)| is_odd(host, entry))
         .map(|(host, _)| host)
         .collect();
     (!odd.is_empty()).then(|| {
@@ -256,7 +344,7 @@ fn npm(key: &str, value: &str) -> Option<String> {
             value,
         )),
         "proxy" | "https-proxy" | "http-proxy" => Some(proxied(key, value)),
-        "cafile" | "ca" if !matches!(bare(value), "null" | "") => Some(authorities(key, value)),
+        "cafile" | "ca" if !matches!(bare(value), "null" | "") => authorities(key, value),
         "strict-ssl" if is_off(value) => Some(unchecked(key)),
         "globalconfig" | "userconfig" => Some(graded(
             format!("{key}: its settings are read from another file"),
@@ -283,7 +371,7 @@ fn yarn(key: &str, value: &str) -> Option<String> {
         )),
         "plugins" => Some(format!("{key}: plugins are loaded into every yarn command")),
         "httpproxy" | "httpsproxy" | "proxy" => Some(proxied(key, value)),
-        "cafilepath" | "cafile" | "httpscafilepath" => Some(authorities(key, value)),
+        "cafilepath" | "cafile" | "httpscafilepath" => authorities(key, value),
         "enablestrictssl" | "strictssl" if is_off(value) => Some(unchecked(key)),
         "unsafehttpwhitelist" => Some(format!(
             "{key}: packages may be fetched over unencrypted HTTP"
@@ -299,7 +387,7 @@ fn bun(section: &str, key: &str, value: &str) -> Option<String> {
             value,
         )),
         ("install", "registry") | ("install.scopes", _) => fetched(value),
-        ("install", "cafile" | "ca") => Some(authorities(key, value)),
+        ("install", "cafile" | "ca") => authorities(key, value),
         // `shell` picks one of bun's two shells and `bun` is a switch;
         // anything else there is not theirs.
         ("run", "shell" | "bun") if !matches!(bare(value), "system" | "bun" | "true" | "false") => {
@@ -311,7 +399,7 @@ fn bun(section: &str, key: &str, value: &str) -> Option<String> {
 
 fn pip(key: &str, value: &str) -> Option<String> {
     match key {
-        "index-url" | "extra-index-url" | "index_url" => fetched(value),
+        "index-url" | "extra-index-url" | "index_url" => index(value),
         "find-links" | "find_links" => fetched(value).or_else(|| {
             (!value.contains("://")).then(|| {
                 graded(
@@ -322,7 +410,7 @@ fn pip(key: &str, value: &str) -> Option<String> {
         }),
         "trusted-host" => Some(format!("{key}: a host's certificate is not checked")),
         "proxy" => Some(proxied(key, value)),
-        "cert" | "client-cert" => Some(authorities(key, value)),
+        "cert" | "client-cert" => authorities(key, value),
         _ => None,
     }
 }
@@ -388,11 +476,12 @@ fn cargo(section: &str, key: &str, value: &str) -> Option<String> {
         (_, "registry" | "index") => fetched(value),
         (_, "replace-with") => said("crates come from another source"),
         ("http", "proxy") => Some(proxied(key, value)),
-        ("http", "cainfo") => Some(authorities(key, value)),
+        ("http", "cainfo") => authorities(key, value),
         ("http", "check-revoke") if is_off(value) => Some(unchecked(key)),
-        ("env", _) if LOADING_VARIABLES.contains(&key.to_ascii_uppercase().as_str()) => Some(
-            graded(format!("{key}: set for every program cargo runs"), value),
-        ),
+        ("env", _) if sets_what_runs(key, table_value(value)) => Some(graded(
+            format!("{key}: set for every program cargo runs"),
+            value,
+        )),
         (
             _,
             "rustc" | "rustdoc" | "rustc-wrapper" | "rustc-workspace-wrapper" | "linker" | "runner",
@@ -400,8 +489,9 @@ fn cargo(section: &str, key: &str, value: &str) -> Option<String> {
             format!("{key}: every build runs a program outside the system's directories"),
             value,
         )),
+        // The linker named in the flags is judged like the `linker` key.
         (_, "rustflags")
-            if value.contains("linker=")
+            if flag_values(value, "linker=").any(is_own_program)
                 || value.contains("-Zpre-link")
                 || value.contains("--sysroot") =>
         {
@@ -437,12 +527,36 @@ fn cargo(section: &str, key: &str, value: &str) -> Option<String> {
     }
 }
 
+/// The value of a cargo `[env]` entry, which may be a table
+/// (`{ value = "x", force = true }`).
+fn table_value(value: &str) -> &str {
+    if !value.trim_start().starts_with('{') {
+        return value;
+    }
+    value
+        .split_once("value")
+        .and_then(|(_, rest)| rest.split(['"', '\'']).nth(1))
+        .unwrap_or(value)
+}
+
+/// What follows each `flag` in a list of compiler flags, up to the end of
+/// its word.
+fn flag_values<'a>(value: &'a str, flag: &'a str) -> impl Iterator<Item = &'a str> {
+    value.match_indices(flag).map(move |(at, _)| {
+        let rest = &value[at + flag.len()..];
+        let end = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ']'))
+            .unwrap_or(rest.len());
+        &rest[..end]
+    })
+}
+
 fn gem(line: &str, key: &str, value: &str) -> Option<String> {
     let key = key.trim_matches(':');
     match key {
         "http_proxy" | "https_proxy" | "http-proxy" => Some(proxied(key, value)),
         "ssl_verify_mode" if bare(value) == "0" => Some(unchecked(key)),
-        "ssl_ca_cert" | "ssl_client_cert" => Some(authorities(key, value)),
+        "ssl_ca_cert" | "ssl_client_cert" => authorities(key, value),
         // A source is a list entry (`- https://…`) or an option of the
         // `gem:` line; either way it is an address on the line.
         _ if line.contains("--http-proxy") || line.contains(" -p ") => Some(proxied("gem", line)),
@@ -459,7 +573,7 @@ fn conda(line: &str, key: &str, value: &str) -> Option<String> {
                 "true" | "yes" | "on" | "1" | "truststore"
             ) =>
         {
-            Some(authorities(key, value))
+            authorities(key, value)
         }
         "proxy_servers" => Some(format!("{key}: its traffic goes through a proxy")),
         "http" | "https" if value.contains("://") => Some(proxied(key, value)),
@@ -472,7 +586,7 @@ fn wget(key: &str, value: &str) -> Option<String> {
     match key.as_str() {
         "check_certificate" if is_off(value) => Some(unchecked(&key)),
         "http_proxy" | "https_proxy" | "ftp_proxy" => Some(proxied(&key, value)),
-        "ca_certificate" | "ca_directory" | "certificate" => Some(authorities(&key, value)),
+        "ca_certificate" | "ca_directory" | "certificate" => authorities(&key, value),
         "use_askpass" => Some(runs(&key, value)),
         "output_document" | "post_file" | "body_file" | "load_cookies" => Some(graded(
             format!("{key}: every wget reads or writes a file of this file's choosing"),
@@ -505,9 +619,7 @@ fn curl(line: &str) -> Option<String> {
         "proxy" | "preproxy" | "socks4" | "socks4a" | "socks5" | "socks5-hostname" => {
             Some(proxied(key, value))
         }
-        "cacert" | "capath" | "proxy-cacert" | "pinnedpubkey" | "cert" => {
-            Some(authorities(key, value))
-        }
+        "cacert" | "capath" | "proxy-cacert" | "pinnedpubkey" | "cert" => authorities(key, value),
         "resolve" | "connect-to" | "doh-url" | "dns-servers" => {
             Some(format!("{key}: host names lead where this file says"))
         }
@@ -641,6 +753,17 @@ fn names_a_program(key: &str) -> bool {
     key.ends_with("path") || key.ends_with("executable")
 }
 
+/// Whether `key` says where a Python interpreter is and `value` is one in
+/// a virtual environment a tool made (Poetry keeps them below `~/.cache`):
+/// in the home's cache, but not in a directory anyone may write.
+fn is_virtualenv_interpreter(key: &str, value: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    (key.contains("python") || key.contains("interpreter"))
+        && VIRTUALENVS.iter().any(|kept| value.contains(kept))
+        && !value.contains("..")
+        && !is_temporary(&value.replace("/.cache/", "/"))
+}
+
 /// One key of an editor's settings, outside any table.
 fn editor_setting(key: &str, value: &str) -> Option<String> {
     let plain = bare(value);
@@ -673,7 +796,11 @@ fn editor_setting(key: &str, value: &str) -> Option<String> {
         }
         // Any tool the editor is told where to find (`python.pythonPath`,
         // `clangd.path`, `rust-analyzer.server.path`).
-        _ if names_a_program(key) && value.starts_with('"') && is_temporary(value) => {
+        _ if names_a_program(key)
+            && value.starts_with('"')
+            && is_temporary(value)
+            && !is_virtualenv_interpreter(key, value) =>
+        {
             Some(format!("{key}: the editor runs a program{FROM_TEMPORARY}"))
         }
         _ => None,
@@ -698,7 +825,7 @@ pub fn editor(text: &str) -> Vec<(usize, String)> {
         if let Some((name, level)) = &mut table {
             if let Some((key, value)) = pair {
                 seen = if name.contains(".env.") {
-                    loading_variable(key)
+                    loading_variable(key, value)
                 } else {
                     terminal_setting(key, value).or_else(|| inline(name, value))
                 };
@@ -731,10 +858,15 @@ pub fn editor(text: &str) -> Vec<(usize, String)> {
     found
 }
 
-fn loading_variable(name: &str) -> Option<String> {
-    LOADING_VARIABLES
-        .contains(&name)
-        .then(|| format!("the editor's terminal starts every program with {name} set by this file"))
+/// A variable of the editor's terminal that changes what runs or is loaded
+/// there. Which editor or pager the terminal's programs open is a
+/// preference, like any other variable an app reads.
+fn loading_variable(name: &str, value: &str) -> Option<String> {
+    (!matches!(
+        name.to_ascii_uppercase().as_str(),
+        "EDITOR" | "VISUAL" | "PAGER"
+    ) && sets_what_runs(name, value))
+    .then(|| format!("the editor's terminal starts every program with {name} set by this file"))
 }
 
 /// What a terminal table written on one line (`{"LD_PRELOAD": "/x.so"}`)
@@ -745,7 +877,7 @@ fn inline(table: &str, value: &str) -> Option<String> {
         .filter_map(json_pair)
         .find_map(|(key, value)| {
             if table.contains(".env.") {
-                loading_variable(key)
+                loading_variable(key, value)
             } else {
                 terminal_setting(key, value)
             }
@@ -811,6 +943,8 @@ mod tests {
                 "https-proxy=http://10.0.0.1:3128",
                 "proxy=http://proxy.corp.example:8080",
                 "cafile=/home/u/ca.pem",
+                "cafile=/tmp/ca.pem",
+                "cafile=/etc/ssl/../../home/u/ca.pem",
                 "ca=\"-----BEGIN CERTIFICATE-----\"",
                 "strict-ssl=false",
                 "prefix=/tmp/npm",
@@ -825,6 +959,11 @@ mod tests {
                 "//registry.npmjs.org/:_authToken=npm_SECRET.SECRET",
                 "node-options=--max-old-space-size=4096",
                 "prefix=/home/u/.npm-global",
+                "prefix=~/.npm-global",
+                "@corp:registry=https://npm.pkg.github.com",
+                "cafile=/etc/ssl/certs/ca-certificates.crt",
+                "cafile=/etc/ca-certificates/extracted/tls-ca-bundle.pem",
+                "cafile=/usr/share/ca-certificates/trust-source/x.crt",
                 "cache=/home/u/.cache/npm",
                 "save-exact=true",
                 "ca=null",
@@ -912,8 +1051,13 @@ mod tests {
             told(
                 path,
                 &[
-                    "index-url = https://pypi.corp.example/simple",
+                    "index-url = http://pypi.corp.example/simple",
                     "extra-index-url = http://pypi.org/simple",
+                    "index-url = https://10.0.0.9/simple",
+                    "index-url = https://[fd00::9]:8443/simple",
+                    "extra-index-url = https://xn--pyp-qma.org/simple",
+                    "extra-index-url = https://github.com.evil.example/simple",
+                    "index-url = https://webhook.site/simple",
                     "find-links = /tmp/wheels",
                     "find-links = https://wheels.corp.example/",
                     "trusted-host = pypi.corp.example",
@@ -924,6 +1068,12 @@ mod tests {
                 &[
                     "[global]",
                     "index-url = https://pypi.org/simple",
+                    // A project's or a company's own index, over HTTPS.
+                    "extra-index-url = https://download.pytorch.org/whl/cpu",
+                    "index-url = https://files.pythonhosted.org/simple",
+                    "index-url = https://user:hunter2@pypi.corp.example/simple",
+                    "index-url = http://localhost:3141/root/pypi",
+                    "cert = /etc/ssl/certs/ca-certificates.crt",
                     "timeout = 60",
                     "no-index = true",
                     "user-agent = x",
@@ -958,6 +1108,7 @@ mod tests {
                 "GOPATH=/home/u/go",
                 "GOSUMDB=sum.golang.org",
                 "GOPRIVATE=github.com/corp/*,*.corp.example",
+                "GOPRIVATE=github.com/mycorp/*",
                 "GONOSUMDB=git.corp.example",
                 "CC=clang",
                 "GOAUTH=netrc",
@@ -973,6 +1124,10 @@ mod tests {
                 "[http]\ncainfo = \"/home/u/ca.pem\"",
                 "[http]\ncheck-revoke = false",
                 "[env]\nRUSTC_WRAPPER = \"/home/u/w\"",
+                "[env]\nCC = \"/tmp/cc\"",
+                "[env]\nCC = { value = \"bin/cc\", relative = true }",
+                "[env]\nPATH = \"/home/u/bin\"",
+                "[build]\nrustflags = [\"-C\", \"linker=/tmp/ld\"]",
                 "[env]\nLD_PRELOAD = { value = \"/home/u/x.so\", force = true }",
                 "[target.x86_64-unknown-linux-gnu]\nlinker = \"/home/u/ld\"",
                 "[target.x86_64-unknown-linux-gnu]\nrunner = \"/tmp/run\"",
@@ -995,6 +1150,12 @@ mod tests {
                 "[http]\ntimeout = 30\ncheck-revoke = true",
                 "[net]\ngit-fetch-with-cli = true",
                 "[env]\nCARGO_TERM_COLOR = \"always\"",
+                // A system compiler by its name or path, as the direct
+                // keys take it.
+                "[env]\nCC = \"clang\"\nCXX = { value = \"/usr/bin/clang++\", force = true }",
+                "[build]\nrustflags = [\"-C\", \"linker=clang\"]",
+                "[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-Clinker=/usr/bin/clang\", \"-C\", \"link-arg=-fuse-ld=mold\"]",
+                "[build]\nrustc-wrapper = \"sccache\"",
                 "[build]\nrustc-wrapper = \"/usr/bin/sccache\"\njobs = 8",
                 "[target.x86_64-unknown-linux-gnu]\nlinker = \"clang\"\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]",
                 "[registries.ok]\nindex = \"https://github.com/rust-lang/crates.io-index\"",
@@ -1079,6 +1240,7 @@ mod tests {
                 "-x socks5://10.0.0.1:1080",
                 "--proxy=\"http://10.0.0.1:3128\"",
                 "cacert = /home/u/ca.pem",
+                "capath = /tmp/certs",
                 "resolve = pypi.org:443:10.0.0.9",
                 "output = /home/u/.bashrc",
                 "-K /home/u/other",
@@ -1088,6 +1250,9 @@ mod tests {
                 "silent",
                 "-s",
                 "--location",
+                "-L",
+                "--silent",
+                "cacert = /etc/ssl/certs/ca-certificates.crt",
                 "user-agent = \"x\"",
                 "connect-timeout = 10",
                 "# insecure",
@@ -1134,7 +1299,18 @@ mod tests {
         assert!(!found.iter().any(|(_, seen)| seen.contains("hunter2")));
         assert!(found[5].1.ends_with(FROM_TEMPORARY), "{found:?}");
         let quiet = r#"{
-  "terminal.integrated.env.linux": { "FOO": "bar" },
+  "terminal.integrated.env.linux": { "FOO": "bar", "EDITOR": "nvim", "CC": "clang" },
+  "terminal.integrated.env.osx": {
+    "VISUAL": "/home/u/bin/edit",
+    "PAGER": "less",
+    "LANG": "en_US.UTF-8",
+    "TERM": "xterm-256color",
+    "RUSTC_WRAPPER": "/usr/bin/sccache"
+  },
+  "terminal.integrated.defaultProfile.linux": "zsh",
+  "python.defaultInterpreterPath": "/home/u/.cache/pypoetry/virtualenvs/app-x-py3.12/bin/python",
+  "python.pythonPath": "~/.local/share/virtualenvs/app-x/bin/python",
+  "mypy.interpreter.path": "/home/u/.cache/uv/environments-v2/x/bin/python",
   "terminal.integrated.profiles.linux": { "zsh": { "path": "/usr/bin/zsh", "args": ["-l"] } },
   "git.path": "/usr/bin/git",
   "http.proxyStrictSSL": true,
@@ -1145,6 +1321,10 @@ mod tests {
 }
 "#;
         assert!(editor(quiet).is_empty(), "{:?}", editor(quiet));
+        // The variables that change what the terminal's programs run or
+        // load, and a compiler from the home.
+        let loading = "{\n\"terminal.integrated.env.linux\": {\n\"PATH\": \"/home/u/bin:${env:PATH}\",\n\"GIT_CONFIG_GLOBAL\": \"/home/u/x\",\n\"https_proxy\": \"http://10.0.0.1:3128\",\n\"CC\": \"/home/u/bin/cc\",\n\"GIT_SSH_COMMAND\": \"ssh -i x\",\n\"MY_APP_MODE\": \"dev\"\n}\n}\n";
+        assert_eq!(lines(loading), [3, 4, 5, 6, 7]);
         assert_eq!(
             lines(
                 "{\n\"terminal.integrated.env.linux\": { \"A\": \"1\", \"NODE_OPTIONS\": \"--require /x.js\" }\n}\n"

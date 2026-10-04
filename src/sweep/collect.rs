@@ -474,6 +474,37 @@ pub fn is_file_there(scope: &Scope<'_>, path: &str, run_by: Option<&str>) -> boo
     }
 }
 
+/// Whether anything at all (a directory too) is called `name` in
+/// `directory`, which `run_by` (or, without one, a process) named. `None`
+/// where root would have to look into a directory not everyone may enter:
+/// whether a name is in there is not root's to tell whoever chose the
+/// directory. Anyone who may enter a directory may ask that of it.
+pub fn holds(scope: &Scope<'_>, directory: &str, name: &str, run_by: Option<&str>) -> Option<bool> {
+    let Some(view) = view(scope, run_by) else {
+        return Some(fs::symlink_metadata(scope.root.join(directory).join(name)).is_ok());
+    };
+    match read::seen(scope.root, directory, view)?.what {
+        read::Public::Directory(handle) => Some(
+            fs::symlink_metadata(format!("/proc/self/fd/{}/{name}", handle.as_raw_fd())).is_ok(),
+        ),
+        _ => None,
+    }
+}
+
+/// Whether `path` is a regular file or a link that leads to one, as
+/// `run_by` may lead the collector to it. (Root's look does not follow a
+/// link by itself, so the chain is walked hop by hop.)
+fn names_a_file(scope: &Scope<'_>, path: &str, run_by: Option<&str>) -> bool {
+    if is_file_there(scope, path, run_by) {
+        return true;
+    }
+    let Some(Some(link)) = hop(scope, path) else {
+        return false;
+    };
+    read::resolve_where(path, &link, &|next| hop(scope, next))
+        .is_some_and(|resolved| matches!(look_past_link(scope, &resolved), Found::File { .. }))
+}
+
 /// How the collector sees the hops of a link chain. As root, a link leads
 /// where its owner says, so every hop is seen as everyone sees it.
 fn hop(scope: &Scope<'_>, path: &str) -> read::Hop {
@@ -543,7 +574,8 @@ pub fn look(scope: &Scope<'_>, category: Category, path: &str, run_by: Option<&s
 /// here (see `tier::classify`), so nothing is told of those at all.
 ///
 /// `None` where there is no such file to compare: the caller then treats
-/// the path as not vouched for.
+/// the path as not vouched for, unless that alone would tell (see
+/// `packaged_out_of_sight`).
 pub fn packaged_item(scope: &Scope<'_>, category: Category, path: &str) -> Option<Item> {
     scope.index.owner(path)?;
     let seen = read::seen(scope.root, path, View::Pinned)?;
@@ -559,6 +591,42 @@ pub fn packaged_item(scope: &Scope<'_>, category: Category, path: &str) -> Optio
     item.body = Body::Binary(COMPARED);
     item.runs.clear();
     Some(item)
+}
+
+/// Whether `path`, which a process led the root collector to, is a
+/// package's path inside a directory that is root's alone and that not
+/// everyone may enter. Of such a path `packaged_item` answers with its one
+/// bit or not at all: were "there is no regular file here" reported (as a
+/// library no package vouches for), whoever named the path would learn
+/// that a packaged file in a directory closed to them is missing or is
+/// something else. Where everyone may enter the directory, that is theirs
+/// to see anyway; where somebody else may write on the way, the file is
+/// theirs and nothing of root's. A packaged file that is missing or odd is
+/// for the look through the fixed directories to report, which no user
+/// steers.
+pub fn packaged_out_of_sight(scope: &Scope<'_>, path: &str) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    if scope.index.owner(path).is_none() {
+        return false;
+    }
+    let Some((directory, _)) = path.rsplit_once('/') else {
+        return false;
+    };
+    let Some(read::Seen {
+        path: walked,
+        what: read::Public::Directory(handle),
+        kept: true,
+    }) = read::seen(scope.root, directory, View::Pinned)
+    else {
+        return false;
+    };
+    let owner = fs::metadata(scope.root).map(|top| top.uid()).ok();
+    let roots_alone = handle
+        .metadata()
+        .is_ok_and(|metadata| Some(metadata.uid()) == owner && metadata.mode() & 0o022 == 0);
+    walked == directory
+        && roots_alone
+        && read::seen(scope.root, directory, View::Everyone).is_none()
 }
 
 /// The tier of a packaged file the sweep could not read: modified when its
@@ -712,6 +780,7 @@ pub fn item_of(
     }
     notes.extend(path_notes(category, &body));
     notes.extend(rewritten.map(str::to_string));
+    notes.extend(tier::session_note(&path, tier, scope.index).map(str::to_string));
     let alerts = settings_alerts(scope, category, &path, tier, &body);
     Item {
         // The root collector's items are all root's, its home included.
@@ -971,6 +1040,18 @@ fn listed(scope: &Scope<'_>, view: Option<View>, directory: &str) -> Vec<String>
     }
 }
 
+/// Whether `command` is a pattern of files and nothing else
+/// (`~/.config/hypr/conf.d/*.conf`), not a command line with a `*` in it.
+fn is_pattern(command: &str) -> bool {
+    let bare = command.trim();
+    let bare = ["$HOME/", "${HOME}/"]
+        .iter()
+        .find_map(|home| bare.strip_prefix(home))
+        .unwrap_or(bare);
+    command.contains(['*', '?'])
+        && !bare.contains(|c: char| c.is_whitespace() || ";|&$()<>`'\"\\".contains(c))
+}
+
 /// What following an item gave.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Followed {
@@ -1012,16 +1093,15 @@ fn follow(scope: &Scope<'_>, item: &Item, search: &Search) -> Followed {
         // A pattern alone (a Hyprland `source`) names the files it
         // matches; anything else with a `*` in it (a command line, however
         // it is written) still runs its program.
-        let bare = command.trim();
-        let bare = ["$HOME/", "${HOME}/"]
-            .iter()
-            .find_map(|home| bare.strip_prefix(home))
-            .unwrap_or(bare);
-        let pattern = command.contains(['*', '?'])
-            && !bare.contains(|c: char| c.is_whitespace() || ";|&$()<>`'\"\\".contains(c));
-        if pattern {
+        if is_pattern(command) {
             let (matched, more) = commands::glob_targets(home, command, &list);
-            targets.extend(matched);
+            // A directory a pattern matches too (`/*`) is no more run
+            // than one a command names.
+            targets.extend(
+                matched
+                    .into_iter()
+                    .filter(|target| names_a_file(scope, target, by)),
+            );
             if more {
                 limit(format!(
                     "only the first {} files a pattern names",
@@ -1367,6 +1447,67 @@ mod tests {
         assert!(super::is_capped(&shell), "{:?}", shell.notes);
         assert_eq!(shell.runs, ["~/bin/agent"]);
         assert!(!super::is_capped(&joined));
+    }
+
+    #[test]
+    fn a_pattern_names_files_and_a_case_branch_names_nothing() {
+        let dir = TempDir::new("sweep-pattern");
+        let root = dir.path();
+        // What a pattern matches: a file, a link to one, a directory and a
+        // link to a directory.
+        write(root, "home/u/.config/hypr/conf.d/a.conf", "x\n");
+        write(root, "home/u/.config/hypr/elsewhere.conf", "x\n");
+        fs::create_dir_all(root.join("home/u/.config/hypr/conf.d/dir")).unwrap();
+        symlink(
+            "../elsewhere.conf",
+            root.join("home/u/.config/hypr/conf.d/linked"),
+        )
+        .unwrap();
+        symlink("dir", root.join("home/u/.config/hypr/conf.d/to-dir")).unwrap();
+        write(
+            root,
+            "home/u/.config/hypr/hyprland.conf",
+            "source = ~/.config/hypr/conf.d/*\n",
+        );
+        // The shape of a packaged completion file: the branch `/*)` is a
+        // pattern, not a command over every top-level directory.
+        for top in ["bin", "etc/x", "tmp/x"] {
+            write(root, &format!("{top}/keep"), "x\n");
+        }
+        write(root, "usr/local/bin/tool", "x\n");
+        write(
+            root,
+            "home/u/.bashrc",
+            "case \"$cur\" in\n'')\n\tCOMPREPLY=()\n\t;;\n/*)\n\t/usr/local/bin/tool\n\t;;\nesac\n",
+        );
+        let index = PackageIndex::with_foreign(HashSet::new());
+        for origin in [Origin::System, Origin::Root] {
+            let scope = Scope {
+                root,
+                home: Some("home/u"),
+                index: &index,
+                origin,
+            };
+            let search = crate::sweep::path::search(&scope);
+            let conf = "home/u/.config/hypr/hyprland.conf";
+            let sourced = super::item(&scope, Category::Hyprland, conf.into(), None);
+            let mut targets = super::follow(&scope, &sourced, &search).targets;
+            targets.sort();
+            assert_eq!(
+                targets,
+                [
+                    "home/u/.config/hypr/conf.d/a.conf",
+                    "home/u/.config/hypr/conf.d/linked"
+                ],
+                "{origin:?}"
+            );
+            let shell = super::item(&scope, Category::Shell, "home/u/.bashrc".into(), None);
+            assert_eq!(shell.runs, ["/usr/local/bin/tool"]);
+            assert_eq!(
+                super::follow(&scope, &shell, &search).targets,
+                ["usr/local/bin/tool"]
+            );
+        }
     }
 
     #[test]

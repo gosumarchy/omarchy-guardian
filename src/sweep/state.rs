@@ -309,7 +309,13 @@ pub fn save_system_allowed(path: &Path, allowed: &Remembered) -> Result<(), Stri
         fs::create_dir_all(directory)
             .map_err(|error| format!("{}: {error}", directory.display()))?;
         // Whatever umask root's shell had: a list its users cannot reach
-        // allows nothing.
+        // allows nothing. Exactly this mode, on this one directory, and
+        // nothing below it is touched: root's other state lives here too.
+        // `sweep/` (the collector's results, closed to all but the
+        // configured group) and `permits/` (written by the permit root
+        // half: root's alone to write, readable by everyone) keep the
+        // modes their writers gave them, and both want what this sets on
+        // their parent: everyone may enter, only root may write.
         fs::set_permissions(directory, fs::Permissions::from_mode(0o755))
             .map_err(|error| format!("{}: {error}", directory.display()))?;
     }
@@ -658,6 +664,20 @@ mod tests {
             assert!(super::all_allowed(&system, &system, 1000).is_empty());
         }
         assert!(super::is_home_label("~/x") && !super::is_home_label("/root/x"));
+        // Saving sets the mode of the list's directory and of nothing in
+        // it: what else root keeps there stays as closed as it was made.
+        let kept = dir.path().join("kept");
+        for (name, mode) in [("sweep", 0o750), ("permits", 0o700)] {
+            fs::create_dir_all(kept.join(name)).unwrap();
+            fs::set_permissions(kept.join(name), fs::Permissions::from_mode(mode)).unwrap();
+        }
+        fs::set_permissions(&kept, fs::Permissions::from_mode(0o700)).unwrap();
+        super::save_system_allowed(&kept.join("allowed.json"), &own).unwrap();
+        let mode =
+            |path: &std::path::Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode(&kept), 0o755);
+        assert_eq!(mode(&kept.join("sweep")), 0o750);
+        assert_eq!(mode(&kept.join("permits")), 0o700);
 
         // Root's list is one every user can reach: beside the results it
         // sat in a directory only one group may enter. The old one is read

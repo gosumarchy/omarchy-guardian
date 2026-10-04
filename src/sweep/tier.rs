@@ -188,9 +188,39 @@ pub fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex) -> Tie
         {
             tier
         }
+        // What `protect` writes into the home, byte for byte: Guardian's
+        // own, like the files its package ships.
+        Observed::File {
+            content: Some(content),
+            mode,
+            ..
+        } if mode & 0o6000 == 0 && is_guardians_session_file(path, content) => Tier::Vendor,
         Observed::File { sha256, .. } if index.copy_of(sha256, path).is_some() => Tier::Copied,
         Observed::File { .. } | Observed::Link { .. } => Tier::Unknown,
     }
+}
+
+/// Where `protect` puts the file uwsm reads for the graphical session, in
+/// a home's configuration, and every byte of it (`SESSION_ENV` in
+/// `tui::integrations`, which a test holds this to). It puts the
+/// directory of Guardian's wrappers, root's own, first on `PATH` and does
+/// nothing else, so a file with exactly this content is no more to review
+/// than the package's files, whoever wrote it.
+const SESSION_FILE: &str = "/.config/uwsm/env.d/90-omarchy-guardian";
+const SESSION_ENV: &str = "# Omarchy Guardian: theme and plugin installs found on PATH go through Guardian.\n# Written by `omarchy-guardian protect`, removed by `omarchy-guardian protect --off`.\nexport PATH=\"/usr/lib/omarchy-guardian/bin:$PATH\"\n";
+
+/// What the note on such an item says.
+const SESSION_NOTE: &str = "Guardian's own: written by `omarchy-guardian protect`, unchanged";
+
+fn is_guardians_session_file(path: &str, content: &[u8]) -> bool {
+    path.ends_with(SESSION_FILE) && content == SESSION_ENV.as_bytes()
+}
+
+/// The note for an item of tier `tier` at `path` that is the file
+/// `protect` wrote (no package owns it, and it is trusted all the same).
+pub fn session_note(path: &str, tier: Tier, index: &PackageIndex) -> Option<&'static str> {
+    (tier == Tier::Vendor && path.ends_with(SESSION_FILE) && index.owner(path).is_none())
+        .then_some(SESSION_NOTE)
 }
 
 /// The newest `python3.N` a package's script may have named.
@@ -490,6 +520,40 @@ mod tests {
             &[],
         );
         index
+    }
+
+    #[test]
+    fn the_session_file_protect_writes_is_guardians_own_while_it_is_exactly_that() {
+        let index = index();
+        let path = "home/u/.config/uwsm/env.d/90-omarchy-guardian";
+        let tier = |path: &str, text: &str, mode| {
+            classify(
+                path,
+                Observed::File {
+                    sha256: &Sha256::digest(text.as_bytes()),
+                    mode,
+                    size: text.len() as u64,
+                    content: Some(text.as_bytes()),
+                },
+                &index,
+            )
+        };
+        assert_eq!(tier(path, super::SESSION_ENV, 0o644), Tier::Vendor);
+        assert!(super::session_note(path, Tier::Vendor, &index).is_some());
+        // One more line, another name, or set-id: a file like any other.
+        let more = format!("{}export PATH=/tmp:$PATH\n", super::SESSION_ENV);
+        assert_eq!(tier(path, &more, 0o644), Tier::Unknown);
+        assert_eq!(tier(path, super::SESSION_ENV, 0o4755), Tier::Unknown);
+        let other = "home/u/.config/uwsm/env.d/91-other";
+        assert_eq!(tier(other, super::SESSION_ENV, 0o644), Tier::Unknown);
+        assert!(super::session_note(other, Tier::Vendor, &index).is_none());
+        // The bytes are the ones the integration writes: its constant is
+        // not reachable from here, so its source is held to this one.
+        let written = format!("const SESSION_ENV: &str = {:?};", super::SESSION_ENV);
+        assert!(
+            include_str!("../tui/integrations.rs").contains(&written),
+            "tui::integrations::SESSION_ENV is no longer what the sweep recognises"
+        );
     }
 
     #[test]

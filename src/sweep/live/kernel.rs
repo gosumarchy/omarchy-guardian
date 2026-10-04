@@ -311,12 +311,15 @@ pub(super) fn highest_number(scope: &Scope<'_>, listed: u32) -> u32 {
         .max(listed)
 }
 
-/// `unlisted` over every number of `range`, shared between a few threads.
+/// `unlisted` over every number of `range`, shared between a few threads;
+/// and the parts of the range whose search did not come back (its thread
+/// died): nothing was learned of those numbers, which is not the same as
+/// nothing hiding among them.
 pub(super) fn unlisted_among(
     listed: &HashSet<u32>,
     range: RangeInclusive<u32>,
     answers: &(dyn Fn(u32) -> Option<Status> + Sync),
-) -> Vec<(u32, String)> {
+) -> (Vec<(u32, String)>, Vec<RangeInclusive<u32>>) {
     let (first, last) = (*range.start(), *range.end());
     let searchers = thread::available_parallelism()
         .map_or(1, |cores| u32::try_from(cores.get()).unwrap_or(1))
@@ -327,14 +330,44 @@ pub(super) fn unlisted_among(
             .map(|searcher| {
                 let from = first.saturating_add(share.saturating_mul(searcher));
                 let to = from.saturating_add(share - 1).min(last);
-                threads.spawn(move || unlisted(listed, from..=to, answers))
+                (
+                    from..=to,
+                    threads.spawn(move || unlisted(listed, from..=to, answers)),
+                )
             })
             .collect();
-        searches
-            .into_iter()
-            .flat_map(|search| search.join().unwrap_or_default())
-            .collect()
+        let mut found = Vec::new();
+        let mut not_searched = Vec::new();
+        for (part, search) in searches {
+            match search.join() {
+                Ok(unlisted) => found.extend(unlisted),
+                Err(_) => not_searched.push(part),
+            }
+        }
+        (found, not_searched)
     })
+}
+
+/// Says which process numbers the search for hidden processes did not
+/// get through: a note for a user's sweep, and for the root checks, which
+/// nothing else covers, something left unchecked.
+pub(super) fn say_not_searched(
+    scope: &Scope<'_>,
+    not_searched: &[RangeInclusive<u32>],
+    found: &mut Found,
+) {
+    for part in not_searched {
+        let sentence = format!(
+            "process numbers {} to {} were not tried in the search for hidden processes: that part of the search failed",
+            part.start(),
+            part.end()
+        );
+        if scope.origin == Origin::Root {
+            found.unchecked.push(sentence);
+        } else {
+            found.notes.push(sentence);
+        }
+    }
 }
 
 /// Processes that exist (their `status` opens under their number) and are
@@ -370,7 +403,9 @@ pub(super) fn hidden_processes(scope: &Scope<'_>, running: &Running, most: u32, 
         members_of_control_groups(scope).into_iter(),
         &answers,
     );
-    suspects.extend(unlisted_among(&listed, first..=top, &answers));
+    let (among, not_searched) = unlisted_among(&listed, first..=top, &answers);
+    suspects.extend(among);
+    say_not_searched(scope, &not_searched, found);
     if suspects.is_empty() {
         return;
     }
