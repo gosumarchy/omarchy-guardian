@@ -1726,57 +1726,115 @@ It asks for sudo only for the steps that need it, and skips what is already
 done: when the version of this checkout is the one already installed, it
 does not build or install again and goes on with the reviewer, the settings
 and `protect`. `./install.sh --reinstall` builds and installs it anyway
-(after changing the source without a new version, say). To upgrade: `git
-pull && ./install.sh`. With the pacman hook on, the
-installed Guardian reviews the new package like any other local archive
-before pacman installs it.
+(after changing the source without a new version, say). With the pacman
+hook on, the installed Guardian reviews the new package like any other
+local archive before pacman installs it.
+
+**Upgrading.** Once the installed Guardian carries the release keys and its
+own upgrade check, upgrade with:
+
+```sh
+git pull && /usr/lib/omarchy-guardian/upgrade
+```
+
+Until then, and for a first install, it is `git pull && ./install.sh`, with
+the tag checked by hand as shown below. The installer's last line says
+which of the two applies.
+
+`/usr/lib/omarchy-guardian/upgrade` is part of the installed package
+(root-owned, and a path the pacman gate protects), not of the checkout, and
+it treats the checkout as data it does not trust:
+
+- It reads the object id of the release tag from the checkout's `.git` as
+  text, and the checkout's objects as files. No git command runs with the
+  checkout as its repository, so nothing the checkout configures is used:
+  not `.git/config` (a verifying program, hooks, `core.worktree`,
+  `core.fsmonitor`, included files), not its index, not its hooks, replace
+  refs or attributes.
+- It copies the tag, its commit and that commit's files into a fresh
+  repository of its own. Every object's id is computed again from its
+  content on the way, so an object file that is not what its name says does
+  not arrive.
+- There it verifies the tag's SSH signature by object id, with
+  `/usr/bin/ssh-keygen`, against
+  `/usr/share/omarchy-guardian/allowed_signers`, and requires a tag object
+  (not a plain tag) that carries the name it is stored under: the genuine
+  signed tag of an old release stored as `v9.9.9` is refused. It prints the
+  tag, the commit, the signer and the key's fingerprint.
+- It exports exactly the signed tree into an empty private directory under
+  `~/.cache/omarchy-guardian/` and builds there. Nothing of the checkout's
+  working tree is used: no changed or added file, no build output left
+  behind. The directory is removed when the installer returns (`--keep`
+  keeps it).
+- It refuses a release older than the installed one: an old release with a
+  hole that a later one closed is signed too. `--allow-downgrade` overrides
+  that.
+- Then it starts the exported release's own `install.sh`, which is signed
+  content, and passes `--yes` and `--reinstall` on to it.
+
+`upgrade [checkout [tag]]` takes the checkout's directory (default: the
+current one) and a tag (default: the highest `vX.Y.Z` tag that verifies; a
+tag that does not is named and passed over). `upgrade --check` verifies and
+exports without building. It runs as your user and refuses to run as root.
+When the installed Guardian carries no release keys it says so and builds
+nothing.
+
+What the upgrade check relies on: the installed Guardian and its key list
+(protected by root ownership and by the pacman gate), `git`, `ssh-keygen`
+and `tar` from the system, and the release key itself. What it cannot
+know: a release newer than the newest tag your checkout has (someone who
+controls where you pull from can withhold a release, though not forge one),
+and whether a first install was genuine.
 
 **Verifying a release.** Guardian's hook runs as root inside pacman, so what
 you build matters. Releases are annotated git tags (`vX.Y.Z`); from the
 release that adds the key file `packaging/allowed_signers` on, they are
-signed with an SSH key listed there. Check out a tag rather than the tip of
-a branch:
+signed with an SSH key listed there. For a first install, or while the
+installed Guardian has no keys, check out a tag rather than the tip of a
+branch and check its signature by hand, against a key file you have reason
+to trust (one you compared with the key the maintainer publishes):
 
 ```sh
 git fetch --tags && git checkout vX.Y.Z
+git -c gpg.format=ssh \
+    -c gpg.ssh.allowedSignersFile=/path/to/allowed_signers \
+    verify-tag refs/tags/vX.Y.Z
+git status --short --ignored      # nothing changed, nothing added
 ./install.sh
 ```
 
-The installer says what it is about to build. When the
-Guardian already installed carries the release keys
-(`/usr/share/omarchy-guardian/allowed_signers`, root-owned, installed by
-the package), it verifies the tag's signature against them with `git
-verify-tag` before building, and asks before going on unless the checkout
-is exactly a release tag signed by one of those keys, with no tracked file
-changed and no file added. A file that is not part of the tag counts
-(cargo would run an added `build.rs` or `.cargo/config.toml`, and an added
-`packaging/allowed_signers` would be installed as the keys the next upgrade
-is checked against); only what the tag's own top-level `.gitignore` names,
-the build's output, is passed over. A directory that is not a git checkout
-(an unpacked tarball) cannot be checked and is asked about too. `--yes`
-never answers that question. The keys come from the installed package,
-never from the checkout being built, which could bring its own; and git is
-asked with the verifying program (`/usr/bin/ssh-keygen`), the signature
-format and the keys file given on its command line and without the system's
-or your own git configuration, so the checkout's `.git/config` cannot name
-another program or other keys to verify with. This check is no defence
-against someone who can rewrite the checkout's `.git` directory in other
-ways (its index, say): it tells a release from a changed or unsigned tree,
-and the tree's history is only as good as where you cloned it from. Two limits: a first
-install has no installed keys to check against, so the installer says the
-signature was not checked (verify the tag yourself, below); and a package
-built from a release that ships no key file installs none. To check a tag
-by hand, against a key file you have reason to trust (the installed
-Guardian's, or one you compared with the key the maintainer publishes):
+Do this in a clone you made yourself. `git verify-tag` runs in the
+checkout and believes its `.git/config`, so it proves nothing about a
+checkout someone else prepared; and the key file in the checkout itself
+(`packaging/allowed_signers`) proves nothing about that checkout. A first
+install is trust on first use: nothing on the system can vouch for it yet.
 
-```sh
-git -c gpg.format=ssh \
-    -c gpg.ssh.allowedSignersFile=/usr/share/omarchy-guardian/allowed_signers \
-    verify-tag vX.Y.Z
-```
-
-The key file in the checkout itself (`packaging/allowed_signers`) proves
-nothing about that checkout.
+`./install.sh` also checks what it is about to build, and says what it
+found. That check is part of the checkout it checks, so it guards against
+mistakes, not against tampering: someone who changed the checkout could
+have changed the installer too. With installed keys it says so and names
+the upgrade check above. What it does: it asks before going on unless
+`HEAD` is the commit of a release tag signed by an installed key and the
+working tree is exactly that commit's tree. The tag is looked up as
+`refs/tags/<name>` and verified by object id, has to be a tag object that
+names `HEAD`'s commit and carries its own name, and git is run with the
+verifying program, the signature format, the keys file and the working
+tree given on its command line and without the system's or your own git
+configuration. Every file of the tagged tree is hashed from disk and
+compared (content, executable bit, links), without asking the index, so a
+file the index was told to pass over is still compared; and every file on
+disk that is not in the tagged tree counts (cargo would run an added
+`build.rs` or `.cargo/config.toml`, and an added
+`packaging/allowed_signers` would be installed as the keys the next
+upgrade is checked against), whatever the index or `.git/info/exclude`
+say. Only what the tag's own top-level `.gitignore` names, the build's
+output, is passed over, and the build starts from an empty build directory
+(`makepkg --cleanbuild`), so what is passed over is not linked in. A
+directory that is not a git checkout (an unpacked tarball), or whose `.git`
+is a file (a linked worktree), cannot be checked and is asked about too.
+`--yes` never answers that question. Without installed keys the installer
+says that the signature was not checked, and goes on. A package built from
+a release that ships no key file installs none.
 
 How to report a weakness, and what counts as one, is in
 [SECURITY.md](SECURITY.md).
@@ -2738,11 +2796,25 @@ maintainer@example.org namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA…
 The first word is the principal (an address or any name), `namespaces="git"`
 limits the key to git signatures, and the rest is the public key as in the
 `.pub` file. The package installs that file as
-`/usr/share/omarchy-guardian/allowed_signers`, and `install.sh` checks the
-next checkout's tag against the installed copy. So a new key takes effect
-one release after it is added: sign the release that adds it with the old
-key, and only later ones with the new. Keep the private
+`/usr/share/omarchy-guardian/allowed_signers`, and the installed
+`/usr/lib/omarchy-guardian/upgrade` (and `install.sh`) check the next
+release's tag against the installed copy. So a new key takes effect one
+release after it is added: sign the release that adds it with the old key,
+and only later ones with the new. The first release that carries the file
+cannot itself be verified by the Guardian installed before it, which has no
+keys: that upgrade is trust on first use, checked by hand at best
+([Verifying a release](#install-arch-linux--omarchy)). Keep the private
 key off the machines that build and test; check a tag before pushing it
-with `git -c gpg.ssh.allowedSignersFile=packaging/allowed_signers verify-tag
-vX.Y.Z`. While the file does not exist the package installs none and the
-installer says that the signature was not checked.
+with `git -c gpg.format=ssh -c
+gpg.ssh.allowedSignersFile=packaging/allowed_signers verify-tag
+refs/tags/vX.Y.Z`. While the file does not exist the package installs none,
+the upgrade check refuses to build, and the installer says that the
+signature was not checked.
+
+The upgrade check holds a release to three things beyond the signature, so
+keep to them: the tag is named `vX.Y.Z` (digits and dots, optionally
+`-N`), it is an annotated tag whose own name is the name it is pushed
+under, and `pkgver`-`pkgrel` in the tagged `packaging/arch/PKGBUILD` is not
+lower than the previous release's. The export is made with `git archive`,
+so a path marked `export-ignore` in the tagged `.gitattributes` would be
+missing from the build.

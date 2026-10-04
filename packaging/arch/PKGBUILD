@@ -101,4 +101,8 @@ package() {
     for wrapper in omarchy omarchy-theme-install omarchy-theme-update omarchy-plugin-add omarchy-plugin-update; do
         install -Dm755 "integrations/omarchy/bin/$wrapper" "$lib/bin/$wrapper"
     done
+    # The upgrade check that does not rely on the checkout it is given: it
+    # has to be the installed copy, so it is run from here, never from a
+    # checkout.
+    install -Dm755 integrations/upgrade.sh "$lib/upgrade"
 }
