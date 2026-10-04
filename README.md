@@ -19,6 +19,8 @@ plugins, and reviews that code **before any of it runs**:
                                   │
              clear ─► the install goes ahead
              risk  ─► blocked, full report in the terminal + desktop notification
+
+ what already runs on its own ──► daily system sweep ──► new or changed items
 ```
 
 - **Two reviews.** Fast local rules flag known-bad patterns (download and
@@ -33,17 +35,27 @@ plugins, and reviews that code **before any of it runs**:
 - **What counts as auto-run.** For pacman packages: install scriptlets, and
   files that run without you starting them (pacman hooks, enabled systemd
   units, sudoers, polkit, PAM, udev, tmpfiles, profile scripts, autostart
-  entries). Unchanged files are skipped on upgrade.
+  entries; the full list is under [Pacman hook](#pacman-hook)), and the
+  package's own text files those name. Unchanged files are skipped on
+  upgrade. The same list of locations is what the
+  [system sweep](#system-sweep) reads on the installed system.
 - **AUR builds.** The recipe (PKGBUILD) is reviewed before any of it runs.
-  makepkg then runs the approved recipe only to download and unpack the
-  sources (its top-level code runs; `pkgver()`, `prepare()`, `verify()`,
-  `build()` and `package()` do not), and the unpacked sources are reviewed
-  before anything is built.
+  Its sources are then listed in a sandbox with no network (the recipe's
+  top-level code runs there and nowhere else before the build), fetched and
+  unpacked from a recipe Guardian writes itself (no code of the package
+  runs: not `pkgver()`, `prepare()`, `build()` or `package()`), and reviewed
+  before anything is built. yay's first call, which only downloads and
+  verifies, is the exception: there makepkg runs the reviewed recipe and its
+  `verify()` as you.
   Plain-HTTP sources without checksums block, and the AUR's own trust signals
-  (age, votes, maintainer changes) are part of the review.
+  (age, votes, maintainer changes) are part of the review. A package made of
+  prebuilt programs, or a recipe whose sources Guardian cannot follow, is not
+  waved through: Guardian says so and asks on the terminal.
 - **Fail closed.** A review that cannot finish blocks. An unavailable AI
   blocks community sources; for official Arch/Omarchy updates the `standard`
-  profile warns instead, `strict` blocks.
+  profile warns instead, `strict` blocks. A question nobody can be asked (no
+  terminal) is answered no. A settings file that does not parse stops the
+  gates that read it instead of being skipped.
 - **Blocks you can read.** A block also raises a desktop notification with
   the Guardian knight. Clicking it opens the full report as a page in your
   browser, saved privately under `~/.cache/omarchy-guardian/reports` (the
@@ -69,16 +81,26 @@ plugins, and reviews that code **before any of it runs**:
   the menu reads its file, yay building through Guardian's root-owned shim
   with no alias, function or other `yay` in front of it, and Guardian's
   theme and plugin commands first on the session's PATH. Anything less
-  reads "partly on" with the reason. paru, pikaur, aura or trizen installed
+  reads "partly on" with the reason. The pacman hook counts as on by its
+  link in `/etc/pacman.d/hooks`, not by the hook file the package always
+  ships. The sweep reads "partly on", naming the file, when a unit or
+  drop-in stands in for one of its own units (the same files the sweep
+  alerts on; see [Guardian's own units](#system-sweep)), and what the daily
+  root checks saw of that kind is a problem of its own. paru, pikaur, aura
+  or trizen installed
   without the gate is a problem too. A class set weaker than its protection
   level (the AI review lowered or off, findings that only warn, the no-AI
   level's question taken away) is a problem until you set it back or accept
   it with `omarchy-guardian config acknowledge`; accepted, it says "local
   checks only" or "findings only warn" beside the gate. When a gate that
   was on goes off or partly off without you turning it off through
-  Guardian, or a class becomes weaker, you get one notification
+  Guardian, a class becomes weaker, the pacman gate's root-owned reviewer
+  goes away, a settings file stops parsing, or a system-wide settings file
+  of the reviewer's appears (`/etc/claude-code/managed-settings.json` and
+  its `.d` directory, `/etc/opencode/opencode.json`: they apply to every
+  review, whatever Guardian passes the reviewer), you get one notification
   ("Guardian protection changed"), from the bar's own check or the daily
-  sweep; a gate that dropped stays listed until it is back on or
+  sweep; what dropped stays listed until it is back or
   `omarchy-guardian status --dismiss`. That record is a file of your own,
   like the list of dismissed blocks: it catches things breaking and crude
   tampering (a line removed from `~/.bashrc`), not a program running as you
@@ -95,8 +117,14 @@ plugins, and reviews that code **before any of it runs**:
 - **Not covered.** Programs you download and run yourself, `curl | sh`
   pasted into a terminal, Flatpak, npm, pip, mise and other language package
   managers, and the binaries inside a package (only what runs at install or
-  boot is reviewed). `omarchy-guardian guard` and `sandbox` cover a download
-  you start by hand.
+  boot is reviewed). Dependencies a build downloads by itself (cargo crates,
+  npm packages) are not reviewed. A theme or plugin copied into place by
+  hand, or installed by a caller that names Omarchy's command by its full
+  path or resets `PATH`, does not pass a gate. With the AI review off for
+  AUR builds, the upstream sources are not checked at all: the local rules
+  read the recipe's own files only. Each section below says what its gate
+  does not see. `omarchy-guardian guard` and `sandbox` cover a download you
+  start by hand.
 
 It is a single Rust binary with **no third-party crates**. SHA-256, JSON, and
 the small subset of TOML it needs are implemented in the crate so the whole
@@ -134,6 +162,7 @@ omarchy-guardian sweep
   read now, `--all` lists trusted items too, `--diff` only what changed since
   the last sweep, `--json` prints one JSON document. `sweep allow PATH`
   trusts one item as it is now; `sweep forget PATH` (or `--all`) undoes it.
+  Both ask for the sudo password: the list of allowed items is root's.
 - `--identity ID` or `--unit DIR ID` (repeatable) on `scan`, `guard` and
   `sandbox` name what is reviewed for the review memory (see
   [How the review scales](#how-the-review-scales)); `omarchy-guardian forget
@@ -142,10 +171,14 @@ omarchy-guardian sweep
 
 Exit codes: `0` clear, warned or limited review (a scriptlet-free pacman
 transaction); `1` findings; `2` an incomplete review, an unavailable AI review
-under `ai = required`, a declined confirmation, or a usage error. Once `guard`
-or `sandbox` starts the command, the exit code is the command's own (128 +
-signal if it was killed). Guardian announces on stderr when it starts the
-command, so its own blocks can be told apart from the command's failures.
+under `ai = required`, a question that got no yes (`NOT CONFIRMED`), a
+settings file that does not parse, or a usage error. `guard` and `sandbox`
+never exit `0` without having started the command: a review with nothing to
+review exits `2` there. Once `guard` or `sandbox` starts the command, the
+exit code is the command's own (128 + signal if it was killed). Guardian
+announces on stderr when it starts the command, so its own blocks can be
+told apart from the command's failures. The full table is under
+[Profiles and settings](#profiles-and-settings).
 
 ## System sweep
 
@@ -155,13 +188,16 @@ gate knows (systemd units and their enable links, drop-ins and generators,
 pacman hooks, udev, modprobe, PAM, sudo and polkit rules, shell start-up
 files, cron, autostart, D-Bus services, initcpio, the pacman, makepkg, sshd,
 logrotate, systemd manager and login-screen configuration, the sessions the
-login screen offers, the kernel command line, DKMS build configuration, and
+login screen offers, the kernel command line, DKMS build configuration,
+`at` jobs, browser policies and native-messaging hosts, certificate
+authorities, and
 Python's `.pth` and `sitecustomize` files, which every Python program runs
 at start), a few more only the sweep reads (PAM modules, libraries in
 `glibc-hwcaps`, the Limine config, `/etc/fstab` and `/etc/crypttab`, Podman
-quadlets in `/etc/containers/systemd`, `at` jobs, browser policies and
-native-messaging hosts, system-wide Flatpak overrides, added certificate
-authorities and `/etc/hosts`) and, in your home, user services (in
+quadlets in `/etc/containers/systemd`, Firefox's `distribution/policies.json`,
+system-wide Flatpak overrides, certificate authorities added in
+`/usr/local/share/ca-certificates`, `/etc/hosts`, and the system-wide
+`npmrc`, `pip.conf`, `tmux.conf` and `inputrc`) and, in your home, user services (in
 `~/.config`, `~/.config/systemd/user.control` and `~/.local/share`) and
 Podman quadlets, session D-Bus services, autostart
 entries, shell files, fish functions, completions and saved variables,
@@ -286,6 +322,10 @@ units in the system's unit directories. Any of these (also a drop-in for
 every `omarchy-…` unit or for every service) is a high finding of its own
 that cannot be allowed. The root checks report the ones in your home too,
 so the finding does not rest on a sweep the override may have redirected.
+The bar looks for the same files every time it is asked (all but drop-ins
+beside the package's own units in `/usr/lib/systemd`, which only the sweep
+can tell from one a repository package ships), shows the sweep as partly
+on, and lists what the root checks reported.
 
 A link of the same name to a
 packaged file is trusted only
@@ -340,7 +380,22 @@ clean system shows nothing here:
   the running kernel's modules directory, where a changed file runs sooner
   or later without being in any auto-run location; a file no package owns
   there is listed as unknown (depmod's indexes and DKMS's modules are
-  not). That reads a few gigabytes on every sweep, on several threads;
+  not). What this finds in `/usr/bin` is listed under "The system's own
+  programs". That reads a few gigabytes on every sweep, on several threads
+  (a sweep takes about half a minute). One change is told apart: a packaged
+  script whose first line alone was rewritten to name the same interpreter
+  another way (Omarchy turns `powerprofilesctl`'s `#!/usr/bin/env python3`
+  into `#!/bin/python3` on every install). The package's content is not on
+  disk, only its digest, so the file is hashed again with each line the
+  package could have shipped for that interpreter (`#!/usr/bin/env NAME`,
+  `#!/usr/bin/NAME`, `#!/bin/NAME`; for Python also `python`, `python3`
+  and `python3.N`) in place of its first; when one gives the recorded
+  digest, everything after the first line is the package's, byte for byte.
+  The new first line must name a program in `/usr/bin` that a repository
+  package installed, with no arguments, and the mode must be unchanged.
+  Such a file is listed as `edited` with a note and no alert, and is read
+  no more than any other packaged file. Any other difference is
+  `modified`;
 - a program that listens on the network (TCP, not loopback), by every
   process that shares the socket. The item is named by the program and the
   port, and for an interpreter with no script on disk by what it was told
@@ -444,7 +499,7 @@ unit's own name, never for units that open a root shell:
 | inert | A masked unit (link to `/dev/null`, or an empty file) or another empty file; not when it masks a defence, Guardian's own sweep included | with `--all` |
 | copy | Identical to a file a repository package ships (Omarchy's `etc-overrides`) | with `--all` |
 | user-built | From a package of no configured repository (AUR), or from a package file nothing checked (`pacman -U`), whatever its name; or put there by a version manager (mise) | yes |
-| edited | A package's configuration file, changed as configuration is meant to be | yes |
+| edited | A package's configuration file, changed as configuration is meant to be; or a packaged script proven to differ from its package in the spelling of its interpreter line alone (see above) | yes |
 | allowed | Allowed with `sweep allow` while unchanged | with `--all` |
 | modified | A package's file that is no longer what the package shipped (content, link, set-id or write bits) | yes, and a high finding |
 | unknown | No package installed it | yes |
@@ -710,7 +765,8 @@ changed" notification.
 
 Every review is tagged with the class of its source. Classes reviewed by the
 pacman hook are *privileged*: Guardian's own settings for them can only be
-loosened by the system file (but see the OpenCode caveat below).
+loosened by the system file (but see below for what of the reviewer stays
+in the invoking user's hands).
 
 | Class | Source | Enforced by | Privileged |
 |---|---|---|---|
@@ -827,11 +883,14 @@ mapping for the level its test run passed with, in both files.
 
 The pacman hook runs the review as the invoking user from an empty
 environment, without a login shell, so shell rc files and exported variables
-cannot affect it. OpenCode still reads that user's own OpenCode configuration
-and credentials under `~`, so the provider endpoint and the default model
-used by the pacman gate remain under the user's control; a root-owned
-OpenCode configuration would be needed to close that, and Guardian does not
-set one up yet.
+cannot affect it. For that review OpenCode is given empty, private
+configuration and cache directories, so the user's own OpenCode settings (a
+provider `baseURL`, plugins, a global `AGENTS.md`) do not shape it. Its
+credentials still come from that user's OpenCode data directory, and the
+Claude Code CLI uses that user's Claude login: the review is kept apart from
+the account's configuration, not from the account. What remains in the
+account's hands, and the system-wide settings neither CLI can be told to
+skip, are listed under [What is checked](#what-is-checked).
 
 - `omarchy-guardian setup` — interactive wizard that detects OpenCode and
   Claude Code (suggesting Claude Sonnet when `claude` is installed), lets
@@ -849,11 +908,13 @@ set one up yet.
 
 `scan` and `guard` take `--class NAME` (default `source`; one of the
 user-level classes `aur`, `theme`, `plugin`, `source`) to tag the review with
-its source class. `scan`, `guard` and `sandbox` take `--profile NAME`
+its source class. `--class system` is rejected: that class is the sweep's
+own, and so are the pacman classes the hook's. `scan`, `guard` and `sandbox`
+take `--profile NAME`
 (`standard`, `strict`, `local-only`) to override the profile for that one run;
 it cannot affect a privileged class, because these commands never review one.
-The yay shim passes `--class aur`; the Omarchy theme handler passes
-`--class theme`.
+The makepkg gate reviews as `aur`; the Omarchy theme and plugin handlers pass
+`--class theme` and `--class plugin`.
 
 | Decision | Exit | When |
 |---|---|---|
@@ -863,7 +924,11 @@ The yay shim passes `--class aur`; the Omarchy theme handler passes
 | `HIGH RISK` / `REVIEW REQUIRED` | 1 | any finding whose policy is `block` |
 | `INCOMPLETE` | 2 | any non-AI gap, or an invalid AI reply (malformed, missing nonce, tool use, `inconclusive`), in every profile |
 | `AI REVIEW UNAVAILABLE` | 2 | the AI review was unavailable under `ai = required` |
-| `NOT CONFIRMED` | 2 | `confirm = true` and the user did not approve |
+| `NOT CONFIRMED` | 2 | `confirm = true` and the user did not approve; or the makepkg gate asked about prebuilt programs, or about a recipe whose sources it cannot follow, and got no yes (no terminal counts as no) |
+
+Before any of these, a user settings file that does not parse ends `scan`,
+`guard`, `sandbox`, `makepkg-gate` and `sweep` with exit 2 and nothing
+reviewed or run; a broken system file does the same to the pacman gate.
 
 Upgrading users on the default `standard` profile: official Arch/Omarchy
 packages now `WARN` on local-rule findings and proceed without the AI review
@@ -1254,7 +1319,46 @@ reviewer (it offers `claude-code`), runs the guided setup on a first
 install, turns every gate on with `omarchy-guardian protect` after showing
 each step, and tests the reviewer with a malicious and a harmless sample.
 It asks for sudo only for the steps that need it, and skips what is already
-done. To upgrade: `git pull && ./install.sh`.
+done. To upgrade: `git pull && ./install.sh`. With the pacman hook on, the
+installed Guardian reviews the new package like any other local archive
+before pacman installs it.
+
+**Verifying a release.** Guardian's hook runs as root inside pacman, so what
+you build matters. Releases are annotated git tags (`vX.Y.Z`); from the
+release that adds the key file `packaging/allowed_signers` on, they are
+signed with an SSH key listed there. Check out a tag rather than the tip of
+a branch:
+
+```sh
+git fetch --tags && git checkout vX.Y.Z
+./install.sh
+```
+
+The installer says which commit and tag it is about to build. When the
+Guardian already installed carries the release keys
+(`/usr/share/omarchy-guardian/allowed_signers`, root-owned, installed by
+the package), it verifies the tag's signature against them with `git
+verify-tag` before building, and asks before going on when the checkout is
+not a signed release tag or has local changes; `--yes` never answers that
+question. The keys come from the installed package, never from the
+checkout being built, which could bring its own. Two limits: a first
+install has no installed keys to check against, so the installer says the
+signature was not checked (verify the tag yourself, below); and a package
+built from a release that ships no key file installs none. To check a tag
+by hand, against a key file you have reason to trust (the installed
+Guardian's, or one you compared with the key the maintainer publishes):
+
+```sh
+git -c gpg.format=ssh \
+    -c gpg.ssh.allowedSignersFile=/usr/share/omarchy-guardian/allowed_signers \
+    verify-tag vX.Y.Z
+```
+
+The key file in the checkout itself (`packaging/allowed_signers`) proves
+nothing about that checkout.
+
+How to report a weakness, and what counts as one, is in
+[SECURITY.md](SECURITY.md).
 
 By hand, the same steps are:
 
@@ -1268,11 +1372,14 @@ omarchy-guardian protect                      # or: omarchy-guardian tui › Pro
 ```
 
 `omarchy-guardian protect` turns on the pacman hook, the yay AUR gate, the
-theme & plugin gate, the Omarchy menu entry, the bar widget (Waybar and/or
+theme & plugin gate, the theme & plugin commands on the session's PATH, the
+Omarchy menu entry, the bar widget (Waybar and/or
 Omarchy's shell bar) and the daily [system sweep](#system-sweep), showing
 each step and asking first (`--yes` skips the question, but never answers
-whether the sweep's root checks may run); `protect --off` turns the three
-install gates and the system sweep off the same way. It leaves the pacman hook off when the
+whether the sweep's root checks may run); `protect --off` turns the pacman
+hook, the AUR gate, the theme & plugin gate, the commands on PATH and the
+system sweep off the same way (the menu entry and the bar widget stay, and
+a pacman hook installed by hand is left alone). It leaves the pacman hook off when the
 pacman gate could not review with the current settings. `omarchy-guardian
 test` runs the two-sample reviewer test from the terminal.
 
@@ -1293,7 +1400,8 @@ home directory (for example with `mise` or `npm`) is not accepted. Without one, 
 each AUR package yay installs. `enable-system-hook.sh` therefore runs
 `omarchy-guardian pacman-hook --preflight` as the invoking user first and does
 not enable the hook until it passes. The pacman hook reviews as the invoking
-user, with that user's Claude login or OpenCode configuration and credentials.
+user, with that user's Claude login or OpenCode credentials (not that user's
+OpenCode configuration, which the pacman gate leaves out).
 
 ### Pacman hook
 
@@ -1376,11 +1484,18 @@ directory aside), a user other than root, or a group other than root's may
 write. Each is passed over when the installed file is already that way: for
 file capabilities, when it has exactly the ones the package ships (access
 lists are not read back, so those are said every time). A package that is
-not from an official repository and brings a new file into a place whose
-content cannot be reviewed and that every login, program or boot uses (a PAM
+not from an official repository and brings a new file into one of the
+places only the sweep reads, which every login, program or boot uses and
+whose content this gate does not review, gets the same finding: a PAM
 module in `usr/lib/security`, a library in `usr/lib/glibc-hwcaps`,
-`etc/default/limine`, `etc/kernel/cmdline`, `boot/limine.conf`) gets the
-same finding; official packages ship PAM modules, so those are let through.
+`etc/default/limine`, `etc/kernel/cmdline`, `boot/limine.conf`,
+`etc/fstab`, `etc/crypttab`, `etc/hosts`, a certificate authority in
+`etc/ca-certificates/trust-source/anchors` or
+`usr/local/share/ca-certificates`, a Podman quadlet in
+`etc/containers/systemd`, Firefox's `distribution/policies.json`, a
+system-wide Flatpak override, `etc/npmrc`, `etc/pip.conf`, `etc/tmux.conf`
+and `etc/inputrc`. A file that is already there is passed over. Official
+packages ship PAM modules and some of the others, so those are let through.
 
 A package that installs a file under `/run`, `/tmp`, `/dev`, `/proc`, `/sys`,
 `/root` or `/home`, or lists one under `/bin`, `/sbin`, `/lib`, `/lib64`,
@@ -1717,6 +1832,12 @@ gate does, in order:
 What is not reviewed is reported: how many code files were left out, and
 that data files were skipped. Prebuilt programs cannot be reviewed by
 anyone; step 5 makes that your decision instead of a silent pass.
+The upstream code of step 4 is judged by the AI alone: the local rules,
+written for scripts, read the recipe and the files beside it (step 2), not
+what the sources unpack to. With the AI review off for AUR builds (`ai =
+"off"`, or the `local-only` level) the upstream code is therefore not
+checked at all; the sources are still fetched in the sandbox, held against
+what was extracted, and the two questions of steps 4 and 5 are still asked.
 Dependencies a build downloads on its own during `prepare()` or `build()`
 (cargo crates into `~/.cargo`, npm packages into `~/.npm`, Go modules into
 `~/go`, pip, and the like) are **not reviewed**: they are not among the
@@ -1817,24 +1938,42 @@ built-in plugins and is not gated.
 ### Removal
 
 ```sh
-yay --makepkg /usr/bin/makepkg --save -P --stats
+omarchy-guardian protect --off     # the gates, the commands on PATH, the sweep's timers
 sudo pacman -R omarchy-guardian
 ```
 
-Removing the package removes the hook link, and with the package's files
-the hook in `/usr/share/libalpm/hooks/`. A hook at the link's path that was
+`protect --off` removes the hook link, points yay back at `makepkg`, takes
+the Guardian line out of `~/.bashrc` and the theme and plugin entries out of
+the Omarchy menu file, removes `~/.config/uwsm/env.d/90-omarchy-guardian`
+and turns the sweep's two timers off, showing each step first. It leaves the
+menu entry and the bar widget (remove those in the TUI's Integrations tab)
+and a pacman hook that was installed by hand. With the link gone the
+packaged hook lets every transaction through, so this alone turns the
+pacman gate off without removing the package.
+
+Removing the package removes the hook link if it is still there, turns the
+root checks' timer off, and takes the hook in `/usr/share/libalpm/hooks/`
+with the package's files. A hook at the link's path that was
 installed by hand and runs Guardian is moved to
 `/etc/pacman.d/hooks/omarchy-guardian.hook.pacsave`, which pacman ignores.
-To turn the pacman gate off without removing the package, remove the link
-(`omarchy-guardian protect --off` does): the packaged hook then lets every
-transaction through.
-Turn the theme & plugin gate and the theme & plugin commands on PATH off in
-the TUI or with `omarchy-guardian protect --off` before removing the package
-(or delete the marked Guardian line from `~/.bashrc`, the `guardian-theme`
-and `guardian-plugin` lines from the Omarchy menu file, and
-`~/.config/uwsm/env.d/90-omarchy-guardian`) to stop theme and plugin
-interception. The session file left behind after removal only names a
-directory that no longer exists. The `<name>.guardian-bak` copies beside
+A removal is not reviewed by the gate.
+
+If you removed the package without `protect --off`, undo the rest by hand:
+`yay --makepkg /usr/bin/makepkg --save -P --stats`, delete the marked
+Guardian line from `~/.bashrc`, the `guardian-theme` and `guardian-plugin`
+lines from the Omarchy menu file and
+`~/.config/uwsm/env.d/90-omarchy-guardian` (left behind, it only names a
+directory that no longer exists), and `systemctl --user disable
+omarchy-guardian-sweep.timer`. Until then yay fails on the missing shim and
+the menu's theme and plugin items name a handler that is gone; the line in
+`~/.bashrc` loads nothing once its file is gone.
+
+Not removed with the package, since they are yours or root's own records:
+the settings (`/etc/omarchy-guardian/`, `~/.config/omarchy-guardian/`), the
+list of allowed sweep items and the root checks' last results
+(`/var/lib/omarchy-guardian/`), the review memory
+(`~/.local/state/omarchy-guardian/`) and the saved reports
+(`~/.cache/omarchy-guardian/`). The `<name>.guardian-bak` copies beside
 `~/.bashrc`, the menu file and the Waybar config are the files as they were
 before Guardian's first edit; delete them when you no longer want them.
 
@@ -1857,62 +1996,137 @@ not inspect compiled package payloads, cannot prove an installed binary was
 built from the reviewed source, and does not intercept direct downloads or
 `curl | sh`. The sandbox is optional and limited to a 120 s run.
 
+The limits of each part are stated where the part is described. The ones
+that matter most:
+
+- **The reviewer can be talked to.** The reviewed text reaches the model,
+  and can address it. The local rules, the nonce and the model's own report
+  of being addressed catch what they catch; none proves a careful reading.
+- **A program already running as you** can change what you own: the user
+  settings file (a weaker setting is shown by the bar until root accepts
+  it), the review memory, the record of what the sweep already told you
+  about, the session's PATH file, `~/.bashrc`. The pacman gate, the list of
+  allowed sweep items and the accepted weaker settings are root's and are
+  not in its reach. The reviewer's login and, for your own sources,
+  OpenCode's configuration are yours too.
+- **Root is trusted.** The sweep judges files by pacman's own records, which
+  root can rewrite, and the pacman gate reviews as the user who called
+  `sudo`, with that user's reviewer login.
+- **Packages:** only scriptlets, auto-run files and the text files those
+  name are reviewed, not the rest of the payload; a removal is not
+  reviewed; front ends that call libalpm directly are blocked, not
+  reviewed.
+- **AUR builds:** yay's download-and-verify call runs the reviewed recipe
+  as you before the sources are reviewed; dependencies a build downloads
+  itself are not reviewed; prebuilt programs are your decision, not a
+  review; with the AI off, the upstream code is not checked at all.
+- **Themes and plugins:** only installs and updates that reach Guardian's
+  commands are reviewed (see [Omarchy themes](#omarchy-themes) for the
+  callers that do not).
+- **Source leaves the machine** through the AI provider you configured,
+  except under `local-only`, and except the files kept from the AI by name
+  or kind (keys, tokens, SSH and git files in a home, `at` jobs).
+- **Releases:** a first install cannot check the release signature (there
+  is no installed key yet); see [Install](#install-arch-linux--omarchy).
+
 ## Development
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked
 ```
 
 On a non-Linux workstation, check with
 `cargo clippy --target x86_64-unknown-linux-gnu --all-targets -- -D warnings`
 (the crate refuses to build for other systems). Local hooks run the same
-checks: `prek install` (see `.pre-commit-config.yaml`). CI builds and tests on
-an Arch Linux container.
+checks: `prek install` (see `.pre-commit-config.yaml`). CI runs them on an
+Arch Linux container, with the shell scripts' syntax and lint, and the
+offline gate suite below.
 
-The integration gates (pacman hook, yay shim, theme install and update) have an
-end-to-end harness that runs the real scripts in a Bubblewrap sandbox with a
-throwaway `/usr` overlay, mock `makepkg`/`omarchy-theme-set`, a simulated pacman
-parent process and a throwaway `HOME`:
+The unit tests include property tests for the hand-written parsers (JSON,
+the TOML subset, the settings file, makepkg's source listing, pacman's
+mtree records, getcap's output): a small deterministic generator feeds them
+generated and damaged input, the same on every run. They check that no
+input panics, that what is written is read back as it was, that nesting
+stops at its limit, that a key given twice is refused however it is
+spelled, and that an accepted settings file is written back to the same
+settings.
+
+There are four end-to-end suites. All need `cargo build --release` first;
+none installs anything or touches the real home.
+
+| Suite | Calls the AI | Needs | In CI |
+|---|---|---|---|
+| `tests/e2e/gates-offline.sh` | no | `bsdtar`, `pacman-conf`, `setsid`; `bwrap` and `makepkg` for some cases | yes |
+| `tests/e2e/sweep.sh` | no | `bwrap` 0.9 or newer (overlays), `jq` | no: it needs user namespaces, which a hosted container does not give |
+| `tests/e2e/integration-gates.sh` | yes | `bwrap` 0.9 or newer, `bsdtar`, `pacman`, `git`, `flock`, `curl`, a reviewer | no |
+| `tests/ai-eval/run.sh` | yes, several times per case | `bsdtar`, `makepkg`, `bwrap`, `jq`, a reviewer | no |
 
 ```sh
 cargo build --release
+bash tests/e2e/gates-offline.sh
+bash tests/e2e/sweep.sh
 bash tests/e2e/integration-gates.sh
 ```
 
+**`gates-offline.sh`** covers what the gates decide before a review, or
+with no reviewer to ask, with the real binary and scripts: the pacman hook
+script letting transactions through until it is turned on; the refusals of
+the pacman gate that need no review (a removal, a parent that is not
+pacman, a missing or mismatched archive, files in `/usr/sbin`, the
+reviewer's settings shipped by a local package, a reviewer from `PATH` for
+root's pacman); Guardian's own package, put together by its PKGBUILD's
+`package()`, through its own gate; `guard`, `scan`, `sandbox` and the
+makepkg gate stopping on a broken user settings file, on a question nobody
+can answer, and never exiting 0 without starting the command; the makepkg
+gate's own jail with the AI off (listing, fetching, `--holdver`, the later
+call held against what was extracted, the two questions); the commands on
+PATH and the Bash interceptor routing every spelling of a theme or plugin
+install to Guardian and help to Omarchy; and the bar's check that the
+interceptor's line is in effect. `opencode` and `claude` on its `PATH` are
+stand-ins, and the suite fails if either is ever started. A case whose
+requirement is missing is reported as skipped, and one known to fail today
+is run, shown as `KNOWN` with the reason and counted apart.
+
+**`integration-gates.sh`** runs the real hook, shim and theme handler in a
+Bubblewrap sandbox with a throwaway `/usr` overlay, mock `makepkg` and
+`omarchy-theme-set`, a simulated pacman parent process and a throwaway
+`HOME`, and reviews with the real reviewer: clean and malicious install
+scripts, recipes, upstream sources and themes, the review memory (cache,
+upgrade as a diff, the chunk limit) and the settings. It needs a working
+`opencode`, and exits `77` when it cannot run or sits where Guardian would
+refuse it (a directory others can write, or a temporary one), because every
+gate is fail-closed on a failed AI review. To review with the Claude Code
+CLI and your Claude login instead, set
+`GUARDIAN_E2E_MODEL=claude-code/claude-sonnet-5-5` (the pacman checks that need
+the AI are then skipped, because the pacman gate takes its model only from a
+root-owned system config). Its scratch directory must not be under `/tmp`,
+which the sandbox empties; by default it is under `$XDG_RUNTIME_DIR`.
+
 The harnesses set `OMARCHY_GUARDIAN_NO_NOTIFY`, since their blocks are
-expected: with it set no notification is shown and no browser opened. It
-silences nothing else: the report of a block is saved and the bar shows it
-all the same. The pacman hook's `--opencode-from-path` is for these
+expected: with it set no pop-up is shown and no browser opened. It
+silences nothing else: the report of a block is still saved (the harnesses
+point `XDG_CACHE_HOME` at their own directory, so those reports stay out of
+yours and of the bar). The pacman hook's `--opencode-from-path` is for these
 harnesses too, whose pacman is a script of yours; it is refused when the
 pacman process belongs to root.
 
-It needs `bwrap` 0.9 or newer, `bsdtar`, `pacman`, `git`, `flock`, `curl` and a
-working `opencode`; it exits `77` when OpenCode cannot run, because every gate
-is fail-closed on a failed AI review. To review with the Claude Code CLI and
-your Claude login instead, set
-`GUARDIAN_E2E_MODEL=claude-code/claude-sonnet-5-5` (the pacman checks that need
-the AI are then skipped, because the pacman gate takes its model only from a
-root-owned system config).
-
-The system sweep has its own end-to-end suite: persistence the way PANIX and
+**`sweep.sh`** plants persistence the way PANIX and
 real Linux malware set it up (enabled services, cron, udev, modprobe, the
 dynamic linker, PAM, profile scripts, autostart, generators, pacman hooks,
 NetworkManager dispatchers, initramfs hooks, a setuid shell copy, a replaced
 setuid binary, Hyprland Lua, Omarchy hooks, `~/.local/bin` shadowing, a
-launcher override, git and SSH, a program running from the cache) is planted
+launcher override, git and SSH, a program running from the cache, overrides
+of Guardian's own units)
 into throwaway `/etc` and `/usr` overlays and a throwaway `HOME`, and one
 sweep must list every planted item and flag the plainly malicious ones;
-`--diff` and `allow` are checked too. It needs `bwrap` 0.9 or newer and `jq`, and no AI
-(the `system` class's AI review is off inside it):
+`--diff` is checked too, and that `sweep allow`, which needs root, fails
+there and changes nothing. The `system` class's AI review is off inside it.
+A sweep reads every file of `/usr/bin` and the libraries, so the suite takes
+a few minutes.
 
-```sh
-cargo build --release
-bash tests/e2e/sweep.sh
-```
-
-The AI review itself has an evaluation suite: install scriptlets, auto-run
+**`tests/ai-eval/run.sh`** measures the AI review itself: install scriptlets, auto-run
 package files, AUR recipes, themes, plugins and files already on a system
 (found by `sweep`) that must come back clear, and attacks that must be
 caught. An upgrade case holds two versions of one source: the first must be
@@ -1937,4 +2151,55 @@ cases the user config's. A system case is judged by the AI's own medium or
 high findings on its planted files, since the rest of the real system decides
 the sweep's exit code; the host's own files no package vouches for are
 reviewed alongside (and sent to the provider), so results can differ from
-machine to machine.
+machine to machine. A case counts only when the AI was asked: a review that
+came out unavailable, incomplete or limited (the gate found nothing it
+reviews) is shown as `I` and fails the case, clear or block. A clear case
+must not match a local rule either, since for a local package that blocks
+whatever the AI says. The AUR cases run the makepkg gate in a Bubblewrap
+sandbox where a stand-in is `/usr/bin/makepkg`, because the gate's own jail
+shows nothing else of the run's directory; the stand-in lets the listing and
+the extraction through to the real makepkg and never builds.
+
+A change to the text of the request (`src/engine/request.rs`; its
+`PROMPT_VERSION` is 13) is measured before it is released, not waved
+through on one green run: review a small source 20 or more times with a
+fresh state directory each time (`XDG_STATE_HOME=<scratch> omarchy-guardian
+scan --class aur <dir>`, removing the directory between runs so nothing is
+cached) and count the replies that fail. With unchanged request text about
+one real call in 200 misses the nonce; an exit 2 in `integration-gates.sh`
+after a request-text change is a result to count, not a flake to rerun
+away. A new `PROMPT_VERSION` also retires every approved baseline and cached
+verdict, so the first review of each source after the upgrade is a full
+one.
+
+### Cutting a release
+
+For the maintainer. A release is a version bump in `Cargo.toml`, `Cargo.lock`
+and `packaging/arch/PKGBUILD`, merged, and an annotated tag `vX.Y.Z` on that
+commit, signed with an SSH key:
+
+```sh
+git config gpg.format ssh
+git config user.signingkey ~/.ssh/release_key.pub    # the public half
+git tag -s vX.Y.Z -m "Omarchy Guardian X.Y.Z"
+git push origin vX.Y.Z
+```
+
+The keys that may sign a release are listed in `packaging/allowed_signers`,
+one line each, in ssh-keygen's allowed-signers format:
+
+```
+maintainer@example.org namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA…
+```
+
+The first word is the principal (an address or any name), `namespaces="git"`
+limits the key to git signatures, and the rest is the public key as in the
+`.pub` file. The package installs that file as
+`/usr/share/omarchy-guardian/allowed_signers`, and `install.sh` checks the
+next checkout's tag against the installed copy. So a new key takes effect
+one release after it is added: sign the release that adds it with the old
+key, and only later ones with the new. Keep the private
+key off the machines that build and test; check a tag before pushing it
+with `git -c gpg.ssh.allowedSignersFile=packaging/allowed_signers verify-tag
+vX.Y.Z`. While the file does not exist the package installs none and the
+installer says that the signature was not checked.
