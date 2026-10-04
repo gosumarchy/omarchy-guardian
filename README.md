@@ -137,12 +137,20 @@ omarchy-guardian sweep
 - `--identity ID` or `--unit DIR ID` (repeatable) on `scan`, `guard` and
   `sandbox` name what is reviewed for the review memory (see
   [How the review scales](#how-the-review-scales)); `omarchy-guardian forget
-  ID` drops that source's baselines (cached verdicts are kept) and `forget
-  --all` clears everything.
+  ID` drops that source's baselines (cached verdicts are kept) and what the
+  AUR gate remembers of it (the questions you answered, its binaries, what
+  was extracted), and `forget --all` clears everything.
+- `permit ID` lets one blocked install through, for exactly the content
+  that was reviewed (see [After a block](#after-a-block)); `permit` alone
+  lists what can be permitted, `permit --revoke ID` takes a permit back.
+- `log` shows what Guardian decided, from the system journal (see
+  [What Guardian decided](#what-guardian-decided)): `--since TIME`, `-n N`,
+  `--json`.
 
-Exit codes: `0` clear, warned or limited review (a scriptlet-free pacman
-transaction); `1` findings; `2` an incomplete review, an unavailable AI review
-under `ai = required`, a declined confirmation, or a usage error. Once `guard`
+Exit codes: `0` clear, warned, limited review (a scriptlet-free pacman
+transaction) or permitted; `1` findings; `2` an incomplete review, an
+unavailable AI review under `ai = required`, a declined confirmation, or a
+usage error. Once `guard`
 or `sandbox` starts the command, the exit code is the command's own (128 +
 signal if it was killed). Guardian announces on stderr when it starts the
 command, so its own blocks can be told apart from the command's failures.
@@ -660,6 +668,198 @@ through the list with your agent without waiting for the daily sweep.
   itself, unless it now raises an alert; it is judged like any other in
   the full sweep.
 
+## What Guardian decided
+
+Every decision goes into the system journal as one entry, so that after an
+incident you can tell what was installed past which verdict:
+
+```sh
+omarchy-guardian log                    # the newest 50 entries
+omarchy-guardian log --since yesterday -n 500
+omarchy-guardian log --json             # one JSON object a line
+journalctl -t omarchy-guardian -o verbose   # the entries as journald keeps them
+```
+
+```
+2026-10-04 16:14 UTC  CLEAR            pacman    ripgrep-14.1.1-1-x86_64  5f0c2a9e41b7
+2026-10-04 16:14 UTC  PASSED           pacman    the hook's root half: how the review ended  for user 1000  [root]
+2026-10-04 16:20 UTC  INCOMPLETE       aur       aur:demo-bin  9be2f4c01a77
+2026-10-04 16:21 UTC  GRANTED          aur       permit 41c9a07d2e556f10  for user 1000  41c9a07d2e55  [root]
+2026-10-04 16:22 UTC  PERMITTED        aur       aur:demo-bin  permit 41c9a07d2e556f10  overrules INCOMPLETE  9be2f4c01a77
+
+Each line is the time, the decision, the gate, what it was about, and the
+first 12 hex characters of the SHA-256 of what was reviewed (`+N` when
+there are more, as in a transaction of several archives; `--json` and
+`journalctl` have them in full).
+```
+
+What is recorded:
+
+- Every gate decision: each pacman transaction (the archives by name and
+  version, each with the SHA-256 of its bytes), each makepkg call of an AUR
+  build (the recipe, and the upstream sources when that call reviews them;
+  `log` counts repeated lines instead of printing them again), each theme
+  and plugin install, and each `guard`, `sandbox` and `scan`. A gate that
+  refused before it could review (a redirected transaction, a recipe that
+  changed after its review) is recorded as `REFUSED`.
+- The decision's name and exit code, the alert counts by severity, the ids
+  of the local rules that matched, how many reasons left the review
+  incomplete, the AI review in numbers (model and thinking level, calls,
+  how many were clear, suspicious, inconclusive, unavailable or from the
+  cache), the protection level and Guardian's version.
+- How each scheduled sweep ended (the decision and counts, no names), every
+  `sweep allow` and `sweep forget`, every `forget`, `protect` and
+  `protect --off`, every settings file Guardian saves, `config
+  acknowledge`, and every permit given, used or revoked (see
+  [After a block](#after-a-block)).
+
+The fields are `GUARDIAN_EVENT` (`review`, `permit`, `gate`, `settings`,
+`allow`, `forget`, `sweep`), `GUARDIAN_GATE`, `GUARDIAN_CLASS`,
+`GUARDIAN_SUBJECT`, `GUARDIAN_DIGEST`, `GUARDIAN_DECISION`, `GUARDIAN_EXIT`,
+`GUARDIAN_FINDINGS`, `GUARDIAN_AI`, `GUARDIAN_PROFILE`, `GUARDIAN_VERSION`,
+and where they apply `GUARDIAN_PERMIT` (the permit that let a review
+through), `GUARDIAN_OVERRULED` (the decision it overruled),
+`GUARDIAN_OFFERED` (the permit a block offered), `GUARDIAN_FOR_UID`,
+`GUARDIAN_FROM`, `GUARDIAN_CHANGES` and `GUARDIAN_EXPIRES`. No file content,
+no excerpt, no AI summary and no address beyond its host is ever written;
+names from reviewed content (packages, paths) are written as one bounded
+line with control characters shown as codes.
+
+The pacman gate also prints one `sha256` line per archive, so the same
+digests are in `/var/log/pacman.log`. Every archive is now hashed once for
+this, the ones in pacman's cache too: a large system upgrade takes a few
+seconds longer.
+
+What an entry proves, and what it does not:
+
+- No user process can change or remove an entry: the journal files are
+  root's, and journald stamps each entry with the user id of the process
+  that sent it (`_UID`), which a sender cannot set.
+- Guardian's reviews run as you, in the pacman hook too, so their entries
+  carry your user id, and **any program running as you can write an entry
+  that looks the same**. An unmarked line in `log` means "written by your
+  user", not "written by Guardian". A program that ran as you can add false
+  lines; it cannot take a true one away.
+- Entries marked `[root]` were written by Guardian's root halves: the
+  pacman hook script records how each review ended (`PASSED`, `PERMITTED`
+  or `BLOCKED`) after the review process, which runs as you, has exited,
+  and permits and the sweep's allow list are written through sudo. No user
+  process can write those. A pacman install with a `[root]` line and no
+  review line beside it, or the reverse, is worth a look.
+- `log` marks an entry sent by another user (`[! written by user N]`) and
+  one that did not arrive the way Guardian sends them (through
+  `/usr/bin/logger` to journald's own socket). Entries written under the
+  test harnesses are marked `[test]`.
+- Entries written by root are in the system journal, which only root and
+  members of the `systemd-journal`, `adm` or `wheel` group can read; run
+  `sudo omarchy-guardian log` otherwise.
+- The user gates (AUR, themes, plugins, `guard`) are programs you run:
+  something that installs without calling them leaves no entry. Only the
+  pacman hook sits where an install cannot go around it.
+
+How long the trail lasts is journald's to say. By default the journal
+under `/var/log/journal` keeps up to 10% of its filesystem (at most 4 GiB)
+and drops the oldest entries first; a program that writes a great many
+entries pushes older ones out sooner. To keep more, or for a set time:
+
+```ini
+# /etc/systemd/journald.conf.d/guardian.conf
+[Journal]
+Storage=persistent
+SystemMaxUse=8G
+MaxRetentionSec=1year
+```
+
+then `sudo systemctl restart systemd-journald`. Guardian keeps no log file
+of its own.
+
+## After a block
+
+A review can be wrong. When a gate blocks on something you may reasonably
+overrule, its report ends with:
+
+```
+To install this exact content anyway: omarchy-guardian permit 41c9a07d2e556f10
+```
+
+```sh
+omarchy-guardian permit                    # blocked installs waiting, and permits in force
+omarchy-guardian permit 41c9a07d2e556f10   # show what is overruled, ask, store the permit
+omarchy-guardian permit --revoke 41c9a07d2e556f10
+```
+
+`permit ID` shows the decision and the review's reasons again, shows what
+root will store, and asks you to type `permit` on the terminal (there is no
+`--yes`; without a terminal it refuses). Then it asks for the sudo
+password and stores the permit. Run the install again: the gate reviews
+again, finds the permit, prints `PERMITTED` and which decision your permit
+overruled, and goes on. This is meant to replace the coarse ways out
+(`protect --off`, `yay --makepkg makepkg`, `ai = "off"`), which stay on
+long after the one install they were for.
+
+- **Bound to the bytes.** The ID is the first 16 hex characters of a
+  SHA-256 over the gate, the class and the digests of exactly what was
+  reviewed: for pacman every archive of the transaction by its SHA-256;
+  for a theme, a plugin or a `guard` the manifest digest of the tree (file
+  paths, hashes and execute bits; not where the tree lies or when it was
+  written, so a fresh clone of the same commit is the same content); for
+  an AUR build the recipe, and for its upstream sources the recipe plus
+  the downloaded files by hash. Change one byte and it is other content,
+  blocked as before.
+- **Short-lived.** A permit ends after 30 minutes. The gates run as you
+  and cannot delete root's file, so until then the same bytes pass again:
+  yay calls the makepkg gate several times for one build, and all of those
+  calls are covered. The pacman hook's root half removes your pacman
+  permits once a transaction used one.
+- **One gate.** A permit for an AUR recipe or its sources does not cover
+  the `pacman -U` that installs the built package: that is another gate
+  and other bytes, with its own review and, if it blocks, its own permit.
+  The recipe and the upstream sources are reviewed apart, so a build can
+  need a permit for each. A recipe permit given before makepkg downloaded
+  into the build directory still stands once the downloads are there (by
+  the names the recipe writes out); sources that are checkouts rather
+  than downloaded files are named by every file, which the build's own
+  `prepare()` changes, so the build call may ask again.
+- **Root's to write.** Permits are files under
+  `/var/lib/omarchy-guardian/permits`, written only through sudo, holding
+  your user id, the gate, the class, the content's SHA-256 and the expiry.
+  A permit counts only while the file and the directories above it are
+  root's alone, for the user who asked. What a gate blocked is kept in
+  your own state directory until you permit it, and a program running as
+  you could write such a record: it still cannot get a permit without
+  your typed word and password, and the screen shows the SHA-256 root
+  will store. Permit only an ID a blocked gate printed itself.
+- **In the trail.** The grant, each permitted run and a revoke are in
+  `omarchy-guardian log`.
+
+A permit can overrule findings of the local rules and the AI (exit 1), an
+incomplete review (a binary the recipe runs, an oversized or binary
+script, an inconclusive or invalid AI reply), an unavailable AI under
+`ai = required`, and a question nobody answered.
+
+No permit is offered, and none is honoured, for:
+
+- what the pacman gate refuses rather than reviews: a package that ships
+  a protected path, looks like or claims the place of Guardian or its
+  reviewer, an archive that is not a clean package, a transaction it
+  cannot attribute or that is redirected (`--root`, `--dbpath`,
+  `--hookdir`, ...), an archive that changed during the review, an invalid
+  system config;
+- the AUR gate's refusals: a recipe that moves makepkg's directories or
+  lists other sources than it writes out, a source that can be replaced in
+  transit, sources that are not the ones Guardian fetched;
+- any block where part of the content has no digest: a file that could
+  not be read or hashed, a link leading out of the tree, a tree over the
+  size limits, upstream sources with unread parts.
+
+Under the `strict` level permits are off. To allow them there, set in the
+root-owned system file:
+
+```toml
+[permit]
+strict = "allowed"                    # system file only
+```
+
 ## Settings app
 
 `omarchy-guardian tui` edits every setting without touching TOML by hand.
@@ -864,6 +1064,7 @@ The yay shim passes `--class aur`; the Omarchy theme handler passes
 | `INCOMPLETE` | 2 | any non-AI gap, or an invalid AI reply (malformed, missing nonce, tool use, `inconclusive`), in every profile |
 | `AI REVIEW UNAVAILABLE` | 2 | the AI review was unavailable under `ai = required` |
 | `NOT CONFIRMED` | 2 | `confirm = true` and the user did not approve |
+| `PERMITTED` | 0 | one of the blocking decisions above, overruled by your permit for exactly this content (see [After a block](#after-a-block)) |
 
 Upgrading users on the default `standard` profile: official Arch/Omarchy
 packages now `WARN` on local-rule findings and proceed without the AI review
