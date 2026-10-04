@@ -647,6 +647,17 @@ fn glob_match(pattern: &str, name: &str) -> bool {
     pattern[p..].iter().all(|character| *character == '*')
 }
 
+/// The files a shell start-up file reads in (see `sourced`), with the
+/// variables it sets to a path written out (`$OMARCHY_PATH/default/x`).
+pub fn sourced_files(text: &str) -> Vec<String> {
+    let variables = path_variables(text);
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#') && line.len() <= MAX_STARTED_LINE)
+        .flat_map(|line| sourced(&crate::rules::with_variables(line, &variables)))
+        .collect()
+}
+
 /// The files a line of a shell start-up file reads in: `source file` and
 /// `. file`, also behind a test (`[ -r file ] && . file`). The file runs as
 /// part of the one that names it.

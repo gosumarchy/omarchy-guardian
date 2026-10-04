@@ -244,11 +244,23 @@ from the AI), the sweep is **incomplete**.
 comes before `/usr/bin` on `PATH` runs whenever its name is typed. Which
 directories those are is read from the real `PATH`s: the one the sweep
 runs with, the systemd user manager's (`systemctl --user
-show-environment`), and the `PATH` lines of your shell start-up files
-(bash, zsh and fish forms, where they are written out), with the usual ones
+show-environment`), and the `PATH` lines of everything a login, a shell
+or the session reads: your shell start-up files and the files they
+`source`, `/etc/profile` and `/etc/profile.d`, fish's `conf.d`,
+`environment.d` (yours and the system's), `~/.pam_environment`, uwsm's
+`env` files and Hyprland's `env` lines (Omarchy's own included). A line
+counts wherever on it the statement stands (`[ -d ~/.x ] && export
+PATH=~/.x:$PATH`, inside an `if`, after `declare -x` or `typeset -x`,
+among other assignments), in the bash, zsh, fish and csh forms. A line
+that sets `PATH` from a command (`PATH=$(…)`) cannot be followed: the
+file's item says so in a note, since the directories it adds are not
+watched. Where mise is installed or turned on (`mise activate`), its shims
+and the directories of what it installed are on the list too, as they are
+in an interactive shell. The usual directories
 (`~/.local/bin`, `~/.cargo/bin`, `~/bin`, mise's shims, the Go, Bun, Deno,
-pnpm, npm and Nix directories) added where no `PATH` that was read puts
-them behind `/usr/bin`. A bare command name in an auto-run file is looked
+pnpm, npm and Nix directories) are added where no `PATH` that was read puts
+them behind `/usr/bin`; a directory that is ahead of `/usr/bin` in any one
+of these is watched. A bare command name in an auto-run file is looked
 for along that same list, first where a shell would look first, and every
 place it is found in is judged. In each directory on it that someone other
 than root can write, the programs named like a command in `/usr/bin` are

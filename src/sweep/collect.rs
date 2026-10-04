@@ -650,6 +650,7 @@ pub fn item_of(
     if is_closed(scope, &path, tier, found) {
         notes.push(CLOSED.to_string());
     }
+    notes.extend(path_notes(category, &body));
     notes.extend(rewritten.map(str::to_string));
     let alerts = settings_alerts(scope, category, &path, tier, &body);
     Item {
@@ -697,6 +698,26 @@ fn handed_back(
         (body, Vec::new())
     } else {
         (body, runs)
+    }
+}
+
+/// The notes for the lines of a start-up file that set `PATH` to what only
+/// running them would tell (see `path::opaque`).
+fn path_notes(category: Category, body: &Body) -> Vec<String> {
+    let read = matches!(
+        category,
+        Category::Shell | Category::Environment | Category::Hyprland
+    );
+    match body {
+        Body::Text(text) if read => path::opaque(text)
+            .into_iter()
+            .map(|line| {
+                format!(
+                    "line {line} sets PATH in a way Guardian cannot follow: the directories it adds are not watched"
+                )
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 

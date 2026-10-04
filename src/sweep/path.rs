@@ -71,20 +71,48 @@ const MANAGED: &[&str] = &[
     ".cargo/bin/",
 ];
 
-/// The start-up files whose `PATH` lines are read, relative to the home
-/// and to the root.
+/// The files whose `PATH` lines are read, relative to the home and to the
+/// root: what a login, a shell of any kind, the user manager, the session
+/// and Hyprland read. A `*` stands for any run of characters in a name.
 const HOME_FILES: &[&str] = &[
     ".profile",
     ".bash_profile",
+    ".bash_login",
     ".bashrc",
     ".zshenv",
     ".zprofile",
     ".zshrc",
+    ".zlogin",
     ".config/fish/config.fish",
+    ".config/fish/conf.d/*.fish",
     ".config/fish/fish_variables",
-    ".config/uwsm/env",
+    ".config/environment.d/*.conf",
+    ".pam_environment",
+    ".config/uwsm/env*",
+    ".config/uwsm/env.d/*",
+    ".config/hypr/*.conf",
+    ".config/hypr/*.lua",
 ];
-const SYSTEM_FILES: &[&str] = &["etc/profile", "etc/environment", "etc/zsh/zshenv"];
+const SYSTEM_FILES: &[&str] = &[
+    "etc/profile",
+    "etc/profile.d/*",
+    "etc/bash.bashrc",
+    "etc/environment",
+    "etc/environment.d/*.conf",
+    "usr/lib/environment.d/*.conf",
+    "etc/zsh/zshenv",
+    "etc/zsh/zprofile",
+    "etc/zsh/zshrc",
+    "etc/fish/config.fish",
+    "etc/fish/conf.d/*.fish",
+    "usr/share/omarchy/default/hypr/*.lua",
+    "usr/share/omarchy/default/hypr/*.conf",
+];
+
+/// The most files read for their `PATH` lines, those a start-up file
+/// reads in (`source`) included, and how far such a chain is followed.
+const MAX_FILES: usize = 256;
+const MAX_SOURCED_DEPTH: usize = 3;
 
 /// The directories of the system's own commands: what comes before the
 /// first of them on a `PATH` is looked in first.
@@ -139,78 +167,306 @@ fn entries(home: &str, value: &str) -> Vec<Entry> {
     found
 }
 
-/// The values a start-up file gives `PATH`, each as a `:`-separated list
-/// with `$PATH` standing for what was there before: `PATH=…`, `export
-/// PATH=…`, zsh's `path=(…)` and `path+=(…)`, fish's `set PATH …`,
-/// `fish_add_path …` and its saved `fish_user_paths`.
-pub fn assignments(text: &str) -> Vec<(usize, String)> {
-    let mut found = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.starts_with('#') || line.len() > MAX_PATH_BYTES {
-            continue;
+/// What one statement does to `PATH`.
+#[derive(Debug, PartialEq, Eq)]
+enum Set {
+    /// A `:`-separated list, `$PATH` standing for what was there before.
+    Value(String),
+    /// Something only running it would tell (`PATH=$(…)`).
+    Opaque,
+}
+
+/// The words of the statements on a line of shell: split at `;`, `&&`,
+/// `||`, `|` and `&` outside quotes, and after `then`, `do`, `else`, `{`
+/// and the pattern of a `case` branch (`*)`). Quotes are taken off; a
+/// substitution (`$(…)`, backquotes) and a zsh list (`(…)`) stay whole,
+/// spaces and all. A `#` that starts a word ends the line.
+fn statements(line: &str) -> Vec<Vec<String>> {
+    let mut found: Vec<Vec<String>> = vec![Vec::new()];
+    let mut word = String::new();
+    let mut quote: Option<char> = None;
+    let mut depth = 0_usize;
+    let mut started = false;
+    let mut characters = line.chars().peekable();
+    let end = |found: &mut Vec<Vec<String>>, word: &mut String, started: &mut bool| {
+        if *started && let Some(last) = found.last_mut() {
+            last.push(std::mem::take(word));
         }
-        let words: Vec<&str> = line.split_whitespace().collect();
-        let value = if let Some(saved) = line
-            .strip_prefix("SETUVAR ")
-            .and_then(|rest| rest.split_once("fish_user_paths:"))
-            .map(|(_, saved)| saved)
-        {
-            // fish keeps the list with `\x1e` between its entries.
-            Some(format!("{}:$PATH", saved.replace("\\x1e", ":")))
-        } else if words.first() == Some(&"fish_add_path") {
-            let append = words.iter().any(|word| matches!(*word, "-a" | "--append"));
-            let directories: Vec<&str> = words[1..]
+        *started = false;
+        let keyword = found
+            .last()
+            .and_then(|words| words.last())
+            .is_some_and(|last| {
+                matches!(
+                    last.as_str(),
+                    "then"
+                        | "do"
+                        | "else"
+                        | "elif"
+                        | "if"
+                        | "while"
+                        | "{"
+                        | "!"
+                        | "and"
+                        | "or"
+                        | "not"
+                        | "begin"
+                ) || (last.ends_with(')') && !last.contains(['(', '=']))
+            });
+        if keyword && let Some(last) = found.last_mut() {
+            last.pop();
+            if !last.is_empty() {
+                found.push(Vec::new());
+            }
+        }
+    };
+    while let Some(character) = characters.next() {
+        match (quote, character) {
+            (Some(open), _) if character == open && open != '`' => quote = None,
+            (Some('`'), '`') => {
+                quote = None;
+                word.push(character);
+            }
+            (Some(_), _) => word.push(character),
+            (None, '(') => {
+                depth += 1;
+                started = true;
+                word.push(character);
+            }
+            (None, ')') if depth > 0 => {
+                depth -= 1;
+                word.push(character);
+            }
+            (None, _) if depth > 0 => word.push(character),
+            (None, '"' | '\'') => {
+                quote = Some(character);
+                started = true;
+            }
+            (None, '`') => {
+                quote = Some(character);
+                started = true;
+                word.push(character);
+            }
+            (None, '#') if !started => break,
+            (None, ';' | '|' | '&') => {
+                end(&mut found, &mut word, &mut started);
+                while characters
+                    .next_if(|next| matches!(next, ';' | '|' | '&'))
+                    .is_some()
+                {}
+                if found.last().is_some_and(|last| !last.is_empty()) {
+                    found.push(Vec::new());
+                }
+            }
+            (None, _) if character.is_whitespace() => end(&mut found, &mut word, &mut started),
+            (None, _) => {
+                started = true;
+                word.push(character);
+            }
+        }
+    }
+    end(&mut found, &mut word, &mut started);
+    found.retain(|words| !words.is_empty());
+    found
+}
+
+/// A `PATH` value with the ways of writing "what was there before"
+/// reduced to `$PATH`.
+fn plain_value(value: &str) -> String {
+    value
+        .replace("${PATH:+$PATH:}", "$PATH:")
+        .replace("${PATH:+:$PATH}", ":$PATH")
+        .replace("${PATH:+:${PATH}}", ":$PATH")
+        .replace("${PATH:+${PATH}:}", "$PATH:")
+        .replace("@{PATH}", "$PATH")
+        .replace("@{HOME}", "$HOME")
+}
+
+/// What an assignment word (`PATH=x`, `PATH+=x`, `path=(a b)`) does to
+/// `PATH`, if it is one to it.
+fn assigned(word: &str) -> Option<Set> {
+    let (name, value) = word.split_once('=')?;
+    let (name, append) = match name.strip_suffix('+') {
+        Some(name) => (name, true),
+        None => (name, false),
+    };
+    if !matches!(name, "PATH" | "path") {
+        return None;
+    }
+    let list = value
+        .strip_prefix('(')
+        .map(|list| list.trim_end_matches(')'));
+    if list.unwrap_or(value).contains(['(', '`']) {
+        return Some(Set::Opaque);
+    }
+    Some(Set::Value(match (list, append) {
+        (Some(list), false) => list.split_whitespace().collect::<Vec<_>>().join(":"),
+        (Some(list), true) => format!(
+            "$PATH:{}",
+            list.split_whitespace().collect::<Vec<_>>().join(":")
+        ),
+        // bash appends the text as it is (`PATH+=:/x`).
+        (None, true) => format!("$PATH{}", plain_value(value)),
+        (None, false) if name == "PATH" => plain_value(value),
+        (None, false) => return None,
+    }))
+}
+
+/// What the statement `words` does to `PATH`: an assignment on its own or
+/// after `export`, `declare`, `typeset`, `local` or `readonly` (among
+/// others: `export A=1 PATH=…`), fish's `set PATH …` and `fish_add_path`,
+/// csh's `setenv PATH …`, and a line of `~/.pam_environment`. An
+/// assignment before a command (`PATH=x make`) is for that command alone.
+fn path_set(words: &[String]) -> Option<Set> {
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let (first, rest) = words.split_first()?;
+    let values = |values: &[&str]| {
+        if values.iter().any(|value| value.contains(['(', '`'])) {
+            Set::Opaque
+        } else {
+            Set::Value(plain_value(&values.join(":")))
+        }
+    };
+    match *first {
+        "export" | "declare" | "typeset" | "local" | "readonly" => rest
+            .iter()
+            .filter(|word| !word.starts_with(['-', '+']))
+            .find_map(|word| assigned(word)),
+        "set" => {
+            let at = rest.iter().position(|word| !word.starts_with('-'))?;
+            matches!(rest[at], "PATH" | "fish_user_paths").then(|| values(&rest[at + 1..]))
+        }
+        "setenv" if rest.first() == Some(&"PATH") => Some(values(&rest[1..])),
+        "fish_add_path" => {
+            let append = rest.iter().any(|word| matches!(*word, "-a" | "--append"));
+            let directories: Vec<&str> = rest
                 .iter()
                 .filter(|word| !word.starts_with('-'))
                 .copied()
                 .collect();
-            Some(if append {
-                format!("$PATH:{}", directories.join(":"))
-            } else {
-                format!("{}:$PATH", directories.join(":"))
+            let listed = directories.join(":");
+            Some(match values(&directories) {
+                Set::Opaque => Set::Opaque,
+                Set::Value(_) if append => Set::Value(format!("$PATH:{listed}")),
+                Set::Value(_) => Set::Value(format!("{listed}:$PATH")),
             })
-        } else if words.first() == Some(&"set")
-            && let Some(at) = words.iter().skip(1).position(|word| !word.starts_with('-'))
-            && matches!(words[at + 1], "PATH" | "fish_user_paths")
+        }
+        "PATH" => rest
+            .iter()
+            .find_map(|word| {
+                word.strip_prefix("DEFAULT=")
+                    .or_else(|| word.strip_prefix("OVERRIDE="))
+            })
+            .map(|value| values(&[value])),
+        _ if words.iter().all(|word| is_assignment(word)) => {
+            words.iter().find_map(|word| assigned(word))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `word` assigns to a variable (`NAME=value`, `NAME+=value`).
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        let name = name.strip_suffix('+').unwrap_or(name);
+        name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// What a line of Hyprland's configuration does to `PATH`: `env =
+/// PATH,value`, or in Lua `hl.env("PATH", "value")`, where a value that is
+/// not written out is known only to Hyprland.
+fn hyprland(line: &str) -> Option<Set> {
+    if let Some(rest) = line.strip_prefix("env")
+        && let Some(setting) = rest.trim_start().strip_prefix('=')
+    {
+        let (name, value) = setting.split_once(',')?;
+        return (name.trim() == "PATH").then(|| Set::Value(plain_value(value.trim())));
+    }
+    let (_, call) = line.split_once(".env(")?;
+    let mut arguments = call.splitn(2, ',');
+    let name = arguments.next()?.trim().trim_matches(['"', '\'']);
+    if name != "PATH" {
+        return None;
+    }
+    let value = arguments.next()?.trim().trim_end_matches(')').trim();
+    let literal = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .filter(|literal| !literal.contains('"'));
+    Some(literal.map_or(Set::Opaque, |literal| Set::Value(plain_value(literal))))
+}
+
+/// What each line of `text` does to `PATH`, with its number.
+fn scan(text: &str) -> Vec<(usize, Set)> {
+    let mut found = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with("--") || line.len() > MAX_PATH_BYTES {
+            continue;
+        }
+        let number = index + 1;
+        if let Some(saved) = line
+            .strip_prefix("SETUVAR ")
+            .and_then(|rest| rest.split_once("fish_user_paths:"))
+            .map(|(_, saved)| saved)
         {
-            Some(words[at + 2..].join(":"))
+            // fish keeps the list with `\\x1e` between its entries.
+            let value = format!("{}:$PATH", saved.replace("\\x1e", ":"));
+            found.push((number, Set::Value(value)));
+        } else if let Some(set) = hyprland(line) {
+            found.push((number, set));
         } else {
-            let line = line.strip_prefix("export ").unwrap_or(line);
-            if let Some(value) = line.strip_prefix("PATH=") {
-                Some(
-                    value
-                        .split([';', ' '])
-                        .next()
-                        .unwrap_or_default()
-                        .trim_matches(['"', '\''])
-                        .to_string(),
-                )
-            } else if let Some(list) = line
-                .strip_prefix("path=(")
-                .or_else(|| line.strip_prefix("path+=("))
-            {
-                let listed = list
-                    .split(')')
-                    .next()
-                    .unwrap_or_default()
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(":");
-                Some(if line.starts_with("path+=") {
-                    format!("$PATH:{listed}")
-                } else {
-                    listed
-                })
-            } else {
-                None
-            }
-        };
-        if let Some(value) = value {
-            found.push((index + 1, value));
+            found.extend(
+                statements(line)
+                    .iter()
+                    .filter_map(|words| path_set(words))
+                    .map(|set| (number, set)),
+            );
         }
     }
     found
+}
+
+/// The values a start-up file gives `PATH`, each as a `:`-separated list
+/// with `$PATH` standing for what was there before, wherever on a line the
+/// statement stands (`[ -d ~/.x ] && export PATH=~/.x:$PATH`): `PATH=…`
+/// alone or after `export`, `declare -x`, `typeset -x` or `local`, zsh's
+/// `path=(…)` and `path+=(…)`, fish's `set PATH …`, `fish_add_path …` and
+/// its saved `fish_user_paths`, csh's `setenv`, an environment file's line
+/// and Hyprland's `env`.
+pub fn assignments(text: &str) -> Vec<(usize, String)> {
+    scan(text)
+        .into_iter()
+        .filter_map(|(line, set)| match set {
+            Set::Value(value) => Some((line, value)),
+            Set::Opaque => None,
+        })
+        .collect()
+}
+
+/// The lines of `text` that set `PATH` to something only running them
+/// would tell (`PATH=$(…)`): the directories they add are not known, so
+/// what is in them is not watched.
+pub fn opaque(text: &str) -> Vec<usize> {
+    let mut lines: Vec<usize> = scan(text)
+        .into_iter()
+        .filter(|(_, set)| *set == Set::Opaque)
+        .map(|(line, _)| line)
+        .collect();
+    lines.dedup();
+    lines
+}
+
+/// Whether a start-up file's text turns mise on for its shell (`eval
+/// "$(mise activate bash)"`, `mise activate fish | source`): mise then puts
+/// the directories of what it installed ahead of the system's.
+fn activates_mise(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim();
+        !line.starts_with('#') && line.contains("mise activate")
+    })
 }
 
 /// Directories nothing lasting belongs in, as they appear in a `PATH`.
@@ -275,6 +531,93 @@ fn others_can_write(root: &Path, directory: &str) -> bool {
     })
 }
 
+/// The text of every file whose `PATH` lines count (`HOME_FILES`,
+/// `SYSTEM_FILES`), and of the files those read in with `source` or `.`,
+/// which run as part of them.
+fn start_up_texts(scope: &Scope<'_>, home: &str) -> Vec<String> {
+    let patterns = scope
+        .home
+        .into_iter()
+        .flat_map(|home| HOME_FILES.iter().map(move |file| format!("{home}/{file}")))
+        .chain(SYSTEM_FILES.iter().map(|file| (*file).to_string()));
+    let mut pending: Vec<(String, Option<String>, usize)> = Vec::new();
+    for pattern in patterns {
+        if pattern.contains('*') {
+            let matched = read::matching(scope.root, &pattern).files;
+            pending.extend(matched.into_iter().map(|file| (file, None, 0)));
+        } else {
+            pending.push((pattern, None, 0));
+        }
+    }
+    pending.reverse();
+    let mut seen: Vec<String> = Vec::new();
+    let mut texts = Vec::new();
+    while let Some((file, by, depth)) = pending.pop() {
+        if seen.contains(&file) || seen.len() >= MAX_FILES {
+            continue;
+        }
+        seen.push(file.clone());
+        // A file another one reads in is named by that file: root looks
+        // at it as it looks at anything a file leads to.
+        let Found::File { head, .. } = collect::look(scope, Category::Shell, &file, by.as_deref())
+        else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&head).into_owned();
+        if depth < MAX_SOURCED_DEPTH {
+            for sourced in commands::sourced_files(&text) {
+                let expanded = commands::expand(home, &sourced);
+                if let Some(path) = expanded.strip_prefix('/')
+                    && !path.contains(['$', '`', '*'])
+                {
+                    pending.push((path.to_string(), Some(file.clone()), depth + 1));
+                }
+            }
+        }
+        texts.push(text);
+    }
+    texts
+}
+
+/// Whether mise is installed where it usually is.
+fn is_installed(scope: &Scope<'_>, home: &str) -> bool {
+    MISE.iter().any(|mise| {
+        let path = commands::expand(home, mise);
+        fs::symlink_metadata(scope.root.join(path.trim_start_matches('/'))).is_ok()
+    })
+}
+
+/// The directories mise puts ahead of the system's own in a shell it is
+/// turned on for: its shims, and the `bin` of every version of every tool
+/// it installed (`~/.local/share/mise/installs/node/22.1.0/bin`, or the
+/// version's own directory where there is no `bin`).
+fn mise_directories(scope: &Scope<'_>, home: &str) -> Vec<Entry> {
+    let mut found = vec![(format!("{home}/.local/share/mise/shims"), true)];
+    if scope.home.is_none() {
+        return found;
+    }
+    let installs = format!("{home}/.local/share/mise/installs");
+    for tool in names(scope, &installs).unwrap_or_default() {
+        let versions = format!("{installs}/{tool}");
+        for version in names(scope, &versions).unwrap_or_default() {
+            // A version is a directory or a link to one (`latest`); a
+            // tool that is one program has it there, without a `bin`.
+            let version = format!("{versions}/{version}");
+            let bin = format!("{version}/bin");
+            let directory = if scope.root.join(&bin).is_dir() {
+                bin
+            } else {
+                version
+            };
+            if scope.root.join(&directory).is_dir() && found.len() < MAX_DIRECTORIES {
+                found.push((directory, true));
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
 /// Where command names are looked up on `scope`'s system: the real
 /// `PATH`s when the system swept is the running one, the ones its start-up
 /// files set, and the usual directories.
@@ -296,17 +639,15 @@ pub fn search(scope: &Scope<'_>) -> Search {
             sources.push(entries(home, &path));
         }
     }
-    let files = scope
-        .home
-        .into_iter()
-        .flat_map(|home| HOME_FILES.iter().map(move |file| format!("{home}/{file}")))
-        .chain(SYSTEM_FILES.iter().map(|file| (*file).to_string()));
-    for file in files {
-        if let Found::File { head, .. } = collect::look(scope, Category::Shell, &file, None) {
-            for (_, value) in assignments(&String::from_utf8_lossy(&head)) {
-                sources.push(entries(home, &value));
-            }
+    let mut mise = false;
+    for text in start_up_texts(scope, home) {
+        mise = mise || activates_mise(&text);
+        for (_, value) in assignments(&text) {
+            sources.push(entries(home, &value));
         }
+    }
+    if mise || is_installed(scope, home) {
+        sources.push(mise_directories(scope, home));
     }
     let mut ahead: Vec<String> = Vec::new();
     let mut behind: Vec<String> = Vec::new();
@@ -495,7 +836,9 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
 
-    use super::{Search, assignments, entries, mark, search, shadowing_programs, unsafe_entries};
+    use super::{
+        Search, assignments, entries, mark, opaque, search, shadowing_programs, unsafe_entries,
+    };
     use crate::autorun::Category;
     use crate::rules::RuleId;
     use crate::sweep::collect::{self, Origin, Scope};
@@ -559,6 +902,206 @@ mod tests {
         );
         assert_eq!(odd.len(), 3, "{odd:?}");
         assert!(odd[0].1.contains("typed in") && odd[2].1.contains(".cache/x/bin"));
+    }
+
+    #[test]
+    fn a_path_is_found_wherever_on_a_line_it_is_set() {
+        let values = |text: &str| -> Vec<String> {
+            assignments(text)
+                .into_iter()
+                .map(|(_, value)| value)
+                .collect()
+        };
+        for (line, expected) in [
+            ("[ -d ~/.x ] && export PATH=~/.x:$PATH", "~/.x:$PATH"),
+            (
+                "if [ -d /opt/a ]; then PATH=/opt/a:$PATH; fi",
+                "/opt/a:$PATH",
+            ),
+            ("declare -x PATH=\"/opt/b:$PATH\"", "/opt/b:$PATH"),
+            ("typeset -gx PATH=/opt/c:$PATH", "/opt/c:$PATH"),
+            ("export A=1 PATH=/opt/d:$PATH B=2", "/opt/d:$PATH"),
+            ("A=1 PATH=/opt/e:$PATH", "/opt/e:$PATH"),
+            ("test -d x || { PATH=/opt/f:$PATH; }", "/opt/f:$PATH"),
+            ("  *) PATH=\"/opt/g${PATH:+:$PATH}\" ;;", "/opt/g:$PATH"),
+            ("PATH=\"${PATH:+$PATH:}/opt/h\"", "$PATH:/opt/h"),
+            ("PATH+=:/opt/i", "$PATH:/opt/i"),
+            (
+                "export PATH=\"$HOME/my tools:$PATH\"",
+                "$HOME/my tools:$PATH",
+            ),
+            ("[[ -d ~/z ]] && path=(~/z $path)", "~/z:$path"),
+            ("true; path+=(/opt/j /opt/k)", "$PATH:/opt/j:/opt/k"),
+            ("test -d ~/f; and set -gx PATH ~/f $PATH", "~/f:$PATH"),
+            ("status is-login && fish_add_path ~/g", "~/g:$PATH"),
+            ("setenv PATH ${PATH}:/opt/l", "${PATH}:/opt/l"),
+            (
+                "PATH DEFAULT=@{HOME}/bin:${PATH} OVERRIDE=",
+                "$HOME/bin:${PATH}",
+            ),
+            ("env = PATH,$HOME/h:$PATH", "$HOME/h:$PATH"),
+            ("hl.env(\"PATH\", \"/opt/m:/usr/bin\")", "/opt/m:/usr/bin"),
+        ] {
+            assert_eq!(values(line), [expected], "{line}");
+            assert!(opaque(line).is_empty(), "{line}");
+        }
+        // Not a lasting change of PATH, or not one at all.
+        for line in [
+            "PATH=/opt/x:$PATH make install",
+            "echo PATH=/opt/x",
+            "export MANPATH=/opt/x",
+            "# export PATH=/opt/x:$PATH",
+            "true # PATH=/opt/x",
+            "alias p='echo $PATH'",
+            "hl.env(\"OMARCHY_PATH\", paths.omarchy_path)",
+            "env = XCURSOR_SIZE,24",
+        ] {
+            assert!(values(line).is_empty(), "{line}: {:?}", values(line));
+            assert!(opaque(line).is_empty(), "{line}");
+        }
+        // What only running it would tell is said, not passed over.
+        for line in [
+            "export PATH=$(getconf PATH):$PATH",
+            "PATH=\"$(/usr/bin/tool path)\"",
+            "PATH=`tool path`:$PATH",
+            "set -gx PATH (tool path) $PATH",
+            "hl.env(\"PATH\", table.concat(kept, \":\"))",
+        ] {
+            assert!(values(line).is_empty(), "{line}: {:?}", values(line));
+            assert_eq!(opaque(line), [1], "{line}");
+        }
+        assert_eq!(
+            unsafe_entries("[ -d /tmp/b ] && export PATH=/tmp/b:$PATH\n").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn every_file_a_shell_or_a_session_reads_counts_for_the_path() {
+        let dir = TempDir::new("sweep-path-sources");
+        let root = dir.path();
+        if std::os::unix::fs::MetadataExt::uid(&fs::metadata(root).unwrap()) == 0 {
+            return;
+        }
+        let write = |path: &str, text: &str| {
+            fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            fs::write(root.join(path), text).unwrap();
+        };
+        write(
+            "home/u/.bashrc",
+            "[ -r ~/.config/shell/extra ] && . ~/.config/shell/extra\nX=$HOME/opt\nsource $X/env.sh\neval \"$(mise activate bash)\"\n",
+        );
+        write(
+            "home/u/.config/shell/extra",
+            "export PATH=\"$HOME/a/bin:$PATH\"\n",
+        );
+        write(
+            "home/u/opt/env.sh",
+            "if true; then PATH=$HOME/b/bin:$PATH; fi\n",
+        );
+        write(
+            "home/u/.config/fish/conf.d/x.fish",
+            "fish_add_path ~/c/bin\n",
+        );
+        write(
+            "home/u/.config/environment.d/10-x.conf",
+            "PATH=$HOME/d/bin:$PATH\n",
+        );
+        write(
+            "home/u/.pam_environment",
+            "PATH DEFAULT=@{HOME}/e/bin:${PATH}\n",
+        );
+        write(
+            "home/u/.config/uwsm/env-hyprland",
+            "export PATH=$HOME/f/bin:$PATH\n",
+        );
+        write(
+            "home/u/.config/hypr/envs.conf",
+            "env = PATH,$HOME/g/bin:$PATH\n",
+        );
+        write("etc/profile.d/x.sh", "PATH=/opt/h/bin:$PATH\n");
+        write("etc/environment.d/x.conf", "PATH=/opt/i/bin:${PATH}\n");
+        write(
+            "usr/share/omarchy/default/hypr/envs.lua",
+            "hl.env(\"PATH\", \"/opt/j/bin:/usr/bin\")\n",
+        );
+        let installs = "home/u/.local/share/mise/installs";
+        write(&format!("{installs}/node/22.1.0/bin/node"), "node");
+        write(&format!("{installs}/node/22.1.0/bin/sudo"), "odd");
+        write(&format!("{installs}/tool/latest/tool"), "tool");
+        write("usr/bin/node", "system");
+        write("usr/bin/sudo", "system");
+        for directory in ["a", "b", "c", "d", "e", "f", "g"] {
+            fs::create_dir_all(root.join(format!("home/u/{directory}/bin"))).unwrap();
+        }
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let scope = Scope {
+            root,
+            home: Some("home/u"),
+            index: &index,
+            origin: Origin::System,
+        };
+        let found = search(&scope);
+        for directory in ["a", "b", "c", "d", "e", "f", "g"] {
+            let directory = format!("home/u/{directory}/bin");
+            assert!(found.shadowing.contains(&directory), "{directory}");
+        }
+        let at = |directory: &str| {
+            found
+                .directories
+                .iter()
+                .position(|known| known == directory)
+        };
+        let system = at("usr/bin").unwrap();
+        for directory in ["opt/h/bin", "opt/i/bin", "opt/j/bin"] {
+            assert!(at(directory).is_some_and(|at| at < system), "{directory}");
+        }
+        // What mise installed is ahead in a shell it is turned on for.
+        let node = format!("{installs}/node/22.1.0/bin");
+        assert!(found.shadowing.contains(&node), "{:?}", found.shadowing);
+        let (paths, _) = shadowing_programs(&scope, &found);
+        assert!(paths.contains(&format!("{node}/node")));
+        assert!(found.shadowing.contains(&format!("{installs}/tool/latest")));
+        let mut items: Vec<_> = paths
+            .into_iter()
+            .map(|path| collect::item(&scope, Category::LocalBin, path, None))
+            .collect();
+        mark(&scope, &found, &mut items);
+        let alerts = |name: &str| {
+            items
+                .iter()
+                .find(|item| item.path == format!("{node}/{name}"))
+                .map(|item| item.alerts.len())
+        };
+        assert_eq!(alerts("node"), Some(0));
+        assert_eq!(alerts("sudo"), Some(1));
+    }
+
+    #[test]
+    fn a_start_up_file_that_sets_the_path_from_a_command_says_so() {
+        let dir = TempDir::new("sweep-path-opaque");
+        let root = dir.path();
+        fs::create_dir_all(root.join("home/u")).unwrap();
+        fs::write(
+            root.join("home/u/.zshrc"),
+            "export PATH=$(tool path):$PATH\n",
+        )
+        .unwrap();
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let scope = Scope {
+            root,
+            home: Some("home/u"),
+            index: &index,
+            origin: Origin::System,
+        };
+        let item = collect::item(&scope, Category::Shell, "home/u/.zshrc".into(), None);
+        assert!(
+            item.notes
+                .iter()
+                .any(|note| note.starts_with("line 1 sets PATH in a way Guardian cannot follow")),
+            "{:?}",
+            item.notes
+        );
     }
 
     #[test]
