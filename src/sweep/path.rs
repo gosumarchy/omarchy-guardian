@@ -587,10 +587,30 @@ fn is_installed(scope: &Scope<'_>, home: &str) -> bool {
     })
 }
 
+/// The versions of a tool under `directory` that a shell gets. mise links
+/// the ones in use under shorter names (`latest`, `22` for `22.1.0`):
+/// where there are such links, the versions they lead to; without any,
+/// every version, since any may be the one in use. An older version kept
+/// beside the one in use is on no `PATH`.
+fn versions_in_use(scope: &Scope<'_>, directory: &str) -> Vec<String> {
+    let versions = names(scope, directory).unwrap_or_default();
+    let mut linked: Vec<String> = versions
+        .iter()
+        .filter_map(|version| {
+            let target = fs::read_link(scope.root.join(directory).join(version)).ok()?;
+            let name = target.file_name()?.to_str()?.to_string();
+            versions.contains(&name).then_some(name)
+        })
+        .collect();
+    linked.sort();
+    linked.dedup();
+    if linked.is_empty() { versions } else { linked }
+}
+
 /// The directories mise puts ahead of the system's own in a shell it is
-/// turned on for: its shims, and the `bin` of every version of every tool
-/// it installed (`~/.local/share/mise/installs/node/22.1.0/bin`, or the
-/// version's own directory where there is no `bin`).
+/// turned on for: its shims, and the `bin` of the versions in use of every
+/// tool it installed (`~/.local/share/mise/installs/node/22.1.0/bin`, or
+/// the version's own directory where there is no `bin`).
 fn mise_directories(scope: &Scope<'_>, home: &str) -> Vec<Entry> {
     let mut found = vec![(format!("{home}/.local/share/mise/shims"), true)];
     if scope.home.is_none() {
@@ -599,9 +619,9 @@ fn mise_directories(scope: &Scope<'_>, home: &str) -> Vec<Entry> {
     let installs = format!("{home}/.local/share/mise/installs");
     for tool in names(scope, &installs).unwrap_or_default() {
         let versions = format!("{installs}/{tool}");
-        for version in names(scope, &versions).unwrap_or_default() {
-            // A version is a directory or a link to one (`latest`); a
-            // tool that is one program has it there, without a `bin`.
+        for version in versions_in_use(scope, &versions) {
+            // A tool that is one program has it in the version's
+            // directory, without a `bin`.
             let version = format!("{versions}/{version}");
             let bin = format!("{version}/bin");
             let directory = if scope.root.join(&bin).is_dir() {
@@ -1075,6 +1095,44 @@ mod tests {
         };
         assert_eq!(alerts("node"), Some(0));
         assert_eq!(alerts("sudo"), Some(1));
+    }
+
+    #[test]
+    fn only_the_versions_mise_has_in_use_are_ahead() {
+        let dir = TempDir::new("sweep-path-mise");
+        let root = dir.path();
+        let installs = "home/u/.local/share/mise/installs";
+        for version in ["2.1.1", "2.1.2"] {
+            let directory = root.join(format!("{installs}/claude/{version}"));
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("claude"), version).unwrap();
+        }
+        fs::create_dir_all(root.join(format!("{installs}/node/22.1.0/bin"))).unwrap();
+        // mise links the version in use under shorter names; the older
+        // one kept beside it is on no `PATH`.
+        for alias in ["latest", "2"] {
+            symlink("./2.1.2", root.join(format!("{installs}/claude/{alias}"))).unwrap();
+        }
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let scope = Scope {
+            root,
+            home: Some("home/u"),
+            index: &index,
+            origin: Origin::System,
+        };
+        let directories: Vec<String> = super::mise_directories(&scope, "home/u")
+            .into_iter()
+            .map(|(directory, _)| directory)
+            .collect();
+        assert_eq!(
+            directories,
+            [
+                format!("{installs}/claude/2.1.2"),
+                // Without links, any version may be the one in use.
+                format!("{installs}/node/22.1.0/bin"),
+                "home/u/.local/share/mise/shims".to_string(),
+            ]
+        );
     }
 
     #[test]
