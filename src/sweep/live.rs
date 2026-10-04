@@ -3630,6 +3630,112 @@ mod tests {
             alerts.is_empty() && notes.len() == 1,
             "{alerts:?} {notes:?}"
         );
+        // Such a module explains only the taints it would have set: not a
+        // module loaded by force (2), and a proprietary one (1) only where
+        // the module that is not loaded has such a licence.
+        for taint in ["4098\n", "4097\n"] {
+            write(root, "proc/sys/kernel/tainted", taint);
+            let (alerts, notes) = hidden(root);
+            assert_eq!(alerts, [RuleId::RootkitSign], "{taint}");
+            assert!(notes.is_empty(), "{taint} {notes:?}");
+        }
+        let modules = "usr/lib/modules/6.1-test";
+        write(root, &format!("{modules}/extramodules/nvidia.ko.zst"), "nv");
+        write(
+            root,
+            &format!("{modules}/modules.dep"),
+            "kernel/a.ko.zst:\nextramodules/nvidia.ko.zst:\n",
+        );
+        let (alerts, notes) = hidden(root);
+        assert!(
+            alerts.is_empty() && notes.len() == 1,
+            "{alerts:?} {notes:?}"
+        );
+        // One that is in the index of modules and not there as a file
+        // could not have been loaded: it explains nothing.
+        fs::remove_file(root.join(format!("{modules}/extramodules/nvidia.ko.zst"))).unwrap();
+        assert_eq!(hidden(root).0, [RuleId::RootkitSign]);
+    }
+
+    #[test]
+    fn every_process_number_is_tried_and_what_was_not_is_said() {
+        use super::Status;
+        // A hidden process far above the listed ones is found.
+        let listed: HashSet<u32> = [1, 2, 700].into_iter().collect();
+        let answers = |pid: u32| {
+            (pid == 300_123).then(|| Status {
+                name: "hidden".into(),
+                group: pid,
+                ..Status::default()
+            })
+        };
+        assert_eq!(
+            super::kernel::unlisted_among(&listed, 1..=400_000, &answers),
+            [(300_123, "hidden".to_string())]
+        );
+        // The numbers go up to the kernel's limit, whatever is listed.
+        let dir = TempDir::new("live-numbers");
+        let root = dir.path();
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let scope = |origin| Scope {
+            root,
+            home: None,
+            index: &index,
+            origin,
+        };
+        process(root, "7", "/usr/bin/x", &[], "");
+        assert_eq!(super::kernel::highest_number(&scope(Origin::System), 7), 7);
+        write(root, "proc/sys/kernel/ns_last_pid", "900\n");
+        assert_eq!(
+            super::kernel::highest_number(&scope(Origin::System), 7),
+            900
+        );
+        write(root, "proc/sys/kernel/pid_max", "5000\n");
+        assert_eq!(
+            super::kernel::highest_number(&scope(Origin::System), 7),
+            4999
+        );
+        // Within what is tried nothing is said; past it, a user's sweep
+        // notes it and root's counts it as not checked.
+        let running = super::processes(&root.join("proc"));
+        let search = |origin, most| {
+            let mut found = super::Found::default();
+            super::kernel::hidden_processes(&scope(origin), &running, most, &mut found);
+            (found.notes, found.unchecked)
+        };
+        assert_eq!(search(Origin::Root, 5000), (vec![], vec![]));
+        let (notes, unchecked) = search(Origin::System, 100);
+        assert!(unchecked.is_empty());
+        assert_eq!(
+            notes,
+            [
+                "process numbers go up to 4999: only the newest 100 and those the control groups name were tried in the search for hidden processes"
+            ]
+        );
+        let (notes, unchecked) = search(Origin::Root, 100);
+        assert!(notes.is_empty() && unchecked.len() == 1, "{unchecked:?}");
+    }
+
+    #[test]
+    fn root_says_when_it_cannot_list_the_pinned_ebpf_objects() {
+        let dir = TempDir::new("live-bpf");
+        let root = dir.path();
+        let index = PackageIndex::with_foreign(HashSet::new());
+        // No such filesystem: nothing to say.
+        assert!(look(root, &index, Origin::Root).unchecked.is_empty());
+        fs::create_dir_all(root.join("sys/fs/bpf")).unwrap();
+        fs::set_permissions(root.join("sys/fs/bpf"), fs::Permissions::from_mode(0o000)).unwrap();
+        let closed = fs::read_dir(root.join("sys/fs/bpf")).is_err();
+        let as_root = look(root, &index, Origin::Root);
+        let as_user = look(root, &index, Origin::System);
+        fs::set_permissions(root.join("sys/fs/bpf"), fs::Permissions::from_mode(0o755)).unwrap();
+        // Run as root, nothing is closed to the test.
+        if !closed {
+            return;
+        }
+        assert_eq!(as_root.unchecked.len(), 1, "{:?}", as_root.unchecked);
+        assert!(as_root.unchecked[0].starts_with("/sys/fs/bpf: could not be listed"));
+        assert!(as_user.unchecked.is_empty());
     }
 
     #[test]
