@@ -99,6 +99,47 @@ else
 fi
 
 ###############################################################################
+step "Checking what this checkout is"
+###############################################################################
+# Guardian runs as root inside pacman, so what gets built matters. The keys
+# releases are signed with come from the Guardian already installed, not
+# from this checkout: a checkout that was tampered with could bring its own.
+SIGNERS=/usr/share/omarchy-guardian/allowed_signers
+if ! git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    note "Not a git checkout: its origin cannot be checked."
+else
+    commit=$(git -C "$ROOT" rev-parse --short=12 HEAD)
+    tag=$(git -C "$ROOT" describe --exact-match --tags HEAD 2>/dev/null || true)
+    if [[ -n $(git -C "$ROOT" status --porcelain --untracked-files=no) ]]; then
+        note "This checkout has local changes on top of commit $commit."
+        dirty=1
+    else
+        dirty=0
+    fi
+    if [[ -n $tag ]]; then
+        ok "Commit $commit, release tag $tag"
+    else
+        note "Commit $commit is not a release tag."
+    fi
+    if [[ -f $SIGNERS && $(stat -c %u -- "$SIGNERS") == 0 ]]; then
+        if [[ -n $tag ]] && ((!dirty)) &&
+            git -C "$ROOT" -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$SIGNERS" \
+                verify-tag "$tag" >/dev/null 2>&1; then
+            ok "$tag is signed by a release key your installed Guardian knows"
+        else
+            note "This is not a release signed by a key your installed Guardian knows."
+            # Never answered by --yes: an unattended run must not wave an
+            # unsigned build through.
+            answer=''
+            read -r -p "  Build and install it anyway? [y/N] " answer </dev/tty || true
+            [[ $answer == [Yy]* ]] || fail "Not installed. Check out a signed release tag (git tag -l 'v*')."
+        fi
+    else
+        note "The installed Guardian carries no release keys, so the signature is not checked."
+    fi
+fi
+
+###############################################################################
 if [[ $installed == "$version" ]] && ((!REINSTALL)); then
     step "Skipping the build: omarchy-guardian $version is already installed (--reinstall to redo it)"
 else

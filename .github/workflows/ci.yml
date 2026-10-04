@@ -13,10 +13,12 @@ jobs:
     runs-on: ubuntu-latest
     # Guardian is Arch-only (pacman, bsdtar, pacman-conf paths), so it is
     # built and tested on Arch.
-    container: archlinux:base-devel
+    # Pinned by digest: a tag can be moved. The packages inside are brought
+    # up to date below, so an old image only costs a longer download.
+    container: archlinux:base-devel@sha256:51dd3d24f7fba779e7c471caeee7804c50e8c134ad948e19685a1c83a42facc3
     steps:
       - name: Install toolchain and test tools
-        run: pacman -Syu --noconfirm --needed rust git libarchive
+        run: pacman -Syu --noconfirm --needed rust git libarchive shellcheck
       # Pinned by commit: a tag can be moved.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -37,6 +39,14 @@ jobs:
         run: cargo test --locked
       - name: Shell syntax
         run: |
-          for script in integrations/*.sh integrations/*/guardian-* integrations/omarchy/*.sh tests/e2e/*.sh; do
+          for script in install.sh integrations/*.sh integrations/*/guardian-* integrations/omarchy/*.sh tests/e2e/*.sh tests/ai-eval/*.sh; do
             bash -n "$script"
           done
+      # Errors only: these scripts gate installs, so a real mistake (an
+      # unquoted expansion that splits, a test that can never be true) must
+      # not ship. Style notes are left to review.
+      - name: Shell lint
+        run: |
+          shellcheck --severity=error --shell=bash \
+            install.sh integrations/*.sh integrations/*/guardian-* integrations/omarchy/*.sh \
+            tests/e2e/*.sh tests/ai-eval/*.sh
