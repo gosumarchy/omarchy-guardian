@@ -15,6 +15,12 @@ touch "$bashrc"
 # The line that loads it, not the marker: a marker left behind, or a line
 # commented out, loads nothing.
 if ! grep -Fxq "$source_line" "$bashrc"; then
+    # The file as it was before Guardian first edited it is kept beside it
+    # (beside the file a symlinked ~/.bashrc names), once.
+    backup="$(readlink -f -- "$bashrc").guardian-bak"
+    if [[ ! -e $backup && ! -L $backup ]]; then
+        (umask 077 && cp -- "$bashrc" "$backup")
+    fi
     {
         printf '\n%s\n' "$marker"
         printf '%s\n' "$source_line"

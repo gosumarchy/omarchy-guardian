@@ -74,4 +74,7 @@ package() {
         install -Dm644 "integrations/systemd/$unit" "$pkgdir/usr/lib/systemd/system/$unit"
     done
     install -Dm644 README.md "$pkgdir/usr/share/doc/omarchy-guardian/README.md"
+    for wrapper in omarchy omarchy-theme-install omarchy-theme-update omarchy-plugin-add omarchy-plugin-update; do
+        install -Dm755 "integrations/omarchy/bin/$wrapper" "$lib/bin/$wrapper"
+    done
 }
