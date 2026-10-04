@@ -148,7 +148,9 @@ files, and programs in `~/.local/bin` named like system commands. It
 follows links and what each file runs, so a trusted service running a
 replaced binary, or an interpreter running a script, is checked too: past
 wrappers (`sudo -u`, `uwsm app --`, `systemd-run`, `env`, `timeout`,
-`flock`), into each command a shell is handed with `-c` (the first 32),
+`flock`), into each command a shell is handed with `-c`, and each command of a
+line a shell runs joined with `;`, `&`, `|` or a line break (a crontab's,
+say), the first 32 of each,
 into the files a shell start-up file reads in with `source` or `.` and
 the programs its statements start by a path (on lines up to 4 KB), a unit's `EnvironmentFile=`, and a Hyprland `.conf`'s
 `source`, `plugin` and `bind … exec` lines. A bare command name is looked

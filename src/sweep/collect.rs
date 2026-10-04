@@ -621,6 +621,9 @@ fn body_of(path: &str, size: u64, head: &[u8]) -> Body {
     }
 }
 
+/// The longest command line split into its commands.
+const MAX_SPLIT_LINE: usize = 4096;
+
 /// The paths `item` leads to that need judging too: a link's target, and
 /// the programs and scripts its commands run.
 fn follow(scope: &Scope<'_>, item: &Item) -> Vec<String> {
@@ -678,9 +681,30 @@ fn follow(scope: &Scope<'_>, item: &Item) -> Vec<String> {
             targets.extend(commands::glob_targets(home, command, &list));
             continue;
         }
-        targets.extend(commands::targets_where(home, command, &|candidate| {
-            is_there(scope, candidate, by)
-        }));
+        // Each command of a line a shell runs (`a; b && c | d`) runs its
+        // own program. Other lines (a unit's `ExecStart=`) are not shell:
+        // there only ` ; ` separates commands, and a long line is taken
+        // whole.
+        let shell_line = matches!(
+            item.category,
+            Category::Cron | Category::Shell | Category::Hyprland
+        );
+        let parts = if command.len() > MAX_SPLIT_LINE {
+            vec![command.clone()]
+        } else if shell_line {
+            commands::inner_commands(command)
+        } else {
+            command.split(" ; ").map(str::to_string).collect()
+        };
+        for part in parts {
+            for target in
+                commands::targets_where(home, &part, &|candidate| is_there(scope, candidate, by))
+            {
+                if !targets.contains(&target) {
+                    targets.push(target);
+                }
+            }
+        }
     }
     targets
         .into_iter()
@@ -926,6 +950,19 @@ mod tests {
         };
         let starred = super::item(&scope, Category::Cron, "var/spool/cron/w".into(), None);
         assert!(super::follow(&scope, &starred).contains(&"etc/open".to_string()));
+        // Each command of a line, however they are joined.
+        write(root, "etc/second", "x\n");
+        write(root, "etc/third", "x\n");
+        write(
+            root,
+            "var/spool/cron/x",
+            "* * * * * /bin/true;/etc/second && /etc/third | cat\n",
+        );
+        let joined = super::item(&scope, Category::Cron, "var/spool/cron/x".into(), None);
+        let followed = super::follow(&scope, &joined);
+        for path in ["etc/second", "etc/third"] {
+            assert!(followed.contains(&path.to_string()), "{followed:?}");
+        }
     }
 
     #[test]

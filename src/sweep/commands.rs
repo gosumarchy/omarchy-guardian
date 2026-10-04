@@ -719,17 +719,24 @@ pub fn targets_where(home: &str, command: &str, exists: &dyn Fn(&str) -> bool) -
 /// The most commands of one `sh -c` line that are looked up.
 const MAX_INNER_COMMANDS: usize = 32;
 
-/// The commands of a `sh -c` line: split at `;`, `|`, `&` and line ends
-/// outside quotes, the first `MAX_INNER_COMMANDS` that are not empty.
-fn inner_commands(code: &str) -> Vec<String> {
+/// The commands of a line a shell runs (a crontab's, or `sh -c`'s): split
+/// at `;`, `|`, `&` and line ends outside quotes, the first
+/// `MAX_INNER_COMMANDS` that are not empty.
+pub fn inner_commands(code: &str) -> Vec<String> {
     let mut commands = Vec::new();
     let mut command = String::new();
     let mut quote: Option<char> = None;
-    for character in code.chars() {
+    let mut previous = ' ';
+    let mut characters = code.chars().peekable();
+    while let Some(character) = characters.next() {
+        // `>&`, `&>` and `<&` are redirections, not the end of a command.
+        let redirection =
+            character == '&' && (matches!(previous, '>' | '<') || characters.peek() == Some(&'>'));
+        previous = character;
         match quote {
             Some(open) if character == open => quote = None,
             None if matches!(character, '"' | '\'') => quote = Some(character),
-            None if matches!(character, ';' | '|' | '&' | '\n') => {
+            None if matches!(character, ';' | '|' | '&' | '\n') && !redirection => {
                 if !command.trim().is_empty() {
                     commands.push(std::mem::take(&mut command));
                     if commands.len() == MAX_INNER_COMMANDS {
@@ -943,6 +950,16 @@ mod tests {
             ),
             ["~/opt/tools/agent", "~/bin/y"]
         );
+    }
+
+    #[test]
+    fn a_line_of_commands_splits_where_a_shell_would() {
+        use super::inner_commands;
+        assert_eq!(
+            inner_commands("/x.sh >/dev/null 2>&1; /y.sh &>/tmp/log && /z.sh"),
+            ["/x.sh >/dev/null 2>&1", " /y.sh &>/tmp/log ", " /z.sh"]
+        );
+        assert_eq!(inner_commands("sh -c 'a; b' | c"), ["sh -c 'a; b' ", " c"]);
     }
 
     #[test]
