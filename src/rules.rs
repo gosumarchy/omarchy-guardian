@@ -51,6 +51,12 @@ pub enum RuleId {
     PrivilegedAccount,
     BootTampering,
     RiskyConfiguration,
+    UnexpectedCapability,
+    NetworkRelay,
+    RootkitSign,
+    TracedProcess,
+    TracedSecrets,
+    KernelTap,
 }
 
 /// How a rule decides whether a lowercased line matches.
@@ -195,7 +201,7 @@ const PRIVILEGE_ESCALATION: &[&str] = &[
 ];
 
 impl RuleId {
-    pub const ALL: [Self; 37] = [
+    pub const ALL: [Self; 43] = [
         Self::DownloadAndExecute,
         Self::EncodedCommandExecution,
         Self::CredentialFileAccess,
@@ -233,6 +239,12 @@ impl RuleId {
         Self::PrivilegedAccount,
         Self::BootTampering,
         Self::RiskyConfiguration,
+        Self::UnexpectedCapability,
+        Self::NetworkRelay,
+        Self::RootkitSign,
+        Self::TracedProcess,
+        Self::TracedSecrets,
+        Self::KernelTap,
     ];
 
     pub fn from_name(name: &str) -> Option<Self> {
@@ -278,6 +290,12 @@ impl RuleId {
             Self::PrivilegedAccount => "privileged-account",
             Self::BootTampering => "boot-tampering",
             Self::RiskyConfiguration => "risky-configuration",
+            Self::UnexpectedCapability => "unexpected-capability",
+            Self::NetworkRelay => "network-relay",
+            Self::RootkitSign => "rootkit-sign",
+            Self::TracedProcess => "traced-process",
+            Self::TracedSecrets => "traced-secrets",
+            Self::KernelTap => "kernel-tap",
         }
     }
 
@@ -302,7 +320,9 @@ impl RuleId {
             | Self::PathHijack
             | Self::NewTrust
             | Self::PrivilegedAccount
-            | Self::BootTampering => Severity::High,
+            | Self::BootTampering
+            | Self::RootkitSign
+            | Self::TracedSecrets => Severity::High,
             Self::NetworkListener => Severity::Low,
             Self::CredentialFileAccess
             | Self::PersistenceModification
@@ -319,7 +339,11 @@ impl RuleId {
             | Self::LookalikeHost
             | Self::DataDropHost
             | Self::TraceRemoval
-            | Self::RiskyConfiguration => Severity::Medium,
+            | Self::RiskyConfiguration
+            | Self::UnexpectedCapability
+            | Self::NetworkRelay
+            | Self::TracedProcess
+            | Self::KernelTap => Severity::Medium,
         }
     }
 
@@ -362,6 +386,44 @@ impl RuleId {
             Self::SshCommand => {
                 "An SSH file runs a command when someone logs in (command= or environment= on a key, or ~/.ssh/rc)."
             }
+            Self::ReviewerInstruction => {
+                "Text addressed to a reviewer or an AI model, telling it what to conclude; software has no reason to carry it."
+            }
+            Self::ReorderedText => {
+                "Holds bidirectional control characters: the text is shown in another order than it is read by a compiler, a shell or the AI review."
+            }
+            Self::InvisibleText => {
+                "Holds Unicode tag characters: text no person sees, which an AI model reads as instructions."
+            }
+            Self::HiddenCharacter => {
+                "An invisible character sits inside a name, a command or a path: it is not the name it reads as, to a person or to the AI review."
+            }
+            Self::LookalikeHost => {
+                "A host name mixes alphabets or is written in punycode, so it can read as another name than the one requested."
+            }
+            Self::DataDropHost => {
+                "Sends to or fetches from a host commonly used to deliver or receive stolen data (a paste site, a chat webhook, a tunnel, a link shortener)."
+            }
+            Self::RemoteShell => {
+                "A shell is connected to the network, so someone elsewhere types the commands (a reverse or bind shell): in code that sets one up, or in a running shell or interpreter with a network socket for its input and output."
+            }
+            Self::CryptoMiner => {
+                "Names a cryptocurrency miner, a mining pool or a mining protocol."
+            }
+            Self::ProtectionDisabled => {
+                "Turns off a protection of this system: a firewall, a security service, or Guardian's own gates."
+            }
+            Self::TraceRemoval => {
+                "Erases shell history or system logs, which is how traces of other commands are removed."
+            }
+            _ => self.state_description(),
+        }
+    }
+
+    /// What the sweep reports about the system as it is now, where
+    /// `description` covers what the rules read in text.
+    const fn state_description(self) -> &'static str {
+        match self {
             Self::ModifiedPackageFile => {
                 "A file a package installed has been changed since; it is not what the package shipped."
             }
@@ -382,37 +444,25 @@ impl RuleId {
                 "A file no package vouches for runs with extra rights (setuid, setgid or capabilities)."
             }
             Self::NetworkListener => {
-                "An interpreter (Python, a shell, Node) listens on the network, with no script on disk to look at."
+                "A program listens on the network that nothing installed accounts for: an interpreter (Python, a shell, Node), or a packaged program no packaged service runs."
             }
-            Self::ReviewerInstruction => {
-                "Text addressed to a reviewer or an AI model, telling it what to conclude; software has no reason to carry it."
+            Self::UnexpectedCapability => {
+                "A packaged program holds file capabilities its package does not set (pacman does not record them, so the file itself is unchanged)."
             }
-            Self::ReorderedText => {
-                "Holds bidirectional control characters: the text is shown in another order than it is read by a compiler, a shell or the AI review."
+            Self::NetworkRelay => {
+                "A tool that runs or forwards what it is told over the network (netcat, socat, a tunnel) listens or is connected."
             }
-            Self::InvisibleText => {
-                "Holds Unicode tag characters: text no person sees, which an AI model reads as instructions."
+            Self::RootkitSign => {
+                "The kernel's own lists disagree (a process, module or socket that exists is not listed), or a program wears a kernel thread's name: what something hiding itself looks like."
             }
-            Self::HiddenCharacter => {
-                "An invisible character sits inside a name, a command or a path: it is not the name it reads as, to a person or to the AI review."
+            Self::TracedProcess => {
+                "Another process is attached to this one the way a debugger is, and can read and change its memory."
             }
-            Self::LookalikeHost => {
-                "A host name mixes alphabets or is written in punycode, so it can read as another name than the one requested."
+            Self::TracedSecrets => {
+                "A process is attached, the way a debugger is, to a program that holds secrets (a shell, SSH, sudo, a key agent, a browser, a password manager)."
             }
-            Self::DataDropHost => {
-                "Sends to or fetches from a host commonly used to deliver or receive stolen data (a paste site, a chat webhook, a tunnel, a link shortener)."
-            }
-            Self::RemoteShell => {
-                "Connects a shell to the network: someone elsewhere types the commands (a reverse or bind shell)."
-            }
-            Self::CryptoMiner => {
-                "Names a cryptocurrency miner, a mining pool or a mining protocol."
-            }
-            Self::ProtectionDisabled => {
-                "Turns off a protection of this system: a firewall, a security service, or Guardian's own gates."
-            }
-            Self::TraceRemoval => {
-                "Erases shell history or system logs, which is how traces of other commands are removed."
+            Self::KernelTap => {
+                "Something no package explains taps the kernel's network or tracing path: a raw packet socket, or a pinned eBPF object."
             }
             Self::GuardianOverride => {
                 "A unit file or drop-in changes what Guardian's own sweep runs; allowing the file does not quiet this."
@@ -432,6 +482,7 @@ impl RuleId {
             Self::RiskyConfiguration => {
                 "A configuration file redirects where programs, packages or web pages come from, or loads code into a program at every start."
             }
+            _ => "",
         }
     }
 
@@ -468,7 +519,13 @@ impl RuleId {
             | Self::NewTrust
             | Self::PrivilegedAccount
             | Self::BootTampering
-            | Self::RiskyConfiguration => Matcher::Reported,
+            | Self::RiskyConfiguration
+            | Self::UnexpectedCapability
+            | Self::NetworkRelay
+            | Self::RootkitSign
+            | Self::TracedProcess
+            | Self::TracedSecrets
+            | Self::KernelTap => Matcher::Reported,
             Self::DisabledTlsVerification => Matcher::Custom(disables_tls_verification),
             Self::RemoteShell => Matcher::Custom(is_remote_shell),
             Self::CryptoMiner => Matcher::Custom(is_crypto_mining),
@@ -520,7 +577,13 @@ impl RuleId {
             | Self::NewTrust
             | Self::PrivilegedAccount
             | Self::BootTampering
-            | Self::RiskyConfiguration => false,
+            | Self::RiskyConfiguration
+            | Self::UnexpectedCapability
+            | Self::NetworkRelay
+            | Self::RootkitSign
+            | Self::TracedProcess
+            | Self::TracedSecrets
+            | Self::KernelTap => false,
         }
     }
 

@@ -300,11 +300,18 @@ It also looks at what runs **now**, listing only what does not add up, so a
 clean system shows nothing here:
 
 - a running program with no file on disk (deleted, or only in memory), or
-  running from a temporary or cache directory; a program an update replaced
-  while it runs is fine, unless it runs in a user namespace of its own,
-  where a deleted program can carry any name: what that one preloads, and
-  whether it reads the keyboard or listens on the network, is checked as
-  for a program no package installed;
+  running from a temporary or cache directory. A program an update
+  replaced while it runs is fine, but only at a path a repository package
+  owns. Anywhere else the file now at that path says nothing about what
+  runs (whoever deleted the program may have put it there): the process is
+  reported as running a program that is no longer on disk, the file there
+  is not hashed in its place, and what it preloads, whether it reads the
+  keyboard and whether it listens is checked as for any other. A file that
+  is merely called `x (deleted)` is told from a deleted one. In a user
+  namespace of its own a deleted program can carry any name, a packaged
+  one included: what that one preloads, and whether it reads the keyboard
+  or listens on the network, is checked as for a program no package
+  installed;
 - a script an interpreter runs from a temporary or cache directory, and a
   program the dynamic loader was handed from one. A script given by a
   relative name is looked for where the process runs now. An AppImage's own
@@ -322,16 +329,78 @@ clean system shows nothing here:
   (`LD_LIBRARY_PATH`; the empty entry launchers leave behind is ignored).
   This is what the process was started with: one that rewrites its own
   environment afterwards is not caught by it;
-- a program no repository package installed that listens on the network
-  (TCP, not loopback), reads the keyboard devices, or uses a camera. Every
-  process sharing a listening socket is looked at, and a packaged tool that
-  runs what it is told (an interpreter, the loader, `awk`, `openssl`,
-  `busybox`) is judged by its script, or shown when it listens;
+- a packaged file that is no longer what its package installed. A running
+  program, a preloaded library and a loaded kernel module are trusted for
+  their content, not for sitting at a packaged path: each is compared with
+  the digest pacman recorded (once per file and sweep, up to 2 GiB; past
+  that a note says so), and one that differs is a modified package file
+  and is checked like a program no package installed. The same comparison
+  runs over `/usr/bin`, the libraries at the top of `/usr/lib`,
+  `/usr/lib/security`, the programs at the top of `/usr/lib/systemd` and
+  the running kernel's modules directory, where a changed file runs sooner
+  or later without being in any auto-run location; a file no package owns
+  there is listed as unknown (depmod's indexes and DKMS's modules are
+  not). That reads a few gigabytes on every sweep, on several threads;
+- a program that listens on the network (TCP, not loopback), by every
+  process that shares the socket. The item is named by the program and the
+  port, and for an interpreter with no script on disk by what it was told
+  to run too (`/usr/bin/python3:tcp-8000:http.server`), so allowing one
+  does not allow another script or port; a port the kernel picked reads
+  `listens`. A packaged program a packaged service runs, or a desktop
+  program known to listen (a browser, Syncthing, KDE Connect, Docker), is
+  listed with the trusted items. Any other packaged program that listens
+  is shown and flagged low, so a new listener shows in `--diff` and in the
+  daily notification; so is an interpreter, the loader, `awk`, `openssl`
+  or `busybox`, whatever its script. A program no package installed that
+  waits on a UDP port somebody chose is listed the same way (not the
+  common ports: DHCP, NTP, SSDP, mDNS, LLMNR). As root, a listening socket
+  that no process holds is a high finding, unless a kernel module that
+  serves files (NFS, SMB, iSCSI) is loaded;
+- a shell or interpreter whose input or output is a network connection,
+  and a shell that holds one among its open files (`bash -i >&
+  /dev/tcp/…`, a socket duplicated onto standard input in Python, `nc
+  -e`): a remote shell, flagged high with the address it is connected to,
+  or medium when that is this machine itself. Pipes and local sockets,
+  which terminals, IDEs and language servers put there, are not network
+  connections and say nothing. A packaged service started per connection
+  is not reported, unless its program is a shell;
+- a tool that runs or forwards what it is told over the network (`nc`,
+  `ncat`, `socat`, `systemd-socket-activate`, `dropbear`, `telnetd`,
+  `chisel`, `ngrok`, `cloudflared` and the like) that listens or is
+  connected to another machine; an `ssh` that forwards ports (`-R`, `-D`,
+  `-w`) started from no terminal; and an `sshd` started with a
+  configuration outside `/etc/ssh`, a setting or a port of its own;
+- a program no repository package installed that reads the keyboard
+  devices or uses a camera, or that holds a raw packet socket (what a
+  sniffer reads the network through; the programs that run the network
+  hold some too, and are not reported). An interface in promiscuous mode
+  is noted, unless it is part of a bridge or a capture tool is running;
 - a loaded kernel module no package installed (one built by DKMS is noted,
-  not flagged), and the kernel's taint flag;
+  not flagged), one the kernel marks out-of-tree or unsigned under an
+  in-tree module's name or from a package not known to ship such modules,
+  and the kernel's taint flag. A taint only a module sets, with no loaded
+  module that carries it, is a hidden module (noted instead where an
+  installed out-of-tree module is not loaded now and may have set it);
+- what hides: a process that answers under its number and is missing from
+  the list of processes (the numbers the control groups name are tried,
+  and every number while the system has handed out fewer than 250,000); a
+  program named like a kernel thread (`[kworker/0:1]`); and, as root, a
+  process root cannot read;
+- a process attached to another the way a debugger is: high when the
+  other holds secrets (a shell, `ssh`, `sudo`, a key agent, a keyring, a
+  browser, a password manager), else medium. A program started under its
+  tracer, and a packaged debugger at work (`gdb`, `lldb`, `strace`,
+  `perf`, an editor's debug adapter), are not reported;
+- eBPF objects pinned in `/sys/fs/bpf` that are not systemd's or the
+  traffic tools' own (as root only);
 - setuid and setgid files, and files with capabilities, under `/usr`,
   `/opt`, `/etc`, `/var`, `/srv`, `/root` and `/home` that no package
-  vouches for; a setuid copy of a packaged program counts as unknown. The
+  vouches for; a setuid copy of a packaged program counts as unknown.
+  Pacman does not record capabilities, so any capability on a packaged
+  file other than exactly those its package is known to set is reported:
+  high for all of them (`=ep`) and for those that amount to root
+  (`cap_setuid`, `cap_dac_read_search`, `cap_sys_admin`, `cap_net_admin`,
+  `cap_bpf` and the like, or one with no name), medium for the rest. The
   search for setuid and setgid files leaves out what holds other systems'
   files: container, machine and Flatpak stores under `/var/lib`,
   `/var/cache`, and snapshot directories (`.snapshots`). Other mounted
