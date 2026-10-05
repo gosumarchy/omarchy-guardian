@@ -956,7 +956,7 @@ release_check_cases() {
 # with a clean checkout of the signed release v1 in $repo.
 release_tampered_cases() {
     printf '=== a checkout that was tampered with ===\n'
-    local upgrade=$PROJECT/integrations/upgrade.sh clean=$repo case_dir tag_id blob other canary export
+    local upgrade=$PROJECT/integrations/upgrade.sh clean=$repo case_dir tag_id blob other canary tree
     if [[ ! -x /usr/bin/tar || ! -x /usr/bin/vercmp || ! -x /usr/bin/pacman ]]; then
         skip "the installed upgrade check: needs tar, vercmp and pacman"
         return
@@ -996,8 +996,8 @@ release_tampered_cases() {
     expect_output 'the signer' 'signer  release@example.test (SHA256:'
     expect_output 'and the commit' "commit  $(at "$clean" rev-parse 'v1^{commit}')"
     check 'the export is the signed tree' signed_main
-    export=$(exported '')
-    no_extras() { [[ ! -e $export/target && ! -e $export/.git && -x $export/install.sh ]]; }
+    tree=$(exported '')
+    no_extras() { [[ ! -e $tree/target && ! -e $tree/.git && -x $tree/install.sh ]]; }
     check "without the checkout's build output or its .git" no_extras
     up "$clean" v1
     expect 'upgrade: the verified release is handed to its own installer' 0 $?
@@ -1089,8 +1089,8 @@ release_tampered_cases() {
     up --check --keep "$repo"
     expect 'upgrade: the release is verified whatever core.worktree says' 0 $?
     check 'and the export has the signed file, not the changed one' signed_main
-    export=$(exported '')
-    check 'and not the added one' test ! -e "$export/build.rs"
+    tree=$(exported '')
+    check 'and not the added one' test ! -e "$tree/build.rs"
 
     # A changed file the index is told to pass over, and an added file the
     # index lists, so that it is not "untracked".
@@ -1111,8 +1111,8 @@ release_tampered_cases() {
     up --check --keep "$repo"
     expect 'upgrade: the release is verified whatever the index says' 0 $?
     check 'and the export has the signed file' signed_main
-    export=$(exported '')
-    check 'and not the added one' test ! -e "$export/build.rs"
+    tree=$(exported '')
+    check 'and not the added one' test ! -e "$tree/build.rs"
 
     # A file whose mode changed, and a file replaced by a link to itself
     # elsewhere: neither changes a byte of content.
