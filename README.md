@@ -36,7 +36,7 @@ gate can be audited in one place. It builds only for Linux.
 - **`protect` changes your system**, showing each step first: a link in
   `/etc/pacman.d/hooks/`, yay's saved configuration, a line in `~/.bashrc`,
   entries in the Omarchy menu file, `~/.config/uwsm/env.d/90-omarchy-guardian`
-  and a line in `~/.config/hypr/hyprland.lua` (from the next login), a bar
+  and two lines in `~/.config/hypr/hyprland.lua` (from the next login), a bar
   widget or Waybar module, and the sweep's systemd timers. Edited files are
   kept beside themselves as `<name>.guardian-bak`. `omarchy-guardian protect
   --off` undoes the gates; see [Removal](#removal).
