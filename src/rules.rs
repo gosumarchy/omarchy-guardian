@@ -63,6 +63,7 @@ pub enum RuleId {
     TracedProcess,
     TracedSecrets,
     KernelTap,
+    KeptFromReview,
     RemoteCodeInstall,
 }
 
@@ -208,7 +209,7 @@ const PRIVILEGE_ESCALATION: &[&str] = &[
 ];
 
 impl RuleId {
-    pub const ALL: [Self; 44] = [
+    pub const ALL: [Self; 45] = [
         Self::DownloadAndExecute,
         Self::EncodedCommandExecution,
         Self::CredentialFileAccess,
@@ -252,6 +253,7 @@ impl RuleId {
         Self::TracedProcess,
         Self::TracedSecrets,
         Self::KernelTap,
+        Self::KeptFromReview,
         Self::RemoteCodeInstall,
     ];
 
@@ -304,6 +306,7 @@ impl RuleId {
             Self::TracedProcess => "traced-process",
             Self::TracedSecrets => "traced-secrets",
             Self::KernelTap => "kernel-tap",
+            Self::KeptFromReview => "kept-from-review",
             Self::RemoteCodeInstall => "remote-code-install",
         }
     }
@@ -353,6 +356,7 @@ impl RuleId {
             | Self::NetworkRelay
             | Self::TracedProcess
             | Self::KernelTap
+            | Self::KeptFromReview
             | Self::RemoteCodeInstall => Severity::Medium,
         }
     }
@@ -360,7 +364,7 @@ impl RuleId {
     /// What each rule reports, in the order of `ALL`. A table rather than a
     /// match so that it stays one item however many rules there are; the
     /// test below holds it to `ALL`.
-    const DESCRIPTIONS: [(Self, &'static str); 44] = [
+    const DESCRIPTIONS: [(Self, &'static str); 45] = [
         (
             Self::DownloadAndExecute,
             "Fetches code from the network and runs it without it being reviewed: piped into a shell or an interpreter, run from a substitution, or saved and then run.",
@@ -534,6 +538,10 @@ impl RuleId {
             "Something no package explains taps the kernel's network or tracing path: a raw packet socket, or a pinned eBPF object.",
         ),
         (
+            Self::KeptFromReview,
+            "Something runs this file, and its path marks it as holding secrets, so the AI review did not read it: only the local rules did. Read it yourself; `sweep allow` records that you did.",
+        ),
+        (
             Self::RemoteCodeInstall,
             "Installs and runs code from an address, not from this source: a package manager is given a URL or a repository, or told to fetch and run a package at whatever its newest version is.",
         ),
@@ -589,7 +597,8 @@ impl RuleId {
             | Self::RootkitSign
             | Self::TracedProcess
             | Self::TracedSecrets
-            | Self::KernelTap => Matcher::Reported,
+            | Self::KernelTap
+            | Self::KeptFromReview => Matcher::Reported,
             Self::DisabledTlsVerification => Matcher::Custom(disables_tls_verification),
             Self::RemoteShell => Matcher::Custom(is_remote_shell),
             Self::CryptoMiner => Matcher::Custom(is_crypto_mining),
@@ -649,7 +658,8 @@ impl RuleId {
             | Self::RootkitSign
             | Self::TracedProcess
             | Self::TracedSecrets
-            | Self::KernelTap => false,
+            | Self::KernelTap
+            | Self::KeptFromReview => false,
         }
     }
 

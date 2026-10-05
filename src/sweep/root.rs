@@ -606,6 +606,9 @@ fn item_json(item: &Item) -> Json {
     if let Some(by) = &item.run_by {
         members.push(("run_by", Json::from(by.as_str())));
     }
+    if let Some(file) = &item.file {
+        members.push(("file", Json::from(file.as_str())));
+    }
     Json::object(members)
 }
 
@@ -650,7 +653,13 @@ fn item_from_json(json: &Json) -> Option<Item> {
         _ => return None,
     };
     Some(Item {
-        file: None,
+        // Relative and plain, like the path; one that is not is none.
+        file: text("file")
+            .filter(|file| {
+                !file.starts_with('/')
+                    && file.split('/').all(|part| !matches!(part, "" | "." | ".."))
+            })
+            .map(str::to_string),
         origin: Origin::Root,
         category: Category::from_name(text("category")?)?,
         path: path.to_string(),

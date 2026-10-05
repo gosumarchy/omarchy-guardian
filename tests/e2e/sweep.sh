@@ -344,6 +344,9 @@ planted_system() {
     expect_listed '~/.gitconfig' git-config-command
     expect_listed '~/.ssh/authorized_keys' ssh-command
     expect_listed '~/.ssh/rc' download-and-execute
+    # Kept from the AI by its path, and something runs it: said, so that a
+    # path cannot be picked to pass unread.
+    expect_listed '~/.ssh/rc' kept-from-review
     expect_listed '~/bin/wrapper.sh'
     expect_listed '~/.cache/stage2.sh' download-and-execute
     expect_listed '~/.cache/sleeper' running-from-temp

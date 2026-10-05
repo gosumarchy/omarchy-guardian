@@ -285,12 +285,17 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
         seen: paths.keys().cloned().collect(),
         pending: paths
             .into_iter()
-            .map(|(path, category)| item(scope, category, path, None))
+            .map(|(path, category)| (0, item(scope, category, path, None)))
             .collect(),
         ..Walk::default()
     };
     let omarchy = omarchy_paths(scope.root);
-    while let Some(mut item) = walk.pending.pop() {
+    while let Some((reading, mut item)) = walk.pending.pop() {
+        // A script that was read again since this reading of it was
+        // queued: the newer one stands.
+        if walk.readings.get(&item.path).copied().unwrap_or(0) != reading {
+            continue;
+        }
         // Configuration itself: a catalogued file, or one reached as more
         // of one and run by nothing so far.
         let root = if item.run_by.is_none() {
@@ -302,14 +307,7 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
         };
         let followed = follow(scope, &item, &search, root.is_some());
         for target in &followed.targets {
-            walk.reach(
-                scope,
-                &mut collection,
-                &item,
-                &followed,
-                root.as_deref(),
-                target,
-            );
+            walk.reach(scope, &item, &followed, root.as_deref(), target);
         }
         item.notes.extend(
             followed
@@ -324,11 +322,23 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
             item.tier = Tier::Inert;
             item.notes.push("sets the locale and nothing else".into());
         }
+        walk.placed
+            .insert(item.path.clone(), collection.items.len());
         collection.items.push(item);
     }
     let Walk {
-        roots, linked, run, ..
+        roots,
+        linked,
+        run,
+        replaced,
+        ..
     } = walk;
+    // The readings a shorter way to a script took the place of.
+    let mut index = 0;
+    collection.items.retain(|_| {
+        index += 1;
+        !replaced.contains(&(index - 1))
+    });
     path::mark(scope, &search, &mut collection.items);
     mark_configuration(&mut collection.items, &roots, &linked, &run);
     for item in &mut collection.items {
@@ -355,8 +365,16 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
 struct Walk {
     /// Every path that is an item already.
     seen: HashSet<String>,
-    /// The items whose own targets are still to be followed.
-    pending: Vec<Item>,
+    /// The items whose own targets are still to be followed, each with
+    /// which reading of its path it is (see `readings`).
+    pending: Vec<(usize, Item)>,
+    /// How often a path was read again from a shorter way to it: only its
+    /// latest reading counts, wherever an older one still waits.
+    readings: HashMap<String, usize>,
+    /// Where in the collection the item of a path was put.
+    placed: HashMap<String, usize>,
+    /// The places of items a later reading of their path replaced.
+    replaced: HashSet<usize>,
     /// What was reached as more configuration, with the catalogued file it
     /// belongs to.
     roots: HashMap<String, String>,
@@ -375,7 +393,6 @@ impl Walk {
     fn reach(
         &mut self,
         scope: &Scope<'_>,
-        collection: &mut Collection,
         item: &Item,
         followed: &Followed,
         root: Option<&str>,
@@ -397,9 +414,14 @@ impl Walk {
         let depth = self.depths.get(&item.path).map_or(1, |depth| depth + 1);
         let fresh = self.seen.insert(target.clone());
         let shallower = !fresh && self.depths.get(target).is_some_and(|known| depth < *known);
+        // An older reading is not searched for: one that still waits is
+        // passed over when its turn comes, and one already collected is
+        // taken out at the end. Each costs the same however many there are.
         if shallower {
-            self.pending.retain(|waiting| waiting.path != *target);
-            collection.items.retain(|done| done.path != *target);
+            *self.readings.entry(target.clone()).or_insert(0) += 1;
+            if let Some(place) = self.placed.remove(target) {
+                self.replaced.insert(place);
+            }
         }
         if !(fresh || shallower) {
             return;
@@ -413,7 +435,8 @@ impl Walk {
         if (handed && read_as_script(&mut reached)) || is_read_script(&reached) {
             bound_scripts(depth, &mut reached, &mut self.depths);
         }
-        self.pending.push(reached);
+        let reading = self.readings.get(target).copied().unwrap_or(0);
+        self.pending.push((reading, reached));
     }
 }
 

