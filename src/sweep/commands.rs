@@ -1123,6 +1123,29 @@ pub fn ssh(line: &str) -> Option<(String, String)> {
         .then_some((key, runs))
 }
 
+/// The files an SSH client or server file reads as more configuration or
+/// as lists of keys and names, as `ssh` gives them: an `Include`, and the
+/// server's key and principal files. They are read, not run: what any
+/// other line names (a `ProxyCommand`, a `Match … exec`) is a program.
+pub fn ssh_read_in(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(ssh)
+        .filter(|(key, _)| {
+            matches!(
+                key.as_str(),
+                "include"
+                    | "trustedusercakeys"
+                    | "authorizedprincipalsfile"
+                    | "authorizedkeysfile"
+                    | "revokedkeys"
+            )
+        })
+        .map(|(_, value)| value)
+        .collect()
+}
+
 /// What a Hyprland `.conf` runs or loads: `exec` and its variants, the
 /// command of a `bind… = MODS, key, exec, command`, a `plugin` (a library
 /// loaded into the compositor) and a `source`d file (one with `*` in its

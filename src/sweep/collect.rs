@@ -86,6 +86,13 @@ pub const CLOSED: &str = "its package installs it readable by everyone, and it n
 /// the sweep counts as incomplete.
 pub const NOT_ALL_FOLLOWED: &str = "not all of what it runs was followed: ";
 
+/// The note on an item that another file reads as more of its own
+/// configuration and that nothing runs: where a link in an auto-run
+/// location leads, and a file an SSH `Include` names. A program one of
+/// those files runs (a `ProxyCommand` script) does not carry it, and is
+/// reviewed like any other program (see `judge::is_local_only`).
+pub const MORE_CONFIGURATION: &str = "read as more of that file's configuration, not run";
+
 /// What stands for the content of a packaged script whose interpreter line
 /// alone was rewritten.
 const PACKAGED_SCRIPT: &str = "packaged script (not read again)";
@@ -217,8 +224,19 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
         .map(|(path, category)| item(scope, category, path, None))
         .collect();
     let omarchy = omarchy_paths(scope.root);
+    // What was reached as more configuration, and what some command runs:
+    // a file that is both is a program.
+    let mut configuration: HashSet<String> = HashSet::new();
+    let mut run: HashSet<String> = HashSet::new();
     while let Some(mut item) = pending.pop() {
         let followed = follow(scope, &item, &search);
+        for target in &followed.targets {
+            if followed.configuration.contains(target) {
+                configuration.insert(target.clone());
+            } else {
+                run.insert(target.clone());
+            }
+        }
         for target in followed.targets {
             if seen.insert(target.clone()) {
                 pending.push(self::item(scope, item.category, target, Some(&item.path)));
@@ -241,6 +259,10 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
     }
     path::mark(scope, &search, &mut collection.items);
     for item in &mut collection.items {
+        if item.run_by.is_some() && configuration.contains(&item.path) && !run.contains(&item.path)
+        {
+            item.notes.push(MORE_CONFIGURATION.to_string());
+        }
         // The package's own directory, and the one for shared data, may
         // hold a drop-in a repository package ships for every unit;
         // nothing else there is spared.
@@ -255,7 +277,17 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
     collection
         .items
         .sort_by(|left, right| left.path.cmp(&right.path));
-    merge(&mut collection, access::items(scope));
+    let (facts, left_out) = access::items(scope);
+    merge(&mut collection, facts);
+    // Root has nothing behind it to cover what it left out; a user's
+    // sweep says so in a note.
+    if let Some(sentence) = left_out {
+        if scope.origin == Origin::Root {
+            collection.truncated.push(sentence);
+        } else {
+            collection.notes.push(sentence);
+        }
+    }
     let boot = boot::check(scope);
     merge(&mut collection, boot.items);
     collection.truncated.extend(boot.unchecked);
@@ -1057,6 +1089,9 @@ fn is_pattern(command: &str) -> bool {
 struct Followed {
     /// The paths it leads to.
     targets: Vec<String>,
+    /// Those among them that the item reads as more configuration and
+    /// does not run (see `MORE_CONFIGURATION`).
+    configuration: Vec<String>,
     /// The limits that were reached, each as the rest of a sentence.
     unfollowed: Vec<String>,
 }
@@ -1075,12 +1110,32 @@ fn follow(scope: &Scope<'_>, item: &Item, search: &Search) -> Followed {
     // Only a link to a regular file leads anywhere to judge (a masked
     // unit's `/dev/null` does not).
     let by = Some(item.path.as_str());
+    // What is read, not run: where a link leads (the same file under
+    // another name), and what an SSH file reads in. Anything a command
+    // names as well is run.
+    let mut read_in: Vec<String> = Vec::new();
+    let mut started: Vec<String> = Vec::new();
     if let Body::Link(target) = &item.body
         && let Some(resolved) = read::resolve_where(&item.path, target, &|next| hop(scope, next))
         && matches!(look_past_link(scope, &resolved), Found::File { .. })
     {
+        read_in.push(resolved.clone());
         targets.push(resolved);
     }
+    let included = match (&item.body, item.category) {
+        (Body::Text(text), Category::Ssh) => commands::ssh_read_in(text),
+        _ => Vec::new(),
+    };
+    // A file some other line runs under the very same words is run.
+    let times = |list: &[String], command: &str| list.iter().filter(|one| *one == command).count();
+    let mut record = |command: &str, target: &str| {
+        let reads = times(&included, command);
+        if reads > 0 && reads == times(&item.runs, command) {
+            read_in.push(target.to_string());
+        } else {
+            started.push(target.to_string());
+        }
+    };
     // `~` in a user's crontab is that user's home, not the sweep's.
     let crontab_home = item
         .path
@@ -1097,11 +1152,13 @@ fn follow(scope: &Scope<'_>, item: &Item, search: &Search) -> Followed {
             let (matched, more) = commands::glob_targets(home, command, &list);
             // A directory a pattern matches too (`/*`) is no more run
             // than one a command names.
-            targets.extend(
-                matched
-                    .into_iter()
-                    .filter(|target| names_a_file(scope, target, by)),
-            );
+            for target in matched
+                .into_iter()
+                .filter(|target| names_a_file(scope, target, by))
+            {
+                record(command, &target);
+                targets.push(target);
+            }
             if more {
                 limit(format!(
                     "only the first {} files a pattern names",
@@ -1140,6 +1197,7 @@ fn follow(scope: &Scope<'_>, item: &Item, search: &Search) -> Followed {
         };
         for part in parts {
             for target in lookup.targets(&part) {
+                record(command, &target);
                 if !targets.contains(&target) {
                     targets.push(target);
                 }
@@ -1152,27 +1210,52 @@ fn follow(scope: &Scope<'_>, item: &Item, search: &Search) -> Followed {
             ));
         }
     }
+    let (targets, configuration) = settle(scope, view, by, targets, &read_in, &started);
+    Followed {
+        targets,
+        configuration,
+        unfollowed,
+    }
+}
+
+/// The paths among `targets` that are followed, as the walk reaches them,
+/// and those among them that are read as configuration and not run (in
+/// `read_in`, and in `started` under no command).
+fn settle(
+    scope: &Scope<'_>,
+    view: Option<View>,
+    by: Option<&str>,
+    targets: Vec<String>,
+    read_in: &[String],
+    started: &[String],
+) -> (Vec<String>, Vec<String>) {
     let under =
         |places: &[&str], target: &str| places.iter().any(|place| target.starts_with(place));
-    let targets = targets
-        .into_iter()
-        .filter(|target| {
-            if under(FILES_ONLY, target) {
-                is_file_there(scope, target, by)
-            } else {
-                !under(NOT_FOLLOWED, target)
-            }
-        })
-        .filter_map(|target| match view {
+    let mut reached = Vec::new();
+    let mut configuration = Vec::new();
+    for target in targets {
+        let followed = if under(FILES_ONLY, &target) {
+            is_file_there(scope, &target, by)
+        } else {
+            !under(NOT_FOLLOWED, &target)
+        };
+        if !followed {
+            continue;
+        }
+        let path = match view {
             // The path the pinned walk took, not one resolved again.
             Some(view) => read::seen(scope.root, &target, view).map(|seen| seen.path),
             None => read::canonical(scope.root, &target),
-        })
-        .collect();
-    Followed {
-        targets,
-        unfollowed,
+        };
+        let Some(path) = path else {
+            continue;
+        };
+        if read_in.contains(&target) && !started.contains(&target) {
+            configuration.push(path.clone());
+        }
+        reached.push(path);
     }
+    (reached, configuration)
 }
 
 /// The home directory of `user`, relative to the root, from `/etc/passwd`.

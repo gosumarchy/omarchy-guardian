@@ -241,6 +241,7 @@ pub fn collect_command(out: bool, settings: &crate::config::Settings) -> ExitCod
     };
     let accounts = access::accounts(&passwd);
     collect::merge(&mut collection, of_accounts(&scope, &accounts, &readers));
+    collection.truncated.extend(accounts_left_out(&accounts));
     let withheld = withhold_others_jobs(&mut collection.items, &readers, &|job| {
         let uid = fs::symlink_metadata(Path::new("/").join(job)).ok()?.uid();
         accounts
@@ -357,6 +358,25 @@ fn accounts_in_group(gid: u32, passwd: &str, group: &str) -> Vec<String> {
 /// The most accounts with a home under `/home` whose keys are looked at.
 const MAX_ACCOUNTS: usize = 200;
 
+/// The accounts `of_accounts` looks at: not root, with a home under
+/// `/home`.
+fn with_a_home(accounts: &[Account]) -> impl Iterator<Item = &Account> {
+    accounts
+        .iter()
+        .filter(|account| account.uid != 0 && account.home.starts_with("home/"))
+}
+
+/// What is said when there are more such accounts than are looked at:
+/// the keys and unit overrides of the rest were not checked.
+fn accounts_left_out(accounts: &[Account]) -> Option<String> {
+    let more = with_a_home(accounts).count().saturating_sub(MAX_ACCOUNTS);
+    (more > 0).then(|| {
+        format!(
+            "more than {MAX_ACCOUNTS} accounts with a home under /home: the keys of {more} were not looked at"
+        )
+    })
+}
+
 /// What root reports about the accounts with a home under `/home`, each
 /// looked at as that account could look itself (no link followed, nothing
 /// read that it could not read): for the accounts the results go to
@@ -366,11 +386,7 @@ const MAX_ACCOUNTS: usize = 200;
 /// keys those are is that account's business, like its crontab.
 fn of_accounts(scope: &Scope<'_>, accounts: &[Account], readers: &[String]) -> Vec<Item> {
     let mut items = Vec::new();
-    for account in accounts
-        .iter()
-        .filter(|account| account.uid != 0 && account.home.starts_with("home/"))
-        .take(MAX_ACCOUNTS)
-    {
+    for account in with_a_home(accounts).take(MAX_ACCOUNTS) {
         let reader = readers.contains(&account.name);
         if reader {
             items.extend(own::of_account(scope, &account.home, account.uid));
@@ -935,6 +951,31 @@ pub fn merge(collection: &mut Collection, part: RootPart) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn more_accounts_than_are_looked_at_is_said() {
+        use super::{MAX_ACCOUNTS, accounts_left_out};
+        let passwd = |count: usize| {
+            let mut lines = vec![
+                "root:x:0:0::/root:/bin/bash".to_string(),
+                "svc:x:900:900::/srv/svc:/bin/sh".to_string(),
+            ];
+            lines.extend((0..count).map(|number| {
+                let uid = 1000 + number;
+                format!("u{number}:x:{uid}:{uid}::/home/u{number}:/bin/bash")
+            }));
+            let text = lines.join("\n");
+            crate::sweep::access::accounts(&text)
+        };
+        // Root and an account whose home is elsewhere are not counted.
+        assert_eq!(accounts_left_out(&passwd(MAX_ACCOUNTS)), None);
+        assert_eq!(
+            accounts_left_out(&passwd(MAX_ACCOUNTS + 2)).as_deref(),
+            Some(
+                "more than 200 accounts with a home under /home: the keys of 2 were not looked at"
+            )
+        );
+    }
+
     #[test]
     fn other_accounts_crontabs_are_withheld() {
         use super::{accounts_in_group, withhold_others_jobs};

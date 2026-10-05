@@ -618,8 +618,24 @@ fn counted_item(origin: Origin, account: &Account, mut all: Vec<String>, too_lar
     item
 }
 
-/// What `scope` sees of accounts, groups and its own home's keys.
-pub fn items(scope: &Scope<'_>) -> Vec<Item> {
+/// What is said when there are more accounts, members and keys than
+/// become items: `left_out` of them were not listed.
+fn left_out(left_out: usize) -> String {
+    format!(
+        "more than {MAX_FACTS} accounts, members of administrator groups and keys: {left_out} were not listed"
+    )
+}
+
+/// `items` within the bound, and what to say of the rest, if any.
+fn bounded(mut items: Vec<Item>) -> (Vec<Item>, Option<String>) {
+    let more = items.len().saturating_sub(MAX_FACTS);
+    items.truncate(MAX_FACTS);
+    (items, (more > 0).then(|| left_out(more)))
+}
+
+/// What `scope` sees of accounts, groups and its own home's keys; and,
+/// where there were more than are listed, a sentence that says so.
+pub fn items(scope: &Scope<'_>) -> (Vec<Item>, Option<String>) {
     let read = |path: &str| fs::read_to_string(scope.root.join(path)).unwrap_or_default();
     let passwd = accounts(&read("etc/passwd"));
     // Only root reads `/etc/shadow`, by its fixed path and never following
@@ -674,8 +690,7 @@ pub fn items(scope: &Scope<'_>) -> Vec<Item> {
             Some(collect::look(scope, Category::Ssh, path, None))
         }));
     }
-    items.truncate(MAX_FACTS);
-    items
+    bounded(items)
 }
 
 /// The keys of `account`, as the root collector may report them: read as
@@ -946,6 +961,34 @@ mod tests {
     }
 
     #[test]
+    fn more_facts_than_are_listed_is_said() {
+        use super::{MAX_FACTS, bounded, fact};
+        use crate::sweep::collect::Origin;
+        let facts = |count: usize| {
+            (0..count)
+                .map(|number| {
+                    fact(
+                        Origin::System,
+                        format!("etc/passwd#u{number}"),
+                        String::new(),
+                        String::new(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let (items, said) = bounded(facts(MAX_FACTS));
+        assert_eq!((items.len(), said), (MAX_FACTS, None));
+        let (items, said) = bounded(facts(MAX_FACTS + 3));
+        assert_eq!(items.len(), MAX_FACTS);
+        assert_eq!(
+            said.as_deref(),
+            Some(
+                "more than 500 accounts, members of administrator groups and keys: 3 were not listed"
+            )
+        );
+    }
+
+    #[test]
     fn keys_the_server_keeps_outside_the_home_are_read_for_their_account() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -1002,7 +1045,7 @@ mod tests {
         assert_eq!(counted.len(), 1);
         assert!(counted[0].notes[0].starts_with("1 key(s) may log in as v"));
         // The user's own sweep finds the same file from its home.
-        let own = super::items(&Scope {
+        let (own, _) = super::items(&Scope {
             root,
             home: Some("home/v"),
             index: &index,
