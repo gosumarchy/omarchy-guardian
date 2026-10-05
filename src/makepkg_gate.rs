@@ -205,6 +205,9 @@ impl Confirm for Asker {
 }
 
 pub fn run(command: &[OsString], settings: &Settings) -> ExitCode {
+    // makepkg's standard output is makepkg's: the helper that called it
+    // reads the package list and the source listing from it.
+    crate::output::leave_stdout_to_the_command();
     let Some((makepkg, arguments)) = command.split_first() else {
         errln!("omarchy-guardian makepkg-gate: no makepkg command was given");
         return ExitCode::from(2);
@@ -2684,9 +2687,19 @@ fn aur_info(base: &str, names: &[String]) -> Result<Option<AurInfo>, Error> {
     if query.is_empty() {
         return Ok(None);
     }
-    let mut args = osv::curl_args();
-    args.push(format!("{RPC_URL}?{}", query.join("&")).into());
-    let body = tools::run(Path::new(tools::CURL), &args, None, &[], RPC_LIMITS)?.into_success()?;
+    let fetch = |over_ipv4: bool| {
+        let mut args = osv::curl_args();
+        if over_ipv4 {
+            args.push("--ipv4".into());
+        }
+        args.push(format!("{RPC_URL}?{}", query.join("&")).into());
+        tools::run(Path::new(tools::CURL), &args, None, &[], RPC_LIMITS)
+            .and_then(tools::Captured::into_success)
+    };
+    // A second try over IPv4: the AUR has answered there while dropping
+    // every IPv6 connection, and curl does not fall back by itself once the
+    // connection was made.
+    let body = fetch(false).or_else(|_| fetch(true))?;
     let reply = Json::parse(&String::from_utf8_lossy(&body))
         .map_err(|error| Error::parse("the AUR reply", error))?;
     Ok(aur::parse_rpc_info(&reply, base))
