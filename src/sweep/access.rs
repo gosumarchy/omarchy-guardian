@@ -452,6 +452,27 @@ fn sshd_configuration(scope: &Scope<'_>) -> Vec<String> {
         .collect()
 }
 
+/// What `found` at `path` is, past a link: a key file kept elsewhere under
+/// another name (a dotfiles directory) is the account's key file all the
+/// same, and the server reads it through the link. `look` says what is at
+/// a path as far as the one who chose the link may see: a link to a file
+/// they could not read shows nothing.
+fn past_link(
+    path: &str,
+    found: Option<Found>,
+    look: &dyn Fn(&str) -> Option<Found>,
+) -> Option<Found> {
+    let Some(Found::Link(target)) = &found else {
+        return found;
+    };
+    let hop = |next: &str| match look(next) {
+        Some(Found::Link(further)) => Some(Some(further)),
+        Some(_) => Some(None),
+        None => None,
+    };
+    read::resolve_where(path, target, &hop).and_then(|resolved| look(&resolved))
+}
+
 /// How the key files of an account are looked at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Detail {
@@ -686,8 +707,19 @@ pub fn items(scope: &Scope<'_>) -> (Vec<Item>, Option<String>) {
         } else {
             scope.origin
         };
+        // Where a key file is a link: a user's sweep reads what it leads to
+        // as that user; root reads it while the whole way is root's alone,
+        // and past that only what everyone may read.
+        let behind = |path: &str| {
+            if scope.origin == Origin::Root {
+                read::look_as(scope.root, path, View::Trusted)
+            } else {
+                Some(read::look(scope.root, path))
+            }
+        };
         items.extend(key_items(origin, &own, &files, Detail::Keys, &|path| {
-            Some(collect::look(scope, Category::Ssh, path, None))
+            let found = collect::look(scope, Category::Ssh, path, None);
+            past_link(path, Some(found), &behind)
         }));
     }
     bounded(items)
@@ -710,6 +742,9 @@ pub fn items(scope: &Scope<'_>) -> (Vec<Item>, Option<String>) {
 pub fn keys_of(scope: &Scope<'_>, account: &Account, detail: Detail) -> Vec<Item> {
     let files = key_files(&sshd_configuration(scope), account);
     let home = format!("{}/", account.home);
+    // A link is the account's to make: what it leads to is read only as
+    // the account could read it, whatever the path says.
+    let as_account = |path: &str| read::look_as(scope.root, path, View::Owner(account.uid));
     key_items(Origin::Root, account, &files, detail, &|path| {
         if !path.starts_with(&home)
             && let Some(seen) = read::seen(scope.root, path, View::Pinned)
@@ -717,7 +752,7 @@ pub fn keys_of(scope: &Scope<'_>, account: &Account, detail: Detail) -> Vec<Item
         {
             return Some(read::look_pinned(seen));
         }
-        read::look_as(scope.root, path, View::Owner(account.uid))
+        past_link(path, as_account(path), &as_account)
     })
 }
 

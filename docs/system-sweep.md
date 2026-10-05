@@ -175,6 +175,12 @@ Never followed: a path under `/dev`, `/proc` or `/sys` (under `/dev/shm` and
 `/run` only a regular file is), and the pattern of a shell `case` branch
 (`/*)`), which is matched, not run.
 
+A script that was reached by following is reviewed as text, but only a shell
+start-up file and what it sources or starts is looked through for the
+programs it starts in turn: what a script named by a unit, a crontab or an
+SSH file goes on to run is not collected by the sweep, and is left to the
+review of that script's text.
+
 A file or directory whose name is not valid UTF-8 cannot be checked, and
 shells, udev and pacman read such names all the same: the sweep says so and is
 **incomplete** (exit 2). It is incomplete too when a location holds more than
@@ -708,18 +714,41 @@ checked the same way, one with `*` in its last part to the files it matches. A
 name relative to `~/.ssh` is not followed (`~/.ssh/config.d/` is read in any
 case).
 
+`~/.ssh/rc`, a script the server runs at login, is flagged for being there
+(`ssh-command`); like the other SSH files of a home its text is not sent.
+
 A program one of these files runs is no such file: the script a `ProxyCommand`
 or git's `sshCommand` names is followed and reviewed like any other program,
-by the local rules and the AI. A file that one line includes and another runs
-counts as run.
+by the local rules and the AI. Such a script reads nothing in as
+configuration, whatever its lines look like, and where it is itself a link,
+what the link leads to is the script.
 
 A linked file is treated as the file it stands for. Dotfile managers keep the
 real file under another name (`~/.npmrc` as a link to `~/dotfiles/npmrc`):
-what such a link leads to is read by the rules of the file the link stands
-for and, where that file is kept from the AI (the SSH and git files, the
-package-manager settings, an editor's `settings.json`, fish's saved
-variables), is kept from it as well. What it runs is still a program, and
-reviewed like any other.
+what the link of a catalogued file leads to is read by the rules of the file
+the link stands for (a linked `~/.ssh/rc` or `authorized_keys` by theirs, and
+the keys of a linked key file are listed as for any other) and, where that
+file is kept from the AI (the SSH and git files, the package-manager settings,
+an editor's `settings.json`, fish's saved variables), is kept from it as well.
+That holds wherever the real file is kept: a `~/.gitconfig` that is a link to
+a file on another mount is your home's configuration still. For the keys of
+another account the root checks follow such a link only to a file that
+account could read itself.
+
+A file is kept from the review this way only while every way the sweep reached
+it was as configuration. One that a command names as well (a file one line
+includes and another runs), or that a live check finds running, is a program:
+it is reviewed by the local rules and sent to the AI, whatever links to it or
+includes it. A file under `~/.ssh` is withheld from the AI by its path in any
+case; where such a file is a program, the sweep says so and is incomplete.
+
+Two things show once after an upgrade from Guardian 0.8.1 or earlier. The
+first sweep sends the scripts your SSH and git files run, which earlier
+versions kept back (with secret-looking values taken out, as for any reviewed
+text).
+And an allowed file that a catalogued link leads to (`~/dotfiles/npmrc`) is
+shown again: it is now read by the rules of the file it stands for, and what
+those find is part of what an allow covers.
 
 Binaries no package vouches for are named to the AI by format and hash but
 never run or uploaded.

@@ -1136,15 +1136,25 @@ mod tests {
             "home/v/.config/systemd/user/omarchy-guardian-sweep.service.d/x.conf",
             "[Service]\nEnvironment=HOME=/tmp/x\n",
         );
-        // A key file that is a link (to a file of root's, say) shows nothing.
+        // A key file that is a link to a file the account may read (kept
+        // in a dotfiles directory) is its key file all the same; one that
+        // leads to a file it could not read (a file of root's, say) shows
+        // nothing.
         write("home/w/.ssh/real", &format!("{key} w\n"));
         std::os::unix::fs::symlink("real", root.join("home/w/.ssh/authorized_keys")).unwrap();
+        write("home/x/.ssh/closed", &format!("{key} x\n"));
+        std::os::unix::fs::symlink("closed", root.join("home/x/.ssh/authorized_keys")).unwrap();
+        std::fs::set_permissions(
+            root.join("home/x/.ssh/closed"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .unwrap();
         // Run as root, the homes are root's, and an account with user id 0
         // is root, whose home is not looked at this way: the accounts are
         // `nobody`'s then, and so are their homes where root can give them
         // away (else they are read by what their modes show everyone).
         let uid = if uid == 0 {
-            for home in ["home/u", "home/v", "home/w"] {
+            for home in ["home/u", "home/v", "home/w", "home/x"] {
                 give_tree(&root.join(home));
             }
             crate::test_support::NOBODY
@@ -1152,7 +1162,7 @@ mod tests {
             uid
         };
         let passwd = format!(
-            "root:x:0:0::/root:/bin/bash\nu:x:{uid}:{uid}::/home/u:/bin/bash\nv:x:{uid}:{uid}::/home/v:/bin/bash\nw:x:{uid}:{uid}::/home/w:/bin/bash\nsvc:x:{uid}:{uid}::/srv/svc:/bin/bash\n"
+            "root:x:0:0::/root:/bin/bash\nu:x:{uid}:{uid}::/home/u:/bin/bash\nv:x:{uid}:{uid}::/home/v:/bin/bash\nw:x:{uid}:{uid}::/home/w:/bin/bash\nx:x:{uid}:{uid}::/home/x:/bin/bash\nsvc:x:{uid}:{uid}::/srv/svc:/bin/bash\n"
         );
         let index =
             crate::sweep::index::PackageIndex::with_foreign(std::collections::HashSet::new());
@@ -1168,7 +1178,7 @@ mod tests {
             &["u".to_string()],
         );
         let paths: Vec<&str> = items.iter().map(|item| item.path.as_str()).collect();
-        assert_eq!(paths.len(), 3, "{paths:?}");
+        assert_eq!(paths.len(), 4, "{paths:?}");
         // The reader's own: the override of Guardian's unit, and each key.
         assert_eq!(
             paths[0],
@@ -1180,6 +1190,8 @@ mod tests {
         assert_eq!(paths[2], "home/v/.ssh/authorized_keys#keys");
         assert!(items[2].notes[0].starts_with("2 key(s) may log in as v"));
         assert!(!format!("{items:?}").contains("v@laptop"));
+        assert_eq!(paths[3], "home/w/.ssh/authorized_keys#keys");
+        assert!(items[3].notes[0].starts_with("1 key(s) may log in as w"));
     }
 
     use super::{from_json, merge, to_json};
