@@ -1148,8 +1148,9 @@ pub fn ssh_read_in(text: &str) -> Vec<String> {
 
 /// What a Hyprland `.conf` runs or loads: `exec` and its variants, the
 /// command of a `bind… = MODS, key, exec, command`, a `plugin` (a library
-/// loaded into the compositor) and a `source`d file (one with `*` in its
-/// name is not looked up); and the commands hypridle and its like run when
+/// loaded into the compositor) and a `source`d file (one with `*` or `?`
+/// in its last part is a pattern, which `collect::follow` writes out to
+/// the files it matches); and the commands hypridle and its like run when
 /// the session goes idle, locks or sleeps.
 fn hyprland_conf(text: &str) -> Vec<String> {
     text.lines()

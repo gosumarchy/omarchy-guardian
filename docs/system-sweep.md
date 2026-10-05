@@ -713,6 +713,14 @@ or git's `sshCommand` names is followed and reviewed like any other program,
 by the local rules and the AI. A file that one line includes and another runs
 counts as run.
 
+A linked file is treated as the file it stands for. Dotfile managers keep the
+real file under another name (`~/.npmrc` as a link to `~/dotfiles/npmrc`):
+what such a link leads to is read by the rules of the file the link stands
+for and, where that file is kept from the AI (the SSH and git files, the
+package-manager settings, an editor's `settings.json`, fish's saved
+variables), is kept from it as well. What it runs is still a program, and
+reviewed like any other.
+
 Binaries no package vouches for are named to the AI by format and hash but
 never run or uploaded.
 

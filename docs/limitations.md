@@ -62,6 +62,9 @@ matter most:
   tokens, an editor's `settings.json`, fish's saved variables, `/etc/hosts`,
   `at` jobs); a secret under a name Guardian does not recognise still goes
   with its file ([System sweep](system-sweep.md#what-goes-to-the-review)).
+  Under `local-only` no source is sent to an AI, but lockfile package names
+  and versions still go to the OSV API (`api.osv.dev`), and an AUR package's
+  name (and the names in its PKGBUILD's `pkgname=` lines) to the AUR.
 - **Releases:** a first install cannot check the release signature (there is
   no installed key yet), and someone who controls where you pull from can
   withhold a newer release, though not forge one; see [Verifying a
