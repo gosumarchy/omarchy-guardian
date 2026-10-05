@@ -28,7 +28,7 @@ const LEVELS: [(Profile, &str, &str); 3] = [
     (
         Profile::Standard,
         "Balanced",
-        "AI review for AUR, themes and third-party packages",
+        "AI review for all sources; lenient for official packages",
     ),
     (
         Profile::Strict,
@@ -38,7 +38,7 @@ const LEVELS: [(Profile, &str, &str); 3] = [
     (
         Profile::LocalOnly,
         "Private",
-        "No AI: nothing leaves this machine; you confirm installs",
+        "No AI: source stays here; you confirm your own installs",
     ),
 ];
 
@@ -184,13 +184,13 @@ impl App {
                 "Your own sources and pacman use different levels. Pick one to protect both the same way."
             }
             Some(Profile::Standard) => {
-                "Balanced protection is on. I read AUR builds, themes and third-party packages before they run."
+                "Balanced protection is on. I read packages, AUR builds, themes and plugins before they run."
             }
             Some(Profile::Strict) => {
                 "Maximum protection. Everything needs a clear AI review, and any finding stops the install."
             }
             Some(Profile::LocalOnly) => {
-                "Private mode. Nothing leaves this machine: I check locally and ask you before anything runs."
+                "Private mode. No source goes to an AI: I check locally and ask before your own installs run."
             }
         };
         (text.into(), color::GREEN)

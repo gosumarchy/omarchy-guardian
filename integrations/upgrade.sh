@@ -122,7 +122,7 @@ for tool in /usr/bin/git /usr/bin/ssh-keygen /usr/bin/tar /usr/bin/vercmp /usr/b
     [[ -x $tool ]] || die "$tool is needed"
 done
 if [[ ! -e $SIGNERS && ! -L $SIGNERS ]]; then
-    die "this installed Guardian carries no release keys ($SIGNERS), so a release cannot be verified. Nothing was built. See 'Verifying a release' in the README for checking a tag by hand."
+    die "this installed Guardian carries no release keys ($SIGNERS), so a release cannot be verified. Nothing was built. See 'Verifying a release' in docs/install.md for checking a tag by hand."
 fi
 [[ -f $SIGNERS && ! -L $SIGNERS ]] || die "$SIGNERS is not a regular file"
 if ((INSTALLED_COPY)); then

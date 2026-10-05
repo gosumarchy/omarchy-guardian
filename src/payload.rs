@@ -224,7 +224,7 @@ fn name_violation(package: &str, class: SourceClass, trusted: &[String]) -> Opti
         && !trusted.iter().any(|name| name == package)
     {
         return Some(format!(
-            "{package} does not come from an official repository: a package of that name would replace Guardian's reviewer (name it in [pacman] trusted_reviewer_packages to allow it)"
+            "{package} does not come from an official repository: a package of that name would replace Guardian's reviewer (name it in trusted_reviewer_packages to allow it)"
         ));
     }
     None
@@ -297,7 +297,7 @@ fn protected_violation(
                     "only the omarchy-guardian package, installed from a local archive or an official repository,"
                         .to_string(),
                 Owner::Packages(packages) => format!(
-                    "only {} from an official repository (or a package named in [pacman] trusted_reviewer_packages)",
+                    "only {} from an official repository (or a package named in trusted_reviewer_packages)",
                     packages.join(" or ")
                 ),
                 Owner::Official => "only a package from an official repository".to_string(),

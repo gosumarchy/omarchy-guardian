@@ -37,7 +37,7 @@ pub enum Mood {
     Calm,
     /// Maximum protection.
     Vigilant,
-    /// Private: nothing leaves the machine.
+    /// Private: no AI review, so no source is sent to a provider.
     Private,
     /// Something needs attention: a gate is off or a file is invalid.
     Worried,

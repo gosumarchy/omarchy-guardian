@@ -29,7 +29,7 @@ ask otherwise.
 In scope:
 
 - a package, recipe, theme or plugin that gets code to run, or rights
-  granted, without the review the README says it gets;
+  granted, without the review the documentation says it gets;
 - a way for reviewed content to change Guardian's verdict other than by
   being harmless (steering the reviewer, hiding from the local rules,
   poisoning the review memory of another source);
@@ -41,24 +41,25 @@ In scope:
 - anything that makes the terminal, the saved report or a notification show
   something other than what was reviewed.
 
-Known limits, stated in the README, are not vulnerabilities by themselves:
+Known limits, stated in the README and in full under
+[Limitations](docs/limitations.md), are not vulnerabilities by themselves:
 compiled programs are not inspected, a clear result is not a guarantee, and
 a program already running as your user can change files your user owns.
-A report that shows one of these limits is cheaper to close than the README
-assumes is still welcome.
+A report showing that one of these limits is easier to exploit, or cheaper
+to close, than the documentation says is still welcome.
 
 ## Supported versions
 
 Only the latest release is supported. Upgrade with
 `git pull && /usr/lib/omarchy-guardian/upgrade` in your checkout; while the
-installed Guardian has no release keys or no such file yet, with
-`git pull && ./install.sh`.
+installed Guardian is older than 0.8.0, and so has no release keys and no
+upgrade check, with `git pull && ./install.sh`.
 
 ## Verifying what you install
 
-Releases are annotated git tags (`vX.Y.Z`); from the release that adds the
-key file `packaging/allowed_signers` on, they are signed with an SSH key
-listed there, and the package installs that list as
+Releases are annotated git tags (`vX.Y.Z`); from 0.8.0 on, the release that
+added the key file `packaging/allowed_signers`, they are signed with an SSH
+key listed there, and the package installs that list as
 `/usr/share/omarchy-guardian/allowed_signers`.
 
 **Upgrades** are verified by the Guardian already installed, with
@@ -75,10 +76,11 @@ installed keys it builds nothing.
 
 `./install.sh` has a check of its own: that `HEAD` is the commit of a
 release tag signed by an installed key and that the working tree is exactly
-that commit's tree, file by file, with nothing added. It asks before going
-on when that is not so, and `--yes` does not answer the question. This
-check is part of the checkout it checks. It catches mistakes (the wrong
-commit, a changed file); it is no defence against a checkout that was
+that commit's tree, file by file, with nothing added. With installed keys
+it asks before going on when that is not so, and `--yes` does not answer
+the question; without them (a first install) it says what it found and goes
+on. This check is part of the checkout it checks. It catches mistakes (the
+wrong commit, a changed file); it is no defence against a checkout that was
 tampered with, whose installer could have been changed along with it.
 
 What remains trusted, and is therefore in scope when it can be subverted:
@@ -93,13 +95,16 @@ What remains trusted, and is therefore in scope when it can be subverted:
 Known limits:
 
 - A first install has no installed keys: it is trust on first use, unless
-  you verify the tag by hand against a key you have reason to trust (the
-  README's Install section shows how). The same holds for the upgrade to
-  the first release that carries the key list.
+  you verify the tag by hand against a key you have reason to trust
+  ([Verifying a release](docs/install.md#verifying-a-release) shows how).
+  The same holds for the upgrade to 0.8.0, the first release that carries
+  the key list.
 - A package built from a release without the key file installs none, and
   from then on nothing can be verified until one with keys is installed.
 - Someone who controls where you pull from can withhold a newer release.
   They cannot forge one, and cannot pass an older one off as an upgrade.
 - A new signing key takes effect one release after it is added.
 
-The README's Development section says how a release is signed.
+[Cutting a release](docs/development.md#cutting-a-release) says how a
+release is signed, and [Upgrading](docs/install.md#upgrading) what the
+upgrade check does step by step.

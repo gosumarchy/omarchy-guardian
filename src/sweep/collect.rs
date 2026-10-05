@@ -3,7 +3,7 @@
 //! and the programs and scripts the collected files run, each with its
 //! trust tier and content.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::os::fd::AsRawFd as _;
@@ -85,6 +85,55 @@ pub const CLOSED: &str = "its package installs it readable by everyone, and it n
 /// commands nobody followed), and where its text is not reviewed either,
 /// the sweep counts as incomplete.
 pub const NOT_ALL_FOLLOWED: &str = "not all of what it runs was followed: ";
+
+/// How the note starts on an item that is read as more of a catalogued
+/// file's configuration and that nothing runs: where a link in an auto-run
+/// location leads, and a file an SSH `Include` names, however many such
+/// steps away. The catalogued file's path follows. A program one of those
+/// files runs (a `ProxyCommand` script) does not carry it, and is reviewed
+/// like any other program (see `judge::is_local_only`). An item keeps the
+/// note only while every way the sweep reached it was as configuration:
+/// `merge` takes it away from one that another check found running.
+const CONFIGURATION_OF: &str = "read as configuration, not run, of /";
+
+/// How the note starts on such an item that a link leads to: the link's
+/// path follows, which is the name the file is read under (`~/.npmrc` for
+/// the `~/dotfiles/npmrc` it points at).
+const STANDS_FOR: &str = "stands for the link /";
+
+/// The catalogued file `item` is read as more configuration of, relative
+/// to the root, if it is (see `CONFIGURATION_OF`).
+pub fn configuration_of(item: &Item) -> Option<&str> {
+    item.notes
+        .iter()
+        .find_map(|note| note.strip_prefix(CONFIGURATION_OF))
+}
+
+/// The path whose name says what kind of file `item` is: its own, or for
+/// configuration a link leads to, the link's.
+pub fn stands_for(item: &Item) -> &str {
+    configuration_of(item)
+        .and_then(|_| {
+            item.notes
+                .iter()
+                .find_map(|note| note.strip_prefix(STANDS_FOR))
+        })
+        .unwrap_or(&item.path)
+}
+
+/// Whether `item` is of a kind whose text is kept from the review for
+/// what it is (see `judge::is_local_only`): configuration that holds
+/// tokens, hosts and names.
+fn is_kept_by_kind(item: &Item) -> bool {
+    matches!(
+        item.category,
+        Category::Ssh | Category::Git | Category::Trust | Category::Toolchain | Category::Editor
+    ) || (item.category == Category::Shell && item.path.ends_with("/fish_variables"))
+}
+
+fn is_configuration_note(note: &str) -> bool {
+    note.starts_with(CONFIGURATION_OF) || note.starts_with(STANDS_FOR)
+}
 
 /// What stands for the content of a packaged script whose interpreter line
 /// alone was rewritten.
@@ -217,11 +266,41 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
         .map(|(path, category)| item(scope, category, path, None))
         .collect();
     let omarchy = omarchy_paths(scope.root);
+    // What was reached as more configuration (with the catalogued file it
+    // belongs to), what a link led to, and what some command runs: a file
+    // that is both configuration and run is a program.
+    let mut roots: HashMap<String, String> = HashMap::new();
+    let mut linked: HashMap<String, String> = HashMap::new();
+    let mut run: HashSet<String> = HashSet::new();
     while let Some(mut item) = pending.pop() {
-        let followed = follow(scope, &item, &search);
+        // Configuration itself: a catalogued file, or one reached as more
+        // of one and run by nothing so far.
+        let root = if item.run_by.is_none() {
+            Some(item.path.clone())
+        } else if run.contains(&item.path) {
+            None
+        } else {
+            roots.get(&item.path).cloned()
+        };
+        let followed = follow(scope, &item, &search, root.is_some());
+        let link = matches!(item.body, Body::Link(_));
         for target in followed.targets {
+            match &root {
+                Some(root) if followed.configuration.contains(&target) => {
+                    roots.entry(target.clone()).or_insert_with(|| root.clone());
+                }
+                _ => {
+                    run.insert(target.clone());
+                }
+            }
             if seen.insert(target.clone()) {
-                pending.push(self::item(scope, item.category, target, Some(&item.path)));
+                let mut reached =
+                    self::item(scope, item.category, target.clone(), Some(&item.path));
+                if link {
+                    read_as(scope, &mut reached, &item.path);
+                    linked.insert(target, item.path.clone());
+                }
+                pending.push(reached);
             }
         }
         item.notes.extend(
@@ -240,6 +319,7 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
         collection.items.push(item);
     }
     path::mark(scope, &search, &mut collection.items);
+    mark_configuration(&mut collection.items, &roots, &linked, &run);
     for item in &mut collection.items {
         // The package's own directory, and the one for shared data, may
         // hold a drop-in a repository package ships for every unit;
@@ -255,12 +335,94 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
     collection
         .items
         .sort_by(|left, right| left.path.cmp(&right.path));
-    merge(&mut collection, access::items(scope));
+    add_facts(scope, &mut collection);
+    collection
+}
+
+/// Adds what is no file of an auto-run location: who may log in and
+/// administer, and how the machine was started.
+fn add_facts(scope: &Scope<'_>, collection: &mut Collection) {
+    let (facts, left_out) = access::items(scope);
+    merge(collection, facts);
+    // Root has nothing behind it to cover what it left out; a user's
+    // sweep says so in a note.
+    if let Some(sentence) = left_out {
+        if scope.origin == Origin::Root {
+            collection.truncated.push(sentence);
+        } else {
+            collection.notes.push(sentence);
+        }
+    }
     let boot = boot::check(scope);
-    merge(&mut collection, boot.items);
+    merge(collection, boot.items);
     collection.truncated.extend(boot.unchecked);
     collection.notes.extend(boot.notes);
-    collection
+}
+
+/// Puts the notes on the items that were reached as configuration all the
+/// way from a catalogued file (see `CONFIGURATION_OF`): `roots` says of
+/// which file, `linked` which link led to an item, `run` what a command
+/// names.
+fn mark_configuration(
+    items: &mut [Item],
+    roots: &HashMap<String, String>,
+    linked: &HashMap<String, String>,
+    run: &HashSet<String>,
+) {
+    let reached_by: HashMap<String, Option<String>> = items
+        .iter()
+        .map(|item| (item.path.clone(), item.run_by.clone()))
+        .collect();
+    for item in items {
+        if item.run_by.is_some()
+            && is_only_configuration(&item.path, &reached_by, roots, run)
+            && let Some(root) = roots.get(&item.path)
+        {
+            item.notes.push(format!("{CONFIGURATION_OF}{root}"));
+            if let Some(link) = linked.get(&item.path) {
+                item.notes.push(format!("{STANDS_FOR}{link}"));
+            }
+        }
+    }
+}
+
+/// Whether the item at `path` was reached as configuration all the way
+/// from a catalogued file: nothing runs it, and the same holds for the item
+/// that led to it, up to one the catalogue names.
+fn is_only_configuration(
+    path: &str,
+    reached_by: &HashMap<String, Option<String>>,
+    roots: &HashMap<String, String>,
+    run: &HashSet<String>,
+) -> bool {
+    let mut current = path;
+    // Chains are short; one that is not ends as not configuration.
+    for _ in 0..32 {
+        match reached_by.get(current) {
+            Some(None) => return true,
+            Some(Some(by)) if roots.contains_key(current) && !run.contains(current) => {
+                current = by;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Reads `item`, which the link at `link` leads to, as the file that link
+/// stands for: what a file runs and what its settings say is told by its
+/// name (`.npmrc`, `settings.json`), and a dotfile manager keeps the real
+/// file under another one (`~/dotfiles/npmrc`).
+fn read_as(scope: &Scope<'_>, item: &mut Item, link: &str) {
+    let Body::Text(text) = &item.body else {
+        return;
+    };
+    item.runs = commands::commands(item.category, link, text);
+    for alert in settings_alerts(scope, item.category, link, item.tier, &item.body) {
+        if !item.alerts.contains(&alert) {
+            item.alerts.push(alert);
+        }
+    }
 }
 
 /// Whether `item` is the system's or a home's `locale.conf`, which the
@@ -298,6 +460,13 @@ pub fn is_capped(item: &Item) -> bool {
 
 /// Adds `items` to `collection`; an item already there by path gains the
 /// new one's notes and alerts instead of appearing twice.
+///
+/// An item that was reached as configuration only stays that only while
+/// the new one was too: one another check found by itself (running, or as
+/// what a command names) is a program, so the notes that keep it from the
+/// review go. And where a live check found a file whose kind keeps it from
+/// the review (a tool's settings, an SSH file), it is listed as what that
+/// check saw: a file something runs is read as a program.
 pub fn merge(collection: &mut Collection, items: Vec<Item>) {
     for item in items {
         if let Some(existing) = collection
@@ -305,6 +474,13 @@ pub fn merge(collection: &mut Collection, items: Vec<Item>) {
             .iter_mut()
             .find(|existing| existing.path == item.path)
         {
+            if configuration_of(&item).is_none() {
+                let kept = configuration_of(existing).is_some() || is_kept_by_kind(existing);
+                existing.notes.retain(|note| !is_configuration_note(note));
+                if kept && item.category.is_live() {
+                    existing.category = item.category;
+                }
+            }
             for note in item.notes {
                 if !existing.notes.contains(&note) {
                     existing.notes.push(note);
@@ -1057,6 +1233,9 @@ fn is_pattern(command: &str) -> bool {
 struct Followed {
     /// The paths it leads to.
     targets: Vec<String>,
+    /// Those among them that the item reads as more configuration and
+    /// does not run (see `CONFIGURATION_OF`).
+    configuration: Vec<String>,
     /// The limits that were reached, each as the rest of a sentence.
     unfollowed: Vec<String>,
 }
@@ -1064,7 +1243,12 @@ struct Followed {
 /// The paths `item` leads to that need judging too: a link's target, and
 /// the programs and scripts its commands run. A bare command name is
 /// looked up in `search`.
-fn follow(scope: &Scope<'_>, item: &Item, search: &Search) -> Followed {
+///
+/// `configuration` says that `item` is itself configuration (a catalogued
+/// file, or more of one): only then is what it reads in more of the same.
+/// A script some command runs reads nothing in as configuration, whatever
+/// its lines look like.
+fn follow(scope: &Scope<'_>, item: &Item, search: &Search, configuration: bool) -> Followed {
     let mut targets = Vec::new();
     let mut unfollowed: Vec<String> = Vec::new();
     let mut limit = |sentence: String| {
@@ -1075,12 +1259,32 @@ fn follow(scope: &Scope<'_>, item: &Item, search: &Search) -> Followed {
     // Only a link to a regular file leads anywhere to judge (a masked
     // unit's `/dev/null` does not).
     let by = Some(item.path.as_str());
+    // What is read, not run: where a link leads (the same file under
+    // another name), and what an SSH file reads in. Anything a command
+    // names as well is run.
+    let mut read_in: Vec<String> = Vec::new();
+    let mut started: Vec<String> = Vec::new();
     if let Body::Link(target) = &item.body
         && let Some(resolved) = read::resolve_where(&item.path, target, &|next| hop(scope, next))
         && matches!(look_past_link(scope, &resolved), Found::File { .. })
     {
+        read_in.push(resolved.clone());
         targets.push(resolved);
     }
+    let included = match (&item.body, item.category) {
+        (Body::Text(text), Category::Ssh) if configuration => commands::ssh_read_in(text),
+        _ => Vec::new(),
+    };
+    // A file some other line runs under the very same words is run.
+    let times = |list: &[String], command: &str| list.iter().filter(|one| *one == command).count();
+    let mut record = |command: &str, target: &str| {
+        let reads = times(&included, command);
+        if reads > 0 && reads == times(&item.runs, command) {
+            read_in.push(target.to_string());
+        } else {
+            started.push(target.to_string());
+        }
+    };
     // `~` in a user's crontab is that user's home, not the sweep's.
     let crontab_home = item
         .path
@@ -1097,11 +1301,13 @@ fn follow(scope: &Scope<'_>, item: &Item, search: &Search) -> Followed {
             let (matched, more) = commands::glob_targets(home, command, &list);
             // A directory a pattern matches too (`/*`) is no more run
             // than one a command names.
-            targets.extend(
-                matched
-                    .into_iter()
-                    .filter(|target| names_a_file(scope, target, by)),
-            );
+            for target in matched
+                .into_iter()
+                .filter(|target| names_a_file(scope, target, by))
+            {
+                record(command, &target);
+                targets.push(target);
+            }
             if more {
                 limit(format!(
                     "only the first {} files a pattern names",
@@ -1140,6 +1346,7 @@ fn follow(scope: &Scope<'_>, item: &Item, search: &Search) -> Followed {
         };
         for part in parts {
             for target in lookup.targets(&part) {
+                record(command, &target);
                 if !targets.contains(&target) {
                     targets.push(target);
                 }
@@ -1152,27 +1359,52 @@ fn follow(scope: &Scope<'_>, item: &Item, search: &Search) -> Followed {
             ));
         }
     }
+    let (targets, configuration) = settle(scope, view, by, targets, &read_in, &started);
+    Followed {
+        targets,
+        configuration,
+        unfollowed,
+    }
+}
+
+/// The paths among `targets` that are followed, as the walk reaches them,
+/// and those among them that are read as configuration and not run (in
+/// `read_in`, and in `started` under no command).
+fn settle(
+    scope: &Scope<'_>,
+    view: Option<View>,
+    by: Option<&str>,
+    targets: Vec<String>,
+    read_in: &[String],
+    started: &[String],
+) -> (Vec<String>, Vec<String>) {
     let under =
         |places: &[&str], target: &str| places.iter().any(|place| target.starts_with(place));
-    let targets = targets
-        .into_iter()
-        .filter(|target| {
-            if under(FILES_ONLY, target) {
-                is_file_there(scope, target, by)
-            } else {
-                !under(NOT_FOLLOWED, target)
-            }
-        })
-        .filter_map(|target| match view {
+    let mut reached = Vec::new();
+    let mut configuration = Vec::new();
+    for target in targets {
+        let followed = if under(FILES_ONLY, &target) {
+            is_file_there(scope, &target, by)
+        } else {
+            !under(NOT_FOLLOWED, &target)
+        };
+        if !followed {
+            continue;
+        }
+        let path = match view {
             // The path the pinned walk took, not one resolved again.
             Some(view) => read::seen(scope.root, &target, view).map(|seen| seen.path),
             None => read::canonical(scope.root, &target),
-        })
-        .collect();
-    Followed {
-        targets,
-        unfollowed,
+        };
+        let Some(path) = path else {
+            continue;
+        };
+        if read_in.contains(&target) && !started.contains(&target) {
+            configuration.push(path.clone());
+        }
+        reached.push(path);
     }
+    (reached, configuration)
 }
 
 /// The home directory of `user`, relative to the root, from `/etc/passwd`.
@@ -1408,7 +1640,7 @@ mod tests {
             origin: Origin::System,
         };
         let search = crate::sweep::path::search(&scope);
-        let follow = |item: &super::Item| super::follow(&scope, item, &search).targets;
+        let follow = |item: &super::Item| super::follow(&scope, item, &search, true).targets;
         let starred = super::item(&scope, Category::Cron, "var/spool/cron/w".into(), None);
         assert!(follow(&starred).contains(&"etc/open".to_string()));
         // Each command of a line, however they are joined.
@@ -1432,7 +1664,7 @@ mod tests {
         );
         write(root, "var/spool/cron/y", &many);
         let long = super::item(&scope, Category::Cron, "var/spool/cron/y".into(), None);
-        let followed = super::follow(&scope, &long, &search);
+        let followed = super::follow(&scope, &long, &search, true);
         assert!(!followed.targets.contains(&"etc/second".to_string()));
         assert_eq!(
             followed.unfollowed,
@@ -1491,7 +1723,7 @@ mod tests {
             let search = crate::sweep::path::search(&scope);
             let conf = "home/u/.config/hypr/hyprland.conf";
             let sourced = super::item(&scope, Category::Hyprland, conf.into(), None);
-            let mut targets = super::follow(&scope, &sourced, &search).targets;
+            let mut targets = super::follow(&scope, &sourced, &search, true).targets;
             targets.sort();
             assert_eq!(
                 targets,
@@ -1504,7 +1736,7 @@ mod tests {
             let shell = super::item(&scope, Category::Shell, "home/u/.bashrc".into(), None);
             assert_eq!(shell.runs, ["/usr/local/bin/tool"]);
             assert_eq!(
-                super::follow(&scope, &shell, &search).targets,
+                super::follow(&scope, &shell, &search, true).targets,
                 ["usr/local/bin/tool"]
             );
         }
@@ -1540,7 +1772,7 @@ mod tests {
         let by = Some("var/spool/cron/u");
         let as_root = scope(Origin::Root);
         let follow_as = |scope: &Scope<'_>, item: &super::Item| {
-            super::follow(scope, item, &crate::sweep::path::search(scope)).targets
+            super::follow(scope, item, &crate::sweep::path::search(scope), true).targets
         };
         // What the crontab line leads to is not even looked for.
         let crontab = super::item(&as_root, Category::Cron, "var/spool/cron/u".into(), None);

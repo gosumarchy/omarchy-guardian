@@ -259,8 +259,9 @@ fn ask_sweep_root() -> Result<String, String> {
     outln!(
         "\nThe system sweep needs root to check what your user can't read: the sudoers\n\
 file and its drop-ins, polkit rules, root's crontab, shell files and SSH keys,\n\
-and programs only root can read. It only reads them (never /etc/shadow or\n\
-private keys), runs nothing it finds, and reports only what no package vouches\n\
+and programs only root can read. It only reads them: of /etc/shadow only\n\
+whether an account has a password that works (never a hash), and never a\n\
+private key. It runs nothing it finds and reports only what no package vouches\n\
 for. Its daily results are kept readable by your group only."
     );
     let allowed =

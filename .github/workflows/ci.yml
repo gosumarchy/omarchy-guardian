@@ -55,7 +55,7 @@ jobs:
           bash tests/e2e/gates-offline.sh
       - name: Shell syntax
         run: |
-          for script in install.sh integrations/*.sh integrations/*/guardian-* integrations/omarchy/*.sh integrations/omarchy/bin/* packaging/arch/PKGBUILD packaging/arch/*.install tests/e2e/*.sh tests/ai-eval/*.sh; do
+          for script in install.sh integrations/*.sh integrations/*/guardian-* integrations/omarchy/*.sh integrations/omarchy/bin/* packaging/arch/PKGBUILD packaging/arch/*.install tests/*.sh tests/e2e/*.sh tests/ai-eval/*.sh; do
             bash -n "$script"
           done
       # Errors only: these scripts gate installs, so a real mistake (an
@@ -65,4 +65,9 @@ jobs:
         run: |
           shellcheck --severity=error --shell=bash \
             install.sh integrations/*.sh integrations/*/guardian-* integrations/omarchy/*.sh \
-            integrations/omarchy/bin/* tests/e2e/*.sh tests/ai-eval/*.sh
+            integrations/omarchy/bin/* tests/*.sh tests/e2e/*.sh tests/ai-eval/*.sh
+      # Every relative link and #anchor in README.md, SECURITY.md and docs/
+      # names a file and a heading that exist, and every page under docs/ is
+      # in the README's index. No network.
+      - name: Documentation links
+        run: bash tests/docs-links.sh

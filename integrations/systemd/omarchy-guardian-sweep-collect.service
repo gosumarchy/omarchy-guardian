@@ -1,6 +1,6 @@
 [Unit]
 Description=Omarchy Guardian system sweep: what only root can read
-Documentation=file:///usr/share/doc/omarchy-guardian/README.md
+Documentation=file:///usr/share/doc/omarchy-guardian/docs/system-sweep.md
 
 [Service]
 Type=oneshot

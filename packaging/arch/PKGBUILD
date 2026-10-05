@@ -24,7 +24,7 @@ optdepends=('claude-code: the default AI reviewer (models written claude-code/..
             'opencode: the AI reviewer for every other model'
             'gum: the theme and plugin gates ask for a missing URL and for confirmation with it; without it, give the URL and --yes'
             'libnotify: desktop notifications about blocks and about protection that went off'
-            'openssh: ssh-keygen, with which install.sh checks the release tag signature of the next upgrade')
+            'openssh: ssh-keygen, which the upgrade check needs and install.sh uses to verify a release tag signature')
 install=omarchy-guardian.install
 
 _root="$startdir/../.."
@@ -97,7 +97,12 @@ package() {
     for unit in omarchy-guardian-sweep-collect.service omarchy-guardian-sweep-collect.timer; do
         install -Dm644 "integrations/systemd/$unit" "$pkgdir/usr/lib/systemd/system/$unit"
     done
+    # The README links to the pages under docs/ and to SECURITY.md by
+    # relative path, so they are installed in the same layout. The design
+    # notes under docs/superpowers are not part of the documentation.
     install -Dm644 README.md "$pkgdir/usr/share/doc/omarchy-guardian/README.md"
+    install -Dm644 SECURITY.md "$pkgdir/usr/share/doc/omarchy-guardian/SECURITY.md"
+    install -Dm644 -t "$pkgdir/usr/share/doc/omarchy-guardian/docs" docs/*.md
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/omarchy-guardian/LICENSE"
     for wrapper in omarchy omarchy-theme-install omarchy-theme-update omarchy-plugin-add omarchy-plugin-update; do
         install -Dm755 "integrations/omarchy/bin/$wrapper" "$lib/bin/$wrapper"

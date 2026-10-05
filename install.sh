@@ -5,7 +5,8 @@
 #   2. builds the Arch package from this checkout
 #   3. installs it with pacman, by absolute path so any installed Guardian
 #      pacman hook can find the archive
-#   4. makes sure there is an AI reviewer (Claude Code or OpenCode)
+#   4. makes sure there is an AI reviewer (Claude Code, or OpenCode where no
+#      repository has the claude-code package)
 #   5. runs the guided setup on a first install
 #   6. turns every gate on (`omarchy-guardian protect`), showing each step
 #   7. tests the reviewer with a malicious and a harmless sample
@@ -338,7 +339,7 @@ else
         unchecked\ *)
             ok "This checkout matches release tag ${state#unchecked }: no file changed, none added"
             note "The installed Guardian carries no release keys, so the signature is not checked."
-            note "To check it yourself, see 'Verifying a release' in the README."
+            note "To check it yourself, see 'Verifying a release' in docs/install.md."
             ;;
         *)
             why=${state#unsigned }
@@ -402,6 +403,9 @@ step "Checking the AI reviewer"
 again=$ROOT/install.sh
 [[ -n $VERIFIED ]] && again="$UPGRADE (in your checkout)"
 root_owned() { [[ -x $1 && $(stat -c %u -- "$1") == 0 ]]; }
+# claude-code is in Omarchy's repository, not in Arch's own: it is offered
+# only where a configured repository has it.
+in_a_repository() { pacman -Si "$1" >/dev/null 2>&1; }
 has_claude=0 has_opencode=0
 command -v claude >/dev/null && has_claude=1
 command -v opencode >/dev/null && has_opencode=1
@@ -412,7 +416,11 @@ if ((has_claude)); then
         ok "The pacman gate can use the root-owned /usr/bin/claude"
     else
         note "The pacman gate only runs a root-owned reviewer, and /usr/bin/claude is missing."
-        if ask "Install it with: sudo pacman -S --needed claude-code?"; then
+        if ! in_a_repository claude-code; then
+            note "None of your repositories has claude-code. For the pacman gate, install a"
+            note "root-owned OpenCode (sudo pacman -S --needed extra/opencode) and choose an"
+            note "OpenCode model for pacman in: omarchy-guardian tui"
+        elif ask "Install it with: sudo pacman -S --needed claude-code?"; then
             sudo pacman -S --needed "${pacman_flags[@]}" claude-code
             ok "Installed claude-code"
         fi
@@ -423,11 +431,19 @@ elif ((has_opencode)); then
         note "The pacman gate needs a root-owned OpenCode: sudo pacman -S --needed extra/opencode"
 else
     note "No AI reviewer found. Guardian works best with Claude Code (your Claude login)."
-    if ask "Install Claude Code with: sudo pacman -S --needed claude-code?"; then
-        sudo pacman -S --needed "${pacman_flags[@]}" claude-code
+    if in_a_repository claude-code; then
+        reviewer=claude-code reviewer_name='Claude Code'
+        reviewer_login="Log in once by running ${BOLD}claude${RESET}"
+    else
+        note "None of your repositories has claude-code (it is in Omarchy's, not in Arch's)."
+        reviewer=extra/opencode reviewer_name=OpenCode
+        reviewer_login="Set up a provider once by running ${BOLD}opencode${RESET}"
+    fi
+    if ask "Install $reviewer_name with: sudo pacman -S --needed $reviewer?"; then
+        sudo pacman -S --needed "${pacman_flags[@]}" "$reviewer"
         cat <<EOF
 
-  Claude Code is installed. Log in once by running ${BOLD}claude${RESET}, then run
+  $reviewer_name is installed. $reviewer_login, then run
   ${BOLD}$again${RESET} again to finish.
 EOF
         exit 0
