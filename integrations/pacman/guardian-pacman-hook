@@ -9,6 +9,18 @@ export PATH
 
 GUARDIAN=/usr/bin/omarchy-guardian
 
+# The hook file is in libalpm's own hook directory, which pacman reads
+# whatever --hookdir it is given, so this script runs in every transaction
+# from the moment the package is installed. It reviews only once root has
+# turned protection on: enable-system-hook.sh leaves this link, in a
+# directory only root writes and at a path no package may ship. Until then
+# it reads the targets pacman hands it and lets the transaction go on.
+ENABLED=/etc/pacman.d/hooks/omarchy-guardian.hook
+if [ "$(id -u)" -eq 0 ] && [ ! -e "$ENABLED" ] && [ ! -L "$ENABLED" ]; then
+    while read -r _; do :; done
+    exit 0
+fi
+
 if [ ! -x "$GUARDIAN" ]; then
     printf '%s\n' "omarchy-guardian is not installed at $GUARDIAN" >&2
     exit 2
@@ -68,10 +80,19 @@ if [ "$(id -u)" -eq 0 ]; then
     # OpenCode config and credentials under HOME. The review insists on a
     # root-owned OpenCode binary, because this gate sits in front of a root
     # transaction.
-    exec /usr/bin/runuser -u "$invoking_user" -- /usr/bin/env -i \
+    status=0
+    /usr/bin/runuser -u "$invoking_user" -- /usr/bin/env -i \
         HOME="$user_home" USER="$invoking_user" LOGNAME="$invoking_user" \
-        PATH=/usr/bin:/bin LANG=C.UTF-8 \
-        "$GUARDIAN" pacman-hook --pacman-pid "$pacman_pid" --cwd "$pacman_cwd"
+        PATH=/usr/bin:/bin LANG=C.UTF-8 OMARCHY_GUARDIAN_ROOT_HOOK=1 \
+        "$GUARDIAN" pacman-hook --pacman-pid "$pacman_pid" --cwd "$pacman_cwd" || status=$?
+    # Root's own line in the audit trail, which no user process can write.
+    # Exit 10 is a review let through by the user's permit (see
+    # `omarchy-guardian permit`): the permit is taken away here, so it lets
+    # one transaction through. Whether this step works or not, the
+    # transaction goes by the review's exit code alone.
+    "$GUARDIAN" pacman-hook-result "$(id -u "$invoking_user")" "$status" </dev/null || :
+    [ "$status" -ne 10 ] || status=0
+    exit "$status"
 fi
 
 # Only reachable when the hook is run without root, which pacman never does;

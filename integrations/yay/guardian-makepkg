@@ -22,4 +22,10 @@ fi
 # run during the build, before handing over to makepkg. The review memory
 # remembers the build by the build directory's name (yay names it after the
 # package base). .SRCINFO is untrusted input and is not read.
+#
+# The gate may ask on the terminal (/dev/tty) before a build of prebuilt
+# programs, or of a recipe whose sources it cannot follow. A yes is
+# remembered, so the later calls for the same build do not ask again; with
+# no terminal the answer is no and the call exits 2. Standard input and
+# output are left as yay set them.
 exec "$GUARDIAN" makepkg-gate -- "$REAL_MAKEPKG" "$@"

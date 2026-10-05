@@ -13,10 +13,14 @@ jobs:
     runs-on: ubuntu-latest
     # Guardian is Arch-only (pacman, bsdtar, pacman-conf paths), so it is
     # built and tested on Arch.
-    container: archlinux:base-devel
+    # Pinned by digest: a tag can be moved. The packages inside are brought
+    # up to date below, so an old image only costs a longer download.
+    container: archlinux:base-devel@sha256:51dd3d24f7fba779e7c471caeee7804c50e8c134ad948e19685a1c83a42facc3
     steps:
       - name: Install toolchain and test tools
-        run: pacman -Syu --noconfirm --needed rust git libarchive
+        # lua and openssh: the offline suite runs the Hyprland PATH file and
+        # the installer's release check (ssh-keygen) with them.
+        run: pacman -Syu --noconfirm --needed rust git libarchive shellcheck lua openssh
       # Pinned by commit: a tag can be moved.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -35,8 +39,30 @@ jobs:
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --locked
+      # What the gates decide before a review, or with no reviewer to ask:
+      # the real binary and scripts, no AI and no sandbox. The job runs as
+      # root in a throwaway container, so the hook script runs for real here,
+      # not turned on and turned on: for the latter the suite creates and
+      # removes /etc/pacman.d/hooks/omarchy-guardian.hook and
+      # /usr/bin/omarchy-guardian (only with CI=true, as root). The pacman
+      # gate's cases run as real root too. The two suites that need Bubblewrap
+      # with overlays (tests/e2e/sweep.sh, and the makepkg jail part of this
+      # one, which skips itself) do not run in a hosted container, and
+      # tests/e2e/integration-gates.sh and tests/ai-eval need a reviewer.
+      - name: Offline gate tests
+        run: |
+          cargo build --locked --release
+          bash tests/e2e/gates-offline.sh
       - name: Shell syntax
         run: |
-          for script in integrations/*.sh integrations/*/guardian-* integrations/omarchy/*.sh tests/e2e/*.sh; do
+          for script in install.sh integrations/*.sh integrations/*/guardian-* integrations/omarchy/*.sh integrations/omarchy/bin/* packaging/arch/PKGBUILD packaging/arch/*.install tests/e2e/*.sh tests/ai-eval/*.sh; do
             bash -n "$script"
           done
+      # Errors only: these scripts gate installs, so a real mistake (an
+      # unquoted expansion that splits, a test that can never be true) must
+      # not ship. Style notes are left to review.
+      - name: Shell lint
+        run: |
+          shellcheck --severity=error --shell=bash \
+            install.sh integrations/*.sh integrations/*/guardian-* integrations/omarchy/*.sh \
+            integrations/omarchy/bin/* tests/e2e/*.sh tests/ai-eval/*.sh

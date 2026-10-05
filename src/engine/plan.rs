@@ -1,11 +1,12 @@
 //! Turns the files queued for the AI review into chunked requests: rank by
 //! risk, choose what each file is sent as on an upgrade, and pack.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::mem;
 
 use crate::agent::SourceFile;
 use crate::engine::diff;
+use crate::json;
 use crate::rules;
 
 /// Unchanged lines shown around each change in an upgrade diff.
@@ -82,18 +83,15 @@ impl Item {
 }
 
 /// The bytes `text` takes in the request, where it is a JSON string: a
-/// control character is written as six, so a file of them is six times its
-/// size there.
+/// control or invisible character is written as six (twelve past the basic
+/// plane), so a file of them is several times its size there.
 fn weight(text: &str) -> usize {
     text.chars().map(char_weight).sum()
 }
 
-fn char_weight(character: char) -> usize {
-    match character {
-        '"' | '\\' | '\n' | '\r' | '\t' => 2,
-        control if u32::from(control) < 0x20 => 6,
-        other => other.len_utf8(),
-    }
+/// Asked of the writer itself, so the two cannot drift apart.
+const fn char_weight(character: char) -> usize {
+    json::written_len(character)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,6 +159,162 @@ fn stem(name: &str) -> Option<&str> {
     name.rsplit_once('.')
         .map(|(stem, _)| stem)
         .filter(|stem| !stem.is_empty())
+}
+
+/// The directory a path is in; empty at the top level.
+fn directory(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(directory, _)| directory)
+}
+
+/// A directory or a glob written in a text: `hooks.d/*`, `tests/*.dat`,
+/// `for f in dir/`, or a bare `*.sh` beside the file that says it.
+struct Glob<'a> {
+    /// The directory as written, without `.` parts; empty for a bare glob.
+    directory: String,
+    /// What the file name must match; `*` for a directory named alone.
+    pattern: &'a str,
+    /// The directory of the file that wrote it.
+    from: &'a str,
+}
+
+/// What texts say about other files: the words, path parts and globs in
+/// them. A file is named by its name or module name as a word, by its
+/// name as a part of something written as a path, or by a directory or
+/// glob that covers it.
+#[derive(Default)]
+pub(crate) struct Mentions<'a> {
+    words: HashSet<&'a str>,
+    parts: HashSet<&'a str>,
+    /// By the last directory a glob names; under the empty key, the ones
+    /// that name none.
+    globs: HashMap<&'a str, Vec<Glob<'a>>>,
+}
+
+impl<'a> Mentions<'a> {
+    /// Adds what `text`, a file in directory `from`, mentions.
+    pub(crate) fn add(&mut self, from: &'a str, text: &'a str) {
+        for token in text.split(|character: char| {
+            !(character.is_alphanumeric()
+                || matches!(character, '.' | '_' | '-' | '+' | '/' | '*' | '?'))
+        }) {
+            if !token.contains(['/', '*', '?']) {
+                self.word(token);
+                continue;
+            }
+            let mut parts: Vec<&str> = token
+                .split('/')
+                .filter(|part| !part.is_empty() && *part != ".")
+                .collect();
+            let Some(&last) = parts.last() else {
+                continue;
+            };
+            if last.contains(['*', '?']) {
+                parts.pop();
+                // A lone `*` is multiplication more often than a glob.
+                if !parts.is_empty() || last.chars().any(char::is_alphanumeric) {
+                    self.glob(&parts, last, from);
+                }
+            } else if token.ends_with('/') {
+                self.glob(&parts, "*", from);
+            }
+            for part in parts {
+                if !part.contains(['*', '?']) {
+                    self.parts.insert(part);
+                    self.word(part);
+                }
+            }
+        }
+    }
+
+    /// As written, without what may only end a sentence (`see
+    /// payload.c.`), and each part between dots (`pkg.helper`).
+    fn word(&mut self, word: &'a str) {
+        if word.is_empty() {
+            return;
+        }
+        self.words.insert(word);
+        self.words.insert(word.trim_end_matches(['.', '-', '+']));
+        self.words
+            .extend(word.split('.').filter(|part| !part.is_empty()));
+    }
+
+    fn glob(&mut self, directory: &[&'a str], pattern: &'a str, from: &'a str) {
+        self.globs
+            .entry(directory.last().copied().unwrap_or_default())
+            .or_default()
+            .push(Glob {
+                directory: directory.join("/"),
+                pattern,
+                from,
+            });
+    }
+
+    /// Whether the texts name the file at `path`. A short name without an
+    /// extension (`run`, `x`) is a word in too many places: it counts only
+    /// as a part of something written as a path (`build-aux/run`).
+    pub(crate) fn names(&self, path: &str) -> bool {
+        let name = file_name(path);
+        let stem = stem(name);
+        if self.parts.contains(name)
+            || (self.words.contains(name) && (stem.is_some() || name.len() >= MIN_NAMED))
+            || stem.is_some_and(|stem| stem.len() >= MIN_NAMED && self.words.contains(stem))
+        {
+            return true;
+        }
+        let parent = directory(path);
+        let beside = self
+            .globs
+            .get("")
+            .into_iter()
+            .flatten()
+            .filter(|glob| glob.from == parent);
+        // Written from anywhere: `tests/*.dat` is `$srcdir/tests/*.dat`.
+        let under = self
+            .globs
+            .get(file_name(parent))
+            .into_iter()
+            .flatten()
+            .filter(|glob| {
+                !glob.directory.is_empty()
+                    && parent
+                        .strip_suffix(glob.directory.as_str())
+                        .is_some_and(|above| above.is_empty() || above.ends_with('/'))
+            });
+        beside
+            .chain(under)
+            .any(|glob| glob_matches(glob.pattern, name))
+    }
+}
+
+/// Whether `name` matches a shell pattern of literal characters, `*` and
+/// `?`.
+pub(crate) fn glob_matches(pattern: &str, name: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    let (mut at, mut seen) = (0, 0);
+    // Where the last `*` was, and how much of the name it has taken.
+    let mut star: Option<(usize, usize)> = None;
+    while seen < name.len() {
+        match pattern.get(at) {
+            Some('*') => {
+                star = Some((at, seen));
+                at += 1;
+            }
+            Some(&character) if character == '?' || character == name[seen] => {
+                at += 1;
+                seen += 1;
+            }
+            _ => {
+                let Some((star_at, taken)) = star else {
+                    return false;
+                };
+                star = Some((star_at, taken + 1));
+                at = star_at + 1;
+                seen = taken + 1;
+            }
+        }
+    }
+    pattern[at..].iter().all(|character| *character == '*')
 }
 
 /// Which of `names` the texts hold as a word: a file name they mention.
@@ -262,6 +416,9 @@ pub struct Plan {
     pub chunks: Vec<Vec<Item>>,
     pub manifest: Vec<ManifestEntry>,
     pub upgrade: bool,
+    /// On an upgrade, the unchanged files a new or changed file names that
+    /// did not fit beside the changes and were not sent.
+    pub named_not_sent: Vec<String>,
 }
 
 /// The plan needs more than `max_chunks` requests, or the manifest and
@@ -452,9 +609,12 @@ fn build_with(input: &PlanInput<'_>, extras: bool) -> Result<Plan, TooLarge> {
         .iter()
         .map(|(tier, _, file)| choose(file, *tier == 0, input.previous, capacity, &mut whole_room))
         .collect();
-    if let Some(previous) = input.previous.filter(|_| extras) {
-        send_what_a_change_names(&ranked, &mut choices, previous, capacity);
-    }
+    // Without the extras nothing named is sent along, and all of it is
+    // reported as left out.
+    let named_room = if extras { capacity / NAMED_SHARE } else { 0 };
+    let named_not_sent = input.previous.map_or_else(Vec::new, |previous| {
+        send_what_a_change_names(&ranked, &mut choices, previous, named_room)
+    });
 
     let mut manifest = Vec::with_capacity(ranked.len() + removed.len());
     let mut items = Vec::new();
@@ -509,7 +669,7 @@ fn build_with(input: &PlanInput<'_>, extras: bool) -> Result<Plan, TooLarge> {
     }
     manifest.extend(hash_only);
 
-    let chunks = pack(items, capacity)?;
+    let chunks = pack(items, capacity, input.files)?;
     if chunks.len() > input.max_chunks {
         return Err(TooLarge::INPUT);
     }
@@ -517,55 +677,45 @@ fn build_with(input: &PlanInput<'_>, extras: bool) -> Result<Plan, TooLarge> {
         chunks,
         manifest,
         upgrade: input.previous.is_some(),
+        named_not_sent,
     })
 }
 
-/// On an upgrade, turns the unchanged files a changed one names into
-/// whole ones, code first, while they fit `NAMED_SHARE` of a request: a
-/// change that only switches on what another file already held is then
-/// seen with that file.
+/// On an upgrade, turns the unchanged files a new or changed one names
+/// into whole ones, the riskiest first, while they fit `room`: a change
+/// that only switches on what another file already held is then seen with
+/// that file. Returns the named files that did not fit, which stay listed
+/// as unchanged.
 fn send_what_a_change_names(
     ranked: &[(u8, bool, &SourceFile)],
     choices: &mut [Choice],
     previous: &Previous,
-    capacity: usize,
-) {
-    let names: HashSet<&str> = ranked
-        .iter()
-        .zip(choices.iter())
-        .filter(|((tier, documentation, _), choice)| {
-            matches!(choice, Choice::Unchanged) && *tier <= 1 && !documentation
-        })
-        .flat_map(|((_, _, file), _)| {
-            let name = file_name(&file.path);
-            [Some(name), stem(name)]
-        })
-        .flatten()
-        .filter(|name| name.len() >= MIN_NAMED)
-        .collect();
-    let named = named_in(
-        &names,
-        // The files that are new or changed: an entry point sent whole
-        // as it was names nothing new.
-        &mut ranked
-            .iter()
-            .filter(|(_, _, file)| previous.get(&file.path) != Some(&file.content))
-            .map(|(_, _, file)| file.content.as_str()),
-    );
-    let mut room = capacity / NAMED_SHARE;
+    mut room: usize,
+) -> Vec<String> {
+    // The files that are new or changed: an entry point sent whole as it
+    // was names nothing new.
+    let mut mentions = Mentions::default();
+    for (_, _, file) in ranked {
+        if previous.get(&file.path) != Some(&file.content) {
+            mentions.add(directory(&file.path), &file.content);
+        }
+    }
+    // Any unchanged file, whatever it is: what a change switches on may be
+    // a test fixture, a build helper or a document as well as code.
+    let mut left_out = Vec::new();
     for ((_, _, file), choice) in ranked.iter().zip(choices.iter_mut()) {
-        let name = file_name(&file.path);
-        if !matches!(choice, Choice::Unchanged)
-            || !(named.contains(name) || stem(name).is_some_and(|stem| named.contains(stem)))
-        {
+        if !matches!(choice, Choice::Unchanged) || !mentions.names(&file.path) {
             continue;
         }
         let cost = file.path.len() + weight(&file.content);
         if cost <= room {
             room -= cost;
             *choice = Choice::Named;
+        } else {
+            left_out.push(file.path.clone());
         }
     }
+    left_out
 }
 
 /// What an upgrade sends for one file. Entry points always go whole, and
@@ -608,26 +758,218 @@ fn choose(
     }
 }
 
-/// Packs items in order, starting a new chunk when the next one does not fit.
-fn pack(items: Vec<Item>, capacity: usize) -> Result<Vec<Vec<Item>>, TooLarge> {
-    let mut chunks = Vec::new();
-    let mut current: Vec<Item> = Vec::new();
-    let mut used = 0;
+/// Packs items in order, starting a new chunk when the next one does not
+/// fit. A source that needs several chunks is then packed again with the
+/// files that belong together side by side (see `groups`), and that
+/// packing is used when it needs no more chunks: each chunk is judged on
+/// its own files, so a file and what it runs are better judged together.
+fn pack(
+    items: Vec<Item>,
+    capacity: usize,
+    files: &[SourceFile],
+) -> Result<Vec<Vec<Item>>, TooLarge> {
+    let mut pieces = Vec::new();
     for item in items {
-        for piece in split(item, capacity)? {
-            let cost = piece.cost();
-            if used + cost > capacity && !current.is_empty() {
-                chunks.push(mem::take(&mut current));
-                used = 0;
-            }
-            used += cost;
-            current.push(piece);
-        }
+        pieces.extend(split(item, capacity)?);
     }
-    if !current.is_empty() {
-        chunks.push(current);
+    let costs: Vec<usize> = pieces.iter().map(Item::cost).collect();
+    let in_order: Vec<usize> = (0..pieces.len()).collect();
+    let plain = fill(&in_order, &costs, None, capacity);
+    let chunk_count = |filled: &[usize]| filled.last().map_or(0, |last| last + 1);
+
+    let (order, filled) = if chunk_count(&plain) > 1 {
+        let (grouped, group_of) = groups(&pieces, files);
+        // Whole groups in one chunk where that costs nothing, else at
+        // least next to each other.
+        [Some(group_of.as_slice()), None]
+            .into_iter()
+            .map(|whole| fill(&grouped, &costs, whole, capacity))
+            .find(|filled| chunk_count(filled) <= chunk_count(&plain))
+            .map_or((in_order, plain), |filled| (grouped, filled))
+    } else {
+        (in_order, plain)
+    };
+
+    let mut chunks: Vec<Vec<Item>> = Vec::new();
+    chunks.resize_with(chunk_count(&filled), Vec::new);
+    let mut pieces: Vec<Option<Item>> = pieces.into_iter().map(Some).collect();
+    for (index, chunk) in order.into_iter().zip(filled) {
+        chunks[chunk].extend(pieces[index].take());
     }
     Ok(chunks)
+}
+
+/// The chunk each of `order` (indexes into `costs`) goes in, filling
+/// chunks in turn. With `group_of`, a group that would be cut by the end
+/// of the chunk, and fits a chunk of its own, starts a new one.
+fn fill(
+    order: &[usize],
+    costs: &[usize],
+    group_of: Option<&[usize]>,
+    capacity: usize,
+) -> Vec<usize> {
+    let mut filled = Vec::with_capacity(order.len());
+    let mut chunk = 0;
+    let mut used = 0;
+    for (position, &index) in order.iter().enumerate() {
+        let starts_group = group_of.is_some_and(|group_of| {
+            position == 0 || group_of[order[position - 1]] != group_of[index]
+        });
+        let needed = match group_of.filter(|_| starts_group) {
+            Some(group_of) => {
+                let whole: usize = order[position..]
+                    .iter()
+                    .take_while(|next| group_of[**next] == group_of[index])
+                    .map(|next| costs[*next])
+                    .sum();
+                if whole <= capacity {
+                    whole
+                } else {
+                    costs[index]
+                }
+            }
+            None => costs[index],
+        };
+        if used + needed > capacity && used > 0 {
+            chunk += 1;
+            used = 0;
+        }
+        used += costs[index];
+        filled.push(chunk);
+    }
+    filled
+}
+
+/// The pieces in an order that puts side by side what belongs together,
+/// and a group number for each piece. Files in the same directory share a
+/// group, and so do a file and the files it names. Groups come in the
+/// order of their riskiest file; within one, each file is followed by the
+/// files it names, and otherwise the order the files had is kept.
+fn groups(pieces: &[Item], files: &[SourceFile]) -> (Vec<usize>, Vec<usize>) {
+    let mut paths: Vec<&str> = Vec::new();
+    let mut numbers: HashMap<&str, usize> = HashMap::new();
+    let mut pieces_of: Vec<Vec<usize>> = Vec::new();
+    for (index, piece) in pieces.iter().enumerate() {
+        let path = *numbers.entry(piece.path()).or_insert_with(|| {
+            paths.push(piece.path());
+            pieces_of.push(Vec::new());
+            paths.len() - 1
+        });
+        pieces_of[path].push(index);
+    }
+    // Each path starts as its own group.
+    let mut group: Vec<usize> = (0..paths.len()).collect();
+    let mut by_directory: HashMap<&str, usize> = HashMap::new();
+    for (index, path) in paths.iter().enumerate() {
+        let first = *by_directory.entry(directory(path)).or_insert(index);
+        join_groups(&mut group, first, index);
+    }
+    let content: HashMap<&str, &str> = files
+        .iter()
+        .map(|file| (file.path.as_str(), file.content.as_str()))
+        .collect();
+    let mut named: Vec<Vec<usize>> = vec![Vec::new(); paths.len()];
+    for (index, path) in paths.iter().enumerate() {
+        let Some(text) = content.get(path) else {
+            continue;
+        };
+        let mut mentions = Mentions::default();
+        mentions.add(directory(path), text);
+        for (other, candidate) in paths.iter().enumerate() {
+            if other != index && mentions.names(candidate) {
+                join_groups(&mut group, index, other);
+                named[index].push(other);
+            }
+        }
+    }
+
+    let mut members: HashMap<usize, Vec<usize>> = HashMap::new();
+    for path in 0..paths.len() {
+        members
+            .entry(group_root(&mut group, path))
+            .or_default()
+            .push(path);
+    }
+    let mut placed = vec![false; paths.len()];
+    let mut order = Vec::with_capacity(pieces.len());
+    for first in 0..paths.len() {
+        let group = group_root(&mut group, first);
+        for &member in members.remove(&group).iter().flatten() {
+            // A file, then what it names, then what those name.
+            let mut next = vec![member];
+            while let Some(path) = next.pop() {
+                if mem::replace(&mut placed[path], true) {
+                    continue;
+                }
+                order.extend(&pieces_of[path]);
+                next.extend(named[path].iter().rev().filter(|other| !placed[**other]));
+            }
+        }
+    }
+    let mut group_of = vec![0; pieces.len()];
+    for (path, pieces) in pieces_of.iter().enumerate() {
+        let group = group_root(&mut group, path);
+        for &piece in pieces {
+            group_of[piece] = group;
+        }
+    }
+    (order, group_of)
+}
+
+/// The group `index` is in: the entry that stands for itself at the end of
+/// the chain from it.
+fn group_root(group: &mut [usize], mut index: usize) -> usize {
+    while group[index] != index {
+        group[index] = group[group[index]];
+        index = group[index];
+    }
+    index
+}
+
+/// Makes two groups one, named by the earlier of the two.
+fn join_groups(group: &mut [usize], left: usize, right: usize) {
+    let (left, right) = (group_root(group, left), group_root(group, right));
+    group[left.max(right)] = left.min(right);
+}
+
+/// The files of one chunk that name files of another, as (file, its
+/// chunk, the file it names, that file's chunk), chunks counted from 1:
+/// each chunk is judged without the other's content, so the report says
+/// where a split falls between a file and what it names.
+pub fn split_references(
+    chunks: &[Vec<Item>],
+    files: &[SourceFile],
+) -> Vec<(String, usize, String, usize)> {
+    if chunks.len() < 2 {
+        return Vec::new();
+    }
+    // A file cut into pieces is in the chunk of its first piece here.
+    let mut chunk_of: Vec<(&str, usize)> = Vec::new();
+    for (number, chunk) in chunks.iter().enumerate() {
+        for item in chunk {
+            if !chunk_of.iter().any(|(path, _)| *path == item.path()) {
+                chunk_of.push((item.path(), number + 1));
+            }
+        }
+    }
+    let content: HashMap<&str, &str> = files
+        .iter()
+        .map(|file| (file.path.as_str(), file.content.as_str()))
+        .collect();
+    let mut references = Vec::new();
+    for (path, chunk) in &chunk_of {
+        let Some(text) = content.get(path) else {
+            continue;
+        };
+        let mut mentions = Mentions::default();
+        mentions.add(directory(path), text);
+        for (named, other) in &chunk_of {
+            if other != chunk && mentions.names(named) {
+                references.push(((*path).to_string(), *chunk, (*named).to_string(), *other));
+            }
+        }
+    }
+    references
 }
 
 /// Splits a whole file that exceeds `capacity` into pieces on line
@@ -863,6 +1205,250 @@ mod tests {
                 ("src/payload.c", Sent::Named),
             ]
         );
+    }
+
+    /// The approved version of `files`, as a plan's `previous`.
+    fn approved(files: &[(&str, &str)]) -> Previous {
+        files
+            .iter()
+            .map(|(path, content)| ((*path).to_string(), (*content).to_string()))
+            .collect()
+    }
+
+    fn sent(plan: &Plan) -> Vec<(&str, Sent)> {
+        plan.manifest
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.sent))
+            .collect()
+    }
+
+    #[test]
+    fn a_change_that_switches_on_a_dormant_file_is_sent_with_it() {
+        // The shape of the xz backdoor: files that sit in the tree as test
+        // data and build helpers, and one changed build line that runs them.
+        let dormant = [
+            ("tests/fixture.dat", "#!/bin/sh\necho payload\n"),
+            ("build-aux/run", "exec \"$@\"\n"),
+            ("m4/x.m4", "AC_DEFUN([X], [])\n"),
+            ("configure", "#!/bin/sh\necho configure\n"),
+            ("docs/NOTES.md", "notes\n"),
+            ("src/quiet.c", "int quiet;\n"),
+            ("src/run.c", "int run;\n"),
+        ];
+        let mut before = dormant.to_vec();
+        before.push(("src/build.mk", "all:\n\tcc -o demo src/quiet.c\n"));
+        let previous = approved(&before);
+        let plan_for = |changed: &str| {
+            let mut files: Vec<SourceFile> = dormant
+                .iter()
+                .map(|(path, content)| file(path, content))
+                .collect();
+            files.push(file("src/build.mk", changed));
+            plan(&files, Some(&previous), 256 * 1024, 8).unwrap()
+        };
+        let named = |changed: &str| -> Vec<String> {
+            plan_for(changed)
+                .manifest
+                .iter()
+                .filter(|entry| entry.sent == Sent::Named)
+                .map(|entry| entry.path.clone())
+                .collect()
+        };
+
+        // By path, at any tier, whatever the file is called.
+        assert_eq!(
+            named("all:\n\tsh tests/fixture.dat\n"),
+            ["tests/fixture.dat"]
+        );
+        assert_eq!(
+            named("all:\n\t$(top_srcdir)/build-aux/run x\n"),
+            ["build-aux/run"]
+        );
+        assert_eq!(named("all:\n\tm4 -I m4 x.m4\n"), ["m4/x.m4"]);
+        // An extensionless name of some length, as a bare word.
+        assert_eq!(named("all:\n\t./configure --prefix=/usr\n"), ["configure"]);
+        // Documentation as well: what is run need not look like code.
+        assert_eq!(named("all:\n\tsh docs/NOTES.md\n"), ["docs/NOTES.md"]);
+        // A short name without an extension is a word in too many places:
+        // `run` alone names nothing, as a part of a path it does.
+        assert_eq!(
+            named("all:\n\trun the tests, then run them again\n"),
+            [""; 0]
+        );
+        assert_eq!(named("all:\n\t./build-aux/run\n"), ["build-aux/run"]);
+        // A module name still stands for its file, a short one does not.
+        assert_eq!(named("all:\n\tcc quiet.o\n"), ["src/quiet.c"]);
+        assert_eq!(named("all:\n\tcc run.o\n"), [""; 0]);
+        // A glob or a directory pulls in what it covers, wherever the
+        // changed file is; a bare glob means the files beside it.
+        assert_eq!(
+            named("all:\n\tcat $(srcdir)/tests/*.dat | sh\n"),
+            ["tests/fixture.dat"]
+        );
+        assert_eq!(
+            named("all:\n\tfor f in build-aux/; do sh $$f; done\n"),
+            ["build-aux/run"]
+        );
+        assert_eq!(named("all:\n\tcc *.c\n"), ["src/quiet.c", "src/run.c"]);
+        assert_eq!(named("all:\n\techo 2 * 3\n"), [""; 0]);
+        // Nothing named: only the change is sent.
+        let quiet = plan_for("all:\n\ttrue\n");
+        assert!(quiet.named_not_sent.is_empty());
+        assert_eq!(
+            sent(&quiet)
+                .iter()
+                .filter(|(_, sent)| *sent != Sent::Unchanged)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_named_file_that_does_not_fit_is_reported_not_dropped() {
+        let large = "x = 1\n".repeat(30_000);
+        let previous = approved(&[
+            ("install.mk", "all:\n\ttrue\n"),
+            ("tests/big.dat", &large),
+            ("tests/small.dat", "s\n"),
+        ]);
+        let files = [
+            file("install.mk", "all:\n\tsh tests/big.dat tests/small.dat\n"),
+            file("tests/big.dat", &large),
+            file("tests/small.dat", "s\n"),
+        ];
+        // Half a request is 128 KiB; the file is 180 KiB there.
+        let plan = plan(&files, Some(&previous), 256 * 1024, 8).unwrap();
+        assert_eq!(plan.named_not_sent, ["tests/big.dat"]);
+        assert_eq!(
+            sent(&plan),
+            [
+                ("install.mk", Sent::Whole),
+                ("tests/big.dat", Sent::Unchanged),
+                ("tests/small.dat", Sent::Named),
+            ]
+        );
+    }
+
+    #[test]
+    fn globs_match_as_a_shell_matches_names() {
+        for (pattern, name, matches) in [
+            ("*", "anything", true),
+            ("*.dat", "fixture.dat", true),
+            ("*.dat", "fixture.data", false),
+            ("fix*", "fixture.dat", true),
+            ("f*x*t", "fixture.dat", true),
+            ("f?xture.dat", "fixture.dat", true),
+            ("f?xture.dat", "fxture.dat", false),
+            ("*.d?t", "a.dot", true),
+            ("a*b*c", "abcabc", true),
+            ("a*b*c", "abcab", false),
+            ("", "", true),
+            ("", "a", false),
+            ("**", "", true),
+        ] {
+            assert_eq!(
+                super::glob_matches(pattern, name),
+                matches,
+                "{pattern} {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn files_that_belong_together_share_a_chunk_where_that_is_free() {
+        // Four files, two to a chunk. By rank the two units, which are
+        // entry points, come first and share a chunk, and the scripts they
+        // start share the other; grouped by directory, each unit is with
+        // its script.
+        let body = |seed: &str| format!("# {seed}\n{}", "x".repeat(390));
+        let files = [
+            file("a/x.service", &body("a1")),
+            file("b/y.service", &body("b1")),
+            file("a/two.sh", &body("a2")),
+            file("b/two.sh", &body("b2")),
+        ];
+        let unit = files[0].path.len() + super::weight(&files[0].content);
+        let overhead = 2 * (11 + 32) + 2 * (8 + 32);
+        let by_directory = plan(&files, None, overhead + 2 * unit, 8).unwrap();
+        let chunks: Vec<Vec<&str>> = by_directory
+            .chunks
+            .iter()
+            .map(|chunk| paths(chunk))
+            .collect();
+        assert_eq!(
+            chunks,
+            [["a/x.service", "a/two.sh"], ["b/y.service", "b/two.sh"]]
+        );
+
+        // A file and the file it names, across directories: `run.sh`
+        // sources `lib/z.sh`, which by path would land in another chunk.
+        let files = [
+            file("lib/a.sh", &body("a")),
+            file("lib/b.sh", &body("b")),
+            file("lib/c.sh", &body("c")),
+            file("lib/z.sh", &body("z")),
+            file("run.sh", &format!(". lib/z.sh\n{}", "x".repeat(384))),
+            file("zz/tail.sh", &body("t")),
+        ];
+        let cost = |file: &SourceFile| file.path.len() + super::weight(&file.content);
+        let overhead: usize = files.iter().map(|file| file.path.len() + 32).sum();
+        let plan = plan(&files, None, overhead + 2 * cost(&files[0]) + 6, 8).unwrap();
+        let chunk_of = |path: &str| {
+            plan.chunks
+                .iter()
+                .position(|chunk| paths(chunk).contains(&path))
+                .unwrap()
+        };
+        // Grouping must not cost a chunk: three pairs either way.
+        assert_eq!(plan.chunks.len(), 3);
+        assert_eq!(chunk_of("run.sh"), chunk_of("lib/z.sh"));
+        assert_eq!(chunk_of("run.sh"), 0, "the entry point's group goes first");
+    }
+
+    #[test]
+    fn grouping_never_takes_more_chunks_than_packing_by_rank() {
+        // Sizes that pack tightly by rank and badly by directory: grouped
+        // packing would need a third chunk, so the rank order is kept.
+        let files = [
+            file("a/1.c", &"x".repeat(150)),
+            file("b/1.c", &"x".repeat(50)),
+            file("a/2.c", &"x".repeat(150)),
+            file("b/2.c", &"x".repeat(50)),
+        ];
+        let overhead = 4 * (5 + 32);
+        let by_rank = plan(&files, None, overhead + 2 * 155 + 2 * 55, 8).unwrap();
+        assert_eq!(by_rank.chunks.len(), 1);
+        let tight = plan(&files, None, overhead + 155 + 55 + 100, 8).unwrap();
+        let chunks: Vec<Vec<&str>> = tight.chunks.iter().map(|chunk| paths(chunk)).collect();
+        assert!(chunks.len() <= 2, "{chunks:?}");
+        assert_eq!(chunks.iter().map(Vec::len).sum::<usize>(), 4, "{chunks:?}");
+    }
+
+    #[test]
+    fn references_across_chunks_are_found() {
+        let files = [
+            file("a.sh", &format!(". ./lib/far.sh\n{}", "x".repeat(280))),
+            file("lib/far.sh", &"y".repeat(300)),
+        ];
+        let overhead = (4 + 32) + (10 + 32);
+        let plan = plan(&files, None, overhead + 320, 8).unwrap();
+        assert_eq!(plan.chunks.len(), 2);
+        assert_eq!(
+            super::split_references(&plan.chunks, &files),
+            [("a.sh".to_string(), 1, "lib/far.sh".to_string(), 2)]
+        );
+        let one = build(&PlanInput {
+            files: &files,
+            flagged: &BTreeSet::new(),
+            findings_bytes: 0,
+            previous: None,
+            max_input_bytes: 64 * 1024,
+            max_chunks: 8,
+            unit_prefixes: &[],
+            hash_only: &[],
+        })
+        .unwrap();
+        assert!(super::split_references(&one.chunks, &files).is_empty());
     }
 
     #[test]
@@ -1140,6 +1726,34 @@ mod tests {
         assert!(plan.chunks.len() >= 3, "{}", plan.chunks.len());
         assert!(plan.chunks.iter().flatten().all(|item| item.cost() <= 207));
         assert_eq!(super::weight("a\"\n\u{1}é"), 1 + 2 + 2 + 6 + 2);
+        // An invisible character is charged as the escape it is sent as,
+        // so a file of them cannot outgrow its chunk.
+        let hidden = "x\u{200b}\u{202e}\u{e0041}\u{7f}é\n";
+        assert_eq!(
+            super::weight(hidden),
+            crate::json::Json::from(hidden).to_string().len() - 2
+        );
+        assert_eq!(super::weight("\u{200b}\u{e0041}"), 6 + 12);
+        let tags = [file("tags.txt", &"\u{e0041}".repeat(100))];
+        let tagged = build(&PlanInput {
+            files: &tags,
+            flagged: &BTreeSet::new(),
+            findings_bytes: 0,
+            previous: None,
+            max_input_bytes: 40 + 207,
+            max_chunks: 16,
+            unit_prefixes: &[],
+            hash_only: &[],
+        })
+        .unwrap();
+        assert!(tagged.chunks.len() >= 6, "{}", tagged.chunks.len());
+        assert!(
+            tagged
+                .chunks
+                .iter()
+                .flatten()
+                .all(|item| item.cost() <= 207)
+        );
     }
 
     #[test]

@@ -85,16 +85,33 @@ const WRAPPERS: &[Wrapper] = &[
 /// Subcommands of `uwsm` that run the command after them.
 const UWSM_RUNS: &[&str] = &["app", "start"];
 
-/// Where a bare command name is looked for, relative to the root; `~`
-/// stands for the home directory.
-const SEARCH: &[&str] = &[
+/// Where a bare command name is looked for when the real `PATH`s say
+/// nothing more (see `path::search`), relative to the root; `~` stands for
+/// the home directory. The directories version managers put ahead of
+/// `/usr/bin` come first, as they do on a `PATH`.
+pub const SEARCH: &[&str] = &[
     "~/.local/bin",
     "~/.cargo/bin",
     "~/bin",
+    "~/.local/share/mise/shims",
+    "~/go/bin",
+    "~/.bun/bin",
+    "~/.deno/bin",
+    "~/.local/share/pnpm",
+    "~/.npm-global/bin",
+    "~/.nix-profile/bin",
     "usr/local/sbin",
     "usr/local/bin",
     "usr/bin",
 ];
+
+/// `SEARCH` with the home directory written out.
+pub fn default_search(home: &str) -> Vec<String> {
+    SEARCH
+        .iter()
+        .map(|directory| expand(home, directory).trim_start_matches('/').to_string())
+        .collect()
+}
 
 /// The command lines `text` (a file of `category` named `name`) runs.
 pub fn commands(category: Category, path: &str, text: &str) -> Vec<String> {
@@ -114,17 +131,48 @@ pub fn commands(category: Category, path: &str, text: &str) -> Vec<String> {
             hyprland_conf(text)
         };
     }
+    if name == "mimeapps.list" {
+        return handlers(text);
+    }
+    // An include line of sudoers may start with `#`, like a comment.
+    if category == Category::Sudo {
+        return sudoers(path, text);
+    }
     let variables = if category == Category::Shell {
         path_variables(text)
     } else {
         Vec::new()
     };
+    // systemd reads a line that ends in `\` on into the next one.
+    let joined;
+    let text = if category == Category::Systemd && text.contains("\\\n") {
+        joined = text.replace("\\\n", " ");
+        joined.as_str()
+    } else {
+        text
+    };
     let mut found = Vec::new();
+    let mut cases = Vec::new();
     for line in text.lines() {
         let line = line.trim();
-        if line.starts_with('#') || line.starts_with(';') {
+        if line.starts_with('#') {
             continue;
         }
+        // A line of `;;` alone ends a `case` branch: the next is a pattern.
+        if line.starts_with(';') {
+            if category == Category::Shell && line.len() <= MAX_STARTED_LINE {
+                without_case_patterns(line, &mut cases);
+            }
+            continue;
+        }
+        // A `case` branch's pattern (`/*)`) is matched, not run.
+        let branches;
+        let line = if category == Category::Shell && line.len() <= MAX_STARTED_LINE {
+            branches = without_case_patterns(line, &mut cases);
+            branches.as_str()
+        } else {
+            line
+        };
         let expanded = crate::rules::with_variables(line, &variables);
         // A line that grew past what is looked at is read as written.
         let line = if expanded.len() > MAX_STARTED_LINE {
@@ -140,11 +188,370 @@ pub fn commands(category: Category, path: &str, text: &str) -> Vec<String> {
             Category::Shell => {
                 let mut runs = sourced(line);
                 runs.extend(started(line));
+                runs.extend(zdotdir(line));
                 runs
             }
+            Category::Terminal => terminal(name, line),
+            Category::Toolchain => toolchain(name, line),
+            Category::Browser => native_host(line),
+            Category::Systemd => key_value(line)
+                .into_iter()
+                .map(|command| with_specifiers(path, &command))
+                .collect(),
             _ => key_value(line),
         };
         found.extend(command);
+    }
+    found
+}
+
+/// What of a file of `category` was not looked through for what it runs,
+/// as sentences: a limit was reached, and nobody should take the list of
+/// what it runs for the whole of it.
+pub fn unfollowed(category: Category, text: &str) -> Vec<String> {
+    let long = text
+        .lines()
+        .filter(|line| line.len() > MAX_STARTED_LINE)
+        .count();
+    if category == Category::Shell && long > 0 {
+        vec![format!(
+            "{long} line(s) longer than {MAX_STARTED_LINE} bytes were not looked through for the programs they start"
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+/// What a sudoers file reads in (`@include file`, `@includedir directory`,
+/// and the older `#include` and `#includedir`), and the programs and
+/// plugins `sudo.conf` names. A directory is given as the pattern of its
+/// files; a name relative to the including file is made whole.
+fn sudoers(path: &str, text: &str) -> Vec<String> {
+    let directory = path.rsplit_once('/').map_or("", |(directory, _)| directory);
+    let whole = |file: &str| {
+        let file = file.trim_matches('"');
+        if file.starts_with('/') {
+            file.to_string()
+        } else {
+            format!("/{directory}/{file}")
+        }
+    };
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let included = match words.as_slice() {
+            // `%h` in a name stands for the host name, which is not known
+            // here.
+            [_, file, ..] if file.contains('%') => continue,
+            ["@include" | "#include", file, ..] => whole(file),
+            ["@includedir" | "#includedir", directory, ..] => {
+                format!("{}/*", whole(directory).trim_end_matches('/'))
+            }
+            ["Path" | "Plugin", _, program, ..] if program.starts_with('/') => {
+                (*program).to_string()
+            }
+            _ => continue,
+        };
+        if !found.contains(&included) {
+            found.push(included);
+        }
+    }
+    found
+}
+
+/// systemd's specifiers for the directories a unit's commands live in,
+/// written out: for a user unit the home's own, for a system unit the
+/// system's. `%t` in a user unit is `/run/user/<uid>`, which is not known
+/// here and stays as written.
+fn with_specifiers(path: &str, command: &str) -> String {
+    if !command.contains('%') {
+        return command.to_string();
+    }
+    let user = path.contains("/systemd/user") || path.contains("/containers/systemd/");
+    let directories: &[(&str, &str)] = if user {
+        &[
+            ("%h", "~"),
+            ("%E", "~/.config"),
+            ("%S", "~/.local/state"),
+            ("%C", "~/.cache"),
+            ("%L", "~/.local/state/log"),
+        ]
+    } else {
+        &[
+            ("%h", "/root"),
+            ("%E", "/etc"),
+            ("%S", "/var/lib"),
+            ("%C", "/var/cache"),
+            ("%L", "/var/log"),
+            ("%t", "/run"),
+        ]
+    };
+    command
+        .split(' ')
+        .map(|word| {
+            for (specifier, directory) in directories {
+                if let Some(rest) = word.strip_prefix(specifier)
+                    && (rest.is_empty() || rest.starts_with('/'))
+                {
+                    return format!("{directory}{rest}");
+                }
+            }
+            word.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The start-up files zsh reads from the directory a `ZDOTDIR=` line names
+/// instead of the home.
+fn zdotdir(line: &str) -> Vec<String> {
+    let line = line.strip_prefix("export ").unwrap_or(line);
+    let Some(value) = line.strip_prefix("ZDOTDIR=") else {
+        return Vec::new();
+    };
+    let directory = value
+        .split([';', ' ', '\t'])
+        .next()
+        .unwrap_or_default()
+        .trim_matches(['"', '\''])
+        .trim_end_matches('/');
+    if directory.is_empty() || directory.contains(['`', '(']) {
+        return Vec::new();
+    }
+    [".zshenv", ".zprofile", ".zshrc", ".zlogin", ".zlogout"]
+        .iter()
+        .map(|file| format!("{directory}/{file}"))
+        .collect()
+}
+
+/// The first quoted strings of a TOML or JSON value, joined as the words
+/// of one command: `"x"` and `["sh", "-c", "x"]` alike. A value without
+/// quotes is taken as written.
+fn quoted_words(value: &str) -> String {
+    let value = value.trim();
+    if !value.contains(['"', '\'']) {
+        return value.trim_end_matches(',').to_string();
+    }
+    let mut words = Vec::new();
+    let mut rest = value;
+    while let Some(start) = rest.find(['"', '\'']) {
+        let quote = rest[start..].chars().next().unwrap_or('"');
+        let after = &rest[start + 1..];
+        let Some(end) = after.find(quote) else {
+            break;
+        };
+        words.push(&after[..end]);
+        rest = &after[end + 1..];
+        // An inline table's next key (`program = "x", args = [...]`) is
+        // not part of the command.
+        if rest.trim_start().starts_with('}') {
+            break;
+        }
+    }
+    words.join(" ")
+}
+
+/// What a terminal, a prompt or tmux is told to run each time it starts:
+/// alacritty's `shell`/`program`, kitty's `shell`, `startup_session` and
+/// `watcher`, ghostty's `command` and `initial-command`, foot's `shell`,
+/// starship's `command` and `when` of a custom module, and tmux's
+/// `run-shell`, `default-command`, `default-shell` and `source-file`.
+fn terminal(name: &str, line: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    if name.ends_with("tmux.conf") {
+        let words = split(line);
+        for (index, word) in words.iter().enumerate() {
+            let value = match word.as_str() {
+                "run-shell" | "run" | "if-shell" | "if" | "source-file" | "source" => words
+                    [index + 1..]
+                    .iter()
+                    .find(|word| !word.starts_with('-')),
+                "default-command" | "default-shell" => words.get(index + 1),
+                _ => None,
+            };
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                found.push(value.clone());
+            }
+        }
+        return found;
+    }
+    if name == "kitty.conf" {
+        let (key, value) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        let value = value.trim();
+        if matches!(key, "shell" | "startup_session" | "watcher")
+            && !value.is_empty()
+            && !matches!(value, "." | "none")
+        {
+            found.push(value.to_string());
+        }
+        return found;
+    }
+    let Some((key, value)) = line.split_once('=') else {
+        return found;
+    };
+    let key = key.trim();
+    let runs = match name {
+        "config" => matches!(key, "command" | "initial-command"),
+        "foot.ini" => key == "shell",
+        "starship.toml" => matches!(key, "command" | "when" | "shell"),
+        // alacritty: `shell = "x"`, `program = "x"` or an inline table.
+        _ => matches!(
+            key,
+            "shell" | "program" | "terminal.shell" | "shell.program"
+        ),
+    };
+    if !runs {
+        return found;
+    }
+    // An inline table (`{ program = "x", args = [...] }`): its program.
+    let command = match value.find("program") {
+        Some(at) if value.trim_start().starts_with('{') => value[at..]
+            .split(['"', '\''])
+            .nth(1)
+            .unwrap_or_default()
+            .to_string(),
+        _ => quoted_words(value),
+    };
+    if !command.is_empty() && !matches!(command.as_str(), "true" | "false") {
+        found.push(command);
+    }
+    found
+}
+
+/// The files a `node-options` value has Node.js load before anything
+/// else (`--require /x.js`, `--import=/x.mjs`).
+fn node_loaded(value: &str) -> Vec<String> {
+    let words: Vec<&str> = value
+        .split_whitespace()
+        .map(|word| word.trim_matches(['"', '\'']))
+        .collect();
+    let mut found = Vec::new();
+    for (index, word) in words.iter().enumerate() {
+        let loaded = match word.split_once('=') {
+            Some(("--require" | "--import" | "--loader" | "--experimental-loader", file)) => {
+                Some(file)
+            }
+            None if matches!(*word, "--require" | "-r" | "--import" | "--loader") => {
+                words.get(index + 1).copied()
+            }
+            _ => None,
+        };
+        found.extend(loaded.filter(|file| !file.is_empty()).map(str::to_string));
+    }
+    found
+}
+
+/// The script a yarn settings file has every yarn command run
+/// (`yarnPath: x`, `yarn-path "x"`); a relative one is beside the file,
+/// which is in the home.
+fn yarn_path(line: &str) -> Vec<String> {
+    let Some((key, value)) = line.split_once([':', ' ', '\t']) else {
+        return Vec::new();
+    };
+    let value = value.trim().trim_matches(['"', '\'']);
+    if !matches!(key.trim_matches('"'), "yarnPath" | "yarn-path") || value.is_empty() {
+        return Vec::new();
+    }
+    if value.starts_with(['/', '~', '$']) {
+        vec![value.to_string()]
+    } else {
+        vec![format!("~/{}", value.trim_start_matches("./"))]
+    }
+}
+
+/// What a package manager's or mise's configuration makes it run:
+/// npm's shells, `git` and loaded scripts, yarn's `yarnPath`, cargo's
+/// wrappers, linker, runner and credential provider, Go's `-toolexec` and
+/// compilers, and mise's sourced files, hooks and task commands.
+fn toolchain(name: &str, line: &str) -> Vec<String> {
+    if matches!(name, ".yarnrc" | ".yarnrc.yml") {
+        return yarn_path(line);
+    }
+    let Some((key, value)) = line.split_once('=') else {
+        return Vec::new();
+    };
+    let key = key.trim().trim_matches('"');
+    let runs = match name {
+        "npmrc" | ".npmrc" if key.eq_ignore_ascii_case("node-options") => {
+            return node_loaded(value);
+        }
+        "npmrc" | ".npmrc" => matches!(
+            key,
+            "script-shell" | "shell" | "git" | "onload-script" | "init-module"
+        ),
+        "env" if matches!(key, "CC" | "CXX") => true,
+        "env" => {
+            return value
+                .split_whitespace()
+                .filter_map(|word| word.trim_matches(['"', '\'']).strip_prefix("-toolexec="))
+                .map(str::to_string)
+                .collect();
+        }
+        "config.toml" | "config" | ".mise.toml" => matches!(
+            key,
+            "rustc-wrapper"
+                | "rustc-workspace-wrapper"
+                | "rustc"
+                | "rustdoc"
+                | "linker"
+                | "runner"
+                | "credential-provider"
+                | "_.source"
+                | "_.file"
+                | "run"
+                | "enter"
+                | "leave"
+                | "cd"
+                | "preinstall"
+                | "postinstall"
+        ),
+        _ => false,
+    };
+    let command = quoted_words(value);
+    if runs && !command.is_empty() {
+        vec![command]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The program a native-messaging manifest lets a browser extension start
+/// (`"path": "/usr/lib/x/host"`).
+fn native_host(line: &str) -> Vec<String> {
+    // The manifest may be written on one line or on many.
+    let Some((_, rest)) = line.split_once("\"path\"") else {
+        return Vec::new();
+    };
+    let program = rest
+        .trim_start()
+        .strip_prefix(':')
+        .and_then(|value| value.split('"').nth(1))
+        .unwrap_or_default();
+    if program.starts_with('/') {
+        vec![program.to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The launchers a `mimeapps.list` names (`x-scheme-handler/https=a.desktop;`),
+/// as the files they would be in the home: one that is there opens the
+/// link or file instead of the system's.
+fn handlers(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let Some((_, value)) = line.trim().split_once('=') else {
+            continue;
+        };
+        for launcher in value.split(';').map(str::trim) {
+            let file = format!("~/.local/share/applications/{launcher}");
+            if read::has_extension(launcher, "desktop")
+                && !launcher.contains('/')
+                && !found.contains(&file)
+            {
+                found.push(file);
+            }
+        }
     }
     found
 }
@@ -192,33 +599,41 @@ const MAX_PATH_VARIABLES: usize = 32;
 
 /// The files a pattern (`~/.config/hypr/conf.d/*.conf`) names: `*` and `?`
 /// in its last part only, matched against what `list` says the directory
-/// holds, at most `MAX_GLOB` of them.
-pub fn glob_targets(home: &str, pattern: &str, list: &dyn Fn(&str) -> Vec<String>) -> Vec<String> {
+/// holds, at most `MAX_GLOB` of them; and whether there were more.
+pub fn glob_targets(
+    home: &str,
+    pattern: &str,
+    list: &dyn Fn(&str) -> Vec<String>,
+) -> (Vec<String>, bool) {
     let expanded = expand(home, pattern.trim());
     let Some(absolute) = expanded.strip_prefix('/') else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
     let (directory, last) = absolute.rsplit_once('/').unwrap_or(("", absolute));
     if directory.contains(['*', '?'])
         || !last.contains(['*', '?'])
         || absolute.contains(char::is_whitespace)
     {
-        return Vec::new();
+        return (Vec::new(), false);
     }
     let mut names: Vec<String> = list(directory)
         .into_iter()
         .filter(|name| glob_match(last, name))
         .collect();
     names.sort();
-    names
-        .into_iter()
-        .take(MAX_GLOB)
-        .map(|name| format!("{directory}/{name}"))
-        .collect()
+    let more = names.len() > MAX_GLOB;
+    (
+        names
+            .into_iter()
+            .take(MAX_GLOB)
+            .map(|name| format!("{directory}/{name}"))
+            .collect(),
+        more,
+    )
 }
 
 /// The most files one pattern stands for.
-const MAX_GLOB: usize = 64;
+pub const MAX_GLOB: usize = 1024;
 
 /// Whether `name` matches `pattern` (`*` any run, `?` one character). A
 /// name starting with `.` matches only a pattern that does, as in a shell.
@@ -248,6 +663,17 @@ fn glob_match(pattern: &str, name: &str) -> bool {
     pattern[p..].iter().all(|character| *character == '*')
 }
 
+/// The files a shell start-up file reads in (see `sourced`), with the
+/// variables it sets to a path written out (`$OMARCHY_PATH/default/x`).
+pub fn sourced_files(text: &str) -> Vec<String> {
+    let variables = path_variables(text);
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#') && line.len() <= MAX_STARTED_LINE)
+        .flat_map(|line| sourced(&crate::rules::with_variables(line, &variables)))
+        .collect()
+}
+
 /// The files a line of a shell start-up file reads in: `source file` and
 /// `. file`, also behind a test (`[ -r file ] && . file`). The file runs as
 /// part of the one that names it.
@@ -270,9 +696,133 @@ fn sourced(line: &str) -> Vec<String> {
         .collect()
 }
 
+/// `line` of a shell file without the patterns of its `case` branches
+/// (`pat)`, `a|b)`, `(pat)`), which are matched against a word and run
+/// nothing: `/*)` is no program, and neither are the directories it would
+/// name as a pattern of files. `cases` carries, from line to line and for
+/// each `case` that is open, whether a pattern comes next.
+///
+/// Only a pattern where the shell reads one is taken out (after `in` and
+/// after `;;` of a `case` that starts a statement), so a line that merely
+/// looks like one (`( ~/bin/x )` on its own, a subshell) stays a command.
+fn without_case_patterns(line: &str, cases: &mut Vec<bool>) -> String {
+    let mut kept = String::new();
+    for (index, piece) in line.split(";;").enumerate() {
+        if index > 0 {
+            kept.push_str(" ; ");
+            if let Some(next) = cases.last_mut() {
+                *next = true;
+            }
+        }
+        let mut rest = piece;
+        loop {
+            if cases.last() == Some(&true) {
+                let branch = rest
+                    .trim_start()
+                    .trim_start_matches(['&', ';'])
+                    .trim_start();
+                if is_word_at(branch, "esac") {
+                    cases.pop();
+                    rest = &branch["esac".len()..];
+                    continue;
+                }
+                // A comment after `;;` is not the next pattern.
+                if !branch.is_empty() && !branch.starts_with('#') {
+                    if let Some(end) = case_pattern_end(branch) {
+                        rest = &branch[end..];
+                    }
+                    if let Some(next) = cases.last_mut() {
+                        *next = false;
+                    }
+                }
+            }
+            // A `case` among this branch's commands (or the first one),
+            // and where one ends.
+            let opened = case_opening(rest);
+            let closed = word_position(rest, "esac").filter(|_| !cases.is_empty());
+            match (opened, closed) {
+                (Some(after), closed) if closed.is_none_or(|closed| after < closed) => {
+                    // What follows the patterns is a statement of its own.
+                    kept.push_str(&rest[..after]);
+                    kept.push_str(" ; ");
+                    rest = &rest[after..];
+                    cases.push(true);
+                }
+                (_, Some(closed)) => {
+                    kept.push_str(&rest[..closed]);
+                    rest = &rest[closed + "esac".len()..];
+                    cases.pop();
+                }
+                _ => break,
+            }
+        }
+        kept.push_str(rest);
+    }
+    kept
+}
+
+/// Whether `text` starts with the shell word `word`.
+fn is_word_at(text: &str, word: &str) -> bool {
+    text.strip_prefix(word).is_some_and(|rest| {
+        rest.chars()
+            .next()
+            .is_none_or(|next| next.is_whitespace() || ";&|)".contains(next))
+    })
+}
+
+/// Where the shell word `word` starts in `text`, as a word of its own.
+fn word_position(text: &str, word: &str) -> Option<usize> {
+    text.match_indices(word).map(|(at, _)| at).find(|at| {
+        is_word_at(&text[*at..], word)
+            && text[..*at]
+                .chars()
+                .next_back()
+                .is_none_or(|before| before.is_whitespace() || ";&|(".contains(before))
+    })
+}
+
+/// Where the patterns begin after a `case WORD in` in `text`. The `case`
+/// must start a statement: the word in an `echo` opens nothing, and so
+/// cannot make the lines after it read as patterns.
+fn case_opening(text: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(at) = word_position(&text[from..], "case").map(|at| at + from) {
+        from = at + "case".len();
+        let before = text[..at].trim_end();
+        let starts = before.is_empty()
+            || before.ends_with([';', '&', '|', '{', '(', ')'])
+            || ["then", "do", "else"].iter().any(|keyword| {
+                before.ends_with(keyword)
+                    && word_position(before, keyword) == Some(before.len() - keyword.len())
+            });
+        if !starts {
+            continue;
+        }
+        if let Some(after) = word_position(&text[from..], "in") {
+            return Some(from + after + "in".len());
+        }
+    }
+    None
+}
+
+/// Where a `case` pattern at the start of `branch` ends (past its `)`):
+/// alternatives with no blank in them, and no substitution or statement
+/// before the bracket.
+fn case_pattern_end(branch: &str) -> Option<usize> {
+    let open = usize::from(branch.starts_with('('));
+    let close = branch[open..].find(')')? + open;
+    let pattern = &branch[open..close];
+    let plain = !pattern.trim().is_empty()
+        && !pattern.contains(['(', ';', '&', '`'])
+        && pattern
+            .split('|')
+            .all(|alternative| !alternative.trim().contains(char::is_whitespace));
+    plain.then_some(close + 1)
+}
+
 /// The longest line of a start-up file looked through for programs, and
 /// the most substitutions on it.
-const MAX_STARTED_LINE: usize = 4096;
+const MAX_STARTED_LINE: usize = 64 * 1024;
 const MAX_SUBSTITUTIONS: usize = 16;
 
 /// The programs a line of a shell start-up file names by a path, as the
@@ -538,6 +1088,17 @@ pub fn ssh(line: &str) -> Option<(String, String)> {
         | "securitykeyprovider" => unquoted(value),
         // The first file: it is read as more of this configuration.
         "include" => unquoted(value.split_whitespace().next().unwrap_or_default()),
+        // Files of the server that decide who may log in: a certificate
+        // authority whose signature opens every account, the names a
+        // certificate may log in under. One named per account (`%u`, `%h`)
+        // is that account's file, looked at with its keys.
+        "trustedusercakeys" | "authorizedprincipalsfile" | "authorizedkeysfile" | "revokedkeys" => {
+            let file = unquoted(value.split_whitespace().next().unwrap_or_default());
+            if !file.starts_with('/') || file.contains('%') {
+                return None;
+            }
+            file
+        }
         // `Subsystem name command`.
         "subsystem" => value
             .split_once(char::is_whitespace)
@@ -565,14 +1126,17 @@ pub fn ssh(line: &str) -> Option<(String, String)> {
 /// What a Hyprland `.conf` runs or loads: `exec` and its variants, the
 /// command of a `bind… = MODS, key, exec, command`, a `plugin` (a library
 /// loaded into the compositor) and a `source`d file (one with `*` in its
-/// name is not looked up).
+/// name is not looked up); and the commands hypridle and its like run when
+/// the session goes idle, locks or sleeps.
 fn hyprland_conf(text: &str) -> Vec<String> {
     text.lines()
         .filter_map(|line| {
             let (key, value) = line.trim().split_once('=')?;
             let (key, value) = (key.trim(), value.trim());
             let runs = match key {
-                "exec" | "exec-once" | "execr" | "execr-once" | "exec-shutdown" | "plugin" => {
+                "exec" | "exec-once" | "execr" | "execr-once" | "exec-shutdown" | "plugin"
+                | "on-timeout" | "on-resume" | "lock_cmd" | "unlock_cmd" | "on_lock_cmd"
+                | "on_unlock_cmd" | "before_sleep_cmd" | "after_sleep_cmd" => {
                     Some(value.to_string())
                 }
                 "source" => Some(value.to_string()),
@@ -607,9 +1171,40 @@ pub fn targets(root: &Path, home: &str, command: &str) -> Vec<String> {
     })
 }
 
-/// `targets`, with the caller saying which candidate paths are there: as
-/// root, a path only root can read is not looked for at a user's word.
+/// `targets`, with the caller saying which candidate paths are there.
+#[cfg(test)]
 pub fn targets_where(home: &str, command: &str, exists: &dyn Fn(&str) -> bool) -> Vec<String> {
+    Lookup {
+        home,
+        search: &default_search(home),
+        exists,
+        capped: std::cell::Cell::new(false),
+    }
+    .targets(command)
+}
+
+/// How the files a command runs are looked for.
+pub struct Lookup<'a> {
+    /// The home directory relative to the root.
+    pub home: &'a str,
+    /// Where a bare command name is looked for, in the order a shell
+    /// would, relative to the root.
+    pub search: &'a [String],
+    /// Which candidate paths are there: as root, a path only root can read
+    /// is not looked for at a user's word.
+    pub exists: &'a dyn Fn(&str) -> bool,
+    /// Set when a line held more commands than are looked up.
+    pub capped: std::cell::Cell<bool>,
+}
+
+impl Lookup<'_> {
+    /// The files `command` runs (see `targets`).
+    pub fn targets(&self, command: &str) -> Vec<String> {
+        targets_of(self, command)
+    }
+}
+
+fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
     let mut words = split(command);
     let mut found = Vec::new();
     // Leading assignments and wrappers, with the wrappers' own options and
@@ -623,7 +1218,7 @@ pub fn targets_where(home: &str, command: &str, exists: &dyn Fn(&str) -> bool) -
             at += 1;
         } else if let Some(wrapper) = WRAPPERS.iter().find(|wrapper| wrapper.name == name) {
             found.extend(
-                locate(home, &word, exists)
+                locate(lookup, &word)
                     .into_iter()
                     .filter(|path| !path.starts_with("usr/bin/")),
             );
@@ -669,7 +1264,7 @@ pub fn targets_where(home: &str, command: &str, exists: &dyn Fn(&str) -> bool) -
     let Some(program) = words.next() else {
         return found;
     };
-    found.extend(locate(home, program, exists));
+    found.extend(locate(lookup, program));
     let name = program.rsplit('/').next().unwrap_or(program);
     let interpreter = INTERPRETERS.iter().any(|interpreter| {
         name == *interpreter
@@ -684,8 +1279,12 @@ pub fn targets_where(home: &str, command: &str, exists: &dyn Fn(&str) -> bool) -
             // all. What `/usr/bin` holds is not listed again.
             if word.starts_with('-') && !word.starts_with("--") && word.ends_with('c') {
                 if let Some(code) = words.next() {
-                    for command in inner_commands(code) {
-                        for path in targets_where(home, &command, exists) {
+                    let (commands, more) = split_commands(code);
+                    if more {
+                        lookup.capped.set(true);
+                    }
+                    for command in commands {
+                        for path in targets_of(lookup, &command) {
                             if !path.starts_with("usr/bin/") && !found.contains(&path) {
                                 found.push(path);
                             }
@@ -708,7 +1307,7 @@ pub fn targets_where(home: &str, command: &str, exists: &dyn Fn(&str) -> bool) -
                 continue;
             }
             if word.contains('/') {
-                found.extend(locate(home, word, exists));
+                found.extend(locate(lookup, word));
             }
             break;
         }
@@ -716,13 +1315,19 @@ pub fn targets_where(home: &str, command: &str, exists: &dyn Fn(&str) -> bool) -
     found
 }
 
-/// The most commands of one `sh -c` line that are looked up.
-const MAX_INNER_COMMANDS: usize = 32;
+/// The most commands of one line a shell runs that are looked up.
+pub const MAX_INNER_COMMANDS: usize = 1024;
 
 /// The commands of a line a shell runs (a crontab's, or `sh -c`'s): split
-/// at `;`, `|`, `&` and line ends outside quotes, the first
-/// `MAX_INNER_COMMANDS` that are not empty.
+/// at `;`, `|`, `&` and line ends outside quotes.
+#[cfg(test)]
 pub fn inner_commands(code: &str) -> Vec<String> {
+    split_commands(code).0
+}
+
+/// `inner_commands`: the first `MAX_INNER_COMMANDS` that are not empty,
+/// and whether the line held more.
+pub fn split_commands(code: &str) -> (Vec<String>, bool) {
     let mut commands = Vec::new();
     let mut command = String::new();
     let mut quote: Option<char> = None;
@@ -740,7 +1345,8 @@ pub fn inner_commands(code: &str) -> Vec<String> {
                 if !command.trim().is_empty() {
                     commands.push(std::mem::take(&mut command));
                     if commands.len() == MAX_INNER_COMMANDS {
-                        return commands;
+                        let more = characters.any(|rest| !rest.is_whitespace());
+                        return (commands, more);
                     }
                 }
                 command.clear();
@@ -753,38 +1359,35 @@ pub fn inner_commands(code: &str) -> Vec<String> {
     if !command.trim().is_empty() {
         commands.push(command);
     }
-    commands
+    (commands, false)
 }
 
 /// The paths `word` may name, relative to the root, that exist there. A
-/// bare name gives every place it is found in: which of them a shell
-/// would take depends on a `PATH` that is not known here.
-fn locate(home: &str, word: &str, exists: &dyn Fn(&str) -> bool) -> Vec<String> {
-    let expanded = expand(home, word);
+/// bare name gives every place on the search list it is found in, first
+/// the one a shell would take: the `PATH` of whatever runs the command
+/// may still differ from the ones the list was made from.
+fn locate(lookup: &Lookup<'_>, word: &str) -> Vec<String> {
+    let expanded = expand(lookup.home, word);
     let candidates: Vec<String> = if let Some(absolute) = expanded.strip_prefix('/') {
         vec![absolute.to_string()]
     } else if expanded.contains('/') {
         return Vec::new();
     } else {
-        SEARCH
+        lookup
+            .search
             .iter()
-            .map(|directory| {
-                format!(
-                    "{}/{expanded}",
-                    expand(home, directory).trim_start_matches('/')
-                )
-            })
+            .map(|directory| format!("{directory}/{expanded}"))
             .collect()
     };
     candidates
         .into_iter()
-        .filter(|candidate| exists(candidate))
+        .filter(|candidate| (lookup.exists)(candidate))
         .collect()
 }
 
 /// `~`, `$HOME`, `${HOME}` and systemd's `%h` as the home directory, and
 /// the XDG directories where they are by default.
-fn expand(home: &str, word: &str) -> String {
+pub fn expand(home: &str, word: &str) -> String {
     for prefix in ["~/", "$HOME/", "${HOME}/", "%h/"] {
         if let Some(rest) = word.strip_prefix(prefix) {
             return format!("/{home}/{rest}");
@@ -917,14 +1520,25 @@ mod tests {
                 ".hidden.conf".to_string(),
             ]
         };
+        let (matched, more) = glob_targets("home/u", "~/.config/hypr/conf.d/*.conf", &list);
         assert_eq!(
-            glob_targets("home/u", "~/.config/hypr/conf.d/*.conf", &list),
+            matched,
             [
                 "home/u/.config/hypr/conf.d/a.conf",
                 "home/u/.config/hypr/conf.d/b.conf"
             ]
         );
-        assert!(glob_targets("home/u", "~/x/*/y.conf", &|_| Vec::new()).is_empty());
+        assert!(!more);
+        assert!(
+            glob_targets("home/u", "~/x/*/y.conf", &|_| Vec::new())
+                .0
+                .is_empty()
+        );
+        // More files than a pattern is followed to: said, not dropped.
+        let many = |_: &str| (0..=super::MAX_GLOB).map(|n| format!("{n}.conf")).collect();
+        let (matched, more) = glob_targets("home/u", "~/d/*.conf", &many);
+        assert_eq!(matched.len(), super::MAX_GLOB);
+        assert!(more);
         assert_eq!(
             commands(
                 Category::Hyprland,
@@ -953,8 +1567,247 @@ mod tests {
     }
 
     #[test]
+    fn terminals_and_prompts_name_what_they_run() {
+        let terminal = |path: &str, text: &str| commands(Category::Terminal, path, text);
+        assert_eq!(
+            terminal(
+                "home/u/.config/alacritty/alacritty.toml",
+                "[terminal.shell]\nprogram = \"/tmp/sh\"\nargs = [\"-l\"]\n[font]\nsize = 9\n"
+            ),
+            ["/tmp/sh"]
+        );
+        assert_eq!(
+            terminal(
+                "home/u/.alacritty.toml",
+                "shell = { program = \"/usr/bin/fish\", args = [\"-l\"] }\n"
+            ),
+            ["/usr/bin/fish"]
+        );
+        assert_eq!(
+            terminal(
+                "home/u/.config/kitty/kitty.conf",
+                "font_size 11\nshell /tmp/sh --login\nshell_integration enabled\nstartup_session ~/.config/kitty/s.conf\nwatcher ~/w.py\nshell .\n"
+            ),
+            ["/tmp/sh --login", "~/.config/kitty/s.conf", "~/w.py"]
+        );
+        assert_eq!(
+            terminal(
+                "home/u/.config/ghostty/config",
+                "font-size = 9\ncommand = /tmp/sh\ninitial-command = ~/bin/first\n"
+            ),
+            ["/tmp/sh", "~/bin/first"]
+        );
+        assert_eq!(
+            terminal(
+                "home/u/.config/foot/foot.ini",
+                "[main]\nshell=/tmp/sh\nfont=x\n"
+            ),
+            ["/tmp/sh"]
+        );
+        assert_eq!(
+            terminal(
+                "home/u/.config/starship.toml",
+                "[custom.x]\ncommand = \"~/bin/prompt\"\nwhen = \"test -d .git\"\nformat = \"$output\"\n[custom.y]\nwhen = true\n"
+            ),
+            ["~/bin/prompt", "test -d .git"]
+        );
+        assert_eq!(
+            terminal(
+                "home/u/.tmux.conf",
+                "set -g default-command \"/tmp/sh\"\nrun-shell -b '~/bin/tmux-start'\nset -g mouse on\nsource-file ~/.tmux.local\n"
+            ),
+            ["/tmp/sh", "~/bin/tmux-start", "~/.tmux.local"]
+        );
+    }
+
+    #[test]
+    fn tools_manifests_and_handlers_name_what_they_run() {
+        let tool = |path: &str, text: &str| commands(Category::Toolchain, path, text);
+        assert_eq!(
+            tool(
+                "home/u/.cargo/config.toml",
+                "[build]\nrustc-wrapper = \"/tmp/wrap\"\njobs = 4\n[target.x86_64-unknown-linux-gnu]\nlinker = \"clang\"\nrunner = [\"~/bin/run\", \"--x\"]\n"
+            ),
+            ["/tmp/wrap", "clang", "~/bin/run --x"]
+        );
+        assert_eq!(
+            tool(
+                "home/u/.config/mise/config.toml",
+                "[env]\n_.source = \"~/.secrets.sh\"\nNODE_ENV = \"x\"\n[hooks]\nenter = \"~/bin/on-enter\"\n[tasks.build]\nrun = \"make\"\n"
+            ),
+            ["~/.secrets.sh", "~/bin/on-enter", "make"]
+        );
+        assert_eq!(
+            tool(
+                "home/u/.npmrc",
+                "registry=https://x.example/\nscript-shell=/tmp/sh\n"
+            ),
+            ["/tmp/sh"]
+        );
+    }
+
+    #[test]
+    fn package_managers_manifests_and_handlers_name_what_they_run() {
+        let tool = |path: &str, text: &str| commands(Category::Toolchain, path, text);
+        assert_eq!(
+            tool(
+                "home/u/.npmrc",
+                "node-options=--max-old-space-size=4096 --require /home/u/a.js --import=/home/u/b.mjs\ngit=/home/u/bin/git\nonload-script=~/c.js\nprefix=/home/u/.npm-global\n"
+            ),
+            ["/home/u/a.js", "/home/u/b.mjs", "/home/u/bin/git", "~/c.js"]
+        );
+        assert_eq!(
+            tool(
+                "home/u/.yarnrc.yml",
+                "nodeLinker: node-modules\nyarnPath: .yarn/releases/yarn.cjs\n"
+            ),
+            ["~/.yarn/releases/yarn.cjs"]
+        );
+        assert_eq!(
+            tool("home/u/.yarnrc", "yarn-path \"/home/u/yarn.js\"\n"),
+            ["/home/u/yarn.js"]
+        );
+        assert_eq!(
+            tool(
+                "home/u/.config/go/env",
+                "GOFLAGS=-mod=mod -toolexec=/tmp/x\nGOPATH=/home/u/go\nCC=/home/u/cc\n"
+            ),
+            ["/tmp/x", "/home/u/cc"]
+        );
+        assert_eq!(
+            commands(
+                Category::Browser,
+                "home/u/.mozilla/native-messaging-hosts/x.json",
+                "{\n  \"name\": \"x\",\n  \"path\": \"/home/u/.cache/host\",\n  \"type\": \"stdio\"\n}\n"
+            ),
+            ["/home/u/.cache/host"]
+        );
+        assert_eq!(
+            commands(
+                Category::Browser,
+                "home/u/.config/chromium/NativeMessagingHosts/x.json",
+                "{\"name\": \"x\", \"path\": \"/home/u/.cache/host\", \"type\": \"stdio\"}\n"
+            ),
+            ["/home/u/.cache/host"]
+        );
+        assert_eq!(
+            commands(
+                Category::Desktop,
+                "home/u/.config/mimeapps.list",
+                "[Default Applications]\nx-scheme-handler/https=open.desktop;firefox.desktop;\ntext/html=open.desktop\nimage/png=../x.desktop\n"
+            ),
+            [
+                "~/.local/share/applications/open.desktop",
+                "~/.local/share/applications/firefox.desktop"
+            ]
+        );
+        // What hypridle and its like run.
+        assert_eq!(
+            commands(
+                Category::Hyprland,
+                "home/u/.config/hypr/hypridle.conf",
+                "general {\n  lock_cmd = ~/bin/lock\n  before_sleep_cmd = loginctl lock-session\n}\nlistener {\n  timeout = 300\n  on-timeout = ~/bin/idle\n  on-resume = ~/bin/back\n}\n"
+            ),
+            [
+                "~/bin/lock",
+                "loginctl lock-session",
+                "~/bin/idle",
+                "~/bin/back"
+            ]
+        );
+        // A `ZDOTDIR` moves zsh's start-up files: they are followed there.
+        assert_eq!(
+            commands(
+                Category::Shell,
+                "home/u/.zshenv",
+                "export ZDOTDIR=\"$HOME/.config/zsh\"\n"
+            ),
+            [
+                "$HOME/.config/zsh/.zshenv",
+                "$HOME/.config/zsh/.zprofile",
+                "$HOME/.config/zsh/.zshrc",
+                "$HOME/.config/zsh/.zlogin",
+                "$HOME/.config/zsh/.zlogout"
+            ]
+        );
+    }
+
+    #[test]
+    fn what_sudoers_reads_in_is_followed() {
+        assert_eq!(
+            commands(
+                Category::Sudo,
+                "etc/sudoers",
+                "# a comment\nroot ALL=(ALL:ALL) ALL\n@includedir /etc/sudoers.d\n#includedir /usr/local/etc/sudoers.d/\n@include /etc/sudoers.local\n#include extra\n@include /etc/sudoers.%h\n#includedirx /no\n"
+            ),
+            [
+                "/etc/sudoers.d/*",
+                "/usr/local/etc/sudoers.d/*",
+                "/etc/sudoers.local",
+                "/etc/extra"
+            ]
+        );
+        assert_eq!(
+            commands(
+                Category::Sudo,
+                "etc/sudo.conf",
+                "Plugin sudoers_policy sudoers.so\nPlugin evil /tmp/evil.so\nPath askpass /usr/local/bin/ask\nSet disable_coredump false\n"
+            ),
+            ["/tmp/evil.so", "/usr/local/bin/ask"]
+        );
+    }
+
+    #[test]
+    fn a_units_continued_lines_and_specifiers_are_written_out() {
+        assert_eq!(
+            commands(
+                Category::Systemd,
+                "home/u/.config/systemd/user/x.service",
+                "[Service]\nExecStart=/usr/bin/env \\\n    A=1 \\\n    %h/.cache/run.sh --now\nExecStartPre=%E/x/pre %i\nExecStop=%t/x/stop\n"
+            ),
+            [
+                "/usr/bin/env A=1 ~/.cache/run.sh --now",
+                "~/.config/x/pre",
+                "%t/x/stop"
+            ]
+        );
+        assert_eq!(
+            commands(
+                Category::Systemd,
+                "etc/systemd/system/x.service",
+                "[Service]\nExecStart=%E/x/run %h/y\nExecStop=%t/x/stop\nExecReload=%S/x/reload\n"
+            ),
+            ["/etc/x/run /root/y", "/run/x/stop", "/var/lib/x/reload"]
+        );
+        let dir = TempDir::new("sweep-specifiers");
+        let root = dir.path();
+        fs::create_dir_all(root.join("home/u/.cache")).unwrap();
+        fs::write(root.join("home/u/.cache/run.sh"), "").unwrap();
+        assert_eq!(
+            targets(root, "home/u", "/usr/bin/env A=1 ~/.cache/run.sh --now"),
+            ["home/u/.cache/run.sh"]
+        );
+    }
+
+    #[test]
     fn a_line_of_commands_splits_where_a_shell_would() {
         use super::inner_commands;
+        // More commands than are looked up: the first, and that there
+        // were more.
+        let many = "x;".repeat(super::MAX_INNER_COMMANDS + 1);
+        let (first, more) = super::split_commands(&many);
+        assert_eq!(first.len(), super::MAX_INNER_COMMANDS);
+        assert!(more);
+        assert!(!super::split_commands(&"x;".repeat(super::MAX_INNER_COMMANDS)).1);
+        let nested = format!("sh -c '{many}'");
+        let lookup = super::Lookup {
+            home: "home/u",
+            search: &[],
+            exists: &|_| false,
+            capped: std::cell::Cell::new(false),
+        };
+        lookup.targets(&nested);
+        assert!(lookup.capped.get());
         assert_eq!(
             inner_commands("/x.sh >/dev/null 2>&1; /y.sh &>/tmp/log && /z.sh"),
             ["/x.sh >/dev/null 2>&1", " /y.sh &>/tmp/log ", " /z.sh"]
@@ -982,6 +1835,23 @@ mod tests {
                 "~/bin/fifth",
                 "~/bin/sixth",
             ]
+        );
+        // A `case` branch's pattern is matched, not run (the shape of a
+        // packaged completion file): what its branches run still is.
+        let completion = "case \"$prev\" in\n--bundle | -b)\n\tcase \"$cur\" in\n\t*:*) ;; # TODO somehow (see above)\n\t'')\n\t\tCOMPREPLY=($(compgen -W '/' -- \"$cur\"))\n\t\t;;\n\t/*)\n\t\t_filedir\n\t\t;;\n\t/opt/* | /srv/*)\n\t\t/opt/tool/run\n\t\t;;\n\t(/var/*)\n\t\t;;\n\tesac\n\treturn\n\t;;\n/etc/*) ~/bin/branch ;; /usr/*) ;;\nesac\ncase $1 in /*) ~/bin/inline ;; esac\n";
+        assert_eq!(
+            commands(Category::Shell, "usr/share/completions/x", completion),
+            ["/opt/tool/run", "~/bin/branch", "~/bin/inline"]
+        );
+        // Only where a shell reads a pattern: a subshell that looks like
+        // one, and a `case` that is a word of another command, hide nothing.
+        assert_eq!(
+            commands(
+                Category::Shell,
+                "home/u/.bashrc",
+                "( ~/bin/first )\necho in case of doubt, look in\n( ~/bin/second )\ncase x in\nx) ( ~/bin/third ) ;;\nesac\n( ~/bin/fourth )\n",
+            ),
+            ["~/bin/first", "~/bin/second", "~/bin/third", "~/bin/fourth"]
         );
         // A packaged start-up file that only reads a directory names no
         // program (`find` in an assignment's substitution).
@@ -1026,6 +1896,22 @@ mod tests {
                 "home/u/.local/bin/first",
                 "home/u/.local/bin/second"
             ]
+        );
+        // A bare name is found first where the search list looks first.
+        let lookup = super::Lookup {
+            home: "home/u",
+            search: &[
+                "home/u/.local/share/mise/shims".to_string(),
+                "usr/bin".to_string(),
+            ],
+            exists: &|candidate| {
+                ["home/u/.local/share/mise/shims/sh", "usr/bin/sh"].contains(&candidate)
+            },
+            capped: std::cell::Cell::new(false),
+        };
+        assert_eq!(
+            lookup.targets("sh -c true"),
+            ["home/u/.local/share/mise/shims/sh", "usr/bin/sh"]
         );
         // A separator inside quotes separates nothing, and empty commands
         // do not use up the limit.
@@ -1222,6 +2108,21 @@ mod tests {
             ("ProxyJump bastion", None),
             ("Subsystem sftp internal-sftp", None),
             ("SecurityKeyProvider internal", None),
+            ("TrustedUserCAKeys /etc/ssh/ca.pub", Some("/etc/ssh/ca.pub")),
+            (
+                "AuthorizedKeysFile /etc/ssh/keys/%u .ssh/authorized_keys",
+                None,
+            ),
+            ("AuthorizedKeysFile .ssh/authorized_keys", None),
+            (
+                "AuthorizedPrincipalsFile /etc/ssh/principals",
+                Some("/etc/ssh/principals"),
+            ),
+            ("AuthorizedPrincipalsFile none", None),
+            (
+                "AuthorizedKeysCommand /usr/local/bin/keys %u",
+                Some("/usr/local/bin/keys %u"),
+            ),
             (
                 "Include ~/.orbstack/ssh/config",
                 Some("~/.orbstack/ssh/config"),

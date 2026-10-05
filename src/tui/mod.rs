@@ -7,7 +7,10 @@ mod app;
 mod canvas;
 mod fields;
 mod integrations;
+mod luascan;
 mod mascot;
+mod menufile;
+mod shellscan;
 pub mod status;
 mod term;
 
@@ -38,6 +41,7 @@ pub fn run(expert: bool) -> Result<(), String> {
     let mut terminal =
         Terminal::open().map_err(|error| format!("cannot use the terminal: {error}"))?;
     let mode = if expert { Mode::Expert } else { Mode::Simple };
+    status::watched();
     let mut app = App::new(load_files(), mode);
     let mut size = (0, 0);
     let mut dirty = true;
@@ -66,6 +70,9 @@ pub fn run(expert: bool) -> Result<(), String> {
             let outcome = perform(&mut terminal, &effect);
             if reloads(&effect) {
                 app.reload(load_files());
+                // Changed here, knowingly: recorded, so the bar does not
+                // call it news.
+                status::chosen();
             }
             app.finish(&effect, outcome);
         }
@@ -177,11 +184,15 @@ fn save_user(text: &str) -> Result<String, String> {
 
 fn integration(terminal: &mut Terminal, plan: &Plan) -> Result<String, String> {
     let paths = paths(&Settings::load()).ok_or("HOME is not set")?;
-    if plan.needs_terminal() {
+    let done = if plan.needs_terminal() {
         on_terminal(terminal, false, || run_plan(&paths, plan))
     } else {
         run_plan(&paths, plan)
+    };
+    if done.is_ok() {
+        crate::audit::gate_changed(&plan.summary, "", "changed in the settings app");
     }
+    done
 }
 
 /// Runs a plan's steps in order; a failed command stops it.
@@ -225,7 +236,9 @@ fn run_plan(paths: &Paths, plan: &Plan) -> Result<String, String> {
             | Step::InstallBarWidget
             | Step::RemoveBarWidget
             | Step::AddWaybarModule
-            | Step::RemoveWaybarModule => {
+            | Step::RemoveWaybarModule
+            | Step::AddSessionPath
+            | Step::RemoveSessionPath => {
                 paths.edit(step)?;
             }
         }
@@ -285,10 +298,11 @@ for. Its daily results are kept readable by your group only."
 
 /// The gates that protect installs, plus the menu entry and the bar widgets:
 /// what `omarchy-guardian protect` and the installer turn on.
-const PROTECT: [Integration; 7] = [
+const PROTECT: [Integration; 8] = [
     Integration::PacmanHook,
     Integration::AurGate,
     Integration::ThemeInterceptor,
+    Integration::SessionPath,
     Integration::MenuEntry,
     Integration::BarWidget,
     Integration::WaybarModule,
@@ -300,6 +314,7 @@ const PROTECT: [Integration; 7] = [
 /// when the pacman gate could not review with the current settings, since it
 /// would refuse every such install.
 pub fn protect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String> {
+    status::watched();
     let settings = Settings::load();
     let paths = paths(&settings).ok_or("HOME is not set")?;
     let mut steps = Vec::new();
@@ -351,7 +366,9 @@ pub fn protect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String> {
     if !yes && !confirm.confirm("Go ahead?") {
         return Err("nothing was changed".into());
     }
-    run_plan(&paths, &plan)
+    let outcome = run_plan(&paths, &plan);
+    status::chosen();
+    outcome
 }
 
 /// `omarchy-guardian protect --off`: turns the three install gates and the
@@ -359,6 +376,7 @@ pub fn protect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String> {
 /// each step and, unless `yes`, asking. A hand-installed pacman hook is left
 /// alone.
 pub fn unprotect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String> {
+    status::watched();
     let settings = Settings::load();
     let paths = paths(&settings).ok_or("HOME is not set")?;
     let mut steps = Vec::new();
@@ -366,6 +384,7 @@ pub fn unprotect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String>
         Integration::PacmanHook,
         Integration::AurGate,
         Integration::ThemeInterceptor,
+        Integration::SessionPath,
         Integration::SystemSweep,
     ] {
         match paths.state(integration) {
@@ -393,7 +412,9 @@ pub fn unprotect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String>
     if !yes && !confirm.confirm("Turn protection off?") {
         return Err("nothing was changed".into());
     }
-    run_plan(&paths, &plan)
+    let outcome = run_plan(&paths, &plan);
+    status::chosen();
+    outcome
 }
 
 /// `omarchy-guardian test`: the settings app's reviewer test; false when a
@@ -451,10 +472,15 @@ fn forget_memory() -> Result<String, String> {
     if !root.is_dir() {
         return Ok("The review memory is already empty.".into());
     }
-    let store = Store::open(root)?;
-    baseline::forget_all(&store)
-        .map(|count| format!("Forgot {count} approved baseline(s) and every cached verdict."))
-        .map_err(|error| error.to_string())
+    let store = Store::open(root.clone())?;
+    let count = baseline::forget_all(&store).map_err(|error| error.to_string())?;
+    // What the AUR gate remembers on its own (answers, program hashes) goes
+    // with the rest.
+    crate::makepkg_gate::forget_all(&root)?;
+    crate::audit::forgot("everything (settings app)");
+    Ok(format!(
+        "Forgot {count} approved baseline(s) and every cached verdict."
+    ))
 }
 
 fn editor() -> String {
@@ -513,6 +539,7 @@ fn edit(terminal: &mut Terminal, scope: Scope) -> Result<String, String> {
                 })
                 .map_err(|error| error.to_string())?;
             if status.success() {
+                crate::audit::settings_changed("the system settings file was edited");
                 Ok(format!("Edited {SYSTEM_PATH}; reloaded."))
             } else {
                 Err(format!("sudoedit exited with {status}"))

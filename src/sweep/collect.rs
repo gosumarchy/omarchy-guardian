@@ -10,10 +10,11 @@ use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-use super::commands;
 use super::index::PackageIndex;
+use super::path::Search;
 use super::read::{self, Found, View};
-use super::tier::{Observed, Tier, classify};
+use super::tier::{self, Observed, Tier, classify};
+use super::{access, boot, commands, config, own, path};
 use crate::autorun::{Category, Kind, Location, SYSTEM, SYSTEM_SWEEP, USER};
 use crate::content::{self, Content};
 use crate::rules::RuleId;
@@ -53,8 +54,52 @@ pub const NOT_LOOKED_AT: &str =
 /// Why root did not look at a path nobody chose.
 const NOT_REACHED: &str = "gone, or behind a link that is not root's alone: not looked at";
 
+/// Where the kernel keeps what is no program on disk: device nodes and its
+/// own files. A command that names one (`--list-file /dev/stdout`) names
+/// where its output goes, and `/dev/stdout` leads to whatever the sweep
+/// itself writes to: nothing there is followed.
+const NOT_FOLLOWED: &[&str] = &["dev/", "proc/", "sys/"];
+
+/// Memory a user fills with files like any directory (`/dev/shm`), and
+/// what lives until the next boot (`/run`, `/run/user/<uid>`): a program
+/// run from there is followed like any other, but only a regular file is
+/// one. The sockets and pipes services keep there are not.
+const FILES_ONLY: &[&str] = &["dev/shm/", "run/"];
+
+/// The variables a locale file sets.
+const LOCALE_VARIABLES: &[&str] = &["LANG", "LANGUAGE"];
+
 /// The format label of a file root hashed but did not hand back.
 pub const WITHHELD: &str = "root-only file (hashed, content withheld)";
+
+/// The format label of a packaged file only root can read that a process
+/// led the root collector to: compared with its package, and no more told.
+pub const COMPARED: &str = "root-only packaged file (compared with its package, hash withheld)";
+
+/// What is said of a packaged file that its package installs readable by
+/// everyone and that no longer is.
+pub const CLOSED: &str = "its package installs it readable by everyone, and it no longer is";
+
+/// How a note starts that says a limit was reached while looking for what
+/// an item runs. Such an item cannot be allowed (an allow would vouch for
+/// commands nobody followed), and where its text is not reviewed either,
+/// the sweep counts as incomplete.
+pub const NOT_ALL_FOLLOWED: &str = "not all of what it runs was followed: ";
+
+/// What stands for the content of a packaged script whose interpreter line
+/// alone was rewritten.
+const PACKAGED_SCRIPT: &str = "packaged script (not read again)";
+
+/// Where `at` keeps its jobs: Arch's spool, the one other builds use, and
+/// Debian's beside the crontabs.
+const AT_SPOOLS: &[&str] = &["var/spool/atd/", "var/spool/at/", "var/spool/cron/atjobs/"];
+
+/// Whether `path` is a queued `at` job. One starts with the whole
+/// environment of whoever queued it, tokens and all, and is told apart by
+/// who owns the file, not by its name.
+pub fn is_at_job(path: &str) -> bool {
+    AT_SPOOLS.iter().any(|spool| path.starts_with(spool))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Origin {
@@ -116,6 +161,12 @@ pub struct Collection {
     /// What was not looked at, each as a sentence: a location with more
     /// entries than the limit, a name that cannot be read.
     pub truncated: Vec<String>,
+    /// What is said of the system as a whole (Secure Boot is off).
+    pub notes: Vec<String>,
+    /// The paths of root's accounts, members, keys and trust anchors that
+    /// the root collector says are new, when it kept track itself (see
+    /// `root::news`); `None` when it did not.
+    pub root_news: Option<Vec<String>>,
 }
 
 /// What a collection runs against.
@@ -146,6 +197,20 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
         }
     }
 
+    // Programs that take a system command's name, wherever a `PATH` puts
+    // a directory someone can write ahead of `/usr/bin`.
+    let search = path::search(scope);
+    let (shadowing, unlisted) = path::shadowing_programs(scope, &search);
+    for path in shadowing {
+        paths.entry(path).or_insert(Category::LocalBin);
+    }
+    collection.truncated.extend(unlisted);
+    // What stands in for Guardian's own units, in the unit directories the
+    // catalog does not walk.
+    for path in own::paths(scope) {
+        paths.entry(path).or_insert(Category::Systemd);
+    }
+
     let mut seen: HashSet<String> = paths.keys().cloned().collect();
     let mut pending: Vec<Item> = paths
         .into_iter()
@@ -153,20 +218,82 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
         .collect();
     let omarchy = omarchy_paths(scope.root);
     while let Some(mut item) = pending.pop() {
-        for target in follow(scope, &item) {
+        let followed = follow(scope, &item, &search);
+        for target in followed.targets {
             if seen.insert(target.clone()) {
                 pending.push(self::item(scope, item.category, target, Some(&item.path)));
             }
         }
+        item.notes.extend(
+            followed
+                .unfollowed
+                .into_iter()
+                .map(|limit| format!("{NOT_ALL_FOLLOWED}{limit}")),
+        );
         if item.tier == Tier::Unknown && omarchy.contains(&format!("/{}", item.path)) {
             item.notes.push("a path Omarchy's installer writes".into());
         }
+        if item.tier == Tier::Unknown && sets_only_the_locale(&item) {
+            item.tier = Tier::Inert;
+            item.notes.push("sets the locale and nothing else".into());
+        }
         collection.items.push(item);
+    }
+    path::mark(scope, &search, &mut collection.items);
+    for item in &mut collection.items {
+        // The package's own directory, and the one for shared data, may
+        // hold a drop-in a repository package ships for every unit;
+        // nothing else there is spared.
+        let shipped = item.tier == Tier::Vendor
+            && ["usr/lib/systemd/", "usr/share/systemd/"]
+                .iter()
+                .any(|packaged| item.path.starts_with(packaged));
+        if own::is_override(scope.home, &item.path) && !shipped {
+            own::mark(item);
+        }
     }
     collection
         .items
         .sort_by(|left, right| left.path.cmp(&right.path));
+    merge(&mut collection, access::items(scope));
+    let boot = boot::check(scope);
+    merge(&mut collection, boot.items);
+    collection.truncated.extend(boot.unchecked);
+    collection.notes.extend(boot.notes);
     collection
+}
+
+/// Whether `item` is the system's or a home's `locale.conf`, which the
+/// profile script of every login shell reads in, and holds nothing but the
+/// locale: `LANG=`, `LANGUAGE=` and `LC_…=` with plain values. No package
+/// owns the file (the installer writes it), and one that only says which
+/// language to speak runs nothing. Any other line, or a value a shell
+/// would expand, leaves it an item to look at.
+fn sets_only_the_locale(item: &Item) -> bool {
+    let named = item.path == "etc/locale.conf" || item.path.ends_with("/.config/locale.conf");
+    let Body::Text(text) = &item.body else {
+        return false;
+    };
+    named
+        && text.lines().map(str::trim).all(|line| {
+            line.is_empty()
+                || line.starts_with('#')
+                || line.split_once('=').is_some_and(|(name, value)| {
+                    (LOCALE_VARIABLES.contains(&name) || name.starts_with("LC_"))
+                        && value.chars().all(|c| {
+                            c.is_ascii_alphanumeric()
+                                || matches!(c, '_' | '-' | '.' | '@' | ':' | '"')
+                        })
+                })
+        })
+}
+
+/// Whether nobody looked for everything `item` runs (see
+/// `NOT_ALL_FOLLOWED`).
+pub fn is_capped(item: &Item) -> bool {
+    item.notes
+        .iter()
+        .any(|note| note.starts_with(NOT_ALL_FOLLOWED))
 }
 
 /// Adds `items` to `collection`; an item already there by path gains the
@@ -347,6 +474,37 @@ pub fn is_file_there(scope: &Scope<'_>, path: &str, run_by: Option<&str>) -> boo
     }
 }
 
+/// Whether anything at all (a directory too) is called `name` in
+/// `directory`, which `run_by` (or, without one, a process) named. `None`
+/// where root would have to look into a directory not everyone may enter:
+/// whether a name is in there is not root's to tell whoever chose the
+/// directory. Anyone who may enter a directory may ask that of it.
+pub fn holds(scope: &Scope<'_>, directory: &str, name: &str, run_by: Option<&str>) -> Option<bool> {
+    let Some(view) = view(scope, run_by) else {
+        return Some(fs::symlink_metadata(scope.root.join(directory).join(name)).is_ok());
+    };
+    match read::seen(scope.root, directory, view)?.what {
+        read::Public::Directory(handle) => Some(
+            fs::symlink_metadata(format!("/proc/self/fd/{}/{name}", handle.as_raw_fd())).is_ok(),
+        ),
+        _ => None,
+    }
+}
+
+/// Whether `path` is a regular file or a link that leads to one, as
+/// `run_by` may lead the collector to it. (Root's look does not follow a
+/// link by itself, so the chain is walked hop by hop.)
+fn names_a_file(scope: &Scope<'_>, path: &str, run_by: Option<&str>) -> bool {
+    if is_file_there(scope, path, run_by) {
+        return true;
+    }
+    let Some(Some(link)) = hop(scope, path) else {
+        return false;
+    };
+    read::resolve_where(path, &link, &|next| hop(scope, next))
+        .is_some_and(|resolved| matches!(look_past_link(scope, &resolved), Found::File { .. }))
+}
+
 /// How the collector sees the hops of a link chain. As root, a link leads
 /// where its owner says, so every hop is seen as everyone sees it.
 fn hop(scope: &Scope<'_>, path: &str) -> read::Hop {
@@ -391,6 +549,104 @@ pub fn look(scope: &Scope<'_>, category: Category, path: &str, run_by: Option<&s
     read::look_as(scope.root, path, view).unwrap_or_else(|| Found::Unreadable(unseen.into()))
 }
 
+/// The item of a packaged file that a process led the root collector to
+/// and that not everyone may read (a running program's `exe`, a preloaded
+/// library), for the one question the live checks ask of it: is it still
+/// what its package installed?
+///
+/// A user decides which path this is, by running the program or naming the
+/// library, so the rule for such paths applies: nothing of a file they
+/// cannot read is told. Three things keep that rule here. The path must be
+/// one the package index holds: the index is root's, pacman's database is
+/// readable by everyone, and so is every package, so that a file is
+/// installed at this path, and what it holds as installed, is already
+/// public. The way to it must be root's alone, with no link followed
+/// (`kept`, and the path the walk took is the path asked for), so the file
+/// looked at is the one root's package manager put there and not one a
+/// user moved or linked in. And what comes back is one bit: the file is as
+/// its package installed it, or it is not. "It is" tells the user they
+/// hold its content already (the package); "it is not" tells them a
+/// packaged program was changed, which is what the sweep is for, and no
+/// more than the size and time `pacman -Qkk` compares as any user. The
+/// hash of a changed file is withheld: it could confirm a guess at content
+/// only root may read. A package's configuration file (`backup=`), which
+/// is meant to be edited and may hold secrets, never comes out as changed
+/// here (see `tier::classify`), so nothing is told of those at all.
+///
+/// `None` where there is no such file to compare: the caller then treats
+/// the path as not vouched for, unless that alone would tell (see
+/// `packaged_out_of_sight`).
+pub fn packaged_item(scope: &Scope<'_>, category: Category, path: &str) -> Option<Item> {
+    scope.index.owner(path)?;
+    let seen = read::seen(scope.root, path, View::Pinned)?;
+    if !seen.kept || seen.path != path || !matches!(seen.what, read::Public::File(_)) {
+        return None;
+    }
+    let found = read::look_pinned(seen);
+    if !matches!(found, Found::File { .. }) {
+        return None;
+    }
+    let mut item = item_of(scope, category, path.to_string(), None, &found);
+    item.sha256 = None;
+    item.body = Body::Binary(COMPARED);
+    item.runs.clear();
+    Some(item)
+}
+
+/// Whether `path`, which a process led the root collector to, is a
+/// package's path inside a directory that is root's alone and that not
+/// everyone may enter. Of such a path `packaged_item` answers with its one
+/// bit or not at all: were "there is no regular file here" reported (as a
+/// library no package vouches for), whoever named the path would learn
+/// that a packaged file in a directory closed to them is missing or is
+/// something else. Where everyone may enter the directory, that is theirs
+/// to see anyway; where somebody else may write on the way, the file is
+/// theirs and nothing of root's. A packaged file that is missing or odd is
+/// for the look through the fixed directories to report, which no user
+/// steers.
+pub fn packaged_out_of_sight(scope: &Scope<'_>, path: &str) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    if scope.index.owner(path).is_none() {
+        return false;
+    }
+    let Some((directory, _)) = path.rsplit_once('/') else {
+        return false;
+    };
+    let Some(read::Seen {
+        path: walked,
+        what: read::Public::Directory(handle),
+        kept: true,
+    }) = read::seen(scope.root, directory, View::Pinned)
+    else {
+        return false;
+    };
+    let owner = fs::metadata(scope.root).map(|top| top.uid()).ok();
+    let roots_alone = handle
+        .metadata()
+        .is_ok_and(|metadata| Some(metadata.uid()) == owner && metadata.mode() & 0o022 == 0);
+    walked == directory
+        && roots_alone
+        && read::seen(scope.root, directory, View::Everyone).is_none()
+}
+
+/// The tier of a packaged file the sweep could not read: modified when its
+/// package installs it readable by everyone, since then somebody closed
+/// it; unknown otherwise. Asked as the sweep's user only: root reads such
+/// a file where it may look at all, and tells nothing of one it may not.
+fn unread_tier(scope: &Scope<'_>, path: &str) -> Tier {
+    if scope.origin == Origin::Root {
+        return Tier::Unknown;
+    }
+    let closed = fs::symlink_metadata(scope.root.join(path)).is_ok_and(|metadata| {
+        metadata.is_file() && tier::is_closed(path, metadata.mode(), scope.index)
+    });
+    if closed {
+        Tier::Modified
+    } else {
+        Tier::Unknown
+    }
+}
+
 /// Whether a file in a user location is one that runs on its own.
 fn wanted(scope: &Scope<'_>, category: Category, relative: &str) -> bool {
     let name = relative.rsplit('/').next().unwrap_or(relative);
@@ -406,15 +662,18 @@ fn wanted(scope: &Scope<'_>, category: Category, relative: &str) -> bool {
         Category::Autostart if relative.starts_with(".config/autostart/") => {
             name.ends_with(".desktop")
         }
-        // Only launchers that replace a system app's.
-        Category::Desktop => {
-            name.ends_with(".desktop")
-                && scope
-                    .root
-                    .join("usr/share/applications")
-                    .join(name)
-                    .exists()
+        // Only launchers that replace a system app's; one `mimeapps.list`
+        // names is followed from there.
+        Category::Desktop if relative.starts_with(".local/share/applications/") => {
+            name == "mimeapps.list"
+                || (name.ends_with(".desktop")
+                    && scope
+                        .root
+                        .join("usr/share/applications")
+                        .join(name)
+                        .exists())
         }
+        Category::Browser if relative.contains("essaging") => read::has_extension(name, "json"),
         // Only programs named like a system command.
         Category::LocalBin => {
             WATCHED_NAMES.contains(&name)
@@ -450,6 +709,7 @@ pub fn item_of(
                 sha256,
                 mode: *mode,
                 size: *size,
+                content: whole(*size, head),
             };
             (
                 classify(&path, observed, scope.index),
@@ -488,28 +748,40 @@ pub fn item_of(
             };
             (Tier::Unknown, None, Body::Unreadable(reason.into()))
         }
-        Found::Unreadable(reason) => (Tier::Unknown, None, Body::Unreadable(reason.clone())),
+        Found::Unreadable(reason) => (
+            unread_tier(scope, &path),
+            None,
+            Body::Unreadable(reason.clone()),
+        ),
     };
     let runs = match &body {
         Body::Text(text) => commands::commands(category, &path, text),
         _ => Vec::new(),
     };
-    // As root, what was reached by following (a command, a link, a
-    // preload, a live check) can be steered by any user (a crontab line, an
-    // `LD_PRELOAD` value) at `/etc/shadow` or a key. Its content is never
-    // handed back and nothing is followed from it; the user's own sweep
-    // reads whatever the user may read. Only the auto-run locations' own
-    // files keep their content.
-    let (body, runs) = if scope.origin == Origin::Root && (run_by.is_some() || category.is_live()) {
-        let body = match body {
-            Body::Text(_) | Body::Oversized | Body::Undecodable => Body::Binary(WITHHELD),
-            other => other,
-        };
-        (body, Vec::new())
-    } else {
-        (body, runs)
+    // An `at` job starts with the whole environment of whoever queued it,
+    // tokens and all: it is told by its hash, and never handed on.
+    let (body, runs) = match body {
+        Body::Text(_) if is_at_job(&path) => (Body::Binary(WITHHELD), Vec::new()),
+        body => (body, runs),
     };
-    let notes = notes(scope, category, &path, &body, run_by);
+    // A packaged script whose interpreter line alone was rewritten is its
+    // package's content from the second line on (see `tier`): it is said,
+    // and read no more than any other file a package installed.
+    let rewritten = tier::interpreter_note(&path, tier, scope.index);
+    let body = match body {
+        Body::Text(_) if rewritten.is_some() => Body::Binary(PACKAGED_SCRIPT),
+        body => body,
+    };
+    let (body, runs) = handed_back(scope, category, run_by, body, runs);
+    let mut notes = notes(scope, category, &path, &body, run_by);
+    notes.extend(limits(scope, category, &path, &body, found));
+    if is_closed(scope, &path, tier, found) {
+        notes.push(CLOSED.to_string());
+    }
+    notes.extend(path_notes(category, &body));
+    notes.extend(rewritten.map(str::to_string));
+    notes.extend(tier::session_note(&path, tier, scope.index).map(str::to_string));
+    let alerts = settings_alerts(scope, category, &path, tier, &body);
     Item {
         // The root collector's items are all root's, its home included.
         origin: if scope.origin == Origin::System
@@ -529,8 +801,116 @@ pub fn item_of(
         runs,
         run_by: run_by.map(str::to_string),
         notes,
-        alerts: Vec::new(),
+        alerts,
     }
+}
+
+/// The content of an item and what it runs, as the collector hands them
+/// back. As root, what was reached by following (a command, a link, a
+/// preload, a live check) can be steered by any user (a crontab line, an
+/// `LD_PRELOAD` value) at `/etc/shadow` or a key. Its content is never
+/// handed back and nothing is followed from it; the user's own sweep reads
+/// whatever the user may read. Only the auto-run locations' own files keep
+/// their content.
+fn handed_back(
+    scope: &Scope<'_>,
+    category: Category,
+    run_by: Option<&str>,
+    body: Body,
+    runs: Vec<String>,
+) -> (Body, Vec<String>) {
+    if scope.origin == Origin::Root && (run_by.is_some() || category.is_live()) {
+        let body = match body {
+            Body::Text(_) | Body::Oversized | Body::Undecodable => Body::Binary(WITHHELD),
+            other => other,
+        };
+        (body, Vec::new())
+    } else {
+        (body, runs)
+    }
+}
+
+/// The notes for the lines of a start-up file that set `PATH` to what only
+/// running them would tell (see `path::opaque`).
+fn path_notes(category: Category, body: &Body) -> Vec<String> {
+    let read = matches!(
+        category,
+        Category::Shell | Category::Environment | Category::Hyprland
+    );
+    match body {
+        Body::Text(text) if read => path::opaque(text)
+            .into_iter()
+            .map(|line| {
+                format!(
+                    "line {line} sets PATH in a way Guardian cannot follow: the directories it adds are not watched"
+                )
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether what `look` found at `path` is a packaged file somebody took
+/// everyone's read access from (see `tier::is_closed`).
+fn is_closed(scope: &Scope<'_>, path: &str, tier: Tier, found: &Found) -> bool {
+    match found {
+        Found::File { mode, .. } => tier::is_closed(path, *mode, scope.index),
+        // Only a closed file gives this tier to one that was not read.
+        Found::Unreadable(_) => tier == Tier::Modified,
+        Found::Link(_) | Found::Other => false,
+    }
+}
+
+/// What the local checks of configuration files say of an item's text
+/// (see `config::alerts`). What a package ships, or a copy of it, is the
+/// distribution's choice of settings and is left alone.
+fn settings_alerts(
+    scope: &Scope<'_>,
+    category: Category,
+    path: &str,
+    tier: Tier,
+    body: &Body,
+) -> Vec<(RuleId, String)> {
+    match body {
+        Body::Text(text) if !matches!(tier, Tier::Vendor | Tier::Copied | Tier::Inert) => {
+            let home = scope.home.unwrap_or("root");
+            config::alerts(category, path, text, &|file| {
+                is_there(
+                    scope,
+                    commands::expand(home, file).trim_start_matches('/'),
+                    Some(path),
+                )
+            })
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The notes for the limits reached while looking at an item: a line too
+/// long to look through for programs, a chain of links too long to follow.
+fn limits(
+    scope: &Scope<'_>,
+    category: Category,
+    path: &str,
+    body: &Body,
+    found: &Found,
+) -> Vec<String> {
+    let mut reached = match body {
+        Body::Text(text) => commands::unfollowed(category, text),
+        _ => Vec::new(),
+    };
+    if let Found::Link(target) = found
+        && read::chain_too_long(path, target, &|next| hop(scope, next))
+    {
+        reached.push(format!(
+            "a chain of more than {} links, or one that goes in a circle",
+            read::MAX_HOPS
+        ));
+    }
+    reached
+        .into_iter()
+        .map(|limit| format!("{NOT_ALL_FOLLOWED}{limit}"))
+        .collect()
 }
 
 /// What to tell about an item beyond its tier.
@@ -557,8 +937,11 @@ fn notes(
     {
         notes.push(format!("shadows /usr/bin/{name}"));
     }
+    // A launcher of the same name; `mimeapps.list` is a list of handlers,
+    // which the home's and the system's both add to.
     if category == Category::Desktop
         && let Some(name) = path.rsplit('/').next()
+        && read::has_extension(name, "desktop")
         && scope
             .root
             .join("usr/share/applications")
@@ -592,18 +975,28 @@ fn declares_alias(scope: &Scope<'_>, unit: &str, name: &str) -> bool {
 fn self_tier(scope: &Scope<'_>, path: &str) -> Option<Tier> {
     match look_past_link(scope, path) {
         Found::File {
-            sha256, mode, size, ..
+            sha256,
+            mode,
+            size,
+            head,
         } => Some(classify(
             path,
             Observed::File {
                 sha256: &sha256,
                 mode,
                 size,
+                content: whole(size, &head),
             },
             scope.index,
         )),
         Found::Link(_) | Found::Other | Found::Unreadable(_) => None,
     }
+}
+
+/// The whole content of a file of `size` bytes, when `head` (the first
+/// bytes kept while it was hashed) holds all of it.
+fn whole(size: u64, head: &[u8]) -> Option<&[u8]> {
+    (head.len() as u64 == size).then_some(head)
 }
 
 fn body_of(path: &str, size: u64, head: &[u8]) -> Body {
@@ -622,12 +1015,63 @@ fn body_of(path: &str, size: u64, head: &[u8]) -> Body {
 }
 
 /// The longest command line split into its commands.
-const MAX_SPLIT_LINE: usize = 4096;
+const MAX_SPLIT_LINE: usize = 64 * 1024;
+
+/// What a directory holds, as the walk may see it.
+fn listed(scope: &Scope<'_>, view: Option<View>, directory: &str) -> Vec<String> {
+    let names = |entries: fs::ReadDir| {
+        entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect()
+    };
+    match view {
+        Some(view) => match read::seen(scope.root, directory, view).map(|seen| seen.what) {
+            Some(read::Public::Directory(handle)) => {
+                fs::read_dir(format!("/proc/self/fd/{}", handle.as_raw_fd()))
+                    .map(names)
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        },
+        None => fs::read_dir(scope.root.join(directory))
+            .map(names)
+            .unwrap_or_default(),
+    }
+}
+
+/// Whether `command` is a pattern of files and nothing else
+/// (`~/.config/hypr/conf.d/*.conf`), not a command line with a `*` in it.
+fn is_pattern(command: &str) -> bool {
+    let bare = command.trim();
+    let bare = ["$HOME/", "${HOME}/"]
+        .iter()
+        .find_map(|home| bare.strip_prefix(home))
+        .unwrap_or(bare);
+    command.contains(['*', '?'])
+        && !bare.contains(|c: char| c.is_whitespace() || ";|&$()<>`'\"\\".contains(c))
+}
+
+/// What following an item gave.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Followed {
+    /// The paths it leads to.
+    targets: Vec<String>,
+    /// The limits that were reached, each as the rest of a sentence.
+    unfollowed: Vec<String>,
+}
 
 /// The paths `item` leads to that need judging too: a link's target, and
-/// the programs and scripts its commands run.
-fn follow(scope: &Scope<'_>, item: &Item) -> Vec<String> {
+/// the programs and scripts its commands run. A bare command name is
+/// looked up in `search`.
+fn follow(scope: &Scope<'_>, item: &Item, search: &Search) -> Followed {
     let mut targets = Vec::new();
+    let mut unfollowed: Vec<String> = Vec::new();
+    let mut limit = |sentence: String| {
+        if !unfollowed.contains(&sentence) {
+            unfollowed.push(sentence);
+        }
+    };
     // Only a link to a regular file leads anywhere to judge (a masked
     // unit's `/dev/null` does not).
     let by = Some(item.path.as_str());
@@ -644,41 +1088,26 @@ fn follow(scope: &Scope<'_>, item: &Item) -> Vec<String> {
         .and_then(|user| user_home(scope.root, user));
     let home = crontab_home.as_deref().or(scope.home).unwrap_or("root");
     let view = view(scope, by);
-    // What a directory holds, as the walk may see it.
-    let list = |directory: &str| -> Vec<String> {
-        let names = |entries: fs::ReadDir| {
-            entries
-                .flatten()
-                .filter_map(|entry| entry.file_name().into_string().ok())
-                .collect()
-        };
-        match view {
-            Some(view) => match read::seen(scope.root, directory, view).map(|seen| seen.what) {
-                Some(read::Public::Directory(handle)) => {
-                    fs::read_dir(format!("/proc/self/fd/{}", handle.as_raw_fd()))
-                        .map(names)
-                        .unwrap_or_default()
-                }
-                _ => Vec::new(),
-            },
-            None => fs::read_dir(scope.root.join(directory))
-                .map(names)
-                .unwrap_or_default(),
-        }
-    };
+    let list = |directory: &str| listed(scope, view, directory);
     for command in &item.runs {
         // A pattern alone (a Hyprland `source`) names the files it
         // matches; anything else with a `*` in it (a command line, however
         // it is written) still runs its program.
-        let bare = command.trim();
-        let bare = ["$HOME/", "${HOME}/"]
-            .iter()
-            .find_map(|home| bare.strip_prefix(home))
-            .unwrap_or(bare);
-        let pattern = command.contains(['*', '?'])
-            && !bare.contains(|c: char| c.is_whitespace() || ";|&$()<>`'\"\\".contains(c));
-        if pattern {
-            targets.extend(commands::glob_targets(home, command, &list));
+        if is_pattern(command) {
+            let (matched, more) = commands::glob_targets(home, command, &list);
+            // A directory a pattern matches too (`/*`) is no more run
+            // than one a command names.
+            targets.extend(
+                matched
+                    .into_iter()
+                    .filter(|target| names_a_file(scope, target, by)),
+            );
+            if more {
+                limit(format!(
+                    "only the first {} files a pattern names",
+                    commands::MAX_GLOB
+                ));
+            }
             continue;
         }
         // Each command of a line a shell runs (`a; b && c | d`) runs its
@@ -689,31 +1118,61 @@ fn follow(scope: &Scope<'_>, item: &Item) -> Vec<String> {
             item.category,
             Category::Cron | Category::Shell | Category::Hyprland
         );
+        let lookup = commands::Lookup {
+            home,
+            search: &search.directories,
+            exists: &|candidate| is_there(scope, candidate, by),
+            capped: std::cell::Cell::new(false),
+        };
         let parts = if command.len() > MAX_SPLIT_LINE {
+            limit(format!(
+                "a command line longer than {MAX_SPLIT_LINE} bytes was taken as one command"
+            ));
             vec![command.clone()]
         } else if shell_line {
-            commands::inner_commands(command)
+            let (parts, more) = commands::split_commands(command);
+            if more {
+                lookup.capped.set(true);
+            }
+            parts
         } else {
             command.split(" ; ").map(str::to_string).collect()
         };
         for part in parts {
-            for target in
-                commands::targets_where(home, &part, &|candidate| is_there(scope, candidate, by))
-            {
+            for target in lookup.targets(&part) {
                 if !targets.contains(&target) {
                     targets.push(target);
                 }
             }
         }
+        if lookup.capped.get() {
+            limit(format!(
+                "only the first {} commands of a line",
+                commands::MAX_INNER_COMMANDS
+            ));
+        }
     }
-    targets
+    let under =
+        |places: &[&str], target: &str| places.iter().any(|place| target.starts_with(place));
+    let targets = targets
         .into_iter()
+        .filter(|target| {
+            if under(FILES_ONLY, target) {
+                is_file_there(scope, target, by)
+            } else {
+                !under(NOT_FOLLOWED, target)
+            }
+        })
         .filter_map(|target| match view {
             // The path the pinned walk took, not one resolved again.
             Some(view) => read::seen(scope.root, &target, view).map(|seen| seen.path),
             None => read::canonical(scope.root, &target),
         })
-        .collect()
+        .collect();
+    Followed {
+        targets,
+        unfollowed,
+    }
 }
 
 /// The home directory of `user`, relative to the root, from `/etc/passwd`.
@@ -948,8 +1407,10 @@ mod tests {
             index: &index,
             origin: Origin::System,
         };
+        let search = crate::sweep::path::search(&scope);
+        let follow = |item: &super::Item| super::follow(&scope, item, &search).targets;
         let starred = super::item(&scope, Category::Cron, "var/spool/cron/w".into(), None);
-        assert!(super::follow(&scope, &starred).contains(&"etc/open".to_string()));
+        assert!(follow(&starred).contains(&"etc/open".to_string()));
         // Each command of a line, however they are joined.
         write(root, "etc/second", "x\n");
         write(root, "etc/third", "x\n");
@@ -959,9 +1420,93 @@ mod tests {
             "* * * * * /bin/true;/etc/second && /etc/third | cat\n",
         );
         let joined = super::item(&scope, Category::Cron, "var/spool/cron/x".into(), None);
-        let followed = super::follow(&scope, &joined);
+        let followed = follow(&joined);
         for path in ["etc/second", "etc/third"] {
             assert!(followed.contains(&path.to_string()), "{followed:?}");
+        }
+        // A line with more commands than are looked up says so, and so
+        // does a file with a line too long to look through.
+        let many = format!(
+            "* * * * * {}/etc/second\n",
+            "true;".repeat(crate::sweep::commands::MAX_INNER_COMMANDS)
+        );
+        write(root, "var/spool/cron/y", &many);
+        let long = super::item(&scope, Category::Cron, "var/spool/cron/y".into(), None);
+        let followed = super::follow(&scope, &long, &search);
+        assert!(!followed.targets.contains(&"etc/second".to_string()));
+        assert_eq!(
+            followed.unfollowed,
+            ["only the first 1024 commands of a line"]
+        );
+        write(
+            root,
+            "home/u/.bashrc",
+            &format!("true {}\n~/bin/agent &\n", "x".repeat(70 * 1024)),
+        );
+        let shell = super::item(&scope, Category::Shell, "home/u/.bashrc".into(), None);
+        assert!(super::is_capped(&shell), "{:?}", shell.notes);
+        assert_eq!(shell.runs, ["~/bin/agent"]);
+        assert!(!super::is_capped(&joined));
+    }
+
+    #[test]
+    fn a_pattern_names_files_and_a_case_branch_names_nothing() {
+        let dir = TempDir::new("sweep-pattern");
+        let root = dir.path();
+        // What a pattern matches: a file, a link to one, a directory and a
+        // link to a directory.
+        write(root, "home/u/.config/hypr/conf.d/a.conf", "x\n");
+        write(root, "home/u/.config/hypr/elsewhere.conf", "x\n");
+        fs::create_dir_all(root.join("home/u/.config/hypr/conf.d/dir")).unwrap();
+        symlink(
+            "../elsewhere.conf",
+            root.join("home/u/.config/hypr/conf.d/linked"),
+        )
+        .unwrap();
+        symlink("dir", root.join("home/u/.config/hypr/conf.d/to-dir")).unwrap();
+        write(
+            root,
+            "home/u/.config/hypr/hyprland.conf",
+            "source = ~/.config/hypr/conf.d/*\n",
+        );
+        // The shape of a packaged completion file: the branch `/*)` is a
+        // pattern, not a command over every top-level directory.
+        for top in ["bin", "etc/x", "tmp/x"] {
+            write(root, &format!("{top}/keep"), "x\n");
+        }
+        write(root, "usr/local/bin/tool", "x\n");
+        write(
+            root,
+            "home/u/.bashrc",
+            "case \"$cur\" in\n'')\n\tCOMPREPLY=()\n\t;;\n/*)\n\t/usr/local/bin/tool\n\t;;\nesac\n",
+        );
+        let index = PackageIndex::with_foreign(HashSet::new());
+        for origin in [Origin::System, Origin::Root] {
+            let scope = Scope {
+                root,
+                home: Some("home/u"),
+                index: &index,
+                origin,
+            };
+            let search = crate::sweep::path::search(&scope);
+            let conf = "home/u/.config/hypr/hyprland.conf";
+            let sourced = super::item(&scope, Category::Hyprland, conf.into(), None);
+            let mut targets = super::follow(&scope, &sourced, &search).targets;
+            targets.sort();
+            assert_eq!(
+                targets,
+                [
+                    "home/u/.config/hypr/conf.d/a.conf",
+                    "home/u/.config/hypr/conf.d/linked"
+                ],
+                "{origin:?}"
+            );
+            let shell = super::item(&scope, Category::Shell, "home/u/.bashrc".into(), None);
+            assert_eq!(shell.runs, ["/usr/local/bin/tool"]);
+            assert_eq!(
+                super::follow(&scope, &shell, &search).targets,
+                ["usr/local/bin/tool"]
+            );
         }
     }
 
@@ -994,26 +1539,29 @@ mod tests {
         };
         let by = Some("var/spool/cron/u");
         let as_root = scope(Origin::Root);
+        let follow_as = |scope: &Scope<'_>, item: &super::Item| {
+            super::follow(scope, item, &crate::sweep::path::search(scope)).targets
+        };
         // What the crontab line leads to is not even looked for.
         let crontab = super::item(&as_root, Category::Cron, "var/spool/cron/u".into(), None);
         assert_eq!(crontab.runs, ["/etc/secret"]);
-        assert!(super::follow(&as_root, &crontab).is_empty());
+        assert!(follow_as(&as_root, &crontab).is_empty());
         write(root, "var/spool/cron/v", "* * * * * /etc/open\n");
         let open_crontab = super::item(&as_root, Category::Cron, "var/spool/cron/v".into(), None);
-        assert_eq!(super::follow(&as_root, &open_crontab), ["etc/open"]);
+        assert_eq!(follow_as(&as_root, &open_crontab), ["etc/open"]);
         // Nor where a user's link leads, directly or through a link only
         // root can see.
         let user_link = super::item(&as_root, Category::Cron, "etc/link".into(), by);
-        assert!(super::follow(&as_root, &user_link).is_empty());
+        assert!(follow_as(&as_root, &user_link).is_empty());
         symlink("/etc/open", root.join("root/private/hop")).unwrap();
         symlink("/root/private/hop", root.join("etc/chain")).unwrap();
         let chain = super::item(&as_root, Category::Cron, "etc/chain".into(), by);
         assert_eq!(chain.body, Body::Link("/root/private/hop".into()));
-        assert!(super::follow(&as_root, &chain).is_empty());
-        assert_eq!(super::follow(&scope(Origin::System), &chain), ["etc/open"]);
+        assert!(follow_as(&as_root, &chain).is_empty());
+        assert_eq!(follow_as(&scope(Origin::System), &chain), ["etc/open"]);
         // The user's own sweep follows both.
         let as_user = scope(Origin::System);
-        assert_eq!(super::follow(&as_user, &crontab), ["etc/secret"]);
+        assert_eq!(follow_as(&as_user, &crontab), ["etc/secret"]);
 
         // Named by a user's crontab: what only root can read is not looked
         // at, and one that is not there looks the same.
@@ -1079,7 +1627,7 @@ mod tests {
             "* * * * * /conf/open\n* * * * * /tmp/conf/open\n",
         );
         let through = super::item(&as_root, Category::Cron, "var/spool/cron/w".into(), None);
-        assert_eq!(super::follow(&as_root, &through), ["etc/open"]);
+        assert_eq!(follow_as(&as_root, &through), ["etc/open"]);
         assert!(!super::is_there(&as_root, "tmp/conf/open", by));
         assert!(super::user_steered(root, None));
         // Not root's file: whoever owns it decides what it names.
@@ -1133,6 +1681,82 @@ mod tests {
     }
 
     #[test]
+    fn devices_and_kernel_files_are_not_followed_and_a_plain_locale_file_is_quiet() {
+        let dir = TempDir::new("sweep-not-followed");
+        let root = dir.path();
+        // What a command writes to is no program it runs.
+        write(
+            root,
+            "etc/profile.d/tidy.sh",
+            "strip --list-file /dev/stdout \"$1\"\ncat /proc/version /sys/x </run/sock >/dev/null\n/dev/shm/payload\n/run/user/1000/payload\n. /etc/locale.conf\n",
+        );
+        for path in [
+            "dev/stdout",
+            "dev/shm/payload",
+            "proc/version",
+            "sys/x",
+            "run/user/1000/payload",
+        ] {
+            write(root, path, "x\n");
+        }
+        std::os::unix::net::UnixListener::bind(root.join("run/sock")).unwrap();
+        write(
+            root,
+            "etc/locale.conf",
+            "# the locale\nLANG=en_US.UTF-8\nLC_TIME=\"de_DE.UTF-8\"\n",
+        );
+        write(
+            root,
+            "home/u/.config/mimeapps.list",
+            "[Default Applications]\n",
+        );
+        write(
+            root,
+            "usr/share/applications/mimeapps.list",
+            "[Default Applications]\n",
+        );
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let scope = Scope {
+            root,
+            home: Some("home/u"),
+            index: &index,
+            origin: Origin::System,
+        };
+        let collection = collect(&scope);
+        let find = |path: &str| collection.items.iter().find(|item| item.path == path);
+        for path in ["dev/stdout", "proc/version", "sys/x", "run/sock"] {
+            assert!(find(path).is_none(), "{path}");
+        }
+        // A program in memory a user fills, or in a runtime directory, is
+        // a program all the same.
+        for path in ["dev/shm/payload", "run/user/1000/payload"] {
+            assert!(find(path).is_some(), "{path}");
+        }
+        // The locale file is listed, and not as something to look at.
+        let locale = find("etc/locale.conf").unwrap();
+        assert_eq!(locale.tier, Tier::Inert);
+        assert!(locale.is_trusted());
+        // The list of handlers replaces no launcher.
+        let handlers = find("home/u/.config/mimeapps.list").unwrap();
+        assert!(handlers.notes.is_empty(), "{:?}", handlers.notes);
+        // One that does more than name a language is an item like any.
+        for text in [
+            "LANG=en_US.UTF-8\nPATH=/tmp/x:$PATH\n",
+            "LANG=$(curl x)\n",
+            "LANG=C; /tmp/x\n",
+        ] {
+            write(root, "etc/locale.conf", text);
+            let collection = collect(&scope);
+            let locale = collection
+                .items
+                .iter()
+                .find(|item| item.path == "etc/locale.conf")
+                .unwrap();
+            assert_eq!(locale.tier, Tier::Unknown, "{text}");
+        }
+    }
+
+    #[test]
     fn a_user_crontab_runs_from_that_users_home() {
         let dir = TempDir::new("sweep-crontab");
         let root = dir.path();
@@ -1144,6 +1768,15 @@ mod tests {
         write(root, "var/spool/cron/u", "@reboot ~/x.sh\n");
         write(root, "home/u/x.sh", "curl x | sh\n");
         write(root, "root/x.sh", "root's\n");
+        // A queued `at` job, in whichever spool: told by its hash, with
+        // the environment it carries left where it is.
+        for spool in ["var/spool/atd", "var/spool/at", "var/spool/cron/atjobs"] {
+            write(
+                root,
+                &format!("{spool}/a0000101"),
+                "#!/bin/sh\nTOKEN=hunter2; export TOKEN\n/home/u/x.sh\n",
+            );
+        }
         let index = PackageIndex::with_foreign(HashSet::new());
         let collection = collect(&Scope {
             root,
@@ -1158,5 +1791,15 @@ mod tests {
                 .any(|item| item.path == "home/u/x.sh")
         );
         assert!(!collection.items.iter().any(|item| item.path == "root/x.sh"));
+        let jobs: Vec<_> = collection
+            .items
+            .iter()
+            .filter(|item| super::is_at_job(&item.path))
+            .collect();
+        assert_eq!(jobs.len(), 3);
+        for job in jobs {
+            assert_eq!(job.body, Body::Binary(super::WITHHELD), "{}", job.path);
+            assert!(job.runs.is_empty() && job.sha256.is_some(), "{}", job.path);
+        }
     }
 }

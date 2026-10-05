@@ -79,6 +79,12 @@ pub struct PartialConfig {
     pub trusted_reviewer_packages: Option<Vec<String>>,
     /// The system sweep's root collector (system file only).
     pub sweep: SweepSettings,
+    /// Weaker-than-the-level settings of user-level classes the owner of
+    /// this machine has accepted, as `class.knob=value` (system file only).
+    pub acknowledged_weaker: Option<Vec<String>>,
+    /// Whether a blocked install can be permitted under the strict level
+    /// (`[permit] strict = "allowed"`; system file only).
+    pub permit_strict: Option<bool>,
     pub agent: AgentDefaults,
     pub classes: Vec<(SourceClass, PartialPolicy)>,
 }
@@ -176,6 +182,24 @@ pub fn is_group_name(name: &str) -> bool {
         })
 }
 
+/// Whether `key` names one accepted weaker setting: `class.knob=value`, of
+/// a user-level class, with a value that knob can have.
+pub fn is_weaker_key(key: &str) -> bool {
+    let Some((name, value)) = key.split_once('=') else {
+        return false;
+    };
+    let Some((class, knob)) = name.split_once('.') else {
+        return false;
+    };
+    let known_value = match knob {
+        "ai" => AiRequirement::parse(value).is_some(),
+        "on_findings" | "on_ai_suspicious" => Action::parse(value).is_some(),
+        "confirm" => value == "false",
+        _ => false,
+    };
+    SourceClass::parse(class).is_some_and(|class| !class.is_privileged()) && known_value
+}
+
 fn apply(
     config: &mut PartialConfig,
     path: &[&str],
@@ -195,6 +219,16 @@ fn apply(
                 return Err(field.error("expected a group name"));
             }
             config.sweep.group = Some(group);
+        }
+        ["acknowledged", "weaker"] => {
+            config.acknowledged_weaker = Some(field.weaker_list(value)?);
+        }
+        ["permit", "strict"] => {
+            config.permit_strict = Some(match field.text(value)?.as_str() {
+                "allowed" => true,
+                "off" => false,
+                _ => return Err(field.error("expected \"allowed\" or \"off\"")),
+            });
         }
         ["agent", "model"] => config.agent.model = Some(field.model(value)?),
         ["agent", "max_input_kib"] => {
@@ -356,6 +390,17 @@ impl Field<'_> {
         }
     }
 
+    fn weaker_list(&self, value: Value) -> Result<Vec<String>, ConfigError> {
+        match value {
+            Value::StringArray(keys) if keys.iter().all(|key| is_weaker_key(key)) => Ok(keys),
+            Value::StringArray(_) | Value::String(_) | Value::Integer(_) | Value::Bool(_) => {
+                Err(self.error(
+                    "expected a list like [\"aur.ai=off\"]: a user-level class, one of ai, on_findings, on_ai_suspicious or confirm, and the accepted value",
+                ))
+            }
+        }
+    }
+
     fn repo_list(&self, value: Value) -> Result<Vec<String>, ConfigError> {
         let is_repo_name = |name: &str| {
             !name.is_empty()
@@ -376,7 +421,54 @@ impl Field<'_> {
 mod tests {
     use std::path::Path;
 
-    use super::{PartialPolicy, parse};
+    use super::{PartialPolicy, is_weaker_key, parse};
+
+    #[test]
+    fn permits_under_the_strict_level_are_allowed_or_off() {
+        let strict =
+            |text: &str| parse(Path::new("system"), text).map(|config| config.permit_strict);
+        assert_eq!(
+            strict("[permit]\nstrict = \"allowed\"\n").unwrap(),
+            Some(true)
+        );
+        assert_eq!(strict("[permit]\nstrict = \"off\"\n").unwrap(), Some(false));
+        assert_eq!(strict("profile = \"strict\"\n").unwrap(), None);
+        assert!(strict("[permit]\nstrict = \"yes\"\n").is_err());
+        assert!(strict("[permit]\nstrict = true\n").is_err());
+        assert!(strict("[permit]\nstandard = \"off\"\n").is_err());
+    }
+
+    #[test]
+    fn accepted_weaker_settings_name_a_user_level_class_a_knob_and_a_value() {
+        let parsed = parse(
+            Path::new("system"),
+            "[acknowledged]\nweaker = [\"aur.ai=off\", \"theme.confirm=false\", \"system.on_findings=warn\"]\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.acknowledged_weaker.map(|keys| keys.len()), Some(3));
+        for bad in [
+            "aur.ai",
+            "aur.ai=sometimes",
+            "aur.thinking=low",
+            "aur.confirm=true",
+            // The pacman classes are never loosened by the user file.
+            "official.ai=off",
+            "nope.ai=off",
+            "ai=off",
+        ] {
+            assert!(!is_weaker_key(bad), "{bad}");
+            let text = format!("[acknowledged]\nweaker = [\"{bad}\"]\n");
+            assert!(parse(Path::new("system"), &text).is_err(), "{bad}");
+        }
+        assert!(
+            parse(
+                Path::new("system"),
+                "[acknowledged]\nweaker = \"aur.ai=off\"\n"
+            )
+            .is_err()
+        );
+    }
+
     use crate::config::model::{Action, AiRequirement, Profile, SourceClass, Thinking, Toggle};
 
     const EXAMPLE: &str = r#"

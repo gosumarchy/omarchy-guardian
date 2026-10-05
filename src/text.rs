@@ -18,6 +18,7 @@ pub const fn is_hidden(character: char) -> bool {
         '\u{0}'..='\u{1f}'
             | '\u{7f}'..='\u{9f}'
             | '\u{ad}'
+            | '\u{34f}'
             | '\u{61c}'
             | '\u{115f}'
             | '\u{1160}'
@@ -25,11 +26,13 @@ pub const fn is_hidden(character: char) -> bool {
             | '\u{200b}'..='\u{200f}'
             | '\u{2028}'..='\u{202e}'
             | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{2800}'
             | '\u{3164}'
             | '\u{fe00}'..='\u{fe0f}'
             | '\u{feff}'
             | '\u{ffa0}'
+            | '\u{fff9}'..='\u{fffb}'
             | '\u{e0000}'..='\u{e007f}'
             | '\u{e0100}'..='\u{e01ef}'
     )
@@ -139,10 +142,25 @@ mod tests {
             '\u{e0041}',
             '\u{fe0f}',
             '\u{2028}',
+            '\u{206a}',
+            '\u{206f}',
+            '\u{34f}',
+            '\u{fff9}',
+            '\u{2800}',
+            '\u{e0100}',
         ] {
             assert!(is_hidden(character), "{:x}", u32::from(character));
         }
-        for character in ['✓', 'é', '中', '\u{1f600}', 'a', ' '] {
+        for character in [
+            '✓',
+            'é',
+            '中',
+            '\u{1f600}',
+            'a',
+            ' ',
+            '\u{2801}',
+            '\u{fffd}',
+        ] {
             assert!(!is_hidden(character));
         }
     }

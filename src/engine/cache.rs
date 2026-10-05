@@ -1,6 +1,7 @@
 //! Cached AI verdicts, one per chunk request. A verdict is reused only for
-//! the exact same request under the same prompt version, model, variant,
-//! thinking level and class.
+//! the exact same request (its instructions and scope included) under the
+//! same prompt version, system prompt, model, variant, thinking level and
+//! class.
 
 use std::str;
 
@@ -35,7 +36,26 @@ pub fn key(settings: &AgentSettings, class: SourceClass, request: &Request) -> S
         class.name()
     );
     hasher.update(header.as_bytes());
+    // The rendered request holds the instructions and scope it was sent
+    // with; the positional message and the system prompt are not in it.
+    for prompt in agent::FIXED_PROMPTS {
+        hasher.update(prompt.as_bytes());
+        hasher.update(b"\0");
+    }
     hasher.update(request.render(KEY_NONCE).as_bytes());
+    hasher.finalize().to_string()
+}
+
+/// A digest of the two prompts outside the request and of `fixed`, the
+/// request wording of a class (`Request::fixed_text`), for what a baseline
+/// is bound to.
+pub fn prompt_digest(fixed: &str) -> String {
+    let mut hasher = Sha256::new();
+    for prompt in agent::FIXED_PROMPTS {
+        hasher.update(prompt.as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.update(fixed.as_bytes());
     hasher.finalize().to_string()
 }
 
@@ -161,6 +181,55 @@ mod tests {
             ..AgentSettings::default()
         };
         assert_ne!(key(&model, SourceClass::Aur, &request("a")), base);
+    }
+
+    #[test]
+    fn keys_cover_the_wording_of_the_request_and_of_the_prompts() {
+        use crate::sha256::Sha256;
+
+        // The instructions and scope are in the rendered request, which is
+        // hashed whole: the key is the digest of the header, the two
+        // prompts outside the request, and that text.
+        let settings = AgentSettings::default();
+        let request = request("a");
+        let rendered = request.render(super::KEY_NONCE);
+        assert!(rendered.contains("Review the supplied source for concrete malicious"));
+        let digest_with = |prompts: [&str; 2], rendered: &str| {
+            let mut hasher = Sha256::new();
+            hasher.update(
+                format!(
+                    "omarchy-guardian-verdict\0{}\0\0\0default\0aur\0",
+                    super::PROMPT_VERSION
+                )
+                .as_bytes(),
+            );
+            for prompt in prompts {
+                hasher.update(prompt.as_bytes());
+                hasher.update(b"\0");
+            }
+            hasher.update(rendered.as_bytes());
+            hasher.finalize().to_string()
+        };
+        let base = key(&settings, SourceClass::Aur, &request);
+        assert_eq!(base, digest_with(crate::agent::FIXED_PROMPTS, &rendered));
+        // One changed word in either prompt, or in the instructions, and
+        // the old verdict is not found, with the version left as it was.
+        let [message, system] = crate::agent::FIXED_PROMPTS;
+        assert_ne!(
+            base,
+            digest_with([message, &system.replace("only", "just")], &rendered)
+        );
+        assert_ne!(
+            base,
+            digest_with([&message.replace("nonce", "token"), system], &rendered)
+        );
+        assert_ne!(
+            base,
+            digest_with(
+                crate::agent::FIXED_PROMPTS,
+                &rendered.replace("concrete malicious", "malicious")
+            )
+        );
     }
 
     #[test]

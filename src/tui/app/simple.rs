@@ -44,10 +44,11 @@ const LEVELS: [(Profile, &str, &str); 3] = [
 
 /// The gates that protect installs. The menu entry is a convenience, not
 /// protection.
-const GATES: [Integration; 4] = [
+const GATES: [Integration; 5] = [
     Integration::PacmanHook,
     Integration::AurGate,
     Integration::ThemeInterceptor,
+    Integration::SessionPath,
     Integration::SystemSweep,
 ];
 
@@ -610,6 +611,7 @@ const fn gate_name(gate: Integration) -> &'static str {
         Integration::PacmanHook => "pacman",
         Integration::AurGate => "AUR",
         Integration::ThemeInterceptor => "themes & plugins",
+        Integration::SessionPath => "theme & plugin commands",
         Integration::MenuEntry => "menu",
         Integration::BarWidget => "bar widget",
         Integration::WaybarModule => "Waybar module",
@@ -767,7 +769,19 @@ mod tests {
             sweep_root_timer_link: root.join("system-wants/omarchy-guardian-sweep-collect.timer"),
             sweep_consent: None,
             sweep_group: Some("u".into()),
+            sweep_overrides: Vec::new(),
             login_shell: None,
+            makepkg_gate: root.join("guardian-makepkg"),
+            owner: std::os::unix::fs::MetadataExt::uid(&fs::metadata(root).unwrap()),
+            system_bin: root.join("bin"),
+            paru_config: root.join("paru.conf"),
+            shell_startup: vec![root.join("bashrc"), root.join("zshrc")],
+            path_dirs: Vec::new(),
+            manager_path: None,
+            wrappers: root.join("wrappers"),
+            session_env: root.join("uwsm/env.d/90-omarchy-guardian"),
+            hypr_config: root.join("hypr/hyprland.lua"),
+            hypr_path: root.join("hyprland-path.lua"),
         };
         let mut app = App::new(files(Some(paths)), Mode::Simple);
         assert!(screen(&mut app).contains("not watching pacman, AUR or themes"));

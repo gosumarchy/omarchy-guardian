@@ -1,0 +1,66 @@
+#!/usr/bin/bash
+# Stands in front of Omarchy's `omarchy` on the session's PATH. The real one
+# finds its commands in its own directory, not on PATH, so `omarchy theme
+# install` would never reach Guardian's `omarchy-theme-install` beside this
+# file: theme and plugin installs and updates are routed here, exactly as the
+# Bash interceptor does, and everything else goes straight through.
+LIB=/usr/lib/omarchy-guardian
+
+# Omarchy's own dispatcher, by full path and never looked up on PATH: that
+# would find this file again, or a file planted in front of it. Under
+# `omarchy dev link` it is the linked checkout's (named in the root-owned
+# /etc/omarchy.conf, which Omarchy itself sources); otherwise the packaged
+# one, in either place Omarchy has kept it.
+real_omarchy() {
+    local linked='' candidate
+    if [[ -f /etc/omarchy.conf && $(/usr/bin/stat -c '%u' /etc/omarchy.conf 2>/dev/null) == 0 ]]; then
+        # shellcheck disable=SC1091
+        linked=$(unset OMARCHY_PATH; . /etc/omarchy.conf >/dev/null 2>&1; printf '%s' "${OMARCHY_PATH-}")
+    fi
+    for candidate in ${linked:+"${linked%/}/bin/omarchy"} /usr/share/omarchy/bin/omarchy /usr/bin/omarchy; do
+        if [[ $candidate == /* && -f $candidate && -x $candidate ]]; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Help only before `--`, as omarchy itself decides: `omarchy theme install
+# URL -- -h` installs, so it must not pass through unreviewed.
+help_requested() {
+    local arg
+    for arg in "$@"; do
+        [[ $arg == -- ]] && return 1
+        [[ $arg == --help || $arg == -h ]] && return 0
+    done
+    return 1
+}
+
+# omarchy also accepts `omarchy theme-install URL` and the like.
+case ${1-} in
+    theme-install | theme-update | plugin-add | plugin-install | plugin-update)
+        set -- "${1%%-*}" "${1#*-}" "${@:2}"
+        ;;
+esac
+
+if ! help_requested "$@"; then
+    if [[ ${1-} == theme && ( ${2-} == install || ${2-} == update ) ]]; then
+        action=$2
+        shift 2
+        exec "$LIB/guardian-theme" "$action" "$@"
+    elif [[ ${1-} == plugin && ( ${2-} == add || ${2-} == install || ${2-} == update ) ]]; then
+        action=$2
+        shift 2
+        exec "$LIB/guardian-plugin" "$action" "$@"
+    fi
+fi
+
+# Everything that is not a theme or plugin install goes straight through.
+# The four gated commands above never get here, so a missing dispatcher
+# stops only what Guardian does not review.
+if ! REAL=$(real_omarchy); then
+    printf '%s\n' "omarchy (Guardian's wrapper): Omarchy's own omarchy command is not at /usr/share/omarchy/bin/omarchy or /usr/bin/omarchy; is Omarchy installed?" >&2
+    exit 127
+fi
+exec "$REAL" "$@"

@@ -180,6 +180,54 @@ impl fmt::Display for Json {
     }
 }
 
+/// Characters written as `\uXXXX` although JSON allows most of them raw:
+/// the ones that are invisible or reorder text. A reader of the request,
+/// the model included, then sees which code point was there, and nothing in
+/// a reviewed file can draw what looks like a line of the request around
+/// it. Nothing is removed: the escape names the character.
+pub const fn is_escaped(character: char) -> bool {
+    matches!(
+        character,
+        '\u{0}'..='\u{1f}'
+            | '\u{7f}'..='\u{9f}'
+            | '\u{ad}'
+            | '\u{34f}'
+            | '\u{61c}'
+            | '\u{115f}'
+            | '\u{1160}'
+            | '\u{17b4}'
+            | '\u{17b5}'
+            | '\u{180b}'..='\u{180f}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{202f}'
+            | '\u{205f}'..='\u{206f}'
+            | '\u{2800}'
+            | '\u{3164}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{feff}'
+            | '\u{ffa0}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0000}'..='\u{e0fff}'
+    )
+}
+
+/// The bytes `character` takes inside a JSON string as written here.
+pub const fn written_len(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\n' | '\r' | '\t' => 2,
+        // Past the basic plane an escape is a surrogate pair.
+        other if is_escaped(other) => {
+            if other as u32 > 0xffff {
+                12
+            } else {
+                6
+            }
+        }
+        other => other.len_utf8(),
+    }
+}
+
 fn write_string(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
     f.write_char('"')?;
     for character in text.chars() {
@@ -189,7 +237,12 @@ fn write_string(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
             '\n' => f.write_str("\\n")?,
             '\r' => f.write_str("\\r")?,
             '\t' => f.write_str("\\t")?,
-            control if u32::from(control) < 0x20 => write!(f, "\\u{:04x}", u32::from(control))?,
+            hidden if is_escaped(hidden) => {
+                let mut units = [0_u16; 2];
+                for unit in hidden.encode_utf16(&mut units) {
+                    write!(f, "\\u{unit:04x}")?;
+                }
+            }
             other => f.write_char(other)?,
         }
     }
@@ -450,7 +503,11 @@ impl<'a> Parser<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::Json;
+    use std::collections::HashSet;
+    use std::fmt::Write as _;
+
+    use super::{Json, MAX_DEPTH};
+    use crate::test_support::Rng;
 
     #[test]
     fn parses_nested_documents() {
@@ -514,10 +571,378 @@ mod tests {
     }
 
     #[test]
+    fn invisible_characters_are_written_as_escapes_and_read_back() {
+        // One of each kind: a C1 control, a soft hyphen, a bidi override, a
+        // zero-width space, a line separator, a variation selector, a
+        // byte-order mark, a blank Braille cell, and two past the basic
+        // plane (a musical format character and a tag letter).
+        let hidden =
+            "a\u{9b}\u{ad}\u{202e}\u{200b}\u{2028}\u{fe0f}\u{feff}\u{2800}\u{1d173}\u{e0041}z";
+        let text = Json::from(hidden).to_string();
+        // The sixteen-bit units in hex, each after a backslash and a `u`.
+        let mut escapes = String::new();
+        for unit in [
+            "009b", "00ad", "202e", "200b", "2028", "fe0f", "feff", "2800", "d834", "dd73", "db40",
+            "dc41",
+        ] {
+            escapes.push('\\');
+            escapes.push('u');
+            escapes.push_str(unit);
+        }
+        assert_eq!(text, format!("\"a{escapes}z\""));
+        assert!(text.is_ascii());
+        assert_eq!(Json::parse(&text).unwrap(), Json::from(hidden));
+        // Ordinary text of any script, and emoji, stay as they are.
+        let plain = "é 中 ✓ \u{1f600} \u{2026}";
+        assert_eq!(Json::from(plain).to_string(), format!("\"{plain}\""));
+    }
+
+    #[test]
+    fn the_written_length_is_what_is_written() {
+        for character in (0..=0x0011_0000_u32).filter_map(char::from_u32) {
+            let mut buffer = [0_u8; 4];
+            let text = Json::from(&*character.encode_utf8(&mut buffer)).to_string();
+            assert_eq!(
+                text.len() - 2,
+                super::written_len(character),
+                "{:x}",
+                u32::from(character)
+            );
+        }
+    }
+
+    #[test]
     fn parses_concatenated_values() {
         let values = Json::parse_stream("{\"id\":\"A\"}\n{\"id\":\"B\"} ").unwrap();
         assert_eq!(values.len(), 2);
         assert_eq!(values[1].get("id").and_then(Json::as_str), Some("B"));
         assert!(Json::parse_stream("{} {").is_err());
+    }
+
+    /// What JSON is written with, and what a parser trips over.
+    const PIECES: &[&str] = &[
+        "{",
+        "}",
+        "[",
+        "]",
+        ":",
+        ",",
+        "\"",
+        "\\",
+        "\\u",
+        "\\ud83d",
+        "\\ude00",
+        "\\udc00",
+        "\\n",
+        "\\x",
+        "/",
+        "true",
+        "false",
+        "null",
+        "nul",
+        "-",
+        "0",
+        "1",
+        "9",
+        ".",
+        "e",
+        "E",
+        "+",
+        " ",
+        "\n",
+        "\t",
+        "\r",
+        "a",
+        "é",
+        "\u{1f600}",
+        "\u{202e}",
+        "\u{0}",
+        "\u{1f}",
+        "\u{7f}",
+        "\u{feff}",
+        "\u{d7ff}",
+        "\u{e000}",
+        "\u{10ffff}",
+        "\"a\"",
+        "\"a\":",
+        "[]",
+        "{}",
+    ];
+
+    /// Characters for generated strings: plain, escaped by the writer,
+    /// escaped by JSON itself, and past the basic plane.
+    const CHARACTERS: &[char] = &[
+        'a',
+        'Z',
+        '0',
+        ' ',
+        '"',
+        '\\',
+        '/',
+        '\n',
+        '\r',
+        '\t',
+        '\u{0}',
+        '\u{8}',
+        '\u{c}',
+        '\u{1f}',
+        '\u{7f}',
+        '\u{9b}',
+        '\u{ad}',
+        'é',
+        '中',
+        '\u{200b}',
+        '\u{202e}',
+        '\u{2028}',
+        '\u{feff}',
+        '\u{fffd}',
+        '\u{d7ff}',
+        '\u{e000}',
+        '\u{1f600}',
+        '\u{e0041}',
+        '\u{10ffff}',
+    ];
+
+    fn string(rng: &mut Rng) -> String {
+        (0..rng.below(8)).map(|_| *rng.pick(CHARACTERS)).collect()
+    }
+
+    fn number(rng: &mut Rng) -> String {
+        let digits = |rng: &mut Rng| -> String {
+            (0..=rng.below(4))
+                .map(|_| *rng.pick(&['0', '1', '7', '9']))
+                .collect()
+        };
+        let mut text = String::new();
+        if rng.chance(3) {
+            text.push('-');
+        }
+        // No leading zero before more digits.
+        if rng.chance(4) {
+            text.push('0');
+        } else {
+            text.push(*rng.pick(&['1', '5', '9']));
+            if rng.chance(2) {
+                text.push_str(&digits(rng));
+            }
+        }
+        if rng.chance(3) {
+            text.push('.');
+            text.push_str(&digits(rng));
+        }
+        if rng.chance(3) {
+            text.push(*rng.pick(&['e', 'E']));
+            text.push_str(rng.pick(&["", "+", "-"]));
+            text.push_str(&digits(rng));
+        }
+        text
+    }
+
+    /// A value at most `depth` containers deep, with unique keys.
+    fn value(rng: &mut Rng, depth: usize) -> Json {
+        match rng.below(if depth == 0 { 4 } else { 6 }) {
+            0 => Json::Null,
+            1 => Json::Bool(rng.chance(2)),
+            2 => Json::Number(number(rng)),
+            3 => Json::String(string(rng)),
+            4 => Json::Array((0..rng.below(4)).map(|_| value(rng, depth - 1)).collect()),
+            _ => {
+                let mut members: Vec<(String, Json)> = Vec::new();
+                for _ in 0..rng.below(4) {
+                    let key = string(rng);
+                    if !members.iter().any(|(known, _)| *known == key) {
+                        members.push((key, value(rng, depth - 1)));
+                    }
+                }
+                Json::Object(members)
+            }
+        }
+    }
+
+    /// How deep the containers of `value` go.
+    fn depth_of(value: &Json) -> usize {
+        match value {
+            Json::Array(items) => 1 + items.iter().map(depth_of).max().unwrap_or(0),
+            Json::Object(members) => {
+                1 + members
+                    .iter()
+                    .map(|(_, member)| depth_of(member))
+                    .max()
+                    .unwrap_or(0)
+            }
+            Json::Null | Json::Bool(_) | Json::Number(_) | Json::String(_) => 0,
+        }
+    }
+
+    fn has_duplicate_keys(value: &Json) -> bool {
+        match value {
+            Json::Array(items) => items.iter().any(has_duplicate_keys),
+            Json::Object(members) => {
+                let mut keys = HashSet::new();
+                members
+                    .iter()
+                    .any(|(key, member)| !keys.insert(key) || has_duplicate_keys(member))
+            }
+            Json::Null | Json::Bool(_) | Json::Number(_) | Json::String(_) => false,
+        }
+    }
+
+    #[test]
+    fn what_is_written_is_read_back_as_it_was() {
+        let mut rng = Rng::new(1);
+        for case in 0..20_000 {
+            let value = value(&mut rng, 4);
+            let text = value.to_string();
+            assert_eq!(
+                Json::parse(&text).as_ref(),
+                Ok(&value),
+                "case {case}: {text}"
+            );
+            // Whitespace around it changes nothing.
+            let padded = format!(" \n\t{text}\r\n ");
+            assert_eq!(Json::parse(&padded).as_ref(), Ok(&value), "case {case}");
+        }
+    }
+
+    #[test]
+    fn several_values_written_back_to_back_are_read_as_those_values() {
+        let mut rng = Rng::new(2);
+        for case in 0..5_000 {
+            let values: Vec<Json> = (0..rng.below(5)).map(|_| value(&mut rng, 2)).collect();
+            let mut text = String::new();
+            for value in &values {
+                let _ = writeln!(text, "{value}");
+            }
+            assert_eq!(
+                Json::parse_stream(&text).as_ref(),
+                Ok(&values),
+                "case {case}: {text}"
+            );
+        }
+    }
+
+    /// Whatever is accepted is within the limits, has no key twice, and is
+    /// read back as itself when written out again.
+    fn check_accepted(text: &str) {
+        if let Ok(value) = Json::parse(text) {
+            assert!(depth_of(&value) <= MAX_DEPTH, "{text:?}");
+            assert!(!has_duplicate_keys(&value), "{text:?}");
+            assert_eq!(Json::parse(&value.to_string()), Ok(value), "{text:?}");
+        }
+        if let Ok(values) = Json::parse_stream(text) {
+            assert!(values.iter().all(|value| depth_of(value) <= MAX_DEPTH));
+        }
+    }
+
+    #[test]
+    fn no_text_makes_the_parser_panic() {
+        let mut rng = Rng::new(3);
+        let mut accepted = 0;
+        for _ in 0..20_000 {
+            let text = rng.text(PIECES, 24);
+            accepted += usize::from(Json::parse(&text).is_ok());
+            check_accepted(&text);
+        }
+        // The pieces do come together as JSON now and then: the cases
+        // reach past the first byte.
+        assert!(accepted > 100, "{accepted}");
+
+        // Every prefix of a document, and documents with a few bytes
+        // dropped, repeated, moved or swapped for another piece.
+        for _ in 0..3_000 {
+            let text = value(&mut rng, 3).to_string();
+            for end in (0..=text.len()).filter(|end| text.is_char_boundary(*end)) {
+                check_accepted(&text[..end]);
+            }
+            for _ in 0..6 {
+                check_accepted(&rng.mutated(&text, PIECES));
+            }
+        }
+    }
+
+    #[test]
+    fn a_key_given_twice_is_refused_however_it_is_spelled() {
+        // The same key as written, and through escapes that decode to it.
+        let spelled = |rng: &mut Rng, key: &str| -> String {
+            let mut text = String::from('"');
+            for character in key.chars() {
+                if rng.chance(2) {
+                    let _ = write!(text, "\\u{:04x}", u32::from(character));
+                } else {
+                    let written = Json::from(character.to_string()).to_string();
+                    text.push_str(&written[1..written.len() - 1]);
+                }
+            }
+            text.push('"');
+            text
+        };
+        let mut rng = Rng::new(4);
+        for case in 0..4_000 {
+            // Three to six members, one of whose keys is given again
+            // somewhere after its first use.
+            let keys: Vec<String> = (0..3 + rng.below(4))
+                .map(|index| format!("k{index}é\"\n"))
+                .collect();
+            let again = rng.below(keys.len());
+            let mut members: Vec<String> = keys
+                .iter()
+                .map(|key| format!("{}:{}", spelled(&mut rng, key), value(&mut rng, 1)))
+                .collect();
+            let unique = format!("{{{}}}", members.join(","));
+            assert!(Json::parse(&unique).is_ok(), "case {case}: {unique}");
+            let at = again + 1 + rng.below(members.len() - again);
+            members.insert(at, format!("{}:null", spelled(&mut rng, &keys[again])));
+            let twice = format!("{{{}}}", members.join(","));
+            assert_eq!(
+                Json::parse(&twice).map_err(|error| error.message),
+                Err("duplicate object key"),
+                "case {case}: {twice}"
+            );
+            // And inside another value.
+            let nested = format!("[1,{{\"outer\":{twice}}}]");
+            assert!(Json::parse(&nested).is_err(), "case {case}");
+        }
+    }
+
+    #[test]
+    fn nesting_is_accepted_up_to_the_limit_and_no_further() {
+        let mut rng = Rng::new(5);
+        // Arrays and objects mixed at random, `depth` deep.
+        let nested = |rng: &mut Rng, depth: usize| -> String {
+            let mut open = String::new();
+            let mut close = String::new();
+            for _ in 0..depth {
+                if rng.chance(2) {
+                    open.push('[');
+                    close.insert(0, ']');
+                } else {
+                    open.push_str("{\"k\":");
+                    close.insert(0, '}');
+                }
+            }
+            format!("{open}null{close}")
+        };
+        for depth in [0, 1, 2, MAX_DEPTH - 1, MAX_DEPTH] {
+            for _ in 0..50 {
+                let text = nested(&mut rng, depth);
+                assert_eq!(Json::parse(&text).map(|value| depth_of(&value)), Ok(depth));
+            }
+        }
+        for depth in [MAX_DEPTH + 1, MAX_DEPTH + 2, 1_000, 100_000] {
+            let text = nested(&mut rng, depth);
+            assert_eq!(
+                Json::parse(&text).map_err(|error| error.message),
+                Err("nesting is too deep"),
+                "{depth}"
+            );
+            assert!(Json::parse_stream(&text).is_err(), "{depth}");
+        }
+        // Never closed, a million deep: refused at the limit, not after
+        // the stack ran out.
+        assert!(Json::parse(&"[".repeat(1_000_000)).is_err());
+        assert!(Json::parse(&"{\"a\":".repeat(1_000_000)).is_err());
+        // Depth is how deep, not how many: siblings do not add up.
+        let wide = format!("[{}]", vec!["[[]]"; 10_000].join(","));
+        assert_eq!(Json::parse(&wide).map(|value| depth_of(&value)), Ok(3));
     }
 }

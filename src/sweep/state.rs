@@ -1,8 +1,9 @@
 //! What the sweep remembers between runs, in a private `sweep` directory of
 //! the review store: the last sweep's untrusted items (so `--diff` and the
-//! schedule report only what is new or changed) and the items the user
-//! allowed (`sweep allow`), each by its label and content hash, so a changed
-//! file is looked at again.
+//! schedule report only what is new or changed). The items the user allowed
+//! (`sweep allow`), each by its label and content hash so that a changed
+//! file is looked at again, are kept in a list only root writes: a program
+//! running as the user could otherwise allow its own autostart entry.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -92,7 +93,12 @@ fn write_text(path: &Path, text: &str) -> Result<(), String> {
     write_text_mode(path, text, 0o600)
 }
 
-fn write_text_mode(path: &Path, text: &str, mode: u32) -> Result<(), String> {
+/// Writes `text` to `path` through a new file and a rename, so a reader
+/// never sees half of it. The file has exactly `mode`, whatever the umask
+/// of the process: the root collector runs with one that would close a
+/// list everyone is meant to read.
+pub fn write_text_mode(path: &Path, text: &str, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
     let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
     drop(fs::remove_file(&temporary));
     let result = OpenOptions::new()
@@ -100,7 +106,10 @@ fn write_text_mode(path: &Path, text: &str, mode: u32) -> Result<(), String> {
         .create_new(true)
         .mode(mode)
         .open(&temporary)
-        .and_then(|mut file| file.write_all(text.as_bytes()))
+        .and_then(|mut file| {
+            file.set_permissions(fs::Permissions::from_mode(mode))?;
+            file.write_all(text.as_bytes())
+        })
         .and_then(|()| fs::rename(&temporary, path));
     if result.is_err() {
         drop(fs::remove_file(&temporary));
@@ -108,74 +117,233 @@ fn write_text_mode(path: &Path, text: &str, mode: u32) -> Result<(), String> {
     result.map_err(|error| format!("{}: {error}", path.display()))
 }
 
-pub fn allowed(directory: &Path) -> Remembered {
+/// The list an older Guardian kept in the user's own state directory. It
+/// counts for nothing now: whatever runs as the user can write it.
+pub fn old_allowed(directory: &Path) -> Remembered {
     read(&directory.join(ALLOWED))
 }
 
-/// Where system items allowed with sudo are kept: a list only root
-/// writes, so a program running as the user cannot add to it.
-pub const SYSTEM_ALLOWED: &str = "/var/lib/omarchy-guardian/sweep/allowed.json";
+/// Where allowed items are kept: a list only root writes (through sudo),
+/// so a program running as the user cannot add to it. A home's items are
+/// kept under the user id they were allowed for, and every user reads it:
+/// it sits where everyone may, not beside root's results, whose directory
+/// only one group may enter.
+pub const SYSTEM_ALLOWED: &str = "/var/lib/omarchy-guardian/allowed.json";
+
+/// Where Guardian up to 0.7.18 kept that list: in the directory of root's
+/// results. A user outside that directory's group could add to the list
+/// through sudo and never read it back, so nothing they allowed counted.
+/// Root moves it on its next write (`move_legacy_allowed`); until then a
+/// sweep that can still reach it reads it there.
+pub const LEGACY_SYSTEM_ALLOWED: &str = "/var/lib/omarchy-guardian/sweep/allowed.json";
+
+/// The most the system list may hold; one that grew past it would read as
+/// empty.
+const MAX_SYSTEM_LIST_BYTES: u64 = MAX_RECORD_BYTES * 16;
+
+/// How `label` is kept in the system list for user `uid`: a home's label
+/// (`~/.bashrc`) with the user id before it (`1000:~/.bashrc`), so that
+/// what one user allowed in their home says nothing about another's.
+pub fn system_key(label: &str, uid: u32) -> String {
+    if is_home_label(label) {
+        format!("{uid}:{label}")
+    } else {
+        label.to_string()
+    }
+}
+
+/// What of the system list `system` counts for user `uid`, by the labels
+/// the sweep shows: the system's items, and that user's own home items.
+pub fn allowed_for(system: &Remembered, uid: u32) -> Remembered {
+    system
+        .iter()
+        .filter_map(|(key, fingerprint)| {
+            let label = if key.starts_with('/') {
+                key.as_str()
+            } else {
+                let (owner, label) = key.split_once(':')?;
+                (owner.parse::<u32>().ok()? == uid && is_home_label(label)).then_some(label)?
+            };
+            Some((label.to_string(), fingerprint.clone()))
+        })
+        .collect()
+}
+
+/// Why `item` cannot be allowed as it is, if it cannot.
+pub fn not_allowable(item: &Item) -> Option<&'static str> {
+    if item
+        .alerts
+        .iter()
+        .any(|(rule, _)| *rule == crate::rules::RuleId::GuardianOverride)
+    {
+        // Allowing it would let whatever wrote it quiet the sweep it
+        // redirects.
+        return Some("it changes Guardian's own sweep, which an allow does not cover; remove it");
+    }
+    if super::collect::is_capped(item) {
+        // An allow vouches for what the item runs, and nobody looked for
+        // all of that.
+        return Some(
+            "not all of what it runs was followed, so it cannot be vouched for as a whole",
+        );
+    }
+    None
+}
 
 /// Whether a label names something in the user's own home.
 pub fn is_home_label(label: &str) -> bool {
     label.starts_with("~/")
 }
 
-/// The system list at `path`, while it and the directories above it up to
-/// `/var/lib` are root's and nobody else may write them; empty otherwise.
-pub fn system_allowed(path: &Path) -> Remembered {
-    let root_alone = |path: &Path| {
+/// The directory above everything Guardian's root halves write.
+pub const ROOT_STATE_ANCHOR: &str = "/var/lib";
+
+/// Whether the file at `path` is `owner`'s alone to write: a regular file
+/// of at most `max_bytes`, which, like every directory above it up to
+/// `anchor`, is owned by `owner` and not writable by a group or by
+/// everyone. For root's state, `owner` is 0 and `anchor` is `/var/lib`.
+pub fn owned_alone(path: &Path, owner: u32, anchor: &Path, max_bytes: u64) -> bool {
+    let alone = |path: &Path| {
         fs::symlink_metadata(path)
-            .is_ok_and(|metadata| metadata.uid() == 0 && metadata.mode() & 0o022 == 0)
+            .is_ok_and(|metadata| metadata.uid() == owner && metadata.mode() & 0o022 == 0)
     };
     let mut directory = path.parent();
     while let Some(current) = directory {
-        if !root_alone(current) {
-            return Remembered::new();
+        if !alone(current) {
+            return false;
         }
-        if current == Path::new("/var/lib") {
+        if current == anchor {
             break;
         }
         directory = current.parent();
     }
     let regular = fs::symlink_metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= MAX_RECORD_BYTES * 16);
-    if !(regular && root_alone(path)) {
-        return Remembered::new();
-    }
-    read(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= max_bytes);
+    regular && alone(path)
 }
 
-/// What counts as allowed: the user's own list for items in the home, and
-/// the system list, which only root writes, for the rest.
-pub fn all_allowed(directory: &Path, system: &Path) -> Remembered {
-    let mut allowed = allowed(directory);
-    allowed.retain(|label, _| is_home_label(label));
-    allowed.extend(
-        system_allowed(system)
-            .into_iter()
-            .filter(|(label, _)| !is_home_label(label)),
-    );
-    allowed
+/// The system list at `path`, while it and the directories above it up to
+/// `/var/lib` are root's and nobody else may write them; empty otherwise.
+pub fn system_allowed(path: &Path) -> Remembered {
+    roots().list(path)
+}
+
+/// Whose a list of allowed items must be to count, and below which
+/// directory: root's, below `/var/lib`. A test plays root with its own
+/// user and directory.
+#[derive(Clone, Copy)]
+struct Keeper<'a> {
+    owner: u32,
+    anchor: &'a Path,
+}
+
+fn roots() -> Keeper<'static> {
+    Keeper {
+        owner: 0,
+        anchor: Path::new(ROOT_STATE_ANCHOR),
+    }
+}
+
+impl Keeper<'_> {
+    /// The list at `path` while it is the keeper's alone; empty otherwise.
+    fn list(self, path: &Path) -> Remembered {
+        if !owned_alone(path, self.owner, self.anchor, MAX_SYSTEM_LIST_BYTES) {
+            return Remembered::new();
+        }
+        read(path)
+    }
+
+    /// The list at `system`, or where there is none yet, the one an older
+    /// Guardian left at `legacy`.
+    fn current(self, system: &Path, legacy: &Path) -> Remembered {
+        if fs::symlink_metadata(system).is_ok() {
+            self.list(system)
+        } else {
+            self.list(legacy)
+        }
+    }
+
+    /// See `move_legacy_allowed`.
+    fn move_legacy(self, path: &Path, legacy: &Path) -> Result<(), String> {
+        if fs::symlink_metadata(legacy).is_err() {
+            return Ok(());
+        }
+        if fs::symlink_metadata(path).is_err() {
+            let old = self.list(legacy);
+            if !old.is_empty() {
+                save_system_allowed(path, &old)?;
+            }
+        }
+        fs::remove_file(legacy).map_err(|error| format!("{}: {error}", legacy.display()))
+    }
+}
+
+/// What counts as allowed for user `uid`: only what the system list at
+/// `system` holds, which only root writes. Where root has not written that
+/// one yet, the list an older Guardian left at `legacy` stands in.
+pub fn all_allowed(system: &Path, legacy: &Path, uid: u32) -> Remembered {
+    allowed_for(&roots().current(system, legacy), uid)
+}
+
+/// `all_allowed` of this system's list.
+pub fn allowed_here(uid: u32) -> Remembered {
+    all_allowed(
+        Path::new(SYSTEM_ALLOWED),
+        Path::new(LEGACY_SYSTEM_ALLOWED),
+        uid,
+    )
+}
+
+/// Moves the list an older Guardian kept at `legacy` to `path`, as root:
+/// taken over as it is where there is no list at `path` yet and the old one
+/// is root's alone, and removed either way, so that one list counts.
+pub fn move_legacy_allowed(path: &Path, legacy: &Path) -> Result<(), String> {
+    roots().move_legacy(path, legacy)
 }
 
 /// Writes the system list, as root: readable by everyone, written only by
-/// root.
+/// root, in a directory everyone may enter.
 pub fn save_system_allowed(path: &Path, allowed: &Remembered) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
     if let Some(directory) = path.parent() {
         fs::create_dir_all(directory)
+            .map_err(|error| format!("{}: {error}", directory.display()))?;
+        // Whatever umask root's shell had: a list its users cannot reach
+        // allows nothing. Exactly this mode, on this one directory, and
+        // nothing below it is touched: root's other state lives here too.
+        // `sweep/` (the collector's results, closed to all but the
+        // configured group) and `permits/` (written by the permit root
+        // half: root's alone to write, readable by everyone) keep the
+        // modes their writers gave them, and both want what this sets on
+        // their parent: everyone may enter, only root may write.
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o755))
             .map_err(|error| format!("{}: {error}", directory.display()))?;
     }
     let json = Json::object(
         allowed
             .iter()
             .map(|(label, value)| (label.as_str(), Json::from(value.as_str()))),
-    );
-    write_text_mode(path, &json.to_string(), 0o644)
+    )
+    .to_string();
+    if json.len() as u64 > MAX_SYSTEM_LIST_BYTES {
+        return Err("the list of allowed items is full; forget some first".into());
+    }
+    write_text_mode(path, &json, 0o644)
 }
 
-pub fn save_allowed(directory: &Path, allowed: &Remembered) -> Result<(), String> {
-    write(&directory.join(ALLOWED), allowed)
+/// Rewrites the list an older Guardian kept (see `old_allowed`); an empty
+/// one is removed.
+pub fn save_old_allowed(directory: &Path, allowed: &Remembered) -> Result<(), String> {
+    let path = directory.join(ALLOWED);
+    if allowed.is_empty() {
+        return match fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                Err(format!("{}: {error}", path.display()))
+            }
+            _ => Ok(()),
+        };
+    }
+    write(&path, allowed)
 }
 
 /// Whether a sweep has remembered anything yet.
@@ -213,10 +381,11 @@ pub fn save_baseline(directory: &Path, current: &Remembered) -> Result<(), Strin
     write(&directory.join(BASELINE), current)
 }
 
-/// Marks items the user allowed, while they are unchanged.
+/// Marks items the user allowed, while they are unchanged and can be
+/// allowed at all (see `not_allowable`).
 pub fn apply_allowed(items: &mut [Item], allowed: &Remembered, label: impl Fn(&Item) -> String) {
     for item in items {
-        if item.is_trusted() {
+        if item.is_trusted() || not_allowable(item).is_some() {
             continue;
         }
         if allowed
@@ -389,10 +558,40 @@ impl Change {
     }
 }
 
+/// How the notes the sweep keeps for itself among the remembered items
+/// start; no item's label does (those start with `/` or `~/`).
+pub const OWN_NOTE: &str = "guardian:";
+
+/// Remembered once accounts, groups, keys and trust anchors were looked at
+/// (and, for the second, once root's part of them was): before that,
+/// finding them says nothing about their being new.
+pub const TRUST_SEEN: &str = "guardian:trust-seen";
+pub const ROOT_TRUST_SEEN: &str = "guardian:root-trust-seen";
+
+/// The content part of a fingerprint: without the alerts and the finding
+/// mark, which come and go with the checks that could run.
+pub fn content_of(fingerprint: &str) -> &str {
+    fingerprint.split('+').next().unwrap_or(fingerprint)
+}
+
 /// What changed between `previous` and `current` (both label to
 /// fingerprint of the untrusted items).
 pub fn diff(previous: &Remembered, current: &Remembered) -> Vec<(Change, String)> {
     let mut changes = Vec::new();
+    let own_note = |label: &&String| !label.starts_with(OWN_NOTE);
+    let (previous, current): (Remembered, Remembered) = (
+        previous
+            .iter()
+            .filter(|(label, _)| own_note(label))
+            .map(|(label, value)| (label.clone(), value.clone()))
+            .collect(),
+        current
+            .iter()
+            .filter(|(label, _)| own_note(label))
+            .map(|(label, value)| (label.clone(), value.clone()))
+            .collect(),
+    );
+    let (previous, current) = (&previous, &current);
     for (label, fingerprint) in current {
         match previous.get(label) {
             None => changes.push((Change::New, label.clone())),
@@ -424,9 +623,7 @@ pub fn diff(previous: &Remembered, current: &Remembered) -> Vec<(Change, String)
 mod tests {
     use std::fs;
 
-    use super::{
-        Change, Remembered, allowed, apply_allowed, baseline, diff, save_allowed, save_baseline,
-    };
+    use super::{Change, Remembered, apply_allowed, baseline, diff, save_baseline};
     use crate::autorun::Category;
     use crate::sha256::Sha256;
     use crate::sweep::collect::{Body, Item, Origin};
@@ -449,20 +646,127 @@ mod tests {
     }
 
     #[test]
-    fn system_items_count_as_allowed_only_from_roots_list() {
+    fn items_count_as_allowed_only_from_roots_list_and_a_home_only_for_its_user() {
+        use std::os::unix::fs::PermissionsExt as _;
         let dir = TempDir::new("sweep-allowed-system");
         let mut own = Remembered::new();
         own.insert("~/.bashrc".into(), "a".into());
         own.insert("/etc/profile.d/x.sh".into(), "b".into());
-        save_allowed(dir.path(), &own).unwrap();
-        // A list in a directory that is not root's counts for nothing, and
-        // the user's own entry for a system item does not count either.
+        // The list an older Guardian kept in the user's own directory is
+        // only read to say what is in it.
+        super::save_old_allowed(dir.path(), &own).unwrap();
+        assert_eq!(super::old_allowed(dir.path()), own);
+        // A list in a directory that is not root's counts for nothing.
         let system = dir.path().join("system.json");
         super::save_system_allowed(&system, &own).unwrap();
-        let allowed = super::all_allowed(dir.path(), &system);
-        assert_eq!(allowed.keys().collect::<Vec<_>>(), ["~/.bashrc"]);
         assert!(super::system_allowed(&system).is_empty());
+        if std::os::unix::fs::MetadataExt::uid(&fs::metadata(dir.path()).unwrap()) != 0 {
+            assert!(super::all_allowed(&system, &system, 1000).is_empty());
+        }
         assert!(super::is_home_label("~/x") && !super::is_home_label("/root/x"));
+        // Saving sets the mode of the list's directory and of nothing in
+        // it: what else root keeps there stays as closed as it was made.
+        let kept = dir.path().join("kept");
+        for (name, mode) in [("sweep", 0o750), ("permits", 0o700)] {
+            fs::create_dir_all(kept.join(name)).unwrap();
+            fs::set_permissions(kept.join(name), fs::Permissions::from_mode(mode)).unwrap();
+        }
+        fs::set_permissions(&kept, fs::Permissions::from_mode(0o700)).unwrap();
+        super::save_system_allowed(&kept.join("allowed.json"), &own).unwrap();
+        let mode =
+            |path: &std::path::Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode(&kept), 0o755);
+        assert_eq!(mode(&kept.join("sweep")), 0o750);
+        assert_eq!(mode(&kept.join("permits")), 0o700);
+
+        // Root's list is one every user can reach: beside the results it
+        // sat in a directory only one group may enter. The old one is read
+        // until root moves it, then the new one alone counts.
+        let keeper = super::Keeper {
+            owner: std::os::unix::fs::MetadataExt::uid(&fs::metadata(dir.path()).unwrap()),
+            anchor: dir.path(),
+        };
+        let state = dir.path().join("guardian");
+        let (list, legacy) = (state.join("allowed.json"), state.join("sweep/allowed.json"));
+        fs::create_dir_all(state.join("sweep")).unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(state.join("sweep"), fs::Permissions::from_mode(0o750)).unwrap();
+        super::save_system_allowed(&legacy, &own).unwrap();
+        assert_eq!(keeper.current(&list, &legacy), own);
+        keeper.move_legacy(&list, &legacy).unwrap();
+        assert!(!legacy.exists());
+        assert_eq!(keeper.list(&list), own);
+        assert_eq!(keeper.current(&list, &legacy), own);
+        let mode =
+            |path: &std::path::Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode(&state), mode(&list)), (0o755, 0o644));
+        // A list written again where the new one stands does not take its
+        // place.
+        let mut other = own.clone();
+        other.insert("/etc/stale".into(), "c".into());
+        super::save_system_allowed(&legacy, &other).unwrap();
+        assert_eq!(keeper.current(&list, &legacy), own);
+        keeper.move_legacy(&list, &legacy).unwrap();
+        assert!(!legacy.exists());
+        assert_eq!(keeper.list(&list), own);
+
+        // In root's list a home's label is bound to a user id.
+        assert_eq!(super::system_key("~/.bashrc", 1000), "1000:~/.bashrc");
+        assert_eq!(super::system_key("/etc/x", 1000), "/etc/x");
+        let list: Remembered = [
+            ("/etc/x", "s"),
+            ("1000:~/.bashrc", "mine"),
+            ("1001:~/.bashrc", "theirs"),
+            // Written by hand, or by an older version: bound to nobody.
+            ("~/.profile", "nobody's"),
+            ("x:~/.profile", "nobody's"),
+            ("1000:/etc/y", "not a home label"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        let mine = super::allowed_for(&list, 1000);
+        assert_eq!(
+            mine.iter().collect::<Vec<_>>(),
+            [
+                (&"/etc/x".to_string(), &"s".to_string()),
+                (&"~/.bashrc".to_string(), &"mine".to_string())
+            ]
+        );
+        assert_eq!(super::allowed_for(&list, 1001)["~/.bashrc"], "theirs");
+        assert_eq!(super::allowed_for(&list, 0).len(), 1);
+        // An emptied old list is removed.
+        super::save_old_allowed(dir.path(), &Remembered::new()).unwrap();
+        assert!(!dir.path().join("allowed.json").exists());
+    }
+
+    #[test]
+    fn an_override_of_guardians_sweep_or_a_half_followed_item_is_never_allowed() {
+        let mut items = vec![item("a", "one"), item("b", "two"), item("c", "three")];
+        items[0].alerts.push((
+            crate::rules::RuleId::GuardianOverride,
+            "changes the sweep".into(),
+        ));
+        items[1].notes.push(format!(
+            "{}only the first 1024 commands of a line",
+            crate::sweep::collect::NOT_ALL_FOLLOWED
+        ));
+        let list: Remembered = items
+            .iter()
+            .map(|item| (item.path.clone(), super::fingerprint(item)))
+            .collect();
+        apply_allowed(&mut items, &list, |item| item.path.clone());
+        let tiers: Vec<Tier> = items.iter().map(|item| item.tier).collect();
+        assert_eq!(tiers, [Tier::Unknown, Tier::Unknown, Tier::Allowed]);
+        assert!(super::not_allowable(&items[0]).is_some());
+        assert!(super::not_allowable(&items[2]).is_none());
+        // What the sweep notes for itself is no change to tell.
+        let before = Remembered::new();
+        let after: Remembered = [(super::TRUST_SEEN.to_string(), "1".to_string())]
+            .into_iter()
+            .collect();
+        assert!(diff(&before, &after).is_empty() && diff(&after, &before).is_empty());
+        assert_eq!(super::content_of("abc+path-hijack+finding"), "abc");
     }
     #[test]
     fn changes_are_new_changed_or_removed() {
@@ -541,17 +845,14 @@ mod tests {
         let mut list = Remembered::new();
         list.insert("/x".into(), super::fingerprint(&items[0]));
         list.insert("/y".into(), "an older hash".into());
-        save_allowed(dir.path(), &list).unwrap();
-        apply_allowed(&mut items, &allowed(dir.path()), |item| {
-            format!("/{}", item.path)
-        });
+        apply_allowed(&mut items, &list, |item| format!("/{}", item.path));
         assert_eq!(items[0].tier, Tier::Allowed);
         assert_eq!(items[1].tier, Tier::Unknown);
 
         save_baseline(dir.path(), &list).unwrap();
         assert_eq!(baseline(dir.path()), list);
         assert!(
-            fs::read_dir(dir.path()).unwrap().count() == 2,
+            fs::read_dir(dir.path()).unwrap().count() == 1,
             "no temporary files left"
         );
     }

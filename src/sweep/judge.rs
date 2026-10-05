@@ -40,8 +40,15 @@ pub fn label(item: &Item, home: Option<&str>) -> String {
     }
 }
 
-/// Runs the review of `collection`.
-pub fn judge(collection: &Collection, home: Option<&str>, context: &ReviewContext<'_>) -> Report {
+/// Runs the review of `collection`. `news` holds the labels of the
+/// accounts, keys and trust anchors that were not there at the sweep
+/// before: each is a finding.
+pub fn judge(
+    collection: &Collection,
+    home: Option<&str>,
+    context: &ReviewContext<'_>,
+    news: &std::collections::HashSet<String>,
+) -> Report {
     let mut report = review::collected_report("system sweep", context);
     let mut facts = Vec::new();
     for item in collection.items.iter().filter(|item| !item.is_trusted()) {
@@ -52,7 +59,27 @@ pub fn judge(collection: &Collection, home: Option<&str>, context: &ReviewContex
                 .push(finding(&label, 1, RuleId::ModifiedPackageFile, ""));
         }
         for (rule, seen) in &item.alerts {
-            report.findings.push(finding(&label, 1, *rule, seen));
+            let (line, seen) = located(seen);
+            report.findings.push(finding(&label, line, *rule, seen));
+        }
+        if news.contains(&label) {
+            report.findings.push(finding(
+                &label,
+                1,
+                RuleId::NewTrust,
+                item.notes.first().map_or("", String::as_str),
+            ));
+        }
+        // Where a limit cut short what an item runs, the review of its
+        // text is all that is left; without one, something went unchecked.
+        let reviewed_as_text = matches!(item.body, Body::Text(_)) && !is_local_only(item, home);
+        if !reviewed_as_text {
+            report.gaps.extend(
+                item.notes
+                    .iter()
+                    .filter_map(|note| note.strip_prefix(super::collect::NOT_ALL_FOLLOWED))
+                    .map(|limit| Gap::Sweep(format!("{label}: not followed past {limit}"))),
+            );
         }
         match &item.body {
             Body::Text(text) if is_local_only(item, home) => {
@@ -107,15 +134,45 @@ pub fn judge(collection: &Collection, home: Option<&str>, context: &ReviewContex
     review::review_collected(report, &context, &units)
 }
 
+/// Developer tool configuration that holds no tokens as a rule, and whose
+/// hooks and commands are worth a review: the rest of that category is
+/// where registry tokens live.
+const REVIEWED_TOOL_FILES: &[&str] = &[
+    "/mise/config.toml",
+    "/.mise.toml",
+    "/.cargo/config.toml",
+    "/.cargo/config",
+];
+
 /// Files whose content may hold secrets (keys, tokens in URLs) are checked
 /// here and never sent to the AI: SSH files and git configuration in the
-/// home directory.
+/// home directory, package-manager configuration (`~/.npmrc`, pip, gem,
+/// yarn, bun and Go keep registry tokens there), an editor's settings and
+/// fish's saved variables. Accounts, keys, trust anchors and `/etc/hosts`
+/// are facts the local checks cover; there is nothing in them to review.
+/// A program one of these files runs is no such file: it is reviewed like
+/// any other.
 fn is_local_only(item: &Item, home: Option<&str>) -> bool {
     let in_home = home
         .into_iter()
         .chain([ROOT_HOME])
         .any(|home| item.path.starts_with(&format!("{home}/")));
-    in_home && matches!(item.category, Category::Ssh | Category::Git)
+    let name = item.path.rsplit('/').next().unwrap_or_default();
+    let named = item.run_by.is_none();
+    match item.category {
+        Category::Ssh | Category::Git => in_home,
+        Category::Account => true,
+        Category::Trust => named,
+        Category::Toolchain => {
+            named
+                && !REVIEWED_TOOL_FILES
+                    .iter()
+                    .any(|reviewed| item.path.ends_with(reviewed))
+        }
+        Category::Editor => named && name == "settings.json",
+        Category::Shell => named && name == "fish_variables",
+        _ => false,
+    }
 }
 
 fn drop_rule(report: &mut Report, from: usize, rule: RuleId) {
@@ -327,6 +384,11 @@ fn local_checks(report: &mut Report, item: &Item, label: &str, text: &str) {
         }
         return;
     }
+    // The other files kept here are covered by the alerts raised when
+    // they were collected (`config::alerts`).
+    if item.category != Category::Ssh {
+        return;
+    }
     let name = item.path.rsplit('/').next().unwrap_or_default();
     if name == "rc" {
         report
@@ -340,7 +402,7 @@ fn local_checks(report: &mut Report, item: &Item, label: &str, text: &str) {
             continue;
         }
         // Key material is never shown: only the keyword.
-        let excerpt = if name == "authorized_keys" {
+        let excerpt = if name.starts_with("authorized_keys") {
             key_options(line)
                 .filter(|options| {
                     let options = options.to_ascii_lowercase();
@@ -389,6 +451,16 @@ fn is_key_type(word: &str) -> bool {
     word.starts_with("ssh-") || word.starts_with("ecdsa-") || word.starts_with("sk-")
 }
 
+/// The line an alert names (`line 4: …`, as `config::alerts` writes it)
+/// and what was seen there, so the finding points at the line and not at
+/// the top of the file; line 1 for an alert about the file as a whole.
+fn located(seen: &str) -> (usize, &str) {
+    seen.strip_prefix("line ")
+        .and_then(|rest| rest.split_once(": "))
+        .and_then(|(line, seen)| Some((line.parse().ok()?, seen)))
+        .unwrap_or((1, seen))
+}
+
 fn finding(path: &str, line: usize, rule: RuleId, excerpt: &str) -> LocalFinding {
     LocalFinding {
         path: path.to_string(),
@@ -405,8 +477,16 @@ fn fact(item: &Item, label: &str) -> String {
         Tier::Edited => {
             "a package's configuration file, edited after install (normal for configuration)"
         }
+        Tier::UserBuilt
+            if item
+                .notes
+                .iter()
+                .any(|note| note.contains("version manager")) =>
+        {
+            "installed by a version manager in the home directory, not by a package"
+        }
         Tier::UserBuilt => {
-            "installed by a package from no configured repository (AUR or a local package)"
+            "installed by a package from no configured repository (AUR or a local package), or from a package file nothing checked"
         }
         Tier::Modified => {
             "installed by a package but changed since (it is not what the package shipped)"
@@ -451,7 +531,7 @@ fn fact(item: &Item, label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{fact, is_local_only, label, local_checks};
+    use super::{fact, is_local_only, label, local_checks, located};
     use crate::autorun::Category;
     use crate::report::Report;
     use crate::rules::RuleId;
@@ -471,6 +551,72 @@ mod tests {
             notes: Vec::new(),
             alerts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn files_that_hold_tokens_and_plain_facts_stay_here() {
+        let home = Some("home/u");
+        for (path, category, local) in [
+            ("home/u/.npmrc", Category::Toolchain, true),
+            ("etc/npmrc", Category::Toolchain, true),
+            ("home/u/.config/pip/pip.conf", Category::Toolchain, true),
+            ("home/u/.bunfig.toml", Category::Toolchain, true),
+            ("home/u/.config/go/env", Category::Toolchain, true),
+            (
+                "home/u/.config/mise/config.toml",
+                Category::Toolchain,
+                false,
+            ),
+            ("home/u/.cargo/config.toml", Category::Toolchain, false),
+            (
+                "home/u/.config/Code/User/settings.json",
+                Category::Editor,
+                true,
+            ),
+            ("home/u/.config/nvim/init.lua", Category::Editor, false),
+            ("home/u/.config/fish/fish_variables", Category::Shell, true),
+            ("home/u/.config/fish/config.fish", Category::Shell, false),
+            ("etc/hosts", Category::Trust, true),
+            ("etc/passwd#u", Category::Account, true),
+            ("home/u/.ssh/authorized_keys2", Category::Ssh, true),
+            (
+                "home/u/.config/chromium-flags.conf",
+                Category::Browser,
+                false,
+            ),
+        ] {
+            assert_eq!(
+                is_local_only(&item(path, category, Tier::Unknown), home),
+                local,
+                "{path}"
+            );
+        }
+        // What such a file runs is a program to review, not a file of
+        // tokens.
+        let mut run = item("usr/local/bin/x", Category::Toolchain, Tier::Unknown);
+        run.run_by = Some("home/u/.npmrc".into());
+        assert!(!is_local_only(&run, home));
+        // Their local checks are the alerts they were collected with: the
+        // SSH rules do not read an npm file as an SSH one.
+        let mut report = Report::new("t");
+        local_checks(
+            &mut report,
+            &item("home/u/.npmrc", Category::Toolchain, Tier::Unknown),
+            "~/.npmrc",
+            "Include /tmp/x\nProxyCommand /tmp/y\n",
+        );
+        assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn an_alert_is_reported_at_the_line_it_names() {
+        assert_eq!(
+            located("line 14: linker: every build runs a program"),
+            (14, "linker: every build runs a program")
+        );
+        // One about the file as a whole, or one that only reads like it.
+        assert_eq!(located("a drop-in overrides"), (1, "a drop-in overrides"));
+        assert_eq!(located("line x: y"), (1, "line x: y"));
     }
 
     #[test]

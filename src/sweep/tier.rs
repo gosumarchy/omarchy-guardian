@@ -1,7 +1,7 @@
 //! How far an installed file can be trusted, from what pacman recorded.
 
 use super::index::{PackageIndex, Recorded};
-use crate::sha256::Digest;
+use crate::sha256::{Digest, Sha256};
 
 /// From most to least trusted. The sweep hides the first two.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -68,6 +68,10 @@ pub enum Observed<'a> {
         /// Permission bits including set-id bits.
         mode: u32,
         size: u64,
+        /// Every byte of it, when it is small enough to have been kept:
+        /// what a script's changed first line is told by (see
+        /// `only_interpreter_line_changed`).
+        content: Option<&'a [u8]>,
     },
     Link {
         target: &'a str,
@@ -81,9 +85,28 @@ pub enum Observed<'a> {
 }
 
 /// The mode bits a change of matters: set-id bits, and write access for
-/// group and others. Read and execute bits change harmlessly (a package's
-/// own install step may relax them).
+/// group and others. Execute bits change harmlessly, and so does a read
+/// bit that was added (a package's own install step may relax them); a
+/// read bit taken away is told by `is_closed`.
 const SECURITY_BITS: u32 = 0o6022;
+
+/// Read access for everyone.
+const WORLD_READ: u32 = 0o004;
+
+/// Whether the file at `path`, of mode `actual`, is one its package
+/// installs readable by everyone and that no longer is. Nothing a package
+/// does closes its own programs afterwards, and a closed one cannot be
+/// compared with its package by anyone but root: that is how a changed
+/// program would be kept from the comparison. A configuration file
+/// (`backup=`) is left out: closing one that holds a password is the
+/// administrator's good sense.
+pub fn is_closed(path: &str, actual: u32, index: &PackageIndex) -> bool {
+    index.owner(path).is_some_and(|owned| {
+        !owned.backup
+            && matches!(owned.recorded, Recorded::File { mode, .. }
+                if mode & WORLD_READ != 0 && actual & WORLD_READ == 0)
+    })
+}
 
 /// The tier of `path` (relative to `/`).
 pub fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex) -> Tier {
@@ -109,7 +132,11 @@ pub fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex) -> Tie
                     mode: actual,
                     ..
                 },
-            ) => recorded == sha256 && *mode & SECURITY_BITS == actual & SECURITY_BITS,
+            ) => {
+                recorded == sha256
+                    && *mode & SECURITY_BITS == actual & SECURITY_BITS
+                    && !is_closed(path, actual, index)
+            }
             (Recorded::Link(recorded), Observed::Link { target, .. }) => recorded == target,
             _ => false,
         };
@@ -121,6 +148,18 @@ pub fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex) -> Tie
                 } else {
                     Tier::Edited
                 }
+            }
+            // Omarchy rewrites the first line of the packaged
+            // `powerprofilesctl` on every install. Proven from the content,
+            // not excused by the path: shown as edited, with a note, and
+            // read no more than any other file its package installed (see
+            // `collect::item_of`).
+            Observed::File {
+                mode,
+                content: Some(content),
+                ..
+            } if only_interpreter_line_changed(&owned.recorded, mode, content, index) => {
+                Tier::Edited
             }
             Observed::File { .. } | Observed::Link { .. } => Tier::Modified,
         };
@@ -149,9 +188,150 @@ pub fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex) -> Tie
         {
             tier
         }
+        // What `protect` writes into the home, byte for byte: Guardian's
+        // own, like the files its package ships.
+        Observed::File {
+            content: Some(content),
+            mode,
+            ..
+        } if mode & 0o6000 == 0 && is_guardians_session_file(path, content) => Tier::Vendor,
         Observed::File { sha256, .. } if index.copy_of(sha256, path).is_some() => Tier::Copied,
         Observed::File { .. } | Observed::Link { .. } => Tier::Unknown,
     }
+}
+
+/// Where `protect` puts the file uwsm reads for the graphical session, in
+/// a home's configuration, and every byte of it (`SESSION_ENV` in
+/// `tui::integrations`, which a test holds this to). It puts the
+/// directory of Guardian's wrappers, root's own, first on `PATH` and does
+/// nothing else, so a file with exactly this content is no more to review
+/// than the package's files, whoever wrote it.
+const SESSION_FILE: &str = "/.config/uwsm/env.d/90-omarchy-guardian";
+const SESSION_ENV: &str = "# Omarchy Guardian: theme and plugin installs found on PATH go through Guardian.\n# Written by `omarchy-guardian protect`, removed by `omarchy-guardian protect --off`.\nexport PATH=\"/usr/lib/omarchy-guardian/bin:$PATH\"\n";
+
+/// What the note on such an item says.
+const SESSION_NOTE: &str = "Guardian's own: written by `omarchy-guardian protect`, unchanged";
+
+fn is_guardians_session_file(path: &str, content: &[u8]) -> bool {
+    path.ends_with(SESSION_FILE) && content == SESSION_ENV.as_bytes()
+}
+
+/// The note for an item of tier `tier` at `path` that is the file
+/// `protect` wrote (no package owns it, and it is trusted all the same).
+pub fn session_note(path: &str, tier: Tier, index: &PackageIndex) -> Option<&'static str> {
+    (tier == Tier::Vendor && path.ends_with(SESSION_FILE) && index.owner(path).is_none())
+        .then_some(SESSION_NOTE)
+}
+
+/// The newest `python3.N` a package's script may have named.
+const MAX_PYTHON_MINOR: u32 = 40;
+
+/// What the note on such an item says (see `interpreter_note`).
+const INTERPRETER_NOTE: &str =
+    "its package's content, with only the first line (the interpreter) changed";
+
+/// The note for an item of tier `tier` at `path` whose first line alone was
+/// changed: an edited file that is not one of its package's configuration
+/// files.
+pub fn interpreter_note(path: &str, tier: Tier, index: &PackageIndex) -> Option<&'static str> {
+    (tier == Tier::Edited && index.owner(path).is_some_and(|owned| !owned.backup))
+        .then_some(INTERPRETER_NOTE)
+}
+
+/// Whether `note` is the one `interpreter_note` gives.
+pub fn is_interpreter_note(note: &str) -> bool {
+    note == INTERPRETER_NOTE
+}
+
+/// The program a `#!` line runs when it names one in the system's program
+/// directory and nothing else: `python3` for `#!/bin/python3` and for
+/// `#!/usr/bin/python3` (`/bin` is `/usr/bin`). `None` for a line with
+/// arguments, with `env`, or with a program anywhere else.
+fn system_interpreter(line: &[u8]) -> Option<&str> {
+    let line = std::str::from_utf8(line).ok()?.strip_prefix("#!")?;
+    let name = line
+        .strip_prefix("/usr/bin/")
+        .or_else(|| line.strip_prefix("/bin/"))?;
+    let plain = !name.is_empty()
+        && name != "env"
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._+-".contains(character));
+    plain.then_some(name)
+}
+
+/// The names one interpreter goes by: Python's are `python`, `python3` and
+/// `python3.N`; any other has its own alone.
+fn interpreter_names(name: &str) -> Vec<String> {
+    let python = name == "python"
+        || name.strip_prefix("python3").is_some_and(|rest| {
+            rest.is_empty()
+                || rest.strip_prefix('.').is_some_and(|minor| {
+                    !minor.is_empty() && minor.chars().all(|digit| digit.is_ascii_digit())
+                })
+        });
+    if !python {
+        return vec![name.to_string()];
+    }
+    let mut names = vec!["python3".to_string(), "python".to_string()];
+    names.extend((0..=MAX_PYTHON_MINOR).map(|minor| format!("python3.{minor}")));
+    names
+}
+
+/// Whether `content`, which is not what `recorded` says the package
+/// installed, is that file with nothing but its interpreter line written
+/// another way. The first line must name a program in `/usr/bin` that a
+/// repository package installed, and putting one of the lines the package
+/// could have shipped for that same interpreter in its place must give
+/// exactly the content the package recorded. Everything after the first
+/// line is then the package's, byte for byte, and the first line runs the
+/// interpreter the package meant, from the system's own directory. A line
+/// that names another interpreter, passes arguments or points anywhere
+/// else is not accepted, and neither is a changed mode.
+fn only_interpreter_line_changed(
+    recorded: &Recorded,
+    mode: u32,
+    content: &[u8],
+    index: &PackageIndex,
+) -> bool {
+    let Recorded::File {
+        mode: packaged_mode,
+        sha256: Some(packaged),
+    } = recorded
+    else {
+        return false;
+    };
+    if packaged_mode & SECURITY_BITS != mode & SECURITY_BITS {
+        return false;
+    }
+    let Some(end) = content.iter().position(|byte| *byte == b'\n') else {
+        return false;
+    };
+    let (line, rest) = content.split_at(end);
+    let Some(name) = system_interpreter(line) else {
+        return false;
+    };
+    let from_a_repository = index
+        .owner(&format!("usr/bin/{name}"))
+        .is_some_and(|owned| !index.is_foreign(index.package(owned)));
+    if !from_a_repository {
+        return false;
+    }
+    interpreter_names(name).iter().any(|name| {
+        [
+            format!("#!/usr/bin/env {name}"),
+            format!("#!/usr/bin/{name}"),
+            format!("#!/bin/{name}"),
+        ]
+        .iter()
+        .filter(|shipped| shipped.as_bytes() != line)
+        .any(|shipped| {
+            let mut hasher = Sha256::new();
+            hasher.update(shipped.as_bytes());
+            hasher.update(rest);
+            hasher.finalize() == *packaged
+        })
+    })
 }
 
 const GUARDIAN: &str = "omarchy-guardian";
@@ -160,8 +340,11 @@ const GUARDIAN: &str = "omarchy-guardian";
 const GUARDIANS_OWN: &[&str] = &[
     "usr/bin/omarchy-guardian",
     "usr/lib/omarchy-guardian/",
+    // The hook pacman always loads; it reviews only once root turned it on.
+    "usr/share/libalpm/hooks/omarchy-guardian.hook",
     "usr/share/omarchy-guardian/",
     "usr/share/doc/omarchy-guardian/",
+    "usr/share/licenses/omarchy-guardian/",
     "usr/lib/systemd/user/omarchy-guardian-sweep.service",
     "usr/lib/systemd/user/omarchy-guardian-sweep.timer",
     "usr/lib/systemd/system/omarchy-guardian-sweep-collect.service",
@@ -190,17 +373,34 @@ fn is_guardians_own(path: &str, observed: Observed<'_>) -> bool {
 /// Packaged units that give a root shell without a password when enabled.
 const ROOT_SHELL_UNITS: &[&str] = &["debug-shell.service", "emergency.service", "rescue.service"];
 
-/// Units whose mask turns off a defence.
+/// Units whose mask turns off a defence: firewalls, access control and
+/// auditing, malware and intrusion scanners, what blocks repeated logins,
+/// the journal, the snapshots a rollback needs, and Guardian's own. A name
+/// stands for itself and for the units that start with it and a dash
+/// (`clamav-daemon`, `snapper-timeline.timer`). `systemd-resolved` and
+/// `systemd-coredump` are left out: masking them is common and harmless.
 const DEFENCES: &[&str] = &[
     "ufw",
     "firewalld",
     "nftables",
     "iptables",
     "ip6tables",
+    "opensnitchd",
     "apparmor",
     "auditd",
+    "audit-rules",
     "usbguard",
     "fail2ban",
+    "sshguard",
+    "crowdsec",
+    "clamav",
+    "aide",
+    "aidecheck",
+    "rkhunter",
+    "snapper",
+    "grub-btrfsd",
+    "limine-snapper-sync",
+    "btrfs-scrub",
     "systemd-journald",
     "omarchy-guardian",
 ];
@@ -324,6 +524,40 @@ mod tests {
     }
 
     #[test]
+    fn the_session_file_protect_writes_is_guardians_own_while_it_is_exactly_that() {
+        let index = index();
+        let path = "home/u/.config/uwsm/env.d/90-omarchy-guardian";
+        let tier = |path: &str, text: &str, mode| {
+            classify(
+                path,
+                Observed::File {
+                    sha256: &Sha256::digest(text.as_bytes()),
+                    mode,
+                    size: text.len() as u64,
+                    content: Some(text.as_bytes()),
+                },
+                &index,
+            )
+        };
+        assert_eq!(tier(path, super::SESSION_ENV, 0o644), Tier::Vendor);
+        assert!(super::session_note(path, Tier::Vendor, &index).is_some());
+        // One more line, another name, or set-id: a file like any other.
+        let more = format!("{}export PATH=/tmp:$PATH\n", super::SESSION_ENV);
+        assert_eq!(tier(path, &more, 0o644), Tier::Unknown);
+        assert_eq!(tier(path, super::SESSION_ENV, 0o4755), Tier::Unknown);
+        let other = "home/u/.config/uwsm/env.d/91-other";
+        assert_eq!(tier(other, super::SESSION_ENV, 0o644), Tier::Unknown);
+        assert!(super::session_note(other, Tier::Vendor, &index).is_none());
+        // The bytes are the ones the integration writes: its constant is
+        // not reachable from here, so its source is held to this one.
+        let written = format!("const SESSION_ENV: &str = {:?};", super::SESSION_ENV);
+        assert!(
+            include_str!("../tui/integrations.rs").contains(&written),
+            "tui::integrations::SESSION_ENV is no longer what the sweep recognises"
+        );
+    }
+
+    #[test]
     fn package_files_are_trusted_only_while_unchanged() {
         let index = index();
         let abc = Sha256::digest(b"abc");
@@ -332,6 +566,7 @@ mod tests {
             sha256,
             mode,
             size: 3,
+            content: None,
         };
         assert_eq!(
             classify("usr/bin/demo", file(&abc, 0o100_755), &index),
@@ -341,11 +576,19 @@ mod tests {
             classify("usr/bin/demo", file(&other, 0o755), &index),
             Tier::Modified
         );
-        // Read and execute bits may differ; set-id and write bits may not.
+        // Execute bits may differ, and a read bit may be added; set-id
+        // and write bits may not, and nobody's read access is taken away.
         assert_eq!(
-            classify("usr/bin/demo", file(&abc, 0o711), &index),
+            classify("usr/bin/demo", file(&abc, 0o744), &index),
             Tier::Vendor
         );
+        assert_eq!(
+            classify("usr/bin/demo", file(&abc, 0o711), &index),
+            Tier::Modified
+        );
+        assert!(super::is_closed("usr/bin/demo", 0o750, &index));
+        assert!(!super::is_closed("usr/bin/demo", 0o705, &index));
+        assert!(!super::is_closed("usr/bin/nobody-owns", 0o700, &index));
         assert_eq!(
             classify("usr/bin/demo", file(&abc, 0o775), &index),
             Tier::Modified
@@ -395,6 +638,7 @@ mod tests {
             sha256,
             mode: 0o644,
             size: 8,
+            content: None,
         };
         let edited = Sha256::digest(b"edited");
         let copy = Sha256::digest(b"override");
@@ -420,7 +664,8 @@ mod tests {
                 Observed::File {
                     sha256: &edited,
                     mode: 0o755,
-                    size: 6
+                    size: 6,
+                    content: None,
                 },
                 &index
             ),
@@ -582,6 +827,23 @@ mod tests {
         };
         let path = "etc/systemd/system/multi-user.target.wants/demo.service";
         assert_eq!(classify(path, link("/dev/null", None), &index), Tier::Inert);
+        // Masking the resolver or the core dumps is common and no defence
+        // lost; a unit that only starts like a defence is not one.
+        for unit in [
+            "systemd-resolved.service",
+            "systemd-coredump.socket",
+            "snapperd-x.service",
+        ] {
+            assert_eq!(
+                classify(
+                    &format!("etc/systemd/system/{unit}"),
+                    link("/dev/null", None),
+                    &index
+                ),
+                Tier::Inert,
+                "{unit}"
+            );
+        }
         assert_eq!(
             classify(
                 path,
@@ -606,7 +868,8 @@ mod tests {
                 Observed::File {
                     sha256: &empty,
                     mode: 0o644,
-                    size: 0
+                    size: 0,
+                    content: None,
                 },
                 &index
             ),
@@ -618,11 +881,24 @@ mod tests {
             "home/u/.config/systemd/user/omarchy-guardian-sweep.timer",
             "etc/systemd/system/ufw.service",
             "etc/systemd/system/omarchy-guardian-sweep-collect.timer",
+            "etc/systemd/system/clamav-daemon.service",
+            "etc/systemd/system/clamav-clamonacc.service",
+            "etc/systemd/system/clamav-freshclam.service",
+            "etc/systemd/system/opensnitchd.service",
+            "etc/systemd/system/sshguard.service",
+            "etc/systemd/system/crowdsec.service",
+            "etc/systemd/system/audit-rules.service",
+            "etc/systemd/system/aidecheck.timer",
+            "etc/systemd/system/rkhunter.timer",
+            "etc/systemd/system/snapper-timeline.timer",
+            "etc/systemd/system/snapper-cleanup.timer",
+            "etc/systemd/system/systemd-journald.service",
         ] {
             let observed = Observed::File {
                 sha256: &empty,
                 mode: 0o644,
                 size: 0,
+                content: None,
             };
             assert_eq!(classify(path, observed, &index), Tier::Unknown, "{path}");
             assert_eq!(
@@ -630,6 +906,36 @@ mod tests {
                 Tier::Unknown,
                 "{path}"
             );
+        }
+    }
+
+    #[test]
+    fn everything_the_package_installs_is_known_as_guardians_own() {
+        use super::GUARDIANS_OWN;
+
+        // Every destination the PKGBUILD's package() writes, up to the
+        // first variable in it (`$unit`, `$wrapper`).
+        let pkgbuild = include_str!("../../packaging/arch/PKGBUILD");
+        let mut installed: Vec<String> = Vec::new();
+        for line in pkgbuild.lines() {
+            for (marker, prefix) in [("\"$pkgdir/", ""), ("\"$lib/", "usr/lib/omarchy-guardian/")] {
+                if let Some((_, rest)) = line.split_once(marker) {
+                    let path = rest.split(['"', '$']).next().unwrap_or_default();
+                    installed.push(format!("{prefix}{path}"));
+                }
+            }
+        }
+        assert!(installed.len() > 15, "{installed:?}");
+        assert!(installed.contains(&"usr/share/libalpm/hooks/omarchy-guardian.hook".to_string()));
+        for path in &installed {
+            // A destination cut at a variable is a prefix of what is known.
+            let known = GUARDIANS_OWN.iter().any(|own| {
+                path == own
+                    || own.strip_suffix('/') == Some(path.as_str())
+                    || (own.ends_with('/') && path.starts_with(own))
+                    || (path.ends_with(['/', '-']) && own.starts_with(path.as_str()))
+            });
+            assert!(known, "{path} is installed by the package and not listed");
         }
     }
 
@@ -646,6 +952,7 @@ mod tests {
             sha256: &abc,
             mode: 0o644,
             size: 3,
+            content: None,
         };
         assert_eq!(
             classify(
@@ -668,10 +975,162 @@ mod tests {
             sha256: &abc,
             mode: 0o4755,
             size: 3,
+            content: None,
         };
         assert_eq!(
             classify("usr/lib/omarchy-guardian/helper", setuid, &index),
             Tier::UserBuilt
+        );
+    }
+
+    /// What follows the interpreter line of the script the package `tool`
+    /// ships as `#!/usr/bin/env python3`.
+    const SCRIPT_BODY: &str = "\nimport sys\nprint(sys.argv)\n";
+
+    /// The packages `tool` (the script, and a configuration file), `python`
+    /// from a repository and a `python` from none.
+    fn script_index() -> PackageIndex {
+        let packaged = Sha256::digest(format!("#!/usr/bin/env python3{SCRIPT_BODY}").as_bytes());
+        let other = Sha256::digest(b"python");
+        let mut index = PackageIndex::with_foreign(HashSet::from(["aur-thing".to_string()]));
+        index.add_for_test(
+            "tool",
+            &format!(
+                "#mtree\n./usr/bin/tool type=file mode=755 sha256digest={packaged}\n./etc/tool.conf type=file mode=644 sha256digest={packaged}\n"
+            ),
+            &["etc/tool.conf"],
+        );
+        index.add_for_test(
+            "python",
+            &format!(
+                "#mtree\n./usr/bin/python3 type=link link=python3.13\n./usr/bin/python3.13 type=file mode=755 sha256digest={other}\n./usr/bin/bash type=file mode=755 sha256digest={other}\n"
+            ),
+            &[],
+        );
+        index.add_for_test(
+            "aur-thing",
+            &format!("#mtree\n./usr/bin/python type=file mode=755 sha256digest={other}\n"),
+            &[],
+        );
+        index
+    }
+
+    /// The tier of `text` at `path`, with its content kept or not.
+    fn script_tier(index: &PackageIndex, path: &str, text: &str, mode: u32, kept: bool) -> Tier {
+        let digest = Sha256::digest(text.as_bytes());
+        classify(
+            path,
+            Observed::File {
+                sha256: &digest,
+                mode,
+                size: text.len() as u64,
+                content: kept.then_some(text.as_bytes()),
+            },
+            index,
+        )
+    }
+
+    #[test]
+    fn a_packaged_script_with_only_its_interpreter_line_rewritten_is_edited() {
+        use super::{interpreter_note, is_interpreter_note};
+
+        let index = script_index();
+        let body = SCRIPT_BODY;
+        let tier = |path: &str, text: &str| script_tier(&index, path, text, 0o755, true);
+        let shipped = format!("#!/usr/bin/env python3{body}");
+        assert_eq!(tier("usr/bin/tool", &shipped), Tier::Vendor);
+
+        // What Omarchy makes of it, and the other ways to name the same
+        // interpreter in the system's own directory.
+        for line in [
+            "#!/bin/python3",
+            "#!/usr/bin/python3",
+            "#!/usr/bin/python3.13",
+        ] {
+            let rewritten = format!("{line}{body}");
+            let found = tier("usr/bin/tool", &rewritten);
+            assert_eq!(found, Tier::Edited, "{line}");
+            let note = interpreter_note("usr/bin/tool", found, &index).unwrap();
+            assert!(is_interpreter_note(note));
+        }
+        // A configuration file that was edited gets no such note.
+        assert_eq!(tier("etc/tool.conf", "changed"), Tier::Edited);
+        assert_eq!(
+            interpreter_note("etc/tool.conf", Tier::Edited, &index),
+            None
+        );
+        assert_eq!(
+            interpreter_note("usr/bin/tool", Tier::Modified, &index),
+            None
+        );
+    }
+
+    #[test]
+    fn a_packaged_script_changed_in_any_other_way_is_modified() {
+        let index = script_index();
+        let body = SCRIPT_BODY;
+        let tier = |path: &str, text: &str, mode: u32, kept: bool| {
+            script_tier(&index, path, text, mode, kept)
+        };
+        for (line, rest, why) in [
+            (
+                "#!/bin/python3",
+                "\nimport os\n",
+                "the rest is not the package's",
+            ),
+            ("#!/bin/python3 -I", body, "an argument"),
+            ("#!/usr/bin/env python3 ", body, "not the line, to the byte"),
+            ("#!/bin/bash", body, "another interpreter"),
+            (
+                "#!/usr/local/bin/python3",
+                body,
+                "not the system's directory",
+            ),
+            ("#!/tmp/python3", body, "a temporary directory"),
+            (
+                "#!/bin/python",
+                body,
+                "an interpreter no repository package installed",
+            ),
+            (
+                "#!/bin/python3.9",
+                body,
+                "an interpreter no package installed",
+            ),
+            (
+                "#!/bin/../tmp/python3",
+                body,
+                "a path that leaves the directory",
+            ),
+            ("#!/usr/bin/env", body, "env alone"),
+            ("", body, "no interpreter line"),
+        ] {
+            let changed = format!("{line}{rest}");
+            assert_eq!(
+                tier("usr/bin/tool", &changed, 0o755, true),
+                Tier::Modified,
+                "{why}"
+            );
+        }
+        let rewritten = format!("#!/bin/python3{body}");
+        // Set-id, or writable by others, on top of it; or too large for
+        // the content to have been kept.
+        assert_eq!(
+            tier("usr/bin/tool", &rewritten, 0o4755, true),
+            Tier::Modified
+        );
+        assert_eq!(
+            tier("usr/bin/tool", &rewritten, 0o757, true),
+            Tier::Modified
+        );
+        assert_eq!(
+            tier("usr/bin/tool", &rewritten, 0o755, false),
+            Tier::Modified
+        );
+        // One line and nothing after it.
+        assert_eq!(
+            tier("usr/bin/tool", "#!/bin/python3", 0o755, true),
+            Tier::Modified
         );
     }
 }

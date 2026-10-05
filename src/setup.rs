@@ -654,6 +654,7 @@ impl Environment for RealEnvironment {
             drop(fs::remove_file(&temporary));
             return Err(error.to_string());
         }
+        crate::audit::settings_changed("the user settings file was saved");
         Ok(path)
     }
 
@@ -668,7 +669,8 @@ impl Environment for RealEnvironment {
 }
 
 /// `text` with the system-only settings no setup screen edits (the trusted
-/// reviewer packages and the sweep's root consent) carried over from
+/// reviewer packages, the sweep's root consent and the accepted weaker
+/// settings) carried over from
 /// `existing` when `text` does not set them, so saving the profile does not
 /// silently undo them.
 pub fn keep_system_only(text: &str, existing: &str) -> String {
@@ -682,11 +684,19 @@ pub fn keep_system_only(text: &str, existing: &str) -> String {
         new.trusted_reviewer_packages.is_none() && old.trusted_reviewer_packages.is_some();
     let missing_sweep =
         new.sweep == SweepSettings::default() && old.sweep != SweepSettings::default();
-    if !missing_trust && !missing_sweep {
+    let missing_accepted = new.acknowledged_weaker.is_none() && old.acknowledged_weaker.is_some();
+    let missing_permit = new.permit_strict.is_none() && old.permit_strict.is_some();
+    if !missing_trust && !missing_sweep && !missing_accepted && !missing_permit {
         return text.to_string();
+    }
+    if missing_permit {
+        new.permit_strict = old.permit_strict;
     }
     if missing_trust {
         new.trusted_reviewer_packages = old.trusted_reviewer_packages;
+    }
+    if missing_accepted {
+        new.acknowledged_weaker = old.acknowledged_weaker;
     }
     if missing_sweep {
         new.sweep = old.sweep;
@@ -728,6 +738,31 @@ pub fn set_sweep_root(consent: RootConsent, group: Option<String>) -> Result<(),
     install_system_file(&write::render(&config, &header))
 }
 
+/// The system config with `keys` as its accepted weaker settings (none
+/// removes the list), and the file as it is now: for the diff the user
+/// approves before `install_accepted` installs it.
+pub fn with_accepted(keys: Vec<String>) -> Result<(String, String), String> {
+    let existing = fs::read_to_string(SYSTEM_PATH).unwrap_or_default();
+    let mut config = if existing.trim().is_empty() {
+        crate::config::file::PartialConfig::default()
+    } else {
+        parse(Path::new(SYSTEM_PATH), &existing).map_err(|error| error.to_string())?
+    };
+    config.acknowledged_weaker = (!keys.is_empty()).then_some(keys);
+    let header = comment_header(&existing);
+    let header = if header.is_empty() {
+        HEADER.to_string()
+    } else {
+        header
+    };
+    Ok((write::render(&config, &header), existing))
+}
+
+/// Installs the text `with_accepted` rendered, with sudo.
+pub fn install_accepted(text: &str) -> Result<(), String> {
+    install_system_file(text)
+}
+
 /// Installs `text` as the system config, the pacman gate's trust root.
 /// The text goes to `install` on its standard input, so no file another
 /// process could rewrite during the password prompt stands between the
@@ -752,7 +787,10 @@ fn install_system_file(text: &str) -> Result<(), String> {
         Some(text),
     )?;
     match fs::read_to_string(SYSTEM_PATH) {
-        Ok(installed) if installed == text => Ok(()),
+        Ok(installed) if installed == text => {
+            crate::audit::settings_changed("the system settings file was saved");
+            Ok(())
+        }
         Ok(_) => Err(format!(
             "{SYSTEM_PATH} does not hold the config you approved; check it before relying on the gates"
         )),

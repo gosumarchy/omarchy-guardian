@@ -8,13 +8,15 @@
 //! exact argv from `/proc/<pid>/cmdline` instead of re-parsing a shell string.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufRead, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use crate::audit::Gate;
+use crate::autorun::{self, Kind};
 use crate::classify;
 use crate::config::Settings;
 use crate::config::model::{AiRequirement, Named, SourceClass};
@@ -23,14 +25,19 @@ use crate::engine::plan::HashOnly;
 use crate::error::{Error, IoContext};
 use crate::notify;
 use crate::payload;
-use crate::report::{Gap, LocalFinding, Report};
+use crate::permit;
+use crate::report::{Gap, LocalFinding, Report, ReviewedArchive};
 use crate::review;
-use crate::rules::RuleId;
+use crate::rules::{self, RuleId};
 use crate::scan::MAX_TEXT_FILE_SIZE;
 use crate::sweep::read::{self, Public, View};
 use crate::tools::{self, Limits, OpenCode, Reviewer};
 
 const DEFAULT_CACHE_DIR: &str = "/var/cache/pacman/pkg/";
+/// Where pacman keeps what it installed, when its configuration names no
+/// other place.
+const DEFAULT_DB_PATH: &str = "/var/lib/pacman/";
+const GZIP: &str = "/usr/bin/gzip";
 /// The configuration pacman and `pacman-conf` read when none is named.
 const DEFAULT_CONFIG: &str = "/etc/pacman.conf";
 const TOOL_LIMITS: Limits = Limits {
@@ -159,6 +166,8 @@ pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report
         archives: &everything,
         index: RefCell::new(None),
     };
+    let links = system_links(&shipped, &mut report);
+    let mut fingerprints = Vec::new();
     for target in &targets {
         let class = classes.get(target).copied().unwrap_or(match operation {
             Operation::Sync => SourceClass::ThirdPartyRepo,
@@ -171,8 +180,31 @@ pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report
                     // link in this one that leads there: each archive is
                     // opened once, and only when such a link is met.
                     let others = |path: &str| shipped.lookup(archive, path);
-                    match scan_package(archive, target, class, &trusted, &others, &mut report) {
-                        Ok((scriptlet, summary)) => summary.announce(target, scriptlet),
+                    match scan_package(
+                        archive,
+                        target,
+                        class,
+                        &trusted,
+                        &others,
+                        &links,
+                        &mut report,
+                    ) {
+                        Ok((scriptlet, summary, fingerprint)) => {
+                            summary.announce(target, scriptlet);
+                            // In pacman's output, and so in its log: the
+                            // exact bytes this review is of.
+                            outln!(
+                                "Pacman package {target}: sha256 {} {}",
+                                fingerprint.digest(),
+                                fingerprint.name()
+                            );
+                            report.archives.push(ReviewedArchive {
+                                name: fingerprint.name(),
+                                class,
+                                sha256: fingerprint.digest().to_string(),
+                            });
+                            fingerprints.push(fingerprint);
+                        }
                         Err(error) => report.gaps.push(Gap::Package(error)),
                     }
                 }
@@ -187,7 +219,434 @@ pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report
     }
 
     review::run_agents(&mut report, settings, &args.opencode, &[], None);
+    // The AI review took its time. Each archive must still be the file, and
+    // hold the bytes, that were reviewed: one rewritten in place meanwhile
+    // would be installed unread.
+    for fingerprint in &fingerprints {
+        if let Err(error) = fingerprint.verify() {
+            report.gaps.push(Gap::Package(error));
+        }
+    }
     Ok(report)
+}
+
+/// The links already in the system's auto-run locations: a package that
+/// replaces what one leads to changes what that link's file says. What
+/// could not be looked at is a gap: system state, which no archive's
+/// digest covers, so no permit stands for it.
+fn system_links(shipped: &Shipped<'_>, report: &mut Report) -> InstalledLinks {
+    let Installed {
+        links,
+        mut unseen,
+        unknown,
+    } = installed_links(Path::new("/"), &local_database(), read::MAX_ENTRIES);
+    // An entry pacman's record does not describe stops mattering once
+    // this transaction puts something else in its place.
+    unseen.extend(unknown_entries(&unknown, &|path| {
+        !matches!(
+            shipped.lookup(Path::new(""), path),
+            payload::InArchive::Absent
+        )
+    }));
+    for reason in unseen {
+        report.gaps.push(Gap::Package(Error::Refused(reason)));
+    }
+    links
+}
+
+/// The classes of the archives `report` reviewed, joined by `+`.
+pub fn reviewed_classes(report: &Report) -> String {
+    let mut classes: Vec<&str> = report
+        .archives
+        .iter()
+        .map(|archive| archive.class.name())
+        .collect();
+    classes.sort_unstable();
+    classes.dedup();
+    classes.join("+")
+}
+
+/// The archives `report` reviewed, by name.
+pub fn reviewed_names(report: &Report) -> String {
+    let names: Vec<&str> = report
+        .archives
+        .iter()
+        .map(|archive| archive.name.as_str())
+        .collect();
+    names.join(" ")
+}
+
+/// The archives `report` reviewed, each with its SHA-256.
+pub fn reviewed_digests(report: &Report) -> String {
+    let digests: Vec<String> = report
+        .archives
+        .iter()
+        .map(|archive| format!("{}={}", archive.name, archive.sha256))
+        .collect();
+    digests.join(" ")
+}
+
+/// The transaction `report` reviewed as a permit names it: every archive
+/// by its class and the SHA-256 of its bytes. `None` when no archive was
+/// read; a transaction with one that was refused has a gap no permit
+/// overrules (see `Gap::content_hashed`).
+pub fn reviewed_content(report: &Report) -> Option<permit::Content> {
+    permit::Content::new(
+        Gate::Pacman,
+        &reviewed_classes(report),
+        &reviewed_names(report),
+        report
+            .archives
+            .iter()
+            .map(|archive| format!("{}:{}", archive.class.name(), archive.sha256))
+            .collect(),
+    )
+}
+
+/// The local database of installed packages (`DBPath`/local).
+fn local_database() -> PathBuf {
+    let configured = tools::run(
+        Path::new(tools::PACMAN_CONF),
+        &["DBPath".into()],
+        None,
+        C_LOCALE,
+        TOOL_LIMITS,
+    )
+    .ok()
+    .and_then(|captured| captured.into_success().ok())
+    .map(|output| String::from_utf8_lossy(&output).trim().to_string())
+    .filter(|path| path.starts_with('/'));
+    PathBuf::from(configured.unwrap_or_else(|| DEFAULT_DB_PATH.to_string())).join("local")
+}
+
+/// Where the symbolic links in the system's auto-run locations lead: each
+/// file led to (relative to the root), with the links that lead there.
+type InstalledLinks = HashMap<String, Vec<String>>;
+
+/// What `installed_links` found.
+struct Installed {
+    links: InstalledLinks,
+    /// What could not be looked at, each as a sentence.
+    unseen: Vec<String>,
+    /// Entries in a directory only root lists that pacman's record does
+    /// not describe: the package's record, and the path.
+    unknown: Vec<(String, String)>,
+}
+
+/// The links in the auto-run locations under `root`, by where they lead,
+/// and what could not be looked at. A directory this user cannot list
+/// (`/etc/sudoers.d`) is read from pacman's record of the packages that
+/// ship into it (`db`); a link root made there by hand is not seen. At
+/// most `limit` entries are looked through under one location.
+fn installed_links(root: &Path, db: &Path, limit: usize) -> Installed {
+    let mut links = InstalledLinks::new();
+    let mut unseen = Vec::new();
+    let mut hidden: Vec<String> = Vec::new();
+    let mut add = |rel: &str, target: &str| {
+        if let Some(leads) = leads_to(root, rel, target) {
+            let from = links.entry(leads).or_default();
+            if !from.iter().any(|known| known == rel) {
+                from.push(rel.to_string());
+            }
+        }
+    };
+    for location in autorun::SYSTEM {
+        let candidates = match location.kind {
+            Kind::File => vec![location.path.to_string()],
+            Kind::Glob => {
+                let matches = read::matching(root, location.path);
+                hidden.extend(matches.unreadable);
+                if matches.truncated {
+                    unseen.push(format!(
+                        "more files match /{} than are looked through for links to the files this transaction replaces; remove what does not belong there",
+                        location.path
+                    ));
+                }
+                matches.files
+            }
+            Kind::Directory | Kind::Units | Kind::Manager => {
+                let walk = link_candidates(root, location.path, limit);
+                hidden.extend(walk.unreadable);
+                if let Some((directory, entries)) = walk.over {
+                    unseen.push(format!(
+                        "/{} holds more than {limit} entries (/{directory} alone has {entries}), more than are looked through for links to the files this transaction replaces; remove what does not belong there",
+                        location.path
+                    ));
+                }
+                walk.files
+            }
+        };
+        for rel in candidates {
+            if location.contains(&rel)
+                && let Ok(target) = fs::read_link(root.join(&rel))
+                && let Some(target) = target.to_str()
+            {
+                add(&rel, target);
+            }
+        }
+    }
+    hidden.sort();
+    hidden.dedup();
+    let mut unknown = Vec::new();
+    if !hidden.is_empty() {
+        match packaged_links(db, &hidden) {
+            Ok(found) => {
+                for (rel, target) in found.links {
+                    if autorun::is_auto_run(&rel) {
+                        add(&rel, &target);
+                    }
+                }
+                unknown = found.unknown;
+            }
+            Err(reason) => unseen.push(format!(
+                "the links installed packages ship into /{} could not be read from pacman's database ({reason})",
+                hidden.join(", /")
+            )),
+        }
+    }
+    Installed {
+        links,
+        unseen,
+        unknown,
+    }
+}
+
+/// What a walk for links found under one location.
+struct Walk {
+    /// Every entry that is not a directory, sorted.
+    files: Vec<String>,
+    /// Directories that exist but could not be listed (only root can).
+    unreadable: Vec<String>,
+    /// The directory at which the limit was passed, and how many entries
+    /// it holds itself.
+    over: Option<(String, usize)>,
+}
+
+/// Every non-directory entry under directory `rel` of `root`, without
+/// entering linked directories. However deep: a directory nested further
+/// than any catalogued shape is no reason to stop, only the number of
+/// entries looked at (directories included) is bounded by `limit`. The
+/// directory that passes it is counted to its end, so it can be named with
+/// what it holds.
+fn link_candidates(root: &Path, rel: &str, limit: usize) -> Walk {
+    let mut walk = Walk {
+        files: Vec::new(),
+        unreadable: Vec::new(),
+        over: None,
+    };
+    let mut seen = 0_usize;
+    let mut pending = vec![rel.trim_end_matches('/').to_string()];
+    while let Some(directory) = pending.pop() {
+        let listing = match fs::read_dir(root.join(&directory)) {
+            Ok(listing) => listing,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue;
+            }
+            Err(_) => {
+                walk.unreadable.push(directory);
+                continue;
+            }
+        };
+        let mut here = 0_usize;
+        for entry in listing.filter_map(Result::ok) {
+            here += 1;
+            if seen + here > limit {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let child = format!("{directory}/{name}");
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push(child);
+            } else {
+                walk.files.push(child);
+            }
+        }
+        seen += here;
+        if seen > limit {
+            walk.over = Some((directory, here));
+            break;
+        }
+    }
+    walk.files.sort();
+    walk.unreadable.sort();
+    walk
+}
+
+/// One sentence for each package whose record leaves out what some of its
+/// entries in a directory only root lists are (`unknown`), but for the
+/// entries this transaction puts something in the place of (`replaced`):
+/// those are read from the archive that brings them.
+fn unknown_entries(unknown: &[(String, String)], replaced: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let mut packages: Vec<&str> = unknown
+        .iter()
+        .map(|(package, _)| package.as_str())
+        .collect();
+    packages.sort_unstable();
+    packages.dedup();
+    packages
+        .into_iter()
+        .filter_map(|package| {
+            let paths: Vec<String> = unknown
+                .iter()
+                .filter(|(owner, path)| owner == package && !replaced(path))
+                .map(|(_, path)| format!("/{path}"))
+                .collect();
+            let first = paths.first()?;
+            let more = match paths.len() - 1 {
+                0 => String::new(),
+                more => format!(" and {more} more"),
+            };
+            Some(format!(
+                "pacman's record of the installed package {package} does not say whether {first}{more} is a symbolic link or where it leads, and only root can look there: whether this transaction replaces what it leads to cannot be told. Install a version of that package with a complete record, or remove it"
+            ))
+        })
+        .collect()
+}
+
+/// Where the link at `rel` with the text `target` leads under `root`,
+/// relative to it: as the system resolves it when what it leads to is
+/// there, and by its text otherwise (the file may be about to be
+/// installed).
+fn leads_to(root: &Path, rel: &str, target: &str) -> Option<String> {
+    let by_text = if target.starts_with('/') {
+        PathBuf::from(target.trim_start_matches('/'))
+    } else {
+        Path::new(rel).parent()?.join(target)
+    };
+    let by_text = read::normalize(&by_text)?;
+    match fs::canonicalize(root.join(&by_text)) {
+        Ok(real) => {
+            let real_root = fs::canonicalize(root).ok()?;
+            Some(real.strip_prefix(real_root).ok()?.to_str()?.to_string())
+        }
+        Err(_) => Some(payload::through_root_links(&by_text)),
+    }
+}
+
+/// What pacman's record says of the entries installed packages ship
+/// inside directories only root lists.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Packaged {
+    /// The symbolic links, with their text.
+    links: Vec<(String, String)>,
+    /// Entries the record does not describe: the package's record
+    /// (`name-version`), and the path.
+    unknown: Vec<(String, String)>,
+}
+
+/// The paths a package's `files` record lists: its `%FILES%` section, not
+/// the backup list after it.
+fn listed_files(files: &str) -> impl Iterator<Item = &str> {
+    files
+        .lines()
+        .skip_while(|line| *line != "%FILES%")
+        .skip(1)
+        .take_while(|line| !line.is_empty() && !line.starts_with('%'))
+}
+
+/// The symbolic links that installed packages ship inside `directories`
+/// (relative to the root), with their text, from pacman's own record of
+/// each package: its `files` list, which pacman writes from the archive,
+/// says which paths to look at, and its `mtree`, which the package brings,
+/// what each is. A listed path the `mtree` has no usable line for may be
+/// a link to anywhere, and is returned as unknown rather than passed over.
+fn packaged_links(db: &Path, directories: &[String]) -> Result<Packaged, String> {
+    let inside = |path: &str| {
+        directories.iter().any(|directory| {
+            path.strip_prefix(directory.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
+    };
+    let mut found = Packaged::default();
+    let unreadable = |error: io::Error| format!("{}: {error}", db.display());
+    for entry in fs::read_dir(db).map_err(unreadable)? {
+        let package = entry.map_err(unreadable)?.path();
+        let files = match fs::read(package.join("files")) {
+            Ok(files) => String::from_utf8_lossy(&files).into_owned(),
+            // The database's own files (`ALPM_DB_VERSION`), or a package
+            // without a file list.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(format!("{}: {error}", package.display())),
+        };
+        let shipped: Vec<&str> = listed_files(&files)
+            .filter(|line| !line.ends_with('/') && inside(line))
+            .collect();
+        if shipped.is_empty() {
+            continue;
+        }
+        let mtree = tools::run(
+            Path::new(GZIP),
+            &["-dc".into(), "--".into(), package.join("mtree").into()],
+            None,
+            C_LOCALE,
+            TOOL_LIMITS,
+        )
+        .and_then(tools::Captured::into_success)
+        .map_err(|error| format!("{}: {error}", package.display()))?;
+        let mut entries = mtree_entries(&String::from_utf8_lossy(&mtree));
+        let name = package
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for path in shipped {
+            match entries.remove(path) {
+                Some(Some(target)) => found.links.push((path.to_string(), target)),
+                Some(None) => {}
+                None => found.unknown.push((name.clone(), path.to_string())),
+            }
+        }
+        // A link the `mtree` has and the file list does not costs one
+        // more look and misses nothing.
+        let mut extra: Vec<(String, String)> = entries
+            .into_iter()
+            .filter(|(path, _)| inside(path))
+            .filter_map(|(path, target)| Some((path, target?)))
+            .collect();
+        extra.sort();
+        found.links.extend(extra);
+    }
+    found.links.sort();
+    found.unknown.sort();
+    Ok(found)
+}
+
+/// What an `mtree` says each path (relative to `/`) is: a symbolic link
+/// with its text (`./path … type=link link=target`), or something else. A
+/// line whose path or link text cannot be read is left out, so what it is
+/// about counts as not described.
+fn mtree_entries(mtree: &str) -> HashMap<String, Option<String>> {
+    mtree
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let path = payload::unescape(fields.next()?.strip_prefix("./")?)?;
+            let mut link = false;
+            let mut target = None;
+            for field in fields {
+                link = link || field == "type=link";
+                target = target.or(field.strip_prefix("link="));
+            }
+            if link {
+                Some((path, Some(payload::unescape(target?)?)))
+            } else {
+                Some((path, None))
+            }
+        })
+        .collect()
 }
 
 fn read_targets(input: impl BufRead) -> Result<Vec<String>, Error> {
@@ -883,7 +1342,7 @@ impl PayloadSummary {
                 .collect();
             let more = self.not_reviewed.len().saturating_sub(shown.len());
             outln!(
-                "Pacman package {target}: {} auto-run file(s) not reviewed: {}{}",
+                "Pacman package {target}: {} file(s) that run on their own, or that those run, not reviewed: {}{}",
                 self.not_reviewed.len(),
                 shown.join(", "),
                 if more > 0 {
@@ -898,17 +1357,23 @@ impl PayloadSummary {
 
 /// Reviews one package archive through its exact model (see `payload`):
 /// the install scriptlet with the local rules and the AI, and the payload
-/// files that run or grant privileges on their own with the AI. Returns
-/// whether it had a scriptlet and what the payload held.
+/// files that run or grant privileges on their own, with the package's
+/// files those name, with the AI. `links` are the links already on the
+/// system (see `installed_links`). Returns whether it had a scriptlet,
+/// what the payload held, and what the archive was when it was read.
 fn scan_package(
     archive_path: &Path,
     target: &str,
     class: SourceClass,
     trusted: &[String],
     others: &dyn Fn(&str) -> payload::InArchive,
+    links: &InstalledLinks,
     report: &mut Report,
-) -> Result<(bool, PayloadSummary), Error> {
+) -> Result<(bool, PayloadSummary, payload::Fingerprint), Error> {
     let archive = payload::Archive::open(archive_path)?;
+    // Taken first: everything read from here on is checked against it once
+    // the AI review is over.
+    let fingerprint = archive.fingerprint()?;
     let reviewed = payload::review(&archive, target, class, trusted)?;
     let archive_name = archive_path
         .file_name()
@@ -916,37 +1381,43 @@ fn scan_package(
         .unwrap_or("package");
 
     let scriptlet = match reviewed.install {
-        None => false,
+        // One over the size limit was not read; `unfollowed` says so.
+        None => archive.paths().any(|path| path == ".INSTALL"),
+        // Unread, and still the archive's bytes: every check that refuses
+        // a package has run by now.
         Some(Content::Undecodable | Content::Binary(_)) => {
-            return Err(Error::Refused(format!(
+            report.gaps.push(Gap::PackageUnread(format!(
                 "the install scriptlet of {} holds binary data and cannot be reviewed",
                 archive_path.display()
             )));
+            true
         }
         Some(Content::Text(text) | Content::Lossy { text, .. }) => {
             let rel = format!("{target}/{archive_name}/.INSTALL");
-            report.file_classes.insert(rel.clone(), class);
-            review::analyze_text(report, &rel, &text, false);
+            review_scriptlet(report, target, class, &rel, &text);
             true
         }
     };
+    for reason in reviewed.unfollowed {
+        report.gaps.push(Gap::PackageUnread(format!(
+            "{}: {reason}",
+            archive_path.display()
+        )));
+    }
 
     let mut summary = PayloadSummary {
         reviewed: 0,
         unchanged: 0,
         not_reviewed: Vec::new(),
     };
+    let root = Path::new("/");
+    let official = class == SourceClass::Official;
+    let settled = settled(&reviewed.files, root, others);
+    let mut as_itself: HashSet<String> = reviewed.read_as_auto_run;
     for mut file in reviewed.files {
-        // An upgrade only brings in what changed; the rest is already active.
-        // A link that did not change still leads somewhere new when this
-        // transaction replaces what it leads to.
-        if file.is_installed_unchanged(Path::new("/"))
-            && !file
-                .leads_outside
-                .as_deref()
-                .is_some_and(|leads| replaced_by_transaction(leads, others))
-        {
-            summary.unchanged += 1;
+        as_itself.insert(file.path.clone());
+        if settled.contains(&file.path) {
+            summary.unchanged += usize::from(!matches!(file.content, Content::Binary(_)));
             continue;
         }
         let rel = format!("{target}/{archive_name}/{}", file.path);
@@ -954,46 +1425,39 @@ fn scan_package(
             continue;
         }
         report.file_classes.insert(rel.clone(), class);
-        match file.content {
-            Content::Text(text) | Content::Lossy { text, .. } => {
-                if review::analyze_payload(report, &rel, &text) {
-                    summary.reviewed += 1;
-                } else {
-                    summary
-                        .not_reviewed
-                        .push(format!("/{} (AI off)", file.path));
-                }
-            }
-            // Official packages ship ELF generators, and hooks and units
-            // run compiled programs: they cannot be read, but the AI is told
-            // they are there.
-            Content::Binary(format)
-                if format.executable()
-                    && (class == SourceClass::Official || file.run_by.is_some()) =>
-            {
-                summary
-                    .not_reviewed
-                    .push(format!("/{} ({})", file.path, format.label()));
-                report.hash_only.push(HashOnly {
-                    path: rel,
-                    bytes: 0,
-                    label: format.label(),
-                    media: false,
-                    skipped_files: None,
-                });
-            }
-            Content::Binary(format) if format.executable() => {
-                report.gaps.push(Gap::Package(Error::Refused(format!(
-                    "/{}: a {} in an auto-run location cannot be reviewed; only packages from an official repository may ship one",
-                    file.path,
-                    format.label()
-                ))));
-            }
-            Content::Binary(_) | Content::Undecodable => {
-                report.gaps.push(Gap::Undecodable(rel));
-            }
-        }
+        let named = !file.run_by.is_empty();
+        queue_payload(
+            report,
+            &mut summary,
+            rel,
+            &file.path,
+            file.content,
+            (named, official),
+        );
     }
+
+    // What a link already on the system leads to is that link's file: a
+    // sudoers drop-in another package linked to this one's `rule` says
+    // what this package now puts there.
+    let mut led: Vec<(&str, &String)> = archive
+        .paths()
+        .filter(|path| !as_itself.contains(*path))
+        .filter_map(|path| {
+            let link = links
+                .get(path)?
+                .iter()
+                .find(|link| autorun::is_reviewed(link, official))?;
+            Some((path, link))
+        })
+        .collect();
+    // By path, not in the order the archive happens to list its entries.
+    led.sort();
+    for (path, link) in led {
+        let rel = format!("{target}/{archive_name}/{path}");
+        report.file_classes.insert(rel.clone(), class);
+        review_led(&archive, (path, link), rel, official, &mut summary, report);
+    }
+
     grant_findings(
         &archive,
         reviewed.root_set_id,
@@ -1002,8 +1466,269 @@ fn scan_package(
         class,
         report,
     );
+    for (path, effect) in reviewed.misplaced {
+        // Already there: the package brings nothing new into that place.
+        if fs::symlink_metadata(root.join(&path)).is_ok() {
+            continue;
+        }
+        let rel = format!("{target}/{archive_name}/{path}");
+        report.file_classes.insert(rel.clone(), class);
+        report.findings.push(LocalFinding {
+            path: rel,
+            line: 1,
+            rule: RuleId::PrivilegeEscalation,
+            excerpt: format!(
+                "/{path} {effect}, and its content is not reviewed: only a package from an official repository is expected to ship a file there"
+            ),
+        });
+    }
     archive.verify_unchanged()?;
-    Ok((scriptlet, summary))
+    Ok((scriptlet, summary, fingerprint))
+}
+
+/// The install scriptlet, named `rel` in the report, with the local rules
+/// and queued for the AI.
+fn review_scriptlet(report: &mut Report, target: &str, class: SourceClass, rel: &str, text: &str) {
+    report.file_classes.insert(rel.to_string(), class);
+    review::analyze_text(report, rel, text, false);
+    own_removal_is_no_attack(report, target, rel, text);
+}
+
+/// The payload files an upgrade does not review again: what is installed
+/// under `root` is what the package ships. A link that did not change
+/// still leads somewhere new when this transaction replaces what it leads
+/// to. A file the reviewed ones name is settled with them: when it did not
+/// change either (a compiled program is never read) and every file that
+/// names it is settled. The scriptlet never is: it runs anew.
+fn settled(
+    files: &[payload::PayloadFile],
+    root: &Path,
+    others: &dyn Fn(&str) -> payload::InArchive,
+) -> HashSet<String> {
+    let mut settled: HashSet<String> = files
+        .iter()
+        .filter(|file| {
+            file.run_by.is_empty()
+                && file.is_installed_unchanged(root)
+                && !file
+                    .leads_outside
+                    .as_deref()
+                    .is_some_and(|leads| replaced_by_transaction(leads, others))
+        })
+        .map(|file| file.path.clone())
+        .collect();
+    loop {
+        let more: Vec<String> = files
+            .iter()
+            .filter(|file| {
+                !file.run_by.is_empty()
+                    && !settled.contains(&file.path)
+                    && file.run_by.iter().all(|by| settled.contains(by))
+                    && (matches!(file.content, Content::Binary(_))
+                        || file.is_installed_unchanged(root))
+            })
+            .map(|file| file.path.clone())
+            .collect();
+        if more.is_empty() {
+            return settled;
+        }
+        settled.extend(more);
+    }
+}
+
+/// Reviews what `archive` puts at `path`, where `link` (a symbolic link in
+/// an auto-run location of this system) leads, as that link's file; `rel`
+/// names it in the report.
+fn review_led(
+    archive: &payload::Archive,
+    (path, link): (&str, &str),
+    rel: String,
+    official: bool,
+    summary: &mut PayloadSummary,
+    report: &mut Report,
+) {
+    match archive.replacement(path) {
+        None => {}
+        // The file as it is installed now adds nothing.
+        Some(payload::Replacement::File(bytes))
+            if same_as_installed(Path::new("/"), path, &bytes) =>
+        {
+            summary.unchanged += 1;
+        }
+        Some(payload::Replacement::File(bytes)) => {
+            let content = payload::annotated(
+                content::classify_payload(link, &bytes),
+                &format!(
+                    "# /{path} is what /{link}, a symbolic link on this system, leads to, so it is read as that file. This package replaces it; its new content follows.\n"
+                ),
+            );
+            queue_payload(report, summary, rel, path, content, (true, official));
+        }
+        Some(payload::Replacement::Binary(label)) => not_read(report, summary, rel, path, label),
+        Some(payload::Replacement::TooLarge) => {
+            report.gaps.push(Gap::PackageUnread(format!(
+                "/{path}, which /{link} on this system links to, is text over the 2 MiB review limit: what the link will hold cannot be reviewed"
+            )));
+        }
+        // A link out of the package, or an archive that could not be
+        // read: nothing the archive's digest stands for.
+        Some(payload::Replacement::Unreadable(reason)) => {
+            report.gaps.push(Gap::Package(Error::Refused(format!(
+                "/{path}, which /{link} on this system links to, {reason}: what the link will hold cannot be reviewed"
+            ))));
+        }
+    }
+}
+
+/// Guardian's own removal turns its own units and hook off, which the
+/// local rules read as switching a protection off. The name is Guardian's
+/// only from a local archive or an official repository (`payload::review`
+/// refused the rest), and the scriptlet (`text`) still goes to the AI
+/// review. Only a line about nothing but Guardian's own is let off.
+fn own_removal_is_no_attack(report: &mut Report, target: &str, rel: &str, text: &str) {
+    if target != payload::GUARDIAN_PACKAGE {
+        return;
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let line = |number: usize| number.checked_sub(1).and_then(|index| lines.get(index));
+    report.findings.retain(|finding| {
+        let own = finding.path == rel
+            && finding.rule == RuleId::ProtectionDisabled
+            && line(finding.line).is_some_and(|written| {
+                // A command continued over lines is not read here.
+                let continued = |part: &&str| part.trim_end().ends_with('\\');
+                !continued(written)
+                    && !line(finding.line - 1).is_some_and(continued)
+                    && only_guardians_own(written)
+            });
+        !own
+    });
+}
+
+/// Whether `line`, which the rules read as switching a protection off,
+/// is about Guardian's own units and files alone: it names Guardian, the
+/// rule no longer matches once Guardian's names are taken out (so no other
+/// service, `ufw disable`, firewall flush, `setenforce` or `ptrace_scope`
+/// rides along, in a comment either), and every unit a `systemctl` on it
+/// names is one of Guardian's.
+fn only_guardians_own(line: &str) -> bool {
+    let line = line.to_lowercase().replace('\t', " ");
+    if !line.contains(payload::GUARDIAN_PACKAGE) {
+        return false;
+    }
+    let rest: Vec<&str> = line
+        .split(' ')
+        .filter(|word| !word.contains(payload::GUARDIAN_PACKAGE))
+        .collect();
+    let rest = rest.join(" ");
+    if rules::line_rules(&rest, &rest).any(|rule| rule == RuleId::ProtectionDisabled) {
+        return false;
+    }
+    let mut words = line.split_whitespace();
+    while let Some(word) = words.next() {
+        if !word.ends_with("systemctl") {
+            continue;
+        }
+        let mut verb = false;
+        while let Some(word) = words.next() {
+            if matches!(word, ";" | "&&" | "||" | "|" | "&") || word.starts_with('#') {
+                break;
+            }
+            // A redirection, with its file when that is the next word.
+            if word.contains(['>', '<']) {
+                let file = if word.ends_with(['>', '<']) {
+                    words.next().unwrap_or_default()
+                } else {
+                    word
+                };
+                if file.ends_with(';') {
+                    break;
+                }
+                continue;
+            }
+            if word.starts_with('-') {
+                continue;
+            }
+            if !verb {
+                verb = true;
+                continue;
+            }
+            let unit = word.trim_end_matches(';').trim_matches(['"', '\'']);
+            if !unit.starts_with(payload::GUARDIAN_PACKAGE) {
+                return false;
+            }
+            if word.ends_with(';') {
+                break;
+            }
+        }
+    }
+    true
+}
+
+/// Hands one payload file to the review as what its content is. What
+/// cannot be read is named as not reviewed where it is expected: a file
+/// the reviewed ones only name (`named`: hooks and units run their
+/// package's compiled programs, scriptlets mention its data), and an ELF
+/// generator of a package from an official repository (`official`).
+/// Elsewhere it makes the review incomplete, as something the archive's
+/// digest still covers.
+fn queue_payload(
+    report: &mut Report,
+    summary: &mut PayloadSummary,
+    rel: String,
+    path: &str,
+    content: Content,
+    (named, official): (bool, bool),
+) {
+    match content {
+        Content::Text(text) | Content::Lossy { text, .. } => {
+            if review::analyze_payload(report, &rel, &text) {
+                summary.reviewed += 1;
+            } else {
+                summary.not_reviewed.push(format!("/{path} (AI off)"));
+            }
+        }
+        Content::Binary(format) if named || (official && format.executable()) => {
+            not_read(report, summary, rel, path, format.label());
+        }
+        // Unread, and the archive's own bytes: a block the user may
+        // overrule for exactly this archive.
+        Content::Binary(format) if format.executable() => {
+            report.gaps.push(Gap::PackageUnread(format!(
+                "/{path}: a compiled file ({}) in an auto-run location cannot be reviewed; only packages from an official repository are expected to ship one",
+                format.label()
+            )));
+        }
+        Content::Binary(_) | Content::Undecodable => {
+            report.gaps.push(Gap::Undecodable(rel));
+        }
+    }
+}
+
+/// Names a file that cannot be read to the user and to the AI.
+fn not_read(
+    report: &mut Report,
+    summary: &mut PayloadSummary,
+    rel: String,
+    path: &str,
+    label: &'static str,
+) {
+    summary.not_reviewed.push(format!("/{path} ({label})"));
+    report.hash_only.push(HashOnly {
+        path: rel,
+        bytes: 0,
+        label,
+        media: false,
+        skipped_files: None,
+    });
+}
+
+/// Whether the file at `path` under `root` holds exactly `bytes` now.
+fn same_as_installed(root: &Path, path: &str, bytes: &[u8]) -> bool {
+    let installed = root.join(path);
+    fs::symlink_metadata(&installed)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() == bytes.len() as u64)
+        && fs::read(&installed).is_ok_and(|now| now == bytes)
 }
 
 /// What the archives of a transaction ship, for a link in one of them that
@@ -1195,6 +1920,58 @@ fn linked_file(
         }
     }
     Err("is behind too many links".into())
+}
+
+#[cfg(test)]
+mod content_tests {
+    use super::{reviewed_classes, reviewed_content, reviewed_digests, reviewed_names};
+    use crate::config::model::SourceClass;
+    use crate::report::{Report, ReviewedArchive};
+
+    #[test]
+    fn a_transaction_is_named_by_every_archive_it_was_reviewed_from() {
+        let mut report = Report::new("pacman transaction");
+        // Nothing was read: nothing a permit could stand for.
+        assert!(reviewed_content(&report).is_none());
+        let archive = |name: &str, class, byte: &str| ReviewedArchive {
+            name: name.to_string(),
+            class,
+            sha256: byte.repeat(64),
+        };
+        report.archives = vec![
+            archive("demo-1-1-any", SourceClass::LocalPackage, "b"),
+            archive("lib-2-1-x86_64", SourceClass::Official, "a"),
+        ];
+        assert_eq!(reviewed_classes(&report), "local-package+official");
+        assert_eq!(reviewed_names(&report), "demo-1-1-any lib-2-1-x86_64");
+        assert_eq!(
+            reviewed_digests(&report),
+            format!(
+                "demo-1-1-any={} lib-2-1-x86_64={}",
+                "b".repeat(64),
+                "a".repeat(64)
+            )
+        );
+        let key = reviewed_content(&report).unwrap().key();
+
+        // The order of the targets and the archives' names say nothing.
+        report.archives.reverse();
+        report.archives[0].name = "renamed".into();
+        assert_eq!(reviewed_content(&report).unwrap().key(), key);
+        // Other bytes, or the same bytes as another kind of package, do.
+        report.archives[0].sha256 = "c".repeat(64);
+        assert_ne!(reviewed_content(&report).unwrap().key(), key);
+        report.archives[0].sha256 = "a".repeat(64);
+        assert_eq!(reviewed_content(&report).unwrap().key(), key);
+        report.archives[0].class = SourceClass::ThirdPartyRepo;
+        assert_ne!(reviewed_content(&report).unwrap().key(), key);
+        // An archive more is another transaction.
+        report.archives[0].class = SourceClass::Official;
+        report
+            .archives
+            .push(archive("extra-1-1-any", SourceClass::Official, "d"));
+        assert_ne!(reviewed_content(&report).unwrap().key(), key);
+    }
 }
 
 #[cfg(test)]
@@ -1611,6 +2388,7 @@ mod tests {
             SourceClass::LocalPackage,
             &[],
             &|_| crate::payload::InArchive::Absent,
+            &super::InstalledLinks::new(),
             &mut report,
         )
         .unwrap();
@@ -1694,6 +2472,7 @@ mod tests {
             SourceClass::LocalPackage,
             &[],
             &others,
+            &super::InstalledLinks::new(),
             &mut report,
         )
         .unwrap();
@@ -1839,12 +2618,13 @@ mod tests {
         let archive = build_package(dir.path(), Some("post_install() { rm -rf /; }\n"));
 
         let mut report = Report::new("test");
-        let (scriptlet, _) = scan_package(
+        let (scriptlet, _, _) = scan_package(
             &archive,
             "sample",
             SourceClass::LocalPackage,
             &[],
             &|_| crate::payload::InArchive::Absent,
+            &super::InstalledLinks::new(),
             &mut report,
         )
         .unwrap();
@@ -1885,6 +2665,7 @@ mod tests {
                 SourceClass::LocalPackage,
                 &[],
                 &|_| crate::payload::InArchive::Absent,
+                &super::InstalledLinks::new(),
                 &mut report
             )
             .unwrap()
@@ -1900,10 +2681,609 @@ mod tests {
                 SourceClass::LocalPackage,
                 &[],
                 &|_| crate::payload::InArchive::Absent,
+                &super::InstalledLinks::new(),
                 &mut Report::default()
             )
             .unwrap()
             .0
         );
+    }
+
+    /// A package archive `name`, owned by root, holding `files`.
+    fn pack(dir: &Path, name: &str, files: &[(&str, &[u8])]) -> std::path::PathBuf {
+        let root = dir.join(format!("{name}-root"));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".PKGINFO"), format!("pkgname = {name}\n")).unwrap();
+        let mut members = vec![".PKGINFO".to_string()];
+        for (path, bytes) in files {
+            fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            fs::write(root.join(path), bytes).unwrap();
+            let top = path.split('/').next().unwrap().to_string();
+            if !members.contains(&top) {
+                members.push(top);
+            }
+        }
+        let archive = dir.join(format!("{name}-1-1-any.pkg.tar"));
+        let status = Command::new("/usr/bin/bsdtar")
+            .args(["--uid", "0", "--gid", "0", "-cf"])
+            .arg(&archive)
+            .args(&members)
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        archive
+    }
+
+    const ELF: &[u8] = b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0\x03\0\x3e\0";
+
+    #[test]
+    fn links_in_auto_run_locations_are_found_by_where_they_lead() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new("pacman-links");
+        let root = dir.path().join("root");
+        for directory in [
+            "etc/cron.d",
+            "usr/share/b",
+            "usr/lib/systemd/system/multi-user.target.wants",
+            "etc/systemd/system",
+        ] {
+            fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        fs::write(root.join("usr/share/b/rule"), "x\n").unwrap();
+        fs::write(root.join("usr/lib/systemd/system/x.service"), "[Service]\n").unwrap();
+        fs::write(root.join("etc/cron.d/plain"), "x\n").unwrap();
+        // To a file that is there, by an absolute and a relative text; to
+        // one that is not there yet, also through `/lib`; a unit a package
+        // enables and one the administrator did.
+        symlink("/usr/share/b/rule", root.join("etc/cron.d/a")).unwrap();
+        symlink("../../usr/share/b/rule", root.join("etc/cron.d/again")).unwrap();
+        symlink("../../usr/share/b/new", root.join("etc/cron.d/new")).unwrap();
+        symlink("/lib/pkg/job", root.join("etc/cron.d/lib")).unwrap();
+        symlink(
+            "../x.service",
+            root.join("usr/lib/systemd/system/multi-user.target.wants/x.service"),
+        )
+        .unwrap();
+        symlink(
+            "/usr/lib/systemd/system/x.service",
+            root.join("etc/systemd/system/x.service"),
+        )
+        .unwrap();
+        // Outside every auto-run location: not looked at.
+        symlink("/usr/share/b/rule", root.join("usr/share/b/alias")).unwrap();
+
+        let super::Installed {
+            links,
+            unseen,
+            unknown,
+        } = super::installed_links(&root, &dir.path().join("no-database"), 20_000);
+        assert!(unseen.is_empty(), "{unseen:?}");
+        assert!(unknown.is_empty(), "{unknown:?}");
+        assert_eq!(
+            links["usr/share/b/rule"],
+            ["etc/cron.d/a", "etc/cron.d/again"]
+        );
+        assert_eq!(links["usr/share/b/new"], ["etc/cron.d/new"]);
+        assert_eq!(links["usr/lib/pkg/job"], ["etc/cron.d/lib"]);
+        let mut unit = links["usr/lib/systemd/system/x.service"].clone();
+        unit.sort();
+        assert_eq!(
+            unit,
+            [
+                "etc/systemd/system/x.service",
+                "usr/lib/systemd/system/multi-user.target.wants/x.service"
+            ]
+        );
+        assert_eq!(links.len(), 4, "{links:?}");
+    }
+
+    #[test]
+    fn links_in_a_directory_only_root_lists_come_from_pacmans_record() {
+        let entries = super::mtree_entries(
+            "#mtree\n/set type=file uid=0 gid=0 mode=644\n./.PKGINFO time=1.0 size=10\n./etc time=1.0 mode=755 type=dir\n./etc/sudoers.d/a time=1.0 mode=777 type=link link=/usr/share/b/rule\n./etc/sudoers.d/with\\040space time=1.0 type=link link=../x\\040y\n./etc/sudoers.d/plain time=1.0 size=3\n./etc/sudoers.d/bad\\x time=1.0 size=3\n./etc/sudoers.d/nowhere time=1.0 type=link\n./etc/sudoers.d/odd time=1.0 type=link link=x\\q\n",
+        );
+        let link = |path: &str| entries.get(path).cloned();
+        assert_eq!(
+            link("etc/sudoers.d/a"),
+            Some(Some("/usr/share/b/rule".to_string()))
+        );
+        assert_eq!(
+            link("etc/sudoers.d/with space"),
+            Some(Some("../x y".to_string()))
+        );
+        assert_eq!(link("etc/sudoers.d/plain"), Some(None));
+        assert_eq!(link("etc"), Some(None));
+        // A name or a link text that cannot be read describes nothing.
+        assert_eq!(entries.len(), 5, "{entries:?}");
+        assert_eq!(link("etc/sudoers.d/nowhere"), None);
+        assert_eq!(link("etc/sudoers.d/odd"), None);
+
+        if !tool_available("/usr/bin/gzip") {
+            return;
+        }
+        let dir = TempDir::new("pacman-packaged-links");
+        let db = dir.path().join("local");
+        let record = |package: &str, files: &str, mtree: &str| {
+            let directory = db.join(package);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("files"), files).unwrap();
+            fs::write(directory.join("mtree"), mtree).unwrap();
+            assert!(
+                Command::new("/usr/bin/gzip")
+                    .arg(directory.join("mtree"))
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            fs::rename(directory.join("mtree.gz"), directory.join("mtree")).unwrap();
+        };
+        record(
+            "a-1-1",
+            "%FILES%\netc/\netc/sudoers.d/\netc/sudoers.d/a\nusr/share/a/link\n",
+            "#mtree\n./etc/sudoers.d/a time=1.0 mode=777 type=link link=/usr/share/b/rule\n./usr/share/a/link time=1.0 type=link link=/etc/passwd\n",
+        );
+        // Ships nothing there: its record is not even unpacked.
+        let other = db.join("b-1-1");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(
+            other.join("files"),
+            "%FILES%\netc/\netc/sudoers.d/\nusr/share/b/rule\n",
+        )
+        .unwrap();
+        fs::write(other.join("mtree"), "not gzip").unwrap();
+        fs::write(db.join("ALPM_DB_VERSION"), "9\n").unwrap();
+
+        let hidden = ["etc/sudoers.d".to_string()];
+        let found = super::packaged_links(&db, &hidden).unwrap();
+        assert_eq!(
+            found.links,
+            [(
+                "etc/sudoers.d/a".to_string(),
+                "/usr/share/b/rule".to_string()
+            )]
+        );
+        assert!(found.unknown.is_empty(), "{:?}", found.unknown);
+
+        // What the file list has and the mtree does not describe (no
+        // line, a link without its text) is said with its package; a
+        // plain file and a backup entry are not.
+        record(
+            "c-2-1",
+            "%FILES%\netc/sudoers.d/\netc/sudoers.d/plain\netc/sudoers.d/missing\netc/sudoers.d/nowhere\n\n%BACKUP%\netc/sudoers.d/plain\td41d8cd98f00b204e9800998ecf8427e\n",
+            "#mtree\n/set type=file uid=0 gid=0 mode=644\n./etc/sudoers.d/plain time=1.0 size=3\n./etc/sudoers.d/nowhere time=1.0 type=link\n",
+        );
+        let found = super::packaged_links(&db, &hidden).unwrap();
+        assert_eq!(found.links.len(), 1);
+        let unknown = |path: &str| ("c-2-1".to_string(), path.to_string());
+        assert_eq!(
+            found.unknown,
+            [
+                unknown("etc/sudoers.d/missing"),
+                unknown("etc/sudoers.d/nowhere")
+            ]
+        );
+        // One sentence for the package, and none for what the transaction
+        // puts something else in the place of.
+        let said = super::unknown_entries(&found.unknown, &|_| false);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("the installed package c-2-1")
+                && said[0].contains("/etc/sudoers.d/missing and 1 more"),
+            "{said:?}"
+        );
+        let said = super::unknown_entries(&found.unknown, &|path| path.ends_with("missing"));
+        assert!(
+            said.len() == 1 && said[0].contains("whether /etc/sudoers.d/nowhere is"),
+            "{said:?}"
+        );
+        assert!(super::unknown_entries(&found.unknown, &|_| true).is_empty());
+        fs::remove_dir_all(db.join("c-2-1")).unwrap();
+        // A record that cannot be read is said, not passed over.
+        fs::write(other.join("files"), "%FILES%\netc/sudoers.d/b\n").unwrap();
+        assert!(super::packaged_links(&db, &hidden).is_err());
+        assert!(super::packaged_links(&dir.path().join("missing"), &hidden).is_err());
+    }
+
+    #[test]
+    fn what_a_link_on_the_system_leads_to_is_reviewed_when_a_package_replaces_it() {
+        if !tool_available("/usr/bin/bsdtar") {
+            return;
+        }
+        let dir = TempDir::new("pacman-stale-link");
+        let mut program = ELF.to_vec();
+        program.resize(3 * 1024 * 1024, 0);
+        let archive = pack(
+            dir.path(),
+            "b",
+            &[
+                (
+                    "usr/share/guardian-test-b/rule",
+                    b"ALL ALL=(ALL) NOPASSWD: ALL\n",
+                ),
+                ("usr/share/guardian-test-b/tool", &program),
+                ("usr/share/guardian-test-b/complete", b"complete -F _b b\n"),
+                ("usr/share/guardian-test-b/untouched", b"x\n"),
+            ],
+        );
+        let mut links = super::InstalledLinks::new();
+        let mut lead = |to: &str, from: &str| {
+            links
+                .entry(format!("usr/share/guardian-test-b/{to}"))
+                .or_default()
+                .push(from.to_string());
+        };
+        lead("rule", "etc/sudoers.d/a");
+        lead("tool", "usr/local/bin/tool");
+        lead("complete", "usr/share/bash-completion/completions/b");
+        let scan = |class| {
+            let mut report = Report::new("test");
+            let (_, summary, _) = scan_package(
+                &archive,
+                "b",
+                class,
+                &[],
+                &|_| crate::payload::InArchive::Absent,
+                &links,
+                &mut report,
+            )
+            .unwrap();
+            (report, summary)
+        };
+
+        let (report, summary) = scan(SourceClass::LocalPackage);
+        assert!(report.gaps.is_empty(), "{:?}", report.gaps);
+        let sent: Vec<&str> = report
+            .agent_input
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                "b/b-1-1-any.pkg.tar/usr/share/guardian-test-b/complete",
+                "b/b-1-1-any.pkg.tar/usr/share/guardian-test-b/rule"
+            ]
+        );
+        let rule = &report.agent_input[1].content;
+        assert!(
+            rule.contains("NOPASSWD")
+                && rule.contains("/etc/sudoers.d/a, a symbolic link on this system"),
+            "{rule}"
+        );
+        // A program a link in /usr/local/bin leads to is named, not read.
+        assert_eq!(
+            summary.not_reviewed,
+            ["/usr/share/guardian-test-b/tool (ELF executable)"]
+        );
+        assert_eq!(report.hash_only.len(), 1);
+        assert_eq!(
+            report.class_of("b/b-1-1-any.pkg.tar/usr/share/guardian-test-b/rule"),
+            SourceClass::LocalPackage
+        );
+
+        // A completion file is not reviewed for an official package,
+        // whichever way it is reached.
+        let (report, _) = scan(SourceClass::Official);
+        assert_eq!(report.agent_input.len(), 1);
+
+        // Without such links nothing of this package is looked at.
+        let mut report = Report::new("test");
+        scan_package(
+            &archive,
+            "b",
+            SourceClass::LocalPackage,
+            &[],
+            &|_| crate::payload::InArchive::Absent,
+            &super::InstalledLinks::new(),
+            &mut report,
+        )
+        .unwrap();
+        assert!(report.agent_input.is_empty());
+
+        // The file as it is installed now adds nothing.
+        assert!(super::same_as_installed(
+            &dir.path().join("b-root"),
+            "usr/share/guardian-test-b/rule",
+            b"ALL ALL=(ALL) NOPASSWD: ALL\n"
+        ));
+        assert!(!super::same_as_installed(
+            &dir.path().join("b-root"),
+            "usr/share/guardian-test-b/rule",
+            b"ALL ALL=(ALL) ALL\n"
+        ));
+    }
+
+    #[test]
+    fn named_files_misplaced_files_and_a_changed_archive_reach_the_report() {
+        use std::io::{Seek, SeekFrom, Write};
+        if !tool_available("/usr/bin/bsdtar") {
+            return;
+        }
+        let dir = TempDir::new("pacman-named");
+        let mut big = b"#!/bin/sh\n".to_vec();
+        big.resize(2 * 1024 * 1024 + 1, b'#');
+        let archive = pack(
+            dir.path(),
+            "sample",
+            &[
+                (
+                    "usr/share/libalpm/hooks/guardian-test.hook",
+                    b"[Action]\nExec = /usr/bin/sh /usr/share/guardian-test/run.sh\n",
+                ),
+                (
+                    "usr/share/guardian-test/run.sh",
+                    b"/usr/lib/guardian-test/helper; . /usr/share/guardian-test/big.sh\n",
+                ),
+                ("usr/lib/guardian-test/helper", ELF),
+                ("usr/share/guardian-test/big.sh", &big),
+                ("usr/lib/security/pam_guardian_test.so", ELF),
+            ],
+        );
+        let scan = |class| {
+            let mut report = Report::new("test");
+            let scanned = scan_package(
+                &archive,
+                "sample",
+                class,
+                &[],
+                &|_| crate::payload::InArchive::Absent,
+                &super::InstalledLinks::new(),
+                &mut report,
+            )
+            .unwrap();
+            (report, scanned)
+        };
+        let (report, (_, summary, fingerprint)) = scan(SourceClass::LocalPackage);
+        let sent: Vec<&str> = report
+            .agent_input
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                "sample/sample-1-1-any.pkg.tar/usr/share/guardian-test/run.sh",
+                "sample/sample-1-1-any.pkg.tar/usr/share/libalpm/hooks/guardian-test.hook",
+            ]
+        );
+        // The program the script runs is said to be unread, to the user
+        // and to the AI.
+        assert_eq!(
+            summary.not_reviewed,
+            ["/usr/lib/guardian-test/helper (ELF executable)"]
+        );
+        assert_eq!(
+            report.hash_only[0].path,
+            "sample/sample-1-1-any.pkg.tar/usr/lib/guardian-test/helper"
+        );
+        // Text too large to read is a gap.
+        assert_eq!(report.gaps.len(), 1, "{:?}", report.gaps);
+        assert!(
+            report.gaps[0]
+                .to_string()
+                .contains("/usr/share/guardian-test/big.sh, which /usr/share/guardian-test/run.sh names, is text over the 2 MiB review limit"),
+            "{:?}",
+            report.gaps
+        );
+        // A PAM module from anything but an official package is a finding.
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert_eq!(report.findings[0].rule, RuleId::PrivilegeEscalation);
+        assert!(
+            report.findings[0]
+                .excerpt
+                .starts_with("/usr/lib/security/pam_guardian_test.so runs when someone logs in"),
+            "{}",
+            report.findings[0].excerpt
+        );
+        let (official, _) = scan(SourceClass::Official);
+        assert!(official.findings.is_empty());
+
+        // Once the review is over the archive must be what it was.
+        fingerprint.verify().unwrap();
+        let mut file = fs::OpenOptions::new().write(true).open(&archive).unwrap();
+        file.seek(SeekFrom::Start(600)).unwrap();
+        file.write_all(b"swapped").unwrap();
+        drop(file);
+        assert!(fingerprint.verify().is_err());
+    }
+
+    #[test]
+    fn a_deep_directory_is_looked_through_and_an_over_large_one_is_named() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new("pacman-deep-links");
+        let root = dir.path().join("root");
+        // Deeper than any catalogued shape: no reason to stop, and a link
+        // down there is still found.
+        let deep = "etc/systemd/system/a/b/c/d/e/f/g";
+        fs::create_dir_all(root.join(deep)).unwrap();
+        fs::create_dir_all(root.join("usr/share/b")).unwrap();
+        symlink("/usr/share/b/unit", root.join(deep).join("x.service")).unwrap();
+        let db = dir.path().join("no-database");
+        let found = super::installed_links(&root, &db, 20_000);
+        assert!(found.unseen.is_empty(), "{:?}", found.unseen);
+        assert_eq!(
+            found.links["usr/share/b/unit"],
+            [format!("{deep}/x.service")]
+        );
+
+        // More entries than are looked through: said once, with the
+        // directory that holds them and how many.
+        fs::create_dir_all(root.join("etc/cron.d/many")).unwrap();
+        for index in 0..40 {
+            fs::write(root.join(format!("etc/cron.d/many/{index}")), "x\n").unwrap();
+        }
+        let found = super::installed_links(&root, &db, 30);
+        assert_eq!(found.unseen.len(), 1, "{:?}", found.unseen);
+        assert!(
+            found.unseen[0].starts_with(
+                "/etc/cron.d/ holds more than 30 entries (/etc/cron.d/many alone has 40)"
+            ),
+            "{:?}",
+            found.unseen
+        );
+        // The deep directory alone never was the reason.
+        assert!(found.links.contains_key("usr/share/b/unit"));
+    }
+
+    #[test]
+    fn only_a_line_about_guardians_own_is_let_off() {
+        for own in [
+            "systemctl disable --now omarchy-guardian-sweep-collect.timer >/dev/null 2>&1 || true",
+            "    systemctl stop omarchy-guardian-sweep.timer omarchy-guardian-sweep.service",
+            "/usr/bin/systemctl --quiet disable 'omarchy-guardian-sweep.timer' 2> /dev/null; true",
+            "rm -f /etc/pacman.d/hooks/omarchy-guardian.hook",
+        ] {
+            assert!(super::only_guardians_own(own), "{own}");
+        }
+        for other in [
+            "systemctl disable ufw # omarchy-guardian",
+            "systemctl stop apparmor omarchy-guardian-sweep.timer",
+            "systemctl disable omarchy-guardian-sweep.timer; ufw disable",
+            "systemctl disable omarchy-guardian-sweep.timer && setenforce 0",
+            "systemctl disable omarchy-guardian-sweep.timer; sysctl kernel.yama.ptrace_scope=0",
+            "systemctl disable omarchy-guardian-sweep.timer; nft flush ruleset",
+            "systemctl disable omarchy-guardian-sweep.timer \"$other\"",
+            "systemctl disable omarchy-guardian-sweep.timer sshd.service",
+            "systemctl mask ufw.service",
+        ] {
+            assert!(!super::only_guardians_own(other), "{other}");
+        }
+
+        let script = "pre_remove() {\n  systemctl disable --now omarchy-guardian-sweep.timer\n  systemctl disable ufw # omarchy-guardian\n  systemctl stop apparmor omarchy-guardian-sweep.timer\n  systemctl disable \\\n    omarchy-guardian-sweep.timer ufw\n}\n";
+        let findings = |target: &str| {
+            let mut report = Report::new("test");
+            analyze_text(&mut report, "x/.INSTALL", script, false);
+            super::own_removal_is_no_attack(&mut report, target, "x/.INSTALL", script);
+            let mut lines: Vec<usize> = report
+                .findings
+                .iter()
+                .filter(|finding| finding.rule == RuleId::ProtectionDisabled)
+                .map(|finding| finding.line)
+                .collect();
+            lines.sort_unstable();
+            lines.dedup();
+            lines
+        };
+        // Any other package keeps every finding; Guardian's own loses
+        // only the line about its own timer.
+        let all = findings("sample");
+        assert!(
+            all.contains(&2) && all.contains(&3) && all.contains(&4),
+            "{all:?}"
+        );
+        let kept = findings("omarchy-guardian");
+        assert!(!kept.contains(&2), "{kept:?}");
+        let rest: Vec<usize> = all.iter().copied().filter(|line| *line != 2).collect();
+        assert_eq!(kept, rest);
+    }
+
+    #[test]
+    fn what_was_not_read_inside_a_fingerprinted_archive_can_be_permitted() {
+        use crate::report::Gap;
+        if !tool_available("/usr/bin/bsdtar") {
+            return;
+        }
+        let dir = TempDir::new("pacman-unread");
+        let mut big = b"#!/bin/sh\n".to_vec();
+        big.resize(2 * 1024 * 1024 + 1, b'#');
+        let scan = |archive: &Path, name: &str| {
+            let mut report = Report::new("test");
+            let scanned = scan_package(
+                archive,
+                name,
+                SourceClass::LocalPackage,
+                &[],
+                &|_| crate::payload::InArchive::Absent,
+                &super::InstalledLinks::new(),
+                &mut report,
+            );
+            (report, scanned)
+        };
+        let unread = |report: &Report, text: &str| {
+            assert!(
+                report
+                    .gaps
+                    .iter()
+                    .any(|gap| matches!(gap, Gap::PackageUnread(said) if said.contains(text))),
+                "{text}: {:?}",
+                report.gaps
+            );
+            assert!(report.content_hashed(), "{:?}", report.gaps);
+        };
+
+        // A compiled program in an auto-run directory, a named text file
+        // and an auto-run file over the size limit: the archive is read
+        // and fingerprinted, and each is a gap a permit can stand for.
+        let archive = pack(
+            dir.path(),
+            "sample",
+            &[
+                ("usr/lib/systemd/system-generators/guardian-test", ELF),
+                (
+                    "usr/share/libalpm/hooks/guardian-test.hook",
+                    b"[Action]\nExec = /usr/bin/sh /usr/share/guardian-test/big.sh\n",
+                ),
+                ("usr/share/guardian-test/big.sh", &big),
+                ("etc/profile.d/guardian-test-big.sh", &big),
+            ],
+        );
+        let (report, scanned) = scan(&archive, "sample");
+        scanned.unwrap();
+        assert_eq!(report.gaps.len(), 3, "{:?}", report.gaps);
+        unread(
+            &report,
+            "a compiled file (ELF executable) in an auto-run location",
+        );
+        unread(
+            &report,
+            "big.sh, which /usr/share/libalpm/hooks/guardian-test.hook names, is text over",
+        );
+        unread(
+            &report,
+            "auto-run file /etc/profile.d/guardian-test-big.sh exceeds",
+        );
+        // The hook itself was still reviewed.
+        assert_eq!(report.agent_input.len(), 1);
+
+        // A scriptlet over the limit, and one of binary data.
+        let long = TempDir::new("pacman-long-scriptlet");
+        fs::write(long.path().join(".INSTALL"), &big).unwrap();
+        let archive = build_package(long.path(), None);
+        let add = |directory: &Path, archive: &Path| {
+            assert!(
+                Command::new("/usr/bin/bsdtar")
+                    .arg("-rf")
+                    .arg(archive)
+                    .arg(".INSTALL")
+                    .current_dir(directory)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        add(long.path(), &archive);
+        let (report, scanned) = scan(&archive, "sample");
+        assert!(scanned.unwrap().0, "a scriptlet is there, if unread");
+        unread(
+            &report,
+            "the install scriptlet exceeds the 2 MiB review limit",
+        );
+
+        let binary = TempDir::new("pacman-binary-scriptlet");
+        fs::write(binary.path().join(".INSTALL"), ELF).unwrap();
+        let archive = build_package(binary.path(), None);
+        add(binary.path(), &archive);
+        let (report, scanned) = scan(&archive, "sample");
+        assert!(scanned.unwrap().0);
+        unread(&report, "holds binary data");
+
+        // What the gate refuses stays refused, whatever else is unread:
+        // an oversized scriptlet does not get a package past its name.
+        let (report, scanned) = scan(&archive, "other-name");
+        assert!(scanned.is_err());
+        assert!(report.gaps.is_empty(), "{:?}", report.gaps);
+        let refused = Gap::Package(scanned.err().unwrap());
+        assert!(!refused.content_hashed());
     }
 }

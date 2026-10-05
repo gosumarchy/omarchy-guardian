@@ -5,8 +5,11 @@
 //! Parsing and selection are pure functions; the few steps that touch the
 //! network or run makepkg live in `cli::makepkg_gate`.
 
-use std::collections::HashSet;
-use std::ffi::OsString;
+pub mod lockfile;
+pub mod recipe;
+
+use std::collections::{BTreeMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
@@ -30,6 +33,10 @@ pub struct Invocation {
     pub runs_functions: bool,
     /// Extracts the sources itself (no `--noextract`, not only verifying).
     pub extracts: bool,
+    /// Goes on to use the sources: extracts them, or builds from a tree
+    /// extracted earlier (`--noextract`). Only a call that downloads and
+    /// stops (to verify, or to generate checksums) does not.
+    pub uses_sources: bool,
 }
 
 /// Classifies makepkg's arguments. Only calls that print (the source list,
@@ -80,6 +87,7 @@ pub fn classify(args: &[OsString]) -> Invocation {
     Invocation {
         runs_functions,
         extracts: runs_functions && !source_only && !noextract,
+        uses_sources: runs_functions && !source_only,
     }
 }
 
@@ -177,6 +185,23 @@ pub fn path_variable_assignments(pkgbuild: &str) -> Vec<String> {
         // `${x}` closes a brace it did not open here.
         depth = (depth + braces).max(0);
     }
+    // The same read as commands, which sees a name through its quoting
+    // (`declare BUILD''DIR=/x`) and a command over several lines.
+    let names = recipe::Naming {
+        set: PATH_VARIABLES,
+        given: &["BUILDDIR", "SRCDEST"],
+        assigners: ASSIGNING_COMMANDS,
+    };
+    let lines: Vec<&str> = pkgbuild.lines().collect();
+    for line in recipe::top_level_naming(pkgbuild, &names).unwrap_or_default() {
+        let text = lines
+            .get(line.saturating_sub(1))
+            .map_or("", |text| text.trim());
+        let entry = format!("line {line}: {text}");
+        if !found.contains(&entry) {
+            found.push(entry);
+        }
+    }
     found
 }
 
@@ -264,114 +289,119 @@ pub const CHECKSUMS: &[&str] = &[
     "b2sums",
 ];
 
-/// The recipe's source entries as written, when every one is plain text
-/// once makepkg's own `pkgname`, `pkgbase`, `pkgver` and `pkgrel` (from
-/// the listing) are put in: `None` when any is computed, when an array is
-/// set more than once, added to, set inside a block (indented), or is for
-/// an architecture the listing does not name, since the text then says
-/// nothing sure.
-pub fn literal_sources(recipe: &str, srcinfo: &str) -> Option<Vec<String>> {
-    let value = |key: &str| {
-        srcinfo.lines().find_map(|line| {
-            line.trim()
-                .strip_prefix(key)
-                .and_then(|rest| rest.strip_prefix(" = "))
-                .map(str::to_string)
-        })
-    };
-    let known: Vec<(String, String)> = ["pkgname", "pkgbase", "pkgver", "pkgrel"]
-        .iter()
-        .filter_map(|name| Some(((*name).to_string(), value(name)?)))
-        .collect();
-    let arches: Vec<&str> = srcinfo
+/// The arrays of a listing that say what is fetched and how it is checked.
+fn is_listed_array(key: &str) -> bool {
+    let base = key.split_once('_').map_or(key, |(base, _)| base);
+    matches!(key, "noextract" | "validpgpkeys") || base == "source" || CHECKSUMS.contains(&base)
+}
+
+/// The `key = value` lines of a listing's first section, the one for the
+/// package base: sources and checksums are only there.
+pub fn base_section(srcinfo: &str) -> impl Iterator<Item = (&str, &str)> {
+    srcinfo
         .lines()
-        .filter_map(|line| line.trim().strip_prefix("arch = "))
-        .collect();
-    let lines: Vec<&str> = recipe.lines().collect();
-    let mut entries = Vec::new();
-    let mut arrays: Vec<String> = Vec::new();
-    let mut index = 0;
-    while index < lines.len() {
-        let line = lines[index];
-        index += 1;
-        let trimmed = line.trim_start();
-        let Some(after) = trimmed.strip_prefix("source") else {
+        .take_while(|line| !line.starts_with("pkgname = "))
+        .filter_map(|line| line.trim_start().split_once(" = "))
+        .map(|(key, value)| (key, value.trim_end()))
+}
+
+/// Why `srcinfo` is not a listing as `makepkg --printsrcinfo` prints one,
+/// if it is not. The recipe is loaded by the shell that prints the listing,
+/// so anything it writes to the same output lands in it: a listing with
+/// text before its first line, a second package base, or a line of another
+/// shape was not written by makepkg alone.
+pub fn check_listing(srcinfo: &str) -> Result<(), String> {
+    let mut lines = srcinfo.lines();
+    if !lines
+        .next()
+        .is_some_and(|line| line.starts_with("pkgbase = "))
+    {
+        return Err("it does not start with the package base".into());
+    }
+    let mut packages = 0;
+    for line in lines {
+        if line.is_empty() {
             continue;
-        };
-        let name_end = after
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .unwrap_or(after.len());
-        let (suffix, tail) = after.split_at(name_end);
-        if !(suffix.is_empty() || suffix.starts_with('_')) {
+        }
+        if line.chars().any(|c| c.is_control() && c != '\t') {
+            return Err("it holds control characters".into());
+        }
+        if line.starts_with("pkgname = ") {
+            packages += 1;
             continue;
         }
-        if tail.starts_with("+=") {
-            return None;
-        }
-        let Some(list) = tail.strip_prefix("=(") else {
-            continue;
-        };
-        // Set inside a block, or for an architecture the listing leaves
-        // out: what the build uses is not plain from the text.
-        let arch = suffix.trim_start_matches('_');
-        if trimmed.len() != line.len() || (!arch.is_empty() && !arches.contains(&arch)) {
-            return None;
-        }
-        let name = format!("source{suffix}");
-        if arrays.contains(&name) {
-            return None;
-        }
-        arrays.push(name);
-        // The array runs to the first `)` outside a comment.
-        let mut part = list;
-        loop {
-            // A comment starts at a `#` after a blank, or at the start.
-            let code = part
-                .char_indices()
-                .find(|&(at, character)| {
-                    character == '#' && (at == 0 || part[..at].ends_with(char::is_whitespace))
-                })
-                .map_or(part, |(at, _)| &part[..at]);
-            let (words, closed) = match code.find(')') {
-                Some(end) => (&code[..end], true),
-                None => (code, false),
-            };
-            for word in words.split_whitespace() {
-                if word == "\\" {
-                    continue;
-                }
-                // Quoted as a whole, or not at all: anything else (a blank
-                // inside quotes, `"a"::b`) is not read as plain text.
-                let quoted = word.len() >= 2
-                    && ((word.starts_with('"') && word.ends_with('"'))
-                        || (word.starts_with('\'') && word.ends_with('\'')));
-                let inner = if quoted {
-                    &word[1..word.len() - 1]
-                } else {
-                    word
-                };
-                if inner.contains(['"', '\'', '\\']) {
-                    return None;
-                }
-                // In single quotes nothing is expanded.
-                let word = if word.starts_with('\'') {
-                    inner.to_string()
-                } else {
-                    crate::rules::with_variables(inner, &known)
-                };
-                if word.contains(['$', '`']) {
-                    return None;
-                }
-                entries.push(word);
-            }
-            if closed {
-                break;
-            }
-            part = lines.get(index)?;
-            index += 1;
+        let entry = line
+            .strip_prefix('\t')
+            .and_then(|rest| rest.split_once(" ="));
+        let named = entry.is_some_and(|(key, value)| {
+            !key.is_empty()
+                && (value.is_empty() || value.starts_with(' '))
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        });
+        if !named || entry.is_some_and(|(key, _)| key == "pkgbase") {
+            return Err(if line.trim_start().starts_with("pkgbase =") {
+                "it names more than one package base".into()
+            } else {
+                "it holds a line makepkg does not print".into()
+            });
         }
     }
-    (!arrays.is_empty()).then_some(entries)
+    if packages == 0 {
+        return Err("it names no package".into());
+    }
+    Ok(())
+}
+
+/// Where a recipe that writes its arrays out plainly (`written`, from
+/// `recipe::sources`) and its listing disagree: the name of the first array
+/// that differs. Such a recipe told the listing something else than its
+/// text says, so what it builds with cannot be known. An array for an
+/// architecture the listing does not name is not listed, and is left out.
+pub fn written_mismatch(written: &[(String, Vec<String>)], srcinfo: &str) -> Option<String> {
+    let mut listed: Vec<(&str, Vec<&str>)> = Vec::new();
+    let mut arches: Vec<&str> = Vec::new();
+    for (key, value) in base_section(srcinfo) {
+        if key == "arch" {
+            arches.push(value);
+        }
+        if !is_listed_array(key) {
+            continue;
+        }
+        match listed.iter_mut().find(|(known, _)| *known == key) {
+            Some((_, values)) => values.push(value),
+            None => listed.push((key, vec![value])),
+        }
+    }
+    // makepkg prints a value with its blanks made single and none at its
+    // ends; an empty one says nothing either way.
+    let printed = |words: &[String]| -> Vec<String> {
+        words
+            .iter()
+            .map(|word| word.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|word| !word.is_empty())
+            .collect()
+    };
+    for (key, values) in &listed {
+        let values: Vec<&str> = values.iter().copied().filter(|v| !v.is_empty()).collect();
+        let same = written
+            .iter()
+            .find(|(name, _)| name == key)
+            .map_or(values.is_empty(), |(_, words)| printed(words) == values);
+        if !same {
+            return Some((*key).to_string());
+        }
+    }
+    written
+        .iter()
+        .find(|(name, words)| {
+            let arch = name.split_once('_').map(|(_, arch)| arch);
+            !printed(words).is_empty()
+                && !listed.iter().any(|(key, _)| key == name)
+                && arch.is_none_or(|arch| arches.contains(&arch))
+        })
+        .map(|(name, _)| name.clone())
 }
 
 /// The sources of `makepkg --printsrcinfo` output, each paired with its
@@ -380,10 +410,7 @@ pub fn parse_srcinfo(text: &str) -> Vec<Source> {
     // Keys are `source` or `sha256sums`, optionally with `_<arch>`.
     let mut sources: Vec<(String, Vec<String>)> = Vec::new();
     let mut sums: Vec<(String, Vec<String>)> = Vec::new();
-    for line in text.lines() {
-        let Some((key, value)) = line.trim().split_once(" = ") else {
-            continue;
-        };
+    for (key, value) in base_section(text) {
         let (base, arch) = key.split_once('_').unwrap_or((key, ""));
         let push = |list: &mut Vec<(String, Vec<String>)>| {
             let arch = arch.to_string();
@@ -492,6 +519,12 @@ fn parse_source(entry: &str) -> Option<Parsed<'_>> {
         },
         fragment,
     })
+}
+
+/// The host a source is downloaded from, as a validated name; `None` for a
+/// local file.
+pub fn source_host(entry: &str) -> Option<String> {
+    parse_source(entry).map(|parsed| parsed.host)
 }
 
 fn full_hash(value: &str, lengths: &[usize]) -> bool {
@@ -731,6 +764,152 @@ pub fn trust_signals(info: &AurInfo, now: u64) -> (Vec<String>, Vec<String>) {
     (facts, warnings)
 }
 
+/// Whether a package has too few votes to have a track record.
+pub const fn is_little_voted(votes: u64) -> bool {
+    votes < FEW_VOTES
+}
+
+/// What the AI and the user are told when the AUR could not be asked.
+pub const TRUST_UNKNOWN: &str = "Guardian could not fetch the AUR's record of this package: its \
+age, votes and maintainer are unknown to this review, and nothing here says they are fine.";
+
+/// Endings that make a new package name out of a known one. The AUR
+/// malware of July 2025 arrived under such names (`librewolf-fix-bin`,
+/// `firefox-patch-bin`, `zen-browser-patched-bin`).
+const VARIANT_SUFFIXES: &[&str] = &["-bin", "-git", "-patched", "-patch", "-fixed", "-fix"];
+/// A package with at least this many votes is one people know.
+const KNOWN_VOTES: u64 = 50;
+/// The most look-alikes named.
+const MAX_LOOKALIKES: usize = 3;
+
+/// `name` without its variant endings: `zen-browser-patched-bin` is
+/// `zen-browser`.
+pub fn plain_name(name: &str) -> &str {
+    let mut plain = name;
+    while let Some(shorter) = VARIANT_SUFFIXES
+        .iter()
+        .find_map(|suffix| plain.strip_suffix(suffix))
+        .filter(|shorter| !shorter.is_empty())
+    {
+        plain = shorter;
+    }
+    plain
+}
+
+/// How many letters have to be changed, added or dropped to make `right`
+/// of `left`, counted up to `most + 1`.
+fn edit_distance(left: &str, right: &str, most: usize) -> usize {
+    let (left, right): (Vec<char>, Vec<char>) = (left.chars().collect(), right.chars().collect());
+    if left.len().abs_diff(right.len()) > most {
+        return most + 1;
+    }
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for (row, from) in left.iter().enumerate() {
+        let mut current = vec![row + 1];
+        for (column, to) in right.iter().enumerate() {
+            let change = previous[column] + usize::from(from != to);
+            current.push(
+                change
+                    .min(previous[column + 1] + 1)
+                    .min(current[column] + 1),
+            );
+        }
+        previous = current;
+    }
+    previous.last().copied().unwrap_or(0).min(most + 1)
+}
+
+/// Whether `name` is a letter or two from `known` without being it: close
+/// enough to be taken for it. Names that differ only in digits (`qt5`,
+/// `qt6`) are versions of each other, and short names are close to
+/// everything.
+fn is_lookalike(name: &str, known: &str) -> bool {
+    let letters = |text: &str| -> String { text.chars().filter(|c| !c.is_ascii_digit()).collect() };
+    let most = if name.len() < 8 { 1 } else { 2 };
+    name != known
+        && name.len() >= 5
+        && letters(name) != letters(known)
+        && edit_distance(name, known, most) <= most
+}
+
+/// The names and votes of an AUR RPC `search` reply.
+pub fn parse_rpc_search(reply: &Json) -> Vec<(String, u64)> {
+    reply
+        .get("results")
+        .and_then(Json::as_array)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|result| {
+            Some((
+                result.get("Name").and_then(Json::as_str)?.to_string(),
+                result.get("NumVotes").and_then(Json::as_u64).unwrap_or(0),
+            ))
+        })
+        .collect()
+}
+
+/// What to search the AUR's names for, to find what `name` could be taken
+/// for: its plain name, or, when it has no variant ending, its first two
+/// thirds, which a name one or two letters off further on still shares.
+/// Only this text is sent.
+pub fn lookalike_search_term(name: &str) -> Option<String> {
+    let plain = plain_name(name);
+    let term = if plain == name {
+        let keep = (name.chars().count() * 2).div_ceil(3).max(4);
+        name.chars().take(keep).collect()
+    } else {
+        plain.to_string()
+    };
+    (term.len() >= 4).then_some(term)
+}
+
+/// Known packages a little-voted package's name could be taken for:
+/// official ones (`official`, the names in the sync databases) and AUR ones
+/// with many more votes (`searched`, from `parse_rpc_search`). One warning
+/// for each, in Guardian's words with validated package names. A package
+/// people have voted for is not asked about.
+pub fn lookalikes(
+    name: &str,
+    votes: u64,
+    official: &[String],
+    searched: &[(String, u64)],
+) -> Vec<String> {
+    if votes >= FEW_VOTES {
+        return Vec::new();
+    }
+    let plain = plain_name(name);
+    let mut found = Vec::new();
+    let valid = |known: &str| crate::pacman::is_valid_package_name(known) && known != name;
+    for known in official.iter().filter(|known| valid(known)) {
+        if plain == known {
+            found.push(format!(
+                "{name} has {votes} vote(s) and is named like the official package {known} with another ending"
+            ));
+        } else if is_lookalike(name, known) || is_lookalike(plain, known) {
+            found.push(format!(
+                "{name} has {votes} vote(s) and its name is a letter or two from the official package {known}"
+            ));
+        }
+    }
+    for (known, known_votes) in searched.iter().filter(|(known, _)| valid(known)) {
+        if *known_votes < KNOWN_VOTES || *known_votes < votes.saturating_mul(20) {
+            continue;
+        }
+        let known_plain = plain_name(known);
+        if plain == known_plain {
+            found.push(format!(
+                "{name} has {votes} vote(s) and is named like the AUR package {known} ({known_votes} votes) with another ending"
+            ));
+        } else if is_lookalike(plain, known_plain) {
+            found.push(format!(
+                "{name} has {votes} vote(s) and its name is a letter or two from the AUR package {known} ({known_votes} votes)"
+            ));
+        }
+    }
+    found.truncate(MAX_LOOKALIKES);
+    found
+}
+
 /// Upstream text that fits one full review; larger sources are reviewed by
 /// their build files only.
 pub const FULL_REVIEW_BYTES: u64 = 1024 * 1024;
@@ -843,6 +1022,28 @@ const DATA_EXTENSIONS: &[&str] = &[
     "adoc", "html", "css",
 ];
 const SCRIPT_EXTENSIONS: &[&str] = &["sh", "bash", "zsh", "py", "pl"];
+/// Code a build runs when a build file names it, however deep it lies: a
+/// `package.json` script that runs `node tools/a/b/gen.js`, a makefile
+/// that runs `lua`, `ruby` or `awk` on a file.
+const NAMED_EXTENSIONS: &[&str] = &[
+    "js", "mjs", "cjs", "ts", "lua", "rb", "php", "awk", "inc", "py", "pl", "sh", "bash", "zsh",
+];
+/// Words a makefile reads another file in with.
+const INCLUDES: &[&str] = &["include", "-include", "sinclude"];
+/// Manifests deeper than this, or under a directory of bundled code, are a
+/// dependency's own and say nothing about what this build downloads.
+const MANIFEST_DEPTH: usize = 3;
+/// The most archives Guardian unpacks itself for one build.
+pub const MAX_UNPACKED_ARCHIVES: usize = 8;
+
+/// Why a text file was not sent for review.
+pub const NOT_REVIEWED_DATA: &str =
+    "data or documentation, which Guardian does not send for review";
+pub const NOT_REVIEWED_BUDGET: &str = "left out past the review budget";
+pub const NOT_REVIEWED_LOCKFILE: &str =
+    "a lockfile too large to send, which Guardian scanned itself for where it fetches from";
+const NOT_UNPACKED: &str =
+    "an archive that is not unpacked for review: what the build takes from it is not reviewed";
 
 /// One upstream text file, by its path under the build directory's `src/`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -853,6 +1054,30 @@ pub struct UpstreamFile {
     /// Build-critical: must be reviewed, or the review is incomplete.
     critical: bool,
     /// Under a directory whose code rarely runs during a build.
+    late: bool,
+    /// New or changed since Guardian extracted the sources itself.
+    changed: bool,
+}
+
+/// An archive among the sources that makepkg did not unpack: the build
+/// opens it itself, if at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Archive {
+    /// Its path under `src/`.
+    pub rel: String,
+    /// Where its bytes are.
+    pub file: PathBuf,
+    /// The recipe names it (`noextract`, or by its name in a function), so
+    /// the build certainly opens it.
+    pub named: bool,
+}
+
+/// A data file kept back from the review, which is read after all if a
+/// build file turns out to name it.
+struct DataFile {
+    child: String,
+    read_from: PathBuf,
+    depth: usize,
     late: bool,
 }
 
@@ -884,6 +1109,56 @@ pub struct Upstream {
     pub gaps: Vec<String>,
     /// Whether `src` existed and had entries.
     pub found: bool,
+    /// Text files that were not sent for review, by path, with why: data
+    /// and documentation, and code past the budget. A reviewed line that
+    /// runs or reads one in makes the review incomplete.
+    pub unreviewed: Vec<(String, &'static str)>,
+    /// Every program among the binaries (ELF and the like), with its hash.
+    pub programs: BTreeMap<String, String>,
+    /// Every file the walk read, with its hash: what the sources were when
+    /// Guardian looked.
+    pub seen: BTreeMap<String, String>,
+    /// The downloaded files makepkg linked into `src/`, with their hashes.
+    pub downloads: BTreeMap<String, String>,
+    /// What a local scan of each lockfile found, in Guardian's words.
+    pub lockfiles: Vec<String>,
+    /// The ecosystems whose manifests or lockfiles the sources hold.
+    pub ecosystems: Vec<lockfile::Ecosystem>,
+    /// Archives Guardian unpacked itself and reviewed like the rest.
+    pub unpacked: Vec<String>,
+    /// Files new or changed since Guardian extracted the sources: how many
+    /// there are, and how many of them were sent for review.
+    pub changed: (usize, usize),
+}
+
+impl Upstream {
+    /// Whether the file at `path` came out of an archive Guardian unpacked
+    /// itself. A directory of the sources whose own name ends in `!` is
+    /// not one.
+    pub fn is_unpacked(&self, path: &str) -> bool {
+        self.unpacked.iter().any(|archive| {
+            path.strip_prefix(archive.as_str())
+                .is_some_and(|inside| inside.starts_with("!/"))
+        })
+    }
+}
+
+/// File names of what is installed and run as it comes, whatever its
+/// bytes look like: an archive of code (a Java archive, an Electron
+/// application, a browser extension) or a package for another packager.
+const CODE_ARCHIVES: &[&str] = &[
+    "jar", "war", "ear", "aar", "apk", "asar", "deb", "rpm", "whl", "egg", "gem", "nupkg", "phar",
+    "pex", "pyz", "xpi", "crx", "vsix", "appimage", "snap", "flatpak", "msi",
+];
+
+/// Whether the file `name` is code nobody reviewed by its name alone (see
+/// `CODE_ARCHIVES`), or a built pacman package.
+fn carries_code(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains(".pkg.tar")
+        || lower
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| CODE_ARCHIVES.contains(&extension))
 }
 
 /// Where makepkg keeps what a build uses: the recipe directory, and the
@@ -914,6 +1189,18 @@ fn is_critical(name: &str, depth: usize, text: &str, executable: bool, recipe: &
 
 struct Walk<'a> {
     src: PathBuf,
+    /// What the paths under `src` start with: nothing for `src/` itself,
+    /// `demo/data.tar.xz!` for an archive Guardian unpacked.
+    start: String,
+    /// The depth `src` counts as: a link at the top of `src/` is one of
+    /// makepkg's own, one at the top of an unpacked archive is not.
+    base_depth: usize,
+    /// The listing's `noextract` names.
+    noextract: &'a [String],
+    /// What the recipe gives to commands that unpack (`unpack_patterns`).
+    unpacks: Vec<String>,
+    archives: Vec<Archive>,
+    data: Vec<DataFile>,
     roots: &'a Roots<'a>,
     recipe: &'a str,
     visited: usize,
@@ -923,15 +1210,90 @@ struct Walk<'a> {
     hashed_bytes: u64,
     /// The file being read is a top-level link to a downloaded source.
     download: bool,
-    /// Archives named as not unpacked, so far.
-    archives_named: usize,
     all: Vec<UpstreamFile>,
     upstream: Upstream,
     /// Directories laid out as git repositories under another name.
     git_dirs: HashSet<PathBuf>,
+    /// Where files are run in the sources (see `Collected::surroundings`).
+    surroundings: image::Surroundings,
+    /// The whole images, with their hashes (see `Collected::images`).
+    images: Vec<(String, String)>,
 }
 
 impl Walk<'_> {
+    /// Notes what the walk saw of one file: its hash, for telling later
+    /// whether the build's sources are still the ones Guardian looked at.
+    /// A file too large to hash is told by its size and when it was last
+    /// written, which an extraction of the same archive gives it again.
+    fn note(&mut self, child: &str, read_from: &Path, digest: Option<&Digest>) {
+        let written = |found: fs::Metadata| {
+            format!(
+                "size-{}-{}-{}",
+                found.len(),
+                found.mtime(),
+                found.mtime_nsec()
+            )
+        };
+        let digest = match digest {
+            Some(digest) => digest.to_string(),
+            None => fs::metadata(read_from).map(written).unwrap_or_default(),
+        };
+        if self.download {
+            self.upstream
+                .downloads
+                .insert(child.to_string(), digest.clone());
+        }
+        self.upstream.seen.insert(format!("src/{child}"), digest);
+    }
+
+    /// A lockfile is read here for where it fetches from, whatever its
+    /// size (see `lockfile`). Returns whether it is small enough to be
+    /// sent whole as well.
+    fn lockfile(&mut self, child: &str, ecosystem: lockfile::Ecosystem, text: &str) -> bool {
+        let scan = lockfile::scan(ecosystem, text);
+        self.upstream
+            .lockfiles
+            .push(format!("src/{child}: {}", scan.summary(ecosystem)));
+        let whole = text.len() <= lockfile::WHOLE_BYTES;
+        if !whole {
+            self.upstream
+                .unreviewed
+                .push((format!("src/{child}"), NOT_REVIEWED_LOCKFILE));
+        }
+        whole
+    }
+
+    /// A text file too large to read whole.
+    fn large(&mut self, read_from: &Path, child: &str, name: &str, critical: bool) {
+        let digest = self.hash_file(read_from);
+        self.note(child, read_from, digest.as_ref());
+        if let Some(ecosystem) = lockfile::lockfile(name) {
+            let mut bytes = Vec::new();
+            let read = fs::File::open(read_from).and_then(|file| {
+                file.take(lockfile::MAX_SCANNED_BYTES + 1)
+                    .read_to_end(&mut bytes)
+            });
+            if read.is_ok() && bytes.len() as u64 <= lockfile::MAX_SCANNED_BYTES {
+                self.lockfile(child, ecosystem, &String::from_utf8_lossy(&bytes));
+                return;
+            }
+            // Not read at all: where it fetches from is not known.
+            self.upstream.gaps.push(format!(
+                "src/{child}: a lockfile too large to read (over 64 MiB) says where dependencies come from"
+            ));
+            return;
+        }
+        if critical {
+            self.upstream.gaps.push(format!(
+                "src/{child}: a build file larger than 2 MiB cannot be reviewed"
+            ));
+        } else {
+            self.upstream
+                .omitted
+                .push((child.to_string(), "larger than 2 MiB"));
+        }
+    }
+
     fn file(&mut self, read_from: &Path, child: &str, name: &str, depth: usize, late: bool) {
         let Ok(metadata) = fs::metadata(read_from) else {
             self.upstream
@@ -940,7 +1302,16 @@ impl Walk<'_> {
             return;
         };
         let executable = metadata.mode() & 0o111 != 0;
+        self.surroundings
+            .note_file(&format!("src/{child}"), executable);
         let name_critical = is_critical(name, depth, "", executable, self.recipe);
+        if !late
+            && depth <= MANIFEST_DEPTH
+            && let Some(ecosystem) = lockfile::manifest(name)
+            && !self.upstream.ecosystems.contains(&ecosystem)
+        {
+            self.upstream.ecosystems.push(ecosystem);
+        }
         if metadata.len() > MAX_TEXT_FILE_SIZE {
             let prefix = fs::File::open(read_from)
                 .and_then(|file| {
@@ -954,13 +1325,7 @@ impl Walk<'_> {
                 content::Prefix::Binary(format) => {
                     self.binary(child, format, executable, read_from, None);
                 }
-                _ if name_critical => self.upstream.gaps.push(format!(
-                    "src/{child}: a build file larger than 2 MiB cannot be reviewed"
-                )),
-                _ => self
-                    .upstream
-                    .omitted
-                    .push((child.to_string(), "larger than 2 MiB")),
+                _ => self.large(read_from, child, name, name_critical),
             }
             return;
         }
@@ -976,6 +1341,7 @@ impl Walk<'_> {
                 return self.binary(child, format, executable, read_from, Some(&bytes));
             }
             Content::Undecodable => {
+                self.note(child, read_from, Some(&Sha256::digest(&bytes)));
                 if name_critical {
                     self.upstream.gaps.push(format!(
                         "src/{child}: a build file or script holds binary data"
@@ -988,7 +1354,15 @@ impl Walk<'_> {
                 return;
             }
         };
-        let critical = is_critical(name, depth, &text, executable, self.recipe);
+        self.note(child, read_from, Some(&Sha256::digest(&bytes)));
+        let mut critical = is_critical(name, depth, &text, executable, self.recipe);
+        if let Some(ecosystem) = lockfile::lockfile(name) {
+            // Read here whatever its size; sent as well when it is small.
+            if !self.lockfile(child, ecosystem, &text) {
+                return;
+            }
+            critical = true;
+        }
         let data = !critical
             && name
                 .to_ascii_lowercase()
@@ -996,6 +1370,12 @@ impl Walk<'_> {
                 .is_some_and(|(_, extension)| DATA_EXTENSIONS.contains(&extension));
         if data {
             self.upstream.data_files += 1;
+            self.data.push(DataFile {
+                child: child.to_string(),
+                read_from: read_from.to_path_buf(),
+                depth,
+                late,
+            });
             return;
         }
         self.all.push(UpstreamFile {
@@ -1004,9 +1384,9 @@ impl Walk<'_> {
             depth,
             critical,
             late,
+            changed: false,
         });
     }
-
     /// `bytes` is the whole file when it was read; a larger one is hashed
     /// from disk, and one that cannot be is listed without a hash, which
     /// no approved version matches.
@@ -1022,8 +1402,9 @@ impl Walk<'_> {
             Some(bytes) => Some(Sha256::digest(bytes)),
             None => self.hash_file(read_from),
         };
-        // A whole image is not the review memory's concern (see
-        // `review::is_plain_image`), nor is a downloaded archive: what it
+        // A whole image away from where files are run is not the review
+        // memory's concern (see `review::is_plain_image_among`), nor is a
+        // downloaded archive: what it
         // unpacks to is what is reviewed, and its name changes with every
         // version. A downloaded program is.
         let image = !executable
@@ -1034,26 +1415,47 @@ impl Walk<'_> {
                 (None, Some(digest)) => image::is_whole_file(read_from, digest),
                 (None, None) => false,
             };
-        let archive = self.download && format.label().contains("archive");
+        let is_archive = format.label().contains("archive");
+        let archive = self.download && is_archive;
         // An archive makepkg was told not to unpack, or one inside the
-        // sources, is opened by the build itself if at all: what is in it
-        // is not reviewed, and the review says so.
+        // sources, is opened by the build itself if at all. Guardian
+        // unpacks the ones the recipe names (see `Collected::to_unpack`);
+        // of the others the review says that they are not reviewed.
         let name = child.rsplit('/').next().unwrap_or(child);
-        if format.label().contains("archive")
-            && (!self.download || self.not_extracted(name))
-            && self.archives_named < MAX_ARCHIVES_NAMED
-        {
-            self.archives_named += 1;
-            self.upstream.omitted.push((
-                child.to_string(),
-                "an archive that is not unpacked for review: what the build takes from it is not reviewed",
-            ));
+        if is_archive && (!self.download || self.not_extracted(name)) {
+            let inside = child[self.start.len()..].trim_start_matches('/');
+            let top_of_unpacked = self.base_depth > 0 && !inside.contains('/');
+            self.archives.push(Archive {
+                rel: child.to_string(),
+                file: read_from.to_path_buf(),
+                named: self.download
+                    || top_of_unpacked
+                    || names_file(self.recipe, name)
+                    || self
+                        .unpacks
+                        .iter()
+                        .any(|pattern| matches_pattern(pattern, name)),
+            });
         }
-        if !(image || archive) {
-            self.upstream.unread.insert(
-                format!("src/{child}"),
-                digest.map(|digest| digest.to_string()).unwrap_or_default(),
-            );
+        self.note(child, read_from, digest.as_ref());
+        let digest = digest.map(|digest| digest.to_string()).unwrap_or_default();
+        // A download makepkg unpacks is reviewed as what comes out of it.
+        let packaged = name
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| matches!(extension, "deb" | "rpm"));
+        let unpacked_by_makepkg =
+            self.download && !self.not_extracted(name) && (is_archive || packaged);
+        if format.executable() || (carries_code(name) && !unpacked_by_makepkg) {
+            self.upstream
+                .programs
+                .insert(format!("src/{child}"), digest.clone());
+        }
+        if image && !archive {
+            // Whether it is passed over is known once the walk has seen
+            // what stands around it (see `Collected::settle_images`).
+            self.images.push((format!("src/{child}"), digest));
+        } else if !archive {
+            self.upstream.unread.insert(format!("src/{child}"), digest);
         }
         self.upstream.binary_files += 1;
         if format.executable() && self.upstream.executables.len() < 20 {
@@ -1063,14 +1465,16 @@ impl Walk<'_> {
         }
     }
 
-    /// Whether the recipe's `noextract` names `name`, or names something
-    /// through a variable, which could be any download.
+    /// Whether makepkg was told not to unpack the download `name`: the
+    /// listing's `noextract` names it, or the recipe's names it or
+    /// something through a variable, which could be any download.
     fn not_extracted(&self, name: &str) -> bool {
-        self.recipe.split("noextract").skip(1).any(|rest| {
-            rest.split(')')
-                .next()
-                .is_some_and(|list| list.contains(name) || list.contains('$'))
-        })
+        self.noextract.iter().any(|listed| listed == name)
+            || self.recipe.split("noextract").skip(1).any(|rest| {
+                rest.split(')')
+                    .next()
+                    .is_some_and(|list| list.contains(name) || list.contains('$'))
+            })
     }
 
     /// The hash of a large binary, within the limits a scan hashes under.
@@ -1102,7 +1506,14 @@ impl Walk<'_> {
         let file = target.as_ref().is_some_and(|target| target.is_file());
         if file && (inside(Some(&self.src)) || inside(self.roots.srcdest)) {
             if let Some(target) = target.clone() {
-                self.download = depth == 0 && !inside(Some(&self.src));
+                // makepkg links a source under its own name, by its full
+                // path. Any other link at the top (one `prepare()` made to
+                // a file beside the recipe) is a file of the sources, not
+                // a download.
+                let as_makepkg = fs::read_link(path).is_ok_and(|written| {
+                    written.is_absolute() && written.file_name() == Some(OsStr::new(name))
+                });
+                self.download = depth == 0 && !inside(Some(&self.src)) && as_makepkg;
                 self.file(&target, child, name, depth, late);
                 self.download = false;
             }
@@ -1263,7 +1674,7 @@ impl Walk<'_> {
                 Some(text) => {
                     if let Some((line, _)) = git_state::executing_keys(&text).first() {
                         gap(format!(
-                            "its {config} names a command git runs (line {line})"
+                            "its {config} names a command git runs, or another address for git to fetch from (line {line})"
                         ));
                     }
                 }
@@ -1319,7 +1730,7 @@ impl Walk<'_> {
     }
 
     fn walk(&mut self) {
-        let mut pending = vec![(self.src.clone(), String::new(), 0_usize, false)];
+        let mut pending = vec![(self.src.clone(), self.start.clone(), self.base_depth, false)];
         while let Some((directory, rel, depth, late)) = pending.pop() {
             if self.stopped {
                 return;
@@ -1423,15 +1834,517 @@ impl Walk<'_> {
     }
 }
 
-/// Collects upstream code under `src`. A source whose code fits
-/// `FULL_REVIEW_BYTES` is taken whole; otherwise every build-critical file
-/// first (the review is incomplete when they alone exceed `budget`), then
-/// other code, shallowest and outside rarely-run directories first, up to
-/// `budget`.
-pub fn collect_upstream(src: &Path, roots: &Roots<'_>, recipe: &str, budget: u64) -> Upstream {
-    collect_with_cap(src, roots, recipe, budget, MAX_ENTRIES)
+/// Whether `recipe` names the file `name`: by its whole name, or by its
+/// name up to the last extension (`data.tar.` for `data.tar.zst`, as in
+/// `tar xf data.tar.*`).
+fn names_file(recipe: &str, name: &str) -> bool {
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    name.len() >= 4 && (recipe.contains(name) || (stem.len() >= 5 && recipe.contains(stem)))
 }
 
+/// Commands that open an archive they are given.
+const UNPACKERS: &[&str] = &[
+    "bsdtar",
+    "tar",
+    "unzip",
+    "7z",
+    "7za",
+    "7zr",
+    "unrar",
+    "unar",
+    "gunzip",
+    "gzip",
+    "unxz",
+    "xz",
+    "unzstd",
+    "zstd",
+    "bunzip2",
+    "bzip2",
+    "ar",
+    "cpio",
+    "bsdcpio",
+    "dpkg-deb",
+    "rpm2cpio",
+    "rpmextract.sh",
+    "unsquashfs",
+    "jar",
+    "asar",
+];
+
+/// The files a recipe gives to a command that unpacks, by name as written:
+/// `bsdtar -xf data.tar.xz`, `tar xf "$srcdir"/payload-*.tar.gz`. A name
+/// may hold `*` or a variable, which stand for anything.
+pub fn unpack_patterns(recipe: &str) -> Vec<String> {
+    let mut patterns = Vec::new();
+    for line in recipe.lines() {
+        let mut words = line
+            .split(|c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')' | '<'))
+            .map(|word| word.trim_matches(['"', '\'']))
+            .skip_while(|word| !UNPACKERS.contains(&word.rsplit('/').next().unwrap_or_default()));
+        if words.next().is_none() {
+            continue;
+        }
+        // The word after these options is where to unpack to.
+        let mut is_directory = false;
+        for word in words.filter(|word| !word.is_empty()) {
+            if std::mem::take(&mut is_directory) {
+                continue;
+            }
+            if word.starts_with('-') {
+                is_directory = matches!(word, "-C" | "-d" | "--directory" | "-o");
+                continue;
+            }
+            let name = word.replace(['"', '\''], "");
+            let name = name.rsplit('/').next().unwrap_or_default();
+            // An option's letters (`xf`) and makepkg's directories are no
+            // archive.
+            let directory = ["pkgdir", "srcdir", "startdir"]
+                .iter()
+                .any(|known| name.trim_matches(['$', '{', '}']) == *known);
+            if name.contains(['.', '$', '*'])
+                && !directory
+                && !patterns.iter().any(|known| known == name)
+            {
+                patterns.push(name.to_string());
+            }
+        }
+    }
+    patterns
+}
+
+/// Whether the file name `name` is one `pattern` stands for (see
+/// `unpack_patterns`).
+fn matches_pattern(pattern: &str, name: &str) -> bool {
+    // Variables become `*`.
+    let mut plain = String::new();
+    let mut characters = pattern.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '$' {
+            plain.push(if character == '?' { '*' } else { character });
+            continue;
+        }
+        plain.push('*');
+        if characters.next_if_eq(&'{').is_some() {
+            for skipped in characters.by_ref() {
+                if skipped == '}' {
+                    break;
+                }
+            }
+        } else {
+            while characters
+                .next_if(|next| next.is_ascii_alphanumeric() || *next == '_')
+                .is_some()
+            {}
+        }
+    }
+    let parts: Vec<&str> = plain.split('*').collect();
+    let (Some(first), Some(last)) = (parts.first(), parts.last()) else {
+        return false;
+    };
+    if parts.len() == 1 {
+        return name == *first;
+    }
+    if !name.starts_with(first) || !name[first.len()..].ends_with(last) {
+        return false;
+    }
+    let mut rest = &name[first.len()..name.len() - last.len()];
+    parts[1..parts.len() - 1]
+        .iter()
+        .all(|part| match rest.find(part) {
+            Some(at) => {
+                rest = &rest[at + part.len()..];
+                true
+            }
+            None => false,
+        })
+}
+
+/// The files the lines of a recipe file run or read in as code, as (line
+/// number, the line, the file as written without what a variable or `./`
+/// puts before it): `./helper`, `sh "$srcdir/tools/gen.sh"`.
+pub fn recipe_runs(text: &str, variables: &[(String, String)]) -> Vec<(usize, String, String)> {
+    let mut runs = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let written = crate::rules::with_variables(line, variables);
+        for target in crate::rules::run_targets(&written) {
+            let path = named_path(&target);
+            if !path.is_empty() {
+                runs.push((index + 1, line.trim().chars().take(200).collect(), path));
+            }
+        }
+    }
+    runs
+}
+
+/// Whether the file at `path` (under `src/`, or inside an archive under
+/// it) is the one a recipe writes as `target`: the recipe's functions move
+/// between directories of the sources, so any directory may stand before.
+pub fn is_target(path: &str, target: &str) -> bool {
+    let inside = path.rsplit_once("!/").map_or(path, |(_, inside)| inside);
+    [path, inside].iter().any(|path| {
+        path.strip_suffix(target)
+            .is_some_and(|before| before.is_empty() || before.ends_with('/'))
+    })
+}
+
+/// A path as a build file writes it, without what stands before it there:
+/// `./`, `../`, and parts given by a variable (`$(srcdir)/tools/gen.js`).
+fn named_path(word: &str) -> String {
+    word.split('/')
+        .skip_while(|part| matches!(*part, "" | "." | "..") || part.contains(['$', '@']))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The files the build files in `files` name: code by its extension
+/// wherever it stands, and whatever a makefile reads in with `include`.
+fn named_by_build_files(files: &[UpstreamFile]) -> (HashSet<String>, HashSet<String>) {
+    let mut code = HashSet::new();
+    let mut included = HashSet::new();
+    let part = |c: char| c.is_ascii_alphanumeric() || "._/-+$@{}()".contains(c);
+    for file in files.iter().filter(|file| file.critical) {
+        for line in file.text.lines() {
+            let mut words = line.split_whitespace();
+            if words.next().is_some_and(|first| INCLUDES.contains(&first)) {
+                included.extend(words.map(named_path).filter(|path| !path.is_empty()));
+            }
+            for word in line.split(|c: char| !part(c)) {
+                let word = word.trim_matches(['(', ')', '{', '}']);
+                let extension = word
+                    .rsplit_once('.')
+                    .map(|(_, extension)| extension.to_ascii_lowercase());
+                if extension.is_some_and(|extension| NAMED_EXTENSIONS.contains(&extension.as_str()))
+                {
+                    let path = named_path(word);
+                    if !path.is_empty() {
+                        code.insert(path);
+                    }
+                }
+            }
+        }
+    }
+    (code, included)
+}
+
+/// Whether the file at `path` (under `src/`) is one `named` holds: by its
+/// whole path under some directory, as a build file writes it.
+fn is_named(path: &str, named: &HashSet<String>) -> bool {
+    let mut rest = path;
+    // Every tail of the path: `a/b/c.js`, `b/c.js`, `c.js`.
+    loop {
+        if named.contains(rest) {
+            return true;
+        }
+        match rest.split_once('/') {
+            Some((_, tail)) => rest = tail,
+            None => return false,
+        }
+    }
+}
+
+/// What a walk of the sources found, before it is decided what of it is
+/// sent for review: Guardian may still unpack archives into it and mark
+/// what changed since an earlier look.
+pub struct Collected {
+    all: Vec<UpstreamFile>,
+    data: Vec<DataFile>,
+    archives: Vec<Archive>,
+    upstream: Upstream,
+    max_entries: usize,
+    /// Where files are run in the whole source tree, what Guardian
+    /// unpacked included: the scripts every walk came by.
+    surroundings: image::Surroundings,
+    /// The images that are whole by their own bytes, with their hashes:
+    /// kept until every walk is done, since a script beside one may be
+    /// read after it.
+    images: Vec<(String, String)>,
+}
+
+impl Collected {
+    /// Walks `src`, whose paths start with `start`, into what is collected.
+    fn walk(
+        &mut self,
+        src: &Path,
+        start: String,
+        roots: &Roots<'_>,
+        recipe: &str,
+        noextract: &[String],
+    ) {
+        let mut walk = Walk {
+            src: src.to_path_buf(),
+            base_depth: usize::from(!start.is_empty()),
+            start,
+            noextract,
+            unpacks: unpack_patterns(recipe),
+            archives: std::mem::take(&mut self.archives),
+            data: std::mem::take(&mut self.data),
+            roots,
+            recipe,
+            visited: 0,
+            max_entries: self.max_entries,
+            stopped: false,
+            hashed_bytes: 0,
+            download: false,
+            all: std::mem::take(&mut self.all),
+            upstream: std::mem::take(&mut self.upstream),
+            git_dirs: HashSet::new(),
+            surroundings: std::mem::take(&mut self.surroundings),
+            images: std::mem::take(&mut self.images),
+        };
+        if src.is_dir() {
+            walk.walk();
+        }
+        self.surroundings = walk.surroundings;
+        self.images = walk.images;
+        self.all = walk.all;
+        self.data = walk.data;
+        self.archives = walk.archives;
+        self.upstream = walk.upstream;
+    }
+
+    /// The archives Guardian should unpack itself: the ones the recipe
+    /// names, at most one archive deep inside another.
+    pub fn to_unpack(&self) -> Vec<Archive> {
+        self.archives
+            .iter()
+            .filter(|archive| archive.named && archive.rel.matches('!').count() < 2)
+            .take(MAX_UNPACKED_ARCHIVES.saturating_sub(self.upstream.unpacked.len()))
+            .cloned()
+            .collect()
+    }
+
+    /// Takes in what Guardian unpacked of `archive` into `unpacked`: its
+    /// files are reviewed like the rest of `src/`, under the archive's
+    /// path followed by `!`.
+    pub fn add_unpacked(
+        &mut self,
+        archive: &Archive,
+        unpacked: &Path,
+        roots: &Roots<'_>,
+        recipe: &str,
+    ) {
+        self.archives.retain(|known| known.rel != archive.rel);
+        // Its files are named `archive!/...`: a directory of that very
+        // name beside it would have its files taken for the archive's.
+        let inside = format!("src/{}!/", archive.rel);
+        if self
+            .upstream
+            .seen
+            .keys()
+            .any(|path| path.starts_with(&inside))
+        {
+            self.upstream.gaps.push(format!(
+                "src/{}: the recipe opens this archive itself, and a directory beside it has its name followed by `!`, so its files cannot be told apart for review",
+                archive.rel
+            ));
+            return;
+        }
+        let path = format!("src/{}", archive.rel);
+        // Reviewed as what came out of it, not as one program.
+        self.upstream.programs.remove(&path);
+        self.upstream.unpacked.push(path);
+        self.walk(unpacked, format!("{}!", archive.rel), roots, recipe, &[]);
+    }
+
+    /// `archive` could not be unpacked for review: the build opens it, so
+    /// the review is incomplete.
+    pub fn not_unpacked(&mut self, archive: &Archive, why: &str) {
+        self.archives.retain(|known| known.rel != archive.rel);
+        self.upstream.gaps.push(format!(
+            "src/{}: the recipe opens this archive itself, and Guardian could not unpack it for review ({why})",
+            archive.rel
+        ));
+    }
+
+    /// What the walk saw: every file with its hash, and the downloads.
+    pub fn upstream(&self) -> &Upstream {
+        &self.upstream
+    }
+
+    /// Marks the files at `paths` as new or changed since Guardian
+    /// extracted the sources: they are sent for review before other code.
+    pub fn mark_changed(&mut self, paths: &HashSet<String>) {
+        self.upstream.changed.0 = paths.len();
+        for file in &mut self.all {
+            file.changed = paths.contains(&file.path);
+        }
+    }
+
+    /// Code and data a build file names is build-critical however deep it
+    /// lies; data nothing names is not sent.
+    fn settle_named(&mut self) {
+        let (code, included) = named_by_build_files(&self.all);
+        for file in self.all.iter_mut().filter(|file| !file.critical) {
+            let relative = file.path.strip_prefix("src/").unwrap_or(&file.path);
+            file.critical = is_named(relative, &code) || is_named(relative, &included);
+        }
+        for data in std::mem::take(&mut self.data) {
+            let text = is_named(&data.child, &included)
+                .then(|| fs::read(&data.read_from).ok())
+                .flatten()
+                .and_then(
+                    |bytes| match content::classify(&data.child, false, false, &bytes) {
+                        Content::Text(text) | Content::Lossy { text, .. } => Some(text),
+                        _ => None,
+                    },
+                );
+            match text {
+                Some(text) => {
+                    self.upstream.data_files -= 1;
+                    self.all.push(UpstreamFile {
+                        path: format!("src/{}", data.child),
+                        text,
+                        depth: data.depth,
+                        critical: true,
+                        late: data.late,
+                        changed: false,
+                    });
+                }
+                None => self
+                    .upstream
+                    .unreviewed
+                    .push((format!("src/{}", data.child), NOT_REVIEWED_DATA)),
+            }
+        }
+    }
+
+    /// A whole image is passed over only away from where files are run
+    /// (see `image::Surroundings`): one beside a script, or in a directory
+    /// whose files a reviewed line runs, is an unread file like any other,
+    /// so a new or changed one makes the review a full one.
+    fn settle_images(&mut self) {
+        for file in &self.all {
+            self.surroundings.note_text(&file.path, &file.text);
+        }
+        for (path, digest) in std::mem::take(&mut self.images) {
+            if !self.surroundings.leaves_alone(&path) {
+                self.upstream.unread.insert(path, digest);
+            }
+        }
+    }
+
+    /// An archive left packed: the review says that what the build takes
+    /// from it is not reviewed, and it is incomplete when the recipe
+    /// certainly opens it.
+    fn settle_archives(&mut self) {
+        for (index, archive) in std::mem::take(&mut self.archives).into_iter().enumerate() {
+            if archive.named {
+                self.upstream.gaps.push(format!(
+                    "src/{}: the recipe opens this archive itself, and it was not unpacked for review",
+                    archive.rel
+                ));
+            } else if index < MAX_ARCHIVES_NAMED {
+                self.upstream.omitted.push((archive.rel, NOT_UNPACKED));
+            }
+        }
+    }
+
+    /// Decides what is sent. A source whose code fits `FULL_REVIEW_BYTES`
+    /// is taken whole; otherwise every build-critical file first (the
+    /// review is incomplete when they alone exceed `budget`), then what
+    /// changed since Guardian extracted the sources, then other code,
+    /// shallowest and outside rarely-run directories first, up to
+    /// `budget`. What is left out is listed in `unreviewed`.
+    pub fn select(mut self, budget: u64) -> Upstream {
+        self.settle_named();
+        self.settle_archives();
+        self.settle_images();
+        let Self {
+            mut all,
+            mut upstream,
+            ..
+        } = self;
+
+        let total: u64 = all.iter().map(|file| file.text.len() as u64).sum();
+        upstream.text_files = all.len();
+        if total <= FULL_REVIEW_BYTES {
+            all.sort_by(|left, right| left.path.cmp(&right.path));
+            upstream.whole = upstream.omitted.is_empty() && upstream.gaps.is_empty();
+            upstream.changed.1 = all.iter().filter(|file| file.changed).count();
+            upstream.files = all;
+            return upstream;
+        }
+
+        all.sort_by(|left, right| {
+            right
+                .critical
+                .cmp(&left.critical)
+                .then(right.changed.cmp(&left.changed))
+                .then(left.late.cmp(&right.late))
+                .then(left.depth.cmp(&right.depth))
+                .then(left.path.cmp(&right.path))
+        });
+        let critical: u64 = all
+            .iter()
+            .filter(|file| file.critical)
+            .map(|file| file.text.len() as u64)
+            .sum();
+        if critical > budget {
+            upstream.gaps.push(format!(
+                "the build files and scripts ({} KiB) exceed what one review can take ({} KiB)",
+                critical / 1024,
+                budget / 1024
+            ));
+        }
+        let mut used = 0_u64;
+        for file in all {
+            let size = file.text.len() as u64;
+            if !file.critical && used + size > budget {
+                upstream.left_out += 1;
+                upstream.unreviewed.push((file.path, NOT_REVIEWED_BUDGET));
+                continue;
+            }
+            used += size;
+            upstream.changed.1 += usize::from(file.changed);
+            upstream.files.push(file);
+        }
+        upstream
+            .files
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        upstream.whole = false;
+        upstream
+    }
+}
+
+/// Walks the upstream code under `src`. `noextract` holds the downloads the
+/// listing says makepkg does not unpack.
+pub fn walk_upstream(
+    src: &Path,
+    roots: &Roots<'_>,
+    recipe: &str,
+    noextract: &[String],
+) -> Collected {
+    walk_with_cap(src, roots, recipe, noextract, MAX_ENTRIES)
+}
+
+fn walk_with_cap(
+    src: &Path,
+    roots: &Roots<'_>,
+    recipe: &str,
+    noextract: &[String],
+    max_entries: usize,
+) -> Collected {
+    let mut collected = Collected {
+        all: Vec::new(),
+        data: Vec::new(),
+        archives: Vec::new(),
+        upstream: Upstream::default(),
+        max_entries,
+        surroundings: image::Surroundings::default(),
+        images: Vec::new(),
+    };
+    collected.walk(src, String::new(), roots, recipe, noextract);
+    collected
+}
+
+/// Collects upstream code under `src` as it is, unpacking nothing (see
+/// `Collected::select` for what is taken).
+#[cfg(test)]
+pub fn collect_upstream(src: &Path, roots: &Roots<'_>, recipe: &str, budget: u64) -> Upstream {
+    walk_upstream(src, roots, recipe, &[]).select(budget)
+}
+
+#[cfg(test)]
 fn collect_with_cap(
     src: &Path,
     roots: &Roots<'_>,
@@ -1439,75 +2352,8 @@ fn collect_with_cap(
     budget: u64,
     max_entries: usize,
 ) -> Upstream {
-    let mut walk = Walk {
-        src: src.to_path_buf(),
-        roots,
-        recipe,
-        visited: 0,
-        max_entries,
-        stopped: false,
-        hashed_bytes: 0,
-        download: false,
-        archives_named: 0,
-        all: Vec::new(),
-        upstream: Upstream::default(),
-        git_dirs: HashSet::new(),
-    };
-    if src.is_dir() {
-        walk.walk();
-    }
-    let Walk {
-        mut all,
-        mut upstream,
-        ..
-    } = walk;
-
-    let total: u64 = all.iter().map(|file| file.text.len() as u64).sum();
-    upstream.text_files = all.len();
-    if total <= FULL_REVIEW_BYTES {
-        all.sort_by(|left, right| left.path.cmp(&right.path));
-        upstream.whole = upstream.omitted.is_empty() && upstream.gaps.is_empty();
-        upstream.files = all;
-        return upstream;
-    }
-
-    all.sort_by(|left, right| {
-        right
-            .critical
-            .cmp(&left.critical)
-            .then(left.late.cmp(&right.late))
-            .then(left.depth.cmp(&right.depth))
-            .then(left.path.cmp(&right.path))
-    });
-    let critical: u64 = all
-        .iter()
-        .filter(|file| file.critical)
-        .map(|file| file.text.len() as u64)
-        .sum();
-    if critical > budget {
-        upstream.gaps.push(format!(
-            "the build files and scripts ({} KiB) exceed what one review can take ({} KiB)",
-            critical / 1024,
-            budget / 1024
-        ));
-    }
-    let mut used = 0_u64;
-    for file in all {
-        let size = file.text.len() as u64;
-        if !file.critical && used + size > budget {
-            upstream.left_out += 1;
-            continue;
-        }
-        used += size;
-        upstream.files.push(file);
-    }
-    upstream
-        .files
-        .sort_by(|left, right| left.path.cmp(&right.path));
-    upstream.whole = false;
-    upstream
+    walk_with_cap(src, roots, recipe, &[], max_entries).select(budget)
 }
-
 /// What the AI is told about the recipe it reviews in the AUR gate.
 pub const RECIPE_SCOPE: &str = "This is an AUR package recipe: the PKGBUILD, install script, \
 patches and other files from the package's AUR repository. The upstream sources it downloads \
@@ -1538,10 +2384,15 @@ tests, or features that do what the program is for.";
 /// Whether a PKGBUILD defines `check()`, which runs the upstream test suite
 /// during the build.
 pub fn runs_tests(pkgbuild: &str) -> bool {
+    defines_function(pkgbuild, "check")
+}
+
+/// Whether a PKGBUILD defines the function `name`.
+pub fn defines_function(pkgbuild: &str, name: &str) -> bool {
     pkgbuild.lines().any(|line| {
         let line = line.trim_start();
         let line = line.strip_prefix("function ").unwrap_or(line).trim_start();
-        line.strip_prefix("check").is_some_and(|rest| {
+        line.strip_prefix(name).is_some_and(|rest| {
             rest.trim_start().starts_with("()")
                 || rest.starts_with(' ') && rest.trim_start().starts_with('{')
         })
@@ -1555,7 +2406,7 @@ mod tests {
 
     use super::{
         AurInfo, Invocation, Roots, Source, check_sources, classify, collect_upstream,
-        literal_sources, parse_rpc_info, parse_srcinfo, trust_signals,
+        parse_rpc_info, parse_srcinfo, trust_signals,
     };
     use crate::json::Json;
     use crate::test_support::TempDir;
@@ -1573,14 +2424,16 @@ mod tests {
             runs(&["--verifysource", "--skippgpcheck", "-f", "-Cc"]),
             Invocation {
                 runs_functions: true,
-                extracts: false
+                extracts: false,
+                uses_sources: false
             }
         );
         assert_eq!(
             runs(&["--nobuild", "-fC", "--ignorearch"]),
             Invocation {
                 runs_functions: true,
-                extracts: true
+                extracts: true,
+                uses_sources: true
             }
         );
         assert_eq!(
@@ -1591,9 +2444,11 @@ mod tests {
                 "--noprepare",
                 "--holdver"
             ]),
+            // It extracts nothing, and builds from what was extracted.
             Invocation {
                 runs_functions: true,
-                extracts: false
+                extracts: false,
+                uses_sources: true
             }
         );
         assert!(!runs(&["--packagelist"]).runs_functions);
@@ -1603,7 +2458,8 @@ mod tests {
                 runs(&[generate]),
                 Invocation {
                     runs_functions: true,
-                    extracts: false
+                    extracts: false,
+                    uses_sources: false
                 },
                 "{generate}"
             );
@@ -1894,6 +2750,14 @@ pkgname = demo
             ]
         );
         assert_eq!(small.data_files, 1);
+        // What is not sent is named with why, so that a reviewed line
+        // which runs it makes the review incomplete.
+        assert_eq!(
+            small.unreviewed,
+            [("src/demo/index.json".to_string(), super::NOT_REVIEWED_DATA)]
+        );
+        assert_eq!(small.ecosystems, [super::lockfile::Ecosystem::Npm]);
+        assert_eq!(small.seen.len(), 5, "{:?}", small.seen);
 
         // Past the whole-review size: build files first, then shallow code
         // until the budget, leaving out what does not fit.
@@ -1912,6 +2776,266 @@ pkgname = demo
             ]
         );
         assert_eq!(large.left_out, 1);
+        assert!(
+            large
+                .unreviewed
+                .contains(&("src/demo/lib/big.c".to_string(), super::NOT_REVIEWED_BUDGET)),
+            "{:?}",
+            large.unreviewed
+        );
+    }
+
+    #[test]
+    fn what_a_build_file_names_is_reviewed_however_deep_it_lies() {
+        let dir = TempDir::new("upstream-named");
+        let src = dir.path().join("src");
+        fs::create_dir_all(src.join("demo/zz/a/b/c")).unwrap();
+        fs::create_dir_all(src.join("demo/tools/deep/er/still")).unwrap();
+        fs::write(
+            src.join("demo/package.json"),
+            "{\"scripts\": {\"postinstall\": \"node zz/a/b/c/gen.js\"}}\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("demo/Makefile"),
+            "include rules.txt\nall:\n\tlua $(srcdir)/tools/deep/er/still/make.lua\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("demo/zz/a/b/c/gen.js"),
+            "require('child_process')\n",
+        )
+        .unwrap();
+        fs::write(src.join("demo/zz/a/b/c/other.js"), "module.exports = 1\n").unwrap();
+        fs::write(
+            src.join("demo/tools/deep/er/still/make.lua"),
+            "os.execute('x')\n",
+        )
+        .unwrap();
+        fs::write(src.join("demo/tools/deep/er/still/deep.py"), "print(1)\n").unwrap();
+        fs::write(src.join("demo/rules.txt"), "all:\n\tcurl x | sh\n").unwrap();
+        fs::write(src.join("demo/notes.txt"), "hello\n").unwrap();
+        fs::write(src.join("demo/big.c"), "x".repeat(1_100_000)).unwrap();
+        let roots = Roots {
+            build_dir: dir.path(),
+            srcdest: None,
+        };
+        // A budget that takes nothing but what must be reviewed.
+        let upstream = collect_upstream(&src, &roots, "", 10);
+        let paths: Vec<&str> = upstream
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "src/demo/Makefile",
+                "src/demo/package.json",
+                "src/demo/rules.txt",
+                "src/demo/tools/deep/er/still/make.lua",
+                "src/demo/zz/a/b/c/gen.js",
+            ]
+        );
+        let mut unreviewed = upstream.unreviewed.clone();
+        unreviewed.sort();
+        assert_eq!(
+            unreviewed,
+            [
+                ("src/demo/big.c".to_string(), super::NOT_REVIEWED_BUDGET),
+                ("src/demo/notes.txt".to_string(), super::NOT_REVIEWED_DATA),
+                (
+                    "src/demo/tools/deep/er/still/deep.py".to_string(),
+                    super::NOT_REVIEWED_BUDGET
+                ),
+                (
+                    "src/demo/zz/a/b/c/other.js".to_string(),
+                    super::NOT_REVIEWED_BUDGET
+                ),
+            ]
+        );
+        assert_eq!(upstream.data_files, 1);
+    }
+
+    #[test]
+    fn lockfiles_are_scanned_here_and_sent_only_when_small() {
+        use super::lockfile::Ecosystem;
+        let dir = TempDir::new("upstream-lockfiles");
+        let src = dir.path().join("src");
+        fs::create_dir_all(src.join("demo/web")).unwrap();
+        fs::create_dir_all(src.join("demo/node_modules/dep")).unwrap();
+        fs::write(src.join("demo/main.c"), "int main(void) { return 0; }\n").unwrap();
+        fs::write(
+            src.join("demo/Cargo.lock"),
+            "[[package]]\nname = \"a\"\nsource = \"git+https://evil.example/a?rev=1#1\"\n",
+        )
+        .unwrap();
+        let entry = "\"resolved\": \"https://registry.npmjs.org/a/-/a-1.0.0.tgz\",\n";
+        let mut large = entry.repeat(2000);
+        large.push_str("\"resolved\": \"https://cdn.evil.example/b.tgz\",\n");
+        fs::write(src.join("demo/web/package-lock.json"), &large).unwrap();
+        fs::write(src.join("demo/go.sum"), "github.com/a/b v1.0.0 h1:abc=\n").unwrap();
+        // A dependency's own manifest says nothing about this build.
+        fs::write(src.join("demo/node_modules/dep/Gemfile"), "gem 'x'\n").unwrap();
+        let roots = Roots {
+            build_dir: dir.path(),
+            srcdest: None,
+        };
+        let upstream = collect_upstream(&src, &roots, "", 1024 * 1024);
+        let paths: Vec<&str> = upstream
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "src/demo/Cargo.lock",
+                "src/demo/go.sum",
+                "src/demo/main.c",
+                "src/demo/node_modules/dep/Gemfile"
+            ]
+        );
+        assert_eq!(
+            upstream.unreviewed,
+            [(
+                "src/demo/web/package-lock.json".to_string(),
+                super::NOT_REVIEWED_LOCKFILE
+            )]
+        );
+        let found = upstream.lockfiles.join("\n");
+        assert!(
+            found.contains("src/demo/Cargo.lock: cargo lockfile, 1 address(es): 1 address(es) outside its registry (hosts: evil.example); 1 version-control address(es)"),
+            "{found}"
+        );
+        assert!(
+            found.contains("src/demo/web/package-lock.json: npm lockfile, 2001 address(es): 1 address(es) outside its registry (hosts: cdn.evil.example)"),
+            "{found}"
+        );
+        assert!(
+            found.contains(
+                "src/demo/go.sum: go modules lockfile, 0 address(es), all on its registry"
+            )
+        );
+        let mut ecosystems = upstream.ecosystems.clone();
+        ecosystems.sort();
+        assert_eq!(
+            ecosystems,
+            [Ecosystem::Npm, Ecosystem::Cargo, Ecosystem::Go]
+        );
+    }
+
+    #[test]
+    fn a_link_a_build_made_beside_the_sources_is_no_download() {
+        let dir = TempDir::new("upstream-own-link");
+        let build = dir.path();
+        let src = build.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(build.join("demo.conf"), "key = value\n").unwrap();
+        fs::write(build.join("fix.patch"), "--- a\n+++ b\n").unwrap();
+        // As makepkg links a source: by its full path, under its name.
+        std::os::unix::fs::symlink(build.join("fix.patch"), src.join("fix.patch")).unwrap();
+        // As a `prepare()` links a file of the recipe.
+        std::os::unix::fs::symlink("../demo.conf", src.join("demo.conf")).unwrap();
+        std::os::unix::fs::symlink(build.join("demo.conf"), src.join("settings")).unwrap();
+        // With makepkg's defaults the downloads lie beside the recipe.
+        let roots = Roots {
+            build_dir: build,
+            srcdest: Some(build),
+        };
+        let upstream = collect_upstream(&src, &roots, "", 1024 * 1024);
+        assert_eq!(upstream.downloads.keys().collect::<Vec<_>>(), ["fix.patch"]);
+        // All three are files of the sources, seen and reviewed.
+        assert_eq!(upstream.seen.len(), 3, "{:?}", upstream.seen);
+    }
+
+    #[test]
+    fn a_lockfile_too_large_to_read_is_a_gap() {
+        let dir = TempDir::new("upstream-huge-lockfile");
+        let src = dir.path().join("src");
+        fs::create_dir_all(src.join("demo")).unwrap();
+        // Text at its start, and past the scanned size without taking the
+        // space: the rest is a hole.
+        let lock = src.join("demo/package-lock.json");
+        fs::write(&lock, "{\n".repeat(8192)).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_len(super::lockfile::MAX_SCANNED_BYTES + 1)
+            .unwrap();
+        let roots = Roots {
+            build_dir: dir.path(),
+            srcdest: None,
+        };
+        let upstream = collect_upstream(&src, &roots, "", 1024 * 1024);
+        assert!(upstream.lockfiles.is_empty());
+        assert!(
+            upstream
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("src/demo/package-lock.json: a lockfile too large")),
+            "{:?}",
+            upstream.gaps
+        );
+    }
+
+    #[test]
+    fn what_a_recipe_unpacks_and_runs_is_read_from_its_text() {
+        use super::{is_target, matches_pattern, recipe_runs, unpack_patterns};
+        let recipe = "package() {\n  bsdtar -xf data.tar.xz -C \"$pkgdir\"\n  tar xf \"${srcdir}\"/payload-*.tar.gz\n  unzip -q \"$_archive\" -d \"$pkgdir/opt\"\n  ar x \"${pkgname}_${pkgver}_amd64.deb\"\n  install -Dm755 tool \"$pkgdir/usr/bin/tool\"\n}\n";
+        assert_eq!(
+            unpack_patterns(recipe),
+            [
+                "data.tar.xz",
+                "payload-*.tar.gz",
+                "$_archive",
+                "${pkgname}_${pkgver}_amd64.deb"
+            ]
+        );
+        for (pattern, name, matches) in [
+            ("data.tar.xz", "data.tar.xz", true),
+            ("data.tar.xz", "data.tar.gz", false),
+            ("payload-*.tar.gz", "payload-1.2.tar.gz", true),
+            ("payload-*.tar.gz", "other-1.2.tar.gz", false),
+            ("$_archive", "anything.zip", true),
+            ("${pkgname}_${pkgver}_amd64.deb", "demo_1.0_amd64.deb", true),
+            (
+                "${pkgname}_${pkgver}_amd64.deb",
+                "demo_1.0_arm64.deb",
+                false,
+            ),
+            ("a*b*c", "a-b-c", true),
+            ("a*b*c", "a-c", false),
+        ] {
+            assert_eq!(matches_pattern(pattern, name), matches, "{pattern} {name}");
+        }
+
+        let variables = vec![("_tool".to_string(), "helper".to_string())];
+        let runs = recipe_runs(
+            "build() {\n  cd demo\n  ./$_tool --gen\n  sh \"$srcdir/demo/tools/gen.sh\"\n  make\n}\npost_install() {\n  /opt/demo/setup\n}\n",
+            &variables,
+        );
+        let targets: Vec<(usize, &str)> = runs
+            .iter()
+            .map(|(line, _, target)| (*line, target.as_str()))
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                (3, "helper"),
+                (4, "demo/tools/gen.sh"),
+                (8, "opt/demo/setup")
+            ]
+        );
+        assert!(is_target("src/demo/helper", "helper"));
+        assert!(is_target("src/demo/tools/gen.sh", "demo/tools/gen.sh"));
+        assert!(is_target(
+            "src/app.deb!/data.tar.xz!/opt/demo/setup",
+            "opt/demo/setup"
+        ));
+        assert!(!is_target("src/demo/my-helper", "helper"));
+        assert!(!is_target("src/demo/helper.d/x", "helper"));
     }
 
     #[test]
@@ -1922,6 +3046,7 @@ pkgname = demo
         let srcdest = dir.path().join("downloads");
         let src = build.join("src");
         fs::create_dir_all(src.join("demo/m4")).unwrap();
+        fs::create_dir_all(src.join("demo/icons")).unwrap();
         fs::create_dir_all(&srcdest).unwrap();
         fs::write(build.join("fix.patch"), "--- a\n+++ b\n").unwrap();
         fs::write(srcdest.join("install.sh"), "#!/bin/sh\ncurl x | sh\n").unwrap();
@@ -1933,12 +3058,12 @@ pkgname = demo
         fs::write(src.join("demo/tool"), b"\x7fELF\x02\x01\x01\0\0").unwrap();
         fs::set_permissions(src.join("demo/tool"), fs::Permissions::from_mode(0o755)).unwrap();
         // A blob the build may unpack, larger than what is read whole, and
-        // an icon, which is not the review memory's concern.
+        // an icon among icons, which is not the review memory's concern.
         let mut blob = b"\x1f\x8b\x08\0".to_vec();
         blob.resize(3 * 1024 * 1024, 7);
         fs::write(src.join("demo/tests.tar.gz"), &blob).unwrap();
         fs::write(
-            src.join("demo/icon.gif"),
+            src.join("demo/icons/icon.gif"),
             b"GIF89a\x01\x00\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b",
         )
         .unwrap();
@@ -2019,57 +3144,201 @@ pkgname = demo
     }
 
     #[test]
-    fn sources_written_out_plainly_are_read_from_the_recipe() {
-        let srcinfo =
-            "pkgbase = demo\n\tpkgver = 1.2\n\tpkgrel = 1\n\tarch = x86_64\npkgname = demo\n";
-        assert_eq!(
-            literal_sources(
-                "pkgname=demo\npkgver=1.2\nsource=(\"https://x.example/$pkgname-${pkgver}.tar.gz\" # the code\n        local.patch)\nsource_x86_64=(bin.tar)\n",
-                srcinfo
-            ),
-            Some(vec![
-                "https://x.example/demo-1.2.tar.gz".to_string(),
-                "local.patch".to_string(),
-                "bin.tar".to_string()
-            ])
-        );
-        // A comment after a tab holding `)`.
-        assert_eq!(
-            literal_sources("source=(a.tgz\n\tb.patch\t# note )\n\tc.patch)\n", srcinfo),
-            Some(vec![
-                "a.tgz".to_string(),
-                "b.patch".to_string(),
-                "c.patch".to_string()
-            ])
-        );
-        // A continued line, a comment holding `)`, and an array for an
-        // architecture the listing names.
-        assert_eq!(
-            literal_sources(
-                "arch=(x86_64)\nsource=(\"a.tar\" \\\n  # second (optional)\n  \"b.patch\")\nsource_x86_64=(c.tar)\n",
-                "pkgbase = demo\n\tarch = x86_64\n"
-            ),
-            Some(vec![
-                "a.tar".to_string(),
-                "b.patch".to_string(),
-                "c.tar".to_string()
-            ])
-        );
-        for recipe in [
-            "source=(a.tar)\nif true; then\n  source+=(b.patch)\nfi\n",
-            "if true; then\n  source=(b.patch)\nfi\n",
-            "source_i686=(old.tar)\n",
-            "source=(\"a b.tgz\")\n",
-            "source=(\"a\"::https://x.example/a)\n",
-            "source=(\"$pkgver_x\")\n",
-            "source=(\"$_url/x\")\n",
-            "source=(a)\nsource+=(b)\n",
-            "source=(a)\nsource=(b)\n",
-            "source=(`echo x`)\n",
-            "pkgname=x\n",
-        ] {
-            assert_eq!(literal_sources(recipe, srcinfo), None, "{recipe}");
+    fn an_upstream_image_is_passed_over_only_away_from_where_files_run() {
+        use std::os::unix::fs::PermissionsExt;
+        const GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b";
+        let dir = TempDir::new("upstream-images");
+        let build = dir.path().join("build");
+        let src = build.join("src");
+        for directory in ["assets", "scripts", "hooks.d", "parts", "bin", "plugin"] {
+            fs::create_dir_all(src.join("demo").join(directory)).unwrap();
+            fs::write(src.join("demo").join(directory).join("a.gif"), GIF).unwrap();
         }
+        // Sorted after the image beside it: the walk reads the image first.
+        fs::write(src.join("demo/scripts/z.sh"), "echo hi\n").unwrap();
+        fs::write(src.join("demo/plugin/main"), "#!/bin/sh\necho hi\n").unwrap();
+        fs::write(src.join("demo/bin/tool"), b"\x7fELF\x02\x01\x01\0\0").unwrap();
+        fs::set_permissions(src.join("demo/bin/tool"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(
+            src.join("demo/Makefile"),
+            "all:\n\trun-parts ./parts\n\tfor h in hooks.d/*; do . \"$$h\"; done\n",
+        )
+        .unwrap();
+        let roots = Roots {
+            build_dir: &build,
+            srcdest: None,
+        };
+        let upstream = collect_upstream(&src, &roots, "", 1024 * 1024);
+        let digest = crate::sha256::Sha256::digest(GIF).to_string();
+        let unread: Vec<&str> = upstream
+            .unread
+            .iter()
+            .filter(|(_, found)| **found == digest)
+            .map(|(path, _)| path.as_str())
+            .collect();
+        assert_eq!(
+            unread,
+            [
+                "src/demo/bin/a.gif",
+                "src/demo/hooks.d/a.gif",
+                "src/demo/parts/a.gif",
+                "src/demo/plugin/a.gif",
+                "src/demo/scripts/a.gif",
+            ]
+        );
+        // Alone among assets it stays what it was: seen, and not unread.
+        assert!(upstream.seen.contains_key("src/demo/assets/a.gif"));
+        assert!(!upstream.unread.contains_key("src/demo/assets/a.gif"));
+
+        // A script in an archive Guardian unpacked counts for the images
+        // of that archive, whichever walk read them.
+        let unpacked = dir.path().join("unpacked");
+        fs::create_dir_all(unpacked.join("run")).unwrap();
+        fs::write(unpacked.join("run/a.gif"), GIF).unwrap();
+        fs::write(unpacked.join("run/go.py"), "print(1)\n").unwrap();
+        fs::write(unpacked.join("logo.gif"), GIF).unwrap();
+        let mut collected = super::walk_upstream(&src, &roots, "", &[]);
+        let archive = super::Archive {
+            rel: "data.tar".to_string(),
+            file: dir.path().join("data.tar"),
+            named: true,
+        };
+        collected.add_unpacked(&archive, &unpacked, &roots, "");
+        let upstream = collected.select(1024 * 1024);
+        assert!(upstream.unread.contains_key("src/data.tar!/run/a.gif"));
+        assert!(!upstream.unread.contains_key("src/data.tar!/logo.gif"));
+        assert!(!upstream.unread.contains_key("src/demo/assets/a.gif"));
+    }
+
+    #[test]
+    fn a_listing_must_be_shaped_as_makepkg_prints_it() {
+        use super::check_listing;
+        let plain = "pkgbase = demo\n\tpkgver = 1.2\n\tsource = a.tar\n\tsource = \n\npkgname = demo\n\tdepends = x\n\npkgname = demo-doc\n";
+        assert_eq!(check_listing(plain), Ok(()));
+        for (listing, why) in [
+            // What a recipe's top level can write ahead of makepkg's own.
+            ("\tsource = evil\npkgbase = demo\npkgname = demo\n", "start"),
+            ("pkgver = 9\npkgbase = demo\npkgname = demo\n", "start"),
+            ("\npkgbase = demo\npkgname = demo\n", "start"),
+            (
+                "pkgbase = demo\npkgbase = other\npkgname = demo\n",
+                "more than one",
+            ),
+            (
+                "pkgbase = demo\n\tpkgbase = other\npkgname = demo\n",
+                "more than one",
+            ),
+            ("pkgbase = demo\nhello\npkgname = demo\n", "does not print"),
+            (
+                "pkgbase = demo\n\tSource = x\npkgname = demo\n",
+                "does not print",
+            ),
+            (
+                "pkgbase = demo\n\tsource=x\npkgname = demo\n",
+                "does not print",
+            ),
+            (
+                "pkgbase = demo\n\tsource = a\u{1b}[2J\npkgname = demo\n",
+                "control",
+            ),
+            ("pkgbase = demo\n\tsource = a\n", "no package"),
+            ("", "start"),
+        ] {
+            let refused = check_listing(listing).unwrap_err();
+            assert!(refused.contains(why), "{listing:?}: {refused}");
+        }
+    }
+
+    #[test]
+    fn sources_are_read_from_the_package_base_section_only() {
+        let listing = "pkgbase = demo\n\tsource = a.tar\n\tsha256sums = 11\n\npkgname = demo\n\tsource = evil.tar\n\tsha256sums = 22\n";
+        assert_eq!(
+            parse_srcinfo(listing),
+            [Source {
+                entry: "a.tar".into(),
+                checksums: vec!["11".into()]
+            }]
+        );
+    }
+
+    #[test]
+    fn a_recipe_written_out_plainly_must_list_what_it_writes() {
+        use super::recipe::{Sources, sources};
+        use super::written_mismatch;
+        let srcinfo = "pkgbase = demo\n\tpkgver = 1.2\n\tarch = x86_64\n\tnoextract = b.zip\n\tsource = https://x.example/demo-1.2.tar.gz\n\tsource = local.patch\n\tsha256sums = abc\n\tsha256sums = SKIP\n\tsource_x86_64 = bin.tar\n\npkgname = demo\n";
+        let written = |recipe: &str| match sources(recipe) {
+            Sources::Written(arrays) => arrays,
+            other => panic!("{recipe}: {other:?}"),
+        };
+        let recipe = "pkgname=demo\npkgver=1.2\nnoextract=(b.zip)\nsource=(\"https://x.example/$pkgname-${pkgver}.tar.gz\" # the code\n        local.patch)\nsha256sums=('abc' SKIP)\nsource_x86_64=(bin.tar)\nsource_i686=(old.tar)\n";
+        assert_eq!(written_mismatch(&written(recipe), srcinfo), None);
+        // Another source, another order, a checksum of its own, a source
+        // the text does not have, or one it has and the listing lacks.
+        for (from, to, array) in [
+            ("local.patch)", "other.patch)", "source"),
+            ("'abc' SKIP", "SKIP 'abc'", "sha256sums"),
+            ("noextract=(b.zip)\n", "", "noextract"),
+            ("source_x86_64=(bin.tar)\n", "", "source_x86_64"),
+            (
+                "source_x86_64=(bin.tar)\n",
+                "source_x86_64=(bin.tar)\nb2sums=(x)\n",
+                "b2sums",
+            ),
+        ] {
+            assert_eq!(
+                written_mismatch(&written(&recipe.replace(from, to)), srcinfo).as_deref(),
+                Some(array),
+                "{from} -> {to}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_little_voted_package_named_like_a_known_one_is_pointed_out() {
+        use super::{lookalike_search_term, lookalikes, parse_rpc_search, plain_name};
+        assert_eq!(plain_name("zen-browser-patched-bin"), "zen-browser");
+        assert_eq!(plain_name("librewolf-fix-bin"), "librewolf");
+        assert_eq!(plain_name("firefox-patch-bin"), "firefox");
+        assert_eq!(plain_name("yay"), "yay");
+        assert_eq!(plain_name("-bin"), "-bin");
+        assert_eq!(
+            lookalike_search_term("librewolf-fix-bin").as_deref(),
+            Some("librewolf")
+        );
+        assert_eq!(
+            lookalike_search_term("gogle-chrome").as_deref(),
+            Some("gogle-ch")
+        );
+        assert_eq!(lookalike_search_term("yay"), None);
+
+        let official: Vec<String> = ["firefox", "qt5-base", "python"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let reply = Json::parse(
+            r#"{"results":[{"Name":"librewolf-bin","NumVotes":800},{"Name":"librewolf","NumVotes":300},{"Name":"librewolf-extra","NumVotes":2},{"Name":"google-chrome","NumVotes":2300}]}"#,
+        )
+        .unwrap();
+        let searched = parse_rpc_search(&reply);
+        assert_eq!(searched.len(), 4);
+
+        let found = lookalikes("firefox-patch-bin", 0, &official, &searched);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("official package firefox with another ending"));
+        let found = lookalikes("librewolf-fix-bin", 1, &official, &searched);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found[0].contains("AUR package librewolf-bin (800 votes) with another ending"));
+        let found = lookalikes("gogle-chrome", 0, &official, &searched);
+        assert!(found[0].contains("a letter or two from the AUR package google-chrome"));
+        let found = lookalikes("firefoz", 0, &official, &searched);
+        assert!(found[0].contains("a letter or two from the official package firefox"));
+        // A package people voted for, a version of another, and a name of
+        // its own are not look-alikes.
+        assert!(lookalikes("firefox-patch-bin", 40, &official, &searched).is_empty());
+        assert!(lookalikes("qt6-base", 0, &official, &searched).is_empty());
+        assert_eq!(lookalikes("pythom", 0, &official, &searched).len(), 1);
+        assert!(lookalikes("something-else", 0, &official, &searched).is_empty());
+        assert!(lookalikes("librewolf", 0, &official, &[("librewolf".into(), 300)]).is_empty());
     }
 
     #[test]
@@ -2310,5 +3579,89 @@ pkgname = demo
         );
         // They are still all sent: none is dropped.
         assert_eq!(upstream.files.len(), 3);
+    }
+
+    #[test]
+    fn no_listing_makes_its_readers_panic_and_an_accepted_one_is_makepkgs_shape() {
+        use super::{base_section, check_listing, written_mismatch};
+        use crate::test_support::Rng;
+
+        const PIECES: &[&str] = &[
+            "pkgbase = demo\n",
+            "pkgname = demo\n",
+            "\tpkgver = 1\n",
+            "\tsource = a.tar.gz\n",
+            "\tsource_x86_64 = https://example.test/x\n",
+            "\tsha256sums = SKIP\n",
+            "\tsha256sums_x86_64 = abc\n",
+            "\tb2sums = SKIP\n",
+            "\tnoextract = a.tar.gz\n",
+            "\t",
+            " = ",
+            "=",
+            "pkgbase",
+            "pkgname",
+            "source",
+            "_",
+            "\n",
+            "\r",
+            " ",
+            "x",
+            "é",
+            "::",
+            "\u{1b}[2K",
+            "\u{0}",
+            "\u{202e}",
+            "echo hello\n",
+            "\tpkgbase = other\n",
+        ];
+        let listing = "pkgbase = demo\n\tpkgver = 1\n\tsource = a.tar.gz\n\tsource = b::https://example.test/b\n\tsource_x86_64 = c\n\tsha256sums = SKIP\n\tsha256sums = abc\n\tsha256sums_x86_64 = def\n\npkgname = demo\n\tdepends = glibc\n";
+        assert_eq!(check_listing(listing), Ok(()));
+        assert_eq!(parse_srcinfo(listing).len(), 3);
+
+        let check = |text: &str| {
+            let sources = parse_srcinfo(text);
+            // One source for each `source` line of the base section.
+            let listed = base_section(text)
+                .filter(|(key, _)| key.split_once('_').map_or(*key, |(base, _)| base) == "source")
+                .count();
+            assert_eq!(sources.len(), listed, "{text:?}");
+            drop(written_mismatch(
+                &[("source".into(), vec!["a".into()])],
+                text,
+            ));
+            if check_listing(text).is_ok() {
+                let mut lines = text.lines();
+                assert!(
+                    lines
+                        .next()
+                        .is_some_and(|line| line.starts_with("pkgbase = "))
+                );
+                for line in lines.filter(|line| !line.is_empty()) {
+                    assert!(
+                        line.starts_with("pkgname = ") || line.starts_with('\t'),
+                        "{text:?}"
+                    );
+                    assert!(!line.trim_start().starts_with("pkgbase ="), "{text:?}");
+                    assert!(
+                        !line.chars().any(|c| c.is_control() && c != '\t'),
+                        "{text:?}"
+                    );
+                }
+            }
+        };
+        let mut rng = Rng::new(21);
+        let mut accepted = 0;
+        for _ in 0..8_000 {
+            let text = rng.text(PIECES, 12);
+            check(&text);
+            let mutated = rng.mutated(listing, PIECES);
+            accepted += usize::from(check_listing(&mutated).is_ok());
+            check(&mutated);
+            // Anything the recipe printed before makepkg's first line.
+            let before = format!("{}{listing}", rng.pick(PIECES));
+            assert!(check_listing(&before).is_err(), "{before:?}");
+        }
+        assert!(accepted > 20, "{accepted}");
     }
 }
