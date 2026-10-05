@@ -1508,6 +1508,23 @@ impl PayloadFile {
     }
 }
 
+/// The files of `archive` where only the sweep looks, by path, with what
+/// a file there does (see `Review::misplaced`); none for an official
+/// package.
+fn misplaced(archive: &Archive, official: bool) -> Vec<(String, &'static str)> {
+    let mut misplaced: Vec<(String, &'static str)> = archive
+        .entries
+        .iter()
+        .filter(|entry| !official && !matches!(entry.kind, Kind::Directory))
+        .filter_map(|entry| {
+            let location = sweep_only_location(&entry.path)?;
+            Some((entry.path.clone(), sweep_only_effect(location)))
+        })
+        .collect();
+    misplaced.sort();
+    misplaced
+}
+
 /// What the pacman gate reviews in one archive.
 pub struct Review {
     /// The install scriptlet, classified (see `content::classify`).
@@ -1623,27 +1640,21 @@ pub fn review(
     let mut files = payload_files(&sources, &read);
     files.extend(named);
     files.sort_by(|left, right| left.path.cmp(&right.path));
-    let root_set_id = archive
+    // By path, like `files`: the order of an archive's entries is whatever
+    // order it was packed in, and the report should not follow that.
+    let mut root_set_id: Vec<(String, &'static str)> = archive
         .entries
         .iter()
         .filter(|entry| !is_chromium_helper(archive, &entry.path))
         .filter_map(|entry| Some((entry.path.clone(), entry.root_set_id?)))
         .collect();
-    let misplaced = archive
-        .entries
-        .iter()
-        .filter(|entry| !official && !matches!(entry.kind, Kind::Directory))
-        .filter_map(|entry| {
-            let location = sweep_only_location(&entry.path)?;
-            Some((entry.path.clone(), sweep_only_effect(location)))
-        })
-        .collect();
+    root_set_id.sort();
     Ok(Review {
         install,
         files,
         root_set_id,
         unfollowed,
-        misplaced,
+        misplaced: misplaced(archive, official),
         read_as_auto_run: wanted
             .into_iter()
             .filter(|path| !METADATA.contains(&path.as_str()))
@@ -3367,16 +3378,17 @@ mod tests {
         assert_eq!(
             misplaced,
             [
-                ("usr/lib/security/pam_pkg.so", "runs when someone logs in"),
-                (
-                    "usr/lib/glibc-hwcaps/x86-64-v3/libc.so.6",
-                    "applies to every program started"
-                ),
+                // By path, whatever order the archive lists them in.
                 (
                     "etc/hosts",
                     "decides which address a name leads to, without asking DNS"
                 ),
                 ("etc/kernel/cmdline", "runs before the system starts"),
+                (
+                    "usr/lib/glibc-hwcaps/x86-64-v3/libc.so.6",
+                    "applies to every program started"
+                ),
+                ("usr/lib/security/pam_pkg.so", "runs when someone logs in"),
                 (
                     "var/lib/flatpak/overrides/global",
                     "decides what every Flatpak app may reach outside its sandbox"

@@ -1439,7 +1439,7 @@ fn scan_package(
     // What a link already on the system leads to is that link's file: a
     // sudoers drop-in another package linked to this one's `rule` says
     // what this package now puts there.
-    let led: Vec<(&str, &String)> = archive
+    let mut led: Vec<(&str, &String)> = archive
         .paths()
         .filter(|path| !as_itself.contains(*path))
         .filter_map(|path| {
@@ -1450,6 +1450,8 @@ fn scan_package(
             Some((path, link))
         })
         .collect();
+    // By path, not in the order the archive happens to list its entries.
+    led.sort();
     for (path, link) in led {
         let rel = format!("{target}/{archive_name}/{path}");
         report.file_classes.insert(rel.clone(), class);
