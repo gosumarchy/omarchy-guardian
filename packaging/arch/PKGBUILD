@@ -8,7 +8,7 @@
 # and lets every transaction through until it is turned on.
 
 pkgname=omarchy-guardian
-pkgver=0.8.0
+pkgver=0.8.1
 pkgrel=1
 pkgdesc='Reviews downloaded source, AUR builds, pacman scriptlets and Omarchy themes before they run'
 arch=('x86_64' 'aarch64')
