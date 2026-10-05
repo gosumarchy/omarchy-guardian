@@ -25,7 +25,8 @@ gate can be audited in one place. It builds only for Linux.
   `secrets`, and the like) is not sent, by any gate or by the sweep, whatever
   runs it. In a gate the review is then incomplete, not clear. In the sweep
   such a file is read by the local rules, looked through for what it starts,
-  and listed as kept from the AI. The sweep also checks SSH and git files in a
+  and listed as kept from the AI; where something runs it, that is a finding
+  of its own. The sweep also checks SSH and git files in a
   home, package-manager configuration and account files locally only, sends a
   file it found running only where it is plainly a script, and takes plainly
   written secret values and URL passwords out of what it sends. A secret

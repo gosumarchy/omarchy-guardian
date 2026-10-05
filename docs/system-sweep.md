@@ -742,6 +742,17 @@ with no text to send), and being kept makes no sweep incomplete.
   finding comes from what it holds, not from its being there), and so is a
   script under `~/.ssh` that a unit runs, or a `~/.env` a start-up file reads
   in. `/etc/ssh/sshrc` is under no such path and is reviewed like any script.
+
+  Whoever writes a file picks its path, so such a path must not be a way past
+  the review. Where something runs a file kept this way (it is a file of an
+  auto-run location, a command names it, a start-up file reads it in, it is
+  the SSH login script, or a live check found it running as a script), the
+  item raises a finding of its own, `kept-from-review` (medium): the AI did
+  not read it, only the local rules did. It shows in the sweep, in `--diff`
+  and in the daily notification when new or changed, and does not make the
+  sweep incomplete. Read the file yourself; `sweep allow` records that you
+  did, bound to its content. A secret nothing runs (a key or an `.env` that a
+  process was merely handed) raises nothing.
 - **SSH and git files in a home directory**: the files of the table above,
   what one of them is a link to (a `~/.gitconfig` kept in a dotfiles
   directory), and a file an SSH `Include` reads in. What is checked: an SSH
@@ -803,25 +814,30 @@ never run or uploaded.
 Before a file is reviewed, two things are taken out of its text, for the local
 rules and the AI alike:
 
-- the value of an assignment whose name has a part (between `_`) that says
-  secret: `KEY`, `APIKEY`, `TOKEN`, `AUTHTOKEN`, `PAT`, `SECRET`, `PASSWORD`,
-  `PASSWD`, `PASSPHRASE`, `PASS`, `PWD`, `PSK`, `AUTH`, `CREDENTIAL(S)`, as in
-  `OPENAI_API_KEY`. The value must be at least 8 characters and either a plain
-  literal, or a literal between quotes with no `$`, backtick or backslash in
-  it (`'p@ss w0rd!'`). The forms read are shell, `NAME=value` (with or without
-  blanks around the `=`), unit `Environment=` and fish `set`;
-- the password of an address (`https://user:password@…`), the user and host
-  staying.
+- the value of an assignment whose name says secret: a part of it between
+  `_` is `KEY`, `APIKEY`, `TOKEN`, `AUTHTOKEN`, `PAT`, `SECRET`, `PASSWORD`,
+  `PASSWD`, `PASSPHRASE`, `PASS`, `PWD`, `PSK`, `AUTH` or `CREDENTIAL(S)` (as
+  in `OPENAI_API_KEY`), or the name is one word that ends in `PASSWORD`,
+  `PASSWD`, `SECRET`, `TOKEN` or `APIKEY` (`PGPASSWORD`). The value must be a
+  literal of at least 8 plain characters (letters, digits and `_-./+=:@%,`),
+  with or without quotes around it. The forms read are shell, `NAME=value`
+  (with or without blanks around the `=`), unit `Environment=` and fish `set`;
+- the password of an address (`https://user:password@…`), where it is plain
+  characters, the user and host staying.
 
 Start-up files are where exported keys live, and the sweep runs on a timer.
-What could be code stays to be read: a value with `$`, a backtick or a
-backslash in it, anything after the assignment on the same line (`PASS=1 curl
-… | sh` stays whole), and a value that says where something is (a path, a
-URL). Masking can only ever take out such a literal; it cannot hide a command.
+The rule is kept this narrow on purpose: what is taken out is hidden from the
+local rules and the AI alike, so nothing that could be a command may ever be
+taken out. A value with a blank, a `;`, `|`, `&`, `$`, a backtick or any other
+punctuation in it stays to be read, quoted or not (`SECRET='p@ss w0rd!'` goes
+with its file); so does anything after the assignment on the same line
+(`PASS=1 curl … | sh` stays whole), and a value that says where something is
+(a path, a URL).
 
 What still goes with its file: a secret under another name, shorter than 8
-characters, in YAML or JSON `key: value` form, handed over as a command-line
-argument, or a key block (PEM) in a file whose path gives no hint.
+characters, with a blank or punctuation in it, in YAML or JSON `key: value`
+form, handed over as a command-line argument, or a key block (PEM) in a file
+whose path gives no hint.
 
 ### After an upgrade
 
@@ -831,8 +847,10 @@ These show once after an upgrade from Guardian 0.8.1 or earlier:
   path does not mark them as holding secrets; earlier versions kept them back;
 - what your own unpackaged shell scripts start or source is listed, and sent
   for review like any other item, where it was not collected before;
-- a `~/.ssh/rc` is no finding by itself any more, and what it holds is read by
-  the local rules;
+- a `~/.ssh/rc` is read by the local rules for what it holds, and raises
+  `kept-from-review` in place of `ssh-command`: allow it once you have read
+  it. The same shows for any other script under a secret-looking path that
+  something runs;
 - an allowed file that a catalogued link leads to (`~/dotfiles/npmrc`) is
   shown again: it is now read by the rules of the file it stands for, and what
   those find is part of what an allow covers.
@@ -1160,6 +1178,7 @@ reviews as well, are listed under [Local rules](local-rules.md#rule-ids).
 | `network-relay` | medium | A tool that runs or forwards what it is told over the network (netcat, socat, a tunnel) listens or is connected. |
 | `traced-process` | medium | Another process is attached to this one the way a debugger is, and can read and change its memory. |
 | `kernel-tap` | medium | Something no package explains taps the kernel's network or tracing path: a raw packet socket, or a pinned eBPF object. |
+| `kept-from-review` | medium | Something runs this file, and its path marks it as holding secrets, so the AI review did not read it: only the local rules did. Read it yourself; `sweep allow` records that you did. |
 | `network-listener` | low | A program listens on the network that nothing installed accounts for: an interpreter (Python, a shell, Node), or a packaged program no packaged service runs. |
 
 `git-config-command` and `remote-shell` are reported by the sweep as well as
