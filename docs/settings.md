@@ -15,32 +15,36 @@ commands, and the table of decisions and exit codes.
 - [The reviewer under the pacman hook](#the-reviewer-under-the-pacman-hook)
 - [Settings commands](#settings-commands)
 - [Decisions and exit codes](#decisions-and-exit-codes)
-- [Note for upgrades from early versions](#note-for-upgrades-from-early-versions)
+- [Official packages under `standard`](#official-packages-under-standard)
 
 ## Settings app
 
-The settings app (`omarchy-guardian tui`) turns every gate on with *Protect
-everything*, picks the protection level and the model, and tests the reviewer
-with a malicious and a harmless sample.
-
-`omarchy-guardian tui` edits every setting without touching TOML by hand. It
-installs a launcher entry ("Omarchy Guardian") that opens as a floating
-window, and can add itself to the Omarchy menu under Setup › Guardian.
+The settings app (`omarchy-guardian tui`) edits every setting without touching
+TOML by hand, turns every gate on with *Protect everything*, and tests the
+reviewer with a malicious and a harmless sample. The package installs a
+launcher entry ("Omarchy Guardian") that opens the app in a floating window,
+and the app can add itself to the Omarchy menu under Setup › Guardian.
 
 It opens in **simple mode**, where the Guardian (the app's mascot) tells you
 how you are protected. Here you choose a protection level, which sets the
 profile for your own sources and for pacman alike:
 
-| Level    | Profile      | What it does                                              |
-| -------- | ------------ | --------------------------------------------------------- |
-| Balanced | `standard`   | AI review for AUR builds, themes and third-party packages |
-| Maximum  | `strict`     | AI review for everything; any finding blocks              |
-| Private  | `local-only` | no AI: nothing leaves the machine; you confirm installs   |
+| Level | Profile | What it does |
+| --- | --- | --- |
+| Balanced | `standard` | AI review for everything; required for AUR builds, themes, plugins, third-party and local packages, your scans and the sweep. For official packages an unavailable AI or a local-rule finding only warns |
+| Maximum | `strict` | AI review for everything; any finding blocks |
+| Private | `local-only` | no AI: no source is sent to an AI provider; you confirm installs of your own sources (AUR builds, themes, plugins, scans) |
 
-You can also pick the model used for both (Claude Code models are listed and
-suggested when `claude` is installed, otherwise OpenCode's), turn on every
-install gate at once (*Protect everything*), test the reviewer (`t`), or reset
-to the defaults.
+Under `local-only` two lookups still go out: package names and versions from
+lockfiles go to the OSV API (`api.osv.dev`), and an AUR package's name goes to
+the AUR (`aur.archlinux.org`). No file content is sent. An AUR build still
+downloads its sources.
+
+You can also pick the model used for your own sources and for pacman (Claude
+Code's models are listed first, and one is suggested, when `claude` is
+installed; OpenCode's are listed when `opencode` is), turn on every install
+gate at once (*Protect everything*), test the reviewer (`t`), or reset to the
+defaults.
 
 Press `e` for **expert mode** (or start there with `tui --expert`), which has
 every setting:
@@ -62,8 +66,9 @@ one is kept as `config.toml.bak`, since comments are not preserved). The
 system file is saved only after showing a diff, with `sudo`, like `setup`
 does. A file that does not parse cannot be edited in the app; fix it with
 Maintenance › Edit. Before Guardian first edits `~/.bashrc`, the Omarchy menu
-file or the Waybar config and style, it keeps the file as it was beside it, as
-`<name>.guardian-bak`; later edits leave that copy alone. What you turn on or
+file, `~/.config/hypr/hyprland.lua` or the Waybar config and style, it keeps
+the file as it was beside it, as `<name>.guardian-bak`; later edits leave that
+copy alone. What you turn on or
 off here is recorded as your choice, so it raises no "protection changed"
 notification.
 
@@ -120,18 +125,19 @@ catches things breaking and crude tampering (a line removed from `~/.bashrc`),
 not a program running as you that also rewrites the record. A dismissed-blocks
 mark that names a report newer than any saved one is not believed.
 
-In Waybar its tooltip lists the gates, problems and last block; left-click
-opens the settings app and right-click the last report. In Omarchy's shell bar
-it opens a panel with the same details and tiles for the report, turning
-protection on or off, and the settings. `omarchy-guardian protect` adds it to
-whichever bar you run.
+In Waybar the knight's tooltip lists the gates, problems and last block;
+left-click opens the settings app and right-click the last report. In
+Omarchy's shell bar it opens a panel with the same details and tiles for the
+report, turning protection on or off, and the settings. `omarchy-guardian
+protect` adds it to whichever bar you run.
 
 ## Source classes
 
 Every review is tagged with the class of its source. Classes reviewed by the
 pacman hook are *privileged*: Guardian's own settings for them can only be
-loosened by the system file (but see below for what of the reviewer stays in
-the invoking user's hands).
+loosened by the system file (what of the reviewer stays with the invoking user
+is under [The reviewer under the pacman
+hook](#the-reviewer-under-the-pacman-hook)).
 
 | Class | Source | Enforced by | Privileged |
 | --- | --- | --- | --- |
@@ -142,6 +148,7 @@ the invoking user's hands).
 | `theme` | Omarchy theme install/update handler | user | no |
 | `plugin` | Omarchy plugin gate (`omarchy plugin add` / `update`) | user | no |
 | `source` | explicit `scan` / `guard` / `sandbox` (default) | user | no |
+| `system` | what `sweep` finds already running on its own | user | no |
 
 `official_repos` defaults to `core, extra, multilib, core-testing,
 extra-testing, multilib-testing, omarchy` and is settable only in the system
@@ -168,7 +175,8 @@ config error.
 
 `confirm` only applies with `ai = off`, on the user-level classes (the pacman
 hook has no reliable terminal): after clean local checks it asks on `/dev/tty`
-whether to proceed; no terminal or no explicit yes blocks the run.
+whether to proceed; no terminal or no explicit yes blocks the run. Setting it
+for a pacman class is a config error, as for `cache` and `diff`.
 
 ## Settings files
 
@@ -185,7 +193,12 @@ is at least as strict as the value from the profile and system file, and
 for those classes. For the user-level classes, the user file's values apply
 directly, since those commands never reach the privileged pacman gate.
 
-That file is yours, so any program running as you can write it. Two things
+Read from the system file only: `official_repos`, `trusted_reviewer_packages`,
+`[sweep] root` and `group`, `[acknowledged] weaker` and `[permit] strict`. In
+the user file `[sweep]`, `[acknowledged]` and `[permit]` are ignored with a
+warning.
+
+The user file is yours, so any program running as you can write it. Two things
 keep that from quietly switching a gate off:
 
 - A user file that is there and does not parse is not skipped. While it is
@@ -214,13 +227,16 @@ keep that from quietly switching a gate off:
   weakening: it turns the AI review off for your own sources and asks before
   each install.
 
+An example with every kind of setting:
+
 ```toml
 profile = "standard"             # standard | strict | local-only
 
 official_repos = ["core", "extra", "multilib", "omarchy"]   # system file only
 
 [agent]
-model = "anthropic/claude-sonnet-5"   # omit for OpenCode's default
+model = "claude-code/claude-sonnet-5-5"   # the Claude Code CLI; omit for OpenCode's default
+# model = "provider/model"            # a placeholder: any other model goes through OpenCode
 max_input_kib = 256                   # 16..=1024, per AI call
 max_chunks = 8                        # 1..=64 AI calls per review
 cache_days = 30                       # 0..=365; 0 turns the verdict cache off
@@ -230,15 +246,15 @@ max_store_mib = 256                   # 16..=4096, review memory size cap
 high = "high"
 max = "xhigh"
 
-[class.official]
-model = "anthropic/claude-haiku-4-5"
+[class.official]                      # a pacman class: model and thinking from the system file only
+model = "claude-code/claude-haiku-4-5"
 thinking = "low"
 
 [class.aur]
 thinking = "max"
 on_findings = "block"
 ai = "required"
-timeout_secs = 300
+timeout_secs = 300                    # 10..=900
 cache = "on"                          # user-level classes only
 diff = "on"                           # off under the strict profile
 ```
@@ -248,6 +264,9 @@ A thinking level is only sent to OpenCode (as `--variant`) when
 unmapped level uses the provider's default and is shown as, for example, `high
 (provider default)` in `config show` and in reports. `setup` writes the
 mapping for the level its test run passed with, in both files.
+
+Left unset, `timeout_secs` follows the thinking level: 120 s, 180 s at `high`
+and 300 s at `max`.
 
 ## The reviewer under the pacman hook
 
@@ -264,18 +283,18 @@ are listed under [How the reviewer is run](review.md#how-the-reviewer-is-run).
 
 ## Settings commands
 
-- `omarchy-guardian setup` — interactive wizard that detects OpenCode and
+- `omarchy-guardian setup`: an interactive wizard that detects OpenCode and
   Claude Code (suggesting Claude Sonnet when `claude` is installed), lets you
   choose a profile, model(s) and thinking level, runs a two-sample test
   review, then writes the user file and (with confirmation) the root-owned
   system file.
-- `omarchy-guardian config show [--class NAME]` — effective policy per class,
+- `omarchy-guardian config show [--class NAME]`: the effective policy per class,
   each value tagged `profile`, `system` or `user`, plus any ignored user
   values and why.
-- `omarchy-guardian config check` — validates both files and the system file's
+- `omarchy-guardian config check`: validates both files and the system file's
   ownership; exit 0 valid, 2 invalid.
-- `omarchy-guardian config path` — prints both file paths.
-- `omarchy-guardian config acknowledge` — accepts, in the system file and with
+- `omarchy-guardian config path`: prints both file paths.
+- `omarchy-guardian config acknowledge`: accepts, in the system file and with
   `sudo`, the user file's settings that are weaker than the profile.
 
 `scan` and `guard` take `--class NAME` (default `source`; one of the
@@ -292,7 +311,7 @@ plugin handlers pass `--class theme` and `--class plugin`.
 | Decision | Exit | When |
 | --- | --- | --- |
 | `CLEAR` | 0 | nothing found, review complete |
-| `WARNED` | 0 | only findings whose policy is `warn`, or the AI review was unavailable under `ai = optional` |
+| `WARNED` | 0 | only findings whose policy is `warn`, the AI review unavailable under `ai = optional`, or a skipped tool directory |
 | `LIMITED REVIEW` | 0 | nothing reviewable (a scriptlet-free pacman transaction); `guard` and `sandbox`, which start nothing then, exit 2 |
 | `HIGH RISK` / `REVIEW REQUIRED` | 1 | any finding whose policy is `block` |
 | `INCOMPLETE` | 2 | any non-AI gap, or an invalid AI reply (malformed, missing nonce, tool use, `inconclusive`), in every profile |
@@ -300,16 +319,20 @@ plugin handlers pass `--class theme` and `--class plugin`.
 | `NOT CONFIRMED` | 2 | `confirm = true` and the user did not approve; or the makepkg gate asked about prebuilt programs, or about a recipe whose sources it cannot follow, and got no yes (no terminal counts as no) |
 | `PERMITTED` | 0 | one of the blocking decisions above, overruled by your permit for exactly this content (see [After a block](permits.md)) |
 
+When several apply, anything that leaves the review incomplete gives
+`INCOMPLETE`; then comes `AI REVIEW UNAVAILABLE`, then the findings.
+`omarchy-guardian log` and the saved report shorten two names: `LIMITED` and
+`AI UNAVAILABLE`.
+
 Before any of these, a user settings file that does not parse ends `scan`,
 `guard`, `sandbox`, `makepkg-gate` and `sweep` with exit 2 and nothing
 reviewed or run; a broken system file does the same to the pacman gate.
 
-## Note for upgrades from early versions
+## Official packages under `standard`
 
-Upgrading users on the default `standard` profile: official Arch/Omarchy
-packages now `WARN` on local-rule findings and proceed without the AI review
-when it is unavailable, where they used to block. To restore the old
-behaviour, set in the system file:
+Under the default `standard` profile, official Arch/Omarchy packages `WARN` on
+local-rule findings and go ahead without the AI review when it is unavailable.
+To block instead, set in the system file:
 
 ```toml
 [class.official]

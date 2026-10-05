@@ -45,8 +45,8 @@ Known limits, stated in the README and in full under
 [Limitations](docs/limitations.md), are not vulnerabilities by themselves:
 compiled programs are not inspected, a clear result is not a guarantee, and
 a program already running as your user can change files your user owns.
-A report that shows one of these limits is cheaper to close than the
-documentation assumes is still welcome.
+A report showing that one of these limits is easier to exploit, or cheaper
+to close, than the documentation says is still welcome.
 
 ## Supported versions
 
@@ -76,10 +76,11 @@ installed keys it builds nothing.
 
 `./install.sh` has a check of its own: that `HEAD` is the commit of a
 release tag signed by an installed key and that the working tree is exactly
-that commit's tree, file by file, with nothing added. It asks before going
-on when that is not so, and `--yes` does not answer the question. This
-check is part of the checkout it checks. It catches mistakes (the wrong
-commit, a changed file); it is no defence against a checkout that was
+that commit's tree, file by file, with nothing added. With installed keys
+it asks before going on when that is not so, and `--yes` does not answer
+the question; without them (a first install) it says what it found and goes
+on. This check is part of the checkout it checks. It catches mistakes (the
+wrong commit, a changed file); it is no defence against a checkout that was
 tampered with, whose installer could have been changed along with it.
 
 What remains trusted, and is therefore in scope when it can be subverted:

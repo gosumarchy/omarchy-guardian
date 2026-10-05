@@ -1,12 +1,12 @@
 # Commands
 
-What `scan`, `guard`, `sandbox`, `sweep`, `permit` and `log` do, the options
-they share, and the exit codes. The commands that change settings (`setup`,
-`config`) are described under [Settings](settings.md#settings-commands),
-`protect` under [Install](install.md#turning-protection-on), and `status`
+What each command does, the options they share, and the exit codes. The
+commands that change settings (`setup`, `config`) are described under
+[Settings](settings.md#settings-commands), `protect` in full under
+[Install](install.md#turning-protection-on), and what `status` counts as on
 under [The bar and `status`](settings.md#the-bar-and-status).
 
-## Reviewing by hand
+## The commands
 
 ```sh
 omarchy-guardian scan ./downloaded-project
@@ -25,20 +25,24 @@ omarchy-guardian sweep
   read](review.md#what-is-read-and-what-makes-a-review-incomplete)).
   `--exclude NAME` (repeatable) leaves a top-level directory (never a file or
   link of that name) out of both the review and the snapshot.
-- `tui` (or `settings`) opens the settings app: a full-screen terminal UI in
-  Omarchy's style, simple by default, with every setting under `--expert` (see
-  [Settings app](settings.md#settings-app)).
+- `--thorough` on `scan` and `guard` also reviews a top-level `target`,
+  `node_modules` or `.venv` that is otherwise skipped (see [what is
+  read](review.md#what-is-read-and-what-makes-a-review-incomplete)).
+  `--hashes` on `scan`, `guard` and `sandbox` prints the SHA-256 of every file
+  in the reviewed snapshot.
 - `sandbox` reviews, copies the tree (without `.git`) to a private temporary
   directory, proves the copy matches the reviewed snapshot, and runs the
   command in Bubblewrap with the network isolated, no host home directory and
-  a read-only system. It is a behaviour smoke test, not a dynamic malware
-  detector.
+  a read-only system. The run is stopped after 120 s (exit `124`). It is a
+  behaviour smoke test, not a dynamic malware detector.
 - `sweep` checks what already runs on its own on this machine (see [System
   sweep](system-sweep.md)). `--root` also checks what only root can read now,
   `--all` lists trusted items too, `--diff` only what changed since the last
-  sweep, `--json` prints one JSON document. `sweep allow PATH` trusts one item
-  as it is now; `sweep forget PATH` (or `--all`) undoes it. Both ask for the
-  sudo password: the list of allowed items is root's.
+  sweep, `--json` prints one JSON document, `--report` saves the report page
+  and opens it. `sweep allow PATH` trusts one item as it is now; `sweep forget
+  PATH` (or `--all`) undoes it; `sweep allow --migrate` moves what an older
+  Guardian allowed. They ask for the sudo password: the list of allowed items
+  is root's.
 - `--identity ID` or `--unit DIR ID` (repeatable) on `scan`, `guard` and
   `sandbox` name what is reviewed for the review memory (see [Review
   memory](review.md#review-memory)); `omarchy-guardian forget ID` drops that
@@ -50,6 +54,20 @@ omarchy-guardian sweep
   can be permitted, `permit --revoke ID` takes a permit back.
 - `log` shows what Guardian decided, from the system journal (see [What
   Guardian decided](audit-trail.md)): `--since TIME`, `-n N`, `--json`.
+- `ask REPORT-ID` opens your AI agent in a new terminal on a saved report,
+  with every tool switched off (see [The report](permits.md#the-report)). The
+  report is sent to your AI provider.
+- `status` prints the gates, the problems and the last block as one line of
+  JSON, which the bar reads. `--waybar` prints the Waybar module's form,
+  `--dismiss` marks blocks and dropped gates as seen, `--open-report` opens
+  the last report.
+- `protect` turns every gate on and `protect --off` the install gates and the
+  sweep off, showing each step and asking first; `--yes` skips the question.
+- `test` tests the saved reviewer with a malicious and a harmless sample; it
+  exits `1` when a sample fails.
+- `tui` (or `settings`) opens the settings app: a full-screen terminal UI in
+  Omarchy's style, simple by default, with every setting under `--expert` (see
+  [Settings app](settings.md#settings-app)).
 
 ## Exit codes
 

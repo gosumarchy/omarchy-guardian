@@ -22,9 +22,11 @@ cargo test --locked
 
 On a non-Linux workstation, check with `cargo clippy --target
 x86_64-unknown-linux-gnu --all-targets -- -D warnings` (the crate refuses to
-build for other systems). Local hooks run the same checks: `prek install` (see
-`.pre-commit-config.yaml`). CI runs them on an Arch Linux container, with the
-shell scripts' syntax and lint, and the offline gate suite below.
+build for other systems). Local hooks run the format and clippy checks: `prek
+install` (see `.pre-commit-config.yaml`; on a non-Linux workstation the clippy
+hook needs `rustup target add x86_64-unknown-linux-gnu`). CI runs all three on
+an Arch Linux container, with the shell scripts' syntax and lint, and the
+offline gate suite below.
 
 The unit tests include property tests for the hand-written parsers (JSON, the
 TOML subset, the settings file, makepkg's source listing, pacman's mtree
@@ -36,12 +38,13 @@ accepted settings file is written back to the same settings.
 
 ## End-to-end suites
 
-There are four end-to-end suites. All need `cargo build --release` first; none
-installs anything or touches the real home.
+There are four end-to-end suites. All need `cargo build --release` first. None
+installs a package, and each runs with a throwaway home; the two that call the
+AI let the reviewer use its own login and state from your home.
 
 | Suite | Calls the AI | Needs | In CI |
 | --- | --- | --- | --- |
-| `tests/e2e/gates-offline.sh` | no | `bsdtar`, `pacman-conf`, `setsid`; `bwrap`, `makepkg`, `lua`, `git` and `ssh-keygen` for some cases | yes |
+| `tests/e2e/gates-offline.sh` | no | `bsdtar`, `pacman-conf`, `setsid`; `bwrap`, `makepkg`, `lua`, `jq`, `git`, `ssh-keygen`, `tar` and `vercmp` for some cases | yes |
 | `tests/e2e/sweep.sh` | no | `bwrap` 0.9 or newer (overlays), `jq` | no: it needs user namespaces, which a hosted container does not give |
 | `tests/e2e/integration-gates.sh` | yes | `bwrap` 0.9 or newer, `bsdtar`, `pacman`, `git`, `flock`, `curl`, a reviewer | no |
 | `tests/ai-eval/run.sh` | yes, several times per case | `bsdtar`, `makepkg`, `bwrap`, `jq`, a reviewer | no |
@@ -98,11 +101,14 @@ Bubblewrap sandbox with a throwaway `/usr` overlay, mock `makepkg` and
 `omarchy-theme-set`, a simulated pacman parent process and a throwaway `HOME`,
 and reviews with the real reviewer: clean and malicious install scripts,
 recipes, upstream sources and themes, the review memory (cache, upgrade as a
-diff, the chunk limit) and the settings. It needs a working `opencode`, and
-exits `77` when it cannot run or sits where Guardian would refuse it (a
-directory others can write, or a temporary one), because every gate is
+diff, the chunk limit) and the settings. It needs a working reviewer: by
+default `opencode` with a configuration that can complete a review
+(`~/.config/opencode/opencode.json`), or `claude` with a login when
+`GUARDIAN_E2E_MODEL` names a `claude-code/` model. It exits `77` when the
+reviewer is missing, is not configured, or sits where Guardian would refuse it
+(a directory others can write, or a temporary one), because every gate is
 fail-closed on a failed AI review. To review with the Claude Code CLI and your
-Claude login instead, set `GUARDIAN_E2E_MODEL=claude-code/claude-sonnet-5-5`
+Claude login, set `GUARDIAN_E2E_MODEL=claude-code/claude-sonnet-5-5`
 (the pacman checks that need the AI are then skipped, because the pacman gate
 takes its model only from a root-owned system config). Its scratch directory
 must not be under `/tmp`, which the sandbox empties; by default it is under
@@ -146,7 +152,8 @@ cargo build --release
 bash tests/ai-eval/run.sh                 # or a filter: run.sh aur/block
 ```
 
-Each case is reviewed three times (`RUNS=N` changes that) and gets a line with
+Each case is reviewed three times (`RUNS=N` changes that; `JOBS=N`, default 3,
+sets how many reviews run at once) and gets a line with
 its pass rate; the run ends with the rates of the block and the clear cases
 and exits non-zero when any case passed less than every run. Some block cases
 attack the reviewer itself: text addressed to it in a comment or a README

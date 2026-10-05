@@ -1,17 +1,50 @@
 # Omarchy Guardian
 
-Omarchy Guardian inspects downloaded source code before you run or install it
-on Arch Linux / Omarchy. It is an early, heuristic tool: a clear result is not
-a safety guarantee.
+[![CI](https://github.com/gosumarchy/omarchy-guardian/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gosumarchy/omarchy-guardian/actions/workflows/ci.yml)
+
+Omarchy Guardian reviews what pacman packages, AUR builds, and Omarchy themes
+and plugins would run on your machine, before any of it runs, and audits what
+already runs there on its own. It is for Arch Linux and Omarchy. It is an
+early, heuristic tool: a clear result is not a safety guarantee.
 
 It is a single Rust binary with **no third-party crates**. SHA-256, JSON, and
 the small subset of TOML it needs are implemented in the crate so the whole
 gate can be audited in one place. It builds only for Linux.
 
+## What it needs, sends and changes
+
+- **An AI reviewer of your own.** Reviews run through the Claude Code CLI with
+  your Claude login, or through OpenCode with the provider you set up there.
+  Guardian has no service of its own.
+- **Code leaves the machine.** The text under review is sent to that provider:
+  package install scriptlets and auto-run files, AUR recipes and their
+  sources, themes, plugins, what you `scan`, and for the daily sweep the
+  start-up files on this machine that no package vouches for. A file whose
+  name or path marks it as holding keys or tokens (`.env`, `*.pem`, `*.key`,
+  `id_ed25519`, anything under `.ssh` or `secrets`, and the like) is not sent,
+  and the review is then incomplete, not clear. The sweep checks SSH and git
+  files in a home, package-manager configuration and account files locally
+  only, and takes plainly written secret values and URL passwords out of what
+  it sends. A secret anywhere else goes with its file. Package names and
+  versions from lockfiles go to the OSV API (`api.osv.dev`), and an AUR
+  package's name goes to the AUR. The `local-only` level sends nothing to an
+  AI; the OSV and AUR lookups remain.
+- **Each review is one or more AI calls** on your subscription or API account:
+  by default up to 8 calls of up to 256 KiB each. System updates with
+  scriptlets, every AUR build and the daily sweep all make calls. Unchanged
+  sources are answered from a cache, except pacman packages.
+- **`protect` changes your system**, showing each step first: a link in
+  `/etc/pacman.d/hooks/`, yay's saved configuration, a line in `~/.bashrc`,
+  entries in the Omarchy menu file, `~/.config/uwsm/env.d/90-omarchy-guardian`
+  and a line in `~/.config/hypr/hyprland.lua` (from the next login), a bar
+  widget or Waybar module, and the sweep's systemd timers. Edited files are
+  kept beside themselves as `<name>.guardian-bak`. `omarchy-guardian protect
+  --off` undoes the gates; see [Removal](#removal).
+
 ## How protection works
 
 Guardian sits in front of the ways Omarchy installs packages, themes and
-plugins, and reviews that code **before any of it runs**:
+plugins, and reviews what would run on install **before any of it runs**:
 
 ```text
  pacman -S / -U / -Syu ──► pacman hook ─────► install scriptlets + auto-run files
@@ -33,16 +66,18 @@ plugins, and reviews that code **before any of it runs**:
   a clean verdict, which is one reason the local rules always run too and a
   clear result is not a guarantee. See [Review](docs/review.md) and [Local
   rules](docs/local-rules.md).
-- **Pacman packages.** For the exact archives being installed, the install
-  scriptlets and the files that run or grant privileges without you starting
-  them are reviewed, with the package's own text files those name. The rest of
-  the payload is not. See [Pacman gate](docs/pacman-gate.md).
+- **Pacman packages.** For the exact archives being installed, Guardian
+  reviews the install scriptlets, the files that run or grant privileges on
+  their own (hooks, units, sudoers and the like), and the package's text files
+  that those refer to. The rest of the payload is not reviewed. See [Pacman
+  gate](docs/pacman-gate.md).
 - **AUR builds.** The recipe (PKGBUILD) is reviewed before any of it runs. Its
   sources are then listed in a sandbox with no network, fetched without
-  running any code of the package, and reviewed before anything is built.
-  Prebuilt programs, and a recipe whose sources Guardian cannot follow, are
-  not waved through: Guardian says so and asks on the terminal. See [AUR
-  gate](docs/aur-gate.md).
+  running any code of the package, and reviewed before anything is built. The
+  one exception is yay's own download-and-verify call, where the reviewed
+  recipe and its `verify()` run as you. Prebuilt programs, and a recipe whose
+  sources Guardian cannot follow, are not waved through: Guardian says so and
+  asks on the terminal. See [AUR gate](docs/aur-gate.md).
 - **Themes and plugins.** Omarchy theme and plugin installs and updates are
   staged and reviewed, and only the exact reviewed checkout is moved into
   place. See [Themes and plugins](docs/themes-and-plugins.md).
@@ -62,10 +97,10 @@ plugins, and reviews that code **before any of it runs**:
   [System sweep](docs/system-sweep.md).
 - **An audit trail.** Every decision goes into the system journal. See [What
   Guardian decided](docs/audit-trail.md).
-- **In your bar.** The Guardian knight sits in the bar: calm when every gate
+- **A bar widget.** The Guardian knight sits in the bar: calm when every gate
   is on, red-eyed when something needs attention, dim when protection is off.
   See [The bar and `status`](docs/settings.md#the-bar-and-status).
-- **Nothing to babysit.** The settings app (`omarchy-guardian tui`) turns
+- **A settings app.** The settings app (`omarchy-guardian tui`) turns
   every gate on with *Protect everything*, picks the protection level and the
   model, and tests the reviewer with a malicious and a harmless sample. See
   [Settings app](docs/settings.md#settings-app).
@@ -74,14 +109,18 @@ plugins, and reviews that code **before any of it runs**:
 
 - Arch Linux or Omarchy, `x86_64` or `aarch64`. Guardian builds only for
   Linux.
-- A Rust toolchain (`cargo`) to build it; rustup's is fine.
-- An AI reviewer: Claude Code (`claude-code`, the default) or OpenCode
-  (`opencode`) with a working provider. The pacman gate only runs a root-owned
-  one, as those packages install it.
+- `base-devel` and a Rust toolchain, 1.88 or newer (`cargo`), to build it;
+  Arch's `rust` or rustup's `stable` both work.
+- An AI reviewer: Claude Code (`claude-code`, what the installer offers and
+  `setup` suggests; it is in Omarchy's repository, not in Arch's) or OpenCode
+  (`extra/opencode`) with a working provider. With no model set, reviews go
+  through OpenCode and its default model. The pacman gate only runs a
+  root-owned one, as those packages install it.
 - `sudo`, for the steps that need root.
+- `openssh` (`ssh-keygen`) for upgrades: the upgrade check will not run
+  without it, and the installer cannot check a release's signature without it.
 - Optional: `yay` for the AUR gate, `libnotify` for desktop notifications,
-  `gum` for the theme and plugin gates' questions, `openssh` for checking a
-  release's signature.
+  `gum` for the theme and plugin gates' questions.
 
 The package's other dependencies are installed by pacman with it; the list is
 under [Install](docs/install.md#requirements).
@@ -99,7 +138,9 @@ installs it with pacman, makes sure there is an AI reviewer (it offers
 `claude-code`), runs the guided setup on a first install, turns every gate on
 with `omarchy-guardian protect` after showing each step, and tests the
 reviewer with a malicious and a harmless sample. It asks for sudo only for the
-steps that need it, and skips what is already done.
+steps that need it, and skips what is already done. If it has to install the
+reviewer, it stops there: log in once (run `claude`, or set up a provider in
+`opencode`), then run the installer again.
 
 Installing the package alone activates nothing: `omarchy-guardian protect` (or
 *Protect everything* in the settings app) turns the gates on. The steps by
@@ -136,9 +177,9 @@ check: there it is `git pull && ./install.sh`, with the tag checked by hand.
 | `permit [ID]` | lets one blocked install through, for exactly the reviewed content |
 | `log` | shows what Guardian decided, from the system journal |
 | `ask REPORT-ID` | opens your AI agent on a saved report, with every tool switched off |
-| `status` | shows the gates, the problems and the last block, as the bar does |
+| `status` | prints the gates, the problems and the last block as JSON, which the bar reads; `--dismiss` marks them seen, `--open-report` opens the last report |
 | `tui` | opens the settings app (`--expert` for every setting) |
-| `protect [--off]` | turns every gate on, or the install gates and the sweep off |
+| `protect [--off] [--yes]` | turns every gate on, or the install gates and the sweep off |
 | `setup` | guided setup: reviewer, profile, model, and a test review |
 | `config …` | `show`, `check`, `path`, and `acknowledge` for weaker settings |
 | `forget ID`, `forget --all` | drops a source's approved baselines, or the whole review memory |
@@ -147,11 +188,11 @@ check: there it is `git pull && ./install.sh`, with the tag checked by hand.
 Each is run as `omarchy-guardian COMMAND`. The options and the details are
 under [Commands](docs/commands.md) and [Settings](docs/settings.md).
 
-| Exit | Meaning                                                            |
-| ---- | ------------------------------------------------------------------ |
-| `0`  | clear, warned, limited review or permitted                         |
-| `1`  | findings                                                           |
-| `2`  | no verdict: incomplete, AI unavailable, not confirmed, or an error |
+| Exit | Meaning |
+| --- | --- |
+| `0` | clear, warned, limited review or permitted |
+| `1` | findings |
+| `2` | no verdict: incomplete, AI unavailable, not confirmed, or an error |
 
 A limited review is a scriptlet-free pacman transaction. Exit `2` covers an
 incomplete review, an unavailable AI review under `ai = required`, a question
@@ -184,8 +225,8 @@ question you declined), and under the `strict` level permits are off. See
 A clean result only means the static checks, the configured AI provider and
 the available OSV data did not identify a problem in the files reviewed.
 Guardian can miss malicious behaviour and benign code can match a rule. The
-limits, each stated in full on its page and together under
-[Limitations](docs/limitations.md):
+limits are listed here. Each is stated in full on its page, and all of them
+under [Limitations](docs/limitations.md):
 
 - Programs you download and run yourself, and `curl | sh` pasted into a
   terminal, are not intercepted. `omarchy-guardian guard` and `sandbox` cover
@@ -214,9 +255,10 @@ limits, each stated in full on its page and together under
 - AUR builds: prebuilt programs cannot be reviewed by anyone; they are your
   decision, not a review ([AUR
   gate](docs/aur-gate.md#step-5-prebuilt-programs)).
-- AUR builds: nothing stands between the sandboxed listing of the sources and
-  the build except Guardian's reading of the recipe's text, which is not a
-  shell ([AUR gate](docs/aur-gate.md#step-4-upstream-code)).
+- AUR builds: Guardian works out what a recipe will fetch by reading its text,
+  and that reading is not a shell. The real makepkg loads the recipe again
+  outside the sandbox and fetches what it says then ([AUR
+  gate](docs/aur-gate.md#step-4-upstream-code)).
 - AUR builds with the AI review off: the upstream sources are read only by the
   local rules' high checks ([AUR
   gate](docs/aur-gate.md#what-is-not-reviewed)).
@@ -252,7 +294,9 @@ limits, each stated in full on its page and together under
   sweep](docs/system-sweep.md)).
 - Source leaves the machine through the AI provider you configured, except
   under `local-only` and except the files kept from the AI by name or kind; a
-  secret under a name Guardian does not recognise still goes with its file
+  secret under a name Guardian does not recognise still goes with its file.
+  Under `local-only` no source is sent, but lockfile package names and
+  versions still go to the OSV API and an AUR package's name to the AUR
   ([Limitations](docs/limitations.md#the-limits-that-matter-most), [System
   sweep](docs/system-sweep.md#what-goes-to-the-review)).
 - A block's report is passed to your AI agent on its command line, which other
