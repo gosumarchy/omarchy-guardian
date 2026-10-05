@@ -288,10 +288,10 @@ under [Limitations](docs/limitations.md):
   can rewrite, and the pacman gate reviews as the user who called `sudo`, with
   that user's reviewer login
   ([Limitations](docs/limitations.md#the-limits-that-matter-most)).
-- System sweep: the EFI programs, the inside of the initramfs image and other
-  mounted filesystems are not looked at; as a user only your own processes can
-  be looked at; without root checks every sweep is incomplete ([System
-  sweep](docs/system-sweep.md)).
+- System sweep: the EFI programs and the inside of the initramfs image are
+  not looked at, and other mounted filesystems are not searched for setuid
+  files; as a user only your own processes can be looked at; without root
+  checks every sweep is incomplete ([System sweep](docs/system-sweep.md)).
 - Source leaves the machine through the AI provider you configured, except
   under `local-only` and except the files kept from the AI by name or kind; a
   secret under a name Guardian does not recognise still goes with its file.
