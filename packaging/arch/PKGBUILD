@@ -24,7 +24,7 @@ optdepends=('claude-code: the default AI reviewer (models written claude-code/..
             'opencode: the AI reviewer for every other model'
             'gum: the theme and plugin gates ask for a missing URL and for confirmation with it; without it, give the URL and --yes'
             'libnotify: desktop notifications about blocks and about protection that went off'
-            'openssh: ssh-keygen, with which install.sh checks the release tag signature of the next upgrade')
+            'openssh: ssh-keygen, which the upgrade check needs and install.sh uses to verify a release tag signature')
 install=omarchy-guardian.install
 
 _root="$startdir/../.."

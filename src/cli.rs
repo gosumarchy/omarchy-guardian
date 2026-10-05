@@ -44,7 +44,7 @@ Usage:
   omarchy-guardian log [--since TIME] [-n N] [--json]
                                                     (what Guardian decided, from the system journal)
   omarchy-guardian setup
-  omarchy-guardian protect [--off] [--yes]          (turn every gate on, or the install gates off)
+  omarchy-guardian protect [--off] [--yes]          (turn every gate on, or the install gates and the sweep off)
   omarchy-guardian test                             (test the saved reviewer with two samples)
   omarchy-guardian sweep [--all] [--json] [--root] [--diff] [--report] | allow PATH|--migrate | forget PATH|--all
                                                     (check what already runs on its own on this system)
@@ -57,9 +57,10 @@ CLASS: aur, theme, plugin, source (default). PROFILE: standard, strict, local-on
 ID names what is reviewed for the review memory, e.g. aur:yay-bin.
 forget ID drops that source's approved baselines and what the AUR gate
 remembers of it; cached verdicts are kept (forget --all clears them too).
-Exit codes: 0 clear, warned or permitted, 1 findings, 2 incomplete review, AI
-unavailable, not confirmed, or usage error. guard and sandbox replace these
-with the command's own exit code once it starts.";
+Exit codes: 0 clear, warned, limited review or permitted; 1 findings; 2
+incomplete review, AI unavailable, not confirmed, invalid settings file, or
+usage error. guard and sandbox replace these with the command's own exit code
+once it starts.";
 
 const USAGE_ERROR: u8 = 2;
 
