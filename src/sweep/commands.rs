@@ -1194,6 +1194,20 @@ pub fn ssh(line: &str) -> Option<(String, String)> {
         .then_some((key, runs))
 }
 
+/// The files a unit reads into its environment (`EnvironmentFile=`), as
+/// `commands` gives them. systemd reads such a file as `NAME=value` lines
+/// and nothing else: it sets variables, and can run nothing.
+pub fn environment_files(path: &str, text: &str) -> Vec<String> {
+    text.replace("\\\n", " ")
+        .lines()
+        .filter_map(|line| line.trim().split_once('='))
+        .filter(|(key, _)| key.trim() == "EnvironmentFile")
+        .map(|(_, value)| value.trim().trim_start_matches('-'))
+        .filter(|file| !file.is_empty())
+        .map(|file| with_specifiers(path, file))
+        .collect()
+}
+
 /// The files an SSH client or server file reads as more configuration or
 /// as lists of keys and names, as `ssh` gives them: an `Include`, and the
 /// server's key and principal files. They are read, not run: what any

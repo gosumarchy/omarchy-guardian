@@ -149,8 +149,21 @@ pub fn item_named(scope: &Scope<'_>, category: Category, name: &str, path: &str)
     item
 }
 
+/// The note on an item that was reached only as a unit's
+/// `EnvironmentFile=`: a list of variables systemd reads, which nothing
+/// runs.
+const ENVIRONMENT_ONLY: &str =
+    "read by a unit as a list of variables (EnvironmentFile=), run by nothing";
+
+/// Whether `item` was reached only as a unit's `EnvironmentFile=`.
+pub fn is_environment_file(item: &Item) -> bool {
+    item.notes.iter().any(|note| note == ENVIRONMENT_ONLY)
+}
+
+/// Whether `note` says how an item was reached: such a note holds only
+/// while every way the sweep reached the item was that way.
 fn is_configuration_note(note: &str) -> bool {
-    note.starts_with(CONFIGURATION_OF) || note.starts_with(STANDS_FOR)
+    note.starts_with(CONFIGURATION_OF) || note.starts_with(STANDS_FOR) || note == ENVIRONMENT_ONLY
 }
 
 /// What stands for the content of a packaged script whose interpreter line
@@ -326,21 +339,14 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
             .insert(item.path.clone(), collection.items.len());
         collection.items.push(item);
     }
-    let Walk {
-        roots,
-        linked,
-        run,
-        replaced,
-        ..
-    } = walk;
     // The readings a shorter way to a script took the place of.
     let mut index = 0;
     collection.items.retain(|_| {
         index += 1;
-        !replaced.contains(&(index - 1))
+        !walk.replaced.contains(&(index - 1))
     });
     path::mark(scope, &search, &mut collection.items);
-    mark_configuration(&mut collection.items, &roots, &linked, &run);
+    mark_reach(&mut collection.items, &walk);
     for item in &mut collection.items {
         // The package's own directory, and the one for shared data, may
         // hold a drop-in a repository package ships for every unit;
@@ -385,6 +391,10 @@ struct Walk {
     run: HashSet<String>,
     /// How many scripts deep each script that is looked through lies.
     depths: HashMap<String, usize>,
+    /// What a unit reads as a list of variables, and what was reached in
+    /// any other way.
+    environment: HashSet<String>,
+    otherwise: HashSet<String>,
 }
 
 impl Walk {
@@ -407,6 +417,11 @@ impl Walk {
             _ => {
                 self.run.insert(target.clone());
             }
+        }
+        if followed.environment.contains(target) {
+            self.environment.insert(target.clone());
+        } else {
+            self.otherwise.insert(target.clone());
         }
         // A script lies one deeper than the script that starts it. One
         // already read from further down a chain is read again from here:
@@ -460,29 +475,27 @@ fn add_facts(scope: &Scope<'_>, collection: &mut Collection) {
     collection.notes.extend(boot.notes);
 }
 
-/// Puts the notes on the items that were reached as configuration all the
-/// way from a catalogued file (see `CONFIGURATION_OF`): `roots` says of
-/// which file, `linked` which link led to an item, `run` what a command
-/// names.
-fn mark_configuration(
-    items: &mut [Item],
-    roots: &HashMap<String, String>,
-    linked: &HashMap<String, String>,
-    run: &HashSet<String>,
-) {
+/// Puts on each item the notes that say how it was reached: as
+/// configuration all the way from a catalogued file (see
+/// `CONFIGURATION_OF`), through a link, or only as a unit's list of
+/// variables.
+fn mark_reach(items: &mut [Item], walk: &Walk) {
     let reached_by: HashMap<String, Option<String>> = items
         .iter()
         .map(|item| (item.path.clone(), item.run_by.clone()))
         .collect();
     for item in items {
         if item.run_by.is_some()
-            && is_only_configuration(&item.path, &reached_by, roots, run)
-            && let Some(root) = roots.get(&item.path)
+            && is_only_configuration(&item.path, &reached_by, &walk.roots, &walk.run)
+            && let Some(root) = walk.roots.get(&item.path)
         {
             item.notes.push(format!("{CONFIGURATION_OF}{root}"));
-            if let Some(link) = linked.get(&item.path) {
+            if let Some(link) = walk.linked.get(&item.path) {
                 item.notes.push(format!("{STANDS_FOR}{link}"));
             }
+        }
+        if walk.environment.contains(&item.path) && !walk.otherwise.contains(&item.path) {
+            item.notes.push(ENVIRONMENT_ONLY.to_string());
         }
     }
 }
@@ -1454,6 +1467,9 @@ struct Followed {
     configuration: Vec<String>,
     /// Those among them that a shell was handed as its script.
     shell_scripts: Vec<String>,
+    /// Those among them that a unit reads as a list of variables
+    /// (`EnvironmentFile=`) and that it does not run.
+    environment: Vec<String>,
     /// The limits that were reached, each as the rest of a sentence.
     unfollowed: Vec<String>,
 }
@@ -1474,8 +1490,6 @@ fn follow(scope: &Scope<'_>, item: &Item, search: &Search, configuration: bool) 
             unfollowed.push(sentence);
         }
     };
-    // Only a link to a regular file leads anywhere to judge (a masked
-    // unit's `/dev/null` does not).
     let by = Some(item.path.as_str());
     // What is read, not run: where a link leads (the same file under
     // another name), and what an SSH file reads in. Anything a command
@@ -1484,26 +1498,29 @@ fn follow(scope: &Scope<'_>, item: &Item, search: &Search, configuration: bool) 
     let mut started: Vec<String> = Vec::new();
     // What a shell was handed as its script (`sh /x/run`).
     let mut handed: Vec<String> = Vec::new();
-    if let Body::Link(target) = &item.body
-        && let Some(resolved) = read::resolve_where(&item.path, target, &|next| hop(scope, next))
-        && matches!(look_past_link(scope, &resolved), Found::File { .. })
-    {
+    if let Some(resolved) = link_target(scope, item) {
         read_in.push(resolved.clone());
         targets.push(resolved);
     }
     let included = included_by(item, configuration);
+    let variables = variables_of(item);
+    let mut environment: Vec<String> = Vec::new();
     // A file some other line runs under the very same words is run.
     let times = |list: &[String], command: &str| list.iter().filter(|one| *one == command).count();
     let mut record = |command: &str, target: &str| {
-        let reads = times(&included, command);
-        if reads > 0 && reads == times(&item.runs, command) {
+        let only = |list: &[String]| {
+            let reads = times(list, command);
+            reads > 0 && reads == times(&item.runs, command)
+        };
+        if only(&included) {
             read_in.push(target.to_string());
+        } else if only(&variables) {
+            environment.push(target.to_string());
         } else {
             started.push(target.to_string());
         }
     };
-    let home = home_for(scope, item);
-    let home = home.as_str();
+    let home: &str = &home_for(scope, item);
     let view = view(scope, by);
     let list = |directory: &str| listed(scope, view, directory);
     for command in &item.runs {
@@ -1575,13 +1592,29 @@ fn follow(scope: &Scope<'_>, item: &Item, search: &Search, configuration: bool) 
         read_in: &read_in,
         started: &started,
         handed: &handed,
+        environment: &environment,
     };
-    let (targets, configuration, shell_scripts) = settle(scope, view, by, targets, &kinds);
-    Followed {
-        targets,
-        configuration,
-        shell_scripts,
-        unfollowed,
+    let mut followed = settle(scope, view, by, targets, &kinds);
+    followed.unfollowed = unfollowed;
+    followed
+}
+
+/// The regular file the link `item` leads to, if it is a link to one (a
+/// masked unit's `/dev/null` is none).
+fn link_target(scope: &Scope<'_>, item: &Item) -> Option<String> {
+    let Body::Link(target) = &item.body else {
+        return None;
+    };
+    read::resolve_where(&item.path, target, &|next| hop(scope, next))
+        .filter(|resolved| matches!(look_past_link(scope, resolved), Found::File { .. }))
+}
+
+/// What the unit `item` reads as a list of variables and does not run
+/// (`EnvironmentFile=`), by the words that name it.
+fn variables_of(item: &Item) -> Vec<String> {
+    match (&item.body, item.category) {
+        (Body::Text(text), Category::Systemd) => commands::environment_files(&item.path, text),
+        _ => Vec::new(),
     }
 }
 
@@ -1630,6 +1663,8 @@ struct Kinds<'a> {
     started: &'a [String],
     /// Handed to a shell as its script.
     handed: &'a [String],
+    /// Read by a unit as a list of variables.
+    environment: &'a [String],
 }
 
 /// The paths among `targets` that are followed, as the walk reaches them;
@@ -1641,8 +1676,9 @@ fn settle(
     by: Option<&str>,
     targets: Vec<String>,
     kinds: &Kinds<'_>,
-) -> (Vec<String>, Vec<String>, Vec<String>) {
+) -> Followed {
     let mut shell_scripts = Vec::new();
+    let mut environment = Vec::new();
     let under =
         |places: &[&str], target: &str| places.iter().any(|place| target.starts_with(place));
     let mut reached = Vec::new();
@@ -1670,9 +1706,18 @@ fn settle(
         if kinds.handed.contains(&target) {
             shell_scripts.push(path.clone());
         }
+        if kinds.environment.contains(&target) && !kinds.started.contains(&target) {
+            environment.push(path.clone());
+        }
         reached.push(path);
     }
-    (reached, configuration, shell_scripts)
+    Followed {
+        targets: reached,
+        configuration,
+        shell_scripts,
+        environment,
+        unfollowed: Vec::new(),
+    }
 }
 
 /// The home directory of `user`, relative to the root, from `/etc/passwd`.

