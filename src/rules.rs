@@ -411,7 +411,7 @@ impl RuleId {
         ),
         (
             Self::SshCommand,
-            "An SSH file runs a command when someone logs in (command= or environment= on a key, or ~/.ssh/rc).",
+            "An SSH file runs a command or loads a library (a ProxyCommand, a Match exec, a provider library), or a key carries a command= or environment= option.",
         ),
         (
             Self::ModifiedPackageFile,

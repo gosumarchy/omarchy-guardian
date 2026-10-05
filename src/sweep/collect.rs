@@ -272,6 +272,8 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
     let mut roots: HashMap<String, String> = HashMap::new();
     let mut linked: HashMap<String, String> = HashMap::new();
     let mut run: HashSet<String> = HashSet::new();
+    // How many scripts deep each script that is looked through lies.
+    let mut depths: HashMap<String, usize> = HashMap::new();
     while let Some(mut item) = pending.pop() {
         // Configuration itself: a catalogued file, or one reached as more
         // of one and run by nothing so far.
@@ -300,6 +302,7 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
                     read_as(scope, &mut reached, &item.path);
                     linked.insert(target, item.path.clone());
                 }
+                bound_scripts(&item, &mut reached, &mut depths);
                 pending.push(reached);
             }
         }
@@ -386,6 +389,26 @@ fn mark_configuration(
     }
 }
 
+/// Keeps chains of scripts within `MAX_SCRIPT_DEPTH`: `reached`, which
+/// `by` led to, is not looked through for what it starts when it lies
+/// deeper, and says so.
+fn bound_scripts(by: &Item, reached: &mut Item, depths: &mut HashMap<String, usize>) {
+    if !is_read_script(reached) {
+        return;
+    }
+    let depth = depths.get(&by.path).copied().unwrap_or(0) + 1;
+    if depth > MAX_SCRIPT_DEPTH {
+        if !reached.runs.is_empty() {
+            reached.runs.clear();
+            reached.notes.push(format!(
+                "{NOT_ALL_FOLLOWED}a chain of more than {MAX_SCRIPT_DEPTH} scripts"
+            ));
+        }
+    } else {
+        depths.insert(reached.path.clone(), depth);
+    }
+}
+
 /// Whether the item at `path` was reached as configuration all the way
 /// from a catalogued file: nothing runs it, and the same holds for the item
 /// that led to it, up to one the catalogue names.
@@ -409,6 +432,68 @@ fn is_only_configuration(
     false
 }
 
+/// How many scripts deep a chain of scripts is looked through (a unit's
+/// wrapper, what it starts, and what that starts): past it the next
+/// script is reviewed as text, and says that what it runs was not followed.
+const MAX_SCRIPT_DEPTH: usize = 3;
+
+/// Whether the text file at `path` is a shell script that is looked
+/// through for the programs it starts and the files it sources, the way a
+/// shell start-up file is (those are of `Category::Shell`, and always
+/// are): a shell script no repository package vouches for as it is, in a
+/// location whose files run (a unit's wrapper, a cron script, an Omarchy
+/// hook) or reached by following a command. A packaged script that is
+/// intact is not: thousands of them start packaged programs, which tells
+/// nothing. A file of a kind kept as configuration (a tool's settings, an
+/// SSH file) is one only where something led to it, or where it is the
+/// SSH server's login script, which is always read.
+fn is_script_to_read(
+    category: Category,
+    path: &str,
+    run_by: Option<&str>,
+    tier: Tier,
+    text: &str,
+) -> bool {
+    if commands::is_ssh_rc(path) {
+        return true;
+    }
+    let configuration = matches!(
+        category,
+        Category::Ssh | Category::Git | Category::Trust | Category::Toolchain | Category::Editor
+    );
+    category != Category::Shell
+        && matches!(
+            tier,
+            Tier::Unknown | Tier::UserBuilt | Tier::Edited | Tier::Modified
+        )
+        && (run_by.is_some() || !configuration)
+        && commands::is_shell_script(path, text)
+}
+
+/// What the file at `path` is read as for the commands it runs: its own
+/// category, or for a shell script no package vouches for a start-up
+/// file's, whatever kind of location named it.
+fn reader(
+    category: Category,
+    path: &str,
+    run_by: Option<&str>,
+    tier: Tier,
+    body: &Body,
+) -> Category {
+    match body {
+        Body::Text(text) if is_script_to_read(category, path, run_by, tier, text) => {
+            Category::Shell
+        }
+        _ => category,
+    }
+}
+
+/// `is_script_to_read` of an item.
+fn is_read_script(item: &Item) -> bool {
+    matches!(&item.body, Body::Text(text)
+        if is_script_to_read(item.category, &item.path, item.run_by.as_deref(), item.tier, text))
+}
+
 /// Reads `item`, which the link at `link` leads to, as the file that link
 /// stands for: what a file runs and what its settings say is told by its
 /// name (`.npmrc`, `settings.json`), and a dotfile manager keeps the real
@@ -417,7 +502,8 @@ fn read_as(scope: &Scope<'_>, item: &mut Item, link: &str) {
     let Body::Text(text) = &item.body else {
         return;
     };
-    item.runs = commands::commands(item.category, link, text);
+    let reader = reader(item.category, link, None, item.tier, &item.body);
+    item.runs = commands::commands(reader, link, text);
     for alert in settings_alerts(scope, item.category, link, item.tier, &item.body) {
         if !item.alerts.contains(&alert) {
             item.alerts.push(alert);
@@ -930,8 +1016,9 @@ pub fn item_of(
             Body::Unreadable(reason.clone()),
         ),
     };
+    let reader = reader(category, &path, run_by, tier, &body);
     let runs = match &body {
-        Body::Text(text) => commands::commands(category, &path, text),
+        Body::Text(text) => commands::commands(reader, &path, text),
         _ => Vec::new(),
     };
     // An `at` job starts with the whole environment of whoever queued it,
@@ -950,7 +1037,7 @@ pub fn item_of(
     };
     let (body, runs) = handed_back(scope, category, run_by, body, runs);
     let mut notes = notes(scope, category, &path, &body, run_by);
-    notes.extend(limits(scope, category, &path, &body, found));
+    notes.extend(limits(scope, reader, &path, &body, found));
     if is_closed(scope, &path, tier, found) {
         notes.push(CLOSED.to_string());
     }
@@ -1323,7 +1410,7 @@ fn follow(scope: &Scope<'_>, item: &Item, search: &Search, configuration: bool) 
         let shell_line = matches!(
             item.category,
             Category::Cron | Category::Shell | Category::Hyprland
-        );
+        ) || is_read_script(item);
         let lookup = commands::Lookup {
             home,
             search: &search.directories,
@@ -1558,6 +1645,100 @@ mod tests {
         assert_eq!(script.category, Category::Udev);
         assert!(matches!(&script.body, Body::Text(text) if text.contains("curl")));
         assert_eq!(collection.items[4].runs, ["waybar"]);
+    }
+
+    #[test]
+    fn a_script_no_package_vouches_for_is_looked_through_for_what_it_starts() {
+        let dir = TempDir::new("sweep-scripts");
+        let root = dir.path();
+        write(
+            root,
+            "etc/systemd/system/x.service",
+            "[Service]\nExecStart=/home/u/bin/wrapper.sh\nExecStartPre=/usr/bin/packaged.sh\nExecStartPost=/home/u/bin/tool.py\n",
+        );
+        write(
+            root,
+            "home/u/bin/wrapper.sh",
+            "#!/usr/bin/env bash\n. /home/u/lib/env.sh\n/home/u/.cache/stage2 --daemon &\n/home/u/bin/s2\n",
+        );
+        write(root, "home/u/lib/env.sh", "X=1\n");
+        write(root, "home/u/.cache/stage2", "\u{7f}ELF");
+        // A chain of scripts is followed three deep, and no further.
+        for (name, next) in [("s2", "s3"), ("s3", "s4"), ("s4", "s5")] {
+            write(
+                root,
+                &format!("home/u/bin/{name}"),
+                &format!("#!/bin/sh\n/home/u/bin/{next}\n"),
+            );
+        }
+        write(root, "home/u/bin/s5", "#!/bin/sh\ntrue\n");
+        // A packaged script that is intact, and a script of another
+        // interpreter, are not looked through.
+        let packaged = "#!/bin/sh\n/home/u/bin/from-packaged\n";
+        write(root, "usr/bin/packaged.sh", packaged);
+        write(root, "home/u/bin/from-packaged", "x\n");
+        write(
+            root,
+            "home/u/bin/tool.py",
+            "#!/usr/bin/python3\n/home/u/bin/from-python\n",
+        );
+        write(root, "home/u/bin/from-python", "x\n");
+        // A hook the catalogue names itself is a script like any other.
+        write(
+            root,
+            "home/u/.config/omarchy/hooks/theme-set",
+            "#!/bin/bash\n/home/u/bin/from-hook\n",
+        );
+        write(root, "home/u/bin/from-hook", "x\n");
+        let mut index = PackageIndex::with_foreign(HashSet::new());
+        index.add_for_test(
+            "vendor",
+            &format!(
+                "#mtree\n./usr/bin/packaged.sh type=file mode=644 sha256digest={}\n",
+                Sha256::digest(packaged.as_bytes())
+            ),
+            &[],
+        );
+        let scope = Scope {
+            root,
+            home: Some("home/u"),
+            index: &index,
+            origin: Origin::System,
+        };
+        let collection = collect(&scope);
+        let found = |path: &str| collection.items.iter().find(|item| item.path == path);
+        let wrapper = found("home/u/bin/wrapper.sh").unwrap();
+        assert_eq!(
+            wrapper.runs,
+            [
+                "/home/u/lib/env.sh",
+                "/home/u/.cache/stage2",
+                "/home/u/bin/s2"
+            ]
+        );
+        for (reached, by) in [
+            ("home/u/.cache/stage2", "home/u/bin/wrapper.sh"),
+            ("home/u/lib/env.sh", "home/u/bin/wrapper.sh"),
+            ("home/u/bin/s3", "home/u/bin/s2"),
+            ("home/u/bin/s4", "home/u/bin/s3"),
+            (
+                "home/u/bin/from-hook",
+                "home/u/.config/omarchy/hooks/theme-set",
+            ),
+        ] {
+            let item = found(reached).unwrap_or_else(|| panic!("{reached} was not collected"));
+            assert_eq!(item.run_by.as_deref(), Some(by), "{reached}");
+        }
+        // The fourth script of the chain is reviewed as text, says that
+        // what it runs was not followed, and so cannot be allowed.
+        let last = found("home/u/bin/s4").unwrap();
+        assert!(last.runs.is_empty());
+        assert!(super::is_capped(last), "{:?}", last.notes);
+        assert!(found("home/u/bin/s5").is_none());
+        assert_eq!(found("usr/bin/packaged.sh").unwrap().tier, Tier::Vendor);
+        for unreached in ["home/u/bin/from-packaged", "home/u/bin/from-python"] {
+            assert!(found(unreached).is_none(), "{unreached}");
+        }
     }
 
     #[test]

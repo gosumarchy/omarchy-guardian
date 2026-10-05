@@ -165,6 +165,7 @@ extra look at the program it names. The limits:
 | A line of a start-up file looked through for programs | 64 KB |
 | One command line split into its commands (a longer one is taken as a single command) | 64 KB |
 | Links in a chain | 8 |
+| Scripts in a chain, each started by the one before | 3 |
 
 Where one of these limits is reached, the item says so in its notes and
 cannot be allowed, since an allow would vouch for commands nobody followed;
@@ -175,11 +176,25 @@ Never followed: a path under `/dev`, `/proc` or `/sys` (under `/dev/shm` and
 `/run` only a regular file is), and the pattern of a shell `case` branch
 (`/*)`), which is matched, not run.
 
-A script that was reached by following is reviewed as text, but only a shell
-start-up file and what it sources or starts is looked through for the
-programs it starts in turn: what a script named by a unit, a crontab or an
-SSH file goes on to run is not collected by the sweep, and is left to the
-review of that script's text.
+A shell script that no repository package vouches for (tier `unknown`,
+`user-built`, `edited` or `modified`) is looked through like a shell start-up
+file, wherever the sweep found it: a unit's wrapper, a cron script, an Omarchy
+hook, a script another script starts. The programs it starts by a path and the
+files it sources are collected and judged in turn, with the same limits, so a
+service's wrapper in your home that launches a second stage from `~/.cache`
+has that second stage listed. A script counts as a shell script by its first
+line (`sh`, `bash`, `dash`, `zsh` or `ksh`, also through `env`) or, without
+one, by its name (`x.sh`). Chains are followed three scripts deep; the fourth
+is reviewed as text, says that what it runs was not followed, and cannot be
+allowed.
+
+What remains: a packaged script that is intact (or a copy of one) is not
+looked through, since thousands of them start packaged programs; scripts of
+other interpreters (Python, Perl, Node, fish) are reviewed as text only; a
+program named by a bare name or as an argument, not in the place of a command,
+is not picked up; and as root nothing is followed from a script the collector
+reached by following. An allowed script is looked through like any other: what
+it starts is an item of its own.
 
 A file or directory whose name is not valid UTF-8 cannot be checked, and
 shells, udev and pacman read such names all the same: the sweep says so and is
@@ -714,8 +729,11 @@ checked the same way, one with `*` in its last part to the files it matches. A
 name relative to `~/.ssh` is not followed (`~/.ssh/config.d/` is read in any
 case).
 
-`~/.ssh/rc`, a script the server runs at login, is flagged for being there
-(`ssh-command`); like the other SSH files of a home its text is not sent.
+`~/.ssh/rc` and `/etc/ssh/sshrc` are no configuration: the server runs them
+as a shell script at every login. They are read like a shell start-up file, by
+the local rules and the AI (with secret-looking values taken out, as for any
+reviewed text), and looked through for what they start. An `rc` that is there
+is listed; a finding comes only from what it holds.
 
 A program one of these files runs is no such file: the script a `ProxyCommand`
 or git's `sshCommand` names is followed and reviewed like any other program,
@@ -726,29 +744,39 @@ what the link leads to is the script.
 A linked file is treated as the file it stands for. Dotfile managers keep the
 real file under another name (`~/.npmrc` as a link to `~/dotfiles/npmrc`):
 what the link of a catalogued file leads to is read by the rules of the file
-the link stands for (a linked `~/.ssh/rc` or `authorized_keys` by theirs, and
-the keys of a linked key file are listed as for any other) and, where that
-file is kept from the AI (the SSH and git files, the package-manager settings,
-an editor's `settings.json`, fish's saved variables), is kept from it as well.
-That holds wherever the real file is kept: a `~/.gitconfig` that is a link to
-a file on another mount is your home's configuration still. For the keys of
-another account the root checks follow such a link only to a file that
-account could read itself.
+the link stands for (a linked `~/.ssh/rc` is the login script, a linked
+`authorized_keys` a key file whose keys are listed as for any other) and,
+where that file is kept from the AI (the SSH and git files, the
+package-manager settings, an editor's `settings.json`, fish's saved
+variables), is kept from it as well. That holds wherever the real file is
+kept: a `~/.gitconfig` that is a link to a file on another mount is your
+home's configuration still. For the keys of another account the root checks
+follow such a link only to a file that account could read itself.
 
 A file is kept from the review this way only while every way the sweep reached
 it was as configuration. One that a command names as well (a file one line
 includes and another runs), or that a live check finds running, is a program:
 it is reviewed by the local rules and sent to the AI, whatever links to it or
-includes it. A file under `~/.ssh` is withheld from the AI by its path in any
-case; where such a file is a program, the sweep says so and is incomplete.
+includes it.
 
-Two things show once after an upgrade from Guardian 0.8.1 or earlier. The
-first sweep sends the scripts your SSH and git files run, which earlier
-versions kept back (with secret-looking values taken out, as for any reviewed
-text).
-And an allowed file that a catalogued link leads to (`~/dotfiles/npmrc`) is
-shown again: it is now read by the rules of the file it stands for, and what
-those find is part of what an allow covers.
+Elsewhere in Guardian a file is withheld from the AI for what its path looks
+like (anything under `.ssh`, a name with `token` or `secret` in it), and the
+review is incomplete for it. In the sweep that does not hold for code: the
+login script, a file a live check found running, and a script (one with a
+`#!` line) that a command names are sent whatever they are called. A file
+that only looks like one of those stays withheld: every other file under
+`~/.ssh`, and a file a start-up file merely reads in (`source ~/.secrets`),
+which is where exported keys are kept.
+
+These show once after an upgrade from Guardian 0.8.1 or earlier:
+
+- the first sweep sends a `~/.ssh/rc` and the scripts your SSH and git files
+  run, which earlier versions kept back (with secret-looking values taken out,
+  as for any reviewed text);
+- what your own scripts start is listed, where it was not before;
+- an allowed file that a catalogued link leads to (`~/dotfiles/npmrc`) is
+  shown again: it is now read by the rules of the file it stands for, and what
+  those find is part of what an allow covers.
 
 Binaries no package vouches for are named to the AI by format and hash but
 never run or uploaded.
@@ -1068,7 +1096,7 @@ reviews as well, are listed under [Local rules](local-rules.md#rule-ids).
 | `boot-tampering` | high | The running kernel was started with a parameter that turns off a defence or replaces init and that the reviewed boot configuration does not hold, or a kernel image in `/boot` is not the one its package ships. |
 | `rootkit-sign` | high | The kernel's own lists disagree (a process, module or socket that exists is not listed), or a program wears a kernel thread's name: what something hiding itself looks like. |
 | `traced-secrets` | high | A process is attached, the way a debugger is, to a program that holds secrets (a shell, SSH, sudo, a key agent, a browser, a password manager). |
-| `ssh-command` | medium | An SSH file runs a command when someone logs in (`command=` or `environment=` on a key, or `~/.ssh/rc`). |
+| `ssh-command` | medium | An SSH file runs a command or loads a library (a `ProxyCommand`, a `Match exec`, a provider library), or a key carries a `command=` or `environment=` option. |
 | `running-from-temp` | medium | A program runs from a temporary or cache directory, where downloads land. |
 | `keyboard-reader` | medium | A program no package installed reads the keyboard device directly. |
 | `risky-configuration` | medium | A configuration file redirects where programs, packages or web pages come from, or loads code into a program at every start. |

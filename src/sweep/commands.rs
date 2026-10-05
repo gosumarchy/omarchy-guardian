@@ -113,9 +113,51 @@ pub fn default_search(home: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether `path` (relative to the root) is the script the SSH server runs
+/// at every login: `~/.ssh/rc` or `/etc/ssh/sshrc`. It is a shell script,
+/// not configuration, whatever directory it sits in.
+pub fn is_ssh_rc(path: &str) -> bool {
+    path == "etc/ssh/sshrc" || path.ends_with("/.ssh/rc")
+}
+
+/// The shells whose scripts are looked through for what they start.
+const SCRIPT_SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "ksh"];
+
+/// Whether the file at `path` with content `text` is a shell script: its
+/// first line names one of `SCRIPT_SHELLS` (also through `env`), or it has
+/// no such line and its name ends in one of theirs (`x.sh`). A script of
+/// another interpreter (Python, Perl, Node, fish) is not read as one.
+pub fn is_shell_script(path: &str, text: &str) -> bool {
+    let first = text.lines().next().unwrap_or_default();
+    if let Some(line) = first.strip_prefix("#!") {
+        let mut words = line.split_whitespace();
+        let program = words.next().unwrap_or_default();
+        let named = |word: &str| word.rsplit('/').next().unwrap_or(word).to_string();
+        let mut name = named(program);
+        if name == "env" {
+            // `env -S bash -e`: the options of `env` come first.
+            name = words
+                .find(|word| !word.starts_with('-'))
+                .map(named)
+                .unwrap_or_default();
+        }
+        return SCRIPT_SHELLS.contains(&name.as_str());
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    SCRIPT_SHELLS
+        .iter()
+        .any(|shell| read::has_extension(name, shell))
+}
+
 /// The command lines `text` (a file of `category` named `name`) runs.
 pub fn commands(category: Category, path: &str, text: &str) -> Vec<String> {
     let name = path.rsplit('/').next().unwrap_or(path);
+    // The login script of the SSH server is read as the shell script it is.
+    let category = if is_ssh_rc(path) {
+        Category::Shell
+    } else {
+        category
+    };
     // logrotate's files are no crontabs: what their `postrotate` scripts
     // run is reviewed as the text it is.
     if path.starts_with("etc/logrotate") {
