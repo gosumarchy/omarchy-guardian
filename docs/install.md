@@ -132,13 +132,14 @@ is out. It only tells: nothing is downloaded to be run and nothing is
 installed. Upgrading stays your own step, through the upgrade check above.
 
 - **When it asks.** At the end of each scheduled [system
-  sweep](system-sweep.md#on-a-schedule), so once a day and only while the
-  sweep is turned on. `omarchy-guardian update` asks at once, says what is
+  sweep](system-sweep.md#on-a-schedule), also one that could not run, so once
+  a day and only while the sweep is turned on. `omarchy-guardian update` asks at once, says what is
   installed and what is newest, and prints the upgrade command.
 - **What it asks.** One HTTPS request with `curl` to the project's repository
   on GitHub for its list of branches and tags, the request `git` itself makes
-  first. Nothing about your machine goes with it, not even the installed
-  version; GitHub sees your address and that the list was asked for.
+  first. Nothing Guardian knows about your machine goes with it, not even the
+  installed version; GitHub sees what any `curl` request shows: your address,
+  curl's version, and that the list was asked for.
 - **What it does with the answer.** Of every tag only
   `v<number>.<number>.<number>` counts, and the newest is kept as three
   numbers in `update.json` in your state directory

@@ -21,6 +21,8 @@ const NOTIFY_SEND: &str = "/usr/bin/notify-send";
 /// The knight with red eyes, installed by the package; a path, so it shows
 /// whatever the icon theme.
 const ALERT_ICON: &str = "/usr/share/icons/hicolor/scalable/apps/omarchy-guardian-alert.svg";
+/// The knight as it is when nothing is wrong.
+const ICON: &str = "/usr/share/icons/hicolor/scalable/apps/omarchy-guardian.svg";
 /// Omarchy's launcher for the default browser, which opens the report.
 const LAUNCH_BROWSER: &str = "/usr/share/omarchy/bin/omarchy-launch-browser";
 const SETSID: &str = "/usr/bin/setsid";
@@ -96,19 +98,30 @@ pub fn changed(detail: &str) {
 /// Shows "Guardian `version` is available" with how to upgrade (`how`).
 /// Only a pop-up, like `changed`.
 pub fn update(version: &str, how: &str) {
-    popup(
+    // The calm knight: a release is no alarm.
+    let icon = if Path::new(ICON).is_file() {
+        ICON
+    } else {
+        "software-update-available"
+    };
+    popup_with(
         &format!("Guardian {} is available", text::shown(version)),
         &format!("To upgrade, {how}"),
+        icon,
     );
 }
 
 fn popup(title: &str, body: &str) {
+    popup_with(title, body, alert_icon());
+}
+
+fn popup_with(title: &str, body: &str, icon: &str) {
     if !popups() {
         return;
     }
     let env = session_env();
     let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    let args = notify_args(title, body, alert_icon());
+    let args = notify_args(title, body, icon);
     drop(tools::run(
         Path::new(NOTIFY_SEND),
         &args,

@@ -36,6 +36,8 @@ const TAGS_URL: &str =
     "https://github.com/gosumarchy/omarchy-guardian.git/info/refs?service=git-upload-pack";
 const TAG_PREFIX: &[u8] = b" refs/tags/v";
 const RECORD: &str = "update.json";
+/// The record is three short members; anything longer is not one.
+const MAX_RECORD: u64 = 1024;
 const LIMITS: Limits = Limits {
     timeout_secs: 60,
     max_output: 4 * 1024 * 1024,
@@ -83,7 +85,10 @@ fn newest(listing: &[u8]) -> Option<Version> {
                 .windows(TAG_PREFIX.len())
                 .position(|window| window == TAG_PREFIX)?
                 + TAG_PREFIX.len();
-            let name = std::str::from_utf8(&line[start..]).ok()?;
+            // The first line of a listing carries the server's
+            // capabilities after a NUL.
+            let name = line[start..].split(|byte| *byte == 0).next()?;
+            let name = std::str::from_utf8(name).ok()?;
             Version::parse(name.strip_suffix("^{}").unwrap_or(name))
         })
         .max()
@@ -133,8 +138,16 @@ impl Record {
         .to_string()
     }
 
+    /// The record in `directory`, when it is a small plain file: the bar
+    /// reads it every half minute, and must not wait on a pipe put in its
+    /// place or read whatever it was made to point at.
     fn read(directory: &Path) -> Option<Self> {
-        Self::parse(&fs::read_to_string(directory.join(RECORD)).ok()?)
+        let path = directory.join(RECORD);
+        let metadata = fs::symlink_metadata(&path).ok()?;
+        if !metadata.is_file() || metadata.len() > MAX_RECORD {
+            return None;
+        }
+        Self::parse(&fs::read_to_string(path).ok()?)
     }
 }
 
@@ -284,6 +297,11 @@ mod tests {
 0000777777777777777777777777777777777777777777 refs/tags/v9.9.9 refs/tags/v9.9.8\n\
 0000888888888888888888888888888888888888888888 refs/tags/9.9.9\n";
         assert_eq!(newest(listing), Some(version("0.8.1")));
+        // A repository whose first line is a tag: its capabilities follow.
+        assert_eq!(
+            newest(b"00001111111111111111111111111111111111111111 refs/tags/v0.8.1\0multi_ack\n"),
+            Some(version("0.8.1"))
+        );
         assert_eq!(newest(b""), None);
         assert_eq!(newest(b"<html>not found</html>"), None);
     }
@@ -354,6 +372,20 @@ mod tests {
         save("0.8.1");
         assert_eq!(newer_in(dir.path(), installed), None);
         std::fs::write(dir.path().join(super::RECORD), "0.9.0").unwrap();
+        assert_eq!(newer_in(dir.path(), installed), None);
+        // Not a plain file, or far too long for a record: not read.
+        save("0.8.3");
+        let record = dir.path().join(super::RECORD);
+        let moved = dir.path().join("elsewhere");
+        std::fs::rename(&record, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &record).unwrap();
+        assert_eq!(newer_in(dir.path(), installed), None);
+        std::fs::remove_file(&record).unwrap();
+        let padded = format!(
+            "{{\"latest\":\"0.8.3\",\"checked\":1,\"pad\":\"{}\"}}",
+            "x".repeat(2000)
+        );
+        std::fs::write(&record, padded).unwrap();
         assert_eq!(newer_in(dir.path(), installed), None);
     }
 }

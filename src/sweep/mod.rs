@@ -678,7 +678,7 @@ fn is_news(previous: Option<&LastRun>, run: &LastRun) -> bool {
 }
 
 /// A sweep that could not even collect.
-fn could_not_run(options: Options, message: &str) -> ExitCode {
+fn could_not_run(options: Options, settings: &Settings, message: &str) -> ExitCode {
     errln!("omarchy-guardian sweep: {message}");
     // The timer counts exit 2 as an incomplete sweep, not a failure, so a
     // sweep that could not run at all says so itself: when that starts, not
@@ -690,6 +690,8 @@ fn could_not_run(options: Options, message: &str) -> ExitCode {
             notify::found("that its daily system sweep could not run", message);
         }
     }
+    // A sweep that cannot run may be what a newer release repairs.
+    crate::update::after_sweep(options.scheduled, settings);
     ExitCode::from(2)
 }
 
@@ -893,7 +895,7 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
     }
     let (mut collection, index, mut notes) = match collect_here(home.as_deref()) {
         Ok(found) => found,
-        Err(message) => return could_not_run(options, &message),
+        Err(message) => return could_not_run(options, settings, &message),
     };
     let with_root = add_root_part(&mut collection, options, settings, &mut notes);
     let directory = state_directory()
