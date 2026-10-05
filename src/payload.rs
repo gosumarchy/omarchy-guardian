@@ -290,17 +290,17 @@ fn protected_violation(
     };
     (!allowed).then(|| {
         format!(
-            "{package} ships /{path}, which only {} may provide: it could disarm Guardian",
+            "{package} ships /{path}, which {} may provide: it could disarm Guardian",
             match owner {
                 Owner::Nobody => "no package".to_string(),
                 Owner::Guardian =>
-                    "the omarchy-guardian package, installed from a local archive or an official repository"
+                    "only the omarchy-guardian package, installed from a local archive or an official repository,"
                         .to_string(),
                 Owner::Packages(packages) => format!(
-                    "{} from an official repository (or a package named in [pacman] trusted_reviewer_packages)",
+                    "only {} from an official repository (or a package named in [pacman] trusted_reviewer_packages)",
                     packages.join(" or ")
                 ),
-                Owner::Official => "a package from an official repository".to_string(),
+                Owner::Official => "only a package from an official repository".to_string(),
             },
             path = protected.trim_end_matches('/')
         )
