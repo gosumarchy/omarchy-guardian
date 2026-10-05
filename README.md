@@ -2858,3 +2858,7 @@ under, and `pkgver`-`pkgrel` in the tagged `packaging/arch/PKGBUILD` is not
 lower than the previous release's. The export is made with `git archive`,
 so a path marked `export-ignore` in the tagged `.gitattributes` would be
 missing from the build.
+
+## Licence
+
+MIT; see [LICENSE](LICENSE).

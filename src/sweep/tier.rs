@@ -344,6 +344,7 @@ const GUARDIANS_OWN: &[&str] = &[
     "usr/share/libalpm/hooks/omarchy-guardian.hook",
     "usr/share/omarchy-guardian/",
     "usr/share/doc/omarchy-guardian/",
+    "usr/share/licenses/omarchy-guardian/",
     "usr/lib/systemd/user/omarchy-guardian-sweep.service",
     "usr/lib/systemd/user/omarchy-guardian-sweep.timer",
     "usr/lib/systemd/system/omarchy-guardian-sweep-collect.service",

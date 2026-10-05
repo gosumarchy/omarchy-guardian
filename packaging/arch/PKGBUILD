@@ -13,7 +13,7 @@ pkgrel=1
 pkgdesc='Reviews downloaded source, AUR builds, pacman scriptlets and Omarchy themes before they run'
 arch=('x86_64' 'aarch64')
 url='https://github.com/gosumarchy/omarchy-guardian'
-license=('unknown')
+license=('MIT')
 # jq: the plugin gate (guardian-plugin) reads plugin manifests with it and
 # stops without it.
 depends=('bubblewrap' 'coreutils' 'curl' 'git' 'glibc' 'jq' 'libarchive' 'pacman' 'util-linux')
@@ -98,6 +98,7 @@ package() {
         install -Dm644 "integrations/systemd/$unit" "$pkgdir/usr/lib/systemd/system/$unit"
     done
     install -Dm644 README.md "$pkgdir/usr/share/doc/omarchy-guardian/README.md"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/omarchy-guardian/LICENSE"
     for wrapper in omarchy omarchy-theme-install omarchy-theme-update omarchy-plugin-add omarchy-plugin-update; do
         install -Dm755 "integrations/omarchy/bin/$wrapper" "$lib/bin/$wrapper"
     done

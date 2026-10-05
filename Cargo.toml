@@ -4,6 +4,7 @@ version = "0.7.18"
 edition = "2024"
 rust-version = "1.88"
 description = "Reviews downloaded source, AUR builds, pacman scriptlets and Omarchy themes before they run"
+license = "MIT"
 publish = false
 
 # Deliberately empty: Guardian is a security gate, so every line of parsing and
