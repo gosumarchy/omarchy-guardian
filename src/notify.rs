@@ -84,19 +84,31 @@ pub fn found(what: &str, detail: &str) {
 /// is not, or a setting became weaker. Only a pop-up: there is no review
 /// to save a report of.
 pub fn changed(detail: &str) {
-    if !popups() {
-        return;
-    }
-    let env = session_env();
-    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    let args = notify_args(
+    popup(
         "Guardian protection changed",
         &format!(
             "{}\nOpen Guardian's settings to see why.",
             text::shown(detail)
         ),
-        alert_icon(),
     );
+}
+
+/// Shows "Guardian `version` is available" with how to upgrade (`how`).
+/// Only a pop-up, like `changed`.
+pub fn update(version: &str, how: &str) {
+    popup(
+        &format!("Guardian {} is available", text::shown(version)),
+        &format!("To upgrade, {how}"),
+    );
+}
+
+fn popup(title: &str, body: &str) {
+    if !popups() {
+        return;
+    }
+    let env = session_env();
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let args = notify_args(title, body, alert_icon());
     drop(tools::run(
         Path::new(NOTIFY_SEND),
         &args,

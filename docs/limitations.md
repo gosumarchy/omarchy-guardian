@@ -74,10 +74,13 @@ matter most:
   sweep](system-sweep.md#what-is-taken-out-of-a-file-that-is-sent)). Under
   `local-only` no source is sent to an AI, but lockfile package names and
   versions still go to the OSV API (`api.osv.dev`), and an AUR package's name
-  (and the names in its PKGBUILD's `pkgname=` lines) to the AUR.
+  (and the names in its PKGBUILD's `pkgname=` lines) to the AUR. The daily
+  check for a newer release asks GitHub for the project's tags under every
+  level, until it is turned off ([Hearing of a new
+  release](install.md#hearing-of-a-new-release)).
 - **Releases:** a first install cannot check the release signature (there is
   no installed key yet), and someone who controls where you pull from can
-  withhold a newer release, though not forge one; see [Verifying a
+  withhold a newer release, or the notice of one, though not forge one; see [Verifying a
   release](install.md#verifying-a-release) and [what the upgrade check relies
   on](install.md#what-the-upgrade-check-relies-on).
 

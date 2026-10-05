@@ -981,6 +981,7 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
         &changes,
     );
     crate::gatewatch::after_sweep(options.scheduled, settings);
+    crate::update::after_sweep(options.scheduled, settings);
     decision.exit_code()
 }
 

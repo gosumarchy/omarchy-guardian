@@ -31,6 +31,7 @@ Panel {
   readonly property var gates: status ? status.gates : []
   readonly property var issues: status ? status.issues : []
   readonly property var block: status ? status.last_block : null
+  readonly property var update: status && status.update ? status.update : null
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -212,6 +213,23 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
             }
+          }
+        }
+
+        Column {
+          width: parent.width
+          spacing: Style.space(8)
+          visible: root.update !== null
+          PanelSeparator { width: parent.width; foreground: root.foreground }
+          PanelSectionHeader { width: parent.width; text: "UPDATE"; foreground: root.foreground; fontFamily: root.fontFamily }
+          Text {
+            textFormat: Text.PlainText
+            width: column.width
+            text: root.update ? "Guardian " + root.update.version + " is available. To upgrade, " + root.update.how : ""
+            color: root.foreground
+            wrapMode: Text.WordWrap
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
           }
         }
 

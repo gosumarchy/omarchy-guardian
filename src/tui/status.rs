@@ -68,6 +68,8 @@ struct Status {
     gates: Vec<Gate>,
     issues: Vec<String>,
     block: Option<LastBlock>,
+    /// A release newer than the one installed, as the last check found.
+    update: Option<String>,
 }
 
 fn collect() -> Status {
@@ -163,6 +165,7 @@ fn collect() -> Status {
         gates,
         issues,
         block,
+        update: crate::update::available(&settings),
     }
 }
 
@@ -527,6 +530,15 @@ pub fn json() -> String {
             Json::Array(status.issues.into_iter().map(Json::from).collect()),
         ),
         (
+            "update",
+            status.update.map_or(Json::Null, |version| {
+                Json::object([
+                    ("version", Json::from(version)),
+                    ("how", Json::from(crate::update::HOW)),
+                ])
+            }),
+        ),
+        (
             "last_block",
             status.block.map_or(Json::Null, |block| {
                 Json::object([
@@ -610,6 +622,14 @@ pub fn waybar() -> String {
             "\n\n<b>Last block</b> · {}\n{}",
             age(block.age_secs),
             markup_safe(&block.title)
+        );
+    }
+    if let Some(version) = &status.update {
+        let _ = write!(
+            tooltip,
+            "\n\n<b>Guardian {} is available</b>\nTo upgrade, {}",
+            markup_safe(version),
+            markup_safe(crate::update::HOW)
         );
     }
     tooltip.push_str("\n\nLeft-click: settings · right-click: last report");

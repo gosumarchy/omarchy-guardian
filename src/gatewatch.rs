@@ -355,7 +355,8 @@ fn observe_in(
     (standing(&record), headline(&news))
 }
 
-fn write(path: &Path, text: &str) -> std::io::Result<()> {
+/// Saves `text` as `path`, private to the user, all of it or none.
+pub fn write(path: &Path, text: &str) -> std::io::Result<()> {
     let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
     drop(fs::remove_file(&temporary));
     let written = OpenOptions::new()
@@ -404,7 +405,7 @@ impl Drop for Lock {
 
 /// The user's private state directory, made if missing. Root keeps no
 /// record: under `sudo -E` the directory is the user's.
-fn directory() -> Option<PathBuf> {
+pub fn directory() -> Option<PathBuf> {
     let uid = store::effective_uid().ok().filter(|uid| *uid != 0)?;
     let root = Store::default_root()?;
     store::private_dir(&root, uid).ok()?;

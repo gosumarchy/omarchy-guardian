@@ -62,6 +62,15 @@ pub fn render(config: &PartialConfig, header: &str) -> String {
         );
     }
 
+    if let Some(check) = config.update_check {
+        text.push_str("\n[update]\n");
+        line(
+            &mut text,
+            "check",
+            &quoted(if check { "on" } else { "off" }),
+        );
+    }
+
     let agent = &config.agent;
     let numbers = [
         ("max_input_kib", agent.max_input_kib),
@@ -176,6 +185,7 @@ mod tests {
             },
             acknowledged_weaker: Some(vec!["aur.ai=off".into(), "theme.confirm=false".into()]),
             permit_strict: Some(true),
+            update_check: Some(false),
             profile: Some(Profile::Strict),
             official_repos: Some(vec!["core".into(), "extra".into()]),
             agent: AgentDefaults {
@@ -218,6 +228,7 @@ mod tests {
         assert_eq!(parsed.sweep, config.sweep);
         assert_eq!(parsed.acknowledged_weaker, config.acknowledged_weaker);
         assert_eq!(parsed.permit_strict, Some(true));
+        assert_eq!(parsed.update_check, Some(false));
         assert_eq!(parsed.profile, config.profile);
         assert_eq!(parsed.official_repos, config.official_repos);
         assert_eq!(parsed.agent, config.agent);

@@ -57,6 +57,7 @@ mod text;
 mod tomlish;
 mod tools;
 mod tui;
+mod update;
 #[cfg(test)]
 mod zero_deps;
 

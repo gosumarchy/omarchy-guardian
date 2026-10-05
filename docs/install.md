@@ -10,6 +10,7 @@ how to remove Guardian, and what to do when a leftover hook stops pacman.
 - [Requirements](#requirements)
 - [Install](#install)
 - [Upgrading](#upgrading)
+- [Hearing of a new release](#hearing-of-a-new-release)
 - [Verifying a release](#verifying-a-release)
 - [Installing by hand](#installing-by-hand)
 - [Turning protection on](#turning-protection-on)
@@ -123,6 +124,54 @@ from the system, and on the release key itself. What it cannot know: a
 release newer than the newest tag your checkout has (someone who controls
 where you pull from can withhold a release, though not forge one), and whether
 a first install was genuine.
+
+## Hearing of a new release
+
+From 0.8.3 on Guardian tells you when a release newer than the installed one
+is out. It only tells: nothing is downloaded to be run and nothing is
+installed. Upgrading stays your own step, through the upgrade check above.
+
+- **When it asks.** At the end of each scheduled [system
+  sweep](system-sweep.md#on-a-schedule), so once a day and only while the
+  sweep is turned on. `omarchy-guardian update` asks at once, says what is
+  installed and what is newest, and prints the upgrade command.
+- **What it asks.** One HTTPS request with `curl` to the project's repository
+  on GitHub for its list of branches and tags, the request `git` itself makes
+  first. Nothing about your machine goes with it, not even the installed
+  version; GitHub sees your address and that the list was asked for.
+- **What it does with the answer.** Of every tag only
+  `v<number>.<number>.<number>` counts, and the newest is kept as three
+  numbers in `update.json` in your state directory
+  (`~/.local/state/omarchy-guardian`). What is shown is written again from
+  those numbers, never text from the answer.
+- **What you see.** One notification per release ("Guardian 0.8.4 is
+  available"), and from then until you upgrade a line in the bar's tooltip or
+  panel and an `update` member in `omarchy-guardian status`. It is not counted
+  as a problem: the knight stays calm.
+- **When it cannot ask.** Offline, or GitHub not answering: nothing is said
+  and the next sweep asks again. `omarchy-guardian update` exits 2 and says
+  why.
+
+To turn it off, in either settings file (see [Settings
+files](settings.md#settings-files)):
+
+```toml
+[update]
+check = "off"
+```
+
+Off in either file is off: no request is made by the sweep and the bar says
+nothing. `omarchy-guardian update` still asks when you type it.
+
+What this does not give you:
+
+- The list of tags is not signed, so the notice is a hint and no proof. A tag
+  that should not be there costs you a notification; `upgrade` then refuses a
+  release whose tag is not signed with the project's key.
+- Whoever can keep the answer from you (your network, GitHub) can keep you
+  from hearing of a release. Nothing here notices a notice that never came.
+- The record is your own file: a program running as you can rewrite it, or
+  turn the check off in your settings file, and so keep the notice quiet.
 
 ## Verifying a release
 
