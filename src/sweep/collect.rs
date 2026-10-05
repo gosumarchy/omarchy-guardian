@@ -131,8 +131,39 @@ fn is_kept_by_kind(item: &Item) -> bool {
     ) || (item.category == Category::Shell && item.path.ends_with("/fish_variables"))
 }
 
+/// The path the content of `item` was read from, relative to the root:
+/// what a path says of a file (that it holds secrets, that it is a script)
+/// is asked of this path, never of the name an item is listed under.
+pub fn file_of(item: &Item) -> &str {
+    item.file.as_deref().unwrap_or(&item.path)
+}
+
+/// The item of the file at `path`, listed under `name`: the path with
+/// what a live check saw the file doing (`/usr/bin/node:tcp-3000`).
+pub fn item_named(scope: &Scope<'_>, category: Category, name: &str, path: &str) -> Item {
+    let mut item = item(scope, category, path.to_string(), None);
+    if name != path {
+        item.path = name.to_string();
+        item.file = Some(path.to_string());
+    }
+    item
+}
+
+/// The note on an item that was reached only as a unit's
+/// `EnvironmentFile=`: a list of variables systemd reads, which nothing
+/// runs.
+const ENVIRONMENT_ONLY: &str =
+    "read by a unit as a list of variables (EnvironmentFile=), run by nothing";
+
+/// Whether `item` was reached only as a unit's `EnvironmentFile=`.
+pub fn is_environment_file(item: &Item) -> bool {
+    item.notes.iter().any(|note| note == ENVIRONMENT_ONLY)
+}
+
+/// Whether `note` says how an item was reached: such a note holds only
+/// while every way the sweep reached the item was that way.
 fn is_configuration_note(note: &str) -> bool {
-    note.starts_with(CONFIGURATION_OF) || note.starts_with(STANDS_FOR)
+    note.starts_with(CONFIGURATION_OF) || note.starts_with(STANDS_FOR) || note == ENVIRONMENT_ONLY
 }
 
 /// What stands for the content of a packaged script whose interpreter line
@@ -189,6 +220,9 @@ pub struct Item {
     pub runs: Vec<String>,
     /// The item that runs or links to this one.
     pub run_by: Option<String>,
+    /// The path the content was read from, where `path` is not that: a
+    /// live check lists a file under its path and what it saw it doing.
+    pub file: Option<String>,
     pub notes: Vec<String>,
     /// What the live checks established about it (a rule and what was seen).
     pub alerts: Vec<(RuleId, String)>,
@@ -260,48 +294,33 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
         paths.entry(path).or_insert(Category::Systemd);
     }
 
-    let mut seen: HashSet<String> = paths.keys().cloned().collect();
-    let mut pending: Vec<Item> = paths
-        .into_iter()
-        .map(|(path, category)| item(scope, category, path, None))
-        .collect();
+    let mut walk = Walk {
+        seen: paths.keys().cloned().collect(),
+        pending: paths
+            .into_iter()
+            .map(|(path, category)| (0, item(scope, category, path, None)))
+            .collect(),
+        ..Walk::default()
+    };
     let omarchy = omarchy_paths(scope.root);
-    // What was reached as more configuration (with the catalogued file it
-    // belongs to), what a link led to, and what some command runs: a file
-    // that is both configuration and run is a program.
-    let mut roots: HashMap<String, String> = HashMap::new();
-    let mut linked: HashMap<String, String> = HashMap::new();
-    let mut run: HashSet<String> = HashSet::new();
-    while let Some(mut item) = pending.pop() {
+    while let Some((reading, mut item)) = walk.pending.pop() {
+        // A script that was read again since this reading of it was
+        // queued: the newer one stands.
+        if walk.readings.get(&item.path).copied().unwrap_or(0) != reading {
+            continue;
+        }
         // Configuration itself: a catalogued file, or one reached as more
         // of one and run by nothing so far.
         let root = if item.run_by.is_none() {
             Some(item.path.clone())
-        } else if run.contains(&item.path) {
+        } else if walk.run.contains(&item.path) {
             None
         } else {
-            roots.get(&item.path).cloned()
+            walk.roots.get(&item.path).cloned()
         };
         let followed = follow(scope, &item, &search, root.is_some());
-        let link = matches!(item.body, Body::Link(_));
-        for target in followed.targets {
-            match &root {
-                Some(root) if followed.configuration.contains(&target) => {
-                    roots.entry(target.clone()).or_insert_with(|| root.clone());
-                }
-                _ => {
-                    run.insert(target.clone());
-                }
-            }
-            if seen.insert(target.clone()) {
-                let mut reached =
-                    self::item(scope, item.category, target.clone(), Some(&item.path));
-                if link {
-                    read_as(scope, &mut reached, &item.path);
-                    linked.insert(target, item.path.clone());
-                }
-                pending.push(reached);
-            }
+        for target in &followed.targets {
+            walk.reach(scope, &item, &followed, root.as_deref(), target);
         }
         item.notes.extend(
             followed
@@ -316,10 +335,18 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
             item.tier = Tier::Inert;
             item.notes.push("sets the locale and nothing else".into());
         }
+        walk.placed
+            .insert(item.path.clone(), collection.items.len());
         collection.items.push(item);
     }
+    // The readings a shorter way to a script took the place of.
+    let mut index = 0;
+    collection.items.retain(|_| {
+        index += 1;
+        !walk.replaced.contains(&(index - 1))
+    });
     path::mark(scope, &search, &mut collection.items);
-    mark_configuration(&mut collection.items, &roots, &linked, &run);
+    mark_reach(&mut collection.items, &walk);
     for item in &mut collection.items {
         // The package's own directory, and the one for shared data, may
         // hold a drop-in a repository package ships for every unit;
@@ -337,6 +364,95 @@ pub fn collect(scope: &Scope<'_>) -> Collection {
         .sort_by(|left, right| left.path.cmp(&right.path));
     add_facts(scope, &mut collection);
     collection
+}
+
+/// What following the collected items has reached so far.
+#[derive(Default)]
+struct Walk {
+    /// Every path that is an item already.
+    seen: HashSet<String>,
+    /// The items whose own targets are still to be followed, each with
+    /// which reading of its path it is (see `readings`).
+    pending: Vec<(usize, Item)>,
+    /// How often a path was read again from a shorter way to it: only its
+    /// latest reading counts, wherever an older one still waits.
+    readings: HashMap<String, usize>,
+    /// Where in the collection the item of a path was put.
+    placed: HashMap<String, usize>,
+    /// The places of items a later reading of their path replaced.
+    replaced: HashSet<usize>,
+    /// What was reached as more configuration, with the catalogued file it
+    /// belongs to.
+    roots: HashMap<String, String>,
+    /// What a link led to, with the link.
+    linked: HashMap<String, String>,
+    /// What some command runs: a file that is both configuration and run
+    /// is a program.
+    run: HashSet<String>,
+    /// How many scripts deep each script that is looked through lies.
+    depths: HashMap<String, usize>,
+    /// What a unit reads as a list of variables, and what was reached in
+    /// any other way.
+    environment: HashSet<String>,
+    otherwise: HashSet<String>,
+}
+
+impl Walk {
+    /// Takes in `target`, which following `item` led to (`followed`);
+    /// `root` is the catalogued file `item` is configuration of, if it is.
+    fn reach(
+        &mut self,
+        scope: &Scope<'_>,
+        item: &Item,
+        followed: &Followed,
+        root: Option<&str>,
+        target: &String,
+    ) {
+        match root {
+            Some(root) if followed.configuration.contains(target) => {
+                self.roots
+                    .entry(target.clone())
+                    .or_insert_with(|| root.to_string());
+            }
+            _ => {
+                self.run.insert(target.clone());
+            }
+        }
+        if followed.environment.contains(target) {
+            self.environment.insert(target.clone());
+        } else {
+            self.otherwise.insert(target.clone());
+        }
+        // A script lies one deeper than the script that starts it. One
+        // already read from further down a chain is read again from here:
+        // a long way to it must not stand for the short one.
+        let depth = self.depths.get(&item.path).map_or(1, |depth| depth + 1);
+        let fresh = self.seen.insert(target.clone());
+        let shallower = !fresh && self.depths.get(target).is_some_and(|known| depth < *known);
+        // An older reading is not searched for: one that still waits is
+        // passed over when its turn comes, and one already collected is
+        // taken out at the end. Each costs the same however many there are.
+        if shallower {
+            *self.readings.entry(target.clone()).or_insert(0) += 1;
+            if let Some(place) = self.placed.remove(target) {
+                self.replaced.insert(place);
+            }
+        }
+        if !(fresh || shallower) {
+            return;
+        }
+        let mut reached = self::item(scope, item.category, target.clone(), Some(&item.path));
+        if matches!(item.body, Body::Link(_)) {
+            read_as(scope, &mut reached, &item.path);
+            self.linked.insert(target.clone(), item.path.clone());
+        }
+        let handed = followed.shell_scripts.contains(target);
+        if (handed && read_as_script(&mut reached)) || is_read_script(&reached) {
+            bound_scripts(depth, &mut reached, &mut self.depths);
+        }
+        let reading = self.readings.get(target).copied().unwrap_or(0);
+        self.pending.push((reading, reached));
+    }
 }
 
 /// Adds what is no file of an auto-run location: who may log in and
@@ -359,30 +475,42 @@ fn add_facts(scope: &Scope<'_>, collection: &mut Collection) {
     collection.notes.extend(boot.notes);
 }
 
-/// Puts the notes on the items that were reached as configuration all the
-/// way from a catalogued file (see `CONFIGURATION_OF`): `roots` says of
-/// which file, `linked` which link led to an item, `run` what a command
-/// names.
-fn mark_configuration(
-    items: &mut [Item],
-    roots: &HashMap<String, String>,
-    linked: &HashMap<String, String>,
-    run: &HashSet<String>,
-) {
+/// Puts on each item the notes that say how it was reached: as
+/// configuration all the way from a catalogued file (see
+/// `CONFIGURATION_OF`), through a link, or only as a unit's list of
+/// variables.
+fn mark_reach(items: &mut [Item], walk: &Walk) {
     let reached_by: HashMap<String, Option<String>> = items
         .iter()
         .map(|item| (item.path.clone(), item.run_by.clone()))
         .collect();
     for item in items {
         if item.run_by.is_some()
-            && is_only_configuration(&item.path, &reached_by, roots, run)
-            && let Some(root) = roots.get(&item.path)
+            && is_only_configuration(&item.path, &reached_by, &walk.roots, &walk.run)
+            && let Some(root) = walk.roots.get(&item.path)
         {
             item.notes.push(format!("{CONFIGURATION_OF}{root}"));
-            if let Some(link) = linked.get(&item.path) {
+            if let Some(link) = walk.linked.get(&item.path) {
                 item.notes.push(format!("{STANDS_FOR}{link}"));
             }
         }
+        if walk.environment.contains(&item.path) && !walk.otherwise.contains(&item.path) {
+            item.notes.push(ENVIRONMENT_ONLY.to_string());
+        }
+    }
+}
+
+/// Keeps chains of scripts within `MAX_SCRIPT_DEPTH`: `reached`, a script
+/// that lies `depth` scripts deep, is not looked through for what it starts
+/// when that is deeper, and says so. The depth is remembered, so that the
+/// script is read again should a shorter way lead to it.
+fn bound_scripts(depth: usize, reached: &mut Item, depths: &mut HashMap<String, usize>) {
+    depths.insert(reached.path.clone(), depth);
+    if depth > MAX_SCRIPT_DEPTH && !reached.runs.is_empty() {
+        reached.runs.clear();
+        reached.notes.push(format!(
+            "{NOT_ALL_FOLLOWED}a chain of more than {MAX_SCRIPT_DEPTH} scripts"
+        ));
     }
 }
 
@@ -409,6 +537,104 @@ fn is_only_configuration(
     false
 }
 
+/// How many scripts deep a chain of scripts is looked through (a unit's
+/// wrapper, what it starts, and what that starts): past it the next
+/// script is reviewed as text, and says that what it runs was not followed.
+const MAX_SCRIPT_DEPTH: usize = 3;
+
+/// Whether the text file at `path` is a shell script that is looked
+/// through for the programs it starts and the files it sources, the way a
+/// shell start-up file is (those are of `Category::Shell`, and always
+/// are): a shell script no repository package vouches for as it is, in a
+/// location whose files run (a unit's wrapper, a cron script, an Omarchy
+/// hook) or reached by following a command. A packaged script that is
+/// intact is not: thousands of them start packaged programs, which tells
+/// nothing. A file of a kind kept as configuration (a tool's settings, an
+/// SSH file) is one only where something led to it, or where it is the
+/// SSH server's login script, which is always read.
+fn is_script_to_read(
+    category: Category,
+    path: &str,
+    run_by: Option<&str>,
+    tier: Tier,
+    text: &str,
+) -> bool {
+    if commands::is_ssh_rc(path) {
+        return true;
+    }
+    let configuration = matches!(
+        category,
+        Category::Ssh | Category::Git | Category::Trust | Category::Toolchain | Category::Editor
+    );
+    category != Category::Shell
+        && matches!(
+            tier,
+            Tier::Unknown | Tier::UserBuilt | Tier::Edited | Tier::Modified
+        )
+        && (run_by.is_some() || !configuration)
+        && commands::is_shell_script(path, text)
+}
+
+/// What the file at `path` is read as for the commands it runs: its own
+/// category, or for a shell script no package vouches for a start-up
+/// file's, whatever kind of location named it.
+fn reader(
+    category: Category,
+    path: &str,
+    run_by: Option<&str>,
+    tier: Tier,
+    body: &Body,
+) -> Category {
+    match body {
+        Body::Text(text) if is_script_to_read(category, path, run_by, tier, text) => {
+            Category::Shell
+        }
+        _ => category,
+    }
+}
+
+/// The command lines the text file at `path` runs: what its own kind of
+/// file runs, always, and where it is also read as a shell script
+/// (`reader`), what a script of that text starts and sources as well. A
+/// first line of `#!/bin/sh` is a comment to systemd, udev, cron and SSH:
+/// it never takes the place of how the file is really read.
+fn runs_of(category: Category, reader: Category, path: &str, text: &str) -> Vec<String> {
+    let mut runs = commands::commands(category, path, text);
+    if reader != category {
+        for run in commands::commands(reader, path, text) {
+            if !runs.contains(&run) {
+                runs.push(run);
+            }
+        }
+    }
+    runs
+}
+
+/// Reads `item` as a shell script as well as what it is: a shell was
+/// handed it as its script, which says so whatever its name and first
+/// line. Only a file no package vouches for, as for any script. Returns
+/// whether it is read that way.
+fn read_as_script(item: &mut Item) -> bool {
+    let unvouched = matches!(
+        item.tier,
+        Tier::Unknown | Tier::UserBuilt | Tier::Edited | Tier::Modified
+    );
+    let Body::Text(text) = &item.body else {
+        return false;
+    };
+    if !unvouched || item.category == Category::Shell {
+        return false;
+    }
+    item.runs = runs_of(item.category, Category::Shell, &item.path, text);
+    true
+}
+
+/// `is_script_to_read` of an item.
+fn is_read_script(item: &Item) -> bool {
+    matches!(&item.body, Body::Text(text)
+        if is_script_to_read(item.category, &item.path, item.run_by.as_deref(), item.tier, text))
+}
+
 /// Reads `item`, which the link at `link` leads to, as the file that link
 /// stands for: what a file runs and what its settings say is told by its
 /// name (`.npmrc`, `settings.json`), and a dotfile manager keeps the real
@@ -417,7 +643,8 @@ fn read_as(scope: &Scope<'_>, item: &mut Item, link: &str) {
     let Body::Text(text) = &item.body else {
         return;
     };
-    item.runs = commands::commands(item.category, link, text);
+    let reader = reader(item.category, link, None, item.tier, &item.body);
+    item.runs = runs_of(item.category, reader, link, text);
     for alert in settings_alerts(scope, item.category, link, item.tier, &item.body) {
         if !item.alerts.contains(&alert) {
             item.alerts.push(alert);
@@ -930,8 +1157,9 @@ pub fn item_of(
             Body::Unreadable(reason.clone()),
         ),
     };
+    let reader = reader(category, &path, run_by, tier, &body);
     let runs = match &body {
-        Body::Text(text) => commands::commands(category, &path, text),
+        Body::Text(text) => runs_of(category, reader, &path, text),
         _ => Vec::new(),
     };
     // An `at` job starts with the whole environment of whoever queued it,
@@ -950,7 +1178,7 @@ pub fn item_of(
     };
     let (body, runs) = handed_back(scope, category, run_by, body, runs);
     let mut notes = notes(scope, category, &path, &body, run_by);
-    notes.extend(limits(scope, category, &path, &body, found));
+    notes.extend(limits(scope, reader, &path, &body, found));
     if is_closed(scope, &path, tier, found) {
         notes.push(CLOSED.to_string());
     }
@@ -959,6 +1187,7 @@ pub fn item_of(
     notes.extend(tier::session_note(&path, tier, scope.index).map(str::to_string));
     let alerts = settings_alerts(scope, category, &path, tier, &body);
     Item {
+        file: None,
         // The root collector's items are all root's, its home included.
         origin: if scope.origin == Origin::System
             && scope
@@ -1236,6 +1465,11 @@ struct Followed {
     /// Those among them that the item reads as more configuration and
     /// does not run (see `CONFIGURATION_OF`).
     configuration: Vec<String>,
+    /// Those among them that a shell was handed as its script.
+    shell_scripts: Vec<String>,
+    /// Those among them that a unit reads as a list of variables
+    /// (`EnvironmentFile=`) and that it does not run.
+    environment: Vec<String>,
     /// The limits that were reached, each as the rest of a sentence.
     unfollowed: Vec<String>,
 }
@@ -1256,41 +1490,37 @@ fn follow(scope: &Scope<'_>, item: &Item, search: &Search, configuration: bool) 
             unfollowed.push(sentence);
         }
     };
-    // Only a link to a regular file leads anywhere to judge (a masked
-    // unit's `/dev/null` does not).
     let by = Some(item.path.as_str());
     // What is read, not run: where a link leads (the same file under
     // another name), and what an SSH file reads in. Anything a command
     // names as well is run.
     let mut read_in: Vec<String> = Vec::new();
     let mut started: Vec<String> = Vec::new();
-    if let Body::Link(target) = &item.body
-        && let Some(resolved) = read::resolve_where(&item.path, target, &|next| hop(scope, next))
-        && matches!(look_past_link(scope, &resolved), Found::File { .. })
-    {
+    // What a shell was handed as its script (`sh /x/run`).
+    let mut handed: Vec<String> = Vec::new();
+    if let Some(resolved) = link_target(scope, item) {
         read_in.push(resolved.clone());
         targets.push(resolved);
     }
-    let included = match (&item.body, item.category) {
-        (Body::Text(text), Category::Ssh) if configuration => commands::ssh_read_in(text),
-        _ => Vec::new(),
-    };
+    let included = included_by(item, configuration);
+    let variables = variables_of(item);
+    let mut environment: Vec<String> = Vec::new();
     // A file some other line runs under the very same words is run.
     let times = |list: &[String], command: &str| list.iter().filter(|one| *one == command).count();
     let mut record = |command: &str, target: &str| {
-        let reads = times(&included, command);
-        if reads > 0 && reads == times(&item.runs, command) {
+        let only = |list: &[String]| {
+            let reads = times(list, command);
+            reads > 0 && reads == times(&item.runs, command)
+        };
+        if only(&included) {
             read_in.push(target.to_string());
+        } else if only(&variables) {
+            environment.push(target.to_string());
         } else {
             started.push(target.to_string());
         }
     };
-    // `~` in a user's crontab is that user's home, not the sweep's.
-    let crontab_home = item
-        .path
-        .strip_prefix("var/spool/cron/")
-        .and_then(|user| user_home(scope.root, user));
-    let home = crontab_home.as_deref().or(scope.home).unwrap_or("root");
+    let home: &str = &home_for(scope, item);
     let view = view(scope, by);
     let list = |directory: &str| listed(scope, view, directory);
     for command in &item.runs {
@@ -1323,29 +1553,28 @@ fn follow(scope: &Scope<'_>, item: &Item, search: &Search, configuration: bool) 
         let shell_line = matches!(
             item.category,
             Category::Cron | Category::Shell | Category::Hyprland
-        );
+        ) || is_read_script(item);
         let lookup = commands::Lookup {
             home,
             search: &search.directories,
             exists: &|candidate| is_there(scope, candidate, by),
             capped: std::cell::Cell::new(false),
+            shell_scripts: std::cell::RefCell::default(),
         };
-        let parts = if command.len() > MAX_SPLIT_LINE {
+        let (parts, long) = parts_of(command, shell_line);
+        if long {
             limit(format!(
                 "a command line longer than {MAX_SPLIT_LINE} bytes was taken as one command"
             ));
-            vec![command.clone()]
-        } else if shell_line {
-            let (parts, more) = commands::split_commands(command);
-            if more {
-                lookup.capped.set(true);
-            }
-            parts
-        } else {
-            command.split(" ; ").map(str::to_string).collect()
-        };
+        }
+        let (parts, more) = parts;
+        if more {
+            lookup.capped.set(true);
+        }
         for part in parts {
-            for target in lookup.targets(&part) {
+            let reached = lookup.targets(&part);
+            handed.extend(lookup.shell_scripts.take());
+            for target in reached {
                 record(command, &target);
                 if !targets.contains(&target) {
                     targets.push(target);
@@ -1359,25 +1588,97 @@ fn follow(scope: &Scope<'_>, item: &Item, search: &Search, configuration: bool) 
             ));
         }
     }
-    let (targets, configuration) = settle(scope, view, by, targets, &read_in, &started);
-    Followed {
-        targets,
-        configuration,
-        unfollowed,
+    let kinds = Kinds {
+        read_in: &read_in,
+        started: &started,
+        handed: &handed,
+        environment: &environment,
+    };
+    let mut followed = settle(scope, view, by, targets, &kinds);
+    followed.unfollowed = unfollowed;
+    followed
+}
+
+/// The regular file the link `item` leads to, if it is a link to one (a
+/// masked unit's `/dev/null` is none).
+fn link_target(scope: &Scope<'_>, item: &Item) -> Option<String> {
+    let Body::Link(target) = &item.body else {
+        return None;
+    };
+    read::resolve_where(&item.path, target, &|next| hop(scope, next))
+        .filter(|resolved| matches!(look_past_link(scope, resolved), Found::File { .. }))
+}
+
+/// What the unit `item` reads as a list of variables and does not run
+/// (`EnvironmentFile=`), by the words that name it.
+fn variables_of(item: &Item) -> Vec<String> {
+    match (&item.body, item.category) {
+        (Body::Text(text), Category::Systemd) => commands::environment_files(&item.path, text),
+        _ => Vec::new(),
     }
 }
 
-/// The paths among `targets` that are followed, as the walk reaches them,
-/// and those among them that are read as configuration and not run (in
-/// `read_in`, and in `started` under no command).
+/// What `item` reads in as more configuration, by the words that name it
+/// (an SSH `Include`): only where it is itself configuration.
+fn included_by(item: &Item, configuration: bool) -> Vec<String> {
+    match (&item.body, item.category) {
+        (Body::Text(text), Category::Ssh) if configuration => commands::ssh_read_in(text),
+        _ => Vec::new(),
+    }
+}
+
+/// The home directory `~` stands for in `item`, relative to the root: in a
+/// user's crontab that user's, not the sweep's.
+fn home_for(scope: &Scope<'_>, item: &Item) -> String {
+    item.path
+        .strip_prefix("var/spool/cron/")
+        .and_then(|user| user_home(scope.root, user))
+        .or_else(|| scope.home.map(str::to_string))
+        .unwrap_or_else(|| "root".to_string())
+}
+
+/// The commands of one command line, and whether it held more than are
+/// looked up; and whether it was too long to split at all. Each command of
+/// a line a shell runs (`a; b && c | d`) runs its own program; other lines
+/// (a unit's `ExecStart=`) are not shell, and there only ` ; ` separates
+/// commands.
+fn parts_of(command: &str, shell_line: bool) -> ((Vec<String>, bool), bool) {
+    if command.len() > MAX_SPLIT_LINE {
+        ((vec![command.to_string()], false), true)
+    } else if shell_line {
+        (commands::split_commands(command), false)
+    } else {
+        (
+            (command.split(" ; ").map(str::to_string).collect(), false),
+            false,
+        )
+    }
+}
+
+/// How the targets of an item were reached, by the paths as written.
+struct Kinds<'a> {
+    /// Read as configuration (a link's target, an SSH `Include`).
+    read_in: &'a [String],
+    /// Named by a command.
+    started: &'a [String],
+    /// Handed to a shell as its script.
+    handed: &'a [String],
+    /// Read by a unit as a list of variables.
+    environment: &'a [String],
+}
+
+/// The paths among `targets` that are followed, as the walk reaches them;
+/// those among them that are read as configuration and not run; and those
+/// a shell was handed as its script.
 fn settle(
     scope: &Scope<'_>,
     view: Option<View>,
     by: Option<&str>,
     targets: Vec<String>,
-    read_in: &[String],
-    started: &[String],
-) -> (Vec<String>, Vec<String>) {
+    kinds: &Kinds<'_>,
+) -> Followed {
+    let mut shell_scripts = Vec::new();
+    let mut environment = Vec::new();
     let under =
         |places: &[&str], target: &str| places.iter().any(|place| target.starts_with(place));
     let mut reached = Vec::new();
@@ -1399,12 +1700,24 @@ fn settle(
         let Some(path) = path else {
             continue;
         };
-        if read_in.contains(&target) && !started.contains(&target) {
+        if kinds.read_in.contains(&target) && !kinds.started.contains(&target) {
             configuration.push(path.clone());
+        }
+        if kinds.handed.contains(&target) {
+            shell_scripts.push(path.clone());
+        }
+        if kinds.environment.contains(&target) && !kinds.started.contains(&target) {
+            environment.push(path.clone());
         }
         reached.push(path);
     }
-    (reached, configuration)
+    Followed {
+        targets: reached,
+        configuration,
+        shell_scripts,
+        environment,
+        unfollowed: Vec::new(),
+    }
 }
 
 /// The home directory of `user`, relative to the root, from `/etc/passwd`.
@@ -1558,6 +1871,264 @@ mod tests {
         assert_eq!(script.category, Category::Udev);
         assert!(matches!(&script.body, Body::Text(text) if text.contains("curl")));
         assert_eq!(collection.items[4].runs, ["waybar"]);
+    }
+
+    #[test]
+    fn a_script_no_package_vouches_for_is_looked_through_for_what_it_starts() {
+        let dir = TempDir::new("sweep-scripts");
+        let root = dir.path();
+        write(
+            root,
+            "etc/systemd/system/x.service",
+            "[Service]\nExecStart=/home/u/bin/wrapper.sh\nExecStartPre=/usr/bin/packaged.sh\nExecStartPost=/home/u/bin/tool.py\n",
+        );
+        write(
+            root,
+            "home/u/bin/wrapper.sh",
+            "#!/usr/bin/env bash\n. /home/u/lib/env.sh\n/home/u/.cache/stage2 --daemon &\n/home/u/bin/s2\n",
+        );
+        write(root, "home/u/lib/env.sh", "X=1\n");
+        write(root, "home/u/.cache/stage2", "\u{7f}ELF");
+        // A chain of scripts is followed three deep, and no further.
+        for (name, next) in [("s2", "s3"), ("s3", "s4"), ("s4", "s5")] {
+            write(
+                root,
+                &format!("home/u/bin/{name}"),
+                &format!("#!/bin/sh\n/home/u/bin/{next}\n"),
+            );
+        }
+        write(root, "home/u/bin/s5", "#!/bin/sh\ntrue\n");
+        // A packaged script that is intact, and a script of another
+        // interpreter, are not looked through.
+        let packaged = "#!/bin/sh\n/home/u/bin/from-packaged\n";
+        write(root, "usr/bin/packaged.sh", packaged);
+        write(root, "home/u/bin/from-packaged", "x\n");
+        write(
+            root,
+            "home/u/bin/tool.py",
+            "#!/usr/bin/python3\n/home/u/bin/from-python\n",
+        );
+        write(root, "home/u/bin/from-python", "x\n");
+        // A hook the catalogue names itself is a script like any other.
+        write(
+            root,
+            "home/u/.config/omarchy/hooks/theme-set",
+            "#!/bin/bash\n/home/u/bin/from-hook\n",
+        );
+        write(root, "home/u/bin/from-hook", "x\n");
+        let mut index = PackageIndex::with_foreign(HashSet::new());
+        index.add_for_test(
+            "vendor",
+            &format!(
+                "#mtree\n./usr/bin/packaged.sh type=file mode=644 sha256digest={}\n",
+                Sha256::digest(packaged.as_bytes())
+            ),
+            &[],
+        );
+        let scope = Scope {
+            root,
+            home: Some("home/u"),
+            index: &index,
+            origin: Origin::System,
+        };
+        let collection = collect(&scope);
+        let found = |path: &str| collection.items.iter().find(|item| item.path == path);
+        let wrapper = found("home/u/bin/wrapper.sh").unwrap();
+        assert_eq!(
+            wrapper.runs,
+            [
+                "/home/u/lib/env.sh",
+                "/home/u/.cache/stage2",
+                "/home/u/bin/s2"
+            ]
+        );
+        for (reached, by) in [
+            ("home/u/.cache/stage2", "home/u/bin/wrapper.sh"),
+            ("home/u/lib/env.sh", "home/u/bin/wrapper.sh"),
+            ("home/u/bin/s3", "home/u/bin/s2"),
+            ("home/u/bin/s4", "home/u/bin/s3"),
+            (
+                "home/u/bin/from-hook",
+                "home/u/.config/omarchy/hooks/theme-set",
+            ),
+        ] {
+            let item = found(reached).unwrap_or_else(|| panic!("{reached} was not collected"));
+            assert_eq!(item.run_by.as_deref(), Some(by), "{reached}");
+        }
+        // The fourth script of the chain is reviewed as text, says that
+        // what it runs was not followed, and so cannot be allowed.
+        let last = found("home/u/bin/s4").unwrap();
+        assert!(last.runs.is_empty());
+        assert!(super::is_capped(last), "{:?}", last.notes);
+        assert!(found("home/u/bin/s5").is_none());
+        assert_eq!(found("usr/bin/packaged.sh").unwrap().tier, Tier::Vendor);
+        for unreached in ["home/u/bin/from-packaged", "home/u/bin/from-python"] {
+            assert!(found(unreached).is_none(), "{unreached}");
+        }
+    }
+
+    #[test]
+    fn a_first_line_that_reads_like_a_script_does_not_stop_a_file_being_read_as_what_it_is() {
+        // `#` starts a comment in every one of these formats.
+        for shebang in ["", "#!/bin/sh\n"] {
+            let dir = TempDir::new("sweep-formats");
+            let root = dir.path();
+            let stage = |name: &str| format!("/home/u/.cache/stage-{name}");
+            let with = |text: String| format!("{shebang}{text}");
+            write(
+                root,
+                "etc/systemd/system/evil.service",
+                &with(format!("[Service]\nExecStart={}\n", stage("unit"))),
+            );
+            write(
+                root,
+                "etc/udev/rules.d/99-x.rules",
+                &with(format!("ACTION==\"add\", RUN+=\"{}\"\n", stage("udev"))),
+            );
+            write(
+                root,
+                "home/u/.config/autostart/evil.desktop",
+                &with(format!("[Desktop Entry]\nExec={}\n", stage("desktop"))),
+            );
+            write(
+                root,
+                "home/u/.config/hypr/hyprland.conf",
+                &with(format!("exec-once = {}\n", stage("hypr"))),
+            );
+            write(root, "home/u/.ssh/config", "Include ~/.ssh/extra\n");
+            write(
+                root,
+                "home/u/.ssh/extra",
+                &with(format!("Host x\n  ProxyCommand {}\n", stage("ssh"))),
+            );
+            // A table of jobs named like a script, and one that starts
+            // like one.
+            write(
+                root,
+                "etc/cron.d/job.sh",
+                &format!("* * * * * root {}\n", stage("cron-ext")),
+            );
+            write(
+                root,
+                "etc/cron.d/job",
+                &format!("#!/bin/sh\n* * * * * root {}\n", stage("cron")),
+            );
+            write(
+                root,
+                "var/spool/cron/u",
+                &format!("#!/bin/sh\n@reboot {}\n", stage("crontab")),
+            );
+            let stages = [
+                "unit", "udev", "desktop", "hypr", "ssh", "cron-ext", "cron", "crontab",
+            ];
+            for name in stages {
+                write(root, stage(name).trim_start_matches('/'), "x\n");
+            }
+            write(root, "etc/passwd", "u:x:1000:1000::/home/u:/bin/bash\n");
+            let index = PackageIndex::with_foreign(HashSet::new());
+            let scope = Scope {
+                root,
+                home: Some("home/u"),
+                index: &index,
+                origin: Origin::System,
+            };
+            let collection = collect(&scope);
+            for name in stages {
+                let path = stage(name);
+                assert!(
+                    collection
+                        .items
+                        .iter()
+                        .any(|item| item.path == path.trim_start_matches('/')),
+                    "{path} is not listed (first line {shebang:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_way_to_a_script_does_not_stand_for_the_short_one() {
+        let dir = TempDir::new("sweep-decoy");
+        let root = dir.path();
+        // Whichever unit is walked first: the decoy chain reaches `x.sh`
+        // four scripts deep, the direct unit one deep.
+        for (direct, chain) in [("a-direct", "z-chain"), ("z-direct", "a-chain")] {
+            write(
+                root,
+                &format!("etc/systemd/system/{direct}.service"),
+                "[Service]\nExecStart=/home/u/bin/x.sh\n",
+            );
+            write(
+                root,
+                &format!("etc/systemd/system/{chain}.service"),
+                "[Service]\nExecStart=/home/u/bin/d1\n",
+            );
+        }
+        for (name, next) in [("d1", "d2"), ("d2", "d3"), ("d3", "x.sh")] {
+            write(
+                root,
+                &format!("home/u/bin/{name}"),
+                &format!("#!/bin/sh\n/home/u/bin/{next}\n"),
+            );
+        }
+        write(
+            root,
+            "home/u/bin/x.sh",
+            "#!/bin/sh\n/home/u/.cache/stage2\n",
+        );
+        write(root, "home/u/.cache/stage2", "x\n");
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let scope = Scope {
+            root,
+            home: Some("home/u"),
+            index: &index,
+            origin: Origin::System,
+        };
+        let collection = collect(&scope);
+        let script: Vec<_> = collection
+            .items
+            .iter()
+            .filter(|item| item.path == "home/u/bin/x.sh")
+            .collect();
+        assert_eq!(script.len(), 1);
+        assert_eq!(script[0].runs, ["/home/u/.cache/stage2"]);
+        assert!(!super::is_capped(script[0]), "{:?}", script[0].notes);
+        assert!(
+            collection
+                .items
+                .iter()
+                .any(|item| item.path == "home/u/.cache/stage2")
+        );
+    }
+
+    #[test]
+    fn a_file_a_shell_is_handed_is_a_shell_script_whatever_it_is_called() {
+        let dir = TempDir::new("sweep-handed");
+        let root = dir.path();
+        write(
+            root,
+            "etc/systemd/system/x.service",
+            "[Service]\nExecStart=/bin/sh /home/u/bin/noshebang\nExecStartPost=/usr/bin/busybox sh /home/u/bin/applet\nExecStop=/usr/bin/python3 /home/u/bin/other\n",
+        );
+        write(root, "home/u/bin/noshebang", "/home/u/.cache/stage-sh\n");
+        write(root, "home/u/bin/applet", "/home/u/.cache/stage-busybox\n");
+        // What another interpreter is handed is not read as shell.
+        write(root, "home/u/bin/other", "/home/u/.cache/stage-python\n");
+        for name in ["sh", "busybox", "python"] {
+            write(root, &format!("home/u/.cache/stage-{name}"), "x\n");
+        }
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let scope = Scope {
+            root,
+            home: Some("home/u"),
+            index: &index,
+            origin: Origin::System,
+        };
+        let collection = collect(&scope);
+        let listed = |path: &str| collection.items.iter().any(|item| item.path == path);
+        assert!(listed("home/u/.cache/stage-sh"));
+        assert!(listed("home/u/.cache/stage-busybox"));
+        assert!(!listed("home/u/.cache/stage-python"));
     }
 
     #[test]

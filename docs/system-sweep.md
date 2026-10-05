@@ -31,6 +31,10 @@ described.
 - [How the machine was started](#how-the-machine-was-started)
 - [How each item is judged](#how-each-item-is-judged)
 - [What goes to the review](#what-goes-to-the-review)
+  - [What is kept from the AI](#what-is-kept-from-the-ai)
+  - [What is sent](#what-is-sent)
+  - [What is taken out of a file that is sent](#what-is-taken-out-of-a-file-that-is-sent)
+  - [After an upgrade](#after-an-upgrade)
 - [Root checks](#root-checks)
   - [What root reads and hands back](#what-root-reads-and-hands-back)
   - [Paths a user can point root at](#paths-a-user-can-point-root-at)
@@ -165,6 +169,7 @@ extra look at the program it names. The limits:
 | A line of a start-up file looked through for programs | 64 KB |
 | One command line split into its commands (a longer one is taken as a single command) | 64 KB |
 | Links in a chain | 8 |
+| Scripts in a chain, each started by the one before | 3 |
 
 Where one of these limits is reached, the item says so in its notes and
 cannot be allowed, since an allow would vouch for commands nobody followed;
@@ -175,11 +180,45 @@ Never followed: a path under `/dev`, `/proc` or `/sys` (under `/dev/shm` and
 `/run` only a regular file is), and the pattern of a shell `case` branch
 (`/*)`), which is matched, not run.
 
-A script that was reached by following is reviewed as text, but only a shell
-start-up file and what it sources or starts is looked through for the
-programs it starts in turn: what a script named by a unit, a crontab or an
-SSH file goes on to run is not collected by the sweep, and is left to the
-review of that script's text.
+A file is always read as the kind of file it is: a unit as a unit, a udev
+rule as a udev rule, a table of cron jobs as that, whatever its first line (a
+`#!/bin/sh` there is a comment to systemd, udev, cron and SSH).
+
+A shell script that no repository package vouches for (tier `unknown`,
+`user-built`, `edited` or `modified`) is looked through like a shell start-up
+file as well, wherever the sweep found it: a unit's wrapper, a cron script, an
+Omarchy hook, a script another script starts. The programs it starts by a path
+and the files it sources are collected and judged in turn, with the same
+limits, so a service's wrapper in your home that launches a second stage from
+`~/.cache` has that second stage listed. A file counts as a shell script:
+
+- by its first line: `sh`, `bash`, `dash`, `zsh`, `ksh`, `ash` or `mksh`, also
+  through `env` (`env -S`, `env -u VAR`) or `busybox`, and after a byte-order
+  mark;
+- without such a line, by its name (`x.sh`);
+- or because the command that runs it is a shell (`ExecStart=/bin/sh
+  /home/u/bin/run`), whatever it is called.
+
+Chains are followed three scripts deep, counted along the shortest way to each
+script; the fourth is reviewed as text, says that what it runs was not
+followed, and cannot be allowed. Shell start-up files and what they source are
+not bounded this way: they are followed as far as they lead, as before. There
+is no cap on the number of items a sweep collects.
+
+What remains:
+
+- a packaged script that is intact (or a copy of one) is not looked through,
+  since thousands of them start packaged programs;
+- scripts of other interpreters (Python, Perl, Node, fish) are reviewed as
+  text only;
+- inside a script, only a program in the place of a command and named by a
+  path is picked up: `bash /x/stage.sh`, `exec python3 /x/s.py`, a program
+  named by a bare name or handed over as an argument are not;
+- as root nothing is followed from a script the collector reached by
+  following.
+
+An allowed script is looked through like any other: what it starts is an item
+of its own.
 
 A file or directory whose name is not valid UTF-8 cannot be checked, and
 shells, udev and pacman read such names all the same: the sweep says so and is
@@ -681,77 +720,177 @@ its name in `/etc/pacman.d/hooks`) is shown the same way. Masking
 
 ## What goes to the review
 
-Everything shown that holds text goes through the local rules and the AI
-review (class `system`), with the review memory, so a repeated sweep of an
-unchanged system makes no AI call.
+Everything shown that holds text goes through the local rules, and what is not
+kept back below through the AI review (class `system`), with the review
+memory, so a repeated sweep of an unchanged system makes no AI call.
 
-Before a file is reviewed, two things are taken out of its text, for the local
-rules and the AI alike. The value of an assignment whose name has a part that
-says secret (`KEY`, `APIKEY`, `TOKEN`, `AUTHTOKEN`, `PAT`, `SECRET`,
-`PASSWORD`, `PASSWD`, `PASSPHRASE`, `AUTH`, `CREDENTIAL(S)`, as in
-`OPENAI_API_KEY`), when it is a plain literal of at least 8 characters, in
-shell, `NAME=value` (with or without blanks around the `=`), unit
-`Environment=` and fish `set` forms; and the password of an address
-(`https://user:password@…`), the user and host staying. Start-up files are
-where exported keys live, and the sweep runs on a timer. A value with `$`, a
-backtick or the like in it could be code a shell runs, and stays to be read;
-so does one that says where something is (a path, a URL). A secret under
-another name, shorter than 8 characters, or written some other way, still goes
-with the file.
+### What is kept from the AI
 
-SSH and git files in a home directory are checked locally only and never sent
-to the AI: the files of the table above, what one of them is a link to (a
-`~/.gitconfig` kept in a dotfiles directory), and a file an SSH `Include`
-reads in. What is checked: an SSH line that runs a command or loads a library
-(`ProxyCommand`, `Match … exec`, `PKCS11Provider`, with blanks or `=`), a key
-with a `command=` or `environment=` option, and git keys that run a command. A
-credential helper is expected and passes, unless it is a shell line of its own
-or a program from a temporary directory; `url.*.insteadOf` rewrites are not
-judged.
+Four kinds of file are read on this machine only. Each says so in a note on
+its item (accounts, keys and certificate authorities do not: they are facts
+with no text to send), and being kept makes no sweep incomplete.
+
+- **A file whose path marks it as holding secrets** is never sent, whether or
+  not something runs it and whatever its first line: anything under `.ssh`,
+  `.aws`, `.gnupg`, `secrets` or `credentials`, `.env` files, `*.pem`,
+  `*.key`, key files by their name (`id_ed25519`), `.netrc`, a name with
+  `secret`, `credential` or `token` in it, and the like. That is asked of the
+  path the content was read from and of the name a link gives it, not of the
+  name an item is listed under. Such a file is still read by the local pattern
+  rules and looked through for what it starts. So `~/.ssh/rc`, the script the
+  SSH server runs at every login, is read like a shell start-up file here (a
+  finding comes from what it holds, not from its being there), and so is a
+  script under `~/.ssh` that a unit runs, or a `~/.env` a start-up file reads
+  in. `/etc/ssh/sshrc` is under no such path and is reviewed like any script.
+
+  Whoever writes a file picks its path, so such a path must not be a way past
+  the review. Where something runs a file kept this way, the item raises a
+  finding of its own, `kept-from-review` (medium): the AI did not read it,
+  only the local rules did. Something runs it when:
+
+  - it is a file of an auto-run location, or what a link there leads to;
+  - a command names it, or a start-up file reads it in;
+  - it is the SSH login script;
+  - a live check found it running as a script.
+
+  Two ordinary cases are passed over. A file a unit only reads as its
+  `EnvironmentFile=` is a list of variables to systemd, which can run nothing
+  from it. And the finding is skipped for a file whose every line only keeps
+  a value in a variable, which is what the usual file of exported keys looks
+  like. A line counts as that when all of this holds:
+
+  - it is written as `NAME=value` (also after `export`, several on a line),
+    fish's `set -gx NAME value`, Hyprland's `env = NAME,value` or `$name =
+    value`, or is blank or a comment;
+  - the name says secret (as for masking, below), or is a plainly inert
+    setting: `LANG`, `LC_*`, `TZ`, `TERM`, `COLORTERM`, `USER`, `LOGNAME`,
+    `HOSTNAME`, `EMAIL`, or a name ending in `_ID`, `_REGION`, `_PROFILE`,
+    `_ACCOUNT`, `_USER`, `_USERNAME`, `_NAME`, `_ORG`, `_PROJECT`, `_ENV`,
+    `_STAGE`, `_TENANT`, `_DATABASE`, `_DB`, `_PORT` or `_MODEL`;
+  - the value is one opaque word: no `/`, no leading `~` or `.`, no `://`, no
+    blank.
+
+  Anything else raises the finding: any other variable, whatever it is called
+  (most of what redirects a program is a variable set to a path, and no list
+  of such names is ever complete); a value that is a path or an address; a
+  `$`, a backtick or a backslash anywhere; `;`, `&`, `|`, a redirection or a
+  bracket outside quotes; a quote left open; a command after an assignment;
+  `source`, `eval`, `alias`, a function. `PATH`, `LD_*`, `PROMPT_COMMAND`,
+  `BASH_ENV`, a proxy and their like raise it even where their name ends like
+  an inert one. Which names are passed over is a judgement about noise, not a
+  guarantee: a file the rule does not recognise costs one finding, answered
+  with `sweep allow`. A secret nothing runs (a key or an `.env` that a process
+  was merely handed) raises nothing either.
+
+  The finding shows in the sweep, in `--diff` and in the daily notification
+  when new or changed, and does not make the sweep incomplete. Read the file
+  yourself; `sweep allow` records that you did, bound to its content. The
+  local pattern rules read the whole file in every case.
+- **SSH and git files in a home directory**: the files of the table above,
+  what one of them is a link to (a `~/.gitconfig` kept in a dotfiles
+  directory), and a file an SSH `Include` reads in. What is checked: an SSH
+  line that runs a command or loads a library (`ProxyCommand`, `Match … exec`,
+  `PKCS11Provider`, with blanks or `=`), a key with a `command=` or
+  `environment=` option, and git keys that run a command. A credential helper
+  is expected and passes, unless it is a shell line of its own or a program
+  from a temporary directory; `url.*.insteadOf` rewrites are not judged.
+- **Settings that hold tokens**: the package-manager settings, an editor's
+  `settings.json`, fish's saved variables, accounts, keys, certificate
+  authorities and `/etc/hosts`, each checked by the rules for its kind (see
+  [More that decides what runs](#more-that-decides-what-runs)).
+- **A file a live check names that nothing says is a script.** The live checks
+  go by a process's arguments, and an argument may as well be a data file
+  (`node --env-file …`). Its text is sent only where it starts with `#!` or
+  has a script's name (`.sh`, `.py`, `.js` and the like), and is under no
+  secret path; anything else is hashed, listed and read by the local rules.
 
 A file an SSH `Include` names by its full path or with `~` is followed and
 checked the same way, one with `*` in its last part to the files it matches. A
 name relative to `~/.ssh` is not followed (`~/.ssh/config.d/` is read in any
 case).
 
-`~/.ssh/rc`, a script the server runs at login, is flagged for being there
-(`ssh-command`); like the other SSH files of a home its text is not sent.
-
-A program one of these files runs is no such file: the script a `ProxyCommand`
-or git's `sshCommand` names is followed and reviewed like any other program,
-by the local rules and the AI. Such a script reads nothing in as
-configuration, whatever its lines look like, and where it is itself a link,
-what the link leads to is the script.
-
 A linked file is treated as the file it stands for. Dotfile managers keep the
 real file under another name (`~/.npmrc` as a link to `~/dotfiles/npmrc`):
 what the link of a catalogued file leads to is read by the rules of the file
-the link stands for (a linked `~/.ssh/rc` or `authorized_keys` by theirs, and
-the keys of a linked key file are listed as for any other) and, where that
-file is kept from the AI (the SSH and git files, the package-manager settings,
-an editor's `settings.json`, fish's saved variables), is kept from it as well.
-That holds wherever the real file is kept: a `~/.gitconfig` that is a link to
-a file on another mount is your home's configuration still. For the keys of
-another account the root checks follow such a link only to a file that
-account could read itself.
+the link stands for (a linked `~/.ssh/rc` is the login script, a linked
+`authorized_keys` a key file whose keys are listed as for any other) and,
+where that file is kept from the AI, is kept from it as well. That holds
+wherever the real file is kept: a `~/.gitconfig` that is a link to a file on
+another mount is your home's configuration still. For the keys of another
+account the root checks follow such a link only to a file that account could
+read itself.
 
-A file is kept from the review this way only while every way the sweep reached
-it was as configuration. One that a command names as well (a file one line
-includes and another runs), or that a live check finds running, is a program:
-it is reviewed by the local rules and sent to the AI, whatever links to it or
-includes it. A file under `~/.ssh` is withheld from the AI by its path in any
-case; where such a file is a program, the sweep says so and is incomplete.
+### What is sent
 
-Two things show once after an upgrade from Guardian 0.8.1 or earlier. The
-first sweep sends the scripts your SSH and git files run, which earlier
-versions kept back (with secret-looking values taken out, as for any reviewed
-text).
-And an allowed file that a catalogued link leads to (`~/dotfiles/npmrc`) is
-shown again: it is now read by the rules of the file it stands for, and what
-those find is part of what an allow covers.
+A program one of the files above runs is no such file: the script a
+`ProxyCommand` or git's `sshCommand` names is followed and reviewed like any
+other program, by the local rules and the AI, unless its own path marks it as
+holding secrets. Such a script reads nothing in as configuration, whatever its
+lines look like, and where it is itself a link, what the link leads to is the
+script.
+
+A settings file is kept as one only while every way the sweep reached it was
+as configuration. One that a command names as well (a file one line includes
+and another runs), or that a live check finds running, is a program, whatever
+links to it or includes it: it is read by the local pattern rules, and sent
+where the rules above allow it.
+
+A file a start-up file reads in (`source ~/.config/shell/aliases`) is reviewed
+and sent like the start-up file itself, unless its path marks it as holding
+secrets.
 
 Binaries no package vouches for are named to the AI by format and hash but
 never run or uploaded.
+
+### What is taken out of a file that is sent
+
+Before a file is reviewed, two things are taken out of its text, for the local
+rules and the AI alike:
+
+- the value of an assignment whose name says secret: a part of it between
+  `_` is `KEY`, `APIKEY`, `TOKEN`, `AUTHTOKEN`, `PAT`, `SECRET`, `PASSWORD`,
+  `PASSWD`, `PASSPHRASE`, `PASS`, `PWD`, `PSK`, `AUTH` or `CREDENTIAL(S)` (as
+  in `OPENAI_API_KEY`), or the name is one word that ends in `PASSWORD`,
+  `PASSWD`, `SECRET`, `TOKEN` or `APIKEY` (`PGPASSWORD`). The value must be a
+  literal of at least 8 plain characters (letters, digits and `_-./+=:@%,`),
+  with or without quotes around it. The forms read are shell, `NAME=value`
+  (with or without blanks around the `=`), unit `Environment=` and fish `set`;
+- the password of an address (`https://user:password@…`), where it is plain
+  characters, the user and host staying.
+
+Start-up files are where exported keys live, and the sweep runs on a timer.
+The rule is kept this narrow on purpose: what is taken out is hidden from the
+local rules and the AI alike, so nothing that could be a command may ever be
+taken out. A value with a blank, a `;`, `|`, `&`, `$`, a backtick or any other
+punctuation in it stays to be read, quoted or not (`SECRET='p@ss w0rd!'` goes
+with its file); so does anything after the assignment on the same line
+(`PASS=1 curl … | sh` stays whole), and a value that says where something is
+(a path, a URL).
+
+A host or a program's name assigned to a secret-named variable
+(`AUTH_HOST=updates.example.org`) is taken out like any other such value, and
+so is hidden from both layers; the line that uses the variable is not.
+
+What still goes with its file: a secret under another name, shorter than 8
+characters, with a blank or punctuation in it, in YAML or JSON `key: value`
+form, handed over as a command-line argument, or a key block (PEM) in a file
+whose path gives no hint.
+
+### After an upgrade
+
+These show once after an upgrade from Guardian 0.8.1 or earlier:
+
+- the scripts your SSH and git files run are sent for review, where their own
+  path does not mark them as holding secrets; earlier versions kept them back;
+- what your own unpackaged shell scripts start or source is listed, and sent
+  for review like any other item, where it was not collected before;
+- a `~/.ssh/rc` is read by the local rules for what it holds, and raises
+  `kept-from-review` in place of `ssh-command`: allow it once you have read
+  it. The same shows for any other script under a secret-looking path that
+  something runs;
+- an allowed file that a catalogued link leads to (`~/dotfiles/npmrc`) is
+  shown again: it is now read by the rules of the file it stands for, and what
+  those find is part of what an allow covers.
 
 ## Root checks
 
@@ -1068,7 +1207,7 @@ reviews as well, are listed under [Local rules](local-rules.md#rule-ids).
 | `boot-tampering` | high | The running kernel was started with a parameter that turns off a defence or replaces init and that the reviewed boot configuration does not hold, or a kernel image in `/boot` is not the one its package ships. |
 | `rootkit-sign` | high | The kernel's own lists disagree (a process, module or socket that exists is not listed), or a program wears a kernel thread's name: what something hiding itself looks like. |
 | `traced-secrets` | high | A process is attached, the way a debugger is, to a program that holds secrets (a shell, SSH, sudo, a key agent, a browser, a password manager). |
-| `ssh-command` | medium | An SSH file runs a command when someone logs in (`command=` or `environment=` on a key, or `~/.ssh/rc`). |
+| `ssh-command` | medium | An SSH file runs a command or loads a library (a `ProxyCommand`, a `Match exec`, a provider library), or a key carries a `command=` or `environment=` option. |
 | `running-from-temp` | medium | A program runs from a temporary or cache directory, where downloads land. |
 | `keyboard-reader` | medium | A program no package installed reads the keyboard device directly. |
 | `risky-configuration` | medium | A configuration file redirects where programs, packages or web pages come from, or loads code into a program at every start. |
@@ -1076,6 +1215,7 @@ reviews as well, are listed under [Local rules](local-rules.md#rule-ids).
 | `network-relay` | medium | A tool that runs or forwards what it is told over the network (netcat, socat, a tunnel) listens or is connected. |
 | `traced-process` | medium | Another process is attached to this one the way a debugger is, and can read and change its memory. |
 | `kernel-tap` | medium | Something no package explains taps the kernel's network or tracing path: a raw packet socket, or a pinned eBPF object. |
+| `kept-from-review` | medium | Something runs this file, or a shell reads it in, and it holds more than opaque values kept in secret-named or plainly inert variables; its path marks it as holding secrets, so the AI review did not read it: only the local rules did. Read it yourself; `sweep allow` records that you did. |
 | `network-listener` | low | A program listens on the network that nothing installed accounts for: an interpreter (Python, a shell, Node), or a packaged program no packaged service runs. |
 
 `git-config-command` and `remote-shell` are reported by the sweep as well as

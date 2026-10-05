@@ -11,9 +11,9 @@ use crate::autorun::Category;
 
 /// Programs that run the file they are given.
 const INTERPRETERS: &[&str] = &[
-    "sh", "bash", "dash", "zsh", "fish", "ksh", "python", "python3", "perl", "ruby", "node", "bun",
-    "deno", "lua", "luajit", "php", "tclsh", "wish", "expect", "Rscript", "pwsh", "julia", "guile",
-    "awk", "gawk", "mawk",
+    "sh", "bash", "dash", "zsh", "fish", "ksh", "ash", "mksh", "python", "python3", "perl", "ruby",
+    "node", "bun", "deno", "lua", "luajit", "php", "tclsh", "wish", "expect", "Rscript", "pwsh",
+    "julia", "guile", "awk", "gawk", "mawk",
 ];
 
 /// A wrapper that runs the command after it: its name, its options that
@@ -113,9 +113,77 @@ pub fn default_search(home: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether `path` (relative to the root) is the script the SSH server runs
+/// at every login: `~/.ssh/rc` or `/etc/ssh/sshrc`. It is a shell script,
+/// not configuration, whatever directory it sits in.
+pub fn is_ssh_rc(path: &str) -> bool {
+    path == "etc/ssh/sshrc" || path.ends_with("/.ssh/rc")
+}
+
+/// The shells whose scripts are looked through for what they start.
+const SCRIPT_SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "ksh", "ash", "mksh"];
+
+/// Whether `name` (a program's file name) is one of `SCRIPT_SHELLS`.
+pub fn is_script_shell(name: &str) -> bool {
+    SCRIPT_SHELLS.contains(&name)
+}
+
+/// The shell a `#!` line (without the `#!`) runs, if it runs one: the
+/// program itself, the one `env` is told to start (past its options, the
+/// variables it sets or unsets, and inside the one word `-S` takes), or
+/// the shell `busybox` is asked to be.
+fn shebang_shell(line: &str) -> Option<&str> {
+    fn named(word: &str) -> &str {
+        word.rsplit('/').next().unwrap_or(word)
+    }
+    let mut words = line.split_whitespace().peekable();
+    let mut name = named(words.next()?);
+    if name == "env" {
+        loop {
+            let word = words.next()?;
+            if matches!(word, "-u" | "--unset" | "-C" | "--chdir") {
+                words.next();
+            } else if !(word.starts_with('-') || word.contains('=')) {
+                name = named(word);
+                break;
+            }
+        }
+    }
+    if name == "busybox" {
+        name = named(words.next()?);
+    }
+    is_script_shell(name).then_some(name)
+}
+
+/// Whether the file at `path` with content `text` is a shell script: its
+/// first line names one of `SCRIPT_SHELLS` (also through `env` or
+/// `busybox`, and after a byte-order mark), or it has no such line and its
+/// name ends in one of theirs (`x.sh`). A script of another interpreter
+/// (Python, Perl, Node, fish) is not read as one.
+pub fn is_shell_script(path: &str, text: &str) -> bool {
+    let first = text
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .next()
+        .unwrap_or_default();
+    if let Some(line) = first.strip_prefix("#!") {
+        return shebang_shell(line).is_some();
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    SCRIPT_SHELLS
+        .iter()
+        .any(|shell| read::has_extension(name, shell))
+}
+
 /// The command lines `text` (a file of `category` named `name`) runs.
 pub fn commands(category: Category, path: &str, text: &str) -> Vec<String> {
     let name = path.rsplit('/').next().unwrap_or(path);
+    // The login script of the SSH server is read as the shell script it is.
+    let category = if is_ssh_rc(path) {
+        Category::Shell
+    } else {
+        category
+    };
     // logrotate's files are no crontabs: what their `postrotate` scripts
     // run is reviewed as the text it is.
     if path.starts_with("etc/logrotate") {
@@ -927,10 +995,13 @@ fn started(line: &str) -> Vec<String> {
 /// `/etc/cron.d/`) have. Environment lines run nothing; a script (in
 /// `cron.daily/` and the like) is reviewed as the file it is.
 fn crontab(path: &str, text: &str) -> Vec<String> {
-    if text.starts_with("#!") {
+    let system = path == "etc/crontab" || path.starts_with("etc/cron.d/");
+    // A script in `cron.daily` and the like is no table of jobs. A table
+    // is one whatever its first line: `#` starts a comment in it, `#!` too.
+    let table = system || path == "etc/anacrontab" || path.starts_with("var/spool/cron/");
+    if text.starts_with("#!") && !table {
         return Vec::new();
     }
-    let system = path == "etc/crontab" || path.starts_with("etc/cron.d/");
     let mut found = Vec::new();
     for line in text.lines() {
         let line = line.trim();
@@ -1123,6 +1194,20 @@ pub fn ssh(line: &str) -> Option<(String, String)> {
         .then_some((key, runs))
 }
 
+/// The files a unit reads into its environment (`EnvironmentFile=`), as
+/// `commands` gives them. systemd reads such a file as `NAME=value` lines
+/// and nothing else: it sets variables, and can run nothing.
+pub fn environment_files(path: &str, text: &str) -> Vec<String> {
+    text.replace("\\\n", " ")
+        .lines()
+        .filter_map(|line| line.trim().split_once('='))
+        .filter(|(key, _)| key.trim() == "EnvironmentFile")
+        .map(|(_, value)| value.trim().trim_start_matches('-'))
+        .filter(|file| !file.is_empty())
+        .map(|file| with_specifiers(path, file))
+        .collect()
+}
+
 /// The files an SSH client or server file reads as more configuration or
 /// as lists of keys and names, as `ssh` gives them: an `Include`, and the
 /// server's key and principal files. They are read, not run: what any
@@ -1203,6 +1288,7 @@ pub fn targets_where(home: &str, command: &str, exists: &dyn Fn(&str) -> bool) -
         search: &default_search(home),
         exists,
         capped: std::cell::Cell::new(false),
+        shell_scripts: std::cell::RefCell::default(),
     }
     .targets(command)
 }
@@ -1219,6 +1305,10 @@ pub struct Lookup<'a> {
     pub exists: &'a dyn Fn(&str) -> bool,
     /// Set when a line held more commands than are looked up.
     pub capped: std::cell::Cell<bool>,
+    /// The files a shell was handed as its script (`sh /x/run`): that a
+    /// shell runs a file is what says it is a shell script, whatever its
+    /// name and first line.
+    pub shell_scripts: std::cell::RefCell<Vec<String>>,
 }
 
 impl Lookup<'_> {
@@ -1228,12 +1318,11 @@ impl Lookup<'_> {
     }
 }
 
-fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
-    let mut words = split(command);
-    let mut found = Vec::new();
-    // Leading assignments and wrappers, with the wrappers' own options and
-    // words: what runs is the command after them. A wrapper found anywhere
-    // but in `/usr/bin` (a `sudo` in `~/.local/bin`) is what runs first.
+/// Steps past what comes before a command in `words`: leading assignments
+/// and wrappers, with the wrappers' own options and words. Returns where
+/// the command starts. A wrapper found anywhere but in `/usr/bin` (a
+/// `sudo` in `~/.local/bin`) is what runs first, and is added to `found`.
+fn past_wrappers(lookup: &Lookup<'_>, words: &mut Vec<String>, found: &mut Vec<String>) -> usize {
     let mut at = 0;
     while let Some(word) = words.get(at).cloned() {
         let name = word.rsplit('/').next().unwrap_or(&word);
@@ -1284,12 +1373,25 @@ fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
             break;
         }
     }
-    let mut words = words.iter().skip(at).map(String::as_str);
+    at
+}
+
+fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
+    let mut words = split(command);
+    let mut found = Vec::new();
+    let at = past_wrappers(lookup, &mut words, &mut found);
+    let mut words = words.iter().skip(at).map(String::as_str).peekable();
     let Some(program) = words.next() else {
         return found;
     };
     found.extend(locate(lookup, program));
-    let name = program.rsplit('/').next().unwrap_or(program);
+    let mut name = program.rsplit('/').next().unwrap_or(program);
+    // `busybox sh script`: the shell is the applet it is asked to be.
+    if name == "busybox"
+        && let Some(applet) = words.next_if(|applet| is_script_shell(applet))
+    {
+        name = applet;
+    }
     let interpreter = INTERPRETERS.iter().any(|interpreter| {
         name == *interpreter
             || name
@@ -1322,7 +1424,7 @@ fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
             }
             // `bash -o pipefail …`: for a shell the option's name is not
             // the script. For Python `-O` is a plain flag.
-            let shell = matches!(name, "sh" | "bash" | "dash" | "zsh");
+            let shell = is_script_shell(name);
             if shell && matches!(word, "-o" | "-O" | "+o" | "+O") {
                 words.next();
                 continue;
@@ -1331,7 +1433,14 @@ fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
                 continue;
             }
             if word.contains('/') {
-                found.extend(locate(lookup, word));
+                let script = locate(lookup, word);
+                if shell {
+                    lookup
+                        .shell_scripts
+                        .borrow_mut()
+                        .extend(script.iter().cloned());
+                }
+                found.extend(script);
             }
             break;
         }
@@ -1460,6 +1569,41 @@ mod tests {
     use super::{commands, targets, targets_where};
     use crate::autorun::Category;
     use crate::test_support::TempDir;
+
+    #[test]
+    fn a_shell_script_is_told_by_its_first_line_or_its_name() {
+        use super::is_shell_script;
+        for first in [
+            "#!/bin/sh",
+            "#! /bin/bash -e",
+            "#!/usr/bin/env bash",
+            "#!/usr/bin/env -S bash -e",
+            "#!/usr/bin/env -S -i bash",
+            "#!/usr/bin/env -u VAR bash",
+            "#!/usr/bin/env A=1 zsh",
+            "#!/bin/busybox sh",
+            "#!/bin/ash",
+            "#!/bin/mksh",
+            "\u{feff}#!/bin/sh",
+        ] {
+            assert!(is_shell_script("x", &format!("{first}\ntrue\n")), "{first}");
+        }
+        for first in [
+            "#!/usr/bin/python3",
+            "#!/usr/bin/env python3",
+            "#!/usr/bin/fish",
+            "#!/bin/busybox awk",
+            "#!/usr/bin/env -u bash python3",
+        ] {
+            assert!(
+                !is_shell_script("x.sh", &format!("{first}\ntrue\n")),
+                "{first}"
+            );
+        }
+        // Without such a line, the name says.
+        assert!(is_shell_script("run.sh", "true\n"));
+        assert!(!is_shell_script("run", "true\n"));
+    }
 
     #[test]
     fn commands_are_found_per_kind_of_file() {
@@ -1829,6 +1973,7 @@ mod tests {
             search: &[],
             exists: &|_| false,
             capped: std::cell::Cell::new(false),
+            shell_scripts: std::cell::RefCell::default(),
         };
         lookup.targets(&nested);
         assert!(lookup.capped.get());
@@ -1932,6 +2077,7 @@ mod tests {
                 ["home/u/.local/share/mise/shims/sh", "usr/bin/sh"].contains(&candidate)
             },
             capped: std::cell::Cell::new(false),
+            shell_scripts: std::cell::RefCell::default(),
         };
         assert_eq!(
             lookup.targets("sh -c true"),

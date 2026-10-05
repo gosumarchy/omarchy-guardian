@@ -247,6 +247,17 @@ fn git_config_findings(report: &mut Report, rel: &str, text: &str) {
 
 /// Applies the local checks to one text file and queues it for the AI review.
 pub fn analyze_text(report: &mut Report, rel: &str, text: &str, inspect_dependencies: bool) {
+    analyze(report, rel, text, inspect_dependencies, true);
+}
+
+/// Applies the local checks to one text file that stays on this machine:
+/// nothing of it is queued for the AI review, and that it is not is no gap
+/// of the review (the caller says why it is kept, see `sweep::judge`).
+pub fn analyze_text_locally(report: &mut Report, rel: &str, text: &str) {
+    analyze(report, rel, text, false, false);
+}
+
+fn analyze(report: &mut Report, rel: &str, text: &str, inspect_dependencies: bool, queue: bool) {
     // These two read every text file, prose included, since that is where
     // text for the reviewer and hidden characters hide.
     analyze_reviewer_text(report, rel, text);
@@ -259,7 +270,9 @@ pub fn analyze_text(report: &mut Report, rel: &str, text: &str, inspect_dependen
     if text.lines().next() == Some(LFS_POINTER) {
         report.gaps.push(Gap::UnresolvedLfs(rel.to_string()));
     }
-    queue_for_agent(report, rel, text);
+    if queue {
+        queue_for_agent(report, rel, text);
+    }
 
     let documentation = rules::is_documentation(rel);
     let inventory_network = !documentation && rules::is_executable_or_runtime_config(rel);

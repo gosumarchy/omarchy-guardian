@@ -919,6 +919,7 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
         state_root: state_root.as_deref(),
         context: &[],
     };
+    judge::note_kept(&mut collection.items, home.as_deref());
     let mut report = judge::judge(&collection, home.as_deref(), &context, &news);
     report.gaps.extend(
         index
@@ -998,6 +999,7 @@ mod tests {
 
     fn item(path: &str, category: Category, text: &str) -> Item {
         Item {
+            file: None,
             origin: Origin::User,
             category,
             path: path.into(),

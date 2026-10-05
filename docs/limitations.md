@@ -41,8 +41,11 @@ matter most:
   inside of the initramfs image are not looked at; other mounted filesystems
   (`/mnt`, `/media`, `/run/media`) are not searched for setuid files; the
   running kernel's modules are not checked between a kernel update and the
-  next boot; and what a process does to its own environment after it started
-  is not seen ([System sweep](system-sweep.md)).
+  next boot; what a process does to its own environment after it started is
+  not seen; and only shell scripts no package vouches for are looked through
+  for what they start, three deep, not scripts of other interpreters, and
+  inside a script only a program named by a path in the place of a command
+  ([System sweep](system-sweep.md#where-following-stops)).
 - **Packages:** only scriptlets, auto-run files and the text files those name
   are reviewed, not the rest of the payload; a removal is not reviewed; a unit
   you enable yourself later is not reviewed then; front ends that call libalpm
@@ -60,11 +63,18 @@ matter most:
   under `local-only`, and except the files kept from the AI by name or kind
   (SSH and git files in a home, package-manager settings that hold registry
   tokens, an editor's `settings.json`, fish's saved variables, `/etc/hosts`,
-  `at` jobs); a secret under a name Guardian does not recognise still goes
-  with its file ([System sweep](system-sweep.md#what-goes-to-the-review)).
-  Under `local-only` no source is sent to an AI, but lockfile package names
-  and versions still go to the OSV API (`api.osv.dev`), and an AUR package's
-  name (and the names in its PKGBUILD's `pkgname=` lines) to the AUR.
+  `at` jobs). A file whose path marks it as holding secrets is never sent, by
+  any gate or by the sweep, whatever runs it; where something runs it, the
+  sweep says so in a finding (`kept-from-review`) and only the local rules
+  have read it, unless every line of it only keeps an opaque value in a
+  secret-named or plainly inert variable. A secret under a name Guardian does
+  not recognise, with a blank or punctuation in it, in YAML or JSON form, as a
+  command-line argument, or a key block in a file whose path gives no hint,
+  still goes with its file ([System
+  sweep](system-sweep.md#what-is-taken-out-of-a-file-that-is-sent)). Under
+  `local-only` no source is sent to an AI, but lockfile package names and
+  versions still go to the OSV API (`api.osv.dev`), and an AUR package's name
+  (and the names in its PKGBUILD's `pkgname=` lines) to the AUR.
 - **Releases:** a first install cannot check the release signature (there is
   no installed key yet), and someone who controls where you pull from can
   withhold a newer release, though not forge one; see [Verifying a

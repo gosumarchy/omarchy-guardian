@@ -785,6 +785,7 @@ mod tests {
         use crate::sweep::tier::Tier;
 
         let item = |path: &str, rule: Option<RuleId>| Item {
+            file: None,
             origin: Origin::Root,
             category: Category::Systemd,
             path: path.into(),

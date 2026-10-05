@@ -114,6 +114,7 @@ fn has_usable_password(field: &str) -> Option<bool> {
 /// compared, `path` names it (`etc/group#wheel:u`).
 fn fact(origin: Origin, path: String, text: String, note: String) -> Item {
     Item {
+        file: None,
         origin,
         category: Category::Account,
         path,

@@ -463,6 +463,7 @@ mod tests {
     #[test]
     fn the_page_escapes_what_it_lists() {
         let item = Item {
+            file: None,
             origin: Origin::Root,
             category: Category::Shell,
             path: "home/u/<b>evil</b>".into(),

@@ -332,11 +332,10 @@ impl Found {
         note: String,
         alert: Option<RuleId>,
     ) {
-        let item = self.items.entry(name.to_string()).or_insert_with(|| {
-            let mut item = collect::item(scope, category, path.to_string(), None);
-            item.path = name.to_string();
-            item
-        });
+        let item = self
+            .items
+            .entry(name.to_string())
+            .or_insert_with(|| collect::item_named(scope, category, name, path));
         push_note(item, note.clone());
         if let Some(rule) = alert
             && !item.alerts.iter().any(|(existing, _)| *existing == rule)
@@ -357,6 +356,7 @@ impl Found {
         rule: RuleId,
     ) {
         let item = self.items.entry(path.to_string()).or_insert_with(|| Item {
+            file: None,
             origin: scope.origin,
             category,
             path: path.to_string(),

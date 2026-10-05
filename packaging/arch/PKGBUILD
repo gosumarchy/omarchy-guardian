@@ -98,8 +98,7 @@ package() {
         install -Dm644 "integrations/systemd/$unit" "$pkgdir/usr/lib/systemd/system/$unit"
     done
     # The README links to the pages under docs/ and to SECURITY.md by
-    # relative path, so they are installed in the same layout. The design
-    # notes under docs/superpowers are not part of the documentation.
+    # relative path, so they are installed in the same layout.
     install -Dm644 README.md "$pkgdir/usr/share/doc/omarchy-guardian/README.md"
     install -Dm644 SECURITY.md "$pkgdir/usr/share/doc/omarchy-guardian/SECURITY.md"
     install -Dm644 -t "$pkgdir/usr/share/doc/omarchy-guardian/docs" docs/*.md

@@ -350,6 +350,7 @@ pub fn of_account(scope: &Scope<'_>, home: &str, uid: u32) -> Vec<Item> {
                 None => return None,
             };
             let mut item = Item {
+                file: None,
                 origin: Origin::Root,
                 category: Category::Systemd,
                 path,
