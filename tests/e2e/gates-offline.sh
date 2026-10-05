@@ -551,6 +551,14 @@ makepkg_jail() {
     write_user_config $'[class.aur]\nai = "off"\nconfirm = false\n'
 
     recipe $'source=(hello.sh)\nsha256sums=(SKIP)' $'build() { :; }\n'"$package"
+    # A helper reads makepkg's standard output on such a call (yay takes the
+    # package names from it), so nothing of Guardian's may be in it.
+    (cd "$build" && setsid -w "${sandbox[@]}" "$BINARY" makepkg-gate -- /usr/bin/makepkg --packagelist \
+        </dev/null >"$E2E/stdout" 2>"$OUT")
+    expect 'a call that only prints is passed on' 0 "$?"
+    check "Guardian writes nothing to makepkg's standard output" test ! -s "$E2E/stdout"
+    expect_output 'and says what it reviewed on standard error' 'Omarchy Guardian'
+
     jail_gate --noconfirm
     expect 'a clean build is started' 0 "$?"
     expect_output 'its sources were extracted and reviewed' 'Upstream: 1 of 1 code and build file(s) reviewed'

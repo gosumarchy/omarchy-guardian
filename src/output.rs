@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 static WARNED: AtomicBool = AtomicBool::new(false);
+static DIVERTED: AtomicBool = AtomicBool::new(false);
 
 /// Everything written through these functions, kept so a blocked review's
 /// report can be saved for the notification to open.
@@ -87,10 +88,23 @@ macro_rules! outln {
     };
 }
 
+/// From here on, what Guardian prints goes to standard error. For a gate
+/// that stands in front of a command whose standard output a program reads
+/// (yay takes the package names from `makepkg --packagelist`): one line of
+/// Guardian's in it and the reader takes it for the command's.
+pub fn leave_stdout_to_the_command() {
+    DIVERTED.store(true, Ordering::Relaxed);
+}
+
 pub fn stdout(args: fmt::Arguments) {
     let text = args.to_string();
     let safe = crate::text::terminal_safe(&text);
     capture(format_args!("{safe}"));
+    if DIVERTED.load(Ordering::Relaxed) {
+        // A failed write to stderr has nowhere to be reported.
+        let _ = io::stderr().lock().write_all(safe.as_bytes());
+        return;
+    }
     if let Err(error) = write_ignoring_broken_pipe(&mut io::stdout().lock(), format_args!("{safe}"))
         && !WARNED.swap(true, Ordering::Relaxed)
     {
