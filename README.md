@@ -34,7 +34,9 @@ gate can be audited in one place. It builds only for Linux.
   anywhere else goes with its file. Package names and versions from lockfiles
   go to the OSV API (`api.osv.dev`), and an AUR package's name goes to the
   AUR. The `local-only` level sends nothing to an AI; the OSV and AUR lookups
-  remain.
+  remain. Once a day the sweep asks the project's repository on GitHub for
+  its release tags, sending nothing about your machine (`[update] check =
+  "off"` turns that off).
 - **Each review is one or more AI calls** on your subscription or API account:
   by default up to 8 calls of up to 256 KiB each. System updates with
   scriptlets, every AUR build and the daily sweep all make calls. Unchanged
@@ -171,6 +173,12 @@ release](docs/install.md#verifying-a-release).
 
 An installed Guardian older than 0.8.0 has no release keys and no upgrade
 check: there it is `git pull && ./install.sh`, with the tag checked by hand.
+
+Guardian tells you when a newer release is out, and installs nothing by
+itself: the daily sweep asks the project's repository for its release tags,
+and a newer one shows as one notification and in the bar. `omarchy-guardian
+update` asks now. See [Hearing of a new
+release](docs/install.md#hearing-of-a-new-release).
 
 ## Commands
 

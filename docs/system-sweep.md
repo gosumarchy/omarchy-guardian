@@ -1003,6 +1003,10 @@ never read.
 
 `protect --off` turns both timers off and keeps your answer.
 
+The scheduled sweep ends by asking whether a newer release of Guardian is out
+(see [Hearing of a new release](install.md#hearing-of-a-new-release)); a sweep
+run by hand does not.
+
 The user unit gives up what the sweep and the AI reviewer it starts do not
 need (gaining privileges, making set-id files, real-time priority, another
 system-call interface). It cannot be given a read-only system the way the

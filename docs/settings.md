@@ -125,6 +125,10 @@ catches things breaking and crude tampering (a line removed from `~/.bashrc`),
 not a program running as you that also rewrites the record. A dismissed-blocks
 mark that names a report newer than any saved one is not believed.
 
+A release newer than the installed one, found by the daily check (see
+[Hearing of a new release](install.md#hearing-of-a-new-release)), is listed
+with how to upgrade. It is not a problem and does not change the knight.
+
 In Waybar the knight's tooltip lists the gates, problems and last block;
 left-click opens the settings app and right-click the last report. In
 Omarchy's shell bar it opens a panel with the same details and tiles for the
@@ -198,6 +202,10 @@ Read from the system file only: `official_repos`, `trusted_reviewer_packages`,
 the user file `[sweep]`, `[acknowledged]` and `[permit]` are ignored with a
 warning.
 
+`[update] check = "off"` is read from both files and turns the daily check
+for a newer release off when either says so (see [Hearing of a new
+release](install.md#hearing-of-a-new-release)).
+
 The user file is yours, so any program running as you can write it. Two things
 keep that from quietly switching a gate off:
 
@@ -233,6 +241,9 @@ An example with every kind of setting:
 profile = "standard"             # standard | strict | local-only
 
 official_repos = ["core", "extra", "multilib", "omarchy"]   # system file only
+
+[update]
+check = "on"                          # on | off; off in either file is off
 
 [agent]
 model = "claude-code/claude-sonnet-5-5"   # the Claude Code CLI; omit for OpenCode's default

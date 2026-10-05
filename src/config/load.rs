@@ -376,6 +376,12 @@ impl Settings {
         self.system.permit_strict == Some(true)
     }
 
+    /// Whether Guardian asks, once a day, for a newer release of itself:
+    /// unless either file turns it off.
+    pub fn checks_for_updates(&self) -> bool {
+        self.system.update_check != Some(false) && self.user.update_check != Some(false)
+    }
+
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }
@@ -560,6 +566,23 @@ mod tests {
             settings.policy(SourceClass::Aur).ai,
             AiRequirement::Required
         );
+    }
+
+    #[test]
+    fn either_file_turns_the_check_for_a_newer_release_off() {
+        let with = |check: Option<bool>| PartialConfig {
+            update_check: check,
+            ..PartialConfig::default()
+        };
+        let checks =
+            |system, user| Settings::from_parts(with(system), with(user)).checks_for_updates();
+        assert!(checks(None, None));
+        assert!(checks(Some(true), Some(true)));
+        assert!(!checks(Some(false), None));
+        assert!(!checks(None, Some(false)));
+        // Neither file turns back on what the other turned off.
+        assert!(!checks(Some(false), Some(true)));
+        assert!(!checks(Some(true), Some(false)));
     }
 
     #[test]

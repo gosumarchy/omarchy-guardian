@@ -57,10 +57,14 @@ omarchy-guardian sweep
 - `ask REPORT-ID` opens your AI agent in a new terminal on a saved report,
   with every tool switched off (see [The report](permits.md#the-report)). The
   report is sent to your AI provider.
-- `status` prints the gates, the problems and the last block as one line of
-  JSON, which the bar reads. `--waybar` prints the Waybar module's form,
+- `status` prints the gates, the problems, the last block and a newer
+  release the last check found as one line of JSON, which the bar reads. `--waybar` prints the Waybar module's form,
   `--dismiss` marks blocks and dropped gates as seen, `--open-report` opens
   the last report.
+- `update` asks the project's repository whether a release newer than the
+  installed one is out, and prints how to upgrade. It installs nothing (see
+  [Hearing of a new release](install.md#hearing-of-a-new-release)); it exits
+  `2` when the list of releases could not be fetched.
 - `protect` turns every gate on and `protect --off` the install gates and the
   sweep off, showing each step and asking first; `--yes` skips the question.
 - `test` tests the saved reviewer with a malicious and a harmless sample; it

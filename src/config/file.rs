@@ -85,6 +85,9 @@ pub struct PartialConfig {
     /// Whether a blocked install can be permitted under the strict level
     /// (`[permit] strict = "allowed"`; system file only).
     pub permit_strict: Option<bool>,
+    /// Whether the scheduled sweep asks for a newer release of Guardian
+    /// (`[update] check = "off"` in either file turns it off).
+    pub update_check: Option<bool>,
     pub agent: AgentDefaults,
     pub classes: Vec<(SourceClass, PartialPolicy)>,
 }
@@ -228,6 +231,13 @@ fn apply(
                 "allowed" => true,
                 "off" => false,
                 _ => return Err(field.error("expected \"allowed\" or \"off\"")),
+            });
+        }
+        ["update", "check"] => {
+            config.update_check = Some(match field.text(value)?.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => return Err(field.error("expected \"on\" or \"off\"")),
             });
         }
         ["agent", "model"] => config.agent.model = Some(field.model(value)?),
@@ -422,6 +432,17 @@ mod tests {
     use std::path::Path;
 
     use super::{PartialPolicy, is_weaker_key, parse};
+
+    #[test]
+    fn the_check_for_a_newer_release_is_on_or_off() {
+        let check = |text: &str| parse(Path::new("user"), text).map(|config| config.update_check);
+        assert_eq!(check("").unwrap(), None);
+        assert_eq!(check("[update]\ncheck = \"on\"\n").unwrap(), Some(true));
+        assert_eq!(check("[update]\ncheck = \"off\"\n").unwrap(), Some(false));
+        assert!(check("[update]\ncheck = \"never\"\n").is_err());
+        assert!(check("[update]\ncheck = false\n").is_err());
+        assert!(check("[update]\nurl = \"https://x.example\"\n").is_err());
+    }
 
     #[test]
     fn permits_under_the_strict_level_are_allowed_or_off() {

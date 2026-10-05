@@ -51,6 +51,7 @@ Usage:
   omarchy-guardian ask <report-id>                  (open your AI agent on a saved report)
   omarchy-guardian status [--waybar | --dismiss | --open-report]
                                                     (bar widget status; mark blocks seen; open the last report)
+  omarchy-guardian update                           (is there a newer release? installs nothing)
   omarchy-guardian tui [--expert]                   (settings app; --expert shows every setting)
 
 CLASS: aur, theme, plugin, source (default). PROFILE: standard, strict, local-only.
@@ -134,6 +135,7 @@ enum Invocation {
     Ask(String),
     /// `status [--waybar | --dismiss | --open-report]`.
     Status(StatusMode),
+    Update,
     Tui {
         expert: bool,
     },
@@ -274,6 +276,7 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
         Invocation::SweepCollect { out } => sweep::root::collect_command(out, &settings),
         Invocation::SweepAllowSystem(arguments) => sweep::root::system_allow_command(&arguments),
         Invocation::Status(mode) => status_command(mode),
+        Invocation::Update => crate::update::command(),
         Invocation::Ask(target) => {
             errln!("omarchy-guardian ask: {}", ask::run(&target, &settings));
             ExitCode::from(2)
@@ -1040,6 +1043,8 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
                 Err("usage: omarchy-guardian status [--waybar | --dismiss | --open-report]".into())
             }
         },
+        Some("update") if rest.is_empty() => Ok(Invocation::Update),
+        Some("update") => Err("usage: omarchy-guardian update".into()),
         Some("ask") => match rest {
             [target] => target
                 .to_str()
