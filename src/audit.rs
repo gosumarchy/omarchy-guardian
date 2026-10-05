@@ -348,7 +348,7 @@ pub struct Reviewed<'a> {
     /// The class, or classes, of what was reviewed.
     pub class: &'a str,
     pub subject: &'a str,
-    /// The SHA-256 of what was reviewed (see the README for each gate).
+    /// The SHA-256 of what was reviewed (see docs/permits.md for each gate).
     pub digest: &'a str,
     pub decision: Decision,
     /// The permit that let it through, if one did.

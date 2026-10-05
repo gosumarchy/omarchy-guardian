@@ -338,7 +338,7 @@ else
         unchecked\ *)
             ok "This checkout matches release tag ${state#unchecked }: no file changed, none added"
             note "The installed Guardian carries no release keys, so the signature is not checked."
-            note "To check it yourself, see 'Verifying a release' in the README."
+            note "To check it yourself, see 'Verifying a release' in docs/install.md."
             ;;
         *)
             why=${state#unsigned }

@@ -1,6 +1,6 @@
 [Unit]
 Description=Omarchy Guardian system sweep
-Documentation=file:///usr/share/doc/omarchy-guardian/README.md
+Documentation=file:///usr/share/doc/omarchy-guardian/docs/system-sweep.md
 
 [Service]
 Type=oneshot
