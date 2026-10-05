@@ -153,6 +153,7 @@ fn command_line(scope: &Scope<'_>, boot: &mut Boot) {
     }
     let running = running.trim().to_string();
     boot.items.push(Item {
+        file: None,
         origin: scope.origin,
         category: Category::Boot,
         path: COMMAND_LINE.into(),

@@ -632,6 +632,7 @@ mod tests {
 
     fn item(path: &str, text: &str) -> Item {
         Item {
+            file: None,
             origin: Origin::User,
             category: Category::Shell,
             path: path.into(),

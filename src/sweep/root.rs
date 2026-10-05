@@ -650,6 +650,7 @@ fn item_from_json(json: &Json) -> Option<Item> {
         _ => return None,
     };
     Some(Item {
+        file: None,
         origin: Origin::Root,
         category: Category::from_name(text("category")?)?,
         path: path.to_string(),
@@ -1202,6 +1203,7 @@ mod tests {
 
     fn item(path: &str, origin: Origin, tier: Tier, body: Body) -> Item {
         Item {
+            file: None,
             origin,
             category: Category::Sudo,
             path: path.into(),
