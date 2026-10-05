@@ -539,7 +539,7 @@ impl RuleId {
         ),
         (
             Self::KeptFromReview,
-            "Something runs this file, or a shell reads it in and it holds more than settings of variables to plain values, and its path marks it as holding secrets, so the AI review did not read it: only the local rules did. Read it yourself; `sweep allow` records that you did.",
+            "Something runs this file, or a shell reads it in, and it holds more than opaque values kept in secret-named or plainly inert variables; its path marks it as holding secrets, so the AI review did not read it: only the local rules did. Read it yourself; `sweep allow` records that you did.",
         ),
         (
             Self::RemoteCodeInstall,

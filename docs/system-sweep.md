@@ -753,18 +753,34 @@ with no text to send), and being kept makes no sweep incomplete.
   - it is the SSH login script;
   - a live check found it running as a script.
 
-  Two ordinary cases raise nothing. A file a unit only reads as its
+  Two ordinary cases are passed over. A file a unit only reads as its
   `EnvironmentFile=` is a list of variables to systemd, which can run nothing
-  from it. And a file that does nothing but set variables to literals holds no
-  command: `NAME=value` (also after `export`, several on a line), fish's `set
-  -gx NAME value`, Hyprland's `env = NAME,value` and `$name = value`, blank
-  lines and comments. Anything else in the file makes it a finding: a `$`, a
-  backtick or a backslash anywhere, `;`, `&`, `|`, a redirection or a bracket
-  outside quotes, a quote left open, a command after an assignment, `source`,
-  `eval`, `alias`, a function, or a variable that decides what runs or is
-  loaded (`PATH`, `LD_PRELOAD`, `PROMPT_COMMAND`, a proxy and the like). When
-  in doubt the finding is raised. A secret nothing runs (a key or an `.env`
-  that a process was merely handed) raises nothing either.
+  from it. And the finding is skipped for a file whose every line only keeps
+  a value in a variable, which is what the usual file of exported keys looks
+  like. A line counts as that when all of this holds:
+
+  - it is written as `NAME=value` (also after `export`, several on a line),
+    fish's `set -gx NAME value`, Hyprland's `env = NAME,value` or `$name =
+    value`, or is blank or a comment;
+  - the name says secret (as for masking, below), or is a plainly inert
+    setting: `LANG`, `LC_*`, `TZ`, `TERM`, `COLORTERM`, `USER`, `LOGNAME`,
+    `HOSTNAME`, `EMAIL`, or a name ending in `_ID`, `_REGION`, `_PROFILE`,
+    `_ACCOUNT`, `_USER`, `_USERNAME`, `_NAME`, `_ORG`, `_PROJECT`, `_ENV`,
+    `_STAGE`, `_TENANT`, `_DATABASE`, `_DB`, `_PORT` or `_MODEL`;
+  - the value is one opaque word: no `/`, no leading `~` or `.`, no `://`, no
+    blank.
+
+  Anything else raises the finding: any other variable, whatever it is called
+  (most of what redirects a program is a variable set to a path, and no list
+  of such names is ever complete); a value that is a path or an address; a
+  `$`, a backtick or a backslash anywhere; `;`, `&`, `|`, a redirection or a
+  bracket outside quotes; a quote left open; a command after an assignment;
+  `source`, `eval`, `alias`, a function. `PATH`, `LD_*`, `PROMPT_COMMAND`,
+  `BASH_ENV`, a proxy and their like raise it even where their name ends like
+  an inert one. Which names are passed over is a judgement about noise, not a
+  guarantee: a file the rule does not recognise costs one finding, answered
+  with `sweep allow`. A secret nothing runs (a key or an `.env` that a process
+  was merely handed) raises nothing either.
 
   The finding shows in the sweep, in `--diff` and in the daily notification
   when new or changed, and does not make the sweep incomplete. Read the file
@@ -1199,7 +1215,7 @@ reviews as well, are listed under [Local rules](local-rules.md#rule-ids).
 | `network-relay` | medium | A tool that runs or forwards what it is told over the network (netcat, socat, a tunnel) listens or is connected. |
 | `traced-process` | medium | Another process is attached to this one the way a debugger is, and can read and change its memory. |
 | `kernel-tap` | medium | Something no package explains taps the kernel's network or tracing path: a raw packet socket, or a pinned eBPF object. |
-| `kept-from-review` | medium | Something runs this file, or a shell reads it in and it holds more than settings of variables to plain values, and its path marks it as holding secrets, so the AI review did not read it: only the local rules did. Read it yourself; `sweep allow` records that you did. |
+| `kept-from-review` | medium | Something runs this file, or a shell reads it in, and it holds more than opaque values kept in secret-named or plainly inert variables; its path marks it as holding secrets, so the AI review did not read it: only the local rules did. Read it yourself; `sweep allow` records that you did. |
 | `network-listener` | low | A program listens on the network that nothing installed accounts for: an interpreter (Python, a shell, Node), or a packaged program no packaged service runs. |
 
 `git-config-command` and `remote-shell` are reported by the sweep as well as
