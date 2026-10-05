@@ -744,15 +744,32 @@ with no text to send), and being kept makes no sweep incomplete.
   in. `/etc/ssh/sshrc` is under no such path and is reviewed like any script.
 
   Whoever writes a file picks its path, so such a path must not be a way past
-  the review. Where something runs a file kept this way (it is a file of an
-  auto-run location, a command names it, a start-up file reads it in, it is
-  the SSH login script, or a live check found it running as a script), the
-  item raises a finding of its own, `kept-from-review` (medium): the AI did
-  not read it, only the local rules did. It shows in the sweep, in `--diff`
-  and in the daily notification when new or changed, and does not make the
-  sweep incomplete. Read the file yourself; `sweep allow` records that you
-  did, bound to its content. A secret nothing runs (a key or an `.env` that a
-  process was merely handed) raises nothing.
+  the review. Where something runs a file kept this way, the item raises a
+  finding of its own, `kept-from-review` (medium): the AI did not read it,
+  only the local rules did. Something runs it when:
+
+  - it is a file of an auto-run location, or what a link there leads to;
+  - a command names it, or a start-up file reads it in;
+  - it is the SSH login script;
+  - a live check found it running as a script.
+
+  Two ordinary cases raise nothing. A file a unit only reads as its
+  `EnvironmentFile=` is a list of variables to systemd, which can run nothing
+  from it. And a file that does nothing but set variables to literals holds no
+  command: `NAME=value` (also after `export`, several on a line), fish's `set
+  -gx NAME value`, Hyprland's `env = NAME,value` and `$name = value`, blank
+  lines and comments. Anything else in the file makes it a finding: a `$`, a
+  backtick or a backslash anywhere, `;`, `&`, `|`, a redirection or a bracket
+  outside quotes, a quote left open, a command after an assignment, `source`,
+  `eval`, `alias`, a function, or a variable that decides what runs or is
+  loaded (`PATH`, `LD_PRELOAD`, `PROMPT_COMMAND`, a proxy and the like). When
+  in doubt the finding is raised. A secret nothing runs (a key or an `.env`
+  that a process was merely handed) raises nothing either.
+
+  The finding shows in the sweep, in `--diff` and in the daily notification
+  when new or changed, and does not make the sweep incomplete. Read the file
+  yourself; `sweep allow` records that you did, bound to its content. The
+  local pattern rules read the whole file in every case.
 - **SSH and git files in a home directory**: the files of the table above,
   what one of them is a link to (a `~/.gitconfig` kept in a dotfiles
   directory), and a file an SSH `Include` reads in. What is checked: an SSH
@@ -833,6 +850,10 @@ punctuation in it stays to be read, quoted or not (`SECRET='p@ss w0rd!'` goes
 with its file); so does anything after the assignment on the same line
 (`PASS=1 curl … | sh` stays whole), and a value that says where something is
 (a path, a URL).
+
+A host or a program's name assigned to a secret-named variable
+(`AUTH_HOST=updates.example.org`) is taken out like any other such value, and
+so is hidden from both layers; the line that uses the variable is not.
 
 What still goes with its file: a secret under another name, shorter than 8
 characters, with a blank or punctuation in it, in YAML or JSON `key: value`
@@ -1178,7 +1199,7 @@ reviews as well, are listed under [Local rules](local-rules.md#rule-ids).
 | `network-relay` | medium | A tool that runs or forwards what it is told over the network (netcat, socat, a tunnel) listens or is connected. |
 | `traced-process` | medium | Another process is attached to this one the way a debugger is, and can read and change its memory. |
 | `kernel-tap` | medium | Something no package explains taps the kernel's network or tracing path: a raw packet socket, or a pinned eBPF object. |
-| `kept-from-review` | medium | Something runs this file, and its path marks it as holding secrets, so the AI review did not read it: only the local rules did. Read it yourself; `sweep allow` records that you did. |
+| `kept-from-review` | medium | Something runs this file, or a shell reads it in and it holds more than settings of variables to plain values, and its path marks it as holding secrets, so the AI review did not read it: only the local rules did. Read it yourself; `sweep allow` records that you did. |
 | `network-listener` | low | A program listens on the network that nothing installed accounts for: an interpreter (Python, a shell, Node), or a packaged program no packaged service runs. |
 
 `git-config-command` and `remote-shell` are reported by the sweep as well as

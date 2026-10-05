@@ -64,9 +64,10 @@ matter most:
   (SSH and git files in a home, package-manager settings that hold registry
   tokens, an editor's `settings.json`, fish's saved variables, `/etc/hosts`,
   `at` jobs). A file whose path marks it as holding secrets is never sent,
-  by any gate or by the sweep, whatever runs it; where something runs it,
-  the sweep says so in a finding (`kept-from-review`) and only the local
-  rules have read it. A secret under a name Guardian does not recognise, with
+  by any gate or by the sweep, whatever runs it; where something runs it
+  and it holds more than settings of variables to plain values, the sweep
+  says so in a finding (`kept-from-review`) and only the local rules have
+  read it. A secret under a name Guardian does not recognise, with
   a blank or punctuation in it, in YAML or JSON form, as a command-line
   argument, or a key block in a file whose path gives no hint, still goes
   with its file ([System
