@@ -573,17 +573,12 @@ mod tests {
                 item.path.rsplit('/').next().unwrap()
             })
             .collect();
-        // Root reads a closed file anyway: there is none to play as root.
-        if uid == 0 {
-            assert_eq!(unread, ["odd.conf", "padded.conf"]);
-        } else {
-            assert_eq!(unread, ["closed.conf", "odd.conf", "padded.conf"]);
-        }
+        // Closed is what the file's mode says to its account, not what the
+        // reader can open: root, which opens everything, reports the same.
+        assert_eq!(unread, ["closed.conf", "odd.conf", "padded.conf"]);
         assert_eq!(reported.len(), 4);
         // An account that may not enter the directory is told nothing.
-        if uid != 0 {
-            fs::set_permissions(root.join("home/u"), fs::Permissions::from_mode(0o700)).unwrap();
-            assert!(of_account(&as_root, "home/u", uid + 1).is_empty());
-        }
+        fs::set_permissions(root.join("home/u"), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(of_account(&as_root, "home/u", uid + 1).is_empty());
     }
 }

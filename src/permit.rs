@@ -1009,7 +1009,7 @@ mod tests {
     use crate::error::Error;
     use crate::notify::current_uid;
     use crate::report::{Blocked, Decision, Gap, Report};
-    use crate::test_support::TempDir;
+    use crate::test_support::{NOBODY, TempDir, give};
 
     const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -1171,12 +1171,33 @@ mod tests {
             owner: 0,
             anchor: dir.path(),
         };
-        assert!(find(&roots, uid, &content, now).is_none());
+        let path = dir.path().join(&name);
+        if uid == 0 {
+            // Run as root, the file is root's: it counts for root's place
+            // until it, or its directory, is somebody else's. (Root of a
+            // user namespace with no other user in it cannot give a file
+            // away; the place of another owner below covers that.)
+            assert!(find(&roots, uid, &content, now).is_some());
+            if give(&path, NOBODY) {
+                assert!(find(&roots, uid, &content, now).is_none());
+                assert!(give(&path, 0));
+                assert!(give(dir.path(), NOBODY));
+                assert!(find(&roots, uid, &content, now).is_none());
+                assert!(give(dir.path(), 0));
+                assert!(find(&roots, uid, &content, now).is_some());
+            }
+            let others = Place {
+                owner: NOBODY,
+                ..roots
+            };
+            assert!(find(&others, uid, &content, now).is_none());
+        } else {
+            assert!(find(&roots, uid, &content, now).is_none());
+        }
 
         let own = place(dir.path());
         assert!(find(&own, uid, &content, now).is_some());
         // Writable by a group, the file or its directory.
-        let path = dir.path().join(&name);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
         assert!(find(&own, uid, &content, now).is_none());
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
@@ -1530,6 +1551,16 @@ mod tests {
         assert!(attempt(&id, &settings(Profile::Strict, None), Some("permit")).is_err());
         assert!(asked.borrow().is_empty());
         assert_eq!(pending_blocks(state.path(), super::now()).len(), 1);
+
+        // Root gives itself none: the root half records the user sudo
+        // names, and there is none. Nothing is asked and the block is kept.
+        if current_uid() == Some(0) {
+            let refused = attempt(&id, &standard, Some("permit")).unwrap_err();
+            assert!(refused.contains("not by root"), "{refused}");
+            assert!(asked.borrow().is_empty());
+            assert_eq!(pending_blocks(state.path(), super::now()).len(), 1);
+            return;
+        }
 
         // Root is given the gate, the class and the SHA-256, and no more.
         assert!(attempt(&id, &standard, Some("permit")).is_ok());

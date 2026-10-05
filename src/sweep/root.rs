@@ -1061,6 +1061,16 @@ mod tests {
         assert_eq!(allowed.keys().collect::<Vec<_>>(), ["1000:~/.bashrc"]);
     }
 
+    /// Gives `path` and everything below it to `nobody`, where root can.
+    fn give_tree(path: &std::path::Path) {
+        if path.is_dir() && !path.is_symlink() {
+            for entry in std::fs::read_dir(path).unwrap().flatten() {
+                give_tree(&entry.path());
+            }
+        }
+        crate::test_support::give(path, crate::test_support::NOBODY);
+    }
+
     #[test]
     fn root_reports_on_each_home_as_its_account_could_look_itself() {
         use std::os::unix::fs::MetadataExt;
@@ -1088,6 +1098,18 @@ mod tests {
         // A key file that is a link (to a file of root's, say) shows nothing.
         write("home/w/.ssh/real", &format!("{key} w\n"));
         std::os::unix::fs::symlink("real", root.join("home/w/.ssh/authorized_keys")).unwrap();
+        // Run as root, the homes are root's, and an account with user id 0
+        // is root, whose home is not looked at this way: the accounts are
+        // `nobody`'s then, and so are their homes where root can give them
+        // away (else they are read by what their modes show everyone).
+        let uid = if uid == 0 {
+            for home in ["home/u", "home/v", "home/w"] {
+                give_tree(&root.join(home));
+            }
+            crate::test_support::NOBODY
+        } else {
+            uid
+        };
         let passwd = format!(
             "root:x:0:0::/root:/bin/bash\nu:x:{uid}:{uid}::/home/u:/bin/bash\nv:x:{uid}:{uid}::/home/v:/bin/bash\nw:x:{uid}:{uid}::/home/w:/bin/bash\nsvc:x:{uid}:{uid}::/srv/svc:/bin/bash\n"
         );

@@ -44,6 +44,16 @@ pub fn write_script(path: &Path, body: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+/// The user `nobody`: the second account of a test that runs as root.
+pub const NOBODY: u32 = 65534;
+
+/// Makes `path` (itself, not what is below it, and not what a link leads
+/// to) the user `owner`'s. Only root can, and not root of a user namespace
+/// that maps no such user: `false` then, for the test to do without.
+pub fn give(path: &Path, owner: u32) -> bool {
+    std::os::unix::fs::lchown(path, Some(owner), None).is_ok()
+}
+
 /// Tests that need an Arch tool skip themselves where it is missing.
 pub fn tool_available(path: &str) -> bool {
     Path::new(path).is_file()
