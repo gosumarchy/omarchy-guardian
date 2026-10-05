@@ -1143,22 +1143,53 @@ content that tries to steer its reviewer is not trusted to be clear."
     })
 }
 
+/// Reads one finding of the reply. A finding is the model saying something
+/// is wrong, so one written a little off the asked shape (two files named
+/// in a list, a line given as "3-5", a severity it made up) is kept and
+/// read as strictly as it can be, never dropped: voiding the whole reply
+/// over it would turn a block with its reasons into a review that failed.
+/// Only something that is not an object at all is malformed.
 fn parse_finding(value: &Json) -> Option<AgentFinding> {
-    let text = |key: &str| value.get(key).and_then(Json::as_str).map(str::to_string);
-    let line = match value.get("line") {
-        None | Some(Json::Null) => None,
-        Some(line) => Some(line.as_u64()?).filter(|line| *line > 0),
+    value.as_object()?;
+    let text = |key: &str| {
+        value
+            .get(key)
+            .and_then(Json::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
     };
+    // The first file of a list stands for the finding; the rest are in
+    // the reason the model gave.
+    let file = text("file").or_else(|| {
+        value
+            .get("file")
+            .and_then(Json::as_array)
+            .and_then(|files| files.iter().find_map(Json::as_str))
+            .map(str::to_string)
+    });
+    let line = match value.get("line") {
+        Some(Json::String(written)) => written
+            .trim()
+            .split(|character: char| !character.is_ascii_digit())
+            .next()
+            .and_then(|digits| digits.parse::<u64>().ok()),
+        Some(line) => line.as_u64(),
+        None => None,
+    }
+    .filter(|line| *line > 0);
 
     Some(AgentFinding {
+        // A severity that cannot be read counts as the worst.
         severity: value
             .get("severity")
             .and_then(Json::as_str)
-            .and_then(Severity::parse)?,
-        file: text("file")?,
+            .and_then(Severity::parse)
+            .unwrap_or(Severity::High),
+        file: file.unwrap_or_else(|| "(no file named)".to_string()),
         line,
-        title: text("title")?,
-        reason: text("reason")?,
+        title: text("title").unwrap_or_else(|| "a finding without a title".to_string()),
+        reason: text("reason").unwrap_or_else(|| "the reviewer gave no reason".to_string()),
     })
 }
 
@@ -1396,11 +1427,45 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_status_and_severity() {
+    fn rejects_an_invalid_status() {
         assert!(parse_review(r#"{"nonce":"n","status":"fine","summary":"s"}"#, "n").is_err());
+    }
+
+    #[test]
+    fn a_finding_written_off_the_asked_shape_is_kept_as_a_finding() {
+        // A made-up severity is read as the worst.
+        let parsed = parse_review(
+            r#"{"nonce":"n","status":"suspicious","summary":"s","findings":[{"severity":"critical","file":"f","title":"t","reason":"r"}]}"#,
+            "n",
+        )
+        .unwrap();
+        assert_eq!(parsed.findings[0].severity, Severity::High);
+
+        // Two files in a list, a line range, no title: what a model writes
+        // for a command put together from two files.
+        let parsed = parse_review(
+            r#"{"nonce":"n","status":"suspicious","summary":"s","findings":[{"severity":"high","file":["Makefile","config.mk"],"line":"7-9","reason":"r"}]}"#,
+            "n",
+        )
+        .unwrap();
+        let finding = &parsed.findings[0];
+        assert_eq!(finding.file, "Makefile");
+        assert_eq!(finding.line, Some(7));
+        assert_eq!(finding.title, "a finding without a title");
+
+        // Nothing usable in it is still a finding, never a clear review.
+        let parsed = parse_review(
+            r#"{"nonce":"n","status":"clear","summary":"s","findings":[{}]}"#,
+            "n",
+        )
+        .unwrap();
+        assert_eq!(parsed.findings.len(), 1);
+        assert_eq!(parsed.findings[0].severity, Severity::High);
+
+        // What is not a finding at all still voids the reply.
         assert!(
             parse_review(
-                r#"{"nonce":"n","status":"clear","summary":"s","findings":[{"severity":"critical","file":"f","title":"t","reason":"r"}]}"#,
+                r#"{"nonce":"n","status":"suspicious","summary":"s","findings":["x"]}"#,
                 "n"
             )
             .is_err()
