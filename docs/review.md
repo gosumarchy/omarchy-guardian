@@ -29,39 +29,45 @@ local rules always run too and a clear result is not a guarantee.
 
 ## Fail closed
 
-A review that cannot finish blocks. An unavailable AI blocks community
-sources; for official Arch/Omarchy updates the `standard` profile warns
-instead, `strict` blocks. A question nobody can be asked (no terminal) is
-answered no. A settings file that does not parse stops the gates that read it
-instead of being skipped.
+A review that cannot finish blocks. An unavailable AI blocks every class whose
+`ai` setting is `required` and warns where it is `optional`. In the stock
+profiles only official Arch/Omarchy updates under `standard` are optional. A
+question nobody can be asked (no terminal) is answered no. A settings file
+that does not parse stops the gates that read it instead of being skipped.
 
 ## What is checked
 
 - **Local rules, network destinations and dependencies:** the checks that run
   on the machine itself, described under [Local rules](local-rules.md).
 - **AI review:** the reviewable text is sent, in chunks of up to
-  `max_input_kib` (default 256 KiB, at most `max_chunks` per review; see [How
-  the review scales](#how-the-review-scales)), to the OpenCode CLI **on
-  stdin** (never in argv, which is size-limited and visible to other users)
-  with every OpenCode tool and permission denied. The reply must echo a random
-  per-run nonce that only exists in that input and is given after the source,
-  so a reply that never saw the source, or stopped reading part-way, is
-  rejected. The nonce shows the reply came from a model that was given this
-  request; it cannot show how carefully the source was read. In the request,
-  every invisible or text-reordering character of a file or a file name
-  (control characters, zero-width and bidirectional marks, variation
-  selectors, Unicode tag characters) is written as a `\u` escape: the model
-  sees which character was there, none reaches it raw, and none can draw a
-  line that looks like the end of the data. Nothing is removed or masked. The
-  reply may also say that the content speaks to its reviewer (an instruction,
-  a verdict, a nonce, a reason to stop reading, in a comment, a string, a
-  document or a file name). Guardian then adds a high finding of its own and
-  the review is not clear, even if the same reply says `clear`: a model that
-  was talked into a verdict is not taken at its word. A reply without that
-  field is read as before. Files that look sensitive by path (`.env*`,
-  `*.env`, `*.tfvars`, SSH and cloud credentials, key files, names containing
-  `secret`, `credential` or `token`) are withheld and make the review
-  incomplete.
+  `max_input_kib` (default 256 KiB, at most `max_chunks` per review, default
+  8; see [How the review scales](#how-the-review-scales)), to the reviewer CLI
+  (OpenCode or Claude Code) **on stdin** (never in argv, which is size-limited
+  and visible to other users) with every tool and permission of that CLI
+  denied. The reply must echo a random per-run nonce that only exists in that
+  input and is given after the source, so a reply that never saw the source,
+  or stopped reading part-way, is rejected. The nonce shows the reply came
+  from a model that was given this request; it cannot show how carefully the
+  source was read. In the request, every invisible or text-reordering
+  character of a file or a file name (control characters, zero-width and
+  bidirectional marks, variation selectors, Unicode tag characters) is written
+  as a `\u` escape: the model sees which character was there, none reaches it
+  raw, and none can draw a line that looks like the end of the data. No
+  character of a file that is sent is removed or masked. The reply may also
+  say that the content speaks to its reviewer (an instruction, a verdict, a
+  nonce, a reason to stop reading, in a comment, a string, a document or a
+  file name). Guardian then adds a high finding of its own and the review is
+  not clear, even if the same reply says `clear`: a model that was talked into
+  a verdict is not taken at its word. A reply without that field is read as
+  before. A finding written a little off the asked shape is kept, not dropped:
+  a severity Guardian cannot read counts as high, the first of several files
+  named stands for the finding, and a line given as `3-5` is read as 3. Only a
+  finding that is not a JSON object makes the reply invalid. Files that look
+  sensitive by path (`.env`, `.env.*`, `*.env`, `*.tfvars`, `*.tfstate`,
+  anything under `.ssh`, `.aws`, `.gnupg`, `credentials` or `secrets`, key and
+  keystore files, `.netrc`, `.pypirc`, `.kube/config`, names containing
+  `secret` or `credential` or the word `token`; `.envrc` and `.npmrc` are
+  sent) are withheld and make the review incomplete.
 - **Integrity:** a SHA-256 manifest of every scanned file. `guard` and
   `sandbox` re-hash immediately before running the command.
 
@@ -77,38 +83,42 @@ where it is. Other symlinks (absolute, leaving the tree, dangling, through
 another link or into a skipped directory), special files, non-UTF-8 file
 names, text files over 2 MiB, files over 512 MiB, unresolved Git LFS pointers
 and an invalid or inconclusive AI reply all make the review **incomplete**,
-never clear.
+never clear. A tree of more than 200,000 files, 256 MiB of text or 4 GiB in
+all is not walked to its end, and one with no text file to review has nothing
+reviewed: both are incomplete.
 
-An *unavailable* AI review (no OpenCode, a provider error, a timeout) follows
-the class's `ai` setting instead: `WARNED` for `official` under `standard`,
-blocked everywhere else. A provider that answers that the request is too long
-for the model is not unavailable: that review is incomplete. Nor is one that
-refuses what it was sent (a usage-policy or safety refusal, a content filter,
-a guardrail): a source can be written to be refused, so that review is invalid
-and blocks in every class. A network or login error, a rate limit and an
-overloaded provider stay unavailable. A run that times out before the model
-starts on the source is unavailable. One that times out after the model had it
-is not, since a source can be written to keep a reviewer busy: that review is
-invalid and blocks, except for the `official` class, whose content nobody
-writing such a source chooses, where it counts as unavailable.
+An *unavailable* AI review (no reviewer CLI, a provider error, a timeout)
+follows the class's `ai` setting instead: `WARNED` where it is `optional`,
+blocked (`AI UNAVAILABLE`) where it is `required`. With the stock profiles
+that is `WARNED` for `official` under `standard` and blocked everywhere else.
+A provider that answers that the request is too long for the model is not
+unavailable: the review is invalid, which blocks as `INCOMPLETE` in every
+class. So is one that refuses what it was sent (a usage-policy or safety
+refusal, a content filter, a guardrail): a source can be written to be
+refused. A network or login error, a rate limit and an overloaded provider
+stay unavailable. A run that times out before the model starts on the source
+is unavailable. One that times out after the model had it is not, since a
+source can be written to keep a reviewer busy: that review is invalid too,
+except for the `official` class, whose content nobody writing such a source
+chooses, where it counts as unavailable.
 
 In `.git`, only the `config` (checked locally for keys that make git run a
 command, such as `core.fsmonitor`, filters and `!` aliases, and never sent to
 the AI; also `config.worktree`) and hooks other than git's `.sample` files are
 reviewed. Submodules kept under `.git/modules` are read the same way, nested
-ones included (past six levels the review is incomplete), and so is a
-directory laid out as a repository under another name: its `config` is checked
-the same way, and is also reviewed like any other file (a build could run it
-as something else) with the user and password of every address in it taken
-out, and so is an `extraHeader` login (`Authorization: basic …` that decodes
-to a plain `user:password`). Other values are kept whatever their key is
-called, since a value can be code or name what a file runs: another token
-written there (a bearer token, say) is seen by the AI provider, and so is a
-password with characters other than letters, digits and `._~%+=-:`. A `.git`
-given as a file or a link, a linked `config`, hooks or submodules behind a
-link, a `commondir` (which makes git read another directory's configuration
-and hooks), and such a `config` that cannot be read make the review
-incomplete: git would read them and the review cannot.
+ones included (past six levels the review is incomplete). A directory laid out
+as a repository under another name is read the same way too. Its `config` is
+checked like a `.git/config` and also reviewed like any other file (a build
+could run it as something else), with two things taken out first: the user and
+password of every address, and an `extraHeader` login (`Authorization: basic
+…` that decodes to a plain `user:password`). Other values are kept whatever
+their key is called, since a value can be code or name what a file runs:
+another token written there (a bearer token, say) is seen by the AI provider,
+and so is a password with characters other than letters, digits and
+`._~%+=-:`. A `.git` given as a file or a link, a linked `config`, hooks or
+submodules behind a link, a `commondir` (which makes git read another
+directory's configuration and hooks), and such a `config` that cannot be read
+make the review incomplete: git would read them and the review cannot.
 
 A file that opens like a known binary format or a UTF-16 mark but is plain
 lines of text is reviewed as text, and text with a NUL byte after its first
@@ -129,16 +139,17 @@ is part of the snapshot, and the review is then at best `WARNED`. `vendor`,
 ## How the reviewer is run
 
 External helpers are run by absolute path (`/usr/bin/curl`, `/usr/bin/bsdtar`,
-`/usr/bin/pacman`, ...) with a timeout and bounded output. OpenCode is looked
-up in the absolute entries of `PATH` for `scan`, `guard` and `sandbox`. The
-pacman hook only accepts a root-owned `/usr/bin/opencode` or
-`/usr/local/bin/opencode`, because it gates a root transaction and a
+`/usr/bin/pacman`, ...) with a timeout and bounded output. The reviewer CLI is
+looked up in the absolute entries of `PATH` for every user-level gate (`scan`,
+`guard`, `sandbox`, the AUR gate, and through `guard` the theme and plugin
+gates). The pacman hook only accepts a root-owned `/usr/bin/opencode` or
+`/usr/local/bin/opencode` (for Claude Code, `/usr/bin/claude` or
+`/usr/local/bin/claude`), because it gates a root transaction and a
 user-writable reviewer could be replaced by user-level malware. A reviewer
 found on `PATH` is refused, with the reason, when it or its directory can be
 written by group or others, or when it lies under `/tmp`, `/var/tmp`,
-`/dev/shm` or your cache directory (also behind a link). OpenCode must be
-configured with a working provider; source leaves the machine through that
-provider.
+`/dev/shm` or your cache directory (also behind a link). The reviewer must
+have a working provider or login; source leaves the machine through it.
 
 The reviewer is given as little besides the request as its CLI allows.
 OpenCode runs from a new, empty, private directory (not from `/usr`, which
@@ -148,16 +159,19 @@ above it, `~/.claude/CLAUDE.md` and Claude Code's skills, skills from other
 tools' directories and its default plugins (`OPENCODE_DISABLE_PROJECT_CONFIG`,
 `OPENCODE_DISABLE_CLAUDE_CODE` and its `_PROMPT` and `_SKILLS` forms,
 `OPENCODE_DISABLE_EXTERNAL_SKILLS`, `OPENCODE_DISABLE_DEFAULT_PLUGINS`), and
-without updating itself or downloading language servers. Neither reviewer
-inherits `NODE_OPTIONS`, `BUN_OPTIONS`, `NODE_TLS_REJECT_UNAUTHORIZED`,
-`LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT` or `OPENCODE_PERMISSION`: they
-load code into the reviewer, switch off its TLS checks or lift the tool
-denials, and a review has no use for them. Variables that people do use, for a
-proxy, Bedrock or Vertex, are kept, and the report names the ones that were
-set (names only): `ANTHROPIC_BASE_URL`, `ANTHROPIC_BEDROCK_BASE_URL`,
-`ANTHROPIC_VERTEX_BASE_URL`, `CLAUDE_CONFIG_DIR`, `OPENCODE_CONFIG`,
-`OPENCODE_CONFIG_DIR`, `HTTPS_PROXY`, `ALL_PROXY`, `NODE_EXTRA_CA_CERTS` and
-`SSL_CERT_FILE`.
+without updating itself or downloading language servers. For the pacman gate
+OpenCode also gets private, empty configuration and cache directories, so your
+own OpenCode settings do not shape the review of a root transaction. Neither
+reviewer inherits `NODE_OPTIONS`, `BUN_OPTIONS`,
+`NODE_TLS_REJECT_UNAUTHORIZED`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT` or
+`OPENCODE_PERMISSION`: they load code into the reviewer, switch off its TLS
+checks or lift the tool denials, and a review has no use for them. Variables
+that people do use, for a proxy, Bedrock or Vertex, are kept, and the report
+names the ones that were set (names only): `ANTHROPIC_BASE_URL`,
+`ANTHROPIC_BEDROCK_BASE_URL`, `ANTHROPIC_VERTEX_BASE_URL`,
+`CLAUDE_CONFIG_DIR`, `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR`,
+`HTTPS_PROXY`/`https_proxy`, `ALL_PROXY`/`all_proxy`, `NODE_EXTRA_CA_CERTS`
+and `SSL_CERT_FILE`.
 
 What stays yours, and so in the hands of anything running as you: for your own
 sources, OpenCode's global configuration in `~/.config/opencode` (a provider's
@@ -167,14 +181,15 @@ OpenCode fetches and merges configuration from that server. System-wide
 settings cannot be switched off either: Claude Code applies
 `/etc/claude-code/managed-settings.json` and `managed-settings.d/*.json`
 whatever `--setting-sources` says, and OpenCode merges
-`/etc/opencode/opencode.json` over the configuration Guardian passes. When
-such a file exists the report says the reviewer loads it. For the pacman gate,
-a file that sets an endpoint or base URL, a key or credential helper,
-environment, hooks or plugins (Claude Code), or providers, plugins, MCP
-servers, permissions, tools, agents, instructions or commands (OpenCode), or
-that Guardian cannot read as plain JSON, makes the review unavailable with
-that reason: Guardian cannot tell an administrator's policy from a file a
-package left there.
+`/etc/opencode/opencode.json` (or `.jsonc`) over the configuration Guardian
+passes. When such a file exists the report says the reviewer loads it. For the
+pacman gate, a file that sets an endpoint or base URL, a key or credential
+helper, environment, hooks or plugins (Claude Code), or providers, plugins,
+MCP servers, permissions, tools, agents, modes, instructions, commands or
+experimental settings (OpenCode), or that Guardian cannot read as plain JSON
+(comments, or over 1 MiB), makes the review unavailable with that reason:
+Guardian cannot tell an administrator's policy from a file a package left
+there.
 
 ## How the review scales
 
@@ -207,12 +222,15 @@ ordinary code). A file larger than a chunk is split on line boundaries, each
 piece repeating the end of the one before; a single line longer than a chunk
 is cut the same way, so nothing is hidden by sitting exactly on a cut. The
 first chunk runs alone; the rest run three at a time. A run that finds the AI
-unavailable (a provider error, not a timeout) is retried once after two
-seconds, and so is a reply that does not echo the run's nonce (models drop it
-now and then); if it still fails, chunks not yet started are not attempted. A
-source that needs more than `max_chunks` chunks of `max_input_kib` is not
-reviewed at all (`INCOMPLETE`): a partial AI review is never presented as a
-review of the whole source.
+unavailable (a provider error; not a timeout, and not a reviewer that could
+not be started) is retried once after two seconds. A reply that does not echo
+the run's nonce is asked for once more straight away (models drop it now and
+then). If it still fails, chunks not yet started are not attempted. A source
+that needs more than `max_chunks` chunks of `max_input_kib` is not reviewed at
+all (`INCOMPLETE`): a partial AI review is never presented as a review of the
+whole source. An entry point that does not fit one request is not cut into
+pieces: nothing is sent and the review is `INCOMPLETE`, and so it is when the
+file list and the local findings alone take more than half a request.
 
 ## Review memory
 
@@ -297,12 +315,20 @@ the memory was not used and the review runs in full:
   reviewed as an upgrade like any other. The `strict` profile turns diff
   review off.
 
-The AUR gate remembers a build by yay's build directory name, and the theme
-handler remembers a theme by its name. Other targets are remembered by their
-class and path. `omarchy-guardian forget ID` drops one source's baselines but
-keeps cached verdicts, so an unchanged rebuild can still be answered from the
-cache; `omarchy-guardian forget --all` also clears every cached verdict.
-`config show` prints the memory's location and size.
+The AUR gate remembers a build by its AUR package name (`aur:<package>` for
+the recipe, `aur-src:<package>` for the upstream sources) when the build
+directory is a clone of that package, and any other build directory by a key
+made from its path. The theme handler remembers a theme by its name. Other
+targets are remembered by their class and path. `omarchy-guardian forget ID`
+drops that identity's baselines, and for `aur:<pkg>` or `aur-src:<pkg>` also
+what the AUR gate remembers of the package (answered questions, binary hashes,
+what it extracted). Cached verdicts are kept, so an unchanged rebuild can
+still be answered from the cache. The recipe and the upstream sources have
+separate baselines: forget both identities to have both reviewed in full.
+`omarchy-guardian forget --all` also clears every cached verdict. `config
+show` prints the memory's location and size. The memory is kept under
+`max_store_mib` (default 256 MiB): expired verdicts go first, then the oldest
+baselines.
 
 The pacman gate never uses this memory: every scriptlet gets a fresh, full
 review. Because the memory lives in your home directory, malware already
@@ -332,9 +358,10 @@ transcript. A `tool_use` block in any assistant message, or a permission
 denial, counts as a tool attempt and makes the review invalid; the extra turn
 the CLI adds to continue a reply its safety classifier interrupted does not.
 The reply must echo the nonce like OpenCode's. `thinking` becomes `--effort`
-directly. Claude Code has no flag that leaves out the administrator's managed
-settings (`--setting-sources` covers user, project and local settings only),
-so those still apply; see above for what Guardian does about them.
+(`minimal` and `low` both as `low`; `default` passes no flag). Claude Code has
+no flag that leaves out the administrator's managed settings
+(`--setting-sources` covers user, project and local settings only), so those
+still apply; see above for what Guardian does about them.
 
 For your own sources `claude` is found on `PATH`. The pacman gate, as with
 OpenCode, only accepts a root-owned `/usr/bin/claude` or

@@ -22,9 +22,9 @@ AI agents. Guardian's `omarchy` hands theme and plugin installs and updates to
 Guardian and passes everything else straight to Omarchy's own `omarchy` by its
 full path (which finds its commands in its own directory, not on PATH, so
 wrapping the four commands alone would miss `omarchy theme install`). It looks
-for that one in `/usr/share/omarchy/bin`, then in `/usr/bin`, or in the
-checkout that `omarchy dev link` named in the root-owned `/etc/omarchy.conf`;
-never on PATH, where it would find itself or a planted file.
+for that one first in the checkout that `omarchy dev link` named in the
+root-owned `/etc/omarchy.conf`, then in `/usr/share/omarchy/bin`, then in
+`/usr/bin`; never on PATH, where it would find itself or a planted file.
 
 Getting that directory first takes two things, because Omarchy sets PATH
 twice. uwsm reads `~/.config/uwsm/env.d/90-omarchy-guardian`, which `protect`
@@ -33,10 +33,10 @@ writes, after Omarchy's own session file. Then Omarchy's Hyprland defaults
 command directory in front for everything Hyprland starts, and its autostart
 hands that PATH to the systemd user manager and to D-Bus; with the session
 file alone, Omarchy's commands would be found first by every key binding,
-launcher, the menu, the bar and zsh or fish. So `protect` also adds one line
-at the end of `~/.config/hypr/hyprland.lua`, the place Omarchy keeps for your
-own configuration, read after its defaults and before Hyprland starts
-anything:
+launcher, the menu, the bar and zsh or fish. So `protect` also adds two lines
+at the end of `~/.config/hypr/hyprland.lua` (a comment, and the line that loads
+Guardian's file), the place Omarchy keeps for your own configuration, read
+after its defaults and before Hyprland starts anything:
 
 ```lua
 -- Omarchy Guardian: its theme and plugin commands first on PATH. Keep this after Omarchy's defaults.
@@ -44,34 +44,40 @@ pcall(dofile, "/usr/lib/omarchy-guardian/hyprland-path.lua")
 ```
 
 The file it loads is root-owned and part of the package: it puts Guardian's
-directory first and Omarchy's right behind it. The line passes over a file
-that is not there. Nothing under `/usr/share/omarchy` is edited, so an Omarchy
-update changes none of it; `omarchy refresh` of the Hyprland configuration
-replaces `hyprland.lua` and with it the line, which the bar then shows and
-notifies about, and `protect` puts back. A Hyprland configuration that is not
-Lua (no `hyprland.lua`) gets no line.
+directory first and Omarchy's right behind it. The second line passes over a
+file that is not there. Nothing under `/usr/share/omarchy` is edited, so an
+Omarchy update changes none of it. `omarchy refresh hyprland` replaces
+`hyprland.lua` and with it both lines; the bar then shows that and notifies,
+and `protect` puts them back. A Hyprland configuration that is not Lua (no
+`hyprland.lua`) gets no lines.
 
-It applies from the next login. It reads "partly on", with the reason, until
-then; when the line is commented out, inside a block, or followed by another
-line that sets PATH; when the session file or the line is missing while the
-other is there; and whenever the session's PATH (`systemctl --user
-show-environment`) finds a stock command before Guardian's. Turning it on
+It applies from the next login and reads "partly on", with the reason, until
+then. It also reads so when the line is commented out, inside a string, a
+function or a block, after a `return` or `os.exit`, or followed by another line
+that sets PATH; when the session file or the line is missing while the other is
+there; when one of Guardian's commands or `hyprland-path.lua` is not root's
+alone to write; and whenever the session's PATH (`systemctl --user
+show-environment`; the calling shell's PATH if that does not answer) does not
+hold Guardian's directory or finds a stock command before it. Turning it on
 again writes what is missing, at the end of the file.
 
 ### The Bash interceptor
 
 The Bash interceptor catches `omarchy theme install/update` typed in an
 interactive Bash, also in a shell whose PATH was reordered or that was not
-started from the graphical session (SSH, a console). It counts only as the
-exact line Guardian writes in `~/.bashrc`, at the top level, with no command
-before it that leaves the file and nothing after it that unsets, redefines or
-aliases its functions. A `return` or `exit` before it counts as leaving,
-except in the usual "stop unless this shell is interactive" line in its common
-spellings: `[[ $- != *i* ]] && return`, `[[ $- == *i* ]] || return`, `[ -z
-"$PS1" ] && return`, `[ -n "$PS1" ] || return`, and `case $- in *i*) ;; *)
-return;; esac`. The words `return` and `exit` in a comment, in a quoted string
-or inside a function or block are not commands; `<<` in `$(( ))` or `(( ))` is
-a shift and `<<<` a here-string, neither starts a here-document.
+started from the graphical session (SSH, a console). It passes what it does not
+gate to `/usr/share/omarchy/bin/omarchy` by its fixed path; the commands on
+PATH also honour `omarchy dev link`. It counts only as the exact line Guardian
+writes in `~/.bashrc`, at the top level, with no command before it that leaves
+the file, nothing after it that unsets or redefines its functions, and no alias
+of one of their names (or of `source`) anywhere in the file. A `return` or
+`exit` before it counts as leaving, except in the usual "stop unless this shell
+is interactive" line in its common spellings: `[[ $- != *i* ]] && return`, `[[
+$- == *i* ]] || return`, `[ -z "$PS1" ] && return`, `[ -n "$PS1" ] || return`,
+and `case $- in *i*) ;; *) return;; esac`. The words `return` and `exit` in a
+comment, in a quoted string or inside a function or block are not commands;
+`<<` in `$(( ))` or `(( ))` is a shift and `<<<` a here-string, neither starts
+a here-document.
 
 Guardian reads `~/.bashrc` line by line, not as a shell would: what a file
 sourced from it does is not seen.
@@ -93,24 +99,36 @@ interceptor and the menu overrides is in place or in effect. Without the
 commands on PATH, `omarchy theme` and `omarchy plugin` typed in another login
 shell (zsh, fish) reach Omarchy directly, and the bar says so beside the gate.
 
+Before Guardian first edits one of your files (`~/.bashrc`, `hyprland.lua`, the
+Omarchy menu file), it keeps the file as it was beside it as
+`<name>.guardian-bak`, once; a later edit never overwrites that copy, and
+turning the gate off leaves it.
+
 ### Not covered
 
-Not covered: a caller that names the stock command by its full path
-(`/usr/share/omarchy/bin/omarchy-theme-install`,
-`/usr/bin/omarchy-theme-install`), a program that resets PATH or puts another
-directory in front (a shell whose start-up files do: `status` typed there says
-so beside the gate), a session not started through uwsm and Hyprland (SSH and
-console logins have the Bash interceptor only), and a theme copied into
-`~/.config/omarchy/themes` by hand. The session file and the line in
-`hyprland.lua` are your own: a program running as you can remove them, which
-the bar then shows and notifies about.
+Not covered:
+
+- a caller that names the stock command by its full path
+  (`/usr/share/omarchy/bin/omarchy-theme-install`,
+  `/usr/bin/omarchy-theme-install`);
+- a program that resets PATH or puts another directory in front (a shell whose
+  start-up files do: `status` typed there says so beside the gate);
+- a session not started through uwsm and Hyprland (SSH and console logins have
+  the Bash interceptor only);
+- a theme copied into `~/.config/omarchy/themes` by hand.
+
+The session file and the lines in `hyprland.lua` are your own: a program
+running as you can remove them, which the bar then shows and notifies about.
 
 ### How a theme is installed
 
-Themes are cloned to a hidden staging directory and reviewed; only the exact
-reviewed checkout is moved into place and applied. Updates stage and review
-every Git-installed theme before replacing any. Themes with local or ignored
-modifications, submodules, or unresolved Git LFS files are refused.
+Themes are cloned to a hidden staging directory and reviewed with `guard
+--class theme --identity theme:<name> --thorough`; only the exact reviewed
+checkout is moved into place and applied. Updates stage and review every
+Git-installed theme before replacing any. A theme with submodules is refused,
+and so is an update of a theme with local, untracked or ignored files, a
+detached HEAD or no upstream branch. Git LFS files are not fetched, so a theme
+that uses them gets an incomplete review and is not installed.
 
 ## Omarchy plugins
 
@@ -119,9 +137,10 @@ Omarchy shell plugins run as unsandboxed code inside the long-lived
 update` go through `guardian-plugin`:
 
 - **Add:** the repository is cloned to a hidden staging directory and checked
-  with Omarchy's own `omarchy-plugin-validate`. It is then reviewed with
-  `guard --class plugin --identity plugin:<id>`, and only after a clear review
-  is the exact reviewed checkout moved into place and, if asked, enabled.
+  with Omarchy's own `omarchy-plugin-validate`. It is then reviewed with `guard
+  --class plugin --identity plugin:<id> --thorough`, and only when the review
+  lets it through (or you gave a permit for exactly that content) is the exact
+  reviewed checkout moved into place and, if asked, enabled.
 - **Update:** each installed plugin's new commits are fetched into a staged
   copy, fast-forwarded and validated, then reviewed as an upgrade of the
   approved version. The installed plugin is fast-forwarded to exactly the
