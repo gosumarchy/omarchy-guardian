@@ -843,17 +843,32 @@ impl Settings<'_> {
     /// Skips blanks and comments; `None` for a comment that never ends.
     fn blank(&mut self) -> Option<()> {
         loop {
+            // The two Unicode line separators end a line for an editor.
+            let rest = &self.bytes[self.at.min(self.bytes.len())..];
+            if rest.starts_with("\u{2028}".as_bytes()) || rest.starts_with("\u{2029}".as_bytes()) {
+                self.line += 1;
+                self.at += 3;
+                continue;
+            }
             match (self.peek(), self.bytes.get(self.at + 1).copied()) {
                 (Some(b'\n'), _) => {
                     self.line += 1;
                     self.at += 1;
                 }
-                (Some(b' ' | b'\t' | b'\r'), _) => self.at += 1,
+                // A carriage return alone ends a line as well.
+                (Some(b'\r'), next) => {
+                    self.line += usize::from(next != Some(b'\n'));
+                    self.at += 1;
+                }
+                (Some(b' ' | b'\t'), _) => self.at += 1,
                 (Some(b'/'), Some(b'/')) => {
-                    // An editor ends the comment at a lone `\r` too.
+                    // An editor ends the comment at a lone `\r` too, and
+                    // at the two Unicode line separators.
                     while self
                         .peek()
                         .is_some_and(|byte| !matches!(byte, b'\n' | b'\r'))
+                        && !self.bytes[self.at..].starts_with("\u{2028}".as_bytes())
+                        && !self.bytes[self.at..].starts_with("\u{2029}".as_bytes())
                     {
                         self.at += 1;
                     }
@@ -1642,7 +1657,13 @@ mod tests {
         assert_eq!(lines(r#"{"git.path":"/tmp/x"}"#), [1]);
         // A comment ends at a lone carriage return, as it does for the
         // editor, and a `\u` escape is four hex digits and no sign.
-        assert_eq!(lines("{ // x\r\"git.path\": \"/tmp/x\",\n\"a\": 1 }"), [1]);
+        assert_eq!(lines("{ // x\r\"git.path\": \"/tmp/x\",\n\"a\": 1 }"), [2]);
+        for separator in ['\u{2028}', '\u{2029}'] {
+            let text = format!("{{ // x{separator}\"git.path\": \"/tmp/x\",\n\"a\": 1 }}");
+            let found = editor(&text);
+            assert_eq!(found.len(), 1, "{text:?}");
+            assert!(found[0].1.starts_with("git.path"), "{found:?}");
+        }
         assert_eq!(lines("{\"git.p\\u+061th\": \"/tmp/x\"}").len(), 1);
         assert!(
             editor("{\"git.p\\u+061th\": \"/tmp/x\"}")[0]

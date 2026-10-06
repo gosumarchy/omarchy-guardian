@@ -1545,26 +1545,29 @@ fn taint_flags(taint: u64) -> String {
 struct Closed {
     count: usize,
     first: Option<String>,
-    /// Where set-id bits have no effect: what cannot be listed there (a
-    /// user's own FUSE mount, closed to root too) holds nothing to find.
-    without_set_id: Vec<String>,
+    /// The places closed to root on a mount where set-id bits have no
+    /// effect (a user's own FUSE mount): how many, and the first by name.
+    covered: usize,
+    covered_first: Option<String>,
+    /// Every mount, without its leading `/`, and whether it is `nosuid`;
+    /// only read for root's search of the real system.
+    mounts: Vec<(String, bool)>,
 }
 
-/// The mount points of a `/proc/self/mountinfo` that are mounted `nosuid`,
-/// without their leading `/`.
-fn nosuid_mounts(mountinfo: &str) -> Vec<String> {
+/// The mount points of a `/proc/self/mountinfo`, without their leading
+/// `/`, each with whether it is mounted `nosuid`, in the file's order.
+fn mounts(mountinfo: &str) -> Vec<(String, bool)> {
     mountinfo
         .lines()
         .filter_map(|line| {
             let mut fields = line.split(' ').skip(4);
             let place = fields.next()?;
-            let options = fields.next()?;
-            options
-                .split(',')
-                .any(|option| option == "nosuid")
-                .then(|| mount_path(place).trim_start_matches('/').to_string())
+            let nosuid = fields.next()?.split(',').any(|option| option == "nosuid");
+            Some((
+                mount_path(place).trim_start_matches('/').to_string(),
+                nosuid,
+            ))
         })
-        .filter(|place| !place.is_empty())
         .collect()
 }
 
@@ -1592,31 +1595,47 @@ fn mount_path(written: &str) -> String {
 }
 
 impl Closed {
-    /// For a search of the real system, with its mounts read once.
+    /// For a search of the real system by root, with the mounts read once.
+    /// A mount point may be named in any bytes, so the file is read as
+    /// bytes.
     fn of(scope: &Scope<'_>) -> Self {
-        let mountinfo = if scope.root == Path::new("/") {
-            fs::read_to_string("/proc/self/mountinfo").unwrap_or_default()
+        let mountinfo = if scope.root == Path::new("/") && scope.origin == Origin::Root {
+            fs::read("/proc/self/mountinfo").unwrap_or_default()
         } else {
-            String::new()
+            Vec::new()
         };
         Self {
-            without_set_id: nosuid_mounts(&mountinfo),
+            mounts: mounts(&String::from_utf8_lossy(&mountinfo)),
             ..Self::default()
         }
     }
 
-    fn add(&mut self, directory: &str) {
-        let inert = self.without_set_id.iter().any(|mount| {
-            directory
-                .strip_prefix(mount.as_str())
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-        });
-        if inert {
-            return;
+    /// Whether `place` is on a mount where set-id bits have no effect:
+    /// the mount it is on is the deepest one above it, and of two at one
+    /// place the later.
+    fn without_set_id(&self, place: &str) -> bool {
+        let mut on: Option<&(String, bool)> = None;
+        for mount in &self.mounts {
+            let above = mount.0.is_empty()
+                || place
+                    .strip_prefix(mount.0.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
+            if above && on.is_none_or(|deepest| mount.0.len() >= deepest.0.len()) {
+                on = Some(mount);
+            }
         }
-        self.count += 1;
-        if self.first.as_deref().is_none_or(|first| directory < first) {
-            self.first = Some(directory.to_string());
+        on.is_some_and(|mount| mount.1)
+    }
+
+    fn add(&mut self, directory: &str) {
+        let (count, first) = if self.without_set_id(directory) {
+            (&mut self.covered, &mut self.covered_first)
+        } else {
+            (&mut self.count, &mut self.first)
+        };
+        *count += 1;
+        if first.as_deref().is_none_or(|first| directory < first) {
+            *first = Some(directory.to_string());
         }
     }
 
@@ -1625,6 +1644,16 @@ impl Closed {
     /// what the root checks are for; root, which nothing stands behind,
     /// leaves them unchecked and names one.
     fn say(self, scope: &Scope<'_>, found: &mut Found) {
+        // Nothing on such a mount is set-id to anyone, so the search is
+        // whole without it; but the mount covers a directory that is not
+        // on it, and that is said.
+        if let Some(first) = &self.covered_first {
+            found.notes.push(format!(
+                "{} place(s) on mounts closed to root were not looked into (/{} among them): set-id bits have no effect on such a mount, but what its mount point covers cannot be seen",
+                self.covered,
+                first.escape_debug()
+            ));
+        }
         let Some(first) = self.first else {
             return;
         };
@@ -1702,13 +1731,15 @@ fn set_id_files(scope: &Scope<'_>, found: &mut Found) {
                 let metadata = match entry.metadata() {
                     Ok(metadata) => metadata,
                     Err(error) => {
-                        // Counted by its own name: a mount closed to
-                        // root shows here, not when it is opened.
-                        if error.kind() != io::ErrorKind::NotFound {
-                            closed.add(&format!(
-                                "{directory}/{}",
-                                entry.file_name().to_string_lossy()
-                            ));
+                        // A mount closed to root shows here, not when it
+                        // is opened, and is counted by its own name; any
+                        // other entry leaves its directory not whole.
+                        let path = format!("{directory}/{}", entry.file_name().to_string_lossy());
+                        if error.kind() == io::ErrorKind::NotFound {
+                        } else if closed.without_set_id(&path) {
+                            closed.add(&path);
+                        } else {
+                            whole = false;
                         }
                         continue;
                     }
@@ -4893,33 +4924,48 @@ mod tests {
     }
 
     #[test]
-    fn a_place_closed_on_a_mount_without_set_id_holds_nothing_to_find() {
-        use super::{Closed, nosuid_mounts};
+    fn a_place_closed_on_a_mount_without_set_id_is_told_apart() {
+        use super::{Closed, mounts};
 
         let mountinfo = "\
 36 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw
-90 36 0:50 / /home/u/remote rw,nosuid,nodev,relatime shared:60 - fuse.sshfs host: rw
-91 36 0:51 / /home/u/my\\040drive rw,nosuid,nodev - fuse.rclone r: rw
-92 36 0:52 / /var/data rw,nodev - ext4 /dev/sdb1 rw
+37 36 8:3 / /home rw,nosuid,relatime shared:2 - ext4 /dev/sda3 rw
+90 37 0:50 / /home/u/remote rw,nosuid,nodev,relatime shared:60 - fuse.sshfs host: rw
+91 37 0:51 / /home/u/my\\040drive rw,nosuid,nodev - fuse.rclone r: rw
+92 37 8:17 / /home/u/disk rw,nodev - ext4 /dev/sdb1 rw
+93 36 0:52 / /var/x rw,nosuid - tmpfs tmpfs rw
+94 93 8:18 / /var/x rw - ext4 /dev/sdc1 rw
 ";
-        let mounts = nosuid_mounts(mountinfo);
-        assert_eq!(mounts, ["home/u/remote", "home/u/my drive"]);
+        let read = mounts(mountinfo);
+        assert_eq!(read.len(), 7);
+        assert!(read.contains(&("home/u/my drive".to_string(), true)));
+        assert!(read.contains(&(String::new(), false)));
         let mut closed = Closed {
-            without_set_id: mounts,
+            mounts: read,
             ..Closed::default()
         };
-        for inert in ["home/u/remote", "home/u/remote/below", "home/u/my drive"] {
-            closed.add(inert);
+        // On a mount without set-id, and below one.
+        for covered in [
+            "home/u/remote",
+            "home/u/remote/below",
+            "home/u/my drive",
+            "home/x",
+        ] {
+            assert!(closed.without_set_id(covered), "{covered}");
+            closed.add(covered);
         }
-        assert_eq!(closed.count, 0);
-        // A name that only begins like the mount, and a mount where the
-        // bits count.
-        for counted in ["home/u/remote2", "home/u", "var/data"] {
+        assert_eq!((closed.covered, closed.count), (4, 0));
+        assert_eq!(closed.covered_first.as_deref(), Some("home/u/my drive"));
+        // A mount with set-id below one without, one mounted over one
+        // without, and a name that only begins like a mount.
+        for counted in ["home/u/disk/closed", "var/x/closed", "var/x2", "root"] {
+            assert!(!closed.without_set_id(counted), "{counted}");
             closed.add(counted);
         }
-        assert_eq!(closed.count, 3);
-        assert_eq!(closed.first.as_deref(), Some("home/u"));
-        assert!(nosuid_mounts("").is_empty());
-        assert!(nosuid_mounts("1 2 3\n").is_empty());
+        assert_eq!((closed.covered, closed.count), (4, 4));
+        assert_eq!(closed.first.as_deref(), Some("home/u/disk/closed"));
+        // With no mounts read (a user's search), nothing is told apart.
+        assert!(!Closed::default().without_set_id("home/u/remote"));
+        assert!(mounts("1 2 3\n").is_empty());
     }
 }
