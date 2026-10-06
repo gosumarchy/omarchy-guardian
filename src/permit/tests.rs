@@ -4,9 +4,10 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
+use super::privileged::{add, remove_where};
 use super::{
-    Command, Content, LIFETIME_SECS, Pending, Place, Standing, Typed, add, enabled, find, grant,
-    parse, pending_blocks, remove_where, standing_at, standing_permits,
+    Command, Content, LIFETIME_SECS, Pending, Place, Standing, Typed, enabled, find, grant, parse,
+    pending_blocks, standing_at, standing_permits,
 };
 use crate::audit::Gate;
 use crate::config::Settings;
@@ -263,7 +264,7 @@ fn the_root_half_takes_only_well_formed_arguments() {
 fn ended_permits_are_cleared_and_a_user_holds_only_so_many() {
     let dir = private("permit-prune");
     let key = |index: usize| format!("{index:064x}");
-    for index in 0..super::MAX_PERMITS {
+    for index in 0..super::privileged::MAX_PERMITS {
         add(dir.path(), 1000, "aur", "aur", &key(index), 100).unwrap();
     }
     assert!(add(dir.path(), 1000, "aur", "aur", &key(999), 100).is_err());
