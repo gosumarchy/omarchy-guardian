@@ -1246,7 +1246,7 @@ struct UpstreamReview<'a> {
 /// (`aur:<pkg>`, `aur-src:<pkg>`, or a local build's own key) under the
 /// review memory's `root`: the questions answered, the binaries and what
 /// was extracted. Returns how many records went.
-pub(crate) fn forget(root: &Path, identity: &str) -> Result<usize, String> {
+pub(crate) fn forget(root: &Path, identity: &str) -> Result<usize, Error> {
     let key = identity
         .strip_prefix("aur:")
         .or_else(|| identity.strip_prefix("aur-src:"))
@@ -1255,7 +1255,7 @@ pub(crate) fn forget(root: &Path, identity: &str) -> Result<usize, String> {
 }
 
 /// Forgets everything the gate remembers under `root`.
-pub(crate) fn forget_all(root: &Path) -> Result<usize, String> {
+pub(crate) fn forget_all(root: &Path) -> Result<usize, Error> {
     state::forget_all(root)
 }
 

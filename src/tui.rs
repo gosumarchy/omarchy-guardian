@@ -22,6 +22,7 @@ use crate::config::model::{Named, SourceClass};
 use crate::config::show::{render_check, render_memory, render_show};
 use crate::engine::baseline;
 use crate::engine::store::Store;
+use crate::error::Error;
 use crate::integrations::Plan;
 use crate::protect::{paths, run_plan, test_reviewer};
 use crate::setup::{self, Environment as _};
@@ -199,10 +200,14 @@ fn forget_memory() -> Result<String, String> {
         return Ok("The review memory is already empty.".into());
     }
     let store = Store::open(root.clone())?;
-    let count = baseline::forget_all(&store).map_err(|error| error.to_string())?;
-    // What the AUR gate remembers on its own (answers, program hashes) goes
-    // with the rest.
-    crate::makepkg_gate::forget_all(&root)?;
+    let forget = || -> Result<usize, Error> {
+        let count = baseline::forget_all(&store)?;
+        // What the AUR gate remembers on its own (answers, program hashes)
+        // goes with the rest.
+        crate::makepkg_gate::forget_all(&root)?;
+        Ok(count)
+    };
+    let count = forget().map_err(|error| error.to_string())?;
     crate::audit::forgot("everything (settings app)");
     Ok(format!(
         "Forgot {count} approved baseline(s) and every cached verdict."
