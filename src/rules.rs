@@ -805,8 +805,8 @@ pub fn continues(line: &str, next: &str) -> bool {
 
 /// What runs a file given to it.
 const RUNNERS: &[&str] = &[
-    "sh", "bash", "zsh", "dash", "ksh", "fish", "source", ".", "python", "perl", "node", "ruby",
-    "php", "lua",
+    "sh", "bash", "zsh", "dash", "ksh", "ash", "fish", "source", ".", "python", "perl", "node",
+    "ruby", "php", "lua",
 ];
 
 /// A file name as written, without a leading `./`.
@@ -1131,6 +1131,10 @@ fn globs_run_by(statement: &str, piped: bool, is_glob: &dyn Fn(&str) -> bool) ->
     };
     let name = command.program.as_str();
     let unversioned = unversioned(name);
+    let assigned = statement
+        .split_whitespace()
+        .next()
+        .is_some_and(|word| word.contains("=$(") || word.contains("=`"));
     let arguments: Vec<&str> = command.arguments.iter().map(String::as_str).collect();
     let operands = arguments
         .iter()
@@ -1145,11 +1149,17 @@ fn globs_run_by(statement: &str, piped: bool, is_glob: &dyn Fn(&str) -> bool) ->
             .collect(),
         "run-parts" => operands.collect(),
         // The places searched come before the first test.
-        "find" if piped || statement.contains("-exec") || statement.contains("-ok") => arguments
-            .iter()
-            .copied()
-            .take_while(|word| !word.starts_with(['-', '(', '!', '\\']))
-            .collect(),
+        // What a variable is given (`x=$(find … | head -n 1)`) is a name
+        // found, not a file run.
+        "find"
+            if !assigned && (piped || statement.contains("-exec") || statement.contains("-ok")) =>
+        {
+            arguments
+                .iter()
+                .copied()
+                .take_while(|word| !word.starts_with(['-', '(', '!', '\\']))
+                .collect()
+        }
         "cat" if !piped => Vec::new(),
         _ if name == "cat"
             || RUNNERS.contains(&name)
@@ -1677,7 +1687,15 @@ fn formats_filesystem(line: &str) -> bool {
             // What stands before the program may run one itself:
             // `X="$(mkfs.ext4 /dev/sda)" ls`.
             let before = &words[..words.len() - rest.len()];
-            !handles_file || before.iter().any(|word| word.contains("mkfs."))
+            // The word a wrapper's option takes may read as a file
+            // command (`env -u install mkfs.ext4 …`): after an option,
+            // the program found is not taken for one.
+            let after_option = before
+                .len()
+                .checked_sub(2)
+                .and_then(|index| before.get(index))
+                .is_some_and(|word| word.starts_with('-') && !word.contains('='));
+            !handles_file || after_option || before.iter().any(|word| word.contains("mkfs."))
         })
 }
 
@@ -1821,8 +1839,19 @@ const PRINTERS: &[&str] = &["echo", "printf"];
 /// letter `flag`: `-k`, `-sk`, `-fsSLk`, before or after the command's
 /// other arguments (`curl URL -k -o f`), but not `--key` nor a flag of
 /// another command on the line. A program is matched without its path.
-fn program_short_flag(line: &str, programs: &[&str], flag: char) -> bool {
-    if !programs.iter().any(|program| line.contains(program)) {
+///
+/// `unless` names options that give the flag another meaning in the same
+/// command: one letter for a short flag, a whole word otherwise.
+fn program_short_flag(line: &str, programs: &[&str], flag: char, unless: &[&str]) -> bool {
+    // A quote inside a name is no part of it: `c""url`.
+    let plain;
+    let text = if line.contains(['"', '\'']) {
+        plain = unquoted(line);
+        plain.as_str()
+    } else {
+        line
+    };
+    if !programs.iter().any(|program| text.contains(program)) {
         return false;
     }
     // The parts follow one another in the line, so what divides each from
@@ -1833,7 +1862,7 @@ fn program_short_flag(line: &str, programs: &[&str], flag: char) -> bool {
         let after = line.get(end..).unwrap_or_default();
         let doubled = after.starts_with("&&") || after.starts_with("||");
         let piped = after.starts_with('|') && !doubled;
-        if part_short_flag(part, piped, programs, flag) {
+        if part_short_flag(part, piped, programs, flag, unless) {
             return true;
         }
         start = end + if doubled { 2 } else { 1 };
@@ -1841,13 +1870,22 @@ fn program_short_flag(line: &str, programs: &[&str], flag: char) -> bool {
     false
 }
 
+/// Whether `word` ends a command inside a part that was not cut there (a
+/// part that opens a group it does not close is not cut inside it).
+fn ends_command(word: &str) -> bool {
+    matches!(word, ";" | "|" | "&&" | "||" | "&") || word.ends_with(';')
+}
+
 /// `program_short_flag` for one command; `piped` says a pipe carries its
 /// output on.
-fn part_short_flag(part: &str, piped: bool, programs: &[&str], flag: char) -> bool {
-    if !(part.contains('-')
-        && part.contains(flag)
-        && programs.iter().any(|program| part.contains(program)))
-    {
+fn part_short_flag(
+    part: &str,
+    piped: bool,
+    programs: &[&str],
+    flag: char,
+    unless: &[&str],
+) -> bool {
+    if !(part.contains('-') && part.contains(flag)) {
         return false;
     }
     let words = unquoted_words(part);
@@ -1856,24 +1894,42 @@ fn part_short_flag(part: &str, piped: bool, programs: &[&str], flag: char) -> bo
     // The words up to and with the command: wrappers, assignments, and
     // the program `shell::command` finds.
     let leading = words.len() - rest.len();
-    // Shown, not run, unless what is shown goes on into a pipe or a file.
-    if command.is_some_and(|command| PRINTERS.contains(&command)) && !piped && !part.contains('>') {
+    // Shown, not run, unless what is shown goes on into a pipe or a file,
+    // or another command follows in the same part.
+    if command.is_some_and(|command| PRINTERS.contains(&command))
+        && !piped
+        && !part.contains('>')
+        && !words.iter().any(|word| ends_command(word))
+    {
         return false;
     }
     // Every option up to the end of the command is its own when the
-    // program is the command, or a setting's value (`ExecStart=/bin/curl`).
-    // Named further on (`xargs curl -k`), only those before its first
-    // operand are: another program may follow.
-    let mut own = false;
-    let mut running = false;
+    // program is the command. Named before it or further on (`CURL=curl
+    // make -k`, `xargs curl -k`), only those before its first operand
+    // are: another program may follow.
+    let (mut own, mut running) = (false, false);
+    // Whether the command so far has the flag, and an option that gives
+    // the flag another meaning.
+    let (mut has, mut other) = (false, false);
     for (index, word) in words.iter().enumerate() {
-        // A part that opens a group it does not close is not cut inside it.
+        let option = word.trim_end_matches([';', ')', '`']);
         if matches!(word.as_str(), ";" | "|" | "&&" | "||" | "&") {
-            own = false;
-            running = false;
-        } else if word.starts_with('-') {
-            if running && short_flag(word.trim_end_matches([';', ')', '`']), flag) {
+            if has && !other {
                 return true;
+            }
+            (own, running, has, other) = (false, false, false, false);
+            continue;
+        }
+        if word.starts_with('-') {
+            if running {
+                has |= short_flag(option, flag);
+                other |= unless.iter().any(|name| {
+                    let mut letters = name.chars();
+                    match (letters.next(), letters.next()) {
+                        (Some(letter), None) => short_flag(option, letter),
+                        _ => option == *name,
+                    }
+                });
             }
         } else if !own {
             let name = match command {
@@ -1881,14 +1937,16 @@ fn part_short_flag(part: &str, piped: bool, programs: &[&str], flag: char) -> bo
                 _ => program_name(word),
             };
             running = programs.contains(&name);
-            own = running && index < leading;
+            own = running && index + 1 == leading;
         }
         if word.ends_with(';') {
-            own = false;
-            running = false;
+            if has && !other {
+                return true;
+            }
+            (own, running, has, other) = (false, false, false, false);
         }
     }
-    false
+    has && !other
 }
 
 /// Whether a command named in `programs` is on the line with one of
@@ -1936,7 +1994,7 @@ fn disables_tls_verification(line: &str) -> bool {
     if git_off && line.contains("git") {
         return true;
     }
-    program_short_flag(line, &["curl"], 'k')
+    program_short_flag(line, &["curl"], 'k', &[])
 }
 
 /// A shell wired to a network connection, so the commands come from
@@ -2030,10 +2088,18 @@ fn disables_protection(line: &str) -> bool {
             .any(|service| line.contains(service));
     let ufw_off = line.contains("ufw disable") || line.contains("ufw --force disable");
     let flush = line.contains("nft flush ruleset")
-        // Lowercased, `-f` is also the fragment match of a rule, which a
-        // rule's target (`-j`) tells from a flush; a flush takes none.
-        || (program_short_flag(line, &["iptables", "ip6tables"], 'f')
-            && !program_short_flag(line, &["iptables", "ip6tables"], 'j'))
+        // Lowercased, `-f` is also the fragment match of a rule. A rule
+        // is appended, inserted, deleted, replaced or checked, and names
+        // a target; a flush does none of that.
+        || program_short_flag(
+            line,
+            &["iptables", "ip6tables"],
+            'f',
+            &[
+                "a", "i", "d", "r", "c", "j", "g", "--append", "--insert", "--delete",
+                "--replace", "--check", "--jump", "--goto",
+            ],
+        )
         || line.contains("iptables --flush")
         || line.contains("ip6tables --flush");
     let selinux = line.contains("setenforce 0") || line.contains("setenforce  0");
@@ -2929,6 +2995,11 @@ mod tests {
             "os.system(\"mkfs.ext4 /dev/sda\")",
             "install x mkfs.y; mkfs.ext4 /dev/sda",
             "x=$(mkfs.btrfs -f /dev/sdb)",
+            // The word a wrapper's option takes is not the program.
+            "env -u install mkfs.ext4 /dev/sda",
+            "exec -a rm mkfs.btrfs -f /dev/nvme0n1",
+            "run0 --unit install mkfs.ext4 /dev/sda",
+            "sudo -u install mkfs.ext4 /dev/sda",
         ] {
             assert!(
                 rules_for(running).contains(&RuleId::DestructiveSystemOperation),
@@ -3185,7 +3256,7 @@ mod tests {
             ("(curl -k https://x.test/i)", tls),
             ("if ! (curl https://x.test/i -k); then", tls),
             // A setting's value, and a program another one is given.
-            ("ExecStart=/usr/bin/curl https://x.test/i -k", tls),
+            ("ExecStart=/usr/bin/curl -k https://x.test/i", tls),
             ("xargs curl -k", tls),
             // Shown into a shell or a file is not only shown.
             ("echo curl -k https://x.test/i | sh", tls),
@@ -3195,6 +3266,19 @@ mod tests {
             ("ip6tables -F", protection),
             ("ip6tables -t mangle -F", protection),
             ("/usr/bin/ip6tables -w -F", protection),
+            // A flush beside a rule is still a flush.
+            ("iptables -F && iptables -A INPUT -j ACCEPT", protection),
+            ("iptables -A INPUT -j ACCEPT; iptables -F", protection),
+            ("iptables -F; iptables -A INPUT -j ACCEPT", protection),
+            ("iptables -A INPUT -f -j DROP; iptables -F", protection),
+            // A quote inside the name is no part of it.
+            ("ipt\"\"ables -F", protection),
+            ("sudo ip'tables' -F", protection),
+            ("c\"\"url -k https://x.test/i", tls),
+            // What follows a command that only shows is run.
+            ("echo ${x#(}; iptables -F", protection),
+            ("echo ${x:-(}; curl -k https://x.test/i", tls),
+            ("echo \\(; iptables -F", protection),
         ] {
             assert!(rules_for(line).contains(&rule), "{line}");
         }
@@ -3216,6 +3300,16 @@ mod tests {
             ("ip6tables -L | grep -f patterns", protection),
             ("iptables -A INPUT -f -j DROP", protection),
             ("sudo ip6tables -I INPUT 1 -f -j ACCEPT", protection),
+            ("iptables -A INPUT -f --jump DROP", protection),
+            ("iptables -A INPUT -f -g CHAIN", protection),
+            ("iptables -A INPUT -f", protection),
+            // The program is only what a variable is set to.
+            (
+                "IPTABLES=/usr/bin/iptables make -f Makefile.linux",
+                protection,
+            ),
+            ("CURL=/usr/bin/curl make -k", tls),
+            ("PREFIX=/usr/lib/curl make -k install", tls),
             ("iptables-save -f /etc/iptables/rules.v4", protection),
         ] {
             assert!(!rules_for(line).contains(&rule), "{line}");
@@ -3294,17 +3388,20 @@ mod tests {
         assert!(!program_short_flag(
             &"curl -a;".repeat(50_000),
             &["curl"],
-            'k'
+            'k',
+            &[]
         ));
         assert!(!program_short_flag(
             &"(curl -a | ".repeat(40_000),
             &["curl"],
-            'k'
+            'k',
+            &[]
         ));
         assert!(program_short_flag(
             &("sudo ".repeat(80_000) + "curl a -k"),
             &["curl"],
-            'k'
+            'k',
+            &[]
         ));
         assert!(formats_filesystem(&"mkfs.x y;".repeat(40_000)));
         assert!(!formats_filesystem(
