@@ -1441,7 +1441,7 @@ fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
             // Each word after an option that takes a value is looked at;
             // a line with no end of them is not followed to its end.
             values += 1;
-            if values > MAX_OPTION_VALUES {
+            if values >= MAX_OPTION_VALUES {
                 lookup.capped.set(true);
                 break;
             }

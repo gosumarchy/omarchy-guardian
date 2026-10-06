@@ -182,15 +182,17 @@ fn value_options_of(name: &str) -> &'static [&'static str] {
             "--glibc-hwcaps-prepend",
             "--glibc-hwcaps-mask",
         ]
-    } else if is_shell(name) && !is(NETWORK_SHELLS) {
+    } else if is(SCRIPT_SHELLS) {
         &["-o", "-O"]
+    } else if is(&["fish"]) {
+        &["-o"]
     } else if is(&["python", "pypy"]) {
         &["-W", "-X"]
     } else if is(&["ruby"]) {
         &["-I", "-r"]
     } else if is(&["perl", "gjs", "nu"]) {
         &["-I"]
-    } else if is(&["node", "bun", "deno"]) {
+    } else if is(&["node", "bun"]) {
         &["-r", "--require", "--import", "--loader"]
     } else if is(&["java"]) {
         &["-cp", "-classpath", "--class-path", "--module-path"]
@@ -496,6 +498,13 @@ mod tests {
         );
         assert_eq!(read("java", &["-cp", "a:b"])[1], Argument::ScriptOrValue);
         assert_eq!(read("gawk", &["-O", "data"])[1], Argument::Script);
+        // For deno `-r` reloads, and tcsh has no `-o`.
+        assert_eq!(read("deno", &["-r", "x.ts"])[1], Argument::Script);
+        assert_eq!(read("tcsh", &["-o", "x.csh"])[1], Argument::Script);
+        assert_eq!(
+            read("bash5.3", &["-o", "pipefail"])[1],
+            Argument::ScriptOrValue
+        );
         // Code on the command line, by each program's own option.
         for (name, option, code) in [
             ("perl", "-e", true),
