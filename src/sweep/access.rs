@@ -1034,10 +1034,6 @@ mod tests {
         let dir = TempDir::new("sweep-keys-elsewhere");
         let root = dir.path();
         let uid = std::fs::metadata(root).unwrap().uid();
-        // Root reads every file: there is no closed one to play.
-        if uid == 0 {
-            return;
-        }
         let write = |path: &str, text: &str| {
             std::fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
             std::fs::write(root.join(path), text).unwrap();

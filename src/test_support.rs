@@ -54,6 +54,46 @@ pub fn give(path: &Path, owner: u32) -> bool {
     std::os::unix::fs::lchown(path, Some(owner), None).is_ok()
 }
 
+/// Makes `path` and everything below it the user `owner`'s, as [`give`]
+/// does for one; `false` as soon as one cannot be given or a directory
+/// cannot be listed.
+pub fn give_tree(path: &Path, owner: u32) -> bool {
+    if !give(path, owner) {
+        return false;
+    }
+    let below = fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir());
+    !below
+        || fs::read_dir(path).is_ok_and(|entries| {
+            entries
+                .into_iter()
+                .all(|entry| entry.is_ok_and(|entry| give_tree(&entry.path(), owner)))
+        })
+}
+
+/// Hands `path` in a fixture, and what is below it, to a user, as a home
+/// is its user's. A test run by a user owns it already; run by root (a
+/// container), everything in the fixture is root's, and it is given to
+/// [`NOBODY`]. `false` where that cannot be done (root of a user namespace
+/// with no such user), for the test to do without; in CI, where it can
+/// always be done, that is a failure, not a test that asserts nothing.
+///
+/// # Panics
+///
+/// When `path` is not there, and in CI when it cannot be handed over.
+pub fn hand_to_a_user(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let owner = fs::metadata(path)
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+        .uid();
+    let handed = owner != 0 || give_tree(path, NOBODY);
+    assert!(
+        handed || env::var_os("CI").is_none(),
+        "{} could not be given to another user",
+        path.display()
+    );
+    handed
+}
+
 /// Tests that need an Arch tool skip themselves where it is missing.
 pub fn tool_available(path: &str) -> bool {
     Path::new(path).is_file()
