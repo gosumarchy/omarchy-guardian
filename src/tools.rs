@@ -240,33 +240,39 @@ const MAX_LINK_HOPS: usize = 40;
 fn link_hops(found: &Path) -> Result<Vec<PathBuf>, String> {
     let mut places = vec![found.to_path_buf()];
     let mut current = found.to_path_buf();
-    while let Some(next) = past_first_link(&current)? {
-        if places.len() > MAX_LINK_HOPS {
+    let mut links = 0;
+    while let Some((link, next)) = past_first_link(&current)? {
+        links += 1;
+        if links > MAX_LINK_HOPS {
             return Err(format!("{} leads through too many links", found.display()));
         }
+        places.push(link);
         places.push(next.clone());
         current = next;
     }
     Ok(places)
 }
 
-/// `path` with the first link in it replaced by what the link names, or
-/// `None` when no part of it is a link.
-fn past_first_link(path: &Path) -> Result<Option<PathBuf>, String> {
+/// The first link in `path`, at the place it really lies in, and `path`
+/// with that link replaced by what it names; `None` when no part of
+/// `path` is a link.
+fn past_first_link(path: &Path) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    let unread = |at: &Path, error| format!("{} cannot be read ({error})", at.display());
     let mut prefix = PathBuf::new();
     let mut parts = path.components();
     while let Some(part) = parts.next() {
         let parent = prefix.clone();
         prefix.push(part);
-        let metadata = fs::symlink_metadata(&prefix)
-            .map_err(|error| format!("{} cannot be read ({error})", prefix.display()))?;
+        let metadata = fs::symlink_metadata(&prefix).map_err(|error| unread(&prefix, error))?;
         if metadata.file_type().is_symlink() {
-            let target = fs::read_link(&prefix)
-                .map_err(|error| format!("{} cannot be read ({error})", prefix.display()))?;
+            let target = fs::read_link(&prefix).map_err(|error| unread(&prefix, error))?;
+            // Nothing above the link is a link, but a `..` there may
+            // stand: the place it lies in is that with each `..` taken.
+            let home = fs::canonicalize(&parent).map_err(|error| unread(&parent, error))?;
             // An absolute target replaces the parent, as `join` does.
-            let mut next = parent.join(target);
+            let mut next = home.join(target);
             next.extend(parts);
-            return Ok(Some(next));
+            return Ok(Some((home.join(part), next)));
         }
     }
     Ok(None)
@@ -945,6 +951,17 @@ mod tests {
                 "{reason}"
             );
         }
+        // A link kept in a scratch directory and reached by a relative
+        // target: the place it lies in is told with each `..` taken.
+        mode(&middle, 0o755);
+        let cache = home.join(".cache");
+        fs::create_dir(&cache).unwrap();
+        symlink("../.local/bin/claude", cache.join("kept")).unwrap();
+        symlink("../home/.cache/kept", good.join("relayed")).unwrap();
+        assert_eq!(refuse_planted(&good.join("relayed"), &[], me), Ok(()));
+        let reason =
+            refuse_planted(&good.join("relayed"), std::slice::from_ref(&cache), me).unwrap_err();
+        assert!(reason.contains("temporary or cache"), "{reason}");
         // A link that leads back to itself is refused, not followed for ever.
         symlink(home.join("loop"), home.join("loop")).unwrap();
         assert!(refuse_planted(&home.join("loop"), &[], me).is_err());

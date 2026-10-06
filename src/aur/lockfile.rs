@@ -284,7 +284,8 @@ pub fn scan(ecosystem: Ecosystem, text: &str) -> Scan {
             let registry = !authority.user && registries.contains(&authority.host.as_str())
                 || (ecosystem == Ecosystem::Cargo
                     && scheme == "registry+https"
-                    && address == "github.com/rust-lang/crates.io-index")
+                    // An older lockfile writes it in parentheses.
+                    && address.trim_end_matches(')') == "github.com/rust-lang/crates.io-index")
                 // Go names modules by host; they are fetched through the
                 // module proxy and checked against the checksum database.
                 || ecosystem == Ecosystem::Go;
@@ -334,6 +335,11 @@ mod tests {
         assert_eq!(found.addresses, 1);
         let cargo = "[[package]]\nname = \"a\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
         assert!(scan(Ecosystem::Cargo, cargo).is_plain());
+        // As an older lockfile writes it, in parentheses.
+        let older = "[metadata]\n\"checksum a 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)\" = \"00\"\n";
+        assert!(scan(Ecosystem::Cargo, older).is_plain());
+        let other = "\"checksum a 1.0.0 (registry+https://github.com/rust-lang/crates.io-index-x)\" = \"00\"\n";
+        assert!(!scan(Ecosystem::Cargo, other).is_plain());
         let go = "github.com/a/b v1.0.0 h1:abc=\ngithub.com/a/b v1.0.0/go.mod h1:def=\n";
         assert!(scan(Ecosystem::Go, go).is_plain());
     }
@@ -406,7 +412,7 @@ mod tests {
             ),
             (
                 "https://user:registry.npmjs.org@evil.example/x.tgz",
-                "evil.example",
+                "an unparseable host",
             ),
             (
                 "https://evil.example@registry.npmjs.org/x.tgz",

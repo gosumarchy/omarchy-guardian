@@ -938,6 +938,8 @@ fn run_command(part: &str) -> Option<shell::Command> {
 fn value_command(part: &str) -> Option<shell::Command> {
     let words = shell_words(part);
     let (key, value) = words.first()?.split_once('=')?;
+    // A unit file writes marks before the program: `ExecStart=-/bin/sh x`.
+    let value = value.trim_start_matches(['-', '@', '+', '!', ':', '|']);
     if key.is_empty() || key.contains(['/', '"', '\'', '$']) || !unquoted(value).starts_with('/') {
         return None;
     }
@@ -1008,20 +1010,18 @@ fn runs_named(command: &shell::Command, is_named: &dyn Fn(&str) -> bool) -> bool
 /// shell (`cat x | sh`). The program is found as in `runs_file`.
 pub fn run_targets(line: &str) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
-    // Only a line that opens a group has a `)` that closes one.
-    let grouped = line.contains('(');
+    // A word that ends in `)` is a file in a group that closes there, or
+    // a file of that name: both are named, and a name no file has is
+    // nobody's.
     let mut add = |word: &str| {
         let word = word.trim_start_matches('<');
-        let word = if grouped {
-            without_group_close(word)
-        } else {
-            word
-        };
-        if let Some(name) = as_file(word)
-            && !name.starts_with('-')
-            && !found.contains(&name)
-        {
-            found.push(name);
+        for word in [without_group_close(word), word] {
+            if let Some(name) = as_file(word)
+                && !name.starts_with('-')
+                && !found.contains(&name)
+            {
+                found.push(name);
+            }
         }
     };
     let flat = line.replace("&&", ";").replace("||", ";");
@@ -2833,7 +2833,11 @@ mod tests {
             "exec-once = sh i.sh",
         ] {
             assert!(runs_file(line, "i.sh"), "{line}");
-            assert_eq!(run_targets(line), ["i.sh"], "{line}");
+            assert_eq!(
+                run_targets(line).first().map(String::as_str),
+                Some("i.sh"),
+                "{line}"
+            );
         }
         for line in [
             "nohup cat i.sh",
@@ -2851,11 +2855,25 @@ mod tests {
             assert!(run_targets(line).is_empty(), "{line}");
         }
         // A name that ends in a `)` of its own keeps it.
-        assert_eq!(run_targets("./'blob)'"), ["blob)"]);
-        assert_eq!(run_targets("sh 'blob)'"), ["blob)"]);
+        // A name that ends in a `)` may be a file's own or a group's close,
+        // on this line or one before: both names are given.
+        assert_eq!(run_targets("./'blob)'"), ["blob", "blob)"]);
+        assert_eq!(run_targets("sh 'blob)'"), ["blob", "blob)"]);
+        assert_eq!(
+            run_targets("  ./configure && ./i.sh)"),
+            ["configure", "i.sh", "i.sh)"]
+        );
         assert!(runs_file("curl -o ')' https://x.example/a; sh ')'", ")"));
         // A setting whose value begins with a path is read as a command too.
         assert!(runs_file("ExecStart=/bin/sh i.sh", "i.sh"));
+        for unit in [
+            "ExecStart=-/bin/sh i.sh",
+            "ExecStartPre=+/bin/sh i.sh",
+            "ExecStart=!!/bin/sh i.sh",
+            "ExecStartPost=-+/bin/bash i.sh",
+        ] {
+            assert!(runs_file(unit, "i.sh"), "{unit}");
+        }
         assert!(runs_file("FOO=/bin/sh i.sh", "i.sh"));
         assert!(!runs_file("FOO=/bin/cat i.sh", "i.sh"));
     }

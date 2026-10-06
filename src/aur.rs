@@ -492,14 +492,19 @@ fn parse_source(entry: &str) -> Option<Parsed<'_>> {
             scheme_lower.clone(),
         ),
     };
-    let (address, fragment) = match rest.split_once('#') {
-        Some((address, fragment)) => (address, fragment.split_once('=')),
-        None => (rest, None),
+    let fragment = rest
+        .split_once('#')
+        .and_then(|(_, fragment)| fragment.split_once('='));
+    // `scp` takes what follows the last `://` for its address.
+    let host = if transport == "scp" && rest.contains("://") {
+        UNPARSEABLE_HOST.into()
+    } else {
+        Authority::of(rest).shown()
     };
     Some(Parsed {
         vcs,
         transport,
-        host: Authority::of(address).shown(),
+        host,
         fragment,
     })
 }
@@ -519,9 +524,10 @@ struct Authority {
 impl Authority {
     /// Reads the authority of an address from just past its `://`. It ends
     /// at a `/`, a `?` or a `#`, so nothing after one is the host. Clients
-    /// disagree in two places, and an authority written that way names no
+    /// disagree in a few places, and an authority written that way names no
     /// host: one ends the host at a `\\` and another takes it for part of
-    /// the user, and the same goes for a `?` or a `#` with an `@` after it.
+    /// the user, the same goes for a `?` or a `#` with an `@` after it, and
+    /// for a user part that is more than a name.
     fn of(rest: &str) -> Self {
         let whole = rest.split('/').next().unwrap_or_default();
         let authority = whole.split(['?', '#']).next().unwrap_or_default();
@@ -532,6 +538,18 @@ impl Authority {
             };
         }
         let user = authority.rsplit_once('@');
+        // A user part is a name: with a `:`, a `%` or a bracket in it, one
+        // program reads the host out of it and another does not.
+        let plain = |name: &str| {
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        };
+        if user.is_some_and(|(name, _)| !plain(name)) {
+            return Self {
+                host: String::new(),
+                user: true,
+            };
+        }
         Self {
             host: user
                 .map_or(authority, |(_, host)| host)
@@ -2612,7 +2630,29 @@ pkgname = demo
             ),
             ("https://github.com/x.tar.gz?a@b", "github.com"),
             ("https://github.com?a=b", "github.com"),
-            ("https://evil.example#@github.com/x.tar.gz", "evil.example"),
+            (
+                "https://evil.example#@github.com/x.tar.gz",
+                "an unparseable host",
+            ),
+            (
+                "rsync://github.com#@evil.example/m/x",
+                "an unparseable host",
+            ),
+            (
+                "git+ssh://evil.example%2f@github.com/a/b",
+                "an unparseable host",
+            ),
+            ("git://[evil.example]@github.com/a/b", "an unparseable host"),
+            ("scp://evil.example:x@github.com:/y", "an unparseable host"),
+            (
+                "scp://github.com/x://evil.example:/y",
+                "an unparseable host",
+            ),
+            (
+                "https://web.archive.org/web/2020/https://example.org/x",
+                "web.archive.org",
+            ),
+            ("https://github.com/x.tar.gz#tag=a@b", "github.com"),
             (
                 "https://evil.example\\@github.com/x.tar.gz",
                 "an unparseable host",
@@ -2625,7 +2665,7 @@ pkgname = demo
             ("https://github.com@evil.example/x.tar.gz", "evil.example"),
             (
                 "https://user:github.com@evil.example/x.tar.gz",
-                "evil.example",
+                "an unparseable host",
             ),
             ("git+ssh://git@example.org/r.git", "example.org"),
             (
@@ -2634,7 +2674,7 @@ pkgname = demo
             ),
             ("https://$(x)/a", "an unparseable host"),
             ("https://ev il/a", "an unparseable host"),
-            ("https://github.com\"@evil.example/a", "evil.example"),
+            ("https://github.com\"@evil.example/a", "an unparseable host"),
             ("https:///a", "an unparseable host"),
         ] {
             assert_eq!(source_host(entry).as_deref(), Some(host), "{entry}");
