@@ -2753,6 +2753,100 @@ sha256sums=('abc'\n            SKIP 'SKIP')\nbuild() {\n  local source=x\n  eval
     /// Whether bash runs the `G` in each of these, as it loads them the way
     /// makepkg loads a recipe. Where it does, Guardian must have read the
     /// command: text that bash takes for code is never text to Guardian.
+    /// Recipe lines after `source=(good)`, with `G` for a command that is
+    /// seen to run, and whether bash 5.3 runs it.
+    const BASH_READS: &[(&str, bool)] = &[
+        // Quotes.
+        ("x='a\\'; G # '\n", true),
+        ("x=\"a\\\"; G # \"\n", false),
+        ("x='a\nG\n'\n", false),
+        ("x=a#'b\nG # '\n", false),
+        ("x=1 # '\nG # '\n", true),
+        // `$'...'`, and a `$` that opens none.
+        ("x=$'a\\'; G # '\n", false),
+        ("x=$'a\\\\'; G # '\n", true),
+        ("x=\\$'a\\'; G # '\n", true),
+        ("x=$$'a\\'; G # '\n", true),
+        ("x=$$$'a\\'; G # '\n", false),
+        ("x=\\\\$'a\\'; G # '\n", false),
+        ("x=$?'a\\'; G # '\n", true),
+        ("x=\"$\"'a\\'; G # '\n", true),
+        ("x=a$\\\n'b\\'; G # '\n", false),
+        ("x=$(echo \\$'a\\'); G # ')\n", true),
+        ("x=$(echo $$'a\\'); G # ')\n", true),
+        ("x=$(echo $'a\\'); G # ')')\n", false),
+        ("x=${y#$'\\''}; G # '\n", true),
+        ("x=${y#$'\\''}; G # '}\n", true),
+        ("x=${y:-$$'a\\'}; G # '}\n", true),
+        // Quotes inside `${ ... }`, with and without quotes around it.
+        ("z=\"${x#'}\"'}\"; G # '\n", true),
+        ("z=\"${x%'}\"'}\"; G # '\n", true),
+        ("z=\"${x/'}\"'/}\"; G # '\n", true),
+        ("z=\"${x^'}\"'}\"; G # '\n", true),
+        ("z=\"${x,,'}\"'}\"; G # '\n", true),
+        ("z=\"${x:-'}\"; G # '}\"\n", false),
+        ("z=\"${x:-'}'}\"; G\n", true),
+        ("z=\"${x:-it's}\"; G\n", false),
+        ("z=\"${x#'a'}\"; G\n", true),
+        ("z=\"${x//'.'/_}\"; G\n", true),
+        ("z=${x:-'}'}; G # '\n", true),
+        ("z=${x:-a b}; G\n", true),
+        ("z=\"${x:-\"}\"}\"; G # \"\n", true),
+        // Substitutions.
+        ("x=\"$(echo ')')\"; G\n", true),
+        ("x=\"$(echo \"a b\")\"; G\n", true),
+        ("x=$(echo a # '\n)\nG # '\n", true),
+        ("x=`echo \\`; G # \\``\n", false),
+        // Here-documents.
+        (": <<X\nG\nX\n", false),
+        (": <<X\ntext\nX\nG\n", true),
+        (": <<X\ntext\n X\nG\nX\n", false),
+        (": <<-X\n\ttext\n\tX\nG\n", true),
+        (": <<-X\n text\n X\nG\n\tX\n", false),
+        (": <<X\"Y\"\n$x\nXY\nG\n", true),
+        (": <<A <<B\none\nA\nG\nB\n", false),
+        (": <<A; : <<B\none\nA\ntwo\nB\nG\n", true),
+        // Lines joined by a backslash inside one.
+        (": <<true\ntr\\\nue\nG\ntrue\n", true),
+        (": <<X\ntext\nX\\\n\nG\nX\n", true),
+        (": <<X\n\\\nX\nG\n", true),
+        (": <<X\ntext \\\nX\nG\nX\n", false),
+        (": <<X\ntext\nX\\\\\n\nG\nX\n", false),
+        (": <<'X'\ntext\nX\\\n\nG\nX\n", false),
+        (": <<\\X\ntext\nX\\\n\nG\nX\n", false),
+        (": <<X''\nte\\\nxt\nX\\\n\nG\nX\n", false),
+        (": <<-X\n\t\\\n\tX\nG\n", true),
+        (": <<-X\n\tte\\\n\tX\nG\nX\n", false),
+        (": <<-X\n\ttext\n\t\\\nX\nG\n", true),
+        // A marker over two lines is one written without quotes.
+        (": <<X\\\nY\nG\nXY\nG\n", true),
+        (": <<X\\\nY\nX\\\nY\nG\nXY\n", true),
+        // A line joined between `<<` and its `-`, or after a `$`.
+        (": <<\\\n-X\n\tX\nG\n-X\n", true),
+        ("x=\"$\\\n(echo '\"')\"; G # '\n", true),
+        ("x=${y:-$\\\n'a\\''}; G # '}\n", true),
+        ("x=$(echo $\\\n'a\\''); G; : $( # '\n)\n", true),
+        // A marker that is more than a word.
+        (": <<$'X'\nX\nG\n$X\n", true),
+        (": <<$\"X\"\n$X\n: '\nX\nG # '\n", true),
+        (": <<\"X\\\\\"\nX\\\nG\nX\\\\\n", true),
+        (": <<`a b`\n`a b`\nG`\n`a\n", true),
+        // A `#` after an escaped character or a joined line, and one
+        // straight after an array.
+        ("x=$(echo \\ #); G; : $(\n)\n", true),
+        ("x=$(echo \\;#); G; : $(\n)\n", true),
+        ("x=$(echo \\(#); G; : $(\n)\n", true),
+        ("x=$(echo a\\\n#); G; : $(\n)\n", true),
+        ("x=(a)#b; G\n", true),
+        // `<` and `<` joined, and an escaped `<` before `<<`.
+        ("x=$(: <\\\n<X\n'\nX\n); G; : $( # '\n)\n", true),
+        ("x=$(:\\<<<X\n'\nX\n); G; : $( # '\n)\n", true),
+        (": <\\\n<X\ntext\nX\nG\n", true),
+        // Bash drops a NUL as it reads the file.
+        ("x=$\0$'a\\'; G # '\n", true),
+        (": <<X\0\nX\nG\nX\0\n", true),
+    ];
+
     #[test]
     fn what_bash_runs_is_code_to_guardian() {
         if !tool_available("/usr/bin/bash") {
@@ -2760,73 +2854,7 @@ sha256sums=('abc'\n            SKIP 'SKIP')\nbuild() {\n  local source=x\n  eval
         }
         let dir = TempDir::new("recipe-bash");
         let mut wrong = Vec::new();
-        for (body, runs) in [
-            // Quotes.
-            ("x='a\\'; G # '\n", true),
-            ("x=\"a\\\"; G # \"\n", false),
-            ("x='a\nG\n'\n", false),
-            ("x=a#'b\nG # '\n", false),
-            ("x=1 # '\nG # '\n", true),
-            // `$'...'`, and a `$` that opens none.
-            ("x=$'a\\'; G # '\n", false),
-            ("x=$'a\\\\'; G # '\n", true),
-            ("x=\\$'a\\'; G # '\n", true),
-            ("x=$$'a\\'; G # '\n", true),
-            ("x=$$$'a\\'; G # '\n", false),
-            ("x=\\\\$'a\\'; G # '\n", false),
-            ("x=$?'a\\'; G # '\n", true),
-            ("x=\"$\"'a\\'; G # '\n", true),
-            ("x=a$\\\n'b\\'; G # '\n", false),
-            ("x=$(echo \\$'a\\'); G # ')\n", true),
-            ("x=$(echo $$'a\\'); G # ')\n", true),
-            ("x=$(echo $'a\\'); G # ')')\n", false),
-            ("x=${y#$'\\''}; G # '\n", true),
-            ("x=${y#$'\\''}; G # '}\n", true),
-            ("x=${y:-$$'a\\'}; G # '}\n", true),
-            // Quotes inside `${ ... }`, with and without quotes around it.
-            ("z=\"${x#'}\"'}\"; G # '\n", true),
-            ("z=\"${x%'}\"'}\"; G # '\n", true),
-            ("z=\"${x/'}\"'/}\"; G # '\n", true),
-            ("z=\"${x^'}\"'}\"; G # '\n", true),
-            ("z=\"${x,,'}\"'}\"; G # '\n", true),
-            ("z=\"${x:-'}\"; G # '}\"\n", false),
-            ("z=\"${x:-'}'}\"; G\n", true),
-            ("z=\"${x:-it's}\"; G\n", false),
-            ("z=\"${x#'a'}\"; G\n", true),
-            ("z=\"${x//'.'/_}\"; G\n", true),
-            ("z=${x:-'}'}; G # '\n", true),
-            ("z=${x:-a b}; G\n", true),
-            ("z=\"${x:-\"}\"}\"; G # \"\n", true),
-            // Substitutions.
-            ("x=\"$(echo ')')\"; G\n", true),
-            ("x=\"$(echo \"a b\")\"; G\n", true),
-            ("x=$(echo a # '\n)\nG # '\n", true),
-            ("x=`echo \\`; G # \\``\n", false),
-            // Here-documents.
-            (": <<X\nG\nX\n", false),
-            (": <<X\ntext\nX\nG\n", true),
-            (": <<X\ntext\n X\nG\nX\n", false),
-            (": <<-X\n\ttext\n\tX\nG\n", true),
-            (": <<-X\n text\n X\nG\n\tX\n", false),
-            (": <<X\"Y\"\n$x\nXY\nG\n", true),
-            (": <<A <<B\none\nA\nG\nB\n", false),
-            (": <<A; : <<B\none\nA\ntwo\nB\nG\n", true),
-            // Lines joined by a backslash inside one.
-            (": <<true\ntr\\\nue\nG\ntrue\n", true),
-            (": <<X\ntext\nX\\\n\nG\nX\n", true),
-            (": <<X\n\\\nX\nG\n", true),
-            (": <<X\ntext \\\nX\nG\nX\n", false),
-            (": <<X\ntext\nX\\\\\n\nG\nX\n", false),
-            (": <<'X'\ntext\nX\\\n\nG\nX\n", false),
-            (": <<\\X\ntext\nX\\\n\nG\nX\n", false),
-            (": <<X''\nte\\\nxt\nX\\\n\nG\nX\n", false),
-            (": <<-X\n\t\\\n\tX\nG\n", true),
-            (": <<-X\n\tte\\\n\tX\nG\nX\n", false),
-            (": <<-X\n\ttext\n\t\\\nX\nG\n", true),
-            // A marker over two lines is one written without quotes.
-            (": <<X\\\nY\nG\nXY\nG\n", true),
-            (": <<X\\\nY\nX\\\nY\nG\nXY\n", true),
-        ] {
+        for &(body, runs) in BASH_READS {
             let recipe = format!("source=(good)\n{}", body.replace('G', GUARDED));
             std::fs::write(dir.path().join("PKGBUILD"), &recipe).unwrap();
             let output = std::process::Command::new("/usr/bin/bash")

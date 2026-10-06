@@ -117,6 +117,9 @@ struct Lexer<'a> {
     /// A `<<` inside the substitution being read: a here-document there
     /// ends where Guardian does not follow.
     here_in_substitution: bool,
+    /// How long the word was just after a character escaped with a
+    /// backslash: that character is no blank and no operator to bash.
+    escaped_at: Option<usize>,
     unsure: Vec<usize>,
 }
 
@@ -125,6 +128,13 @@ impl Lexer<'_> {
         if self.unsure.last() != Some(&self.line) {
             self.unsure.push(self.line);
         }
+    }
+
+    /// Whether a backslash and a new line come next: bash joins the lines
+    /// there, and reads what is before and after them as one.
+    fn joins_ahead(&self) -> bool {
+        let mut ahead = self.characters.clone();
+        ahead.next() == Some('\\') && ahead.next() == Some('\n')
     }
 
     fn push(&mut self, character: char) {
@@ -195,13 +205,33 @@ impl Lexer<'_> {
             .any(|inside| *inside == Inside::Double)
     }
 
+    /// The character after a backslash just kept in the word, inside
+    /// quotes or a substitution: kept with it.
+    fn escaped(&mut self, inside: Inside) {
+        // `<` and a joined line, or `\<`: whether a here-document follows
+        // is told by the `<` Guardian counts.
+        let before_less = self.word[..self.word.len() - 1].ends_with('<');
+        if let Some(next) = self.characters.next() {
+            if matches!(inside, Inside::Substitution(..))
+                && (next == '<' || (next == '\n' && before_less))
+            {
+                self.unsure();
+            }
+            self.word.push(next);
+            self.line += usize::from(next == '\n');
+            self.escaped_at = Some(self.word.len());
+        }
+    }
+
     /// One character inside quotes or a substitution: kept in the word.
     fn quoted(&mut self, inside: Inside, character: char) {
         let boundary = |last: char| is_blank(last) || "(;|&".contains(last);
         if let Inside::Substitution(_, kind @ (Kind::Code | Kind::Arithmetic)) = inside {
             // A comment: its quotes open nothing.
             if character == '#' && self.word.ends_with(boundary) {
-                if kind == Kind::Arithmetic {
+                // After an escaped blank or operator, or a joined line,
+                // it is part of a word.
+                if kind == Kind::Arithmetic || self.escaped_at == Some(self.word.len()) {
                     self.unsure();
                 }
                 while self.characters.next_if(|next| *next != '\n').is_some() {}
@@ -240,11 +270,12 @@ impl Lexer<'_> {
                 self.stack.pop();
             }
             (Inside::Single, _) => {}
-            (_, '\\') => {
-                if let Some(next) = self.characters.next() {
-                    self.word.push(next);
-                    self.line += usize::from(next == '\n');
-                }
+            (_, '\\') => self.escaped(inside),
+            // Bash joins two lines before it reads what follows a `$`.
+            (Inside::Double | Inside::Substitution(..) | Inside::Brace, '$')
+                if self.joins_ahead() =>
+            {
+                self.unsure();
             }
             (Inside::Double | Inside::Substitution(..) | Inside::Brace, '$')
                 if matches!(self.characters.peek(), Some('(' | '{')) =>
@@ -381,6 +412,16 @@ impl Lexer<'_> {
                     quote = Some(next);
                     quoted = true;
                 }
+                // `$'X'`, `$"X"` and a marker in backticks are not read
+                // here as bash reads them, nor is a backslash inside `"`.
+                None if next == '$' || next == '`' => {
+                    self.unsure();
+                    marker.push(next);
+                }
+                Some('"') if next == '\\' => {
+                    self.unsure();
+                    marker.push(next);
+                }
                 None if next == '\\' => {
                     self.characters.next();
                     // Before a new line it joins the lines and quotes
@@ -409,12 +450,18 @@ impl Lexer<'_> {
             self.redirect = true;
             return;
         }
+        // A joined line before the `-` or the marker: what comes after
+        // it belongs to the `<<`.
+        let joined = self.joins_ahead();
         let strip_tabs = self.characters.next_if_eq(&'-').is_some();
         while self
             .characters
             .next_if(|next| *next == ' ' || *next == '\t')
             .is_some()
         {}
+        if joined || self.joins_ahead() {
+            self.unsure();
+        }
         let (marker, quoted) = self.here_marker();
         if marker.is_empty() {
             self.unsure();
@@ -528,7 +575,18 @@ impl Lexer<'_> {
     fn close_parenthesis(&mut self) {
         self.end_word();
         match self.array.take() {
-            Some(array) => self.emit(array),
+            Some(array) => {
+                // What stands straight after the `)` goes on the word:
+                // `x=(a)#b` has no comment.
+                let ends = self
+                    .characters
+                    .peek()
+                    .is_none_or(|next| is_blank(*next) || ";&|)".contains(*next));
+                if !ends {
+                    self.unsure();
+                }
+                self.emit(array);
+            }
             None => self.operator(")"),
         }
     }
@@ -587,7 +645,13 @@ impl Lexer<'_> {
         let next = self.characters.peek().copied();
         match character {
             '\\' => match self.characters.next() {
-                Some('\n') => self.line += 1,
+                Some('\n') => {
+                    // `<` and `<` on two joined lines are one `<<`.
+                    if self.redirect && self.word.is_empty() {
+                        self.unsure();
+                    }
+                    self.line += 1;
+                }
                 Some(escaped) => {
                     self.push('\\');
                     self.push(escaped);
@@ -670,8 +734,14 @@ pub fn tokens(recipe: &str) -> (Vec<Token>, Vec<usize>) {
         redirect: false,
         here: Vec::new(),
         here_in_substitution: false,
+        escaped_at: None,
         unsure: Vec::new(),
     };
+    // Bash drops a NUL as it reads the file, so the characters around one
+    // stand together for it.
+    if recipe.contains('\0') {
+        lexer.unsure();
+    }
     while let Some(character) = lexer.characters.next() {
         match lexer.stack.last().copied() {
             Some(inside) => lexer.quoted(inside, character),
