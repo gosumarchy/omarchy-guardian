@@ -5,6 +5,7 @@
 //! that runs its output. Decoding alone is ordinary (certificates, icons,
 //! test data), and so is `eval`; the two meeting is what is flagged.
 
+use super::matchers::last_pipe_reader;
 use super::shell::{self, Command, program_name, short_flag, unquoted_words};
 use super::{contains_pattern, pattern_starts, pipes_into_shell};
 
@@ -139,20 +140,85 @@ fn filters_literal_into_shell(
     is_filter: &dyn Fn(&Command) -> bool,
     spelled_out: bool,
 ) -> bool {
-    let parts: Vec<&str> = line.split('|').collect();
-    (0..parts.len()).any(|at| {
-        if !shell::pipes_from(parts[at], is_filter) {
-            return false;
+    let filters = |part: &str| shell::pipes_from(part, is_filter);
+    // The line as `pipes_into_shell` cuts it: at single pipes, with `||`
+    // read as `;`. Only what stands before the last reader is piped into
+    // one.
+    let groups = pipe_groups(line);
+    let flat: Vec<String> = groups
+        .iter()
+        .map(|group| group.replace("||", ";"))
+        .collect();
+    let segments: Vec<&str> = flat.iter().map(String::as_str).collect();
+    let Some(reader) = last_pipe_reader(&segments) else {
+        return false;
+    };
+    // Whether a segment after the one looked at, and before the reader, is
+    // a filter by itself: from the end, so each segment is read once.
+    let mut later = false;
+    let mut followed = 0;
+    for index in (0..reader).rev() {
+        let parts: Vec<&str> = groups[index].split('|').collect();
+        // Where each part begins in the segment, which has one character
+        // for each `||` before it.
+        let mut start = 0;
+        for (at, part) in parts.iter().enumerate() {
+            let begins = start;
+            start += part.len() + (at + 1) % 2;
+            if !filters(part) {
+                continue;
+            }
+            let before = match at.checked_sub(1) {
+                Some(before) => Some(parts[before]),
+                None => index
+                    .checked_sub(1)
+                    .and_then(|group| groups[group].rsplit('|').next()),
+            };
+            let fed = (part.contains("<<") && !(spelled_out && part.contains('$')))
+                || before.is_some_and(|before| prints(before, spelled_out));
+            if !fed {
+                continue;
+            }
+            // Its output is piped on as it is, or a later filter's is.
+            if at + 1 == parts.len() || later {
+                return true;
+            }
+            // `tr … <<< x || y | sh`: what is piped on is the end of the
+            // segment, read from the filter on.
+            followed += 1;
+            if followed > MAX_FOLLOWED || flat[index].get(begins..).is_some_and(&filters) {
+                return true;
+            }
         }
-        let fed = (parts[at].contains("<<") && !(spelled_out && parts[at].contains('$')))
-            || at
-                .checked_sub(1)
-                .is_some_and(|before| prints(parts[before], spelled_out));
-        // From the filter on: what reads its output.
-        fed && pipes_into_shell(&parts[at..].join("|"), |part| {
-            shell::pipes_from(part, is_filter)
-        })
-    })
+        later = later || filters(segments[index]);
+    }
+    false
+}
+
+/// The most filters of one line, each with a `||` after it, whose pipeline
+/// is read on from there. A line with more is taken to run one: to read
+/// each would cost a pass over the line apiece.
+const MAX_FOLLOWED: usize = 64;
+
+/// What the single pipes of `line` divide: a `||` is no pipe, and is left
+/// in its part.
+fn pipe_groups(line: &str) -> Vec<&str> {
+    let bytes = line.as_bytes();
+    let mut groups = Vec::new();
+    let (mut start, mut index) = (0, 0);
+    while index < bytes.len() {
+        if bytes[index] != b'|' {
+            index += 1;
+        } else if bytes.get(index + 1) == Some(&b'|') {
+            index += 2;
+        } else {
+            groups.push(&line[start..index]);
+            index += 1;
+            start = index;
+        }
+    }
+    groups.push(&line[start..]);
+    groups
 }
 
 /// The shell shapes: a decoder (or a literal written in escapes, or a
@@ -579,5 +645,47 @@ mod tests {
         assert!(!runs_name("exec(decode)", "code"));
         assert!(!runs_name("exec(other, code)", "code"));
         assert!(!runs_name("print(code)", "code"));
+    }
+
+    #[test]
+    fn a_filter_before_an_or_is_read_to_what_is_piped_on() {
+        for line in [
+            "tr a b <<< x || tr c d <<< y | sh",
+            "tr a b <<< x | cat || true | sh",
+            "gunzip <<< x || gunzip <<< y | cat | bash",
+            "echo x | tr a b || echo y | tr c d | sh",
+        ] {
+            assert!(matches(line), "{line}");
+        }
+        for line in [
+            // What is piped on is the last command of its part.
+            "tr a b <<< x || cat | sh",
+            "tr a b <<< x || cat y | sh",
+            "echo x | tr a b || true | sh",
+            "tr a b <<< x ||| sh",
+            // The shell is before the filter, or reads nothing.
+            "sh | tr a b <<< x",
+            "tr a b <<< x || sh",
+            "tr a b <<< x |sh||x",
+        ] {
+            assert!(!matches(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_long_line_of_filters_costs_one_pass() {
+        use super::MAX_FOLLOWED;
+        // Filters none of which is read by a shell, and then one that is.
+        let filters = "tr a b<<<x|".repeat(12_000);
+        assert!(!matches(&filters));
+        assert!(matches(&(filters + "sh")));
+        assert!(!matches(&"echo x|tr a b|".repeat(8_000)));
+        // Each with a `||` after it: up to `MAX_FOLLOWED` are read on to
+        // what is piped into the shell, and a line with more is taken to
+        // run one.
+        let followed = |count: usize| "tr a b<<<x||".repeat(count) + "cat|sh";
+        assert!(!matches(&followed(MAX_FOLLOWED)));
+        assert!(matches(&followed(MAX_FOLLOWED + 1)));
+        assert!(matches(&followed(5_000)));
     }
 }

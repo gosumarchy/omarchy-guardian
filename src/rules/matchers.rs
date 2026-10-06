@@ -167,31 +167,43 @@ pub(super) fn pipes_into_shell(line: &str, source: impl Fn(&str) -> bool) -> boo
     let Some(first) = segments.iter().position(|segment| source(segment)) else {
         return false;
     };
-    (first + 1..segments.len()).any(|index| {
-        // A real pipe has whitespace on a side; a regex alternation
-        // (`a|perl|b`) does not.
-        let spaced = segments[index - 1].ends_with(char::is_whitespace)
-            || segments[index].starts_with(char::is_whitespace);
-        // A segment cut at a pipe may open a quote it does not close
-        // (`sh -c "a | sh"`), so its words are cut at whitespace alone and
-        // a quote before a word is taken off it. Wrappers that run the
-        // command after them do not change what it is, so `| timeout 5 sh`
-        // still reads the pipe into a shell.
-        let mut words = segments[index]
-            .split_whitespace()
-            .map(|word| word.trim_start_matches(['(', '{', '"', '\'']));
-        let Some(word) = shell::program_word(&mut words) else {
-            return false;
-        };
-        // `xargs sh -c '…'`: xargs hands the input to the shell.
-        if program_name(word) == "xargs" {
-            let mut rest = words.skip_while(|argument| argument.starts_with('-'));
-            return rest
-                .next()
-                .is_some_and(|program| consumes_pipe(program, rest, spaced));
-        }
-        consumes_pipe(word, words, spaced)
-    })
+    (first + 1..segments.len()).any(|index| reads_pipe(&segments, index))
+}
+
+/// Whether the segment at `index`, which is not the first, runs what the
+/// pipe before it carries.
+fn reads_pipe(segments: &[&str], index: usize) -> bool {
+    // A real pipe has whitespace on a side; a regex alternation
+    // (`a|perl|b`) does not.
+    let spaced = segments[index - 1].ends_with(char::is_whitespace)
+        || segments[index].starts_with(char::is_whitespace);
+    // A segment cut at a pipe may open a quote it does not close
+    // (`sh -c "a | sh"`), so its words are cut at whitespace alone and
+    // a quote before a word is taken off it. Wrappers that run the
+    // command after them do not change what it is, so `| timeout 5 sh`
+    // still reads the pipe into a shell.
+    let mut words = segments[index]
+        .split_whitespace()
+        .map(|word| word.trim_start_matches(['(', '{', '"', '\'']));
+    let Some(word) = shell::program_word(&mut words) else {
+        return false;
+    };
+    // `xargs sh -c '…'`: xargs hands the input to the shell.
+    if program_name(word) == "xargs" {
+        let mut rest = words.skip_while(|argument| argument.starts_with('-'));
+        return rest
+            .next()
+            .is_some_and(|program| consumes_pipe(program, rest, spaced));
+    }
+    consumes_pipe(word, words, spaced)
+}
+
+/// The last of `segments`, cut as `pipes_into_shell` cuts a line, that runs
+/// what is piped into it.
+pub(super) fn last_pipe_reader(segments: &[&str]) -> Option<usize> {
+    (1..segments.len())
+        .rev()
+        .find(|index| reads_pipe(segments, *index))
 }
 
 pub(super) fn is_encoded_command_execution(line: &str) -> bool {
