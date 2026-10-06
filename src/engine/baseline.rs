@@ -18,6 +18,7 @@ use crate::engine::request::{PROMPT_VERSION, Request};
 use crate::engine::store::{BASELINES, BLOBS, Store, VERDICTS, is_hex_digest};
 use crate::error::Error;
 use crate::sha256::Sha256;
+use crate::time::SECONDS_PER_DAY;
 
 const FORMAT: &str = "omarchy-guardian-baseline 3";
 const MAX_IDENTITY_BYTES: usize = 512;
@@ -141,8 +142,6 @@ struct Manifest {
 /// as diffs, or this many days, the next review is a full one.
 pub const MAX_DIFF_REVIEWS: u32 = 5;
 pub const MAX_DAYS_SINCE_FULL: u64 = 30;
-
-const SECONDS_PER_DAY: u64 = 86_400;
 
 /// Why a baseline is no longer diffed against, or `None` while it is.
 fn due(manifest: &Manifest, now: u64) -> Option<String> {

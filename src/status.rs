@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 use crate::agent;
 use crate::config::Settings;
@@ -27,6 +27,7 @@ use crate::protect::paths;
 use crate::rules::RuleId;
 use crate::sweep::root::{RESULTS, RootPart, from_results, results_problem};
 use crate::sweep::state::{self, LastRun, Outcome};
+use crate::time::SECONDS_PER_DAY;
 use crate::tools::Reviewer;
 
 /// A block younger than this needs attention until it is dismissed.
@@ -74,9 +75,7 @@ struct Status {
 
 fn collect() -> Status {
     let settings = Settings::load();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
+    let now = crate::time::now();
     let mut issues: Vec<String> = settings.warnings().to_vec();
     if let Some(reason) = settings.privileged_block() {
         issues.push(reason.to_string());
@@ -202,9 +201,7 @@ fn root_overrides(paths: &Paths) -> Vec<String> {
     if fs::metadata(results).map_or(true, |metadata| metadata.len() > MAX_ROOT_RESULTS) {
         return Vec::new();
     }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
+    let now = crate::time::now();
     from_results(results, now)
         .map(|part| reported_overrides(&part, &paths.sweep_overrides))
         .unwrap_or_default()
@@ -654,8 +651,8 @@ fn age(seconds: u64) -> String {
     match seconds {
         0..60 => "just now".into(),
         60..3600 => format!("{} min ago", seconds / 60),
-        3600..86_400 => format!("{} h ago", seconds / 3600),
-        _ => format!("{} d ago", seconds / 86_400),
+        3600..SECONDS_PER_DAY => format!("{} h ago", seconds / 3600),
+        _ => format!("{} d ago", seconds / SECONDS_PER_DAY),
     }
 }
 
@@ -752,9 +749,7 @@ pub fn mark_seen_unless_waiting(directory: &Path, id: &str, now: u64) -> bool {
 pub fn dismiss() -> Result<(), String> {
     gatewatch::dismiss();
     let directory = notify::reports_dir().ok_or("no reports directory (set HOME)")?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
+    let now = crate::time::now();
     if let Some((newest, _)) = newest_report(&directory, now) {
         fs::write(directory.join(SEEN), newest).map_err(|error| error.to_string())?;
     }
@@ -765,9 +760,7 @@ pub fn dismiss() -> Result<(), String> {
 /// Opens the last block's report in the browser and marks it seen.
 pub fn open_report() -> Result<(), String> {
     let directory = notify::reports_dir().ok_or("no reports directory (set HOME)")?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
+    let now = crate::time::now();
     let (newest, _) = newest_report(&directory, now).ok_or("no block reports yet")?;
     let page = directory.join(format!("{newest}.html"));
     Command::new("omarchy-launch-browser")

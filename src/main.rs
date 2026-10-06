@@ -57,6 +57,7 @@ mod sweep;
 #[cfg(test)]
 mod test_support;
 mod text;
+mod time;
 mod tomlish;
 mod tools;
 mod tui;

@@ -43,7 +43,6 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use self::state::{Drift, Extraction, State};
 use crate::audit::{self, Gate};
@@ -779,9 +778,7 @@ fn aur_facts(base: Option<&str>, directory_name: &str, recipe: &str) -> Vec<Stri
     names.dedup();
     match aur_info(base, &names) {
         Ok(Some(info)) => {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_secs());
+            let now = crate::time::now();
             let (found, mut warnings) = aur::trust_signals(&info, now);
             if let Some(summary) = found.first() {
                 outln!("{summary}");

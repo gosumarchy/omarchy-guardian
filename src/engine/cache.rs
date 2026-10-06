@@ -12,12 +12,11 @@ use crate::engine::store::{Store, VERDICTS};
 use crate::error::Error;
 use crate::json::Json;
 use crate::sha256::Sha256;
+use crate::time::SECONDS_PER_DAY;
 
 /// Stands in for the per-run nonce when a request is hashed: the nonce is
 /// random, everything else in the request is what was judged.
 const KEY_NONCE: &str = "cache-key";
-
-const SECONDS_PER_DAY: u64 = 86_400;
 
 pub struct Cached {
     pub review: AgentReview,

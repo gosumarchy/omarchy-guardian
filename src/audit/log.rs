@@ -24,8 +24,8 @@ use super::{
 };
 use crate::json::Json;
 use crate::notify;
-use crate::report::html::utc;
 use crate::text::shown;
+use crate::time::utc;
 use crate::tools::{self, Limits};
 
 const JOURNALCTL: &str = "/usr/bin/journalctl";

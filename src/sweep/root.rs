@@ -261,9 +261,7 @@ pub fn collect_command(out: bool, settings: &crate::config::Settings) -> ExitCod
     // one; a run through sudo reads it where there is one and writes
     // nothing, as it writes nothing else. Without a record yet (the
     // timer's first run too) the results carry no list.
-    let now = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
+    let now = crate::time::now();
     let seen = read_trust_seen(Path::new(TRUST_SEEN));
     let (new, seen) = news(&collection.items, seen, now);
     let json = to_json(&collection, &notes, new.as_deref()).to_string();

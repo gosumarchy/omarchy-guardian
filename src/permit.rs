@@ -37,7 +37,6 @@ use std::io::{BufRead, BufReader, Write as _};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::audit::{self, Entry, Event, Gate};
 use crate::config::Settings;
@@ -45,11 +44,11 @@ use crate::config::model::{Named, Profile, SourceClass};
 use crate::engine::store::{self, Store};
 use crate::json::Json;
 use crate::notify;
-use crate::report::html::utc;
 use crate::report::{Decision, Report};
 use crate::sha256::Sha256;
 use crate::sweep::{root, state};
 use crate::text::shown;
+use crate::time::{now, utc};
 
 /// Where root keeps the permits: one file each.
 pub const DIRECTORY: &str = "/var/lib/omarchy-guardian/permits";
@@ -85,12 +84,6 @@ const WORD: &str = "permit";
 
 const SYSTEM_USAGE: &str =
     "usage: omarchy-guardian permit-system (--add GATE CLASS SHA256 | --revoke ID)";
-
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
-}
 
 fn is_hex(text: &str, length: usize) -> bool {
     text.len() == length

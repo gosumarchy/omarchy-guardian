@@ -10,11 +10,11 @@ use std::io::Write as _;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::output;
 use crate::report::{Blocked, html};
 use crate::text;
+use crate::time;
 use crate::tools::{self, Limits};
 
 const NOTIFY_SEND: &str = "/usr/bin/notify-send";
@@ -248,9 +248,7 @@ pub fn save_and_open(title: &str, detail: &str, ran: Ran) -> Option<(PathBuf, St
     // Asked for and opened, it is seen; checked after saving, so an alert
     // saved meanwhile still keeps the bar's attention.
     if let Some(directory) = path.parent() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_secs());
+        let now = time::now();
         crate::status::mark_seen_unless_waiting(directory, &id, now);
     }
     if env::var_os(QUIET).is_none() && Path::new(LAUNCH_BROWSER).is_file() {
@@ -282,15 +280,13 @@ fn save_report(title: &str, detail: &str, ran: Ran, uid: u32) -> Option<PathBuf>
     }
     let directory = reports_dir()?;
     crate::engine::store::private_dir(&directory, uid).ok()?;
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
+    let seconds = time::now();
     let id = format!("{seconds}-{}", std::process::id());
     let captured = output::captured();
     // The page for people; the plain text for `omarchy-guardian ask`.
     let plain = format!("{title}: {detail}\n\n{}", html::strip_ansi(&captured));
     write_private(&directory.join(format!("{id}.txt")), &plain)?;
-    let page = html::page(title, detail, ran, &html::utc(seconds), &id, &captured);
+    let page = html::page(title, detail, ran, &time::utc(seconds), &id, &captured);
     let path = directory.join(format!("{id}.html"));
     write_private(&path, &page)?;
     prune(&directory, uid);

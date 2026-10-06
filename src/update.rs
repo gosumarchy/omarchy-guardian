@@ -22,13 +22,13 @@ use std::fmt;
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Settings;
 use crate::gatewatch;
 use crate::json::Json;
 use crate::notify;
 use crate::osv::curl_args;
+use crate::time::now;
 use crate::tools::{self, Limits};
 
 /// What git itself asks a repository for its branches and tags.
@@ -167,12 +167,6 @@ fn seen(
         told: news.or(told),
     };
     (record, news)
-}
-
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// The release on record that is newer than `installed`.

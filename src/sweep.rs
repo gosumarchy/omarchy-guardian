@@ -35,7 +35,6 @@ pub mod tools;
 use std::env;
 use std::path::Path;
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Settings;
 use crate::config::model::{RootConsent, SourceClass};
@@ -43,6 +42,7 @@ use crate::engine::store::{self, Store};
 use crate::notify;
 use crate::report::{AgentOutcome, Blocked, Decision, Gap, Report};
 use crate::review::ReviewContext;
+use crate::time::now;
 use crate::tools::OpenCode;
 use collect::{Collection, Origin, Scope};
 use index::{LOCAL_DB, PackageIndex};
@@ -426,9 +426,7 @@ fn add_root_part(
     } else {
         match settings.sweep_root().0 {
             Some(RootConsent::Allowed) => {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |elapsed| elapsed.as_secs());
+                let now = now();
                 root::from_results(Path::new(root::RESULTS), now)
                     .map_err(|reason| format!("root checks: {reason}"))
             }
@@ -642,13 +640,6 @@ fn notify_scheduled(
             notify::found("that its daily system sweep could not finish", reason);
         }
     }
-}
-
-/// Seconds since the epoch.
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// Records how this scheduled sweep ended for the bar (see

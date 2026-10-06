@@ -472,28 +472,6 @@ fn skip_string(characters: &mut std::iter::Peekable<impl Iterator<Item = char>>)
     }
 }
 
-/// `seconds` since the epoch as `YYYY-MM-DD HH:MM UTC`.
-pub fn utc(seconds: u64) -> String {
-    let days = seconds / 86_400;
-    let rest = seconds % 86_400;
-    // Days to a civil date (Howard Hinnant's algorithm), for dates after 1970.
-    let z = days + 719_468;
-    let era = z / 146_097;
-    let day_of_era = z % 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let mp = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = year_of_era + era * 400 + u64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
-        rest / 3600,
-        rest % 3600 / 60
-    )
-}
-
 const STYLE: &str = r#"
 *{box-sizing:border-box}
 html,body{margin:0;background:var(--bg);color:var(--fg)}
@@ -544,8 +522,9 @@ footer{margin-top:28px;font-size:11px;letter-spacing:.12em;color:color-mix(in sr
 
 #[cfg(test)]
 mod tests {
-    use super::{esc, page, strip_ansi, utc};
+    use super::{esc, page, strip_ansi};
     use crate::notify::Ran;
+    use crate::time::utc;
 
     #[test]
     fn hidden_characters_are_shown_and_every_escape_is_dropped() {

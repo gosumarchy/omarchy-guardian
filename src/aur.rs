@@ -774,7 +774,7 @@ pub fn declared_names(pkgbuild: &str) -> Vec<String> {
     names
 }
 
-const DAY: u64 = 86_400;
+const DAY: u64 = crate::time::SECONDS_PER_DAY;
 /// A package younger than this is new.
 const NEW_DAYS: u64 = 30;
 /// A package with fewer votes has no track record.
