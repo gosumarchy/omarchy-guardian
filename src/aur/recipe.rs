@@ -2750,9 +2750,6 @@ sha256sums=('abc'\n            SKIP 'SKIP')\nbuild() {\n  local source=x\n  eval
     /// and says that it ran.
     const GUARDED: &str = "[[ -w . ]] && source=(evil) && echo RAN";
 
-    /// Whether bash runs the `G` in each of these, as it loads them the way
-    /// makepkg loads a recipe. Where it does, Guardian must have read the
-    /// command: text that bash takes for code is never text to Guardian.
     /// Recipe lines after `source=(good)`, with `G` for a command that is
     /// seen to run, and whether bash 5.3 runs it.
     const BASH_READS: &[(&str, bool)] = &[
@@ -2841,12 +2838,23 @@ sha256sums=('abc'\n            SKIP 'SKIP')\nbuild() {\n  local source=x\n  eval
         // `<` and `<` joined, and an escaped `<` before `<<`.
         ("x=$(: <\\\n<X\n'\nX\n); G; : $( # '\n)\n", true),
         ("x=$(:\\<<<X\n'\nX\n); G; : $( # '\n)\n", true),
-        (": <\\\n<X\ntext\nX\nG\n", true),
+        // A `$` in a marker's double quotes, and a pattern list on one.
+        (": <<\"${y+\" \"}\"\n${y+ }\nG\n${y+\nx=1}\n", true),
+        ("shopt -s extglob\n: <<X+(a b)\nX+(a b)\nG\nX+\n", true),
+        // A here-document named in a substitution that closes on its line.
+        ("x=$(: <<X)\ny='\nX\nG # '\n", true),
+        ("x=\"$(: <<-X)\"\ny='\nX\nG # '\n", true),
+        // A `#` straight after a group inside a substitution.
+        ("x=$( (:)# '\n); G # ')\n", true),
         // Bash drops a NUL as it reads the file.
         ("x=$\0$'a\\'; G # '\n", true),
         (": <<X\0\nX\nG\nX\0\n", true),
     ];
 
+    /// Whether bash runs the `G` in each of `BASH_READS`, as it loads them
+    /// the way makepkg loads a recipe. Where it does, Guardian must have
+    /// read the command: text that bash takes for code is never text to
+    /// Guardian.
     #[test]
     fn what_bash_runs_is_code_to_guardian() {
         if !tool_available("/usr/bin/bash") {
@@ -2879,6 +2887,10 @@ sha256sums=('abc'\n            SKIP 'SKIP')\nbuild() {\n  local source=x\n  eval
     #[test]
     fn what_a_recipe_does_elsewhere_is_no_reason_to_ask() {
         for recipe in [
+            // A redirection whose file is on the next, joined line, and a
+            // comment in one substitution after an escape in another.
+            "source=(a)\nbuild() {\n  sed s/a/b/ x > \\\n    \"$pkgdir/y\"\n  cat < \\\n    x 2>> \\\n    log\n}\n",
+            "x=$(a \\; b)\ny=$(ab; #c\n)\nsource=(a)\n",
             "pkgname=demo\nsource=(a)\nbuild() {\n  eval \"$(x)\"\n  printf -v v %s y\n  export BUILDDIR=b\n  read -r source < f\n}\n",
             "_helper() { local x=$1; echo \"$x\"; }\npackage() { _helper a; }\nsource=(a)\n",
             "shopt -s extglob\nsource=(a)\nprintf '%s\\n' hello\n",

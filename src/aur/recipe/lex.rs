@@ -146,6 +146,7 @@ impl Lexer<'_> {
 
     fn end_word(&mut self) {
         self.here_in_substitution = false;
+        self.escaped_at = None;
         if self.word.is_empty() {
             return;
         }
@@ -227,6 +228,11 @@ impl Lexer<'_> {
     fn quoted(&mut self, inside: Inside, character: char) {
         let boundary = |last: char| is_blank(last) || "(;|&".contains(last);
         if let Inside::Substitution(_, kind @ (Kind::Code | Kind::Arithmetic)) = inside {
+            // After a `)` that closed a group a `#` begins a comment, and
+            // after one that closed a substitution it does not.
+            if character == '#' && kind == Kind::Code && self.word.ends_with(')') {
+                self.unsure();
+            }
             // A comment: its quotes open nothing.
             if character == '#' && self.word.ends_with(boundary) {
                 // After an escaped blank or operator, or a joined line,
@@ -321,6 +327,11 @@ impl Lexer<'_> {
                 self.stack.push(Inside::Substitution(depth + 1, kind));
             }
             (Inside::Substitution(depth, kind), ')') => {
+                // A here-document named here and not yet read takes the
+                // lines after this one (in arithmetic, `<<` is a shift).
+                if self.here_in_substitution && kind == Kind::Code {
+                    self.unsure();
+                }
                 self.stack.pop();
                 if depth > 1 {
                     self.stack.push(Inside::Substitution(depth - 1, kind));
@@ -418,7 +429,7 @@ impl Lexer<'_> {
                     self.unsure();
                     marker.push(next);
                 }
-                Some('"') if next == '\\' => {
+                Some('"') if matches!(next, '\\' | '$' | '`') => {
                     self.unsure();
                     marker.push(next);
                 }
@@ -436,6 +447,14 @@ impl Lexer<'_> {
                 _ => marker.push(next),
             }
             self.characters.next();
+        }
+        // A pattern list (`X+(a b)`) or a process substitution goes on
+        // the marker for bash.
+        let mut ahead = self.characters.clone();
+        let stopped = ahead.next();
+        if stopped == Some('(') || (matches!(stopped, Some('<' | '>')) && ahead.next() == Some('('))
+        {
+            self.unsure();
         }
         if quote.is_some() {
             self.unsure();
@@ -645,13 +664,7 @@ impl Lexer<'_> {
         let next = self.characters.peek().copied();
         match character {
             '\\' => match self.characters.next() {
-                Some('\n') => {
-                    // `<` and `<` on two joined lines are one `<<`.
-                    if self.redirect && self.word.is_empty() {
-                        self.unsure();
-                    }
-                    self.line += 1;
-                }
+                Some('\n') => self.line += 1,
                 Some(escaped) => {
                     self.push('\\');
                     self.push(escaped);
