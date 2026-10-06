@@ -503,22 +503,19 @@ fn part_short_flag(
 /// a flag of a later command does not count.
 fn command_has_flag(line: &str, programs: &[&str], exact_flags: &[&str]) -> bool {
     let words = unquoted_words(line);
-    let mut index = 0;
-    while index < words.len() {
-        if programs.contains(&program_name(&words[index])) {
-            if exact_flags.is_empty() {
-                return true;
-            }
-            for argument in &words[index + 1..] {
-                if matches!(argument.as_str(), ";" | "|" | "&&" | "||" | "&") {
-                    break;
-                }
-                if exact_flags.contains(&argument.as_str()) {
-                    return true;
-                }
-            }
+    // Whether one of the flags is among the arguments after the word
+    // looked at: read from the end, so the arguments many commands share
+    // are read once.
+    let mut flagged = false;
+    for word in words.iter().rev() {
+        if matches!(word.as_str(), ";" | "|" | "&&" | "||" | "&") {
+            flagged = false;
+            continue;
         }
-        index += 1;
+        if programs.contains(&program_name(word)) && (exact_flags.is_empty() || flagged) {
+            return true;
+        }
+        flagged = flagged || exact_flags.contains(&word.as_str());
     }
     false
 }

