@@ -846,7 +846,7 @@ fn hold_against_extraction(
     let extraction = step
         .state
         .extraction()
-        .filter(|extraction| Path::new(&extraction.srcdir) == srcdir);
+        .filter(|extraction| extraction.is_of(srcdir));
     let Some(extraction) = extraction else {
         outln!(
             "Sources: Guardian has no record of extracting them for this build; they are reviewed as they are now."
@@ -896,8 +896,8 @@ fn record_extraction(step: &UpstreamStep<'_>, srcdir: &Path, collected: &aur::Co
         srcdir: srcdir.to_string_lossy().into_owned(),
         identity: state::identity(srcdir),
         cleanbuild: cleans,
-        downloads: Extraction::keyed(&seen.downloads),
-        files: Extraction::keyed(&seen.seen),
+        downloads: seen.downloads.clone(),
+        files: seen.seen.clone(),
     });
 }
 

@@ -41,7 +41,8 @@ pub(super) struct Extraction {
     pub(super) identity: Option<String>,
     /// The build removes and re-creates that directory (`--cleanbuild`).
     pub(super) cleanbuild: bool,
-    /// The downloaded files linked into it, with their hashes.
+    /// The downloaded files linked into it, with their hashes. The names
+    /// here and the paths below are as they are, not as they are written.
     pub(super) downloads: BTreeMap<String, String>,
     /// Every file in it, with its hash.
     pub(super) files: BTreeMap<String, String>,
@@ -65,6 +66,43 @@ fn short(digest: &str) -> &str {
     digest.get(..DIGEST_CHARS).unwrap_or(digest)
 }
 
+/// Whether `text` may stand for a name that is not text: such a name is
+/// kept with the replacement character where its bytes were not UTF-8, so
+/// it reads the same as other names and as the one really written so. It
+/// is never taken for the name of what was extracted.
+fn is_lossy(text: &str) -> bool {
+    text.contains(char::REPLACEMENT_CHARACTER)
+}
+
+/// `text` as `str::escape_default` wrote it, plain again. Only what that
+/// writes is read, and only the one way it writes it, so two texts never
+/// read as the same name; anything else is `None`.
+fn unescaped(text: &str) -> Option<String> {
+    let mut plain = String::with_capacity(text.len());
+    let mut rest = text.chars();
+    while let Some(character) = rest.next() {
+        if character != '\\' {
+            plain.push(character);
+            continue;
+        }
+        plain.push(match rest.next()? {
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            '\\' => '\\',
+            '\'' => '\'',
+            '"' => '"',
+            'u' => {
+                let (hex, after) = rest.as_str().strip_prefix('{')?.split_once('}')?;
+                rest = after.chars();
+                char::from_u32(u32::from_str_radix(hex, 16).ok()?)?
+            }
+            _ => return None,
+        });
+    }
+    (plain.escape_default().to_string() == text).then_some(plain)
+}
+
 /// What a later call found different from an `Extraction`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Drift {
@@ -78,6 +116,11 @@ pub(super) enum Drift {
 }
 
 impl Extraction {
+    /// Whether this is the record of the sources in `srcdir`.
+    pub(super) fn is_of(&self, srcdir: &Path) -> bool {
+        !is_lossy(&self.srcdir) && Path::new(&self.srcdir) == srcdir
+    }
+
     /// Compares the sources as they are now with what Guardian extracted.
     pub(super) fn drift(
         &self,
@@ -92,8 +135,10 @@ impl Extraction {
             return Drift::Elsewhere;
         }
         let differs = |known: &BTreeMap<String, String>, path: &String, digest: &String| {
-            let kept = known.get(&path.escape_default().to_string());
-            digest.is_empty() || kept.map(|kept| short(kept)) != Some(short(digest))
+            let kept = known.get(path);
+            digest.is_empty()
+                || is_lossy(path)
+                || kept.map(|kept| short(kept)) != Some(short(digest))
         };
         let changed: Vec<String> = downloads
             .iter()
@@ -112,6 +157,11 @@ impl Extraction {
         )
     }
 
+    /// The record as it is kept: a line each for the directory, its
+    /// identity and whether the build cleans, then one for each download
+    /// (`D`) and file (`F`) with its hash and its path. A path is written
+    /// escaped, once, here, so that it stays one line of plain ASCII, and
+    /// `parse` reads it back as it was.
     fn to_text(&self) -> String {
         let mut text = format!(
             "srcdir {}\nidentity {}\ncleanbuild {}\n",
@@ -132,44 +182,52 @@ impl Extraction {
         text
     }
 
+    /// Reads what `to_text` wrote. A record that is cut short, holds a
+    /// path not escaped the way `to_text` escapes it, or names a path
+    /// twice is no record.
     fn parse(text: &str) -> Option<Self> {
-        let mut lines = text.lines();
-        let mut header = |name: &str| -> Option<String> {
-            Some(
-                lines
-                    .next()?
-                    .strip_prefix(name)?
-                    .strip_prefix(' ')?
-                    .to_string(),
-            )
-        };
+        let mut lines = text.strip_suffix('\n')?.split('\n');
+        let mut header =
+            |name: &str| -> Option<&str> { lines.next()?.strip_prefix(name)?.strip_prefix(' ') };
         let mut extraction = Self {
-            srcdir: header("srcdir")?,
-            identity: Some(header("identity")?).filter(|identity| identity != "-"),
-            cleanbuild: header("cleanbuild")? == "1",
+            srcdir: unescaped(header("srcdir")?)?,
+            identity: Some(header("identity")?)
+                .filter(|identity| *identity != "-")
+                .map(str::to_string),
+            cleanbuild: match header("cleanbuild")? {
+                "0" => false,
+                "1" => true,
+                _ => return None,
+            },
             ..Self::default()
         };
         for line in lines {
             let mut fields = line.splitn(3, ' ');
             let (kind, digest, path) = (fields.next()?, fields.next()?, fields.next()?);
             let digest = if digest == "-" { "" } else { digest };
-            match kind {
+            let entries = match kind {
                 "D" => &mut extraction.downloads,
                 "F" => &mut extraction.files,
                 _ => return None,
+            };
+            if entries
+                .insert(unescaped(path)?, digest.to_string())
+                .is_some()
+            {
+                return None;
             }
-            .insert(path.to_string(), digest.to_string());
         }
         Some(extraction)
     }
+}
 
-    /// The paths as they are kept: written so that each stays one line.
-    pub(super) fn keyed(entries: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-        entries
-            .iter()
-            .map(|(path, digest)| (path.escape_default().to_string(), digest.clone()))
-            .collect()
-    }
+/// The paths as the record of the binaries keeps them: written so that
+/// each stays one line.
+fn one_line(entries: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    entries
+        .iter()
+        .map(|(path, digest)| (path.escape_default().to_string(), digest.clone()))
+        .collect()
 }
 
 /// The gate's memory of one package. Without a directory it remembers
@@ -256,7 +314,7 @@ impl State {
 
     pub(super) fn record_binaries(&self, binaries: &BTreeMap<String, String>) {
         let mut text = String::new();
-        for (path, digest) in Extraction::keyed(binaries) {
+        for (path, digest) in one_line(binaries) {
             let digest = if digest.is_empty() { "-" } else { &digest };
             let _ = writeln!(text, "{digest} {path}");
         }
@@ -324,7 +382,7 @@ pub(super) fn binary_changes(
     known: &BTreeMap<String, String>,
     now: &BTreeMap<String, String>,
 ) -> (Vec<String>, Vec<String>) {
-    let now = Extraction::keyed(now);
+    let now = one_line(now);
     let changed = now
         .iter()
         .filter(|(path, digest)| {
@@ -347,6 +405,9 @@ pub(super) fn binary_changes(
 
 #[cfg(test)]
 mod forget_tests;
+
+#[cfg(test)]
+mod record_tests;
 
 #[cfg(test)]
 mod tests;

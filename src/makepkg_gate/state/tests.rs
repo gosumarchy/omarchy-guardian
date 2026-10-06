@@ -76,8 +76,8 @@ fn binaries_and_extractions_round_trip() {
         srcdir: "/build/demo/src".into(),
         identity: Some("1:2:3".into()),
         cleanbuild: true,
-        downloads: Extraction::keyed(&map(&[("demo.tar.gz", &"a".repeat(64))])),
-        files: Extraction::keyed(&map(&[("src/demo/a.c", &"b".repeat(64)), ("src/x y", "")])),
+        downloads: map(&[("demo.tar.gz", &"a".repeat(64))]),
+        files: map(&[("src/demo/a.c", &"b".repeat(64)), ("src/x y", "")]),
     };
     state.record_extraction(&extraction);
     let read = state.extraction().unwrap();
@@ -101,8 +101,8 @@ fn a_later_call_sees_what_changed_since_guardian_extracted() {
         srcdir: "/x".into(),
         identity: Some("1:2:3".into()),
         cleanbuild: true,
-        downloads: Extraction::keyed(&downloads),
-        files: Extraction::keyed(&files),
+        downloads: downloads.clone(),
+        files: files.clone(),
     });
     let extraction = state.extraction().unwrap();
     // The build made the directory anew and left the files alone.
