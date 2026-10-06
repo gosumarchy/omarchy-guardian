@@ -21,8 +21,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
 use super::{
-    Found, Process, Running, is_interpreter, is_named, is_temporary, is_updated, module_of,
-    packaged, plain, replaced_in_own_namespace, started_in, subject, told, trusted_program,
+    Found, Process, Running, Source, is_interpreter, is_named, is_temporary, is_updated, module_of,
+    packaged, plain, replaced_in_own_namespace, source, started_in, subject, told, trusted_program,
 };
 use crate::autorun::Category;
 use crate::rules::RuleId;
@@ -231,26 +231,38 @@ pub(super) fn shown_for_test(socket: &Socket) -> (String, u16, bool, String) {
 struct Tables {
     tcp: HashMap<String, Socket>,
     udp: HashMap<String, Socket>,
+    /// The tables that are there and could not be read, each with why:
+    /// their sockets are missing above. One that is not there (`tcp6`
+    /// without IPv6) has none.
+    unread: Vec<(&'static str, String)>,
 }
 
 impl Tables {
     /// Reads the tables under `directory` (`/proc/net`, or a process's
     /// `/proc/<pid>/net` for the namespace it is in).
     fn read(directory: &Path) -> Self {
-        let table = |names: [&str; 2]| -> HashMap<String, Socket> {
+        let mut unread = Vec::new();
+        let mut table = |names: [&'static str; 2]| -> HashMap<String, Socket> {
             names
-                .iter()
-                .filter_map(|name| fs::read_to_string(directory.join(name)).ok())
+                .into_iter()
+                .filter_map(
+                    |name| match source(fs::read_to_string(directory.join(name))) {
+                        Source::Read(text) => Some(text),
+                        Source::Absent => None,
+                        Source::Unreadable(reason) => {
+                            unread.push((name, reason));
+                            None
+                        }
+                    },
+                )
                 .flat_map(|text| text.lines().skip(1).filter_map(socket).collect::<Vec<_>>())
                 // Inode 0 is a socket the reader is not told the owner of.
                 .filter(|socket| socket.inode != "0")
                 .map(|socket| (socket.inode.clone(), socket))
                 .collect()
         };
-        Self {
-            tcp: table(["tcp", "tcp6"]),
-            udp: table(["udp", "udp6"]),
-        }
+        let (tcp, udp) = (table(["tcp", "tcp6"]), table(["udp", "udp6"]));
+        Self { tcp, udp, unread }
     }
 }
 
@@ -280,6 +292,14 @@ fn holders(processes: &[Process]) -> HashMap<&str, Vec<&Process>> {
 pub(super) fn check(scope: &Scope<'_>, running: &Running, found: &mut Found) {
     let holders = holders(&running.processes);
     let own = Tables::read(&scope.root.join("proc/net"));
+    for (name, reason) in &own.unread {
+        found.not_checked(
+            scope,
+            format!(
+                "/proc/net/{name}: could not be read ({reason}); the sockets it lists were not checked"
+            ),
+        );
+    }
     listeners(scope, &own, &holders, found);
     // A process in a network namespace of its own (a container) is not in
     // the sweep's tables: its namespace's are read through it, once.
@@ -288,10 +308,28 @@ pub(super) fn check(scope: &Scope<'_>, running: &Running, found: &mut Found) {
         let tables = match process.network.as_deref() {
             None => &own,
             Some(namespace) => others.entry(namespace).or_insert_with(|| {
-                Tables::read(&scope.root.join("proc").join(&process.pid).join("net"))
+                let directory = scope.root.join("proc").join(&process.pid);
+                let mut tables = Tables::read(&directory.join("net"));
+                // A process that ended meanwhile has no tables left.
+                if !directory.exists() {
+                    tables.unread.clear();
+                }
+                tables
             }),
         };
         connections(scope, process, tables, found);
+    }
+    let closed = others
+        .values()
+        .filter(|tables| !tables.unread.is_empty())
+        .count();
+    if closed > 0 {
+        found.not_checked(
+            scope,
+            format!(
+                "the sockets of {closed} other network namespace(s) could not be read; connections there were not checked"
+            ),
+        );
     }
     packet_sockets(scope, &holders, found);
     promiscuous(scope, running, found);
@@ -829,7 +867,14 @@ fn remote_shell(
 /// that waits for a magic packet without opening a port, reads the
 /// network through. The programs that run the network hold some too.
 fn packet_sockets(scope: &Scope<'_>, holders: &HashMap<&str, Vec<&Process>>, found: &mut Found) {
-    let Ok(text) = fs::read_to_string(scope.root.join("proc/net/packet")) else {
+    // Not there until the kernel's packet-socket support is loaded.
+    let read = fs::read_to_string(scope.root.join("proc/net/packet"));
+    let Some(text) = found.read(
+        scope,
+        "/proc/net/packet",
+        "raw packet sockets were not checked",
+        read,
+    ) else {
         return;
     };
     let mut unattributed = 0;

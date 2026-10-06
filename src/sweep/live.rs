@@ -28,6 +28,7 @@ mod net;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs;
+use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -256,6 +257,12 @@ impl Process {
 pub fn check(scope: &Scope<'_>) -> Live {
     let mut found = Found::default();
     let running = processes(&scope.root.join("proc"));
+    if let Some(reason) = &running.unlistable {
+        found.not_checked(
+            scope,
+            format!("/proc: could not be listed ({reason}); running processes were not checked"),
+        );
+    }
     // As a user that is what root's checks are for. Root has nothing
     // behind it to cover them: a process root cannot look at is one that
     // something keeps from it.
@@ -306,7 +313,60 @@ struct Found {
     cut_short: bool,
 }
 
+/// What reading one of the kernel's own files or directories gave.
+enum Source<T> {
+    Read(T),
+    /// It is not there: a kernel without it, or a test tree.
+    Absent,
+    /// It is there and could not be read, and why.
+    Unreadable(String),
+}
+
+/// Tells a source that is not there from one that could not be read:
+/// only the first has nothing in it.
+fn source<T>(read: io::Result<T>) -> Source<T> {
+    match read {
+        Ok(read) => Source::Read(read),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Source::Absent,
+        Err(error) => Source::Unreadable(error.to_string()),
+    }
+}
+
 impl Found {
+    /// Says what could not be looked at: for the root checks, which
+    /// nothing stands behind, something left unchecked; a note in a user's
+    /// sweep.
+    fn not_checked(&mut self, scope: &Scope<'_>, sentence: String) {
+        if scope.origin == Origin::Root {
+            self.unchecked.push(sentence);
+        } else {
+            self.notes.push(sentence);
+        }
+    }
+
+    /// What `read` gave of the source called `name`. Nothing where it is
+    /// not there; nothing either where it is there and could not be read,
+    /// which is said once, with what was `missed` for it.
+    fn read<T>(
+        &mut self,
+        scope: &Scope<'_>,
+        name: &str,
+        missed: &str,
+        read: io::Result<T>,
+    ) -> Option<T> {
+        match source(read) {
+            Source::Read(read) => Some(read),
+            Source::Absent => None,
+            Source::Unreadable(reason) => {
+                self.not_checked(
+                    scope,
+                    format!("{name}: could not be read ({reason}); {missed}"),
+                );
+                None
+            }
+        }
+    }
+
     /// Adds what was seen about the file at `path`; one item per path.
     fn add(
         &mut self,
@@ -421,12 +481,22 @@ struct Running {
     processes: Vec<Process>,
     listed: Vec<Listed>,
     unreadable: usize,
+    /// Why the list of processes itself could not be read, where it is
+    /// there: nothing above says anything of what runs then.
+    unlistable: Option<String>,
 }
 
 /// Every process under `proc`.
 fn processes(proc: &Path) -> Running {
-    let Ok(listing) = fs::read_dir(proc) else {
-        return Running::default();
+    let listing = match source(fs::read_dir(proc)) {
+        Source::Read(listing) => listing,
+        Source::Absent => return Running::default(),
+        Source::Unreadable(reason) => {
+            return Running {
+                unlistable: Some(reason),
+                ..Running::default()
+            };
+        }
     };
     let mut running = Running::default();
     let link = |path: &Path| fs::read_link(path).ok();
@@ -459,7 +529,7 @@ fn processes(proc: &Path) -> Running {
         });
         let exe = match fs::read_link(directory.join("exe")) {
             Ok(exe) => exe.to_string_lossy().into_owned(),
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                 running.unreadable += 1;
                 continue;
             }
@@ -1244,9 +1314,16 @@ fn searched(environment: Option<&[u8]>) -> Vec<Option<String>> {
 
 /// The running kernel's release, as its modules directory is named.
 fn kernel_release(scope: &Scope<'_>) -> Option<String> {
-    let release = fs::read_to_string(scope.root.join("proc/sys/kernel/osrelease")).ok()?;
+    release_named(&fs::read_to_string(scope.root.join(OSRELEASE)).ok()?)
+}
+
+/// Where the running kernel says which release it is, under the root.
+const OSRELEASE: &str = "proc/sys/kernel/osrelease";
+
+/// The release the text of `osrelease` names.
+fn release_named(text: &str) -> Option<String> {
     // It names a directory: nothing that leads elsewhere.
-    let release = release.trim();
+    let release = text.trim();
     (!release.is_empty() && !release.contains('/') && release != "." && release != "..")
         .then(|| release.to_string())
 }
@@ -1263,7 +1340,16 @@ fn kernel_installed(scope: &Scope<'_>, modules_root: &str) -> bool {
 
 /// Loaded modules no package installed, and the taint flag.
 fn kernel(scope: &Scope<'_>, found: &mut Found) {
-    let Some(release) = kernel_release(scope) else {
+    let missed = "loaded kernel modules were not checked";
+    let read = fs::read_to_string(scope.root.join(OSRELEASE));
+    let Some(text) = found.read(scope, &format!("/{OSRELEASE}"), missed, read) else {
+        return;
+    };
+    let Some(release) = release_named(&text) else {
+        found.not_checked(
+            scope,
+            format!("/{OSRELEASE}: names no kernel release; {missed}"),
+        );
         return;
     };
     let modules_root = format!("usr/lib/modules/{release}");
@@ -1327,7 +1413,15 @@ fn loaded_modules(scope: &Scope<'_>, modules_root: &str, found: &mut Found) {
             .map(|path| (module_name(path), path.to_string()))
             .collect();
     let dkms = scope.root.join("var/lib/dkms").is_dir();
-    let loaded = fs::read_to_string(scope.root.join("proc/modules")).unwrap_or_default();
+    let read = fs::read_to_string(scope.root.join("proc/modules"));
+    let loaded = found
+        .read(
+            scope,
+            "/proc/modules",
+            "loaded kernel modules were not checked",
+            read,
+        )
+        .unwrap_or_default();
     for name in loaded
         .lines()
         .filter_map(|line| line.split_whitespace().next())
@@ -1445,10 +1539,48 @@ fn taint_flags(taint: u64) -> String {
     format!("flags {taint}: {}", reasons.join(", "))
 }
 
-/// Setuid and setgid files, and files with capabilities, that no package
-/// vouches for.
-fn privileged_files(scope: &Scope<'_>, found: &mut Found) {
+/// The directories the search for set-id files could not list, or not in
+/// full: how many, and the first of them by name.
+#[derive(Default)]
+struct Closed {
+    count: usize,
+    first: Option<String>,
+}
+
+impl Closed {
+    fn add(&mut self, directory: &str) {
+        self.count += 1;
+        if self.first.as_deref().is_none_or(|first| directory < first) {
+            self.first = Some(directory.to_string());
+        }
+    }
+
+    /// Says it in one sentence, however many there are. A user's sweep
+    /// cannot list much of the system (`/root`, other homes), which is
+    /// what the root checks are for; root, which nothing stands behind,
+    /// leaves them unchecked and names one.
+    fn say(self, scope: &Scope<'_>, found: &mut Found) {
+        let Some(first) = self.first else {
+            return;
+        };
+        let count = self.count;
+        if scope.origin == Origin::Root {
+            found.unchecked.push(format!(
+                "setuid programs were not looked for in {count} place(s) that could not be listed (/{} among them)",
+                first.escape_debug()
+            ));
+        } else {
+            found.notes.push(format!(
+                "setuid programs were not looked for in {count} place(s) that could not be listed; the root checks cover them"
+            ));
+        }
+    }
+}
+
+/// Setuid and setgid files that no package vouches for.
+fn set_id_files(scope: &Scope<'_>, found: &mut Found) {
     let mut looked_at = 0;
+    let mut closed = Closed::default();
     let root = scope.origin == Origin::Root;
     'walk: for start in PRIVILEGED_ROOTS {
         let mut pending = vec![(*start).to_string()];
@@ -1464,12 +1596,28 @@ fn privileged_files(scope: &Scope<'_>, found: &mut Found) {
                         ));
                         continue;
                     }
-                    _ => continue,
+                    // No directory (any more): a link or a file.
+                    Some(_) => continue,
+                    // The pinned walk does not say why it shows nothing:
+                    // what is gone is nothing, what is still there was
+                    // not looked into.
+                    None => {
+                        let gone = fs::symlink_metadata(scope.root.join(&directory)).map_or_else(
+                            |error| error.kind() == io::ErrorKind::NotFound,
+                            |metadata| !metadata.is_dir(),
+                        );
+                        if !gone {
+                            closed.add(&directory);
+                        }
+                        continue;
+                    }
                 };
             let Ok(listing) = fs::read_dir(format!("/proc/self/fd/{}", opened.as_raw_fd())) else {
+                closed.add(&directory);
                 continue;
             };
-            for entry in listing.filter_map(Result::ok) {
+            let mut whole = true;
+            for entry in listing {
                 looked_at += 1;
                 if looked_at > MAX_WALK {
                     found.unchecked.push(format!(
@@ -1477,8 +1625,17 @@ fn privileged_files(scope: &Scope<'_>, found: &mut Found) {
                     ));
                     break 'walk;
                 }
-                let Ok(metadata) = entry.metadata() else {
-                    continue;
+                // An entry that went away meanwhile is nothing; one that
+                // is there and cannot be asked about may be anything.
+                let (entry, metadata) = match entry.and_then(|entry| {
+                    let metadata = entry.metadata()?;
+                    Ok((entry, metadata))
+                }) {
+                    Ok(read) => read,
+                    Err(error) => {
+                        whole = whole && error.kind() == io::ErrorKind::NotFound;
+                        continue;
+                    }
                 };
                 let Some(name) = entry.file_name().to_str().map(str::to_string) else {
                     // A directory may hold set-id files; a file may be one.
@@ -1507,8 +1664,18 @@ fn privileged_files(scope: &Scope<'_>, found: &mut Found) {
                     }
                 }
             }
+            if !whole {
+                closed.add(&directory);
+            }
         }
     }
+    closed.say(scope, found);
+}
+
+/// Setuid and setgid files, and files with capabilities, that no package
+/// vouches for.
+fn privileged_files(scope: &Scope<'_>, found: &mut Found) {
+    set_id_files(scope, found);
     match capability_files(scope) {
         Ok(files) => {
             // A name that is not UTF-8 comes out of getcap unreadable.
@@ -4197,14 +4364,33 @@ mod tests {
             "sys/fs/cgroup/user.slice/a.scope/cgroup.procs",
             "0\n77\n",
         );
-        let mut members = super::kernel::members_of_control_groups(&Scope {
-            root: dir.path(),
-            home: None,
-            index: &index,
-            origin: Origin::System,
-        });
-        members.sort_unstable();
-        assert_eq!(members, [0, 1, 2, 77]);
+        let members = |origin, most| {
+            let scope = Scope {
+                root: dir.path(),
+                home: None,
+                index: &index,
+                origin,
+            };
+            let mut found = super::Found::default();
+            let mut members = super::kernel::members_of_control_groups(&scope, most, &mut found);
+            members.sort_unstable();
+            (members, found.notes, found.unchecked)
+        };
+        assert_eq!(
+            members(Origin::System, 3),
+            (vec![0, 1, 2, 77], vec![], vec![])
+        );
+        // Groups past the bound are said to be left out: a note in a
+        // user's sweep, not checked for root.
+        let left = "more than 2 control groups: the processes the rest name were not tried in the search for hidden processes";
+        assert_eq!(
+            members(Origin::System, 2),
+            (vec![1, 2], vec![left.to_string()], vec![])
+        );
+        assert_eq!(
+            members(Origin::Root, 2),
+            (vec![1, 2], vec![], vec![left.to_string()])
+        );
     }
 
     #[test]
@@ -4393,6 +4579,196 @@ mod tests {
         for _ in 0..10_000 {
             check(&rng.text(PIECES, 14));
             check(&rng.mutated(output, PIECES));
+        }
+    }
+
+    /// What a sweep said it could not read, as a user's sweep notes it
+    /// and as the root checks leave it unchecked.
+    fn unread(root: &Path, index: &PackageIndex) -> (Vec<String>, Vec<String>) {
+        let said = |sentences: Vec<String>| {
+            let mut said: Vec<String> = sentences
+                .into_iter()
+                .filter(|sentence| sentence.contains("could not be"))
+                .collect();
+            said.sort();
+            said
+        };
+        let as_user = look(root, index, Origin::System);
+        let as_root = look(root, index, Origin::Root);
+        // Never both ways at once.
+        assert_eq!(said(as_user.unchecked), [""; 0]);
+        assert_eq!(said(as_root.notes), [""; 0]);
+        (said(as_user.notes), said(as_root.unchecked))
+    }
+
+    #[test]
+    fn a_kernel_source_that_is_there_and_cannot_be_read_is_said() {
+        let pkgbase = "usr/lib/modules/6.1-test/pkgbase";
+        let (dir, index) = system("live-unread", &[(pkgbase, "linux\n")]);
+        let root = dir.path();
+        write(root, "proc/sys/kernel/osrelease", "6.1-test\n");
+        write(root, "usr/lib/modules/6.1-test/modules.dep", "");
+        process(root, "7", "/usr/bin/x", &[], "");
+        // What is not there is a kernel without it: nothing to say.
+        assert_eq!(unread(root, &index), (vec![], vec![]));
+        // A directory where a file belongs and a file where a directory
+        // does are there, and are not read by root either.
+        for file in ["proc/modules", "proc/net/tcp", "proc/net/packet"] {
+            fs::create_dir_all(root.join(file)).unwrap();
+        }
+        write(root, "sys/module", "no directory");
+        let (notes, unchecked) = unread(root, &index);
+        assert_eq!(notes, unchecked);
+        assert_eq!(unchecked.len(), 4, "{unchecked:?}");
+        for (said, (start, end)) in unchecked.iter().zip([
+            (
+                "/proc/modules: could not be read (",
+                "); loaded kernel modules were not checked",
+            ),
+            (
+                "/proc/net/packet: could not be read (",
+                "); raw packet sockets were not checked",
+            ),
+            (
+                "/proc/net/tcp: could not be read (",
+                "); the sockets it lists were not checked",
+            ),
+            (
+                "/sys/module: could not be read (",
+                "); a module the kernel's list does not show was not looked for",
+            ),
+        ]) {
+            assert!(said.starts_with(start) && said.ends_with(end), "{said}");
+        }
+    }
+
+    #[test]
+    fn a_kernel_release_or_a_list_of_processes_that_cannot_be_read_is_said() {
+        let (dir, index) = system("live-unread-release", &[]);
+        let root = dir.path();
+        // A release that names no directory.
+        write(root, "proc/sys/kernel/osrelease", "../x\n");
+        let nameless = "/proc/sys/kernel/osrelease: names no kernel release; loaded kernel modules were not checked";
+        assert_eq!(
+            look(root, &index, Origin::System).notes,
+            [nameless.to_string()]
+        );
+        assert_eq!(
+            look(root, &index, Origin::Root).unchecked,
+            [nameless.to_string()]
+        );
+        // One that cannot be read.
+        fs::remove_file(root.join("proc/sys/kernel/osrelease")).unwrap();
+        fs::create_dir_all(root.join("proc/sys/kernel/osrelease")).unwrap();
+        let (notes, unchecked) = unread(root, &index);
+        assert_eq!(notes, unchecked);
+        assert_eq!(unchecked.len(), 1, "{unchecked:?}");
+        assert!(
+            unchecked[0].starts_with("/proc/sys/kernel/osrelease: could not be read (")
+                && unchecked[0].ends_with("); loaded kernel modules were not checked"),
+            "{unchecked:?}"
+        );
+        // The tables of another network namespace, read through a process
+        // in it; not those of a process that is gone by then.
+        fs::remove_dir_all(root.join("proc/sys")).unwrap();
+        process(root, "7", "/usr/bin/x", &[], "");
+        fs::create_dir_all(root.join("proc/self/ns")).unwrap();
+        symlink("net:[1]", root.join("proc/self/ns/net")).unwrap();
+        fs::create_dir_all(root.join("proc/7/ns")).unwrap();
+        symlink("net:[2]", root.join("proc/7/ns/net")).unwrap();
+        assert_eq!(unread(root, &index), (vec![], vec![]));
+        fs::create_dir_all(root.join("proc/7/net/udp")).unwrap();
+        let elsewhere = "the sockets of 1 other network namespace(s) could not be read; connections there were not checked";
+        assert_eq!(
+            unread(root, &index),
+            (vec![elsewhere.to_string()], vec![elsewhere.to_string()])
+        );
+        // No list of processes at all, where there is a `/proc`.
+        let dir = TempDir::new("live-unread-proc");
+        let root = dir.path();
+        assert!(super::processes(&root.join("proc")).unlistable.is_none());
+        write(root, "proc", "no directory");
+        assert!(super::processes(&root.join("proc")).unlistable.is_some());
+        let (notes, unchecked) = unread(root, &index);
+        assert_eq!(notes, unchecked);
+        assert!(
+            unchecked.iter().any(|said| {
+                said.starts_with("/proc: could not be listed (")
+                    && said.ends_with("); running processes were not checked")
+            }),
+            "{unchecked:?}"
+        );
+    }
+
+    #[test]
+    fn directories_the_search_for_setuid_programs_cannot_list_are_said_once() {
+        use super::Closed;
+        let dir = TempDir::new("live-closed");
+        let root = dir.path();
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let scope = |origin| Scope {
+            root,
+            home: None,
+            index: &index,
+            origin,
+        };
+        // One sentence however many there are: a note that leaves them to
+        // the root checks for a user, not checked for root.
+        let say = |origin, directories: &[&str]| {
+            let mut closed = Closed::default();
+            for directory in directories {
+                closed.add(directory);
+            }
+            let mut found = super::Found::default();
+            closed.say(&scope(origin), &mut found);
+            (found.notes, found.unchecked)
+        };
+        assert_eq!(say(Origin::Root, &[]), (vec![], vec![]));
+        assert_eq!(say(Origin::System, &[]), (vec![], vec![]));
+        assert_eq!(
+            say(Origin::Root, &["var/lib/x", "root", "var/a"]),
+            (
+                vec![],
+                vec![
+                    "setuid programs were not looked for in 3 place(s) that could not be listed (/root among them)"
+                        .to_string()
+                ]
+            )
+        );
+        assert_eq!(
+            say(Origin::System, &["var/lib/x", "root"]),
+            (
+                vec![
+                    "setuid programs were not looked for in 2 place(s) that could not be listed; the root checks cover them"
+                        .to_string()
+                ],
+                vec![]
+            )
+        );
+        // The walk itself: what it can list, and what is no directory,
+        // is nothing to say.
+        write(root, "usr/local/bin/x", "x");
+        write(root, "etc", "no directory");
+        fs::create_dir_all(root.join("var/closed/below")).unwrap();
+        let walk = |origin| {
+            let mut found = super::Found::default();
+            super::privileged_files(&scope(origin), &mut found);
+            (found.notes, found.unchecked)
+        };
+        assert_eq!(walk(Origin::System), (vec![], vec![]));
+        assert_eq!(walk(Origin::Root), (vec![], vec![]));
+        // A directory closed to the reader. Nothing is closed to root, who
+        // walks into it like any other.
+        let closed = root.join("var/closed");
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o000)).unwrap();
+        let is_closed = fs::read_dir(&closed).is_err();
+        let (as_user, as_root) = (walk(Origin::System), walk(Origin::Root));
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o755)).unwrap();
+        if is_closed {
+            assert_eq!(as_user, say(Origin::System, &["var/closed"]));
+            assert_eq!(as_root, say(Origin::Root, &["var/closed"]));
+        } else {
+            assert_eq!((as_user, as_root), ((vec![], vec![]), (vec![], vec![])));
         }
     }
 

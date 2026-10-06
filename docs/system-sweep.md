@@ -437,6 +437,14 @@ look-alike, a tracer or a listener of another account is the root checks' to
 report, and a note says how many listening sockets and processes were left to
 them.
 
+What these checks read comes from the kernel (`/proc`, `/sys`). A source that
+is not there (a kernel built without it) has nothing in it. One that is there
+and cannot be read is said, one sentence a source: the list of processes, the
+kernel's release, `/proc/modules`, `/sys/module`, the socket tables
+(`/proc/net/tcp` and the like, and those of another network namespace) and
+`/proc/net/packet`. For the root checks that is something not checked, and the
+sweep is **incomplete**; in your own sweep it is a note.
+
 ### Programs with no file, or from a temporary directory
 
 A running program with no file on disk (deleted, or only in memory), or
@@ -604,7 +612,8 @@ processes is listed. The numbers the control groups name are tried, and every
 number a process may have, up to the kernel's limit (numbers start over when
 it is reached, so the last one handed out says little); were there ever more
 than can be tried, the newest are and the sweep says so, as it does of a share
-of the numbers its search did not get through.
+of the numbers its search did not get through and of control groups past the
+20,000 it reads.
 
 So is a program named like a kernel thread (`[kworker/0:1]`); and, as root, a
 process root cannot read. Root also says when it cannot list the pinned eBPF
@@ -641,6 +650,12 @@ files: container, machine and Flatpak stores under `/var/lib`, `/var/cache`,
 and snapshot directories (`.snapshots`). The search for files with
 capabilities (`getcap -r`) leaves nothing out. Other mounted filesystems
 (`/mnt`, `/media`, `/run/media`) are not looked through at all.
+
+Directories the search for setuid and setgid files cannot list are counted. In
+your own sweep, which cannot list `/root` and much of `/var`, one note says
+how many and leaves them to the root checks. For the root checks they are not
+checked: one sentence says how many and names one, and the sweep is
+**incomplete**.
 
 ## How the machine was started
 
