@@ -225,9 +225,9 @@ shells, udev and pacman read such names all the same: the sweep says so and is
 **incomplete** (exit 2). It is incomplete too when a location holds more than
 20,000 files or goes more than six directories deep, when a pattern of the
 catalogue matches more than 500 files, when there are more than 2,000,000
-files to look through for setuid programs, when `getcap` fails or times out,
-when a package's record cannot be read, and when the root checks found more
-than 5,000 items.
+files to look through for setuid programs, when `getcap` is missing, fails
+(any exit but 0, or a signal) or times out, when a package's record cannot be
+read, and when the root checks found more than 5,000 items.
 
 ### Programs ahead of the system's own
 
@@ -255,7 +255,9 @@ that is ahead of `/usr/bin` in any one of these is watched.
 
 **What is listed.** In each directory on the list that someone other than root
 can write, the programs named like a command in `/usr/bin` or in Omarchy's
-`bin` are listed, and any named like the commands below.
+`bin` are listed, and any named like the commands below. A directory on the
+list that is there and cannot be listed (it is closed to the sweep, or, for
+the root checks, a link) is said, and the sweep is **incomplete**.
 
 **What is a finding.** One named like a command that asks for a password,
 fetches or installs (`sudo`, `su`, `doas`, `pkexec`, `run0`, `ssh`, `scp`,
@@ -311,7 +313,11 @@ reviewed too, except where it is kept from the AI, which is said below.
   compiler from outside the system's directories), not `EDITOR`, `PAGER` or an
   app's own; and a Python interpreter in a virtual environment a tool keeps
   under `~/.cache` (Poetry, uv, pre-commit) or `~/.local/share/virtualenvs` is
-  a project's ordinary one.
+  a project's ordinary one. The file is read by key, as JSON with comments,
+  wherever on a line a key stands and however many lines its value takes. One
+  that cannot be read that way to its end (an editor loads what it can of
+  such a file) is itself a finding, at the line where it stops making sense:
+  none of its settings were checked.
 - **`/etc/hosts` and `/etc/crypttab`.** In `/etc/hosts` (checked locally,
   never sent to the AI), a line for a host that updates, packages or the AI
   review come from (archlinux.org, omarchy.org, github.com, anthropic.com, the
@@ -340,7 +346,10 @@ What is a finding there:
   read as another, or a host data is dropped off at.
 
 One that names a path in a temporary or cache directory, or an `http://`
-address, says so, and each finding names its line.
+address, says so, and each finding names its line. Cargo's and bun's files are
+read as TOML, by key however it is written (`build.rustc-wrapper = …`, `build
+= { rustc-wrapper = … }`, a value over several lines); one that is not TOML is
+read line by line, and a finding says so.
 
 What developers set every day is not a finding: a compiler or linker by its
 name or from the system's directories (`linker = "clang"`, the same in
@@ -434,6 +443,14 @@ them. Your own sweep cannot name another account's program: a kernel-thread
 look-alike, a tracer or a listener of another account is the root checks' to
 report, and a note says how many listening sockets and processes were left to
 them.
+
+What these checks read comes from the kernel (`/proc`, `/sys`). A source that
+is not there (a kernel built without it) has nothing in it. One that is there
+and cannot be read is said, one sentence a source: the list of processes, the
+kernel's release, `/proc/modules`, `/sys/module`, the socket tables
+(`/proc/net/tcp` and the like, and those of another network namespace) and
+`/proc/net/packet`. For the root checks that is something not checked, and the
+sweep is **incomplete**; in your own sweep it is a note.
 
 ### Programs with no file, or from a temporary directory
 
@@ -602,7 +619,8 @@ processes is listed. The numbers the control groups name are tried, and every
 number a process may have, up to the kernel's limit (numbers start over when
 it is reached, so the last one handed out says little); were there ever more
 than can be tried, the newest are and the sweep says so, as it does of a share
-of the numbers its search did not get through.
+of the numbers its search did not get through and of control groups past the
+20,000 it reads.
 
 So is a program named like a kernel thread (`[kworker/0:1]`); and, as root, a
 process root cannot read. Root also says when it cannot list the pinned eBPF
@@ -639,6 +657,15 @@ files: container, machine and Flatpak stores under `/var/lib`, `/var/cache`,
 and snapshot directories (`.snapshots`). The search for files with
 capabilities (`getcap -r`) leaves nothing out. Other mounted filesystems
 (`/mnt`, `/media`, `/run/media`) are not looked through at all.
+
+Directories the search for setuid and setgid files cannot list are counted. In
+your own sweep, which cannot list `/root` and much of `/var`, one note says
+how many and leaves them to the root checks. For the root checks they are not
+checked: one sentence says how many and names one, and the sweep is
+**incomplete**. A place on a filesystem mounted `nosuid` is told apart: the
+bits have no effect there, and a user's own FUSE mount (sshfs, rclone) is
+closed to root as well. Such places get a note of their own, which also says
+that what the mount point covers cannot be seen, and the sweep stays whole.
 
 ## How the machine was started
 

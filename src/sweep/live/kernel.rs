@@ -137,7 +137,13 @@ pub(super) fn check(scope: &Scope<'_>, running: &Running, found: &mut Found) {
 /// kernel remembers a module that its list of modules does not show.
 fn hidden_module(scope: &Scope<'_>, found: &mut Found) {
     let taint = taint(scope);
-    let Ok(modules) = fs::read_dir(scope.root.join("sys/module")) else {
+    let read = fs::read_dir(scope.root.join("sys/module"));
+    let Some(modules) = found.read(
+        scope,
+        "/sys/module",
+        "a module the kernel's list does not show was not looked for",
+        read,
+    ) else {
         return;
     };
     let carried: String = modules
@@ -262,14 +268,25 @@ fn listing(scope: &Scope<'_>) -> HashSet<u32> {
 /// The processes the control groups list as their members (every
 /// `cgroup.procs` under `/sys/fs/cgroup`): the kernel's other account of
 /// what runs, which whatever filters the list of processes rarely thinks
-/// of. One outside the sweep's own process namespace is listed as 0.
-pub(super) fn members_of_control_groups(scope: &Scope<'_>) -> Vec<u32> {
+/// of. One outside the sweep's own process namespace is listed as 0. At
+/// most `most` groups are read, and the sweep says when there are more.
+pub(super) fn members_of_control_groups(
+    scope: &Scope<'_>,
+    most: usize,
+    found: &mut Found,
+) -> Vec<u32> {
     let mut members = Vec::new();
     let mut pending = vec![scope.root.join("sys/fs/cgroup")];
     let mut looked_at = 0;
     while let Some(directory) = pending.pop() {
         looked_at += 1;
-        if looked_at > MAX_CONTROL_GROUPS {
+        if looked_at > most {
+            found.not_checked(
+                scope,
+                format!(
+                    "more than {most} control groups: the processes the rest name were not tried in the search for hidden processes"
+                ),
+            );
             break;
         }
         members.extend(
@@ -398,11 +415,8 @@ pub(super) fn hidden_processes(scope: &Scope<'_>, running: &Running, most: u32, 
             found.notes.push(sentence);
         }
     }
-    let mut suspects = unlisted(
-        &listed,
-        members_of_control_groups(scope).into_iter(),
-        &answers,
-    );
+    let members = members_of_control_groups(scope, MAX_CONTROL_GROUPS, found);
+    let mut suspects = unlisted(&listed, members.into_iter(), &answers);
     let (among, not_searched) = unlisted_among(&listed, first..=top, &answers);
     suspects.extend(among);
     say_not_searched(scope, &not_searched, found);
