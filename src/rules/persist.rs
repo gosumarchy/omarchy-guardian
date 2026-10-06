@@ -7,8 +7,8 @@
 //! A directive that runs `/usr/bin/x`, `~/.local/bin/x` or a script beside
 //! its own configuration is how every desktop is set up, and stays quiet.
 
-use super::shell::{self, Command};
-use super::{is_packaged_path, shell_words, unquoted};
+use super::is_packaged_path;
+use super::shell::{self, Command, program_name, unquoted_words};
 
 /// Dot-files in the home that sessions have always run by name.
 const SESSION_FILES: &[&str] = &[
@@ -99,10 +99,7 @@ fn runs_from_drop(command: &str, depth: usize) -> bool {
     shell::split_top(command, &["&&", "||", ";", "|"])
         .iter()
         .any(|statement| {
-            let words: Vec<String> = shell_words(statement)
-                .iter()
-                .map(|word| unquoted(word))
-                .collect();
+            let words = unquoted_words(statement);
             let mut words = words.iter().map(String::as_str).peekable();
             // Hyprland's `[workspace 2 silent] cmd`.
             if words.peek().is_some_and(|word| word.starts_with('[')) {
@@ -122,7 +119,7 @@ fn runs_from_drop(command: &str, depth: usize) -> bool {
             if is_drop_location(program) {
                 return true;
             }
-            if !INTERPRETERS.contains(&super::program_name(program)) {
+            if !INTERPRETERS.contains(&program_name(program)) {
                 return false;
             }
             let mut inline = false;
@@ -385,10 +382,7 @@ fn is_startup_file(path: &str) -> bool {
 /// `install`, `cp`, `mv`, `ln` and `sed -i` are given to write.
 fn written_files(part: &str) -> Vec<String> {
     let mut found = Vec::new();
-    let words: Vec<String> = shell_words(part)
-        .iter()
-        .map(|word| unquoted(word))
-        .collect();
+    let words = unquoted_words(part);
     let mut rest = words.iter();
     while let Some(word) = rest.next() {
         if matches!(word.as_str(), ">" | ">>") {

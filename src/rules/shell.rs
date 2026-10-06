@@ -1,11 +1,74 @@
-//! Reading a shell command line a little closer than word by word: its
-//! statements and pipelines outside quotes, the command substitutions in
-//! it, and the program a part of it runs.
+//! Reading a shell command line: its words, and a little closer than word
+//! by word, its statements and pipelines outside quotes, the command
+//! substitutions in it, and the program a part of it runs. Every rule
+//! reads these here, so that they agree.
 //!
 //! None of this is a shell parser. It reads the shapes the rules name and
 //! gives up (finds nothing) on anything else.
 
-use super::{PIPE_SHELLS, program_name, shell_words, unquoted};
+/// Shells that read commands from standard input.
+pub(super) const PIPE_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "ash", "fish"];
+
+/// Splits a command line into words at whitespace outside quotes. Quote
+/// characters are kept in the words.
+pub(super) fn shell_words(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote: Option<char> = None;
+    for character in line.chars() {
+        if quote.is_none() && character.is_whitespace() {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            continue;
+        }
+        match quote {
+            Some(open) if character == open => quote = None,
+            None if character == '"' || character == '\'' => quote = Some(character),
+            Some(_) | None => {}
+        }
+        word.push(character);
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+pub(super) fn unquoted(word: &str) -> String {
+    word.chars()
+        .filter(|character| !matches!(character, '"' | '\''))
+        .collect()
+}
+
+/// The words of a command line (see `shell_words`), without their quotes.
+pub(super) fn unquoted_words(line: &str) -> Vec<String> {
+    shell_words(line)
+        .iter()
+        .map(|word| unquoted(word))
+        .collect()
+}
+
+/// A program's name without its directory.
+pub(super) fn program_name(word: &str) -> &str {
+    word.rsplit('/').next().unwrap_or_default()
+}
+
+/// A program's name without the version written after it: `python3.12` is
+/// `python`.
+pub(super) fn unversioned(program: &str) -> &str {
+    program.trim_end_matches(|character: char| character.is_ascii_digit() || character == '.')
+}
+
+/// Whether `word` is a cluster of short options holding `flag`: `-c`,
+/// `-lc`, but not `--c`.
+pub(super) fn short_flag(word: &str, flag: char) -> bool {
+    word.len() > 1
+        && word.starts_with('-')
+        && !word.starts_with("--")
+        && word[1..].chars().all(|c| c.is_ascii_alphabetic())
+        && word[1..].contains(flag)
+}
 
 /// The most substitutions of one line looked at.
 const MAX_SUBSTITUTIONS: usize = 64;
@@ -186,12 +249,7 @@ impl Command {
         self.arguments
             .iter()
             .take_while(|word| word.starts_with('-'))
-            .any(|word| {
-                !word.starts_with("--")
-                    && word.len() > 1
-                    && word[1..].chars().all(|c| c.is_ascii_alphabetic())
-                    && word[1..].contains(flag)
-            })
+            .any(|word| short_flag(word, flag))
     }
 
     /// The arguments that are not options.
@@ -213,16 +271,13 @@ const WRAPPERS: &[&str] = &[
     "ionice", "chrt", "time", "then", "do", "else", "if", "while", "until", "!", "{", "(",
 ];
 
-/// The command a statement, or one part of a pipeline, runs: past wrappers
-/// (`sudo`, `env X=1`, `timeout 5`) and what opens a group.
-pub fn command(part: &str) -> Option<Command> {
-    let words: Vec<String> = shell_words(part)
-        .iter()
-        .map(|word| unquoted(word))
-        .collect();
-    let mut words = words.into_iter();
+/// The program among `words`, which are left at what it is given: past
+/// wrappers (`sudo -u x`, `env X=1`, `timeout 5`), assignments and what
+/// opens a group or a block. Every rule that asks what a command runs
+/// reads it here, so they agree on what a wrapper is.
+pub(super) fn program_word<'a>(words: &mut impl Iterator<Item = &'a str>) -> Option<&'a str> {
     let mut elevated = false;
-    let path = loop {
+    loop {
         let word = words.next()?;
         let bare = word.trim_start_matches(['(', '{', '`']);
         let bare = bare.strip_prefix("$(").unwrap_or(bare);
@@ -247,8 +302,16 @@ pub fn command(part: &str) -> Option<Command> {
         if bare.contains('=') && !bare.starts_with(['/', '.', '$', '=']) {
             continue;
         }
-        break bare.to_string();
-    };
+        return Some(bare);
+    }
+}
+
+/// The command a statement, or one part of a pipeline, runs: past wrappers
+/// (`sudo`, `env X=1`, `timeout 5`) and what opens a group.
+pub fn command(part: &str) -> Option<Command> {
+    let words = unquoted_words(part);
+    let mut words = words.iter().map(String::as_str);
+    let path = program_word(&mut words)?.to_string();
     let arguments = words
         .map(|word| word.trim_end_matches(';').to_string())
         .filter(|word| !word.is_empty())
@@ -280,10 +343,7 @@ pub fn pipes_from(part: &str, accepts: &dyn Fn(&Command) -> bool) -> bool {
 /// The file one command writes its output to: by a redirection, as `tee`,
 /// or through `-out`.
 pub fn written_file(part: &str) -> Option<String> {
-    let words: Vec<String> = shell_words(part)
-        .iter()
-        .map(|word| unquoted(word))
-        .collect();
+    let words = unquoted_words(part);
     let tee = words
         .first()
         .is_some_and(|word| program_name(word) == "tee");
@@ -448,6 +508,41 @@ mod tests {
         }
         assert!(command("X=1").is_none());
         assert!(command("sudo").is_none());
+    }
+
+    #[test]
+    fn words_names_and_option_clusters_are_read_one_way() {
+        use super::{program_name, program_word, short_flag, unquoted_words, unversioned};
+        assert_eq!(
+            unquoted_words("a \"b c\" 'd'e  \"f"),
+            ["a", "b c", "de", "f"]
+        );
+        assert_eq!(program_name("/usr/bin/python3.12"), "python3.12");
+        for (program, plain) in [
+            ("python3.12", "python"),
+            ("pip3", "pip"),
+            ("sh", "sh"),
+            ("7", ""),
+        ] {
+            assert_eq!(unversioned(program), plain, "{program}");
+        }
+        for (word, held) in [
+            ("-k", true),
+            ("-fsSLk", true),
+            ("-s", false),
+            ("--k", false),
+            ("--insecure-k", false),
+            ("-k=1", false),
+            ("-", false),
+            ("k", false),
+        ] {
+            assert_eq!(short_flag(word, 'k'), held, "{word}");
+        }
+        // The words after the program are left for the caller.
+        let mut words = "sudo -u build timeout 5 X=1 (sh -c x".split(' ');
+        assert_eq!(program_word(&mut words), Some("sh"));
+        assert_eq!(words.collect::<Vec<_>>(), ["-c", "x"]);
+        assert_eq!(program_word(&mut "nohup env".split(' ')), None);
     }
 
     #[test]

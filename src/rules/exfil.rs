@@ -226,7 +226,7 @@ fn is_identity(text: &str) -> bool {
         .trim_start_matches(['(', '{', ' '])
         .split_whitespace()
         .next()
-        .map(|word| super::program_name(word.trim_matches(['"', '\''])))
+        .map(|word| shell::program_name(word.trim_matches(['"', '\''])))
         .unwrap_or_default();
     IDENTITY_COMMANDS.contains(&first) || text.contains("/proc/self/environ")
 }
