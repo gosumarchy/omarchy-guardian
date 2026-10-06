@@ -20,11 +20,11 @@ use shell::shell;
 
 /// One line as the local rules see it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Line {
+pub(crate) struct Line {
     /// The line with comments blanked.
-    pub code: String,
+    pub(crate) code: String,
     /// `code` with printed-only text also blanked.
-    pub quiet: String,
+    pub(crate) quiet: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,7 +43,7 @@ enum Language {
 }
 
 /// The lines of `text`, aligned with `text.lines()`.
-pub fn lines(rel: &str, text: &str) -> Vec<Line> {
+pub(crate) fn lines(rel: &str, text: &str) -> Vec<Line> {
     let per_line = |mask: &mut dyn FnMut(&str) -> String| {
         text.lines()
             .map(|line| {

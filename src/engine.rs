@@ -2,12 +2,12 @@
 //! queued, answers them from the verdict cache where it can, and keeps the
 //! approved baselines of user-level sources (described in docs/review.md).
 
-pub mod baseline;
-pub mod cache;
-pub mod diff;
-pub mod plan;
-pub mod request;
-pub mod store;
+pub(crate) mod baseline;
+mod cache;
+mod diff;
+pub(crate) mod plan;
+pub(crate) mod request;
+pub(crate) mod store;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -33,22 +33,22 @@ use crate::tools::{OpenCode, Reviewer};
 const FINDING_OVERHEAD: usize = 48;
 
 /// What the review of one user-level target may remember.
-pub struct Memory {
-    pub store: Store,
-    pub class: SourceClass,
-    pub units: Vec<Unit>,
-    pub use_cache: bool,
-    pub use_diff: bool,
-    pub cache_max_age_secs: u64,
-    pub max_store_bytes: u64,
-    pub now: u64,
+pub(crate) struct Memory {
+    store: Store,
+    class: SourceClass,
+    units: Vec<Unit>,
+    use_cache: bool,
+    use_diff: bool,
+    cache_max_age_secs: u64,
+    max_store_bytes: u64,
+    now: u64,
 }
 
 impl Memory {
     /// `Ok(None)` when this review uses no memory: no state root, a pacman
     /// class, `ai = off`, or both cache and diff turned off. `Err` when it
     /// should, but the store cannot be used.
-    pub fn open(
+    pub(crate) fn open(
         settings: &Settings,
         class: SourceClass,
         units: Vec<Unit>,
@@ -85,39 +85,39 @@ impl Memory {
 }
 
 /// Files that share one set of agent settings, reviewed as one plan.
-pub struct Group<'a> {
-    pub settings: &'a AgentSettings,
-    pub class: SourceClass,
-    pub files: &'a [SourceFile],
-    pub findings: &'a [LocalFinding],
+pub(crate) struct Group<'a> {
+    pub(crate) settings: &'a AgentSettings,
+    pub(crate) class: SourceClass,
+    pub(crate) files: &'a [SourceFile],
+    pub(crate) findings: &'a [LocalFinding],
     /// The review's units, for ranking a unit-relative top-level path (spec
     /// §4); independent of whether memory is enabled for this review.
-    pub units: &'a [Unit],
+    pub(crate) units: &'a [Unit],
     /// Trusted facts for every request (see `Request::context`).
-    pub context: &'a [String],
+    pub(crate) context: &'a [String],
     /// Files hashed but not read, named in every request's manifest.
-    pub hash_only: &'a [HashOnly],
+    pub(crate) hash_only: &'a [HashOnly],
     /// What the review cannot read (see `Unread`): an upgrade is reviewed
     /// as one only while these are what the approved version had.
-    pub unread: &'a Unread,
+    pub(crate) unread: &'a Unread,
 }
 
 /// What reviewing one group produced.
 #[derive(Debug, Default)]
-pub struct GroupReview {
+pub(crate) struct GroupReview {
     /// One run per chunk, in order.
-    pub runs: Vec<AgentRun>,
+    pub(crate) runs: Vec<AgentRun>,
     /// An invalid reply: the review is blocked and nothing from it is cached.
-    pub invalid: Option<Error>,
+    pub(crate) invalid: Option<Error>,
     /// The plan needed more than `max_chunks` requests; nothing was sent.
-    pub too_large: bool,
+    pub(crate) too_large: bool,
     /// An entry point larger than one request; nothing was sent.
-    pub entry_point_too_large: Option<String>,
+    pub(crate) entry_point_too_large: Option<String>,
     /// Lines for the report: the upgrade summary and memory problems.
-    pub notes: Vec<String>,
+    pub(crate) notes: Vec<String>,
 }
 
-pub fn review_group(
+pub(crate) fn review_group(
     group: &Group<'_>,
     opencode: &OpenCode,
     memory: Option<&Memory>,
@@ -819,7 +819,7 @@ fn review_parallel(
 /// after every chunk was clear, with no gaps and a clear decision, and all
 /// files shared one set of settings), then prune the store. Returns notes
 /// for the report.
-pub fn remember(
+pub(crate) fn remember(
     memory: &Memory,
     approved: Option<(&[SourceFile], &AgentSettings)>,
     unread: &Unread,

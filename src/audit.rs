@@ -18,7 +18,7 @@
 //! names (package names, paths, rule ids), each as one bounded, printable
 //! line; no file content, no excerpts, no addresses, no summaries.
 
-pub mod log;
+pub(crate) mod log;
 
 use std::fmt::Write as _;
 #[cfg(not(test))]
@@ -32,7 +32,7 @@ use crate::text::shown;
 use crate::tools::{self, Limits};
 
 /// The journal identifier of every entry: `journalctl -t omarchy-guardian`.
-pub const IDENTIFIER: &str = "omarchy-guardian";
+const IDENTIFIER: &str = "omarchy-guardian";
 #[cfg(not(test))]
 const LOGGER: &str = "/usr/bin/logger";
 /// The most characters one field holds; the rest is cut, visibly.
@@ -41,37 +41,37 @@ const MAX_VALUE_CHARS: usize = 32 * 1024;
 /// left out, so the variable cannot be used to hide an install.
 const HARNESS: &str = "OMARCHY_GUARDIAN_NO_NOTIFY";
 
-pub const EVENT: &str = "GUARDIAN_EVENT";
-pub const GATE: &str = "GUARDIAN_GATE";
-pub const CLASS: &str = "GUARDIAN_CLASS";
-pub const SUBJECT: &str = "GUARDIAN_SUBJECT";
-pub const DIGEST: &str = "GUARDIAN_DIGEST";
-pub const DECISION: &str = "GUARDIAN_DECISION";
-pub const EXIT: &str = "GUARDIAN_EXIT";
-pub const FINDINGS: &str = "GUARDIAN_FINDINGS";
-pub const AI: &str = "GUARDIAN_AI";
-pub const PROFILE: &str = "GUARDIAN_PROFILE";
-pub const VERSION: &str = "GUARDIAN_VERSION";
+const EVENT: &str = "GUARDIAN_EVENT";
+const GATE: &str = "GUARDIAN_GATE";
+pub(crate) const CLASS: &str = "GUARDIAN_CLASS";
+pub(crate) const SUBJECT: &str = "GUARDIAN_SUBJECT";
+pub(crate) const DIGEST: &str = "GUARDIAN_DIGEST";
+pub(crate) const DECISION: &str = "GUARDIAN_DECISION";
+const EXIT: &str = "GUARDIAN_EXIT";
+const FINDINGS: &str = "GUARDIAN_FINDINGS";
+const AI: &str = "GUARDIAN_AI";
+const PROFILE: &str = "GUARDIAN_PROFILE";
+const VERSION: &str = "GUARDIAN_VERSION";
 /// The permit that let a blocked review through.
-pub const PERMIT: &str = "GUARDIAN_PERMIT";
+pub(crate) const PERMIT: &str = "GUARDIAN_PERMIT";
 /// The decision a permit overruled.
-pub const OVERRULED: &str = "GUARDIAN_OVERRULED";
+const OVERRULED: &str = "GUARDIAN_OVERRULED";
 /// The permit a block offered (`omarchy-guardian permit <ID>`).
-pub const OFFERED: &str = "GUARDIAN_OFFERED";
+const OFFERED: &str = "GUARDIAN_OFFERED";
 /// The user a root half acted for.
-pub const FOR_UID: &str = "GUARDIAN_FOR_UID";
+pub(crate) const FOR_UID: &str = "GUARDIAN_FOR_UID";
 /// What a gate or setting was before a change.
-pub const FROM: &str = "GUARDIAN_FROM";
+const FROM: &str = "GUARDIAN_FROM";
 /// New or changed items a scheduled sweep found.
-pub const CHANGES: &str = "GUARDIAN_CHANGES";
+const CHANGES: &str = "GUARDIAN_CHANGES";
 /// When a permit ends, in seconds since the epoch.
-pub const EXPIRES: &str = "GUARDIAN_EXPIRES";
+pub(crate) const EXPIRES: &str = "GUARDIAN_EXPIRES";
 /// Written under a test harness.
-pub const TEST: &str = "GUARDIAN_TEST";
+const TEST: &str = "GUARDIAN_TEST";
 
 /// What kind of thing an entry records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Event {
+pub(crate) enum Event {
     /// A gate's decision on what it reviewed.
     Review,
     /// A permit granted, used or revoked.
@@ -89,7 +89,7 @@ pub enum Event {
 }
 
 impl Event {
-    pub const ALL: [Self; 7] = [
+    const ALL: [Self; 7] = [
         Self::Review,
         Self::Permit,
         Self::Gate,
@@ -99,7 +99,7 @@ impl Event {
         Self::Sweep,
     ];
 
-    pub const fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Self::Review => "review",
             Self::Permit => "permit",
@@ -114,7 +114,7 @@ impl Event {
 
 /// The gate an entry is about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Gate {
+pub(crate) enum Gate {
     Pacman,
     Aur,
     Theme,
@@ -137,7 +137,7 @@ impl Gate {
         Self::Sweep,
     ];
 
-    pub const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Pacman => "pacman",
             Self::Aur => "aur",
@@ -150,13 +150,13 @@ impl Gate {
         }
     }
 
-    pub fn parse(text: &str) -> Option<Self> {
+    pub(crate) fn parse(text: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|gate| gate.name() == text)
     }
 
     /// The gate a `guard` of `class` is: the theme and plugin commands go
     /// through `guard`, and are told by the class they pass.
-    pub const fn of_guard(class: SourceClass) -> Self {
+    pub(crate) const fn of_guard(class: SourceClass) -> Self {
         match class {
             SourceClass::Theme => Self::Theme,
             SourceClass::Plugin => Self::Plugin,
@@ -167,7 +167,7 @@ impl Gate {
 
 /// One journal entry, built field by field.
 #[derive(Clone, Debug)]
-pub struct Entry {
+pub(crate) struct Entry {
     event: Event,
     fields: Vec<(&'static str, String)>,
 }
@@ -207,7 +207,7 @@ fn single_line(value: &str) -> String {
 }
 
 impl Entry {
-    pub fn new(event: Event) -> Self {
+    pub(crate) fn new(event: Event) -> Self {
         Self {
             event,
             fields: Vec::new(),
@@ -216,7 +216,7 @@ impl Entry {
 
     /// Adds `field` unless `value` is empty.
     #[must_use]
-    pub fn with(mut self, field: &'static str, value: impl AsRef<str>) -> Self {
+    pub(crate) fn with(mut self, field: &'static str, value: impl AsRef<str>) -> Self {
         let value = single_line(value.as_ref());
         if !value.is_empty() {
             self.fields.retain(|(known, _)| *known != field);
@@ -226,20 +226,20 @@ impl Entry {
     }
 
     #[must_use]
-    pub fn gate(self, gate: Gate) -> Self {
+    pub(crate) fn gate(self, gate: Gate) -> Self {
         self.with(GATE, gate.name())
     }
 
     /// The decision's name and the exit code it stands for.
     #[must_use]
-    pub fn decision(self, name: &str, exit: u8) -> Self {
+    pub(crate) fn decision(self, name: &str, exit: u8) -> Self {
         self.with(DECISION, name).with(EXIT, exit.to_string())
     }
 
     /// What a review found, from its report: counts and rule ids, the AI
     /// runs in numbers, and the profile.
     #[must_use]
-    pub fn report(self, report: &Report) -> Self {
+    fn report(self, report: &Report) -> Self {
         self.with(FINDINGS, report.audit_findings())
             .with(AI, report.audit_ai())
             .with(PROFILE, &report.profile)
@@ -290,7 +290,7 @@ impl Entry {
 
     /// Writes the entry to the journal. A failure is said once and changes
     /// nothing else.
-    pub fn record(self) {
+    pub(crate) fn record(self) {
         static WARNED: AtomicBool = AtomicBool::new(false);
         if let Err(reason) = send(&self.render())
             && !WARNED.swap(true, Ordering::Relaxed)
@@ -338,28 +338,28 @@ thread_local! {
 
 /// The entries this test thread wrote since it last asked.
 #[cfg(test)]
-pub fn taken() -> Vec<String> {
+pub(crate) fn taken() -> Vec<String> {
     SENT.with(|sent| std::mem::take(&mut *sent.borrow_mut()))
 }
 
 /// What a gate decided on a review, for `review`.
-pub struct Reviewed<'a> {
-    pub gate: Gate,
+pub(crate) struct Reviewed<'a> {
+    pub(crate) gate: Gate,
     /// The class, or classes, of what was reviewed.
-    pub class: &'a str,
-    pub subject: &'a str,
+    pub(crate) class: &'a str,
+    pub(crate) subject: &'a str,
     /// The SHA-256 of what was reviewed (see docs/permits.md for each gate).
-    pub digest: &'a str,
-    pub decision: Decision,
+    pub(crate) digest: &'a str,
+    pub(crate) decision: Decision,
     /// The permit that let it through, if one did.
-    pub permit: Option<&'a str>,
+    pub(crate) permit: Option<&'a str>,
     /// The permit the block offered, if it offered one.
-    pub offered: Option<&'a str>,
-    pub exit: u8,
+    pub(crate) offered: Option<&'a str>,
+    pub(crate) exit: u8,
 }
 
 /// The entry for a gate's decision on `report`.
-pub fn review(reviewed: &Reviewed<'_>, report: &Report) -> Entry {
+pub(crate) fn review(reviewed: &Reviewed<'_>, report: &Report) -> Entry {
     let name = if reviewed.permit.is_some() {
         "PERMITTED"
     } else {
@@ -384,7 +384,7 @@ pub fn review(reviewed: &Reviewed<'_>, report: &Report) -> Entry {
 }
 
 /// A gate refused before, or without, a review it could decide on.
-pub fn refused(gate: Gate, subject: &str, exit: u8) {
+pub(crate) fn refused(gate: Gate, subject: &str, exit: u8) {
     Entry::new(Event::Review)
         .gate(gate)
         .with(SUBJECT, subject)
@@ -394,7 +394,7 @@ pub fn refused(gate: Gate, subject: &str, exit: u8) {
 
 /// A gate or integration went from one state to another (`on`, `off`).
 /// For the settings app and `protect`.
-pub fn gate_changed(name: &str, from: &str, to: &str) {
+pub(crate) fn gate_changed(name: &str, from: &str, to: &str) {
     Entry::new(Event::Gate)
         .with(SUBJECT, name)
         .with(FROM, from)
@@ -403,7 +403,7 @@ pub fn gate_changed(name: &str, from: &str, to: &str) {
 }
 
 /// The system settings changed: `what` says how, in a few words.
-pub fn settings_changed(what: &str) {
+pub(crate) fn settings_changed(what: &str) {
     Entry::new(Event::Settings)
         .with(SUBJECT, what)
         .with(DECISION, "SAVED")
@@ -411,7 +411,7 @@ pub fn settings_changed(what: &str) {
 }
 
 /// Review memory was forgotten: one identity, or everything.
-pub fn forgot(what: &str) {
+pub(crate) fn forgot(what: &str) {
     Entry::new(Event::Forget)
         .with(SUBJECT, what)
         .with(DECISION, "FORGOTTEN")
@@ -420,7 +420,7 @@ pub fn forgot(what: &str) {
 
 /// The sweep's list of allowed items was changed for user `uid`, by root:
 /// `changes` are the changes asked for, without the fingerprints.
-pub fn allow_list_changed(changes: &str, uid: Option<u32>) {
+pub(crate) fn allow_list_changed(changes: &str, uid: Option<u32>) {
     Entry::new(Event::Allow)
         .gate(Gate::Sweep)
         .with(SUBJECT, changes)
@@ -430,7 +430,7 @@ pub fn allow_list_changed(changes: &str, uid: Option<u32>) {
 }
 
 /// How a scheduled sweep ended: the decision and counts, no names.
-pub fn sweep_ended(report: &Report, decision: Decision, changes: usize) {
+pub(crate) fn sweep_ended(report: &Report, decision: Decision, changes: usize) {
     Entry::new(Event::Sweep)
         .gate(Gate::Sweep)
         .with(CLASS, SourceClass::System.name())
@@ -441,7 +441,7 @@ pub fn sweep_ended(report: &Report, decision: Decision, changes: usize) {
 }
 
 /// A scheduled sweep that could not run at all.
-pub fn sweep_failed() {
+pub(crate) fn sweep_failed() {
     Entry::new(Event::Sweep)
         .gate(Gate::Sweep)
         .decision("FAILED", 2)

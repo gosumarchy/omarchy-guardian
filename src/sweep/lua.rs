@@ -15,7 +15,7 @@ const STARTUP: &[&str] = &[
 ];
 
 /// The commands `text` starts.
-pub fn startup_commands(text: &str) -> Vec<String> {
+pub(super) fn startup_commands(text: &str) -> Vec<String> {
     let tokens = tokenize(text);
     let mut found = Vec::new();
     for (index, token) in tokens.iter().enumerate() {

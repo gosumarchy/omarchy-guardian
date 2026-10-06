@@ -72,7 +72,7 @@ const WORDS: &[&[u8]] = &[
 const SYNTAX: &[&[u8]] = &[b"$(", b"${", b"`", b"&&", b"||", b"| ", b"|sh"];
 
 /// Whether `rel` is named as an image of a format `is_whole` knows.
-pub fn is_named(rel: &str) -> bool {
+pub(crate) fn is_named(rel: &str) -> bool {
     let name = file_name(rel).to_ascii_lowercase();
     name.rsplit_once('.')
         .is_some_and(|(stem, extension)| !stem.is_empty() && EXTENSIONS.contains(&extension))
@@ -81,7 +81,7 @@ pub fn is_named(rel: &str) -> bool {
 /// Whether `bytes` are one complete PNG, JPEG, GIF or WebP image, with no
 /// more metadata than a picture has, and nothing in them that reads as a
 /// script.
-pub fn is_whole(bytes: &[u8]) -> bool {
+pub(crate) fn is_whole(bytes: &[u8]) -> bool {
     png(bytes)
         .or_else(|| jpeg(bytes))
         .or_else(|| gif(bytes))
@@ -90,7 +90,7 @@ pub fn is_whole(bytes: &[u8]) -> bool {
 }
 
 /// `is_whole` for the file at `path`, which must still hash to `expected`.
-pub fn is_whole_file(path: &Path, expected: &Digest) -> bool {
+pub(crate) fn is_whole_file(path: &Path, expected: &Digest) -> bool {
     let mut bytes = Vec::new();
     File::open(path)
         .and_then(|file| file.take(MAX_BYTES + 1).read_to_end(&mut bytes))
@@ -117,7 +117,7 @@ fn directory(path: &str) -> &str {
 /// that a reviewed line loops over, globs or hands to something that runs
 /// what it finds. A wallpaper among wallpapers stays what it was.
 #[derive(Default)]
-pub struct Surroundings {
+pub(crate) struct Surroundings {
     /// Directories that hold a file a shell or an interpreter would run.
     script_directories: HashSet<String>,
     /// The directory and the name pattern of each place files are run
@@ -128,7 +128,7 @@ pub struct Surroundings {
 impl Surroundings {
     /// Notes the file at `path`: one marked to run, or named as a script,
     /// makes its directory a place scripts are.
-    pub fn note_file(&mut self, path: &str, executable: bool) {
+    pub(crate) fn note_file(&mut self, path: &str, executable: bool) {
         let name = file_name(path);
         let script = name.rsplit_once('.').is_some_and(|(_, extension)| {
             SCRIPT_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
@@ -140,7 +140,7 @@ impl Surroundings {
 
     /// Notes the reviewed text of the file at `path`: a script by its
     /// first line, and the directories and globs its lines run.
-    pub fn note_text(&mut self, path: &str, text: &str) {
+    pub(crate) fn note_text(&mut self, path: &str, text: &str) {
         if text.starts_with("#!") {
             self.script_directories.insert(directory(path).to_string());
         }
@@ -159,7 +159,7 @@ impl Surroundings {
     }
 
     /// Whether an image at `path` is away from where files are run.
-    pub fn leaves_alone(&self, path: &str) -> bool {
+    pub(crate) fn leaves_alone(&self, path: &str) -> bool {
         let parent = directory(path);
         let name = file_name(path);
         let under = format!("/{parent}/");

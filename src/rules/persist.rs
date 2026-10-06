@@ -36,7 +36,7 @@ fn below_home(path: &str) -> Option<&str> {
 /// Whether `path` is somewhere a download or a dropped file lands and no
 /// installed program lives: a temporary or cache directory, the runtime
 /// directory, or a hidden file directly in the home.
-pub fn is_drop_location(path: &str) -> bool {
+fn is_drop_location(path: &str) -> bool {
     let path = path.trim_matches(['"', '\'']);
     if [
         "/tmp/",
@@ -558,7 +558,7 @@ fn takes_over_shell(line: &str) -> bool {
 
 /// Whether the line, lowercased and without what it only prints, sets up
 /// persistence in one of the ways this module knows.
-pub fn matches(line: &str) -> bool {
+pub(super) fn matches(line: &str) -> bool {
     if directive_runs_from_drop(line) || writes_startup_file(line) {
         return true;
     }

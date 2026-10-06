@@ -14,22 +14,22 @@ use std::fmt;
 
 /// One `key = value` line.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Entry {
+pub(crate) struct Entry {
     /// Counts table headers seen so far, so entries of different
     /// `[[array-table]]` items can be told apart. The root table is 0.
-    pub section: usize,
-    pub table: Vec<String>,
-    pub array_table: bool,
-    pub key: Vec<String>,
+    section: usize,
+    table: Vec<String>,
+    pub(crate) array_table: bool,
+    pub(crate) key: Vec<String>,
     /// The value's source text, trimmed, with comments removed.
-    pub value: String,
+    pub(crate) value: String,
     /// 1-based line of the key.
-    pub line: usize,
+    pub(crate) line: usize,
 }
 
 impl Entry {
     /// The table path followed by the key path.
-    pub fn full_path(&self) -> Vec<&str> {
+    pub(crate) fn full_path(&self) -> Vec<&str> {
         self.table
             .iter()
             .chain(&self.key)
@@ -39,7 +39,7 @@ impl Entry {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct ParseError {
+pub(crate) struct ParseError {
     line: usize,
     message: &'static str,
 }
@@ -53,12 +53,12 @@ impl fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 impl ParseError {
-    pub fn line(&self) -> usize {
+    pub(crate) fn line(&self) -> usize {
         self.line
     }
 }
 
-pub fn entries(text: &str) -> Result<Vec<Entry>, ParseError> {
+pub(crate) fn entries(text: &str) -> Result<Vec<Entry>, ParseError> {
     let mut reader = Reader {
         bytes: text.as_bytes(),
         position: 0,
@@ -104,7 +104,7 @@ pub fn entries(text: &str) -> Result<Vec<Entry>, ParseError> {
 }
 
 /// Groups the entries of every `[[name]]` item, in document order.
-pub fn array_table_items<'e>(entries: &'e [Entry], name: &str) -> Vec<Vec<&'e Entry>> {
+pub(crate) fn array_table_items<'e>(entries: &'e [Entry], name: &str) -> Vec<Vec<&'e Entry>> {
     let mut items: Vec<Vec<&Entry>> = Vec::new();
     let mut current_section = None;
 
@@ -124,14 +124,14 @@ pub fn array_table_items<'e>(entries: &'e [Entry], name: &str) -> Vec<Vec<&'e En
 }
 
 /// The decoded string value of a single-segment key in an array-table item.
-pub fn string_field(item: &[&Entry], key: &str) -> Option<String> {
+pub(crate) fn string_field(item: &[&Entry], key: &str) -> Option<String> {
     item.iter()
         .find(|entry| entry.key.len() == 1 && entry.key[0] == key)
         .and_then(|entry| string_value(&entry.value))
 }
 
 /// Decodes a single-line basic (`"..."`) or literal (`'...'`) string value.
-pub fn string_value(raw: &str) -> Option<String> {
+fn string_value(raw: &str) -> Option<String> {
     let bytes = raw.as_bytes();
     let (decoded, consumed) = match bytes.first() {
         Some(b'"') if !raw.starts_with("\"\"\"") => decode_basic(&bytes[1..])?,
@@ -142,7 +142,7 @@ pub fn string_value(raw: &str) -> Option<String> {
 }
 
 /// Whether the value is an array or inline table with no elements.
-pub fn is_empty_container(raw: &str) -> bool {
+pub(crate) fn is_empty_container(raw: &str) -> bool {
     let inner = raw
         .strip_prefix('[')
         .and_then(|rest| rest.strip_suffix(']'))
@@ -160,14 +160,14 @@ pub fn is_empty_container(raw: &str) -> bool {
 /// A typed value in Guardian's own config file. Only the forms the config
 /// uses are supported; anything else is `None` and becomes a config error.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Value {
+pub(crate) enum Value {
     String(String),
     Integer(i64),
     Bool(bool),
     StringArray(Vec<String>),
 }
 
-pub fn typed_value(raw: &str) -> Option<Value> {
+pub(crate) fn typed_value(raw: &str) -> Option<Value> {
     if let Some(text) = string_value(raw) {
         return Some(Value::String(text));
     }

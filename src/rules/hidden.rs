@@ -12,12 +12,12 @@ use super::{RuleId, is_documentation};
 
 /// One hidden character worth a finding.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Found {
+pub(crate) struct Found {
     /// The line it is on, counted from 1.
-    pub line: usize,
-    pub rule: RuleId,
+    pub(crate) line: usize,
+    pub(crate) rule: RuleId,
     /// The text around it; the report shows hidden characters as codes.
-    pub excerpt: String,
+    pub(crate) excerpt: String,
 }
 
 /// The most findings of one rule reported for one file: a file full of
@@ -172,7 +172,7 @@ fn excerpt(characters: &[char], at: usize) -> String {
 /// The hidden characters of `text` that are findings in the file `rel`.
 /// Prose and translations are only checked for tag characters, which no
 /// writing system uses.
-pub fn findings(rel: &str, text: &str) -> Vec<Found> {
+pub(crate) fn findings(rel: &str, text: &str) -> Vec<Found> {
     let mut found: Vec<Found> = Vec::new();
     if text.is_ascii() {
         return found;
@@ -335,7 +335,7 @@ fn is_lookalike_label(label: &str) -> bool {
 /// it spells, and one that spells nothing is no name anyone registered in
 /// good faith. A name written wholly in one other script is just a name,
 /// in either spelling.
-pub fn is_lookalike_host(host: &str) -> bool {
+pub(super) fn is_lookalike_host(host: &str) -> bool {
     host.split('.').any(|label| {
         let ascii_form = label
             .get(..4)

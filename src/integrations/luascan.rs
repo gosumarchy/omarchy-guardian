@@ -104,7 +104,7 @@ fn words(code: &str) -> impl Iterator<Item = &str> {
 /// Whether `line`, the exact line Guardian writes, is in `text` (a
 /// Hyprland Lua configuration) where it runs, with no later line setting
 /// PATH again. `path` is the file the line loads.
-pub fn loads(text: &str, line: &str, path: &str) -> Loads {
+pub(super) fn loads(text: &str, line: &str, path: &str) -> Loads {
     let (code, inside) = bare(text);
     let raw: Vec<&str> = text.lines().collect();
     let code: Vec<&str> = code.lines().collect();

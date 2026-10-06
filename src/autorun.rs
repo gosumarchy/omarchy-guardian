@@ -13,7 +13,7 @@ use std::path::Path;
 
 /// What a location is for, for grouping and explaining what was found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Category {
+pub(crate) enum Category {
     Autostart,
     Boot,
     BootConfig,
@@ -59,7 +59,7 @@ pub enum Category {
 }
 
 impl Category {
-    pub const ALL: [Self; 38] = [
+    const ALL: [Self; 38] = [
         Self::Autostart,
         Self::Boot,
         Self::BootConfig,
@@ -101,7 +101,7 @@ impl Category {
     ];
 
     /// A stable machine name (`pam`, `systemd-generator`).
-    pub const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Autostart => "autostart",
             Self::Boot => "boot",
@@ -144,14 +144,14 @@ impl Category {
         }
     }
 
-    pub fn from_name(name: &str) -> Option<Self> {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
             .find(|category| category.name() == name)
     }
 
     /// Found by the sweep's live checks, not in an auto-run location.
-    pub const fn is_live(self) -> bool {
+    pub(crate) const fn is_live(self) -> bool {
         matches!(
             self,
             Self::Process
@@ -164,7 +164,7 @@ impl Category {
     }
 
     /// A short name for headings.
-    pub const fn label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Autostart => "Autostart entries",
             Self::Boot => "Boot loader",
@@ -208,7 +208,7 @@ impl Category {
     }
 
     /// When what is found here runs, or what it grants.
-    pub const fn when(self) -> &'static str {
+    pub(crate) const fn when(self) -> &'static str {
         match self {
             Self::Autostart | Self::Hyprland => "runs when you log in",
             Self::Boot => "runs before the system starts",
@@ -249,7 +249,7 @@ impl Category {
 
 /// How a location matches paths.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
+pub(crate) enum Kind {
     /// Exactly this file.
     File,
     /// Every file under this directory.
@@ -268,7 +268,7 @@ pub enum Kind {
 
 /// Whether `name` (one path component) matches `pattern`, in which each
 /// `*` stands for any run of characters.
-pub fn name_matches(pattern: &str, name: &str) -> bool {
+pub(crate) fn name_matches(pattern: &str, name: &str) -> bool {
     let mut parts = pattern.split('*');
     let Some(first) = parts.next() else {
         return name.is_empty();
@@ -293,11 +293,11 @@ pub fn name_matches(pattern: &str, name: &str) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Location {
+pub(crate) struct Location {
     /// Relative to `/` (system) or to `$HOME` (user); a directory ends in `/`.
-    pub path: &'static str,
-    pub kind: Kind,
-    pub category: Category,
+    pub(crate) path: &'static str,
+    pub(crate) kind: Kind,
+    pub(crate) category: Category,
 }
 
 const fn location(path: &'static str, kind: Kind, category: Category) -> Location {
@@ -309,7 +309,7 @@ const fn location(path: &'static str, kind: Kind, category: Category) -> Locatio
 }
 
 /// System locations a package can ship into: the pacman gate reviews these.
-pub const SYSTEM: &[Location] = &[
+pub(crate) const SYSTEM: &[Location] = &[
     location("etc/sudoers", Kind::File, Category::Sudo),
     location("etc/sudo.conf", Kind::File, Category::Sudo),
     location("etc/ld.so.preload", Kind::File, Category::Linker),
@@ -854,7 +854,7 @@ const UNOFFICIAL_ONLY: &[&str] = &[
 /// `filesystem` the tables); for any other package a new file here is a
 /// finding (see `sweep_only_location`). No row lies under a `SYSTEM`
 /// location: what is there is reviewed, and would be called unreviewed.
-pub const SYSTEM_SWEEP: &[Location] = &[
+pub(crate) const SYSTEM_SWEEP: &[Location] = &[
     // PAM modules: a `.so` every login loads.
     location("usr/lib/security/", Kind::Directory, Category::Pam),
     location("boot/limine.conf", Kind::File, Category::Boot),
@@ -890,7 +890,7 @@ pub const SYSTEM_SWEEP: &[Location] = &[
 ];
 
 /// Locations in a home directory, relative to it.
-pub const USER: &[Location] = &[
+pub(crate) const USER: &[Location] = &[
     location(".config/systemd/user/", Kind::Directory, Category::Systemd),
     location(
         ".config/environment.d/",
@@ -1120,7 +1120,7 @@ const ENABLING: &[&str] = &[".wants", ".requires", ".upholds"];
 
 impl Location {
     /// Whether `path` (relative, like `path`) falls under this location.
-    pub fn contains(&self, path: &str) -> bool {
+    pub(crate) fn contains(&self, path: &str) -> bool {
         match self.kind {
             Kind::File => path == self.path,
             Kind::Directory => path.starts_with(self.path),
@@ -1158,7 +1158,7 @@ const SKEL: &str = "etc/skel/";
 /// file under `/etc/skel` is what it will be in a new user's home: the
 /// start-up files and directories of `USER` there, not the whole tree
 /// (Omarchy ships thousands of editor plugin files in it).
-pub fn system_location(path: &str) -> Option<&'static Location> {
+fn system_location(path: &str) -> Option<&'static Location> {
     if path
         .split('/')
         .any(|component| matches!(component, "" | "." | ".."))
@@ -1176,14 +1176,14 @@ pub fn system_location(path: &str) -> Option<&'static Location> {
 
 /// Whether the file at `path` (a canonical package path) runs or grants
 /// privileges on its own.
-pub fn is_auto_run(path: &str) -> bool {
+pub(crate) fn is_auto_run(path: &str) -> bool {
     system_location(path).is_some()
 }
 
 /// Whether the pacman gate reviews the file at `path` for a package that
 /// is (`official`), or is not, from an official repository (see
 /// `UNOFFICIAL_ONLY`).
-pub fn is_reviewed(path: &str, official: bool) -> bool {
+pub(crate) fn is_reviewed(path: &str, official: bool) -> bool {
     system_location(path)
         .is_some_and(|location| !(official && UNOFFICIAL_ONLY.contains(&location.path)))
 }
@@ -1191,7 +1191,7 @@ pub fn is_reviewed(path: &str, official: bool) -> bool {
 /// The sweep-only location a canonical package path falls under, if any:
 /// where a package that is not from an official repository has no
 /// business shipping a file.
-pub fn sweep_only_location(path: &str) -> Option<&'static Location> {
+pub(crate) fn sweep_only_location(path: &str) -> Option<&'static Location> {
     if path
         .split('/')
         .any(|component| matches!(component, "" | "." | ".."))
@@ -1208,7 +1208,7 @@ pub fn sweep_only_location(path: &str) -> Option<&'static Location> {
 /// `etc/systemd/user`). A link to a directory of another kind would have
 /// its files read as something they were not reviewed as, and one to a
 /// directory below a catalogued one may itself be a link elsewhere.
-pub fn is_alias_of_reviewed_directory(link: &str, target: &str) -> bool {
+pub(crate) fn is_alias_of_reviewed_directory(link: &str, target: &str) -> bool {
     let (link, target) = (format!("{link}/"), format!("{target}/"));
     let directories = || {
         SYSTEM
@@ -1225,7 +1225,7 @@ pub fn is_alias_of_reviewed_directory(link: &str, target: &str) -> bool {
 /// Whether `path` names a directory of auto-run files or one above it (an
 /// `etc/cron.d`, a `<target>.wants`, a `usr/share/libalpm`): a link there
 /// stands in for the directory, and what it leads to is read as its files.
-pub fn is_auto_run_directory(path: &str) -> bool {
+pub(crate) fn is_auto_run_directory(path: &str) -> bool {
     let directory = format!("{path}/");
     // systemd reads `<target>.wants` and `<unit>.d` as directories
     // wherever it reads units.
@@ -1260,7 +1260,7 @@ const WORD_BREAKS: &str = "\"'`;|&()<>=,:${}[]\\!*?#";
 /// sourced file, a udev `RUN+=` program and a cron command are all words
 /// of their line; so is a path in a comment, which costs one more file
 /// read and misses nothing.
-pub fn named_words(text: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn named_words(text: &str) -> impl Iterator<Item = &str> {
     text.split(|character: char| character.is_whitespace() || WORD_BREAKS.contains(character))
         .filter(|word| !word.is_empty())
 }

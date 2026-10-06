@@ -198,7 +198,7 @@ fn agent_args(reviewer: Reviewer, model: Option<&str>, system: &str, prompt: &st
 
 /// Opens the agent on report `target` in a new terminal window; returns only
 /// on failure.
-pub fn run(target: &str, settings: &Settings) -> String {
+pub(crate) fn run(target: &str, settings: &Settings) -> String {
     let result = (|| {
         let id = report_id(target)?;
         let directory = notify::reports_dir().ok_or("no reports directory (set HOME)")?;

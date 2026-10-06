@@ -28,12 +28,12 @@ use crate::paths::{self, Accept};
 use crate::sweep::own;
 use shellscan::Loads;
 
-pub use plan::{Plan, Step};
+pub(crate) use plan::{Plan, Step};
 
-pub const HOOK_SOURCE: &str = "/usr/share/omarchy-guardian/omarchy-guardian.hook";
-pub const HOOK_TARGET: &str = "/etc/pacman.d/hooks/omarchy-guardian.hook";
-pub const MAKEPKG_GATE: &str = "/usr/lib/omarchy-guardian/guardian-makepkg";
-pub const INTERCEPTOR_INSTALLER: &str = "/usr/lib/omarchy-guardian/install-user-interceptor.sh";
+const HOOK_SOURCE: &str = "/usr/share/omarchy-guardian/omarchy-guardian.hook";
+const HOOK_TARGET: &str = "/etc/pacman.d/hooks/omarchy-guardian.hook";
+const MAKEPKG_GATE: &str = "/usr/lib/omarchy-guardian/guardian-makepkg";
+const INTERCEPTOR_INSTALLER: &str = "/usr/lib/omarchy-guardian/install-user-interceptor.sh";
 const INTERCEPTOR_SOURCE: &str = "/usr/lib/omarchy-guardian/omarchy-bash-interceptor.sh";
 /// The line `install-user-interceptor.sh` writes. Only this exact line
 /// counts as loading the interceptor.
@@ -42,7 +42,7 @@ const INTERCEPTOR_LINE: &str = "[[ -r /usr/lib/omarchy-guardian/omarchy-bash-int
 /// installers (and of its dispatcher), which go through Guardian. First on
 /// the session's PATH, they catch every caller that finds those commands
 /// by name: scripts, other shells, launchers, key bindings.
-pub const WRAPPERS: &str = "/usr/lib/omarchy-guardian/bin";
+const WRAPPERS: &str = "/usr/lib/omarchy-guardian/bin";
 const WRAPPED: [&str; 5] = [
     "omarchy",
     "omarchy-theme-install",
@@ -53,7 +53,7 @@ const WRAPPED: [&str; 5] = [
 /// The file Hyprland's configuration loads to put the wrappers first: a
 /// root-owned file of the package, so the line in the user's file never
 /// has to change.
-pub const HYPR_PATH: &str = "/usr/lib/omarchy-guardian/hyprland-path.lua";
+const HYPR_PATH: &str = "/usr/lib/omarchy-guardian/hyprland-path.lua";
 const HYPR_LINE: &str = "pcall(dofile, \"/usr/lib/omarchy-guardian/hyprland-path.lua\")";
 /// The file uwsm sources for the graphical session, after Omarchy's own
 /// (`10-omarchy`), and the line in it that counts.
@@ -64,7 +64,7 @@ pub(crate) const SESSION_ENV: &str = "# Omarchy Guardian: theme and plugin insta
 const UNGATED_HELPERS: [&str; 3] = ["pikaur", "aura", "trizen"];
 const MENU_ID: &str = "\"setup.guardian\"";
 /// The bar widget plugin the package ships, and its Omarchy plugin id.
-pub const WIDGET_SOURCE: &str = "/usr/share/omarchy-guardian/bar-widget";
+const WIDGET_SOURCE: &str = "/usr/share/omarchy-guardian/bar-widget";
 const WIDGET_ID: &str = "omarchy-guardian";
 /// The Waybar module: an image module showing the Guardian knight (calm,
 /// alert or dimmed), its name in a modules list, its definition (one line, so
@@ -96,10 +96,10 @@ const THEME_GATE: &str = "/usr/lib/omarchy-guardian/guardian-";
 /// `systemctl enable` makes for them.
 const SWEEP_TIMER: &str = "omarchy-guardian-sweep.timer";
 const SWEEP_ROOT_TIMER: &str = "omarchy-guardian-sweep-collect.timer";
-pub const MENU_ENTRY: &str = "\"setup.guardian\": {\"icon\":\"󰒃\",\"label\":\"Guardian\",\"description\":\"Omarchy Guardian settings\",\"action\":\"omarchy-launch-tui --app-id=TUI.float omarchy-guardian tui\"},";
+const MENU_ENTRY: &str = "\"setup.guardian\": {\"icon\":\"󰒃\",\"label\":\"Guardian\",\"description\":\"Omarchy Guardian settings\",\"action\":\"omarchy-launch-tui --app-id=TUI.float omarchy-guardian tui\"},";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Integration {
+pub(crate) enum Integration {
     PacmanHook,
     AurGate,
     ThemeInterceptor,
@@ -111,7 +111,7 @@ pub enum Integration {
 }
 
 impl Integration {
-    pub const ALL: [Self; 8] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::PacmanHook,
         Self::AurGate,
         Self::ThemeInterceptor,
@@ -122,7 +122,7 @@ impl Integration {
         Self::SystemSweep,
     ];
 
-    pub const fn label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::PacmanHook => "Pacman hook",
             Self::AurGate => "AUR gate (yay)",
@@ -135,7 +135,7 @@ impl Integration {
         }
     }
 
-    pub const fn help(self) -> &'static str {
+    pub(crate) const fn help(self) -> &'static str {
         match self {
             Self::PacmanHook => {
                 "Reviews install scriptlets before every pacman transaction. Needs a root-owned reviewer (claude-code or extra/opencode, matching the model) while pacman packages require AI; sudo to change."
@@ -162,7 +162,7 @@ impl Integration {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum State {
+pub(crate) enum State {
     On,
     Off,
     /// Present, but not the packaged setup (for example a hand-installed hook).
@@ -175,60 +175,60 @@ pub enum State {
 /// Where each integration lives. Tests point these into a temporary
 /// directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Paths {
-    pub hook_source: PathBuf,
-    pub hook_target: PathBuf,
-    pub yay: PathBuf,
-    pub yay_config: PathBuf,
-    pub interceptor_installer: PathBuf,
-    pub bashrc: PathBuf,
-    pub omarchy: PathBuf,
-    pub menu: PathBuf,
-    pub widget_source: PathBuf,
-    pub widget_target: PathBuf,
-    pub shell_config: PathBuf,
-    pub waybar_config: PathBuf,
-    pub waybar_style: PathBuf,
+pub(crate) struct Paths {
+    pub(crate) hook_source: PathBuf,
+    pub(crate) hook_target: PathBuf,
+    pub(crate) yay: PathBuf,
+    pub(crate) yay_config: PathBuf,
+    pub(crate) interceptor_installer: PathBuf,
+    pub(crate) bashrc: PathBuf,
+    pub(crate) omarchy: PathBuf,
+    pub(crate) menu: PathBuf,
+    pub(crate) widget_source: PathBuf,
+    pub(crate) widget_target: PathBuf,
+    pub(crate) shell_config: PathBuf,
+    pub(crate) waybar_config: PathBuf,
+    pub(crate) waybar_style: PathBuf,
     /// The pacman gate needs a root-owned OpenCode and none is installed
     /// (see `pacman::preflight`).
-    pub opencode_missing: bool,
+    pub(crate) opencode_missing: bool,
     /// The sweep's user timer as packaged, and its enable link.
-    pub sweep_timer: PathBuf,
-    pub sweep_timer_link: PathBuf,
+    pub(crate) sweep_timer: PathBuf,
+    pub(crate) sweep_timer_link: PathBuf,
     /// The sweep's root timer as packaged, and its enable link.
-    pub sweep_root_timer: PathBuf,
-    pub sweep_root_timer_link: PathBuf,
+    pub(crate) sweep_root_timer: PathBuf,
+    pub(crate) sweep_root_timer_link: PathBuf,
     /// What the system configuration says about the root checks, and the
     /// group allowed to read the daily results.
-    pub sweep_consent: Option<RootConsent>,
-    pub sweep_group: Option<String>,
+    pub(crate) sweep_consent: Option<RootConsent>,
+    pub(crate) sweep_group: Option<String>,
     /// The files that stand in for, or change, one of the sweep's own
     /// units (see `sweep::own`), relative to the root.
-    pub sweep_overrides: Vec<String>,
+    pub(crate) sweep_overrides: Vec<String>,
     /// The name of the user's login shell (`bash`, `zsh`), if known.
-    pub login_shell: Option<String>,
+    pub(crate) login_shell: Option<String>,
     /// Guardian's makepkg shim, which yay is pointed at.
-    pub makepkg_gate: PathBuf,
+    pub(crate) makepkg_gate: PathBuf,
     /// Who must own the files Guardian installs: root. Tests, which cannot
     /// make root's files, name their own user.
-    pub owner: u32,
+    pub(crate) owner: u32,
     /// Where other AUR helpers are installed.
-    pub system_bin: PathBuf,
-    pub paru_config: PathBuf,
+    pub(crate) system_bin: PathBuf,
+    pub(crate) paru_config: PathBuf,
     /// The shell start-up files an alias or function could be in.
-    pub shell_startup: Vec<PathBuf>,
+    pub(crate) shell_startup: Vec<PathBuf>,
     /// This process's PATH, and the session service manager's if it can
     /// be asked.
-    pub path_dirs: Vec<PathBuf>,
-    pub manager_path: Option<Vec<PathBuf>>,
+    pub(crate) path_dirs: Vec<PathBuf>,
+    pub(crate) manager_path: Option<Vec<PathBuf>>,
     /// The wrapper commands as packaged, and the session file that puts
     /// them first on PATH.
-    pub wrappers: PathBuf,
-    pub session_env: PathBuf,
+    pub(crate) wrappers: PathBuf,
+    pub(crate) session_env: PathBuf,
     /// The user's Hyprland Lua configuration, which gets Guardian's line,
     /// and the packaged file that line loads.
-    pub hypr_config: PathBuf,
-    pub hypr_path: PathBuf,
+    pub(crate) hypr_config: PathBuf,
+    pub(crate) hypr_path: PathBuf,
 }
 
 /// The directories of a PATH value.
@@ -293,7 +293,7 @@ fn shell_of(passwd: &str, uid: u32) -> Option<String> {
 }
 
 impl Paths {
-    pub fn real(
+    pub(crate) fn real(
         opencode_missing: bool,
         (sweep_consent, sweep_group): (Option<RootConsent>, Option<String>),
     ) -> Option<Self> {
@@ -367,7 +367,7 @@ impl Paths {
         })
     }
 
-    pub fn state(&self, integration: Integration) -> State {
+    pub(crate) fn state(&self, integration: Integration) -> State {
         match integration {
             Integration::PacmanHook => self.hook_state(),
             Integration::AurGate => self.aur_state(),
@@ -426,7 +426,7 @@ impl Paths {
     /// interceptor is a Bash file, so what is typed in another login shell
     /// goes straight to Omarchy. Nothing here can turn that on, so it is
     /// said beside the gate rather than counted as a fault.
-    pub fn theme_caveat(&self) -> Option<String> {
+    pub(crate) fn theme_caveat(&self) -> Option<String> {
         // With Guardian's commands first on PATH every shell finds them.
         if self.session_state() == State::On {
             return None;
@@ -677,7 +677,7 @@ impl Paths {
 
     /// AUR helpers on this machine that build without Guardian: one line
     /// each, for the bar's list of problems.
-    pub fn helper_issues(&self) -> Vec<String> {
+    pub(crate) fn helper_issues(&self) -> Vec<String> {
         let mut issues = Vec::new();
         if self.system_bin.join("paru").exists() {
             // paru.conf: `Makepkg = <command>` under `[bin]`.
@@ -742,7 +742,7 @@ impl Paths {
     /// own could not be asked: what they read here is this caller's view,
     /// which another caller need not share, so it is not put on record
     /// (see `gatewatch`).
-    pub fn unsettled(&self) -> Vec<Integration> {
+    pub(crate) fn unsettled(&self) -> Vec<Integration> {
         if self.manager_path.is_some() {
             Vec::new()
         } else {
@@ -754,7 +754,7 @@ impl Paths {
     /// guard or attach to: the AUR gate needs yay, the PATH wrappers and
     /// the menu entry need Omarchy. One that does not apply is not
     /// protection missing.
-    pub fn applies(&self, integration: Integration) -> bool {
+    pub(crate) fn applies(&self, integration: Integration) -> bool {
         match integration {
             Integration::AurGate => self.yay.exists(),
             Integration::SessionPath | Integration::MenuEntry => self.omarchy.is_dir(),
@@ -861,7 +861,7 @@ impl Paths {
     /// What to say beside the wrappers while they are on for the session
     /// and this caller's own shell finds something else first: its start-up
     /// files reorder PATH. Said to this caller only, never put on record.
-    pub fn path_caveat(&self) -> Option<String> {
+    pub(crate) fn path_caveat(&self) -> Option<String> {
         self.manager_path.as_ref()?;
         if self.path_dirs.is_empty() || self.session_state() != State::On {
             return None;

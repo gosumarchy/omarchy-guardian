@@ -50,7 +50,7 @@ pub(super) fn write_results(path: &Path, json: &str, gid: u32) -> Result<(), Str
 /// What the scheduled root collector found, if it is trustworthy and
 /// recent: owned by root and writable by no one else, file and directory,
 /// and at most `MAX_AGE_SECS` old.
-pub fn from_results(path: &Path, now: u64) -> Result<RootPart, String> {
+pub(crate) fn from_results(path: &Path, now: u64) -> Result<RootPart, String> {
     if let Some(problem) = results_problem(path, now) {
         return Err(problem);
     }
@@ -60,7 +60,7 @@ pub fn from_results(path: &Path, now: u64) -> Result<RootPart, String> {
 
 /// Why the results at `path` are not used, as far as that shows without
 /// reading them (the bar asks this too).
-pub fn results_problem(path: &Path, now: u64) -> Option<String> {
+pub(crate) fn results_problem(path: &Path, now: u64) -> Option<String> {
     let directory = path.parent()?;
     for checked in [directory, path] {
         let metadata = match fs::symlink_metadata(checked) {

@@ -12,7 +12,7 @@ use crate::report::Gap;
 use crate::tomlish::{self, Entry};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Ecosystem {
+pub(crate) enum Ecosystem {
     CratesIo,
     Npm,
     PyPi,
@@ -21,7 +21,7 @@ pub enum Ecosystem {
 
 impl Ecosystem {
     /// The ecosystem name in the OSV schema.
-    pub const fn osv_name(self) -> &'static str {
+    pub(crate) const fn osv_name(self) -> &'static str {
         match self {
             Self::CratesIo => "crates.io",
             Self::Npm => "npm",
@@ -32,16 +32,16 @@ impl Ecosystem {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Dependency {
-    pub ecosystem: Ecosystem,
-    pub name: String,
-    pub version: String,
+pub(crate) struct Dependency {
+    pub(crate) ecosystem: Ecosystem,
+    pub(crate) name: String,
+    pub(crate) version: String,
     /// The lockfile it was found in, relative to the review root.
-    pub lockfile: String,
+    pub(crate) lockfile: String,
 }
 
 #[derive(Debug, Default)]
-pub struct Inventory {
+pub(crate) struct Inventory {
     packages: Vec<Dependency>,
     seen: HashSet<(Ecosystem, String, String)>,
     manifests: Vec<(String, Ecosystem)>,
@@ -52,11 +52,11 @@ pub struct Inventory {
 }
 
 impl Inventory {
-    pub fn packages(&self) -> &[Dependency] {
+    pub(crate) fn packages(&self) -> &[Dependency] {
         &self.packages
     }
 
-    pub fn lockfile_count(&self) -> usize {
+    pub(crate) fn lockfile_count(&self) -> usize {
         self.lockfiles.len()
     }
 
@@ -90,7 +90,7 @@ impl Inventory {
 }
 
 /// Records whatever dependency information `contents` holds.
-pub fn inspect(inventory: &mut Inventory, gaps: &mut Vec<Gap>, rel: &str, contents: &str) {
+pub(crate) fn inspect(inventory: &mut Inventory, gaps: &mut Vec<Gap>, rel: &str, contents: &str) {
     let name = Path::new(rel)
         .file_name()
         .and_then(|name| name.to_str())
@@ -151,7 +151,7 @@ pub fn inspect(inventory: &mut Inventory, gaps: &mut Vec<Gap>, rel: &str, conten
 
 /// Requires every manifest to have a lockfile of its ecosystem in its own
 /// directory or an ancestor (a Cargo workspace root, for example).
-pub fn check_coverage(inventory: &Inventory, gaps: &mut Vec<Gap>) {
+pub(crate) fn check_coverage(inventory: &Inventory, gaps: &mut Vec<Gap>) {
     for (manifest, ecosystem) in &inventory.manifests {
         let directory = Path::new(manifest).parent().unwrap_or(Path::new(""));
         let covering: Vec<&String> = inventory

@@ -69,10 +69,10 @@ const OPENCODE_SETTINGS_KEYS: &[&str] = &[
 /// What a reviewer run is exposed to besides the request: lines for the
 /// report, and for a root transaction a reason not to run it at all.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct Exposure {
-    pub notes: Vec<String>,
+pub(crate) struct Exposure {
+    pub(crate) notes: Vec<String>,
     /// Set only for the pacman classes: the review is then unavailable.
-    pub refusal: Option<String>,
+    pub(crate) refusal: Option<String>,
 }
 
 /// Looks at what `reviewer` will take from Guardian's environment and from
@@ -83,7 +83,7 @@ pub struct Exposure {
 /// an endpoint, a key helper, environment, hooks or plugins make the review
 /// unavailable: Guardian cannot tell a company's policy file from one a
 /// package left there, and a root transaction is not judged through either.
-pub fn exposure(reviewer: Reviewer, privileged: bool) -> Exposure {
+pub(crate) fn exposure(reviewer: Reviewer, privileged: bool) -> Exposure {
     exposure_in(
         reviewer,
         privileged,

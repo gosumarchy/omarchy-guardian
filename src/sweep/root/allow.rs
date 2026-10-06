@@ -13,7 +13,7 @@ use crate::user;
 /// `what` ("changing ..."), which is said first. What only root may write
 /// is written this way: by the installed, root-owned program, never by the
 /// one that is running.
-pub fn as_root(command: &str, arguments: &[&str], what: &str) -> Result<(), String> {
+pub(crate) fn as_root(command: &str, arguments: &[&str], what: &str) -> Result<(), String> {
     let program = installed()?;
     errln!("Guardian needs root for {what}; it asks for your password.");
     let status = Command::new(SUDO)
@@ -34,7 +34,7 @@ pub fn as_root(command: &str, arguments: &[&str], what: &str) -> Result<(), Stri
 
 /// Changes the system's list of allowed items through sudo (see
 /// `system_allow_command`).
-pub fn system_allow(arguments: &[&str]) -> Result<(), String> {
+pub(crate) fn system_allow(arguments: &[&str]) -> Result<(), String> {
     as_root(
         "sweep-allow-system",
         arguments,
@@ -133,7 +133,7 @@ fn changes_asked(arguments: &[String]) -> String {
 /// LABEL | --clear)...`, run as root through sudo by `sweep allow` and
 /// `sweep forget`: the list of allowed items, which only root writes. The
 /// user it acts for is the one sudo says ran it (`SUDO_UID`).
-pub fn system_allow_command(arguments: &[String]) -> ExitCode {
+pub(crate) fn system_allow_command(arguments: &[String]) -> ExitCode {
     if !user::effective_uid().is_ok_and(|uid| uid == 0) {
         errln!("omarchy-guardian sweep-allow-system: only `sweep allow` runs this, as root");
         return ExitCode::from(2);

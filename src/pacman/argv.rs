@@ -34,7 +34,7 @@ pub(super) fn read_targets(input: impl BufRead) -> Result<Vec<String>, Error> {
 }
 
 /// Pacman package names: alphanumerics and `@._+-`, not starting with `-` or `.`.
-pub fn is_valid_package_name(name: &str) -> bool {
+pub(crate) fn is_valid_package_name(name: &str) -> bool {
     name.chars()
         .next()
         .is_some_and(|first| first.is_ascii_alphanumeric() || "@_+".contains(first))
@@ -90,9 +90,9 @@ const VALUED: &[&str] = &[
 /// A pacman command line: the operation and its operands (package names
 /// for a sync, archives for an upgrade).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Transaction {
-    pub operation: Operation,
-    pub operands: Vec<String>,
+pub(super) struct Transaction {
+    pub(super) operation: Operation,
+    pub(super) operands: Vec<String>,
 }
 
 /// Reads pacman's command line. Only sync (`-S`) and upgrade (`-U`)
@@ -101,7 +101,7 @@ pub struct Transaction {
 /// option by any unambiguous beginning, so a redirecting or valued one is
 /// recognised by its beginning too; an argument that is no option is an
 /// operand, whatever it is named.
-pub fn parse_transaction(argv: &[String]) -> Result<Transaction, Error> {
+pub(super) fn parse_transaction(argv: &[String]) -> Result<Transaction, Error> {
     // A script named pacman shows as its interpreter, then itself; after
     // pacman itself, an argument of that name is an operand.
     let named = |index: usize| {

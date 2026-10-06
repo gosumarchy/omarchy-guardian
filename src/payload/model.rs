@@ -12,7 +12,7 @@ use super::{Entry, Kind, METADATA};
 /// Undoes bsdtar's (and mtree's) escaping of names (`\\`, `\n`, `\t` and
 /// octal `\ooo`); `None` for a name that is not UTF-8 or holds control
 /// characters.
-pub fn unescape(raw: &str) -> Option<String> {
+pub(crate) fn unescape(raw: &str) -> Option<String> {
     let mut bytes = Vec::with_capacity(raw.len());
     let mut input = raw.bytes().peekable();
     while let Some(byte) = input.next() {
@@ -59,21 +59,21 @@ pub(super) fn root_set_id(mode: &str, owner: &str, group: &str) -> Option<&'stat
     }
 }
 
-pub const SETUID_ROOT: &str = "setuid root";
-pub const SETGID_ROOT: &str = "setgid root";
+const SETUID_ROOT: &str = "setuid root";
+const SETGID_ROOT: &str = "setgid root";
 /// It runs as its owner, or with its group (`disk`, `shadow`, `kmem` reach
 /// far), for whoever starts it.
-pub const SETUID_OTHER: &str = "setuid for a user other than root";
-pub const SETGID_OTHER: &str = "setgid for a group other than root";
+pub(crate) const SETUID_OTHER: &str = "setuid for a user other than root";
+pub(crate) const SETGID_OTHER: &str = "setgid for a group other than root";
 /// What to call an entry that carries file capabilities, and one with an
 /// access control list.
-pub const WITH_CAPABILITIES: &str = "with file capabilities";
-pub const WITH_ACL: &str = "with an access control list";
+pub(crate) const WITH_CAPABILITIES: &str = "with file capabilities";
+pub(crate) const WITH_ACL: &str = "with an access control list";
 /// What to call a file or directory anyone may write, where the system's
 /// own files are, and one that is somebody else's to write.
-pub const WRITABLE_BY_ALL: &str = "writable by everyone";
-pub const OWNED_BY_OTHER: &str = "owned by a user other than root";
-pub const WRITABLE_BY_GROUP: &str = "writable by a group other than root";
+pub(crate) const WRITABLE_BY_ALL: &str = "writable by everyone";
+pub(crate) const OWNED_BY_OTHER: &str = "owned by a user other than root";
+pub(crate) const WRITABLE_BY_GROUP: &str = "writable by a group other than root";
 
 /// Whether a listed entry under `/usr`, `/etc` or `/opt` can be written by
 /// someone other than root: by everyone, by its owner, or by its group.
@@ -107,7 +107,7 @@ pub(super) fn open_to_others(
 /// Whether what `what` names is how the installed file already is: then a
 /// package that ships it that way again grants nothing new. Capabilities
 /// and access lists are not read back, so those are said every time.
-pub fn already_granted(what: &str, installed: &Metadata) -> bool {
+pub(crate) fn already_granted(what: &str, installed: &Metadata) -> bool {
     let mode = installed.mode();
     let (uid, gid) = (installed.uid(), installed.gid());
     match what {

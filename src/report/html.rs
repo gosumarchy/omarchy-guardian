@@ -21,7 +21,7 @@ const KNIGHT: &str = include_str!("../../integrations/icons/omarchy-guardian-ale
 static SECTIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Remembers `report` for the page.
-pub fn collect(report: &Report, decision: Decision) {
+pub(super) fn collect(report: &Report, decision: Decision) {
     let section = section(report, decision);
     SECTIONS
         .lock()
@@ -31,7 +31,7 @@ pub fn collect(report: &Report, decision: Decision) {
 
 /// Remembers a section built elsewhere (the sweep's items), already
 /// escaped, for the page.
-pub fn collect_section(section: String) {
+pub(crate) fn collect_section(section: String) {
     SECTIONS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -42,7 +42,14 @@ pub fn collect_section(section: String) {
 /// UTC time, `id` names the saved report for the ask link, and `fallback`
 /// is the printed output, shown when no report was collected (a gate that
 /// stopped before reviewing).
-pub fn page(title: &str, detail: &str, ran: Ran, when: &str, id: &str, fallback: &str) -> String {
+pub(crate) fn page(
+    title: &str,
+    detail: &str,
+    ran: Ran,
+    when: &str,
+    id: &str,
+    fallback: &str,
+) -> String {
     let sections = SECTIONS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -401,7 +408,7 @@ const fn tone(color: &str) -> &'static str {
 /// Escapes text for HTML content and attribute values. A hidden character
 /// (a control, bidirectional override or invisible character) is shown as a
 /// visible code, so a file name cannot reorder or hide what the page says.
-pub fn esc(text: &str) -> String {
+pub(crate) fn esc(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for character in text.chars() {
         match character {
@@ -426,7 +433,7 @@ pub fn esc(text: &str) -> String {
 
 /// Drops terminal escape sequences (ECMA-48 CSI, OSC and other string
 /// controls, and two-character escapes) from captured output.
-pub fn strip_ansi(text: &str) -> String {
+pub(crate) fn strip_ansi(text: &str) -> String {
     let mut plain = String::with_capacity(text.len());
     let mut characters = text.chars().peekable();
     while let Some(character) = characters.next() {

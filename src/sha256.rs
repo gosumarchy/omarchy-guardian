@@ -85,7 +85,7 @@ const BLOCK_LEN: usize = 64;
 
 /// A finished SHA-256 digest. `Display` renders lowercase hex.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Digest([u8; 32]);
+pub(crate) struct Digest([u8; 32]);
 
 impl fmt::Display for Digest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -98,7 +98,7 @@ impl fmt::Display for Digest {
 
 impl Digest {
     /// A digest from 64 hex digits (either case).
-    pub fn from_hex(hex: &str) -> Option<Self> {
+    pub(crate) fn from_hex(hex: &str) -> Option<Self> {
         let bytes = hex.as_bytes();
         if bytes.len() != 64 {
             return None;
@@ -123,7 +123,7 @@ impl fmt::Debug for Digest {
 
 /// Incremental SHA-256 hasher.
 #[derive(Clone)]
-pub struct Sha256 {
+pub(crate) struct Sha256 {
     state: [u32; 8],
     buffer: [u8; BLOCK_LEN],
     buffered: usize,
@@ -137,7 +137,7 @@ impl Default for Sha256 {
 }
 
 impl Sha256 {
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             state: INITIAL_STATE,
             buffer: [0; BLOCK_LEN],
@@ -146,13 +146,13 @@ impl Sha256 {
         }
     }
 
-    pub fn digest(bytes: &[u8]) -> Digest {
+    pub(crate) fn digest(bytes: &[u8]) -> Digest {
         let mut hasher = Self::new();
         hasher.update(bytes);
         hasher.finalize()
     }
 
-    pub fn update(&mut self, mut bytes: &[u8]) {
+    pub(crate) fn update(&mut self, mut bytes: &[u8]) {
         self.length = self.length.wrapping_add(bytes.len() as u64);
 
         if self.buffered > 0 {
@@ -178,7 +178,7 @@ impl Sha256 {
         self.buffered = tail.len();
     }
 
-    pub fn finalize(mut self) -> Digest {
+    pub(crate) fn finalize(mut self) -> Digest {
         let bit_length = self.length.wrapping_mul(8);
 
         self.update(&[0x80]);

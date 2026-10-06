@@ -4,7 +4,7 @@
 /// checked: every `=` at the end is dropped, and bits left over after the
 /// last whole byte are ignored. Anything outside the standard alphabet
 /// (the URL-safe `-` and `_`, whitespace, a `=` before the end) is refused.
-pub fn base64_decode(encoded: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(encoded: &str) -> Option<Vec<u8>> {
     let mut bits = 0_u32;
     let mut count = 0;
     let mut bytes = Vec::with_capacity(encoded.len() * 3 / 4);

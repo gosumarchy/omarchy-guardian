@@ -7,7 +7,7 @@ use super::lex::{Token, Word};
 
 /// How a command follows the one before it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Join {
+pub(super) enum Join {
     /// After it, whatever it gave: a new line or `;`.
     Sequence,
     /// `&&` or `||`: depending on its result.
@@ -17,18 +17,18 @@ pub enum Join {
 }
 
 #[derive(Clone, Debug)]
-pub struct Item {
-    pub join: Join,
+pub(super) struct Item {
+    pub(super) join: Join,
     /// Ended with `&`.
-    pub background: bool,
-    pub command: Command,
+    pub(super) background: bool,
+    pub(super) command: Command,
     /// What its redirections read or write, and whether one is a
     /// here-document that bash expands.
-    pub redirects: Vec<(Word, bool)>,
+    pub(super) redirects: Vec<(Word, bool)>,
 }
 
 #[derive(Clone, Debug)]
-pub enum Command {
+pub(super) enum Command {
     Simple(Vec<Word>),
     /// `[[ ... ]]`, without the brackets.
     Test(Vec<Word>),
@@ -60,7 +60,7 @@ pub enum Command {
 
 impl Item {
     /// The line it starts on, as far as it has words of its own.
-    pub fn line(&self) -> usize {
+    pub(super) fn line(&self) -> usize {
         match &self.command {
             Command::Simple(words) | Command::Test(words) => {
                 words.first().map_or(0, |word| word.line)
@@ -81,7 +81,7 @@ impl Item {
 }
 
 /// The line the parser could not read on from.
-pub type Parsed<T> = Result<T, usize>;
+type Parsed<T> = Result<T, usize>;
 
 struct Parser {
     tokens: Vec<Token>,
@@ -415,7 +415,7 @@ impl Parser {
 }
 
 /// The commands of a recipe, from its tokens.
-pub fn commands(tokens: Vec<Token>) -> Parsed<Vec<Item>> {
+pub(super) fn commands(tokens: Vec<Token>) -> Parsed<Vec<Item>> {
     let mut parser = Parser {
         tokens,
         at: 0,

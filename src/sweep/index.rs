@@ -19,7 +19,7 @@ use crate::payload::unescape;
 use crate::sha256::Digest;
 use crate::tools::{self, Limits};
 
-pub const LOCAL_DB: &str = "/var/lib/pacman/local";
+pub(super) const LOCAL_DB: &str = "/var/lib/pacman/local";
 const GZIP: &str = "/usr/bin/gzip";
 const PACMAN: &str = "/usr/bin/pacman";
 
@@ -30,7 +30,7 @@ const MAX_TOTAL: usize = 256 * 1024 * 1024;
 
 /// What pacman recorded for one installed path.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Recorded {
+pub(super) enum Recorded {
     File {
         /// Permission bits, including set-id bits (`0o4755`).
         mode: u32,
@@ -40,34 +40,34 @@ pub enum Recorded {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Owned {
+pub(super) struct Owned {
     /// Index into `PackageIndex::packages`.
     package: usize,
-    pub recorded: Recorded,
+    pub(super) recorded: Recorded,
     /// A configuration file the package expects the administrator to edit
     /// (`backup=` in its PKGBUILD).
-    pub backup: bool,
+    pub(super) backup: bool,
 }
 
 #[derive(Debug, Default)]
-pub struct PackageIndex {
+pub(super) struct PackageIndex {
     packages: Vec<String>,
     owners: HashMap<String, Owned>,
     foreign: HashSet<String>,
     /// Packages a repository carries by name but that were installed from
     /// a file nothing vouched for (`pacman -U`): they are in `foreign` too.
-    pub unverified: Vec<String>,
+    pub(super) unverified: Vec<String>,
     /// Repository-package files by content, for files copied out of a
     /// package (Omarchy's `etc-overrides`).
     copies: HashMap<Digest, Vec<String>>,
     /// Packages whose record could not be read.
-    pub problems: Vec<String>,
+    pub(super) problems: Vec<String>,
 }
 
 impl PackageIndex {
     /// Reads every package under `db`. `foreign` names packages from no
     /// configured repository (AUR, `pacman -U`).
-    pub fn load(db: &Path, foreign: HashSet<String>) -> Result<Self, Error> {
+    pub(super) fn load(db: &Path, foreign: HashSet<String>) -> Result<Self, Error> {
         let mut index = Self {
             foreign,
             ..Self::default()
@@ -156,7 +156,7 @@ impl PackageIndex {
     /// is `path`'s, if any: Omarchy's `etc-overrides/nsswitch.conf` for
     /// `/etc/nsswitch.conf`. A file with a different name (a packaged script
     /// dropped into `/etc/profile.d/`) is not a copy of it.
-    pub fn copy_of(&self, digest: &Digest, path: &str) -> Option<&str> {
+    pub(super) fn copy_of(&self, digest: &Digest, path: &str) -> Option<&str> {
         let name = file_name(path);
         self.copies
             .get(digest)?
@@ -166,26 +166,26 @@ impl PackageIndex {
     }
 
     /// The record for `path`, relative to `/` (`usr/bin/ssh`).
-    pub fn owner(&self, path: &str) -> Option<&Owned> {
+    pub(super) fn owner(&self, path: &str) -> Option<&Owned> {
         self.owners.get(path)
     }
 
-    pub fn package(&self, owned: &Owned) -> &str {
+    pub(super) fn package(&self, owned: &Owned) -> &str {
         &self.packages[owned.package]
     }
 
     /// Whether `package` comes from no configured repository.
-    pub fn is_foreign(&self, package: &str) -> bool {
+    pub(super) fn is_foreign(&self, package: &str) -> bool {
         self.foreign.contains(package)
     }
 
     #[cfg(test)]
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.owners.len()
     }
 
     #[cfg(test)]
-    pub fn with_foreign(foreign: HashSet<String>) -> Self {
+    pub(super) fn with_foreign(foreign: HashSet<String>) -> Self {
         Self {
             foreign,
             ..Self::default()
@@ -193,7 +193,7 @@ impl PackageIndex {
     }
 
     #[cfg(test)]
-    pub fn add_for_test(&mut self, package: &str, mtree: &str, backup: &[&str]) {
+    pub(super) fn add_for_test(&mut self, package: &str, mtree: &str, backup: &[&str]) {
         let backup = backup.iter().map(|path| (*path).to_string()).collect();
         self.add(package, mtree, &backup, true);
     }
@@ -281,7 +281,7 @@ fn read_mtree(path: &Path) -> Result<String, Error> {
 /// The packages no configured repository carries by name (`pacman -Qmq`);
 /// `PackageIndex::load` adds the ones installed from an unverified file.
 /// pacman exits 1 when there are none.
-pub fn foreign_packages() -> Result<HashSet<String>, Error> {
+pub(super) fn foreign_packages() -> Result<HashSet<String>, Error> {
     let captured = tools::run(
         Path::new(PACMAN),
         &[OsString::from("-Qmq")],

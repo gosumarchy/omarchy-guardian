@@ -272,13 +272,13 @@ pub(super) fn record_runs(report: &mut Report, rel: &str, line: usize, text: &st
 
 /// The most files run, and downloads, recorded for one review. Past it the
 /// review is incomplete: what runs further on is not followed.
-pub const MAX_RUNS: usize = 100_000;
+pub(crate) const MAX_RUNS: usize = 100_000;
 
 /// What one reviewed file does with another: runs one that a different
 /// file downloads (download-and-run across files), or runs or reads in as
 /// code one Guardian could not read as text (`unread`, with why), which is
 /// then not reviewed although it runs.
-pub fn check_runs(report: &mut Report, unread: &[(String, String)]) {
+pub(crate) fn check_runs(report: &mut Report, unread: &[(String, String)]) {
     if report.runs_overflowed {
         report.gaps.push(Gap::RunsUnread(format!(
             "more than {MAX_RUNS} lines run or download a file: the rest are not followed"

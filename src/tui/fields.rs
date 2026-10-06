@@ -20,13 +20,13 @@ use crate::config::model::{
 use crate::config::write::render;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Scope {
+pub(super) enum Scope {
     User,
     System,
 }
 
 impl Scope {
-    pub const fn name(self) -> &'static str {
+    pub(super) const fn name(self) -> &'static str {
         match self {
             Self::User => "user",
             Self::System => "system",
@@ -35,7 +35,7 @@ impl Scope {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Knob {
+pub(super) enum Knob {
     Ai,
     OnFindings,
     OnAiSuspicious,
@@ -49,7 +49,7 @@ pub enum Knob {
 
 impl Knob {
     /// The knobs a class can set in the file it is edited in.
-    pub fn for_class(class: SourceClass) -> &'static [Self] {
+    pub(super) fn for_class(class: SourceClass) -> &'static [Self] {
         if class.is_privileged() {
             &[
                 Self::Ai,
@@ -90,7 +90,7 @@ impl Knob {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Setting {
+pub(super) enum Setting {
     Profile,
     OfficialRepos,
     AgentModel,
@@ -102,14 +102,14 @@ pub enum Setting {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Field {
-    pub scope: Scope,
-    pub setting: Setting,
+pub(super) struct Field {
+    pub(super) scope: Scope,
+    pub(super) setting: Setting,
 }
 
 /// How a value is entered. Every field can also be reset to inherit.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Input {
+pub(super) enum Input {
     Choice(Vec<&'static str>),
     Number(RangeInclusive<u32>),
     Model,
@@ -121,12 +121,12 @@ fn names<T: Named>() -> Vec<&'static str> {
 }
 
 impl Field {
-    pub const fn new(scope: Scope, setting: Setting) -> Self {
+    pub(super) const fn new(scope: Scope, setting: Setting) -> Self {
         Self { scope, setting }
     }
 
     /// A class knob, in the file that class is edited in.
-    pub fn class(class: SourceClass, knob: Knob) -> Self {
+    pub(super) fn class(class: SourceClass, knob: Knob) -> Self {
         let scope = if class.is_privileged() {
             Scope::System
         } else {
@@ -135,7 +135,7 @@ impl Field {
         Self::new(scope, Setting::Class(class, knob))
     }
 
-    pub fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self.setting {
             Setting::Profile => match self.scope {
                 Scope::User => "Your sources",
@@ -161,7 +161,7 @@ impl Field {
         }
     }
 
-    pub fn help(self) -> &'static str {
+    pub(super) fn help(self) -> &'static str {
         match self.setting {
             Setting::Profile => match self.scope {
                 Scope::User => {
@@ -212,7 +212,7 @@ impl Field {
         }
     }
 
-    pub fn input(self) -> Input {
+    pub(super) fn input(self) -> Input {
         match self.setting {
             Setting::Profile => Input::Choice(names::<Profile>()),
             Setting::OfficialRepos => Input::Repos,
@@ -234,7 +234,7 @@ impl Field {
     }
 
     /// The value set in `config`, or `None` when the field inherits.
-    pub fn get(self, config: &PartialConfig) -> Option<String> {
+    pub(super) fn get(self, config: &PartialConfig) -> Option<String> {
         let agent = &config.agent;
         match self.setting {
             Setting::Profile => config.profile.map(|value| value.name().to_string()),
@@ -266,7 +266,7 @@ impl Field {
     /// Sets (or with `None`, clears) the field in `config`. The whole file
     /// is then checked with the real parser, so a value the config file
     /// would reject is refused here with the parser's own message.
-    pub fn set(self, config: &mut PartialConfig, value: Option<&str>) -> Result<(), String> {
+    pub(super) fn set(self, config: &mut PartialConfig, value: Option<&str>) -> Result<(), String> {
         let mut changed = config.clone();
         self.assign(&mut changed, value.map(str::trim))?;
         validate(&changed)?;
@@ -356,7 +356,7 @@ impl Field {
     }
 
     /// The value in effect with both drafts applied, for display.
-    pub fn effective(
+    pub(super) fn effective(
         self,
         settings: &Settings,
         user: &PartialConfig,
@@ -410,7 +410,7 @@ impl Field {
     }
 
     /// Where the effective value of a class knob comes from.
-    pub fn origin(self, settings: &Settings) -> Option<&'static str> {
+    pub(super) fn origin(self, settings: &Settings) -> Option<&'static str> {
         match self.setting {
             Setting::Class(class, knob) => Some(settings.resolve(class).origin(knob.key()).name()),
             _ => None,
@@ -418,11 +418,11 @@ impl Field {
     }
 }
 
-pub const HEADER: &str =
+pub(super) const HEADER: &str =
     "# Written by `omarchy-guardian tui`. See `omarchy-guardian config show`.\n";
 
 /// The file text for `config`, checked with the real parser.
-pub fn validate(config: &PartialConfig) -> Result<String, String> {
+pub(super) fn validate(config: &PartialConfig) -> Result<String, String> {
     let text = render(config, HEADER);
     parse(Path::new("config"), &text)
         .map(|_| text)

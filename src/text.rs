@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 
 /// Characters that control a terminal, reorder text or are invisible.
 /// `\t` and `\n` are included; callers decide whether to keep them.
-pub const fn is_hidden(character: char) -> bool {
+pub(crate) const fn is_hidden(character: char) -> bool {
     matches!(
         character,
         '\u{0}'..='\u{1f}'
@@ -69,12 +69,12 @@ fn replace(text: &str, keep: impl Fn(char) -> bool) -> Cow<'_, str> {
 
 /// A single-line field: every hidden character, `\t` and `\n` included,
 /// becomes a visible code.
-pub fn shown(text: &str) -> Cow<'_, str> {
+pub(crate) fn shown(text: &str) -> Cow<'_, str> {
     replace(text, |_| false)
 }
 
 /// Multi-line text: like `shown`, keeping `\n` and `\t`.
-pub fn shown_block(text: &str) -> Cow<'_, str> {
+pub(crate) fn shown_block(text: &str) -> Cow<'_, str> {
     replace(text, |character| matches!(character, '\n' | '\t'))
 }
 
@@ -88,7 +88,7 @@ fn allowed_parameter(param: &str) -> bool {
 /// (`ESC [ … m` with only the parameters it uses) pass; every other escape
 /// sequence and hidden character becomes a visible code. The worst attacker
 /// text can do is colour itself.
-pub fn terminal_safe(text: &str) -> Cow<'_, str> {
+pub(crate) fn terminal_safe(text: &str) -> Cow<'_, str> {
     if !text
         .chars()
         .any(|character| is_hidden(character) && !matches!(character, '\n' | '\t'))

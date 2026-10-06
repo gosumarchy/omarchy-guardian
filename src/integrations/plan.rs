@@ -11,7 +11,7 @@ const INSTALL_OPENCODE: [&str; 4] = ["/usr/bin/pacman", "-S", "--needed", "extra
 
 /// One step of a plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Step {
+pub(crate) enum Step {
     /// A program run on the terminal.
     Command(Vec<String>),
     /// A program run silently whose failure does not fail the plan.
@@ -33,14 +33,14 @@ pub enum Step {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Plan {
-    pub summary: String,
-    pub steps: Vec<Step>,
+pub(crate) struct Plan {
+    pub(crate) summary: String,
+    pub(crate) steps: Vec<Step>,
 }
 
 impl Plan {
     /// Lines describing exactly what will run or change.
-    pub fn describe(&self, paths: &Paths) -> Vec<String> {
+    pub(crate) fn describe(&self, paths: &Paths) -> Vec<String> {
         self.steps
             .iter()
             .map(|step| match step {
@@ -105,7 +105,7 @@ impl Plan {
 
     /// Commands may ask for a password or print, so they run on the normal
     /// screen; optional steps (a menu refresh) run silently.
-    pub fn needs_terminal(&self) -> bool {
+    pub(crate) fn needs_terminal(&self) -> bool {
         self.steps
             .iter()
             .any(|step| matches!(step, Step::Command(_) | Step::AskSweepRoot))
@@ -115,7 +115,7 @@ impl Plan {
 impl Paths {
     /// The plan that flips `integration` from `state`; `None` when it
     /// cannot be changed from here.
-    pub fn plan(&self, integration: Integration, state: &State) -> Option<Plan> {
+    pub(crate) fn plan(&self, integration: Integration, state: &State) -> Option<Plan> {
         let text = |path: &Path| path.display().to_string();
         let on = match state {
             State::On => false,

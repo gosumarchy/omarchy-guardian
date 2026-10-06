@@ -26,9 +26,9 @@ mod exposure;
 mod provider;
 mod reply;
 
-pub use exposure::{Exposure, exposure};
+pub(crate) use exposure::{Exposure, exposure};
 use reply::{claude_verdict, scan_events, verdict};
-pub use reply::{review_from_json, review_to_json};
+pub(crate) use reply::{review_from_json, review_to_json};
 
 const MAX_OUTPUT: usize = 4 * 1024 * 1024;
 
@@ -95,7 +95,7 @@ const DENIED_PERMISSIONS: &[&str] = &[
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Status {
+pub(crate) enum Status {
     Clear,
     Suspicious,
     Inconclusive,
@@ -111,7 +111,7 @@ impl Status {
         }
     }
 
-    pub const fn label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Clear => "CLEAR",
             Self::Suspicious => "SUSPICIOUS",
@@ -119,7 +119,7 @@ impl Status {
         }
     }
 
-    pub const fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Self::Clear => "clear",
             Self::Suspicious => "suspicious",
@@ -129,32 +129,32 @@ impl Status {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentFinding {
-    pub severity: Severity,
-    pub file: String,
-    pub line: Option<u64>,
-    pub title: String,
-    pub reason: String,
+pub(crate) struct AgentFinding {
+    pub(crate) severity: Severity,
+    pub(crate) file: String,
+    pub(crate) line: Option<u64>,
+    pub(crate) title: String,
+    pub(crate) reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentReview {
-    pub status: Status,
-    pub summary: String,
-    pub findings: Vec<AgentFinding>,
+pub(crate) struct AgentReview {
+    pub(crate) status: Status,
+    pub(crate) summary: String,
+    pub(crate) findings: Vec<AgentFinding>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SourceFile {
-    pub path: String,
-    pub content: String,
+pub(crate) struct SourceFile {
+    pub(crate) path: String,
+    pub(crate) content: String,
 }
 
 /// Why a review produced no verdict. `Unavailable` follows the class's `ai`
 /// policy; `Invalid` always blocks, because a reviewer that answers wrongly
 /// is not the same as a reviewer that is absent.
 #[derive(Debug)]
-pub enum AgentError {
+pub(crate) enum AgentError {
     /// No binary, spawn failure, provider/model/variant error, timeout.
     Unavailable(Error),
     /// Malformed events or reply, missing nonce, tool use, oversized output.
@@ -168,7 +168,7 @@ pub enum AgentError {
 }
 
 impl AgentError {
-    pub fn into_error(self) -> Error {
+    pub(crate) fn into_error(self) -> Error {
         match self {
             Self::Unavailable(error) | Self::Invalid(error) | Self::OutOfTime(error) => error,
         }
@@ -185,7 +185,7 @@ impl AgentError {
 /// directory of the user the review runs as (the one who called pacman
 /// through sudo), which that user can write: the review is isolated from
 /// their configuration, not from the account itself.
-pub fn review(
+pub(crate) fn review(
     binary: &Path,
     render: &dyn Fn(&str) -> String,
     settings: &AgentSettings,
@@ -362,7 +362,7 @@ pub(crate) fn random_nonce() -> Result<String, Error> {
     }))
 }
 
-pub(crate) fn opencode_config() -> Json {
+fn opencode_config() -> Json {
     locked_config(
         [(
             "guardian-review",
@@ -435,15 +435,15 @@ fn locked_config<'a>(
 
 /// Why a reply without this run's nonce is refused; the engine asks once
 /// more when it sees it.
-pub const NONCE_MISSING: &str =
+pub(crate) const NONCE_MISSING: &str =
     "the reply does not echo this run's nonce, so it was not based on the supplied source";
 
 /// The optional reply field a model sets when the reviewed content speaks
 /// to its reviewer, and the finding Guardian adds when it is true. The
 /// finding names no file of the source: the model is not asked for one.
-pub const ADDRESSED_FIELD: &str = "addressed_to_reviewer";
-pub const ADDRESSED_FILE: &str = "(reviewed content)";
-pub const ADDRESSED_TITLE: &str = "the reviewed content addresses the reviewer";
+const ADDRESSED_FIELD: &str = "addressed_to_reviewer";
+const ADDRESSED_FILE: &str = "(reviewed content)";
+pub(crate) const ADDRESSED_TITLE: &str = "the reviewed content addresses the reviewer";
 
 #[cfg(test)]
 mod tests;

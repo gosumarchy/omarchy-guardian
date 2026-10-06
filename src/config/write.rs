@@ -10,7 +10,7 @@ use crate::config::model::{Named, SourceClass};
 
 /// The file text for `config`, after a comment `header` (each line of which
 /// should start with `#`).
-pub fn render(config: &PartialConfig, header: &str) -> String {
+pub(crate) fn render(config: &PartialConfig, header: &str) -> String {
     let mut text = String::from(header);
     let line = |text: &mut String, key: &str, value: &str| {
         // Formatting into a String cannot fail.

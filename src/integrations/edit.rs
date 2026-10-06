@@ -29,7 +29,7 @@ const WAYBAR_SELECTOR: &str = "#image.omarchy-guardian";
 
 impl Paths {
     /// Applies one file-editing step.
-    pub fn edit(&self, step: &Step) -> Result<(), String> {
+    pub(crate) fn edit(&self, step: &Step) -> Result<(), String> {
         match step {
             Step::RemoveInterceptor => {
                 let text = fs::read_to_string(&self.bashrc).map_err(|error| error.to_string())?;

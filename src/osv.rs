@@ -26,24 +26,24 @@ const LIMITS: Limits = Limits {
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Advisory {
-    pub id: String,
-    pub package: String,
-    pub version: String,
-    pub lockfile: String,
+pub(crate) struct Advisory {
+    pub(crate) id: String,
+    pub(crate) package: String,
+    pub(crate) version: String,
+    pub(crate) lockfile: String,
     /// `None` when OSV did not provide a severity or details were unavailable.
-    pub severity: Option<Severity>,
-    pub summary: Option<String>,
+    pub(crate) severity: Option<Severity>,
+    pub(crate) summary: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Audit {
-    pub advisories: Vec<Advisory>,
+pub(crate) struct Audit {
+    pub(crate) advisories: Vec<Advisory>,
     /// OSV had more advisories for some package than one response lists.
-    pub truncated: bool,
+    pub(crate) truncated: bool,
 }
 
-pub fn audit(packages: &[Dependency]) -> Result<Audit, Error> {
+pub(crate) fn audit(packages: &[Dependency]) -> Result<Audit, Error> {
     if packages.len() > MAX_PACKAGES {
         return Err(Error::Refused(format!(
             "dependency inventory exceeds the {MAX_PACKAGES}-package audit limit"
@@ -194,7 +194,7 @@ fn advisory_summary(record: &Json) -> Option<String> {
     (!line.is_empty()).then_some(line)
 }
 
-pub fn curl_args() -> Vec<OsString> {
+pub(crate) fn curl_args() -> Vec<OsString> {
     [
         "--disable",
         "--fail",

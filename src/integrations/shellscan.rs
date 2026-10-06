@@ -8,7 +8,7 @@
 
 /// What the interceptor defines. Unset, redefined or aliased after it is
 /// loaded, the command goes straight to Omarchy again.
-pub const INTERCEPTED: [&str; 6] = [
+const INTERCEPTED: [&str; 6] = [
     "omarchy",
     "omarchy-theme-install",
     "omarchy-theme-update",
@@ -18,7 +18,7 @@ pub const INTERCEPTED: [&str; 6] = [
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Loads {
+pub(super) enum Loads {
     /// Nothing in the file names the interceptor.
     Missing,
     Effective,
@@ -233,7 +233,7 @@ fn code_lines(text: &str) -> impl Iterator<Item = &str> {
 /// Whether `source_line`, the exact line Guardian writes, is in `text` (a
 /// `~/.bashrc`) where it runs, with nothing after it that takes the
 /// interceptor's functions away again. `path` is the interceptor's own.
-pub fn interceptor(text: &str, source_line: &str, path: &str) -> Loads {
+pub(super) fn interceptor(text: &str, source_line: &str, path: &str) -> Loads {
     let mut depth = 0_usize;
     let mut document: Option<String> = None;
     let mut continued = false;
@@ -329,7 +329,7 @@ pub fn interceptor(text: &str, source_line: &str, path: &str) -> Loads {
 /// (Guardian's own shim): the helper then builds with whatever that names,
 /// whatever its saved configuration says. `--makepkg` on another command
 /// of the file is not an override of this helper.
-pub fn overrides_makepkg(text: &str, helper: &str, gate: &str) -> bool {
+pub(super) fn overrides_makepkg(text: &str, helper: &str, gate: &str) -> bool {
     let lines: Vec<&str> = code_lines(text).collect();
     lines.iter().enumerate().any(|(index, line)| {
         if defines_alias(line, helper) {

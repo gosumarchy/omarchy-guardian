@@ -18,14 +18,14 @@ use crate::time::SECONDS_PER_DAY;
 /// random, everything else in the request is what was judged.
 const KEY_NONCE: &str = "cache-key";
 
-pub struct Cached {
-    pub review: AgentReview,
+pub(super) struct Cached {
+    pub(super) review: AgentReview,
     /// The `AgentSettings::label` of the run that produced it.
-    pub model: String,
-    pub age_days: u64,
+    pub(super) model: String,
+    pub(super) age_days: u64,
 }
 
-pub fn key(settings: &AgentSettings, class: SourceClass, request: &Request) -> String {
+pub(super) fn key(settings: &AgentSettings, class: SourceClass, request: &Request) -> String {
     let mut hasher = Sha256::new();
     let header = format!(
         "omarchy-guardian-verdict\0{PROMPT_VERSION}\0{}\0{}\0{}\0{}\0",
@@ -48,7 +48,7 @@ pub fn key(settings: &AgentSettings, class: SourceClass, request: &Request) -> S
 /// A digest of the two prompts outside the request and of `fixed`, the
 /// request wording of a class (`Request::fixed_text`), for what a baseline
 /// is bound to.
-pub fn prompt_digest(fixed: &str) -> String {
+pub(super) fn prompt_digest(fixed: &str) -> String {
     let mut hasher = Sha256::new();
     for prompt in agent::FIXED_PROMPTS {
         hasher.update(prompt.as_bytes());
@@ -61,7 +61,7 @@ pub fn prompt_digest(fixed: &str) -> String {
 /// The cached verdict for `key` if it is younger than `max_age_secs`.
 /// Entries that are expired, unreadable, dated in the future or stored under
 /// another key are deleted.
-pub fn lookup(
+pub(super) fn lookup(
     store: &Store,
     key: &str,
     now: u64,
@@ -101,7 +101,7 @@ fn decode(bytes: &[u8], key: &str, now: u64, max_age_secs: u64) -> Option<Cached
 
 /// Caches a live verdict. Inconclusive verdicts are not cached: they block,
 /// and a later run may well conclude.
-pub fn save(
+pub(super) fn save(
     store: &Store,
     key: &str,
     review: &AgentReview,
@@ -121,7 +121,7 @@ pub fn save(
 }
 
 /// Deletes every verdict that is expired or unreadable.
-pub fn expire(store: &Store, now: u64, max_age_secs: u64) -> Result<(), Error> {
+pub(super) fn expire(store: &Store, now: u64, max_age_secs: u64) -> Result<(), Error> {
     for name in store.list(VERDICTS)? {
         let fresh = store
             .read(VERDICTS, &name)?

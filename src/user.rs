@@ -6,12 +6,12 @@ use std::fs;
 const STATUS: &str = "/proc/self/status";
 
 /// The real uid of this process.
-pub fn real_uid() -> Option<u32> {
+pub(crate) fn real_uid() -> Option<u32> {
     uid_in(&fs::read_to_string(STATUS).ok()?, REAL)
 }
 
 /// The effective user id, from `/proc/self/status` (`Uid: real effective saved fs`).
-pub fn effective_uid() -> Result<u32, String> {
+pub(crate) fn effective_uid() -> Result<u32, String> {
     let status = fs::read_to_string(STATUS).map_err(|error| format!("{STATUS}: {error}"))?;
     uid_in(&status, EFFECTIVE).ok_or_else(|| "cannot read the effective user id".to_string())
 }
@@ -33,7 +33,7 @@ fn uid_in(status: &str, field: usize) -> Option<u32> {
 /// Whether a file owned by `owner` belongs to someone other than root or
 /// the user `uid`. In a user namespace that does not map root, root's
 /// files show the overflow owner, which is then not foreign either.
-pub fn is_foreign_owner(owner: u32, uid: Option<u32>) -> bool {
+pub(crate) fn is_foreign_owner(owner: u32, uid: Option<u32>) -> bool {
     owner != 0 && Some(owner) != uid && !(owner == overflow_uid() && root_unmapped())
 }
 
@@ -48,7 +48,7 @@ fn overflow_uid() -> u32 {
 /// Whether this process runs in a user namespace that does not map root
 /// (a sandbox, as in the end-to-end tests), where root's directories show
 /// the overflow owner. The real pacman hook never runs in one.
-pub fn root_unmapped() -> bool {
+pub(crate) fn root_unmapped() -> bool {
     fs::read_to_string("/proc/self/uid_map").is_ok_and(|map| root_unmapped_in(&map))
 }
 

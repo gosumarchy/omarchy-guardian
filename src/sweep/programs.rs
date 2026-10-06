@@ -10,7 +10,7 @@
 /// what they start (`commands::is_shell_script`): the others below are
 /// written in a syntax of their own. They are matched by their exact name,
 /// as a `#!` line and a `busybox` applet give it.
-pub const SCRIPT_SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "ksh", "ash", "mksh"];
+pub(super) const SCRIPT_SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "ksh", "ash", "mksh"];
 
 /// Shells with a syntax of their own that make no network connections
 /// themselves.
@@ -70,7 +70,7 @@ const SERVERS_AND_TUNNELS: &[&str] = &[
 
 /// Whether file name `name` is `program`, or a version of it
 /// (`python3.14`, `lua5.4`).
-pub fn is_named(name: &str, program: &str) -> bool {
+pub(super) fn is_named(name: &str, program: &str) -> bool {
     name.strip_prefix(program)
         .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit() || c == '.'))
 }
@@ -82,13 +82,13 @@ fn is_any(name: &str, lists: &[&[&str]]) -> bool {
 }
 
 /// Whether `name` (a program's file name) is one of `SCRIPT_SHELLS`.
-pub fn is_script_shell(name: &str) -> bool {
+pub(super) fn is_script_shell(name: &str) -> bool {
     SCRIPT_SHELLS.contains(&name)
 }
 
 /// Whether `name` is a shell of any kind, or a version of one: what is
 /// typed into it passes through its memory.
-pub fn is_shell(name: &str) -> bool {
+pub(super) fn is_shell(name: &str) -> bool {
     is_any(name, &[SCRIPT_SHELLS, OTHER_SHELLS, NETWORK_SHELLS])
 }
 
@@ -96,7 +96,7 @@ pub fn is_shell(name: &str) -> bool {
 /// held on any descriptor is a finding. One with a client built in holds
 /// connections in ordinary use, and is reported like any interpreter, when
 /// the connection is its input or output.
-pub fn is_shell_without_client(name: &str) -> bool {
+pub(super) fn is_shell_without_client(name: &str) -> bool {
     is_any(name, &[SCRIPT_SHELLS, OTHER_SHELLS])
 }
 
@@ -111,14 +111,14 @@ fn is_loader(name: &str) -> bool {
 /// first path among a netcat's or `openssl`'s arguments is an address, a
 /// socket or a key, and `busybox` is followed as the applet it is asked to
 /// be.
-pub fn runs_a_script(name: &str) -> bool {
+pub(super) fn runs_a_script(name: &str) -> bool {
     is_shell(name) || is_any(name, &[LANGUAGES])
 }
 
 /// Whether the program at `path` runs what it is given, so that who it is
 /// says nothing about what it runs: a shell, a language, the loader, a
 /// netcat, a multi-call program or `openssl`.
-pub fn is_interpreter(path: &str) -> bool {
+pub(super) fn is_interpreter(path: &str) -> bool {
     let name = crate::paths::file_name(path);
     is_loader(name)
         || runs_a_script(name)
@@ -127,7 +127,7 @@ pub fn is_interpreter(path: &str) -> bool {
 
 /// Whether `name` is exactly a packaged tool that runs or forwards what it
 /// is told over the network.
-pub fn is_relay(name: &str) -> bool {
+pub(super) fn is_relay(name: &str) -> bool {
     [NETCATS, MULTI_CALL, SERVERS_AND_TUNNELS]
         .iter()
         .any(|list| list.contains(&name))
@@ -137,7 +137,7 @@ pub fn is_relay(name: &str) -> bool {
 /// interpreters, the ones that are given no script (`ncat -e
 /// /usr/bin/bash` names a program to run, not a file to read). Narrower
 /// than `is_relay`: `busybox sh x.sh` does run a script.
-pub fn is_netcat(name: &str) -> bool {
+pub(super) fn is_netcat(name: &str) -> bool {
     NETCATS.contains(&name)
 }
 
@@ -204,7 +204,7 @@ fn value_options_of(name: &str) -> &'static [&'static str] {
 /// Whether `option` gives the program called `name` its code on the
 /// command line, so that no script follows (`perl -e code`, `php -r
 /// code`). For a shell `-e` is a plain flag (`bash -e script`).
-pub fn takes_code(name: &str, option: &str) -> bool {
+pub(super) fn takes_code(name: &str, option: &str) -> bool {
     let is = |programs: &[&str]| programs.iter().any(|program| is_named(name, program));
     if is_shell(name) {
         false
@@ -223,7 +223,7 @@ pub fn takes_code(name: &str, option: &str) -> bool {
 
 /// What one argument of an interpreter is, on the way to its script.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Argument {
+pub(super) enum Argument {
     /// An option: not the script.
     Option,
     /// The script, or the value of the option before it: the script may
@@ -236,7 +236,7 @@ pub enum Argument {
 /// Reads the arguments of an interpreter (or the loader) one by one, up
 /// to its script.
 #[derive(Debug)]
-pub struct ScriptArguments {
+pub(super) struct ScriptArguments {
     may_be_value: bool,
     value_options: &'static [&'static str],
 }
@@ -255,7 +255,7 @@ impl Default for ScriptArguments {
 impl ScriptArguments {
     /// For a command line that starts the program called `name`: only its
     /// own options take a value.
-    pub fn of(name: &str) -> Self {
+    pub(super) fn of(name: &str) -> Self {
         Self {
             may_be_value: false,
             value_options: value_options_of(name),
@@ -263,7 +263,7 @@ impl ScriptArguments {
     }
 
     /// What `argument`, the next one, is.
-    pub fn read(&mut self, argument: &str) -> Argument {
+    pub(super) fn read(&mut self, argument: &str) -> Argument {
         if argument.starts_with('-') {
             self.may_be_value = self.value_options.contains(&argument);
             Argument::Option
@@ -281,7 +281,7 @@ impl ScriptArguments {
 /// given on the command line (`python3 -c …`) comes out as one, and is
 /// dropped where it names no file; `bash -e x.sh`, where `-e` is a plain
 /// flag, keeps its script.
-pub fn script_arguments(arguments: &[String]) -> Vec<&str> {
+pub(super) fn script_arguments(arguments: &[String]) -> Vec<&str> {
     let mut candidates = Vec::new();
     let mut reader = ScriptArguments::default();
     for argument in arguments.iter().skip(1).map(String::as_str) {

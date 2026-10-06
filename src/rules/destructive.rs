@@ -156,7 +156,7 @@ pub(super) fn formats_filesystem(line: &str) -> bool {
 
 /// Recursive `rm` of `/`, `/*`, `~` or `$HOME` itself. Removing paths below
 /// them (`rm -rf /tmp/build`, `rm -rf "$pkgdir"`) is ordinary build hygiene.
-pub fn removes_root_or_home(line: &str) -> bool {
+pub(super) fn removes_root_or_home(line: &str) -> bool {
     let tokens: Vec<&str> = line.split_whitespace().collect();
 
     tokens.iter().enumerate().any(|(index, token)| {

@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
-pub enum Error {
+pub(crate) enum Error {
     /// A filesystem operation on `path` failed.
     Io { path: PathBuf, source: io::Error },
     /// An external tool could not be started.
@@ -21,7 +21,7 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn parse(what: impl Into<String>, detail: impl fmt::Display) -> Self {
+    pub(crate) fn parse(what: impl Into<String>, detail: impl fmt::Display) -> Self {
         Self::Parse {
             what: what.into(),
             detail: detail.to_string(),
@@ -57,7 +57,7 @@ impl std::error::Error for Error {
 }
 
 /// Attaches the path an I/O operation was acting on.
-pub trait IoContext<T> {
+pub(crate) trait IoContext<T> {
     fn at(self, path: &Path) -> Result<T, Error>;
 }
 

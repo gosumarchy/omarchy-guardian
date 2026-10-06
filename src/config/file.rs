@@ -11,19 +11,19 @@ use crate::config::model::{
 };
 use crate::tomlish::{self, Entry, Value};
 
-pub const TIMEOUT_RANGE: RangeInclusive<u32> = 10..=900;
-pub const INPUT_KIB_RANGE: RangeInclusive<u32> = 16..=1024;
-pub const CHUNKS_RANGE: RangeInclusive<u32> = 1..=64;
-pub const CACHE_DAYS_RANGE: RangeInclusive<u32> = 0..=365;
-pub const STORE_MIB_RANGE: RangeInclusive<u32> = 16..=4096;
+pub(crate) const TIMEOUT_RANGE: RangeInclusive<u32> = 10..=900;
+pub(crate) const INPUT_KIB_RANGE: RangeInclusive<u32> = 16..=1024;
+pub(crate) const CHUNKS_RANGE: RangeInclusive<u32> = 1..=64;
+pub(crate) const CACHE_DAYS_RANGE: RangeInclusive<u32> = 0..=365;
+pub(crate) const STORE_MIB_RANGE: RangeInclusive<u32> = 16..=4096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConfigError {
-    pub file: PathBuf,
-    pub line: usize,
+pub(crate) struct ConfigError {
+    file: PathBuf,
+    line: usize,
     /// Dotted key path; empty for syntax errors.
-    pub key: String,
-    pub message: String,
+    key: String,
+    pub(crate) message: String,
 }
 
 impl fmt::Display for ConfigError {
@@ -39,62 +39,62 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PartialPolicy {
-    pub ai: Option<AiRequirement>,
-    pub on_findings: Option<Action>,
-    pub on_ai_suspicious: Option<Action>,
-    pub thinking: Option<Thinking>,
-    pub model: Option<String>,
-    pub timeout_secs: Option<u32>,
-    pub confirm: Option<bool>,
-    pub cache: Option<Toggle>,
-    pub diff: Option<Toggle>,
+pub(crate) struct PartialPolicy {
+    pub(crate) ai: Option<AiRequirement>,
+    pub(crate) on_findings: Option<Action>,
+    pub(crate) on_ai_suspicious: Option<Action>,
+    pub(crate) thinking: Option<Thinking>,
+    pub(crate) model: Option<String>,
+    pub(crate) timeout_secs: Option<u32>,
+    pub(crate) confirm: Option<bool>,
+    pub(crate) cache: Option<Toggle>,
+    pub(crate) diff: Option<Toggle>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct AgentDefaults {
-    pub model: Option<String>,
-    pub max_input_kib: Option<u32>,
-    pub max_chunks: Option<u32>,
-    pub cache_days: Option<u32>,
-    pub max_store_mib: Option<u32>,
+pub(crate) struct AgentDefaults {
+    pub(crate) model: Option<String>,
+    pub(crate) max_input_kib: Option<u32>,
+    pub(crate) max_chunks: Option<u32>,
+    pub(crate) cache_days: Option<u32>,
+    pub(crate) max_store_mib: Option<u32>,
     /// Portable thinking level to provider variant name.
-    pub variants: Vec<(Thinking, String)>,
+    pub(crate) variants: Vec<(Thinking, String)>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SweepSettings {
+pub(crate) struct SweepSettings {
     /// Whether the root collector may run.
-    pub root: Option<RootConsent>,
+    pub(crate) root: Option<RootConsent>,
     /// The group that may read what the scheduled root collector found.
-    pub group: Option<String>,
+    pub(crate) group: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PartialConfig {
-    pub profile: Option<Profile>,
-    pub official_repos: Option<Vec<String>>,
+pub(crate) struct PartialConfig {
+    pub(crate) profile: Option<Profile>,
+    pub(crate) official_repos: Option<Vec<String>>,
     /// Packages allowed to provide the reviewer binaries from outside the
     /// official repositories (system file only).
-    pub trusted_reviewer_packages: Option<Vec<String>>,
+    pub(crate) trusted_reviewer_packages: Option<Vec<String>>,
     /// The system sweep's root collector (system file only).
-    pub sweep: SweepSettings,
+    pub(crate) sweep: SweepSettings,
     /// Weaker-than-the-level settings of user-level classes the owner of
     /// this machine has accepted, as `class.knob=value` (system file only).
-    pub acknowledged_weaker: Option<Vec<String>>,
+    pub(crate) acknowledged_weaker: Option<Vec<String>>,
     /// Whether a blocked install can be permitted under the strict level
     /// (`[permit] strict = "allowed"`; system file only).
-    pub permit_strict: Option<bool>,
+    pub(crate) permit_strict: Option<bool>,
     /// Whether the scheduled sweep asks for a newer release of Guardian
     /// (`[update] check = "off"` in either file turns it off).
-    pub update_check: Option<bool>,
-    pub agent: AgentDefaults,
-    pub classes: Vec<(SourceClass, PartialPolicy)>,
+    pub(crate) update_check: Option<bool>,
+    pub(crate) agent: AgentDefaults,
+    pub(crate) classes: Vec<(SourceClass, PartialPolicy)>,
 }
 
 impl PartialConfig {
     /// The explicit values for one class (empty when the file has none).
-    pub fn class(&self, class: SourceClass) -> PartialPolicy {
+    pub(crate) fn class(&self, class: SourceClass) -> PartialPolicy {
         self.classes
             .iter()
             .find(|(candidate, _)| *candidate == class)
@@ -102,7 +102,7 @@ impl PartialConfig {
             .unwrap_or_default()
     }
 
-    pub fn class_mut(&mut self, class: SourceClass) -> &mut PartialPolicy {
+    pub(crate) fn class_mut(&mut self, class: SourceClass) -> &mut PartialPolicy {
         if let Some(index) = self
             .classes
             .iter()
@@ -119,7 +119,7 @@ impl PartialConfig {
 /// A model is spelled `provider/model`, both parts non-empty, of
 /// characters model names are made of. It becomes an argument of the
 /// reviewer's command, so it may not look like an option.
-pub fn is_model_name(text: &str) -> bool {
+pub(crate) fn is_model_name(text: &str) -> bool {
     // Each part by itself too: one reviewer is given the part after the
     // provider as an argument of its own.
     text.split_once('/')
@@ -129,7 +129,7 @@ pub fn is_model_name(text: &str) -> bool {
 
 /// Whether `text` is safe as one argument of the reviewer's command: no
 /// leading `-`, and only letters, digits and `._:/@-[]+=~`.
-pub fn is_plain_argument(text: &str) -> bool {
+fn is_plain_argument(text: &str) -> bool {
     !text.is_empty()
         && !text.starts_with('-')
         && text
@@ -137,7 +137,7 @@ pub fn is_plain_argument(text: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "._:/@-[]+=~".contains(c))
 }
 
-pub fn parse(file: &Path, text: &str) -> Result<PartialConfig, ConfigError> {
+pub(crate) fn parse(file: &Path, text: &str) -> Result<PartialConfig, ConfigError> {
     let entries = tomlish::entries(text).map_err(|error| ConfigError {
         file: file.to_path_buf(),
         line: error.line(),
@@ -174,7 +174,7 @@ pub fn parse(file: &Path, text: &str) -> Result<PartialConfig, ConfigError> {
 }
 
 /// A Linux group name as `groupadd` accepts it.
-pub fn is_group_name(name: &str) -> bool {
+pub(crate) fn is_group_name(name: &str) -> bool {
     let mut characters = name.chars();
     name.len() <= 32
         && characters
@@ -187,7 +187,7 @@ pub fn is_group_name(name: &str) -> bool {
 
 /// Whether `key` names one accepted weaker setting: `class.knob=value`, of
 /// a user-level class, with a value that knob can have.
-pub fn is_weaker_key(key: &str) -> bool {
+fn is_weaker_key(key: &str) -> bool {
     let Some((name, value)) = key.split_once('=') else {
         return false;
     };

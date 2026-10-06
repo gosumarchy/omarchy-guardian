@@ -20,7 +20,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use self::archives::{local_archives, missing_targets, sync_archives};
-pub use self::argv::{Transaction, is_valid_package_name, parse_transaction};
+pub(crate) use self::argv::is_valid_package_name;
+use self::argv::{Transaction, parse_transaction};
 use self::argv::{pacman_argv, read_targets};
 use self::links::{InstalledLinks, installed_links, local_database, unknown_entries};
 use crate::audit::Gate;
@@ -42,7 +43,7 @@ use crate::tools::{self, Limits, OpenCode, Reviewer};
 #[cfg(test)]
 use self::archives::{Archives, check_private, sync_filenames, sync_versions};
 #[cfg(test)]
-pub use self::archives::{parse_filenames, parse_sync_info};
+use self::archives::{parse_filenames, parse_sync_info};
 #[cfg(test)]
 use self::argv::split_cmdline;
 #[cfg(test)]
@@ -62,22 +63,22 @@ const PRIVILEGED: [SourceClass; 3] = [
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HookArgs {
-    pub pacman_pid: u32,
-    pub cwd: PathBuf,
+pub(crate) struct HookArgs {
+    pub(crate) pacman_pid: u32,
+    pub(crate) cwd: PathBuf,
     /// `SystemOnly` in production. The hook script passes `UserPath` only on
     /// its non-root branch, which pacman never takes; tests use it.
-    pub opencode: OpenCode,
+    pub(crate) opencode: OpenCode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Operation {
+enum Operation {
     Sync,
     LocalUpgrade,
 }
 
 /// The pacman classes whose policy requires an AI review.
-pub fn classes_requiring_ai(settings: &Settings) -> Vec<SourceClass> {
+pub(crate) fn classes_requiring_ai(settings: &Settings) -> Vec<SourceClass> {
     PRIVILEGED
         .iter()
         .copied()
@@ -87,7 +88,7 @@ pub fn classes_requiring_ai(settings: &Settings) -> Vec<SourceClass> {
 
 /// Whether every pacman class that requires the AI review has a root-owned
 /// binary of the reviewer CLI its model selects.
-pub fn system_reviewer_ready(settings: &Settings) -> bool {
+pub(crate) fn system_reviewer_ready(settings: &Settings) -> bool {
     classes_requiring_ai(settings).iter().all(|class| {
         let reviewer = Reviewer::for_model(settings.agent_settings(*class).model.as_deref());
         OpenCode::SystemOnly.resolve_reviewer(reviewer).is_ok()
@@ -96,7 +97,7 @@ pub fn system_reviewer_ready(settings: &Settings) -> bool {
 
 /// Whether the pacman classes that require the AI review use OpenCode, so a
 /// missing reviewer is fixed by installing `extra/opencode`.
-pub fn system_reviewer_is_opencode(settings: &Settings) -> bool {
+pub(crate) fn system_reviewer_is_opencode(settings: &Settings) -> bool {
     classes_requiring_ai(settings).iter().all(|class| {
         Reviewer::for_model(settings.agent_settings(*class).model.as_deref()) == Reviewer::OpenCode
     })
@@ -106,7 +107,7 @@ pub fn system_reviewer_is_opencode(settings: &Settings) -> bool {
 /// Without a root-owned OpenCode, every transaction with a target whose
 /// class requires the AI review is refused; this says so before the hook
 /// is turned on rather than on the next install.
-pub fn preflight(settings: &Settings, opencode_ready: bool) -> Result<(), String> {
+pub(crate) fn preflight(settings: &Settings, opencode_ready: bool) -> Result<(), String> {
     if let Some(reason) = settings.privileged_block() {
         return Err(reason.to_string());
     }
@@ -126,7 +127,7 @@ pub fn preflight(settings: &Settings, opencode_ready: bool) -> Result<(), String
     ))
 }
 
-pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report, Error> {
+pub(crate) fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report, Error> {
     if let Some(reason) = settings.privileged_block() {
         return Err(Error::Refused(reason.to_string()));
     }
@@ -263,7 +264,7 @@ fn system_links(shipped: &Shipped<'_>, report: &mut Report) -> InstalledLinks {
 }
 
 /// The classes of the archives `report` reviewed, joined by `+`.
-pub fn reviewed_classes(report: &Report) -> String {
+pub(crate) fn reviewed_classes(report: &Report) -> String {
     let mut classes: Vec<&str> = report
         .archives
         .iter()
@@ -275,7 +276,7 @@ pub fn reviewed_classes(report: &Report) -> String {
 }
 
 /// The archives `report` reviewed, by name.
-pub fn reviewed_names(report: &Report) -> String {
+pub(crate) fn reviewed_names(report: &Report) -> String {
     let names: Vec<&str> = report
         .archives
         .iter()
@@ -285,7 +286,7 @@ pub fn reviewed_names(report: &Report) -> String {
 }
 
 /// The archives `report` reviewed, each with its SHA-256.
-pub fn reviewed_digests(report: &Report) -> String {
+pub(crate) fn reviewed_digests(report: &Report) -> String {
     let digests: Vec<String> = report
         .archives
         .iter()
@@ -298,7 +299,7 @@ pub fn reviewed_digests(report: &Report) -> String {
 /// by its class and the SHA-256 of its bytes. `None` when no archive was
 /// read; a transaction with one that was refused has a gap no permit
 /// overrules (see `Gap::content_hashed`).
-pub fn reviewed_content(report: &Report) -> Option<permit::Content> {
+pub(crate) fn reviewed_content(report: &Report) -> Option<permit::Content> {
     permit::Content::new(
         Gate::Pacman,
         &reviewed_classes(report),

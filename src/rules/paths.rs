@@ -106,7 +106,7 @@ const PROSE_NAMES: &[&str] = &[
 /// Prose files are sent to the AI review but not matched by the local
 /// command rules, where install instructions (`sudo pacman -S ...`) and
 /// examples would otherwise block every project with a README.
-pub fn is_documentation(rel: &str) -> bool {
+pub(crate) fn is_documentation(rel: &str) -> bool {
     let path = Path::new(rel);
     let name = path
         .file_name()
@@ -145,7 +145,7 @@ pub fn is_documentation(rel: &str) -> bool {
 }
 
 /// Files whose URLs are likely to be requested when the software runs.
-pub fn is_executable_or_runtime_config(rel: &str) -> bool {
+pub(crate) fn is_executable_or_runtime_config(rel: &str) -> bool {
     let path = Path::new(rel);
     let name = path
         .file_name()
@@ -224,7 +224,7 @@ pub fn is_executable_or_runtime_config(rel: &str) -> bool {
 /// Whether a relative path looks like it holds credentials. The check uses
 /// the path inside the reviewed tree, so where the tree itself lives (for
 /// example under `~/secrets/`) does not matter.
-pub fn is_sensitive_path(rel: &str) -> bool {
+pub(crate) fn is_sensitive_path(rel: &str) -> bool {
     let lower = rel.to_lowercase();
     let name = file_name(&lower);
 

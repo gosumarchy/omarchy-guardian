@@ -75,7 +75,7 @@ const PRIVILEGE_ESCALATION: &[&str] = &[
     "chown root",
 ];
 
-pub fn is_download_piped_to_shell(line: &str) -> bool {
+pub(super) fn is_download_piped_to_shell(line: &str) -> bool {
     is_fetch_piped_to_shell(line) || fetch::matches(line)
 }
 
@@ -98,7 +98,7 @@ fn is_fetch_piped_to_shell(line: &str) -> bool {
 
 /// Whether the command on `line` goes on in `next`: a trailing backslash,
 /// pipe or `&&`, or a pipe opening the next line.
-pub fn continues(line: &str, next: &str) -> bool {
+pub(crate) fn continues(line: &str, next: &str) -> bool {
     let line = line.trim_end();
     line.ends_with('\\')
         || line.ends_with('|')
@@ -211,7 +211,7 @@ pub(super) fn is_encoded_command_execution(line: &str) -> bool {
         || encoded::matches(line)
 }
 
-pub fn is_encoded_data_executed(line: &str) -> bool {
+pub(super) fn is_encoded_data_executed(line: &str) -> bool {
     let decodes_data =
         line.contains("base64.b64decode(") || line.contains("[convert]::frombase64string");
     let executes_data = ["exec(", "eval(", "os.system(", "invoke-expression", "iex "]
@@ -239,7 +239,7 @@ const SANDBOX_HELPERS: &[&str] = &[
 ];
 
 /// Whether `path` names one of those helpers.
-pub fn is_sandbox_helper(path: &str) -> bool {
+pub(crate) fn is_sandbox_helper(path: &str) -> bool {
     SANDBOX_HELPERS.contains(&file_name(path))
 }
 
@@ -283,7 +283,7 @@ pub(super) fn references_credential(line: &str) -> bool {
         || (exfil::mentions_credential(line) && exfil::takes_credential(line))
 }
 
-pub fn looks_like_credential_exfiltration(line: &str) -> bool {
+pub(super) fn looks_like_credential_exfiltration(line: &str) -> bool {
     if exfil::sends_secret(line) {
         return true;
     }

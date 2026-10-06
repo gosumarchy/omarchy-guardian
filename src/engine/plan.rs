@@ -32,16 +32,16 @@ const WHOLE_SHARE: usize = 2;
 const NAMED_SHARE: usize = 2;
 
 /// Bytes charged for each manifest entry on top of its path.
-pub const MANIFEST_ENTRY_OVERHEAD: usize = 32;
+const MANIFEST_ENTRY_OVERHEAD: usize = 32;
 
 /// A cut line piece must hold at least one character of any width.
 const MIN_PIECE: usize = 4;
 
 /// The approved version of each file, by path, when the target is an upgrade.
-pub type Previous = BTreeMap<String, String>;
+pub(super) type Previous = BTreeMap<String, String>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Item {
+pub(super) enum Item {
     Whole {
         path: String,
         content: String,
@@ -64,7 +64,7 @@ pub enum Item {
 }
 
 impl Item {
-    pub fn path(&self) -> &str {
+    pub(super) fn path(&self) -> &str {
         match self {
             Self::Whole { path, .. } | Self::Piece { path, .. } | Self::Diff { path, .. } => path,
         }
@@ -99,7 +99,7 @@ const fn char_weight(character: char) -> usize {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Sent {
+pub(super) enum Sent {
     Whole,
     Diff,
     Unchanged,
@@ -113,7 +113,7 @@ pub enum Sent {
 }
 
 impl Sent {
-    pub const fn name(self) -> &'static str {
+    pub(super) const fn name(self) -> &'static str {
         match self {
             Self::Whole => "whole",
             Self::Diff => "diff",
@@ -127,27 +127,27 @@ impl Sent {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ManifestEntry {
-    pub path: String,
-    pub bytes: usize,
-    pub sent: Sent,
+pub(super) struct ManifestEntry {
+    pub(super) path: String,
+    pub(super) bytes: usize,
+    pub(super) sent: Sent,
     /// The detected format of hash-only files.
-    pub format: Option<String>,
+    pub(super) format: Option<String>,
     /// How many files a grouped entry stands for.
-    pub files: Option<usize>,
+    pub(super) files: Option<usize>,
 }
 
 /// A file the review hashed but did not read: named to the AI with its
 /// format, so a supplied file that runs, loads or unpacks it is judged.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HashOnly {
-    pub path: String,
-    pub bytes: u64,
-    pub label: &'static str,
+pub(crate) struct HashOnly {
+    pub(crate) path: String,
+    pub(crate) bytes: u64,
+    pub(crate) label: &'static str,
     /// Images, audio, video and fonts: grouped per directory.
-    pub media: bool,
+    pub(crate) media: bool,
     /// A skipped generated directory, with the entries it holds.
-    pub skipped_files: Option<usize>,
+    pub(crate) skipped_files: Option<usize>,
 }
 
 /// The most hash-only manifest rows; the rest are counted in one row.
@@ -156,7 +156,7 @@ const MAX_HASH_ONLY_ROWS: usize = 64;
 /// Manifest rows for hash-only files: one per file, except media, which get
 /// one row per directory. Past the limit, the files a reviewed text names
 /// (`named`) come first.
-pub fn hash_only_entries(files: &[HashOnly], named: &HashSet<&str>) -> Vec<ManifestEntry> {
+fn hash_only_entries(files: &[HashOnly], named: &HashSet<&str>) -> Vec<ManifestEntry> {
     let mut entries: Vec<ManifestEntry> = Vec::new();
     let mut media: BTreeMap<String, (usize, usize, BTreeSet<&str>)> = BTreeMap::new();
     for file in files {
@@ -220,51 +220,51 @@ pub fn hash_only_entries(files: &[HashOnly], named: &HashSet<&str>) -> Vec<Manif
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Plan {
-    pub chunks: Vec<Vec<Item>>,
-    pub manifest: Vec<ManifestEntry>,
-    pub upgrade: bool,
+pub(super) struct Plan {
+    pub(super) chunks: Vec<Vec<Item>>,
+    pub(super) manifest: Vec<ManifestEntry>,
+    pub(super) upgrade: bool,
     /// On an upgrade, the unchanged files a new or changed file names that
     /// did not fit beside the changes and were not sent.
-    pub named_not_sent: Vec<String>,
+    pub(super) named_not_sent: Vec<String>,
 }
 
 /// The plan needs more than `max_chunks` requests, or the manifest and
 /// findings every request repeats leave too little room for source, or an
 /// entry point does not fit one request.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TooLarge {
+pub(super) struct TooLarge {
     /// An install or build entry point larger than one request: it runs as
     /// a whole, so it is not reviewed in pieces.
-    pub entry_point: Option<String>,
+    pub(super) entry_point: Option<String>,
 }
 
 impl TooLarge {
-    pub const INPUT: Self = Self { entry_point: None };
+    const INPUT: Self = Self { entry_point: None };
 }
 
 /// The most lines a piece repeats from the previous piece.
 const MAX_CONTEXT_LINES: usize = 200;
 
-pub struct PlanInput<'a> {
-    pub files: &'a [SourceFile],
+pub(super) struct PlanInput<'a> {
+    pub(super) files: &'a [SourceFile],
     /// Paths with a local finding: always sent whole and first.
-    pub flagged: &'a BTreeSet<String>,
+    pub(super) flagged: &'a BTreeSet<String>,
     /// Bytes the local-findings block adds to every request.
-    pub findings_bytes: usize,
-    pub previous: Option<&'a Previous>,
-    pub max_input_bytes: usize,
-    pub max_chunks: usize,
+    pub(super) findings_bytes: usize,
+    pub(super) previous: Option<&'a Previous>,
+    pub(super) max_input_bytes: usize,
+    pub(super) max_chunks: usize,
     /// The review's unit prefixes (`Unit::prefix`), so a unit-relative path
     /// like `good/install.sh` still ranks as top-level under `--unit`.
-    pub unit_prefixes: &'a [String],
+    pub(super) unit_prefixes: &'a [String],
     /// Files hashed but not read, listed in the manifest.
-    pub hash_only: &'a [HashOnly],
+    pub(super) hash_only: &'a [HashOnly],
 }
 
 /// 0: entry points that run at install, build or login time, and flagged
 /// files; 1: other code and runtime config; 2: everything else.
-pub fn tier(path: &str, content: &str, flagged: bool, unit_prefixes: &[String]) -> u8 {
+fn tier(path: &str, content: &str, flagged: bool, unit_prefixes: &[String]) -> u8 {
     if flagged || is_entry_point(path, content, unit_prefixes) {
         0
     } else if rules::is_executable_or_runtime_config(path) {
@@ -362,7 +362,7 @@ fn hash_only_rows(input: &PlanInput<'_>) -> Vec<ManifestEntry> {
     )
 }
 
-pub fn build(input: &PlanInput<'_>) -> Result<Plan, TooLarge> {
+pub(super) fn build(input: &PlanInput<'_>) -> Result<Plan, TooLarge> {
     // An upgrade shows more than the changes while that fits; where it
     // does not, the changes alone are still an upgrade review.
     build_with(input, true).or_else(|too_large| {
@@ -744,7 +744,7 @@ fn join_groups(group: &mut [usize], left: usize, right: usize) {
 /// chunk, the file it names, that file's chunk), chunks counted from 1:
 /// each chunk is judged without the other's content, so the report says
 /// where a split falls between a file and what it names.
-pub fn split_references(
+pub(super) fn split_references(
     chunks: &[Vec<Item>],
     files: &[SourceFile],
 ) -> Vec<(String, usize, String, usize)> {

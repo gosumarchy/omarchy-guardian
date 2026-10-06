@@ -9,7 +9,7 @@
 
 /// The directories git keeps in a git directory: no submodule is in one
 /// (those under `modules` are looked into by name).
-pub const OWN_DIRECTORIES: &[&str] = &[
+pub(crate) const OWN_DIRECTORIES: &[&str] = &[
     "objects",
     "refs",
     "hooks",
@@ -85,7 +85,7 @@ const EXECUTING_KEYS: &[&str] = &[
 
 /// Whether `rel` is a git config file the walk reviews: a `.git/config`, or a
 /// submodule's under `.git/modules/`.
-pub fn is_git_config(rel: &str) -> bool {
+pub(crate) fn is_git_config(rel: &str) -> bool {
     let mut components = rel.split('/').rev();
     matches!(components.next(), Some("config" | "config.worktree"))
         && rel.split('/').any(|component| component == ".git")
@@ -94,7 +94,7 @@ pub fn is_git_config(rel: &str) -> bool {
 /// `text` with the user and password of every `scheme://user:secret@host`
 /// taken out (`scheme://***@host`): a git configuration's remote addresses
 /// can carry tokens, and the rest of it is what a review needs to see.
-pub fn without_url_credentials(text: &str) -> String {
+pub(crate) fn without_url_credentials(text: &str) -> String {
     text.split_inclusive('\n')
         .map(|line| without_basic_credential(&without_line_credentials(line)))
         .collect()
@@ -172,7 +172,7 @@ fn without_line_credentials(line: &str) -> String {
 
 /// The lines of `text` that set a key running a command, as (line number,
 /// `key = value` with any URL credentials masked).
-pub fn executing_keys(text: &str) -> Vec<(usize, String)> {
+pub(crate) fn executing_keys(text: &str) -> Vec<(usize, String)> {
     // The sections a key may belong to. Usually one; after a header that
     // may itself be the tail of a continued value, also the ones before.
     let mut sections: Vec<(String, Option<String>)> = vec![(String::new(), None)];

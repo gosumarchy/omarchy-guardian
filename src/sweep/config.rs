@@ -218,7 +218,7 @@ fn handlers(line: &str, there: &dyn Fn(&str) -> bool) -> Option<String> {
 
 /// The alerts for the text of the file at `path`: what each rule saw, with
 /// its line. `there` says whether a file exists (`~` is the home).
-pub fn alerts(
+pub(super) fn alerts(
     category: Category,
     path: &str,
     text: &str,

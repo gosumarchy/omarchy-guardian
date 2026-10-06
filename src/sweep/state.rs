@@ -29,7 +29,7 @@ const MAX_REASON_CHARS: usize = 300;
 const MAX_RECORD_BYTES: u64 = 64 * 1024;
 
 /// The sweep's directory in the review store.
-pub fn directory(store_root: &Path) -> Result<PathBuf, String> {
+pub(super) fn directory(store_root: &Path) -> Result<PathBuf, String> {
     let uid = user::effective_uid()?;
     paths::private_dir(store_root, uid)?;
     let directory = store_root.join("sweep");
@@ -39,7 +39,7 @@ pub fn directory(store_root: &Path) -> Result<PathBuf, String> {
 
 /// An item's content hash as remembered: the file's SHA-256, or for a link
 /// its target, or `-` when it could not be read.
-pub fn fingerprint(item: &Item) -> String {
+pub(super) fn fingerprint(item: &Item) -> String {
     let content = match (&item.sha256, &item.body) {
         (Some(digest), _) => digest.to_string(),
         (None, super::collect::Body::Link(target)) => format!("link:{target}"),
@@ -58,14 +58,14 @@ pub fn fingerprint(item: &Item) -> String {
 }
 
 /// The mark on the remembered fingerprint of an item with a finding.
-pub const FLAGGED: &str = "+finding";
+pub(super) const FLAGGED: &str = "+finding";
 
 /// The fingerprint of an item that could not be read (and raised no
 /// alert): only this one carries over a previous fingerprint.
-pub const UNREAD: &str = "-";
+pub(super) const UNREAD: &str = "-";
 
 /// Label to fingerprint.
-pub type Remembered = BTreeMap<String, String>;
+pub(super) type Remembered = BTreeMap<String, String>;
 
 fn read(path: &Path) -> Remembered {
     let Some(json) = fs::read_to_string(path)
@@ -98,7 +98,7 @@ fn write_text(path: &Path, text: &str) -> Result<(), String> {
 /// never sees half of it. The file has exactly `mode`, whatever the umask
 /// of the process: the root collector runs with one that would close a
 /// list everyone is meant to read.
-pub fn write_text_mode(path: &Path, text: &str, mode: u32) -> Result<(), String> {
+pub(crate) fn write_text_mode(path: &Path, text: &str, mode: u32) -> Result<(), String> {
     let options = AtomicWrite {
         mode,
         exact_mode: true,
@@ -110,7 +110,7 @@ pub fn write_text_mode(path: &Path, text: &str, mode: u32) -> Result<(), String>
 
 /// The list an older Guardian kept in the user's own state directory. It
 /// counts for nothing now: whatever runs as the user can write it.
-pub fn old_allowed(directory: &Path) -> Remembered {
+pub(super) fn old_allowed(directory: &Path) -> Remembered {
     read(&directory.join(ALLOWED))
 }
 
@@ -119,14 +119,14 @@ pub fn old_allowed(directory: &Path) -> Remembered {
 /// kept under the user id they were allowed for, and every user reads it:
 /// it sits where everyone may, not beside root's results, whose directory
 /// only one group may enter.
-pub const SYSTEM_ALLOWED: &str = "/var/lib/omarchy-guardian/allowed.json";
+pub(super) const SYSTEM_ALLOWED: &str = "/var/lib/omarchy-guardian/allowed.json";
 
 /// Where Guardian up to 0.7.18 kept that list: in the directory of root's
 /// results. A user outside that directory's group could add to the list
 /// through sudo and never read it back, so nothing they allowed counted.
 /// Root moves it on its next write (`move_legacy_allowed`); until then a
 /// sweep that can still reach it reads it there.
-pub const LEGACY_SYSTEM_ALLOWED: &str = "/var/lib/omarchy-guardian/sweep/allowed.json";
+pub(super) const LEGACY_SYSTEM_ALLOWED: &str = "/var/lib/omarchy-guardian/sweep/allowed.json";
 
 /// The most the system list may hold; one that grew past it would read as
 /// empty.
@@ -135,7 +135,7 @@ const MAX_SYSTEM_LIST_BYTES: u64 = MAX_RECORD_BYTES * 16;
 /// How `label` is kept in the system list for user `uid`: a home's label
 /// (`~/.bashrc`) with the user id before it (`1000:~/.bashrc`), so that
 /// what one user allowed in their home says nothing about another's.
-pub fn system_key(label: &str, uid: u32) -> String {
+pub(super) fn system_key(label: &str, uid: u32) -> String {
     if is_home_label(label) {
         format!("{uid}:{label}")
     } else {
@@ -145,7 +145,7 @@ pub fn system_key(label: &str, uid: u32) -> String {
 
 /// What of the system list `system` counts for user `uid`, by the labels
 /// the sweep shows: the system's items, and that user's own home items.
-pub fn allowed_for(system: &Remembered, uid: u32) -> Remembered {
+fn allowed_for(system: &Remembered, uid: u32) -> Remembered {
     system
         .iter()
         .filter_map(|(key, fingerprint)| {
@@ -161,7 +161,7 @@ pub fn allowed_for(system: &Remembered, uid: u32) -> Remembered {
 }
 
 /// Why `item` cannot be allowed as it is, if it cannot.
-pub fn not_allowable(item: &Item) -> Option<&'static str> {
+pub(super) fn not_allowable(item: &Item) -> Option<&'static str> {
     if item
         .alerts
         .iter()
@@ -182,18 +182,18 @@ pub fn not_allowable(item: &Item) -> Option<&'static str> {
 }
 
 /// Whether a label names something in the user's own home.
-pub fn is_home_label(label: &str) -> bool {
+pub(super) fn is_home_label(label: &str) -> bool {
     label.starts_with("~/")
 }
 
 /// The directory above everything Guardian's root halves write.
-pub const ROOT_STATE_ANCHOR: &str = "/var/lib";
+pub(crate) const ROOT_STATE_ANCHOR: &str = "/var/lib";
 
 /// Whether the file at `path` is `owner`'s alone to write: a regular file
 /// of at most `max_bytes`, which, like every directory above it up to
 /// `anchor`, is owned by `owner` and not writable by a group or by
 /// everyone. For root's state, `owner` is 0 and `anchor` is `/var/lib`.
-pub fn owned_alone(path: &Path, owner: u32, anchor: &Path, max_bytes: u64) -> bool {
+pub(crate) fn owned_alone(path: &Path, owner: u32, anchor: &Path, max_bytes: u64) -> bool {
     let alone = |path: &Path| {
         fs::symlink_metadata(path)
             .is_ok_and(|metadata| metadata.uid() == owner && metadata.mode() & 0o022 == 0)
@@ -215,7 +215,7 @@ pub fn owned_alone(path: &Path, owner: u32, anchor: &Path, max_bytes: u64) -> bo
 
 /// The system list at `path`, while it and the directories above it up to
 /// `/var/lib` are root's and nobody else may write them; empty otherwise.
-pub fn system_allowed(path: &Path) -> Remembered {
+pub(super) fn system_allowed(path: &Path) -> Remembered {
     roots().list(path)
 }
 
@@ -272,12 +272,12 @@ impl Keeper<'_> {
 /// What counts as allowed for user `uid`: only what the system list at
 /// `system` holds, which only root writes. Where root has not written that
 /// one yet, the list an older Guardian left at `legacy` stands in.
-pub fn all_allowed(system: &Path, legacy: &Path, uid: u32) -> Remembered {
+fn all_allowed(system: &Path, legacy: &Path, uid: u32) -> Remembered {
     allowed_for(&roots().current(system, legacy), uid)
 }
 
 /// `all_allowed` of this system's list.
-pub fn allowed_here(uid: u32) -> Remembered {
+pub(super) fn allowed_here(uid: u32) -> Remembered {
     all_allowed(
         Path::new(SYSTEM_ALLOWED),
         Path::new(LEGACY_SYSTEM_ALLOWED),
@@ -288,13 +288,13 @@ pub fn allowed_here(uid: u32) -> Remembered {
 /// Moves the list an older Guardian kept at `legacy` to `path`, as root:
 /// taken over as it is where there is no list at `path` yet and the old one
 /// is root's alone, and removed either way, so that one list counts.
-pub fn move_legacy_allowed(path: &Path, legacy: &Path) -> Result<(), String> {
+pub(super) fn move_legacy_allowed(path: &Path, legacy: &Path) -> Result<(), String> {
     roots().move_legacy(path, legacy)
 }
 
 /// Writes the system list, as root: readable by everyone, written only by
 /// root, in a directory everyone may enter.
-pub fn save_system_allowed(path: &Path, allowed: &Remembered) -> Result<(), String> {
+pub(super) fn save_system_allowed(path: &Path, allowed: &Remembered) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt as _;
     if let Some(directory) = path.parent() {
         fs::create_dir_all(directory)
@@ -324,7 +324,7 @@ pub fn save_system_allowed(path: &Path, allowed: &Remembered) -> Result<(), Stri
 
 /// Rewrites the list an older Guardian kept (see `old_allowed`); an empty
 /// one is removed.
-pub fn save_old_allowed(directory: &Path, allowed: &Remembered) -> Result<(), String> {
+pub(super) fn save_old_allowed(directory: &Path, allowed: &Remembered) -> Result<(), String> {
     let path = directory.join(ALLOWED);
     if allowed.is_empty() {
         return match fs::remove_file(&path) {
@@ -338,11 +338,11 @@ pub fn save_old_allowed(directory: &Path, allowed: &Remembered) -> Result<(), St
 }
 
 /// Whether a sweep has remembered anything yet.
-pub fn has_baseline(directory: &Path) -> bool {
+pub(super) fn has_baseline(directory: &Path) -> bool {
     directory.join(BASELINE).is_file()
 }
 
-pub fn baseline(directory: &Path) -> Remembered {
+pub(super) fn baseline(directory: &Path) -> Remembered {
     read(&directory.join(BASELINE))
 }
 
@@ -351,7 +351,7 @@ pub fn baseline(directory: &Path) -> Remembered {
 /// so running one says nothing on the timer's behalf (what it finds would
 /// otherwise never be notified). Installs from before it existed fall back
 /// to what the last sweep remembered.
-pub fn told(directory: &Path) -> Remembered {
+pub(super) fn told(directory: &Path) -> Remembered {
     if directory.join(TOLD).is_file() {
         read(&directory.join(TOLD))
     } else {
@@ -359,22 +359,26 @@ pub fn told(directory: &Path) -> Remembered {
     }
 }
 
-pub fn has_told(directory: &Path) -> bool {
+pub(super) fn has_told(directory: &Path) -> bool {
     directory.join(TOLD).is_file() || has_baseline(directory)
 }
 
-pub fn save_told(directory: &Path, current: &Remembered) -> Result<(), String> {
+pub(super) fn save_told(directory: &Path, current: &Remembered) -> Result<(), String> {
     write(&directory.join(TOLD), current)
 }
 
 /// Remembers the untrusted items of this sweep for the next `--diff`.
-pub fn save_baseline(directory: &Path, current: &Remembered) -> Result<(), String> {
+pub(super) fn save_baseline(directory: &Path, current: &Remembered) -> Result<(), String> {
     write(&directory.join(BASELINE), current)
 }
 
 /// Marks items the user allowed, while they are unchanged and can be
 /// allowed at all (see `not_allowable`).
-pub fn apply_allowed(items: &mut [Item], allowed: &Remembered, label: impl Fn(&Item) -> String) {
+pub(super) fn apply_allowed(
+    items: &mut [Item],
+    allowed: &Remembered,
+    label: impl Fn(&Item) -> String,
+) {
     for item in items {
         if item.is_trusted() || not_allowable(item).is_some() {
             continue;
@@ -390,7 +394,7 @@ pub fn apply_allowed(items: &mut [Item], allowed: &Remembered, label: impl Fn(&I
 
 /// How the last sweep ended, as the bar tells it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Outcome {
+pub(crate) enum Outcome {
     /// It saw everything it looks at (and may have found something).
     Complete,
     /// It could not see or review everything.
@@ -413,15 +417,15 @@ impl Outcome {
 /// why. Written by every sweep, so that one which stops running, or keeps
 /// ending unfinished, shows in the bar instead of going quiet.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LastRun {
+pub(crate) struct LastRun {
     /// Seconds since the epoch.
-    pub at: u64,
-    pub outcome: Outcome,
-    pub reasons: Vec<String>,
+    pub(crate) at: u64,
+    pub(crate) outcome: Outcome,
+    pub(crate) reasons: Vec<String>,
 }
 
 impl LastRun {
-    pub fn new(at: u64, outcome: Outcome, mut reasons: Vec<String>) -> Self {
+    pub(crate) fn new(at: u64, outcome: Outcome, mut reasons: Vec<String>) -> Self {
         let more = reasons.len().saturating_sub(MAX_REASONS);
         reasons.truncate(MAX_REASONS);
         if more > 0 {
@@ -438,7 +442,7 @@ impl LastRun {
 /// The last sweep's record in the store at `store_root`, without creating
 /// anything (the bar only reads). A sweep from before there was a record
 /// left what it remembered: that counts as a complete run of that time.
-pub fn last_run_in(store_root: &Path) -> Option<LastRun> {
+pub(crate) fn last_run_in(store_root: &Path) -> Option<LastRun> {
     let directory = store_root.join("sweep");
     // Only where there is no record at all: one that cannot be read is
     // not vouched for by what a sweep run by hand remembered.
@@ -457,13 +461,13 @@ pub fn last_run_in(store_root: &Path) -> Option<LastRun> {
 
 /// Notes that a scheduled sweep started at `now`; `save_last_run` takes the
 /// note away. One that stays is a sweep that was killed, crashed or hangs.
-pub fn mark_started(directory: &Path, now: u64) -> Result<(), String> {
+pub(super) fn mark_started(directory: &Path, now: u64) -> Result<(), String> {
     write_text(&directory.join(STARTED), &now.to_string())
 }
 
 /// When the scheduled sweep that has not ended yet started, if there is
 /// one, in the store at `store_root`.
-pub fn started_in(store_root: &Path) -> Option<u64> {
+pub(crate) fn started_in(store_root: &Path) -> Option<u64> {
     let path = store_root.join("sweep").join(STARTED);
     if fs::metadata(&path).ok()?.len() > 32 {
         return None;
@@ -473,7 +477,7 @@ pub fn started_in(store_root: &Path) -> Option<u64> {
 
 /// The record is a file anyone running as the user can write: it is read
 /// within bounds, and its text is shown as one plain line.
-pub fn last_run(directory: &Path) -> Option<LastRun> {
+pub(super) fn last_run(directory: &Path) -> Option<LastRun> {
     let path = directory.join(LAST_RUN);
     if fs::metadata(&path).ok()?.len() > MAX_RECORD_BYTES {
         return None;
@@ -506,7 +510,7 @@ pub fn last_run(directory: &Path) -> Option<LastRun> {
     })
 }
 
-pub fn save_last_run(directory: &Path, run: &LastRun) -> Result<(), String> {
+pub(super) fn save_last_run(directory: &Path, run: &LastRun) -> Result<(), String> {
     let json = Json::object([
         ("at", Json::from(run.at)),
         ("outcome", Json::from(run.outcome.name())),
@@ -532,7 +536,7 @@ pub fn save_last_run(directory: &Path, run: &LastRun) -> Result<(), String> {
 
 /// How an item changed since the last sweep.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Change {
+pub(super) enum Change {
     New,
     Changed,
     Removed,
@@ -540,7 +544,7 @@ pub enum Change {
 
 impl Change {
     /// How the change is shown, and its colour.
-    pub const fn shown(self) -> (&'static str, &'static str) {
+    pub(super) const fn shown(self) -> (&'static str, &'static str) {
         match self {
             Self::New => ("+ new", "33;1"),
             Self::Changed => ("~ changed", "33;1"),
@@ -551,23 +555,23 @@ impl Change {
 
 /// How the notes the sweep keeps for itself among the remembered items
 /// start; no item's label does (those start with `/` or `~/`).
-pub const OWN_NOTE: &str = "guardian:";
+const OWN_NOTE: &str = "guardian:";
 
 /// Remembered once accounts, groups, keys and trust anchors were looked at
 /// (and, for the second, once root's part of them was): before that,
 /// finding them says nothing about their being new.
-pub const TRUST_SEEN: &str = "guardian:trust-seen";
-pub const ROOT_TRUST_SEEN: &str = "guardian:root-trust-seen";
+pub(super) const TRUST_SEEN: &str = "guardian:trust-seen";
+pub(super) const ROOT_TRUST_SEEN: &str = "guardian:root-trust-seen";
 
 /// The content part of a fingerprint: without the alerts and the finding
 /// mark, which come and go with the checks that could run.
-pub fn content_of(fingerprint: &str) -> &str {
+pub(super) fn content_of(fingerprint: &str) -> &str {
     fingerprint.split('+').next().unwrap_or(fingerprint)
 }
 
 /// What changed between `previous` and `current` (both label to
 /// fingerprint of the untrusted items).
-pub fn diff(previous: &Remembered, current: &Remembered) -> Vec<(Change, String)> {
+pub(super) fn diff(previous: &Remembered, current: &Remembered) -> Vec<(Change, String)> {
     let mut changes = Vec::new();
     let own_note = |label: &&String| !label.starts_with(OWN_NOTE);
     let (previous, current): (Remembered, Remembered) = (

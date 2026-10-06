@@ -10,21 +10,21 @@ use std::path::{Path, PathBuf};
 /// `O_NOFOLLOW`, `O_DIRECTORY` and `O_NONBLOCK`. The generic Linux ABI
 /// (`x86_64`, `riscv64`) and Arm's give the first two different bits.
 #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
-pub const O_NOFOLLOW: i32 = 0o400_000;
+pub(crate) const O_NOFOLLOW: i32 = 0o400_000;
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-pub const O_NOFOLLOW: i32 = 0o100_000;
+const O_NOFOLLOW: i32 = 0o100_000;
 #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
-pub const O_DIRECTORY: i32 = 0o200_000;
+pub(crate) const O_DIRECTORY: i32 = 0o200_000;
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-pub const O_DIRECTORY: i32 = 0o40_000;
+const O_DIRECTORY: i32 = 0o40_000;
 /// The same on all of them (`x86_64`, `aarch64`, `arm`, `riscv64`). A path
 /// swapped for a FIFO between `lstat` and `open` then fails the identity check
 /// instead of blocking the open; it has no effect on regular files.
-pub const O_NONBLOCK: i32 = 0o4000;
+pub(crate) const O_NONBLOCK: i32 = 0o4000;
 
 /// The text of a regular file of at most `max` bytes, opened without
 /// following a link or waiting on a pipe.
-pub fn read_small_file(path: &Path, max: u64) -> Option<String> {
+pub(crate) fn read_small_file(path: &Path, max: u64) -> Option<String> {
     let metadata = fs::symlink_metadata(path).ok()?;
     if !metadata.is_file() || metadata.len() > max {
         return None;
@@ -43,33 +43,33 @@ pub fn read_small_file(path: &Path, max: u64) -> Option<String> {
 }
 
 /// How `write_atomic` makes the new file.
-pub struct AtomicWrite {
+pub(crate) struct AtomicWrite {
     /// The new file's name until it is moved into place, in the directory
     /// of the file it replaces. Whatever is under that name is removed
     /// first. Each writer keeps a name of its own: another process may see
     /// it, and two writers of one file must not share it unless they did.
-    pub temporary: PathBuf,
+    pub(crate) temporary: PathBuf,
     /// The mode the file is made with, less what the umask takes away.
-    pub mode: u32,
+    pub(crate) mode: u32,
     /// Gives the file exactly `mode` before anything is written, whatever
     /// the umask.
-    pub exact_mode: bool,
+    pub(crate) exact_mode: bool,
     /// Whom the written file is handed to before it is moved into place.
-    pub owner: Option<Owner>,
+    pub(crate) owner: Option<Owner>,
     /// Waits for the text to reach the disk before the move.
-    pub sync: bool,
+    pub(crate) sync: bool,
 }
 
 /// The owner and group a written file is given, and the mode it has then.
-pub struct Owner {
-    pub uid: u32,
-    pub gid: u32,
-    pub mode: u32,
+pub(crate) struct Owner {
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) mode: u32,
 }
 
 impl AtomicWrite {
     /// A file of the user's own (mode 0600 at most), not waited for.
-    pub fn private(temporary: PathBuf) -> Self {
+    pub(crate) fn private(temporary: PathBuf) -> Self {
         Self {
             temporary,
             mode: 0o600,
@@ -84,7 +84,7 @@ impl AtomicWrite {
 /// file beside it, which is then moved over it, so a reader never sees half.
 /// The new file is made new, never written through a link left under its
 /// name, and does not stay behind where any step fails.
-pub fn write_atomic(path: &Path, bytes: &[u8], options: &AtomicWrite) -> io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8], options: &AtomicWrite) -> io::Result<()> {
     let temporary = &options.temporary;
     drop(fs::remove_file(temporary));
     let written = fill(bytes, options).and_then(|()| fs::rename(temporary, path));

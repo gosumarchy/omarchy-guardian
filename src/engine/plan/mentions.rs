@@ -37,7 +37,7 @@ struct Glob<'a> {
 /// name as a part of something written as a path, or by a directory or
 /// glob that covers it.
 #[derive(Default)]
-pub(crate) struct Mentions<'a> {
+pub(super) struct Mentions<'a> {
     words: HashSet<&'a str>,
     parts: HashSet<&'a str>,
     /// By the last directory a glob names; under the empty key, the ones
@@ -47,7 +47,7 @@ pub(crate) struct Mentions<'a> {
 
 impl<'a> Mentions<'a> {
     /// Adds what `text`, a file in directory `from`, mentions.
-    pub(crate) fn add(&mut self, from: &'a str, text: &'a str) {
+    pub(super) fn add(&mut self, from: &'a str, text: &'a str) {
         for token in text.split(|character: char| {
             !(character.is_alphanumeric()
                 || matches!(character, '.' | '_' | '-' | '+' | '/' | '*' | '?'))
@@ -107,7 +107,7 @@ impl<'a> Mentions<'a> {
     /// Whether the texts name the file at `path`. A short name without an
     /// extension (`run`, `x`) is a word in too many places: it counts only
     /// as a part of something written as a path (`build-aux/run`).
-    pub(crate) fn names(&self, path: &str) -> bool {
+    pub(super) fn names(&self, path: &str) -> bool {
         let name = file_name(path);
         let stem = stem(name);
         if self.parts.contains(name)

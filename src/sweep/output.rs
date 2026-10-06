@@ -188,7 +188,7 @@ fn item_row(item: &Item, home: Option<&str>, flagged: &HashSet<String>) -> Vec<V
 }
 
 /// The summary card, then a table of items for each area.
-pub fn print(collection: &Collection, report: &Report, home: Option<&str>, all: bool) {
+pub(super) fn print(collection: &Collection, report: &Report, home: Option<&str>, all: bool) {
     let painter = Painter::for_stdout();
     let width = layout::width();
     let shown_items: Vec<&Item> = collection
@@ -244,7 +244,7 @@ pub fn print(collection: &Collection, report: &Report, home: Option<&str>, all: 
 }
 
 /// Notes on what the sweep could not check, as a list.
-pub fn print_notes(notes: &[String]) {
+pub(super) fn print_notes(notes: &[String]) {
     if notes.is_empty() {
         return;
     }
@@ -261,7 +261,7 @@ pub fn print_notes(notes: &[String]) {
 }
 
 /// What changed since the last sweep, in a table.
-pub fn print_changes(changes: &[(super::state::Change, String)]) {
+pub(super) fn print_changes(changes: &[(super::state::Change, String)]) {
     let painter = Painter::for_stdout();
     let width = layout::width();
     if changes.is_empty() {
@@ -308,7 +308,7 @@ pub fn print_changes(changes: &[(super::state::Change, String)]) {
 }
 
 /// The sweep as one JSON document.
-pub fn json(
+pub(super) fn json(
     collection: &Collection,
     report: &Report,
     decision: Decision,

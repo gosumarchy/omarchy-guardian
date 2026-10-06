@@ -37,7 +37,7 @@ const STALE_LOCK: Duration = Duration::from_secs(60);
 
 /// How much of its job a gate does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Level {
+pub(crate) enum Level {
     Off,
     Partial,
     On,
@@ -61,34 +61,34 @@ impl Level {
 
 /// One gate as it is now.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Gate {
+pub(crate) struct Gate {
     /// Its name in the record, which stays the same between versions.
-    pub key: String,
-    pub level: Level,
+    pub(crate) key: String,
+    pub(crate) level: Level,
     /// What a notification says when it dropped: "the AUR gate is off".
-    pub now: String,
+    pub(crate) now: String,
 }
 
 /// Everything watched, as it is now.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Snapshot {
-    pub gates: Vec<Gate>,
+pub(crate) struct Snapshot {
+    pub(crate) gates: Vec<Gate>,
     /// The gates (by key) whose state could not be read the way every
     /// caller reads it: the state of one that depends on the session's
     /// PATH, seen from a shell with no session to ask. Their record is
     /// left as it is, so two callers with different PATHs cannot take
     /// turns raising and clearing the same alert.
-    pub unknown: Vec<String>,
+    pub(crate) unknown: Vec<String>,
     /// Settings weaker than their level and not accepted: the system
     /// file's key for each, and the line that says it.
-    pub weak: Vec<(String, String)>,
+    pub(crate) weak: Vec<(String, String)>,
 }
 
 /// The record's name for the reviewer's system-wide settings.
-pub const REVIEWER_SETTINGS: &str = "reviewer settings";
+const REVIEWER_SETTINGS: &str = "reviewer settings";
 /// The record's name for what the root checks saw standing in for the
 /// sweep's own units.
-pub const SWEEP_UNITS: &str = "sweep units";
+pub(crate) const SWEEP_UNITS: &str = "sweep units";
 
 /// How `agent::exposure` words a system-wide settings file the reviewer
 /// loads; the file's path follows.
@@ -101,7 +101,7 @@ const LOADS_SETTINGS: &str = "the reviewer loads system-wide settings from ";
 /// that could redirect a review, off with one the pacman gate refuses to
 /// review through. `exposures` holds what `agent::exposure` says of each
 /// reviewer in use, asked as for a root transaction.
-pub fn reviewer_settings(exposures: &[Exposure]) -> Gate {
+pub(crate) fn reviewer_settings(exposures: &[Exposure]) -> Gate {
     let mut files: Vec<&str> = exposures
         .iter()
         .flat_map(|exposure| &exposure.notes)
@@ -139,7 +139,7 @@ pub fn reviewer_settings(exposures: &[Exposure]) -> Gate {
 
 /// What the root checks saw standing in for one of the sweep's own units
 /// (`paths`, absolute), as something to watch: on with none.
-pub fn sweep_units(paths: &[String]) -> Gate {
+pub(crate) fn sweep_units(paths: &[String]) -> Gate {
     Gate {
         key: SWEEP_UNITS.into(),
         level: if paths.is_empty() {
@@ -163,7 +163,7 @@ pub fn sweep_units(paths: &[String]) -> Gate {
 
 /// Who is looking.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Observer {
+pub(crate) enum Observer {
     /// The bar or the scheduled sweep: a drop is news.
     Watching,
     /// The user just changed something through Guardian: recorded, and
@@ -358,7 +358,7 @@ fn observe_in(
 }
 
 /// Saves `text` as `path`, private to the user, all of it or none.
-pub fn write(path: &Path, text: &str) -> std::io::Result<()> {
+pub(crate) fn write(path: &Path, text: &str) -> std::io::Result<()> {
     let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
     write_atomic(path, text.as_bytes(), &AtomicWrite::private(temporary))
 }
@@ -396,7 +396,7 @@ impl Drop for Lock {
 
 /// The user's private state directory, made if missing. Root keeps no
 /// record: under `sudo -E` the directory is the user's.
-pub fn directory() -> Option<PathBuf> {
+pub(crate) fn directory() -> Option<PathBuf> {
     let uid = user::effective_uid().ok().filter(|uid| *uid != 0)?;
     let root = Store::default_root()?;
     paths::private_dir(&root, uid).ok()?;
@@ -406,7 +406,7 @@ pub fn directory() -> Option<PathBuf> {
 /// Records `snapshot`, notifies about what dropped since the last record
 /// (unless the user chose it), and returns the drops still standing (the
 /// gate's key and the line that says it), for the bar's list of problems.
-pub fn observe(snapshot: &Snapshot, observer: Observer) -> Vec<(String, String)> {
+pub(crate) fn observe(snapshot: &Snapshot, observer: Observer) -> Vec<(String, String)> {
     let Some(directory) = directory() else {
         return Vec::new();
     };
@@ -418,7 +418,7 @@ pub fn observe(snapshot: &Snapshot, observer: Observer) -> Vec<(String, String)>
 }
 
 /// `status --dismiss`: the drops on record are seen.
-pub fn dismiss() {
+pub(crate) fn dismiss() {
     let Some(path) = directory().map(|directory| directory.join(RECORD)) else {
         return;
     };
@@ -437,7 +437,7 @@ pub fn dismiss() {
 
 /// Run at the end of a scheduled sweep, so a gate that went off is told
 /// within a day even where no bar asks for the status.
-pub fn after_sweep(scheduled: bool, settings: &Settings) {
+pub(crate) fn after_sweep(scheduled: bool, settings: &Settings) {
     if scheduled {
         observe(&crate::status::snapshot(settings), Observer::Watching);
     }

@@ -86,7 +86,7 @@ const DROP_HOSTS: &[(&str, &str)] = &[
 
 /// Whether an address on `host` with `path` (both lowercased, the path
 /// starting with `/` or empty) is one of the destinations above.
-pub fn is_drop_destination(host: &str, path: &str) -> bool {
+pub(super) fn is_drop_destination(host: &str, path: &str) -> bool {
     let host = host.trim_end_matches('.');
     DROP_HOSTS.iter().any(|(known, prefix)| {
         let on_host = host
@@ -116,7 +116,7 @@ const CODE_HOSTS: &[&str] = &[
 /// as GitHub up to where a glance stops. The name must be whole labels
 /// with more after them; `mygithub.com` and `github.com` itself are not
 /// that.
-pub fn embeds_code_host(host: &str) -> bool {
+pub(super) fn embeds_code_host(host: &str) -> bool {
     let host = format!(".{}.", host.trim_end_matches('.'));
     CODE_HOSTS.iter().any(|known| {
         let embedded = format!(".{known}.");

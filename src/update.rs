@@ -43,11 +43,11 @@ const LIMITS: Limits = Limits {
     max_output: 4 * 1024 * 1024,
 };
 /// How to upgrade, wherever a newer release is named.
-pub const HOW: &str = "in your checkout: git pull && /usr/lib/omarchy-guardian/upgrade";
+pub(crate) const HOW: &str = "in your checkout: git pull && /usr/lib/omarchy-guardian/upgrade";
 
 /// A release's number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Version(u32, u32, u32);
+struct Version(u32, u32, u32);
 
 impl Version {
     /// `1.2.3`, and nothing else: three plain numbers.
@@ -177,7 +177,7 @@ fn newer_in(directory: &Path, installed: Version) -> Option<Version> {
 }
 
 /// The newer release the last check found, for the bar. Asks nobody.
-pub fn available(settings: &Settings) -> Option<String> {
+pub(crate) fn available(settings: &Settings) -> Option<String> {
     if !settings.checks_for_updates() {
         return None;
     }
@@ -187,7 +187,7 @@ pub fn available(settings: &Settings) -> Option<String> {
 /// Run at the end of a scheduled sweep: asks for the newest release,
 /// records it and shows one notification for a release not told of yet.
 /// A check that fails says nothing: the next sweep asks again.
-pub fn after_sweep(scheduled: bool, settings: &Settings) {
+pub(crate) fn after_sweep(scheduled: bool, settings: &Settings) {
     if !scheduled || !settings.checks_for_updates() {
         return;
     }
@@ -209,7 +209,7 @@ pub fn after_sweep(scheduled: bool, settings: &Settings) {
 
 /// `omarchy-guardian update`: asks now, and says what there is. Installs
 /// nothing.
-pub fn command() -> ExitCode {
+pub(crate) fn command() -> ExitCode {
     let Some(installed) = Version::installed() else {
         errln!("omarchy-guardian update: this build has no release number");
         return ExitCode::from(2);

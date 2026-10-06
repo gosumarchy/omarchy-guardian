@@ -35,7 +35,7 @@ const RECENT_SECS: u64 = 24 * 60 * 60;
 /// The newest report id the user has dismissed, in the reports directory.
 const SEEN: &str = ".seen";
 /// Waybar refreshes the module on `SIGRTMIN+WAYBAR_SIGNAL`.
-pub const WAYBAR_SIGNAL: u8 = 9;
+const WAYBAR_SIGNAL: u8 = 9;
 
 /// A daily sweep, or daily root results, older than this have stopped.
 const STALE_SECS: u64 = 3 * 24 * 60 * 60;
@@ -270,7 +270,7 @@ fn quiet_weakenings(settings: &Settings, paths: Option<&Paths>) -> Vec<String> {
 
 /// Every gate, integration and weaker setting as it is now, for the record
 /// that tells when one of them drops (see `gatewatch`).
-pub fn snapshot(settings: &Settings) -> gatewatch::Snapshot {
+pub(crate) fn snapshot(settings: &Settings) -> gatewatch::Snapshot {
     snapshot_of(settings, paths(settings).as_ref())
 }
 
@@ -362,14 +362,14 @@ fn snapshot_of(settings: &Settings, paths: Option<&Paths>) -> gatewatch::Snapsho
 
 /// Records the gates as they are after the user changed one through
 /// Guardian (`protect`, the settings app): known, so not news.
-pub fn chosen() {
+pub(crate) fn chosen() {
     gatewatch::observe(&snapshot(&Settings::load()), Observer::Chosen);
 }
 
 /// Looks at the gates before the user changes one through Guardian, so
 /// what dropped by itself until now is told as news and not recorded as
 /// the user's choice along with the change.
-pub fn watched() {
+pub(crate) fn watched() {
     gatewatch::observe(&snapshot(&Settings::load()), Observer::Watching);
 }
 
@@ -499,7 +499,7 @@ fn sweep_health(
 }
 
 /// The Omarchy shell widget's JSON.
-pub fn json() -> String {
+pub(crate) fn json() -> String {
     let status = collect();
     let rendered = Json::object([
         ("version", Json::from(env!("CARGO_PKG_VERSION"))),
@@ -570,7 +570,7 @@ fn escape_hidden(json: &str) -> String {
 }
 
 /// details.
-pub fn waybar() -> String {
+pub(crate) fn waybar() -> String {
     let status = collect();
     let icon = match status.state {
         "ok" => "omarchy-guardian",
@@ -723,7 +723,7 @@ fn seen(directory: &Path, newest: (u64, u64), now: u64) -> Option<(u64, u64)> {
 /// daily sweep or a gate, say): that keeps the bar's attention. Reports
 /// too old for the bar to show do not count, and what is seen never moves
 /// back.
-pub fn mark_seen_unless_waiting(directory: &Path, id: &str, now: u64) -> bool {
+pub(crate) fn mark_seen_unless_waiting(directory: &Path, id: &str, now: u64) -> bool {
     let Some(asked) = notify::report_id(id) else {
         return false;
     };
@@ -746,7 +746,7 @@ pub fn mark_seen_unless_waiting(directory: &Path, id: &str, now: u64) -> bool {
 
 /// Marks every report so far as seen and every gate that dropped as
 /// known, and refreshes the Waybar module.
-pub fn dismiss() -> Result<(), String> {
+pub(crate) fn dismiss() -> Result<(), String> {
     gatewatch::dismiss();
     let directory = notify::reports_dir().ok_or("no reports directory (set HOME)")?;
     let now = crate::time::now();
@@ -758,7 +758,7 @@ pub fn dismiss() -> Result<(), String> {
 }
 
 /// Opens the last block's report in the browser and marks it seen.
-pub fn open_report() -> Result<(), String> {
+pub(crate) fn open_report() -> Result<(), String> {
     let directory = notify::reports_dir().ok_or("no reports directory (set HOME)")?;
     let now = crate::time::now();
     let (newest, _) = newest_report(&directory, now).ok_or("no block reports yet")?;
@@ -771,7 +771,7 @@ pub fn open_report() -> Result<(), String> {
 }
 
 /// Asks a running Waybar to re-run the module now.
-pub fn refresh_waybar() {
+fn refresh_waybar() {
     drop(
         Command::new("pkill")
             .arg(format!("-RTMIN+{WAYBAR_SIGNAL}"))

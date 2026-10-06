@@ -22,13 +22,13 @@ use crate::engine::request::Request;
 use crate::files::{AtomicWrite, write_atomic};
 use crate::tools::{self, Limits, OpenCode, Reviewer};
 
-pub trait Terminal {
+pub(crate) trait Terminal {
     fn say(&mut self, text: &str);
     /// `None` when no answer can be read (closed terminal).
     fn ask(&mut self, question: &str) -> Option<String>;
 }
 
-pub trait Environment {
+pub(crate) trait Environment {
     fn user_opencode(&self) -> Option<PathBuf>;
     fn system_opencode(&self) -> bool;
     /// Whether the Claude Code CLI is on PATH.
@@ -44,12 +44,12 @@ pub trait Environment {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Choice {
-    pub profile: Profile,
-    pub model: Option<String>,
-    pub official_model: Option<String>,
+struct Choice {
+    profile: Profile,
+    model: Option<String>,
+    official_model: Option<String>,
     /// Thinking level for community sources.
-    pub thinking: Thinking,
+    thinking: Thinking,
 }
 
 const HEADER: &str = "# Written by `omarchy-guardian setup`. See `omarchy-guardian config show`.\n";
@@ -102,11 +102,11 @@ fn tested_variant(choice: &Choice) -> Option<Thinking> {
         .then_some(choice.thinking)
 }
 
-pub fn render_user(choice: &Choice) -> String {
+fn render_user(choice: &Choice) -> String {
     render(choice, &USER_CLASSES, false)
 }
 
-pub fn render_system(choice: &Choice) -> String {
+fn render_system(choice: &Choice) -> String {
     render(choice, &PRIVILEGED_COMMUNITY, true)
 }
 
@@ -208,7 +208,10 @@ fn ask_model(
     }
 }
 
-pub fn run(terminal: &mut dyn Terminal, environment: &dyn Environment) -> Result<(), String> {
+pub(crate) fn run(
+    terminal: &mut dyn Terminal,
+    environment: &dyn Environment,
+) -> Result<(), String> {
     terminal.say("Omarchy Guardian setup\n");
 
     let has_opencode = environment.user_opencode().is_some();
@@ -444,7 +447,7 @@ fn write_files(
 }
 
 /// Lines only in the old text marked `-`, lines only in the new one `+`.
-pub fn line_diff(old: &str, new: &str) -> String {
+pub(crate) fn line_diff(old: &str, new: &str) -> String {
     let mut text = String::new();
 
     for line in old
@@ -465,7 +468,7 @@ pub fn line_diff(old: &str, new: &str) -> String {
     text
 }
 
-pub struct TtyTerminal;
+pub(crate) struct TtyTerminal;
 
 impl Terminal for TtyTerminal {
     fn say(&mut self, text: &str) {
@@ -499,11 +502,11 @@ fn read_answer(mut reader: impl BufRead) -> Option<String> {
     }
 }
 
-pub struct RealEnvironment;
+pub(crate) struct RealEnvironment;
 
 /// The model setup and the settings app suggest when the Claude Code CLI is
 /// installed.
-pub const SUGGESTED_CLAUDE_MODEL: &str = "claude-code/claude-sonnet-5-5";
+pub(crate) const SUGGESTED_CLAUDE_MODEL: &str = "claude-code/claude-sonnet-5-5";
 
 /// Models offered for the Claude Code CLI, as `claude-code/<model>`.
 const CLAUDE_CODE_MODELS: &[&str] = &[
@@ -665,7 +668,7 @@ impl Environment for RealEnvironment {
 /// settings) carried over from
 /// `existing` when `text` does not set them, so saving the profile does not
 /// silently undo them.
-pub fn keep_system_only(text: &str, existing: &str) -> String {
+fn keep_system_only(text: &str, existing: &str) -> String {
     let (Ok(mut new), Ok(old)) = (
         parse(Path::new(SYSTEM_PATH), text),
         parse(Path::new(SYSTEM_PATH), existing),
@@ -710,7 +713,7 @@ fn comment_header(text: &str) -> String {
 
 /// Records whether the system sweep may run its root collector, and the
 /// group that may read what the daily one finds, in the system config.
-pub fn set_sweep_root(consent: RootConsent, group: Option<String>) -> Result<(), String> {
+pub(crate) fn set_sweep_root(consent: RootConsent, group: Option<String>) -> Result<(), String> {
     let existing = fs::read_to_string(SYSTEM_PATH).unwrap_or_default();
     let mut config = if existing.trim().is_empty() {
         crate::config::file::PartialConfig::default()
@@ -733,7 +736,7 @@ pub fn set_sweep_root(consent: RootConsent, group: Option<String>) -> Result<(),
 /// The system config with `keys` as its accepted weaker settings (none
 /// removes the list), and the file as it is now: for the diff the user
 /// approves before `install_accepted` installs it.
-pub fn with_accepted(keys: Vec<String>) -> Result<(String, String), String> {
+pub(crate) fn with_accepted(keys: Vec<String>) -> Result<(String, String), String> {
     let existing = fs::read_to_string(SYSTEM_PATH).unwrap_or_default();
     let mut config = if existing.trim().is_empty() {
         crate::config::file::PartialConfig::default()
@@ -751,7 +754,7 @@ pub fn with_accepted(keys: Vec<String>) -> Result<(String, String), String> {
 }
 
 /// Installs the text `with_accepted` rendered, with sudo.
-pub fn install_accepted(text: &str) -> Result<(), String> {
+pub(crate) fn install_accepted(text: &str) -> Result<(), String> {
     install_system_file(text)
 }
 

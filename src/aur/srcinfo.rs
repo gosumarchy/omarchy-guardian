@@ -7,14 +7,14 @@ use crate::paths::file_name;
 
 /// One `source` entry with the checksums given for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Source {
-    pub entry: String,
-    pub checksums: Vec<String>,
+pub(crate) struct Source {
+    pub(crate) entry: String,
+    pub(crate) checksums: Vec<String>,
 }
 
 /// A source entry's protocol as makepkg reads it: `git`, `https`, ..., or
 /// `local` for a file beside the recipe.
-pub fn source_protocol(entry: &str) -> &str {
+pub(crate) fn source_protocol(entry: &str) -> &str {
     let after_name = entry.split_once("::").map_or(entry, |(_, rest)| rest);
     if let Some((scheme, _)) = entry
         .contains("://")
@@ -33,7 +33,7 @@ pub fn source_protocol(entry: &str) -> &str {
 
 /// The name makepkg keeps a source under in the download directory,
 /// derived the way makepkg derives it.
-pub fn source_filename(entry: &str) -> String {
+pub(crate) fn source_filename(entry: &str) -> String {
     if let Some((name, _)) = entry.split_once("::") {
         return name.to_string();
     }
@@ -54,14 +54,14 @@ pub fn source_filename(entry: &str) -> String {
 }
 
 /// The repository URL makepkg clones a git source from.
-pub fn git_source_url(entry: &str) -> &str {
+pub(crate) fn git_source_url(entry: &str) -> &str {
     let url = entry.split_once("::").map_or(entry, |(_, url)| url);
     let url = url.strip_prefix("git+").unwrap_or(url);
     url.split(['#', '?']).next().unwrap_or(url)
 }
 
 /// Whether a source is kept as a version-control checkout.
-pub fn is_vcs_source(entry: &str) -> bool {
+pub(crate) fn is_vcs_source(entry: &str) -> bool {
     VCS.contains(&source_protocol(entry))
 }
 
@@ -73,7 +73,7 @@ fn is_listed_array(key: &str) -> bool {
 
 /// The `key = value` lines of a listing's first section, the one for the
 /// package base: sources and checksums are only there.
-pub fn base_section(srcinfo: &str) -> impl Iterator<Item = (&str, &str)> {
+pub(crate) fn base_section(srcinfo: &str) -> impl Iterator<Item = (&str, &str)> {
     srcinfo
         .lines()
         .take_while(|line| !line.starts_with("pkgname = "))
@@ -86,7 +86,7 @@ pub fn base_section(srcinfo: &str) -> impl Iterator<Item = (&str, &str)> {
 /// so anything it writes to the same output lands in it: a listing with
 /// text before its first line, a second package base, or a line of another
 /// shape was not written by makepkg alone.
-pub fn check_listing(srcinfo: &str) -> Result<(), String> {
+pub(crate) fn check_listing(srcinfo: &str) -> Result<(), String> {
     let mut lines = srcinfo.lines();
     if !lines
         .next()
@@ -135,7 +135,7 @@ pub fn check_listing(srcinfo: &str) -> Result<(), String> {
 /// that differs. Such a recipe told the listing something else than its
 /// text says, so what it builds with cannot be known. An array for an
 /// architecture the listing does not name is not listed, and is left out.
-pub fn written_mismatch(written: &[(String, Vec<String>)], srcinfo: &str) -> Option<String> {
+pub(crate) fn written_mismatch(written: &[(String, Vec<String>)], srcinfo: &str) -> Option<String> {
     let mut listed: Vec<(&str, Vec<&str>)> = Vec::new();
     let mut arches: Vec<&str> = Vec::new();
     for (key, value) in base_section(srcinfo) {
@@ -182,7 +182,7 @@ pub fn written_mismatch(written: &[(String, Vec<String>)], srcinfo: &str) -> Opt
 
 /// The sources of `makepkg --printsrcinfo` output, each paired with its
 /// checksums of every algorithm, per architecture.
-pub fn parse_srcinfo(text: &str) -> Vec<Source> {
+pub(crate) fn parse_srcinfo(text: &str) -> Vec<Source> {
     // Keys are `source` or `sha256sums`, optionally with `_<arch>`.
     let mut sources: Vec<(String, Vec<String>)> = Vec::new();
     let mut sums: Vec<(String, Vec<String>)> = Vec::new();
@@ -221,16 +221,16 @@ pub fn parse_srcinfo(text: &str) -> Vec<Source> {
 
 /// What the source check found.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SourceChecks {
+pub(crate) struct SourceChecks {
     /// Sources whose content can change after the review: unpinned
     /// repositories and unverified downloads over an encrypted connection.
-    pub warnings: Vec<String>,
+    pub(crate) warnings: Vec<String>,
     /// Sources anyone on the network path can replace (unverified and
     /// unencrypted): the build does not start.
-    pub blocking: Vec<String>,
+    pub(crate) blocking: Vec<String>,
     /// The same warnings for the AI, written only from Guardian's own
     /// words and a validated host name, never from the entry's text.
-    pub context: Vec<String>,
+    pub(crate) context: Vec<String>,
 }
 
 /// A source entry split the way makepkg reads it.
@@ -287,7 +287,7 @@ fn parse_source(entry: &str) -> Option<Parsed<'_>> {
 
 /// The host a source is downloaded from, as a validated name; `None` for a
 /// local file.
-pub fn source_host(entry: &str) -> Option<String> {
+pub(crate) fn source_host(entry: &str) -> Option<String> {
     parse_source(entry).map(|parsed| parsed.host)
 }
 
@@ -313,7 +313,7 @@ fn shown(entry: &str) -> String {
 /// Sources whose content can differ from what a checksum or a commit pins:
 /// code fetched without verification can change after the review, or
 /// between one download and the next.
-pub fn check_sources(sources: &[Source]) -> SourceChecks {
+pub(crate) fn check_sources(sources: &[Source]) -> SourceChecks {
     let mut checks = SourceChecks::default();
     let total = sources.len();
     for (index, source) in sources.iter().enumerate() {

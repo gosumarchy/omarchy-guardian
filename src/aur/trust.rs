@@ -5,20 +5,20 @@ use crate::json::Json;
 
 /// What the AUR says about a package, from `/rpc/v5/info`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AurInfo {
-    pub name: String,
-    pub package_base: String,
-    pub first_submitted: u64,
-    pub last_modified: u64,
-    pub votes: u64,
-    pub maintainer: Option<String>,
-    pub submitter: Option<String>,
-    pub out_of_date: bool,
+pub(crate) struct AurInfo {
+    pub(crate) name: String,
+    pub(super) package_base: String,
+    pub(super) first_submitted: u64,
+    pub(super) last_modified: u64,
+    pub(crate) votes: u64,
+    pub(super) maintainer: Option<String>,
+    pub(super) submitter: Option<String>,
+    pub(super) out_of_date: bool,
 }
 
 /// The result of an AUR RPC `info` reply whose package base is `base`, or
 /// `None` when the AUR has none.
-pub fn parse_rpc_info(reply: &Json, base: &str) -> Option<AurInfo> {
+pub(crate) fn parse_rpc_info(reply: &Json, base: &str) -> Option<AurInfo> {
     let result = reply
         .get("results")?
         .as_array()?
@@ -43,7 +43,7 @@ pub fn parse_rpc_info(reply: &Json, base: &str) -> Option<AurInfo> {
 /// named `<base>`, as yay and `git clone` make it. Anything else is not an
 /// AUR clone, and gets no AUR facts. The config is read as text; git is
 /// never run in the untrusted directory.
-pub fn aur_identity(directory_name: &str, git_config: &str) -> Option<String> {
+pub(crate) fn aur_identity(directory_name: &str, git_config: &str) -> Option<String> {
     let mut in_origin = false;
     for line in git_config.lines() {
         let line = line.trim();
@@ -73,7 +73,7 @@ pub fn aur_identity(directory_name: &str, git_config: &str) -> Option<String> {
 
 /// The names a PKGBUILD declares in simple top-level `pkgname=` lines, as
 /// lookup keys only (the reply is checked against the package base).
-pub fn declared_names(pkgbuild: &str) -> Vec<String> {
+pub(crate) fn declared_names(pkgbuild: &str) -> Vec<String> {
     let mut names = Vec::new();
     for line in pkgbuild.lines() {
         let Some(value) = line.strip_prefix("pkgname=") else {
@@ -103,7 +103,7 @@ const FEW_VOTES: u64 = 5;
 /// AI review; warnings are the signals worth the user's attention. New and
 /// unvoted packages, and packages recently changed by someone other than
 /// their submitter, are how most AUR malware has arrived.
-pub fn trust_signals(info: &AurInfo, now: u64) -> (Vec<String>, Vec<String>) {
+pub(crate) fn trust_signals(info: &AurInfo, now: u64) -> (Vec<String>, Vec<String>) {
     let age_days = now.saturating_sub(info.first_submitted) / DAY;
     let changed_days = now.saturating_sub(info.last_modified) / DAY;
     let mut facts = vec![format!(
@@ -140,12 +140,12 @@ pub fn trust_signals(info: &AurInfo, now: u64) -> (Vec<String>, Vec<String>) {
 }
 
 /// Whether a package has too few votes to have a track record.
-pub const fn is_little_voted(votes: u64) -> bool {
+pub(crate) const fn is_little_voted(votes: u64) -> bool {
     votes < FEW_VOTES
 }
 
 /// What the AI and the user are told when the AUR could not be asked.
-pub const TRUST_UNKNOWN: &str = "Guardian could not fetch the AUR's record of this package: its \
+pub(crate) const TRUST_UNKNOWN: &str = "Guardian could not fetch the AUR's record of this package: its \
 age, votes and maintainer are unknown to this review, and nothing here says they are fine.";
 
 /// Endings that make a new package name out of a known one. The AUR
@@ -159,7 +159,7 @@ const MAX_LOOKALIKES: usize = 3;
 
 /// `name` without its variant endings: `zen-browser-patched-bin` is
 /// `zen-browser`.
-pub fn plain_name(name: &str) -> &str {
+pub(super) fn plain_name(name: &str) -> &str {
     let mut plain = name;
     while let Some(shorter) = VARIANT_SUFFIXES
         .iter()
@@ -208,7 +208,7 @@ fn is_lookalike(name: &str, known: &str) -> bool {
 }
 
 /// The names and votes of an AUR RPC `search` reply.
-pub fn parse_rpc_search(reply: &Json) -> Vec<(String, u64)> {
+pub(crate) fn parse_rpc_search(reply: &Json) -> Vec<(String, u64)> {
     reply
         .get("results")
         .and_then(Json::as_array)
@@ -227,7 +227,7 @@ pub fn parse_rpc_search(reply: &Json) -> Vec<(String, u64)> {
 /// for: its plain name, or, when it has no variant ending, its first two
 /// thirds, which a name one or two letters off further on still shares.
 /// Only this text is sent.
-pub fn lookalike_search_term(name: &str) -> Option<String> {
+pub(crate) fn lookalike_search_term(name: &str) -> Option<String> {
     let plain = plain_name(name);
     let term = if plain == name {
         let keep = (name.chars().count() * 2).div_ceil(3).max(4);
@@ -243,7 +243,7 @@ pub fn lookalike_search_term(name: &str) -> Option<String> {
 /// with many more votes (`searched`, from `parse_rpc_search`). One warning
 /// for each, in Guardian's words with validated package names. A package
 /// people have voted for is not asked about.
-pub fn lookalikes(
+pub(crate) fn lookalikes(
     name: &str,
     votes: u64,
     official: &[String],

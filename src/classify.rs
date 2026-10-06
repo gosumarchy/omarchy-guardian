@@ -22,13 +22,17 @@ const LIMITS: Limits = Limits {
     max_output: 64 * 1024,
 };
 
-pub fn requires_signatures(siglevel: &str) -> bool {
+pub(crate) fn requires_signatures(siglevel: &str) -> bool {
     !siglevel
         .split(|character: char| character.is_whitespace() || character == '=')
         .any(|token| UNSIGNED.contains(&token))
 }
 
-pub fn repo_class(repo: &str, official_repos: &[String], signatures_required: bool) -> SourceClass {
+pub(crate) fn repo_class(
+    repo: &str,
+    official_repos: &[String],
+    signatures_required: bool,
+) -> SourceClass {
     if signatures_required && official_repos.iter().any(|official| official == repo) {
         SourceClass::Official
     } else {
@@ -38,7 +42,7 @@ pub fn repo_class(repo: &str, official_repos: &[String], signatures_required: bo
 
 /// A package offered by several repositories is only official if every
 /// candidate is; no candidates at all is treated as third-party.
-pub fn strictest(classes: impl IntoIterator<Item = SourceClass>) -> SourceClass {
+pub(crate) fn strictest(classes: impl IntoIterator<Item = SourceClass>) -> SourceClass {
     let mut classes = classes.into_iter().peekable();
     if classes.peek().is_none() {
         return SourceClass::ThirdPartyRepo;
@@ -52,7 +56,7 @@ pub fn strictest(classes: impl IntoIterator<Item = SourceClass>) -> SourceClass 
 
 /// The effective `SigLevel` of a repository, falling back to the global one
 /// when the repository does not set its own.
-pub fn siglevel(repo: &str) -> Result<String, Error> {
+pub(crate) fn siglevel(repo: &str) -> Result<String, Error> {
     let query = |args: Vec<OsString>| -> Result<String, Error> {
         let output = tools::run(
             Path::new(tools::PACMAN_CONF),

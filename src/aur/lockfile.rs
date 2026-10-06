@@ -11,15 +11,15 @@
 use super::{Authority, UNPARSEABLE_HOST};
 
 /// A lockfile up to this size is also sent to the AI whole.
-pub const WHOLE_BYTES: usize = 64 * 1024;
+pub(super) const WHOLE_BYTES: usize = 64 * 1024;
 /// The most of a larger lockfile that is read for the local scan.
-pub const MAX_SCANNED_BYTES: u64 = 64 * 1024 * 1024;
+pub(super) const MAX_SCANNED_BYTES: u64 = 64 * 1024 * 1024;
 /// The most foreign hosts named for one lockfile.
 const MAX_HOSTS: usize = 8;
 
 /// The package ecosystem a file belongs to, by its name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Ecosystem {
+pub(crate) enum Ecosystem {
     Npm,
     Cargo,
     Go,
@@ -30,7 +30,7 @@ pub enum Ecosystem {
 }
 
 impl Ecosystem {
-    pub const fn label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Npm => "npm",
             Self::Cargo => "cargo",
@@ -62,7 +62,7 @@ impl Ecosystem {
 
 /// The ecosystem whose lockfile `name` is: a file that pins or lists where
 /// dependencies come from.
-pub fn lockfile(name: &str) -> Option<Ecosystem> {
+pub(super) fn lockfile(name: &str) -> Option<Ecosystem> {
     let lower = name.to_ascii_lowercase();
     Some(match lower.as_str() {
         "package-lock.json"
@@ -88,7 +88,7 @@ pub fn lockfile(name: &str) -> Option<Ecosystem> {
 
 /// The ecosystem `name` is a manifest of: a build that has one usually
 /// downloads the dependencies it names.
-pub fn manifest(name: &str) -> Option<Ecosystem> {
+pub(super) fn manifest(name: &str) -> Option<Ecosystem> {
     lockfile(name).or_else(|| {
         Some(match name.to_ascii_lowercase().as_str() {
             "package.json" => Ecosystem::Npm,
@@ -102,27 +102,27 @@ pub fn manifest(name: &str) -> Option<Ecosystem> {
 
 /// What a local scan of one lockfile found.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Scan {
+pub(super) struct Scan {
     /// Addresses in the file.
-    pub addresses: usize,
+    addresses: usize,
     /// Addresses on a host that is not the ecosystem's registry.
-    pub foreign: usize,
+    foreign: usize,
     /// Those hosts (validated names), sorted, up to `MAX_HOSTS`.
-    pub hosts: Vec<String>,
+    hosts: Vec<String>,
     /// Addresses of a version-control repository.
-    pub repositories: usize,
+    repositories: usize,
     /// Addresses fetched without encryption.
-    pub unencrypted: usize,
+    unencrypted: usize,
     /// Entries marked as running a script when installed.
-    pub install_scripts: usize,
+    install_scripts: usize,
     /// Lines that point a dependency somewhere else (`replace`, an extra
     /// index, a local path).
-    pub redirects: usize,
+    redirects: usize,
 }
 
 impl Scan {
     /// Whether the scan found anything a reviewer should weigh.
-    pub fn is_plain(&self) -> bool {
+    fn is_plain(&self) -> bool {
         self.foreign + self.repositories + self.unencrypted + self.install_scripts + self.redirects
             == 0
     }
@@ -135,7 +135,7 @@ impl Scan {
 
     /// The scan in Guardian's own words: counts and validated host names,
     /// nothing of the file's own text.
-    pub fn summary(&self, ecosystem: Ecosystem) -> String {
+    pub(super) fn summary(&self, ecosystem: Ecosystem) -> String {
         if self.is_plain() {
             return format!(
                 "{} lockfile, {} address(es), all on its registry",
@@ -221,7 +221,7 @@ fn count_true(text: &str, key: &str) -> usize {
 /// Scans a lockfile's text. It looks for addresses wherever they stand
 /// rather than parsing each format: a format it knows less well is then
 /// read too broadly, never too narrowly.
-pub fn scan(ecosystem: Ecosystem, text: &str) -> Scan {
+pub(super) fn scan(ecosystem: Ecosystem, text: &str) -> Scan {
     let mut scan = Scan::default();
     let registries = ecosystem.registries();
     scan.install_scripts =

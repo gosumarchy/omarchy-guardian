@@ -18,16 +18,16 @@ use crate::sha256::{Digest, Sha256};
 /// Directories deeper than this under a location are not looked into.
 const MAX_DEPTH: usize = 6;
 /// Entries one location may hold before the rest is reported, not read.
-pub const MAX_ENTRIES: usize = 20_000;
+pub(crate) const MAX_ENTRIES: usize = 20_000;
 /// Links followed when resolving one.
-pub const MAX_HOPS: usize = 8;
+pub(super) const MAX_HOPS: usize = 8;
 
 /// Why a file past the hash limit was not read.
-pub const TOO_LARGE: &str = "larger than the hash limit";
+pub(super) const TOO_LARGE: &str = "larger than the hash limit";
 
 /// What is at a path.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Found {
+pub(super) enum Found {
     File {
         sha256: Digest,
         /// Permission bits including set-id bits.
@@ -44,7 +44,7 @@ pub enum Found {
 }
 
 /// Looks at `rel` under `root` without following a final link.
-pub fn look(root: &Path, rel: &str) -> Found {
+pub(super) fn look(root: &Path, rel: &str) -> Found {
     let path = root.join(rel);
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -73,7 +73,7 @@ pub fn look(root: &Path, rel: &str) -> Found {
 }
 
 /// What a pinned walk found at a path.
-pub enum Public {
+pub(crate) enum Public {
     /// A regular file, opened.
     File(File),
     /// A link (anyone who can reach a link can read it), with its text.
@@ -86,7 +86,7 @@ pub enum Public {
 
 /// Whose view a pinned walk takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum View {
+pub(crate) enum View {
     /// What anyone may see: every directory on the way may be entered by
     /// anyone and a file may be read by anyone. The view the root collector
     /// takes of a path somebody else chose.
@@ -107,14 +107,14 @@ pub enum View {
 }
 
 /// What a pinned walk reached, and the path it really took.
-pub struct Seen {
+pub(crate) struct Seen {
     /// `rel` with every link on the way resolved (`bin/sh` is `usr/bin/sh`
     /// on Arch); the last component is kept as is.
-    pub path: String,
-    pub what: Public,
+    pub(crate) path: String,
+    pub(crate) what: Public,
     /// Every directory on the way is the root owner's and nobody else may
     /// write it: what is at this path is there by the root owner's doing.
-    pub kept: bool,
+    pub(crate) kept: bool,
 }
 
 /// Opens what is at `path` itself (no link followed, no waiting on a
@@ -134,7 +134,7 @@ fn open_entry(path: &Path, directory: bool) -> io::Result<File> {
 /// is followed, by its text and from the top, only where the owner of the
 /// root alone could have put it (`/bin`, `/usr/sbin`): it is theirs, and
 /// nobody else may write the directory it sits in or any above that.
-pub fn seen(root: &Path, rel: &str, view: View) -> Option<Seen> {
+pub(crate) fn seen(root: &Path, rel: &str, view: View) -> Option<Seen> {
     let open = |path: &Path| open_entry(path, false);
     let allowed = |metadata: &fs::Metadata, bit: u32, kept: bool| match view {
         View::Pinned => true,
@@ -244,17 +244,17 @@ pub fn seen(root: &Path, rel: &str, view: View) -> Option<Seen> {
 }
 
 /// What everyone may see at `rel` (see `View::Everyone`).
-pub fn public(root: &Path, rel: &str) -> Option<Public> {
+fn public(root: &Path, rel: &str) -> Option<Public> {
     seen(root, rel, View::Everyone).map(|seen| seen.what)
 }
 
 /// `look` through a pinned walk: `None` where `seen` shows nothing.
-pub fn look_as(root: &Path, rel: &str, view: View) -> Option<Found> {
+pub(super) fn look_as(root: &Path, rel: &str, view: View) -> Option<Found> {
     seen(root, rel, view).map(look_pinned)
 }
 
 /// `look` at what a pinned walk reached.
-pub fn look_pinned(seen: Seen) -> Found {
+pub(super) fn look_pinned(seen: Seen) -> Found {
     match seen.what {
         Public::Link(target) => Found::Link(target),
         Public::Directory(_) | Public::Other => Found::Other,
@@ -313,7 +313,7 @@ fn hash(mut file: File, opened: &fs::Metadata) -> io::Result<Found> {
 }
 
 /// Whether file `name` has extension `extension` (any case).
-pub fn has_extension(name: &str, extension: &str) -> bool {
+pub(super) fn has_extension(name: &str, extension: &str) -> bool {
     Path::new(name)
         .extension()
         .is_some_and(|found| found.eq_ignore_ascii_case(extension))
@@ -321,21 +321,21 @@ pub fn has_extension(name: &str, extension: &str) -> bool {
 
 /// What a directory walk found.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct Listing {
+pub(super) struct Listing {
     /// Every non-directory entry, sorted.
-    pub files: Vec<String>,
+    pub(super) files: Vec<String>,
     /// The walk stopped at a limit.
-    pub truncated: bool,
+    pub(super) truncated: bool,
     /// Directories that exist but could not be listed (only root can).
-    pub unreadable: Vec<String>,
+    pub(super) unreadable: Vec<String>,
     /// Entries whose name is not UTF-8, as far as it can be shown: a
     /// shell, udev or pacman reads them all the same, and the sweep cannot.
-    pub unnamed: Vec<String>,
+    pub(super) unnamed: Vec<String>,
 }
 
 /// Every non-directory entry under directory `rel` (relative to `root`),
 /// without entering linked directories.
-pub fn entries(root: &Path, rel: &str) -> Listing {
+pub(super) fn entries(root: &Path, rel: &str) -> Listing {
     let mut files = Vec::new();
     let mut unreadable = Vec::new();
     let mut unnamed = Vec::new();
@@ -386,15 +386,15 @@ pub fn entries(root: &Path, rel: &str) -> Listing {
 
 /// What a pattern matched.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct Matches {
+pub(crate) struct Matches {
     /// The paths that match, sorted.
-    pub files: Vec<String>,
+    pub(crate) files: Vec<String>,
     /// More matched than are kept.
-    pub truncated: bool,
+    pub(crate) truncated: bool,
     /// Entries whose name is not UTF-8 where a match was looked for.
-    pub unnamed: Vec<String>,
+    pub(super) unnamed: Vec<String>,
     /// Directories that exist but could not be listed.
-    pub unreadable: Vec<String>,
+    pub(crate) unreadable: Vec<String>,
 }
 
 /// The most paths one pattern may match.
@@ -403,7 +403,7 @@ const MAX_MATCHES: usize = 500;
 /// Every path under `root` that `pattern` matches: in each name of it, `*`
 /// stands for any run of characters. Directories are listed only where a
 /// name has one; linked directories are not entered.
-pub fn matching(root: &Path, pattern: &str) -> Matches {
+pub(crate) fn matching(root: &Path, pattern: &str) -> Matches {
     let mut found = Matches::default();
     let mut bases = vec![String::new()];
     let names: Vec<&str> = pattern.split('/').collect();
@@ -461,17 +461,17 @@ pub fn matching(root: &Path, pattern: &str) -> Matches {
 /// `root`, following further links; `None` when it leaves `root`, loops or
 /// points at nothing.
 #[cfg(test)]
-pub fn resolve(root: &Path, rel: &str, target: &str) -> Option<String> {
+fn resolve(root: &Path, rel: &str, target: &str) -> Option<String> {
     resolve_where(rel, target, &|hop| plain_hop(root, hop))
 }
 
 /// What a hop of a link chain is, for `resolve_where`: nothing to go on
 /// (`None`), the end of the chain (`Some(None)`), or a further link with
 /// its text.
-pub type Hop = Option<Option<String>>;
+pub(super) type Hop = Option<Option<String>>;
 
 /// A hop as `symlink_metadata` and `read_link` see it.
-pub fn plain_hop(root: &Path, hop: &str) -> Hop {
+pub(super) fn plain_hop(root: &Path, hop: &str) -> Hop {
     match fs::symlink_metadata(root.join(hop)) {
         Ok(metadata) if metadata.file_type().is_symlink() => Some(Some(
             fs::read_link(root.join(hop)).ok()?.to_str()?.to_string(),
@@ -482,7 +482,7 @@ pub fn plain_hop(root: &Path, hop: &str) -> Hop {
 }
 
 /// A hop as anyone may see it (see `public`).
-pub fn public_hop(root: &Path, hop: &str) -> Hop {
+pub(super) fn public_hop(root: &Path, hop: &str) -> Hop {
     Some(match public(root, hop)? {
         Public::Link(target) => Some(target),
         Public::File(_) | Public::Directory(_) | Public::Other => None,
@@ -491,14 +491,14 @@ pub fn public_hop(root: &Path, hop: &str) -> Hop {
 
 /// `resolve`, with the caller looking at each hop: a chain through a hop
 /// it does not show leads nowhere.
-pub fn resolve_where(rel: &str, target: &str, look: &dyn Fn(&str) -> Hop) -> Option<String> {
+pub(super) fn resolve_where(rel: &str, target: &str, look: &dyn Fn(&str) -> Hop) -> Option<String> {
     walk_links(rel, target, look).ok().flatten()
 }
 
 /// Whether the chain of links from `rel` is longer than is followed (or
 /// goes in a circle): where it ends was not looked at, which is not the
 /// same as it leading nowhere.
-pub fn chain_too_long(rel: &str, target: &str, look: &dyn Fn(&str) -> Hop) -> bool {
+pub(super) fn chain_too_long(rel: &str, target: &str, look: &dyn Fn(&str) -> Hop) -> bool {
     walk_links(rel, target, look).is_err()
 }
 
@@ -533,7 +533,7 @@ fn walk_links(rel: &str, target: &str, look: &dyn Fn(&str) -> Hop) -> Result<Opt
 /// `rel` with every directory link on the way resolved (`bin/sh` is
 /// `usr/bin/sh` on Arch, where `/bin` links to `usr/bin`); the last
 /// component is kept as is. `None` when it leaves `root`.
-pub fn canonical(root: &Path, rel: &str) -> Option<String> {
+pub(super) fn canonical(root: &Path, rel: &str) -> Option<String> {
     let (parent, name) = rel.rsplit_once('/').unwrap_or(("", rel));
     let real_root = fs::canonicalize(root).ok()?;
     let real_parent = fs::canonicalize(root.join(parent)).ok()?;
@@ -546,7 +546,7 @@ pub fn canonical(root: &Path, rel: &str) -> Option<String> {
 }
 
 /// `path` without `.` and `..`, refusing to climb above the root.
-pub fn normalize(path: &Path) -> Option<String> {
+pub(crate) fn normalize(path: &Path) -> Option<String> {
     let mut parts: Vec<&str> = Vec::new();
     for component in path.components() {
         match component {

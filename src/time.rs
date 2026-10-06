@@ -2,17 +2,17 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const SECONDS_PER_DAY: u64 = 86_400;
+pub(crate) const SECONDS_PER_DAY: u64 = 86_400;
 
 /// Whole seconds since the epoch; 0 where the clock is set before it.
-pub fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// `seconds` since the epoch as `YYYY-MM-DD HH:MM UTC`.
-pub fn utc(seconds: u64) -> String {
+pub(crate) fn utc(seconds: u64) -> String {
     let days = seconds / SECONDS_PER_DAY;
     let rest = seconds % SECONDS_PER_DAY;
     // Days to a civil date (Howard Hinnant's algorithm), for dates after 1970.

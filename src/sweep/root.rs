@@ -14,8 +14,9 @@
 mod allow;
 mod results;
 
-pub use allow::{as_root, system_allow, system_allow_command};
-pub use results::{from_results, results_problem};
+pub(super) use allow::system_allow;
+pub(crate) use allow::{as_root, system_allow_command};
+pub(crate) use results::{from_results, results_problem};
 
 use std::fs;
 use std::io::{Read, Write as _};
@@ -45,19 +46,19 @@ const MAX_ITEMS: usize = 5000;
 
 /// What the root collector found.
 #[derive(Debug, Default)]
-pub struct RootPart {
-    pub items: Vec<Item>,
-    pub truncated: Vec<String>,
+pub(crate) struct RootPart {
+    pub(crate) items: Vec<Item>,
+    pub(crate) truncated: Vec<String>,
     /// What the live checks say of the system as a whole (a tainted
     /// kernel, modules no package installed).
-    pub notes: Vec<String>,
+    pub(crate) notes: Vec<String>,
     /// Written by an older collector, which did not run every check this
     /// one does: what the user's own sweep leaves to the root checks is not
     /// covered by these results.
-    pub outdated: bool,
+    pub(crate) outdated: bool,
     /// The paths of the accounts, members, keys and trust anchors that are
     /// new to the collector, when it kept track (see `news`).
-    pub news: Option<Vec<String>>,
+    pub(crate) news: Option<Vec<String>>,
 }
 
 /// Where the collector remembers the accounts, group members, keys and
@@ -166,13 +167,13 @@ fn news(items: &[Item], seen: Option<TrustSeen>, now: u64) -> (Option<Vec<String
 }
 
 /// Where the scheduled root collector leaves what it found.
-pub const RESULTS: &str = "/var/lib/omarchy-guardian/sweep/root.json";
+pub(crate) const RESULTS: &str = "/var/lib/omarchy-guardian/sweep/root.json";
 
 /// `omarchy-guardian sweep-collect [--out]`: run as root, by `sweep --root`
 /// through sudo (printing to stdout), or by the daily system timer with
 /// `--out` (writing `RESULTS`, only when the system configuration allows
 /// it, readable by the configured group).
-pub fn collect_command(out: bool, settings: &crate::config::Settings) -> ExitCode {
+pub(crate) fn collect_command(out: bool, settings: &crate::config::Settings) -> ExitCode {
     if !user::effective_uid().is_ok_and(|uid| uid == 0) {
         errln!(
             "omarchy-guardian sweep-collect: only `sweep --root` and its timer run this, as root"
@@ -280,7 +281,7 @@ pub fn collect_command(out: bool, settings: &crate::config::Settings) -> ExitCod
 
 /// The name of this process's primary group, from `/proc/self/status` and
 /// `/etc/group`.
-pub fn primary_group() -> Option<String> {
+pub(crate) fn primary_group() -> Option<String> {
     let gid: u32 = fs::read_to_string("/proc/self/status")
         .ok()?
         .lines()
@@ -442,7 +443,7 @@ fn installed() -> Result<&'static Path, String> {
 
 /// Runs the root collector through sudo, which asks for the password on
 /// the terminal, and reads what it found.
-pub fn from_root() -> Result<RootPart, String> {
+pub(super) fn from_root() -> Result<RootPart, String> {
     // Always the installed, root-owned Guardian: running the current
     // executable would let a user-writable build run as root.
     let program = installed()?;
@@ -474,7 +475,7 @@ pub fn from_root() -> Result<RootPart, String> {
 
 /// Replaces what the user's sweep could not judge on the system side with
 /// what root found: the user's home items and trusted system items stay.
-pub fn merge(collection: &mut Collection, part: RootPart) {
+pub(super) fn merge(collection: &mut Collection, part: RootPart) {
     // Root's view only fills in what the user could not read: root's
     // results may be a day old, and what the user read now is newer.
     collection.items.retain(|item| {

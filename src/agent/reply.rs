@@ -253,7 +253,7 @@ fn strip_code_fence(text: &str) -> &str {
     body.strip_suffix("```").map_or(trimmed, str::trim)
 }
 
-pub fn parse_review(text: &str, nonce: &str) -> Result<AgentReview, Error> {
+pub(super) fn parse_review(text: &str, nonce: &str) -> Result<AgentReview, Error> {
     let value = Json::parse(strip_code_fence(text))
         .map_err(|error| Error::parse("the OpenCode security report", error))?;
     if value.get("nonce").and_then(Json::as_str) != Some(nonce) {
@@ -263,7 +263,7 @@ pub fn parse_review(text: &str, nonce: &str) -> Result<AgentReview, Error> {
 }
 
 /// A review in the reply's own JSON shape, without the nonce.
-pub fn review_to_json(review: &AgentReview) -> Json {
+pub(crate) fn review_to_json(review: &AgentReview) -> Json {
     let findings = review
         .findings
         .iter()
@@ -291,7 +291,7 @@ pub fn review_to_json(review: &AgentReview) -> Json {
 }
 
 /// Reads a review from the reply's JSON shape; the nonce is not checked here.
-pub fn review_from_json(value: &Json) -> Result<AgentReview, Error> {
+pub(crate) fn review_from_json(value: &Json) -> Result<AgentReview, Error> {
     let invalid = |detail: &str| Error::parse("the OpenCode security report", detail);
     let status = value
         .get("status")
