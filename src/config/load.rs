@@ -1,6 +1,5 @@
 //! Locating, validating and combining the two config files into `Settings`.
 
-use std::env;
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
@@ -12,6 +11,7 @@ use crate::config::model::{
     DEFAULT_MAX_STORE_MIB, Policy, Profile, SourceClass, StoreSettings,
 };
 use crate::config::resolve::{Layers, Resolved, resolve};
+use crate::paths::{self, Accept};
 
 pub const SYSTEM_PATH: &str = "/etc/omarchy-guardian/config.toml";
 
@@ -48,15 +48,7 @@ pub struct Settings {
 
 /// `$XDG_CONFIG_HOME/omarchy-guardian/config.toml`, else `~/.config/...`.
 pub fn user_config_path() -> Option<PathBuf> {
-    let base = env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| {
-            env::var_os("HOME")
-                .map(PathBuf::from)
-                .filter(|path| path.is_absolute())
-                .map(|home| home.join(".config"))
-        })?;
+    let base = paths::config_home(Accept::Absolute, Accept::Absolute)?;
     Some(base.join("omarchy-guardian").join("config.toml"))
 }
 

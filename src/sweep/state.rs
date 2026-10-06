@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 
 use super::collect::Item;
 use super::tier::Tier;
-use crate::engine::store;
 use crate::json::Json;
+use crate::paths;
 use crate::user;
 
 const BASELINE: &str = "baseline.json";
@@ -31,9 +31,9 @@ const MAX_RECORD_BYTES: u64 = 64 * 1024;
 /// The sweep's directory in the review store.
 pub fn directory(store_root: &Path) -> Result<PathBuf, String> {
     let uid = user::effective_uid()?;
-    store::private_dir(store_root, uid)?;
+    paths::private_dir(store_root, uid)?;
     let directory = store_root.join("sweep");
-    store::private_dir(&directory, uid)?;
+    paths::private_dir(&directory, uid)?;
     Ok(directory)
 }
 

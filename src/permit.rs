@@ -41,8 +41,9 @@ use std::process::ExitCode;
 use crate::audit::{self, Entry, Event, Gate};
 use crate::config::Settings;
 use crate::config::model::{Named, Profile, SourceClass};
-use crate::engine::store::{self, Store};
+use crate::engine::store::Store;
 use crate::json::Json;
+use crate::paths;
 use crate::report::{Decision, Report};
 use crate::sha256::Sha256;
 use crate::sweep::{root, state};
@@ -438,9 +439,9 @@ impl Pending {
 /// The user's directory of blocks to permit, private to them.
 fn pending_directory(state_root: &Path) -> Result<PathBuf, String> {
     let uid = user::effective_uid()?;
-    store::private_dir(state_root, uid)?;
+    paths::private_dir(state_root, uid)?;
     let directory = state_root.join(PENDING_DIRECTORY);
-    store::private_dir(&directory, uid)?;
+    paths::private_dir(&directory, uid)?;
     Ok(directory)
 }
 

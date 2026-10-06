@@ -42,6 +42,7 @@ mod mask;
 mod notify;
 mod osv;
 mod pacman;
+mod paths;
 mod payload;
 mod permit;
 mod protect;

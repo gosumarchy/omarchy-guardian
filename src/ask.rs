@@ -22,8 +22,8 @@ use std::process::Command;
 use crate::agent;
 use crate::config::Settings;
 use crate::config::model::SourceClass;
-use crate::engine::store;
 use crate::notify;
+use crate::paths;
 use crate::text;
 use crate::tools::{OpenCode, Reviewer};
 use crate::user;
@@ -203,7 +203,7 @@ pub fn run(target: &str, settings: &Settings) -> String {
         let id = report_id(target)?;
         let directory = notify::reports_dir().ok_or("no reports directory (set HOME)")?;
         let uid = user::real_uid().ok_or("cannot tell the current user")?;
-        store::private_dir(&directory, uid)?;
+        paths::private_dir(&directory, uid)?;
         let report = read_report(&directory, id, uid)?;
         // Older reports were saved before control characters were shown as
         // codes.
@@ -226,7 +226,7 @@ pub fn run(target: &str, settings: &Settings) -> String {
         // An empty folder of its own: nothing for the agent to pick up, and
         // Claude Code's trust question is asked once, not for every report.
         let workspace = directory.with_file_name("agent");
-        store::private_dir(&workspace, uid)?;
+        paths::private_dir(&workspace, uid)?;
         command.args(&args).current_dir(&workspace);
         for (key, value) in &env {
             command.env(key, value);

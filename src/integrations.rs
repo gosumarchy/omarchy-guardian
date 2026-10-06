@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::model::RootConsent;
 use crate::json::Json;
+use crate::paths::{self, Accept};
 use crate::sweep::own;
 use shellscan::Loads;
 
@@ -412,10 +413,8 @@ impl Paths {
         let home = env::var_os("HOME")
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())?;
-        let config = env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .unwrap_or_else(|| home.join(".config"));
+        // With an absolute HOME there is always one.
+        let config = paths::config_home(Accept::Absolute, Accept::Absolute)?;
         Some(Self {
             hook_source: HOOK_SOURCE.into(),
             hook_target: HOOK_TARGET.into(),

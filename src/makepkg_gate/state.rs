@@ -18,7 +18,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use crate::engine::store;
+use crate::paths;
 use crate::sha256::Sha256;
 use crate::user;
 
@@ -184,14 +184,14 @@ impl State {
     pub fn open(root: Option<&Path>, key: &str) -> Self {
         let directory = root.and_then(|root| {
             let uid = user::effective_uid().ok()?;
-            store::private_dir(root, uid).ok()?;
+            paths::private_dir(root, uid).ok()?;
             let directory = root.join(DIRECTORY);
             match DirBuilder::new().mode(0o700).create(&directory) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(_) => return None,
             }
-            store::private_dir(&directory, uid).ok()?;
+            paths::private_dir(&directory, uid).ok()?;
             Some(directory)
         });
         Self {

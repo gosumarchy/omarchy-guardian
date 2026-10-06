@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::output;
+use crate::paths::{self, Accept};
 use crate::report::{Blocked, html};
 use crate::text;
 use crate::time;
@@ -280,7 +281,7 @@ fn save_report(title: &str, detail: &str, ran: Ran, uid: u32) -> Option<PathBuf>
         return None;
     }
     let directory = reports_dir()?;
-    crate::engine::store::private_dir(&directory, uid).ok()?;
+    paths::private_dir(&directory, uid).ok()?;
     let seconds = time::now();
     let id = format!("{seconds}-{}", std::process::id());
     let captured = output::captured();
@@ -306,10 +307,7 @@ fn write_private(path: &Path, text: &str) -> Option<()> {
 
 /// The reports directory: `$XDG_CACHE_HOME/omarchy-guardian/reports`.
 pub fn reports_dir() -> Option<PathBuf> {
-    let base = env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+    let base = paths::cache_home(Accept::Absolute, Accept::Any)?;
     Some(base.join("omarchy-guardian/reports"))
 }
 

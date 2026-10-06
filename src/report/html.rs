@@ -11,6 +11,7 @@ use std::sync::{Mutex, PoisonError};
 use super::{AgentOutcome, Blocked, Decision, Report, Severity, recommendation};
 use crate::agent::Status;
 use crate::notify::Ran;
+use crate::paths::{self, Accept};
 use crate::scan::FileKind;
 
 const KNIGHT: &str = include_str!("../../integrations/icons/omarchy-guardian-alert.svg");
@@ -136,11 +137,7 @@ const fn ran_text(ran: Ran) -> &'static str {
 /// same file), so the report looks like the rest of the desktop; dark
 /// defaults without one. Only `#rrggbb` values are used.
 fn palette() -> String {
-    let path = std::env::var_os("XDG_STATE_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/state"))
-        })
+    let path = paths::state_home(Accept::Any, Accept::Any)
         .map(|base| base.join("omarchy/current/theme/colors.toml"));
     let theme = path
         .and_then(|path| std::fs::read_to_string(path).ok())

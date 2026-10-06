@@ -24,9 +24,10 @@ use std::time::{Duration, SystemTime};
 
 use crate::agent::Exposure;
 use crate::config::Settings;
-use crate::engine::store::{self, Store};
+use crate::engine::store::Store;
 use crate::json::Json;
 use crate::notify;
+use crate::paths;
 use crate::user;
 
 const RECORD: &str = "gatewatch.json";
@@ -409,7 +410,7 @@ impl Drop for Lock {
 pub fn directory() -> Option<PathBuf> {
     let uid = user::effective_uid().ok().filter(|uid| *uid != 0)?;
     let root = Store::default_root()?;
-    store::private_dir(&root, uid).ok()?;
+    paths::private_dir(&root, uid).ok()?;
     Some(root)
 }
 
