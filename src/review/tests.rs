@@ -12,7 +12,7 @@ use crate::config::model::{AiRequirement, Profile, SourceClass, builtin};
 use crate::report::{AgentOutcome, AgentRun, Blocked, Decision, Gap, Report};
 use crate::rules::RuleId;
 use crate::scan::ScanConfig;
-use crate::test_support::{TempDir, mock_opencode};
+use crate::test_support::{TempDir, mock_opencode, mock_opencode_counting};
 use crate::tools::OpenCode;
 
 fn unavailable() -> OpenCode {
@@ -1164,4 +1164,187 @@ fn a_store_with_a_bad_mode_is_skipped_with_a_note() {
         report.decide(&|class| settings.policy(class)),
         Decision::Clear
     );
+}
+
+/// Shell lines for `mock_opencode_counting(_, 0, _)`: a reviewer that
+/// answers by what it was sent. A request carrying a run of `q` gets
+/// `on_q` instead of a reply; one carrying a run of `z` is answered
+/// `z_status`, with a finding in `c.c` when that is suspicious; any other
+/// is clear.
+fn reviewer_by_content(on_q: &str, z_status: &str) -> String {
+    let finding = if z_status == "suspicious" {
+        r#"{\"severity\":\"high\",\"file\":\"c.c\",\"title\":\"fetches and runs a script\",\"reason\":\"mock\"}"#
+    } else {
+        ""
+    };
+    format!(
+        r#"nonce=$(printf '%s\n' "$input" | sed -n 's/^Nonce: //p' | tr -d '\n')
+status=clear
+findings=
+case "$input" in
+*qqqqqqqqqqqqqqqq*)
+{on_q}
+exit 0 ;;
+*zzzzzzzzzzzzzzzz*) status={z_status}; findings="{finding}" ;;
+esac
+reply="{{\"nonce\":\"$nonce\",\"status\":\"$status\",\"summary\":\"mock\",\"findings\":[$findings]}}"
+escaped=$(printf '%s' "$reply" | sed 's/"/\\"/g')
+printf '{{"type":"text","part":{{"type":"text","text":"%s"}}}}\n' "$escaped""#
+    )
+}
+
+/// A tree reviewed in three chunks, the second of which gets `on_q` for a
+/// reply and the third `z_status`: that review, which must be incomplete,
+/// and the next one of the same tree, by a reviewer that finds everything
+/// clear.
+fn review_with_a_failed_second_chunk(
+    on_q: &str,
+    z_status: &str,
+    timeout_secs: Option<u32>,
+) -> (Report, Report) {
+    let dir = TempDir::new("failed-chunk");
+    let bin = TempDir::new("failed-chunk-bin");
+    let clear_bin = TempDir::new("failed-chunk-clear-bin");
+    let state = TempDir::new("failed-chunk-state");
+    for (name, byte) in [("a.c", "x"), ("b.c", "q"), ("c.c", "z")] {
+        let line = format!("{}\n", byte.repeat(63));
+        fs::write(dir.path().join(name), line.repeat(160)).unwrap();
+    }
+    let system = PartialConfig {
+        agent: AgentDefaults {
+            max_input_kib: Some(16),
+            ..AgentDefaults::default()
+        },
+        classes: vec![(
+            SourceClass::Aur,
+            PartialPolicy {
+                timeout_secs,
+                ..PartialPolicy::default()
+            },
+        )],
+        ..PartialConfig::default()
+    };
+    let settings = Settings::from_parts(system, PartialConfig::default());
+    let root = state.path().join("store");
+    let failing = OpenCode::At(mock_opencode_counting(
+        bin.path(),
+        0,
+        &reviewer_by_content(on_q, z_status),
+    ));
+    let report = review_tree(
+        &ScanConfig::new(dir.path()),
+        &ReviewContext {
+            state_root: Some(&root),
+            ..context(&settings, SourceClass::Aur, &failing)
+        },
+    );
+    assert!(
+        matches!(report.gaps.as_slice(), [Gap::Agent(_)]),
+        "{:?}",
+        report.gaps
+    );
+    assert_eq!(
+        report.decide(&|class| settings.policy(class)),
+        Decision::Blocked(Blocked::Incomplete)
+    );
+    let clear = clear_opencode(&clear_bin);
+    let next = review_tree(
+        &ScanConfig::new(dir.path()),
+        &ReviewContext {
+            state_root: Some(&root),
+            ..context(&settings, SourceClass::Aur, &clear)
+        },
+    );
+    (report, next)
+}
+
+/// The chunk and the finding titles of every verdict in `report`.
+fn verdicts(report: &Report) -> Vec<(usize, Vec<&str>)> {
+    report
+        .agent_runs
+        .iter()
+        .filter_map(|run| match &run.outcome {
+            AgentOutcome::Reviewed(review) => Some((
+                run.chunk.map_or(0, |(index, _)| index),
+                review
+                    .findings
+                    .iter()
+                    .map(|finding| finding.title.as_str())
+                    .collect(),
+            )),
+            AgentOutcome::Unavailable(_) => None,
+        })
+        .collect()
+}
+
+/// Nothing of the failed review was remembered: the next one is a first
+/// review, with every chunk asked anew.
+fn assert_nothing_was_remembered(next: &Report) {
+    assert_eq!(next.agent_runs.len(), 3);
+    assert!(
+        next.agent_runs.iter().all(|run| run.cached.is_none()),
+        "{:?}",
+        next.agent_runs
+    );
+    assert!(
+        !next.notes.iter().any(|note| note.contains("upgrade")),
+        "{:?}",
+        next.notes
+    );
+}
+
+const MOCK_FINDING: &str = "HIGH c.c (AI) fetches and runs a script";
+
+#[test]
+fn a_finding_beside_an_invalid_chunk_is_reported_with_the_gap() {
+    // The invalid reply comes after a pause, so the third chunk, which runs
+    // beside the second, has been started by then.
+    let (report, next) =
+        review_with_a_failed_second_chunk("sleep 1\nprintf '%s\\n' 'not json'", "suspicious", None);
+
+    assert_eq!(
+        verdicts(&report),
+        [(1, vec![]), (3, vec!["fetches and runs a script"])]
+    );
+    let summary = report.overruled_summary(16);
+    assert!(
+        summary.iter().any(|line| line == MOCK_FINDING),
+        "{summary:?}"
+    );
+    assert!(
+        summary
+            .iter()
+            .any(|line| line.starts_with("not reviewed: AI review failed")),
+        "{summary:?}"
+    );
+    assert_nothing_was_remembered(&next);
+}
+
+#[test]
+fn clear_chunks_beside_an_invalid_one_do_not_make_the_review_clear() {
+    let (report, next) =
+        review_with_a_failed_second_chunk("sleep 1\nprintf '%s\\n' 'not json'", "clear", None);
+
+    assert_eq!(verdicts(&report), [(1, vec![]), (3, vec![])]);
+    assert_nothing_was_remembered(&next);
+}
+
+#[test]
+fn a_finding_beside_a_chunk_that_ran_out_of_time_is_reported_with_the_gap() {
+    let (report, next) = review_with_a_failed_second_chunk(
+        "printf '{\"type\":\"step_start\"}\\n'\nexec sleep 10",
+        "suspicious",
+        Some(3),
+    );
+
+    assert_eq!(
+        verdicts(&report),
+        [(1, vec![]), (3, vec!["fetches and runs a script"])]
+    );
+    let summary = report.overruled_summary(16);
+    assert!(
+        summary.iter().any(|line| line == MOCK_FINDING),
+        "{summary:?}"
+    );
+    assert_nothing_was_remembered(&next);
 }
