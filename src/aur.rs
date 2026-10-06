@@ -519,11 +519,13 @@ struct Authority {
 impl Authority {
     /// Reads the authority of an address from just past its `://`. It ends
     /// at a `/`, a `?` or a `#`, so nothing after one is the host. Clients
-    /// disagree about a `\\`: one ends the host there and another takes it
-    /// for part of the user, so an authority with one names no host.
+    /// disagree in two places, and an authority written that way names no
+    /// host: one ends the host at a `\\` and another takes it for part of
+    /// the user, and the same goes for a `?` or a `#` with an `@` after it.
     fn of(rest: &str) -> Self {
-        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-        if authority.contains('\\') {
+        let whole = rest.split('/').next().unwrap_or_default();
+        let authority = whole.split(['?', '#']).next().unwrap_or_default();
+        if whole.contains('\\') || whole[authority.len()..].contains('@') {
             return Self {
                 host: String::new(),
                 user: true,
@@ -2594,12 +2596,22 @@ pkgname = demo
     #[test]
     fn a_source_is_named_by_the_host_it_is_fetched_from() {
         use super::source_host;
-        // What stands after a `?`, a `#`, a `\` or a user's `@` is not the
-        // host the download goes to.
+        // What stands after a `/`, or before a user's `@`, is not the host
+        // the download goes to; where clients read an address differently
+        // no host can be told.
         for (entry, host) in [
             ("https://github.com/x.tar.gz", "github.com"),
             ("x.tar.gz::https://GitHub.com:443/x.tar.gz", "github.com"),
-            ("https://evil.example?@github.com/x.tar.gz", "evil.example"),
+            (
+                "https://evil.example?@github.com/x.tar.gz",
+                "an unparseable host",
+            ),
+            (
+                "scp://github.com?@evil.example/x.tar.gz",
+                "an unparseable host",
+            ),
+            ("https://github.com/x.tar.gz?a@b", "github.com"),
+            ("https://github.com?a=b", "github.com"),
             ("https://evil.example#@github.com/x.tar.gz", "evil.example"),
             (
                 "https://evil.example\\@github.com/x.tar.gz",
@@ -2633,7 +2645,7 @@ pkgname = demo
             checksums: vec!["SKIP".into()],
         }]);
         assert!(
-            checks.context[0].contains("(host evil.example)"),
+            checks.context[0].contains("(host an unparseable host)"),
             "{checks:#?}"
         );
     }

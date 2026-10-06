@@ -738,7 +738,12 @@ fn names_persistence_path(line: &str) -> bool {
 /// PKGBUILD assembles: it begins with `$pkgdir` and never climbs out of it
 /// with `..`.
 fn is_packaged_path(word: &str) -> bool {
-    is_pkgdir_prefix(word) && !word.contains("..")
+    // `."."` and `.\.` are `..` to the shell.
+    let plain: String = word
+        .chars()
+        .filter(|character| !matches!(character, '"' | '\'' | '\\'))
+        .collect();
+    is_pkgdir_prefix(word) && !plain.contains("..")
 }
 
 /// `$pkgdir` or `${pkgdir}` as a whole word, possibly quoted: `$pkgdirz`
@@ -903,12 +908,14 @@ pub fn fetched_files(line: &str) -> Vec<String> {
 }
 
 /// A word without the `)` that closes the group it stands last in:
-/// `(sh x)`. A word with a parenthesis of its own is left as it is.
+/// `(sh x)`. A word with a parenthesis of its own is left as it is, and
+/// so is one that is nothing else.
 fn without_group_close(word: &str) -> &str {
-    if word.contains('(') {
+    let bare = word.trim_end_matches(')');
+    if word.contains('(') || bare.is_empty() {
         word
     } else {
-        word.trim_end_matches(')')
+        bare
     }
 }
 
@@ -918,20 +925,35 @@ fn without_group_close(word: &str) -> &str {
 /// assignments (`X=1`) and what opens a group or a block. A command as a
 /// configuration's value (`exec = sh x`) is read from after the key.
 fn run_command(part: &str) -> Option<shell::Command> {
-    let command = shell::command(part)?;
-    if command.path == "=" {
-        return shell::command(part.split_once('=')?.1);
+    let words = shell_words(part);
+    if words.get(1).is_some_and(|word| word == "=") {
+        return shell::command(&words[2..].join(" "));
     }
-    Some(command)
+    shell::command(part)
+}
+
+/// The command `part` runs when it is a setting whose value begins with a
+/// path: `ExecStart=/bin/sh x`. To a shell the same words run `x` with a
+/// variable set, so this is a second reading, not the first.
+fn value_command(part: &str) -> Option<shell::Command> {
+    let words = shell_words(part);
+    let (key, value) = words.first()?.split_once('=')?;
+    if key.is_empty() || key.contains(['/', '"', '\'', '$']) || !unquoted(value).starts_with('/') {
+        return None;
+    }
+    let rest = [&[value.to_string()], &words[1..]].concat().join(" ");
+    shell::command(&rest)
 }
 
 /// Whether `line` runs the file named `file`: given to a shell or an
 /// interpreter, sourced, or run by its path (see `run_command`).
 pub fn runs_file(line: &str, file: &str) -> bool {
-    // A file saved inside a group is named with the group's `)` too.
-    let file = without_group_close(file);
+    // Inside a group a word is written with the group's `)`: the file as
+    // it was saved, and the word that names it.
     let is_named = |word: &str| {
-        as_file(without_group_close(word.trim_start_matches('<'))).is_some_and(|name| name == file)
+        as_file(word.trim_start_matches('<')).is_some_and(|name| {
+            name == file || without_group_close(&name) == without_group_close(file)
+        })
     };
     let names_it = |statement: &str| {
         shell_words(statement)
@@ -944,34 +966,40 @@ pub fn runs_file(line: &str, file: &str) -> bool {
     }
     let line = line.replace("&&", ";").replace("||", ";");
     line.split([';', '|']).any(|statement| {
-        let Some(command) = run_command(statement) else {
-            return false;
-        };
-        let program = command.path.as_str();
-        if (program.contains('/') || program.starts_with('$')) && is_named(program) {
-            return true;
-        }
-        // `python3.12` is `python`.
-        let name = command.program.as_str();
-        let unversioned =
-            name.trim_end_matches(|character: char| character.is_ascii_digit() || character == '.');
-        // Only parsed or compiled: `sh -n`, `node --check`, `python -m`.
-        let only_checks = command
-            .arguments
-            .iter()
-            .take_while(|word| word.starts_with('-'))
-            .any(|word| {
-                matches!(
-                    (unversioned, word.as_str()),
-                    ("sh" | "bash" | "zsh" | "dash" | "ksh", "-n")
-                        | ("python", "-m")
-                        | ("node", "--check")
-                )
-            });
-        (RUNNERS.contains(&name) || (!unversioned.is_empty() && RUNNERS.contains(&unversioned)))
-            && !only_checks
-            && command.arguments.iter().any(|word| is_named(word))
+        [run_command(statement), value_command(statement)]
+            .into_iter()
+            .flatten()
+            .any(|command| runs_named(&command, &is_named))
     })
+}
+
+/// Whether `command` runs a file `is_named` knows: by its path, or as what
+/// a shell or an interpreter is given.
+fn runs_named(command: &shell::Command, is_named: &dyn Fn(&str) -> bool) -> bool {
+    let program = command.path.as_str();
+    if (program.contains('/') || program.starts_with('$')) && is_named(program) {
+        return true;
+    }
+    // `python3.12` is `python`.
+    let name = command.program.as_str();
+    let unversioned =
+        name.trim_end_matches(|character: char| character.is_ascii_digit() || character == '.');
+    // Only parsed or compiled: `sh -n`, `node --check`, `python -m`.
+    let only_checks = command
+        .arguments
+        .iter()
+        .take_while(|word| word.starts_with('-'))
+        .any(|word| {
+            matches!(
+                (unversioned, word.as_str()),
+                ("sh" | "bash" | "zsh" | "dash" | "ksh", "-n")
+                    | ("python", "-m")
+                    | ("node", "--check")
+            )
+        });
+    (RUNNERS.contains(&name) || (!unversioned.is_empty() && RUNNERS.contains(&unversioned)))
+        && !only_checks
+        && command.arguments.iter().any(|word| is_named(word))
 }
 
 /// The files `line` runs or reads in as code, as written: what it gives a
@@ -980,8 +1008,16 @@ pub fn runs_file(line: &str, file: &str) -> bool {
 /// shell (`cat x | sh`). The program is found as in `runs_file`.
 pub fn run_targets(line: &str) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
+    // Only a line that opens a group has a `)` that closes one.
+    let grouped = line.contains('(');
     let mut add = |word: &str| {
-        if let Some(name) = as_file(without_group_close(word.trim_start_matches('<')))
+        let word = word.trim_start_matches('<');
+        let word = if grouped {
+            without_group_close(word)
+        } else {
+            word
+        };
+        if let Some(name) = as_file(word)
             && !name.starts_with('-')
             && !found.contains(&name)
         {
@@ -2794,6 +2830,7 @@ mod tests {
             "if sh i.sh; then",
             "while ! ./i.sh; do",
             "exec = sh i.sh",
+            "exec-once = sh i.sh",
         ] {
             assert!(runs_file(line, "i.sh"), "{line}");
             assert_eq!(run_targets(line), ["i.sh"], "{line}");
@@ -2813,6 +2850,14 @@ mod tests {
             assert!(!runs_file(line, "i.sh"), "{line}");
             assert!(run_targets(line).is_empty(), "{line}");
         }
+        // A name that ends in a `)` of its own keeps it.
+        assert_eq!(run_targets("./'blob)'"), ["blob)"]);
+        assert_eq!(run_targets("sh 'blob)'"), ["blob)"]);
+        assert!(runs_file("curl -o ')' https://x.example/a; sh ')'", ")"));
+        // A setting whose value begins with a path is read as a command too.
+        assert!(runs_file("ExecStart=/bin/sh i.sh", "i.sh"));
+        assert!(runs_file("FOO=/bin/sh i.sh", "i.sh"));
+        assert!(!runs_file("FOO=/bin/cat i.sh", "i.sh"));
     }
 
     #[test]

@@ -754,6 +754,8 @@ mod tests {
             "cp x \"$pkgdir/../../home/u/.config/hypr/a.conf\"",
             "install -m755 x \"${pkgdir}\"/../.local/bin/sudo",
             "cp x.fish $pkgdir/usr/../../../.config/fish/conf.d/",
+            "echo x >> $pkgdir/.\\./.\\./.zshenv",
+            "echo x >> \"$pkgdir\"/.\".\"/.\".\"/.zshenv",
         ] {
             assert!(matches(line), "{line}");
         }

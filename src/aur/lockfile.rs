@@ -263,10 +263,9 @@ pub fn scan(ecosystem: Ecosystem, text: &str) -> Scan {
                 continue;
             }
             // The address ends where the text around it does: at a quote
-            // or a space. A `\\` ends it too: in a lockfile it escapes the
-            // `/` that follows.
+            // or a space.
             let address = rest
-                .split(|c: char| c == '"' || c == '\'' || c == '\\' || c.is_whitespace())
+                .split(|c: char| c == '"' || c == '\'' || c.is_whitespace())
                 .next()
                 .unwrap_or_default();
             let authority = Authority::of(address);
@@ -284,8 +283,8 @@ pub fn scan(ecosystem: Ecosystem, text: &str) -> Scan {
             // what stands before the `@` can read as its host.
             let registry = !authority.user && registries.contains(&authority.host.as_str())
                 || (ecosystem == Ecosystem::Cargo
-                    && scheme.starts_with("registry+")
-                    && rest.starts_with("github.com/rust-lang/crates.io-index"))
+                    && scheme == "registry+https"
+                    && address == "github.com/rust-lang/crates.io-index")
                 // Go names modules by host; they are fetched through the
                 // module proxy and checked against the checksum database.
                 || ecosystem == Ecosystem::Go;
@@ -385,20 +384,21 @@ mod tests {
 
     #[test]
     fn a_foreign_host_does_not_read_as_the_registry() {
-        // What stands after a `?`, a `\` or a user's `@` is not the host
-        // the client fetches from.
+        // What stands before a user's `@` is not the host the client
+        // fetches from, and where clients read an address differently no
+        // host can be told.
         for (address, host) in [
             (
                 "https://evil.example?@registry.npmjs.org/x.tgz",
-                "evil.example",
+                "an unparseable host",
             ),
             (
                 "https://evil.example\\@registry.npmjs.org/x.tgz",
-                "evil.example",
+                "an unparseable host",
             ),
             (
                 "https://evil.example#@registry.npmjs.org/x.tgz",
-                "evil.example",
+                "an unparseable host",
             ),
             (
                 "https://registry.npmjs.org@evil.example/x.tgz",

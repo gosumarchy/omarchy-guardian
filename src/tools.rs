@@ -179,8 +179,8 @@ fn scratch_directories(home: Option<&OsStr>, cache: Option<&OsStr>) -> Vec<PathB
 /// Why a reviewer found on `PATH` at `found` is not trusted to be the one
 /// the user `uid` installed: it, or a directory above it, belongs to
 /// someone other than that user or root, or can be written by group or
-/// others, or it lies under one of the `scratch` directories. Both the
-/// place `PATH` names and the place a link there leads to are checked, up
+/// others, or it lies under one of the `scratch` directories. The place
+/// `PATH` names and every place a link on the way leads to are checked, up
 /// to the root: whoever can write a directory can replace what is in it.
 ///
 /// A sticky directory above the one the file is in may be writable by
@@ -189,7 +189,9 @@ fn scratch_directories(home: Option<&OsStr>, cache: Option<&OsStr>) -> Vec<PathB
 fn refuse_planted(found: &Path, scratch: &[PathBuf], uid: Option<u32>) -> Result<(), String> {
     let resolved =
         fs::canonicalize(found).map_err(|error| format!("it cannot be resolved ({error})"))?;
-    for path in [found, resolved.as_path()] {
+    let mut places = link_hops(found)?;
+    places.push(resolved);
+    for path in places.iter().map(PathBuf::as_path) {
         if let Some(directory) = scratch.iter().find(|directory| path.starts_with(directory)) {
             return Err(format!(
                 "{} is under {}, a temporary or cache directory",
@@ -227,6 +229,47 @@ fn refuse_planted(found: &Path, scratch: &[PathBuf], uid: Option<u32>) -> Result
         }
     }
     Ok(())
+}
+
+/// The most links followed on the way to a reviewer.
+const MAX_LINK_HOPS: usize = 40;
+
+/// `found`, and every path it becomes as the links in it are followed one
+/// at a time: whoever can write the directory a link in the middle lies
+/// in can point it elsewhere.
+fn link_hops(found: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut places = vec![found.to_path_buf()];
+    let mut current = found.to_path_buf();
+    while let Some(next) = past_first_link(&current)? {
+        if places.len() > MAX_LINK_HOPS {
+            return Err(format!("{} leads through too many links", found.display()));
+        }
+        places.push(next.clone());
+        current = next;
+    }
+    Ok(places)
+}
+
+/// `path` with the first link in it replaced by what the link names, or
+/// `None` when no part of it is a link.
+fn past_first_link(path: &Path) -> Result<Option<PathBuf>, String> {
+    let mut prefix = PathBuf::new();
+    let mut parts = path.components();
+    while let Some(part) = parts.next() {
+        let parent = prefix.clone();
+        prefix.push(part);
+        let metadata = fs::symlink_metadata(&prefix)
+            .map_err(|error| format!("{} cannot be read ({error})", prefix.display()))?;
+        if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&prefix)
+                .map_err(|error| format!("{} cannot be read ({error})", prefix.display()))?;
+            // An absolute target replaces the parent, as `join` does.
+            let mut next = parent.join(target);
+            next.extend(parts);
+            return Ok(Some(next));
+        }
+    }
+    Ok(None)
 }
 
 /// Whether a file owned by `owner` belongs to someone other than root or
@@ -828,8 +871,10 @@ mod tests {
                     assert!(give(entry, 0));
                 }
             }
-        } else {
-            // Asked for by someone else, the same files are another user's.
+        } else if !super::root_unmapped() {
+            // Asked for by someone else, the same files are another user's
+            // (where root is not mapped, the owner shown stands for any
+            // user, and is nobody's).
             for other in [Some(owner + 1), None] {
                 let reason = refuse_planted(&binary, &[], other).unwrap_err();
                 assert!(
@@ -878,6 +923,31 @@ mod tests {
             mode(&above, restored);
         }
         assert_eq!(refuse_planted(&binary, &[], me), Ok(()));
+
+        // A link on the way that lies in a directory others can write:
+        // neither the place found nor the place it ends at shows it.
+        let middle = dir.path().join("middle");
+        fs::create_dir(&middle).unwrap();
+        symlink(&binary, middle.join("tool")).unwrap();
+        symlink(binary.parent().unwrap(), middle.join("bin")).unwrap();
+        symlink(middle.join("tool"), good.join("opencode")).unwrap();
+        symlink(middle.join("bin"), home.join("linked")).unwrap();
+        let through = [good.join("opencode"), home.join("linked/claude")];
+        mode(&middle, 0o755);
+        for found in &through {
+            assert_eq!(refuse_planted(found, &[], me), Ok(()), "{found:?}");
+        }
+        mode(&middle, 0o777);
+        for found in &through {
+            let reason = refuse_planted(found, &[], me).unwrap_err();
+            assert!(
+                reason.contains(&middle.display().to_string()) && reason.contains("writable"),
+                "{reason}"
+            );
+        }
+        // A link that leads back to itself is refused, not followed for ever.
+        symlink(home.join("loop"), home.join("loop")).unwrap();
+        assert!(refuse_planted(&home.join("loop"), &[], me).is_err());
     }
 
     #[test]
