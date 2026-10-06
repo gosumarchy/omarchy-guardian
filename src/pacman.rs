@@ -1190,9 +1190,7 @@ fn check_private(path: &Path, uid: Option<u32>) -> Result<(), Error> {
     while let Some(here) = current {
         let metadata = fs::symlink_metadata(here).at(here)?;
         let sticky = metadata.is_dir() && metadata.mode() & 0o1000 != 0;
-        let foreign_owner = metadata.uid() != 0
-            && Some(metadata.uid()) != uid
-            && !(metadata.uid() == overflow_uid() && root_unmapped());
+        let foreign_owner = tools::is_foreign_owner(metadata.uid(), uid);
         let shared = metadata.mode() & 0o022 != 0 && !sticky;
         if foreign_owner || shared {
             return Err(Error::Refused(format!(
@@ -1204,28 +1202,6 @@ fn check_private(path: &Path, uid: Option<u32>) -> Result<(), Error> {
         current = here.parent();
     }
     Ok(())
-}
-
-/// The owner the kernel shows for users a user namespace does not map.
-fn overflow_uid() -> u32 {
-    fs::read_to_string("/proc/sys/kernel/overflowuid")
-        .ok()
-        .and_then(|text| text.trim().parse().ok())
-        .unwrap_or(65_534)
-}
-
-/// Whether this process runs in a user namespace that does not map root
-/// (a sandbox, as in the end-to-end tests), where root's directories show
-/// the overflow owner. The real pacman hook never runs in one.
-fn root_unmapped() -> bool {
-    fs::read_to_string("/proc/self/uid_map").is_ok_and(|map| {
-        !map.lines().any(|line| {
-            let mut fields = line.split_whitespace();
-            let inside: Option<u64> = fields.next().and_then(|field| field.parse().ok());
-            let count: Option<u64> = fields.nth(1).and_then(|field| field.parse().ok());
-            matches!((inside, count), (Some(start), Some(count)) if start == 0 && count > 0)
-        })
-    })
 }
 
 /// A cache directory must be root's alone: `-S` packages are reviewed there

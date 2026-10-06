@@ -725,15 +725,20 @@ fn names_persistence_path(line: &str) -> bool {
                 .next()
                 .unwrap_or(before)
                 .trim_start_matches(['>', '<', '"', '\'', '(']);
-            let packaged = is_pkgdir_prefix(word)
-                && !line[start..]
-                    .split(char::is_whitespace)
-                    .next()
-                    .is_some_and(|rest| rest.contains(".."))
-                && !word.contains("..");
-            !packaged
+            let rest = line[start..]
+                .split(char::is_whitespace)
+                .next()
+                .unwrap_or_default();
+            !is_packaged_path(word) || rest.contains("..")
         })
     })
+}
+
+/// Whether `word` is a path, or the start of one, inside the package a
+/// PKGBUILD assembles: it begins with `$pkgdir` and never climbs out of it
+/// with `..`.
+fn is_packaged_path(word: &str) -> bool {
+    is_pkgdir_prefix(word) && !word.contains("..")
 }
 
 /// `$pkgdir` or `${pkgdir}` as a whole word, possibly quoted: `$pkgdirz`
@@ -897,11 +902,37 @@ pub fn fetched_files(line: &str) -> Vec<String> {
     found
 }
 
+/// A word without the `)` that closes the group it stands last in:
+/// `(sh x)`. A word with a parenthesis of its own is left as it is.
+fn without_group_close(word: &str) -> &str {
+    if word.contains('(') {
+        word
+    } else {
+        word.trim_end_matches(')')
+    }
+}
+
+/// The command one statement, or one part of a pipeline, runs, for
+/// `runs_file` and `run_targets`. What stands before the program is read
+/// by `shell::command`: wrappers (`sudo -u x`, `nohup`, `timeout 5`),
+/// assignments (`X=1`) and what opens a group or a block. A command as a
+/// configuration's value (`exec = sh x`) is read from after the key.
+fn run_command(part: &str) -> Option<shell::Command> {
+    let command = shell::command(part)?;
+    if command.path == "=" {
+        return shell::command(part.split_once('=')?.1);
+    }
+    Some(command)
+}
+
 /// Whether `line` runs the file named `file`: given to a shell or an
-/// interpreter, sourced, or run by its path.
+/// interpreter, sourced, or run by its path (see `run_command`).
 pub fn runs_file(line: &str, file: &str) -> bool {
-    let is_named =
-        |word: &str| as_file(word.trim_start_matches('<')).is_some_and(|name| name == file);
+    // A file saved inside a group is named with the group's `)` too.
+    let file = without_group_close(file);
+    let is_named = |word: &str| {
+        as_file(without_group_close(word.trim_start_matches('<'))).is_some_and(|name| name == file)
+    };
     let names_it = |statement: &str| {
         shell_words(statement)
             .iter()
@@ -913,34 +944,25 @@ pub fn runs_file(line: &str, file: &str) -> bool {
     }
     let line = line.replace("&&", ";").replace("||", ";");
     line.split([';', '|']).any(|statement| {
-        let words: Vec<String> = shell_words(statement)
-            .iter()
-            .map(|word| unquoted(word))
-            .collect();
-        let mut words = words.iter().map(String::as_str).skip_while(|word| {
-            matches!(
-                *word,
-                "sudo" | "doas" | "run0" | "env" | "command" | "exec" | "then" | "do" | "else"
-            ) || word.starts_with('-')
-        });
-        let Some(program) = words.next() else {
+        let Some(command) = run_command(statement) else {
             return false;
         };
+        let program = command.path.as_str();
         if (program.contains('/') || program.starts_with('$')) && is_named(program) {
             return true;
         }
         // `python3.12` is `python`.
-        let name = program_name(program);
+        let name = command.program.as_str();
         let unversioned =
             name.trim_end_matches(|character: char| character.is_ascii_digit() || character == '.');
-        let arguments: Vec<&str> = words.collect();
         // Only parsed or compiled: `sh -n`, `node --check`, `python -m`.
-        let only_checks = arguments
+        let only_checks = command
+            .arguments
             .iter()
             .take_while(|word| word.starts_with('-'))
             .any(|word| {
                 matches!(
-                    (unversioned, *word),
+                    (unversioned, word.as_str()),
                     ("sh" | "bash" | "zsh" | "dash" | "ksh", "-n")
                         | ("python", "-m")
                         | ("node", "--check")
@@ -948,18 +970,18 @@ pub fn runs_file(line: &str, file: &str) -> bool {
             });
         (RUNNERS.contains(&name) || (!unversioned.is_empty() && RUNNERS.contains(&unversioned)))
             && !only_checks
-            && arguments.into_iter().any(is_named)
+            && command.arguments.iter().any(|word| is_named(word))
     })
 }
 
 /// The files `line` runs or reads in as code, as written: what it gives a
 /// shell or an interpreter (`sh x`, `. ./x`, `python3 x.py`, `sh <x`),
 /// what it runs by its path (`./x`, `/opt/x`), and what it pipes into a
-/// shell (`cat x | sh`).
+/// shell (`cat x | sh`). The program is found as in `runs_file`.
 pub fn run_targets(line: &str) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     let mut add = |word: &str| {
-        if let Some(name) = as_file(word.trim_start_matches('<'))
+        if let Some(name) = as_file(without_group_close(word.trim_start_matches('<')))
             && !name.starts_with('-')
             && !found.contains(&name)
         {
@@ -985,40 +1007,17 @@ pub fn run_targets(line: &str) -> Vec<String> {
             shell_after[at] = shell_after[at + 1] || is_shell;
         }
         for (at, segment) in segments.iter().enumerate() {
-            let words: Vec<String> = shell_words(segment)
-                .iter()
-                .map(|word| unquoted(word))
-                .collect();
-            let mut words = words.iter().map(String::as_str).skip_while(|word| {
-                matches!(
-                    *word,
-                    "sudo"
-                        | "doas"
-                        | "run0"
-                        | "env"
-                        | "command"
-                        | "exec"
-                        | "then"
-                        | "do"
-                        | "else"
-                        | "!"
-                        | "nohup"
-                        | "nice"
-                        | "setsid"
-                        | "time"
-                ) || word.starts_with('-')
-                    || (word.contains('=') && !word.starts_with(['/', '.', '$']))
-            });
-            let Some(program) = words.next() else {
+            let Some(command) = run_command(segment) else {
                 continue;
             };
-            if program.contains('/') {
-                add(program);
+            if command.path.contains('/') {
+                add(&command.path);
             }
-            let arguments: Vec<&str> = words.collect();
+            let arguments: Vec<&str> = command.arguments.iter().map(String::as_str).collect();
             // `cat x | sh`: what is read into a shell after it.
             let piped_into_shell = shell_after[at + 1];
-            if program_name(program) == "cat" && piped_into_shell {
+            let name = command.program.as_str();
+            if name == "cat" && piped_into_shell {
                 for argument in &arguments {
                     if !argument.starts_with('-') {
                         add(argument);
@@ -1026,7 +1025,6 @@ pub fn run_targets(line: &str) -> Vec<String> {
                 }
                 continue;
             }
-            let name = program_name(program);
             let unversioned = name
                 .trim_end_matches(|character: char| character.is_ascii_digit() || character == '.');
             if !(RUNNERS.contains(&name)
@@ -2775,6 +2773,46 @@ mod tests {
         assert!(continues("curl https://x.example/i.sh |", "sh"));
         assert!(continues("curl https://x.example/i.sh", "  | sh"));
         assert!(!continues("curl https://x.example/i.sh", "sh i.sh"));
+    }
+
+    #[test]
+    fn a_run_behind_a_wrapper_an_assignment_or_a_group_is_still_a_run() {
+        use super::{run_targets, runs_file};
+        for line in [
+            "nohup sh i.sh",
+            "FOO=1 bash i.sh",
+            "time sh i.sh",
+            "setsid bash i.sh",
+            "! sh i.sh",
+            "chmod +x i.sh; nohup ./i.sh &",
+            "timeout 5 sh i.sh",
+            "timeout --signal=9 10 ./i.sh",
+            "( sh i.sh )",
+            "(sh i.sh)",
+            "{ sh ./i.sh; }",
+            "sudo -u x sh i.sh",
+            "if sh i.sh; then",
+            "while ! ./i.sh; do",
+            "exec = sh i.sh",
+        ] {
+            assert!(runs_file(line, "i.sh"), "{line}");
+            assert_eq!(run_targets(line), ["i.sh"], "{line}");
+        }
+        for line in [
+            "nohup cat i.sh",
+            "FOO=i.sh",
+            "X=sh echo i.sh",
+            "timeout 5 cat i.sh",
+            "( cat i.sh )",
+            "sudo -u sh cat i.sh",
+            "if [ -f i.sh ]; then",
+            "time bash -n i.sh",
+            "exec = cat i.sh",
+            "name = i.sh",
+        ] {
+            assert!(!runs_file(line, "i.sh"), "{line}");
+            assert!(run_targets(line).is_empty(), "{line}");
+        }
     }
 
     #[test]

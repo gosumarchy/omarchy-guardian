@@ -8,6 +8,8 @@
 //! tells the AI what it found in its own words, and sends the file itself
 //! only when it is small.
 
+use super::{Authority, UNPARSEABLE_HOST};
+
 /// A lockfile up to this size is also sent to the AI whole.
 pub const WHOLE_BYTES: usize = 64 * 1024;
 /// The most of a larger lockfile that is read for the local scan.
@@ -181,9 +183,6 @@ impl Scan {
     }
 }
 
-/// What a host is named as when its text is not a host name.
-const UNPARSEABLE: &str = "an unparseable host";
-
 /// Lines that send a dependency somewhere other than where its name says.
 fn is_redirect(ecosystem: Ecosystem, line: &str) -> bool {
     let line = line.trim_start();
@@ -235,7 +234,7 @@ pub fn scan(ecosystem: Ecosystem, text: &str) -> Scan {
         if line.contains("\\u00") {
             scan.addresses += 1;
             scan.foreign += 1;
-            scan.note_host(UNPARSEABLE.to_string());
+            scan.note_host(UNPARSEABLE_HOST.to_string());
         }
         if is_redirect(ecosystem, line) {
             scan.redirects += 1;
@@ -263,19 +262,13 @@ pub fn scan(ecosystem: Ecosystem, text: &str) -> Scan {
             if scheme.is_empty() {
                 continue;
             }
-            // Where the client that fetches it ends the host: a `?` or a
-            // `\` ends it like a `/`, so nothing after one is the host.
-            let authority: &str = rest
-                .split(|c: char| "/\"'#?\\".contains(c) || c.is_whitespace())
+            // The address ends where the text around it does: at a quote
+            // or a space.
+            let address = rest
+                .split(|c: char| c == '"' || c == '\'' || c.is_whitespace())
                 .next()
                 .unwrap_or_default();
-            let user = authority.rsplit_once('@');
-            let host = user
-                .map_or(authority, |(_, host)| host)
-                .split(':')
-                .next()
-                .unwrap_or_default()
-                .to_ascii_lowercase();
+            let authority = Authority::of(address);
             scan.addresses += 1;
             let transport = scheme.rsplit('+').next().unwrap_or_default();
             if scheme.starts_with("git") || scheme.contains("ssh") || scheme.contains("hg+") {
@@ -288,7 +281,7 @@ pub fn scan(ecosystem: Ecosystem, text: &str) -> Scan {
             }
             // An address with a user part is never the registry's own:
             // what stands before the `@` can read as its host.
-            let registry = user.is_none() && registries.contains(&host.as_str())
+            let registry = !authority.user && registries.contains(&authority.host.as_str())
                 || (ecosystem == Ecosystem::Cargo
                     && scheme.starts_with("registry+")
                     && rest.starts_with("github.com/rust-lang/crates.io-index"))
@@ -299,12 +292,7 @@ pub fn scan(ecosystem: Ecosystem, text: &str) -> Scan {
                 continue;
             }
             scan.foreign += 1;
-            let valid = !host.is_empty()
-                && host.len() <= 253
-                && host
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
-            scan.note_host(if valid { host } else { UNPARSEABLE.to_string() });
+            scan.note_host(authority.shown());
         }
     }
     scan.hosts.sort();

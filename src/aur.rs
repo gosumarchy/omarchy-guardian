@@ -496,29 +496,58 @@ fn parse_source(entry: &str) -> Option<Parsed<'_>> {
         Some((address, fragment)) => (address, fragment.split_once('=')),
         None => (rest, None),
     };
-    let authority = address.split('/').next().unwrap_or_default();
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host)
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let valid = !host.is_empty()
-        && host.len() <= 253
-        && host.chars().all(|character| {
-            character.is_ascii_alphanumeric() || character == '.' || character == '-'
-        });
     Some(Parsed {
         vcs,
         transport,
-        host: if valid {
-            host
-        } else {
-            "an unparseable host".into()
-        },
+        host: Authority::of(address).shown(),
         fragment,
     })
+}
+
+/// What a host is named as when its text is not a host name.
+const UNPARSEABLE_HOST: &str = "an unparseable host";
+
+/// The part of an address that says where it is fetched from.
+struct Authority {
+    /// The host as written, lowercased; not yet known to be a host name.
+    host: String,
+    /// Whether a user part (`user@`) stands before the host: what is
+    /// written there can read as a host.
+    user: bool,
+}
+
+impl Authority {
+    /// Reads the authority of an address from just past its `://`. It ends
+    /// where the client that fetches it ends the host: a `?`, a `#` or a
+    /// `\` ends it like a `/`, so nothing after one is the host.
+    fn of(rest: &str) -> Self {
+        let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or_default();
+        let user = authority.rsplit_once('@');
+        Self {
+            host: user
+                .map_or(authority, |(_, host)| host)
+                .split(':')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase(),
+            user: user.is_some(),
+        }
+    }
+
+    /// The host as a validated name, for a person, a remembered answer or
+    /// the AI to read.
+    fn shown(self) -> String {
+        let valid = !self.host.is_empty()
+            && self.host.len() <= 253
+            && self.host.chars().all(|character| {
+                character.is_ascii_alphanumeric() || character == '.' || character == '-'
+            });
+        if valid {
+            self.host
+        } else {
+            UNPARSEABLE_HOST.into()
+        }
+    }
 }
 
 /// The host a source is downloaded from, as a validated name; `None` for a
@@ -2553,6 +2582,46 @@ pkgname = demo
         );
         let control = check("https://h/\u{1b}]52;c;x\u{7}", "SKIP");
         assert!(!control.warnings[0].contains('\u{1b}'));
+    }
+
+    #[test]
+    fn a_source_is_named_by_the_host_it_is_fetched_from() {
+        use super::source_host;
+        // What stands after a `?`, a `#`, a `\` or a user's `@` is not the
+        // host the download goes to.
+        for (entry, host) in [
+            ("https://github.com/x.tar.gz", "github.com"),
+            ("x.tar.gz::https://GitHub.com:443/x.tar.gz", "github.com"),
+            ("https://evil.example?@github.com/x.tar.gz", "evil.example"),
+            ("https://evil.example#@github.com/x.tar.gz", "evil.example"),
+            ("https://evil.example\\@github.com/x.tar.gz", "evil.example"),
+            ("https://evil.example/?@github.com/x.tar.gz", "evil.example"),
+            ("https://github.com@evil.example/x.tar.gz", "evil.example"),
+            (
+                "https://user:github.com@evil.example/x.tar.gz",
+                "evil.example",
+            ),
+            ("git+ssh://git@example.org/r.git", "example.org"),
+            (
+                "https://github.com.evil.example/x",
+                "github.com.evil.example",
+            ),
+            ("https://$(x)/a", "an unparseable host"),
+            ("https://ev il/a", "an unparseable host"),
+            ("https://github.com\"@evil.example/a", "evil.example"),
+            ("https:///a", "an unparseable host"),
+        ] {
+            assert_eq!(source_host(entry).as_deref(), Some(host), "{entry}");
+        }
+        assert_eq!(source_host("local.patch"), None);
+        let checks = check_sources(&[Source {
+            entry: "https://evil.example?@github.com/x.tar.gz".into(),
+            checksums: vec!["SKIP".into()],
+        }]);
+        assert!(
+            checks.context[0].contains("(host evil.example)"),
+            "{checks:#?}"
+        );
     }
 
     #[test]

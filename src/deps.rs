@@ -242,6 +242,13 @@ fn go_mod_has_requirements(contents: &str) -> bool {
         .any(|line| line.trim_start().starts_with("require ") || line.trim() == "require (")
 }
 
+/// crates.io as a `Cargo.lock` names it, whole: its index repository, and
+/// its sparse index. Any other registry is one OSV does not know.
+const CRATES_IO_SOURCES: &[&str] = &[
+    "registry+https://github.com/rust-lang/crates.io-index",
+    "sparse+https://index.crates.io/",
+];
+
 fn parse_cargo_lock(
     inventory: &mut Inventory,
     gap: &mut dyn FnMut(String),
@@ -268,10 +275,7 @@ fn parse_cargo_lock(
             continue;
         };
         match tomlish::string_field(&package, "source") {
-            Some(source) if source.starts_with("registry+") && source.contains("crates.io") => {
-                inventory.add(Ecosystem::CratesIo, &name, &version, rel);
-            }
-            Some(source) if source.starts_with("sparse+") && source.contains("crates.io") => {
+            Some(source) if CRATES_IO_SOURCES.contains(&source.as_str()) => {
                 inventory.add(Ecosystem::CratesIo, &name, &version, rel);
             }
             Some(source) if source.starts_with("registry+") || source.starts_with("sparse+") => {
@@ -516,6 +520,38 @@ mod tests {
             "[[package]]\nname = \"a\"\nversion = \"1.0.0\"\nsource = \"git+https://example.test/a#abc\"\n",
         )]);
         assert_eq!(gaps.len(), 1);
+        let lock = |source: &str| {
+            format!("[[package]]\nname = \"a\"\nversion = \"1.0.0\"\nsource = \"{source}\"\n")
+        };
+        for source in [
+            "registry+https://crates.io.evil.test/index",
+            "registry+https://example.test/crates.io-index",
+            "registry+https://github.com/rust-lang/crates.io-index.evil",
+            "registry+https://github.com/evil/crates.io-index",
+            "registry+http://github.com/rust-lang/crates.io-index",
+            "sparse+https://index.crates.io.evil.test/",
+            "sparse+https://example.test/index.crates.io/",
+            "sparse+https://index.crates.io/mirror/",
+        ] {
+            let (inventory, gaps) = run(&[("Cargo.lock", &lock(source))]);
+            assert!(inventory.packages().is_empty(), "{source}");
+            assert_eq!(gaps.len(), 1, "{source}: {gaps:?}");
+            assert!(
+                gaps[0].to_string().contains("needs an external audit"),
+                "{gaps:?}"
+            );
+        }
+        for source in [
+            "registry+https://github.com/rust-lang/crates.io-index",
+            "sparse+https://index.crates.io/",
+        ] {
+            let (inventory, gaps) = run(&[("Cargo.lock", &lock(source))]);
+            assert!(
+                has(&inventory, Ecosystem::CratesIo, "a", "1.0.0"),
+                "{source}"
+            );
+            assert!(gaps.is_empty(), "{source}: {gaps:?}");
+        }
     }
 
     #[test]

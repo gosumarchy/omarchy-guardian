@@ -8,7 +8,7 @@
 //! its own configuration is how every desktop is set up, and stays quiet.
 
 use super::shell::{self, Command};
-use super::{is_pkgdir_prefix, shell_words, unquoted};
+use super::{is_packaged_path, shell_words, unquoted};
 
 /// Dot-files in the home that sessions have always run by name.
 const SESSION_FILES: &[&str] = &[
@@ -455,7 +455,7 @@ fn writes_startup_file(line: &str) -> bool {
         shell::pipeline(statement).iter().any(|part| {
             written_files(part)
                 .iter()
-                .any(|path| is_startup_file(path) && !is_pkgdir_prefix(path))
+                .any(|path| is_startup_file(path) && !is_packaged_path(path))
         })
     })
 }
@@ -742,6 +742,24 @@ mod tests {
             "install -Dm644 x.conf \"$pkgdir/etc/skel/.config/hypr/x.conf\"",
             "grep root /etc/passwd",
             "getent passwd \"$user\" > /dev/null",
+        ] {
+            assert!(!matches(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_path_that_climbs_out_of_the_package_is_not_a_package_file() {
+        for line in [
+            "echo x >> \"$pkgdir/../../../.zshenv\"",
+            "cp x \"$pkgdir/../../home/u/.config/hypr/a.conf\"",
+            "install -m755 x \"${pkgdir}\"/../.local/bin/sudo",
+            "cp x.fish $pkgdir/usr/../../../.config/fish/conf.d/",
+        ] {
+            assert!(matches(line), "{line}");
+        }
+        for line in [
+            "echo x >> \"$pkgdir/etc/skel/.zshenv\"",
+            "cp x.fish \"${pkgdir}\"/etc/skel/.config/fish/conf.d/",
         ] {
             assert!(!matches(line), "{line}");
         }
