@@ -2,6 +2,9 @@
 //! owner is someone else.
 
 use std::fs;
+use std::path::Path;
+
+use crate::error::{Error, IoContext};
 
 const STATUS: &str = "/proc/self/status";
 
@@ -11,9 +14,10 @@ pub(crate) fn real_uid() -> Option<u32> {
 }
 
 /// The effective user id, from `/proc/self/status` (`Uid: real effective saved fs`).
-pub(crate) fn effective_uid() -> Result<u32, String> {
-    let status = fs::read_to_string(STATUS).map_err(|error| format!("{STATUS}: {error}"))?;
-    uid_in(&status, EFFECTIVE).ok_or_else(|| "cannot read the effective user id".to_string())
+pub(crate) fn effective_uid() -> Result<u32, Error> {
+    let status = fs::read_to_string(STATUS).at(Path::new(STATUS))?;
+    uid_in(&status, EFFECTIVE)
+        .ok_or_else(|| Error::Refused("cannot read the effective user id".to_string()))
 }
 
 /// Where each id stands on the `Uid:` line.

@@ -41,6 +41,7 @@ use crate::audit::Gate;
 use crate::config::Settings;
 use crate::config::model::{Named, Profile, SourceClass};
 use crate::engine::store::Store;
+use crate::error::{Error, IoContext};
 use crate::json::Json;
 use crate::paths;
 use crate::report::{Decision, Report};
@@ -445,7 +446,7 @@ impl Pending {
 }
 
 /// The user's directory of blocks to permit, private to them.
-fn pending_directory(state_root: &Path) -> Result<PathBuf, String> {
+fn pending_directory(state_root: &Path) -> Result<PathBuf, Error> {
     let uid = user::effective_uid()?;
     paths::private_dir(state_root, uid)?;
     let directory = state_root.join(PENDING_DIRECTORY);
@@ -477,7 +478,7 @@ fn pending_blocks(state_root: &Path, now: u64) -> Vec<Pending> {
 
 /// Keeps `block` to be permitted, and drops the ones that are too old or
 /// too many.
-fn keep_pending(state_root: &Path, block: &Pending) -> Result<(), String> {
+fn keep_pending(state_root: &Path, block: &Pending) -> Result<(), Error> {
     let directory = pending_directory(state_root)?;
     let kept: Vec<String> = pending_blocks(state_root, block.at)
         .into_iter()
@@ -487,7 +488,7 @@ fn keep_pending(state_root: &Path, block: &Pending) -> Result<(), String> {
     let name = format!("{}.json", block.content.id());
     state::write_text_mode(&directory.join(&name), &block.to_json(), 0o600)?;
     for entry in fs::read_dir(&directory)
-        .map_err(|error| format!("{}: {error}", directory.display()))?
+        .at(&directory)?
         .filter_map(Result::ok)
     {
         let stale = entry
@@ -682,34 +683,41 @@ fn grant(
     settings: &Settings,
     state_root: &Path,
     typed: &mut dyn Typed,
-    as_root: &dyn Fn(&[&str]) -> Result<(), String>,
-) -> Result<String, String> {
+    as_root: &dyn Fn(&[&str]) -> Result<(), Error>,
+) -> Result<String, Error> {
     let now = now();
     let block = pending_blocks(state_root, now)
         .into_iter()
         .find(|block| block.content.id() == id)
         .ok_or_else(|| {
-            format!("no blocked install is kept under {id}; `omarchy-guardian permit` lists them")
+            Error::Refused(format!(
+                "no blocked install is kept under {id}; `omarchy-guardian permit` lists them"
+            ))
         })?;
     let content = &block.content;
     if !enabled(settings, &content.class) {
-        return Err(
+        return Err(Error::Refused(
             "permits are off under the strict level; the system file's [permit] strict = \"allowed\" turns them on"
                 .into(),
-        );
+        ));
     }
-    let uid = user::real_uid().ok_or("cannot tell which user this is")?;
+    let uid =
+        user::real_uid().ok_or_else(|| Error::Refused("cannot tell which user this is".into()))?;
     if uid == 0 {
-        return Err("a permit is given by the user who was blocked, not by root".into());
+        return Err(Error::Refused(
+            "a permit is given by the user who was blocked, not by root".into(),
+        ));
     }
     show(&block, uid);
     let answer = typed
         .typed(&format!(
             "Type {WORD} to overrule the review, anything else to leave it: "
         ))
-        .ok_or("a permit is given on a terminal, by you: there is none here")?;
+        .ok_or_else(|| {
+            Error::Refused("a permit is given on a terminal, by you: there is none here".into())
+        })?;
     if answer != WORD {
-        return Err("nothing was permitted".into());
+        return Err(Error::Refused("nothing was permitted".into()));
     }
     as_root(&["--add", content.gate.name(), &content.class, &content.key()])?;
     drop_pending(state_root, id);
@@ -754,7 +762,7 @@ fn list(state_root: Option<&Path>) {
     }
 }
 
-fn revoke(id: &str, state_root: Option<&Path>) -> Result<String, String> {
+fn revoke(id: &str, state_root: Option<&Path>) -> Result<String, Error> {
     if let Some(root) = state_root {
         drop_pending(root, id);
     }
@@ -771,7 +779,7 @@ fn revoke(id: &str, state_root: Option<&Path>) -> Result<String, String> {
 }
 
 /// The root half, through sudo.
-fn system(arguments: &[&str]) -> Result<(), String> {
+fn system(arguments: &[&str]) -> Result<(), Error> {
     root::as_root("permit-system", arguments, "changing your permits")
 }
 
@@ -784,7 +792,9 @@ pub(crate) fn command(command: &Command, settings: &Settings) -> ExitCode {
         }
         Command::Grant(id) => match state_root.as_deref() {
             Some(root) => grant(id, settings, root, &mut TtyTyped, &system),
-            None => Err("no state directory (set HOME or XDG_STATE_HOME)".into()),
+            None => Err(Error::Refused(
+                "no state directory (set HOME or XDG_STATE_HOME)".into(),
+            )),
         },
         Command::Revoke(id) => revoke(id, state_root.as_deref()),
     };

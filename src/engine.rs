@@ -53,7 +53,7 @@ impl Memory {
         class: SourceClass,
         units: Vec<Unit>,
         root: Option<PathBuf>,
-    ) -> Result<Option<Self>, String> {
+    ) -> Result<Option<Self>, Error> {
         let Some(root) = root else {
             return Ok(None);
         };

@@ -8,6 +8,7 @@ use std::time::UNIX_EPOCH;
 
 use super::{MAX_ITEMS, MAX_OUTPUT, RootPart, in_keeping_order};
 use crate::autorun::Category;
+use crate::error::{Error, IoContext};
 use crate::files::{AtomicWrite, Owner, write_atomic};
 use crate::json::Json;
 use crate::rules::RuleId;
@@ -29,13 +30,13 @@ const MAX_AGE_SECS: u64 = 36 * 60 * 60;
 
 /// Writes `json` to `path` (and its directory) owned by root and group
 /// `gid`: the directory 0750, the file 0640, replaced atomically.
-pub(super) fn write_results(path: &Path, json: &str, gid: u32) -> Result<(), String> {
-    let describe = |path: &Path, error: std::io::Error| format!("{}: {error}", path.display());
-    let directory = path.parent().ok_or("no directory")?;
-    fs::create_dir_all(directory).map_err(|error| describe(directory, error))?;
-    unix_fs::chown(directory, Some(0), Some(gid)).map_err(|error| describe(directory, error))?;
-    fs::set_permissions(directory, fs::Permissions::from_mode(0o750))
-        .map_err(|error| describe(directory, error))?;
+pub(super) fn write_results(path: &Path, json: &str, gid: u32) -> Result<(), Error> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| Error::Refused("no directory".into()))?;
+    fs::create_dir_all(directory).at(directory)?;
+    unix_fs::chown(directory, Some(0), Some(gid)).at(directory)?;
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o750)).at(directory)?;
     let options = AtomicWrite {
         owner: Some(Owner {
             uid: 0,
@@ -44,7 +45,7 @@ pub(super) fn write_results(path: &Path, json: &str, gid: u32) -> Result<(), Str
         }),
         ..AtomicWrite::private(path.with_extension("json.tmp"))
     };
-    write_atomic(path, json.as_bytes(), &options).map_err(|error| describe(path, error))
+    write_atomic(path, json.as_bytes(), &options).at(path)
 }
 
 /// What the scheduled root collector found, if it is trustworthy and

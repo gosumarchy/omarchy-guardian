@@ -29,6 +29,7 @@ use super::collect::{self, Body, Collection, Item, Origin, Scope};
 use super::index::{self, LOCAL_DB, PackageIndex};
 use super::state;
 use super::{live, own};
+use crate::error::Error;
 use crate::json::Json;
 use crate::user;
 use results::{from_json, to_json, write_results};
@@ -428,15 +429,17 @@ fn group_id(name: &str) -> Option<u32> {
 
 /// The installed Guardian, when it is root's alone: the only program run
 /// as root on the user's behalf.
-fn installed() -> Result<&'static Path, String> {
+fn installed() -> Result<&'static Path, Error> {
     let program = Path::new(INSTALLED);
     let metadata = fs::metadata(program).map_err(|error| {
-        format!("{INSTALLED}: {error}; root's part needs the installed Guardian (./install.sh)")
+        Error::Refused(format!(
+            "{INSTALLED}: {error}; root's part needs the installed Guardian (./install.sh)"
+        ))
     })?;
     if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-        return Err(format!(
+        return Err(Error::Refused(format!(
             "{INSTALLED} is not root's alone; root's part needs the installed Guardian (./install.sh)"
-        ));
+        )));
     }
     Ok(program)
 }
@@ -446,7 +449,7 @@ fn installed() -> Result<&'static Path, String> {
 pub(super) fn from_root() -> Result<RootPart, String> {
     // Always the installed, root-owned Guardian: running the current
     // executable would let a user-writable build run as root.
-    let program = installed()?;
+    let program = installed().map_err(|error| error.to_string())?;
     errln!(
         "Guardian needs root to check what your user can't read (sudoers, root's crontab, shell files and keys). It only reads them."
     );

@@ -5,6 +5,7 @@ use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 
 use super::{SUDO, installed};
+use crate::error::Error;
 use crate::sweep::state::{self, Remembered};
 use crate::user;
 
@@ -13,7 +14,7 @@ use crate::user;
 /// `what` ("changing ..."), which is said first. What only root may write
 /// is written this way: by the installed, root-owned program, never by the
 /// one that is running.
-pub(crate) fn as_root(command: &str, arguments: &[&str], what: &str) -> Result<(), String> {
+pub(crate) fn as_root(command: &str, arguments: &[&str], what: &str) -> Result<(), Error> {
     let program = installed()?;
     errln!("Guardian needs root for {what}; it asks for your password.");
     let status = Command::new(SUDO)
@@ -22,19 +23,19 @@ pub(crate) fn as_root(command: &str, arguments: &[&str], what: &str) -> Result<(
         .args(arguments)
         .stdin(Stdio::inherit())
         .status()
-        .map_err(|error| format!("cannot start sudo: {error}"))?;
+        .map_err(|error| Error::Refused(format!("cannot start sudo: {error}")))?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!(
+        Err(Error::Refused(format!(
             "{what} failed ({status}); nothing was changed. If the installed Guardian is older than this one, run ./install.sh"
-        ))
+        )))
     }
 }
 
 /// Changes the system's list of allowed items through sudo (see
 /// `system_allow_command`).
-pub(crate) fn system_allow(arguments: &[&str]) -> Result<(), String> {
+pub(crate) fn system_allow(arguments: &[&str]) -> Result<(), Error> {
     as_root(
         "sweep-allow-system",
         arguments,

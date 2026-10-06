@@ -8,6 +8,8 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
+use crate::error::{Error, IoContext};
+
 /// Which values of an environment variable are taken as a directory.
 #[derive(Clone, Copy)]
 pub(crate) enum Accept {
@@ -77,30 +79,32 @@ pub(crate) fn extension_lowercase(path: &str) -> String {
 /// missing parents, mode 0700) only under an existing directory owned by
 /// `uid`, then requires a real directory (not a symlink) owned by `uid` with
 /// no access for group or others.
-pub(crate) fn private_dir(root: &Path, uid: u32) -> Result<(), String> {
-    let describe = |path: &Path, error: io::Error| format!("{}: {error}", path.display());
+pub(crate) fn private_dir(root: &Path, uid: u32) -> Result<(), Error> {
     match fs::symlink_metadata(root) {
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => create_root(root, uid)?,
-        Err(error) => return Err(describe(root, error)),
+        Err(error) => return Err(error).at(root),
     }
 
-    let metadata = fs::symlink_metadata(root).map_err(|error| describe(root, error))?;
+    let metadata = fs::symlink_metadata(root).at(root)?;
     if !metadata.file_type().is_dir() {
-        return Err(format!("{} is not a directory", root.display()));
+        return Err(Error::Refused(format!(
+            "{} is not a directory",
+            root.display()
+        )));
     }
     if metadata.uid() != uid {
-        return Err(format!(
+        return Err(Error::Refused(format!(
             "{} is owned by uid {}, not {uid}",
             root.display(),
             metadata.uid()
-        ));
+        )));
     }
     if metadata.mode() & 0o077 != 0 {
-        return Err(format!(
+        return Err(Error::Refused(format!(
             "{} is accessible to group or others",
             root.display()
-        ));
+        )));
     }
     Ok(())
 }
@@ -111,32 +115,31 @@ pub(crate) fn private_dir(root: &Path, uid: u32) -> Result<(), String> {
 /// (euid 0, the user's HOME kept) that ancestor belongs to the user, so
 /// nothing root-owned is created there. The store root itself is still
 /// checked without following symlinks by `Store::open`.
-fn create_root(root: &Path, uid: u32) -> Result<(), String> {
+fn create_root(root: &Path, uid: u32) -> Result<(), Error> {
     let ancestor = nearest_existing_ancestor(root)?;
-    let metadata =
-        fs::metadata(&ancestor).map_err(|error| format!("{}: {error}", ancestor.display()))?;
+    let metadata = fs::metadata(&ancestor).at(&ancestor)?;
     if !metadata.is_dir() {
-        return Err(format!(
+        return Err(Error::Refused(format!(
             "{} is not a directory; not creating the store under it",
             ancestor.display()
-        ));
+        )));
     }
     if metadata.uid() != uid {
-        return Err(format!(
+        return Err(Error::Refused(format!(
             "{} is owned by uid {}, not {uid}; not creating the store under it",
             ancestor.display(),
             metadata.uid()
-        ));
+        )));
     }
     DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(root)
-        .map_err(|error| format!("{}: {error}", root.display()))
+        .at(root)
 }
 
 /// The closest ancestor of `root` that exists (as seen by `symlink_metadata`).
-fn nearest_existing_ancestor(root: &Path) -> Result<PathBuf, String> {
+fn nearest_existing_ancestor(root: &Path) -> Result<PathBuf, Error> {
     for ancestor in root
         .ancestors()
         .skip(1)
@@ -145,10 +148,13 @@ fn nearest_existing_ancestor(root: &Path) -> Result<PathBuf, String> {
         match fs::symlink_metadata(ancestor) {
             Ok(_) => return Ok(ancestor.to_path_buf()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("{}: {error}", ancestor.display())),
+            Err(error) => return Err(error).at(ancestor),
         }
     }
-    Err(format!("{} has no existing ancestor", root.display()))
+    Err(Error::Refused(format!(
+        "{} has no existing ancestor",
+        root.display()
+    )))
 }
 
 #[cfg(test)]

@@ -199,8 +199,8 @@ fn forget_memory() -> Result<String, String> {
     if !root.is_dir() {
         return Ok("The review memory is already empty.".into());
     }
-    let store = Store::open(root.clone())?;
     let forget = || -> Result<usize, Error> {
+        let store = Store::open(root.clone())?;
         let count = baseline::forget_all(&store)?;
         // What the AUR gate remembers on its own (answers, program hashes)
         // goes with the rest.

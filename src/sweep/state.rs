@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use super::collect::Item;
 use super::tier::Tier;
+use crate::error::{Error, IoContext};
 use crate::files::{AtomicWrite, write_atomic};
 use crate::json::Json;
 use crate::paths;
@@ -29,7 +30,7 @@ const MAX_REASON_CHARS: usize = 300;
 const MAX_RECORD_BYTES: u64 = 64 * 1024;
 
 /// The sweep's directory in the review store.
-pub(super) fn directory(store_root: &Path) -> Result<PathBuf, String> {
+pub(super) fn directory(store_root: &Path) -> Result<PathBuf, Error> {
     let uid = user::effective_uid()?;
     paths::private_dir(store_root, uid)?;
     let directory = store_root.join("sweep");
@@ -81,7 +82,7 @@ fn read(path: &Path) -> Remembered {
         .collect()
 }
 
-fn write(path: &Path, remembered: &Remembered) -> Result<(), String> {
+fn write(path: &Path, remembered: &Remembered) -> Result<(), Error> {
     let json = Json::object(
         remembered
             .iter()
@@ -90,7 +91,7 @@ fn write(path: &Path, remembered: &Remembered) -> Result<(), String> {
     write_text(path, &json.to_string())
 }
 
-fn write_text(path: &Path, text: &str) -> Result<(), String> {
+fn write_text(path: &Path, text: &str) -> Result<(), Error> {
     write_text_mode(path, text, 0o600)
 }
 
@@ -98,14 +99,13 @@ fn write_text(path: &Path, text: &str) -> Result<(), String> {
 /// never sees half of it. The file has exactly `mode`, whatever the umask
 /// of the process: the root collector runs with one that would close a
 /// list everyone is meant to read.
-pub(crate) fn write_text_mode(path: &Path, text: &str, mode: u32) -> Result<(), String> {
+pub(crate) fn write_text_mode(path: &Path, text: &str, mode: u32) -> Result<(), Error> {
     let options = AtomicWrite {
         mode,
         exact_mode: true,
         ..AtomicWrite::private(path.with_extension(format!("tmp.{}", std::process::id())))
     };
-    write_atomic(path, text.as_bytes(), &options)
-        .map_err(|error| format!("{}: {error}", path.display()))
+    write_atomic(path, text.as_bytes(), &options).at(path)
 }
 
 /// The list an older Guardian kept in the user's own state directory. It
@@ -255,7 +255,7 @@ impl Keeper<'_> {
     }
 
     /// See `move_legacy_allowed`.
-    fn move_legacy(self, path: &Path, legacy: &Path) -> Result<(), String> {
+    fn move_legacy(self, path: &Path, legacy: &Path) -> Result<(), Error> {
         if fs::symlink_metadata(legacy).is_err() {
             return Ok(());
         }
@@ -265,7 +265,7 @@ impl Keeper<'_> {
                 save_system_allowed(path, &old)?;
             }
         }
-        fs::remove_file(legacy).map_err(|error| format!("{}: {error}", legacy.display()))
+        fs::remove_file(legacy).at(legacy)
     }
 }
 
@@ -288,17 +288,16 @@ pub(super) fn allowed_here(uid: u32) -> Remembered {
 /// Moves the list an older Guardian kept at `legacy` to `path`, as root:
 /// taken over as it is where there is no list at `path` yet and the old one
 /// is root's alone, and removed either way, so that one list counts.
-pub(super) fn move_legacy_allowed(path: &Path, legacy: &Path) -> Result<(), String> {
+pub(super) fn move_legacy_allowed(path: &Path, legacy: &Path) -> Result<(), Error> {
     roots().move_legacy(path, legacy)
 }
 
 /// Writes the system list, as root: readable by everyone, written only by
 /// root, in a directory everyone may enter.
-pub(super) fn save_system_allowed(path: &Path, allowed: &Remembered) -> Result<(), String> {
+pub(super) fn save_system_allowed(path: &Path, allowed: &Remembered) -> Result<(), Error> {
     use std::os::unix::fs::PermissionsExt as _;
     if let Some(directory) = path.parent() {
-        fs::create_dir_all(directory)
-            .map_err(|error| format!("{}: {error}", directory.display()))?;
+        fs::create_dir_all(directory).at(directory)?;
         // Whatever umask root's shell had: a list its users cannot reach
         // allows nothing. Exactly this mode, on this one directory, and
         // nothing below it is touched: root's other state lives here too.
@@ -307,8 +306,7 @@ pub(super) fn save_system_allowed(path: &Path, allowed: &Remembered) -> Result<(
         // half: root's alone to write, readable by everyone) keep the
         // modes their writers gave them, and both want what this sets on
         // their parent: everyone may enter, only root may write.
-        fs::set_permissions(directory, fs::Permissions::from_mode(0o755))
-            .map_err(|error| format!("{}: {error}", directory.display()))?;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).at(directory)?;
     }
     let json = Json::object(
         allowed
@@ -317,19 +315,21 @@ pub(super) fn save_system_allowed(path: &Path, allowed: &Remembered) -> Result<(
     )
     .to_string();
     if json.len() as u64 > MAX_SYSTEM_LIST_BYTES {
-        return Err("the list of allowed items is full; forget some first".into());
+        return Err(Error::Refused(
+            "the list of allowed items is full; forget some first".into(),
+        ));
     }
     write_text_mode(path, &json, 0o644)
 }
 
 /// Rewrites the list an older Guardian kept (see `old_allowed`); an empty
 /// one is removed.
-pub(super) fn save_old_allowed(directory: &Path, allowed: &Remembered) -> Result<(), String> {
+pub(super) fn save_old_allowed(directory: &Path, allowed: &Remembered) -> Result<(), Error> {
     let path = directory.join(ALLOWED);
     if allowed.is_empty() {
         return match fs::remove_file(&path) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                Err(format!("{}: {error}", path.display()))
+            Err(source) if source.kind() != std::io::ErrorKind::NotFound => {
+                Err(Error::Io { path, source })
             }
             _ => Ok(()),
         };
@@ -363,12 +363,12 @@ pub(super) fn has_told(directory: &Path) -> bool {
     directory.join(TOLD).is_file() || has_baseline(directory)
 }
 
-pub(super) fn save_told(directory: &Path, current: &Remembered) -> Result<(), String> {
+pub(super) fn save_told(directory: &Path, current: &Remembered) -> Result<(), Error> {
     write(&directory.join(TOLD), current)
 }
 
 /// Remembers the untrusted items of this sweep for the next `--diff`.
-pub(super) fn save_baseline(directory: &Path, current: &Remembered) -> Result<(), String> {
+pub(super) fn save_baseline(directory: &Path, current: &Remembered) -> Result<(), Error> {
     write(&directory.join(BASELINE), current)
 }
 
@@ -461,7 +461,7 @@ pub(crate) fn last_run_in(store_root: &Path) -> Option<LastRun> {
 
 /// Notes that a scheduled sweep started at `now`; `save_last_run` takes the
 /// note away. One that stays is a sweep that was killed, crashed or hangs.
-pub(super) fn mark_started(directory: &Path, now: u64) -> Result<(), String> {
+pub(super) fn mark_started(directory: &Path, now: u64) -> Result<(), Error> {
     write_text(&directory.join(STARTED), &now.to_string())
 }
 
@@ -510,7 +510,7 @@ pub(super) fn last_run(directory: &Path) -> Option<LastRun> {
     })
 }
 
-pub(super) fn save_last_run(directory: &Path, run: &LastRun) -> Result<(), String> {
+pub(super) fn save_last_run(directory: &Path, run: &LastRun) -> Result<(), Error> {
     let json = Json::object([
         ("at", Json::from(run.at)),
         ("outcome", Json::from(run.outcome.name())),
@@ -527,7 +527,7 @@ pub(super) fn save_last_run(directory: &Path, run: &LastRun) -> Result<(), Strin
     // The sweep ended, whether or not that can be written down.
     let unmarked = match fs::remove_file(directory.join(STARTED)) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            Err(format!("{}: {error}", directory.join(STARTED).display()))
+            Err(error).at(&directory.join(STARTED))
         }
         _ => Ok(()),
     };

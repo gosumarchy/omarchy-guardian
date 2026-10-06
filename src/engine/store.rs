@@ -52,8 +52,7 @@ impl Store {
     /// created only under an existing real directory owned by the effective
     /// user, so a run under `sudo -E` (which keeps the user's HOME) cannot
     /// leave root-owned directories in it.
-    pub(crate) fn open(root: PathBuf) -> Result<Self, String> {
-        let describe = |path: &Path, error: io::Error| format!("{}: {error}", path.display());
+    pub(crate) fn open(root: PathBuf) -> Result<Self, Error> {
         let uid = user::effective_uid()?;
         paths::private_dir(&root, uid)?;
 
@@ -62,10 +61,13 @@ impl Store {
             match DirBuilder::new().mode(0o700).create(&path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(describe(&path, error)),
+                Err(source) => return Err(Error::Io { path, source }),
             }
             if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
-                return Err(format!("{} is not a directory", path.display()));
+                return Err(Error::Refused(format!(
+                    "{} is not a directory",
+                    path.display()
+                )));
             }
         }
         Ok(Self {
@@ -331,7 +333,8 @@ mod tests {
 
         let error = Store::open(file.join("state").join("omarchy-guardian"))
             .err()
-            .unwrap();
+            .unwrap()
+            .to_string();
         // The kernel refuses the path itself (ENOTDIR) before any ancestor
         // check; either way nothing is created.
         assert!(error.to_lowercase().contains("not a directory"), "{error}");
@@ -344,7 +347,7 @@ mod tests {
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o770)).unwrap();
 
-        let error = Store::open(root).err().unwrap();
+        let error = Store::open(root).err().unwrap().to_string();
         assert!(error.contains("group or others"), "{error}");
     }
 
