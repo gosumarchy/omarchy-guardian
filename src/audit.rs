@@ -26,6 +26,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::model::{Named, SourceClass};
+use crate::error::Error;
 use crate::report::{Decision, Report};
 use crate::text::shown;
 #[cfg(not(test))]
@@ -303,7 +304,7 @@ impl Entry {
 }
 
 #[cfg(not(test))]
-fn send(text: &str) -> Result<(), String> {
+fn send(text: &str) -> Result<(), Error> {
     tools::run(
         Path::new(LOGGER),
         &["--journald".into()],
@@ -316,15 +317,14 @@ fn send(text: &str) -> Result<(), String> {
     )
     .and_then(tools::Captured::into_success)
     .map(drop)
-    .map_err(|error| error.to_string())
 }
 
 /// Under test nothing reaches the journal: the entries are kept for the
 /// test that wrote them, unless that test has the journal refuse them.
 #[cfg(test)]
-fn send(text: &str) -> Result<(), String> {
+fn send(text: &str) -> Result<(), Error> {
     if REFUSING.with(std::cell::Cell::get) {
-        return Err("no journal in this test".into());
+        return Err(Error::Refused("no journal in this test".into()));
     }
     SENT.with(|sent| sent.borrow_mut().push(text.to_string()));
     Ok(())
