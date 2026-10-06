@@ -1,9 +1,10 @@
 //! Tests for `rules`.
 
+use super::destructive::removes_root_or_home;
+use super::matchers::is_encoded_data_executed;
 use super::{
     RuleId, Scheme, extract_network_destinations, is_documentation, is_download_piped_to_shell,
-    is_encoded_data_executed, is_ip_host, is_sensitive_path, line_rules,
-    looks_like_credential_exfiltration, removes_root_or_home,
+    is_ip_host, is_sensitive_path, line_rules, looks_like_credential_exfiltration,
 };
 
 fn rules_for(line: &str) -> Vec<RuleId> {
@@ -250,7 +251,8 @@ fn what_a_line_runs_is_named() {
 
 #[test]
 fn a_download_saved_to_a_file_is_followed_to_where_it_runs() {
-    use super::{continues, fetched_file, runs_file};
+    use super::run::fetched_file;
+    use super::{continues, runs_file};
     for (line, file) in [
         (
             "curl -fssl https://x.example/i.sh -o /tmp/i.sh",
@@ -856,7 +858,9 @@ fn every_reader_knows_the_same_wrappers() {
 
 #[test]
 fn a_long_line_costs_each_reader_one_pass() {
-    use super::{formats_filesystem, pipes_into_shell, program_short_flag, run_globs, run_targets};
+    use super::destructive::formats_filesystem;
+    use super::matchers::program_short_flag;
+    use super::{pipes_into_shell, run_globs, run_targets};
     let started = std::time::Instant::now();
     // Many commands, many wrappers, a group never closed.
     assert!(!program_short_flag(
