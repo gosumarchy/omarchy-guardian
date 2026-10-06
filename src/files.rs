@@ -1,10 +1,11 @@
 //! Opening, reading and replacing files with care: the open(2) flags the
-//! standard library does not name, and a bounded read that follows no link.
+//! standard library does not name, a bounded read that follows no link,
+//! and a write that replaces a file in one step.
 
-use std::fs::{self, OpenOptions};
-use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::fs::{self, OpenOptions, Permissions};
+use std::io::{self, Read, Write as _};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt as _, chown};
+use std::path::{Path, PathBuf};
 
 /// `O_NOFOLLOW`, `O_DIRECTORY` and `O_NONBLOCK`. The generic Linux ABI
 /// (`x86_64`, `riscv64`) and Arm's give the first two different bits.
@@ -41,12 +42,89 @@ pub fn read_small_file(path: &Path, max: u64) -> Option<String> {
     (bytes.len() as u64 <= max).then(|| String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// How `write_atomic` makes the new file.
+pub struct AtomicWrite {
+    /// The new file's name until it is moved into place, in the directory
+    /// of the file it replaces. Whatever is under that name is removed
+    /// first. Each writer keeps a name of its own: another process may see
+    /// it, and two writers of one file must not share it unless they did.
+    pub temporary: PathBuf,
+    /// The mode the file is made with, less what the umask takes away.
+    pub mode: u32,
+    /// Gives the file exactly `mode` before anything is written, whatever
+    /// the umask.
+    pub exact_mode: bool,
+    /// Whom the written file is handed to before it is moved into place.
+    pub owner: Option<Owner>,
+    /// Waits for the text to reach the disk before the move.
+    pub sync: bool,
+}
+
+/// The owner and group a written file is given, and the mode it has then.
+pub struct Owner {
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+}
+
+impl AtomicWrite {
+    /// A file of the user's own (mode 0600 at most), not waited for.
+    pub fn private(temporary: PathBuf) -> Self {
+        Self {
+            temporary,
+            mode: 0o600,
+            exact_mode: false,
+            owner: None,
+            sync: false,
+        }
+    }
+}
+
+/// Saves `bytes` as `path`, all of them or none: they are written to a new
+/// file beside it, which is then moved over it, so a reader never sees half.
+/// The new file is made new, never written through a link left under its
+/// name, and does not stay behind where any step fails.
+pub fn write_atomic(path: &Path, bytes: &[u8], options: &AtomicWrite) -> io::Result<()> {
+    let temporary = &options.temporary;
+    drop(fs::remove_file(temporary));
+    let written = fill(bytes, options).and_then(|()| fs::rename(temporary, path));
+    if written.is_err() {
+        drop(fs::remove_file(temporary));
+    }
+    written
+}
+
+fn fill(bytes: &[u8], options: &AtomicWrite) -> io::Result<()> {
+    let temporary = &options.temporary;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(options.mode)
+        .open(temporary)?;
+    if options.exact_mode {
+        file.set_permissions(Permissions::from_mode(options.mode))?;
+    }
+    file.write_all(bytes)?;
+    if options.sync {
+        file.sync_all()?;
+    }
+    drop(file);
+    if let Some(owner) = &options.owner {
+        chown(temporary, Some(owner.uid), Some(owner.gid))?;
+        fs::set_permissions(temporary, Permissions::from_mode(owner.mode))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::{self, OpenOptions};
-    use std::os::unix::fs::{OpenOptionsExt, symlink};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
+    use std::path::Path;
 
-    use super::{O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK, read_small_file};
+    use super::{
+        AtomicWrite, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK, Owner, read_small_file, write_atomic,
+    };
     use crate::test_support::TempDir;
 
     #[test]
@@ -56,9 +134,8 @@ mod tests {
         let link = dir.path().join("link");
         fs::write(&file, "x").unwrap();
         symlink(&file, &link).unwrap();
-        let open = |path: &std::path::Path, flags: i32| {
-            OpenOptions::new().read(true).custom_flags(flags).open(path)
-        };
+        let open =
+            |path: &Path, flags: i32| OpenOptions::new().read(true).custom_flags(flags).open(path);
 
         assert!(open(&file, O_NOFOLLOW | O_NONBLOCK).is_ok());
         assert!(open(&link, O_NONBLOCK).is_ok());
@@ -111,5 +188,103 @@ mod tests {
             read_small_file(&through.join("file"), 8).as_deref(),
             Some("x")
         );
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    fn names(directory: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn an_atomic_write_replaces_the_file_and_leaves_nothing_else() {
+        let dir = TempDir::new("atomic-write");
+        let path = dir.path().join("record.json");
+        let temporary = dir.path().join("record.tmp");
+        // A leftover under the temporary name is not written through.
+        let elsewhere = dir.path().join("elsewhere");
+        fs::write(&elsewhere, "keep").unwrap();
+        symlink(&elsewhere, &temporary).unwrap();
+
+        let options = AtomicWrite::private(temporary);
+        write_atomic(&path, b"one", &options).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "one");
+        assert_eq!(mode(&path) & 0o177, 0);
+        write_atomic(&path, b"two", &options).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "two");
+        assert_eq!(fs::read_to_string(&elsewhere).unwrap(), "keep");
+        assert_eq!(names(dir.path()), ["elsewhere", "record.json"]);
+    }
+
+    #[test]
+    fn a_failed_atomic_write_leaves_the_old_file_and_no_new_one() {
+        let dir = TempDir::new("atomic-write-fails");
+        // A directory cannot be replaced by a file.
+        let path = dir.path().join("taken");
+        fs::create_dir(&path).unwrap();
+        let options = AtomicWrite::private(dir.path().join("taken.tmp"));
+        assert!(write_atomic(&path, b"text", &options).is_err());
+        assert!(path.is_dir());
+        assert_eq!(names(dir.path()), ["taken"]);
+
+        // Nor can a file be made where there is no directory.
+        let missing = dir.path().join("none/file");
+        let options = AtomicWrite::private(dir.path().join("none/file.tmp"));
+        assert!(write_atomic(&missing, b"text", &options).is_err());
+        assert_eq!(names(dir.path()), ["taken"]);
+    }
+
+    #[test]
+    fn an_atomic_write_gives_the_mode_and_owner_it_is_asked_for() {
+        let dir = TempDir::new("atomic-write-mode");
+        let made = |name: &str| {
+            (
+                dir.path().join(name),
+                dir.path().join(format!("{name}.tmp")),
+            )
+        };
+
+        // The mode at creation is at most the one asked for.
+        let (path, temporary) = made("created");
+        let options = AtomicWrite {
+            mode: 0o644,
+            sync: true,
+            ..AtomicWrite::private(temporary)
+        };
+        write_atomic(&path, b"x", &options).unwrap();
+        assert_eq!(mode(&path) & !0o644, 0);
+
+        // An exact mode is not narrowed by the umask.
+        let (path, temporary) = made("exact");
+        let options = AtomicWrite {
+            mode: 0o666,
+            exact_mode: true,
+            ..AtomicWrite::private(temporary)
+        };
+        write_atomic(&path, b"x", &options).unwrap();
+        assert_eq!(mode(&path), 0o666);
+
+        // Handed over (here to its owner already), it has the owner's mode.
+        let (path, temporary) = made("owned");
+        let metadata = fs::metadata(dir.path()).unwrap();
+        let options = AtomicWrite {
+            owner: Some(Owner {
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+                mode: 0o640,
+            }),
+            ..AtomicWrite::private(temporary)
+        };
+        write_atomic(&path, b"x", &options).unwrap();
+        assert_eq!(mode(&path), 0o640);
+        assert_eq!(fs::metadata(&path).unwrap().uid(), metadata.uid());
+        assert_eq!(names(dir.path()), ["created", "exact", "owned"]);
     }
 }

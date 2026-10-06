@@ -12,12 +12,12 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
-use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::Write as _;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::fs::{self, DirBuilder};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use crate::files::{AtomicWrite, write_atomic};
 use crate::paths;
 use crate::sha256::Sha256;
 use crate::user;
@@ -220,17 +220,11 @@ impl State {
     fn write(&self, what: &str, text: &str) {
         let Some(path) = self.path(what) else { return };
         let temporary = path.with_extension(format!("{what}.{}.tmp", std::process::id()));
-        drop(fs::remove_file(&temporary));
-        let written = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)
-            .and_then(|mut file| file.write_all(text.as_bytes()))
-            .and_then(|()| fs::rename(&temporary, &path));
-        if written.is_err() {
-            drop(fs::remove_file(&temporary));
-        }
+        drop(write_atomic(
+            &path,
+            text.as_bytes(),
+            &AtomicWrite::private(temporary),
+        ));
     }
 
     /// Whether the user said yes to `what` (a hash of exactly what was

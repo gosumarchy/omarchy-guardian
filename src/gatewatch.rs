@@ -17,7 +17,6 @@
 //! a program that also rewrites the record is not caught.
 
 use std::fs::{self, OpenOptions};
-use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -25,6 +24,7 @@ use std::time::{Duration, SystemTime};
 use crate::agent::Exposure;
 use crate::config::Settings;
 use crate::engine::store::Store;
+use crate::files::{AtomicWrite, write_atomic};
 use crate::json::Json;
 use crate::notify;
 use crate::paths;
@@ -360,18 +360,7 @@ fn observe_in(
 /// Saves `text` as `path`, private to the user, all of it or none.
 pub fn write(path: &Path, text: &str) -> std::io::Result<()> {
     let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-    drop(fs::remove_file(&temporary));
-    let written = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temporary)
-        .and_then(|mut file| file.write_all(text.as_bytes()))
-        .and_then(|()| fs::rename(&temporary, path));
-    if written.is_err() {
-        drop(fs::remove_file(&temporary));
-    }
-    written
+    write_atomic(path, text.as_bytes(), &AtomicWrite::private(temporary))
 }
 
 /// A lock file, removed when dropped.

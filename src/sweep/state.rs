@@ -6,13 +6,13 @@
 //! running as the user could otherwise allow its own autostart entry.
 
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::io::Write as _;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use super::collect::Item;
 use super::tier::Tier;
+use crate::files::{AtomicWrite, write_atomic};
 use crate::json::Json;
 use crate::paths;
 use crate::user;
@@ -99,23 +99,13 @@ fn write_text(path: &Path, text: &str) -> Result<(), String> {
 /// of the process: the root collector runs with one that would close a
 /// list everyone is meant to read.
 pub fn write_text_mode(path: &Path, text: &str, mode: u32) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
-    drop(fs::remove_file(&temporary));
-    let result = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(&temporary)
-        .and_then(|mut file| {
-            file.set_permissions(fs::Permissions::from_mode(mode))?;
-            file.write_all(text.as_bytes())
-        })
-        .and_then(|()| fs::rename(&temporary, path));
-    if result.is_err() {
-        drop(fs::remove_file(&temporary));
-    }
-    result.map_err(|error| format!("{}: {error}", path.display()))
+    let options = AtomicWrite {
+        mode,
+        exact_mode: true,
+        ..AtomicWrite::private(path.with_extension(format!("tmp.{}", std::process::id())))
+    };
+    write_atomic(path, text.as_bytes(), &options)
+        .map_err(|error| format!("{}: {error}", path.display()))
 }
 
 /// The list an older Guardian kept in the user's own state directory. It
