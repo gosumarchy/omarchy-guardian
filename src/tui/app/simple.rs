@@ -7,9 +7,9 @@ use crate::config::file::AgentDefaults;
 use crate::config::file::PartialConfig;
 use crate::config::load::FileStatus;
 use crate::config::model::{Named, Profile, SourceClass};
+use crate::integrations::{Integration, Plan, State};
 use crate::tui::canvas::{Canvas, Style, color};
 use crate::tui::fields::{Field, Scope, Setting};
-use crate::tui::integrations::{Integration, Plan, State};
 use crate::tui::mascot::{self, Mood};
 use crate::tui::term::Key;
 
@@ -628,9 +628,9 @@ mod tests {
     use crate::config::file::PartialConfig;
     use crate::config::load::FileStatus;
     use crate::config::model::Profile;
+    use crate::integrations::{Paths, Step};
     use crate::test_support::TempDir;
     use crate::tui::canvas::Canvas;
-    use crate::tui::integrations::{Paths, Step};
     use crate::tui::term::Key;
 
     fn files(paths: Option<Paths>) -> Loaded {

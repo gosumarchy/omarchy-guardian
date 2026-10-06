@@ -11,8 +11,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::integrations::{Integration, Paths, State};
-use super::paths;
 use crate::agent;
 use crate::config::Settings;
 use crate::config::model::{
@@ -21,9 +19,11 @@ use crate::config::model::{
 use crate::config::weaker;
 use crate::engine::store::Store;
 use crate::gatewatch::{self, Level, Observer};
+use crate::integrations::{Integration, Paths, State};
 use crate::json::Json;
 use crate::notify;
 use crate::pacman;
+use crate::protect::paths;
 use crate::rules::RuleId;
 use crate::sweep::root::{RESULTS, RootPart, from_results, results_problem};
 use crate::sweep::state::{self, LastRun, Outcome};
@@ -173,7 +173,7 @@ fn collect() -> Status {
 /// with nothing on this machine to guard (the AUR gate without yay, the
 /// PATH wrappers without Omarchy) is not protection missing; any other
 /// gate that cannot be there is.
-pub(super) fn gate_issue(paths: &Paths, integration: Integration, state: &State) -> Option<String> {
+pub(crate) fn gate_issue(paths: &Paths, integration: Integration, state: &State) -> Option<String> {
     match state {
         State::On => None,
         State::Unavailable(_) if !paths.applies(integration) => None,
@@ -1044,7 +1044,7 @@ mod tests {
         use crate::config::Settings;
         use crate::config::file::PartialConfig;
         use crate::config::model::{AiRequirement, Profile, SourceClass};
-        use crate::tui::integrations::Integration;
+        use crate::integrations::Integration;
         let defaults = Settings::from_parts(PartialConfig::default(), PartialConfig::default());
         for gate in [
             Integration::PacmanHook,

@@ -11,18 +11,20 @@
 //! that need root or another program run as commands on the terminal (so
 //! `sudo` can ask for a password); the rest are small, exact file edits.
 
+mod luascan;
+mod menufile;
+mod shellscan;
+
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use super::luascan;
-use super::menufile;
-use super::shellscan::{self, Loads};
 use crate::config::model::RootConsent;
 use crate::json::Json;
 use crate::sweep::own;
+use shellscan::Loads;
 
 pub const HOOK_SOURCE: &str = "/usr/share/omarchy-guardian/omarchy-guardian.hook";
 pub const HOOK_TARGET: &str = "/etc/pacman.d/hooks/omarchy-guardian.hook";
@@ -59,7 +61,7 @@ const HYPR_LINE: &str = "pcall(dofile, \"/usr/lib/omarchy-guardian/hyprland-path
 /// (`10-omarchy`), and the line in it that counts.
 const SESSION_ENV_NAME: &str = "90-omarchy-guardian";
 const SESSION_ENV_LINE: &str = "export PATH=\"/usr/lib/omarchy-guardian/bin:$PATH\"";
-const SESSION_ENV: &str = "# Omarchy Guardian: theme and plugin installs found on PATH go through Guardian.\n# Written by `omarchy-guardian protect`, removed by `omarchy-guardian protect --off`.\nexport PATH=\"/usr/lib/omarchy-guardian/bin:$PATH\"\n";
+pub(crate) const SESSION_ENV: &str = "# Omarchy Guardian: theme and plugin installs found on PATH go through Guardian.\n# Written by `omarchy-guardian protect`, removed by `omarchy-guardian protect --off`.\nexport PATH=\"/usr/lib/omarchy-guardian/bin:$PATH\"\n";
 /// AUR helpers Guardian has no gate for.
 const UNGATED_HELPERS: [&str; 3] = ["pikaur", "aura", "trizen"];
 /// What is left of a file as it was before Guardian first edited it.
@@ -2340,7 +2342,7 @@ mod tests {
 
     #[test]
     fn what_has_nothing_to_guard_on_this_machine_is_not_a_problem() {
-        use super::super::status::gate_issue;
+        use crate::status::gate_issue;
         let dir = TempDir::new("integrations-applies");
         let paths = paths(&dir);
         fs::create_dir_all(&paths.wrappers).unwrap();

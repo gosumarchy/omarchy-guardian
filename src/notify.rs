@@ -251,7 +251,7 @@ pub fn save_and_open(title: &str, detail: &str, ran: Ran) -> Option<(PathBuf, St
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
-        crate::tui::status::mark_seen_unless_waiting(directory, &id, now);
+        crate::status::mark_seen_unless_waiting(directory, &id, now);
     }
     if env::var_os(QUIET).is_none() && Path::new(LAUNCH_BROWSER).is_file() {
         let env = session_env();

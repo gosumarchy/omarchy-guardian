@@ -20,11 +20,13 @@ use crate::makepkg_gate;
 use crate::notify;
 use crate::pacman::{self, HookArgs};
 use crate::permit::{self, Content, Standing};
+use crate::protect;
 use crate::report::{Blocked, Decision, Report};
 use crate::review::{self, ReviewContext};
 use crate::sandbox;
 use crate::scan::{self, ScanConfig};
 use crate::setup;
+use crate::status;
 use crate::sweep;
 use crate::tools::OpenCode;
 use crate::tui;
@@ -264,7 +266,7 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
         Invocation::Protect { yes, off } => protect_command(yes, off),
         Invocation::Test => {
             outln!("Testing the reviewer with a malicious and a harmless sample...");
-            let (report, passed) = tui::test();
+            let (report, passed) = protect::test();
             outln!("{report}");
             if passed {
                 ExitCode::SUCCESS
@@ -309,9 +311,9 @@ fn preflight_command(settings: &Settings) -> ExitCode {
 /// it goes into the audit trail.
 fn protect_command(yes: bool, off: bool) -> ExitCode {
     let outcome = if off {
-        tui::unprotect(yes, &mut TtyConfirm)
+        protect::unprotect(yes, &mut TtyConfirm)
     } else {
-        tui::protect(yes, &mut TtyConfirm)
+        protect::protect(yes, &mut TtyConfirm)
     };
     match outcome {
         Ok(message) => {
@@ -649,14 +651,14 @@ fn status_command(mode: StatusMode) -> ExitCode {
         // Written as it is: the terminal-safe output would rewrite a
         // hidden character inside a string into something that is no JSON.
         StatusMode::Shell => {
-            writeln!(io::stdout(), "{}", tui::status::json()).map_err(|error| error.to_string())
+            writeln!(io::stdout(), "{}", status::json()).map_err(|error| error.to_string())
         }
         StatusMode::Waybar => {
-            outln!("{}", tui::status::waybar());
+            outln!("{}", status::waybar());
             Ok(())
         }
-        StatusMode::Dismiss => tui::status::dismiss(),
-        StatusMode::OpenReport => tui::status::open_report(),
+        StatusMode::Dismiss => status::dismiss(),
+        StatusMode::OpenReport => status::open_report(),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -794,7 +796,7 @@ fn acknowledge_command(settings: &Settings, confirm: &mut dyn Confirm) -> Result
         "weaker settings acknowledged: {}",
         weaker::to_acknowledge(settings).join(", ")
     ));
-    tui::status::chosen();
+    status::chosen();
     Ok("Acknowledged; the bar no longer counts them as a problem.".into())
 }
 
