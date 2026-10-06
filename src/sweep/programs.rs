@@ -168,6 +168,57 @@ const VALUE_OPTIONS: &[&str] = &[
     "-O",
 ];
 
+/// The options of the program called `name` that take the next argument
+/// as their value, for a command line, where the program is known: there
+/// `python3 -O x.py data` has one script, and `data` is not it.
+fn value_options_of(name: &str) -> &'static [&'static str] {
+    let is = |programs: &[&str]| programs.iter().any(|program| is_named(name, program));
+    if is_loader(name) {
+        &[
+            "--library-path",
+            "--preload",
+            "--audit",
+            "--argv0",
+            "--glibc-hwcaps-prepend",
+            "--glibc-hwcaps-mask",
+        ]
+    } else if is_shell(name) && !is(NETWORK_SHELLS) {
+        &["-o", "-O"]
+    } else if is(&["python", "pypy"]) {
+        &["-W", "-X"]
+    } else if is(&["ruby"]) {
+        &["-I", "-r"]
+    } else if is(&["perl", "gjs", "nu"]) {
+        &["-I"]
+    } else if is(&["node", "bun", "deno"]) {
+        &["-r", "--require", "--import", "--loader"]
+    } else if is(&["java"]) {
+        &["-cp", "-classpath", "--class-path", "--module-path"]
+    } else {
+        &[]
+    }
+}
+
+/// Whether `option` gives the program called `name` its code on the
+/// command line, so that no script follows (`perl -e code`, `php -r
+/// code`). For a shell `-e` is a plain flag (`bash -e script`).
+pub fn takes_code(name: &str, option: &str) -> bool {
+    let is = |programs: &[&str]| programs.iter().any(|program| is_named(name, program));
+    if is_shell(name) {
+        false
+    } else if is(&["php"]) {
+        option == "-r"
+    } else if is(&["node", "bun", "deno"]) {
+        matches!(option, "-e" | "-p" | "--eval" | "--print")
+    } else if is(&["perl"]) {
+        matches!(option, "-e" | "-E")
+    } else if is(&["awk", "gawk", "mawk"]) {
+        matches!(option, "-e" | "--source")
+    } else {
+        option == "-e"
+    }
+}
+
 /// What one argument of an interpreter is, on the way to its script.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Argument {
@@ -182,16 +233,37 @@ pub enum Argument {
 
 /// Reads the arguments of an interpreter (or the loader) one by one, up
 /// to its script.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ScriptArguments {
     may_be_value: bool,
+    value_options: &'static [&'static str],
+}
+
+/// For a process, whose program is told only by a file's name: any of
+/// `VALUE_OPTIONS` may have taken a value.
+impl Default for ScriptArguments {
+    fn default() -> Self {
+        Self {
+            may_be_value: false,
+            value_options: VALUE_OPTIONS,
+        }
+    }
 }
 
 impl ScriptArguments {
+    /// For a command line that starts the program called `name`: only its
+    /// own options take a value.
+    pub fn of(name: &str) -> Self {
+        Self {
+            may_be_value: false,
+            value_options: value_options_of(name),
+        }
+    }
+
     /// What `argument`, the next one, is.
     pub fn read(&mut self, argument: &str) -> Argument {
         if argument.starts_with('-') {
-            self.may_be_value = VALUE_OPTIONS.contains(&argument);
+            self.may_be_value = self.value_options.contains(&argument);
             Argument::Option
         } else if std::mem::take(&mut self.may_be_value) {
             Argument::ScriptOrValue
@@ -229,7 +301,7 @@ mod tests {
         Argument, LANGUAGES, MULTI_CALL, NETCATS, NETWORK_SHELLS, OTHER_SHELLS, SCRIPT_SHELLS,
         SERVERS_AND_TUNNELS, ScriptArguments, TOLD_BY_ARGUMENTS, is_interpreter, is_named,
         is_netcat, is_relay, is_script_shell, is_shell, is_shell_without_client, runs_a_script,
-        script_arguments,
+        script_arguments, takes_code,
     };
 
     const LISTS: &[&[&str]] = &[
@@ -338,6 +410,108 @@ mod tests {
         // A relay is told by its exact name.
         assert!(is_relay("socat") && is_relay("busybox") && is_relay("nc.openbsd"));
         assert!(!is_relay("socat2") && !is_relay("ssh"));
+    }
+
+    /// The names each check knew before the lists became one, written
+    /// out: taking one off a list fails here.
+    #[test]
+    fn no_name_a_check_knew_is_lost() {
+        let shells = [
+            "sh", "bash", "dash", "zsh", "ksh", "ash", "mksh", "fish", "tcsh", "csh", "elvish",
+            "nu", "xonsh",
+        ];
+        let languages = [
+            "python", "python3", "pypy", "perl", "ruby", "node", "bun", "deno", "php", "lua",
+            "luajit", "java", "awk", "gawk", "mawk", "tclsh", "wish", "expect", "R", "Rscript",
+            "pwsh", "erl", "beam.smp", "julia", "dotnet", "mono", "guile", "gjs",
+        ];
+        let relays = [
+            "nc",
+            "ncat",
+            "netcat",
+            "socat",
+            "busybox",
+            "toybox",
+            "systemd-socket-activate",
+            "telnetd",
+            "in.telnetd",
+            "dropbear",
+            "tcpserver",
+            "xinetd",
+            "inetd",
+            "websocat",
+            "chisel",
+            "gost",
+            "frpc",
+            "frps",
+            "ngrok",
+            "cloudflared",
+            "bore",
+            "rathole",
+        ];
+        for name in shells {
+            assert!(is_shell(name) && runs_a_script(name), "{name}");
+            assert_eq!(
+                is_shell_without_client(name),
+                !["nu", "xonsh"].contains(&name),
+                "{name}"
+            );
+        }
+        for name in languages {
+            assert!(runs_a_script(name) && !is_shell(name), "{name}");
+        }
+        for name in relays {
+            assert!(is_relay(name), "{name}");
+        }
+        for name in shells.iter().chain(&languages).chain(&relays[..6]) {
+            assert!(is_interpreter(name), "{name}");
+        }
+        assert!(is_interpreter("openssl") && is_interpreter("ld.so"));
+    }
+
+    #[test]
+    fn only_a_programs_own_options_take_a_value_on_a_command_line() {
+        let read = |name: &str, arguments: &[&str]| -> Vec<Argument> {
+            let mut reader = ScriptArguments::of(name);
+            arguments
+                .iter()
+                .map(|argument| reader.read(argument))
+                .collect()
+        };
+        // For Python `-O` and `-I` are plain flags; `-W` takes a value.
+        assert_eq!(
+            read("python3", &["-O", "x.py"]),
+            [Argument::Option, Argument::Script]
+        );
+        assert_eq!(read("python3.13", &["-I", "x.py"])[1], Argument::Script);
+        assert_eq!(
+            read("python3", &["-W", "ignore"])[1],
+            Argument::ScriptOrValue
+        );
+        assert_eq!(read("perl", &["-I", "lib"])[1], Argument::ScriptOrValue);
+        assert_eq!(read("perl", &["-W", "x.pl"])[1], Argument::Script);
+        assert_eq!(
+            read("bash", &["-o", "pipefail"])[1],
+            Argument::ScriptOrValue
+        );
+        assert_eq!(read("java", &["-cp", "a:b"])[1], Argument::ScriptOrValue);
+        assert_eq!(read("gawk", &["-O", "data"])[1], Argument::Script);
+        // Code on the command line, by each program's own option.
+        for (name, option, code) in [
+            ("perl", "-e", true),
+            ("perl5.42", "-E", true),
+            ("php", "-r", true),
+            ("php", "-e", false),
+            ("node", "--eval", true),
+            ("node", "-p", true),
+            ("gawk", "--source", true),
+            ("ruby", "-e", true),
+            ("bash", "-e", false),
+            ("tcsh", "-e", false),
+            ("python3", "-W", false),
+        ] {
+            assert_eq!(takes_code(name, option), code, "{name} {option}");
+        }
     }
 
     #[test]

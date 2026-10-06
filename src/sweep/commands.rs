@@ -1380,12 +1380,18 @@ fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
     }
     if programs::runs_a_script(name) {
         let shell = is_script_shell(name);
-        let mut arguments = ScriptArguments::default();
+        let mut arguments = ScriptArguments::of(name);
+        let mut values = 0;
         while let Some(word) = words.next() {
             // `sh -c "command line"` (also `-lc`, `-ic`) runs that line:
             // each command in it is found the same way, wrappers and
             // all. What `/usr/bin` holds is not listed again.
-            if word.starts_with('-') && !word.starts_with("--") && word.ends_with('c') {
+            // (Not `java -verbose:gc`: an option with a value of its own.)
+            if word.starts_with('-')
+                && !word.starts_with("--")
+                && word.ends_with('c')
+                && !word.contains([':', '='])
+            {
                 if let Some(code) = words.next() {
                     let (commands, more) = split_commands(code);
                     if more {
@@ -1403,7 +1409,7 @@ fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
             }
             // `perl -e code` is given no script. For a shell `-e` is a
             // plain flag (`bash -e script`).
-            if word == "-e" && !programs::is_shell(name) {
+            if programs::takes_code(name, word) {
                 break;
             }
             // `bash -o pipefail …`: for a shell the option's name is not
@@ -1432,10 +1438,20 @@ fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
             if shell || argument == Argument::Script {
                 break;
             }
+            // Each word after an option that takes a value is looked at;
+            // a line with no end of them is not followed to its end.
+            values += 1;
+            if values > MAX_OPTION_VALUES {
+                lookup.capped.set(true);
+                break;
+            }
         }
     }
     found
 }
+
+/// The most values of options that are looked at on the way to a script.
+const MAX_OPTION_VALUES: usize = 8;
 
 /// The most commands of one line a shell runs that are looked up.
 pub const MAX_INNER_COMMANDS: usize = 1024;
@@ -2176,15 +2192,33 @@ mod tests {
             lookup.targets("perl -e 'print 1' /home/u/x.sh"),
             ["usr/bin/perl"]
         );
-        // The script after the value of an option; where the option may
-        // be a plain flag, the word after the script is looked at too.
+        // The script after the value of an option. An option that is a
+        // plain flag for this program takes none: what follows the script
+        // is the script's own, a file of data that is not looked at.
         assert_eq!(
             lookup.targets("python3 -W ignore /home/u/x.py"),
             ["usr/bin/python3", "home/u/x.py"]
         );
         assert_eq!(
             lookup.targets("python3 -I /home/u/x.py /home/u/data"),
-            ["usr/bin/python3", "home/u/x.py", "home/u/data"]
+            ["usr/bin/python3", "home/u/x.py"]
+        );
+        assert_eq!(
+            lookup.targets("perl -I /home/u/lib /home/u/x.py /home/u/data"),
+            ["usr/bin/perl", "home/u/x.py"]
+        );
+        // Code given another way than `-e`, and an option that only ends
+        // like `-c`.
+        let data = "home/u/data".to_string();
+        assert!(
+            !lookup
+                .targets("php -r 'echo 1;' /home/u/data")
+                .contains(&data)
+        );
+        assert!(
+            lookup
+                .targets("java -verbose:gc -cp /home/u/lib /home/u/x.py")
+                .contains(&"home/u/x.py".to_string())
         );
         assert_eq!(
             lookup.targets("python3 /home/u/x.py /home/u/data"),
