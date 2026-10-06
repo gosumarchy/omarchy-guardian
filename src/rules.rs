@@ -1131,10 +1131,12 @@ fn globs_run_by(statement: &str, piped: bool, is_glob: &dyn Fn(&str) -> bool) ->
     };
     let name = command.program.as_str();
     let unversioned = unversioned(name);
-    let assigned = statement
-        .split_whitespace()
-        .next()
-        .is_some_and(|word| word.contains("=$(") || word.contains("=`"));
+    // Also the value alone, as it is read from after the `=`.
+    let value = statement.trim_start();
+    let assigned = statement.contains("=$(")
+        || statement.contains("=`")
+        || value.starts_with("$(")
+        || value.starts_with('`');
     let arguments: Vec<&str> = command.arguments.iter().map(String::as_str).collect();
     let operands = arguments
         .iter()
@@ -1694,7 +1696,7 @@ fn formats_filesystem(line: &str) -> bool {
                 .len()
                 .checked_sub(2)
                 .and_then(|index| before.get(index))
-                .is_some_and(|word| word.starts_with('-') && !word.contains('='));
+                .is_some_and(|word| word.starts_with('-') && !word.contains('=') && word != "--");
             !handles_file || after_option || before.iter().any(|word| word.contains("mkfs."))
         })
 }
@@ -3335,7 +3337,14 @@ mod tests {
         ] {
             assert_eq!(run_globs(line), globs, "{line}");
         }
-        for line in ["timeout 5 ls scripts/*", "X=1 cat notes/*.txt"] {
+        for line in [
+            "timeout 5 ls scripts/*",
+            "X=1 cat notes/*.txt",
+            // What a variable is given by `find` is a name found.
+            "x=$(find scripts -type f | head -1)",
+            "local x=$(find target -name app | head -n 1)",
+            "x=`find scripts -type f | head -1`",
+        ] {
             assert!(run_globs(line).is_empty(), "{line}");
         }
         // What is read into a shell behind a wrapper, or into any shell.
