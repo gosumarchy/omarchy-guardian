@@ -402,16 +402,15 @@ pub(super) fn runs_substitution(line: &str, source: &dyn Fn(&str) -> bool) -> bo
         .any(|found| source(found.body) && is_run(line, found))
 }
 
-/// Whether `word` is `$name` or `${name}`, quoted or not.
-pub(super) fn is_reference(word: &str, name: &str) -> bool {
-    let word = word.trim().trim_matches(['"', '\'']);
-    word.strip_prefix('$').is_some_and(|rest| {
-        rest == name
-            || rest
-                .strip_prefix('{')
-                .and_then(|rest| rest.strip_suffix('}'))
-                == Some(name)
-    })
+/// The names `word` is a reference to, quoted or not: `x` for `$x` and for
+/// `${x}`. What follows the `$` is one, and so is what stands in braces
+/// after it.
+pub(super) fn referenced(word: &str) -> [Option<&str>; 2] {
+    let rest = word.trim().trim_matches(['"', '\'']).strip_prefix('$');
+    let braced = rest
+        .and_then(|rest| rest.strip_prefix('{'))
+        .and_then(|rest| rest.strip_suffix('}'));
+    [rest, braced]
 }
 
 /// A variable name as a shell accepts it.
@@ -465,7 +464,7 @@ pub(super) fn assignments(statement: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        argument, assignments, command, is_reference, pipeline, runs_substitution, statements,
+        argument, assignments, command, pipeline, referenced, runs_substitution, statements,
         substitutions,
     };
 
@@ -596,9 +595,11 @@ mod tests {
         );
         assert!(pairs("make CC=gcc").is_empty());
         assert!(pairs("[ $a = 1 ]").is_empty());
+        let is_reference = |word: &str, name: &str| referenced(word).contains(&Some(name));
         assert!(is_reference("\"${x}\"", "x"));
         assert!(is_reference("$x", "x"));
         assert!(!is_reference("$xy", "x"));
         assert!(!is_reference("\"$x/y\"", "x"));
+        assert_eq!(referenced("x"), [None, None]);
     }
 }
