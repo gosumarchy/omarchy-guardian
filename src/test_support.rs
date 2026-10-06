@@ -54,6 +54,31 @@ pub fn give(path: &Path, owner: u32) -> bool {
     std::os::unix::fs::lchown(path, Some(owner), None).is_ok()
 }
 
+/// Makes `path` and everything below it the user `owner`'s, as [`give`]
+/// does for one; `false` as soon as one cannot be given.
+pub fn give_tree(path: &Path, owner: u32) -> bool {
+    if !give(path, owner) {
+        return false;
+    }
+    let below = fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir());
+    !below
+        || fs::read_dir(path).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .all(|entry| give_tree(&entry.path(), owner))
+        })
+}
+
+/// Makes `path` in a fixture, and what is below it, a user's own, as a
+/// home or a crontab is. A test run by a user owns it already; run by root
+/// (a container), everything in the fixture is root's, and it is given to
+/// [`NOBODY`]. `false` where that cannot be done (root of a user namespace
+/// with no such user), for the test to do without.
+pub fn owned_by_a_user(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path).is_ok_and(|metadata| metadata.uid() != 0) || give_tree(path, NOBODY)
+}
+
 /// Tests that need an Arch tool skip themselves where it is missing.
 pub fn tool_available(path: &str) -> bool {
     Path::new(path).is_file()

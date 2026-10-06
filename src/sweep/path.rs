@@ -902,7 +902,7 @@ mod tests {
     use crate::sweep::collect::{self, Origin, Scope};
     use crate::sweep::index::PackageIndex;
     use crate::sweep::tier::Tier;
-    use crate::test_support::TempDir;
+    use crate::test_support::{TempDir, owned_by_a_user};
 
     #[test]
     fn a_path_is_read_in_order_and_split_at_the_systems_own() {
@@ -1038,9 +1038,6 @@ mod tests {
     fn every_file_a_shell_or_a_session_reads_counts_for_the_path() {
         let dir = TempDir::new("sweep-path-sources");
         let root = dir.path();
-        if std::os::unix::fs::MetadataExt::uid(&fs::metadata(root).unwrap()) == 0 {
-            return;
-        }
         let write = |path: &str, text: &str| {
             fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
             fs::write(root.join(path), text).unwrap();
@@ -1099,6 +1096,10 @@ mod tests {
             index: &index,
             origin: Origin::System,
         };
+        // A home is its user's, whoever runs the test.
+        if !owned_by_a_user(&root.join("home")) {
+            return;
+        }
         let found = search(&scope);
         for directory in ["a", "b", "c", "d", "e", "f", "g"] {
             let directory = format!("home/u/{directory}/bin");
@@ -1204,11 +1205,6 @@ mod tests {
     fn programs_ahead_of_the_systems_own_are_found_where_the_start_up_files_put_them() {
         let dir = TempDir::new("sweep-path");
         let root = dir.path();
-        // Run as root (a container), every directory here is root's own:
-        // there is nobody else who could write them.
-        if std::os::unix::fs::MetadataExt::uid(&fs::metadata(root).unwrap()) == 0 {
-            return;
-        }
         let write = |path: &str, text: &str| {
             fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
             fs::write(root.join(path), text).unwrap();
@@ -1243,6 +1239,10 @@ mod tests {
             index: &index,
             origin: Origin::System,
         };
+        // A home is its user's, whoever runs the test.
+        if !owned_by_a_user(&root.join("home")) {
+            return;
+        }
         let found = search(&scope);
         assert_eq!(found.directories[0], "home/u/tools/bin");
         assert!(found.shadowing.contains(&"home/u/tools/bin".to_string()));
@@ -1311,9 +1311,6 @@ mod tests {
     fn a_directory_behind_the_systems_own_takes_no_commands_name() {
         let dir = TempDir::new("sweep-path-behind");
         let root = dir.path();
-        if std::os::unix::fs::MetadataExt::uid(&fs::metadata(root).unwrap()) == 0 {
-            return;
-        }
         let write = |path: &str, text: &str| {
             fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
             fs::write(root.join(path), text).unwrap();
@@ -1330,6 +1327,10 @@ mod tests {
         // no command's name there.
         write("home/u/.bashrc", "export PATH=\"$PATH:$HOME/.local/bin\"\n");
         write("home/u/.local/bin/sudo", "#!/bin/sh\n");
+        // A home is its user's, whoever runs the test.
+        if !owned_by_a_user(&root.join("home")) {
+            return;
+        }
         let behind = search(&scope);
         assert!(!behind.shadowing.contains(&"home/u/.local/bin".to_string()));
         assert!(

@@ -1770,7 +1770,7 @@ mod tests {
     use crate::sha256::Sha256;
     use crate::sweep::index::PackageIndex;
     use crate::sweep::tier::Tier;
-    use crate::test_support::TempDir;
+    use crate::test_support::{TempDir, owned_by_a_user};
 
     fn write(root: &Path, path: &str, text: &str) {
         fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
@@ -2315,15 +2315,15 @@ mod tests {
 
     #[test]
     fn root_only_looks_where_a_user_points_if_the_user_could_too() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new("sweep-steered");
         let root = dir.path();
-        // Run as root (a container), every file here is root's own, which
-        // nobody else steers: there is no user to play.
-        if fs::metadata(root).unwrap().uid() == 0 {
+        // A crontab is its user's, whoever runs the test.
+        write(root, "var/spool/cron/u", "* * * * * /etc/secret\n");
+        write(root, "var/spool/cron/v", "* * * * * /etc/open\n");
+        if !owned_by_a_user(&root.join("var/spool/cron")) {
             return;
         }
-        write(root, "var/spool/cron/u", "* * * * * /etc/secret\n");
         write(root, "etc/secret", "pin 1234\n");
         write(root, "etc/open", "public\n");
         write(root, "root/private/key", "key\n");
@@ -2349,7 +2349,6 @@ mod tests {
         let crontab = super::item(&as_root, Category::Cron, "var/spool/cron/u".into(), None);
         assert_eq!(crontab.runs, ["/etc/secret"]);
         assert!(follow_as(&as_root, &crontab).is_empty());
-        write(root, "var/spool/cron/v", "* * * * * /etc/open\n");
         let open_crontab = super::item(&as_root, Category::Cron, "var/spool/cron/v".into(), None);
         assert_eq!(follow_as(&as_root, &open_crontab), ["etc/open"]);
         // Nor where a user's link leads, directly or through a link only
