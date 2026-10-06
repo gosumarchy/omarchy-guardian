@@ -662,7 +662,9 @@ Directories the search for setuid and setgid files cannot list are counted. In
 your own sweep, which cannot list `/root` and much of `/var`, one note says
 how many and leaves them to the root checks. For the root checks they are not
 checked: one sentence says how many and names one, and the sweep is
-**incomplete**.
+**incomplete**. A place on a filesystem mounted `nosuid` is not counted: the
+bits have no effect there, and a user's own FUSE mount (sshfs, rclone) is
+closed to root as well.
 
 ## How the machine was started
 

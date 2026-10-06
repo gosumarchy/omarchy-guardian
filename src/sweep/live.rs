@@ -1545,10 +1545,75 @@ fn taint_flags(taint: u64) -> String {
 struct Closed {
     count: usize,
     first: Option<String>,
+    /// Where set-id bits have no effect: what cannot be listed there (a
+    /// user's own FUSE mount, closed to root too) holds nothing to find.
+    without_set_id: Vec<String>,
+}
+
+/// The mount points of a `/proc/self/mountinfo` that are mounted `nosuid`,
+/// without their leading `/`.
+fn nosuid_mounts(mountinfo: &str) -> Vec<String> {
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(' ').skip(4);
+            let place = fields.next()?;
+            let options = fields.next()?;
+            options
+                .split(',')
+                .any(|option| option == "nosuid")
+                .then(|| mount_path(place).trim_start_matches('/').to_string())
+        })
+        .filter(|place| !place.is_empty())
+        .collect()
+}
+
+/// A mount point as the kernel writes it, with its `\040`-style escapes
+/// read back.
+fn mount_path(written: &str) -> String {
+    let mut bytes = Vec::with_capacity(written.len());
+    let mut rest = written.as_bytes();
+    while let Some((&byte, after)) = rest.split_first() {
+        let escaped = (byte == b'\\')
+            .then(|| after.get(..3))
+            .flatten()
+            .and_then(|digits| std::str::from_utf8(digits).ok())
+            .filter(|digits| digits.bytes().all(|digit| (b'0'..=b'7').contains(&digit)))
+            .and_then(|digits| u8::from_str_radix(digits, 8).ok());
+        if let Some(escaped) = escaped {
+            bytes.push(escaped);
+            rest = &after[3..];
+        } else {
+            bytes.push(byte);
+            rest = after;
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 impl Closed {
+    /// For a search of the real system, with its mounts read once.
+    fn of(scope: &Scope<'_>) -> Self {
+        let mountinfo = if scope.root == Path::new("/") {
+            fs::read_to_string("/proc/self/mountinfo").unwrap_or_default()
+        } else {
+            String::new()
+        };
+        Self {
+            without_set_id: nosuid_mounts(&mountinfo),
+            ..Self::default()
+        }
+    }
+
     fn add(&mut self, directory: &str) {
+        let inert = self.without_set_id.iter().any(|mount| {
+            directory
+                .strip_prefix(mount.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        });
+        if inert {
+            return;
+        }
         self.count += 1;
         if self.first.as_deref().is_none_or(|first| directory < first) {
             self.first = Some(directory.to_string());
@@ -1580,7 +1645,7 @@ impl Closed {
 /// Setuid and setgid files that no package vouches for.
 fn set_id_files(scope: &Scope<'_>, found: &mut Found) {
     let mut looked_at = 0;
-    let mut closed = Closed::default();
+    let mut closed = Closed::of(scope);
     let root = scope.origin == Origin::Root;
     'walk: for start in PRIVILEGED_ROOTS {
         let mut pending = vec![(*start).to_string()];
@@ -1627,13 +1692,24 @@ fn set_id_files(scope: &Scope<'_>, found: &mut Found) {
                 }
                 // An entry that went away meanwhile is nothing; one that
                 // is there and cannot be asked about may be anything.
-                let (entry, metadata) = match entry.and_then(|entry| {
-                    let metadata = entry.metadata()?;
-                    Ok((entry, metadata))
-                }) {
-                    Ok(read) => read,
+                let entry = match entry {
+                    Ok(entry) => entry,
                     Err(error) => {
                         whole = whole && error.kind() == io::ErrorKind::NotFound;
+                        continue;
+                    }
+                };
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        // Counted by its own name: a mount closed to
+                        // root shows here, not when it is opened.
+                        if error.kind() != io::ErrorKind::NotFound {
+                            closed.add(&format!(
+                                "{directory}/{}",
+                                entry.file_name().to_string_lossy()
+                            ));
+                        }
                         continue;
                     }
                 };
@@ -4814,5 +4890,36 @@ mod tests {
             super::capabilities_below(&getcap, &[]),
             Ok(vec![("usr/bin/x".to_string(), "cap_setuid=ep".to_string())])
         );
+    }
+
+    #[test]
+    fn a_place_closed_on_a_mount_without_set_id_holds_nothing_to_find() {
+        use super::{Closed, nosuid_mounts};
+
+        let mountinfo = "\
+36 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw
+90 36 0:50 / /home/u/remote rw,nosuid,nodev,relatime shared:60 - fuse.sshfs host: rw
+91 36 0:51 / /home/u/my\\040drive rw,nosuid,nodev - fuse.rclone r: rw
+92 36 0:52 / /var/data rw,nodev - ext4 /dev/sdb1 rw
+";
+        let mounts = nosuid_mounts(mountinfo);
+        assert_eq!(mounts, ["home/u/remote", "home/u/my drive"]);
+        let mut closed = Closed {
+            without_set_id: mounts,
+            ..Closed::default()
+        };
+        for inert in ["home/u/remote", "home/u/remote/below", "home/u/my drive"] {
+            closed.add(inert);
+        }
+        assert_eq!(closed.count, 0);
+        // A name that only begins like the mount, and a mount where the
+        // bits count.
+        for counted in ["home/u/remote2", "home/u", "var/data"] {
+            closed.add(counted);
+        }
+        assert_eq!(closed.count, 3);
+        assert_eq!(closed.first.as_deref(), Some("home/u"));
+        assert!(nosuid_mounts("").is_empty());
+        assert!(nosuid_mounts("1 2 3\n").is_empty());
     }
 }

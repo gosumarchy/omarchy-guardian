@@ -479,7 +479,19 @@ fn cargo(section: &str, key: &str, value: &str) -> Option<String> {
         ("http", "proxy") => Some(proxied(key, value)),
         ("http", "cainfo") => authorities(key, value),
         ("http", "check-revoke") if is_off(value) => Some(unchecked(key)),
-        ("env", _) if sets_what_runs(key, table_value(value)) => Some(graded(
+        // `[env.NAME]` with `value = "x"` is `NAME = "x"` under `[env]`.
+        (_, "value")
+            if section
+                .strip_prefix("env.")
+                .is_some_and(|name| sets_what_runs(name, value)) =>
+        {
+            let name = section.strip_prefix("env.").unwrap_or(section);
+            Some(graded(
+                format!("{name}: set for every program cargo runs"),
+                value,
+            ))
+        }
+        ("env", _) if sets_what_runs(key, &table_value(value)) => Some(graded(
             format!("{key}: set for every program cargo runs"),
             value,
         )),
@@ -530,14 +542,14 @@ fn cargo(section: &str, key: &str, value: &str) -> Option<String> {
 
 /// The value of a cargo `[env]` entry, which may be a table
 /// (`{ value = "x", force = true }`).
-fn table_value(value: &str) -> &str {
+fn table_value(value: &str) -> String {
     if !value.trim_start().starts_with('{') {
-        return value;
+        return value.to_string();
     }
-    value
-        .split_once("value")
-        .and_then(|(_, rest)| rest.split(['"', '\'']).nth(1))
-        .unwrap_or(value)
+    inline_members(value.trim())
+        .into_iter()
+        .find(|(path, _)| path.len() == 1 && path[0] == "value")
+        .map_or_else(|| value.to_string(), |(_, inner)| inner)
 }
 
 /// What follows each `flag` in a list of compiler flags, up to the end of
@@ -735,7 +747,8 @@ pub fn alerts(path: &str, text: &str) -> Vec<(usize, String)> {
     // TOML is read by key, wherever on a line and however it is written
     // (`build.rustc-wrapper = …`, `build = { rustc-wrapper = … }`).
     if matches!(tool, Tool::Cargo | Tool::Bun) {
-        match tomlish::entries(text) {
+        // A byte order mark is no part of the first key.
+        match tomlish::entries(text.trim_start_matches('\u{feff}')) {
             Ok(entries) => {
                 for entry in &entries {
                     let path: Vec<String> = entry
@@ -837,7 +850,11 @@ impl Settings<'_> {
                 }
                 (Some(b' ' | b'\t' | b'\r'), _) => self.at += 1,
                 (Some(b'/'), Some(b'/')) => {
-                    while self.peek().is_some_and(|byte| byte != b'\n') {
+                    // An editor ends the comment at a lone `\r` too.
+                    while self
+                        .peek()
+                        .is_some_and(|byte| !matches!(byte, b'\n' | b'\r'))
+                    {
                         self.at += 1;
                     }
                 }
@@ -888,7 +905,11 @@ impl Settings<'_> {
 
     /// The four hex digits after `\u`.
     fn unit(&mut self) -> Option<u32> {
-        let digits = self.bytes.get(self.at..self.at + 4)?;
+        // Digits only: `from_str_radix` would also take a sign.
+        let digits = self
+            .bytes
+            .get(self.at..self.at + 4)
+            .filter(|digits| digits.iter().all(u8::is_ascii_hexdigit))?;
         let unit = u32::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()?;
         self.at += 4;
         Some(unit)
@@ -1619,6 +1640,15 @@ mod tests {
             |text: &str| -> Vec<usize> { editor(text).into_iter().map(|(line, _)| line).collect() };
         // On one line, on the line of the brace, after another key.
         assert_eq!(lines(r#"{"git.path":"/tmp/x"}"#), [1]);
+        // A comment ends at a lone carriage return, as it does for the
+        // editor, and a `\u` escape is four hex digits and no sign.
+        assert_eq!(lines("{ // x\r\"git.path\": \"/tmp/x\",\n\"a\": 1 }"), [1]);
+        assert_eq!(lines("{\"git.p\\u+061th\": \"/tmp/x\"}").len(), 1);
+        assert!(
+            editor("{\"git.p\\u+061th\": \"/tmp/x\"}")[0]
+                .1
+                .contains("cannot be read")
+        );
         assert_eq!(
             lines(r#"{ "security.workspace.trust.enabled": false }"#),
             [1]
@@ -1789,6 +1819,13 @@ mod tests {
                 1,
             ),
             ("env.LD_PRELOAD = \"/home/u/x.so\"\n", 1),
+            // A variable as a table of its own, in each way to write one,
+            // and a file that begins with a byte order mark.
+            ("[env.LD_PRELOAD]\nvalue = \"/home/u/x.so\"\n", 2),
+            ("env.LD_PRELOAD.value = \"/home/u/x.so\"\n", 1),
+            ("[env]\nLD_PRELOAD.value = \"/home/u/x.so\"\n", 2),
+            ("[env]\nCC = { \"value\" = \"/home/u/cc\" }\n", 2),
+            ("\u{feff}build.rustc-wrapper = \"/tmp/w\"\n", 1),
             (
                 "env = { A = \"x, y\", LD_PRELOAD = { value = \"/home/u/x.so\", force = true } }\n",
                 1,
