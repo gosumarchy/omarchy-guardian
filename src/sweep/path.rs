@@ -902,7 +902,7 @@ mod tests {
     use crate::sweep::collect::{self, Origin, Scope};
     use crate::sweep::index::PackageIndex;
     use crate::sweep::tier::Tier;
-    use crate::test_support::{TempDir, owned_by_a_user};
+    use crate::test_support::{TempDir, hand_to_a_user};
 
     #[test]
     fn a_path_is_read_in_order_and_split_at_the_systems_own() {
@@ -1097,7 +1097,7 @@ mod tests {
             origin: Origin::System,
         };
         // A home is its user's, whoever runs the test.
-        if !owned_by_a_user(&root.join("home")) {
+        if !hand_to_a_user(&root.join("home")) {
             return;
         }
         let found = search(&scope);
@@ -1240,7 +1240,7 @@ mod tests {
             origin: Origin::System,
         };
         // A home is its user's, whoever runs the test.
-        if !owned_by_a_user(&root.join("home")) {
+        if !hand_to_a_user(&root.join("home")) {
             return;
         }
         let found = search(&scope);
@@ -1328,7 +1328,7 @@ mod tests {
         write("home/u/.bashrc", "export PATH=\"$PATH:$HOME/.local/bin\"\n");
         write("home/u/.local/bin/sudo", "#!/bin/sh\n");
         // A home is its user's, whoever runs the test.
-        if !owned_by_a_user(&root.join("home")) {
+        if !hand_to_a_user(&root.join("home")) {
             return;
         }
         let behind = search(&scope);

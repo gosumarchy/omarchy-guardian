@@ -1112,16 +1112,6 @@ mod tests {
         assert_eq!(allowed.keys().collect::<Vec<_>>(), ["1000:~/.bashrc"]);
     }
 
-    /// Gives `path` and everything below it to `nobody`, where root can.
-    fn give_tree(path: &std::path::Path) {
-        if path.is_dir() && !path.is_symlink() {
-            for entry in std::fs::read_dir(path).unwrap().flatten() {
-                give_tree(&entry.path());
-            }
-        }
-        crate::test_support::give(path, crate::test_support::NOBODY);
-    }
-
     #[test]
     fn root_reports_on_each_home_as_its_account_could_look_itself() {
         use std::os::unix::fs::MetadataExt;
@@ -1165,7 +1155,7 @@ mod tests {
         // away (else they are read by what their modes show everyone).
         let uid = if uid == 0 {
             for home in ["home/u", "home/v", "home/w", "home/x"] {
-                give_tree(&root.join(home));
+                crate::test_support::give_tree(&root.join(home), crate::test_support::NOBODY);
             }
             crate::test_support::NOBODY
         } else {

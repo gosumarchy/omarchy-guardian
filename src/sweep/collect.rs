@@ -1770,7 +1770,7 @@ mod tests {
     use crate::sha256::Sha256;
     use crate::sweep::index::PackageIndex;
     use crate::sweep::tier::Tier;
-    use crate::test_support::{TempDir, owned_by_a_user};
+    use crate::test_support::TempDir;
 
     fn write(root: &Path, path: &str, text: &str) {
         fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
@@ -2318,12 +2318,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new("sweep-steered");
         let root = dir.path();
-        // A crontab is its user's, whoever runs the test.
+        // What a crontab in the spool names is a user's choice, whoever
+        // the file belongs to: run as root (a container), these are root's.
         write(root, "var/spool/cron/u", "* * * * * /etc/secret\n");
         write(root, "var/spool/cron/v", "* * * * * /etc/open\n");
-        if !owned_by_a_user(&root.join("var/spool/cron")) {
-            return;
-        }
         write(root, "etc/secret", "pin 1234\n");
         write(root, "etc/open", "public\n");
         write(root, "root/private/key", "key\n");
@@ -2432,7 +2430,7 @@ mod tests {
         assert_eq!(follow_as(&as_root, &through), ["etc/open"]);
         assert!(!super::is_there(&as_root, "tmp/conf/open", by));
         assert!(super::user_steered(root, None));
-        // Not root's file: whoever owns it decides what it names.
+        // A crontab in the spool: its user decides what it names.
         assert!(super::user_steered(root, by));
     }
 
