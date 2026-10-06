@@ -5,9 +5,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use super::gate::{not_started, tree_content};
 use super::{
     ConfigCommand, Confirm, Forget, Invocation, Target, forget_command, forget_in, guard_command,
-    not_started, pacman_hook_command, parse, review_and_decide, reviews_for_the_user, tree_content,
+    pacman_hook_command, parse, review_and_decide, reviews_for_the_user,
 };
 use crate::agent::SourceFile;
 use crate::audit::{self, Gate};
