@@ -136,6 +136,28 @@ pub(super) enum Effect {
     Quit,
 }
 
+impl Effect {
+    /// The files this effect rewrote, whose drafts are replaced by what is
+    /// read back afterwards; `None` when nothing needs reading again.
+    /// `done` is whether the effect succeeded: a save that failed wrote
+    /// nothing, so its draft stays. An integration rewrites neither file's
+    /// settings, and setup or an editor may have rewritten both (the user
+    /// agreed to drop the drafts before either started).
+    const fn rewrites(&self, done: bool) -> Option<&'static [Scope]> {
+        match self {
+            Self::SaveUser(_) if done => Some(&[Scope::User]),
+            Self::SaveSystem(_) if done => Some(&[Scope::System]),
+            Self::SaveUser(_) | Self::SaveSystem(_) | Self::Integration(_) => Some(&[]),
+            Self::GuidedSetup | Self::Edit(_) => Some(&[Scope::User, Scope::System]),
+            Self::Report(_)
+            | Self::ForgetMemory
+            | Self::LoadModels(_)
+            | Self::ResetDefaults
+            | Self::Quit => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Dialog {
     Choice {
@@ -267,11 +289,39 @@ impl App {
         app
     }
 
-    /// Replaces the files after a save, an edit or setup, keeping the
-    /// position and any drafts of files that were not reloaded.
-    pub(super) fn reload(&mut self, files: Loaded) {
-        self.user = files.user.clone();
-        self.system = files.system.clone();
+    /// What the event loop does once an effect has been carried out: reads
+    /// the files again (with `load`) when the effect may have changed them,
+    /// then reports the outcome. Returns whether they were read again.
+    pub(super) fn settle(
+        &mut self,
+        effect: &Effect,
+        outcome: Result<String, String>,
+        load: impl FnOnce() -> Loaded,
+    ) -> bool {
+        let rewritten = effect.rewrites(outcome.is_ok());
+        if let Some(rewritten) = rewritten {
+            self.reload(load(), rewritten);
+        }
+        self.finish(effect, outcome);
+        rewritten.is_some()
+    }
+
+    /// Takes the files as they are now, keeping the position. The draft of
+    /// a file in `rewritten` is replaced by what was read; so is a draft
+    /// without edits, which follows its file. A draft with unsaved edits of
+    /// any other file is kept.
+    fn reload(&mut self, files: Loaded, rewritten: &[Scope]) {
+        if rewritten.contains(&Scope::User) || !self.dirty(Scope::User) {
+            self.user = files.user.clone();
+        }
+        if rewritten.contains(&Scope::System) || !self.dirty(Scope::System) {
+            self.system = files.system.clone();
+        } else {
+            // Turning on the system sweep records its root consent in the
+            // system file. No field here edits it, so a kept draft takes
+            // it from the file and saving the draft cannot undo it.
+            self.system.sweep = files.system.sweep.clone();
+        }
         self.files = files;
         self.refresh_integrations();
         for status in [&self.files.user_status, &self.files.system_status] {
@@ -338,7 +388,7 @@ impl App {
     }
 
     /// Reports how an effect went.
-    pub(super) fn finish(&mut self, effect: &Effect, outcome: Result<String, String>) {
+    fn finish(&mut self, effect: &Effect, outcome: Result<String, String>) {
         match outcome {
             Err(error) => {
                 self.message = Some((error, Tone::Bad));

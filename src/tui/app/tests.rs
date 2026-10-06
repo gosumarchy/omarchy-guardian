@@ -2,11 +2,13 @@
 
 use std::path::PathBuf;
 
-use super::{App, Effect, Loaded, Mode, Tab};
+use super::{App, Effect, Loaded, Mode, Tab, Task};
 use crate::config::file::PartialConfig;
 use crate::config::load::FileStatus;
-use crate::config::model::{AiRequirement, Profile, SourceClass};
+use crate::config::model::{AiRequirement, Profile, RootConsent, SourceClass};
+use crate::integrations::Plan;
 use crate::tui::canvas::Canvas;
+use crate::tui::fields::Scope;
 use crate::tui::term::Key;
 
 fn loaded(user: PartialConfig, system: PartialConfig) -> Loaded {
@@ -107,6 +109,136 @@ fn user_then_system_saves_chain() {
     };
     app.finish(effect, Ok("Saved.".into()));
     assert!(screen(&mut app).contains("Save the system file?"));
+}
+
+/// The event loop's step after an effect that went well, with `user` and
+/// `system` as the files it reads back.
+fn settle(app: &mut App, effect: &Effect, user: PartialConfig, system: PartialConfig) {
+    assert!(app.settle(effect, Ok("Done.".into()), || loaded(user, system)));
+}
+
+fn toggle() -> Effect {
+    Effect::Integration(Plan {
+        summary: "Turn a gate on".into(),
+        steps: Vec::new(),
+    })
+}
+
+#[test]
+fn the_system_draft_outlives_saving_the_user_file() {
+    let mut app = app();
+    press(&mut app, &[Key::Char(' '), Key::Down, Key::Char(' ')]);
+    let effects = press(&mut app, &[Key::Char('s')]);
+    let [effect @ Effect::SaveUser(_)] = &effects[..] else {
+        panic!("{effects:?}");
+    };
+    // The user file now holds the draft; the system file is as it was.
+    let written = app.user.clone();
+    settle(&mut app, effect, written, PartialConfig::default());
+
+    assert_eq!(app.system.profile, Some(Profile::Standard));
+    assert!(!app.dirty(Scope::User));
+    let text = screen(&mut app);
+    assert!(text.contains("Save the system file?"), "{text}");
+    assert!(text.contains("+ profile = \"standard\""), "{text}");
+    let effects = press(&mut app, &[Key::Char('y')]);
+    let [effect @ Effect::SaveSystem(saved)] = &effects[..] else {
+        panic!("{effects:?}");
+    };
+    assert!(saved.contains("profile = \"standard\""), "{saved}");
+
+    let (user, system) = (app.user.clone(), app.system.clone());
+    settle(&mut app, effect, user, system);
+    assert_eq!(app.changed_count(), 0);
+    assert!(!app.dirty(Scope::System));
+}
+
+#[test]
+fn a_save_that_fails_keeps_its_draft() {
+    let mut app = app();
+    press(&mut app, &[Key::Char(' ')]);
+    let effects = press(&mut app, &[Key::Char('s')]);
+    let [effect @ Effect::SaveUser(_)] = &effects[..] else {
+        panic!("{effects:?}");
+    };
+    app.settle(effect, Err("read-only file system".into()), || {
+        loaded(PartialConfig::default(), PartialConfig::default())
+    });
+    assert_eq!(app.user.profile, Some(Profile::Standard));
+    assert!(screen(&mut app).contains("read-only file system"));
+}
+
+#[test]
+fn an_integration_toggle_keeps_unsaved_edits() {
+    let mut app = app();
+    press(&mut app, &[Key::Char(' '), Key::Down, Key::Char(' ')]);
+    settle(
+        &mut app,
+        &toggle(),
+        PartialConfig::default(),
+        PartialConfig::default(),
+    );
+    assert_eq!(app.user.profile, Some(Profile::Standard));
+    assert_eq!(app.system.profile, Some(Profile::Standard));
+    assert!(screen(&mut app).contains("2 unsaved"));
+}
+
+#[test]
+fn a_kept_system_draft_takes_the_sweep_consent_a_toggle_recorded() {
+    let mut app = app();
+    press(&mut app, &[Key::Down, Key::Char(' ')]);
+    let mut system = PartialConfig::default();
+    system.sweep.root = Some(RootConsent::Allowed);
+    settle(
+        &mut app,
+        &toggle(),
+        PartialConfig::default(),
+        system.clone(),
+    );
+    assert_eq!(app.system.profile, Some(Profile::Standard));
+    assert_eq!(app.system.sweep, system.sweep);
+    assert_eq!(app.changed_count(), 1);
+}
+
+#[test]
+fn a_draft_without_edits_follows_its_file() {
+    let mut app = app();
+    press(&mut app, &[Key::Char(' ')]);
+    let system = PartialConfig {
+        profile: Some(Profile::Strict),
+        ..PartialConfig::default()
+    };
+    settle(
+        &mut app,
+        &toggle(),
+        PartialConfig::default(),
+        system.clone(),
+    );
+    assert_eq!(app.user.profile, Some(Profile::Standard));
+    assert_eq!(app.system, system);
+    assert!(!app.dirty(Scope::System));
+}
+
+#[test]
+fn setup_and_the_editor_replace_both_drafts() {
+    for effect in [Effect::GuidedSetup, Effect::Edit(Scope::User)] {
+        let mut app = app();
+        press(&mut app, &[Key::Char(' '), Key::Down, Key::Char(' ')]);
+        settle(
+            &mut app,
+            &effect,
+            PartialConfig::default(),
+            PartialConfig::default(),
+        );
+        assert_eq!(app.changed_count(), 0, "{effect:?}");
+    }
+}
+
+#[test]
+fn reports_do_not_read_the_files_again() {
+    let mut app = app();
+    let effect = Effect::Report(Task::ShowConfig);
+    assert!(!app.settle(&effect, Ok("line".into()), || panic!("read again")));
 }
 
 #[test]

@@ -622,13 +622,13 @@ const fn gate_name(gate: Integration) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::super::{App, Effect, Loaded, Mode, Task};
     use crate::config::file::PartialConfig;
     use crate::config::load::FileStatus;
     use crate::config::model::Profile;
-    use crate::integrations::{Paths, Step};
+    use crate::integrations::{Paths, Plan, Step};
     use crate::test_support::TempDir;
     use crate::tui::canvas::Canvas;
     use crate::tui::term::Key;
@@ -727,6 +727,50 @@ mod tests {
     }
 
     #[test]
+    fn a_level_reaches_the_system_file_after_the_user_file_is_saved() {
+        let mut app = App::new(files(None), Mode::Simple);
+        press(&mut app, &[Key::Char('2')]);
+        let effects = press(&mut app, &[Key::Char('s')]);
+        let [effect @ Effect::SaveUser(_)] = &effects[..] else {
+            panic!("{effects:?}");
+        };
+        // What the event loop reads back: the user file as just written.
+        let mut written = files(None);
+        written.user = app.user.clone();
+        assert!(app.settle(effect, Ok("Saved.".into()), || written));
+
+        assert_eq!(app.system.profile, Some(Profile::Strict));
+        let text = screen(&mut app);
+        assert!(text.contains("Save the system file?"), "{text}");
+        assert!(text.contains("+ profile = \"strict\""), "{text}");
+        let effects = press(&mut app, &[Key::Char('y')]);
+        let [Effect::SaveSystem(saved)] = &effects[..] else {
+            panic!("{effects:?}");
+        };
+        assert!(saved.contains("profile = \"strict\""), "{saved}");
+    }
+
+    #[test]
+    fn turning_the_gates_on_keeps_an_unsaved_level() {
+        let dir = TempDir::new("simple-toggle");
+        let mut app = App::new(files(None), Mode::Simple);
+        press(&mut app, &[Key::Char('2')]);
+        assert!(app.gates_off().is_empty());
+        let effect = Effect::Integration(Plan {
+            summary: "Protect everything".into(),
+            steps: Vec::new(),
+        });
+        let read = files(Some(paths(dir.path())));
+        assert!(app.settle(&effect, Ok("Done.".into()), || read));
+
+        assert_eq!(app.user.profile, Some(Profile::Strict));
+        assert_eq!(app.system.profile, Some(Profile::Strict));
+        assert!(screen(&mut app).contains("unsaved changes"));
+        // The gates themselves are looked at again.
+        assert!(!app.gates_off().is_empty());
+    }
+
+    #[test]
     fn mixed_levels_are_shown_and_resolved_by_picking_one() {
         let mut loaded = files(None);
         loaded.user.profile = Some(Profile::LocalOnly);
@@ -740,15 +784,13 @@ mod tests {
         assert!(active_level(&screen(&mut app), "Balanced"));
     }
 
-    #[test]
-    fn protect_everything_turns_on_every_gate_that_is_off() {
-        let dir = TempDir::new("simple-gates");
-        let root = dir.path();
+    /// A machine under `root` where every gate can be turned on and none is.
+    fn paths(root: &Path) -> Paths {
         fs::create_dir_all(root.join("omarchy")).unwrap();
         fs::write(root.join("hook"), "").unwrap();
         fs::write(root.join("yay"), "").unwrap();
         fs::write(root.join("installer"), "").unwrap();
-        let paths = Paths {
+        Paths {
             hook_source: root.join("hook"),
             hook_target: root.join("hooks/hook"),
             yay: root.join("yay"),
@@ -782,8 +824,13 @@ mod tests {
             session_env: root.join("uwsm/env.d/90-omarchy-guardian"),
             hypr_config: root.join("hypr/hyprland.lua"),
             hypr_path: root.join("hyprland-path.lua"),
-        };
-        let mut app = App::new(files(Some(paths)), Mode::Simple);
+        }
+    }
+
+    #[test]
+    fn protect_everything_turns_on_every_gate_that_is_off() {
+        let dir = TempDir::new("simple-gates");
+        let mut app = App::new(files(Some(paths(dir.path()))), Mode::Simple);
         assert!(screen(&mut app).contains("not watching pacman, AUR or themes"));
 
         // Levels, model, then Protect everything.
