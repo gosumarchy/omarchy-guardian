@@ -183,8 +183,9 @@ impl Lexer<'_> {
     }
 
     /// Whether a single quote opens a quotation where the lexer stands:
-    /// not straight inside double quotes (`"${x:-it's}"`), but again inside
-    /// a substitution within them.
+    /// always, except straight inside double quotes, where `${ ... }` has
+    /// rules of its own (`quote_in_quoted_braces`). Inside a substitution
+    /// within them it opens one again.
     fn single_quotes(&self) -> bool {
         !self
             .stack
@@ -257,10 +258,24 @@ impl Lexer<'_> {
                 };
                 self.stack.push(inside);
             }
-            (Inside::Substitution(..), '$') if self.characters.peek() == Some(&'\'') => {
+            (Inside::Substitution(..) | Inside::Brace, '$')
+                if self.characters.peek() == Some(&'\'') && self.single_quotes() =>
+            {
                 self.word.push('\'');
                 self.characters.next();
                 self.stack.push(Inside::Ansi);
+            }
+            // `$$` is one parameter. Whether a `'`, a `(` or a `{` after
+            // it opens what it opens after one `$` depends on what the
+            // parentheses or braces hold.
+            (Inside::Substitution(..) | Inside::Brace, '$')
+                if self.characters.peek() == Some(&'$') =>
+            {
+                self.word.push('$');
+                self.characters.next();
+                if matches!(self.characters.peek(), Some('\'' | '(' | '{')) {
+                    self.unsure();
+                }
             }
             (Inside::Double | Inside::Substitution(..) | Inside::Brace, '`') => {
                 self.stack.push(Inside::Backtick);
@@ -268,6 +283,7 @@ impl Lexer<'_> {
             (Inside::Substitution(..) | Inside::Brace, '\'') if self.single_quotes() => {
                 self.stack.push(Inside::Single);
             }
+            (Inside::Brace, '\'') => self.quote_in_quoted_braces(),
             (Inside::Substitution(..) | Inside::Brace, '"') => self.stack.push(Inside::Double),
             (Inside::Substitution(depth, kind), '(') => {
                 self.stack.pop();
@@ -280,6 +296,33 @@ impl Lexer<'_> {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// A `'` just read straight inside `"${ ... }"`. Bash looks for the one
+    /// that pairs with it (`"${x#'}'}"`), though after some operators both
+    /// stay characters of the value (`"${x:-'a'}"`). Read as a pair or as
+    /// two characters, the braces end at the same place where nothing
+    /// between the two closes or opens anything; anywhere else Guardian
+    /// does not say which it is.
+    fn quote_in_quoted_braces(&mut self) {
+        let mut ahead = self.characters.clone();
+        let same = loop {
+            match ahead.next() {
+                Some('\'') => break true,
+                Some('}' | '"' | '\\' | '$' | '`') | None => break false,
+                Some(_) => {}
+            }
+        };
+        if !same {
+            return self.unsure();
+        }
+        for character in self.characters.by_ref() {
+            self.word.push(character);
+            self.line += usize::from(character == '\n');
+            if character == '\'' {
+                break;
+            }
         }
     }
 
@@ -340,8 +383,14 @@ impl Lexer<'_> {
                 }
                 None if next == '\\' => {
                     self.characters.next();
-                    quoted = true;
-                    marker.extend(self.characters.peek().filter(|escaped| **escaped != '\n'));
+                    // Before a new line it joins the lines and quotes
+                    // nothing.
+                    if self.characters.peek() == Some(&'\n') {
+                        self.line += 1;
+                    } else {
+                        quoted = true;
+                        marker.extend(self.characters.peek());
+                    }
                 }
                 _ => marker.push(next),
             }
@@ -390,7 +439,20 @@ impl Lexer<'_> {
     fn skip_here_documents(&mut self) {
         for here in std::mem::take(&mut self.here) {
             let (mut current, mut expands, mut found) = (String::new(), false, false);
-            for character in self.characters.by_ref() {
+            while let Some(character) = self.characters.next() {
+                // Under a marker written without quotes, bash joins a line
+                // that ends in a backslash with the next one before it
+                // looks for the marker; a backslash keeps another.
+                if character == '\\' && here.expands {
+                    match self.characters.next() {
+                        Some('\n') => self.line += 1,
+                        kept => {
+                            current.push(character);
+                            current.extend(kept);
+                        }
+                    }
+                    continue;
+                }
                 if character != '\n' {
                     current.push(character);
                     continue;
@@ -532,7 +594,6 @@ impl Lexer<'_> {
                 }
                 None => {}
             },
-            '\'' if self.word.ends_with('$') => self.open(Inside::Ansi, character),
             '\'' => self.open(Inside::Single, character),
             '"' => self.open(Inside::Double, character),
             '`' => self.open(Inside::Backtick, character),
@@ -553,6 +614,26 @@ impl Lexer<'_> {
                 self.characters.next();
                 self.push(character);
                 self.open(Inside::Brace, '{');
+            }
+            // `$'...'`: after a `$` that stands alone, with no backslash
+            // before it.
+            '$' if next == Some('\'') => {
+                self.characters.next();
+                self.push(character);
+                self.open(Inside::Ansi, '\'');
+            }
+            // `$$` is one parameter: a `'` after it is a plain quote.
+            '$' if next == Some('$') => {
+                self.characters.next();
+                self.push(character);
+                self.push(character);
+            }
+            // Bash joins two lines before it reads what follows a `$`.
+            '$' if next == Some('\\') => {
+                if self.characters.clone().nth(1) == Some('\n') {
+                    self.unsure();
+                }
+                self.push(character);
             }
             '\n' => self.new_line(),
             ' ' | '\t' => self.end_word(),

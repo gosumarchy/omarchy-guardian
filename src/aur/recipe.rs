@@ -225,7 +225,8 @@ fn quote_end(text: &str) -> Option<usize> {
 /// Where the `close` is that ends what was opened just before `text`
 /// (`$(`, `${`, `[`), past the quotes and substitutions inside it.
 /// `in_double`: within double quotes, where a single quote in `${...}` is
-/// a character.
+/// read as a character: the lexer is sure of one there only where that
+/// ends the braces at the same place as reading it as a quote.
 fn closing(text: &str, close: char, in_double: bool) -> Option<usize> {
     let open = match close {
         ')' => '(',
@@ -1166,8 +1167,9 @@ impl<'a> Reader<'a> {
         // A count or a sum is a number, whatever it comes to.
         let text = assignment.value.trim_matches('"');
         let whole = |open: &str, close: char| {
-            text.strip_prefix(open)
-                .is_some_and(|rest| closing(rest, close, false) == Some(rest.len() - 1))
+            text.strip_prefix(open).is_some_and(|rest| {
+                closing(rest, close, false).is_some_and(|end| end + 1 == rest.len())
+            })
         };
         let summed = text.starts_with("$((") && text.ends_with("))") && whole("$(", ')');
         if (whole("${#", '}') || summed) && !text[1..].contains("$(") {
@@ -1994,6 +1996,7 @@ pub fn top_level_naming(recipe: &str, names: &Naming<'_>) -> Option<Vec<usize>> 
 mod tests {
     use super::lex::{Token, tokens};
     use super::{Naming, Sources, sources, top_level_naming, written_variables};
+    use crate::test_support::{Rng, TempDir, tool_available};
 
     fn written(recipe: &str) -> Vec<(String, Vec<String>)> {
         match sources(recipe) {
@@ -2085,6 +2088,30 @@ mod tests {
         // One that never ends, or whose text bash expands, hides code.
         assert!(not_followed("source=(a)\ncat <<X\ntext\n"));
         assert!(not_followed("source=(a)\ncat <<X\n${source:=evil}\nX\n"));
+        // Under a marker written without quotes, a line that ends in a
+        // backslash goes on in the next, and the marker is looked for in
+        // the two together.
+        assert_eq!(
+            words("cat <<X\ntext \\\nX\nx=1\nX\ncat <<X\nmore\nX\\\n\ny=2\n"),
+            [list(&["cat", "> "]), list(&["cat", "> "]), list(&["y=2"])]
+        );
+        assert_eq!(
+            words("cat <<-X\n\t\\\n\tX\ny=2\ncat <<-X\n\ta\\\n\tX\nx=1\nX\n"),
+            [list(&["cat", "> "]), list(&["y=2"]), list(&["cat", "> "])]
+        );
+        // A backslash before the backslash, or a quoted marker: the line
+        // ends where it ends.
+        for recipe in [
+            "cat <<X\ntext \\\\\nX\nsource=(a)\n",
+            "cat <<'X'\ntext \\\nX\nx=1\nX\nsource=(a)\n",
+            "cat <<\\X\nX\\\n\nx=1\nX\nsource=(a)\n",
+        ] {
+            assert_eq!(written(recipe)[0].1, ["a"], "{recipe}");
+        }
+        for body in ["X\\\n\nG\n", "te\\\nxt\nX\\\n\nG\nX\n"] {
+            let recipe = format!("source=(good)\ncat <<X\n{body}").replace('G', GUARDED);
+            assert!(not_followed(&recipe), "{recipe}: {:?}", sources(&recipe));
+        }
     }
 
     #[test]
@@ -2502,6 +2529,323 @@ sha256sums=('abc'\n            SKIP 'SKIP')\nbuild() {\n  local source=x\n  eval
                 sources(recipe)
             );
         }
+    }
+
+    #[test]
+    fn a_quote_after_a_dollar_is_read_as_bash_reads_it() {
+        // `$'...'` only after a `$` that stands alone: not after `\$`, and
+        // not after `$$`, which is one parameter.
+        for (recipe, expected) in [
+            ("x=$'a\\'; y=1 # '\n", vec![list(&["x=$'a\\'; y=1 # '"])]),
+            (
+                "x=\\$'a\\'; y=1 # '\n",
+                vec![list(&["x=\\$'a\\'"]), list(&["y=1"])],
+            ),
+            (
+                "x=$$'a\\'; y=1 # '\n",
+                vec![list(&["x=$$'a\\'"]), list(&["y=1"])],
+            ),
+            (
+                "x=$$$'a\\'; y=1 # '\n",
+                vec![list(&["x=$$$'a\\'; y=1 # '"])],
+            ),
+            (
+                "x=\\\\$'a\\'; y=1 # '\n",
+                vec![list(&["x=\\\\$'a\\'; y=1 # '"])],
+            ),
+            (
+                "x=$?'a\\'; y=1 # '\n",
+                vec![list(&["x=$?'a\\'"]), list(&["y=1"])],
+            ),
+            (
+                "x=$(echo \\$'a\\'); y=1 # ')\n",
+                vec![list(&["x=$(echo \\$'a\\')"]), list(&["y=1"])],
+            ),
+            (
+                "x=${y#$'\\''}; y=1 # '\n",
+                vec![list(&["x=${y#$'\\''}"]), list(&["y=1"])],
+            ),
+        ] {
+            assert_eq!(words(recipe), expected, "{recipe}");
+            assert!(tokens(recipe).1.is_empty(), "{recipe}");
+        }
+        // Where the `$` and the quote are a line apart, or inside
+        // parentheses or braces after `$$`, Guardian does not say.
+        for recipe in [
+            "x=$\\\n'a\\'; y=1 # '\n",
+            "x=$(echo $$'a\\'); y=1 # ')\n",
+            "x=${y:-$$'a\\'}; y=1 # '}\n",
+            "x=${y:-$$(echo })}\n",
+        ] {
+            assert!(!tokens(recipe).1.is_empty(), "{recipe}");
+        }
+    }
+
+    #[test]
+    fn a_single_quote_in_quoted_braces_is_read_both_ways_or_not_at_all() {
+        // Bash looks for the one that pairs with it, whatever stands between.
+        for recipe in [
+            "z=\"${x#'}\"'}\"; y=1 # '\n",
+            "z=\"${x:-'}\"; y=1 # '}\"\n",
+            "z=\"${x:-it's}\"\n",
+            "z=\"${x%'a\\'}\"\n",
+            "z=\"${x/'$y'/b}\"\n",
+            "z=\"${x#${y%'}}\"\n",
+            "z=\"${x#$'a\\'b'}\"\n",
+        ] {
+            assert!(!tokens(recipe).1.is_empty(), "{recipe}");
+        }
+        // A pair with plain text between reads the same either way.
+        for (recipe, expected) in [
+            ("z=\"${x//'.'/_}\"; y=1\n", "z=\"${x//'.'/_}\""),
+            ("z=\"${x%'-bin'}\"; y=1\n", "z=\"${x%'-bin'}\""),
+            ("z=\"${x:-'a b'}\"; y=1\n", "z=\"${x:-'a b'}\""),
+            (
+                "z=\"$(echo \"${x#'a'}\" 'b')\"; y=1\n",
+                "z=\"$(echo \"${x#'a'}\" 'b')\"",
+            ),
+        ] {
+            assert_eq!(
+                words(recipe),
+                [list(&[expected]), list(&["y=1"])],
+                "{recipe}"
+            );
+            assert!(tokens(recipe).1.is_empty(), "{recipe}");
+        }
+        assert_eq!(
+            sources("pkgver=1.2\nsource=(\"x-${pkgver//'.'/_}.tar\")\n"),
+            Sources::Derived
+        );
+    }
+
+    #[test]
+    fn an_expansion_cut_off_at_the_end_is_not_followed() {
+        for recipe in ["x=${#", "x=\"${#", "x=$((", "x=${", "x=$(", "x=$((1 + "] {
+            let recipe = format!("source=(a)\n{recipe}");
+            assert!(not_followed(&recipe), "{recipe}: {:?}", sources(&recipe));
+        }
+        // A count and a lone `$` that are whole are read as they stand.
+        assert_eq!(written("source=(a)\nx=${#}\ny=$")[0].1, ["a"]);
+    }
+
+    /// Pieces recipes are written with, for texts that reach far into the
+    /// lexer, the parser and the reader.
+    const PIECES: &[&str] = &[
+        "source=(",
+        "source+=(",
+        "depends=(",
+        "x=",
+        "_y=",
+        "a",
+        "b.tar",
+        "1",
+        ")",
+        "(",
+        "\n",
+        "\n",
+        " ",
+        " ",
+        "\t",
+        "'",
+        "\"",
+        "\\",
+        "`",
+        "$",
+        "$x",
+        "${",
+        "${#",
+        "${x",
+        "$(",
+        "$((",
+        "$'",
+        "}",
+        "{",
+        "[",
+        "]",
+        "[[",
+        "]]",
+        "((",
+        "))",
+        "#",
+        "%",
+        "/",
+        ":-",
+        ":=",
+        "=",
+        "+=",
+        ";",
+        ";;",
+        "&",
+        "&&",
+        "||",
+        "|",
+        "<",
+        ">",
+        "<<",
+        "<<-",
+        "<<<",
+        "X",
+        "\nX\n",
+        "!",
+        "*",
+        "?",
+        "@",
+        "~",
+        "-",
+        "if ",
+        "then ",
+        "else ",
+        "fi",
+        "for ",
+        "in ",
+        "do ",
+        "done",
+        "while ",
+        "case ",
+        "esac",
+        "function ",
+        "_f()",
+        "_f",
+        "package()",
+        "build()",
+        "local ",
+        "declare -a ",
+        "eval ",
+        "read ",
+        "printf -v ",
+        "unset ",
+        "é",
+        "\u{a0}",
+    ];
+
+    #[test]
+    fn no_text_makes_the_reader_panic() {
+        let names = Naming {
+            set: &["BUILDDIR", "x"],
+            given: &["BUILDDIR", "x"],
+            assigners: &["printf", "read", "declare"],
+        };
+        let mut rng = Rng::new(1);
+        let (mut written, mut asked) = (0, 0);
+        for _ in 0..2_000 {
+            let text = rng.text(PIECES, 16);
+            for recipe in [rng.mutated(&text, PIECES), text] {
+                match sources(&recipe) {
+                    Sources::Written(_) | Sources::Derived => written += 1,
+                    Sources::NotFollowed(why) => {
+                        assert!(!why.is_empty(), "{recipe:?}");
+                        asked += 1;
+                    }
+                }
+                written_variables(&recipe);
+                top_level_naming(&recipe, &names);
+            }
+        }
+        // The pieces come together as shell Guardian follows, and as shell
+        // it does not: the cases reach past the lexer.
+        assert!(written > 100 && asked > 100, "{written} {asked}");
+    }
+
+    /// A command that sets a source if the directory can be written to,
+    /// and says that it ran.
+    const GUARDED: &str = "[[ -w . ]] && source=(evil) && echo RAN";
+
+    /// Whether bash runs the `G` in each of these, as it loads them the way
+    /// makepkg loads a recipe. Where it does, Guardian must have read the
+    /// command: text that bash takes for code is never text to Guardian.
+    #[test]
+    fn what_bash_runs_is_code_to_guardian() {
+        if !tool_available("/usr/bin/bash") {
+            return;
+        }
+        let dir = TempDir::new("recipe-bash");
+        let mut wrong = Vec::new();
+        for (body, runs) in [
+            // Quotes.
+            ("x='a\\'; G # '\n", true),
+            ("x=\"a\\\"; G # \"\n", false),
+            ("x='a\nG\n'\n", false),
+            ("x=a#'b\nG # '\n", false),
+            ("x=1 # '\nG # '\n", true),
+            // `$'...'`, and a `$` that opens none.
+            ("x=$'a\\'; G # '\n", false),
+            ("x=$'a\\\\'; G # '\n", true),
+            ("x=\\$'a\\'; G # '\n", true),
+            ("x=$$'a\\'; G # '\n", true),
+            ("x=$$$'a\\'; G # '\n", false),
+            ("x=\\\\$'a\\'; G # '\n", false),
+            ("x=$?'a\\'; G # '\n", true),
+            ("x=\"$\"'a\\'; G # '\n", true),
+            ("x=a$\\\n'b\\'; G # '\n", false),
+            ("x=$(echo \\$'a\\'); G # ')\n", true),
+            ("x=$(echo $$'a\\'); G # ')\n", true),
+            ("x=$(echo $'a\\'); G # ')')\n", false),
+            ("x=${y#$'\\''}; G # '\n", true),
+            ("x=${y#$'\\''}; G # '}\n", true),
+            ("x=${y:-$$'a\\'}; G # '}\n", true),
+            // Quotes inside `${ ... }`, with and without quotes around it.
+            ("z=\"${x#'}\"'}\"; G # '\n", true),
+            ("z=\"${x%'}\"'}\"; G # '\n", true),
+            ("z=\"${x/'}\"'/}\"; G # '\n", true),
+            ("z=\"${x^'}\"'}\"; G # '\n", true),
+            ("z=\"${x,,'}\"'}\"; G # '\n", true),
+            ("z=\"${x:-'}\"; G # '}\"\n", false),
+            ("z=\"${x:-'}'}\"; G\n", true),
+            ("z=\"${x:-it's}\"; G\n", false),
+            ("z=\"${x#'a'}\"; G\n", true),
+            ("z=\"${x//'.'/_}\"; G\n", true),
+            ("z=${x:-'}'}; G # '\n", true),
+            ("z=${x:-a b}; G\n", true),
+            ("z=\"${x:-\"}\"}\"; G # \"\n", true),
+            // Substitutions.
+            ("x=\"$(echo ')')\"; G\n", true),
+            ("x=\"$(echo \"a b\")\"; G\n", true),
+            ("x=$(echo a # '\n)\nG # '\n", true),
+            ("x=`echo \\`; G # \\``\n", false),
+            // Here-documents.
+            (": <<X\nG\nX\n", false),
+            (": <<X\ntext\nX\nG\n", true),
+            (": <<X\ntext\n X\nG\nX\n", false),
+            (": <<-X\n\ttext\n\tX\nG\n", true),
+            (": <<-X\n text\n X\nG\n\tX\n", false),
+            (": <<X\"Y\"\n$x\nXY\nG\n", true),
+            (": <<A <<B\none\nA\nG\nB\n", false),
+            (": <<A; : <<B\none\nA\ntwo\nB\nG\n", true),
+            // Lines joined by a backslash inside one.
+            (": <<true\ntr\\\nue\nG\ntrue\n", true),
+            (": <<X\ntext\nX\\\n\nG\nX\n", true),
+            (": <<X\n\\\nX\nG\n", true),
+            (": <<X\ntext \\\nX\nG\nX\n", false),
+            (": <<X\ntext\nX\\\\\n\nG\nX\n", false),
+            (": <<'X'\ntext\nX\\\n\nG\nX\n", false),
+            (": <<\\X\ntext\nX\\\n\nG\nX\n", false),
+            (": <<X''\nte\\\nxt\nX\\\n\nG\nX\n", false),
+            (": <<-X\n\t\\\n\tX\nG\n", true),
+            (": <<-X\n\tte\\\n\tX\nG\nX\n", false),
+            (": <<-X\n\ttext\n\t\\\nX\nG\n", true),
+            // A marker over two lines is one written without quotes.
+            (": <<X\\\nY\nG\nXY\nG\n", true),
+            (": <<X\\\nY\nX\\\nY\nG\nXY\n", true),
+        ] {
+            let recipe = format!("source=(good)\n{}", body.replace('G', GUARDED));
+            std::fs::write(dir.path().join("PKGBUILD"), &recipe).unwrap();
+            let output = std::process::Command::new("/usr/bin/bash")
+                .args(["-c", "source ./PKGBUILD"])
+                .current_dir(dir.path())
+                .env_clear()
+                // Nothing here needs a program, and none is to be found.
+                .env("PATH", dir.path())
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            let ran = String::from_utf8_lossy(&output.stdout).contains("RAN");
+            if ran != runs {
+                wrong.push(format!("bash runs it ({ran}) in {recipe:?}"));
+            } else if ran && !not_followed(&recipe) {
+                wrong.push(format!("{recipe:?}: {:?}", sources(&recipe)));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]
