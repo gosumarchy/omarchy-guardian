@@ -2,9 +2,11 @@
 
 use std::fs;
 
+use super::exposure::exposure_in;
+use super::reply::parse_review;
 use super::{
-    AgentError, Exposure, SourceFile, Status, claude_effort, claude_verdict, exposure_in,
-    parse_review, review, review_from_json, review_to_json, scan_events, verdict,
+    AgentError, Exposure, SourceFile, Status, claude_effort, claude_verdict, review,
+    review_from_json, review_to_json, scan_events, verdict,
 };
 use crate::config::model::SourceClass;
 use crate::config::model::{AgentSettings, Thinking};
@@ -642,7 +644,7 @@ fn variables_that_steer_the_reviewer_are_named_and_never_shown() {
     );
     // Every variable the review names or removes is in exactly one list.
     for name in super::REMOVED_VARIABLES {
-        assert!(!super::NAMED_VARIABLES.contains(name), "{name}");
+        assert!(!super::exposure::NAMED_VARIABLES.contains(name), "{name}");
     }
     for name in [
         "ANTHROPIC_BASE_URL",
@@ -657,7 +659,7 @@ fn variables_that_steer_the_reviewer_are_named_and_never_shown() {
         "NODE_EXTRA_CA_CERTS",
         "SSL_CERT_FILE",
     ] {
-        assert!(super::NAMED_VARIABLES.contains(&name), "{name}");
+        assert!(super::exposure::NAMED_VARIABLES.contains(&name), "{name}");
     }
     for name in [
         "NODE_OPTIONS",
@@ -833,7 +835,7 @@ fn a_provider_that_refuses_the_source_is_no_absent_reviewer() {
         "Rejected by our safety system (request 4290 of your quota was not charged)",
         "The model is overloaded with requests like this one, which violate the content policy",
     ] {
-        assert!(super::rejects_content(refused), "{refused}");
+        assert!(super::provider::rejects_content(refused), "{refused}");
         let claude = format!(
             "{{\"type\":\"system\",\"subtype\":\"init\"}}\n{{\"type\":\"result\",\"is_error\":true,\"result\":{},\"usage\":{{\"output_tokens\":0}}}}\n",
             Json::from(refused)
@@ -887,7 +889,7 @@ fn a_provider_that_refuses_the_source_is_no_absent_reviewer() {
         "exited with signal: 11 (SIGSEGV)",
         "timed out",
     ] {
-        assert!(!super::rejects_content(absent), "{absent}");
+        assert!(!super::provider::rejects_content(absent), "{absent}");
         let claude = format!(
             "{{\"type\":\"result\",\"is_error\":true,\"result\":{}}}\n",
             Json::from(absent)
