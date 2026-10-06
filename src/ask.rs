@@ -26,6 +26,7 @@ use crate::engine::store;
 use crate::notify;
 use crate::text;
 use crate::tools::{OpenCode, Reviewer};
+use crate::user;
 
 const SCHEME: &str = "omarchy-guardian://ask/";
 const LAUNCH_TUI: &str = "/usr/share/omarchy/bin/omarchy-launch-tui";
@@ -201,7 +202,7 @@ pub fn run(target: &str, settings: &Settings) -> String {
     let result = (|| {
         let id = report_id(target)?;
         let directory = notify::reports_dir().ok_or("no reports directory (set HOME)")?;
-        let uid = notify::current_uid().ok_or("cannot tell the current user")?;
+        let uid = user::real_uid().ok_or("cannot tell the current user")?;
         store::private_dir(&directory, uid)?;
         let report = read_report(&directory, id, uid)?;
         // Older reports were saved before control characters were shown as

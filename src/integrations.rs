@@ -381,7 +381,7 @@ enum Part {
 /// The login shell's name: of the user's `/etc/passwd` entry, else of
 /// `SHELL`.
 fn login_shell() -> Option<String> {
-    let uid = crate::notify::current_uid();
+    let uid = crate::user::real_uid();
     let shell = fs::read_to_string("/etc/passwd")
         .ok()
         .and_then(|passwd| uid.and_then(|uid| shell_of(&passwd, uid)))

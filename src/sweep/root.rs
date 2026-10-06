@@ -25,10 +25,10 @@ use super::state::{self, Remembered};
 use super::tier::Tier;
 use super::{live, own};
 use crate::autorun::Category;
-use crate::engine::store;
 use crate::json::Json;
 use crate::rules::RuleId;
 use crate::sha256::Digest;
+use crate::user;
 
 const SUDO: &str = "/usr/bin/sudo";
 const INSTALLED: &str = "/usr/bin/omarchy-guardian";
@@ -179,7 +179,7 @@ const MAX_AGE_SECS: u64 = 36 * 60 * 60;
 /// `--out` (writing `RESULTS`, only when the system configuration allows
 /// it, readable by the configured group).
 pub fn collect_command(out: bool, settings: &crate::config::Settings) -> ExitCode {
-    if !store::effective_uid().is_ok_and(|uid| uid == 0) {
+    if !user::effective_uid().is_ok_and(|uid| uid == 0) {
         errln!(
             "omarchy-guardian sweep-collect: only `sweep --root` and its timer run this, as root"
         );
@@ -880,7 +880,7 @@ fn changes_asked(arguments: &[String]) -> String {
 /// `sweep forget`: the list of allowed items, which only root writes. The
 /// user it acts for is the one sudo says ran it (`SUDO_UID`).
 pub fn system_allow_command(arguments: &[String]) -> ExitCode {
-    if !store::effective_uid().is_ok_and(|uid| uid == 0) {
+    if !user::effective_uid().is_ok_and(|uid| uid == 0) {
         errln!("omarchy-guardian sweep-allow-system: only `sweep allow` runs this, as root");
         return ExitCode::from(2);
     }

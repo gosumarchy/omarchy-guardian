@@ -20,6 +20,7 @@ use std::time::UNIX_EPOCH;
 
 use crate::engine::store;
 use crate::sha256::Sha256;
+use crate::user;
 
 /// The directory under the review memory's root.
 const DIRECTORY: &str = "aur-gate";
@@ -182,7 +183,7 @@ impl State {
     /// `root`, creating its directory for the user alone.
     pub fn open(root: Option<&Path>, key: &str) -> Self {
         let directory = root.and_then(|root| {
-            let uid = store::effective_uid().ok()?;
+            let uid = user::effective_uid().ok()?;
             store::private_dir(root, uid).ok()?;
             let directory = root.join(DIRECTORY);
             match DirBuilder::new().mode(0o700).create(&directory) {

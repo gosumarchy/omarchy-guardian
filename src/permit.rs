@@ -43,12 +43,12 @@ use crate::config::Settings;
 use crate::config::model::{Named, Profile, SourceClass};
 use crate::engine::store::{self, Store};
 use crate::json::Json;
-use crate::notify;
 use crate::report::{Decision, Report};
 use crate::sha256::Sha256;
 use crate::sweep::{root, state};
 use crate::text::shown;
 use crate::time::{now, utc};
+use crate::user;
 
 /// Where root keeps the permits: one file each.
 pub const DIRECTORY: &str = "/var/lib/omarchy-guardian/permits";
@@ -437,7 +437,7 @@ impl Pending {
 
 /// The user's directory of blocks to permit, private to them.
 fn pending_directory(state_root: &Path) -> Result<PathBuf, String> {
-    let uid = store::effective_uid()?;
+    let uid = user::effective_uid()?;
     store::private_dir(state_root, uid)?;
     let directory = state_root.join(PENDING_DIRECTORY);
     store::private_dir(&directory, uid)?;
@@ -538,7 +538,7 @@ fn standing_at(
     if !report.content_hashed() || !enabled(settings, &content.class) {
         return Standing::None;
     }
-    let Some(uid) = notify::current_uid() else {
+    let Some(uid) = user::real_uid() else {
         return Standing::None;
     };
     if let Some(permitted) = contents
@@ -689,7 +689,7 @@ fn grant(
                 .into(),
         );
     }
-    let uid = notify::current_uid().ok_or("cannot tell which user this is")?;
+    let uid = user::real_uid().ok_or("cannot tell which user this is")?;
     if uid == 0 {
         return Err("a permit is given by the user who was blocked, not by root".into());
     }
@@ -728,7 +728,7 @@ fn list(state_root: Option<&Path>) {
             );
         }
     }
-    let permits = notify::current_uid()
+    let permits = user::real_uid()
         .map(|uid| standing_permits(&root_place(), uid, now))
         .unwrap_or_default();
     if !permits.is_empty() {
@@ -749,7 +749,7 @@ fn revoke(id: &str, state_root: Option<&Path>) -> Result<String, String> {
     if let Some(root) = state_root {
         drop_pending(root, id);
     }
-    let held = notify::current_uid().is_some_and(|uid| {
+    let held = user::real_uid().is_some_and(|uid| {
         standing_permits(&root_place(), uid, now())
             .iter()
             .any(|permit| permit.key.starts_with(id))
@@ -927,7 +927,7 @@ fn system_change(arguments: &[String]) -> Result<(), String> {
 /// `omarchy-guardian permit-system …`, run as root through sudo by
 /// `permit`: the permits, which only root writes.
 pub fn system_command(arguments: &[String]) -> ExitCode {
-    if !store::effective_uid().is_ok_and(|uid| uid == 0) {
+    if !user::effective_uid().is_ok_and(|uid| uid == 0) {
         errln!("omarchy-guardian permit-system: only `permit` runs this, as root");
         return ExitCode::from(2);
     }
@@ -945,7 +945,7 @@ pub fn system_command(arguments: &[String]) -> ExitCode {
 /// root's own line in the audit trail, which no user process can write,
 /// and the end of a permit the transaction used.
 pub fn hook_result_command(arguments: &[String]) -> ExitCode {
-    if !store::effective_uid().is_ok_and(|uid| uid == 0) {
+    if !user::effective_uid().is_ok_and(|uid| uid == 0) {
         errln!("omarchy-guardian pacman-hook-result: only the pacman hook runs this, as root");
         return ExitCode::from(2);
     }
@@ -1000,9 +1000,9 @@ mod tests {
     use crate::config::file::PartialConfig;
     use crate::config::model::{Profile, SourceClass};
     use crate::error::Error;
-    use crate::notify::current_uid;
     use crate::report::{Blocked, Decision, Gap, Report};
     use crate::test_support::{NOBODY, TempDir, give};
+    use crate::user::real_uid as current_uid;
 
     const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";

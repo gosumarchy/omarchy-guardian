@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, IoContext};
 use crate::sha256::Sha256;
+use crate::user;
 
 pub const BLOBS: &str = "blobs";
 pub const BASELINES: &str = "baselines";
@@ -61,7 +62,7 @@ impl Store {
     /// leave root-owned directories in it.
     pub fn open(root: PathBuf) -> Result<Self, String> {
         let describe = |path: &Path, error: io::Error| format!("{}: {error}", path.display());
-        let uid = effective_uid()?;
+        let uid = user::effective_uid()?;
         private_dir(&root, uid)?;
 
         for name in [BLOBS, BASELINES, VERDICTS] {
@@ -343,18 +344,6 @@ pub fn summary(root: &Path) -> Option<(usize, u64)> {
 fn unix_secs(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
-}
-
-/// The effective user id, from `/proc/self/status` (`Uid: real effective saved fs`).
-pub fn effective_uid() -> Result<u32, String> {
-    let status = fs::read_to_string("/proc/self/status")
-        .map_err(|error| format!("/proc/self/status: {error}"))?;
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix("Uid:"))
-        .and_then(|ids| ids.split_whitespace().nth(1))
-        .and_then(|id| id.parse().ok())
-        .ok_or_else(|| "cannot read the effective user id".to_string())
 }
 
 #[cfg(test)]

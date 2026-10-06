@@ -15,6 +15,7 @@ use super::collect::Item;
 use super::tier::Tier;
 use crate::engine::store;
 use crate::json::Json;
+use crate::user;
 
 const BASELINE: &str = "baseline.json";
 const ALLOWED: &str = "allowed.json";
@@ -29,7 +30,7 @@ const MAX_RECORD_BYTES: u64 = 64 * 1024;
 
 /// The sweep's directory in the review store.
 pub fn directory(store_root: &Path) -> Result<PathBuf, String> {
-    let uid = store::effective_uid()?;
+    let uid = user::effective_uid()?;
     store::private_dir(store_root, uid)?;
     let directory = store_root.join("sweep");
     store::private_dir(&directory, uid)?;

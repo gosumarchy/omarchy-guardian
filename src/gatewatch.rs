@@ -27,6 +27,7 @@ use crate::config::Settings;
 use crate::engine::store::{self, Store};
 use crate::json::Json;
 use crate::notify;
+use crate::user;
 
 const RECORD: &str = "gatewatch.json";
 const LOCK: &str = "gatewatch.lock";
@@ -406,7 +407,7 @@ impl Drop for Lock {
 /// The user's private state directory, made if missing. Root keeps no
 /// record: under `sudo -E` the directory is the user's.
 pub fn directory() -> Option<PathBuf> {
-    let uid = store::effective_uid().ok().filter(|uid| *uid != 0)?;
+    let uid = user::effective_uid().ok().filter(|uid| *uid != 0)?;
     let root = Store::default_root()?;
     store::private_dir(&root, uid).ok()?;
     Some(root)
