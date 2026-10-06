@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use crate::content::{self, Content, Format, Prefix};
 use crate::error::Error;
-use crate::files::{O_NOFOLLOW, O_NONBLOCK};
+use crate::files::{O_NONBLOCK, read_small_file};
 use crate::git_state;
 use crate::report::Gap;
 use crate::sha256::{Digest, Sha256};
@@ -279,28 +279,6 @@ pub fn verify_copy(config: &ScanConfig, expected: &Snapshot) -> Result<(), Error
     Ok(())
 }
 
-/// The text of a regular file no larger than a reviewable one, opened
-/// without following a link or waiting on a pipe.
-fn read_small_file(path: &Path) -> Option<String> {
-    let metadata = fs::symlink_metadata(path).ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_TEXT_FILE_SIZE {
-        return None;
-    }
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
-        .open(path)
-        .ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_TEXT_FILE_SIZE + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    (bytes.len() as u64 <= MAX_TEXT_FILE_SIZE).then(|| String::from_utf8_lossy(&bytes).into_owned())
-}
-
 struct Walker<'a> {
     config: &'a ScanConfig,
     on_text: &'a mut dyn FnMut(TextFile<'_>),
@@ -469,7 +447,7 @@ impl Walker<'_> {
                 } else {
                     format!("{rel}/{config}")
                 };
-                if read_small_file(&handle.join(config)).is_none() {
+                if read_small_file(&handle.join(config), MAX_TEXT_FILE_SIZE).is_none() {
                     self.gaps.push(Gap::GitState(format!(
                         "{config_rel}: the configuration of a directory laid out as a git repository cannot be read"
                     )));
