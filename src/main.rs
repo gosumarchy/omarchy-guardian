@@ -29,6 +29,7 @@ mod cli;
 mod config;
 mod content;
 mod deps;
+mod encoding;
 mod engine;
 mod error;
 mod files;
