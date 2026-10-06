@@ -158,7 +158,7 @@ fn system_change(arguments: &[String]) -> Result<(), String> {
 
 /// `omarchy-guardian permit-system …`, run as root through sudo by
 /// `permit`: the permits, which only root writes.
-pub fn system_command(arguments: &[String]) -> ExitCode {
+pub(crate) fn system_command(arguments: &[String]) -> ExitCode {
     if !user::effective_uid().is_ok_and(|uid| uid == 0) {
         errln!("omarchy-guardian permit-system: only `permit` runs this, as root");
         return ExitCode::from(2);
@@ -176,7 +176,7 @@ pub fn system_command(arguments: &[String]) -> ExitCode {
 /// hook's root half once the review, which runs as the user, has ended:
 /// root's own line in the audit trail, which no user process can write,
 /// and the end of a permit the transaction used.
-pub fn hook_result_command(arguments: &[String]) -> ExitCode {
+pub(crate) fn hook_result_command(arguments: &[String]) -> ExitCode {
     if !user::effective_uid().is_ok_and(|uid| uid == 0) {
         errln!("omarchy-guardian pacman-hook-result: only the pacman hook runs this, as root");
         return ExitCode::from(2);

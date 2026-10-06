@@ -19,7 +19,7 @@ pub(super) fn as_file(word: &str) -> Option<String> {
 
 /// The file a fetch on `line` is saved as: `curl -o x`, `wget -O x`,
 /// `curl … > x`, or the name in the address for `wget` and `curl -O`.
-pub fn fetched_file(line: &str) -> Option<String> {
+pub(super) fn fetched_file(line: &str) -> Option<String> {
     let words = unquoted_words(line);
     let at = words
         .iter()
@@ -96,7 +96,7 @@ pub fn fetched_file(line: &str) -> Option<String> {
 /// Every file a fetch on `line` is saved as: what `fetched_file` names,
 /// and what `fetch::saved_files` adds (through `tee`, into a directory, by
 /// another fetcher).
-pub fn fetched_files(line: &str) -> Vec<String> {
+pub(crate) fn fetched_files(line: &str) -> Vec<String> {
     let mut found: Vec<String> = fetched_file(line).into_iter().collect();
     for file in fetch::saved_files(line) {
         if !found.contains(&file) {
@@ -148,7 +148,7 @@ fn value_command(part: &str) -> Option<shell::Command> {
 
 /// Whether `line` runs the file named `file`: given to a shell or an
 /// interpreter, sourced, or run by its path (see `run_command`).
-pub fn runs_file(line: &str, file: &str) -> bool {
+pub(crate) fn runs_file(line: &str, file: &str) -> bool {
     // Inside a group a word is written with the group's `)`: the file as
     // it was saved, and the word that names it.
     let is_named = |word: &str| {
@@ -199,7 +199,7 @@ fn runs_named(command: &shell::Command, is_named: &dyn Fn(&str) -> bool) -> bool
 /// shell or an interpreter (`sh x`, `. ./x`, `python3 x.py`, `sh <x`),
 /// what it runs by its path (`./x`, `/opt/x`), and what it pipes into a
 /// shell (`cat x | sh`). The program is found as in `runs_file`.
-pub fn run_targets(line: &str) -> Vec<String> {
+pub(crate) fn run_targets(line: &str) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     // A word that ends in `)` is a file in a group that closes there, or
     // a file of that name: both are named, and a name no file has is
@@ -293,7 +293,7 @@ pub fn run_targets(line: &str) -> Vec<String> {
 /// files; which files these reach is known only where they run. What a
 /// loop does with its words is on later lines, so every loop over paths
 /// counts.
-pub fn run_globs(line: &str) -> Vec<String> {
+pub(crate) fn run_globs(line: &str) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     if !(line.contains(['*', '?'])
         || ["for ", "run-parts", "find "]
@@ -534,7 +534,7 @@ fn package_json_runs(line: &str, found: &mut Vec<String>) {
 
 /// Variables a file sets to a fetcher or a shell (`F=curl`, `S="bash"`),
 /// lowercased, so `$F … | $S` is judged as what it runs.
-pub fn command_variables(text: &str) -> Vec<(String, String)> {
+pub(crate) fn command_variables(text: &str) -> Vec<(String, String)> {
     let mut found: Vec<(String, String)> = Vec::new();
     for line in text.lines() {
         let line = line.trim().strip_prefix("export ").unwrap_or(line.trim());
@@ -566,7 +566,7 @@ const MAX_COMMAND_VARIABLES: usize = 32;
 
 /// `code` with `$name` and `${name}` of `variables` written out. Names are
 /// matched as given: a caller that wants it case-blind lowercases both.
-pub fn with_variables(code: &str, variables: &[(String, String)]) -> String {
+pub(crate) fn with_variables(code: &str, variables: &[(String, String)]) -> String {
     if variables.is_empty() || !code.contains('$') {
         return code.to_string();
     }

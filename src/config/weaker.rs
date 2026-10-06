@@ -9,7 +9,7 @@ use crate::config::model::{AiRequirement, Named, SourceClass, builtin};
 use crate::config::resolve::Origin;
 
 /// The classes the user file can loosen.
-pub const USER_CLASSES: [SourceClass; 5] = [
+const USER_CLASSES: [SourceClass; 5] = [
     SourceClass::Aur,
     SourceClass::Theme,
     SourceClass::Plugin,
@@ -18,27 +18,27 @@ pub const USER_CLASSES: [SourceClass; 5] = [
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Weakening {
-    pub class: SourceClass,
-    pub knob: &'static str,
+pub(crate) struct Weakening {
+    pub(crate) class: SourceClass,
+    pub(crate) knob: &'static str,
     /// The value in effect, and the level's own.
-    pub value: String,
-    pub level: String,
+    pub(crate) value: String,
+    pub(crate) level: String,
     /// The level's name.
-    pub profile: &'static str,
+    pub(crate) profile: &'static str,
     /// Accepted: named in the system file's `[acknowledged]`, or set by
     /// the system file itself, which only root writes.
-    pub acknowledged: bool,
+    pub(crate) acknowledged: bool,
 }
 
 impl Weakening {
     /// How the system file names it: `aur.ai=off`.
-    pub fn key(&self) -> String {
+    pub(crate) fn key(&self) -> String {
         format!("{}.{}={}", self.class.name(), self.knob, self.value)
     }
 
     /// One line for the bar: what is weaker, and the two ways out.
-    pub fn issue(&self) -> String {
+    pub(crate) fn issue(&self) -> String {
         format!(
             "{}: {} = {} is weaker than the {} level ({}); set it back in `omarchy-guardian tui`, or keep it with `omarchy-guardian config acknowledge`",
             subject(self.class),
@@ -51,7 +51,7 @@ impl Weakening {
 }
 
 /// What a class reviews, in the words the bar uses.
-pub const fn subject(class: SourceClass) -> &'static str {
+pub(crate) const fn subject(class: SourceClass) -> &'static str {
     match class {
         SourceClass::Official => "official packages",
         SourceClass::ThirdPartyRepo => "third-party packages",
@@ -67,7 +67,7 @@ pub const fn subject(class: SourceClass) -> &'static str {
 /// Every knob of every user-level class that is weaker than the class's
 /// level. The review memory (`cache`, `diff`), the model and the thinking
 /// level are choices, not weakenings.
-pub fn weakenings(settings: &Settings) -> Vec<Weakening> {
+pub(crate) fn weakenings(settings: &Settings) -> Vec<Weakening> {
     let accepted = settings.acknowledged_weaker();
     let mut found = Vec::new();
     for class in USER_CLASSES {
@@ -124,7 +124,7 @@ pub fn weakenings(settings: &Settings) -> Vec<Weakening> {
 
 /// The `[acknowledged]` list that accepts exactly what the user file
 /// weakens now: what was accepted and is no longer weak is dropped.
-pub fn to_acknowledge(settings: &Settings) -> Vec<String> {
+pub(crate) fn to_acknowledge(settings: &Settings) -> Vec<String> {
     weakenings(settings)
         .iter()
         .filter(|weakening| {

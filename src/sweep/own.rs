@@ -119,7 +119,7 @@ fn overrides(units: &[&str], relative: &str, with_units: bool) -> bool {
 
 /// Whether `path` (relative to the root) overrides one of Guardian's units,
 /// for a sweep whose home is `home`.
-pub fn is_override(home: Option<&str>, path: &str) -> bool {
+pub(super) fn is_override(home: Option<&str>, path: &str) -> bool {
     let under = |directory: &str, units: &[&str], with_units: bool| {
         path.strip_prefix(directory)
             .and_then(|rest| rest.strip_prefix('/'))
@@ -249,7 +249,7 @@ fn candidates_under(root: &Path, home: Option<&str>, packaged: bool) -> Vec<Stri
 /// that home's and its runtime directory's. The root collector looks at
 /// root's own home here; the homes of the accounts its results go to are
 /// looked at as those accounts (`of_account`).
-pub fn paths(scope: &Scope<'_>) -> Vec<String> {
+pub(super) fn paths(scope: &Scope<'_>) -> Vec<String> {
     candidates_under(scope.root, scope.home, true)
 }
 
@@ -259,7 +259,7 @@ pub fn paths(scope: &Scope<'_>) -> Vec<String> {
 /// package's own directories are therefore left to the sweep: only it
 /// can tell the one a repository package ships for every unit from one
 /// put there by hand.
-pub fn standing(root: &Path, home: Option<&str>) -> Vec<String> {
+pub(crate) fn standing(root: &Path, home: Option<&str>) -> Vec<String> {
     candidates_under(root, home, false)
         .into_iter()
         .filter(|path| is_override(home, path))
@@ -269,7 +269,7 @@ pub fn standing(root: &Path, home: Option<&str>) -> Vec<String> {
 /// Puts the alert on `item`, which overrides one of Guardian's units. An
 /// alert takes away whatever trust its tier gave it: a mask is no longer
 /// inert.
-pub fn mark(item: &mut Item) {
+pub(super) fn mark(item: &mut Item) {
     if !item
         .alerts
         .iter()
@@ -308,7 +308,7 @@ fn is_there(scope: &Scope<'_>, path: &str, view: View) -> bool {
 /// chose, not one a user named, it lies in the account's own home or
 /// runtime directory, and it is looked for only through directories the
 /// account may enter itself.
-pub fn of_account(scope: &Scope<'_>, home: &str, uid: u32) -> Vec<Item> {
+pub(super) fn of_account(scope: &Scope<'_>, home: &str, uid: u32) -> Vec<Item> {
     let view = View::Owner(uid);
     let list = |directory: &str| -> Vec<String> {
         match read::seen(scope.root, directory, view).map(|seen| seen.what) {

@@ -34,11 +34,11 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use self::model::{Attribute, attributes_in_tar, parse_model};
-pub use self::model::{
+pub(crate) use self::model::{
     OWNED_BY_OTHER, SETGID_OTHER, SETUID_OTHER, WITH_ACL, WITH_CAPABILITIES, WRITABLE_BY_ALL,
     WRITABLE_BY_GROUP, already_granted, unescape,
 };
-pub use self::review::{GUARDIAN_PACKAGE, PayloadFile, annotated, review};
+pub(crate) use self::review::{GUARDIAN_PACKAGE, PayloadFile, annotated, review};
 use crate::autorun::named_words;
 use crate::content::{self, PROBE_SIZE, Prefix};
 use crate::error::{Error, IoContext};
@@ -81,7 +81,7 @@ const USR_LINKS: &[&str] = &["usr/sbin/", "usr/lib64/"];
 
 /// `path` (relative to `/`) as the system reads it through those links:
 /// `bin/sh` and `usr/sbin/sh` are `usr/bin/sh`.
-pub fn through_root_links(path: &str) -> String {
+pub(crate) fn through_root_links(path: &str) -> String {
     for (link, leads) in [
         ("bin/", "usr/bin/"),
         ("sbin/", "usr/bin/"),
@@ -129,7 +129,7 @@ enum Resolution {
 
 /// What an archive ships at a path.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum InArchive {
+pub(crate) enum InArchive {
     Absent,
     /// A directory, a link, or a file that could not be read.
     Other,
@@ -137,7 +137,7 @@ pub enum InArchive {
 }
 
 /// A package archive opened once and modelled exactly.
-pub struct Archive {
+pub(crate) struct Archive {
     path: PathBuf,
     file: File,
     identity: Identity,
@@ -178,7 +178,7 @@ impl Identity {
 /// meanwhile; `verify` is asked again once the review is over. The digest
 /// is also what the audit trail records and a permit is bound to.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Fingerprint {
+pub(crate) struct Fingerprint {
     path: PathBuf,
     identity: Identity,
     digest: Digest,
@@ -205,13 +205,13 @@ fn root_alone(path: &Path, file: &Metadata) -> bool {
 
 impl Fingerprint {
     /// The SHA-256 of the archive's bytes as they were reviewed.
-    pub const fn digest(&self) -> &Digest {
+    pub(crate) const fn digest(&self) -> &Digest {
         &self.digest
     }
 
     /// The archive by its file name without `.pkg.tar.*`: the package's
     /// name, version, build and architecture.
-    pub fn name(&self) -> String {
+    pub(crate) fn name(&self) -> String {
         let name = self
             .path
             .file_name()
@@ -224,7 +224,7 @@ impl Fingerprint {
 
     /// The path must still name the same file, unchanged, holding the same
     /// bytes.
-    pub fn verify(&self) -> Result<(), Error> {
+    pub(crate) fn verify(&self) -> Result<(), Error> {
         let changed = || {
             Error::Refused(format!(
                 "{} changed while it was being reviewed",
@@ -271,7 +271,7 @@ fn digest_of(mut file: &File) -> io::Result<Digest> {
 /// What an archive puts where a link on the system leads (see
 /// `Archive::replacement`).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Replacement {
+pub(crate) enum Replacement {
     /// A file small enough to read, with its bytes.
     File(Vec<u8>),
     /// A larger file that is no text, by what it is.
@@ -286,7 +286,7 @@ pub enum Replacement {
 impl Archive {
     /// Opens `path` (not following a link), lists it twice and builds the
     /// model; any listing that is not a clean package fails.
-    pub fn open(path: &Path) -> Result<Self, Error> {
+    pub(crate) fn open(path: &Path) -> Result<Self, Error> {
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(O_NOFOLLOW | O_NONBLOCK)
@@ -487,7 +487,7 @@ impl Archive {
     /// The archive as it is now, to compare with once the review is over.
     /// The whole of it is hashed, through the descriptor it was opened
     /// with; unless the file is root's alone, it is hashed again then.
-    pub fn fingerprint(&self) -> Result<Fingerprint, Error> {
+    pub(crate) fn fingerprint(&self) -> Result<Fingerprint, Error> {
         let rehash = !root_alone(&self.path, &self.file.metadata().at(&self.path)?);
         let file = File::open(format!("/proc/self/fd/{}", self.file.as_raw_fd())).at(&self.path)?;
         Ok(Fingerprint {
@@ -614,7 +614,7 @@ impl Archive {
     /// What this archive installs at `path` (no leading `/`), for a link
     /// on the system that leads there and is read as an auto-run file:
     /// `None` when it ships no file there.
-    pub fn replacement(&self, path: &str) -> Option<Replacement> {
+    pub(crate) fn replacement(&self, path: &str) -> Option<Replacement> {
         let regular = match &self.entry(path)?.kind {
             Kind::Directory => return None,
             Kind::Symlink(_) => match self.regular_at(path) {
@@ -652,12 +652,12 @@ impl Archive {
 
     /// The file capabilities the archive gives `path` (see
     /// `capabilities`), when those are all its attributes grant.
-    pub fn shipped_capability(&self, path: &str) -> Option<&str> {
+    pub(crate) fn shipped_capability(&self, path: &str) -> Option<&str> {
         self.capabilities.get(path).map(String::as_str)
     }
 
     /// The path must still name the file that was reviewed.
-    pub fn verify_unchanged(&self) -> Result<(), Error> {
+    pub(crate) fn verify_unchanged(&self) -> Result<(), Error> {
         let current = fs::symlink_metadata(&self.path).at(&self.path)?;
         if current.is_file() && Identity::of(&current) == self.identity {
             Ok(())
@@ -776,12 +776,12 @@ impl Archive {
     }
 
     /// The paths of everything this archive ships (no leading `/`).
-    pub fn paths(&self) -> impl Iterator<Item = &str> {
+    pub(crate) fn paths(&self) -> impl Iterator<Item = &str> {
         self.entries.iter().map(|entry| entry.path.as_str())
     }
 
     /// What this archive ships at `path` (no leading `/`).
-    pub fn shipped_file(&self, path: &str) -> InArchive {
+    pub(crate) fn shipped_file(&self, path: &str) -> InArchive {
         let Some(entry) = self.entry(path) else {
             return InArchive::Absent;
         };

@@ -7,8 +7,8 @@
 
 use crate::tui::canvas::{Canvas, Style};
 
-pub const WIDTH: usize = 18;
-pub const HEIGHT: usize = PIXELS.len() / 2;
+pub(super) const WIDTH: usize = 18;
+pub(super) const HEIGHT: usize = PIXELS.len() / 2;
 
 /// One character per pixel; see `palette` for the colours. `.` is empty
 /// and `e` is an eye.
@@ -32,7 +32,7 @@ const PIXELS: [&str; 16] = [
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mood {
+pub(super) enum Mood {
     /// Balanced protection, everything in place.
     Calm,
     /// Maximum protection.
@@ -79,7 +79,7 @@ fn pixel(column: usize, row: usize, mood: Mood, blink: bool) -> Option<u8> {
 
 /// Draws the knight with its top-left corner at `(x, y)`. Empty pixels are
 /// left untouched, so it never paints over what is around it.
-pub fn draw(canvas: &mut Canvas, x: usize, y: usize, mood: Mood, blink: bool) {
+pub(super) fn draw(canvas: &mut Canvas, x: usize, y: usize, mood: Mood, blink: bool) {
     for text_row in 0..HEIGHT {
         for column in 0..WIDTH {
             let top = pixel(column, text_row * 2, mood, blink);

@@ -15,9 +15,9 @@ use crate::paths::{self, Accept};
 use crate::sha256::Sha256;
 use crate::user;
 
-pub const BLOBS: &str = "blobs";
-pub const BASELINES: &str = "baselines";
-pub const VERDICTS: &str = "verdicts";
+pub(super) const BLOBS: &str = "blobs";
+pub(super) const BASELINES: &str = "baselines";
+pub(super) const VERDICTS: &str = "verdicts";
 
 const TEMP_PREFIX: &str = ".tmp-";
 
@@ -31,7 +31,7 @@ const MAX_TEMP_ATTEMPTS: u32 = 16;
 /// otherwise leaves that file behind forever.
 const STALE_TEMP_SECS: u64 = 3_600;
 
-pub struct Store {
+pub(crate) struct Store {
     root: PathBuf,
     /// Per-instance so a fresh `Store::open` (once per Guardian run) starts
     /// its temp names at 0 again; only `process::id()` needs to disambiguate
@@ -41,7 +41,7 @@ pub struct Store {
 
 impl Store {
     /// `$XDG_STATE_HOME/omarchy-guardian`, else `~/.local/state/omarchy-guardian`.
-    pub fn default_root() -> Option<PathBuf> {
+    pub(crate) fn default_root() -> Option<PathBuf> {
         let base = paths::state_home(Accept::Absolute, Accept::Absolute)?;
         Some(base.join("omarchy-guardian"))
     }
@@ -52,7 +52,7 @@ impl Store {
     /// created only under an existing real directory owned by the effective
     /// user, so a run under `sudo -E` (which keeps the user's HOME) cannot
     /// leave root-owned directories in it.
-    pub fn open(root: PathBuf) -> Result<Self, String> {
+    pub(crate) fn open(root: PathBuf) -> Result<Self, String> {
         let describe = |path: &Path, error: io::Error| format!("{}: {error}", path.display());
         let uid = user::effective_uid()?;
         paths::private_dir(&root, uid)?;
@@ -80,7 +80,7 @@ impl Store {
 
     /// Writes through a new temporary file in the same directory, then
     /// renames it into place, so a reader never sees half a file.
-    pub fn write(&self, dir: &str, name: &str, bytes: &[u8]) -> Result<(), Error> {
+    pub(super) fn write(&self, dir: &str, name: &str, bytes: &[u8]) -> Result<(), Error> {
         let target = self.path(dir, name);
         let (temp, mut file) = self.open_temp(dir)?;
         let written = file.write_all(bytes).and_then(|()| file.sync_all());
@@ -124,7 +124,7 @@ impl Store {
     /// Deletes `.tmp-*` files older than an hour from every store directory:
     /// leftovers from a run killed mid-write that `write` itself never
     /// cleans up.
-    pub fn sweep_stale_temp_files(&self, now: u64) -> Result<(), Error> {
+    pub(super) fn sweep_stale_temp_files(&self, now: u64) -> Result<(), Error> {
         for dir in [BLOBS, BASELINES, VERDICTS] {
             let path = self.root.join(dir);
             for entry in fs::read_dir(&path).at(&path)? {
@@ -149,7 +149,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn read(&self, dir: &str, name: &str) -> Result<Option<Vec<u8>>, Error> {
+    pub(super) fn read(&self, dir: &str, name: &str) -> Result<Option<Vec<u8>>, Error> {
         let path = self.path(dir, name);
         match fs::read(&path) {
             Ok(bytes) => Ok(Some(bytes)),
@@ -158,7 +158,7 @@ impl Store {
         }
     }
 
-    pub fn remove(&self, dir: &str, name: &str) -> Result<(), Error> {
+    pub(super) fn remove(&self, dir: &str, name: &str) -> Result<(), Error> {
         let path = self.path(dir, name);
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
@@ -169,7 +169,7 @@ impl Store {
 
     /// Entry names in one of the store's directories, sorted, leaving out
     /// temporary files.
-    pub fn list(&self, dir: &str) -> Result<Vec<String>, Error> {
+    pub(super) fn list(&self, dir: &str) -> Result<Vec<String>, Error> {
         let path = self.root.join(dir);
         let mut names = Vec::new();
         for entry in fs::read_dir(&path).at(&path)? {
@@ -187,7 +187,7 @@ impl Store {
     }
 
     /// Total bytes of the store's files.
-    pub fn size(&self) -> Result<u64, Error> {
+    pub(super) fn size(&self) -> Result<u64, Error> {
         let mut total = 0;
         for dir in [BLOBS, BASELINES, VERDICTS] {
             for name in self.list(dir)? {
@@ -203,7 +203,7 @@ impl Store {
     }
 
     /// Stores `bytes` under their SHA-256 and returns the hex digest.
-    pub fn put_blob(&self, bytes: &[u8]) -> Result<String, Error> {
+    pub(super) fn put_blob(&self, bytes: &[u8]) -> Result<String, Error> {
         let digest = Sha256::digest(bytes).to_string();
         if !self.path(BLOBS, &digest).exists() {
             self.write(BLOBS, &digest, bytes)?;
@@ -213,7 +213,7 @@ impl Store {
 
     /// The blob with this digest, or `None` when it is missing or no longer
     /// matches its digest; a corrupt blob is deleted.
-    pub fn get_blob(&self, digest: &str) -> Result<Option<Vec<u8>>, Error> {
+    pub(super) fn get_blob(&self, digest: &str) -> Result<Option<Vec<u8>>, Error> {
         if !is_hex_digest(digest) {
             return Ok(None);
         }
@@ -230,7 +230,7 @@ impl Store {
 }
 
 /// A lowercase hex SHA-256 digest, the only names blobs and verdicts use.
-pub fn is_hex_digest(text: &str) -> bool {
+pub(super) fn is_hex_digest(text: &str) -> bool {
     text.len() == 64
         && text
             .bytes()
@@ -239,7 +239,7 @@ pub fn is_hex_digest(text: &str) -> bool {
 
 /// A read-only summary for `config show`: the number of baselines and the
 /// store's bytes, or `None` when there is no store yet.
-pub fn summary(root: &Path) -> Option<(usize, u64)> {
+pub(crate) fn summary(root: &Path) -> Option<(usize, u64)> {
     if !root.is_dir() {
         return None;
     }

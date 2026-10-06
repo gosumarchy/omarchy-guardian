@@ -20,10 +20,10 @@ use crate::sha256::{Digest, Sha256};
 
 /// Upstream text that fits one full review; larger sources are reviewed by
 /// their build files only.
-pub const FULL_REVIEW_BYTES: u64 = 1024 * 1024;
+const FULL_REVIEW_BYTES: u64 = 1024 * 1024;
 /// The most text sent when a source is reviewed in part: its build files
 /// and scripts first, then its other code, shallowest first.
-pub const PARTIAL_REVIEW_BYTES: u64 = 1024 * 1024;
+pub(crate) const PARTIAL_REVIEW_BYTES: u64 = 1024 * 1024;
 const MAX_DEPTH: usize = 16;
 const MAX_ENTRIES: usize = 200_000;
 /// Scripts deeper than this are not treated as build files.
@@ -142,22 +142,22 @@ const INCLUDES: &[&str] = &["include", "-include", "sinclude"];
 /// dependency's own and say nothing about what this build downloads.
 const MANIFEST_DEPTH: usize = 3;
 /// The most archives Guardian unpacks itself for one build.
-pub const MAX_UNPACKED_ARCHIVES: usize = 8;
+const MAX_UNPACKED_ARCHIVES: usize = 8;
 
 /// Why a text file was not sent for review.
-pub const NOT_REVIEWED_DATA: &str =
+pub(crate) const NOT_REVIEWED_DATA: &str =
     "data or documentation, which Guardian does not send for review";
-pub const NOT_REVIEWED_BUDGET: &str = "left out past the review budget";
-pub const NOT_REVIEWED_LOCKFILE: &str =
+pub(crate) const NOT_REVIEWED_BUDGET: &str = "left out past the review budget";
+pub(super) const NOT_REVIEWED_LOCKFILE: &str =
     "a lockfile too large to send, which Guardian scanned itself for where it fetches from";
 const NOT_UNPACKED: &str =
     "an archive that is not unpacked for review: what the build takes from it is not reviewed";
 
 /// One upstream text file, by its path under the build directory's `src/`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UpstreamFile {
-    pub path: String,
-    pub text: String,
+pub(crate) struct UpstreamFile {
+    pub(crate) path: String,
+    pub(crate) text: String,
     depth: usize,
     /// Build-critical: must be reviewed, or the review is incomplete.
     critical: bool,
@@ -170,14 +170,14 @@ pub struct UpstreamFile {
 /// An archive among the sources that makepkg did not unpack: the build
 /// opens it itself, if at all.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Archive {
+pub(crate) struct Archive {
     /// Its path under `src/`.
-    pub rel: String,
+    pub(crate) rel: String,
     /// Where its bytes are.
-    pub file: PathBuf,
+    pub(crate) file: PathBuf,
     /// The recipe names it (`noextract`, or by its name in a function), so
     /// the build certainly opens it.
-    pub named: bool,
+    pub(super) named: bool,
 }
 
 /// A data file kept back from the review, which is read after all if a
@@ -191,59 +191,59 @@ struct DataFile {
 
 /// What was taken from the extracted sources for the review.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Upstream {
-    pub files: Vec<UpstreamFile>,
+pub(crate) struct Upstream {
+    pub(crate) files: Vec<UpstreamFile>,
     /// Every text file was taken and nothing was omitted.
-    pub whole: bool,
+    pub(crate) whole: bool,
     /// Text files left out past the budget (never build-critical ones).
-    pub left_out: usize,
+    pub(crate) left_out: usize,
     /// Text files other than data and documentation.
-    pub text_files: usize,
+    pub(crate) text_files: usize,
     /// Data and documentation files, not reviewed.
-    pub data_files: usize,
+    pub(crate) data_files: usize,
     /// Binary files, which cannot be reviewed.
-    pub binary_files: usize,
+    pub(crate) binary_files: usize,
     /// Executable binaries (up to 20), named to the AI.
-    pub executables: Vec<String>,
+    pub(crate) executables: Vec<String>,
     /// The binary files with their hashes, for the review memory (see
     /// `baseline::Unread`).
-    pub unread: Unread,
+    pub(crate) unread: Unread,
     /// Links to recipe files, which the recipe review covered.
-    pub recipe_links: usize,
+    pub(super) recipe_links: usize,
     /// Files skipped without harm to the review, with the reason.
-    pub omitted: Vec<(String, &'static str)>,
+    pub(crate) omitted: Vec<(String, &'static str)>,
     /// Build-critical files that could not be reviewed: the review is
     /// incomplete.
-    pub gaps: Vec<String>,
+    pub(crate) gaps: Vec<String>,
     /// Whether `src` existed and had entries.
-    pub found: bool,
+    pub(crate) found: bool,
     /// Text files that were not sent for review, by path, with why: data
     /// and documentation, and code past the budget. A reviewed line that
     /// runs or reads one in makes the review incomplete.
-    pub unreviewed: Vec<(String, &'static str)>,
+    pub(crate) unreviewed: Vec<(String, &'static str)>,
     /// Every program among the binaries (ELF and the like), with its hash.
-    pub programs: BTreeMap<String, String>,
+    pub(crate) programs: BTreeMap<String, String>,
     /// Every file the walk read, with its hash: what the sources were when
     /// Guardian looked.
-    pub seen: BTreeMap<String, String>,
+    pub(crate) seen: BTreeMap<String, String>,
     /// The downloaded files makepkg linked into `src/`, with their hashes.
-    pub downloads: BTreeMap<String, String>,
+    pub(crate) downloads: BTreeMap<String, String>,
     /// What a local scan of each lockfile found, in Guardian's words.
-    pub lockfiles: Vec<String>,
+    pub(crate) lockfiles: Vec<String>,
     /// The ecosystems whose manifests or lockfiles the sources hold.
-    pub ecosystems: Vec<lockfile::Ecosystem>,
+    pub(crate) ecosystems: Vec<lockfile::Ecosystem>,
     /// Archives Guardian unpacked itself and reviewed like the rest.
-    pub unpacked: Vec<String>,
+    pub(crate) unpacked: Vec<String>,
     /// Files new or changed since Guardian extracted the sources: how many
     /// there are, and how many of them were sent for review.
-    pub changed: (usize, usize),
+    pub(crate) changed: (usize, usize),
 }
 
 impl Upstream {
     /// Whether the file at `path` came out of an archive Guardian unpacked
     /// itself. A directory of the sources whose own name ends in `!` is
     /// not one.
-    pub fn is_unpacked(&self, path: &str) -> bool {
+    pub(crate) fn is_unpacked(&self, path: &str) -> bool {
         self.unpacked.iter().any(|archive| {
             path.strip_prefix(archive.as_str())
                 .is_some_and(|inside| inside.starts_with("!/"))
@@ -271,9 +271,9 @@ fn carries_code(name: &str) -> bool {
 
 /// Where makepkg keeps what a build uses: the recipe directory, and the
 /// download directory (`SRCDEST`), which `src/` links into.
-pub struct Roots<'a> {
-    pub build_dir: &'a Path,
-    pub srcdest: Option<&'a Path>,
+pub(crate) struct Roots<'a> {
+    pub(crate) build_dir: &'a Path,
+    pub(crate) srcdest: Option<&'a Path>,
 }
 
 fn is_build_file(name: &str, depth: usize, text: &str) -> bool {
@@ -982,7 +982,7 @@ const UNPACKERS: &[&str] = &[
 /// The files a recipe gives to a command that unpacks, by name as written:
 /// `bsdtar -xf data.tar.xz`, `tar xf "$srcdir"/payload-*.tar.gz`. A name
 /// may hold `*` or a variable, which stand for anything.
-pub fn unpack_patterns(recipe: &str) -> Vec<String> {
+pub(super) fn unpack_patterns(recipe: &str) -> Vec<String> {
     let mut patterns = Vec::new();
     for line in recipe.lines() {
         let mut words = line
@@ -1070,7 +1070,10 @@ pub(super) fn matches_pattern(pattern: &str, name: &str) -> bool {
 /// The files the lines of a recipe file run or read in as code, as (line
 /// number, the line, the file as written without what a variable or `./`
 /// puts before it): `./helper`, `sh "$srcdir/tools/gen.sh"`.
-pub fn recipe_runs(text: &str, variables: &[(String, String)]) -> Vec<(usize, String, String)> {
+pub(crate) fn recipe_runs(
+    text: &str,
+    variables: &[(String, String)],
+) -> Vec<(usize, String, String)> {
     let mut runs = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let written = crate::rules::with_variables(line, variables);
@@ -1087,7 +1090,7 @@ pub fn recipe_runs(text: &str, variables: &[(String, String)]) -> Vec<(usize, St
 /// Whether the file at `path` (under `src/`, or inside an archive under
 /// it) is the one a recipe writes as `target`: the recipe's functions move
 /// between directories of the sources, so any directory may stand before.
-pub fn is_target(path: &str, target: &str) -> bool {
+pub(crate) fn is_target(path: &str, target: &str) -> bool {
     let inside = path.rsplit_once("!/").map_or(path, |(_, inside)| inside);
     [path, inside].iter().any(|path| {
         path.strip_suffix(target)
@@ -1153,7 +1156,7 @@ fn is_named(path: &str, named: &HashSet<String>) -> bool {
 /// What a walk of the sources found, before it is decided what of it is
 /// sent for review: Guardian may still unpack archives into it and mark
 /// what changed since an earlier look.
-pub struct Collected {
+pub(crate) struct Collected {
     all: Vec<UpstreamFile>,
     data: Vec<DataFile>,
     archives: Vec<Archive>,
@@ -1212,7 +1215,7 @@ impl Collected {
 
     /// The archives Guardian should unpack itself: the ones the recipe
     /// names, at most one archive deep inside another.
-    pub fn to_unpack(&self) -> Vec<Archive> {
+    pub(crate) fn to_unpack(&self) -> Vec<Archive> {
         self.archives
             .iter()
             .filter(|archive| archive.named && archive.rel.matches('!').count() < 2)
@@ -1224,7 +1227,7 @@ impl Collected {
     /// Takes in what Guardian unpacked of `archive` into `unpacked`: its
     /// files are reviewed like the rest of `src/`, under the archive's
     /// path followed by `!`.
-    pub fn add_unpacked(
+    pub(crate) fn add_unpacked(
         &mut self,
         archive: &Archive,
         unpacked: &Path,
@@ -1256,7 +1259,7 @@ impl Collected {
 
     /// `archive` could not be unpacked for review: the build opens it, so
     /// the review is incomplete.
-    pub fn not_unpacked(&mut self, archive: &Archive, why: &str) {
+    pub(crate) fn not_unpacked(&mut self, archive: &Archive, why: &str) {
         self.archives.retain(|known| known.rel != archive.rel);
         self.upstream.gaps.push(format!(
             "src/{}: the recipe opens this archive itself, and Guardian could not unpack it for review ({why})",
@@ -1265,13 +1268,13 @@ impl Collected {
     }
 
     /// What the walk saw: every file with its hash, and the downloads.
-    pub fn upstream(&self) -> &Upstream {
+    pub(crate) fn upstream(&self) -> &Upstream {
         &self.upstream
     }
 
     /// Marks the files at `paths` as new or changed since Guardian
     /// extracted the sources: they are sent for review before other code.
-    pub fn mark_changed(&mut self, paths: &HashSet<String>) {
+    pub(crate) fn mark_changed(&mut self, paths: &HashSet<String>) {
         self.upstream.changed.0 = paths.len();
         for file in &mut self.all {
             file.changed = paths.contains(&file.path);
@@ -1353,7 +1356,7 @@ impl Collected {
     /// changed since Guardian extracted the sources, then other code,
     /// shallowest and outside rarely-run directories first, up to
     /// `budget`. What is left out is listed in `unreviewed`.
-    pub fn select(mut self, budget: u64) -> Upstream {
+    pub(crate) fn select(mut self, budget: u64) -> Upstream {
         self.settle_named();
         self.settle_archives();
         self.settle_images();
@@ -1416,7 +1419,7 @@ impl Collected {
 
 /// Walks the upstream code under `src`. `noextract` holds the downloads the
 /// listing says makepkg does not unpack.
-pub fn walk_upstream(
+pub(crate) fn walk_upstream(
     src: &Path,
     roots: &Roots<'_>,
     recipe: &str,
@@ -1448,7 +1451,12 @@ fn walk_with_cap(
 /// Collects upstream code under `src` as it is, unpacking nothing (see
 /// `Collected::select` for what is taken).
 #[cfg(test)]
-pub fn collect_upstream(src: &Path, roots: &Roots<'_>, recipe: &str, budget: u64) -> Upstream {
+pub(super) fn collect_upstream(
+    src: &Path,
+    roots: &Roots<'_>,
+    recipe: &str,
+    budget: u64,
+) -> Upstream {
     walk_upstream(src, roots, recipe, &[]).select(budget)
 }
 

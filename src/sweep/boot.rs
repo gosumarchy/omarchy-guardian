@@ -72,12 +72,12 @@ const MAX_IMAGES: usize = 32;
 
 /// What the boot checks found.
 #[derive(Debug, Default)]
-pub struct Boot {
-    pub items: Vec<Item>,
+pub(super) struct Boot {
+    pub(super) items: Vec<Item>,
     /// What is said of the system as a whole.
-    pub notes: Vec<String>,
+    pub(super) notes: Vec<String>,
     /// What could not be checked, as sentences: the sweep is incomplete.
-    pub unchecked: Vec<String>,
+    pub(super) unchecked: Vec<String>,
 }
 
 /// The watched parameters of the command line `running` that none of the
@@ -354,7 +354,7 @@ fn secure_boot(scope: &Scope<'_>, boot: &mut Boot) {
 }
 
 /// Runs the boot checks against `scope`.
-pub fn check(scope: &Scope<'_>) -> Boot {
+pub(super) fn check(scope: &Scope<'_>) -> Boot {
     let mut boot = Boot::default();
     command_line(scope, &mut boot);
     kernel_images(scope, &mut boot);

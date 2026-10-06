@@ -64,7 +64,7 @@ pub(super) fn view(scope: &Scope<'_>, run_by: Option<&str>) -> Option<View> {
 /// collector to.
 /// A directory is not: a command that names one (`find /etc/x`) does not
 /// run it.
-pub fn is_there(scope: &Scope<'_>, path: &str, run_by: Option<&str>) -> bool {
+pub(super) fn is_there(scope: &Scope<'_>, path: &str, run_by: Option<&str>) -> bool {
     match view(scope, run_by) {
         Some(view) => read::seen(scope.root, path, view)
             .is_some_and(|seen| !matches!(seen.what, read::Public::Directory(_))),
@@ -79,7 +79,7 @@ pub fn is_there(scope: &Scope<'_>, path: &str, run_by: Option<&str>) -> bool {
 /// Whether there is a regular file at `path` that `run_by` may lead the
 /// collector to (a link to one counts, as for `Path::is_file`, unless root
 /// looks).
-pub fn is_file_there(scope: &Scope<'_>, path: &str, run_by: Option<&str>) -> bool {
+pub(crate) fn is_file_there(scope: &Scope<'_>, path: &str, run_by: Option<&str>) -> bool {
     match view(scope, run_by) {
         Some(view) => matches!(
             read::seen(scope.root, path, view).map(|seen| seen.what),
@@ -94,7 +94,12 @@ pub fn is_file_there(scope: &Scope<'_>, path: &str, run_by: Option<&str>) -> boo
 /// where root would have to look into a directory not everyone may enter:
 /// whether a name is in there is not root's to tell whoever chose the
 /// directory. Anyone who may enter a directory may ask that of it.
-pub fn holds(scope: &Scope<'_>, directory: &str, name: &str, run_by: Option<&str>) -> Option<bool> {
+pub(crate) fn holds(
+    scope: &Scope<'_>,
+    directory: &str,
+    name: &str,
+    run_by: Option<&str>,
+) -> Option<bool> {
     let Some(view) = view(scope, run_by) else {
         return Some(fs::symlink_metadata(scope.root.join(directory).join(name)).is_ok());
     };
@@ -145,7 +150,12 @@ pub(super) fn look_past_link(scope: &Scope<'_>, path: &str) -> Found {
 /// auto-run locations' own files, and the set-id and kernel-module checks'
 /// (which find their files themselves, so nobody chose those), as root
 /// sees them.
-pub fn look(scope: &Scope<'_>, category: Category, path: &str, run_by: Option<&str>) -> Found {
+pub(crate) fn look(
+    scope: &Scope<'_>,
+    category: Category,
+    path: &str,
+    run_by: Option<&str>,
+) -> Found {
     if scope.origin != Origin::Root {
         return read::look(scope.root, path);
     }
@@ -191,7 +201,7 @@ pub fn look(scope: &Scope<'_>, category: Category, path: &str, run_by: Option<&s
 /// `None` where there is no such file to compare: the caller then treats
 /// the path as not vouched for, unless that alone would tell (see
 /// `packaged_out_of_sight`).
-pub fn packaged_item(scope: &Scope<'_>, category: Category, path: &str) -> Option<Item> {
+pub(crate) fn packaged_item(scope: &Scope<'_>, category: Category, path: &str) -> Option<Item> {
     scope.index.owner(path)?;
     let seen = read::seen(scope.root, path, View::Pinned)?;
     if !seen.kept || seen.path != path || !matches!(seen.what, read::Public::File(_)) {
@@ -219,7 +229,7 @@ pub fn packaged_item(scope: &Scope<'_>, category: Category, path: &str) -> Optio
 /// theirs and nothing of root's. A packaged file that is missing or odd is
 /// for the look through the fixed directories to report, which no user
 /// steers.
-pub fn packaged_out_of_sight(scope: &Scope<'_>, path: &str) -> bool {
+pub(crate) fn packaged_out_of_sight(scope: &Scope<'_>, path: &str) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     if scope.index.owner(path).is_none() {
         return false;

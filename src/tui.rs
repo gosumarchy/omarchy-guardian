@@ -32,7 +32,7 @@ use canvas::Canvas;
 use fields::{HEADER, Scope};
 use term::Terminal;
 
-pub fn run(expert: bool) -> Result<(), String> {
+pub(crate) fn run(expert: bool) -> Result<(), String> {
     let mut terminal =
         Terminal::open().map_err(|error| format!("cannot use the terminal: {error}"))?;
     let mode = if expert { Mode::Expert } else { Mode::Simple };

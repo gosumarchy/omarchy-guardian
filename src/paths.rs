@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 /// Which values of an environment variable are taken as a directory.
 #[derive(Clone, Copy)]
-pub enum Accept {
+pub(crate) enum Accept {
     /// Whatever it holds, a relative or an empty path too.
     Any,
     /// Only an absolute path; anything else is as if it were not set.
@@ -18,17 +18,17 @@ pub enum Accept {
 }
 
 /// `$XDG_STATE_HOME`, else `~/.local/state`.
-pub fn state_home(xdg: Accept, home: Accept) -> Option<PathBuf> {
+pub(crate) fn state_home(xdg: Accept, home: Accept) -> Option<PathBuf> {
     base("XDG_STATE_HOME", xdg, home, ".local/state")
 }
 
 /// `$XDG_CONFIG_HOME`, else `~/.config`.
-pub fn config_home(xdg: Accept, home: Accept) -> Option<PathBuf> {
+pub(crate) fn config_home(xdg: Accept, home: Accept) -> Option<PathBuf> {
     base("XDG_CONFIG_HOME", xdg, home, ".config")
 }
 
 /// `$XDG_CACHE_HOME`, else `~/.cache`.
-pub fn cache_home(xdg: Accept, home: Accept) -> Option<PathBuf> {
+pub(crate) fn cache_home(xdg: Accept, home: Accept) -> Option<PathBuf> {
     base("XDG_CACHE_HOME", xdg, home, ".cache")
 }
 
@@ -59,14 +59,14 @@ fn resolve(
 
 /// The file name of a path written with `/`: what follows the last one, or
 /// all of it where there is none. Nothing, for a path that ends in one.
-pub fn file_name(path: &str) -> &str {
+pub(crate) fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
 /// The extension of a path's file name in lowercase: what follows its last
 /// `.`, or nothing where it has none. A name that starts with its only dot
 /// (`.bashrc`) has the rest as its extension.
-pub fn extension_lowercase(path: &str) -> String {
+pub(crate) fn extension_lowercase(path: &str) -> String {
     file_name(path)
         .rsplit_once('.')
         .map(|(_, extension)| extension.to_ascii_lowercase())
@@ -77,7 +77,7 @@ pub fn extension_lowercase(path: &str) -> String {
 /// missing parents, mode 0700) only under an existing directory owned by
 /// `uid`, then requires a real directory (not a symlink) owned by `uid` with
 /// no access for group or others.
-pub fn private_dir(root: &Path, uid: u32) -> Result<(), String> {
+pub(crate) fn private_dir(root: &Path, uid: u32) -> Result<(), String> {
     let describe = |path: &Path, error: io::Error| format!("{}: {error}", path.display());
     match fs::symlink_metadata(root) {
         Ok(_) => {}

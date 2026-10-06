@@ -33,23 +33,23 @@ const DIGEST_CHARS: usize = 32;
 
 /// What a makepkg call that extracts left for the calls after it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Extraction {
+pub(super) struct Extraction {
     /// Where the sources were extracted.
-    pub srcdir: String,
+    pub(super) srcdir: String,
     /// Which directory that was (see `identity`), when it can be told.
-    pub identity: Option<String>,
+    pub(super) identity: Option<String>,
     /// The build removes and re-creates that directory (`--cleanbuild`).
-    pub cleanbuild: bool,
+    pub(super) cleanbuild: bool,
     /// The downloaded files linked into it, with their hashes.
-    pub downloads: BTreeMap<String, String>,
+    pub(super) downloads: BTreeMap<String, String>,
     /// Every file in it, with its hash.
-    pub files: BTreeMap<String, String>,
+    pub(super) files: BTreeMap<String, String>,
 }
 
 /// What tells one directory from another made later under the same name:
 /// its device, its number and when it was made. `None` where the
 /// filesystem does not record the last.
-pub fn identity(directory: &Path) -> Option<String> {
+pub(super) fn identity(directory: &Path) -> Option<String> {
     let metadata = fs::symlink_metadata(directory).ok()?;
     let made = metadata.created().ok()?.duration_since(UNIX_EPOCH).ok()?;
     Some(format!(
@@ -66,7 +66,7 @@ fn short(digest: &str) -> &str {
 
 /// What a later call found different from an `Extraction`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Drift {
+pub(super) enum Drift {
     /// The build did not extract into the directory Guardian reviewed.
     Elsewhere,
     /// Downloads that are new or not the ones Guardian fetched.
@@ -78,7 +78,7 @@ pub enum Drift {
 
 impl Extraction {
     /// Compares the sources as they are now with what Guardian extracted.
-    pub fn drift(
+    pub(super) fn drift(
         &self,
         identity: Option<&str>,
         downloads: &BTreeMap<String, String>,
@@ -163,7 +163,7 @@ impl Extraction {
     }
 
     /// The paths as they are kept: written so that each stays one line.
-    pub fn keyed(entries: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    pub(super) fn keyed(entries: &BTreeMap<String, String>) -> BTreeMap<String, String> {
         entries
             .iter()
             .map(|(path, digest)| (path.escape_default().to_string(), digest.clone()))
@@ -173,7 +173,7 @@ impl Extraction {
 
 /// The gate's memory of one package. Without a directory it remembers
 /// nothing: every read is empty and every write is dropped.
-pub struct State {
+pub(super) struct State {
     directory: Option<PathBuf>,
     name: String,
 }
@@ -181,7 +181,7 @@ pub struct State {
 impl State {
     /// Opens the memory of the package `key` under the review memory's
     /// `root`, creating its directory for the user alone.
-    pub fn open(root: Option<&Path>, key: &str) -> Self {
+    pub(super) fn open(root: Option<&Path>, key: &str) -> Self {
         let directory = root.and_then(|root| {
             let uid = user::effective_uid().ok()?;
             paths::private_dir(root, uid).ok()?;
@@ -229,12 +229,12 @@ impl State {
 
     /// Whether the user said yes to `what` (a hash of exactly what was
     /// asked) for this package before.
-    pub fn is_confirmed(&self, what: &str) -> bool {
+    pub(super) fn is_confirmed(&self, what: &str) -> bool {
         self.read("confirmed")
             .is_some_and(|text| text.lines().any(|line| line == what))
     }
 
-    pub fn remember_confirmed(&self, what: &str) {
+    pub(super) fn remember_confirmed(&self, what: &str) {
         let known = self.read("confirmed").unwrap_or_default();
         let mut lines: Vec<&str> = known.lines().filter(|line| *line != what).collect();
         lines.push(what);
@@ -243,7 +243,7 @@ impl State {
     }
 
     /// The binaries the sources held at the last build that passed.
-    pub fn binaries(&self) -> Option<BTreeMap<String, String>> {
+    pub(super) fn binaries(&self) -> Option<BTreeMap<String, String>> {
         let text = self.read("binaries")?;
         text.lines()
             .map(|line| {
@@ -253,7 +253,7 @@ impl State {
             .collect()
     }
 
-    pub fn record_binaries(&self, binaries: &BTreeMap<String, String>) {
+    pub(super) fn record_binaries(&self, binaries: &BTreeMap<String, String>) {
         let mut text = String::new();
         for (path, digest) in Extraction::keyed(binaries) {
             let digest = if digest.is_empty() { "-" } else { &digest };
@@ -262,11 +262,11 @@ impl State {
         self.write("binaries", &text);
     }
 
-    pub fn extraction(&self) -> Option<Extraction> {
+    pub(super) fn extraction(&self) -> Option<Extraction> {
         Extraction::parse(&self.read("extraction")?)
     }
 
-    pub fn record_extraction(&self, extraction: &Extraction) {
+    pub(super) fn record_extraction(&self, extraction: &Extraction) {
         self.write("extraction", &extraction.to_text());
     }
 }
@@ -276,7 +276,7 @@ const RECORDS: [&str; 3] = ["confirmed", "binaries", "extraction"];
 
 /// Removes what is remembered of the package `key` under the review
 /// memory's `root`; returns how many records there were.
-pub fn forget(root: &Path, key: &str) -> Result<usize, String> {
+pub(super) fn forget(root: &Path, key: &str) -> Result<usize, String> {
     let name = Sha256::digest(key.as_bytes()).to_string();
     let mut removed = 0;
     for what in RECORDS {
@@ -293,7 +293,7 @@ pub fn forget(root: &Path, key: &str) -> Result<usize, String> {
 /// Removes everything the gate remembers under `root`: the files of its
 /// directory, which stays. Returns how many there were. A directory that
 /// is a link somewhere is left alone.
-pub fn forget_all(root: &Path) -> Result<usize, String> {
+pub(super) fn forget_all(root: &Path) -> Result<usize, String> {
     let directory = root.join(DIRECTORY);
     let describe = |error: std::io::Error| format!("{}: {error}", directory.display());
     match fs::symlink_metadata(&directory) {
@@ -315,7 +315,7 @@ pub fn forget_all(root: &Path) -> Result<usize, String> {
 
 /// How the binaries now differ from the ones remembered, as names for the
 /// user: `(new or changed, gone)`.
-pub fn binary_changes(
+pub(super) fn binary_changes(
     known: &BTreeMap<String, String>,
     now: &BTreeMap<String, String>,
 ) -> (Vec<String>, Vec<String>) {

@@ -13,18 +13,18 @@ use crate::osv::Audit;
 use crate::rules::{RuleId, Scheme};
 use crate::scan::Snapshot;
 
-pub mod html;
+pub(crate) mod html;
 mod terminal;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Severity {
+pub(crate) enum Severity {
     High,
     Medium,
     Low,
 }
 
 impl Severity {
-    pub fn parse(text: &str) -> Option<Self> {
+    pub(crate) fn parse(text: &str) -> Option<Self> {
         match text.to_ascii_lowercase().as_str() {
             "high" => Some(Self::High),
             "medium" => Some(Self::Medium),
@@ -33,7 +33,7 @@ impl Severity {
         }
     }
 
-    pub const fn label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::High => "HIGH",
             Self::Medium => "MEDIUM",
@@ -53,7 +53,7 @@ impl Severity {
 /// A reason the review cannot vouch for what it was asked to review. Any gap
 /// blocks the decision as `Blocked(Incomplete)`.
 #[derive(Debug)]
-pub enum Gap {
+pub(crate) enum Gap {
     Io(Error),
     Symlink(String),
     SpecialFile(String),
@@ -105,7 +105,7 @@ impl Gap {
     /// file that could not be opened or hashed, a link leading elsewhere, a
     /// package Guardian refused) is content nobody put a digest on, which
     /// no permit can stand for.
-    pub const fn content_hashed(&self) -> bool {
+    pub(crate) const fn content_hashed(&self) -> bool {
         match self {
             Self::OversizedText(_)
             | Self::UnresolvedLfs(_)
@@ -189,7 +189,7 @@ impl fmt::Display for Gap {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Blocked {
+pub(crate) enum Blocked {
     Findings,
     Incomplete,
     AiUnavailable,
@@ -197,7 +197,7 @@ pub enum Blocked {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Decision {
+pub(crate) enum Decision {
     Clear,
     Warned,
     /// Nothing reviewable existed (a pacman transaction without scriptlets).
@@ -206,12 +206,12 @@ pub enum Decision {
 }
 
 impl Decision {
-    pub fn exit_code(self) -> ExitCode {
+    pub(crate) fn exit_code(self) -> ExitCode {
         ExitCode::from(self.exit_status())
     }
 
     /// The exit code as a number, for the audit trail.
-    pub const fn exit_status(self) -> u8 {
+    pub(crate) const fn exit_status(self) -> u8 {
         match self {
             Self::Clear | Self::Warned | Self::Limited => 0,
             Self::Blocked(Blocked::Findings) => 1,
@@ -222,7 +222,7 @@ impl Decision {
     }
 
     /// Whether `guard` and `sandbox` may start their command.
-    pub const fn allows_running(self) -> bool {
+    pub(crate) const fn allows_running(self) -> bool {
         match self {
             Self::Clear | Self::Warned => true,
             Self::Limited | Self::Blocked(_) => false,
@@ -231,109 +231,109 @@ impl Decision {
 }
 
 #[derive(Debug)]
-pub enum AgentOutcome {
+pub(crate) enum AgentOutcome {
     Reviewed(AgentReview),
     Unavailable(Error),
 }
 
 /// One OpenCode call and the files it covered.
 #[derive(Debug)]
-pub struct AgentRun {
-    pub files: Vec<String>,
+pub(crate) struct AgentRun {
+    pub(crate) files: Vec<String>,
     /// `model · thinking`, from `AgentSettings::label`.
-    pub label: String,
+    pub(crate) label: String,
     /// 1-based chunk index and count when the review needed several calls.
-    pub chunk: Option<(usize, usize)>,
+    pub(crate) chunk: Option<(usize, usize)>,
     /// Set when the verdict came from the cache: `from cache: ...`.
-    pub cached: Option<String>,
-    pub outcome: AgentOutcome,
+    pub(crate) cached: Option<String>,
+    pub(crate) outcome: AgentOutcome,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LocalFinding {
-    pub path: String,
-    pub line: usize,
-    pub rule: RuleId,
-    pub excerpt: String,
+pub(crate) struct LocalFinding {
+    pub(crate) path: String,
+    pub(crate) line: usize,
+    pub(crate) rule: RuleId,
+    pub(crate) excerpt: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct NetworkRequest {
-    pub path: String,
-    pub line: usize,
-    pub scheme: Scheme,
-    pub host: String,
+pub(crate) struct NetworkRequest {
+    pub(crate) path: String,
+    pub(crate) line: usize,
+    pub(crate) scheme: Scheme,
+    pub(crate) host: String,
 }
 
 #[derive(Debug, Default)]
-pub struct Report {
-    pub subject: String,
-    pub snapshot: Snapshot,
-    pub gaps: Vec<Gap>,
-    pub text_files_reviewed: usize,
+pub(crate) struct Report {
+    pub(crate) subject: String,
+    pub(crate) snapshot: Snapshot,
+    pub(crate) gaps: Vec<Gap>,
+    pub(crate) text_files_reviewed: usize,
     /// Text files decoded with replacement characters (a legacy encoding).
-    pub lossy_files: usize,
+    pub(crate) lossy_files: usize,
     /// Files hashed but not read, named to the AI.
-    pub hash_only: Vec<crate::engine::plan::HashOnly>,
+    pub(crate) hash_only: Vec<crate::engine::plan::HashOnly>,
     /// What an approved version is bound to besides its text.
-    pub unread: crate::engine::baseline::Unread,
-    pub findings: Vec<LocalFinding>,
-    pub network: Vec<NetworkRequest>,
-    pub agent_input: Vec<SourceFile>,
-    pub agent_input_overflowed: bool,
+    pub(crate) unread: crate::engine::baseline::Unread,
+    pub(crate) findings: Vec<LocalFinding>,
+    pub(crate) network: Vec<NetworkRequest>,
+    pub(crate) agent_input: Vec<SourceFile>,
+    pub(crate) agent_input_overflowed: bool,
     /// Classes whose policy has `ai = off`: their files are never queued for
     /// the AI provider, so AI-input gaps do not apply to them either. Files
     /// are matched through `class_of`, so `file_classes` must be set before
     /// a file is analyzed.
-    pub ai_off_classes: Vec<SourceClass>,
-    pub dependencies: Inventory,
-    pub audit: Option<Audit>,
+    pub(crate) ai_off_classes: Vec<SourceClass>,
+    pub(crate) dependencies: Inventory,
+    pub(crate) audit: Option<Audit>,
     /// Class of every file not listed in `file_classes`.
-    pub class: SourceClass,
+    pub(crate) class: SourceClass,
     /// Per-file classes when one report spans several (pacman transactions).
-    pub file_classes: HashMap<String, SourceClass>,
-    pub agent_runs: Vec<AgentRun>,
+    pub(crate) file_classes: HashMap<String, SourceClass>,
+    pub(crate) agent_runs: Vec<AgentRun>,
     /// Profile name shown next to AI verdicts.
-    pub profile: String,
+    pub(crate) profile: String,
     /// Review-memory lines: the upgrade summary and store problems. Never gaps.
-    pub notes: Vec<String>,
+    pub(crate) notes: Vec<String>,
     /// Facts Guardian established for the AI review (see `Request::context`).
-    pub context: Vec<String>,
+    pub(crate) context: Vec<String>,
     /// What each reviewed file runs or reads in as code, by line (see
     /// `review::check_runs`).
-    pub runs: Vec<RunRef>,
+    pub(crate) runs: Vec<RunRef>,
     /// The files each reviewed file downloads to, lowercased.
-    pub fetches: Vec<(String, String)>,
+    pub(crate) fetches: Vec<(String, String)>,
     /// More were found than are recorded (see `review::MAX_RUNS`).
-    pub runs_overflowed: bool,
+    pub(crate) runs_overflowed: bool,
     /// The package archives a pacman transaction was reviewed from, each
     /// with the SHA-256 of its bytes: what the audit trail records and a
     /// permit is bound to.
-    pub archives: Vec<ReviewedArchive>,
+    pub(crate) archives: Vec<ReviewedArchive>,
     /// The permit of the user's that overrules this report's decision
     /// (see `permit`): it is printed as PERMITTED.
-    pub permit: Option<String>,
+    pub(crate) permit: Option<String>,
 }
 
 /// One archive of a reviewed pacman transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReviewedArchive {
+pub(crate) struct ReviewedArchive {
     /// The archive's file name without `.pkg.tar.*`: name, version, build
     /// and architecture.
-    pub name: String,
-    pub class: SourceClass,
+    pub(crate) name: String,
+    pub(crate) class: SourceClass,
     /// Hex SHA-256 of the archive's bytes.
-    pub sha256: String,
+    pub(crate) sha256: String,
 }
 
 /// A file one reviewed file runs or reads in as code.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RunRef {
-    pub rel: String,
-    pub line: usize,
-    pub excerpt: String,
+pub(crate) struct RunRef {
+    pub(crate) rel: String,
+    pub(crate) line: usize,
+    pub(crate) excerpt: String,
     /// As written on the line (`./data/x.png`).
-    pub target: String,
+    pub(crate) target: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -374,14 +374,14 @@ impl Tally {
 }
 
 impl Report {
-    pub fn new(subject: impl Into<String>) -> Self {
+    pub(crate) fn new(subject: impl Into<String>) -> Self {
         Self {
             subject: subject.into(),
             ..Self::default()
         }
     }
 
-    pub fn class_of(&self, path: &str) -> SourceClass {
+    pub(crate) fn class_of(&self, path: &str) -> SourceClass {
         self.file_classes.get(path).copied().unwrap_or(self.class)
     }
 
@@ -398,7 +398,7 @@ impl Report {
 
     /// Spec §9. Precedence: incomplete, AI unavailable, findings, warned,
     /// then limited or clear.
-    pub fn decide(&self, policy_for: &dyn Fn(SourceClass) -> Policy) -> Decision {
+    pub(crate) fn decide(&self, policy_for: &dyn Fn(SourceClass) -> Policy) -> Decision {
         if !self.gaps.is_empty() {
             return Decision::Blocked(Blocked::Incomplete);
         }
@@ -475,7 +475,7 @@ impl Report {
 
     /// The decision as one word or two, as the saved report and the audit
     /// trail name it.
-    pub fn decision_name(&self, decision: Decision) -> &'static str {
+    pub(crate) fn decision_name(&self, decision: Decision) -> &'static str {
         match decision {
             Decision::Clear => "CLEAR",
             Decision::Warned => "WARNED",
@@ -490,14 +490,14 @@ impl Report {
 
     /// Whether a permit could stand for this report's content: every gap
     /// is about something the digest of what was reviewed still covers.
-    pub fn content_hashed(&self) -> bool {
+    pub(crate) fn content_hashed(&self) -> bool {
         self.gaps.iter().all(Gap::content_hashed)
     }
 
     /// What was found, for the audit trail: the alert counts, the local
     /// rules that matched and how many reasons left the review incomplete.
     /// Numbers and rule ids only: nothing of the reviewed text.
-    pub fn audit_findings(&self) -> String {
+    pub(crate) fn audit_findings(&self) -> String {
         let counts = self.counts();
         let mut text = format!(
             "high={} medium={} low={} incomplete={}",
@@ -521,7 +521,7 @@ impl Report {
 
     /// The AI review in numbers, for the audit trail: the model and
     /// thinking level, how many calls there were and how each ended.
-    pub fn audit_ai(&self) -> String {
+    pub(crate) fn audit_ai(&self) -> String {
         if self.agent_runs.is_empty() {
             return "none".into();
         }
@@ -551,7 +551,7 @@ impl Report {
     /// What a permit for this report would overrule, a line each and at
     /// most `limit` of them: the alerts by where they are, and why the
     /// review is incomplete. Shown to the user before they permit.
-    pub fn overruled_summary(&self, limit: usize) -> Vec<String> {
+    pub(crate) fn overruled_summary(&self, limit: usize) -> Vec<String> {
         let mut lines: Vec<String> = self
             .findings
             .iter()

@@ -56,11 +56,11 @@ impl Target {
 
 /// Asks the person at the terminal. Anything but an explicit yes, and any
 /// failure to reach a terminal, is a no.
-pub trait Confirm {
+pub(crate) trait Confirm {
     fn confirm(&mut self, question: &str) -> bool;
 }
 
-pub struct TtyConfirm;
+pub(crate) struct TtyConfirm;
 
 impl Confirm for TtyConfirm {
     fn confirm(&mut self, question: &str) -> bool {
@@ -101,7 +101,7 @@ impl Verdict {
 
 /// What a gate's review is of, as permits and the audit trail name it
 /// (see `permit::standing`); nothing when it has no digest.
-pub(crate) type ContentOf<'a> = &'a dyn Fn(&Report) -> Vec<Content>;
+type ContentOf<'a> = &'a dyn Fn(&Report) -> Vec<Content>;
 
 /// The reviewed tree by its manifest digest, for a gate that reviews one.
 pub(super) fn tree_content(gate: Gate, target: &Target, report: &Report) -> Vec<Content> {
@@ -300,7 +300,7 @@ pub(super) fn not_started(decision: Decision) -> ExitCode {
 
 /// Replaces this process with the guarded command, so its exit status and
 /// signal behaviour are exactly the command's own.
-pub(crate) fn exec_command(command: &[OsString]) -> ExitCode {
+pub(super) fn exec_command(command: &[OsString]) -> ExitCode {
     let Some((program, arguments)) = command.split_first() else {
         return ExitCode::from(USAGE_ERROR);
     };

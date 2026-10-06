@@ -36,7 +36,7 @@ fn capture(args: fmt::Arguments) {
 }
 
 /// The output written so far.
-pub fn captured() -> String {
+pub(crate) fn captured() -> String {
     CAPTURED
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -44,7 +44,7 @@ pub fn captured() -> String {
 }
 
 /// Like `eprintln!`, and kept with the captured output.
-pub fn stderr_line(args: fmt::Arguments) {
+pub(crate) fn stderr_line(args: fmt::Arguments) {
     let line = format!("{args}\n");
     let safe = crate::text::terminal_safe(&line);
     // A failed write to stderr has nowhere to be reported.
@@ -53,7 +53,7 @@ pub fn stderr_line(args: fmt::Arguments) {
 }
 
 /// Like `eprint!`, with terminal control sequences shown as codes.
-pub fn stderr(args: fmt::Arguments) {
+pub(crate) fn stderr(args: fmt::Arguments) {
     let text = args.to_string();
     // A failed write to stderr has nowhere to be reported.
     let _ = io::stderr()
@@ -92,11 +92,11 @@ macro_rules! outln {
 /// that stands in front of a command whose standard output a program reads
 /// (yay takes the package names from `makepkg --packagelist`): one line of
 /// Guardian's in it and the reader takes it for the command's.
-pub fn leave_stdout_to_the_command() {
+pub(crate) fn leave_stdout_to_the_command() {
     DIVERTED.store(true, Ordering::Relaxed);
 }
 
-pub fn stdout(args: fmt::Arguments) {
+pub(crate) fn stdout(args: fmt::Arguments) {
     let text = args.to_string();
     let safe = crate::text::terminal_safe(&text);
     capture(format_args!("{safe}"));

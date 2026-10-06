@@ -18,13 +18,13 @@ use std::thread;
 use crate::error::{Error, IoContext};
 use crate::user;
 
-pub const TIMEOUT: &str = "/usr/bin/timeout";
-pub const KILL: &str = "/usr/bin/kill";
-pub const BSDTAR: &str = "/usr/bin/bsdtar";
-pub const CURL: &str = "/usr/bin/curl";
-pub const PACMAN: &str = "/usr/bin/pacman";
-pub const PACMAN_CONF: &str = "/usr/bin/pacman-conf";
-pub const BWRAP: &str = "/usr/bin/bwrap";
+pub(crate) const TIMEOUT: &str = "/usr/bin/timeout";
+const KILL: &str = "/usr/bin/kill";
+pub(crate) const BSDTAR: &str = "/usr/bin/bsdtar";
+pub(crate) const CURL: &str = "/usr/bin/curl";
+pub(crate) const PACMAN: &str = "/usr/bin/pacman";
+pub(crate) const PACMAN_CONF: &str = "/usr/bin/pacman-conf";
+pub(crate) const BWRAP: &str = "/usr/bin/bwrap";
 
 /// Locations accepted for OpenCode when the review gates a root action.
 const SYSTEM_OPENCODE: &[&str] = &["/usr/bin/opencode", "/usr/local/bin/opencode"];
@@ -35,16 +35,16 @@ const SYSTEM_CLAUDE: &[&str] = &["/usr/bin/claude", "/usr/local/bin/claude"];
 /// The CLI that runs a review: OpenCode, or the Claude Code CLI for models
 /// written `claude-code/<model>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Reviewer {
+pub(crate) enum Reviewer {
     OpenCode,
     ClaudeCode,
 }
 
 impl Reviewer {
     /// The model prefix that selects the Claude Code CLI.
-    pub const CLAUDE_CODE_PREFIX: &'static str = "claude-code/";
+    pub(crate) const CLAUDE_CODE_PREFIX: &'static str = "claude-code/";
 
-    pub fn for_model(model: Option<&str>) -> Self {
+    pub(crate) fn for_model(model: Option<&str>) -> Self {
         if model.is_some_and(|model| model.starts_with(Self::CLAUDE_CODE_PREFIX)) {
             Self::ClaudeCode
         } else {
@@ -78,7 +78,7 @@ const MAX_STDERR: usize = 64 * 1024;
 
 /// Where the OpenCode reviewer may be loaded from.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum OpenCode {
+pub(crate) enum OpenCode {
     /// The first `opencode` in an absolute `PATH` entry of the invoking user.
     UserPath,
     /// Only a root-owned binary in a system directory, for gates in front of
@@ -90,12 +90,12 @@ pub enum OpenCode {
 }
 
 impl OpenCode {
-    pub fn resolve(&self) -> Result<PathBuf, Error> {
+    pub(crate) fn resolve(&self) -> Result<PathBuf, Error> {
         self.resolve_reviewer(Reviewer::OpenCode)
     }
 
     /// The reviewer CLI's binary under this policy.
-    pub fn resolve_reviewer(&self, reviewer: Reviewer) -> Result<PathBuf, Error> {
+    pub(crate) fn resolve_reviewer(&self, reviewer: Reviewer) -> Result<PathBuf, Error> {
         match self {
             Self::UserPath => {
                 let path = env::var_os("PATH").unwrap_or_default();
@@ -145,7 +145,7 @@ impl OpenCode {
 /// Finds an executable in the absolute entries of a `PATH` value. Relative
 /// and empty entries are skipped because they resolve against the current
 /// directory, which may be the untrusted tree under review.
-pub fn find_in_path(name: &str, path: &OsStr) -> Option<PathBuf> {
+fn find_in_path(name: &str, path: &OsStr) -> Option<PathBuf> {
     env::split_paths(path)
         .filter(|directory| directory.is_absolute())
         .map(|directory| directory.join(name))
@@ -294,21 +294,21 @@ fn verify_root_owned(path: &Path) -> Result<(), Error> {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct Limits {
-    pub timeout_secs: u32,
-    pub max_output: usize,
+pub(crate) struct Limits {
+    pub(crate) timeout_secs: u32,
+    pub(crate) max_output: usize,
 }
 
-pub struct Captured {
+pub(crate) struct Captured {
     tool: String,
-    pub status: ExitStatus,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
 }
 
 impl Captured {
     /// Stdout of a successful run, or an error that carries stderr.
-    pub fn into_success(self) -> Result<Vec<u8>, Error> {
+    pub(crate) fn into_success(self) -> Result<Vec<u8>, Error> {
         if self.status.success() {
             return Ok(self.stdout);
         }
@@ -318,7 +318,7 @@ impl Captured {
         })
     }
 
-    pub fn failure_detail(&self) -> String {
+    pub(crate) fn failure_detail(&self) -> String {
         // GNU timeout exits 124 when it had to stop the command.
         if self.status.code() == Some(124) {
             return "timed out".to_string();
@@ -337,7 +337,7 @@ impl Captured {
 /// most `limits.max_output` bytes of stdout. Stdin, stdout and stderr are
 /// serviced concurrently, so a child that fills one pipe while Guardian waits
 /// on another cannot deadlock the review.
-pub fn run(
+pub(crate) fn run(
     program: &Path,
     args: &[OsString],
     input: Option<&[u8]>,
@@ -349,7 +349,7 @@ pub fn run(
 
 /// Like `run`, in `directory`, for a child that is fed `input` and must
 /// not inherit the variables named in `unset`.
-pub fn run_in_without(
+pub(crate) fn run_in_without(
     program: &Path,
     args: &[OsString],
     input: &[u8],
@@ -370,7 +370,7 @@ pub fn run_in_without(
 }
 
 /// Like `run`, in `directory` and without input.
-pub fn run_in(
+pub(crate) fn run_in(
     program: &Path,
     args: &[OsString],
     directory: &Path,
@@ -382,7 +382,7 @@ pub fn run_in(
 
 /// Like `run`, with `file` as the child's standard input: an archive opened
 /// once is read by every pass, whatever happens to its path meanwhile.
-pub fn run_with_stdin_file(
+pub(crate) fn run_with_stdin_file(
     program: &Path,
     args: &[OsString],
     file: fs::File,
@@ -561,7 +561,7 @@ fn terminate(pid: u32) {
 
 /// Maps a child's exit status to this process's exit code, using the shell
 /// convention of 128 + signal number for a child killed by a signal.
-pub fn exit_code_of(status: ExitStatus) -> ExitCode {
+pub(crate) fn exit_code_of(status: ExitStatus) -> ExitCode {
     let code = status
         .code()
         .or_else(|| status.signal().map(|signal| 128 + signal))

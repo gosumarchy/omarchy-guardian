@@ -72,12 +72,12 @@ const MAX_NOTES: usize = 3;
 
 /// What the live checks found.
 #[derive(Debug, Default)]
-pub struct Live {
-    pub items: Vec<Item>,
-    pub notes: Vec<String>,
+pub(super) struct Live {
+    pub(super) items: Vec<Item>,
+    pub(super) notes: Vec<String>,
     /// What was not looked at, each as a sentence (see
     /// `Collection::truncated`).
-    pub unchecked: Vec<String>,
+    pub(super) unchecked: Vec<String>,
 }
 
 /// What a process's `status` says of it.
@@ -187,7 +187,7 @@ impl Process {
 }
 
 /// Runs every live check against `scope` (its root holds `proc`).
-pub fn check(scope: &Scope<'_>) -> Live {
+pub(super) fn check(scope: &Scope<'_>) -> Live {
     let mut found = Found::default();
     let running = processes(&scope.root.join("proc"));
     if let Some(reason) = &running.unlistable {

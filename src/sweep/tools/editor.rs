@@ -359,7 +359,7 @@ fn editor_setting(key: &str, value: &str) -> Option<String> {
 /// The file is kept from the AI, so nothing else looks at it: one that
 /// cannot be read to the end as an editor's settings is said to be, at the
 /// line where it stops making sense, instead of passing with no key seen.
-pub fn editor(text: &str) -> Vec<(usize, String)> {
+pub(crate) fn editor(text: &str) -> Vec<(usize, String)> {
     let mut found = Vec::new();
     match settings(text) {
         Ok(settings) => told_of(&settings, None, &mut found),

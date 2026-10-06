@@ -121,7 +121,7 @@ const NOT_FOR_PACKAGES: &[&str] = &["run/", "tmp/", "dev/", "proc/", "sys/", "ro
 /// Guardian's own package. What other packages a `.PKGINFO` may not claim
 /// to replace, conflict with or provide: pacman would then remove Guardian
 /// for it.
-pub const GUARDIAN_PACKAGE: &str = "omarchy-guardian";
+pub(crate) const GUARDIAN_PACKAGE: &str = "omarchy-guardian";
 /// What a package of that name must ship to be Guardian: an "upgrade" to
 /// one without its program or hook script takes the gate away.
 const GUARDIAN_FILES: &[&str] = &[
@@ -234,16 +234,16 @@ pub(super) fn protected_violation(
 
 /// One payload file for the review, with its content as classified.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PayloadFile {
-    pub path: String,
-    pub content: Content,
+pub(crate) struct PayloadFile {
+    pub(crate) path: String,
+    pub(crate) content: Content,
     /// For a file of the package that reviewed files name (a script a hook
     /// runs, a file a login script sources): those files, `.INSTALL` for
     /// the scriptlet. Empty for an auto-run file.
-    pub run_by: Vec<String>,
+    pub(crate) run_by: Vec<String>,
     /// For a link to a file this package does not ship: that file's path,
     /// for the caller to find where the transaction or the system has it.
-    pub leads_outside: Option<String>,
+    pub(crate) leads_outside: Option<String>,
     /// The file as shipped: its bytes, or its link target for a symbolic
     /// link, to compare with what is installed.
     shipped: Shipped,
@@ -268,7 +268,7 @@ impl PayloadFile {
     /// leads to identical bytes. Such a file adds nothing new, so an
     /// upgrade does not review it again. A file that cannot be read (for
     /// example root-only) counts as changed.
-    pub fn is_installed_unchanged(&self, root: &Path) -> bool {
+    pub(crate) fn is_installed_unchanged(&self, root: &Path) -> bool {
         let installed = root.join(&self.path);
         match &self.shipped {
             Shipped::Bytes(bytes) => {
@@ -308,25 +308,25 @@ fn misplaced(archive: &Archive, official: bool) -> Vec<(String, &'static str)> {
 }
 
 /// What the pacman gate reviews in one archive.
-pub struct Review {
+pub(crate) struct Review {
     /// The install scriptlet, classified (see `content::classify`).
-    pub install: Option<Content>,
-    pub files: Vec<PayloadFile>,
+    pub(crate) install: Option<Content>,
+    pub(crate) files: Vec<PayloadFile>,
     /// Files installed setuid or setgid root, with which of the two, but
     /// for the sandbox helper of a Chromium-based program.
-    pub root_set_id: Vec<(String, &'static str)>,
+    pub(crate) root_set_id: Vec<(String, &'static str)>,
     /// What of the package was not read, each as a sentence: a scriptlet
     /// or auto-run file over the limits, and what the scriptlet or an
     /// auto-run file names and could not be followed to. The review is
     /// incomplete; the bytes are still the archive's.
-    pub unfollowed: Vec<String>,
+    pub(crate) unfollowed: Vec<String>,
     /// For a package that is not from an official repository: its files
     /// where only the sweep looks (a PAM module, the boot loader's
     /// configuration, `/etc/hosts`), with what a file there does.
-    pub misplaced: Vec<(String, &'static str)>,
+    pub(crate) misplaced: Vec<(String, &'static str)>,
     /// The regular files read as auto-run files: those themselves, and
     /// what the package's auto-run links lead to inside it.
-    pub read_as_auto_run: HashSet<String>,
+    pub(crate) read_as_auto_run: HashSet<String>,
 }
 
 /// An auto-run entry and what its content is read from.
@@ -337,7 +337,7 @@ type Source<'a> = (&'a Entry, Resolution);
 /// package, and the install scriptlet and auto-run files are extracted
 /// and classified. `trusted` names extra reviewer packages the system
 /// configuration allows.
-pub fn review(
+pub(crate) fn review(
     archive: &Archive,
     package: &str,
     class: SourceClass,
@@ -837,7 +837,7 @@ fn payload_files(sources: &[Source<'_>], read: &HashMap<String, Vec<u8>>) -> Vec
 }
 
 /// `content` with `header` before its text.
-pub fn annotated(content: Content, header: &str) -> Content {
+pub(crate) fn annotated(content: Content, header: &str) -> Content {
     match content {
         Content::Text(text) => Content::Text(format!("{header}{text}")),
         Content::Lossy { text, replaced } => Content::Lossy {

@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 const STTY: &str = "/usr/bin/stty";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Key {
+pub(super) enum Key {
     Up,
     Down,
     Left,
@@ -33,7 +33,7 @@ pub enum Key {
 
 /// Decodes the bytes of one read. Unknown escape sequences are dropped; a
 /// lone ESC is the Escape key.
-pub fn parse_keys(bytes: &[u8]) -> Vec<Key> {
+fn parse_keys(bytes: &[u8]) -> Vec<Key> {
     let text = String::from_utf8_lossy(bytes);
     let mut chars = text.chars().peekable();
     let mut keys = Vec::new();
@@ -81,14 +81,14 @@ pub fn parse_keys(bytes: &[u8]) -> Vec<Key> {
 
 /// The terminal in raw mode on the alternate screen. Dropping it restores
 /// the saved mode and the main screen.
-pub struct Terminal {
+pub(super) struct Terminal {
     tty: File,
     saved: String,
     active: bool,
 }
 
 impl Terminal {
-    pub fn open() -> io::Result<Self> {
+    pub(super) fn open() -> io::Result<Self> {
         let tty = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
         let saved = stty(&tty, &["-g"])?;
         let mut terminal = Self {
@@ -101,7 +101,7 @@ impl Terminal {
     }
 
     /// Raw input, alternate screen, hidden cursor.
-    pub fn resume(&mut self) -> io::Result<()> {
+    pub(super) fn resume(&mut self) -> io::Result<()> {
         stty(
             &self.tty,
             &[
@@ -116,7 +116,7 @@ impl Terminal {
 
     /// Back to the main screen in the saved mode, for running a command
     /// that uses the terminal itself (sudo, an editor, the setup wizard).
-    pub fn suspend(&mut self) -> io::Result<()> {
+    pub(super) fn suspend(&mut self) -> io::Result<()> {
         if !self.active {
             return Ok(());
         }
@@ -127,7 +127,7 @@ impl Terminal {
     }
 
     /// `(columns, rows)`, or 80×24 when the size cannot be read.
-    pub fn size(&self) -> (usize, usize) {
+    pub(super) fn size(&self) -> (usize, usize) {
         stty(&self.tty, &["size"])
             .ok()
             .and_then(|text| {
@@ -141,20 +141,20 @@ impl Terminal {
     }
 
     /// The keys pressed since the last call; empty after a 200 ms timeout.
-    pub fn keys(&mut self) -> io::Result<Vec<Key>> {
+    pub(super) fn keys(&mut self) -> io::Result<Vec<Key>> {
         let mut buffer = [0_u8; 64];
         let count = self.tty.read(&mut buffer)?;
         Ok(parse_keys(&buffer[..count]))
     }
 
-    pub fn draw(&mut self, frame: &str) -> io::Result<()> {
+    pub(super) fn draw(&mut self, frame: &str) -> io::Result<()> {
         self.tty.write_all(frame.as_bytes())?;
         self.tty.flush()
     }
 
     /// Waits for Enter after an external command, so its output can be read
     /// before the screen switches back.
-    pub fn pause(&mut self, message: &str) {
+    pub(super) fn pause(&mut self, message: &str) {
         let _ = writeln!(self.tty, "\n{message}");
         let _ = self.tty.flush();
         let mut line = String::new();

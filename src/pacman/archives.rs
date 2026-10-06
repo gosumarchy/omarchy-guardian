@@ -89,10 +89,10 @@ pub(super) fn missing_targets(targets: &[String], archives: &Archives) -> Vec<St
 /// One repository's offer of a package: the version pacman would install and
 /// the repository offering it, which decides the package's source class.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SyncCandidate {
-    pub version: String,
-    pub version_arch: String,
-    pub repo: String,
+pub(super) struct SyncCandidate {
+    pub(super) version: String,
+    pub(super) version_arch: String,
+    pub(super) repo: String,
 }
 
 /// For `-S`: the archive of each target's sync-database version in pacman's
@@ -244,7 +244,7 @@ pub(super) fn sync_filenames(
 
 /// The packages `pacman -Sp` printed in `sync_filenames`' format. A file
 /// name that is not a plain one is left out.
-pub fn parse_filenames(output: &str) -> Filenames {
+pub(super) fn parse_filenames(output: &str) -> Filenames {
     output
         .lines()
         .filter_map(|line| {
@@ -275,7 +275,7 @@ pub(super) fn sync_versions(
     Ok(parse_sync_info(&String::from_utf8_lossy(&captured.stdout)))
 }
 
-pub fn parse_sync_info(output: &str) -> HashMap<String, Vec<SyncCandidate>> {
+pub(super) fn parse_sync_info(output: &str) -> HashMap<String, Vec<SyncCandidate>> {
     let mut versions: HashMap<String, Vec<SyncCandidate>> = HashMap::new();
     let mut fields: HashMap<&str, &str> = HashMap::new();
 

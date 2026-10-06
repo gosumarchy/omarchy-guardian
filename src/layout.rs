@@ -18,12 +18,12 @@ const MAX_WIDTH: usize = 120;
 const DEFAULT_WIDTH: usize = 100;
 
 #[derive(Clone, Copy)]
-pub struct Painter {
+pub(crate) struct Painter {
     enabled: bool,
 }
 
 impl Painter {
-    pub fn for_stdout() -> Self {
+    pub(crate) fn for_stdout() -> Self {
         Self {
             enabled: io::stdout().is_terminal()
                 && env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
@@ -32,16 +32,16 @@ impl Painter {
     }
 
     #[cfg(test)]
-    pub const fn plain() -> Self {
+    pub(crate) const fn plain() -> Self {
         Self { enabled: false }
     }
 
     #[cfg(test)]
-    pub const fn colored() -> Self {
+    pub(crate) const fn colored() -> Self {
         Self { enabled: true }
     }
 
-    pub fn paint(self, text: &str, color: &str) -> String {
+    pub(crate) fn paint(self, text: &str, color: &str) -> String {
         if self.enabled && !color.is_empty() {
             format!("\x1b[{color}m{text}\x1b[0m")
         } else {
@@ -52,7 +52,7 @@ impl Painter {
 
 /// The width to lay output out in: the terminal's, kept between
 /// `MIN_WIDTH` and `MAX_WIDTH`.
-pub fn width() -> usize {
+pub(crate) fn width() -> usize {
     let columns = env::var("COLUMNS")
         .ok()
         .and_then(|columns| columns.trim().parse::<usize>().ok())
@@ -90,14 +90,14 @@ const fn char_width(character: char) -> usize {
     }
 }
 
-pub fn text_width(text: &str) -> usize {
+fn text_width(text: &str) -> usize {
     text.chars().map(char_width).sum()
 }
 
 /// Splits `text` into lines at most `width` wide: at spaces where it can,
 /// and inside a word too long for a line (a path) where it must, after a
 /// `/` when there is one.
-pub fn wrap(text: &str, width: usize) -> Vec<String> {
+fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     if text_width(text) <= width {
         return vec![text.to_string()];
@@ -207,15 +207,15 @@ fn pad(text: &str, width: usize) -> String {
 
 /// One line of a cell, with its colour.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Span {
-    pub text: String,
-    pub color: &'static str,
+pub(crate) struct Span {
+    text: String,
+    color: &'static str,
     /// Never wrapped (a digest someone copies): it overflows instead.
-    pub whole: bool,
+    whole: bool,
 }
 
 impl Span {
-    pub fn new(text: impl Into<String>, color: &'static str) -> Self {
+    pub(crate) fn new(text: impl Into<String>, color: &'static str) -> Self {
         Self {
             text: text.into(),
             color,
@@ -223,14 +223,14 @@ impl Span {
         }
     }
 
-    pub fn whole(text: impl Into<String>, color: &'static str) -> Self {
+    pub(crate) fn whole(text: impl Into<String>, color: &'static str) -> Self {
         Self {
             whole: true,
             ..Self::new(text, color)
         }
     }
 
-    pub fn plain(text: impl Into<String>) -> Self {
+    pub(crate) fn plain(text: impl Into<String>) -> Self {
         Self::new(text, "")
     }
 }
@@ -253,20 +253,20 @@ fn wrap_spans(spans: &[Span], width: usize) -> Vec<Span> {
 
 /// A table drawn with box lines. Each cell holds lines; a line wider than
 /// its column wraps.
-pub struct Table {
+pub(crate) struct Table {
     headers: Vec<&'static str>,
     rows: Vec<Vec<Vec<Span>>>,
 }
 
 impl Table {
-    pub const fn new(headers: Vec<&'static str>) -> Self {
+    pub(crate) const fn new(headers: Vec<&'static str>) -> Self {
         Self {
             headers,
             rows: Vec::new(),
         }
     }
 
-    pub fn row(&mut self, cells: Vec<Vec<Span>>) {
+    pub(crate) fn row(&mut self, cells: Vec<Vec<Span>>) {
         self.rows.push(cells);
     }
 
@@ -290,14 +290,14 @@ impl Table {
     }
 
     /// The table, `indent` spaces in, `width` wide.
-    pub fn render(&self, width: usize, indent: usize, painter: Painter) -> String {
+    pub(crate) fn render(&self, width: usize, indent: usize, painter: Painter) -> String {
         Self::render_all(std::slice::from_ref(self), width, indent, painter).concat()
     }
 
     /// Tables with the same columns, drawn alike: each column as wide as
     /// the widest line any of them needs (narrowed from the widest column
     /// down until they fit), the last column taking what is left.
-    pub fn render_all(
+    pub(crate) fn render_all(
         tables: &[Self],
         width: usize,
         indent: usize,
@@ -424,7 +424,13 @@ fn shorten(text: &str, width: usize) -> String {
 
 /// A rounded box around `lines`, with `title` in its top edge; the edges
 /// take `color`.
-pub fn boxed(title: &str, lines: &[Span], width: usize, color: &str, painter: Painter) -> String {
+pub(crate) fn boxed(
+    title: &str,
+    lines: &[Span],
+    width: usize,
+    color: &str,
+    painter: Painter,
+) -> String {
     let inner = width.saturating_sub(4);
     let title = shorten(title, width.saturating_sub(6));
     let title = title.as_str();
@@ -449,7 +455,7 @@ pub fn boxed(title: &str, lines: &[Span], width: usize, color: &str, painter: Pa
 
 /// Labelled fields, the labels in one column and each value wrapped
 /// beside its label.
-pub fn fields(rows: &[(&str, Vec<Span>)], width: usize, painter: Painter) -> String {
+pub(crate) fn fields(rows: &[(&str, Vec<Span>)], width: usize, painter: Painter) -> String {
     let label_width = rows
         .iter()
         .map(|(label, _)| text_width(label))
@@ -472,7 +478,7 @@ pub fn fields(rows: &[(&str, Vec<Span>)], width: usize, painter: Painter) -> Str
 }
 
 /// A bar `width` wide, filled for `part` of `whole`.
-pub fn bar(part: usize, whole: usize, width: usize) -> (String, String) {
+pub(crate) fn bar(part: usize, whole: usize, width: usize) -> (String, String) {
     let filled = (part * width + whole / 2)
         .checked_div(whole)
         .unwrap_or(width);

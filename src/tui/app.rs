@@ -17,7 +17,7 @@ use crate::tui::term::Key;
 mod simple;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tab {
+enum Tab {
     Profiles,
     Sources,
     Ai,
@@ -50,7 +50,7 @@ impl Tab {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Task {
+pub(super) enum Task {
     ShowConfig,
     CheckConfig,
     ReviewMemory,
@@ -121,7 +121,7 @@ impl Row {
 
 /// What the event loop is asked to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Effect {
+pub(super) enum Effect {
     SaveUser(String),
     SaveSystem(String),
     Integration(Plan),
@@ -177,7 +177,7 @@ struct Choice {
 
 /// Simple mode shows the essentials; expert mode every setting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
+pub(super) enum Mode {
     Simple,
     Expert,
 }
@@ -190,19 +190,23 @@ enum Tone {
 }
 
 /// The files as last read, and the drafts being edited.
-pub struct Loaded {
-    pub user: PartialConfig,
-    pub system: PartialConfig,
-    pub user_status: FileStatus,
-    pub system_status: FileStatus,
-    pub system_path: PathBuf,
+pub(super) struct Loaded {
+    user: PartialConfig,
+    system: PartialConfig,
+    user_status: FileStatus,
+    system_status: FileStatus,
+    system_path: PathBuf,
     /// The system file's text, for the diff shown before saving it.
-    pub system_text: String,
-    pub paths: Option<Paths>,
+    system_text: String,
+    paths: Option<Paths>,
 }
 
 impl Loaded {
-    pub fn from_settings(settings: &Settings, system_text: String, paths: Option<Paths>) -> Self {
+    pub(super) fn from_settings(
+        settings: &Settings,
+        system_text: String,
+        paths: Option<Paths>,
+    ) -> Self {
         Self {
             user: settings.user_config().clone(),
             system: settings.system_config().clone(),
@@ -215,7 +219,7 @@ impl Loaded {
     }
 }
 
-pub struct App {
+pub(super) struct App {
     tab: Tab,
     cursors: [usize; 5],
     scrolls: [usize; 5],
@@ -232,11 +236,11 @@ pub struct App {
     simple_cursor: usize,
     /// Event-loop ticks, for the mascot's blink.
     ticks: u64,
-    pub quit: bool,
+    pub(super) quit: bool,
 }
 
 impl App {
-    pub fn new(files: Loaded, mode: Mode) -> Self {
+    pub(super) fn new(files: Loaded, mode: Mode) -> Self {
         let mut app = Self {
             tab: Tab::Profiles,
             cursors: [0; 5],
@@ -265,7 +269,7 @@ impl App {
 
     /// Replaces the files after a save, an edit or setup, keeping the
     /// position and any drafts of files that were not reloaded.
-    pub fn reload(&mut self, files: Loaded) {
+    pub(super) fn reload(&mut self, files: Loaded) {
         self.user = files.user.clone();
         self.system = files.system.clone();
         self.files = files;
@@ -329,12 +333,12 @@ impl App {
             .count()
     }
 
-    pub fn say(&mut self, text: &str) {
+    fn say(&mut self, text: &str) {
         self.message = Some((text.to_string(), Tone::Info));
     }
 
     /// Reports how an effect went.
-    pub fn finish(&mut self, effect: &Effect, outcome: Result<String, String>) {
+    pub(super) fn finish(&mut self, effect: &Effect, outcome: Result<String, String>) {
         match outcome {
             Err(error) => {
                 self.message = Some((error, Tone::Bad));
@@ -367,7 +371,7 @@ impl App {
     }
 
     /// Called when no key arrived for a while; returns whether to redraw.
-    pub fn tick(&mut self) -> bool {
+    pub(super) fn tick(&mut self) -> bool {
         self.ticks += 1;
         self.mode == Mode::Simple && matches!(self.ticks % 20, 0 | 19)
     }
@@ -377,7 +381,7 @@ impl App {
         self.ticks % 20 == 19
     }
 
-    pub fn handle(&mut self, key: Key) -> Option<Effect> {
+    pub(super) fn handle(&mut self, key: Key) -> Option<Effect> {
         if self.dialog.is_some() {
             return self.handle_dialog(key);
         }
@@ -576,7 +580,7 @@ impl App {
     }
 
     /// Starts the two-sample test of the saved settings.
-    pub(super) fn test_reviewer(&mut self) -> Effect {
+    fn test_reviewer(&mut self) -> Effect {
         if self.dirty(Scope::User) || self.dirty(Scope::System) {
             self.say("Testing the saved settings (unsaved changes are not tested)…");
         } else {
@@ -949,7 +953,7 @@ impl App {
         });
     }
 
-    pub fn draw(&mut self, canvas: &mut Canvas) {
+    pub(super) fn draw(&mut self, canvas: &mut Canvas) {
         let (width, height) = (canvas.width, canvas.height);
         if width < 48 || height < 14 {
             canvas.text_fit(0, 0, "Guardian: window too small", Style::PLAIN, width);

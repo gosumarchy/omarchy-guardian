@@ -23,7 +23,7 @@ use crate::tools::OpenCode;
 mod local;
 
 use local::{MAX_PROSE_TARGETS, apply_rules, check_run_prose};
-pub use local::{MAX_RUNS, check_runs};
+pub(crate) use local::{MAX_RUNS, check_runs};
 
 const EXCERPT_CHARS: usize = 180;
 
@@ -44,20 +44,20 @@ const LFS_POINTER: &str = "version https://git-lfs.github.com/spec/v1";
 
 /// What one review runs against: the settings, the class the target itself
 /// belongs to, and where to find OpenCode.
-pub struct ReviewContext<'a> {
-    pub settings: &'a Settings,
-    pub class: SourceClass,
-    pub opencode: &'a OpenCode,
+pub(crate) struct ReviewContext<'a> {
+    pub(crate) settings: &'a Settings,
+    pub(crate) class: SourceClass,
+    pub(crate) opencode: &'a OpenCode,
     /// What the target is remembered as; empty for `<class>:<canonical path>`.
-    pub units: &'a [Unit],
+    pub(crate) units: &'a [Unit],
     /// The review-memory store; `None` reviews without it.
-    pub state_root: Option<&'a Path>,
+    pub(crate) state_root: Option<&'a Path>,
     /// Facts for the AI review (see `Request::context`).
-    pub context: &'a [String],
+    pub(crate) context: &'a [String],
 }
 
 /// Reviews a file or directory tree as one source class.
-pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
+pub(crate) fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
     let mut report = collected_report(config.root.display().to_string(), context);
 
     // The text of prose files, which the command rules skip: kept so a
@@ -150,7 +150,7 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
 }
 
 /// A report for files collected outside a tree walk (see `review_collected`).
-pub fn collected_report(subject: impl Into<String>, context: &ReviewContext<'_>) -> Report {
+pub(crate) fn collected_report(subject: impl Into<String>, context: &ReviewContext<'_>) -> Report {
     let mut report = Report::new(subject);
     report.class = context.class;
     report.profile = context
@@ -187,7 +187,11 @@ fn is_plain_image_among(root: &Path, file: &FileHash, surroundings: &image::Surr
 
 /// Runs the AI review of what `report` has queued, with the review memory
 /// for `units`, and records an approved baseline.
-pub fn review_collected(mut report: Report, context: &ReviewContext<'_>, units: &[Unit]) -> Report {
+pub(crate) fn review_collected(
+    mut report: Report,
+    context: &ReviewContext<'_>,
+    units: &[Unit],
+) -> Report {
     report.context = context.context.to_vec();
     let memory = match Memory::open(
         context.settings,
@@ -222,7 +226,7 @@ pub fn review_collected(mut report: Report, context: &ReviewContext<'_>, units: 
 }
 
 /// The subset of `classes` whose resolved policy has `ai = off`.
-pub fn ai_off_classes(settings: &Settings, classes: &[SourceClass]) -> Vec<SourceClass> {
+pub(crate) fn ai_off_classes(settings: &Settings, classes: &[SourceClass]) -> Vec<SourceClass> {
     classes
         .iter()
         .copied()
@@ -250,14 +254,14 @@ fn git_config_findings(report: &mut Report, rel: &str, text: &str) {
 }
 
 /// Applies the local checks to one text file and queues it for the AI review.
-pub fn analyze_text(report: &mut Report, rel: &str, text: &str, inspect_dependencies: bool) {
+pub(crate) fn analyze_text(report: &mut Report, rel: &str, text: &str, inspect_dependencies: bool) {
     analyze(report, rel, text, inspect_dependencies, true);
 }
 
 /// Applies the local checks to one text file that stays on this machine:
 /// nothing of it is queued for the AI review, and that it is not is no gap
 /// of the review (the caller says why it is kept, see `sweep::judge`).
-pub fn analyze_text_locally(report: &mut Report, rel: &str, text: &str) {
+pub(crate) fn analyze_text_locally(report: &mut Report, rel: &str, text: &str) {
     analyze(report, rel, text, false, false);
 }
 
@@ -320,7 +324,7 @@ fn analyze_hidden_characters(report: &mut Report, rel: &str, text: &str) {
 /// these files are where legitimate services, rules and privileges live, so
 /// the rules' matches on them are noise. Returns whether it was queued: a
 /// class with `ai = off` does not review payload files at all.
-pub fn analyze_payload(report: &mut Report, rel: &str, text: &str) -> bool {
+pub(crate) fn analyze_payload(report: &mut Report, rel: &str, text: &str) -> bool {
     if report.ai_off_classes.contains(&report.class_of(rel)) {
         return false;
     }
@@ -345,7 +349,7 @@ pub fn analyze_payload(report: &mut Report, rel: &str, text: &str) -> bool {
 /// projects ship prompts and agent instructions of their own, the request
 /// shows invisible characters as codes, and the reply says when the
 /// source spoke to it.
-pub fn analyze_upstream(report: &mut Report, rel: &str, text: &str) -> bool {
+pub(crate) fn analyze_upstream(report: &mut Report, rel: &str, text: &str) -> bool {
     let before = report.findings.len();
     if analyze_payload(report, rel, text) {
         analyze_hidden_characters(report, rel, text);
@@ -403,7 +407,7 @@ fn audit_dependencies(report: &mut Report) {
 /// `None` when nothing was reviewed or the files needed more than one set
 /// of settings (a baseline is bound to one set, so such a review is never
 /// recorded as one).
-pub fn run_agents(
+pub(crate) fn run_agents(
     report: &mut Report,
     settings: &Settings,
     opencode: &OpenCode,

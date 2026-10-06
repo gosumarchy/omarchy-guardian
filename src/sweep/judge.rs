@@ -35,7 +35,7 @@ const ROOT_HOME: &str = "root";
 const IDENTITY: &str = "system:sweep";
 
 /// Whether an item is trusted and only counted.
-pub const fn is_trusted(tier: Tier) -> bool {
+pub(super) const fn is_trusted(tier: Tier) -> bool {
     matches!(
         tier,
         Tier::Vendor | Tier::Inert | Tier::Copied | Tier::Allowed
@@ -44,7 +44,7 @@ pub const fn is_trusted(tier: Tier) -> bool {
 
 /// How an item is named to the user and the AI: absolute, with the home
 /// directory as `~`.
-pub fn label(item: &Item, home: Option<&str>) -> String {
+pub(super) fn label(item: &Item, home: Option<&str>) -> String {
     shown_path(&item.path, home)
 }
 
@@ -60,7 +60,7 @@ fn shown_path(path: &str, home: Option<&str>) -> String {
 /// Runs the review of `collection`. `news` holds the labels of the
 /// accounts, keys and trust anchors that were not there at the sweep
 /// before: each is a finding.
-pub fn judge(
+pub(super) fn judge(
     collection: &Collection,
     home: Option<&str>,
     context: &ReviewContext<'_>,
@@ -261,7 +261,7 @@ fn is_local_only(item: &Item, home: Option<&str>) -> bool {
 
 /// How the text of an item is read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Reading {
+enum Reading {
     /// By the local rules and the AI review.
     Reviewed,
     /// Settings that hold tokens, hosts and names: by the rules for that
@@ -306,7 +306,7 @@ const SCRIPT_EXTENSIONS: &[&str] = &[
 /// gives it (`~/.ssh/rc` kept in a dotfiles directory is still a file of
 /// `~/.ssh`), never of the name the item is listed under, which may carry
 /// what a live check saw (`…/.env:tcp-3001`).
-pub fn reading(item: &Item, home: Option<&str>, text: &str) -> Reading {
+fn reading(item: &Item, home: Option<&str>, text: &str) -> Reading {
     if is_local_only(item, home) {
         return Reading::Settings;
     }
@@ -364,7 +364,7 @@ fn is_run(item: &Item, text: &str) -> bool {
 }
 
 /// Says on each item that is kept from the AI that it is, and why.
-pub fn note_kept(items: &mut [Item], home: Option<&str>) {
+pub(super) fn note_kept(items: &mut [Item], home: Option<&str>) {
     // An account, a key or a certificate authority is a fact with no text
     // to send: nothing to say of those.
     let fact = |item: &Item| matches!(item.category, Category::Account | Category::Trust);

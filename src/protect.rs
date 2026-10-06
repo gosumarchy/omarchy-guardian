@@ -141,7 +141,7 @@ const PROTECT: [Integration; 8] = [
 /// showing each step and, unless `yes`, asking. The pacman hook is left off
 /// when the pacman gate could not review with the current settings, since it
 /// would refuse every such install.
-pub fn protect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String> {
+pub(crate) fn protect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String> {
     status::watched();
     let settings = Settings::load();
     let paths = paths(&settings).ok_or("HOME is not set")?;
@@ -203,7 +203,7 @@ pub fn protect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String> {
 /// system sweep off (the menu entry and the bar widget stay), after showing
 /// each step and, unless `yes`, asking. A hand-installed pacman hook is left
 /// alone.
-pub fn unprotect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String> {
+pub(crate) fn unprotect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String> {
     status::watched();
     let settings = Settings::load();
     let paths = paths(&settings).ok_or("HOME is not set")?;
@@ -247,7 +247,7 @@ pub fn unprotect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String>
 
 /// `omarchy-guardian test`: the settings app's reviewer test; false when a
 /// check failed.
-pub fn test() -> (String, bool) {
+pub(crate) fn test() -> (String, bool) {
     let report = test_reviewer(&Settings::load());
     let passed = !report.lines().any(|line| line.starts_with('✗'));
     (report, passed)

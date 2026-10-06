@@ -41,13 +41,18 @@ fn unread_tier(scope: &Scope<'_>, path: &str) -> Tier {
 }
 
 /// One item: what is at `path`, its tier and content, and what it runs.
-pub fn item(scope: &Scope<'_>, category: Category, path: String, run_by: Option<&str>) -> Item {
+pub(crate) fn item(
+    scope: &Scope<'_>,
+    category: Category,
+    path: String,
+    run_by: Option<&str>,
+) -> Item {
     let found = look(scope, category, &path, run_by);
     item_of(scope, category, path, run_by, &found)
 }
 
 /// The item for what `look` found at `path`.
-pub fn item_of(
+pub(crate) fn item_of(
     scope: &Scope<'_>,
     category: Category,
     path: String,

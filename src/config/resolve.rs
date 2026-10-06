@@ -6,7 +6,7 @@
 use crate::config::file::PartialPolicy;
 use crate::config::model::{Named, Policy, Profile, SourceClass, builtin};
 
-pub const KNOBS: [&str; 9] = [
+pub(super) const KNOBS: [&str; 9] = [
     "ai",
     "on_findings",
     "on_ai_suspicious",
@@ -19,14 +19,14 @@ pub const KNOBS: [&str; 9] = [
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Origin {
+pub(crate) enum Origin {
     Profile,
     System,
     User,
 }
 
 impl Origin {
-    pub const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Profile => "profile",
             Self::System => "system",
@@ -35,23 +35,23 @@ impl Origin {
     }
 }
 
-pub struct Layers<'a> {
-    pub system_profile: Profile,
-    pub system: &'a PartialPolicy,
-    pub user_profile: Option<Profile>,
-    pub user: &'a PartialPolicy,
+pub(super) struct Layers<'a> {
+    pub(super) system_profile: Profile,
+    pub(super) system: &'a PartialPolicy,
+    pub(super) user_profile: Option<Profile>,
+    pub(super) user: &'a PartialPolicy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Resolved {
-    pub policy: Policy,
-    pub origins: Vec<(&'static str, Origin)>,
+pub(crate) struct Resolved {
+    pub(super) policy: Policy,
+    origins: Vec<(&'static str, Origin)>,
     /// User values that were not applied, with the reason.
-    pub ignored: Vec<String>,
+    pub(super) ignored: Vec<String>,
 }
 
 impl Resolved {
-    pub fn origin(&self, knob: &str) -> Origin {
+    pub(crate) fn origin(&self, knob: &str) -> Origin {
         self.origins
             .iter()
             .find(|(name, _)| *name == knob)
@@ -203,7 +203,7 @@ fn tighten_knob<T: Named + Ord>(
     }
 }
 
-pub fn resolve(class: SourceClass, layers: &Layers<'_>) -> Resolved {
+pub(super) fn resolve(class: SourceClass, layers: &Layers<'_>) -> Resolved {
     if class.is_privileged() {
         let mut resolved = Resolved::from_profile(layers.system_profile, class);
         resolved.apply(layers.system, Origin::System);

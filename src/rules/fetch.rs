@@ -50,7 +50,7 @@ fn fetches(part: &str) -> bool {
 
 /// Whether any command in `text` fetches, including inside a `$(…)` or
 /// `<(…)` substitution (`read -r x < <(curl …)`).
-pub fn text_fetches(text: &str) -> bool {
+pub(super) fn text_fetches(text: &str) -> bool {
     text.split(['|', ';', '&', '\n']).any(fetches)
         || shell::substitutions(text)
             .iter()
@@ -60,7 +60,7 @@ pub fn text_fetches(text: &str) -> bool {
 /// The download-and-run shapes the plain pipe rule does not know: another
 /// fetcher piped into an interpreter, a fetch run through a here-string or
 /// a substitution, and Python running what it requests.
-pub fn matches(line: &str) -> bool {
+pub(super) fn matches(line: &str) -> bool {
     if ![
         "curl",
         "wget",
@@ -208,7 +208,7 @@ fn saved_in_directory(command: &Command) -> Option<String> {
 /// The files a fetch on `line` is saved as beyond what `fetched_file`
 /// names: through `tee`, into a directory, by a redirection of another
 /// fetcher, or by a program that copies from another machine.
-pub fn saved_files(line: &str) -> Vec<String> {
+pub(super) fn saved_files(line: &str) -> Vec<String> {
     let mut found = Vec::new();
     for statement in shell::statements(line) {
         let parts = shell::pipeline(statement);
@@ -370,7 +370,7 @@ fn builds_from_address(command: &Command) -> bool {
 
 /// A package manager told to install, and so run, code from an address
 /// rather than from this source or a registry by name.
-pub fn installs_remote_code(line: &str) -> bool {
+pub(super) fn installs_remote_code(line: &str) -> bool {
     if ![
         "pip", "uv ", "npm ", "npx ", "pnpm ", "yarn ", "bun", "go ", "cargo ",
     ]

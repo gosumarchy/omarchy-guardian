@@ -5,50 +5,50 @@
 //! Parsing and selection are pure functions; the few steps that touch the
 //! network or run makepkg live in `cli::makepkg_gate`.
 
-pub mod lockfile;
-pub mod recipe;
+mod lockfile;
+pub(crate) mod recipe;
 mod srcinfo;
 mod trust;
 mod upstream;
 
 use std::ffi::OsString;
 
-pub use self::srcinfo::{
+pub(crate) use self::srcinfo::{
     Source, base_section, check_listing, check_sources, git_source_url, is_vcs_source,
     parse_srcinfo, source_filename, source_host, source_protocol, written_mismatch,
 };
-pub use self::trust::{
+pub(crate) use self::trust::{
     AurInfo, TRUST_UNKNOWN, aur_identity, declared_names, is_little_voted, lookalike_search_term,
     lookalikes, parse_rpc_info, parse_rpc_search, trust_signals,
 };
-pub use self::upstream::{
+pub(crate) use self::upstream::{
     Collected, NOT_REVIEWED_DATA, PARTIAL_REVIEW_BYTES, Roots, Upstream, is_target, recipe_runs,
     walk_upstream,
 };
 
 #[cfg(test)]
-pub use self::trust::plain_name;
+use self::trust::plain_name;
 #[cfg(test)]
-pub use self::upstream::{
-    Archive, NOT_REVIEWED_BUDGET, NOT_REVIEWED_LOCKFILE, collect_upstream, unpack_patterns,
-};
+pub(crate) use self::upstream::NOT_REVIEWED_BUDGET;
+#[cfg(test)]
+use self::upstream::{Archive, NOT_REVIEWED_LOCKFILE, collect_upstream, unpack_patterns};
 #[cfg(test)]
 use self::upstream::{collect_with_cap, matches_pattern};
 
 /// How one makepkg invocation uses the sources.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Invocation {
+pub(crate) struct Invocation {
     /// Downloads the sources, and (but for generating checksums) runs
     /// PKGBUILD functions on them: `verify()` on every such call,
     /// `pkgver()` whenever it gets past extraction, and prepare, build,
     /// check and package.
-    pub runs_functions: bool,
+    pub(crate) runs_functions: bool,
     /// Extracts the sources itself (no `--noextract`, not only verifying).
-    pub extracts: bool,
+    pub(crate) extracts: bool,
     /// Goes on to use the sources: extracts them, or builds from a tree
     /// extracted earlier (`--noextract`). Only a call that downloads and
     /// stops (to verify, or to generate checksums) does not.
-    pub uses_sources: bool,
+    pub(crate) uses_sources: bool,
 }
 
 /// Classifies makepkg's arguments. Only calls that print (the source list,
@@ -56,7 +56,7 @@ pub struct Invocation {
 /// checksums downloads the sources, and `--verifysource`, `--source` and
 /// `--nobuild --noprepare` also run `verify()` and `pkgver()` on what they
 /// download.
-pub fn classify(args: &[OsString]) -> Invocation {
+pub(crate) fn classify(args: &[OsString]) -> Invocation {
     let mut info_only = false;
     let mut source_only = false;
     let mut noextract = false;
@@ -160,7 +160,7 @@ fn code_and_braces(line: &str) -> (&str, i64) {
 /// given by name to a command that assigns (`printf -v`, `read`, `eval`,
 /// ...). This reads lines, not shell: it names the plain cases before
 /// anything runs, and the listing run checks what the recipe really did.
-pub fn path_variable_assignments(pkgbuild: &str) -> Vec<String> {
+pub(crate) fn path_variable_assignments(pkgbuild: &str) -> Vec<String> {
     let mut found = Vec::new();
     let mut depth = 0_i64;
     for (index, line) in pkgbuild.lines().enumerate() {
@@ -230,7 +230,7 @@ fn names_bare(code: &str, name: &str) -> bool {
 }
 
 /// The checksum arrays of a recipe, by makepkg's names.
-pub const CHECKSUMS: &[&str] = &[
+pub(crate) const CHECKSUMS: &[&str] = &[
     "cksums",
     "md5sums",
     "sha1sums",
@@ -310,7 +310,7 @@ impl Authority {
 }
 
 /// What the AI is told about the recipe it reviews in the AUR gate.
-pub const RECIPE_SCOPE: &str = "This is an AUR package recipe: the PKGBUILD, install script, \
+pub(crate) const RECIPE_SCOPE: &str = "This is an AUR package recipe: the PKGBUILD, install script, \
 patches and other files from the package's AUR repository. The upstream sources it downloads \
 are fetched and reviewed separately in the next step, before prepare(), build(), check() and \
 package() run. pkgver() and verify() also run on the downloaded sources: report a pkgver() or \
@@ -325,7 +325,7 @@ desktop entries, licenses, services and completions, and setuid on the package's
 helper.";
 
 /// What the AI is told about upstream files, alongside the facts.
-pub const UPSTREAM_SCOPE: &str = "These files are from the upstream source that this AUR package \
+pub(crate) const UPSTREAM_SCOPE: &str = "These files are from the upstream source that this AUR package \
 downloads and builds (the recipe was reviewed separately). Report only malicious intent, not \
 quality. That is: code that runs on this machine during the build (build scripts, makefiles, \
 scripts the recipe runs, and the test suite when the recipe runs it) and does something \
@@ -338,12 +338,12 @@ tests, or features that do what the program is for.";
 
 /// Whether a PKGBUILD defines `check()`, which runs the upstream test suite
 /// during the build.
-pub fn runs_tests(pkgbuild: &str) -> bool {
+pub(crate) fn runs_tests(pkgbuild: &str) -> bool {
     defines_function(pkgbuild, "check")
 }
 
 /// Whether a PKGBUILD defines the function `name`.
-pub fn defines_function(pkgbuild: &str, name: &str) -> bool {
+pub(crate) fn defines_function(pkgbuild: &str, name: &str) -> bool {
     pkgbuild.lines().any(|line| {
         let line = line.trim_start();
         let line = line.strip_prefix("function ").unwrap_or(line).trim_start();

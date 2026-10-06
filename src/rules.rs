@@ -5,20 +5,20 @@
 
 use crate::report::Severity;
 
-pub mod addressed;
+pub(crate) mod addressed;
 mod destructive;
-pub mod encoded;
-pub mod exfil;
-pub mod fetch;
-pub mod flow;
-pub mod hidden;
-pub mod hosts;
+pub(crate) mod encoded;
+mod exfil;
+mod fetch;
+pub(crate) mod flow;
+pub(crate) mod hidden;
+mod hosts;
 mod matchers;
 mod net;
 mod paths;
-pub mod persist;
+mod persist;
 mod run;
-pub mod shell;
+mod shell;
 
 use destructive::is_destructive_operation;
 use matchers::{
@@ -27,20 +27,20 @@ use matchers::{
     is_remote_shell, looks_like_credential_exfiltration, pipes_into_shell, references_credential,
     removes_traces,
 };
-pub use matchers::{continues, is_sandbox_helper};
-pub use net::{
+pub(crate) use matchers::{continues, is_sandbox_helper};
+pub(crate) use net::{
     Scheme, declares_lookalike_host, extract_network_destinations, host_concerns, is_ip_host,
     is_local_host,
 };
-pub use paths::{is_documentation, is_executable_or_runtime_config, is_sensitive_path};
+pub(crate) use paths::{is_documentation, is_executable_or_runtime_config, is_sensitive_path};
 use paths::{is_packaged_path, is_persistence};
 use run::as_file;
-pub use run::{
+pub(crate) use run::{
     command_variables, fetched_files, run_globs, run_targets, runs_file, with_variables,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum RuleId {
+pub(crate) enum RuleId {
     DownloadAndExecute,
     EncodedCommandExecution,
     CredentialFileAccess,
@@ -121,7 +121,7 @@ const SHELL_EXECUTION: &[&str] = &[
 ];
 
 impl RuleId {
-    pub const ALL: [Self; 45] = [
+    const ALL: [Self; 45] = [
         Self::DownloadAndExecute,
         Self::EncodedCommandExecution,
         Self::CredentialFileAccess,
@@ -169,11 +169,11 @@ impl RuleId {
         Self::RemoteCodeInstall,
     ];
 
-    pub fn from_name(name: &str) -> Option<Self> {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|rule| rule.name() == name)
     }
 
-    pub const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::DownloadAndExecute => "download-and-execute",
             Self::EncodedCommandExecution => "encoded-command-execution",
@@ -223,7 +223,7 @@ impl RuleId {
         }
     }
 
-    pub const fn severity(self) -> Severity {
+    pub(crate) const fn severity(self) -> Severity {
         match self {
             Self::DownloadAndExecute
             | Self::EncodedCommandExecution
@@ -459,7 +459,7 @@ impl RuleId {
         ),
     ];
 
-    pub const fn description(self) -> &'static str {
+    pub(crate) const fn description(self) -> &'static str {
         let mut index = 0;
         while index < Self::DESCRIPTIONS.len() {
             if Self::DESCRIPTIONS[index].0 as usize == self as usize {
@@ -525,7 +525,7 @@ impl RuleId {
     /// enable ...`, `add this to ~/.bashrc`). They skip text a script only
     /// prints. The rules for directly dangerous commands still match printed
     /// text, so a message cannot hide one.
-    pub const fn ignores_messages(self) -> bool {
+    const fn ignores_messages(self) -> bool {
         match self {
             Self::CredentialFileAccess
             | Self::PersistenceModification
@@ -586,7 +586,7 @@ impl RuleId {
 
 /// The line rules matched by one lowercased line: `code` with comments
 /// blanked, `quiet` with printed messages blanked as well (see `mask`).
-pub fn line_rules<'a>(code: &'a str, quiet: &'a str) -> impl Iterator<Item = RuleId> + 'a {
+pub(crate) fn line_rules<'a>(code: &'a str, quiet: &'a str) -> impl Iterator<Item = RuleId> + 'a {
     RuleId::ALL
         .into_iter()
         .filter(move |rule| rule.matches_line(if rule.ignores_messages() { quiet } else { code }))

@@ -13,12 +13,12 @@ use crate::paths::{extension_lowercase, file_name};
 use crate::rules;
 
 /// How much of a large file is looked at to classify it.
-pub const PROBE_SIZE: usize = 8192;
+pub(crate) const PROBE_SIZE: usize = 8192;
 /// A script more replaced than this (per mille) cannot be meaningfully read.
 const MAX_REPLACED_PER_MILLE: usize = 50;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Content {
+pub(crate) enum Content {
     /// UTF-8 without NUL, or UTF-16 decoded without loss.
     Text(String),
     /// Text in a legacy encoding, decoded with `replaced` replacement
@@ -33,7 +33,7 @@ pub enum Content {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Format {
+pub(crate) enum Format {
     Known {
         label: &'static str,
         /// Machine code or bytecode that runs when loaded.
@@ -46,7 +46,7 @@ pub enum Format {
 impl Format {
     /// The label as Guardian names it, from one given elsewhere (the root
     /// collector's output); an unknown label is reported as unrecognized.
-    pub fn label_named(label: &str) -> &'static str {
+    pub(crate) fn label_named(label: &str) -> &'static str {
         MAGIC
             .iter()
             .map(|(_, _, known, _)| *known)
@@ -55,14 +55,14 @@ impl Format {
             .unwrap_or("unrecognized binary data")
     }
 
-    pub const fn label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Known { label, .. } => label,
             Self::Unrecognized => "unrecognized binary data",
         }
     }
 
-    pub const fn executable(self) -> bool {
+    pub(crate) const fn executable(self) -> bool {
         matches!(
             self,
             Self::Known {
@@ -74,7 +74,7 @@ impl Format {
 
     /// Images, audio, video and fonts: grouped per directory in the AI
     /// manifest, where one theme can hold hundreds of them.
-    pub fn is_media(self) -> bool {
+    pub(crate) fn is_media(self) -> bool {
         match self {
             Self::Known { label, .. } => ["image", "audio", "video", "font"]
                 .iter()
@@ -86,7 +86,7 @@ impl Format {
 
 /// A large file judged from its first `PROBE_SIZE` bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Prefix {
+pub(crate) enum Prefix {
     /// Text (or a file that must be read as text): too large to review, so a gap.
     Text,
     Binary(Format),
@@ -179,7 +179,7 @@ const REVIEW_EXTENSIONS: &[&str] = &[
 
 /// Whether `rel` must be read as code whatever its bytes are: a shebang, or
 /// a script, build or runtime-config name.
-pub fn must_review(rel: &str, head: &[u8]) -> bool {
+pub(crate) fn must_review(rel: &str, head: &[u8]) -> bool {
     if head.starts_with(b"#!") {
         return true;
     }
@@ -196,7 +196,7 @@ pub fn must_review(rel: &str, head: &[u8]) -> bool {
 /// Classifies a whole file. `force` marks a file that must be read as code
 /// (an install scriptlet, an auto-run payload file); `executable` is the
 /// file's execute bit.
-pub fn classify(rel: &str, executable: bool, force: bool, bytes: &[u8]) -> Content {
+pub(crate) fn classify(rel: &str, executable: bool, force: bool, bytes: &[u8]) -> Content {
     let review = force || must_review(rel, bytes);
     if let Ok(text) = std::str::from_utf8(bytes)
         && !text.contains('\0')
@@ -245,7 +245,7 @@ pub fn classify(rel: &str, executable: bool, force: bool, bytes: &[u8]) -> Conte
 /// Classifies a payload file that must be read as code, except that a
 /// recognised executable format (an ELF generator, a compiled program a
 /// hook runs) is reported as that binary, for the caller to allow or refuse.
-pub fn classify_payload(rel: &str, bytes: &[u8]) -> Content {
+pub(crate) fn classify_payload(rel: &str, bytes: &[u8]) -> Content {
     match classify(rel, false, true, bytes) {
         Content::Undecodable => match magic(rel, bytes) {
             Some(format) if format.executable() => Content::Binary(format),
@@ -256,7 +256,7 @@ pub fn classify_payload(rel: &str, bytes: &[u8]) -> Content {
 }
 
 /// Classifies a file too large to review from its first bytes.
-pub fn classify_prefix(rel: &str, executable: bool, head: &[u8]) -> Prefix {
+pub(crate) fn classify_prefix(rel: &str, executable: bool, head: &[u8]) -> Prefix {
     let probe = &head[..head.len().min(PROBE_SIZE)];
     if must_review(rel, probe) {
         return Prefix::Text;

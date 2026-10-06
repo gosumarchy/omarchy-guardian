@@ -11,7 +11,7 @@ use std::fmt::{self, Write as _};
 const MAX_DEPTH: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Json {
+pub(crate) enum Json {
     Null,
     Bool(bool),
     /// The number exactly as written in the source text.
@@ -23,7 +23,7 @@ pub enum Json {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct ParseError {
+pub(crate) struct ParseError {
     offset: usize,
     message: &'static str,
 }
@@ -38,7 +38,7 @@ impl std::error::Error for ParseError {}
 
 impl Json {
     /// Parses exactly one JSON value surrounded by optional whitespace.
-    pub fn parse(text: &str) -> Result<Self, ParseError> {
+    pub(crate) fn parse(text: &str) -> Result<Self, ParseError> {
         let mut parser = Parser::new(text);
         let value = parser.value()?;
         parser.skip_whitespace();
@@ -50,7 +50,7 @@ impl Json {
 
     /// Parses a sequence of whitespace-separated JSON values, as produced when
     /// several responses are written back to back.
-    pub fn parse_stream(text: &str) -> Result<Vec<Self>, ParseError> {
+    pub(crate) fn parse_stream(text: &str) -> Result<Vec<Self>, ParseError> {
         let mut parser = Parser::new(text);
         let mut values = Vec::new();
         loop {
@@ -63,7 +63,7 @@ impl Json {
     }
 
     /// Builds an object from `(key, value)` pairs.
-    pub fn object<'a>(members: impl IntoIterator<Item = (&'a str, Json)>) -> Self {
+    pub(crate) fn object<'a>(members: impl IntoIterator<Item = (&'a str, Json)>) -> Self {
         Self::Object(
             members
                 .into_iter()
@@ -72,7 +72,7 @@ impl Json {
         )
     }
 
-    pub fn get(&self, key: &str) -> Option<&Self> {
+    pub(crate) fn get(&self, key: &str) -> Option<&Self> {
         match self {
             Self::Object(members) => members
                 .iter()
@@ -82,14 +82,14 @@ impl Json {
         }
     }
 
-    pub fn as_str(&self) -> Option<&str> {
+    pub(crate) fn as_str(&self) -> Option<&str> {
         match self {
             Self::String(text) => Some(text),
             Self::Null | Self::Bool(_) | Self::Number(_) | Self::Array(_) | Self::Object(_) => None,
         }
     }
 
-    pub fn as_bool(&self) -> Option<bool> {
+    pub(crate) fn as_bool(&self) -> Option<bool> {
         match self {
             Self::Bool(value) => Some(*value),
             Self::Null | Self::Number(_) | Self::String(_) | Self::Array(_) | Self::Object(_) => {
@@ -99,14 +99,14 @@ impl Json {
     }
 
     /// The value as a non-negative integer, if it is one.
-    pub fn as_u64(&self) -> Option<u64> {
+    pub(crate) fn as_u64(&self) -> Option<u64> {
         match self {
             Self::Number(text) => text.parse().ok(),
             Self::Null | Self::Bool(_) | Self::String(_) | Self::Array(_) | Self::Object(_) => None,
         }
     }
 
-    pub fn as_array(&self) -> Option<&[Self]> {
+    pub(crate) fn as_array(&self) -> Option<&[Self]> {
         match self {
             Self::Array(items) => Some(items),
             Self::Null | Self::Bool(_) | Self::Number(_) | Self::String(_) | Self::Object(_) => {
@@ -115,7 +115,7 @@ impl Json {
         }
     }
 
-    pub fn as_object(&self) -> Option<&[(String, Self)]> {
+    pub(crate) fn as_object(&self) -> Option<&[(String, Self)]> {
         match self {
             Self::Object(members) => Some(members),
             Self::Null | Self::Bool(_) | Self::Number(_) | Self::String(_) | Self::Array(_) => None,
@@ -185,7 +185,7 @@ impl fmt::Display for Json {
 /// the model included, then sees which code point was there, and nothing in
 /// a reviewed file can draw what looks like a line of the request around
 /// it. Nothing is removed: the escape names the character.
-pub const fn is_escaped(character: char) -> bool {
+const fn is_escaped(character: char) -> bool {
     matches!(
         character,
         '\u{0}'..='\u{1f}'
@@ -213,7 +213,7 @@ pub const fn is_escaped(character: char) -> bool {
 }
 
 /// The bytes `character` takes inside a JSON string as written here.
-pub const fn written_len(character: char) -> usize {
+pub(crate) const fn written_len(character: char) -> usize {
     match character {
         '"' | '\\' | '\n' | '\r' | '\t' => 2,
         // Past the basic plane an escape is a surrogate pair.

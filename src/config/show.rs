@@ -45,7 +45,7 @@ fn header(settings: &Settings) -> String {
     text
 }
 
-pub fn render_show(settings: &Settings, classes: &[SourceClass]) -> String {
+pub(crate) fn render_show(settings: &Settings, classes: &[SourceClass]) -> String {
     let mut text = header(settings);
 
     for class in classes {
@@ -103,7 +103,7 @@ pub fn render_show(settings: &Settings, classes: &[SourceClass]) -> String {
 }
 
 /// The check report and whether both files are usable.
-pub fn render_check(settings: &Settings) -> (String, bool) {
+pub(crate) fn render_check(settings: &Settings) -> (String, bool) {
     let valid = !matches!(settings.system_status(), FileStatus::Invalid(_))
         && !matches!(settings.user_status(), FileStatus::Invalid(_))
         && settings.privileged_block().is_none();
@@ -118,7 +118,7 @@ pub fn render_check(settings: &Settings) -> (String, bool) {
 
 /// One line on the review memory: where it is, how many baselines it holds
 /// and its size.
-pub fn render_memory(root: Option<&Path>) -> String {
+pub(crate) fn render_memory(root: Option<&Path>) -> String {
     let Some(root) = root else {
         return "\nReview memory: no state directory (set HOME or XDG_STATE_HOME)\n".into();
     };

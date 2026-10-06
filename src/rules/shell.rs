@@ -74,18 +74,18 @@ pub(super) fn short_flag(word: &str, flag: char) -> bool {
 const MAX_SUBSTITUTIONS: usize = 64;
 
 /// A `$(…)`, `<(…)` or backtick substitution.
-pub struct Substitution<'a> {
+pub(super) struct Substitution<'a> {
     /// `$(`, `<(` or a backtick.
-    pub open: &'static str,
+    open: &'static str,
     /// Where it opens in the line.
-    pub start: usize,
-    pub body: &'a str,
+    start: usize,
+    pub(super) body: &'a str,
 }
 
 /// The index just past the `)` that closes a parenthesis opened before
 /// `text`, or the end of `text` when nothing closes it. Parentheses inside
 /// quotes do not count, except those of a substitution (`"$(…)"`).
-pub fn closing_paren(text: &str) -> usize {
+fn closing_paren(text: &str) -> usize {
     let bytes = text.as_bytes();
     let mut depth = 1_usize;
     let mut quote: Option<u8> = None;
@@ -120,13 +120,13 @@ pub fn closing_paren(text: &str) -> usize {
 
 /// What stands between a parenthesis opened before `text` and the one
 /// that closes it.
-pub fn argument(text: &str) -> &str {
+pub(super) fn argument(text: &str) -> &str {
     let end = closing_paren(text);
     text[..end].strip_suffix(')').unwrap_or(&text[..end])
 }
 
 /// Every substitution in `text`, the nested ones after the one around them.
-pub fn substitutions(text: &str) -> Vec<Substitution<'_>> {
+pub(super) fn substitutions(text: &str) -> Vec<Substitution<'_>> {
     let bytes = text.as_bytes();
     let mut found = Vec::new();
     let mut index = 0;
@@ -166,7 +166,7 @@ pub fn substitutions(text: &str) -> Vec<Substitution<'_>> {
 
 /// Splits `text` at each of `separators` that stands outside quotes and
 /// substitutions. A two-character separator is tried before a single one.
-pub fn split_top<'a>(text: &'a str, separators: &[&str]) -> Vec<&'a str> {
+pub(super) fn split_top<'a>(text: &'a str, separators: &[&str]) -> Vec<&'a str> {
     let bytes = text.as_bytes();
     let mut parts = Vec::new();
     let mut quote: Option<u8> = None;
@@ -223,29 +223,29 @@ pub fn split_top<'a>(text: &'a str, separators: &[&str]) -> Vec<&'a str> {
 }
 
 /// The statements of a line: what `;`, `&&`, `||` and a line break divide.
-pub fn statements(line: &str) -> Vec<&str> {
+pub(super) fn statements(line: &str) -> Vec<&str> {
     split_top(line, &["&&", "||", ";", "\n"])
 }
 
 /// The parts of one statement that a pipe joins.
-pub fn pipeline(statement: &str) -> Vec<&str> {
+pub(super) fn pipeline(statement: &str) -> Vec<&str> {
     // `||` first, so it is not read as two pipes.
     split_top(statement, &["||", "|"])
 }
 
 /// A program and what it is given, without quotes.
-pub struct Command {
+pub(super) struct Command {
     /// The program as written, with its directory.
-    pub path: String,
+    pub(super) path: String,
     /// The program's name without its directory.
-    pub program: String,
-    pub arguments: Vec<String>,
+    pub(super) program: String,
+    pub(super) arguments: Vec<String>,
 }
 
 impl Command {
     /// Whether one of the command's own options is `flag` (`-c`), or a
     /// cluster of short options holding its letter (`-lc`).
-    pub fn has_short(&self, flag: char) -> bool {
+    pub(super) fn has_short(&self, flag: char) -> bool {
         self.arguments
             .iter()
             .take_while(|word| word.starts_with('-'))
@@ -253,14 +253,14 @@ impl Command {
     }
 
     /// The arguments that are not options.
-    pub fn operands(&self) -> impl Iterator<Item = &str> {
+    pub(super) fn operands(&self) -> impl Iterator<Item = &str> {
         self.arguments
             .iter()
             .map(String::as_str)
             .filter(|word| !word.starts_with('-'))
     }
 
-    pub fn is_shell(&self) -> bool {
+    pub(super) fn is_shell(&self) -> bool {
         PIPE_SHELLS.contains(&self.program.as_str())
     }
 }
@@ -308,7 +308,7 @@ pub(super) fn program_word<'a>(words: &mut impl Iterator<Item = &'a str>) -> Opt
 
 /// The command a statement, or one part of a pipeline, runs: past wrappers
 /// (`sudo`, `env X=1`, `timeout 5`) and what opens a group.
-pub fn command(part: &str) -> Option<Command> {
+pub(super) fn command(part: &str) -> Option<Command> {
     let words = unquoted_words(part);
     let mut words = words.iter().map(String::as_str);
     let path = program_word(&mut words)?.to_string();
@@ -325,7 +325,7 @@ pub fn command(part: &str) -> Option<Command> {
 
 /// The last statement of a pipeline part cut at pipes alone, which is the
 /// one whose output the pipe carries on: `a; b` gives `b`.
-pub fn piped_statement(part: &str) -> &str {
+pub(super) fn piped_statement(part: &str) -> &str {
     let last = part.rsplit(';').next().unwrap_or(part);
     last.rsplit("&&").next().unwrap_or(last)
 }
@@ -333,7 +333,7 @@ pub fn piped_statement(part: &str) -> &str {
 /// Whether the command whose output a pipe carries on from `part` is one
 /// `accepts`. A part cut at a pipe may open a quote it does not close
 /// (`sh -c "a; b | c"`), so it is read both with its quotes and without.
-pub fn pipes_from(part: &str, accepts: &dyn Fn(&Command) -> bool) -> bool {
+pub(super) fn pipes_from(part: &str, accepts: &dyn Fn(&Command) -> bool) -> bool {
     let quoted = statements(part).last().copied().unwrap_or(part);
     [quoted, piped_statement(part)]
         .iter()
@@ -342,7 +342,7 @@ pub fn pipes_from(part: &str, accepts: &dyn Fn(&Command) -> bool) -> bool {
 
 /// The file one command writes its output to: by a redirection, as `tee`,
 /// or through `-out`.
-pub fn written_file(part: &str) -> Option<String> {
+pub(super) fn written_file(part: &str) -> Option<String> {
     let words = unquoted_words(part);
     let tee = words
         .first()
@@ -370,7 +370,7 @@ pub fn written_file(part: &str) -> Option<String> {
 /// Whether the output of the substitution `found` in `line` is run: `eval
 /// "$(…)"`, `sh -c "$(…)"`, `bash <<< "$(…)"`, `source <(…)`, `bash <(…)`.
 /// A substitution that is only an argument or a value is not.
-pub fn is_run(line: &str, found: &Substitution<'_>) -> bool {
+pub(super) fn is_run(line: &str, found: &Substitution<'_>) -> bool {
     let before = &line[..found.start];
     let statement = before
         .rsplit([';', '|', '\n'])
@@ -393,7 +393,7 @@ pub fn is_run(line: &str, found: &Substitution<'_>) -> bool {
 
 /// Whether `line` runs the output of a substitution whose body `source`
 /// accepts.
-pub fn runs_substitution(line: &str, source: &dyn Fn(&str) -> bool) -> bool {
+pub(super) fn runs_substitution(line: &str, source: &dyn Fn(&str) -> bool) -> bool {
     if !(line.contains("$(") || line.contains("<(") || line.contains('`')) {
         return false;
     }
@@ -403,7 +403,7 @@ pub fn runs_substitution(line: &str, source: &dyn Fn(&str) -> bool) -> bool {
 }
 
 /// Whether `word` is `$name` or `${name}`, quoted or not.
-pub fn is_reference(word: &str, name: &str) -> bool {
+pub(super) fn is_reference(word: &str, name: &str) -> bool {
     let word = word.trim().trim_matches(['"', '\'']);
     word.strip_prefix('$').is_some_and(|rest| {
         rest == name
@@ -415,14 +415,14 @@ pub fn is_reference(word: &str, name: &str) -> bool {
 }
 
 /// A variable name as a shell accepts it.
-pub fn is_name(word: &str) -> bool {
+pub(super) fn is_name(word: &str) -> bool {
     word.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
         && word.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The assignments a statement makes, as (name, value as written):
 /// `x=1`, `export x=$(…)`, `local a=1 b=2`.
-pub fn assignments(statement: &str) -> Vec<(String, String)> {
+pub(super) fn assignments(statement: &str) -> Vec<(String, String)> {
     let mut found = Vec::new();
     let words = shell_words(statement);
     let mut declaring = false;

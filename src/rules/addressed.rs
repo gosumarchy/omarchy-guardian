@@ -477,7 +477,7 @@ fn excerpt(line: &str, at: usize) -> String {
 }
 
 /// The lines of `text` that address a reviewer, with an excerpt each.
-pub fn findings(text: &str) -> Vec<(usize, String)> {
+pub(crate) fn findings(text: &str) -> Vec<(usize, String)> {
     let lines: Vec<&str> = text.lines().collect();
     let normal: Vec<Line> = lines.iter().map(|line| normalised(line)).collect();
     let all: Vec<Signals> = (0..normal.len())

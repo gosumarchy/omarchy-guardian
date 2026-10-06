@@ -7,13 +7,13 @@ use std::path::Path;
 use super::{hidden, hosts};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Scheme {
+pub(crate) enum Scheme {
     Http,
     Https,
 }
 
 impl Scheme {
-    pub const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Http => "http",
             Self::Https => "https",
@@ -23,7 +23,7 @@ impl Scheme {
 
 /// Literal HTTP(S) destinations in a line, reduced to scheme and host so
 /// paths, queries and credentials in URLs are never echoed.
-pub fn extract_network_destinations(line: &str) -> Vec<(Scheme, String)> {
+pub(crate) fn extract_network_destinations(line: &str) -> Vec<(Scheme, String)> {
     let mut result: Vec<(Scheme, String)> = destinations_with_path(line)
         .into_iter()
         .map(|(scheme, host, _)| (scheme, host))
@@ -36,17 +36,17 @@ pub fn extract_network_destinations(line: &str) -> Vec<(Scheme, String)> {
 /// How a host read from a URL is classified, kept apart so the path that
 /// decides it is used but never stored (see `Report::network`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HostConcern {
+pub(crate) struct HostConcern {
     /// A host made to read as another name (mixed scripts, a well-known
     /// host's name in front of another domain).
-    pub lookalike: bool,
+    pub(crate) lookalike: bool,
     /// A host commonly used to drop off or pick up stolen data.
-    pub drop: bool,
+    pub(crate) drop: bool,
 }
 
 /// Each literal HTTP(S) destination's host classified by the concerns its
 /// name and path raise, with the path itself discarded.
-pub fn host_concerns(line: &str) -> Vec<(String, HostConcern)> {
+pub(crate) fn host_concerns(line: &str) -> Vec<(String, HostConcern)> {
     destinations_with_path(line)
         .into_iter()
         .filter_map(|(_, host, path)| {
@@ -71,7 +71,7 @@ fn reads_as_another_host(host: &str) -> bool {
 /// and so no network requests of the recipe's own. Cleartext and bare
 /// addresses there are makepkg's to fetch and check, but a source host
 /// that passes for a forge is the typosquat itself.
-pub fn declares_lookalike_host(code: &str, quiet: &str) -> bool {
+pub(crate) fn declares_lookalike_host(code: &str, quiet: &str) -> bool {
     if code == quiet {
         return false;
     }
@@ -196,11 +196,11 @@ fn url_host(after_scheme: &str) -> Option<String> {
     (!host.is_empty() && host != "]").then_some(host)
 }
 
-pub fn is_local_host(host: &str) -> bool {
+pub(crate) fn is_local_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") || host.ends_with(".localhost")
 }
 
-pub fn is_ip_host(host: &str) -> bool {
+pub(crate) fn is_ip_host(host: &str) -> bool {
     host.trim_start_matches('[')
         .trim_end_matches(']')
         .parse::<IpAddr>()

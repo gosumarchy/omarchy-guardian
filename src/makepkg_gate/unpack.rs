@@ -38,10 +38,10 @@ const UNPACK_LIMITS: Limits = Limits {
 };
 
 /// What the directories Guardian unpacks into are named, beside `src/`.
-pub const SCRATCH_PREFIX: &str = ".guardian-unpack-";
+const SCRATCH_PREFIX: &str = ".guardian-unpack-";
 
 /// A directory to unpack into, removed on drop.
-pub struct Scratch {
+pub(super) struct Scratch {
     path: PathBuf,
     used: usize,
 }
@@ -49,7 +49,7 @@ pub struct Scratch {
 impl Scratch {
     /// Creates it in `parent`, for the user alone. It is on disk beside
     /// the sources, not in the temporary directory, which is memory.
-    pub fn create(parent: &Path) -> Result<Self, String> {
+    pub(super) fn create(parent: &Path) -> Result<Self, String> {
         remove_stale(parent);
         let mut bytes = [0_u8; 8];
         fs::File::open("/dev/urandom")
@@ -68,7 +68,7 @@ impl Scratch {
     }
 
     /// A new empty directory in it.
-    pub fn next(&mut self) -> Result<PathBuf, String> {
+    pub(super) fn next(&mut self) -> Result<PathBuf, String> {
         let path = self.path.join(self.used.to_string());
         self.used += 1;
         DirBuilder::new()
@@ -88,7 +88,7 @@ impl Drop for Scratch {
 }
 
 /// Removes what a crashed run left in `parent`.
-pub fn remove_stale(parent: &Path) {
+pub(super) fn remove_stale(parent: &Path) {
     let Ok(entries) = fs::read_dir(parent) else {
         return;
     };
@@ -167,7 +167,7 @@ fn make_readable(root: &Path, entries: &mut usize, bytes: &mut u64) -> std::io::
 /// Unpacks `archive` into the empty directory `into`. `jail` is the command
 /// that runs a program confined (Bubblewrap's arguments up to `--`, see
 /// `sandbox::fetch_jail`), with `archive` readable and `into` writable.
-pub fn unpack(jail: &[OsString], archive: &Path, into: &Path) -> Result<(), String> {
+pub(super) fn unpack(jail: &[OsString], archive: &Path, into: &Path) -> Result<(), String> {
     let run = |arguments: Vec<OsString>, limits: Limits| -> Result<Vec<u8>, String> {
         let mut command = jail.to_vec();
         command.extend(arguments);

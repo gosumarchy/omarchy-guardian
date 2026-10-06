@@ -8,7 +8,7 @@
 
 mod editor;
 
-pub use editor::editor;
+pub(super) use editor::editor;
 
 use super::config::{host, is_usual, key_value};
 use crate::paths::file_name;
@@ -19,11 +19,11 @@ use editor::NOT_SETTINGS;
 
 /// How what is seen ends when the value is a path in a temporary or cache
 /// directory, where downloads land and anyone's program may write.
-pub const FROM_TEMPORARY: &str = " (in a temporary or cache directory)";
+const FROM_TEMPORARY: &str = " (in a temporary or cache directory)";
 
 /// How what is seen ends when an address is plain HTTP: whoever is on the
 /// way can change what is fetched.
-pub const CLEARTEXT: &str = " (over unencrypted HTTP)";
+const CLEARTEXT: &str = " (over unencrypted HTTP)";
 
 /// The most alerts kept for one file.
 const MAX_ALERTS: usize = 20;
@@ -151,7 +151,7 @@ fn bare(value: &str) -> &str {
 }
 
 /// Whether `value` names a path in a temporary or cache directory.
-pub fn is_temporary(value: &str) -> bool {
+fn is_temporary(value: &str) -> bool {
     let from_root = |directory: &str| {
         value.match_indices(directory).any(|(at, _)| {
             !value[..at].ends_with(|c: char| {
@@ -736,7 +736,7 @@ fn inline_members(table: &str) -> Vec<(Vec<String>, String)> {
 
 /// What the settings of a developer tool at `path` do that is worth
 /// seeing, each with its line; nothing for a file of no known tool.
-pub fn alerts(path: &str, text: &str) -> Vec<(usize, String)> {
+pub(super) fn alerts(path: &str, text: &str) -> Vec<(usize, String)> {
     let Some(tool) = tool(path) else {
         return Vec::new();
     };

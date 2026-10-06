@@ -5,16 +5,16 @@
 
 /// A word as written, quotes included.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub struct Word {
-    pub text: String,
-    pub line: usize,
+pub(super) struct Word {
+    pub(super) text: String,
+    pub(super) line: usize,
     /// For an array assignment (`text` is `name=(` or `name+=(`): its
     /// elements.
-    pub elements: Option<Vec<Word>>,
+    pub(super) elements: Option<Vec<Word>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Token {
+pub(super) enum Token {
     Word(Word),
     /// `;`, a new line, `&&`, `||`, `|`, `|&`, `&`, `(`, `)`, `;;`, `;&`
     /// or `;;&`.
@@ -733,7 +733,7 @@ impl Lexer<'_> {
 
 /// The words and operators of `recipe`, and the lines where Guardian is not
 /// sure it reads them as bash does.
-pub fn tokens(recipe: &str) -> (Vec<Token>, Vec<usize>) {
+pub(super) fn tokens(recipe: &str) -> (Vec<Token>, Vec<usize>) {
     let mut lexer = Lexer {
         characters: recipe.chars().peekable(),
         line: 1,

@@ -5,26 +5,26 @@
 use std::fmt::Write as _;
 
 /// Palette colours by role.
-pub mod color {
-    pub const RED: u8 = 1;
-    pub const GREEN: u8 = 2;
-    pub const YELLOW: u8 = 3;
-    pub const ACCENT: u8 = 4;
-    pub const CYAN: u8 = 6;
-    pub const MUTED: u8 = 8;
+pub(super) mod color {
+    pub(crate) const RED: u8 = 1;
+    pub(crate) const GREEN: u8 = 2;
+    pub(crate) const YELLOW: u8 = 3;
+    pub(crate) const ACCENT: u8 = 4;
+    pub(crate) const CYAN: u8 = 6;
+    pub(crate) const MUTED: u8 = 8;
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Style {
-    pub fg: Option<u8>,
-    pub bg: Option<u8>,
-    pub bold: bool,
-    pub dim: bool,
-    pub reverse: bool,
+pub(super) struct Style {
+    fg: Option<u8>,
+    bg: Option<u8>,
+    bold: bool,
+    dim: bool,
+    reverse: bool,
 }
 
 impl Style {
-    pub const PLAIN: Self = Self {
+    pub(super) const PLAIN: Self = Self {
         fg: None,
         bg: None,
         bold: false,
@@ -32,7 +32,7 @@ impl Style {
         reverse: false,
     };
 
-    pub const fn fg(color: u8) -> Self {
+    pub(super) const fn fg(color: u8) -> Self {
         Self {
             fg: Some(color),
             ..Self::PLAIN
@@ -40,25 +40,25 @@ impl Style {
     }
 
     #[cfg(test)]
-    pub fn code(self) -> String {
+    fn code(self) -> String {
         self.sgr()
     }
 
-    pub const fn with_fg(self, color: u8) -> Self {
+    pub(super) const fn with_fg(self, color: u8) -> Self {
         Self {
             fg: Some(color),
             ..self
         }
     }
 
-    pub const fn with_bg(self, color: u8) -> Self {
+    pub(super) const fn with_bg(self, color: u8) -> Self {
         Self {
             bg: Some(color),
             ..self
         }
     }
 
-    pub const fn bold(self) -> Self {
+    pub(super) const fn bold(self) -> Self {
         Self { bold: true, ..self }
     }
 
@@ -97,14 +97,14 @@ const BLANK: Cell = Cell {
     style: Style::PLAIN,
 };
 
-pub struct Canvas {
-    pub width: usize,
-    pub height: usize,
+pub(super) struct Canvas {
+    pub(super) width: usize,
+    pub(super) height: usize,
     cells: Vec<Cell>,
 }
 
 impl Canvas {
-    pub fn new(width: usize, height: usize) -> Self {
+    pub(super) fn new(width: usize, height: usize) -> Self {
         Self {
             width,
             height,
@@ -114,7 +114,14 @@ impl Canvas {
 
     /// Writes `text` from `(x, y)`, clipped to the canvas and to `limit`
     /// columns. Returns the column after the last character written.
-    pub fn text(&mut self, x: usize, y: usize, text: &str, style: Style, limit: usize) -> usize {
+    pub(super) fn text(
+        &mut self,
+        x: usize,
+        y: usize,
+        text: &str,
+        style: Style,
+        limit: usize,
+    ) -> usize {
         let mut column = x;
         let end = (x + limit).min(self.width);
         if y >= self.height {
@@ -138,7 +145,7 @@ impl Canvas {
     }
 
     /// Like `text`, but ends with `…` when `text` does not fit.
-    pub fn text_fit(&mut self, x: usize, y: usize, text: &str, style: Style, limit: usize) {
+    pub(super) fn text_fit(&mut self, x: usize, y: usize, text: &str, style: Style, limit: usize) {
         if text.chars().count() <= limit {
             self.text(x, y, text, style, limit);
         } else if limit > 0 {
@@ -148,7 +155,7 @@ impl Canvas {
         }
     }
 
-    pub fn fill(&mut self, x: usize, y: usize, width: usize, style: Style) {
+    fn fill(&mut self, x: usize, y: usize, width: usize, style: Style) {
         let end = (x + width).min(self.width);
         if y < self.height {
             for column in x..end {
@@ -161,7 +168,7 @@ impl Canvas {
     }
 
     /// A rounded box with an optional title in its top edge.
-    pub fn frame(&mut self, x: usize, y: usize, width: usize, height: usize, style: Style) {
+    pub(super) fn frame(&mut self, x: usize, y: usize, width: usize, height: usize, style: Style) {
         if width < 2 || height < 2 {
             return;
         }
@@ -178,7 +185,7 @@ impl Canvas {
     }
 
     /// A horizontal divider joining a frame's sides.
-    pub fn divider(&mut self, x: usize, y: usize, width: usize, style: Style) {
+    pub(super) fn divider(&mut self, x: usize, y: usize, width: usize, style: Style) {
         if width >= 2 {
             let line = format!("├{}┤", "─".repeat(width - 2));
             self.text(x, y, &line, style, width);
@@ -187,7 +194,7 @@ impl Canvas {
 
     /// The rows as plain text, for tests.
     #[cfg(test)]
-    pub fn rows(&self) -> Vec<String> {
+    pub(super) fn rows(&self) -> Vec<String> {
         self.cells
             .chunks(self.width)
             .map(|row| {
@@ -203,7 +210,7 @@ impl Canvas {
     /// The whole screen as one ANSI frame. Characters a terminal may draw
     /// wider than one column (Nerd Font icons) are followed by an absolute
     /// column move, so one wide glyph never shifts the rest of its row.
-    pub fn render(&self) -> String {
+    pub(super) fn render(&self) -> String {
         let mut out = String::with_capacity(self.cells.len() * 2);
         for (row_index, row) in self.cells.chunks(self.width).enumerate() {
             let _ = write!(out, "\x1b[{};1H", row_index + 1);

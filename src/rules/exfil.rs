@@ -72,7 +72,7 @@ const TAKERS: &[&str] = &[
 
 /// Whether `line` hands a credential store to a taking command, or to a
 /// `curl` upload flag.
-pub fn takes_credential(line: &str) -> bool {
+pub(super) fn takes_credential(line: &str) -> bool {
     shell::statements(line).iter().any(|statement| {
         shell::pipeline(statement).iter().any(|part| {
             let Some(command) = shell::command(part) else {
@@ -292,7 +292,7 @@ fn clipboard_capture(line: &str) -> bool {
 
 /// Whether the line, lowercased and without what it only prints, takes or
 /// sends a secret in one of these shapes.
-pub fn sends_secret(line: &str) -> bool {
+pub(super) fn sends_secret(line: &str) -> bool {
     pipes_secret_to_sender(line)
         || sends_identity(line)
         || dns_exfiltration(line)
@@ -307,7 +307,7 @@ pub fn sends_secret(line: &str) -> bool {
 
 /// Words that treat a credential path as data, for the `is_credential`
 /// quick gate.
-pub fn mentions_credential(line: &str) -> bool {
+pub(super) fn mentions_credential(line: &str) -> bool {
     [
         ".gnupg",
         ".ssh",

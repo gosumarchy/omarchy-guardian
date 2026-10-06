@@ -7,7 +7,7 @@ use crate::sha256::{Digest, Sha256};
 
 /// From most to least trusted. The sweep hides the first two.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Tier {
+pub(crate) enum Tier {
     /// What a package from a configured repository installed, unchanged.
     Vendor,
     /// Does nothing: a link to `/dev/null` (a masked unit) or an empty file.
@@ -32,7 +32,7 @@ pub enum Tier {
 }
 
 impl Tier {
-    pub const ALL: [Self; 8] = [
+    const ALL: [Self; 8] = [
         Self::Vendor,
         Self::Inert,
         Self::Copied,
@@ -44,7 +44,7 @@ impl Tier {
     ];
 
     /// A stable machine name.
-    pub const fn name(self) -> &'static str {
+    pub(super) const fn name(self) -> &'static str {
         match self {
             Self::Vendor => "package",
             Self::Inert => "inert",
@@ -57,14 +57,14 @@ impl Tier {
         }
     }
 
-    pub fn from_name(name: &str) -> Option<Self> {
+    pub(super) fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|tier| tier.name() == name)
     }
 }
 
 /// What is on disk at a path.
 #[derive(Clone, Copy, Debug)]
-pub enum Observed<'a> {
+pub(super) enum Observed<'a> {
     File {
         sha256: &'a Digest,
         /// Permission bits including set-id bits.
@@ -102,7 +102,7 @@ const WORLD_READ: u32 = 0o004;
 /// program would be kept from the comparison. A configuration file
 /// (`backup=`) is left out: closing one that holds a password is the
 /// administrator's good sense.
-pub fn is_closed(path: &str, actual: u32, index: &PackageIndex) -> bool {
+pub(super) fn is_closed(path: &str, actual: u32, index: &PackageIndex) -> bool {
     index.owner(path).is_some_and(|owned| {
         !owned.backup
             && matches!(owned.recorded, Recorded::File { mode, .. }
@@ -111,7 +111,7 @@ pub fn is_closed(path: &str, actual: u32, index: &PackageIndex) -> bool {
 }
 
 /// The tier of `path` (relative to `/`).
-pub fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex) -> Tier {
+pub(super) fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex) -> Tier {
     // Guardian itself is installed with `pacman -U`, so it is foreign; the
     // files it ships, unchanged, are as trusted as the sweep that reads them.
     let packaged = |index: &PackageIndex, package: &str| {
@@ -219,7 +219,7 @@ fn is_guardians_session_file(path: &str, content: &[u8]) -> bool {
 
 /// The note for an item of tier `tier` at `path` that is the file
 /// `protect` wrote (no package owns it, and it is trusted all the same).
-pub fn session_note(path: &str, tier: Tier, index: &PackageIndex) -> Option<&'static str> {
+pub(super) fn session_note(path: &str, tier: Tier, index: &PackageIndex) -> Option<&'static str> {
     (tier == Tier::Vendor && path.ends_with(SESSION_FILE) && index.owner(path).is_none())
         .then_some(SESSION_NOTE)
 }
@@ -234,13 +234,17 @@ const INTERPRETER_NOTE: &str =
 /// The note for an item of tier `tier` at `path` whose first line alone was
 /// changed: an edited file that is not one of its package's configuration
 /// files.
-pub fn interpreter_note(path: &str, tier: Tier, index: &PackageIndex) -> Option<&'static str> {
+pub(super) fn interpreter_note(
+    path: &str,
+    tier: Tier,
+    index: &PackageIndex,
+) -> Option<&'static str> {
     (tier == Tier::Edited && index.owner(path).is_some_and(|owned| !owned.backup))
         .then_some(INTERPRETER_NOTE)
 }
 
 /// Whether `note` is the one `interpreter_note` gives.
-pub fn is_interpreter_note(note: &str) -> bool {
+pub(super) fn is_interpreter_note(note: &str) -> bool {
     note == INTERPRETER_NOTE
 }
 

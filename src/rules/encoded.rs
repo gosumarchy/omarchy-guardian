@@ -36,7 +36,7 @@ fn words(text: &str) -> Vec<String> {
 /// Whether `text` holds a command that decodes: `base64 -d`, `base32
 /// --decode`, `basenc -d`, `xxd -r` in any option order, `openssl enc -d`,
 /// `uudecode`.
-pub fn has_decoder(text: &str) -> bool {
+pub(super) fn has_decoder(text: &str) -> bool {
     if !["base", "xxd", "openssl", "uudecode"]
         .iter()
         .any(|name| text.contains(name))
@@ -242,7 +242,7 @@ const HIDING_CODECS: &[&str] = &[
 ];
 
 /// Whether `text` holds a call that decodes.
-pub fn has_decode_call(text: &str) -> bool {
+fn has_decode_call(text: &str) -> bool {
     DECODE_CALLS.iter().any(|call| text.contains(call))
         // `Buffer.from(x, 'base64')`: only with an encoding that hides.
         || (text.contains("buffer.from(")
@@ -269,7 +269,7 @@ const MAX_ARGUMENT: usize = 4096;
 
 /// What each run call on the line is given, with `function(` when what it
 /// is given opens the argument list (a declaration lists names there).
-pub fn run_arguments(line: &str) -> Vec<&str> {
+pub(super) fn run_arguments(line: &str) -> Vec<&str> {
     let mut found = Vec::new();
     for call in RUN_CALLS {
         // `vm.runInNewContext(` is a method: no word boundary before it.
@@ -322,13 +322,13 @@ fn encoded_powershell(line: &str) -> bool {
 }
 
 /// Whether the line, lowercased, decodes something and runs it.
-pub fn matches(line: &str) -> bool {
+pub(super) fn matches(line: &str) -> bool {
     shell_shape(line) || call_shape(line) || encoded_powershell(line)
 }
 
 /// The file a decoder on `line` writes: `base64 -d > x`, `… | base64 -d |
 /// tee x`, `openssl enc -d … -out x`.
-pub fn decoded_file(line: &str) -> Option<String> {
+pub(crate) fn decoded_file(line: &str) -> Option<String> {
     if !has_decoder(line) {
         return None;
     }
@@ -344,7 +344,7 @@ pub fn decoded_file(line: &str) -> Option<String> {
 /// A value assigned from a decode call, as the name it is assigned to:
 /// `code = base64.b64decode(…)`, `local s = string.char(…)`, `const src =
 /// atob(…)`.
-pub fn assigned_decode(line: &str) -> Option<&str> {
+pub(super) fn assigned_decode(line: &str) -> Option<&str> {
     let (name, value) = line.split_once('=')?;
     // `==`, `<=`, `!=` compare.
     if value.starts_with('=') || name.ends_with(['<', '>', '!', '=', '+', '-']) {
@@ -360,7 +360,7 @@ pub fn assigned_decode(line: &str) -> Option<&str> {
 }
 
 /// Whether a run call on `line` is given the variable `name`.
-pub fn runs_name(line: &str, name: &str) -> bool {
+pub(super) fn runs_name(line: &str, name: &str) -> bool {
     run_arguments(line).iter().any(|argument| {
         // The code is the first thing a run call is given.
         let first = argument.split(',').next().unwrap_or_default();

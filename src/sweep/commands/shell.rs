@@ -39,7 +39,7 @@ fn shebang_shell(line: &str) -> Option<&str> {
 /// `busybox`, and after a byte-order mark), or it has no such line and its
 /// name ends in one of theirs (`x.sh`). A script of another interpreter
 /// (Python, Perl, Node, fish) is not read as one.
-pub fn is_shell_script(path: &str, text: &str) -> bool {
+pub(crate) fn is_shell_script(path: &str, text: &str) -> bool {
     let first = text
         .trim_start_matches('\u{feff}')
         .lines()
@@ -119,7 +119,7 @@ const MAX_PATH_VARIABLES: usize = 32;
 
 /// The files a shell start-up file reads in (see `sourced`), with the
 /// variables it sets to a path written out (`$OMARCHY_PATH/default/x`).
-pub fn sourced_files(text: &str) -> Vec<String> {
+pub(crate) fn sourced_files(text: &str) -> Vec<String> {
     let variables = path_variables(text);
     text.lines()
         .map(str::trim)

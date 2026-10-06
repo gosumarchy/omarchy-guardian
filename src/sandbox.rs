@@ -18,12 +18,12 @@ const MAX_COPY_SIZE: u64 = 512 * 1024 * 1024;
 const TIMEOUT: &str = "120s";
 
 /// A private temporary directory removed on drop.
-pub struct Workspace {
+pub(crate) struct Workspace {
     path: PathBuf,
 }
 
 impl Workspace {
-    pub fn create(label: &str) -> Result<Self, Error> {
+    pub(crate) fn create(label: &str) -> Result<Self, Error> {
         // The counter keeps workspaces created at once by parallel reviews apart.
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nonce = SystemTime::now()
@@ -40,7 +40,7 @@ impl Workspace {
         Ok(Self { path })
     }
 
-    pub fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 }
@@ -54,7 +54,7 @@ impl Drop for Workspace {
 
 /// Copies the reviewed tree, proves the copy matches the reviewed snapshot,
 /// and runs `command` inside it.
-pub fn run(
+pub(crate) fn run(
     config: &ScanConfig,
     reviewed: &Snapshot,
     command: &[OsString],
@@ -167,23 +167,23 @@ const GUEST_HOME: &[&str] = &[
 /// sources. The recipe's own code runs in that makepkg, and a recipe can
 /// make it run more than it should, so it gets the system read-only, an
 /// empty home, and nothing to write to but the build's own directories.
-pub struct FetchJail<'a> {
+pub(crate) struct FetchJail<'a> {
     /// The user's home: empty inside, apart from what is bound below.
-    pub home: &'a Path,
+    pub(crate) home: &'a Path,
     /// makepkg's own configuration files under the home, read-only.
-    pub readable: &'a [PathBuf],
+    pub(crate) readable: &'a [PathBuf],
     /// The build, download and report directories.
-    pub writable: &'a [&'a Path],
+    pub(crate) writable: &'a [&'a Path],
     /// A copy of the public keyring, to verify source signatures with.
-    pub keyring: Option<&'a Path>,
+    pub(crate) keyring: Option<&'a Path>,
     /// Downloading needs the network; listing the sources does not.
-    pub network: bool,
-    pub environment: &'a [(&'a str, &'a OsStr)],
-    pub directory: &'a Path,
+    pub(crate) network: bool,
+    pub(crate) environment: &'a [(&'a str, &'a OsStr)],
+    pub(crate) directory: &'a Path,
 }
 
 /// The Bubblewrap arguments for `jail`, up to and including `--`.
-pub fn fetch_jail(jail: &FetchJail<'_>) -> Vec<OsString> {
+pub(crate) fn fetch_jail(jail: &FetchJail<'_>) -> Vec<OsString> {
     let mut arguments: Vec<OsString> = ISOLATION.iter().map(Into::into).collect();
     let mut push = |items: &[&OsStr]| arguments.extend(items.iter().map(Into::into));
     if jail.network {

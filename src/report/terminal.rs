@@ -11,7 +11,7 @@ use crate::text::shown;
 use super::{AgentOutcome, Blocked, Decision, Report, Severity, html, recommendation};
 
 impl Report {
-    pub fn print(&self, show_hashes: bool, decision: Decision) {
+    pub(crate) fn print(&self, show_hashes: bool, decision: Decision) {
         let painter = Painter::for_stdout();
         let width = layout::width();
 

@@ -25,10 +25,10 @@ const MAX_IDENTITY_BYTES: usize = 512;
 
 /// What a reviewed source is remembered as, such as `aur:yay-bin`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Identity(String);
+pub(crate) struct Identity(String);
 
 impl Identity {
-    pub fn parse(text: &str) -> Result<Self, String> {
+    pub(crate) fn parse(text: &str) -> Result<Self, String> {
         if text.is_empty() || text.len() > MAX_IDENTITY_BYTES || text.chars().any(char::is_control)
         {
             return Err(format!(
@@ -38,7 +38,7 @@ impl Identity {
         Ok(Self(text.to_string()))
     }
 
-    pub fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -46,15 +46,15 @@ impl Identity {
 /// The files under `prefix` (empty for the whole tree, else `dir/`) are
 /// the source `identity`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Unit {
-    pub prefix: String,
-    pub identity: Identity,
+pub(crate) struct Unit {
+    pub(crate) prefix: String,
+    pub(crate) identity: Identity,
 }
 
 /// What a review did not read (binaries, links, anything that is neither
 /// reviewed text nor a plain image: see `review::is_plain_image`), by path
 /// with its hex SHA-256. An entry without a digest is never recorded.
-pub type Unread = BTreeMap<String, String>;
+pub(crate) type Unread = BTreeMap<String, String>;
 
 /// The most paths `unread_changes` names, and the most characters of each.
 const MAX_NAMED_CHANGES: usize = 20;
@@ -64,7 +64,7 @@ const MAX_NAMED_CHARS: usize = 120;
 /// ones in the units it covers, as a fact for the AI review; `None` when
 /// they are the same. An entry without a digest always differs. Paths are
 /// quoted: they are the reviewed source's own.
-pub fn unread_changes(approved: &Approved, current: &Unread) -> Option<String> {
+pub(super) fn unread_changes(approved: &Approved, current: &Unread) -> Option<String> {
     let named = |path: &str, what: &str| {
         let shown: String = path.chars().take(MAX_NAMED_CHARS).collect();
         format!("{shown:?} ({what})")
@@ -102,16 +102,16 @@ pub fn unread_changes(approved: &Approved, current: &Unread) -> Option<String> {
 
 /// An approved version: the text that was reviewed, and what was beside it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Approved {
-    pub files: Previous,
-    pub unread: Unread,
+pub(crate) struct Approved {
+    pub(super) files: Previous,
+    unread: Unread,
     /// The prefixes of the units it covers; other units have no baseline.
-    pub prefixes: Vec<String>,
+    prefixes: Vec<String>,
 }
 
 impl Approved {
     /// Whether `path` belongs to a unit this approval covers.
-    pub fn covers(&self, path: &str) -> bool {
+    pub(super) fn covers(&self, path: &str) -> bool {
         self.prefixes
             .iter()
             .any(|prefix| path.starts_with(prefix.as_str()))
@@ -140,8 +140,8 @@ struct Manifest {
 /// A baseline rolls forward with every approved upgrade, so what the AI
 /// last saw whole falls further behind. After this many upgrades approved
 /// as diffs, or this many days, the next review is a full one.
-pub const MAX_DIFF_REVIEWS: u32 = 5;
-pub const MAX_DAYS_SINCE_FULL: u64 = 30;
+const MAX_DIFF_REVIEWS: u32 = 5;
+const MAX_DAYS_SINCE_FULL: u64 = 30;
 
 /// Why a baseline is no longer diffed against, or `None` while it is.
 fn due(manifest: &Manifest, now: u64) -> Option<String> {
@@ -168,7 +168,7 @@ fn due(manifest: &Manifest, now: u64) -> Option<String> {
 /// same ones `cache::key` hashes) and the wording of the prompts and of a
 /// request of `class`, as a hex SHA-256. A prompt changed without a new
 /// `PROMPT_VERSION` still retires the baselines approved under the old one.
-pub fn fingerprint(settings: &AgentSettings, class: SourceClass) -> String {
+fn fingerprint(settings: &AgentSettings, class: SourceClass) -> String {
     let text = format!(
         "omarchy-guardian-baseline-settings\0{}\0{}\0{}\0{}\0",
         settings.model.as_deref().unwrap_or_default(),
@@ -257,7 +257,7 @@ fn read_manifest(store: &Store, name: &str) -> Result<Option<Manifest>, Error> {
 /// a missing or corrupt blob is deleted. This one does not ask how old the
 /// baseline is; a review uses `load_fresh`.
 #[cfg(test)]
-pub fn load(
+pub(crate) fn load(
     store: &Store,
     class: SourceClass,
     units: &[Unit],
@@ -268,18 +268,18 @@ pub fn load(
 
 /// What `load_fresh` found.
 #[derive(Debug, Default)]
-pub struct Loaded {
-    pub approved: Option<Approved>,
+pub(super) struct Loaded {
+    pub(super) approved: Option<Approved>,
     /// Why a unit's baseline was retired as due for a full review, as a
     /// line for the report.
-    pub due: Vec<String>,
+    pub(super) due: Vec<String>,
 }
 
 /// `load` for a review at time `now`: a baseline that is due for a full
 /// review (see `MAX_DIFF_REVIEWS`, `MAX_DAYS_SINCE_FULL`) is deleted like
 /// any other that no longer counts, so that review is a full one and the
 /// baseline it records starts again.
-pub fn load_fresh(
+pub(super) fn load_fresh(
     store: &Store,
     class: SourceClass,
     units: &[Unit],
@@ -377,7 +377,7 @@ fn load_unit(
 /// Deletes the baselines of `units`: the engine does so when a review that
 /// had one is done in full instead, so what that review approves starts
 /// again from a full review.
-pub fn retire(store: &Store, class: SourceClass, units: &[Unit]) -> Result<(), Error> {
+pub(super) fn retire(store: &Store, class: SourceClass, units: &[Unit]) -> Result<(), Error> {
     for unit in units {
         store.remove(BASELINES, &manifest_name(class, &unit.identity))?;
     }
@@ -398,7 +398,7 @@ pub fn retire(store: &Store, class: SourceClass, units: &[Unit]) -> Result<(), E
 /// differ, that was one more upgrade approved as a diff since the last
 /// full review, and when they are the same, nothing new was approved.
 /// Without one, this review was a full one.
-pub fn record(
+pub(crate) fn record(
     store: &Store,
     class: SourceClass,
     units: &[Unit],
@@ -467,7 +467,7 @@ pub fn record(
 }
 
 /// Deletes every class's baseline for `identity`; returns how many existed.
-pub fn forget(store: &Store, identity: &Identity) -> Result<usize, Error> {
+pub(crate) fn forget(store: &Store, identity: &Identity) -> Result<usize, Error> {
     let mut removed = 0;
     for &class in SourceClass::ALL {
         let name = manifest_name(class, identity);
@@ -481,7 +481,7 @@ pub fn forget(store: &Store, identity: &Identity) -> Result<usize, Error> {
 
 /// Deletes every baseline, blob and cached verdict; returns how many
 /// baselines existed.
-pub fn forget_all(store: &Store) -> Result<usize, Error> {
+pub(crate) fn forget_all(store: &Store) -> Result<usize, Error> {
     let baselines = store.list(BASELINES)?.len();
     for dir in [BASELINES, VERDICTS, BLOBS] {
         for name in store.list(dir)? {
@@ -494,7 +494,7 @@ pub fn forget_all(store: &Store) -> Result<usize, Error> {
 /// Deletes stale leftover temp files, blobs no baseline references, then the
 /// oldest baselines until the store fits in `max_bytes`. Unreadable
 /// baselines are deleted.
-pub fn collect_garbage(store: &Store, max_bytes: u64, now: u64) -> Result<(), Error> {
+pub(super) fn collect_garbage(store: &Store, max_bytes: u64, now: u64) -> Result<(), Error> {
     store.sweep_stale_temp_files(now)?;
     let mut manifests: Vec<(u64, String, Vec<String>)> = Vec::new();
     for name in store.list(BASELINES)? {

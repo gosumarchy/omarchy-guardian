@@ -45,7 +45,7 @@ exec "$5" "$6""#;
 
 /// What of the blocked source had run when the gate stopped it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Ran {
+pub(crate) enum Ran {
     /// Nothing: the block came before any of it ran.
     Nothing,
     /// makepkg had run the reviewed recipe to fetch and unpack the sources.
@@ -58,7 +58,7 @@ pub enum Ran {
 }
 
 /// Why a gate blocked, in a few words for the notification.
-pub const fn reason(blocked: Blocked) -> &'static str {
+pub(crate) const fn reason(blocked: Blocked) -> &'static str {
     match blocked {
         Blocked::Findings => "the review found a risk",
         Blocked::Incomplete => "the review could not be completed",
@@ -70,13 +70,13 @@ pub const fn reason(blocked: Blocked) -> &'static str {
 /// Shows "Guardian blocked `what`" with `detail`, best effort: nothing
 /// happens without `notify-send` or a session bus, and a failure is ignored,
 /// because the terminal already carries the full report.
-pub fn blocked(what: &str, detail: &str, ran: Ran) {
+pub(crate) fn blocked(what: &str, detail: &str, ran: Ran) {
     alert(&format!("Guardian blocked {what}"), detail, ran);
 }
 
 /// Shows "Guardian found `what`" for what the scheduled system sweep found,
 /// with the same saved report and click-to-open as a block.
-pub fn found(what: &str, detail: &str) {
+pub(crate) fn found(what: &str, detail: &str) {
     alert(
         &format!("Guardian found {what}"),
         detail,
@@ -87,7 +87,7 @@ pub fn found(what: &str, detail: &str) {
 /// Shows "Guardian protection changed" with `detail`: a gate that was on
 /// is not, or a setting became weaker. Only a pop-up: there is no review
 /// to save a report of.
-pub fn changed(detail: &str) {
+pub(crate) fn changed(detail: &str) {
     popup(
         "Guardian protection changed",
         &format!(
@@ -99,7 +99,7 @@ pub fn changed(detail: &str) {
 
 /// Shows "Guardian `version` is available" with how to upgrade (`how`).
 /// Only a pop-up, like `changed`.
-pub fn update(version: &str, how: &str) {
+pub(crate) fn update(version: &str, how: &str) {
     // The calm knight: a release is no alarm.
     let icon = if Path::new(ICON).is_file() {
         ICON
@@ -243,7 +243,7 @@ fn pango(text: &str) -> String {
 /// Saves what this run printed as a report page and opens it in the
 /// browser (not under the test harnesses); returns the page and its id for
 /// `omarchy-guardian ask`. Nothing is saved as root.
-pub fn save_and_open(title: &str, detail: &str, ran: Ran) -> Option<(PathBuf, String)> {
+pub(crate) fn save_and_open(title: &str, detail: &str, ran: Ran) -> Option<(PathBuf, String)> {
     let uid = user::effective_uid().ok()?;
     let path = save_report(title, detail, ran, uid)?;
     let id = path.file_stem()?.to_str()?.to_string();
@@ -306,7 +306,7 @@ fn write_private(path: &Path, text: &str) -> Option<()> {
 }
 
 /// The reports directory: `$XDG_CACHE_HOME/omarchy-guardian/reports`.
-pub fn reports_dir() -> Option<PathBuf> {
+pub(crate) fn reports_dir() -> Option<PathBuf> {
     let base = paths::cache_home(Accept::Absolute, Accept::Any)?;
     Some(base.join("omarchy-guardian/reports"))
 }
@@ -314,7 +314,7 @@ pub fn reports_dir() -> Option<PathBuf> {
 /// The time and process of a report id, `<seconds>-<pid>` in digits only:
 /// the one shape Guardian saves. Anything else under that name is not a
 /// report.
-pub fn report_id(id: &str) -> Option<(u64, u64)> {
+pub(crate) fn report_id(id: &str) -> Option<(u64, u64)> {
     let (seconds, pid) = id.split_once('-')?;
     let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
     if !digits(seconds) || !digits(pid) {

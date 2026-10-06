@@ -13,24 +13,24 @@
 //!   review; `output` shows it.
 //! - `root` is the read-only root collector behind `sweep --root`.
 
-pub mod access;
-pub mod boot;
-pub mod collect;
-pub mod commands;
-pub mod config;
-pub mod index;
-pub mod judge;
-pub mod live;
-pub mod lua;
-pub mod output;
-pub mod own;
-pub mod path;
-pub mod programs;
-pub mod read;
-pub mod root;
-pub mod state;
-pub mod tier;
-pub mod tools;
+mod access;
+mod boot;
+pub(crate) mod collect;
+mod commands;
+mod config;
+mod index;
+mod judge;
+mod live;
+mod lua;
+mod output;
+pub(crate) mod own;
+mod path;
+mod programs;
+pub(crate) mod read;
+pub(crate) mod root;
+pub(crate) mod state;
+pub(crate) mod tier;
+mod tools;
 
 use std::env;
 use std::path::Path;
@@ -51,7 +51,7 @@ use state::{Change, LastRun, Outcome, Remembered};
 
 /// How a sweep is shown.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum View {
+pub(crate) enum View {
     /// What isn't trusted, then the report.
     #[default]
     List,
@@ -64,19 +64,19 @@ pub enum View {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Options {
-    pub view: View,
+pub(crate) struct Options {
+    pub(crate) view: View,
     /// Also run the root collector now (asks for the sudo password).
-    pub root: bool,
+    pub(crate) root: bool,
     /// Run by the timer: show what changed and notify about it.
-    pub scheduled: bool,
+    pub(crate) scheduled: bool,
     /// Also save the report as a page, open it, and say how to ask an AI
     /// agent about it.
-    pub report: bool,
+    pub(crate) report: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Command {
+pub(crate) enum Command {
     Run(Options),
     /// Trust one item as it is now (its label, as the sweep shows it).
     Allow(String),
@@ -101,7 +101,7 @@ fn not_as_root(command: &Command) -> &'static str {
     }
 }
 
-pub fn command(command: &Command, settings: &Settings) -> ExitCode {
+pub(crate) fn command(command: &Command, settings: &Settings) -> ExitCode {
     if user::effective_uid().is_ok_and(|uid| uid == 0) {
         errln!("omarchy-guardian sweep: {}", not_as_root(command));
         return ExitCode::from(2);
@@ -453,7 +453,7 @@ fn add_root_part(
 
 /// Whether a new item of this kind is a finding in itself: an account, a
 /// member of an administrator group, an SSH key, a certificate authority.
-pub fn is_trust(item: &collect::Item) -> bool {
+fn is_trust(item: &collect::Item) -> bool {
     use crate::autorun::Category;
     item.category == Category::Account
         || (item.category == Category::Trust && item.path != "etc/hosts")

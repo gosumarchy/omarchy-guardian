@@ -4,13 +4,13 @@
 //! Knob enums declare their variants loosest first, so the derived `Ord` is
 //! the strictness order the tighten-only rule relies on.
 
-pub const DEFAULT_MAX_INPUT_KIB: u32 = 256;
-pub const DEFAULT_MAX_CHUNKS: u32 = 8;
-pub const DEFAULT_CACHE_DAYS: u32 = 30;
-pub const DEFAULT_MAX_STORE_MIB: u32 = 256;
+pub(crate) const DEFAULT_MAX_INPUT_KIB: u32 = 256;
+pub(crate) const DEFAULT_MAX_CHUNKS: u32 = 8;
+pub(super) const DEFAULT_CACHE_DAYS: u32 = 30;
+pub(super) const DEFAULT_MAX_STORE_MIB: u32 = 256;
 
 /// An enum spelled in the config file by a fixed lowercase name.
-pub trait Named: Copy + 'static {
+pub(crate) trait Named: Copy + 'static {
     const ALL: &'static [Self];
 
     fn name(self) -> &'static str;
@@ -23,7 +23,7 @@ pub trait Named: Copy + 'static {
 /// Whether the system sweep may run its read-only root collector (asked by
 /// `protect`; system file only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RootConsent {
+pub(crate) enum RootConsent {
     Allowed,
     Declined,
 }
@@ -40,7 +40,7 @@ impl Named for RootConsent {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum SourceClass {
+pub(crate) enum SourceClass {
     Official,
     ThirdPartyRepo,
     LocalPackage,
@@ -55,7 +55,7 @@ pub enum SourceClass {
 
 impl SourceClass {
     /// Enforced by the root pacman hook; user settings may only tighten these.
-    pub const fn is_privileged(self) -> bool {
+    pub(crate) const fn is_privileged(self) -> bool {
         match self {
             Self::Official | Self::ThirdPartyRepo | Self::LocalPackage => true,
             Self::Aur | Self::Theme | Self::Plugin | Self::Source | Self::System => false,
@@ -90,7 +90,7 @@ impl Named for SourceClass {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Profile {
+pub(crate) enum Profile {
     Standard,
     Strict,
     LocalOnly,
@@ -98,7 +98,7 @@ pub enum Profile {
 
 impl Profile {
     /// One line for the setup wizard and `config show`.
-    pub const fn summary(self) -> &'static str {
+    pub(crate) const fn summary(self) -> &'static str {
         match self {
             Self::Standard => {
                 "AI review for community sources; official updates never blocked by an unavailable AI"
@@ -124,7 +124,7 @@ impl Named for Profile {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum AiRequirement {
+pub(crate) enum AiRequirement {
     Off,
     Optional,
     Required,
@@ -143,7 +143,7 @@ impl Named for AiRequirement {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Action {
+pub(crate) enum Action {
     Warn,
     Block,
 }
@@ -160,7 +160,7 @@ impl Named for Action {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Thinking {
+pub(crate) enum Thinking {
     Default,
     Minimal,
     Low,
@@ -194,7 +194,7 @@ impl Named for Thinking {
 /// Whether a review-memory feature is used. `On` is the looser value: it lets
 /// an earlier review stand in for part of this one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Toggle {
+pub(crate) enum Toggle {
     On,
     Off,
 }
@@ -212,26 +212,26 @@ impl Named for Toggle {
 
 /// Everything that decides how one source class is reviewed and judged.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Policy {
-    pub ai: AiRequirement,
+pub(crate) struct Policy {
+    pub(crate) ai: AiRequirement,
     /// Local-rule and OSV findings.
-    pub on_findings: Action,
+    pub(crate) on_findings: Action,
     /// An AI `suspicious` verdict or any AI finding.
-    pub on_ai_suspicious: Action,
-    pub thinking: Thinking,
-    pub model: Option<String>,
+    pub(crate) on_ai_suspicious: Action,
+    pub(crate) thinking: Thinking,
+    pub(super) model: Option<String>,
     /// `None` derives the timeout from `thinking`.
-    pub timeout_secs: Option<u32>,
+    pub(super) timeout_secs: Option<u32>,
     /// With `ai = off`: ask the user before running anything.
-    pub confirm: bool,
+    pub(crate) confirm: bool,
     /// Reuse cached AI verdicts for identical requests. User-level only.
-    pub cache: Toggle,
+    pub(crate) cache: Toggle,
     /// Review upgrades of an approved source as diffs. User-level only.
-    pub diff: Toggle,
+    pub(crate) diff: Toggle,
 }
 
 impl Policy {
-    pub fn timeout_secs(&self) -> u32 {
+    pub(crate) fn timeout_secs(&self) -> u32 {
         self.timeout_secs.unwrap_or(match self.thinking {
             Thinking::High => 180,
             Thinking::Max => 300,
@@ -242,15 +242,15 @@ impl Policy {
 
 /// How one OpenCode review is run.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentSettings {
-    pub model: Option<String>,
-    pub thinking: Thinking,
+pub(crate) struct AgentSettings {
+    pub(crate) model: Option<String>,
+    pub(crate) thinking: Thinking,
     /// The `--variant` value, or `None` for the provider default.
-    pub variant: Option<String>,
-    pub timeout_secs: u32,
-    pub max_input_bytes: usize,
+    pub(crate) variant: Option<String>,
+    pub(crate) timeout_secs: u32,
+    pub(crate) max_input_bytes: usize,
     /// AI calls one review may make; a source needing more is incomplete.
-    pub max_chunks: usize,
+    pub(crate) max_chunks: usize,
 }
 
 impl Default for AgentSettings {
@@ -269,7 +269,7 @@ impl Default for AgentSettings {
 impl AgentSettings {
     /// `model · thinking`, shown next to every AI verdict. A level without a
     /// variant is marked, because OpenCode never received it.
-    pub fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         let model = self.model.as_deref().unwrap_or("default model");
         // The Claude Code CLI takes the level itself (`--effort`); OpenCode
         // only through a mapped provider variant.
@@ -285,14 +285,14 @@ impl AgentSettings {
 
 /// Limits of the user-level review memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StoreSettings {
+pub(crate) struct StoreSettings {
     /// How long a cached verdict stays valid; 0 turns the cache off.
-    pub cache_days: u32,
-    pub max_store_mib: u32,
+    pub(crate) cache_days: u32,
+    pub(crate) max_store_mib: u32,
 }
 
 /// The built-in value of every knob for one profile and class (spec §5).
-pub fn builtin(profile: Profile, class: SourceClass) -> Policy {
+pub(crate) fn builtin(profile: Profile, class: SourceClass) -> Policy {
     use Action::{Block, Warn};
     use AiRequirement::{Off, Optional, Required};
 

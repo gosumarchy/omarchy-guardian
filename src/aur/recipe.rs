@@ -509,7 +509,7 @@ enum Mode {
 
 /// How a recipe arrives at what makepkg fetches.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Sources {
+pub(crate) enum Sources {
     /// Written out: each watched array once, in plain words. The arrays as
     /// written, by name, which a listing must give back exactly.
     Written(Vec<(String, Vec<String>)>),
@@ -1827,7 +1827,7 @@ fn commands(recipe: &str) -> Result<(Vec<Item>, Vec<usize>), String> {
 }
 
 /// Classifies how `recipe` arrives at its sources (see `Sources`).
-pub fn sources(recipe: &str) -> Sources {
+pub(crate) fn sources(recipe: &str) -> Sources {
     let (items, unsure) = match commands(recipe) {
         Ok(read) => read,
         Err(why) => return Sources::NotFollowed(vec![why]),
@@ -1882,7 +1882,7 @@ pub fn sources(recipe: &str) -> Sources {
 /// The variables a recipe sets to plain text at its top level, longest name
 /// first, for reading its functions' commands as they will run
 /// (`./$_binary`).
-pub fn written_variables(recipe: &str) -> Vec<(String, String)> {
+pub(crate) fn written_variables(recipe: &str) -> Vec<(String, String)> {
     let Ok((items, _)) = commands(recipe) else {
         return Vec::new();
     };
@@ -1914,12 +1914,12 @@ fn names_bare(text: &str, name: &str) -> bool {
 }
 
 /// The names `top_level_naming` looks for.
-pub struct Naming<'a> {
+pub(super) struct Naming<'a> {
     /// Variables that may not be assigned.
-    pub set: &'a [&'a str],
+    pub(super) set: &'a [&'a str],
     /// Variables that may not be given by name to one of `assigners`.
-    pub given: &'a [&'a str],
-    pub assigners: &'a [&'a str],
+    pub(super) given: &'a [&'a str],
+    pub(super) assigners: &'a [&'a str],
 }
 
 /// The lines outside any function where `items` name what `names` holds.
@@ -1983,7 +1983,7 @@ fn naming_lines(items: &[Item], names: &Naming<'_>, found: &mut Vec<usize>) {
 /// variables in `names` or give one to a command that assigns, however the
 /// name is quoted (`declare BUILD''DIR=x`, `printf -v "SRCDEST"`). `None`
 /// where the recipe is not read as commands.
-pub fn top_level_naming(recipe: &str, names: &Naming<'_>) -> Option<Vec<usize>> {
+pub(super) fn top_level_naming(recipe: &str, names: &Naming<'_>) -> Option<Vec<usize>> {
     let (items, _) = commands(recipe).ok()?;
     let mut found = Vec::new();
     naming_lines(&items, names, &mut found);

@@ -9,7 +9,8 @@
 
 mod statement;
 
-pub use statement::{assignments, opaque, unsafe_entries};
+use statement::assignments;
+pub(super) use statement::{opaque, unsafe_entries};
 
 use std::env;
 use std::ffi::OsString;
@@ -132,13 +133,13 @@ const MAX_PATH_BYTES: usize = 64 * 1024;
 
 /// Where command names are looked up.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct Search {
+pub(super) struct Search {
     /// Every directory, relative to the root, those ahead of `/usr/bin`
     /// first: the order a shell would try them in.
-    pub directories: Vec<String>,
+    pub(super) directories: Vec<String>,
     /// The directories ahead of `/usr/bin` that someone other than root
     /// can write.
-    pub shadowing: Vec<String>,
+    shadowing: Vec<String>,
 }
 
 /// One entry of a `PATH`: the directory, and whether it comes before the
@@ -323,7 +324,7 @@ fn mise_directories(scope: &Scope<'_>, home: &str) -> Vec<Entry> {
 /// Where command names are looked up on `scope`'s system: the real
 /// `PATH`s when the system swept is the running one, the ones its start-up
 /// files set, and the usual directories.
-pub fn search(scope: &Scope<'_>) -> Search {
+pub(super) fn search(scope: &Scope<'_>) -> Search {
     let home = scope.home.unwrap_or("root");
     let mut sources: Vec<Vec<Entry>> = Vec::new();
     // The running system's own: a fixture has no environment.
@@ -448,7 +449,7 @@ fn listing(scope: &Scope<'_>, directory: &str) -> Listing {
 /// The programs in the directories of `search` that someone other than
 /// root can write and that take a system command's name, as paths; and
 /// what could not be listed, or not in full, as sentences.
-pub fn shadowing_programs(scope: &Scope<'_>, search: &Search) -> (Vec<String>, Vec<String>) {
+pub(super) fn shadowing_programs(scope: &Scope<'_>, search: &Search) -> (Vec<String>, Vec<String>) {
     let mut paths = Vec::new();
     let mut unchecked = Vec::new();
     for directory in &search.shadowing {
@@ -526,7 +527,7 @@ fn mise_shim(scope: &Scope<'_>, item: &Item) -> Option<Tier> {
 /// installs is an alert, unless a version manager put it there under a name
 /// version managers do take. A mise shim is as trusted as the mise it
 /// links to.
-pub fn mark(scope: &Scope<'_>, search: &Search, items: &mut [Item]) {
+pub(super) fn mark(scope: &Scope<'_>, search: &Search, items: &mut [Item]) {
     for item in items
         .iter_mut()
         .filter(|item| item.category == Category::LocalBin && item.run_by.is_none())

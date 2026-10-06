@@ -29,14 +29,13 @@ use crate::tui;
 mod gate;
 mod parse;
 
-pub use gate::{Confirm, TtyConfirm};
-pub(crate) use gate::{Target, Verdict, passed, review_and_decide};
+pub(crate) use gate::{Confirm, Target, TtyConfirm, Verdict, passed, review_and_decide};
 use gate::{exec_command, guard_command, sandbox_command};
 use parse::{ConfigCommand, Forget, Invocation, StatusMode, USAGE, parse};
 
 const USAGE_ERROR: u8 = 2;
 
-pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
+pub(crate) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
     let args: Vec<OsString> = args.collect();
     let invocation = match parse(&args) {
         Ok(invocation) => invocation,

@@ -57,20 +57,20 @@ const NOT_LISTED: &str = "more keys than are listed one by one";
 
 /// One line of `/etc/passwd`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Account {
-    pub name: String,
+pub(super) struct Account {
+    pub(super) name: String,
     /// The password field: `x` (kept in `/etc/shadow`), empty (none
     /// needed), `!`/`*` (locked) or a hash.
     password: String,
-    pub uid: u32,
+    pub(super) uid: u32,
     gid: u32,
     /// Relative to the root.
-    pub home: String,
+    pub(super) home: String,
     shell: String,
 }
 
 /// The accounts of a `passwd` text; a line that does not parse is left out.
-pub fn accounts(passwd: &str) -> Vec<Account> {
+pub(super) fn accounts(passwd: &str) -> Vec<Account> {
     passwd
         .lines()
         .filter_map(|line| {
@@ -243,7 +243,7 @@ fn to_base64(bytes: &[u8]) -> String {
 /// comment, and the names of its options (a `command=` and its value are
 /// what the key runs; the value stays in the file).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Key {
+struct Key {
     kind: String,
     /// The digest in hex, for a name that is a plain path component.
     hex: String,
@@ -291,7 +291,7 @@ fn is_key_type(word: &str) -> bool {
 
 /// The keys of an `authorized_keys` text. A line that is not a key is
 /// counted, not guessed at.
-pub fn keys(text: &str) -> (Vec<Key>, usize) {
+fn keys(text: &str) -> (Vec<Key>, usize) {
     let mut found = Vec::new();
     let mut odd = 0;
     for line in text.lines() {
@@ -454,7 +454,7 @@ fn past_link(
 
 /// How the key files of an account are looked at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Detail {
+pub(super) enum Detail {
     /// One item for each key: the account is the reader's own, or root.
     Keys,
     /// One item for the account: how many keys, and a hash of the list, so
@@ -635,7 +635,7 @@ fn bounded(mut items: Vec<Item>) -> (Vec<Item>, Option<String>) {
 
 /// What `scope` sees of accounts, groups and its own home's keys; and,
 /// where there were more than are listed, a sentence that says so.
-pub fn items(scope: &Scope<'_>) -> (Vec<Item>, Option<String>) {
+pub(super) fn items(scope: &Scope<'_>) -> (Vec<Item>, Option<String>) {
     let read = |path: &str| fs::read_to_string(scope.root.join(path)).unwrap_or_default();
     let passwd = accounts(&read("etc/passwd"));
     // Only root reads `/etc/shadow`, by its fixed path and never following
@@ -718,7 +718,7 @@ pub fn items(scope: &Scope<'_>) -> (Vec<Item>, Option<String>) {
 /// any other, how many and a hash of the list. Where somebody else may
 /// write a directory on the way, the file is whatever they put there, and
 /// it is read as the account could read it.
-pub fn keys_of(scope: &Scope<'_>, account: &Account, detail: Detail) -> Vec<Item> {
+pub(super) fn keys_of(scope: &Scope<'_>, account: &Account, detail: Detail) -> Vec<Item> {
     let files = key_files(&sshd_configuration(scope), account);
     let home = format!("{}/", account.home);
     // A link is the account's to make: what it leads to is read only as

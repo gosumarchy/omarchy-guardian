@@ -13,9 +13,9 @@ use crate::config::model::{
 use crate::config::resolve::{Layers, Resolved, resolve};
 use crate::paths::{self, Accept};
 
-pub const SYSTEM_PATH: &str = "/etc/omarchy-guardian/config.toml";
+pub(crate) const SYSTEM_PATH: &str = "/etc/omarchy-guardian/config.toml";
 
-pub const DEFAULT_OFFICIAL_REPOS: [&str; 7] = [
+const DEFAULT_OFFICIAL_REPOS: [&str; 7] = [
     "core",
     "extra",
     "multilib",
@@ -26,14 +26,14 @@ pub const DEFAULT_OFFICIAL_REPOS: [&str; 7] = [
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FileStatus {
+pub(crate) enum FileStatus {
     Missing,
     Loaded,
     Invalid(String),
 }
 
 #[derive(Clone, Debug)]
-pub struct Settings {
+pub(crate) struct Settings {
     system_path: PathBuf,
     user_path: Option<PathBuf>,
     system: PartialConfig,
@@ -47,14 +47,14 @@ pub struct Settings {
 }
 
 /// `$XDG_CONFIG_HOME/omarchy-guardian/config.toml`, else `~/.config/...`.
-pub fn user_config_path() -> Option<PathBuf> {
+pub(crate) fn user_config_path() -> Option<PathBuf> {
     let base = paths::config_home(Accept::Absolute, Accept::Absolute)?;
     Some(base.join("omarchy-guardian").join("config.toml"))
 }
 
 /// The system file and its directory must be root-owned regular entries
 /// that only root can write.
-pub fn check_root_owned(path: &Path) -> Result<(), String> {
+fn check_root_owned(path: &Path) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
     if !metadata.file_type().is_file() {
         return Err("not a regular file".into());
@@ -111,7 +111,7 @@ fn read(path: &Path, secure: Option<&Verify<'_>>) -> Read {
 }
 
 impl Settings {
-    pub fn load() -> Self {
+    pub(crate) fn load() -> Self {
         Self::load_from(
             Path::new(SYSTEM_PATH),
             user_config_path().as_deref(),
@@ -121,11 +121,11 @@ impl Settings {
 
     /// The root-owned system file alone, for Guardian's root halves: the
     /// user's file is not read.
-    pub fn system_only() -> Self {
+    pub(crate) fn system_only() -> Self {
         Self::load_from(Path::new(SYSTEM_PATH), None, &check_root_owned)
     }
 
-    pub fn load_from(
+    pub(super) fn load_from(
         system_path: &Path,
         user_path: Option<&Path>,
         secure: &dyn Fn(&Path) -> Result<(), String>,
@@ -199,7 +199,7 @@ impl Settings {
         settings
     }
 
-    pub fn from_parts(system: PartialConfig, user: PartialConfig) -> Self {
+    pub(crate) fn from_parts(system: PartialConfig, user: PartialConfig) -> Self {
         Self {
             system_path: PathBuf::from(SYSTEM_PATH),
             user_path: None,
@@ -215,12 +215,12 @@ impl Settings {
     }
 
     /// A one-run profile for user-level classes (`--profile`).
-    pub fn with_profile(mut self, profile: Profile) -> Self {
+    pub(crate) fn with_profile(mut self, profile: Profile) -> Self {
         self.profile_override = Some(profile);
         self
     }
 
-    pub fn system_profile(&self) -> Profile {
+    pub(crate) fn system_profile(&self) -> Profile {
         self.system.profile.unwrap_or(Profile::Standard)
     }
 
@@ -229,7 +229,7 @@ impl Settings {
     }
 
     /// The profile whose built-ins a class starts from.
-    pub fn profile_for(&self, class: SourceClass) -> Profile {
+    pub(crate) fn profile_for(&self, class: SourceClass) -> Profile {
         if class.is_privileged() {
             self.system_profile()
         } else {
@@ -237,7 +237,7 @@ impl Settings {
         }
     }
 
-    pub fn resolve(&self, class: SourceClass) -> Resolved {
+    pub(crate) fn resolve(&self, class: SourceClass) -> Resolved {
         let system = self.system.class(class);
         let user = self.user.class(class);
         resolve(
@@ -251,7 +251,7 @@ impl Settings {
         )
     }
 
-    pub fn policy(&self, class: SourceClass) -> Policy {
+    pub(crate) fn policy(&self, class: SourceClass) -> Policy {
         self.resolve(class).policy
     }
 
@@ -265,7 +265,7 @@ impl Settings {
         }
     }
 
-    pub fn agent_settings(&self, class: SourceClass) -> AgentSettings {
+    pub(crate) fn agent_settings(&self, class: SourceClass) -> AgentSettings {
         let policy = self.policy(class);
         let layers = self.agent_layers(class);
 
@@ -305,7 +305,7 @@ impl Settings {
 
     /// Review-memory limits. The memory only serves user-level classes, so
     /// the user file's values come first.
-    pub fn store_settings(&self) -> StoreSettings {
+    pub(crate) fn store_settings(&self) -> StoreSettings {
         let layers = [&self.user.agent, &self.system.agent];
         StoreSettings {
             cache_days: layers
@@ -322,20 +322,20 @@ impl Settings {
     /// Whether the system sweep may run its root collector, and the group
     /// that may read what the scheduled one found; only the root-owned
     /// system file says.
-    pub fn sweep_root(&self) -> (Option<crate::config::model::RootConsent>, Option<String>) {
+    pub(crate) fn sweep_root(&self) -> (Option<crate::config::model::RootConsent>, Option<String>) {
         (self.system.sweep.root, self.system.sweep.group.clone())
     }
 
     /// Reviewer packages trusted from outside the official repositories;
     /// only the root-owned system file can name them.
-    pub fn trusted_reviewer_packages(&self) -> Vec<String> {
+    pub(crate) fn trusted_reviewer_packages(&self) -> Vec<String> {
         self.system
             .trusted_reviewer_packages
             .clone()
             .unwrap_or_default()
     }
 
-    pub fn official_repos(&self) -> Vec<String> {
+    pub(crate) fn official_repos(&self) -> Vec<String> {
         self.system.official_repos.clone().unwrap_or_else(|| {
             DEFAULT_OFFICIAL_REPOS
                 .iter()
@@ -344,18 +344,18 @@ impl Settings {
         })
     }
 
-    pub fn privileged_block(&self) -> Option<&str> {
+    pub(crate) fn privileged_block(&self) -> Option<&str> {
         self.privileged_block.as_deref()
     }
 
     /// Why no user-level review can run: the user file is there and does
     /// not parse.
-    pub fn user_block(&self) -> Option<&str> {
+    pub(crate) fn user_block(&self) -> Option<&str> {
         self.user_block.as_deref()
     }
 
     /// The weaker settings accepted in the root-owned system file.
-    pub fn acknowledged_weaker(&self) -> &[String] {
+    pub(crate) fn acknowledged_weaker(&self) -> &[String] {
         self.system
             .acknowledged_weaker
             .as_deref()
@@ -364,43 +364,43 @@ impl Settings {
 
     /// Whether a blocked install can be permitted under the strict level:
     /// only when the root-owned system file says so.
-    pub fn permits_under_strict(&self) -> bool {
+    pub(crate) fn permits_under_strict(&self) -> bool {
         self.system.permit_strict == Some(true)
     }
 
     /// Whether Guardian asks, once a day, for a newer release of itself:
     /// unless either file turns it off.
-    pub fn checks_for_updates(&self) -> bool {
+    pub(crate) fn checks_for_updates(&self) -> bool {
         self.system.update_check != Some(false) && self.user.update_check != Some(false)
     }
 
-    pub fn warnings(&self) -> &[String] {
+    pub(crate) fn warnings(&self) -> &[String] {
         &self.warnings
     }
 
-    pub fn system_status(&self) -> &FileStatus {
+    pub(crate) fn system_status(&self) -> &FileStatus {
         &self.system_status
     }
 
-    pub fn user_status(&self) -> &FileStatus {
+    pub(crate) fn user_status(&self) -> &FileStatus {
         &self.user_status
     }
 
     /// The values set in the system file, as parsed.
-    pub fn system_config(&self) -> &PartialConfig {
+    pub(crate) fn system_config(&self) -> &PartialConfig {
         &self.system
     }
 
     /// The values set in the user file, as parsed.
-    pub fn user_config(&self) -> &PartialConfig {
+    pub(crate) fn user_config(&self) -> &PartialConfig {
         &self.user
     }
 
-    pub fn system_path(&self) -> &Path {
+    pub(crate) fn system_path(&self) -> &Path {
         &self.system_path
     }
 
-    pub fn user_path(&self) -> Option<&Path> {
+    pub(crate) fn user_path(&self) -> Option<&Path> {
         self.user_path.as_deref()
     }
 }

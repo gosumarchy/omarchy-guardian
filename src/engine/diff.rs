@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use std::iter;
 
 /// Either input above this size is sent whole instead of diffed.
-pub const MAX_DIFF_INPUT: usize = 1024 * 1024;
+const MAX_DIFF_INPUT: usize = 1024 * 1024;
 
 /// The table has `old × new` cells for the trimmed middle; above this the
 /// file is sent whole.
@@ -23,7 +23,7 @@ enum Op {
 /// A unified diff from `old` to `new` with `context` unchanged lines around
 /// each change, or `None` when the inputs are too large to diff. Identical
 /// inputs give an empty string.
-pub fn unified(old: &str, new: &str, context: usize) -> Option<String> {
+pub(super) fn unified(old: &str, new: &str, context: usize) -> Option<String> {
     if old.len() > MAX_DIFF_INPUT || new.len() > MAX_DIFF_INPUT {
         return None;
     }

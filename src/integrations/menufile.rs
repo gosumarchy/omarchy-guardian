@@ -10,7 +10,7 @@ use crate::json::Json;
 
 /// One item of the file: its id and its value (`None` for a value the
 /// menu reads and this strict reader does not: a key set twice inside it).
-pub type Item = (String, Option<Json>);
+type Item = (String, Option<Json>);
 
 /// `raw` without what the menu strips before parsing.
 fn stripped(raw: &str) -> String {
@@ -116,7 +116,7 @@ fn members(text: &str) -> Result<Vec<(String, &str)>, String> {
 
 /// The items of the menu file `raw`, in order and with repeats; an error
 /// when the menu would ignore the file.
-pub fn items(raw: &str) -> Result<Vec<Item>, String> {
+pub(super) fn items(raw: &str) -> Result<Vec<Item>, String> {
     let text = stripped(raw);
     if text.trim().is_empty() {
         return Ok(Vec::new());
@@ -149,7 +149,7 @@ pub fn items(raw: &str) -> Result<Vec<Item>, String> {
 
 /// The `action` in effect for `id`: of its last entry. `None` when the
 /// item is not in the file, or its last entry has no readable action.
-pub fn action<'a>(items: &'a [Item], id: &str) -> Option<&'a str> {
+pub(super) fn action<'a>(items: &'a [Item], id: &str) -> Option<&'a str> {
     items
         .iter()
         .rev()

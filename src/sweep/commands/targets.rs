@@ -80,7 +80,7 @@ const UWSM_RUNS: &[&str] = &["app", "start"];
 /// nothing more (see `path::search`), relative to the root; `~` stands for
 /// the home directory. The directories version managers put ahead of
 /// `/usr/bin` come first, as they do on a `PATH`.
-pub const SEARCH: &[&str] = &[
+const SEARCH: &[&str] = &[
     "~/.local/bin",
     "~/.cargo/bin",
     "~/bin",
@@ -97,7 +97,7 @@ pub const SEARCH: &[&str] = &[
 ];
 
 /// `SEARCH` with the home directory written out.
-pub fn default_search(home: &str) -> Vec<String> {
+pub(crate) fn default_search(home: &str) -> Vec<String> {
     SEARCH
         .iter()
         .map(|directory| expand(home, directory).trim_start_matches('/').to_string())
@@ -107,7 +107,7 @@ pub fn default_search(home: &str) -> Vec<String> {
 /// The files a pattern (`~/.config/hypr/conf.d/*.conf`) names: `*` and `?`
 /// in its last part only, matched against what `list` says the directory
 /// holds, at most `MAX_GLOB` of them; and whether there were more.
-pub fn glob_targets(
+pub(crate) fn glob_targets(
     home: &str,
     pattern: &str,
     list: &dyn Fn(&str) -> Vec<String>,
@@ -140,7 +140,7 @@ pub fn glob_targets(
 }
 
 /// The most files one pattern stands for.
-pub const MAX_GLOB: usize = 1024;
+pub(crate) const MAX_GLOB: usize = 1024;
 
 /// Whether `name` matches `pattern` (`*` any run, `?` one character). A
 /// name starting with `.` matches only a pattern that does, as in a shell.
@@ -175,7 +175,7 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 /// given. `home` is the home directory relative to the root. Only paths
 /// that exist under `root` are returned.
 #[cfg(test)]
-pub fn targets(root: &Path, home: &str, command: &str) -> Vec<String> {
+pub(super) fn targets(root: &Path, home: &str, command: &str) -> Vec<String> {
     targets_where(home, command, &|candidate| {
         std::fs::symlink_metadata(root.join(candidate)).is_ok()
     })
@@ -183,7 +183,11 @@ pub fn targets(root: &Path, home: &str, command: &str) -> Vec<String> {
 
 /// `targets`, with the caller saying which candidate paths are there.
 #[cfg(test)]
-pub fn targets_where(home: &str, command: &str, exists: &dyn Fn(&str) -> bool) -> Vec<String> {
+pub(super) fn targets_where(
+    home: &str,
+    command: &str,
+    exists: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
     Lookup {
         home,
         search: &default_search(home),
@@ -195,26 +199,26 @@ pub fn targets_where(home: &str, command: &str, exists: &dyn Fn(&str) -> bool) -
 }
 
 /// How the files a command runs are looked for.
-pub struct Lookup<'a> {
+pub(crate) struct Lookup<'a> {
     /// The home directory relative to the root.
-    pub home: &'a str,
+    pub(crate) home: &'a str,
     /// Where a bare command name is looked for, in the order a shell
     /// would, relative to the root.
-    pub search: &'a [String],
+    pub(crate) search: &'a [String],
     /// Which candidate paths are there: as root, a path only root can read
     /// is not looked for at a user's word.
-    pub exists: &'a dyn Fn(&str) -> bool,
+    pub(crate) exists: &'a dyn Fn(&str) -> bool,
     /// Set when a line held more commands than are looked up.
-    pub capped: std::cell::Cell<bool>,
+    pub(crate) capped: std::cell::Cell<bool>,
     /// The files a shell was handed as its script (`sh /x/run`): that a
     /// shell runs a file is what says it is a shell script, whatever its
     /// name and first line.
-    pub shell_scripts: std::cell::RefCell<Vec<String>>,
+    pub(crate) shell_scripts: std::cell::RefCell<Vec<String>>,
 }
 
 impl Lookup<'_> {
     /// The files `command` runs (see `targets`).
-    pub fn targets(&self, command: &str) -> Vec<String> {
+    pub(crate) fn targets(&self, command: &str) -> Vec<String> {
         targets_of(self, command)
     }
 }
@@ -369,18 +373,18 @@ fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
 const MAX_OPTION_VALUES: usize = 8;
 
 /// The most commands of one line a shell runs that are looked up.
-pub const MAX_INNER_COMMANDS: usize = 1024;
+pub(crate) const MAX_INNER_COMMANDS: usize = 1024;
 
 /// The commands of a line a shell runs (a crontab's, or `sh -c`'s): split
 /// at `;`, `|`, `&` and line ends outside quotes.
 #[cfg(test)]
-pub fn inner_commands(code: &str) -> Vec<String> {
+pub(super) fn inner_commands(code: &str) -> Vec<String> {
     split_commands(code).0
 }
 
 /// `inner_commands`: the first `MAX_INNER_COMMANDS` that are not empty,
 /// and whether the line held more.
-pub fn split_commands(code: &str) -> (Vec<String>, bool) {
+pub(crate) fn split_commands(code: &str) -> (Vec<String>, bool) {
     let mut commands = Vec::new();
     let mut command = String::new();
     let mut quote: Option<char> = None;
@@ -440,7 +444,7 @@ fn locate(lookup: &Lookup<'_>, word: &str) -> Vec<String> {
 
 /// `~`, `$HOME`, `${HOME}` and systemd's `%h` as the home directory, and
 /// the XDG directories where they are by default.
-pub fn expand(home: &str, word: &str) -> String {
+pub(crate) fn expand(home: &str, word: &str) -> String {
     for prefix in ["~/", "$HOME/", "${HOME}/", "%h/"] {
         if let Some(rest) = word.strip_prefix(prefix) {
             return format!("/{home}/{rest}");

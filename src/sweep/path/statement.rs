@@ -273,7 +273,7 @@ fn scan(text: &str) -> Vec<(usize, Set)> {
 /// `path=(…)` and `path+=(…)`, fish's `set PATH …`, `fish_add_path …` and
 /// its saved `fish_user_paths`, csh's `setenv`, an environment file's line
 /// and Hyprland's `env`.
-pub fn assignments(text: &str) -> Vec<(usize, String)> {
+pub(super) fn assignments(text: &str) -> Vec<(usize, String)> {
     scan(text)
         .into_iter()
         .filter_map(|(line, set)| match set {
@@ -286,7 +286,7 @@ pub fn assignments(text: &str) -> Vec<(usize, String)> {
 /// The lines of `text` that set `PATH` to something only running them
 /// would tell (`PATH=$(…)`): the directories they add are not known, so
 /// what is in them is not watched.
-pub fn opaque(text: &str) -> Vec<usize> {
+pub(crate) fn opaque(text: &str) -> Vec<usize> {
     let mut lines: Vec<usize> = scan(text)
         .into_iter()
         .filter(|(_, set)| *set == Set::Opaque)
@@ -302,7 +302,7 @@ const TEMPORARY: &[&str] = &["/tmp", "/var/tmp", "/dev/shm", "/run/user/", "/.ca
 /// The entries of the `PATH`s `text` sets that anyone can fill: the
 /// working directory (`.`, or an empty entry), a relative directory, and a
 /// temporary or cache directory. Each with its line.
-pub fn unsafe_entries(text: &str) -> Vec<(usize, String)> {
+pub(crate) fn unsafe_entries(text: &str) -> Vec<(usize, String)> {
     let mut found = Vec::new();
     for (line, value) in assignments(text) {
         for entry in value.split(':') {

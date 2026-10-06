@@ -23,21 +23,21 @@ use crate::paths::extension_lowercase;
 use crate::report::Gap;
 use crate::sha256::{Digest, Sha256};
 
-pub const MAX_TEXT_FILE_SIZE: u64 = 2 * 1024 * 1024;
-pub const MAX_HASHED_FILE_SIZE: u64 = 512 * 1024 * 1024;
+pub(crate) const MAX_TEXT_FILE_SIZE: u64 = 2 * 1024 * 1024;
+pub(crate) const MAX_HASHED_FILE_SIZE: u64 = 512 * 1024 * 1024;
 
 /// Whole-tree limits: past any of them the walk stops with a gap, so a tree
 /// built to exhaust memory or time (thousands of hardlinks to one large
 /// file, huge sparse files) fails closed quickly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Limits {
-    pub files: usize,
-    pub text_bytes: u64,
-    pub hashed_bytes: u64,
+pub(crate) struct Limits {
+    pub(crate) files: usize,
+    pub(crate) text_bytes: u64,
+    pub(crate) hashed_bytes: u64,
 }
 
 impl Limits {
-    pub const DEFAULT: Self = Self {
+    pub(crate) const DEFAULT: Self = Self {
         files: 200_000,
         text_bytes: 256 * 1024 * 1024,
         hashed_bytes: 4 * 1024 * 1024 * 1024,
@@ -58,21 +58,21 @@ const GENERATED_DIRS: &[(&str, &[&str])] = &[
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScanConfig {
-    pub root: PathBuf,
-    pub include_ignored_dirs: bool,
+pub(crate) struct ScanConfig {
+    pub(crate) root: PathBuf,
+    pub(crate) include_ignored_dirs: bool,
     /// Top-level directory names left out of both the review and the
     /// snapshot. A file or link of such a name is reviewed like any other:
     /// only a directory is something a build tool made.
-    pub excluded_top_level: Vec<String>,
+    pub(crate) excluded_top_level: Vec<String>,
     /// Top-level names left out whatever they are. For comparing snapshots
     /// (what makepkg downloaded since), never for a review.
-    pub excluded_entries: Vec<String>,
-    pub limits: Limits,
+    pub(crate) excluded_entries: Vec<String>,
+    pub(crate) limits: Limits,
 }
 
 impl ScanConfig {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
+    pub(crate) fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
             include_ignored_dirs: false,
@@ -110,13 +110,13 @@ impl ScanConfig {
 /// A generated directory the walk skipped, with how many entries it held
 /// (counted without reading them, up to the file limit).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SkippedDir {
-    pub path: String,
-    pub files: usize,
+pub(crate) struct SkippedDir {
+    pub(crate) path: String,
+    pub(crate) files: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FileKind {
+pub(crate) enum FileKind {
     /// Text within the review size limit (see `FileHash::lossy`).
     Text,
     /// A script, build or config file holding binary data: a gap.
@@ -132,24 +132,24 @@ pub enum FileKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FileHash {
+pub(crate) struct FileHash {
     /// Path relative to the scan root, `/`-separated.
-    pub path: String,
-    pub sha256: Digest,
-    pub kind: FileKind,
+    pub(crate) path: String,
+    pub(crate) sha256: Digest,
+    pub(crate) kind: FileKind,
     /// The format of a hash-only file.
-    pub format: Option<Format>,
+    pub(crate) format: Option<Format>,
     /// Text decoded with replacement characters.
-    pub lossy: bool,
+    lossy: bool,
     /// Size in bytes.
-    pub bytes: u64,
+    pub(crate) bytes: u64,
     /// The execute bit.
-    pub executable: bool,
+    pub(crate) executable: bool,
 }
 
 /// The files of a tree, sorted by path.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Snapshot {
+pub(crate) struct Snapshot {
     files: Vec<FileHash>,
     skipped: Vec<SkippedDir>,
 }
@@ -160,23 +160,23 @@ impl Snapshot {
         Self { files, skipped }
     }
 
-    pub fn files(&self) -> &[FileHash] {
+    pub(crate) fn files(&self) -> &[FileHash] {
         &self.files
     }
 
     /// Generated directories left out of the review.
-    pub fn skipped(&self) -> &[SkippedDir] {
+    pub(crate) fn skipped(&self) -> &[SkippedDir] {
         &self.skipped
     }
 
-    pub fn count(&self, kind: FileKind) -> usize {
+    pub(crate) fn count(&self, kind: FileKind) -> usize {
         self.files.iter().filter(|file| file.kind == kind).count()
     }
 
     /// One digest over the whole manifest: path, NUL, hex digest, a kind
     /// byte (1 reviewed text, 2 symbolic link, 0 otherwise) and the execute
     /// bit per file: a file made executable is not the same tree.
-    pub fn manifest_digest(&self) -> Digest {
+    pub(crate) fn manifest_digest(&self) -> Digest {
         let mut hasher = Sha256::new();
         for file in &self.files {
             hasher.update(file.path.as_bytes());
@@ -200,20 +200,23 @@ impl Snapshot {
 }
 
 /// A reviewable text file found by the walk.
-pub struct TextFile<'a> {
-    pub rel: &'a str,
-    pub text: &'a str,
+pub(crate) struct TextFile<'a> {
+    pub(crate) rel: &'a str,
+    pub(crate) text: &'a str,
     /// Decoded with replacement characters from a legacy encoding.
-    pub lossy: bool,
+    pub(crate) lossy: bool,
     /// A git configuration in a directory laid out as a repository under
     /// another name: checked like `.git/config` as well, and reviewed with
     /// the credentials in its addresses taken out.
-    pub git_config: bool,
+    pub(crate) git_config: bool,
 }
 
 /// Walks the tree, calling `on_text` for each reviewable text file. Returns
 /// the snapshot of every file found and the reasons the walk was incomplete.
-pub fn walk(config: &ScanConfig, on_text: &mut dyn FnMut(TextFile<'_>)) -> (Snapshot, Vec<Gap>) {
+pub(crate) fn walk(
+    config: &ScanConfig,
+    on_text: &mut dyn FnMut(TextFile<'_>),
+) -> (Snapshot, Vec<Gap>) {
     let mut walker = Walker {
         config,
         on_text,
@@ -245,7 +248,7 @@ pub fn walk(config: &ScanConfig, on_text: &mut dyn FnMut(TextFile<'_>)) -> (Snap
 }
 
 /// Re-walks the tree and requires it to match `expected` exactly.
-pub fn verify_unchanged(config: &ScanConfig, expected: &Snapshot) -> Result<(), Error> {
+pub(crate) fn verify_unchanged(config: &ScanConfig, expected: &Snapshot) -> Result<(), Error> {
     let (current, gaps) = walk(config, &mut |_| {});
     if !gaps.is_empty() {
         return Err(Error::Refused(
@@ -262,7 +265,7 @@ pub fn verify_unchanged(config: &ScanConfig, expected: &Snapshot) -> Result<(), 
 
 /// Like `verify_unchanged`, for a copy made without git's own directories
 /// (the sandbox leaves them behind): those are not compared.
-pub fn verify_copy(config: &ScanConfig, expected: &Snapshot) -> Result<(), Error> {
+pub(crate) fn verify_copy(config: &ScanConfig, expected: &Snapshot) -> Result<(), Error> {
     let (current, gaps) = walk(config, &mut |_| {});
     let kept = |snapshot: &Snapshot| -> Vec<FileHash> {
         snapshot

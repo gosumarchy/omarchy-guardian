@@ -7,8 +7,9 @@ mod follow;
 mod item;
 mod sight;
 
-pub use item::{item, item_of};
-pub use sight::{holds, is_file_there, is_there, look, packaged_item, packaged_out_of_sight};
+pub(super) use item::{item, item_of};
+use sight::is_there;
+pub(super) use sight::{holds, is_file_there, look, packaged_item, packaged_out_of_sight};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -57,28 +58,29 @@ const WATCHED_NAMES: &[&str] = &[
 const OMARCHY_INSTALL: &[&str] = &["usr/share/omarchy/install", "usr/share/omarchy/migrations"];
 
 /// Why root did not look at a path a user could have chosen.
-pub const NOT_LOOKED_AT: &str =
+const NOT_LOOKED_AT: &str =
     "only root can read it, and a user's file or process names it: not looked at";
 
 /// The variables a locale file sets.
 const LOCALE_VARIABLES: &[&str] = &["LANG", "LANGUAGE"];
 
 /// The format label of a file root hashed but did not hand back.
-pub const WITHHELD: &str = "root-only file (hashed, content withheld)";
+pub(super) const WITHHELD: &str = "root-only file (hashed, content withheld)";
 
 /// The format label of a packaged file only root can read that a process
 /// led the root collector to: compared with its package, and no more told.
-pub const COMPARED: &str = "root-only packaged file (compared with its package, hash withheld)";
+pub(super) const COMPARED: &str =
+    "root-only packaged file (compared with its package, hash withheld)";
 
 /// What is said of a packaged file that its package installs readable by
 /// everyone and that no longer is.
-pub const CLOSED: &str = "its package installs it readable by everyone, and it no longer is";
+pub(super) const CLOSED: &str = "its package installs it readable by everyone, and it no longer is";
 
 /// How a note starts that says a limit was reached while looking for what
 /// an item runs. Such an item cannot be allowed (an allow would vouch for
 /// commands nobody followed), and where its text is not reviewed either,
 /// the sweep counts as incomplete.
-pub const NOT_ALL_FOLLOWED: &str = "not all of what it runs was followed: ";
+pub(super) const NOT_ALL_FOLLOWED: &str = "not all of what it runs was followed: ";
 
 /// How the note starts on an item that is read as more of a catalogued
 /// file's configuration and that nothing runs: where a link in an auto-run
@@ -97,7 +99,7 @@ const STANDS_FOR: &str = "stands for the link /";
 
 /// The catalogued file `item` is read as more configuration of, relative
 /// to the root, if it is (see `CONFIGURATION_OF`).
-pub fn configuration_of(item: &Item) -> Option<&str> {
+pub(super) fn configuration_of(item: &Item) -> Option<&str> {
     item.notes
         .iter()
         .find_map(|note| note.strip_prefix(CONFIGURATION_OF))
@@ -105,7 +107,7 @@ pub fn configuration_of(item: &Item) -> Option<&str> {
 
 /// The path whose name says what kind of file `item` is: its own, or for
 /// configuration a link leads to, the link's.
-pub fn stands_for(item: &Item) -> &str {
+pub(super) fn stands_for(item: &Item) -> &str {
     configuration_of(item)
         .and_then(|_| {
             item.notes
@@ -128,13 +130,13 @@ fn is_kept_by_kind(item: &Item) -> bool {
 /// The path the content of `item` was read from, relative to the root:
 /// what a path says of a file (that it holds secrets, that it is a script)
 /// is asked of this path, never of the name an item is listed under.
-pub fn file_of(item: &Item) -> &str {
+pub(super) fn file_of(item: &Item) -> &str {
     item.file.as_deref().unwrap_or(&item.path)
 }
 
 /// The item of the file at `path`, listed under `name`: the path with
 /// what a live check saw the file doing (`/usr/bin/node:tcp-3000`).
-pub fn item_named(scope: &Scope<'_>, category: Category, name: &str, path: &str) -> Item {
+pub(super) fn item_named(scope: &Scope<'_>, category: Category, name: &str, path: &str) -> Item {
     let mut item = item(scope, category, path.to_string(), None);
     if name != path {
         item.path = name.to_string();
@@ -150,7 +152,7 @@ const ENVIRONMENT_ONLY: &str =
     "read by a unit as a list of variables (EnvironmentFile=), run by nothing";
 
 /// Whether `item` was reached only as a unit's `EnvironmentFile=`.
-pub fn is_environment_file(item: &Item) -> bool {
+pub(super) fn is_environment_file(item: &Item) -> bool {
     item.notes.iter().any(|note| note == ENVIRONMENT_ONLY)
 }
 
@@ -167,12 +169,12 @@ const AT_SPOOLS: &[&str] = &["var/spool/atd/", "var/spool/at/", "var/spool/cron/
 /// Whether `path` is a queued `at` job. One starts with the whole
 /// environment of whoever queued it, tokens and all, and is told apart by
 /// who owns the file, not by its name.
-pub fn is_at_job(path: &str) -> bool {
+pub(super) fn is_at_job(path: &str) -> bool {
     AT_SPOOLS.iter().any(|spool| path.starts_with(spool))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Origin {
+pub(crate) enum Origin {
     /// The system, read as the user.
     System,
     /// The user's home directory.
@@ -183,7 +185,7 @@ pub enum Origin {
 
 /// What an item holds, as far as the review is concerned.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Body {
+pub(crate) enum Body {
     Text(String),
     /// A recognised binary format: hashed, never read.
     Binary(&'static str),
@@ -198,61 +200,61 @@ pub enum Body {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Item {
-    pub origin: Origin,
-    pub category: Category,
+pub(crate) struct Item {
+    pub(crate) origin: Origin,
+    pub(crate) category: Category,
     /// Relative to the root (`etc/udev/rules.d/x.rules`, `home/u/.bashrc`).
-    pub path: String,
-    pub tier: Tier,
-    pub sha256: Option<Digest>,
-    pub body: Body,
+    pub(crate) path: String,
+    pub(crate) tier: Tier,
+    pub(crate) sha256: Option<Digest>,
+    pub(crate) body: Body,
     /// The command lines it runs.
-    pub runs: Vec<String>,
+    pub(crate) runs: Vec<String>,
     /// The item that runs or links to this one.
-    pub run_by: Option<String>,
+    pub(crate) run_by: Option<String>,
     /// The path the content was read from, where `path` is not that: a
     /// live check lists a file under its path and what it saw it doing.
-    pub file: Option<String>,
-    pub notes: Vec<String>,
+    pub(crate) file: Option<String>,
+    pub(crate) notes: Vec<String>,
     /// What the live checks established about it (a rule and what was seen).
-    pub alerts: Vec<(RuleId, String)>,
+    pub(crate) alerts: Vec<(RuleId, String)>,
 }
 
 impl Item {
     /// Trusted items are only counted. An item the live checks raised an
     /// alert about is not trusted by its tier (a setuid copy of a packaged
     /// program is still a copy), only by the user allowing it.
-    pub fn is_trusted(&self) -> bool {
+    pub(super) fn is_trusted(&self) -> bool {
         self.tier == Tier::Allowed
             || (super::judge::is_trusted(self.tier) && self.alerts.is_empty())
     }
 }
 
 #[derive(Debug, Default)]
-pub struct Collection {
-    pub items: Vec<Item>,
+pub(super) struct Collection {
+    pub(super) items: Vec<Item>,
     /// What was not looked at, each as a sentence: a location with more
     /// entries than the limit, a name that cannot be read.
-    pub truncated: Vec<String>,
+    pub(super) truncated: Vec<String>,
     /// What is said of the system as a whole (Secure Boot is off).
-    pub notes: Vec<String>,
+    pub(super) notes: Vec<String>,
     /// The paths of root's accounts, members, keys and trust anchors that
     /// the root collector says are new, when it kept track itself (see
     /// `root::news`); `None` when it did not.
-    pub root_news: Option<Vec<String>>,
+    pub(super) root_news: Option<Vec<String>>,
 }
 
 /// What a collection runs against.
-pub struct Scope<'a> {
-    pub root: &'a Path,
+pub(super) struct Scope<'a> {
+    pub(super) root: &'a Path,
     /// The home directory relative to the root (`home/u`), if any.
-    pub home: Option<&'a str>,
-    pub index: &'a PackageIndex,
-    pub origin: Origin,
+    pub(super) home: Option<&'a str>,
+    pub(super) index: &'a PackageIndex,
+    pub(super) origin: Origin,
 }
 
 /// Collects the system catalog and, with a home, the user catalog.
-pub fn collect(scope: &Scope<'_>) -> Collection {
+pub(super) fn collect(scope: &Scope<'_>) -> Collection {
     let mut paths: BTreeMap<String, Category> = BTreeMap::new();
     let mut collection = Collection::default();
     for location in SYSTEM.iter().chain(SYSTEM_SWEEP) {
@@ -669,7 +671,7 @@ fn sets_only_the_locale(item: &Item) -> bool {
 
 /// Whether nobody looked for everything `item` runs (see
 /// `NOT_ALL_FOLLOWED`).
-pub fn is_capped(item: &Item) -> bool {
+pub(super) fn is_capped(item: &Item) -> bool {
     item.notes
         .iter()
         .any(|note| note.starts_with(NOT_ALL_FOLLOWED))
@@ -684,7 +686,7 @@ pub fn is_capped(item: &Item) -> bool {
 /// review go. And where a live check found a file whose kind keeps it from
 /// the review (a tool's settings, an SSH file), it is listed as what that
 /// check saw: a file something runs is read as a program.
-pub fn merge(collection: &mut Collection, items: Vec<Item>) {
+pub(super) fn merge(collection: &mut Collection, items: Vec<Item>) {
     for item in items {
         if let Some(existing) = collection
             .items
@@ -768,7 +770,7 @@ fn add_location(
 }
 
 /// The sentence for an entry whose name the sweep cannot read.
-pub fn not_utf8(shown: &str) -> String {
+pub(super) fn not_utf8(shown: &str) -> String {
     // A name may hold a newline, which would start a line of its own.
     format!("/{}{NOT_UTF8}", shown.escape_debug())
 }
@@ -779,7 +781,7 @@ const NOT_UTF8: &str = ": a name that is not UTF-8 was not checked";
 const MAX_UNCHECKED: usize = 20;
 
 /// `unchecked` without repeats and within a bound, the rest counted.
-pub fn bounded(mut unchecked: Vec<String>) -> Vec<String> {
+pub(super) fn bounded(mut unchecked: Vec<String>) -> Vec<String> {
     // Names last: anyone can make many, and they must not crowd out a
     // limit that was reached.
     unchecked.sort_by_key(|sentence| (sentence.ends_with(NOT_UTF8), sentence.clone()));

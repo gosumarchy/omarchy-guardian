@@ -217,7 +217,7 @@ impl Confirm for Asker {
     }
 }
 
-pub fn run(command: &[OsString], settings: &Settings) -> ExitCode {
+pub(crate) fn run(command: &[OsString], settings: &Settings) -> ExitCode {
     // makepkg's standard output is makepkg's: the helper that called it
     // reads the package list and the source listing from it.
     crate::output::leave_stdout_to_the_command();
@@ -1246,7 +1246,7 @@ struct UpstreamReview<'a> {
 /// (`aur:<pkg>`, `aur-src:<pkg>`, or a local build's own key) under the
 /// review memory's `root`: the questions answered, the binaries and what
 /// was extracted. Returns how many records went.
-pub fn forget(root: &Path, identity: &str) -> Result<usize, String> {
+pub(crate) fn forget(root: &Path, identity: &str) -> Result<usize, String> {
     let key = identity
         .strip_prefix("aur:")
         .or_else(|| identity.strip_prefix("aur-src:"))
@@ -1255,7 +1255,7 @@ pub fn forget(root: &Path, identity: &str) -> Result<usize, String> {
 }
 
 /// Forgets everything the gate remembers under `root`.
-pub fn forget_all(root: &Path) -> Result<usize, String> {
+pub(crate) fn forget_all(root: &Path) -> Result<usize, String> {
     state::forget_all(root)
 }
 
@@ -1270,7 +1270,7 @@ fn print_warnings(title: &str, warnings: &[String]) {
 }
 
 /// Parses `makepkg-gate -- <makepkg> [args...]`.
-pub fn parse(args: &[OsString]) -> Result<Vec<OsString>, String> {
+pub(crate) fn parse(args: &[OsString]) -> Result<Vec<OsString>, String> {
     match args.split_first() {
         Some((separator, rest)) if separator == "--" && !rest.is_empty() => Ok(rest.to_vec()),
         _ => Err("usage: omarchy-guardian makepkg-gate -- <makepkg> [args...]".into()),

@@ -10,24 +10,24 @@ use super::{lua, read};
 use crate::autorun::Category;
 use crate::paths::file_name;
 
-pub use shell::{is_shell_script, sourced_files};
+pub(super) use shell::{is_shell_script, sourced_files};
 use shell::{path_variables, sourced, started, without_case_patterns, zdotdir};
 use targets::split;
-pub use targets::{
+pub(super) use targets::{
     Lookup, MAX_GLOB, MAX_INNER_COMMANDS, default_search, expand, glob_targets, split_commands,
 };
 #[cfg(test)]
-pub use targets::{inner_commands, targets, targets_where};
+use targets::{inner_commands, targets, targets_where};
 
 /// Whether `path` (relative to the root) is the script the SSH server runs
 /// at every login: `~/.ssh/rc` or `/etc/ssh/sshrc`. It is a shell script,
 /// not configuration, whatever directory it sits in.
-pub fn is_ssh_rc(path: &str) -> bool {
+pub(super) fn is_ssh_rc(path: &str) -> bool {
     path == "etc/ssh/sshrc" || path.ends_with("/.ssh/rc")
 }
 
 /// The command lines `text` (a file of `category` named `name`) runs.
-pub fn commands(category: Category, path: &str, text: &str) -> Vec<String> {
+pub(super) fn commands(category: Category, path: &str, text: &str) -> Vec<String> {
     let name = file_name(path);
     // The login script of the SSH server is read as the shell script it is.
     let category = if is_ssh_rc(path) {
@@ -127,7 +127,7 @@ pub fn commands(category: Category, path: &str, text: &str) -> Vec<String> {
 /// What of a file of `category` was not looked through for what it runs,
 /// as sentences: a limit was reached, and nobody should take the list of
 /// what it runs for the whole of it.
-pub fn unfollowed(category: Category, text: &str) -> Vec<String> {
+pub(super) fn unfollowed(category: Category, text: &str) -> Vec<String> {
     let long = text
         .lines()
         .filter(|line| line.len() > MAX_STARTED_LINE)
@@ -608,7 +608,7 @@ fn pam(line: &str) -> Vec<String> {
 /// its key (lower case) and what it runs or loads. The key and its value
 /// are separated by blanks or by `=`. `Match … exec "command"` runs its
 /// command to decide whether the block applies.
-pub fn ssh(line: &str) -> Option<(String, String)> {
+pub(super) fn ssh(line: &str) -> Option<(String, String)> {
     let line = line.trim();
     let end = line.find(|c: char| c.is_whitespace() || c == '=')?;
     let key = line[..end].to_ascii_lowercase();
@@ -665,7 +665,7 @@ pub fn ssh(line: &str) -> Option<(String, String)> {
 /// The files a unit reads into its environment (`EnvironmentFile=`), as
 /// `commands` gives them. systemd reads such a file as `NAME=value` lines
 /// and nothing else: it sets variables, and can run nothing.
-pub fn environment_files(path: &str, text: &str) -> Vec<String> {
+pub(super) fn environment_files(path: &str, text: &str) -> Vec<String> {
     text.replace("\\\n", " ")
         .lines()
         .filter_map(|line| line.trim().split_once('='))
@@ -680,7 +680,7 @@ pub fn environment_files(path: &str, text: &str) -> Vec<String> {
 /// as lists of keys and names, as `ssh` gives them: an `Include`, and the
 /// server's key and principal files. They are read, not run: what any
 /// other line names (a `ProxyCommand`, a `Match … exec`) is a program.
-pub fn ssh_read_in(text: &str) -> Vec<String> {
+pub(super) fn ssh_read_in(text: &str) -> Vec<String> {
     text.lines()
         .map(str::trim)
         .filter(|line| !line.starts_with('#'))

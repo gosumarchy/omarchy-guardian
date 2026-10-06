@@ -40,7 +40,7 @@ const DIGEST_CHARS: usize = 12;
 const USAGE: &str = "usage: omarchy-guardian log [--since TIME] [-n N] [--json]";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Options {
+pub(crate) struct Options {
     /// A time as journalctl takes one (`yesterday`, `2026-01-31`, `-2h`).
     since: Option<String>,
     /// The newest entries shown.
@@ -58,7 +58,7 @@ fn is_time(text: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || " :-+.".contains(character))
 }
 
-pub fn parse(args: &[OsString]) -> Result<Options, String> {
+pub(crate) fn parse(args: &[OsString]) -> Result<Options, String> {
     let mut options = Options {
         since: None,
         entries: DEFAULT_ENTRIES,
@@ -341,7 +341,7 @@ fn read(options: &Options) -> Result<(String, String), String> {
     Ok((String::from_utf8_lossy(&output).into_owned(), notes))
 }
 
-pub fn command(options: &Options) -> ExitCode {
+pub(crate) fn command(options: &Options) -> ExitCode {
     let (output, notes) = match read(options) {
         Ok(read) => read,
         Err(reason) => {

@@ -52,18 +52,18 @@ use crate::user;
 
 mod privileged;
 
-pub use privileged::{hook_result_command, system_command};
+pub(crate) use privileged::{hook_result_command, system_command};
 
 /// Where root keeps the permits: one file each.
-pub const DIRECTORY: &str = "/var/lib/omarchy-guardian/permits";
+const DIRECTORY: &str = "/var/lib/omarchy-guardian/permits";
 /// How long a permit lasts.
-pub const LIFETIME_SECS: u64 = 30 * 60;
+const LIFETIME_SECS: u64 = 30 * 60;
 /// The exit code of a pacman gate that let a transaction through on a
 /// permit, when the hook's root half asked to be told (`ROOT_HOOK`): the
 /// script removes the permit and goes on with 0.
-pub const PERMITTED_EXIT: u8 = 10;
+pub(crate) const PERMITTED_EXIT: u8 = 10;
 /// Set by the hook script's root half for the review it starts.
-pub const ROOT_HOOK: &str = "OMARCHY_GUARDIAN_ROOT_HOOK";
+pub(crate) const ROOT_HOOK: &str = "OMARCHY_GUARDIAN_ROOT_HOOK";
 
 /// Hex characters of the content's SHA-256 that make the ID: 128 bits,
 /// so that no second content with the same ID can be searched for (the
@@ -123,7 +123,7 @@ fn is_part(part: &str) -> bool {
 
 /// Exactly what a gate reviewed, as a permit names it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Content {
+pub(crate) struct Content {
     gate: Gate,
     class: String,
     /// What it is called, for the user; not part of the key.
@@ -134,7 +134,12 @@ pub struct Content {
 impl Content {
     /// `None` when a permit cannot name this: no digest, one that is not a
     /// SHA-256, or a gate or class permits are not for.
-    pub fn new(gate: Gate, class: &str, subject: &str, mut parts: Vec<String>) -> Option<Self> {
+    pub(crate) fn new(
+        gate: Gate,
+        class: &str,
+        subject: &str,
+        mut parts: Vec<String>,
+    ) -> Option<Self> {
         parts.sort();
         parts.dedup();
         let named = permits(gate)
@@ -151,7 +156,12 @@ impl Content {
     }
 
     /// A reviewed tree, by its snapshot's manifest digest.
-    pub fn tree(gate: Gate, class: SourceClass, subject: &str, manifest: &str) -> Option<Self> {
+    pub(crate) fn tree(
+        gate: Gate,
+        class: SourceClass,
+        subject: &str,
+        manifest: &str,
+    ) -> Option<Self> {
         Self::new(
             gate,
             class.name(),
@@ -162,7 +172,7 @@ impl Content {
 
     /// The SHA-256 over the gate, the class and every digest: what root
     /// stores and what the gate looks a permit up by.
-    pub fn key(&self) -> String {
+    pub(crate) fn key(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(b"omarchy-guardian permit 1\n");
         for line in [self.gate.name(), self.class.as_str()]
@@ -175,7 +185,7 @@ impl Content {
         hasher.finalize().to_string()
     }
 
-    pub fn id(&self) -> String {
+    fn id(&self) -> String {
         self.key()[..ID_CHARS].to_string()
     }
 
@@ -186,12 +196,12 @@ impl Content {
         }
     }
 
-    pub fn class(&self) -> &str {
+    pub(crate) fn class(&self) -> &str {
         &self.class
     }
 
     /// One digest for the audit trail: the only part, or the key over all.
-    pub fn digest(&self) -> String {
+    pub(crate) fn digest(&self) -> String {
         match self.parts.as_slice() {
             [part] => part.clone(),
             _ => format!("content:{}", self.key()),
@@ -202,7 +212,7 @@ impl Content {
 /// Whether permits are on for `class` under these settings: not under the
 /// strict level unless the root-owned system file allows them there, and
 /// not while that file cannot be read (nobody can say what it sets).
-pub fn enabled(settings: &Settings, class: &str) -> bool {
+fn enabled(settings: &Settings, class: &str) -> bool {
     if settings.privileged_block().is_some() {
         return false;
     }
@@ -219,7 +229,7 @@ pub fn enabled(settings: &Settings, class: &str) -> bool {
 /// The permit a block is offered: its ID, and the whole SHA-256 of the
 /// content that ID is the start of. Shown as the ID.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Offer {
+pub(crate) struct Offer {
     id: String,
     key: String,
 }
@@ -232,7 +242,7 @@ impl std::fmt::Display for Offer {
 
 /// How a blocked review stands with permits.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Standing {
+pub(crate) enum Standing {
     /// Not blocked, or blocked on what no permit can overrule.
     None,
     /// A permit of this ID lets it through.
@@ -242,14 +252,14 @@ pub enum Standing {
 }
 
 impl Standing {
-    pub fn permitted(&self) -> Option<&str> {
+    pub(crate) fn permitted(&self) -> Option<&str> {
         match self {
             Self::Permitted(id) => Some(id),
             Self::None | Self::Offered(_) => None,
         }
     }
 
-    pub fn offered(&self) -> Option<&str> {
+    pub(crate) fn offered(&self) -> Option<&str> {
         match self {
             Self::Offered(offer) => Some(&offer.id),
             Self::None | Self::Permitted(_) => None,
@@ -261,7 +271,7 @@ impl Standing {
     /// for. `permit` reads what it asks about from a file any program
     /// running as the user can write; this is the gate's own word for
     /// what it blocked, to hold against what `permit` shows.
-    pub fn say(&self) {
+    pub(crate) fn say(&self) {
         if let Self::Offered(offer) = self {
             crate::output::stderr_line(format_args!(
                 "To install this exact content anyway: omarchy-guardian permit {}",
@@ -504,7 +514,7 @@ fn drop_pending(state_root: &Path, id: &str) {
 /// permit for any of them lets it through, and a block is offered a permit
 /// for the first. A block that can be permitted is kept under `state_root`
 /// to be shown again; without a place to keep it, nothing is offered.
-pub fn standing(
+pub(crate) fn standing(
     contents: &[Content],
     report: &Report,
     decision: Decision,
@@ -566,13 +576,13 @@ fn standing_at(
 
 /// `omarchy-guardian permit [ID | --revoke ID]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Command {
+pub(crate) enum Command {
     List,
     Grant(String),
     Revoke(String),
 }
 
-pub fn parse(args: &[std::ffi::OsString]) -> Result<Command, String> {
+pub(crate) fn parse(args: &[std::ffi::OsString]) -> Result<Command, String> {
     const USAGE: &str = "usage: omarchy-guardian permit [ID | --revoke ID]";
     let words: Vec<&str> = args
         .iter()
@@ -597,11 +607,11 @@ pub fn parse(args: &[std::ffi::OsString]) -> Result<Command, String> {
 
 /// Reads one line the user types on the terminal. `None` without a
 /// terminal: a permit is never given unattended.
-pub trait Typed {
+trait Typed {
     fn typed(&mut self, prompt: &str) -> Option<String>;
 }
 
-pub struct TtyTyped;
+struct TtyTyped;
 
 impl Typed for TtyTyped {
     fn typed(&mut self, prompt: &str) -> Option<String> {
@@ -765,7 +775,7 @@ fn system(arguments: &[&str]) -> Result<(), String> {
     root::as_root("permit-system", arguments, "changing your permits")
 }
 
-pub fn command(command: &Command, settings: &Settings) -> ExitCode {
+pub(crate) fn command(command: &Command, settings: &Settings) -> ExitCode {
     let state_root = Store::default_root();
     let result = match command {
         Command::List => {

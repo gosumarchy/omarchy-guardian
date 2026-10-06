@@ -98,7 +98,7 @@ fn runs_variable(line: &str, name: &str) -> bool {
 /// The findings from following values through `lines` (each lowercased,
 /// comments blanked): a run of a variable that holds fetched or decoded
 /// content, as (line number, rule).
-pub fn findings(lines: &[String]) -> Vec<(usize, RuleId)> {
+pub(crate) fn findings(lines: &[String]) -> Vec<(usize, RuleId)> {
     let mut found = Vec::new();
     // Shell variables holding fetched or decoded content.
     let mut held: Vec<(String, Source)> = Vec::new();
