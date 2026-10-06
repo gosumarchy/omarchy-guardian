@@ -172,6 +172,8 @@ pub fn pipeline(statement: &str) -> Vec<&str> {
 
 /// A program and what it is given, without quotes.
 pub struct Command {
+    /// The program as written, with its directory.
+    pub path: String,
     /// The program's name without its directory.
     pub program: String,
     pub arguments: Vec<String>,
@@ -253,6 +255,7 @@ pub fn command(part: &str) -> Option<Command> {
         .collect();
     Some(Command {
         program: program_name(&path).to_string(),
+        path,
         arguments,
     })
 }

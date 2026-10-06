@@ -492,33 +492,89 @@ fn parse_source(entry: &str) -> Option<Parsed<'_>> {
             scheme_lower.clone(),
         ),
     };
-    let (address, fragment) = match rest.split_once('#') {
-        Some((address, fragment)) => (address, fragment.split_once('=')),
-        None => (rest, None),
+    let fragment = rest
+        .split_once('#')
+        .and_then(|(_, fragment)| fragment.split_once('='));
+    // `scp` takes what follows the last `://` for its address.
+    let host = if transport == "scp" && rest.contains("://") {
+        UNPARSEABLE_HOST.into()
+    } else {
+        Authority::of(rest).shown()
     };
-    let authority = address.split('/').next().unwrap_or_default();
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host)
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let valid = !host.is_empty()
-        && host.len() <= 253
-        && host.chars().all(|character| {
-            character.is_ascii_alphanumeric() || character == '.' || character == '-'
-        });
     Some(Parsed {
         vcs,
         transport,
-        host: if valid {
-            host
-        } else {
-            "an unparseable host".into()
-        },
+        host,
         fragment,
     })
+}
+
+/// What a host is named as when its text is not a host name.
+const UNPARSEABLE_HOST: &str = "an unparseable host";
+
+/// The part of an address that says where it is fetched from.
+struct Authority {
+    /// The host as written, lowercased; not yet known to be a host name.
+    host: String,
+    /// Whether a user part (`user@`) stands before the host: what is
+    /// written there can read as a host.
+    user: bool,
+}
+
+impl Authority {
+    /// Reads the authority of an address from just past its `://`. It ends
+    /// at a `/`, a `?` or a `#`, so nothing after one is the host. Clients
+    /// disagree in a few places, and an authority written that way names no
+    /// host: one ends the host at a `\\` and another takes it for part of
+    /// the user, the same goes for a `?` or a `#` with an `@` after it, and
+    /// for a user part that is more than a name.
+    fn of(rest: &str) -> Self {
+        let whole = rest.split('/').next().unwrap_or_default();
+        let authority = whole.split(['?', '#']).next().unwrap_or_default();
+        if whole.contains('\\') || whole[authority.len()..].contains('@') {
+            return Self {
+                host: String::new(),
+                user: true,
+            };
+        }
+        let user = authority.rsplit_once('@');
+        // A user part is a name: with a `:`, a `%` or a bracket in it, one
+        // program reads the host out of it and another does not.
+        let plain = |name: &str| {
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        };
+        if user.is_some_and(|(name, _)| !plain(name)) {
+            return Self {
+                host: String::new(),
+                user: true,
+            };
+        }
+        Self {
+            host: user
+                .map_or(authority, |(_, host)| host)
+                .split(':')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase(),
+            user: user.is_some(),
+        }
+    }
+
+    /// The host as a validated name, for a person, a remembered answer or
+    /// the AI to read.
+    fn shown(self) -> String {
+        let valid = !self.host.is_empty()
+            && self.host.len() <= 253
+            && self.host.chars().all(|character| {
+                character.is_ascii_alphanumeric() || character == '.' || character == '-'
+            });
+        if valid {
+            self.host
+        } else {
+            UNPARSEABLE_HOST.into()
+        }
+    }
 }
 
 /// The host a source is downloaded from, as a validated name; `None` for a
@@ -2553,6 +2609,85 @@ pkgname = demo
         );
         let control = check("https://h/\u{1b}]52;c;x\u{7}", "SKIP");
         assert!(!control.warnings[0].contains('\u{1b}'));
+    }
+
+    #[test]
+    fn a_source_is_named_by_the_host_it_is_fetched_from() {
+        use super::source_host;
+        // What stands after a `/`, or before a user's `@`, is not the host
+        // the download goes to; where clients read an address differently
+        // no host can be told.
+        for (entry, host) in [
+            ("https://github.com/x.tar.gz", "github.com"),
+            ("x.tar.gz::https://GitHub.com:443/x.tar.gz", "github.com"),
+            (
+                "https://evil.example?@github.com/x.tar.gz",
+                "an unparseable host",
+            ),
+            (
+                "scp://github.com?@evil.example/x.tar.gz",
+                "an unparseable host",
+            ),
+            ("https://github.com/x.tar.gz?a@b", "github.com"),
+            ("https://github.com?a=b", "github.com"),
+            (
+                "https://evil.example#@github.com/x.tar.gz",
+                "an unparseable host",
+            ),
+            (
+                "rsync://github.com#@evil.example/m/x",
+                "an unparseable host",
+            ),
+            (
+                "git+ssh://evil.example%2f@github.com/a/b",
+                "an unparseable host",
+            ),
+            ("git://[evil.example]@github.com/a/b", "an unparseable host"),
+            ("scp://evil.example:x@github.com:/y", "an unparseable host"),
+            (
+                "scp://github.com/x://evil.example:/y",
+                "an unparseable host",
+            ),
+            (
+                "https://web.archive.org/web/2020/https://example.org/x",
+                "web.archive.org",
+            ),
+            ("https://github.com/x.tar.gz#tag=a@b", "github.com"),
+            (
+                "https://evil.example\\@github.com/x.tar.gz",
+                "an unparseable host",
+            ),
+            (
+                "https://github.com\\@evil.example/x.tar.gz",
+                "an unparseable host",
+            ),
+            ("https://evil.example/?@github.com/x.tar.gz", "evil.example"),
+            ("https://github.com@evil.example/x.tar.gz", "evil.example"),
+            (
+                "https://user:github.com@evil.example/x.tar.gz",
+                "an unparseable host",
+            ),
+            ("git+ssh://git@example.org/r.git", "example.org"),
+            (
+                "https://github.com.evil.example/x",
+                "github.com.evil.example",
+            ),
+            ("https://$(x)/a", "an unparseable host"),
+            ("https://ev il/a", "an unparseable host"),
+            ("https://github.com\"@evil.example/a", "an unparseable host"),
+            ("https:///a", "an unparseable host"),
+        ] {
+            assert_eq!(source_host(entry).as_deref(), Some(host), "{entry}");
+        }
+        assert_eq!(source_host("local.patch"), None);
+        let checks = check_sources(&[Source {
+            entry: "https://evil.example?@github.com/x.tar.gz".into(),
+            checksums: vec!["SKIP".into()],
+        }]);
+        assert!(
+            checks.context[0].contains("(host an unparseable host)"),
+            "{checks:#?}"
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::thread;
 
 use crate::error::{Error, IoContext};
+use crate::notify;
 
 pub const TIMEOUT: &str = "/usr/bin/timeout";
 pub const KILL: &str = "/usr/bin/kill";
@@ -109,7 +110,7 @@ impl OpenCode {
                     env::var_os("HOME").as_deref(),
                     env::var_os("XDG_CACHE_HOME").as_deref(),
                 );
-                refuse_planted(&found, &scratch).map_err(|reason| {
+                refuse_planted(&found, &scratch, notify::current_uid()).map_err(|reason| {
                     Error::Refused(format!(
                         "{} at {} is not used: {reason}; anything running as another user, or anything that writes a cache or temporary file, could have put it there. Install it in a directory only you or root can write, or fix PATH",
                         reviewer.label(),
@@ -176,14 +177,21 @@ fn scratch_directories(home: Option<&OsStr>, cache: Option<&OsStr>) -> Vec<PathB
 }
 
 /// Why a reviewer found on `PATH` at `found` is not trusted to be the one
-/// the user installed: it, or the directory it is in, can be written by
-/// group or others, or it lies under one of the `scratch` directories.
-/// Both the place `PATH` names and the place a link there leads to are
-/// checked.
-fn refuse_planted(found: &Path, scratch: &[PathBuf]) -> Result<(), String> {
+/// the user `uid` installed: it, or a directory above it, belongs to
+/// someone other than that user or root, or can be written by group or
+/// others, or it lies under one of the `scratch` directories. The place
+/// `PATH` names and every place a link on the way leads to are checked, up
+/// to the root: whoever can write a directory can replace what is in it.
+///
+/// A sticky directory above the one the file is in may be writable by
+/// others (a shared `/srv` laid out like `/tmp`): only an entry's owner
+/// renames it there, and the entry's owner is checked.
+fn refuse_planted(found: &Path, scratch: &[PathBuf], uid: Option<u32>) -> Result<(), String> {
     let resolved =
         fs::canonicalize(found).map_err(|error| format!("it cannot be resolved ({error})"))?;
-    for path in [found, resolved.as_path()] {
+    let mut places = link_hops(found)?;
+    places.push(resolved);
+    for path in places.iter().map(PathBuf::as_path) {
         if let Some(directory) = scratch.iter().find(|directory| path.starts_with(directory)) {
             return Err(format!(
                 "{} is under {}, a temporary or cache directory",
@@ -191,14 +199,28 @@ fn refuse_planted(found: &Path, scratch: &[PathBuf]) -> Result<(), String> {
                 directory.display()
             ));
         }
-        let directory = path.parent().unwrap_or(path);
-        for (what, entry) in [("the directory", directory), ("the file", path)] {
-            let writable = fs::metadata(entry)
-                .map_err(|error| format!("{} cannot be read ({error})", entry.display()))?
-                .mode()
-                & 0o022
-                != 0;
-            if writable {
+        for (depth, entry) in path.ancestors().enumerate() {
+            let what = if depth == 0 {
+                "the file"
+            } else {
+                "the directory"
+            };
+            let unread = |error| format!("{} cannot be read ({error})", entry.display());
+            // A link is its owner's to point elsewhere, so both the link
+            // and what it leads to are looked at.
+            let link = fs::symlink_metadata(entry).map_err(unread)?;
+            let metadata = fs::metadata(entry).map_err(unread)?;
+            if let Some(owner) = [link.uid(), metadata.uid()]
+                .into_iter()
+                .find(|owner| is_foreign_owner(*owner, uid))
+            {
+                return Err(format!(
+                    "{what} {} belongs to another user (uid {owner})",
+                    entry.display()
+                ));
+            }
+            let sticky = depth > 1 && metadata.mode() & 0o1000 != 0;
+            if metadata.mode() & 0o022 != 0 && !sticky {
                 return Err(format!(
                     "{what} {} is writable by other users",
                     entry.display()
@@ -207,6 +229,82 @@ fn refuse_planted(found: &Path, scratch: &[PathBuf]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The most links followed on the way to a reviewer.
+const MAX_LINK_HOPS: usize = 40;
+
+/// `found`, and every path it becomes as the links in it are followed one
+/// at a time: whoever can write the directory a link in the middle lies
+/// in can point it elsewhere.
+fn link_hops(found: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut places = vec![found.to_path_buf()];
+    let mut current = found.to_path_buf();
+    let mut links = 0;
+    while let Some((link, next)) = past_first_link(&current)? {
+        links += 1;
+        if links > MAX_LINK_HOPS {
+            return Err(format!("{} leads through too many links", found.display()));
+        }
+        places.push(link);
+        places.push(next.clone());
+        current = next;
+    }
+    Ok(places)
+}
+
+/// The first link in `path`, at the place it really lies in, and `path`
+/// with that link replaced by what it names; `None` when no part of
+/// `path` is a link.
+fn past_first_link(path: &Path) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    let unread = |at: &Path, error| format!("{} cannot be read ({error})", at.display());
+    let mut prefix = PathBuf::new();
+    let mut parts = path.components();
+    while let Some(part) = parts.next() {
+        let parent = prefix.clone();
+        prefix.push(part);
+        let metadata = fs::symlink_metadata(&prefix).map_err(|error| unread(&prefix, error))?;
+        if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&prefix).map_err(|error| unread(&prefix, error))?;
+            // Nothing above the link is a link, but a `..` there may
+            // stand: the place it lies in is that with each `..` taken.
+            let home = fs::canonicalize(&parent).map_err(|error| unread(&parent, error))?;
+            // An absolute target replaces the parent, as `join` does.
+            let mut next = home.join(target);
+            next.extend(parts);
+            return Ok(Some((home.join(part), next)));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether a file owned by `owner` belongs to someone other than root or
+/// the user `uid`. In a user namespace that does not map root, root's
+/// files show the overflow owner, which is then not foreign either.
+pub fn is_foreign_owner(owner: u32, uid: Option<u32>) -> bool {
+    owner != 0 && Some(owner) != uid && !(owner == overflow_uid() && root_unmapped())
+}
+
+/// The owner the kernel shows for users a user namespace does not map.
+fn overflow_uid() -> u32 {
+    fs::read_to_string("/proc/sys/kernel/overflowuid")
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(65_534)
+}
+
+/// Whether this process runs in a user namespace that does not map root
+/// (a sandbox, as in the end-to-end tests), where root's directories show
+/// the overflow owner. The real pacman hook never runs in one.
+fn root_unmapped() -> bool {
+    fs::read_to_string("/proc/self/uid_map").is_ok_and(|map| {
+        !map.lines().any(|line| {
+            let mut fields = line.split_whitespace();
+            let inside: Option<u64> = fields.next().and_then(|field| field.parse().ok());
+            let count: Option<u64> = fields.nth(1).and_then(|field| field.parse().ok());
+            matches!((inside, count), (Some(start), Some(count)) if start == 0 && count > 0)
+        })
+    })
 }
 
 /// Requires `path` and every directory above it to be owned by root and not
@@ -621,11 +719,12 @@ mod tests {
     #[test]
     fn a_reviewer_in_a_place_others_can_write_is_refused() {
         use std::fs;
-        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
         use super::{refuse_planted, scratch_directories};
 
         let dir = TempDir::new("reviewer-place");
+        let me = Some(fs::metadata(dir.path()).unwrap().uid());
         let mode = |path: &Path, mode: u32| {
             fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
         };
@@ -637,12 +736,12 @@ mod tests {
         mode(&binary, 0o755);
         // Nothing here is a scratch directory for this check.
         let nowhere = [dir.path().join("cache")];
-        assert_eq!(refuse_planted(&binary, &nowhere), Ok(()));
+        assert_eq!(refuse_planted(&binary, &nowhere, me), Ok(()));
 
         // The directory, or the file, writable by group or by everyone.
         for writable in [0o775, 0o757, 0o1777] {
             mode(&install, writable);
-            let reason = refuse_planted(&binary, &nowhere).unwrap_err();
+            let reason = refuse_planted(&binary, &nowhere, me).unwrap_err();
             assert!(
                 reason.contains("the directory") && reason.contains("writable"),
                 "{reason}"
@@ -650,7 +749,7 @@ mod tests {
         }
         mode(&install, 0o755);
         mode(&binary, 0o775);
-        let reason = refuse_planted(&binary, &nowhere).unwrap_err();
+        let reason = refuse_planted(&binary, &nowhere, me).unwrap_err();
         assert!(reason.contains("the file"), "{reason}");
         mode(&binary, 0o755);
 
@@ -659,12 +758,12 @@ mod tests {
         fs::create_dir_all(&cached).unwrap();
         mode(&cached, 0o700);
         write_script(&cached.join("claude"), "#!/bin/sh\n");
-        let reason = refuse_planted(&cached.join("claude"), &nowhere).unwrap_err();
+        let reason = refuse_planted(&cached.join("claude"), &nowhere, me).unwrap_err();
         assert!(reason.contains("temporary or cache directory"), "{reason}");
         // A link from a good directory into one is followed.
         let linked = install.join("opencode");
         symlink(cached.join("claude"), &linked).unwrap();
-        assert!(refuse_planted(&linked, &nowhere).is_err());
+        assert!(refuse_planted(&linked, &nowhere, me).is_err());
         // And one that leads to a directory others can write.
         let shared = dir.path().join("shared");
         fs::create_dir(&shared).unwrap();
@@ -673,11 +772,11 @@ mod tests {
         mode(&shared.join("real"), 0o755);
         let via = install.join("via");
         symlink(shared.join("real"), &via).unwrap();
-        assert!(refuse_planted(&via, &nowhere).is_err());
+        assert!(refuse_planted(&via, &nowhere, me).is_err());
         // A dangling link resolves to nothing.
         let dangling = install.join("dangling");
         symlink(dir.path().join("gone"), &dangling).unwrap();
-        assert!(refuse_planted(&dangling, &nowhere).is_err());
+        assert!(refuse_planted(&dangling, &nowhere, me).is_err());
 
         // The places that count: the temporary directories, the user's
         // cache, and a cache directory named in the environment.
@@ -699,6 +798,173 @@ mod tests {
             3
         );
         assert_eq!(scratch_directories(Some("".as_ref()), None).len(), 3);
+    }
+
+    /// A reviewer installed the way one is under a home directory:
+    /// `home/.local/bin/claude`, the home private, the rest readable. Gives
+    /// the binary and the owner of the fixture.
+    fn installed(dir: &TempDir) -> (std::path::PathBuf, u32) {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let home = dir.path().join("home");
+        let install = home.join(".local/bin");
+        std::fs::create_dir_all(&install).unwrap();
+        for (directory, mode) in [
+            (home.as_path(), 0o700),
+            (&home.join(".local"), 0o755),
+            (&install, 0o755),
+        ] {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let binary = install.join("claude");
+        write_script(&binary, "#!/bin/sh\n");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (binary, std::fs::metadata(dir.path()).unwrap().uid())
+    }
+
+    #[test]
+    fn a_reviewer_in_the_users_own_directories_is_accepted() {
+        use std::os::unix::fs::symlink;
+
+        use super::refuse_planted;
+
+        let dir = TempDir::new("reviewer-home");
+        let (binary, owner) = installed(&dir);
+        let me = Some(owner);
+        assert_eq!(refuse_planted(&binary, &[], me), Ok(()));
+        // Through a linked directory, and as a link to where a version is
+        // kept.
+        let home = dir.path().join("home");
+        symlink(home.join(".local/bin"), home.join("bin")).unwrap();
+        assert_eq!(refuse_planted(&home.join("bin/claude"), &[], me), Ok(()));
+        let versions = home.join(".local/share/claude/versions");
+        std::fs::create_dir_all(&versions).unwrap();
+        write_script(&versions.join("1.0"), "#!/bin/sh\n");
+        let linked = home.join(".local/bin/opencode");
+        symlink("../share/claude/versions/1.0", &linked).unwrap();
+        assert_eq!(refuse_planted(&linked, &[], me), Ok(()));
+        // What the system installed is root's, whoever asks.
+        assert_eq!(refuse_planted(Path::new("/bin/sh"), &[], me), Ok(()));
+    }
+
+    #[test]
+    fn a_reviewer_that_belongs_to_another_user_is_refused() {
+        use super::{is_foreign_owner, refuse_planted};
+        use crate::test_support::{NOBODY, give};
+
+        assert!(!is_foreign_owner(0, None));
+        assert!(!is_foreign_owner(0, Some(1000)));
+        assert!(!is_foreign_owner(1000, Some(1000)));
+        assert!(is_foreign_owner(1000, Some(1001)));
+        assert!(is_foreign_owner(1000, None));
+
+        let dir = TempDir::new("reviewer-owner");
+        let (binary, owner) = installed(&dir);
+        assert_eq!(refuse_planted(&binary, &[], Some(owner)), Ok(()));
+        if owner == 0 {
+            // Root's own files are anyone's to use: hand them to another.
+            for (entry, what) in [
+                (binary.as_path(), "the file"),
+                (binary.parent().unwrap(), "the directory"),
+                (dir.path().join("home").as_path(), "the directory"),
+            ] {
+                if give(entry, NOBODY) {
+                    let reason = refuse_planted(&binary, &[], Some(0)).unwrap_err();
+                    assert!(
+                        reason.contains(what) && reason.contains("belongs to another user"),
+                        "{reason}"
+                    );
+                    assert!(give(entry, 0));
+                }
+            }
+        } else if !super::root_unmapped() {
+            // Asked for by someone else, the same files are another user's
+            // (where root is not mapped, the owner shown stands for any
+            // user, and is nobody's).
+            for other in [Some(owner + 1), None] {
+                let reason = refuse_planted(&binary, &[], other).unwrap_err();
+                assert!(
+                    reason.contains("the file") && reason.contains("belongs to another user"),
+                    "{reason}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_reviewer_below_a_directory_others_can_write_is_refused() {
+        use std::fs;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        use super::refuse_planted;
+
+        let dir = TempDir::new("reviewer-above");
+        let (binary, owner) = installed(&dir);
+        let me = Some(owner);
+        let mode = |path: &Path, mode: u32| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let home = dir.path().join("home");
+        // A link from a good place to the same file is refused with it.
+        let good = dir.path().join("good");
+        fs::create_dir(&good).unwrap();
+        mode(&good, 0o755);
+        symlink(&binary, good.join("claude")).unwrap();
+        for (above, restored) in [(home.join(".local"), 0o755), (home.clone(), 0o700)] {
+            for writable in [0o775, 0o757, 0o777] {
+                mode(&above, writable);
+                for found in [&binary, &good.join("claude")] {
+                    let reason = refuse_planted(found, &[], me).unwrap_err();
+                    assert!(
+                        reason.contains("the directory")
+                            && reason.contains(&above.display().to_string())
+                            && reason.contains("writable"),
+                        "{reason}"
+                    );
+                }
+            }
+            // Sticky, as `/tmp` is: only its owner renames what is in it.
+            mode(&above, 0o1777);
+            assert_eq!(refuse_planted(&binary, &[], me), Ok(()));
+            mode(&above, restored);
+        }
+        assert_eq!(refuse_planted(&binary, &[], me), Ok(()));
+
+        // A link on the way that lies in a directory others can write:
+        // neither the place found nor the place it ends at shows it.
+        let middle = dir.path().join("middle");
+        fs::create_dir(&middle).unwrap();
+        symlink(&binary, middle.join("tool")).unwrap();
+        symlink(binary.parent().unwrap(), middle.join("bin")).unwrap();
+        symlink(middle.join("tool"), good.join("opencode")).unwrap();
+        symlink(middle.join("bin"), home.join("linked")).unwrap();
+        let through = [good.join("opencode"), home.join("linked/claude")];
+        mode(&middle, 0o755);
+        for found in &through {
+            assert_eq!(refuse_planted(found, &[], me), Ok(()), "{found:?}");
+        }
+        mode(&middle, 0o777);
+        for found in &through {
+            let reason = refuse_planted(found, &[], me).unwrap_err();
+            assert!(
+                reason.contains(&middle.display().to_string()) && reason.contains("writable"),
+                "{reason}"
+            );
+        }
+        // A link kept in a scratch directory and reached by a relative
+        // target: the place it lies in is told with each `..` taken.
+        mode(&middle, 0o755);
+        let cache = home.join(".cache");
+        fs::create_dir(&cache).unwrap();
+        symlink("../.local/bin/claude", cache.join("kept")).unwrap();
+        symlink("../home/.cache/kept", good.join("relayed")).unwrap();
+        assert_eq!(refuse_planted(&good.join("relayed"), &[], me), Ok(()));
+        let reason =
+            refuse_planted(&good.join("relayed"), std::slice::from_ref(&cache), me).unwrap_err();
+        assert!(reason.contains("temporary or cache"), "{reason}");
+        // A link that leads back to itself is refused, not followed for ever.
+        symlink(home.join("loop"), home.join("loop")).unwrap();
+        assert!(refuse_planted(&home.join("loop"), &[], me).is_err());
     }
 
     #[test]
