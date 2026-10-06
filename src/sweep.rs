@@ -39,6 +39,7 @@ use std::process::ExitCode;
 use crate::config::Settings;
 use crate::config::model::{RootConsent, SourceClass};
 use crate::engine::store::Store;
+use crate::error::Error;
 use crate::notify;
 use crate::report::{AgentOutcome, Blocked, Decision, Gap, Report};
 use crate::review::ReviewContext;
@@ -139,10 +140,10 @@ fn home() -> Option<String> {
 /// Collects this system and the user's home.
 /// Collects this system and the user's home, and runs the live checks;
 /// returns the live checks' notes too.
-fn collect_here(home: Option<&str>) -> Result<(Collection, PackageIndex, Vec<String>), String> {
+fn collect_here(home: Option<&str>) -> Result<(Collection, PackageIndex, Vec<String>), Error> {
     let index = index::foreign_packages()
         .and_then(|foreign| PackageIndex::load(Path::new(LOCAL_DB), foreign))
-        .map_err(|error| format!("cannot read the package database: {error}"))?;
+        .map_err(|error| Error::Refused(format!("cannot read the package database: {error}")))?;
     let scope = Scope {
         root: Path::new("/"),
         home,
@@ -173,14 +174,15 @@ fn collect_here(home: Option<&str>) -> Result<(Collection, PackageIndex, Vec<Str
     Ok((collection, index, notes))
 }
 
-fn state_directory() -> Result<std::path::PathBuf, String> {
-    let root = Store::default_root().ok_or("no state directory (set HOME or XDG_STATE_HOME)")?;
+fn state_directory() -> Result<std::path::PathBuf, Error> {
+    let root = Store::default_root()
+        .ok_or_else(|| Error::Refused("no state directory (set HOME or XDG_STATE_HOME)".into()))?;
     state::directory(&root)
 }
 
 /// The item the sweep shows as `label`, with everything root's latest
 /// results add.
-fn collect_for_allow(settings: &Settings) -> Result<(Collection, Option<String>), String> {
+fn collect_for_allow(settings: &Settings) -> Result<(Collection, Option<String>), Error> {
     let home = home();
     let (mut collection, _, mut notes) = collect_here(home.as_deref())?;
     // Items only root can read come from root's latest results.
@@ -188,14 +190,16 @@ fn collect_for_allow(settings: &Settings) -> Result<(Collection, Option<String>)
     Ok((collection, home))
 }
 
-fn allow(label: &str, settings: &Settings) -> Result<String, String> {
+fn allow(label: &str, settings: &Settings) -> Result<String, Error> {
     let (collection, home) = collect_for_allow(settings)?;
     let item = collection
         .items
         .iter()
         .find(|item| judge::label(item, home.as_deref()) == label)
         .ok_or_else(|| {
-            format!("{label} is not something the sweep lists; use the path as it shows it")
+            Error::Refused(format!(
+                "{label} is not something the sweep lists; use the path as it shows it"
+            ))
         })?;
     if item.is_trusted() {
         return Ok(format!(
@@ -204,12 +208,14 @@ fn allow(label: &str, settings: &Settings) -> Result<String, String> {
         ));
     }
     if let Some(reason) = state::not_allowable(item) {
-        return Err(format!("{label} cannot be allowed: {reason}"));
+        return Err(Error::Refused(format!(
+            "{label} cannot be allowed: {reason}"
+        )));
     }
     if item.sha256.is_none() && !matches!(item.body, collect::Body::Link(_)) {
-        return Err(format!(
+        return Err(Error::Refused(format!(
             "{label} cannot be read, so it cannot be allowed as it is"
-        ));
+        )));
     }
     // What is allowed is the item as it is at this moment, which is not
     // necessarily what the last sweep showed: it is said, and where the
@@ -251,29 +257,29 @@ fn since_last_sweep(before: Option<&str>, now: &str) -> Option<String> {
 
 /// Asks, on a terminal, whether to allow an item that is not what the last
 /// sweep showed; without one, nothing is allowed.
-fn confirm_changed(difference: &str) -> Result<(), String> {
+fn confirm_changed(difference: &str) -> Result<(), Error> {
     use std::io::IsTerminal as _;
     if !std::io::stdin().is_terminal() {
-        return Err(format!(
+        return Err(Error::Refused(format!(
             "{difference}; run `omarchy-guardian sweep` to see it as it is, or allow it from a terminal"
-        ));
+        )));
     }
     errln!("Note: {difference}. Allow it as it is now? [y/N]");
     let mut answer = String::new();
     std::io::stdin()
         .read_line(&mut answer)
-        .map_err(|error| format!("cannot read the answer: {error}"))?;
+        .map_err(|error| Error::Refused(format!("cannot read the answer: {error}")))?;
     if matches!(answer.trim(), "y" | "Y" | "yes") {
         Ok(())
     } else {
-        Err("nothing was allowed".into())
+        Err(Error::Refused("nothing was allowed".into()))
     }
 }
 
 /// `sweep allow --migrate`: shows what an older Guardian kept in the
 /// user's own list and, after a yes, moves the entries whose items are
 /// still as they were allowed into the system's list.
-fn migrate(settings: &Settings) -> Result<String, String> {
+fn migrate(settings: &Settings) -> Result<String, Error> {
     use std::io::IsTerminal as _;
     let directory = state_directory()?;
     let mut old = state::old_allowed(&directory);
@@ -303,9 +309,9 @@ fn migrate(settings: &Settings) -> Result<String, String> {
     // The old list was the user's own to write, so any program running as
     // them could have added to it: nothing moves without a yes.
     if !std::io::stdin().is_terminal() {
-        return Err(
+        return Err(Error::Refused(
             "these are only moved after you looked at them: run `sweep allow --migrate` in a terminal".into(),
-        );
+        ));
     }
     errln!(
         "Any program running as you could have added to that list. Move these {} item(s) only if you recognise every one. Move them? [y/N]",
@@ -314,7 +320,7 @@ fn migrate(settings: &Settings) -> Result<String, String> {
     let mut answer = String::new();
     std::io::stdin()
         .read_line(&mut answer)
-        .map_err(|error| format!("cannot read the answer: {error}"))?;
+        .map_err(|error| Error::Refused(format!("cannot read the answer: {error}")))?;
     if !matches!(answer.trim(), "y" | "Y" | "yes") {
         return Ok("Nothing moved.".into());
     }
@@ -362,7 +368,7 @@ fn movable(
     (movable, stale)
 }
 
-fn forget(label: Option<&str>) -> Result<String, String> {
+fn forget(label: Option<&str>) -> Result<String, Error> {
     let uid = user::effective_uid()?;
     let allowed = state::allowed_here(uid);
     // What an older Guardian kept in the user's own list counted for
@@ -383,7 +389,9 @@ fn forget(label: Option<&str>) -> Result<String, String> {
     if allowed.contains_key(label) {
         root::system_allow(&["--remove", label])?;
     } else if !stale {
-        return Err(format!("{label} is not in the list of allowed items"));
+        return Err(Error::Refused(format!(
+            "{label} is not in the list of allowed items"
+        )));
     }
     Ok(format!("{label} is no longer allowed."))
 }
@@ -595,7 +603,7 @@ fn before(directory: Option<&Path>, scheduled: bool) -> (bool, Option<Remembered
 }
 
 /// Remembers what this sweep saw; the timer's sweep also as told about.
-fn remember(directory: &Path, current: &Remembered, scheduled: bool) -> Result<(), String> {
+fn remember(directory: &Path, current: &Remembered, scheduled: bool) -> Result<(), Error> {
     state::save_baseline(directory, current)?;
     if scheduled {
         state::save_told(directory, current)?;
@@ -890,7 +898,7 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
     }
     let (mut collection, index, mut notes) = match collect_here(home.as_deref()) {
         Ok(found) => found,
-        Err(message) => return could_not_run(options, settings, &message),
+        Err(message) => return could_not_run(options, settings, &message.to_string()),
     };
     let with_root = add_root_part(&mut collection, options, settings, &mut notes);
     let directory = state_directory()

@@ -8,6 +8,7 @@ use std::process::ExitCode;
 
 use crate::audit::{self, Entry, Event, Gate};
 use crate::config::Settings;
+use crate::error::{Error, IoContext};
 use crate::json::Json;
 use crate::sweep::state;
 use crate::time::now;
@@ -54,20 +55,21 @@ pub(super) fn add(
     class: &str,
     key: &str,
     now: u64,
-) -> Result<Permit, String> {
+) -> Result<Permit, Error> {
     let gate = Gate::parse(gate)
         .filter(|gate| permits(*gate))
-        .ok_or_else(|| format!("{gate:?} is not a gate permits are for"))?;
+        .ok_or_else(|| Error::Refused(format!("{gate:?} is not a gate permits are for")))?;
     if classes(class).is_none() {
-        return Err(format!("{class:?} is not a class"));
+        return Err(Error::Refused(format!("{class:?} is not a class")));
     }
     if !is_hex(key, 64) {
-        return Err("the content is named by its SHA-256 (64 hex characters)".into());
+        return Err(Error::Refused(
+            "the content is named by its SHA-256 (64 hex characters)".into(),
+        ));
     }
-    fs::create_dir_all(directory).map_err(|error| format!("{}: {error}", directory.display()))?;
+    fs::create_dir_all(directory).at(directory)?;
     let open = |path: &Path, mode: u32| {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))
-            .map_err(|error| format!("{}: {error}", path.display()))
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).at(path)
     };
     // Whatever sudo's umask is, the gates run as the user and must be able
     // to read a permit.
@@ -75,7 +77,7 @@ pub(super) fn add(
     remove_where(directory, &|name| ended(directory, name, now));
     let prefix = format!("{uid}-");
     let held = fs::read_dir(directory)
-        .map_err(|error| format!("{}: {error}", directory.display()))?
+        .at(directory)?
         .filter_map(Result::ok)
         .filter(|entry| {
             entry
@@ -85,7 +87,9 @@ pub(super) fn add(
         })
         .count();
     if held >= MAX_PERMITS {
-        return Err("too many permits are in force; revoke some or let them end".into());
+        return Err(Error::Refused(
+            "too many permits are in force; revoke some or let them end".into(),
+        ));
     }
     let permit = Permit {
         uid,
@@ -114,10 +118,12 @@ fn permit_entry(decision: &str, uid: u32) -> Entry {
         .with(audit::FOR_UID, uid.to_string())
 }
 
-fn system_change(arguments: &[String]) -> Result<(), String> {
-    let uid = invoker().ok_or(
-        "a permit is given to the user who asks through sudo: run `omarchy-guardian permit` as that user",
-    )?;
+fn system_change(arguments: &[String]) -> Result<(), Error> {
+    let uid = invoker().ok_or_else(|| {
+        Error::Refused(
+            "a permit is given to the user who asks through sudo: run `omarchy-guardian permit` as that user".into(),
+        )
+    })?;
     let directory = Path::new(DIRECTORY);
     let words: Vec<&str> = arguments.iter().map(String::as_str).collect();
     match words.as_slice() {
@@ -126,7 +132,9 @@ fn system_change(arguments: &[String]) -> Result<(), String> {
             // file is not read here.
             let settings = Settings::system_only();
             if !enabled(&settings, class) {
-                return Err("permits are off under these system settings".into());
+                return Err(Error::Refused(
+                    "permits are off under these system settings".into(),
+                ));
             }
             let permit = add(directory, uid, gate, class, key, now())?;
             permit_entry("GRANTED", uid)
@@ -152,7 +160,7 @@ fn system_change(arguments: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        _ => Err(SYSTEM_USAGE.into()),
+        _ => Err(Error::Refused(SYSTEM_USAGE.into())),
     }
 }
 

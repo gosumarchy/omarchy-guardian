@@ -22,6 +22,7 @@ use super::{
     AI, CLASS, DECISION, DIGEST, EVENT, EXIT, Event, FINDINGS, FOR_UID, FROM, GATE, IDENTIFIER,
     OFFERED, OVERRULED, PERMIT, PROFILE, SUBJECT, TEST, VERSION,
 };
+use crate::error::Error;
 use crate::json::Json;
 use crate::text::shown;
 use crate::time::utc;
@@ -315,7 +316,7 @@ fn rendered(lines: &[Line]) -> Vec<String> {
         .collect()
 }
 
-fn read(options: &Options) -> Result<(String, String), String> {
+fn read(options: &Options) -> Result<(String, String), Error> {
     let mut arguments: Vec<OsString> = vec![
         "--no-pager".into(),
         "--quiet".into(),
@@ -334,10 +335,9 @@ fn read(options: &Options) -> Result<(String, String), String> {
             .iter()
             .map(|event| OsString::from(format!("{EVENT}={}", event.name()))),
     );
-    let captured = tools::run(Path::new(JOURNALCTL), &arguments, None, &[], LIMITS)
-        .map_err(|error| error.to_string())?;
+    let captured = tools::run(Path::new(JOURNALCTL), &arguments, None, &[], LIMITS)?;
     let notes = String::from_utf8_lossy(&captured.stderr).into_owned();
-    let output = captured.into_success().map_err(|error| error.to_string())?;
+    let output = captured.into_success()?;
     Ok((String::from_utf8_lossy(&output).into_owned(), notes))
 }
 

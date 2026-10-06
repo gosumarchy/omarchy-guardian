@@ -562,7 +562,9 @@ fn a_permit_takes_the_typed_word_and_a_terminal() {
     // Root gives itself none: the root half records the user sudo
     // names, and there is none. Nothing is asked and the block is kept.
     if current_uid() == Some(0) {
-        let refused = attempt(&id, &standard, Some("permit")).unwrap_err();
+        let refused = attempt(&id, &standard, Some("permit"))
+            .unwrap_err()
+            .to_string();
         assert!(refused.contains("not by root"), "{refused}");
         assert!(asked.borrow().is_empty());
         assert_eq!(pending_blocks(state.path(), super::now()).len(), 1);

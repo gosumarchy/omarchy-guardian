@@ -17,6 +17,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use crate::error::{Error, IoContext};
 use crate::files::{AtomicWrite, write_atomic};
 use crate::paths;
 use crate::sha256::Sha256;
@@ -276,7 +277,7 @@ const RECORDS: [&str; 3] = ["confirmed", "binaries", "extraction"];
 
 /// Removes what is remembered of the package `key` under the review
 /// memory's `root`; returns how many records there were.
-pub(super) fn forget(root: &Path, key: &str) -> Result<usize, String> {
+pub(super) fn forget(root: &Path, key: &str) -> Result<usize, Error> {
     let name = Sha256::digest(key.as_bytes()).to_string();
     let mut removed = 0;
     for what in RECORDS {
@@ -284,7 +285,7 @@ pub(super) fn forget(root: &Path, key: &str) -> Result<usize, String> {
         match fs::remove_file(&path) {
             Ok(()) => removed += 1,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("{}: {error}", path.display())),
+            Err(source) => return Err(Error::Io { path, source }),
         }
     }
     Ok(removed)
@@ -293,20 +294,24 @@ pub(super) fn forget(root: &Path, key: &str) -> Result<usize, String> {
 /// Removes everything the gate remembers under `root`: the files of its
 /// directory, which stays. Returns how many there were. A directory that
 /// is a link somewhere is left alone.
-pub(super) fn forget_all(root: &Path) -> Result<usize, String> {
+pub(super) fn forget_all(root: &Path) -> Result<usize, Error> {
     let directory = root.join(DIRECTORY);
-    let describe = |error: std::io::Error| format!("{}: {error}", directory.display());
     match fs::symlink_metadata(&directory) {
         Ok(metadata) if metadata.is_dir() => {}
-        Ok(_) => return Err(format!("{} is not a directory", directory.display())),
+        Ok(_) => {
+            return Err(Error::Refused(format!(
+                "{} is not a directory",
+                directory.display()
+            )));
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(describe(error)),
+        Err(error) => return Err(error).at(&directory),
     }
     let mut removed = 0;
-    for entry in fs::read_dir(&directory).map_err(describe)? {
-        let path = entry.map_err(describe)?.path();
+    for entry in fs::read_dir(&directory).at(&directory)? {
+        let path = entry.at(&directory)?.path();
         if fs::symlink_metadata(&path).is_ok_and(|metadata| !metadata.is_dir()) {
-            fs::remove_file(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+            fs::remove_file(&path).at(&path)?;
             removed += 1;
         }
     }

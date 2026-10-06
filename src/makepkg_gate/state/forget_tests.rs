@@ -16,18 +16,18 @@ fn forgetting_a_package_takes_its_records_and_leaves_the_others() {
         state.remember_confirmed("sources abc");
         state.record_binaries(&binaries);
     }
-    assert_eq!(forget(&root, "demo"), Ok(2));
+    assert_eq!(forget(&root, "demo").ok(), Some(2));
     let demo = State::open(Some(&root), "demo");
     assert!(!demo.is_confirmed("sources abc"));
     assert_eq!(demo.binaries(), None);
     assert!(State::open(Some(&root), "other").is_confirmed("sources abc"));
-    assert_eq!(forget(&root, "demo"), Ok(0));
+    assert_eq!(forget(&root, "demo").ok(), Some(0));
 
-    assert_eq!(forget_all(&root), Ok(2));
+    assert_eq!(forget_all(&root).ok(), Some(2));
     assert!(!State::open(Some(&root), "other").is_confirmed("sources abc"));
     // The directory stays, for the next build.
     assert!(root.join("aur-gate").is_dir());
-    assert_eq!(forget_all(&dir.path().join("none")), Ok(0));
+    assert_eq!(forget_all(&dir.path().join("none")).ok(), Some(0));
     // A link in the directory's place is not followed.
     let elsewhere = dir.path().join("elsewhere");
     fs::create_dir_all(elsewhere.join("aur-gate")).unwrap();
