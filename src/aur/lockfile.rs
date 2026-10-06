@@ -263,9 +263,10 @@ pub fn scan(ecosystem: Ecosystem, text: &str) -> Scan {
                 continue;
             }
             // The address ends where the text around it does: at a quote
-            // or a space.
+            // or a space. A `\\` ends it too: in a lockfile it escapes the
+            // `/` that follows.
             let address = rest
-                .split(|c: char| c == '"' || c == '\'' || c.is_whitespace())
+                .split(|c: char| c == '"' || c == '\'' || c == '\\' || c.is_whitespace())
                 .next()
                 .unwrap_or_default();
             let authority = Authority::of(address);

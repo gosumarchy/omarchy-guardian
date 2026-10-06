@@ -518,10 +518,17 @@ struct Authority {
 
 impl Authority {
     /// Reads the authority of an address from just past its `://`. It ends
-    /// where the client that fetches it ends the host: a `?`, a `#` or a
-    /// `\` ends it like a `/`, so nothing after one is the host.
+    /// at a `/`, a `?` or a `#`, so nothing after one is the host. Clients
+    /// disagree about a `\\`: one ends the host there and another takes it
+    /// for part of the user, so an authority with one names no host.
     fn of(rest: &str) -> Self {
-        let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or_default();
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        if authority.contains('\\') {
+            return Self {
+                host: String::new(),
+                user: true,
+            };
+        }
         let user = authority.rsplit_once('@');
         Self {
             host: user
@@ -2594,7 +2601,14 @@ pkgname = demo
             ("x.tar.gz::https://GitHub.com:443/x.tar.gz", "github.com"),
             ("https://evil.example?@github.com/x.tar.gz", "evil.example"),
             ("https://evil.example#@github.com/x.tar.gz", "evil.example"),
-            ("https://evil.example\\@github.com/x.tar.gz", "evil.example"),
+            (
+                "https://evil.example\\@github.com/x.tar.gz",
+                "an unparseable host",
+            ),
+            (
+                "https://github.com\\@evil.example/x.tar.gz",
+                "an unparseable host",
+            ),
             ("https://evil.example/?@github.com/x.tar.gz", "evil.example"),
             ("https://github.com@evil.example/x.tar.gz", "evil.example"),
             (
