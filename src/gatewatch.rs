@@ -448,7 +448,7 @@ pub fn dismiss() {
 /// within a day even where no bar asks for the status.
 pub fn after_sweep(scheduled: bool, settings: &Settings) {
     if scheduled {
-        observe(&crate::tui::status::snapshot(settings), Observer::Watching);
+        observe(&crate::status::snapshot(settings), Observer::Watching);
     }
 }
 

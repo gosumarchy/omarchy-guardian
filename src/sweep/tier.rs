@@ -1,6 +1,7 @@
 //! How far an installed file can be trusted, from what pacman recorded.
 
 use super::index::{PackageIndex, Recorded};
+use crate::integrations::SESSION_ENV;
 use crate::sha256::{Digest, Sha256};
 
 /// From most to least trusted. The sweep hides the first two.
@@ -201,13 +202,12 @@ pub fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex) -> Tie
 }
 
 /// Where `protect` puts the file uwsm reads for the graphical session, in
-/// a home's configuration, and every byte of it (`SESSION_ENV` in
-/// `tui::integrations`, which a test holds this to). It puts the
+/// a home's configuration, and every byte of it (`SESSION_ENV`, the
+/// one constant `integrations` writes it from). It puts the
 /// directory of Guardian's wrappers, root's own, first on `PATH` and does
 /// nothing else, so a file with exactly this content is no more to review
 /// than the package's files, whoever wrote it.
 const SESSION_FILE: &str = "/.config/uwsm/env.d/90-omarchy-guardian";
-const SESSION_ENV: &str = "# Omarchy Guardian: theme and plugin installs found on PATH go through Guardian.\n# Written by `omarchy-guardian protect`, removed by `omarchy-guardian protect --off`.\nexport PATH=\"/usr/lib/omarchy-guardian/bin:$PATH\"\n";
 
 /// What the note on such an item says.
 const SESSION_NOTE: &str = "Guardian's own: written by `omarchy-guardian protect`, unchanged";
@@ -548,13 +548,6 @@ mod tests {
         let other = "home/u/.config/uwsm/env.d/91-other";
         assert_eq!(tier(other, super::SESSION_ENV, 0o644), Tier::Unknown);
         assert!(super::session_note(other, Tier::Vendor, &index).is_none());
-        // The bytes are the ones the integration writes: its constant is
-        // not reachable from here, so its source is held to this one.
-        let written = format!("const SESSION_ENV: &str = {:?};", super::SESSION_ENV);
-        assert!(
-            include_str!("../tui/integrations.rs").contains(&written),
-            "tui::integrations::SESSION_ENV is no longer what the sweep recognises"
-        );
     }
 
     #[test]

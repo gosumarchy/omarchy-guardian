@@ -8,10 +8,10 @@ use crate::config::Settings;
 use crate::config::file::PartialConfig;
 use crate::config::load::FileStatus;
 use crate::config::model::{Named, Profile, SourceClass};
+use crate::integrations::{Integration, Paths, Plan, State};
 use crate::setup::{self, line_diff};
 use crate::tui::canvas::{Canvas, Style, color};
 use crate::tui::fields::{Field, Input, Knob, Scope, Setting, validate};
-use crate::tui::integrations::{Integration, Paths, Plan, State};
 use crate::tui::term::Key;
 
 mod simple;
