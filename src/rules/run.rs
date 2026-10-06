@@ -416,8 +416,10 @@ fn make_includes(line: &str, found: &mut Vec<String>) {
 fn reads_in_file(line: &str, found: &mut Vec<String>) {
     // `$(cat x)` / `` `cat x` `` whose output a shell runs (`sh -c
     // "$(cat x)"`, `eval "$(cat x)"`), not one only captured in a value.
+    let mut reading = shell::Reading::of(line);
     for substitution in shell::substitutions(line) {
         if shell::is_run(line, &substitution)
+            && reading.takes(substitution.body)
             && let Some(command) = shell::command(substitution.body)
             && command.program == "cat"
         {

@@ -164,6 +164,41 @@ pub(super) fn substitutions(text: &str) -> Vec<Substitution<'_>> {
     found
 }
 
+/// How much of a line's substitutions may be read beyond twice the line's
+/// own length.
+const MAX_NESTED: usize = 64 * 1024;
+
+/// How much of the substitutions of one line is still read. A substitution
+/// inside another holds the same text again, so sixty-four of them, each
+/// reaching to the end of a long line, are sixty-four times the line: they
+/// are read up to twice the line's length and `MAX_NESTED` more. A line of
+/// a kibibyte never holds more, and neither does one whose substitutions
+/// are not inside one another.
+pub(super) struct Reading {
+    left: usize,
+}
+
+impl Reading {
+    pub(super) const fn of(line: &str) -> Self {
+        Self {
+            left: line.len().saturating_mul(2).saturating_add(MAX_NESTED),
+        }
+    }
+
+    /// Whether `body` is still read. What is asked of a body that is not
+    /// must be answered without it, as a line too long to read would be:
+    /// by taking it to hold what is looked for.
+    pub(super) fn takes(&mut self, body: &str) -> bool {
+        match self.left.checked_sub(body.len()) {
+            Some(left) => {
+                self.left = left;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 /// Splits `text` at each of `separators` that stands outside quotes and
 /// substitutions. A two-character separator is tried before a single one.
 pub(super) fn split_top<'a>(text: &'a str, separators: &[&str]) -> Vec<&'a str> {
@@ -397,9 +432,12 @@ pub(super) fn runs_substitution(line: &str, source: &dyn Fn(&str) -> bool) -> bo
     if !(line.contains("$(") || line.contains("<(") || line.contains('`')) {
         return false;
     }
+    // Whether it is run is asked first: that reads the command before it,
+    // and its body is read only then.
+    let mut reading = Reading::of(line);
     substitutions(line)
         .iter()
-        .any(|found| source(found.body) && is_run(line, found))
+        .any(|found| is_run(line, found) && (!reading.takes(found.body) || source(found.body)))
 }
 
 /// The names `word` is a reference to, quoted or not: `x` for `$x` and for
@@ -601,5 +639,29 @@ mod tests {
         assert!(!is_reference("$xy", "x"));
         assert!(!is_reference("\"$x/y\"", "x"));
         assert_eq!(referenced("x"), [None, None]);
+    }
+
+    #[test]
+    fn substitutions_inside_one_another_are_read_up_to_a_measure() {
+        use super::{MAX_NESTED, Reading};
+        let none = |_: &str| false;
+        let any = |_: &str| true;
+        // A few inside one another are each read.
+        assert!(!runs_substitution("eval $(a $(b $(c $(d))))", &none));
+        assert!(runs_substitution("eval $(a $(b $(c $(d))))", &|body| body == "d"));
+        // Sixty-four that each reach the end of a long line are more than is
+        // read: a line that runs them is taken to run what is looked for.
+        let nested = "$(x ".repeat(50_000);
+        assert!(runs_substitution(&format!("eval {nested}"), &none));
+        // One that is not run is not read at all.
+        assert!(!runs_substitution(&nested, &any));
+        assert!(!runs_substitution(&format!("echo {nested}"), &any));
+        // As many side by side are no more than the line.
+        let beside = "$(x) ".repeat(50_000);
+        assert!(!runs_substitution(&format!("eval {beside}"), &none));
+        let mut reading = Reading::of("abcd");
+        assert!(reading.takes(&"x".repeat(8 + MAX_NESTED)));
+        assert!(!reading.takes("x"));
+        assert!(reading.takes(""));
     }
 }

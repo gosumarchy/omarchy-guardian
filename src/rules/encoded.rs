@@ -250,7 +250,7 @@ fn shell_shape(line: &str) -> bool {
     if shell::runs_substitution(line, &|body| {
         has_decoder(body)
             || prints_escaped_literal(body)
-            || (has_decompressor(body) && body.contains("<<"))
+            || (body.contains("<<") && has_decompressor(body))
     }) {
         return true;
     }
