@@ -19,6 +19,7 @@ use crate::content::{self, Content, Format, Prefix};
 use crate::error::Error;
 use crate::files::{O_NONBLOCK, read_small_file};
 use crate::git_state;
+use crate::paths::extension_lowercase;
 use crate::report::Gap;
 use crate::sha256::{Digest, Sha256};
 
@@ -666,12 +667,7 @@ impl Walker<'_> {
         // How a file is read depends on its name and mode as well as on
         // its bytes: a link under a script's name is not classed by what
         // the same bytes were under a data file's.
-        let extension = rel
-            .rsplit('/')
-            .next()
-            .and_then(|name| name.rsplit_once('.'))
-            .map(|(_, extension)| extension.to_ascii_lowercase())
-            .unwrap_or_default();
+        let extension = extension_lowercase(&rel);
         let key = (
             metadata.dev(),
             metadata.ino(),

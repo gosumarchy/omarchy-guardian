@@ -14,6 +14,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::error::Error;
+use crate::paths::file_name;
 use crate::payload::unescape;
 use crate::sha256::Digest;
 use crate::tools::{self, Limits};
@@ -156,7 +157,7 @@ impl PackageIndex {
     /// `/etc/nsswitch.conf`. A file with a different name (a packaged script
     /// dropped into `/etc/profile.d/`) is not a copy of it.
     pub fn copy_of(&self, digest: &Digest, path: &str) -> Option<&str> {
-        let name = path.rsplit('/').next().unwrap_or(path);
+        let name = file_name(path);
         self.copies
             .get(digest)?
             .iter()

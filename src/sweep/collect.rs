@@ -17,6 +17,7 @@ use super::tier::{self, Observed, Tier, classify};
 use super::{access, boot, commands, config, own, path};
 use crate::autorun::{Category, Kind, Location, SYSTEM, SYSTEM_SWEEP, USER};
 use crate::content::{self, Content};
+use crate::paths::file_name;
 use crate::rules::RuleId;
 use crate::scan::MAX_TEXT_FILE_SIZE;
 use crate::sha256::Digest;
@@ -1052,7 +1053,7 @@ fn unread_tier(scope: &Scope<'_>, path: &str) -> Tier {
 
 /// Whether a file in a user location is one that runs on its own.
 fn wanted(scope: &Scope<'_>, category: Category, relative: &str) -> bool {
-    let name = relative.rsplit('/').next().unwrap_or(relative);
+    let name = file_name(relative);
     match category {
         // A backup Omarchy left (`hyprland.conf.bak.1700000000`) ends in
         // neither; a file Hyprland is told to `source` is followed from
@@ -1125,7 +1126,7 @@ pub fn item_of(
             let resolved = resolved_path
                 .as_deref()
                 .and_then(|resolved| self_tier(scope, resolved));
-            let name = path.rsplit('/').next().unwrap_or(&path);
+            let name = file_name(&path);
             let observed = Observed::Link {
                 target,
                 resolved,

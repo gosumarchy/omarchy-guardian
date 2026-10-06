@@ -9,6 +9,7 @@
 //! binary formats are recognised by their magic bytes and stay hash-only.
 //! Other text in a legacy encoding is reviewed with replacement characters.
 
+use crate::paths::{extension_lowercase, file_name};
 use crate::rules;
 
 /// How much of a large file is looked at to classify it.
@@ -182,7 +183,7 @@ pub fn must_review(rel: &str, head: &[u8]) -> bool {
     if head.starts_with(b"#!") {
         return true;
     }
-    let name = rel.rsplit('/').next().unwrap_or(rel).to_ascii_lowercase();
+    let name = file_name(rel).to_ascii_lowercase();
     let extension = name
         .rsplit_once('.')
         .map(|(_, extension)| extension)
@@ -407,12 +408,7 @@ fn utf16(bytes: &[u8]) -> Option<String> {
 
 /// The binary format `bytes` start with, if known.
 fn magic(rel: &str, bytes: &[u8]) -> Option<Format> {
-    let extension = rel
-        .rsplit('/')
-        .next()
-        .and_then(|name| name.rsplit_once('.'))
-        .map(|(_, extension)| extension.to_ascii_lowercase())
-        .unwrap_or_default();
+    let extension = extension_lowercase(rel);
     let known = |label: &'static str, executable: bool| Format::Known { label, executable };
     for (offset, magic, label, executable) in MAGIC {
         if bytes.get(*offset..offset + magic.len()) == Some(*magic) {

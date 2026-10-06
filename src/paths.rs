@@ -1,5 +1,5 @@
 //! Where Guardian keeps things: the XDG base directories, and directories
-//! that only one user can reach.
+//! that only one user can reach. Also the parts of a path written as text.
 
 use std::env;
 use std::ffi::OsString;
@@ -55,6 +55,22 @@ fn resolve(
     };
     accepted(xdg, accept_xdg)
         .or_else(|| accepted(home, accept_home).map(|home| home.join(below_home)))
+}
+
+/// The file name of a path written with `/`: what follows the last one, or
+/// all of it where there is none. Nothing, for a path that ends in one.
+pub fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// The extension of a path's file name in lowercase: what follows its last
+/// `.`, or nothing where it has none. A name that starts with its only dot
+/// (`.bashrc`) has the rest as its extension.
+pub fn extension_lowercase(path: &str) -> String {
+    file_name(path)
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default()
 }
 
 /// Makes sure `root` is a private directory of `uid`: creates it (and
@@ -142,7 +158,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
-    use super::{Accept, private_dir, resolve};
+    use super::{Accept, extension_lowercase, file_name, private_dir, resolve};
     use crate::test_support::TempDir;
 
     fn found(
@@ -201,6 +217,47 @@ mod tests {
             found(None, Any, Some("/h"), Any),
             Some(PathBuf::from("/h").join(".local").join("state"))
         );
+    }
+
+    #[test]
+    fn the_file_name_is_what_follows_the_last_slash() {
+        assert_eq!(file_name("a/b/c.txt"), "c.txt");
+        assert_eq!(file_name("c.txt"), "c.txt");
+        assert_eq!(file_name("/usr/bin/sh"), "sh");
+        assert_eq!(file_name("a/b/"), "");
+        assert_eq!(file_name("/"), "");
+        assert_eq!(file_name(""), "");
+        assert_eq!(file_name("a//b"), "b");
+        // Only `/` parts a path; nothing is resolved.
+        assert_eq!(file_name("a/.."), "..");
+        assert_eq!(file_name("a\\b"), "a\\b");
+        // As the expression it replaces, for any of these.
+        for path in [
+            "",
+            "/",
+            "a",
+            "a/",
+            "/a",
+            "a/b",
+            "a/b/",
+            "a//",
+            "\u{e9}/\u{e9}",
+        ] {
+            assert_eq!(file_name(path), path.rsplit('/').next().unwrap_or_default());
+        }
+    }
+
+    #[test]
+    fn the_extension_is_what_follows_the_last_dot_of_the_name() {
+        assert_eq!(extension_lowercase("a/b/c.TXT"), "txt");
+        assert_eq!(extension_lowercase("archive.tar.GZ"), "gz");
+        assert_eq!(extension_lowercase("a.d/file"), "");
+        assert_eq!(extension_lowercase("file"), "");
+        assert_eq!(extension_lowercase("file."), "");
+        assert_eq!(extension_lowercase(".bashrc"), "bashrc");
+        assert_eq!(extension_lowercase("a/.SH"), "sh");
+        assert_eq!(extension_lowercase("a.sh/"), "");
+        assert_eq!(extension_lowercase(""), "");
     }
 
     #[test]

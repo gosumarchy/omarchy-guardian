@@ -13,6 +13,8 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use crate::paths::file_name;
+
 /// One line as the local rules see it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Line {
@@ -119,7 +121,7 @@ fn language(rel: &str, text: &str) -> Language {
 fn shebang(text: &str) -> Option<Language> {
     let line = text.lines().next()?.strip_prefix("#!")?;
     let mut words = line.split_whitespace();
-    let basename = |word: &str| word.rsplit('/').next().unwrap_or_default().to_string();
+    let basename = |word: &str| file_name(word).to_string();
     let mut program = basename(words.next()?);
     if program == "env" {
         program = basename(words.find(|word| !word.starts_with('-'))?);
@@ -389,7 +391,7 @@ fn output_may_run(text: &str) -> bool {
             })
             .unwrap_or_default();
         let program = program.trim_matches(['"', '\'']);
-        let program = program.rsplit('/').next().unwrap_or_default();
+        let program = file_name(program);
         INTERPRETERS.contains(&program)
     });
 

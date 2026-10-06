@@ -6,6 +6,7 @@
 
 use super::{path, tools};
 use crate::autorun::Category;
+use crate::paths::file_name;
 use crate::rules::RuleId;
 
 /// Hosts that updates, packages and the AI review come from: a line in
@@ -223,7 +224,7 @@ pub fn alerts(
     text: &str,
     there: &dyn Fn(&str) -> bool,
 ) -> Vec<(RuleId, String)> {
-    let name = path.rsplit('/').next().unwrap_or(path);
+    let name = file_name(path);
     let mut found: Vec<(RuleId, String)> = Vec::new();
     if matches!(category, Category::Shell | Category::Environment) {
         found.extend(

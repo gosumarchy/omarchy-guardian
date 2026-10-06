@@ -15,6 +15,7 @@ use super::read::{self, Found, View};
 use super::tier::Tier;
 use crate::autorun::Category;
 use crate::encoding::base64_decode;
+use crate::paths::file_name;
 use crate::rules::RuleId;
 use crate::sha256::Sha256;
 
@@ -94,7 +95,7 @@ pub fn accounts(passwd: &str) -> Vec<Account> {
 
 impl Account {
     fn can_log_in(&self) -> bool {
-        let shell = self.shell.rsplit('/').next().unwrap_or_default();
+        let shell = file_name(&self.shell);
         !NO_LOGIN.contains(&shell)
     }
 }
@@ -653,7 +654,7 @@ pub fn items(scope: &Scope<'_>) -> (Vec<Item>, Option<String>) {
             .iter()
             .find(|account| account.home == home)
             .map_or_else(
-                || home.rsplit('/').next().unwrap_or(home).to_string(),
+                || file_name(home).to_string(),
                 |account| account.name.clone(),
             );
         // The user id is what `%U` in the server's configuration stands

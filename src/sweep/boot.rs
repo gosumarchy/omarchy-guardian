@@ -15,6 +15,7 @@ use super::collect::{self, Body, Item, Scope};
 use super::read::{self, Found};
 use super::tier::Tier;
 use crate::autorun::Category;
+use crate::paths::file_name;
 use crate::rules::RuleId;
 use crate::sha256::Sha256;
 
@@ -242,7 +243,7 @@ fn default_names(scope: &Scope<'_>) -> Vec<String> {
 /// snapshot's boot entry (Limine with snapper keeps those after every
 /// kernel update), which no installed package can vouch for any more.
 fn is_started(scope: &Scope<'_>, path: &str, defaults: &[String]) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
+    let name = file_name(path);
     if defaults.iter().any(|default| default == name) {
         return true;
     }

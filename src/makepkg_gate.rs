@@ -58,6 +58,7 @@ use crate::json::Json;
 use crate::notify::{self, Ran};
 use crate::osv;
 use crate::pacman;
+use crate::paths::file_name;
 use crate::permit::{self, Content, Standing};
 use crate::report::{Blocked, Decision, Gap, Report, RunRef};
 use crate::review::{self, ReviewContext};
@@ -1775,7 +1776,7 @@ fn prebuilt(step: &UpstreamStep<'_>, upstream: &Upstream, sources: &[aur::Source
     }
     let builds = aur::defines_function(step.recipe, "build");
     let named = |path: &str| {
-        let name = path.rsplit('/').next().unwrap_or(path);
+        let name = file_name(path);
         upstream.is_unpacked(path) || (name.len() >= 5 && functions.written.contains(name))
     };
     let mut programs: BTreeMap<String, String> = upstream

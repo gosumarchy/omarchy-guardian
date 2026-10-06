@@ -9,6 +9,7 @@ use std::path::Path;
 use super::programs::{self, Argument, SCRIPT_SHELLS, ScriptArguments, is_script_shell};
 use super::{lua, read};
 use crate::autorun::Category;
+use crate::paths::file_name;
 
 /// A wrapper that runs the command after it: its name, its options that
 /// take the next word as their value, and how many words of its own come
@@ -120,7 +121,7 @@ pub fn is_ssh_rc(path: &str) -> bool {
 /// the shell `busybox` is asked to be.
 fn shebang_shell(line: &str) -> Option<&str> {
     fn named(word: &str) -> &str {
-        word.rsplit('/').next().unwrap_or(word)
+        file_name(word)
     }
     let mut words = line.split_whitespace().peekable();
     let mut name = named(words.next()?);
@@ -155,7 +156,7 @@ pub fn is_shell_script(path: &str, text: &str) -> bool {
     if let Some(line) = first.strip_prefix("#!") {
         return shebang_shell(line).is_some();
     }
-    let name = path.rsplit('/').next().unwrap_or(path);
+    let name = file_name(path);
     SCRIPT_SHELLS
         .iter()
         .any(|shell| read::has_extension(name, shell))
@@ -163,7 +164,7 @@ pub fn is_shell_script(path: &str, text: &str) -> bool {
 
 /// The command lines `text` (a file of `category` named `name`) runs.
 pub fn commands(category: Category, path: &str, text: &str) -> Vec<String> {
-    let name = path.rsplit('/').next().unwrap_or(path);
+    let name = file_name(path);
     // The login script of the SSH server is read as the shell script it is.
     let category = if is_ssh_rc(path) {
         Category::Shell
@@ -1311,7 +1312,7 @@ impl Lookup<'_> {
 fn past_wrappers(lookup: &Lookup<'_>, words: &mut Vec<String>, found: &mut Vec<String>) -> usize {
     let mut at = 0;
     while let Some(word) = words.get(at).cloned() {
-        let name = word.rsplit('/').next().unwrap_or(&word);
+        let name = file_name(&word);
         let assignment = word.contains('=') && !word.starts_with('/') && !word.starts_with('-');
         if assignment || word == "--" || word.starts_with('-') {
             at += 1;
@@ -1371,7 +1372,7 @@ fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
         return found;
     };
     found.extend(locate(lookup, program));
-    let mut name = program.rsplit('/').next().unwrap_or(program);
+    let mut name = file_name(program);
     // `busybox sh script`: the shell is the applet it is asked to be.
     if name == "busybox"
         && let Some(applet) = words.next_if(|applet| is_script_shell(applet))

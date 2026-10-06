@@ -6,6 +6,7 @@
 use std::net::IpAddr;
 use std::path::Path;
 
+use crate::paths::file_name;
 use crate::report::Severity;
 
 pub mod addressed;
@@ -1531,7 +1532,7 @@ const SANDBOX_HELPERS: &[&str] = &[
 
 /// Whether `path` names one of those helpers.
 pub fn is_sandbox_helper(path: &str) -> bool {
-    SANDBOX_HELPERS.contains(&path.rsplit('/').next().unwrap_or_default())
+    SANDBOX_HELPERS.contains(&file_name(path))
 }
 
 /// The line with every `chmod 4755` / `chmod u+s` / `chown root` of a lone
@@ -1551,7 +1552,7 @@ fn without_sandbox_helper_setuid(line: &str) -> Option<String> {
             ("chmod", Some("4755" | "u+s")) | ("chown", Some("root" | "root:root"))
         ) && words.get(index + 2).is_some_and(|target| {
             let target = unquoted(target.trim_end_matches(';'));
-            SANDBOX_HELPERS.contains(&target.rsplit('/').next().unwrap_or_default())
+            SANDBOX_HELPERS.contains(&file_name(&target))
         }) && words.get(index + 3).is_none_or(|next| {
             matches!(next.as_str(), "||" | "&&" | ";" | "|" | "2>/dev/null")
                 || words[index + 2].ends_with(';')
@@ -2288,7 +2289,7 @@ pub fn is_executable_or_runtime_config(rel: &str) -> bool {
 /// example under `~/secrets/`) does not matter.
 pub fn is_sensitive_path(rel: &str) -> bool {
     let lower = rel.to_lowercase();
-    let name = lower.rsplit('/').next().unwrap_or_default();
+    let name = file_name(&lower);
 
     lower.split('/').any(|component| {
         matches!(

@@ -7,6 +7,7 @@ use std::mem;
 use crate::agent::SourceFile;
 use crate::engine::diff;
 use crate::json;
+use crate::paths::file_name;
 use crate::rules;
 
 /// Unchanged lines shown around each change in an upgrade diff.
@@ -148,10 +149,6 @@ pub struct HashOnly {
 
 /// The most hash-only manifest rows; the rest are counted in one row.
 const MAX_HASH_ONLY_ROWS: usize = 64;
-
-fn file_name(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
-}
 
 /// A file name without its extension, as code names a module (`import
 /// helper` for `helper.py`).
@@ -467,7 +464,7 @@ pub fn tier(path: &str, content: &str, flagged: bool, unit_prefixes: &[String]) 
 }
 
 fn is_entry_point(path: &str, content: &str, unit_prefixes: &[String]) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+    let name = file_name(path).to_ascii_lowercase();
     let extension = name.rsplit_once('.').map_or("", |(_, extension)| extension);
     let top_level = is_top_level(path, unit_prefixes);
 

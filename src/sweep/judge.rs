@@ -12,6 +12,7 @@ use crate::autorun::Category;
 use crate::engine::baseline::{Identity, Unit};
 use crate::engine::plan::HashOnly;
 use crate::git_state;
+use crate::paths::file_name;
 use crate::report::{Gap, LocalFinding, Report};
 use crate::review::{self, ReviewContext};
 use crate::rules::RuleId;
@@ -229,7 +230,7 @@ fn is_local_only(item: &Item, home: Option<&str>) -> bool {
                 .any(|home| path.starts_with(&format!("{home}/")))
         });
     let path = collect::stands_for(item);
-    let name = path.rsplit('/').next().unwrap_or_default();
+    let name = file_name(path);
     match item.category {
         // The login script is code, not configuration: it is reviewed.
         Category::Ssh if commands::is_ssh_rc(path) => false,
@@ -321,7 +322,7 @@ pub fn reading(item: &Item, home: Option<&str>, text: &str) -> Reading {
 /// Whether `text` is credibly a script by its first line or by the name of
 /// the file at `file`.
 fn is_script(file: &str, text: &str) -> bool {
-    let name = file.rsplit('/').next().unwrap_or(file);
+    let name = file_name(file);
     text.trim_start_matches('\u{feff}').starts_with("#!")
         || SCRIPT_EXTENSIONS
             .iter()
@@ -806,10 +807,7 @@ fn local_checks(report: &mut Report, item: &Item, label: &str, text: &str) {
     }
     // A linked file is the file its link stands for: `~/.ssh/rc` kept in
     // a dotfiles directory is still what the server runs at login.
-    let name = collect::stands_for(item)
-        .rsplit('/')
-        .next()
-        .unwrap_or_default();
+    let name = file_name(collect::stands_for(item));
     for (index, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.starts_with('#') {
