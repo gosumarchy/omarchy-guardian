@@ -313,7 +313,11 @@ reviewed too, except where it is kept from the AI, which is said below.
   compiler from outside the system's directories), not `EDITOR`, `PAGER` or an
   app's own; and a Python interpreter in a virtual environment a tool keeps
   under `~/.cache` (Poetry, uv, pre-commit) or `~/.local/share/virtualenvs` is
-  a project's ordinary one.
+  a project's ordinary one. The file is read by key, as JSON with comments,
+  wherever on a line a key stands and however many lines its value takes. One
+  that cannot be read that way to its end (an editor loads what it can of
+  such a file) is itself a finding, at the line where it stops making sense:
+  none of its settings were checked.
 - **`/etc/hosts` and `/etc/crypttab`.** In `/etc/hosts` (checked locally,
   never sent to the AI), a line for a host that updates, packages or the AI
   review come from (archlinux.org, omarchy.org, github.com, anthropic.com, the
@@ -342,7 +346,10 @@ What is a finding there:
   read as another, or a host data is dropped off at.
 
 One that names a path in a temporary or cache directory, or an `http://`
-address, says so, and each finding names its line.
+address, says so, and each finding names its line. Cargo's and bun's files are
+read as TOML, by key however it is written (`build.rustc-wrapper = …`, `build
+= { rustc-wrapper = … }`, a value over several lines); one that is not TOML is
+read line by line, and a finding says so.
 
 What developers set every day is not a finding: a compiler or linker by its
 name or from the system's directories (`linker = "clang"`, the same in

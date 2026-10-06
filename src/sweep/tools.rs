@@ -7,6 +7,7 @@
 //! and the host of an address.
 
 use super::config::{host, is_usual, key_value};
+use crate::tomlish;
 
 /// How what is seen ends when the value is a path in a temporary or cache
 /// directory, where downloads land and anyone's program may write.
@@ -647,6 +648,83 @@ fn pair(line: &str) -> Option<(String, &str)> {
     Some((key.trim_start_matches("--").to_string(), value))
 }
 
+/// What is said of a TOML file that cannot be read as one.
+const NOT_TOML: &str =
+    "the file cannot be read as TOML from here on: only keys that start a line were checked";
+
+/// How deep inline tables are looked into.
+const MAX_INLINE_DEPTH: usize = 8;
+
+/// What the TOML entry at `path` (its tables, then its key) does, at
+/// `line`. An inline table that says nothing as a whole is looked into:
+/// `build = { rustc-wrapper = "/x" }` is `build.rustc-wrapper = "/x"`.
+fn toml_entry(
+    tool: Tool,
+    path: &[String],
+    value: &str,
+    (line, depth): (usize, usize),
+    found: &mut Vec<(usize, String)>,
+) {
+    let Some((key, tables)) = path.split_last() else {
+        return;
+    };
+    let section = tables.join(".");
+    let seen = if tool == Tool::Bun {
+        bun(&section, key, value)
+    } else {
+        cargo(&section, key, value)
+    };
+    if let Some(seen) = seen {
+        found.push((line, seen));
+    } else if depth < MAX_INLINE_DEPTH && value.starts_with('{') {
+        for (inner, value) in inline_members(value) {
+            let path: Vec<String> = path.iter().cloned().chain(inner).collect();
+            toml_entry(tool, &path, &value, (line, depth + 1), found);
+        }
+    }
+}
+
+/// The keys of an inline table (`{ a = 1, b.c = "x" }`), each as its path
+/// in lower case, with its value.
+fn inline_members(table: &str) -> Vec<(Vec<String>, String)> {
+    let inner = table
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .unwrap_or_default();
+    // Split at the commas that are in no string and no table or array of
+    // the table's own.
+    let mut members = Vec::new();
+    let mut start = 0;
+    let mut depth = 0_usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (at, character) in inner.char_indices() {
+        match (quote, character) {
+            _ if escaped => escaped = false,
+            (Some('"'), '\\') => escaped = true,
+            (Some(open), _) if character == open => quote = None,
+            (None, '"' | '\'') => quote = Some(character),
+            (None, '{' | '[') => depth += 1,
+            (None, '}' | ']') => depth = depth.saturating_sub(1),
+            (None, ',') if depth == 0 => {
+                members.push(&inner[start..at]);
+                start = at + 1;
+            }
+            // Inside a string, or nothing that splits.
+            _ => {}
+        }
+    }
+    members.push(&inner[start..]);
+    members
+        .into_iter()
+        .filter_map(|member| tomlish::entries(member).ok()?.into_iter().next())
+        .map(|entry| {
+            let path = entry.key.iter().map(|part| part.to_ascii_lowercase());
+            (path.collect(), entry.value)
+        })
+        .collect()
+}
+
 /// What the settings of a developer tool at `path` do that is worth
 /// seeing, each with its line; nothing for a file of no known tool.
 pub fn alerts(path: &str, text: &str) -> Vec<(usize, String)> {
@@ -654,6 +732,26 @@ pub fn alerts(path: &str, text: &str) -> Vec<(usize, String)> {
         return Vec::new();
     };
     let mut found = Vec::new();
+    // TOML is read by key, wherever on a line and however it is written
+    // (`build.rustc-wrapper = …`, `build = { rustc-wrapper = … }`).
+    if matches!(tool, Tool::Cargo | Tool::Bun) {
+        match tomlish::entries(text) {
+            Ok(entries) => {
+                for entry in &entries {
+                    let path: Vec<String> = entry
+                        .full_path()
+                        .iter()
+                        .map(|part| part.to_ascii_lowercase())
+                        .collect();
+                    toml_entry(tool, &path, &entry.value, (entry.line, 0), &mut found);
+                }
+                found.truncate(MAX_ALERTS);
+                return found;
+            }
+            // Read line by line then, as far as that goes, and said.
+            Err(error) => found.push((error.line(), NOT_TOML.to_string())),
+        }
+    }
     let mut section = String::new();
     for (index, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -698,33 +796,235 @@ pub fn alerts(path: &str, text: &str) -> Vec<(usize, String)> {
     found
 }
 
-/// The key of a `"key": value` line of a JSON settings file, and the rest.
-fn json_pair(line: &str) -> Option<(&str, &str)> {
-    let rest = line.trim().strip_prefix('"')?;
-    let (key, rest) = rest.split_once('"')?;
-    Some((key, rest.trim_start().strip_prefix(':')?.trim()))
+/// One key of an editor's settings, wherever on a line it stands.
+struct Member {
+    /// The key, with its escapes read.
+    key: String,
+    /// The line the key is on.
+    line: usize,
+    /// The value on one line, as the checks read it: strings in quotes
+    /// with their escapes read, no comments, no blanks between the parts.
+    value: String,
+    /// The keys of the tables the value holds, at whatever depth of lists.
+    inside: Vec<Member>,
 }
 
-/// How deep a line leaves the braces and brackets it opens, relative to
-/// where it started.
-fn depth(line: &str) -> i32 {
-    let mut depth = 0;
-    let mut quoted = false;
-    let mut escaped = false;
-    for character in line.chars() {
-        match character {
-            _ if escaped => escaped = false,
-            '\\' => escaped = true,
-            '"' => quoted = !quoted,
-            '{' | '[' if !quoted => depth += 1,
-            '}' | ']' if !quoted => depth -= 1,
-            _ => {}
+/// How deep the tables and lists of an editor's settings may go.
+const MAX_SETTINGS_DEPTH: usize = 64;
+
+/// Reads an editor's settings the way editors do: JSON with `//` and
+/// `/* */` comments and a comma allowed after the last entry. Unlike them
+/// it does not read on past what it cannot make out: a file an editor
+/// would load in part is not one whose keys were all seen.
+struct Settings<'a> {
+    bytes: &'a [u8],
+    at: usize,
+    line: usize,
+}
+
+impl Settings<'_> {
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.at).copied()
+    }
+
+    /// Skips blanks and comments; `None` for a comment that never ends.
+    fn blank(&mut self) -> Option<()> {
+        loop {
+            match (self.peek(), self.bytes.get(self.at + 1).copied()) {
+                (Some(b'\n'), _) => {
+                    self.line += 1;
+                    self.at += 1;
+                }
+                (Some(b' ' | b'\t' | b'\r'), _) => self.at += 1,
+                (Some(b'/'), Some(b'/')) => {
+                    while self.peek().is_some_and(|byte| byte != b'\n') {
+                        self.at += 1;
+                    }
+                }
+                (Some(b'/'), Some(b'*')) => {
+                    self.at += 2;
+                    while !self.bytes[self.at.min(self.bytes.len())..].starts_with(b"*/") {
+                        if self.peek()? == b'\n' {
+                            self.line += 1;
+                        }
+                        self.at += 1;
+                    }
+                    self.at += 2;
+                }
+                _ => return Some(()),
+            }
         }
     }
-    depth
+
+    /// A string, from its opening quote, with its escapes read.
+    fn string(&mut self) -> Option<String> {
+        let mut read = Vec::new();
+        self.at += 1;
+        loop {
+            let byte = self.peek()?;
+            self.at += 1;
+            match byte {
+                b'"' => return Some(String::from_utf8_lossy(&read).into_owned()),
+                b'\n' | b'\r' => return None,
+                b'\\' => {
+                    let escape = self.peek()?;
+                    self.at += 1;
+                    let character = match escape {
+                        b'"' | b'\\' | b'/' => char::from(escape),
+                        b'b' => '\u{8}',
+                        b'f' => '\u{c}',
+                        b'n' => '\n',
+                        b'r' => '\r',
+                        b't' => '\t',
+                        b'u' => self.escaped()?,
+                        _ => return None,
+                    };
+                    read.extend(character.encode_utf8(&mut [0; 4]).as_bytes());
+                }
+                byte => read.push(byte),
+            }
+        }
+    }
+
+    /// The four hex digits after `\u`.
+    fn unit(&mut self) -> Option<u32> {
+        let digits = self.bytes.get(self.at..self.at + 4)?;
+        let unit = u32::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()?;
+        self.at += 4;
+        Some(unit)
+    }
+
+    /// The character of a `\u` escape, or of the two that make one; a
+    /// half without its other half is the replacement character.
+    fn escaped(&mut self) -> Option<char> {
+        let first = self.unit()?;
+        if (0xd800..0xdc00).contains(&first) && self.bytes[self.at..].starts_with(b"\\u") {
+            let back = self.at;
+            self.at += 2;
+            let second = self.unit()?;
+            if (0xdc00..0xe000).contains(&second) {
+                let joined = 0x1_0000 + ((first - 0xd800) << 10) + (second - 0xdc00);
+                return Some(char::from_u32(joined).unwrap_or(char::REPLACEMENT_CHARACTER));
+            }
+            self.at = back;
+        }
+        Some(char::from_u32(first).unwrap_or(char::REPLACEMENT_CHARACTER))
+    }
+
+    /// Reads one value: its text is added to `text`, and the keys of the
+    /// tables in it to `inside`.
+    fn value(&mut self, depth: usize, text: &mut String, inside: &mut Vec<Member>) -> Option<()> {
+        if depth > MAX_SETTINGS_DEPTH {
+            return None;
+        }
+        self.blank()?;
+        match self.peek()? {
+            open @ (b'{' | b'[') => {
+                let close = if open == b'{' { b'}' } else { b']' };
+                self.at += 1;
+                text.push(char::from(open));
+                loop {
+                    self.blank()?;
+                    if self.peek()? == close {
+                        self.at += 1;
+                        text.push(char::from(close));
+                        return Some(());
+                    }
+                    if open == b'{' {
+                        inside.push(self.member(depth)?);
+                        text.push_str(&inside.last().map(Member::shown).unwrap_or_default());
+                    } else {
+                        self.value(depth + 1, text, inside)?;
+                    }
+                    self.blank()?;
+                    // A comma, or the end; one may follow the last entry.
+                    match self.peek()? {
+                        b',' => {
+                            self.at += 1;
+                            text.push(',');
+                        }
+                        byte if byte == close => {}
+                        _ => return None,
+                    }
+                }
+            }
+            b'"' => {
+                let string = self.string()?;
+                text.push('"');
+                text.push_str(&string);
+                text.push('"');
+                Some(())
+            }
+            _ => {
+                // A number or a word (`true`, `null`).
+                let start = self.at;
+                while self
+                    .peek()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || b"+-.".contains(&byte))
+                {
+                    self.at += 1;
+                }
+                text.push_str(&String::from_utf8_lossy(&self.bytes[start..self.at]));
+                (self.at > start).then_some(())
+            }
+        }
+    }
+
+    /// Reads one `"key": value` of a table.
+    fn member(&mut self, depth: usize) -> Option<Member> {
+        if self.peek()? != b'"' {
+            return None;
+        }
+        let line = self.line;
+        let key = self.string()?;
+        self.blank()?;
+        if self.peek()? != b':' {
+            return None;
+        }
+        self.at += 1;
+        let mut member = Member {
+            key,
+            line,
+            value: String::new(),
+            inside: Vec::new(),
+        };
+        self.value(depth + 1, &mut member.value, &mut member.inside)?;
+        Some(member)
+    }
 }
 
-/// What a line inside a terminal's environment or profile table of an
+impl Member {
+    /// The member as part of the value that holds it.
+    fn shown(&self) -> String {
+        format!("\"{}\":{}", self.key, self.value)
+    }
+}
+
+/// The keys of an editor's settings; the line they stop making sense at
+/// where they cannot be read to the end. An empty file has none.
+fn settings(text: &str) -> Result<Vec<Member>, usize> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut settings = Settings {
+        bytes: text.as_bytes(),
+        at: 0,
+        line: 1,
+    };
+    let mut read = || {
+        settings.blank()?;
+        let mut inside = Vec::new();
+        match settings.peek() {
+            None => return Some(inside),
+            Some(b'{') => settings.value(0, &mut String::new(), &mut inside)?,
+            Some(_) => return None,
+        }
+        settings.blank()?;
+        settings.peek().is_none().then_some(inside)
+    };
+    // The end of a file that ends its last line is not a line of its own.
+    read().ok_or_else(|| settings.line.min(text.lines().count().max(1)))
+}
+
+/// What a key inside a terminal's environment or profile table of an
 /// editor's settings does.
 fn terminal_setting(key: &str, value: &str) -> Option<String> {
     match key {
@@ -811,51 +1111,46 @@ fn editor_setting(key: &str, value: &str) -> Option<String> {
 /// its line: the environment and shell of its terminal, its proxy, the
 /// programs it is told to run from odd places, and the switches that let a
 /// folder run its tasks unasked.
+///
+/// The file is kept from the AI, so nothing else looks at it: one that
+/// cannot be read to the end as an editor's settings is said to be, at the
+/// line where it stops making sense, instead of passing with no key seen.
 pub fn editor(text: &str) -> Vec<(usize, String)> {
     let mut found = Vec::new();
-    // The terminal table the lines are in, and how deep.
-    let mut table: Option<(String, i32)> = None;
-    for (index, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("//") {
-            continue;
-        }
-        let pair = json_pair(line);
-        let mut seen = None;
-        if let Some((name, level)) = &mut table {
-            if let Some((key, value)) = pair {
-                seen = if name.contains(".env.") {
-                    loading_variable(key, value)
-                } else {
-                    terminal_setting(key, value).or_else(|| inline(name, value))
-                };
-            }
-            *level += depth(line);
-            if *level <= 0 {
-                table = None;
-            }
-        } else if let Some((key, value)) = pair {
-            let terminal = ["env.", "profiles.", "automationProfile."]
+    match settings(text) {
+        Ok(settings) => told_of(&settings, None, &mut found),
+        Err(line) => found.push((line, NOT_SETTINGS.to_string())),
+    }
+    found
+}
+
+/// What is said of an editor's settings that cannot be read to the end.
+const NOT_SETTINGS: &str =
+    "the file cannot be read as JSON with comments from here on: none of its settings were checked";
+
+/// What `members` do, each at its line. `table` is the terminal table
+/// they are in (its environment, or its profiles), at whatever depth.
+fn told_of(members: &[Member], table: Option<&str>, found: &mut Vec<(usize, String)>) {
+    for member in members {
+        let (key, value) = (member.key.as_str(), member.value.as_str());
+        let terminal = table.is_none()
+            && ["env.", "profiles.", "automationProfile."]
                 .iter()
                 .any(|kind| key.starts_with(&format!("terminal.integrated.{kind}")));
-            if terminal {
-                // A table written on one line holds its keys on this one.
-                seen = inline(key, value);
-                let level = depth(value);
-                if level > 0 {
-                    table = Some((key.to_string(), level));
-                }
-            } else {
-                seen = editor_setting(key, value);
-            }
-        }
+        let seen = match table {
+            Some(name) if name.contains(".env.") => loading_variable(key, value),
+            Some(_) => terminal_setting(key, value),
+            // What a terminal table does is in its keys.
+            None if terminal => None,
+            None => editor_setting(key, value),
+        };
         if let Some(seen) = seen
             && found.len() < MAX_ALERTS
         {
-            found.push((index + 1, seen));
+            found.push((member.line, seen));
         }
+        told_of(&member.inside, table.or(terminal.then_some(key)), found);
     }
-    found
 }
 
 /// A variable of the editor's terminal that changes what runs or is loaded
@@ -869,24 +1164,9 @@ fn loading_variable(name: &str, value: &str) -> Option<String> {
     .then(|| format!("the editor's terminal starts every program with {name} set by this file"))
 }
 
-/// What a terminal table written on one line (`{"LD_PRELOAD": "/x.so"}`)
-/// does.
-fn inline(table: &str, value: &str) -> Option<String> {
-    value
-        .split(['{', ','])
-        .filter_map(json_pair)
-        .find_map(|(key, value)| {
-            if table.contains(".env.") {
-                loading_variable(key, value)
-            } else {
-                terminal_setting(key, value)
-            }
-        })
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{CLEARTEXT, FROM_TEMPORARY, alerts, editor, is_temporary};
+    use super::{CLEARTEXT, FROM_TEMPORARY, NOT_SETTINGS, NOT_TOML, alerts, editor, is_temporary};
 
     /// What is seen in `text` at `path`, without the line numbers.
     fn seen(path: &str, text: &str) -> Vec<String> {
@@ -1331,5 +1611,235 @@ mod tests {
             ),
             [2]
         );
+    }
+
+    #[test]
+    fn an_editors_settings_are_read_by_key_wherever_on_a_line_it_stands() {
+        let lines =
+            |text: &str| -> Vec<usize> { editor(text).into_iter().map(|(line, _)| line).collect() };
+        // On one line, on the line of the brace, after another key.
+        assert_eq!(lines(r#"{"git.path":"/tmp/x"}"#), [1]);
+        assert_eq!(
+            lines(r#"{ "security.workspace.trust.enabled": false }"#),
+            [1]
+        );
+        assert_eq!(
+            lines("{ \"git.path\": \"/home/u/bin/git\",\n  \"editor.fontSize\": 12 }\n"),
+            [1]
+        );
+        assert_eq!(
+            lines(
+                "{\n  \"editor.fontSize\": 12, \"http.proxyStrictSSL\": false,\n\n  \"task.allowAutomaticTasks\": \"on\" }"
+            ),
+            [2, 4]
+        );
+        // A value that goes over several lines, at the line of its key.
+        assert_eq!(
+            lines(
+                "{\n  \"terminal.integrated.shellArgs.linux\": [\n    \"-c\",\n    \"x\"\n  ]\n}\n"
+            ),
+            [2]
+        );
+        assert_eq!(lines("{\n  \"git.path\":\n\n    \"/tmp/x\"\n}\n"), [2]);
+        // A terminal table on one line with the rest, and its keys below.
+        assert_eq!(
+            lines("{\"a\": 1, \"terminal.integrated.env.linux\": {\"LD_PRELOAD\": \"/x.so\"}}"),
+            [1]
+        );
+        assert_eq!(
+            lines(
+                "{\"terminal.integrated.profiles.linux\": {\"odd\": {\n\"path\": \"/tmp/sh\", \"args\": [\n\"-c\", \"x\"]}}}"
+            ),
+            [2, 2]
+        );
+        // A key in a table of another key's (a language's own settings).
+        assert_eq!(
+            lines("{\"[python]\": {\"python.defaultInterpreterPath\": \"/tmp/v/python\"}}"),
+            [1]
+        );
+        // Comments and a comma after the last entry, as editors allow; a
+        // key after a comment on its line; nothing inside a comment or a
+        // string.
+        let commented = "// \"git.path\": \"/tmp/a\"\n{\n  /* \"git.path\": \"/tmp/b\",\n     \"http.proxyStrictSSL\": false */\n  /* own */ \"git.path\": \"/tmp/c\", // \"git.path\": \"/tmp/d\"\n  \"x.note\": \"\\\"git.path\\\": \\\"/tmp/e\\\" // */ /*\",\n  \"x.list\": [1, 2,],\n}\n";
+        assert_eq!(lines(commented), [5]);
+        // Escapes are read before a key or a value is looked at.
+        assert_eq!(lines(r#"{"git.p\u0061th": "\/tmp\/x"}"#), [1]);
+        assert_eq!(
+            lines(r#"{"terminal.integrated.shellArgs.linux": ["\u002dc", "x \ud83d\ude00"]}"#),
+            [1]
+        );
+        // Nothing to read is nothing to say.
+        for empty in ["", "\n", "// none\n", "/* none */", "{}", "\u{feff}{ }\n"] {
+            assert_eq!(lines(empty), [0; 0], "{empty:?}");
+        }
+    }
+
+    #[test]
+    fn an_editors_settings_that_cannot_be_read_to_the_end_are_said_to_be() {
+        let unread = |text: &str| -> Option<usize> {
+            let found = editor(text);
+            assert!(found.len() <= 1 || found.iter().all(|(_, seen)| seen != NOT_SETTINGS));
+            found
+                .into_iter()
+                .find(|(_, seen)| seen == NOT_SETTINGS)
+                .map(|(line, _)| line)
+        };
+        for (text, line) in [
+            // Cut short, in a table, a string or a comment.
+            ("{\"git.path\": \"/tmp/x\"", 1),
+            ("{\n\"git.path\": \"/tmp/x", 2),
+            ("{\n\"a\": 1 /* \"git.path\": \"/tmp/x\"\n}\n", 3),
+            // What an editor reads on past: a missing comma, a missing
+            // value, a key without quotes, a string over two lines.
+            ("{\n\"a\": 1\n\"git.path\": \"/tmp/x\"\n}\n", 3),
+            ("{\n\"a\":\n}\n", 3),
+            ("{\ngit.path: \"/tmp/x\"\n}\n", 2),
+            ("{\"a\": \"x\ny\", \"git.path\": \"/tmp/x\"}", 1),
+            ("{\"a\": \"\\x\"}", 1),
+            ("{\"a\": 'x'}", 1),
+            // No table of settings, or more after it.
+            ("[]", 1),
+            ("\"git.path\"", 1),
+            ("{}\n{\"git.path\": \"/tmp/x\"}\n", 2),
+            ("{}}", 1),
+        ] {
+            assert_eq!(unread(text), Some(line), "{text:?}");
+        }
+        // Deeper than any settings go.
+        let deep = format!("{{\"a\": {}1{}}}", "[".repeat(100), "]".repeat(100));
+        assert_eq!(unread(&deep), Some(1));
+        let fine = format!("{{\"a\": {}1{}}}", "[".repeat(20), "]".repeat(20));
+        assert_eq!(unread(&fine), None);
+        // It is a finding of the file, at its line.
+        let told = crate::sweep::config::alerts(
+            crate::autorun::Category::Editor,
+            "home/u/.config/Code/User/settings.json",
+            "{\n  \"git.path\": \"/tmp/x\"\n",
+            &|_| false,
+        );
+        assert_eq!(
+            told,
+            [(
+                crate::rules::RuleId::RiskyConfiguration,
+                format!("line 2: {NOT_SETTINGS}")
+            )]
+        );
+    }
+
+    #[test]
+    fn an_editors_settings_are_read_whatever_they_hold() {
+        use crate::test_support::Rng;
+        const PIECES: &[&str] = &[
+            "{",
+            "}",
+            "[",
+            "]",
+            ":",
+            ",",
+            "\"",
+            "\\",
+            "\\u",
+            "d83d",
+            "//",
+            "/*",
+            "*/",
+            "\n",
+            " ",
+            "\"git.path\"",
+            "\"/tmp/x\"",
+            "\"terminal.integrated.env.linux\"",
+            "true",
+            "1",
+            "é",
+        ];
+        let settings = "{\n  // one\n  \"git.path\": \"/tmp/x\", /* two */\n  \"terminal.integrated.env.linux\": { \"LD_PRELOAD\": \"/x.so\" },\n  \"x\": [1, {\"path\": \"\\u00e9\"}],\n}\n";
+        assert_eq!(editor(settings).len(), 2);
+        let check = |text: &str| {
+            let lines = text.lines().count().max(1);
+            for (line, seen) in editor(text) {
+                assert!((1..=lines).contains(&line), "{text:?}: {line}");
+                assert!(!seen.is_empty());
+            }
+        };
+        let mut rng = Rng::new(7);
+        for _ in 0..10_000 {
+            check(&rng.text(PIECES, 16));
+            check(&rng.mutated(settings, PIECES));
+        }
+    }
+
+    #[test]
+    fn toml_settings_are_read_by_key_however_they_are_written() {
+        let cargo = "home/u/.cargo/config.toml";
+        let lines = |path: &str, text: &str| -> Vec<usize> {
+            alerts(path, text)
+                .into_iter()
+                .map(|(line, _)| line)
+                .collect()
+        };
+        // A dotted key, a key in quotes, an inline table, and one in
+        // another; a value over several lines, at the line of its key.
+        for (text, line) in [
+            ("build.rustc-wrapper = \"/tmp/w\"\n", 1),
+            ("\"build\".\"rustc-wrapper\" = \"/tmp/w\"\n", 1),
+            ("build = { rustc-wrapper = \"/tmp/w\" }\n", 1),
+            ("build = { jobs = 8, rustc-wrapper = \"/tmp/w\" }\n", 1),
+            (
+                "http = { timeout = 30, proxy = \"http://10.0.0.1:3128\" }\n",
+                1,
+            ),
+            ("env.LD_PRELOAD = \"/home/u/x.so\"\n", 1),
+            (
+                "env = { A = \"x, y\", LD_PRELOAD = { value = \"/home/u/x.so\", force = true } }\n",
+                1,
+            ),
+            (
+                "target = { x86_64-unknown-linux-gnu = { linker = \"/home/u/ld\" } }\n",
+                1,
+            ),
+            (
+                "[target]\nx86_64-unknown-linux-gnu.runner = \"/tmp/run\"\n",
+                2,
+            ),
+            (
+                "registries.corp = { index = \"sparse+https://crates.corp.example/index/\" }\n",
+                1,
+            ),
+            (
+                "[build]\nrustflags = [\n  \"-C\",\n  \"linker=/tmp/ld\",\n]\n",
+                2,
+            ),
+        ] {
+            assert_eq!(lines(cargo, text), [line], "{text}");
+        }
+        assert_eq!(
+            lines(
+                cargo,
+                "[build]\njobs = 8\nrustflags = [\n  \"-Clinker=/tmp/ld\",\n]\n"
+            ),
+            [3]
+        );
+        assert_eq!(
+            lines(
+                "home/u/.bunfig.toml",
+                "install.registry = \"https://npm.corp.example\"\nrun = { shell = \"/home/u/sh\" }\n"
+            ),
+            [1, 2]
+        );
+        // The same written of what is fine says nothing.
+        for text in [
+            "build.rustc-wrapper = \"sccache\"\nbuild = { jobs = 8 }\n",
+            "env = { CC = \"clang\", NOTE = \"LD_PRELOAD = /x.so, rustc = /tmp/x\" }\n",
+            "registries.ok = { index = \"https://github.com/rust-lang/crates.io-index\" }\n",
+            "[profile.release]\nlto = true\ndebug = { level = 1 }\n",
+        ] {
+            assert_eq!(lines(cargo, text), [0; 0], "{text}");
+        }
+        // A file that is no TOML is read line by line, and said to be.
+        let broken = "[build]\nrustc-wrapper = \"/tmp/w\"\nnot toml at all\n";
+        let found = alerts(cargo, broken);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0], (3, NOT_TOML.to_string()));
+        assert_eq!(found[1].0, 2);
     }
 }
