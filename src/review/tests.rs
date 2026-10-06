@@ -1002,7 +1002,7 @@ fn a_line_that_runs_an_image_is_a_gap_whatever_the_image_holds() {
         ("cat splash.webp | sh", "splash.webp"),
     ] {
         let mut report = Report::new("runs");
-        super::record_runs(&mut report, "src/tool/build.sh", 3, line, line);
+        super::local::record_runs(&mut report, "src/tool/build.sh", 3, line, line);
         super::check_runs(&mut report, &[]);
         let gaps: Vec<String> = report.gaps.iter().map(ToString::to_string).collect();
         assert_eq!(gaps.len(), 1, "{line}: {gaps:?}");
@@ -1020,7 +1020,7 @@ fn a_line_that_runs_an_image_is_a_gap_whatever_the_image_holds() {
         "x=logo.png",
     ] {
         let mut report = Report::new("runs");
-        super::record_runs(&mut report, "src/tool/build.sh", 3, line, line);
+        super::local::record_runs(&mut report, "src/tool/build.sh", 3, line, line);
         super::check_runs(&mut report, &[]);
         assert!(report.gaps.is_empty(), "{line}: {:?}", report.gaps);
     }
