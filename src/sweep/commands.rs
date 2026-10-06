@@ -6,15 +6,9 @@
 #[cfg(test)]
 use std::path::Path;
 
+use super::programs::{self, Argument, SCRIPT_SHELLS, ScriptArguments, is_script_shell};
 use super::{lua, read};
 use crate::autorun::Category;
-
-/// Programs that run the file they are given.
-const INTERPRETERS: &[&str] = &[
-    "sh", "bash", "dash", "zsh", "fish", "ksh", "ash", "mksh", "python", "python3", "perl", "ruby",
-    "node", "bun", "deno", "lua", "luajit", "php", "tclsh", "wish", "expect", "Rscript", "pwsh",
-    "julia", "guile", "awk", "gawk", "mawk",
-];
 
 /// A wrapper that runs the command after it: its name, its options that
 /// take the next word as their value, and how many words of its own come
@@ -118,14 +112,6 @@ pub fn default_search(home: &str) -> Vec<String> {
 /// not configuration, whatever directory it sits in.
 pub fn is_ssh_rc(path: &str) -> bool {
     path == "etc/ssh/sshrc" || path.ends_with("/.ssh/rc")
-}
-
-/// The shells whose scripts are looked through for what they start.
-const SCRIPT_SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "ksh", "ash", "mksh"];
-
-/// Whether `name` (a program's file name) is one of `SCRIPT_SHELLS`.
-pub fn is_script_shell(name: &str) -> bool {
-    SCRIPT_SHELLS.contains(&name)
 }
 
 /// The shell a `#!` line (without the `#!`) runs, if it runs one: the
@@ -1392,13 +1378,9 @@ fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
     {
         name = applet;
     }
-    let interpreter = INTERPRETERS.iter().any(|interpreter| {
-        name == *interpreter
-            || name
-                .strip_prefix(interpreter)
-                .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit() || c == '.'))
-    });
-    if interpreter {
+    if programs::runs_a_script(name) {
+        let shell = is_script_shell(name);
+        let mut arguments = ScriptArguments::default();
         while let Some(word) = words.next() {
             // `sh -c "command line"` (also `-lc`, `-ic`) runs that line:
             // each command in it is found the same way, wrappers and
@@ -1419,17 +1401,21 @@ fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
                 }
                 break;
             }
-            if word == "-e" {
+            // `perl -e code` is given no script. For a shell `-e` is a
+            // plain flag (`bash -e script`).
+            if word == "-e" && !programs::is_shell(name) {
                 break;
             }
             // `bash -o pipefail …`: for a shell the option's name is not
             // the script. For Python `-O` is a plain flag.
-            let shell = is_script_shell(name);
             if shell && matches!(word, "-o" | "-O" | "+o" | "+O") {
                 words.next();
                 continue;
             }
-            if word.starts_with('-') {
+            // `python3 -W ignore script`: the word after an option that
+            // may take a value is looked at, and so is the next.
+            let argument = arguments.read(word);
+            if argument == Argument::Option {
                 continue;
             }
             if word.contains('/') {
@@ -1442,7 +1428,10 @@ fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
                 }
                 found.extend(script);
             }
-            break;
+            // A shell's options that take a value are the ones above.
+            if shell || argument == Argument::Script {
+                break;
+            }
         }
     }
     found
@@ -2129,6 +2118,80 @@ mod tests {
             ["home/u/.cache/x.sh"]
         );
         assert!(targets(root, "home/u", "missing").is_empty());
+    }
+
+    #[test]
+    fn the_script_is_found_for_every_interpreter_and_past_its_options() {
+        let there = [
+            "usr/bin/bash",
+            "usr/bin/tcsh",
+            "usr/bin/python3",
+            "usr/bin/pypy3",
+            "usr/bin/java",
+            "usr/bin/perl",
+            "usr/bin/ncat",
+            "home/u/x.sh",
+            "home/u/x.py",
+            "home/u/app.jar",
+            "home/u/data",
+            "run/x.sock",
+        ];
+        let exists = |path: &str| there.contains(&path);
+        let lookup = super::Lookup {
+            home: "home/u",
+            search: &super::default_search("home/u"),
+            exists: &exists,
+            capped: std::cell::Cell::new(false),
+            shell_scripts: std::cell::RefCell::default(),
+        };
+        // Interpreters the live checks knew and this one did not.
+        assert_eq!(
+            lookup.targets("pypy3 ~/x.py"),
+            ["usr/bin/pypy3", "home/u/x.py"]
+        );
+        assert_eq!(
+            lookup.targets("java -jar /home/u/app.jar"),
+            ["usr/bin/java", "home/u/app.jar"]
+        );
+        assert_eq!(
+            lookup.targets("tcsh -e /home/u/x.sh"),
+            ["usr/bin/tcsh", "home/u/x.sh"]
+        );
+        // Only a Bourne shell's script is read as one.
+        assert!(lookup.shell_scripts.borrow().is_empty());
+        // `-e` is a plain flag of a shell, and code for another program.
+        for command in [
+            "/usr/bin/bash -e /home/u/x.sh",
+            "bash -eu -o pipefail /home/u/x.sh",
+            "bash +o posix -e /home/u/x.sh /home/u/data",
+        ] {
+            assert_eq!(
+                lookup.targets(command),
+                ["usr/bin/bash", "home/u/x.sh"],
+                "{command}"
+            );
+        }
+        assert_eq!(*lookup.shell_scripts.borrow(), ["home/u/x.sh"; 3]);
+        assert_eq!(
+            lookup.targets("perl -e 'print 1' /home/u/x.sh"),
+            ["usr/bin/perl"]
+        );
+        // The script after the value of an option; where the option may
+        // be a plain flag, the word after the script is looked at too.
+        assert_eq!(
+            lookup.targets("python3 -W ignore /home/u/x.py"),
+            ["usr/bin/python3", "home/u/x.py"]
+        );
+        assert_eq!(
+            lookup.targets("python3 -I /home/u/x.py /home/u/data"),
+            ["usr/bin/python3", "home/u/x.py", "home/u/data"]
+        );
+        assert_eq!(
+            lookup.targets("python3 /home/u/x.py /home/u/data"),
+            ["usr/bin/python3", "home/u/x.py"]
+        );
+        // A netcat is given no script: the path is a socket's.
+        assert_eq!(lookup.targets("ncat -U /run/x.sock"), ["usr/bin/ncat"]);
     }
 
     #[test]
