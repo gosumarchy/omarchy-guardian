@@ -14,7 +14,7 @@ compile_error!("omarchy-guardian is a Linux (Arch Linux / Omarchy) application")
     target_arch = "arm",
     target_arch = "riscv64"
 )))]
-compile_error!("payload.rs hard-codes the open(2) flags of these targets; check them for this one");
+compile_error!("files.rs hard-codes the open(2) flags of these targets; check them for this one");
 
 #[macro_use]
 mod output;
@@ -31,6 +31,7 @@ mod content;
 mod deps;
 mod engine;
 mod error;
+mod files;
 mod gatewatch;
 mod git_state;
 mod image;

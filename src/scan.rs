@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 
 use crate::content::{self, Content, Format, Prefix};
 use crate::error::Error;
+use crate::files::{O_NOFOLLOW, O_NONBLOCK};
 use crate::git_state;
-use crate::payload::O_NOFOLLOW;
 use crate::report::Gap;
 use crate::sha256::{Digest, Sha256};
 
@@ -55,11 +55,6 @@ const GENERATED_DIRS: &[(&str, &[&str])] = &[
     ),
     (".venv", &["pyvenv.cfg"]),
 ];
-
-/// `O_NONBLOCK` in the Linux generic ABI (`x86_64`, `aarch64`, `arm`, `riscv64`). A path
-/// swapped for a FIFO between `lstat` and `open` then fails the identity check
-/// instead of blocking the open; it has no effect on regular files.
-const O_NONBLOCK: i32 = 0o4000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanConfig {

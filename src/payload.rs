@@ -37,6 +37,7 @@ use crate::autorun::{
 use crate::config::model::SourceClass;
 use crate::content::{self, Content, PROBE_SIZE, Prefix};
 use crate::error::{Error, IoContext};
+use crate::files::{O_NOFOLLOW, O_NONBLOCK};
 use crate::rules;
 use crate::sandbox::Workspace;
 use crate::scan::MAX_TEXT_FILE_SIZE;
@@ -68,18 +69,6 @@ const EXTRACT_LIMITS: Limits = Limits {
     max_output: 1024 * 1024,
 };
 const C_LOCALE: &[(&str, &str)] = &[("LC_ALL", "C")];
-
-/// `O_NOFOLLOW`, `O_DIRECTORY` and `O_NONBLOCK`. The generic Linux ABI
-/// (`x86_64`, `riscv64`) and Arm's give the first two different bits.
-#[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
-pub const O_NOFOLLOW: i32 = 0o400_000;
-#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-pub const O_NOFOLLOW: i32 = 0o100_000;
-#[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
-pub const O_DIRECTORY: i32 = 0o200_000;
-#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-pub const O_DIRECTORY: i32 = 0o40_000;
-pub const O_NONBLOCK: i32 = 0o4000;
 
 /// Who may ship a protected path.
 #[derive(Clone, Copy, Debug)]

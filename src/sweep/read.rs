@@ -11,7 +11,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
-use crate::payload::{O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK};
+use crate::files::{O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK};
 use crate::scan::{MAX_HASHED_FILE_SIZE, MAX_TEXT_FILE_SIZE};
 use crate::sha256::{Digest, Sha256};
 
