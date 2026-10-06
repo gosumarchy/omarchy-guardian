@@ -2030,7 +2030,10 @@ fn disables_protection(line: &str) -> bool {
             .any(|service| line.contains(service));
     let ufw_off = line.contains("ufw disable") || line.contains("ufw --force disable");
     let flush = line.contains("nft flush ruleset")
-        || program_short_flag(line, &["iptables", "ip6tables"], 'f')
+        // Lowercased, `-f` is also the fragment match of a rule, which a
+        // rule's target (`-j`) tells from a flush; a flush takes none.
+        || (program_short_flag(line, &["iptables", "ip6tables"], 'f')
+            && !program_short_flag(line, &["iptables", "ip6tables"], 'j'))
         || line.contains("iptables --flush")
         || line.contains("ip6tables --flush");
     let selinux = line.contains("setenforce 0") || line.contains("setenforce  0");
@@ -3211,6 +3214,8 @@ mod tests {
             ("iptables -L -n; ls -f", protection),
             ("iptables -L && rm -f x", protection),
             ("ip6tables -L | grep -f patterns", protection),
+            ("iptables -A INPUT -f -j DROP", protection),
+            ("sudo ip6tables -I INPUT 1 -f -j ACCEPT", protection),
             ("iptables-save -f /etc/iptables/rules.v4", protection),
         ] {
             assert!(!rules_for(line).contains(&rule), "{line}");
