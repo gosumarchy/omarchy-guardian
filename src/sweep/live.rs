@@ -20,6 +20,12 @@
 //! - `files` checks the files the other checks vouch for by their path
 //!   against what their package recorded, and looks through the
 //!   directories programs and libraries are loaded from.
+//! - `process` reads the processes from `/proc`, and `program` tells what
+//!   each one runs: its script, its module, where it was started.
+//! - `preload` looks at what is preloaded, at programs running from
+//!   temporary directories, and at who reads the keyboard or a camera.
+//! - `modules` checks the loaded kernel modules against the packaged ones.
+//! - `privileged` looks for setuid, setgid and capability files.
 
 mod files;
 mod kernel;
