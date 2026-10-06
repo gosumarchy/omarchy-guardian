@@ -31,6 +31,7 @@ use std::fs;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::process::ExitStatus;
 
 use super::collect::{self, Body, Item, Origin, Scope};
 use super::read::{self, View};
@@ -1693,7 +1694,7 @@ fn has_capabilities(path: &str) -> Option<bool> {
         limits,
     )
     .ok()
-    .filter(|captured| captured.status.code() != Some(124))
+    .filter(|captured| getcap_failure(captured.status).is_none())
     .map(|captured| {
         parse_getcap(&String::from_utf8_lossy(&captured.stdout))
             .iter()
@@ -1701,20 +1702,44 @@ fn has_capabilities(path: &str) -> Option<bool> {
     })
 }
 
+/// How a getcap that did not give a whole answer ended. It exits with 0
+/// whatever it found or could not open, so anything else (a time-out, a
+/// signal, a failure) leaves part of the answer out.
+fn getcap_failure(status: ExitStatus) -> Option<String> {
+    if status.success() {
+        None
+    } else if status.code() == Some(124) {
+        // GNU timeout exits 124 when it had to stop the command.
+        Some("getcap timed out".into())
+    } else {
+        Some(format!("getcap failed: {status}"))
+    }
+}
+
 /// Files with capabilities, from `getcap -r` (on the real system only).
 fn capability_files(scope: &Scope<'_>) -> Result<Vec<(String, String)>, String> {
-    if scope.root != Path::new("/") || !Path::new(GETCAP).is_file() {
+    if scope.root != Path::new("/") {
         return Ok(Vec::new());
     }
+    let roots: Vec<OsString> = PRIVILEGED_ROOTS
+        .iter()
+        .map(|root| OsString::from(format!("/{root}")))
+        .filter(|root| Path::new(root).is_dir())
+        .collect();
+    capabilities_below(Path::new(GETCAP), &roots)
+}
+
+/// What `getcap -r` reports below `roots`. A getcap that is missing,
+/// cannot be started or does not finish is an error: what it printed until
+/// then is not the whole list.
+fn capabilities_below(getcap: &Path, roots: &[OsString]) -> Result<Vec<(String, String)>, String> {
+    if !getcap.is_file() {
+        return Err(format!("{} is not installed", getcap.display()));
+    }
     let mut args = vec![OsString::from("-r")];
-    args.extend(
-        PRIVILEGED_ROOTS
-            .iter()
-            .map(|root| OsString::from(format!("/{root}")))
-            .filter(|root| Path::new(root).is_dir()),
-    );
+    args.extend(roots.iter().cloned());
     let captured = tools::run(
-        Path::new(GETCAP),
+        getcap,
         &args,
         None,
         &[("LC_ALL", "C")],
@@ -1724,8 +1749,8 @@ fn capability_files(scope: &Scope<'_>) -> Result<Vec<(String, String)>, String> 
         },
     )
     .map_err(|error| error.to_string())?;
-    if captured.status.code() == Some(124) {
-        return Err("getcap timed out".into());
+    if let Some(failure) = getcap_failure(captured.status) {
+        return Err(failure);
     }
     Ok(parse_getcap(&String::from_utf8_lossy(&captured.stdout)))
 }
@@ -4369,5 +4394,49 @@ mod tests {
             check(&rng.text(PIECES, 14));
             check(&rng.mutated(output, PIECES));
         }
+    }
+
+    #[test]
+    fn a_getcap_that_is_missing_or_does_not_finish_is_not_an_empty_answer() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+        // A wait status holds the exit code in its second byte, and the
+        // signal that ended the program in its first.
+        let exited = |code: i32| ExitStatus::from_raw(code << 8);
+        assert_eq!(super::getcap_failure(exited(0)), None);
+        assert_eq!(
+            super::getcap_failure(exited(124)).as_deref(),
+            Some("getcap timed out")
+        );
+        assert_eq!(
+            super::getcap_failure(exited(1)).as_deref(),
+            Some("getcap failed: exit status: 1")
+        );
+        let killed = super::getcap_failure(ExitStatus::from_raw(9)).unwrap();
+        assert!(killed.starts_with("getcap failed: signal: 9"), "{killed:?}");
+
+        let dir = TempDir::new("live-getcap");
+        let getcap = dir.path().join("getcap");
+        assert_eq!(
+            super::capabilities_below(&getcap, &[]),
+            Err(format!("{} is not installed", getcap.display()))
+        );
+        if !crate::test_support::tool_available("/usr/bin/timeout")
+            || !crate::test_support::tool_available("/bin/sh")
+        {
+            return;
+        }
+        // What it printed before it failed is not taken for the list.
+        let listing = "#!/bin/sh\necho '/usr/bin/x cap_setuid=ep'\n";
+        crate::test_support::write_script(&getcap, &format!("{listing}exit 1\n"));
+        assert_eq!(
+            super::capabilities_below(&getcap, &[]),
+            Err("getcap failed: exit status: 1".to_string())
+        );
+        crate::test_support::write_script(&getcap, listing);
+        assert_eq!(
+            super::capabilities_below(&getcap, &[]),
+            Ok(vec![("usr/bin/x".to_string(), "cap_setuid=ep".to_string())])
+        );
     }
 }

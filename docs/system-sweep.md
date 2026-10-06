@@ -225,9 +225,9 @@ shells, udev and pacman read such names all the same: the sweep says so and is
 **incomplete** (exit 2). It is incomplete too when a location holds more than
 20,000 files or goes more than six directories deep, when a pattern of the
 catalogue matches more than 500 files, when there are more than 2,000,000
-files to look through for setuid programs, when `getcap` fails or times out,
-when a package's record cannot be read, and when the root checks found more
-than 5,000 items.
+files to look through for setuid programs, when `getcap` is missing, fails
+(any exit but 0, or a signal) or times out, when a package's record cannot be
+read, and when the root checks found more than 5,000 items.
 
 ### Programs ahead of the system's own
 
