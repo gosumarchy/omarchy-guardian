@@ -35,6 +35,7 @@ use std::path::Path;
 use std::process::ExitStatus;
 
 use super::collect::{self, Body, Item, Origin, Scope};
+use super::programs::{is_interpreter, is_netcat, script_arguments};
 use super::read::{self, View};
 use super::tier::Tier;
 use crate::autorun::Category;
@@ -652,37 +653,6 @@ fn of_root(directory: &Path) -> bool {
     status(directory).of_root
 }
 
-/// Programs that run the script they are given: who they are says nothing
-/// about what they run.
-const INTERPRETERS: &[&str] = &[
-    "python", "python3", "pypy", "perl", "ruby", "node", "bun", "deno", "php", "lua", "luajit",
-    "bash", "sh", "dash", "zsh", "fish", "tcsh", "csh", "ksh", "mksh", "nu", "elvish", "xonsh",
-    "java", "socat", "nc", "ncat", "netcat", "awk", "gawk", "mawk", "busybox", "toybox", "openssl",
-    "tclsh", "wish", "expect", "R", "Rscript", "pwsh", "erl", "beam.smp", "julia", "dotnet",
-    "mono", "guile", "gjs",
-];
-
-/// The dynamic loader run as a program (`ld-linux-x86-64.so.2 ./program`):
-/// it runs the program it is given, as an interpreter runs a script.
-fn is_loader(name: &str) -> bool {
-    name == "ld.so" || name.starts_with("ld-linux") || name.starts_with("ld-musl")
-}
-
-/// Whether file name `name` is `program`, or a version of it
-/// (`python3.14`, `lua5.4`).
-fn is_named(name: &str, program: &str) -> bool {
-    name.strip_prefix(program)
-        .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit() || c == '.'))
-}
-
-fn is_interpreter(path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    is_loader(name)
-        || INTERPRETERS
-            .iter()
-            .any(|interpreter| is_named(name, interpreter))
-}
-
 /// Whether `process` runs a repository package's program and nothing else:
 /// the file at its path is the very file it runs (a bind mount or rename
 /// cannot borrow a packaged name), it is what the package installed, and
@@ -736,65 +706,12 @@ fn is_updated(scope: &Scope<'_>, process: &Process) -> bool {
         && is_replaced(scope, process)
 }
 
-/// Options that take the next argument as their value in some interpreter
-/// or in the loader (`python3 -W ignore x.py`, `ld-linux --library-path d
-/// prog`). In another they are plain flags (`python3 -I x.py`), so what
-/// follows one may be the script or may be a value before it.
-const VALUE_OPTIONS: &[&str] = &[
-    "--library-path",
-    "--preload",
-    "--audit",
-    "--argv0",
-    "--glibc-hwcaps-prepend",
-    "--glibc-hwcaps-mask",
-    "-W",
-    "-X",
-    "-r",
-    "--require",
-    "--import",
-    "--loader",
-    "-I",
-    "-cp",
-    "-classpath",
-    "--class-path",
-    "--module-path",
-    // `bash -o pipefail script`.
-    "-o",
-    "-O",
-];
-
-/// The arguments that may be the script (or, for the loader, the program)
-/// of a process: the first that is no option, and, where that one follows
-/// an option that may have taken it as its value, the next one too. Code
-/// given on the command line (`python3 -c …`) comes out as one, and is
-/// dropped where it names no file; `bash -e x.sh`, where `-e` is a plain
-/// flag, keeps its script.
-fn script_arguments(arguments: &[String]) -> Vec<&str> {
-    let mut candidates = Vec::new();
-    let mut may_be_value = false;
-    for argument in arguments.iter().skip(1).map(String::as_str) {
-        if argument.starts_with('-') {
-            may_be_value = VALUE_OPTIONS.contains(&argument);
-            continue;
-        }
-        candidates.push(argument);
-        if !may_be_value {
-            break;
-        }
-        may_be_value = false;
-    }
-    candidates
-}
-
 /// The files on disk an interpreter (or the loader) may be running as its
 /// script, most likely first; none for a program that is not one, and for
 /// a relay, which runs what it is told (`ncat -e /usr/bin/bash`), not a
 /// script.
 fn scripts(scope: &Scope<'_>, process: &Process, exe: &str) -> Vec<String> {
-    let relay = matches!(
-        exe.rsplit('/').next(),
-        Some("nc" | "ncat" | "netcat" | "socat")
-    );
+    let relay = is_netcat(exe.rsplit('/').next().unwrap_or(exe));
     if !is_interpreter(exe) || relay {
         return Vec::new();
     }
@@ -3729,6 +3646,99 @@ mod tests {
                 ("usr/bin/ssh:to-203.0.113.5", vec![RuleId::NetworkRelay]),
             ]
         );
+    }
+
+    #[test]
+    fn every_check_knows_the_same_shells_and_interpreters() {
+        let (dir, index) = system(
+            "live-programs",
+            &[
+                ("usr/bin/mksh", "mksh"),
+                ("usr/bin/elvish", "elvish"),
+                ("usr/bin/nu", "nu"),
+                ("usr/bin/ash", "ash"),
+                ("usr/bin/busybox", "busybox"),
+                ("usr/bin/nc.openbsd", "nc"),
+            ],
+        );
+        let root = dir.path();
+        for path in ["home/u/spy", "home/u/run.sh"] {
+            write(root, path, path);
+        }
+        let status = |pid: &str, name: &str, tracer: u32| {
+            detail(
+                root,
+                pid,
+                "status",
+                &format!(
+                    "Name:\t{name}\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t1\nTracerPid:\t{tracer}\n"
+                ),
+            );
+        };
+        // Something attached to a shell the tracing check did not know.
+        process(root, "40", "/usr/bin/mksh", &[], "");
+        status("40", "mksh", 41);
+        process(root, "41", "/home/u/spy", &[], "");
+        status("41", "spy", 0);
+        // A shell at a terminal that holds a connection: one the
+        // connection check did not know, and one with a client of its own,
+        // which is reported once the connection is its input and output.
+        let held = |pid: &str, exe: &str, inode: &str| {
+            let socket = format!("socket:[{inode}]");
+            process(root, pid, exe, &[("0", "/dev/pts/1"), ("3", &socket)], "");
+        };
+        held("42", "/usr/bin/elvish", "900");
+        held("43", "/usr/bin/nu", "901");
+        let socket = "socket:[902]";
+        process(
+            root,
+            "44",
+            "/usr/bin/nu",
+            &[("0", socket), ("1", socket), ("2", socket)],
+            "",
+        );
+        let here = "0200A8C0:D431";
+        table(
+            root,
+            "tcp",
+            &[
+                (here, "076433C6:115C", "01", "900"),
+                (here, "076433C6:115C", "01", "901"),
+                (here, "057100CB:01BB", "01", "902"),
+            ],
+        );
+        let live = look(root, &index, Origin::System);
+        assert_eq!(
+            listed(&live),
+            [
+                ("home/u/spy:attached-to-mksh", vec![RuleId::TracedSecrets]),
+                ("usr/bin/elvish:to-198.51.100.7", vec![RuleId::RemoteShell]),
+                ("usr/bin/nu:to-203.0.113.5", vec![RuleId::RemoteShell]),
+            ]
+        );
+
+        // A shell the live checks did not count as an interpreter is named
+        // by its script; so is a multi-call program run as a shell, which
+        // is a relay too. A netcat is named by itself.
+        let scope = Scope {
+            root,
+            home: Some("home/u"),
+            index: &index,
+            origin: Origin::System,
+        };
+        for (exe, arguments, subject) in [
+            ("usr/bin/ash", ["ash", "/home/u/run.sh"], "home/u/run.sh"),
+            ("usr/bin/busybox", ["sh", "/home/u/run.sh"], "home/u/run.sh"),
+            (
+                "usr/bin/nc.openbsd",
+                ["nc.openbsd", "/home/u/run.sh"],
+                "usr/bin/nc.openbsd",
+            ),
+        ] {
+            assert!(super::is_interpreter(exe), "{exe}");
+            let process = running(&format!("/{exe}"), &arguments, None, "");
+            assert_eq!(super::subject(&scope, &process, exe).0, subject, "{exe}");
+        }
     }
 
     #[test]

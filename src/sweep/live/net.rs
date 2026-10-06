@@ -21,51 +21,18 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
 use super::{
-    Found, Process, Running, Source, is_interpreter, is_named, is_temporary, is_updated, module_of,
-    packaged, plain, replaced_in_own_namespace, source, started_in, subject, told, trusted_program,
+    Found, Process, Running, Source, is_temporary, is_updated, module_of, packaged, plain,
+    replaced_in_own_namespace, source, started_in, subject, told, trusted_program,
 };
 use crate::autorun::Category;
 use crate::rules::RuleId;
 use crate::sweep::collect::{Origin, Scope};
+use crate::sweep::programs::{is_interpreter, is_named, is_relay, is_shell_without_client};
 use crate::sweep::read::{self, View};
-
-/// Shells: with a connection among their open files they are a remote
-/// shell whatever their input is.
-const SHELLS: &[&str] = &[
-    "bash", "sh", "dash", "zsh", "fish", "tcsh", "csh", "ksh", "mksh", "ash",
-];
 
 /// Programs that are no interpreter of scripts but do what whoever is on
 /// their input says.
 const DRIVEN_BY_INPUT: &[&str] = &["gdb", "telnet"];
-
-/// Packaged tools that run or forward what they are told over the network.
-const RELAYS: &[&str] = &[
-    "nc",
-    "ncat",
-    "netcat",
-    "nc.openbsd",
-    "nc.traditional",
-    "socat",
-    "systemd-socket-activate",
-    "telnetd",
-    "in.telnetd",
-    "dropbear",
-    "tcpserver",
-    "xinetd",
-    "inetd",
-    "websocat",
-    "chisel",
-    "gost",
-    "frpc",
-    "frps",
-    "ngrok",
-    "cloudflared",
-    "bore",
-    "rathole",
-    "busybox",
-    "toybox",
-];
 
 /// Packaged desktop programs known to listen on the network by
 /// themselves, with no unit that starts them.
@@ -708,7 +675,7 @@ fn unit_runs(scope: &Scope<'_>, unit: &str, exe: &str) -> bool {
 /// server started with settings of somebody's own.
 fn relay(process: &Process) -> Option<&'static str> {
     let name = process.name();
-    if RELAYS.contains(&name) {
+    if is_relay(name) {
         return Some("a tool that runs or forwards what it is told over the network");
     }
     // A process title may be one string (`sshd: /usr/bin/sshd -D
@@ -789,7 +756,8 @@ fn connections(scope: &Scope<'_>, process: &Process, tables: &Tables, found: &mu
     held.sort_by_key(|(fd, socket)| (is_loopback(&socket.remote), *fd));
     let name = process.name();
     let exe = process.path();
-    let shell = SHELLS.iter().any(|shell| is_named(name, shell));
+    // A shell with a client of its own holds connections in ordinary use.
+    let shell = is_shell_without_client(name);
     let driven = is_interpreter(exe) || DRIVEN_BY_INPUT.contains(&name);
     let on_stdio = held.iter().find(|(fd, _)| *fd <= 2);
     if let Some((_, socket)) = on_stdio.filter(|_| driven) {
