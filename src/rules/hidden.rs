@@ -24,6 +24,10 @@ pub(crate) struct Found {
 /// them says so once, not on every line.
 const MAX_PER_RULE: usize = 3;
 
+/// The most findings of one file: `MAX_PER_RULE` of each of the three rules
+/// reported here (invisible text, reordered text, a hidden character).
+const MAX_FOUND: usize = 3 * MAX_PER_RULE;
+
 /// How much of a line is shown before and after the character.
 const BEFORE: usize = 40;
 const AFTER: usize = 100;
@@ -169,6 +173,22 @@ fn excerpt(characters: &[char], at: usize) -> String {
         .to_string()
 }
 
+/// Records a hidden character, unless its rule has all it may report or
+/// has one on this line already.
+fn add(found: &mut Vec<Found>, line: usize, rule: RuleId, characters: &[char], at: usize) {
+    let reported = found.iter().filter(|known| known.rule == rule).count();
+    let same_line = found
+        .iter()
+        .any(|known| known.rule == rule && known.line == line);
+    if reported < MAX_PER_RULE && !same_line {
+        found.push(Found {
+            line,
+            rule,
+            excerpt: excerpt(characters, at),
+        });
+    }
+}
+
 /// The hidden characters of `text` that are findings in the file `rel`.
 /// Prose and translations are only checked for tag characters, which no
 /// writing system uses.
@@ -179,20 +199,11 @@ pub(crate) fn findings(rel: &str, text: &str) -> Vec<Found> {
     }
     let only_tags = is_documentation(rel) || is_translation(rel);
     let markup = is_markup(rel);
-    let mut add = |line: usize, rule: RuleId, characters: &[char], at: usize| {
-        let reported = found.iter().filter(|known| known.rule == rule).count();
-        let same_line = found
-            .iter()
-            .any(|known| known.rule == rule && known.line == line);
-        if reported < MAX_PER_RULE && !same_line {
-            found.push(Found {
-                line,
-                rule,
-                excerpt: excerpt(characters, at),
-            });
-        }
-    };
     for (index, line) in text.lines().enumerate() {
+        // Nothing more is reported once every rule has all it may.
+        if found.len() >= MAX_FOUND {
+            break;
+        }
         if line.is_ascii() {
             continue;
         }
@@ -203,10 +214,21 @@ pub(crate) fn findings(rel: &str, text: &str) -> Vec<Found> {
         // An emoji flag of a region is a black flag followed by tag
         // characters: the one place tags are ordinary.
         let mut in_flag = false;
+        let is_visible = |other: char| !is_zero_width(other) && !is_filler(other);
+        // The nearest visible character on either side of the one looked
+        // at: the one before is carried along, and the one after is looked
+        // for again only once the last one found has been passed, so a run
+        // of invisible characters is read once and not once for each.
+        let mut seen: Option<char> = None;
+        let mut next = 0;
         for (at, character) in characters.iter().copied().enumerate() {
+            let before = seen;
+            if is_visible(character) {
+                seen = Some(character);
+            }
             if is_tag(character) {
                 if !in_flag {
-                    add(number, RuleId::InvisibleText, &characters, at);
+                    add(&mut found, number, RuleId::InvisibleText, &characters, at);
                 }
                 continue;
             }
@@ -215,26 +237,29 @@ pub(crate) fn findings(rel: &str, text: &str) -> Vec<Found> {
                 continue;
             }
             if is_reordering(character) || (is_direction_mark(character) && !right_to_left) {
-                add(number, RuleId::ReorderedText, &characters, at);
+                add(&mut found, number, RuleId::ReorderedText, &characters, at);
                 continue;
             }
-            let visible = |range: &mut dyn Iterator<Item = &char>| {
-                range
-                    .copied()
-                    .find(|other| !is_zero_width(*other) && !is_filler(*other))
-            };
-            let before = visible(&mut characters[..at].iter().rev());
-            let after = visible(&mut characters[at + 1..].iter());
+            if !is_filler(character) && !is_zero_width(character) {
+                continue;
+            }
+            if next <= at {
+                next = characters[at + 1..]
+                    .iter()
+                    .position(|other| is_visible(*other))
+                    .map_or(characters.len(), |offset| at + 1 + offset);
+            }
+            let after = characters.get(next).copied();
             if is_filler(character) {
                 if !before.is_some_and(is_hangul) && !after.is_some_and(is_hangul) {
-                    add(number, RuleId::HiddenCharacter, &characters, at);
+                    add(&mut found, number, RuleId::HiddenCharacter, &characters, at);
                 }
             } else if is_zero_width(character)
                 && !(markup && character == '\u{ad}')
                 && before.is_some_and(is_token)
                 && after.is_some_and(is_token)
             {
-                add(number, RuleId::HiddenCharacter, &characters, at);
+                add(&mut found, number, RuleId::HiddenCharacter, &characters, at);
             }
         }
     }
@@ -353,7 +378,7 @@ pub(super) fn is_lookalike_host(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{RuleId, findings, is_lookalike_host, punycode};
+    use super::{MAX_FOUND, MAX_PER_RULE, RuleId, findings, is_lookalike_host, punycode};
 
     fn rules_in(rel: &str, text: &str) -> Vec<RuleId> {
         findings(rel, text)
@@ -556,5 +581,40 @@ mod tests {
         ] {
             assert_eq!(punycode(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_long_run_of_hidden_characters_is_read_once() {
+        let rules = |text: &str| -> Vec<RuleId> {
+            findings("a.sh", text)
+                .iter()
+                .map(|found| found.rule)
+                .collect()
+        };
+        // Nothing to hide in, then a name around them.
+        let run = "\u{200b}".repeat(150_000);
+        assert!(rules(&run).is_empty());
+        assert_eq!(rules(&format!("cu{run}rl")), [RuleId::HiddenCharacter]);
+        assert!(rules(&format!("cu{run} rl")).is_empty());
+        assert!(rules(&format!("\u{e9}{run}rl")).is_empty());
+        // Fillers by themselves are a blank name; between Hangul they are
+        // writing.
+        let fillers = "\u{3164}".repeat(150_000);
+        assert_eq!(rules(&fillers), [RuleId::HiddenCharacter]);
+        assert!(rules(&format!("\u{ac00}{fillers}")).is_empty());
+        assert!(rules(&format!("{fillers}{run}\u{ac00}")).is_empty());
+        // The nearest visible character is looked for past both kinds.
+        assert_eq!(
+            rules(&format!("a{run}{fillers}b\n")),
+            [RuleId::HiddenCharacter]
+        );
+        // Every rule at its most: the lines after are not read.
+        let line = "a\u{200b}b \u{202e} \u{e0041}\n";
+        let full = line.repeat(MAX_PER_RULE);
+        assert_eq!(findings("a.sh", &full).len(), MAX_FOUND);
+        assert_eq!(
+            findings("a.sh", &(full.clone() + &line.repeat(100_000))),
+            findings("a.sh", &full)
+        );
     }
 }
