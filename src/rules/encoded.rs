@@ -5,8 +5,8 @@
 //! that runs its output. Decoding alone is ordinary (certificates, icons,
 //! test data), and so is `eval`; the two meeting is what is flagged.
 
-use super::shell::{self, Command};
-use super::{contains_pattern, pattern_starts, pipes_into_shell, shell_words, unquoted};
+use super::shell::{self, Command, program_name, short_flag, unquoted_words};
+use super::{contains_pattern, pattern_starts, pipes_into_shell};
 
 /// Programs that turn encoded text back into what it stands for when given
 /// `-d` or `--decode`.
@@ -25,24 +25,12 @@ const COMPRESSORS: &[&str] = &["gzip", "xz", "zstd", "bzip2", "lz4"];
 fn words(text: &str) -> Vec<String> {
     text.split(['|', ';', '&', '(', ')', '`'])
         .flat_map(|part| {
-            let mut words: Vec<String> = shell_words(part)
-                .iter()
-                .map(|word| unquoted(word))
-                .collect();
+            let mut words = unquoted_words(part);
             // Marks where one command ends.
             words.push(String::new());
             words
         })
         .collect()
-}
-
-/// Whether `word` is a cluster of short options holding `flag`.
-fn short_flag(word: &str, flag: char) -> bool {
-    word.len() > 1
-        && word.starts_with('-')
-        && !word.starts_with("--")
-        && word[1..].chars().all(|c| c.is_ascii_alphabetic())
-        && word[1..].contains(flag)
 }
 
 /// Whether `text` holds a command that decodes: `base64 -d`, `base32
@@ -57,7 +45,7 @@ pub fn has_decoder(text: &str) -> bool {
     }
     let words = words(text);
     words.iter().enumerate().any(|(index, word)| {
-        let program = super::program_name(word);
+        let program = program_name(word);
         let own = || {
             words[index + 1..]
                 .iter()
@@ -81,7 +69,7 @@ pub fn has_decoder(text: &str) -> bool {
 fn has_decompressor(text: &str) -> bool {
     let words = words(text);
     words.iter().enumerate().any(|(index, word)| {
-        let program = super::program_name(word);
+        let program = program_name(word);
         DECOMPRESSORS.contains(&program)
             || (COMPRESSORS.contains(&program)
                 && words[index + 1..]
@@ -328,9 +316,9 @@ fn call_shape(line: &str) -> bool {
 /// PowerShell given its command encoded: `powershell -enc …`.
 fn encoded_powershell(line: &str) -> bool {
     (line.contains("powershell") || line.contains("pwsh"))
-        && shell_words(line)
+        && unquoted_words(line)
             .iter()
-            .any(|word| matches!(unquoted(word).as_str(), "-enc" | "-encodedcommand" | "-ec"))
+            .any(|word| matches!(word.as_str(), "-enc" | "-encodedcommand" | "-ec"))
 }
 
 /// Whether the line, lowercased, decodes something and runs it.

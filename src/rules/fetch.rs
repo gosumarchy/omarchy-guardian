@@ -3,8 +3,8 @@
 //! where a fetch is saved, and package managers told to install from an
 //! address.
 
-use super::shell::{self, Command};
-use super::{FETCHERS, as_file, pipes_into_shell, program_name};
+use super::shell::{self, Command, program_name, unversioned};
+use super::{FETCHERS, as_file, pipes_into_shell};
 
 /// What marks an address rather than a file or a package name.
 const ADDRESS_PREFIXES: &[&str] = &["http://", "https://", "ftp://", "git://", "ssh://"];
@@ -17,11 +17,6 @@ fn is_address(word: &str) -> bool {
 
 /// Calls that read from an address in Python, as `python -c` is given them.
 const PYTHON_FETCHES: &[&str] = &["urlopen(", "urlretrieve(", "requests.get(", "httpx.get("];
-
-/// `python3.12` as `python`.
-fn unversioned(program: &str) -> &str {
-    program.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.')
-}
 
 /// Whether `command` writes what it fetches to standard output, for the
 /// fetchers beyond curl, wget and aria2c: httpie given an address, BSD

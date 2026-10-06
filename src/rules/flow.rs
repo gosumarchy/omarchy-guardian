@@ -7,8 +7,8 @@
 //! `review::apply_rules`; this is the same idea for fetched and decoded
 //! *content* held in a variable.
 
-use super::shell::{self, Command};
-use super::{RuleId, encoded, fetch, program_name, shell_words, unquoted};
+use super::shell::{self, Command, program_name, unquoted_words};
+use super::{RuleId, encoded, fetch};
 
 /// Where a tracked value came from.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -197,7 +197,7 @@ fn unset_variable_removals(lines: &[String]) -> Vec<(usize, RuleId)> {
             if !is_recursive_rm(statement) {
                 continue;
             }
-            for word in shell_words(statement).iter().map(|word| unquoted(word)) {
+            for word in unquoted_words(statement) {
                 if let Some(name) = removal_target_variable(&word)
                     && empty_when_unset(&name)
                 {
