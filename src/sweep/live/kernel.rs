@@ -15,12 +15,12 @@ use std::ops::RangeInclusive;
 use std::thread;
 
 use super::{
-    Found, Listed, Process, Running, Status, is_named, parse_status, plain, subject,
-    trusted_program,
+    Found, Listed, Process, Running, Status, parse_status, plain, subject, trusted_program,
 };
 use crate::autorun::Category;
 use crate::rules::RuleId;
 use crate::sweep::collect::{Origin, Scope};
+use crate::sweep::programs::{is_named, is_shell};
 
 /// The taint bits a module sets, and the letter the module then carries
 /// in `/sys/module/<name>/taint`.
@@ -109,9 +109,6 @@ const SECRET_HOLDERS: &[&str] = &[
     "brave",
     "vivaldi-bin",
 ];
-
-/// Shells: what is typed into one passes through its memory.
-const SHELLS: &[&str] = &["bash", "sh", "zsh", "fish", "dash", "ksh", "tcsh"];
 
 /// eBPF pins the system's own tools make.
 const KNOWN_PINS: &[&str] = &["systemd", "tc", "xdp", "ip", "snap"];
@@ -521,10 +518,12 @@ fn name_of<'a>(running: &'a Running, listed: &'a Listed) -> &'a str {
 /// Whether a process called `name` holds secrets. The kernel's short name
 /// is cut at 15 characters.
 fn holds_secrets(name: &str) -> bool {
-    SHELLS.iter().chain(SECRET_HOLDERS).any(|holder| {
-        is_named(name, holder)
-            || (name.len() == 15 && holder.len() > 15 && holder.starts_with(name))
-    })
+    // Shells: what is typed into one passes through its memory.
+    is_shell(name)
+        || SECRET_HOLDERS.iter().any(|holder| {
+            is_named(name, holder)
+                || (name.len() == 15 && holder.len() > 15 && holder.starts_with(name))
+        })
 }
 
 /// Whether process `pid` was started, however many steps down, by process
@@ -559,7 +558,7 @@ fn tracers(scope: &Scope<'_>, running: &Running, found: &mut Found) {
         let tracer = process_of(running, traced.status.tracer);
         let started_under_it = descends_from(running, traced.pid, traced.status.tracer);
         let debugger = tracer.is_some_and(|tracer| is_debugger(scope, tracer, found));
-        let shell = SHELLS.iter().any(|shell| is_named(target, shell));
+        let shell = is_shell(target);
         let rule = if holds_secrets(target) && !(shell && started_under_it && debugger) {
             RuleId::TracedSecrets
         } else if started_under_it || debugger {

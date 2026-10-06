@@ -7,6 +7,8 @@
 //!   package shipped.
 //! - `collect` gathers the items (with `read`, which never follows links into
 //!   files, and `commands`/`lua`, which find what each item runs).
+//! - `programs` names the shells, interpreters and relays that `commands`
+//!   and `live` tell by name.
 //! - `judge` sends what isn't trusted through the local rules and the AI
 //!   review; `output` shows it.
 //! - `root` is the read-only root collector behind `sweep --root`.
@@ -23,6 +25,7 @@ pub mod lua;
 pub mod output;
 pub mod own;
 pub mod path;
+pub mod programs;
 pub mod read;
 pub mod root;
 pub mod state;
