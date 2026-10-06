@@ -90,7 +90,6 @@ pub(super) fn matches(line: &str) -> bool {
     piped
         || shell::runs_substitution(line, &text_fetches)
         || super::encoded::run_arguments(line)
-            .iter()
             .any(|argument| PYTHON_FETCHES.iter().any(|call| argument.contains(call)))
 }
 

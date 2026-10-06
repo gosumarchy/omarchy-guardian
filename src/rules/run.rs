@@ -425,7 +425,7 @@ fn reads_in_file(line: &str, found: &mut Vec<String>) {
         }
     }
     // `open('x')` inside an `exec`/`eval` argument.
-    for argument in encoded::run_arguments(line) {
+    for argument in encoded::run_arguments(line).arguments {
         for opener in ["open('", "open(\"", "read_text('", "read_text(\""] {
             if let Some(at) = argument.find(opener) {
                 let rest = &argument[at + opener.len()..];
