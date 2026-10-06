@@ -102,6 +102,7 @@ package() {
     install -Dm644 README.md "$pkgdir/usr/share/doc/omarchy-guardian/README.md"
     install -Dm644 SECURITY.md "$pkgdir/usr/share/doc/omarchy-guardian/SECURITY.md"
     install -Dm644 -t "$pkgdir/usr/share/doc/omarchy-guardian/docs" docs/*.md
+    install -Dm644 -t "$pkgdir/usr/share/doc/omarchy-guardian/docs/images" docs/images/*.png
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/omarchy-guardian/LICENSE"
     for wrapper in omarchy omarchy-theme-install omarchy-theme-update omarchy-plugin-add omarchy-plugin-update; do
         install -Dm755 "integrations/omarchy/bin/$wrapper" "$lib/bin/$wrapper"

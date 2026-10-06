@@ -11,6 +11,13 @@ It is a single Rust binary with **no third-party crates**. SHA-256, JSON, and
 the small subset of TOML it needs are implemented in the crate so the whole
 gate can be audited in one place. It builds only for Linux.
 
+![The settings app: the protection level, the AI model and the five gates](docs/images/settings-app.png)
+
+The settings app (`omarchy-guardian tui`), and the knight in the bar with what
+it shows on hover:
+
+![The Guardian knight in Waybar, with its tooltip listing the gates and the last block](docs/images/bar-tooltip.png)
+
 ## What it needs, sends and changes
 
 - **An AI reviewer of your own.** Reviews run through the Claude Code CLI with
