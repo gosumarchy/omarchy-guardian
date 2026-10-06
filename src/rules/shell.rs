@@ -51,7 +51,7 @@ pub(super) fn unquoted_words(line: &str) -> Vec<String> {
 
 /// A program's name without its directory.
 pub(super) fn program_name(word: &str) -> &str {
-    word.rsplit('/').next().unwrap_or_default()
+    crate::paths::file_name(word)
 }
 
 /// A program's name without the version written after it: `python3.12` is

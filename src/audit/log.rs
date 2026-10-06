@@ -23,10 +23,10 @@ use super::{
     OFFERED, OVERRULED, PERMIT, PROFILE, SUBJECT, TEST, VERSION,
 };
 use crate::json::Json;
-use crate::notify;
-use crate::report::html::utc;
 use crate::text::shown;
+use crate::time::utc;
 use crate::tools::{self, Limits};
+use crate::user;
 
 const JOURNALCTL: &str = "/usr/bin/journalctl";
 const LIMITS: Limits = Limits {
@@ -349,7 +349,7 @@ pub fn command(options: &Options) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let lines = lines(&output, notify::current_uid());
+    let lines = lines(&output, user::real_uid());
     if options.json {
         let mut stdout = io::stdout().lock();
         for line in &lines {

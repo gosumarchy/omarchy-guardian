@@ -10,12 +10,14 @@ use std::io::Write as _;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::output;
+use crate::paths::{self, Accept};
 use crate::report::{Blocked, html};
 use crate::text;
+use crate::time;
 use crate::tools::{self, Limits};
+use crate::user;
 
 const NOTIFY_SEND: &str = "/usr/bin/notify-send";
 /// The knight with red eyes, installed by the package; a path, so it shows
@@ -156,7 +158,7 @@ fn alert(title: &str, detail: &str, ran: Ran) {
     let detail = &text::shown(detail);
     // Saved whether or not a pop-up can be shown: the bar's last block
     // comes from here.
-    let report = crate::engine::store::effective_uid()
+    let report = user::effective_uid()
         .ok()
         .and_then(|uid| save_report(&title, detail, ran, uid));
     if !popups() {
@@ -242,15 +244,13 @@ fn pango(text: &str) -> String {
 /// browser (not under the test harnesses); returns the page and its id for
 /// `omarchy-guardian ask`. Nothing is saved as root.
 pub fn save_and_open(title: &str, detail: &str, ran: Ran) -> Option<(PathBuf, String)> {
-    let uid = crate::engine::store::effective_uid().ok()?;
+    let uid = user::effective_uid().ok()?;
     let path = save_report(title, detail, ran, uid)?;
     let id = path.file_stem()?.to_str()?.to_string();
     // Asked for and opened, it is seen; checked after saving, so an alert
     // saved meanwhile still keeps the bar's attention.
     if let Some(directory) = path.parent() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_secs());
+        let now = time::now();
         crate::status::mark_seen_unless_waiting(directory, &id, now);
     }
     if env::var_os(QUIET).is_none() && Path::new(LAUNCH_BROWSER).is_file() {
@@ -281,16 +281,14 @@ fn save_report(title: &str, detail: &str, ran: Ran, uid: u32) -> Option<PathBuf>
         return None;
     }
     let directory = reports_dir()?;
-    crate::engine::store::private_dir(&directory, uid).ok()?;
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
+    paths::private_dir(&directory, uid).ok()?;
+    let seconds = time::now();
     let id = format!("{seconds}-{}", std::process::id());
     let captured = output::captured();
     // The page for people; the plain text for `omarchy-guardian ask`.
     let plain = format!("{title}: {detail}\n\n{}", html::strip_ansi(&captured));
     write_private(&directory.join(format!("{id}.txt")), &plain)?;
-    let page = html::page(title, detail, ran, &html::utc(seconds), &id, &captured);
+    let page = html::page(title, detail, ran, &time::utc(seconds), &id, &captured);
     let path = directory.join(format!("{id}.html"));
     write_private(&path, &page)?;
     prune(&directory, uid);
@@ -309,10 +307,7 @@ fn write_private(path: &Path, text: &str) -> Option<()> {
 
 /// The reports directory: `$XDG_CACHE_HOME/omarchy-guardian/reports`.
 pub fn reports_dir() -> Option<PathBuf> {
-    let base = env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+    let base = paths::cache_home(Accept::Absolute, Accept::Any)?;
     Some(base.join("omarchy-guardian/reports"))
 }
 
@@ -366,7 +361,7 @@ fn prune(directory: &Path, uid: u32) {
 fn session_env() -> Vec<(&'static str, String)> {
     let mut env = Vec::new();
     let runtime = env::var("XDG_RUNTIME_DIR").ok().or_else(|| {
-        let uid = real_uid(&fs::read_to_string("/proc/self/status").ok()?)?;
+        let uid = user::real_uid()?;
         let directory = format!("/run/user/{uid}");
         Path::new(&directory).is_dir().then_some(directory)
     });
@@ -391,39 +386,15 @@ fn session_env() -> Vec<(&'static str, String)> {
     env
 }
 
-/// The real uid of this process.
-pub fn current_uid() -> Option<u32> {
-    real_uid(&fs::read_to_string("/proc/self/status").ok()?)
-}
-
-fn real_uid(status: &str) -> Option<u32> {
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix("Uid:"))?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
 
     use std::os::unix::fs::{MetadataExt, symlink};
 
-    use super::{
-        KEEP_REPORTS, ON_CLICK, Ran, notify_args, pango, prune, real_uid, reason, save_report,
-    };
+    use super::{KEEP_REPORTS, ON_CLICK, Ran, notify_args, pango, prune, reason, save_report};
     use crate::report::Blocked;
     use crate::test_support::TempDir;
-
-    #[test]
-    fn reads_the_real_uid_from_proc_status() {
-        let status = "Name:\tomarchy-guardian\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\n";
-        assert_eq!(real_uid(status), Some(1000));
-        assert_eq!(real_uid("Name:\tx\n"), None);
-    }
 
     #[test]
     fn every_block_has_a_reason() {

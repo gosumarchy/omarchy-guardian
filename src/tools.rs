@@ -16,7 +16,7 @@ use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::thread;
 
 use crate::error::{Error, IoContext};
-use crate::notify;
+use crate::user;
 
 pub const TIMEOUT: &str = "/usr/bin/timeout";
 pub const KILL: &str = "/usr/bin/kill";
@@ -110,7 +110,7 @@ impl OpenCode {
                     env::var_os("HOME").as_deref(),
                     env::var_os("XDG_CACHE_HOME").as_deref(),
                 );
-                refuse_planted(&found, &scratch, notify::current_uid()).map_err(|reason| {
+                refuse_planted(&found, &scratch, user::real_uid()).map_err(|reason| {
                     Error::Refused(format!(
                         "{} at {} is not used: {reason}; anything running as another user, or anything that writes a cache or temporary file, could have put it there. Install it in a directory only you or root can write, or fix PATH",
                         reviewer.label(),
@@ -212,7 +212,7 @@ fn refuse_planted(found: &Path, scratch: &[PathBuf], uid: Option<u32>) -> Result
             let metadata = fs::metadata(entry).map_err(unread)?;
             if let Some(owner) = [link.uid(), metadata.uid()]
                 .into_iter()
-                .find(|owner| is_foreign_owner(*owner, uid))
+                .find(|owner| user::is_foreign_owner(*owner, uid))
             {
                 return Err(format!(
                     "{what} {} belongs to another user (uid {owner})",
@@ -276,35 +276,6 @@ fn past_first_link(path: &Path) -> Result<Option<(PathBuf, PathBuf)>, String> {
         }
     }
     Ok(None)
-}
-
-/// Whether a file owned by `owner` belongs to someone other than root or
-/// the user `uid`. In a user namespace that does not map root, root's
-/// files show the overflow owner, which is then not foreign either.
-pub fn is_foreign_owner(owner: u32, uid: Option<u32>) -> bool {
-    owner != 0 && Some(owner) != uid && !(owner == overflow_uid() && root_unmapped())
-}
-
-/// The owner the kernel shows for users a user namespace does not map.
-fn overflow_uid() -> u32 {
-    fs::read_to_string("/proc/sys/kernel/overflowuid")
-        .ok()
-        .and_then(|text| text.trim().parse().ok())
-        .unwrap_or(65_534)
-}
-
-/// Whether this process runs in a user namespace that does not map root
-/// (a sandbox, as in the end-to-end tests), where root's directories show
-/// the overflow owner. The real pacman hook never runs in one.
-fn root_unmapped() -> bool {
-    fs::read_to_string("/proc/self/uid_map").is_ok_and(|map| {
-        !map.lines().any(|line| {
-            let mut fields = line.split_whitespace();
-            let inside: Option<u64> = fields.next().and_then(|field| field.parse().ok());
-            let count: Option<u64> = fields.nth(1).and_then(|field| field.parse().ok());
-            matches!((inside, count), (Some(start), Some(count)) if start == 0 && count > 0)
-        })
-    })
 }
 
 /// Requires `path` and every directory above it to be owned by root and not
@@ -849,8 +820,9 @@ mod tests {
 
     #[test]
     fn a_reviewer_that_belongs_to_another_user_is_refused() {
-        use super::{is_foreign_owner, refuse_planted};
+        use super::refuse_planted;
         use crate::test_support::{NOBODY, give};
+        use crate::user::is_foreign_owner;
 
         assert!(!is_foreign_owner(0, None));
         assert!(!is_foreign_owner(0, Some(1000)));
@@ -877,7 +849,7 @@ mod tests {
                     assert!(give(entry, 0));
                 }
             }
-        } else if !super::root_unmapped() {
+        } else if !crate::user::root_unmapped() {
             // Asked for by someone else, the same files are another user's
             // (where root is not mapped, the owner shown stands for any
             // user, and is nobody's).

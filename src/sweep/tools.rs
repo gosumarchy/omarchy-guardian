@@ -7,6 +7,7 @@
 //! and the host of an address.
 
 use super::config::{host, is_usual, key_value};
+use crate::paths::file_name;
 use crate::tomlish;
 
 /// How what is seen ends when the value is a path in a temporary or cache
@@ -128,7 +129,7 @@ enum Tool {
 }
 
 fn tool(path: &str) -> Option<Tool> {
-    let name = path.rsplit('/').next().unwrap_or(path);
+    let name = file_name(path);
     Some(match name {
         "npmrc" | ".npmrc" => Tool::Npm,
         ".yarnrc" | ".yarnrc.yml" => Tool::Yarn,

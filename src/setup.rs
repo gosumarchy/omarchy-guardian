@@ -7,7 +7,6 @@
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -20,6 +19,7 @@ use crate::config::model::{
 };
 use crate::config::write;
 use crate::engine::request::Request;
+use crate::files::{AtomicWrite, write_atomic};
 use crate::tools::{self, Limits, OpenCode, Reviewer};
 
 pub trait Terminal {
@@ -638,22 +638,14 @@ impl Environment for RealEnvironment {
 
         // A file of its own, made new (never written through a link
         // somebody left under a fixed name), then moved into place.
-        let temporary = directory.join(format!(".config.toml.{}.tmp", std::process::id()));
-        drop(fs::remove_file(&temporary));
-        let written = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o644)
-            .open(&temporary)
-            .and_then(|mut file| {
-                file.write_all(text.as_bytes())?;
-                file.sync_all()
-            })
-            .and_then(|()| fs::rename(&temporary, &path));
-        if let Err(error) = written {
-            drop(fs::remove_file(&temporary));
-            return Err(error.to_string());
-        }
+        let options = AtomicWrite {
+            mode: 0o644,
+            sync: true,
+            ..AtomicWrite::private(
+                directory.join(format!(".config.toml.{}.tmp", std::process::id())),
+            )
+        };
+        write_atomic(&path, text.as_bytes(), &options).map_err(|error| error.to_string())?;
         crate::audit::settings_changed("the user settings file was saved");
         Ok(path)
     }

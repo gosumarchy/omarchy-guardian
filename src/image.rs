@@ -19,6 +19,7 @@ use std::ops::Range;
 use std::path::Path;
 
 use crate::engine::plan::glob_matches;
+use crate::paths::file_name;
 use crate::rules;
 use crate::sha256::{Digest, Sha256};
 
@@ -72,7 +73,7 @@ const SYNTAX: &[&[u8]] = &[b"$(", b"${", b"`", b"&&", b"||", b"| ", b"|sh"];
 
 /// Whether `rel` is named as an image of a format `is_whole` knows.
 pub fn is_named(rel: &str) -> bool {
-    let name = rel.rsplit('/').next().unwrap_or(rel).to_ascii_lowercase();
+    let name = file_name(rel).to_ascii_lowercase();
     name.rsplit_once('.')
         .is_some_and(|(stem, extension)| !stem.is_empty() && EXTENSIONS.contains(&extension))
 }
@@ -128,7 +129,7 @@ impl Surroundings {
     /// Notes the file at `path`: one marked to run, or named as a script,
     /// makes its directory a place scripts are.
     pub fn note_file(&mut self, path: &str, executable: bool) {
-        let name = path.rsplit('/').next().unwrap_or(path);
+        let name = file_name(path);
         let script = name.rsplit_once('.').is_some_and(|(_, extension)| {
             SCRIPT_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
         });
@@ -160,7 +161,7 @@ impl Surroundings {
     /// Whether an image at `path` is away from where files are run.
     pub fn leaves_alone(&self, path: &str) -> bool {
         let parent = directory(path);
-        let name = path.rsplit('/').next().unwrap_or(path);
+        let name = file_name(path);
         let under = format!("/{parent}/");
         !self.script_directories.contains(parent)
             && !self.run_globs.iter().any(|(directory, pattern)| {

@@ -119,7 +119,7 @@ pub fn runs_a_script(name: &str) -> bool {
 /// says nothing about what it runs: a shell, a language, the loader, a
 /// netcat, a multi-call program or `openssl`.
 pub fn is_interpreter(path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
+    let name = crate::paths::file_name(path);
     is_loader(name)
         || runs_a_script(name)
         || is_any(name, &[NETCATS, MULTI_CALL, TOLD_BY_ARGUMENTS])

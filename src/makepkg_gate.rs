@@ -43,7 +43,6 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use self::state::{Drift, Extraction, State};
 use crate::audit::{self, Gate};
@@ -59,6 +58,7 @@ use crate::json::Json;
 use crate::notify::{self, Ran};
 use crate::osv;
 use crate::pacman;
+use crate::paths::file_name;
 use crate::permit::{self, Content, Standing};
 use crate::report::{Blocked, Decision, Gap, Report, RunRef};
 use crate::review::{self, ReviewContext};
@@ -779,9 +779,7 @@ fn aur_facts(base: Option<&str>, directory_name: &str, recipe: &str) -> Vec<Stri
     names.dedup();
     match aur_info(base, &names) {
         Ok(Some(info)) => {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_secs());
+            let now = crate::time::now();
             let (found, mut warnings) = aur::trust_signals(&info, now);
             if let Some(summary) = found.first() {
                 outln!("{summary}");
@@ -1778,7 +1776,7 @@ fn prebuilt(step: &UpstreamStep<'_>, upstream: &Upstream, sources: &[aur::Source
     }
     let builds = aur::defines_function(step.recipe, "build");
     let named = |path: &str| {
-        let name = path.rsplit('/').next().unwrap_or(path);
+        let name = file_name(path);
         upstream.is_unpacked(path) || (name.len() >= 5 && functions.written.contains(name))
     };
     let mut programs: BTreeMap<String, String> = upstream

@@ -14,6 +14,8 @@ use super::collect::{self, Body, Item, Origin, Scope};
 use super::read::{self, Found, View};
 use super::tier::Tier;
 use crate::autorun::Category;
+use crate::encoding::base64_decode;
+use crate::paths::file_name;
 use crate::rules::RuleId;
 use crate::sha256::Sha256;
 
@@ -93,7 +95,7 @@ pub fn accounts(passwd: &str) -> Vec<Account> {
 
 impl Account {
     fn can_log_in(&self) -> bool {
-        let shell = self.shell.rsplit('/').next().unwrap_or_default();
+        let shell = file_name(&self.shell);
         !NO_LOGIN.contains(&shell)
     }
 }
@@ -218,30 +220,6 @@ fn member_items(origin: Origin, passwd: &[Account], group: &str) -> Vec<Item> {
     items
 }
 
-/// Standard base64 decoded, or `None`.
-fn base64(encoded: &str) -> Option<Vec<u8>> {
-    let mut bits = 0_u32;
-    let mut count = 0;
-    let mut bytes = Vec::with_capacity(encoded.len() * 3 / 4);
-    for character in encoded.trim_end_matches('=').bytes() {
-        let value = match character {
-            b'A'..=b'Z' => character - b'A',
-            b'a'..=b'z' => character - b'a' + 26,
-            b'0'..=b'9' => character - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        };
-        bits = (bits << 6) | u32::from(value);
-        count += 6;
-        if count >= 8 {
-            count -= 8;
-            bytes.push(u8::try_from((bits >> count) & 0xff).ok()?);
-        }
-    }
-    Some(bytes)
-}
-
 /// Standard base64 without padding, as SSH writes a fingerprint.
 fn to_base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -343,7 +321,7 @@ pub fn keys(text: &str) -> (Vec<Key>, usize) {
             odd += 1;
             continue;
         };
-        let Some(blob) = words.get(at + 1).and_then(|blob| base64(blob)) else {
+        let Some(blob) = words.get(at + 1).and_then(|blob| base64_decode(blob)) else {
             odd += 1;
             continue;
         };
@@ -676,7 +654,7 @@ pub fn items(scope: &Scope<'_>) -> (Vec<Item>, Option<String>) {
             .iter()
             .find(|account| account.home == home)
             .map_or_else(
-                || home.rsplit('/').next().unwrap_or(home).to_string(),
+                || file_name(home).to_string(),
                 |account| account.name.clone(),
             );
         // The user id is what `%U` in the server's configuration stands
@@ -848,7 +826,7 @@ mod tests {
             "YW55IGNhcm5hbCBwbGVhcw"
         );
         assert_eq!(
-            super::base64("YW55IGNhcm5hbCBwbGVhcw==").unwrap(),
+            super::base64_decode("YW55IGNhcm5hbCBwbGVhcw==").unwrap(),
             b"any carnal pleas"
         );
 

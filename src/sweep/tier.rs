@@ -2,6 +2,7 @@
 
 use super::index::{PackageIndex, Recorded};
 use crate::integrations::SESSION_ENV;
+use crate::paths::file_name;
 use crate::sha256::{Digest, Sha256};
 
 /// From most to least trusted. The sweep hides the first two.
@@ -165,7 +166,7 @@ pub fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex) -> Tie
             Observed::File { .. } | Observed::Link { .. } => Tier::Modified,
         };
     }
-    let name = path.rsplit('/').next().unwrap_or(path);
+    let name = file_name(path);
     match observed {
         // A mask (an empty file, a link to /dev/null) disables what it
         // names; disabling a defence, or a pacman hook a package ships, is
@@ -482,7 +483,7 @@ const UNIT_EXTENSIONS: &[&str] = &[
 /// Whether link `name` enables the unit at `target`: the same name, or an
 /// instance (`getty@tty1.service`) of a template (`getty@.service`).
 fn same_unit(name: &str, target: &str) -> bool {
-    let target_name = target.rsplit('/').next().unwrap_or(target);
+    let target_name = file_name(target);
     if name == target_name {
         return true;
     }

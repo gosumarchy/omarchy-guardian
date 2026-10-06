@@ -39,6 +39,7 @@ use super::programs::{is_interpreter, is_netcat, script_arguments};
 use super::read::{self, View};
 use super::tier::Tier;
 use crate::autorun::Category;
+use crate::paths::file_name;
 use crate::rules::RuleId;
 use crate::tools::{self, Limits};
 
@@ -221,7 +222,7 @@ impl Process {
     /// Its program's file name.
     fn name(&self) -> &str {
         let path = self.path();
-        path.rsplit('/').next().unwrap_or(path)
+        file_name(path)
     }
 
     /// Its number.
@@ -711,7 +712,7 @@ fn is_updated(scope: &Scope<'_>, process: &Process) -> bool {
 /// a relay, which runs what it is told (`ncat -e /usr/bin/bash`), not a
 /// script.
 fn scripts(scope: &Scope<'_>, process: &Process, exe: &str) -> Vec<String> {
-    let relay = is_netcat(exe.rsplit('/').next().unwrap_or(exe));
+    let relay = is_netcat(file_name(exe));
     if !is_interpreter(exe) || relay {
         return Vec::new();
     }
@@ -816,7 +817,7 @@ fn python_library(scope: &Scope<'_>, exe: &str) -> Option<String> {
 /// started-in directory that holds only part of the name), no file is
 /// named.
 fn module_of(scope: &Scope<'_>, process: &Process, exe: &str) -> Option<Module> {
-    let name = exe.rsplit('/').next().unwrap_or(exe);
+    let name = file_name(exe);
     if !["python", "pypy"]
         .iter()
         .any(|python| name.starts_with(python))
@@ -1434,7 +1435,7 @@ fn packaged_module(scope: &Scope<'_>, name: &str, file: &str, path: &str, found:
 /// A module's name from its `modules.dep` path: `kernel/x/snd-hda.ko.zst`
 /// is `snd_hda`.
 fn module_name(path: &str) -> String {
-    let file = path.rsplit('/').next().unwrap_or(path);
+    let file = file_name(path);
     file.split(".ko").next().unwrap_or(file).replace('-', "_")
 }
 

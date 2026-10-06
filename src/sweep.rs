@@ -35,15 +35,16 @@ pub mod tools;
 use std::env;
 use std::path::Path;
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Settings;
 use crate::config::model::{RootConsent, SourceClass};
-use crate::engine::store::{self, Store};
+use crate::engine::store::Store;
 use crate::notify;
 use crate::report::{AgentOutcome, Blocked, Decision, Gap, Report};
 use crate::review::ReviewContext;
+use crate::time::now;
 use crate::tools::OpenCode;
+use crate::user;
 use collect::{Collection, Origin, Scope};
 use index::{LOCAL_DB, PackageIndex};
 use state::{Change, LastRun, Outcome, Remembered};
@@ -101,7 +102,7 @@ fn not_as_root(command: &Command) -> &'static str {
 }
 
 pub fn command(command: &Command, settings: &Settings) -> ExitCode {
-    if store::effective_uid().is_ok_and(|uid| uid == 0) {
+    if user::effective_uid().is_ok_and(|uid| uid == 0) {
         errln!("omarchy-guardian sweep: {}", not_as_root(command));
         return ExitCode::from(2);
     }
@@ -279,7 +280,7 @@ fn migrate(settings: &Settings) -> Result<String, String> {
     if old.is_empty() {
         return Ok("Nothing to move: no list of an older Guardian is left.".into());
     }
-    let uid = store::effective_uid()?;
+    let uid = user::effective_uid()?;
     let current = state::allowed_here(uid);
     let (collection, home) = collect_for_allow(settings)?;
     let (movable, stale) = movable(&old, &current, &collection.items, &|item| {
@@ -362,7 +363,7 @@ fn movable(
 }
 
 fn forget(label: Option<&str>) -> Result<String, String> {
-    let uid = store::effective_uid()?;
+    let uid = user::effective_uid()?;
     let allowed = state::allowed_here(uid);
     // What an older Guardian kept in the user's own list counted for
     // nothing; it goes either way.
@@ -426,9 +427,7 @@ fn add_root_part(
     } else {
         match settings.sweep_root().0 {
             Some(RootConsent::Allowed) => {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |elapsed| elapsed.as_secs());
+                let now = now();
                 root::from_results(Path::new(root::RESULTS), now)
                     .map_err(|reason| format!("root checks: {reason}"))
             }
@@ -644,13 +643,6 @@ fn notify_scheduled(
     }
 }
 
-/// Seconds since the epoch.
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
-}
-
 /// Records how this scheduled sweep ended for the bar (see
 /// `state::LastRun`), and returns whether that is news: it did not end
 /// this way last time. Only the timer's sweeps are recorded: the bar tells
@@ -781,7 +773,7 @@ fn apply_allowed(
     label: &dyn Fn(&collect::Item) -> String,
     notes: &mut Vec<String>,
 ) {
-    let allowed = match store::effective_uid() {
+    let allowed = match user::effective_uid() {
         Ok(uid) => state::allowed_here(uid),
         Err(reason) => {
             notes.push(format!("allowed items do not count this time ({reason})"));

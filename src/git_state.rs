@@ -135,26 +135,7 @@ fn without_basic_credential(line: &str) -> String {
 
 /// Standard base64 (padding optional) decoded to UTF-8 text.
 fn base64_text(encoded: &str) -> Option<String> {
-    let mut bits = 0_u32;
-    let mut count = 0;
-    let mut bytes = Vec::with_capacity(encoded.len() * 3 / 4);
-    for character in encoded.trim_end_matches('=').chars() {
-        let value = match character {
-            'A'..='Z' => u32::from(character) - u32::from('A'),
-            'a'..='z' => u32::from(character) - u32::from('a') + 26,
-            '0'..='9' => u32::from(character) - u32::from('0') + 52,
-            '+' => 62,
-            '/' => 63,
-            _ => return None,
-        };
-        bits = (bits << 6) | value;
-        count += 6;
-        if count >= 8 {
-            count -= 8;
-            bytes.push(u8::try_from((bits >> count) & 0xff).ok()?);
-        }
-    }
-    String::from_utf8(bytes).ok()
+    String::from_utf8(crate::encoding::base64_decode(encoded)?).ok()
 }
 
 /// Whether `text` is written as a credential is: nothing in it a shell

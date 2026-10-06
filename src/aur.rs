@@ -20,6 +20,7 @@ use crate::engine::baseline::Unread;
 use crate::git_state;
 use crate::image;
 use crate::json::Json;
+use crate::paths::file_name;
 use crate::scan::{Limits, MAX_HASHED_FILE_SIZE, MAX_TEXT_FILE_SIZE};
 use crate::sha256::{Digest, Sha256};
 
@@ -251,11 +252,11 @@ pub fn source_filename(entry: &str) -> String {
     }
     let protocol = source_protocol(entry);
     if !VCS.contains(&protocol) {
-        return entry.rsplit('/').next().unwrap_or(entry).to_string();
+        return file_name(entry).to_string();
     }
     let url = entry.split(['#', '?']).next().unwrap_or_default();
     let url = url.strip_suffix('/').unwrap_or(url);
-    let mut name = url.rsplit('/').next().unwrap_or(url);
+    let mut name = file_name(url);
     match protocol {
         "bzr" => name = name.split_once("lp:").map_or(name, |(_, rest)| rest),
         "fossil" => return format!("{name}.fossil"),
@@ -774,7 +775,7 @@ pub fn declared_names(pkgbuild: &str) -> Vec<String> {
     names
 }
 
-const DAY: u64 = 86_400;
+const DAY: u64 = crate::time::SECONDS_PER_DAY;
 /// A package younger than this is new.
 const NEW_DAYS: u64 = 30;
 /// A package with fewer votes has no track record.
@@ -1477,7 +1478,7 @@ impl Walk<'_> {
         // sources, is opened by the build itself if at all. Guardian
         // unpacks the ones the recipe names (see `Collected::to_unpack`);
         // of the others the review says that they are not reviewed.
-        let name = child.rsplit('/').next().unwrap_or(child);
+        let name = file_name(child);
         if is_archive && (!self.download || self.not_extracted(name)) {
             let inside = child[self.start.len()..].trim_start_matches('/');
             let top_of_unpacked = self.base_depth > 0 && !inside.contains('/');
@@ -1936,7 +1937,7 @@ pub fn unpack_patterns(recipe: &str) -> Vec<String> {
         let mut words = line
             .split(|c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')' | '<'))
             .map(|word| word.trim_matches(['"', '\'']))
-            .skip_while(|word| !UNPACKERS.contains(&word.rsplit('/').next().unwrap_or_default()));
+            .skip_while(|word| !UNPACKERS.contains(&file_name(word)));
         if words.next().is_none() {
             continue;
         }
@@ -1951,7 +1952,7 @@ pub fn unpack_patterns(recipe: &str) -> Vec<String> {
                 continue;
             }
             let name = word.replace(['"', '\''], "");
-            let name = name.rsplit('/').next().unwrap_or_default();
+            let name = file_name(&name);
             // An option's letters (`xf`) and makepkg's directories are no
             // archive.
             let directory = ["pkgdir", "srcdir", "startdir"]

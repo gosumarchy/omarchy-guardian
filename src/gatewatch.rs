@@ -17,16 +17,18 @@
 //! a program that also rewrites the record is not caught.
 
 use std::fs::{self, OpenOptions};
-use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::agent::Exposure;
 use crate::config::Settings;
-use crate::engine::store::{self, Store};
+use crate::engine::store::Store;
+use crate::files::{AtomicWrite, write_atomic};
 use crate::json::Json;
 use crate::notify;
+use crate::paths;
+use crate::user;
 
 const RECORD: &str = "gatewatch.json";
 const LOCK: &str = "gatewatch.lock";
@@ -358,18 +360,7 @@ fn observe_in(
 /// Saves `text` as `path`, private to the user, all of it or none.
 pub fn write(path: &Path, text: &str) -> std::io::Result<()> {
     let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-    drop(fs::remove_file(&temporary));
-    let written = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temporary)
-        .and_then(|mut file| file.write_all(text.as_bytes()))
-        .and_then(|()| fs::rename(&temporary, path));
-    if written.is_err() {
-        drop(fs::remove_file(&temporary));
-    }
-    written
+    write_atomic(path, text.as_bytes(), &AtomicWrite::private(temporary))
 }
 
 /// A lock file, removed when dropped.
@@ -406,9 +397,9 @@ impl Drop for Lock {
 /// The user's private state directory, made if missing. Root keeps no
 /// record: under `sudo -E` the directory is the user's.
 pub fn directory() -> Option<PathBuf> {
-    let uid = store::effective_uid().ok().filter(|uid| *uid != 0)?;
+    let uid = user::effective_uid().ok().filter(|uid| *uid != 0)?;
     let root = Store::default_root()?;
-    store::private_dir(&root, uid).ok()?;
+    paths::private_dir(&root, uid).ok()?;
     Some(root)
 }
 

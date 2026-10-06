@@ -23,7 +23,6 @@ use crate::config::model::{AiRequirement, Named, SourceClass};
 use crate::content::{self, Content};
 use crate::engine::plan::HashOnly;
 use crate::error::{Error, IoContext};
-use crate::notify;
 use crate::payload;
 use crate::permit;
 use crate::report::{Gap, LocalFinding, Report, ReviewedArchive};
@@ -32,6 +31,7 @@ use crate::rules::{self, RuleId};
 use crate::scan::MAX_TEXT_FILE_SIZE;
 use crate::sweep::read::{self, Public, View};
 use crate::tools::{self, Limits, OpenCode, Reviewer};
+use crate::user;
 
 const DEFAULT_CACHE_DIR: &str = "/var/cache/pacman/pkg/";
 /// Where pacman keeps what it installed, when its configuration names no
@@ -856,7 +856,7 @@ fn local_archives(operands: &[String], cwd: &Path) -> Result<Archives, Error> {
                 path.display()
             )));
         }
-        check_private(&path, notify::current_uid())?;
+        check_private(&path, user::real_uid())?;
 
         let name = package_name(&path)?;
         if let Ok(paths) = archives.entry(name).or_insert_with(|| Ok(Vec::new())) {
@@ -1190,7 +1190,7 @@ fn check_private(path: &Path, uid: Option<u32>) -> Result<(), Error> {
     while let Some(here) = current {
         let metadata = fs::symlink_metadata(here).at(here)?;
         let sticky = metadata.is_dir() && metadata.mode() & 0o1000 != 0;
-        let foreign_owner = tools::is_foreign_owner(metadata.uid(), uid);
+        let foreign_owner = user::is_foreign_owner(metadata.uid(), uid);
         let shared = metadata.mode() & 0o022 != 0 && !sticky;
         if foreign_owner || shared {
             return Err(Error::Refused(format!(

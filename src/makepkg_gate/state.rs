@@ -12,14 +12,15 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
-use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::Write as _;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::fs::{self, DirBuilder};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use crate::engine::store;
+use crate::files::{AtomicWrite, write_atomic};
+use crate::paths;
 use crate::sha256::Sha256;
+use crate::user;
 
 /// The directory under the review memory's root.
 const DIRECTORY: &str = "aur-gate";
@@ -182,15 +183,15 @@ impl State {
     /// `root`, creating its directory for the user alone.
     pub fn open(root: Option<&Path>, key: &str) -> Self {
         let directory = root.and_then(|root| {
-            let uid = store::effective_uid().ok()?;
-            store::private_dir(root, uid).ok()?;
+            let uid = user::effective_uid().ok()?;
+            paths::private_dir(root, uid).ok()?;
             let directory = root.join(DIRECTORY);
             match DirBuilder::new().mode(0o700).create(&directory) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(_) => return None,
             }
-            store::private_dir(&directory, uid).ok()?;
+            paths::private_dir(&directory, uid).ok()?;
             Some(directory)
         });
         Self {
@@ -219,17 +220,11 @@ impl State {
     fn write(&self, what: &str, text: &str) {
         let Some(path) = self.path(what) else { return };
         let temporary = path.with_extension(format!("{what}.{}.tmp", std::process::id()));
-        drop(fs::remove_file(&temporary));
-        let written = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)
-            .and_then(|mut file| file.write_all(text.as_bytes()))
-            .and_then(|()| fs::rename(&temporary, &path));
-        if written.is_err() {
-            drop(fs::remove_file(&temporary));
-        }
+        drop(write_atomic(
+            &path,
+            text.as_bytes(),
+            &AtomicWrite::private(temporary),
+        ));
     }
 
     /// Whether the user said yes to `what` (a hash of exactly what was

@@ -9,6 +9,7 @@
 
 use super::is_packaged_path;
 use super::shell::{self, Command, program_name, unquoted_words};
+use crate::paths::file_name;
 
 /// Dot-files in the home that sessions have always run by name.
 const SESSION_FILES: &[&str] = &[
@@ -355,7 +356,7 @@ const SHADOWED_COMMANDS: &[&str] = &[
 /// These are ordinary to mention, so they count only as what a command
 /// writes.
 fn is_startup_file(path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or_default();
+    let name = file_name(path);
     let within = |directory: &str, extensions: &[&str]| {
         path.split_once(directory).is_some_and(|(_, rest)| {
             extensions.is_empty() || extensions.iter().any(|extension| rest.ends_with(extension))
@@ -407,12 +408,11 @@ fn written_files(part: &str) -> Vec<String> {
                 found.push((*destination).to_string());
                 // Into a directory: under the name it had.
                 if destination.ends_with('/') {
-                    found.extend(sources.iter().map(|source| {
-                        format!(
-                            "{destination}{}",
-                            source.rsplit('/').next().unwrap_or_default()
-                        )
-                    }));
+                    found.extend(
+                        sources
+                            .iter()
+                            .map(|source| format!("{destination}{}", file_name(source))),
+                    );
                 }
             }
         }

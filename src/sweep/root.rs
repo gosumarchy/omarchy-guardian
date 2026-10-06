@@ -11,9 +11,9 @@
 //! keys that may log in as them, as those accounts could look themselves;
 //! of other accounts' keys it says only how many there are.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{Read, Write as _};
-use std::os::unix::fs::{self as unix_fs, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{self as unix_fs, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 use std::time::UNIX_EPOCH;
@@ -25,10 +25,11 @@ use super::state::{self, Remembered};
 use super::tier::Tier;
 use super::{live, own};
 use crate::autorun::Category;
-use crate::engine::store;
+use crate::files::{AtomicWrite, Owner, write_atomic};
 use crate::json::Json;
 use crate::rules::RuleId;
 use crate::sha256::Digest;
+use crate::user;
 
 const SUDO: &str = "/usr/bin/sudo";
 const INSTALLED: &str = "/usr/bin/omarchy-guardian";
@@ -179,7 +180,7 @@ const MAX_AGE_SECS: u64 = 36 * 60 * 60;
 /// `--out` (writing `RESULTS`, only when the system configuration allows
 /// it, readable by the configured group).
 pub fn collect_command(out: bool, settings: &crate::config::Settings) -> ExitCode {
-    if !store::effective_uid().is_ok_and(|uid| uid == 0) {
+    if !user::effective_uid().is_ok_and(|uid| uid == 0) {
         errln!(
             "omarchy-guardian sweep-collect: only `sweep --root` and its timer run this, as root"
         );
@@ -261,9 +262,7 @@ pub fn collect_command(out: bool, settings: &crate::config::Settings) -> ExitCod
     // one; a run through sudo reads it where there is one and writes
     // nothing, as it writes nothing else. Without a record yet (the
     // timer's first run too) the results carry no list.
-    let now = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
+    let now = crate::time::now();
     let seen = read_trust_seen(Path::new(TRUST_SEEN));
     let (new, seen) = news(&collection.items, seen, now);
     let json = to_json(&collection, &notes, new.as_deref()).to_string();
@@ -442,21 +441,15 @@ fn write_results(path: &Path, json: &str, gid: u32) -> Result<(), String> {
     unix_fs::chown(directory, Some(0), Some(gid)).map_err(|error| describe(directory, error))?;
     fs::set_permissions(directory, fs::Permissions::from_mode(0o750))
         .map_err(|error| describe(directory, error))?;
-    let temporary = path.with_extension("json.tmp");
-    drop(fs::remove_file(&temporary));
-    let result = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temporary)
-        .and_then(|mut file| file.write_all(json.as_bytes()))
-        .and_then(|()| unix_fs::chown(&temporary, Some(0), Some(gid)))
-        .and_then(|()| fs::set_permissions(&temporary, fs::Permissions::from_mode(0o640)))
-        .and_then(|()| fs::rename(&temporary, path));
-    if result.is_err() {
-        drop(fs::remove_file(&temporary));
-    }
-    result.map_err(|error| describe(path, error))
+    let options = AtomicWrite {
+        owner: Some(Owner {
+            uid: 0,
+            gid,
+            mode: 0o640,
+        }),
+        ..AtomicWrite::private(path.with_extension("json.tmp"))
+    };
+    write_atomic(path, json.as_bytes(), &options).map_err(|error| describe(path, error))
 }
 
 /// What the scheduled root collector found, if it is trustworthy and
@@ -882,7 +875,7 @@ fn changes_asked(arguments: &[String]) -> String {
 /// `sweep forget`: the list of allowed items, which only root writes. The
 /// user it acts for is the one sudo says ran it (`SUDO_UID`).
 pub fn system_allow_command(arguments: &[String]) -> ExitCode {
-    if !store::effective_uid().is_ok_and(|uid| uid == 0) {
+    if !user::effective_uid().is_ok_and(|uid| uid == 0) {
         errln!("omarchy-guardian sweep-allow-system: only `sweep allow` runs this, as root");
         return ExitCode::from(2);
     }

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::agent::{self, AgentError, AgentReview, SourceFile};
 use crate::config::Settings;
@@ -26,9 +26,8 @@ use crate::engine::store::Store;
 use crate::error::Error;
 use crate::report::{AgentOutcome, AgentRun, LocalFinding};
 use crate::rules;
+use crate::time::SECONDS_PER_DAY;
 use crate::tools::{OpenCode, Reviewer};
-
-const SECONDS_PER_DAY: u64 = 86_400;
 
 /// Bytes charged per local finding on top of its path and excerpt.
 const FINDING_OVERHEAD: usize = 48;
@@ -80,9 +79,7 @@ impl Memory {
             use_diff,
             cache_max_age_secs: u64::from(limits.cache_days) * SECONDS_PER_DAY,
             max_store_bytes: u64::from(limits.max_store_mib) * 1024 * 1024,
-            now: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_secs()),
+            now: crate::time::now(),
         }))
     }
 }
