@@ -574,6 +574,18 @@ pub(crate) fn with_variables(code: &str, variables: &[(String, String)]) -> Stri
     }
     let mut out = code.to_string();
     for (name, value) in variables {
+        // Most lines name none of them: such a line is not written anew
+        // for each.
+        let named = out.match_indices('$').any(|(at, _)| {
+            let rest = &out[at + 1..];
+            rest.starts_with(name.as_str())
+                || rest
+                    .strip_prefix('{')
+                    .is_some_and(|rest| rest.starts_with(name.as_str()))
+        });
+        if !named {
+            continue;
+        }
         out = out.replace(&format!("${{{name}}}"), value);
         // `$name` only where the name ends there.
         let pattern = format!("${name}");

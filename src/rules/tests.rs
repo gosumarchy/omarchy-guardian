@@ -950,6 +950,26 @@ fn commands_that_share_their_arguments_cost_one_pass() {
 }
 
 #[test]
+fn only_a_variable_that_is_named_is_written_out() {
+    use super::with_variables;
+    let variables = [
+        ("f".to_string(), "curl".to_string()),
+        ("fx".to_string(), "wget".to_string()),
+    ];
+    for (code, written) in [
+        (
+            "$f ${f} $fx ${fx} $fy ${fy} $ f {f}",
+            "curl curl wget wget $fy ${fy} $ f {f}",
+        ),
+        ("$(f) $$f ${f", "$(f) $curl ${f"),
+    ] {
+        assert_eq!(with_variables(code, &variables), written, "{code}");
+    }
+    let long = "$( ".repeat(100_000);
+    assert_eq!(with_variables(&long, &variables), long);
+}
+
+#[test]
 fn substitutions_inside_one_another_cost_each_rule_little() {
     // Each of these is sixty-four substitutions that reach the end of the
     // line: none is run, so no rule reads them.
