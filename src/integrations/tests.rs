@@ -3,10 +3,10 @@
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 
+use super::edit::{HYPR_MARKER, INTERCEPTOR_MARKER, with_menu_entries, without_interceptor};
 use super::{
-    HYPR_LINE, HYPR_MARKER, INTERCEPTOR_LINE, INTERCEPTOR_MARKER, Integration, MENU_ENTRY, Part,
-    Paths, SESSION_ENV, State, Step, THEME_OVERRIDES, WRAPPED, with_menu_entries,
-    without_interceptor,
+    HYPR_LINE, INTERCEPTOR_LINE, Integration, MENU_ENTRY, Part, Paths, SESSION_ENV, State, Step,
+    THEME_OVERRIDES, WRAPPED,
 };
 use crate::test_support::TempDir;
 
@@ -803,23 +803,23 @@ const WAYBAR_CONFIG: &str = "{\n  \"layer\": \"top\",\n  \"modules-left\": [\"cu
 
 #[test]
 fn the_waybar_module_is_added_and_removed_exactly() {
-    let added = super::with_waybar_module(WAYBAR_CONFIG).unwrap();
+    let added = super::edit::with_waybar_module(WAYBAR_CONFIG).unwrap();
     assert!(
         added.contains("\"modules-right\": [\"image#omarchy-guardian\", \"network\", \"battery\"]")
     );
     assert_eq!(added.lines().nth(1).unwrap(), super::WAYBAR_DEFINITION);
     assert!(added.contains("// a comment"));
     // Adding twice keeps one copy.
-    assert_eq!(super::with_waybar_module(&added).unwrap(), added);
-    assert_eq!(super::without_waybar_module(&added), WAYBAR_CONFIG);
+    assert_eq!(super::edit::with_waybar_module(&added).unwrap(), added);
+    assert_eq!(super::edit::without_waybar_module(&added), WAYBAR_CONFIG);
 
     let empty = "{\n  \"modules-right\": [],\n}\n";
     assert!(
-        super::with_waybar_module(empty)
+        super::edit::with_waybar_module(empty)
             .unwrap()
             .contains("[\"image#omarchy-guardian\"]")
     );
-    assert!(super::with_waybar_module("{\n}\n").is_err());
+    assert!(super::edit::with_waybar_module("{\n}\n").is_err());
 
     // An empty list over several lines, or with a comment in it,
     // gets no comma after the module.
@@ -828,14 +828,14 @@ fn the_waybar_module_is_added_and_removed_exactly() {
         "{\n  \"modules-right\": [ /* none */ ]\n}\n",
         "{\n  \"modules-right\": [\n    // none\n  ]\n}\n",
     ] {
-        let added = super::with_waybar_module(empty).unwrap();
+        let added = super::edit::with_waybar_module(empty).unwrap();
         assert!(!added.contains("guardian\","), "{added}");
-        assert!(!super::without_waybar_module(&added).contains("guardian"));
+        assert!(!super::edit::without_waybar_module(&added).contains("guardian"));
     }
     // One per line: taking it out leaves no comma of its own.
     let listed =
         "{\n  \"modules-right\": [\n    \"image#omarchy-guardian\",\n    \"clock\"\n  ]\n}\n";
-    assert!(!super::without_waybar_module(listed).contains(','));
+    assert!(!super::edit::without_waybar_module(listed).contains(','));
 }
 
 #[test]
@@ -889,7 +889,7 @@ fn a_file_is_replaced_whole_and_a_link_to_it_stays_a_link() {
     let link = dir.path().join("link.conf");
     fs::write(&real, "old\n").unwrap();
     symlink(&real, &link).unwrap();
-    super::replace_file(&link, "new\n").unwrap();
+    super::edit::replace_file(&link, "new\n").unwrap();
     assert!(
         fs::symlink_metadata(&link)
             .unwrap()
@@ -901,7 +901,7 @@ fn a_file_is_replaced_whole_and_a_link_to_it_stays_a_link() {
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
     // Its mode stays what it was.
     fs::set_permissions(&real, fs::Permissions::from_mode(0o640)).unwrap();
-    super::replace_file(&real, "newer\n").unwrap();
+    super::edit::replace_file(&real, "newer\n").unwrap();
     assert_eq!(
         fs::metadata(&real).unwrap().permissions().mode() & 0o777,
         0o640
@@ -909,7 +909,7 @@ fn a_file_is_replaced_whole_and_a_link_to_it_stays_a_link() {
     // A link that leads nowhere yet gets its file.
     let dangling = dir.path().join("dangling.conf");
     symlink(dir.path().join("made.conf"), &dangling).unwrap();
-    super::replace_file(&dangling, "made\n").unwrap();
+    super::edit::replace_file(&dangling, "made\n").unwrap();
     assert_eq!(
         fs::read_to_string(dir.path().join("made.conf")).unwrap(),
         "made\n"
