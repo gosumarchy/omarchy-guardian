@@ -10,6 +10,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::io;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -715,40 +716,74 @@ fn shadows(scope: &Scope<'_>, name: &str) -> bool {
         .any(|directory| fs::symlink_metadata(scope.root.join(directory).join(name)).is_ok())
 }
 
+/// What listing a directory gave.
+enum Listing {
+    Names(Vec<String>),
+    /// Nothing is there (any more).
+    Gone,
+    /// Something is there and `scope` could not list it: a directory closed
+    /// to it, one it will not follow a link into, or no directory at all.
+    Closed,
+}
+
 /// The names in `directory` (not looked into further), as `scope` may see
 /// them; `None` when it cannot be listed.
 fn names(scope: &Scope<'_>, directory: &str) -> Option<Vec<String>> {
-    let listed = |entries: fs::ReadDir| -> Vec<String> {
-        entries
-            .flatten()
-            .filter_map(|entry| entry.file_name().into_string().ok())
-            .take(read::MAX_ENTRIES + 1)
-            .collect()
+    match listing(scope, directory) {
+        Listing::Names(names) => Some(names),
+        Listing::Gone | Listing::Closed => None,
+    }
+}
+
+/// `names`, with why there are none.
+fn listing(scope: &Scope<'_>, directory: &str) -> Listing {
+    let listed = |entries: io::Result<fs::ReadDir>| match entries {
+        Ok(entries) => Listing::Names(
+            entries
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .take(read::MAX_ENTRIES + 1)
+                .collect(),
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Listing::Gone,
+        Err(_) => Listing::Closed,
     };
     if scope.origin == Origin::Root {
         // Without following a link anybody but root could have put there.
-        match read::seen(scope.root, directory, View::Pinned)?.what {
-            read::Public::Directory(handle) => {
-                fs::read_dir(format!("/proc/self/fd/{}", handle.as_raw_fd()))
-                    .ok()
-                    .map(listed)
-            }
-            _ => None,
+        match read::seen(scope.root, directory, View::Pinned).map(|seen| seen.what) {
+            Some(read::Public::Directory(handle)) => listed(fs::read_dir(format!(
+                "/proc/self/fd/{}",
+                handle.as_raw_fd()
+            ))),
+            Some(_) => Listing::Closed,
+            // The pinned walk does not say why it shows nothing.
+            None => match fs::symlink_metadata(scope.root.join(directory)) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Listing::Gone,
+                _ => Listing::Closed,
+            },
         }
     } else {
-        fs::read_dir(scope.root.join(directory)).ok().map(listed)
+        listed(fs::read_dir(scope.root.join(directory)))
     }
 }
 
 /// The programs in the directories of `search` that someone other than
 /// root can write and that take a system command's name, as paths; and
-/// what could not be listed in full, as sentences.
+/// what could not be listed, or not in full, as sentences.
 pub fn shadowing_programs(scope: &Scope<'_>, search: &Search) -> (Vec<String>, Vec<String>) {
     let mut paths = Vec::new();
     let mut unchecked = Vec::new();
     for directory in &search.shadowing {
-        let Some(mut listed) = names(scope, directory) else {
-            continue;
+        let mut listed = match listing(scope, directory) {
+            Listing::Names(listed) => listed,
+            // Gone since the search saw it: nothing is ahead there now.
+            Listing::Gone => continue,
+            Listing::Closed => {
+                unchecked.push(format!(
+                    "/{directory}: could not be listed; programs ahead of /usr/bin there were not checked"
+                ));
+                continue;
+            }
         };
         if listed.len() > read::MAX_ENTRIES {
             unchecked.push(format!("/{directory}: more entries than were looked at"));
@@ -1323,5 +1358,65 @@ mod tests {
                 shadowing: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn a_directory_ahead_that_cannot_be_listed_is_said() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("sweep-path-closed");
+        let root = dir.path();
+        for file in ["usr/bin/sudo", "home/u/bin/sudo", "home/u/closed/sudo"] {
+            let path = root.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "x").unwrap();
+        }
+        fs::write(root.join("home/u/file"), "no directory").unwrap();
+        symlink("bin", root.join("home/u/linked")).unwrap();
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let scope = |origin| Scope {
+            root,
+            home: Some("home/u"),
+            index: &index,
+            origin,
+        };
+        let ahead = |directories: &[&str]| Search {
+            directories: Vec::new(),
+            shadowing: directories
+                .iter()
+                .map(|name| format!("home/u/{name}"))
+                .collect(),
+        };
+        let closed = |name: &str| {
+            format!(
+                "/home/u/{name}: could not be listed; programs ahead of /usr/bin there were not checked"
+            )
+        };
+        // What is there and is no directory to list is said, whoever
+        // looks; what is gone since the search saw it is not.
+        for origin in [Origin::System, Origin::Root] {
+            let (paths, unchecked) =
+                shadowing_programs(&scope(origin), &ahead(&["gone", "file", "bin"]));
+            assert_eq!(paths, ["home/u/bin/sudo"], "{origin:?}");
+            assert_eq!(unchecked, [closed("file")], "{origin:?}");
+        }
+        // Root follows no link into a directory, and says it did not look.
+        let (paths, unchecked) = shadowing_programs(&scope(Origin::Root), &ahead(&["linked"]));
+        assert!(paths.is_empty(), "{paths:?}");
+        assert_eq!(unchecked, [closed("linked")]);
+        let (paths, unchecked) = shadowing_programs(&scope(Origin::System), &ahead(&["linked"]));
+        assert_eq!(paths, ["home/u/linked/sudo"]);
+        assert!(unchecked.is_empty(), "{unchecked:?}");
+        // A directory closed to the reader. Nothing is closed to root, who
+        // then lists it like any other.
+        let directory = root.join("home/u/closed");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o000)).unwrap();
+        let is_closed = fs::read_dir(&directory).is_err();
+        let found = shadowing_programs(&scope(Origin::System), &ahead(&["closed"]));
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        if is_closed {
+            assert_eq!(found, (vec![], vec![closed("closed")]));
+        } else {
+            assert_eq!(found, (vec!["home/u/closed/sudo".to_string()], vec![]));
+        }
     }
 }

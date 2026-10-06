@@ -255,7 +255,9 @@ that is ahead of `/usr/bin` in any one of these is watched.
 
 **What is listed.** In each directory on the list that someone other than root
 can write, the programs named like a command in `/usr/bin` or in Omarchy's
-`bin` are listed, and any named like the commands below.
+`bin` are listed, and any named like the commands below. A directory on the
+list that is there and cannot be listed (it is closed to the sweep, or, for
+the root checks, a link) is said, and the sweep is **incomplete**.
 
 **What is a finding.** One named like a command that asks for a password,
 fetches or installs (`sudo`, `su`, `doas`, `pkexec`, `run0`, `ssh`, `scp`,
