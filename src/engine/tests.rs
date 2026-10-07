@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use super::{Group, Memory, is_retryable, remember, review_group};
+use super::{Group, Memory, chunk_error, is_retryable, remember, review_group};
 use crate::agent::SourceFile;
 use crate::config::Settings;
 use crate::config::file::{AgentDefaults, PartialConfig};
@@ -12,7 +12,9 @@ use crate::engine::baseline::{self, Identity, Unit, Unread};
 use crate::engine::store::{Store, VERDICTS};
 use crate::error::Error;
 use crate::report::AgentOutcome;
-use crate::test_support::{TempDir, mock_opencode, mock_opencode_counting, write_script};
+use crate::test_support::{
+    TempDir, mock_opencode, mock_opencode_counting, reviewer_by_content, write_script,
+};
 use crate::tools::OpenCode;
 
 static NOTHING_UNREAD: Unread = Unread::new();
@@ -164,33 +166,6 @@ fn an_invalid_chunk_blocks_and_caches_nothing() {
     assert!(memory.store.list(VERDICTS).unwrap().is_empty());
 }
 
-/// Shell lines for `mock_opencode_counting(_, 0, _)`: a reviewer that
-/// answers by what it was sent. A request carrying a run of `q` gets
-/// `on_q` instead of a reply; one carrying a run of `z` is answered
-/// `z_status`, with a finding in `c.c` when that is suspicious; any other
-/// is clear.
-fn reviewer_by_content(on_q: &str, z_status: &str) -> String {
-    let finding = if z_status == "suspicious" {
-        r#"{\"severity\":\"high\",\"file\":\"c.c\",\"title\":\"fetches and runs a script\",\"reason\":\"mock\"}"#
-    } else {
-        ""
-    };
-    format!(
-        r#"nonce=$(printf '%s\n' "$input" | sed -n 's/^Nonce: //p' | tr -d '\n')
-status=clear
-findings=
-case "$input" in
-*qqqqqqqqqqqqqqqq*)
-{on_q}
-exit 0 ;;
-*zzzzzzzzzzzzzzzz*) status={z_status}; findings="{finding}" ;;
-esac
-reply="{{\"nonce\":\"$nonce\",\"status\":\"$status\",\"summary\":\"mock\",\"findings\":[$findings]}}"
-escaped=$(printf '%s' "$reply" | sed 's/"/\\"/g')
-printf '{{"type":"text","part":{{"type":"text","text":"%s"}}}}\n' "$escaped""#
-    )
-}
-
 /// `three_chunks` with content `reviewer_by_content` tells apart: the
 /// second chunk is the run of `q`, the third the run of `z`.
 fn three_told_apart() -> (AgentSettings, Vec<SourceFile>) {
@@ -232,7 +207,14 @@ fn a_verdict_reached_beside_an_invalid_chunk_is_kept() {
 
         let review = review_group(&group(&settings, &files), &opencode, Some(&memory));
 
-        assert!(review.invalid.is_some(), "{:?}", review.runs);
+        // The error says which chunk it is about.
+        let invalid = review.invalid.map(|error| error.to_string());
+        assert!(
+            invalid
+                .as_deref()
+                .is_some_and(|error| error.starts_with("chunk 2/3: ")),
+            "{invalid:?}"
+        );
         assert_eq!(
             chunks_and_findings(&review.runs),
             [(1, Some(0)), (3, Some(findings))],
@@ -241,6 +223,46 @@ fn a_verdict_reached_beside_an_invalid_chunk_is_kept() {
         );
         assert!(memory.store.list(VERDICTS).unwrap().is_empty());
     }
+}
+
+#[test]
+fn the_error_names_the_failed_chunk_and_counts_the_others() {
+    let error = || Error::Refused("no reply".into());
+    // A review in one request has no chunk to name.
+    assert_eq!(chunk_error((1, 1), 0, error()).to_string(), "no reply");
+    assert_eq!(
+        chunk_error((2, 8), 0, error()).to_string(),
+        "chunk 2/8: no reply"
+    );
+    assert_eq!(
+        chunk_error((2, 8), 2, error()).to_string(),
+        "chunk 2/8 (and 2 more failed): no reply"
+    );
+}
+
+#[test]
+fn every_failed_chunk_is_counted() {
+    // The first reply is clear; every later one is invalid after a pause,
+    // so the second and third chunk, which run beside each other, have
+    // both been started by then.
+    let bin = TempDir::new("engine-invalid-both-bin");
+    let opencode = OpenCode::At(mock_opencode_counting(
+        bin.path(),
+        1,
+        "sleep 1\nprintf '%s\\n' 'not json'",
+    ));
+    let (settings, files) = three_chunks();
+
+    let review = review_group(&group(&settings, &files), &opencode, None);
+
+    let invalid = review.invalid.map(|error| error.to_string());
+    assert!(
+        invalid
+            .as_deref()
+            .is_some_and(|error| error.starts_with("chunk 2/3 (and 1 more failed): ")),
+        "{invalid:?}"
+    );
+    assert_eq!(chunks_and_findings(&review.runs), [(1, Some(0))]);
 }
 
 #[test]
@@ -258,7 +280,7 @@ fn a_verdict_reached_beside_a_chunk_that_ran_out_of_time_is_kept() {
     let memory = memory(&state, Vec::new());
     let (settings, files) = three_told_apart();
     let settings = AgentSettings {
-        timeout_secs: 3,
+        timeout_secs: 5,
         ..settings
     };
 

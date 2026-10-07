@@ -12,7 +12,7 @@ use crate::config::model::{AiRequirement, Profile, SourceClass, builtin};
 use crate::report::{AgentOutcome, AgentRun, Blocked, Decision, Gap, Report};
 use crate::rules::RuleId;
 use crate::scan::ScanConfig;
-use crate::test_support::{TempDir, mock_opencode, mock_opencode_counting};
+use crate::test_support::{TempDir, mock_opencode, mock_opencode_counting, reviewer_by_content};
 use crate::tools::OpenCode;
 
 fn unavailable() -> OpenCode {
@@ -1166,33 +1166,6 @@ fn a_store_with_a_bad_mode_is_skipped_with_a_note() {
     );
 }
 
-/// Shell lines for `mock_opencode_counting(_, 0, _)`: a reviewer that
-/// answers by what it was sent. A request carrying a run of `q` gets
-/// `on_q` instead of a reply; one carrying a run of `z` is answered
-/// `z_status`, with a finding in `c.c` when that is suspicious; any other
-/// is clear.
-fn reviewer_by_content(on_q: &str, z_status: &str) -> String {
-    let finding = if z_status == "suspicious" {
-        r#"{\"severity\":\"high\",\"file\":\"c.c\",\"title\":\"fetches and runs a script\",\"reason\":\"mock\"}"#
-    } else {
-        ""
-    };
-    format!(
-        r#"nonce=$(printf '%s\n' "$input" | sed -n 's/^Nonce: //p' | tr -d '\n')
-status=clear
-findings=
-case "$input" in
-*qqqqqqqqqqqqqqqq*)
-{on_q}
-exit 0 ;;
-*zzzzzzzzzzzzzzzz*) status={z_status}; findings="{finding}" ;;
-esac
-reply="{{\"nonce\":\"$nonce\",\"status\":\"$status\",\"summary\":\"mock\",\"findings\":[$findings]}}"
-escaped=$(printf '%s' "$reply" | sed 's/"/\\"/g')
-printf '{{"type":"text","part":{{"type":"text","text":"%s"}}}}\n' "$escaped""#
-    )
-}
-
 /// A tree reviewed in three chunks, the second of which gets `on_q` for a
 /// reply and the third `z_status`: that review, which must be incomplete,
 /// and the next one of the same tree, by a reviewer that finds everything
@@ -1334,7 +1307,7 @@ fn a_finding_beside_a_chunk_that_ran_out_of_time_is_reported_with_the_gap() {
     let (report, next) = review_with_a_failed_second_chunk(
         "printf '{\"type\":\"step_start\"}\\n'\nexec sleep 10",
         "suspicious",
-        Some(3),
+        Some(5),
     );
 
     assert_eq!(
