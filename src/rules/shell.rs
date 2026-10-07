@@ -313,16 +313,19 @@ const WRAPPERS: &[&str] = &[
 /// wrappers (`sudo -u x`, `env X=1`, `timeout 5`), assignments and what
 /// opens a group or a block. Every rule that asks what a command runs
 /// reads it here, so they agree on what a wrapper is.
-pub(super) fn program_word<'a>(words: &mut impl Iterator<Item = &'a str>) -> Option<&'a str> {
+pub(super) fn program_word<'a>(
+    words: &mut (impl Iterator<Item = &'a str> + Clone),
+) -> Option<&'a str> {
     let mut elevated = false;
-    // The command of a substitution that an assignment holds whole
-    // (`x=$(date)`): the program, unless one follows the assignment.
+    // The command of a substitution an assignment was given (`x=$(date)`):
+    // the program, unless one follows the assignment.
     let mut held: Option<&'a str> = None;
-    // What stands after the opening of one that goes on (`x=$(sudo`), read
-    // next as the word it is.
-    let mut opened: Option<&'a str> = None;
+    // What stands after the opening of a substitution that is read on
+    // (`x=$(sudo sh f)`): read next, as the word it is.
+    let mut inner: Option<&'a str> = None;
     loop {
-        let Some(word) = opened.take().or_else(|| words.next()) else {
+        let read_on = inner.is_some();
+        let Some(word) = inner.take().or_else(|| words.next()) else {
             return held;
         };
         let bare = word.trim_start_matches(['(', '{', '`']);
@@ -351,13 +354,24 @@ pub(super) fn program_word<'a>(words: &mut impl Iterator<Item = &'a str>) -> Opt
         }
         // `VAR=x cmd`: an assignment before the program.
         if bare.contains('=') && !bare.starts_with(['/', '.', '$', '=']) {
-            match substituted(bare) {
+            // An assignment inside a substitution that is read on is read
+            // past as a value, not opened again.
+            match (!read_on).then(|| substituted(bare)).flatten() {
                 // `x=$(date) sh f`: the program follows; the command in
                 // the substitution is it only when none does.
                 Some(Substituted::Whole(command)) => held = held.or(command),
-                // `x=$(sha256sum f`: the value is a command that goes on,
-                // and what follows is given to it.
-                Some(Substituted::Open(rest)) => opened = (!rest.is_empty()).then_some(rest),
+                Some(Substituted::Open(rest, backtick)) => {
+                    if let Some(after) = past_substitution(words, rest, backtick) {
+                        // `x=$(mktemp -d) sh f`: as above, with the
+                        // substitution over several words.
+                        held = held.or_else(|| command_of(rest));
+                        *words = after;
+                    } else {
+                        // `x=$(sha256sum f`: the value is the command, and
+                        // what follows is given to it.
+                        inner = command_of(rest);
+                    }
+                }
                 None => {}
             }
             continue;
@@ -366,14 +380,65 @@ pub(super) fn program_word<'a>(words: &mut impl Iterator<Item = &'a str>) -> Opt
     }
 }
 
+/// The most words a substitution is looked through for where it closes.
+const MAX_SUBSTITUTED_WORDS: usize = 64;
+
+/// `words` past the word that closes a substitution opened before them,
+/// where something follows it; `rest` is what stood after the opening.
+/// `None` where it does not close within `MAX_SUBSTITUTED_WORDS`, or
+/// nothing follows: then what it holds is all there is to read.
+fn past_substitution<'a, I>(words: &I, rest: &str, backtick: bool) -> Option<I>
+where
+    I: Iterator<Item = &'a str> + Clone,
+{
+    let mut ahead = words.clone();
+    let mut depth = 1 + depth_change(rest);
+    for _ in 0..MAX_SUBSTITUTED_WORDS {
+        let word = ahead.next()?;
+        let closes = if backtick {
+            word.contains('`')
+        } else {
+            depth += depth_change(word);
+            depth <= 0
+        };
+        if closes {
+            return ahead.clone().next().is_some().then_some(ahead);
+        }
+    }
+    None
+}
+
+/// How many more `(` than `)` a word holds.
+fn depth_change(word: &str) -> isize {
+    word.bytes().fold(0, |depth, byte| match byte {
+        b'(' => depth + 1,
+        b')' => depth - 1,
+        _ => depth,
+    })
+}
+
+/// The command a substitution begins with: its first word, up to what
+/// ends a word (`x=$(./f;)`, `x=$(./f|cat)`). `$(<file)` reads a file and
+/// runs nothing.
+fn command_of(inner: &str) -> Option<&str> {
+    let inner = inner.trim_start();
+    if inner.starts_with('<') {
+        return None;
+    }
+    inner
+        .split(|character: char| character.is_whitespace() || ";|&<>)`".contains(character))
+        .next()
+        .filter(|command| !command.is_empty())
+}
+
 /// The command an assignment's value runs.
 enum Substituted<'a> {
     /// The substitution closes within the word (`x=$(date)`,
     /// `PATH=$(pwd)/bin`): its command, if it names one.
     Whole(Option<&'a str>),
     /// It goes on in the words after (`x=$(cmd`): what stands after its
-    /// opening, which is empty when the command is the next word.
-    Open(&'a str),
+    /// opening, and whether a backtick opened it.
+    Open(&'a str, bool),
 }
 
 /// Reads the substitution an assignment's value begins with (`x=$(cmd`, or
@@ -401,8 +466,8 @@ fn substituted(assignment: &str) -> Option<Substituted<'_>> {
         })
     };
     Some(match end {
-        Some(end) => Substituted::Whole(inner[..end].split_whitespace().next()),
-        None => Substituted::Open(inner),
+        Some(end) => Substituted::Whole(command_of(&inner[..end])),
+        None => Substituted::Open(inner, backtick),
     })
 }
 
