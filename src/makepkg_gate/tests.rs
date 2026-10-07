@@ -632,6 +632,7 @@ fn a_later_call_is_held_against_what_guardian_extracted() {
         assert!(
             refused
                 .unwrap_err()
+                .message
                 .contains("did not extract the sources into the directory")
         );
     }
@@ -674,7 +675,9 @@ fn a_later_call_is_held_against_what_guardian_extracted() {
     fs::write(build.join("demo.tar.gz"), b"\x1f\x8b\x08\0two").unwrap();
     fs::write(build.join("extra.bin"), ELF).unwrap();
     std::os::unix::fs::symlink(build.join("extra.bin"), src.join("extra.bin")).unwrap();
-    let refused = hold_against_extraction(&step, &src, &mut fixture.collected()).unwrap_err();
+    let refused = hold_against_extraction(&step, &src, &mut fixture.collected())
+        .unwrap_err()
+        .message;
     assert!(
         refused
             .contains("not the ones Guardian fetched and reviewed: \"demo.tar.gz\", \"extra.bin\""),
