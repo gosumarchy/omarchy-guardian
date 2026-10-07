@@ -42,6 +42,7 @@ pub(crate) struct Settings {
     user_status: FileStatus,
     profile_override: Option<Profile>,
     privileged_block: Option<String>,
+    system_block: Option<String>,
     user_block: Option<String>,
     warnings: Vec<String>,
 }
@@ -110,6 +111,17 @@ fn read(path: &Path, secure: Option<&Verify<'_>>) -> Read {
     }
 }
 
+/// `reason` with the file it is about in front. A parse error names the
+/// file and line itself.
+fn named(path: &Path, reason: &str) -> String {
+    let file = path.display().to_string();
+    if reason.starts_with(&file) {
+        reason.to_string()
+    } else {
+        format!("{file}: {reason}")
+    }
+}
+
 impl Settings {
     pub(crate) fn load() -> Self {
         Self::load_from(
@@ -125,7 +137,7 @@ impl Settings {
         Self::load_from(Path::new(SYSTEM_PATH), None, &check_root_owned)
     }
 
-    pub(super) fn load_from(
+    pub(crate) fn load_from(
         system_path: &Path,
         user_path: Option<&Path>,
         secure: &dyn Fn(&Path) -> Result<(), String>,
@@ -140,14 +152,20 @@ impl Settings {
                 settings.system = config;
                 settings.system_status = FileStatus::Loaded;
             }
+            // Not carried on with the built-in defaults, for the pacman gate
+            // or for anything else: the file may hold a stricter level or a
+            // tightened class, and one typo would quietly undo it.
             Read::Failed(reason) => {
                 settings.privileged_block = Some(format!(
                     "{}: {reason}; fix it (see `omarchy-guardian config check`) before pacman transactions can be reviewed",
                     system_path.display()
                 ));
-                settings
-                    .warnings
-                    .push(format!("ignoring {}: {reason}", system_path.display()));
+                let block = format!(
+                    "{}; fix it as root (`omarchy-guardian config check` shows the problem) before AUR builds, themes, plugins, scans and the sweep can be reviewed",
+                    named(system_path, &reason)
+                );
+                settings.warnings.push(block.clone());
+                settings.system_block = Some(block);
                 settings.system_status = FileStatus::Invalid(reason);
             }
         }
@@ -180,13 +198,7 @@ impl Settings {
                 // Not carried on with the defaults: the file may hold a
                 // stricter profile, and one typo would quietly undo it.
                 Read::Failed(reason) => {
-                    // A parse error names the file and line itself.
-                    let file = user_path.display().to_string();
-                    let named = if reason.starts_with(&file) {
-                        reason.clone()
-                    } else {
-                        format!("{file}: {reason}")
-                    };
+                    let named = named(user_path, &reason);
                     let block = format!(
                         "{named}; fix it (see `omarchy-guardian config check`) before AUR builds, themes, plugins, scans and the sweep can be reviewed"
                     );
@@ -209,6 +221,7 @@ impl Settings {
             user_status: FileStatus::Missing,
             profile_override: None,
             privileged_block: None,
+            system_block: None,
             user_block: None,
             warnings: Vec::new(),
         }
@@ -348,10 +361,17 @@ impl Settings {
         self.privileged_block.as_deref()
     }
 
-    /// Why no user-level review can run: the user file is there and does
-    /// not parse.
+    /// Why no user-level review can run: the system file is there and is
+    /// invalid or insecure, or the user file is there and does not parse.
+    /// The system file's reason comes first: it is the one root has to fix.
     pub(crate) fn user_block(&self) -> Option<&str> {
-        self.user_block.as_deref()
+        self.system_block.as_deref().or(self.user_block.as_deref())
+    }
+
+    /// The part of `user_block` that is the system file's: it is there and
+    /// cannot be used, so no review of any kind runs with its settings.
+    pub(crate) fn system_block(&self) -> Option<&str> {
+        self.system_block.as_deref()
     }
 
     /// The weaker settings accepted in the root-owned system file.
@@ -410,7 +430,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use super::{FileStatus, Settings};
+    use super::{FileStatus, Settings, check_root_owned};
     use crate::config::file::{AgentDefaults, PartialConfig, PartialPolicy};
     use crate::config::model::{
         AiRequirement, Profile, RootConsent, SourceClass, StoreSettings, Thinking,
@@ -464,20 +484,113 @@ mod tests {
                 .contains("owned by uid 1000")
         );
         assert!(matches!(settings.system_status(), FileStatus::Invalid(_)));
-        // User-level classes fall back to the built-in standard profile.
-        assert_eq!(
-            settings.policy(SourceClass::Theme).ai,
-            AiRequirement::Required
+        // User-level classes are not reviewed at the built-in standard
+        // profile instead: they are blocked too.
+        let block = settings.user_block().unwrap();
+        assert_eq!(settings.system_block(), Some(block));
+        assert!(
+            block.starts_with(&format!(
+                "{}: insecure: owned by uid 1000; fix it as root",
+                system.display()
+            )),
+            "{block}"
         );
+        assert!(block.contains("config check"), "{block}");
+        assert_eq!(settings.warnings(), [block.to_string()]);
 
         fs::write(&system, "profile = \"bogus\"\n").unwrap();
         let settings = Settings::load_from(&system, None, &secure);
+        let privileged = settings.privileged_block().unwrap();
+        assert!(privileged.contains("config check"), "{privileged}");
+        assert!(
+            privileged.ends_with("before pacman transactions can be reviewed"),
+            "{privileged}"
+        );
+        // The parser's reason names the file and line once.
+        let block = settings.user_block().unwrap();
+        assert!(
+            block.starts_with(&format!("{}:1: profile:", system.display())),
+            "{block}"
+        );
+    }
+
+    #[test]
+    fn a_broken_system_file_blocks_user_level_reviews_whatever_the_user_file_says() {
+        let dir = TempDir::new("settings-system-block");
+        let system = dir.path().join("system.toml");
+        let user = dir.path().join("user.toml");
+        // A stricter level, a tightened class and one typo.
+        fs::write(
+            &system,
+            "profile = \"strict\"\n[class.aur]\nai = \"sometimes\"\n",
+        )
+        .unwrap();
+        fs::write(&user, "profile = \"standard\"\n").unwrap();
+
+        let settings = Settings::load_from(&system, Some(&user), &secure);
+        let block = settings.user_block().unwrap();
+        assert!(
+            block.contains(&format!("{}:3:", system.display())),
+            "{block}"
+        );
+        assert_eq!(settings.system_block(), Some(block));
+        assert_eq!(settings.user_status(), &FileStatus::Loaded);
+
+        // Both broken: both are said, the system file's first.
+        fs::write(&user, "profile = \"strict\n").unwrap();
+        let both = Settings::load_from(&system, Some(&user), &secure);
+        assert_eq!(both.warnings().len(), 2);
+        assert!(both.user_block().unwrap().contains("as root"));
+        assert!(both.warnings()[1].contains(&user.display().to_string()));
+
+        // Not there: the built-in defaults, and nothing blocked by it.
+        let missing = Settings::load_from(&dir.path().join("none.toml"), Some(&user), &secure);
+        assert_eq!(missing.system_status(), &FileStatus::Missing);
+        assert_eq!(missing.system_block(), None);
+        assert_eq!(missing.privileged_block(), None);
+        assert!(missing.user_block().unwrap().contains("user.toml"));
+
+        // Valid: in force, and nothing blocked.
+        fs::write(&system, "profile = \"strict\"\n").unwrap();
+        fs::write(&user, "").unwrap();
+        let valid = Settings::load_from(&system, Some(&user), &secure);
+        assert_eq!(valid.user_block(), None);
+        assert_eq!(valid.system_block(), None);
+        assert_eq!(valid.privileged_block(), None);
+        assert!(valid.warnings().is_empty());
+        assert_eq!(valid.profile_for(SourceClass::Aur), Profile::Strict);
+    }
+
+    #[test]
+    fn a_system_file_that_is_not_roots_alone_blocks_user_level_reviews() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The real ownership check. As a user the file is not root's; as
+        // root it is, and writable by everyone: refused either way.
+        let dir = TempDir::new("settings-system-owner");
+        let system = dir.path().join("system.toml");
+        fs::write(&system, "profile = \"strict\"\n").unwrap();
+        fs::set_permissions(&system, fs::Permissions::from_mode(0o666)).unwrap();
+
+        let settings = Settings::load_from(&system, None, &check_root_owned);
+        let FileStatus::Invalid(reason) = settings.system_status() else {
+            panic!("an insecure system file was loaded");
+        };
+        assert!(reason.starts_with("insecure: "), "{reason}");
+        assert!(
+            reason.contains("not root") || reason.contains("writable by group or others"),
+            "{reason}"
+        );
+        let block = settings.user_block().unwrap();
+        assert!(block.contains(reason.as_str()), "{block}");
         assert!(
             settings
                 .privileged_block()
                 .unwrap()
-                .contains("config check")
+                .contains(reason.as_str())
         );
+        // Its level is not in force, and nothing says it is.
+        assert_eq!(settings.system_profile(), Profile::Standard);
     }
 
     #[test]

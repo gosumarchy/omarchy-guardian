@@ -36,6 +36,9 @@ fn header(settings: &Settings) -> String {
     if let Some(reason) = settings.privileged_block() {
         let _ = writeln!(text, "Pacman gate: BLOCKED — {reason}");
     }
+    if let Some(reason) = settings.user_block() {
+        let _ = writeln!(text, "User-level reviews: BLOCKED — {reason}");
+    }
     let memory = settings.store_settings();
     let _ = writeln!(
         text,
@@ -58,11 +61,23 @@ pub(crate) fn render_show(settings: &Settings, classes: &[SourceClass]) -> Strin
             "user-level"
         };
 
+        // A class no review runs for: what follows is what the files that
+        // could be read give, not a policy in force.
+        let blocked = if class.is_privileged() {
+            settings.privileged_block()
+        } else {
+            settings.user_block()
+        };
         let _ = writeln!(
             text,
-            "\n[{}]  {scope} · profile {}",
+            "\n[{}]  {scope} · profile {}{}",
             class.name(),
-            settings.profile_for(*class).name()
+            settings.profile_for(*class).name(),
+            if blocked.is_some() {
+                " · NOT IN FORCE: blocked until the settings file is fixed"
+            } else {
+                ""
+            }
         );
         for knob in KNOBS {
             let value = match knob {
@@ -140,7 +155,7 @@ mod tests {
     use super::{render_check, render_memory, render_show};
     use crate::agent::SourceFile;
     use crate::config::Settings;
-    use crate::config::model::{AgentSettings, SourceClass};
+    use crate::config::model::{AgentSettings, Named, SourceClass};
     use crate::engine::baseline::{self, Identity, Unit};
     use crate::engine::store::Store;
     use crate::test_support::TempDir;
@@ -200,6 +215,62 @@ mod tests {
         let (text, valid) = render_check(&Settings::load_from(&system, None, &secure));
         assert!(!valid);
         assert!(text.contains("system.toml:1: profile: expected one of"));
+    }
+
+    #[test]
+    fn a_broken_system_file_is_shown_as_blocking_every_class() {
+        let dir = TempDir::new("show-system-broken");
+        let system = dir.path().join("system.toml");
+        fs::write(
+            &system,
+            "profile = \"strict\"\n[class.aur]\nai = \"sometimes\"\n",
+        )
+        .unwrap();
+        let settings = Settings::load_from(&system, None, &secure);
+
+        let (check, valid) = render_check(&settings);
+        assert!(!valid);
+        assert!(check.contains("(INVALID: "), "{check}");
+        assert!(check.contains("system.toml:3:"), "{check}");
+        assert!(check.contains("Pacman gate: BLOCKED — "), "{check}");
+        assert!(check.contains("User-level reviews: BLOCKED — "), "{check}");
+        assert!(check.contains("fix it as root"), "{check}");
+        assert!(check.contains("Configuration has errors"), "{check}");
+
+        // Shown, and no class reads as reviewed at the defaults.
+        let show = render_show(&settings, SourceClass::ALL);
+        assert!(show.contains("User-level reviews: BLOCKED — "), "{show}");
+        for class in SourceClass::ALL {
+            let heading = show
+                .lines()
+                .find(|line| line.starts_with(&format!("[{}]", class.name())))
+                .unwrap();
+            assert!(heading.contains("NOT IN FORCE"), "{heading}");
+        }
+
+        // Not there, or valid: as before.
+        let missing = Settings::load_from(&dir.path().join("none.toml"), None, &secure);
+        fs::write(&system, "profile = \"strict\"\n").unwrap();
+        for settings in [missing, Settings::load_from(&system, None, &secure)] {
+            let (check, valid) = render_check(&settings);
+            assert!(valid, "{check}");
+            let show = render_show(&settings, SourceClass::ALL);
+            assert!(!show.contains("BLOCKED"), "{show}");
+            assert!(!show.contains("NOT IN FORCE"), "{show}");
+        }
+
+        // A broken user file blocks the user-level classes alone.
+        let user = dir.path().join("user.toml");
+        fs::write(&user, "profile = \"strict\n").unwrap();
+        let settings = Settings::load_from(&system, Some(&user), &secure);
+        let show = render_show(&settings, &[SourceClass::Official, SourceClass::Aur]);
+        assert!(!show.contains("Pacman gate: BLOCKED"), "{show}");
+        assert!(show.contains("User-level reviews: BLOCKED — "), "{show}");
+        assert!(show.contains("hook · profile strict\n"), "{show}");
+        assert!(
+            show.contains("[aur]  user-level · profile strict · NOT IN FORCE"),
+            "{show}"
+        );
     }
 
     #[test]

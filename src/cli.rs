@@ -57,10 +57,8 @@ pub(crate) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
     for warning in settings.warnings() {
         errln!("omarchy-guardian: {warning}");
     }
-    // A user file that does not parse is not reviewed around: its settings
-    // (a stricter level, say) would be gone without a word.
-    if reviews_for_the_user(&invocation) && settings.user_block().is_some() {
-        errln!("omarchy-guardian: nothing was reviewed or run: the user settings file is invalid.");
+    if let Some(refusal) = refusal(&invocation, &settings) {
+        errln!("omarchy-guardian: {refusal}");
         return ExitCode::from(2);
     }
 
@@ -165,9 +163,9 @@ fn protect_command(yes: bool, off: bool) -> ExitCode {
     }
 }
 
-/// Whether `invocation` reviews with the user file's settings: the gates
-/// and reviews that are not the pacman hook's. Settings commands are not, so
-/// a broken file can still be shown and fixed.
+/// Whether `invocation` reviews at the user level, with both files'
+/// settings: the gates and reviews that are not the pacman hook's. Settings
+/// commands are not, so a broken file can still be shown and fixed.
 const fn reviews_for_the_user(invocation: &Invocation) -> bool {
     matches!(
         invocation,
@@ -177,6 +175,26 @@ const fn reviews_for_the_user(invocation: &Invocation) -> bool {
             | Invocation::MakepkgGate(_)
             | Invocation::Sweep(sweep::Command::Run(_))
     )
+}
+
+/// Why `invocation` is not started: it reviews for the user, and a settings
+/// file that is there cannot be used. Such a file is not reviewed around,
+/// at the built-in defaults: its settings (a stricter level, say) would be
+/// gone without a word. The reason itself is in the warnings printed before
+/// this line; the system file is named again, with the way out.
+fn refusal(invocation: &Invocation, settings: &Settings) -> Option<String> {
+    if !reviews_for_the_user(invocation) {
+        return None;
+    }
+    if settings.system_block().is_some() {
+        return Some(format!(
+            "nothing was reviewed or run: the system settings file {} is invalid or insecure. Fix it as root; `omarchy-guardian config check` shows the problem.",
+            settings.system_path().display()
+        ));
+    }
+    settings
+        .user_block()
+        .map(|_| "nothing was reviewed or run: the user settings file is invalid.".to_string())
 }
 
 /// A one-run profile override (`--profile`) applies on top of the loaded

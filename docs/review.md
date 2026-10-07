@@ -33,7 +33,8 @@ A review that cannot finish blocks. An unavailable AI blocks every class whose
 `ai` setting is `required` and warns where it is `optional`. In the stock
 profiles only official Arch/Omarchy updates under `standard` are optional. A
 question nobody can be asked (no terminal) is answered no. A settings file
-that does not parse stops the gates that read it instead of being skipped.
+that does not parse stops the gates that read it instead of being skipped; a
+broken system file stops them all.
 
 ## What is checked
 

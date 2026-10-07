@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use super::gate::{not_started, tree_content};
 use super::{
     ConfigCommand, Confirm, Forget, Invocation, Target, forget_command, forget_in, guard_command,
-    pacman_hook_command, parse, review_and_decide, reviews_for_the_user,
+    pacman_hook_command, parse, refusal, review_and_decide, reviews_for_the_user,
 };
 use crate::agent::SourceFile;
 use crate::audit::{self, Gate};
@@ -361,6 +361,90 @@ fn only_reviews_for_the_user_stop_on_a_broken_user_file() {
     ] {
         let invocation = parse(&args(line)).unwrap();
         assert_eq!(reviews_for_the_user(&invocation), reviews, "{line:?}");
+    }
+}
+
+/// Every command line, and whether it reviews at the user level.
+const LINES: [(&[&str], bool); 17] = [
+    (&["scan", "dir"], true),
+    (&["guard", "dir", "--", "true"], true),
+    (&["guard", "--class", "theme", "dir", "--", "true"], true),
+    (&["guard", "--class", "plugin", "dir", "--", "true"], true),
+    (&["sandbox", "dir", "--", "true"], true),
+    (&["makepkg-gate", "--", "/usr/bin/makepkg"], true),
+    (&["sweep"], true),
+    (&["sweep", "--scheduled"], true),
+    // What shows and repairs the settings still runs.
+    (&["config", "check"], false),
+    (&["config", "show"], false),
+    (&["config", "path"], false),
+    (&["tui"], false),
+    (&["setup"], false),
+    (&["status"], false),
+    (&["log"], false),
+    (&["permit"], false),
+    (&["forget", "--all"], false),
+];
+
+#[test]
+fn a_broken_system_file_stops_every_review_for_the_user() {
+    let dir = TempDir::new("cli-system-broken");
+    let system = dir.path().join("system.toml");
+    let user = dir.path().join("user.toml");
+    let verified = |_: &std::path::Path| Ok(());
+    let not_roots = |_: &std::path::Path| Err("owned by uid 1000, not root".to_string());
+    fs::write(&user, "profile = \"standard\"\n").unwrap();
+
+    // It does not parse, or it is not root's alone.
+    fs::write(&system, "profile = \"strict\n").unwrap();
+    let unparsed = Settings::load_from(&system, Some(&user), &verified);
+    fs::write(&system, "profile = \"strict\"\n").unwrap();
+    let insecure = Settings::load_from(&system, Some(&user), &not_roots);
+    for settings in [&unparsed, &insecure] {
+        for (line, reviews) in LINES {
+            let said = refusal(&parse(&args(line)).unwrap(), settings);
+            assert_eq!(said.is_some(), reviews, "{line:?}");
+            let Some(said) = said else { continue };
+            assert!(
+                said.starts_with("nothing was reviewed or run: the system settings file "),
+                "{said}"
+            );
+            assert!(said.contains(&system.display().to_string()), "{said}");
+            assert!(said.contains("as root"), "{said}");
+            assert!(said.contains("omarchy-guardian config check"), "{said}");
+        }
+        // The reason itself is the warning every command prints first.
+        assert_eq!(settings.warnings().len(), 1);
+    }
+    assert!(unparsed.warnings()[0].contains("system.toml:1:"));
+    assert!(insecure.warnings()[0].contains("insecure: owned by uid 1000, not root"));
+    // The pacman gate refuses as it did.
+    assert!(
+        insecure
+            .privileged_block()
+            .unwrap()
+            .ends_with("before pacman transactions can be reviewed")
+    );
+
+    // Valid, or not there: nothing is refused.
+    let valid = Settings::load_from(&system, Some(&user), &verified);
+    let missing = Settings::load_from(&dir.path().join("none.toml"), Some(&user), &verified);
+    for settings in [&valid, &missing] {
+        for (line, _) in LINES {
+            assert_eq!(refusal(&parse(&args(line)).unwrap(), settings), None);
+        }
+    }
+
+    // A broken user file under a valid system file says what it said.
+    fs::write(&user, "profile = \"strict\n").unwrap();
+    let user_broken = Settings::load_from(&system, Some(&user), &verified);
+    for (line, reviews) in LINES {
+        let said = refusal(&parse(&args(line)).unwrap(), &user_broken);
+        assert_eq!(
+            said.as_deref(),
+            reviews.then_some("nothing was reviewed or run: the user settings file is invalid."),
+            "{line:?}"
+        );
     }
 }
 
