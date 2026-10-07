@@ -104,8 +104,10 @@ fn the_audit_trail_gets_numbers_and_the_user_gets_the_reasons() {
     });
     report.gaps.push(Gap::Undecodable("blob".into()));
     let summary = report.overruled_summary(10);
+    // Why the review is incomplete comes first, then the alerts.
+    assert!(summary[0].starts_with("not reviewed: blob"), "{summary:?}");
     assert!(
-        summary[0].ends_with("install.sh:3 download-and-execute"),
+        summary[1].ends_with("install.sh:3 download-and-execute"),
         "{summary:?}"
     );
     assert!(summary.iter().any(|line| line == "AI review: SUSPICIOUS"));
@@ -114,14 +116,97 @@ fn the_audit_trail_gets_numbers_and_the_user_gets_the_reasons() {
             .iter()
             .any(|line| line.starts_with("AI review unavailable"))
     );
-    assert!(
-        summary
-            .iter()
-            .any(|line| line.starts_with("not reviewed: blob"))
-    );
     // Bounded, and it says what it left out.
     assert_eq!(report.overruled_summary(2).len(), 3);
     assert_eq!(report.overruled_summary(2)[2], "and 2 more");
+}
+
+fn local_findings(count: usize) -> Vec<LocalFinding> {
+    (1..=count)
+        .map(|line| LocalFinding {
+            path: "install.sh".into(),
+            line,
+            rule: RuleId::DownloadAndExecute,
+            excerpt: "curl x | sh".into(),
+        })
+        .collect()
+}
+
+fn not_attempted(chunk: (usize, usize)) -> AgentRun {
+    AgentRun {
+        chunk: Some(chunk),
+        outcome: AgentOutcome::Unavailable(Error::Refused(format!(
+            "{}: no reply",
+            super::NOT_ATTEMPTED
+        ))),
+        ..unavailable(&["x"])
+    }
+}
+
+#[test]
+fn the_summary_keeps_why_the_review_is_incomplete_whatever_else_there_is() {
+    // More alerts than the summary has lines for, and a gap.
+    let mut report = Report::new("x");
+    report.findings = local_findings(20);
+    report
+        .gaps
+        .push(Gap::Agent(Error::Refused("no reply".into())));
+    let summary = report.overruled_summary(16);
+    assert_eq!(summary[0], "not reviewed: AI review failed: no reply");
+    assert_eq!(summary.len(), 17);
+    assert_eq!(summary[16], "and 5 more");
+
+    // The first of eight chunks failed, so seven were never sent, beside
+    // nine local findings: one line for the seven.
+    let mut report = Report::new("x");
+    report.findings = local_findings(9);
+    report.agent_runs = (2..=8).map(|index| not_attempted((index, 8))).collect();
+    report
+        .gaps
+        .push(Gap::Agent(Error::Refused("chunk 1/8: no reply".into())));
+    let summary = report.overruled_summary(16);
+    assert_eq!(
+        summary[0],
+        "not reviewed: AI review failed: chunk 1/8: no reply"
+    );
+    let collapsed: Vec<&String> = summary
+        .iter()
+        .filter(|line| line.contains("not attempted"))
+        .collect();
+    assert_eq!(
+        collapsed,
+        ["7 chunk(s) not attempted after an earlier chunk failed"]
+    );
+    assert_eq!(summary.len(), 11, "{summary:?}");
+
+    // The second of four chunks failed and the two after it found sixteen
+    // things between them.
+    let mut report = Report::new("x");
+    report.agent_runs.push(reviewed(Status::Clear, &["a"]));
+    for file in ["c", "d"] {
+        let mut run = reviewed(Status::Suspicious, &[file]);
+        if let AgentOutcome::Reviewed(review) = &mut run.outcome {
+            review.findings = (0..8)
+                .map(|_| AgentFinding {
+                    severity: Severity::High,
+                    file: file.into(),
+                    line: None,
+                    title: "runs a download".into(),
+                    reason: "mock".into(),
+                })
+                .collect();
+        }
+        report.agent_runs.push(run);
+    }
+    report
+        .gaps
+        .push(Gap::Agent(Error::Refused("chunk 2/4: no reply".into())));
+    let summary = report.overruled_summary(16);
+    assert_eq!(
+        summary[0],
+        "not reviewed: AI review failed: chunk 2/4: no reply"
+    );
+    assert_eq!(summary[16], "and 1 more");
 }
 
 fn reviewed(status: Status, files: &[&str]) -> AgentRun {

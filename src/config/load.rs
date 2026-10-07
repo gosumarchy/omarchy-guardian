@@ -76,7 +76,7 @@ pub(crate) struct Insecure {
 }
 
 impl Insecure {
-    fn other(reason: String) -> Self {
+    pub(crate) fn other(reason: String) -> Self {
         Self {
             reason,
             owner: None,
@@ -98,11 +98,33 @@ impl Insecure {
             entry.display()
         ))
     }
+
+    /// The reason as it is said of the file at `path`, naming it once.
+    pub(crate) fn said_of(&self, path: &Path) -> String {
+        named(path, &self.reason_text())
+    }
+
+    fn reason_text(&self) -> String {
+        format!("insecure: {}", self.reason)
+    }
+
+    /// Whether the refused owner is root as a user namespace that does not
+    /// map root shows it: nothing in the file is then root's to fix.
+    pub(crate) fn unverified(&self) -> bool {
+        unverified_here(self.owner)
+    }
+}
+
+/// `unverified` for the namespace this process runs in.
+fn unverified_here(owner: Option<u32>) -> bool {
+    unverified(user::root_unmapped(), owner, &|owner| {
+        owner != 0 && !user::is_foreign_owner(owner, None)
+    })
 }
 
 /// The system file and its directory must be root-owned regular entries
 /// that only root can write.
-fn check_root_owned(path: &Path) -> Result<(), Insecure> {
+pub(crate) fn check_root_owned(path: &Path) -> Result<(), Insecure> {
     let metadata =
         fs::symlink_metadata(path).map_err(|error| Insecure::other(error.to_string()))?;
     if !metadata.file_type().is_file() {
@@ -142,7 +164,7 @@ fn read(path: &Path, secure: Option<&Verify<'_>>) -> Read {
     if let Some(secure) = secure
         && let Err(insecure) = secure(path)
     {
-        return Read::Failed(format!("insecure: {}", insecure.reason), insecure.owner);
+        return Read::Failed(insecure.reason_text(), insecure.owner);
     }
     match fs::read_to_string(path) {
         Ok(text) => match parse(path, &text) {
@@ -207,11 +229,7 @@ impl Settings {
         user_path: Option<&Path>,
         secure: &Verify<'_>,
     ) -> Self {
-        Self::load_in(system_path, user_path, secure, &|owner| {
-            unverified(user::root_unmapped(), owner, &|owner| {
-                owner != 0 && !user::is_foreign_owner(owner, None)
-            })
-        })
+        Self::load_in(system_path, user_path, secure, &unverified_here)
     }
 
     /// `load_from`, told by `unverified` whether a refused owner of the

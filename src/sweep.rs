@@ -714,7 +714,7 @@ fn remember_run(
     crate::audit::sweep_ended(report, decision, changes.len());
     // Findings are a sweep that did its job; anything else that blocks is
     // one that could not see or review everything.
-    let reasons: Vec<String> = match decision {
+    let mut reasons: Vec<String> = match decision {
         Decision::Blocked(Blocked::Findings)
         | Decision::Clear
         | Decision::Warned
@@ -732,6 +732,9 @@ fn remember_run(
             .chain(report.gaps.iter().map(ToString::to_string))
             .collect(),
     };
+    // The chunks never sent after one failed all give the same reason.
+    let mut said = std::collections::HashSet::new();
+    reasons.retain(|reason| said.insert(reason.clone()));
     let outcome = if reasons.is_empty() {
         Outcome::Complete
     } else {

@@ -57,7 +57,7 @@ use self::permits::{
 };
 use self::rpc::aur_facts;
 use self::sources::{download_names, fetch_refusal, source_context};
-use self::state::{Drift, Extraction, State};
+use self::state::{Drift, Extraction, Kept, State};
 use self::upstream::{review_upstream_files, unreviewable_sources};
 use crate::audit::{self, Gate};
 use crate::aur::recipe::{self, Sources};
@@ -835,34 +835,78 @@ fn unpack_one(
     Ok(into)
 }
 
+/// Why a call must not go on with the sources it finds: what is said, and
+/// what is noted of it.
+#[derive(Debug, PartialEq, Eq)]
+struct NotHeld {
+    message: String,
+    why: &'static str,
+}
+
+impl NotHeld {
+    /// The sources are not what Guardian extracted.
+    fn changed(message: String) -> Self {
+        Self {
+            message,
+            why: "the sources are not the ones Guardian fetched and reviewed",
+        }
+    }
+
+    /// There is a record of what Guardian extracted, and it cannot be
+    /// used: what the build would be held against is not known.
+    fn unusable(step: &UpstreamStep<'_>, reason: &str) -> Self {
+        Self {
+            message: format!(
+                "Guardian's record of the sources it extracted for this build cannot be used ({reason}), so the sources cannot be held against it. Nothing was built. Run the build again from the start: Guardian extracts the sources again and writes a new record. Or remove the record with `omarchy-guardian forget aur:{}` (it also drops what else Guardian remembers of this package): the sources are then reviewed as they are found.",
+                step.key
+            ),
+            why: "the record of what Guardian extracted cannot be used",
+        }
+    }
+
+    /// The sources were too many to record (see `Extraction::unlisted`).
+    fn unlisted() -> Self {
+        Self {
+            message: "the sources have more files, or files with longer names, than Guardian can keep a record of, so a build cannot be held to what Guardian extracted and reviewed. Nothing was built.".into(),
+            why: "the sources are too many to hold the build to",
+        }
+    }
+}
+
 /// Holds the sources as a call that does not extract finds them against
 /// what Guardian extracted for this build. `Err` is why the build must not
-/// go on; `Ok` holds facts for the AI about what changed in between.
+/// go on; `Ok` holds facts for the AI about what changed in between. Only
+/// where there is no record, or the record is of another directory, are
+/// the sources reviewed as they are; a record that cannot be used stops
+/// the build.
 fn hold_against_extraction(
     step: &UpstreamStep<'_>,
     srcdir: &Path,
     collected: &mut aur::Collected,
-) -> Result<Vec<String>, String> {
-    let extraction = step
-        .state
-        .extraction()
-        .filter(|extraction| Path::new(&extraction.srcdir) == srcdir);
-    let Some(extraction) = extraction else {
-        outln!(
-            "Sources: Guardian has no record of extracting them for this build; they are reviewed as they are now."
-        );
-        return Ok(vec![
-            "Guardian did not extract these sources itself for this build: they are reviewed as an earlier makepkg run left them.".into(),
-        ]);
+) -> Result<Vec<String>, NotHeld> {
+    let extraction = match step.state.extraction() {
+        Kept::Usable(extraction) if extraction.is_of(srcdir) => extraction,
+        Kept::Unusable(reason) => return Err(NotHeld::unusable(step, &reason)),
+        Kept::Absent | Kept::Usable(_) => {
+            outln!(
+                "Sources: Guardian has no record of extracting them for this build; they are reviewed as they are now."
+            );
+            return Ok(vec![
+                "Guardian did not extract these sources itself for this build: they are reviewed as an earlier makepkg run left them.".into(),
+            ]);
+        }
     };
+    if extraction.unlisted {
+        return Err(NotHeld::unlisted());
+    }
     let identity = state::identity(srcdir);
     let seen = collected.upstream();
     match extraction.drift(identity.as_deref(), &seen.downloads, &seen.seen) {
-        Drift::Elsewhere => Err(format!(
+        Drift::Elsewhere => Err(NotHeld::changed(format!(
             "makepkg did not extract the sources into the directory Guardian reviewed ({}): the build's own extraction and prepare() ran somewhere else, or not at all.",
             srcdir.display()
-        )),
-        Drift::Downloads(names) => Err(format!(
+        ))),
+        Drift::Downloads(names) => Err(NotHeld::changed(format!(
             "the build uses download(s) that are not the ones Guardian fetched and reviewed: {}.",
             names
                 .iter()
@@ -870,7 +914,7 @@ fn hold_against_extraction(
                 .map(|name| format!("{name:?}"))
                 .collect::<Vec<_>>()
                 .join(", ")
-        )),
+        ))),
         Drift::Files(changed) if changed.is_empty() => Ok(Vec::new()),
         Drift::Files(changed) => {
             let count = changed.len();
@@ -885,8 +929,9 @@ fn hold_against_extraction(
     }
 }
 
-/// Records what Guardian extracted, for the calls that follow.
-fn record_extraction(step: &UpstreamStep<'_>, srcdir: &Path, collected: &aur::Collected) {
+/// Records what Guardian extracted, for the calls that follow. Returns
+/// whether it could be recorded whole; where not, the record says so.
+fn record_extraction(step: &UpstreamStep<'_>, srcdir: &Path, collected: &aur::Collected) -> bool {
     let seen = collected.upstream();
     let cleans = step
         .mirrored
@@ -896,9 +941,10 @@ fn record_extraction(step: &UpstreamStep<'_>, srcdir: &Path, collected: &aur::Co
         srcdir: srcdir.to_string_lossy().into_owned(),
         identity: state::identity(srcdir),
         cleanbuild: cleans,
-        downloads: Extraction::keyed(&seen.downloads),
-        files: Extraction::keyed(&seen.seen),
-    });
+        downloads: seen.downloads.clone(),
+        files: seen.seen.clone(),
+        unlisted: false,
+    })
 }
 
 /// Facts about the dependencies a build downloads on its own.
@@ -1020,18 +1066,13 @@ fn collect_sources(
     let mut collected = aur::walk_upstream(&srcdir, &roots, &step.functions.written, &noextract);
     // Kept until the files are chosen: the unpacked ones are read from it.
     let scratch = unpack_archives(step, &srcdir, &roots, &mut collected);
+    let not_held = |refused: NotHeld| block(step, &refused.message, refused.why, 2);
     if step.extract {
-        record_extraction(step, &srcdir, &collected);
+        if !record_extraction(step, &srcdir, &collected) {
+            return Err(not_held(NotHeld::unlisted()));
+        }
     } else if collected.upstream().found {
-        let changed = hold_against_extraction(step, &srcdir, &mut collected).map_err(|why| {
-            block(
-                step,
-                &why,
-                "the sources are not the ones Guardian fetched and reviewed",
-                2,
-            )
-        })?;
-        context.extend(changed);
+        context.extend(hold_against_extraction(step, &srcdir, &mut collected).map_err(not_held)?);
     }
     let upstream = collected.select(budget);
     drop(scratch);
