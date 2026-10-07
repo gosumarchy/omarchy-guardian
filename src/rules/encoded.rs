@@ -5,6 +5,7 @@
 //! that runs its output. Decoding alone is ordinary (certificates, icons,
 //! test data), and so is `eval`; the two meeting is what is flagged.
 
+use super::matchers::last_pipe_reader;
 use super::shell::{self, Command, program_name, short_flag, unquoted_words};
 use super::{contains_pattern, pattern_starts, pipes_into_shell};
 
@@ -139,20 +140,85 @@ fn filters_literal_into_shell(
     is_filter: &dyn Fn(&Command) -> bool,
     spelled_out: bool,
 ) -> bool {
-    let parts: Vec<&str> = line.split('|').collect();
-    (0..parts.len()).any(|at| {
-        if !shell::pipes_from(parts[at], is_filter) {
-            return false;
+    let filters = |part: &str| shell::pipes_from(part, is_filter);
+    // The line as `pipes_into_shell` cuts it: at single pipes, with `||`
+    // read as `;`. Only what stands before the last reader is piped into
+    // one.
+    let groups = pipe_groups(line);
+    let flat: Vec<String> = groups
+        .iter()
+        .map(|group| group.replace("||", ";"))
+        .collect();
+    let segments: Vec<&str> = flat.iter().map(String::as_str).collect();
+    let Some(reader) = last_pipe_reader(&segments) else {
+        return false;
+    };
+    // Whether a segment after the one looked at, and before the reader, is
+    // a filter by itself: from the end, so each segment is read once.
+    let mut later = false;
+    let mut followed = 0;
+    for index in (0..reader).rev() {
+        let parts: Vec<&str> = groups[index].split('|').collect();
+        // Where each part begins in the segment, which has one character
+        // for each `||` before it.
+        let mut start = 0;
+        for (at, part) in parts.iter().enumerate() {
+            let begins = start;
+            start += part.len() + (at + 1) % 2;
+            if !filters(part) {
+                continue;
+            }
+            let before = match at.checked_sub(1) {
+                Some(before) => Some(parts[before]),
+                None => index
+                    .checked_sub(1)
+                    .and_then(|group| groups[group].rsplit('|').next()),
+            };
+            let fed = (part.contains("<<") && !(spelled_out && part.contains('$')))
+                || before.is_some_and(|before| prints(before, spelled_out));
+            if !fed {
+                continue;
+            }
+            // Its output is piped on as it is, or a later filter's is.
+            if at + 1 == parts.len() || later {
+                return true;
+            }
+            // `tr … <<< x || y | sh`: what is piped on is the end of the
+            // segment, read from the filter on.
+            followed += 1;
+            if followed > MAX_FOLLOWED || flat[index].get(begins..).is_some_and(filters) {
+                return true;
+            }
         }
-        let fed = (parts[at].contains("<<") && !(spelled_out && parts[at].contains('$')))
-            || at
-                .checked_sub(1)
-                .is_some_and(|before| prints(parts[before], spelled_out));
-        // From the filter on: what reads its output.
-        fed && pipes_into_shell(&parts[at..].join("|"), |part| {
-            shell::pipes_from(part, is_filter)
-        })
-    })
+        later = later || filters(segments[index]);
+    }
+    false
+}
+
+/// The most filters of one line, each with a `||` after it, whose pipeline
+/// is read on from there. A line with more is taken to run one: to read
+/// each would cost a pass over the line apiece.
+const MAX_FOLLOWED: usize = 64;
+
+/// What the single pipes of `line` divide: a `||` is no pipe, and is left
+/// in its part.
+fn pipe_groups(line: &str) -> Vec<&str> {
+    let bytes = line.as_bytes();
+    let mut groups = Vec::new();
+    let (mut start, mut index) = (0, 0);
+    while index < bytes.len() {
+        if bytes[index] != b'|' {
+            index += 1;
+        } else if bytes.get(index + 1) == Some(&b'|') {
+            index += 2;
+        } else {
+            groups.push(&line[start..index]);
+            index += 1;
+            start = index;
+        }
+    }
+    groups.push(&line[start..]);
+    groups
 }
 
 /// The shell shapes: a decoder (or a literal written in escapes, or a
@@ -184,7 +250,7 @@ fn shell_shape(line: &str) -> bool {
     if shell::runs_substitution(line, &|body| {
         has_decoder(body)
             || prints_escaped_literal(body)
-            || (has_decompressor(body) && body.contains("<<"))
+            || (body.contains("<<") && has_decompressor(body))
     }) {
         return true;
     }
@@ -267,10 +333,37 @@ const RUN_CALLS: &[&str] = &[
 /// The furthest into a line a call's argument is read.
 const MAX_ARGUMENT: usize = 4096;
 
-/// What each run call on the line is given, with `function(` when what it
-/// is given opens the argument list (a declaration lists names there).
-pub(super) fn run_arguments(line: &str) -> Vec<&str> {
-    let mut found = Vec::new();
+/// The most of one line read as what its calls are given, a call at a time:
+/// calls inside one another are each given the same text again. A line with
+/// more is read once more, as a whole (see `Given::unread`).
+const MAX_GIVEN: usize = 1 << 20;
+
+/// What the run calls of a line are given.
+pub(super) struct Given<'a> {
+    /// What each call is given, with `function(` when what it is given
+    /// opens the argument list (a declaration lists names there).
+    pub(super) arguments: Vec<&'a str>,
+    /// The line, when it has calls beyond the `MAX_GIVEN` read: what they
+    /// are given is somewhere in it.
+    pub(super) unread: Option<&'a str>,
+}
+
+impl Given<'_> {
+    /// Whether `accepts` holds for what a call is given. Calls not read one
+    /// by one count when it holds for the line: a line too long to read
+    /// call by call is not taken to be without one.
+    pub(super) fn any(&self, accepts: impl Fn(&str) -> bool) -> bool {
+        self.arguments.iter().any(|argument| accepts(argument)) || self.unread.is_some_and(accepts)
+    }
+}
+
+/// What each run call on the line is given.
+pub(super) fn run_arguments(line: &str) -> Given<'_> {
+    let mut given = Given {
+        arguments: Vec::new(),
+        unread: None,
+    };
+    let mut read = 0;
     for call in RUN_CALLS {
         // `vm.runInNewContext(` is a method: no word boundary before it.
         let method = call.starts_with("runin");
@@ -280,14 +373,21 @@ pub(super) fn run_arguments(line: &str) -> Vec<&str> {
             pattern_starts(line, call).collect()
         };
         for start in starts {
+            if read > MAX_GIVEN {
+                given.unread = Some(line);
+                return given;
+            }
             let mut end = (start + call.len() + MAX_ARGUMENT).min(line.len());
             while !line.is_char_boundary(end) {
                 end -= 1;
             }
-            found.push(shell::argument(&line[start + call.len()..end]));
+            let argument = shell::argument(&line[start + call.len()..end]);
+            // An empty one was still looked at.
+            read += argument.len() + 1;
+            given.arguments.push(argument);
         }
     }
-    found
+    given
 }
 
 /// A run call given a decode call, or a response just fetched: `exec(
@@ -298,19 +398,33 @@ fn call_shape(line: &str) -> bool {
         return false;
     }
     if run_arguments(line)
-        .iter()
         .any(|argument| has_decode_call(argument) || argument.contains("responsetext"))
     {
         return true;
     }
     // `new Function(atob(…))`, `Function(Buffer.from(…, 'base64'))`: a
     // declaration (`function(a, b)`) opens with names instead.
-    pattern_starts(line, "function(").any(|start| {
-        let argument = shell::argument(&line[start + "function(".len()..]);
-        let opens = argument.trim_start();
-        (opens.starts_with("atob(") || opens.starts_with("buffer.from("))
-            && has_decode_call(argument)
-    })
+    let mut read = 0;
+    for start in pattern_starts(line, "function(") {
+        let rest = &line[start + "function(".len()..];
+        let opens = rest.trim_start();
+        // Neither holds a parenthesis that closes, so what is given
+        // reaches at least as far.
+        if !(opens.starts_with("atob(") || opens.starts_with("buffer.from(")) {
+            continue;
+        }
+        // Past `MAX_GIVEN` the rest of the line stands for what this call
+        // and every later one is given.
+        if read > MAX_GIVEN {
+            return has_decode_call(rest);
+        }
+        let argument = shell::argument(rest);
+        if has_decode_call(argument) {
+            return true;
+        }
+        read += argument.len();
+    }
+    false
 }
 
 /// PowerShell given its command encoded: `powershell -enc …`.
@@ -361,14 +475,16 @@ pub(super) fn assigned_decode(line: &str) -> Option<&str> {
 
 /// Whether a run call on `line` is given the variable `name`.
 pub(super) fn runs_name(line: &str, name: &str) -> bool {
-    run_arguments(line).iter().any(|argument| {
-        // The code is the first thing a run call is given.
-        let first = argument.split(',').next().unwrap_or_default();
-        pattern_starts(first, name).any(|start| {
-            !first[start + name.len()..]
-                .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+    let names = |text: &str| {
+        pattern_starts(text, name).any(|start| {
+            !text[start + name.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
         })
-    })
+    };
+    let given = run_arguments(line);
+    given.arguments.iter().any(|argument| {
+        // The code is the first thing a run call is given.
+        names(argument.split(',').next().unwrap_or_default())
+    }) || given.unread.is_some_and(names)
 }
 
 #[cfg(test)]
@@ -579,5 +695,65 @@ mod tests {
         assert!(!runs_name("exec(decode)", "code"));
         assert!(!runs_name("exec(other, code)", "code"));
         assert!(!runs_name("print(code)", "code"));
+    }
+
+    #[test]
+    fn a_filter_before_an_or_is_read_to_what_is_piped_on() {
+        for line in [
+            "tr a b <<< x || tr c d <<< y | sh",
+            "tr a b <<< x | cat || true | sh",
+            "gunzip <<< x || gunzip <<< y | cat | bash",
+            "echo x | tr a b || echo y | tr c d | sh",
+        ] {
+            assert!(matches(line), "{line}");
+        }
+        for line in [
+            // What is piped on is the last command of its part.
+            "tr a b <<< x || cat | sh",
+            "tr a b <<< x || cat y | sh",
+            "echo x | tr a b || true | sh",
+            "tr a b <<< x ||| sh",
+            // The shell is before the filter, or reads nothing.
+            "sh | tr a b <<< x",
+            "tr a b <<< x || sh",
+            "tr a b <<< x |sh||x",
+        ] {
+            assert!(!matches(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_long_line_of_filters_costs_one_pass() {
+        use super::MAX_FOLLOWED;
+        // Filters none of which is read by a shell, and then one that is.
+        let filters = "tr a b<<<x|".repeat(12_000);
+        assert!(!matches(&filters));
+        assert!(matches(&(filters + "sh")));
+        assert!(!matches(&"echo x|tr a b|".repeat(8_000)));
+        // Each with a `||` after it: up to `MAX_FOLLOWED` are read on to
+        // what is piped into the shell, and a line with more is taken to
+        // run one.
+        let followed = |count: usize| "tr a b<<<x||".repeat(count) + "cat|sh";
+        assert!(!matches(&followed(MAX_FOLLOWED)));
+        assert!(matches(&followed(MAX_FOLLOWED + 1)));
+        assert!(matches(&followed(5_000)));
+    }
+
+    #[test]
+    fn a_long_line_of_calls_costs_one_pass() {
+        use super::MAX_ARGUMENT;
+        // Calls that are never closed, each given the rest of the line.
+        assert!(!matches(&"function(buffer.from(".repeat(8_000)));
+        assert!(!matches(&"exec(".repeat(80_000)));
+        assert!(!matches(&"eval(x(".repeat(15_000)));
+        assert!(matches(&("exec(".repeat(20_000) + "atob(x)")));
+        // Past `MAX_GIVEN` a decode call anywhere on the line counts: none
+        // of these calls is given it.
+        let closed = "exec(".repeat(300) + &")".repeat(300);
+        assert!(!matches(&(closed.repeat(2) + " atob(x)")));
+        assert!(matches(&(closed.repeat(6) + " atob(x)")));
+        let named = "exec(".repeat(100) + &"x".repeat(MAX_ARGUMENT);
+        assert!(!runs_name(&(named.repeat(2) + ", code"), "code"));
+        assert!(runs_name(&(named.repeat(4) + ", code"), "code"));
     }
 }

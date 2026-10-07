@@ -45,22 +45,86 @@ pub(super) fn is_persistence(line: &str) -> bool {
 /// file, just like a unit under `/usr/lib/systemd/system`.
 fn names_persistence_path(line: &str) -> bool {
     PERSISTENCE_PATHS.iter().any(|pattern| {
-        pattern_starts(line, pattern).any(|start| {
-            let before = &line[..start];
-            // The last word; `rsplit` cuts after the whole whitespace
-            // character, which may be longer than one byte.
-            let word = before
+        // The matches come in order, so those in one word share its
+        // reading.
+        let mut word: Option<Word> = None;
+        // Most lines hold none, and `contains` is the cheaper search.
+        line.contains(pattern)
+            && pattern_starts(line, pattern).any(|start| {
+                if word.as_ref().is_none_or(|known| start >= known.end) {
+                    word = Some(Word::around(line, start));
+                }
+                word.as_ref().is_some_and(|word| {
+                    !word.is_packaged_before(line, start) || word.climbs_from(start)
+                })
+            })
+    })
+}
+
+/// The word of a line that a persistence path was found in, read once for
+/// every match in it.
+struct Word {
+    /// Where it begins, past what may stand before a path: a redirection,
+    /// a quote, a parenthesis.
+    path: usize,
+    /// Where it ends: at whitespace, or with the line.
+    end: usize,
+    /// The first index a `..` has been written by, as the shell reads it:
+    /// `."."` and `.\.` are `..` (see `is_packaged_path`).
+    climbed: Option<usize>,
+    /// Where the last `..` written out begins.
+    last_climb: Option<usize>,
+}
+
+impl Word {
+    /// The word around `at`, which is not whitespace.
+    fn around(line: &str, at: usize) -> Self {
+        // `rsplit` cuts after the whole whitespace character, which may be
+        // longer than one byte.
+        let before = &line[..at];
+        let start = at
+            - before
                 .rsplit(char::is_whitespace)
                 .next()
                 .unwrap_or(before)
-                .trim_start_matches(['>', '<', '"', '\'', '(']);
-            let rest = line[start..]
-                .split(char::is_whitespace)
-                .next()
-                .unwrap_or_default();
-            !is_packaged_path(word) || rest.contains("..")
-        })
-    })
+                .len();
+        let end = line[at..]
+            .find(char::is_whitespace)
+            .map_or(line.len(), |length| at + length);
+        let word = &line[start..end];
+        let opening = word.len() - word.trim_start_matches(['>', '<', '"', '\'', '(']).len();
+        // No match begins with one of those, so it is never among them.
+        let path = (start + opening).min(at);
+        let mut climbed = None;
+        let mut dot = false;
+        for (index, character) in line[path..end].char_indices() {
+            if matches!(character, '"' | '\'' | '\\') {
+                continue;
+            }
+            if dot && character == '.' {
+                climbed = Some(path + index + 1);
+                break;
+            }
+            dot = character == '.';
+        }
+        Self {
+            path,
+            end,
+            climbed,
+            last_climb: line[at..end].rfind("..").map(|index| at + index),
+        }
+    }
+
+    /// Whether what the word holds before `at` is a path inside the
+    /// package (see `is_packaged_path`).
+    fn is_packaged_before(&self, line: &str, at: usize) -> bool {
+        is_pkgdir_prefix(&line[self.path..at]) && self.climbed.is_none_or(|end| end > at)
+    }
+
+    /// Whether the word has a `..` from `at` on.
+    fn climbs_from(&self, at: usize) -> bool {
+        self.last_climb.is_some_and(|climb| climb >= at)
+    }
 }
 
 /// Whether `word` is a path, or the start of one, inside the package a

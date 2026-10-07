@@ -158,41 +158,38 @@ pub(super) fn formats_filesystem(line: &str) -> bool {
 /// them (`rm -rf /tmp/build`, `rm -rf "$pkgdir"`) is ordinary build hygiene.
 pub(super) fn removes_root_or_home(line: &str) -> bool {
     let tokens: Vec<&str> = line.split_whitespace().collect();
-
-    tokens.iter().enumerate().any(|(index, token)| {
+    // Whether what a command at the token looked at would be given holds a
+    // recursive flag, and a root or home target: read from the end, so the
+    // arguments many commands share are read once.
+    let (mut recursive, mut target) = (false, false);
+    for token in tokens.iter().rev() {
         let command = token.trim_start_matches(['(', '`', '{']);
-        if command != "rm" && !command.ends_with("/rm") {
-            return false;
+        if (command == "rm" || command.ends_with("/rm")) && recursive && target {
+            return true;
         }
-
-        let mut arguments = Vec::new();
-        for argument in &tokens[index + 1..] {
-            if matches!(*argument, ";" | "&&" | "||" | "|" | "&") {
-                break;
-            }
-            arguments.push(*argument);
-            if argument.ends_with([';', '&', '|']) {
-                break;
-            }
+        // A command's arguments end before a separator, or with a word
+        // that ends in one.
+        if matches!(*token, ";" | "&&" | "||" | "|" | "&") {
+            (recursive, target) = (false, false);
+            continue;
         }
-        let recursive = arguments.iter().any(|argument| {
-            *argument == "--recursive"
-                || argument
-                    .strip_prefix('-')
-                    .is_some_and(|flags| !flags.starts_with('-') && flags.contains('r'))
-        });
-
-        recursive
-            && arguments
-                .iter()
-                .filter(|argument| !argument.starts_with('-'))
-                .any(|argument| {
-                    let target = argument
+        if token.ends_with([';', '&', '|']) {
+            (recursive, target) = (false, false);
+        }
+        recursive = recursive
+            || *token == "--recursive"
+            || token
+                .strip_prefix('-')
+                .is_some_and(|flags| !flags.starts_with('-') && flags.contains('r'));
+        target = target
+            || (!token.starts_with('-')
+                && is_root_or_home(
+                    token
                         .trim_end_matches([';', ')', '`'])
-                        .trim_matches(['"', '\'']);
-                    is_root_or_home(target)
-                })
-    })
+                        .trim_matches(['"', '\'']),
+                ));
+    }
+    false
 }
 
 fn is_root_or_home(target: &str) -> bool {

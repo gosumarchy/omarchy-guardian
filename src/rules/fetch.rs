@@ -51,10 +51,13 @@ fn fetches(part: &str) -> bool {
 /// Whether any command in `text` fetches, including inside a `$(…)` or
 /// `<(…)` substitution (`read -r x < <(curl …)`).
 pub(super) fn text_fetches(text: &str) -> bool {
-    text.split(['|', ';', '&', '\n']).any(fetches)
-        || shell::substitutions(text)
-            .iter()
-            .any(|found| found.body.split(['|', ';', '&']).any(fetches))
+    if text.split(['|', ';', '&', '\n']).any(fetches) {
+        return true;
+    }
+    let mut reading = shell::Reading::of(text);
+    shell::substitutions(text)
+        .iter()
+        .any(|found| !reading.takes(found.body) || found.body.split(['|', ';', '&']).any(fetches))
 }
 
 /// The download-and-run shapes the plain pipe rule does not know: another
@@ -90,7 +93,6 @@ pub(super) fn matches(line: &str) -> bool {
     piped
         || shell::runs_substitution(line, &text_fetches)
         || super::encoded::run_arguments(line)
-            .iter()
             .any(|argument| PYTHON_FETCHES.iter().any(|call| argument.contains(call)))
 }
 
