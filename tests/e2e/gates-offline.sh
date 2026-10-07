@@ -507,6 +507,42 @@ user_gates() {
     expect 'config check reports the broken file' 2 "$?"
     expect_output 'and names it invalid' 'INVALID'
     write_user_config
+
+    # The same for a system file that is there and cannot be used: no review
+    # goes on at the built-in level. The file is put at its path in a mount
+    # view of this suite's own (the real /etc is not written): as a user it
+    # is not root's there, and as root it does not parse.
+    local -a etc=(bwrap --dev-bind / / --tmpfs /etc --dir /etc/omarchy-guardian
+        --ro-bind "$E2E/system.toml" /etc/omarchy-guardian/config.toml)
+    printf 'profile = "strict\n' >"$E2E/system.toml"
+    if ! command -v bwrap >/dev/null || ! "${etc[@]}" /usr/bin/true 2>/dev/null; then
+        skip 'a broken system settings file: needs bwrap'
+        return
+    fi
+    local refused='the system settings file /etc/omarchy-guardian/config.toml is invalid or insecure'
+    with_system() { setsid -w "${etc[@]}" "$BINARY" "$@" </dev/null >"$OUT" 2>&1; }
+    with_system guard --class theme "$clean" -- /usr/bin/touch "$ran"
+    expect 'guard stops on a broken system settings file' 2 "$?"
+    expect_output 'and says nothing was reviewed or run' "nothing was reviewed or run: $refused"
+    expect_output 'and how to go on' 'Fix it as root; `omarchy-guardian config check` shows the problem.'
+    check 'the command was not started' absent "$ran"
+    with_system scan "$clean"
+    expect 'scan stops on a broken system settings file' 2 "$?"
+    expect_output 'and says nothing was reviewed or run' "$refused"
+    with_system sandbox "$clean" -- /usr/bin/true
+    expect 'sandbox stops on a broken system settings file' 2 "$?"
+    expect_output 'and says nothing was reviewed or run' "$refused"
+    (cd "$build" && with_system makepkg-gate -- "$E2E/makepkg" --noconfirm)
+    expect 'the makepkg gate stops on a broken system settings file' 2 "$?"
+    expect_output 'and says nothing was reviewed or run' "$refused"
+    check 'makepkg was never started' absent "$E2E/built"
+    with_system config check
+    expect 'config check reports the broken system file' 2 "$?"
+    expect_output 'and names it invalid' 'INVALID'
+    expect_output 'and says what it stops' 'User-level reviews: BLOCKED'
+    with_system config show
+    expect 'config show still runs' 0 "$?"
+    expect_output 'and shows no class as in force' '[aur]  user-level · profile standard · NOT IN FORCE'
 }
 
 ###############################################################################
@@ -524,6 +560,10 @@ makepkg_jail() {
     mkdir -p "$E2E/usr-layer/bin" "$build"
     sandbox=(bwrap --dev-bind / / --overlay-src /usr --overlay-src "$E2E/usr-layer" --tmp-overlay /usr
         --ro-bind "$E2E/jail-makepkg" /usr/bin/makepkg)
+    # bwrap's user namespace shows root's files as nobody's, so a system
+    # settings file of this machine would read as insecure and stop the gate:
+    # the cases run without one, as on a machine that has none.
+    [[ -d /etc/omarchy-guardian ]] && sandbox+=(--tmpfs /etc/omarchy-guardian)
     printf '#!/bin/sh\ncase " $* " in\n*" --printsrcinfo "* | *" --nobuild "*) exec /usr/bin/makepkg.real "$@" ;;\nesac\nprintf "%%s\\n" "$*" >%q\n' \
         "$built" >"$E2E/jail-makepkg"
     chmod 755 "$E2E/jail-makepkg"

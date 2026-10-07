@@ -66,7 +66,7 @@ that is not pacman, a missing or mismatched archive, files in `/usr/sbin`, the
 reviewer's settings shipped by a local package, a reviewer from `PATH` for
 root's pacman); Guardian's own package, put together by its PKGBUILD's
 `package()`, through its own gate; `guard`, `scan`, `sandbox` and the makepkg
-gate stopping on a broken user settings file, on a question nobody can answer,
+gate stopping on a broken user or system settings file, on a question nobody can answer,
 and never exiting 0 without starting the command; the makepkg gate's own jail
 with the AI off (listing, fetching, `--holdver`, the later call held against
 what was extracted, the two questions); the commands on PATH and the Bash

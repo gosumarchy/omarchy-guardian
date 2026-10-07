@@ -100,7 +100,8 @@ plugins, and reviews what would run on install **before any of it runs**:
   blocks community sources; for official Arch/Omarchy updates the `standard`
   profile warns instead, `strict` blocks. A question nobody can be asked (no
   terminal) is answered no. A settings file that does not parse stops the
-  gates that read it instead of being skipped. See
+  gates that read it instead of being skipped; a broken system file stops
+  them all. See
   [Settings](docs/settings.md).
 - **Blocks you can read.** A block prints the full report in the terminal and
   raises a desktop notification that opens it as a page, with a button to ask

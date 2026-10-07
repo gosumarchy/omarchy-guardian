@@ -12,6 +12,7 @@ use crate::config::model::{
 };
 use crate::config::resolve::{Layers, Resolved, resolve};
 use crate::paths::{self, Accept};
+use crate::user;
 
 pub(crate) const SYSTEM_PATH: &str = "/etc/omarchy-guardian/config.toml";
 
@@ -42,6 +43,8 @@ pub(crate) struct Settings {
     user_status: FileStatus,
     profile_override: Option<Profile>,
     privileged_block: Option<String>,
+    system_block: Option<String>,
+    system_unverified: bool,
     user_block: Option<String>,
     warnings: Vec<String>,
 }
@@ -52,12 +55,80 @@ pub(crate) fn user_config_path() -> Option<PathBuf> {
     Some(base.join("omarchy-guardian").join("config.toml"))
 }
 
+/// Why no user-level review runs, for what says so in its own words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UserBlock {
+    /// The system file is there and is invalid or insecure.
+    SystemFile,
+    /// The system file looks like nobody's because this runs in a user
+    /// namespace that does not map root: whose it is cannot be told.
+    Unverified,
+    /// The user file is there and does not parse.
+    UserFile,
+}
+
+/// Why a system file is not root's alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Insecure {
+    reason: String,
+    /// The owner that was refused, where the owner is the reason.
+    owner: Option<u32>,
+}
+
+impl Insecure {
+    pub(crate) fn other(reason: String) -> Self {
+        Self {
+            reason,
+            owner: None,
+        }
+    }
+
+    /// `entry` (the file or its directory) belongs to `uid`.
+    pub(crate) fn owned_by(entry: &Path, uid: u32) -> Self {
+        Self {
+            reason: format!("{} is owned by uid {uid}, not root", entry.display()),
+            owner: Some(uid),
+        }
+    }
+
+    /// `entry` (the file or its directory) can be written by more than root.
+    pub(crate) fn writable(entry: &Path) -> Self {
+        Self::other(format!(
+            "{} is writable by group or others",
+            entry.display()
+        ))
+    }
+
+    /// The reason as it is said of the file at `path`, naming it once.
+    pub(crate) fn said_of(&self, path: &Path) -> String {
+        named(path, &self.reason_text())
+    }
+
+    fn reason_text(&self) -> String {
+        format!("insecure: {}", self.reason)
+    }
+
+    /// Whether the refused owner is root as a user namespace that does not
+    /// map root shows it: nothing in the file is then root's to fix.
+    pub(crate) fn unverified(&self) -> bool {
+        unverified_here(self.owner)
+    }
+}
+
+/// `unverified` for the namespace this process runs in.
+fn unverified_here(owner: Option<u32>) -> bool {
+    unverified(user::root_unmapped(), owner, &|owner| {
+        owner != 0 && !user::is_foreign_owner(owner, None)
+    })
+}
+
 /// The system file and its directory must be root-owned regular entries
 /// that only root can write.
-pub(crate) fn check_root_owned(path: &Path) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+pub(crate) fn check_root_owned(path: &Path) -> Result<(), Insecure> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| Insecure::other(error.to_string()))?;
     if !metadata.file_type().is_file() {
-        return Err("not a regular file".into());
+        return Err(Insecure::other("not a regular file".into()));
     }
     let checks = [(path, metadata)].into_iter().chain(
         path.parent()
@@ -65,17 +136,10 @@ pub(crate) fn check_root_owned(path: &Path) -> Result<(), String> {
     );
     for (entry, metadata) in checks {
         if metadata.uid() != 0 {
-            return Err(format!(
-                "{} is owned by uid {}, not root",
-                entry.display(),
-                metadata.uid()
-            ));
+            return Err(Insecure::owned_by(entry, metadata.uid()));
         }
         if metadata.mode() & 0o022 != 0 {
-            return Err(format!(
-                "{} is writable by group or others",
-                entry.display()
-            ));
+            return Err(Insecure::writable(entry));
         }
     }
     Ok(())
@@ -84,29 +148,64 @@ pub(crate) fn check_root_owned(path: &Path) -> Result<(), String> {
 enum Read {
     Missing,
     Parsed(PartialConfig),
-    Failed(String),
+    /// The reason, and the owner that was refused if that is the reason.
+    Failed(String, Option<u32>),
 }
 
 /// A pluggable check for whether a config file is safely owned.
-type Verify<'a> = dyn Fn(&Path) -> Result<(), String> + 'a;
+type Verify<'a> = dyn Fn(&Path) -> Result<(), Insecure> + 'a;
 
 fn read(path: &Path, secure: Option<&Verify<'_>>) -> Read {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Read::Missing,
-        Err(error) => return Read::Failed(error.to_string()),
+        Err(error) => return Read::Failed(error.to_string(), None),
         Ok(_) => {}
     }
     if let Some(secure) = secure
-        && let Err(reason) = secure(path)
+        && let Err(insecure) = secure(path)
     {
-        return Read::Failed(format!("insecure: {reason}"));
+        return Read::Failed(insecure.reason_text(), insecure.owner);
     }
     match fs::read_to_string(path) {
         Ok(text) => match parse(path, &text) {
             Ok(config) => Read::Parsed(config),
-            Err(error) => Read::Failed(error.to_string()),
+            Err(error) => Read::Failed(error.to_string(), None),
         },
-        Err(error) => Read::Failed(error.to_string()),
+        Err(error) => Read::Failed(error.to_string(), None),
+    }
+}
+
+/// `reason`, naming the file it is about once: in front, unless the reason
+/// names it itself (a parse error with its line, the file's owner or mode).
+fn named(path: &Path, reason: &str) -> String {
+    let file = path.display().to_string();
+    if reason.contains(&file) {
+        reason.to_string()
+    } else {
+        format!("{file}: {reason}")
+    }
+}
+
+/// Whether a refused owner is root seen from a user namespace that does
+/// not map root (`unmapped`), where root's files show the overflow owner
+/// (`nobody`). Such a file is still refused: the same owner is shown for
+/// every user the namespace does not map.
+fn unverified(unmapped: bool, owner: Option<u32>, nobody: &dyn Fn(u32) -> bool) -> bool {
+    unmapped && owner.is_some_and(nobody)
+}
+
+/// What every command says of a system file that cannot be used, and what
+/// stops the reviews for the user.
+fn system_block_text(path: &Path, reason: &str, unverified: bool) -> String {
+    let named = named(path, reason);
+    if unverified {
+        format!(
+            "{named}; this is running in a user namespace that does not map root, where root's files look like nobody's: run it outside the sandbox for AUR builds, themes, plugins, scans and the sweep to be reviewed"
+        )
+    } else {
+        format!(
+            "{named}; fix it as root (`omarchy-guardian config check` shows the problem) before AUR builds, themes, plugins, scans and the sweep can be reviewed"
+        )
     }
 }
 
@@ -125,10 +224,21 @@ impl Settings {
         Self::load_from(Path::new(SYSTEM_PATH), None, &check_root_owned)
     }
 
-    pub(super) fn load_from(
+    pub(crate) fn load_from(
         system_path: &Path,
         user_path: Option<&Path>,
-        secure: &dyn Fn(&Path) -> Result<(), String>,
+        secure: &Verify<'_>,
+    ) -> Self {
+        Self::load_in(system_path, user_path, secure, &unverified_here)
+    }
+
+    /// `load_from`, told by `unverified` whether a refused owner of the
+    /// system file is root as a user namespace without root shows it.
+    pub(crate) fn load_in(
+        system_path: &Path,
+        user_path: Option<&Path>,
+        secure: &Verify<'_>,
+        unverified: &dyn Fn(Option<u32>) -> bool,
     ) -> Self {
         let mut settings = Self::from_parts(PartialConfig::default(), PartialConfig::default());
         settings.system_path = system_path.to_path_buf();
@@ -140,14 +250,18 @@ impl Settings {
                 settings.system = config;
                 settings.system_status = FileStatus::Loaded;
             }
-            Read::Failed(reason) => {
+            // Not carried on with the built-in defaults, for the pacman gate
+            // or for anything else: the file may hold a stricter level or a
+            // tightened class, and one typo would quietly undo it.
+            Read::Failed(reason, owner) => {
                 settings.privileged_block = Some(format!(
                     "{}: {reason}; fix it (see `omarchy-guardian config check`) before pacman transactions can be reviewed",
                     system_path.display()
                 ));
-                settings
-                    .warnings
-                    .push(format!("ignoring {}: {reason}", system_path.display()));
+                settings.system_unverified = unverified(owner);
+                let block = system_block_text(system_path, &reason, settings.system_unverified);
+                settings.warnings.push(block.clone());
+                settings.system_block = Some(block);
                 settings.system_status = FileStatus::Invalid(reason);
             }
         }
@@ -179,14 +293,8 @@ impl Settings {
                 }
                 // Not carried on with the defaults: the file may hold a
                 // stricter profile, and one typo would quietly undo it.
-                Read::Failed(reason) => {
-                    // A parse error names the file and line itself.
-                    let file = user_path.display().to_string();
-                    let named = if reason.starts_with(&file) {
-                        reason.clone()
-                    } else {
-                        format!("{file}: {reason}")
-                    };
+                Read::Failed(reason, _) => {
+                    let named = named(user_path, &reason);
                     let block = format!(
                         "{named}; fix it (see `omarchy-guardian config check`) before AUR builds, themes, plugins, scans and the sweep can be reviewed"
                     );
@@ -209,6 +317,8 @@ impl Settings {
             user_status: FileStatus::Missing,
             profile_override: None,
             privileged_block: None,
+            system_block: None,
+            system_unverified: false,
             user_block: None,
             warnings: Vec::new(),
         }
@@ -348,10 +458,25 @@ impl Settings {
         self.privileged_block.as_deref()
     }
 
-    /// Why no user-level review can run: the user file is there and does
-    /// not parse.
+    /// Why no user-level review can run: the system file is there and is
+    /// invalid or insecure, or the user file is there and does not parse.
+    /// The system file's reason comes first: it is the one root has to fix.
     pub(crate) fn user_block(&self) -> Option<&str> {
-        self.user_block.as_deref()
+        self.system_block.as_deref().or(self.user_block.as_deref())
+    }
+
+    /// Which file stops the reviews for the user, and whether it is the
+    /// namespace this runs in that makes the system file unusable.
+    pub(crate) fn user_block_cause(&self) -> Option<UserBlock> {
+        if self.system_block.is_some() {
+            Some(if self.system_unverified {
+                UserBlock::Unverified
+            } else {
+                UserBlock::SystemFile
+            })
+        } else {
+            self.user_block.as_ref().map(|_| UserBlock::UserFile)
+        }
     }
 
     /// The weaker settings accepted in the root-owned system file.
@@ -410,7 +535,9 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use super::{FileStatus, Settings};
+    use super::{
+        FileStatus, Insecure, Settings, UserBlock, check_root_owned, system_block_text, unverified,
+    };
     use crate::config::file::{AgentDefaults, PartialConfig, PartialPolicy};
     use crate::config::model::{
         AiRequirement, Profile, RootConsent, SourceClass, StoreSettings, Thinking,
@@ -421,13 +548,16 @@ mod tests {
         clippy::unnecessary_wraps,
         reason = "must match the `Verify` callback signature `Settings::load_from` expects"
     )]
-    fn secure(_: &Path) -> Result<(), String> {
+    fn secure(_: &Path) -> Result<(), Insecure> {
         Ok(())
     }
 
-    fn insecure(_: &Path) -> Result<(), String> {
-        Err("owned by uid 1000".into())
+    /// What the real check says of a file that is a user's.
+    fn insecure(path: &Path) -> Result<(), Insecure> {
+        Err(Insecure::owned_by(path, 1000))
     }
+
+    const FIX: &str = "; fix it as root (`omarchy-guardian config check` shows the problem) before AUR builds, themes, plugins, scans and the sweep can be reviewed";
 
     #[test]
     fn missing_files_mean_the_standard_profile() {
@@ -456,28 +586,217 @@ mod tests {
         let system = dir.path().join("system.toml");
         fs::write(&system, "profile = \"local-only\"\n").unwrap();
 
+        let file = system.display().to_string();
         let settings = Settings::load_from(&system, None, &insecure);
-        assert!(
-            settings
-                .privileged_block()
-                .unwrap()
-                .contains("owned by uid 1000")
+        // The pacman gate's own words, as they were.
+        assert_eq!(
+            settings.privileged_block(),
+            Some(
+                format!(
+                    "{file}: insecure: {file} is owned by uid 1000, not root; fix it (see `omarchy-guardian config check`) before pacman transactions can be reviewed"
+                )
+                .as_str()
+            )
         );
         assert!(matches!(settings.system_status(), FileStatus::Invalid(_)));
-        // User-level classes fall back to the built-in standard profile.
-        assert_eq!(
-            settings.policy(SourceClass::Theme).ai,
-            AiRequirement::Required
-        );
+        // User-level classes are not reviewed at the built-in standard
+        // profile instead: they are blocked too.
+        let block = settings.user_block().unwrap();
+        assert_eq!(settings.system_block.as_deref(), Some(block));
+        assert_eq!(settings.user_block_cause(), Some(UserBlock::SystemFile));
+        assert_eq!(settings.warnings(), [block.to_string()]);
 
         fs::write(&system, "profile = \"bogus\"\n").unwrap();
         let settings = Settings::load_from(&system, None, &secure);
+        let privileged = settings.privileged_block().unwrap();
+        assert!(privileged.contains("config check"), "{privileged}");
+        assert!(
+            privileged.ends_with("before pacman transactions can be reviewed"),
+            "{privileged}"
+        );
+    }
+
+    #[test]
+    fn the_block_names_the_system_file_once_whatever_the_reason() {
+        let dir = TempDir::new("settings-named");
+        let system = dir.path().join("system.toml");
+        let file = system.display().to_string();
+        let folder = dir.path().display().to_string();
+        fs::write(&system, "profile = \"strict\"\n").unwrap();
+        let said = |secure: &dyn Fn(&Path) -> Result<(), Insecure>| {
+            let settings = Settings::load_from(&system, None, secure);
+            settings.user_block().unwrap().to_string()
+        };
+
+        // The file's owner and mode, as the real check words them.
+        assert_eq!(
+            said(&|path| Err(Insecure::owned_by(path, 1000))),
+            format!("insecure: {file} is owned by uid 1000, not root{FIX}")
+        );
+        assert_eq!(
+            said(&|path| Err(Insecure::writable(path))),
+            format!("insecure: {file} is writable by group or others{FIX}")
+        );
+        // Its directory's: the file, then what is wrong with the directory.
+        assert_eq!(
+            said(&|path| Err(Insecure::owned_by(path.parent().unwrap(), 1000))),
+            format!("{file}: insecure: {folder} is owned by uid 1000, not root{FIX}")
+        );
+        assert_eq!(
+            said(&|path| Err(Insecure::writable(path.parent().unwrap()))),
+            format!("{file}: insecure: {folder} is writable by group or others{FIX}")
+        );
+        assert_eq!(
+            said(&|_| Err(Insecure::other("not a regular file".into()))),
+            format!("{file}: insecure: not a regular file{FIX}")
+        );
+
+        // A parse error names the file with its line.
+        fs::write(&system, "profile = \"bogus\"\n").unwrap();
+        let block = said(&secure);
+        assert!(
+            block.starts_with(&format!("{file}:1: profile: ")),
+            "{block}"
+        );
+        assert!(block.ends_with(FIX), "{block}");
+        assert_eq!(block.matches(file.as_str()).count(), 1, "{block}");
+
+        // It cannot be read: a directory in its place.
+        fs::remove_file(&system).unwrap();
+        fs::create_dir(&system).unwrap();
+        let block = said(&secure);
+        assert!(block.starts_with(&format!("{file}: ")), "{block}");
+        assert!(block.ends_with(FIX), "{block}");
+        assert_eq!(block.matches(file.as_str()).count(), 1, "{block}");
+    }
+
+    #[test]
+    fn a_namespace_without_root_is_named_instead_of_a_fix_as_root() {
+        let nobody = |owner: u32| owner == 65_534;
+        assert!(unverified(true, Some(65_534), &nobody));
+        // A user's file, another reason, or a namespace with root in it.
+        assert!(!unverified(true, Some(1000), &nobody));
+        assert!(!unverified(true, None, &nobody));
+        assert!(!unverified(false, Some(65_534), &nobody));
+
+        let path = Path::new("/etc/omarchy-guardian/config.toml");
+        let reason = "insecure: /etc/omarchy-guardian/config.toml is owned by uid 65534, not root";
+        assert_eq!(
+            system_block_text(path, reason, true),
+            "insecure: /etc/omarchy-guardian/config.toml is owned by uid 65534, not root; this is running in a user namespace that does not map root, where root's files look like nobody's: run it outside the sandbox for AUR builds, themes, plugins, scans and the sweep to be reviewed"
+        );
+        assert_eq!(
+            system_block_text(path, reason, false),
+            format!("{reason}{FIX}")
+        );
+
+        // Still refused, for both gates, and said to be the namespace's.
+        let dir = TempDir::new("settings-namespace");
+        let system = dir.path().join("system.toml");
+        fs::write(&system, "profile = \"strict\"\n").unwrap();
+        let overflow = |path: &Path| Err(Insecure::owned_by(path, 65_534));
+        let settings = Settings::load_in(&system, None, &overflow, &|owner| {
+            unverified(true, owner, &nobody)
+        });
+        assert_eq!(settings.user_block_cause(), Some(UserBlock::Unverified));
+        assert!(matches!(settings.system_status(), FileStatus::Invalid(_)));
         assert!(
             settings
                 .privileged_block()
                 .unwrap()
-                .contains("config check")
+                .ends_with("before pacman transactions can be reviewed")
         );
+        let block = settings.user_block().unwrap();
+        assert!(block.contains("run it outside the sandbox"), "{block}");
+        assert!(!block.contains("as root"), "{block}");
+        // The same owner where root is mapped is somebody else's file.
+        let mapped = Settings::load_in(&system, None, &overflow, &|owner| {
+            unverified(false, owner, &nobody)
+        });
+        assert_eq!(mapped.user_block_cause(), Some(UserBlock::SystemFile));
+        assert!(mapped.user_block().unwrap().ends_with(FIX));
+    }
+
+    #[test]
+    fn a_broken_system_file_blocks_user_level_reviews_whatever_the_user_file_says() {
+        let dir = TempDir::new("settings-system-block");
+        let system = dir.path().join("system.toml");
+        let user = dir.path().join("user.toml");
+        // A stricter level, a tightened class and one typo.
+        fs::write(
+            &system,
+            "profile = \"strict\"\n[class.aur]\nai = \"sometimes\"\n",
+        )
+        .unwrap();
+        fs::write(&user, "profile = \"standard\"\n").unwrap();
+
+        let settings = Settings::load_from(&system, Some(&user), &secure);
+        let block = settings.user_block().unwrap();
+        assert!(
+            block.contains(&format!("{}:3:", system.display())),
+            "{block}"
+        );
+        assert_eq!(settings.system_block.as_deref(), Some(block));
+        assert_eq!(settings.user_status(), &FileStatus::Loaded);
+        assert_eq!(settings.user_block_cause(), Some(UserBlock::SystemFile));
+
+        // Both broken: both are said, the system file's first.
+        fs::write(&user, "profile = \"strict\n").unwrap();
+        let both = Settings::load_from(&system, Some(&user), &secure);
+        assert_eq!(both.warnings().len(), 2);
+        assert!(both.user_block().unwrap().contains("as root"));
+        assert!(both.warnings()[1].contains(&user.display().to_string()));
+
+        // Not there: the built-in defaults, and nothing blocked by it.
+        let missing = Settings::load_from(&dir.path().join("none.toml"), Some(&user), &secure);
+        assert_eq!(missing.system_status(), &FileStatus::Missing);
+        assert_eq!(missing.system_block.as_deref(), None);
+        assert_eq!(missing.privileged_block(), None);
+        assert!(missing.user_block().unwrap().contains("user.toml"));
+        assert_eq!(missing.user_block_cause(), Some(UserBlock::UserFile));
+
+        // Valid: in force, and nothing blocked.
+        fs::write(&system, "profile = \"strict\"\n").unwrap();
+        fs::write(&user, "").unwrap();
+        let valid = Settings::load_from(&system, Some(&user), &secure);
+        assert_eq!(valid.user_block(), None);
+        assert_eq!(valid.system_block.as_deref(), None);
+        assert_eq!(valid.user_block_cause(), None);
+        assert_eq!(valid.privileged_block(), None);
+        assert!(valid.warnings().is_empty());
+        assert_eq!(valid.profile_for(SourceClass::Aur), Profile::Strict);
+    }
+
+    #[test]
+    fn a_system_file_that_is_not_roots_alone_blocks_user_level_reviews() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The real ownership check. As a user the file is not root's; as
+        // root it is, and writable by everyone: refused either way.
+        let dir = TempDir::new("settings-system-owner");
+        let system = dir.path().join("system.toml");
+        fs::write(&system, "profile = \"strict\"\n").unwrap();
+        fs::set_permissions(&system, fs::Permissions::from_mode(0o666)).unwrap();
+
+        let settings = Settings::load_from(&system, None, &check_root_owned);
+        let FileStatus::Invalid(reason) = settings.system_status() else {
+            panic!("an insecure system file was loaded");
+        };
+        assert!(reason.starts_with("insecure: "), "{reason}");
+        assert!(
+            reason.contains("not root") || reason.contains("writable by group or others"),
+            "{reason}"
+        );
+        let block = settings.user_block().unwrap();
+        assert!(block.contains(reason.as_str()), "{block}");
+        assert!(
+            settings
+                .privileged_block()
+                .unwrap()
+                .contains(reason.as_str())
+        );
+        // Its level is not in force, and nothing says it is.
+        assert_eq!(settings.system_profile(), Profile::Standard);
     }
 
     #[test]

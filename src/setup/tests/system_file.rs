@@ -13,9 +13,10 @@ use super::super::{
     Choice, HEADER, MAX_SYSTEM_FILE, PRIVILEGED_COMMUNITY, Place, USER_CLASSES, render_system,
     render_user, run, set_sweep_root_at, tested_variant, with_accepted_at, write_system_at,
 };
+use super::super::{insecure_refusal, load_system};
 use super::{Fake, script};
 use crate::config::file::{PartialConfig, parse};
-use crate::config::load::check_root_owned;
+use crate::config::load::{Insecure, check_root_owned};
 use crate::config::model::{Action, Named, Profile, RootConsent, SourceClass, Thinking};
 use crate::test_support::TempDir;
 
@@ -534,7 +535,7 @@ fn a_system_file_the_gate_refuses_as_insecure_is_not_taken_over() {
     let (directory, path) = system_file("profile = \"local-only\"\n");
     let place = Place {
         path: &path,
-        secure: &|file| Err(format!("{} is owned by uid 1000, not root", file.display())),
+        secure: &|file| Err(Insecure::owned_by(file, 1000)),
     };
     let shown = path.display().to_string();
     let folder = directory.path().display().to_string();
@@ -556,7 +557,7 @@ fn a_system_file_the_gate_refuses_as_insecure_is_not_taken_over() {
         opencode: true,
         test_passes: true,
         system_path: Some(path.clone()),
-        system_insecure: Some("it is owned by uid 1000, not root"),
+        system_insecure: Some(1000),
         ..Fake::default()
     };
     let mut terminal = script(&["", "2", "", "", "y"]);
@@ -571,6 +572,53 @@ fn a_system_file_the_gate_refuses_as_insecure_is_not_taken_over() {
         "{}",
         terminal.output
     );
+}
+
+#[test]
+fn an_insecure_system_file_is_named_once_with_its_repair() {
+    let (directory, path) = system_file(ADMIN);
+    let shown = path.display().to_string();
+    let folder = directory.path().display().to_string();
+    let repair = format!(
+        "; it was not changed. Check what it holds, then make it root's: `sudo chown root:root \
+{folder} {shown} && sudo chmod 755 {folder} && sudo chmod 644 {shown}` (`omarchy-guardian config \
+check` shows the problem)."
+    );
+    let refused = |secure: &dyn Fn(&Path) -> Result<(), Insecure>| {
+        load_system(&Place {
+            path: &path,
+            secure,
+        })
+        .err()
+        .unwrap()
+    };
+
+    // The file's owner: the reason names the file itself.
+    assert_eq!(
+        refused(&|file| Err(Insecure::owned_by(file, 1000))),
+        format!("insecure: {shown} is owned by uid 1000, not root{repair}")
+    );
+    // Its directory's mode: the file, then what is wrong with the directory.
+    assert_eq!(
+        refused(&|file| Err(Insecure::writable(file.parent().unwrap()))),
+        format!("{shown}: insecure: {folder} is writable by group or others{repair}")
+    );
+}
+
+#[test]
+fn in_a_namespace_without_root_no_chown_is_advised() {
+    let path = Path::new("/etc/omarchy-guardian/config.toml");
+    let nobodys = Insecure::owned_by(path, 65_534);
+    assert_eq!(
+        insecure_refusal(path, &nobodys, true),
+        "insecure: /etc/omarchy-guardian/config.toml is owned by uid 65534, not root; it was not \
+changed. This is running in a user namespace that does not map root, where root's files look like \
+nobody's: run it outside the sandbox."
+    );
+    // The same owner where root is mapped is somebody's file to take back.
+    let mapped = insecure_refusal(path, &nobodys, false);
+    assert!(mapped.contains("sudo chown root:root"), "{mapped}");
+    assert!(!mapped.contains("sandbox"), "{mapped}");
 }
 
 #[test]
@@ -664,7 +712,7 @@ fn without_its_directory_there_is_no_system_file() {
     // Not asked about a file that is not there.
     let place = Place {
         path: &path,
-        secure: &|_| Err("never asked".into()),
+        secure: &|_| Err(Insecure::other("never asked".into())),
     };
     set_sweep_root_at(&place, &installed.installer(), RootConsent::Declined, None).unwrap();
 

@@ -740,7 +740,7 @@ type Install<'a> = dyn Fn(&str) -> Result<(), String> + 'a;
 /// holds is taken over into a new one: the gate's own, or a test's.
 struct Place<'a> {
     path: &'a Path,
-    secure: &'a dyn Fn(&Path) -> Result<(), String>,
+    secure: &'a dyn Fn(&Path) -> Result<(), load::Insecure>,
 }
 
 impl Place<'static> {
@@ -762,6 +762,27 @@ fn how_to_correct(path: &Path) -> String {
         "Correct it with `sudoedit {}` or \"Edit system file\" in the settings app; \
 `omarchy-guardian config check` shows the problem.",
         path.display()
+    )
+}
+
+/// The refusal of a system file the gate's check does not accept: the file,
+/// named once, the reason, and the repair. `unverified` says the owner only
+/// looks like nobody's, in a user namespace that does not map root: there
+/// is then nothing for `chown` to correct, and nowhere to run it.
+fn insecure_refusal(path: &Path, insecure: &load::Insecure, unverified: bool) -> String {
+    let shown = path.display();
+    let named = insecure.said_of(path);
+    if unverified {
+        return format!(
+            "{named}; it was not changed. This is running in a user namespace that does not \
+map root, where root's files look like nobody's: run it outside the sandbox."
+        );
+    }
+    let directory = path.parent().unwrap_or(path).display();
+    format!(
+        "{named}; it was not changed. Check what it holds, then make it \
+root's: `sudo chown root:root {directory} {shown} && sudo chmod 755 {directory} && sudo chmod 644 \
+{shown}` (`omarchy-guardian config check` shows the problem)."
     )
 }
 
@@ -802,13 +823,8 @@ fn load_system(place: &Place<'_>) -> Result<Option<SystemFile>, String> {
 there or remove it with sudo; `omarchy-guardian config check` shows the problem."
         ));
     }
-    if let Err(reason) = (place.secure)(path) {
-        let directory = path.parent().unwrap_or(path).display();
-        return Err(format!(
-            "{shown}: insecure: {reason}; it was not changed. Check what it holds, then make it \
-root's: `sudo chown root:root {directory} {shown} && sudo chmod 755 {directory} && sudo chmod 644 \
-{shown}` (`omarchy-guardian config check` shows the problem)."
-        ));
+    if let Err(insecure) = (place.secure)(path) {
+        return Err(insecure_refusal(path, &insecure, insecure.unverified()));
     }
 
     // Opened without following a link or waiting on a pipe put there since.
@@ -1068,8 +1084,8 @@ mod tests {
         /// Where the system file is (a file, a directory in its place, or
         /// nothing); `None` for no system file at all.
         system_path: Option<PathBuf>,
-        /// Why the gate's check refuses that file, when it does.
-        system_insecure: Option<&'static str>,
+        /// Whose the gate's check finds that file to be, when it refuses it.
+        system_insecure: Option<u32>,
         user_written: RefCell<Option<String>>,
         system_written: RefCell<Option<String>>,
         tested: RefCell<Vec<AgentSettings>>,
@@ -1078,9 +1094,10 @@ mod tests {
     impl Fake {
         /// The check on the system file's owner and mode: a test's files
         /// are its user's, so the answer is the test's to give.
-        fn secure(&self) -> Result<(), String> {
-            self.system_insecure
-                .map_or(Ok(()), |reason| Err(reason.to_string()))
+        fn secure(&self, path: &Path) -> Result<(), crate::config::load::Insecure> {
+            self.system_insecure.map_or(Ok(()), |uid| {
+                Err(crate::config::load::Insecure::owned_by(path, uid))
+            })
         }
     }
 
@@ -1130,7 +1147,7 @@ mod tests {
             let Some(path) = &self.system_path else {
                 return Ok(None);
             };
-            let secure = |_: &Path| self.secure();
+            let secure = |path: &Path| self.secure(path);
             super::load_system(&super::Place {
                 path,
                 secure: &secure,
@@ -1150,7 +1167,7 @@ mod tests {
             let Some(path) = &self.system_path else {
                 return record(text);
             };
-            let secure = |_: &Path| self.secure();
+            let secure = |path: &Path| self.secure(path);
             let place = super::Place {
                 path,
                 secure: &secure,
