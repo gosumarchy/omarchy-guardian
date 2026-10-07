@@ -192,9 +192,12 @@ impl Missing {
                     directory.display(),
                     path.display()
                 ),
+                // No command for it: the directory above may be `/`, or a
+                // home that is not this user's, and neither is to be given
+                // away.
                 format!(
-                    "Make that directory yours (`sudo chown {uid} {}`), or point XDG_STATE_HOME at a directory of yours.",
-                    path.display()
+                    "Have its owner make {} for you (a directory of yours alone, mode 700), or point XDG_STATE_HOME at a directory of yours.",
+                    directory.display()
                 ),
             ),
             Self::NotDirectory { path } => (

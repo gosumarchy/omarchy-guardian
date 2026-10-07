@@ -336,14 +336,13 @@ fn a_state_directory_of_another_user_is_to_be_made_ones_own() {
                 unmade.display()
             ),
             &format!(
-                "Make that directory yours (`sudo chown {mine} {above}`), or point XDG_STATE_HOME at a directory of yours."
+                "Have its owner make {} for you (a directory of yours alone, mode 700), or point XDG_STATE_HOME at a directory of yours.",
+                unmade.display()
             ),
         ],
-        &[
-            "chmod",
-            "forget",
-            &format!("chown {mine} {}", unmade.display()),
-        ],
+        // No command is given for a directory above: it may be `/` or
+        // another user's home.
+        &["chmod", "forget", "chown", "sudo"],
     );
     assert!(!tree.dir.path().join("none").exists());
 }
