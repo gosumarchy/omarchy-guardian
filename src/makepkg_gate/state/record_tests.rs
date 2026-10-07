@@ -90,7 +90,7 @@ fn a_record_with_odd_paths_reads_back_as_it_was() {
     // Through the file, as the next makepkg call reads it.
     let dir = TempDir::new("gate-record-odd");
     let state = State::open(Some(&dir.path().join("state")), "demo");
-    state.record_extraction(&extraction);
+    state.record_extraction(&extraction).unwrap();
     let read = usable(&state);
     assert_eq!(read, extraction);
     assert!(read.is_of(Path::new(&extraction.srcdir)));
@@ -206,7 +206,7 @@ fn the_gate_holds_a_build_under_an_odd_directory_against_its_record() {
     );
 
     with_step(&build, &[], |step| {
-        record_extraction(step, &src, &build.collected());
+        record_extraction(step, &src, &build.collected()).unwrap();
         let record = usable(step.state);
         assert!(record.is_of(&src));
         // The names are kept as they are (the hashes are kept short).
@@ -228,7 +228,7 @@ fn the_gate_holds_a_build_under_an_odd_directory_against_its_record() {
     });
     // A build that cleans first and finds the directory Guardian made.
     with_step(&build, &["-C"], |step| {
-        record_extraction(step, &src, &build.collected());
+        record_extraction(step, &src, &build.collected()).unwrap();
         let refused = hold_against_extraction(step, &src, &mut build.collected());
         if identity(&src).is_some() {
             assert!(
@@ -247,7 +247,7 @@ fn the_gate_holds_a_build_under_an_odd_directory_against_its_record() {
     });
     // A download that is not the one Guardian fetched.
     with_step(&build, &[], |step| {
-        record_extraction(step, &src, &build.collected());
+        record_extraction(step, &src, &build.collected()).unwrap();
         fs::write(build.build.join(&download), b"\x1f\x8b\x08\0another").unwrap();
         let refused = hold_against_extraction(step, &src, &mut build.collected())
             .unwrap_err()
@@ -271,7 +271,7 @@ fn a_name_that_is_not_text_is_never_taken_for_another() {
     let lossy = PathBuf::from(src.to_string_lossy().into_owned());
     assert_ne!(lossy, src);
     with_step(&build, &[], |step| {
-        record_extraction(step, &src, &build.collected());
+        record_extraction(step, &src, &build.collected()).unwrap();
         let record = usable(step.state);
         assert_eq!(Path::new(&record.srcdir), lossy);
         assert!(!record.is_of(&src));
@@ -481,9 +481,11 @@ fn an_escape_the_record_does_not_write_is_rejected() {
     // taken as what Guardian extracted, and it is not taken for none.
     let dir = TempDir::new("gate-record-broken");
     let state = State::open(Some(&dir.path().join("state")), "demo");
-    assert!(state.record_extraction(&odd_extraction()));
+    assert!(state.record_extraction(&odd_extraction()).unwrap());
     assert_eq!(usable(&state), odd_extraction());
-    state.write("extraction", &record("/x", "caf\\u{E9}"));
+    state
+        .write("extraction", &record("/x", "caf\\u{E9}"))
+        .unwrap();
     assert!(matches!(state.extraction(), Kept::Unusable(_)));
 }
 

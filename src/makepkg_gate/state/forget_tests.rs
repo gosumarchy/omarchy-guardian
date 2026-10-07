@@ -13,8 +13,8 @@ fn forgetting_a_package_takes_its_records_and_leaves_the_others() {
     let binaries: BTreeMap<String, String> = [("src/demo/tool".to_string(), "a".repeat(64))].into();
     for key in ["demo", "other"] {
         let state = State::open(Some(&root), key);
-        state.remember_confirmed("sources abc");
-        state.record_binaries(&binaries);
+        state.remember_confirmed("sources abc").unwrap();
+        state.record_binaries(&binaries).unwrap();
     }
     assert_eq!(forget(&root, "demo").ok(), Some(2));
     let demo = State::open(Some(&root), "demo");
