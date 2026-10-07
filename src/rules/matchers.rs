@@ -196,15 +196,94 @@ fn reads_pipe(segments: &[&str], index: usize) -> bool {
 
 /// Whether the program `word`, given `rest`, runs what a pipe carries to
 /// it: itself, or as `xargs` handing the input to a shell.
-fn takes_pipe<'a>(word: &str, rest: impl Iterator<Item = &'a str>, spaced: bool) -> bool {
-    // `xargs sh -c '…'`: xargs hands the input to the shell.
+fn takes_pipe<'a>(word: &str, rest: impl Iterator<Item = &'a str> + Clone, spaced: bool) -> bool {
+    // `xargs sh -c '…'`: xargs hands the input to the program it runs.
     if program_name(word) == "xargs" {
-        let mut rest = rest.skip_while(|argument| argument.starts_with('-'));
-        return rest
-            .next()
-            .is_some_and(|program| consumes_pipe(program, rest, spaced));
+        return xargs_hands_on(rest, spaced, XARGS_READINGS);
     }
     consumes_pipe(word, rest, spaced)
+}
+
+/// The short options of `xargs` that take a value, which may be the word
+/// after them (`-n 1`, `-I {}`).
+const XARGS_VALUE_OPTIONS: &[char] = &['E', 'I', 'L', 'P', 'a', 'd', 'n', 's'];
+
+/// Those that take one as a capital and none in lower case. A line is
+/// read in lower case too, where the two cannot be told apart.
+const XARGS_UNSURE_OPTIONS: &[char] = &['e', 'i', 'l', 'p'];
+
+/// The long options whose value is not joined by `=`.
+const XARGS_LONG_VALUE_OPTIONS: &[&str] = &[
+    "--arg-file",
+    "--delimiter",
+    "--max-args",
+    "--max-chars",
+    "--max-procs",
+    "--process-slot-var",
+];
+
+/// Whether a cluster of short options of `xargs` takes the word after it
+/// as a value; `None` where it may or may not. The first option that takes
+/// a value takes the rest of the word, or the next word when it stands
+/// last.
+fn xargs_value(cluster: &str) -> Option<bool> {
+    // An option before this one may have taken the rest of the word.
+    let mut unsure = false;
+    for (at, option) in cluster.char_indices().skip(1) {
+        let last = at + option.len_utf8() == cluster.len();
+        if XARGS_VALUE_OPTIONS.contains(&option) {
+            return (!last || !unsure).then_some(last);
+        }
+        if XARGS_UNSURE_OPTIONS.contains(&option) {
+            if last {
+                return None;
+            }
+            unsure = true;
+        }
+    }
+    Some(false)
+}
+
+/// How many options of `xargs` are read both ways.
+const XARGS_READINGS: u8 = 4;
+
+/// Whether the command `xargs` is given in `words`, which follow it, runs
+/// what a pipe carries: found past its options, the values that are words
+/// of their own (`-n 1 sh`), and wrappers (`sudo sh`). Where an option may
+/// or may not take the next word, `readings` of them are read both ways.
+fn xargs_hands_on<'a>(
+    mut words: impl Iterator<Item = &'a str> + Clone,
+    spaced: bool,
+    mut readings: u8,
+) -> bool {
+    loop {
+        let mut ahead = words.clone();
+        let Some(option) = ahead.next().filter(|word| word.starts_with('-')) else {
+            break;
+        };
+        words = ahead;
+        if option == "--" {
+            break;
+        }
+        if option.starts_with("--") {
+            if XARGS_LONG_VALUE_OPTIONS.contains(&option) {
+                words.next();
+            }
+            continue;
+        }
+        let takes = xargs_value(option);
+        if takes == Some(true) {
+            words.next();
+        } else if takes.is_none() && readings > 0 {
+            readings -= 1;
+            let mut taken = words.clone();
+            taken.next();
+            if xargs_hands_on(taken, spaced, readings) {
+                return true;
+            }
+        }
+    }
+    shell::program_word(&mut words).is_some_and(|program| consumes_pipe(program, words, spaced))
 }
 
 /// The last of `segments`, cut as `pipes_into_shell` cuts a line, that runs

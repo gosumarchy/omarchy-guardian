@@ -215,6 +215,12 @@ pub(super) fn saved_files(line: &str) -> Vec<String> {
     for statement in shell::statements(line) {
         let parts = shell::pipeline(statement);
         for (at, part) in parts.iter().enumerate() {
+            // `x=$(git clone … d) make`: the command in a substitution
+            // that was looked past saves as well.
+            for command in shell::inner_commands(part) {
+                found.extend(saved_by(&command));
+                found.extend(saved_in_directory(&command));
+            }
             let Some(command) = shell::command(part) else {
                 continue;
             };

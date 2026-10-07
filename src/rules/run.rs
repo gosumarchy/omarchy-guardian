@@ -13,10 +13,17 @@ const RUNNERS: &[&str] = &[
     "ruby", "php", "lua",
 ];
 
-/// A file name as written, without a leading `./`.
+/// A file name as written, without a leading `./` and without the
+/// backtick that closes a substitution it stands last in.
 pub(super) fn as_file(word: &str) -> Option<String> {
-    let name = word.trim_end_matches(';').trim_start_matches("./");
+    let name = word.trim_end_matches([';', '`']).trim_start_matches("./");
     (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The program a word names where it may open a substitution: `x=$(curl`.
+fn fetcher_name(word: &str) -> &str {
+    let word = word.rsplit("$(").next().unwrap_or(word);
+    program_name(word.rsplit('`').next().unwrap_or(word))
 }
 
 /// The file a fetch on `line` is saved as: `curl -o x`, `wget -O x`,
@@ -25,8 +32,18 @@ pub(super) fn fetched_file(line: &str) -> Option<String> {
     let words = unquoted_words(line);
     let at = words
         .iter()
-        .position(|word| FETCHERS.contains(&program_name(word)))?;
-    let fetcher = program_name(&words[at]);
+        .position(|word| FETCHERS.contains(&fetcher_name(word)))?;
+    let name = saved_as(&words, at)?;
+    // Last in a substitution, the name is written with what closes it.
+    if words[at].contains("$(") {
+        return as_file(without_group_close(&name));
+    }
+    Some(name)
+}
+
+/// `fetched_file`, for the fetcher at `at` among `words`.
+fn saved_as(words: &[String], at: usize) -> Option<String> {
+    let fetcher = fetcher_name(&words[at]);
     let mut by_address = fetcher == "wget";
     let mut address = None;
     let mut rest = words[at + 1..].iter();
@@ -241,30 +258,23 @@ pub(crate) fn run_targets(line: &str) -> Vec<String> {
         }
         // A substitution that was looked past for the program after it
         // runs a command too, at the same place in the pipeline.
-        let within: Vec<(usize, Option<shell::Command>)> = statement
+        // Its output is the variable's, so no shell after it reads it.
+        let within: Vec<shell::Command> = statement
             .split('|')
             .take(MAX_SEGMENTS)
-            .enumerate()
-            .flat_map(|(at, segment)| {
-                shell::inner_commands(segment)
-                    .into_iter()
-                    .map(move |command| (at, Some(command)))
-            })
+            .flat_map(shell::inner_commands)
             .collect();
         let each = commands
             .iter()
             .enumerate()
-            .chain(within.iter().map(|(at, command)| (*at, command)));
-        for (at, command) in each {
-            let Some(command) = command else {
-                continue;
-            };
+            .filter_map(|(at, command)| Some((shell_after[at + 1], command.as_ref()?)))
+            .chain(within.iter().map(|command| (false, command)));
+        for (piped_into_shell, command) in each {
             if command.path.contains('/') {
                 add(&command.path);
             }
             let arguments: Vec<&str> = command.arguments.iter().map(String::as_str).collect();
             // `cat x | sh`: what is read into a shell after it.
-            let piped_into_shell = shell_after[at + 1];
             let name = command.program.as_str();
             if name == "cat" && piped_into_shell {
                 for argument in &arguments {
