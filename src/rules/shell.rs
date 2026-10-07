@@ -316,6 +316,26 @@ const WRAPPERS: &[&str] = &[
 pub(super) fn program_word<'a>(
     words: &mut (impl Iterator<Item = &'a str> + Clone),
 ) -> Option<&'a str> {
+    program_past(words, &mut Passed::Unnoted)
+}
+
+/// What `program_past` does at a substitution an assignment opens, with a
+/// program after it.
+enum Passed<'a> {
+    /// Looks past it to that program, and does not keep what it held.
+    Unnoted,
+    /// Looks past it, and keeps the words of the first one it passed.
+    Noted(Option<Vec<&'a str>>),
+    /// Reads what it holds, not what follows: for those words themselves.
+    Never,
+}
+
+/// `program_word`, which may keep the words of a substitution it looked
+/// past: the command there runs too.
+fn program_past<'a>(
+    words: &mut (impl Iterator<Item = &'a str> + Clone),
+    passed: &mut Passed<'a>,
+) -> Option<&'a str> {
     let mut elevated = false;
     // The command of a substitution an assignment was given (`x=$(date)`):
     // the program, unless one follows the assignment.
@@ -361,11 +381,25 @@ pub(super) fn program_word<'a>(
                 // the substitution is it only when none does.
                 Some(Substituted::Whole(command)) => held = held.or(command),
                 Some(Substituted::Open(rest, backtick)) => {
-                    if let Some(after) = past_substitution(words, rest, backtick) {
+                    let after = (!matches!(passed, Passed::Never))
+                        .then(|| past_substitution(words, rest, backtick))
+                        .flatten();
+                    if let Some((within, after)) = after {
                         // `x=$(mktemp -d) sh f`: as above, with the
                         // substitution over several words.
                         held = held.or_else(|| command_of(rest));
+                        if let Passed::Noted(noted @ None) = passed {
+                            *noted = Some(
+                                std::iter::once(rest)
+                                    .chain(words.clone().take(within))
+                                    .collect(),
+                            );
+                        }
                         *words = after;
+                    } else if rest.trim_start().starts_with('<') {
+                        // `x=$(< f)` reads a file: with nothing after it,
+                        // nothing is run.
+                        return held;
                     } else {
                         // `x=$(sha256sum f`: the value is the command, and
                         // what follows is given to it.
@@ -383,17 +417,18 @@ pub(super) fn program_word<'a>(
 /// The most words a substitution is looked through for where it closes.
 const MAX_SUBSTITUTED_WORDS: usize = 64;
 
-/// `words` past the word that closes a substitution opened before them,
-/// where something follows it; `rest` is what stood after the opening.
-/// `None` where it does not close within `MAX_SUBSTITUTED_WORDS`, or
-/// nothing follows: then what it holds is all there is to read.
-fn past_substitution<'a, I>(words: &I, rest: &str, backtick: bool) -> Option<I>
+/// How many words the substitution opened before `words` takes up to the
+/// one that closes it, and `words` past that one, where a command follows;
+/// `rest` is what stood after the opening. `None` where it does not close
+/// within `MAX_SUBSTITUTED_WORDS`, or nothing but a redirection, a closing
+/// or a comment follows: then what it holds is all there is to read.
+fn past_substitution<'a, I>(words: &I, rest: &str, backtick: bool) -> Option<(usize, I)>
 where
     I: Iterator<Item = &'a str> + Clone,
 {
     let mut ahead = words.clone();
     let mut depth = 1 + depth_change(rest);
-    for _ in 0..MAX_SUBSTITUTED_WORDS {
+    for within in 1..=MAX_SUBSTITUTED_WORDS {
         let word = ahead.next()?;
         let closes = if backtick {
             word.contains('`')
@@ -402,7 +437,13 @@ where
             depth <= 0
         };
         if closes {
-            return ahead.clone().next().is_some().then_some(ahead);
+            let next = ahead.clone().next()?;
+            let no_command = next == "\\"
+                || next.starts_with(['>', '<', '#', ')', '}', ';', '|', '&'])
+                || next
+                    .trim_start_matches(|character: char| character.is_ascii_digit())
+                    .starts_with(['>', '<']);
+            return (!no_command).then_some((within, ahead));
         }
     }
     None
@@ -478,6 +519,28 @@ pub(super) fn command(part: &str) -> Option<Command> {
     let mut words = words.iter().map(String::as_str);
     let path = program_word(&mut words)?.to_string();
     let arguments = words
+        .map(|word| word.trim_end_matches(';').to_string())
+        .filter(|word| !word.is_empty())
+        .collect();
+    Some(Command {
+        program: program_name(&path).to_string(),
+        path,
+        arguments,
+    })
+}
+
+/// The command inside a substitution that `command` looked past for the
+/// program after it (`x=$(sudo sh f) :`): it runs as well.
+pub(super) fn inner_command(part: &str) -> Option<Command> {
+    let words = unquoted_words(part);
+    let mut passed = Passed::Noted(None);
+    program_past(&mut words.iter().map(String::as_str), &mut passed)?;
+    let Passed::Noted(Some(within)) = passed else {
+        return None;
+    };
+    let mut within = within.into_iter();
+    let path = program_past(&mut within, &mut Passed::Never)?.to_string();
+    let arguments = within
         .map(|word| word.trim_end_matches(';').to_string())
         .filter(|word| !word.is_empty())
         .collect();

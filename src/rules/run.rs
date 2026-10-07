@@ -165,10 +165,14 @@ pub(crate) fn runs_file(line: &str, file: &str) -> bool {
     }
     let line = line.replace("&&", ";").replace("||", ";");
     line.split([';', '|']).any(|statement| {
-        [run_command(statement), value_command(statement)]
-            .into_iter()
-            .flatten()
-            .any(|command| runs_named(&command, &is_named))
+        [
+            run_command(statement),
+            value_command(statement),
+            shell::inner_command(statement),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|command| runs_named(&command, &is_named))
     })
 }
 
@@ -238,7 +242,20 @@ pub(crate) fn run_targets(line: &str) -> Vec<String> {
             let is_shell = commands[at].as_ref().is_some_and(shell::Command::is_shell);
             shell_after[at] = shell_after[at + 1] || is_shell;
         }
-        for (at, command) in commands.iter().enumerate() {
+        // A substitution that was looked past for the program after it
+        // runs a command too, at the same place in the pipeline.
+        let within: Vec<(usize, Option<shell::Command>)> = statement
+            .split('|')
+            .take(MAX_SEGMENTS)
+            .map(shell::inner_command)
+            .enumerate()
+            .filter(|(_, command)| command.is_some())
+            .collect();
+        let each = commands
+            .iter()
+            .enumerate()
+            .chain(within.iter().map(|(at, command)| (*at, command)));
+        for (at, command) in each {
             let Some(command) = command else {
                 continue;
             };

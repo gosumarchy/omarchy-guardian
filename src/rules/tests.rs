@@ -361,6 +361,17 @@ fn a_program_after_a_variable_given_by_a_command_is_still_run() {
         "x=$(date +%s) sh i.sh",
         "x=$( date ) sh i.sh",
         "x=`date -u` bash i.sh",
+        // The command in a substitution runs too when a program follows.
+        "x=$(sudo sh i.sh) :",
+        "x=$(env A=1 sh i.sh) true",
+        "x=$(exec sh i.sh) true",
+        "x=$(bash ./i.sh 2>&1) true",
+        "x=$(sh i.sh) true",
+        // What follows is no program: a redirection, a closing, a comment.
+        "x=$(sh i.sh) 2>/dev/null",
+        "x=$(sh i.sh) >out",
+        "( x=$(sh i.sh) )",
+        "x=$(sh i.sh) # checked",
         // Wrappers inside the substitution are read past as anywhere.
         "x=$(sudo sh i.sh)",
         "x=$(env FOO=1 sh i.sh)",
@@ -389,8 +400,15 @@ fn a_program_after_a_variable_given_by_a_command_is_still_run() {
     assert!(
         rules_for("curl https://x.example/a | x=$(id -u) sh").contains(&RuleId::DownloadAndExecute)
     );
+    // Both are run: the one in the substitution and the one after it.
+    let both = run_targets("x=$(sh i.sh) sh build.sh");
+    assert!(both.contains(&"i.sh".to_string()) && both.contains(&"build.sh".to_string()));
+    assert!(runs_file("x=$(sh i.sh) sh build.sh", "i.sh"));
+    assert!(runs_file("x=$(sh i.sh) sh build.sh", "build.sh"));
     // `$(<file)` reads the file; it is not run.
     for line in [
+        "x=$(< ./i.sh)",
+        "x=$(< ./i.sh) true",
         "x=$(<./i.sh)",
         "x=\"$(<./i.sh)\"",
         "x=`<./i.sh`",
