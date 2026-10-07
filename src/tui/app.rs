@@ -1,11 +1,12 @@
 //! The settings TUI's state, key handling and drawing. Nothing here touches
 //! the system: actions come back as `Effect`s for the event loop to carry
-//! out, and their outcomes are reported back through `finish`.
+//! out, and their outcomes are reported back through `settle`, which also
+//! takes the files as the effect left them.
 
 use std::path::PathBuf;
 
 use crate::config::Settings;
-use crate::config::file::PartialConfig;
+use crate::config::file::{PartialConfig, PartialPolicy};
 use crate::config::load::FileStatus;
 use crate::config::model::{Named, Profile, SourceClass};
 use crate::integrations::{Integration, Paths, Plan, State};
@@ -136,6 +137,30 @@ pub(super) enum Effect {
     Quit,
 }
 
+impl Effect {
+    /// The files whose drafts are replaced by what is read back after this
+    /// effect; `None` when nothing needs reading again. `done` is whether
+    /// the effect succeeded: a save that failed wrote nothing, so its draft
+    /// stays. An integration replaces no draft: nobody was asked about
+    /// dropping edits, and what it may write to the system file (the
+    /// sweep's root consent) reaches a kept draft when the files are read
+    /// back. Setup or an editor may have rewritten both files, and the
+    /// user agreed to drop the drafts before either started.
+    const fn rewrites(&self, done: bool) -> Option<&'static [Scope]> {
+        match self {
+            Self::SaveUser(_) if done => Some(&[Scope::User]),
+            Self::SaveSystem(_) if done => Some(&[Scope::System]),
+            Self::SaveUser(_) | Self::SaveSystem(_) | Self::Integration(_) => Some(&[]),
+            Self::GuidedSetup | Self::Edit(_) => Some(&[Scope::User, Scope::System]),
+            Self::Report(_)
+            | Self::ForgetMemory
+            | Self::LoadModels(_)
+            | Self::ResetDefaults
+            | Self::Quit => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Dialog {
     Choice {
@@ -217,6 +242,20 @@ impl Loaded {
             paths,
         }
     }
+
+    const fn config(&self, scope: Scope) -> &PartialConfig {
+        match scope {
+            Scope::User => &self.user,
+            Scope::System => &self.system,
+        }
+    }
+
+    const fn status(&self, scope: Scope) -> &FileStatus {
+        match scope {
+            Scope::User => &self.user_status,
+            Scope::System => &self.system_status,
+        }
+    }
 }
 
 pub(super) struct App {
@@ -267,11 +306,56 @@ impl App {
         app
     }
 
-    /// Replaces the files after a save, an edit or setup, keeping the
-    /// position and any drafts of files that were not reloaded.
-    pub(super) fn reload(&mut self, files: Loaded) {
-        self.user = files.user.clone();
-        self.system = files.system.clone();
+    /// What the event loop does once an effect has been carried out: reads
+    /// the files again (with `load`) when the effect may have changed them,
+    /// then reports the outcome. Returns whether they were read again.
+    pub(super) fn settle(
+        &mut self,
+        effect: &Effect,
+        outcome: Result<String, String>,
+        load: impl FnOnce() -> Loaded,
+    ) -> bool {
+        let rewritten = effect.rewrites(outcome.is_ok());
+        let dropped = rewritten.and_then(|rewritten| self.reload(load(), rewritten));
+        self.finish(effect, outcome);
+        if let Some(dropped) = dropped {
+            // Lost edits are said after the outcome, and beside an error.
+            let text = match self.message.take() {
+                Some((error, Tone::Bad)) => format!("{error} {dropped}"),
+                _ => dropped,
+            };
+            self.message = Some((text, Tone::Bad));
+        }
+        rewritten.is_some()
+    }
+
+    /// Takes the files as they are now, keeping the position. The draft of
+    /// a file in `rewritten` is replaced by what was read; so is a draft
+    /// without edits, which follows its file. Unsaved edits of any other
+    /// file are kept, carried over to the file as it is now (`rebuilt`).
+    /// They cannot be carried to a file that is no longer valid: they are
+    /// dropped, and the sentence saying so is returned.
+    fn reload(&mut self, files: Loaded, rewritten: &[Scope]) -> Option<String> {
+        let mut dropped = None;
+        for scope in [Scope::User, Scope::System] {
+            let fresh = files.config(scope);
+            let kept = if rewritten.contains(&scope) || !self.dirty(scope) {
+                None
+            } else if matches!(files.status(scope), FileStatus::Invalid(_)) {
+                dropped = Some(format!(
+                    "The {} file is no longer valid; your unsaved changes to it were dropped.",
+                    scope.name()
+                ));
+                None
+            } else {
+                Some(self.rebuilt(scope, fresh))
+            };
+            let draft = kept.unwrap_or_else(|| fresh.clone());
+            match scope {
+                Scope::User => self.user = draft,
+                Scope::System => self.system = draft,
+            }
+        }
         self.files = files;
         self.refresh_integrations();
         for status in [&self.files.user_status, &self.files.system_status] {
@@ -279,6 +363,36 @@ impl App {
                 self.message = Some((reason.clone(), Tone::Bad));
             }
         }
+        dropped
+    }
+
+    /// The unsaved edits of `scope` on top of `fresh`, its file as read
+    /// just now. A draft is not kept as the snapshot it was: every field
+    /// edited here is set again in the fresh file's settings, so a field
+    /// that was not edited, and every setting no field shows, is what the
+    /// file says now, and saving cannot undo a change made elsewhere.
+    ///
+    /// The one thing here that changes settings without a field is "Reset
+    /// to defaults", which removes them. Whether a draft still holds that
+    /// removal is read off the draft, never remembered: its settings
+    /// without a field then differ from its file's. Such a draft is the
+    /// fresh file cleared the same way, with the fields set since.
+    fn rebuilt(&self, scope: Scope, fresh: &PartialConfig) -> PartialConfig {
+        let reset = unlisted(scope, self.draft(scope)) != unlisted(scope, self.saved(scope));
+        let (from, mut draft) = if reset {
+            (defaults(scope, self.saved(scope)), defaults(scope, fresh))
+        } else {
+            (self.saved(scope).clone(), fresh.clone())
+        };
+        for field in fields(scope) {
+            let value = field.get(self.draft(scope));
+            if value != field.get(&from) && value != field.get(&draft) {
+                // A value the file as it is now refuses stays as the file
+                // has it.
+                drop(field.set(&mut draft, value.as_deref()));
+            }
+        }
+        draft
     }
 
     fn refresh_integrations(&mut self) {
@@ -303,17 +417,11 @@ impl App {
     }
 
     fn saved(&self, scope: Scope) -> &PartialConfig {
-        match scope {
-            Scope::User => &self.files.user,
-            Scope::System => &self.files.system,
-        }
+        self.files.config(scope)
     }
 
     fn status(&self, scope: Scope) -> &FileStatus {
-        match scope {
-            Scope::User => &self.files.user_status,
-            Scope::System => &self.files.system_status,
-        }
+        self.files.status(scope)
     }
 
     fn dirty(&self, scope: Scope) -> bool {
@@ -321,16 +429,21 @@ impl App {
     }
 
     fn changed_count(&self) -> usize {
-        Tab::ALL
-            .iter()
-            .flat_map(|tab| rows(*tab))
-            .filter(|row| match row {
-                Row::Field(field) => {
-                    field.get(self.draft(field.scope)) != field.get(self.saved(field.scope))
+        [Scope::User, Scope::System]
+            .into_iter()
+            .map(|scope| {
+                let edited = fields(scope)
+                    .filter(|field| field.get(self.draft(scope)) != field.get(self.saved(scope)))
+                    .count();
+                // "Reset to defaults" can remove settings no field shows:
+                // that counts as one change, never as none.
+                if edited == 0 && self.dirty(scope) {
+                    1
+                } else {
+                    edited
                 }
-                _ => false,
             })
-            .count()
+            .sum()
     }
 
     fn say(&mut self, text: &str) {
@@ -338,7 +451,7 @@ impl App {
     }
 
     /// Reports how an effect went.
-    pub(super) fn finish(&mut self, effect: &Effect, outcome: Result<String, String>) {
+    fn finish(&mut self, effect: &Effect, outcome: Result<String, String>) {
         match outcome {
             Err(error) => {
                 self.message = Some((error, Tone::Bad));
@@ -361,7 +474,8 @@ impl App {
                 }
                 Effect::SaveUser(_) => {
                     self.message = Some((text, Tone::Good));
-                    if std::mem::take(&mut self.system_after_user) {
+                    // Not when reading the files back dropped that draft.
+                    if std::mem::take(&mut self.system_after_user) && self.dirty(Scope::System) {
                         self.confirm_system_save();
                     }
                 }
@@ -488,8 +602,8 @@ impl App {
         None
     }
 
-    /// Refuses edits to a file that could not be read, since saving would
-    /// replace it.
+    /// Refuses edits to, and saves over, a file that could not be read,
+    /// since saving would replace it.
     fn editable(&mut self, scope: Scope) -> bool {
         if let FileStatus::Invalid(reason) = self.status(scope) {
             self.message = Some((
@@ -726,6 +840,9 @@ impl App {
             return None;
         }
         if user {
+            if !self.editable(Scope::User) {
+                return None;
+            }
             match validate(&self.user) {
                 Ok(text) => {
                     self.system_after_user = system;
@@ -742,6 +859,9 @@ impl App {
     }
 
     fn confirm_system_save(&mut self) {
+        if !self.editable(Scope::System) {
+            return;
+        }
         match validate(&self.system) {
             Ok(text) => {
                 let mut lines = vec![
@@ -1349,6 +1469,46 @@ fn class_header(class: SourceClass) -> String {
         SourceClass::System => ("What already runs on this system", "sweep · user file"),
     };
     format!("{name}  ·  {gate}")
+}
+
+/// Every setting of one file that can be edited here, in either mode.
+fn fields(scope: Scope) -> impl Iterator<Item = Field> {
+    Tab::ALL
+        .iter()
+        .flat_map(|tab| rows(*tab))
+        .filter_map(move |row| match row {
+            Row::Field(field) if field.scope == scope => Some(field),
+            _ => None,
+        })
+}
+
+/// The settings of `config` that no field of its file shows: `config` with
+/// every field cleared. Class sections left empty do not count.
+fn unlisted(scope: Scope, config: &PartialConfig) -> PartialConfig {
+    let mut rest = config.clone();
+    for field in fields(scope) {
+        field.clear(&mut rest);
+    }
+    rest.classes
+        .retain(|(_, policy)| *policy != PartialPolicy::default());
+    rest
+}
+
+/// What "Reset to defaults" makes of `file`: nothing set, except the
+/// system-only settings that saving the system file never removes (the
+/// trusted reviewer packages, the sweep's root consent, the accepted weaker
+/// settings and the strict-level permit).
+fn defaults(scope: Scope, file: &PartialConfig) -> PartialConfig {
+    match scope {
+        Scope::User => PartialConfig::default(),
+        Scope::System => PartialConfig {
+            trusted_reviewer_packages: file.trusted_reviewer_packages.clone(),
+            sweep: file.sweep.clone(),
+            acknowledged_weaker: file.acknowledged_weaker.clone(),
+            permit_strict: file.permit_strict,
+            ..PartialConfig::default()
+        },
+    }
 }
 
 fn rows(tab: Tab) -> Vec<Row> {
