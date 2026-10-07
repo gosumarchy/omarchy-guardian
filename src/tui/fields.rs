@@ -274,6 +274,13 @@ impl Field {
         Ok(())
     }
 
+    /// Clears the field in `config`, without checking the file: for
+    /// comparing what is left of two configs, not for editing one.
+    pub(super) fn clear(self, config: &mut PartialConfig) {
+        // Only a value can be refused.
+        drop(self.assign(config, None));
+    }
+
     fn assign(self, config: &mut PartialConfig, value: Option<&str>) -> Result<(), String> {
         fn named<T: Named>(value: Option<&str>) -> Result<Option<T>, String> {
             value

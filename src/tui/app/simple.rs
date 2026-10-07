@@ -304,10 +304,6 @@ impl App {
     pub(super) fn reset_defaults(&mut self) {
         self.user = defaults(Scope::User, &self.files.user);
         self.system = defaults(Scope::System, &self.files.system);
-        self.reset = [Scope::User, Scope::System]
-            .into_iter()
-            .filter(|scope| self.dirty(*scope))
-            .collect();
         if self.dirty(Scope::User) || self.dirty(Scope::System) {
             self.say("Defaults set. Press s to save.");
         } else {
@@ -631,7 +627,7 @@ mod tests {
     use super::super::{App, Effect, Loaded, Mode, Task};
     use crate::config::file::PartialConfig;
     use crate::config::load::FileStatus;
-    use crate::config::model::{Profile, RootConsent};
+    use crate::config::model::{Action, Profile, RootConsent, SourceClass, Thinking};
     use crate::integrations::{Paths, Plan, Step};
     use crate::test_support::TempDir;
     use crate::tui::canvas::Canvas;
@@ -935,6 +931,108 @@ mod tests {
         );
         assert_eq!(app.system.profile, Some(Profile::LocalOnly));
         assert_eq!(app.system.sweep, system_file().sweep);
+    }
+
+    fn toggle() -> Effect {
+        Effect::Integration(Plan {
+            summary: "Protect everything".into(),
+            steps: Vec::new(),
+        })
+    }
+
+    /// Picks the suggested model, for your sources and for pacman.
+    fn pick_a_model(app: &mut App) {
+        let effects = press(
+            app,
+            &[Key::Home, Key::Down, Key::Down, Key::Down, Key::Enter],
+        );
+        if let [effect @ Effect::LoadModels(_)] = &effects[..] {
+            app.finish(effect, Ok("claude-code/claude-sonnet-5-5".into()));
+        }
+        press(app, &[Key::Enter]);
+        assert!(app.user.agent.model.is_some());
+    }
+
+    /// The files with settings no field of their own file shows, as set
+    /// elsewhere while the app is open.
+    fn with_unlisted(mut read: Loaded) -> Loaded {
+        read.user.update_check = Some(false);
+        read.user.class_mut(SourceClass::Official).on_findings = Some(Action::Block);
+        read.system.update_check = Some(false);
+        read.system.agent.variants = vec![(Thinking::High, "max".into())];
+        read
+    }
+
+    fn strict_files() -> Loaded {
+        let mut loaded = files(None);
+        loaded.user.profile = Some(Profile::Strict);
+        loaded.system.profile = Some(Profile::Strict);
+        loaded
+    }
+
+    fn assert_unlisted_kept(app: &App) {
+        let read = with_unlisted(files(None));
+        assert_eq!(app.user.update_check, Some(false));
+        assert_eq!(app.user.classes, read.user.classes);
+        assert_eq!(app.system.update_check, Some(false));
+        assert_eq!(app.system.agent.variants, read.system.agent.variants);
+    }
+
+    #[test]
+    fn a_reset_taken_back_is_no_longer_a_reset() {
+        let mut app = App::new(strict_files(), Mode::Simple);
+        // Reset, then Maximum again: the drafts are the files once more.
+        press(&mut app, &[Key::End, Key::Enter, Key::Char('y')]);
+        press(&mut app, &[Key::Char('2')]);
+        assert_eq!(app.changed_count(), 0);
+        pick_a_model(&mut app);
+
+        let read = with_unlisted(strict_files());
+        assert!(app.settle(&toggle(), Ok("Done.".into()), || read));
+        assert_unlisted_kept(&app);
+        assert_eq!(app.changed_count(), 2);
+
+        let effects = press(&mut app, &[Key::Char('s')]);
+        let [Effect::SaveUser(text)] = &effects[..] else {
+            panic!("{effects:?}");
+        };
+        assert!(text.contains("[update]\ncheck = \"off\""), "{text}");
+        assert!(
+            text.contains("[class.official]\non_findings = \"block\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("model = \"claude-code/claude-sonnet-5-5\""),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_saved_reset_is_no_longer_a_reset() {
+        let mut app = App::new(with_unlisted(strict_files()), Mode::Simple);
+        press(&mut app, &[Key::End, Key::Enter, Key::Char('y')]);
+        assert_eq!(app.user, PartialConfig::default());
+
+        // Save both files; each is read back as it was written.
+        let effects = press(&mut app, &[Key::Char('s')]);
+        let [effect @ Effect::SaveUser(_)] = &effects[..] else {
+            panic!("{effects:?}");
+        };
+        let mut read = files(None);
+        read.system = app.files.system.clone();
+        assert!(app.settle(effect, Ok("Saved.".into()), || read));
+        let effects = press(&mut app, &[Key::Char('y')]);
+        let [effect @ Effect::SaveSystem(_)] = &effects[..] else {
+            panic!("{effects:?}");
+        };
+        assert!(app.settle(effect, Ok("Saved.".into()), || files(None)));
+        assert_eq!(app.changed_count(), 0);
+
+        pick_a_model(&mut app);
+        let read = with_unlisted(files(None));
+        assert!(app.settle(&toggle(), Ok("Done.".into()), || read));
+        assert_unlisted_kept(&app);
+        assert_eq!(app.changed_count(), 2);
     }
 
     #[test]

@@ -2,13 +2,13 @@
 
 use std::path::PathBuf;
 
-use super::{App, Effect, Loaded, Mode, Row, Tab, Task};
+use super::{App, Effect, Loaded, Mode, Row, Tab, Task, fields};
 use crate::config::file::PartialConfig;
 use crate::config::load::FileStatus;
 use crate::config::model::{AiRequirement, Profile, RootConsent, SourceClass};
 use crate::integrations::Plan;
 use crate::tui::canvas::Canvas;
-use crate::tui::fields::Scope;
+use crate::tui::fields::{Field, Input, Scope};
 use crate::tui::term::Key;
 
 fn loaded(user: PartialConfig, system: PartialConfig) -> Loaded {
@@ -480,6 +480,83 @@ fn clearing_what_the_file_no_longer_sets_is_not_a_change() {
         PartialConfig::default(),
     );
     assert_eq!(app.user, PartialConfig::default());
+}
+
+/// Two values `field` accepts.
+fn two_values(field: Field) -> [String; 2] {
+    match field.input() {
+        Input::Choice(names) => [names[0].to_string(), names[1].to_string()],
+        Input::Number(range) => [range.start().to_string(), range.end().to_string()],
+        Input::Model => ["one/first".into(), "two/second".into()],
+        Input::Repos => ["core".into(), "core, extra".into()],
+    }
+}
+
+/// One file of `scope` with `sets` in it, beside an empty other file.
+fn file_of(scope: Scope, sets: &[(Field, &str)]) -> (PartialConfig, PartialConfig) {
+    let mut config = PartialConfig::default();
+    for (field, value) in sets {
+        field.set(&mut config, Some(value)).unwrap();
+    }
+    match scope {
+        Scope::User => (config, PartialConfig::default()),
+        Scope::System => (PartialConfig::default(), config),
+    }
+}
+
+/// An app whose file of `scope` holds `sets`, with `field` then edited to
+/// `value` and the files read again as `reread`.
+fn edited_then_reread(
+    scope: Scope,
+    sets: &[(Field, &str)],
+    (field, value): (Field, Option<&str>),
+    reread: &[(Field, &str)],
+) -> App {
+    let (user, system) = file_of(scope, sets);
+    let mut app = App::new(loaded(user, system), Mode::Expert);
+    app.set(field, value).unwrap();
+    let (user, system) = file_of(scope, reread);
+    settle(&mut app, &toggle(), user, system);
+    app
+}
+
+#[test]
+fn every_field_edit_is_carried_over_to_the_file_as_read_again() {
+    for scope in [Scope::User, Scope::System] {
+        let all: Vec<Field> = fields(scope).collect();
+        for (index, field) in all.iter().copied().enumerate() {
+            let other = all[(index + 1) % all.len()];
+            let [one, two] = two_values(field);
+            let [elsewhere, _] = two_values(other);
+            let value = |app: &App, field: Field| field.get(app.draft(scope));
+
+            // The file sets the same field to something else: the edit wins.
+            let app = edited_then_reread(scope, &[], (field, Some(&one)), &[(field, &two)]);
+            assert_eq!(value(&app, field), Some(one.clone()), "{field:?}");
+            assert_eq!(app.changed_count(), 1, "{field:?}");
+
+            // The file now says what the edit says: nothing is unsaved.
+            let app = edited_then_reread(scope, &[], (field, Some(&one)), &[(field, &one)]);
+            assert!(!app.dirty(scope), "{field:?}");
+            assert_eq!(app.changed_count(), 0, "{field:?}");
+
+            // Another field changes in the file: both are there.
+            let app = edited_then_reread(scope, &[], (field, Some(&one)), &[(other, &elsewhere)]);
+            assert_eq!(value(&app, field), Some(one.clone()), "{field:?}");
+            assert_eq!(value(&app, other), Some(elsewhere.clone()), "{field:?}");
+            assert_eq!(app.changed_count(), 1, "{field:?}");
+
+            // A value cleared here stays cleared when the file changes it.
+            let app = edited_then_reread(scope, &[(field, &one)], (field, None), &[(field, &two)]);
+            assert_eq!(value(&app, field), None, "{field:?}");
+            assert_eq!(app.changed_count(), 1, "{field:?}");
+
+            // A field that was not edited follows the file.
+            let app = edited_then_reread(scope, &[(other, &elsewhere)], (field, Some(&one)), &[]);
+            assert_eq!(value(&app, other), None, "{field:?}");
+            assert_eq!(app.changed_count(), 1, "{field:?}");
+        }
+    }
 }
 
 #[test]

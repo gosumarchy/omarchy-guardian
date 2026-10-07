@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use crate::config::Settings;
-use crate::config::file::PartialConfig;
+use crate::config::file::{PartialConfig, PartialPolicy};
 use crate::config::load::FileStatus;
 use crate::config::model::{Named, Profile, SourceClass};
 use crate::integrations::{Integration, Paths, Plan, State};
@@ -270,9 +270,6 @@ pub(super) struct App {
     message: Option<(String, Tone)>,
     /// Ask to save the system file once the user file is saved.
     system_after_user: bool,
-    /// The files whose draft "Reset to defaults" cleared and that have not
-    /// been read back since: their edits are relative to the cleared file.
-    reset: Vec<Scope>,
     models: Option<Vec<String>>,
     mode: Mode,
     simple_cursor: usize,
@@ -294,7 +291,6 @@ impl App {
             dialog: None,
             message: None,
             system_after_user: false,
-            reset: Vec::new(),
             models: None,
             mode,
             simple_cursor: 0,
@@ -354,9 +350,6 @@ impl App {
             } else {
                 Some(self.rebuilt(scope, fresh))
             };
-            if kept.is_none() {
-                self.reset.retain(|candidate| *candidate != scope);
-            }
             let draft = kept.unwrap_or_else(|| fresh.clone());
             match scope {
                 Scope::User => self.user = draft,
@@ -377,10 +370,16 @@ impl App {
     /// just now. A draft is not kept as the snapshot it was: every field
     /// edited here is set again in the fresh file's settings, so a field
     /// that was not edited, and every setting no field shows, is what the
-    /// file says now, and saving cannot undo a change made elsewhere. After
-    /// "Reset to defaults" the edits are relative to the cleared file.
+    /// file says now, and saving cannot undo a change made elsewhere.
+    ///
+    /// The one thing here that changes settings without a field is "Reset
+    /// to defaults", which removes them. Whether a draft still holds that
+    /// removal is read off the draft, never remembered: its settings
+    /// without a field then differ from its file's. Such a draft is the
+    /// fresh file cleared the same way, with the fields set since.
     fn rebuilt(&self, scope: Scope, fresh: &PartialConfig) -> PartialConfig {
-        let (from, mut draft) = if self.reset.contains(&scope) {
+        let reset = unlisted(scope, self.draft(scope)) != unlisted(scope, self.saved(scope));
+        let (from, mut draft) = if reset {
             (defaults(scope, self.saved(scope)), defaults(scope, fresh))
         } else {
             (self.saved(scope).clone(), fresh.clone())
@@ -1481,6 +1480,18 @@ fn fields(scope: Scope) -> impl Iterator<Item = Field> {
             Row::Field(field) if field.scope == scope => Some(field),
             _ => None,
         })
+}
+
+/// The settings of `config` that no field of its file shows: `config` with
+/// every field cleared. Class sections left empty do not count.
+fn unlisted(scope: Scope, config: &PartialConfig) -> PartialConfig {
+    let mut rest = config.clone();
+    for field in fields(scope) {
+        field.clear(&mut rest);
+    }
+    rest.classes
+        .retain(|(_, policy)| *policy != PartialPolicy::default());
+    rest
 }
 
 /// What "Reset to defaults" makes of `file`: nothing set, except the
