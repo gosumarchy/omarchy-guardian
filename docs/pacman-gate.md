@@ -357,3 +357,10 @@ cannot attribute to pacman, to an invoking user, or to an archive are blocked;
 pacman run from a root shell, with no invoking user, is one of them. Front
 ends that call libalpm directly (for example pamac) are not supported and will
 be blocked.
+
+The transaction goes on after a `CLEAR`, `WARNED` or `LIMITED REVIEW` decision
+and stops on any other (see
+[Decisions and exit codes](settings.md#decisions-and-exit-codes)). Low remarks
+of the AI beside a clear verdict do not stop it under `standard`; under
+`strict` they are findings and do (see
+[What the reviewer's reply decides](review.md#what-the-reviewers-reply-decides)).

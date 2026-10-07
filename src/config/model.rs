@@ -210,14 +210,33 @@ impl Named for Toggle {
     }
 }
 
+/// What the low findings of an AI review whose verdict is `clear` are. The
+/// reviewer then says that nothing here means harm and adds what it noticed
+/// all the same (a download without certificate checks, an unquoted
+/// variable). `Findings` is the stricter value.
+///
+/// It comes with the profile and is no setting: no file names it, so a
+/// class cannot be given the looser value under a stricter profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Remarks {
+    /// Shown in the report; `on_ai_suspicious` does not apply to them.
+    Shown,
+    /// Findings like any other: `on_ai_suspicious` applies.
+    Findings,
+}
+
 /// Everything that decides how one source class is reviewed and judged.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Policy {
     pub(crate) ai: AiRequirement,
     /// Local-rule and OSV findings.
     pub(crate) on_findings: Action,
-    /// An AI `suspicious` verdict or any AI finding.
+    /// An AI `suspicious` verdict or an AI finding (see `ai_remarks` for
+    /// the low ones of a `clear` verdict).
     pub(crate) on_ai_suspicious: Action,
+    /// What the low findings of a `clear` AI verdict are. From the profile
+    /// alone (see `Remarks`).
+    pub(crate) ai_remarks: Remarks,
     pub(crate) thinking: Thinking,
     pub(super) model: Option<String>,
     /// `None` derives the timeout from `thinking`.
@@ -312,6 +331,12 @@ pub(crate) fn builtin(profile: Profile, class: SourceClass) -> Policy {
         ai,
         on_findings,
         on_ai_suspicious: Block,
+        // Whoever chose strict asked for the cautious side of every call.
+        ai_remarks: if profile == Profile::Strict {
+            Remarks::Findings
+        } else {
+            Remarks::Shown
+        },
         thinking,
         model: None,
         timeout_secs: None,

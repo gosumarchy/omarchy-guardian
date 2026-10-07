@@ -10,6 +10,13 @@ use crate::text::shown;
 
 use super::{AgentOutcome, Blocked, Decision, Report, Severity, html, recommendation};
 
+/// What the remarks are, after their count in the verdict box.
+const REMARKS: &str = "the AI review is clear; these are not alerts";
+
+/// Said above the remarks.
+pub(super) const REMARKS_NOTE: &str =
+    "The AI review is clear; it noted these all the same. They do not block.";
+
 impl Report {
     pub(crate) fn print(&self, show_hashes: bool, decision: Decision) {
         let painter = Painter::for_stdout();
@@ -31,7 +38,7 @@ impl Report {
         if show_hashes {
             self.print_hashes();
         }
-        self.print_findings(width, painter);
+        out!("{}", self.findings_text(width, painter));
 
         for gap in &self.gaps {
             crate::output::stderr_line(format_args!("  ! {}", shown(&gap.to_string())));
@@ -58,6 +65,13 @@ impl Report {
             );
         }
         match decision {
+            Decision::Clear if self.remark_count() > 0 => (
+                format!(
+                    "✓ CLEAR — no known concerns found; the AI reviewer left {} remark(s)",
+                    self.remark_count()
+                ),
+                "32",
+            ),
             Decision::Clear => ("✓ CLEAR — no known concerns found".to_string(), "32"),
             Decision::Warned => (
                 format!("! WARNED — {total} alert(s); allowed by policy for this source"),
@@ -91,9 +105,9 @@ impl Report {
         }
     }
 
-    /// The verdict, and the alert counts when there are any, in a box the
-    /// verdict's colour.
-    fn verdict_box(&self, decision: Decision, width: usize, painter: Painter) -> String {
+    /// The verdict, and the counts of alerts and of remarks when there are
+    /// any, in a box the verdict's colour.
+    pub(super) fn verdict_box(&self, decision: Decision, width: usize, painter: Painter) -> String {
         let counts = self.counts();
         let (headline, color) = self.headline(decision);
         let mut lines = vec![Span::new(headline, color)];
@@ -102,6 +116,10 @@ impl Report {
                 "Alerts: {} high · {} medium · {} low",
                 counts.high, counts.medium, counts.low
             )));
+        }
+        let remarks = self.remark_count();
+        if remarks > 0 {
+            lines.push(Span::plain(format!("Remarks: {remarks} low · {REMARKS}")));
         }
         let title = format!("Omarchy Guardian · {}", shown(&self.subject));
         let edge = color.split(';').next().unwrap_or(color);
@@ -273,7 +291,10 @@ impl Report {
         }
     }
 
-    fn print_findings(&self, width: usize, painter: Painter) {
+    /// The tables of what was found: the local checks, the AI's findings,
+    /// its remarks and the dependency advisories, each under its title.
+    pub(super) fn findings_text(&self, width: usize, painter: Painter) -> String {
+        let mut text = String::new();
         let severity = |severity: Severity| vec![Span::new(severity.label(), severity.color())];
         if !self.findings.is_empty() {
             let mut table = Table::new(vec!["Severity", "Where", "Local check"]);
@@ -295,17 +316,19 @@ impl Report {
                     what,
                 ]);
             }
-            outln!("\n{}", painter.paint("  Local checks", "1"));
-            outln!("{}", table.render(width, 2, painter));
+            let _ = writeln!(text, "\n{}", painter.paint("  Local checks", "1"));
+            let _ = writeln!(text, "{}", table.render(width, 2, painter));
         }
 
-        let mut table = Table::new(vec!["Severity", "Where", "AI finding"]);
-        let mut any = false;
-        for run in &self.agent_runs {
-            let AgentOutcome::Reviewed(review) = &run.outcome else {
-                continue;
-            };
-            for finding in &review.findings {
+        // The remarks of a clear verdict have a table of their own, so
+        // that none reads as an alert.
+        for (remarks, title, column) in [
+            (false, "  AI findings", "AI finding"),
+            (true, "  AI remarks", "AI remark"),
+        ] {
+            let mut table = Table::new(vec!["Severity", "Where", column]);
+            let mut any = false;
+            for finding in self.agent_findings(remarks) {
                 any = true;
                 let line = finding
                     .line
@@ -320,10 +343,13 @@ impl Report {
                     ],
                 ]);
             }
-        }
-        if any {
-            outln!("\n{}", painter.paint("  AI findings", "1"));
-            outln!("{}", table.render(width, 2, painter));
+            if any {
+                let _ = writeln!(text, "\n{}", painter.paint(title, "1"));
+                if remarks {
+                    let _ = writeln!(text, "  {}", painter.paint(REMARKS_NOTE, "2"));
+                }
+                let _ = writeln!(text, "{}", table.render(width, 2, painter));
+            }
         }
 
         if let Some(audit) = self
@@ -353,15 +379,17 @@ impl Report {
                     what,
                 ]);
             }
-            outln!(
+            let _ = writeln!(
+                text,
                 "\n{}",
                 painter.paint("  Known dependency vulnerabilities", "1")
             );
-            outln!("{}", table.render(width, 2, painter));
+            let _ = writeln!(text, "{}", table.render(width, 2, painter));
             if audit.truncated {
-                outln!("  … OSV reported more advisories than it returned in one page");
+                text.push_str("  … OSV reported more advisories than it returned in one page\n");
             }
         }
+        text
     }
 }
 

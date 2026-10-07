@@ -4,15 +4,17 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-use super::{ReviewContext, ai_off_classes, analyze_text, review_tree, run_agents};
+use super::{ReviewContext, ai_off_classes, analyze_text, remark_classes, review_tree, run_agents};
 use crate::agent::Status;
 use crate::config::Settings;
 use crate::config::file::{AgentDefaults, PartialConfig, PartialPolicy};
-use crate::config::model::{AiRequirement, Profile, SourceClass, builtin};
+use crate::config::model::{AiRequirement, Named, Profile, SourceClass, builtin};
 use crate::report::{AgentOutcome, AgentRun, Blocked, Decision, Gap, Report};
 use crate::rules::RuleId;
 use crate::scan::ScanConfig;
-use crate::test_support::{TempDir, mock_opencode, mock_opencode_counting, reviewer_by_content};
+use crate::test_support::{
+    TempDir, mock_opencode, mock_opencode_counting, mock_opencode_findings, reviewer_by_content,
+};
 use crate::tools::OpenCode;
 
 fn unavailable() -> OpenCode {
@@ -1320,4 +1322,190 @@ fn a_finding_beside_a_chunk_that_ran_out_of_time_is_reported_with_the_gap() {
         "{summary:?}"
     );
     assert_nothing_was_remembered(&next);
+}
+
+/// A reviewer whose verdict is clear and that notes two things graded as
+/// `severity` all the same.
+fn remarking_opencode(bin: &TempDir, severity: &str) -> OpenCode {
+    OpenCode::At(mock_opencode_findings(
+        bin.path(),
+        "clear",
+        &[
+            (severity, "fetch.sh", "Download without certificate checks"),
+            (severity, "warn.sh", "Unquoted command substitution"),
+        ],
+    ))
+}
+
+fn tree_with_two_scripts(name: &str) -> TempDir {
+    let dir = TempDir::new(name);
+    fs::write(dir.path().join("fetch.sh"), "echo fetching\n").unwrap();
+    fs::write(dir.path().join("warn.sh"), "echo warning\n").unwrap();
+    dir
+}
+
+#[test]
+fn a_clear_review_with_low_remarks_is_clear_and_remembered_with_them() {
+    let dir = tree_with_two_scripts("remarks");
+    let bin = TempDir::new("remarks-bin");
+    let state = TempDir::new("remarks-state");
+    let opencode = remarking_opencode(&bin, "low");
+    let settings = default_settings();
+    let root = state.path().join("store");
+    let context = ReviewContext {
+        state_root: Some(&root),
+        ..context(&settings, SourceClass::Aur, &opencode)
+    };
+    let titles = |report: &Report| -> Vec<String> {
+        report
+            .agent_runs
+            .iter()
+            .flat_map(|run| match &run.outcome {
+                AgentOutcome::Reviewed(review) => review.findings.clone(),
+                AgentOutcome::Unavailable(_) => Vec::new(),
+            })
+            .map(|finding| format!("{} {}", finding.severity.label(), finding.title))
+            .collect()
+    };
+    let noted = [
+        "LOW Download without certificate checks",
+        "LOW Unquoted command substitution",
+    ];
+
+    let first = review_tree(&ScanConfig::new(dir.path()), &context);
+    let decision = first.decide(&|class| settings.policy(class));
+    assert_eq!(decision, Decision::Clear, "{:?}", first.gaps);
+    assert_eq!(first.remark_classes, [SourceClass::Aur]);
+    assert_eq!(first.remark_count(), 2);
+    assert_eq!(titles(&first), noted);
+    assert!(first.agent_runs[0].cached.is_none());
+    assert_eq!(first.decision_name(decision), "CLEAR");
+    assert!(first.overruled_summary(10).is_empty());
+    assert_eq!(
+        first.audit_findings(),
+        "high=0 medium=0 low=0 incomplete=0 remarks=2"
+    );
+
+    // The same content again: the cache answers, with the remarks.
+    fs::remove_file(bin.path().join("stdin")).unwrap();
+    let second = review_tree(&ScanConfig::new(dir.path()), &context);
+    assert!(!bin.path().join("stdin").exists(), "{:?}", second.notes);
+    assert_eq!(second.agent_runs.len(), 1, "{:?}", second.notes);
+    assert!(second.agent_runs[0].cached.is_some());
+    assert_eq!(titles(&second), noted);
+    assert_eq!(second.remark_count(), 2);
+    assert_eq!(
+        second.decide(&|class| settings.policy(class)),
+        Decision::Clear
+    );
+
+    // And it was approved like any clear review: a change is reviewed as
+    // an upgrade of it.
+    fs::write(dir.path().join("warn.sh"), "echo warning twice\n").unwrap();
+    let third = review_tree(&ScanConfig::new(dir.path()), &context);
+    assert!(
+        third
+            .notes
+            .iter()
+            .any(|note| note.starts_with("upgrade of the approved version")),
+        "{:?}",
+        third.notes
+    );
+}
+
+#[test]
+fn the_same_reply_blocks_under_strict_and_with_a_grade_that_is_not_low() {
+    for (name, profile, severity, counted) in [
+        ("strict", Profile::Strict, "low", "high=0 medium=0 low=2"),
+        (
+            "medium",
+            Profile::Standard,
+            "medium",
+            "high=0 medium=2 low=0",
+        ),
+        // A grade the reviewer made up counts as the worst.
+        (
+            "unknown",
+            Profile::Standard,
+            "minor",
+            "high=2 medium=0 low=0",
+        ),
+    ] {
+        let dir = tree_with_two_scripts(&format!("remarks-{name}"));
+        let bin = TempDir::new(&format!("remarks-{name}-bin"));
+        let state = TempDir::new(&format!("remarks-{name}-state"));
+        let opencode = remarking_opencode(&bin, severity);
+        let settings = default_settings().with_profile(profile);
+        let root = state.path().join("store");
+        let context = ReviewContext {
+            state_root: Some(&root),
+            ..context(&settings, SourceClass::Aur, &opencode)
+        };
+
+        let first = review_tree(&ScanConfig::new(dir.path()), &context);
+        assert_eq!(
+            first.decide(&|class| settings.policy(class)),
+            Decision::Blocked(Blocked::Findings),
+            "{name}"
+        );
+        assert_eq!(first.remark_count(), 0, "{name}");
+        assert_eq!(
+            first.audit_findings(),
+            format!("{counted} incomplete=0"),
+            "{name}"
+        );
+        assert_eq!(first.overruled_summary(10).len(), 2, "{name}");
+
+        // Not approved: a change is reviewed in full, not as an upgrade.
+        fs::write(dir.path().join("warn.sh"), "echo warning twice\n").unwrap();
+        let next = review_tree(&ScanConfig::new(dir.path()), &context);
+        assert!(
+            !next.notes.iter().any(|note| note.contains("approved")),
+            "{name}: {:?}",
+            next.notes
+        );
+    }
+}
+
+#[test]
+fn remark_classes_are_the_classes_whose_profile_shows_remarks() {
+    let all = SourceClass::ALL;
+    let user_level: Vec<SourceClass> = all
+        .iter()
+        .copied()
+        .filter(|class| !class.is_privileged())
+        .collect();
+    let with = |system: Option<Profile>, user: Option<Profile>| {
+        Settings::from_parts(
+            PartialConfig {
+                profile: system,
+                ..PartialConfig::default()
+            },
+            PartialConfig {
+                profile: user,
+                ..PartialConfig::default()
+            },
+        )
+    };
+    let strict = Some(Profile::Strict);
+    let standard = Some(Profile::Standard);
+
+    assert_eq!(remark_classes(&default_settings(), all), all);
+    assert_eq!(
+        remark_classes(&with(Some(Profile::LocalOnly), None), all),
+        all
+    );
+    assert!(remark_classes(&with(strict, None), all).is_empty());
+    // A stricter profile of the user's holds for the pacman classes too.
+    assert!(remark_classes(&with(standard, strict), all).is_empty());
+    // A looser one does not loosen them.
+    assert_eq!(remark_classes(&with(strict, standard), all), user_level);
+    // `--profile strict` for one run.
+    assert!(
+        remark_classes(
+            &default_settings().with_profile(Profile::Strict),
+            &user_level
+        )
+        .is_empty()
+    );
 }

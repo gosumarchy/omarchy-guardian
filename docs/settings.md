@@ -32,7 +32,7 @@ profile for your own sources and for pacman alike:
 | Level | Profile | What it does |
 | --- | --- | --- |
 | Balanced | `standard` | AI review for everything; required for AUR builds, themes, plugins, third-party and local packages, your scans and the sweep. For official packages an unavailable AI or a local-rule finding only warns |
-| Maximum | `strict` | AI review for everything; any finding blocks |
+| Maximum | `strict` | AI review for everything; any finding blocks, the AI's low remarks beside a clear verdict included |
 | Private | `local-only` | no AI: no source is sent to an AI provider; you confirm installs of your own sources (AUR builds, themes, plugins, scans) |
 
 Under `local-only` two lookups still go out: package names and versions from
@@ -172,6 +172,15 @@ A profile is a named preset for every knob (`ai`, `on_findings`,
 | `standard` (default) | `ai = optional`, `thinking = low`, `on_findings = warn`, `on_ai_suspicious = block` | `ai = required`, `thinking = high`, `on_findings = block`, `on_ai_suspicious = block` |
 | `strict` | `ai = required`, `thinking = medium`, `on_findings = block`, `on_ai_suspicious = block` | `ai = required`, `thinking = max`, `on_findings = block`, `on_ai_suspicious = block` |
 | `local-only` | `ai = off`, `on_findings = warn` | `ai = off`, `on_findings = block`, plus `confirm = true` for user-level classes |
+
+One thing differs between the profiles that no knob sets: what the low
+findings of a `clear` AI verdict are. Under `standard` and `local-only` they
+are remarks, shown in the report and deciding nothing; under `strict` they are
+findings and follow `on_ai_suspicious`. No settings file can change this for a
+class, and for the pacman classes the stricter of the system's profile and
+your own holds. `config show` prints it per class as `low AI remarks`
+(`shown` or `findings`). See
+[What the reviewer's reply decides](review.md#what-the-reviewers-reply-decides).
 
 `cache` and `diff` are `on` for user-level classes (`diff` is `off` under
 `strict`) and always `off` for the pacman classes, where setting them is a
@@ -316,7 +325,8 @@ are listed under [How the reviewer is run](review.md#how-the-reviewer-is-run).
   system file.
 - `omarchy-guardian config show [--class NAME]`: the effective policy per class,
   each value tagged `profile`, `system` or `user`, plus any ignored user
-  values and why. While a settings file is broken, the classes it stops are
+  values and why. It also prints what the profile makes of low AI remarks,
+  which is no setting. While a settings file is broken, the classes it stops are
   marked `NOT IN FORCE`.
 - `omarchy-guardian config check`: validates both files and the system file's
   ownership; exit 0 valid, 2 invalid.
@@ -337,7 +347,7 @@ plugin handlers pass `--class theme` and `--class plugin`.
 
 | Decision | Exit | When |
 | --- | --- | --- |
-| `CLEAR` | 0 | nothing found, review complete |
+| `CLEAR` | 0 | nothing found, review complete; remarks of the AI beside a clear verdict do not change it (under `strict` they are findings) |
 | `WARNED` | 0 | only findings whose policy is `warn`, the AI review unavailable under `ai = optional`, or a skipped tool directory |
 | `LIMITED REVIEW` | 0 | nothing reviewable (a scriptlet-free pacman transaction); `guard` and `sandbox`, which start nothing then, exit 2 |
 | `HIGH RISK` / `REVIEW REQUIRED` | 1 | any finding whose policy is `block` |

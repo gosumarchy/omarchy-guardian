@@ -79,8 +79,10 @@ plugins, and reviews what would run on install **before any of it runs**:
   then reads the code with every tool switched off and must echo a one-time
   nonce given after the code. The code can still try to talk the reviewer into
   a clean verdict, which is one reason the local rules always run too and a
-  clear result is not a guarantee. See [Review](docs/review.md) and [Local
-  rules](docs/local-rules.md).
+  clear result is not a guarantee. What the reviewer notes at low severity
+  beside a clear verdict (code quality, not harm) is shown as remarks and does
+  not block, except under `strict`, where every finding does. See
+  [Review](docs/review.md) and [Local rules](docs/local-rules.md).
 - **Pacman packages.** For the exact archives being installed, Guardian
   reviews the install scriptlets, the files that run or grant privileges on
   their own (hooks, units, sudoers and the like), and the package's text files

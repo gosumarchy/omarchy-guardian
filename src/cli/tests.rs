@@ -21,7 +21,7 @@ use crate::engine::store::Store;
 use crate::permit::Standing;
 use crate::report::{Blocked, Decision};
 use crate::scan::ScanConfig;
-use crate::test_support::{TempDir, mock_opencode};
+use crate::test_support::{TempDir, mock_opencode, mock_opencode_findings};
 use crate::tools::OpenCode;
 
 fn args(values: &[&str]) -> Vec<OsString> {
@@ -847,4 +847,105 @@ fn forget_removes_baselines() {
     );
     assert!(!record("other").exists());
     assert_eq!(forget_command(&Forget::All, None), ExitCode::from(2));
+}
+
+#[test]
+fn remarks_of_a_clear_review_stop_no_gate_and_are_findings_under_strict() {
+    let dir = TempDir::new("gate-remarks");
+    let bin = TempDir::new("gate-remarks-bin");
+    let state = private("gate-remarks-state");
+    fs::write(dir.path().join("install.sh"), "echo installing\n").unwrap();
+    let opencode = OpenCode::At(mock_opencode_findings(
+        bin.path(),
+        "clear",
+        &[
+            ("low", "install.sh", "Download without certificate checks"),
+            ("low", "install.sh", "Unquoted command substitution"),
+        ],
+    ));
+    let target = Target {
+        class: SourceClass::Theme,
+        state_root: Some(state.path().to_path_buf()),
+        ..target(&dir)
+    };
+    // `guard`: the exit code, whether the command started, what was
+    // asked, and the audit entry.
+    let guarded = |settings: &Settings| {
+        audit::taken();
+        let mut launched = false;
+        let mut confirm = Scripted(Some(false), Vec::new());
+        let status = guard_command(
+            &target,
+            &args(&["true"]),
+            settings,
+            &opencode,
+            &mut confirm,
+            &mut |_| {
+                launched = true;
+                ExitCode::from(7)
+            },
+        );
+        let mut entries = audit::taken();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        (status, launched, confirm.1, entries.remove(0))
+    };
+
+    // Standard, and a class told to ask: remarks are no reason to.
+    let asking = PartialConfig {
+        classes: vec![(
+            SourceClass::Theme,
+            PartialPolicy {
+                confirm: Some(true),
+                ..PartialPolicy::default()
+            },
+        )],
+        ..PartialConfig::default()
+    };
+    let standard = Settings::from_parts(PartialConfig::default(), asking);
+    let (status, launched, asked, entry) = guarded(&standard);
+    assert_eq!(status, ExitCode::from(7));
+    assert!(launched);
+    assert!(asked.is_empty(), "{asked:?}");
+    for expected in [
+        "GUARDIAN_DECISION=CLEAR",
+        "GUARDIAN_EXIT=0",
+        "GUARDIAN_FINDINGS=high=0 medium=0 low=0 incomplete=0 remarks=2",
+        "clear=1 suspicious=0",
+    ] {
+        assert!(entry.contains(expected), "{expected}\n{entry}");
+    }
+    assert!(!entry.contains("GUARDIAN_OFFERED"), "{entry}");
+
+    // A scan of it ends with success, and nothing is offered.
+    audit::taken();
+    let verdict = review_and_decide(
+        &target,
+        &standard,
+        &opencode,
+        None,
+        &[],
+        Gate::Scan,
+        Some(&|report| tree_content(Gate::Scan, &target, report)),
+    );
+    assert_eq!(verdict.decision, Decision::Clear);
+    assert_eq!(verdict.decision.exit_status(), 0);
+    assert_eq!(verdict.standing, Standing::None);
+    assert_eq!(super::gate::passed(&verdict), "review clear");
+    assert!(audit::taken()[0].contains("GUARDIAN_EXIT=0"));
+
+    // Strict: the same reply is two alerts and the command does not
+    // start, as before (strict offers no permit unless the system file
+    // allows them there).
+    let strict = default_settings().with_profile(Profile::Strict);
+    let (status, launched, _, entry) = guarded(&strict);
+    assert_eq!(status, ExitCode::from(1));
+    assert!(!launched);
+    for expected in [
+        "GUARDIAN_DECISION=REVIEW REQUIRED",
+        "GUARDIAN_EXIT=1",
+        "GUARDIAN_FINDINGS=high=0 medium=0 low=2 incomplete=0",
+    ] {
+        assert!(entry.contains(expected), "{expected}\n{entry}");
+    }
+    assert!(!entry.contains("remarks="), "{entry}");
 }

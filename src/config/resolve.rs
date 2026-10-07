@@ -209,8 +209,12 @@ pub(super) fn resolve(class: SourceClass, layers: &Layers<'_>) -> Resolved {
         resolved.apply(layers.system, Origin::System);
 
         if let Some(profile) = layers.user_profile {
-            let profile_values = as_partial(&builtin(profile, class));
+            let stricter = builtin(profile, class);
+            let profile_values = as_partial(&stricter);
             resolved.tighten(&profile_values, &format!("user profile {}", profile.name()));
+            // No knob, so no file sets it: it follows the stricter of the
+            // two profiles, like the knobs above.
+            resolved.policy.ai_remarks = resolved.policy.ai_remarks.max(stricter.ai_remarks);
         }
         resolved.tighten(layers.user, "user file");
 
@@ -388,6 +392,51 @@ mod tests {
             builtin(Profile::Strict, SourceClass::Official)
         );
         assert!(!looser.ignored.is_empty());
+    }
+
+    #[test]
+    fn low_ai_remarks_follow_the_profile_and_no_layer_of_values() {
+        use crate::config::model::Remarks::{Findings, Shown};
+        use Profile::{LocalOnly, Standard, Strict};
+
+        // Every knob a file can set, at its loosest, in both files.
+        let loosest = PartialPolicy {
+            ai: Some(AiRequirement::Off),
+            on_findings: Some(Action::Warn),
+            on_ai_suspicious: Some(Action::Warn),
+            thinking: Some(Thinking::Minimal),
+            confirm: Some(false),
+            cache: Some(Toggle::On),
+            diff: Some(Toggle::On),
+            ..PartialPolicy::default()
+        };
+        let empty = PartialPolicy::default();
+        for values in [&empty, &loosest] {
+            for class in SourceClass::ALL.iter().copied() {
+                for (system, user, user_level, privileged) in [
+                    (Standard, None, Shown, Shown),
+                    (Strict, None, Findings, Findings),
+                    (LocalOnly, None, Shown, Shown),
+                    // A user-level class takes the user's profile; a
+                    // pacman class the stricter of the two.
+                    (Standard, Some(Strict), Findings, Findings),
+                    (Strict, Some(Standard), Shown, Findings),
+                    (Strict, Some(LocalOnly), Shown, Findings),
+                    (LocalOnly, Some(Strict), Findings, Findings),
+                ] {
+                    let resolved = resolve(class, &layers(system, values, user, values));
+                    assert_eq!(
+                        resolved.policy.ai_remarks,
+                        if class.is_privileged() {
+                            privileged
+                        } else {
+                            user_level
+                        },
+                        "{class:?} system {system:?} user {user:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// Spec §6: for privileged classes the result is never looser than the

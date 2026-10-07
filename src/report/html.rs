@@ -8,6 +8,7 @@
 use std::fmt::Write as _;
 use std::sync::{Mutex, PoisonError};
 
+use super::terminal::REMARKS_NOTE;
 use super::{AgentOutcome, Blocked, Decision, Report, Severity, recommendation};
 use crate::agent::Status;
 use crate::notify::Ran;
@@ -193,19 +194,23 @@ fn verdict_word(report: &Report, decision: Decision) -> &'static str {
     }
 }
 
-fn section(report: &Report, decision: Decision) -> String {
+pub(super) fn section(report: &Report, decision: Decision) -> String {
     let mut html = String::new();
     let (_, color) = report.headline(decision);
     let counts = report.counts();
     let _ = write!(
         html,
-        r#"<section><hr><div class="row"><span class="subject">{subject}</span><span class="word {tone}">{word}</span></div><div class="meta">{high} HIGH · {medium} MEDIUM · {low} LOW · {files} TEXT FILES REVIEWED · {binary} BINARY HASHED</div>"#,
+        r#"<section><hr><div class="row"><span class="subject">{subject}</span><span class="word {tone}">{word}</span></div><div class="meta">{high} HIGH · {medium} MEDIUM · {low} LOW{remarks} · {files} TEXT FILES REVIEWED · {binary} BINARY HASHED</div>"#,
         subject = esc(&report.subject),
         tone = tone(color),
         word = verdict_word(report, decision),
         high = counts.high,
         medium = counts.medium,
         low = counts.low,
+        remarks = match report.remark_count() {
+            0 => String::new(),
+            remarks => format!(" · {remarks} AI REMARK(S)"),
+        },
         files = report.text_files_reviewed,
         binary = report.snapshot.count(FileKind::Binary),
     );
@@ -262,44 +267,46 @@ fn ai_reviews(html: &mut String, report: &Report) {
 }
 
 fn findings(html: &mut String, report: &Report) {
-    let ai: Vec<_> = report
-        .agent_runs
-        .iter()
-        .filter_map(|run| match &run.outcome {
-            AgentOutcome::Reviewed(review) => Some(review.findings.iter()),
-            AgentOutcome::Unavailable(_) => None,
-        })
-        .flatten()
-        .collect();
-    if report.findings.is_empty() && ai.is_empty() {
-        return;
+    let ai_cards = |html: &mut String, remarks: bool| {
+        for finding in report.agent_findings(remarks) {
+            let location = finding.line.map_or_else(
+                || finding.file.clone(),
+                |line| format!("{}:{line}", finding.file),
+            );
+            finding_card(
+                html,
+                finding.severity,
+                if remarks { "AI remark" } else { "AI" },
+                &finding.title,
+                &location,
+                &finding.reason,
+                None,
+            );
+        }
+    };
+    if !report.findings.is_empty() || report.agent_findings(false).next().is_some() {
+        html.push_str("<h3>Findings</h3>");
+        ai_cards(html, false);
+        for finding in &report.findings {
+            finding_card(
+                html,
+                finding.rule.severity(),
+                "Local rule",
+                finding.rule.name(),
+                &format!("{}:{}", finding.path, finding.line),
+                finding.rule.description(),
+                Some(&finding.excerpt).filter(|excerpt| !excerpt.is_empty()),
+            );
+        }
     }
-    html.push_str("<h3>Findings</h3>");
-    for finding in &ai {
-        let location = finding.line.map_or_else(
-            || finding.file.clone(),
-            |line| format!("{}:{line}", finding.file),
-        );
-        finding_card(
+    // The remarks of a clear verdict are apart, as on the terminal.
+    if report.remark_count() > 0 {
+        let _ = write!(
             html,
-            finding.severity,
-            "AI",
-            &finding.title,
-            &location,
-            &finding.reason,
-            None,
+            r#"<h3>AI remarks</h3><p class="dim">{}</p>"#,
+            esc(REMARKS_NOTE)
         );
-    }
-    for finding in &report.findings {
-        finding_card(
-            html,
-            finding.rule.severity(),
-            "Local rule",
-            finding.rule.name(),
-            &format!("{}:{}", finding.path, finding.line),
-            finding.rule.description(),
-            Some(&finding.excerpt).filter(|excerpt| !excerpt.is_empty()),
-        );
+        ai_cards(html, true);
     }
 }
 

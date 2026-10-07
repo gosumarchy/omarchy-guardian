@@ -461,3 +461,5 @@ fn colors_can_be_disabled() {
         "\x1b[32mCLEAR\x1b[0m"
     );
 }
+
+mod remarks;

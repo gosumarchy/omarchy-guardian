@@ -46,6 +46,8 @@ and `journalctl` have them in full).
   no permit offered.
 - The decision's name and exit code, the alert counts by severity, the ids of
   the local rules that matched, how many reasons left the review incomplete,
+  how many remarks the AI left beside a clear verdict when it left any
+  (`remarks=N`; they are not among the alerts),
   the AI review in numbers (model and thinking level, calls, how many were
   clear, suspicious, inconclusive, unavailable or from the cache), the
   protection level and Guardian's version.

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fmt::{self, Write as _};
 use std::process::ExitCode;
 
-use crate::agent::{AgentReview, SourceFile, Status};
+use crate::agent::{AgentFinding, AgentReview, SourceFile, Status};
 use crate::config::model::{Action, AiRequirement, Policy, SourceClass};
 use crate::deps::Inventory;
 use crate::error::Error;
@@ -290,6 +290,11 @@ pub(crate) struct Report {
     /// are matched through `class_of`, so `file_classes` must be set before
     /// a file is analyzed.
     pub(crate) ai_off_classes: Vec<SourceClass>,
+    /// Classes whose policy shows the low findings of a clear AI verdict as
+    /// remarks (`Policy::ai_remarks`, see `review::remark_classes`). Empty
+    /// unless whoever builds the report sets it: every AI finding is then
+    /// a finding, as the system sweep has it in every profile.
+    pub(crate) remark_classes: Vec<SourceClass>,
     pub(crate) dependencies: Inventory,
     pub(crate) audit: Option<Audit>,
     /// Class of every file not listed in `file_classes`.
@@ -400,8 +405,43 @@ impl Report {
         classes
     }
 
+    /// Whether the findings of `run` are remarks: its verdict is clear,
+    /// every one of its findings is graded low, and every class involved
+    /// (the run's files and each file a finding names, wherever it is)
+    /// shows such findings as remarks. The reviewer then says that nothing
+    /// here means harm, and what it adds is shown and decides nothing. One
+    /// finding graded higher, or a severity that could not be read (which
+    /// counts as high, see `agent::reply`), and all of the run's findings
+    /// are findings.
+    pub(crate) fn is_remarks(&self, run: &AgentRun) -> bool {
+        let AgentOutcome::Reviewed(review) = &run.outcome else {
+            return false;
+        };
+        review.status == Status::Clear
+            && !review.findings.is_empty()
+            && review
+                .findings
+                .iter()
+                .all(|finding| finding.severity == Severity::Low)
+            && self
+                .run_classes(run)
+                .into_iter()
+                .chain(
+                    review
+                        .findings
+                        .iter()
+                        .map(|finding| self.class_of(&finding.file)),
+                )
+                .all(|class| self.remark_classes.contains(&class))
+    }
+
+    /// How many remarks the AI review left (see `is_remarks`).
+    pub(crate) fn remark_count(&self) -> usize {
+        self.agent_findings(true).count()
+    }
+
     /// Spec §9. Precedence: incomplete, AI unavailable, findings, warned,
-    /// then limited or clear.
+    /// then limited or clear. Remarks (see `is_remarks`) are no findings.
     pub(crate) fn decide(&self, policy_for: &dyn Fn(SourceClass) -> Policy) -> Decision {
         if !self.gaps.is_empty() {
             return Decision::Blocked(Blocked::Incomplete);
@@ -423,6 +463,7 @@ impl Report {
                 AgentOutcome::Reviewed(review) if review.status == Status::Inconclusive => {
                     return Decision::Blocked(Blocked::Incomplete);
                 }
+                AgentOutcome::Reviewed(_) if self.is_remarks(run) => {}
                 AgentOutcome::Reviewed(review) => {
                     let mut flagged: Vec<SourceClass> = review
                         .findings
@@ -499,8 +540,10 @@ impl Report {
     }
 
     /// What was found, for the audit trail: the alert counts, the local
-    /// rules that matched and how many reasons left the review incomplete.
-    /// Numbers and rule ids only: nothing of the reviewed text.
+    /// rules that matched and how many reasons left the review incomplete,
+    /// and how many remarks the AI left, when it left any (they are not
+    /// among the alerts). Numbers and rule ids only: nothing of the
+    /// reviewed text.
     pub(crate) fn audit_findings(&self) -> String {
         let counts = self.counts();
         let mut text = format!(
@@ -510,6 +553,10 @@ impl Report {
             counts.low,
             self.gaps.len()
         );
+        let remarks = self.remark_count();
+        if remarks > 0 {
+            let _ = write!(text, " remarks={remarks}");
+        }
         let mut rules: Vec<&str> = self
             .findings
             .iter()
@@ -557,7 +604,8 @@ impl Report {
     /// by where they are. Shown to the user before they permit. The
     /// reasons the review is incomplete come first, so that the limit cuts
     /// alerts before it cuts them; the chunks never sent after one failed
-    /// are one line together.
+    /// are one line together. Remarks are not among them: they block
+    /// nothing, so a permit overrules nothing about them.
     pub(crate) fn overruled_summary(&self, limit: usize) -> Vec<String> {
         let mut lines: Vec<String> = self
             .gaps
@@ -576,6 +624,7 @@ impl Report {
         let mut not_attempted = 0_usize;
         for run in &self.agent_runs {
             match &run.outcome {
+                AgentOutcome::Reviewed(_) if self.is_remarks(run) => {}
                 AgentOutcome::Reviewed(review) => {
                     lines.extend(review.findings.iter().map(|finding| {
                         format!(
@@ -616,17 +665,27 @@ impl Report {
         lines
     }
 
-    /// Dependency advisories without a known severity count as medium.
+    /// The AI's findings in report order: those that are remarks (see
+    /// `is_remarks`), or those that are not.
+    fn agent_findings(&self, remarks: bool) -> impl Iterator<Item = &AgentFinding> {
+        self.agent_runs
+            .iter()
+            .filter(move |run| self.is_remarks(run) == remarks)
+            .flat_map(|run| match &run.outcome {
+                AgentOutcome::Reviewed(review) => review.findings.as_slice(),
+                AgentOutcome::Unavailable(_) => &[],
+            })
+    }
+
+    /// The alerts by severity. Dependency advisories without a known
+    /// severity count as medium; the AI's remarks are counted apart (see
+    /// `remark_count`).
     fn counts(&self) -> Counts {
         let mut counts = Counts::default();
         for finding in &self.findings {
             counts.add(finding.rule.severity());
         }
-        let agent_findings = self.agent_runs.iter().flat_map(|run| match &run.outcome {
-            AgentOutcome::Reviewed(review) => review.findings.as_slice(),
-            AgentOutcome::Unavailable(_) => &[],
-        });
-        for finding in agent_findings {
+        for finding in self.agent_findings(false) {
             counts.add(finding.severity);
         }
         for advisory in self.audit.iter().flat_map(|audit| &audit.advisories) {

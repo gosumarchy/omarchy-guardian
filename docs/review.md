@@ -11,6 +11,7 @@ reviewed, and the review memory. The local checks have a page of their own:
 - [Two reviews](#two-reviews)
 - [Fail closed](#fail-closed)
 - [What is checked](#what-is-checked)
+- [What the reviewer's reply decides](#what-the-reviewers-reply-decides)
 - [What is read, and what makes a review incomplete](#what-is-read-and-what-makes-a-review-incomplete)
 - [How the reviewer is run](#how-the-reviewer-is-run)
 - [How the review scales](#how-the-review-scales)
@@ -71,6 +72,50 @@ broken system file stops them all.
   sent) are withheld and make the review incomplete.
 - **Integrity:** a SHA-256 manifest of every scanned file. `guard` and
   `sandbox` re-hash immediately before running the command.
+
+## What the reviewer's reply decides
+
+Each chunk's reply carries a verdict (`clear`, `suspicious` or `inconclusive`)
+and a list of findings, each graded `high`, `medium` or `low`:
+
+- `inconclusive`, or a reply Guardian cannot take as a review, leaves the
+  review `INCOMPLETE`.
+- `suspicious`, with or without findings, follows `on_ai_suspicious`, which
+  is `block` in every profile. So does any finding graded `medium` or `high`,
+  whatever the verdict beside it.
+- A `clear` verdict whose findings are all graded `low` says that nothing in
+  the chunk means harm to you, and adds what the reviewer noticed all the
+  same: a download with `curl -k` in upstream code, an unquoted variable in a
+  message. Under `standard` and `local-only` these are **remarks**. The report
+  lists them in full under "AI remarks" and counts them apart from the alerts,
+  and they decide nothing: the decision is what it would be without them
+  (`CLEAR`, or what the local rules, advisories and gaps make it), the install
+  goes ahead, and no notification is sent and no permit offered on their
+  account. Under `strict` they are findings like any other and follow
+  `on_ai_suspicious`.
+
+One finding of a chunk graded above `low`, or one whose severity Guardian
+cannot read (it counts as high), and every finding of that chunk is a
+finding. Each chunk is judged on its own: the remarks of one take nothing
+from a `suspicious` verdict or a higher finding in another, which block as
+they always did. Where a pacman transaction holds packages of several
+classes, a chunk's low findings are remarks only when every class it touches
+(its files, and each file a finding names) shows them as remarks.
+
+What remarks are comes with the profile and is not a setting: no settings
+file can change it for a class. For the pacman classes the stricter of the
+system's profile and your own holds, as for the other values. `config show`
+prints it as `low AI remarks`.
+
+A review that is clear with remarks is remembered like any clear review (see
+[Review memory](#review-memory)): the verdict is cached with its remarks, so
+the same content shows them again from the cache, and the source becomes the
+approved baseline. The audit trail records how many there were
+(`remarks=N`).
+
+The [system sweep](system-sweep.md) is not a gate and lists what there is to
+look at: there every AI finding on an item is a finding in every profile, the
+low ones of a clear verdict included.
 
 ## What is read, and what makes a review incomplete
 
@@ -215,8 +260,8 @@ other chunks (the rule, the file and the line, not the text), and the report
 lists the files that name a file sent in another chunk. That is the limit of
 it: a payload split over two files that land in different chunks is seen by no
 single request, and Guardian does not ask the model to report every call into
-another chunk, because any AI finding blocks and large honest sources are full
-of such calls. A file is charged what it takes in the request (a newline or a
+another chunk, because an AI finding blocks (under `strict` even a low one
+beside a clear verdict) and large honest sources are full of such calls. A file is charged what it takes in the request (a newline or a
 quote takes two bytes there, a control or invisible character six and one
 outside the basic plane twelve, a few percent more than the file's size for
 ordinary code). A file larger than a chunk is split on line boundaries, each
@@ -251,7 +296,8 @@ the memory was not used and the review runs in full:
   an old verdict, whatever its version number says.
 - **Diff review of upgrades.** A review becomes the approved baseline of that
   source when every chunk was `clear`, there were no gaps, and the decision is
-  `CLEAR`. The next review of the same source is then sent as follows: changed
+  `CLEAR` (remarks beside a clear verdict do not stand in the way where the
+  profile shows them as remarks). The next review of the same source is then sent as follows: changed
   files whole when they are small (up to 48 KiB: what a changed line switches
   on may be anywhere in the file), larger changed files whole too while
   together they fit half a request, and the rest as unified diffs with twenty

@@ -1060,6 +1060,101 @@ mod tests {
         assert_eq!(stale, ["/etc/b", "/etc/c", "/etc/gone"]);
     }
 
+    /// The low findings of a clear AI review are findings in a sweep,
+    /// whatever the profile: listed, counted, told and remembered with the
+    /// item, and never recorded as an approved version.
+    #[test]
+    fn a_low_remark_of_a_clear_review_is_a_finding_of_the_sweep_in_every_profile() {
+        use crate::config::Settings;
+        use crate::config::file::PartialConfig;
+        use crate::config::model::{Named, Profile, SourceClass};
+        use crate::report::{Blocked, Decision};
+        use crate::review::ReviewContext;
+        use crate::test_support::{TempDir, mock_opencode_findings};
+        use crate::tools::OpenCode;
+
+        const HOME: Option<&str> = Some("home/u");
+        let bin = TempDir::new("sweep-remarks-bin");
+        let state = TempDir::new("sweep-remarks-state");
+        let opencode = OpenCode::At(mock_opencode_findings(
+            bin.path(),
+            "clear",
+            &[
+                ("low", "~/.bashrc", "Unquoted variable"),
+                ("low", "~/.bashrc", "Download without certificate checks"),
+            ],
+        ));
+        let collection = Collection {
+            items: vec![item(
+                "home/u/.bashrc",
+                Category::Shell,
+                "export EDITOR=vi\n",
+            )],
+            truncated: Vec::new(),
+            notes: Vec::new(),
+            root_news: None,
+        };
+        let label = |item: &Item| super::judge::label(item, HOME);
+        for profile in [Profile::Standard, Profile::Strict] {
+            let settings = Settings::from_parts(PartialConfig::default(), PartialConfig::default())
+                .with_profile(profile);
+            let root = state.path().join(profile.name());
+            let context = ReviewContext {
+                settings: &settings,
+                class: SourceClass::System,
+                opencode: &opencode,
+                units: &[],
+                state_root: Some(&root),
+                context: &[],
+            };
+            for again in [false, true] {
+                let report = super::judge::judge(
+                    &collection,
+                    HOME,
+                    &context,
+                    &std::collections::HashSet::new(),
+                );
+                let case = format!("{profile:?} again={again}: {:?}", report.notes);
+                assert!(report.remark_classes.is_empty(), "{case}");
+                assert_eq!(report.remark_count(), 0, "{case}");
+
+                // How the sweep ends: with findings, exit 1.
+                let decision = report.decide(&|class| settings.policy(class));
+                assert_eq!(decision, Decision::Blocked(Blocked::Findings), "{case}");
+                assert_eq!(decision.exit_status(), 1, "{case}");
+                assert_eq!(report.decision_name(decision), "REVIEW REQUIRED");
+                assert_eq!(
+                    report.audit_findings(),
+                    "high=0 medium=0 low=2 incomplete=0",
+                    "{case}"
+                );
+
+                // What it remembers of the item, and what it lists.
+                let current = super::remembered(&collection, &report, None, label);
+                assert!(current["~/.bashrc"].ends_with(state::FLAGGED), "{case}");
+                let json =
+                    super::output::json(&collection, &report, decision, HOME, &[]).to_string();
+                for expected in [
+                    r#""decision":"findings""#,
+                    r#""severity":"low","title":"Unquoted variable""#,
+                    "Download without certificate checks",
+                ] {
+                    assert!(json.contains(expected), "{expected}\n{json}");
+                }
+
+                // Not approved: the next sweep asks the cache for the same
+                // verdict and lists the same findings, where an approved
+                // version would be passed without a word.
+                assert_eq!(report.agent_runs.len(), 1, "{case}");
+                assert_eq!(report.agent_runs[0].cached.is_some(), again, "{case}");
+                assert!(
+                    !report.notes.iter().any(|note| note.contains("approved")),
+                    "{case}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_key_or_member_that_was_not_there_before_is_news_once_such_things_were_looked_at() {
         let label = |item: &Item| format!("/{}", item.path);

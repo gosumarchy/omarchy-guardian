@@ -305,7 +305,12 @@ does not name stays packed and is named as not reviewed, up to five of them.
 
 The review looks for malicious intent in what runs during the build and in the
 program's own code, not bugs or vulnerabilities, and is told whether the
-recipe runs the test suite (`check()`).
+recipe runs the test suite (`check()`). What the reviewer notes about code
+quality all the same, graded low beside a clear verdict (a download with
+`curl -k`, an unquoted variable), is listed as remarks and does not stop the
+build under `standard`; under `strict` such findings block like any other (see
+[What the reviewer's reply decides](review.md#what-the-reviewers-reply-decides)).
+The same holds for the recipe's review in step 2.
 
 The upstream review is remembered as `aur-src:<package>`, so a new version is
 reviewed as a diff, unless a binary file in the unpacked sources was added,

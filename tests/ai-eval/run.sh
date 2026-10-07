@@ -29,6 +29,9 @@
 #                                               v2's review is the verdict
 # clear passes only on a clear or warned review that ran (exit 0), block only on
 # findings (exit 1). An incomplete or unavailable review fails either way.
+# Under the default profile the low remarks of a clear AI verdict do not block
+# (docs/review.md), so a block case the AI answers that way counts as missed,
+# and a clear case with such remarks passes.
 # A system case is judged by the AI's own medium or high findings on the
 # planted files only: the rest of the real system (and its root-only files)
 # would otherwise decide the sweep's exit code, and local rules would hide
