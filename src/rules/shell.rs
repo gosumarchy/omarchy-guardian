@@ -315,13 +315,23 @@ const WRAPPERS: &[&str] = &[
 /// reads it here, so they agree on what a wrapper is.
 pub(super) fn program_word<'a>(words: &mut impl Iterator<Item = &'a str>) -> Option<&'a str> {
     let mut elevated = false;
+    // The command of a substitution that an assignment holds whole
+    // (`x=$(date)`): the program, unless one follows the assignment.
+    let mut held: Option<&'a str> = None;
+    // What stands after the opening of one that goes on (`x=$(sudo`), read
+    // next as the word it is.
+    let mut opened: Option<&'a str> = None;
     loop {
-        let word = words.next()?;
+        let Some(word) = opened.take().or_else(|| words.next()) else {
+            return held;
+        };
         let bare = word.trim_start_matches(['(', '{', '`']);
         let bare = bare.strip_prefix("$(").unwrap_or(bare);
         // `sudo -u build cmd`: the user is not the program.
         if elevated && matches!(bare, "-u" | "-g" | "--user" | "--group") {
-            words.next()?;
+            if words.next().is_none() {
+                return held;
+            }
             continue;
         }
         elevated = elevated || matches!(bare, "sudo" | "doas" | "run0");
@@ -330,22 +340,25 @@ pub(super) fn program_word<'a>(words: &mut impl Iterator<Item = &'a str>) -> Opt
         }
         if bare == "timeout" {
             // `timeout 5s cmd`, `timeout --signal=9 10 cmd`.
-            let mut next = words.next()?;
-            while next.starts_with('-') {
-                next = words.next()?;
+            loop {
+                match words.next() {
+                    Some(next) if next.starts_with('-') => {}
+                    Some(_) => break,
+                    None => return held,
+                }
             }
             continue;
         }
         // `VAR=x cmd`: an assignment before the program.
         if bare.contains('=') && !bare.starts_with(['/', '.', '$', '=']) {
-            // `x=$(cmd arg)`: the value is a command run here, and what
-            // follows is given to it; nothing after it is a program run
-            // with the variable set.
-            if let Some(inner) = substituted(bare) {
-                if inner.is_empty() {
-                    continue;
-                }
-                return Some(inner);
+            match substituted(bare) {
+                // `x=$(date) sh f`: the program follows; the command in
+                // the substitution is it only when none does.
+                Some(Substituted::Whole(command)) => held = held.or(command),
+                // `x=$(sha256sum f`: the value is a command that goes on,
+                // and what follows is given to it.
+                Some(Substituted::Open(rest)) => opened = (!rest.is_empty()).then_some(rest),
+                None => {}
             }
             continue;
         }
@@ -353,16 +366,44 @@ pub(super) fn program_word<'a>(words: &mut impl Iterator<Item = &'a str>) -> Opt
     }
 }
 
-/// The start of the command an assignment's value runs (`x=$(cmd`, or
-/// with a backtick): what stands after the opening, which is empty when
-/// the command is the next word.
-fn substituted(assignment: &str) -> Option<&str> {
+/// The command an assignment's value runs.
+enum Substituted<'a> {
+    /// The substitution closes within the word (`x=$(date)`,
+    /// `PATH=$(pwd)/bin`): its command, if it names one.
+    Whole(Option<&'a str>),
+    /// It goes on in the words after (`x=$(cmd`): what stands after its
+    /// opening, which is empty when the command is the next word.
+    Open(&'a str),
+}
+
+/// Reads the substitution an assignment's value begins with (`x=$(cmd`, or
+/// with a backtick). `$((` is arithmetic, which runs nothing.
+fn substituted(assignment: &str) -> Option<Substituted<'_>> {
     let (_, value) = assignment.split_once('=')?;
-    let inner = value
-        .strip_prefix("$(")
-        .or_else(|| value.strip_prefix('`'))?;
-    // `$((` is arithmetic, which runs nothing.
-    (!inner.starts_with('(')).then_some(inner)
+    let (inner, backtick) = match value.strip_prefix("$(") {
+        Some(inner) => (inner, false),
+        None => (value.strip_prefix('`')?, true),
+    };
+    if !backtick && inner.starts_with('(') {
+        return None;
+    }
+    let end = if backtick {
+        inner.find('`')
+    } else {
+        let mut depth = 1_usize;
+        inner.char_indices().find_map(|(at, character)| {
+            match character {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            (depth == 0).then_some(at)
+        })
+    };
+    Some(match end {
+        Some(end) => Substituted::Whole(inner[..end].split_whitespace().next()),
+        None => Substituted::Open(inner),
+    })
 }
 
 /// The command a statement, or one part of a pipeline, runs: past wrappers

