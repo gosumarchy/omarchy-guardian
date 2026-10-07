@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
-use super::{Drift, Extraction, State, binary_changes, identity};
+use super::{Drift, Extraction, Kept, State, binary_changes, identity};
 use crate::test_support::TempDir;
 
 fn map(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -78,9 +78,13 @@ fn binaries_and_extractions_round_trip() {
         cleanbuild: true,
         downloads: map(&[("demo.tar.gz", &"a".repeat(64))]),
         files: map(&[("src/demo/a.c", &"b".repeat(64)), ("src/x y", "")]),
+        unlisted: false,
     };
-    state.record_extraction(&extraction);
-    let read = state.extraction().unwrap();
+    assert_eq!(state.extraction(), Kept::Absent);
+    assert!(state.record_extraction(&extraction));
+    let Kept::Usable(read) = state.extraction() else {
+        panic!("a record");
+    };
     assert_eq!(read.srcdir, extraction.srcdir);
     assert_eq!(read.identity, extraction.identity);
     assert!(read.cleanbuild);
@@ -103,8 +107,11 @@ fn a_later_call_sees_what_changed_since_guardian_extracted() {
         cleanbuild: true,
         downloads: downloads.clone(),
         files: files.clone(),
+        unlisted: false,
     });
-    let extraction = state.extraction().unwrap();
+    let Kept::Usable(extraction) = state.extraction() else {
+        panic!("a record");
+    };
     // The build made the directory anew and left the files alone.
     assert_eq!(
         extraction.drift(Some("1:9:9"), &downloads, &files),

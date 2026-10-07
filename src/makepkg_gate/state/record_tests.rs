@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use super::super::{
     Configured, UpstreamStep, hold_against_extraction, recipe_functions, record_extraction,
 };
-use super::{Drift, Extraction, State, identity};
+use super::{Drift, Extraction, Kept, State, identity, short};
 use crate::aur;
 use crate::test_support::{Rng, TempDir};
 
@@ -40,11 +40,20 @@ fn odd_extraction() -> Extraction {
             ("src/caf\u{e9}/\u{1f600}", "size-1-2-3"),
             ("src/unhashed \\n", ""),
         ]),
+        unlisted: false,
+    }
+}
+
+/// The record `state` keeps, which must be one that can be used.
+pub(super) fn usable(state: &State) -> Extraction {
+    match state.extraction() {
+        Kept::Usable(extraction) => extraction,
+        other => panic!("no usable record: {other:?}"),
     }
 }
 
 /// The record as it was written before paths were kept as they are: the
-/// directory escaped once, each path twice.
+/// directory escaped once, each path twice, each hash kept short.
 fn old_text(extraction: &Extraction) -> String {
     let mut text = format!(
         "srcdir {}\nidentity {}\ncleanbuild {}\n",
@@ -54,7 +63,11 @@ fn old_text(extraction: &Extraction) -> String {
     );
     for (kind, entries) in [("D", &extraction.downloads), ("F", &extraction.files)] {
         for (path, digest) in entries {
-            let digest = if digest.is_empty() { "-" } else { digest };
+            let digest = if digest.is_empty() {
+                "-"
+            } else {
+                short(digest)
+            };
             let twice = path.escape_default().to_string();
             let _ = writeln!(text, "{kind} {digest} {}", twice.escape_default());
         }
@@ -78,7 +91,7 @@ fn a_record_with_odd_paths_reads_back_as_it_was() {
     let dir = TempDir::new("gate-record-odd");
     let state = State::open(Some(&dir.path().join("state")), "demo");
     state.record_extraction(&extraction);
-    let read = state.extraction().unwrap();
+    let read = usable(&state);
     assert_eq!(read, extraction);
     assert!(read.is_of(Path::new(&extraction.srcdir)));
     assert!(!read.is_of(Path::new("/home/jos\\u{e9}/build/src")));
@@ -110,16 +123,16 @@ fn a_record_with_odd_paths_reads_back_as_it_was() {
     );
 }
 
-struct Tree {
-    dir: TempDir,
-    build: PathBuf,
-    state: State,
+pub(super) struct Tree {
+    pub(super) dir: TempDir,
+    pub(super) build: PathBuf,
+    pub(super) state: State,
 }
 
 impl Tree {
     /// A build directory named `name` with one download linked into its
     /// sources and two source files.
-    fn new(label: &str, name: OsString, download: &str) -> Self {
+    pub(super) fn new(label: &str, name: OsString, download: &str) -> Self {
         let dir = TempDir::new(label);
         let build = dir.path().join(name);
         let src = build.join("src");
@@ -133,11 +146,11 @@ impl Tree {
         Self { dir, build, state }
     }
 
-    fn src(&self) -> PathBuf {
+    pub(super) fn src(&self) -> PathBuf {
         self.build.join("src")
     }
 
-    fn collected(&self) -> aur::Collected {
+    pub(super) fn collected(&self) -> aur::Collected {
         let roots = aur::Roots {
             build_dir: &self.build,
             srcdest: Some(&self.build),
@@ -149,7 +162,11 @@ impl Tree {
 const RECIPE: &str = "pkgname=demo\nbuild() { make; }\n";
 
 /// Runs `check` with the gate's step for `build`, called with `mirrored`.
-fn with_step<T>(build: &Tree, mirrored: &[&str], check: impl FnOnce(&UpstreamStep<'_>) -> T) -> T {
+pub(super) fn with_step<T>(
+    build: &Tree,
+    mirrored: &[&str],
+    check: impl FnOnce(&UpstreamStep<'_>) -> T,
+) -> T {
     let mirrored: Vec<OsString> = mirrored.iter().map(Into::into).collect();
     let functions = recipe_functions(&build.build, RECIPE);
     let configured = Configured::default();
@@ -190,7 +207,7 @@ fn the_gate_holds_a_build_under_an_odd_directory_against_its_record() {
 
     with_step(&build, &[], |step| {
         record_extraction(step, &src, &build.collected());
-        let record = step.state.extraction().unwrap();
+        let record = usable(step.state);
         assert!(record.is_of(&src));
         // The names are kept as they are (the hashes are kept short).
         assert!(record.downloads.keys().eq(seen.upstream().downloads.keys()));
@@ -217,15 +234,24 @@ fn the_gate_holds_a_build_under_an_odd_directory_against_its_record() {
             assert!(
                 refused
                     .unwrap_err()
+                    .message
                     .contains("did not extract the sources into the directory")
             );
+        } else {
+            // A filesystem that does not record when a directory was
+            // made: one directory cannot be told from another made
+            // later, so that check has nothing to go by, and the
+            // sources are as they were recorded just now.
+            assert_eq!(refused, Ok(Vec::new()));
         }
     });
     // A download that is not the one Guardian fetched.
     with_step(&build, &[], |step| {
         record_extraction(step, &src, &build.collected());
         fs::write(build.build.join(&download), b"\x1f\x8b\x08\0another").unwrap();
-        let refused = hold_against_extraction(step, &src, &mut build.collected()).unwrap_err();
+        let refused = hold_against_extraction(step, &src, &mut build.collected())
+            .unwrap_err()
+            .message;
         assert!(
             refused.contains("not the ones Guardian fetched and reviewed")
                 && refused.contains(&format!("{download:?}")),
@@ -246,7 +272,7 @@ fn a_name_that_is_not_text_is_never_taken_for_another() {
     assert_ne!(lossy, src);
     with_step(&build, &[], |step| {
         record_extraction(step, &src, &build.collected());
-        let record = step.state.extraction().unwrap();
+        let record = usable(step.state);
         assert_eq!(Path::new(&record.srcdir), lossy);
         assert!(!record.is_of(&src));
         assert!(!record.is_of(&lossy));
@@ -321,6 +347,7 @@ fn generated(rng: &mut Rng, pieces: &[&str]) -> Extraction {
         srcdir: rng.text(pieces, 20),
         identity: (!rng.chance(4)).then(|| format!("{}:{}:7", rng.below(99), rng.below(99))),
         cleanbuild: rng.chance(2),
+        unlisted: false,
     }
 }
 
@@ -388,7 +415,7 @@ fn a_broken_record_never_panics_and_reads_one_way_only() {
         }
         assert_eq!(
             text.lines().count(),
-            3 + parsed.downloads.len() + parsed.files.len(),
+            3 + usize::from(parsed.unlisted) + parsed.downloads.len() + parsed.files.len(),
             "{text:?}"
         );
     }
@@ -450,14 +477,14 @@ fn an_escape_the_record_does_not_write_is_rejected() {
         assert_eq!(Extraction::parse(bad), None, "{bad:?}");
     }
 
-    // On disk, such a record is no record: nothing in it is taken as
-    // what Guardian extracted.
+    // On disk, such a record is one that cannot be used: nothing in it is
+    // taken as what Guardian extracted, and it is not taken for none.
     let dir = TempDir::new("gate-record-broken");
     let state = State::open(Some(&dir.path().join("state")), "demo");
-    state.record_extraction(&odd_extraction());
-    assert!(state.extraction().is_some());
+    assert!(state.record_extraction(&odd_extraction()));
+    assert_eq!(usable(&state), odd_extraction());
     state.write("extraction", &record("/x", "caf\\u{E9}"));
-    assert_eq!(state.extraction(), None);
+    assert!(matches!(state.extraction(), Kept::Unusable(_)));
 }
 
 #[test]
@@ -480,6 +507,7 @@ fn a_plain_record_is_written_as_it_always_was() {
             ("src/demo-1.0/a file+x~{1}.c", &"b".repeat(32)),
             ("src/demo-1.0/unhashed", ""),
         ]),
+        unlisted: false,
     };
     assert_eq!(extraction.to_text(), text);
     assert_eq!(old_text(&extraction), text);
