@@ -116,10 +116,23 @@ fn saved_as(words: &[String], at: usize) -> Option<String> {
 /// and what `fetch::saved_files` adds (through `tee`, into a directory, by
 /// another fetcher).
 pub(crate) fn fetched_files(line: &str) -> Vec<String> {
-    let mut found: Vec<String> = fetched_file(line).into_iter().collect();
-    for file in fetch::saved_files(line) {
-        if !found.contains(&file) {
-            found.push(file);
+    let mut found = Vec::new();
+    // A substitution runs what it holds (`x=$(sudo curl -o f …)`,
+    // `$(curl … | tee f)`), so each is read as a line of its own. One
+    // past what `Reading` reads names no file.
+    let mut reading = shell::Reading::of(line);
+    let bodies = shell::substitutions(line)
+        .into_iter()
+        .map(|substitution| substitution.body)
+        .filter(|body| reading.takes(body));
+    for text in std::iter::once(line).chain(bodies) {
+        for file in fetched_file(text)
+            .into_iter()
+            .chain(fetch::saved_files(text))
+        {
+            if !found.contains(&file) {
+                found.push(file);
+            }
         }
     }
     found
@@ -220,6 +233,27 @@ fn runs_named(command: &shell::Command, is_named: &dyn Fn(&str) -> bool) -> bool
 /// what it runs by its path (`./x`, `/opt/x`), and what it pipes into a
 /// shell (`cat x | sh`). The program is found as in `runs_file`.
 pub(crate) fn run_targets(line: &str) -> Vec<String> {
+    let mut found = targets_of(line);
+    // A substitution runs what it holds (`x=$(cat f | sh) make`), so each
+    // is read as a line of its own. One past what `Reading` reads names
+    // no file.
+    let mut reading = shell::Reading::of(line);
+    for substitution in shell::substitutions(line) {
+        // `$(<f)` reads a file and runs nothing.
+        if substitution.body.trim_start().starts_with('<') || !reading.takes(substitution.body) {
+            continue;
+        }
+        for target in targets_of(substitution.body) {
+            if !found.contains(&target) {
+                found.push(target);
+            }
+        }
+    }
+    found
+}
+
+/// `run_targets`, for the line itself.
+fn targets_of(line: &str) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     // The names found so far, so that a line of many is not read through
     // for each.
@@ -229,6 +263,8 @@ pub(crate) fn run_targets(line: &str) -> Vec<String> {
     // nobody's.
     let mut add = |word: &str| {
         let word = word.trim_start_matches('<');
+        // `./x>/dev/null`: a redirection written onto the word ends it.
+        let word = word.split(['<', '>']).next().unwrap_or(word);
         for word in [without_group_close(word), word] {
             if let Some(name) = as_file(word)
                 && !name.starts_with('-')
