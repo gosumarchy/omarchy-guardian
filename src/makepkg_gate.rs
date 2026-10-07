@@ -258,7 +258,9 @@ pub(crate) fn run(command: &[OsString], settings: &Settings) -> ExitCode {
     let base = aur::aur_identity(&directory_name, &git_config);
     let facts = aur_facts(base.as_deref(), &directory_name, &recipe);
     let key = base.clone().unwrap_or_else(|| local_key(&build_dir));
-    let state = State::open(Store::default_root().as_deref(), &key);
+    let Some(state) = open_records(arguments, &key, &directory_name) else {
+        return ExitCode::from(2);
+    };
 
     // 2. The recipe.
     let target = recipe_target(&build_dir, &key, base.is_some());
@@ -888,29 +890,12 @@ impl NotHeld {
         }
     }
 
-    /// The directory Guardian keeps its records in cannot be used or
-    /// made, at the call that `extracts` or at one that does not.
+    /// Guardian has no directory to keep its records in, at the call that
+    /// `extracts` or at one that does not.
     fn no_directory(missing: &Missing, extracts: bool) -> Self {
-        let lost = if extracts {
-            "no record of the sources it extracted for this build could be kept, and a later call of this build could not be held to them"
-        } else {
-            "whether it has a record of the sources it extracted for this build cannot be known, and the sources cannot be held against one"
-        };
-        match missing {
-            Missing::Refused { directory, reason } => Self {
-                message: format!(
-                    "Guardian does not use the directory it keeps its records of builds in ({reason}), so {lost}. Nothing was built. Make {0} a directory of yours alone (`chmod 700 {0}`), or remove what is in its place; then run the build again from the start.",
-                    directory.display()
-                ),
-                why: "the directory of Guardian's records of builds is not the user's alone",
-            },
-            Missing::NotMade { directory, reason } => Self {
-                message: format!(
-                    "Guardian could not make the directory it keeps its records of builds in ({reason}), so {lost}. Nothing was built. Free space on that disk, or put right what the error names, so that {} can be made; then run the build again from the start.",
-                    directory.display()
-                ),
-                why: "the directory of Guardian's records of builds could not be made",
-            },
+        Self {
+            message: missing.message(extracts),
+            why: missing.why(),
         }
     }
 
@@ -930,8 +915,29 @@ impl NotHeld {
     }
 }
 
-/// Said by a call that extracts where Guardian has nowhere to keep anything.
-const NOWHERE_NOTICE: &str = "Guardian has nowhere to keep a record of the sources it extracted (neither XDG_STATE_HOME nor HOME names a place): a later call of this build has them reviewed as it finds them, not held to these.";
+/// Stops a call that extracts, or builds from what was extracted, where
+/// Guardian has no directory to keep its record of the extraction in: such
+/// a call could not record what it extracts, or be held to what was. It is
+/// stopped before anything is reviewed, fetched or asked. A call that only
+/// prints, or only downloads, keeps no record and is not stopped here.
+fn without_records(state: &State, invocation: aur::Invocation) -> Option<NotHeld> {
+    let missing = state.missing().filter(|_| invocation.uses_sources)?;
+    Some(NotHeld::no_directory(missing, invocation.extracts))
+}
+
+/// Opens what the gate remembers of the package `key`. `None` is a call
+/// stopped for want of a directory to keep it in (see `without_records`):
+/// said, noted and notified, with exit code 2. Nothing has run yet.
+fn open_records(arguments: &[OsString], key: &str, name: &str) -> Option<State> {
+    let state = State::open(Store::default_root().as_deref(), key);
+    let Some(refused) = without_records(&state, aur::classify(arguments)) else {
+        return Some(state);
+    };
+    errln!("Guardian blocked makepkg: {}", refused.message);
+    audit::refused(Gate::Aur, &format!("aur:{key}: {}", refused.why), 2);
+    notify::blocked(&subject(name), refused.why, Ran::Nothing);
+    None
+}
 
 /// Holds the sources as a call that does not extract finds them against
 /// what Guardian extracted for this build. `Err` is why the build must not
@@ -995,17 +1001,14 @@ fn hold_against_extraction(
 /// why the build must not go on: the sources were too many to list, which
 /// the record then says, or there is a directory to keep the record in and
 /// it could not be written, so a later call would find the record of an
-/// earlier extraction, or none, and not be held to these sources; or that
-/// directory is refused or cannot be made. Only where no place for one is
-/// known is nothing recorded and that `Ok`, as before, and said.
+/// earlier extraction, or none, and not be held to these sources; or there
+/// is no such directory (a call that extracts is stopped for that before
+/// it comes here, see `without_records`).
 fn record_extraction(
     step: &UpstreamStep<'_>,
     srcdir: &Path,
     collected: &aur::Collected,
 ) -> Result<(), NotHeld> {
-    if step.state.is_nowhere() {
-        errln!("{NOWHERE_NOTICE}");
-    }
     let seen = collected.upstream();
     let cleans = step
         .mirrored

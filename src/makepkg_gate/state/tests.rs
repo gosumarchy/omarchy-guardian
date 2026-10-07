@@ -41,10 +41,10 @@ fn confirmations_are_kept_per_package_and_only_in_a_private_directory() {
     assert!(state.is_confirmed("sources 39"));
 
     // Without a place for a directory, or with one open to others,
-    // nothing is remembered: the question is asked again. The first is
-    // no error; the second is one.
+    // nothing is remembered, and that is an error: the question is asked
+    // again.
     let nowhere = State::open(None, "demo");
-    nowhere.remember_confirmed("x").unwrap();
+    assert!(nowhere.remember_confirmed("x").is_err());
     assert!(!nowhere.is_confirmed("x"));
     let open = dir.path().join("open");
     fs::create_dir(&open).unwrap();

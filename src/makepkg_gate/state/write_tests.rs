@@ -216,14 +216,25 @@ fn a_directory_where_the_record_goes_is_named_and_never_emptied() {
         assert_eq!(step.state.extraction(), Kept::InTheWay(record.clone()));
         in_the_way(&hold_against_extraction(step, &src, &mut tree.collected()).unwrap_err());
         in_the_way(&record_extraction(step, &src, &tree.collected()).unwrap_err());
-        // `forget` says the same, and how to go on.
+        // `forget` removes what it can, then names every directory it
+        // left and says how to go on.
+        step.state.remember_confirmed("x").unwrap();
+        let binaries = step.state.path("binaries").unwrap();
+        fs::create_dir(&binaries).unwrap();
+        fs::write(binaries.join("kept"), "x").unwrap();
         let refused = forget(&root, "demo").unwrap_err().to_string();
-        assert!(
-            refused.contains(&record.display().to_string())
-                && refused.contains("remove that directory yourself, then run this again"),
-            "{refused}"
-        );
+        for part in [
+            "1 record(s) of the AUR gate were forgotten, and 2 directory(ies)",
+            &format!("{} (", binaries.display()),
+            &format!("{} (", record.display()),
+            "remove them yourself, then run this again.",
+        ] {
+            assert!(refused.contains(part), "{part}: {refused}");
+        }
+        assert!(!step.state.is_confirmed("x"));
         assert_eq!(fs::read_to_string(record.join("kept")).unwrap(), "x");
+        assert_eq!(fs::read_to_string(binaries.join("kept")).unwrap(), "x");
+        fs::remove_dir_all(&binaries).unwrap();
 
         // An empty one stops the call that does not extract, and goes
         // with `forget` or with the next extraction.

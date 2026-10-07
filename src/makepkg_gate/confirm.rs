@@ -124,7 +124,7 @@ pub(super) fn confirm_not_followed(
 fn remember(step: &UpstreamStep<'_>, asked: &str) {
     if let Err(error) = step.state.remember_confirmed(asked) {
         errln!(
-            "Guardian could not remember your answer ({error}): it asks again at the next build of this package."
+            "Guardian could not remember your answer ({error}): it asks again at the next makepkg call."
         );
     }
 }
@@ -288,12 +288,12 @@ pub(super) fn confirm_prebuilt(
 /// `binary_changes` at the next build. That comparison tells the user and
 /// the AI what changed and stops nothing, so where the record cannot be
 /// written the build goes on, and says what the next one is compared with:
-/// the record of the build before this one if there is one, which only
-/// names more as changed, or none, as at a first build.
+/// the record of an earlier build if there is one, or none, as at a first
+/// build.
 pub(super) fn remember_binaries(step: &UpstreamStep<'_>, upstream: &Upstream) {
     if let Err(error) = step.state.record_binaries(&all_binaries(upstream)) {
         errln!(
-            "Guardian could not record the binaries among these sources ({error}): the next build of this package is compared with the build before this one, or with none."
+            "Guardian could not record the binaries among these sources ({error}): the next build of this package is compared with an earlier record, or with none."
         );
     }
 }

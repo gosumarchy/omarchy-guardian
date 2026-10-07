@@ -75,36 +75,94 @@ pub(crate) fn extension_lowercase(path: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Why a directory is not a private one of a user's (see `private_dir`).
+#[derive(Debug)]
+pub(crate) enum NotPrivate {
+    /// `path` is not a directory: a link, a file or something else is in
+    /// its place. Where `above`, it is the nearest that exists above the
+    /// directory, which was to be made under it.
+    NotDirectory { path: PathBuf, above: bool },
+    /// `path` belongs to `owner`, not to the user (`above` as before).
+    Owner {
+        path: PathBuf,
+        owner: u32,
+        above: bool,
+    },
+    /// `path` can be reached by group or others.
+    Open { path: PathBuf },
+    /// It could not be looked at, or made.
+    Other(Error),
+}
+
+impl From<Error> for NotPrivate {
+    fn from(error: Error) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl NotPrivate {
+    /// The refusal as an error, for the user `uid`.
+    fn into_error(self, uid: u32) -> Error {
+        let under = |above: bool| {
+            if above {
+                "; not creating the store under it"
+            } else {
+                ""
+            }
+        };
+        Error::Refused(match self {
+            Self::NotDirectory { path, above } => {
+                format!("{} is not a directory{}", path.display(), under(above))
+            }
+            Self::Owner { path, owner, above } => format!(
+                "{} is owned by uid {owner}, not {uid}{}",
+                path.display(),
+                under(above)
+            ),
+            Self::Open { path } => {
+                format!("{} is accessible to group or others", path.display())
+            }
+            Self::Other(error) => return error,
+        })
+    }
+}
+
 /// Makes sure `root` is a private directory of `uid`: creates it (and
 /// missing parents, mode 0700) only under an existing directory owned by
 /// `uid`, then requires a real directory (not a symlink) owned by `uid` with
 /// no access for group or others.
 pub(crate) fn private_dir(root: &Path, uid: u32) -> Result<(), Error> {
+    check_private_dir(root, uid).map_err(|refusal| refusal.into_error(uid))
+}
+
+/// `private_dir`, with the kind of refusal for a caller that tells the
+/// user how to put it right.
+pub(crate) fn check_private_dir(root: &Path, uid: u32) -> Result<(), NotPrivate> {
     match fs::symlink_metadata(root) {
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => create_root(root, uid)?,
-        Err(error) => return Err(error).at(root),
+        Err(source) => {
+            return Err(NotPrivate::Other(Error::Io {
+                path: root.to_path_buf(),
+                source,
+            }));
+        }
     }
 
     let metadata = fs::symlink_metadata(root).at(root)?;
+    let path = root.to_path_buf();
     if !metadata.file_type().is_dir() {
-        return Err(Error::Refused(format!(
-            "{} is not a directory",
-            root.display()
-        )));
+        return Err(NotPrivate::NotDirectory { path, above: false });
     }
     if metadata.uid() != uid {
-        return Err(Error::Refused(format!(
-            "{} is owned by uid {}, not {uid}",
-            root.display(),
-            metadata.uid()
-        )));
+        return Err(NotPrivate::Owner {
+            path,
+            owner: metadata.uid(),
+            above: false,
+        });
     }
     if metadata.mode() & 0o077 != 0 {
-        return Err(Error::Refused(format!(
-            "{} is accessible to group or others",
-            root.display()
-        )));
+        return Err(NotPrivate::Open { path });
     }
     Ok(())
 }
@@ -115,27 +173,28 @@ pub(crate) fn private_dir(root: &Path, uid: u32) -> Result<(), Error> {
 /// (euid 0, the user's HOME kept) that ancestor belongs to the user, so
 /// nothing root-owned is created there. The store root itself is still
 /// checked without following symlinks by `Store::open`.
-fn create_root(root: &Path, uid: u32) -> Result<(), Error> {
+fn create_root(root: &Path, uid: u32) -> Result<(), NotPrivate> {
     let ancestor = nearest_existing_ancestor(root)?;
     let metadata = fs::metadata(&ancestor).at(&ancestor)?;
     if !metadata.is_dir() {
-        return Err(Error::Refused(format!(
-            "{} is not a directory; not creating the store under it",
-            ancestor.display()
-        )));
+        return Err(NotPrivate::NotDirectory {
+            path: ancestor,
+            above: true,
+        });
     }
     if metadata.uid() != uid {
-        return Err(Error::Refused(format!(
-            "{} is owned by uid {}, not {uid}; not creating the store under it",
-            ancestor.display(),
-            metadata.uid()
-        )));
+        return Err(NotPrivate::Owner {
+            path: ancestor,
+            owner: metadata.uid(),
+            above: true,
+        });
     }
     DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(root)
-        .at(root)
+        .at(root)?;
+    Ok(())
 }
 
 /// The closest ancestor of `root` that exists (as seen by `symlink_metadata`).

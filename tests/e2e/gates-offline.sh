@@ -644,11 +644,16 @@ makepkg_jail() {
     # A directory for the records that is not the user's alone is not used,
     # and a build with none to keep its record in is not started.
     chmod 770 "$kept"
+    rm -rf -- "$build/src"
     jail_gate --noconfirm
     expect 'a call that extracts with its records open to the group is blocked' 2 "$?"
     expect_output 'the gate says why it does not use the directory' "$kept is accessible to group or others"
-    expect_output 'and how to put it right' "chmod 700 $kept"
+    expect_output 'and how to close it' "chmod 700 $kept"
+    expect_output 'and to drop what it holds' 'omarchy-guardian forget --all'
     check 'makepkg was not started' absent "$built"
+    check 'and nothing was fetched or extracted first' absent "$build/src"
+    jail_gate --packagelist
+    expect 'a call that only prints is still passed on' 0 "$?"
     jail_gate --noconfirm --noextract
     expect 'and so is a later call' 2 "$?"
     expect_output 'for the same reason' "$kept is accessible to group or others"
@@ -656,6 +661,13 @@ makepkg_jail() {
     chmod 700 "$kept"
     jail_gate --noconfirm
     expect 'with the directory its own again the build is started' 0 "$?"
+    # With nowhere to keep its records at all, the same.
+    rm -f -- "$built"
+    (cd "$build" && setsid -w "${sandbox[@]}" env -u HOME -u XDG_STATE_HOME "$BINARY" makepkg-gate -- \
+        /usr/bin/makepkg --noconfirm </dev/null >"$OUT" 2>&1)
+    expect 'a call that extracts with nowhere to keep its records is blocked' 2 "$?"
+    expect_output 'the gate says it has nowhere' 'Guardian has nowhere to keep its records of builds'
+    check 'makepkg was not started' absent "$built"
     rm -f -- "$record"
     # A directory where the record goes is named, and left as it is.
     mkdir -- "$record"
