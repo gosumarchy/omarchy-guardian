@@ -613,6 +613,79 @@ makepkg_jail() {
     expect 'a later call with a new file among the sources is started' 0 "$?"
     expect_output 'the new file was noticed' '1 file(s) are new or changed since Guardian extracted them'
     check 'makepkg got the original arguments' test "$(cat "$built" 2>/dev/null)" = '--noconfirm --noextract'
+
+    # The record of what the gate extracted, when it cannot be used, stops
+    # the later call; a call that extracts writes it again.
+    local kept=$XDG_STATE_HOME/omarchy-guardian/aur-gate record
+    local -a records=("$kept"/*.extraction)
+    record=${records[0]}
+    check 'the gate kept one record of what it extracted' test "${#records[@]}" = 1 -a -f "$record"
+    printf 'garbage' >"$record"
+    jail_gate --noconfirm --noextract
+    expect 'a later call whose record cannot be used is blocked' 2 "$?"
+    expect_output 'the gate says the record cannot be used' 'cannot be used'
+    check 'makepkg was not started' absent "$built"
+    jail_gate --noconfirm
+    expect 'a call that extracts again is started' 0 "$?"
+    jail_gate --noconfirm --noextract
+    expect 'and the later call is held to the new record and started' 0 "$?"
+
+    # A record that cannot be written stops the call that extracts: a later
+    # call would find none and not be held to these sources.
+    rm -f -- "$record"
+    chmod 500 "$kept"
+    jail_gate --noconfirm
+    expect 'a call that extracts and cannot write its record is blocked' 2 "$?"
+    expect_output 'the gate says the record could not be written' 'could not write its record of the sources it extracted'
+    expect_output 'and names the directory to fix' "fix the permissions of $kept"
+    check 'makepkg was not started' absent "$built"
+    check 'no record was left' absent "$record"
+    chmod 700 "$kept"
+    # A directory for the records that is not the user's alone is not used,
+    # and a build with none to keep its record in is not started.
+    chmod 770 "$kept"
+    rm -rf -- "$build/src"
+    jail_gate --noconfirm
+    expect 'a call that extracts with its records open to the group is blocked' 2 "$?"
+    expect_output 'the gate says why it does not use the directory' "$kept is accessible to group or others"
+    expect_output 'and how to close it' "chmod 700 $kept"
+    expect_output 'and to drop what it holds' 'omarchy-guardian forget --all'
+    check 'makepkg was not started' absent "$built"
+    check 'and nothing was fetched or extracted first' absent "$build/src"
+    jail_gate --packagelist
+    expect 'a call that only prints is still passed on' 0 "$?"
+    jail_gate --noconfirm --noextract
+    expect 'and so is a later call' 2 "$?"
+    expect_output 'for the same reason' "$kept is accessible to group or others"
+    check 'makepkg was not started' absent "$built"
+    chmod 700 "$kept"
+    jail_gate --noconfirm
+    expect 'with the directory its own again the build is started' 0 "$?"
+    # With nowhere to keep its records at all, the same.
+    rm -f -- "$built"
+    (cd "$build" && setsid -w "${sandbox[@]}" env -u HOME -u XDG_STATE_HOME "$BINARY" makepkg-gate -- \
+        /usr/bin/makepkg --noconfirm </dev/null >"$OUT" 2>&1)
+    expect 'a call that extracts with nowhere to keep its records is blocked' 2 "$?"
+    expect_output 'the gate says it has nowhere' 'Guardian has nowhere to keep its records of builds'
+    check 'makepkg was not started' absent "$built"
+    rm -f -- "$record"
+    # A directory where the record goes is named, and left as it is.
+    mkdir -- "$record"
+    : >"$record/kept"
+    jail_gate --noconfirm
+    expect 'a call that extracts with a directory where its record goes is blocked' 2 "$?"
+    expect_output 'the gate says to remove the directory' 'remove that directory yourself'
+    check 'makepkg was not started' absent "$built"
+    jail_gate --noconfirm --noextract
+    expect 'and so is a later call' 2 "$?"
+    expect_output 'the gate names the directory' "$record"
+    check 'makepkg was not started' absent "$built"
+    check 'the directory was not emptied' test -e "$record/kept"
+    rm -rf -- "$record"
+    jail_gate --noconfirm
+    expect 'with the directory gone the build is started again' 0 "$?"
+    check 'and its record is written' test -f "$record"
+
     # (What is in the sources is judged by the AI alone: with it off, as
     # here, the local rules read the recipe's own files and nothing
     # upstream. integration-gates.sh has the malicious upstream script.)

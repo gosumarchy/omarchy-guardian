@@ -7,22 +7,27 @@
 //! Guardian. Without this a question would be asked on every call, and a
 //! later call could not tell whether the sources it finds are the ones an
 //! earlier call fetched and reviewed. It lives beside the review memory, in
-//! a directory only the user can read or write; with no such directory
-//! nothing is remembered and every question is asked again.
+//! a directory only the user can read or write. Where there is no such
+//! directory (`Missing`: no place for one is known, or it is refused, or
+//! it cannot be made), or a record cannot be written, that is an error its
+//! caller answers for: a record that should be there is not.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
-use std::fs::{self, DirBuilder, File};
+use std::fs::{self, File};
 use std::io::Read as _;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use crate::error::{Error, IoContext};
 use crate::files::{AtomicWrite, write_atomic};
-use crate::paths;
 use crate::sha256::Sha256;
 use crate::user;
+
+mod place;
+
+pub(super) use self::place::Missing;
 
 /// The directory under the review memory's root.
 const DIRECTORY: &str = "aur-gate";
@@ -58,8 +63,7 @@ pub(super) struct Extraction {
 /// What a later call finds of the record of an extraction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Kept {
-    /// There is none: Guardian extracted nothing for this package, or
-    /// has nowhere to remember it.
+    /// There is none: Guardian extracted nothing for this package.
     Absent,
     /// The record, as it was written.
     Usable(Extraction),
@@ -67,6 +71,24 @@ pub(super) enum Kept {
     /// none: what was extracted is then not known, which is not the same
     /// as nothing having been extracted.
     Unusable(String),
+    /// A directory is where the record would be. Neither is that none: no
+    /// record can take its place while it is there.
+    InTheWay(PathBuf),
+    /// The directory the records are kept in cannot be used: whether
+    /// there is a record is not known.
+    Missing(Missing),
+}
+
+/// Why a record of an extraction was not kept.
+#[derive(Debug)]
+pub(super) enum NotKept {
+    /// A directory that is not empty is where the record goes. Guardian
+    /// did not make it and does not remove what is in it.
+    InTheWay(PathBuf),
+    /// It could not be written: the error names the path.
+    Write(Error),
+    /// There is no directory to write it in.
+    Missing(Missing),
 }
 
 /// What tells one directory from another made later under the same name:
@@ -274,10 +296,11 @@ fn one_line(entries: &BTreeMap<String, String>) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The gate's memory of one package. Without a directory it remembers
-/// nothing: every read is empty and every write is dropped.
+/// The gate's memory of one package. Without a directory (`Missing`) every
+/// read of an answer or of the binaries is empty, every write is an error,
+/// and the read of the record of an extraction says what is missing.
 pub(super) struct State {
-    directory: Option<PathBuf>,
+    place: Result<PathBuf, Missing>,
     name: String,
     /// The most the record of an extraction may hold, written or read.
     most: u64,
@@ -285,33 +308,28 @@ pub(super) struct State {
 
 impl State {
     /// Opens the memory of the package `key` under the review memory's
-    /// `root`, creating its directory for the user alone.
+    /// `root`, creating its directory for the user alone. It never fails:
+    /// what it could not open, its reads and writes say.
     pub(super) fn open(root: Option<&Path>, key: &str) -> Self {
-        let directory = root.and_then(|root| {
-            let uid = user::effective_uid().ok()?;
-            paths::private_dir(root, uid).ok()?;
-            let directory = root.join(DIRECTORY);
-            match DirBuilder::new().mode(0o700).create(&directory) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(_) => return None,
-            }
-            paths::private_dir(&directory, uid).ok()?;
-            Some(directory)
-        });
+        Self::open_as(root, key, user::effective_uid())
+    }
+
+    /// `open`, for the user `uid`, or for none that can be told.
+    fn open_as(root: Option<&Path>, key: &str, uid: Result<u32, Error>) -> Self {
         Self {
-            directory,
+            place: place::place(root, uid),
             name: Sha256::digest(key.as_bytes()).to_string(),
             most: MAX_BYTES,
         }
     }
 
     fn path(&self, what: &str) -> Option<PathBuf> {
-        Some(
-            self.directory
-                .as_ref()?
-                .join(format!("{}.{what}", self.name)),
-        )
+        Some(self.directory()?.join(format!("{}.{what}", self.name)))
+    }
+
+    /// Why there is no directory, where there is none.
+    pub(super) fn missing(&self) -> Option<&Missing> {
+        self.place.as_ref().err()
     }
 
     fn read(&self, what: &str) -> Option<String> {
@@ -322,15 +340,30 @@ impl State {
             .flatten()
     }
 
-    /// Writes through a new file and a rename, so a reader never sees half.
-    fn write(&self, what: &str, text: &str) {
-        let Some(path) = self.path(what) else { return };
+    /// The directory the records are kept in, when there is one.
+    pub(super) fn directory(&self) -> Option<&Path> {
+        self.place.as_deref().ok()
+    }
+
+    /// Writes through a new file and a rename, so a reader never sees half
+    /// and a write that fails leaves what was there. An error is a record
+    /// that should now be there and is not; it names the path.
+    fn write(&self, what: &str, text: &str) -> Result<(), Error> {
+        let path = match &self.place {
+            Ok(directory) => directory.join(format!("{}.{what}", self.name)),
+            Err(missing) => return Err(Error::Refused(missing.reason())),
+        };
         let temporary = path.with_extension(format!("{what}.{}.tmp", std::process::id()));
-        drop(write_atomic(
-            &path,
-            text.as_bytes(),
-            &AtomicWrite::private(temporary),
-        ));
+        let options = AtomicWrite::private(temporary.clone());
+        write_atomic(&path, text.as_bytes(), &options).map_err(|source| {
+            // Something that could not be removed from under the new
+            // file's name is what stood in the way.
+            let blocked = fs::symlink_metadata(&temporary).is_ok();
+            Error::Io {
+                path: if blocked { temporary } else { path },
+                source,
+            }
+        })
     }
 
     /// Whether the user said yes to `what` (a hash of exactly what was
@@ -340,12 +373,14 @@ impl State {
             .is_some_and(|text| text.lines().any(|line| line == what))
     }
 
-    pub(super) fn remember_confirmed(&self, what: &str) {
+    /// Remembers that yes. Where it cannot be written the question is
+    /// asked again next time, which is all that is lost.
+    pub(super) fn remember_confirmed(&self, what: &str) -> Result<(), Error> {
         let known = self.read("confirmed").unwrap_or_default();
         let mut lines: Vec<&str> = known.lines().filter(|line| *line != what).collect();
         lines.push(what);
         let from = lines.len().saturating_sub(MAX_CONFIRMATIONS);
-        self.write("confirmed", &(lines[from..].join("\n") + "\n"));
+        self.write("confirmed", &(lines[from..].join("\n") + "\n"))
     }
 
     /// The binaries the sources held at the last build that passed.
@@ -359,24 +394,32 @@ impl State {
             .collect()
     }
 
-    pub(super) fn record_binaries(&self, binaries: &BTreeMap<String, String>) {
+    /// Keeps the binaries of a build that passed. Where they cannot be
+    /// written the record of an earlier build stays, or none: the next
+    /// build is then compared with that one, or with none.
+    pub(super) fn record_binaries(&self, binaries: &BTreeMap<String, String>) -> Result<(), Error> {
         let mut text = String::new();
         for (path, digest) in one_line(binaries) {
             let digest = if digest.is_empty() { "-" } else { &digest };
             let _ = writeln!(text, "{digest} {path}");
         }
-        self.write("binaries", &text);
+        self.write("binaries", &text)
     }
 
     /// The record of an extraction as a later call finds it. A record
-    /// that is there and cannot be read is `Unusable`, never `Absent`.
+    /// that is there and cannot be read is `Unusable`, and a directory in
+    /// its place is `InTheWay`: never `Absent`.
     /// Nothing but a regular file is opened, so a pipe left under the
     /// record's name is not waited on.
     pub(super) fn extraction(&self) -> Kept {
+        if let Some(missing) = self.missing() {
+            return Kept::Missing(missing.clone());
+        }
         let Some(path) = self.path("extraction") else {
             return Kept::Absent;
         };
         match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => return Kept::InTheWay(path),
             Ok(metadata) if !metadata.is_file() => {
                 return Kept::Unusable("it is not a regular file".into());
             }
@@ -414,41 +457,71 @@ impl State {
     /// Keeps `extraction` for the calls that follow, and returns whether
     /// all of it was kept. One too large to be read back is not written
     /// and not cut: a record that says nothing is listed is written in
-    /// its place, so that a later call finds that and not nothing.
-    pub(super) fn record_extraction(&self, extraction: &Extraction) -> bool {
+    /// its place, so that a later call finds that and not nothing. `Err`
+    /// is a record that was not written at all: a later call then finds
+    /// the record of an earlier extraction, or none, and must not be let
+    /// come to that unsaid.
+    pub(super) fn record_extraction(&self, extraction: &Extraction) -> Result<bool, NotKept> {
+        if let Some(missing) = self.missing() {
+            return Err(NotKept::Missing(missing.clone()));
+        }
         // A directory left under the record's name would keep the new
-        // record from taking its place.
+        // record from taking its place. An empty one is removed; one that
+        // is not is left as it is.
         if let Some(path) = self.path("extraction") {
-            drop(fs::remove_dir(path));
+            drop(fs::remove_dir(&path));
+            if is_directory(&path) {
+                return Err(NotKept::InTheWay(path));
+            }
         }
         let text = extraction.to_text();
         let whole = u64::try_from(text.len()).is_ok_and(|length| length <= self.most);
-        if whole {
-            self.write("extraction", &text);
+        let written = if whole {
+            self.write("extraction", &text)
         } else {
-            self.write("extraction", &extraction.unlisted().to_text());
-        }
-        whole
+            self.write("extraction", &extraction.unlisted().to_text())
+        };
+        written.map(|()| whole).map_err(NotKept::Write)
     }
+}
+
+/// Whether a directory itself, not a link to one, is at `path`.
+fn is_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
 }
 
 /// The records a `State` keeps of one package.
 const RECORDS: [&str; 3] = ["confirmed", "binaries", "extraction"];
 
 /// Removes what is remembered of the package `key` under the review
-/// memory's `root`; returns how many records there were.
+/// memory's `root`; returns how many records there were. An empty
+/// directory under a record's name goes as a record does. One that is not
+/// empty is not Guardian's and is left; the others are still removed, and
+/// the error then names every one left and how many records went.
 pub(super) fn forget(root: &Path, key: &str) -> Result<usize, Error> {
     let name = Sha256::digest(key.as_bytes()).to_string();
     let mut removed = 0;
+    let mut left: Vec<String> = Vec::new();
     for what in RECORDS {
         let path = root.join(DIRECTORY).join(format!("{name}.{what}"));
         match fs::remove_file(&path) {
             Ok(()) => removed += 1,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) if is_directory(&path) => match fs::remove_dir(&path) {
+                Ok(()) => removed += 1,
+                Err(error) => left.push(format!("{} ({error})", path.display())),
+            },
             Err(source) => return Err(Error::Io { path, source }),
         }
     }
-    Ok(removed)
+    if left.is_empty() {
+        return Ok(removed);
+    }
+    Err(Error::Refused(format!(
+        "{removed} record(s) of the AUR gate were forgotten, and {} directory(ies) where it keeps a record of this package could not be removed: {}. Guardian does not remove what is in a directory it did not make: remove them yourself, then run this again.",
+        left.len(),
+        left.join(", ")
+    )))
 }
 
 /// Removes everything the gate remembers under `root`: the files of its
@@ -509,6 +582,9 @@ pub(super) fn binary_changes(
 mod forget_tests;
 
 #[cfg(test)]
+mod place_tests;
+
+#[cfg(test)]
 mod record_tests;
 
 #[cfg(test)]
@@ -516,3 +592,6 @@ mod tests;
 
 #[cfg(test)]
 mod unusable_tests;
+
+#[cfg(test)]
+mod write_tests;

@@ -113,10 +113,20 @@ pub(super) fn confirm_not_followed(
         step.name
     );
     if confirm.confirm(&question) {
-        step.state.remember_confirmed(&asked);
+        remember(step, &asked);
         return true;
     }
     false
+}
+
+/// Remembers a yes. It only saves asking again, so where it cannot be
+/// written the build goes on with the answer it was given, and says so.
+fn remember(step: &UpstreamStep<'_>, asked: &str) {
+    if let Err(error) = step.state.remember_confirmed(asked) {
+        errln!(
+            "Guardian could not remember your answer ({error}): it asks again at the next makepkg call."
+        );
+    }
 }
 
 /// Prebuilt programs among the sources that end up installed or run: no
@@ -267,11 +277,25 @@ pub(super) fn confirm_prebuilt(
     );
     if confirm.confirm(&question) {
         if let Some(asked) = asked {
-            step.state.remember_confirmed(&asked);
+            remember(step, &asked);
         }
         return true;
     }
     false
+}
+
+/// Keeps the binaries among the sources of a build that passed, for
+/// `binary_changes` at the next build. That comparison tells the user and
+/// the AI what changed and stops nothing, so where the record cannot be
+/// written the build goes on, and says what the next one is compared with:
+/// the record of an earlier build if there is one, or none, as at a first
+/// build.
+pub(super) fn remember_binaries(step: &UpstreamStep<'_>, upstream: &Upstream) {
+    if let Err(error) = step.state.record_binaries(&all_binaries(upstream)) {
+        errln!(
+            "Guardian could not record the binaries among these sources ({error}): the next build of this package is compared with an earlier record, or with none."
+        );
+    }
 }
 
 /// What the binaries among the sources are now, held against the ones of

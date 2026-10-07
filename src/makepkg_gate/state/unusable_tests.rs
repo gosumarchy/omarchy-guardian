@@ -5,11 +5,19 @@ use std::fs::{self, File};
 use std::path::Path;
 use std::process::Command;
 
-use super::super::{hold_against_extraction, record_extraction};
+use super::super::{NotHeld, hold_against_extraction, record_extraction};
 use super::record_tests::{Tree, usable, with_step};
 use super::{Extraction, Kept, MAX_BYTES, forget};
 
 const UNUSABLE: &str = "the record of what Guardian extracted cannot be used";
+
+/// What a build whose sources are too many to record is told.
+fn too_many() -> NotHeld {
+    NotHeld {
+        message: "the sources have more files, or files with longer names, than Guardian can keep a record of, so a build cannot be held to what Guardian extracted and reviewed. Nothing was built, and running the build again ends the same way: no setting changes this. The one way on gives that check up for this build: after `omarchy-guardian forget aur:demo` (it also drops what else Guardian remembers of this package), a call that does not extract again (`makepkg --noextract`) finds no record, and the sources are reviewed as they are found, not held to what Guardian extracted.".into(),
+        why: "the sources are too many to hold the build to",
+    }
+}
 
 /// Removes whatever is under the record's name.
 fn clear(path: &Path) {
@@ -46,7 +54,11 @@ fn stops_and_recovers(tree: &Tree, reason: &str) {
             );
         }
         // The call that extracts does not read the record: it writes it.
-        assert!(record_extraction(step, &src, &tree.collected()), "{reason}");
+        assert_eq!(
+            record_extraction(step, &src, &tree.collected()),
+            Ok(()),
+            "{reason}"
+        );
         assert!(usable(step.state).is_of(&src), "{reason}");
         assert_eq!(
             hold_against_extraction(step, &src, &mut tree.collected()),
@@ -66,7 +78,7 @@ fn a_record_that_cannot_be_used_stops_the_build_until_it_is_written_again() {
         assert_eq!(step.state.extraction(), Kept::Absent);
         let facts = hold_against_extraction(step, &src, &mut tree.collected()).unwrap();
         assert!(facts[0].contains("did not extract these sources itself"));
-        assert!(record_extraction(step, &src, &tree.collected()));
+        assert_eq!(record_extraction(step, &src, &tree.collected()), Ok(()));
         fs::read(&path).unwrap()
     });
 
@@ -89,12 +101,9 @@ fn a_record_that_cannot_be_used_stops_the_build_until_it_is_written_again() {
         stops_and_recovers(&tree, not_written);
     }
 
-    // Not a regular file: a directory, a link (even to a record that
-    // could be read), and a pipe, which is not opened and so not waited
-    // on.
-    clear(&path);
-    fs::create_dir(&path).unwrap();
-    stops_and_recovers(&tree, "it is not a regular file");
+    // Not a regular file: a link (even to a record that could be read),
+    // and a pipe, which is not opened and so not waited on. (A directory
+    // is told apart: see `write_tests`.)
     let elsewhere = tree.dir.path().join("record");
     fs::write(&elsewhere, &whole).unwrap();
     clear(&path);
@@ -129,7 +138,7 @@ fn a_record_of_another_directory_is_none_for_this_one() {
     let src = tree.src();
     let other = tree.build.join("other");
     with_step(&tree, &[], |step| {
-        assert!(record_extraction(step, &other, &tree.collected()));
+        assert_eq!(record_extraction(step, &other, &tree.collected()), Ok(()));
         let facts = hold_against_extraction(step, &src, &mut tree.collected()).unwrap();
         assert!(facts[0].contains("did not extract these sources itself"));
     });
@@ -144,7 +153,7 @@ fn sources_too_many_to_record_are_recorded_as_that_and_stop_the_build() {
     }
     let path = tree.state.path("extraction").unwrap();
     let whole = with_step(&tree, &[], |step| {
-        assert!(record_extraction(step, &src, &tree.collected()));
+        assert_eq!(record_extraction(step, &src, &tree.collected()), Ok(()));
         fs::read(&path).unwrap()
     });
     let header = usable(&tree.state).unlisted().to_text();
@@ -153,7 +162,7 @@ fn sources_too_many_to_record_are_recorded_as_that_and_stop_the_build() {
     // A record may be exactly as large as the most, and no larger.
     tree.state.most = u64::try_from(whole.len()).unwrap();
     with_step(&tree, &[], |step| {
-        assert!(record_extraction(step, &src, &tree.collected()));
+        assert_eq!(record_extraction(step, &src, &tree.collected()), Ok(()));
     });
     assert_eq!(fs::read(&path).unwrap(), whole);
     assert!(!usable(&tree.state).unlisted);
@@ -163,7 +172,8 @@ fn sources_too_many_to_record_are_recorded_as_that_and_stop_the_build() {
     assert!(matches!(tree.state.extraction(), Kept::Unusable(_)));
     with_step(&tree, &[], |step| {
         // Not written whole, not cut, and not left out: it says so.
-        assert!(!record_extraction(step, &src, &tree.collected()));
+        let refused = record_extraction(step, &src, &tree.collected()).unwrap_err();
+        assert_eq!(refused, too_many());
         assert_eq!(fs::read_to_string(&path).unwrap(), header);
         assert!(header.ends_with("\ncleanbuild 0\nunlisted\n"), "{header}");
         let record = usable(step.state);
@@ -171,17 +181,22 @@ fn sources_too_many_to_record_are_recorded_as_that_and_stop_the_build() {
         assert!(record.downloads.is_empty() && record.files.is_empty());
 
         let refused = hold_against_extraction(step, &src, &mut tree.collected()).unwrap_err();
-        assert_eq!(refused.why, "the sources are too many to hold the build to");
+        assert_eq!(refused, too_many());
+        // `forget` is the way on the message names: no record is left,
+        // and the sources are then reviewed as they are found.
+        assert_eq!(forget(&tree.dir.path().join("state"), "demo").unwrap(), 1);
+        let facts = hold_against_extraction(step, &src, &mut tree.collected()).unwrap();
+        assert!(facts[0].contains("did not extract these sources itself"));
         assert_eq!(
-            refused.message,
-            "the sources have more files, or files with longer names, than Guardian can keep a record of, so a build cannot be held to what Guardian extracted and reviewed. Nothing was built."
+            record_extraction(step, &src, &tree.collected()).unwrap_err(),
+            too_many()
         );
     });
 
     // With room for it again, the next extraction records it whole.
     tree.state.most = MAX_BYTES;
     with_step(&tree, &[], |step| {
-        assert!(record_extraction(step, &src, &tree.collected()));
+        assert_eq!(record_extraction(step, &src, &tree.collected()), Ok(()));
         assert_eq!(
             hold_against_extraction(step, &src, &mut tree.collected()),
             Ok(Vec::new())

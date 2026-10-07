@@ -422,7 +422,10 @@ fn sources_with_no_text_are_not_a_clear_review() {
     // The binaries of a build that passed are what the next one's are
     // held against.
     assert_eq!(binary_changes(&step, &upstream), None);
-    fixture.state.record_binaries(&all_binaries(&upstream));
+    fixture
+        .state
+        .record_binaries(&all_binaries(&upstream))
+        .unwrap();
     assert_eq!(binary_changes(&step, &upstream), None);
     fs::write(src.join("demo"), b"\x7fELF\x02\x01\x01\0\0\x02").unwrap();
     fs::write(src.join("extra"), ELF).unwrap();
@@ -624,7 +627,7 @@ fn a_later_call_is_held_against_what_guardian_extracted() {
     let facts = hold_against_extraction(&step, &src, &mut fixture.collected()).unwrap();
     assert!(facts[0].contains("did not extract these sources itself"));
 
-    record_extraction(&step, &src, &fixture.collected());
+    record_extraction(&step, &src, &fixture.collected()).unwrap();
     // The build cleans first (`-C`), so a source directory that is
     // still the one Guardian made was not the build's.
     let refused = hold_against_extraction(&step, &src, &mut fixture.collected());
@@ -644,7 +647,7 @@ fn a_later_call_is_held_against_what_guardian_extracted() {
         mirrored: &kept.mirrored,
         ..fixture.step()
     };
-    record_extraction(&step, &src, &fixture.collected());
+    record_extraction(&step, &src, &fixture.collected()).unwrap();
     assert_eq!(
         hold_against_extraction(&step, &src, &mut fixture.collected()),
         Ok(Vec::new())

@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use self::confirm::{
-    Followed, Prebuilt, all_binaries, binary_changes, confirm_not_followed, followed, prebuilt,
+    Followed, Prebuilt, binary_changes, confirm_not_followed, followed, prebuilt, remember_binaries,
 };
 use self::jail::{home, pre_extract, probe};
 use self::permits::{
@@ -57,7 +57,7 @@ use self::permits::{
 };
 use self::rpc::aur_facts;
 use self::sources::{download_names, fetch_refusal, source_context};
-use self::state::{Drift, Extraction, Kept, State};
+use self::state::{Drift, Extraction, Kept, Missing, NotKept, State};
 use self::upstream::{review_upstream_files, unreviewable_sources};
 use crate::audit::{self, Gate};
 use crate::aur::recipe::{self, Sources};
@@ -77,7 +77,7 @@ use crate::sha256::Sha256;
 use crate::tools::{self, Limits, OpenCode};
 
 #[cfg(test)]
-use self::confirm::confirm_prebuilt;
+use self::confirm::{all_binaries, confirm_prebuilt};
 #[cfg(test)]
 use self::jail::{is_jailable, listing_recipe, listing_report, public_keyring, with_mounts};
 #[cfg(test)]
@@ -258,7 +258,9 @@ pub(crate) fn run(command: &[OsString], settings: &Settings) -> ExitCode {
     let base = aur::aur_identity(&directory_name, &git_config);
     let facts = aur_facts(base.as_deref(), &directory_name, &recipe);
     let key = base.clone().unwrap_or_else(|| local_key(&build_dir));
-    let state = State::open(Store::default_root().as_deref(), &key);
+    let Some(state) = open_records(arguments, &key, &directory_name) else {
+        return ExitCode::from(2);
+    };
 
     // 2. The recipe.
     let target = recipe_target(&build_dir, &key, base.is_some());
@@ -865,12 +867,76 @@ impl NotHeld {
     }
 
     /// The sources were too many to record (see `Extraction::unlisted`).
-    fn unlisted() -> Self {
+    /// No setting lets such a build through. `forget` does, as it does for
+    /// any record, and the message says so and what is given up.
+    fn unlisted(step: &UpstreamStep<'_>) -> Self {
         Self {
-            message: "the sources have more files, or files with longer names, than Guardian can keep a record of, so a build cannot be held to what Guardian extracted and reviewed. Nothing was built.".into(),
+            message: format!(
+                "the sources have more files, or files with longer names, than Guardian can keep a record of, so a build cannot be held to what Guardian extracted and reviewed. Nothing was built, and running the build again ends the same way: no setting changes this. The one way on gives that check up for this build: after `omarchy-guardian forget aur:{}` (it also drops what else Guardian remembers of this package), a call that does not extract again (`makepkg --noextract`) finds no record, and the sources are reviewed as they are found, not held to what Guardian extracted.",
+                step.key
+            ),
             why: "the sources are too many to hold the build to",
         }
     }
+
+    /// A directory is where the record of what Guardian extracted goes.
+    fn in_the_way(record: &Path) -> Self {
+        Self {
+            message: format!(
+                "a directory is where Guardian keeps its record of the sources it extracted for this build ({}), so there is no record to hold a build to. Nothing was built. Guardian removes such a directory only when it is empty, and `omarchy-guardian forget` does no more: remove that directory yourself, then run the build again from the start.",
+                record.display()
+            ),
+            why: "a directory is in the place of the record of what Guardian extracted",
+        }
+    }
+
+    /// Guardian has no directory to keep its records in, at the call that
+    /// `extracts` or at one that does not.
+    fn no_directory(missing: &Missing, extracts: bool) -> Self {
+        Self {
+            message: missing.message(extracts),
+            why: missing.why(),
+        }
+    }
+
+    /// The record of what Guardian extracted could not be written, where
+    /// there is a directory to keep it in.
+    fn not_recorded(step: &UpstreamStep<'_>, error: &Error) -> Self {
+        let directory = step.state.directory().map_or_else(
+            || "Guardian's state directory".to_string(),
+            |directory| directory.display().to_string(),
+        );
+        Self {
+            message: format!(
+                "Guardian could not write its record of the sources it extracted for this build ({error}), so a later call of this build could not be held to them. Nothing was built. Free space on that disk, or fix the permissions of {directory}, whichever the error says; then run the build again."
+            ),
+            why: "the record of what Guardian extracted could not be written",
+        }
+    }
+}
+
+/// Stops a call that extracts, or builds from what was extracted, where
+/// Guardian has no directory to keep its record of the extraction in: such
+/// a call could not record what it extracts, or be held to what was. It is
+/// stopped before anything is reviewed, fetched or asked. A call that only
+/// prints, or only downloads, keeps no record and is not stopped here.
+fn without_records(state: &State, invocation: aur::Invocation) -> Option<NotHeld> {
+    let missing = state.missing().filter(|_| invocation.uses_sources)?;
+    Some(NotHeld::no_directory(missing, invocation.extracts))
+}
+
+/// Opens what the gate remembers of the package `key`. `None` is a call
+/// stopped for want of a directory to keep it in (see `without_records`):
+/// said, noted and notified, with exit code 2. Nothing has run yet.
+fn open_records(arguments: &[OsString], key: &str, name: &str) -> Option<State> {
+    let state = State::open(Store::default_root().as_deref(), key);
+    let Some(refused) = without_records(&state, aur::classify(arguments)) else {
+        return Some(state);
+    };
+    errln!("Guardian blocked makepkg: {}", refused.message);
+    audit::refused(Gate::Aur, &format!("aur:{key}: {}", refused.why), 2);
+    notify::blocked(&subject(name), refused.why, Ran::Nothing);
+    None
 }
 
 /// Holds the sources as a call that does not extract finds them against
@@ -887,6 +953,8 @@ fn hold_against_extraction(
     let extraction = match step.state.extraction() {
         Kept::Usable(extraction) if extraction.is_of(srcdir) => extraction,
         Kept::Unusable(reason) => return Err(NotHeld::unusable(step, &reason)),
+        Kept::InTheWay(record) => return Err(NotHeld::in_the_way(&record)),
+        Kept::Missing(missing) => return Err(NotHeld::no_directory(&missing, false)),
         Kept::Absent | Kept::Usable(_) => {
             outln!(
                 "Sources: Guardian has no record of extracting them for this build; they are reviewed as they are now."
@@ -897,7 +965,7 @@ fn hold_against_extraction(
         }
     };
     if extraction.unlisted {
-        return Err(NotHeld::unlisted());
+        return Err(NotHeld::unlisted(step));
     }
     let identity = state::identity(srcdir);
     let seen = collected.upstream();
@@ -929,22 +997,38 @@ fn hold_against_extraction(
     }
 }
 
-/// Records what Guardian extracted, for the calls that follow. Returns
-/// whether it could be recorded whole; where not, the record says so.
-fn record_extraction(step: &UpstreamStep<'_>, srcdir: &Path, collected: &aur::Collected) -> bool {
+/// Records what Guardian extracted, for the calls that follow. `Err` is
+/// why the build must not go on: the sources were too many to list, which
+/// the record then says, or there is a directory to keep the record in and
+/// it could not be written, so a later call would find the record of an
+/// earlier extraction, or none, and not be held to these sources; or there
+/// is no such directory (a call that extracts is stopped for that before
+/// it comes here, see `without_records`).
+fn record_extraction(
+    step: &UpstreamStep<'_>,
+    srcdir: &Path,
+    collected: &aur::Collected,
+) -> Result<(), NotHeld> {
     let seen = collected.upstream();
     let cleans = step
         .mirrored
         .iter()
         .any(|argument| argument == "-C" || argument == "--cleanbuild");
-    step.state.record_extraction(&Extraction {
+    let recorded = step.state.record_extraction(&Extraction {
         srcdir: srcdir.to_string_lossy().into_owned(),
         identity: state::identity(srcdir),
         cleanbuild: cleans,
         downloads: seen.downloads.clone(),
         files: seen.seen.clone(),
         unlisted: false,
-    })
+    });
+    match recorded {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(NotHeld::unlisted(step)),
+        Err(NotKept::InTheWay(record)) => Err(NotHeld::in_the_way(&record)),
+        Err(NotKept::Write(error)) => Err(NotHeld::not_recorded(step, &error)),
+        Err(NotKept::Missing(missing)) => Err(NotHeld::no_directory(&missing, true)),
+    }
 }
 
 /// Facts about the dependencies a build downloads on its own.
@@ -1068,9 +1152,7 @@ fn collect_sources(
     let scratch = unpack_archives(step, &srcdir, &roots, &mut collected);
     let not_held = |refused: NotHeld| block(step, &refused.message, refused.why, 2);
     if step.extract {
-        if !record_extraction(step, &srcdir, &collected) {
-            return Err(not_held(NotHeld::unlisted()));
-        }
+        record_extraction(step, &srcdir, &collected).map_err(not_held)?;
     } else if collected.upstream().found {
         context.extend(hold_against_extraction(step, &srcdir, &mut collected).map_err(not_held)?);
     }
@@ -1186,13 +1268,13 @@ fn review_upstream(
                 "Guardian: your permit {} overrules the review of the upstream sources.",
                 standing.permitted().unwrap_or_default()
             );
-            step.state.record_binaries(&all_binaries(&upstream));
+            remember_binaries(step, &upstream);
             Ok(UpstreamOutcome { dirs, downloads })
         }
         // Nothing was sent to the AI (`ai = off`): the recipe decision stands.
         Decision::Limited | Decision::Clear | Decision::Warned => {
             // What a later build's binaries are held against.
-            step.state.record_binaries(&all_binaries(&upstream));
+            remember_binaries(step, &upstream);
             Ok(UpstreamOutcome { dirs, downloads })
         }
         Decision::Blocked(_) => {

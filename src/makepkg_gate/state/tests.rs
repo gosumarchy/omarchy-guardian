@@ -20,7 +20,7 @@ fn confirmations_are_kept_per_package_and_only_in_a_private_directory() {
     let root = dir.path().join("state");
     let state = State::open(Some(&root), "demo");
     assert!(!state.is_confirmed("prebuilt abc"));
-    state.remember_confirmed("prebuilt abc");
+    state.remember_confirmed("prebuilt abc").unwrap();
     assert!(state.is_confirmed("prebuilt abc"));
     assert!(!state.is_confirmed("prebuilt abd"));
     assert!(!State::open(Some(&root), "other").is_confirmed("prebuilt abc"));
@@ -33,21 +33,28 @@ fn confirmations_are_kept_per_package_and_only_in_a_private_directory() {
     );
     // Only so many are kept.
     for index in 0..40 {
-        state.remember_confirmed(&format!("sources {index}"));
+        state
+            .remember_confirmed(&format!("sources {index}"))
+            .unwrap();
     }
     assert!(!state.is_confirmed("prebuilt abc"));
     assert!(state.is_confirmed("sources 39"));
 
-    // Without a directory, or with one open to others, nothing is
-    // remembered: the question is asked again.
+    // Without a place for a directory, or with one open to others,
+    // nothing is remembered, and that is an error: the question is asked
+    // again.
     let nowhere = State::open(None, "demo");
-    nowhere.remember_confirmed("x");
+    assert!(nowhere.remember_confirmed("x").is_err());
     assert!(!nowhere.is_confirmed("x"));
     let open = dir.path().join("open");
     fs::create_dir(&open).unwrap();
     fs::set_permissions(&open, fs::Permissions::from_mode(0o755)).unwrap();
     let state = State::open(Some(&open), "demo");
-    state.remember_confirmed("x");
+    let refused = state.remember_confirmed("x").unwrap_err().to_string();
+    assert!(
+        refused.ends_with("open is accessible to group or others"),
+        "{refused}"
+    );
     assert!(!state.is_confirmed("x"));
 }
 
@@ -61,7 +68,7 @@ fn binaries_and_extractions_round_trip() {
         ("src/odd\nname", ""),
         ("src/x", "22"),
     ]);
-    state.record_binaries(&binaries);
+    state.record_binaries(&binaries).unwrap();
     let known = state.binaries().unwrap();
     assert_eq!(known.len(), 3);
     assert_eq!(binary_changes(&known, &binaries).1, Vec::<String>::new());
@@ -81,7 +88,7 @@ fn binaries_and_extractions_round_trip() {
         unlisted: false,
     };
     assert_eq!(state.extraction(), Kept::Absent);
-    assert!(state.record_extraction(&extraction));
+    assert!(state.record_extraction(&extraction).unwrap());
     let Kept::Usable(read) = state.extraction() else {
         panic!("a record");
     };
@@ -101,14 +108,16 @@ fn a_later_call_sees_what_changed_since_guardian_extracted() {
     ]);
     let dir = TempDir::new("gate-drift");
     let state = State::open(Some(&dir.path().join("state")), "demo");
-    state.record_extraction(&Extraction {
-        srcdir: "/x".into(),
-        identity: Some("1:2:3".into()),
-        cleanbuild: true,
-        downloads: downloads.clone(),
-        files: files.clone(),
-        unlisted: false,
-    });
+    state
+        .record_extraction(&Extraction {
+            srcdir: "/x".into(),
+            identity: Some("1:2:3".into()),
+            cleanbuild: true,
+            downloads: downloads.clone(),
+            files: files.clone(),
+            unlisted: false,
+        })
+        .unwrap();
     let Kept::Usable(extraction) = state.extraction() else {
         panic!("a record");
     };

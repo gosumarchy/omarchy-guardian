@@ -219,10 +219,33 @@ extracts over to makepkg and cannot look in between. The call that extracts is
 handed to makepkg with `--holdver` added, so it does not fetch newer VCS
 sources than were reviewed.
 
-With no such record (Guardian did not extract for this build, or has no review
-memory to keep it in), the sources are reviewed as that call finds them, and
-you and the AI are told so. Without the review memory no answer is remembered
-either, and each makepkg call asks again.
+With no such record because Guardian did not extract for this build, the
+sources are reviewed as that call finds them, and you and the AI are told so.
+
+Where there should be a record and there cannot be one, the build is blocked
+(exit 2) and the message says what to put right:
+
+- Guardian keeps these records in `aur-gate` under its review memory
+  (`$XDG_STATE_HOME/omarchy-guardian`, else `~/.local/state/omarchy-guardian`),
+  a directory that must be yours alone. If it or the directory above it is
+  open to group or others, belongs to another user, has a link or a file in
+  its place, or cannot be made, or if neither variable names a place, a call
+  that extracts or builds from what was extracted is blocked before anything
+  is reviewed or fetched. A directory that was open to others is not to be
+  closed and used as it is: someone else may have put records in it. The
+  message gives the commands to close it and drop what it holds, or to remove
+  it. Calls that only print (`--printsrcinfo`, `--packagelist`) still work.
+- If the record cannot be written (a full disk, a directory you cannot write
+  to), the call that extracts is blocked. A record of an earlier extraction
+  stays as it was.
+- If the record is there and cannot be read back, or a directory is in its
+  place, the later call is blocked. Extracting again writes a new record; a
+  directory that is not empty you remove yourself.
+- If the sources have more files, or longer names, than a record can hold, the
+  build is blocked at both calls.
+
+An answer of yours that cannot be remembered, or binary hashes that cannot be
+kept, do not block: Guardian says so, and asks again at the next makepkg call.
 
 The AI then reviews the upstream code under `src/`: all of it when its code is
 up to 1 MiB. A larger source is reviewed in part: its build files and scripts
