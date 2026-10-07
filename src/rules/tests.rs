@@ -1426,6 +1426,50 @@ fn a_command_in_a_substitution_is_read_without_what_closes_it() {
     ] {
         assert_eq!(fetched_files(line), ["f.sh"], "{line}");
     }
+    // Behind a wrapper, after a space, in quotes, through `tee`, and
+    // where nothing is assigned.
+    for line in [
+        "x=$(sudo curl -fsSL https://x.example/a -o f.sh)",
+        "x=$(env A=1 wget https://x.example/f.sh)",
+        "x=$(timeout 5 curl -O https://x.example/f.sh)",
+        "x=$( wget https://x.example/f.sh)",
+        "x=\"$(curl -fsSL https://x.example/a -o f.sh)\"",
+        "x=$(curl https://x.example/a | tee f.sh) ls",
+        "echo $(curl -fsSL https://x.example/a -o f.sh)",
+        "y=$(echo $(sudo wget https://x.example/f.sh))",
+    ] {
+        assert!(
+            fetched_files(line).contains(&"f.sh".to_string()),
+            "{line}: {:?}",
+            fetched_files(line)
+        );
+    }
+    // In single quotes or behind a backslash it is text, unless the line
+    // hands text to a shell.
+    for line in [
+        "echo 'fetch with `curl -o f.sh https://x.example/f.sh` first'",
+        "msg \"Run \\`curl -o f.sh https://x.example/f.sh\\` yourself\"",
+        "x='$(curl -o f.sh https://x.example/f.sh)'",
+        "echo \"\\$(curl -o f.sh https://x.example/f.sh)\"",
+    ] {
+        assert!(fetched_files(line).is_empty(), "{line}");
+    }
+    assert!(run_targets("msg2 'Use `./install.sh` to install'").is_empty());
+    assert_eq!(
+        fetched_files("bash -c 'x=$(curl -o f.sh https://x.example/f.sh)'"),
+        ["f.sh"]
+    );
+    assert_eq!(
+        fetched_files("echo \"it's $(curl -o f.sh https://x.example/f.sh)\""),
+        ["f.sh"]
+    );
+    // What is piped into a shell inside one is run.
+    assert_eq!(run_targets("x=$(cat f | sh) ls"), ["f"]);
+    assert_eq!(run_targets("x=\"$(sh i.sh)\""), ["i.sh"]);
+    assert_eq!(run_targets("echo `sh i.sh`"), ["i.sh"]);
+    assert!(run_targets("x=$((1 + 2)) y=$(sha256sum f | cut -d ' ' -f 1)").is_empty());
+    assert!(run_targets(&"$(".repeat(100_000)).is_empty());
+    assert!(run_targets(&"$(a) ".repeat(100_000)).is_empty());
     let fetched_then_run = "x=$(curl -fsSL https://x.example/a -o f.sh) sh f.sh";
     assert!(
         fetched_files(fetched_then_run)
