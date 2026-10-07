@@ -1444,6 +1444,25 @@ fn a_command_in_a_substitution_is_read_without_what_closes_it() {
             fetched_files(line)
         );
     }
+    // In single quotes or behind a backslash it is text, unless the line
+    // hands text to a shell.
+    for line in [
+        "echo 'fetch with `curl -o f.sh https://x.example/f.sh` first'",
+        "msg \"Run \\`curl -o f.sh https://x.example/f.sh\\` yourself\"",
+        "x='$(curl -o f.sh https://x.example/f.sh)'",
+        "echo \"\\$(curl -o f.sh https://x.example/f.sh)\"",
+    ] {
+        assert!(fetched_files(line).is_empty(), "{line}");
+    }
+    assert!(run_targets("msg2 'Use `./install.sh` to install'").is_empty());
+    assert_eq!(
+        fetched_files("bash -c 'x=$(curl -o f.sh https://x.example/f.sh)'"),
+        ["f.sh"]
+    );
+    assert_eq!(
+        fetched_files("echo \"it's $(curl -o f.sh https://x.example/f.sh)\""),
+        ["f.sh"]
+    );
     // What is piped into a shell inside one is run.
     assert_eq!(run_targets("x=$(cat f | sh) ls"), ["f"]);
     assert_eq!(run_targets("x=\"$(sh i.sh)\""), ["i.sh"]);

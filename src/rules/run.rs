@@ -118,14 +118,8 @@ fn saved_as(words: &[String], at: usize) -> Option<String> {
 pub(crate) fn fetched_files(line: &str) -> Vec<String> {
     let mut found = Vec::new();
     // A substitution runs what it holds (`x=$(sudo curl -o f …)`,
-    // `$(curl … | tee f)`), so each is read as a line of its own. One
-    // past what `Reading` reads names no file.
-    let mut reading = shell::Reading::of(line);
-    let bodies = shell::substitutions(line)
-        .into_iter()
-        .map(|substitution| substitution.body)
-        .filter(|body| reading.takes(body));
-    for text in std::iter::once(line).chain(bodies) {
+    // `$(curl … | tee f)`), so each is read as a line of its own.
+    for text in std::iter::once(line).chain(substituted_lines(line)) {
         for file in fetched_file(text)
             .into_iter()
             .chain(fetch::saved_files(text))
@@ -235,21 +229,52 @@ fn runs_named(command: &shell::Command, is_named: &dyn Fn(&str) -> bool) -> bool
 pub(crate) fn run_targets(line: &str) -> Vec<String> {
     let mut found = targets_of(line);
     // A substitution runs what it holds (`x=$(cat f | sh) make`), so each
-    // is read as a line of its own. One past what `Reading` reads names
-    // no file.
-    let mut reading = shell::Reading::of(line);
-    for substitution in shell::substitutions(line) {
+    // is read as a line of its own.
+    for body in substituted_lines(line) {
         // `$(<f)` reads a file and runs nothing.
-        if substitution.body.trim_start().starts_with('<') || !reading.takes(substitution.body) {
+        if body.trim_start().starts_with('<') {
             continue;
         }
-        for target in targets_of(substitution.body) {
+        for target in targets_of(body) {
             if !found.contains(&target) {
                 found.push(target);
             }
         }
     }
     found
+}
+
+/// What each substitution of `line` holds, where the shell runs it. One
+/// past what `Reading` reads is left out: it names no file. So is one in
+/// single quotes or behind a backslash, which is text (`echo 'run `x`'`),
+/// unless the line hands text to a shell.
+fn substituted_lines(line: &str) -> Vec<&str> {
+    let handed_on = [" -c", "eval "].iter().any(|runner| line.contains(runner));
+    let mut reading = shell::Reading::of(line);
+    shell::substitutions(line)
+        .into_iter()
+        .filter(|substitution| handed_on || !is_text(line, substitution.start))
+        .map(|substitution| substitution.body)
+        .filter(|body| reading.takes(body))
+        .collect()
+}
+
+/// Whether what stands at `at` in `line` is text to the shell: inside
+/// single quotes, or after a backslash.
+fn is_text(line: &str, at: usize) -> bool {
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    for byte in line.bytes().take(at) {
+        let was_escaped = std::mem::take(&mut escaped);
+        match byte {
+            b'\\' if quote != Some(b'\'') => escaped = !was_escaped,
+            b'\'' | b'"' if was_escaped => {}
+            b'\'' | b'"' if quote == Some(byte) => quote = None,
+            b'\'' | b'"' if quote.is_none() => quote = Some(byte),
+            _ => {}
+        }
+    }
+    escaped || quote == Some(b'\'')
 }
 
 /// `run_targets`, for the line itself.

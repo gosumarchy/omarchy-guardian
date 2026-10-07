@@ -78,7 +78,7 @@ pub(super) struct Substitution<'a> {
     /// `$(`, `<(` or a backtick.
     open: &'static str,
     /// Where it opens in the line.
-    start: usize,
+    pub(super) start: usize,
     pub(super) body: &'a str,
 }
 
