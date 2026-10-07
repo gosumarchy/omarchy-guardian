@@ -445,7 +445,7 @@ impl Report {
                     || review
                         .findings
                         .iter()
-                        .any(|finding| finding.file == local.path)
+                        .any(|finding| names(&finding.file, &local.path))
             })
     }
 
@@ -742,6 +742,25 @@ const fn recommendation(decision: Decision) -> &'static str {
         }
         Decision::Clear => "Scope: this is a heuristic source review, not a safety guarantee.",
     }
+}
+
+/// Whether `named`, a file as the reviewer wrote it, is the file `path`.
+/// The reviewer may write `./path`, add a line (`path:4`), or give only
+/// the end of the path; any of these names it.
+fn names(named: &str, path: &str) -> bool {
+    let named = named.trim().trim_start_matches("./");
+    let named = match named.rsplit_once(':') {
+        Some((file, line)) if !line.is_empty() && line.bytes().all(|b| b.is_ascii_digit()) => file,
+        _ => named,
+    };
+    !named.is_empty()
+        && (named == path
+            || path
+                .strip_suffix(named)
+                .is_some_and(|before| before.ends_with('/'))
+            || named
+                .strip_suffix(path)
+                .is_some_and(|before| before.ends_with('/')))
 }
 
 #[cfg(test)]

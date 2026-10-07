@@ -222,6 +222,41 @@ fn one_run_with_more_than_remarks_blocks_and_the_others_keep_theirs() {
 }
 
 #[test]
+fn a_matched_file_is_named_however_the_reviewer_spells_it() {
+    let standard = |class| builtin(Profile::Standard, class);
+    let lows = [Severity::Low, Severity::Low];
+    let official = || report_under(Profile::Standard, SourceClass::Official);
+
+    // However the reviewer spells the file it names: with `./`, with a
+    // line, or by the end of its path.
+    for spelled in ["./a/.INSTALL", "a/.INSTALL:4", " a/.INSTALL", ".INSTALL"] {
+        let mut named = official();
+        named.findings.push(finding("a/.INSTALL"));
+        named
+            .agent_runs
+            .push(run_with(Status::Clear, &["a/.INSTALL"], &[]));
+        named
+            .agent_runs
+            .push(run_naming(Status::Clear, &["b/.INSTALL"], spelled, &lows));
+        assert_eq!(named.decide(&standard), FINDINGS, "{spelled}");
+        assert_eq!(named.remark_count(), 0, "{spelled}");
+    }
+    // A name that only ends like it is another file.
+    let mut other = official();
+    other.findings.push(finding("a/.INSTALL"));
+    other
+        .agent_runs
+        .push(run_with(Status::Clear, &["a/.INSTALL"], &[]));
+    other.agent_runs.push(run_naming(
+        Status::Clear,
+        &["b/x.INSTALL"],
+        "b/x.INSTALL",
+        &lows,
+    ));
+    assert_eq!(other.remark_count(), 2);
+}
+
+#[test]
 fn a_low_finding_where_a_local_rule_matched_is_no_remark() {
     let standard = |class| builtin(Profile::Standard, class);
     let lows = [Severity::Low, Severity::Low];
