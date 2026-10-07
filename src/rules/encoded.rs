@@ -744,7 +744,7 @@ mod tests {
         use super::MAX_ARGUMENT;
         // Calls that are never closed, each given the rest of the line.
         assert!(!matches(&"function(buffer.from(".repeat(8_000)));
-        assert!(!matches(&"exec(".repeat(20_000)));
+        assert!(!matches(&"exec(".repeat(80_000)));
         assert!(!matches(&"eval(x(".repeat(15_000)));
         assert!(matches(&("exec(".repeat(20_000) + "atob(x)")));
         // Past `MAX_GIVEN` a decode call anywhere on the line counts: none

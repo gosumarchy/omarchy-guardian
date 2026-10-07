@@ -972,7 +972,10 @@ fn only_a_variable_that_is_named_is_written_out() {
 #[test]
 fn substitutions_inside_one_another_cost_each_rule_little() {
     // Each of these is sixty-four substitutions that reach the end of the
-    // line: none is run, so no rule reads them.
+    // line: none is run, so no rule reads them. At this length these check
+    // what is found; the nested line that names the clipboard, below, is
+    // the one that would not come back in a test's time were each body
+    // read.
     for token in ["$(", "<(", "$(curl ", "x=$(", "\"$( "] {
         let line = token.repeat(60_000 / token.len());
         let found = rules_for(&line);
@@ -984,10 +987,13 @@ fn substitutions_inside_one_another_cost_each_rule_little() {
         rules_for(&format!("eval {nested}")),
         [RuleId::EncodedCommandExecution]
     );
+    // The clipboard is named, but by none of the commands that are read.
+    let nested = "$(echo ".repeat(8_000);
     assert_eq!(
-        rules_for(&format!("curl a {}", "$(wl-paste ".repeat(8_000))),
+        rules_for(&format!("curl a {nested}xclip")),
         [RuleId::CredentialExfiltration]
     );
+    assert!(rules_for("curl a $(echo $(echo $(echo xclip)))").is_empty());
     // A few are read as before.
     assert!(rules_for("eval \"$(echo \"$(tr a b <<< \"$(cat x)\")\")\"").is_empty());
     assert_eq!(
