@@ -324,8 +324,8 @@ pub(super) fn program_word<'a>(
 enum Passed<'a> {
     /// Looks past it to that program, and does not keep what it held.
     Unnoted,
-    /// Looks past it, and keeps the words of the first one it passed.
-    Noted(Option<Vec<&'a str>>),
+    /// Looks past it, and keeps the words of each one it passed.
+    Noted(Vec<Vec<&'a str>>),
     /// Reads what it holds, not what follows: for those words themselves.
     Never,
 }
@@ -388,8 +388,8 @@ fn program_past<'a>(
                         // `x=$(mktemp -d) sh f`: as above, with the
                         // substitution over several words.
                         held = held.or_else(|| command_of(rest));
-                        if let Passed::Noted(noted @ None) = passed {
-                            *noted = Some(
+                        if let Passed::Noted(noted) = passed {
+                            noted.push(
                                 std::iter::once(rest)
                                     .chain(words.clone().take(within))
                                     .collect(),
@@ -529,26 +529,46 @@ pub(super) fn command(part: &str) -> Option<Command> {
     })
 }
 
-/// The command inside a substitution that `command` looked past for the
-/// program after it (`x=$(sudo sh f) :`): it runs as well.
-pub(super) fn inner_command(part: &str) -> Option<Command> {
-    let words = unquoted_words(part);
-    let mut passed = Passed::Noted(None);
-    program_past(&mut words.iter().map(String::as_str), &mut passed)?;
-    let Passed::Noted(Some(within)) = passed else {
-        return None;
+/// `program_word`, with the program and what it is given inside each
+/// substitution that was looked past for the program after it
+/// (`x=$(sudo sh f) :`): those run as well.
+pub(super) fn programs<'a>(
+    words: &mut (impl Iterator<Item = &'a str> + Clone),
+) -> (Option<&'a str>, Vec<Within<'a>>) {
+    let mut passed = Passed::Noted(Vec::new());
+    let program = program_past(words, &mut passed);
+    let Passed::Noted(noted) = passed else {
+        return (program, Vec::new());
     };
-    let mut within = within.into_iter();
-    let path = program_past(&mut within, &mut Passed::Never)?.to_string();
-    let arguments = within
-        .map(|word| word.trim_end_matches(';').to_string())
-        .filter(|word| !word.is_empty())
+    let within = noted
+        .into_iter()
+        .filter_map(|words| {
+            let mut words = words.into_iter();
+            let program = program_past(&mut words, &mut Passed::Never)?;
+            Some((program, words))
+        })
         .collect();
-    Some(Command {
-        program: program_name(&path).to_string(),
-        path,
-        arguments,
-    })
+    (program, within)
+}
+
+/// A program inside a substitution, and the words after it there.
+pub(super) type Within<'a> = (&'a str, std::vec::IntoIter<&'a str>);
+
+/// The commands inside the substitutions that `command` looked past.
+pub(super) fn inner_commands(part: &str) -> Vec<Command> {
+    let words = unquoted_words(part);
+    let (_, within) = programs(&mut words.iter().map(String::as_str));
+    within
+        .into_iter()
+        .map(|(path, rest)| Command {
+            program: program_name(path).to_string(),
+            path: path.to_string(),
+            arguments: rest
+                .map(|word| word.trim_end_matches(';').to_string())
+                .filter(|word| !word.is_empty())
+                .collect(),
+        })
+        .collect()
 }
 
 /// The last statement of a pipeline part cut at pipes alone, which is the

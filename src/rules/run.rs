@@ -165,14 +165,11 @@ pub(crate) fn runs_file(line: &str, file: &str) -> bool {
     }
     let line = line.replace("&&", ";").replace("||", ";");
     line.split([';', '|']).any(|statement| {
-        [
-            run_command(statement),
-            value_command(statement),
-            shell::inner_command(statement),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|command| runs_named(&command, &is_named))
+        [run_command(statement), value_command(statement)]
+            .into_iter()
+            .flatten()
+            .chain(shell::inner_commands(statement))
+            .any(|command| runs_named(&command, &is_named))
     })
 }
 
@@ -247,9 +244,12 @@ pub(crate) fn run_targets(line: &str) -> Vec<String> {
         let within: Vec<(usize, Option<shell::Command>)> = statement
             .split('|')
             .take(MAX_SEGMENTS)
-            .map(shell::inner_command)
             .enumerate()
-            .filter(|(_, command)| command.is_some())
+            .flat_map(|(at, segment)| {
+                shell::inner_commands(segment)
+                    .into_iter()
+                    .map(move |command| (at, Some(command)))
+            })
             .collect();
         let each = commands
             .iter()

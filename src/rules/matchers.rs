@@ -185,7 +185,16 @@ fn reads_pipe(segments: &[&str], index: usize) -> bool {
     let mut words = segments[index]
         .split_whitespace()
         .map(|word| word.trim_start_matches(['(', '{', '"', '\'']));
-    let Some(word) = shell::program_word(&mut words) else {
+    // A command inside a substitution that was looked past for the
+    // program after it reads the pipe as well: `| x=$(sudo sh) true`.
+    let (word, within) = shell::programs(&mut words);
+    if within
+        .into_iter()
+        .any(|(program, rest)| consumes_pipe(program, rest, spaced))
+    {
+        return true;
+    }
+    let Some(word) = word else {
         return false;
     };
     // `xargs sh -c '…'`: xargs hands the input to the shell.
