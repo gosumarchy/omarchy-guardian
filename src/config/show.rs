@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::config::Settings;
-use crate::config::load::FileStatus;
+use crate::config::load::{FileStatus, UserBlock};
 use crate::config::model::{Named, SourceClass};
 use crate::config::resolve::KNOBS;
 use crate::engine::store;
@@ -36,8 +36,19 @@ fn header(settings: &Settings) -> String {
     if let Some(reason) = settings.privileged_block() {
         let _ = writeln!(text, "Pacman gate: BLOCKED — {reason}");
     }
-    if let Some(reason) = settings.user_block() {
-        let _ = writeln!(text, "User-level reviews: BLOCKED — {reason}");
+    // The reason is beside the file above; `config check` prints this, so
+    // it is not said here to run it.
+    if let Some(cause) = settings.user_block_cause() {
+        let _ = writeln!(
+            text,
+            "User-level reviews: BLOCKED — {}",
+            match cause {
+                UserBlock::SystemFile => "until the system file is fixed, as root",
+                UserBlock::Unverified =>
+                    "this is running in a user namespace that does not map root, where root's files look like nobody's: run it outside the sandbox",
+                UserBlock::UserFile => "until the user file is fixed",
+            }
+        );
     }
     let memory = settings.store_settings();
     let _ = writeln!(
@@ -155,6 +166,7 @@ mod tests {
     use super::{render_check, render_memory, render_show};
     use crate::agent::SourceFile;
     use crate::config::Settings;
+    use crate::config::load::Insecure;
     use crate::config::model::{AgentSettings, Named, SourceClass};
     use crate::engine::baseline::{self, Identity, Unit};
     use crate::engine::store::Store;
@@ -164,7 +176,7 @@ mod tests {
         clippy::unnecessary_wraps,
         reason = "must match the `Verify` callback signature `Settings::load_from` expects"
     )]
-    fn secure(_: &Path) -> Result<(), String> {
+    fn secure(_: &Path) -> Result<(), Insecure> {
         Ok(())
     }
 
@@ -233,8 +245,15 @@ mod tests {
         assert!(check.contains("(INVALID: "), "{check}");
         assert!(check.contains("system.toml:3:"), "{check}");
         assert!(check.contains("Pacman gate: BLOCKED — "), "{check}");
-        assert!(check.contains("User-level reviews: BLOCKED — "), "{check}");
-        assert!(check.contains("fix it as root"), "{check}");
+        assert!(
+            check.contains(
+                "User-level reviews: BLOCKED — until the system file is fixed, as root\n"
+            ),
+            "{check}"
+        );
+        // `config check` does not say to run `config check` for this; the
+        // pacman gate's line is the gate's own text, as it was.
+        assert_eq!(check.matches("config check").count(), 1, "{check}");
         assert!(check.contains("Configuration has errors"), "{check}");
 
         // Shown, and no class reads as reviewed at the defaults.
@@ -265,7 +284,18 @@ mod tests {
         let settings = Settings::load_from(&system, Some(&user), &secure);
         let show = render_show(&settings, &[SourceClass::Official, SourceClass::Aur]);
         assert!(!show.contains("Pacman gate: BLOCKED"), "{show}");
-        assert!(show.contains("User-level reviews: BLOCKED — "), "{show}");
+        assert!(
+            show.contains("User-level reviews: BLOCKED — until the user file is fixed\n"),
+            "{show}"
+        );
+
+        // A namespace without root: said, and not as something to fix.
+        let overflow = |path: &Path| Err(Insecure::owned_by(path, 65_534));
+        let settings = Settings::load_in(&system, None, &overflow, &|_| true);
+        let (check, valid) = render_check(&settings);
+        assert!(!valid);
+        assert!(check.contains("run it outside the sandbox"), "{check}");
+        assert!(!check.contains("as root"), "{check}");
         assert!(show.contains("hook · profile strict\n"), "{show}");
         assert!(
             show.contains("[aur]  user-level · profile strict · NOT IN FORCE"),

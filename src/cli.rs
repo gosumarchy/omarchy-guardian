@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use crate::ask;
 use crate::audit::{self, Gate};
 use crate::config::Settings;
+use crate::config::load::UserBlock;
 use crate::config::model::{Named, SourceClass};
 use crate::config::show;
 use crate::config::weaker;
@@ -186,15 +187,19 @@ fn refusal(invocation: &Invocation, settings: &Settings) -> Option<String> {
     if !reviews_for_the_user(invocation) {
         return None;
     }
-    if settings.system_block().is_some() {
-        return Some(format!(
-            "nothing was reviewed or run: the system settings file {} is invalid or insecure. Fix it as root; `omarchy-guardian config check` shows the problem.",
-            settings.system_path().display()
-        ));
-    }
-    settings
-        .user_block()
-        .map(|_| "nothing was reviewed or run: the user settings file is invalid.".to_string())
+    let system = settings.system_path().display();
+    Some(match settings.user_block_cause()? {
+        UserBlock::SystemFile => format!(
+            "nothing was reviewed or run: the system settings file {system} is invalid or insecure. Fix it as root; `omarchy-guardian config check` shows the problem."
+        ),
+        // Nothing is wrong with the file that root could fix.
+        UserBlock::Unverified => format!(
+            "nothing was reviewed or run: whether the system settings file {system} is root's cannot be told in a user namespace that does not map root. Run this outside the sandbox."
+        ),
+        UserBlock::UserFile => {
+            "nothing was reviewed or run: the user settings file is invalid.".to_string()
+        }
+    })
 }
 
 /// A one-run profile override (`--profile`) applies on top of the loaded

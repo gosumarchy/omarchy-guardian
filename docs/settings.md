@@ -224,7 +224,12 @@ keep that, or a typo in either file, from quietly switching a gate off:
   The message names the file and the reason. Fix the file as root:
   `omarchy-guardian config check` shows the problem, `config show` marks
   every class as `NOT IN FORCE`, and the bar counts it as a problem. A system
-  file that is not there is no error: the built-in defaults apply.
+  file that is not there is no error: the built-in defaults apply. In a user
+  namespace that does not map root (a sandbox such as `bwrap` without
+  `--uid 0`, a rootless container) root's files look like nobody's, so the
+  file cannot be told to be root's and the same commands are refused there
+  too; the message then says to run Guardian outside the sandbox, since
+  there is nothing in the file to fix.
 - A user-level class set weaker than its profile (`ai` lower, `on_findings` or
   `on_ai_suspicious` on `warn` where the profile blocks, `confirm = false`
   under `local-only` with the AI off) still applies, and the bar counts it as

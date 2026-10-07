@@ -14,6 +14,7 @@ use crate::agent::SourceFile;
 use crate::audit::{self, Gate};
 use crate::config::Settings;
 use crate::config::file::{PartialConfig, PartialPolicy};
+use crate::config::load::Insecure;
 use crate::config::model::{AgentSettings, AiRequirement, Profile, SourceClass};
 use crate::engine::baseline::{self, Identity, Unit};
 use crate::engine::store::Store;
@@ -365,7 +366,7 @@ fn only_reviews_for_the_user_stop_on_a_broken_user_file() {
 }
 
 /// Every command line, and whether it reviews at the user level.
-const LINES: [(&[&str], bool); 17] = [
+const LINES: [(&[&str], bool); 27] = [
     (&["scan", "dir"], true),
     (&["guard", "dir", "--", "true"], true),
     (&["guard", "--class", "theme", "dir", "--", "true"], true),
@@ -384,6 +385,19 @@ const LINES: [(&[&str], bool); 17] = [
     (&["log"], false),
     (&["permit"], false),
     (&["forget", "--all"], false),
+    // The sweep's own list, not a review.
+    (&["sweep", "allow", "item"], false),
+    (&["sweep", "allow", "--migrate"], false),
+    (&["sweep", "forget", "--all"], false),
+    // Nothing of the user's is reviewed or started by these.
+    (&["ask", "last"], false),
+    (&["test"], false),
+    (&["update"], false),
+    (&["protect"], false),
+    (&["protect", "--off"], false),
+    // The pacman gate refuses in its own words (`privileged_block`).
+    (&["pacman-hook", "--pacman-pid", "1", "--cwd", "/"], false),
+    (&["pacman-hook", "--preflight"], false),
 ];
 
 #[test]
@@ -392,7 +406,7 @@ fn a_broken_system_file_stops_every_review_for_the_user() {
     let system = dir.path().join("system.toml");
     let user = dir.path().join("user.toml");
     let verified = |_: &std::path::Path| Ok(());
-    let not_roots = |_: &std::path::Path| Err("owned by uid 1000, not root".to_string());
+    let not_roots = |path: &std::path::Path| Err(Insecure::owned_by(path, 1000));
     fs::write(&user, "profile = \"standard\"\n").unwrap();
 
     // It does not parse, or it is not root's alone.
@@ -417,7 +431,26 @@ fn a_broken_system_file_stops_every_review_for_the_user() {
         assert_eq!(settings.warnings().len(), 1);
     }
     assert!(unparsed.warnings()[0].contains("system.toml:1:"));
-    assert!(insecure.warnings()[0].contains("insecure: owned by uid 1000, not root"));
+    assert!(insecure.warnings()[0].starts_with(&format!(
+        "insecure: {} is owned by uid 1000, not root; fix it as root",
+        system.display()
+    )));
+
+    // In a user namespace that does not map root there is nothing for root
+    // to fix: the same commands are refused, and told to run outside it.
+    let overflow = |path: &std::path::Path| Err(Insecure::owned_by(path, 65_534));
+    let unverified = Settings::load_in(&system, Some(&user), &overflow, &|_| true);
+    for (line, reviews) in LINES {
+        let said = refusal(&parse(&args(line)).unwrap(), &unverified);
+        assert_eq!(
+            said,
+            reviews.then(|| format!(
+                "nothing was reviewed or run: whether the system settings file {} is root's cannot be told in a user namespace that does not map root. Run this outside the sandbox.",
+                system.display()
+            )),
+            "{line:?}"
+        );
+    }
     // The pacman gate refuses as it did.
     assert!(
         insecure
