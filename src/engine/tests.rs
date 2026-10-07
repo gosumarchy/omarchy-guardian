@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use super::{Group, Memory, is_retryable, remember, review_group};
+use super::{Group, Memory, chunk_error, is_retryable, remember, review_group};
 use crate::agent::SourceFile;
 use crate::config::Settings;
 use crate::config::file::{AgentDefaults, PartialConfig};
@@ -12,7 +12,9 @@ use crate::engine::baseline::{self, Identity, Unit, Unread};
 use crate::engine::store::{Store, VERDICTS};
 use crate::error::Error;
 use crate::report::AgentOutcome;
-use crate::test_support::{TempDir, mock_opencode, mock_opencode_counting, write_script};
+use crate::test_support::{
+    TempDir, mock_opencode, mock_opencode_counting, reviewer_by_content, write_script,
+};
 use crate::tools::OpenCode;
 
 static NOTHING_UNREAD: Unread = Unread::new();
@@ -147,9 +149,213 @@ fn an_invalid_chunk_blocks_and_caches_nothing() {
 
     let review = review_group(&group(&settings, &files), &opencode, Some(&memory));
 
+    // The second chunk's reply is invalid and has no run. The third either
+    // ran beside it (invalid too, no run) or was never started, and then its
+    // run says so. Neither is a verdict.
     assert!(review.invalid.is_some());
-    assert_eq!(review.runs.len(), 1);
+    assert!(matches!(review.runs[0].outcome, AgentOutcome::Reviewed(_)));
+    assert!(review.runs.len() <= 2, "{:?}", review.runs);
+    assert!(
+        review.runs[1..].iter().all(|run| matches!(
+            &run.outcome,
+            AgentOutcome::Unavailable(error) if error.to_string().contains("not attempted")
+        )),
+        "{:?}",
+        review.runs
+    );
     assert!(memory.store.list(VERDICTS).unwrap().is_empty());
+}
+
+/// `three_chunks` with content `reviewer_by_content` tells apart: the
+/// second chunk is the run of `q`, the third the run of `z`.
+fn three_told_apart() -> (AgentSettings, Vec<SourceFile>) {
+    let (settings, _) = three_chunks();
+    let files = [("a.c", "x"), ("b.c", "q"), ("c.c", "z")]
+        .map(|(path, byte)| file(path, &byte.repeat(300)))
+        .to_vec();
+    (settings, files)
+}
+
+/// Each run's chunk number, and how many findings its verdict has (`None`
+/// for a run without a verdict).
+fn chunks_and_findings(runs: &[crate::report::AgentRun]) -> Vec<(usize, Option<usize>)> {
+    runs.iter()
+        .map(|run| {
+            let findings = match &run.outcome {
+                AgentOutcome::Reviewed(review) => Some(review.findings.len()),
+                AgentOutcome::Unavailable(_) => None,
+            };
+            (run.chunk.map_or(0, |(index, _)| index), findings)
+        })
+        .collect()
+}
+
+#[test]
+fn a_verdict_reached_beside_an_invalid_chunk_is_kept() {
+    // The invalid reply comes after a pause, so the third chunk, which runs
+    // beside the second, has been started by then.
+    for (z_status, findings) in [("suspicious", 1), ("clear", 0)] {
+        let state = TempDir::new("engine-invalid-beside");
+        let bin = TempDir::new("engine-invalid-beside-bin");
+        let opencode = OpenCode::At(mock_opencode_counting(
+            bin.path(),
+            0,
+            &reviewer_by_content("sleep 1\nprintf '%s\\n' 'not json'", z_status),
+        ));
+        let memory = memory(&state, Vec::new());
+        let (settings, files) = three_told_apart();
+
+        let review = review_group(&group(&settings, &files), &opencode, Some(&memory));
+
+        // The error says which chunk it is about.
+        let invalid = review.invalid.map(|error| error.to_string());
+        assert!(
+            invalid
+                .as_deref()
+                .is_some_and(|error| error.starts_with("chunk 2/3: ")),
+            "{invalid:?}"
+        );
+        assert_eq!(
+            chunks_and_findings(&review.runs),
+            [(1, Some(0)), (3, Some(findings))],
+            "{:?}",
+            review.runs
+        );
+        assert!(memory.store.list(VERDICTS).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn the_error_names_the_failed_chunk_and_counts_the_others() {
+    let error = || Error::Refused("no reply".into());
+    // A review in one request has no chunk to name.
+    assert_eq!(chunk_error((1, 1), 0, error()).to_string(), "no reply");
+    assert_eq!(
+        chunk_error((2, 8), 0, error()).to_string(),
+        "chunk 2/8: no reply"
+    );
+    assert_eq!(
+        chunk_error((2, 8), 2, error()).to_string(),
+        "chunk 2/8 (and 2 more failed): no reply"
+    );
+}
+
+#[test]
+fn every_failed_chunk_is_counted() {
+    // The first reply is clear; every later one is invalid after a pause,
+    // so the second and third chunk, which run beside each other, have
+    // both been started by then.
+    let bin = TempDir::new("engine-invalid-both-bin");
+    let opencode = OpenCode::At(mock_opencode_counting(
+        bin.path(),
+        1,
+        "sleep 1\nprintf '%s\\n' 'not json'",
+    ));
+    let (settings, files) = three_chunks();
+
+    let review = review_group(&group(&settings, &files), &opencode, None);
+
+    let invalid = review.invalid.map(|error| error.to_string());
+    assert!(
+        invalid
+            .as_deref()
+            .is_some_and(|error| error.starts_with("chunk 2/3 (and 1 more failed): ")),
+        "{invalid:?}"
+    );
+    assert_eq!(chunks_and_findings(&review.runs), [(1, Some(0))]);
+}
+
+#[test]
+fn a_verdict_reached_beside_a_chunk_that_ran_out_of_time_is_kept() {
+    let state = TempDir::new("engine-out-of-time-beside");
+    let bin = TempDir::new("engine-out-of-time-beside-bin");
+    let opencode = OpenCode::At(mock_opencode_counting(
+        bin.path(),
+        0,
+        &reviewer_by_content(
+            "printf '{\"type\":\"step_start\"}\\n'\nexec sleep 10",
+            "suspicious",
+        ),
+    ));
+    let memory = memory(&state, Vec::new());
+    let (settings, files) = three_told_apart();
+    let settings = AgentSettings {
+        timeout_secs: 5,
+        ..settings
+    };
+
+    let aur = review_group(&group(&settings, &files), &opencode, Some(&memory));
+    assert!(aur.invalid.is_some(), "{:?}", aur.runs);
+    assert_eq!(
+        chunks_and_findings(&aur.runs),
+        [(1, Some(0)), (3, Some(1))],
+        "{:?}",
+        aur.runs
+    );
+    assert!(memory.store.list(VERDICTS).unwrap().is_empty());
+
+    // An official package's slow chunk is an unavailable run, as before,
+    // beside the other chunks' verdicts.
+    let official = Group {
+        class: SourceClass::Official,
+        ..group(&settings, &files)
+    };
+    let official = review_group(&official, &opencode, Some(&memory));
+    assert!(official.invalid.is_none());
+    assert_eq!(
+        chunks_and_findings(&official.runs),
+        [(1, Some(0)), (2, None), (3, Some(1))],
+        "{:?}",
+        official.runs
+    );
+}
+
+#[test]
+fn a_cached_verdict_after_an_invalid_chunk_is_kept() {
+    let state = TempDir::new("engine-invalid-cached");
+    let bin = TempDir::new("engine-invalid-cached-bin");
+    let memory = memory(&state, Vec::new());
+    let settings = AgentSettings {
+        max_input_bytes: 600,
+        ..AgentSettings::default()
+    };
+    let files = [file("a.c", &"x".repeat(300)), file("c.c", &"z".repeat(300))];
+
+    // Both chunks are reviewed and cached; then the first one's verdict,
+    // the clear one, is taken out of the cache.
+    let answers = OpenCode::At(mock_opencode_counting(
+        bin.path(),
+        0,
+        &reviewer_by_content("", "suspicious"),
+    ));
+    let first = review_group(&group(&settings, &files), &answers, Some(&memory));
+    assert_eq!(
+        chunks_and_findings(&first.runs),
+        [(1, Some(0)), (2, Some(1))]
+    );
+    let cached = memory.store.list(VERDICTS).unwrap();
+    assert_eq!(cached.len(), 2);
+    for name in &cached {
+        let verdict = memory.store.read(VERDICTS, name).unwrap().unwrap();
+        if !String::from_utf8_lossy(&verdict).contains("suspicious") {
+            memory.store.remove(VERDICTS, name).unwrap();
+        }
+    }
+    assert_eq!(memory.store.list(VERDICTS).unwrap().len(), 1);
+
+    // The first chunk's reply is now invalid: the second chunk's cached
+    // verdict and its finding are still part of the review.
+    let invalid = OpenCode::At(mock_opencode_counting(
+        bin.path(),
+        0,
+        "printf '%s\\n' 'not json'",
+    ));
+    let review = review_group(&group(&settings, &files), &invalid, Some(&memory));
+
+    assert!(review.invalid.is_some());
+    assert_eq!(chunks_and_findings(&review.runs), [(2, Some(1))]);
+    assert!(review.runs[0].cached.is_some());
+    assert_eq!(memory.store.list(VERDICTS).unwrap().len(), 1);
 }
 
 #[test]

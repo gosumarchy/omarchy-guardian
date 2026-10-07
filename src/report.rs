@@ -230,6 +230,10 @@ impl Decision {
     }
 }
 
+/// How the error of a chunk that was never sent begins: an earlier chunk
+/// had failed (see `engine`). The reason follows after a colon.
+pub(crate) const NOT_ATTEMPTED: &str = "not attempted after an earlier chunk failed";
+
 #[derive(Debug)]
 pub(crate) enum AgentOutcome {
     Reviewed(AgentReview),
@@ -549,22 +553,27 @@ impl Report {
     }
 
     /// What a permit for this report would overrule, a line each and at
-    /// most `limit` of them: the alerts by where they are, and why the
-    /// review is incomplete. Shown to the user before they permit.
+    /// most `limit` of them: why the review is incomplete, then the alerts
+    /// by where they are. Shown to the user before they permit. The
+    /// reasons the review is incomplete come first, so that the limit cuts
+    /// alerts before it cuts them; the chunks never sent after one failed
+    /// are one line together.
     pub(crate) fn overruled_summary(&self, limit: usize) -> Vec<String> {
         let mut lines: Vec<String> = self
-            .findings
+            .gaps
             .iter()
-            .map(|finding| {
-                format!(
-                    "{} {}:{} {}",
-                    finding.rule.severity().label(),
-                    finding.path,
-                    finding.line,
-                    finding.rule.name()
-                )
-            })
+            .map(|gap| format!("not reviewed: {gap}"))
             .collect();
+        lines.extend(self.findings.iter().map(|finding| {
+            format!(
+                "{} {}:{} {}",
+                finding.rule.severity().label(),
+                finding.path,
+                finding.line,
+                finding.rule.name()
+            )
+        }));
+        let mut not_attempted = 0_usize;
         for run in &self.agent_runs {
             match &run.outcome {
                 AgentOutcome::Reviewed(review) => {
@@ -581,9 +590,17 @@ impl Report {
                     }
                 }
                 AgentOutcome::Unavailable(error) => {
-                    lines.push(format!("AI review unavailable: {error}"));
+                    let error = error.to_string();
+                    if error.starts_with(NOT_ATTEMPTED) {
+                        not_attempted += 1;
+                    } else {
+                        lines.push(format!("AI review unavailable: {error}"));
+                    }
                 }
             }
+        }
+        if not_attempted > 0 {
+            lines.push(format!("{not_attempted} chunk(s) {NOT_ATTEMPTED}"));
         }
         for advisory in self.audit.iter().flat_map(|audit| &audit.advisories) {
             lines.push(format!(
@@ -591,7 +608,6 @@ impl Report {
                 advisory.id, advisory.package, advisory.version
             ));
         }
-        lines.extend(self.gaps.iter().map(|gap| format!("not reviewed: {gap}")));
         let more = lines.len().saturating_sub(limit);
         lines.truncate(limit);
         if more > 0 {
