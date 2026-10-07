@@ -186,7 +186,7 @@ fn filters_literal_into_shell(
             // `tr … <<< x || y | sh`: what is piped on is the end of the
             // segment, read from the filter on.
             followed += 1;
-            if followed > MAX_FOLLOWED || flat[index].get(begins..).is_some_and(&filters) {
+            if followed > MAX_FOLLOWED || flat[index].get(begins..).is_some_and(filters) {
                 return true;
             }
         }
