@@ -114,15 +114,18 @@ pub(crate) fn render_show(settings: &Settings, classes: &[SourceClass]) -> Strin
         }
         // No knob: it comes with the profile (for a pacman class, with
         // the stricter of the system's and the user's) and is shown so
-        // that what is printed here is the whole policy.
+        // that what is printed here is the whole policy. The sweep, which
+        // is all that reviews as `system`, counts them as findings in
+        // every profile (see `sweep::judge`).
+        let (remarks, from) = match (class, policy.ai_remarks) {
+            (SourceClass::System, _) => ("findings", "the sweep's own rule"),
+            (_, Remarks::Shown) => ("shown", "profile"),
+            (_, Remarks::Findings) => ("findings", "profile"),
+        };
         let _ = writeln!(
             text,
-            "  {:<17} {:<17} (profile; not a setting)",
-            "low AI remarks",
-            match policy.ai_remarks {
-                Remarks::Shown => "shown",
-                Remarks::Findings => "findings",
-            }
+            "  {:<17} {remarks:<17} ({from}; not a setting)",
+            "low AI remarks"
         );
         let _ = writeln!(
             text,
@@ -226,6 +229,14 @@ mod tests {
                 .count(),
             2,
             "{text}"
+        );
+        // The sweep's class: findings there whatever the profile.
+        let sweep = render_show(&settings, &[SourceClass::System]);
+        assert!(
+            sweep.contains(
+                "  low AI remarks    findings          (the sweep's own rule; not a setting)"
+            ),
+            "{sweep}"
         );
         let strict = Settings::load_from(&system, Some(&user), &secure)
             .with_profile(crate::config::model::Profile::Strict);

@@ -96,9 +96,13 @@ and a list of findings, each graded `high`, `medium` or `low`:
 
 One finding of a chunk graded above `low`, or one whose severity Guardian
 cannot read (it counts as high), and every finding of that chunk is a
-finding. Each chunk is judged on its own: the remarks of one take nothing
+finding. So is every low finding of a chunk in whose files a local rule
+matched, or that names a file where one did: the reviewer is asked to confirm
+or dismiss each local match, so a low finding beside one may be its
+confirmation, and it follows `on_ai_suspicious` as before. Each chunk is judged on its own: the remarks of one take nothing
 from a `suspicious` verdict or a higher finding in another, which block as
-they always did. Where a pacman transaction holds packages of several
+they always did; the report then says that the remarks come from the parts
+judged clear. Where a pacman transaction holds packages of several
 classes, a chunk's low findings are remarks only when every class it touches
 (its files, and each file a finding names) shows them as remarks.
 
@@ -110,8 +114,11 @@ prints it as `low AI remarks`.
 A review that is clear with remarks is remembered like any clear review (see
 [Review memory](#review-memory)): the verdict is cached with its remarks, so
 the same content shows them again from the cache, and the source becomes the
-approved baseline. The audit trail records how many there were
-(`remarks=N`).
+approved baseline. The baseline says that it was approved with remarks, and
+so does every upgrade approved as a diff on top of it: under a profile that
+counts remarks as findings (`strict`) such a baseline is no approval, and the
+source is reviewed in full. The audit trail records how many remarks there
+were (`remarks=N`).
 
 The [system sweep](system-sweep.md) is not a gate and lists what there is to
 look at: there every AI finding on an item is a finding in every profile, the

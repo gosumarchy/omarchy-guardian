@@ -31,7 +31,17 @@
 # findings (exit 1). An incomplete or unavailable review fails either way.
 # Under the default profile the low remarks of a clear AI verdict do not block
 # (docs/review.md), so a block case the AI answers that way counts as missed,
-# and a clear case with such remarks passes.
+# and a clear case with such remarks passes. A block case passes on exit 1
+# whatever blocked it, a local rule included, so the exit code alone does not
+# show a reviewer that answered a block case with clear and low findings.
+# Each gate run therefore also records whether a report of it had that answer
+# (see `clear_with_low`): AI remarks, or low AI findings alone beside a clear
+# verdict, which count as findings where a local rule matched in the same
+# files. The count is printed beside each case's pass rate as `clear+low`,
+# and the run ends with the block cases that had it in any run, and the clear
+# cases that passed only because remarks do not block. This changes no pass
+# or fail. A system case shows "-": the sweep counts every AI finding, and
+# its cases are judged by severity already.
 # A system case is judged by the AI's own medium or high findings on the
 # planted files only: the rest of the real system (and its root-only files)
 # would otherwise decide the sweep's exit code, and local rules would hide
@@ -222,6 +232,29 @@ sweep_case() {
     return 0
 }
 
+# clear_with_low <log>: whether the reviewer answered some part of the case
+# with a clear verdict and low findings only. Read from the printed report:
+# the verdict box's "Remarks: 2 low · ..." line (those chunks were clear and
+# their findings did not count), or a report whose "AI findings" table holds
+# LOW rows alone while no chunk of it was SUSPICIOUS (clear, and the low
+# findings counted: a local rule matched beside them, or the profile is
+# strict). An AUR case's log holds two reports, the recipe's and the upstream
+# sources'; either counts.
+clear_with_low() {
+    [[ -r $1 ]] || return 1
+    grep -Eq 'Remarks: [0-9]+ low' "$1" && return 0
+    awk '
+        function ended() { if (low && !higher && !suspicious) found = 1 }
+        /^╭─ Omarchy Guardian/ { ended(); low = higher = suspicious = table = 0 }
+        /^  AI review .*SUSPICIOUS/ { suspicious = 1 }
+        /^  AI findings$/ { table = 1; next }
+        table && /^$/ { table = 0 }
+        table && /^  │ LOW / { low = 1 }
+        table && /^  │ (MEDIUM|HIGH) / { higher = 1 }
+        END { ended(); exit !found }
+    ' "$1"
+}
+
 # review <case-path> <run> <log>: prints the exit code of the gate
 review() {
     local case=$1 run=$2 log=$3
@@ -317,6 +350,12 @@ for case in "${cases[@]}"; do
             # say) lets the case through without asking the AI: no verdict.
             [[ $case != system/* ]] && grep -q 'LIMITED REVIEW' "$log" && status=2
             printf '%s\n' "$status" >"$WORK/results/${case//\//-}.$run"
+            remarks=-
+            if [[ $case != system/* ]]; then
+                remarks=0
+                clear_with_low "$log" && remarks=1
+            fi
+            printf '%s\n' "$remarks" >"$WORK/results/${case//\//-}.$run.remarks"
         ) &
         if ((++running >= JOBS)); then
             wait -n
@@ -328,10 +367,15 @@ wait
 
 failed=0
 block_passes=0 block_runs=0 clear_passes=0 clear_runs=0
+# Lines for the two lists at the end (see the head of this file).
+block_with_remarks=() clear_by_remarks=()
 for case in "${cases[@]}"; do
     want=0
     [[ $case == */block/* ]] && want=1
     passes=0 verdicts=""
+    # Runs the reviewer answered with clear and low findings only (see
+    # `clear_with_low`), and those of them the gate let through.
+    noted=0 let_through=0 remarks_shown=-
     for ((run = 1; run <= RUNS; run++)); do
         status=$(cat "$WORK/results/${case//\//-}.$run" 2>/dev/null || echo 2)
         case $status in
@@ -340,7 +384,20 @@ for case in "${cases[@]}"; do
         *) verdicts+=I ;;
         esac
         [[ $status == "$want" ]] && passes=$((passes + 1))
+        remarks=$(cat "$WORK/results/${case//\//-}.$run.remarks" 2>/dev/null || echo -)
+        if [[ $remarks == 1 ]]; then
+            noted=$((noted + 1))
+            [[ $status == 0 ]] && let_through=$((let_through + 1))
+        fi
+        [[ $remarks == - ]] || remarks_shown=$noted/$RUNS
     done
+    if ((noted > 0 && want == 1)); then
+        block_with_remarks+=("$(printf '%-45s %-6s clear+low in %d/%d run(s), let through in %d' \
+            "$case" "$verdicts" "$noted" "$RUNS" "$let_through")")
+    elif ((let_through > 0)); then
+        clear_by_remarks+=("$(printf '%-45s %-6s %d/%d run(s)' \
+            "$case" "$verdicts" "$let_through" "$RUNS")")
+    fi
     if ((want == 1)); then
         block_passes=$((block_passes + passes)) block_runs=$((block_runs + RUNS))
     else
@@ -351,8 +408,8 @@ for case in "${cases[@]}"; do
         mark=FAIL
         failed=$((failed + 1))
     fi
-    printf '%-4s %-45s %-6s %d/%d (%d%%)\n' "$mark" "$case" "$verdicts" \
-        "$passes" "$RUNS" $((100 * passes / RUNS))
+    printf '%-4s %-45s %-6s %d/%d (%d%%)  clear+low %s\n' "$mark" "$case" "$verdicts" \
+        "$passes" "$RUNS" $((100 * passes / RUNS)) "$remarks_shown"
 done
 
 # rate <passes> <runs>: a percentage, or "none" when no such case ran.
@@ -360,6 +417,17 @@ rate() {
     if (($2 > 0)); then printf '%d/%d (%d%%)' "$1" "$2" $((100 * $1 / $2)); else printf 'none'; fi
 }
 printf '\nC clear  F findings  I incomplete or unavailable\n'
+printf 'clear+low n/N: runs the reviewer answered, in some part, with a clear verdict and low findings only\n'
+if ((${#block_with_remarks[@]} > 0)); then
+    printf '\nBLOCK cases the reviewer answered with clear and low findings: look at these.\n'
+    printf 'Where such a case still passed (F), something else blocked it: a local rule,\n'
+    printf 'or another chunk. Without that, the gate would have let it through.\n'
+    printf '  %s\n' "${block_with_remarks[@]}"
+fi
+if ((${#clear_by_remarks[@]} > 0)); then
+    printf '\nCLEAR cases that passed only because remarks do not block:\n'
+    printf '  %s\n' "${clear_by_remarks[@]}"
+fi
 printf 'pass rate: block %s  clear %s  overall %s\n' \
     "$(rate "$block_passes" "$block_runs")" "$(rate "$clear_passes" "$clear_runs")" \
     "$(rate $((block_passes + clear_passes)) $((block_runs + clear_runs)))"

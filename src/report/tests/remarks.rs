@@ -59,42 +59,71 @@ fn only_strict_counts_the_low_findings_of_a_clear_verdict() {
     assert!(Remarks::Shown < Remarks::Findings);
 }
 
+/// Where a local rule matched, beside a run over `a/.INSTALL`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Local {
+    Nowhere,
+    /// In the run's own file.
+    InTheRun,
+    /// In a file no run of this report carries.
+    Elsewhere,
+}
+
 #[test]
-fn low_findings_of_a_clear_verdict_block_only_under_strict() {
+fn low_findings_of_a_clear_verdict_block_only_under_strict_or_beside_a_local_match() {
     use Severity::{High, Low, Medium};
-    for profile in [Profile::Standard, Profile::LocalOnly, Profile::Strict] {
-        for status in [Status::Clear, Status::Suspicious] {
-            for severities in [&[][..], &[Low, Low], &[Low, Medium], &[High]] {
-                for local in [false, true] {
-                    let mut report = report_under(profile, SourceClass::Aur);
-                    report
-                        .agent_runs
-                        .push(run_with(status, &["PKGBUILD"], severities));
-                    if local {
-                        report.findings.push(finding("PKGBUILD"));
-                    }
-                    let remarks = status == Status::Clear
-                        && severities == [Low, Low]
-                        && profile != Profile::Strict;
-                    let blocks = local
-                        || status == Status::Suspicious
-                        || (!severities.is_empty() && !remarks);
-                    let case = format!("{profile:?} {status:?} {severities:?} local={local}");
-                    assert_eq!(
-                        report.decide(&|class| builtin(profile, class)),
-                        if blocks { FINDINGS } else { Decision::Clear },
-                        "{case}"
-                    );
-                    assert_eq!(report.remark_count(), if remarks { 2 } else { 0 }, "{case}");
-                    // A remark is no alert; anything else is counted as before.
-                    let low = severities.iter().filter(|severity| **severity == Low);
-                    assert_eq!(
-                        report.counts().low,
-                        if remarks { 0 } else { low.count() },
-                        "{case}"
-                    );
-                }
+    let cases = [Profile::Standard, Profile::LocalOnly, Profile::Strict]
+        .into_iter()
+        .flat_map(|profile| [SourceClass::Aur, SourceClass::Official].map(|class| (profile, class)))
+        .flat_map(|(profile, class)| {
+            [Status::Clear, Status::Suspicious].map(|status| (profile, class, status))
+        })
+        .flat_map(|(profile, class, status)| {
+            [Local::Nowhere, Local::InTheRun, Local::Elsewhere]
+                .map(|local| (profile, class, status, local))
+        });
+    for (profile, class, status, local) in cases {
+        for severities in [&[][..], &[Low, Low], &[Low, Medium], &[High]] {
+            let mut report = report_under(profile, class);
+            report
+                .agent_runs
+                .push(run_with(status, &["a/.INSTALL"], severities));
+            match local {
+                Local::Nowhere => {}
+                Local::InTheRun => report.findings.push(finding("a/.INSTALL")),
+                Local::Elsewhere => report.findings.push(finding("b/.INSTALL")),
             }
+            let policy = builtin(profile, class);
+            let remarks = status == Status::Clear
+                && severities == [Low, Low]
+                && profile != Profile::Strict
+                && local != Local::InTheRun;
+            // `on_ai_suspicious` is block in every profile; a local match
+            // follows `on_findings`, which warns for official packages
+            // outside strict.
+            let ai_acts = status == Status::Suspicious || (!severities.is_empty() && !remarks);
+            let local_blocks = local != Local::Nowhere && policy.on_findings == Action::Block;
+            let expected = if ai_acts || local_blocks {
+                FINDINGS
+            } else if local != Local::Nowhere {
+                Decision::Warned
+            } else {
+                Decision::Clear
+            };
+            let case = format!("{profile:?} {class:?} {status:?} {severities:?} {local:?}");
+            assert_eq!(
+                report.decide(&|class| builtin(profile, class)),
+                expected,
+                "{case}"
+            );
+            assert_eq!(report.remark_count(), if remarks { 2 } else { 0 }, "{case}");
+            // A remark is no alert; anything else is counted as before.
+            let low = severities.iter().filter(|severity| **severity == Low);
+            assert_eq!(
+                report.counts().low,
+                if remarks { 0 } else { low.count() },
+                "{case}"
+            );
         }
     }
 }
@@ -152,9 +181,36 @@ fn one_run_with_more_than_remarks_blocks_and_the_others_keep_theirs() {
         // the alerts they are, and a low one beside a high one is an alert.
         assert_eq!(report.remark_count(), 2);
         assert_eq!(report.counts().total(), alerts);
-        let shown = report.findings_text(100, Painter::plain());
+        let shown = format!(
+            "{}\n{}",
+            report.verdict_box(FINDINGS, 100, Painter::plain()),
+            report.findings_text(FINDINGS, 100, Painter::plain())
+        );
         assert!(shown.contains("AI remarks"), "{shown}");
         assert_eq!(shown.contains("AI findings"), alerts > 0, "{shown}");
+        // The remarks say where they are from, and nothing calls a review
+        // clear that another chunk stopped. The page agrees.
+        let page = html::section(&report, FINDINGS);
+        for expected in [
+            "Remarks: 2 low · from parts the AI review judged clear; they did not decide this",
+            "From the parts the AI review judged clear. They did not decide this review.",
+        ] {
+            assert!(shown.contains(expected), "{expected}\n{shown}");
+        }
+        assert!(
+            page.contains(
+                "From the parts the AI review judged clear. They did not decide this review."
+            ),
+            "{page}"
+        );
+        for absent in [
+            "the AI review is clear",
+            "The AI review is clear",
+            "do not block",
+        ] {
+            assert!(!shown.contains(absent), "{absent}\n{shown}");
+            assert!(!page.contains(absent), "{absent}\n{page}");
+        }
         // A permit would overrule the block, not the remarks.
         let summary = report.overruled_summary(10);
         assert!(
@@ -166,41 +222,116 @@ fn one_run_with_more_than_remarks_blocks_and_the_others_keep_theirs() {
 }
 
 #[test]
-fn local_findings_act_as_before_beside_remarks() {
+fn a_low_finding_where_a_local_rule_matched_is_no_remark() {
     let standard = |class| builtin(Profile::Standard, class);
     let lows = [Severity::Low, Severity::Low];
+    let official = || report_under(Profile::Standard, SourceClass::Official);
 
-    // Official under standard: `on_findings = warn`.
-    let mut official = report_under(Profile::Standard, SourceClass::Official);
-    official.findings.push(finding("a/.INSTALL"));
-    official
+    // Official under standard has `on_findings = warn`. A local match and
+    // a clear review that adds low findings in the same run blocks, as it
+    // did before there were remarks: they may be the reviewer's word on
+    // the match.
+    let mut both = official();
+    both.findings.push(finding("a/.INSTALL"));
+    both.agent_runs
+        .push(run_with(Status::Clear, &["a/.INSTALL"], &lows));
+    assert_eq!(both.decide(&standard), FINDINGS);
+    assert_eq!((both.remark_count(), both.counts().total()), (0, 3));
+    assert_eq!(both.overruled_summary(10).len(), 3);
+
+    // The match alone warns, as before.
+    let mut matched = official();
+    matched.findings.push(finding("a/.INSTALL"));
+    matched
+        .agent_runs
+        .push(run_with(Status::Clear, &["a/.INSTALL"], &[]));
+    assert_eq!(matched.decide(&standard), Decision::Warned);
+
+    // Low findings alone are remarks, and the review is clear.
+    let mut noted = official();
+    noted
         .agent_runs
         .push(run_with(Status::Clear, &["a/.INSTALL"], &lows));
-    assert_eq!(official.decide(&standard), Decision::Warned);
-    assert_eq!(official.remark_count(), 2);
-    let (headline, _) = official.headline(Decision::Warned);
-    assert!(headline.starts_with("! WARNED — 1 alert(s)"), "{headline}");
+    assert_eq!(noted.decide(&standard), Decision::Clear);
+    assert_eq!((noted.remark_count(), noted.counts().total()), (2, 0));
 
-    // Without the local finding it is clear, and a medium finding of the
-    // AI's blocks an official package as before.
-    official.findings.clear();
-    assert_eq!(official.decide(&standard), Decision::Clear);
-    official.agent_runs.push(run_with(
+    // The run counts as a whole: a match in one of its files, low
+    // findings on another of them.
+    let mut same_run = official();
+    same_run.findings.push(finding("a/.INSTALL"));
+    same_run.agent_runs.push(run_naming(
+        Status::Clear,
+        &["a/.INSTALL", "b/.INSTALL"],
+        "b/.INSTALL",
+        &lows,
+    ));
+    assert_eq!(same_run.decide(&standard), FINDINGS);
+    assert_eq!(same_run.remark_count(), 0);
+
+    // So does a file a finding names that another run carried.
+    let mut named = official();
+    named.findings.push(finding("a/.INSTALL"));
+    named
+        .agent_runs
+        .push(run_with(Status::Clear, &["a/.INSTALL"], &[]));
+    named.agent_runs.push(run_naming(
         Status::Clear,
         &["b/.INSTALL"],
-        &[Severity::Medium],
+        "a/.INSTALL",
+        &lows,
     ));
-    assert_eq!(official.decide(&standard), FINDINGS);
+    assert_eq!(named.decide(&standard), FINDINGS);
+    assert_eq!(named.remark_count(), 0);
 
-    // A class that blocks on local findings blocks, with the remarks
-    // still remarks.
+    // A match in another run's file, which no low finding names, leaves
+    // the remarks remarks: the match warns, as it would alone.
+    let mut apart = official();
+    apart.findings.push(finding("a/.INSTALL"));
+    apart
+        .agent_runs
+        .push(run_with(Status::Clear, &["a/.INSTALL"], &[]));
+    apart
+        .agent_runs
+        .push(run_with(Status::Clear, &["b/.INSTALL"], &lows));
+    assert_eq!(apart.decide(&standard), Decision::Warned);
+    assert_eq!((apart.remark_count(), apart.counts().total()), (2, 1));
+    let (headline, _) = apart.headline(Decision::Warned);
+    assert!(headline.starts_with("! WARNED — 1 alert(s)"), "{headline}");
+    let boxed = apart.verdict_box(Decision::Warned, 120, Painter::plain());
+    assert!(
+        boxed.contains("Remarks: 2 low · from parts the AI review judged clear"),
+        "{boxed}"
+    );
+
+    // A dependency advisory is no local rule match: the remarks stay
+    // remarks, and the advisory acts as it always did.
+    let mut advised = report_under(Profile::Standard, SourceClass::Aur);
+    advised
+        .agent_runs
+        .push(run_with(Status::Clear, &["Cargo.lock"], &lows));
+    advised.audit = Some(crate::osv::Audit {
+        advisories: vec![crate::osv::Advisory {
+            id: "GHSA-x".into(),
+            package: "p".into(),
+            version: "1".into(),
+            lockfile: "Cargo.lock".into(),
+            severity: None,
+            summary: None,
+        }],
+        truncated: false,
+    });
+    assert_eq!(advised.decide(&standard), FINDINGS);
+    assert_eq!(advised.remark_count(), 2);
+
+    // A class that blocks on local findings blocks either way; the low
+    // findings beside the match are alerts again.
     let mut theme = report_under(Profile::Standard, SourceClass::Theme);
     theme.findings.push(finding("hyprland.lua"));
     theme
         .agent_runs
         .push(run_with(Status::Clear, &["hyprland.lua"], &lows));
     assert_eq!(theme.decide(&standard), FINDINGS);
-    assert_eq!((theme.remark_count(), theme.counts().total()), (2, 1));
+    assert_eq!((theme.remark_count(), theme.counts().total()), (0, 3));
 }
 
 #[test]
@@ -381,7 +512,7 @@ fn a_clear_review_with_remarks_reads_as_clear() {
 
     let plain = Painter::plain();
     let banner = report.verdict_box(decision, 100, plain);
-    let tables = report.findings_text(100, plain);
+    let tables = report.findings_text(decision, 100, plain);
     let shown = format!("{banner}\n{tables}");
     for expected in [
         "✓ CLEAR — no known concerns found; the AI reviewer left 2 remark(s)",
@@ -396,7 +527,14 @@ fn a_clear_review_with_remarks_reads_as_clear() {
     ] {
         assert!(shown.contains(expected), "{expected}\n{shown}");
     }
-    for absent in ["REVIEW REQUIRED", "Alerts:", "alert(s)", "AI finding"] {
+    for absent in [
+        "REVIEW REQUIRED",
+        "Alerts:",
+        "alert(s)",
+        "AI finding",
+        "judged clear",
+        "decide this",
+    ] {
         assert!(!shown.contains(absent), "{absent}\n{shown}");
     }
     let advice = crate::report::recommendation(decision);
@@ -408,6 +546,7 @@ fn a_clear_review_with_remarks_reads_as_clear() {
         r#"<span class="word green">CLEAR</span>"#,
         "0 HIGH · 0 MEDIUM · 0 LOW · 2 AI REMARK(S) · ",
         "<h3>AI remarks</h3>",
+        "The AI review is clear; it noted these all the same. They do not block.",
         "AI REMARK · fetch.sh:12",
         "Unquoted command substitution",
     ] {
@@ -435,7 +574,7 @@ fn under_strict_the_same_review_blocks_as_before() {
     let shown = format!(
         "{}\n{}",
         report.verdict_box(decision, 100, plain),
-        report.findings_text(100, plain)
+        report.findings_text(decision, 100, plain)
     );
     for expected in [
         "! REVIEW REQUIRED — 2 alert(s) across local and AI review",

@@ -43,6 +43,7 @@ fn memory(state: &TempDir, units: Vec<Unit>) -> Memory {
         cache_max_age_secs: 86_400,
         max_store_bytes: 1 << 30,
         now: 1_000_000,
+        remarks_are_findings: false,
     }
 }
 

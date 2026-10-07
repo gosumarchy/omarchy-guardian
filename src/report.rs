@@ -406,13 +406,20 @@ impl Report {
     }
 
     /// Whether the findings of `run` are remarks: its verdict is clear,
-    /// every one of its findings is graded low, and every class involved
-    /// (the run's files and each file a finding names, wherever it is)
-    /// shows such findings as remarks. The reviewer then says that nothing
-    /// here means harm, and what it adds is shown and decides nothing. One
-    /// finding graded higher, or a severity that could not be read (which
-    /// counts as high, see `agent::reply`), and all of the run's findings
-    /// are findings.
+    /// every one of its findings is graded low, every class involved (the
+    /// run's files and each file a finding names, wherever it is) shows
+    /// such findings as remarks, and no local rule matched in any of those
+    /// files. The reviewer then says that nothing here means harm, and
+    /// what it adds is shown and decides nothing. One finding graded
+    /// higher, or a severity that could not be read (which counts as high,
+    /// see `agent::reply`), and all of the run's findings are findings.
+    ///
+    /// A local match makes them findings because the request asks the
+    /// reviewer to confirm or dismiss every local finding in the files it
+    /// is sent: a low finding from a run that was asked about one may be
+    /// that confirmation, wherever the reviewer pinned it. So the whole
+    /// run counts, not only the file a finding names; a named file outside
+    /// the run counts too, since every run is told what matched there.
     pub(crate) fn is_remarks(&self, run: &AgentRun) -> bool {
         let AgentOutcome::Reviewed(review) = &run.outcome else {
             return false;
@@ -433,6 +440,13 @@ impl Report {
                         .map(|finding| self.class_of(&finding.file)),
                 )
                 .all(|class| self.remark_classes.contains(&class))
+            && !self.findings.iter().any(|local| {
+                run.files.contains(&local.path)
+                    || review
+                        .findings
+                        .iter()
+                        .any(|finding| finding.file == local.path)
+            })
     }
 
     /// How many remarks the AI review left (see `is_remarks`).

@@ -220,7 +220,8 @@ pub(crate) fn review_collected(
             .as_ref()
             .filter(|_| is_approved(&report, context.settings))
             .map(|settings| (report.agent_input.as_slice(), settings));
-        let notes = engine::remember(memory, approved, &report.unread);
+        let remarks = report.remark_count() > 0;
+        let notes = engine::remember_review(memory, approved, &report.unread, remarks);
         report.notes.extend(notes);
     }
     report

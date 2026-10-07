@@ -131,6 +131,11 @@ struct Manifest {
     /// before these were kept has neither, and is due (see `due`).
     full: Option<u64>,
     diffs: Option<u32>,
+    /// A review this version rests on left remarks: low findings beside a
+    /// clear AI verdict, which a profile that shows them lets pass (see
+    /// `Policy::ai_remarks`). Written only when set, so a manifest from
+    /// before there were remarks reads as one without any.
+    remarks: bool,
     /// (blob digest, path) per file.
     files: Entries,
     /// (digest, path) per unread file.
@@ -202,6 +207,7 @@ fn parse_manifest(text: &str) -> Option<Manifest> {
     let recorded = lines.next()?.strip_prefix("recorded ")?.parse().ok()?;
     let mut full = None;
     let mut diffs = None;
+    let mut remarks = false;
     let mut files = Vec::new();
     let mut unread = Vec::new();
     for line in lines {
@@ -213,6 +219,10 @@ fn parse_manifest(text: &str) -> Option<Manifest> {
         }
         if let Some(count) = line.strip_prefix("diffs ") {
             diffs = Some(count.parse().ok()?);
+            continue;
+        }
+        if let Some(count) = line.strip_prefix("remarks ") {
+            remarks = count.parse::<u32>().ok()? > 0;
             continue;
         }
         let (list, digest, path) = if let Some(entry) = line.strip_prefix("unread ") {
@@ -238,6 +248,7 @@ fn parse_manifest(text: &str) -> Option<Manifest> {
         recorded,
         full,
         diffs,
+        remarks,
         files,
         unread,
     })
@@ -263,7 +274,7 @@ pub(crate) fn load(
     units: &[Unit],
     settings: &AgentSettings,
 ) -> Result<Option<Approved>, Error> {
-    load_with(store, class, units, settings, None).map(|loaded| loaded.approved)
+    load_with(store, class, units, settings, None, false).map(|loaded| loaded.approved)
 }
 
 /// What `load_fresh` found.
@@ -278,15 +289,25 @@ pub(super) struct Loaded {
 /// `load` for a review at time `now`: a baseline that is due for a full
 /// review (see `MAX_DIFF_REVIEWS`, `MAX_DAYS_SINCE_FULL`) is deleted like
 /// any other that no longer counts, so that review is a full one and the
-/// baseline it records starts again.
+/// baseline it records starts again. So is one approved with remarks when
+/// `remarks_are_findings`: under such a policy that review would not have
+/// approved it.
 pub(super) fn load_fresh(
     store: &Store,
     class: SourceClass,
     units: &[Unit],
     settings: &AgentSettings,
     now: u64,
+    remarks_are_findings: bool,
 ) -> Result<Loaded, Error> {
-    load_with(store, class, units, settings, Some(now))
+    load_with(
+        store,
+        class,
+        units,
+        settings,
+        Some(now),
+        remarks_are_findings,
+    )
 }
 
 fn load_with(
@@ -295,6 +316,7 @@ fn load_with(
     units: &[Unit],
     settings: &AgentSettings,
     now: Option<u64>,
+    remarks_are_findings: bool,
 ) -> Result<Loaded, Error> {
     let expected = fingerprint(settings, class);
     let mut approved = Approved::default();
@@ -306,7 +328,14 @@ fn load_with(
             continue;
         }
         match load_unit(store, &name, unit, &expected, now)? {
-            UnitBaseline::Approved(files, unread) => {
+            UnitBaseline::Approved { remarks: true, .. } if remarks_are_findings => {
+                loaded.due.push(format!(
+                    "the approved version of {} was approved with low AI remarks, which are findings under this profile",
+                    unit.identity.as_str()
+                ));
+                store.remove(BASELINES, &name)?;
+            }
+            UnitBaseline::Approved { files, unread, .. } => {
                 found = true;
                 approved.prefixes.push(unit.prefix.clone());
                 approved.files.extend(files);
@@ -328,8 +357,13 @@ fn load_with(
 
 /// What one unit's stored baseline is worth to a review.
 enum UnitBaseline {
-    /// Its files and unread files, by path in the reviewed tree.
-    Approved(Entries, Entries),
+    /// Its files and unread files, by path in the reviewed tree, and
+    /// whether it was approved with remarks (see `Manifest::remarks`).
+    Approved {
+        files: Entries,
+        unread: Entries,
+        remarks: bool,
+    },
     /// Unreadable, another identity's, or approved under another prompt or
     /// other settings.
     Stale,
@@ -356,6 +390,7 @@ fn load_unit(
     if let Some(reason) = now.and_then(|now| due(&manifest, now)) {
         return Ok(UnitBaseline::Due(reason));
     }
+    let remarks = manifest.remarks;
     let mut files = Vec::with_capacity(manifest.files.len());
     for (digest, path) in manifest.files {
         let Some(content) = store
@@ -371,7 +406,11 @@ fn load_unit(
         .into_iter()
         .map(|(digest, path)| (format!("{}{path}", unit.prefix), digest))
         .collect();
-    Ok(UnitBaseline::Approved(files, unread))
+    Ok(UnitBaseline::Approved {
+        files,
+        unread,
+        remarks,
+    })
 }
 
 /// Deletes the baselines of `units`: the engine does so when a review that
@@ -398,6 +437,7 @@ pub(super) fn retire(store: &Store, class: SourceClass, units: &[Unit]) -> Resul
 /// differ, that was one more upgrade approved as a diff since the last
 /// full review, and when they are the same, nothing new was approved.
 /// Without one, this review was a full one.
+#[cfg(test)]
 pub(crate) fn record(
     store: &Store,
     class: SourceClass,
@@ -407,6 +447,39 @@ pub(crate) fn record(
     settings: &AgentSettings,
     now: u64,
 ) -> Result<(), Error> {
+    let version = Version {
+        files,
+        unread,
+        remarks: false,
+    };
+    record_version(store, class, units, &version, settings, now)
+}
+
+/// What a review approved.
+pub(super) struct Version<'a> {
+    pub(super) files: &'a [SourceFile],
+    pub(super) unread: &'a Unread,
+    /// The review left remarks (see `Manifest::remarks`).
+    pub(super) remarks: bool,
+}
+
+/// `record`, with whether the review left remarks. A version approved as a
+/// diff against one that had remarks rests on that review too (the files
+/// that did not change were not read again), so it keeps the mark until a
+/// full review without remarks starts the baseline again.
+pub(super) fn record_version(
+    store: &Store,
+    class: SourceClass,
+    units: &[Unit],
+    version: &Version<'_>,
+    settings: &AgentSettings,
+    now: u64,
+) -> Result<(), Error> {
+    let Version {
+        files,
+        unread,
+        remarks,
+    } = *version;
     let approved_under = fingerprint(settings, class);
     for unit in units {
         let mut kept_files: Entries = Vec::new();
@@ -444,6 +517,10 @@ pub(crate) fn record(
                 && manifest.prompt == PROMPT_VERSION
                 && manifest.settings == approved_under
         });
+        let remarks = remarks
+            || reviewed_against
+                .as_ref()
+                .is_some_and(|manifest| manifest.remarks);
         let (full, diffs) = match reviewed_against {
             Some(Manifest {
                 full: Some(full),
@@ -457,8 +534,11 @@ pub(crate) fn record(
             }
             Some(_) | None => (now, 0),
         };
+        // Only when set: a version without remarks is written as it
+        // always was.
+        let marked = if remarks { "remarks 1\n" } else { "" };
         let text = format!(
-            "{FORMAT}\nidentity {}\nprompt {PROMPT_VERSION}\nsettings {approved_under}\nrecorded {now}\nfull {full}\ndiffs {diffs}\n{entries}",
+            "{FORMAT}\nidentity {}\nprompt {PROMPT_VERSION}\nsettings {approved_under}\nrecorded {now}\nfull {full}\ndiffs {diffs}\n{marked}{entries}",
             unit.identity.as_str()
         );
         store.write(BASELINES, &name, text.as_bytes())?;
@@ -621,6 +701,90 @@ mod tests {
         assert_eq!(
             load(&store, SourceClass::Theme, &units, &settings()).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn a_baseline_says_when_it_was_approved_with_remarks() {
+        let dir = TempDir::new("baseline-remarks");
+        let store = store(&dir);
+        let units = [unit("", "aur:demo")];
+        let name = super::manifest_name(SourceClass::Aur, &units[0].identity);
+        let text = |store: &Store| {
+            String::from_utf8(store.read(BASELINES, &name).unwrap().unwrap()).unwrap()
+        };
+        let record = |files: &[SourceFile], remarks: bool, now: u64| {
+            let version = super::Version {
+                files,
+                unread: &Unread::new(),
+                remarks,
+            };
+            super::record_version(&store, SourceClass::Aur, &units, &version, &settings(), now)
+                .unwrap();
+        };
+        let fresh = |findings: bool| {
+            super::load_fresh(&store, SourceClass::Aur, &units, &settings(), 10, findings).unwrap()
+        };
+        let v1 = [file("a", "one\n")];
+        let v2 = [file("a", "two\n")];
+
+        // Without remarks a baseline is written as it always was, and one
+        // written before there were remarks reads as one without any.
+        record(&v1, false, 10);
+        let plain = text(&store);
+        assert!(!plain.contains("remarks"), "{plain}");
+        assert!(
+            plain.starts_with(&format!(
+                "{}\nidentity aur:demo\nprompt {PROMPT_VERSION}\nsettings ",
+                super::FORMAT
+            )) && plain.contains("\nrecorded 10\nfull 10\ndiffs 0\nfile "),
+            "{plain}"
+        );
+        assert!(!super::parse_manifest(&plain).unwrap().remarks);
+        // It is an approval whatever remarks are under the policy.
+        for findings in [false, true] {
+            let loaded = fresh(findings);
+            assert!(loaded.approved.is_some() && loaded.due.is_empty());
+        }
+
+        // With remarks it says so, and stays an approval only where
+        // remarks are remarks.
+        store.remove(BASELINES, &name).unwrap();
+        record(&v1, true, 10);
+        let marked = text(&store);
+        assert_eq!(marked, plain.replace("diffs 0\n", "diffs 0\nremarks 1\n"));
+        assert!(super::parse_manifest(&marked).unwrap().remarks);
+        assert!(fresh(false).approved.is_some());
+
+        // A version approved as a diff on top of it rests on that review
+        // too: the mark stays, whatever the diff's review said.
+        record(&v2, false, 10);
+        let upgraded = text(&store);
+        assert!(upgraded.contains("\ndiffs 1\nremarks 1\n"), "{upgraded}");
+
+        // Where remarks are findings it is no approval: said, and deleted
+        // like any baseline that no longer counts.
+        let loaded = fresh(true);
+        assert!(loaded.approved.is_none());
+        assert_eq!(
+            loaded.due,
+            [
+                "the approved version of aur:demo was approved with low AI remarks, which are findings under this profile"
+            ]
+        );
+        assert!(store.read(BASELINES, &name).unwrap().is_none());
+
+        // The full review that follows starts the baseline again.
+        record(&v2, false, 10);
+        assert!(!text(&store).contains("remarks"));
+        assert!(fresh(true).approved.is_some());
+
+        // A mark that is no number is no manifest.
+        assert!(super::parse_manifest(&marked.replace("remarks 1", "remarks x")).is_none());
+        assert!(
+            !super::parse_manifest(&marked.replace("remarks 1", "remarks 0"))
+                .unwrap()
+                .remarks
         );
     }
 
@@ -937,7 +1101,8 @@ mod tests {
     /// What `load_fresh` gives at `now`: whether there is a baseline, and
     /// why not when it was due.
     fn fresh(store: &Store, units: &[Unit], now: u64) -> (bool, Vec<String>) {
-        let loaded = super::load_fresh(store, SourceClass::Aur, units, &settings(), now).unwrap();
+        let loaded =
+            super::load_fresh(store, SourceClass::Aur, units, &settings(), now, false).unwrap();
         (loaded.approved.is_some(), loaded.due)
     }
 

@@ -179,7 +179,8 @@ are remarks, shown in the report and deciding nothing; under `strict` they are
 findings and follow `on_ai_suspicious`. No settings file can change this for a
 class, and for the pacman classes the stricter of the system's profile and
 your own holds. `config show` prints it per class as `low AI remarks`
-(`shown` or `findings`). See
+(`shown` or `findings`); for `system`, the sweep's class, it prints `findings`
+in every profile, since the sweep counts every AI finding. See
 [What the reviewer's reply decides](review.md#what-the-reviewers-reply-decides).
 
 `cache` and `diff` are `on` for user-level classes (`diff` is `off` under

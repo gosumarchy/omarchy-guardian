@@ -1153,6 +1153,26 @@ mod tests {
                 );
             }
         }
+
+        // Under local-only the sweep asks no AI, so there is no AI finding
+        // to count either way: only that no class shows remarks.
+        let settings = Settings::from_parts(PartialConfig::default(), PartialConfig::default())
+            .with_profile(Profile::LocalOnly);
+        let context = ReviewContext {
+            settings: &settings,
+            class: SourceClass::System,
+            opencode: &opencode,
+            units: &[],
+            state_root: None,
+            context: &[],
+        };
+        let report = super::judge::judge(
+            &collection,
+            HOME,
+            &context,
+            &std::collections::HashSet::new(),
+        );
+        assert!(report.remark_classes.is_empty() && report.agent_runs.is_empty());
     }
 
     #[test]

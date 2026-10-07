@@ -8,7 +8,7 @@
 use std::fmt::Write as _;
 use std::sync::{Mutex, PoisonError};
 
-use super::terminal::REMARKS_NOTE;
+use super::terminal::remarks_note;
 use super::{AgentOutcome, Blocked, Decision, Report, Severity, recommendation};
 use crate::agent::Status;
 use crate::notify::Ran;
@@ -216,7 +216,7 @@ pub(super) fn section(report: &Report, decision: Decision) -> String {
     );
 
     ai_reviews(&mut html, report);
-    findings(&mut html, report);
+    findings(&mut html, report, decision);
     extras(&mut html, report);
 
     let _ = write!(
@@ -266,7 +266,7 @@ fn ai_reviews(html: &mut String, report: &Report) {
     }
 }
 
-fn findings(html: &mut String, report: &Report) {
+fn findings(html: &mut String, report: &Report, decision: Decision) {
     let ai_cards = |html: &mut String, remarks: bool| {
         for finding in report.agent_findings(remarks) {
             let location = finding.line.map_or_else(
@@ -304,7 +304,7 @@ fn findings(html: &mut String, report: &Report) {
         let _ = write!(
             html,
             r#"<h3>AI remarks</h3><p class="dim">{}</p>"#,
-            esc(REMARKS_NOTE)
+            esc(remarks_note(decision))
         );
         ai_cards(html, true);
     }

@@ -1509,3 +1509,138 @@ fn remark_classes_are_the_classes_whose_profile_shows_remarks() {
         .is_empty()
     );
 }
+
+/// Strict for the user-level classes, with a class set so that a baseline
+/// approved under standard still fits: the thinking level standard
+/// reviews with, diff reviews on, and no cache to answer in its place.
+fn strict_reusing_standards_baselines(class: SourceClass) -> Settings {
+    use crate::config::model::{Thinking, Toggle};
+    Settings::from_parts(
+        PartialConfig {
+            profile: Some(Profile::Strict),
+            ..PartialConfig::default()
+        },
+        PartialConfig {
+            classes: vec![(
+                class,
+                PartialPolicy {
+                    thinking: Some(Thinking::High),
+                    diff: Some(Toggle::On),
+                    cache: Some(Toggle::Off),
+                    ..PartialPolicy::default()
+                },
+            )],
+            ..PartialConfig::default()
+        },
+    )
+}
+
+#[test]
+fn a_baseline_approved_with_remarks_is_no_approval_where_remarks_are_findings() {
+    use crate::config::model::Toggle;
+    const UNCHANGED: &str = "every file is unchanged since the approved version";
+    let class = SourceClass::Theme;
+    // (name, the first review leaves remarks, the second is under strict)
+    for (name, remarks, strict) in [
+        ("remarks-then-strict", true, true),
+        ("clear-then-strict", false, true),
+        ("remarks-then-standard", true, false),
+    ] {
+        // No entry point among the files: an unchanged tree sends nothing.
+        let dir = TempDir::new(&format!("baseline-{name}"));
+        let bin = TempDir::new(&format!("baseline-{name}-bin"));
+        let state = TempDir::new(&format!("baseline-{name}-state"));
+        fs::create_dir(dir.path().join("lib")).unwrap();
+        fs::write(dir.path().join("lib/fetch.lua"), "return 1\n").unwrap();
+        fs::write(dir.path().join("lib/warn.lua"), "return 2\n").unwrap();
+        let opencode = if remarks {
+            OpenCode::At(mock_opencode_findings(
+                bin.path(),
+                "clear",
+                &[
+                    (
+                        "low",
+                        "lib/fetch.lua",
+                        "Download without certificate checks",
+                    ),
+                    ("low", "lib/warn.lua", "Unquoted command substitution"),
+                ],
+            ))
+        } else {
+            clear_opencode(&bin)
+        };
+        let root = state.path().join("store");
+
+        let standard = default_settings();
+        let first = review_tree(
+            &ScanConfig::new(dir.path()),
+            &ReviewContext {
+                state_root: Some(&root),
+                ..context(&standard, class, &opencode)
+            },
+        );
+        assert_eq!(
+            first.decide(&|class| standard.policy(class)),
+            Decision::Clear,
+            "{name}: {:?}",
+            first.gaps
+        );
+        assert_eq!(first.remark_count(), if remarks { 2 } else { 0 }, "{name}");
+        fs::remove_file(bin.path().join("stdin")).unwrap();
+
+        // The same tree again, with nothing in the cache to answer.
+        let again = if strict {
+            strict_reusing_standards_baselines(class)
+        } else {
+            Settings::from_parts(
+                PartialConfig::default(),
+                PartialConfig {
+                    classes: vec![(
+                        class,
+                        PartialPolicy {
+                            cache: Some(Toggle::Off),
+                            ..PartialPolicy::default()
+                        },
+                    )],
+                    ..PartialConfig::default()
+                },
+            )
+        };
+        assert_eq!(
+            again.agent_settings(class).label(),
+            standard.agent_settings(class).label(),
+            "{name}"
+        );
+        let second = review_tree(
+            &ScanConfig::new(dir.path()),
+            &ReviewContext {
+                state_root: Some(&root),
+                ..context(&again, class, &opencode)
+            },
+        );
+        let decision = second.decide(&|class| again.policy(class));
+        let asked = bin.path().join("stdin").exists();
+        let passed_unread = second.notes.iter().any(|note| note.contains(UNCHANGED));
+        if remarks && strict {
+            // Reviewed in full, and strict blocks on the low findings.
+            assert!(asked && !passed_unread, "{name}: {:?}", second.notes);
+            assert!(
+                second.notes.iter().any(|note| note.contains(
+                    "was approved with low AI remarks, which are findings under this profile; reviewing it in full"
+                )),
+                "{name}: {:?}",
+                second.notes
+            );
+            assert_eq!(decision, Decision::Blocked(Blocked::Findings), "{name}");
+            assert_eq!(
+                second.audit_findings(),
+                "high=0 medium=0 low=2 incomplete=0"
+            );
+        } else {
+            // Honoured as before: nothing changed, so nothing is asked.
+            assert!(!asked && passed_unread, "{name}: {:?}", second.notes);
+            assert!(second.agent_runs.is_empty(), "{name}");
+            assert_eq!(decision, Decision::Clear, "{name}");
+        }
+    }
+}

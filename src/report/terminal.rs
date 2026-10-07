@@ -10,12 +10,29 @@ use crate::text::shown;
 
 use super::{AgentOutcome, Blocked, Decision, Report, Severity, html, recommendation};
 
-/// What the remarks are, after their count in the verdict box.
-const REMARKS: &str = "the AI review is clear; these are not alerts";
+/// What the remarks are, after their count in the verdict box: for a
+/// review that is clear, and for one that is not (something else decided
+/// it: another chunk, a local rule, a gap).
+const fn remarks_are(decision: Decision) -> &'static str {
+    match decision {
+        Decision::Clear => "the AI review is clear; these are not alerts",
+        Decision::Warned | Decision::Limited | Decision::Blocked(_) => {
+            "from parts the AI review judged clear; they did not decide this"
+        }
+    }
+}
 
-/// Said above the remarks.
-pub(super) const REMARKS_NOTE: &str =
-    "The AI review is clear; it noted these all the same. They do not block.";
+/// Said above the remarks, for the same two cases.
+pub(super) const fn remarks_note(decision: Decision) -> &'static str {
+    match decision {
+        Decision::Clear => {
+            "The AI review is clear; it noted these all the same. They do not block."
+        }
+        Decision::Warned | Decision::Limited | Decision::Blocked(_) => {
+            "From the parts the AI review judged clear. They did not decide this review."
+        }
+    }
+}
 
 impl Report {
     pub(crate) fn print(&self, show_hashes: bool, decision: Decision) {
@@ -38,7 +55,7 @@ impl Report {
         if show_hashes {
             self.print_hashes();
         }
-        out!("{}", self.findings_text(width, painter));
+        out!("{}", self.findings_text(decision, width, painter));
 
         for gap in &self.gaps {
             crate::output::stderr_line(format_args!("  ! {}", shown(&gap.to_string())));
@@ -119,7 +136,10 @@ impl Report {
         }
         let remarks = self.remark_count();
         if remarks > 0 {
-            lines.push(Span::plain(format!("Remarks: {remarks} low · {REMARKS}")));
+            lines.push(Span::plain(format!(
+                "Remarks: {remarks} low · {}",
+                remarks_are(decision)
+            )));
         }
         let title = format!("Omarchy Guardian · {}", shown(&self.subject));
         let edge = color.split(';').next().unwrap_or(color);
@@ -293,7 +313,12 @@ impl Report {
 
     /// The tables of what was found: the local checks, the AI's findings,
     /// its remarks and the dependency advisories, each under its title.
-    pub(super) fn findings_text(&self, width: usize, painter: Painter) -> String {
+    pub(super) fn findings_text(
+        &self,
+        decision: Decision,
+        width: usize,
+        painter: Painter,
+    ) -> String {
         let mut text = String::new();
         let severity = |severity: Severity| vec![Span::new(severity.label(), severity.color())];
         if !self.findings.is_empty() {
@@ -346,7 +371,7 @@ impl Report {
             if any {
                 let _ = writeln!(text, "\n{}", painter.paint(title, "1"));
                 if remarks {
-                    let _ = writeln!(text, "  {}", painter.paint(REMARKS_NOTE, "2"));
+                    let _ = writeln!(text, "  {}", painter.paint(remarks_note(decision), "2"));
                 }
                 let _ = writeln!(text, "{}", table.render(width, 2, painter));
             }
