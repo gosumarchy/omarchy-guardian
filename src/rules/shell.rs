@@ -379,7 +379,12 @@ fn program_past<'a>(
             match (!read_on).then(|| substituted(bare)).flatten() {
                 // `x=$(date) sh f`: the program follows; the command in
                 // the substitution is it only when none does.
-                Some(Substituted::Whole(command)) => held = held.or(command),
+                Some(Substituted::Whole(command)) => {
+                    held = held.or(command);
+                    if let (Passed::Noted(noted), Some(command)) = (&mut *passed, command) {
+                        noted.push(vec![command]);
+                    }
+                }
                 Some(Substituted::Open(rest, backtick)) => {
                     let after = (!matches!(passed, Passed::Never))
                         .then(|| past_substitution(words, rest, backtick))
@@ -389,11 +394,11 @@ fn program_past<'a>(
                         // substitution over several words.
                         held = held.or_else(|| command_of(rest));
                         if let Passed::Noted(noted) = passed {
-                            noted.push(
-                                std::iter::once(rest)
-                                    .chain(words.clone().take(within))
-                                    .collect(),
-                            );
+                            let mut held: Vec<&str> = std::iter::once(rest)
+                                .chain(words.clone().take(within))
+                                .collect();
+                            close(&mut held, backtick);
+                            noted.push(held);
                         }
                         *words = after;
                     } else if rest.trim_start().starts_with('<') {
@@ -447,6 +452,31 @@ where
         }
     }
     None
+}
+
+/// Cuts the last of `held`, the words of a substitution from after its
+/// opening, at what closes it: `f)` is `f`.
+fn close(held: &mut Vec<&str>, backtick: bool) {
+    let Some(last) = held.pop() else {
+        return;
+    };
+    let end = if backtick {
+        last.find('`')
+    } else {
+        let mut depth = 1 + held.iter().map(|word| depth_change(word)).sum::<isize>();
+        last.bytes().position(|byte| {
+            depth += match byte {
+                b'(' => 1,
+                b')' => -1,
+                _ => 0,
+            };
+            depth <= 0
+        })
+    };
+    let last = &last[..end.unwrap_or(last.len())];
+    if !last.is_empty() {
+        held.push(last);
+    }
 }
 
 /// How many more `(` than `)` a word holds.
