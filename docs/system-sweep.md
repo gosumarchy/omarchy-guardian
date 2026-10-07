@@ -1022,7 +1022,9 @@ never read.
   sweep run by hand (by you, or by a program that hopes to have its files
   taken as seen) does not count, so you may be notified of something you
   already looked at. A finding that appears on a file that did not change
-  counts as a change; one that goes away does not. The first scheduled sweep
+  counts as a change; one that goes away does not. (Every AI finding on an
+  item is one here, in every profile: the low remarks that a gate under
+  `standard` only shows are findings of the sweep.) The first scheduled sweep
   has nothing to compare with: it notifies only when it found something with
   an alert or could not finish;
 - a system timer (`omarchy-guardian-sweep-collect.timer`) for the root checks,

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::config::Settings;
 use crate::config::load::{FileStatus, UserBlock};
-use crate::config::model::{Named, SourceClass};
+use crate::config::model::{Named, Remarks, SourceClass};
 use crate::config::resolve::KNOBS;
 use crate::engine::store;
 
@@ -112,6 +112,21 @@ pub(crate) fn render_show(settings: &Settings, classes: &[SourceClass]) -> Strin
                 resolved.origin(knob).name()
             );
         }
+        // No knob: it comes with the profile (for a pacman class, with
+        // the stricter of the system's and the user's) and is shown so
+        // that what is printed here is the whole policy. The sweep, which
+        // is all that reviews as `system`, counts them as findings in
+        // every profile (see `sweep::judge`).
+        let (remarks, from) = match (class, policy.ai_remarks) {
+            (SourceClass::System, _) => ("findings", "the sweep's own rule"),
+            (_, Remarks::Shown) => ("shown", "profile"),
+            (_, Remarks::Findings) => ("findings", "profile"),
+        };
+        let _ = writeln!(
+            text,
+            "  {:<17} {remarks:<17} ({from}; not a setting)",
+            "low AI remarks"
+        );
         let _ = writeln!(
             text,
             "  {:<17} {} · timeout {}s · input {} KiB × up to {} chunk(s)",
@@ -208,6 +223,30 @@ mod tests {
         assert!(text.contains(&format!("  {:<17} {:<17} ({})", "cache", "on", "profile")));
         assert!(text.contains(&format!("  {:<17} {:<17} ({})", "diff", "off", "profile")));
         assert!(text.contains("× up to 8 chunk(s)"));
+        // Shown with the policy, and marked as no setting.
+        assert_eq!(
+            text.matches("  low AI remarks    shown             (profile; not a setting)")
+                .count(),
+            2,
+            "{text}"
+        );
+        // The sweep's class: findings there whatever the profile.
+        let sweep = render_show(&settings, &[SourceClass::System]);
+        assert!(
+            sweep.contains(
+                "  low AI remarks    findings          (the sweep's own rule; not a setting)"
+            ),
+            "{sweep}"
+        );
+        let strict = Settings::load_from(&system, Some(&user), &secure)
+            .with_profile(crate::config::model::Profile::Strict);
+        let text = render_show(&strict, &[SourceClass::Official, SourceClass::Aur]);
+        assert_eq!(
+            text.matches("  low AI remarks    findings          (profile; not a setting)")
+                .count(),
+            2,
+            "{text}"
+        );
         assert!(text.contains(&format!(
             "{:<12} cache 30 day(s) · store up to 256 MiB",
             "Memory"

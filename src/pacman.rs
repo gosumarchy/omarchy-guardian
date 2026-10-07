@@ -145,6 +145,7 @@ pub(crate) fn review_transaction(args: &HookArgs, settings: &Settings) -> Result
     report.class = SourceClass::ThirdPartyRepo;
     report.profile = settings.system_profile().name().to_string();
     report.ai_off_classes = review::ai_off_classes(settings, &PRIVILEGED);
+    report.remark_classes = review::remark_classes(settings, &PRIVILEGED);
 
     let trusted = settings.trusted_reviewer_packages();
     let (archives, classes) = match operation {

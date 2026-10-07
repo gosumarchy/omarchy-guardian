@@ -634,6 +634,12 @@ diff = "off"
                 "class.aur.ai",
             ),
             ("mystery = true\n", 1, "mystery"),
+            // What low AI remarks are comes with the profile alone.
+            (
+                "[class.aur]\nai_remarks = \"shown\"\n",
+                2,
+                "class.aur.ai_remarks",
+            ),
             (
                 "[class.official]\ncache = \"on\"\n",
                 2,

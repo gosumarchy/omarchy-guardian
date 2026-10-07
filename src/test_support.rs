@@ -114,6 +114,36 @@ pub(crate) fn mock_opencode_then(
     echo_nonce: bool,
     after: &str,
 ) -> PathBuf {
+    mock_opencode_reply(dir, status, "", echo_nonce, after)
+}
+
+/// [`mock_opencode`] whose reply carries a finding for each of `findings`:
+/// its severity as written, the file it names and its title.
+pub(crate) fn mock_opencode_findings(
+    dir: &Path,
+    status: &str,
+    findings: &[(&str, &str, &str)],
+) -> PathBuf {
+    let findings: Vec<String> = findings
+        .iter()
+        .map(|(severity, file, title)| {
+            format!(
+                r#"{{\"severity\":\"{severity}\",\"file\":\"{file}\",\"title\":\"{title}\",\"reason\":\"mock reason\"}}"#
+            )
+        })
+        .collect();
+    mock_opencode_reply(dir, status, &findings.join(","), true, "")
+}
+
+/// `findings` is the inside of the reply's list, as the script's shell
+/// reads it between double quotes.
+fn mock_opencode_reply(
+    dir: &Path,
+    status: &str,
+    findings: &str,
+    echo_nonce: bool,
+    after: &str,
+) -> PathBuf {
     let binary = dir.join("opencode");
     let nonce = if echo_nonce {
         r#"$(printf '%s\n' "$input" | sed -n 's/^Nonce: //p' | tr -d '\n')"#
@@ -130,7 +160,7 @@ case "$OPENCODE_CONFIG_CONTENT" in *'"*":"deny"'*) ;; *) exit 8 ;; esac
 input=$(cat)
 printf '%s\n' "$input" >"$dir/stdin"
 nonce={nonce}
-reply="{{\"nonce\":\"$nonce\",\"status\":\"{status}\",\"summary\":\"mock\",\"findings\":[]}}"
+reply="{{\"nonce\":\"$nonce\",\"status\":\"{status}\",\"summary\":\"mock\",\"findings\":[{findings}]}}"
 escaped=$(printf '%s' "$reply" | sed 's/"/\\"/g')
 printf '{{"type":"text","part":{{"type":"text","text":"%s"}}}}\n' "$escaped"
 {after}

@@ -67,6 +67,10 @@ pub(super) fn judge(
     news: &std::collections::HashSet<String>,
 ) -> Report {
     let mut report = review::collected_report("system sweep", context);
+    // The sweep lists what is on the system to look at, and a low remark
+    // of the AI on an item is one such thing in every profile: it stays a
+    // finding here, listed, counted, remembered and told as one.
+    report.remark_classes.clear();
     let facts = examine(&mut report, collection, home, news);
     let context = ReviewContext {
         context: &facts,

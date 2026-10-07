@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::agent::{SourceFile, Status};
 use crate::config::Settings;
-use crate::config::model::{AgentSettings, AiRequirement, Named, SourceClass};
+use crate::config::model::{AgentSettings, AiRequirement, Named, Remarks, SourceClass};
 use crate::content::Format;
 use crate::deps;
 use crate::engine::baseline::{Identity, Unit};
@@ -159,6 +159,7 @@ pub(crate) fn collected_report(subject: impl Into<String>, context: &ReviewConte
         .name()
         .to_string();
     report.ai_off_classes = ai_off_classes(context.settings, &[context.class]);
+    report.remark_classes = remark_classes(context.settings, &[context.class]);
     report
 }
 
@@ -219,7 +220,8 @@ pub(crate) fn review_collected(
             .as_ref()
             .filter(|_| is_approved(&report, context.settings))
             .map(|settings| (report.agent_input.as_slice(), settings));
-        let notes = engine::remember(memory, approved, &report.unread);
+        let remarks = report.remark_count() > 0;
+        let notes = engine::remember_review(memory, approved, &report.unread, remarks);
         report.notes.extend(notes);
     }
     report
@@ -231,6 +233,16 @@ pub(crate) fn ai_off_classes(settings: &Settings, classes: &[SourceClass]) -> Ve
         .iter()
         .copied()
         .filter(|class| settings.policy(*class).ai == AiRequirement::Off)
+        .collect()
+}
+
+/// The subset of `classes` whose resolved policy shows the low findings of
+/// a clear AI verdict as remarks (see `Report::remark_classes`).
+pub(crate) fn remark_classes(settings: &Settings, classes: &[SourceClass]) -> Vec<SourceClass> {
+    classes
+        .iter()
+        .copied()
+        .filter(|class| settings.policy(*class).ai_remarks == Remarks::Shown)
         .collect()
 }
 
@@ -502,7 +514,9 @@ fn default_units(class: SourceClass, root: &Path) -> Vec<Unit> {
 }
 
 /// A baseline is recorded only when every chunk got a clear AI verdict, the
-/// report has no gaps, and the decision is clear.
+/// report has no gaps, and the decision is clear. Remarks under a clear
+/// verdict (see `Report::is_remarks`) leave the decision clear, so such a
+/// review is approved like any clear one.
 fn is_approved(report: &Report, settings: &Settings) -> bool {
     report.gaps.is_empty()
         && !report.agent_runs.is_empty()

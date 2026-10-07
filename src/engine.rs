@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use crate::agent::{self, AgentError, AgentReview, SourceFile};
 use crate::config::Settings;
-use crate::config::model::{AgentSettings, AiRequirement, SourceClass, Toggle};
+use crate::config::model::{AgentSettings, AiRequirement, Remarks, SourceClass, Toggle};
 use crate::engine::baseline::{Approved, Unit, Unread};
 use crate::engine::plan::{HashOnly, ManifestEntry, Plan, PlanInput, Previous, Sent, TooLarge};
 use crate::engine::request::Request;
@@ -42,6 +42,9 @@ pub(crate) struct Memory {
     cache_max_age_secs: u64,
     max_store_bytes: u64,
     now: u64,
+    /// The class's policy counts the low findings of a clear verdict as
+    /// findings: a baseline approved with such remarks is not one here.
+    remarks_are_findings: bool,
 }
 
 impl Memory {
@@ -80,6 +83,7 @@ impl Memory {
             cache_max_age_secs: u64::from(limits.cache_days) * SECONDS_PER_DAY,
             max_store_bytes: u64::from(limits.max_store_mib) * 1024 * 1024,
             now: crate::time::now(),
+            remarks_are_findings: policy.ai_remarks == Remarks::Findings,
         }))
     }
 }
@@ -487,6 +491,7 @@ fn previous_version(
         &memory.units,
         group.settings,
         memory.now,
+        memory.remarks_are_findings,
     )
     .map(|loaded| {
         notes.extend(
@@ -845,19 +850,36 @@ fn review_parallel(
 /// after every chunk was clear, with no gaps and a clear decision, and all
 /// files shared one set of settings), then prune the store. Returns notes
 /// for the report.
+#[cfg(test)]
 pub(crate) fn remember(
     memory: &Memory,
     approved: Option<(&[SourceFile], &AgentSettings)>,
     unread: &Unread,
 ) -> Vec<String> {
+    remember_review(memory, approved, unread, false)
+}
+
+/// `remember`, with whether the approved review left remarks (low findings
+/// beside a clear AI verdict, where the profile shows them): the baseline
+/// says so, and a policy that counts them as findings does not take it for
+/// an approval.
+pub(crate) fn remember_review(
+    memory: &Memory,
+    approved: Option<(&[SourceFile], &AgentSettings)>,
+    unread: &Unread,
+    remarks: bool,
+) -> Vec<String> {
     let mut notes = Vec::new();
     if let Some((files, settings)) = approved.filter(|_| memory.use_diff)
-        && let Err(error) = baseline::record(
+        && let Err(error) = baseline::record_version(
             &memory.store,
             memory.class,
             &memory.units,
-            files,
-            unread,
+            &baseline::Version {
+                files,
+                unread,
+                remarks,
+            },
             settings,
             memory.now,
         )
