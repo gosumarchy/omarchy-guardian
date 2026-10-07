@@ -313,6 +313,33 @@ fn a_download_saved_to_a_file_is_followed_to_where_it_runs() {
 }
 
 #[test]
+fn what_a_variable_is_given_by_a_command_is_that_commands_to_read() {
+    use super::{run_targets, runs_file};
+    // The command in the substitution is the program; what it is given is
+    // not run with the variable set.
+    for line in [
+        "actual=$(sha256sum \"$output.part\" | cut -d ' ' -f 1)",
+        "size=$(stat -c %s i.sh)",
+        "sum=`md5sum i.sh`",
+        "x=$( wc -l i.sh )",
+        "n=$((1 + 2))",
+    ] {
+        assert!(!runs_file(line, "i.sh"), "{line}");
+        assert!(!runs_file(line, "$output.part"), "{line}");
+        assert!(run_targets(line).is_empty(), "{line}");
+    }
+    // A shell in the substitution runs the file all the same.
+    for line in ["out=$(sh i.sh)", "out=$(bash ./i.sh 2>&1)", "out=$(./i.sh)"] {
+        assert!(runs_file(line, "i.sh"), "{line}");
+        assert_eq!(
+            run_targets(line).first().map(String::as_str),
+            Some("i.sh"),
+            "{line}"
+        );
+    }
+}
+
+#[test]
 fn a_run_behind_a_wrapper_an_assignment_or_a_group_is_still_a_run() {
     use super::{run_targets, runs_file};
     for line in [

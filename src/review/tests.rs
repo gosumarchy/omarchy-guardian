@@ -563,6 +563,33 @@ fn local_only_never_calls_the_agent() {
     );
 }
 
+/// The evaluation's own clear case: a script that downloads a word list,
+/// checks its checksum and never runs it.
+#[test]
+fn a_download_that_is_only_checked_and_moved_is_no_finding() {
+    let dir = TempDir::new("verified-download");
+    let bin = TempDir::new("verified-download-bin");
+    for (name, text) in [
+        (
+            "PKGBUILD",
+            include_str!("../../tests/ai-eval/cases/aur/clear/verified-download/PKGBUILD"),
+        ),
+        (
+            "fetch-wordlist.sh",
+            include_str!("../../tests/ai-eval/cases/aur/clear/verified-download/fetch-wordlist.sh"),
+        ),
+    ] {
+        fs::write(dir.path().join(name), text).unwrap();
+    }
+    let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
+    let settings = default_settings().with_profile(Profile::LocalOnly);
+    let report = review_tree(
+        &ScanConfig::new(dir.path()),
+        &context(&settings, SourceClass::Aur, &opencode),
+    );
+    assert!(report.findings.is_empty(), "{:#?}", report.findings);
+}
+
 #[test]
 fn classes_with_equal_agent_settings_share_one_run() {
     let bin = TempDir::new("grouped-bin");

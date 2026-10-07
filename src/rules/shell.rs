@@ -338,10 +338,31 @@ pub(super) fn program_word<'a>(words: &mut impl Iterator<Item = &'a str>) -> Opt
         }
         // `VAR=x cmd`: an assignment before the program.
         if bare.contains('=') && !bare.starts_with(['/', '.', '$', '=']) {
+            // `x=$(cmd arg)`: the value is a command run here, and what
+            // follows is given to it; nothing after it is a program run
+            // with the variable set.
+            if let Some(inner) = substituted(bare) {
+                if inner.is_empty() {
+                    continue;
+                }
+                return Some(inner);
+            }
             continue;
         }
         return Some(bare);
     }
+}
+
+/// The start of the command an assignment's value runs (`x=$(cmd`, or
+/// with a backtick): what stands after the opening, which is empty when
+/// the command is the next word.
+fn substituted(assignment: &str) -> Option<&str> {
+    let (_, value) = assignment.split_once('=')?;
+    let inner = value
+        .strip_prefix("$(")
+        .or_else(|| value.strip_prefix('`'))?;
+    // `$((` is arithmetic, which runs nothing.
+    (!inner.starts_with('(')).then_some(inner)
 }
 
 /// The command a statement, or one part of a pipeline, runs: past wrappers
