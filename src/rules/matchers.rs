@@ -227,15 +227,18 @@ const XARGS_LONG_VALUE_OPTIONS: &[&str] = &[
 /// a value takes the rest of the word, or the next word when it stands
 /// last.
 fn xargs_value(cluster: &str) -> Option<bool> {
-    let last = cluster.len() - 1;
+    // An option before this one may have taken the rest of the word.
+    let mut unsure = false;
     for (at, option) in cluster.char_indices().skip(1) {
+        let last = at + option.len_utf8() == cluster.len();
         if XARGS_VALUE_OPTIONS.contains(&option) {
-            return Some(at == last);
+            return (!last || !unsure).then_some(last);
         }
         if XARGS_UNSURE_OPTIONS.contains(&option) {
-            // Before more letters, it takes them or the next one decides:
-            // either way the word after may be the command.
-            return (at != last).then_some(false);
+            if last {
+                return None;
+            }
+            unsure = true;
         }
     }
     Some(false)

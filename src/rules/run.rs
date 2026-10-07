@@ -33,6 +33,16 @@ pub(super) fn fetched_file(line: &str) -> Option<String> {
     let at = words
         .iter()
         .position(|word| FETCHERS.contains(&fetcher_name(word)))?;
+    let name = saved_as(&words, at)?;
+    // Last in a substitution, the name is written with what closes it.
+    if words[at].contains("$(") {
+        return as_file(without_group_close(&name));
+    }
+    Some(name)
+}
+
+/// `fetched_file`, for the fetcher at `at` among `words`.
+fn saved_as(words: &[String], at: usize) -> Option<String> {
     let fetcher = fetcher_name(&words[at]);
     let mut by_address = fetcher == "wget";
     let mut address = None;

