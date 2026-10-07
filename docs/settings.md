@@ -206,8 +206,8 @@ warning.
 for a newer release off when either says so (see [Hearing of a new
 release](install.md#hearing-of-a-new-release)).
 
-The user file is yours, so any program running as you can write it. Two things
-keep that from quietly switching a gate off:
+The user file is yours, so any program running as you can write it. These
+keep that, or a typo in either file, from quietly switching a gate off:
 
 - A user file that is there and does not parse is not skipped. While it is
   broken, `makepkg-gate`, `guard`, `scan`, `sandbox` and `sweep` refuse with
@@ -215,6 +215,21 @@ keep that from quietly switching a gate off:
   file. (Skipping it would review at `standard` whatever stricter profile it
   holds.) `config check`, `config show`, `tui` and `setup` still work, to fix
   it.
+- The system file is treated the same way, for the same reason: root may have
+  set `profile = "strict"` or tightened a class there. A system file that is
+  there and cannot be used (it does not parse, it or its directory is not
+  root's alone, it cannot be read) stops the pacman gate and, with exit 2 and
+  nothing reviewed or run, `makepkg-gate`, `guard`, `scan`, `sandbox` and
+  `sweep` as well; none of them goes on at the built-in `standard` profile.
+  The message names the file and the reason. Fix the file as root:
+  `omarchy-guardian config check` shows the problem, `config show` marks
+  every class as `NOT IN FORCE`, and the bar counts it as a problem. A system
+  file that is not there is no error: the built-in defaults apply. In a user
+  namespace that does not map root (a sandbox such as `bwrap` without
+  `--uid 0`, a rootless container) root's files look like nobody's, so the
+  file cannot be told to be root's and the same commands are refused there
+  too; the message then says to run Guardian outside the sandbox, since
+  there is nothing in the file to fix.
 - A user-level class set weaker than its profile (`ai` lower, `on_findings` or
   `on_ai_suspicious` on `warn` where the profile blocks, `confirm = false`
   under `local-only` with the AI off) still applies, and the bar counts it as
@@ -301,7 +316,8 @@ are listed under [How the reviewer is run](review.md#how-the-reviewer-is-run).
   system file.
 - `omarchy-guardian config show [--class NAME]`: the effective policy per class,
   each value tagged `profile`, `system` or `user`, plus any ignored user
-  values and why.
+  values and why. While a settings file is broken, the classes it stops are
+  marked `NOT IN FORCE`.
 - `omarchy-guardian config check`: validates both files and the system file's
   ownership; exit 0 valid, 2 invalid.
 - `omarchy-guardian config path`: prints both file paths.
@@ -337,7 +353,8 @@ When several apply, anything that leaves the review incomplete gives
 
 Before any of these, a user settings file that does not parse ends `scan`,
 `guard`, `sandbox`, `makepkg-gate` and `sweep` with exit 2 and nothing
-reviewed or run; a broken system file does the same to the pacman gate.
+reviewed or run; a broken system file (one that does not parse or is not
+root's alone) does the same to them and to the pacman gate.
 
 ## Official packages under `standard`
 

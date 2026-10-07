@@ -2,7 +2,7 @@
 //! and a reset to defaults, with the Guardian mascot saying how things
 //! stand. Expert mode (`e`) has every other setting.
 
-use super::{App, Dialog, Effect, Mode, Tone, draw_dialog, value_hint, wrap};
+use super::{App, Dialog, Effect, Mode, Tone, defaults, draw_dialog, value_hint, wrap};
 use crate::config::file::AgentDefaults;
 use crate::config::file::PartialConfig;
 use crate::config::load::FileStatus;
@@ -302,8 +302,8 @@ impl App {
     }
 
     pub(super) fn reset_defaults(&mut self) {
-        self.user = PartialConfig::default();
-        self.system = PartialConfig::default();
+        self.user = defaults(Scope::User, &self.files.user);
+        self.system = defaults(Scope::System, &self.files.system);
         if self.dirty(Scope::User) || self.dirty(Scope::System) {
             self.say("Defaults set. Press s to save.");
         } else {
@@ -622,15 +622,16 @@ const fn gate_name(gate: Integration) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::super::{App, Effect, Loaded, Mode, Task};
     use crate::config::file::PartialConfig;
     use crate::config::load::FileStatus;
-    use crate::config::model::Profile;
-    use crate::integrations::{Paths, Step};
+    use crate::config::model::{Action, Profile, RootConsent, SourceClass, Thinking};
+    use crate::integrations::{Paths, Plan, Step};
     use crate::test_support::TempDir;
     use crate::tui::canvas::Canvas;
+    use crate::tui::fields::validate;
     use crate::tui::term::Key;
 
     fn files(paths: Option<Paths>) -> Loaded {
@@ -727,6 +728,50 @@ mod tests {
     }
 
     #[test]
+    fn a_level_reaches_the_system_file_after_the_user_file_is_saved() {
+        let mut app = App::new(files(None), Mode::Simple);
+        press(&mut app, &[Key::Char('2')]);
+        let effects = press(&mut app, &[Key::Char('s')]);
+        let [effect @ Effect::SaveUser(_)] = &effects[..] else {
+            panic!("{effects:?}");
+        };
+        // What the event loop reads back: the user file as just written.
+        let mut written = files(None);
+        written.user = app.user.clone();
+        assert!(app.settle(effect, Ok("Saved.".into()), || written));
+
+        assert_eq!(app.system.profile, Some(Profile::Strict));
+        let text = screen(&mut app);
+        assert!(text.contains("Save the system file?"), "{text}");
+        assert!(text.contains("+ profile = \"strict\""), "{text}");
+        let effects = press(&mut app, &[Key::Char('y')]);
+        let [Effect::SaveSystem(saved)] = &effects[..] else {
+            panic!("{effects:?}");
+        };
+        assert!(saved.contains("profile = \"strict\""), "{saved}");
+    }
+
+    #[test]
+    fn turning_the_gates_on_keeps_an_unsaved_level() {
+        let dir = TempDir::new("simple-toggle");
+        let mut app = App::new(files(None), Mode::Simple);
+        press(&mut app, &[Key::Char('2')]);
+        assert!(app.gates_off().is_empty());
+        let effect = Effect::Integration(Plan {
+            summary: "Protect everything".into(),
+            steps: Vec::new(),
+        });
+        let read = files(Some(paths(dir.path())));
+        assert!(app.settle(&effect, Ok("Done.".into()), || read));
+
+        assert_eq!(app.user.profile, Some(Profile::Strict));
+        assert_eq!(app.system.profile, Some(Profile::Strict));
+        assert!(screen(&mut app).contains("unsaved changes"));
+        // The gates themselves are looked at again.
+        assert!(!app.gates_off().is_empty());
+    }
+
+    #[test]
     fn mixed_levels_are_shown_and_resolved_by_picking_one() {
         let mut loaded = files(None);
         loaded.user.profile = Some(Profile::LocalOnly);
@@ -740,15 +785,13 @@ mod tests {
         assert!(active_level(&screen(&mut app), "Balanced"));
     }
 
-    #[test]
-    fn protect_everything_turns_on_every_gate_that_is_off() {
-        let dir = TempDir::new("simple-gates");
-        let root = dir.path();
+    /// A machine under `root` where every gate can be turned on and none is.
+    fn paths(root: &Path) -> Paths {
         fs::create_dir_all(root.join("omarchy")).unwrap();
         fs::write(root.join("hook"), "").unwrap();
         fs::write(root.join("yay"), "").unwrap();
         fs::write(root.join("installer"), "").unwrap();
-        let paths = Paths {
+        Paths {
             hook_source: root.join("hook"),
             hook_target: root.join("hooks/hook"),
             yay: root.join("yay"),
@@ -782,8 +825,13 @@ mod tests {
             session_env: root.join("uwsm/env.d/90-omarchy-guardian"),
             hypr_config: root.join("hypr/hyprland.lua"),
             hypr_path: root.join("hyprland-path.lua"),
-        };
-        let mut app = App::new(files(Some(paths)), Mode::Simple);
+        }
+    }
+
+    #[test]
+    fn protect_everything_turns_on_every_gate_that_is_off() {
+        let dir = TempDir::new("simple-gates");
+        let mut app = App::new(files(Some(paths(dir.path()))), Mode::Simple);
         assert!(screen(&mut app).contains("not watching pacman, AUR or themes"));
 
         // Levels, model, then Protect everything.
@@ -808,6 +856,183 @@ mod tests {
         assert!(screen(&mut app).contains("1 Profiles"));
         press(&mut app, &[Key::Char('e')]);
         assert!(screen(&mut app).contains("PROTECTION LEVEL"));
+    }
+
+    /// A system file with a level and the settings saving it never removes.
+    fn system_file() -> PartialConfig {
+        let mut system = PartialConfig {
+            profile: Some(Profile::Strict),
+            trusted_reviewer_packages: Some(vec!["opencode-bin".into()]),
+            acknowledged_weaker: Some(vec!["aur.ai=off".into()]),
+            permit_strict: Some(true),
+            ..PartialConfig::default()
+        };
+        system.sweep.root = Some(RootConsent::Allowed);
+        system
+    }
+
+    #[test]
+    fn a_reset_shows_only_what_saving_the_system_file_removes() {
+        let mut loaded = files(None);
+        loaded.system = system_file();
+        loaded.system_text = validate(&loaded.system).unwrap();
+        let mut app = App::new(loaded, Mode::Simple);
+        press(&mut app, &[Key::End, Key::Enter, Key::Char('y')]);
+        assert_eq!(app.system.profile, None);
+        assert_eq!(app.system.sweep, system_file().sweep);
+        assert_eq!(app.system.permit_strict, Some(true));
+
+        assert!(press(&mut app, &[Key::Char('s')]).is_empty());
+        let text = screen(&mut app);
+        assert!(text.contains("- profile = \"strict\""), "{text}");
+        // The level is the only line removed; the rest is shown as kept.
+        assert_eq!(text.matches("│ - ").count(), 1, "{text}");
+        assert!(text.contains("│   [sweep]"), "{text}");
+    }
+
+    #[test]
+    fn a_reset_that_removes_only_unlisted_settings_counts_as_a_change() {
+        let mut loaded = files(None);
+        loaded.user.update_check = Some(false);
+        let mut app = App::new(loaded, Mode::Simple);
+        press(&mut app, &[Key::End, Key::Enter, Key::Char('y')]);
+        assert!(press(&mut app, &[Key::Char('q')]).is_empty());
+        assert!(screen(&mut app).contains("1 unsaved change(s) will be lost"));
+    }
+
+    #[test]
+    fn a_reset_is_still_a_reset_after_the_files_are_read_again() {
+        let mut on_disk = files(None);
+        on_disk.user.profile = Some(Profile::Strict);
+        on_disk.user.update_check = Some(false);
+        on_disk.system = system_file();
+        let read = files(None);
+        let read = Loaded {
+            user: on_disk.user.clone(),
+            system: on_disk.system.clone(),
+            ..read
+        };
+        let mut app = App::new(on_disk, Mode::Simple);
+        // Reset, then choose Private again on top of the cleared files.
+        press(&mut app, &[Key::End, Key::Enter, Key::Char('y')]);
+        press(&mut app, &[Key::Char('3')]);
+        let effect = Effect::Integration(Plan {
+            summary: "Protect everything".into(),
+            steps: Vec::new(),
+        });
+        assert!(app.settle(&effect, Ok("Done.".into()), || read));
+
+        assert_eq!(
+            app.user,
+            PartialConfig {
+                profile: Some(Profile::LocalOnly),
+                ..PartialConfig::default()
+            }
+        );
+        assert_eq!(app.system.profile, Some(Profile::LocalOnly));
+        assert_eq!(app.system.sweep, system_file().sweep);
+    }
+
+    fn toggle() -> Effect {
+        Effect::Integration(Plan {
+            summary: "Protect everything".into(),
+            steps: Vec::new(),
+        })
+    }
+
+    /// Picks the suggested model, for your sources and for pacman.
+    fn pick_a_model(app: &mut App) {
+        let effects = press(
+            app,
+            &[Key::Home, Key::Down, Key::Down, Key::Down, Key::Enter],
+        );
+        if let [effect @ Effect::LoadModels(_)] = &effects[..] {
+            app.finish(effect, Ok("claude-code/claude-sonnet-5-5".into()));
+        }
+        press(app, &[Key::Enter]);
+        assert!(app.user.agent.model.is_some());
+    }
+
+    /// The files with settings no field of their own file shows, as set
+    /// elsewhere while the app is open.
+    fn with_unlisted(mut read: Loaded) -> Loaded {
+        read.user.update_check = Some(false);
+        read.user.class_mut(SourceClass::Official).on_findings = Some(Action::Block);
+        read.system.update_check = Some(false);
+        read.system.agent.variants = vec![(Thinking::High, "max".into())];
+        read
+    }
+
+    fn strict_files() -> Loaded {
+        let mut loaded = files(None);
+        loaded.user.profile = Some(Profile::Strict);
+        loaded.system.profile = Some(Profile::Strict);
+        loaded
+    }
+
+    fn assert_unlisted_kept(app: &App) {
+        let read = with_unlisted(files(None));
+        assert_eq!(app.user.update_check, Some(false));
+        assert_eq!(app.user.classes, read.user.classes);
+        assert_eq!(app.system.update_check, Some(false));
+        assert_eq!(app.system.agent.variants, read.system.agent.variants);
+    }
+
+    #[test]
+    fn a_reset_taken_back_is_no_longer_a_reset() {
+        let mut app = App::new(strict_files(), Mode::Simple);
+        // Reset, then Maximum again: the drafts are the files once more.
+        press(&mut app, &[Key::End, Key::Enter, Key::Char('y')]);
+        press(&mut app, &[Key::Char('2')]);
+        assert_eq!(app.changed_count(), 0);
+        pick_a_model(&mut app);
+
+        let read = with_unlisted(strict_files());
+        assert!(app.settle(&toggle(), Ok("Done.".into()), || read));
+        assert_unlisted_kept(&app);
+        assert_eq!(app.changed_count(), 2);
+
+        let effects = press(&mut app, &[Key::Char('s')]);
+        let [Effect::SaveUser(text)] = &effects[..] else {
+            panic!("{effects:?}");
+        };
+        assert!(text.contains("[update]\ncheck = \"off\""), "{text}");
+        assert!(
+            text.contains("[class.official]\non_findings = \"block\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("model = \"claude-code/claude-sonnet-5-5\""),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_saved_reset_is_no_longer_a_reset() {
+        let mut app = App::new(with_unlisted(strict_files()), Mode::Simple);
+        press(&mut app, &[Key::End, Key::Enter, Key::Char('y')]);
+        assert_eq!(app.user, PartialConfig::default());
+
+        // Save both files; each is read back as it was written.
+        let effects = press(&mut app, &[Key::Char('s')]);
+        let [effect @ Effect::SaveUser(_)] = &effects[..] else {
+            panic!("{effects:?}");
+        };
+        let mut read = files(None);
+        read.system = app.files.system.clone();
+        assert!(app.settle(effect, Ok("Saved.".into()), || read));
+        let effects = press(&mut app, &[Key::Char('y')]);
+        let [effect @ Effect::SaveSystem(_)] = &effects[..] else {
+            panic!("{effects:?}");
+        };
+        assert!(app.settle(effect, Ok("Saved.".into()), || files(None)));
+        assert_eq!(app.changed_count(), 0);
+
+        pick_a_model(&mut app);
+        let read = with_unlisted(files(None));
+        assert!(app.settle(&toggle(), Ok("Done.".into()), || read));
+        assert_unlisted_kept(&app);
+        assert_eq!(app.changed_count(), 2);
     }
 
     #[test]

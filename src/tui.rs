@@ -64,13 +64,11 @@ pub(crate) fn run(expert: bool) -> Result<(), String> {
             // Show what is happening before a slow step starts.
             draw(&mut terminal, &mut app, size)?;
             let outcome = perform(&mut terminal, &effect);
-            if reloads(&effect) {
-                app.reload(load_files());
+            if app.settle(&effect, outcome, load_files) {
                 // Changed here, knowingly: recorded, so the bar does not
                 // call it news.
                 status::chosen();
             }
-            app.finish(&effect, outcome);
         }
     }
     Ok(())
@@ -92,17 +90,6 @@ fn load_files() -> Loaded {
     let settings = Settings::load();
     let system_text = fs::read_to_string(SYSTEM_PATH).unwrap_or_default();
     Loaded::from_settings(&settings, system_text, paths(&settings))
-}
-
-const fn reloads(effect: &Effect) -> bool {
-    matches!(
-        effect,
-        Effect::SaveUser(_)
-            | Effect::SaveSystem(_)
-            | Effect::Integration(_)
-            | Effect::GuidedSetup
-            | Effect::Edit(_)
-    )
 }
 
 fn perform(terminal: &mut Terminal, effect: &Effect) -> Result<String, String> {
