@@ -2,7 +2,7 @@
 //! and a reset to defaults, with the Guardian mascot saying how things
 //! stand. Expert mode (`e`) has every other setting.
 
-use super::{App, Dialog, Effect, Mode, Tone, draw_dialog, value_hint, wrap};
+use super::{App, Dialog, Effect, Mode, Tone, defaults, draw_dialog, value_hint, wrap};
 use crate::config::file::AgentDefaults;
 use crate::config::file::PartialConfig;
 use crate::config::load::FileStatus;
@@ -302,8 +302,12 @@ impl App {
     }
 
     pub(super) fn reset_defaults(&mut self) {
-        self.user = PartialConfig::default();
-        self.system = PartialConfig::default();
+        self.user = defaults(Scope::User, &self.files.user);
+        self.system = defaults(Scope::System, &self.files.system);
+        self.reset = [Scope::User, Scope::System]
+            .into_iter()
+            .filter(|scope| self.dirty(*scope))
+            .collect();
         if self.dirty(Scope::User) || self.dirty(Scope::System) {
             self.say("Defaults set. Press s to save.");
         } else {
@@ -627,10 +631,11 @@ mod tests {
     use super::super::{App, Effect, Loaded, Mode, Task};
     use crate::config::file::PartialConfig;
     use crate::config::load::FileStatus;
-    use crate::config::model::Profile;
+    use crate::config::model::{Profile, RootConsent};
     use crate::integrations::{Paths, Plan, Step};
     use crate::test_support::TempDir;
     use crate::tui::canvas::Canvas;
+    use crate::tui::fields::validate;
     use crate::tui::term::Key;
 
     fn files(paths: Option<Paths>) -> Loaded {
@@ -855,6 +860,81 @@ mod tests {
         assert!(screen(&mut app).contains("1 Profiles"));
         press(&mut app, &[Key::Char('e')]);
         assert!(screen(&mut app).contains("PROTECTION LEVEL"));
+    }
+
+    /// A system file with a level and the settings saving it never removes.
+    fn system_file() -> PartialConfig {
+        let mut system = PartialConfig {
+            profile: Some(Profile::Strict),
+            trusted_reviewer_packages: Some(vec!["opencode-bin".into()]),
+            acknowledged_weaker: Some(vec!["aur.ai=off".into()]),
+            permit_strict: Some(true),
+            ..PartialConfig::default()
+        };
+        system.sweep.root = Some(RootConsent::Allowed);
+        system
+    }
+
+    #[test]
+    fn a_reset_shows_only_what_saving_the_system_file_removes() {
+        let mut loaded = files(None);
+        loaded.system = system_file();
+        loaded.system_text = validate(&loaded.system).unwrap();
+        let mut app = App::new(loaded, Mode::Simple);
+        press(&mut app, &[Key::End, Key::Enter, Key::Char('y')]);
+        assert_eq!(app.system.profile, None);
+        assert_eq!(app.system.sweep, system_file().sweep);
+        assert_eq!(app.system.permit_strict, Some(true));
+
+        assert!(press(&mut app, &[Key::Char('s')]).is_empty());
+        let text = screen(&mut app);
+        assert!(text.contains("- profile = \"strict\""), "{text}");
+        // The level is the only line removed; the rest is shown as kept.
+        assert_eq!(text.matches("│ - ").count(), 1, "{text}");
+        assert!(text.contains("│   [sweep]"), "{text}");
+    }
+
+    #[test]
+    fn a_reset_that_removes_only_unlisted_settings_counts_as_a_change() {
+        let mut loaded = files(None);
+        loaded.user.update_check = Some(false);
+        let mut app = App::new(loaded, Mode::Simple);
+        press(&mut app, &[Key::End, Key::Enter, Key::Char('y')]);
+        assert!(press(&mut app, &[Key::Char('q')]).is_empty());
+        assert!(screen(&mut app).contains("1 unsaved change(s) will be lost"));
+    }
+
+    #[test]
+    fn a_reset_is_still_a_reset_after_the_files_are_read_again() {
+        let mut on_disk = files(None);
+        on_disk.user.profile = Some(Profile::Strict);
+        on_disk.user.update_check = Some(false);
+        on_disk.system = system_file();
+        let read = files(None);
+        let read = Loaded {
+            user: on_disk.user.clone(),
+            system: on_disk.system.clone(),
+            ..read
+        };
+        let mut app = App::new(on_disk, Mode::Simple);
+        // Reset, then choose Private again on top of the cleared files.
+        press(&mut app, &[Key::End, Key::Enter, Key::Char('y')]);
+        press(&mut app, &[Key::Char('3')]);
+        let effect = Effect::Integration(Plan {
+            summary: "Protect everything".into(),
+            steps: Vec::new(),
+        });
+        assert!(app.settle(&effect, Ok("Done.".into()), || read));
+
+        assert_eq!(
+            app.user,
+            PartialConfig {
+                profile: Some(Profile::LocalOnly),
+                ..PartialConfig::default()
+            }
+        );
+        assert_eq!(app.system.profile, Some(Profile::LocalOnly));
+        assert_eq!(app.system.sweep, system_file().sweep);
     }
 
     #[test]

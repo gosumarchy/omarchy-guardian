@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use super::{App, Effect, Loaded, Mode, Tab, Task};
+use super::{App, Effect, Loaded, Mode, Row, Tab, Task};
 use crate::config::file::PartialConfig;
 use crate::config::load::FileStatus;
 use crate::config::model::{AiRequirement, Profile, RootConsent, SourceClass};
@@ -221,7 +221,11 @@ fn a_draft_without_edits_follows_its_file() {
 
 #[test]
 fn setup_and_the_editor_replace_both_drafts() {
-    for effect in [Effect::GuidedSetup, Effect::Edit(Scope::User)] {
+    for effect in [
+        Effect::GuidedSetup,
+        Effect::Edit(Scope::User),
+        Effect::Edit(Scope::System),
+    ] {
         let mut app = app();
         press(&mut app, &[Key::Char(' '), Key::Down, Key::Char(' ')]);
         settle(
@@ -232,6 +236,250 @@ fn setup_and_the_editor_replace_both_drafts() {
         );
         assert_eq!(app.changed_count(), 0, "{effect:?}");
     }
+}
+
+/// Edits the pacman gate's profile, asks to save and confirms.
+fn system_save(app: &mut App) -> Effect {
+    press(app, &[Key::Down, Key::Char(' ')]);
+    let effects = press(app, &[Key::Char('s'), Key::Char('y')]);
+    let [effect @ Effect::SaveSystem(_)] = &effects[..] else {
+        panic!("{effects:?}");
+    };
+    effect.clone()
+}
+
+#[test]
+fn a_system_save_that_fails_keeps_its_draft() {
+    let mut app = app();
+    let effect = system_save(&mut app);
+    app.settle(&effect, Err("sudo: a password is required".into()), || {
+        loaded(PartialConfig::default(), PartialConfig::default())
+    });
+    assert_eq!(app.system.profile, Some(Profile::Standard));
+    assert!(app.dirty(Scope::System));
+}
+
+#[test]
+fn a_user_save_that_fails_does_not_go_on_to_the_system_file() {
+    let mut app = app();
+    press(&mut app, &[Key::Char(' '), Key::Down, Key::Char(' ')]);
+    let effects = press(&mut app, &[Key::Char('s')]);
+    let [effect @ Effect::SaveUser(_)] = &effects[..] else {
+        panic!("{effects:?}");
+    };
+    assert!(app.system_after_user);
+    app.settle(effect, Err("read-only file system".into()), || {
+        loaded(PartialConfig::default(), PartialConfig::default())
+    });
+    assert!(!app.system_after_user);
+    assert!(app.dialog.is_none(), "{:?}", app.dialog);
+    assert_eq!(app.changed_count(), 2);
+}
+
+#[test]
+fn a_saved_system_draft_becomes_the_file_as_read_back() {
+    let mut app = app();
+    let effect = system_save(&mut app);
+    // What is read back is not the draft: a section of the file was kept,
+    // and the level was set again elsewhere right after.
+    let mut installed = app.system.clone();
+    installed.sweep.root = Some(RootConsent::Declined);
+    installed.profile = Some(Profile::Strict);
+    settle(
+        &mut app,
+        &effect,
+        PartialConfig::default(),
+        installed.clone(),
+    );
+    assert_eq!(app.system, installed);
+    assert!(!app.dirty(Scope::System));
+}
+
+#[test]
+fn an_integration_toggle_that_fails_keeps_unsaved_edits() {
+    let mut app = app();
+    press(&mut app, &[Key::Char(' '), Key::Down, Key::Char(' ')]);
+    app.settle(&toggle(), Err("pacman hook: exit status 1".into()), || {
+        loaded(PartialConfig::default(), PartialConfig::default())
+    });
+    assert_eq!(app.user.profile, Some(Profile::Standard));
+    assert_eq!(app.system.profile, Some(Profile::Standard));
+}
+
+#[test]
+fn the_system_save_after_a_root_checks_toggle_carries_the_consent() {
+    let mut app = app();
+    press(&mut app, &[Key::Down, Key::Char(' ')]);
+    let mut system = PartialConfig::default();
+    system.sweep.root = Some(RootConsent::Allowed);
+    settle(&mut app, &toggle(), PartialConfig::default(), system);
+    let effects = press(&mut app, &[Key::Char('s'), Key::Char('y')]);
+    let [Effect::SaveSystem(text)] = &effects[..] else {
+        panic!("{effects:?}");
+    };
+    assert!(text.contains("[sweep]\nroot = \"allowed\""), "{text}");
+    assert!(text.contains("profile = \"standard\""), "{text}");
+}
+
+/// A system file with every setting no field of the app shows.
+fn system_only() -> PartialConfig {
+    let mut system = PartialConfig {
+        trusted_reviewer_packages: Some(vec!["opencode-bin".into()]),
+        acknowledged_weaker: Some(vec!["aur.ai=off".into()]),
+        permit_strict: Some(true),
+        update_check: Some(false),
+        ..PartialConfig::default()
+    };
+    system.sweep.root = Some(RootConsent::Allowed);
+    system
+}
+
+#[test]
+fn saving_a_kept_draft_does_not_undo_what_changed_in_the_file() {
+    let mut app = App::new(
+        loaded(PartialConfig::default(), system_only()),
+        Mode::Expert,
+    );
+    press(&mut app, &[Key::Down, Key::Char(' ')]);
+    // Meanwhile, elsewhere: the acknowledgement and the rest are revoked,
+    // and a setting that has a field here is set.
+    let mut revoked = PartialConfig::default();
+    revoked.agent.model = Some("opencode/free".into());
+    settle(
+        &mut app,
+        &toggle(),
+        PartialConfig::default(),
+        revoked.clone(),
+    );
+    assert_eq!(app.changed_count(), 1);
+
+    let effects = press(&mut app, &[Key::Char('s'), Key::Char('y')]);
+    let [Effect::SaveSystem(text)] = &effects[..] else {
+        panic!("{effects:?}");
+    };
+    assert!(text.contains("profile = \"standard\""), "{text}");
+    assert!(text.contains("model = \"opencode/free\""), "{text}");
+    for gone in ["weaker", "[permit]", "trusted", "[sweep]", "[update]"] {
+        assert!(!text.contains(gone), "{gone}: {text}");
+    }
+    revoked.profile = Some(Profile::Standard);
+    assert_eq!(app.system, revoked);
+}
+
+#[test]
+fn undoing_the_edit_of_a_kept_draft_leaves_nothing_unsaved() {
+    let mut app = app();
+    press(&mut app, &[Key::Char(' ')]);
+    let user = PartialConfig {
+        update_check: Some(false),
+        ..PartialConfig::default()
+    };
+    settle(&mut app, &toggle(), user.clone(), PartialConfig::default());
+    assert_eq!(app.user.update_check, Some(false));
+    assert_eq!(app.changed_count(), 1);
+
+    press(&mut app, &[Key::Char('u')]);
+    assert_eq!(app.user, user);
+    assert!(!screen(&mut app).contains("unsaved"));
+    assert!(press(&mut app, &[Key::Char('s')]).is_empty());
+    assert_eq!(press(&mut app, &[Key::Char('q')]), [Effect::Quit]);
+    assert!(app.quit);
+}
+
+#[test]
+fn edits_of_a_file_that_became_invalid_are_dropped_and_said() {
+    let mut app = app();
+    press(&mut app, &[Key::Char(' ')]);
+    let mut broken = loaded(PartialConfig::default(), PartialConfig::default());
+    broken.user_status = FileStatus::Invalid("line 1: expected key = value".into());
+    assert!(app.settle(&toggle(), Ok("Done.".into()), || broken));
+
+    assert_eq!(app.user, PartialConfig::default());
+    let text = screen(&mut app);
+    assert!(
+        text.contains("The user file is no longer valid; your unsaved changes"),
+        "{text}"
+    );
+    assert!(press(&mut app, &[Key::Char('s')]).is_empty());
+    assert!(app.dialog.is_none());
+}
+
+#[test]
+fn the_chained_system_save_stops_when_that_file_became_invalid() {
+    let mut app = app();
+    press(&mut app, &[Key::Char(' '), Key::Down, Key::Char(' ')]);
+    let effects = press(&mut app, &[Key::Char('s')]);
+    let [effect @ Effect::SaveUser(_)] = &effects[..] else {
+        panic!("{effects:?}");
+    };
+    let mut broken = loaded(app.user.clone(), PartialConfig::default());
+    broken.system_status = FileStatus::Invalid("not owned by root".into());
+    app.settle(effect, Ok("Saved.".into()), || broken);
+
+    assert!(app.dialog.is_none(), "{:?}", app.dialog);
+    assert!(!app.dirty(Scope::System));
+    assert!(screen(&mut app).contains("The system file is no longer valid"));
+}
+
+#[test]
+fn a_file_that_cannot_be_read_is_not_saved_over() {
+    for scope in [Scope::User, Scope::System] {
+        let mut app = app();
+        press(&mut app, &[Key::Char(' '), Key::Down, Key::Char(' ')]);
+        let status = FileStatus::Invalid("line 3: unknown key".into());
+        match scope {
+            Scope::User => app.files.user_status = status,
+            Scope::System => {
+                app.files.system_status = status;
+                // Only the system file is left to save.
+                app.user = app.files.user.clone();
+            }
+        }
+        assert!(press(&mut app, &[Key::Char('s')]).is_empty(), "{scope:?}");
+        assert!(app.dialog.is_none(), "{scope:?}");
+        assert!(screen(&mut app).contains("fix it under Maintenance"));
+    }
+}
+
+#[test]
+fn an_edit_taken_back_is_not_carried_over() {
+    let mut app = app();
+    // A class knob of the user file, set and cleared again: the draft is
+    // left with an empty section for that class.
+    press(&mut app, &[Key::Char('2')]);
+    while !matches!(app.selected(), Some(Row::Field(field)) if field.scope == Scope::User) {
+        press(&mut app, &[Key::Down]);
+    }
+    press(&mut app, &[Key::Char(' '), Key::Char('x')]);
+    assert!(app.dirty(Scope::User));
+    settle(
+        &mut app,
+        &toggle(),
+        PartialConfig::default(),
+        PartialConfig::default(),
+    );
+    assert_eq!(app.user, PartialConfig::default());
+}
+
+#[test]
+fn clearing_what_the_file_no_longer_sets_is_not_a_change() {
+    let mut user = PartialConfig::default();
+    user.class_mut(SourceClass::Aur).ai = Some(AiRequirement::Off);
+    let mut app = App::new(loaded(user, PartialConfig::default()), Mode::Expert);
+    press(&mut app, &[Key::Char('2')]);
+    while !matches!(app.selected(), Some(Row::Field(field)) if field.scope == Scope::User) {
+        press(&mut app, &[Key::Down]);
+    }
+    press(&mut app, &[Key::Char('x')]);
+    assert_eq!(app.changed_count(), 1);
+    // Meanwhile the file lost that section.
+    settle(
+        &mut app,
+        &toggle(),
+        PartialConfig::default(),
+        PartialConfig::default(),
+    );
+    assert_eq!(app.user, PartialConfig::default());
 }
 
 #[test]
