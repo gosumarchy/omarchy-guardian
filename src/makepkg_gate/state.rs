@@ -7,9 +7,11 @@
 //! Guardian. Without this a question would be asked on every call, and a
 //! later call could not tell whether the sources it finds are the ones an
 //! earlier call fetched and reviewed. It lives beside the review memory, in
-//! a directory only the user can read or write; with no such directory
-//! nothing is remembered and every question is asked again. With one, a
-//! record that cannot be written is an error its caller answers for.
+//! a directory only the user can read or write. Where no place for one
+//! is known at all, nothing is remembered and every question is asked
+//! again. Where there is a place and the directory is refused or cannot be
+//! made (`Missing`), or a record cannot be written, that is an error its
+//! caller answers for: a record that should be there is not.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
@@ -71,6 +73,85 @@ pub(super) enum Kept {
     /// A directory is where the record would be. Neither is that none: no
     /// record can take its place while it is there.
     InTheWay(PathBuf),
+    /// The directory the records are kept in cannot be used: whether
+    /// there is a record is not known.
+    Missing(Missing),
+}
+
+/// Why there is no directory to keep records in, where there is a place
+/// for one. `reason` names the path it is about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Missing {
+    /// It, or the directory above it, is not a private directory of the
+    /// user's (another's, open to group or others, not a directory), or
+    /// who the user is cannot be told.
+    Refused { directory: PathBuf, reason: String },
+    /// It could not be made, or looked at.
+    NotMade { directory: PathBuf, reason: String },
+}
+
+impl Missing {
+    fn of(directory: &Path, error: &Error) -> Self {
+        let (directory, reason) = (directory.to_path_buf(), error.to_string());
+        match error {
+            Error::Refused(_) => Self::Refused { directory, reason },
+            _ => Self::NotMade { directory, reason },
+        }
+    }
+
+    fn reason(&self) -> &str {
+        match self {
+            Self::Refused { reason, .. } | Self::NotMade { reason, .. } => reason,
+        }
+    }
+}
+
+/// Where a `State` keeps its records.
+enum Place {
+    /// In this directory.
+    Open(PathBuf),
+    /// No place for one is known: nothing is remembered.
+    Nowhere,
+    /// There is a place, and no directory that can be used.
+    Missing(Missing),
+}
+
+impl Place {
+    /// The directory under the review memory's `root`, made for the user
+    /// alone where it is not there.
+    fn under(root: Option<&Path>) -> Self {
+        let Some(root) = root else {
+            return Self::Nowhere;
+        };
+        let uid = match user::effective_uid() {
+            Ok(uid) => uid,
+            Err(error) => {
+                return Self::Missing(Missing::Refused {
+                    directory: root.to_path_buf(),
+                    reason: error.to_string(),
+                });
+            }
+        };
+        if let Err(error) = paths::private_dir(root, uid) {
+            return Self::Missing(Missing::of(root, &error));
+        }
+        let directory = root.join(DIRECTORY);
+        match DirBuilder::new().mode(0o700).create(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(source) => {
+                let error = Error::Io {
+                    path: directory.clone(),
+                    source,
+                };
+                return Self::Missing(Missing::of(&directory, &error));
+            }
+        }
+        match paths::private_dir(&directory, uid) {
+            Ok(()) => Self::Open(directory),
+            Err(error) => Self::Missing(Missing::of(&directory, &error)),
+        }
+    }
 }
 
 /// Why a record of an extraction was not kept.
@@ -81,6 +162,8 @@ pub(super) enum NotKept {
     InTheWay(PathBuf),
     /// It could not be written: the error names the path.
     Write(Error),
+    /// There is no directory to write it in, where there should be one.
+    Missing(Missing),
 }
 
 /// What tells one directory from another made later under the same name:
@@ -288,11 +371,13 @@ fn one_line(entries: &BTreeMap<String, String>) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The gate's memory of one package. Without a directory it remembers
-/// nothing: every read is empty and every write is dropped, which is no
-/// error. With one, a write that fails is.
+/// The gate's memory of one package. Where no place for a directory is
+/// known it remembers nothing: every read is empty and every write is
+/// dropped, which is no error. With a directory, a write that fails is
+/// one; so is every write where the directory is `Missing`, and the read
+/// of the record of an extraction says so too.
 pub(super) struct State {
-    directory: Option<PathBuf>,
+    place: Place,
     name: String,
     /// The most the record of an extraction may hold, written or read.
     most: u64,
@@ -300,33 +385,32 @@ pub(super) struct State {
 
 impl State {
     /// Opens the memory of the package `key` under the review memory's
-    /// `root`, creating its directory for the user alone.
+    /// `root`, creating its directory for the user alone. It never fails:
+    /// what it could not open, its reads and writes say.
     pub(super) fn open(root: Option<&Path>, key: &str) -> Self {
-        let directory = root.and_then(|root| {
-            let uid = user::effective_uid().ok()?;
-            paths::private_dir(root, uid).ok()?;
-            let directory = root.join(DIRECTORY);
-            match DirBuilder::new().mode(0o700).create(&directory) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(_) => return None,
-            }
-            paths::private_dir(&directory, uid).ok()?;
-            Some(directory)
-        });
         Self {
-            directory,
+            place: Place::under(root),
             name: Sha256::digest(key.as_bytes()).to_string(),
             most: MAX_BYTES,
         }
     }
 
     fn path(&self, what: &str) -> Option<PathBuf> {
-        Some(
-            self.directory
-                .as_ref()?
-                .join(format!("{}.{what}", self.name)),
-        )
+        Some(self.directory()?.join(format!("{}.{what}", self.name)))
+    }
+
+    /// Why there is no directory, where there should be one.
+    fn missing(&self) -> Option<&Missing> {
+        match &self.place {
+            Place::Missing(missing) => Some(missing),
+            Place::Open(_) | Place::Nowhere => None,
+        }
+    }
+
+    /// Whether no place to keep anything is known, so that nothing is
+    /// remembered and nothing is wrong with that.
+    pub(super) fn is_nowhere(&self) -> bool {
+        matches!(self.place, Place::Nowhere)
     }
 
     fn read(&self, what: &str) -> Option<String> {
@@ -339,14 +423,20 @@ impl State {
 
     /// The directory the records are kept in, when there is one.
     pub(super) fn directory(&self) -> Option<&Path> {
-        self.directory.as_deref()
+        match &self.place {
+            Place::Open(directory) => Some(directory),
+            Place::Nowhere | Place::Missing(_) => None,
+        }
     }
 
     /// Writes through a new file and a rename, so a reader never sees half
-    /// and a write that fails leaves what was there. With no directory
-    /// nothing is written, and that is `Ok`; an error is a record that
-    /// should now be there and is not, and names the path.
+    /// and a write that fails leaves what was there. Where no place is
+    /// known nothing is written, and that is `Ok`; an error is a record
+    /// that should now be there and is not, and names the path.
     fn write(&self, what: &str, text: &str) -> Result<(), Error> {
+        if let Some(missing) = self.missing() {
+            return Err(Error::Refused(missing.reason().to_string()));
+        }
         let Some(path) = self.path(what) else {
             return Ok(());
         };
@@ -409,6 +499,9 @@ impl State {
     /// Nothing but a regular file is opened, so a pipe left under the
     /// record's name is not waited on.
     pub(super) fn extraction(&self) -> Kept {
+        if let Some(missing) = self.missing() {
+            return Kept::Missing(missing.clone());
+        }
         let Some(path) = self.path("extraction") else {
             return Kept::Absent;
         };
@@ -456,6 +549,9 @@ impl State {
     /// the record of an earlier extraction, or none, and must not be let
     /// come to that unsaid.
     pub(super) fn record_extraction(&self, extraction: &Extraction) -> Result<bool, NotKept> {
+        if let Some(missing) = self.missing() {
+            return Err(NotKept::Missing(missing.clone()));
+        }
         // A directory left under the record's name would keep the new
         // record from taking its place. An empty one is removed; one that
         // is not is left as it is.
@@ -567,6 +663,9 @@ pub(super) fn binary_changes(
 
 #[cfg(test)]
 mod forget_tests;
+
+#[cfg(test)]
+mod place_tests;
 
 #[cfg(test)]
 mod record_tests;

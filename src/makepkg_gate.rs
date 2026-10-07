@@ -57,7 +57,7 @@ use self::permits::{
 };
 use self::rpc::aur_facts;
 use self::sources::{download_names, fetch_refusal, source_context};
-use self::state::{Drift, Extraction, Kept, NotKept, State};
+use self::state::{Drift, Extraction, Kept, Missing, NotKept, State};
 use self::upstream::{review_upstream_files, unreviewable_sources};
 use crate::audit::{self, Gate};
 use crate::aur::recipe::{self, Sources};
@@ -888,6 +888,32 @@ impl NotHeld {
         }
     }
 
+    /// The directory Guardian keeps its records in cannot be used or
+    /// made, at the call that `extracts` or at one that does not.
+    fn no_directory(missing: &Missing, extracts: bool) -> Self {
+        let lost = if extracts {
+            "no record of the sources it extracted for this build could be kept, and a later call of this build could not be held to them"
+        } else {
+            "whether it has a record of the sources it extracted for this build cannot be known, and the sources cannot be held against one"
+        };
+        match missing {
+            Missing::Refused { directory, reason } => Self {
+                message: format!(
+                    "Guardian does not use the directory it keeps its records of builds in ({reason}), so {lost}. Nothing was built. Make {0} a directory of yours alone (`chmod 700 {0}`), or remove what is in its place; then run the build again from the start.",
+                    directory.display()
+                ),
+                why: "the directory of Guardian's records of builds is not the user's alone",
+            },
+            Missing::NotMade { directory, reason } => Self {
+                message: format!(
+                    "Guardian could not make the directory it keeps its records of builds in ({reason}), so {lost}. Nothing was built. Free space on that disk, or put right what the error names, so that {} can be made; then run the build again from the start.",
+                    directory.display()
+                ),
+                why: "the directory of Guardian's records of builds could not be made",
+            },
+        }
+    }
+
     /// The record of what Guardian extracted could not be written, where
     /// there is a directory to keep it in.
     fn not_recorded(step: &UpstreamStep<'_>, error: &Error) -> Self {
@@ -904,6 +930,9 @@ impl NotHeld {
     }
 }
 
+/// Said by a call that extracts where Guardian has nowhere to keep anything.
+const NOWHERE_NOTICE: &str = "Guardian has nowhere to keep a record of the sources it extracted (neither XDG_STATE_HOME nor HOME names a place): a later call of this build has them reviewed as it finds them, not held to these.";
+
 /// Holds the sources as a call that does not extract finds them against
 /// what Guardian extracted for this build. `Err` is why the build must not
 /// go on; `Ok` holds facts for the AI about what changed in between. Only
@@ -919,6 +948,7 @@ fn hold_against_extraction(
         Kept::Usable(extraction) if extraction.is_of(srcdir) => extraction,
         Kept::Unusable(reason) => return Err(NotHeld::unusable(step, &reason)),
         Kept::InTheWay(record) => return Err(NotHeld::in_the_way(&record)),
+        Kept::Missing(missing) => return Err(NotHeld::no_directory(&missing, false)),
         Kept::Absent | Kept::Usable(_) => {
             outln!(
                 "Sources: Guardian has no record of extracting them for this build; they are reviewed as they are now."
@@ -965,13 +995,17 @@ fn hold_against_extraction(
 /// why the build must not go on: the sources were too many to list, which
 /// the record then says, or there is a directory to keep the record in and
 /// it could not be written, so a later call would find the record of an
-/// earlier extraction, or none, and not be held to these sources. With no
-/// such directory nothing is recorded and that is `Ok`, as before.
+/// earlier extraction, or none, and not be held to these sources; or that
+/// directory is refused or cannot be made. Only where no place for one is
+/// known is nothing recorded and that `Ok`, as before, and said.
 fn record_extraction(
     step: &UpstreamStep<'_>,
     srcdir: &Path,
     collected: &aur::Collected,
 ) -> Result<(), NotHeld> {
+    if step.state.is_nowhere() {
+        errln!("{NOWHERE_NOTICE}");
+    }
     let seen = collected.upstream();
     let cleans = step
         .mirrored
@@ -990,6 +1024,7 @@ fn record_extraction(
         Ok(false) => Err(NotHeld::unlisted(step)),
         Err(NotKept::InTheWay(record)) => Err(NotHeld::in_the_way(&record)),
         Err(NotKept::Write(error)) => Err(NotHeld::not_recorded(step, &error)),
+        Err(NotKept::Missing(missing)) => Err(NotHeld::no_directory(&missing, true)),
     }
 }
 

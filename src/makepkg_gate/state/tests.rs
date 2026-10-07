@@ -40,8 +40,9 @@ fn confirmations_are_kept_per_package_and_only_in_a_private_directory() {
     assert!(!state.is_confirmed("prebuilt abc"));
     assert!(state.is_confirmed("sources 39"));
 
-    // Without a directory, or with one open to others, nothing is
-    // remembered: the question is asked again.
+    // Without a place for a directory, or with one open to others,
+    // nothing is remembered: the question is asked again. The first is
+    // no error; the second is one.
     let nowhere = State::open(None, "demo");
     nowhere.remember_confirmed("x").unwrap();
     assert!(!nowhere.is_confirmed("x"));
@@ -49,7 +50,11 @@ fn confirmations_are_kept_per_package_and_only_in_a_private_directory() {
     fs::create_dir(&open).unwrap();
     fs::set_permissions(&open, fs::Permissions::from_mode(0o755)).unwrap();
     let state = State::open(Some(&open), "demo");
-    state.remember_confirmed("x").unwrap();
+    let refused = state.remember_confirmed("x").unwrap_err().to_string();
+    assert!(
+        refused.ends_with("open is accessible to group or others"),
+        "{refused}"
+    );
     assert!(!state.is_confirmed("x"));
 }
 

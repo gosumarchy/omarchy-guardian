@@ -641,6 +641,22 @@ makepkg_jail() {
     check 'makepkg was not started' absent "$built"
     check 'no record was left' absent "$record"
     chmod 700 "$kept"
+    # A directory for the records that is not the user's alone is not used,
+    # and a build with none to keep its record in is not started.
+    chmod 770 "$kept"
+    jail_gate --noconfirm
+    expect 'a call that extracts with its records open to the group is blocked' 2 "$?"
+    expect_output 'the gate says why it does not use the directory' "$kept is accessible to group or others"
+    expect_output 'and how to put it right' "chmod 700 $kept"
+    check 'makepkg was not started' absent "$built"
+    jail_gate --noconfirm --noextract
+    expect 'and so is a later call' 2 "$?"
+    expect_output 'for the same reason' "$kept is accessible to group or others"
+    check 'makepkg was not started' absent "$built"
+    chmod 700 "$kept"
+    jail_gate --noconfirm
+    expect 'with the directory its own again the build is started' 0 "$?"
+    rm -f -- "$record"
     # A directory where the record goes is named, and left as it is.
     mkdir -- "$record"
     : >"$record/kept"
