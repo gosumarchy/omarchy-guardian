@@ -188,23 +188,23 @@ fn reads_pipe(segments: &[&str], index: usize) -> bool {
     // A command inside a substitution that was looked past for the
     // program after it reads the pipe as well: `| x=$(sudo sh) true`.
     let (word, within) = shell::programs(&mut words);
-    if within
+    within
         .into_iter()
-        .any(|(program, rest)| consumes_pipe(program, rest, spaced))
-    {
-        return true;
-    }
-    let Some(word) = word else {
-        return false;
-    };
+        .any(|(program, rest)| takes_pipe(program, rest, spaced))
+        || word.is_some_and(|word| takes_pipe(word, words, spaced))
+}
+
+/// Whether the program `word`, given `rest`, runs what a pipe carries to
+/// it: itself, or as `xargs` handing the input to a shell.
+fn takes_pipe<'a>(word: &str, rest: impl Iterator<Item = &'a str>, spaced: bool) -> bool {
     // `xargs sh -c '…'`: xargs hands the input to the shell.
     if program_name(word) == "xargs" {
-        let mut rest = words.skip_while(|argument| argument.starts_with('-'));
+        let mut rest = rest.skip_while(|argument| argument.starts_with('-'));
         return rest
             .next()
             .is_some_and(|program| consumes_pipe(program, rest, spaced));
     }
-    consumes_pipe(word, words, spaced)
+    consumes_pipe(word, rest, spaced)
 }
 
 /// The last of `segments`, cut as `pipes_into_shell` cuts a line, that runs
