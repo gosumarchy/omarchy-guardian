@@ -264,30 +264,36 @@ fn dns_exfiltration(line: &str) -> bool {
     })
 }
 
+/// Programs that write out what the clipboard holds.
+const CLIPBOARD_READERS: &[&str] = &["wl-paste", "xclip", "xsel", "pbpaste"];
+
 /// Reading the clipboard into a sender, or into a file in a loop.
 fn clipboard_capture(line: &str) -> bool {
+    // A reader is named on the line, inside quotes or not, or no command
+    // on it is one.
+    let plain = shell::unquoted(line);
+    if !CLIPBOARD_READERS.iter().any(|name| plain.contains(name)) {
+        return false;
+    }
     let reads_clipboard = |text: &str| {
         shell::command(text).is_some_and(|command| {
-            matches!(
-                command.program.as_str(),
-                "wl-paste" | "xclip" | "xsel" | "pbpaste"
-            ) && (command.program == "wl-paste"
-                || command.program == "pbpaste"
-                || command.has_short('o'))
+            CLIPBOARD_READERS.contains(&command.program.as_str())
+                && (command.program == "wl-paste"
+                    || command.program == "pbpaste"
+                    || command.has_short('o'))
         })
     };
     // Into a sender.
     if pipes_into(line, &reads_clipboard, SENDERS) {
         return true;
     }
-    if shell::substitutions(line)
-        .iter()
-        .any(|found| reads_clipboard(found.body))
-        && has_sender(line)
-    {
-        return true;
-    }
-    false
+    // The sender is asked for first: each substitution's body is read for
+    // its command only on a line that has one.
+    let mut reading = shell::Reading::of(line);
+    has_sender(line)
+        && shell::substitutions(line)
+            .iter()
+            .any(|found| !reading.takes(found.body) || reads_clipboard(found.body))
 }
 
 /// Whether the line, lowercased and without what it only prints, takes or

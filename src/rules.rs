@@ -600,7 +600,10 @@ fn is_identifier_byte(byte: u8) -> bool {
 /// character must not continue an identifier or member access, so `eval(`
 /// matches `eval(x)` but not `retrieval(x)` or `model.eval()`.
 fn contains_pattern(haystack: &str, pattern: &str) -> bool {
-    pattern_starts(haystack, pattern).next().is_some()
+    // Most lines hold none of a rule's patterns, and `contains` is the
+    // cheaper search of the two: where each match stands is only asked on a
+    // line that has one.
+    haystack.contains(pattern) && pattern_starts(haystack, pattern).next().is_some()
 }
 
 /// Where `pattern` occurs in `haystack`, respecting identifier boundaries.

