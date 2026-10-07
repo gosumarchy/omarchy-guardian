@@ -24,7 +24,7 @@ use crate::engine::plan::{HashOnly, ManifestEntry, Plan, PlanInput, Previous, Se
 use crate::engine::request::Request;
 use crate::engine::store::Store;
 use crate::error::Error;
-use crate::report::{AgentOutcome, AgentRun, LocalFinding};
+use crate::report::{AgentOutcome, AgentRun, LocalFinding, NOT_ATTEMPTED};
 use crate::rules;
 use crate::time::SECONDS_PER_DAY;
 use crate::tools::{OpenCode, Reviewer};
@@ -105,9 +105,13 @@ pub(crate) struct Group<'a> {
 /// What reviewing one group produced.
 #[derive(Debug, Default)]
 pub(crate) struct GroupReview {
-    /// One run per chunk, in order.
+    /// One run per chunk, in order; a chunk whose reply was invalid has none
+    /// and is what `invalid` is about.
     pub(crate) runs: Vec<AgentRun>,
     /// An invalid reply: the review is blocked and nothing from it is cached.
+    /// For a review in several chunks it names the first chunk that failed
+    /// and says how many more did.
+    /// The other chunks' verdicts are in `runs` all the same.
     pub(crate) invalid: Option<Error>,
     /// The plan needed more than `max_chunks` requests; nothing was sent.
     pub(crate) too_large: bool,
@@ -190,15 +194,11 @@ pub(crate) fn review_group(
         memory,
         fresh: Vec::new(),
     };
-    match runner.run_all(&requests(group, &plan, &facts), &mut review.notes) {
-        Ok(runs) => review.runs = runs,
-        Err((runs, error)) => {
-            review.runs = runs;
-            review.invalid = Some(error);
-            return review;
-        }
+    (review.runs, review.invalid) =
+        runner.run_all(&requests(group, &plan, &facts), &mut review.notes);
+    if review.invalid.is_none() {
+        runner.save(&mut review.notes);
     }
-    runner.save(&mut review.notes);
     review
 }
 
@@ -566,17 +566,21 @@ struct Runner<'a> {
 }
 
 impl Runner<'_> {
-    /// One run per request, in order, or the runs before the first invalid
-    /// reply together with that reply's error. The cache answers what it
-    /// can; the first live request runs alone, so an unavailable AI costs
-    /// one call (and its retry), and the rest run `PARALLEL_REVIEWS` at a
-    /// time. Once a request finds the AI unavailable or invalid, requests
-    /// not yet started are not attempted.
+    /// One run per request, in order, and the error of the first invalid
+    /// reply, if there was one (see `chunk_error`). A request whose reply was invalid has no
+    /// run: the error stands for it. Every other request keeps its run,
+    /// whether it comes before or after: a verdict that exists (from the
+    /// cache, or from a request that ran beside the invalid one) is never
+    /// left out of the review. The cache answers what it can; the first
+    /// live request runs alone, so an unavailable AI costs one call (and
+    /// its retry), and the rest run `PARALLEL_REVIEWS` at a time. Once a
+    /// request finds the AI unavailable or invalid, requests not yet
+    /// started are not attempted, and their runs say so.
     fn run_all(
         &mut self,
         requests: &[Request],
         notes: &mut Vec<String>,
-    ) -> Result<Vec<AgentRun>, (Vec<AgentRun>, Error)> {
+    ) -> (Vec<AgentRun>, Option<Error>) {
         let memory = self.memory.filter(|memory| memory.use_cache);
         let keys: Vec<Option<String>> = requests
             .iter()
@@ -621,6 +625,8 @@ impl Runner<'_> {
 
         let mut runs = Vec::with_capacity(requests.len());
         let mut stopped: Option<String> = None;
+        let mut invalid: Option<((usize, usize), Error)> = None;
+        let mut failed = 0_usize;
         for (index, request) in requests.iter().enumerate() {
             let (outcome, cached) = match (outcomes[index].take(), results[index].take()) {
                 (Some(done), _) => done,
@@ -650,8 +656,13 @@ impl Runner<'_> {
                             stopped.get_or_insert_with(|| error.to_string());
                             (AgentOutcome::Unavailable(error), None)
                         }
+                        // The review is blocked on the first of these; the
+                        // chunks after it are still collected.
                         Err(AgentError::Invalid(error) | AgentError::OutOfTime(error)) => {
-                            return Err((runs, error));
+                            stopped.get_or_insert_with(|| error.to_string());
+                            failed += 1;
+                            invalid = invalid.or(Some((request.chunk, error)));
+                            continue;
                         }
                     }
                 }
@@ -670,7 +681,8 @@ impl Runner<'_> {
                 outcome,
             });
         }
-        Ok(runs)
+        let invalid = invalid.map(|(chunk, error)| chunk_error(chunk, failed - 1, error));
+        (runs, invalid)
     }
 
     /// The cached verdict for `key`, if the cache has one.
@@ -733,9 +745,23 @@ impl Runner<'_> {
 }
 
 fn not_attempted(reason: &str) -> AgentOutcome {
-    AgentOutcome::Unavailable(Error::Refused(format!(
-        "not attempted after an earlier chunk failed: {reason}"
-    )))
+    AgentOutcome::Unavailable(Error::Refused(format!("{NOT_ATTEMPTED}: {reason}")))
+}
+
+/// The error of the first chunk whose reply was invalid, for the report:
+/// in a review of several chunks it says which chunk that was, and how
+/// many `more` chunks failed after it. The error of a review in one
+/// request is left as it is.
+fn chunk_error((index, count): (usize, usize), more: usize, error: Error) -> Error {
+    if count <= 1 {
+        return error;
+    }
+    let others = if more > 0 {
+        format!(" (and {more} more failed)")
+    } else {
+        String::new()
+    };
+    Error::Refused(format!("chunk {index}/{count}{others}: {error}"))
 }
 
 /// One review, retried once after a short pause when the AI was unavailable

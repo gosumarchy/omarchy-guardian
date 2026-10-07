@@ -116,10 +116,14 @@ cp -- /usr/bin/makepkg "$WORK/usr-layer/bin/makepkg.real"
 # else of this run's directory: a stand-in kept there would not be found,
 # and every aur case would end incomplete. Everything else is the host's,
 # writable as it is (the reviewer keeps its login and session state in the
-# home). In this sandbox the system settings file does not look root-owned
-# and is ignored, which the gate says: the user file decides.
+# home), but for the system settings file: in this sandbox's user namespace
+# it does not look root-owned, and the gate would refuse every case for it.
+# It is hidden where there is one, so the user file decides; a mount point
+# cannot be made in /etc where there is none, and then nothing is to hide.
 makepkg_sandbox() {
-    bwrap --dev-bind / / \
+    local -a hidden=()
+    [[ -d /etc/omarchy-guardian ]] && hidden=(--tmpfs /etc/omarchy-guardian)
+    bwrap --dev-bind / / "${hidden[@]}" \
         --overlay-src /usr --overlay-src "$WORK/usr-layer" --tmp-overlay /usr \
         --ro-bind "$WORK/makepkg" /usr/bin/makepkg -- "$@"
 }
