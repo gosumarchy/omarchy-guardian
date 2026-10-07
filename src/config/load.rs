@@ -54,7 +54,7 @@ pub(crate) fn user_config_path() -> Option<PathBuf> {
 
 /// The system file and its directory must be root-owned regular entries
 /// that only root can write.
-fn check_root_owned(path: &Path) -> Result<(), String> {
+pub(crate) fn check_root_owned(path: &Path) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
     if !metadata.file_type().is_file() {
         return Err("not a regular file".into());

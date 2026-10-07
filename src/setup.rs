@@ -6,7 +6,8 @@
 
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read as _, Write};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -19,7 +20,7 @@ use crate::config::model::{
 };
 use crate::config::write;
 use crate::engine::request::Request;
-use crate::files::{AtomicWrite, write_atomic};
+use crate::files::{AtomicWrite, O_NOFOLLOW, O_NONBLOCK, write_atomic};
 use crate::tools::{self, Limits, OpenCode, Reviewer};
 
 pub(crate) trait Terminal {
@@ -225,7 +226,7 @@ pub(crate) fn run(
 ) -> Result<(), String> {
     // Before any question: a system file that cannot be read or is not
     // valid has to be put right first, and setup would not replace it.
-    environment.existing_system()?;
+    environment.existing_system().map_err(wrote_neither)?;
     terminal.say("Omarchy Guardian setup\n");
 
     let has_opencode = environment.user_opencode().is_some();
@@ -438,7 +439,7 @@ fn write_files(
     environment: &dyn Environment,
     choice: &Choice,
 ) -> Result<(), String> {
-    let existing = environment.existing_system()?;
+    let existing = environment.existing_system().map_err(wrote_neither)?;
     let (user_text, new_system_text) = validate_rendered(choice)?;
     // What will be installed: the file as it is with the keys setup asks
     // about changed, not a new file that drops the rest.
@@ -466,26 +467,69 @@ fn write_files(
     Ok(())
 }
 
-/// Lines only in the old text marked `-`, lines only in the new one `+`.
+/// Why setup stopped on a system file it will not change, with what that
+/// means for the user's own file.
+fn wrote_neither(mut reason: String) -> String {
+    reason.push_str(
+        "\nSetup wrote nothing, not your own settings file either: it does not save one while \
+the system file is in a state it cannot change.",
+    );
+    reason
+}
+
+/// What changes between two config texts. A setting is told apart by the
+/// table it is under as well as its line, so the same line under two tables
+/// is two settings: every one the new text no longer has is a `-` line
+/// naming its table, listed first. The new text follows, a setting the old
+/// one did not have under that table marked `+`. Order and spacing alone
+/// change nothing.
 pub(crate) fn line_diff(old: &str, new: &str) -> String {
+    let old = settings_lines(old);
+    let new = settings_lines(new);
     let mut text = String::new();
 
-    for line in old
-        .lines()
-        .filter(|line| !new.lines().any(|other| other == *line))
-    {
+    for (table, line) in old.iter().filter(|entry| !new.contains(entry)) {
+        // A table's own line and the spacing say nothing its settings do not.
+        if line.trim().is_empty() || is_table(line) {
+            continue;
+        }
         // Formatting into a String cannot fail.
-        let _ = writeln!(text, "- {line}");
-    }
-    for line in new.lines() {
-        let marker = if old.lines().any(|other| other == line) {
-            " "
+        let _ = if table.is_empty() {
+            writeln!(text, "- {line}")
         } else {
-            "+"
+            writeln!(text, "- {table} {line}")
         };
-        let _ = writeln!(text, "{marker} {line}");
+    }
+    for entry in &new {
+        let same = entry.1.trim().is_empty() || old.contains(entry);
+        let marker = if same { " " } else { "+" };
+        let _ = writeln!(text, "{marker} {}", entry.1);
     }
     text
+}
+
+/// Each line of a config text with the table it is under: none before the
+/// first table, and none for what belongs to no table (a table's own line,
+/// a comment, spacing).
+fn settings_lines(text: &str) -> Vec<(&str, &str)> {
+    let mut table = "";
+    text.lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            if is_table(line) {
+                table = trimmed.find(']').map_or(trimmed, |end| &trimmed[..=end]);
+                ("", line)
+            } else if trimmed.is_empty() || trimmed.starts_with('#') {
+                ("", line)
+            } else {
+                (table, line)
+            }
+        })
+        .collect()
+}
+
+fn is_table(line: &str) -> bool {
+    line.trim_start().starts_with('[')
 }
 
 pub(crate) struct TtyTerminal;
@@ -651,7 +695,7 @@ impl Environment for RealEnvironment {
     }
 
     fn existing_system(&self) -> Result<Option<SystemFile>, String> {
-        load_system(Path::new(SYSTEM_PATH))
+        load_system(&Place::system())
     }
 
     fn write_user(&self, text: &str) -> Result<PathBuf, String> {
@@ -674,7 +718,7 @@ impl Environment for RealEnvironment {
     }
 
     fn write_system(&self, text: &str) -> Result<(), String> {
-        write_system_at(Path::new(SYSTEM_PATH), &install_system_file, text)
+        write_system_at(&Place::system(), &install_system_file, text)
     }
 
     fn hook_enabled(&self) -> bool {
@@ -692,38 +736,125 @@ pub(crate) struct SystemFile {
 /// How a new system file is put in place: with sudo, or recorded by a test.
 type Install<'a> = dyn Fn(&str) -> Result<(), String> + 'a;
 
-/// Loads the system config at `path` for editing: `None` when there is no
-/// file, the file when it is there and valid. Anything else is an error
-/// naming the file and the reason, for the caller to stop on. A file that
-/// cannot be read or does not parse is never taken for a missing one: what
-/// would then be installed in its place holds none of what it set.
-fn load_system(path: &Path) -> Result<Option<SystemFile>, String> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(format!(
-                "cannot read {}: {error}; it was not changed",
-                path.display()
-            ));
+/// Where the system file is, and the check it has to pass before what it
+/// holds is taken over into a new one: the gate's own, or a test's.
+struct Place<'a> {
+    path: &'a Path,
+    secure: &'a dyn Fn(&Path) -> Result<(), String>,
+}
+
+impl Place<'static> {
+    /// The system file, held to what the gate requires of it.
+    fn system() -> Self {
+        Self {
+            path: Path::new(SYSTEM_PATH),
+            secure: &load::check_root_owned,
         }
+    }
+}
+
+/// More than any system config holds; a larger file is not read.
+const MAX_SYSTEM_FILE: u64 = 1024 * 1024;
+
+/// How to correct the system file at `path`, for a refusal to end with.
+fn how_to_correct(path: &Path) -> String {
+    format!(
+        "Correct it with `sudoedit {}` or \"Edit system file\" in the settings app; \
+`omarchy-guardian config check` shows the problem.",
+        path.display()
+    )
+}
+
+/// Loads the system config for editing: `None` when there is no file (or
+/// no directory for it), the file when it is there, safe and valid.
+/// Anything else is an error naming the file, the reason and the repair,
+/// for the caller to stop on. A file that cannot be read or does not parse
+/// is never taken for a missing one: what would then be installed in its
+/// place holds none of what it set. And one the gate refuses (not a regular
+/// file, not root's, writable by others, or in such a directory) is never
+/// read: installing its content again as root's would make the gate accept
+/// what somebody other than root wrote. A link is not followed, whether or
+/// not it leads anywhere.
+fn load_system(place: &Place<'_>) -> Result<Option<SystemFile>, String> {
+    let path = place.path;
+    let shown = path.display();
+    let unreadable = |error: &io::Error| {
+        format!(
+            "cannot read {shown}: {error}; it was not changed. {}",
+            how_to_correct(path)
+        )
     };
+    let kind = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata.file_type(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(unreadable(&error)),
+    };
+    if !kind.is_file() {
+        let what = if kind.is_symlink() {
+            "a symbolic link"
+        } else if kind.is_dir() {
+            "a directory"
+        } else {
+            "not a regular file"
+        };
+        return Err(format!(
+            "{shown} is {what}, so it was not read or changed. Put a root-owned regular file \
+there or remove it with sudo; `omarchy-guardian config check` shows the problem."
+        ));
+    }
+    if let Err(reason) = (place.secure)(path) {
+        let directory = path.parent().unwrap_or(path).display();
+        return Err(format!(
+            "{shown}: insecure: {reason}; it was not changed. Check what it holds, then make it \
+root's: `sudo chown root:root {directory} {shown} && sudo chmod 755 {directory} && sudo chmod 644 \
+{shown}` (`omarchy-guardian config check` shows the problem)."
+        ));
+    }
+
+    // Opened without following a link or waiting on a pipe put there since.
+    let mut bytes = Vec::new();
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+        .open(path)
+        .and_then(|file| {
+            if file.metadata()?.is_file() {
+                file.take(MAX_SYSTEM_FILE + 1).read_to_end(&mut bytes)
+            } else {
+                Err(io::Error::other("not a regular file"))
+            }
+        })
+        .map_err(|error| unreadable(&error))?;
+    if bytes.len() as u64 > MAX_SYSTEM_FILE {
+        return Err(format!(
+            "{shown} is larger than {} KiB, so it was not read or changed. {}",
+            MAX_SYSTEM_FILE / 1024,
+            how_to_correct(path)
+        ));
+    }
+    let text = String::from_utf8(bytes).map_err(|_| {
+        format!(
+            "{shown} is not UTF-8 text; it was not changed. {}",
+            how_to_correct(path)
+        )
+    })?;
     match parse(path, &text) {
         Ok(config) => Ok(Some(SystemFile { text, config })),
         Err(error) => Err(format!(
-            "{error}; the file is not valid and was not changed, correct it first"
+            "{error}; the file is not valid and was not changed. {}",
+            how_to_correct(path)
         )),
     }
 }
 
-/// The system config at `path` with `change` made to it and nothing else,
+/// The system config at `place` with `change` made to it and nothing else,
 /// under the comment header it had, and the file's text as it is now (empty
 /// when there is none).
 fn edited_system(
-    path: &Path,
+    place: &Place<'_>,
     change: impl FnOnce(&mut PartialConfig),
 ) -> Result<(String, String), String> {
-    let (existing, mut config) = load_system(path)?
+    let (existing, mut config) = load_system(place)?
         .map(|file| (file.text, file.config))
         .unwrap_or_default();
     change(&mut config);
@@ -736,21 +867,22 @@ fn edited_system(
     Ok((write::render(&config, header), existing))
 }
 
-/// Installs `text`, a whole system config, over the one at `path`, which
-/// has to be absent or valid. The system-only settings no screen edits (the
-/// trusted reviewer packages, the sweep's root consent, the accepted weaker
-/// settings and whether a block can be permitted under strict) are carried
-/// over from it when `text` does not set them, so a save does not silently
-/// undo one made since `text` was drawn up.
-fn write_system_at(path: &Path, install: &Install<'_>, text: &str) -> Result<(), String> {
-    match load_system(path)? {
+/// Installs `text`, a whole system config, over the one at `place`, which
+/// has to be absent or safe and valid. Four system-only settings no screen
+/// edits (the trusted reviewer packages, the sweep's root consent, the
+/// accepted weaker settings and whether a block can be permitted under
+/// strict) are carried over from it, each only when `text` does not set it
+/// at all: one `text` sets, to any value, is installed as `text` has it,
+/// and every other setting is installed as `text` has it or leaves it out.
+fn write_system_at(place: &Place<'_>, install: &Install<'_>, text: &str) -> Result<(), String> {
+    match load_system(place)? {
         Some(existing) => install(&keep_system_only(text, &existing.config)?),
         None => install(text),
     }
 }
 
 /// `text` with the four system-only settings of [`write_system_at`] carried
-/// over from `old` where `text` does not set them.
+/// over from `old`, each only where `text` does not set it at all.
 fn keep_system_only(text: &str, old: &PartialConfig) -> Result<String, String> {
     let mut new = parse(Path::new(SYSTEM_PATH), text)
         .map_err(|error| format!("the new system settings are not valid: {error}"))?;
@@ -794,16 +926,16 @@ fn comment_header(text: &str) -> String {
 /// Records whether the system sweep may run its root collector, and the
 /// group that may read what the daily one finds, in the system config.
 pub(crate) fn set_sweep_root(consent: RootConsent, group: Option<String>) -> Result<(), String> {
-    set_sweep_root_at(Path::new(SYSTEM_PATH), &install_system_file, consent, group)
+    set_sweep_root_at(&Place::system(), &install_system_file, consent, group)
 }
 
 fn set_sweep_root_at(
-    path: &Path,
+    place: &Place<'_>,
     install: &Install<'_>,
     consent: RootConsent,
     group: Option<String>,
 ) -> Result<(), String> {
-    let (text, _) = edited_system(path, |config| {
+    let (text, _) = edited_system(place, |config| {
         config.sweep = SweepSettings {
             root: Some(consent),
             group,
@@ -816,11 +948,11 @@ fn set_sweep_root_at(
 /// removes the list), and the file as it is now: for the diff the user
 /// approves before `install_accepted` installs it.
 pub(crate) fn with_accepted(keys: Vec<String>) -> Result<(String, String), String> {
-    with_accepted_at(Path::new(SYSTEM_PATH), keys)
+    with_accepted_at(&Place::system(), keys)
 }
 
-fn with_accepted_at(path: &Path, keys: Vec<String>) -> Result<(String, String), String> {
-    edited_system(path, |config| {
+fn with_accepted_at(place: &Place<'_>, keys: Vec<String>) -> Result<(String, String), String> {
+    edited_system(place, |config| {
         config.acknowledged_weaker = (!keys.is_empty()).then_some(keys);
     })
 }
@@ -936,9 +1068,20 @@ mod tests {
         /// Where the system file is (a file, a directory in its place, or
         /// nothing); `None` for no system file at all.
         system_path: Option<PathBuf>,
+        /// Why the gate's check refuses that file, when it does.
+        system_insecure: Option<&'static str>,
         user_written: RefCell<Option<String>>,
         system_written: RefCell<Option<String>>,
         tested: RefCell<Vec<AgentSettings>>,
+    }
+
+    impl Fake {
+        /// The check on the system file's owner and mode: a test's files
+        /// are its user's, so the answer is the test's to give.
+        fn secure(&self) -> Result<(), String> {
+            self.system_insecure
+                .map_or(Ok(()), |reason| Err(reason.to_string()))
+        }
     }
 
     impl Environment for Fake {
@@ -984,9 +1127,14 @@ mod tests {
             }
         }
         fn existing_system(&self) -> Result<Option<super::SystemFile>, String> {
-            self.system_path
-                .as_deref()
-                .map_or(Ok(None), super::load_system)
+            let Some(path) = &self.system_path else {
+                return Ok(None);
+            };
+            let secure = |_: &Path| self.secure();
+            super::load_system(&super::Place {
+                path,
+                secure: &secure,
+            })
         }
         fn write_user(&self, text: &str) -> Result<PathBuf, String> {
             *self.user_written.borrow_mut() = Some(text.to_string());
@@ -999,10 +1147,15 @@ mod tests {
                 *self.system_written.borrow_mut() = Some(text.to_string());
                 Ok(())
             };
-            match &self.system_path {
-                Some(path) => super::write_system_at(path, &record, text),
-                None => record(text),
-            }
+            let Some(path) = &self.system_path else {
+                return record(text);
+            };
+            let secure = |_: &Path| self.secure();
+            let place = super::Place {
+                path,
+                secure: &secure,
+            };
+            super::write_system_at(&place, &record, text)
         }
         fn hook_enabled(&self) -> bool {
             true
@@ -1016,6 +1169,7 @@ mod tests {
         }
     }
 
+    mod diff;
     mod system_file;
 
     #[test]

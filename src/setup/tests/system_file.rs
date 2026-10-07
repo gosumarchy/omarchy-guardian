@@ -5,14 +5,17 @@
 use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::fs;
+use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use super::super::{
-    Choice, HEADER, PRIVILEGED_COMMUNITY, USER_CLASSES, render_system, render_user, run,
-    set_sweep_root_at, tested_variant, with_accepted_at, write_system_at,
+    Choice, HEADER, MAX_SYSTEM_FILE, PRIVILEGED_COMMUNITY, Place, USER_CLASSES, render_system,
+    render_user, run, set_sweep_root_at, tested_variant, with_accepted_at, write_system_at,
 };
 use super::{Fake, script};
 use crate::config::file::{PartialConfig, parse};
+use crate::config::load::check_root_owned;
 use crate::config::model::{Action, Named, Profile, RootConsent, SourceClass, Thinking};
 use crate::test_support::TempDir;
 
@@ -43,6 +46,15 @@ fn unreadable() -> (TempDir, PathBuf) {
     let path = directory.path().join("config.toml");
     fs::create_dir(&path).unwrap();
     (directory, path)
+}
+
+/// The system file at `path`, with the check on its owner and mode passed:
+/// a test's files are its user's, not root's.
+fn at(path: &Path) -> Place<'_> {
+    Place {
+        path,
+        secure: &|_| Ok(()),
+    }
 }
 
 fn parsed(text: &str) -> PartialConfig {
@@ -98,7 +110,7 @@ fn the_sweeps_consent_keeps_every_other_setting() {
     let installed = Installed::default();
 
     set_sweep_root_at(
-        &path,
+        &at(&path),
         &installed.installer(),
         RootConsent::Allowed,
         Some("wheel".into()),
@@ -124,7 +136,7 @@ fn the_sweeps_consent_keeps_every_other_setting() {
 fn accepting_weaker_settings_keeps_every_other_setting() {
     let (_directory, path) = system_file(ADMIN);
 
-    let (text, existing) = with_accepted_at(&path, vec!["aur.ai=off".into()]).unwrap();
+    let (text, existing) = with_accepted_at(&at(&path), vec!["aur.ai=off".into()]).unwrap();
 
     assert_eq!(existing, ADMIN);
     let config = parsed(&text);
@@ -159,22 +171,29 @@ fn a_setup_run_keeps_what_it_does_not_ask_about() {
     );
     assert_admin_settings_kept(&config);
     // The diff shown says the same: none of them is a removed line.
+    let removed: Vec<&str> = terminal
+        .output
+        .lines()
+        .filter(|line| line.starts_with("- "))
+        .collect();
+    assert!(
+        removed.contains(&"- [agent] model = \"ollama/qwen3\""),
+        "{removed:?}"
+    );
     for kept in [
-        "- official_repos",
-        "- check = \"off\"",
-        "- timeout_secs",
-        "- max_chunks",
-        "- on_findings",
-        "- strict = \"allowed\"",
-        "- trusted_reviewer_packages",
+        "official_repos",
+        "check",
+        "timeout_secs",
+        "max_chunks",
+        "on_findings",
+        "strict",
+        "trusted_reviewer_packages",
     ] {
         assert!(
-            !terminal.output.contains(kept),
-            "{kept}\n{}",
-            terminal.output
+            !removed.iter().any(|line| line.contains(kept)),
+            "{kept}\n{removed:?}"
         );
     }
-    assert!(terminal.output.contains("- model = \"ollama/qwen3\""));
     assert_eq!(fs::read_to_string(&path).unwrap(), ADMIN);
 }
 
@@ -225,16 +244,17 @@ fn a_system_file_that_cannot_be_read_is_not_replaced() {
     let install = installed.installer();
     let shown = path.display().to_string();
 
-    let error = set_sweep_root_at(&path, &install, RootConsent::Declined, None).unwrap_err();
+    let error = set_sweep_root_at(&at(&path), &install, RootConsent::Declined, None).unwrap_err();
     assert!(
-        error.contains(&shown) && error.contains("cannot read"),
+        error.contains(&shown) && error.contains("is a directory"),
         "{error}"
     );
+    assert!(error.contains("config check"), "{error}");
 
-    let error = with_accepted_at(&path, vec!["aur.ai=off".into()]).unwrap_err();
+    let error = with_accepted_at(&at(&path), vec!["aur.ai=off".into()]).unwrap_err();
     assert!(error.contains(&shown), "{error}");
 
-    let error = write_system_at(&path, &install, "profile = \"standard\"\n").unwrap_err();
+    let error = write_system_at(&at(&path), &install, "profile = \"standard\"\n").unwrap_err();
     assert!(error.contains(&shown), "{error}");
 
     let environment = Fake {
@@ -246,6 +266,10 @@ fn a_system_file_that_cannot_be_read_is_not_replaced() {
     let mut terminal = script(&["", "2", "", "", "y"]);
     let error = run(&mut terminal, &environment).unwrap_err();
     assert!(error.contains(&shown), "{error}");
+    assert!(
+        error.contains("Setup wrote nothing, not your own settings file either"),
+        "{error}"
+    );
     assert!(environment.user_written.borrow().is_none());
     assert!(environment.system_written.borrow().is_none());
     assert!(environment.tested.borrow().is_empty());
@@ -261,11 +285,16 @@ fn a_system_file_that_is_not_text_is_not_replaced() {
     fs::write(&path, b"profile = \"strict\"\n\xff\xfe\n").unwrap();
     let installed = Installed::default();
 
-    let error =
-        set_sweep_root_at(&path, &installed.installer(), RootConsent::Allowed, None).unwrap_err();
+    let error = set_sweep_root_at(
+        &at(&path),
+        &installed.installer(),
+        RootConsent::Allowed,
+        None,
+    )
+    .unwrap_err();
 
     assert!(error.contains(&path.display().to_string()), "{error}");
-    assert!(with_accepted_at(&path, Vec::new()).is_err());
+    assert!(with_accepted_at(&at(&path), Vec::new()).is_err());
     assert!(installed.0.borrow().is_empty());
 }
 
@@ -280,11 +309,21 @@ fn a_system_file_that_is_not_valid_is_not_replaced() {
         assert!(error.contains(&path.display().to_string()), "{error}");
         assert!(error.contains("profil"), "{error}");
         assert!(error.contains("unknown key"), "{error}");
+        assert!(error.contains("was not changed"), "{error}");
+        assert!(
+            error.contains(&format!("sudoedit {}", path.display())),
+            "{error}"
+        );
+        assert!(error.contains("omarchy-guardian config check"), "{error}");
     };
 
-    names_the_problem(&set_sweep_root_at(&path, &install, RootConsent::Allowed, None).unwrap_err());
-    names_the_problem(&with_accepted_at(&path, vec!["aur.ai=off".into()]).unwrap_err());
-    names_the_problem(&write_system_at(&path, &install, "profile = \"standard\"\n").unwrap_err());
+    names_the_problem(
+        &set_sweep_root_at(&at(&path), &install, RootConsent::Allowed, None).unwrap_err(),
+    );
+    names_the_problem(&with_accepted_at(&at(&path), vec!["aur.ai=off".into()]).unwrap_err());
+    names_the_problem(
+        &write_system_at(&at(&path), &install, "profile = \"standard\"\n").unwrap_err(),
+    );
 
     let environment = Fake {
         opencode: true,
@@ -308,8 +347,12 @@ fn a_system_file_that_turns_invalid_during_setup_is_not_replaced() {
 
     // Valid when the diff was drawn up, not when it is installed.
     fs::write(&path, "profile = \n").unwrap();
-    let error =
-        write_system_at(&path, &installed.installer(), "profile = \"standard\"\n").unwrap_err();
+    let error = write_system_at(
+        &at(&path),
+        &installed.installer(),
+        "profile = \"standard\"\n",
+    )
+    .unwrap_err();
 
     assert!(error.contains(&path.display().to_string()), "{error}");
     assert!(installed.0.borrow().is_empty());
@@ -321,7 +364,7 @@ fn saving_a_whole_system_file_keeps_the_settings_no_screen_edits() {
     let installed = Installed::default();
 
     write_system_at(
-        &path,
+        &at(&path),
         &installed.installer(),
         "# Written by a screen\nprofile = \"standard\"\n",
     )
@@ -346,20 +389,26 @@ fn without_a_system_file_one_is_created_as_before() {
     let installed = Installed::default();
     let install = installed.installer();
 
-    set_sweep_root_at(&path, &install, RootConsent::Allowed, Some("wheel".into())).unwrap();
+    set_sweep_root_at(
+        &at(&path),
+        &install,
+        RootConsent::Allowed,
+        Some("wheel".into()),
+    )
+    .unwrap();
     assert_eq!(
         installed.0.borrow()[0],
         format!("{HEADER}\n[sweep]\nroot = \"allowed\"\ngroup = \"wheel\"\n")
     );
 
-    let (text, existing) = with_accepted_at(&path, vec!["aur.ai=off".into()]).unwrap();
+    let (text, existing) = with_accepted_at(&at(&path), vec!["aur.ai=off".into()]).unwrap();
     assert_eq!(existing, "");
     assert_eq!(
         text,
         format!("{HEADER}\n[acknowledged]\nweaker = [\"aur.ai=off\"]\n")
     );
 
-    write_system_at(&path, &install, "profile = \"standard\"\n").unwrap();
+    write_system_at(&at(&path), &install, "profile = \"standard\"\n").unwrap();
     assert_eq!(installed.0.borrow()[1], "profile = \"standard\"\n");
 
     let environment = Fake {
@@ -456,4 +505,171 @@ fn every_choice_renders_the_files_it_always_did() {
         }
     }
     assert_eq!(compared, 3 * 4 * 4 * Thinking::ALL.len());
+}
+
+/// Every way in refuses the file at `place` with `expected` in the reason,
+/// and installs nothing.
+fn assert_refused(place: &Place<'_>, expected: &[&str]) {
+    let installed = Installed::default();
+    let install = installed.installer();
+    let shown = place.path.display().to_string();
+    let errors = [
+        set_sweep_root_at(place, &install, RootConsent::Allowed, Some("wheel".into())).unwrap_err(),
+        with_accepted_at(place, vec!["aur.ai=off".into()]).unwrap_err(),
+        write_system_at(place, &install, "profile = \"standard\"\n").unwrap_err(),
+    ];
+    for error in errors {
+        assert!(error.contains(&shown), "{error}");
+        assert!(error.contains("changed"), "{error}");
+        for part in expected {
+            assert!(error.contains(part), "{part}\n{error}");
+        }
+    }
+    assert!(installed.0.borrow().is_empty());
+}
+
+#[test]
+fn a_system_file_the_gate_refuses_as_insecure_is_not_taken_over() {
+    // Valid, and what a writer other than root would want installed as root's.
+    let (directory, path) = system_file("profile = \"local-only\"\n");
+    let place = Place {
+        path: &path,
+        secure: &|file| Err(format!("{} is owned by uid 1000, not root", file.display())),
+    };
+    let shown = path.display().to_string();
+    let folder = directory.path().display().to_string();
+
+    assert_refused(
+        &place,
+        &[
+            "insecure",
+            "is owned by uid 1000, not root",
+            "it was not changed",
+            &format!("sudo chown root:root {folder} {shown}"),
+            &format!("sudo chmod 755 {folder}"),
+            &format!("sudo chmod 644 {shown}"),
+            "omarchy-guardian config check",
+        ],
+    );
+
+    let environment = Fake {
+        opencode: true,
+        test_passes: true,
+        system_path: Some(path.clone()),
+        system_insecure: Some("it is owned by uid 1000, not root"),
+        ..Fake::default()
+    };
+    let mut terminal = script(&["", "2", "", "", "y"]);
+    let error = run(&mut terminal, &environment).unwrap_err();
+    assert!(error.contains("insecure"), "{error}");
+    assert!(error.contains("Setup wrote nothing"), "{error}");
+    assert!(environment.user_written.borrow().is_none());
+    assert!(environment.system_written.borrow().is_none());
+    // Not shown as what the system file holds, either.
+    assert!(
+        !terminal.output.contains("local-only\""),
+        "{}",
+        terminal.output
+    );
+}
+
+#[test]
+fn the_gates_own_check_decides_what_is_insecure() {
+    // Writable by the group: refused whoever runs the test (as a user, for
+    // the owner already).
+    let (_directory, path) = system_file(ADMIN);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+    assert_refused(
+        &Place {
+            path: &path,
+            secure: &check_root_owned,
+        },
+        &["insecure", "sudo chmod 644"],
+    );
+
+    // A file as it should be, in a directory others can write.
+    let (directory, path) = system_file(ADMIN);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o777)).unwrap();
+    assert_refused(
+        &Place {
+            path: &path,
+            secure: &check_root_owned,
+        },
+        &["insecure", "sudo chmod 755"],
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), ADMIN);
+}
+
+#[test]
+fn a_link_in_place_of_the_system_file_is_not_followed() {
+    let directory = TempDir::new("setup-system");
+    let target = directory.path().join("mine.toml");
+    fs::write(&target, "profile = \"local-only\"\n").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o666)).unwrap();
+    let path = directory.path().join("config.toml");
+    symlink(&target, &path).unwrap();
+
+    assert_refused(&at(&path), &["is a symbolic link", "config check"]);
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "profile = \"local-only\"\n"
+    );
+
+    // One that leads nowhere is still something at the path, not no file.
+    let dangling = directory.path().join("dangling.toml");
+    symlink(directory.path().join("nothing"), &dangling).unwrap();
+    assert_refused(&at(&dangling), &["is a symbolic link"]);
+}
+
+#[test]
+fn a_pipe_in_place_of_the_system_file_is_refused_without_waiting() {
+    let directory = TempDir::new("setup-system");
+    let path = directory.path().join("config.toml");
+    let made = Command::new("mkfifo").arg(&path).status().unwrap();
+    assert!(made.success());
+
+    // Nothing ever writes to it: reading it would wait for ever.
+    assert_refused(&at(&path), &["is not a regular file"]);
+}
+
+#[test]
+fn a_system_file_larger_than_any_config_is_not_read() {
+    let size = usize::try_from(MAX_SYSTEM_FILE).unwrap() + 1;
+    let (_directory, path) = system_file(&"#".repeat(size));
+
+    assert_refused(&at(&path), &["is larger than 1024 KiB"]);
+}
+
+#[test]
+fn what_stands_in_the_way_of_the_system_file_is_an_error_not_no_file() {
+    // A file where the directory would be.
+    let directory = TempDir::new("setup-system");
+    let blocker = directory.path().join("omarchy-guardian");
+    fs::write(&blocker, "").unwrap();
+    let path = blocker.join("config.toml");
+
+    assert_refused(&at(&path), &["cannot read", "sudoedit", "config check"]);
+}
+
+#[test]
+fn without_its_directory_there_is_no_system_file() {
+    let directory = TempDir::new("setup-system");
+    let path = directory
+        .path()
+        .join("omarchy-guardian")
+        .join("config.toml");
+    let installed = Installed::default();
+
+    // Not asked about a file that is not there.
+    let place = Place {
+        path: &path,
+        secure: &|_| Err("never asked".into()),
+    };
+    set_sweep_root_at(&place, &installed.installer(), RootConsent::Declined, None).unwrap();
+
+    assert_eq!(
+        installed.0.borrow()[0],
+        format!("{HEADER}\n[sweep]\nroot = \"declined\"\n")
+    );
 }
