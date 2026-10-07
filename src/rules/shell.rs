@@ -185,9 +185,12 @@ impl Reading {
         }
     }
 
-    /// Whether `body` is still read. What is asked of a body that is not
-    /// must be answered without it, as a line too long to read would be:
-    /// by taking it to hold what is looked for.
+    /// Whether `body` is still read. A rule that asks whether a body holds
+    /// something must answer for one that is not read as for a line too
+    /// long to read: by taking it to hold what is looked for. Only the
+    /// naming of files a line reads in (`run::reads_in_file`) leaves an
+    /// unread body out, having nothing to name; the rules that read the
+    /// same line report it.
     pub(super) fn takes(&mut self, body: &str) -> bool {
         match self.left.checked_sub(body.len()) {
             Some(left) => {

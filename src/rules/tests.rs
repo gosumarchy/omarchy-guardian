@@ -967,6 +967,53 @@ fn only_a_variable_that_is_named_is_written_out() {
     }
     let long = "$( ".repeat(100_000);
     assert_eq!(with_variables(&long, &variables), long);
+    // What is written out is read again for the variables after it, and a
+    // name no shell would take is still matched as given.
+    let chained = [
+        ("a".to_string(), "$b".to_string()),
+        ("b".to_string(), "sh".to_string()),
+        ("curlx".to_string(), "wget".to_string()),
+    ];
+    assert_eq!(with_variables("$a $${f}x", &chained), "sh $${f}x");
+    assert_eq!(
+        with_variables("$a $${f}x", &[&variables[..1], &chained[..]].concat()),
+        "sh wget"
+    );
+    let odd = [("a-b".to_string(), "sh".to_string())];
+    assert_eq!(with_variables("$a-b ${a-b} $a", &odd), "sh sh $a");
+}
+
+#[test]
+fn files_opened_by_run_calls_are_named_on_a_line_of_any_length() {
+    use super::run_targets;
+    // What each call is given is read: the first of each kind in it.
+    assert_eq!(
+        run_targets("exec(open('a.py').read() + open('b.py').read()); open('c.py')"),
+        ["a.py"]
+    );
+    // Calls beyond what is read call by call: every file opened on the
+    // line is named.
+    let many = "exec(".repeat(256) + &"x".repeat(4096) + &")".repeat(256);
+    let named = |line: &str, file: &str| run_targets(line).iter().any(|name| name == file);
+    assert!(named(
+        &format!("{many}; exec(open('./evil.bin').read())"),
+        "evil.bin"
+    ));
+    let line =
+        format!("{many}; exec(open('a.py').read() + open(\"b.py\").read()); read_text('c.py')");
+    for file in ["a.py", "b.py", "c.py"] {
+        assert!(named(&line, file), "{file}");
+    }
+    // Under that, only what a call is given names a file.
+    let few = "exec(".repeat(8) + &")".repeat(8);
+    assert!(named(&format!("{few}; exec(open('a.py'))"), "a.py"));
+    assert!(!named(&format!("{few}; exec(x); open('a.py')"), "a.py"));
+    // Many calls, and many files, cost one pass.
+    assert!(run_targets(&"exec(".repeat(200_000)).is_empty());
+    let opens: Vec<String> = (0..40_000)
+        .map(|at| format!("exec(open('f{at}'))"))
+        .collect();
+    assert_eq!(run_targets(&opens.concat()).len(), 40_000);
 }
 
 #[test]

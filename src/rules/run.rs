@@ -1,6 +1,8 @@
 //! What a line runs: the files it fetches, the files and programs it starts,
 //! and the variables its commands are built from.
 
+use std::collections::HashSet;
+
 use super::matchers::pipes_into_shell;
 use super::shell::{PIPE_SHELLS, program_name, shell_words, unquoted, unquoted_words, unversioned};
 use super::{FETCHERS, encoded, fetch, shell};
@@ -201,6 +203,9 @@ fn runs_named(command: &shell::Command, is_named: &dyn Fn(&str) -> bool) -> bool
 /// shell (`cat x | sh`). The program is found as in `runs_file`.
 pub(crate) fn run_targets(line: &str) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
+    // The names found so far, so that a line of many is not read through
+    // for each.
+    let mut known: HashSet<String> = HashSet::new();
     // A word that ends in `)` is a file in a group that closes there, or
     // a file of that name: both are named, and a name no file has is
     // nobody's.
@@ -209,7 +214,7 @@ pub(crate) fn run_targets(line: &str) -> Vec<String> {
         for word in [without_group_close(word), word] {
             if let Some(name) = as_file(word)
                 && !name.starts_with('-')
-                && !found.contains(&name)
+                && known.insert(name.clone())
             {
                 found.push(name);
             }
@@ -416,6 +421,11 @@ fn make_includes(line: &str, found: &mut Vec<String>) {
 fn reads_in_file(line: &str, found: &mut Vec<String>) {
     // `$(cat x)` / `` `cat x` `` whose output a shell runs (`sh -c
     // "$(cat x)"`, `eval "$(cat x)"`), not one only captured in a value.
+    // A body past what `Reading` reads names no file here: unlike a rule,
+    // this has no answer that stands for "it may". The line is not let
+    // through for that: a rule that asks whether it runs such a
+    // substitution takes the unread body to hold what it looks for, and
+    // reports the line.
     let mut reading = shell::Reading::of(line);
     for substitution in shell::substitutions(line) {
         if shell::is_run(line, &substitution)
@@ -426,15 +436,35 @@ fn reads_in_file(line: &str, found: &mut Vec<String>) {
             found.extend(command.operands().next().map(ToString::to_string));
         }
     }
-    // `open('x')` inside an `exec`/`eval` argument.
-    for argument in encoded::run_arguments(line).arguments {
-        for opener in ["open('", "open(\"", "read_text('", "read_text(\""] {
-            if let Some(at) = argument.find(opener) {
-                let rest = &argument[at + opener.len()..];
-                found.extend(rest.split(['\'', '"']).next().map(ToString::to_string));
-            }
+    // `open('x')` inside an `exec`/`eval` argument: the first of each kind
+    // in what a call is given.
+    let given = encoded::run_arguments(line);
+    for argument in &given.arguments {
+        for opener in OPENERS {
+            found.extend(opened(argument, opener).next());
         }
     }
+    // Calls left unread are given something on the line, so every file
+    // opened anywhere on it is named: more than they open, never less.
+    // Each opener is looked for once over the line, not once for each call.
+    if let Some(line) = given.unread {
+        for opener in OPENERS {
+            found.extend(opened(line, opener));
+        }
+    }
+}
+
+/// How code given to a run call opens a file to read it in.
+const OPENERS: &[&str] = &["open('", "open(\"", "read_text('", "read_text(\""];
+
+/// The file each `opener` in `text` names: what stands up to the next quote.
+fn opened<'a>(text: &'a str, opener: &'a str) -> impl Iterator<Item = String> + 'a {
+    text.match_indices(opener).filter_map(move |(at, _)| {
+        text[at + opener.len()..]
+            .split(['\'', '"'])
+            .next()
+            .map(ToString::to_string)
+    })
 }
 
 /// A script read in beside the running one: `. "$(dirname "$0")/x"`,
@@ -572,39 +602,77 @@ pub(crate) fn with_variables(code: &str, variables: &[(String, String)]) -> Stri
     if variables.is_empty() || !code.contains('$') {
         return code.to_string();
     }
+    // Names written as a shell writes them are looked up among the names
+    // the line holds after a `$`, which are read in one pass; any other
+    // name is looked for by itself.
+    let plain = variables.iter().all(|(name, _)| shell::is_name(name));
     let mut out = code.to_string();
-    for (name, value) in variables {
-        // Most lines name none of them: such a line is not written anew
-        // for each.
-        let named = out.match_indices('$').any(|(at, _)| {
-            let rest = &out[at + 1..];
-            rest.starts_with(name.as_str())
-                || rest
-                    .strip_prefix('{')
-                    .is_some_and(|rest| rest.starts_with(name.as_str()))
-        });
-        if !named {
-            continue;
-        }
-        out = out.replace(&format!("${{{name}}}"), value);
-        // `$name` only where the name ends there.
-        let pattern = format!("${name}");
-        let mut result = String::with_capacity(out.len());
-        let mut rest = out.as_str();
-        while let Some(at) = rest.find(&pattern) {
-            let after = &rest[at + pattern.len()..];
-            result.push_str(&rest[..at]);
-            if after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
-                result.push_str(&pattern);
-            } else {
-                result.push_str(value);
-            }
-            rest = after;
-        }
-        result.push_str(rest);
-        out = result;
+    let mut next = 0;
+    while next < variables.len() {
+        // The first variable from `next` on that the line names. Most
+        // lines name none, and are not written anew for any.
+        let at = if plain {
+            let named = names_after_dollar(&out);
+            variables[next..]
+                .iter()
+                .position(|(name, _)| named.contains(name.as_str()))
+        } else {
+            variables[next..].iter().position(|(name, _)| {
+                out.match_indices('$').any(|(at, _)| {
+                    let rest = &out[at + 1..];
+                    rest.starts_with(name.as_str())
+                        || rest
+                            .strip_prefix('{')
+                            .is_some_and(|rest| rest.starts_with(name.as_str()))
+                })
+            })
+        };
+        let Some(at) = at else {
+            break;
+        };
+        let (name, value) = &variables[next + at];
+        out = written_out(&out, name, value);
+        // What was written may have made another name: the line is read
+        // again for the variables after this one.
+        next += at + 1;
     }
     out
+}
+
+/// The names `text` holds after a `$` or a `${`: each run of the
+/// characters a name is made of.
+fn names_after_dollar(text: &str) -> HashSet<&str> {
+    text.match_indices('$')
+        .filter_map(|(at, _)| {
+            let rest = &text[at + 1..];
+            let rest = rest.strip_prefix('{').unwrap_or(rest);
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            (end > 0).then(|| &rest[..end])
+        })
+        .collect()
+}
+
+/// `text` with `${name}`, and `$name` where the name ends there, replaced
+/// by `value`.
+fn written_out(text: &str, name: &str, value: &str) -> String {
+    let out = text.replace(&format!("${{{name}}}"), value);
+    let pattern = format!("${name}");
+    let mut result = String::with_capacity(out.len());
+    let mut rest = out.as_str();
+    while let Some(at) = rest.find(&pattern) {
+        let after = &rest[at + pattern.len()..];
+        result.push_str(&rest[..at]);
+        if after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+            result.push_str(&pattern);
+        } else {
+            result.push_str(value);
+        }
+        rest = after;
+    }
+    result.push_str(rest);
+    result
 }
 
 /// The most pipeline parts of one statement looked at.

@@ -28,8 +28,12 @@ impl Source {
     }
 }
 
-/// The most assigned variables, and the most code variables, tracked
-/// through one file.
+/// The most variables given their content by an assignment (`x=$(curl
+/// …)`), and the most code variables set from a decode call, followed
+/// through one file. With one more, the one followed longest is forgotten,
+/// and nothing says so: a run of it later in the file is not found. Names
+/// read from a fetch (`read x < <(curl …)`) are not counted and are never
+/// forgotten.
 const MAX_TRACKED: usize = 64;
 
 /// How many lines after a decode assignment a run of it still counts, for
