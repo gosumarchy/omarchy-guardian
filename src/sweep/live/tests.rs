@@ -1852,11 +1852,24 @@ fn a_name_that_ends_like_a_deleted_one_is_told_from_a_deleted_file() {
     let run = |name: &str| {
         let program = dir.path().join(name);
         fs::copy("/usr/bin/sleep", &program).unwrap();
-        let child = Command::new(&program)
-            .arg("60")
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
+        // Another test's child, forked while the copy was being written,
+        // holds it open for a moment: the kernel then calls it busy.
+        let mut tries = 0;
+        let child = loop {
+            match Command::new(&program)
+                .arg("60")
+                .stdout(Stdio::null())
+                .spawn()
+            {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 200 =>
+                {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                child => break child.unwrap(),
+            }
+        };
         (program, child)
     };
     let (gone, mut deleted) = run("gone");
