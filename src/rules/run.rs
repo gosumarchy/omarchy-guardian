@@ -326,7 +326,7 @@ impl Quoted {
         let mut at = 0;
         while at < bytes.len() {
             let byte = bytes[at];
-            if quote.is_some() && at > 0 && bytes[at - 1].is_ascii_whitespace() {
+            if at > 0 && bytes[at - 1].is_ascii_whitespace() && Self::in_message(bytes, at, quote) {
                 words.insert(at);
             }
             // `$'…'` is kept as `$`.
@@ -374,6 +374,23 @@ impl Quoted {
             at += 1;
         }
         Self { text: found, words }
+    }
+
+    /// Whether the word at `at` begins as part of a quoted message. In
+    /// double quotes a word that opens a substitution is a command from
+    /// there on: `"x $(eval …) y"`.
+    fn in_message(bytes: &[u8], at: usize, quote: Option<u8>) -> bool {
+        match quote {
+            None => false,
+            Some(b'"') => {
+                let word = bytes[at..]
+                    .split(u8::is_ascii_whitespace)
+                    .next()
+                    .unwrap_or_default();
+                !word.contains(&b'`') && !word.windows(2).any(|pair| pair == b"$(")
+            }
+            Some(_) => true,
+        }
     }
 }
 

