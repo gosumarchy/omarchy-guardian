@@ -290,6 +290,14 @@ const OPERAND_RUNNERS: &[&str] = &[
     "bwrap",
     "firejail",
     "proot",
+    "xvfb-run",
+    "proxychains",
+    "torsocks",
+    "unbuffer",
+    "valgrind",
+    "busybox",
+    "setpriv",
+    "lxc-attach",
 ];
 
 /// Whether `line` gives text to a shell to run: to `eval` or `trap`, down
@@ -336,7 +344,8 @@ fn hands_text_on(line: &str, quoted: &HashSet<usize>) -> bool {
                     || PIPE_SHELLS.contains(&program_name(bare))
                     || TEXT_RUNNERS.contains(&program)));
         is_given = is_given || option;
-        runs_operand = runs_operand || (!in_message && OPERAND_RUNNERS.contains(&program));
+        runs_operand = runs_operand
+            || (!in_message && !opens_message(word) && OPERAND_RUNNERS.contains(&program));
         before = [before[1], bare];
     }
     (names_runner && is_given) || pipes_into_shell(line, |_| true)
