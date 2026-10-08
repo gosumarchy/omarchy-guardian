@@ -244,6 +244,22 @@ fn xargs_value(cluster: &str) -> Option<bool> {
     Some(false)
 }
 
+/// Whether `value`, the word after a cluster that ends in an unsure
+/// option, can be that option's value: a number for `-L` and `-P`, and for
+/// `-I` a word that `rest`, the command, then uses.
+fn may_be_xargs_value<'a>(
+    cluster: &str,
+    value: &str,
+    mut rest: impl Iterator<Item = &'a str>,
+) -> bool {
+    let value = value.trim_matches(['"', '\'']);
+    match cluster.chars().last() {
+        Some('l' | 'p') => !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()),
+        Some('i') => !value.is_empty() && rest.any(|word| word.contains(value)),
+        _ => true,
+    }
+}
+
 /// How many options of `xargs` are read both ways.
 const XARGS_READINGS: u8 = 4;
 
@@ -275,9 +291,12 @@ fn xargs_hands_on<'a>(
         if takes == Some(true) {
             words.next();
         } else if takes.is_none() && readings > 0 {
-            readings -= 1;
             let mut taken = words.clone();
-            taken.next();
+            let value = taken.next().unwrap_or_default();
+            if !may_be_xargs_value(option, value, taken.clone()) {
+                continue;
+            }
+            readings -= 1;
             if xargs_hands_on(taken, spaced, readings) {
                 return true;
             }

