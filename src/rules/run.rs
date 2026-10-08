@@ -20,10 +20,13 @@ pub(super) fn as_file(word: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// The program a word names where it may open a substitution: `x=$(curl`.
+/// The program a word names where it may open a substitution or a group:
+/// `x=$(curl`, `(curl`.
 fn fetcher_name(word: &str) -> &str {
     let word = word.rsplit("$(").next().unwrap_or(word);
-    program_name(word.rsplit('`').next().unwrap_or(word))
+    let word = word.rsplit('`').next().unwrap_or(word);
+    // `(curl …)`, `{ curl …; }`: a group opens before it.
+    program_name(word.trim_start_matches(['(', '{']))
 }
 
 /// The file a fetch on `line` is saved as: `curl -o x`, `wget -O x`,
@@ -34,8 +37,9 @@ pub(super) fn fetched_file(line: &str) -> Option<String> {
         .iter()
         .position(|word| FETCHERS.contains(&fetcher_name(word)))?;
     let name = saved_as(&words, at)?;
-    // Last in a substitution, the name is written with what closes it.
-    if words[at].contains("$(") {
+    // Last in a substitution or a group, the name is written with what
+    // closes it.
+    if words[..=at].iter().any(|word| word.contains('(')) {
         return as_file(without_group_close(&name));
     }
     Some(name)
@@ -249,32 +253,174 @@ pub(crate) fn run_targets(line: &str) -> Vec<String> {
 /// single quotes or behind a backslash, which is text (`echo 'run `x`'`),
 /// unless the line hands text to a shell.
 fn substituted_lines(line: &str) -> Vec<&str> {
-    let handed_on = [" -c", "eval "].iter().any(|runner| line.contains(runner));
+    let quoted = Quoted::read(line);
+    let handed_on = hands_text_on(line, &quoted.words);
     let mut reading = shell::Reading::of(line);
     shell::substitutions(line)
         .into_iter()
-        .filter(|substitution| handed_on || !is_text(line, substitution.start))
+        .filter(|substitution| handed_on || !quoted.text.contains(&substitution.start))
         .map(|substitution| substitution.body)
         .filter(|body| reading.takes(body))
         .collect()
 }
 
-/// Whether what stands at `at` in `line` is text to the shell: inside
-/// single quotes, or after a backslash.
-fn is_text(line: &str, at: usize) -> bool {
-    let mut quote: Option<u8> = None;
-    let mut escaped = false;
-    for byte in line.bytes().take(at) {
-        let was_escaped = std::mem::take(&mut escaped);
-        match byte {
-            b'\\' if quote != Some(b'\'') => escaped = !was_escaped,
-            b'\'' | b'"' if was_escaped => {}
-            b'\'' | b'"' if quote == Some(byte) => quote = None,
-            b'\'' | b'"' if quote.is_none() => quote = Some(byte),
-            _ => {}
+/// Programs that run text given to them as `-c`, besides the shells in
+/// `PIPE_SHELLS`.
+const TEXT_RUNNERS: &[&str] = &[
+    "csh", "tcsh", "mksh", "su", "runuser", "sg", "script", "watch", "python",
+];
+
+/// Whether `line` gives text to a shell to run: to `eval` or `trap`, down
+/// a pipe into one, or to one it names as `-c` (`bash -lc '…'`,
+/// `$SHELL -c '…'`) or through a here-string. Without a shell on the line
+/// those are another program's (`wc -c`, `cat <<< '…'`).
+fn hands_text_on(line: &str, quoted: &HashSet<usize>) -> bool {
+    let mut names_runner = false;
+    let mut is_given = line.contains("<<<");
+    // Whether the word before was a variable, which may hold a shell.
+    let mut after_variable = false;
+    for word in line.split_whitespace() {
+        // In a quote the word is part of a message: `echo 'a trap …'`.
+        let start = word.as_ptr() as usize - line.as_ptr() as usize;
+        if !quoted.contains(&start)
+            && word
+                .split([';', '&', '|', '!', '\\', '(', '{', '`'])
+                .any(|part| matches!(part, "eval" | "trap"))
+        {
+            return true;
+        }
+        let bare = word.trim_matches(['(', '{', '"', '\'', ';', ')']);
+        let program = unversioned(program_name(bare));
+        let option = bare.starts_with('-') && !bare.starts_with("--") && bare.ends_with('c');
+        names_runner = names_runner
+            || PIPE_SHELLS.contains(&program)
+            || PIPE_SHELLS.contains(&program_name(bare))
+            || TEXT_RUNNERS.contains(&program)
+            || (option && after_variable);
+        is_given = is_given || option;
+        after_variable = bare.starts_with('$');
+    }
+    (names_runner && is_given) || pipes_into_shell(line, |_| true)
+}
+
+/// What the quotes of a line make of its parts.
+struct Quoted {
+    /// Where a `$` or a backtick stands that is text to the shell: inside
+    /// single quotes, or after a backslash.
+    text: HashSet<usize>,
+    /// Where a word begins inside a quote.
+    words: HashSet<usize>,
+}
+
+impl Quoted {
+    /// Reads the quotes of `line`. Quotes inside a substitution are its
+    /// own (`"$(echo "it's")"`), and in `$'…'` a backslash keeps a quote
+    /// from closing it.
+    fn read(line: &str) -> Self {
+        // The substitutions open around what is being read.
+        let mut around: Vec<Around> = Vec::new();
+        let mut quote: Option<u8> = None;
+        let mut found = HashSet::new();
+        let mut words = HashSet::new();
+        let bytes = line.as_bytes();
+        let mut at = 0;
+        while at < bytes.len() {
+            let byte = bytes[at];
+            if at > 0 && bytes[at - 1].is_ascii_whitespace() && Self::in_message(bytes, at, quote) {
+                words.insert(at);
+            }
+            // `$'…'` is kept as `$`.
+            let single = matches!(quote, Some(b'\'' | b'$'));
+            let room = around.len() < MAX_SEGMENTS;
+            match byte {
+                b'\\' if quote != Some(b'\'') => {
+                    if matches!(bytes.get(at + 1), Some(b'$' | b'`')) {
+                        found.insert(at + 1);
+                    }
+                    at += 1;
+                }
+                b'$' | b'`' if single => {
+                    found.insert(at);
+                }
+                b'\'' if single => quote = None,
+                b'"' if quote == Some(b'"') => quote = None,
+                b'\'' | b'"' if quote.is_none() => quote = Some(byte),
+                b'$' if quote.is_none() && bytes.get(at + 1) == Some(&b'\'') => {
+                    quote = Some(b'$');
+                    at += 1;
+                }
+                b'$' if room && bytes.get(at + 1) == Some(&b'(') => {
+                    around.push(Around::new(quote.take(), false));
+                    at += 1;
+                }
+                b'`' if quote.is_none() && around.last().is_some_and(|open| open.backtick) => {
+                    quote = around.pop().and_then(|open| open.quote);
+                }
+                b'`' if room => around.push(Around::new(quote.take(), true)),
+                b'(' if quote.is_none() => {
+                    if let Some(open) = around.last_mut() {
+                        open.groups += 1;
+                    }
+                }
+                b')' if quote.is_none() => match around.last_mut() {
+                    Some(open) if open.groups > 0 => open.groups -= 1,
+                    Some(open) if !open.backtick => {
+                        quote = around.pop().and_then(|open| open.quote);
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+            at += 1;
+        }
+        Self { text: found, words }
+    }
+
+    /// Whether the word at `at` begins as part of a quoted message. In
+    /// double quotes a word that opens a substitution is a command from
+    /// there on: `"x $(eval …) y"`.
+    fn in_message(bytes: &[u8], at: usize, quote: Option<u8>) -> bool {
+        match quote {
+            None => false,
+            Some(b'"') => {
+                let word = bytes[at..]
+                    .split(u8::is_ascii_whitespace)
+                    .next()
+                    .unwrap_or_default();
+                // One written after a backslash opens nothing.
+                let mut escaped = false;
+                !word
+                    .iter()
+                    .zip(word.iter().skip(1).chain([&b' ']))
+                    .any(|(byte, next)| {
+                        let opens = !escaped && (*byte == b'`' || (*byte == b'$' && *next == b'('));
+                        escaped = !escaped && *byte == b'\\';
+                        opens
+                    })
+            }
+            Some(_) => true,
         }
     }
-    escaped || quote == Some(b'\'')
+}
+
+/// A substitution that is open in `Quoted::read`.
+struct Around {
+    /// The quote it stands in, open again when it closes.
+    quote: Option<u8>,
+    /// A backtick opened it, not `$(`.
+    backtick: bool,
+    /// The `(` inside it that are not closed yet.
+    groups: usize,
+}
+
+impl Around {
+    const fn new(quote: Option<u8>, backtick: bool) -> Self {
+        Self {
+            quote,
+            backtick,
+            groups: 0,
+        }
+    }
 }
 
 /// `run_targets`, for the line itself.
