@@ -387,7 +387,16 @@ impl Quoted {
                     .split(u8::is_ascii_whitespace)
                     .next()
                     .unwrap_or_default();
-                !word.contains(&b'`') && !word.windows(2).any(|pair| pair == b"$(")
+                // One written after a backslash opens nothing.
+                let mut escaped = false;
+                !word
+                    .iter()
+                    .zip(word.iter().skip(1).chain([&b' ']))
+                    .any(|(byte, next)| {
+                        let opens = !escaped && (*byte == b'`' || (*byte == b'$' && *next == b'('));
+                        escaped = !escaped && *byte == b'\\';
+                        opens
+                    })
             }
             Some(_) => true,
         }

