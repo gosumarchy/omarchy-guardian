@@ -270,6 +270,36 @@ const TEXT_RUNNERS: &[&str] = &[
     "csh", "tcsh", "mksh", "su", "runuser", "sg", "script", "watch", "flock", "python",
 ];
 
+/// Programs that run the command they are given as their operand, with
+/// options of their own before it: `xargs -0 $cmd -c '…'`.
+const OPERAND_RUNNERS: &[&str] = &[
+    "xargs",
+    "find",
+    "strace",
+    "ltrace",
+    "parallel",
+    "chroot",
+    "unshare",
+    "nsenter",
+    "pkexec",
+    "fakeroot",
+    "systemd-run",
+    "flatpak-spawn",
+    "docker",
+    "podman",
+    "bwrap",
+    "firejail",
+    "proot",
+    "xvfb-run",
+    "proxychains",
+    "torsocks",
+    "unbuffer",
+    "valgrind",
+    "busybox",
+    "setpriv",
+    "lxc-attach",
+];
+
 /// Whether `line` gives text to a shell to run: to `eval` or `trap`, down
 /// a pipe into one, or to one it names as `-c` (`bash -lc '…'`,
 /// `$SHELL -c '…'`) or through a here-string. Without a shell on the line
@@ -286,6 +316,9 @@ fn hands_text_on(line: &str, quoted: &HashSet<usize>) -> bool {
     // The two words before, for a variable right before `-c` that is not
     // the value of an option: `find -exec $SHELL -c`, not `tar -C $dir -xc`.
     let mut before = ["", ""];
+    // A program that runs what it is given was named: after it a
+    // variable may be that program, whatever stands before it.
+    let mut runs_operand = false;
     for word in line.split_whitespace() {
         // In a quote the word is part of a message: `echo 'a trap …'`.
         let in_message = quoted.contains(&(word.as_ptr() as usize - line.as_ptr() as usize));
@@ -301,6 +334,7 @@ fn hands_text_on(line: &str, quoted: &HashSet<usize>) -> bool {
         let option = bare.starts_with('-') && !bare.starts_with("--") && bare.ends_with('c');
         let after_variable = before[1].starts_with('$')
             && (!(before[0].len() == 2 && before[0].starts_with('-'))
+                || runs_operand
                 || is_shell_variable(before[1]));
         names_runner = names_runner
             || (option && after_variable)
@@ -310,6 +344,8 @@ fn hands_text_on(line: &str, quoted: &HashSet<usize>) -> bool {
                     || PIPE_SHELLS.contains(&program_name(bare))
                     || TEXT_RUNNERS.contains(&program)));
         is_given = is_given || option;
+        runs_operand = runs_operand
+            || (!in_message && !opens_message(word) && OPERAND_RUNNERS.contains(&program));
         before = [before[1], bare];
     }
     (names_runner && is_given) || pipes_into_shell(line, |_| true)
@@ -324,7 +360,15 @@ fn is_shell_variable(word: &str) -> bool {
         .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
         .collect::<String>()
         .to_lowercase();
-    PIPE_SHELLS.contains(&name.as_str()) || name.contains("shell") || name.ends_with("_sh")
+    // `$bash_path`, `$zsh`: a shell's name leads. `sh` alone leads many
+    // other words, so it counts only before what names a program's place.
+    let leads = PIPE_SHELLS
+        .iter()
+        .any(|shell| shell.len() > 2 && name.starts_with(shell));
+    let plain = name.strip_prefix("sh").is_some_and(|rest| {
+        rest.is_empty() || rest.starts_with('_') || matches!(rest, "bin" | "path" | "cmd" | "exe")
+    });
+    leads || plain || name.contains("shell") || name.ends_with("_sh")
 }
 
 /// Whether `word` opens a quote that goes on past it: the first word of
