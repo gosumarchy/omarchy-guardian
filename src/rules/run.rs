@@ -253,15 +253,12 @@ pub(crate) fn run_targets(line: &str) -> Vec<String> {
 /// single quotes or behind a backslash, which is text (`echo 'run `x`'`),
 /// unless the line hands text to a shell.
 fn substituted_lines(line: &str) -> Vec<&str> {
-    let handed_on = hands_text_on(line);
-    let text = (!handed_on).then(|| text_starts(line));
+    let quoted = Quoted::read(line);
+    let handed_on = hands_text_on(line, &quoted.words);
     let mut reading = shell::Reading::of(line);
     shell::substitutions(line)
         .into_iter()
-        .filter(|substitution| {
-            text.as_ref()
-                .is_none_or(|text| !text.contains(&substitution.start))
-        })
+        .filter(|substitution| handed_on || !quoted.text.contains(&substitution.start))
         .map(|substitution| substitution.body)
         .filter(|body| reading.takes(body))
         .collect()
@@ -277,31 +274,20 @@ const TEXT_RUNNERS: &[&str] = &[
 /// a pipe into one, or to one it names as `-c` (`bash -lc '…'`,
 /// `$SHELL -c '…'`) or through a here-string. Without a shell on the line
 /// those are another program's (`wc -c`, `cat <<< '…'`).
-fn hands_text_on(line: &str) -> bool {
+fn hands_text_on(line: &str, quoted: &HashSet<usize>) -> bool {
     let mut names_runner = false;
     let mut is_given = line.contains("<<<");
-    // The quote a word begins in, and whether the word before it was a
-    // variable, which may hold a shell.
-    let mut quote: Option<char> = None;
+    // Whether the word before was a variable, which may hold a shell.
     let mut after_variable = false;
     for word in line.split_whitespace() {
         // In a quote the word is part of a message: `echo 'a trap …'`.
-        if quote.is_none()
+        let start = word.as_ptr() as usize - line.as_ptr() as usize;
+        if !quoted.contains(&start)
             && word
                 .split([';', '&', '|', '!', '\\', '(', '{', '`'])
                 .any(|part| matches!(part, "eval" | "trap"))
         {
             return true;
-        }
-        for character in word
-            .chars()
-            .filter(|character| matches!(character, '"' | '\''))
-        {
-            quote = match quote {
-                None => Some(character),
-                Some(open) if open == character => None,
-                open => open,
-            };
         }
         let bare = word.trim_matches(['(', '{', '"', '\'', ';', ')']);
         let program = unversioned(program_name(bare));
@@ -317,67 +303,81 @@ fn hands_text_on(line: &str) -> bool {
     (names_runner && is_given) || pipes_into_shell(line, |_| true)
 }
 
-/// Where in `line` a `$` or a backtick stands that is text to the shell:
-/// inside single quotes, or after a backslash. Quotes inside a
-/// substitution are its own (`"$(echo "it's")"`), and in `$'…'` a
-/// backslash keeps a quote from closing it.
-fn text_starts(line: &str) -> HashSet<usize> {
-    // The substitutions open around what is being read.
-    let mut around: Vec<Around> = Vec::new();
-    let mut quote: Option<u8> = None;
-    let mut found = HashSet::new();
-    let bytes = line.as_bytes();
-    let mut at = 0;
-    while at < bytes.len() {
-        let byte = bytes[at];
-        // `$'…'` is kept as `$`.
-        let single = matches!(quote, Some(b'\'' | b'$'));
-        let room = around.len() < MAX_SEGMENTS;
-        match byte {
-            b'\\' if quote != Some(b'\'') => {
-                if matches!(bytes.get(at + 1), Some(b'$' | b'`')) {
-                    found.insert(at + 1);
-                }
-                at += 1;
-            }
-            b'$' | b'`' if single => {
-                found.insert(at);
-            }
-            b'\'' if single => quote = None,
-            b'"' if quote == Some(b'"') => quote = None,
-            b'\'' | b'"' if quote.is_none() => quote = Some(byte),
-            b'$' if quote.is_none() && bytes.get(at + 1) == Some(&b'\'') => {
-                quote = Some(b'$');
-                at += 1;
-            }
-            b'$' if room && bytes.get(at + 1) == Some(&b'(') => {
-                around.push(Around::new(quote.take(), false));
-                at += 1;
-            }
-            b'`' if quote.is_none() && around.last().is_some_and(|open| open.backtick) => {
-                quote = around.pop().and_then(|open| open.quote);
-            }
-            b'`' if room => around.push(Around::new(quote.take(), true)),
-            b'(' if quote.is_none() => {
-                if let Some(open) = around.last_mut() {
-                    open.groups += 1;
-                }
-            }
-            b')' if quote.is_none() => match around.last_mut() {
-                Some(open) if open.groups > 0 => open.groups -= 1,
-                Some(open) if !open.backtick => {
-                    quote = around.pop().and_then(|open| open.quote);
-                }
-                _ => {}
-            },
-            _ => {}
-        }
-        at += 1;
-    }
-    found
+/// What the quotes of a line make of its parts.
+struct Quoted {
+    /// Where a `$` or a backtick stands that is text to the shell: inside
+    /// single quotes, or after a backslash.
+    text: HashSet<usize>,
+    /// Where a word begins inside a quote.
+    words: HashSet<usize>,
 }
 
-/// A substitution that is open in `text_starts`.
+impl Quoted {
+    /// Reads the quotes of `line`. Quotes inside a substitution are its
+    /// own (`"$(echo "it's")"`), and in `$'…'` a backslash keeps a quote
+    /// from closing it.
+    fn read(line: &str) -> Self {
+        // The substitutions open around what is being read.
+        let mut around: Vec<Around> = Vec::new();
+        let mut quote: Option<u8> = None;
+        let mut found = HashSet::new();
+        let mut words = HashSet::new();
+        let bytes = line.as_bytes();
+        let mut at = 0;
+        while at < bytes.len() {
+            let byte = bytes[at];
+            if quote.is_some() && at > 0 && bytes[at - 1].is_ascii_whitespace() {
+                words.insert(at);
+            }
+            // `$'…'` is kept as `$`.
+            let single = matches!(quote, Some(b'\'' | b'$'));
+            let room = around.len() < MAX_SEGMENTS;
+            match byte {
+                b'\\' if quote != Some(b'\'') => {
+                    if matches!(bytes.get(at + 1), Some(b'$' | b'`')) {
+                        found.insert(at + 1);
+                    }
+                    at += 1;
+                }
+                b'$' | b'`' if single => {
+                    found.insert(at);
+                }
+                b'\'' if single => quote = None,
+                b'"' if quote == Some(b'"') => quote = None,
+                b'\'' | b'"' if quote.is_none() => quote = Some(byte),
+                b'$' if quote.is_none() && bytes.get(at + 1) == Some(&b'\'') => {
+                    quote = Some(b'$');
+                    at += 1;
+                }
+                b'$' if room && bytes.get(at + 1) == Some(&b'(') => {
+                    around.push(Around::new(quote.take(), false));
+                    at += 1;
+                }
+                b'`' if quote.is_none() && around.last().is_some_and(|open| open.backtick) => {
+                    quote = around.pop().and_then(|open| open.quote);
+                }
+                b'`' if room => around.push(Around::new(quote.take(), true)),
+                b'(' if quote.is_none() => {
+                    if let Some(open) = around.last_mut() {
+                        open.groups += 1;
+                    }
+                }
+                b')' if quote.is_none() => match around.last_mut() {
+                    Some(open) if open.groups > 0 => open.groups -= 1,
+                    Some(open) if !open.backtick => {
+                        quote = around.pop().and_then(|open| open.quote);
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+            at += 1;
+        }
+        Self { text: found, words }
+    }
+}
+
+/// A substitution that is open in `Quoted::read`.
 struct Around {
     /// The quote it stands in, open again when it closes.
     quote: Option<u8>,
