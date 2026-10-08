@@ -267,7 +267,7 @@ fn substituted_lines(line: &str) -> Vec<&str> {
 /// Programs that run text given to them as `-c`, besides the shells in
 /// `PIPE_SHELLS`.
 const TEXT_RUNNERS: &[&str] = &[
-    "csh", "tcsh", "mksh", "su", "runuser", "sg", "script", "watch", "python",
+    "csh", "tcsh", "mksh", "su", "runuser", "sg", "script", "watch", "flock", "python",
 ];
 
 /// Whether `line` gives text to a shell to run: to `eval` or `trap`, down
@@ -299,8 +299,9 @@ fn hands_text_on(line: &str, quoted: &HashSet<usize>) -> bool {
         let bare = word.trim_matches(['(', '{', '"', '\'', ';', ')']);
         let program = unversioned(program_name(bare));
         let option = bare.starts_with('-') && !bare.starts_with("--") && bare.ends_with('c');
-        let after_variable =
-            before[1].starts_with('$') && !(before[0].len() == 2 && before[0].starts_with('-'));
+        let after_variable = before[1].starts_with('$')
+            && (!(before[0].len() == 2 && before[0].starts_with('-'))
+                || is_shell_variable(before[1]));
         names_runner = names_runner
             || (option && after_variable)
             || (!in_message
@@ -312,6 +313,18 @@ fn hands_text_on(line: &str, quoted: &HashSet<usize>) -> bool {
         before = [before[1], bare];
     }
     (names_runner && is_given) || pipes_into_shell(line, |_| true)
+}
+
+/// Whether the variable `word` begins with is named as one that holds a
+/// shell: `$SHELL`, `${sh:-bash}`, `$login_shell`.
+fn is_shell_variable(word: &str) -> bool {
+    let name: String = word
+        .trim_start_matches(['$', '{'])
+        .chars()
+        .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+        .collect::<String>()
+        .to_lowercase();
+    PIPE_SHELLS.contains(&name.as_str()) || name.contains("shell") || name.ends_with("_sh")
 }
 
 /// Whether `word` opens a quote that goes on past it: the first word of
