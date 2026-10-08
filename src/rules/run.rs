@@ -267,29 +267,52 @@ fn substituted_lines(line: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Programs that run text given to them as `-c`, besides the shells.
-const TEXT_RUNNERS: &[&str] = &["su", "runuser", "python"];
+/// Programs that run text given to them as `-c`, besides the shells in
+/// `PIPE_SHELLS`.
+const TEXT_RUNNERS: &[&str] = &[
+    "csh", "tcsh", "mksh", "su", "runuser", "sg", "script", "watch", "python",
+];
 
 /// Whether `line` gives text to a shell to run: to `eval` or `trap`, down
-/// a pipe into one, or to one it names as `-c` (`bash -lc '…'`) or through
-/// a here-string. Without a shell on the line those are another program's
-/// (`wc -c`, `cat <<< '…'`).
+/// a pipe into one, or to one it names as `-c` (`bash -lc '…'`,
+/// `$SHELL -c '…'`) or through a here-string. Without a shell on the line
+/// those are another program's (`wc -c`, `cat <<< '…'`).
 fn hands_text_on(line: &str) -> bool {
     let mut names_runner = false;
     let mut is_given = line.contains("<<<");
+    // The quote a word begins in, and whether the word before it was a
+    // variable, which may hold a shell.
+    let mut quote: Option<char> = None;
+    let mut after_variable = false;
     for word in line.split_whitespace() {
-        // In a quote the word is part of a message: `echo 'trap …'`.
-        if matches!(word.trim_start_matches(['(', '{']), "eval" | "trap") {
+        // In a quote the word is part of a message: `echo 'a trap …'`.
+        if quote.is_none()
+            && word
+                .split([';', '&', '|', '!', '\\', '(', '{', '`'])
+                .any(|part| matches!(part, "eval" | "trap"))
+        {
             return true;
         }
-        let word = word.trim_matches(['(', '{', '"', '\'', ';', ')']);
-        let program = unversioned(program_name(word));
+        for character in word
+            .chars()
+            .filter(|character| matches!(character, '"' | '\''))
+        {
+            quote = match quote {
+                None => Some(character),
+                Some(open) if open == character => None,
+                open => open,
+            };
+        }
+        let bare = word.trim_matches(['(', '{', '"', '\'', ';', ')']);
+        let program = unversioned(program_name(bare));
+        let option = bare.starts_with('-') && !bare.starts_with("--") && bare.ends_with('c');
         names_runner = names_runner
             || PIPE_SHELLS.contains(&program)
-            || PIPE_SHELLS.contains(&program_name(word))
-            || TEXT_RUNNERS.contains(&program);
-        is_given =
-            is_given || (word.starts_with('-') && !word.starts_with("--") && word.ends_with('c'));
+            || PIPE_SHELLS.contains(&program_name(bare))
+            || TEXT_RUNNERS.contains(&program)
+            || (option && after_variable);
+        is_given = is_given || option;
+        after_variable = bare.starts_with('$');
     }
     (names_runner && is_given) || pipes_into_shell(line, |_| true)
 }
