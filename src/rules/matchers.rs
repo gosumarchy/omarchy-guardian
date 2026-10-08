@@ -245,8 +245,9 @@ fn xargs_value(cluster: &str) -> Option<bool> {
 }
 
 /// Whether `value`, the word after a cluster that ends in an unsure
-/// option, can be that option's value: a number for `-L` and `-P`, and for
-/// `-I` a word that `rest`, the command, then uses.
+/// option, can be that option's value: a number or what expands to one
+/// for `-L` and `-P`, and for `-I` a word that `rest`, the command, then
+/// uses.
 fn may_be_xargs_value<'a>(
     cluster: &str,
     value: &str,
@@ -254,7 +255,11 @@ fn may_be_xargs_value<'a>(
 ) -> bool {
     let value = value.trim_matches(['"', '\'']);
     match cluster.chars().last() {
-        Some('l' | 'p') => !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()),
+        // A number, as written or worked out: `-P 4`, `-P $(nproc)`.
+        Some('l' | 'p') => {
+            value.contains(['$', '`'])
+                || (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        }
         Some('i') => !value.is_empty() && rest.any(|word| word.contains(value)),
         _ => true,
     }

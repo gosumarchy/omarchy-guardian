@@ -272,8 +272,8 @@ fn substituted_lines(line: &str) -> Vec<&str> {
 fn hands_text_on(line: &str) -> bool {
     line.contains("<<<")
         || line.split_whitespace().any(|word| {
-            let word = word.trim_start_matches(['(', '{', '"', '\'']);
-            matches!(word, "eval" | "trap")
+            // In a quote the word is part of a message: `echo 'trap …'`.
+            matches!(word.trim_start_matches(['(', '{']), "eval" | "trap")
                 || (word.starts_with('-') && !word.starts_with("--") && word.ends_with('c'))
         })
         || pipes_into_shell(line, |_| true)
