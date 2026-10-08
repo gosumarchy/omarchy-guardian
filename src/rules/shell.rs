@@ -149,6 +149,16 @@ pub(super) fn substitutions(text: &str) -> Vec<Substitution<'_>> {
                 start: index,
                 body: &text[inside..inside + length],
             });
+            // What `$(…)` it holds is read as well. A backtick inside it
+            // is written with a backslash and opens nothing here.
+            for nested in substitutions(&text[inside..inside + length]) {
+                if found.len() < MAX_SUBSTITUTIONS {
+                    found.push(Substitution {
+                        start: inside + nested.start,
+                        ..nested
+                    });
+                }
+            }
             // Past the closing backtick: it does not open another.
             index = inside + length + 1;
         } else {

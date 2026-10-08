@@ -275,14 +275,21 @@ const TEXT_RUNNERS: &[&str] = &[
 /// `$SHELL -c '…'`) or through a here-string. Without a shell on the line
 /// those are another program's (`wc -c`, `cat <<< '…'`).
 fn hands_text_on(line: &str, quoted: &HashSet<usize>) -> bool {
-    let mut names_runner = false;
+    // A program kept in a variable may be a shell: `$SHELL -c '…'`.
+    let mut names_runner = line.split([';', '&', '|', '\n']).any(|statement| {
+        let mut words = statement
+            .split_whitespace()
+            .map(|word| word.trim_start_matches(['(', '{', '"', '\'']));
+        shell::program_word(&mut words).is_some_and(|program| program.starts_with('$'))
+    });
     let mut is_given = line.contains("<<<");
-    // Whether the word before was a variable, which may hold a shell.
-    let mut after_variable = false;
+    // The two words before, for a variable right before `-c` that is not
+    // the value of an option: `find -exec $SHELL -c`, not `tar -C $dir -xc`.
+    let mut before = ["", ""];
     for word in line.split_whitespace() {
         // In a quote the word is part of a message: `echo 'a trap …'`.
-        let start = word.as_ptr() as usize - line.as_ptr() as usize;
-        if !quoted.contains(&start)
+        let in_message = quoted.contains(&(word.as_ptr() as usize - line.as_ptr() as usize));
+        if !in_message
             && word
                 .split([';', '&', '|', '!', '\\', '(', '{', '`'])
                 .any(|part| matches!(part, "eval" | "trap"))
@@ -292,15 +299,28 @@ fn hands_text_on(line: &str, quoted: &HashSet<usize>) -> bool {
         let bare = word.trim_matches(['(', '{', '"', '\'', ';', ')']);
         let program = unversioned(program_name(bare));
         let option = bare.starts_with('-') && !bare.starts_with("--") && bare.ends_with('c');
+        let after_variable =
+            before[1].starts_with('$') && !(before[0].len() == 2 && before[0].starts_with('-'));
         names_runner = names_runner
-            || PIPE_SHELLS.contains(&program)
-            || PIPE_SHELLS.contains(&program_name(bare))
-            || TEXT_RUNNERS.contains(&program)
-            || (option && after_variable);
+            || (option && after_variable)
+            || (!in_message
+                && !opens_message(word)
+                && (PIPE_SHELLS.contains(&program)
+                    || PIPE_SHELLS.contains(&program_name(bare))
+                    || TEXT_RUNNERS.contains(&program)));
         is_given = is_given || option;
-        after_variable = bare.starts_with('$');
+        before = [before[1], bare];
     }
     (names_runner && is_given) || pipes_into_shell(line, |_| true)
+}
+
+/// Whether `word` opens a quote that goes on past it: the first word of
+/// a message (`'watch out: …'`), where `'bash'` is a word in quotes.
+fn opens_message(word: &str) -> bool {
+    let mut characters = word.chars();
+    characters
+        .next()
+        .is_some_and(|quote| matches!(quote, '"' | '\'') && !characters.any(|next| next == quote))
 }
 
 /// What the quotes of a line make of its parts.
