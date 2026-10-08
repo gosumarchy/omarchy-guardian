@@ -267,16 +267,31 @@ fn substituted_lines(line: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Whether `line` gives text to a shell to run: as `-c` (`bash -lc '…'`),
-/// to `eval` or `trap`, through a here-string, or down a pipe into one.
+/// Programs that run text given to them as `-c`, besides the shells.
+const TEXT_RUNNERS: &[&str] = &["su", "runuser", "python"];
+
+/// Whether `line` gives text to a shell to run: to `eval` or `trap`, down
+/// a pipe into one, or to one it names as `-c` (`bash -lc '…'`) or through
+/// a here-string. Without a shell on the line those are another program's
+/// (`wc -c`, `cat <<< '…'`).
 fn hands_text_on(line: &str) -> bool {
-    line.contains("<<<")
-        || line.split_whitespace().any(|word| {
-            // In a quote the word is part of a message: `echo 'trap …'`.
-            matches!(word.trim_start_matches(['(', '{']), "eval" | "trap")
-                || (word.starts_with('-') && !word.starts_with("--") && word.ends_with('c'))
-        })
-        || pipes_into_shell(line, |_| true)
+    let mut names_runner = false;
+    let mut is_given = line.contains("<<<");
+    for word in line.split_whitespace() {
+        // In a quote the word is part of a message: `echo 'trap …'`.
+        if matches!(word.trim_start_matches(['(', '{']), "eval" | "trap") {
+            return true;
+        }
+        let word = word.trim_matches(['(', '{', '"', '\'', ';', ')']);
+        let program = unversioned(program_name(word));
+        names_runner = names_runner
+            || PIPE_SHELLS.contains(&program)
+            || PIPE_SHELLS.contains(&program_name(word))
+            || TEXT_RUNNERS.contains(&program);
+        is_given =
+            is_given || (word.starts_with('-') && !word.starts_with("--") && word.ends_with('c'));
+    }
+    (names_runner && is_given) || pipes_into_shell(line, |_| true)
 }
 
 /// Where in `line` a `$` or a backtick stands that is text to the shell:
