@@ -79,6 +79,13 @@ something needs attention (a gate is off, a setting is broken, the daily sweep
 stopped running or could not finish, or a block in the last day is unseen),
 dim when protection is off.
 
+In Omarchy's shell bar the widget is a plugin. Guardian copies its own
+(`omarchy-guardian`) into `~/.config/omarchy/plugins`, unless the same widget
+is already there as a plugin of its own, added with `omarchy plugin add`
+(`io.github.gosumarchy.guardian`): then that one is Guardian's bar widget.
+Turning the bar widget on or off only puts it in the bar or takes it out, and
+its files are left alone.
+
 A gate that cannot be there (the package's files are missing) counts as a
 problem; a gate with nothing on this machine to guard does not: the AUR gate
 without yay installed, and, without Omarchy (plain Arch), the theme and plugin

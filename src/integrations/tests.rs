@@ -1002,3 +1002,86 @@ fn a_comma_goes_before_a_comment_that_ends_the_line() {
     let out = with_menu_entries("{\n  \"a\": 1, // c\n}\n", &["\"b\": 1"]).unwrap();
     assert_eq!(out, "{\n  \"a\": 1, // c\n  \"b\": 1\n}\n");
 }
+
+#[test]
+fn the_widget_added_as_a_plugin_of_its_own_stands_in_for_the_packaged_copy() {
+    let dir = TempDir::new("integrations-listed-widget");
+    let paths = paths(&dir);
+    let root = dir.path();
+    fs::create_dir_all(root.join("share/bar-widget")).unwrap();
+    fs::write(
+        root.join("share/bar-widget/manifest.json"),
+        r#"{"id":"omarchy-guardian"}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("omarchy/bin")).unwrap();
+    fs::write(root.join("omarchy/bin/omarchy-plugin-enable"), "").unwrap();
+    assert_eq!(paths.state(Integration::BarWidget), State::Off);
+
+    let listed = root.join("plugins/io.github.gosumarchy.guardian");
+    fs::create_dir_all(&listed).unwrap();
+    fs::write(
+        listed.join("manifest.json"),
+        r#"{"id":"io.github.gosumarchy.guardian"}"#,
+    )
+    .unwrap();
+
+    // Installed and not in the bar: turning it on places it, and copies
+    // nothing.
+    let state = paths.state(Integration::BarWidget);
+    assert!(matches!(state, State::Partial(_)), "{state:?}");
+    let enable = root.join("omarchy/bin/omarchy-plugin-enable");
+    assert_eq!(
+        paths.plan(Integration::BarWidget, &state).unwrap().steps,
+        [Step::Command(vec![
+            enable.display().to_string(),
+            "io.github.gosumarchy.guardian".into()
+        ])]
+    );
+
+    // In the bar it is on; turning it off takes it out and removes nothing.
+    fs::write(
+        &paths.shell_config,
+        r#"{"bar":{"layout":{"right":[{"id":"io.github.gosumarchy.guardian"}]}}}"#,
+    )
+    .unwrap();
+    assert_eq!(paths.state(Integration::BarWidget), State::On);
+    let disable = root.join("omarchy/bin/omarchy-plugin-disable");
+    assert_eq!(
+        paths
+            .plan(Integration::BarWidget, &State::On)
+            .unwrap()
+            .steps,
+        [Step::Optional(vec![
+            disable.display().to_string(),
+            "io.github.gosumarchy.guardian".into()
+        ])]
+    );
+
+    // A folder of that name holding another plugin is not it.
+    fs::write(listed.join("manifest.json"), r#"{"id":"other"}"#).unwrap();
+    assert_eq!(paths.state(Integration::BarWidget), State::Off);
+    fs::write(
+        listed.join("manifest.json"),
+        r#"{"id":"io.github.gosumarchy.guardian"}"#,
+    )
+    .unwrap();
+
+    // With the packaged copy there too, that one is still Guardian's to
+    // update and to remove.
+    fs::create_dir_all(&paths.widget_target).unwrap();
+    fs::write(
+        paths.widget_target.join("manifest.json"),
+        r#"{"id":"omarchy-guardian"}"#,
+    )
+    .unwrap();
+    let state = paths.state(Integration::BarWidget);
+    assert!(matches!(state, State::Partial(_)), "{state:?}");
+    assert!(
+        paths
+            .plan(Integration::BarWidget, &state)
+            .unwrap()
+            .steps
+            .contains(&Step::InstallBarWidget)
+    );
+}

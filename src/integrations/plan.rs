@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use super::{Integration, Part, Paths, State, WIDGET_ID, refresh, sudo};
+use super::{Integration, LISTED_WIDGET_ID, Part, Paths, State, WIDGET_ID, refresh, sudo};
 
 /// Installs OpenCode from the official repos, root-owned, where the pacman
 /// gate looks for it.
@@ -250,9 +250,23 @@ impl Paths {
     }
 
     /// Installs (or updates) the widget and puts it in the bar, or takes it
-    /// out and removes it.
+    /// out and removes it. The widget added as a plugin of its own is only
+    /// put in the bar or taken out: its files are the user's.
     fn widget_steps(&self, on: bool) -> Vec<Step> {
         let omarchy_bin = |name: &str| self.omarchy.join("bin").join(name).display().to_string();
+        if self.listed_widget_stands_in() {
+            let enable = if on {
+                "omarchy-plugin-enable"
+            } else {
+                "omarchy-plugin-disable"
+            };
+            let command = vec![omarchy_bin(enable), LISTED_WIDGET_ID.into()];
+            return vec![if on {
+                Step::Command(command)
+            } else {
+                Step::Optional(command)
+            }];
+        }
         if on {
             let mut steps = vec![
                 Step::InstallBarWidget,
@@ -262,7 +276,7 @@ impl Paths {
                     "rescanPlugins".into(),
                 ]),
             ];
-            if !self.widget_in_bar() {
+            if !self.widget_in_bar(WIDGET_ID) {
                 steps.push(Step::Command(vec![
                     omarchy_bin("omarchy-plugin-enable"),
                     WIDGET_ID.into(),
