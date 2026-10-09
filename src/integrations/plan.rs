@@ -285,13 +285,23 @@ impl Paths {
             }
             steps
         } else {
-            vec![
+            let mut steps = Vec::new();
+            // Both in the bar: off means neither is. The added one goes
+            // first, so that a failure leaves everything as it was.
+            if self.listed_widget_installed() && self.widget_in_bar(LISTED_WIDGET_ID) {
+                steps.push(Step::Command(vec![
+                    omarchy_bin("omarchy-plugin-disable"),
+                    LISTED_WIDGET_ID.into(),
+                ]));
+            }
+            steps.extend([
                 Step::Optional(vec![
                     omarchy_bin("omarchy-plugin-disable"),
                     WIDGET_ID.into(),
                 ]),
                 Step::RemoveBarWidget,
-            ]
+            ]);
+            steps
         }
     }
 

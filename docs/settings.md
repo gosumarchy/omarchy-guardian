@@ -87,10 +87,11 @@ That one is Guardian's bar widget where Guardian's own copy is not installed,
 or is installed but out of the bar while the added one is in it. Guardian
 then copies nothing: turning the bar widget on or off only puts the added
 plugin in the bar or takes it out, and its files are left alone (turning it
-off also removes a copy of Guardian's own that was left out of the bar). To
-move from
-Guardian's copy to the added one, add it and take `omarchy-guardian` out of
-the bar (`omarchy plugin disable omarchy-guardian`, or `omarchy plugin remove
+off also removes a copy of Guardian's own that was left out of the bar). With
+both in the bar, turning the bar widget off takes both out. To move from
+Guardian's copy to the added one, add it, put it in the bar (`omarchy plugin
+enable io.github.gosumarchy.guardian`) and then take `omarchy-guardian` out
+(`omarchy plugin disable omarchy-guardian`, or `omarchy plugin remove
 omarchy-guardian`).
 
 What Guardian checks of the added plugin is its id. Its files are yours to

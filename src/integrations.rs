@@ -600,24 +600,27 @@ impl Paths {
         })
     }
 
+    /// Whether the widget added as a plugin of its own is installed: a
+    /// folder of its name whose manifest names it.
+    fn listed_widget_installed(&self) -> bool {
+        let Some(plugins) = self.widget_target.parent() else {
+            return false;
+        };
+        let manifest = plugins.join(LISTED_WIDGET_ID).join("manifest.json");
+        manifest.is_file()
+            && fs::read_to_string(manifest)
+                .ok()
+                .and_then(|text| Json::parse(&text).ok())
+                .is_some_and(|json| json.get("id").and_then(Json::as_str) == Some(LISTED_WIDGET_ID))
+    }
+
     /// Whether the widget added as a plugin of its own is the one to go
     /// by: it is installed, and the packaged copy is either not there or
     /// out of the bar while this one is in it (what is left after the
     /// packaged one was taken out for it). Otherwise the packaged copy is
     /// still Guardian's to update and to remove.
     fn listed_widget_stands_in(&self) -> bool {
-        let Some(plugins) = self.widget_target.parent() else {
-            return false;
-        };
-        let manifest = plugins.join(LISTED_WIDGET_ID).join("manifest.json");
-        let listed = manifest.is_file()
-            && fs::read_to_string(manifest)
-                .ok()
-                .and_then(|text| Json::parse(&text).ok())
-                .is_some_and(|json| {
-                    json.get("id").and_then(Json::as_str) == Some(LISTED_WIDGET_ID)
-                });
-        listed
+        self.listed_widget_installed()
             && (!self.widget_target.join("manifest.json").is_file()
                 || !self.widget_in_bar(WIDGET_ID) && self.widget_in_bar(LISTED_WIDGET_ID))
     }

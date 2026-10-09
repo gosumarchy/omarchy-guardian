@@ -1067,11 +1067,10 @@ fn the_widget_added_as_a_plugin_of_its_own_stands_in_for_the_packaged_copy() {
     .unwrap();
     assert_eq!(paths.state(Integration::BarWidget), State::On);
     let disable = root.join("omarchy/bin/omarchy-plugin-disable");
+    let plan = paths.plan(Integration::BarWidget, &State::On).unwrap();
+    assert_eq!(plan.summary, "Take the Guardian bar widget out of the bar");
     assert_eq!(
-        paths
-            .plan(Integration::BarWidget, &State::On)
-            .unwrap()
-            .steps,
+        plan.steps,
         [Step::Command(vec![
             disable.display().to_string(),
             "io.github.gosumarchy.guardian".into()
@@ -1165,10 +1164,20 @@ fn a_packaged_copy_beside_the_added_widget_is_guardians_while_it_is_in_the_bar()
     )
     .unwrap();
     assert_eq!(paths.state(Integration::BarWidget), State::On);
+    // Off means neither is in the bar: the added one is taken out first.
     let plan = paths.plan(Integration::BarWidget, &State::On).unwrap();
     assert_eq!(plan.summary, "Remove the Guardian bar widget");
-    assert!(plan.steps.contains(&Step::RemoveBarWidget));
+    assert_eq!(
+        plan.steps.first(),
+        Some(&Step::Command(vec![
+            disable.display().to_string(),
+            "io.github.gosumarchy.guardian".into()
+        ]))
+    );
+    assert_eq!(plan.steps.last(), Some(&Step::RemoveBarWidget));
     paths.edit(&Step::RemoveBarWidget).unwrap();
+    fs::write(&paths.shell_config, "{}").unwrap();
     assert!(!paths.widget_target.exists());
     assert!(listed.join("manifest.json").is_file());
+    assert_eq!(paths.state(Integration::BarWidget), State::Off);
 }
