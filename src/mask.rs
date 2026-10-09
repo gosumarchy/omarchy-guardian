@@ -15,8 +15,10 @@ use std::path::Path;
 use crate::paths::file_name;
 
 mod shell;
+mod slash;
 
 use shell::shell;
+use slash::Dialect;
 
 /// One line as the local rules see it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,8 +36,8 @@ enum Language {
     },
     /// `#` starts a full-line comment.
     Hash,
-    /// `//` full-line and `/* */` block comments.
-    Slash,
+    /// `//` full-line and `/* */` block comments (see `slash`).
+    Slash(Dialect),
     Lua,
     /// Unified diff (see `patch`).
     Patch,
@@ -65,9 +67,9 @@ pub(crate) fn lines(rel: &str, text: &str) -> Vec<Line> {
                 line.to_string()
             }
         }),
-        Language::Slash => {
-            let mut in_block = false;
-            per_line(&mut |line| block_comments(line, &mut in_block, "//", "/*", "*/"))
+        Language::Slash(dialect) => {
+            let mut reader = slash::Reader::new(dialect);
+            per_line(&mut |line| reader.line(line))
         }
         Language::Lua => {
             let mut closing: Option<String> = None;
@@ -106,7 +108,7 @@ fn language(rel: &str, text: &str) -> Language {
         | "service" | "timer" | "socket" | "desktop" | "fish" | "cmake" => Language::Hash,
         "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "cs" | "java" | "js" | "jsx" | "mjs"
         | "cjs" | "ts" | "tsx" | "go" | "rs" | "swift" | "kt" | "kts" | "scala" | "dart"
-        | "zig" | "css" | "scss" | "less" | "jsonc" => Language::Slash,
+        | "zig" | "css" | "scss" | "less" | "jsonc" => Language::Slash(Dialect::of(&extension)),
         "lua" => Language::Lua,
         "patch" | "diff" => Language::Patch,
         _ if matches!(
@@ -172,7 +174,7 @@ fn is_full_line_comment(language: Language, line: &str) -> bool {
     let line = line.trim_start();
     match language {
         Language::Shell { .. } | Language::Hash => line.starts_with('#'),
-        Language::Slash => line.starts_with("//") && !is_a_path(line),
+        Language::Slash(_) => line.starts_with("//") && !is_a_path(line),
         Language::Lua => line.starts_with("--"),
         Language::Patch | Language::Other => false,
     }
@@ -197,53 +199,6 @@ fn is_a_path(line: &str) -> bool {
 
 fn blank(line: &str) -> String {
     " ".repeat(line.chars().count())
-}
-
-/// Full-line comments and block comments that open at the start of a line.
-/// Comment markers after code are left alone: telling them apart from the
-/// same characters inside a string needs a real parser.
-fn block_comments(
-    line: &str,
-    in_block: &mut bool,
-    single: &str,
-    open: &str,
-    close: &str,
-) -> String {
-    let expands = |text: &str| text.contains("${");
-    let (skipped, rest) = if *in_block {
-        if expands(line) {
-            *in_block = !line.contains(close);
-            return line.to_string();
-        }
-        (0, line)
-    } else {
-        let trimmed = line.trim_start();
-        let indent = line.len() - trimmed.len();
-        if trimmed.starts_with(single) && !(single == "//" && is_a_path(trimmed)) {
-            return blank(line);
-        }
-        let Some(after_open) = trimmed.strip_prefix(open) else {
-            return line.to_string();
-        };
-        // Inside a template string, `/* ${code} */` is text with code in
-        // it, not a comment: one that holds an expansion stays visible.
-        // The comment still runs on: its other lines are passed over.
-        if expands(after_open) {
-            *in_block = !after_open.contains(close);
-            return line.to_string();
-        }
-        *in_block = true;
-        (indent + open.len(), after_open)
-    };
-
-    match rest.find(close) {
-        Some(end) => {
-            *in_block = false;
-            let code_start = skipped + end + close.len();
-            blank(&line[..code_start]) + &line[code_start..]
-        }
-        None => blank(line),
-    }
 }
 
 /// `--` comments and `--[[ ]]` / `--[==[ ]==]` block comments opening at

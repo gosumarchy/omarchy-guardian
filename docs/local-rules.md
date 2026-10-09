@@ -111,6 +111,19 @@ C-like languages, Lua `--`, and comment lines a patch adds to a file of one of
 those languages). Lines a patch removes are skipped by the same checks as
 printed text below, since `patch -R` would apply them.
 
+A `/*` at the start of a line opens a comment only where code is read: strings
+are followed, so a `/*` inside a template string or another string that runs
+over lines hides nothing, and a comment inside a comment is counted where the
+language nests them. Guardian does not read these languages in full. Where it
+meets something it does not follow (among them a regular expression with a
+quote or a comment mark after it on the line, JSX or XML, a raw or
+triple-quoted string, a quote directly after a word, a `*\` at the end of a
+line in C, a `#if` in C#, a `\u` escape in Java or Scala), it stops skipping
+`/* */` from there to the end of the file, and skips a `//` line only if
+nothing on it could end a string, a comment or markup that began earlier (a
+quote, `*/`, `${`, and `<` or `{` where markup may be written). That only ever
+shows the rules more.
+
 In shell scripts, text that is only printed (`echo` and `printf` arguments,
 `cat <<EOF` bodies, when nothing pipes, redirects or substitutes them) is
 skipped by the persistence, privilege, credential-file, TLS,
