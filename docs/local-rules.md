@@ -111,6 +111,14 @@ C-like languages, Lua `--`, and comment lines a patch adds to a file of one of
 those languages). Lines a patch removes are skipped by the same checks as
 printed text below, since `patch -R` would apply them.
 
+A `/*` at the start of a line opens a comment only where code is read: strings
+are followed, so a `/*` inside a template string or another string that runs
+over lines hides nothing. Where Guardian cannot tell what is being read (a
+regular expression or JSX that may hold a quote, a raw or triple-quoted
+string, a line spliced with `\` in C, a `#if` in C#, a `\u` escape in Java), no
+`/* */` is skipped from there to the end of the file. That only ever shows the
+rules more.
+
 In shell scripts, text that is only printed (`echo` and `printf` arguments,
 `cat <<EOF` bodies, when nothing pipes, redirects or substitutes them) is
 skipped by the persistence, privilege, credential-file, TLS,
