@@ -1,0 +1,81 @@
+name: Release
+
+# A pushed release tag is checked with the verifier a user's machine runs
+# before installing, and only then published with the notes it carries. The
+# tag is signed on the maintainer's machine: no key is kept here.
+#
+# This catches a maintainer's mistake (an unsigned tag, the wrong commit, a
+# version that does not match), not someone with write access: on a tag
+# push GitHub runs this file as the tagged commit has it, and whoever can
+# push a tag can also publish a release by hand. What holds against that is
+# the check on every user's machine, which no release page takes part in.
+on:
+  push:
+    tags:
+      - 'v*'
+  # Checks an existing tag again. Nothing is published.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: An existing release tag, vX.Y.Z
+        required: true
+        type: string
+      notes:
+        description: Require the release notes in the tag (not there before 0.9.8)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # The verifier needs pacman's vercmp; the image is the one CI tests on.
+    container: archlinux:base-devel@sha256:51dd3d24f7fba779e7c471caeee7804c50e8c134ad948e19685a1c83a42facc3
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      NOTES: ${{ github.event_name == 'push' || inputs.notes }}
+    steps:
+      - name: Install git and ssh-keygen
+        run: pacman -Syu --noconfirm --needed git openssh
+      # Main, not the tag: the keys and the verifier a tag is checked with
+      # are not the tag's own. Main only changes through reviewed pull
+      # requests.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check the tag
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # The tag object itself, as it was pushed.
+          git fetch --no-tags origin "+refs/tags/$TAG:refs/tags/$TAG"
+          if [ "$NOTES" = true ]; then
+            bash packaging/check-release.sh "$TAG"
+          else
+            bash packaging/check-release.sh "$TAG" --no-notes
+          fi
+
+  publish:
+    needs: check
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      # Nothing is checked out: the notes are read as the one file they
+      # are, so nothing else in the tag reaches this job.
+      - name: Publish the release
+        run: |
+          notes="$RUNNER_TEMP/notes.md"
+          gh api -H 'Accept: application/vnd.github.raw' \
+            "repos/$GH_REPO/contents/packaging/notes/$TAG.md?ref=refs/tags/$TAG" > "$notes"
+          gh release create "$TAG" --verify-tag \
+            --title "Omarchy Guardian ${TAG#v}" \
+            --notes-file "$notes"
