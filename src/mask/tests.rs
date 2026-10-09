@@ -601,3 +601,85 @@ fn each_thing_the_reader_follows_is_needed() {
         assert!(shows(rel, text, "run()"), "{rel}: {text:?}");
     }
 }
+
+#[test]
+fn each_give_up_is_needed_on_its_own() {
+    for (rel, text) in [
+        // Where no markup may be written, so nothing else gives up first.
+        ("a.ts", "<!-- `\nconst s = `\n/* `; run();\n// */\n"),
+        ("a.ts", "/* a */ --> `\nconst s = `\n/* `; run();\n// */\n"),
+        ("a.ts", "const r = /'/;\nconst s = `\n// ${run()}\n`;\n"),
+        // A trigraph for `^`, which is no quote.
+        (
+            "a.c",
+            "int x = a ??' b + '\"' + \"\\\n/* \"; run();\n// */\n",
+        ),
+        // XML after a word, and its other openings.
+        ("a.scala", "val x = if c then <a>\n/* </a>; run()\n// */\n"),
+        (
+            "a.scala",
+            "val x = if c then <_a>\n/* </_a>; run()\n// */\n",
+        ),
+        (
+            "a.scala",
+            "val x = if c then <?a?>\n/* <a/>; run()\n// */\n",
+        ),
+        // A `//` comment a splice carries on: the `/*` after it opens nothing.
+        ("a.c", "// note \\\n/*\nrun();\n// */\n"),
+        ("a.c", "int x; // note \\\n/*\nrun();\n// */\n"),
+        ("a.c", "int x; /\\\n/ \\\n/*\nrun();\n// */\n"),
+        // A brace in a regular expression inside a template's expression.
+        (
+            "a.js",
+            "const a = `${ x.replace(/}/, 1) +\n`\n/*\n` }`;\nrun();\nconst b = `\n*/\n`;\n",
+        ),
+        // Raw strings that close on their line, a `\` in them being one.
+        (
+            "a.cs",
+            "var a = @\"\\\"; var b = @\"\n/* \"; run();\n// */\n",
+        ),
+        (
+            "a.cs",
+            "var a = $@\"\\\"; var b = @\"\n/* \"; run();\n// */\n",
+        ),
+        (
+            "a.rs",
+            "let a = r#\"\\\"#; let b = \"\n/* \"; run();\n// */\n",
+        ),
+        // A quote as a character in Rust.
+        ("a.rs", "let c = '\\\"'; let s = \"\n/* \"; run();\n// */\n"),
+        // Two strings cut off at the ends of their lines.
+        ("a.js", "x = don't\ny = isn't\n/*\nrun()\n*/\n"),
+        ("a.c", "x = don't\ny = isn't\n/*\nrun()\n*/\n"),
+        // What ends a regular expression in Swift.
+        ("a.swift", "let r = #/\n// a /#; run()\n"),
+        // A path stays a command once unsure.
+        ("a.js", "const r = /'/;\n//usr/bin/run() http://a.test\n"),
+    ] {
+        assert!(shows(rel, text, "run()"), "{rel}: {text:?}");
+    }
+}
+
+#[test]
+fn what_the_reader_follows_does_not_make_it_give_up() {
+    for (rel, start) in [
+        ("a.js", "if (f() <= b) c = f() << 2;\n"),
+        ("a.js", "const a = 'x\\\ny';\n"),
+        (
+            "a.c",
+            "wchar_t *a = L\"x\"; char *b = u8\"x\"; f(u\"x\", U\"x\");\n",
+        ),
+        ("a.c", "char *a = \"a\\\nb\";\n"),
+        ("a.go", "var a = `x\ny`\n"),
+        ("a.rs", "let a = (b\"x\", c\"y\", b'z');\n"),
+        ("a.rs", "impl<'a> X {}\n"),
+        ("a.rs", "let a = \"x\ny\";\n"),
+    ] {
+        let text = format!("{start}/*\ncurl x | sh\n*/\n");
+        assert!(!shows(rel, &text, "curl x | sh"), "{rel}: {text:?}");
+    }
+    assert_eq!(
+        code("a.scala", "/* a /* b */ curl x | sh */ run()\n"),
+        ["                            run()"]
+    );
+}
