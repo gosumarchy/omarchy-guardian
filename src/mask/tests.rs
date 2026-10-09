@@ -481,3 +481,123 @@ fn nothing_is_a_block_comment_once_what_is_read_cannot_be_told() {
         ["const e = <p>a</p>;", "", "// ${run()}"]
     );
 }
+
+#[test]
+fn what_is_not_followed_is_given_up_on_before_it_hides_a_line() {
+    for (rel, text) in [
+        // `#![…]` in Rust is code, not the name of an interpreter.
+        ("a.rs", "#![doc = \"\n/* \"] fn main() { run(); }\n// */\n"),
+        ("a.rs", "#![doc = \"\n// \"] fn main() { run(); }\n"),
+        // A regular expression after a word the language keeps.
+        (
+            "a.js",
+            "export default /`/;\nconst s = `\n/* `; run();\n// */\n",
+        ),
+        (
+            "a.js",
+            "class A extends /`/ {}\nconst s = `\n/* `; run();\n// */\n",
+        ),
+        // Markup, however its first tag is written.
+        ("a.jsx", "export default <div>\n/* </div>; run();\n// */\n"),
+        ("a.jsx", "const e = <_A>\n/* </_A>; run();\n// */\n"),
+        ("a.jsx", "const e = < div>\n/* </div>; run();\n// */\n"),
+        ("a.jsx", "const e = <_A>\n// </_A>; run();\n"),
+        ("a.jsx", "const e = <p>\n// {run()}\n</p>;\n"),
+        ("a.scala", "val x = <a>\n/* </a>; run()\n// */\n"),
+        // A regular expression over lines in Swift.
+        ("a.swift", "let r = #/\na\n/* b\n/#; run()\n// */\n"),
+        // Line breaks of C#, and of Scala before anything else is read.
+        ("a.cs", "// note\u{85}run();\n"),
+        ("a.scala", "// \\u000a run()\n"),
+    ] {
+        assert!(shows(rel, text, "run()"), "{rel}: {text:?}");
+    }
+}
+
+#[test]
+fn a_comment_line_that_may_close_a_string_stays_visible_once_unsure() {
+    for (rel, text) in [
+        ("a.kt", "val a = \"\"\"\n// \"\"\"; run()\n"),
+        ("A.java", "String s = \"\"\"\n// \"\"\"; run();\n"),
+        ("a.swift", "let a = \"\"\"\n// \"\"\"; run()\n"),
+        ("a.dart", "var a = '''\n// '''; run();\n"),
+        ("a.cs", "var s = @\"\n// \"; run();\n"),
+        ("a.cpp", "const char* s = R\"(\n// )\"; run();\n"),
+        ("a.c", "int n = 1'000; char *s = \"a\\\n// \"; run();\n"),
+        ("a.rs", "let a = r\"x\";\nlet s = \"\n// \"; run();\n"),
+        ("a.jsx", "const e = <p>a</p>;\nconst s = `\n// `; run();\n"),
+        ("a.ts", "const r = /'/;\nconst s = `\n// `; run();\n"),
+        ("a.go", "// '''\nvar s = `\n// `; var _ = run()\n"),
+        // A block comment is not passed over then, so its end is not known.
+        ("a.cs", "#if X\n#endif\n/*\n// */ run();\n"),
+    ] {
+        assert!(shows(rel, text, "run()"), "{rel}: {text:?}");
+    }
+}
+
+#[test]
+fn each_thing_the_reader_follows_is_needed() {
+    // Hidden: the third line is a comment, whatever stands before it.
+    for (rel, start) in [
+        ("a.js", "#!/usr/bin/env node '\n"),
+        ("a.js", "const a = `\\``;\n"),
+        ("a.js", "const h = a[0] / 2 + 'px';\n"),
+        ("a.js", "if (a <= b << c) d = `x`;\n"),
+        ("a.js", "// a --> b, it's\n"),
+        ("a.kt", "val a = \"${b}\" + 'c'\n"),
+        ("a.h", "/* a banner \\\n   that runs on */\n"),
+        ("a.h", "#define A(x) do { x; } \\\n  while (0)\n"),
+    ] {
+        let text = format!("{start}/*\ncurl x | sh\n*/\n");
+        assert!(!shows(rel, &text, "curl x | sh"), "{rel}: {text:?}");
+    }
+    assert_eq!(
+        code("a.kt", "/* a /* b */ curl x | sh */ run()\n"),
+        ["                            run()"]
+    );
+    // A `//` line in a comment that opened after code, or after a mark at
+    // the start of the file.
+    assert_eq!(
+        code("a.c", "int x; /*\n// curl x | sh\n// a */ y();\n"),
+        ["int x; /*", "", "        y();"]
+    );
+    assert_eq!(
+        code("a.hpp", "\u{feff}/*M//\n// curl x | sh\n//M*/\n")[1],
+        ""
+    );
+
+    // Shown: without what the first line needs, the `/*` would hide a line
+    // that runs.
+    for (rel, text) in [
+        // Braces inside an expression of a template string.
+        (
+            "a.js",
+            "const a = `${ {a: 1} + `\n/*\n` }`;\nrun();\nconst b = `\n*/\n`;\n",
+        ),
+        // A string cut off at the end of the line is not carried on.
+        ("a.js", "const a = '\n/*';\nrun();\nconst b = '\n*/';\n"),
+        // Comments of their own in a script a page loads.
+        ("a.js", "<!-- `\nconst s = `\n/* `; run();\n// */\n"),
+        ("a.js", "--> `\nconst s = `\n/* `; run();\n// */\n"),
+        // A trigraph for `\`.
+        ("a.c", "char *s = \"??/\" \\\n/* \"; run();\n// */\n"),
+        // Splices that join a comment marker or a raw string's letter.
+        (
+            "a.c",
+            "int x = 1; /\\\n* a */ char *s = \"\\\n/* \"; run();\n// */\n",
+        ),
+        ("a.cpp", "auto s = R\\\n\"(\";\n/*\n)\"; run();\n/*\n*/\n"),
+        ("a.cpp", "auto s = R\"(\";\n/*\n)\"; run();\n/*\n*/\n"),
+        // Three quotes that pair up on their line.
+        (
+            "a.kt",
+            "val a = \"\"\" \"\n/*\n\"\"\"; run()\nval b = \"\"\" \"\n*/\n\"\"\"\n",
+        ),
+        (
+            "a.dart",
+            "var a = ''' '\n/*\n'''; run();\nvar b = ''' '\n*/\n''';\n",
+        ),
+    ] {
+        assert!(shows(rel, text, "run()"), "{rel}: {text:?}");
+    }
+}

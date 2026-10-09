@@ -25,8 +25,10 @@ pub(super) enum Dialect {
     C,
     CSharp,
     Java,
-    /// Swift, Kotlin, Scala and Dart: block comments nest.
+    /// Swift, Kotlin and Dart: block comments nest.
     Nesting,
+    /// Block comments nest, and XML may be written as a value.
+    Scala,
     Other,
 }
 
@@ -40,7 +42,8 @@ impl Dialect {
             "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" => Self::C,
             "cs" => Self::CSharp,
             "java" => Self::Java,
-            "swift" | "kt" | "kts" | "scala" | "dart" => Self::Nesting,
+            "swift" | "kt" | "kts" | "dart" => Self::Nesting,
+            "scala" => Self::Scala,
             _ => Self::Other,
         }
     }
@@ -56,8 +59,20 @@ impl Dialect {
             | Self::CSharp
             | Self::Java
             | Self::Nesting
+            | Self::Scala
             | Self::Other => &[],
         }
+    }
+
+    /// Whether text that is not code may stand between tags: JSX, XML.
+    fn markup(self) -> bool {
+        matches!(self, Self::Script { markup: true } | Self::Scala)
+    }
+
+    /// Whether `\u000a` is a line break and `\u0022` a quote, before
+    /// anything else is read.
+    fn escapes_everywhere(self) -> bool {
+        matches!(self, Self::Java | Self::Scala)
     }
 }
 
@@ -75,23 +90,65 @@ enum Mode {
     Template,
 }
 
-/// After these a `/` or a `<` begins a value: a regular expression, markup.
-const BEFORE_A_VALUE: [&str; 14] = [
-    "return",
-    "typeof",
-    "instanceof",
-    "in",
-    "of",
-    "new",
-    "delete",
-    "void",
-    "throw",
+/// A `/` or a `<` after one of these words may begin a value (a regular
+/// expression, markup). Every word the language keeps for itself is here,
+/// the ones a value never follows too: only after a name of the script's
+/// own is a `/` known to divide.
+const KEYWORDS: [&str; 49] = [
+    "as",
+    "async",
+    "await",
+    "break",
     "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
     "do",
     "else",
+    "enum",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "from",
+    "function",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "let",
+    "new",
+    "null",
+    "of",
+    "return",
+    "satisfies",
+    "static",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "var",
+    "void",
+    "while",
+    "with",
     "yield",
-    "await",
+    "get",
+    "set",
+    "is",
+    "implements",
 ];
+
+/// A line break to one of these languages that `str::lines` does not split
+/// at.
+const LINE_BREAKS: [char; 4] = ['\r', '\u{85}', '\u{2028}', '\u{2029}'];
 
 /// One line, and what is known of it before it is read.
 struct Text<'a> {
@@ -108,7 +165,7 @@ struct Text<'a> {
 impl<'a> Text<'a> {
     fn new(line: &'a str) -> Self {
         let chars: Vec<char> = line.chars().collect();
-        let pair = |at: usize| {
+        let mark = |at: usize| {
             chars[at] == '/' && matches!(chars.get(at + 1), Some('/' | '*'))
                 || matches!(chars[at], '"' | '\'' | '`')
         };
@@ -118,7 +175,7 @@ impl<'a> Text<'a> {
                 .iter()
                 .take_while(|character| character.is_whitespace())
                 .count(),
-            last_mark: (0..chars.len()).rev().find(|at| pair(*at)),
+            last_mark: (0..chars.len()).rev().find(|at| mark(*at)),
             last_brace: chars
                 .iter()
                 .rposition(|character| matches!(character, '{' | '}')),
@@ -157,7 +214,12 @@ impl Reader {
 
     /// `line` with its comments blanked.
     pub(super) fn line(&mut self, line: &str) -> String {
-        if std::mem::take(&mut self.first) && line.starts_with("#!") {
+        // A `#!` line names an interpreter; `#![…]` in Rust is code.
+        if std::mem::take(&mut self.first)
+            && line
+                .strip_prefix("#!")
+                .is_some_and(|program| program.trim_start().starts_with('/'))
+        {
             return line.to_string();
         }
         if !self.unsure {
@@ -177,12 +239,16 @@ impl Reader {
     }
 
     /// Whether a `//` line could run all the same, when it is not known to
-    /// be read as code: inside a template string an expansion does, and a
+    /// be read as code. It may stand in a string, a comment or markup that
+    /// began on an earlier line: whatever closes one of those on this line
+    /// is followed by code, and an expansion in a template string runs. A
     /// line break `str::lines` does not split at ends the comment.
     fn may_hold_code(&self, line: &str) -> bool {
-        line.contains("${")
-            || line.contains(['\r', '\u{2028}', '\u{2029}'])
-            || self.dialect == Dialect::Java && line.contains("\\u")
+        line.contains(['"', '\'', '`'])
+            || ["*/", "${", "/#"].iter().any(|mark| line.contains(mark))
+            || line.contains(LINE_BREAKS)
+            || self.dialect.escapes_everywhere() && line.contains("\\u")
+            || self.dialect.markup() && line.contains(['<', '{'])
     }
 
     /// Whether `line` holds something this reader does not follow, wherever
@@ -190,12 +256,20 @@ impl Reader {
     fn suspect(&self, line: &str) -> bool {
         // A line break the language sees and `str::lines` does not, and
         // strings in three quotes, each language's own.
-        line.contains(['\r', '\u{2028}', '\u{2029}'])
+        line.contains(LINE_BREAKS)
+            || self.dialect.escapes_everywhere() && line.contains("\\u")
             || line.contains("\"\"\"")
             || line.contains("'''")
             || match self.dialect {
-                // Comments of their own in a script a page loads.
-                Dialect::Script { .. } => line.contains("<!--") || line.contains("-->"),
+                // Comments of their own in a script a page loads: `<!--`
+                // anywhere, `-->` where only blanks and comments precede it.
+                Dialect::Script { .. } => {
+                    line.contains("<!--")
+                        || line.split("-->").next().is_some_and(|before| {
+                            before.len() < line.len()
+                                && (before.trim().is_empty() || before.contains("*/"))
+                        })
+                }
                 // Trigraphs: `??/` is a `\`.
                 Dialect::C => line.contains("??/") || line.contains("??'"),
                 // What a false condition leaves out is not read at all, a
@@ -207,10 +281,16 @@ impl Reader {
                     .is_some_and(|directive| {
                         directive.starts_with("if") || directive.starts_with("el")
                     }),
-                // `\u000a` is a line break and `"` a quote, before
-                // anything else is read.
-                Dialect::Java => line.contains("\\u"),
-                Dialect::Go | Dialect::Rust | Dialect::Nesting | Dialect::Other => false,
+                // A regular expression in Swift that runs over lines.
+                Dialect::Nesting => line.contains("#/"),
+                // XML, whose text is not code.
+                Dialect::Scala => line.char_indices().any(|(at, character)| {
+                    character == '<'
+                        && line[at + 1..].starts_with(|next: char| {
+                            next.is_alphabetic() || matches!(next, '_' | '!' | '?')
+                        })
+                }),
+                Dialect::Java | Dialect::Go | Dialect::Rust | Dialect::Other => false,
             }
     }
 
@@ -224,13 +304,18 @@ impl Reader {
             return spliced.is_none().then(|| blank(line));
         }
 
+        // A `//` line inside a comment that opened after code is passed
+        // over as far as the comment runs, like any other `//` line.
+        let mut slashes = matches!(self.mode, Mode::Comment { hidden: false, .. })
+            && text.starts(text.indent, "//")
+            && !is_a_path(line);
+
         let mut at = 0;
-        // How much of the line, from its start, is a comment that opened
-        // at the start of a line.
+        // How much of the line, from its start, is a comment to pass over.
         let mut hidden = 0;
         let in_hidden = |mode: Mode| matches!(mode, Mode::Comment { hidden: true, .. });
         while at < text.chars.len() {
-            let was_hidden = in_hidden(self.mode);
+            let was_hidden = in_hidden(self.mode) || std::mem::take(&mut slashes);
             at = match self.mode {
                 Mode::Code => self.code(&text, at)?,
                 Mode::Comment { .. } => self.comment(&text, at),
@@ -238,7 +323,7 @@ impl Reader {
                 Mode::Template => self.template(&text, at),
             };
             if was_hidden || in_hidden(self.mode) {
-                hidden = at.min(text.chars.len());
+                hidden = at;
             }
         }
 
@@ -251,14 +336,20 @@ impl Reader {
                     Dialect::Go => quote == '`',
                     Dialect::Rust => quote == '"',
                     Dialect::Script { .. } | Dialect::C => escaped,
-                    Dialect::CSharp | Dialect::Java | Dialect::Nesting | Dialect::Other => false,
+                    Dialect::CSharp
+                    | Dialect::Java
+                    | Dialect::Nesting
+                    | Dialect::Scala
+                    | Dialect::Other => false,
                 };
                 if !carried {
                     return None;
                 }
             }
             // `*\` and a `/` on the next line close the comment.
-            Mode::Comment { .. } if spliced.is_some() => return None,
+            Mode::Comment { .. } if spliced.is_some_and(|before| before.ends_with('*')) => {
+                return None;
+            }
             // A splice may join two halves of a `/*`, or an `R` to its `"`.
             Mode::Code
                 if spliced.is_some_and(|before| {
@@ -273,9 +364,8 @@ impl Reader {
             Mode::Code | Mode::Comment { .. } | Mode::Template => {}
         }
 
-        // Inside a template string, `/* ${code} */` is text with code in
-        // it: belt and braces, a comment line that holds an expansion stays
-        // visible.
+        // A comment line that holds an expansion stays visible: were this
+        // text in a template string after all, the expansion would run.
         if hidden == 0 || line.contains("${") {
             return Some(line.to_string());
         }
@@ -317,12 +407,12 @@ impl Reader {
                     return None;
                 }
             }
-            // Nor is markup, whose text is not code.
-            '<' if self.dialect == (Dialect::Script { markup: true })
-                && text
-                    .chars
-                    .get(at + 1)
-                    .is_some_and(|next| next.is_ascii_alphabetic() || *next == '>')
+            // Nor is markup, whose text is not code: where a value may
+            // begin, a `<` compares nothing.
+            '<' if self.dialect.markup()
+                // `<=` and `<<` compare and shift.
+                && !matches!(text.chars.get(at + 1), Some('=' | '<'))
+                && !text.chars[..at].ends_with(&['<'])
                 && may_begin_a_value(&text.chars[..at]) =>
             {
                 return None;
@@ -432,7 +522,10 @@ impl Reader {
         let Mode::Comment { mut depth, hidden } = self.mode else {
             return at;
         };
-        let nests = matches!(self.dialect, Dialect::Rust | Dialect::Nesting);
+        let nests = matches!(
+            self.dialect,
+            Dialect::Rust | Dialect::Nesting | Dialect::Scala
+        );
         while at < text.chars.len() {
             if text.starts(at, "*/") {
                 at += 2;
@@ -480,5 +573,5 @@ fn may_begin_a_value(before: &[char]) -> bool {
         .rposition(|character| !is_word(*character))
         .map_or(0, |last| last + 1);
     let word: String = before[start..].iter().collect();
-    BEFORE_A_VALUE.contains(&word.as_str())
+    KEYWORDS.contains(&word.as_str())
 }
