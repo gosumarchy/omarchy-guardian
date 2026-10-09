@@ -66,6 +66,10 @@ const MENU_ID: &str = "\"setup.guardian\"";
 /// The bar widget plugin the package ships, and its Omarchy plugin id.
 const WIDGET_SOURCE: &str = "/usr/share/omarchy-guardian/bar-widget";
 const WIDGET_ID: &str = "omarchy-guardian";
+/// The same widget as a plugin of its own, added with `omarchy plugin add`.
+/// Where that one is installed it is Guardian's bar widget, and the
+/// packaged copy is not put beside it.
+const LISTED_WIDGET_ID: &str = "io.github.gosumarchy.guardian";
 /// The Waybar module: an image module showing the Guardian knight (calm,
 /// alert or dimmed), its name in a modules list, its definition (one line, so
 /// it can be found and removed exactly), and the markers of its style block.
@@ -571,9 +575,16 @@ impl Paths {
         if !self.omarchy.join("bin/omarchy-plugin-enable").exists() {
             return State::Unavailable("this Omarchy has no shell plugins".into());
         }
+        if self.listed_widget_stands_in() {
+            return if self.widget_in_bar(LISTED_WIDGET_ID) {
+                State::On
+            } else {
+                State::Off
+            };
+        }
         let installed = self.widget_target.join("manifest.json").is_file();
         let current = installed && self.widget_is_current();
-        match (installed, self.widget_in_bar()) {
+        match (installed, self.widget_in_bar(WIDGET_ID)) {
             (true, true) if current => State::On,
             (true, true) => State::Partial("an older copy; turning it on updates it".into()),
             (true, false) => State::Partial("installed but not in the bar".into()),
@@ -589,8 +600,34 @@ impl Paths {
         })
     }
 
-    /// Whether the widget is placed in the bar (`bar.layout` of shell.json).
-    fn widget_in_bar(&self) -> bool {
+    /// Whether the widget added as a plugin of its own is installed: a
+    /// folder of its name whose manifest names it.
+    fn listed_widget_installed(&self) -> bool {
+        let Some(plugins) = self.widget_target.parent() else {
+            return false;
+        };
+        let manifest = plugins.join(LISTED_WIDGET_ID).join("manifest.json");
+        manifest.is_file()
+            && fs::read_to_string(manifest)
+                .ok()
+                .and_then(|text| Json::parse(&text).ok())
+                .is_some_and(|json| json.get("id").and_then(Json::as_str) == Some(LISTED_WIDGET_ID))
+    }
+
+    /// Whether the widget added as a plugin of its own is the one to go
+    /// by: it is installed, and the packaged copy is either not there or
+    /// out of the bar while this one is in it (what is left after the
+    /// packaged one was taken out for it). Otherwise the packaged copy is
+    /// still Guardian's to update and to remove.
+    fn listed_widget_stands_in(&self) -> bool {
+        self.listed_widget_installed()
+            && (!self.widget_target.join("manifest.json").is_file()
+                || !self.widget_in_bar(WIDGET_ID) && self.widget_in_bar(LISTED_WIDGET_ID))
+    }
+
+    /// Whether the widget `id` is placed in the bar (`bar.layout` of
+    /// shell.json).
+    fn widget_in_bar(&self, id: &str) -> bool {
         let Some(config) = fs::read_to_string(&self.shell_config)
             .ok()
             .and_then(|text| Json::parse(&text).ok())
@@ -607,7 +644,7 @@ impl Paths {
                 .is_some_and(|entries| {
                     entries
                         .iter()
-                        .any(|entry| entry.get("id").and_then(Json::as_str) == Some(WIDGET_ID))
+                        .any(|entry| entry.get("id").and_then(Json::as_str) == Some(id))
                 })
         })
     }
