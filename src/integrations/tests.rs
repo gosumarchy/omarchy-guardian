@@ -1003,10 +1003,14 @@ fn a_comma_goes_before_a_comment_that_ends_the_line() {
     assert_eq!(out, "{\n  \"a\": 1, // c\n  \"b\": 1\n}\n");
 }
 
-#[test]
-fn the_widget_added_as_a_plugin_of_its_own_stands_in_for_the_packaged_copy() {
-    let dir = TempDir::new("integrations-listed-widget");
-    let paths = paths(&dir);
+const LISTED_WIDGET_MANIFEST: &str = r#"{"id":"io.github.gosumarchy.guardian"}"#;
+const LISTED_WIDGET_IN_BAR: &str =
+    r#"{"bar":{"layout":{"right":[{"id":"io.github.gosumarchy.guardian"}]}}}"#;
+
+/// Paths with the packaged widget's source and an Omarchy that has shell
+/// plugins.
+fn widget_paths(dir: &TempDir) -> Paths {
+    let paths = paths(dir);
     let root = dir.path();
     fs::create_dir_all(root.join("share/bar-widget")).unwrap();
     fs::write(
@@ -1016,6 +1020,14 @@ fn the_widget_added_as_a_plugin_of_its_own_stands_in_for_the_packaged_copy() {
     .unwrap();
     fs::create_dir_all(root.join("omarchy/bin")).unwrap();
     fs::write(root.join("omarchy/bin/omarchy-plugin-enable"), "").unwrap();
+    paths
+}
+
+#[test]
+fn the_widget_added_as_a_plugin_of_its_own_stands_in_for_the_packaged_copy() {
+    let dir = TempDir::new("integrations-listed-widget");
+    let paths = widget_paths(&dir);
+    let root = dir.path();
     assert_eq!(paths.state(Integration::BarWidget), State::Off);
 
     let listed = root.join("plugins/io.github.gosumarchy.guardian");
@@ -1088,6 +1100,18 @@ fn the_widget_added_as_a_plugin_of_its_own_stands_in_for_the_packaged_copy() {
         r#"{"id":"io.github.gosumarchy.guardian"}"#,
     )
     .unwrap();
+}
+
+#[test]
+fn a_packaged_copy_beside_the_added_widget_is_guardians_while_it_is_in_the_bar() {
+    let dir = TempDir::new("integrations-both-widgets");
+    let paths = widget_paths(&dir);
+    let root = dir.path();
+    let listed = root.join("plugins/io.github.gosumarchy.guardian");
+    fs::create_dir_all(&listed).unwrap();
+    fs::write(listed.join("manifest.json"), LISTED_WIDGET_MANIFEST).unwrap();
+    fs::write(&paths.shell_config, LISTED_WIDGET_IN_BAR).unwrap();
+    let disable = root.join("omarchy/bin/omarchy-plugin-disable");
 
     // With the packaged copy there too and out of the bar, the added one in
     // the bar is still the one to go by: nothing is partly on. Turning it
