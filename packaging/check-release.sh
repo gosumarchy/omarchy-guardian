@@ -1,7 +1,7 @@
 #!/bin/bash
-# Checks a release tag before it is published, the way a user's machine
-# will before it installs it. Run by .github/workflows/release.yml on every
-# pushed tag and by packaging/release.sh before a tag is pushed.
+# Checks a release tag before it is published, with the verifier a user's
+# machine runs before it installs one. Run by .github/workflows/release.yml
+# on every pushed tag and by packaging/release.sh before a tag is pushed.
 #
 # It is run from a checkout of main, with the tag fetched. The keys
 # (packaging/allowed_signers) and the verifier (integrations/upgrade.sh) are
@@ -9,15 +9,21 @@
 #
 #   1. the tag is named vX.Y.Z and is an annotated tag
 #   2. integrations/upgrade.sh --check accepts it: signed by a listed key,
-#      carrying its own name, its tree exported whole
+#      carrying its own name, its tree exported whole. Unlike on a user's
+#      machine, the release is not compared with an installed one, the key
+#      file need not be root's, and the verifier may run as root (CI)
 #   3. Cargo.toml, Cargo.lock and packaging/arch/PKGBUILD in the tag all
 #      say X.Y.Z
 #   4. the tagged commit is on origin/main
-#   5. the tag holds its release notes, packaging/notes/vX.Y.Z.md
+#   5. the tag holds its release notes, packaging/notes/vX.Y.Z.md, as a
+#      plain file
 #
 # Usage: packaging/check-release.sh vX.Y.Z [--no-notes]
 #   --no-notes  pass over step 5, for a release from before the notes were
 #               kept in the repository
+#
+# For this script's own tests, GUARDIAN_RELEASE_TEST_SIGNERS names another
+# key file than the checkout's. The verifier prints the one it used.
 set -euo pipefail
 
 die() {
@@ -26,10 +32,16 @@ die() {
 }
 ok() { printf 'ok   %s\n' "$*"; }
 
+usage='usage: packaging/check-release.sh vX.Y.Z [--no-notes]'
 tag=${1-}
 notes=1
-[[ ${2-} == --no-notes ]] && notes=0
-[[ $tag =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]] || die "usage: packaging/check-release.sh vX.Y.Z [--no-notes]"
+case ${2-} in
+    '') ;;
+    --no-notes) notes=0 ;;
+    *) die "$usage" ;;
+esac
+(($# <= 2)) || die "$usage"
+[[ $tag =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]] || die "$usage"
 version=${BASH_REMATCH[1]}
 
 cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.."
@@ -43,7 +55,7 @@ ok "$tag is an annotated tag on ${commit:0:12}"
 # The verifier refuses to run as root, which a CI container is.
 as_root=()
 ((EUID == 0)) && as_root=(GUARDIAN_UPGRADE_TEST_AS_ROOT=1)
-signers=${GUARDIAN_UPGRADE_TEST_SIGNERS:-$PWD/packaging/allowed_signers}
+signers=${GUARDIAN_RELEASE_TEST_SIGNERS:-$PWD/packaging/allowed_signers}
 env "${as_root[@]}" GUARDIAN_UPGRADE_TEST_SIGNERS="$signers" GUARDIAN_UPGRADE_TEST_INSTALLED= \
     bash integrations/upgrade.sh --check . "$tag" || die "the upgrade check refused $tag"
 ok "the upgrade check accepts $tag"
@@ -63,7 +75,11 @@ git merge-base --is-ancestor "$commit" refs/remotes/origin/main ||
 ok "the tagged commit is on origin/main"
 
 if ((notes)); then
-    [[ -n $(in_tag "packaging/notes/$tag.md") ]] || die "$tag has no release notes (packaging/notes/$tag.md)"
+    # A link or a directory of that name would be read as whatever it
+    # points to where the notes are published.
+    [[ $(git ls-tree "$commit" -- "packaging/notes/$tag.md" | cut -f 1) == 100644\ blob\ * ]] ||
+        die "$tag has no release notes as a plain file (packaging/notes/$tag.md)"
+    [[ -n $(in_tag "packaging/notes/$tag.md") ]] || die "the release notes in $tag are empty"
     ok "release notes are in the tag"
 fi
 printf '%s is ready to publish.\n' "$tag"

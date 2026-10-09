@@ -1,8 +1,14 @@
 name: Release
 
-# A pushed release tag is checked the way a user's machine checks it before
-# installing, and only then published with the notes it carries. The tag is
-# signed on the maintainer's machine: no key is kept here.
+# A pushed release tag is checked with the verifier a user's machine runs
+# before installing, and only then published with the notes it carries. The
+# tag is signed on the maintainer's machine: no key is kept here.
+#
+# This catches a maintainer's mistake (an unsigned tag, the wrong commit, a
+# version that does not match), not someone with write access: on a tag
+# push GitHub runs this file as the tagged commit has it, and whoever can
+# push a tag can also publish a release by hand. What holds against that is
+# the check on every user's machine, which no release page takes part in.
 on:
   push:
     tags:
@@ -61,13 +67,15 @@ jobs:
     env:
       TAG: ${{ github.ref_name }}
       GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-          sparse-checkout: packaging/notes
+      # Nothing is checked out: the notes are read as the one file they
+      # are, so nothing else in the tag reaches this job.
       - name: Publish the release
         run: |
+          notes="$RUNNER_TEMP/notes.md"
+          gh api -H 'Accept: application/vnd.github.raw' \
+            "repos/$GH_REPO/contents/packaging/notes/$TAG.md?ref=refs/tags/$TAG" > "$notes"
           gh release create "$TAG" --verify-tag \
             --title "Omarchy Guardian ${TAG#v}" \
-            --notes-file "packaging/notes/$TAG.md"
+            --notes-file "$notes"
