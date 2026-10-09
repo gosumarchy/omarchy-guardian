@@ -148,10 +148,11 @@ impl Paths {
                 self.theme_steps(on),
             ),
             (Integration::BarWidget, _) => (
-                if on {
-                    "Add the Guardian bar widget"
-                } else {
-                    "Remove the Guardian bar widget"
+                match (on, self.listed_widget_stands_in()) {
+                    (true, false) => "Add the Guardian bar widget",
+                    (false, false) => "Remove the Guardian bar widget",
+                    (true, true) => "Put the Guardian bar widget in the bar",
+                    (false, true) => "Take the Guardian bar widget out of the bar",
                 },
                 self.widget_steps(on),
             ),
@@ -254,28 +255,28 @@ impl Paths {
     /// put in the bar or taken out: its files are the user's.
     fn widget_steps(&self, on: bool) -> Vec<Step> {
         let omarchy_bin = |name: &str| self.omarchy.join("bin").join(name).display().to_string();
+        let rescan = Step::Optional(vec![
+            "omarchy-shell".into(),
+            "shell".into(),
+            "rescanPlugins".into(),
+        ]);
         if self.listed_widget_stands_in() {
-            let enable = if on {
-                "omarchy-plugin-enable"
-            } else {
-                "omarchy-plugin-disable"
-            };
-            let command = vec![omarchy_bin(enable), LISTED_WIDGET_ID.into()];
-            return vec![if on {
-                Step::Command(command)
-            } else {
-                Step::Optional(command)
-            }];
+            // Taking it out is all that turning it off does, so that step
+            // is not one that may fail unseen.
+            let run = |name: &str| Step::Command(vec![omarchy_bin(name), LISTED_WIDGET_ID.into()]);
+            if on {
+                return vec![rescan, run("omarchy-plugin-enable")];
+            }
+            let mut steps = vec![run("omarchy-plugin-disable")];
+            // A packaged copy left out of the bar goes too, or it would be
+            // what turning the widget on again brings back.
+            if self.widget_target.join("manifest.json").is_file() {
+                steps.push(Step::RemoveBarWidget);
+            }
+            return steps;
         }
         if on {
-            let mut steps = vec![
-                Step::InstallBarWidget,
-                Step::Optional(vec![
-                    "omarchy-shell".into(),
-                    "shell".into(),
-                    "rescanPlugins".into(),
-                ]),
-            ];
+            let mut steps = vec![Step::InstallBarWidget, rescan];
             if !self.widget_in_bar(WIDGET_ID) {
                 steps.push(Step::Command(vec![
                     omarchy_bin("omarchy-plugin-enable"),

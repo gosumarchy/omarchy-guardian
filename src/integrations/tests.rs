@@ -1026,17 +1026,25 @@ fn the_widget_added_as_a_plugin_of_its_own_stands_in_for_the_packaged_copy() {
     )
     .unwrap();
 
-    // Installed and not in the bar: turning it on places it, and copies
-    // nothing.
-    let state = paths.state(Integration::BarWidget);
-    assert!(matches!(state, State::Partial(_)), "{state:?}");
+    // Installed and not in the bar: off, and turning it on places it and
+    // copies nothing.
+    assert_eq!(paths.state(Integration::BarWidget), State::Off);
     let enable = root.join("omarchy/bin/omarchy-plugin-enable");
+    let plan = paths.plan(Integration::BarWidget, &State::Off).unwrap();
+    assert_eq!(plan.summary, "Put the Guardian bar widget in the bar");
     assert_eq!(
-        paths.plan(Integration::BarWidget, &state).unwrap().steps,
-        [Step::Command(vec![
-            enable.display().to_string(),
-            "io.github.gosumarchy.guardian".into()
-        ])]
+        plan.steps,
+        [
+            Step::Optional(vec![
+                "omarchy-shell".into(),
+                "shell".into(),
+                "rescanPlugins".into()
+            ]),
+            Step::Command(vec![
+                enable.display().to_string(),
+                "io.github.gosumarchy.guardian".into()
+            ])
+        ]
     );
 
     // In the bar it is on; turning it off takes it out and removes nothing.
@@ -1052,7 +1060,7 @@ fn the_widget_added_as_a_plugin_of_its_own_stands_in_for_the_packaged_copy() {
             .plan(Integration::BarWidget, &State::On)
             .unwrap()
             .steps,
-        [Step::Optional(vec![
+        [Step::Command(vec![
             disable.display().to_string(),
             "io.github.gosumarchy.guardian".into()
         ])]
@@ -1067,14 +1075,57 @@ fn the_widget_added_as_a_plugin_of_its_own_stands_in_for_the_packaged_copy() {
     )
     .unwrap();
 
-    // With the packaged copy there too, that one is still Guardian's to
-    // update and to remove.
-    fs::create_dir_all(&paths.widget_target).unwrap();
+    // What is no manifest is not read: a directory, or text that is not
+    // one.
+    fs::remove_file(listed.join("manifest.json")).unwrap();
+    fs::create_dir(listed.join("manifest.json")).unwrap();
+    assert_eq!(paths.state(Integration::BarWidget), State::Off);
+    fs::remove_dir(listed.join("manifest.json")).unwrap();
+    fs::write(listed.join("manifest.json"), "{").unwrap();
+    assert_eq!(paths.state(Integration::BarWidget), State::Off);
     fs::write(
-        paths.widget_target.join("manifest.json"),
-        r#"{"id":"omarchy-guardian"}"#,
+        listed.join("manifest.json"),
+        r#"{"id":"io.github.gosumarchy.guardian"}"#,
     )
     .unwrap();
+
+    // With the packaged copy there too and out of the bar, the added one in
+    // the bar is still the one to go by: nothing is partly on. Turning it
+    // off takes it out and removes the packaged copy, which would otherwise
+    // be what turning it on again brings back.
+    let packaged = |paths: &Paths| {
+        fs::create_dir_all(&paths.widget_target).unwrap();
+        fs::write(
+            paths.widget_target.join("manifest.json"),
+            r#"{"id":"omarchy-guardian"}"#,
+        )
+        .unwrap();
+    };
+    packaged(&paths);
+    assert_eq!(paths.state(Integration::BarWidget), State::On);
+    assert_eq!(
+        paths
+            .plan(Integration::BarWidget, &State::On)
+            .unwrap()
+            .steps,
+        [
+            Step::Command(vec![
+                disable.display().to_string(),
+                "io.github.gosumarchy.guardian".into()
+            ]),
+            Step::RemoveBarWidget
+        ]
+    );
+    paths.edit(&Step::RemoveBarWidget).unwrap();
+    fs::write(&paths.shell_config, "{}").unwrap();
+    assert_eq!(paths.state(Integration::BarWidget), State::Off);
+    assert!(listed.join("manifest.json").is_file());
+    packaged(&paths);
+
+    // With neither in the bar, or the packaged one in it, the packaged copy
+    // is Guardian's to update and to remove, and the added one is not
+    // touched.
+    fs::write(&paths.shell_config, "{}").unwrap();
     let state = paths.state(Integration::BarWidget);
     assert!(matches!(state, State::Partial(_)), "{state:?}");
     assert!(
@@ -1084,4 +1135,16 @@ fn the_widget_added_as_a_plugin_of_its_own_stands_in_for_the_packaged_copy() {
             .steps
             .contains(&Step::InstallBarWidget)
     );
+    fs::write(
+        &paths.shell_config,
+        r#"{"bar":{"layout":{"right":[{"id":"omarchy-guardian"},{"id":"io.github.gosumarchy.guardian"}]}}}"#,
+    )
+    .unwrap();
+    assert_eq!(paths.state(Integration::BarWidget), State::On);
+    let plan = paths.plan(Integration::BarWidget, &State::On).unwrap();
+    assert_eq!(plan.summary, "Remove the Guardian bar widget");
+    assert!(plan.steps.contains(&Step::RemoveBarWidget));
+    paths.edit(&Step::RemoveBarWidget).unwrap();
+    assert!(!paths.widget_target.exists());
+    assert!(listed.join("manifest.json").is_file());
 }
