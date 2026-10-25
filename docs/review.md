@@ -212,9 +212,25 @@ above it, `~/.claude/CLAUDE.md` and Claude Code's skills, skills from other
 tools' directories and its default plugins (`OPENCODE_DISABLE_PROJECT_CONFIG`,
 `OPENCODE_DISABLE_CLAUDE_CODE` and its `_PROMPT` and `_SKILLS` forms,
 `OPENCODE_DISABLE_EXTERNAL_SKILLS`, `OPENCODE_DISABLE_DEFAULT_PLUGINS`), and
-without updating itself or downloading language servers. For the pacman gate
-OpenCode also gets private, empty configuration and cache directories, so your
-own OpenCode settings do not shape the review of a root transaction. Neither
+without updating itself or downloading language servers. Its title agent is
+turned off: it would send the whole request, source included, to the model a
+second time for a session title nobody reads. For the pacman gate OpenCode
+also gets private, empty configuration and cache directories, so your own
+OpenCode settings do not shape the review of a root transaction.
+
+OpenCode 2 changed its command line: it has no `--pure` (no external plugins),
+no `run --dir` and no `--variant`, and `run` goes through a background service
+unless told `--standalone`. Guardian asks `opencode --version` before each
+review and, for 2.x, runs `run --standalone` from the empty directory with the
+variant after the model (`provider/model#variant`). Since nothing switches the
+plugins of your own configuration off in 2.x (a `plugin` list in the config
+Guardian passes is merged with yours, not put in its place), every OpenCode 2
+review gets the private configuration and cache directories, not only the
+pacman gate's: a provider set up with `opencode auth login` keeps working, one
+defined only in `~/.config/opencode` does not. OpenCode 2 also prints no event
+until the reply is complete, so a review it runs out of time on is taken as one
+the model had the source for: a source can be written to keep a reviewer busy.
+Neither
 reviewer inherits `NODE_OPTIONS`, `BUN_OPTIONS`,
 `NODE_TLS_REJECT_UNAUTHORIZED`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT` or
 `OPENCODE_PERMISSION`: they load code into the reviewer, switch off its TLS
@@ -227,7 +243,8 @@ names the ones that were set (names only): `ANTHROPIC_BASE_URL`,
 and `SSL_CERT_FILE`.
 
 What stays yours, and so in the hands of anything running as you: for your own
-sources, OpenCode's global configuration in `~/.config/opencode` (a provider's
+sources reviewed by OpenCode 1, OpenCode's global configuration in
+`~/.config/opencode` (a provider's
 `baseURL`, a global `AGENTS.md`), and for every review the credentials in
 OpenCode's data directory, including "wellknown" logins, through which
 OpenCode fetches and merges configuration from that server. System-wide

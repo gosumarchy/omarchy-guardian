@@ -134,6 +134,14 @@ pub(super) struct Events {
     delivered: bool,
 }
 
+impl Events {
+    /// Takes the request to have reached the model although no event says
+    /// so: OpenCode 2 prints none before the reply is complete.
+    pub(super) const fn assume_delivered(&mut self) {
+        self.delivered = true;
+    }
+}
+
 pub(super) fn scan_events(output: &str) -> Events {
     let mut events = Events::default();
 
@@ -150,10 +158,12 @@ pub(super) fn scan_events(output: &str) -> Events {
 
         match event.get("type").and_then(Json::as_str) {
             Some("error") => {
-                let message = event
-                    .get("error")
+                // OpenCode 1 nests the message under `data`; 2 does not.
+                let error = event.get("error");
+                let message = error
                     .and_then(|error| error.get("data"))
                     .and_then(|data| data.get("message"))
+                    .or_else(|| error.and_then(|error| error.get("message")))
                     .and_then(Json::as_str)
                     .unwrap_or("OpenCode reported an agent error");
                 events.error.get_or_insert_with(|| message.to_string());

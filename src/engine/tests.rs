@@ -416,8 +416,10 @@ fn a_failure_the_retry_recovers_from_is_a_review_with_a_note() {
     write_script(
         &flaky,
         &format!(
-            "#!/bin/sh\nif [ ! -e \"$0.failed\" ]; then : >\"$0.failed\"; cat >/dev/null; \
+            "#!/bin/sh\n[ \"$1\" = --version ] && exec {} \"$@\"\n\
+                 if [ ! -e \"$0.failed\" ]; then : >\"$0.failed\"; cat >/dev/null; \
                  echo 'rate limited' >&2; exit 1; fi\nexec {} \"$@\"\n",
+            clear.display(),
             clear.display()
         ),
     );

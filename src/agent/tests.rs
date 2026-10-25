@@ -5,8 +5,9 @@ use std::fs;
 use super::exposure::exposure_in;
 use super::reply::parse_review;
 use super::{
-    AgentError, Exposure, SourceFile, Status, claude_effort, claude_verdict, review,
-    review_from_json, review_to_json, scan_events, verdict,
+    AgentError, Exposure, OpenCodeCli, SourceFile, Status, claude_effort, claude_verdict,
+    cli_from_version, opencode_config, review, review_from_json, review_to_json, scan_events,
+    verdict,
 };
 use crate::config::model::SourceClass;
 use crate::config::model::{AgentSettings, Thinking};
@@ -15,7 +16,7 @@ use crate::json::Json;
 use crate::report::Severity;
 use crate::test_support::{
     TempDir, mock_opencode, mock_opencode_failing, mock_opencode_output, mock_opencode_then,
-    write_script,
+    mock_opencode2, write_script,
 };
 use crate::tools::Reviewer;
 
@@ -162,6 +163,12 @@ fn rejects_tool_calls_errors_and_empty_replies() {
         judge(r#"{"type":"error","error":{"name":"AuthError"}}"#),
         Err(AgentError::Unavailable(_))
     ));
+    // OpenCode 2 puts the message at the top of the error.
+    let free_limit = r#"{"type":"error","error":{"type":"provider.free-limit","message":"Free usage limit reached"}}"#;
+    assert_eq!(
+        scan_events(free_limit).error.as_deref(),
+        Some("Free usage limit reached")
+    );
     assert!(matches!(
         judge(r#"{"type":"step_start"}"#),
         Err(AgentError::Invalid(_))
@@ -344,6 +351,118 @@ fn default_settings_pass_no_model_or_variant() {
 
     let args = fs::read_to_string(dir.path().join("args")).unwrap();
     assert!(!args.contains("--model") && !args.contains("--variant"));
+}
+
+#[test]
+fn the_version_tells_opencode_1_from_2() {
+    assert_eq!(cli_from_version("1.18.29\n"), OpenCodeCli::One);
+    assert_eq!(cli_from_version("opencode v2.1.2\n"), OpenCodeCli::Two);
+    assert_eq!(cli_from_version("opencode v10.0.0"), OpenCodeCli::Two);
+    // Anything else is the command line Guardian has always used.
+    for output in ["", "0.9.1", "opencode", "{\"type\":\"text\"}", "v.2"] {
+        assert_eq!(cli_from_version(output), OpenCodeCli::One, "{output}");
+    }
+}
+
+#[test]
+fn opencode_2_runs_standalone_with_the_variant_after_the_model_and_its_own_config() {
+    let dir = TempDir::new("opencode-2");
+    let binary = mock_opencode2(dir.path(), "clear");
+    let settings = AgentSettings {
+        model: Some("anthropic/claude-sonnet-5".into()),
+        variant: Some("high".into()),
+        ..AgentSettings::default()
+    };
+    let files = [SourceFile {
+        path: "a.sh".into(),
+        content: "true\n".into(),
+    }];
+
+    // A user-level review: OpenCode 2 has no --pure, so it gets a private
+    // configuration all the same.
+    let review_result = review(&binary, &render(&files), &settings, false).unwrap();
+    assert_eq!(review_result.status, Status::Clear);
+    let args = fs::read_to_string(dir.path().join("args")).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    assert_eq!(
+        args[..6],
+        [
+            "run",
+            "--standalone",
+            "--format",
+            "json",
+            "--agent",
+            "guardian-review"
+        ]
+    );
+    let model = args.iter().position(|arg| *arg == "--model").unwrap();
+    assert_eq!(args[model + 1], "anthropic/claude-sonnet-5#high");
+    for gone in ["--pure", "--dir", "--variant"] {
+        assert!(!args.contains(&gone), "{gone}: {args:?}");
+    }
+    let config_home = fs::read_to_string(dir.path().join("config_home")).unwrap();
+    assert!(
+        config_home.contains("omarchy-guardian-opencode")
+            && config_home.trim_end().ends_with("/config"),
+        "{config_home}"
+    );
+
+    // A variant needs a model to go after.
+    let variant_alone = AgentSettings {
+        variant: Some("high".into()),
+        ..AgentSettings::default()
+    };
+    let error = review(&binary, &render(&files), &variant_alone, false).unwrap_err();
+    let AgentError::Unavailable(error) = error else {
+        panic!("expected unavailable, got {error:?}");
+    };
+    assert!(
+        error.to_string().contains("provider/model#variant"),
+        "{error}"
+    );
+}
+
+#[test]
+fn opencode_2_out_of_time_is_not_an_absent_reviewer() {
+    let dir = TempDir::new("opencode-2-slow");
+    let binary = dir.path().join("opencode");
+    // OpenCode 2 prints nothing before the reply is complete.
+    write_script(
+        &binary,
+        "#!/bin/sh\n[ \"$1\" = --version ] && { echo 'opencode v2.1.2'; exit 0; }\ncat >/dev/null\nsleep 10\n",
+    );
+    let settings = AgentSettings {
+        timeout_secs: 1,
+        ..AgentSettings::default()
+    };
+    let files = [SourceFile {
+        path: "a.sh".into(),
+        content: "true\n".into(),
+    }];
+    assert!(matches!(
+        review(&binary, &render(&files), &settings, false),
+        Err(AgentError::OutOfTime(_))
+    ));
+}
+
+#[test]
+fn every_opencode_config_turns_the_title_agent_off() {
+    // It would send the request, source and all, to the model again.
+    let configs = [
+        opencode_config(),
+        super::opencode_ask_config("S", None),
+        super::opencode_ask_config("S", Some("p/m")),
+    ];
+    for config in configs {
+        assert_eq!(
+            config
+                .get("agent")
+                .and_then(|agents| agents.get("title"))
+                .and_then(|title| title.get("disable")),
+            Some(&Json::Bool(true)),
+            "{config}"
+        );
+    }
 }
 
 #[test]

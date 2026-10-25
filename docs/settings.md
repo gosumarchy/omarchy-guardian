@@ -314,7 +314,8 @@ cache = "on"                          # user-level classes only
 diff = "on"                           # off under the strict profile
 ```
 
-A thinking level is only sent to OpenCode (as `--variant`) when
+A thinking level is only sent to OpenCode (as `--variant`, or after the model
+as `provider/model#variant` for OpenCode 2, which then needs `model` set) when
 `[agent.variants]` maps it, because variant names differ between providers. An
 unmapped level uses the provider's default and is shown as, for example, `high
 (provider default)` in `config show` and in reports. `setup` writes the
