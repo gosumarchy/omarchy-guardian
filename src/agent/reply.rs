@@ -132,13 +132,20 @@ pub(super) struct Events {
     pub(super) error: Option<String>,
     /// The model started a step or reasoned: the request reached it.
     delivered: bool,
+    /// An error OpenCode 2 typed as the provider's (`provider.no-route`,
+    /// `provider.transport`, `provider.free-limit`): no model had the request.
+    provider_side: bool,
 }
 
 impl Events {
-    /// Takes the request to have reached the model although no event says
-    /// so: OpenCode 2 prints none before the reply is complete.
-    pub(super) const fn assume_delivered(&mut self) {
-        self.delivered = true;
+    /// Whether an OpenCode 2 run that `failed` had reached the model. Its
+    /// `step_start` comes once per attempt, also for one that never reached
+    /// the provider, and nothing else is printed before the reply is
+    /// complete; so a failure counts as delivered unless OpenCode typed it
+    /// as the provider's. A source can be written to keep a reviewer busy
+    /// or make it fail, so the doubt goes against the source.
+    pub(super) const fn settle_opencode_2_delivery(&mut self, failed: bool) {
+        self.delivered = failed && !self.provider_side;
     }
 }
 
@@ -160,6 +167,10 @@ pub(super) fn scan_events(output: &str) -> Events {
             Some("error") => {
                 // OpenCode 1 nests the message under `data`; 2 does not.
                 let error = event.get("error");
+                events.provider_side |= error
+                    .and_then(|error| error.get("type"))
+                    .and_then(Json::as_str)
+                    .is_some_and(|kind| kind.starts_with("provider."));
                 let message = error
                     .and_then(|error| error.get("data"))
                     .and_then(|data| data.get("message"))

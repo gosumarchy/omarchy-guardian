@@ -358,6 +358,15 @@ fn the_version_tells_opencode_1_from_2() {
     assert_eq!(cli_from_version("1.18.29\n"), OpenCodeCli::One);
     assert_eq!(cli_from_version("opencode v2.1.2\n"), OpenCodeCli::Two);
     assert_eq!(cli_from_version("opencode v10.0.0"), OpenCodeCli::Two);
+    // A note after the version does not hide it.
+    assert_eq!(
+        cli_from_version("opencode v2.1.2 (abc1234)"),
+        OpenCodeCli::Two
+    );
+    assert_eq!(
+        cli_from_version("2.1.2\nA new version is available"),
+        OpenCodeCli::Two
+    );
     // Anything else is the command line Guardian has always used.
     for output in ["", "0.9.1", "opencode", "{\"type\":\"text\"}", "v.2"] {
         assert_eq!(cli_from_version(output), OpenCodeCli::One, "{output}");
@@ -419,6 +428,81 @@ fn opencode_2_runs_standalone_with_the_variant_after_the_model_and_its_own_confi
     assert!(
         error.to_string().contains("provider/model#variant"),
         "{error}"
+    );
+}
+
+/// A fake OpenCode 2 that prints `stdout` and exits with `code`. Each
+/// `--version` call appends the `XDG_CONFIG_HOME` it saw to `versions`.
+fn mock_opencode2_output(dir: &std::path::Path, stdout: &str, code: i32) -> std::path::PathBuf {
+    let binary = dir.join("opencode");
+    write_script(
+        &binary,
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' \"$XDG_CONFIG_HOME\" >>\"$(dirname \"$0\")/versions\"; \
+             echo 'opencode v2.1.2'; exit 0; fi\ncat >/dev/null\ncat <<'EOF'\n{stdout}\nEOF\nexit {code}\n"
+        ),
+    );
+    binary
+}
+
+#[test]
+fn opencode_2_failures_count_as_seen_unless_the_provider_had_them() {
+    let files = [SourceFile {
+        path: "a.sh".into(),
+        content: "true\n".into(),
+    }];
+    let run = |name: &str, stdout: &str| {
+        let dir = TempDir::new(name);
+        let binary = mock_opencode2_output(dir.path(), stdout, 1);
+        review(&binary, &render(&files), &AgentSettings::default(), false)
+    };
+    // Typed as the provider's: no model had the request, though OpenCode 2
+    // started a step for each attempt.
+    let step = r#"{"type":"step_start","part":{"type":"step-start"}}"#;
+    for (name, error) in [
+        ("o2-transport", "provider.transport"),
+        ("o2-no-route", "provider.no-route"),
+        ("o2-free-limit", "provider.free-limit"),
+    ] {
+        let stdout = format!(
+            "{step}\n{step}\n{{\"type\":\"error\",\"error\":{{\"type\":\"{error}\",\"message\":\"m\"}}}}"
+        );
+        assert!(
+            matches!(run(name, &stdout), Err(AgentError::Unavailable(_))),
+            "{error}"
+        );
+    }
+    // Anything else may have come after the model had the source.
+    assert!(matches!(
+        run(
+            "o2-other",
+            r#"{"type":"error","error":{"type":"session.aborted","message":"stream ended"}}"#
+        ),
+        Err(AgentError::Invalid(_))
+    ));
+}
+
+#[test]
+fn the_opencode_version_is_asked_once_per_binary_and_with_a_private_configuration() {
+    let dir = TempDir::new("o2-version-once");
+    let binary = mock_opencode2_output(
+        dir.path(),
+        r#"{"type":"error","error":{"type":"provider.transport","message":"m"}}"#,
+        1,
+    );
+    let files = [SourceFile {
+        path: "a.sh".into(),
+        content: "true\n".into(),
+    }];
+    for _ in 0..3 {
+        let _ = review(&binary, &render(&files), &AgentSettings::default(), false);
+    }
+    let versions = fs::read_to_string(dir.path().join("versions")).unwrap();
+    let versions: Vec<&str> = versions.lines().collect();
+    assert_eq!(versions.len(), 1, "{versions:?}");
+    assert!(
+        versions[0].contains("omarchy-guardian-opencode") && versions[0].ends_with("/config"),
+        "{versions:?}"
     );
 }
 

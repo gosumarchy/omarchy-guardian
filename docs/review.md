@@ -220,18 +220,28 @@ OpenCode settings do not shape the review of a root transaction.
 
 OpenCode 2 changed its command line: it has no `--pure` (no external plugins),
 no `run --dir` and no `--variant`, and `run` goes through a background service
-unless told `--standalone`. Guardian asks `opencode --version` before each
-review and, for 2.x, runs `run --standalone` from the empty directory with the
-variant after the model (`provider/model#variant`). Since nothing switches the
-plugins of your own configuration off in 2.x (a `plugin` list in the config
-Guardian passes is merged with yours, not put in its place), every OpenCode 2
-review gets the private configuration and cache directories, not only the
-pacman gate's: a provider set up with `opencode auth login` keeps working, one
-defined only in `~/.config/opencode` does not. OpenCode 2 also prints no event
-until the reply is complete, so a review it runs out of time on is taken as one
-the model had the source for: a source can be written to keep a reviewer busy.
-Neither
-reviewer inherits `NODE_OPTIONS`, `BUN_OPTIONS`,
+unless told `--standalone`. Guardian asks `opencode --version` once per binary
+(with the same private configuration as the review) and, for 2.x, runs
+`run --standalone` from the empty directory with the variant after the model
+(`provider/model#variant`). Since nothing switches the plugins of your own
+configuration off in 2.x (a `plugin` list in the config Guardian passes is
+merged with yours, not put in its place), every OpenCode 2 review gets a
+private configuration directory, not only the pacman gate's: a provider set up
+with `opencode auth login` keeps working, one defined only in
+`~/.config/opencode` does not. With no `model` of Guardian's, the `model` of
+your `opencode.json` is passed on, so the source still goes where you chose.
+Outside the pacman gate OpenCode 2 keeps your cache (the model list and
+provider packages, which load only when a configuration names them).
+OpenCode 2 prints a `step_start` for every attempt, also one that never reached
+the provider, and nothing else before the reply is complete; so a run that
+fails or runs out of time counts as one the model had the source for (a
+source can be written to keep a reviewer busy or make it fail), unless
+OpenCode typed the error as the provider's (`provider.transport`,
+`provider.no-route`, `provider.free-limit`, ...), which is a reviewer that is
+unavailable. `omarchy-guardian ask` passes OpenCode 2 its agent and model in
+the config, and its variables reach the agent alone, not the terminal it opens.
+
+Neither reviewer inherits `NODE_OPTIONS`, `BUN_OPTIONS`,
 `NODE_TLS_REJECT_UNAUTHORIZED`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT` or
 `OPENCODE_PERMISSION`: they load code into the reviewer, switch off its TLS
 checks or lift the tool denials, and a review has no use for them. Variables

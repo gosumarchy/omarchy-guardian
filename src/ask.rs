@@ -24,7 +24,7 @@ use crate::config::Settings;
 use crate::config::model::SourceClass;
 use crate::error::Error;
 use crate::notify;
-use crate::paths;
+use crate::paths::{self, Accept};
 use crate::text;
 use crate::tools::{OpenCode, Reviewer};
 use crate::user;
@@ -151,16 +151,25 @@ fn agent_command(settings: &Settings, system: &str, prompt: &str) -> Result<Agen
     let model = settings.agent_settings(SourceClass::Aur).model;
     let reviewer = Reviewer::for_model(model.as_deref());
     let binary = OpenCode::UserPath.resolve_reviewer(reviewer)?;
-    let cli = match reviewer {
-        Reviewer::OpenCode => agent::opencode_cli(&binary, Path::new("/")),
-        Reviewer::ClaudeCode => OpenCodeCli::One,
+    let (cli, config_home) = match reviewer {
+        Reviewer::OpenCode => {
+            let config_home = ask_config_home()?.display().to_string();
+            let private = [("XDG_CONFIG_HOME", config_home.as_str())];
+            (
+                agent::opencode_cli(&binary, Path::new("/"), &private),
+                Some(config_home),
+            )
+        }
+        Reviewer::ClaudeCode => (OpenCodeCli::One, None),
     };
     let (args, mut env) = agent_args(reviewer, cli, model.as_deref(), system, prompt);
-    if reviewer == Reviewer::OpenCode && cli == OpenCodeCli::Two {
+    if cli == OpenCodeCli::Two
+        && let Some(config_home) = config_home
+    {
         // Without `--pure` the user's OpenCode configuration would bring its
         // plugins along: OpenCode 2 reads its configuration from a private,
         // empty directory of Guardian's, as for a review.
-        env.push(("XDG_CONFIG_HOME", ask_config_home()?.display().to_string()));
+        env.push(("XDG_CONFIG_HOME", config_home));
     }
     Ok(AgentCommand { binary, args, env })
 }
@@ -169,12 +178,8 @@ fn agent_command(settings: &Settings, system: &str, prompt: &str) -> Result<Agen
 /// `ask`. It outlives the call, since the agent runs in a terminal of its
 /// own after Guardian has returned.
 fn ask_config_home() -> Result<PathBuf, Error> {
-    let directory = notify::reports_dir()
-        .and_then(|reports| {
-            reports
-                .parent()
-                .map(|guardian| guardian.join("opencode-ask"))
-        })
+    let directory = paths::cache_home(Accept::Absolute, Accept::Any)
+        .map(|cache| cache.join("omarchy-guardian/opencode-ask"))
         .ok_or_else(|| Error::Refused("no cache directory (set HOME)".into()))?;
     let uid =
         user::real_uid().ok_or_else(|| Error::Refused("cannot tell the current user".into()))?;
@@ -270,15 +275,21 @@ pub(crate) fn run(target: &str, settings: &Settings) -> String {
         if target.starts_with(SCHEME) {
             command.args(["/bin/sh", "-c", CONFIRM_LINK, "sh", id]);
         }
+        // The agent's variables go to the agent alone, through env(1) in
+        // the command the terminal runs: set on the launcher, they would
+        // also reach the terminal (which would read its settings from
+        // `XDG_CONFIG_HOME`) and be lost where a running terminal server
+        // opens the window.
+        if !env.is_empty() {
+            command.arg("/usr/bin/env");
+            command.args(env.iter().map(|(key, value)| format!("{key}={value}")));
+        }
         command.arg(&binary);
         // An empty folder of its own: nothing for the agent to pick up, and
         // Claude Code's trust question is asked once, not for every report.
         let workspace = directory.with_file_name("agent");
         paths::private_dir(&workspace, uid)?;
         command.args(&args).current_dir(&workspace);
-        for (key, value) in &env {
-            command.env(key, value);
-        }
         Err::<(), Error>(Error::Refused(format!(
             "could not open a terminal: {}",
             command.exec()

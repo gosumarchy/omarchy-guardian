@@ -8,16 +8,19 @@
 //! that exists only in that stdin text, so a reply that never saw the source
 //! cannot pass as a review.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt::Write as _;
-use std::fs::{DirBuilder, File};
+use std::fs::{self, DirBuilder, File};
 use std::io::Read;
-use std::os::unix::fs::DirBuilderExt;
-use std::path::Path;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use crate::config::model::{AgentSettings, Thinking};
 use crate::error::{Error, IoContext};
 use crate::json::Json;
+use crate::paths::{self, Accept};
 use crate::report::Severity;
 use crate::sandbox::Workspace;
 use crate::tools::{self, Limits, Reviewer};
@@ -27,7 +30,6 @@ mod provider;
 mod reply;
 
 pub(crate) use exposure::{Exposure, exposure};
-use provider::TIMED_OUT;
 use reply::{claude_verdict, scan_events, verdict};
 pub(crate) use reply::{review_from_json, review_to_json};
 
@@ -112,14 +114,31 @@ pub(crate) enum OpenCodeCli {
 const VERSION_TIMEOUT_SECS: u32 = 15;
 
 /// Which command line `opencode` takes, from `opencode --version` (`1.18.29`,
-/// or `opencode v2.1.2`), run in `directory` without the variables the
-/// review removes. Anything else is taken for 1.x, the command line Guardian
-/// has always used: a reviewer it cannot tell fails as it did before.
-pub(crate) fn opencode_cli(opencode: &Path, directory: &Path) -> OpenCodeCli {
-    let env: Vec<(&str, &str)> = OPENCODE_SWITCHES
-        .iter()
-        .map(|switch| (*switch, "1"))
-        .collect();
+/// or `opencode v2.1.2`), run in `directory` with `env` (the review's own
+/// isolation) and without the variables the review removes. Anything else
+/// is taken for 1.x, the command line Guardian has always used: a reviewer
+/// it cannot tell fails as it did before. The answer is kept for the
+/// binary as it is on disk, so a review split into chunks, or retried,
+/// asks once.
+pub(crate) fn opencode_cli(opencode: &Path, directory: &Path, env: &[(&str, &str)]) -> OpenCodeCli {
+    type Known = HashMap<(PathBuf, u64, u64, i64), OpenCodeCli>;
+    static KNOWN: OnceLock<Mutex<Known>> = OnceLock::new();
+    let key = fs::metadata(opencode).ok().map(|metadata| {
+        (
+            opencode.to_path_buf(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+        )
+    });
+    let known = KNOWN.get_or_init(Mutex::default);
+    if let Some(key) = &key
+        && let Some(cli) = known.lock().ok().and_then(|known| known.get(key).copied())
+    {
+        return cli;
+    }
+    let mut env = env.to_vec();
+    env.extend(OPENCODE_SWITCHES.iter().map(|switch| (*switch, "1")));
     let Ok(captured) = tools::run_in_without(
         opencode,
         &[OsString::from("--version")],
@@ -137,20 +156,47 @@ pub(crate) fn opencode_cli(opencode: &Path, directory: &Path) -> OpenCodeCli {
     if !captured.status.success() {
         return OpenCodeCli::One;
     }
-    cli_from_version(&String::from_utf8_lossy(&captured.stdout))
+    let cli = cli_from_version(&String::from_utf8_lossy(&captured.stdout));
+    if let (Some(key), Ok(mut known)) = (key, known.lock()) {
+        known.insert(key, cli);
+    }
+    cli
 }
 
+/// The first word of `output` that reads as a version (`1.18.29`, `v2.1.2`),
+/// so a note after it does not hide it.
 fn cli_from_version(output: &str) -> OpenCodeCli {
-    let major = output
-        .split_whitespace()
-        .next_back()
-        .map(|word| word.trim_start_matches('v'))
-        .and_then(|version| version.split('.').next())
-        .and_then(|major| major.parse::<u32>().ok());
+    let major = output.split_whitespace().find_map(|word| {
+        let (major, rest) = word.trim_start_matches('v').split_once('.')?;
+        if !rest.starts_with(|c: char| c.is_ascii_digit()) {
+            return None;
+        }
+        major.parse::<u32>().ok()
+    });
     match major {
         Some(major) if major >= 2 => OpenCodeCli::Two,
         _ => OpenCodeCli::One,
     }
+}
+
+/// The `model` of the user's own OpenCode configuration
+/// (`~/.config/opencode/opencode.json`, or a `.jsonc` written as plain JSON),
+/// for an OpenCode 2 review that runs without that configuration and has
+/// no model of Guardian's: the source then still goes to the model the user
+/// chose, not to OpenCode's default.
+fn user_opencode_model() -> Option<String> {
+    let directory = paths::config_home(Accept::Absolute, Accept::Any)?.join("opencode");
+    ["opencode.json", "opencode.jsonc"].iter().find_map(|name| {
+        let file = File::open(directory.join(name)).ok()?;
+        let mut text = String::new();
+        file.take(1024 * 1024).read_to_string(&mut text).ok()?;
+        Json::parse(&text)
+            .ok()?
+            .get("model")
+            .and_then(Json::as_str)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string)
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -274,30 +320,39 @@ fn opencode_review(
     // and config files from its directory and the ones above it.
     let workspace = Workspace::create("opencode").map_err(AgentError::Unavailable)?;
     let directory = workspace.path().join("empty");
-    DirBuilder::new()
-        .mode(0o700)
-        .create(&directory)
-        .at(workspace.path())
-        .map_err(AgentError::Unavailable)?;
-    let cli = opencode_cli(opencode, &directory);
-    let isolated = isolated || cli == OpenCodeCli::Two;
-    if isolated {
-        for name in ["config", "cache"] {
-            DirBuilder::new()
-                .mode(0o700)
-                .create(workspace.path().join(name))
-                .at(workspace.path())
-                .map_err(AgentError::Unavailable)?;
-        }
+    // The configuration directory is made whatever the version: the version
+    // check runs with it, so not even that start reads the user's plugins.
+    for name in ["empty", "config", "cache"] {
+        DirBuilder::new()
+            .mode(0o700)
+            .create(workspace.path().join(name))
+            .at(workspace.path())
+            .map_err(AgentError::Unavailable)?;
     }
     let config_home = workspace.path().join("config").display().to_string();
     let cache_home = workspace.path().join("cache").display().to_string();
+    let mut private: Vec<(&str, &str)> = vec![("XDG_CONFIG_HOME", &config_home)];
+    if isolated {
+        private.push(("XDG_CACHE_HOME", &cache_home));
+    }
+    let cli = opencode_cli(opencode, &directory, &private);
     let mut env: Vec<(&str, &str)> = vec![("OPENCODE_CONFIG_CONTENT", &config), ("NO_COLOR", "1")];
     env.extend(OPENCODE_SWITCHES.iter().map(|switch| (*switch, "1")));
-    if isolated {
-        env.push(("XDG_CONFIG_HOME", &config_home));
-        env.push(("XDG_CACHE_HOME", &cache_home));
+    // OpenCode 1 keeps the user's configuration for their own sources, and
+    // `--pure` keeps its plugins out. OpenCode 2 has no `--pure`, so its
+    // configuration is always the private one. Its cache stays the user's
+    // outside the pacman gate: what it holds (the model list, provider
+    // packages) is loaded only when the configuration names it.
+    if isolated || cli == OpenCodeCli::Two {
+        env.extend(private.iter().copied());
     }
+    let user_model = (cli == OpenCodeCli::Two && !isolated && settings.model.is_none())
+        .then(user_opencode_model)
+        .flatten();
+    let settings = &AgentSettings {
+        model: settings.model.clone().or(user_model),
+        ..settings.clone()
+    };
     let args = opencode_args(cli, &directory, settings)?;
 
     let captured = tools::run_in_without(
@@ -321,11 +376,8 @@ fn opencode_review(
     // tried a tool or answered and then failed is invalid, not absent.
     let mut events = scan_events(&String::from_utf8_lossy(&captured.stdout));
     let failure = (!captured.status.success()).then(|| captured.failure_detail());
-    // OpenCode 2 prints no event until the reply is complete, so a run
-    // stopped for time cannot show that the model had the source. It is
-    // taken to have had it: a source can be written to keep a reviewer busy.
-    if cli == OpenCodeCli::Two && failure.as_deref() == Some(TIMED_OUT) {
-        events.assume_delivered();
+    if cli == OpenCodeCli::Two {
+        events.settle_opencode_2_delivery(failure.is_some() || events.error.is_some());
     }
     verdict(events, failure, nonce)
 }
@@ -486,6 +538,7 @@ fn opencode_config() -> Json {
             ),
         )],
         None,
+        None,
     )
 }
 
@@ -496,7 +549,7 @@ fn opencode_config() -> Json {
 /// it uses (OpenCode 2 takes no `--model` outside `run`).
 pub(crate) fn opencode_ask_config(system: &str, model: Option<&str>) -> Json {
     let disabled = || Json::object([("disable", Json::from(true))]);
-    let config = locked_config(
+    locked_config(
         [
             (
                 "guardian-ask",
@@ -508,14 +561,8 @@ pub(crate) fn opencode_ask_config(system: &str, model: Option<&str>) -> Json {
             ("explore", disabled()),
         ],
         Some("guardian-ask"),
-    );
-    match (config, model) {
-        (Json::Object(mut members), Some(model)) => {
-            members.push(("model".into(), Json::from(model)));
-            Json::Object(members)
-        }
-        (config, _) => config,
-    }
+        model,
+    )
 }
 
 /// An agent with every permission denied, no tools and one step per message.
@@ -541,6 +588,7 @@ fn denied_permissions() -> Json {
 fn locked_config<'a>(
     agents: impl IntoIterator<Item = (&'a str, Json)>,
     default_agent: Option<&str>,
+    model: Option<&str>,
 ) -> Json {
     // OpenCode's title agent would send the whole request, the untrusted
     // source included, to the model a second time for a session title
@@ -557,6 +605,9 @@ fn locked_config<'a>(
     ];
     if let Some(agent) = default_agent {
         members.push(("default_agent", Json::from(agent)));
+    }
+    if let Some(model) = model {
+        members.push(("model", Json::from(model)));
     }
     Json::object(members)
 }
