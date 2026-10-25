@@ -13,6 +13,7 @@ use std::io::{self, BufRead, BufReader, Read as _, Write};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::agent::{self, SourceFile, Status};
@@ -51,8 +52,9 @@ pub(crate) trait Environment {
     /// The same test as the pacman gate runs a review: with the root-owned
     /// binary and the review isolated from the user's own configuration.
     fn test_gate_review(&self, settings: &AgentSettings) -> Result<Duration, String>;
-    /// The model the user's own reviews use now, for `setup --gate`.
-    fn user_review_model(&self) -> Option<String>;
+    /// The user's own settings file as it is (empty when there is none or
+    /// it is not valid), for `setup --gate`: its review model and profile.
+    fn user_config(&self) -> PartialConfig;
     /// The system file as it is now: `None` when there is none, an error
     /// when one is there that cannot be read or is not valid.
     fn existing_system(&self) -> Result<Option<SystemFile>, String>;
@@ -104,11 +106,11 @@ fn apply_choice(
     system: bool,
 ) {
     config.profile = Some(choice.profile);
+    config.agent.variants = tested_variants(choice);
     if system {
         apply_gate(config, choice);
     } else {
         config.agent.model.clone_from(&choice.model);
-        config.agent.variants = tested_variants(choice);
     }
     let thinking = (choice.profile != Profile::LocalOnly).then_some(choice.thinking);
     for class in classes {
@@ -116,11 +118,11 @@ fn apply_choice(
     }
 }
 
-/// What `setup --gate` changes in the system file: `[agent] model`, the
-/// `[agent.variants]` table and `[class.official] model`, to the gate's.
+/// What `setup --gate` changes in the system file: `[agent] model` and
+/// `[class.official] model`, to the gate's. `[agent.variants]` stays as it
+/// is: the gate's test ran with it.
 fn apply_gate(config: &mut PartialConfig, choice: &Choice) {
     config.agent.model.clone_from(&choice.gate.model);
-    config.agent.variants = tested_variants(choice);
     config
         .class_mut(SourceClass::Official)
         .model
@@ -294,9 +296,15 @@ pub(crate) fn run(
     };
     if profile != Profile::LocalOnly {
         tune_agent(terminal, environment, &mut choice)?;
-        if !choose_gate(terminal, environment, &mut choice)? {
+        let variants = tested_variants(&choice);
+        if !choose_gate(terminal, environment, &mut choice, &variants)? {
             // Nothing chosen for the gate: it gets the review models, as
             // before this question.
+            terminal.say(&format!(
+                "The pacman gate gets the review model ({}) as before; choose another later \
+with: omarchy-guardian setup --gate",
+                model_label(choice.model.as_deref())
+            ));
             choice.gate = Gate {
                 model: choice.model.clone(),
                 official_model: choice.official_model.clone(),
@@ -364,8 +372,43 @@ warning and third-party packages are blocked (standard profile).",
         );
     }
     if has_claude && !gate_claude {
-        terminal.say("To review pacman packages with Claude Code: sudo pacman -S claude-code");
+        if environment.claude_code_in_repository() {
+            terminal.say("To review pacman packages with Claude Code: sudo pacman -S claude-code");
+        } else {
+            terminal.say(
+                "Your claude is not root-owned in /usr/bin, so the pacman gate cannot run it.",
+            );
+        }
     }
+}
+
+/// Whether `model` is OpenCode's default or one of its own free models,
+/// which are rate-limited and can run out.
+fn is_free(model: Option<&str>) -> bool {
+    model.is_none_or(|model| model.starts_with("opencode/"))
+}
+
+/// Whether the gate's question has something better than `current` to
+/// offer: any reviewer at all when the gate cannot run `current`, and a
+/// model that is not a free one when `current` is.
+fn gate_needs_choice(
+    environment: &dyn Environment,
+    current: Option<&str>,
+    review_model: Option<&str>,
+) -> bool {
+    let runs = gate_runs(environment, current);
+    if runs && !is_free(current) {
+        return false;
+    }
+    gate_options(environment, review_model)
+        .iter()
+        .any(|(action, _)| match action {
+            GateAction::Use(model) => {
+                model.as_deref() != current && (!runs || !is_free(model.as_deref()))
+            }
+            GateAction::InstallClaude => true,
+            GateAction::Leave => false,
+        })
 }
 
 /// Whether every OpenCode model listed is one of OpenCode's own free ones.
@@ -474,19 +517,22 @@ fn suggested_gate_option(options: &[(GateAction, String)]) -> usize {
 
 /// Picks the pacman gate's reviewer from those it can run, installing
 /// Claude Code first when the user asks to, and tests the choice as the
-/// gate runs it. `false` when there is nothing it can run or the user
-/// leaves it without one: `choice.gate` is then not set.
+/// gate runs it, with `variants` as `[agent.variants]`. `false` when there
+/// is nothing it can run, the user leaves it without one or gives up after
+/// a failed test: `choice.gate` is then not set, and the caller says what
+/// the gate keeps.
 fn choose_gate(
     terminal: &mut dyn Terminal,
     environment: &dyn Environment,
     choice: &mut Choice,
+    variants: &[(Thinking, String)],
 ) -> Result<bool, String> {
     loop {
         let options = gate_options(environment, choice.model.as_deref());
         if options.is_empty() {
             terminal.say(
-                "\nThe pacman gate has no root-owned reviewer to run, so it keeps the review model \
-until one is installed (then run: omarchy-guardian setup --gate).",
+                "\nThe pacman gate has no root-owned reviewer it can run. Install one, then run: \
+omarchy-guardian setup --gate",
             );
             return Ok(false);
         }
@@ -512,10 +558,7 @@ until one is installed (then run: omarchy-guardian setup --gate).",
 
         let model = match &options[index].0 {
             GateAction::Use(model) => model.clone(),
-            GateAction::Leave => {
-                terminal.say("The pacman gate keeps its current reviewer.");
-                return Ok(false);
-            }
+            GateAction::Leave => return Ok(false),
             GateAction::InstallClaude => {
                 if !yes(terminal, "Install claude-code with sudo pacman now?") {
                     continue;
@@ -557,6 +600,7 @@ until one is installed (then run: omarchy-guardian setup --gate).",
             terminal,
             &|settings| environment.test_gate_review(settings),
             choice,
+            variants,
             gate.model.as_deref(),
             gate.official_model.as_deref(),
         );
@@ -571,8 +615,11 @@ until one is installed (then run: omarchy-guardian setup --gate).",
             }
             Err(reason) => {
                 terminal.say(&format!("Test failed: {reason}"));
-                if !yes(terminal, "Choose a different reviewer for the pacman gate?") {
-                    return Err("setup cancelled; nothing was written".into());
+                // With one option there is nothing different to choose.
+                if options.len() == 1
+                    || !yes(terminal, "Choose a different reviewer for the pacman gate?")
+                {
+                    return Ok(false);
                 }
             }
         }
@@ -627,6 +674,7 @@ fn tune_agent(
             terminal,
             &|settings| environment.test_review(settings),
             choice,
+            &tested_variants(choice),
             choice.model.as_deref(),
             choice.official_model.as_deref(),
         );
@@ -649,24 +697,26 @@ fn tune_agent(
 /// Runs `test` with `model` at the community thinking level, then, when
 /// it differs, with what the pacman gate runs for official packages: their
 /// own model and thinking level, proved too before they go into the
-/// root-owned system file.
+/// root-owned system file. A level gets a `--variant` only where `variants`
+/// (`[agent.variants]`) maps it.
 fn test_pairings(
     terminal: &mut dyn Terminal,
     test: &dyn Fn(&AgentSettings) -> Result<Duration, String>,
     choice: &Choice,
+    variants: &[(Thinking, String)],
     model: Option<&str>,
     official_model: Option<&str>,
 ) -> Result<Duration, String> {
     let settings = AgentSettings {
         model: model.map(str::to_string),
         thinking: choice.thinking,
-        variant: tested_variant(choice).map(|level| level.name().to_string()),
+        variant: mapped_variant(variants, choice.thinking),
         timeout_secs: 300,
         ..AgentSettings::default()
     };
     let elapsed = test(&settings)?;
 
-    let official = official_settings(choice, model, official_model);
+    let official = official_settings(choice, variants, model, official_model);
     if official.model == settings.model && official.variant == settings.variant {
         return Ok(elapsed);
     }
@@ -681,10 +731,11 @@ fn test_pairings(
 
 /// What the pacman gate will run for official packages with these choices:
 /// `official_model` or else `model` (`[agent] model`), the profile's
-/// official thinking level, and a `--variant` only if that level is the
-/// mapped one.
+/// official thinking level, and a `--variant` only if `variants` maps that
+/// level.
 fn official_settings(
     choice: &Choice,
+    variants: &[(Thinking, String)],
     model: Option<&str>,
     official_model: Option<&str>,
 ) -> AgentSettings {
@@ -692,10 +743,18 @@ fn official_settings(
     AgentSettings {
         model: official_model.or(model).map(str::to_string),
         thinking,
-        variant: (tested_variant(choice) == Some(thinking)).then(|| thinking.name().to_string()),
+        variant: mapped_variant(variants, thinking),
         timeout_secs: 300,
         ..AgentSettings::default()
     }
+}
+
+/// The variant `variants` maps `level` to, as the gate looks it up.
+fn mapped_variant(variants: &[(Thinking, String)], level: Thinking) -> Option<String> {
+    variants
+        .iter()
+        .find(|(mapped, _)| *mapped == level)
+        .map(|(_, name)| name.clone())
 }
 
 /// Renders both files (the system one as written where there is none yet),
@@ -771,9 +830,11 @@ fn offer_system_file(
 
 /// `setup --gate`: the gate's question alone, for a reviewer installed
 /// after setup ran or a gate left on OpenCode's free model. Only the gate's
-/// models and the tested variant change in the system file; the user file
-/// is not touched. With `if_needed`, nothing is asked while the system file
-/// names a model the gate can run.
+/// models change in the system file; the user file is not touched. With
+/// `if_needed` (the installer's reinstall), nothing is asked unless the
+/// gate cannot run its model, or runs a free one, and there is something
+/// better to offer; nor when the user chose local-only and the system file
+/// names no profile.
 pub(crate) fn run_gate(
     terminal: &mut dyn Terminal,
     environment: &dyn Environment,
@@ -784,6 +845,7 @@ pub(crate) fn run_gate(
         .as_ref()
         .map(|file| file.config.clone())
         .unwrap_or_default();
+    let user = environment.user_config();
     let profile = config.profile.unwrap_or(Profile::Standard);
     if profile == Profile::LocalOnly {
         if !if_needed {
@@ -792,8 +854,12 @@ pub(crate) fn run_gate(
         return Ok(());
     }
     if if_needed
-        && config.agent.model.is_some()
-        && gate_runs(environment, config.agent.model.as_deref())
+        && (config.profile.is_none() && user.profile == Some(Profile::LocalOnly)
+            || !gate_needs_choice(
+                environment,
+                config.agent.model.as_deref(),
+                user.agent.model.as_deref(),
+            ))
     {
         return Ok(());
     }
@@ -802,7 +868,7 @@ pub(crate) fn run_gate(
     summarize(terminal, environment);
     let mut choice = Choice {
         profile,
-        model: environment.user_review_model(),
+        model: user.agent.model.clone(),
         official_model: config.class(SourceClass::Official).model,
         thinking: config
             .class(SourceClass::ThirdPartyRepo)
@@ -810,7 +876,8 @@ pub(crate) fn run_gate(
             .unwrap_or(builtin(profile, SourceClass::ThirdPartyRepo).thinking),
         gate: Gate::default(),
     };
-    if !choose_gate(terminal, environment, &mut choice)? {
+    if !choose_gate(terminal, environment, &mut choice, &config.agent.variants)? {
+        terminal.say("The pacman gate keeps its current settings.");
         return Ok(());
     }
 
@@ -1013,6 +1080,7 @@ impl Environment for RealEnvironment {
     }
 
     fn models(&self) -> Vec<String> {
+        static LISTED: OnceLock<Vec<String>> = OnceLock::new();
         // The Claude Code CLI takes these without a provider list to ask.
         let mut models: Vec<String> = if self.user_claude() {
             CLAUDE_CODE_MODELS
@@ -1025,36 +1093,40 @@ impl Environment for RealEnvironment {
         let Some(binary) = self.user_opencode() else {
             return models;
         };
-        let listed: Vec<String> = tools::run(
-            &binary,
-            &["models".into()],
-            None,
-            &[("NO_COLOR", "1")],
-            Limits {
-                timeout_secs: 30,
-                max_output: 1024 * 1024,
-            },
-        )
-        .ok()
-        .filter(|captured| captured.status.success())
-        .map(|captured| {
-            String::from_utf8_lossy(&captured.stdout)
-                .lines()
-                .map(str::trim)
-                .filter(|line| {
-                    line.contains('/')
+        // Listed once: setup asks for the list for the summary and for each
+        // model question, and `opencode models` may go to the network.
+        let listed = LISTED.get_or_init(|| {
+            tools::run(
+                &binary,
+                &["models".into()],
+                None,
+                &[("NO_COLOR", "1")],
+                Limits {
+                    timeout_secs: 30,
+                    max_output: 1024 * 1024,
+                },
+            )
+            .ok()
+            .filter(|captured| captured.status.success())
+            .map(|captured| {
+                String::from_utf8_lossy(&captured.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| {
+                        line.contains('/')
                         && !line.contains(char::is_whitespace)
                         // `"` and `\` are in no model name the config accepts;
                         // `validate_rendered` refuses them too, but such a name
                         // should never reach the picker in the first place.
                         && !line.contains('"')
                         && !line.contains('\\')
-                })
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-        models.extend(listed);
+                    })
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+        });
+        models.extend(listed.iter().cloned());
         models
     }
 
@@ -1066,10 +1138,14 @@ impl Environment for RealEnvironment {
         test_samples(&OpenCode::SystemOnly, settings, true)
     }
 
-    fn user_review_model(&self) -> Option<String> {
-        load::Settings::load()
-            .agent_settings(SourceClass::Aur)
-            .model
+    fn user_config(&self) -> PartialConfig {
+        let Some(path) = load::user_config_path() else {
+            return PartialConfig::default();
+        };
+        fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| parse(&path, &text).ok())
+            .unwrap_or_default()
     }
 
     fn existing_system(&self) -> Result<Option<SystemFile>, String> {
@@ -1525,6 +1601,8 @@ mod tests {
         listed: Option<Vec<&'static str>>,
         /// The model of the user's own reviews, for `setup --gate`.
         user_model: Option<&'static str>,
+        /// The profile of the user's own file.
+        user_profile: Option<Profile>,
         user_written: RefCell<Option<String>>,
         system_written: RefCell<Option<String>>,
         tested: RefCell<Vec<AgentSettings>>,
@@ -1606,8 +1684,13 @@ mod tests {
             self.gate_tested.borrow_mut().push(settings.clone());
             self.outcome(settings)
         }
-        fn user_review_model(&self) -> Option<String> {
-            self.user_model.map(str::to_string)
+        fn user_config(&self) -> crate::config::file::PartialConfig {
+            let mut config = crate::config::file::PartialConfig {
+                profile: self.user_profile,
+                ..Default::default()
+            };
+            config.agent.model = self.user_model.map(str::to_string);
+            config
         }
         fn existing_system(&self) -> Result<Option<super::SystemFile>, String> {
             let Some(path) = &self.system_path else {
@@ -1729,7 +1812,9 @@ mod tests {
             Some("claude-code/claude-sonnet-5-5")
         );
         assert!(terminal.output.contains("Found on this system"));
-        assert!(terminal.output.contains("sudo pacman -S claude-code"));
+        // No repository has claude-code here, so no pacman command is given.
+        assert!(terminal.output.contains("not root-owned in /usr/bin"));
+        assert!(!terminal.output.contains("sudo pacman -S claude-code"));
     }
 
     #[test]
@@ -1944,6 +2029,7 @@ mod tests {
             opencode: true,
             claude: true,
             gate_opencode: true,
+            claude_in_repo: true,
             test_passes: true,
             ..Fake::default()
         };
@@ -1981,7 +2067,11 @@ mod tests {
 
         run(&mut terminal, &environment).unwrap();
 
-        assert!(terminal.output.contains("no root-owned reviewer to run"));
+        assert!(
+            terminal
+                .output
+                .contains("no root-owned reviewer it can run")
+        );
         assert!(environment.gate_tested.borrow().is_empty());
         assert_eq!(
             written_system(&environment).agent.model.as_deref(),
@@ -2122,6 +2212,11 @@ mod tests {
         run(&mut terminal, &environment).unwrap();
 
         assert!(!environment.installed.get());
+        assert!(
+            terminal
+                .output
+                .contains("The pacman gate gets the review model")
+        );
         assert_eq!(
             written_system(&environment).agent.model.as_deref(),
             Some("anthropic/claude-sonnet-5")
@@ -2220,6 +2315,188 @@ mod tests {
             written_system(&environment).agent.model.as_deref(),
             Some("anthropic/claude-sonnet-5")
         );
+    }
+
+    #[test]
+    fn giving_up_on_the_gate_still_finishes_setup() {
+        let environment = Fake {
+            opencode: true,
+            gate_claude: true.into(),
+            test_passes: true,
+            failing_model: Some("claude-code/claude-sonnet-5-5"),
+            ..Fake::default()
+        };
+        // the gate's default fails; no other choice, then confirm
+        let mut terminal = script(&["", "2", "", "", "", "n", "y"]);
+
+        run(&mut terminal, &environment).unwrap();
+
+        assert!(environment.user_written.borrow().is_some());
+        assert_eq!(
+            written_system(&environment).agent.model.as_deref(),
+            Some("anthropic/claude-sonnet-5")
+        );
+    }
+
+    #[test]
+    fn a_single_failing_gate_option_is_not_retried() {
+        let failing = Fake {
+            opencode: true,
+            gate_opencode: true,
+            no_models: true,
+            test_passes: true,
+            ..Fake::default()
+        };
+        // Only OpenCode's default, and the gate's test of it fails.
+        let gate_fails = GateFails(failing);
+        let mut terminal = script(&["", "", "", "", "y"]);
+        run(&mut terminal, &gate_fails).unwrap();
+        assert_eq!(gate_fails.0.gate_tested.borrow().len(), 1);
+        assert!(!terminal.output.contains("Choose a different reviewer"));
+    }
+
+    /// `Fake` with every gate test failing.
+    struct GateFails(Fake);
+
+    impl Environment for GateFails {
+        fn user_opencode(&self) -> Option<PathBuf> {
+            self.0.user_opencode()
+        }
+        fn system_opencode(&self) -> bool {
+            self.0.system_opencode()
+        }
+        fn user_claude(&self) -> bool {
+            self.0.user_claude()
+        }
+        fn system_claude(&self) -> bool {
+            self.0.system_claude()
+        }
+        fn opencode_version(&self) -> Option<String> {
+            self.0.opencode_version()
+        }
+        fn claude_code_in_repository(&self) -> bool {
+            self.0.claude_code_in_repository()
+        }
+        fn install_claude_code(&self) -> Result<(), String> {
+            self.0.install_claude_code()
+        }
+        fn models(&self) -> Vec<String> {
+            self.0.models()
+        }
+        fn test_review(&self, settings: &AgentSettings) -> Result<Duration, String> {
+            self.0.test_review(settings)
+        }
+        fn test_gate_review(&self, settings: &AgentSettings) -> Result<Duration, String> {
+            self.0.gate_tested.borrow_mut().push(settings.clone());
+            Err("the gate's reviewer could not reach the provider".into())
+        }
+        fn user_config(&self) -> crate::config::file::PartialConfig {
+            self.0.user_config()
+        }
+        fn existing_system(&self) -> Result<Option<super::SystemFile>, String> {
+            self.0.existing_system()
+        }
+        fn write_user(&self, text: &str) -> Result<PathBuf, String> {
+            self.0.write_user(text)
+        }
+        fn write_system(&self, text: &str) -> Result<(), String> {
+            self.0.write_system(text)
+        }
+        fn hook_enabled(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn setup_gate_keeps_the_variants_table() {
+        let (_directory, path) = gate_system_file(
+            "[agent]\nmodel = \"anthropic/claude-sonnet-5\"\n\n[agent.variants]\nmax = \"xhigh\"\nlow = \"low\"\n",
+        );
+        let environment = Fake {
+            gate_claude: true.into(),
+            test_passes: true,
+            system_path: Some(path),
+            ..Fake::default()
+        };
+        let mut terminal = script(&["", "y"]);
+
+        run_gate(&mut terminal, &environment, false).unwrap();
+
+        let system = written_system(&environment);
+        assert_eq!(
+            system.agent.variants,
+            vec![
+                (Thinking::Max, "xhigh".to_string()),
+                (Thinking::Low, "low".to_string())
+            ]
+        );
+        // The official packages' test sent the variant the table maps.
+        let tested = environment.gate_tested.borrow();
+        assert!(
+            tested
+                .iter()
+                .any(|settings| settings.thinking == Thinking::Low
+                    && settings.variant.as_deref() == Some("low"))
+        );
+    }
+
+    #[test]
+    fn setup_gate_if_needed_asks_about_a_free_named_model() {
+        let (_directory, path) = gate_system_file("[agent]\nmodel = \"opencode/big-pickle\"\n");
+        let environment = Fake {
+            opencode: true,
+            gate_opencode: true,
+            listed: Some(vec!["opencode/big-pickle", "anthropic/claude-sonnet-5"]),
+            test_passes: true,
+            system_path: Some(path),
+            ..Fake::default()
+        };
+        let mut terminal = script(&["", "y"]);
+
+        run_gate(&mut terminal, &environment, true).unwrap();
+
+        assert_eq!(
+            written_system(&environment).agent.model.as_deref(),
+            Some("anthropic/claude-sonnet-5")
+        );
+    }
+
+    #[test]
+    fn setup_gate_if_needed_is_quiet_with_nothing_better() {
+        // OpenCode's default is all the gate can run and all it has.
+        let environment = Fake {
+            opencode: true,
+            gate_opencode: true,
+            listed: Some(vec!["opencode/big-pickle"]),
+            ..Fake::default()
+        };
+        let mut terminal = script(&[]);
+        run_gate(&mut terminal, &environment, true).unwrap();
+        assert!(terminal.output.is_empty());
+
+        // Nothing root-owned at all.
+        let environment = Fake {
+            opencode: true,
+            ..Fake::default()
+        };
+        let mut terminal = script(&[]);
+        run_gate(&mut terminal, &environment, true).unwrap();
+        assert!(terminal.output.is_empty());
+    }
+
+    #[test]
+    fn setup_gate_if_needed_respects_a_local_only_user() {
+        let environment = Fake {
+            gate_claude: true.into(),
+            user_profile: Some(Profile::LocalOnly),
+            ..Fake::default()
+        };
+        let mut terminal = script(&[]);
+
+        run_gate(&mut terminal, &environment, true).unwrap();
+
+        assert!(terminal.output.is_empty());
+        assert!(environment.system_written.borrow().is_none());
     }
 
     /// A directory holding a system file with `text`.

@@ -352,12 +352,17 @@ are listed under [How the reviewer is run](review.md#how-the-reviewer-is-run).
   `sudo pacman` first), and OpenCode's models. The choice is tested the way
   the gate runs a review. Last it writes the user file and (with
   confirmation) the root-owned system file.
+  If the gate's test fails and you choose nothing else, setup still finishes
+  and the gate gets the review model, as before.
 - `omarchy-guardian setup --gate [--if-needed]`: only the pacman gate's
-  question, changing only the gate's model, its tested variant and the
-  official-package model (dropped when the gate cannot run it) in the system
-  file, with confirmation. With `--if-needed` it asks nothing while the system
-  file names a model the gate can run; the installer runs it that way when it
-  keeps existing settings.
+  question, changing only the gate's model and the official-package model
+  (dropped when the gate cannot run it) in the system file, with
+  confirmation; `[agent.variants]` is kept, and the test uses it. With
+  `--if-needed` it asks nothing unless the gate cannot run its model, or runs
+  OpenCode's default or a free `opencode/` model, and there is something
+  better to offer; nor when your own file chose local-only and the system file
+  names no profile. The installer runs it that way when it keeps existing
+  settings.
 - `omarchy-guardian config show [--class NAME]`: the effective policy per class,
   each value tagged `profile`, `system` or `user`, plus any ignored user
   values and why. It also prints what the profile makes of low AI remarks,

@@ -489,8 +489,9 @@ user_config=${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-guardian/config.toml
 if [[ -f $user_config ]]; then
     ok "Keeping your settings in $user_config (change them with: omarchy-guardian tui)"
     # A reinstall keeps the settings, but the pacman gate may have no
-    # reviewer it can run (none was root-owned when setup ran, or it is on
-    # OpenCode's free model): ask only that question, and only then.
+    # reviewer it can run (none was root-owned when setup ran) or be on a
+    # free OpenCode model: ask only that question, and only when a better
+    # reviewer is available.
     if has_command "setup [--gate"; then
         omarchy-guardian setup --gate --if-needed ||
             note "The pacman gate's reviewer was not changed; choose one later with: omarchy-guardian setup --gate"
