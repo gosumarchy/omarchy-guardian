@@ -37,7 +37,8 @@
 #   --check            verify and export only; build and install nothing
 #   --keep             keep the private directory and say where it is
 #   --allow-downgrade  install a release older than the installed one
-#   --yes, --reinstall passed on to the release's install.sh
+#   --yes, --reinstall, --allow-snapshot-boot
+#                      passed on to the release's install.sh
 set -euo pipefail
 
 SELF=$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}")
@@ -93,6 +94,7 @@ while (($#)); do
         --keep) KEEP=1 ;;
         --allow-downgrade) ALLOW_DOWNGRADE=1 ;;
         -y | --yes) installer_args+=(--yes) ;;
+        --allow-snapshot-boot) installer_args+=(--allow-snapshot-boot) ;;
         --reinstall) installer_args+=(--reinstall) ;;
         -h | --help)
             /usr/bin/sed -n '2,/^set -euo/{/^#/s/^# \{0,1\}//p}' "$SELF"

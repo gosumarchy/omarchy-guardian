@@ -127,6 +127,11 @@ fn collect() -> Status {
     if let Err(reason) = pacman::preflight(&settings, pacman::system_reviewer_ready(&settings)) {
         issues.push(reason);
     }
+    let read = |path: &str| fs::read_to_string(path).unwrap_or_default();
+    issues.extend(snapshot_boot_issue(
+        &read("/proc/cmdline"),
+        &read("/proc/self/mountinfo"),
+    ));
     issues.extend(quiet_weakenings(&settings, paths.as_ref()));
     if let Some(paths) = &paths {
         issues.extend(overrides_issue(&root_overrides(paths)));
@@ -181,6 +186,36 @@ pub(crate) fn gate_issue(paths: &Paths, integration: Integration, state: &State)
         }
         _ => Some(format!("{} is not fully on", integration.label())),
     }
+}
+
+/// The bar's problem line for a boot whose root keeps nothing: a snapshot
+/// booted from the boot menu, which limine-snapper-sync mounts under an
+/// overlay held in memory. Guardian installed or upgraded there, and every
+/// gate turned on, is gone at the next reboot with no trace in pacman's
+/// log, which lives on its own subvolume.
+fn snapshot_boot_issue(cmdline: &str, mountinfo: &str) -> Option<String> {
+    let subvolume = cmdline
+        .split_whitespace()
+        .filter_map(|word| word.strip_prefix("rootflags="))
+        .flat_map(|flags| flags.split(','))
+        .filter_map(|flag| flag.strip_prefix("subvol="))
+        .find(|subvolume| subvolume.contains("/.snapshots/"));
+    // The last mount on / is the one in use.
+    let overlay = mountinfo
+        .lines()
+        .filter(|line| line.split(' ').nth(4) == Some("/"))
+        .filter_map(|line| line.split_once(" - ")?.1.split(' ').next())
+        .next_back()
+        == Some("overlay");
+    let what = match (subvolume, overlay) {
+        (Some(subvolume), _) => format!("the snapshot {subvolume}"),
+        (None, true) => "an overlay that is not kept".to_string(),
+        (None, false) => return None,
+    };
+    Some(format!(
+        "this boot runs from {what}: Guardian and anything installed now are lost at the next \
+         reboot; restore the snapshot or boot the main entry, then install again"
+    ))
 }
 
 /// Root's results are a few kilobytes; past this the bar leaves them to
@@ -787,6 +822,42 @@ mod tests {
 
     use super::{RECENT_SECS, SEEN, age, last_block, mark_seen_unless_waiting, markup_safe};
     use crate::test_support::TempDir;
+
+    #[test]
+    fn a_snapshot_boot_is_a_problem_because_what_is_installed_there_is_lost() {
+        use super::snapshot_boot_issue;
+
+        let mount = |fstype: &str| {
+            format!(
+                "21 1 0:20 / /proc rw,nosuid - proc proc rw\n\
+                 25 1 0:31 / / rw,relatime - {fstype} /dev/mapper/root rw\n"
+            )
+        };
+        let main = "root=/dev/mapper/root rootflags=subvol=@ rw quiet";
+        let snapshot =
+            "root=/dev/mapper/root rootflags=compress=zstd,subvol=/@/.snapshots/1/snapshot rw";
+
+        assert_eq!(snapshot_boot_issue(main, &mount("btrfs")), None);
+        assert_eq!(snapshot_boot_issue("", ""), None);
+        let issue = snapshot_boot_issue(snapshot, &mount("overlay")).unwrap();
+        assert!(
+            issue.starts_with("this boot runs from the snapshot /@/.snapshots/1/snapshot: "),
+            "{issue}"
+        );
+        assert!(issue.contains("lost at the next reboot"), "{issue}");
+        // An overlay root without a snapshot on the command line is lost too.
+        let issue = snapshot_boot_issue(main, &mount("overlay")).unwrap();
+        assert!(
+            issue.starts_with("this boot runs from an overlay that is not kept: "),
+            "{issue}"
+        );
+        // Only the mount in use counts: the last one on /.
+        let stacked = format!(
+            "{}26 25 0:40 / / rw - btrfs /dev/mapper/root rw\n",
+            mount("overlay")
+        );
+        assert_eq!(snapshot_boot_issue(main, &stacked), None);
+    }
 
     #[test]
     fn what_root_saw_standing_in_for_the_sweeps_units_is_a_problem_of_the_bars() {

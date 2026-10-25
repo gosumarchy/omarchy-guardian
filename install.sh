@@ -19,10 +19,13 @@
 # release without relying on anything in the checkout, this script included,
 # and then starts the verified release's copy of this script.
 #
-# Usage: ./install.sh [--yes] [--reinstall]
+# Usage: ./install.sh [--yes] [--reinstall] [--allow-snapshot-boot]
 #   --yes        answer yes to the installer's own questions and to pacman
 #                (the guided setup still asks its questions)
 #   --reinstall  rebuild and reinstall even when this version is installed
+#   --allow-snapshot-boot
+#                install although this boot runs from a snapshot, where
+#                the install is lost at the next reboot
 #   --verified-by-installed=<tag>:<commit>
 #                given by /usr/lib/omarchy-guardian/upgrade to the export it
 #                made of a release it verified; refused in a git checkout
@@ -32,12 +35,14 @@ ROOT=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd -P)
 PKG_DIR=$ROOT/packaging/arch
 YES=0
 REINSTALL=0
+SNAPSHOT_OK=0
 VERIFIED=''
 
 for arg; do
     case $arg in
         -y | --yes) YES=1 ;;
         --reinstall) REINSTALL=1 ;;
+        --allow-snapshot-boot) SNAPSHOT_OK=1 ;;
         --verified-by-installed=*)
             VERIFIED=${arg#*=}
             if [[ ! $VERIFIED =~ ^v[0-9]+(\.[0-9]+)*(-[0-9]+)?:([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
@@ -97,6 +102,22 @@ for tool in pacman makepkg sudo; do
     command -v "$tool" >/dev/null || fail "$tool is required (this installer is for Arch Linux / Omarchy)."
 done
 ok "Arch Linux with pacman and makepkg"
+
+# A snapshot booted from the boot menu runs under an overlay held in memory:
+# the package, its hooks and every gate would be gone at the next reboot,
+# with nothing in pacman's log (its own subvolume) to say so.
+snapshot=$(tr ' ' '\n' </proc/cmdline | sed -n 's/^rootflags=//p' | tr ',' '\n' |
+    sed -n 's/^subvol=//p' | grep -F '/.snapshots/' || true)
+root_type=$(findmnt -no FSTYPE / 2>/dev/null | tail -n 1 || true)
+if [[ -n $snapshot || $root_type == overlay ]]; then
+    where=${snapshot:+the snapshot $snapshot}
+    where=${where:-an overlay that is not kept}
+    if ((SNAPSHOT_OK)); then
+        note "This boot runs from $where: this install is lost at the next reboot."
+    else
+        fail "This boot runs from $where: anything installed now, Guardian included, is lost at the next reboot. Restore the snapshot or boot the main entry, then run the installer again (or pass --allow-snapshot-boot to install for this boot only)."
+    fi
+fi
 
 if command -v cargo >/dev/null; then
     ok "Rust toolchain: $(cargo --version)"
