@@ -25,7 +25,9 @@
 #   --reinstall  rebuild and reinstall even when this version is installed
 #   --allow-snapshot-boot
 #                install although this boot runs from a snapshot, where
-#                the install is lost at the next reboot
+#                the install is lost at the next reboot; the environment
+#                variable OMARCHY_GUARDIAN_ALLOW_SNAPSHOT_BOOT=1 does the
+#                same through an upgrade that does not know the option
 #   --verified-by-installed=<tag>:<commit>
 #                given by /usr/lib/omarchy-guardian/upgrade to the export it
 #                made of a release it verified; refused in a git checkout
@@ -36,6 +38,7 @@ PKG_DIR=$ROOT/packaging/arch
 YES=0
 REINSTALL=0
 SNAPSHOT_OK=0
+[[ ${OMARCHY_GUARDIAN_ALLOW_SNAPSHOT_BOOT-} == 1 ]] && SNAPSHOT_OK=1
 VERIFIED=''
 
 for arg; do
@@ -103,19 +106,18 @@ for tool in pacman makepkg sudo; do
 done
 ok "Arch Linux with pacman and makepkg"
 
-# A snapshot booted from the boot menu runs under an overlay held in memory:
-# the package, its hooks and every gate would be gone at the next reboot,
-# with nothing in pacman's log (its own subvolume) to say so.
-snapshot=$(tr ' ' '\n' </proc/cmdline | sed -n 's/^rootflags=//p' | tr ',' '\n' |
-    sed -n 's/^subvol=//p' | grep -F '/.snapshots/' || true)
-root_type=$(findmnt -no FSTYPE / 2>/dev/null | tail -n 1 || true)
-if [[ -n $snapshot || $root_type == overlay ]]; then
-    where=${snapshot:+the snapshot $snapshot}
-    where=${where:-an overlay that is not kept}
+# A snapshot booted from the boot menu (a subvolume under .snapshots/, in
+# snapper's /@/.snapshots/N or archinstall's flat /@.snapshots/N layout):
+# the package, its hooks and every gate are gone once the main entry boots
+# again, with nothing in pacman's log (its own subvolume) to say so. The
+# kernel takes the last rootflags=, and btrfs the last subvol=.
+snapshot=$(tr ' ' '\n' </proc/cmdline | sed -n 's/^rootflags=//p' | tail -n 1 |
+    tr ',' '\n' | sed -n 's/^subvol=//p' | tail -n 1 | grep -F '.snapshots/' || true)
+if [[ -n $snapshot ]]; then
     if ((SNAPSHOT_OK)); then
-        note "This boot runs from $where: this install is lost at the next reboot."
+        note "This boot runs from the snapshot $snapshot: this install is lost at the next reboot."
     else
-        fail "This boot runs from $where: anything installed now, Guardian included, is lost at the next reboot. Restore the snapshot or boot the main entry, then run the installer again (or pass --allow-snapshot-boot to install for this boot only)."
+        fail "This boot runs from the snapshot $snapshot: anything installed now, Guardian included, is lost at the next reboot. Restore the snapshot or boot the main entry, then run the installer again (or pass --allow-snapshot-boot, or set OMARCHY_GUARDIAN_ALLOW_SNAPSHOT_BOOT=1, to install for this boot only)."
     fi
 fi
 

@@ -62,12 +62,14 @@ Guardian reviews the new package like any other local archive before pacman
 installs it.
 
 The installer stops when this boot runs from a snapshot, as one picked from
-Limine's snapshot entries does: that root sits under an overlay held in
-memory, so the package, its hooks and every gate are gone at the next reboot,
+Limine's snapshot entries does (a root subvolume under `.snapshots/`): the
+package, its hooks and every gate are gone once the main entry boots again,
 and pacman's log, on its own subvolume, keeps no trace of the removal.
-Restore the snapshot or boot the main entry first;
-`./install.sh --allow-snapshot-boot` installs for this boot only. The bar
-widgets show the same problem while Guardian runs on such a boot.
+Restore the snapshot or boot the main entry first.
+`./install.sh --allow-snapshot-boot`, or `OMARCHY_GUARDIAN_ALLOW_SNAPSHOT_BOOT=1`
+in the environment (which also reaches the installer through an older
+`upgrade`), installs for this boot only. The bar widgets show the same
+problem while Guardian runs on such a boot.
 
 ## Upgrading
 
@@ -112,8 +114,8 @@ treats the checkout as data it does not trust:
   hole that a later one closed is signed too. `--allow-downgrade` overrides
   that.
 - Then it starts the exported release's own `install.sh`, which is signed
-  content, and passes `--yes`, `--reinstall` and `--allow-snapshot-boot` on
-  to it.
+  content, and passes `--yes` and `--reinstall` on to it, and
+  `--allow-snapshot-boot` when that release knows it.
 
 ### Options
 

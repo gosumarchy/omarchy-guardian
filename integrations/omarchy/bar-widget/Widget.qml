@@ -1,5 +1,5 @@
 // Omarchy Guardian in the bar: a shield that shows whether Guardian protects
-// this machine, turning the bar's urgent colour when something needs
+// this machine, turning the theme's red when something needs
 // attention (a gate is off, a setting is broken, or a recent block has not
 // been looked at) and dim when protection is off. Clicking opens a panel
 // with the details and a few actions; everything else stays in the settings
@@ -8,6 +8,7 @@
 // All data comes from `omarchy-guardian status`, a local command; the widget
 // runs nothing else except the actions the user clicks.
 import QtQuick
+import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -35,6 +36,12 @@ Panel {
   readonly property var issues: status ? status.issues : []
   readonly property var block: status ? status.last_block : null
   readonly property var update: status && status.update ? status.update : null
+  // A gate that is there to turn on and is not: what Protect can fix. Other
+  // problems (a snapshot boot, a stopped sweep) are not fixed by turning
+  // the gates on again.
+  readonly property bool gateOff: gates.some(function(gate) {
+    return gate.state !== "on" && gate.state !== "unavailable"
+  })
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -149,6 +156,12 @@ Panel {
         if (key === "s") root.openSettings()
         else if (key === "r") root.refresh()
       }
+      // The catcher takes the arrows and j/k before the Flickable does.
+      onMoveRequested: function(dx, dy) {
+        if (dy === 0) return
+        var bottom = Math.max(0, scroller.contentHeight - scroller.height)
+        scroller.contentY = Math.max(0, Math.min(bottom, scroller.contentY + dy * Style.space(48)))
+      }
 
       Flickable {
         id: scroller
@@ -157,6 +170,9 @@ Panel {
         contentHeight: column.implicitHeight
         clip: true
         boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.VerticalFlick
+        interactive: contentHeight > height
+        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
         Column {
           id: column
@@ -291,9 +307,9 @@ Panel {
             }
             Tile {
               width: tiles.tileWidth
-              glyph: root.state === "off" || root.issues.length > 0 ? "󰒃" : "󰦞"
-              label: root.state === "off" || root.issues.length > 0 ? "Protect" : "Turn off"
-              onActivated: root.state === "off" || root.issues.length > 0
+              glyph: root.state === "off" || root.gateOff ? "󰒃" : "󰦞"
+              label: root.state === "off" || root.gateOff ? "Protect" : "Turn off"
+              onActivated: root.state === "off" || root.gateOff
                 ? root.inTerminal("omarchy-guardian protect")
                 : root.inTerminal("omarchy-guardian protect --off")
             }
