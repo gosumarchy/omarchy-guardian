@@ -477,20 +477,27 @@ fi
 ###############################################################################
 step "Settings"
 ###############################################################################
-user_config=${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-guardian/config.toml
-if [[ -f $user_config ]]; then
-    ok "Keeping your settings in $user_config (change them with: omarchy-guardian tui)"
-else
-    omarchy-guardian setup || fail "Setup did not finish; run the installer again, or: omarchy-guardian setup"
-fi
-
-# `protect` and `test` arrived in 0.4.2; an older installed Guardian (the
-# build was skipped) has neither.
+# `protect` and `test` arrived in 0.4.2, `setup --gate` later; an older
+# installed Guardian (the build was skipped) has none of them.
 has_command() {
     local usage
     usage=$(omarchy-guardian 2>&1 || true)
     [[ $usage == *"omarchy-guardian $1 "* ]]
 }
+
+user_config=${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-guardian/config.toml
+if [[ -f $user_config ]]; then
+    ok "Keeping your settings in $user_config (change them with: omarchy-guardian tui)"
+    # A reinstall keeps the settings, but the pacman gate may have no
+    # reviewer it can run (none was root-owned when setup ran, or it is on
+    # OpenCode's free model): ask only that question, and only then.
+    if has_command "setup [--gate"; then
+        omarchy-guardian setup --gate --if-needed ||
+            note "The pacman gate's reviewer was not changed; choose one later with: omarchy-guardian setup --gate"
+    fi
+else
+    omarchy-guardian setup || fail "Setup did not finish; run the installer again, or: omarchy-guardian setup"
+fi
 
 ###############################################################################
 step "Turning protection on"

@@ -48,7 +48,10 @@ cd omarchy-guardian
 The installer checks for a Rust toolchain (rustup's `cargo` is fine), builds
 and tests the package, installs it with pacman, makes sure there is an AI
 reviewer (it offers `claude-code`, or `extra/opencode` where no repository
-has that package), runs the guided setup on a first install, turns every gate
+has that package), runs the guided setup on a first install (on a reinstall
+it keeps your settings and asks only which reviewer the pacman gate uses, and
+only when the gate has none it can run: `omarchy-guardian setup --gate
+--if-needed`), turns every gate
 on with `omarchy-guardian protect` after showing each step, and tests the
 reviewer with a malicious and a harmless sample. If it has to install the
 reviewer, it stops there: log in once (run `claude`, or set up a provider in

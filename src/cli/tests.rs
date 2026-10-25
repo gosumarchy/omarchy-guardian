@@ -679,8 +679,29 @@ fn parses_config_subcommands() {
 
 #[test]
 fn parses_setup() {
-    assert_eq!(parse(&args(&["setup"])).unwrap(), Invocation::Setup);
+    assert_eq!(
+        parse(&args(&["setup"])).unwrap(),
+        Invocation::Setup {
+            gate: false,
+            if_needed: false
+        }
+    );
+    assert_eq!(
+        parse(&args(&["setup", "--gate"])).unwrap(),
+        Invocation::Setup {
+            gate: true,
+            if_needed: false
+        }
+    );
+    assert_eq!(
+        parse(&args(&["setup", "--gate", "--if-needed"])).unwrap(),
+        Invocation::Setup {
+            gate: true,
+            if_needed: true
+        }
+    );
     assert!(parse(&args(&["setup", "extra"])).is_err());
+    assert!(parse(&args(&["setup", "--if-needed"])).is_err());
     assert_eq!(
         parse(&args(&["protect"])).unwrap(),
         Invocation::Protect {

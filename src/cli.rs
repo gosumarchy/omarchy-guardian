@@ -92,7 +92,11 @@ pub(crate) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
         Invocation::HookPreflight => preflight_command(&settings),
         Invocation::Config(command) => config_command(&command, &settings),
         Invocation::Forget(forget) => forget_command(&forget, Store::default_root()),
-        Invocation::Setup => match setup::run(&mut setup::TtyTerminal, &setup::RealEnvironment) {
+        Invocation::Setup { gate, if_needed } => match if gate {
+            setup::run_gate(&mut setup::TtyTerminal, &setup::RealEnvironment, if_needed)
+        } else {
+            setup::run(&mut setup::TtyTerminal, &setup::RealEnvironment)
+        } {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {
                 errln!("omarchy-guardian setup: {message}");

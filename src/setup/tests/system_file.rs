@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::super::{
-    Choice, HEADER, MAX_SYSTEM_FILE, PRIVILEGED_COMMUNITY, Place, USER_CLASSES, render_system,
-    render_user, run, set_sweep_root_at, tested_variant, with_accepted_at, write_system_at,
+    Choice, Gate, HEADER, MAX_SYSTEM_FILE, PRIVILEGED_COMMUNITY, Place, USER_CLASSES,
+    render_system, render_user, run, set_sweep_root_at, tested_variant, with_accepted_at,
+    write_system_at,
 };
 use super::super::{insecure_refusal, load_system};
 use super::{Fake, script};
@@ -205,6 +206,10 @@ fn setup_changes_only_the_keys_it_asks_about() {
         model: None,
         official_model: Some("anthropic/claude-haiku-4-5".into()),
         thinking: Thinking::Default,
+        gate: Gate {
+            model: None,
+            official_model: Some("anthropic/claude-haiku-4-5".into()),
+        },
     };
 
     let merged = super::super::system_config(&choice, parsed(ADMIN));
@@ -427,6 +432,10 @@ fn without_a_system_file_one_is_created_as_before() {
         model: Some("anthropic/claude-sonnet-5".into()),
         official_model: Some("anthropic/claude-haiku-4-5".into()),
         thinking: Thinking::High,
+        gate: Gate {
+            model: Some("anthropic/claude-sonnet-5".into()),
+            official_model: Some("anthropic/claude-haiku-4-5".into()),
+        },
     };
     assert_eq!(
         environment.system_written.borrow().as_deref(),
@@ -444,7 +453,12 @@ fn without_a_system_file_one_is_created_as_before() {
 fn written_by_hand(choice: &Choice, classes: &[SourceClass], official_model: bool) -> String {
     let mut text = format!("{HEADER}profile = \"{}\"\n", choice.profile.name());
 
-    if let Some(model) = &choice.model {
+    let model = if official_model {
+        &choice.gate.model
+    } else {
+        &choice.model
+    };
+    if let Some(model) = model {
         let _ = write!(text, "\n[agent]\nmodel = \"{model}\"\n");
     }
     if let Some(level) = tested_variant(choice) {
@@ -455,7 +469,7 @@ fn written_by_hand(choice: &Choice, classes: &[SourceClass], official_model: boo
             level.name()
         );
     }
-    if official_model && let Some(model) = &choice.official_model {
+    if official_model && let Some(model) = &choice.gate.official_model {
         let _ = write!(text, "\n[class.official]\nmodel = \"{model}\"\n");
     }
     if choice.profile != Profile::LocalOnly {
@@ -489,6 +503,10 @@ fn every_choice_renders_the_files_it_always_did() {
                         model: model.clone(),
                         official_model: official_model.clone(),
                         thinking,
+                        gate: Gate {
+                            model: model.clone(),
+                            official_model: official_model.clone(),
+                        },
                     };
                     assert_eq!(
                         render_user(&choice),
