@@ -1,5 +1,5 @@
 // Omarchy Guardian in the bar: a shield that shows whether Guardian protects
-// this machine, turning the bar's urgent colour when something needs
+// this machine, turning the theme's red when something needs
 // attention (a gate is off, a setting is broken, or a recent block has not
 // been looked at) and dim when protection is off. Clicking opens a panel
 // with the details and a few actions; everything else stays in the settings
@@ -8,6 +8,7 @@
 // All data comes from `omarchy-guardian status`, a local command; the widget
 // runs nothing else except the actions the user clicks.
 import QtQuick
+import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -18,7 +19,10 @@ Panel {
   moduleName: "omarchy-guardian"
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
-  readonly property color urgent: bar ? bar.urgent : Color.urgent
+  // The theme's red, not the bar's: the bar's urgent colour is its "active"
+  // role, which themes such as BlackTurq set to their accent, so a problem
+  // would look the same as everything being fine.
+  readonly property color urgent: Color.urgent
   readonly property color accent: Color.accent
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
@@ -32,6 +36,12 @@ Panel {
   readonly property var issues: status ? status.issues : []
   readonly property var block: status ? status.last_block : null
   readonly property var update: status && status.update ? status.update : null
+  // A gate that is there to turn on and is not: what Protect can fix. Other
+  // problems (a snapshot boot, a stopped sweep) are not fixed by turning
+  // the gates on again.
+  readonly property bool gateOff: gates.some(function(gate) {
+    return gate.state !== "on" && gate.state !== "unavailable"
+  })
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -116,6 +126,7 @@ Panel {
     bar: root.bar
     text: "󰒃"
     active: root.state === "attention"
+    activeColor: root.urgent
     dimmed: root.state === "off" || root.state === "unknown"
     tooltipText: "Guardian: " + root.headline()
     onPressed: function(code) {
@@ -133,7 +144,9 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(360))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(560))
+    // As tall as the screen allows; the content scrolls past that, so a long
+    // gate detail or block title never spills out of the card.
+    contentHeight: panel.fittedContentHeight(column.implicitHeight)
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -143,151 +156,169 @@ Panel {
         if (key === "s") root.openSettings()
         else if (key === "r") root.refresh()
       }
+      // The catcher takes the arrows and j/k before the Flickable does.
+      onMoveRequested: function(dx, dy) {
+        if (dy === 0) return
+        var bottom = Math.max(0, scroller.contentHeight - scroller.height)
+        scroller.contentY = Math.max(0, Math.min(bottom, scroller.contentY + dy * Style.space(48)))
+      }
 
-      Column {
-        id: column
-        width: parent.width
-        spacing: Style.space(12)
-
-        PanelHero {
-          width: parent.width
-          title: "Guardian"
-          meta: root.status
-            ? (root.levelName(root.status.profile) + " · " + root.status.model).toUpperCase()
-            : root.lastError.toUpperCase()
-          foreground: root.foreground
-          fontFamily: root.fontFamily
-          iconComponent: Component {
-            Image {
-              width: Style.font.display * 1.6
-              height: Style.font.display * 1.6
-              sourceSize.width: 128
-              sourceSize.height: 128
-              smooth: false
-              source: root.state === "attention"
-                ? "file:///usr/share/icons/hicolor/scalable/apps/omarchy-guardian-alert.svg"
-                : "file:///usr/share/icons/hicolor/scalable/apps/omarchy-guardian.svg"
-              opacity: root.state === "off" ? 0.5 : 1
-            }
-          }
-        }
-
-        StatusRow {
-          width: parent.width
-          label: root.headline()
-          value: root.state === "ok" ? "PROTECTED" : (root.state === "off" ? "OFF" : "CHECK")
-          valueColor: root.state === "ok" ? root.accent : root.urgent
-          bold: true
-        }
-
-        PanelSeparator { width: parent.width; foreground: root.foreground }
-
-        PanelSectionHeader { width: parent.width; text: "GATES"; foreground: root.foreground; fontFamily: root.fontFamily }
-        Repeater {
-          model: root.gates
-          delegate: StatusRow {
-            required property var modelData
-            width: column.width
-            label: modelData.label
-            detail: modelData.detail
-            value: modelData.state === "on" ? "ON" : (modelData.state === "unavailable" ? "N/A" : modelData.state.toUpperCase())
-            valueColor: modelData.state === "on" ? root.accent : (modelData.state === "unavailable" ? root.dim : root.urgent)
-          }
-        }
+      Flickable {
+        id: scroller
+        anchors.fill: parent
+        contentWidth: width
+        contentHeight: column.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.VerticalFlick
+        interactive: contentHeight > height
+        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
         Column {
-          width: parent.width
-          spacing: Style.space(8)
-          visible: root.issues.length > 0
+          id: column
+          width: scroller.width
+          spacing: Style.space(12)
+
+          PanelHero {
+            width: parent.width
+            title: "Guardian"
+            meta: root.status
+              ? (root.levelName(root.status.profile) + " · " + root.status.model).toUpperCase()
+              : root.lastError.toUpperCase()
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            iconComponent: Component {
+              Image {
+                width: Style.font.display * 1.6
+                height: Style.font.display * 1.6
+                sourceSize.width: 128
+                sourceSize.height: 128
+                smooth: false
+                source: root.state === "attention"
+                  ? "file:///usr/share/icons/hicolor/scalable/apps/omarchy-guardian-alert.svg"
+                  : "file:///usr/share/icons/hicolor/scalable/apps/omarchy-guardian.svg"
+                opacity: root.state === "off" ? 0.5 : 1
+              }
+            }
+          }
+
+          StatusRow {
+            width: parent.width
+            label: root.headline()
+            value: root.state === "ok" ? "PROTECTED" : (root.state === "off" ? "OFF" : "CHECK")
+            valueColor: root.state === "ok" ? root.accent : root.urgent
+            bold: true
+          }
+
           PanelSeparator { width: parent.width; foreground: root.foreground }
-          PanelSectionHeader { width: parent.width; text: "NEEDS FIXING"; foreground: root.foreground; fontFamily: root.fontFamily }
+
+          PanelSectionHeader { width: parent.width; text: "GATES"; foreground: root.foreground; fontFamily: root.fontFamily }
           Repeater {
-            model: root.issues
-            delegate: Text {
+            model: root.gates
+            delegate: StatusRow {
               required property var modelData
+              width: column.width
+              label: modelData.label
+              detail: modelData.detail
+              value: modelData.state === "on" ? "ON" : (modelData.state === "unavailable" ? "N/A" : modelData.state.toUpperCase())
+              valueColor: modelData.state === "on" ? root.accent : (modelData.state === "unavailable" ? root.dim : root.urgent)
+            }
+          }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(8)
+            visible: root.issues.length > 0
+            PanelSeparator { width: parent.width; foreground: root.foreground }
+            PanelSectionHeader { width: parent.width; text: "NEEDS FIXING"; foreground: root.foreground; fontFamily: root.fontFamily }
+            Repeater {
+              model: root.issues
+              delegate: Text {
+                required property var modelData
+                textFormat: Text.PlainText
+                width: column.width
+                text: modelData
+                color: root.urgent
+                wrapMode: Text.WordWrap
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+            }
+          }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(8)
+            visible: root.update !== null
+            PanelSeparator { width: parent.width; foreground: root.foreground }
+            PanelSectionHeader { width: parent.width; text: "UPDATE"; foreground: root.foreground; fontFamily: root.fontFamily }
+            Text {
               textFormat: Text.PlainText
               width: column.width
-              text: modelData
-              color: root.urgent
+              text: root.update ? "Guardian " + root.update.version + " is available. To upgrade, " + root.update.how : ""
+              color: root.foreground
               wrapMode: Text.WordWrap
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
             }
           }
-        }
 
-        Column {
-          width: parent.width
-          spacing: Style.space(8)
-          visible: root.update !== null
-          PanelSeparator { width: parent.width; foreground: root.foreground }
-          PanelSectionHeader { width: parent.width; text: "UPDATE"; foreground: root.foreground; fontFamily: root.fontFamily }
-          Text {
-            textFormat: Text.PlainText
-            width: column.width
-            text: root.update ? "Guardian " + root.update.version + " is available. To upgrade, " + root.update.how : ""
-            color: root.foreground
-            wrapMode: Text.WordWrap
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-          }
-        }
-
-        Column {
-          width: parent.width
-          spacing: Style.space(8)
-          visible: root.block !== null
-          PanelSeparator { width: parent.width; foreground: root.foreground }
-          StatusRow {
+          Column {
             width: parent.width
-            label: "LAST BLOCK"
-            labelColor: root.dim
-            small: true
-            value: root.block ? root.age(root.block.age_secs).toUpperCase() : ""
-            valueColor: root.block && root.block.unseen ? root.urgent : root.dim
-          }
-          Text {
-            textFormat: Text.PlainText
-            width: parent.width
-            text: root.block ? root.block.title.replace(/^Guardian blocked /, "Blocked ") : ""
-            color: root.foreground
-            wrapMode: Text.WordWrap
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.body
-          }
-        }
-
-        PanelSeparator { width: parent.width; foreground: root.foreground }
-
-        Row {
-          id: tiles
-          width: parent.width
-          spacing: Style.space(10)
-          readonly property real tileWidth: (width - spacing * 2) / 3
-
-          Tile {
-            width: tiles.tileWidth
-            glyph: "󰈙"
-            label: "Report"
-            enabled: root.block !== null
-            onActivated: {
-              if (root.block && root.block.unseen) Quickshell.execDetached(["omarchy-guardian", "status", "--dismiss"])
-              root.run(["omarchy-launch-browser", "file://" + root.block.report])
+            spacing: Style.space(8)
+            visible: root.block !== null
+            PanelSeparator { width: parent.width; foreground: root.foreground }
+            StatusRow {
+              width: parent.width
+              label: "LAST BLOCK"
+              labelColor: root.dim
+              small: true
+              value: root.block ? root.age(root.block.age_secs).toUpperCase() : ""
+              valueColor: root.block && root.block.unseen ? root.urgent : root.dim
+            }
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              text: root.block ? root.block.title.replace(/^Guardian blocked /, "Blocked ") : ""
+              color: root.foreground
+              wrapMode: Text.WordWrap
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
             }
           }
-          Tile {
-            width: tiles.tileWidth
-            glyph: root.state === "off" || root.issues.length > 0 ? "󰒃" : "󰦞"
-            label: root.state === "off" || root.issues.length > 0 ? "Protect" : "Turn off"
-            onActivated: root.state === "off" || root.issues.length > 0
-              ? root.inTerminal("omarchy-guardian protect")
-              : root.inTerminal("omarchy-guardian protect --off")
-          }
-          Tile {
-            width: tiles.tileWidth
-            glyph: "󰒓"
-            label: "Settings"
-            onActivated: root.openSettings()
+
+          PanelSeparator { width: parent.width; foreground: root.foreground }
+
+          Row {
+            id: tiles
+            width: parent.width
+            spacing: Style.space(10)
+            readonly property real tileWidth: (width - spacing * 2) / 3
+
+            Tile {
+              width: tiles.tileWidth
+              glyph: "󰈙"
+              label: "Report"
+              enabled: root.block !== null
+              onActivated: {
+                if (root.block && root.block.unseen) Quickshell.execDetached(["omarchy-guardian", "status", "--dismiss"])
+                root.run(["omarchy-launch-browser", "file://" + root.block.report])
+              }
+            }
+            Tile {
+              width: tiles.tileWidth
+              glyph: root.state === "off" || root.gateOff ? "󰒃" : "󰦞"
+              label: root.state === "off" || root.gateOff ? "Protect" : "Turn off"
+              onActivated: root.state === "off" || root.gateOff
+                ? root.inTerminal("omarchy-guardian protect")
+                : root.inTerminal("omarchy-guardian protect --off")
+            }
+            Tile {
+              width: tiles.tileWidth
+              glyph: "󰒓"
+              label: "Settings"
+              onActivated: root.openSettings()
+            }
           }
         }
       }

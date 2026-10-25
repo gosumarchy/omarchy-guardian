@@ -19,10 +19,15 @@
 # release without relying on anything in the checkout, this script included,
 # and then starts the verified release's copy of this script.
 #
-# Usage: ./install.sh [--yes] [--reinstall]
+# Usage: ./install.sh [--yes] [--reinstall] [--allow-snapshot-boot]
 #   --yes        answer yes to the installer's own questions and to pacman
 #                (the guided setup still asks its questions)
 #   --reinstall  rebuild and reinstall even when this version is installed
+#   --allow-snapshot-boot
+#                install although this boot runs from a snapshot, where
+#                the install is lost at the next reboot; the environment
+#                variable OMARCHY_GUARDIAN_ALLOW_SNAPSHOT_BOOT=1 does the
+#                same through an upgrade that does not know the option
 #   --verified-by-installed=<tag>:<commit>
 #                given by /usr/lib/omarchy-guardian/upgrade to the export it
 #                made of a release it verified; refused in a git checkout
@@ -32,12 +37,15 @@ ROOT=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd -P)
 PKG_DIR=$ROOT/packaging/arch
 YES=0
 REINSTALL=0
+SNAPSHOT_OK=0
+[[ ${OMARCHY_GUARDIAN_ALLOW_SNAPSHOT_BOOT-} == 1 ]] && SNAPSHOT_OK=1
 VERIFIED=''
 
 for arg; do
     case $arg in
         -y | --yes) YES=1 ;;
         --reinstall) REINSTALL=1 ;;
+        --allow-snapshot-boot) SNAPSHOT_OK=1 ;;
         --verified-by-installed=*)
             VERIFIED=${arg#*=}
             if [[ ! $VERIFIED =~ ^v[0-9]+(\.[0-9]+)*(-[0-9]+)?:([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
@@ -97,6 +105,21 @@ for tool in pacman makepkg sudo; do
     command -v "$tool" >/dev/null || fail "$tool is required (this installer is for Arch Linux / Omarchy)."
 done
 ok "Arch Linux with pacman and makepkg"
+
+# A snapshot booted from the boot menu (a subvolume under .snapshots/, in
+# snapper's /@/.snapshots/N or archinstall's flat /@.snapshots/N layout):
+# the package, its hooks and every gate are gone once the main entry boots
+# again, with nothing in pacman's log (its own subvolume) to say so. The
+# kernel takes the last rootflags=, and btrfs the last subvol=.
+snapshot=$(tr ' ' '\n' </proc/cmdline | sed -n 's/^rootflags=//p' | tail -n 1 |
+    tr ',' '\n' | sed -n 's/^subvol=//p' | tail -n 1 | grep -F '.snapshots/' || true)
+if [[ -n $snapshot ]]; then
+    if ((SNAPSHOT_OK)); then
+        note "This boot runs from the snapshot $snapshot: this install is lost at the next reboot."
+    else
+        fail "This boot runs from the snapshot $snapshot: anything installed now, Guardian included, is lost at the next reboot. Restore the snapshot or boot the main entry, then run the installer again (or pass --allow-snapshot-boot, or set OMARCHY_GUARDIAN_ALLOW_SNAPSHOT_BOOT=1, to install for this boot only)."
+    fi
+fi
 
 if command -v cargo >/dev/null; then
     ok "Rust toolchain: $(cargo --version)"

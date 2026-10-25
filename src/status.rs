@@ -127,6 +127,9 @@ fn collect() -> Status {
     if let Err(reason) = pacman::preflight(&settings, pacman::system_reviewer_ready(&settings)) {
         issues.push(reason);
     }
+    issues.extend(snapshot_boot_issue(
+        &fs::read_to_string("/proc/cmdline").unwrap_or_default(),
+    ));
     issues.extend(quiet_weakenings(&settings, paths.as_ref()));
     if let Some(paths) = &paths {
         issues.extend(overrides_issue(&root_overrides(paths)));
@@ -181,6 +184,30 @@ pub(crate) fn gate_issue(paths: &Paths, integration: Integration, state: &State)
         }
         _ => Some(format!("{} is not fully on", integration.label())),
     }
+}
+
+/// The bar's problem line for a boot from a snapshot, as picked from
+/// Limine's snapshot entries: the kernel mounts a subvolume under
+/// `.snapshots/` (snapper's `/@/.snapshots/N/snapshot`, or archinstall's
+/// flat `/@.snapshots/N/snapshot`) as root. Guardian installed or upgraded
+/// there, and every gate turned on, is gone once the main entry boots
+/// again, with no trace in pacman's log, which lives on its own subvolume.
+/// Only the command line is read: an overlay root on its own is as often a
+/// container's lasting image as a boot that keeps nothing.
+fn snapshot_boot_issue(cmdline: &str) -> Option<String> {
+    // The kernel takes the last `rootflags=`, and btrfs the last `subvol=`.
+    let subvolume = cmdline
+        .split_whitespace()
+        .filter_map(|word| word.strip_prefix("rootflags="))
+        .next_back()?
+        .split(',')
+        .filter_map(|flag| flag.strip_prefix("subvol="))
+        .next_back()
+        .filter(|subvolume| subvolume.contains(".snapshots/"))?;
+    Some(format!(
+        "this boot runs from the snapshot {subvolume}: Guardian and anything installed now are \
+         lost at the next reboot; restore the snapshot or boot the main entry, then install again"
+    ))
 }
 
 /// Root's results are a few kilobytes; past this the bar leaves them to
@@ -787,6 +814,47 @@ mod tests {
 
     use super::{RECENT_SECS, SEEN, age, last_block, mark_seen_unless_waiting, markup_safe};
     use crate::test_support::TempDir;
+
+    #[test]
+    fn a_snapshot_boot_is_a_problem_because_what_is_installed_there_is_lost() {
+        use super::snapshot_boot_issue;
+
+        let main = "root=/dev/mapper/root rootflags=subvol=@ rw quiet";
+        assert_eq!(snapshot_boot_issue(main), None);
+        assert_eq!(snapshot_boot_issue(""), None);
+        let issue = snapshot_boot_issue(
+            "root=/dev/mapper/root rootflags=compress=zstd,subvol=/@/.snapshots/1/snapshot rw",
+        )
+        .unwrap();
+        assert!(
+            issue.starts_with("this boot runs from the snapshot /@/.snapshots/1/snapshot: "),
+            "{issue}"
+        );
+        assert!(issue.contains("lost at the next reboot"), "{issue}");
+        // archinstall's flat layout keeps snapshots beside @, not in it.
+        let flat = snapshot_boot_issue("rootflags=subvol=/@.snapshots/4/snapshot").unwrap();
+        assert!(
+            flat.contains("the snapshot /@.snapshots/4/snapshot: "),
+            "{flat}"
+        );
+        // The kernel takes the last rootflags, and btrfs the last subvol.
+        assert_eq!(
+            snapshot_boot_issue("rootflags=subvol=/@/.snapshots/3/snapshot rootflags=subvol=@"),
+            None
+        );
+        assert_eq!(
+            snapshot_boot_issue("rootflags=subvol=/@/.snapshots/3/snapshot,subvol=@"),
+            None
+        );
+        let last = snapshot_boot_issue(
+            "rootflags=subvol=/@/.snapshots/2/snapshot rootflags=subvol=/@/.snapshots/5/snapshot",
+        )
+        .unwrap();
+        assert!(
+            last.contains("the snapshot /@/.snapshots/5/snapshot: "),
+            "{last}"
+        );
+    }
 
     #[test]
     fn what_root_saw_standing_in_for_the_sweeps_units_is_a_problem_of_the_bars() {

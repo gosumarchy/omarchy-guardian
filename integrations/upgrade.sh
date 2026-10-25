@@ -37,7 +37,8 @@
 #   --check            verify and export only; build and install nothing
 #   --keep             keep the private directory and say where it is
 #   --allow-downgrade  install a release older than the installed one
-#   --yes, --reinstall passed on to the release's install.sh
+#   --yes, --reinstall, --allow-snapshot-boot
+#                      passed on to the release's install.sh
 set -euo pipefail
 
 SELF=$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}")
@@ -85,6 +86,7 @@ fi
 CHECK_ONLY=0
 KEEP=0
 ALLOW_DOWNGRADE=0
+ALLOW_SNAPSHOT_BOOT=0
 installer_args=()
 positional=()
 while (($#)); do
@@ -93,6 +95,7 @@ while (($#)); do
         --keep) KEEP=1 ;;
         --allow-downgrade) ALLOW_DOWNGRADE=1 ;;
         -y | --yes) installer_args+=(--yes) ;;
+        --allow-snapshot-boot) ALLOW_SNAPSHOT_BOOT=1 ;;
         --reinstall) installer_args+=(--reinstall) ;;
         -h | --help)
             /usr/bin/sed -n '2,/^set -euo/{/^#/s/^# \{0,1\}//p}' "$SELF"
@@ -409,6 +412,15 @@ fi
 # before it knew the option is started without it, and asks.
 if /usr/bin/grep -q -- '--verified-by-installed' "$EXPORT/install.sh"; then
     installer_args+=("--verified-by-installed=$TAG:$RELEASE_COMMIT")
+fi
+# Likewise a release from before --allow-snapshot-boot would stop on it as
+# an unknown option; one that knows it also reads the environment variable.
+if ((ALLOW_SNAPSHOT_BOOT)); then
+    if /usr/bin/grep -q -- '--allow-snapshot-boot' "$EXPORT/install.sh"; then
+        installer_args+=(--allow-snapshot-boot)
+    else
+        printf 'upgrade: %s does not know --allow-snapshot-boot; installing without it\n' "$TAG" >&2
+    fi
 fi
 status=0
 (
