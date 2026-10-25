@@ -106,6 +106,30 @@ pub(crate) fn mock_opencode(dir: &Path, status: &str, echo_nonce: bool) -> PathB
     mock_opencode_then(dir, status, echo_nonce, "")
 }
 
+/// The first line of every fake `opencode`: `opencode --version` answers as
+/// OpenCode 1 would, without reading input or recording anything, so the
+/// version check before a review leaves no trace of its own.
+const OPENCODE_1_VERSION: &str = "[ \"$1\" = --version ] && { echo 1.18.29; exit 0; }";
+
+/// [`mock_opencode`] answering `--version` as OpenCode 2 does; it records
+/// its arguments and `XDG_CONFIG_HOME` (in `config_home`) like the others.
+pub(crate) fn mock_opencode2(dir: &Path, status: &str) -> PathBuf {
+    let binary = mock_opencode_reply(
+        dir,
+        status,
+        "",
+        true,
+        r#"printf '%s\n' "$XDG_CONFIG_HOME" >"$dir/config_home""#,
+    );
+    let script = fs::read_to_string(&binary).unwrap().replacen(
+        OPENCODE_1_VERSION,
+        "[ \"$1\" = --version ] && { echo 'opencode v2.1.2'; exit 0; }",
+        1,
+    );
+    write_script(&binary, &script);
+    binary
+}
+
 /// [`mock_opencode`] followed by the shell lines in `after`, for events or
 /// an exit status that come after the reply.
 pub(crate) fn mock_opencode_then(
@@ -154,6 +178,7 @@ fn mock_opencode_reply(
         &binary,
         &format!(
             r#"#!/bin/sh
+{OPENCODE_1_VERSION}
 dir=$(dirname "$0")
 printf '%s\n' "$@" >"$dir/args"
 case "$OPENCODE_CONFIG_CONTENT" in *'"*":"deny"'*) ;; *) exit 8 ;; esac
@@ -175,7 +200,9 @@ pub(crate) fn mock_opencode_failing(dir: &Path, stderr: &str) -> PathBuf {
     let binary = dir.join("opencode");
     write_script(
         &binary,
-        &format!("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{stderr}' >&2\nexit 1\n"),
+        &format!(
+            "#!/bin/sh\n{OPENCODE_1_VERSION}\ncat >/dev/null\nprintf '%s\\n' '{stderr}' >&2\nexit 1\n"
+        ),
     );
     binary
 }
@@ -185,7 +212,9 @@ pub(crate) fn mock_opencode_output(dir: &Path, stdout: &str, code: i32) -> PathB
     let binary = dir.join("opencode");
     write_script(
         &binary,
-        &format!("#!/bin/sh\ncat >/dev/null\ncat <<'EOF'\n{stdout}\nEOF\nexit {code}\n"),
+        &format!(
+            "#!/bin/sh\n{OPENCODE_1_VERSION}\ncat >/dev/null\ncat <<'EOF'\n{stdout}\nEOF\nexit {code}\n"
+        ),
     );
     binary
 }
@@ -200,6 +229,7 @@ pub(crate) fn mock_opencode_counting(dir: &Path, good_calls: u32, then: &str) ->
         &binary,
         &format!(
             r#"#!/bin/sh
+{OPENCODE_1_VERSION}
 dir=$(dirname "$0")
 input=$(cat)
 count=$(flock "$dir/count" sh -c 'c=$(( $(cat "$1" 2>/dev/null || echo 0) + 1 )); echo "$c" >"$1"; echo "$c"' sh "$dir/count")

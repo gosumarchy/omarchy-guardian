@@ -19,12 +19,12 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::agent;
+use crate::agent::{self, OpenCodeCli};
 use crate::config::Settings;
 use crate::config::model::SourceClass;
 use crate::error::Error;
 use crate::notify;
-use crate::paths;
+use crate::paths::{self, Accept};
 use crate::text;
 use crate::tools::{OpenCode, Reviewer};
 use crate::user;
@@ -151,13 +151,51 @@ fn agent_command(settings: &Settings, system: &str, prompt: &str) -> Result<Agen
     let model = settings.agent_settings(SourceClass::Aur).model;
     let reviewer = Reviewer::for_model(model.as_deref());
     let binary = OpenCode::UserPath.resolve_reviewer(reviewer)?;
-    let (args, env) = agent_args(reviewer, model.as_deref(), system, prompt);
+    let (cli, config_home) = match reviewer {
+        Reviewer::OpenCode => {
+            let config_home = ask_config_home()?.display().to_string();
+            let private = [("XDG_CONFIG_HOME", config_home.as_str())];
+            (
+                agent::opencode_cli(&binary, Path::new("/"), &private),
+                Some(config_home),
+            )
+        }
+        Reviewer::ClaudeCode => (OpenCodeCli::One, None),
+    };
+    let (args, mut env) = agent_args(reviewer, cli, model.as_deref(), system, prompt);
+    if cli == OpenCodeCli::Two
+        && let Some(config_home) = config_home
+    {
+        // Without `--pure` the user's OpenCode configuration would bring its
+        // plugins along: OpenCode 2 reads its configuration from a private,
+        // empty directory of Guardian's, as for a review.
+        env.push(("XDG_CONFIG_HOME", config_home));
+    }
     Ok(AgentCommand { binary, args, env })
+}
+
+/// The private, empty configuration directory OpenCode 2 is given for
+/// `ask`. It outlives the call, since the agent runs in a terminal of its
+/// own after Guardian has returned.
+fn ask_config_home() -> Result<PathBuf, Error> {
+    let directory = paths::cache_home(Accept::Absolute, Accept::Any)
+        .map(|cache| cache.join("omarchy-guardian/opencode-ask"))
+        .ok_or_else(|| Error::Refused("no cache directory (set HOME)".into()))?;
+    let uid =
+        user::real_uid().ok_or_else(|| Error::Refused("cannot tell the current user".into()))?;
+    paths::private_dir(&directory, uid)?;
+    Ok(directory)
 }
 
 type AgentArgs = (Vec<OsString>, Vec<(&'static str, String)>);
 
-fn agent_args(reviewer: Reviewer, model: Option<&str>, system: &str, prompt: &str) -> AgentArgs {
+fn agent_args(
+    reviewer: Reviewer,
+    cli: OpenCodeCli,
+    model: Option<&str>,
+    system: &str,
+    prompt: &str,
+) -> AgentArgs {
     let mut args: Vec<OsString> = Vec::new();
     let mut env = Vec::new();
     match reviewer {
@@ -185,16 +223,25 @@ fn agent_args(reviewer: Reviewer, model: Option<&str>, system: &str, prompt: &st
             }
             args.push(prompt.into());
         }
-        Reviewer::OpenCode => {
+        Reviewer::OpenCode if cli == OpenCodeCli::One => {
             env.push((
                 "OPENCODE_CONFIG_CONTENT",
-                agent::opencode_ask_config(system).to_string(),
+                agent::opencode_ask_config(system, None).to_string(),
             ));
             args.extend(["--pure", "--agent", "guardian-ask"].map(OsString::from));
             if let Some(model) = model {
                 args.extend(["--model".into(), model.into()]);
             }
             args.extend(["--prompt".into(), prompt.into()]);
+        }
+        // OpenCode 2's interactive command takes neither an agent nor a
+        // model: the config names both (`default_agent`, `model`).
+        Reviewer::OpenCode => {
+            env.push((
+                "OPENCODE_CONFIG_CONTENT",
+                agent::opencode_ask_config(system, model).to_string(),
+            ));
+            args.extend(["--standalone", "--prompt", prompt].map(OsString::from));
         }
     }
     (args, env)
@@ -228,15 +275,21 @@ pub(crate) fn run(target: &str, settings: &Settings) -> String {
         if target.starts_with(SCHEME) {
             command.args(["/bin/sh", "-c", CONFIRM_LINK, "sh", id]);
         }
+        // The agent's variables go to the agent alone, through env(1) in
+        // the command the terminal runs: set on the launcher, they would
+        // also reach the terminal (which would read its settings from
+        // `XDG_CONFIG_HOME`) and be lost where a running terminal server
+        // opens the window.
+        if !env.is_empty() {
+            command.arg("/usr/bin/env");
+            command.args(env.iter().map(|(key, value)| format!("{key}={value}")));
+        }
         command.arg(&binary);
         // An empty folder of its own: nothing for the agent to pick up, and
         // Claude Code's trust question is asked once, not for every report.
         let workspace = directory.with_file_name("agent");
         paths::private_dir(&workspace, uid)?;
         command.args(&args).current_dir(&workspace);
-        for (key, value) in &env {
-            command.env(key, value);
-        }
         Err::<(), Error>(Error::Refused(format!(
             "could not open a terminal: {}",
             command.exec()
@@ -253,7 +306,8 @@ mod tests {
     use std::fs;
 
     use super::{
-        MAX_REPORT_BYTES, agent_args, fresh_nonce, prompt, read_report, report_id, system,
+        MAX_REPORT_BYTES, OpenCodeCli, agent_args, fresh_nonce, prompt, read_report, report_id,
+        system,
     };
     use crate::test_support::TempDir;
     use crate::tools::Reviewer;
@@ -327,7 +381,13 @@ mod tests {
 
     #[test]
     fn the_agents_start_locked_down() {
-        let (args, env) = agent_args(Reviewer::ClaudeCode, Some("claude-code/opus"), "S", "P");
+        let (args, env) = agent_args(
+            Reviewer::ClaudeCode,
+            OpenCodeCli::One,
+            Some("claude-code/opus"),
+            "S",
+            "P",
+        );
         let args: Vec<_> = args.iter().map(|arg| arg.to_str().unwrap()).collect();
         for flag in [
             "--tools",
@@ -343,10 +403,28 @@ mod tests {
         assert_eq!(args.last(), Some(&"P"));
         assert!(env.is_empty());
 
-        let (args, env) = agent_args(Reviewer::OpenCode, None, "S", "P");
+        // OpenCode 2: no agent or model on the command line, both in the
+        // config.
+        let (args, env) = agent_args(Reviewer::OpenCode, OpenCodeCli::Two, Some("p/m"), "S", "P");
+        let args: Vec<_> = args.iter().map(|arg| arg.to_str().unwrap()).collect();
+        assert_eq!(args, ["--standalone", "--prompt", "P"]);
+        let config = crate::json::Json::parse(&env[0].1).unwrap();
+        assert_eq!(
+            config.get("model").and_then(crate::json::Json::as_str),
+            Some("p/m")
+        );
+        assert_eq!(
+            config
+                .get("default_agent")
+                .and_then(crate::json::Json::as_str),
+            Some("guardian-ask")
+        );
+
+        let (args, env) = agent_args(Reviewer::OpenCode, OpenCodeCli::One, None, "S", "P");
         let args: Vec<_> = args.iter().map(|arg| arg.to_str().unwrap()).collect();
         assert_eq!(args, ["--pure", "--agent", "guardian-ask", "--prompt", "P"]);
         let config = crate::json::Json::parse(&env[0].1).unwrap();
+        assert_eq!(config.get("model"), None);
         let agent = config.get("agent").unwrap();
         assert_eq!(
             config
