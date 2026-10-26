@@ -43,7 +43,29 @@ pub(crate) struct Audit {
     pub(crate) truncated: bool,
 }
 
+/// Looks `packages` up in OSV and fetches the details of what it lists.
 pub(crate) fn audit(packages: &[Dependency]) -> Result<Audit, Error> {
+    let mut audit = query(packages)?;
+    if let Ok(details) = fetch_details(&audit.advisories) {
+        for advisory in &mut audit.advisories {
+            if let Some((severity, summary)) = details.get(&advisory.id) {
+                advisory.severity = *severity;
+                advisory.summary.clone_from(summary);
+            }
+        }
+    }
+    Ok(audit)
+}
+
+/// Asks OSV which advisories cover each of `packages`, by ecosystem, name
+/// and version only, in batches of `BATCH_SIZE`. The advisories carry no
+/// severity or summary: those take a fetch per advisory (see `audit`).
+///
+/// # Errors
+///
+/// When there are more than `MAX_PACKAGES`, when `curl` fails or times out,
+/// or when OSV's answer cannot be read.
+pub(crate) fn query(packages: &[Dependency]) -> Result<Audit, Error> {
     if packages.len() > MAX_PACKAGES {
         return Err(Error::Refused(format!(
             "dependency inventory exceeds the {MAX_PACKAGES}-package audit limit"
@@ -54,15 +76,6 @@ pub(crate) fn audit(packages: &[Dependency]) -> Result<Audit, Error> {
     for batch in packages.chunks(BATCH_SIZE) {
         let response = post(QUERY_BATCH_URL, &batch_query(batch))?;
         collect_batch(&response, batch, &mut audit)?;
-    }
-
-    if let Ok(details) = fetch_details(&audit.advisories) {
-        for advisory in &mut audit.advisories {
-            if let Some((severity, summary)) = details.get(&advisory.id) {
-                advisory.severity = *severity;
-                advisory.summary.clone_from(summary);
-            }
-        }
     }
     Ok(audit)
 }
