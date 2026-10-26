@@ -15,6 +15,7 @@ described.
   - [Where following stops](#where-following-stops)
   - [Programs ahead of the system's own](#programs-ahead-of-the-systems-own)
   - [More that decides what runs](#more-that-decides-what-runs)
+  - [Neovim plugins](#neovim-plugins)
   - [AI coding agents](#ai-coding-agents)
   - [Browser extensions](#browser-extensions)
   - [Accounts, keys and trust anchors](#accounts-keys-and-trust-anchors)
@@ -306,7 +307,9 @@ reviewed too, except where it is kept from the AI, which is said below.
 - **Flatpak.** Flatpak overrides that open the sandbox to the home or the
   host, or let an app talk to `org.freedesktop.Flatpak`.
 - **Editor.** Editor start-up files (`~/.config/nvim/init.lua` and `init.vim`,
-  `plugin/`, `after/plugin/` and `lua/`, `~/.vimrc`, `~/.vim/plugin`), and in
+  `plugin/`, `after/plugin/` and `lua/`, `~/.local/share/nvim/site/plugin/`,
+  `after/plugin/`, `ftdetect/` and `pack/*/start/*/plugin/`, `~/.vimrc`,
+  `~/.vim/plugin`), and in
   the `settings.json` of VS Code and its forks (Code - OSS, VSCodium, Cursor)
   the settings that run a folder's tasks unasked, the environment and shell of
   its terminal (`terminal.integrated.env.*` with `LD_PRELOAD`, `PATH` and the
@@ -369,6 +372,139 @@ and git files they are checked locally and never sent to the AI (mise's and
 cargo's are reviewed, with secret-looking values taken out), and what is shown
 is the key and, for an address, its host, never the rest of the value; so are
 an editor's `settings.json` and fish's saved variables.
+
+### Neovim plugins
+
+LazyVim, Omarchy's editor setup, installs its plugins with lazy.nvim, which
+keeps each as a git checkout in `~/.local/share/nvim/lazy/<name>`
+(`$XDG_DATA_HOME/nvim/lazy` when that is set) and updates them from GitHub.
+Neovim runs that code at every start. The sweep lists each plugin as one item,
+under its directory, whose hash covers every file of it outside `.git` (a
+file's mode included), the address it was cloned from, the commit it is at, and
+what may make git run a program in it or fetch from elsewhere: the hooks and the
+configuration keys that a clone does not write, of the checkout and of each
+submodule under `.git/modules`, and every entry of those git directories that
+is not plain data. A plugin that is updated, edited,
+moved to another address or given a hook is changed, shows in `--diff` and in
+the daily notification, and an allow covers it as a whole until it changes.
+Plain data is what git only reads: `objects`, `refs`, `HEAD`, `index`,
+`packed-refs`, `logs`, `description`, `FETCH_HEAD`, `ORIG_HEAD`, `shallow`, and
+`exclude`, `refs` and `sparse-checkout` in `info`; anything else there
+(`commondir`, `gitdir`, `worktrees`, an unknown name) may point git at another
+repository and is a finding.
+
+What is read, all as files, without running git: the origin from `.git/config`
+and `.git/config.worktree` (with any user and password taken out of the
+address; an origin that is not exactly one address read one way, through a
+continued line or several `url` keys, is not checked, and is a finding; an
+empty `url` clears those before it, as git 2.46 and later does),
+the commit from `.git/HEAD` and the refs (`packed-refs` too), every key of
+`.git/config` and `.git/config.worktree`, and of those of each submodule, read
+the way git reads them, the hooks in `.git/hooks`, in a
+`core.hooksPath` within the checkout and in each submodule's `hooks`, the names
+in each git directory, `lazy-lock.json` in `~/.config/nvim`
+(`$XDG_CONFIG_HOME/nvim`), and the plugin specs in the Lua files of your
+configuration and in those plugins ship where lazy.nvim reads them
+(`lua/<module>/plugins/`, as LazyVim does, and `lazy.lua`). Only table literals
+of a spec are read (`{ "owner/repo", name = …, url = …, build = … }`). No link
+under `.git/modules` is followed, and at most 256 directories there are looked
+at; what is left is said as not checked.
+
+What is a finding, on every sweep:
+
+- `plugin-source`: a plugin directory that is no git checkout, or a link; a
+  checkout that names no origin, or whose origin cannot be read one way; an
+  origin that is not where any spec has
+  lazy.nvim fetch the plugin from (`owner/repo` is GitHub's, an address is
+  taken as written; scheme, user, case and `.git` do not count). A plugin no
+  spec names gets a note, not a finding: a spec built by code is not read;
+- `plugin-build`: a spec whose `build` is a literal shell command, or a list
+  holding one (`build = "make"`, `["build"] = ("make")`, `"a" .. "b"`, `{
+  "make", [2] = "x" }`), which lazy.nvim runs at install and update; a field of
+  a spec whose key code computes (`[("build")] = …`), which may be such a build
+  step, and code that was not read decides; and any git hook in the checkout or
+  a submodule, which git runs when lazy.nvim updates it;
+- `git-config-command`: any key of the configuration of the checkout or of a
+  submodule (`config`, `config.worktree`) that `git clone`, `git submodule`
+  and lazy.nvim do not write, in that file, or with a value they do not
+  write. In `config.worktree` they write `core.sparseCheckout` and
+  `sparseCheckoutCone`. In `config` they write `core.repositoryformatversion`,
+  `filemode`, `bare = false`, `logallrefupdates = true`, `autocrlf = false`, a
+  submodule's `core.worktree` that stays in the checkout; one
+  `remote.origin.url` (every one after the first is a finding: git fetches
+  from the first), which for a submodule must be the one url the checkout's
+  `.gitmodules` gives it, its `fetch` into `refs/remotes/origin/`, `promisor`,
+  `partialclonefilter` and `tagopt = --no-tags`; `branch.<name>.remote =
+  origin` and `merge`; `submodule.active = .`, `submodule.<name>.active =
+  true` and, in the checkout's own `config`, `submodule.<name>.url` when it is
+  the one url `.gitmodules` gives that name (a file of the plugin, reviewed
+  when it changes); and `extensions.worktreeConfig`, `partialClone = origin`
+  and `objectFormat`. Anything else is a finding, as it may make the git
+  commands lazy.nvim runs run a program or fetch from elsewhere: a command key
+  such as `core.fsmonitor`, `core.hooksPath`, a proxy, `http.sslVerify`,
+  another remote, `include.path`, a submodule url that `.gitmodules` does not
+  give (a relative one there, `./x` or `../x`, which git writes into `config`
+  as a full address, stays a finding until you allow the plugin), and the
+  url of a submodule's own submodule. So is any entry of a git directory that
+  is not plain data, and any `.git` directory or file below the top of the
+  checkout, whose configuration and hooks git may run, but for the file a
+  submodule checkout leaves: one line, `gitdir: ` and a path from its
+  directory to the `.git/modules/<name>` of the submodule `.gitmodules` puts
+  in that directory, which is checked like the checkout's own.
+
+A build step that is a Neovim command (`":TSUpdate"`), a Lua function or a Lua
+expression that picks a command (`vim.g.x and "cargo build"`) is noted on the
+item, not a finding, and so is a top-level `build.lua`, which lazy.nvim runs; a
+commit other than the one `lazy-lock.json` pins, and a plugin it does not name,
+are noted too. Escapes in strings (`"\99url"`) are decoded as Lua decodes them.
+
+What goes to the review. The first sweep that finds plugins and no record of
+them takes them as they are: their files are hashed and recorded, and none is
+read by the text rules or sent to the AI, which on a LazyVim install would be
+some 3,500 Lua files and tens of local findings in ordinary plugin code. That
+sweep costs no AI call for plugins. After it, the Lua, Vimscript, shell and
+build files (`Makefile`, `*.rockspec`) of a plugin that are new or changed
+since the record go through the local rules and the AI review like any other
+text the sweep reviews, with what Guardian established about the plugin
+(origin, commit, build step); a plugin new since the record sends all of them.
+So a later sweep costs one review's share per plugin that changed, and none
+when nothing did. A file whose path marks it as holding secrets is read by the
+local rules only and raises `kept-from-review`. At most 1,500 files or 4 MiB of
+one plugin are sent in one sweep; past that the sweep is incomplete and says
+so: read the plugin yourself and allow it. Code that may run but that the
+review does not read, if new or changed since the record, makes the sweep
+incomplete and is named, until you check the plugin and allow it: a native
+library (`*.so`), a file of a remote plugin (`rplugin/`), a script in another
+language (`*.py`, `*.js`, `*.mjs`, `*.cjs`, `*.ts`, `*.pl`, `*.rb`: Python
+under `pythonx/` or `python3/`, Node and Deno scripts), any executable file
+(`bin/`), and any link, which may lead to code elsewhere. A plugin you allowed
+is not reviewed again until it changes.
+
+The record (`nvim-plugins.json` in the sweep's directory of the review store)
+holds each plugin's code files and their hashes. A plugin's entry moves on only
+when its changed files were reviewed without a finding and every review of them
+finished; otherwise they are sent again at the next sweep. A record that holds
+no plugin still counts: a plugin installed after the first sweep is new and
+reviewed, never taken as it is. It is your own file: one that is gone while the
+last sweep listed plugins, or that cannot be read, makes that sweep incomplete,
+and the plugins are taken as they are.
+
+After the upgrade that adds plugins to the sweep, each plugin shows once as
+new, in `--diff` and in the daily notification; that sweep takes them as they
+are.
+
+Of a package under `site/pack/*/start/`, only the files directly in its
+`plugin/` directory are read; its subdirectories, `ftdetect/` and
+`after/plugin/` are not.
+
+Not covered here: plugins of other managers (packer, vim-plug, Neovim's own
+`pack/*/start` under your data directory, whose `plugin/` files the
+Editor start-up files cover, see [More that decides what
+runs](#more-that-decides-what-runs)), a lazy.nvim `root` other than the
+default, specs built by code, the other files of a plugin (data, documentation,
+anything not executable and not named above), which count for whether it
+changed but are neither sent nor reported, and what lazy.nvim fetches when a
+plugin is installed or updated: the sweep sees a plugin once it is on disk.
 
 ### AI coding agents
 
@@ -1842,9 +1978,12 @@ reviews as well, are listed under [Local rules](local-rules.md#rule-ids).
 | `network-relay` | medium | A tool that runs or forwards what it is told over the network (netcat, socat, a tunnel) listens or is connected. |
 | `traced-process` | medium | Another process is attached to this one the way a debugger is, and can read and change its memory. |
 | `kernel-tap` | medium | Something no package explains taps the kernel's network or tracing path: a raw packet socket, or a pinned eBPF object. |
+| `plugin-source` | medium | An editor plugin is not a git checkout of where its plugin manager fetches it from: its origin is not the address its spec names, it names no origin, or it is no checkout at all. |
+| `plugin-build` | medium | An editor plugin runs a program when its plugin manager installs or updates it: a shell command as its build step, a field whose key code computes and that may be one, or a git hook in its checkout. |
 | `kept-from-review` | medium | Something runs this file, or a shell reads it in, and it holds more than opaque values kept in secret-named or plainly inert variables; it holds secrets (by its path or a boot password), so the AI review did not read it: only the local rules did. Read it yourself; `sweep allow` records that you did. |
 | `network-listener` | low | A program listens on the network that nothing installed accounts for: an interpreter (Python, a shell, Node), or a packaged program no packaged service runs. |
 
 `git-config-command` and `remote-shell` are reported by the sweep as well as
-by source reviews: the first for a git key in a home that runs a command, the
+by source reviews: the first for a git key in a home that runs a command or
+one in a Neovim plugin's checkout that a clone does not write, the
 second for a running shell or interpreter on a network connection.

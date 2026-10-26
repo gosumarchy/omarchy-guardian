@@ -368,7 +368,9 @@ fn whole(size: u64, head: &[u8]) -> Option<&[u8]> {
     (head.len() as u64 == size).then_some(head)
 }
 
-fn body_of(path: &str, size: u64, head: &[u8]) -> Body {
+/// What the review gets of the file at `path`, of `size` bytes, whose first
+/// bytes (as `read` keeps them) are `head`.
+pub(crate) fn body_of(path: &str, size: u64, head: &[u8]) -> Body {
     if size > MAX_TEXT_FILE_SIZE {
         return match content::classify_payload(path, &head[..head.len().min(8192)]) {
             Content::Binary(format) => Body::Binary(format.label()),

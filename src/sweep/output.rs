@@ -128,7 +128,7 @@ fn items_html(
                 Body::Link(target) => details.push(format!("→ {}", esc(target))),
                 Body::Binary(format) => details.push(format!("[{}]", esc(format))),
                 Body::Unreadable(_) => details.push("[not readable]".to_string()),
-                Body::Text(_) | Body::Undecodable | Body::Oversized => {}
+                Body::Text(_) | Body::Undecodable | Body::Oversized | Body::Plugin(_) => {}
             }
             details.extend(
                 item.runs
@@ -170,7 +170,7 @@ fn item_row(item: &Item, home: Option<&str>, flagged: &HashSet<String>) -> Vec<V
         Body::Link(target) => details.push(Span::new(format!("→ {}", shown(target)), "36")),
         Body::Binary(format) => details.push(Span::new(format!("[{format}]"), "35")),
         Body::Unreadable(_) => details.push(Span::new("[not readable]", "33")),
-        Body::Text(_) | Body::Undecodable | Body::Oversized => {}
+        Body::Text(_) | Body::Undecodable | Body::Oversized | Body::Plugin(_) => {}
     }
     for command in item.runs.iter().take(3) {
         details.push(Span::plain(format!("runs {}", shown(command))));
