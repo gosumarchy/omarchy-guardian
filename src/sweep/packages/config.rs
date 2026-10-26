@@ -124,10 +124,11 @@ pub(super) struct Places {
     pub(super) uv_env: Vec<String>,
     /// npm's default global prefix where no `prefix` is set (`PREFIX`).
     pub(super) npm_global_prefix: Option<String>,
-    /// The variables that name a configuration file or a tool's directory
-    /// by a path that is not absolute (`npm_config_userconfig`,
-    /// `PIP_CONFIG_FILE`, `UV_CONFIG_FILE`, `CARGO_HOME`, `PIPX_HOME`,
-    /// `MISE_DATA_DIR`), with their value: it is not found here.
+    /// The variables that name a configuration file, a tool's directory or
+    /// an XDG directory by a path that is not absolute
+    /// (`npm_config_userconfig`, `PIP_CONFIG_FILE`, `UV_CONFIG_FILE`,
+    /// `CARGO_HOME`, `PIPX_HOME`, `MISE_DATA_DIR`, `XDG_CONFIG_HOME`,
+    /// `XDG_CONFIG_DIRS`), with their value: it is not found here.
     pub(super) unfound: Vec<(&'static str, String)>,
 }
 
@@ -179,9 +180,12 @@ impl Places {
     }
 
     /// The defaults, with what the environment changes. A variable that
-    /// names a place and is not an absolute path without `..` is ignored,
-    /// except one that names a configuration file, which is kept in
-    /// `unfound`.
+    /// names a tool's directory, a configuration file or an XDG directory
+    /// by a path that is not absolute without `..` is kept in `unfound`,
+    /// and nothing is read in its place. An empty `CARGO_HOME` or XDG
+    /// directory is unset, as cargo and pip take it; an empty `PIPX_HOME`
+    /// or `MISE_DATA_DIR` is said as not absolute, since their manuals on
+    /// this machine do not say how they take it.
     pub(super) fn from_env(home: Option<&str>) -> Self {
         let variables: Vec<(String, String)> = env::vars_os()
             .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
@@ -194,7 +198,7 @@ impl Places {
         for (name, value) in variables {
             let (name, place) = match name.as_str() {
                 "MISE_DATA_DIR" => ("MISE_DATA_DIR", &mut places.mise),
-                "CARGO_HOME" => ("CARGO_HOME", &mut places.cargo),
+                "CARGO_HOME" if !value.is_empty() => ("CARGO_HOME", &mut places.cargo),
                 "PIPX_HOME" => ("PIPX_HOME", &mut places.pipx),
                 _ => continue,
             };
@@ -238,11 +242,15 @@ impl Places {
                 .find(|(name, _)| name == wanted)
                 .map(|(_, value)| value.as_str())
         };
-        let mut config_dirs: Vec<&str> = variable("XDG_CONFIG_HOME").into_iter().collect();
+        let mut config_dirs: Vec<(&'static str, &str)> = variable("XDG_CONFIG_HOME")
+            .map(|home| ("XDG_CONFIG_HOME", home))
+            .into_iter()
+            .collect();
         config_dirs.extend(
             variable("XDG_CONFIG_DIRS")
                 .into_iter()
-                .flat_map(|dirs| dirs.split(':')),
+                .flat_map(|dirs| dirs.split(':'))
+                .map(|directory| ("XDG_CONFIG_DIRS", directory)),
         );
         // A file already read (a default, or a global one) is read once.
         let add = |files: &mut Vec<String>, globals: &[&str], file: Option<String>| {
@@ -253,7 +261,16 @@ impl Places {
                 files.push(file);
             }
         };
-        for directory in config_dirs {
+        // An empty one is unset; a relative one, which pip and uv would
+        // resolve against where they ran, is said.
+        for (name, directory) in config_dirs {
+            if directory.is_empty() {
+                continue;
+            }
+            if from_root(directory).is_none() {
+                places.unfound.push((name, directory.to_string()));
+                continue;
+            }
             let pip = from_root(&format!("{directory}/pip/pip.conf"));
             add(&mut places.pip, GLOBAL_PIP, pip);
             let uv = from_root(&format!("{directory}/uv/uv.toml"));
@@ -331,6 +348,10 @@ pub(super) struct NpmConfig {
     /// closed, or too large), or cannot be found, as said to the user: what
     /// they set is not known, so no package counts as public.
     pub(super) unreadable: Vec<String>,
+    /// A shell start-up or environment file may set npm's registry or
+    /// configuration files where npm runs, and no package counts as
+    /// public.
+    pub(super) set_at_start_up: bool,
 }
 
 /// Whether a node's npm counts for the install-scripts note: one that is
@@ -516,7 +537,7 @@ impl NpmConfig {
     pub(super) fn is_public(&self, name: &str, resolved: Option<&str>) -> bool {
         // A file it could not read may set a private registry for any
         // scope, and npm follows a link to it.
-        if !self.unreadable.is_empty() {
+        if !self.unreadable.is_empty() || self.set_at_start_up {
             return false;
         }
         if let Some(resolved) = resolved {
@@ -560,6 +581,7 @@ impl IndexConfig {
             .iter()
             .any(|(_, value)| is_other_pip_index(value));
         let mut unreadable = unfound(places, "PIP_CONFIG_FILE");
+        unreadable.extend(unfound_under(places, "pip.conf"));
         for file in files {
             match read_config(root, &file) {
                 ConfigFile::Absent => {}
@@ -584,6 +606,7 @@ impl IndexConfig {
             .chain(places.uv.iter().cloned());
         let mut other_index = !places.uv_env.is_empty();
         let mut unreadable = unfound(places, "UV_CONFIG_FILE");
+        unreadable.extend(unfound_under(places, "uv.toml"));
         for file in files {
             let entries = match read_config(root, &file) {
                 ConfigFile::Absent => continue,
@@ -661,6 +684,19 @@ fn unfound(places: &Places, name: &str) -> Vec<String> {
         .iter()
         .filter(|(variable, _)| *variable == name)
         .map(|(variable, value)| format!("the file {variable} names ({value})"))
+        .collect()
+}
+
+/// The configuration file `file` under each XDG directory that cannot be
+/// found, as said to the user.
+fn unfound_under(places: &Places, file: &str) -> Vec<String> {
+    places
+        .unfound
+        .iter()
+        .filter(|(variable, _)| variable.starts_with("XDG_"))
+        .map(|(variable, value)| {
+            format!("the {file} under the directory {variable} names ({value})")
+        })
         .collect()
 }
 
@@ -861,23 +897,41 @@ fn unquoted(text: &str) -> &str {
     }
 }
 
-/// The top-level settings of an npm configuration file, or `None` where
-/// npm would read a key that is not known here. A key under a `[section]`
-/// is not one of npm's settings, so reading stops at the first. npm
-/// expands `${...}` in a key from its own environment.
+/// The top-level settings of an npm configuration file that the inventory
+/// reads (`NPM_KEYS` and each scope's registry), or `None` where npm would
+/// read a key that is not known here: npm expands `${...}` in a key from
+/// its own environment, decodes a double-quoted key as JSON (an escape in
+/// it may spell any key), and reads a `key[]` as a list. A key under a
+/// `[section]` is not one of npm's settings, so reading stops at the
+/// first. Lines and sections are split as npm's `ini` package splits them
+/// (`decode`): at any run of CR and LF, and a section is a line that starts
+/// with `[` in its first column and ends with `]` and blanks, with no `]`
+/// in between.
 fn npm_settings(text: &str) -> Option<Vec<(String, String)>> {
     let mut settings = Vec::new();
-    for line in text.lines() {
-        if line.trim().starts_with('[') {
+    for line in text.split(['\r', '\n']) {
+        let end = line.trim_end();
+        let inner = end.strip_prefix('[').and_then(|end| end.strip_suffix(']'));
+        if inner.is_some_and(|inner| !inner.contains(']')) {
             break;
+        }
+        let raw_key = line.split_once('=').map_or(line, |(key, _)| key).trim();
+        if raw_key.starts_with('"') && raw_key.contains('\\') {
+            return None;
         }
         let Some((key, value)) = setting(line) else {
             continue;
         };
-        if key.contains("${") {
+        let list = key.strip_suffix("[]");
+        let name = list.unwrap_or(key);
+        let used = NPM_KEYS.contains(&name) || name.ends_with(":registry");
+        if name.contains("${") || (used && list.is_some()) {
             return None;
         }
-        settings.push((key.to_string(), value.to_string()));
+        // The other keys include registry tokens (`//host/:_authToken`).
+        if used {
+            settings.push((name.to_string(), value.to_string()));
+        }
     }
     Some(settings)
 }
@@ -920,6 +974,7 @@ mod tests {
         npm_prefix, npm_settings, npm_variables, pip_file_other_index, pip_variables,
         pipx_metadata_other_index, setting, uv_receipt_other_index,
     };
+    use crate::test_support::TempDir;
 
     #[test]
     fn npmrc_lines_are_read_as_npm_reads_them() {
@@ -1008,6 +1063,23 @@ mod tests {
             npm_settings("${SCOPE}:registry=https://npm.corp.example/\n"),
             None
         );
+        let registry = Some(vec![("registry".to_string(), "x".to_string())]);
+        // Tokens and other keys are not kept.
+        assert_eq!(
+            npm_settings("//r.example/:_authToken=s\nregistry=x\n"),
+            registry
+        );
+        // An indented `[work]` is no section; a CR alone ends a line.
+        assert_eq!(npm_settings("  [work]\nregistry=x\n"), registry);
+        assert_eq!(
+            npm_settings("a=b\rregistry=x\r[work]\rregistry=y"),
+            registry
+        );
+        assert_eq!(npm_settings("[a]b]\nregistry=x\n"), registry);
+        // A list or an escaped key npm would read differently.
+        assert_eq!(npm_settings("registry[]=x\n"), None);
+        assert_eq!(npm_settings("\"regi\\u0073try\"=x\n"), None);
+        assert_eq!(npm_settings("ca[]=x\nregistry=x\n"), registry);
     }
 
     #[test]
@@ -1037,6 +1109,36 @@ mod tests {
         // A relative tool home is not replaced by the default.
         assert_eq!(places.cargo, None);
         assert_eq!(places.unfound, [("CARGO_HOME", "cargo".to_string())]);
+    }
+
+    #[test]
+    fn an_empty_place_is_unset_and_a_relative_xdg_directory_is_said() {
+        let variables = [
+            ("CARGO_HOME", ""),
+            ("XDG_CONFIG_HOME", ""),
+            ("XDG_CONFIG_DIRS", "conf::/etc/corp"),
+        ]
+        .map(|(name, value)| (name.to_string(), value.to_string()));
+
+        let places = Places::from_variables(Some("home/u"), &variables);
+
+        assert_eq!(places.cargo.as_deref(), Some("home/u/.cargo"));
+        assert_eq!(
+            places.pip,
+            [
+                "home/u/.config/pip/pip.conf",
+                "home/u/.pip/pip.conf",
+                "etc/corp/pip/pip.conf"
+            ]
+        );
+        assert_eq!(places.unfound, [("XDG_CONFIG_DIRS", "conf".to_string())]);
+        let root = TempDir::new("xdg-relative");
+        let pip = IndexConfig::pip(root.path(), &places);
+        assert!(pip.other_index);
+        assert_eq!(
+            pip.unreadable,
+            ["the pip.conf under the directory XDG_CONFIG_DIRS names (conf)"]
+        );
     }
 
     #[test]
@@ -1161,7 +1263,7 @@ mod tests {
         assert!(is_uv_index(&["index", "url"]));
         assert!(!is_uv_index(&["pip", "compile-bytecode"]));
         let places = Places::defaults(Some("home/u"));
-        let root = crate::test_support::TempDir::new("packages-uv-config");
+        let root = TempDir::new("packages-uv-config");
         for (text, other) in [
             (
                 "[pip]\nindex-url = \"https://pypi.corp.example/simple\"\n",

@@ -954,6 +954,26 @@ fn a_mise_npm_tool_in_pnpms_layout_is_said_as_not_read() {
 }
 
 #[test]
+fn a_mise_npm_tool_bun_installed_into_lib_is_said_as_not_read() {
+    let root = TempDir::new("packages-mise-bun");
+    let root = root.path();
+    let bun = "home/u/.local/share/mise/installs/npm-x/1.0.0";
+    npm(root, &format!("{bun}/lib/node_modules/x"), "x", "1.0.0");
+    write(root, &format!("{bun}/lib/bun.lock"), "{}");
+    let by_npm = "home/u/.local/share/mise/installs/npm-y/2.0.0";
+    npm(root, &format!("{by_npm}/lib/node_modules/y"), "y", "2.0.0");
+
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+
+    assert_eq!(found(&inventory), [(Ecosystem::Npm, "y", "2.0.0")]);
+    assert!(
+        inventory.unchecked.join("\n").contains(&format!("/{bun}")),
+        "{:?}",
+        inventory.unchecked
+    );
+}
+
+#[test]
 fn npms_global_file_under_each_prefix_decides_too() {
     let root = TempDir::new("packages-npm-global");
     let root = root.path();
@@ -1305,4 +1325,89 @@ fn a_relative_tool_home_and_a_linked_mise_tool_are_said() {
         "{:?}",
         inventory.notes
     );
+}
+
+#[test]
+fn a_start_up_file_that_names_an_index_variable_leaves_its_packages_out() {
+    let root = TempDir::new("packages-start-up");
+    let root = root.path();
+    npm(root, "usr/lib/node_modules/tool", "tool", "1.0.0");
+    let site = "home/u/.local/share/mise/installs/python/3.12.1/lib/python3.12/site-packages";
+    python(root, site, "requests", "2.31.0");
+    let pythons = |inventory: &Inventory| {
+        found(inventory)
+            .iter()
+            .filter(|(ecosystem, ..)| *ecosystem == Ecosystem::PyPi)
+            .count()
+    };
+    let npms = |inventory: &Inventory| {
+        found(inventory)
+            .iter()
+            .filter(|(ecosystem, ..)| *ecosystem == Ecosystem::Npm)
+            .count()
+    };
+
+    // A start-up file that names none changes nothing.
+    write(root, "home/u/.bashrc", "export PATH=\"$HOME/bin:$PATH\"\n");
+    write(root, "etc/profile.d/locale.sh", "export LANG=C.UTF-8\n");
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    assert_eq!((npms(&inventory), pythons(&inventory)), (1, 1));
+    assert!(
+        !inventory.unchecked.join("\n").contains("start-up"),
+        "{:?}",
+        inventory.unchecked
+    );
+
+    // pip's variable, in any case, in a file the shell reads.
+    write(
+        root,
+        "home/u/.bashrc",
+        "export pip_index_url=https://pypi.corp.example/simple\n",
+    );
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    assert_eq!((npms(&inventory), pythons(&inventory)), (1, 0));
+    assert!(
+        inventory
+            .unchecked
+            .join("\n")
+            .contains("name a variable that sets pip's index where the tool runs from a shell, so no Python package pip installed was looked up in OSV: /home/u/.bashrc"),
+        "{:?}",
+        inventory.unchecked
+    );
+    write(root, "home/u/.bashrc", "");
+
+    // npm's, in a fish file one directory below a catalogued one.
+    write(
+        root,
+        "etc/fish/conf.d/npm.fish",
+        "set -gx NPM_CONFIG_REGISTRY https://npm.corp.example/\n",
+    );
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    assert_eq!((npms(&inventory), pythons(&inventory)), (0, 1));
+    assert!(
+        inventory
+            .unchecked
+            .join("\n")
+            .contains("/etc/fish/conf.d/npm.fish"),
+        "{:?}",
+        inventory.unchecked
+    );
+    fs::remove_file(root.join("etc/fish/conf.d/npm.fish")).unwrap();
+
+    // One that cannot be read may name any of them; completions are not
+    // start-up files.
+    fs::create_dir_all(root.join("etc/environment")).unwrap();
+    write(
+        root,
+        "usr/share/bash-completion/completions/uv",
+        "UV_INDEX_URL PIP_INDEX_URL npm_config_registry\n",
+    );
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    assert_eq!((npms(&inventory), pythons(&inventory)), (0, 0));
+    let unchecked = inventory.unchecked.join("\n");
+    assert!(
+        unchecked.contains("could not be read") && unchecked.contains("/etc/environment"),
+        "{unchecked}"
+    );
+    assert!(!unchecked.contains("completions"), "{unchecked}");
 }

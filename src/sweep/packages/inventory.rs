@@ -19,6 +19,7 @@ use std::io;
 use std::path::Path;
 
 use super::config::{self, ConfigFile, IndexConfig, NpmConfig, Places};
+use super::startup::Startup;
 use crate::deps::Ecosystem;
 use crate::files::read_small_file;
 use crate::json::Json;
@@ -41,6 +42,18 @@ const MAX_NODE_DEPTH: usize = 8;
 /// `METADATA` carries the package's whole description after its headers;
 /// 2 MiB is arbitrary and far above what packages ship.
 const MAX_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Files bun, pnpm or aube leave in a global directory and npm never
+/// writes in a global prefix: their lockfiles, the manifest they keep the
+/// global packages in, and pnpm's store.
+const OTHER_NPM_MANAGER_FILES: &[&str] = &[
+    "package.json",
+    "bun.lock",
+    "bun.lockb",
+    "pnpm-lock.yaml",
+    "aube-lock.yaml",
+    "node_modules/.pnpm",
+];
 
 /// The most nodes of mise's whose npm configuration is read. Arbitrary:
 /// far more than anyone keeps installed.
@@ -111,8 +124,12 @@ pub(super) fn collect(root: &Path, places: &Places) -> Inventory {
             "the npm configuration of the nodes mise installed past the first {MAX_NODES}"
         ));
     }
-    let pip = IndexConfig::pip(root, places);
-    let uv = IndexConfig::uv(root, places);
+    let startup = Startup::read(root, places.home.as_deref());
+    npm.set_at_start_up = startup.sets_npm();
+    let mut pip = IndexConfig::pip(root, places);
+    pip.other_index |= startup.sets_pip();
+    let mut uv = IndexConfig::uv(root, places);
+    uv.other_index |= startup.sets_uv();
     let cargo = IndexConfig::cargo(root, places);
     let sources = Sources {
         pip: Source::configured(&pip),
@@ -171,6 +188,7 @@ pub(super) fn collect(root: &Path, places: &Places) -> Inventory {
             "cargo's configuration replaces a source or includes other files (`[source]` or `include` in its config.toml), so installed crates may come from a mirror or a private registry and none was looked up in OSV".to_string(),
         );
     }
+    say_startup(&startup, &mut inventory.unchecked);
     for file in &uv.unreadable {
         inventory.unchecked.push(format!(
             "{} could not be read (not a regular file, closed, too large, not TOML, or not found): it may name a private index, so no Python package mise installed through uv was looked up in OSV",
@@ -178,6 +196,42 @@ pub(super) fn collect(root: &Path, places: &Places) -> Inventory {
         ));
     }
     inventory
+}
+
+/// Says which start-up files leave which packages out.
+fn say_startup(startup: &Startup, unchecked: &mut Vec<String>) {
+    for (files, setting, left_out) in [
+        (
+            &startup.npm,
+            "npm's registry or configuration files",
+            "no npm package",
+        ),
+        (
+            &startup.pip,
+            "pip's index",
+            "no Python package pip installed",
+        ),
+        (
+            &startup.uv,
+            "uv's index",
+            "no Python package mise installed through uv",
+        ),
+    ] {
+        if !files.is_empty() {
+            unchecked.push(format!(
+                "{} shell start-up or environment file(s) name a variable that sets {setting} where the tool runs from a shell, so {left_out} was looked up in OSV: {}",
+                files.len(),
+                named(files, "")
+            ));
+        }
+    }
+    if !startup.unreadable.is_empty() {
+        unchecked.push(format!(
+            "{} shell start-up or environment file(s) or director(ies) could not be read (not a regular file, closed, too large, too deep, or past a limit): they may set npm's registry or pip's or uv's index, so no npm package and no Python package pip or uv installed was looked up in OSV: {}",
+            startup.unreadable.len(),
+            named(&startup.unreadable, "")
+        ));
+    }
 }
 
 /// The directories of the nodes mise installed under `node`, relative to
@@ -701,10 +755,16 @@ impl<'a> Walk<'a> {
     fn mise_tool(&mut self, backend: Backend, directory: &str) {
         let found = match backend {
             // Newer mise installs `npm:` tools with aube, in pnpm's layout,
-            // with no `lib`: such a tool is said as not read.
+            // with no `lib`: such a tool is said as not read. With
+            // `npm.package_manager` set to bun or pnpm, mise points their
+            // global directory at the tool's, and where it lands is not
+            // documented: a `lib/node_modules` beside their files is not
+            // npm's, and their own configuration is not parsed, so the
+            // tool is said as not read too.
             Backend::Node | Backend::Npm => {
                 let lib = format!("{directory}/lib");
-                let there = self.entry(&lib) == Some(Entry::Directory);
+                let there = self.entry(&lib) == Some(Entry::Directory)
+                    && !(backend == Backend::Npm && self.other_npm_manager(directory));
                 if there {
                     self.node_modules(&format!("{lib}/node_modules"));
                 }
@@ -749,6 +809,18 @@ impl<'a> Walk<'a> {
         if !found && !self.full {
             self.unreadable.push(directory.to_string());
         }
+    }
+
+    /// Whether a file another package manager than npm leaves in a global
+    /// directory is in the tool's directory or its `lib`.
+    fn other_npm_manager(&mut self, directory: &str) -> bool {
+        [directory.to_string(), format!("{directory}/lib")]
+            .iter()
+            .any(|place| {
+                OTHER_NPM_MANAGER_FILES
+                    .iter()
+                    .any(|file| self.entry(&format!("{place}/{file}")).is_some())
+            })
     }
 
     /// The inventory, with what was left out said.

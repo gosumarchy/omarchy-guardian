@@ -27,8 +27,12 @@
 //!   files cannot tell these, which are sent like any other package:
 //!   - `npm i -g` of git or a tarball, under a name whose registry is the
 //!     public one (npm records no source for a global install);
-//!   - `pip install --index-url` given on the command line, into a Python
-//!     mise installed or a pipx environment too old to have a record;
+//!   - `pip install --index-url` given on the command line, directly or in
+//!     a requirements file named there, into a Python mise installed or a
+//!     pipx environment too old to have a record;
+//!   - a setting exported in a way the start-up files do not name: by
+//!     another program, or by a file the shell reads that is not in the
+//!     autorun catalog;
 //!   - settings given on a tool's command line, such as `cargo install
 //!     --config 'source.crates-io.replace-with=...'`.
 //! - `sweep allow` on a package item runs the OSV lookup again: the item
@@ -37,6 +41,7 @@
 
 mod config;
 mod inventory;
+mod startup;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 

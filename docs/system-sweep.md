@@ -431,15 +431,41 @@ What is read and never run (links below these places are not followed, see below
   `MISE_DATA_DIR`) as node or python itself, or through its `npm:`, `pipx:`
   (with pipx or uv) and `cargo:` backends, read as above. Newer mise
   installs `npm:` tools with aube, in pnpm's layout (no `lib`): such a tool
-  is not read, and is said as not checked. Tools of other
+  is not read, and is said as not checked. So is an `npm:` tool with a file
+  bun, pnpm or aube leaves (`package.json`, `bun.lock`, `bun.lockb`,
+  `pnpm-lock.yaml`, `aube-lock.yaml` or `node_modules/.pnpm`) in its
+  directory or its `lib`, as when mise's `npm.package_manager` is bun or
+  pnpm: their own configuration (`bunfig.toml`, `BUN_CONFIG_REGISTRY`) is
+  not read. Tools of other
   backends are not covered: `aqua:`, `ubi:` and core tools such as Go are
   programs, not packages of a registry OSV knows, and a `go:` tool leaves
   only the program it built, with no module path and version beside it,
   although OSV has a Go ecosystem.
 
-A `CARGO_HOME`, `PIPX_HOME` or `MISE_DATA_DIR` that is not an absolute
-path is said, and nothing is read in its place. The variables are read from the sweep's own environment: the daily timer's
-sweep gets them only where they are set for your systemd user session.
+A `CARGO_HOME`, `PIPX_HOME`, `MISE_DATA_DIR`, `XDG_CONFIG_HOME` or
+`XDG_CONFIG_DIRS` entry that is not an absolute path is said, and nothing is
+read in its place. An empty `CARGO_HOME` or XDG directory counts as unset;
+an empty `PIPX_HOME` or `MISE_DATA_DIR` is said as not absolute. The variables are read from the sweep's own
+environment: the daily timer's sweep gets them only where they are set for
+your systemd user session.
+
+The tools may have run from a shell with settings the sweep does not see, so
+the shell start-up and environment files of the
+[auto-run locations](#auto-run-locations) (`/etc/environment`,
+`environment.d`, `/etc/profile` and `profile.d`, the bash, zsh and fish files,
+uwsm's environment files) are searched, in any case, for the names of the
+variables that set an index or registry: `PIP_INDEX_URL`,
+`PIP_EXTRA_INDEX_URL`, `PIP_FIND_LINKS`, `PIP_REQUIREMENT`,
+`PIP_CONSTRAINT`, `PIP_CONFIG_FILE`; `UV_INDEX*`, `UV_DEFAULT_INDEX`,
+`UV_EXTRA_INDEX_URL`, `UV_FIND_LINKS`, `UV_CONFIG_FILE`; and
+`npm_config_registry`, a scope's `npm_config_@scope:registry`,
+`npm_config_userconfig` and `npm_config_globalconfig`. A file that names
+one, whatever it sets it to, leaves out every package of that tool (for npm,
+as an npm file that cannot be read does), and is said. One that is there and
+cannot be read, a directory that cannot be listed or is nested more than 4
+deep, and files past the first 2,000 leave out the packages of all three.
+Completion, function, makepkg, readline and logout files are not searched:
+they do not set the environment the tools run in.
 
 A package whose name may be private is not sent anywhere, as far as the files
 the tools leave behind tell. Only packages from the public registry go to OSV:
@@ -467,7 +493,15 @@ from PyPI, crates from crates.io.
   `PREFIX` is not absolute, a file has a `${...}` in a key, or more than 100
   nodes are installed, no npm package is sent: a private registry may be
   set where it was not read. Settings under a `[section]` of a file are not
-  npm's own and are not read, and keys may be quoted, as in npm.
+  npm's own and are not read, and keys may be quoted, as in npm; a section
+  is a line that starts with `[` in its first column and ends with `]`, and
+  lines end at a CR or LF, as npm splits them. A double-quoted key with an
+  escape in it (npm decodes it as JSON) and a list key such as
+  `registry[]` are not read as npm reads them: the file counts as one that
+  cannot be read when such a key may be one read here. Only `prefix`,
+  `globalconfig`, `userconfig`, `ignore-scripts`, `registry` and each
+  scope's registry are taken from a file; the rest, tokens included, are
+  not kept.
 - pip: a package installed from an address or a local directory (it has a
   `direct_url.json`) is left out. So is every package of a pipx environment
   installed with another index or a requirements or constraints file
@@ -515,8 +549,11 @@ package:
 - a global npm package installed from git or a tarball (`npm i -g
   git+...`) under a name whose registry is the public one;
 - a Python package installed with `pip install --index-url` given on the
-  command line, into a Python mise installed or a pipx environment too old
-  to have a `pipx_metadata.json`;
+  command line, directly or in a requirements file named there, into a
+  Python mise installed or a pipx environment too old to have a
+  `pipx_metadata.json`;
+- a setting exported in a way the start-up files above do not name: by
+  another program, or by a file the shell reads that is not among them;
 - a setting given on a tool's command line, such as `cargo install --config
   'source.crates-io.replace-with=...'`.
 
