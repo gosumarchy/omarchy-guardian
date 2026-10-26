@@ -1444,3 +1444,43 @@ fn an_agents_entry_is_reviewed_whatever_its_key_is_named() {
         "{findings:?}"
     );
 }
+
+#[test]
+fn what_an_agents_entry_runs_is_shown_as_it_is_sent() {
+    let dir = planted(
+        "sweep-agent-runs",
+        &[(
+            "home/u/.claude/settings.json",
+            r#"{"hooks": {"Stop": [{"hooks": [
+                {"command": "export ANTHROPIC_API_KEY=plainsecretvalue1234; cmd"}
+            ]}]}}"#,
+        )],
+        &[],
+    );
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let collection = collect::collect(&Scope {
+        root: dir.path(),
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::System,
+    });
+    let mut report = Report::new("t", ReviewScope::default());
+    super::examine(&mut report, &collection, Some("home/u"), &HashSet::new());
+    let label = "~/.claude/settings.json#hooks/Stop/0/0";
+    let sent = report
+        .agent_input
+        .iter()
+        .find(|file| file.path == label)
+        .unwrap_or_else(|| panic!("{label} was not sent"));
+    let hook = collection
+        .items
+        .iter()
+        .find(|item| item.path == "home/u/.claude/settings.json#hooks/Stop/0/0")
+        .unwrap();
+    assert_eq!(hook.runs, [sent.content.trim_end()]);
+    assert!(
+        !sent.content.contains("plainsecretvalue1234"),
+        "{}",
+        sent.content
+    );
+}

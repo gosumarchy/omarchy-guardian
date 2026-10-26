@@ -822,8 +822,10 @@ fn a_line_loses_its_secrets_and_keeps_what_a_review_needs() {
             "echo <redacted-by-guardian>",
         ),
         (
-            "x aB3dE6gH9jK2mN5pQ8sT1vW4yZ7bC0eF",
-            "x <redacted-by-guardian>",
+            // Mixed case and digits are no sign of a token: base64 looks
+            // the same, and taking it out would hide a payload.
+            "echo aB3dE6gH9jK2mN5pQ8sT1vW4yZ7bC0eF | base64 -d | sh",
+            "echo aB3dE6gH9jK2mN5pQ8sT1vW4yZ7bC0eF | base64 -d | sh",
         ),
         (
             "x 0123456789abcdef0123456789abcdef sk-learn",
@@ -1445,9 +1447,11 @@ fn a_program_or_package_named_like_a_token_is_followed_and_shown() {
         Some("home/u/.claude/settings.json#hooks/Stop/0/0")
     );
     let hook = item("home/u/.claude/settings.json#hooks/Stop/0/0");
+    // Shown and sent without what looks like a token, even as the program;
+    // followed as written, above.
     assert_eq!(
         text(hook),
-        "sk-helper-script-one-two --api-key <redacted-by-guardian>\n"
+        "<redacted-by-guardian> --api-key <redacted-by-guardian>\n"
     );
     assert_eq!(hook.runs, [text(hook).trim_end()]);
     let server = item("home/u/.claude/settings.json#mcpServers/fs");
@@ -1455,35 +1459,89 @@ fn a_program_or_package_named_like_a_token_is_followed_and_shown() {
 }
 
 #[test]
-fn only_what_runs_keeps_a_token_shaped_name() {
+fn a_token_is_taken_out_by_its_look_anywhere_but_in_the_package_that_runs() {
+    let token = "sk-ant-api03-abcdefghijk";
+    let package = "sk-mcp-filesystem-tools";
     for (line, expected) in [
+        // In program position too.
+        (token.to_string(), "<redacted-by-guardian>".to_string()),
         (
-            "sk-helper-script-one-two sk-ant-api03-abcdefghijk",
-            "sk-helper-script-one-two <redacted-by-guardian>",
-        ),
-        ("a; sk-helper-script-one-two", "a; sk-helper-script-one-two"),
-        (
-            "env -i sk-helper-script-one-two",
-            "env -i sk-helper-script-one-two",
+            format!("cmd {token};"),
+            "cmd <redacted-by-guardian>;".to_string(),
         ),
         (
-            "sudo KEY=k sk-helper-script-one-two",
-            "sudo KEY=<redacted-by-guardian> sk-helper-script-one-two",
+            format!("x=$(echo {token})"),
+            "x=$(echo <redacted-by-guardian>)".to_string(),
         ),
         (
-            "uvx --python 3.12 sk-mcp-filesystem-tools",
-            "uvx --python 3.12 sk-mcp-filesystem-tools",
+            format!("FOO={token} cmd"),
+            "FOO=<redacted-by-guardian> cmd".to_string(),
         ),
         (
-            "pipx run sk-mcp-filesystem-tools",
-            "pipx run sk-mcp-filesystem-tools",
+            format!("cmd --foo={token}"),
+            "cmd --foo=<redacted-by-guardian>".to_string(),
+        ),
+        // The package a runner fetches is what runs: never taken out.
+        (format!("npx -y {package}"), format!("npx -y {package}")),
+        (
+            format!("bunx {package} {token}"),
+            format!("bunx {package} <redacted-by-guardian>"),
         ),
         (
-            "bunx sk-mcp-filesystem-tools sk-ant-api03-abcdefghijk",
-            "bunx sk-mcp-filesystem-tools <redacted-by-guardian>",
+            format!("npx -p {package} tool"),
+            format!("npx -p {package} tool"),
+        ),
+        (
+            format!("npx --package {package} tool"),
+            format!("npx --package {package} tool"),
+        ),
+        // After `-p`, the command is one the fetched package provides.
+        (
+            format!("npx -p tools {package}"),
+            format!("npx -p tools {package}"),
+        ),
+        (
+            format!("uvx --python 3.12 {package}"),
+            format!("uvx --python 3.12 {package}"),
+        ),
+        (
+            format!("uvx --from {package} tool"),
+            format!("uvx --from {package} tool"),
+        ),
+        (
+            format!("uvx --from tools {package}"),
+            format!("uvx --from tools {package}"),
+        ),
+        (format!("pipx run {package}"), format!("pipx run {package}")),
+        // Past a prefix's flags and their values.
+        (
+            format!("sudo -u x npx {package}"),
+            format!("sudo -u x npx {package}"),
+        ),
+        (
+            format!("env -u NAME npx {package}"),
+            format!("env -u NAME npx {package}"),
+        ),
+        (
+            format!("nice -n 5 uvx {package}"),
+            format!("nice -n 5 uvx {package}"),
+        ),
+        (
+            format!("xargs -I {{}} npx {package}"),
+            format!("xargs -I {{}} npx {package}"),
+        ),
+        (format!("a; npx {package}"), format!("a; npx {package}")),
+        // A runner's flag values are not packages elsewhere.
+        (
+            format!("npx --python {package}"),
+            format!("npx --python {package}"),
+        ),
+        (
+            format!("sudo -u {package} x"),
+            "sudo -u <redacted-by-guardian> x".to_string(),
         ),
     ] {
-        assert_eq!(redacted(line), expected, "{line}");
+        assert_eq!(redacted(&line), expected, "{line}");
     }
 }
 

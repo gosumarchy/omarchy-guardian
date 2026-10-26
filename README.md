@@ -31,9 +31,9 @@ it shows on hover:
   only what each hook, helper, MCP server or plugin starts is sent: its
   command line with token-shaped secrets taken out (logins in addresses,
   `Authorization` values, values after secret-named flags or names, words that
-  look like tokens), the names of its variables, or a remote server's host; of
-  Claude Code's `env`, only the variable names and the host of a base address
-  or proxy. Never the files themselves, which hold tokens and project history,
+  start like known tokens), the names of its variables, or a remote server's
+  host; of Claude Code's `env`, only the variable names and the host of a base
+  address or proxy. Never the files themselves, which hold tokens and project history,
   and nothing derived from a project's path. A file whose name or path marks
   it as holding keys or tokens (`.env`, `*.pem`, `*.key`, `id_ed25519`,
   anything under `.ssh` or `secrets`, and the like) is not sent, by any gate

@@ -7,13 +7,16 @@
 //! `is_token_shaped`), never a word with a shell character in it, never a
 //! path or an expansion (`$TOKEN`), which are what a review needs to see.
 //!
+//! A token is told by its look only where it starts as a known kind of
+//! token does (see `masked_tokens`).
+//!
 //! Not covered, and sent as written: a secret in a header other than
 //! `Authorization` (`X-Api-Key: …`), `curl -u user:password`, the word
 //! after a flag named for authorization rather than a secret
 //! (`--authorization v`), and a quoted value of several words.
 
 use crate::rules::RUNNER_VALUE_FLAGS;
-use crate::sweep::judge::secrets::{REDACTED, is_secret_name};
+use crate::sweep::judge::secrets::{REDACTED, is_secret_name, without_secrets};
 
 /// The beginnings of tokens that say what they are by themselves: Anthropic
 /// and `OpenAI` keys, GitHub, GitLab, Slack, AWS, Google, npm and `PyPI` tokens.
@@ -45,11 +48,6 @@ const TOKEN_PREFIXES: &[&str] = &[
 /// `sk-learn`.
 const MIN_PREFIXED_TOKEN: usize = 16;
 
-/// The shortest word with no telling beginning that is taken for a token
-/// when it mixes upper and lower case and digits. Arbitrary: a hash in hex
-/// or a UUID never mixes case, a token of 32 random characters always does.
-const MIN_BARE_TOKEN: usize = 32;
-
 /// What the word before asked of the next one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Next {
@@ -57,15 +55,128 @@ enum Next {
     Word,
     /// It is the value of a flag or header named for a secret.
     Value,
-    /// It is the program a command runs.
+    /// It is the program a command runs, a prefix such as `sudo`, or an
+    /// assignment before them.
     Program,
+    /// It is a flag of a prefix, an assignment, or the program after it.
+    PrefixArgs(Prefix),
+    /// It is the value of a flag of a prefix (`sudo -u build`).
+    PrefixValue(Prefix),
     /// It is the verb after `pipx`.
     PipxVerb,
-    /// It is the package `npx`, `bunx`, `uvx` or `pipx run` fetches and
-    /// runs, or a flag before it.
-    Package,
-    /// It is the value of a flag before such a package (`--python 3.12`).
-    PackageFlagValue,
+    /// It is the package `npx` or `bunx` runs, or a flag before it.
+    NpmPackage,
+    /// It is the value of npm's `-p` or `--package`: a package.
+    NpmPackageValue,
+    /// It is the package `uvx` or `pipx run` runs, or a flag before it.
+    UvPackage,
+    /// It is the value of `--from` or `--spec`: a package.
+    UvPackageValue,
+    /// It is the value of another flag before such a package
+    /// (`--python 3.12`).
+    UvFlagValue,
+}
+
+impl Next {
+    /// Whether the word is a package a runner fetches: never taken out by
+    /// its look, since it is what runs and what the review must see.
+    fn is_package(self) -> bool {
+        matches!(
+            self,
+            Self::NpmPackage | Self::NpmPackageValue | Self::UvPackage | Self::UvPackageValue
+        )
+    }
+}
+
+/// A program that runs the program after its own flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Prefix {
+    Sudo,
+    Env,
+    Nice,
+    Xargs,
+    Time,
+    /// `exec`, `nohup`, `command`: no flag of theirs takes a value.
+    Plain,
+}
+
+impl Prefix {
+    fn of(program: &str) -> Option<Self> {
+        match program {
+            "sudo" => Some(Self::Sudo),
+            "env" => Some(Self::Env),
+            "nice" => Some(Self::Nice),
+            "xargs" => Some(Self::Xargs),
+            "time" => Some(Self::Time),
+            "exec" | "nohup" | "command" => Some(Self::Plain),
+            _ => None,
+        }
+    }
+
+    /// The flags that take the next word as their value, from sudo(8) at
+    /// sudo.ws, and env(1), nice(1), xargs(1) and time(1) of the Linux man
+    /// pages (checked 2026-10-26). A flag with an optional value written
+    /// onto it (`xargs -i`, `-l`, `-e`) takes none.
+    fn value_flags(self) -> &'static [&'static str] {
+        match self {
+            Self::Sudo => &[
+                "-a",
+                "--auth-type",
+                "-C",
+                "--close-from",
+                "-c",
+                "--login-class",
+                "-D",
+                "--chdir",
+                "-g",
+                "--group",
+                "-h",
+                "--host",
+                "-p",
+                "--prompt",
+                "-R",
+                "--chroot",
+                "-r",
+                "--role",
+                "-t",
+                "--type",
+                "-T",
+                "--command-timeout",
+                "-U",
+                "--other-user",
+                "-u",
+                "--user",
+            ],
+            Self::Env => &[
+                "-a",
+                "--argv0",
+                "-u",
+                "--unset",
+                "-C",
+                "--chdir",
+                "-S",
+                "--split-string",
+            ],
+            Self::Nice => &["-n", "--adjustment"],
+            Self::Xargs => &[
+                "-a",
+                "--arg-file",
+                "-d",
+                "--delimiter",
+                "-E",
+                "-I",
+                "-L",
+                "-n",
+                "--max-args",
+                "-P",
+                "--max-procs",
+                "-s",
+                "--max-chars",
+            ],
+            Self::Time => &["-f", "--format", "-o", "--output"],
+            Self::Plain => &[],
+        }
+    }
 }
 
 /// `line` with the secrets in it taken out, as `REDACTED`:
@@ -76,8 +187,9 @@ enum Next {
 /// - the value of `NAME=value` where a name before an `=` is named for a
 ///   secret (`GITHUB_TOKEN=x`, `--env=API_KEY=x`, `--token=x`);
 /// - the word after a flag named for a secret (`--api-key x`);
-/// - a word that is a token by its look (see `is_token`), but for the
-///   program a command runs and the package `npx` and the like run.
+/// - a token by its look, inside any word (see `masked_tokens`), but for
+///   the package `npx` and the like run;
+/// - what the review's own removal takes out (`export API_KEY=…`).
 ///
 /// Each only where it is token-shaped. The line is read word by word, as
 /// blanks split it; quotes around a word stay where they are.
@@ -100,7 +212,9 @@ pub(super) fn redacted(line: &str) -> String {
     if let Some(start) = word_start {
         out.push_str(&redacted_word(&line[start..], &mut next));
     }
-    out
+    // The review's own removal too, so what is shown and saved is what is
+    // sent (`export API_KEY=…; cmd`).
+    without_secrets(&out)
 }
 
 /// One word of a line, with what the word before asked of it.
@@ -113,6 +227,7 @@ fn redacted_word(word: &str, next: &mut Next) -> String {
     let at = word.len() - word.trim_start_matches(quotes).len();
     let (before, after) = (&word[..at], &word[at + core.len()..]);
     let asked = std::mem::replace(next, Next::Word);
+    let written = core;
     let lower = core.to_ascii_lowercase();
     let core = if matches!(lower.as_str(), "bearer" | "basic")
         || (asked == Next::Value && is_auth_scheme(&lower))
@@ -138,47 +253,67 @@ fn redacted_word(word: &str, next: &mut Next) -> String {
         if core.starts_with('-') && !core.contains('=') && is_secret_name(&core) {
             *next = Next::Value;
             core
-        } else if let Some(assigned) = without_assigned_secret(&core) {
-            assigned
-        } else if !matches!(asked, Next::Program | Next::Package) && is_token(&core) {
-            // What runs is never taken out by its look: a program or
-            // package named like a token (`sk-helper`) is what the review
-            // must see.
-            REDACTED.to_string()
         } else {
-            core
+            without_assigned_secret(&core).unwrap_or(core)
         }
     };
+    let core = if asked.is_package() {
+        core
+    } else {
+        masked_tokens(&core)
+    };
     if *next == Next::Word {
-        *next = following(asked, &lower);
+        *next = following(asked, written);
     }
     format!("{before}{core}{after}")
 }
 
-/// What the word `lower`, itself what `asked` says, makes of the next one:
-/// a shell separator, a prefix such as `sudo`, an assignment before a
-/// program, or a flag of such a prefix (`env -i`) leads to a program; `npx`, `bunx`, `uvx` and `pipx run` to the
-/// package they run.
-fn following(asked: Next, lower: &str) -> Next {
-    let program = lower.rsplit('/').next().unwrap_or(lower);
+/// What the word `word`, itself what `asked` says, makes of the next one.
+/// Flags and programs are told apart in their case (`xargs -I`, `-i`).
+/// A shell separator leads to a program. A prefix (`sudo`, `env`) leads
+/// to its flags, the values of those, assignments and then the program.
+/// `npx` and `bunx` lead to the package they run, also as the value of
+/// `-p` or `--package`; `uvx` and `pipx run` to theirs, also as the value
+/// of `--from` or `--spec`, past the values of their other flags.
+fn following(asked: Next, word: &str) -> Next {
+    if word.ends_with([';', '|', '&']) {
+        return Next::Program;
+    }
+    let flag = word.starts_with('-');
     match asked {
-        _ if lower.ends_with([';', '|', '&']) => Next::Program,
-        Next::Program if matches!(program, "npx" | "bunx" | "uvx") => Next::Package,
-        Next::Program if program == "pipx" => Next::PipxVerb,
-        Next::PipxVerb if lower == "run" => Next::Package,
-        Next::Program
-            if matches!(
-                program,
-                "sudo" | "env" | "exec" | "nohup" | "command" | "time"
-            ) || lower.contains('=')
-                || lower.starts_with('-') =>
-        {
-            Next::Program
+        Next::Program | Next::PrefixArgs(_) if !flag && word.contains('=') => asked,
+        Next::PrefixArgs(prefix) if flag => {
+            if prefix.value_flags().contains(&word) {
+                Next::PrefixValue(prefix)
+            } else {
+                Next::PrefixArgs(prefix)
+            }
         }
-        Next::Package if RUNNER_VALUE_FLAGS.contains(&lower) => Next::PackageFlagValue,
-        Next::Package if lower.starts_with('-') => Next::Package,
-        Next::PackageFlagValue => Next::Package,
-        Next::Word | Next::Value | Next::Program | Next::PipxVerb | Next::Package => Next::Word,
+        Next::PrefixValue(prefix) => Next::PrefixArgs(prefix),
+        Next::Program | Next::PrefixArgs(_) => {
+            program_word(word.rsplit('/').next().unwrap_or(word))
+        }
+        Next::PipxVerb if word == "run" => Next::UvPackage,
+        Next::NpmPackage if matches!(word, "-p" | "--package") => Next::NpmPackageValue,
+        Next::NpmPackage if flag => Next::NpmPackage,
+        Next::NpmPackageValue => Next::NpmPackage,
+        Next::UvPackage if matches!(word, "--from" | "--spec") => Next::UvPackageValue,
+        Next::UvPackage if RUNNER_VALUE_FLAGS.contains(&word) => Next::UvFlagValue,
+        Next::UvPackage if flag => Next::UvPackage,
+        Next::UvPackageValue | Next::UvFlagValue => Next::UvPackage,
+        Next::Word | Next::Value | Next::PipxVerb | Next::NpmPackage | Next::UvPackage => {
+            Next::Word
+        }
+    }
+}
+
+/// What the program `program` makes of the word after it.
+fn program_word(program: &str) -> Next {
+    match program {
+        "npx" | "bunx" => Next::NpmPackage,
+        "uvx" => Next::UvPackage,
+        "pipx" => Next::PipxVerb,
+        other => Prefix::of(other).map_or(Next::Word, Next::PrefixArgs),
     }
 }
 
@@ -257,19 +392,33 @@ pub(super) fn without_login(word: &str) -> String {
     out
 }
 
-/// Whether `word` is a token by its look: one of `TOKEN_PREFIXES` and at
-/// least `MIN_PREFIXED_TOKEN` characters, or at least `MIN_BARE_TOKEN`
-/// characters that mix upper and lower case and digits; letters, digits,
-/// `_`, `-` and `.` only.
-fn is_token(word: &str) -> bool {
-    let plain = word
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
-    let prefixed = word.len() >= MIN_PREFIXED_TOKEN
-        && TOKEN_PREFIXES.iter().any(|prefix| word.starts_with(prefix));
-    let mixed = word.len() >= MIN_BARE_TOKEN
-        && word.chars().any(|c| c.is_ascii_uppercase())
-        && word.chars().any(|c| c.is_ascii_lowercase())
-        && word.chars().any(|c| c.is_ascii_digit());
-    plain && (prefixed || mixed)
+/// `word` with each token in it by its look taken out: each longest run of
+/// letters, digits, `_`, `.` and `-` that starts with one of
+/// `TOKEN_PREFIXES` and is at least `MIN_PREFIXED_TOKEN` long. What is
+/// around it stays (`$(echo sk-…)`, `--key=sk-…;`).
+///
+/// Only a known prefix tells a token by its look. A long run of mixed case
+/// and digits is no sign: a base64 payload looks the same
+/// (`echo <base64> | base64 -d | sh`), and taking it out would hide code
+/// from the review.
+fn masked_tokens(word: &str) -> String {
+    let is_token_character = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-');
+    let mut out = String::with_capacity(word.len());
+    let mut rest = word;
+    while let Some(start) = rest.find(is_token_character) {
+        out.push_str(&rest[..start]);
+        let run = &rest[start..];
+        let end = run
+            .find(|c: char| !is_token_character(c))
+            .unwrap_or(run.len());
+        let candidate = &run[..end];
+        let token = candidate.len() >= MIN_PREFIXED_TOKEN
+            && TOKEN_PREFIXES
+                .iter()
+                .any(|prefix| candidate.starts_with(prefix));
+        out.push_str(if token { REDACTED } else { candidate });
+        rest = &run[end..];
+    }
+    out.push_str(rest);
+    out
 }

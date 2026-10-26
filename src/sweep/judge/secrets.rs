@@ -32,7 +32,7 @@ pub(in crate::sweep) const REDACTED: &str = "<redacted-by-guardian>";
 /// provider on a timer. Only a plain literal is taken out: a value that is
 /// computed (`$(…)`, a variable, a path) is code or configuration to
 /// review, and holds no secret itself.
-pub(super) fn without_secrets(text: &str) -> String {
+pub(in crate::sweep) fn without_secrets(text: &str) -> String {
     text.split_inclusive('\n')
         .map(|line| {
             let line = redact_line(line).unwrap_or_else(|| line.to_string());
