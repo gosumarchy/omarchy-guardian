@@ -198,6 +198,17 @@ fn changes(
     let mut bytes = 0;
     let mut sent = Vec::new();
     for file in changed {
+        if super::runs_unread(file) {
+            // Not read: the review cannot judge it. A binary body is what
+            // the judge reports as code that runs unread, and no hash
+            // keeps the record from moving on until the plugin is allowed.
+            sent.push(Sent {
+                path: file.clone(),
+                sha256: None,
+                body: Body::Binary("code that runs unread"),
+            });
+            continue;
+        }
         let (sha256, body) = match read::look(root, &format!("{path}/{file}")) {
             Found::File {
                 sha256, size, head, ..

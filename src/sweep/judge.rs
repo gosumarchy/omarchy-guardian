@@ -241,9 +241,10 @@ fn plugin_files(report: &mut Report, plugin: &nvim::Plugin, label: &str) -> Opti
             Body::Unreadable(reason) => report
                 .gaps
                 .push(Gap::Sweep(format!("{shown}: could not be read ({reason})"))),
-            Body::Binary(_) | Body::Link(_) | Body::Plugin(_) => {
-                report.gaps.push(Gap::RunsUnread(shown));
-            }
+            Body::Binary(_) => report.gaps.push(Gap::RunsUnread(format!(
+                "{shown}: new or changed, and Neovim runs it without the review reading it; check it, then `sweep allow` the plugin"
+            ))),
+            Body::Link(_) | Body::Plugin(_) => report.gaps.push(Gap::RunsUnread(shown)),
         }
     }
     Some(nvim::fact(plugin, label))

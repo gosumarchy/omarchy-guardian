@@ -1349,6 +1349,11 @@ fn a_changed_plugin_sends_its_changed_files_and_keeps_secret_named_ones() {
     let gaps: Vec<String> = report.gaps.iter().map(ToString::to_string).collect();
     assert_eq!(gaps.len(), 2, "{gaps:?}");
     assert!(gaps.iter().all(|gap| gap.contains(label)), "{gaps:?}");
+    assert!(
+        gaps.iter()
+            .any(|gap| gap.contains("compiled.lua: new or changed, and Neovim runs it")),
+        "{gaps:?}"
+    );
 }
 
 #[test]

@@ -650,6 +650,44 @@ fn only_new_or_changed_code_files_are_sent() {
 }
 
 #[test]
+fn a_changed_native_library_or_remote_plugin_is_reported_not_sent() {
+    let temp = TempDir::new("nvim-unread-code");
+    let root = temp.path();
+    plugin(
+        root,
+        "p",
+        "https://github.com/o/p",
+        &[
+            ("lua/p.lua", "same"),
+            ("lua/fuzzy.so", "\x7fELF new"),
+            ("rplugin/python3/p.py", "import os"),
+            ("doc/p.txt", "help"),
+        ],
+    );
+    let before = record(
+        "p",
+        &[("lua/p.lua", "same"), ("lua/fuzzy.so", "\x7fELF old")],
+    );
+    let (items, _) = planned(root, &before, true);
+    let Review::Changed(sent) = &plugin_of(&items[0]).review else {
+        panic!("{:?}", plugin_of(&items[0]).review);
+    };
+    let paths: Vec<&str> = sent.iter().map(|file| file.path.as_str()).collect();
+    assert_eq!(paths, ["lua/fuzzy.so", "rplugin/python3/p.py"]);
+    assert!(
+        sent.iter()
+            .all(|file| file.sha256.is_none() && matches!(file.body, Body::Binary(_)))
+    );
+    // Nothing of it was read, so the record keeps what it had.
+    let settled = settle(&items, &before, &Report::new("t"), &label);
+    assert_eq!(
+        settled["p"].get("lua/fuzzy.so"),
+        Some(&digest("\x7fELF old"))
+    );
+    assert_eq!(settled["p"].get("rplugin/python3/p.py"), None);
+}
+
+#[test]
 fn a_plugin_too_large_to_review_is_not_read() {
     let temp = TempDir::new("nvim-large");
     let root = temp.path();

@@ -418,8 +418,11 @@ them. So a later sweep costs one review's share per plugin that changed, and
 none when nothing did. A file whose path marks it as holding secrets is read
 by the local rules only and raises `kept-from-review`. At most 1,500 files or
 4 MiB of one plugin are sent in one sweep; past that the sweep is incomplete
-and says so: read the plugin yourself and allow it. A plugin you allowed is
-not reviewed again until it changes.
+and says so: read the plugin yourself and allow it. A native library (`*.so`)
+or a file of a remote plugin (`rplugin/`) that is new or changed since the
+record is code Neovim runs that the review cannot read: the sweep is
+incomplete and names it, until you check the plugin and allow it. A plugin
+you allowed is not reviewed again until it changes.
 
 The record (`nvim-plugins.json` in the sweep's directory of the review store)
 holds each plugin's code files and their hashes. A plugin's entry moves on
@@ -436,9 +439,8 @@ are.
 
 Not covered: plugins of other managers (packer, vim-plug, Neovim's own
 `pack/*/start` under your data directory), a lazy.nvim `root` other than the
-default, specs built by code, other files of a plugin (data, documentation,
-compiled libraries, Python or Node remote plugins), which count for whether it
-changed but are not sent, and what lazy.nvim fetches when a plugin is
+default, specs built by code, other files of a plugin (data, documentation), which
+count for whether it changed but are neither sent nor reported, and what lazy.nvim fetches when a plugin is
 installed or updated: the sweep sees a plugin once it is on disk.
 
 ### Accounts, keys and trust anchors

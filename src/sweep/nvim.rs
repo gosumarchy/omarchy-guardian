@@ -115,9 +115,10 @@ pub(crate) struct Plugin {
     commit: Option<String>,
     /// The commit `lazy-lock.json` pins for it.
     locked: Option<String>,
-    /// Its code files (Lua, Vimscript, shell and build files), relative to
-    /// its directory, with their hashes: what the record keeps, and what is
-    /// reviewed once it changes.
+    /// Its code files (Lua, Vimscript, shell and build files) and the
+    /// files that run unread (see `runs_unread`), relative to its
+    /// directory, with their hashes: what the record keeps, and what is
+    /// reviewed, or reported, once it changes.
     code: BTreeMap<String, Digest>,
     /// The build steps its specs give.
     builds: Vec<Build>,
@@ -558,10 +559,20 @@ fn code_files(files: &[(String, Entry)]) -> BTreeMap<String, Digest> {
     files
         .iter()
         .filter_map(|(path, entry)| match entry {
-            Entry::File(digest) if is_code(path) => Some((path.clone(), *digest)),
+            Entry::File(digest) if is_code(path) || runs_unread(path) => {
+                Some((path.clone(), *digest))
+            }
             Entry::File(_) | Entry::Link(_) => None,
         })
         .collect()
+}
+
+/// Whether the file at `path` of a plugin is code Neovim runs that the
+/// review cannot read: a native library (a Lua C module, a fuzzy matcher
+/// built at install) or a file of a remote plugin (`rplugin/`, run by a
+/// Python or Node host). A change to one is reported, never sent.
+pub(super) fn runs_unread(path: &str) -> bool {
+    !is_code(path) && (read::has_extension(path, "so") || path.starts_with("rplugin/"))
 }
 
 /// File name endings of the code files reviewed: Lua, Vimscript, shell and
