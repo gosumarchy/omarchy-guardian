@@ -20,10 +20,11 @@ const SECRET_NAMES: &[&str] = &[
     "PASS",
     "PWD",
     "PSK",
+    "BEARER",
 ];
 
 /// What stands where a value was taken out.
-pub(super) const REDACTED: &str = "<redacted-by-guardian>";
+pub(in crate::sweep) const REDACTED: &str = "<redacted-by-guardian>";
 
 /// `text` with the values of assignments that look like secrets
 /// (`export API_KEY=…`, `Environment=TOKEN=…`, fish's `set -gx TOKEN …`)
@@ -32,7 +33,7 @@ pub(super) const REDACTED: &str = "<redacted-by-guardian>";
 /// provider on a timer. Only a plain literal is taken out: a value that is
 /// computed (`$(…)`, a variable, a path) is code or configuration to
 /// review, and holds no secret itself.
-pub(super) fn without_secrets(text: &str) -> String {
+pub(in crate::sweep) fn without_secrets(text: &str) -> String {
     text.split_inclusive('\n')
         .map(|line| {
             // The hash first: a user name with `KEY=` in it would
@@ -329,16 +330,43 @@ fn redact_line(line: &str) -> Option<String> {
     changed.then_some(out)
 }
 
-/// Whether a part of `name` (between `_`) is one of `SECRET_NAMES`:
-/// `OPENAI_API_KEY` and `DB_PASSWORD` are, `AuthorizedKeysCommand` and
-/// `KEYMAP` are not.
+/// Whether a part of `name` is one of `SECRET_NAMES`: `OPENAI_API_KEY`,
+/// `DB_PASSWORD`, `--api-key` and `clientSecret` are, `AuthorizedKeysCommand`
+/// and `KEYMAP` are not. Parts are split at anything but a letter or digit,
+/// and where a lower-case letter or digit is followed by an upper-case one.
 ///
 /// A name written as one word counts where it ends in one of
 /// `SECRET_ENDINGS` (`PGPASSWORD`, `MYSQLPASSWORD`).
-pub(super) fn is_secret_name(name: &str) -> bool {
-    let name = name.to_ascii_uppercase();
-    name.split('_').any(|part| SECRET_NAMES.contains(&part))
-        || (!name.contains('_') && SECRET_ENDINGS.iter().any(|ending| name.ends_with(ending)))
+pub(in crate::sweep) fn is_secret_name(name: &str) -> bool {
+    let parts = name_parts(name);
+    parts
+        .iter()
+        .any(|part| SECRET_NAMES.contains(&part.as_str()))
+        || (parts.len() == 1
+            && SECRET_ENDINGS
+                .iter()
+                .any(|ending| parts[0].ends_with(ending)))
+}
+
+/// The parts of a name, in upper case (see `is_secret_name`).
+fn name_parts(name: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut previous_lower = false;
+    for character in name.chars() {
+        if !character.is_ascii_alphanumeric() {
+            parts.extend((!current.is_empty()).then(|| std::mem::take(&mut current)));
+            previous_lower = false;
+            continue;
+        }
+        if character.is_ascii_uppercase() && previous_lower {
+            parts.push(std::mem::take(&mut current));
+        }
+        previous_lower = character.is_ascii_lowercase() || character.is_ascii_digit();
+        current.push(character.to_ascii_uppercase());
+    }
+    parts.extend((!current.is_empty()).then_some(current));
+    parts
 }
 
 /// How a secret's name ends where it is written as one word.

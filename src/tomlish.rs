@@ -157,6 +157,36 @@ pub(crate) fn is_empty_container(raw: &str) -> bool {
     })
 }
 
+/// The entries of an inline table value (`{ A = "x", b.c = [1] }` gives
+/// `A` with `"x"` and `b`, `c` with `[1]`), each value as its source text;
+/// `None` when the value is no inline table or cannot be delimited. A date
+/// and time written with a blank in it is not read.
+pub(crate) fn inline_table_entries(raw: &str) -> Option<Vec<(Vec<String>, String)>> {
+    let inner = raw.strip_prefix('{')?.strip_suffix('}')?;
+    let mut reader = Reader {
+        bytes: inner.as_bytes(),
+        position: 0,
+        counted: Cell::new((0, 1)),
+    };
+    let mut entries = Vec::new();
+    loop {
+        reader.skip_blank_lines();
+        if reader.peek().is_none() {
+            return Some(entries);
+        }
+        let key = reader.key_path().ok()?;
+        reader.expect(b'=', "expected '=' after key").ok()?;
+        let value = reader.inline_value().ok()?;
+        entries.push((key, value));
+        reader.skip_blank_lines();
+        match reader.peek() {
+            None => return Some(entries),
+            Some(b',') => reader.position += 1,
+            Some(_) => return None,
+        }
+    }
+}
+
 /// A typed value in Guardian's own config file. Only the forms the config
 /// uses are supported; anything else is `None` and becomes a config error.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -476,6 +506,40 @@ impl Reader<'_> {
         Ok(value.to_string())
     }
 
+    /// One value inside an inline table, as its source text: up to the
+    /// blank, `,` or end that follows it outside strings, arrays and nested
+    /// tables.
+    fn inline_value(&mut self) -> Result<String, ParseError> {
+        self.skip_spaces();
+        let start = self.position;
+        let mut depth = 0_usize;
+        let mut ignored = Vec::new();
+        loop {
+            match self.peek() {
+                None | Some(b',' | b' ' | b'\t' | b'\n' | b'\r') if depth == 0 => break,
+                None => return Err(self.error("unterminated array or inline table")),
+                Some(b'"' | b'\'') => self.copy_string(&mut ignored)?,
+                Some(b'[' | b'{') => {
+                    depth += 1;
+                    self.position += 1;
+                }
+                Some(b']' | b'}') => {
+                    depth = depth
+                        .checked_sub(1)
+                        .ok_or_else(|| self.error("unbalanced bracket in value"))?;
+                    self.position += 1;
+                }
+                Some(_) => self.position += 1,
+            }
+        }
+        let value = String::from_utf8(self.bytes[start..self.position].to_vec())
+            .map_err(|_| self.error("invalid UTF-8"))?;
+        if value.is_empty() {
+            return Err(self.error("missing value"));
+        }
+        Ok(value)
+    }
+
     fn copy_string(&mut self, output: &mut Vec<u8>) -> Result<(), ParseError> {
         let rest = self.rest();
         let (delimiter, multiline): (&[u8], bool) = if rest.starts_with(b"\"\"\"") {
@@ -520,8 +584,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        Value, array_table_items, entries, is_empty_container, string_field, string_value,
-        typed_value,
+        Value, array_table_items, entries, inline_table_entries, is_empty_container, string_field,
+        string_value, typed_value,
     };
     use crate::config::file::{PartialConfig, PartialPolicy, parse};
     use crate::config::model::{Named, SourceClass};
@@ -1093,5 +1157,29 @@ multi "line" ]
             refused += 1;
         }
         assert!(refused > 2_000, "{refused}");
+    }
+
+    #[test]
+    fn inline_table_entries_keep_each_value_as_written() {
+        let document = r#"env = { TOKEN = "a, b = c", "DOTTED.NAME" = 'x', nested = { y = [1, "]"] }, a.b = 2 }"#;
+        let parsed = entries(document).unwrap();
+        let found = inline_table_entries(&parsed[0].value).unwrap();
+        let keys: Vec<String> = found.iter().map(|(key, _)| key.join("|")).collect();
+        assert_eq!(keys, ["TOKEN", "DOTTED.NAME", "nested", "a|b"]);
+        let values: Vec<&str> = found.iter().map(|(_, value)| value.as_str()).collect();
+        assert_eq!(values, [r#""a, b = c""#, "'x'", r#"{ y = [1, "]"] }"#, "2"]);
+        assert_eq!(inline_table_entries("{}").unwrap(), Vec::new());
+        assert_eq!(inline_table_entries("{ A = 1, }").unwrap().len(), 1);
+        for odd in [
+            "[1]",
+            "\"x\"",
+            "{ A }",
+            "{ A = }",
+            "{ A = 1 B = 2 }",
+            "{ = 1 }",
+            "{ A = \"x }",
+        ] {
+            assert_eq!(inline_table_entries(odd), None, "{odd}");
+        }
     }
 }

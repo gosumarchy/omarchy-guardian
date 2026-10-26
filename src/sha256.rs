@@ -115,6 +115,26 @@ impl Digest {
     }
 }
 
+/// HMAC-SHA256 of `message` (RFC 2104), keyed by the 32 bytes of `key`.
+/// A key of a digest's size is shorter than a block, so it is used as it
+/// is, padded with zeros.
+pub(crate) fn hmac(key: &Digest, message: &[u8]) -> Digest {
+    let pad = |byte: u8| {
+        let mut block = [byte; BLOCK_LEN];
+        for (padded, key) in block.iter_mut().zip(key.0) {
+            *padded ^= key;
+        }
+        block
+    };
+    let mut inner = Sha256::new();
+    inner.update(&pad(0x36));
+    inner.update(message);
+    let mut outer = Sha256::new();
+    outer.update(&pad(0x5c));
+    outer.update(&inner.finalize().0);
+    outer.finalize()
+}
+
 impl fmt::Debug for Digest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Digest({self})")
@@ -313,6 +333,20 @@ mod tests {
         assert_eq!(
             hex(&[b'a'; 64]),
             "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb"
+        );
+    }
+
+    #[test]
+    fn hmac_matches_rfc_4231() {
+        // RFC 4231, test case 1: a key of 20 bytes of 0x0b, given here as
+        // the first 20 of 32 bytes; the other 12 are zeros, as HMAC pads
+        // any short key.
+        let mut key = "0b".repeat(20);
+        key.push_str(&"00".repeat(12));
+        let key = Digest::from_hex(&key).unwrap();
+        assert_eq!(
+            super::hmac(&key, b"Hi There").to_string(),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
     }
 }

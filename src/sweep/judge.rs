@@ -3,7 +3,7 @@
 //! like any other source, with the review memory, so an unchanged system
 //! costs no AI call on the next sweep.
 
-mod secrets;
+pub(super) mod secrets;
 mod variables;
 
 use std::fmt::Write as _;
@@ -147,7 +147,7 @@ fn examine(
                 // the item is listed under.
                 let written = text;
                 let text = without_secrets(text);
-                let file = shown_path(collect::file_of(item), home);
+                let file = shown_path(checked_path(item), home);
                 if reading == Some(Reading::Reviewed) {
                     review::analyze_text(report, &file, &text, false);
                     facts.push(fact(item, &label));
@@ -371,6 +371,25 @@ impl Reading {
     }
 }
 
+/// Whether `item` is an entry of an AI coding agent's configuration,
+/// named by its file and its key in it (see `sweep::agents`).
+fn is_agent_entry(item: &Item) -> bool {
+    item.category == Category::Agent && item.path.contains('#')
+}
+
+/// The path the local checks are told an item's text has: its file's own,
+/// and for an agent's entry the configuration file it is in. The key after
+/// `#` is the configuration's choice, so a server named `notes.md` is not
+/// taken for documentation the rules skip.
+fn checked_path(item: &Item) -> &str {
+    let file = collect::file_of(item);
+    if is_agent_entry(item) {
+        file.split_once('#').map_or(file, |(config, _)| config)
+    } else {
+        file
+    }
+}
+
 /// File name endings of scripts.
 const SCRIPT_EXTENSIONS: &[&str] = &[
     "sh", "bash", "zsh", "ksh", "dash", "fish", "py", "pl", "rb", "js", "mjs", "cjs", "ts", "lua",
@@ -383,6 +402,12 @@ const SCRIPT_EXTENSIONS: &[&str] = &[
 /// `~/.ssh`), never of the name the item is listed under, which may carry
 /// what a live check saw (`…/.env:tcp-3001`).
 fn reading(item: &Item, home: Option<&str>, text: &str) -> Reading {
+    // An agent's entry holds only what it starts, its secrets taken out
+    // already; its name ends in a key the configuration chose
+    // (`…#mcpServers/token.md`), which says nothing of what it holds.
+    if is_agent_entry(item) {
+        return Reading::Reviewed;
+    }
     if is_local_only(item, home) {
         return Reading::Settings;
     }

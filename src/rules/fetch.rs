@@ -354,6 +354,109 @@ fn node_installs_address(command: &Command) -> bool {
         })
 }
 
+/// uv and pipx running a Python package fetched for the occasion, at
+/// whatever version is newest: `uvx pkg`, `uv tool run pkg`, `pipx run
+/// pkg`. Neither asks first, like `bunx`.
+fn python_runs_fetched(command: &Command) -> bool {
+    let run = match unversioned(&command.program) {
+        "uvx" => Some(&command.arguments[..]),
+        "uv" => after(command, &["tool"])
+            .and_then(|rest| rest.split_first())
+            .filter(|(verb, _)| *verb == "run")
+            .map(|(_, rest)| rest),
+        "pipx" => after(command, &["run"]),
+        _ => None,
+    };
+    run.and_then(fetched_package).is_some_and(|package| {
+        is_remote_package(package) || (is_unpinned(package) && !package.contains("=="))
+    })
+}
+
+/// The flags of `uv tool run` (from uv's CLI reference, checked
+/// 2026-10-26) and `pipx run` that take a value as the next word.
+const RUNNER_VALUE_FLAGS: &[&str] = &[
+    "--allow-insecure-host",
+    "--trusted-host",
+    "--build-constraints",
+    "--build-constraint",
+    "-b",
+    "--cache-dir",
+    "--color",
+    "--config-file",
+    "--config-setting",
+    "--config-settings",
+    "-C",
+    "--config-settings-package",
+    "--constraints",
+    "--constraint",
+    "-c",
+    "--default-index",
+    "--directory",
+    "--env-file",
+    "--exclude-newer",
+    "--exclude-newer-package",
+    "--extra-index-url",
+    "--find-links",
+    "-f",
+    "--fork-strategy",
+    "--index",
+    "--index-strategy",
+    "--index-url",
+    "-i",
+    "--keyring-provider",
+    "--link-mode",
+    "--no-binary-package",
+    "--no-build-isolation-package",
+    "--no-build-package",
+    "--no-sources-package",
+    "--overrides",
+    "--override",
+    "--pip-args",
+    "--prerelease",
+    "--prerelease-package",
+    "--project",
+    "--python",
+    "-p",
+    "--python-platform",
+    "--refresh-package",
+    "--reinstall-package",
+    "--resolution",
+    "--torch-backend",
+    "--upgrade-group",
+    "--upgrade-package",
+    "-P",
+    "--with",
+    "-w",
+    "--with-editable",
+    "--with-requirements",
+];
+
+/// The package `uvx`, `uv tool run` or `pipx run` fetches out of what
+/// follows it: the value of `--from` (or `--spec`) where it is given,
+/// else the first word that is no flag. The values of the flags that take
+/// one (`--python 3.12`, `--with x`) are not the package.
+fn fetched_package(run: &[String]) -> Option<&str> {
+    let mut words = run.iter();
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "--from" | "--spec" => return words.next().map(String::as_str),
+            flag if RUNNER_VALUE_FLAGS.contains(&flag) => {
+                words.next();
+            }
+            flag if flag.starts_with('-') => {
+                if let Some(package) = ["--from=", "--spec="]
+                    .iter()
+                    .find_map(|prefix| flag.strip_prefix(prefix))
+                {
+                    return Some(package);
+                }
+            }
+            package => return Some(package),
+        }
+    }
+    None
+}
+
 /// `go run` or `go install` of a module on another host at whatever its
 /// newest version is, and `cargo install --git`.
 fn builds_from_address(command: &Command) -> bool {
@@ -380,7 +483,7 @@ fn builds_from_address(command: &Command) -> bool {
 /// rather than from this source or a registry by name.
 pub(super) fn installs_remote_code(line: &str) -> bool {
     if ![
-        "pip", "uv ", "npm ", "npx ", "pnpm ", "yarn ", "bun", "go ", "cargo ",
+        "pip", "uv ", "uvx", "npm ", "npx ", "pnpm ", "yarn ", "bun", "go ", "cargo ",
     ]
     .iter()
     .any(|word| line.contains(word))
@@ -396,6 +499,7 @@ pub(super) fn installs_remote_code(line: &str) -> bool {
             let fed_by_fetch = at > 0 && fetches(parts[at - 1]);
             pip_installs_address(&command, fed_by_fetch)
                 || node_installs_address(&command)
+                || python_runs_fetched(&command)
                 || builds_from_address(&command)
         })
     })
@@ -528,6 +632,17 @@ mod tests {
             "npx github:someone/pkg",
             "pnpm dlx some-tool",
             "bunx some-tool",
+            "uvx some-tool",
+            "uvx --from git+https://x.example/a/b tool",
+            "uvx --from=some-pkg tool",
+            "uvx --python 3.12 some-tool",
+            "uvx -p 3.12.1 --with rich==13.0.0 some-tool",
+            "uvx --with-requirements pinned==1.0.0 some-tool",
+            "uvx -w rich==13.0.0 some-tool",
+            "uvx -c constraints==1.0.0 --exclude-newer 2024-01-01 some-tool",
+            "pipx run --spec some-pkg tool",
+            "uv tool run some-tool@latest",
+            "pipx run some-tool",
             "go run x.example/a/b/cmd/tool@latest",
             "go install x.example/a/tool@latest",
             "cargo install --git https://x.example/a/b tool",
@@ -553,6 +668,14 @@ mod tests {
             "npx --yes some-tool@1.2.3",
             "npx -y @scope/tool@2.0.0 build",
             "pnpm dlx some-tool@3.1.0",
+            "uvx some-tool@1.2.3",
+            "uvx some-tool==1.2.3 --help",
+            "uvx --python 3.12 some-tool@1.2.3",
+            "uvx --with rich some-tool==1.2.3",
+            "uvx --from some-tool==1.2.3 tool",
+            "uv tool install some-tool",
+            "uv run pytest",
+            "pipx run some-tool==2.0",
             "go build ./...",
             "go install ./cmd/tool",
             "go install x.example/a/tool@v1.2.3",
