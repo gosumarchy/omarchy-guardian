@@ -376,8 +376,9 @@ Neovim runs that code at every start. The sweep lists each plugin as one item,
 under its directory, whose hash covers every file of it outside `.git` (a
 file's mode included), the address it was cloned from, the commit it is at, and
 what may make git run a program in it: the hooks and the keys that run commands
-of the checkout and of each submodule under `.git/modules`, and every entry of
-those git directories that is not plain data. A plugin that is updated, edited,
+of the checkout and of each submodule under `.git/modules`, the keys that point
+a fetch at a remote other than `origin`, and every entry of those git
+directories that is not plain data. A plugin that is updated, edited,
 moved to another address or given a hook is changed, shows in `--diff` and in
 the daily notification, and an allow covers it as a whole until it changes.
 Plain data is what git only reads: `objects`, `refs`, `HEAD`, `index`,
