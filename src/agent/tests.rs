@@ -12,6 +12,7 @@ use super::{
 use crate::config::model::SourceClass;
 use crate::config::model::{AgentSettings, Thinking};
 use crate::engine::request::Request;
+use crate::error::Error;
 use crate::json::Json;
 use crate::report::Severity;
 use crate::test_support::{
@@ -100,6 +101,17 @@ fn claude_code_results_are_judged_like_opencode_ones() {
         claude_verdict(began, Some(Failure::TimedOut), "n1"),
         Err(AgentError::OutOfTime(_))
     ));
+    // Only Guardian's own time limit is a timeout; the CLI saying so is a
+    // failure like any other.
+    assert!(matches!(
+        claude_verdict(began, Some(Failure::Failed("timed out".into())), "n1"),
+        Err(AgentError::Invalid(_))
+    ));
+    let started = scan_events(r#"{"type":"step_start","part":{}}"#);
+    assert!(matches!(
+        verdict(started, Some(Failure::Failed("timed out".into())), "n1"),
+        Err(AgentError::Unavailable(Error::ToolFailed { .. }))
+    ));
     // The nonce must be echoed.
     assert!(matches!(
         claude_verdict(&claude_result(THINKING, "[]", false, reply), None, "other"),
@@ -122,6 +134,13 @@ fn a_line_that_does_not_parse_hides_nothing_around_it() {
     assert!(matches!(
         claude_verdict(&extra, None, "n1"),
         Err(AgentError::Invalid(_))
+    ));
+    // A notice beside an error result the model never saw.
+    let notice = "Update available\n\
+        {\"type\":\"result\",\"is_error\":true,\"permission_denials\":[],\"result\":\"\"}\n";
+    assert!(matches!(
+        claude_verdict(notice, Some(Failure::Failed("exited with 1".into())), "n1"),
+        Err(AgentError::Unavailable(_))
     ));
     // Nothing reached the model: a failed start stays an absent reviewer.
     assert!(matches!(

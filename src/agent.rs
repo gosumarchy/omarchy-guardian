@@ -617,8 +617,8 @@ fn locked_config<'a>(
     Json::object(members)
 }
 
-/// What the reply is called when it cannot be read.
-const REPORT: &str = "the OpenCode security report";
+/// What the reviewer's reply is called when it cannot be read, from either CLI.
+const REPORT: &str = "the reviewer's security report";
 
 /// Why a reply without this run's nonce is refused.
 const NONCE_MISSING: &str =

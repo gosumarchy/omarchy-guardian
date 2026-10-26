@@ -72,16 +72,18 @@ impl Item {
 
     fn cost(&self) -> usize {
         match self {
-            Self::Whole { path, content } => path.len() + weight(content),
+            Self::Whole { path, content } => weight(path) + weight(content),
             Self::Piece {
                 path,
                 content,
                 context,
                 ..
             } => {
-                path.len() + weight(content) + context.as_ref().map_or(0, |(_, text)| weight(text))
+                weight(path)
+                    + weight(content)
+                    + context.as_ref().map_or(0, |(_, text)| weight(text))
             }
-            Self::Diff { path, diff } => path.len() + weight(diff),
+            Self::Diff { path, diff } => weight(path) + weight(diff),
         }
     }
 }
@@ -393,19 +395,19 @@ fn build_with(input: &PlanInput<'_>, extras: bool) -> Result<Plan, TooLarge> {
         + hash_only
             .iter()
             .map(|entry| {
-                entry.path.len()
-                    + entry.format.as_ref().map_or(0, String::len)
+                weight(&entry.path)
+                    + entry.format.as_deref().map_or(0, weight)
                     + MANIFEST_ENTRY_OVERHEAD
             })
             .sum::<usize>()
         + input
             .files
             .iter()
-            .map(|file| file.path.len() + MANIFEST_ENTRY_OVERHEAD)
+            .map(|file| weight(&file.path) + MANIFEST_ENTRY_OVERHEAD)
             .sum::<usize>()
         + removed
             .iter()
-            .map(|(path, _)| path.len() + MANIFEST_ENTRY_OVERHEAD)
+            .map(|(path, _)| weight(path) + MANIFEST_ENTRY_OVERHEAD)
             .sum::<usize>();
     if overhead.saturating_mul(2) > input.max_input_bytes {
         return Err(TooLarge::INPUT);

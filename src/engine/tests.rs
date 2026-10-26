@@ -460,6 +460,27 @@ printf '{"type":"text","part":{"type":"text","text":"%s"}}\n' "$escaped""#;
 }
 
 #[test]
+fn a_second_reply_without_the_nonce_blocks_even_for_official_packages() {
+    let bin = TempDir::new("engine-nonce-twice");
+    let always_wrong = r#"reply='{"nonce":"wrong","status":"clear","summary":"mock","findings":[]}'
+escaped=$(printf '%s' "$reply" | sed 's/"/\\"/g')
+printf '{"type":"text","part":{"type":"text","text":"%s"}}\n' "$escaped""#;
+    let opencode = OpenCode::At(mock_opencode_counting(bin.path(), 0, always_wrong));
+    let settings = AgentSettings::default();
+    let files = [file("install.sh", "echo hi\n")];
+    let official = Group {
+        class: SourceClass::Official,
+        ..group(&settings, &files)
+    };
+    let review = review_group(&official, &opencode, None);
+    assert!(review.invalid.is_some(), "{:?}", review.runs);
+    assert_eq!(
+        fs::read_to_string(bin.path().join("count")).unwrap().trim(),
+        "2"
+    );
+}
+
+#[test]
 fn running_out_of_time_on_the_source_blocks_except_for_official_packages() {
     let bin = TempDir::new("engine-out-of-time");
     let opencode = OpenCode::At(mock_opencode_counting(

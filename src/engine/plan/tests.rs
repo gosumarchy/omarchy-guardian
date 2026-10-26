@@ -795,3 +795,13 @@ fn hash_only_files_are_named_and_media_grouped_per_directory() {
             .any(|entry| entry.path == "lib/loaded.so")
     );
 }
+
+#[test]
+fn a_path_is_charged_what_its_escaped_text_takes() {
+    // Each control character is written as six bytes in the request.
+    let item = Item::Whole {
+        path: "\u{1}".repeat(10),
+        content: "x".into(),
+    };
+    assert_eq!(item.cost(), 61);
+}

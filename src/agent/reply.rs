@@ -87,10 +87,6 @@ pub(super) fn claude_verdict(
             "the Claude Code CLI attempted to use a tool during source review".into(),
         )));
     }
-    // A result beside lines that are not events is no transcript to trust.
-    if let Some(error) = malformed {
-        return Err(AgentError::Invalid(error));
-    }
     let text = result
         .get("result")
         .and_then(Json::as_str)
@@ -124,6 +120,12 @@ pub(super) fn claude_verdict(
         } else {
             unavailable(failure)
         });
+    }
+    // A reply beside lines that are not events is no transcript to trust.
+    // An error result the model never saw stays an absent reviewer above,
+    // whatever notice the CLI printed beside it.
+    if let Some(error) = malformed {
+        return Err(AgentError::Invalid(error));
     }
     if text.is_empty() {
         return Err(AgentError::Invalid(Error::Refused(
@@ -325,7 +327,7 @@ pub(crate) fn review_to_json(review: &AgentReview) -> Json {
 
 /// Reads a review from the reply's JSON shape; the nonce is not checked here.
 pub(crate) fn review_from_json(value: &Json) -> Result<AgentReview, Error> {
-    let invalid = |detail: &str| Error::parse("the OpenCode security report", detail);
+    let invalid = |detail: &str| Error::parse(REPORT, detail);
     let status = value
         .get("status")
         .and_then(Json::as_str)
