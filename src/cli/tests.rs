@@ -13,7 +13,6 @@ use super::{
 };
 use crate::agent::SourceFile;
 use crate::audit::{self, Gate};
-use crate::cli::FAILED;
 use crate::config::Settings;
 use crate::config::file::{PartialConfig, PartialPolicy};
 use crate::config::load::Insecure;
@@ -22,6 +21,7 @@ use crate::engine::baseline::{self, Identity, Unit};
 use crate::engine::store::Store;
 use crate::permit::Standing;
 use crate::protect::Consent;
+use crate::report::FAILED;
 use crate::report::Hashes;
 use crate::report::{Blocked, Decision};
 use crate::scan::ScanConfig;

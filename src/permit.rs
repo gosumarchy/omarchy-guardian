@@ -38,13 +38,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::audit::Gate;
-use crate::cli::FAILED;
 use crate::config::Settings;
 use crate::config::model::{Named, Profile, SourceClass};
 use crate::engine::store::Store;
 use crate::error::{Error, IoContext};
 use crate::json::Json;
 use crate::paths;
+use crate::report::FAILED;
 use crate::report::{Decision, Report};
 use crate::sha256::Sha256;
 use crate::sweep::{root, state};

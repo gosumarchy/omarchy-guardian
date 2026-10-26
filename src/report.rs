@@ -6,7 +6,6 @@ use std::fmt::{self, Write as _};
 use std::process::ExitCode;
 
 use crate::agent::{AgentFinding, AgentReview, SourceFile, Status};
-use crate::cli::FAILED;
 use crate::config::model::{Action, AiRequirement, Policy, SourceClass};
 use crate::deps::Inventory;
 use crate::error::Error;
@@ -197,6 +196,11 @@ pub(crate) enum Blocked {
     AiUnavailable,
     NotConfirmed,
 }
+
+/// The exit code of a command that could not do what it was asked, or was
+/// asked wrongly: the `2` an incomplete review gives too (see the exit
+/// codes in docs/commands.md).
+pub(crate) const FAILED: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Decision {

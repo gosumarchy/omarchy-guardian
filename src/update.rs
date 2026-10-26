@@ -23,13 +23,13 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::cli::FAILED;
 use crate::config::Settings;
 use crate::error::Error;
 use crate::gatewatch;
 use crate::json::Json;
 use crate::notify;
 use crate::osv::curl_args;
+use crate::report::FAILED;
 use crate::time::now;
 use crate::tools::{self, Limits};
 

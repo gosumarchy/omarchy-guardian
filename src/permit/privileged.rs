@@ -7,10 +7,10 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use crate::audit::{self, Entry, Event, Gate};
-use crate::cli::FAILED;
 use crate::config::Settings;
 use crate::error::{Error, IoContext};
 use crate::json::Json;
+use crate::report::FAILED;
 use crate::sweep::state;
 use crate::time::now;
 use crate::user;

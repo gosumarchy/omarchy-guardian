@@ -36,12 +36,12 @@ use std::env;
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::cli::FAILED;
 use crate::config::Settings;
 use crate::config::model::{RootConsent, SourceClass};
 use crate::engine::store::Store;
 use crate::error::Error;
 use crate::notify;
+use crate::report::FAILED;
 use crate::report::{AgentOutcome, Blocked, Decision, Gap, Hashes, Report};
 use crate::review::ReviewContext;
 use crate::time::now;

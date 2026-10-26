@@ -22,9 +22,9 @@ use super::{
     AI, CLASS, DECISION, DIGEST, EVENT, EXIT, Event, FINDINGS, FOR_UID, FROM, GATE, IDENTIFIER,
     OFFERED, OVERRULED, PERMIT, PROFILE, SUBJECT, TEST, VERSION,
 };
-use crate::cli::FAILED;
 use crate::error::Error;
 use crate::json::Json;
+use crate::report::FAILED;
 use crate::text::shown;
 use crate::time::utc;
 use crate::tools::{self, Limits};

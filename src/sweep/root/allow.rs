@@ -5,8 +5,8 @@ use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 
 use super::{SUDO, installed};
-use crate::cli::FAILED;
 use crate::error::{Error, IoContext};
+use crate::report::FAILED;
 use crate::sweep::state::{self, Remembered};
 use crate::user;
 

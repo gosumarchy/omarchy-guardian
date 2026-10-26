@@ -2,11 +2,11 @@
 
 use super::{AgentOutcome, AgentRun, Blocked, Decision, Gap, LocalFinding, Report, ReviewScope};
 use crate::agent::{AgentFinding, AgentReview, Status};
-use crate::cli::FAILED;
 use crate::config::model::{Profile, SourceClass, builtin};
 use crate::error::Error;
 use crate::layout::Painter;
 use crate::osv::{Advisory, Audit};
+use crate::report::FAILED;
 use crate::report::Severity;
 use crate::rules::RuleId;
 

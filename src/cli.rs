@@ -19,6 +19,7 @@ use crate::makepkg_gate;
 use crate::pacman;
 use crate::permit;
 use crate::protect::{self, Consent};
+use crate::report::FAILED;
 use crate::setup;
 use crate::status;
 use crate::sweep;
@@ -33,11 +34,6 @@ pub(crate) use gate::{
 };
 use gate::{exec_command, guard_command, sandbox_command};
 use parse::{ConfigCommand, Forget, Invocation, Protection, SetupScope, StatusMode, USAGE, parse};
-
-/// The exit code of a command that could not do what it was asked, or was
-/// asked wrongly: the `2` an incomplete review gives too (see the exit
-/// codes in docs/commands.md).
-pub(crate) const FAILED: u8 = 2;
 
 /// Says why `command` failed, if it did, and gives its exit code.
 fn finish(command: &str, result: Result<(), Error>) -> ExitCode {

@@ -62,16 +62,14 @@ use self::upstream::{review_upstream_files, unreviewable_sources};
 use crate::audit::{self, Gate};
 use crate::aur::recipe::{self, Sources};
 use crate::aur::{self, Roots, Upstream};
-use crate::cli::{
-    Confirm, FAILED, GateReview, Target, TtyConfirm, Verdict, passed, review_and_decide,
-};
+use crate::cli::{Confirm, GateReview, Target, TtyConfirm, Verdict, passed, review_and_decide};
 use crate::config::Settings;
 use crate::config::model::SourceClass;
 use crate::engine::baseline::{Identity, Unit};
 use crate::engine::store::Store;
 use crate::error::{Error, IoContext};
 use crate::notify::{self, Ran};
-use crate::report::{Blocked, Decision, Hashes};
+use crate::report::{Blocked, Decision, FAILED, Hashes};
 use crate::rules;
 use crate::sandbox::{self, FetchJail};
 use crate::scan::{self, ScanConfig, Snapshot};

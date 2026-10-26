@@ -4,11 +4,11 @@ use std::process::ExitCode;
 
 use super::{HookArgs, review_transaction};
 use crate::audit::{self, Gate};
-use crate::cli::FAILED;
 use crate::config::Settings;
 use crate::engine::store::Store;
 use crate::notify;
 use crate::permit::{self, Content};
+use crate::report::FAILED;
 use crate::report::{Decision, Hashes};
 use crate::tools::OpenCode;
 
@@ -115,10 +115,10 @@ mod tests {
     use std::process::ExitCode;
 
     use super::{StartedBy, run};
-    use crate::cli::FAILED;
     use crate::config::Settings;
     use crate::config::file::PartialConfig;
     use crate::pacman::HookArgs;
+    use crate::report::FAILED;
     use crate::tools::OpenCode;
 
     #[test]

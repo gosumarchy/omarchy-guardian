@@ -29,9 +29,9 @@ use super::collect::{self, Body, Collection, Item, Origin, Scope};
 use super::index::{self, LOCAL_DB, PackageIndex};
 use super::state;
 use super::{live, own};
-use crate::cli::FAILED;
 use crate::error::{Error, IoContext};
 use crate::json::Json;
+use crate::report::FAILED;
 use crate::user;
 use results::{from_json, to_json, write_results};
 
