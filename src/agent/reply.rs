@@ -24,7 +24,18 @@ pub(super) fn claude_verdict(
 ) -> Result<AgentReview, AgentError> {
     let unavailable =
         |failure: Failure| AgentError::Unavailable(failure.into_error("claude".into()));
-    let events = Json::parse_stream(output).unwrap_or_default();
+    // One event per line, each read on its own: a line that does not parse
+    // must not hide the tool use or the reply on the lines around it.
+    let mut malformed = None;
+    let mut events = Vec::new();
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        match Json::parse(line) {
+            Ok(event) => events.push(event),
+            Err(error) => {
+                malformed.get_or_insert(Error::parse("the Claude Code event stream", error));
+            }
+        }
+    }
     let tool_use = events.iter().any(|event| {
         event.get("type").and_then(Json::as_str) == Some("assistant")
             && event
@@ -75,6 +86,10 @@ pub(super) fn claude_verdict(
         return Err(AgentError::Invalid(Error::Refused(
             "the Claude Code CLI attempted to use a tool during source review".into(),
         )));
+    }
+    // A result beside lines that are not events is no transcript to trust.
+    if let Some(error) = malformed {
+        return Err(AgentError::Invalid(error));
     }
     let text = result
         .get("result")

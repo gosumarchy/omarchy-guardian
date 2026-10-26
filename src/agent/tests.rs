@@ -108,6 +108,33 @@ fn claude_code_results_are_judged_like_opencode_ones() {
 }
 
 #[test]
+fn a_line_that_does_not_parse_hides_nothing_around_it() {
+    let reply = r#"{"nonce":"n1","status":"clear","summary":"ok","findings":[]}"#;
+    let tool = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#;
+    // A tool attempt, then a line cut off as the run failed.
+    let cut = format!("{tool}\n{{\"type\":\"assis\n");
+    assert!(matches!(
+        claude_verdict(&cut, Some(Failure::Failed("exited with 1".into())), "n1"),
+        Err(AgentError::Invalid(_))
+    ));
+    // A result beside a line that is not an event.
+    let extra = format!("{}not json\n", claude_result(THINKING, "[]", false, reply));
+    assert!(matches!(
+        claude_verdict(&extra, None, "n1"),
+        Err(AgentError::Invalid(_))
+    ));
+    // Nothing reached the model: a failed start stays an absent reviewer.
+    assert!(matches!(
+        claude_verdict(
+            "Error: not logged in\n",
+            Some(Failure::Failed("exited with 1".into())),
+            "n1"
+        ),
+        Err(AgentError::Unavailable(_))
+    ));
+}
+
+#[test]
 fn claude_code_is_chosen_by_the_model_prefix() {
     assert_eq!(
         Reviewer::for_model(Some("claude-code/claude-sonnet-5-5")),
