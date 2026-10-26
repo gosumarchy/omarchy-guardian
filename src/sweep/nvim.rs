@@ -286,8 +286,8 @@ impl Specs {
         self.0.get(name).map_or(&[], Vec::as_slice)
     }
 
-    /// Every build step any spec gives `name`: lazy.nvim merges the specs
-    /// of a plugin, so a build in either counts.
+    /// Every build step any spec of `name` gives: lazy.nvim merges a
+    /// plugin's specs.
     fn builds(&self, name: &str) -> Vec<Build> {
         let mut builds: Vec<Build> = Vec::new();
         for build in self.of(name).iter().flat_map(|spec| &spec.builds) {
