@@ -271,9 +271,10 @@ fn a_directory_that_is_no_checkout_or_a_link_is_an_alert() {
         rules(found(&collected.items, "linked")),
         [RuleId::PluginSource]
     );
+    // The other remote is a finding of its own: a bare fetch may use it.
     assert_eq!(
         rules(found(&collected.items, "no-origin")),
-        [RuleId::PluginSource]
+        [RuleId::PluginSource, RuleId::GitConfigCommand]
     );
     // What a link leads to is not looked at, and that is said.
     assert!(
@@ -442,6 +443,57 @@ fn the_worktree_config_and_an_in_tree_hooks_path_are_read() {
 }
 
 #[test]
+fn other_remotes_and_a_worktree_origin_are_findings() {
+    let temp = TempDir::new("nvim-remotes");
+    let root = temp.path();
+    plugin(root, "p", "https://github.com/o/p", &[]);
+    write(
+        root,
+        &format!("{LAZY}/p/.git/config"),
+        "[remote \"origin\"]\n\turl = https://github.com/o/p\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n\
+         [remote \"mirror\"]\n\turl = https://user:secret@evil/p\n\
+         [branch \"main\"]\n\tremote = mirror\n\tmerge = refs/heads/main\n\
+         [branch \"dev\"]\n\tremote = origin\n",
+    );
+    let collected = collected(root);
+    let item = &collected.items[0];
+    let runs: Vec<&str> = item
+        .alerts
+        .iter()
+        .filter(|(rule, _)| *rule == RuleId::GitConfigCommand)
+        .map(|(_, message)| message.as_str())
+        .collect();
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert!(
+        runs[0].contains("line 5: ") && runs[0].contains("remote.mirror.url = https://***@evil/p"),
+        "{runs:?}"
+    );
+    assert!(runs[1].contains("line 7: ") && runs[1].contains("branch.main.remote = mirror"));
+    assert!(!runs.iter().any(|run| run.contains("secret")));
+    assert_eq!(
+        plugin_of(item).origin.as_deref(),
+        Some("https://github.com/o/p")
+    );
+
+    // A second origin url in config.worktree leaves the origin unread.
+    write(
+        root,
+        &format!("{LAZY}/p/.git/config.worktree"),
+        "[remote \"origin\"]\n\turl = https://evil/p\n",
+    );
+    let collected = self::collected(root);
+    assert_eq!(plugin_of(&collected.items[0]).origin, None);
+    assert!(
+        collected
+            .unchecked
+            .iter()
+            .any(|sentence| sentence.contains("more than one url")),
+        "{:?}",
+        collected.unchecked
+    );
+}
+
+#[test]
 fn a_field_with_a_computed_key_is_a_build_finding() {
     let temp = TempDir::new("nvim-computed");
     let root = temp.path();
@@ -560,9 +612,9 @@ fn submodules_are_read_like_the_checkout() {
     let item = &collected(root).items[0];
     let alerts: Vec<&str> = item.alerts.iter().map(|(_, text)| text.as_str()).collect();
     for expected in [
-        ".git/modules/dep/config runs",
-        ".git/modules/a/b/config runs",
-        ".git/modules/dep/modules/inner/config runs",
+        ".git/modules/dep/config changes",
+        ".git/modules/a/b/config changes",
+        ".git/modules/dep/modules/inner/config changes",
         "git hook .git/modules/dep/hooks/post-checkout",
     ] {
         assert!(
@@ -719,19 +771,47 @@ fn moved_configuration_is_collected_as_editor_start_up_files() {
 
 #[test]
 fn checkout_metadata_is_read_without_git() {
-    let config = "[core]\n[Remote \"upstream\"]\n\turl = https://a/b\n[remote \"origin\"]\n\tURL = \"https://github.com/o/r.git\"\n\turl = https://second\n";
-    assert!(matches!(origin(config), Remote::Url(url) if url == "https://github.com/o/r.git"));
+    let config = "[core]\n[Remote \"upstream\"]\n\turl = https://a/b\n[remote \"origin\"]\n\tURL = \"https://github.com/o/r.git\"\n";
+    assert!(
+        matches!(origin(config, None), Remote::Url(url) if url == "https://github.com/o/r.git")
+    );
+    // git keeps every url, and an empty one (git 2.46 and later) clears
+    // those before it: only a single url left is where it fetches from.
+    let urls = "[remote \"origin\"]\nurl = https://good\nurl =\nurl = https://evil\n";
+    assert!(matches!(origin(urls, None), Remote::Url(url) if url == "https://evil"));
+    for (config, worktree) in [
+        (
+            "[remote \"origin\"]\nurl = https://a\nurl = https://b\n",
+            None,
+        ),
+        (
+            "[remote \"origin\"]\nurl = https://good\n",
+            Some("[remote \"origin\"]\nurl = https://evil\n"),
+        ),
+    ] {
+        assert!(
+            matches!(origin(config, worktree), Remote::Unread),
+            "{config}"
+        );
+    }
     assert!(matches!(
-        origin("[remote \"upstream\"]\nurl = x\n"),
+        origin(
+            "[remote \"origin\"]\nurl = https://a\n",
+            Some("[remote \"origin\"]\nurl =\n")
+        ),
+        Remote::Unnamed
+    ));
+    assert!(matches!(
+        origin("[remote \"upstream\"]\nurl = x\n", None),
         Remote::Unnamed
     ));
     // Read as git reads it: an old-style header is lowercased, a quoted
     // subsection has its escapes decoded.
     assert!(
-        matches!(origin("[remote.ORIGIN]\nurl = https://a/b\n"), Remote::Url(url) if url == "https://a/b")
+        matches!(origin("[remote.ORIGIN]\nurl = https://a/b\n", None), Remote::Url(url) if url == "https://a/b")
     );
     assert!(
-        matches!(origin("[remote \"or\\igin\"]\nurl = https://a/c\n"), Remote::Url(url) if url == "https://a/c")
+        matches!(origin("[remote \"or\\igin\"]\nurl = https://a/c\n", None), Remote::Url(url) if url == "https://a/c")
     );
     // A url that continues, or that may be the rest of another line, is
     // not one git reads one way only.
@@ -740,7 +820,7 @@ fn checkout_metadata_is_read_without_git() {
         "[remote \"origin\"]\nx = y\\\nurl = https://evil/x\n",
         "[remote \"x\"]\nurl = a \\\n[remote \"origin\"]\nurl = https://a/d\n",
     ] {
-        assert!(matches!(origin(config), Remote::Unread), "{config}");
+        assert!(matches!(origin(config, None), Remote::Unread), "{config}");
     }
     assert_eq!(
         without_userinfo("https://user:tok@en@github.com/o/r"),

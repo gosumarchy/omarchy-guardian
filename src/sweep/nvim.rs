@@ -486,7 +486,7 @@ fn git_alerts(name: &str, git: &Git, specs: &Specs, alerts: &mut Vec<(RuleId, St
     for run in &git.runs {
         let alert = match run.line {
             Some(line) => format!(
-                "line {line}: {} runs a command on the git commands lazy.nvim runs: {}",
+                "line {line}: {} changes what the git commands lazy.nvim runs do: {}",
                 shown(&run.file),
                 shown(&run.what)
             ),

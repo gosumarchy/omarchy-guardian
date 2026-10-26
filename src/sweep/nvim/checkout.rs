@@ -286,10 +286,14 @@ fn git(root: &Path, path: &str, inner: Vec<String>, unchecked: &mut Vec<String>)
         return None;
     }
     let config = text(root, &format!("{directory}/config"), MAX_GIT_FILE);
-    let remote = match config.as_deref().map(origin) {
+    let worktree = worktree_config(root, &directory, unchecked);
+    let remote = match config
+        .as_deref()
+        .map(|config| origin(config, worktree.as_deref()))
+    {
         Some(Remote::Unread) => {
             unchecked.push(format!(
-                "/{directory}/config: the origin can be read more than one way (a continued line), so where the plugin is fetched from was not checked"
+                "/{directory}/config: the origin is not one url read one way (a continued line, more than one url), so where the plugin is fetched from was not checked"
             ));
             Remote::Unread
         }
@@ -309,7 +313,7 @@ fn git(root: &Path, path: &str, inner: Vec<String>, unchecked: &mut Vec<String>)
         visited: 0,
         unchecked,
     };
-    let hooks_path = gits.git_directory(".git", config.as_deref());
+    let hooks_path = gits.git_directory(".git", config.as_deref(), worktree.as_deref());
     // A hooks directory within the checkout: git runs its hooks instead.
     if let Some(hooks_path) = hooks_path.filter(|value| git_state::is_in_tree(value)) {
         gits.hooks(hooks_path.trim_end_matches('/'));
@@ -353,10 +357,15 @@ impl Gits<'_> {
     /// (`None` when it could not be read, which is said already): its
     /// command keys, its hooks, and its entries that are not plain data.
     /// Returns the `core.hooksPath` git uses, if any.
-    fn git_directory(&mut self, git: &str, config: Option<&str>) -> Option<String> {
+    fn git_directory(
+        &mut self,
+        git: &str,
+        config: Option<&str>,
+        worktree: Option<&str>,
+    ) -> Option<String> {
         self.layout(git);
         self.hooks(&format!("{git}/hooks"));
-        self.settings(git, config)
+        self.settings(git, config, worktree)
     }
 
     /// Takes in every entry of the git directory `git` that is not plain
@@ -440,29 +449,21 @@ impl Gits<'_> {
         self.hooks.extend(found);
     }
 
-    /// Takes in the command keys of the git directory `git`: its `config`
-    /// (`config`, `None` when it could not be read, which is said already)
-    /// and its `config.worktree`, which git reads once
-    /// `extensions.worktreeConfig` is set and which is read whenever it is
-    /// there. Returns the `core.hooksPath` git uses, if it reads one way.
-    fn settings(&mut self, git: &str, config: Option<&str>) -> Option<String> {
-        let worktree = format!("{git}/config.worktree");
-        let full = format!("{}/{worktree}", self.plugin);
-        let worktree_text = if fs::symlink_metadata(self.root.join(&full)).is_ok() {
-            let found = text(self.root, &full, MAX_GIT_FILE);
-            if found.is_none() {
-                self.unchecked.push(format!(
-                    "/{full}: could not be read, so the commands it may have git run were not checked"
-                ));
-            }
-            found
-        } else {
-            None
-        };
+    /// Takes in what may make git run something in the configuration of
+    /// the git directory `git`: its `config` and its `config.worktree`
+    /// (`None` where there is none or it could not be read, which is said
+    /// already). Returns the `core.hooksPath` git uses, if it reads one
+    /// way.
+    fn settings(
+        &mut self,
+        git: &str,
+        config: Option<&str>,
+        worktree: Option<&str>,
+    ) -> Option<String> {
         let mut hooks_path = None;
         for (file, text) in [
             (format!("{git}/config"), config),
-            (worktree, worktree_text.as_deref()),
+            (format!("{git}/config.worktree"), worktree),
         ] {
             let Some(text) = text else {
                 continue;
@@ -489,8 +490,47 @@ impl Gits<'_> {
                     Reading::OneOfSeveral => None,
                 };
             }
+            self.other_remotes(&file, text);
         }
         hooks_path
+    }
+
+    /// Takes in, from the configuration `text` of `file`, what may make a
+    /// bare `git fetch` (which lazy.nvim runs) fetch from elsewhere than
+    /// origin, or move origin's refs: every key of a remote other than
+    /// origin, and every `branch.*.remote` other than origin.
+    fn other_remotes(&mut self, file: &str, text: &str) {
+        let remotes = git_state::section_keys(text, "remote")
+            .into_iter()
+            .filter(|key| key.subsection.as_deref() != Some("origin"));
+        let branches = git_state::section_keys(text, "branch")
+            .into_iter()
+            .filter(|key| key.key == "remote" && key.value != "origin");
+        for found in remotes.chain(branches) {
+            let section = if found.key == "remote" {
+                "branch"
+            } else {
+                "remote"
+            };
+            let name = found.subsection.as_deref().unwrap_or_default();
+            let what = format!(
+                "{section}.{name}.{} = {} (a bare git fetch may use it)",
+                found.key,
+                without_url_credentials(&found.value)
+            );
+            let duplicate = self
+                .runs
+                .iter()
+                .any(|run| run.file == file && run.line == Some(found.line));
+            if !duplicate {
+                self.runs.push(Run {
+                    file: file.to_string(),
+                    line: Some(found.line),
+                    what,
+                    entry: None,
+                });
+            }
+        }
     }
 
     /// Takes in the submodule git directories under `modules`, `depth`
@@ -580,9 +620,11 @@ impl Gits<'_> {
                 "/{config}: could not be read, so the commands it may have git run were not checked"
             ));
         }
+        let directory = format!("{}/{git}", self.plugin);
+        let worktree = worktree_config(self.root, &directory, self.unchecked);
         // A submodule's hooks path is relative to its own working tree,
         // which is not looked for: the key is in `runs`, as a finding.
-        self.git_directory(git, text.as_deref());
+        self.git_directory(git, text.as_deref(), worktree.as_deref());
         self.modules(&format!("{git}/modules"), depth);
     }
 }
@@ -598,21 +640,47 @@ fn text(root: &Path, path: &str, limit: u64) -> Option<String> {
     }
 }
 
-/// Where a git configuration says to fetch from: the first
-/// `remote.origin.url`, which is where git fetches from. Unread where any
-/// reading of it is one of several (a continued line): which one git
-/// takes depends on quoting rules this does not repeat.
-pub(super) fn origin(config: &str) -> Remote {
-    let urls = git_state::values(config, "remote", Some("origin"), "url");
-    if urls
-        .iter()
-        .any(|(_, _, reading)| *reading == Reading::OneOfSeveral)
-    {
-        return Remote::Unread;
+/// `config.worktree` of the git directory `directory` (relative to the
+/// root), which git reads once `extensions.worktreeConfig` is set and
+/// which is read whenever it is there; one that cannot be read is said in
+/// `unchecked`.
+fn worktree_config(root: &Path, directory: &str, unchecked: &mut Vec<String>) -> Option<String> {
+    let path = format!("{directory}/config.worktree");
+    fs::symlink_metadata(root.join(&path)).ok()?;
+    let found = text(root, &path, MAX_GIT_FILE);
+    if found.is_none() {
+        unchecked.push(format!(
+            "/{path}: could not be read, so the commands it may have git run were not checked"
+        ));
     }
-    urls.first().map_or(Remote::Unnamed, |(_, url, _)| {
-        Remote::Url(without_userinfo(url))
-    })
+    found
+}
+
+/// Where a checkout whose configuration is `config` and `worktree` (its
+/// `config.worktree`, read after it) fetches from: `remote.origin.url`.
+/// Unread unless that names exactly one address, read one way: git keeps a
+/// list of urls, an empty one clears the list (git 2.46 and later), and
+/// which of several readings of a continued line git takes depends on
+/// quoting rules this does not repeat.
+pub(super) fn origin(config: &str, worktree: Option<&str>) -> Remote {
+    let mut urls: Vec<String> = Vec::new();
+    for text in std::iter::once(config).chain(worktree) {
+        for (_, url, reading) in git_state::values(text, "remote", Some("origin"), "url") {
+            if reading == Reading::OneOfSeveral {
+                return Remote::Unread;
+            }
+            if url.is_empty() {
+                urls.clear();
+            } else {
+                urls.push(url);
+            }
+        }
+    }
+    match urls.as_slice() {
+        [] => Remote::Unnamed,
+        [url] => Remote::Url(without_userinfo(url)),
+        [_, _, ..] => Remote::Unread,
+    }
 }
 
 /// The commit the git directory `directory` has checked out: `HEAD` itself

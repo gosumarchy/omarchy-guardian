@@ -385,8 +385,10 @@ Plain data is what git only reads: `objects`, `refs`, `HEAD`, `index`,
 repository and is a finding.
 
 What is read, all as files, without running git: the origin from `.git/config`
-(with any user and password taken out of the address; an origin that can be
-read more than one way, through a continued line, is not checked, and says so),
+and `.git/config.worktree` (with any user and password taken out of the
+address; an origin that is not exactly one address read one way, through a
+continued line or several `url` keys, is not checked, and says so; an empty
+`url` clears those before it, as git 2.46 and later does),
 the commit from `.git/HEAD` and the refs (`packed-refs` too), the keys that run
 commands in `.git/config` and `.git/config.worktree`, and in those of each
 submodule, read the way git reads them, the hooks in `.git/hooks`, in a
@@ -415,7 +417,9 @@ What is a finding, on every sweep:
 - `git-config-command`: a key of the configuration of the checkout or of a
   submodule (`config`, `config.worktree`) that runs a command (`core.fsmonitor`
   and the like) on the git commands lazy.nvim runs, any `core.hooksPath`, in
-  the checkout or not, any entry of a git directory that is not plain data, and
+  the checkout or not, any key of a remote other than `origin` and any
+  `branch.<name>.remote` other than `origin`, which a bare `git fetch` may use,
+  any entry of a git directory that is not plain data, and
   any `.git` directory or file below the top of the checkout, whose
   configuration and hooks git may run.
 
