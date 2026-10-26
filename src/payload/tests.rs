@@ -1583,3 +1583,45 @@ fn what_is_over_a_limit_is_left_unread_and_a_refusal_still_refuses() {
     let opened = Archive::open(&archive).unwrap();
     assert!(review(&opened, "pkg", SourceClass::LocalPackage, &[]).is_err());
 }
+
+#[test]
+fn file_heads_are_cut_at_the_probe_size_and_the_listing_is_held_to() {
+    let (short, long) = ("a".to_string(), "b".to_string());
+    let big = vec![b'x'; crate::content::PROBE_SIZE + 10];
+    let stream = [&b"abc"[..], &big].concat();
+
+    let heads = super::heads_in_stream(&mut &stream[..], &[(&short, 3), (&long, big.len() as u64)])
+        .unwrap();
+    assert_eq!(heads[&short], b"abc");
+    assert_eq!(heads[&long].len(), crate::content::PROBE_SIZE);
+
+    // Less than listed, or more than the listing names, is refused.
+    assert_eq!(
+        super::heads_in_stream(&mut &b"ab"[..], &[(&short, 3)]),
+        Err("/a is shorter than listed".to_string())
+    );
+    assert_eq!(
+        super::heads_in_stream(&mut &b"abcd"[..], &[(&short, 3)]),
+        Err("more was extracted than the listing names".to_string())
+    );
+}
+
+#[test]
+fn a_bsdtar_pass_ends_as_timed_out_failed_or_read_through() {
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::ExitStatus;
+
+    assert_eq!(
+        super::read_through(ExitStatus::from_raw(0), "files"),
+        Ok(())
+    );
+    assert_eq!(
+        super::read_through(ExitStatus::from_raw(124 << 8), "files"),
+        Err("timed out reading it for its files".to_string())
+    );
+    assert!(
+        super::read_through(ExitStatus::from_raw(13), "files")
+            .unwrap_err()
+            .starts_with("could not be read through for its files (")
+    );
+}

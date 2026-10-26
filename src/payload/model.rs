@@ -2,6 +2,7 @@
 //! pax headers that carry capabilities and access control lists, and what an
 //! entry's mode and owner grant.
 
+use crate::content::PROBE_SIZE;
 use crate::error::Error;
 use std::collections::{HashMap, HashSet};
 use std::fs::Metadata;
@@ -120,6 +121,39 @@ pub(crate) fn already_granted(what: &str, installed: &Metadata) -> bool {
         OWNED_BY_OTHER => !installed.file_type().is_symlink() && uid != 0,
         WRITABLE_BY_GROUP => !installed.file_type().is_symlink() && mode & 0o020 != 0 && gid != 0,
         _ => false,
+    }
+}
+
+/// The first `PROBE_SIZE` bytes of each of `files` (path and listed
+/// size), read from bsdtar's `-x -O` output, which prints them one after
+/// another in archive order. A file shorter than listed, or more output
+/// than the listing names, is refused.
+pub(super) fn heads_in_stream(
+    stream: &mut impl Read,
+    files: &[(&String, u64)],
+) -> Result<HashMap<String, Vec<u8>>, String> {
+    let mut heads = HashMap::new();
+    for (path, size) in files {
+        let mut head = Vec::new();
+        let kept = (&mut *stream)
+            .take((*size).min(PROBE_SIZE as u64))
+            .read_to_end(&mut head)
+            .map_err(|error| error.to_string())?;
+        let skipped = io::copy(
+            &mut (&mut *stream).take(size - kept as u64),
+            &mut io::sink(),
+        )
+        .map_err(|error| error.to_string())?;
+        if kept as u64 + skipped != *size {
+            return Err(format!("/{path} is shorter than listed"));
+        }
+        heads.insert((*path).clone(), head);
+    }
+    // Anything more is a file the model does not know.
+    let mut more = [0_u8; 1];
+    match stream.read(&mut more) {
+        Ok(0) => Ok(heads),
+        _ => Err("more was extracted than the listing names".to_string()),
     }
 }
 

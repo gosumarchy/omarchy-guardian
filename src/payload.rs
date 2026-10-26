@@ -34,14 +34,14 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
-use self::model::{Attribute, attributes_in_tar, parse_model};
+use self::model::{Attribute, attributes_in_tar, heads_in_stream, parse_model};
 pub(crate) use self::model::{
     OWNED_BY_OTHER, SETGID_OTHER, SETUID_OTHER, WITH_ACL, WITH_CAPABILITIES, WRITABLE_BY_ALL,
     WRITABLE_BY_GROUP, already_granted, unescape,
 };
 pub(crate) use self::review::{GUARDIAN_PACKAGE, PayloadFile, annotated, review};
 use crate::autorun::named_words;
-use crate::content::{self, PROBE_SIZE, Prefix};
+use crate::content::{self, Prefix};
 use crate::error::{Error, IoContext};
 use crate::files::{O_NOFOLLOW, O_NONBLOCK};
 use crate::sandbox::Workspace;
@@ -376,6 +376,8 @@ impl Archive {
         if found.is_err() {
             drain(&mut stream);
         }
+        // bsdtar must not block on a full pipe while it is waited for.
+        drop(stream);
         let status = child.wait().spawning("bsdtar")?;
         // Before what was read: a bsdtar that was stopped or failed ends
         // its stream early, which reads as a cut-short archive.
@@ -440,37 +442,20 @@ impl Archive {
             return Err(failed("no output".into()));
         };
         let mut stream = io::BufReader::with_capacity(1 << 16, stdout);
-        let heads = (|| {
-            let mut heads = HashMap::new();
-            for (index, path) in &ordered {
-                let size = self.entries[*index].size;
-                let mut head = Vec::new();
-                let kept = (&mut stream)
-                    .take(size.min(PROBE_SIZE as u64))
-                    .read_to_end(&mut head)
-                    .map_err(|error| error.to_string())?;
-                let skipped =
-                    io::copy(&mut (&mut stream).take(size - kept as u64), &mut io::sink())
-                        .map_err(|error| error.to_string())?;
-                if kept as u64 + skipped != size {
-                    return Err(format!("/{path} is shorter than listed"));
-                }
-                heads.insert((*path).clone(), head);
-            }
-            // Anything more is a file the model does not know.
-            let mut more = [0_u8; 1];
-            match stream.read(&mut more) {
-                Ok(0) => Ok(heads),
-                _ => Err("more was extracted than the listing names".to_string()),
-            }
-        })();
+        let files: Vec<(&String, u64)> = ordered
+            .iter()
+            .map(|(index, path)| (*path, self.entries[*index].size))
+            .collect();
+        let heads = heads_in_stream(&mut stream, &files);
         if heads.is_err() {
             drain(&mut stream);
         }
+        // bsdtar must not block on a full pipe while it is waited for.
+        drop(stream);
         let status = child.wait().spawning("bsdtar")?;
         // Before what was read, as in `attributes`.
         read_through(status, "files").map_err(failed)?;
-        heads.map_err(failed)
+        heads.map_err(|detail| Error::Message(format!("{}: {detail}", self.path.display())))
     }
 
     /// The archive as it is now, to compare with once the review is over.
@@ -867,9 +852,10 @@ fn read_extracted(root: &Path, rel: &str) -> io::Result<Vec<u8>> {
 }
 
 /// Reads the rest of a stream Guardian stopped parsing, so bsdtar's exit
-/// is its own and not a SIGPIPE from the reader leaving early. Its time
-/// limit bounds the wait; a failed read here changes nothing, as the
-/// parse error is what is reported.
+/// is its own and not a SIGPIPE from the reader leaving early. bsdtar's
+/// time limit (`timeout --kill-after`) bounds the wait. If the drain
+/// itself fails, bsdtar's resulting exit is reported instead of the parse
+/// error.
 fn drain(stream: &mut impl Read) {
     drop(io::copy(stream, &mut io::sink()));
 }
@@ -877,11 +863,16 @@ fn drain(stream: &mut impl Read) {
 /// How a bsdtar pass that read the archive through for its `what` ended,
 /// as the detail of its failure.
 fn read_through(status: ExitStatus, what: &str) -> Result<(), String> {
+    if status.success() {
+        return Ok(());
+    }
     // GNU timeout exits 124 when it had to stop the command.
-    match status.code() {
-        _ if status.success() => Ok(()),
-        Some(124) => Err(format!("timed out reading it for its {what}")),
-        _ => Err(format!("could not be read through for its {what}")),
+    if status.code() == Some(124) {
+        Err(format!("timed out reading it for its {what}"))
+    } else {
+        Err(format!(
+            "could not be read through for its {what} ({status})"
+        ))
     }
 }
 
