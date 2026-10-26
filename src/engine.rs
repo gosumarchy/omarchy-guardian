@@ -29,9 +29,6 @@ use crate::rules;
 use crate::time::SECONDS_PER_DAY;
 use crate::tools::{OpenCode, Reviewer};
 
-/// Bytes charged per local finding on top of its path and excerpt.
-const FINDING_OVERHEAD: usize = 48;
-
 /// What the review of one user-level target may remember.
 pub(crate) struct Memory {
     store: Store,
@@ -231,11 +228,7 @@ fn plan_review(
         .iter()
         .map(|finding| finding.path.clone())
         .collect();
-    let findings_bytes = group
-        .findings
-        .iter()
-        .map(|finding| finding.path.len() + finding.excerpt.len() + FINDING_OVERHEAD)
-        .sum();
+    let findings_bytes = group.findings.iter().map(request::finding_bytes).sum();
     let unit_prefixes: Vec<String> = group.units.iter().map(|unit| unit.prefix.clone()).collect();
     let input = PlanInput {
         files: group.files,
