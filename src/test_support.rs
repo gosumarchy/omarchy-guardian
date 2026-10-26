@@ -5,7 +5,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A temporary directory removed on drop, even when the test panics.
 pub(crate) struct TempDir {
@@ -37,6 +37,37 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         drop(fs::remove_dir_all(&self.path));
     }
+}
+
+/// A point in the CPU time this thread has run, for tests that bound how
+/// long work takes. A CPU-time bound holds however busy the machine is,
+/// where a wall-clock one fails while other builds run: 3.7s of work once
+/// went past a 30s wall-clock bound that way.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CpuInstant(Duration);
+
+impl CpuInstant {
+    pub(crate) fn now() -> Self {
+        Self(thread_cpu_time())
+    }
+
+    pub(crate) fn elapsed(self) -> Duration {
+        thread_cpu_time()
+            .checked_sub(self.0)
+            .expect("a thread's CPU time never goes back")
+    }
+}
+
+/// The first field of `schedstat` is the nanoseconds this thread has run.
+fn thread_cpu_time() -> Duration {
+    let schedstat = fs::read_to_string("/proc/thread-self/schedstat")
+        .expect("Linux with CONFIG_SCHED_INFO provides /proc/thread-self/schedstat");
+    let nanos = schedstat
+        .split_whitespace()
+        .next()
+        .and_then(|field| field.parse().ok())
+        .expect("schedstat starts with the nanoseconds run");
+    Duration::from_nanos(nanos)
 }
 
 pub(crate) fn write_script(path: &Path, body: &str) {
