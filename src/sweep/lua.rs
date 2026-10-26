@@ -482,24 +482,30 @@ fn tokenize(text: &str) -> Vec<Token> {
 /// escapes decoded as Lua decodes them, and the index after it.
 fn short_string(chars: &[char], start: usize) -> (String, usize) {
     let quote = chars[start];
-    let mut value = String::new();
+    let mut value = Vec::new();
     let mut index = start + 1;
-    while index < chars.len() && chars[index] != quote && chars[index] != '\n' {
+    // An unescaped line break ends the string, as an error ends it in Lua.
+    while index < chars.len() && chars[index] != quote && !matches!(chars[index], '\n' | '\r') {
         if chars[index] == '\\' && index + 1 < chars.len() {
             index = escape(chars, index + 1, &mut value);
         } else {
-            value.push(chars[index]);
+            push_char(&mut value, chars[index]);
             index += 1;
         }
     }
-    (value, index + 1)
+    (String::from_utf8_lossy(&value).into_owned(), index + 1)
+}
+
+fn push_char(value: &mut Vec<u8>, character: char) {
+    value.extend_from_slice(character.encode_utf8(&mut [0; 4]).as_bytes());
 }
 
 /// Decodes the escape whose first character after the backslash is at
-/// `start` into `value`, and returns the index after it: `\ddd` (decimal),
-/// `\xXX`, `\u{XXX}`, `\z` (skips the blanks after it) and the one-letter
-/// ones.
-fn escape(chars: &[char], start: usize, value: &mut String) -> usize {
+/// `start` into the bytes `value`, and returns the index after it:
+/// `\ddd` (a decimal byte), `\xXX` (a hex byte), `\u{XXX}`, `\z` (skips
+/// the blanks after it), a line break (`\n`, `\r`, `\r\n` or `\n\r`, one
+/// newline) and the one-letter ones.
+fn escape(chars: &[char], start: usize, value: &mut Vec<u8>) -> usize {
     let digits = |from: usize, radix: u32, most: usize| {
         let end = (from..chars.len().min(from + most))
             .find(|&at| !chars[at].is_digit(radix))
@@ -507,14 +513,23 @@ fn escape(chars: &[char], start: usize, value: &mut String) -> usize {
         let text: String = chars[from..end].iter().collect();
         (u32::from_str_radix(&text, radix).ok(), end)
     };
+    let byte = |code: Option<u32>| code.and_then(|code| u8::try_from(code).ok());
+    let one = |character: char| (Some(character), start + 1);
     let (decoded, end) = match chars[start] {
-        'n' => (Some('\n'), start + 1),
-        't' => (Some('\t'), start + 1),
-        'r' => (Some('\r'), start + 1),
-        'a' => (Some('\u{7}'), start + 1),
-        'b' => (Some('\u{8}'), start + 1),
-        'f' => (Some('\u{c}'), start + 1),
-        'v' => (Some('\u{b}'), start + 1),
+        'n' => one('\n'),
+        't' => one('\t'),
+        'r' => one('\r'),
+        'a' => one('\u{7}'),
+        'b' => one('\u{8}'),
+        'f' => one('\u{c}'),
+        'v' => one('\u{b}'),
+        first @ ('\n' | '\r') => {
+            let pair = matches!(
+                (first, chars.get(start + 1)),
+                ('\n', Some('\r')) | ('\r', Some('\n'))
+            );
+            (Some('\n'), start + 1 + usize::from(pair))
+        }
         'z' => {
             let end = (start + 1..chars.len())
                 .find(|&at| !chars[at].is_whitespace())
@@ -523,7 +538,8 @@ fn escape(chars: &[char], start: usize, value: &mut String) -> usize {
         }
         'x' => {
             let (code, end) = digits(start + 1, 16, 2);
-            (code.and_then(char::from_u32), end)
+            value.extend(byte(code));
+            (None, end)
         }
         'u' if chars.get(start + 1) == Some(&'{') => {
             let (code, end) = digits(start + 2, 16, 8);
@@ -536,11 +552,14 @@ fn escape(chars: &[char], start: usize, value: &mut String) -> usize {
         }
         digit if digit.is_ascii_digit() => {
             let (code, end) = digits(start, 10, 3);
-            (code.and_then(char::from_u32), end)
+            value.extend(byte(code));
+            (None, end)
         }
-        other => (Some(other), start + 1),
+        other => one(other),
     };
-    value.extend(decoded);
+    if let Some(character) = decoded {
+        push_char(value, character);
+    }
     end
 }
 
@@ -730,6 +749,27 @@ return {
                 sh\u{21}" }"#
             ),
             shell("curl x|sh!")
+        );
+        // A backslash before a line break, CRLF included, is one newline,
+        // and the string goes on.
+        assert_eq!(
+            builds("{ \"a/b\", build = \"curl x \\\r\n| sh\" }"),
+            shell("curl x \n| sh")
+        );
+        // Decimal and hex escapes are bytes.
+        assert_eq!(
+            builds(r#"{ "a/b", build = "\195\169\xc3\xa9" }"#),
+            shell("\u{e9}\u{e9}")
+        );
+        // A bare carriage return ends a string, as a newline does.
+        assert_eq!(
+            super::tokenize("\"a\rb\"")[0],
+            super::Token::String("a".into())
+        );
+        // Every build key counts.
+        assert_eq!(
+            builds(r#"{ "a/b", build = "make", build = ":X" }"#),
+            [Build::Shell("make".into()), Build::Command(":X".into())]
         );
         // A key code computes may be `build`: its value is kept, unread.
         let computed = |text: &str| vec![Build::Computed(vec![text.into()])];
