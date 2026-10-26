@@ -202,7 +202,8 @@ fn scratch_directories(home: Option<&OsStr>, cache: Option<&OsStr>) -> Vec<PathB
 /// others (a shared `/srv` laid out like `/tmp`): only an entry's owner
 /// renames it there, and the entry's owner is checked.
 fn refuse_planted(found: &Path, scratch: &[PathBuf], uid: Option<u32>) -> Result<(), Error> {
-    let resolved = fs::canonicalize(found).at(found)?;
+    let resolved = fs::canonicalize(found)
+        .map_err(|error| Error::Message(format!("it cannot be resolved ({error})")))?;
     let mut places = link_hops(found)?;
     places.push(resolved);
     for path in places.iter().map(PathBuf::as_path) {
