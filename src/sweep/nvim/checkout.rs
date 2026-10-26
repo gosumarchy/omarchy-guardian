@@ -106,11 +106,10 @@ pub(super) fn all(root: &Path, lazy: &str, unchecked: &mut Vec<String>) -> Vec<C
         };
         // lazy.nvim keeps nothing but plugins there; a plain file is no
         // plugin Neovim loads.
-        if entry
-            .file_type()
-            .is_ok_and(|kind| kind.is_dir() || kind.is_symlink())
-        {
-            names.push(name);
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() || kind.is_symlink() => names.push(name),
+            Ok(_) => {}
+            Err(error) => unchecked.push(format!("/{lazy}/{name}: could not be read ({error})")),
         }
     }
     names.sort();

@@ -394,6 +394,9 @@ fn what_cannot_be_read_is_not_checked() {
     let closed = root.join(LAZY).join("p/lua/closed.lua");
     fs::write(&closed, "z").unwrap();
     fs::set_permissions(&closed, fs::Permissions::from_mode(0o000)).unwrap();
+    write(root, &format!("{LAZY}/p/.git/hooks/post-merge"), "id");
+    let hook = root.join(LAZY).join("p/.git/hooks/post-merge");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o000)).unwrap();
     let collected = collected(root);
     assert!(
         collected
@@ -410,6 +413,14 @@ fn what_cannot_be_read_is_not_checked() {
                 .unchecked
                 .iter()
                 .any(|sentence| sentence.contains("closed.lua: could not be read")),
+            "{:?}",
+            collected.unchecked
+        );
+        assert!(
+            collected
+                .unchecked
+                .iter()
+                .any(|sentence| sentence.contains("hooks/post-merge: could not be read")),
             "{:?}",
             collected.unchecked
         );
