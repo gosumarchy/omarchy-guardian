@@ -65,7 +65,8 @@ or saved to a file and then run.
 A separate `remote-code-install` finding (medium) marks a package manager
 told to install and so run code from an address rather than from this source:
 `pip install` of a URL or `git+` repository, `npm install` of a
-URL/tarball/git or `npx` of an unpinned remote package, `go install …@latest`,
+URL/tarball/git or `npx` of an unpinned remote package, `uvx`, `uv tool run` or
+`pipx run` of a package with no version fixed, `go install …@latest`,
 `cargo install --git`; an ordinary `pip install -r requirements.txt`, `npm ci`
 with a lockfile or `go build` stays quiet.
 

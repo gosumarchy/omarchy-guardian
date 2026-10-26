@@ -146,16 +146,7 @@ pub(crate) fn item_of(
     let alerts = settings_alerts(scope, category, &path, tier, &body);
     Item {
         file: None,
-        // The root collector's items are all root's, its home included.
-        origin: if scope.origin == Origin::System
-            && scope
-                .home
-                .is_some_and(|home| path.starts_with(&format!("{home}/")))
-        {
-            Origin::User
-        } else {
-            scope.origin
-        },
+        origin: origin(scope, &path),
         category,
         path,
         tier,
@@ -165,6 +156,21 @@ pub(crate) fn item_of(
         run_by: run_by.map(str::to_string),
         notes,
         alerts,
+    }
+}
+
+/// Whose item at `path` is: the home's for a path in it, else the
+/// collection's. The root collector's items are all root's, its home
+/// included.
+pub(crate) fn origin(scope: &Scope<'_>, path: &str) -> Origin {
+    if scope.origin == Origin::System
+        && scope
+            .home
+            .is_some_and(|home| path.starts_with(&format!("{home}/")))
+    {
+        Origin::User
+    } else {
+        scope.origin
     }
 }
 

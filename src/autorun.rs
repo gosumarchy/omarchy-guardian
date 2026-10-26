@@ -56,10 +56,13 @@ pub(crate) enum Category {
     /// The system's own program directory, which the sweep compares with
     /// the packages: a changed or unowned file there.
     Program,
+    /// The hooks, plugins and MCP servers AI coding agents (Claude Code,
+    /// OpenCode, Codex) start on their own, read from their configuration.
+    Agent,
 }
 
 impl Category {
-    const ALL: [Self; 38] = [
+    const ALL: [Self; 39] = [
         Self::Autostart,
         Self::Boot,
         Self::BootConfig,
@@ -98,6 +101,7 @@ impl Category {
         Self::Terminal,
         Self::Toolchain,
         Self::Program,
+        Self::Agent,
     ];
 
     /// A stable machine name (`pam`, `systemd-generator`).
@@ -141,6 +145,7 @@ impl Category {
             Self::Terminal => "terminal",
             Self::Toolchain => "toolchain",
             Self::Program => "program",
+            Self::Agent => "agent",
         }
     }
 
@@ -204,6 +209,7 @@ impl Category {
             Self::Terminal => "Terminal and prompt configuration",
             Self::Toolchain => "Developer tool configuration (npm, pip, cargo, mise)",
             Self::Program => "The system's own programs",
+            Self::Agent => "AI coding agent hooks, plugins and MCP servers",
         }
     }
 
@@ -243,6 +249,7 @@ impl Category {
             Self::Terminal => "runs in every terminal",
             Self::Toolchain => "decides what builds and installs run and fetch",
             Self::Program => "runs when anything starts it by name",
+            Self::Agent => "runs when an AI coding agent starts, or as it works",
         }
     }
 }
