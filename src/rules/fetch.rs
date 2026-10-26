@@ -381,7 +381,19 @@ fn fetched_package(run: &[String]) -> Option<&str> {
     while let Some(word) = words.next() {
         match word.as_str() {
             "--from" | "--spec" => return words.next().map(String::as_str),
-            "--python" | "-p" | "--with" | "--index" | "--index-url" => {
+            "--python"
+            | "-p"
+            | "--with"
+            | "--with-editable"
+            | "--with-requirements"
+            | "--index"
+            | "--index-url"
+            | "-i"
+            | "--extra-index-url"
+            | "-f"
+            | "-c"
+            | "--exclude-newer"
+            | "--index-strategy" => {
                 words.next();
             }
             flag if flag.starts_with('-') => {
@@ -578,6 +590,8 @@ mod tests {
             "uvx --from=some-pkg tool",
             "uvx --python 3.12 some-tool",
             "uvx -p 3.12.1 --with rich==13.0.0 some-tool",
+            "uvx --with-requirements pinned==1.0.0 some-tool",
+            "uvx -c constraints==1.0.0 --exclude-newer 2024-01-01 some-tool",
             "pipx run --spec some-pkg tool",
             "uv tool run some-tool@latest",
             "pipx run some-tool",
