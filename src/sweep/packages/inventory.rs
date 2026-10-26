@@ -18,7 +18,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use super::config::{self, IndexConfig, NpmConfig, Places};
+use super::config::{self, ConfigFile, IndexConfig, NpmConfig, Places};
 use crate::deps::Ecosystem;
 use crate::files::read_small_file;
 use crate::json::Json;
@@ -41,6 +41,10 @@ const MAX_NODE_DEPTH: usize = 8;
 /// `METADATA` carries the package's whole description after its headers;
 /// 2 MiB is arbitrary and far above what packages ship.
 const MAX_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
+
+/// The most nodes of mise's whose npm configuration is read. Arbitrary:
+/// far more than anyone keeps installed.
+const MAX_NODES: usize = 100;
 
 /// The largest `.crates2.json` read: about 1 KiB
 /// per package, so 8 MiB is arbitrary room for thousands.
@@ -93,25 +97,25 @@ pub(super) struct Inventory {
 
 /// Reads what is installed under `root` in `places`.
 pub(super) fn collect(root: &Path, places: &Places) -> Inventory {
-    let npm = NpmConfig::read(root, places);
+    let mut nodes = vec!["usr".to_string()];
+    nodes.extend(places.mise.as_ref().map_or_else(Vec::new, |mise| {
+        mise_nodes(root, &format!("{mise}/installs/node"))
+    }));
+    let npm = NpmConfig::read(root, places, &nodes);
     let pip = IndexConfig::pip(root, places);
     let uv = IndexConfig::uv(root, places);
-    let mut walk = Walk::new(
-        root,
-        &npm,
-        Source::configured(&pip),
-        Source::configured(&uv),
-    );
+    let cargo = IndexConfig::cargo(root, places);
+    let sources = Sources {
+        pip: Source::configured(&pip),
+        uv: Source::configured(&uv),
+        cargo: Source::configured(&cargo),
+    };
+    let mut walk = Walk::new(root, &npm, sources);
 
-    let mut global = vec!["usr/lib/node_modules".to_string()];
-    global.extend(
-        npm.prefix
-            .as_ref()
-            .map(|prefix| format!("{prefix}/lib/node_modules")),
-    );
-    global.dedup();
-    for directory in &global {
-        walk.node_modules(directory);
+    // A prefix set to a node's own directory is read with that node.
+    walk.node_modules("usr/lib/node_modules");
+    for prefix in npm.prefixes.iter().filter(|prefix| !nodes.contains(prefix)) {
+        walk.node_modules(&format!("{prefix}/lib/node_modules"));
     }
     if let Some(pipx) = &places.pipx {
         walk.pipx(&format!("{pipx}/venvs"));
@@ -139,6 +143,17 @@ pub(super) fn collect(root: &Path, places: &Places) -> Inventory {
             text::shown(file)
         ));
     }
+    for file in &cargo.unreadable {
+        inventory.unchecked.push(format!(
+            "{} could not be read (not a regular file, closed, too large, not TOML, or not found): it may replace crates.io with another source, so no crate was looked up in OSV",
+            text::shown(file)
+        ));
+    }
+    if cargo.other_index && cargo.unreadable.is_empty() {
+        inventory.unchecked.push(
+            "cargo's configuration replaces a source or includes other files (`[source]` or `include` in its config.toml), so installed crates may come from a mirror or a private registry and none was looked up in OSV".to_string(),
+        );
+    }
     for file in &uv.unreadable {
         inventory.unchecked.push(format!(
             "{} could not be read (not a regular file, closed, too large, not TOML, or not found): it may name a private index, so no Python package mise installed through uv was looked up in OSV",
@@ -146,6 +161,26 @@ pub(super) fn collect(root: &Path, places: &Places) -> Inventory {
         ));
     }
     inventory
+}
+
+/// The directories of the nodes mise installed under `node`, relative to
+/// the root. A link is one of mise's short versions, read under the full
+/// one. At most `MAX_NODES` are taken.
+fn mise_nodes(root: &Path, node: &str) -> Vec<String> {
+    let path = root.join(node);
+    if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+        return Vec::new();
+    }
+    let Ok(listing) = fs::read_dir(path) else {
+        return Vec::new();
+    };
+    listing
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .take(MAX_NODES)
+        .map(|version| format!("{node}/{version}"))
+        .collect()
 }
 
 /// What a directory entry is, without following a link.
@@ -207,6 +242,14 @@ impl Backend {
     }
 }
 
+/// Where what each tool installs comes from, by its configuration.
+#[derive(Clone, Copy, Debug)]
+struct Sources {
+    pip: Source,
+    uv: Source,
+    cargo: Source,
+}
+
 /// A walk over the places packages are kept, within the limits.
 struct Walk<'a> {
     root: &'a Path,
@@ -215,6 +258,9 @@ struct Walk<'a> {
     pip: Source,
     /// The same for uv.
     uv: Source,
+    /// Where what cargo records as from crates.io comes from, by cargo's
+    /// configuration.
+    cargo: Source,
     inventory: Inventory,
     entries: usize,
     /// A limit was reached: nothing more is read.
@@ -232,12 +278,14 @@ struct Walk<'a> {
 }
 
 impl<'a> Walk<'a> {
-    fn new(root: &'a Path, npm: &'a NpmConfig, pip: Source, uv: Source) -> Self {
+    fn new(root: &'a Path, npm: &'a NpmConfig, sources: Sources) -> Self {
+        let Sources { pip, uv, cargo } = sources;
         Self {
             root,
             npm,
             pip,
             uv,
+            cargo,
             inventory: Inventory::default(),
             entries: 0,
             full: false,
@@ -484,18 +532,18 @@ impl<'a> Walk<'a> {
     }
 
     /// Whether the file `rel`, a record of where packages came from, says
-    /// they came from somewhere else. One that is not there says nothing;
-    /// one that is there and cannot be read counts, and is said.
+    /// they came from somewhere else. It is read as a configuration file
+    /// is, through a link too. One that is not there says nothing; one
+    /// that is there and cannot be read counts, and is said.
     fn records_elsewhere(&mut self, rel: &str, elsewhere: fn(&str) -> bool) -> bool {
-        let path = self.root.join(rel);
-        if fs::symlink_metadata(&path).is_err_and(|error| error.kind() == io::ErrorKind::NotFound) {
-            return false;
+        match config::read_config(self.root, rel) {
+            ConfigFile::Absent => false,
+            ConfigFile::Unreadable => {
+                self.unreadable.push(rel.to_string());
+                true
+            }
+            ConfigFile::Text(text) => elsewhere(&text),
         }
-        let Some(text) = read_small_file(&path, MAX_MANIFEST_BYTES) else {
-            self.unreadable.push(rel.to_string());
-            return true;
-        };
-        elsewhere(&text)
     }
 
     /// Every `lib/python*/site-packages` of `environment`, whose packages
@@ -586,7 +634,7 @@ impl<'a> Walk<'a> {
                 version: version.to_string(),
             };
             let source = if CRATES_IO.contains(&source) {
-                Source::Public
+                self.cargo
             } else {
                 Source::Elsewhere
             };

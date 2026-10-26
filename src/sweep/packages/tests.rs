@@ -903,9 +903,21 @@ fn records_in_python_environments_that_name_another_index_leave_them_out() {
     let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
     assert_eq!(found(&inventory), [(Ecosystem::PyPi, "plain", "1.0.0")]);
 
-    // A record that is there and cannot be read is said by its path.
+    // A linked record is followed, as pip follows it.
     symlink(
         root.join(format!("{venvs}/siteconf/pip.conf")),
+        root.join(format!("{venvs}/plain/pip.conf")),
+    )
+    .unwrap();
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    assert_eq!(found(&inventory), []);
+    let unchecked = inventory.unchecked.join("\n");
+    assert!(!unchecked.contains("could not be read"), "{unchecked}");
+
+    // One that leads to no regular file is said by its path.
+    fs::remove_file(root.join(format!("{venvs}/plain/pip.conf"))).unwrap();
+    symlink(
+        root.join(format!("{venvs}/siteconf")),
         root.join(format!("{venvs}/plain/pip.conf")),
     )
     .unwrap();
@@ -936,6 +948,123 @@ fn a_mise_npm_tool_in_pnpms_layout_is_said_as_not_read() {
             .unchecked
             .join("\n")
             .contains(&format!("/{install}")),
+        "{:?}",
+        inventory.unchecked
+    );
+}
+
+#[test]
+fn npms_global_file_under_each_prefix_decides_too() {
+    let root = TempDir::new("packages-npm-global");
+    let root = root.path();
+    let node = "home/u/.local/share/mise/installs/node/22.1.0";
+    npm(root, "usr/lib/node_modules/system", "system", "1.0.0");
+    npm(root, "opt/g/lib/node_modules/mine", "mine", "1.0.0");
+    npm(
+        root,
+        &format!("{node}/lib/node_modules/npm"),
+        "npm",
+        "10.0.0",
+    );
+    let places = Places::defaults(Some(HOME));
+    write(root, "home/u/.npmrc", "prefix=/opt/g\n");
+    assert_eq!(found(&inventory::collect(root, &places)).len(), 3);
+
+    // `npm config set -g registry ...` writes `{prefix}/etc/npmrc`; the
+    // prefix comes from the user's file.
+    write(root, "home/u/.npmrc", "prefix=/opt/g\n");
+    write(
+        root,
+        "opt/g/etc/npmrc",
+        "registry=https://npm.corp.example/\n",
+    );
+    let inventory = inventory::collect(root, &places);
+    assert_eq!(found(&inventory), []);
+    assert!(!inventory.unchecked.join("\n").contains("could not be read"));
+
+    // Without a prefix, a node's own directory is its prefix.
+    fs::remove_file(root.join("home/u/.npmrc")).unwrap();
+    assert_eq!(found(&inventory::collect(root, &places)).len(), 2);
+    write(
+        root,
+        &format!("{node}/etc/npmrc"),
+        "registry=https://npm.corp.example/\n",
+    );
+    assert_eq!(found(&inventory::collect(root, &places)), []);
+
+    // `globalconfig` names the global file in its place; one it names by
+    // a path that is not absolute cannot be found, and leaves npm out.
+    fs::remove_file(root.join(format!("{node}/etc/npmrc"))).unwrap();
+    write(root, "home/u/.npmrc", "globalconfig=/srv/npmrc\n");
+    write(
+        root,
+        "srv/npmrc",
+        "@x:registry=https://npm.corp.example/\nregistry=https://npm.corp.example/\n",
+    );
+    assert_eq!(found(&inventory::collect(root, &places)), []);
+    write(root, "home/u/.npmrc", "globalconfig=npmrc\n");
+    let inventory = inventory::collect(root, &places);
+    assert_eq!(found(&inventory), []);
+    assert!(
+        inventory
+            .unchecked
+            .join("\n")
+            .contains("the file npm's globalconfig names (npmrc)"),
+        "{:?}",
+        inventory.unchecked
+    );
+}
+
+#[test]
+fn cargo_source_replacement_leaves_every_crate_out() {
+    let root = TempDir::new("packages-cargo-config");
+    let root = root.path();
+    crates(
+        root,
+        "home/u/.cargo/.crates2.json",
+        &["ripgrep 14.1.0 (registry+https://github.com/rust-lang/crates.io-index)"],
+    );
+    let places = Places::defaults(Some(HOME));
+    write(root, "home/u/.cargo/config.toml", "[net]\nretry = 3\n");
+    assert_eq!(
+        found(&inventory::collect(root, &places)),
+        [(Ecosystem::CratesIo, "ripgrep", "14.1.0")]
+    );
+
+    for (file, text) in [
+        (
+            "home/u/.cargo/config.toml",
+            "[source.crates-io]\nreplace-with = \"mirror\"\n[source.mirror]\nregistry = \"sparse+https://mirror.example/\"\n",
+        ),
+        (
+            "home/u/.cargo/config",
+            "source = { crates-io = { replace-with = \"vendored\" } }\n",
+        ),
+        ("home/u/.cargo/config.toml", "include = [\"more.toml\"]\n"),
+    ] {
+        fs::remove_file(root.join("home/u/.cargo/config.toml")).ok();
+        fs::remove_file(root.join("home/u/.cargo/config")).ok();
+        write(root, file, text);
+        let inventory = inventory::collect(root, &places);
+        assert_eq!(found(&inventory), [], "{text}");
+        assert!(
+            inventory
+                .unchecked
+                .join("\n")
+                .contains("cargo's configuration replaces a source"),
+            "{:?}",
+            inventory.unchecked
+        );
+    }
+
+    write(root, "home/u/.cargo/config.toml", "[source\n");
+    let inventory = inventory::collect(root, &places);
+    assert_eq!(found(&inventory), []);
+    assert!(
+        inventory
+            .unchecked
+            .join("\n")
+            .contains("/home/u/.cargo/config.toml could not be read"),
         "{:?}",
         inventory.unchecked
     );

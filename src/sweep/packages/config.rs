@@ -1,13 +1,14 @@
-//! What npm's, pip's and uv's configuration say about where packages come
-//! from, read locally only. These files hold registry tokens and index
+//! What npm's, pip's, uv's and cargo's configuration say about where
+//! packages come from, read locally only. These files hold registry tokens and index
 //! passwords: only the keys named here are taken, and nothing of them is
 //! shown or sent.
 //!
 //! A package from a registry other than the public one may have a private
 //! name, which must not go to OSV: npm's `registry` (or a scope's own),
 //! the `_resolved` an older npm wrote in `package.json`, pip's
-//! `index-url`, `extra-index-url` and `find-links`, and uv's index settings
-//! (for what mise installs through uv) decide that.
+//! `index-url`, `extra-index-url` and `find-links`, uv's index settings
+//! (for what mise installs through uv), and cargo's source replacement
+//! decide that.
 
 use std::env;
 use std::fs;
@@ -22,10 +23,9 @@ use crate::tomlish;
 /// lines.
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
-/// npm's global configuration files: the one npm reads under its prefix
-/// (`/usr`) and the one Arch's npm is built to read. The user's own file is
-/// read after them, and the environment after that, as in npm.
-const GLOBAL_NPMRC: &[&str] = &["usr/etc/npmrc", "etc/npmrc"];
+/// The global npm configuration file Arch's npm is built to read, besides
+/// the one under the prefix.
+const ARCH_NPMRC: &str = "etc/npmrc";
 
 /// pip's global configuration files, read before the user's.
 const GLOBAL_PIP: &[&str] = &["etc/xdg/pip/pip.conf", "etc/pip.conf"];
@@ -247,72 +247,148 @@ pub(super) fn from_root(path: &str) -> Option<String> {
     (absolute && !relative.is_empty()).then(|| relative.to_string())
 }
 
-/// What npm's configuration says that the inventory needs.
+/// What npm's configuration says that the inventory needs, for every node
+/// installed: npm's files differ from one node to the next.
 #[derive(Debug, Default)]
 pub(super) struct NpmConfig {
-    /// Where global packages go, relative to the root.
-    pub(super) prefix: Option<String>,
+    /// Where global packages go, relative to the root, where a node's
+    /// configuration sets it.
+    pub(super) prefixes: Vec<String>,
+    /// Every node's npm is set not to run install scripts.
     pub(super) ignore_scripts: bool,
+    /// Where each node's npm takes packages from.
+    nodes: Vec<NpmRegistries>,
+    /// The files that are there and could not be read (not a regular file,
+    /// closed, or too large), or cannot be found, as said to the user: what
+    /// they set is not known, so no package counts as public.
+    pub(super) unreadable: Vec<String>,
+}
+
+/// The registries one node's npm is set to use.
+#[derive(Debug, Default)]
+struct NpmRegistries {
     /// The registry packages come from, where one is set.
     registry: Option<String>,
     /// The registry of each scope that has its own (`@scope:registry`).
     scoped: Vec<(String, String)>,
-    /// The files that are there and could not be read (not a regular file, closed, or
-    /// too large), or cannot be found, as said to the user: what they set
-    /// is not known, so no package counts as public.
-    pub(super) unreadable: Vec<String>,
 }
 
 impl NpmConfig {
-    /// Reads the global files, then the user's, then the environment, each
-    /// setting winning over the one before.
-    pub(super) fn read(root: &Path, places: &Places) -> Self {
+    /// Reads npm's configuration as the npm of each node in `nodes` (its
+    /// install directory relative to the root, `usr` for the system's)
+    /// reads it, in npm's order: its built-in file, the global file, the
+    /// user's, then the environment, each winning over the one before.
+    /// The global file is `globalconfig` where one is set, or else
+    /// `etc/npmrc` under the prefix in effect
+    /// (`@npmcli/config` 10, lib/index.js, `globalconfig`).
+    pub(super) fn read(root: &Path, places: &Places, nodes: &[String]) -> Self {
         let mut config = Self {
             unreadable: unfound(places, "npm_config_userconfig"),
+            ignore_scripts: true,
             ..Self::default()
         };
-        let files = GLOBAL_NPMRC
-            .iter()
-            .map(|file| (*file).to_string())
-            .chain(places.npmrc.clone());
-        for file in files {
-            let text = match read_config(root, &file) {
-                ConfigFile::Absent => continue,
-                ConfigFile::Unreadable => {
-                    config.unreadable.push(format!("/{file}"));
-                    continue;
-                }
-                ConfigFile::Text(text) => text,
+        let home = places.home.as_deref();
+        let user = config.file(root, places.npmrc.as_deref());
+        for node in nodes {
+            let builtin = config.file(root, Some(&format!("{node}/lib/node_modules/npm/npmrc")));
+            let before: Vec<&(String, String)> =
+                builtin.iter().chain(&user).chain(&places.npm_env).collect();
+            let last = |key: &str| {
+                before
+                    .iter()
+                    .rev()
+                    .find(|(known, _)| known == key)
+                    .map(|(_, value)| value.as_str())
             };
-            for (key, value) in text.lines().filter_map(setting) {
-                config.set(key, value, places.home.as_deref());
-            }
-        }
-        for (key, value) in &places.npm_env {
-            config.set(key, value, places.home.as_deref());
+            let global = match last("globalconfig") {
+                Some(file) => npm_prefix(file, home).ok_or(file),
+                None => Ok(format!(
+                    "{}/etc/npmrc",
+                    last("prefix")
+                        .and_then(|prefix| npm_prefix(prefix, home))
+                        .unwrap_or_else(|| node.clone())
+                )),
+            };
+            let globals = match global {
+                Ok(file) => {
+                    let mut globals = config.file(root, Some(&file));
+                    if node == "usr" && file != ARCH_NPMRC {
+                        globals.extend(config.file(root, Some(ARCH_NPMRC)));
+                    }
+                    globals
+                }
+                Err(file) => {
+                    config
+                        .unreadable
+                        .push(format!("the file npm's globalconfig names ({file})"));
+                    Vec::new()
+                }
+            };
+            let ordered = builtin
+                .iter()
+                .chain(&globals)
+                .chain(&user)
+                .chain(&places.npm_env);
+            config.apply(ordered, home);
         }
         config
     }
 
-    fn set(&mut self, key: &str, value: &str, home: Option<&str>) {
-        match key {
-            "prefix" => self.prefix = npm_prefix(value, home),
-            "ignore-scripts" => self.ignore_scripts = value == "true",
-            "registry" => self.registry = Some(value.to_string()),
-            _ => {
-                if let Some(scope) = key
-                    .strip_suffix(":registry")
-                    .filter(|scope| scope.starts_with('@'))
-                {
-                    self.scoped.retain(|(known, _)| known != scope);
-                    self.scoped.push((scope.to_string(), value.to_string()));
-                }
+    /// The settings of an npm configuration file, or none where there is
+    /// none; one that cannot be read is kept in `unreadable`.
+    fn file(&mut self, root: &Path, file: Option<&str>) -> Vec<(String, String)> {
+        let Some(file) = file else {
+            return Vec::new();
+        };
+        match read_config(root, file) {
+            ConfigFile::Absent => Vec::new(),
+            ConfigFile::Unreadable => {
+                self.unreadable.push(format!("/{file}"));
+                Vec::new()
             }
+            ConfigFile::Text(text) => text
+                .lines()
+                .filter_map(setting)
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
         }
     }
 
+    /// Takes one node's settings, the last of each key winning.
+    fn apply<'a>(
+        &mut self,
+        settings: impl Iterator<Item = &'a (String, String)>,
+        home: Option<&str>,
+    ) {
+        let mut registries = NpmRegistries::default();
+        let mut prefix = None;
+        let mut ignore_scripts = false;
+        for (key, value) in settings {
+            match key.as_str() {
+                "prefix" => prefix = npm_prefix(value, home),
+                "ignore-scripts" => ignore_scripts = value == "true",
+                "registry" => registries.registry = Some(value.clone()),
+                _ => {
+                    if let Some(scope) = key
+                        .strip_suffix(":registry")
+                        .filter(|scope| scope.starts_with('@'))
+                    {
+                        registries.scoped.retain(|(known, _)| known != scope);
+                        registries.scoped.push((scope.to_string(), value.clone()));
+                    }
+                }
+            }
+        }
+        self.ignore_scripts &= ignore_scripts;
+        if let Some(prefix) = prefix.filter(|prefix| !self.prefixes.contains(prefix)) {
+            self.prefixes.push(prefix);
+        }
+        self.nodes.push(registries);
+    }
+
     /// Whether the npm package `name`, installed from the address
-    /// `resolved` where one is recorded, came from npm's public registry.
+    /// `resolved` where one is recorded, came from npm's public registry,
+    /// whichever node's npm installed it.
     pub(super) fn is_public(&self, name: &str, resolved: Option<&str>) -> bool {
         // A file it could not read may set a private registry for any
         // scope, and npm follows a link to it.
@@ -326,11 +402,13 @@ impl NpmConfig {
             .split_once('/')
             .map(|(scope, _)| scope)
             .filter(|scope| scope.starts_with('@'));
-        let registry = scope
-            .and_then(|scope| self.scoped.iter().find(|(known, _)| known == scope))
-            .map(|(_, registry)| registry)
-            .or(self.registry.as_ref());
-        registry.is_none_or(|registry| is_on(registry, NPM_REGISTRIES))
+        self.nodes.iter().all(|node| {
+            let registry = scope
+                .and_then(|scope| node.scoped.iter().find(|(known, _)| known == scope))
+                .map(|(_, registry)| registry)
+                .or(node.registry.as_ref());
+            registry.is_none_or(|registry| is_on(registry, NPM_REGISTRIES))
+        })
     }
 }
 
@@ -393,6 +471,40 @@ impl IndexConfig {
                     other_index |= entries.iter().any(|entry| {
                         is_uv_index(&entry.full_path())
                             || inline_keys(&entry.value).any(|key| UV_INDEX_KEYS.contains(&key))
+                    });
+                }
+                Err(()) => unreadable.push(format!("/{file}")),
+            }
+        }
+        Self {
+            other_index: other_index || !unreadable.is_empty(),
+            unreadable,
+        }
+    }
+
+    /// cargo's configuration under its home (`config.toml`, and `config`,
+    /// which cargo still reads). A crate from a source that replaces
+    /// crates.io (`[source.crates-io] replace-with`) is recorded as from
+    /// crates.io, so any `[source]` table counts, and so does `include`,
+    /// whose files are not read. cargo reads neither from the environment
+    /// (the cargo book, config reference: "Environment: not supported").
+    pub(super) fn cargo(root: &Path, places: &Places) -> Self {
+        let files = places
+            .cargo
+            .iter()
+            .flat_map(|cargo| [format!("{cargo}/config.toml"), format!("{cargo}/config")]);
+        let mut other_index = false;
+        let mut unreadable = Vec::new();
+        for file in files {
+            let entries = match read_config(root, &file) {
+                ConfigFile::Absent => continue,
+                ConfigFile::Unreadable => Err(()),
+                ConfigFile::Text(text) => tomlish::entries(&text).map_err(drop),
+            };
+            match entries {
+                Ok(entries) => {
+                    other_index |= entries.iter().any(|entry| {
+                        matches!(entry.full_path().first(), Some(&("source" | "include")))
                     });
                 }
                 Err(()) => unreadable.push(format!("/{file}")),
@@ -534,7 +646,7 @@ pub(super) fn pipx_metadata_other_index(text: &str) -> bool {
 }
 
 /// What reading one configuration file gave.
-enum ConfigFile {
+pub(super) enum ConfigFile {
     Absent,
     /// There, and a broken link, not a regular file, closed, or larger
     /// than `MAX_CONFIG_BYTES`.
@@ -545,7 +657,11 @@ enum ConfigFile {
 /// Reads a configuration file, following a link to it: dotfile managers
 /// link these files, and the tool follows the link too. The target must
 /// still be a regular file within the size limit.
-fn read_config(root: &Path, file: &str) -> ConfigFile {
+///
+/// A link's target resolves against the real `/`, not against `root`.
+/// That is right because the sweep's root is `/`; the tests make their
+/// links point inside their own root.
+pub(super) fn read_config(root: &Path, file: &str) -> ConfigFile {
     let path = root.join(file);
     if let Err(error) = fs::symlink_metadata(&path) {
         return match error.kind() {
@@ -720,15 +836,36 @@ mod tests {
             &["registry.npmjs.org"]
         ));
 
-        let mut config = NpmConfig::default();
+        let with = |settings: &[(&str, &str)]| {
+            let settings: Vec<(String, String)> = settings
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect();
+            let mut config = NpmConfig::default();
+            config.apply(settings.iter(), None);
+            config
+        };
+        let config = with(&[]);
         assert!(config.is_public("a", None));
         assert!(!config.is_public("a", Some("file:../a")));
-        config.set("@corp:registry", "https://npm.corp.example/", None);
+        let config = with(&[("@corp:registry", "https://npm.corp.example/")]);
         assert!(!config.is_public("@corp/a", None));
         assert!(config.is_public("@other/a", None));
-        config.set("registry", "https://mirror.example/", None);
+        let config = with(&[("registry", "https://mirror.example/")]);
         assert!(!config.is_public("a", None));
         assert!(config.is_public("a", Some("https://registry.npmjs.org/a/-/a-1.tgz")));
+        // Each node's npm decides for itself; one that is set elsewhere
+        // is enough to leave a package out.
+        let mut config = with(&[]);
+        config.apply(
+            [(
+                "registry".to_string(),
+                "https://mirror.example/".to_string(),
+            )]
+            .iter(),
+            None,
+        );
+        assert!(!config.is_public("a", None));
 
         assert!(has_index_argument(["--index-url", "https://x"]));
         assert!(has_index_argument(["--extra-index-url=https://x"]));
@@ -829,7 +966,7 @@ mod tests {
         let places = Places::from_variables(Some("home/u"), &variables);
         let root = std::path::Path::new("/nonexistent");
 
-        let npm = NpmConfig::read(root, &places);
+        let npm = NpmConfig::read(root, &places, &["usr".to_string()]);
         assert_eq!(
             npm.unreadable,
             ["the file npm_config_userconfig names (npmrc)"]

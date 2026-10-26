@@ -450,8 +450,16 @@ from PyPI, crates from crates.io.
   so the `registry` (or the scope's own `@scope:registry`) npm is set to use
   decides, or `_resolved` where an older npm wrote one. A global package
   installed from git or a tarball under a name whose registry is the public
-  one is sent like any other. Where an npm configuration file is there and
-  cannot be read, no npm package is sent: it may set a private registry.
+  one is sent like any other. npm's configuration is read as each node's
+  npm reads it, the system's (`/usr`) and each one mise installed: its
+  built-in `npmrc`, its global file (`etc/npmrc` under the `prefix` in
+  effect, which is the node's own directory unless one is set, or the file
+  `globalconfig` names; `/etc/npmrc` too for the system's), your
+  `~/.npmrc` and the environment. A package is sent only when every node's
+  npm takes it from the public registry. Where an npm configuration file
+  is there and cannot be read, or `globalconfig` or
+  `npm_config_userconfig` names one by a path that is not absolute, no npm
+  package is sent: it may set a private registry.
 - pip: a package installed from an address or a local directory (it has a
   `direct_url.json`) is left out. So is every package of a pipx environment
   installed with another index or a requirements or constraints file
@@ -463,8 +471,9 @@ from PyPI, crates from crates.io.
   (`/etc/pip.conf`, `/etc/xdg/pip/pip.conf`, `~/.config/pip/pip.conf`,
   `~/.pip/pip.conf`, the `pip/pip.conf` under `XDG_CONFIG_HOME` and each of
   `XDG_CONFIG_DIRS`, `PIP_CONFIG_FILE`, `PIP_INDEX_URL` and the like) sets
-  `index-url`, `extra-index-url` or `find-links` to anything but PyPI, an
-  a line indented deeper than its key continuing a value included. A
+  `index-url`, `extra-index-url` or `find-links` to anything but PyPI (an
+  empty value, and a value continued on lines indented deeper than its key,
+  included). A
   `PIP_CONFIG_FILE` that is not an absolute path counts as a file that
   cannot be read. pip keeps no record of an index
   given on its command line: a package installed with `pip install
@@ -479,11 +488,16 @@ from PyPI, crates from crates.io.
   `uv-receipt.toml` records an index, or a requirement with a git, address,
   path or index source, is left out. A `uv.toml` in the directory mise ran uv
   from is not known and not read.
-- cargo: crates from git, a path or another registry are left out.
+- cargo: crates from git, a path or another registry are left out. A crate
+  from a source that replaces crates.io (`[source.crates-io] replace-with`)
+  is still recorded as from crates.io, so every crate is left out, and the
+  reason said, where cargo's `config.toml` or `config` under `CARGO_HOME`
+  has any `[source]` table or an `include`, or cannot be read or parsed.
+  cargo takes neither from the environment. A `.cargo/config.toml` in the
+  directory `cargo install` ran from is not known and not read.
 
 What is left out this way is said as not checked, so a machine with such
-packages has an incomplete sweep. An `npm_config_userconfig` that is not an
-absolute path counts as a file that cannot be read.
+packages has an incomplete sweep.
 
 At every sweep the rest of the inventory goes to OSV: the ecosystem, the name
 and the version of each package, in requests of up to 500 packages per
@@ -520,16 +534,18 @@ of such a place itself (an npm prefix, `CARGO_HOME`, mise's or pipx's home, a
 home kept on another disk) is followed, as the tool follows it. An
 `*.egg-info` package is not read.
 
-When npm is installed (`/usr/bin/npm`, or a node of mise's) and npm's
-configuration does not set `ignore-scripts=true` (`/usr/etc/npmrc`,
-`/etc/npmrc`, then your `~/.npmrc` or the file `npm_config_userconfig` names,
-then `npm_config_ignore_scripts` in the environment, each winning over the one
-before), a note says that npm runs the install scripts of every package it
+When npm is installed (`/usr/bin/npm`, or a node of mise's) and the
+configuration of any node's npm, read in the order above with each file
+winning over the one before (your `~/.npmrc` or the file
+`npm_config_userconfig` names over the global files, and
+`npm_config_ignore_scripts` in the environment over all), does not set
+`ignore-scripts=true`, a note says that npm runs the install scripts of every package it
 installs, which is how most malicious npm packages act, and how to turn them
 off (`npm config set ignore-scripts true`). It is said once, and again should
-it stop and come back. Only `prefix`, `ignore-scripts`, `registry` and the
-scopes' registries are taken from npm's files, and only the index settings
-from pip's and uv's; these files hold registry tokens, and nothing of them is shown or
+it stop and come back. Only `prefix`, `globalconfig`, `ignore-scripts`, `registry` and the
+scopes' registries are taken from npm's files, only the index settings
+from pip's and uv's, and only the `[source]` and `include` keys from
+cargo's; these files hold registry tokens, and nothing of them is shown or
 sent.
 
 ### Guardian's own units
