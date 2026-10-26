@@ -58,6 +58,11 @@ fn files_that_hold_tokens_and_plain_facts_stay_here() {
         ("boot/vmlinuz-linux", Category::Boot, true),
         ("boot/limine.conf", Category::Boot, false),
         ("boot/loader/entries/arch.conf", Category::Boot, false),
+        ("boot/loader/loader.conf", Category::Boot, false),
+        ("boot/grub/grub.cfg", Category::Boot, false),
+        ("boot/EFI/limine/limine.conf", Category::Boot, false),
+        ("boot/EFI/BOOT/startup.nsh", Category::Boot, false),
+        ("boot/EFI/refind/refind.conf", Category::Boot, false),
         ("proc/cmdline", Category::Boot, false),
         (
             "home/u/.config/chromium-flags.conf",

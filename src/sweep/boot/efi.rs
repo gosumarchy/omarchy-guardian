@@ -39,6 +39,7 @@ use std::path::Path;
 
 use super::Boot;
 use crate::autorun::Category;
+use crate::error::{Error, IoContext as _};
 use crate::files::{O_NOFOLLOW, O_NONBLOCK};
 use crate::paths::file_name;
 use crate::rules::RuleId;
@@ -49,9 +50,7 @@ use crate::sweep::tier::Tier;
 
 /// Where packages ship the EFI programs that boot loader tools copy into
 /// `/boot`: Limine, systemd-boot, fwupd, shim and rEFInd. A packaged
-/// program counts wherever it sits, so the UEFI shell is deliberately left
-/// out: copied to the firmware's default path it would run `startup.nsh`
-/// at every boot, and no boot loader tool puts it there.
+/// program counts wherever it sits.
 const PACKAGED: &[&str] = &[
     "usr/share/limine/*",
     "usr/lib/systemd/boot/efi/*",
@@ -60,6 +59,12 @@ const PACKAGED: &[&str] = &[
     "usr/share/refind/*",
     "usr/share/refind/drivers_*/*",
 ];
+
+/// Where packages ship the UEFI shell. It is a finding anywhere in `/boot`:
+/// a trusted boot loader can start it from any path (systemd-boot's
+/// `auto-efi-shell` entry), and it runs `startup.nsh` and whatever is
+/// typed at the firmware's console, before the kernel and its defences.
+const SHELLS: &str = "usr/share/edk2-shell/*/*";
 
 /// Where systemd ships the stubs UKIs are built from.
 const STUBS: &str = "usr/lib/systemd/boot/efi/*.efi.stub";
@@ -100,7 +105,7 @@ const GRUB: &str = "not comparable: grub-install builds GRUB's EFI program on th
 const ELSEWHERE: &str = "an EFI program no installed package ships, outside the directories this system's boot loaders start from: another system's boot loader or a firmware tool, or one put there";
 
 /// What an EFI program in `/boot` was found to be.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {
     /// What a package ships, perhaps signed or with Limine's configuration
     /// hash enrolled since.
@@ -112,6 +117,8 @@ enum Verdict {
     /// A UKI built from the packaged stub around a kernel no package ships,
     /// that this system starts.
     StartedKernel,
+    /// A packaged UEFI shell (see `SHELLS`).
+    Shell,
     /// No installed package ships it.
     Unknown,
 }
@@ -126,6 +133,8 @@ struct Reference {
 /// What the programs in `/boot` are compared with.
 struct Packaged<'a> {
     programs: Vec<Reference>,
+    /// The packaged UEFI shells, which no program in `/boot` may be.
+    shells: Vec<Reference>,
     /// The bytes of the packaged UKI stubs that are still what systemd
     /// shipped.
     stubs: Vec<Vec<u8>>,
@@ -156,7 +165,8 @@ pub(super) fn compare(scope: &Scope<'_>, files: &[String], kernels: &[Digest], b
         );
     }
     let packaged = Packaged {
-        programs: references(scope),
+        programs: references(scope, PACKAGED),
+        shells: references(scope, &[SHELLS]),
         stubs: stubs(scope),
         kernels,
         grub: scope
@@ -170,15 +180,13 @@ pub(super) fn compare(scope: &Scope<'_>, files: &[String], kernels: &[Digest], b
         let found = collect::look(scope, Category::Boot, path, None);
         let mut item = collect::item_of(scope, Category::Boot, path.clone(), None, &found);
         let verdict = match &found {
+            // Before what a package installed in `/boot` itself: a shell
+            // there is a finding whoever put it there.
+            Found::File { sha256, .. } if is_listed(&packaged.shells, *sha256) => Verdict::Shell,
             Found::File { .. } if matches!(item.tier, Tier::Vendor | Tier::UserBuilt) => {
                 Verdict::Packaged
             }
-            Found::File { sha256, .. }
-                if packaged
-                    .programs
-                    .iter()
-                    .any(|reference| reference.sha256 == *sha256) =>
-            {
+            Found::File { sha256, .. } if is_listed(&packaged.programs, *sha256) => {
                 Verdict::Packaged
             }
             Found::File { size, .. } if *size > MAX_PROGRAM_SIZE => {
@@ -191,47 +199,66 @@ pub(super) fn compare(scope: &Scope<'_>, files: &[String], kernels: &[Digest], b
             }
             Found::File {
                 sha256, size, head, ..
-            } => {
-                let Some(bytes) = whole(&scope.root.join(path), *sha256, *size, head) else {
-                    unread(scope, boot, path);
+            } => match whole(&scope.root.join(path), *sha256, *size, head) {
+                Ok(bytes) => verdict(path, &bytes, &packaged),
+                Err(error) => {
+                    unread(scope, boot, path, &error.to_string());
                     continue;
-                };
-                verdict(path, &bytes, &packaged)
-            }
+                }
+            },
             Found::Link(target) => {
                 link(scope, boot, path, target);
                 continue;
             }
             Found::Other => continue,
-            Found::Unreadable(_) => {
-                unread(scope, boot, path);
+            Found::Unreadable(reason) => {
+                unread(scope, boot, path, reason);
                 continue;
             }
         };
         match verdict {
-            Verdict::Packaged => continue,
-            Verdict::PackagedKernel => {
-                packaged_kernels += 1;
-                continue;
+            Verdict::Packaged => {}
+            Verdict::PackagedKernel => packaged_kernels += 1,
+            Verdict::NotComparable(_)
+            | Verdict::StartedKernel
+            | Verdict::Shell
+            | Verdict::Unknown => {
+                mark(&mut item, path, verdict);
+                boot.items.push(item);
             }
-            Verdict::NotComparable(reason) => item.notes.push(reason.into()),
-            Verdict::StartedKernel => item.alerts.push((
-                RuleId::BootTampering,
-                "a unified kernel image this system starts, built around a kernel no installed kernel package ships".into(),
-            )),
-            Verdict::Unknown if is_started(path) => item.alerts.push((
-                RuleId::BootTampering,
-                "not an EFI program any installed package ships, in a directory the boot loader starts from".into(),
-            )),
-            Verdict::Unknown => item.notes.push(ELSEWHERE.into()),
         }
-        boot.items.push(item);
     }
     if packaged_kernels > 0 {
         boot.notes.push(format!(
             "{packaged_kernels} unified kernel image(s) in /boot: the stub and the kernel inside are what installed packages ship; the initramfs and command line inside are built on this machine and are not compared"
         ));
     }
+}
+
+/// Whether `sha256` is that of one of `references` as shipped.
+fn is_listed(references: &[Reference], sha256: Digest) -> bool {
+    references
+        .iter()
+        .any(|reference| reference.sha256 == sha256)
+}
+
+/// Puts on `item`, the program at `path`, what `verdict` says of it.
+fn mark(item: &mut collect::Item, path: &str, verdict: Verdict) {
+    let alert = match verdict {
+        Verdict::Packaged | Verdict::PackagedKernel => return,
+        Verdict::NotComparable(reason) => return item.notes.push(reason.into()),
+        Verdict::Unknown if !is_started(path) => return item.notes.push(ELSEWHERE.into()),
+        Verdict::StartedKernel => {
+            "a unified kernel image this system starts, built around a kernel no installed kernel package ships"
+        }
+        Verdict::Shell => {
+            "the UEFI shell, which a boot loader can start from any path and which runs startup.nsh and whatever is typed at the firmware's console"
+        }
+        Verdict::Unknown => {
+            "not an EFI program any installed package ships, in a directory the boot loader starts from"
+        }
+    };
+    item.alerts.push((RuleId::BootTampering, alert.into()));
 }
 
 /// Says what could not be checked: for root the sweep is incomplete, a
@@ -264,11 +291,12 @@ fn link(scope: &Scope<'_>, boot: &mut Boot, path: &str, target: &str) {
     }
 }
 
-/// Says that the program at `path` could not be read.
-fn unread(scope: &Scope<'_>, boot: &mut Boot, path: &str) {
+/// Says that the program at `path` could not be read, for `reason`.
+fn unread(scope: &Scope<'_>, boot: &mut Boot, path: &str, reason: &str) {
     if scope.origin == Origin::Root {
-        boot.unchecked
-            .push(format!("/{path}: could not be read; not compared"));
+        boot.unchecked.push(format!(
+            "/{path}: could not be read ({reason}); not compared"
+        ));
     } else {
         boot.notes.push(format!(
             "/{path} cannot be read as this user; the root checks compare it with the packaged EFI programs"
@@ -303,15 +331,20 @@ fn intact(scope: &Scope<'_>, pattern: &str, extension: &str) -> Vec<(Digest, Opt
             if !matches!(item.tier, Tier::Vendor | Tier::UserBuilt) {
                 return None;
             }
-            let bytes = whole(&scope.root.join(&path), sha256, size, &head).map(Cow::into_owned);
+            // One that cannot be read whole is compared by its digest only,
+            // so a program in `/boot` is the less likely to match it.
+            let bytes = whole(&scope.root.join(&path), sha256, size, &head)
+                .ok()
+                .map(Cow::into_owned);
             Some((sha256, bytes))
         })
         .collect()
 }
 
-/// The packaged EFI programs that are still what their packages shipped.
-fn references(scope: &Scope<'_>) -> Vec<Reference> {
-    PACKAGED
+/// The packaged EFI programs `patterns` match that are still what their
+/// packages shipped.
+fn references(scope: &Scope<'_>, patterns: &[&str]) -> Vec<Reference> {
+    patterns
         .iter()
         .flat_map(|pattern| intact(scope, pattern, "efi"))
         .map(|(sha256, bytes)| Reference {
@@ -332,34 +365,43 @@ fn stubs(scope: &Scope<'_>) -> Vec<Vec<u8>> {
 /// Every byte of the file at `path`, which was looked at as `sha256`,
 /// `size` bytes of which `head` holds the first: `head` itself when it
 /// holds them all, otherwise read again and checked to be the same file
-/// with the same content. `None` when that cannot be done.
-fn whole<'a>(path: &Path, sha256: Digest, size: u64, head: &'a [u8]) -> Option<Cow<'a, [u8]>> {
+/// with the same content. `Err`, saying why, when that cannot be done.
+fn whole<'a>(
+    path: &Path,
+    sha256: Digest,
+    size: u64,
+    head: &'a [u8],
+) -> Result<Cow<'a, [u8]>, Error> {
     if head.len() as u64 == size {
-        return Some(Cow::Borrowed(head));
+        return Ok(Cow::Borrowed(head));
     }
+    let refused = |reason: &str| Err(Error::Message(format!("{}: {reason}", path.display())));
     if size > MAX_PROGRAM_SIZE {
-        return None;
+        return refused(&format!("larger than {MAX_PROGRAM_SIZE} bytes"));
     }
     // Checked before opening, so that a device or a pipe put in its place
     // is never opened.
-    let before = fs::symlink_metadata(path).ok()?;
+    let before = fs::symlink_metadata(path).at(path)?;
     if !before.is_file() {
-        return None;
+        return refused("not a regular file");
     }
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(O_NOFOLLOW | O_NONBLOCK)
         .open(path)
-        .ok()?;
-    let opened = file.metadata().ok()?;
+        .at(path)?;
+    let opened = file.metadata().at(path)?;
     if !opened.is_file() || opened.ino() != before.ino() || opened.dev() != before.dev() {
-        return None;
+        return refused("replaced while it was read");
     }
     let mut bytes = Vec::new();
     file.take(MAX_PROGRAM_SIZE + 1)
         .read_to_end(&mut bytes)
-        .ok()?;
-    (Sha256::digest(&bytes) == sha256).then_some(Cow::Owned(bytes))
+        .at(path)?;
+    if Sha256::digest(&bytes) != sha256 {
+        return refused("changed since it was hashed");
+    }
+    Ok(Cow::Owned(bytes))
 }
 
 /// What the program at `path` with content `bytes`, which is not a
@@ -368,13 +410,18 @@ fn verdict(path: &str, bytes: &[u8], packaged: &Packaged<'_>) -> Verdict {
     let Some(program) = pe::normalized(bytes) else {
         return Verdict::Unknown;
     };
-    let same = packaged.programs.iter().any(|reference| {
-        reference
-            .normalized
-            .as_deref()
-            .is_some_and(|shipped| pe::is_same_program(&program, shipped))
-    });
-    if same {
+    let is_one_of = |references: &[Reference]| {
+        references.iter().any(|reference| {
+            reference
+                .normalized
+                .as_deref()
+                .is_some_and(|shipped| pe::is_same_program(&program, shipped))
+        })
+    };
+    if is_one_of(&packaged.shells) {
+        return Verdict::Shell;
+    }
+    if is_one_of(&packaged.programs) {
         return Verdict::Packaged;
     }
     if let Some(verdict) = unified(path, bytes, packaged) {

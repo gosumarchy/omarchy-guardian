@@ -82,7 +82,7 @@ them into `/etc/skel`).
 | Kernel modules and parameters | `sysctl.d`, `modules-load.d`, `binfmt.d` and `modprobe.d` under `/usr/lib` and `/etc` | | gate and sweep |
 | udev rules | `/usr/lib/udev/rules.d`, `/etc/udev/rules.d`, `/usr/local/lib/udev/rules.d` | | gate and sweep |
 | Boot loader: what entries and the kernel command line are built from | `/usr/share/limine-entry-tool.d`, `/etc/limine-entry-tool.d`, `/etc/cmdline.d` | | gate and sweep |
-| Boot loader: its own configuration | The Limine config (`/boot/limine.conf`, `/etc/default/limine`), `/etc/kernel/cmdline` | | sweep only |
+| Boot loader: its own configuration | Limine's (`/boot/limine.conf`, `/boot/limine/limine.conf`, `/boot/EFI/limine/limine.conf`, `/etc/default/limine`), systemd-boot's (`/boot/loader/loader.conf`, `/boot/loader/entries/`), GRUB's (`/boot/grub/grub.cfg`, `/etc/default/grub`), `/etc/kernel/cmdline`, the UEFI shell's `startup.nsh` (`/boot`, `/boot/EFI/BOOT`), rEFInd's `/boot/EFI/*/refind.conf` | | sweep only |
 | Initramfs and kernel install hooks | initcpio (`/usr/lib/initcpio/hooks`, `install` and `post`, `/etc/initcpio`), `/etc/mkinitcpio.conf`, `/etc/mkinitcpio.conf.d`, `/etc/mkinitcpio.d`, `kernel/install.d` under `/usr/lib` and `/etc`, DKMS build configuration (`/usr/src/*/dkms.conf`) | | gate and sweep |
 | Dynamic linker and Python start-up | `/etc/ld.so.preload`, `/etc/ld.so.conf`, `/etc/ld.so.conf.d`, `/etc/nsswitch.conf`; Python's `.pth`, `sitecustomize.py` and `usercustomize.py` files in `/usr/lib/python*/site-packages` and `/usr/lib/python*/sitecustomize.py`, which every Python program runs at start | Your own `.pth`, `sitecustomize.py` and `usercustomize.py` in `~/.local/lib/python*/site-packages` | gate and sweep |
 | Preferred libraries | Libraries in `/usr/lib/glibc-hwcaps` | | sweep only |
@@ -741,10 +741,7 @@ Every EFI program under `/boot` (a `.efi` file; the first 64, more is said)
 is compared by SHA-256 with the ones packages ship for a boot loader tool to
 copy there: Limine (`/usr/share/limine`), systemd-boot and its UKI stub
 (`/usr/lib/systemd/boot/efi`), fwupd, shim and rEFInd, each only while it is
-still what its package shipped. The UEFI shell is left out on purpose: a
-packaged program counts wherever it is, and the shell copied to the
-firmware's default path would run `startup.nsh` at every boot. Some tools change the copy
-after install in known ways, and those changes are put back before the
+still what its package shipped. Some tools change the copy after install in known ways, and those changes are put back before the
 comparison, so a program that differs only by them counts as packaged: a
 signature `sbctl` or `sbsign` added (the certificate table at the end, the
 header entry that points at it, the header checksum and the alignment
@@ -760,6 +757,7 @@ bytes.
 | A UKI built from the packaged stub around a kernel no installed package ships, in one of the directories the boot loaders start from (below) or whose `.uname` is the running release | a high finding (`boot-tampering`), like a kernel image the machine starts |
 | Such a UKI anywhere else | listed with a note and no alert, like an older kernel image |
 | A UKI where no packaged stub is installed to compare it with | in those directories a high finding (`boot-tampering`); elsewhere listed with a note: not comparable |
+| The packaged UEFI shell (`/usr/share/edk2-shell`), anywhere in `/boot` | a high finding (`boot-tampering`) |
 | GRUB's program (`grub*.efi`) where the grub package is installed, which `grub-install` builds on this machine | listed with a note: not comparable |
 | Any other program in `/boot/EFI/BOOT`, `/boot/EFI/limine`, `/boot/EFI/systemd` or `/boot/EFI/Linux` | a high finding (`boot-tampering`) |
 | Any other program elsewhere (another system's boot loader on a shared ESP, a firmware tool) | listed with a note and no alert |
@@ -782,9 +780,14 @@ ESP has no links, and the file it leads to is not compared.
 
 A listed program can be allowed as it is. Nothing from `/boot` goes to the AI
 review: kernel images and EFI programs are judged by these local rules alone,
-even one whose bytes read as text. The one exception is the boot loader's
-configuration (`/boot/limine.conf` and the others the command line is compared
-with), which is reviewed as a file like any other.
+even one whose bytes read as text. The one exception is the boot
+configuration, which is reviewed as a file like any other: Limine's
+`limine.conf` (in `/boot`, `/boot/limine` or `/boot/EFI/limine`),
+systemd-boot's `loader/loader.conf` and `loader/entries/*`, GRUB's
+`grub/grub.cfg`, a `startup.nsh` for the UEFI shell (in `/boot` or
+`/boot/EFI/BOOT`) and rEFInd's `refind.conf`. The UEFI shell is a finding
+anywhere in `/boot` because a trusted boot loader can start it from any path
+(systemd-boot's `auto-efi-shell`), and it runs `startup.nsh`.
 
 What this machine shows, as Omarchy sets it up: Limine is the boot loader,
 `limine-install` copies `/usr/share/limine/BOOTX64.EFI` to

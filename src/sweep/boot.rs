@@ -17,7 +17,7 @@ use std::fs;
 use super::collect::{self, Body, Item, Scope};
 use super::read::{self, Found};
 use super::tier::Tier;
-use crate::autorun::Category;
+use crate::autorun::{self, Category};
 use crate::error::{Error, IoContext as _};
 use crate::paths::file_name;
 use crate::rules::RuleId;
@@ -68,15 +68,11 @@ const CONFIGURED: &[&str] = &[
 /// Directories of boot entries, one file each.
 const CONFIGURED_DIRECTORIES: &[&str] = &["boot/loader/entries", "etc/cmdline.d"];
 
-/// Whether `path` is a boot loader's configuration the command line is
-/// compared with: of what is in `/boot`, the only text the AI reviews
-/// (see `judge::is_local_only`).
+/// Whether `path` is boot configuration the sweep collects as a file (a
+/// boot loader's, the firmware shell's `startup.nsh`, rEFInd's): of what is
+/// in `/boot`, the only text the AI reviews (see `judge::is_local_only`).
 pub(super) fn is_configuration(path: &str) -> bool {
-    CONFIGURED.contains(&path)
-        || CONFIGURED_DIRECTORIES.iter().any(|directory| {
-            path.strip_prefix(directory)
-                .is_some_and(|rest| rest.starts_with('/'))
-        })
+    autorun::sweep_only_location(path).is_some_and(|location| location.category == Category::Boot)
 }
 
 /// The running kernel's command line, relative to the root.
@@ -411,6 +407,27 @@ mod tests {
     use crate::sweep::collect::{Origin, Scope};
     use crate::sweep::index::PackageIndex;
     use crate::test_support::TempDir;
+
+    /// Every file the command line is compared with is also collected and
+    /// reviewed: what a boot loader is told to start is in no other check.
+    /// (`/etc/cmdline.d` is catalogued with the files the pacman gate
+    /// reviews, so it is no sweep-only location.)
+    #[test]
+    fn every_configuration_the_command_line_is_compared_with_is_reviewed() {
+        for path in super::CONFIGURED {
+            assert!(super::is_configuration(path), "{path}");
+        }
+        for directory in super::CONFIGURED_DIRECTORIES
+            .iter()
+            .filter(|directory| directory.starts_with("boot/"))
+        {
+            assert!(
+                super::is_configuration(&format!("{directory}/x.conf")),
+                "{directory}"
+            );
+        }
+        assert!(!super::is_configuration("boot/EFI/BOOT/BOOTX64.EFI"));
+    }
 
     #[test]
     fn only_watched_parameters_the_configuration_does_not_hold_are_told() {

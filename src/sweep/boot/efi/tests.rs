@@ -458,12 +458,19 @@ fn programs_larger_than_what_is_kept_are_read_whole() {
     let path = root.join("boot/EFI/BOOT/BOOTX64.EFI");
     let head = &large[..1024];
     let size = u64::try_from(large.len()).unwrap();
-    assert!(whole(&path, Sha256::digest(&large), size, head).is_none());
+    let refused =
+        |sha256, size, path: &Path| whole(path, sha256, size, head).unwrap_err().to_string();
+    assert!(
+        refused(Sha256::digest(&large), size, &path).ends_with(": changed since it was hashed")
+    );
     let hashed = Sha256::digest(&signed(&large));
-    assert!(whole(&path, hashed, size + 1, head).is_some());
-    assert!(whole(&path, hashed, MAX_PROGRAM_SIZE + 1, head).is_none());
+    assert!(whole(&path, hashed, size + 1, head).is_ok());
+    assert!(
+        refused(hashed, MAX_PROGRAM_SIZE + 1, &path)
+            .ends_with(&format!(": larger than {MAX_PROGRAM_SIZE} bytes"))
+    );
     // A device or pipe in its place is never opened.
-    assert!(whole(Path::new("/dev/zero"), hashed, size, head).is_none());
+    assert!(refused(hashed, size, Path::new("/dev/zero")).ends_with(": not a regular file"));
 }
 
 #[test]
@@ -504,10 +511,11 @@ fn a_link_out_of_boot_is_said() {
     );
 }
 
-/// The packaged UEFI shell vouches for nothing: in the firmware's default
-/// path it would run `startup.nsh` at every boot.
+/// The packaged UEFI shell is a finding anywhere in `/boot`: a trusted
+/// boot loader can start it from any path (systemd-boot's
+/// `auto-efi-shell`), and it runs `startup.nsh`.
 #[test]
-fn the_packaged_uefi_shell_is_not_trusted_in_boot() {
+fn the_packaged_uefi_shell_is_a_finding_anywhere_in_boot() {
     let dir = TempDir::new("sweep-efi-shell");
     let root = dir.path();
     let shell = program(&[(".text", b"uefi shell")]);
@@ -516,26 +524,19 @@ fn the_packaged_uefi_shell_is_not_trusted_in_boot() {
     let mut index = PackageIndex::with_foreign(HashSet::new());
     index.add_for_test("edk2-shell", &mtree_line(packaged, &shell), &[]);
     write(root, "boot/EFI/BOOT/BOOTX64.EFI", &shell);
-    write(root, "boot/shellx64.efi", &shell);
+    write(root, "boot/shellx64.efi", &signed(&shell));
     let scope = Scope {
         root,
         home: None,
         index: &index,
         origin: Origin::Root,
     };
+    let tampered = Some(RuleId::BootTampering);
     assert_eq!(
         found(&scope),
         [
-            (
-                "boot/EFI/BOOT/BOOTX64.EFI".to_string(),
-                Some(RuleId::BootTampering),
-                None
-            ),
-            (
-                "boot/shellx64.efi".to_string(),
-                None,
-                Some(ELSEWHERE.to_string())
-            ),
+            ("boot/EFI/BOOT/BOOTX64.EFI".to_string(), tampered, None),
+            ("boot/shellx64.efi".to_string(), tampered, None),
         ]
     );
 }

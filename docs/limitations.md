@@ -45,7 +45,8 @@ matter most:
   against `limine.conf`); EFI programs are judged as the boot loader's only
   where the ESP is mounted at `/boot` (as on Omarchy): under an ESP at
   `/boot/efi` an unknown one is only listed with a note, and an ESP at `/efi`
-  is not looked at; browser
+  is not looked at; only files named `.efi` are compared, and the firmware's
+  boot entries (NVRAM) are not read; browser
   extensions are judged by where they came from and what they were granted,
   not by their code, and only Chromium's, Brave's, Chrome's, Firefox's and
   Zen's; other mounted filesystems (`/mnt`, `/media`, `/run/media`) are not

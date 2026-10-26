@@ -864,8 +864,20 @@ const UNOFFICIAL_ONLY: &[&str] = &[
 pub(crate) const SYSTEM_SWEEP: &[Location] = &[
     // PAM modules: a `.so` every login loads.
     location("usr/lib/security/", Kind::Directory, Category::Pam),
+    // The boot loaders' configuration, each place the command line is
+    // compared with (see `sweep::boot`), and what the firmware's shell and
+    // rEFInd read: what they start and with which parameters.
     location("boot/limine.conf", Kind::File, Category::Boot),
+    location("boot/limine/limine.conf", Kind::File, Category::Boot),
+    location("boot/EFI/limine/limine.conf", Kind::File, Category::Boot),
+    location("boot/loader/loader.conf", Kind::File, Category::Boot),
+    location("boot/loader/entries/", Kind::Directory, Category::Boot),
+    location("boot/grub/grub.cfg", Kind::File, Category::Boot),
+    location("boot/startup.nsh", Kind::File, Category::Boot),
+    location("boot/EFI/BOOT/startup.nsh", Kind::File, Category::Boot),
+    location("boot/EFI/*/refind.conf", Kind::Glob, Category::Boot),
     location("etc/default/limine", Kind::File, Category::Boot),
+    location("etc/default/grub", Kind::File, Category::Boot),
     location("etc/kernel/cmdline", Kind::File, Category::Boot),
     // Libraries the dynamic linker prefers over the ones in `/usr/lib`.
     location("usr/lib/glibc-hwcaps/", Kind::Directory, Category::Linker),
