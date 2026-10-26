@@ -30,6 +30,20 @@ fn plan(
     })
 }
 
+/// What a file's manifest row is charged in a request before the plan
+/// knows how it is sent: `{"path":"","bytes":,"sent":"unchanged-sent"},`
+/// is 45 bytes, around the escaped path and the size.
+fn row(path: &str, bytes: usize) -> usize {
+    45 + super::weight(path) + bytes.to_string().len()
+}
+
+fn rows(files: &[SourceFile]) -> usize {
+    files
+        .iter()
+        .map(|file| row(&file.path, file.content.len()))
+        .sum()
+}
+
 fn paths(chunk: &[Item]) -> Vec<&str> {
     chunk.iter().map(Item::path).collect()
 }
@@ -256,7 +270,7 @@ fn files_that_belong_together_share_a_chunk_where_that_is_free() {
         file("b/two.sh", &body("b2")),
     ];
     let unit = files[0].path.len() + super::weight(&files[0].content);
-    let overhead = 2 * (11 + 32) + 2 * (8 + 32);
+    let overhead = rows(&files);
     let by_directory = plan(&files, None, overhead + 2 * unit, 8).unwrap();
     let chunks: Vec<Vec<&str>> = by_directory
         .chunks
@@ -279,7 +293,7 @@ fn files_that_belong_together_share_a_chunk_where_that_is_free() {
         file("zz/tail.sh", &body("t")),
     ];
     let cost = |file: &SourceFile| file.path.len() + super::weight(&file.content);
-    let overhead: usize = files.iter().map(|file| file.path.len() + 32).sum();
+    let overhead = rows(&files);
     let plan = plan(&files, None, overhead + 2 * cost(&files[0]) + 6, 8).unwrap();
     let chunk_of = |path: &str| {
         plan.chunks
@@ -303,7 +317,7 @@ fn grouping_never_takes_more_chunks_than_packing_by_rank() {
         file("a/2.c", &"x".repeat(150)),
         file("b/2.c", &"x".repeat(50)),
     ];
-    let overhead = 4 * (5 + 32);
+    let overhead = rows(&files);
     let by_rank = plan(&files, None, overhead + 2 * 155 + 2 * 55, 8).unwrap();
     assert_eq!(by_rank.chunks.len(), 1);
     let tight = plan(&files, None, overhead + 155 + 55 + 100, 8).unwrap();
@@ -318,7 +332,7 @@ fn references_across_chunks_are_found() {
         file("a.sh", &format!(". ./lib/far.sh\n{}", "x".repeat(280))),
         file("lib/far.sh", &"y".repeat(300)),
     ];
-    let overhead = (4 + 32) + (10 + 32);
+    let overhead = rows(&files);
     let plan = plan(&files, None, overhead + 320, 8).unwrap();
     assert_eq!(plan.chunks.len(), 2);
     assert_eq!(
@@ -452,10 +466,11 @@ fn files_are_ordered_by_tier_then_documentation_then_path() {
 #[test]
 fn packing_fills_a_chunk_exactly_then_starts_the_next() {
     let files = [file("b.c", &"b".repeat(100)), file("c.c", &"c".repeat(100))];
-    // Overhead: 2 × (3 + 32) = 70; each item costs 103.
-    let one = plan(&files, None, 70 + 206, 8).unwrap();
+    // Each item costs 103.
+    let overhead = rows(&files);
+    let one = plan(&files, None, overhead + 206, 8).unwrap();
     assert_eq!(one.chunks.len(), 1);
-    let two = plan(&files, None, 70 + 205, 8).unwrap();
+    let two = plan(&files, None, overhead + 205, 8).unwrap();
     assert_eq!(two.chunks.len(), 2);
 }
 
@@ -464,8 +479,8 @@ fn a_large_file_is_split_on_line_boundaries() {
     // A line takes 100 bytes of the request: its newline is two there.
     let line = format!("{}\n", "x".repeat(98));
     let files = [file("big.c", &line.repeat(5))];
-    // Overhead 5 + 32 = 37; capacity 205 leaves 200 bytes of text per piece.
-    let plan = plan(&files, None, 37 + 205, 8).unwrap();
+    // Capacity 205 leaves 200 bytes of text per piece.
+    let plan = plan(&files, None, rows(&files) + 205, 8).unwrap();
     let pieces: Vec<(usize, usize, usize)> = plan
         .chunks
         .iter()
@@ -504,7 +519,7 @@ fn a_piece_carries_the_tail_of_the_previous_piece() {
     // context budget.
     let line = format!("{}\n", "z".repeat(8));
     let files = [file("big.c", &line.repeat(40))];
-    let plan = plan(&files, None, 37 + 205, 8).unwrap();
+    let plan = plan(&files, None, rows(&files) + 205, 8).unwrap();
     let pieces: Vec<_> = plan
         .chunks
         .iter()
@@ -555,8 +570,8 @@ fn an_entry_point_larger_than_a_chunk_is_too_large() {
 #[test]
 fn a_line_longer_than_a_chunk_is_cut() {
     let files = [file("min.js", &"y".repeat(450))];
-    // Overhead 6 + 32 = 38; capacity 206 leaves 200 bytes per piece.
-    let plan = plan(&files, None, 38 + 206, 8).unwrap();
+    // Capacity 206 leaves 200 bytes per piece.
+    let plan = plan(&files, None, rows(&files) + 206, 8).unwrap();
     let sizes: Vec<(usize, usize)> = plan
         .chunks
         .iter()
@@ -648,7 +663,7 @@ fn a_manifest_larger_than_half_the_limit_is_too_large() {
     let files: Vec<SourceFile> = (0..200)
         .map(|index| file(&format!("f{index:03}.txt"), "x"))
         .collect();
-    // 200 × (8 + 32) = 8000 bytes of manifest against a 10000-byte limit.
+    // 200 × (45 + 8 + 1) = 10800 bytes of manifest against a 10000-byte limit.
     assert_eq!(plan(&files, None, 10_000, 64), Err(TooLarge::INPUT));
 }
 
@@ -824,10 +839,10 @@ fn a_path_of_control_characters_is_measured_as_it_is_sent() {
             );
         }
         // Pieces of any other file each fit what the request has room for
-        // beside the file's manifest row: its escaped path (60 bytes for
-        // the controls, 7 for the rest) and the row's 32 bytes of overhead.
+        // beside the file's manifest row, its escaped path included (60
+        // bytes for the controls, 7 for the rest).
         let path = format!("lib/{controls}.js");
-        let manifest_row = 60 + 7 + 32;
+        let manifest_row = row(&path, content.len());
         let files = [file(&path, &content)];
         if let Ok(plan) = plan(&files, None, max_input, 8) {
             assert!(
@@ -837,5 +852,12 @@ fn a_path_of_control_characters_is_measured_as_it_is_sent() {
                 "{max_input}"
             );
         }
+    }
+}
+
+#[test]
+fn a_file_is_charged_for_the_longest_way_it_can_be_sent() {
+    for sent in [Sent::Whole, Sent::Diff, Sent::Unchanged, Sent::Named] {
+        assert!(sent.name().len() <= Sent::Named.name().len(), "{sent:?}");
     }
 }
