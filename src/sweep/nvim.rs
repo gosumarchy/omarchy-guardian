@@ -435,15 +435,23 @@ fn alerts(checkout: &Checkout, specs: &Specs, builds: &[Build]) -> Vec<(RuleId, 
         Shape::Tree { git: Some(git), .. } => git_alerts(&checkout.name, git, specs, &mut alerts),
     }
     for build in builds {
-        if let Build::Shell(command) = build {
-            alerts.push((
-                RuleId::PluginBuild,
-                format!(
-                    "its spec's build step runs {} at install and update",
-                    quoted(std::slice::from_ref(command))
-                ),
-            ));
-        }
+        let alert = match build {
+            Build::Shell(command) => format!(
+                "its spec's build step runs {} at install and update",
+                quoted(std::slice::from_ref(command))
+            ),
+            // Code that was not read decides whether this is a build step,
+            // so it is taken as one.
+            Build::Computed(strings) if strings.is_empty() => {
+                "its spec has a field whose key is computed by code, which was not read: it may be a build step".into()
+            }
+            Build::Computed(strings) => format!(
+                "its spec has a field whose key is computed by code, which was not read: it may be a build step that runs {}",
+                quoted(strings)
+            ),
+            Build::Command(_) | Build::Lua(_) => continue,
+        };
+        alerts.push((RuleId::PluginBuild, alert));
     }
     alerts
 }
@@ -556,16 +564,7 @@ fn notes(checkout: &Checkout, plugin: &Plugin, specs: &Specs, unlocked: bool) ->
                 "its spec's build step is Lua code that may run {}",
                 quoted(strings)
             )),
-            Build::Computed(strings) => {
-                let mut note = String::from(
-                    "its spec has a field whose key is computed by code, which was not read: it may be a build step",
-                );
-                if !strings.is_empty() {
-                    let _ = write!(note, " that runs {}", quoted(strings));
-                }
-                notes.push(note);
-            }
-            Build::Shell(_) => {}
+            Build::Shell(_) | Build::Computed(_) => {}
         }
     }
     let build_lua = matches!(&checkout.shape, Shape::Tree { files, .. }

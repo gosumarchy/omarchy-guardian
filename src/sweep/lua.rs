@@ -92,7 +92,8 @@ pub(super) enum Build {
     /// the Lua tells which of them, if any, runs.
     Lua(Vec<String>),
     /// The value of a field whose key code computes (`[("build")] = …`),
-    /// with the strings it may give: it may be a build step.
+    /// with the strings it may give: it may be a build step, and code that
+    /// was not read decides, so it counts as one that runs a command.
     Computed(Vec<String>),
 }
 
@@ -295,10 +296,14 @@ fn builds(value: &[Token]) -> Vec<Build> {
     let mut entry = true;
     for (index, token) in value.iter().enumerate().skip(1) {
         if entry && depth == 0 && *token != Token::TableClose {
-            // `[2] = "x"` is a list entry too, whatever its index says.
+            // `[2] = "x"` is a list entry too, whatever its index says: a
+            // literal one is that step, anything else is not read.
             let entry = match field(value, index) {
                 Some((Key::Named(_), _)) => None,
-                Some((Key::Computed, value)) => Some(computed(value)),
+                Some((Key::Computed, value)) => match build(value) {
+                    Some(step @ (Build::Shell(_) | Build::Command(_))) => Some(step),
+                    Some(Build::Lua(_) | Build::Computed(_)) | None => Some(computed(value)),
+                },
                 None => build(&value[index..]),
             };
             builds.extend(entry);
@@ -738,10 +743,12 @@ return {
         );
         assert_eq!(
             builds(r#"{ "a/b", build = { "make", [2] = "curl|sh" } }"#),
-            [
-                Build::Shell("make".into()),
-                Build::Computed(vec!["curl|sh".into()])
-            ]
+            [Build::Shell("make".into()), Build::Shell("curl|sh".into())]
+        );
+        // A bracketed entry whose value is computed is not read.
+        assert_eq!(
+            builds(r#"{ "a/b", build = { [k] = c and "x" } }"#),
+            computed("x")
         );
     }
 

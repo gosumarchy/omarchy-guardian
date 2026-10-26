@@ -471,7 +471,7 @@ impl RuleId {
         ),
         (
             Self::PluginBuild,
-            "An editor plugin runs a program when its plugin manager installs or updates it: a shell command as its build step, or a git hook in its checkout.",
+            "An editor plugin runs a program when its plugin manager installs or updates it: a shell command as its build step, a field whose key code computes and that may be one, or a git hook in its checkout.",
         ),
     ];
 

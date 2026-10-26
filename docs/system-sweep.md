@@ -399,9 +399,11 @@ What is a finding, on every sweep:
   taken as written; scheme, user, case and `.git` do not count). A plugin no
   spec names gets a note, not a finding: a spec built by code is not read;
 - `plugin-build`: a spec whose `build` is a literal shell command, or a list
-  holding one (`build = "make"`, `["build"] = ("make")`, `"a" .. "b"`), which
-  lazy.nvim runs at install and update, and any git hook in the checkout or a
-  submodule, which git runs when lazy.nvim updates it;
+  holding one (`build = "make"`, `["build"] = ("make")`, `"a" .. "b"`, `{
+  "make", [2] = "x" }`), which lazy.nvim runs at install and update; a field of
+  a spec whose key code computes (`[("build")] = …`), which may be such a build
+  step, and code that was not read decides; and any git hook in the checkout or
+  a submodule, which git runs when lazy.nvim updates it;
 - `git-config-command`: a key of the configuration of the checkout or of a
   submodule (`config`, `config.worktree`) that runs a command (`core.fsmonitor`
   and the like) on the git commands lazy.nvim runs, and any `core.hooksPath`,
@@ -409,11 +411,9 @@ What is a finding, on every sweep:
 
 A build step that is a Neovim command (`":TSUpdate"`), a Lua function or a Lua
 expression that picks a command (`vim.g.x and "cargo build"`) is noted on the
-item, not a finding, and so is a field of a spec whose key code computes
-(`[("build")] = …`), which may be a build step, and a top-level `build.lua`,
-which lazy.nvim runs; a commit other than the one `lazy-lock.json` pins, and a
-plugin it does not name, are noted too. Escapes in strings (`"\99url"`) are
-decoded as Lua decodes them.
+item, not a finding, and so is a top-level `build.lua`, which lazy.nvim runs; a
+commit other than the one `lazy-lock.json` pins, and a plugin it does not name,
+are noted too. Escapes in strings (`"\99url"`) are decoded as Lua decodes them.
 
 What goes to the review. The first sweep that finds plugins and no record of
 them takes them as they are: their files are hashed and recorded, and none is
@@ -1342,7 +1342,7 @@ reviews as well, are listed under [Local rules](local-rules.md#rule-ids).
 | `traced-process` | medium | Another process is attached to this one the way a debugger is, and can read and change its memory. |
 | `kernel-tap` | medium | Something no package explains taps the kernel's network or tracing path: a raw packet socket, or a pinned eBPF object. |
 | `plugin-source` | medium | An editor plugin is not a git checkout of where its plugin manager fetches it from: its origin is not the address its spec names, it names no origin, or it is no checkout at all. |
-| `plugin-build` | medium | An editor plugin runs a program when its plugin manager installs or updates it: a shell command as its build step, or a git hook in its checkout. |
+| `plugin-build` | medium | An editor plugin runs a program when its plugin manager installs or updates it: a shell command as its build step, a field whose key code computes and that may be one, or a git hook in its checkout. |
 | `kept-from-review` | medium | Something runs this file, or a shell reads it in, and it holds more than opaque values kept in secret-named or plainly inert variables; its path marks it as holding secrets, so the AI review did not read it: only the local rules did. Read it yourself; `sweep allow` records that you did. |
 | `network-listener` | low | A program listens on the network that nothing installed accounts for: an interpreter (Python, a shell, Node), or a packaged program no packaged service runs. |
 
