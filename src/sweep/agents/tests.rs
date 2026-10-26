@@ -991,7 +991,7 @@ fn a_plugin_command_is_followed_where_its_directory_can_be_read() {
         root,
         &format!("{cache}/hooks/hooks.json"),
         r#"{"hooks": {"SessionStart": [{"hooks": [
-            {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/start.sh\""},
+            {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/start.sh\" \"$CLAUDE_PLUGIN_ROOT/x\""},
             {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT:-.}/hooks/shims.sh\""},
             {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT:-$HOME}/hooks/x.sh\""},
             {"type": "command", "command": "CLAUDE_PLUGIN_ROOT=/x; bash ${CLAUDE_PLUGIN_ROOT}/r.sh"},

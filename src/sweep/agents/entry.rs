@@ -446,9 +446,9 @@ pub(super) fn plugin_root_readings(line: &str, root: Option<&str>) -> Vec<String
 /// `unset`, `export`, `env -u`); or a form was left as written and names
 /// no file. Following the new value would take a shell's parser, so the
 /// line is reviewed as written and the gap is said. Not caught: a name
-/// built as it runs (`unset $v`, `$'\x43…'`, `unset CLAUDE_PLUGIN_{ROOT,X}`),
-/// and a command that clears the whole environment (`env -i`, `exec -c`,
-/// `sudo`).
+/// built as it runs (`unset $v`, `$'\x43…'`, `unset CLAUDE_PLUGIN_RO$()OT`,
+/// `unset CLAUDE_PLUGIN_{ROOT,X}`, a glob), and a command that clears the
+/// whole environment (`env -i`, `exec -c`, `sudo`).
 fn plugin_root_not_followed(line: &str, runs: &[String]) -> Option<String> {
     if changes_plugin_root(line) {
         Some(format!(
@@ -465,8 +465,8 @@ fn plugin_root_not_followed(line: &str, runs: &[String]) -> Option<String> {
 
 /// Whether `line` names the plugin's variable other than to expand it, as
 /// an assignment or an argument does: `CLAUDE_PLUGIN_ROOT` not right after
-/// `$` or `${`, or after `${` with `:=` or `=`, which assigns the default
-/// once the variable is unset. A longer name that holds it (`MY_CLAUDE_PLUGIN_ROOT`,
+/// `$` or `${`, or after `${` with `:=` or `=`, which assigns a value when
+/// the variable is unset (or, for `:=`, empty). A longer name that holds it (`MY_CLAUDE_PLUGIN_ROOT`,
 /// `CLAUDE_PLUGIN_ROOTS`) counts too: telling it apart is what let an
 /// option with the name attached (`env -uCLAUDE_PLUGIN_ROOT`, `printf
 /// -vCLAUDE_PLUGIN_ROOT`) through, and such a name only adds a note.

@@ -673,8 +673,9 @@ all followed. So does a command that changes the variable itself
 (`CLAUDE_PLUGIN_ROOT=/x`, `unset`, `env -u`, `${CLAUDE_PLUGIN_ROOT:=/x}`, with
 the name quoted or not): what it then runs is not looked for. A longer name that
 holds it (`MY_CLAUDE_PLUGIN_ROOT`) is noted too. Not caught: a name built as the
-command runs (`unset $v`, `$'\x43…'`, `unset CLAUDE_PLUGIN_{ROOT,X}`, a glob)
-and a command that clears the whole environment (`env -i`, `exec -c`, `sudo`).
+command runs (`unset $v`, `$'\x43…'`, `unset CLAUDE_PLUGIN_RO$()OT`,
+`unset CLAUDE_PLUGIN_{ROOT,X}`, a glob) and a command that clears the whole
+environment (`env -i`, `exec -c`, `sudo`).
 A `file://` plugin of OpenCode is followed to its file.
 
 What is a finding:
