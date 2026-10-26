@@ -742,6 +742,7 @@ mod tests {
         assert_eq!(both.warnings().len(), 2);
         assert!(both.user_block().unwrap().contains("as root"));
         assert!(both.warnings()[1].contains(&user.display().to_string()));
+        assert_eq!(both.user_block_cause(), Some(UserBlock::SystemFile));
 
         // Not there: the built-in defaults, and nothing blocked by it.
         let missing = Settings::load_from(&dir.path().join("none.toml"), Some(&user), &secure);
