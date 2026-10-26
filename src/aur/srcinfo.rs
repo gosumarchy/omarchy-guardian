@@ -3,6 +3,7 @@
 //! pinned, verified and fetched over a connection nobody can change.
 
 use super::{Authority, CHECKSUMS, UNPARSEABLE_HOST};
+use crate::error::Error;
 use crate::paths::file_name;
 
 /// One `source` entry with the checksums given for it.
@@ -86,13 +87,15 @@ pub(crate) fn base_section(srcinfo: &str) -> impl Iterator<Item = (&str, &str)> 
 /// so anything it writes to the same output lands in it: a listing with
 /// text before its first line, a second package base, or a line of another
 /// shape was not written by makepkg alone.
-pub(crate) fn check_listing(srcinfo: &str) -> Result<(), String> {
+pub(crate) fn check_listing(srcinfo: &str) -> Result<(), Error> {
     let mut lines = srcinfo.lines();
     if !lines
         .next()
         .is_some_and(|line| line.starts_with("pkgbase = "))
     {
-        return Err("it does not start with the package base".into());
+        return Err(Error::Message(
+            "it does not start with the package base".into(),
+        ));
     }
     let mut packages = 0;
     for line in lines {
@@ -100,7 +103,7 @@ pub(crate) fn check_listing(srcinfo: &str) -> Result<(), String> {
             continue;
         }
         if line.chars().any(|c| c.is_control() && c != '\t') {
-            return Err("it holds control characters".into());
+            return Err(Error::Message("it holds control characters".into()));
         }
         if line.starts_with("pkgname = ") {
             packages += 1;
@@ -117,15 +120,18 @@ pub(crate) fn check_listing(srcinfo: &str) -> Result<(), String> {
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         });
         if !named || entry.is_some_and(|(key, _)| key == "pkgbase") {
-            return Err(if line.trim_start().starts_with("pkgbase =") {
-                "it names more than one package base".into()
-            } else {
-                "it holds a line makepkg does not print".into()
-            });
+            return Err(Error::Message(
+                if line.trim_start().starts_with("pkgbase =") {
+                    "it names more than one package base"
+                } else {
+                    "it holds a line makepkg does not print"
+                }
+                .into(),
+            ));
         }
     }
     if packages == 0 {
-        return Err("it names no package".into());
+        return Err(Error::Message("it names no package".into()));
     }
     Ok(())
 }

@@ -356,12 +356,9 @@ pub(super) fn probe(step: &UpstreamStep<'_>) -> Result<String, Error> {
 /// Fetches and extracts the sources, in the jail with the network on, from
 /// `recipe`: the generated one, so none of the package's recipe runs. A
 /// source tree left by an earlier run is removed first (`--cleanbuild`).
-pub(super) fn pre_extract(
-    step: &UpstreamStep<'_>,
-    dirs: &Dirs,
-    recipe: &str,
-) -> Result<(), String> {
-    let prepare = |error: Error| format!("could not prepare the sources ({error}).");
+pub(super) fn pre_extract(step: &UpstreamStep<'_>, dirs: &Dirs, recipe: &str) -> Result<(), Error> {
+    let prepare =
+        |error: Error| Error::Message(format!("could not prepare the sources ({error})."));
     let workspace = Workspace::create("fetch").map_err(prepare)?;
     let copy = RecipeCopy::create(step.build_dir, recipe).map_err(prepare)?;
     let mut args: Vec<OsString> = vec!["-p".into(), copy.name()];
@@ -385,12 +382,16 @@ pub(super) fn pre_extract(
         .args(command)
         .stdin(Stdio::null())
         .status()
-        .map_err(|error| format!("could not run makepkg to fetch the sources ({error})."))?;
+        .map_err(|error| {
+            Error::Message(format!(
+                "could not run makepkg to fetch the sources ({error})."
+            ))
+        })?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!(
+        Err(Error::Message(format!(
             "fetching the sources for review failed ({status})."
-        ))
+        )))
     }
 }

@@ -375,7 +375,8 @@ impl Archive {
             .take()
             .ok_or_else(|| failed("no output".into()))
             .and_then(|stdout| {
-                attributes_in_tar(io::BufReader::with_capacity(1 << 16, stdout)).map_err(failed)
+                attributes_in_tar(io::BufReader::with_capacity(1 << 16, stdout))
+                    .map_err(|error| failed(error.to_string()))
             });
         let status = child
             .wait()
@@ -683,7 +684,7 @@ impl Archive {
     }
 
     /// Resolves the symbolic link at `link` with `target` inside the model.
-    fn resolve(&self, link: &str, target: &str) -> Result<Resolution, String> {
+    fn resolve(&self, link: &str, target: &str) -> Result<Resolution, Error> {
         let mut link = link.to_string();
         let mut target = target.to_string();
         for _ in 0..MAX_HOPS {
@@ -701,7 +702,9 @@ impl Archive {
                     "" | "." => {}
                     ".." => {
                         if parts.pop().is_none() {
-                            return Err(format!("{link} links above the root of the package"));
+                            return Err(Error::Message(format!(
+                                "{link} links above the root of the package"
+                            )));
                         }
                     }
                     name => {
@@ -740,12 +743,14 @@ impl Archive {
                         let here = parts.join("/");
                         match self.entry(&here).map(|entry| &entry.kind) {
                             Some(Kind::Symlink(_)) if !last => {
-                                return Err(format!(
+                                return Err(Error::Message(format!(
                                     "{link} links through {here}, which is a symbolic link"
-                                ));
+                                )));
                             }
                             Some(Kind::File | Kind::HardLink(_)) if !last => {
-                                return Err(format!("{link} links through the file {here}"));
+                                return Err(Error::Message(format!(
+                                    "{link} links through the file {here}"
+                                )));
                             }
                             None => outside = true,
                             _ => {}
@@ -763,7 +768,9 @@ impl Archive {
                     return Ok(Resolution::Regular(original.clone()));
                 }
                 Some(Kind::Directory) => {
-                    return Err(format!("{link} links to the directory /{resolved}"));
+                    return Err(Error::Message(format!(
+                        "{link} links to the directory /{resolved}"
+                    )));
                 }
                 Some(Kind::Symlink(next)) => {
                     link = resolved;
@@ -772,7 +779,7 @@ impl Archive {
                 None => return Ok(Resolution::Outside(format!("/{resolved}"))),
             }
         }
-        Err(format!("{link}: too many symbolic links"))
+        Err(Error::Message(format!("{link}: too many symbolic links")))
     }
 
     /// The paths of everything this archive ships (no leading `/`).

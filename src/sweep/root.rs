@@ -29,7 +29,7 @@ use super::collect::{self, Body, Collection, Item, Origin, Scope};
 use super::index::{self, LOCAL_DB, PackageIndex};
 use super::state;
 use super::{live, own};
-use crate::error::Error;
+use crate::error::{Error, IoContext};
 use crate::json::Json;
 use crate::user;
 use results::{from_json, to_json, write_results};
@@ -446,10 +446,10 @@ fn installed() -> Result<&'static Path, Error> {
 
 /// Runs the root collector through sudo, which asks for the password on
 /// the terminal, and reads what it found.
-pub(super) fn from_root() -> Result<RootPart, String> {
+pub(super) fn from_root() -> Result<RootPart, Error> {
     // Always the installed, root-owned Guardian: running the current
     // executable would let a user-writable build run as root.
-    let program = installed().map_err(|error| error.to_string())?;
+    let program = installed()?;
     errln!(
         "Guardian needs root to check what your user can't read (sudoers, root's crontab, shell files and keys). It only reads them."
     );
@@ -460,18 +460,20 @@ pub(super) fn from_root() -> Result<RootPart, String> {
         .stderr(Stdio::inherit())
         .stdout(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("cannot start sudo: {error}"))?;
+        .spawning("sudo")?;
     let mut output = String::new();
     let read = child
         .stdout
         .take()
-        .ok_or("no output")?
+        .ok_or_else(|| Error::Message("no output".into()))?
         .take(MAX_OUTPUT)
         .read_to_string(&mut output);
-    let status = child.wait().map_err(|error| error.to_string())?;
-    read.map_err(|error| error.to_string())?;
+    let status = child.wait().spawning("sudo")?;
+    read.map_err(|error| Error::parse("the root collector's output", error))?;
     if !status.success() {
-        return Err(format!("the root collector exited with {status}"));
+        return Err(Error::Message(format!(
+            "the root collector exited with {status}"
+        )));
     }
     from_json(&output)
 }

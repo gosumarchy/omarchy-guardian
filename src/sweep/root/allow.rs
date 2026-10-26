@@ -58,21 +58,25 @@ pub(super) fn change_allowed(
     allowed: &mut Remembered,
     arguments: &[String],
     invoker: Option<u32>,
-) -> Result<(), String> {
-    let key = |label: &str| -> Result<String, String> {
+) -> Result<(), Error> {
+    let key = |label: &str| -> Result<String, Error> {
         let plain = label.len() <= MAX_LABEL && !label.chars().any(char::is_control);
         if state::is_home_label(label) && plain {
             invoker.map(|uid| state::system_key(label, uid)).ok_or_else(|| {
-                "an item in a home is allowed for the user who asks: run `sweep allow` as that user".to_string()
+                Error::Message(
+                    "an item in a home is allowed for the user who asks: run `sweep allow` as that user".into(),
+                )
             })
         } else if label.starts_with('/') && plain {
             Ok(label.to_string())
         } else {
-            Err(format!("{label:?} is not a label the sweep shows"))
+            Err(Error::Message(format!(
+                "{label:?} is not a label the sweep shows"
+            )))
         }
     };
     if arguments.is_empty() {
-        return Err(ALLOW_USAGE.into());
+        return Err(Error::Message(ALLOW_USAGE.into()));
     }
     let mut rest = arguments;
     while let Some((flag, tail)) = rest.split_first() {
@@ -82,7 +86,7 @@ pub(super) fn change_allowed(
                     || fingerprint.len() > MAX_FINGERPRINT
                     || fingerprint.chars().any(char::is_control)
                 {
-                    return Err(format!("{label}: not a fingerprint"));
+                    return Err(Error::Message(format!("{label}: not a fingerprint")));
                 }
                 allowed.insert(key(label)?, fingerprint.clone());
                 tail
@@ -100,7 +104,7 @@ pub(super) fn change_allowed(
                 });
                 tail
             }
-            _ => return Err(ALLOW_USAGE.into()),
+            _ => return Err(Error::Message(ALLOW_USAGE.into())),
         };
     }
     Ok(())

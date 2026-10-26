@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use crate::agent::{self, SourceFile, Status};
+use crate::agent::{self, AgentError, SourceFile, Status};
 use crate::config::file::{PartialConfig, SweepSettings, is_model_name, parse};
 use crate::config::load::{self, SYSTEM_PATH};
 use crate::config::model::{
@@ -24,6 +24,7 @@ use crate::config::model::{
 };
 use crate::config::write;
 use crate::engine::request::Request;
+use crate::error::{Error, IoContext};
 use crate::files::{AtomicWrite, O_NOFOLLOW, O_NONBLOCK, write_atomic};
 use crate::tools::{self, Limits, OpenCode, Reviewer};
 
@@ -46,20 +47,20 @@ pub(crate) trait Environment {
     fn claude_code_in_repository(&self) -> bool;
     /// Installs `claude-code` with sudo pacman, the user answering pacman's
     /// own questions on the terminal.
-    fn install_claude_code(&self) -> Result<(), String>;
+    fn install_claude_code(&self) -> Result<(), Error>;
     fn models(&self) -> Vec<String>;
-    fn test_review(&self, settings: &AgentSettings) -> Result<Duration, String>;
+    fn test_review(&self, settings: &AgentSettings) -> Result<Duration, Error>;
     /// The same test as the pacman gate runs a review: with the root-owned
     /// binary and the review isolated from the user's own configuration.
-    fn test_gate_review(&self, settings: &AgentSettings) -> Result<Duration, String>;
+    fn test_gate_review(&self, settings: &AgentSettings) -> Result<Duration, Error>;
     /// The user's own settings file as it is (empty when there is none or
     /// it is not valid), for `setup --gate`: its review model and profile.
     fn user_config(&self) -> PartialConfig;
     /// The system file as it is now: `None` when there is none, an error
     /// when one is there that cannot be read or is not valid.
-    fn existing_system(&self) -> Result<Option<SystemFile>, String>;
-    fn write_user(&self, text: &str) -> Result<PathBuf, String>;
-    fn write_system(&self, text: &str) -> Result<(), String>;
+    fn existing_system(&self) -> Result<Option<SystemFile>, Error>;
+    fn write_user(&self, text: &str) -> Result<PathBuf, Error>;
+    fn write_system(&self, text: &str) -> Result<(), Error>;
     fn hook_enabled(&self) -> bool;
 }
 
@@ -169,7 +170,7 @@ fn pick<T: Copy>(
     question: &str,
     options: &[(T, String)],
     default: usize,
-) -> Result<T, String> {
+) -> Result<T, Error> {
     let mut prompt = format!("{question}\n");
     for (index, (_, label)) in options.iter().enumerate() {
         let marker = if index == default { " (default)" } else { "" };
@@ -180,7 +181,7 @@ fn pick<T: Copy>(
     loop {
         let answer = terminal
             .ask(&format!("{prompt}Choose 1-{}:", options.len()))
-            .ok_or("setup cancelled: no terminal input")?;
+            .ok_or_else(|| Error::Message("setup cancelled: no terminal input".into()))?;
         let answer = answer.trim();
 
         if answer.is_empty() {
@@ -214,7 +215,7 @@ fn choose_model(
     question: &str,
     fallback: &str,
     suggested: Option<&str>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, Error> {
     let models = environment.models();
     if models.is_empty() {
         return ask_model(terminal, question, fallback);
@@ -241,13 +242,13 @@ fn ask_model(
     terminal: &mut dyn Terminal,
     question: &str,
     fallback: &str,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, Error> {
     loop {
         let answer = terminal
             .ask(&format!(
                 "{question}\nEnter provider/model (empty for {fallback}):"
             ))
-            .ok_or("setup cancelled: no terminal input")?;
+            .ok_or_else(|| Error::Message("setup cancelled: no terminal input".into()))?;
         let answer = answer.trim();
 
         if answer.is_empty() {
@@ -262,13 +263,12 @@ fn ask_model(
     }
 }
 
-pub(crate) fn run(
-    terminal: &mut dyn Terminal,
-    environment: &dyn Environment,
-) -> Result<(), String> {
+pub(crate) fn run(terminal: &mut dyn Terminal, environment: &dyn Environment) -> Result<(), Error> {
     // Before any question: a system file that cannot be read or is not
     // valid has to be put right first, and setup would not replace it.
-    environment.existing_system().map_err(wrote_neither)?;
+    environment
+        .existing_system()
+        .map_err(|reason| wrote_neither(&reason))?;
     terminal.say("Omarchy Guardian setup\n");
 
     let has_opencode = environment.user_opencode().is_some();
@@ -526,7 +526,7 @@ fn choose_gate(
     environment: &dyn Environment,
     choice: &mut Choice,
     variants: &[(Thinking, String)],
-) -> Result<bool, String> {
+) -> Result<bool, Error> {
     loop {
         let options = gate_options(environment, choice.model.as_deref());
         if options.is_empty() {
@@ -633,7 +633,7 @@ fn tune_agent(
     terminal: &mut dyn Terminal,
     environment: &dyn Environment,
     choice: &mut Choice,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     loop {
         choice.model = choose_model(
             terminal,
@@ -687,7 +687,9 @@ fn tune_agent(
             Err(reason) => {
                 terminal.say(&format!("Test failed: {reason}"));
                 if !yes(terminal, "Try different settings?") {
-                    return Err("setup cancelled; nothing was written".into());
+                    return Err(Error::Message(
+                        "setup cancelled; nothing was written".into(),
+                    ));
                 }
             }
         }
@@ -701,12 +703,12 @@ fn tune_agent(
 /// (`[agent.variants]`) maps it.
 fn test_pairings(
     terminal: &mut dyn Terminal,
-    test: &dyn Fn(&AgentSettings) -> Result<Duration, String>,
+    test: &dyn Fn(&AgentSettings) -> Result<Duration, Error>,
     choice: &Choice,
     variants: &[(Thinking, String)],
     model: Option<&str>,
     official_model: Option<&str>,
-) -> Result<Duration, String> {
+) -> Result<Duration, Error> {
     let settings = AgentSettings {
         model: model.map(str::to_string),
         thinking: choice.thinking,
@@ -726,7 +728,7 @@ fn test_pairings(
     ));
     test(&official)
         .map(|more| elapsed + more)
-        .map_err(|reason| format!("official-package reviewer: {reason}"))
+        .map_err(|reason| Error::Message(format!("official-package reviewer: {reason}")))
 }
 
 /// What the pacman gate will run for official packages with these choices:
@@ -761,13 +763,11 @@ fn mapped_variant(variants: &[(Thinking, String)], level: Thinking) -> Option<St
 /// parses them back and requires the parsed model and variant fields to
 /// exactly match what was selected: a model name the parser would refuse or
 /// read differently fails here, before anything is written.
-fn validate_rendered(choice: &Choice) -> Result<(String, String), String> {
+fn validate_rendered(choice: &Choice) -> Result<(String, String), Error> {
     let user_text = render_user(choice);
     let system_text = render_system(choice);
-    let user_config =
-        parse(Path::new("user config"), &user_text).map_err(|error| error.to_string())?;
-    let system_config =
-        parse(Path::new("system config"), &system_text).map_err(|error| error.to_string())?;
+    let user_config = parse(Path::new("user config"), &user_text)?;
+    let system_config = parse(Path::new("system config"), &system_text)?;
 
     let variants = tested_variants(choice);
     let matches = user_config.agent.model == choice.model
@@ -778,7 +778,9 @@ fn validate_rendered(choice: &Choice) -> Result<(String, String), String> {
     if matches {
         Ok((user_text, system_text))
     } else {
-        Err("rendered config does not match the selection; nothing was written".into())
+        Err(Error::Message(
+            "rendered config does not match the selection; nothing was written".into(),
+        ))
     }
 }
 
@@ -789,8 +791,10 @@ fn write_files(
     terminal: &mut dyn Terminal,
     environment: &dyn Environment,
     choice: &Choice,
-) -> Result<(), String> {
-    let existing = environment.existing_system().map_err(wrote_neither)?;
+) -> Result<(), Error> {
+    let existing = environment
+        .existing_system()
+        .map_err(|reason| wrote_neither(&reason))?;
     let (user_text, new_system_text) = validate_rendered(choice)?;
     // What will be installed: the file as it is with the keys setup asks
     // about changed, not a new file that drops the rest.
@@ -814,7 +818,7 @@ fn offer_system_file(
     environment: &dyn Environment,
     existing_text: &str,
     system_text: &str,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     terminal.say(&format!(
         "\nSystem file {SYSTEM_PATH} (settings for the pacman gate):"
     ));
@@ -839,7 +843,7 @@ pub(crate) fn run_gate(
     terminal: &mut dyn Terminal,
     environment: &dyn Environment,
     if_needed: bool,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let existing = environment.existing_system()?;
     let config = existing
         .as_ref()
@@ -891,24 +895,24 @@ pub(crate) fn run_gate(
         header.as_str()
     };
     let system_text = write::render(&system, header);
-    let parsed =
-        parse(Path::new("system config"), &system_text).map_err(|error| error.to_string())?;
+    let parsed = parse(Path::new("system config"), &system_text)?;
     if parsed.agent.model != choice.gate.model
         || parsed.class(SourceClass::Official).model != choice.gate.official_model
     {
-        return Err("rendered config does not match the selection; nothing was written".into());
+        return Err(Error::Message(
+            "rendered config does not match the selection; nothing was written".into(),
+        ));
     }
     offer_system_file(terminal, environment, &existing_text, &system_text)
 }
 
 /// Why setup stopped on a system file it will not change, with what that
 /// means for the user's own file.
-fn wrote_neither(mut reason: String) -> String {
-    reason.push_str(
-        "\nSetup wrote nothing, not your own settings file either: it does not save one while \
-the system file is in a state it cannot change.",
-    );
-    reason
+fn wrote_neither(reason: &Error) -> Error {
+    Error::Message(format!(
+        "{reason}\nSetup wrote nothing, not your own settings file either: it does not save one \
+while the system file is in a state it cannot change."
+    ))
 }
 
 /// What changes between two config texts. A setting is told apart by the
@@ -1067,15 +1071,15 @@ impl Environment for RealEnvironment {
             .is_ok_and(|status| status.success())
     }
 
-    fn install_claude_code(&self) -> Result<(), String> {
+    fn install_claude_code(&self) -> Result<(), Error> {
         let status = Command::new("/usr/bin/sudo")
             .args(["/usr/bin/pacman", "-S", "--needed", "claude-code"])
             .status()
-            .map_err(|error| error.to_string())?;
+            .spawning("sudo")?;
         if status.success() {
             Ok(())
         } else {
-            Err(format!("sudo pacman exited with {status}"))
+            Err(Error::Message(format!("sudo pacman exited with {status}")))
         }
     }
 
@@ -1130,11 +1134,11 @@ impl Environment for RealEnvironment {
         models
     }
 
-    fn test_review(&self, settings: &AgentSettings) -> Result<Duration, String> {
+    fn test_review(&self, settings: &AgentSettings) -> Result<Duration, Error> {
         test_samples(&OpenCode::UserPath, settings, false)
     }
 
-    fn test_gate_review(&self, settings: &AgentSettings) -> Result<Duration, String> {
+    fn test_gate_review(&self, settings: &AgentSettings) -> Result<Duration, Error> {
         test_samples(&OpenCode::SystemOnly, settings, true)
     }
 
@@ -1148,14 +1152,17 @@ impl Environment for RealEnvironment {
             .unwrap_or_default()
     }
 
-    fn existing_system(&self) -> Result<Option<SystemFile>, String> {
+    fn existing_system(&self) -> Result<Option<SystemFile>, Error> {
         load_system(&Place::system())
     }
 
-    fn write_user(&self, text: &str) -> Result<PathBuf, String> {
-        let path = load::user_config_path().ok_or("cannot find the user config directory")?;
-        let directory = path.parent().ok_or("invalid user config path")?;
-        fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    fn write_user(&self, text: &str) -> Result<PathBuf, Error> {
+        let path = load::user_config_path()
+            .ok_or_else(|| Error::Message("cannot find the user config directory".into()))?;
+        let directory = path
+            .parent()
+            .ok_or_else(|| Error::Message("invalid user config path".into()))?;
+        fs::create_dir_all(directory).at(directory)?;
 
         // A file of its own, made new (never written through a link
         // somebody left under a fixed name), then moved into place.
@@ -1166,12 +1173,12 @@ impl Environment for RealEnvironment {
                 directory.join(format!(".config.toml.{}.tmp", std::process::id())),
             )
         };
-        write_atomic(&path, text.as_bytes(), &options).map_err(|error| error.to_string())?;
+        write_atomic(&path, text.as_bytes(), &options).at(&path)?;
         crate::audit::settings_changed("the user settings file was saved");
         Ok(path)
     }
 
-    fn write_system(&self, text: &str) -> Result<(), String> {
+    fn write_system(&self, text: &str) -> Result<(), Error> {
         write_system_at(&Place::system(), &install_system_file, text)
     }
 
@@ -1187,10 +1194,8 @@ fn test_samples(
     policy: &OpenCode,
     settings: &AgentSettings,
     isolated: bool,
-) -> Result<Duration, String> {
-    let binary = policy
-        .resolve_reviewer(Reviewer::for_model(settings.model.as_deref()))
-        .map_err(|error| error.to_string())?;
+) -> Result<Duration, Error> {
+    let binary = policy.resolve_reviewer(Reviewer::for_model(settings.model.as_deref()))?;
     let started = Instant::now();
 
     let bad_request = Request::for_files(
@@ -1206,9 +1211,11 @@ fn test_samples(
         settings,
         isolated,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(AgentError::into_error)?;
     if bad.status != Status::Suspicious && bad.findings.is_empty() {
-        return Err("the model did not flag the malicious sample".into());
+        return Err(Error::Message(
+            "the model did not flag the malicious sample".into(),
+        ));
     }
 
     let clean_request = Request::for_files(
@@ -1224,9 +1231,9 @@ fn test_samples(
         settings,
         isolated,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(AgentError::into_error)?;
     if clean.status != Status::Clear || !clean.findings.is_empty() {
-        return Err("the model flagged a harmless sample".into());
+        return Err(Error::Message("the model flagged a harmless sample".into()));
     }
     Ok(started.elapsed())
 }
@@ -1239,7 +1246,7 @@ pub(crate) struct SystemFile {
 }
 
 /// How a new system file is put in place: with sudo, or recorded by a test.
-type Install<'a> = dyn Fn(&str) -> Result<(), String> + 'a;
+type Install<'a> = dyn Fn(&str) -> Result<(), Error> + 'a;
 
 /// Where the system file is, and the check it has to pass before what it
 /// holds is taken over into a new one: the gate's own, or a test's.
@@ -1301,14 +1308,14 @@ root's: `sudo chown root:root {directory} {shown} && sudo chmod 755 {directory} 
 /// read: installing its content again as root's would make the gate accept
 /// what somebody other than root wrote. A link is not followed, whether or
 /// not it leads anywhere.
-fn load_system(place: &Place<'_>) -> Result<Option<SystemFile>, String> {
+fn load_system(place: &Place<'_>) -> Result<Option<SystemFile>, Error> {
     let path = place.path;
     let shown = path.display();
     let unreadable = |error: &io::Error| {
-        format!(
+        Error::Message(format!(
             "cannot read {shown}: {error}; it was not changed. {}",
             how_to_correct(path)
-        )
+        ))
     };
     let kind = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata.file_type(),
@@ -1323,13 +1330,17 @@ fn load_system(place: &Place<'_>) -> Result<Option<SystemFile>, String> {
         } else {
             "not a regular file"
         };
-        return Err(format!(
+        return Err(Error::Message(format!(
             "{shown} is {what}, so it was not read or changed. Put a root-owned regular file \
 there or remove it with sudo; `omarchy-guardian config check` shows the problem."
-        ));
+        )));
     }
     if let Err(insecure) = (place.secure)(path) {
-        return Err(insecure_refusal(path, &insecure, insecure.unverified()));
+        return Err(Error::Message(insecure_refusal(
+            path,
+            &insecure,
+            insecure.unverified(),
+        )));
     }
 
     // Opened without following a link or waiting on a pipe put there since.
@@ -1347,24 +1358,24 @@ there or remove it with sudo; `omarchy-guardian config check` shows the problem.
         })
         .map_err(|error| unreadable(&error))?;
     if bytes.len() as u64 > MAX_SYSTEM_FILE {
-        return Err(format!(
+        return Err(Error::Message(format!(
             "{shown} is larger than {} KiB, so it was not read or changed. {}",
             MAX_SYSTEM_FILE / 1024,
             how_to_correct(path)
-        ));
+        )));
     }
     let text = String::from_utf8(bytes).map_err(|_| {
-        format!(
+        Error::Message(format!(
             "{shown} is not UTF-8 text; it was not changed. {}",
             how_to_correct(path)
-        )
+        ))
     })?;
     match parse(path, &text) {
         Ok(config) => Ok(Some(SystemFile { text, config })),
-        Err(error) => Err(format!(
+        Err(error) => Err(Error::Message(format!(
             "{error}; the file is not valid and was not changed. {}",
             how_to_correct(path)
-        )),
+        ))),
     }
 }
 
@@ -1374,7 +1385,7 @@ there or remove it with sudo; `omarchy-guardian config check` shows the problem.
 fn edited_system(
     place: &Place<'_>,
     change: impl FnOnce(&mut PartialConfig),
-) -> Result<(String, String), String> {
+) -> Result<(String, String), Error> {
     let (existing, mut config) = load_system(place)?
         .map(|file| (file.text, file.config))
         .unwrap_or_default();
@@ -1395,7 +1406,7 @@ fn edited_system(
 /// strict) are carried over from it, each only when `text` does not set it
 /// at all: one `text` sets, to any value, is installed as `text` has it,
 /// and every other setting is installed as `text` has it or leaves it out.
-fn write_system_at(place: &Place<'_>, install: &Install<'_>, text: &str) -> Result<(), String> {
+fn write_system_at(place: &Place<'_>, install: &Install<'_>, text: &str) -> Result<(), Error> {
     match load_system(place)? {
         Some(existing) => install(&keep_system_only(text, &existing.config)?),
         None => install(text),
@@ -1404,9 +1415,10 @@ fn write_system_at(place: &Place<'_>, install: &Install<'_>, text: &str) -> Resu
 
 /// `text` with the four system-only settings of [`write_system_at`] carried
 /// over from `old`, each only where `text` does not set it at all.
-fn keep_system_only(text: &str, old: &PartialConfig) -> Result<String, String> {
-    let mut new = parse(Path::new(SYSTEM_PATH), text)
-        .map_err(|error| format!("the new system settings are not valid: {error}"))?;
+fn keep_system_only(text: &str, old: &PartialConfig) -> Result<String, Error> {
+    let mut new = parse(Path::new(SYSTEM_PATH), text).map_err(|error| {
+        Error::Message(format!("the new system settings are not valid: {error}"))
+    })?;
     let missing_trust =
         new.trusted_reviewer_packages.is_none() && old.trusted_reviewer_packages.is_some();
     let missing_sweep =
@@ -1446,7 +1458,7 @@ fn comment_header(text: &str) -> String {
 
 /// Records whether the system sweep may run its root collector, and the
 /// group that may read what the daily one finds, in the system config.
-pub(crate) fn set_sweep_root(consent: RootConsent, group: Option<String>) -> Result<(), String> {
+pub(crate) fn set_sweep_root(consent: RootConsent, group: Option<String>) -> Result<(), Error> {
     set_sweep_root_at(&Place::system(), &install_system_file, consent, group)
 }
 
@@ -1455,7 +1467,7 @@ fn set_sweep_root_at(
     install: &Install<'_>,
     consent: RootConsent,
     group: Option<String>,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let (text, _) = edited_system(place, |config| {
         config.sweep = SweepSettings {
             root: Some(consent),
@@ -1468,18 +1480,18 @@ fn set_sweep_root_at(
 /// The system config with `keys` as its accepted weaker settings (none
 /// removes the list), and the file as it is now: for the diff the user
 /// approves before `install_accepted` installs it.
-pub(crate) fn with_accepted(keys: Vec<String>) -> Result<(String, String), String> {
+pub(crate) fn with_accepted(keys: Vec<String>) -> Result<(String, String), Error> {
     with_accepted_at(&Place::system(), keys)
 }
 
-fn with_accepted_at(place: &Place<'_>, keys: Vec<String>) -> Result<(String, String), String> {
+fn with_accepted_at(place: &Place<'_>, keys: Vec<String>) -> Result<(String, String), Error> {
     edited_system(place, |config| {
         config.acknowledged_weaker = (!keys.is_empty()).then_some(keys);
     })
 }
 
 /// Installs the text `with_accepted` rendered, with sudo.
-pub(crate) fn install_accepted(text: &str) -> Result<(), String> {
+pub(crate) fn install_accepted(text: &str) -> Result<(), Error> {
     install_system_file(text)
 }
 
@@ -1491,10 +1503,10 @@ pub(crate) fn install_accepted(text: &str) -> Result<(), String> {
 /// would create it with sudo's umask, and a 0700 directory hides the file
 /// from the pacman hook, which runs as the user and would then block every
 /// transaction.
-fn install_system_file(text: &str) -> Result<(), String> {
+fn install_system_file(text: &str) -> Result<(), Error> {
     let directory = Path::new(SYSTEM_PATH)
         .parent()
-        .ok_or("invalid system config path")?;
+        .ok_or_else(|| Error::Message("invalid system config path".into()))?;
 
     sudo_install(
         &["-d", "-m", "0755", "-o", "root", "-g", "root"],
@@ -1511,20 +1523,22 @@ fn install_system_file(text: &str) -> Result<(), String> {
             crate::audit::settings_changed("the system settings file was saved");
             Ok(())
         }
-        Ok(_) => Err(format!(
+        Ok(_) => Err(Error::Message(format!(
             "{SYSTEM_PATH} does not hold the config you approved; check it before relying on the gates"
-        )),
-        Err(error) => Err(format!("cannot read back {SYSTEM_PATH}: {error}")),
+        ))),
+        Err(error) => Err(Error::Message(format!(
+            "cannot read back {SYSTEM_PATH}: {error}"
+        ))),
     }
 }
 
-fn sudo_install(flags: &[&str], paths: &[&Path], input: Option<&str>) -> Result<(), String> {
+fn sudo_install(flags: &[&str], paths: &[&Path], input: Option<&str>) -> Result<(), Error> {
     let mut command = Command::new("/usr/bin/sudo");
     command.arg("/usr/bin/install").args(flags).args(paths);
     if input.is_some() {
         command.stdin(Stdio::piped());
     }
-    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let mut child = command.spawn().spawning("sudo")?;
     if let Some(text) = input
         && let Some(mut stdin) = child.stdin.take()
     {
@@ -1532,11 +1546,11 @@ fn sudo_install(flags: &[&str], paths: &[&Path], input: Option<&str>) -> Result<
         // written while it waits; a failed write shows in install's status.
         drop(stdin.write_all(text.as_bytes()));
     }
-    let status = child.wait().map_err(|error| error.to_string())?;
+    let status = child.wait().spawning("sudo")?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!("sudo install exited with {status}"))
+        Err(Error::Message(format!("sudo install exited with {status}")))
     }
 }
 
@@ -1553,6 +1567,7 @@ mod tests {
     };
     use crate::config::file::parse;
     use crate::config::model::{AgentSettings, Profile, SourceClass, Thinking};
+    use crate::error::Error;
 
     struct Script {
         answers: VecDeque<&'static str>,
@@ -1611,13 +1626,15 @@ mod tests {
     }
 
     impl Fake {
-        fn outcome(&self, settings: &AgentSettings) -> Result<Duration, String> {
+        fn outcome(&self, settings: &AgentSettings) -> Result<Duration, Error> {
             let failing =
                 self.failing_model.is_some() && settings.model.as_deref() == self.failing_model;
             if self.test_passes && !failing {
                 Ok(Duration::from_secs(3))
             } else {
-                Err("the model did not flag the malicious sample".into())
+                Err(Error::Message(
+                    "the model did not flag the malicious sample".into(),
+                ))
             }
         }
 
@@ -1650,7 +1667,7 @@ mod tests {
         fn claude_code_in_repository(&self) -> bool {
             self.claude_in_repo
         }
-        fn install_claude_code(&self) -> Result<(), String> {
+        fn install_claude_code(&self) -> Result<(), Error> {
             self.installed.set(true);
             self.gate_claude.set(true);
             Ok(())
@@ -1676,11 +1693,11 @@ mod tests {
             ]);
             models
         }
-        fn test_review(&self, settings: &AgentSettings) -> Result<Duration, String> {
+        fn test_review(&self, settings: &AgentSettings) -> Result<Duration, Error> {
             self.tested.borrow_mut().push(settings.clone());
             self.outcome(settings)
         }
-        fn test_gate_review(&self, settings: &AgentSettings) -> Result<Duration, String> {
+        fn test_gate_review(&self, settings: &AgentSettings) -> Result<Duration, Error> {
             self.gate_tested.borrow_mut().push(settings.clone());
             self.outcome(settings)
         }
@@ -1692,7 +1709,7 @@ mod tests {
             config.agent.model = self.user_model.map(str::to_string);
             config
         }
-        fn existing_system(&self) -> Result<Option<super::SystemFile>, String> {
+        fn existing_system(&self) -> Result<Option<super::SystemFile>, Error> {
             let Some(path) = &self.system_path else {
                 return Ok(None);
             };
@@ -1702,13 +1719,13 @@ mod tests {
                 secure: &secure,
             })
         }
-        fn write_user(&self, text: &str) -> Result<PathBuf, String> {
+        fn write_user(&self, text: &str) -> Result<PathBuf, Error> {
             *self.user_written.borrow_mut() = Some(text.to_string());
             Ok(PathBuf::from(
                 "/home/u/.config/omarchy-guardian/config.toml",
             ))
         }
-        fn write_system(&self, text: &str) -> Result<(), String> {
+        fn write_system(&self, text: &str) -> Result<(), Error> {
             let record = |text: &str| {
                 *self.system_written.borrow_mut() = Some(text.to_string());
                 Ok(())
@@ -2377,29 +2394,31 @@ mod tests {
         fn claude_code_in_repository(&self) -> bool {
             self.0.claude_code_in_repository()
         }
-        fn install_claude_code(&self) -> Result<(), String> {
+        fn install_claude_code(&self) -> Result<(), Error> {
             self.0.install_claude_code()
         }
         fn models(&self) -> Vec<String> {
             self.0.models()
         }
-        fn test_review(&self, settings: &AgentSettings) -> Result<Duration, String> {
+        fn test_review(&self, settings: &AgentSettings) -> Result<Duration, Error> {
             self.0.test_review(settings)
         }
-        fn test_gate_review(&self, settings: &AgentSettings) -> Result<Duration, String> {
+        fn test_gate_review(&self, settings: &AgentSettings) -> Result<Duration, Error> {
             self.0.gate_tested.borrow_mut().push(settings.clone());
-            Err("the gate's reviewer could not reach the provider".into())
+            Err(Error::Message(
+                "the gate's reviewer could not reach the provider".into(),
+            ))
         }
         fn user_config(&self) -> crate::config::file::PartialConfig {
             self.0.user_config()
         }
-        fn existing_system(&self) -> Result<Option<super::SystemFile>, String> {
+        fn existing_system(&self) -> Result<Option<super::SystemFile>, Error> {
             self.0.existing_system()
         }
-        fn write_user(&self, text: &str) -> Result<PathBuf, String> {
+        fn write_user(&self, text: &str) -> Result<PathBuf, Error> {
             self.0.write_user(text)
         }
-        fn write_system(&self, text: &str) -> Result<(), String> {
+        fn write_system(&self, text: &str) -> Result<(), Error> {
             self.0.write_system(text)
         }
         fn hook_enabled(&self) -> bool {

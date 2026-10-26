@@ -19,6 +19,7 @@ use super::{Fake, script};
 use crate::config::file::{PartialConfig, parse};
 use crate::config::load::{Insecure, check_root_owned};
 use crate::config::model::{Action, Named, Profile, RootConsent, SourceClass, Thinking};
+use crate::error::Error;
 use crate::test_support::TempDir;
 
 /// A system file an administrator wrote: settings no setup screen asks
@@ -98,7 +99,7 @@ fn assert_admin_settings_kept(config: &PartialConfig) {
 struct Installed(RefCell<Vec<String>>);
 
 impl Installed {
-    fn installer(&self) -> impl Fn(&str) -> Result<(), String> + '_ {
+    fn installer(&self) -> impl Fn(&str) -> Result<(), Error> + '_ {
         |text| {
             self.0.borrow_mut().push(text.to_string());
             Ok(())
@@ -252,16 +253,16 @@ fn a_system_file_that_cannot_be_read_is_not_replaced() {
 
     let error = set_sweep_root_at(&at(&path), &install, RootConsent::Declined, None).unwrap_err();
     assert!(
-        error.contains(&shown) && error.contains("is a directory"),
+        error.to_string().contains(&shown) && error.to_string().contains("is a directory"),
         "{error}"
     );
-    assert!(error.contains("config check"), "{error}");
+    assert!(error.to_string().contains("config check"), "{error}");
 
     let error = with_accepted_at(&at(&path), vec!["aur.ai=off".into()]).unwrap_err();
-    assert!(error.contains(&shown), "{error}");
+    assert!(error.to_string().contains(&shown), "{error}");
 
     let error = write_system_at(&at(&path), &install, "profile = \"standard\"\n").unwrap_err();
-    assert!(error.contains(&shown), "{error}");
+    assert!(error.to_string().contains(&shown), "{error}");
 
     let environment = Fake {
         opencode: true,
@@ -271,9 +272,11 @@ fn a_system_file_that_cannot_be_read_is_not_replaced() {
     };
     let mut terminal = script(&["", "2", "", "", "y"]);
     let error = run(&mut terminal, &environment).unwrap_err();
-    assert!(error.contains(&shown), "{error}");
+    assert!(error.to_string().contains(&shown), "{error}");
     assert!(
-        error.contains("Setup wrote nothing, not your own settings file either"),
+        error
+            .to_string()
+            .contains("Setup wrote nothing, not your own settings file either"),
         "{error}"
     );
     assert!(environment.user_written.borrow().is_none());
@@ -299,7 +302,10 @@ fn a_system_file_that_is_not_text_is_not_replaced() {
     )
     .unwrap_err();
 
-    assert!(error.contains(&path.display().to_string()), "{error}");
+    assert!(
+        error.to_string().contains(&path.display().to_string()),
+        "{error}"
+    );
     assert!(with_accepted_at(&at(&path), Vec::new()).is_err());
     assert!(installed.0.borrow().is_empty());
 }
@@ -311,7 +317,8 @@ fn a_system_file_that_is_not_valid_is_not_replaced() {
     let (_directory, path) = system_file(malformed);
     let installed = Installed::default();
     let install = installed.installer();
-    let names_the_problem = |error: &str| {
+    let names_the_problem = |error: &Error| {
+        let error = error.to_string();
         assert!(error.contains(&path.display().to_string()), "{error}");
         assert!(error.contains("profil"), "{error}");
         assert!(error.contains("unknown key"), "{error}");
@@ -360,7 +367,10 @@ fn a_system_file_that_turns_invalid_during_setup_is_not_replaced() {
     )
     .unwrap_err();
 
-    assert!(error.contains(&path.display().to_string()), "{error}");
+    assert!(
+        error.to_string().contains(&path.display().to_string()),
+        "{error}"
+    );
     assert!(installed.0.borrow().is_empty());
 }
 
@@ -538,10 +548,10 @@ fn assert_refused(place: &Place<'_>, expected: &[&str]) {
         write_system_at(place, &install, "profile = \"standard\"\n").unwrap_err(),
     ];
     for error in errors {
-        assert!(error.contains(&shown), "{error}");
-        assert!(error.contains("changed"), "{error}");
+        assert!(error.to_string().contains(&shown), "{error}");
+        assert!(error.to_string().contains("changed"), "{error}");
         for part in expected {
-            assert!(error.contains(part), "{part}\n{error}");
+            assert!(error.to_string().contains(part), "{part}\n{error}");
         }
     }
     assert!(installed.0.borrow().is_empty());
@@ -580,8 +590,8 @@ fn a_system_file_the_gate_refuses_as_insecure_is_not_taken_over() {
     };
     let mut terminal = script(&["", "2", "", "", "y"]);
     let error = run(&mut terminal, &environment).unwrap_err();
-    assert!(error.contains("insecure"), "{error}");
-    assert!(error.contains("Setup wrote nothing"), "{error}");
+    assert!(error.to_string().contains("insecure"), "{error}");
+    assert!(error.to_string().contains("Setup wrote nothing"), "{error}");
     assert!(environment.user_written.borrow().is_none());
     assert!(environment.system_written.borrow().is_none());
     // Not shown as what the system file holds, either.
@@ -613,12 +623,12 @@ check` shows the problem)."
 
     // The file's owner: the reason names the file itself.
     assert_eq!(
-        refused(&|file| Err(Insecure::owned_by(file, 1000))),
+        refused(&|file| Err(Insecure::owned_by(file, 1000))).to_string(),
         format!("insecure: {shown} is owned by uid 1000, not root{repair}")
     );
     // Its directory's mode: the file, then what is wrong with the directory.
     assert_eq!(
-        refused(&|file| Err(Insecure::writable(file.parent().unwrap()))),
+        refused(&|file| Err(Insecure::writable(file.parent().unwrap()))).to_string(),
         format!("{shown}: insecure: {folder} is writable by group or others{repair}")
     );
 }

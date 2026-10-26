@@ -23,6 +23,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use crate::config::model::RootConsent;
+use crate::error::Error;
 use crate::json::Json;
 use crate::paths::{self, Accept};
 use crate::sweep::own;
@@ -812,16 +813,22 @@ impl Paths {
     /// Checks that `path` is a file Guardian's package installed: a
     /// regular file owned by root that only root can write, in such a
     /// directory. Anything else could be replaced by the user's programs.
-    fn installed_file(&self, path: &Path) -> Result<(), String> {
-        let metadata =
-            fs::symlink_metadata(path).map_err(|_| format!("{} is missing", path.display()))?;
+    fn installed_file(&self, path: &Path) -> Result<(), Error> {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|_| Error::Message(format!("{} is missing", path.display())))?;
         if !metadata.file_type().is_file() {
-            return Err(format!("{} is not a regular file", path.display()));
+            return Err(Error::Message(format!(
+                "{} is not a regular file",
+                path.display()
+            )));
         }
         let directory = path.parent().and_then(|parent| fs::metadata(parent).ok());
         for metadata in std::iter::once(metadata).chain(directory) {
             if metadata.uid() != self.owner || metadata.mode() & 0o022 != 0 {
-                return Err(format!("{} is not root's alone to write", path.display()));
+                return Err(Error::Message(format!(
+                    "{} is not root's alone to write",
+                    path.display()
+                )));
             }
         }
         Ok(())

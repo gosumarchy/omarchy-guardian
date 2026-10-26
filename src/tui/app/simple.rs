@@ -244,7 +244,7 @@ impl App {
                 let user = Field::new(Scope::User, Setting::Profile);
                 let system = Field::new(Scope::System, Setting::Profile);
                 if let Err(error) = self.set_both(user, Some(system), Some(profile.name())) {
-                    self.message = Some((error, Tone::Bad));
+                    self.message = Some((error.to_string(), Tone::Bad));
                 }
                 None
             }

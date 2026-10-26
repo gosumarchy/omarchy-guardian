@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 use crate::cli::Confirm;
 use crate::config::Settings;
 use crate::config::model::{AgentSettings, RootConsent, SourceClass};
+use crate::error::{Error, IoContext};
 use crate::integrations::{Integration, Paths, Plan, State, Step};
 use crate::pacman;
 use crate::setup::{self, Environment as _};
@@ -23,7 +24,7 @@ pub(crate) fn paths(settings: &Settings) -> Option<Paths> {
 }
 
 /// Runs a plan's steps in order; a failed command stops it.
-pub(crate) fn run_plan(paths: &Paths, plan: &Plan) -> Result<String, String> {
+pub(crate) fn run_plan(paths: &Paths, plan: &Plan) -> Result<String, Error> {
     for step in &plan.steps {
         match step {
             Step::Command(argv) | Step::Optional(argv) => {
@@ -42,8 +43,14 @@ pub(crate) fn run_plan(paths: &Paths, plan: &Plan) -> Result<String, String> {
                 let succeeded = status.as_ref().is_ok_and(std::process::ExitStatus::success);
                 if !succeeded && matches!(step, Step::Command(_)) {
                     return Err(match status {
-                        Ok(status) => format!("{} exited with {status}", argv.join(" ")),
-                        Err(error) => format!("{program}: {error}"),
+                        Ok(status) => Error::ToolFailed {
+                            tool: argv.join(" "),
+                            detail: format!("exited with {status}"),
+                        },
+                        Err(source) => Error::Spawn {
+                            tool: program.clone(),
+                            source,
+                        },
                     });
                 }
             }
@@ -76,7 +83,7 @@ pub(crate) fn run_plan(paths: &Paths, plan: &Plan) -> Result<String, String> {
 /// What the root checks are, asked once on the terminal; the answer goes to
 /// the system configuration, and a yes enables their daily timer. Without a
 /// terminal nothing is recorded, so a non-interactive run is never a no.
-fn ask_sweep_root() -> Result<String, String> {
+fn ask_sweep_root() -> Result<String, Error> {
     if OpenOptions::new().read(true).open("/dev/tty").is_err() {
         return Ok(
             "Root checks not set up: run `omarchy-guardian protect` in a terminal to answer."
@@ -114,13 +121,13 @@ for. Its daily results are kept readable by your group only."
             "omarchy-guardian-sweep-collect.timer",
         ])
         .status()
-        .map_err(|error| error.to_string())?;
+        .spawning("sudo")?;
     if status.success() {
         Ok("Root checks allowed; they run daily.".into())
     } else {
-        Err(format!(
+        Err(Error::Message(format!(
             "enabling the root checks' timer exited with {status}"
-        ))
+        )))
     }
 }
 
@@ -141,10 +148,10 @@ const PROTECT: [Integration; 8] = [
 /// showing each step and, unless `yes`, asking. The pacman hook is left off
 /// when the pacman gate could not review with the current settings, since it
 /// would refuse every such install.
-pub(crate) fn protect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String> {
+pub(crate) fn protect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, Error> {
     status::watched();
     let settings = Settings::load();
-    let paths = paths(&settings).ok_or("HOME is not set")?;
+    let paths = paths(&settings).ok_or_else(|| Error::Message("HOME is not set".into()))?;
     let mut steps = Vec::new();
     let mut notes = Vec::new();
     for integration in PROTECT {
@@ -192,7 +199,7 @@ pub(crate) fn protect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, St
         outln!("  {line}");
     }
     if !yes && !confirm.confirm("Go ahead?") {
-        return Err("nothing was changed".into());
+        return Err(Error::Message("nothing was changed".into()));
     }
     let outcome = run_plan(&paths, &plan);
     status::chosen();
@@ -203,10 +210,10 @@ pub(crate) fn protect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, St
 /// system sweep off (the menu entry and the bar widget stay), after showing
 /// each step and, unless `yes`, asking. A hand-installed pacman hook is left
 /// alone.
-pub(crate) fn unprotect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, String> {
+pub(crate) fn unprotect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, Error> {
     status::watched();
     let settings = Settings::load();
-    let paths = paths(&settings).ok_or("HOME is not set")?;
+    let paths = paths(&settings).ok_or_else(|| Error::Message("HOME is not set".into()))?;
     let mut steps = Vec::new();
     for integration in [
         Integration::PacmanHook,
@@ -238,7 +245,7 @@ pub(crate) fn unprotect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, 
     }
     outln!("Until you turn it back on, installs are not reviewed.");
     if !yes && !confirm.confirm("Turn protection off?") {
-        return Err("nothing was changed".into());
+        return Err(Error::Message("nothing was changed".into()));
     }
     let outcome = run_plan(&paths, &plan);
     status::chosen();

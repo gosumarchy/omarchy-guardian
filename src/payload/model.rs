@@ -2,6 +2,7 @@
 //! pax headers that carry capabilities and access control lists, and what an
 //! entry's mode and owner grant.
 
+use crate::error::Error;
 use std::collections::{HashMap, HashSet};
 use std::fs::Metadata;
 use std::io::{self, Read};
@@ -126,18 +127,19 @@ pub(crate) fn already_granted(what: &str, installed: &Metadata) -> bool {
 /// carries a `security.*` or `trusted.*` attribute (file capabilities:
 /// root-like rights for whoever runs the file) or an access control list
 /// (rights the mode does not show), with what to call them.
-pub(super) fn attributes_in_tar(mut stream: impl Read) -> Result<Vec<Attribute>, String> {
+pub(super) fn attributes_in_tar(mut stream: impl Read) -> Result<Vec<Attribute>, Error> {
     let mut found = Vec::new();
     // What the extended header before the next entry said.
     let mut pending: Option<(&'static str, Option<String>)> = None;
     let mut path_override: Option<String> = None;
+    let broken = |detail: &dyn std::fmt::Display| Error::parse("the package's tar stream", detail);
     let mut header = [0_u8; 512];
     loop {
         if let Err(error) = stream.read_exact(&mut header) {
             return if error.kind() == io::ErrorKind::UnexpectedEof {
                 Ok(found)
             } else {
-                Err(error.to_string())
+                Err(broken(&error))
             };
         }
         if header.iter().all(|byte| *byte == 0) {
@@ -154,20 +156,28 @@ pub(super) fn attributes_in_tar(mut stream: impl Read) -> Result<Vec<Attribute>,
             String::from_utf8_lossy(&bytes[..end]).into_owned()
         };
         let size = u64::from_str_radix(field(124..136).trim(), 8)
-            .map_err(|_| "an entry size that is not a number".to_string())?;
+            .map_err(|_| broken(&"an entry size that is not a number"))?;
         let blocks = size.div_ceil(512) * 512;
         // A pax extended header for the next entry (`x`) or for all that
         // follow (`g`).
         let kind = header[156];
         if matches!(kind, b'x' | b'g') {
             if size > 1 << 20 {
-                return Err("an extended header larger than 1 MiB".into());
+                return Err(broken(&"an extended header larger than 1 MiB"));
             }
-            let mut data = vec![0_u8; usize::try_from(blocks).map_err(|_| "size")?];
+            let mut data = vec![
+                0_u8;
+                usize::try_from(blocks).map_err(|_| broken(
+                    &"an entry size too large for this machine"
+                ))?
+            ];
             stream
                 .read_exact(&mut data)
-                .map_err(|error| error.to_string())?;
-            data.truncate(usize::try_from(size).map_err(|_| "size")?);
+                .map_err(|error| broken(&error))?;
+            data.truncate(
+                usize::try_from(size)
+                    .map_err(|_| broken(&"an entry size too large for this machine"))?,
+            );
             let records = pax_records(&data);
             if kind == b'x' {
                 path_override = records.path;
@@ -194,7 +204,7 @@ pub(super) fn attributes_in_tar(mut stream: impl Read) -> Result<Vec<Attribute>,
             let take = usize::try_from(left.min(8192)).unwrap_or(8192);
             stream
                 .read_exact(&mut sink[..take])
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| broken(&error))?;
             left -= take as u64;
         }
     }
@@ -264,7 +274,7 @@ pub(super) type Attribute = (String, &'static str, Option<String>);
 
 /// An entry under a symbolic-link directory is installed wherever that
 /// link points, not where it is listed: such an archive is refused.
-fn under_links(entries: &[Entry]) -> Result<(), String> {
+fn under_links(entries: &[Entry]) -> Result<(), Error> {
     let links: HashSet<&str> = entries
         .iter()
         .filter(|entry| matches!(entry.kind, Kind::Symlink(_)))
@@ -274,10 +284,10 @@ fn under_links(entries: &[Entry]) -> Result<(), String> {
         let mut prefix = entry.path.as_str();
         while let Some((parent, _)) = prefix.rsplit_once('/') {
             if links.contains(parent) {
-                return Err(format!(
+                return Err(Error::Message(format!(
                     "{} is inside {parent}, which is a symbolic link",
                     entry.path
-                ));
+                )));
             }
             prefix = parent;
         }
@@ -288,11 +298,11 @@ fn under_links(entries: &[Entry]) -> Result<(), String> {
 /// Builds the archive model from `bsdtar -tf` (names) and `bsdtar -tv
 /// --numeric-owner` (details) output, refusing anything a real package
 /// never contains.
-pub(super) fn parse_model(names: &str, details: &str) -> Result<Vec<Entry>, String> {
+pub(super) fn parse_model(names: &str, details: &str) -> Result<Vec<Entry>, Error> {
     let names: Vec<&str> = names.lines().collect();
     let details: Vec<&str> = details.lines().collect();
     if names.len() != details.len() {
-        return Err("the archive's two listings disagree".into());
+        return Err(Error::Message("the archive's two listings disagree".into()));
     }
     let mut entries: Vec<Entry> = Vec::with_capacity(names.len());
     let mut seen: HashMap<String, usize> = HashMap::new();
@@ -303,18 +313,18 @@ pub(super) fn parse_model(names: &str, details: &str) -> Result<Vec<Entry>, Stri
             rest = rest.trim_start();
             let end = rest
                 .find(char::is_whitespace)
-                .ok_or_else(|| format!("unreadable listing line {line:?}"))?;
+                .ok_or_else(|| Error::Message(format!("unreadable listing line {line:?}")))?;
             fields.push(&rest[..end]);
             rest = &rest[end..];
         }
         let after = rest
             .strip_prefix(' ')
             .and_then(|rest| rest.strip_prefix(*raw_name))
-            .ok_or_else(|| format!("unreadable listing line {line:?}"))?;
+            .ok_or_else(|| Error::Message(format!("unreadable listing line {line:?}")))?;
         let size: u64 = fields[4]
             .parse()
-            .map_err(|_| format!("unreadable size in {line:?}"))?;
-        let bad = || format!("an entry name Guardian refuses: {raw_name:?}");
+            .map_err(|_| Error::Message(format!("unreadable size in {line:?}")))?;
+        let bad = || Error::Message(format!("an entry name Guardian refuses: {raw_name:?}"));
         let mut path = unescape(raw_name).ok_or_else(bad)?;
         let kind = match (fields[0].chars().next(), after) {
             (Some('-'), "") => Kind::File,
@@ -334,7 +344,11 @@ pub(super) fn parse_model(names: &str, details: &str) -> Result<Vec<Entry>, Stri
                     .and_then(unescape)
                     .ok_or_else(bad)?,
             ),
-            _ => return Err(format!("an entry of a type Guardian refuses: {line:?}")),
+            _ => {
+                return Err(Error::Message(format!(
+                    "an entry of a type Guardian refuses: {line:?}"
+                )));
+            }
         };
         if path.is_empty()
             || path.starts_with('/')
@@ -350,7 +364,7 @@ pub(super) fn parse_model(names: &str, details: &str) -> Result<Vec<Entry>, Stri
                 return Err(bad());
             }
             if kind != Kind::File {
-                return Err(format!("{path} is not a regular file"));
+                return Err(Error::Message(format!("{path} is not a regular file")));
             }
         }
         if let Kind::HardLink(target) = &kind {
@@ -358,13 +372,13 @@ pub(super) fn parse_model(names: &str, details: &str) -> Result<Vec<Entry>, Stri
                 .get(target)
                 .is_some_and(|index| entries[*index].kind == Kind::File);
             if !regular {
-                return Err(format!(
+                return Err(Error::Message(format!(
                     "{path} is a hard link to {target}, which is not an earlier regular file"
-                ));
+                )));
             }
         }
         if seen.insert(path.clone(), entries.len()).is_some() {
-            return Err(format!("{path} appears more than once"));
+            return Err(Error::Message(format!("{path} appears more than once")));
         }
         let root_set_id = match kind {
             Kind::File | Kind::HardLink(_) => root_set_id(fields[0], fields[2], fields[3])

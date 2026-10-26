@@ -6,6 +6,7 @@
 //! ignored whole. Of an item named twice the later entry wins. A line that
 //! merely contains Guardian's path proves none of that.
 
+use crate::error::Error;
 use crate::json::Json;
 
 /// One item of the file: its id and its value (`None` for a value the
@@ -57,12 +58,12 @@ fn skip_space(bytes: &[u8], mut index: usize) -> usize {
 
 /// The members of the object `text` holds, in order and with repeats, each
 /// value as its source text.
-fn members(text: &str) -> Result<Vec<(String, &str)>, String> {
-    const BROKEN: &str = "it is not one JSON object";
+fn members(text: &str) -> Result<Vec<(String, &str)>, Error> {
+    let broken = || Error::Message("it is not one JSON object".into());
     let bytes = text.as_bytes();
     let mut index = skip_space(bytes, 0);
     if bytes.get(index) != Some(&b'{') {
-        return Err(BROKEN.into());
+        return Err(broken());
     }
     index = skip_space(bytes, index + 1);
     let mut found = Vec::new();
@@ -71,25 +72,25 @@ fn members(text: &str) -> Result<Vec<(String, &str)>, String> {
     } else {
         loop {
             if bytes.get(index) != Some(&b'"') {
-                return Err(BROKEN.into());
+                return Err(broken());
             }
-            let key_end = string_end(bytes, index).ok_or(BROKEN)?;
+            let key_end = string_end(bytes, index).ok_or_else(broken)?;
             let key = Json::parse(&text[index..key_end])
                 .ok()
                 .and_then(|key| key.as_str().map(str::to_string))
-                .ok_or(BROKEN)?;
+                .ok_or_else(broken)?;
             index = skip_space(bytes, key_end);
             if bytes.get(index) != Some(&b':') {
-                return Err(BROKEN.into());
+                return Err(broken());
             }
             let value_start = index + 1;
             index = value_start;
             let mut depth = 0_usize;
             // To the comma or brace that ends this member.
             loop {
-                match bytes.get(index).ok_or(BROKEN)? {
+                match bytes.get(index).ok_or_else(broken)? {
                     b'"' => {
-                        index = string_end(bytes, index).ok_or(BROKEN)?;
+                        index = string_end(bytes, index).ok_or_else(broken)?;
                         continue;
                     }
                     b'{' | b'[' => depth += 1,
@@ -110,18 +111,18 @@ fn members(text: &str) -> Result<Vec<(String, &str)>, String> {
     if skip_space(bytes, index) == bytes.len() {
         Ok(found)
     } else {
-        Err(BROKEN.into())
+        Err(broken())
     }
 }
 
 /// The items of the menu file `raw`, in order and with repeats; an error
 /// when the menu would ignore the file.
-pub(super) fn items(raw: &str) -> Result<Vec<Item>, String> {
+pub(super) fn items(raw: &str) -> Result<Vec<Item>, Error> {
     let text = stripped(raw);
     if text.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let parse = |members: Vec<(String, &str)>| -> Result<Vec<Item>, String> {
+    let parse = |members: Vec<(String, &str)>| -> Result<Vec<Item>, Error> {
         members
             .into_iter()
             .map(|(id, value)| match Json::parse(value) {
@@ -129,7 +130,9 @@ pub(super) fn items(raw: &str) -> Result<Vec<Item>, String> {
                 // The menu takes the last of a repeated key; which one that
                 // leaves is not worked out here.
                 Err(error) if error.to_string().contains("duplicate") => Ok((id, None)),
-                Err(error) => Err(format!("the entry {id:?} is not JSON ({error})")),
+                Err(error) => Err(Error::Message(format!(
+                    "the entry {id:?} is not JSON ({error})"
+                ))),
             })
             .collect()
     };

@@ -583,26 +583,26 @@ pub(crate) enum Command {
     Revoke(String),
 }
 
-pub(crate) fn parse(args: &[std::ffi::OsString]) -> Result<Command, String> {
+pub(crate) fn parse(args: &[std::ffi::OsString]) -> Result<Command, Error> {
     const USAGE: &str = "usage: omarchy-guardian permit [ID | --revoke ID]";
     let words: Vec<&str> = args
         .iter()
-        .map(|arg| arg.to_str().ok_or(USAGE))
+        .map(|arg| arg.to_str().ok_or_else(|| Error::Message(USAGE.into())))
         .collect::<Result<_, _>>()?;
     let id = |text: &str| {
         if is_hex(text, ID_CHARS) {
             Ok(text.to_string())
         } else {
-            Err(format!(
+            Err(Error::Message(format!(
                 "{text:?} is not a permit ID ({ID_CHARS} hex characters, as a blocked gate prints it)"
-            ))
+            )))
         }
     };
     match words.as_slice() {
         [] => Ok(Command::List),
         ["--revoke", text] => id(text).map(Command::Revoke),
         [text] if !text.starts_with('-') => id(text).map(Command::Grant),
-        _ => Err(USAGE.into()),
+        _ => Err(Error::Message(USAGE.into())),
     }
 }
 

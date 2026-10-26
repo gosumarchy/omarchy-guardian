@@ -390,7 +390,7 @@ pub(crate) fn review(
         wanted,
         sources,
         unread,
-    } = plan_reads(archive, official).map_err(refuse)?;
+    } = plan_reads(archive, official).map_err(|reason| refuse(reason.to_string()))?;
     let mut read = archive.extract(&wanted)?;
 
     let pkginfo =
@@ -522,13 +522,13 @@ struct Plan<'a> {
 /// said (`unread`) rather than refused: the checks that refuse a package
 /// still run on the rest, and the archive's digest covers what was not
 /// read.
-fn plan_reads(archive: &Archive, official: bool) -> Result<Plan<'_>, String> {
+fn plan_reads(archive: &Archive, official: bool) -> Result<Plan<'_>, Error> {
     let mut wanted: Vec<String> = Vec::new();
     let mut unread = Vec::new();
     match archive.entry(".PKGINFO") {
         Some(entry) if entry.size <= MAX_TEXT_FILE_SIZE => wanted.push(".PKGINFO".into()),
-        Some(_) => return Err(".PKGINFO is too large".into()),
-        None => return Err("the package has no .PKGINFO".into()),
+        Some(_) => return Err(Error::Message(".PKGINFO is too large".into())),
+        None => return Err(Error::Message("the package has no .PKGINFO".into())),
     }
     if let Some(entry) = archive.entry(".INSTALL") {
         if entry.size > MAX_TEXT_FILE_SIZE {
@@ -551,10 +551,10 @@ fn plan_reads(archive: &Archive, official: bool) -> Result<Plan<'_>, String> {
             {
                 continue;
             }
-            return Err(format!(
+            return Err(Error::Message(format!(
                 "/{} is a symbolic link standing in for a directory whose files run on their own",
                 entry.path
-            ));
+            )));
         }
         if matches!(entry.kind, Kind::Directory) || !is_reviewed(&entry.path, official) {
             continue;

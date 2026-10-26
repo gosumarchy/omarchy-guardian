@@ -79,6 +79,9 @@ fn parse_keys(bytes: &[u8]) -> Vec<Key> {
     keys
 }
 
+/// The device every `Terminal` operation reads or writes.
+pub(super) const TTY: &str = "/dev/tty";
+
 /// The terminal in raw mode on the alternate screen. Dropping it restores
 /// the saved mode and the main screen.
 pub(super) struct Terminal {
@@ -89,7 +92,7 @@ pub(super) struct Terminal {
 
 impl Terminal {
     pub(super) fn open() -> io::Result<Self> {
-        let tty = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
+        let tty = OpenOptions::new().read(true).write(true).open(TTY)?;
         let saved = stty(&tty, &["-g"])?;
         let mut terminal = Self {
             tty,

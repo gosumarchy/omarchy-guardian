@@ -590,13 +590,17 @@ fn the_command_takes_an_id_as_a_gate_prints_it() {
     let args = |words: &[&str]| -> Vec<std::ffi::OsString> {
         words.iter().map(std::ffi::OsString::from).collect()
     };
-    assert_eq!(parse(&args(&[])), Ok(Command::List));
     assert_eq!(
-        parse(&args(&["0123456789abcdef0123456789abcdef"])),
+        parse(&args(&[])).map_err(|error| error.to_string()),
+        Ok(Command::List)
+    );
+    assert_eq!(
+        parse(&args(&["0123456789abcdef0123456789abcdef"])).map_err(|error| error.to_string()),
         Ok(Command::Grant("0123456789abcdef0123456789abcdef".into()))
     );
     assert_eq!(
-        parse(&args(&["--revoke", "0123456789abcdef0123456789abcdef"])),
+        parse(&args(&["--revoke", "0123456789abcdef0123456789abcdef"]))
+            .map_err(|error| error.to_string()),
         Ok(Command::Revoke("0123456789abcdef0123456789abcdef".into()))
     );
     for bad in [

@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use crate::audit;
 use crate::config::model::{Named, Profile, SourceClass};
 use crate::engine::baseline::{Identity, Unit};
+use crate::error::Error;
 use crate::makepkg_gate;
 use crate::pacman::HookArgs;
 use crate::permit;
@@ -127,18 +128,26 @@ pub(super) enum Forget {
     One(Identity),
 }
 
-fn parse_sweep(args: &[OsString]) -> Result<sweep::Command, String> {
+/// A usage line as the error a command gives when it is called wrongly.
+fn usage(text: &str) -> Error {
+    Error::Message(text.to_string())
+}
+
+fn parse_sweep(args: &[OsString]) -> Result<sweep::Command, Error> {
     const USAGE: &str = "usage: omarchy-guardian sweep [--all] [--json] [--root] [--diff] [--report] | allow PATH | allow --migrate | forget PATH | forget --all";
     let text: Vec<&str> = args
         .iter()
-        .map(|arg| arg.to_str().ok_or("arguments must be UTF-8"))
+        .map(|arg| {
+            arg.to_str()
+                .ok_or_else(|| Error::Message("arguments must be UTF-8".into()))
+        })
         .collect::<Result<_, _>>()?;
     match text.as_slice() {
         ["allow", "--migrate"] => return Ok(sweep::Command::Migrate),
         ["allow", path] => return Ok(sweep::Command::Allow((*path).to_string())),
         ["forget", "--all"] => return Ok(sweep::Command::Forget(None)),
         ["forget", path] => return Ok(sweep::Command::Forget(Some((*path).to_string()))),
-        ["allow" | "forget", ..] => return Err(USAGE.into()),
+        ["allow" | "forget", ..] => return Err(usage(USAGE)),
         _ => {}
     }
     let mut options = sweep::Options::default();
@@ -151,30 +160,32 @@ fn parse_sweep(args: &[OsString]) -> Result<sweep::Command, String> {
             "--report" => options.report = true,
             // Run by the user timer.
             "--scheduled" => options.scheduled = true,
-            _ => return Err(USAGE.into()),
+            _ => return Err(usage(USAGE)),
         }
     }
     if options.report && options.view == sweep::View::Json {
-        return Err("sweep: --report saves the printed report; it does not go with --json".into());
+        return Err(Error::Message(
+            "sweep: --report saves the printed report; it does not go with --json".into(),
+        ));
     }
     // The timer's run saves its own page when it notifies.
     if options.report && options.scheduled {
-        return Err(USAGE.into());
+        return Err(usage(USAGE));
     }
     Ok(sweep::Command::Run(options))
 }
 
-fn parse_forget(args: &[OsString]) -> Result<Forget, String> {
+fn parse_forget(args: &[OsString]) -> Result<Forget, Error> {
     match args {
         [arg] if arg == "--all" => Ok(Forget::All),
         [arg] => match arg.to_str() {
-            Some(text) if text.starts_with('-') => Err(format!(
+            Some(text) if text.starts_with('-') => Err(Error::Message(format!(
                 "unknown option {text:?}; forget takes one identity or --all"
-            )),
+            ))),
             Some(text) => Identity::parse(text).map(Forget::One),
-            None => Err("the identity must be UTF-8".to_string()),
+            None => Err(Error::Message("the identity must be UTF-8".to_string())),
         },
-        _ => Err("forget takes one identity or --all".into()),
+        _ => Err(Error::Message("forget takes one identity or --all".into())),
     }
 }
 
@@ -185,9 +196,9 @@ struct Allowed {
     class: bool,
 }
 
-pub(super) fn parse(args: &[OsString]) -> Result<Invocation, String> {
+pub(super) fn parse(args: &[OsString]) -> Result<Invocation, Error> {
     let Some((command, rest)) = args.split_first() else {
-        return Err("missing command".into());
+        return Err(Error::Message("missing command".into()));
     };
     let full = Allowed {
         thorough: true,
@@ -239,7 +250,9 @@ pub(super) fn parse(args: &[OsString]) -> Result<Invocation, String> {
                 match flag.to_str() {
                     Some("--yes" | "-y") => yes = true,
                     Some("--off") => off = true,
-                    _ => return Err("usage: omarchy-guardian protect [--off] [--yes]".into()),
+                    _ => {
+                        return Err(usage("usage: omarchy-guardian protect [--off] [--yes]"));
+                    }
                 }
             }
             Ok(Invocation::Protect { yes, off })
@@ -250,7 +263,7 @@ pub(super) fn parse(args: &[OsString]) -> Result<Invocation, String> {
         Some("sweep-collect") => match rest {
             [] => Ok(Invocation::SweepCollect { out: false }),
             [flag] if flag == "--out" => Ok(Invocation::SweepCollect { out: true }),
-            _ => Err("usage: omarchy-guardian sweep-collect [--out]".into()),
+            _ => Err(usage("usage: omarchy-guardian sweep-collect [--out]")),
         },
         // Run as root by `sweep allow` and `sweep forget`; not listed.
         Some("sweep-allow-system") => {
@@ -262,34 +275,37 @@ pub(super) fn parse(args: &[OsString]) -> Result<Invocation, String> {
                 Some("--waybar") => Ok(Invocation::Status(StatusMode::Waybar)),
                 Some("--dismiss") => Ok(Invocation::Status(StatusMode::Dismiss)),
                 Some("--open-report") => Ok(Invocation::Status(StatusMode::OpenReport)),
-                _ => Err(
-                    "usage: omarchy-guardian status [--waybar | --dismiss | --open-report]".into(),
-                ),
+                _ => Err(usage(
+                    "usage: omarchy-guardian status [--waybar | --dismiss | --open-report]",
+                )),
             },
-            _ => {
-                Err("usage: omarchy-guardian status [--waybar | --dismiss | --open-report]".into())
-            }
+            _ => Err(usage(
+                "usage: omarchy-guardian status [--waybar | --dismiss | --open-report]",
+            )),
         },
         Some("update") if rest.is_empty() => Ok(Invocation::Update),
-        Some("update") => Err("usage: omarchy-guardian update".into()),
+        Some("update") => Err(usage("usage: omarchy-guardian update")),
         Some("ask") => match rest {
             [target] => target
                 .to_str()
                 .map(|target| Invocation::Ask(target.to_string()))
-                .ok_or_else(|| "the report id must be UTF-8".to_string()),
-            _ => Err("usage: omarchy-guardian ask <report-id>".into()),
+                .ok_or_else(|| Error::Message("the report id must be UTF-8".into())),
+            _ => Err(usage("usage: omarchy-guardian ask <report-id>")),
         },
         Some("tui" | "settings") => match rest {
             [] => Ok(Invocation::Tui { expert: false }),
             [flag] if flag == "--expert" => Ok(Invocation::Tui { expert: true }),
-            _ => Err("usage: omarchy-guardian tui [--expert]".into()),
+            _ => Err(usage("usage: omarchy-guardian tui [--expert]")),
         },
-        _ => Err(format!("unknown command {:?}", command.to_string_lossy())),
+        _ => Err(Error::Message(format!(
+            "unknown command {:?}",
+            command.to_string_lossy()
+        ))),
     }
 }
 
 /// `setup [--gate [--if-needed]]`.
-fn parse_setup(rest: &[OsString]) -> Result<Invocation, String> {
+fn parse_setup(rest: &[OsString]) -> Result<Invocation, Error> {
     let flags: Vec<Option<&str>> = rest.iter().map(|flag| flag.to_str()).collect();
     match flags.as_slice() {
         [] => Ok(Invocation::Setup {
@@ -306,23 +322,25 @@ fn parse_setup(rest: &[OsString]) -> Result<Invocation, String> {
                 if_needed: true,
             })
         }
-        _ => Err("usage: omarchy-guardian setup [--gate [--if-needed]]".into()),
+        _ => Err(usage(
+            "usage: omarchy-guardian setup [--gate [--if-needed]]",
+        )),
     }
 }
 
 /// The arguments of a command root's half runs, as text.
-fn utf8_arguments(command: &str, args: &[OsString]) -> Result<Vec<String>, String> {
+fn utf8_arguments(command: &str, args: &[OsString]) -> Result<Vec<String>, Error> {
     args.iter()
         .map(|argument| {
             argument
                 .to_str()
                 .map(str::to_string)
-                .ok_or_else(|| format!("{command}: arguments must be UTF-8"))
+                .ok_or_else(|| Error::Message(format!("{command}: arguments must be UTF-8")))
         })
         .collect()
 }
 
-fn parse_config(args: &[OsString]) -> Result<ConfigCommand, String> {
+fn parse_config(args: &[OsString]) -> Result<ConfigCommand, Error> {
     let words: Vec<&str> = args
         .iter()
         .map(|arg| arg.to_str().unwrap_or_default())
@@ -331,27 +349,29 @@ fn parse_config(args: &[OsString]) -> Result<ConfigCommand, String> {
         ["show"] => Ok(ConfigCommand::Show(None)),
         ["show", "--class", name] => SourceClass::parse(name)
             .map(|class| ConfigCommand::Show(Some(class)))
-            .ok_or_else(|| format!("unknown class {name:?}")),
+            .ok_or_else(|| Error::Message(format!("unknown class {name:?}"))),
         ["check"] => Ok(ConfigCommand::Check),
         ["path"] => Ok(ConfigCommand::Path),
         ["acknowledge"] => Ok(ConfigCommand::Acknowledge),
-        _ => Err("config takes show [--class CLASS], check, path or acknowledge".into()),
+        _ => Err(Error::Message(
+            "config takes show [--class CLASS], check, path or acknowledge".into(),
+        )),
     }
 }
 
-fn split_command(args: &[OsString]) -> Result<(&[OsString], Vec<OsString>), String> {
+fn split_command(args: &[OsString]) -> Result<(&[OsString], Vec<OsString>), Error> {
     let separator = args
         .iter()
         .position(|arg| arg == "--")
-        .ok_or("missing `--` before the command")?;
+        .ok_or_else(|| Error::Message("missing `--` before the command".into()))?;
     let command = args[separator + 1..].to_vec();
     if command.is_empty() {
-        return Err("missing command after `--`".into());
+        return Err(Error::Message("missing command after `--`".into()));
     }
     Ok((&args[..separator], command))
 }
 
-fn parse_target(args: &[OsString], allowed: Allowed) -> Result<Target, String> {
+fn parse_target(args: &[OsString], allowed: Allowed) -> Result<Target, Error> {
     let mut root: Option<PathBuf> = None;
     let mut include_ignored_dirs = false;
     let mut hashes = Hashes::Hidden;
@@ -366,7 +386,9 @@ fn parse_target(args: &[OsString], allowed: Allowed) -> Result<Target, String> {
             Some("--hashes") => hashes = Hashes::Shown,
             Some("--thorough") if allowed.thorough => include_ignored_dirs = true,
             Some("--exclude") if allowed.exclude => {
-                let name = args.next().ok_or("--exclude needs a directory name")?;
+                let name = args
+                    .next()
+                    .ok_or_else(|| Error::Message("--exclude needs a directory name".into()))?;
                 excluded_top_level.push(parse_top_level_name("--exclude", name)?);
             }
             Some("--class") if allowed.class => {
@@ -379,13 +401,17 @@ fn parse_target(args: &[OsString], allowed: Allowed) -> Result<Target, String> {
                 let parsed = SourceClass::parse(name)
                     .filter(|class| !class.is_privileged() && *class != SourceClass::System)
                     .ok_or_else(|| {
-                        format!("--class takes one of: aur, theme, plugin, source (got {name:?})")
+                        Error::Message(format!(
+                            "--class takes one of: aur, theme, plugin, source (got {name:?})"
+                        ))
                     })?;
                 class = parsed;
             }
             Some("--identity") => {
                 if !units.is_empty() {
-                    return Err("--identity is given once and never with --unit".into());
+                    return Err(Error::Message(
+                        "--identity is given once and never with --unit".into(),
+                    ));
                 }
                 units.push(Unit {
                     prefix: String::new(),
@@ -394,18 +420,22 @@ fn parse_target(args: &[OsString], allowed: Allowed) -> Result<Target, String> {
             }
             Some("--unit") => {
                 if units.iter().any(|unit| unit.prefix.is_empty()) {
-                    return Err("--unit cannot be combined with --identity".into());
+                    return Err(Error::Message(
+                        "--unit cannot be combined with --identity".into(),
+                    ));
                 }
-                let name = args
-                    .next()
-                    .ok_or("--unit needs a directory name and an identity")?;
+                let name = args.next().ok_or_else(|| {
+                    Error::Message("--unit needs a directory name and an identity".into())
+                })?;
                 let prefix = format!("{}/", parse_top_level_name("--unit", name)?);
                 let identity = parse_identity("--unit", args.next())?;
                 if units
                     .iter()
                     .any(|unit| unit.prefix == prefix || unit.identity == identity)
                 {
-                    return Err("--unit names each directory and each identity once".into());
+                    return Err(Error::Message(
+                        "--unit names each directory and each identity once".into(),
+                    ));
                 }
                 units.push(Unit { prefix, identity });
             }
@@ -415,20 +445,24 @@ fn parse_target(args: &[OsString], allowed: Allowed) -> Result<Target, String> {
                     .and_then(|name| name.to_str())
                     .unwrap_or_default();
                 profile = Some(Profile::parse(name).ok_or_else(|| {
-                    format!("--profile takes standard, strict or local-only (got {name:?})")
+                    Error::Message(format!(
+                        "--profile takes standard, strict or local-only (got {name:?})"
+                    ))
                 })?);
             }
             Some(option) if option.starts_with('-') => {
-                return Err(format!(
+                return Err(Error::Message(format!(
                     "unknown option {option:?} (prefix a path that starts with `-` with ./)"
-                ));
+                )));
             }
             Some(_) | None if root.is_none() => root = Some(PathBuf::from(arg)),
-            Some(_) | None => return Err("more than one path given".into()),
+            Some(_) | None => return Err(Error::Message("more than one path given".into())),
         }
     }
 
-    let mut config = ScanConfig::new(root.ok_or("missing file or directory to review")?);
+    let mut config = ScanConfig::new(
+        root.ok_or_else(|| Error::Message("missing file or directory to review".into()))?,
+    );
     config.include_ignored_dirs = include_ignored_dirs;
     config.excluded_top_level = excluded_top_level;
     Ok(Target {
@@ -441,26 +475,26 @@ fn parse_target(args: &[OsString], allowed: Allowed) -> Result<Target, String> {
     })
 }
 
-fn parse_top_level_name(option: &str, name: &OsStr) -> Result<String, String> {
+fn parse_top_level_name(option: &str, name: &OsStr) -> Result<String, Error> {
     match name.to_str() {
         Some(name) if !name.is_empty() && name != "." && name != ".." && !name.contains('/') => {
             Ok(name.to_string())
         }
-        Some(_) | None => Err(format!(
+        Some(_) | None => Err(Error::Message(format!(
             "{option} takes one top-level directory name, not {:?}",
             name.to_string_lossy()
-        )),
+        ))),
     }
 }
 
-fn parse_identity(option: &str, value: Option<&OsString>) -> Result<Identity, String> {
+fn parse_identity(option: &str, value: Option<&OsString>) -> Result<Identity, Error> {
     let text = value
         .and_then(|value| value.to_str())
-        .ok_or_else(|| format!("{option} needs an identity"))?;
+        .ok_or_else(|| Error::Message(format!("{option} needs an identity")))?;
     Identity::parse(text)
 }
 
-fn parse_hook(args: &[OsString]) -> Result<HookArgs, String> {
+fn parse_hook(args: &[OsString]) -> Result<HookArgs, Error> {
     let mut pacman_pid = None;
     let mut cwd = None;
     let mut opencode = OpenCode::SystemOnly;
@@ -473,30 +507,32 @@ fn parse_hook(args: &[OsString]) -> Result<HookArgs, String> {
                 pacman_pid = Some(
                     value
                         .and_then(|value| value.parse::<u32>().ok())
-                        .ok_or("--pacman-pid needs a process id")?,
+                        .ok_or_else(|| Error::Message("--pacman-pid needs a process id".into()))?,
                 );
             }
             Some("--cwd") => {
-                let value = args.next().ok_or("--cwd needs a directory")?;
+                let value = args
+                    .next()
+                    .ok_or_else(|| Error::Message("--cwd needs a directory".into()))?;
                 let value = PathBuf::from(value);
                 if !value.is_absolute() {
-                    return Err("--cwd must be an absolute path".into());
+                    return Err(Error::Message("--cwd must be an absolute path".into()));
                 }
                 cwd = Some(value);
             }
             Some("--opencode-from-path") => opencode = OpenCode::UserPath,
             Some(_) | None => {
-                return Err(format!(
+                return Err(Error::Message(format!(
                     "unexpected pacman-hook argument {:?}",
                     arg.to_string_lossy()
-                ));
+                )));
             }
         }
     }
 
     Ok(HookArgs {
-        pacman_pid: pacman_pid.ok_or("missing --pacman-pid")?,
-        cwd: cwd.ok_or("missing --cwd")?,
+        pacman_pid: pacman_pid.ok_or_else(|| Error::Message("missing --pacman-pid".into()))?,
+        cwd: cwd.ok_or_else(|| Error::Message("missing --cwd".into()))?,
         opencode,
     })
 }

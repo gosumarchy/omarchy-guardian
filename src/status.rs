@@ -18,6 +18,7 @@ use crate::config::model::{
 };
 use crate::config::weaker;
 use crate::engine::store::Store;
+use crate::error::{Error, IoContext};
 use crate::gatewatch::{self, Level, Observer};
 use crate::integrations::{Integration, Paths, State};
 use crate::json::Json;
@@ -125,7 +126,7 @@ fn collect() -> Status {
         }
     }
     if let Err(reason) = pacman::preflight(&settings, pacman::system_reviewer_ready(&settings)) {
-        issues.push(reason);
+        issues.push(reason.to_string());
     }
     issues.extend(snapshot_boot_issue(
         &fs::read_to_string("/proc/cmdline").unwrap_or_default(),
@@ -773,27 +774,31 @@ pub(crate) fn mark_seen_unless_waiting(directory: &Path, id: &str, now: u64) -> 
 
 /// Marks every report so far as seen and every gate that dropped as
 /// known, and refreshes the Waybar module.
-pub(crate) fn dismiss() -> Result<(), String> {
+pub(crate) fn dismiss() -> Result<(), Error> {
     gatewatch::dismiss();
-    let directory = notify::reports_dir().ok_or("no reports directory (set HOME)")?;
+    let directory = notify::reports_dir()
+        .ok_or_else(|| Error::Message("no reports directory (set HOME)".into()))?;
     let now = crate::time::now();
     if let Some((newest, _)) = newest_report(&directory, now) {
-        fs::write(directory.join(SEEN), newest).map_err(|error| error.to_string())?;
+        let seen = directory.join(SEEN);
+        fs::write(&seen, newest).at(&seen)?;
     }
     refresh_waybar();
     Ok(())
 }
 
 /// Opens the last block's report in the browser and marks it seen.
-pub(crate) fn open_report() -> Result<(), String> {
-    let directory = notify::reports_dir().ok_or("no reports directory (set HOME)")?;
+pub(crate) fn open_report() -> Result<(), Error> {
+    let directory = notify::reports_dir()
+        .ok_or_else(|| Error::Message("no reports directory (set HOME)".into()))?;
     let now = crate::time::now();
-    let (newest, _) = newest_report(&directory, now).ok_or("no block reports yet")?;
+    let (newest, _) = newest_report(&directory, now)
+        .ok_or_else(|| Error::Message("no block reports yet".into()))?;
     let page = directory.join(format!("{newest}.html"));
     Command::new("omarchy-launch-browser")
         .arg(format!("file://{}", page.display()))
         .spawn()
-        .map_err(|error| format!("could not open the browser: {error}"))?;
+        .map_err(|error| Error::Message(format!("could not open the browser: {error}")))?;
     dismiss()
 }
 

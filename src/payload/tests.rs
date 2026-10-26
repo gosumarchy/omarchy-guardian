@@ -466,7 +466,9 @@ fn links_out_of_the_package_or_through_links_are_notes_or_refusals() {
     build(&root, &archive, &[".PKGINFO", "etc"], &[]);
     let opened = Archive::open(&archive).unwrap();
     assert_eq!(
-        opened.resolve("etc/sudoers.d/out", "/usr/lib/systemd/system/other.service"),
+        opened
+            .resolve("etc/sudoers.d/out", "/usr/lib/systemd/system/other.service")
+            .map_err(|error| error.to_string()),
         Ok(Resolution::Outside(
             "/usr/lib/systemd/system/other.service".into()
         ))
@@ -499,7 +501,9 @@ fn links_out_of_the_package_or_through_links_are_notes_or_refusals() {
         ("../../lib/pkg/data", "usr/lib/pkg/data"),
     ] {
         assert_eq!(
-            opened.resolve("etc/sudoers.d/x", target),
+            opened
+                .resolve("etc/sudoers.d/x", target)
+                .map_err(|error| error.to_string()),
             Ok(Resolution::Regular(leads.into())),
             "{target}"
         );

@@ -240,9 +240,8 @@ fn status_command(mode: StatusMode) -> ExitCode {
     let result = match mode {
         // Written as it is: the terminal-safe output would rewrite a
         // hidden character inside a string into something that is no JSON.
-        StatusMode::Shell => {
-            writeln!(io::stdout(), "{}", status::json()).map_err(|error| error.to_string())
-        }
+        StatusMode::Shell => writeln!(io::stdout(), "{}", status::json())
+            .map_err(|error| Error::Message(format!("cannot write to standard output: {error}"))),
         StatusMode::Waybar => {
             outln!("{}", status::waybar());
             Ok(())
@@ -350,9 +349,11 @@ fn process_owner(pid: u32) -> Option<u32> {
 /// user file into the system file's `[acknowledged]` list, after showing
 /// them and the change, with sudo. Only root can write that file, so a
 /// program running as the user cannot accept its own weakening.
-fn acknowledge_command(settings: &Settings, confirm: &mut dyn Confirm) -> Result<String, String> {
+fn acknowledge_command(settings: &Settings, confirm: &mut dyn Confirm) -> Result<String, Error> {
     if settings.user_block().is_some() || settings.privileged_block().is_some() {
-        return Err("fix the settings files first (see `omarchy-guardian config check`)".into());
+        return Err(Error::Message(
+            "fix the settings files first (see `omarchy-guardian config check`)".into(),
+        ));
     }
     let keys = weaker::to_acknowledge(settings);
     if keys == settings.acknowledged_weaker() {
@@ -378,7 +379,7 @@ fn acknowledge_command(settings: &Settings, confirm: &mut dyn Confirm) -> Result
     outln!("\nSystem file {}:", settings.system_path().display());
     outln!("{}", setup::line_diff(&existing, &text));
     if !confirm.confirm("Accept these weaker settings and install the file with sudo?") {
-        return Err("nothing was changed".into());
+        return Err(Error::Message("nothing was changed".into()));
     }
     setup::install_accepted(&text)?;
     audit::settings_changed(&format!(

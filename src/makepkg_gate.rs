@@ -41,7 +41,7 @@ mod upstream;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 use std::os::unix::process::CommandExt;
@@ -67,7 +67,7 @@ use crate::config::Settings;
 use crate::config::model::SourceClass;
 use crate::engine::baseline::{Identity, Unit};
 use crate::engine::store::Store;
-use crate::error::Error;
+use crate::error::{Error, IoContext};
 use crate::notify::{self, Ran};
 use crate::report::{Blocked, Decision, Hashes};
 use crate::rules;
@@ -506,23 +506,27 @@ fn is_abbreviated(text: &str) -> bool {
 /// `MIRRORED_FLAGS` (also out of short clusters like `-fCA`), `--config
 /// <file>`, and makepkg's trailing `NAME=value` settings. A call that picks
 /// another recipe or directory (`-p`, `-D`) is refused.
-fn mirrored_arguments(arguments: &[OsString]) -> Result<Vec<OsString>, String> {
+fn mirrored_arguments(arguments: &[OsString]) -> Result<Vec<OsString>, Error> {
     let unsupported = |text: &str| {
-        format!("{text} is not supported: the gate reviews the PKGBUILD in the working directory")
+        Error::Message(format!(
+            "{text} is not supported: the gate reviews the PKGBUILD in the working directory"
+        ))
     };
     let mut mirrored = Vec::new();
     let mut iter = arguments.iter();
     while let Some(arg) = iter.next() {
         let Some(text) = arg.to_str() else {
-            return Err(format!(
+            return Err(Error::Message(format!(
                 "an argument is not UTF-8: {}",
                 arg.to_string_lossy()
-            ));
+            )));
         };
         match text {
             "-p" | "--file" | "-D" | "--dir" => return Err(unsupported(text)),
             "--config" => {
-                let file = iter.next().ok_or("--config needs a file")?;
+                let file = iter
+                    .next()
+                    .ok_or_else(|| Error::Message("--config needs a file".into()))?;
                 mirrored.extend(["--config".into(), file.clone()]);
             }
             _ if text.starts_with("--config=") || MIRRORED_FLAGS.contains(&text) => {
@@ -794,7 +798,7 @@ fn unpack_archives(
                     );
                     collected.add_unpacked(&archive, &directory, roots, &step.functions.written);
                 }
-                Err(why) => collected.not_unpacked(&archive, &why),
+                Err(why) => collected.not_unpacked(&archive, &why.to_string()),
             }
         }
     }
@@ -805,17 +809,17 @@ fn unpack_one(
     srcdir: &Path,
     archive: &Path,
     scratch: &mut Option<unpack::Scratch>,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, Error> {
     if scratch.is_none() {
         let beside = srcdir.parent().unwrap_or(srcdir);
         *scratch = Some(unpack::Scratch::create(beside)?);
     }
     let into = scratch
         .as_mut()
-        .ok_or("no directory to unpack into")?
+        .ok_or_else(|| Error::Message("no directory to unpack into".into()))?
         .next()?;
-    let home = home().map_err(|error| error.to_string())?;
-    let archive = fs::canonicalize(archive).map_err(|error| error.to_string())?;
+    let home = home()?;
+    let archive = fs::canonicalize(archive).at(archive)?;
     let mut jail: Vec<OsString> = vec![tools::BWRAP.into()];
     jail.extend(sandbox::fetch_jail(&FetchJail {
         home: &home,
@@ -1058,7 +1062,7 @@ fn dependency_facts(upstream: &Upstream) -> Vec<String> {
 /// A block of the upstream step: said, notified, and turned into the exit
 /// code. It notes that the recipe ran: makepkg sources it, in the jail, to
 /// list the sources.
-fn block(step: &UpstreamStep<'_>, message: &str, why: &str, code: u8) -> ExitCode {
+fn block(step: &UpstreamStep<'_>, message: impl fmt::Display, why: &str, code: u8) -> ExitCode {
     errln!("Guardian blocked makepkg: {message}");
     audit::refused(Gate::Aur, &format!("aur:{}: {why}", step.key), code);
     notify::blocked(&subject(step.name), why, Ran::RecipeToFetch);
@@ -1088,7 +1092,7 @@ fn list_sources(step: &UpstreamStep<'_>, confirm: &mut dyn Confirm) -> Result<Li
     let unreadable = |error: String| {
         block(
             step,
-            &format!("could not read the source list ({error})."),
+            format!("could not read the source list ({error})."),
             "the source list could not be read",
             2,
         )
@@ -1104,7 +1108,7 @@ fn list_sources(step: &UpstreamStep<'_>, confirm: &mut dyn Confirm) -> Result<Li
         Followed::Differs(array) => {
             return Err(block(
                 step,
-                &format!(
+                format!(
                     "listing the recipe gave another {array} than it writes out; what it builds with cannot be known."
                 ),
                 "the recipe lists other sources than it writes out",
@@ -1210,9 +1214,8 @@ fn review_upstream(
     context.extend(facts);
 
     if step.extract {
-        pre_extract(step, &dirs, &listed.fetch).map_err(|message| {
-            block(step, &message, "fetching the sources for review failed", 2)
-        })?;
+        pre_extract(step, &dirs, &listed.fetch)
+            .map_err(|message| block(step, message, "fetching the sources for review failed", 2))?;
     }
 
     let budget = upstream_budget(settings);
@@ -1227,7 +1230,7 @@ fn review_upstream(
     if !sources.is_empty() && !upstream.found {
         return Err(block(
             step,
-            &format!(
+            format!(
                 "the extracted sources were not found where makepkg put them ({}).",
                 dirs.srcdir().display()
             ),
@@ -1393,10 +1396,12 @@ fn print_warnings(title: &str, warnings: &[String]) {
 }
 
 /// Parses `makepkg-gate -- <makepkg> [args...]`.
-pub(crate) fn parse(args: &[OsString]) -> Result<Vec<OsString>, String> {
+pub(crate) fn parse(args: &[OsString]) -> Result<Vec<OsString>, Error> {
     match args.split_first() {
         Some((separator, rest)) if separator == "--" && !rest.is_empty() => Ok(rest.to_vec()),
-        _ => Err("usage: omarchy-guardian makepkg-gate -- <makepkg> [args...]".into()),
+        _ => Err(Error::Message(
+            "usage: omarchy-guardian makepkg-gate -- <makepkg> [args...]".into(),
+        )),
     }
 }
 

@@ -804,7 +804,7 @@ fn review_with_retry(
 
 fn is_retryable(error: &Error) -> bool {
     match error {
-        Error::TimedOut { .. } | Error::Spawn { .. } => false,
+        Error::TimedOut { .. } | Error::Spawn { .. } | Error::Config(_) => false,
         Error::Io { .. }
         | Error::ToolFailed { .. }
         | Error::OutputTooLarge { .. }

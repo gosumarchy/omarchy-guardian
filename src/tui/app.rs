@@ -9,6 +9,7 @@ use crate::config::Settings;
 use crate::config::file::{PartialConfig, PartialPolicy};
 use crate::config::load::FileStatus;
 use crate::config::model::{Named, Profile, SourceClass};
+use crate::error::Error;
 use crate::integrations::{Integration, Paths, Plan, State};
 use crate::setup::{self, line_diff};
 use crate::tui::canvas::{Canvas, Style, color};
@@ -312,7 +313,7 @@ impl App {
     pub(super) fn settle(
         &mut self,
         effect: &Effect,
-        outcome: Result<String, String>,
+        outcome: Result<String, Error>,
         load: impl FnOnce() -> Loaded,
     ) -> bool {
         let rewritten = effect.rewrites(outcome.is_ok());
@@ -451,10 +452,10 @@ impl App {
     }
 
     /// Reports how an effect went.
-    fn finish(&mut self, effect: &Effect, outcome: Result<String, String>) {
+    fn finish(&mut self, effect: &Effect, outcome: Result<String, Error>) {
         match outcome {
             Err(error) => {
-                self.message = Some((error, Tone::Bad));
+                self.message = Some((error.to_string(), Tone::Bad));
                 self.system_after_user = false;
             }
             Ok(text) => match effect {
@@ -618,7 +619,7 @@ impl App {
         true
     }
 
-    fn set(&mut self, field: Field, value: Option<&str>) -> Result<(), String> {
+    fn set(&mut self, field: Field, value: Option<&str>) -> Result<(), Error> {
         let draft = match field.scope {
             Scope::User => &mut self.user,
             Scope::System => &mut self.system,
@@ -807,7 +808,7 @@ impl App {
             Some(index) => names.get(index + 1).copied(),
         };
         if let Err(error) = self.set(field, next) {
-            self.message = Some((error, Tone::Bad));
+            self.message = Some((error.to_string(), Tone::Bad));
         }
         None
     }
@@ -817,7 +818,7 @@ impl App {
             && self.editable(field.scope)
             && let Err(error) = self.set(field, None)
         {
-            self.message = Some((error, Tone::Bad));
+            self.message = Some((error.to_string(), Tone::Bad));
         }
         None
     }
@@ -826,7 +827,7 @@ impl App {
         if let Some(Row::Field(field)) = self.selected() {
             let saved = field.get(self.saved(field.scope));
             if let Err(error) = self.set(field, saved.as_deref()) {
-                self.message = Some((error, Tone::Bad));
+                self.message = Some((error.to_string(), Tone::Bad));
             }
         }
         None
@@ -849,7 +850,7 @@ impl App {
                     return Some(Effect::SaveUser(text));
                 }
                 Err(error) => {
-                    self.message = Some((error, Tone::Bad));
+                    self.message = Some((error.to_string(), Tone::Bad));
                     return None;
                 }
             }
@@ -887,7 +888,7 @@ impl App {
                     effect: Effect::SaveSystem(text),
                 });
             }
-            Err(error) => self.message = Some((error, Tone::Bad)),
+            Err(error) => self.message = Some((error.to_string(), Tone::Bad)),
         }
     }
 
@@ -1003,7 +1004,7 @@ impl App {
                 }
                 let value = (selected > 0).then(|| options[selected].clone());
                 if let Err(error) = self.set_both(field, also, value.as_deref()) {
-                    self.message = Some((error, Tone::Bad));
+                    self.message = Some((error.to_string(), Tone::Bad));
                 }
                 return;
             }
@@ -1025,7 +1026,7 @@ impl App {
         field: Field,
         also: Option<Field>,
         value: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<(), Error> {
         let (user, system) = (self.user.clone(), self.system.clone());
         let result = self
             .set(field, value)
@@ -1052,7 +1053,7 @@ impl App {
                 let value = (!value.is_empty()).then_some(value);
                 match self.set_both(field, also, value) {
                     Ok(()) => return,
-                    Err(message) => error = Some(message),
+                    Err(message) => error = Some(message.to_string()),
                 }
             }
             Key::Backspace => {
