@@ -823,13 +823,17 @@ fn a_path_of_control_characters_is_measured_as_it_is_sent() {
                 "{max_input}"
             );
         }
-        // Pieces of any other file each fit a request.
-        let files = [file(&format!("lib/{controls}.js"), &content)];
+        // Pieces of any other file each fit what the request has room for
+        // beside the file's manifest row: its escaped path (60 bytes for
+        // the controls, 7 for the rest) and the row's 32 bytes of overhead.
+        let path = format!("lib/{controls}.js");
+        let manifest_row = 60 + 7 + 32;
+        let files = [file(&path, &content)];
         if let Ok(plan) = plan(&files, None, max_input, 8) {
             assert!(
-                plan.chunks
-                    .iter()
-                    .all(|chunk| chunk.iter().map(Item::cost).sum::<usize>() <= max_input),
+                plan.chunks.iter().all(|chunk| {
+                    chunk.iter().map(Item::cost).sum::<usize>() + manifest_row <= max_input
+                }),
                 "{max_input}"
             );
         }
