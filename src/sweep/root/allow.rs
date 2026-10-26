@@ -6,7 +6,7 @@ use std::process::{Command, ExitCode, Stdio};
 
 use super::{SUDO, installed};
 use crate::cli::FAILED;
-use crate::error::Error;
+use crate::error::{Error, IoContext};
 use crate::sweep::state::{self, Remembered};
 use crate::user;
 
@@ -24,7 +24,7 @@ pub(crate) fn as_root(command: &str, arguments: &[&str], what: &str) -> Result<(
         .args(arguments)
         .stdin(Stdio::inherit())
         .status()
-        .map_err(|error| Error::Message(format!("cannot start sudo: {error}")))?;
+        .spawning(SUDO)?;
     if status.success() {
         Ok(())
     } else {

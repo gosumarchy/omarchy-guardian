@@ -10,7 +10,7 @@ use crate::config::file::ConfigError;
 pub(crate) enum Error {
     /// A filesystem operation on `path` failed.
     Io { path: PathBuf, source: io::Error },
-    /// An external tool could not be started.
+    /// An external tool could not be started or waited for.
     Spawn { tool: String, source: io::Error },
     /// An external tool was stopped by its time limit.
     TimedOut { tool: String },
@@ -40,7 +40,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
-            Self::Spawn { tool, source } => write!(f, "could not start {tool}: {source}"),
+            Self::Spawn { tool, source } => write!(f, "could not run {tool}: {source}"),
             Self::TimedOut { tool } => write!(f, "{tool} timed out"),
             Self::ToolFailed { tool, detail } => write!(f, "{tool} failed: {detail}"),
             Self::OutputTooLarge { tool, limit } => {
