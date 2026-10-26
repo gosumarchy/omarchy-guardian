@@ -854,8 +854,8 @@ fn read_extracted(root: &Path, rel: &str) -> io::Result<Vec<u8>> {
 /// Reads the rest of a stream Guardian stopped parsing, so bsdtar's exit
 /// is its own and not a SIGPIPE from the reader leaving early. bsdtar's
 /// time limit (`timeout --kill-after`) bounds the wait. If the drain
-/// itself fails, bsdtar's resulting exit is reported instead of the parse
-/// error.
+/// itself fails, a bsdtar still writing dies of SIGPIPE once the reader
+/// is dropped, and that exit is reported instead of the parse error.
 fn drain(stream: &mut impl Read) {
     drop(io::copy(stream, &mut io::sink()));
 }

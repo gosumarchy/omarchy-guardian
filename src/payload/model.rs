@@ -153,7 +153,8 @@ pub(super) fn heads_in_stream(
     let mut more = [0_u8; 1];
     match stream.read(&mut more) {
         Ok(0) => Ok(heads),
-        _ => Err("more was extracted than the listing names".to_string()),
+        Ok(_) => Err("more was extracted than the listing names".to_string()),
+        Err(error) => Err(error.to_string()),
     }
 }
 
