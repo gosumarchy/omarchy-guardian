@@ -221,10 +221,25 @@ struct Specs(HashMap<String, Vec<Spec>>);
 impl Specs {
     /// Reads the specs of the configuration's Lua files and those the
     /// plugins in `checkouts` ship: `lua/<module>/plugins/` and a top-level
-    /// `lazy.lua`, where lazy.nvim looks for them. Spec files past the
-    /// limit are said in `unchecked`.
+    /// `lazy.lua`, where lazy.nvim looks for them. What of them could not
+    /// be read is said in `unchecked`: an origin is then compared with
+    /// fewer specs than there are.
     fn read(root: &Path, dirs: &Dirs, checkouts: &[Checkout], unchecked: &mut Vec<String>) -> Self {
-        let listing = read::entries(root, &format!("{}/lua", dirs.config));
+        let lua = format!("{}/lua", dirs.config);
+        let listing = read::entries(root, &lua);
+        if listing.truncated {
+            unchecked.push(format!(
+                "/{lua}: more entries than were looked at, so the plugin specs in the rest were not checked"
+            ));
+        }
+        unchecked.extend(listing.unreadable.iter().map(|directory| {
+            format!("/{directory}: could not be listed, so the plugin specs in it were not checked")
+        }));
+        unchecked.extend(listing.unnamed.iter().map(|name| collect::not_utf8(name)));
+        let init = format!("{}/init.lua", dirs.config);
+        let init = fs::symlink_metadata(root.join(&init))
+            .is_ok()
+            .then_some(init);
         let shipped = checkouts.iter().flat_map(|checkout| {
             let files = match &checkout.shape {
                 Shape::Tree { files, .. } => files.as_slice(),
@@ -235,7 +250,8 @@ impl Specs {
                 .filter(|(path, _)| is_shipped_spec(path))
                 .map(|(path, _)| format!("{}/{path}", checkout.path))
         });
-        let mut paths: Vec<String> = std::iter::once(format!("{}/init.lua", dirs.config))
+        let mut paths: Vec<String> = init
+            .into_iter()
             .chain(listing.files)
             .filter(|path| read::has_extension(path, "lua"))
             .chain(shipped)
@@ -247,7 +263,16 @@ impl Specs {
             paths.truncate(MAX_SPEC_FILES);
         }
         let mut specs = Self::default();
-        for text in paths.iter().filter_map(|path| spec_text(root, path)) {
+        for path in &paths {
+            let text = match spec_text(root, path) {
+                Ok(text) => text,
+                Err(reason) => {
+                    unchecked.push(format!(
+                        "/{path}: {reason}, so the plugin specs in it were not checked"
+                    ));
+                    continue;
+                }
+            };
             for spec in lua::plugin_specs(&text) {
                 specs.0.entry(spec.name.clone()).or_default().push(spec);
             }
@@ -284,14 +309,17 @@ fn is_shipped_spec(path: &str) -> bool {
             && read::has_extension(path, "lua"))
 }
 
-/// The text of the spec file at `path`, if it is a file within the text
-/// review limit.
-fn spec_text(root: &Path, path: &str) -> Option<String> {
+/// The text of the spec file at `path`, or why it was not read: it is not
+/// a file within the text review limit.
+fn spec_text(root: &Path, path: &str) -> Result<String, String> {
     match read::look(root, path) {
         Found::File { size, head, .. } if size <= MAX_TEXT_FILE_SIZE => {
-            Some(String::from_utf8_lossy(&head).into_owned())
+            Ok(String::from_utf8_lossy(&head).into_owned())
         }
-        Found::File { .. } | Found::Link(_) | Found::Other | Found::Unreadable(_) => None,
+        Found::File { .. } => Err("larger than the text review limit".into()),
+        Found::Link(_) => Err("a link, which is not followed".into()),
+        Found::Other => Err("not a file".into()),
+        Found::Unreadable(reason) => Err(format!("could not be read ({reason})")),
     }
 }
 

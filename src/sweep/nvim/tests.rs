@@ -428,6 +428,52 @@ fn what_cannot_be_read_is_not_checked() {
 }
 
 #[test]
+fn spec_files_that_cannot_be_read_are_not_checked() {
+    let temp = TempDir::new("nvim-unread-specs");
+    let root = temp.path();
+    plugin(root, "p", "https://github.com/o/p", &[]);
+    write(
+        root,
+        &format!("{CONFIG}/lua/plugins/closed.lua"),
+        "{ \"o/p\" }",
+    );
+    let closed = root.join(CONFIG).join("lua/plugins/closed.lua");
+    fs::set_permissions(&closed, fs::Permissions::from_mode(0o000)).unwrap();
+    let odd = std::ffi::OsStr::from_bytes(b"b\xff.lua");
+    fs::write(root.join(CONFIG).join("lua").join(odd), "").unwrap();
+    symlink("/elsewhere.lua", root.join(LAZY).join("p/lazy.lua")).unwrap();
+    let unchecked = collected(root).unchecked;
+    let said = |text: &str| unchecked.iter().any(|sentence| sentence.contains(text));
+    assert!(said("not UTF-8"), "{unchecked:?}");
+    assert!(
+        said("p/lazy.lua: a link, which is not followed, so the plugin specs"),
+        "{unchecked:?}"
+    );
+    // Root reads every file whatever its mode.
+    if crate::user::effective_uid().is_ok_and(|uid| uid != 0) {
+        assert!(said("closed.lua: could not be read"), "{unchecked:?}");
+    }
+    // No init.lua is no spec file left unread.
+    assert!(!said("init.lua"), "{unchecked:?}");
+}
+
+#[test]
+fn spec_files_past_the_limit_are_not_checked() {
+    let temp = TempDir::new("nvim-many-specs");
+    let root = temp.path();
+    for index in 0..=super::MAX_SPEC_FILES {
+        write(root, &format!("{CONFIG}/lua/plugins/{index}.lua"), "");
+    }
+    let unchecked = collected(root).unchecked;
+    assert!(
+        unchecked
+            .iter()
+            .any(|sentence| sentence.contains("Neovim plugin specs: more than")),
+        "{unchecked:?}"
+    );
+}
+
+#[test]
 fn moved_configuration_is_collected_as_editor_start_up_files() {
     let temp = TempDir::new("nvim-xdg");
     let root = temp.path();
