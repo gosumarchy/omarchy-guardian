@@ -2,11 +2,11 @@
 
 use super::{reviewed_classes, reviewed_content, reviewed_digests, reviewed_names};
 use crate::config::model::SourceClass;
-use crate::report::{Report, ReviewedArchive};
+use crate::report::{Report, ReviewScope, ReviewedArchive};
 
 #[test]
 fn a_transaction_is_named_by_every_archive_it_was_reviewed_from() {
-    let mut report = Report::new("pacman transaction");
+    let mut report = Report::new("pacman transaction", ReviewScope::default());
     // Nothing was read: nothing a permit could stand for.
     assert!(reviewed_content(&report).is_none());
     let archive = |name: &str, class, byte: &str| ReviewedArchive {

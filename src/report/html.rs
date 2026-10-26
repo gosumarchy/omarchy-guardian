@@ -245,7 +245,7 @@ fn ai_reviews(html: &mut String, report: &Report) {
         if let Some(note) = &run.cached {
             let _ = write!(meta, " · {}", esc(note));
         }
-        let _ = write!(meta, " · profile {}", esc(&report.profile));
+        let _ = write!(meta, " · profile {}", esc(report.profile()));
         let (label, tone, text) = match &run.outcome {
             AgentOutcome::Reviewed(review) => (
                 review.status.label(),

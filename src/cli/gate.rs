@@ -14,7 +14,7 @@ use crate::config::model::{AiRequirement, Named, Profile, SourceClass};
 use crate::engine::baseline::Unit;
 use crate::notify;
 use crate::permit::{self, Content, Standing};
-use crate::report::{Blocked, Decision, Report};
+use crate::report::{Blocked, Decision, Hashes, Report};
 use crate::review::{self, ReviewContext};
 use crate::sandbox;
 use crate::scan::{self, ScanConfig};
@@ -25,7 +25,7 @@ use super::{USAGE_ERROR, settings_for};
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Target {
     pub(crate) config: ScanConfig,
-    pub(crate) show_hashes: bool,
+    pub(crate) hashes: Hashes,
     pub(crate) class: SourceClass,
     pub(crate) profile: Option<Profile>,
     pub(crate) units: Vec<Unit>,
@@ -140,7 +140,7 @@ pub(crate) fn review_and_decide(
     gate: Gate,
     content: Option<ContentOf<'_>>,
 ) -> Verdict {
-    let mut report = review::review_tree(
+    let report = review::review_tree(
         &target.config,
         &ReviewContext {
             settings,
@@ -183,8 +183,7 @@ pub(crate) fn review_and_decide(
         settings,
         target.state_root.as_deref(),
     );
-    report.permit = standing.permitted().map(str::to_string);
-    report.print(target.show_hashes, decision);
+    report.print(decision, target.hashes, standing.permitted());
 
     let verdict = Verdict {
         report,

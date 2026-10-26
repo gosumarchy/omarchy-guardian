@@ -16,7 +16,7 @@ use crate::engine::baseline::{Identity, Unit};
 use crate::engine::plan::HashOnly;
 use crate::git_state;
 use crate::paths::file_name;
-use crate::report::{Gap, LocalFinding, Report};
+use crate::report::{Gap, LocalFinding, Report, ReviewScope};
 use crate::review::{self, ReviewContext};
 use crate::rules::RuleId;
 use crate::text::shown;
@@ -66,11 +66,14 @@ pub(super) fn judge(
     context: &ReviewContext<'_>,
     news: &std::collections::HashSet<String>,
 ) -> Report {
-    let mut report = review::collected_report("system sweep", context);
     // The sweep lists what is on the system to look at, and a low remark
     // of the AI on an item is one such thing in every profile: it stays a
     // finding here, listed, counted, remembered and told as one.
-    report.remark_classes.clear();
+    let scope = ReviewScope {
+        remark_classes: Vec::new(),
+        ..review::scope(context.settings, context.class, &[context.class])
+    };
+    let mut report = Report::new("system sweep", scope);
     let facts = examine(&mut report, collection, home, news);
     let context = ReviewContext {
         context: &facts,

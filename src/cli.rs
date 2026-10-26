@@ -20,7 +20,7 @@ use crate::notify;
 use crate::pacman::{self, HookArgs};
 use crate::permit::{self, Content};
 use crate::protect;
-use crate::report::Decision;
+use crate::report::{Decision, Hashes};
 use crate::setup;
 use crate::status;
 use crate::sweep;
@@ -276,7 +276,7 @@ fn pacman_hook_command(hook: &HookArgs, settings: &Settings, root_hook: bool) ->
         return ExitCode::from(2);
     }
     match pacman::review_transaction(hook, settings) {
-        Ok(mut report) => {
+        Ok(report) => {
             let decision = report.decide(&|class| settings.policy(class));
             let contents: Vec<Content> = pacman::reviewed_content(&report).into_iter().collect();
             let standing = permit::standing(
@@ -286,8 +286,7 @@ fn pacman_hook_command(hook: &HookArgs, settings: &Settings, root_hook: bool) ->
                 settings,
                 Store::default_root().as_deref(),
             );
-            report.permit = standing.permitted().map(str::to_string);
-            report.print(false, decision);
+            report.print(decision, Hashes::Hidden, standing.permitted());
             let exit = match (standing.permitted(), root_hook) {
                 (Some(_), true) => permit::PERMITTED_EXIT,
                 (Some(_), false) => 0,

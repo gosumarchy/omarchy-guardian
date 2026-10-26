@@ -243,7 +243,7 @@ impl Entry {
     fn report(self, report: &Report) -> Self {
         self.with(FINDINGS, report.audit_findings())
             .with(AI, report.audit_ai())
-            .with(PROFILE, &report.profile)
+            .with(PROFILE, report.profile())
     }
 
     fn value(&self, field: &str) -> &str {
@@ -451,7 +451,7 @@ pub(crate) fn sweep_failed() {
 #[cfg(test)]
 mod tests {
     use super::{DIGEST, Entry, Event, Gate, Reviewed, SUBJECT, review, taken};
-    use crate::report::{Blocked, Decision, Gap, LocalFinding, Report};
+    use crate::report::{Blocked, Decision, Gap, LocalFinding, Report, ReviewScope};
     use crate::rules::RuleId;
 
     fn field<'a>(entry: &'a str, name: &str) -> Option<&'a str> {
@@ -536,8 +536,13 @@ mod tests {
 
     #[test]
     fn a_review_records_counts_and_rule_ids_and_no_content() {
-        let mut report = Report::new("pacman transaction");
-        report.profile = "standard".into();
+        let mut report = Report::new(
+            "pacman transaction",
+            ReviewScope {
+                profile: "standard".into(),
+                ..ReviewScope::default()
+            },
+        );
         report.findings.push(LocalFinding {
             path: "demo/.INSTALL".into(),
             line: 3,

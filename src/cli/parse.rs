@@ -10,6 +10,7 @@ use crate::engine::baseline::{Identity, Unit};
 use crate::makepkg_gate;
 use crate::pacman::HookArgs;
 use crate::permit;
+use crate::report::Hashes;
 use crate::scan::ScanConfig;
 use crate::sweep;
 use crate::tools::OpenCode;
@@ -353,7 +354,7 @@ fn split_command(args: &[OsString]) -> Result<(&[OsString], Vec<OsString>), Stri
 fn parse_target(args: &[OsString], allowed: Allowed) -> Result<Target, String> {
     let mut root: Option<PathBuf> = None;
     let mut include_ignored_dirs = false;
-    let mut show_hashes = false;
+    let mut hashes = Hashes::Hidden;
     let mut excluded_top_level = Vec::new();
     let mut class = SourceClass::Source;
     let mut profile = None;
@@ -362,7 +363,7 @@ fn parse_target(args: &[OsString], allowed: Allowed) -> Result<Target, String> {
 
     while let Some(arg) = args.next() {
         match arg.to_str() {
-            Some("--hashes") => show_hashes = true,
+            Some("--hashes") => hashes = Hashes::Shown,
             Some("--thorough") if allowed.thorough => include_ignored_dirs = true,
             Some("--exclude") if allowed.exclude => {
                 let name = args.next().ok_or("--exclude needs a directory name")?;
@@ -432,7 +433,7 @@ fn parse_target(args: &[OsString], allowed: Allowed) -> Result<Target, String> {
     config.excluded_top_level = excluded_top_level;
     Ok(Target {
         config,
-        show_hashes,
+        hashes,
         class,
         profile,
         units,

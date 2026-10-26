@@ -15,7 +15,7 @@ use crate::engine::{self, Group, Memory};
 use crate::git_state;
 use crate::image;
 use crate::osv;
-use crate::report::{AgentOutcome, Decision, Gap, LocalFinding, Report};
+use crate::report::{AgentOutcome, Decision, Gap, LocalFinding, Report, ReviewScope};
 use crate::rules::{self, RuleId};
 use crate::scan::{self, FileHash, FileKind, ScanConfig, TextFile};
 use crate::tools::OpenCode;
@@ -151,16 +151,25 @@ pub(crate) fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> R
 
 /// A report for files collected outside a tree walk (see `review_collected`).
 pub(crate) fn collected_report(subject: impl Into<String>, context: &ReviewContext<'_>) -> Report {
-    let mut report = Report::new(subject);
-    report.class = context.class;
-    report.profile = context
-        .settings
-        .profile_for(context.class)
-        .name()
-        .to_string();
-    report.ai_off_classes = ai_off_classes(context.settings, &[context.class]);
-    report.remark_classes = remark_classes(context.settings, &[context.class]);
-    report
+    Report::new(
+        subject,
+        scope(context.settings, context.class, &[context.class]),
+    )
+}
+
+/// What a review of files of `classes` runs under: the policies `settings`
+/// give those classes, with `class` for files given none of their own.
+pub(crate) fn scope(
+    settings: &Settings,
+    class: SourceClass,
+    classes: &[SourceClass],
+) -> ReviewScope {
+    ReviewScope {
+        class,
+        profile: settings.profile_for(class).name().to_string(),
+        ai_off_classes: ai_off_classes(settings, classes),
+        remark_classes: remark_classes(settings, classes),
+    }
 }
 
 /// An image by its name and by its whole content, not marked to run: a
@@ -237,7 +246,7 @@ pub(crate) fn ai_off_classes(settings: &Settings, classes: &[SourceClass]) -> Ve
 }
 
 /// The subset of `classes` whose resolved policy shows the low findings of
-/// a clear AI verdict as remarks (see `Report::remark_classes`).
+/// a clear AI verdict as remarks (see `ReviewScope::remark_classes`).
 pub(crate) fn remark_classes(settings: &Settings, classes: &[SourceClass]) -> Vec<SourceClass> {
     classes
         .iter()
@@ -337,7 +346,7 @@ fn analyze_hidden_characters(report: &mut Report, rel: &str, text: &str) {
 /// the rules' matches on them are noise. Returns whether it was queued: a
 /// class with `ai = off` does not review payload files at all.
 pub(crate) fn analyze_payload(report: &mut Report, rel: &str, text: &str) -> bool {
-    if report.ai_off_classes.contains(&report.class_of(rel)) {
+    if report.is_ai_off(rel) {
         return false;
     }
     report.text_files_reviewed += 1;
@@ -384,7 +393,7 @@ pub(crate) fn analyze_upstream(report: &mut Report, rel: &str, text: &str) -> bo
 }
 
 fn queue_for_agent(report: &mut Report, rel: &str, text: &str) {
-    if report.ai_off_classes.contains(&report.class_of(rel)) {
+    if report.is_ai_off(rel) {
         return;
     }
     if rules::is_sensitive_path(rel) {
@@ -489,11 +498,11 @@ pub(crate) fn run_agents(
 /// else the report's (the strictest pacman class for a transaction).
 fn group_class(report: &Report, files: &[SourceFile]) -> SourceClass {
     let mut classes = files.iter().map(|file| report.class_of(&file.path));
-    let first = classes.next().unwrap_or(report.class);
+    let first = classes.next().unwrap_or(report.class());
     if classes.all(|class| class == first) {
         first
     } else {
-        report.class
+        report.class()
     }
 }
 

@@ -1,6 +1,6 @@
 //! Tests for `report`.
 
-use super::{AgentOutcome, AgentRun, Blocked, Decision, Gap, LocalFinding, Report};
+use super::{AgentOutcome, AgentRun, Blocked, Decision, Gap, LocalFinding, Report, ReviewScope};
 use crate::agent::{AgentFinding, AgentReview, Status};
 use crate::config::model::{Profile, SourceClass, builtin};
 use crate::error::Error;
@@ -15,14 +15,13 @@ fn standard(class: SourceClass) -> crate::config::model::Policy {
 
 #[test]
 fn a_permitted_report_says_so_and_names_what_it_overruled() {
-    let mut report = Report::new("theme:demo");
+    let mut report = Report::new("theme:demo", ReviewScope::default());
     report.gaps.push(Gap::Undecodable("install.sh".into()));
     let blocked = Decision::Blocked(Blocked::Incomplete);
     assert!(report.headline(blocked).0.contains("INCOMPLETE"));
     assert_eq!(blocked.exit_status(), 2);
 
-    report.permit = Some("0123456789abcdef".into());
-    let (headline, _) = report.headline(blocked);
+    let headline = report.verdict_box(blocked, Some("0123456789abcdef"), 100, Painter::plain());
     assert!(headline.contains("PERMITTED"), "{headline}");
     assert!(
         headline.contains("permit 0123456789abcdef overrules INCOMPLETE"),
@@ -65,7 +64,7 @@ fn a_permit_needs_every_gap_to_be_about_hashed_content() {
         Gap::Package(refused()),
     ] {
         assert!(!gap.content_hashed(), "{gap}");
-        let mut report = Report::new("x");
+        let mut report = Report::new("x", ReviewScope::default());
         report.gaps.push(Gap::NoReviewableFiles);
         assert!(report.content_hashed());
         report.gaps.push(gap);
@@ -75,7 +74,7 @@ fn a_permit_needs_every_gap_to_be_about_hashed_content() {
 
 #[test]
 fn the_audit_trail_gets_numbers_and_the_user_gets_the_reasons() {
-    let mut report = Report::new("x");
+    let mut report = Report::new("x", ReviewScope::default());
     assert_eq!(report.audit_ai(), "none");
     assert_eq!(
         report.audit_findings(),
@@ -145,7 +144,7 @@ fn not_attempted(chunk: (usize, usize)) -> AgentRun {
 #[test]
 fn the_summary_keeps_why_the_review_is_incomplete_whatever_else_there_is() {
     // More alerts than the summary has lines for, and a gap.
-    let mut report = Report::new("x");
+    let mut report = Report::new("x", ReviewScope::default());
     report.findings = local_findings(20);
     report
         .gaps
@@ -157,7 +156,7 @@ fn the_summary_keeps_why_the_review_is_incomplete_whatever_else_there_is() {
 
     // The first of eight chunks failed, so seven were never sent, beside
     // nine local findings: one line for the seven.
-    let mut report = Report::new("x");
+    let mut report = Report::new("x", ReviewScope::default());
     report.findings = local_findings(9);
     report.agent_runs = (2..=8).map(|index| not_attempted((index, 8))).collect();
     report
@@ -180,7 +179,7 @@ fn the_summary_keeps_why_the_review_is_incomplete_whatever_else_there_is() {
 
     // The second of four chunks failed and the two after it found sixteen
     // things between them.
-    let mut report = Report::new("x");
+    let mut report = Report::new("x", ReviewScope::default());
     report.agent_runs.push(reviewed(Status::Clear, &["a"]));
     for file in ["c", "d"] {
         let mut run = reviewed(Status::Suspicious, &[file]);
@@ -243,7 +242,10 @@ fn finding(path: &str) -> LocalFinding {
 
 fn report(class: SourceClass) -> Report {
     Report {
-        class,
+        scope: ReviewScope {
+            class,
+            ..ReviewScope::default()
+        },
         text_files_reviewed: 1,
         ..Report::default()
     }

@@ -69,7 +69,7 @@ use crate::engine::baseline::{Identity, Unit};
 use crate::engine::store::Store;
 use crate::error::Error;
 use crate::notify::{self, Ran};
-use crate::report::{Blocked, Decision};
+use crate::report::{Blocked, Decision, Hashes};
 use crate::rules;
 use crate::sandbox::{self, FetchJail};
 use crate::scan::{self, ScanConfig, Snapshot};
@@ -474,7 +474,7 @@ fn recipe_target(build_dir: &Path, key: &str, aur: bool) -> Target {
             excluded_entries: Vec::new(),
             limits: scan::Limits::DEFAULT,
         },
-        show_hashes: false,
+        hashes: Hashes::Hidden,
         class: SourceClass::Aur,
         profile: None,
         units: identity
