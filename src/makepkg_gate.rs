@@ -711,7 +711,7 @@ impl Configured {
         )?
         .into_success()?;
         Self::parse(&output)
-            .ok_or_else(|| Error::Refused("makepkg's configuration could not be read".into()))
+            .ok_or_else(|| Error::Message("makepkg's configuration could not be read".into()))
     }
 
     fn parse(output: &[u8]) -> Option<Self> {
@@ -1320,7 +1320,7 @@ fn verify_recipe(
     };
     let (current, gaps) = scan::walk(&config, &mut |_| {});
     if !gaps.is_empty() {
-        return Err(Error::Refused(
+        return Err(Error::Message(
             "the recipe became unreadable after review".into(),
         ));
     }
@@ -1337,7 +1337,7 @@ fn verify_recipe(
     if now == then {
         Ok(())
     } else {
-        Err(Error::Refused("the recipe changed after review".into()))
+        Err(Error::Message("the recipe changed after review".into()))
     }
 }
 

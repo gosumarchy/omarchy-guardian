@@ -18,8 +18,9 @@ pub(crate) enum Error {
     OutputTooLarge { tool: String, limit: usize },
     /// Structured input (JSON, TOML, tool output) could not be understood.
     Parse { what: String, detail: String },
-    /// Input or state that Guardian refuses to act on.
-    Refused(String),
+    /// Anything else, said in full: input or state Guardian refuses to act
+    /// on, or a failure with no more structure than its message.
+    Message(String),
 }
 
 impl Error {
@@ -42,7 +43,7 @@ impl fmt::Display for Error {
                 write!(f, "{tool} output exceeds {limit} bytes")
             }
             Self::Parse { what, detail } => write!(f, "could not parse {what}: {detail}"),
-            Self::Refused(reason) => f.write_str(reason),
+            Self::Message(text) => f.write_str(text),
         }
     }
 }

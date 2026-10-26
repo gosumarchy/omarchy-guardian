@@ -60,7 +60,7 @@ pub(crate) fn run(
     command: &[OsString],
 ) -> Result<ExitCode, Error> {
     let Some((program, arguments)) = command.split_first() else {
-        return Err(Error::Refused("no sandbox command was given".into()));
+        return Err(Error::Message("no sandbox command was given".into()));
     };
 
     scan::verify_unchanged(config, reviewed)?;
@@ -236,7 +236,7 @@ pub(crate) fn fetch_jail(jail: &FetchJail<'_>) -> Vec<OsString> {
 fn copy_tree(source: &Path, destination: &Path, total: &mut u64) -> Result<(), Error> {
     let metadata = fs::symlink_metadata(source).at(source)?;
     if !metadata.is_dir() {
-        return Err(Error::Refused(format!(
+        return Err(Error::Message(format!(
             "not a non-symlink directory: {}",
             source.display()
         )));
@@ -251,7 +251,7 @@ fn copy_tree(source: &Path, destination: &Path, total: &mut u64) -> Result<(), E
         let from = entry.path();
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
-            return Err(Error::Refused(format!(
+            return Err(Error::Message(format!(
                 "non-UTF-8 path in source tree: {}",
                 from.display()
             )));
@@ -267,7 +267,7 @@ fn copy_tree(source: &Path, destination: &Path, total: &mut u64) -> Result<(), E
         } else if file_type.is_file() {
             *total = total.saturating_add(entry.metadata().at(&from)?.len());
             if *total > MAX_COPY_SIZE {
-                return Err(Error::Refused(format!(
+                return Err(Error::Message(format!(
                     "source exceeds the sandbox copy limit of {} MiB",
                     MAX_COPY_SIZE / (1024 * 1024)
                 )));
@@ -277,7 +277,7 @@ fn copy_tree(source: &Path, destination: &Path, total: &mut u64) -> Result<(), E
             let target = fs::read_link(&from).at(&from)?;
             symlink(&target, &to).at(&to)?;
         } else {
-            return Err(Error::Refused(format!(
+            return Err(Error::Message(format!(
                 "unsupported file type: {}",
                 from.display()
             )));

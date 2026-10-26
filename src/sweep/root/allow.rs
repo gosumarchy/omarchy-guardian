@@ -23,11 +23,11 @@ pub(crate) fn as_root(command: &str, arguments: &[&str], what: &str) -> Result<(
         .args(arguments)
         .stdin(Stdio::inherit())
         .status()
-        .map_err(|error| Error::Refused(format!("cannot start sudo: {error}")))?;
+        .map_err(|error| Error::Message(format!("cannot start sudo: {error}")))?;
     if status.success() {
         Ok(())
     } else {
-        Err(Error::Refused(format!(
+        Err(Error::Message(format!(
             "{what} failed ({status}); nothing was changed. If the installed Guardian is older than this one, run ./install.sh"
         )))
     }

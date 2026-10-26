@@ -351,7 +351,7 @@ fn a_state_directory_of_another_user_is_to_be_made_ones_own() {
 fn a_user_that_cannot_be_told_is_said_to_be_that() {
     let mut tree = Tree::new("gate-place-user", "build".into(), "demo.tar.gz");
     let root = tree.dir.path().join("state");
-    let unknown = || Err(Error::Refused("cannot read the effective user id".into()));
+    let unknown = || Err(Error::Message("cannot read the effective user id".into()));
     tree.state = State::open_as(Some(&root), "demo", unknown());
     let kept = root.join("aur-gate").display().to_string();
     stops_both_calls(

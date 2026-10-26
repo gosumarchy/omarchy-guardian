@@ -76,7 +76,7 @@ fn report_id(target: &str) -> Result<&str, Error> {
     if valid {
         Ok(id)
     } else {
-        Err(Error::Refused(format!("not a Guardian report: {target:?}")))
+        Err(Error::Message(format!("not a Guardian report: {target:?}")))
     }
 }
 
@@ -85,15 +85,15 @@ fn report_id(target: &str) -> Result<&str, Error> {
 fn read_report(directory: &Path, id: &str, uid: u32) -> Result<String, Error> {
     let path = directory.join(format!("{id}.txt"));
     let metadata =
-        fs::symlink_metadata(&path).map_err(|_| Error::Refused(format!("no saved report {id}")))?;
+        fs::symlink_metadata(&path).map_err(|_| Error::Message(format!("no saved report {id}")))?;
     if !metadata.is_file() || metadata.uid() != uid {
-        return Err(Error::Refused(format!(
+        return Err(Error::Message(format!(
             "{} is not a report Guardian saved",
             path.display()
         )));
     }
     // The message names no file: it is the system's own, as it was.
-    let text = fs::read_to_string(&path).map_err(|error| Error::Refused(error.to_string()))?;
+    let text = fs::read_to_string(&path).map_err(|error| Error::Message(error.to_string()))?;
     if text.len() <= MAX_REPORT_BYTES {
         return Ok(text);
     }
@@ -180,9 +180,9 @@ fn agent_command(settings: &Settings, system: &str, prompt: &str) -> Result<Agen
 fn ask_config_home() -> Result<PathBuf, Error> {
     let directory = paths::cache_home(Accept::Absolute, Accept::Any)
         .map(|cache| cache.join("omarchy-guardian/opencode-ask"))
-        .ok_or_else(|| Error::Refused("no cache directory (set HOME)".into()))?;
+        .ok_or_else(|| Error::Message("no cache directory (set HOME)".into()))?;
     let uid =
-        user::real_uid().ok_or_else(|| Error::Refused("cannot tell the current user".into()))?;
+        user::real_uid().ok_or_else(|| Error::Message("cannot tell the current user".into()))?;
     paths::private_dir(&directory, uid)?;
     Ok(directory)
 }
@@ -253,9 +253,9 @@ pub(crate) fn run(target: &str, settings: &Settings) -> String {
     let result = (|| {
         let id = report_id(target)?;
         let directory = notify::reports_dir()
-            .ok_or_else(|| Error::Refused("no reports directory (set HOME)".into()))?;
+            .ok_or_else(|| Error::Message("no reports directory (set HOME)".into()))?;
         let uid = user::real_uid()
-            .ok_or_else(|| Error::Refused("cannot tell the current user".into()))?;
+            .ok_or_else(|| Error::Message("cannot tell the current user".into()))?;
         paths::private_dir(&directory, uid)?;
         let report = read_report(&directory, id, uid)?;
         // Older reports were saved before control characters were shown as
@@ -290,7 +290,7 @@ pub(crate) fn run(target: &str, settings: &Settings) -> String {
         let workspace = directory.with_file_name("agent");
         paths::private_dir(&workspace, uid)?;
         command.args(&args).current_dir(&workspace);
-        Err::<(), Error>(Error::Refused(format!(
+        Err::<(), Error>(Error::Message(format!(
             "could not open a terminal: {}",
             command.exec()
         )))

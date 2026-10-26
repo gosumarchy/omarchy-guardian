@@ -251,12 +251,12 @@ pub(crate) fn walk(
 pub(crate) fn verify_unchanged(config: &ScanConfig, expected: &Snapshot) -> Result<(), Error> {
     let (current, gaps) = walk(config, &mut |_| {});
     if !gaps.is_empty() {
-        return Err(Error::Refused(
+        return Err(Error::Message(
             "the source tree changed or became unreadable after review".into(),
         ));
     }
     if current != *expected {
-        return Err(Error::Refused(
+        return Err(Error::Message(
             "the scanned file set or file contents changed after review".into(),
         ));
     }
@@ -276,7 +276,7 @@ pub(crate) fn verify_copy(config: &ScanConfig, expected: &Snapshot) -> Result<()
             .collect()
     };
     if !gaps.is_empty() || kept(&current) != kept(expected) || current.skipped != expected.skipped {
-        return Err(Error::Refused(
+        return Err(Error::Message(
             "the sandbox copy does not match the reviewed source".into(),
         ));
     }

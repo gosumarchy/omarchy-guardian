@@ -64,7 +64,7 @@ impl Store {
                 Err(source) => return Err(Error::Io { path, source }),
             }
             if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
-                return Err(Error::Refused(format!(
+                return Err(Error::Message(format!(
                     "{} is not a directory",
                     path.display()
                 )));

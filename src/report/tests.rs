@@ -69,7 +69,7 @@ fn the_advice_after_a_passing_review_names_its_scope() {
 
 #[test]
 fn a_permit_needs_every_gap_to_be_about_hashed_content() {
-    let refused = || Error::Refused("x".into());
+    let refused = || Error::Message("x".into());
     for gap in [
         Gap::OversizedText("x".into()),
         Gap::UnresolvedLfs("x".into()),
@@ -123,7 +123,7 @@ fn the_audit_trail_gets_numbers_and_the_user_gets_the_reasons() {
         label: "m · high".into(),
         chunk: None,
         cached: None,
-        outcome: AgentOutcome::Unavailable(Error::Refused("no network".into())),
+        outcome: AgentOutcome::Unavailable(Error::Message("no network".into())),
     });
     assert_eq!(
         report.audit_ai(),
@@ -182,7 +182,7 @@ fn the_summary_keeps_why_the_review_is_incomplete_whatever_else_there_is() {
     report.findings = local_findings(20);
     report
         .gaps
-        .push(Gap::Agent(Error::Refused("no reply".into())));
+        .push(Gap::Agent(Error::Message("no reply".into())));
     let summary = report.overruled_summary(16);
     assert_eq!(summary[0], "not reviewed: AI review failed: no reply");
     assert_eq!(summary.len(), 17);
@@ -195,7 +195,7 @@ fn the_summary_keeps_why_the_review_is_incomplete_whatever_else_there_is() {
     report.agent_runs = (2..=8).map(|index| not_attempted((index, 8))).collect();
     report
         .gaps
-        .push(Gap::Agent(Error::Refused("chunk 1/8: no reply".into())));
+        .push(Gap::Agent(Error::Message("chunk 1/8: no reply".into())));
     let summary = report.overruled_summary(16);
     assert_eq!(
         summary[0],
@@ -232,7 +232,7 @@ fn the_summary_keeps_why_the_review_is_incomplete_whatever_else_there_is() {
     }
     report
         .gaps
-        .push(Gap::Agent(Error::Refused("chunk 2/4: no reply".into())));
+        .push(Gap::Agent(Error::Message("chunk 2/4: no reply".into())));
     let summary = report.overruled_summary(16);
     assert_eq!(
         summary[0],
@@ -261,7 +261,7 @@ fn unavailable(files: &[&str]) -> AgentRun {
         label: "m · high".into(),
         chunk: None,
         cached: None,
-        outcome: AgentOutcome::Unavailable(Error::Refused("provider down".into())),
+        outcome: AgentOutcome::Unavailable(Error::Message("provider down".into())),
     }
 }
 

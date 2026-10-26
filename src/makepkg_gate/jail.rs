@@ -135,7 +135,7 @@ pub(super) fn home() -> Result<PathBuf, Error> {
     env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|home| home.is_absolute() && home.parent().is_some())
-        .ok_or_else(|| Error::Refused("HOME is not set to a directory".into()))
+        .ok_or_else(|| Error::Message("HOME is not set to a directory".into()))
 }
 
 /// Puts `extra` Bubblewrap arguments before the `--chdir <dir> --` that
@@ -174,7 +174,7 @@ fn jailed(
                 // makepkg would create a configured one; a bind needs it.
                 fs::create_dir_all(directory).at(directory)?;
                 if !is_jailable(directory, &home) {
-                    return Err(Error::Refused(format!(
+                    return Err(Error::Message(format!(
                         "{} holds more than a build, so the sources cannot be fetched into it in the sandbox",
                         directory.display()
                     )));
@@ -344,10 +344,10 @@ pub(super) fn probe(step: &UpstreamStep<'_>) -> Result<String, Error> {
     expected.push(0);
     match listing_report(&workspace.path().join("report")) {
         Some(report) if report == expected => Ok(String::from_utf8_lossy(&captured).into_owned()),
-        Some(_) => Err(Error::Refused(
+        Some(_) => Err(Error::Message(
             "the PKGBUILD moves makepkg's build or download directory".into(),
         )),
-        None => Err(Error::Refused(
+        None => Err(Error::Message(
             "the PKGBUILD did not finish loading here (it stops or fails on this system)".into(),
         )),
     }

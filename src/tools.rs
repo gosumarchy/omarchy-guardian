@@ -101,7 +101,7 @@ impl OpenCode {
             Self::UserPath => {
                 let path = env::var_os("PATH").unwrap_or_default();
                 let found = find_in_path(reviewer.program(), &path).ok_or_else(|| {
-                    Error::Refused(format!(
+                    Error::Message(format!(
                         "{} (`{}`) was not found on PATH",
                         reviewer.label(),
                         reviewer.program()
@@ -112,7 +112,7 @@ impl OpenCode {
                     env::var_os("XDG_CACHE_HOME").as_deref(),
                 );
                 refuse_planted(&found, &scratch, user::real_uid()).map_err(|reason| {
-                    Error::Refused(format!(
+                    Error::Message(format!(
                         "{} at {} is not used: {reason}; anything running as another user, or anything that writes a cache or temporary file, could have put it there. Install it in a directory only you or root can write, or fix PATH",
                         reviewer.label(),
                         found.display()
@@ -127,7 +127,7 @@ impl OpenCode {
                     .map(Path::new)
                     .find(|path| path.is_file())
                     .ok_or_else(|| {
-                        Error::Refused(format!(
+                        Error::Message(format!(
                             "the pacman gate requires a root-owned {} at {}",
                             reviewer.label(),
                             paths.join(" or ")
@@ -285,7 +285,7 @@ fn verify_root_owned(path: &Path) -> Result<(), Error> {
     for ancestor in path.ancestors() {
         let metadata = fs::metadata(ancestor).at(ancestor)?;
         if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-            return Err(Error::Refused(format!(
+            return Err(Error::Message(format!(
                 "{} must be owned by root and not writable by other users",
                 ancestor.display()
             )));

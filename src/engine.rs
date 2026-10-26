@@ -727,7 +727,7 @@ impl Runner<'_> {
         };
         notes.extend(exposure.notes);
         match exposure.refusal {
-            Some(reason) => Err(Error::Refused(reason)),
+            Some(reason) => Err(Error::Message(reason)),
             None => self.opencode.resolve_reviewer(reviewer),
         }
     }
@@ -766,7 +766,7 @@ fn chunk_error((index, count): (usize, usize), more: usize, error: Error) -> Err
     } else {
         String::new()
     };
-    Error::Refused(format!("chunk {index}/{count}{others}: {error}"))
+    Error::Message(format!("chunk {index}/{count}{others}: {error}"))
 }
 
 /// One review, retried once after a short pause when the AI was unavailable
@@ -809,7 +809,7 @@ fn is_retryable(error: &Error) -> bool {
         | Error::ToolFailed { .. }
         | Error::OutputTooLarge { .. }
         | Error::Parse { .. }
-        | Error::Refused(_) => true,
+        | Error::Message(_) => true,
     }
 }
 

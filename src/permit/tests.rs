@@ -404,10 +404,10 @@ fn what_has_no_digest_or_was_refused_is_never_permitted() {
     // A refused package, a file that could not be read, a link that
     // leads elsewhere: the permit is ignored and none is offered.
     for gap in [
-        Gap::Package(Error::Refused(
+        Gap::Package(Error::Message(
             "demo ships /usr/bin/omarchy-guardian".into(),
         )),
-        Gap::Io(Error::Refused("x: permission denied".into())),
+        Gap::Io(Error::Message("x: permission denied".into())),
         Gap::Symlink("x".into()),
         Gap::HashLimit("x".into()),
         Gap::TreeTooLarge { files: 1, bytes: 1 },

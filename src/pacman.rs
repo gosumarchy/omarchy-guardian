@@ -129,7 +129,7 @@ pub(crate) fn preflight(settings: &Settings, opencode_ready: bool) -> Result<(),
 
 pub(crate) fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report, Error> {
     if let Some(reason) = settings.privileged_block() {
-        return Err(Error::Refused(reason.to_string()));
+        return Err(Error::Message(reason.to_string()));
     }
 
     let targets = read_targets(io::stdin().lock())?;
@@ -220,8 +220,8 @@ pub(crate) fn review_transaction(args: &HookArgs, settings: &Settings) -> Result
             }
             Some(Err(reason)) => report
                 .gaps
-                .push(Gap::Package(Error::Refused(format!("{target}: {reason}")))),
-            None => report.gaps.push(Gap::Package(Error::Refused(format!(
+                .push(Gap::Package(Error::Message(format!("{target}: {reason}")))),
+            None => report.gaps.push(Gap::Package(Error::Message(format!(
                 "no package archive matched transaction target {target}"
             )))),
         }
@@ -258,7 +258,7 @@ fn system_links(shipped: &Shipped<'_>, report: &mut Report) -> InstalledLinks {
         )
     }));
     for reason in unseen {
-        report.gaps.push(Gap::Package(Error::Refused(reason)));
+        report.gaps.push(Gap::Package(Error::Message(reason)));
     }
     links
 }
@@ -670,7 +670,7 @@ fn review_led(
         // A link out of the package, or an archive that could not be
         // read: nothing the archive's digest stands for.
         Some(payload::Replacement::Unreadable(reason)) => {
-            report.gaps.push(Gap::Package(Error::Refused(format!(
+            report.gaps.push(Gap::Package(Error::Message(format!(
                 "/{path}, which /{link} on this system links to, {reason}: what the link will hold cannot be reviewed"
             ))));
         }
@@ -905,7 +905,7 @@ fn follow_outside_link(
             true
         }
         Err(reason) => {
-            report.gaps.push(Gap::Package(Error::Refused(format!(
+            report.gaps.push(Gap::Package(Error::Message(format!(
                 "/{} links to {leads}, which {reason}: what it holds cannot be reviewed",
                 file.path
             ))));

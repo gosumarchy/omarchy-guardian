@@ -432,12 +432,12 @@ fn group_id(name: &str) -> Option<u32> {
 fn installed() -> Result<&'static Path, Error> {
     let program = Path::new(INSTALLED);
     let metadata = fs::metadata(program).map_err(|error| {
-        Error::Refused(format!(
+        Error::Message(format!(
             "{INSTALLED}: {error}; root's part needs the installed Guardian (./install.sh)"
         ))
     })?;
     if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-        return Err(Error::Refused(format!(
+        return Err(Error::Message(format!(
             "{INSTALLED} is not root's alone; root's part needs the installed Guardian (./install.sh)"
         )));
     }

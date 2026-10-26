@@ -449,7 +449,7 @@ fn opencode_args(
                 }
                 (Some(model), None) => args.extend(["--model".into(), OsString::from(model)]),
                 (None, Some(_)) => {
-                    return Err(AgentError::Unavailable(Error::Refused(
+                    return Err(AgentError::Unavailable(Error::Message(
                         "OpenCode 2 takes a variant only after a model (provider/model#variant): \
                          set model as well as variant"
                             .into(),

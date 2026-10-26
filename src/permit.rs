@@ -690,21 +690,21 @@ fn grant(
         .into_iter()
         .find(|block| block.content.id() == id)
         .ok_or_else(|| {
-            Error::Refused(format!(
+            Error::Message(format!(
                 "no blocked install is kept under {id}; `omarchy-guardian permit` lists them"
             ))
         })?;
     let content = &block.content;
     if !enabled(settings, &content.class) {
-        return Err(Error::Refused(
+        return Err(Error::Message(
             "permits are off under the strict level; the system file's [permit] strict = \"allowed\" turns them on"
                 .into(),
         ));
     }
     let uid =
-        user::real_uid().ok_or_else(|| Error::Refused("cannot tell which user this is".into()))?;
+        user::real_uid().ok_or_else(|| Error::Message("cannot tell which user this is".into()))?;
     if uid == 0 {
-        return Err(Error::Refused(
+        return Err(Error::Message(
             "a permit is given by the user who was blocked, not by root".into(),
         ));
     }
@@ -714,10 +714,10 @@ fn grant(
             "Type {WORD} to overrule the review, anything else to leave it: "
         ))
         .ok_or_else(|| {
-            Error::Refused("a permit is given on a terminal, by you: there is none here".into())
+            Error::Message("a permit is given on a terminal, by you: there is none here".into())
         })?;
     if answer != WORD {
-        return Err(Error::Refused("nothing was permitted".into()));
+        return Err(Error::Message("nothing was permitted".into()));
     }
     as_root(&["--add", content.gate.name(), &content.class, &content.key()])?;
     drop_pending(state_root, id);
@@ -792,7 +792,7 @@ pub(crate) fn command(command: &Command, settings: &Settings) -> ExitCode {
         }
         Command::Grant(id) => match state_root.as_deref() {
             Some(root) => grant(id, settings, root, &mut TtyTyped, &system),
-            None => Err(Error::Refused(
+            None => Err(Error::Message(
                 "no state directory (set HOME or XDG_STATE_HOME)".into(),
             )),
         },

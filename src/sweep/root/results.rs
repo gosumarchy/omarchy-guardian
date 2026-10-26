@@ -33,7 +33,7 @@ const MAX_AGE_SECS: u64 = 36 * 60 * 60;
 pub(super) fn write_results(path: &Path, json: &str, gid: u32) -> Result<(), Error> {
     let directory = path
         .parent()
-        .ok_or_else(|| Error::Refused("no directory".into()))?;
+        .ok_or_else(|| Error::Message("no directory".into()))?;
     fs::create_dir_all(directory).at(directory)?;
     unix_fs::chown(directory, Some(0), Some(gid)).at(directory)?;
     fs::set_permissions(directory, fs::Permissions::from_mode(0o750)).at(directory)?;

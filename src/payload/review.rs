@@ -343,7 +343,7 @@ pub(crate) fn review(
     class: SourceClass,
     trusted: &[String],
 ) -> Result<Review, Error> {
-    let refuse = |reason: String| Error::Refused(format!("{}: {reason}", archive.path.display()));
+    let refuse = |reason: String| Error::Message(format!("{}: {reason}", archive.path.display()));
     if let Some(reason) = name_violation(package, class, trusted) {
         return Err(refuse(reason));
     }

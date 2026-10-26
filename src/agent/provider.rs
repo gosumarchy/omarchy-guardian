@@ -4,7 +4,7 @@
 use crate::error::Error;
 
 pub(super) fn out_of_time() -> Error {
-    Error::Refused(
+    Error::Message(
         "the AI saw the source and ran out of time reviewing it; retry, or raise timeout_secs"
             .into(),
     )
@@ -126,7 +126,7 @@ fn is_marked_slow_down(message: &str) -> bool {
 }
 
 pub(super) fn content_rejected(detail: &str) -> Error {
-    Error::Refused(format!(
+    Error::Message(format!(
         "the AI provider refused this source ({detail}); a source can be written to be refused, so this is not an absent reviewer"
     ))
 }

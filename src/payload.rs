@@ -226,7 +226,7 @@ impl Fingerprint {
     /// bytes.
     pub(crate) fn verify(&self) -> Result<(), Error> {
         let changed = || {
-            Error::Refused(format!(
+            Error::Message(format!(
                 "{} changed while it was being reviewed",
                 self.path.display()
             ))
@@ -294,7 +294,7 @@ impl Archive {
             .at(path)?;
         let metadata = file.metadata().at(path)?;
         if !metadata.is_file() {
-            return Err(Error::Refused(format!(
+            return Err(Error::Message(format!(
                 "{} is not a regular file",
                 path.display()
             )));
@@ -321,7 +321,7 @@ impl Archive {
             &String::from_utf8_lossy(&names),
             &String::from_utf8_lossy(&details),
         )
-        .map_err(|reason| Error::Refused(format!("{}: {reason}", path.display())))?;
+        .map_err(|reason| Error::Message(format!("{}: {reason}", path.display())))?;
         archive.index = archive
             .entries
             .iter()
@@ -332,7 +332,7 @@ impl Archive {
         // control lists, which libalpm restores with the file.
         for (path, what, capability) in archive.attributes()? {
             let index = archive.index.get(&path).copied().ok_or_else(|| {
-                Error::Refused(format!(
+                Error::Message(format!(
                     "{}: its attributes name {path:?}, which its listing does not",
                     archive.path.display()
                 ))
@@ -662,7 +662,7 @@ impl Archive {
         if current.is_file() && Identity::of(&current) == self.identity {
             Ok(())
         } else {
-            Err(Error::Refused(format!(
+            Err(Error::Message(format!(
                 "{} changed while it was being reviewed",
                 self.path.display()
             )))
@@ -822,9 +822,9 @@ impl Archive {
         for path in paths {
             let expected = self.entry(path).map_or(0, |entry| entry.size);
             let bytes = read_extracted(workspace.path(), path)
-                .map_err(|error| Error::Refused(format!("/{path}: {error}")))?;
+                .map_err(|error| Error::Message(format!("/{path}: {error}")))?;
             if bytes.len() as u64 != expected {
-                return Err(Error::Refused(format!(
+                return Err(Error::Message(format!(
                     "/{path} was extracted with a different size than listed"
                 )));
             }

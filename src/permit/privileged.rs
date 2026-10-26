@@ -58,12 +58,12 @@ pub(super) fn add(
 ) -> Result<Permit, Error> {
     let gate = Gate::parse(gate)
         .filter(|gate| permits(*gate))
-        .ok_or_else(|| Error::Refused(format!("{gate:?} is not a gate permits are for")))?;
+        .ok_or_else(|| Error::Message(format!("{gate:?} is not a gate permits are for")))?;
     if classes(class).is_none() {
-        return Err(Error::Refused(format!("{class:?} is not a class")));
+        return Err(Error::Message(format!("{class:?} is not a class")));
     }
     if !is_hex(key, 64) {
-        return Err(Error::Refused(
+        return Err(Error::Message(
             "the content is named by its SHA-256 (64 hex characters)".into(),
         ));
     }
@@ -87,7 +87,7 @@ pub(super) fn add(
         })
         .count();
     if held >= MAX_PERMITS {
-        return Err(Error::Refused(
+        return Err(Error::Message(
             "too many permits are in force; revoke some or let them end".into(),
         ));
     }
@@ -120,7 +120,7 @@ fn permit_entry(decision: &str, uid: u32) -> Entry {
 
 fn system_change(arguments: &[String]) -> Result<(), Error> {
     let uid = invoker().ok_or_else(|| {
-        Error::Refused(
+        Error::Message(
             "a permit is given to the user who asks through sudo: run `omarchy-guardian permit` as that user".into(),
         )
     })?;
@@ -132,7 +132,7 @@ fn system_change(arguments: &[String]) -> Result<(), Error> {
             // file is not read here.
             let settings = Settings::system_only();
             if !enabled(&settings, class) {
-                return Err(Error::Refused(
+                return Err(Error::Message(
                     "permits are off under these system settings".into(),
                 ));
             }
@@ -160,7 +160,7 @@ fn system_change(arguments: &[String]) -> Result<(), Error> {
             }
             Ok(())
         }
-        _ => Err(Error::Refused(SYSTEM_USAGE.into())),
+        _ => Err(Error::Message(SYSTEM_USAGE.into())),
     }
 }
 
