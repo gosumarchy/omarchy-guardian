@@ -37,6 +37,13 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      # aarch64 is a supported target with open(2) flags of its own
+      # (src/files.rs), and an x86_64 build does not compile that code. Arm
+      # and riscv64 have no Arch target package, so they stay unchecked.
+      - name: Clippy (aarch64)
+        run: |
+          pacman -S --noconfirm --needed rust-aarch64-gnu
+          cargo clippy --locked --all-targets --all-features --target aarch64-unknown-linux-gnu -- -D warnings
       - name: Test
         run: cargo test --locked
       # What the gates decide before a review, or with no reviewer to ask:
