@@ -12,11 +12,11 @@ use std::path::{Path, PathBuf};
 #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
 pub(crate) const O_NOFOLLOW: i32 = 0o400_000;
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-const O_NOFOLLOW: i32 = 0o100_000;
+pub(crate) const O_NOFOLLOW: i32 = 0o100_000;
 #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
 pub(crate) const O_DIRECTORY: i32 = 0o200_000;
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-const O_DIRECTORY: i32 = 0o40_000;
+pub(crate) const O_DIRECTORY: i32 = 0o40_000;
 /// The same on all of them (`x86_64`, `aarch64`, `arm`, `riscv64`). A path
 /// swapped for a FIFO between `lstat` and `open` then fails the identity check
 /// instead of blocking the open; it has no effect on regular files.
