@@ -660,11 +660,44 @@ fn a_file_is_budgeted_by_what_it_takes_in_the_request() {
 
 #[test]
 fn a_manifest_larger_than_half_the_limit_is_too_large() {
-    let files: Vec<SourceFile> = (0..200)
+    let files: Vec<SourceFile> = (0..100)
         .map(|index| file(&format!("f{index:03}.txt"), "x"))
         .collect();
-    // 200 × (45 + 8 + 1) = 10800 bytes of manifest against a 10000-byte limit.
+    // 100 × (45 + 8 + 1) = 5400 bytes of manifest: more than half of 10000,
+    // exactly half of 10800.
     assert_eq!(plan(&files, None, 10_000, 64), Err(TooLarge::INPUT));
+    assert!(plan(&files, None, 10_800, 64).is_ok());
+}
+
+#[test]
+fn removed_and_hash_only_rows_are_charged_as_written() {
+    let files = [file("a", "x")];
+    let previous: Previous = [("old".to_string(), "abc".to_string())].into();
+    let binary = super::HashOnly {
+        path: "bin/tool".into(),
+        bytes: 100,
+        label: "ELF executable",
+        media: false,
+        skipped_files: None,
+    };
+    // `{"path":"old","bytes":3,"sent":"removed"},` is 42 bytes and
+    // `{"path":"bin/tool","bytes":100,"sent":"hash-only","format":"ELF
+    // executable"},` 77, beside the file's own row.
+    let manifest = row("a", 1) + 42 + 77;
+    let build_at = |max_input_bytes| {
+        build(&PlanInput {
+            files: &files,
+            flagged: &BTreeSet::new(),
+            findings_bytes: 0,
+            previous: Some(&previous),
+            max_input_bytes,
+            max_chunks: 16,
+            unit_prefixes: &[],
+            hash_only: std::slice::from_ref(&binary),
+        })
+    };
+    assert!(build_at(2 * manifest).is_ok());
+    assert_eq!(build_at(2 * manifest - 1), Err(TooLarge::INPUT));
 }
 
 #[test]
