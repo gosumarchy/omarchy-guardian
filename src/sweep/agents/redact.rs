@@ -43,6 +43,14 @@ enum Next {
 ///
 /// Each only where it is token-shaped. The line is read word by word, as
 /// blanks split it; quotes around a word stay where they are.
+///
+/// Nothing else is taken out, so an API key pasted anywhere else
+/// (`"apiKeyHelper": "sk-ant-…"`, `echo sk-ant-…`) reaches the AI provider
+/// as written. Masking can hide code: a word that looks like a key may also
+/// be the package a runner fetches, a host, a path or a file name, and a
+/// review that cannot see what runs is worse than a leaked key. Accepted by
+/// the owner after a review found every by-look rule hid a package, host or
+/// path under some spelling (`pnpm dlx`, `sh -c 'npx …'`, a mirror's host).
 pub(super) fn redacted(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut next = Next::Word;

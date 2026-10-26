@@ -31,12 +31,14 @@ it shows on hover:
   only what each hook, helper, MCP server or plugin starts is sent: its
   command line with secrets taken out only where they are the token-shaped
   value of a secret-named setting, flag or `Authorization` header, or the
-  login in an address (a token written anywhere else is sent, since masking
-  what could name the program would hide code from the review), the names of
-  its variables, or a remote server's host; of Claude Code's `env`, only the
-  variable names and the host of a base address or proxy. Never the files
-  themselves, which hold tokens and project history, and nothing derived from
-  a project's path. A file whose name or path marks
+  login in an address, the names of its variables, or a remote server's host;
+  of Claude Code's `env`, only the variable names and the host of a base
+  address or proxy. An API key pasted anywhere else in such a command line
+  (`"apiKeyHelper": "sk-ant-…"`) reaches the AI provider as written: masking
+  can hide code, since a word that looks like a key may also name the
+  package, host or script that runs. Keep keys in variables. The files
+  themselves, which hold tokens and project history, are never sent, nor is
+  anything derived from a project's path. A file whose name or path marks
   it as holding keys or tokens (`.env`, `*.pem`, `*.key`, `id_ed25519`,
   anything under `.ssh` or `secrets`, and the like) is not sent, by any gate
   or by the sweep, whatever runs it. In
