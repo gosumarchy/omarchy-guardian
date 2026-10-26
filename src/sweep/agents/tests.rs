@@ -5,9 +5,15 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
 
+use super::entry::{is_pinned, remote, with_plugin_root, without_port};
+use super::redact::redacted;
 use super::*;
-use crate::sweep::collect::Origin;
+use crate::autorun::Category;
+use crate::rules::RuleId;
+use crate::sweep::collect::{self, Body, Origin};
 use crate::sweep::index::PackageIndex;
+use crate::sweep::judge::secrets::is_secret_name;
+use crate::sweep::tier::Tier;
 use crate::test_support::TempDir;
 
 fn write(root: &Path, path: &str, text: &str) {
@@ -18,6 +24,11 @@ fn write(root: &Path, path: &str, text: &str) {
 /// What the agents' configuration under `root` gives, for the home
 /// `home/u` with the default directories.
 fn found_in(root: &Path) -> Found {
+    found_with(root, &Dirs::new("home/u", &|_| None, None))
+}
+
+/// What the agents' configuration under `root` gives, read from `dirs`.
+fn found_with(root: &Path, dirs: &Dirs) -> Found {
     let index = PackageIndex::with_foreign(HashSet::new());
     let scope = Scope {
         root,
@@ -26,9 +37,8 @@ fn found_in(root: &Path) -> Found {
         origin: Origin::System,
     };
     let mut found = Found::default();
-    let dirs = Dirs::new("home/u", &|_| None);
-    claude::collect(&scope, Some(&dirs), &mut found);
-    opencode::collect(&scope, &dirs, &mut found);
+    claude::collect(&scope, Some(dirs), &mut found);
+    opencode::collect(&scope, dirs, &mut found);
     codex::collect(&scope, &dirs.codex, &mut found);
     found
 }
@@ -167,14 +177,15 @@ fn claude_json_gives_only_its_servers_and_hides_projects_and_secrets() {
           }
         }"#,
     );
-    let found = found_in(root);
+    let key = ProjectKey(Sha256::digest(b"a key"));
+    let found = found_with(root, &Dirs::new("home/u", &|_| None, Some(key)));
     assert_eq!(found.unchecked, Vec::<String>::new());
 
     let github = at(&found, "home/u/.claude.json#mcpServers/github");
     assert_eq!(
         text(github),
         "# started with these variables set (values not read): GITHUB_TOKEN LD_PRELOAD\n\
-         docker run -e 'GITHUB_TOKEN=<value-not-read>' --api-key '<value-not-read>' \
+         docker run -e GITHUB_TOKEN=<value-not-read> --api-key <value-not-read> \
          --url=https://api.example.com/v1 'image name'\n"
     );
     let docs = at(&found, "home/u/.claude.json#mcpServers/docs");
@@ -190,18 +201,20 @@ fn claude_json_gives_only_its_servers_and_hides_projects_and_secrets() {
             .all(|item| !item.path.ends_with("/empty"))
     );
 
-    // A project is named by a digest of its path; only the note, which
-    // stays here, names it.
+    // A project is named by a digest of its path keyed with a secret of
+    // this machine; only the note, which stays here, names it.
     let project = found
         .items
         .iter()
         .find(|item| item.path.ends_with("/mcpServers/db"))
         .unwrap();
-    let digest = &Sha256::digest(b"/home/u/work/secret-project").to_string()[..12];
+    let key = Sha256::digest(b"a key");
+    let digest = sha256::hmac(&key, b"/home/u/work/secret-project");
     assert_eq!(
         project.path,
-        format!("home/u/.claude.json#projects/~{digest}/mcpServers/db")
+        format!("home/u/.claude.json#projects/{digest}/mcpServers/db")
     );
+    assert_ne!(digest, Sha256::digest(b"/home/u/work/secret-project"));
     assert_eq!(text(project), "uvx db-server\n");
     assert_eq!(
         project.notes,
@@ -286,7 +299,7 @@ fn a_plugin_is_read_through_its_install_and_its_scripts_are_followed() {
 
     let start = at(
         &found,
-        &format!("{list}#guard@market/hooks/hooks.json/SessionStart/0/0"),
+        &format!("{list}#plugins/guard@market/0/hooks/SessionStart/0/0"),
     );
     assert_eq!(
         text(start),
@@ -304,10 +317,13 @@ fn a_plugin_is_read_through_its_install_and_its_scripts_are_followed() {
     );
     let helper = at(
         &found,
-        &format!("{list}#guard@market/.claude-plugin/plugin.json/mcpServers/helper"),
+        &format!("{list}#plugins/guard@market/0/manifest-mcp/helper"),
     );
     assert_eq!(helper.runs, [format!("/{cache}/bin/helper")]);
-    let stop = at(&found, &format!("{list}#guard@market/more.json/Stop/0/0"));
+    let stop = at(
+        &found,
+        &format!("{list}#plugins/guard@market/0/hooks-file-2/Stop/0/0"),
+    );
     assert_eq!(stop.runs, [format!("/{cache}/stop")]);
     // The default hooks file the manifest names again is read once.
     let starts = found
@@ -396,8 +412,13 @@ fn opencode_servers_and_plugins_are_read_from_jsonc_and_its_plugin_directories()
         "z\n",
     );
     let found = found_in(root);
-    assert_eq!(found.unchecked, Vec::<String>::new());
     let file = "home/u/.config/opencode/opencode.jsonc";
+    assert_eq!(
+        found.unchecked,
+        [format!(
+            "/{file}: the name of plugin/4 could not be read; what it starts was not checked"
+        )]
+    );
 
     let fs = at(&found, &format!("{file}#mcp/fs"));
     assert_eq!(
@@ -596,49 +617,109 @@ fn the_sweep_follows_what_a_hook_and_a_plugin_run() {
     );
     assert_eq!(
         run_by(&format!("{cache}/run.sh")).as_deref(),
-        Some("home/u/.claude/plugins/installed_plugins.json#p@m/hooks/hooks.json/PostToolUse/0/0")
+        Some("home/u/.claude/plugins/installed_plugins.json#plugins/p@m/0/hooks/PostToolUse/0/0")
     );
 }
 
 #[test]
 fn the_environment_moves_each_agents_directory() {
-    let defaults = Dirs::new("home/u", &|_| None);
+    let defaults = Dirs::new("home/u", &|_| None, None);
     assert_eq!(
         defaults,
         Dirs {
             claude: "home/u/.claude".into(),
             claude_json: "home/u/.claude.json".into(),
             opencode: "home/u/.config/opencode".into(),
+            opencode_extra: None,
             opencode_config: None,
             codex: "home/u/.codex".into(),
+            project_key: None,
         }
     );
-    let moved = Dirs::new("home/u", &|name| {
-        Some(
-            match name {
-                "CLAUDE_CONFIG_DIR" => "srv/claude",
-                "XDG_CONFIG_HOME" => "home/u/conf",
-                "OPENCODE_CONFIG" => "home/u/oc.json",
-                "CODEX_HOME" => "opt/codex",
-                other => panic!("asked for {other}"),
-            }
-            .to_string(),
-        )
-    });
+    let moved = Dirs::new(
+        "home/u",
+        &|name| {
+            Some(
+                match name {
+                    "CLAUDE_CONFIG_DIR" => "srv/claude",
+                    "XDG_CONFIG_HOME" => "home/u/conf",
+                    "OPENCODE_CONFIG_DIR" => "home/u/oc",
+                    "OPENCODE_CONFIG" => "home/u/oc.json",
+                    "CODEX_HOME" => "opt/codex",
+                    other => panic!("asked for {other}"),
+                }
+                .to_string(),
+            )
+        },
+        None,
+    );
     assert_eq!(
         moved,
         Dirs {
             claude: "srv/claude".into(),
             claude_json: "srv/claude/.claude.json".into(),
             opencode: "home/u/conf/opencode".into(),
+            opencode_extra: Some("home/u/oc".into()),
             opencode_config: Some("home/u/oc.json".into()),
             codex: "opt/codex".into(),
+            project_key: None,
         }
     );
     assert_eq!(relative("/srv/claude/").as_deref(), Some("srv/claude"));
     for odd in ["", "/", "relative/dir", "/a/../b", "/a//b", "/./a"] {
         assert_eq!(relative(odd), None, "{odd}");
     }
+}
+
+#[test]
+fn a_variable_set_to_no_plain_path_is_said_and_the_default_read() {
+    let lookup = |name: &str| match name {
+        "CLAUDE_CONFIG_DIR" => Some(Some("relative/claude".to_string())),
+        "XDG_CONFIG_HOME" => Some(None),
+        "OPENCODE_CONFIG" => Some(Some("/a/../b.json".to_string())),
+        "CODEX_HOME" => Some(Some("/opt/codex/".to_string())),
+        _ => None,
+    };
+    let mut found = Found::default();
+    let variable = resolved(&lookup, &mut found);
+    let dirs = Dirs::new("home/u", &variable, None);
+    assert_eq!(dirs.claude, "home/u/.claude");
+    assert_eq!(dirs.opencode, "home/u/.config/opencode");
+    assert_eq!(dirs.opencode_config, None);
+    assert_eq!(dirs.codex, "opt/codex");
+    let said: Vec<&str> = found
+        .unchecked
+        .iter()
+        .map(|line| line.split_once(' ').unwrap().0)
+        .collect();
+    assert_eq!(
+        said,
+        ["CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "OPENCODE_CONFIG"]
+    );
+    assert!(found.unchecked[0].ends_with("was not checked"));
+}
+
+#[test]
+fn a_home_that_is_not_the_users_own_reads_the_defaults_without_a_key() {
+    let dir = TempDir::new("agents-other-home");
+    let index = PackageIndex::with_foreign(HashSet::new());
+    // No `HOME` a test runs with is this one.
+    let home = "home/not-the-user-running-the-tests";
+    let scope = Scope {
+        root: dir.path(),
+        home: Some(home),
+        index: &index,
+        origin: Origin::System,
+    };
+    let mut found = Found::default();
+    let dirs = Dirs::of(&scope, &mut found).unwrap();
+    assert_eq!(dirs, Dirs::new(home, &|_| None, None));
+    assert_eq!(found.unchecked, Vec::<String>::new());
+    let no_home = Scope {
+        home: None,
+        ..scope
+    };
+    assert_eq!(Dirs::of(&no_home, &mut found), None);
 }
 
 #[test]
@@ -657,7 +738,7 @@ fn keys_are_plain_or_a_digest_and_never_two_parts() {
     let parts: HashSet<String> = odd.iter().map(|name| key_part(name)).collect();
     assert_eq!(parts.len(), odd.len());
     for part in parts {
-        assert!(part.starts_with('~') && part.len() == 13, "{part}");
+        assert!(part.starts_with('~') && part.len() == 65, "{part}");
     }
 }
 
@@ -674,7 +755,7 @@ fn jsonc_loses_comments_and_trailing_commas_and_keeps_strings() {
 }
 
 #[test]
-fn command_lines_quote_what_a_shell_would_split_and_take_out_secrets() {
+fn command_lines_quote_what_a_shell_would_split() {
     let line = |program: &str, args: &[&str]| {
         let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
         command_line(program, &args)
@@ -685,15 +766,82 @@ fn command_lines_quote_what_a_shell_would_split_and_take_out_secrets() {
     );
     assert_eq!(line("my tool", &["it's"]), r"'my tool' 'it'\''s'");
     assert_eq!(line("x", &[""]), "x ''");
-    assert_eq!(
-        line("x", &["--password", "p", "--keymap", "k", "--auth-token=t"]),
-        "x --password '<value-not-read>' --keymap k '--auth-token=<value-not-read>'"
-    );
-    assert_eq!(
-        line("x", &["git+https://me:s3cret@git.example/r.git"]),
-        "x git+https://git.example/r.git"
-    );
-    assert_eq!(line("x", &["mail=a@b.example"]), "x mail=a@b.example");
+}
+
+#[test]
+fn a_line_loses_its_secrets_and_keeps_what_a_review_needs() {
+    for (line, expected) in [
+        (
+            "x --password p --keymap k --auth-token=t",
+            "x --password <value-not-read> --keymap k --auth-token=<value-not-read>",
+        ),
+        (
+            "x --authToken t --clientSecret 's'",
+            "x --authToken <value-not-read> --clientSecret '<value-not-read>'",
+        ),
+        (
+            "x --api-key $KEY --token-file ~/.t",
+            "x --api-key $KEY --token-file ~/.t",
+        ),
+        (
+            r#"curl -H "Authorization: Bearer abc" -H 'authorization:token xyz' u"#,
+            r#"curl -H "Authorization: Bearer <value-not-read>" -H 'authorization:token <value-not-read>' u"#,
+        ),
+        (
+            "curl -H 'Authorization: token xyz' -H 'Authorization:abc' u",
+            "curl -H 'Authorization: token <value-not-read>' -H 'Authorization:<value-not-read>' u",
+        ),
+        (
+            "curl --oauth2-bearer abc u",
+            "curl --oauth2-bearer <value-not-read> u",
+        ),
+        ("x Bearer abc", "x Bearer <value-not-read>"),
+        (
+            "docker run --env=API_KEY=k -e GITHUB_TOKEN=g --env=REGION=eu",
+            "docker run --env=API_KEY=<value-not-read> -e GITHUB_TOKEN=<value-not-read> --env=REGION=eu",
+        ),
+        (
+            "echo sk-ant-api03-abcdefghijklmnop",
+            "echo <value-not-read>",
+        ),
+        ("x aB3dE6gH9jK2mN5pQ8sT1vW4yZ7bC0eF", "x <value-not-read>"),
+        (
+            "x 0123456789abcdef0123456789abcdef sk-learn",
+            "x 0123456789abcdef0123456789abcdef sk-learn",
+        ),
+        (
+            "git clone git+https://me:s3cret@git.example/r.git https://tok@h.example",
+            "git clone git+https://git.example/r.git https://h.example",
+        ),
+        ("x mail=a@b.example", "x mail=a@b.example"),
+    ] {
+        assert_eq!(redacted(line), expected, "{line}");
+    }
+}
+
+#[test]
+fn a_secret_name_is_found_in_every_way_it_is_written() {
+    for name in [
+        "OPENAI_API_KEY",
+        "--api-key",
+        "--authToken",
+        "--clientSecret",
+        "clientSecret",
+        "PGPASSWORD",
+        "Bearer",
+        "x-auth-token",
+    ] {
+        assert!(is_secret_name(name), "{name}");
+    }
+    for name in [
+        "KEYMAP",
+        "AuthorizedKeysCommand",
+        "--port",
+        "monkey",
+        "--keymap",
+    ] {
+        assert!(!is_secret_name(name), "{name}");
+    }
 }
 
 #[test]
@@ -726,6 +874,11 @@ fn a_package_is_pinned_only_by_one_version() {
         "a@~1",
         "a@",
         "a@1.x || 2",
+        "a@1",
+        "a@1.x",
+        "a@1.2",
+        "a@1.2.3.4",
+        "a@01.2.x",
     ] {
         assert!(!is_pinned(unpinned), "{unpinned}");
     }
@@ -742,8 +895,379 @@ fn a_remote_address_is_its_scheme_and_host() {
         "https://example.com:8443"
     );
     assert_eq!(host("example.com/x"), "://example.com");
+    for odd in ["1http://h.example/x", "ht tp://h.example", "-x://h.example"] {
+        assert_eq!(host(odd), "://h.example", "{odd}");
+    }
+    assert_eq!(host("git+ssh://git@h.example"), "git+ssh://h.example");
     assert_eq!(host("http://[::1]:8080/sse"), "http://[::1]:8080");
     assert_eq!(without_port("[::1]:8080"), "[::1]");
     assert_eq!(without_port("localhost:3000"), "localhost");
     assert_eq!(without_port("::1"), "::1");
+}
+
+#[test]
+fn codex_servers_written_as_inline_tables_are_read_like_tables() {
+    let dir = TempDir::new("agents-codex-inline");
+    let root = dir.path();
+    write(
+        root,
+        "home/u/.codex/config.toml",
+        r#"
+mcp_servers.top = { url = "https://top.example/mcp" }
+
+[mcp_servers]
+inline = { command = "npx", args = ["-y", "inline-mcp"], env = { K = "v-1" } }
+"#,
+    );
+    let found = found_in(root);
+    assert_eq!(found.unchecked, Vec::<String>::new());
+    let file = "home/u/.codex/config.toml";
+    assert_eq!(
+        text(at(&found, &format!("{file}#mcp_servers/inline"))),
+        "# started with these variables set (values not read): K\nnpx -y inline-mcp\n"
+    );
+    assert_eq!(
+        text(at(&found, &format!("{file}#mcp_servers/top"))),
+        "https://top.example\n"
+    );
+    assert_eq!(found.items.len(), 2);
+}
+
+#[test]
+fn a_codex_entry_not_understood_is_said_as_not_checked() {
+    let dir = TempDir::new("agents-codex-odd");
+    let root = dir.path();
+    write(
+        root,
+        "home/u/.codex/config.toml",
+        r#"
+notify = "notify-send done"
+
+[mcp_servers]
+number = 5
+broken = { command = "x" args = [] }
+
+[mcp_servers.fields]
+command = 1
+args = "no list"
+url = ["no", "string"]
+env = "no table"
+"#,
+    );
+    let found = found_in(root);
+    assert_eq!(found.items, Vec::new());
+    let file = "/home/u/.codex/config.toml";
+    let said = |what: &str| {
+        format!("{file}: the {what} could not be read; what it starts was not checked")
+    };
+    assert_eq!(
+        found.unchecked,
+        [
+            said("command of notify"),
+            said("table of mcp_servers/number"),
+            said("table of mcp_servers/broken"),
+            said("command of mcp_servers/fields"),
+            said("args of mcp_servers/fields"),
+            said("url of mcp_servers/fields"),
+            said("env of mcp_servers/fields"),
+        ]
+    );
+
+    write(root, "home/u/.codex/config.toml", "mcp_servers = 5\n");
+    assert_eq!(
+        found_in(root).unchecked,
+        [said("table of servers of mcp_servers")]
+    );
+}
+
+#[test]
+fn a_claude_field_that_is_there_and_cannot_be_read_is_said_as_not_checked() {
+    let dir = TempDir::new("agents-claude-odd");
+    let root = dir.path();
+    write(
+        root,
+        "home/u/.claude/settings.json",
+        r#"{
+          "hooks": {
+            "Stop": [{"hooks": [{"command": 5}, {"type": "http", "url": 1}, {"type": "future"},
+                                {"type": "mcp_tool", "server": "s", "tool": "t"}]},
+                     {"hooks": "none"}],
+            "Start": {}
+          },
+          "statusLine": {"command": ["a"]},
+          "apiKeyHelper": 5,
+          "env": [],
+          "mcpServers": {
+            "s": {"command": 5, "args": "x", "url": 1, "env": [], "headersHelper": 2},
+            "quiet": {"type": "stdio"}
+          }
+        }"#,
+    );
+    write(
+        root,
+        "home/u/.claude.json",
+        r#"{"projects": 5, "hooks": []}"#,
+    );
+    let found = found_in(root);
+    assert_eq!(found.items, Vec::new());
+    let said = |file: &str, what: &str| {
+        format!("/home/u/{file}: the {what} could not be read; what it starts was not checked")
+    };
+    let settings = ".claude/settings.json";
+    assert_eq!(
+        found.unchecked,
+        [
+            said(settings, "command of hooks/Stop/0/0"),
+            said(settings, "url of hooks/Stop/0/1"),
+            said(settings, "type of hooks/Stop/0/2"),
+            said(settings, "list of hooks of hooks/Stop/1"),
+            said(settings, "list of groups of hooks/Start"),
+            said(settings, "command of statusLine"),
+            said(settings, "command of apiKeyHelper"),
+            said(settings, "table of env"),
+            said(settings, "command of mcpServers/s"),
+            said(settings, "args of mcpServers/s"),
+            said(settings, "url of mcpServers/s"),
+            said(settings, "headersHelper of mcpServers/s"),
+            said(settings, "env of mcpServers/s"),
+            said(".claude.json", "table of hooks of hooks"),
+            said(".claude.json", "table of projects"),
+        ]
+    );
+}
+
+#[test]
+fn helpers_and_hooks_lose_their_secrets_before_they_are_items() {
+    let dir = TempDir::new("agents-helpers");
+    let root = dir.path();
+    write(
+        root,
+        "home/u/.claude/settings.json",
+        r#"{
+          "apiKeyHelper": "echo sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+          "statusLine": {"command": "status --token t-1 --style x"},
+          "hooks": {"Stop": [{"hooks": [
+            {"command": "curl -H 'Authorization: Bearer b-1' https://h.example/x"}
+          ]}]},
+          "mcpServers": {
+            "remote": {"type": "http", "url": "https://mcp.example/mcp",
+                       "headersHelper": "/home/u/bin/headers --secret s-1"}
+          }
+        }"#,
+    );
+    let found = found_in(root);
+    assert_eq!(found.unchecked, Vec::<String>::new());
+    let file = "home/u/.claude/settings.json";
+    assert_eq!(
+        text(at(&found, &format!("{file}#apiKeyHelper"))),
+        "echo <value-not-read>\n"
+    );
+    assert_eq!(
+        text(at(&found, &format!("{file}#statusLine"))),
+        "status --token <value-not-read> --style x\n"
+    );
+    let hook = at(&found, &format!("{file}#hooks/Stop/0/0"));
+    assert_eq!(
+        text(hook),
+        "curl -H 'Authorization: Bearer <value-not-read>' https://h.example/x\n"
+    );
+    // What is followed is the command as written, read only here.
+    assert_eq!(
+        hook.runs,
+        ["curl -H 'Authorization: Bearer b-1' https://h.example/x"]
+    );
+    let helper = at(&found, &format!("{file}#mcpServers/remote/headersHelper"));
+    assert_eq!(
+        text(helper),
+        "/home/u/bin/headers --secret <value-not-read>\n"
+    );
+    assert_eq!(helper.runs, ["/home/u/bin/headers --secret s-1"]);
+    at(&found, &format!("{file}#mcpServers/remote"));
+}
+
+#[test]
+fn the_agents_environment_is_its_names_and_the_hosts_of_its_addresses() {
+    let dir = TempDir::new("agents-env");
+    let root = dir.path();
+    write(
+        root,
+        "home/u/.claude/settings.json",
+        r#"{"env": {
+          "ANTHROPIC_API_KEY": "sk-ant-secret-1",
+          "NODE_OPTIONS": "--require /tmp/x.js",
+          "ANTHROPIC_BASE_URL": "https://u:p@relay.example.net:8443/v1?k=1",
+          "OPENAI_BASE_URL": "https://api.openai.com/v1",
+          "LOCAL_BASE_URL": "http://localhost:4000",
+          "HTTPS_PROXY": "http://user:pw@corp-proxy:3128",
+          "DISABLE_TELEMETRY": 1
+        }}"#,
+    );
+    write(root, "home/u/.claude/settings.local.json", r#"{"env": {}}"#);
+    let found = found_in(root);
+    assert_eq!(found.unchecked, Vec::<String>::new());
+    assert_eq!(found.items.len(), 1);
+    let env = at(&found, "home/u/.claude/settings.json#env");
+    assert_eq!(
+        text(env),
+        "# variables the agent sets for itself and all it starts (values not read, but for the host of an address)\n\
+         ANTHROPIC_API_KEY\n\
+         NODE_OPTIONS\n\
+         ANTHROPIC_BASE_URL=https://relay.example.net:8443\n\
+         OPENAI_BASE_URL=https://api.openai.com\n\
+         LOCAL_BASE_URL=http://localhost:4000\n\
+         HTTPS_PROXY=http://corp-proxy:3128\n\
+         DISABLE_TELEMETRY\n"
+    );
+    assert!(env.runs.is_empty());
+    let alerts: Vec<&str> = env.alerts.iter().map(|(_, alert)| alert.as_str()).collect();
+    assert_eq!(alerts.len(), 3, "{alerts:?}");
+    assert!(alerts[0].starts_with("sets NODE_OPTIONS"));
+    assert!(alerts[1].starts_with("ANTHROPIC_BASE_URL sends"));
+    // A proxy is held to what an editor's terminal is held to.
+    assert!(alerts[2].starts_with("sets HTTPS_PROXY"));
+    assert!(
+        env.alerts
+            .iter()
+            .all(|(rule, _)| *rule == RuleId::RiskyConfiguration)
+    );
+}
+
+#[test]
+fn a_package_loses_who_it_logs_in_as() {
+    let dir = TempDir::new("agents-package-login");
+    let root = dir.path();
+    write(
+        root,
+        "home/u/.config/opencode/opencode.json",
+        r#"{"plugin": ["git+https://me:tok@git.example/p.git", "https://me@h.example/p.tgz"]}"#,
+    );
+    let found = found_in(root);
+    let file = "home/u/.config/opencode/opencode.json";
+    assert_eq!(
+        text(at(&found, &format!("{file}#plugin/0"))),
+        "npm package git+https://git.example/p.git\n"
+    );
+    assert_eq!(
+        text(at(&found, &format!("{file}#plugin/1"))),
+        "npm package https://h.example/p.tgz\n"
+    );
+    for item in &found.items {
+        for (_, alert) in &item.alerts {
+            assert!(!alert.contains("me"), "{alert}");
+        }
+    }
+}
+
+#[test]
+fn without_a_key_a_project_is_named_by_its_position() {
+    let dir = TempDir::new("agents-project-index");
+    let root = dir.path();
+    write(
+        root,
+        "home/u/.claude.json",
+        r#"{"projects": {
+          "/home/u/a": {"history": []},
+          "/home/u/b": {"mcpServers": {"db": {"command": "db-mcp"}}}
+        }}"#,
+    );
+    let found = found_in(root);
+    let project = at(&found, "home/u/.claude.json#projects/1/mcpServers/db");
+    assert_eq!(project.notes, ["an MCP server of the project /home/u/b"]);
+}
+
+#[test]
+fn past_the_most_entries_of_a_file_the_rest_is_said_as_not_checked() {
+    let dir = TempDir::new("agents-many");
+    let root = dir.path();
+    let servers: Vec<String> = (0..=MAX_ENTRIES)
+        .map(|index| format!(r#""s{index}": {{"command": "srv"}}"#))
+        .collect();
+    write(
+        root,
+        "home/u/.claude.json",
+        &format!(r#"{{"mcpServers": {{{}}}}}"#, servers.join(",")),
+    );
+    let found = found_in(root);
+    assert_eq!(found.items.len(), MAX_ENTRIES);
+    assert_eq!(
+        found.unchecked,
+        [format!(
+            "/home/u/.claude.json: more than {MAX_ENTRIES} entries that start something; what it starts was not checked"
+        )]
+    );
+}
+
+#[test]
+fn opencode_plugin_directories_that_cannot_be_listed_or_are_too_full_are_said() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = TempDir::new("agents-opencode-listing");
+    let root = dir.path();
+    for index in 0..=500 {
+        write(
+            root,
+            &format!("home/u/.config/opencode/plugin/p{index:03}.js"),
+            "x\n",
+        );
+    }
+    let closed = root.join("home/u/.config/opencode/plugins");
+    fs::create_dir_all(&closed).unwrap();
+    fs::set_permissions(&closed, fs::Permissions::from_mode(0o000)).unwrap();
+    let listable = fs::read_dir(&closed).is_ok();
+    let found = found_in(root);
+    fs::set_permissions(&closed, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let plugins = found
+        .items
+        .iter()
+        .filter(|item| item.path.contains("/plugin/"))
+        .count();
+    assert_eq!(plugins, 500);
+    let mut expected = vec![
+        "/home/u/.config/opencode/plugin/*.js: more files than were looked at; what it starts was not checked"
+            .to_string(),
+    ];
+    // A test run as root lists any directory.
+    if !listable {
+        for _ in ["js", "ts"] {
+            expected.push(
+                "/home/u/.config/opencode/plugins: could not be listed; what it starts was not checked"
+                    .to_string(),
+            );
+        }
+    }
+    assert_eq!(found.unchecked, expected);
+}
+
+#[test]
+fn opencode_reads_the_directory_and_file_its_variables_name_once() {
+    let dir = TempDir::new("agents-opencode-moved");
+    let root = dir.path();
+    write(
+        root,
+        "home/u/oc/opencode.json",
+        r#"{"mcp": {"a": {"type": "local", "command": ["a-mcp"]}}}"#,
+    );
+    write(root, "home/u/oc/plugin/x.js", "x\n");
+    write(
+        root,
+        "home/u/.config/opencode/opencode.json",
+        r#"{"mcp": {"b": {"type": "local", "command": ["b-mcp"]}}}"#,
+    );
+    let variable = |name: &str| match name {
+        "OPENCODE_CONFIG_DIR" => Some("home/u/oc".to_string()),
+        "OPENCODE_CONFIG" => Some("home/u/.config/opencode/opencode.json".to_string()),
+        _ => None,
+    };
+    let found = found_with(root, &Dirs::new("home/u", &variable, None));
+    let mut paths: Vec<&str> = found.items.iter().map(|item| item.path.as_str()).collect();
+    paths.sort_unstable();
+    assert_eq!(
+        paths,
+        [
+            "home/u/.config/opencode/opencode.json#mcp/b",
+            "home/u/oc/opencode.json#mcp/a",
+            "home/u/oc/plugin/x.js",
+        ]
+    );
 }
