@@ -443,7 +443,10 @@ What is a finding, on every sweep:
   as a full address, stays a finding until you allow the plugin), and the
   url of a submodule's own submodule. So is any entry of a git directory that
   is not plain data, and any `.git` directory or file below the top of the
-  checkout, whose configuration and hooks git may run.
+  checkout, whose configuration and hooks git may run, but for the file a
+  submodule checkout leaves: one line, `gitdir: ` and a path from its
+  directory to the `.git/modules/<name>` of the submodule `.gitmodules` puts
+  in that directory, which is checked like the checkout's own.
 
 A build step that is a Neovim command (`":TSUpdate"`), a Lua function or a Lua
 expression that picks a command (`vim.g.x and "cargo build"`) is noted on the

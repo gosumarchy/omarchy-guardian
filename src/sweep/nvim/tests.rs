@@ -693,6 +693,95 @@ fn a_submodule_fetches_only_from_where_gitmodules_says() {
 }
 
 #[test]
+fn a_checked_out_submodule_is_no_finding_and_other_inner_gits_are() {
+    let temp = TempDir::new("nvim-submodule-layout");
+    let root = temp.path();
+    let url = "https://github.com/o/x";
+    plugin(root, "p", "https://github.com/folke/flash.nvim", &[]);
+    // As `git clone --recurse-submodules` leaves it.
+    let config = format!("{CLONE_CONFIG}[submodule \"deps/x\"]\n\tactive = true\n\turl = {url}\n");
+    write(root, &format!("{LAZY}/p/.git/config"), &config);
+    write(
+        root,
+        &format!("{LAZY}/p/.gitmodules"),
+        &format!("[submodule \"deps/x\"]\n\tpath = deps/x\n\turl = {url}\n"),
+    );
+    let module = format!("{LAZY}/p/.git/modules/deps/x");
+    write(
+        root,
+        &format!("{module}/config"),
+        &format!(
+            "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\
+             \tlogallrefupdates = true\n\tworktree = ../../../../deps/x\n\
+             [remote \"origin\"]\n\turl = {url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n\
+             [branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n"
+        ),
+    );
+    write(root, &format!("{module}/HEAD"), &format!("{COMMIT}\n"));
+    let pointer = format!("{LAZY}/p/deps/x/.git");
+    write(root, &pointer, "gitdir: ../../.git/modules/deps/x\n");
+    write(root, &format!("{LAZY}/p/deps/x/init.lua"), "return 1");
+    let runs = |root: &Path| -> Vec<String> {
+        collected(root).items[0]
+            .alerts
+            .iter()
+            .filter(|(rule, _)| *rule == RuleId::GitConfigCommand)
+            .map(|(_, message)| message.clone())
+            .collect()
+    };
+    assert_eq!(runs(root), Vec::<String>::new());
+
+    // A pointer from a directory `.gitmodules` does not give that
+    // submodule, or to a submodule directory that is not there, is not.
+    write(
+        root,
+        &format!("{LAZY}/p/deps/y/.git"),
+        "gitdir: ../../.git/modules/deps/x\n",
+    );
+    write(
+        root,
+        &format!("{LAZY}/p/.gitmodules"),
+        &format!(
+            "[submodule \"deps/x\"]\n\tpath = deps/x\n\turl = {url}\n\
+             [submodule \"deps/z\"]\n\tpath = deps/z\n\turl = {url}\n"
+        ),
+    );
+    write(
+        root,
+        &format!("{LAZY}/p/deps/z/.git"),
+        "gitdir: ../../.git/modules/deps/z\n",
+    );
+    let found = runs(root);
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(found[0].contains("deps/y/.git") && found[1].contains("deps/z/.git"));
+    fs::remove_file(root.join(LAZY).join("p/deps/y/.git")).unwrap();
+    fs::remove_file(root.join(LAZY).join("p/deps/z/.git")).unwrap();
+
+    // A pointer anywhere else, or with more in it, is a finding.
+    for text in [
+        "gitdir: ../../elsewhere\n",
+        "gitdir: /home/u/.git/modules/deps/x\n",
+        "gitdir: ../../.git/modules/deps/x\nmore\n",
+    ] {
+        write(root, &pointer, text);
+        let found = runs(root);
+        assert!(
+            found.len() == 1 && found[0].contains("deps/x/.git"),
+            "{text}: {found:?}"
+        );
+    }
+
+    // So is a git directory in the tree.
+    fs::remove_file(root.join(&pointer)).unwrap();
+    write(root, &format!("{pointer}/HEAD"), &format!("{COMMIT}\n"));
+    let found = runs(root);
+    assert!(
+        found.len() == 1 && found[0].contains("deps/x/.git"),
+        "{found:?}"
+    );
+}
+
+#[test]
 fn every_origin_url_after_the_first_is_a_finding() {
     let one = "[remote \"origin\"]\n\turl = https://github.com/folke/flash.nvim.git\n";
     let twice = format!("{CLONE_CONFIG}{one}");

@@ -13,7 +13,8 @@
 //! them. Plain data (objects, refs, the index, logs and the other names in
 //! `checkout::PLAIN_DATA`) changes with every update and is only read by
 //! git; anything else in a git directory, an entry there of a kind it
-//! should not be, and a `.git` below the top of the checkout are findings.
+//! should not be, and a `.git` below the top of the checkout (but a
+//! submodule's pointer, see `checkout::is_submodule_pointer`) are findings.
 //! What a checkout says is read as files and never by running git: the
 //! origin from `.git/config` and `.git/config.worktree`, the commit from
 //! `.git/HEAD` and the refs, and the commit `lazy-lock.json` pins.

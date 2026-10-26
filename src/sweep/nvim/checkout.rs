@@ -107,7 +107,8 @@ pub(super) enum Remote {
     /// `.git/config` names no origin.
     Unnamed,
     /// `.git/config` could not be read, or can be read more than one way
-    /// where it names the origin; said as not checked.
+    /// where it names the origin: said as not checked, and a
+    /// plugin-source finding.
     Unread,
 }
 
@@ -330,9 +331,13 @@ fn git(root: &Path, path: &str, inner: Vec<String>, unchecked: &mut Vec<String>)
     let Gits {
         mut runs,
         mut hooks,
+        gitmodules,
         ..
     } = gits;
-    runs.extend(inner.into_iter().map(|file| Run {
+    let inner = inner
+        .into_iter()
+        .filter(|file| !is_submodule_pointer(root, path, file, gitmodules.as_deref()));
+    runs.extend(inner.map(|file| Run {
         file,
         line: None,
         what: "a git directory or pointer below the checkout; git may run its configuration and hooks".into(),
@@ -662,9 +667,7 @@ fn cloned(
         ("remote", "url") => match git.strip_prefix(".git/modules/") {
             None => origin,
             Some(name) => {
-                origin
-                    && !name.contains("/modules/")
-                    && gitmodules_url(gitmodules, name).is_some_and(|url| url == value)
+                origin && !name.contains("/modules/") && is_gitmodules_url(gitmodules, name, value)
             }
         },
         // A filter only tells the server what to leave out.
@@ -678,9 +681,7 @@ fn cloned(
         // the working tree and so hashed and reviewed when it changes. A
         // submodule's own submodules are not matched against theirs.
         ("submodule", "url") => match &found.subsection {
-            Some(name) if git == ".git" => {
-                gitmodules_url(gitmodules, name).is_some_and(|url| url == value)
-            }
+            Some(name) if git == ".git" => is_gitmodules_url(gitmodules, name, value),
             _ => false,
         },
         ("submodule", "active") => match found.subsection {
@@ -693,14 +694,68 @@ fn cloned(
     }
 }
 
-/// The url `.gitmodules` gives the submodule `name`, if it gives one, read
-/// one way.
-fn gitmodules_url(gitmodules: Option<&str>, name: &str) -> Option<String> {
-    let urls = git_state::values(gitmodules?, "submodule", Some(name), "url");
-    match <[_; 1]>::try_from(urls) {
-        Ok([(_, url, Reading::Sure)]) => Some(url),
-        Ok([(_, _, Reading::OneOfSeveral)]) | Err(_) => None,
+/// Whether `.gitmodules` gives the submodule `name` exactly one url, read
+/// one way, and that url is `value`.
+fn is_gitmodules_url(gitmodules: Option<&str>, name: &str, value: &str) -> bool {
+    let Some(gitmodules) = gitmodules else {
+        return false;
+    };
+    let urls = git_state::values(gitmodules, "submodule", Some(name), "url");
+    matches!(urls.as_slice(), [(_, url, Reading::Sure)] if url == value)
+}
+
+/// Whether `file`, a `.git` below the checkout `plugin` (relative to it),
+/// is what `git clone --recurse-submodules` writes for a submodule: a file
+/// whose only line is `gitdir: <path>`, where the path leads from its
+/// directory to `.git/modules/<name>` of this checkout, which is checked
+/// like the checkout's own, and `.gitmodules` gives `<name>` that
+/// directory as its path. A submodule of a submodule is not matched.
+fn is_submodule_pointer(root: &Path, plugin: &str, file: &str, gitmodules: Option<&str>) -> bool {
+    let (Some(directory), Some(gitmodules)) = (file.strip_suffix("/.git"), gitmodules) else {
+        return false;
+    };
+    let Some(text) = text(root, &format!("{plugin}/{file}"), MAX_GIT_FILE) else {
+        return false;
+    };
+    let Some(target) = text
+        .strip_suffix('\n')
+        .unwrap_or(&text)
+        .strip_prefix("gitdir: ")
+        .filter(|target| !target.contains('\n'))
+    else {
+        return false;
+    };
+    let Some(name) = joined(directory, target)
+        .and_then(|joined| joined.strip_prefix(".git/modules/").map(str::to_string))
+    else {
+        return false;
+    };
+    let paths = git_state::values(gitmodules, "submodule", Some(&name), "path");
+    let is_dir = fs::symlink_metadata(root.join(format!("{plugin}/.git/modules/{name}")))
+        .is_ok_and(|metadata| metadata.is_dir());
+    is_dir
+        && !name.contains("/modules/")
+        && matches!(paths.as_slice(), [(_, path, Reading::Sure)] if path == directory)
+}
+
+/// `relative` taken from the directory `base` (both relative to the
+/// checkout, `/`-separated), or `None` where it is absolute or leaves the
+/// checkout.
+fn joined(base: &str, relative: &str) -> Option<String> {
+    if relative.starts_with('/') {
+        return None;
     }
+    let mut parts: Vec<&str> = base.split('/').filter(|part| !part.is_empty()).collect();
+    for part in relative.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            part => parts.push(part),
+        }
+    }
+    Some(parts.join("/"))
 }
 
 /// Whether `value` is the refspec a clone gives origin:
