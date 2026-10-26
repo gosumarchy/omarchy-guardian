@@ -3,7 +3,7 @@
 //! like any other source, with the review memory, so an unchanged system
 //! costs no AI call on the next sweep.
 
-mod secrets;
+pub(super) mod secrets;
 mod variables;
 
 use std::fmt::Write as _;
