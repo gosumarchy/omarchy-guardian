@@ -461,7 +461,7 @@ fn advisories_follow_the_reports_class() {
             severity: None,
             summary: None,
         }],
-        truncated: false,
+        truncated: Vec::new(),
     });
     assert_eq!(aur.decide(&standard), Decision::Blocked(Blocked::Findings));
     assert_eq!(aur.counts().medium, 1);

@@ -353,7 +353,7 @@ fn a_low_finding_where_a_local_rule_matched_is_no_remark() {
             severity: None,
             summary: None,
         }],
-        truncated: false,
+        truncated: Vec::new(),
     });
     assert_eq!(advised.decide(&standard), FINDINGS);
     assert_eq!(advised.remark_count(), 2);

@@ -17,9 +17,10 @@
 //! where it is installed, named by its manifest, ecosystem and name; its
 //! text is the version, so a new version is a changed item.
 
+mod config;
 mod inventory;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::collect::{Body, Item, Origin, Scope};
 use super::tier::Tier;
@@ -29,7 +30,8 @@ use crate::error::Error;
 use crate::osv::{self, Audit};
 use crate::rules::RuleId;
 use crate::sha256::Sha256;
-use inventory::{Installed, Inventory, Package, Places};
+use config::Places;
+use inventory::{Installed, Inventory, Package};
 
 /// The ecosystems the inventory reads, each asked about on its own.
 const ECOSYSTEMS: [Ecosystem; 3] = [Ecosystem::Npm, Ecosystem::PyPi, Ecosystem::CratesIo];
@@ -47,7 +49,7 @@ type Lookup<'a> = &'a dyn Fn(&[Dependency]) -> Result<Audit, Error>;
 type Malicious = BTreeMap<Package, Vec<String>>;
 
 /// What the check found.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct Packages {
     /// One item for each malicious package where it is installed.
     pub(super) items: Vec<Item>,
@@ -138,22 +140,29 @@ fn ask(
             return;
         }
     };
-    if audit.truncated {
+    // The advisories past OSV's first page for a package were not seen:
+    // that package is not checked, whatever the first page held.
+    for truncated in &audit.truncated {
         unchecked.push(format!(
-            "OSV listed more advisories for some {ecosystem} packages than one answer holds: the rest were not checked"
+            "OSV listed more advisories for {ecosystem} package {} {} than one answer holds: the rest were not checked",
+            truncated.name, truncated.version
         ));
     }
+    let mut by_package: HashMap<(&str, &str), Vec<String>> = HashMap::new();
+    for advisory in audit
+        .advisories
+        .iter()
+        .filter(|advisory| is_malicious_id(&advisory.id))
+    {
+        by_package
+            .entry((advisory.package.as_str(), advisory.version.as_str()))
+            .or_default()
+            .push(advisory.id.clone());
+    }
     for package in batch {
-        let ids = audit
-            .advisories
-            .iter()
-            .filter(|advisory| {
-                advisory.package == package.name
-                    && advisory.version == package.version
-                    && is_malicious_id(&advisory.id)
-            })
-            .map(|advisory| advisory.id.clone())
-            .collect();
+        let ids = by_package
+            .remove(&(package.name.as_str(), package.version.as_str()))
+            .unwrap_or_default();
         malicious.insert((*package).clone(), ids);
     }
 }

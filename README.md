@@ -40,8 +40,8 @@ it shows on hover:
   written secret values and URL passwords out of what it sends. A secret
   anywhere else goes with its file. Package names and versions from lockfiles
   go to the OSV API (`api.osv.dev`), and so do the ecosystem, name and version
-  of each npm, pipx and cargo package the sweep finds installed outside pacman
-  ([Language packages](docs/system-sweep.md#language-packages)); an AUR
+  of each npm, pipx and cargo package from the public registries the sweep
+  finds installed outside pacman ([Language packages](docs/system-sweep.md#language-packages)); an AUR
   package's name goes to the AUR. The `local-only` level sends nothing to an AI; the OSV and AUR lookups
   remain. Once a day the sweep asks the project's repository on GitHub for
   its release tags, sending nothing about your machine (`[update] check =

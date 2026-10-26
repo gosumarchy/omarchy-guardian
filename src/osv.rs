@@ -40,8 +40,8 @@ pub(crate) struct Advisory {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Audit {
     pub(crate) advisories: Vec<Advisory>,
-    /// OSV had more advisories for some package than one response lists.
-    pub(crate) truncated: bool,
+    /// The packages OSV had more advisories for than one response lists.
+    pub(crate) truncated: Vec<Dependency>,
 }
 
 /// Looks `packages` up in OSV and fetches the details of what it lists.
@@ -113,7 +113,9 @@ fn collect_batch(response: &Json, batch: &[Dependency], audit: &mut Audit) -> Re
     }
 
     for (dependency, result) in batch.iter().zip(results) {
-        audit.truncated |= result.get("next_page_token").is_some();
+        if result.get("next_page_token").is_some() {
+            audit.truncated.push(dependency.clone());
+        }
         let vulnerabilities = result
             .get("vulns")
             .and_then(Json::as_array)
@@ -290,7 +292,7 @@ mod tests {
         collect_batch(&response, &batch, &mut audit).unwrap();
         assert_eq!(audit.advisories.len(), 1);
         assert_eq!(audit.advisories[0].package, "a");
-        assert!(audit.truncated);
+        assert_eq!(audit.truncated, [dependency("a")]);
     }
 
     #[test]

@@ -423,7 +423,7 @@ impl Report {
                 painter.paint("  Known dependency vulnerabilities", "1")
             );
             let _ = writeln!(text, "{}", table.render(width, 2, painter));
-            if audit.truncated {
+            if !audit.truncated.is_empty() {
                 text.push_str("  … OSV reported more advisories than it returned in one page\n");
             }
         }

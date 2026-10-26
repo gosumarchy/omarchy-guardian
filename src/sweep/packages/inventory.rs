@@ -2,16 +2,24 @@
 //! files their tools leave behind: `package.json` in a global
 //! `node_modules`, `*.dist-info/METADATA` in a Python environment, and
 //! cargo's `.crates2.json`. No tool is run and no link is followed: a
-//! linked package directory (what `npm link` makes) is said, not read.
+//! linked package directory (what `npm link` makes) or environment is
+//! said, not read.
+//!
+//! A package that came from somewhere other than the public registry
+//! (see `config`) is not taken: its name may be private, and it goes to no
+//! one. It is said as not checked.
 
-use std::env;
+use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::path::{Component, Path};
+use std::path::Path;
+use std::rc::Rc;
 
+use super::config::{self, NpmConfig, Places};
 use crate::deps::Ecosystem;
 use crate::files::read_small_file;
 use crate::json::Json;
+use crate::text;
 
 /// The most packages taken in one sweep. Arbitrary: well above the global
 /// installs of a heavy developer machine, and 40 requests to OSV.
@@ -26,18 +34,14 @@ const MAX_ENTRIES: usize = 100_000;
 /// levels is rare; 8 is arbitrary.
 const MAX_NODE_DEPTH: usize = 8;
 
-/// The largest `package.json` or `METADATA` read. `METADATA` carries the
-/// package's whole description after its headers; 2 MiB is arbitrary and
-/// far above what packages ship.
+/// The largest `package.json`, `METADATA` or `pipx_metadata.json` read.
+/// `METADATA` carries the package's whole description after its headers;
+/// 2 MiB is arbitrary and far above what packages ship.
 const MAX_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
 
-/// The largest `.crates2.json` read: about 1 KiB per crate, so 8 MiB is
-/// arbitrary room for thousands.
-const MAX_CRATES_BYTES: u64 = 8 * 1024 * 1024;
-
-/// The largest npm configuration file read. Arbitrary: such a file holds
-/// a few lines.
-const MAX_NPMRC_BYTES: u64 = 1024 * 1024;
+/// The largest `.crates2.json` or npm hidden lockfile read: about 1 KiB
+/// per package, so 8 MiB is arbitrary room for thousands.
+const MAX_LIST_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The longest name or version taken as a registry's. npm allows 214
 /// characters for a name; 256 is arbitrary room above that.
@@ -53,13 +57,8 @@ const CRATES_IO: &[&str] = &[
     "sparse+https://index.crates.io/",
 ];
 
-/// npm's global configuration files: the one npm reads under its prefix
-/// (`/usr`) and the one Arch's npm is built to read. The user's own file is
-/// read after them and wins, as in npm.
-const GLOBAL_NPMRC: &[&str] = &["usr/etc/npmrc", "etc/npmrc"];
-
 /// One package as OSV names it.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Package {
     pub(super) ecosystem: Ecosystem,
     pub(super) name: String,
@@ -67,7 +66,7 @@ pub(super) struct Package {
 }
 
 /// An installed package and where it was read.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(super) struct Installed {
     pub(super) package: Package,
     /// The manifest it was read from, relative to the root.
@@ -78,82 +77,28 @@ pub(super) struct Installed {
 #[derive(Debug, Default)]
 pub(super) struct Inventory {
     pub(super) installed: Vec<Installed>,
-    /// What could not be read, or lay past a limit, each as a sentence:
-    /// those packages are not checked.
+    /// What could not be read, lay past a limit or came from a registry
+    /// that may be private, each as a sentence: those packages are not
+    /// checked.
     pub(super) unchecked: Vec<String>,
-    /// What is left out by design, each as a sentence: a linked package, a
-    /// crate from git, a mise tool whose backend OSV has no ecosystem for.
+    /// What is left out by design, each as a sentence: a link, a mise tool
+    /// whose backend OSV has no ecosystem for.
     pub(super) notes: Vec<String>,
     /// npm is installed and its configuration lets packages run their
     /// install scripts.
     pub(super) npm_runs_scripts: bool,
 }
 
-/// Where the tools keep what they installed, relative to the root.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Places {
-    /// mise's data directory (`MISE_DATA_DIR`).
-    pub(super) mise: Option<String>,
-    /// cargo's home (`CARGO_HOME`).
-    pub(super) cargo: Option<String>,
-    /// pipx's home (`PIPX_HOME`).
-    pub(super) pipx: Option<String>,
-    /// The user's npm configuration (`NPM_CONFIG_USERCONFIG`).
-    pub(super) npmrc: Option<String>,
-    /// The home directory, which `~` in npm's `prefix` stands for.
-    pub(super) home: Option<String>,
-}
-
-impl Places {
-    /// The tools' own defaults under `home` (relative to the root).
-    pub(super) fn defaults(home: Option<&str>) -> Self {
-        let under = |rest: &str| home.map(|home| format!("{home}/{rest}"));
-        Self {
-            mise: under(".local/share/mise"),
-            cargo: under(".cargo"),
-            pipx: under(".local/share/pipx"),
-            npmrc: under(".npmrc"),
-            home: home.map(str::to_string),
-        }
-    }
-
-    /// The defaults, with each place the environment moves elsewhere. A
-    /// variable that is not an absolute path without `..` is ignored.
-    pub(super) fn from_env(home: Option<&str>) -> Self {
-        let mut places = Self::defaults(home);
-        let moved = [
-            ("MISE_DATA_DIR", &mut places.mise),
-            ("CARGO_HOME", &mut places.cargo),
-            ("PIPX_HOME", &mut places.pipx),
-            ("NPM_CONFIG_USERCONFIG", &mut places.npmrc),
-        ];
-        for (variable, place) in moved {
-            if let Some(path) = env::var(variable).ok().as_deref().and_then(from_root) {
-                *place = Some(path);
-            }
-        }
-        places
-    }
-}
-
-/// `path`, absolute and without `..`, relative to `/`.
-fn from_root(path: &str) -> Option<String> {
-    let absolute = Path::new(path).is_absolute()
-        && !Path::new(path)
-            .components()
-            .any(|component| component == Component::ParentDir);
-    let relative = path.trim_matches('/');
-    (absolute && !relative.is_empty()).then(|| relative.to_string())
-}
-
 /// Reads what is installed under `root` in `places`.
 pub(super) fn collect(root: &Path, places: &Places) -> Inventory {
-    let npm = npm_config(root, places);
-    let mut walk = Walk::new(root);
+    let npm = NpmConfig::read(root, places);
+    let pip_other_index = config::pip_uses_other_index(root, places);
+    let mut walk = Walk::new(root, &npm, pip_other_index);
 
     let mut global = vec!["usr/lib/node_modules".to_string()];
     global.extend(
         npm.prefix
+            .as_ref()
             .map(|prefix| format!("{prefix}/lib/node_modules")),
     );
     global.dedup();
@@ -175,67 +120,21 @@ pub(super) fn collect(root: &Path, places: &Places) -> Inventory {
     walk.finish(npm_installed && !npm.ignore_scripts)
 }
 
-/// What npm's configuration files say that the inventory needs. These files
-/// hold registry tokens: only these two keys are taken, and nothing of them
-/// is shown or sent.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct NpmConfig {
-    /// Where global packages go, relative to the root.
-    prefix: Option<String>,
-    ignore_scripts: bool,
-}
-
-fn npm_config(root: &Path, places: &Places) -> NpmConfig {
-    let mut config = NpmConfig::default();
-    let files = GLOBAL_NPMRC
-        .iter()
-        .map(|file| (*file).to_string())
-        .chain(places.npmrc.clone());
-    for file in files {
-        let Some(text) = read_small_file(&root.join(file), MAX_NPMRC_BYTES) else {
-            continue;
-        };
-        for (key, value) in text.lines().filter_map(npmrc_setting) {
-            match key {
-                "prefix" => config.prefix = npm_prefix(value, places.home.as_deref()),
-                "ignore-scripts" => config.ignore_scripts = value == "true",
-                _ => {}
-            }
-        }
-    }
-    config
-}
-
-/// The key and value of one line of an npm configuration file, which is
-/// INI: `key = value`, comments after `;` or `#`, values maybe quoted.
-fn npmrc_setting(line: &str) -> Option<(&str, &str)> {
-    let line = line.trim();
-    if line.starts_with([';', '#']) {
-        return None;
-    }
-    let (key, value) = line.split_once('=')?;
-    Some((key.trim(), value.trim().trim_matches(['"', '\''])))
-}
-
-/// npm's `prefix`, relative to the root: an absolute path, or one under the
-/// home written as `~/`, `$HOME/` or `${HOME}/`.
-fn npm_prefix(value: &str, home: Option<&str>) -> Option<String> {
-    let in_home = ["~/", "$HOME/", "${HOME}/"]
-        .iter()
-        .find_map(|start| value.strip_prefix(start));
-    match (in_home, home) {
-        (Some(rest), Some(home)) => from_root(&format!("/{home}/{rest}")),
-        (Some(_), None) => None,
-        (None, _) => from_root(value),
-    }
-}
-
 /// What a directory entry is, without following a link.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Entry {
     Directory,
     Link,
     Other,
+}
+
+/// Whether a package came from the public registry of its ecosystem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Source {
+    Public,
+    /// Another registry or index, an address, git or a local path: its
+    /// name may be private.
+    Elsewhere,
 }
 
 /// How mise installed a tool, by the name of its directory under
@@ -269,30 +168,45 @@ impl Backend {
     }
 }
 
+/// What an npm hidden lockfile (`node_modules/.package-lock.json`)
+/// records of the address each package below it came from, by its path
+/// relative to `base`, the directory that holds that `node_modules`.
+#[derive(Debug)]
+struct Lock {
+    base: String,
+    resolved: HashMap<String, String>,
+}
+
 /// A walk over the places packages are kept, within the limits.
 struct Walk<'a> {
     root: &'a Path,
+    npm: &'a NpmConfig,
+    /// pip's configuration names an index other than the Python Package Index.
+    pip_other_index: bool,
     inventory: Inventory,
     entries: usize,
-    /// A limit was reached: nothing more is taken.
+    /// A limit was reached: nothing more is read.
     full: bool,
     /// A `node_modules` lay deeper than `MAX_NODE_DEPTH`.
     too_deep: bool,
-    /// Manifests (or the directories that should hold one) that could not
-    /// be read or named no package.
+    /// Manifests, directories and environments that could not be read or
+    /// named no package.
     unreadable: Vec<String>,
-    /// Package directories that are links.
+    /// Package directories, environments and directories on the way to
+    /// them that are links.
     linked: Vec<String>,
-    /// Crates from git, a path or another registry.
+    /// Packages from somewhere other than the public registry.
     elsewhere: Vec<String>,
     /// mise tools whose backend OSV has no ecosystem for.
     skipped: Vec<String>,
 }
 
 impl<'a> Walk<'a> {
-    fn new(root: &'a Path) -> Self {
+    fn new(root: &'a Path, npm: &'a NpmConfig, pip_other_index: bool) -> Self {
         Self {
             root,
+            npm,
+            pip_other_index,
             inventory: Inventory::default(),
             entries: 0,
             full: false,
@@ -304,9 +218,30 @@ impl<'a> Walk<'a> {
         }
     }
 
-    /// The entries of directory `rel`, sorted; none when it does not
-    /// exist. One that exists and cannot be listed is unreadable.
+    /// What is at `rel`, without following a link; `None` when nothing is.
+    /// A link is said.
+    fn entry(&mut self, rel: &str) -> Option<Entry> {
+        let metadata = fs::symlink_metadata(self.root.join(rel)).ok()?;
+        Some(if metadata.file_type().is_symlink() {
+            self.linked.push(rel.to_string());
+            Entry::Link
+        } else if metadata.is_dir() {
+            Entry::Directory
+        } else {
+            Entry::Other
+        })
+    }
+
+    /// The entries of directory `rel`, sorted; none when it does not exist
+    /// or is a link (which is said). One that cannot be listed is
+    /// unreadable.
     fn list(&mut self, rel: &str) -> Vec<(String, Entry)> {
+        // `read_dir` follows a link at the end of the path; the check
+        // before it keeps it from doing so (a link swapped in between is
+        // a race only a program already running as the user can run).
+        if self.full || self.entry(rel) != Some(Entry::Directory) {
+            return Vec::new();
+        }
         let listing = match fs::read_dir(self.root.join(rel)) {
             Ok(listing) => listing,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Vec::new(),
@@ -316,6 +251,7 @@ impl<'a> Walk<'a> {
             }
         };
         let mut found = Vec::new();
+        let mut broken = false;
         for entry in listing {
             if self.entries >= MAX_ENTRIES {
                 self.full = true;
@@ -323,12 +259,11 @@ impl<'a> Walk<'a> {
             }
             self.entries += 1;
             let Ok(entry) = entry else {
-                self.unreadable.push(rel.to_string());
+                broken = true;
                 continue;
             };
             let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                self.unreadable
-                    .push(format!("{rel}/{}", entry.file_name().to_string_lossy()));
+                broken = true;
                 continue;
             };
             // `DirEntry::file_type` does not follow a link.
@@ -337,36 +272,40 @@ impl<'a> Walk<'a> {
                 Ok(kind) if kind.is_dir() => Entry::Directory,
                 Ok(_) => Entry::Other,
                 Err(_) => {
-                    self.unreadable.push(format!("{rel}/{name}"));
+                    broken = true;
                     continue;
                 }
             };
             found.push((name, kind));
         }
+        if broken {
+            self.unreadable.push(rel.to_string());
+        }
         found.sort();
         found
     }
 
-    /// Takes in one package, unless its name or version is no registry's.
-    fn add(&mut self, ecosystem: Ecosystem, name: &str, version: &str, manifest: &str) {
-        if !is_registry_word(name) || !is_registry_word(version) {
+    /// Takes in one package from `source`, unless its name or version is
+    /// no registry's.
+    fn add(&mut self, package: Package, manifest: &str, source: Source) {
+        if !is_registry_word(&package.name) || !is_registry_word(&package.version) {
             self.unreadable.push(manifest.to_string());
+            return;
+        }
+        if source == Source::Elsewhere {
+            self.elsewhere.push(package.name);
             return;
         }
         if self.inventory.installed.len() >= MAX_PACKAGES {
             self.full = true;
             return;
         }
-        let name = match ecosystem {
-            Ecosystem::PyPi => canonical_python_name(name),
-            Ecosystem::CratesIo | Ecosystem::Npm | Ecosystem::Go => name.to_string(),
+        let name = match package.ecosystem {
+            Ecosystem::PyPi => canonical_python_name(&package.name),
+            Ecosystem::CratesIo | Ecosystem::Npm | Ecosystem::Go => package.name,
         };
         self.inventory.installed.push(Installed {
-            package: Package {
-                ecosystem,
-                name,
-                version: version.to_string(),
-            },
+            package: Package { name, ..package },
             manifest: manifest.to_string(),
         });
     }
@@ -374,22 +313,49 @@ impl<'a> Walk<'a> {
     /// Every package in the `node_modules` directory `top`, and in their
     /// own `node_modules` below them.
     fn node_modules(&mut self, top: &str) {
-        let mut pending = vec![(top.to_string(), 0)];
-        while let Some((directory, depth)) = pending.pop() {
+        let mut pending: Vec<(String, usize, Option<Rc<Lock>>)> = vec![(top.to_string(), 0, None)];
+        while let Some((directory, depth, inherited)) = pending.pop() {
+            let lock = self.lock(&directory).map(Rc::new).or(inherited);
             for package in self.packages_in(&directory) {
                 if self.full {
                     return;
                 }
-                let Some(nested) = self.npm_package(&package) else {
+                let Some(nested) = self.npm_package(&package, lock.as_deref()) else {
                     continue;
                 };
                 if depth + 1 < MAX_NODE_DEPTH {
-                    pending.push((nested, depth + 1));
+                    pending.push((nested, depth + 1, lock.clone()));
                 } else {
                     self.too_deep = true;
                 }
             }
         }
+    }
+
+    /// The hidden lockfile npm keeps in `node_modules`, if there is one
+    /// that can be read.
+    fn lock(&self, node_modules: &str) -> Option<Lock> {
+        let text = read_small_file(
+            &self.root.join(format!("{node_modules}/.package-lock.json")),
+            MAX_LIST_BYTES,
+        )?;
+        let json = Json::parse(&text).ok()?;
+        let resolved = json
+            .get("packages")?
+            .as_object()?
+            .iter()
+            .filter_map(|(path, entry)| {
+                let resolved = entry.get("resolved")?.as_str()?;
+                Some((path.clone(), resolved.to_string()))
+            })
+            .collect();
+        let base = node_modules
+            .strip_suffix("/node_modules")
+            .unwrap_or(node_modules);
+        Some(Lock {
+            base: base.to_string(),
+            resolved,
+        })
     }
 
     /// The package directories in the `node_modules` directory
@@ -419,9 +385,9 @@ impl<'a> Walk<'a> {
         packages
     }
 
-    /// Reads the npm package in `directory`; returns its own
-    /// `node_modules`, if it has one.
-    fn npm_package(&mut self, directory: &str) -> Option<String> {
+    /// Reads the npm package in `directory`, which `lock` may record;
+    /// returns its own `node_modules`, if it has one.
+    fn npm_package(&mut self, directory: &str, lock: Option<&Lock>) -> Option<String> {
         let manifest = format!("{directory}/package.json");
         let json = read_small_file(&self.root.join(&manifest), MAX_MANIFEST_BYTES)
             .and_then(|text| Json::parse(&text).ok());
@@ -431,38 +397,91 @@ impl<'a> Walk<'a> {
                 .and_then(Json::as_str)
                 .map(str::to_string)
         };
+        let from_lock = lock.and_then(|lock| {
+            let path = directory.strip_prefix(&format!("{}/", lock.base))?;
+            lock.resolved.get(path).cloned()
+        });
+        let resolved = from_lock.or_else(|| field("_resolved"));
         match (field("name"), field("version")) {
-            (Some(name), Some(version)) => self.add(Ecosystem::Npm, &name, &version, &manifest),
+            (Some(name), Some(version)) => {
+                let source = if self.npm.is_public(&name, resolved.as_deref()) {
+                    Source::Public
+                } else {
+                    Source::Elsewhere
+                };
+                let package = Package {
+                    ecosystem: Ecosystem::Npm,
+                    name,
+                    version,
+                };
+                self.add(package, &manifest, source);
+            }
             _ => self.unreadable.push(manifest),
         }
         let nested = format!("{directory}/node_modules");
-        fs::symlink_metadata(self.root.join(&nested))
-            .is_ok_and(|metadata| metadata.is_dir())
-            .then_some(nested)
+        (self.entry(&nested) == Some(Entry::Directory)).then_some(nested)
     }
 
     /// Every pipx environment under `venvs`.
     fn pipx(&mut self, venvs: &str) {
         for (venv, kind) in self.list(venvs) {
+            if self.full {
+                return;
+            }
             let path = format!("{venvs}/{venv}");
             match kind {
-                Entry::Directory if !self.pythons(&path) => self.unreadable.push(path),
+                Entry::Directory if !self.pipx_venv(&path) => self.unreadable.push(path),
                 Entry::Link => self.linked.push(path),
                 Entry::Directory | Entry::Other => {}
             }
         }
     }
 
-    /// Every `lib/python*/site-packages` of `environment`; returns whether
-    /// there was one.
-    fn pythons(&mut self, environment: &str) -> bool {
+    /// One pipx environment; returns whether it had a `site-packages`.
+    fn pipx_venv(&mut self, venv: &str) -> bool {
+        let source = if self.pip_other_index || self.pipx_other_index(venv) {
+            Source::Elsewhere
+        } else {
+            Source::Public
+        };
+        self.pythons(venv, source)
+    }
+
+    /// Whether pipx installed the environment `venv` with pip arguments
+    /// that name another index. Its record, when there is one, keeps them.
+    fn pipx_other_index(&self, venv: &str) -> bool {
+        let Some(json) = read_small_file(
+            &self.root.join(format!("{venv}/pipx_metadata.json")),
+            MAX_MANIFEST_BYTES,
+        )
+        .and_then(|text| Json::parse(&text).ok()) else {
+            return false;
+        };
+        let injected = json
+            .get("injected_packages")
+            .and_then(Json::as_object)
+            .unwrap_or_default()
+            .iter()
+            .map(|(_, package)| package);
+        json.get("main_package")
+            .into_iter()
+            .chain(injected)
+            .filter_map(|package| package.get("pip_args")?.as_array())
+            .any(|arguments| config::has_index_argument(arguments.iter().filter_map(Json::as_str)))
+    }
+
+    /// Every `lib/python*/site-packages` of `environment`, whose packages
+    /// came from `source`; returns whether there was one.
+    fn pythons(&mut self, environment: &str, source: Source) -> bool {
         let lib = format!("{environment}/lib");
         let mut found = false;
         for (python, kind) in self.list(&lib) {
             if kind == Entry::Directory && python.starts_with("python") {
                 let site = format!("{lib}/{python}/site-packages");
-                found |= fs::symlink_metadata(self.root.join(&site)).is_ok();
-                self.site_packages(&site);
+                if self.entry(&site) == Some(Entry::Directory) {
+                    found = true;
+                    self.site_packages(&site, source);
+                }
             }
         }
         found
@@ -470,8 +489,9 @@ impl<'a> Walk<'a> {
 
     /// Every package pip recorded in `site`, a `*.dist-info` directory
     /// each. An `*.egg-info` is not read: pip has not written one for an
-    /// install in years.
-    fn site_packages(&mut self, site: &str) {
+    /// install in years. One with a `direct_url.json` was installed from an
+    /// address or a local directory, not from an index.
+    fn site_packages(&mut self, site: &str, source: Source) {
         for (name, kind) in self.list(site) {
             if self.full {
                 return;
@@ -482,22 +502,33 @@ impl<'a> Walk<'a> {
             let manifest = format!("{site}/{name}/METADATA");
             let headers = read_small_file(&self.root.join(&manifest), MAX_MANIFEST_BYTES)
                 .and_then(|text| metadata(&text));
-            match headers {
-                Some((name, version)) => self.add(Ecosystem::PyPi, &name, &version, &manifest),
-                None => self.unreadable.push(manifest),
-            }
+            let Some((name, version)) = headers else {
+                self.unreadable.push(manifest);
+                continue;
+            };
+            let direct = fs::symlink_metadata(
+                self.root
+                    .join(manifest.replace("/METADATA", "/direct_url.json")),
+            )
+            .is_ok();
+            let package = Package {
+                ecosystem: Ecosystem::PyPi,
+                name,
+                version,
+            };
+            let source = if direct { Source::Elsewhere } else { source };
+            self.add(package, &manifest, source);
         }
     }
 
     /// Every crate cargo recorded in `file` (a `.crates2.json`), if there
     /// is one.
     fn crates(&mut self, file: &str) {
-        let path = self.root.join(file);
-        if fs::symlink_metadata(&path).is_err() {
+        if self.entry(file).is_none() {
             return;
         }
-        let json =
-            read_small_file(&path, MAX_CRATES_BYTES).and_then(|text| Json::parse(&text).ok());
+        let json = read_small_file(&self.root.join(file), MAX_LIST_BYTES)
+            .and_then(|text| Json::parse(&text).ok());
         let Some(installs) = json
             .as_ref()
             .and_then(|json| json.get("installs"))
@@ -510,13 +541,21 @@ impl<'a> Walk<'a> {
             if self.full {
                 return;
             }
-            match crate_key(key) {
-                Some((name, version, source)) if CRATES_IO.contains(&source) => {
-                    self.add(Ecosystem::CratesIo, name, version, file);
-                }
-                Some((name, _, _)) => self.elsewhere.push(name.to_string()),
-                None => self.unreadable.push(file.to_string()),
-            }
+            let Some((name, version, source)) = crate_key(key) else {
+                self.unreadable.push(file.to_string());
+                continue;
+            };
+            let package = Package {
+                ecosystem: Ecosystem::CratesIo,
+                name: name.to_string(),
+                version: version.to_string(),
+            };
+            let source = if CRATES_IO.contains(&source) {
+                Source::Public
+            } else {
+                Source::Elsewhere
+            };
+            self.add(package, file, source);
         }
     }
 
@@ -536,6 +575,9 @@ impl<'a> Walk<'a> {
             // mise links the short versions (`22`, `latest`) to a full
             // one, which is read under its own name.
             for (version, kind) in self.list(&directory) {
+                if self.full {
+                    return node;
+                }
                 if kind == Entry::Directory {
                     self.mise_tool(backend, &format!("{directory}/{version}"));
                     node |= backend == Backend::Node;
@@ -547,35 +589,41 @@ impl<'a> Walk<'a> {
 
     /// One version of one tool mise installed, in `directory`.
     fn mise_tool(&mut self, backend: Backend, directory: &str) {
-        match backend {
+        let found = match backend {
             Backend::Node | Backend::Npm => {
-                self.node_modules(&format!("{directory}/lib/node_modules"));
+                let lib = format!("{directory}/lib");
+                if self.entry(&lib) == Some(Entry::Directory) {
+                    self.node_modules(&format!("{lib}/node_modules"));
+                }
+                true
             }
             Backend::Cargo => {
                 let file = format!("{directory}/.crates2.json");
-                if fs::symlink_metadata(self.root.join(&file)).is_ok() {
-                    self.crates(&file);
-                } else {
-                    self.unreadable.push(file);
-                }
+                let there = self.entry(&file).is_some();
+                self.crates(&file);
+                there
             }
             Backend::Pipx => {
                 let venvs = format!("{directory}/venvs");
-                let mut found = self.pythons(directory);
+                let mut found = self.pipx_venv(directory);
                 for (venv, kind) in self.list(&venvs) {
                     if kind == Entry::Directory {
-                        found |= self.pythons(&format!("{venvs}/{venv}"));
+                        found |= self.pipx_venv(&format!("{venvs}/{venv}"));
                     }
                 }
-                if !found {
-                    self.unreadable.push(directory.to_string());
-                }
+                found
             }
             Backend::Python => {
-                if !self.pythons(directory) {
-                    self.unreadable.push(directory.to_string());
-                }
+                let source = if self.pip_other_index {
+                    Source::Elsewhere
+                } else {
+                    Source::Public
+                };
+                self.pythons(directory, source)
             }
+        };
+        if !found && !self.full {
+            self.unreadable.push(directory.to_string());
         }
     }
 
@@ -585,9 +633,16 @@ impl<'a> Walk<'a> {
         inventory.npm_runs_scripts = npm_runs_scripts;
         if !self.unreadable.is_empty() {
             inventory.unchecked.push(format!(
-                "{} language package manifest(s) or environment(s) could not be read or name no package and version, so those packages were not looked up in OSV: {}",
+                "{} language package manifest(s), director(ies) or environment(s) could not be read or name no package and version, so those packages were not looked up in OSV: {}",
                 self.unreadable.len(),
                 named(&self.unreadable, "/")
+            ));
+        }
+        if !self.elsewhere.is_empty() {
+            inventory.unchecked.push(format!(
+                "{} language package(s) are from a private registry or another index than the public one, an address, git or a local path, so they were not looked up in OSV (their names may be private) and are not checked: {}",
+                self.elsewhere.len(),
+                named(&self.elsewhere, "")
             ));
         }
         if self.full {
@@ -602,16 +657,9 @@ impl<'a> Walk<'a> {
         }
         if !self.linked.is_empty() {
             inventory.notes.push(format!(
-                "{} linked language package(s) were not followed or looked up in OSV (what `npm link` installs is a project of your own): {}",
+                "{} linked language package director(ies) or environment(s) were not followed or looked up in OSV (what `npm link` installs is a project of your own): {}",
                 self.linked.len(),
                 named(&self.linked, "/")
-            ));
-        }
-        if !self.elsewhere.is_empty() {
-            inventory.notes.push(format!(
-                "{} crate(s) installed from git, a path or another registry than crates.io are not looked up in OSV: {}",
-                self.elsewhere.len(),
-                named(&self.elsewhere, "")
             ));
         }
         if !self.skipped.is_empty() {
@@ -631,7 +679,7 @@ fn named(names: &[String], before: &str) -> String {
     let mut shown: Vec<String> = names
         .iter()
         .take(NAMED)
-        .map(|name| crate::text::shown(&format!("{before}{name}")).into_owned())
+        .map(|name| text::shown(&format!("{before}{name}")).into_owned())
         .collect();
     if names.len() > NAMED {
         shown.push("...".into());
@@ -695,9 +743,7 @@ fn crate_key(key: &str) -> Option<(&str, &str, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Places, canonical_python_name, crate_key, from_root, metadata, npm_prefix, npmrc_setting,
-    };
+    use super::{canonical_python_name, crate_key, metadata};
 
     #[test]
     fn names_and_keys_are_read_as_the_tools_write_them() {
@@ -716,32 +762,5 @@ mod tests {
             Some(("Black".into(), "24.1.0".into()))
         );
         assert_eq!(metadata("Name: x\n\nVersion: 1\n"), None);
-    }
-
-    #[test]
-    fn npm_settings_and_places_take_only_what_npm_would() {
-        assert_eq!(
-            npmrc_setting(" ignore-scripts = \"true\" "),
-            Some(("ignore-scripts", "true"))
-        );
-        assert_eq!(npmrc_setting("; ignore-scripts=true"), None);
-        assert_eq!(npmrc_setting("# ignore-scripts=true"), None);
-        assert_eq!(
-            npm_prefix("~/.npm-global", Some("home/u")).as_deref(),
-            Some("home/u/.npm-global")
-        );
-        assert_eq!(
-            npm_prefix("${HOME}/g", Some("home/u")).as_deref(),
-            Some("home/u/g")
-        );
-        assert_eq!(npm_prefix("/opt/npm/", None).as_deref(), Some("opt/npm"));
-        assert_eq!(npm_prefix("relative", Some("home/u")), None);
-        assert_eq!(npm_prefix("/a/../etc", Some("home/u")), None);
-        assert_eq!(from_root("/"), None);
-        assert_eq!(
-            Places::defaults(Some("home/u")).mise.as_deref(),
-            Some("home/u/.local/share/mise")
-        );
-        assert_eq!(Places::defaults(None).cargo, None);
     }
 }

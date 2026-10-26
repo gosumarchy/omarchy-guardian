@@ -436,35 +436,57 @@ What is read, never run, and never followed through a link:
 The variables are read from the sweep's own environment: the daily timer's
 sweep gets them only where they are set for your systemd user session.
 
-At every sweep the whole inventory goes to OSV: the ecosystem, the name and
-the version of each installed package, in requests of up to 500 packages per
+A package whose name may be private is not sent anywhere. Only packages from
+the public registry go to OSV: npm packages from `registry.npmjs.org` (or
+Yarn's copy of it), Python packages from PyPI, crates from crates.io. Where an
+npm package came from is read from npm's hidden lockfile
+(`node_modules/.package-lock.json`), from `_resolved` in its `package.json`,
+or else from the `registry` (or the scope's own `@scope:registry`) npm is set
+to use. A Python package installed from an address or a local directory (it
+has a `direct_url.json`), every package of a pipx environment installed with
+another index (`--index-url`, `--extra-index-url`, `--find-links`, as pipx
+records them), and every Python package at all where pip's configuration
+(`/etc/pip.conf`, `~/.config/pip/pip.conf`, `~/.pip/pip.conf`,
+`PIP_CONFIG_FILE`, `PIP_INDEX_URL` and the like) names an index other than
+PyPI or any extra index, are left out; so are crates from git, a path or
+another registry. What is left out this way is said as not checked, so a
+machine with such packages has an incomplete sweep.
+
+At every sweep the rest of the inventory goes to OSV: the ecosystem, the name
+and the version of each package, in requests of up to 500 packages per
 ecosystem (`api.osv.dev/v1/querybatch`, the lookup the gate uses for
 lockfiles), and nothing else. Nothing goes to the AI, the lookup costs no AI
-call, and there is no setting to turn it off, as there is none for the gate's.
-Nothing of OSV's answers is kept, so a package found malicious after it was
-installed is told at the next sweep.
+call, and there is no setting to turn it off: no profile, `local-only`
+included, stops the gate's OSV lookup either. Nothing of OSV's answers is
+kept, so a package found malicious after it was installed is told at the next
+sweep. `sweep allow` asks OSV again, to find the item it is told to allow.
 
 Each malicious package is an item where it is installed, named by its manifest,
 ecosystem and name (`/usr/lib/node_modules/x/package.json#npm:x`), with its
 version as what is remembered: a new version of it is a changed item, and an
 allow covers the version allowed.
 
-What is not checked makes the sweep incomplete: a manifest that cannot be read
-or names no package and version, an environment with no `site-packages`, more
-than 20,000 packages or 100,000 directory entries, npm packages nested deeper
-than 8 levels, and a request to OSV that failed (offline, OSV down), whose
-packages are each said as not checked, never as clear. A linked package directory (what `npm link` makes), a crate from
-git, a path or another registry, and an `*.egg-info` package are not looked up;
-the first two are named in a note.
+What is not checked makes the sweep incomplete: a manifest or directory that
+cannot be read or names no package and version, an environment with no
+`site-packages`, more than 20,000 packages or 100,000 directory entries, npm
+packages nested deeper than 8 levels, a package OSV listed more advisories for
+than one answer holds, and a request to OSV that failed (offline, OSV down),
+whose packages are each said as not checked, never as clear. A link on the way
+to a package (a package directory `npm link` made, a linked environment,
+`site-packages` or `node_modules`) is not followed, and a note names it. An
+`*.egg-info` package is not read.
 
-When npm is installed (`/usr/bin/npm`, or a node of mise's) and neither your
-`~/.npmrc` (or the file `NPM_CONFIG_USERCONFIG` names) nor `/etc/npmrc` or
-`/usr/etc/npmrc` sets `ignore-scripts=true`, a note says that npm runs the
-install scripts of every package it installs, which is how most malicious npm
-packages act, and how to turn them off (`npm config set ignore-scripts true`).
-It is said once, and again should it stop and come back. Only the `prefix` and
-`ignore-scripts` keys are taken from these files, which hold registry tokens;
-nothing of them is shown or sent.
+When npm is installed (`/usr/bin/npm`, or a node of mise's) and npm's
+configuration does not set `ignore-scripts=true` (`/usr/etc/npmrc`,
+`/etc/npmrc`, then your `~/.npmrc` or the file `npm_config_userconfig` names,
+then `npm_config_ignore_scripts` in the environment, each winning over the one
+before), a note says that npm runs the install scripts of every package it
+installs, which is how most malicious npm packages act, and how to turn them
+off (`npm config set ignore-scripts true`). It is said once, and again should
+it stop and come back. Only `prefix`, `ignore-scripts`, `registry` and the
+scopes' registries are taken from npm's files, and only the index settings
+from pip's; these files hold registry tokens, and nothing of them is shown or
+sent.
 
 ### Guardian's own units
 

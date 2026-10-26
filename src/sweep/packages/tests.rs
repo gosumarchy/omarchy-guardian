@@ -6,7 +6,8 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
 
-use super::inventory::{self, Inventory, Package, Places};
+use super::config::Places;
+use super::inventory::{self, Inventory, Package};
 use super::{INSTALL_SCRIPTS, Packages, look_up};
 use crate::autorun::Category;
 use crate::deps::{Dependency, Ecosystem};
@@ -150,7 +151,11 @@ impl FakeOsv {
                 })
                 .cloned()
                 .collect(),
-            truncated: self.truncated,
+            truncated: if self.truncated {
+                query.to_vec()
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -208,7 +213,7 @@ fn global_npm_packages_are_read_with_their_own_dependencies() {
         inventory
             .notes
             .iter()
-            .any(|note| note.starts_with("1 linked language package(s)")
+            .any(|note| note.starts_with("1 linked language package")
                 && note.contains("/usr/lib/node_modules/linked")),
         "{:?}",
         inventory.notes
@@ -310,7 +315,6 @@ fn pipx_cargo_mise_and_an_npm_prefix_are_read() {
         ]
     );
     let notes = inventory.notes.join("\n");
-    assert!(notes.contains("1 crate(s) installed from git"), "{notes}");
     assert!(
         notes.contains("1 mise tool(s)") && notes.contains("go"),
         "{notes}"
@@ -319,6 +323,11 @@ fn pipx_cargo_mise_and_an_npm_prefix_are_read() {
     let unchecked = inventory.unchecked.join("\n");
     assert!(
         unchecked.contains("/home/u/.local/share/pipx/venvs/empty"),
+        "{unchecked}"
+    );
+    assert!(
+        unchecked.contains("1 language package(s) are from a private registry")
+            && unchecked.contains("mine"),
         "{unchecked}"
     );
     assert!(!unchecked.contains("secret"), "{unchecked}");
@@ -352,6 +361,15 @@ fn the_user_npm_configuration_decides_about_install_scripts() {
     fs::remove_file(root.join("etc/npmrc")).unwrap();
     write(root, "home/u/elsewhere/npmrc", "ignore-scripts=true\n");
     assert!(!inventory::collect(root, &moved).npm_runs_scripts);
+
+    // The environment wins over every file.
+    let from_env = |value: &str| Places {
+        npm_env: vec![("ignore-scripts".into(), value.into())],
+        ..Places::defaults(Some(HOME))
+    };
+    assert!(inventory::collect(root, &from_env("false")).npm_runs_scripts);
+    write(root, "home/u/.npmrc", "ignore-scripts=false\n");
+    assert!(!inventory::collect(root, &from_env("true")).npm_runs_scripts);
 }
 
 #[test]
@@ -461,7 +479,11 @@ fn a_truncated_answer_is_said() {
 
     assert_eq!(packages.items.len(), 1);
     assert_eq!(packages.unchecked.len(), 1);
-    assert!(packages.unchecked[0].contains("more advisories"));
+    assert!(
+        packages.unchecked[0].contains("more advisories for npm package a 1.0.0"),
+        "{:?}",
+        packages.unchecked
+    );
 }
 
 #[test]
@@ -478,4 +500,187 @@ fn install_scripts_are_noted_once_npm_runs_them() {
     assert_eq!(packages.notes.len(), 1);
     assert!(packages.notes[0].starts_with(INSTALL_SCRIPTS));
     assert!(packages.notes[0].contains("ignore-scripts true"));
+}
+
+#[test]
+fn links_on_the_way_to_packages_are_said_and_not_followed() {
+    let root = TempDir::new("packages-links");
+    let root = root.path();
+    let elsewhere = root.join("elsewhere");
+    npm(root, "elsewhere/lib/node_modules/hidden", "hidden", "1.0.0");
+    python(root, "elsewhere/site", "planted", "1.0.0");
+    let installs = "home/u/.local/share/mise/installs";
+    fs::create_dir_all(root.join(format!("{installs}/node/22.1.0/lib"))).unwrap();
+    symlink(
+        elsewhere.join("lib/node_modules"),
+        root.join(format!("{installs}/node/22.1.0/lib/node_modules")),
+    )
+    .unwrap();
+    let python_lib = "home/u/.local/share/pipx/venvs/tool/lib/python3.12";
+    fs::create_dir_all(root.join(python_lib)).unwrap();
+    symlink(
+        elsewhere.join("site"),
+        root.join(format!("{python_lib}/site-packages")),
+    )
+    .unwrap();
+    let scope = "usr/lib/node_modules/@scope";
+    fs::create_dir_all(root.join(scope)).unwrap();
+    symlink(
+        elsewhere.join("lib/node_modules/hidden"),
+        root.join(format!("{scope}/x")),
+    )
+    .unwrap();
+
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+
+    assert_eq!(found(&inventory), []);
+    let notes = inventory.notes.join("\n");
+    assert!(notes.starts_with("3 linked language package"), "{notes}");
+    assert!(notes.contains("/usr/lib/node_modules/@scope/x"), "{notes}");
+}
+
+#[test]
+fn a_directory_that_cannot_be_listed_is_not_checked() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = TempDir::new("packages-closed");
+    let root = root.path();
+    let closed = root.join("usr/lib/node_modules/closed");
+    npm(
+        root,
+        "usr/lib/node_modules/closed/node_modules/x",
+        "x",
+        "1.0.0",
+    );
+    npm(root, "usr/lib/node_modules/closed", "closed", "1.0.0");
+    let nested = closed.join("node_modules");
+    fs::set_permissions(&nested, fs::Permissions::from_mode(0o000)).unwrap();
+    // Root reads what it likes: there is nothing to test as root.
+    let readable = fs::read_dir(&nested).is_ok();
+
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    fs::set_permissions(&nested, fs::Permissions::from_mode(0o755)).unwrap();
+
+    if readable {
+        return;
+    }
+    assert_eq!(found(&inventory), [(Ecosystem::Npm, "closed", "1.0.0")]);
+    let unchecked = inventory.unchecked.join("\n");
+    assert!(
+        unchecked.contains("/usr/lib/node_modules/closed/node_modules"),
+        "{unchecked}"
+    );
+}
+
+#[test]
+fn more_packages_than_the_limit_are_said() {
+    let root = TempDir::new("packages-limit");
+    let root = root.path();
+    let keys: Vec<String> = (0..20_001)
+        .map(|index| {
+            format!("c{index} 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)")
+        })
+        .collect();
+    let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+    crates(root, "home/u/.cargo/.crates2.json", &keys);
+
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+
+    assert_eq!(inventory.installed.len(), 20_000);
+    assert!(
+        inventory
+            .unchecked
+            .iter()
+            .any(|sentence| sentence.starts_with("more than 20000 language packages")),
+        "{:?}",
+        inventory.unchecked
+    );
+}
+
+#[test]
+fn mises_python_and_private_sources_are_told_apart() {
+    let root = TempDir::new("packages-private");
+    let root = root.path();
+    let installs = "home/u/.local/share/mise/installs";
+    let site = format!("{installs}/python/3.12.1/lib/python3.12/site-packages");
+    python(root, &site, "requests", "2.31.0");
+    python(root, &site, "inhouse", "1.0.0");
+    write(
+        root,
+        &format!("{site}/inhouse-1.0.0.dist-info/direct_url.json"),
+        r#"{"url":"file:///src/inhouse"}"#,
+    );
+    let top = "usr/lib/node_modules";
+    npm(root, &format!("{top}/tool"), "tool", "1.0.0");
+    npm(
+        root,
+        &format!("{top}/tool/node_modules/dep"),
+        "dep",
+        "1.0.0",
+    );
+    npm(
+        root,
+        &format!("{top}/tool/node_modules/corp-dep"),
+        "corp-dep",
+        "1.0.0",
+    );
+    write(
+        root,
+        &format!("{top}/tool/node_modules/.package-lock.json"),
+        r#"{"packages":{
+            "node_modules/dep":{"resolved":"https://registry.npmjs.org/dep/-/dep-1.0.0.tgz"},
+            "node_modules/corp-dep":{"resolved":"https://npm.corp.example/corp-dep-1.0.0.tgz"}
+        }}"#,
+    );
+    write(
+        root,
+        &format!("{top}/old/package.json"),
+        r#"{"name":"old","version":"1.0.0","_resolved":"git+ssh://git@example.com/old.git"}"#,
+    );
+    write(
+        root,
+        "home/u/.npmrc",
+        "@corp:registry=https://npm.corp.example/\n",
+    );
+    npm(root, &format!("{top}/@corp/cli"), "@corp/cli", "2.0.0");
+    let pipx = "home/u/.local/share/pipx/venvs/mirrored";
+    python(
+        root,
+        &format!("{pipx}/lib/python3.12/site-packages"),
+        "mirrored",
+        "1.0.0",
+    );
+    write(
+        root,
+        &format!("{pipx}/pipx_metadata.json"),
+        r#"{"main_package":{"pip_args":["--index-url","https://pypi.corp.example/simple"]}}"#,
+    );
+
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+
+    assert_eq!(
+        found(&inventory),
+        [
+            (Ecosystem::Npm, "dep", "1.0.0"),
+            (Ecosystem::Npm, "tool", "1.0.0"),
+            (Ecosystem::PyPi, "requests", "2.31.0"),
+        ]
+    );
+    let unchecked = inventory.unchecked.join("\n");
+    assert!(
+        unchecked.starts_with("5 language package(s) are from a private registry"),
+        "{unchecked}"
+    );
+
+    // An index of pip's own other than PyPI keeps every Python package out.
+    write(
+        root,
+        "home/u/.config/pip/pip.conf",
+        "[global]\nindex-url = https://pypi.corp.example/simple\n",
+    );
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    assert!(
+        found(&inventory)
+            .iter()
+            .all(|(ecosystem, ..)| *ecosystem == Ecosystem::Npm)
+    );
 }
