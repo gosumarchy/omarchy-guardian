@@ -27,8 +27,10 @@ it shows on hover:
   package install scriptlets and auto-run files, AUR recipes and their
   sources, themes, plugins, what you `scan`, and for the daily sweep the
   start-up files on this machine that no package vouches for, with the scripts
-  they run. Of an AI coding agent's configuration (Claude Code, OpenCode, Codex)
-  only what each hook, helper, MCP server or plugin starts is sent: its
+  they run, and the Lua, Vimscript, shell and build files of a Neovim plugin
+  that are new or changed since an earlier sweep. Of an AI coding agent's
+  configuration (Claude Code, OpenCode, Codex) only what each hook, helper,
+  MCP server or plugin starts is sent: its
   command line with secrets taken out only where they are the token-shaped
   value of a secret-named setting, flag or `Authorization` header, or the
   login in an address, the names of its variables, or a remote server's host;
@@ -52,7 +54,7 @@ it shows on hover:
   it found running only where it is plainly a script, keeps boot
   configuration with any boot secret it cannot mask from the AI, and takes
   plainly written secret values, URL passwords and GRUB password hashes out
-  of what it sends. A secret
+  of what it sends (only URL passwords for Neovim plugin code). A secret
   anywhere else goes with its file. Package names and versions from lockfiles
   go to the OSV API (`api.osv.dev`), and an AUR package's name goes to the
   AUR. The `local-only` level sends nothing to an AI; the OSV and AUR lookups
@@ -334,6 +336,9 @@ under [Limitations](docs/limitations.md):
   code, and other mounted filesystems are not searched for setuid files; as a
   user only your own processes can be looked at; without root checks every
   sweep is incomplete ([System sweep](docs/system-sweep.md)).
+- System sweep: the Neovim plugins the first sweep finds are taken as they
+  are and reviewed only once they change, and only lazy.nvim's plugins are
+  covered ([System sweep](docs/system-sweep.md#neovim-plugins)).
 - System sweep: an AI coding agent's hooks and MCP servers are read from your
   own configuration, not from a project's (`.claude/settings.json`,
   `.mcp.json` in a repository), and a configuration file that is a link is

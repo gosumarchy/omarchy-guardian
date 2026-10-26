@@ -7,7 +7,7 @@ mod follow;
 mod item;
 mod sight;
 
-pub(super) use item::{item, item_of, origin};
+pub(super) use item::{body_of, item, item_of, origin};
 use sight::is_there;
 pub(super) use sight::{holds, is_file_there, look, packaged_item, packaged_out_of_sight};
 
@@ -20,7 +20,7 @@ use std::path::Path;
 use super::index::PackageIndex;
 use super::read::{self, View};
 use super::tier::Tier;
-use super::{access, agents, boot, commands, extensions, own, path};
+use super::{access, agents, boot, commands, extensions, nvim, own, path};
 use crate::autorun::{Category, Kind, Location, SYSTEM, SYSTEM_SWEEP, USER};
 use crate::paths::file_name;
 use crate::rules::RuleId;
@@ -197,6 +197,8 @@ pub(crate) enum Body {
     Link(String),
     /// Could not be read as this user.
     Unreadable(String),
+    /// A Neovim plugin's directory, judged as a whole (see `nvim`).
+    Plugin(Box<nvim::Plugin>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

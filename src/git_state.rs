@@ -173,10 +173,115 @@ fn without_line_credentials(line: &str) -> String {
 /// The lines of `text` that set a key running a command, as (line number,
 /// `key = value` with any URL credentials masked).
 pub(crate) fn executing_keys(text: &str) -> Vec<(usize, String)> {
+    let mut hits: Vec<(usize, String)> = Vec::new();
+    each_key(text, |line, section, subsection, key, value, _| {
+        if !runs_command(section, subsection.is_some(), key, value) {
+            return;
+        }
+        let full = subsection.map_or_else(
+            || format!("{section}.{key}"),
+            |sub| format!("{section}.{sub}.{key}"),
+        );
+        let hit = (line, format!("{full} = {}", mask_credentials(value)));
+        if !hits.contains(&hit) {
+            hits.push(hit);
+        }
+    });
+    hits
+}
+
+/// Whether a key was read the one way git can read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reading {
+    /// Its line stands on its own, under one section.
+    Sure,
+    /// Its line continues, or may be the rest of another, or may belong to
+    /// more than one section: it is one of several readings (see
+    /// `each_key`), and git takes only one of them.
+    OneOfSeveral,
+}
+
+/// Every value of `section.key` (`subsection` `None`) or
+/// `section.subsection.key` in `text`, in order, with its line and how
+/// surely it was read, the value as git takes it: quotes dropped, escapes
+/// decoded, a comment after it cut off. `section` and `key` are lowercase.
+pub(crate) fn values(
+    text: &str,
+    section: &str,
+    subsection: Option<&str>,
+    key: &str,
+) -> Vec<(usize, String, Reading)> {
+    let mut found: Vec<(usize, String, Reading)> = Vec::new();
+    each_key(text, |line, at, sub, name, value, reading| {
+        let entry = (line, unquoted(value), reading);
+        if at == section && sub == subsection && name == key && !found.contains(&entry) {
+            found.push(entry);
+        }
+    });
+    found
+}
+
+/// One key of a git configuration, as `keys` gives it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ConfigKey {
+    pub(crate) line: usize,
+    /// Lowercase.
+    pub(crate) section: String,
+    pub(crate) subsection: Option<String>,
+    /// Lowercase.
+    pub(crate) key: String,
+    /// As git takes it (see `values`).
+    pub(crate) value: String,
+}
+
+/// Every key of `text`, in every reading of its line (see `each_key`).
+pub(crate) fn keys(text: &str) -> Vec<ConfigKey> {
+    let mut found: Vec<ConfigKey> = Vec::new();
+    each_key(text, |line, section, subsection, key, value, _| {
+        let entry = ConfigKey {
+            line,
+            section: section.to_string(),
+            subsection: subsection.map(str::to_string),
+            key: key.to_string(),
+            value: unquoted(value),
+        };
+        if !found.contains(&entry) {
+            found.push(entry);
+        }
+    });
+    found
+}
+
+/// A raw value as git takes it (see `values`).
+fn unquoted(raw: &str) -> String {
+    let mut value = String::new();
+    let mut quoted = false;
+    let mut characters = raw.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '"' => quoted = !quoted,
+            '\\' => match characters.next() {
+                Some('n') => value.push('\n'),
+                Some('t') => value.push('\t'),
+                Some('b') => value.push('\u{8}'),
+                Some(other) => value.push(other),
+                None => {}
+            },
+            '#' | ';' if !quoted => break,
+            other => value.push(other),
+        }
+    }
+    value.trim().to_string()
+}
+
+/// Calls `visit` with (line, section, subsection, key, raw value, reading)
+/// for each key of `text`, in every reading of its line. Section and key
+/// are lowercased, as is the subsection of an old-style header
+/// (`[remote.ORIGIN]`); a quoted subsection has its escapes decoded.
+fn each_key(text: &str, mut visit: impl FnMut(usize, &str, Option<&str>, &str, &str, Reading)) {
     // The sections a key may belong to. Usually one; after a header that
     // may itself be the tail of a continued value, also the ones before.
     let mut sections: Vec<(String, Option<String>)> = vec![(String::new(), None)];
-    let mut hits: Vec<(usize, String)> = Vec::new();
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let lines: Vec<&str> = text.lines().collect();
     for (index, raw) in lines.iter().enumerate() {
@@ -187,6 +292,7 @@ pub(crate) fn executing_keys(text: &str) -> Vec<(usize, String)> {
         // read both as a line of its own and as more of that value: a key
         // that runs a command in any reading is reported.
         let continued = index > 0 && lines[index - 1].ends_with('\\');
+        let several = continued || raw.ends_with('\\');
         let mut readings = vec![(*raw).to_string()];
         if raw.ends_with('\\') {
             let mut joined = (*raw).to_string();
@@ -203,16 +309,16 @@ pub(crate) fn executing_keys(text: &str) -> Vec<(usize, String)> {
         }
         for (reading_index, reading) in readings.into_iter().enumerate() {
             let mut line = reading.trim();
-            if let Some(header) = line.strip_prefix('[') {
+            // git reads headers one after another on one line
+            // (`[x] [core] hooksPath = …`): the last one opens the section.
+            while let Some(header) = line.strip_prefix('[') {
                 let (header, rest) = split_header(header);
                 let header = header.trim();
                 let found = if let Some((name, sub)) = header.split_once(char::is_whitespace) {
-                    (
-                        name.to_lowercase(),
-                        Some(sub.trim().trim_matches('"').to_string()),
-                    )
+                    (name.to_lowercase(), Some(quoted_subsection(sub.trim())))
                 } else if let Some((name, sub)) = header.split_once('.') {
-                    (name.to_lowercase(), Some(sub.to_string()))
+                    // git lowercases an old-style subsection.
+                    (name.to_lowercase(), Some(sub.to_lowercase()))
                 } else {
                     (header.to_lowercase(), None)
                 };
@@ -236,22 +342,39 @@ pub(crate) fn executing_keys(text: &str) -> Vec<(usize, String)> {
                 .split_once('=')
                 .map_or((line, "true"), |(key, value)| (key.trim(), value.trim()));
             let key = key.to_lowercase();
+            let reading = if several || sections.len() > 1 {
+                Reading::OneOfSeveral
+            } else {
+                Reading::Sure
+            };
             for (section, subsection) in &sections {
-                if !runs_command(section, subsection.is_some(), &key, value) {
-                    continue;
-                }
-                let full = subsection.as_ref().map_or_else(
-                    || format!("{section}.{key}"),
-                    |sub| format!("{section}.{sub}.{key}"),
+                visit(
+                    index + 1,
+                    section,
+                    subsection.as_deref(),
+                    &key,
+                    value,
+                    reading,
                 );
-                let hit = (index + 1, format!("{full} = {}", mask_credentials(value)));
-                if !hits.contains(&hit) {
-                    hits.push(hit);
-                }
             }
         }
     }
-    hits
+}
+
+/// A quoted subsection (`"a\\"b"`) as git takes it: quotes dropped, and a
+/// backslash taking the next character as it is.
+fn quoted_subsection(sub: &str) -> String {
+    let inner = sub.strip_prefix('"').unwrap_or(sub);
+    let inner = inner.strip_suffix('"').unwrap_or(inner);
+    let mut name = String::new();
+    let mut characters = inner.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' => name.extend(characters.next()),
+            other => name.push(other),
+        }
+    }
+    name
 }
 
 /// A section header (without its `[`) and what follows its closing `]`,
@@ -319,7 +442,7 @@ fn runs_command(section: &str, has_subsection: bool, key: &str, value: &str) -> 
 
 /// A relative path that stays inside the working tree, and outside the
 /// git directory, whose files the walk reads only in part.
-fn is_in_tree(path: &str) -> bool {
+pub(crate) fn is_in_tree(path: &str) -> bool {
     !path.is_empty()
         && !path.starts_with(['/', '~'])
         && !path.contains('$')
@@ -345,7 +468,7 @@ fn mask_credentials(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{executing_keys, is_git_config};
+    use super::{Reading, executing_keys, is_git_config, values};
 
     fn keys(text: &str) -> Vec<String> {
         executing_keys(text)
@@ -460,6 +583,51 @@ mod tests {
         // More keys that name a command.
         let text = "[submodule \"a\"]\n\tupdate = !sh x\n[remote \"origin\"]\n\tuploadpack = sh x\n\turl = https://x.example/r\n[difftool \"d\"]\n\tcmd = sh x\n[gpg \"ssh\"]\n\tdefaultKeyCommand = sh x\n";
         assert_eq!(keys(text).len(), 4, "{:?}", keys(text));
+    }
+
+    #[test]
+    fn values_are_read_as_git_takes_them() {
+        let text = "[core] hooksPath = \"a b\" # note\n[core]\n\thooksPath = c;d\n[remote \"origin\"]\n\turl = \"x\\ty\"\n";
+        assert_eq!(
+            values(text, "core", None, "hookspath"),
+            [
+                (1, "a b".to_string(), Reading::Sure),
+                (3, "c".to_string(), Reading::Sure)
+            ]
+        );
+        assert_eq!(
+            values(text, "remote", Some("origin"), "url"),
+            [(5, "x\ty".to_string(), Reading::Sure)]
+        );
+        // Several headers on one line: the last one holds the key.
+        assert_eq!(
+            executing_keys("[x] [core] hooksPath = /tmp/evil-hooks\n"),
+            [(1, "core.hookspath = /tmp/evil-hooks".to_string())]
+        );
+        assert_eq!(
+            values("[x][core]hooksPath=/a\n", "core", None, "hookspath"),
+            [(1, "/a".to_string(), Reading::Sure)]
+        );
+        assert_eq!(
+            values(
+                "[y] [remote \"origin\"] url = https://evil/x\n",
+                "remote",
+                Some("origin"),
+                "url"
+            ),
+            [(1, "https://evil/x".to_string(), Reading::Sure)]
+        );
+        // An old-style subsection is lowercased, a quoted one decoded, and
+        // a continued line is one of several readings.
+        let url = |text: &str| values(text, "remote", Some("origin"), "url");
+        assert_eq!(url("[remote.ORIGIN]\nurl = a\n")[0].1, "a");
+        assert_eq!(url("[remote \"or\\igin\"]\nurl = b\n")[0].1, "b");
+        assert!(
+            url("[remote \"origin\"]\nurl = c\\\nd\n")
+                .iter()
+                .all(|(_, _, reading)| *reading == Reading::OneOfSeveral)
+        );
+        assert!(values(text, "remote", Some("Origin"), "url").is_empty());
     }
 
     #[test]

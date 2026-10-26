@@ -9,6 +9,7 @@ mod variables;
 use std::fmt::Write as _;
 
 use super::collect::{self, Body, Collection, Item};
+use super::nvim::{self, Review};
 use super::tier::Tier;
 use super::{boot, commands};
 use crate::autorun::Category;
@@ -20,7 +21,7 @@ use crate::report::{Gap, LocalFinding, Report, ReviewScope};
 use crate::review::{self, ReviewContext};
 use crate::rules::RuleId;
 use crate::text::shown;
-use secrets::{has_boot_secret, without_secrets};
+use secrets::{has_boot_secret, without_secrets, without_url_passwords};
 use variables::sets_only_variables;
 
 #[cfg(test)]
@@ -196,9 +197,63 @@ fn examine(
             Body::Unreadable(_) => report.gaps.push(Gap::RootOnly(label)),
             // A link is judged by its target, which is its own item.
             Body::Link(_) => {}
+            Body::Plugin(plugin) => facts.extend(plugin_files(report, plugin, &label)),
         }
     }
     facts
+}
+
+/// Puts the files of `plugin`, listed as `label`, that this sweep reviews
+/// (see `nvim`) through the local rules and the AI review, as the text of
+/// any other item; returns what Guardian established about the plugin
+/// where any of it is reviewed.
+fn plugin_files(report: &mut Report, plugin: &nvim::Plugin, label: &str) -> Option<String> {
+    let (sent, news) = match &plugin.review {
+        Review::New(sent) => (sent, nvim::News::New),
+        Review::Changed(sent) => (sent, nvim::News::Changed),
+        Review::Baseline | Review::Unchanged => return None,
+        Review::Unplanned => {
+            report.gaps.push(Gap::Sweep(format!(
+                "{label}: not compared with what the last sweep saw of it"
+            )));
+            return None;
+        }
+        Review::TooLarge { files } => {
+            report.gaps.push(Gap::Sweep(format!(
+                "{label}: {files} new or changed code files are more than one plugin's review takes; read them yourself, then `sweep allow` it"
+            )));
+            return None;
+        }
+    };
+    for file in sent {
+        let shown = format!("{label}/{}", file.path);
+        match &file.body {
+            // Whoever writes a plugin picks its file names: code a secret
+            // name keeps from the AI must not pass unseen for that.
+            Body::Text(text) if crate::rules::is_sensitive_path(&shown) => {
+                review::analyze_text_locally(report, &shown, &without_url_passwords(text));
+                report
+                    .findings
+                    .push(finding(&shown, 1, RuleId::KeptFromReview, ""));
+            }
+            // Plugin code is not configuration: blanking what looks like a
+            // secret assignment would let a plugin hide code from the AI
+            // behind a name like TOKEN. Only URL passwords are masked.
+            Body::Text(text) => {
+                review::analyze_text(report, &shown, &without_url_passwords(text), false);
+            }
+            Body::Oversized => report.gaps.push(Gap::OversizedText(shown)),
+            Body::Undecodable => report.gaps.push(Gap::Undecodable(shown)),
+            Body::Unreadable(reason) => report
+                .gaps
+                .push(Gap::Sweep(format!("{shown}: could not be read ({reason})"))),
+            Body::Binary(_) => report.gaps.push(Gap::RunsUnread(format!(
+                "{shown}: new or changed, and Neovim runs it without the review reading it; check it, then `sweep allow` the plugin"
+            ))),
+            Body::Link(_) | Body::Plugin(_) => report.gaps.push(Gap::RunsUnread(shown)),
+        }
+    }
+    Some(nvim::fact(plugin, label, news))
 }
 
 /// Developer tool configuration that holds no tokens as a rule, and whose

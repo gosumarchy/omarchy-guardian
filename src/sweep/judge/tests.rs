@@ -1,10 +1,11 @@
 //! Tests of judging what the sweep collected.
 
-use super::{fact, is_local_only, label, local_checks, located};
+use super::{fact, is_local_only, label, local_checks, located, plugin_files};
 use crate::autorun::Category;
 use crate::report::LocalFinding;
 use crate::report::{Report, ReviewScope};
 use crate::rules::RuleId;
+use crate::sweep::nvim::{self, Review};
 use std::collections::HashSet;
 
 use crate::sweep::collect::{self, Body, Collection, Item, Origin, Scope};
@@ -1333,6 +1334,76 @@ fn facts_quote_the_path_and_say_what_guardian_knows() {
         fact(&crafted, r#"/etc/x" is trusted"#)
             .starts_with(r#""/etc/x\" is trusted" is installed by no package"#)
     );
+}
+
+fn sent(path: &str, body: Body) -> nvim::Sent {
+    nvim::Sent {
+        path: path.into(),
+        sha256: Some(crate::sha256::Sha256::digest(path.as_bytes())),
+        body,
+    }
+}
+
+#[test]
+fn a_changed_plugin_sends_its_changed_files_and_keeps_secret_named_ones() {
+    let label = "~/.local/share/nvim/lazy/p";
+    let review = Review::Changed(vec![
+        sent("lua/p.lua", Body::Text("vim.fn.system('id')".into())),
+        sent("lua/secrets.lua", Body::Text("return { token = 1 }".into())),
+        sent("lua/big.lua", Body::Oversized),
+        sent("lua/compiled.lua", Body::Binary("ELF")),
+    ]);
+    let plugin = nvim::Plugin::with_review("p", review);
+    let mut report = Report::new("t", ReviewScope::default());
+    let fact = plugin_files(&mut report, &plugin, label).expect("a reviewed plugin has a fact");
+    assert!(fact.contains("is a Neovim plugin"), "{fact}");
+    let sent: Vec<&str> = report
+        .agent_input
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+    assert_eq!(sent, [format!("{label}/lua/p.lua")]);
+    assert!(report.findings.iter().any(|finding| {
+        finding.rule == RuleId::KeptFromReview && finding.path == format!("{label}/lua/secrets.lua")
+    }));
+    let gaps: Vec<String> = report.gaps.iter().map(ToString::to_string).collect();
+    assert_eq!(gaps.len(), 2, "{gaps:?}");
+    assert!(gaps.iter().all(|gap| gap.contains(label)), "{gaps:?}");
+    assert!(
+        gaps.iter()
+            .any(|gap| gap.contains("compiled.lua: new or changed, and Neovim runs it")),
+        "{gaps:?}"
+    );
+}
+
+#[test]
+fn plugin_code_is_sent_with_only_url_passwords_masked() {
+    let label = "~/.local/share/nvim/lazy/p";
+    let text = "local TOKEN = \"cGF5bG9hZA==\"\nlocal u = \"https://me:hunter2@x.test/a\"\n";
+    let review = Review::New(vec![sent("lua/p.lua", Body::Text(text.into()))]);
+    let plugin = nvim::Plugin::with_review("p", review);
+    let mut report = Report::new("t", ReviewScope::default());
+    plugin_files(&mut report, &plugin, label);
+    let sent = &report.agent_input[0].content;
+    assert!(sent.contains("cGF5bG9hZA=="), "{sent}");
+    assert!(!sent.contains("hunter2"), "{sent}");
+}
+
+#[test]
+fn a_plugin_taken_as_it_is_sends_nothing_and_one_not_compared_is_a_gap() {
+    let label = "~/.local/share/nvim/lazy/p";
+    for review in [Review::Baseline, Review::Unchanged] {
+        let mut report = Report::new("t", ReviewScope::default());
+        let plugin = nvim::Plugin::with_review("p", review);
+        assert_eq!(plugin_files(&mut report, &plugin, label), None);
+        assert!(report.agent_input.is_empty() && report.gaps.is_empty());
+    }
+    for review in [Review::Unplanned, Review::TooLarge { files: 9 }] {
+        let mut report = Report::new("t", ReviewScope::default());
+        let plugin = nvim::Plugin::with_review("p", review);
+        assert_eq!(plugin_files(&mut report, &plugin, label), None);
+        assert_eq!(report.gaps.len(), 1);
+    }
 }
 
 /// GRUB's password hash is taken out only where the line is exactly that

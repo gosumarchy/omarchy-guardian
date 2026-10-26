@@ -11,6 +11,8 @@
 //!   and `live` tell by name.
 //! - `judge` sends what isn't trusted through the local rules and the AI
 //!   review; `output` shows it.
+//! - `nvim` collects the Neovim plugins lazy.nvim installed, each judged
+//!   as a whole and reviewed once it changes.
 //! - `extensions` lists the browser extensions of the home's profiles.
 //! - `root` is the read-only root collector behind `sweep --root`.
 //! - `agents` reads what AI coding agents start on their own (hooks, MCP
@@ -27,6 +29,7 @@ mod index;
 mod judge;
 mod live;
 mod lua;
+mod nvim;
 mod output;
 pub(crate) mod own;
 mod path;
@@ -157,6 +160,12 @@ fn collect_here(home: Option<&str>) -> Result<(Collection, PackageIndex, Vec<Str
         origin: Origin::System,
     };
     let mut collection = collect::collect(&scope);
+    if let Some(home) = home {
+        let neovim = nvim::collect(&scope, &nvim::Dirs::here(home));
+        collect::merge(&mut collection, neovim.items);
+        collection.truncated.extend(neovim.unchecked);
+        collection.notes.extend(neovim.notes);
+    }
     let live = live::check(&scope);
     collect::merge(&mut collection, live.items);
     collection.truncated.extend(live.unchecked);
@@ -608,13 +617,34 @@ fn before(directory: Option<&Path>, scheduled: bool) -> (bool, Option<Remembered
     }
 }
 
-/// Remembers what this sweep saw; the timer's sweep also as told about.
-fn remember(directory: &Path, current: &Remembered, scheduled: bool) -> Result<(), Error> {
+/// Remembers what this sweep saw, and the code of the Neovim plugins as
+/// `plugins` settled it; the timer's sweep also as told about.
+fn remember(
+    directory: &Path,
+    current: &Remembered,
+    plugins: &nvim::Files,
+    scheduled: bool,
+) -> Result<(), Error> {
     state::save_baseline(directory, current)?;
     if scheduled {
         state::save_told(directory, current)?;
     }
-    Ok(())
+    nvim::Record::save(directory, plugins)
+}
+
+/// Decides what this sweep reviews of the Neovim plugins in `collection`
+/// (see `nvim`), against `record`. Where that does not stand for the last
+/// sweep, whose remembered items are `previous`, it is something not
+/// checked.
+fn plan_plugins(
+    collection: &mut Collection,
+    record: &nvim::Record,
+    previous: Option<&Remembered>,
+    label: &dyn Fn(&collect::Item) -> String,
+) {
+    let listed = |item: &collect::Item| previous.is_some_and(|p| p.contains_key(&label(item)));
+    let lost = nvim::plan(&mut collection.items, record, Path::new("/"), &listed);
+    collection.truncated.extend(lost);
 }
 
 /// What a scheduled sweep tells the desktop: new or changed items, or
@@ -930,6 +960,8 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
         state_root: state_root.as_deref(),
         context: &[],
     };
+    let plugins = nvim::Record::load(directory.as_deref());
+    plan_plugins(&mut collection, &plugins, previous.as_ref(), &label);
     judge::note_kept(&mut collection.items, home.as_deref());
     let mut report = judge::judge(&collection, home.as_deref(), &context, &news);
     report.gaps.extend(
@@ -971,8 +1003,9 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
         changes: &changes,
     };
     show(options, &shown);
+    let settled = nvim::settle(&collection.items, &plugins, &report, &label);
     if let Some(directory) = &directory
-        && let Err(reason) = remember(directory, &current, options.scheduled)
+        && let Err(reason) = remember(directory, &current, &settled, options.scheduled)
     {
         errln!("omarchy-guardian sweep: {reason}");
         // Without it the next sweep would see nothing as new.

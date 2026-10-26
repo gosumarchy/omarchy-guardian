@@ -1113,6 +1113,29 @@ pub(crate) const USER: &[Location] = &[
         Category::Editor,
     ),
     location(".config/nvim/lua/", Kind::Directory, Category::Editor),
+    // The user's own `site` directory, read like the system's (see
+    // `usr/share/nvim/site` above). Packages there are outside lazy.nvim,
+    // so the plugin sweep does not see them.
+    location(
+        ".local/share/nvim/site/plugin/",
+        Kind::Directory,
+        Category::Editor,
+    ),
+    location(
+        ".local/share/nvim/site/after/plugin/",
+        Kind::Directory,
+        Category::Editor,
+    ),
+    location(
+        ".local/share/nvim/site/ftdetect/",
+        Kind::Directory,
+        Category::Editor,
+    ),
+    location(
+        ".local/share/nvim/site/pack/*/start/*/plugin/*",
+        Kind::Glob,
+        Category::Editor,
+    ),
     location(".vimrc", Kind::File, Category::Editor),
     location(".vim/plugin/", Kind::Directory, Category::Editor),
     location(

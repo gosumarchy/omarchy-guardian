@@ -76,6 +76,10 @@ fn auto_run_locations() {
         "etc/skel/.bashrc",
         "etc/skel/.config/hypr/hyprland.conf",
         "etc/skel/.config/autostart/x.desktop",
+        "etc/skel/.local/share/nvim/site/plugin/x.lua",
+        "etc/skel/.local/share/nvim/site/after/plugin/x.vim",
+        "etc/skel/.local/share/nvim/site/ftdetect/x.vim",
+        "etc/skel/.local/share/nvim/site/pack/p/start/x/plugin/x.lua",
         "usr/share/pipewire/pipewire.conf.d/x.conf",
         "etc/pipewire/pipewire.conf",
         "etc/chromium/policies/managed/x.json",
@@ -100,6 +104,7 @@ fn auto_run_locations() {
         "usr/share/pipewire/pipewire.conf",
         // Only what runs on its own in a new home, not all of it.
         "etc/skel/.local/share/nvim/lazy/x/README.md",
+        "etc/skel/.local/share/nvim/site/pack/p/opt/x/plugin/x.lua",
         "etc/skel/.config/app/settings.json",
         // Sweep-only locations are not part of the gate's review.
         "usr/lib/security/pam_x.so",
