@@ -34,7 +34,7 @@ const MAX_AGE_SECS: u64 = 36 * 60 * 60;
 pub(super) fn write_results(path: &Path, json: &str, gid: u32) -> Result<(), Error> {
     let directory = path
         .parent()
-        .ok_or_else(|| Error::Refused("no directory".into()))?;
+        .ok_or_else(|| Error::Message("no directory".into()))?;
     fs::create_dir_all(directory).at(directory)?;
     unix_fs::chown(directory, Some(0), Some(gid)).at(directory)?;
     fs::set_permissions(directory, fs::Permissions::from_mode(0o750)).at(directory)?;
@@ -52,11 +52,11 @@ pub(super) fn write_results(path: &Path, json: &str, gid: u32) -> Result<(), Err
 /// What the scheduled root collector found, if it is trustworthy and
 /// recent: owned by root and writable by no one else, file and directory,
 /// and at most `MAX_AGE_SECS` old.
-pub(crate) fn from_results(path: &Path, now: u64) -> Result<RootPart, String> {
+pub(crate) fn from_results(path: &Path, now: u64) -> Result<RootPart, Error> {
     if let Some(problem) = results_problem(path, now) {
-        return Err(problem);
+        return Err(Error::Message(problem));
     }
-    let text = fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let text = fs::read_to_string(path).at(path)?;
     from_json(&text)
 }
 
@@ -278,16 +278,19 @@ fn item_from_json(json: &Json) -> Option<Item> {
     })
 }
 
-pub(super) fn from_json(text: &str) -> Result<RootPart, String> {
-    let json = Json::parse(text.trim()).map_err(|error| format!("unreadable output: {error}"))?;
+pub(super) fn from_json(text: &str) -> Result<RootPart, Error> {
+    let json = Json::parse(text.trim())
+        .map_err(|error| Error::Message(format!("unreadable output: {error}")))?;
     let version = json.get("version").and_then(Json::as_u64);
     if !version.is_some_and(|version| (OLDEST_VERSION..=VERSION).contains(&version)) {
-        return Err("the root collector is a different version; reinstall Guardian".into());
+        return Err(Error::Message(
+            "the root collector is a different version; reinstall Guardian".into(),
+        ));
     }
     let listed = json
         .get("items")
         .and_then(Json::as_array)
-        .ok_or("no item list")?;
+        .ok_or_else(|| Error::Message("no item list".into()))?;
     let items: Vec<Item> = listed
         .iter()
         .take(MAX_ITEMS)

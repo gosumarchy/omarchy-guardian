@@ -892,7 +892,10 @@ fn an_upstream_image_is_passed_over_only_away_from_where_files_run() {
 fn a_listing_must_be_shaped_as_makepkg_prints_it() {
     use super::check_listing;
     let plain = "pkgbase = demo\n\tpkgver = 1.2\n\tsource = a.tar\n\tsource = \n\npkgname = demo\n\tdepends = x\n\npkgname = demo-doc\n";
-    assert_eq!(check_listing(plain), Ok(()));
+    assert_eq!(
+        check_listing(plain).map_err(|error| error.to_string()),
+        Ok(())
+    );
     for (listing, why) in [
         // What a recipe's top level can write ahead of makepkg's own.
         ("\tsource = evil\npkgbase = demo\npkgname = demo\n", "start"),
@@ -923,7 +926,7 @@ fn a_listing_must_be_shaped_as_makepkg_prints_it() {
         ("", "start"),
     ] {
         let refused = check_listing(listing).unwrap_err();
-        assert!(refused.contains(why), "{listing:?}: {refused}");
+        assert!(refused.to_string().contains(why), "{listing:?}: {refused}");
     }
 }
 
@@ -1294,7 +1297,10 @@ fn no_listing_makes_its_readers_panic_and_an_accepted_one_is_makepkgs_shape() {
         "\tpkgbase = other\n",
     ];
     let listing = "pkgbase = demo\n\tpkgver = 1\n\tsource = a.tar.gz\n\tsource = b::https://example.test/b\n\tsource_x86_64 = c\n\tsha256sums = SKIP\n\tsha256sums = abc\n\tsha256sums_x86_64 = def\n\npkgname = demo\n\tdepends = glibc\n";
-    assert_eq!(check_listing(listing), Ok(()));
+    assert_eq!(
+        check_listing(listing).map_err(|error| error.to_string()),
+        Ok(())
+    );
     assert_eq!(parse_srcinfo(listing).len(), 3);
 
     let check = |text: &str| {

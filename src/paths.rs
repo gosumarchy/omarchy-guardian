@@ -110,7 +110,7 @@ impl NotPrivate {
                 ""
             }
         };
-        Error::Refused(match self {
+        Error::Message(match self {
             Self::NotDirectory { path, above } => {
                 format!("{} is not a directory{}", path.display(), under(above))
             }
@@ -210,7 +210,7 @@ fn nearest_existing_ancestor(root: &Path) -> Result<PathBuf, Error> {
             Err(error) => return Err(error).at(ancestor),
         }
     }
-    Err(Error::Refused(format!(
+    Err(Error::Message(format!(
         "{} has no existing ancestor",
         root.display()
     )))

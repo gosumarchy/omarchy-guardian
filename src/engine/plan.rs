@@ -6,6 +6,7 @@ use std::mem;
 
 use crate::agent::SourceFile;
 use crate::engine::diff;
+use crate::engine::request::manifest_entry_bytes;
 use crate::json;
 use crate::paths::file_name;
 use crate::rules;
@@ -30,9 +31,6 @@ const WHOLE_SHARE: usize = 2;
 /// this share of one request: what a change switches on may sit in a file
 /// that did not change.
 const NAMED_SHARE: usize = 2;
-
-/// Bytes charged for each manifest entry on top of its path.
-const MANIFEST_ENTRY_OVERHEAD: usize = 32;
 
 /// A cut line piece must hold at least one character of any width.
 const MIN_PIECE: usize = 4;
@@ -376,6 +374,43 @@ pub(super) fn build(input: &PlanInput<'_>) -> Result<Plan, TooLarge> {
     })
 }
 
+/// The bytes the manifest takes in each request, every entry with the
+/// comma after it (see `request::manifest_entry_bytes`).
+fn manifest_bytes(
+    input: &PlanInput<'_>,
+    hash_only: &[ManifestEntry],
+    removed: &[(&String, &String)],
+) -> usize {
+    hash_only.iter().map(manifest_entry_bytes).sum::<usize>()
+        + input
+            .files
+            .iter()
+            .map(|file| {
+                // How the file is sent is not chosen yet: charged as the
+                // longest name.
+                manifest_entry_bytes(&ManifestEntry {
+                    path: file.path.clone(),
+                    bytes: file.content.len(),
+                    sent: Sent::Named,
+                    format: None,
+                    files: None,
+                })
+            })
+            .sum::<usize>()
+        + removed
+            .iter()
+            .map(|(path, content)| {
+                manifest_entry_bytes(&ManifestEntry {
+                    path: (*path).clone(),
+                    bytes: content.len(),
+                    sent: Sent::Removed,
+                    format: None,
+                    files: None,
+                })
+            })
+            .sum::<usize>()
+}
+
 /// `build`, with or without what an upgrade sends beyond its changes
 /// (`extras`): larger changed files whole, and unchanged files a change
 /// names.
@@ -391,24 +426,7 @@ fn build_with(input: &PlanInput<'_>, extras: bool) -> Result<Plan, TooLarge> {
         .collect();
 
     let hash_only = hash_only_rows(input);
-    let overhead = input.findings_bytes
-        + hash_only
-            .iter()
-            .map(|entry| {
-                weight(&entry.path)
-                    + entry.format.as_deref().map_or(0, weight)
-                    + MANIFEST_ENTRY_OVERHEAD
-            })
-            .sum::<usize>()
-        + input
-            .files
-            .iter()
-            .map(|file| weight(&file.path) + MANIFEST_ENTRY_OVERHEAD)
-            .sum::<usize>()
-        + removed
-            .iter()
-            .map(|(path, _)| weight(path) + MANIFEST_ENTRY_OVERHEAD)
-            .sum::<usize>();
+    let overhead = input.findings_bytes + manifest_bytes(input, &hash_only, &removed);
     if overhead.saturating_mul(2) > input.max_input_bytes {
         return Err(TooLarge::INPUT);
     }

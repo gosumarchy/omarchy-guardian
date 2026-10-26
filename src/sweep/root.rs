@@ -29,8 +29,9 @@ use super::collect::{self, Body, Collection, Item, Origin, Scope};
 use super::index::{self, LOCAL_DB, PackageIndex};
 use super::state;
 use super::{live, own};
-use crate::error::Error;
+use crate::error::{Error, IoContext};
 use crate::json::Json;
+use crate::report::FAILED;
 use crate::user;
 use results::{from_json, to_json, write_results};
 
@@ -170,16 +171,26 @@ fn news(items: &[Item], seen: Option<TrustSeen>, now: u64) -> (Option<Vec<String
 /// Where the scheduled root collector leaves what it found.
 pub(crate) const RESULTS: &str = "/var/lib/omarchy-guardian/sweep/root.json";
 
+/// Where `sweep-collect` puts what it found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CollectTo {
+    /// For `sweep --root`, which runs it through sudo.
+    Stdout,
+    /// `RESULTS`, for the daily system timer (`--out`).
+    Results,
+}
+
 /// `omarchy-guardian sweep-collect [--out]`: run as root, by `sweep --root`
 /// through sudo (printing to stdout), or by the daily system timer with
 /// `--out` (writing `RESULTS`, only when the system configuration allows
 /// it, readable by the configured group).
-pub(crate) fn collect_command(out: bool, settings: &crate::config::Settings) -> ExitCode {
+pub(crate) fn collect_command(to: CollectTo, settings: &crate::config::Settings) -> ExitCode {
+    let out = to == CollectTo::Results;
     if !user::effective_uid().is_ok_and(|uid| uid == 0) {
         errln!(
             "omarchy-guardian sweep-collect: only `sweep --root` and its timer run this, as root"
         );
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     }
     // The list of allowed items an older Guardian kept beside the results
     // moves to where every user can read it. Not being able to is no reason
@@ -198,7 +209,7 @@ pub(crate) fn collect_command(out: bool, settings: &crate::config::Settings) -> 
             errln!(
                 "omarchy-guardian sweep-collect: no valid [sweep] group in the system configuration"
             );
-            return ExitCode::from(2);
+            return ExitCode::from(FAILED);
         };
         Some(gid)
     } else {
@@ -210,7 +221,7 @@ pub(crate) fn collect_command(out: bool, settings: &crate::config::Settings) -> 
         Ok(index) => index,
         Err(error) => {
             errln!("omarchy-guardian sweep-collect: cannot read the package database: {error}");
-            return ExitCode::from(2);
+            return ExitCode::from(FAILED);
         }
     };
     let scope = Scope {
@@ -266,7 +277,7 @@ pub(crate) fn collect_command(out: bool, settings: &crate::config::Settings) -> 
         // with a hidden character must stay the path it is.
         None => match writeln!(std::io::stdout(), "{json}") {
             Ok(()) => ExitCode::SUCCESS,
-            Err(_) => ExitCode::from(2),
+            Err(_) => ExitCode::from(FAILED),
         },
         Some(gid) => match write_results(Path::new(RESULTS), &json, gid).and_then(|()| {
             state::write_text_mode(Path::new(TRUST_SEEN), &trust_seen_json(&seen), 0o600)
@@ -274,7 +285,7 @@ pub(crate) fn collect_command(out: bool, settings: &crate::config::Settings) -> 
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 errln!("omarchy-guardian sweep-collect: {error}");
-                ExitCode::from(2)
+                ExitCode::from(FAILED)
             }
         },
     }
@@ -432,12 +443,12 @@ fn group_id(name: &str) -> Option<u32> {
 fn installed() -> Result<&'static Path, Error> {
     let program = Path::new(INSTALLED);
     let metadata = fs::metadata(program).map_err(|error| {
-        Error::Refused(format!(
+        Error::Message(format!(
             "{INSTALLED}: {error}; root's part needs the installed Guardian (./install.sh)"
         ))
     })?;
     if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-        return Err(Error::Refused(format!(
+        return Err(Error::Message(format!(
             "{INSTALLED} is not root's alone; root's part needs the installed Guardian (./install.sh)"
         )));
     }
@@ -446,10 +457,10 @@ fn installed() -> Result<&'static Path, Error> {
 
 /// Runs the root collector through sudo, which asks for the password on
 /// the terminal, and reads what it found.
-pub(super) fn from_root() -> Result<RootPart, String> {
+pub(super) fn from_root() -> Result<RootPart, Error> {
     // Always the installed, root-owned Guardian: running the current
     // executable would let a user-writable build run as root.
-    let program = installed().map_err(|error| error.to_string())?;
+    let program = installed()?;
     errln!(
         "Guardian needs root to check what your user can't read (sudoers, root's crontab, shell files and keys). It only reads them."
     );
@@ -460,18 +471,23 @@ pub(super) fn from_root() -> Result<RootPart, String> {
         .stderr(Stdio::inherit())
         .stdout(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("cannot start sudo: {error}"))?;
+        .spawning("sudo")?;
     let mut output = String::new();
     let read = child
         .stdout
         .take()
-        .ok_or("no output")?
+        .ok_or_else(|| Error::Message("no output".into()))?
         .take(MAX_OUTPUT)
         .read_to_string(&mut output);
-    let status = child.wait().map_err(|error| error.to_string())?;
-    read.map_err(|error| error.to_string())?;
+    let status = child.wait().spawning("sudo")?;
+    read.map_err(|error| Error::ToolFailed {
+        tool: "the root collector".into(),
+        detail: format!("its output could not be read: {error}"),
+    })?;
     if !status.success() {
-        return Err(format!("the root collector exited with {status}"));
+        return Err(Error::Message(format!(
+            "the root collector exited with {status}"
+        )));
     }
     from_json(&output)
 }

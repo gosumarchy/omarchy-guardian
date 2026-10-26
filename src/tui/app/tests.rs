@@ -6,6 +6,7 @@ use super::{App, Effect, Loaded, Mode, Row, Tab, Task, fields};
 use crate::config::file::PartialConfig;
 use crate::config::load::FileStatus;
 use crate::config::model::{AiRequirement, Profile, RootConsent, SourceClass};
+use crate::error::Error;
 use crate::integrations::Plan;
 use crate::tui::canvas::Canvas;
 use crate::tui::fields::{Field, Input, Scope};
@@ -161,9 +162,11 @@ fn a_save_that_fails_keeps_its_draft() {
     let [effect @ Effect::SaveUser(_)] = &effects[..] else {
         panic!("{effects:?}");
     };
-    app.settle(effect, Err("read-only file system".into()), || {
-        loaded(PartialConfig::default(), PartialConfig::default())
-    });
+    app.settle(
+        effect,
+        Err(Error::Message("read-only file system".into())),
+        || loaded(PartialConfig::default(), PartialConfig::default()),
+    );
     assert_eq!(app.user.profile, Some(Profile::Standard));
     assert!(screen(&mut app).contains("read-only file system"));
 }
@@ -252,9 +255,11 @@ fn system_save(app: &mut App) -> Effect {
 fn a_system_save_that_fails_keeps_its_draft() {
     let mut app = app();
     let effect = system_save(&mut app);
-    app.settle(&effect, Err("sudo: a password is required".into()), || {
-        loaded(PartialConfig::default(), PartialConfig::default())
-    });
+    app.settle(
+        &effect,
+        Err(Error::Message("sudo: a password is required".into())),
+        || loaded(PartialConfig::default(), PartialConfig::default()),
+    );
     assert_eq!(app.system.profile, Some(Profile::Standard));
     assert!(app.dirty(Scope::System));
 }
@@ -268,9 +273,11 @@ fn a_user_save_that_fails_does_not_go_on_to_the_system_file() {
         panic!("{effects:?}");
     };
     assert!(app.system_after_user);
-    app.settle(effect, Err("read-only file system".into()), || {
-        loaded(PartialConfig::default(), PartialConfig::default())
-    });
+    app.settle(
+        effect,
+        Err(Error::Message("read-only file system".into())),
+        || loaded(PartialConfig::default(), PartialConfig::default()),
+    );
     assert!(!app.system_after_user);
     assert!(app.dialog.is_none(), "{:?}", app.dialog);
     assert_eq!(app.changed_count(), 2);
@@ -299,9 +306,11 @@ fn a_saved_system_draft_becomes_the_file_as_read_back() {
 fn an_integration_toggle_that_fails_keeps_unsaved_edits() {
     let mut app = app();
     press(&mut app, &[Key::Char(' '), Key::Down, Key::Char(' ')]);
-    app.settle(&toggle(), Err("pacman hook: exit status 1".into()), || {
-        loaded(PartialConfig::default(), PartialConfig::default())
-    });
+    app.settle(
+        &toggle(),
+        Err(Error::Message("pacman hook: exit status 1".into())),
+        || loaded(PartialConfig::default(), PartialConfig::default()),
+    );
     assert_eq!(app.user.profile, Some(Profile::Standard));
     assert_eq!(app.system.profile, Some(Profile::Standard));
 }

@@ -10,7 +10,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use super::lockfile;
-use crate::content::{self, Content};
+use crate::content::{self, Content, Reading};
 use crate::engine::baseline::Unread;
 use crate::git_state;
 use crate::image;
@@ -444,7 +444,7 @@ impl Walk<'_> {
                 .push((child.to_string(), "unreadable"));
             return;
         };
-        let text = match content::classify(child, executable, false, &bytes) {
+        let text = match content::classify(child, executable, Reading::ByName, &bytes) {
             Content::Text(text) | Content::Lossy { text, .. } => text,
             Content::Binary(format) => {
                 return self.binary(child, format, executable, read_from, Some(&bytes));
@@ -1293,12 +1293,12 @@ impl Collected {
             let text = is_named(&data.child, &included)
                 .then(|| fs::read(&data.read_from).ok())
                 .flatten()
-                .and_then(
-                    |bytes| match content::classify(&data.child, false, false, &bytes) {
+                .and_then(|bytes| {
+                    match content::classify(&data.child, false, Reading::ByName, &bytes) {
                         Content::Text(text) | Content::Lossy { text, .. } => Some(text),
                         _ => None,
-                    },
-                );
+                    }
+                });
             match text {
                 Some(text) => {
                     self.upstream.data_files -= 1;

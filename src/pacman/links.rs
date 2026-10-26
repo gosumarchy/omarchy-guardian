@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use super::{C_LOCALE, Installed, TOOL_LIMITS};
 use crate::autorun::{self, Kind};
+use crate::error::{Error, IoContext};
 use crate::payload;
 use crate::sweep::read;
 use crate::tools;
@@ -264,7 +265,7 @@ fn listed_files(files: &str) -> impl Iterator<Item = &str> {
 /// says which paths to look at, and its `mtree`, which the package brings,
 /// what each is. A listed path the `mtree` has no usable line for may be
 /// a link to anywhere, and is returned as unknown rather than passed over.
-pub(super) fn packaged_links(db: &Path, directories: &[String]) -> Result<Packaged, String> {
+pub(super) fn packaged_links(db: &Path, directories: &[String]) -> Result<Packaged, Error> {
     let inside = |path: &str| {
         directories.iter().any(|directory| {
             path.strip_prefix(directory.as_str())
@@ -272,9 +273,8 @@ pub(super) fn packaged_links(db: &Path, directories: &[String]) -> Result<Packag
         })
     };
     let mut found = Packaged::default();
-    let unreadable = |error: io::Error| format!("{}: {error}", db.display());
-    for entry in fs::read_dir(db).map_err(unreadable)? {
-        let package = entry.map_err(unreadable)?.path();
+    for entry in fs::read_dir(db).at(db)? {
+        let package = entry.at(db)?.path();
         let files = match fs::read(package.join("files")) {
             Ok(files) => String::from_utf8_lossy(&files).into_owned(),
             // The database's own files (`ALPM_DB_VERSION`), or a package
@@ -287,7 +287,7 @@ pub(super) fn packaged_links(db: &Path, directories: &[String]) -> Result<Packag
             {
                 continue;
             }
-            Err(error) => return Err(format!("{}: {error}", package.display())),
+            Err(error) => return Err(error).at(&package),
         };
         let shipped: Vec<&str> = listed_files(&files)
             .filter(|line| !line.ends_with('/') && inside(line))
@@ -303,7 +303,7 @@ pub(super) fn packaged_links(db: &Path, directories: &[String]) -> Result<Packag
             TOOL_LIMITS,
         )
         .and_then(tools::Captured::into_success)
-        .map_err(|error| format!("{}: {error}", package.display()))?;
+        .map_err(|error| Error::Message(format!("{}: {error}", package.display())))?;
         let mut entries = mtree_entries(&String::from_utf8_lossy(&mtree));
         let name = package
             .file_name()

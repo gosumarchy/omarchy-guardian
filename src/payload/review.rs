@@ -12,7 +12,7 @@ use crate::autorun::{
     sweep_only_location,
 };
 use crate::config::model::SourceClass;
-use crate::content::{self, Content, Prefix};
+use crate::content::{self, Content, Prefix, Reading};
 use crate::error::Error;
 use crate::rules;
 use crate::scan::MAX_TEXT_FILE_SIZE;
@@ -343,7 +343,7 @@ pub(crate) fn review(
     class: SourceClass,
     trusted: &[String],
 ) -> Result<Review, Error> {
-    let refuse = |reason: String| Error::Refused(format!("{}: {reason}", archive.path.display()));
+    let refuse = |reason: String| Error::Message(format!("{}: {reason}", archive.path.display()));
     if let Some(reason) = name_violation(package, class, trusted) {
         return Err(refuse(reason));
     }
@@ -390,7 +390,7 @@ pub(crate) fn review(
         wanted,
         sources,
         unread,
-    } = plan_reads(archive, official).map_err(refuse)?;
+    } = plan_reads(archive, official).map_err(|reason| refuse(reason.to_string()))?;
     let mut read = archive.extract(&wanted)?;
 
     let pkginfo =
@@ -418,7 +418,7 @@ pub(crate) fn review(
 
     let install = read
         .get(".INSTALL")
-        .map(|bytes| content::classify(".INSTALL", false, true, bytes));
+        .map(|bytes| content::classify(".INSTALL", false, Reading::AsCode, bytes));
     let mut files = payload_files(&sources, &read);
     files.extend(named);
     files.sort_by(|left, right| left.path.cmp(&right.path));
@@ -522,13 +522,13 @@ struct Plan<'a> {
 /// said (`unread`) rather than refused: the checks that refuse a package
 /// still run on the rest, and the archive's digest covers what was not
 /// read.
-fn plan_reads(archive: &Archive, official: bool) -> Result<Plan<'_>, String> {
+fn plan_reads(archive: &Archive, official: bool) -> Result<Plan<'_>, Error> {
     let mut wanted: Vec<String> = Vec::new();
     let mut unread = Vec::new();
     match archive.entry(".PKGINFO") {
         Some(entry) if entry.size <= MAX_TEXT_FILE_SIZE => wanted.push(".PKGINFO".into()),
-        Some(_) => return Err(".PKGINFO is too large".into()),
-        None => return Err("the package has no .PKGINFO".into()),
+        Some(_) => return Err(Error::Message(".PKGINFO is too large".into())),
+        None => return Err(Error::Message("the package has no .PKGINFO".into())),
     }
     if let Some(entry) = archive.entry(".INSTALL") {
         if entry.size > MAX_TEXT_FILE_SIZE {
@@ -551,10 +551,10 @@ fn plan_reads(archive: &Archive, official: bool) -> Result<Plan<'_>, String> {
             {
                 continue;
             }
-            return Err(format!(
+            return Err(Error::Message(format!(
                 "/{} is a symbolic link standing in for a directory whose files run on their own",
                 entry.path
-            ));
+            )));
         }
         if matches!(entry.kind, Kind::Directory) || !is_reviewed(&entry.path, official) {
             continue;
@@ -694,7 +694,7 @@ fn named_files(
         naming.clear();
         for path in texts {
             let bytes = read.get(&path).cloned().unwrap_or_default();
-            let content = content::classify(&path, false, false, &bytes);
+            let content = content::classify(&path, false, Reading::ByName, &bytes);
             if matches!(content, Content::Text(_) | Content::Lossy { .. }) {
                 naming.push((path.clone(), path.clone()));
             }
