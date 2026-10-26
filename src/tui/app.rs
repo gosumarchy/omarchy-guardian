@@ -203,7 +203,7 @@ struct Choice {
 
 /// Simple mode shows the essentials; expert mode every setting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Mode {
+pub(crate) enum Mode {
     Simple,
     Expert,
 }

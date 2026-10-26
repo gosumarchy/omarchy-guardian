@@ -144,11 +144,20 @@ const PROTECT: [Integration; 8] = [
     Integration::SystemSweep,
 ];
 
+/// Whether `protect` asks before it changes anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Consent {
+    Ask,
+    /// Given on the command line (`--yes`).
+    Given,
+}
+
 /// `omarchy-guardian protect`: turns on every gate that is off, after
-/// showing each step and, unless `yes`, asking. The pacman hook is left off
+/// showing each step and, unless the user's consent was `Given` (`--yes`), asking. The pacman hook is left off
 /// when the pacman gate could not review with the current settings, since it
 /// would refuse every such install.
-pub(crate) fn protect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, Error> {
+pub(crate) fn protect(consent: Consent, confirm: &mut dyn Confirm) -> Result<String, Error> {
+    let yes = consent == Consent::Given;
     status::watched();
     let settings = Settings::load();
     let paths = paths(&settings).ok_or_else(|| Error::Message("HOME is not set".into()))?;
@@ -208,9 +217,10 @@ pub(crate) fn protect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, Er
 
 /// `omarchy-guardian protect --off`: turns the three install gates and the
 /// system sweep off (the menu entry and the bar widget stay), after showing
-/// each step and, unless `yes`, asking. A hand-installed pacman hook is left
+/// each step and, unless consent was `Given`, asking. A hand-installed pacman hook is left
 /// alone.
-pub(crate) fn unprotect(yes: bool, confirm: &mut dyn Confirm) -> Result<String, Error> {
+pub(crate) fn unprotect(consent: Consent, confirm: &mut dyn Confirm) -> Result<String, Error> {
+    let yes = consent == Consent::Given;
     status::watched();
     let settings = Settings::load();
     let paths = paths(&settings).ok_or_else(|| Error::Message("HOME is not set".into()))?;

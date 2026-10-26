@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use super::gate::{not_started, tree_content};
+use super::parse::{Protection, SetupScope};
 use super::{
     ConfigCommand, Confirm, Forget, Invocation, Target, forget_command, forget_in, guard_command,
     pacman_hook_command, parse, refusal, review_and_decide, reviews_for_the_user,
@@ -19,11 +20,14 @@ use crate::config::model::{AgentSettings, AiRequirement, Profile, SourceClass};
 use crate::engine::baseline::{self, Identity, Unit};
 use crate::engine::store::Store;
 use crate::permit::Standing;
+use crate::protect::Consent;
 use crate::report::Hashes;
 use crate::report::{Blocked, Decision};
 use crate::scan::ScanConfig;
+use crate::setup::GateAsk;
 use crate::test_support::{TempDir, mock_opencode, mock_opencode_findings};
 use crate::tools::OpenCode;
+use crate::tui;
 
 fn args(values: &[&str]) -> Vec<OsString> {
     values.iter().map(OsString::from).collect()
@@ -682,50 +686,35 @@ fn parses_config_subcommands() {
 fn parses_setup() {
     assert_eq!(
         parse(&args(&["setup"])).unwrap(),
-        Invocation::Setup {
-            gate: false,
-            if_needed: false
-        }
+        Invocation::Setup(SetupScope::Everything)
     );
     assert_eq!(
         parse(&args(&["setup", "--gate"])).unwrap(),
-        Invocation::Setup {
-            gate: true,
-            if_needed: false
-        }
+        Invocation::Setup(SetupScope::Gate(GateAsk::Always))
     );
     assert_eq!(
         parse(&args(&["setup", "--gate", "--if-needed"])).unwrap(),
-        Invocation::Setup {
-            gate: true,
-            if_needed: true
-        }
+        Invocation::Setup(SetupScope::Gate(GateAsk::IfNeeded))
     );
     assert!(parse(&args(&["setup", "extra"])).is_err());
     assert!(parse(&args(&["setup", "--if-needed"])).is_err());
     assert_eq!(
         parse(&args(&["protect"])).unwrap(),
-        Invocation::Protect {
-            yes: false,
-            off: false
-        }
+        Invocation::Protect(Protection::On, Consent::Ask)
     );
     assert_eq!(
         parse(&args(&["protect", "--off", "--yes"])).unwrap(),
-        Invocation::Protect {
-            yes: true,
-            off: true
-        }
+        Invocation::Protect(Protection::Off, Consent::Given)
     );
     assert!(parse(&args(&["protect", "--all"])).is_err());
     assert_eq!(parse(&args(&["test"])).unwrap(), Invocation::Test);
     assert_eq!(
         parse(&args(&["tui"])).unwrap(),
-        Invocation::Tui { expert: false }
+        Invocation::Tui(tui::Mode::Simple)
     );
     assert_eq!(
         parse(&args(&["settings", "--expert"])).unwrap(),
-        Invocation::Tui { expert: true }
+        Invocation::Tui(tui::Mode::Expert)
     );
     assert!(parse(&args(&["tui", "extra"])).is_err());
     assert_eq!(

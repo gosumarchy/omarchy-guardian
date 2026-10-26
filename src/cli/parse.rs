@@ -11,10 +11,13 @@ use crate::error::Error;
 use crate::makepkg_gate;
 use crate::pacman::HookArgs;
 use crate::permit;
+use crate::protect::Consent;
 use crate::report::Hashes;
 use crate::scan::ScanConfig;
+use crate::setup::GateAsk;
 use crate::sweep;
 use crate::tools::OpenCode;
+use crate::tui;
 
 use super::gate::Target;
 
@@ -66,23 +69,14 @@ pub(super) enum Invocation {
     MakepkgGate(Vec<OsString>),
     Config(ConfigCommand),
     Forget(Forget),
-    /// `setup`; with `gate`, only the pacman gate's reviewer, and with
-    /// `if_needed` only when the system file names none the gate can run.
-    Setup {
-        gate: bool,
-        if_needed: bool,
-    },
-    /// `protect [--yes]`: turn on every gate that is off.
-    Protect {
-        yes: bool,
-        off: bool,
-    },
+    Setup(SetupScope),
+    /// `protect [--off] [--yes]`: turn on every gate that is off, or with
+    /// `--off` turn them off.
+    Protect(Protection, Consent),
     /// `test`: the two-sample reviewer test of the saved settings.
     Test,
     Sweep(sweep::Command),
-    SweepCollect {
-        out: bool,
-    },
+    SweepCollect(sweep::root::CollectTo),
     /// Run as root by `sweep allow` and `sweep forget` through sudo.
     SweepAllowSystem(Vec<String>),
     /// `permit [ID | --revoke ID]`.
@@ -98,9 +92,21 @@ pub(super) enum Invocation {
     /// `status [--waybar | --dismiss | --open-report]`.
     Status(StatusMode),
     Update,
-    Tui {
-        expert: bool,
-    },
+    Tui(tui::Mode),
+}
+
+/// What `setup` asks about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SetupScope {
+    Everything,
+    /// `--gate`: only the pacman gate's reviewer.
+    Gate(GateAsk),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Protection {
+    On,
+    Off,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -243,26 +249,15 @@ pub(super) fn parse(args: &[OsString]) -> Result<Invocation, Error> {
             utf8_arguments("pacman-hook-result", rest).map(Invocation::HookResult)
         }
         Some("setup") => parse_setup(rest),
-        Some("protect") => {
-            let mut yes = false;
-            let mut off = false;
-            for flag in rest {
-                match flag.to_str() {
-                    Some("--yes" | "-y") => yes = true,
-                    Some("--off") => off = true,
-                    _ => {
-                        return Err(usage("usage: omarchy-guardian protect [--off] [--yes]"));
-                    }
-                }
-            }
-            Ok(Invocation::Protect { yes, off })
-        }
+        Some("protect") => parse_protect(rest),
         Some("test") if rest.is_empty() => Ok(Invocation::Test),
         Some("sweep") => parse_sweep(rest).map(Invocation::Sweep),
         // Run as root by `sweep --root`; not listed in the usage.
         Some("sweep-collect") => match rest {
-            [] => Ok(Invocation::SweepCollect { out: false }),
-            [flag] if flag == "--out" => Ok(Invocation::SweepCollect { out: true }),
+            [] => Ok(Invocation::SweepCollect(sweep::root::CollectTo::Stdout)),
+            [flag] if flag == "--out" => {
+                Ok(Invocation::SweepCollect(sweep::root::CollectTo::Results))
+            }
             _ => Err(usage("usage: omarchy-guardian sweep-collect [--out]")),
         },
         // Run as root by `sweep allow` and `sweep forget`; not listed.
@@ -293,8 +288,8 @@ pub(super) fn parse(args: &[OsString]) -> Result<Invocation, Error> {
             _ => Err(usage("usage: omarchy-guardian ask <report-id>")),
         },
         Some("tui" | "settings") => match rest {
-            [] => Ok(Invocation::Tui { expert: false }),
-            [flag] if flag == "--expert" => Ok(Invocation::Tui { expert: true }),
+            [] => Ok(Invocation::Tui(tui::Mode::Simple)),
+            [flag] if flag == "--expert" => Ok(Invocation::Tui(tui::Mode::Expert)),
             _ => Err(usage("usage: omarchy-guardian tui [--expert]")),
         },
         _ => Err(Error::Message(format!(
@@ -304,23 +299,30 @@ pub(super) fn parse(args: &[OsString]) -> Result<Invocation, Error> {
     }
 }
 
+/// `protect [--off] [--yes]`.
+fn parse_protect(rest: &[OsString]) -> Result<Invocation, Error> {
+    let mut consent = Consent::Ask;
+    let mut protection = Protection::On;
+    for flag in rest {
+        match flag.to_str() {
+            Some("--yes" | "-y") => consent = Consent::Given,
+            Some("--off") => protection = Protection::Off,
+            _ => {
+                return Err(usage("usage: omarchy-guardian protect [--off] [--yes]"));
+            }
+        }
+    }
+    Ok(Invocation::Protect(protection, consent))
+}
+
 /// `setup [--gate [--if-needed]]`.
 fn parse_setup(rest: &[OsString]) -> Result<Invocation, Error> {
     let flags: Vec<Option<&str>> = rest.iter().map(|flag| flag.to_str()).collect();
     match flags.as_slice() {
-        [] => Ok(Invocation::Setup {
-            gate: false,
-            if_needed: false,
-        }),
-        [Some("--gate")] => Ok(Invocation::Setup {
-            gate: true,
-            if_needed: false,
-        }),
+        [] => Ok(Invocation::Setup(SetupScope::Everything)),
+        [Some("--gate")] => Ok(Invocation::Setup(SetupScope::Gate(GateAsk::Always))),
         [Some("--gate"), Some("--if-needed")] | [Some("--if-needed"), Some("--gate")] => {
-            Ok(Invocation::Setup {
-                gate: true,
-                if_needed: true,
-            })
+            Ok(Invocation::Setup(SetupScope::Gate(GateAsk::IfNeeded)))
         }
         _ => Err(usage(
             "usage: omarchy-guardian setup [--gate [--if-needed]]",

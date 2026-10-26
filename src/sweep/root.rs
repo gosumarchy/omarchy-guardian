@@ -170,11 +170,21 @@ fn news(items: &[Item], seen: Option<TrustSeen>, now: u64) -> (Option<Vec<String
 /// Where the scheduled root collector leaves what it found.
 pub(crate) const RESULTS: &str = "/var/lib/omarchy-guardian/sweep/root.json";
 
+/// Where `sweep-collect` puts what it found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CollectTo {
+    /// For `sweep --root`, which runs it through sudo.
+    Stdout,
+    /// `RESULTS`, for the daily system timer (`--out`).
+    Results,
+}
+
 /// `omarchy-guardian sweep-collect [--out]`: run as root, by `sweep --root`
 /// through sudo (printing to stdout), or by the daily system timer with
 /// `--out` (writing `RESULTS`, only when the system configuration allows
 /// it, readable by the configured group).
-pub(crate) fn collect_command(out: bool, settings: &crate::config::Settings) -> ExitCode {
+pub(crate) fn collect_command(to: CollectTo, settings: &crate::config::Settings) -> ExitCode {
+    let out = to == CollectTo::Results;
     if !user::effective_uid().is_ok_and(|uid| uid == 0) {
         errln!(
             "omarchy-guardian sweep-collect: only `sweep --root` and its timer run this, as root"

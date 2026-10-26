@@ -19,7 +19,7 @@ use crate::makepkg_gate;
 use crate::notify;
 use crate::pacman::{self, HookArgs};
 use crate::permit::{self, Content};
-use crate::protect;
+use crate::protect::{self, Consent};
 use crate::report::{Decision, Hashes};
 use crate::setup;
 use crate::status;
@@ -32,7 +32,7 @@ mod parse;
 
 pub(crate) use gate::{Confirm, Target, TtyConfirm, Verdict, passed, review_and_decide};
 use gate::{exec_command, guard_command, sandbox_command};
-use parse::{ConfigCommand, Forget, Invocation, StatusMode, USAGE, parse};
+use parse::{ConfigCommand, Forget, Invocation, Protection, SetupScope, StatusMode, USAGE, parse};
 
 const USAGE_ERROR: u8 = 2;
 
@@ -92,10 +92,11 @@ pub(crate) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
         Invocation::HookPreflight => preflight_command(&settings),
         Invocation::Config(command) => config_command(&command, &settings),
         Invocation::Forget(forget) => forget_command(&forget, Store::default_root()),
-        Invocation::Setup { gate, if_needed } => match if gate {
-            setup::run_gate(&mut setup::TtyTerminal, &setup::RealEnvironment, if_needed)
-        } else {
-            setup::run(&mut setup::TtyTerminal, &setup::RealEnvironment)
+        Invocation::Setup(scope) => match match scope {
+            SetupScope::Gate(ask) => {
+                setup::run_gate(&mut setup::TtyTerminal, &setup::RealEnvironment, ask)
+            }
+            SetupScope::Everything => setup::run(&mut setup::TtyTerminal, &setup::RealEnvironment),
         } {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {
@@ -103,7 +104,7 @@ pub(crate) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
                 ExitCode::from(2)
             }
         },
-        Invocation::Protect { yes, off } => protect_command(yes, off),
+        Invocation::Protect(protection, consent) => protect_command(protection, consent),
         Invocation::Test => {
             outln!("Testing the reviewer with a malicious and a harmless sample...");
             let (report, passed) = protect::test();
@@ -115,7 +116,7 @@ pub(crate) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
             }
         }
         Invocation::Sweep(command) => sweep::command(&command, &settings),
-        Invocation::SweepCollect { out } => sweep::root::collect_command(out, &settings),
+        Invocation::SweepCollect(to) => sweep::root::collect_command(to, &settings),
         Invocation::SweepAllowSystem(arguments) => sweep::root::system_allow_command(&arguments),
         Invocation::Status(mode) => status_command(mode),
         Invocation::Update => crate::update::command(),
@@ -123,7 +124,7 @@ pub(crate) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
             errln!("omarchy-guardian ask: {}", ask::run(&target, &settings));
             ExitCode::from(2)
         }
-        Invocation::Tui { expert } => match tui::run(expert) {
+        Invocation::Tui(mode) => match tui::run(mode) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {
                 errln!("omarchy-guardian tui: {message}");
@@ -149,15 +150,17 @@ fn preflight_command(settings: &Settings) -> ExitCode {
 
 /// `protect [--off]`: every gate on, or the install gates off; what came of
 /// it goes into the audit trail.
-fn protect_command(yes: bool, off: bool) -> ExitCode {
-    let outcome = if off {
-        protect::unprotect(yes, &mut TtyConfirm)
-    } else {
-        protect::protect(yes, &mut TtyConfirm)
+fn protect_command(protection: Protection, consent: Consent) -> ExitCode {
+    let (outcome, command) = match protection {
+        Protection::On => (protect::protect(consent, &mut TtyConfirm), "protect"),
+        Protection::Off => (
+            protect::unprotect(consent, &mut TtyConfirm),
+            "protect --off",
+        ),
     };
     match outcome {
         Ok(message) => {
-            audit::gate_changed(if off { "protect --off" } else { "protect" }, "", &message);
+            audit::gate_changed(command, "", &message);
             outln!("{message}");
             ExitCode::SUCCESS
         }

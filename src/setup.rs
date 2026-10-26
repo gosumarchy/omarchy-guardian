@@ -839,18 +839,27 @@ fn offer_system_file(
     Ok(())
 }
 
+/// When `run_gate` asks its question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GateAsk {
+    Always,
+    /// Only when the gate cannot run its model or runs a free one (`--if-needed`).
+    IfNeeded,
+}
+
 /// `setup --gate`: the gate's question alone, for a reviewer installed
 /// after setup ran or a gate left on OpenCode's free model. Only the gate's
 /// models change in the system file; the user file is not touched. With
-/// `if_needed` (the installer's reinstall), nothing is asked unless the
+/// `GateAsk::IfNeeded` (the installer's reinstall), nothing is asked unless the
 /// gate cannot run its model, or runs a free one, and there is something
 /// better to offer; nor when the user chose local-only and the system file
 /// names no profile.
 pub(crate) fn run_gate(
     terminal: &mut dyn Terminal,
     environment: &dyn Environment,
-    if_needed: bool,
+    ask: GateAsk,
 ) -> Result<(), Error> {
+    let if_needed = ask == GateAsk::IfNeeded;
     let existing = environment.existing_system()?;
     let config = existing
         .as_ref()
@@ -1565,7 +1574,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Choice, Environment, Gate, Terminal, read_answer, render_system, render_user, run,
+        Choice, Environment, Gate, GateAsk, Terminal, read_answer, render_system, render_user, run,
         run_gate, validate_rendered,
     };
     use crate::config::file::parse;
@@ -2277,7 +2286,7 @@ mod tests {
         };
         let mut terminal = script(&["", "y"]);
 
-        run_gate(&mut terminal, &environment, true).unwrap();
+        run_gate(&mut terminal, &environment, GateAsk::IfNeeded).unwrap();
 
         assert!(environment.user_written.borrow().is_none());
         let written = environment.system_written.borrow().clone().unwrap();
@@ -2305,7 +2314,7 @@ mod tests {
         };
         let mut terminal = script(&[]);
 
-        run_gate(&mut terminal, &environment, true).unwrap();
+        run_gate(&mut terminal, &environment, GateAsk::IfNeeded).unwrap();
 
         assert!(terminal.output.is_empty());
         assert!(environment.system_written.borrow().is_none());
@@ -2324,7 +2333,7 @@ mod tests {
         // ones, then confirm
         let mut terminal = script(&["", "y"]);
 
-        run_gate(&mut terminal, &environment, true).unwrap();
+        run_gate(&mut terminal, &environment, GateAsk::IfNeeded).unwrap();
 
         assert!(
             terminal
@@ -2442,7 +2451,7 @@ mod tests {
         };
         let mut terminal = script(&["", "y"]);
 
-        run_gate(&mut terminal, &environment, false).unwrap();
+        run_gate(&mut terminal, &environment, GateAsk::Always).unwrap();
 
         let system = written_system(&environment);
         assert_eq!(
@@ -2475,7 +2484,7 @@ mod tests {
         };
         let mut terminal = script(&["", "y"]);
 
-        run_gate(&mut terminal, &environment, true).unwrap();
+        run_gate(&mut terminal, &environment, GateAsk::IfNeeded).unwrap();
 
         assert_eq!(
             written_system(&environment).agent.model.as_deref(),
@@ -2493,7 +2502,7 @@ mod tests {
             ..Fake::default()
         };
         let mut terminal = script(&[]);
-        run_gate(&mut terminal, &environment, true).unwrap();
+        run_gate(&mut terminal, &environment, GateAsk::IfNeeded).unwrap();
         assert!(terminal.output.is_empty());
 
         // Nothing root-owned at all.
@@ -2502,7 +2511,7 @@ mod tests {
             ..Fake::default()
         };
         let mut terminal = script(&[]);
-        run_gate(&mut terminal, &environment, true).unwrap();
+        run_gate(&mut terminal, &environment, GateAsk::IfNeeded).unwrap();
         assert!(terminal.output.is_empty());
     }
 
@@ -2515,7 +2524,7 @@ mod tests {
         };
         let mut terminal = script(&[]);
 
-        run_gate(&mut terminal, &environment, true).unwrap();
+        run_gate(&mut terminal, &environment, GateAsk::IfNeeded).unwrap();
 
         assert!(terminal.output.is_empty());
         assert!(environment.system_written.borrow().is_none());

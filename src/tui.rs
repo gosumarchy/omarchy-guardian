@@ -28,14 +28,14 @@ use crate::protect::{paths, run_plan, test_reviewer};
 use crate::setup::{self, Environment as _};
 use crate::status;
 
-use app::{App, Effect, Loaded, Mode, Task};
+pub(crate) use app::Mode;
+use app::{App, Effect, Loaded, Task};
 use canvas::Canvas;
 use fields::{HEADER, Scope};
 use term::{TTY, Terminal};
 
-pub(crate) fn run(expert: bool) -> Result<(), Error> {
+pub(crate) fn run(mode: Mode) -> Result<(), Error> {
     let mut terminal = Terminal::open().at(Path::new(TTY))?;
-    let mode = if expert { Mode::Expert } else { Mode::Simple };
     status::watched();
     let mut app = App::new(load_files(), mode);
     let mut size = (0, 0);
