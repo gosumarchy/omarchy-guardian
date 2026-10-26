@@ -16,6 +16,7 @@ described.
   - [Programs ahead of the system's own](#programs-ahead-of-the-systems-own)
   - [More that decides what runs](#more-that-decides-what-runs)
   - [Neovim plugins](#neovim-plugins)
+  - [Browser extensions](#browser-extensions)
   - [Accounts, keys and trust anchors](#accounts-keys-and-trust-anchors)
   - [Guardian's own units](#guardians-own-units)
 - [What runs now](#what-runs-now)
@@ -82,7 +83,7 @@ them into `/etc/skel`).
 | Kernel modules and parameters | `sysctl.d`, `modules-load.d`, `binfmt.d` and `modprobe.d` under `/usr/lib` and `/etc` | | gate and sweep |
 | udev rules | `/usr/lib/udev/rules.d`, `/etc/udev/rules.d`, `/usr/local/lib/udev/rules.d` | | gate and sweep |
 | Boot loader: what entries and the kernel command line are built from | `/usr/share/limine-entry-tool.d`, `/etc/limine-entry-tool.d`, `/etc/cmdline.d` | | gate and sweep |
-| Boot loader: its own configuration | The Limine config (`/boot/limine.conf`, `/etc/default/limine`), `/etc/kernel/cmdline` | | sweep only |
+| Boot loader: its own configuration | Limine's (`/boot/limine.conf`, `/boot/limine/limine.conf`, `/boot/EFI/limine/limine.conf`, `/etc/default/limine`), systemd-boot's (`/boot/loader/loader.conf`, `/boot/loader/entries/`), GRUB's (`/boot/grub/grub.cfg`, `/boot/grub/custom.cfg`, `/etc/default/grub`, the scripts in `/etc/grub.d/`), `/etc/kernel/cmdline`, the UEFI shell's `startup.nsh` (`/boot`, `/boot/EFI/BOOT`), rEFInd's `/boot/EFI/*/refind.conf` | | sweep only |
 | Initramfs and kernel install hooks | initcpio (`/usr/lib/initcpio/hooks`, `install` and `post`, `/etc/initcpio`), `/etc/mkinitcpio.conf`, `/etc/mkinitcpio.conf.d`, `/etc/mkinitcpio.d`, `kernel/install.d` under `/usr/lib` and `/etc`, DKMS build configuration (`/usr/src/*/dkms.conf`) | | gate and sweep |
 | Dynamic linker and Python start-up | `/etc/ld.so.preload`, `/etc/ld.so.conf`, `/etc/ld.so.conf.d`, `/etc/nsswitch.conf`; Python's `.pth`, `sitecustomize.py` and `usercustomize.py` files in `/usr/lib/python*/site-packages` and `/usr/lib/python*/sitecustomize.py`, which every Python program runs at start | Your own `.pth`, `sitecustomize.py` and `usercustomize.py` in `~/.local/lib/python*/site-packages` | gate and sweep |
 | Preferred libraries | Libraries in `/usr/lib/glibc-hwcaps` | | sweep only |
@@ -428,8 +429,8 @@ What is a finding, on every sweep:
   `branch.<name>.remote = origin` and `merge`; `submodule.active = .`,
   `submodule.<name>.active = true` and, in the checkout's own `config`,
   `submodule.<name>.url` when it is the one url the checkout's `.gitmodules`
-  gives that name (a file of the plugin, reviewed when it changes); and `extensions.worktreeConfig`,
-  `partialClone = origin` and `objectFormat`. Anything else is a finding,
+  gives that name (a file of the plugin, reviewed when it changes); and
+  `extensions.worktreeConfig`, `partialClone = origin` and `objectFormat`. Anything else is a finding,
   as it may make the git commands lazy.nvim runs run a program or fetch from
   elsewhere: a command key such as `core.fsmonitor`, `core.hooksPath`, a
   proxy, `http.sslVerify`, another remote, `include.path`, a submodule url
@@ -490,6 +491,57 @@ default, specs built by code, the other files of a plugin (data, documentation,
 anything not executable and not named above), which count for whether it
 changed but are neither sent nor reported, and what lazy.nvim fetches when a
 plugin is installed or updated: the sweep sees a plugin once it is on disk.
+
+### Browser extensions
+
+An extension runs inside the browser, in every page its granted hosts cover,
+and no file of an auto-run location says it is there. For each profile
+(`Default`, `Profile N`) of Chromium, Brave and Google Chrome
+(`~/.config/chromium`, `~/.config/BraveSoftware/Brave-Browser`,
+`~/.config/google-chrome`) the sweep reads the extensions listed in
+`Preferences` and `Secure Preferences` (the latter wins where both list one),
+with each extension's `manifest.json` for its name, version and update URL
+(the one on disk, which the browser loads; a copy in the preferences counts
+only where there is no directory).
+For Firefox (`~/.mozilla/firefox`, `~/.config/mozilla/firefox`) and Zen
+(`~/.zen`) it reads each profile's `extensions.json`. The browsers' own
+extensions (Chromium's component extensions, where the preferences say one
+loads from under `/usr` or `/opt`, and Firefox's built-in add-ons) and
+Firefox themes, dictionaries and language packs are not listed.
+
+Each extension is an item of its own, named by its profile and id
+(`~/.config/chromium/Default#extension:<id>`), with its name and version in
+a note:
+
+| What it is | How it is shown |
+| --- | --- |
+| From the Chrome Web Store (its update URL is the store's) or addons.mozilla.org | listed, no alert |
+| Installed from anywhere else (another update URL, or none) | `risky-configuration`, with the host it updates from |
+| Loaded unpacked (developer mode, `--load-extension`, a temporary add-on) | `risky-configuration`, with the directory |
+| Loaded unpacked from a directory whose every file a package installed, unchanged | trusted, only counted (Omarchy loads its own extensions this way) |
+| Installed in Firefox without Mozilla's signature | `risky-configuration` |
+| Installed in Firefox for every user (`/usr/lib/mozilla/extensions` and the like) with no source, from a file a package installed, unchanged | trusted, only counted |
+| The same, from a file no package installed as it is | `risky-configuration` |
+| Its manifest cannot be read, and the browser marks it as from its store | listed with a note, no alert; the sweep is incomplete |
+| Its manifest cannot be read, and the browser does not mark it as from its store | `risky-configuration`; the sweep is incomplete |
+
+What the sweep remembers of an extension is its id, where it came from and the
+permissions and hosts it was granted, not its version: an update that grants
+nothing new is no change, an extension installed since the last sweep is new,
+and one granted more (or less) is changed, in `--diff` and the daily
+notification like any item. Allow the ones you know with `sweep allow`; one
+that is granted more after that shows again.
+
+These are local rules only. The preferences files hold your browsing data:
+they are read on this machine, and only what makes the item (id, name,
+version, source, granted permissions and hosts) is kept from them. Nothing of
+an extension is sent to the AI, its code is not reviewed, and the extension
+data directories are not read. A preferences file that cannot be read or
+parsed leaves that profile not checked, and the sweep incomplete; so does a
+profile directory whose name is not UTF-8, and an extension listed under an
+id the browser does not make is counted as not checked. At most 32
+profiles of a browser and 500 extensions of a profile are checked; past that the
+sweep says what was left out and is incomplete. It costs no AI call.
 
 ### Accounts, keys and trust anchors
 
@@ -815,9 +867,74 @@ keeps older kernels for its snapshot entries, and no installed package can
 vouch for those. `/boot` is usually root's alone, so this is the root checks'
 to do, and your own sweep says so in a note.
 
+Every EFI program under `/boot` (a `.efi` file; the first 64, more is said)
+is compared by SHA-256 with the ones packages ship for a boot loader tool to
+copy there: Limine (`/usr/share/limine`), systemd-boot and its UKI stub
+(`/usr/lib/systemd/boot/efi`), fwupd, shim and rEFInd, each only while it is
+still what its package shipped. Some tools change the copy after install in known ways, and those changes are put back before the
+comparison, so a program that differs only by them counts as packaged: a
+signature `sbctl` or `sbsign` added (the certificate table at the end, the
+header entry that points at it, the header checksum and the alignment
+padding), and the hash of `limine.conf` that `limine enroll-config` writes
+into Limine (put back before comparing, not checked against `limine.conf`).
+Everything the firmware loads must still be the package's
+bytes.
+
+| What it is | How it is shown |
+| --- | --- |
+| A packaged program, as shipped, signed since, or with the configuration hash enrolled | trusted, not listed |
+| A unified kernel image (UKI) built from systemd's packaged stub around a kernel a kernel package ships | one note; the initramfs and command line inside are built on this machine and are not comparable |
+| A UKI built from the packaged stub around a kernel no installed package ships, in one of the directories the boot loaders start from (below) or whose `.uname` is the running release | a high finding (`boot-tampering`), like a kernel image the machine starts |
+| Such a UKI anywhere else | listed with a note and no alert, like an older kernel image |
+| A UKI where no packaged stub is installed to compare it with | in those directories a high finding (`boot-tampering`); elsewhere listed with a note: not comparable |
+| The packaged UEFI shell (`/usr/share/edk2-shell`), anywhere in `/boot` | a high finding (`boot-tampering`) |
+| GRUB's program (`grub*.efi`) where the grub package is installed, which `grub-install` builds on this machine | listed with a note: not comparable |
+| Any other program in `/boot/EFI/BOOT`, `/boot/EFI/limine`, `/boot/EFI/systemd` or `/boot/EFI/Linux` | a high finding (`boot-tampering`) |
+| Any other program elsewhere (another system's boot loader on a shared ESP, a firmware tool) | listed with a note and no alert |
+
+A UKI counts as built from the stub when it starts where the stub does, has
+the stub's data directories (but the certificate table), holds every section
+of the stub at the same address with the same flags and bytes (`.sbat`, into
+which `ukify` merges the kernel's entries, may have grown), lists no section
+twice (and no more than 96), has no two sections over the same addresses
+(a section's extent is the larger of its virtual and raw sizes, as a loader
+copies the raw size where the virtual size is 0), and adds only the
+sections the UKI format defines, none of them marked executable. A UKI that is not,
+or a `grub*.efi` where the grub package is not installed, is told like any
+other program: in the directories above, a finding. A program larger than the
+2 MiB kept of every file is read again whole (up to 256 MiB) and checked to
+be the file that was hashed; one that cannot be is not compared, and for the
+root checks the sweep is incomplete. So is one larger than that, and a `.efi`
+link in `/boot` that leads anywhere but to another `.efi` file in `/boot`: an
+ESP has no links, and the file it leads to is not compared.
+
+A listed program can be allowed as it is. Nothing from `/boot` goes to the AI
+review: kernel images and EFI programs are judged by these local rules alone,
+even one whose bytes read as text. The one exception is the boot
+configuration, which is reviewed as a file like any other: Limine's
+`limine.conf` (in `/boot`, `/boot/limine` or `/boot/EFI/limine`),
+systemd-boot's `loader/loader.conf` and `loader/entries/*`, GRUB's
+`grub/grub.cfg`, a `startup.nsh` for the UEFI shell (in `/boot` or
+`/boot/EFI/BOOT`) and rEFInd's `refind.conf`. The UEFI shell is a finding
+anywhere in `/boot` because a trusted boot loader can start it from any path
+(systemd-boot's `auto-efi-shell`), and it runs `startup.nsh`.
+
+What this machine shows, as Omarchy sets it up: Limine is the boot loader,
+`limine-install` copies `/usr/share/limine/BOOTX64.EFI` to
+`/boot/EFI/limine/limine_x64.efi` (with a backup archive beside it) and to the
+firmware's default `/boot/EFI/BOOT/BOOTX64.EFI`, and snapper keeps older
+kernels for its snapshot entries. Unified kernel images are off by default
+(`ENABLE_UKI=no` in `/etc/limine-entry-tool.conf`) and so is enrolling the
+configuration hash; both are told apart when they are turned on, and so is a
+signature once `sbctl` is set up. The directories above assume the ESP is
+mounted at `/boot`, as Omarchy mounts it: under an ESP at `/boot/efi` an
+unknown program is only listed with a note, and an ESP at `/efi` is not looked
+at.
+
 A note also says whether Secure Boot is on; that it is off is said once, and
-after that only with `--all`, until it changes. The EFI programs (the boot
-loader itself) and what is inside the initramfs image are not looked at.
+after that only with `--all`, until it changes. What is inside the initramfs
+image is not compared: mkinitcpio builds it on this machine, so no package has
+a copy.
 
 ## How each item is judged
 
@@ -880,9 +997,10 @@ memory, so a repeated sweep of an unchanged system makes no AI call.
 
 ### What is kept from the AI
 
-Four kinds of file are read on this machine only. Each says so in a note on
-its item (accounts, keys and certificate authorities do not: they are facts
-with no text to send), and being kept makes no sweep incomplete.
+Five kinds of file are read on this machine only. Each says so in a note on
+its item (accounts, keys, certificate authorities and browser extensions do
+not: they are facts with no text to send), and being kept makes no sweep
+incomplete.
 
 - **A file whose path marks it as holding secrets** is never sent, whether or
   not something runs it and whatever its first line: anything under `.ssh`,
@@ -951,12 +1069,49 @@ with no text to send), and being kept makes no sweep incomplete.
 - **Settings that hold tokens**: the package-manager settings, an editor's
   `settings.json`, fish's saved variables, accounts, keys, certificate
   authorities and `/etc/hosts`, each checked by the rules for its kind (see
-  [More that decides what runs](#more-that-decides-what-runs)).
+  [More that decides what runs](#more-that-decides-what-runs)), and browser
+  extensions ([Browser extensions](#browser-extensions)).
 - **A file a live check names that nothing says is a script.** The live checks
   go by a process's arguments, and an argument may as well be a data file
   (`node --env-file …`). Its text is sent only where it starts with `#!` or
   has a script's name (`.sh`, `.py`, `.js` and the like), and is under no
   secret path; anything else is hashed, listed and read by the local rules.
+- **Boot configuration that holds a secret the exact rule below cannot take
+  out** is read like a file whose path marks it as holding secrets (above):
+  the secret wins over the review. That is a line with a word that starts
+  with `password` in any case (GRUB's plain `password <user> <password>`,
+  `password_pbkdf2` or `password_argon2` in any shape but the exact one
+  below, also inside a `menuentry` or after `then`, or a comment that names
+  one, `# Password: …`), a GRUB password hash (`grub.pbkdf2.`,
+  `grub.argon2.`) anywhere else, a line that names `GRUB_USERS` (whose
+  entries end in a password), a word between blanks with a `:` before an
+  `@` (the user and password of an address, with a scheme as in
+  `cifs://alice:p;ss@nas` or without one as in dracut's
+  `netroot=iscsi:user:password@server…`; a `subvol=@` or `getty@tty1` has
+  none) or with an `@` and an odd number of one kind of quote (a quoted
+  password with a blank in it; an `@` right after `=` or `=/`, as in a
+  quoted `"quiet rootflags=subvol=@"`, is passed over, but any other quoted
+  string with an `@` and a blank keeps the file too. A quoted password that
+  holds a blank and whose last part before the `@` ends in `=` is read as a
+  value such as `subvol=@` and is not caught), an assignment to a name that
+  says secret (`GRUB_PASSWORD=…`, `GRUB_PASSWORD+=…`, `X_PASSWORD[0]=…`,
+  `${LUKS_PASSWORD}=…`, as for masking below, whatever the value, also as
+  the last part of a dotted name such as `cifs.password=`; only
+  systemd-cryptsetup's `rd.luks.key=` and `luks.key=` are passed over, as
+  their value is where a key file is, never the key) or to dracut's
+  `cifspass=`, `set [-flags] NAME value` with such a name (the UEFI shell's
+  form in `startup.nsh`, in any case and after an `@`), or, in a file that
+  runs `cryptomount`, a word that starts with `-p` or `--password` on any
+  line (its options may go on after a `\`). The text is read as written,
+  not as GRUB parses it: a word joined from quoted parts, or split by a `\`
+  at the end of a line, is not seen. This fails closed: a file kept this
+  way that something runs raises `kept-from-review`. Where the only secret
+  is a hash on an exact line, the hash is taken out (below) and the rest of
+  the file is reviewed. So a modified `/etc/grub.d/00_header`, which writes
+  GRUB's password lines, goes to the local rules only (a modified package
+  file, and `kept-from-review`), not to the AI. So does a modified
+  `/etc/grub.d/31_efi_bootnext`: its stock `ACTIVE_PAT='\*'` is an
+  assignment to a name that ends in `PAT`, which reads as a token's.
 
 A file an SSH `Include` names by its full path or with `~` is followed and
 checked the same way, one with `*` in its last part to the files it matches. A
@@ -998,8 +1153,8 @@ never run or uploaded.
 
 ### What is taken out of a file that is sent
 
-Before a file is reviewed, two things are taken out of its text, for the local
-rules and the AI alike:
+Before a file is reviewed, three things are taken out of its text, for the
+local rules and the AI alike:
 
 - the value of an assignment whose name says secret: a part of it between
   `_` is `KEY`, `APIKEY`, `TOKEN`, `AUTHTOKEN`, `PAT`, `SECRET`, `PASSWORD`,
@@ -1010,7 +1165,11 @@ rules and the AI alike:
   with or without quotes around it. The forms read are shell, `NAME=value`
   (with or without blanks around the `=`), unit `Environment=` and fish `set`;
 - the password of an address (`https://user:password@…`), where it is plain
-  characters, the user and host staying.
+  characters, the user and host staying;
+- the hash of a GRUB password, on a line that is exactly `password_pbkdf2
+  <user> grub.pbkdf2.sha512.<rounds>.<salt>.<hash>` (digits and hexadecimal,
+  nothing else on the line). Such a hash can carry no code; a line of any
+  other shape stays whole.
 
 Start-up files are where exported keys live, and the sweep runs on a timer.
 The rule is kept this narrow on purpose: what is taken out is hidden from the
@@ -1212,7 +1371,8 @@ Guardian left there):
 
 Results written by an older Guardian are still read, but count for less: what
 your own sweep leaves to the root checks stays marked as not covered, with a
-note, until the collector has run again. Results of a version this Guardian
+note, until the collector has run again. Results written before the collector compared the
+EFI programs in `/boot` count as such. Results of a version this Guardian
 does not know are not read at all, and the sweep says to reinstall.
 
 The results file makes the root-only items it lists (a sudoers drop-in no
@@ -1364,20 +1524,20 @@ reviews as well, are listed under [Local rules](local-rules.md#rule-ids).
 | `path-hijack` | high | A program or directory a user can write comes ahead of the system's own on `PATH` and takes over a command's name. |
 | `new-trust` | high | Something that was not there at the last sweep may now log in, administer or vouch here: an account, a member of an administrator group, an SSH key or a certificate authority. |
 | `privileged-account` | high | An account has rights no ordinary system gives it: a second account with user id 0, or a system account someone can log in to. |
-| `boot-tampering` | high | The running kernel was started with a parameter that turns off a defence or replaces init and that the reviewed boot configuration does not hold, or a kernel image in `/boot` is not the one its package ships. |
+| `boot-tampering` | high | The running kernel was started with a parameter that turns off a defence or replaces init and that the reviewed boot configuration does not hold, or a kernel image or EFI program in `/boot` is not the one its package ships. |
 | `rootkit-sign` | high | The kernel's own lists disagree (a process, module or socket that exists is not listed), or a program wears a kernel thread's name: what something hiding itself looks like. |
 | `traced-secrets` | high | A process is attached, the way a debugger is, to a program that holds secrets (a shell, SSH, sudo, a key agent, a browser, a password manager). |
 | `ssh-command` | medium | An SSH file runs a command or loads a library (a `ProxyCommand`, a `Match exec`, a provider library), or a key carries a `command=` or `environment=` option. |
 | `running-from-temp` | medium | A program runs from a temporary or cache directory, where downloads land. |
 | `keyboard-reader` | medium | A program no package installed reads the keyboard device directly. |
-| `risky-configuration` | medium | A configuration file redirects where programs, packages or web pages come from, or loads code into a program at every start. |
+| `risky-configuration` | medium | A configuration file redirects where programs, packages or web pages come from, or loads code into a program at every start; or a browser extension was loaded unpacked, installed from outside the browser's store, or is not signed. |
 | `unexpected-capability` | medium | A packaged program holds file capabilities its package does not set (pacman does not record them, so the file itself is unchanged). |
 | `network-relay` | medium | A tool that runs or forwards what it is told over the network (netcat, socat, a tunnel) listens or is connected. |
 | `traced-process` | medium | Another process is attached to this one the way a debugger is, and can read and change its memory. |
 | `kernel-tap` | medium | Something no package explains taps the kernel's network or tracing path: a raw packet socket, or a pinned eBPF object. |
 | `plugin-source` | medium | An editor plugin is not a git checkout of where its plugin manager fetches it from: its origin is not the address its spec names, it names no origin, or it is no checkout at all. |
 | `plugin-build` | medium | An editor plugin runs a program when its plugin manager installs or updates it: a shell command as its build step, a field whose key code computes and that may be one, or a git hook in its checkout. |
-| `kept-from-review` | medium | Something runs this file, or a shell reads it in, and it holds more than opaque values kept in secret-named or plainly inert variables; its path marks it as holding secrets, so the AI review did not read it: only the local rules did. Read it yourself; `sweep allow` records that you did. |
+| `kept-from-review` | medium | Something runs this file, or a shell reads it in, and it holds more than opaque values kept in secret-named or plainly inert variables; it holds secrets (by its path or a boot password), so the AI review did not read it: only the local rules did. Read it yourself; `sweep allow` records that you did. |
 | `network-listener` | low | A program listens on the network that nothing installed accounts for: an interpreter (Python, a shell, Node), or a packaged program no packaged service runs. |
 
 `git-config-command` and `remote-shell` are reported by the sweep as well as

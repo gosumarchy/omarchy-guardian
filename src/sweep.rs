@@ -13,6 +13,7 @@
 //!   review; `output` shows it.
 //! - `nvim` collects the Neovim plugins lazy.nvim installed, each judged
 //!   as a whole and reviewed once it changes.
+//! - `extensions` lists the browser extensions of the home's profiles.
 //! - `root` is the read-only root collector behind `sweep --root`.
 
 mod access;
@@ -20,6 +21,7 @@ mod boot;
 pub(crate) mod collect;
 mod commands;
 mod config;
+mod extensions;
 mod index;
 mod judge;
 mod live;

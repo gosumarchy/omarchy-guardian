@@ -37,15 +37,29 @@ matter most:
   root can rewrite, and the pacman gate reviews as the user who called `sudo`,
   with that user's reviewer login.
 - **System sweep:** as a user only your own processes can be looked at, and
-  without root checks every sweep is incomplete. The EFI programs and the
-  inside of the initramfs image are not looked at; other mounted filesystems
-  (`/mnt`, `/media`, `/run/media`) are not searched for setuid files; the
-  running kernel's modules are not checked between a kernel update and the
-  next boot; what a process does to its own environment after it started is
-  not seen; and only shell scripts no package vouches for are looked through
-  for what they start, three deep, not scripts of other interpreters, and
-  inside a script only a program named by a path in the place of a command
-  ([System sweep](system-sweep.md#where-following-stops)).
+  without root checks every sweep is incomplete. The inside of the initramfs
+  image, and of a unified kernel image except its stub and kernel, is not
+  compared, as it is built on the machine; GRUB's EFI program is listed as not
+  comparable; a signature on an EFI program, and Limine's enrolled
+  configuration hash, are put back before comparing, not checked (the hash not
+  against `limine.conf`); EFI programs are judged as the boot loader's only
+  where the ESP is mounted at `/boot` (as on Omarchy): under an ESP at
+  `/boot/efi` an unknown one is only listed with a note, and an ESP at `/efi`
+  is not looked at; only files named `.efi` are compared, and the firmware's
+  boot entries (NVRAM) are not read; rEFInd's configuration is found only as
+  `refind.conf` in lower case, though FAT ignores case; files rEFInd
+  `include`s or GRUB `source`s or `configfile`s, other than
+  `/boot/grub/custom.cfg`, are not collected; browser
+  extensions are judged by where they came from and what they were granted,
+  not by their code, and only Chromium's, Brave's, Chrome's, Firefox's and
+  Zen's; other mounted filesystems (`/mnt`, `/media`, `/run/media`) are not
+  searched for setuid files; the running kernel's modules are not checked
+  between a kernel update and the next boot; what a process does to its own
+  environment after it started is not seen; and only shell scripts no package
+  vouches for are looked through for what they start, three deep, not scripts
+  of other interpreters, and inside a script only a program named by a path in
+  the place of a command ([System
+  sweep](system-sweep.md#where-following-stops)).
 - **Packages:** only scriptlets, auto-run files and the text files those name
   are reviewed, not the rest of the payload; a removal is not reviewed; a unit
   you enable yourself later is not reviewed then; front ends that call libalpm
@@ -130,8 +144,8 @@ The full text of each limit is on the page of its part, not repeated here:
   reads](system-sweep.md#what-it-reads)), Neovim plugins taken as they are at
   the first sweep and the plugin managers not covered ([Neovim
   plugins](system-sweep.md#neovim-plugins)), what the live checks miss ([What
-  runs now](system-sweep.md#what-runs-now)), the EFI programs and the
-  initramfs ([How the machine was
+  runs now](system-sweep.md#what-runs-now)), the initramfs and what else in
+  `/boot` is built on the machine ([How the machine was
   started](system-sweep.md#how-the-machine-was-started)), pacman's records
   taken as intact ([How each item is
   judged](system-sweep.md#how-each-item-is-judged)), secrets that still go

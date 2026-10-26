@@ -29,23 +29,25 @@ it shows on hover:
   start-up files on this machine that no package vouches for, with the scripts
   they run, and the Lua, Vimscript, shell and build files of a Neovim plugin
   that are new or changed since an earlier sweep. A file whose name or path
-  marks it as holding keys or tokens (`.env`, `*.pem`, `*.key`, `id_ed25519`,
-  anything under `.ssh` or `secrets`, and the like) is not sent, by any gate
-  or by the sweep, whatever runs it. In a gate the review is then incomplete,
-  not clear. In the sweep such a file is read by the local rules, looked
-  through for what it starts, and listed as kept from the AI; where something
-  runs it, that is a finding of its own, unless the file only keeps opaque
-  values in secret-named or plainly inert variables. The sweep also checks SSH
-  and git files in a home, package-manager configuration and account files
-  locally only, sends a file it found running only where it is plainly a
-  script, and takes plainly written secret values and URL passwords out of
-  what it sends (only URL passwords for Neovim plugin code). A secret anywhere
-  else goes with its file. Package names and versions from lockfiles go to the
-  OSV API (`api.osv.dev`), and an AUR package's name goes to the AUR. The
-  `local-only` level sends nothing to an AI; the OSV and AUR lookups remain.
-  Once a day the sweep asks the project's repository on GitHub for its release
-  tags, sending nothing about your machine (`[update] check = "off"` turns
-  that off).
+  marks it as holding keys or tokens (`.env`, `*.pem`, `*.key`, `id_ed25519`, anything under `.ssh` or `secrets`,
+  and the like) is not sent, by any gate or by the sweep, whatever runs it. In
+  a gate the review is then incomplete, not clear. In the sweep such a file is
+  read by the local rules, looked through for what it starts, and listed as
+  kept from the AI; where something runs it, that is a finding of its own,
+  unless the file only keeps opaque values in secret-named or plainly inert
+  variables. The sweep also checks SSH and git files in a home,
+  package-manager configuration, account files and browser extensions (read
+  from the browser profiles' preferences) locally only, sends a file
+  it found running only where it is plainly a script, keeps boot
+  configuration with any boot secret it cannot mask from the AI, and takes
+  plainly written secret values, URL passwords and GRUB password hashes out
+  of what it sends (only URL passwords for Neovim plugin code). A secret
+  anywhere else goes with its file. Package names and versions from lockfiles
+  go to the OSV API (`api.osv.dev`), and an AUR package's name goes to the
+  AUR. The `local-only` level sends nothing to an AI; the OSV and AUR lookups
+  remain. Once a day the sweep asks the project's repository on GitHub for
+  its release tags, sending nothing about your machine (`[update] check =
+  "off"` turns that off).
 - **Each review is one or more AI calls** on your subscription or API account:
   by default up to 8 calls of up to 256 KiB each. System updates with
   scriptlets, every AUR build and the daily sweep all make calls. Unchanged
@@ -315,10 +317,12 @@ under [Limitations](docs/limitations.md):
   can rewrite, and the pacman gate reviews as the user who called `sudo`, with
   that user's reviewer login
   ([Limitations](docs/limitations.md#the-limits-that-matter-most)).
-- System sweep: the EFI programs and the inside of the initramfs image are
-  not looked at, and other mounted filesystems are not searched for setuid
-  files; as a user only your own processes can be looked at; without root
-  checks every sweep is incomplete ([System sweep](docs/system-sweep.md)).
+- System sweep: the inside of the initramfs image, and of a unified kernel
+  image except its stub and kernel, is not compared, browser extensions are
+  judged by where they came from and what they were granted, not by their
+  code, and other mounted filesystems are not searched for setuid files; as a
+  user only your own processes can be looked at; without root checks every
+  sweep is incomplete ([System sweep](docs/system-sweep.md)).
 - System sweep: the Neovim plugins the first sweep finds are taken as they
   are and reviewed only once they change, and only lazy.nvim's plugins are
   covered ([System sweep](docs/system-sweep.md#neovim-plugins)).

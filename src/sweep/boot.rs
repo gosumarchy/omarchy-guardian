@@ -1,23 +1,27 @@
 //! What the machine was started with: the kernel's command line as it is
-//! now, the kernel images in `/boot` against the ones the kernel packages
-//! ship, and whether Secure Boot is on.
+//! now, the kernel images and EFI programs in `/boot` against the ones
+//! packages ship (see `efi`), and whether Secure Boot is on.
 //!
 //! The boot loader's configuration is reviewed as a file. A parameter
-//! typed at the boot menu, or a kernel image swapped in `/boot`, is in no
-//! file the sweep reviews, so both are compared here. `/boot` is usually
-//! root's alone, so most of this is the root collector's to do. The EFI
-//! programs (the boot loader itself) and what is inside the initramfs
-//! image are not looked at.
+//! typed at the boot menu, or a kernel image or boot loader swapped in
+//! `/boot`, is in no file the sweep reviews, so these are compared here.
+//! `/boot` is usually root's alone, so most of this is the root
+//! collector's to do. What is inside the initramfs image is not looked at:
+//! mkinitcpio builds it on this machine, so no package has a copy to
+//! compare it with.
+
+mod efi;
 
 use std::fs;
 
 use super::collect::{self, Body, Item, Scope};
 use super::read::{self, Found};
 use super::tier::Tier;
-use crate::autorun::Category;
+use crate::autorun::{self, Category};
+use crate::error::{Error, IoContext as _};
 use crate::paths::file_name;
 use crate::rules::RuleId;
-use crate::sha256::Sha256;
+use crate::sha256::{Digest, Sha256};
 
 /// Kernel parameters that replace what starts first, open a root shell or
 /// turn a defence off. One ending in `=` matches any value.
@@ -63,6 +67,13 @@ const CONFIGURED: &[&str] = &[
 ];
 /// Directories of boot entries, one file each.
 const CONFIGURED_DIRECTORIES: &[&str] = &["boot/loader/entries", "etc/cmdline.d"];
+
+/// Whether `path` is boot configuration the sweep collects as a file (a
+/// boot loader's, the firmware shell's `startup.nsh`, rEFInd's): of what is
+/// in `/boot`, the only text the AI reviews (see `judge::is_local_only`).
+pub(super) fn is_configuration(path: &str) -> bool {
+    autorun::sweep_only_location(path).is_some_and(|location| location.category == Category::Boot)
+}
 
 /// The running kernel's command line, relative to the root.
 const COMMAND_LINE: &str = "proc/cmdline";
@@ -174,26 +185,28 @@ fn command_line(scope: &Scope<'_>, boot: &mut Boot) {
     });
 }
 
-/// The kernel images under `/boot`, as paths relative to the root: files
-/// whose name starts with `vmlinuz`, up to three directories down (Limine's
-/// entry tool keeps them in a directory for each machine and kernel); and
-/// whether there were more than are compared. `Err` when `/boot` cannot be
-/// listed.
-fn images(scope: &Scope<'_>) -> Result<(Vec<String>, bool), ()> {
-    match fs::read_dir(scope.root.join("boot")) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((Vec::new(), false));
-        }
-        Err(_) => return Err(()),
-        Ok(_) => {}
-    }
+/// Every file under `/boot`, as paths relative to the root (none when
+/// there is no `/boot`); `Err` when it cannot be listed.
+fn listing(scope: &Scope<'_>) -> Result<Vec<String>, Error> {
+    let boot = scope.root.join("boot");
+    match fs::read_dir(&boot) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        listed => listed.at(&boot)?,
+    };
     let listing = read::entries(scope.root, "boot");
-    if !listing.unreadable.is_empty() {
-        return Err(());
+    match listing.unreadable.first() {
+        None => Ok(listing.files),
+        Some(directory) => Err(Error::Message(format!("/{directory} cannot be listed"))),
     }
-    let mut images: Vec<String> = listing
-        .files
-        .into_iter()
+}
+
+/// The kernel images among `files`: those whose name starts with
+/// `vmlinuz`, up to three directories down (Limine's entry tool keeps them
+/// in a directory for each machine and kernel); and whether there were
+/// more than are compared.
+fn images(files: &[String]) -> (Vec<String>, bool) {
+    let mut images: Vec<String> = files
+        .iter()
         .filter(|path| {
             path.matches('/').count() <= 4
                 && path
@@ -201,10 +214,11 @@ fn images(scope: &Scope<'_>) -> Result<(Vec<String>, bool), ()> {
                     .next()
                     .is_some_and(|name| name.starts_with("vmlinuz"))
         })
+        .cloned()
         .collect();
     let more = images.len() > MAX_IMAGES;
     images.truncate(MAX_IMAGES);
-    Ok((images, more))
+    (images, more)
 }
 
 /// The release a kernel image says it is (`6.12.1-arch1-1`), from the
@@ -247,30 +261,54 @@ fn is_started(scope: &Scope<'_>, path: &str, defaults: &[String]) -> bool {
     if defaults.iter().any(|default| default == name) {
         return true;
     }
-    let running = fs::read_to_string(scope.root.join("proc/sys/kernel/osrelease"))
-        .map(|release| release.trim().to_string())
-        .unwrap_or_default();
+    let Some(running) = running_release(scope) else {
+        return false;
+    };
     match collect::look(scope, Category::Boot, path, None) {
-        Found::File { head, .. } => {
-            image_release(&head).is_some_and(|release| !running.is_empty() && release == running)
-        }
+        Found::File { head, .. } => image_release(&head).is_some_and(|release| release == running),
         _ => false,
     }
 }
 
-fn kernel_images(scope: &Scope<'_>, boot: &mut Boot) {
+/// The release of the running kernel (`6.12.1-arch1-1`), where it is known.
+fn running_release(scope: &Scope<'_>) -> Option<String> {
+    let release = fs::read_to_string(scope.root.join("proc/sys/kernel/osrelease")).ok()?;
+    let release = release.trim();
+    (!release.is_empty()).then(|| release.to_string())
+}
+
+/// The digests of the kernel images the installed kernel packages ship,
+/// where they are still what those packages shipped.
+fn shipped_kernels(scope: &Scope<'_>) -> Vec<Digest> {
+    read::matching(scope.root, "usr/lib/modules/*/vmlinuz")
+        .files
+        .into_iter()
+        .filter_map(|path| {
+            let item = collect::item(scope, Category::Boot, path, None);
+            matches!(item.tier, Tier::Vendor | Tier::UserBuilt)
+                .then_some(item.sha256)
+                .flatten()
+        })
+        .collect()
+}
+
+/// Says that `/boot` could not be listed: for root the sweep is
+/// incomplete, a user's sweep leaves it to the root checks.
+fn unlisted(scope: &Scope<'_>, boot: &mut Boot, error: &Error) {
+    if scope.origin == collect::Origin::Root {
+        boot.unchecked.push(format!(
+            "/boot: could not be listed ({error}); the kernel images and EFI programs were not compared"
+        ));
+    } else {
+        boot.notes.push(
+            "the kernel images and EFI programs in /boot cannot be read as this user; the root checks compare them with the packaged ones".into(),
+        );
+    }
+}
+
+fn kernel_images(scope: &Scope<'_>, files: &[String], shipped: &[Digest], boot: &mut Boot) {
     let as_root = scope.origin == collect::Origin::Root;
-    let Ok((images, more)) = images(scope) else {
-        if as_root {
-            boot.unchecked
-                .push("/boot: could not be listed; the kernel images were not compared".into());
-        } else {
-            boot.notes.push(
-                "the kernel images in /boot cannot be read as this user; the root checks compare them with the packaged ones".into(),
-            );
-        }
-        return;
-    };
+    let (images, more) = images(files);
     if images.is_empty() {
         return;
     }
@@ -284,17 +322,6 @@ fn kernel_images(scope: &Scope<'_>, boot: &mut Boot) {
         }
     }
     let defaults = default_names(scope);
-    // What the kernel packages ship, where it is still what they shipped.
-    let shipped: Vec<_> = read::matching(scope.root, "usr/lib/modules/*/vmlinuz")
-        .files
-        .into_iter()
-        .filter_map(|path| {
-            let item = collect::item(scope, Category::Boot, path, None);
-            matches!(item.tier, Tier::Vendor | Tier::UserBuilt)
-                .then_some(item.sha256)
-                .flatten()
-        })
-        .collect();
     for path in images {
         let mut item = collect::item(scope, Category::Boot, path, None);
         match (&item.body, item.sha256) {
@@ -357,7 +384,14 @@ fn secure_boot(scope: &Scope<'_>, boot: &mut Boot) {
 pub(super) fn check(scope: &Scope<'_>) -> Boot {
     let mut boot = Boot::default();
     command_line(scope, &mut boot);
-    kernel_images(scope, &mut boot);
+    match listing(scope) {
+        Ok(files) => {
+            let shipped = shipped_kernels(scope);
+            kernel_images(scope, &files, &shipped, &mut boot);
+            efi::compare(scope, &files, &shipped, &mut boot);
+        }
+        Err(error) => unlisted(scope, &mut boot, &error),
+    }
     secure_boot(scope, &mut boot);
     boot
 }
@@ -373,6 +407,33 @@ mod tests {
     use crate::sweep::collect::{Origin, Scope};
     use crate::sweep::index::PackageIndex;
     use crate::test_support::TempDir;
+
+    /// Every file the command line is compared with is also collected and
+    /// reviewed: what a boot loader is told to start is in no other check.
+    /// (`/etc/cmdline.d` is catalogued with the files the pacman gate
+    /// reviews, so it is no sweep-only location.)
+    #[test]
+    fn every_configuration_the_command_line_is_compared_with_is_reviewed() {
+        for path in super::CONFIGURED {
+            assert!(super::is_configuration(path), "{path}");
+        }
+        for directory in super::CONFIGURED_DIRECTORIES
+            .iter()
+            .filter(|directory| directory.starts_with("boot/"))
+        {
+            assert!(
+                super::is_configuration(&format!("{directory}/x.conf")),
+                "{directory}"
+            );
+        }
+        assert!(!super::is_configuration("boot/EFI/BOOT/BOOTX64.EFI"));
+        // `grub-mkconfig`'s scripts are boot configuration too, read under
+        // the same secret rules.
+        assert_eq!(
+            crate::autorun::sweep_only_location("etc/grub.d/40_custom").map(|found| found.category),
+            Some(crate::autorun::Category::Boot)
+        );
+    }
 
     #[test]
     fn only_watched_parameters_the_configuration_does_not_hold_are_told() {

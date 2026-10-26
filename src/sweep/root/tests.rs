@@ -329,14 +329,15 @@ fn only_a_private_group_may_read_roots_results() {
 #[test]
 fn malformed_or_foreign_output_is_refused() {
     assert!(from_json("not json").is_err());
-    assert!(from_json(r#"{"version":3,"items":[]}"#).is_err());
+    assert!(from_json(r#"{"version":4,"items":[]}"#).is_err());
     assert!(from_json(r#"{"items":[]}"#).is_err());
     // An older collector's results are read, and known as that.
     assert!(from_json(r#"{"version":1,"items":[]}"#).unwrap().outdated);
-    let current = from_json(r#"{"version":2,"items":[],"new_trust":["etc/passwd#x"]}"#).unwrap();
+    assert!(from_json(r#"{"version":2,"items":[]}"#).unwrap().outdated);
+    let current = from_json(r#"{"version":3,"items":[],"new_trust":["etc/passwd#x"]}"#).unwrap();
     assert!(!current.outdated);
     assert_eq!(current.news, Some(vec!["etc/passwd#x".to_string()]));
-    assert_eq!(from_json(r#"{"version":2,"items":[]}"#).unwrap().news, None);
+    assert_eq!(from_json(r#"{"version":3,"items":[]}"#).unwrap().news, None);
     let escaping = r#"{"version":1,"items":[{"path":"../etc/x","category":"sudo","tier":"unknown","body":{"kind":"undecodable"},"runs":[],"notes":[],"alerts":[]}]}"#;
     // A bad item is left out; the rest of root's results still count.
     assert!(from_json(escaping).unwrap().items.is_empty());
