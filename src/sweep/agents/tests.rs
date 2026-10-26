@@ -853,6 +853,64 @@ fn a_line_loses_its_secrets_and_keeps_what_a_review_needs() {
 }
 
 #[test]
+fn only_a_value_that_is_a_secret_is_taken_out() {
+    for (line, expected) in [
+        // A scheme counts only after a header, not after a secret-named
+        // flag: the flag's value is taken out, the package after it stays.
+        (
+            "npx --auth token evil-pkg",
+            "npx --auth <redacted-by-guardian> evil-pkg",
+        ),
+        (
+            "uvx --api-key basic evil-pkg",
+            "uvx --api-key <redacted-by-guardian> evil-pkg",
+        ),
+        (
+            "npx --token bearer evil-pkg",
+            "npx --token <redacted-by-guardian> evil-pkg",
+        ),
+        // A header whose quote opens inside the word.
+        (
+            r#"wget --header="Authorization: Bearer abc123" https://x/y"#,
+            r#"wget --header="Authorization: Bearer <redacted-by-guardian>" https://x/y"#,
+        ),
+        (
+            r#"curl -H"Authorization: Bearer abc123" https://x/y"#,
+            r#"curl -H"Authorization: Bearer <redacted-by-guardian>" https://x/y"#,
+        ),
+        // A flag is never a value.
+        (
+            "npx --token --package=evil-pkg cmd",
+            "npx --token --package=evil-pkg cmd",
+        ),
+        // A flag counts only where the last part of its name is a secret.
+        ("x --auth-command evil-cmd", "x --auth-command evil-cmd"),
+        (
+            "x --password-command evil-pkg",
+            "x --password-command evil-pkg",
+        ),
+        ("x --token-file evil.sh", "x --token-file evil.sh"),
+        ("x --token-file=evil.sh", "x --token-file=evil.sh"),
+        (
+            "docker login --password-stdin ghcr.io",
+            "docker login --password-stdin ghcr.io",
+        ),
+        (
+            "x --api-key a --authToken b --clientSecret c --oauth2-bearer d",
+            "x --api-key <redacted-by-guardian> --authToken <redacted-by-guardian> \
+             --clientSecret <redacted-by-guardian> --oauth2-bearer <redacted-by-guardian>",
+        ),
+        // Only the first word of a quoted value of several.
+        (
+            r#"x --token "abc def""#,
+            r#"x --token "<redacted-by-guardian> def""#,
+        ),
+    ] {
+        assert_eq!(redacted(line), expected, "{line}");
+    }
+}
+
+#[test]
 fn a_secret_name_is_found_in_every_way_it_is_written() {
     for name in [
         "OPENAI_API_KEY",

