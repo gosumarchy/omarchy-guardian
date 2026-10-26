@@ -18,6 +18,9 @@ pub(crate) enum Category {
     Boot,
     BootConfig,
     Browser,
+    /// The extensions in a home's browser profiles, checked by the sweep's
+    /// own rules only (see `sweep::extensions`).
+    BrowserExtension,
     Cron,
     Dbus,
     Desktop,
@@ -56,17 +59,21 @@ pub(crate) enum Category {
     /// The system's own program directory, which the sweep compares with
     /// the packages: a changed or unowned file there.
     Program,
+    /// The hooks, plugins and MCP servers AI coding agents (Claude Code,
+    /// OpenCode, Codex) start on their own, read from their configuration.
+    Agent,
     /// A language package installed outside pacman (npm, pipx, cargo,
     /// mise) that OSV lists as malicious.
     Package,
 }
 
 impl Category {
-    const ALL: [Self; 39] = [
+    const ALL: [Self; 41] = [
         Self::Autostart,
         Self::Boot,
         Self::BootConfig,
         Self::Browser,
+        Self::BrowserExtension,
         Self::Cron,
         Self::Dbus,
         Self::Desktop,
@@ -101,6 +108,7 @@ impl Category {
         Self::Terminal,
         Self::Toolchain,
         Self::Program,
+        Self::Agent,
         Self::Package,
     ];
 
@@ -111,6 +119,7 @@ impl Category {
             Self::Boot => "boot",
             Self::BootConfig => "boot-config",
             Self::Browser => "browser",
+            Self::BrowserExtension => "browser-extension",
             Self::Cron => "cron",
             Self::Dbus => "dbus",
             Self::Desktop => "desktop",
@@ -145,6 +154,7 @@ impl Category {
             Self::Terminal => "terminal",
             Self::Toolchain => "toolchain",
             Self::Program => "program",
+            Self::Agent => "agent",
             Self::Package => "package",
         }
     }
@@ -206,9 +216,11 @@ impl Category {
             Self::Setuid => "Programs with extra privileges",
             Self::Account => "Accounts and who may log in",
             Self::Browser => "Browser flags, policies and native hosts",
+            Self::BrowserExtension => "Browser extensions",
             Self::Terminal => "Terminal and prompt configuration",
             Self::Toolchain => "Developer tool configuration (npm, pip, cargo, mise)",
             Self::Program => "The system's own programs",
+            Self::Agent => "AI coding agent hooks, plugins and MCP servers",
             Self::Package => "Language packages (npm, pipx, cargo, mise)",
         }
     }
@@ -220,6 +232,7 @@ impl Category {
             Self::Boot => "runs before the system starts",
             Self::BootConfig | Self::SystemdGenerator => "runs at every boot",
             Self::Browser => "applies to every browser started",
+            Self::BrowserExtension => "runs in the browser, in the pages it may reach",
             Self::Cron => "runs on a schedule",
             Self::Dbus => "runs when a program asks for it over D-Bus",
             Self::Desktop => "runs when you open the app",
@@ -249,6 +262,7 @@ impl Category {
             Self::Terminal => "runs in every terminal",
             Self::Toolchain => "decides what builds and installs run and fetch",
             Self::Program => "runs when anything starts it by name",
+            Self::Agent => "runs when an AI coding agent starts, or as it works",
             Self::Package => "runs when a tool that uses it starts",
         }
     }
@@ -864,8 +878,27 @@ const UNOFFICIAL_ONLY: &[&str] = &[
 pub(crate) const SYSTEM_SWEEP: &[Location] = &[
     // PAM modules: a `.so` every login loads.
     location("usr/lib/security/", Kind::Directory, Category::Pam),
+    // The boot loaders' configuration, each place the command line is
+    // compared with (see `sweep::boot`), and what the firmware's shell and
+    // rEFInd read: what they start and with which parameters.
     location("boot/limine.conf", Kind::File, Category::Boot),
+    location("boot/limine/limine.conf", Kind::File, Category::Boot),
+    location("boot/EFI/limine/limine.conf", Kind::File, Category::Boot),
+    location("boot/loader/loader.conf", Kind::File, Category::Boot),
+    location("boot/loader/entries/", Kind::Directory, Category::Boot),
+    location("boot/grub/grub.cfg", Kind::File, Category::Boot),
+    // Read in at boot by the stock `41_custom`.
+    location("boot/grub/custom.cfg", Kind::File, Category::Boot),
+    location("boot/startup.nsh", Kind::File, Category::Boot),
+    location("boot/EFI/BOOT/startup.nsh", Kind::File, Category::Boot),
+    // Matched by name as listed, so a `REFIND.CONF` on FAT is missed: a
+    // limit the docs state (`docs/limitations.md`).
+    location("boot/EFI/*/refind.conf", Kind::Glob, Category::Boot),
     location("etc/default/limine", Kind::File, Category::Boot),
+    location("etc/default/grub", Kind::File, Category::Boot),
+    // The scripts `grub-mkconfig` runs to write `grub.cfg` (`40_custom`
+    // holds entries and passwords written by hand).
+    location("etc/grub.d/", Kind::Directory, Category::Boot),
     location("etc/kernel/cmdline", Kind::File, Category::Boot),
     // Libraries the dynamic linker prefers over the ones in `/usr/lib`.
     location("usr/lib/glibc-hwcaps/", Kind::Directory, Category::Linker),

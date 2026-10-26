@@ -5,7 +5,7 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
 
-use super::{Body, Origin, Scope, collect};
+use super::{Body, Origin, Scope, Walk, collect, queue_entries};
 use crate::autorun::Category;
 use crate::sha256::Sha256;
 use crate::sweep::index::PackageIndex;
@@ -840,4 +840,27 @@ fn a_user_crontab_runs_from_that_users_home() {
         assert_eq!(job.body, Body::Binary(super::WITHHELD), "{}", job.path);
         assert!(job.runs.is_empty() && job.sha256.is_some(), "{}", job.path);
     }
+}
+
+#[test]
+fn an_agents_entry_whose_name_is_taken_is_said_as_not_checked() {
+    let dir = TempDir::new("collect-entry-twice");
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root: dir.path(),
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::System,
+    };
+    let entry = || super::item(&scope, Category::Agent, "home/u/a.json#x".into(), None);
+    let file = || super::item(&scope, Category::Agent, "home/u/plugin.js".into(), None);
+    let mut walk = Walk::default();
+    walk.seen.insert("home/u/plugin.js".into());
+    let mut truncated = Vec::new();
+    queue_entries(&mut walk, vec![entry(), entry(), file()], &mut truncated);
+    assert_eq!(walk.pending.len(), 1);
+    assert_eq!(
+        truncated,
+        ["/home/u/a.json#x: two entries share this name; not checked"]
+    );
 }

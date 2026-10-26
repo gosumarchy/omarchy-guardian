@@ -18,8 +18,9 @@ use crate::sweep::tier::Tier;
 
 /// The version of the results. 2: the collector compares packaged programs
 /// only root can read, reports what it could not check in the kernel's own
-/// accounts, and keeps track of new accounts, members and keys itself.
-const VERSION: u64 = 2;
+/// accounts, and keeps track of new accounts, members and keys itself. 3:
+/// it compares the EFI programs in `/boot` with the packaged ones.
+const VERSION: u64 = 3;
 /// The oldest version still read. Its results are kept, and count as those
 /// of a collector that does not run every check (see `RootPart::outdated`).
 const OLDEST_VERSION: u64 = 1;

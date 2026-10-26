@@ -27,17 +27,32 @@ it shows on hover:
   package install scriptlets and auto-run files, AUR recipes and their
   sources, themes, plugins, what you `scan`, and for the daily sweep the
   start-up files on this machine that no package vouches for, with the scripts
-  they run. A file whose name or path marks it as holding keys or tokens
-  (`.env`, `*.pem`, `*.key`, `id_ed25519`, anything under `.ssh` or `secrets`,
-  and the like) is not sent, by any gate or by the sweep, whatever runs it. In
+  they run. Of an AI coding agent's configuration (Claude Code, OpenCode, Codex)
+  only what each hook, helper, MCP server or plugin starts is sent: its
+  command line with secrets taken out only where they are the token-shaped
+  value of a secret-named setting, flag or `Authorization` header, or the
+  login in an address, the names of its variables, or a remote server's host;
+  of Claude Code's `env`, only the variable names and the host of a base
+  address or proxy. An API key pasted anywhere else in such a command line
+  (`"apiKeyHelper": "sk-ant-…"`) reaches the AI provider as written: masking
+  can hide code, since a word that looks like a key may also name the
+  package, host or script that runs. Keep keys in variables. The files
+  themselves, which hold tokens and project history, are never sent, nor is
+  anything derived from a project's path. A file whose name or path marks
+  it as holding keys or tokens (`.env`, `*.pem`, `*.key`, `id_ed25519`,
+  anything under `.ssh` or `secrets`, and the like) is not sent, by any gate
+  or by the sweep, whatever runs it. In
   a gate the review is then incomplete, not clear. In the sweep such a file is
   read by the local rules, looked through for what it starts, and listed as
   kept from the AI; where something runs it, that is a finding of its own,
   unless the file only keeps opaque values in secret-named or plainly inert
   variables. The sweep also checks SSH and git files in a home,
-  package-manager configuration and account files locally only, sends a file
-  it found running only where it is plainly a script, and takes plainly
-  written secret values and URL passwords out of what it sends. A secret
+  package-manager configuration, account files and browser extensions (read
+  from the browser profiles' preferences) locally only, sends a file
+  it found running only where it is plainly a script, keeps boot
+  configuration with any boot secret it cannot mask from the AI, and takes
+  plainly written secret values, URL passwords and GRUB password hashes out
+  of what it sends. A secret
   anywhere else goes with its file. Package names and versions from lockfiles
   go to the OSV API (`api.osv.dev`), and so do the ecosystem, name and version
   of each npm, pipx and cargo package from the public registries the sweep
@@ -315,13 +330,19 @@ under [Limitations](docs/limitations.md):
   can rewrite, and the pacman gate reviews as the user who called `sudo`, with
   that user's reviewer login
   ([Limitations](docs/limitations.md#the-limits-that-matter-most)).
-- System sweep: the EFI programs and the inside of the initramfs image are
-  not looked at, and other mounted filesystems are not searched for setuid
-  files; as a user only your own processes can be looked at; without root
-  checks every sweep is incomplete ([System sweep](docs/system-sweep.md)).
-  Installed language packages are looked up only for OSV's known-malicious
-  advisories, not for vulnerabilities ([Language
+- System sweep: the inside of the initramfs image, and of a unified kernel
+  image except its stub and kernel, is not compared, browser extensions are
+  judged by where they came from and what they were granted, not by their
+  code, and other mounted filesystems are not searched for setuid files; as a
+  user only your own processes can be looked at; without root checks every
+  sweep is incomplete ([System sweep](docs/system-sweep.md)). Installed
+  language packages are looked up only for OSV's known-malicious advisories,
+  not for vulnerabilities ([Language
   packages](docs/system-sweep.md#language-packages)).
+- System sweep: an AI coding agent's hooks and MCP servers are read from your
+  own configuration, not from a project's (`.claude/settings.json`,
+  `.mcp.json` in a repository), and a configuration file that is a link is
+  not followed ([System sweep](docs/system-sweep.md#ai-coding-agents)).
 - Source leaves the machine through the AI provider you configured, except
   under `local-only` and except the files kept from the AI by name or kind; a
   secret under a name Guardian does not recognise still goes with its file.

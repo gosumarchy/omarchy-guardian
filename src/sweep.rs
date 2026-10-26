@@ -11,15 +11,20 @@
 //!   and `live` tell by name.
 //! - `judge` sends what isn't trusted through the local rules and the AI
 //!   review; `output` shows it.
+//! - `extensions` lists the browser extensions of the home's profiles.
 //! - `root` is the read-only root collector behind `sweep --root`.
+//! - `agents` reads what AI coding agents start on their own (hooks, MCP
+//!   servers, plugins) out of their configuration, entry by entry.
 //! - `packages` looks the language packages installed outside pacman up
 //!   in OSV's list of malicious ones.
 
 mod access;
+mod agents;
 mod boot;
 pub(crate) mod collect;
 mod commands;
 mod config;
+mod extensions;
 mod index;
 mod judge;
 mod live;
