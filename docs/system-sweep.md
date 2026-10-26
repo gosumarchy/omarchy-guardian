@@ -962,8 +962,9 @@ incomplete.
   `cifs://alice:p;ss@nas` or without one as in dracut's
   `netroot=iscsi:user:password@server…`; a `subvol=@` or `getty@tty1` has
   none) or with an `@` and an odd number of one kind of quote (a quoted
-  password with a blank in it, so a quoted string with an `@` and a blank
-  keeps the file too), an assignment to a name that says secret
+  password with a blank in it; an `@` right after `=` or `=/`, as in a
+  quoted `"quiet rootflags=subvol=@"`, is passed over, but any other quoted
+  string with an `@` and a blank keeps the file too), an assignment to a name that says secret
   (`GRUB_PASSWORD=…`, `GRUB_PASSWORD+=…`, `X_PASSWORD[0]=…`,
   `${LUKS_PASSWORD}=…`, as for masking below, whatever the value, also as
   the last part of a dotted name such as `cifs.password=`; only

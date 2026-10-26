@@ -1302,6 +1302,11 @@ fn values_that_look_like_secrets_are_taken_out_before_review() {
         without_secrets("@SET -v API_TOKEN abcdefgh1234\n"),
         "@SET -v API_TOKEN <redacted-by-guardian>\n"
     );
+    // The value is cut where it stands, not where equal text first is.
+    assert_eq!(
+        without_secrets("set -v TOKEN_abcdefgh abcdefgh\n"),
+        "set -v TOKEN_abcdefgh <redacted-by-guardian>\n"
+    );
 
     // A password inside an address, wherever on the line it is.
     let urls = "ExecStart=/usr/bin/curl https://bot:s3cr3tpass@x.example/hook?a=1 -o /tmp/x\nurl = \"ftp://u:${PASS}@h.example/\"\nsee https://x.example:8443/a and git@x.example:r.git\n";
@@ -1417,6 +1422,8 @@ fn only_an_exact_grub_password_hash_is_taken_out() {
         "Set -v Secret x\n",
         // Stock in grub's 31_efi_bootnext: a name that ends in `PAT`.
         "ACTIVE_PAT='\\*'\n",
+        // An option, outside `cryptomount` too.
+        "fs0:\\EFI\\tool.efi --password hunter2\n",
     ] {
         assert!(has_boot_secret(secret), "{secret}");
     }
@@ -1435,6 +1442,12 @@ fn only_an_exact_grub_password_hash_is_taken_out() {
         "set -v pager 1\n",
         "linux /vmlinuz-linux cryptdevice=PARTUUID=0123:root root=/dev/mapper/root rootflags=subvol=@\n",
         "linux /vmlinuz-linux bypass=1\n",
+        // A quoted command line with a Btrfs subvolume `@` in it.
+        "GRUB_CMDLINE_LINUX_DEFAULT=\"loglevel=3 quiet rootflags=subvol=@\"\n",
+        "GRUB_CMDLINE_LINUX=\"quiet rootflags=subvol=/@\"\n",
+        "KERNEL_CMDLINE[default]+=\"rw rootflags=subvol=@\"\n",
+        "  options \"root=PARTUUID=x rw rootflags=subvol=@\"\n",
+        "GRUB_CMDLINE_LINUX=\"rootflags=subvol=@ cryptdevice=UUID=x:root\"\n",
     ] {
         assert!(!has_boot_secret(plain), "{plain}");
     }

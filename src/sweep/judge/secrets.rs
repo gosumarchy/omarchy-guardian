@@ -91,7 +91,8 @@ fn without_grub_hash(line: &str) -> Option<String> {
 ///   masking cannot take out whole (`without_url_passwords` needs `://`
 ///   and plain characters); and a word with an `@` and an odd number of
 ///   one kind of quote, as a quoted password may hold a blank
-///   (`"netroot=cifs://u:p ss@h"`);
+///   (`"netroot=cifs://u:p ss@h"`), but where the `@` follows `=` or `=/`
+///   (`"quiet rootflags=subvol=@"`);
 /// - an assignment to a name that says secret (`GRUB_PASSWORD=…`, see
 ///   `is_secret_name`, on the last part of a dotted name), whatever the
 ///   value, quoted or not, but the kernel parameters in
@@ -125,15 +126,21 @@ pub(super) fn has_boot_secret(text: &str) -> bool {
         let hash = ["grub.pbkdf2.", "grub.argon2.", "GRUB_USERS"]
             .iter()
             .any(|marker| line.contains(marker));
-        let password = words
-            .iter()
-            .any(|word| word.to_ascii_lowercase().starts_with("password"));
+        let password = words.iter().any(|word| {
+            word.trim_start_matches('-')
+                .to_ascii_lowercase()
+                .starts_with("password")
+        });
         // Split at blanks only: a password may hold any other character.
         // `rootflags=subvol=@` and `getty@tty1` have no `:` before the `@`.
         let userinfo = line.split_whitespace().any(|word| {
             let odd = |quote: char| word.matches(quote).count() % 2 == 1;
-            word.split_once('@')
-                .is_some_and(|(before, _)| before.contains(':') || odd('"') || odd('\''))
+            // An `@` right after `=` is a value of its own, such as Btrfs's
+            // `rootflags=subvol=@` inside a quoted command line.
+            word.split_once('@').is_some_and(|(before, _)| {
+                before.contains(':')
+                    || (!before.trim_end_matches('/').ends_with('=') && (odd('"') || odd('\'')))
+            })
         });
         hash || password || userinfo || passphrase || assigns_secret(line) || sets_secret(&words)
     })
@@ -251,7 +258,14 @@ fn redact_line(line: &str) -> Option<String> {
         && is_literal_secret(value.trim_matches(['"', '\'']))
         && words.len() == name_at + 3
     {
-        return Some(line.replacen(value, REDACTED, 1));
+        // Cut where the value stands: a `replacen` would take the first
+        // equal text, which may be part of the name.
+        let at = value.as_ptr().addr() - line.as_ptr().addr();
+        return Some(format!(
+            "{}{REDACTED}{}",
+            &line[..at],
+            &line[at + value.len()..]
+        ));
     }
     let mut out = String::new();
     let mut rest = line;
