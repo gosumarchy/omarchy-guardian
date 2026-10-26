@@ -135,10 +135,9 @@ fn local_findings(count: usize) -> Vec<LocalFinding> {
 fn not_attempted(chunk: (usize, usize)) -> AgentRun {
     AgentRun {
         chunk: Some(chunk),
-        outcome: AgentOutcome::Unavailable(Error::Refused(format!(
-            "{}: no reply",
-            super::NOT_ATTEMPTED
-        ))),
+        outcome: AgentOutcome::NotAttempted {
+            reason: "no reply".into(),
+        },
         ..unavailable(&["x"])
     }
 }

@@ -256,7 +256,11 @@ fn ai_reviews(html: &mut String, report: &Report) {
                 },
                 review.summary.clone(),
             ),
-            AgentOutcome::Unavailable(error) => ("UNAVAILABLE", "amber", error.to_string()),
+            AgentOutcome::Unavailable(_) | AgentOutcome::NotAttempted { .. } => (
+                "UNAVAILABLE",
+                "amber",
+                run.outcome.problem().unwrap_or_default(),
+            ),
         };
         let _ = write!(
             html,

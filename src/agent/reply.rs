@@ -4,11 +4,12 @@
 use crate::error::Error;
 use crate::json::Json;
 use crate::report::Severity;
+use crate::tools::Failure;
 
-use super::provider::{TIMED_OUT, content_rejected, out_of_time, rejects_content, rejects_input};
+use super::provider::{content_rejected, out_of_time, rejects_content, rejects_input};
 use super::{
     ADDRESSED_FIELD, ADDRESSED_FILE, ADDRESSED_TITLE, AgentError, AgentFinding, AgentReview,
-    NONCE_MISSING, Status,
+    REPORT, Status,
 };
 
 /// Classifies a Claude Code `--output-format stream-json` transcript. A
@@ -18,15 +19,11 @@ use super::{
 /// happens when the model reasons about a credential-stealing payload.
 pub(super) fn claude_verdict(
     output: &str,
-    failure: Option<String>,
+    failure: Option<Failure>,
     nonce: &str,
 ) -> Result<AgentReview, AgentError> {
-    let unavailable = |detail: String| {
-        AgentError::Unavailable(Error::ToolFailed {
-            tool: "claude".into(),
-            detail,
-        })
-    };
+    let unavailable =
+        |failure: Failure| AgentError::Unavailable(failure.into_error("claude".into()));
     let events = Json::parse_stream(output).unwrap_or_default();
     let tool_use = events.iter().any(|event| {
         event.get("type").and_then(Json::as_str) == Some("assistant")
@@ -60,13 +57,11 @@ pub(super) fn claude_verdict(
             )));
         }
         return Err(match failure {
-            Some(detail) if delivered && detail == TIMED_OUT => {
-                AgentError::OutOfTime(out_of_time())
-            }
-            Some(detail) if delivered => AgentError::Invalid(Error::Refused(format!(
-                "the AI saw the source and the review then failed ({detail}); retry"
+            Some(Failure::TimedOut) if delivered => AgentError::OutOfTime(out_of_time()),
+            Some(failure) if delivered => AgentError::Invalid(Error::Refused(format!(
+                "the AI saw the source and the review then failed ({failure}); retry"
             ))),
-            Some(detail) => unavailable(detail),
+            Some(failure) => unavailable(failure),
             None => {
                 AgentError::Invalid(Error::parse("the Claude Code result", "not a JSON result"))
             }
@@ -86,11 +81,12 @@ pub(super) fn claude_verdict(
         .and_then(Json::as_str)
         .unwrap_or_default();
     if result.get("is_error").and_then(Json::as_bool) == Some(true) {
-        let detail = if text.is_empty() {
-            failure.unwrap_or_else(|| "reported an error".into())
+        let failure = if text.is_empty() {
+            failure.unwrap_or_else(|| Failure::Failed("reported an error".into()))
         } else {
-            text.chars().take(300).collect()
+            Failure::Failed(text.chars().take(300).collect())
         };
+        let detail = failure.to_string();
         // A model that saw the source and then declined or failed is not an
         // absent reviewer: content crafted to trigger a refusal must not
         // turn a review into a warning.
@@ -111,7 +107,7 @@ pub(super) fn claude_verdict(
         } else if rejects_content(&detail) {
             AgentError::Invalid(content_rejected(&detail))
         } else {
-            unavailable(detail)
+            unavailable(failure)
         });
     }
     if text.is_empty() {
@@ -119,7 +115,7 @@ pub(super) fn claude_verdict(
             "the Claude Code CLI returned no review text".into(),
         )));
     }
-    parse_review(text, nonce).map_err(AgentError::Invalid)
+    parse_review(text, nonce)
 }
 
 /// What OpenCode's JSON event stream contained, gathered in full before the
@@ -202,7 +198,7 @@ pub(super) fn scan_events(output: &str) -> Events {
 /// when OpenCode did not exit successfully.
 pub(super) fn verdict(
     events: Events,
-    failure: Option<String>,
+    failure: Option<Failure>,
     nonce: &str,
 ) -> Result<AgentReview, AgentError> {
     if events.tool_use {
@@ -221,7 +217,7 @@ pub(super) fn verdict(
                 detail: format!("reported an error after replying: {message}"),
             }));
         }
-        return parse_review(&events.text, nonce).map_err(AgentError::Invalid);
+        return parse_review(&events.text, nonce);
     }
 
     if events.delivered
@@ -231,12 +227,13 @@ pub(super) fn verdict(
             "the AI saw the source and then declined or failed to review it ({message}); retry"
         ))));
     }
-    if events.delivered && failure.as_deref() == Some(TIMED_OUT) {
+    if events.delivered && failure == Some(Failure::TimedOut) {
         return Err(AgentError::OutOfTime(out_of_time()));
     }
+    let failure_text = failure.as_ref().map(ToString::to_string);
     // Wherever it is said: as an error event, or as the reason the run
     // failed.
-    if let Some(message) = [events.error.as_deref(), failure.as_deref()]
+    if let Some(message) = [events.error.as_deref(), failure_text.as_deref()]
         .into_iter()
         .flatten()
         .find(|message| rejects_input(message))
@@ -245,18 +242,18 @@ pub(super) fn verdict(
             "the AI could not take this source in one request ({message}); lower max_input_kib or use a model with a larger context"
         ))));
     }
-    if let Some(message) = [events.error.as_deref(), failure.as_deref()]
+    if let Some(message) = [events.error.as_deref(), failure_text.as_deref()]
         .into_iter()
         .flatten()
         .find(|message| rejects_content(message))
     {
         return Err(AgentError::Invalid(content_rejected(message)));
     }
-    if let Some(detail) = events.error.or(failure) {
-        return Err(AgentError::Unavailable(Error::ToolFailed {
-            tool: "opencode".into(),
-            detail,
-        }));
+    // A provider's own error event comes before how the run ended.
+    if let Some(failure) = events.error.map(Failure::Failed).or(failure) {
+        return Err(AgentError::Unavailable(
+            failure.into_error("opencode".into()),
+        ));
     }
     Err(AgentError::Invalid(Error::Refused(
         "OpenCode returned no review text".into(),
@@ -274,13 +271,13 @@ fn strip_code_fence(text: &str) -> &str {
     body.strip_suffix("```").map_or(trimmed, str::trim)
 }
 
-pub(super) fn parse_review(text: &str, nonce: &str) -> Result<AgentReview, Error> {
+pub(super) fn parse_review(text: &str, nonce: &str) -> Result<AgentReview, AgentError> {
     let value = Json::parse(strip_code_fence(text))
-        .map_err(|error| Error::parse("the OpenCode security report", error))?;
+        .map_err(|error| AgentError::Invalid(Error::parse(REPORT, error)))?;
     if value.get("nonce").and_then(Json::as_str) != Some(nonce) {
-        return Err(Error::parse("the OpenCode security report", NONCE_MISSING));
+        return Err(AgentError::NonceMissing);
     }
-    review_from_json(&value)
+    review_from_json(&value).map_err(AgentError::Invalid)
 }
 
 /// A review in the reply's own JSON shape, without the nonce.

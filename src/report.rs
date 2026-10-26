@@ -230,14 +230,30 @@ impl Decision {
     }
 }
 
-/// How the error of a chunk that was never sent begins: an earlier chunk
-/// had failed (see `engine`). The reason follows after a colon.
-pub(crate) const NOT_ATTEMPTED: &str = "not attempted after an earlier chunk failed";
+/// What is said of a chunk that was never sent.
+const NOT_ATTEMPTED: &str = "not attempted after an earlier chunk failed";
 
 #[derive(Debug)]
 pub(crate) enum AgentOutcome {
     Reviewed(AgentReview),
     Unavailable(Error),
+    /// Never sent, because an earlier chunk failed (see `engine`). It
+    /// counts as unavailable.
+    NotAttempted {
+        /// Why the earlier chunk failed.
+        reason: String,
+    },
+}
+
+impl AgentOutcome {
+    /// Why there is no review, for a run that has none.
+    pub(crate) fn problem(&self) -> Option<String> {
+        match self {
+            Self::Reviewed(_) => None,
+            Self::Unavailable(error) => Some(error.to_string()),
+            Self::NotAttempted { reason } => Some(format!("{NOT_ATTEMPTED}: {reason}")),
+        }
+    }
 }
 
 /// One OpenCode call and the files it covered.
@@ -465,7 +481,7 @@ impl Report {
         for run in &self.agent_runs {
             let classes = self.run_classes(run);
             match &run.outcome {
-                AgentOutcome::Unavailable(_) => {
+                AgentOutcome::Unavailable(_) | AgentOutcome::NotAttempted { .. } => {
                     for class in classes {
                         if policy_for(class).ai == AiRequirement::Required {
                             tally.ai_unavailable = true;
@@ -608,7 +624,12 @@ impl Report {
             count(&ended(Status::Clear)),
             count(&ended(Status::Suspicious)),
             count(&ended(Status::Inconclusive)),
-            count(&|run| matches!(run.outcome, AgentOutcome::Unavailable(_))),
+            count(&|run| {
+                matches!(
+                    run.outcome,
+                    AgentOutcome::Unavailable(_) | AgentOutcome::NotAttempted { .. }
+                )
+            }),
             count(&|run| run.cached.is_some()),
         )
     }
@@ -653,13 +674,9 @@ impl Report {
                     }
                 }
                 AgentOutcome::Unavailable(error) => {
-                    let error = error.to_string();
-                    if error.starts_with(NOT_ATTEMPTED) {
-                        not_attempted += 1;
-                    } else {
-                        lines.push(format!("AI review unavailable: {error}"));
-                    }
+                    lines.push(format!("AI review unavailable: {error}"));
                 }
+                AgentOutcome::NotAttempted { .. } => not_attempted += 1,
             }
         }
         if not_attempted > 0 {
@@ -687,7 +704,7 @@ impl Report {
             .filter(move |run| self.is_remarks(run) == remarks)
             .flat_map(|run| match &run.outcome {
                 AgentOutcome::Reviewed(review) => review.findings.as_slice(),
-                AgentOutcome::Unavailable(_) => &[],
+                AgentOutcome::Unavailable(_) | AgentOutcome::NotAttempted { .. } => &[],
             })
     }
 

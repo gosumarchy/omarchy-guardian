@@ -24,7 +24,7 @@ use crate::engine::plan::{HashOnly, ManifestEntry, Plan, PlanInput, Previous, Se
 use crate::engine::request::Request;
 use crate::engine::store::Store;
 use crate::error::Error;
-use crate::report::{AgentOutcome, AgentRun, LocalFinding, NOT_ATTEMPTED};
+use crate::report::{AgentOutcome, AgentRun, LocalFinding};
 use crate::rules;
 use crate::time::SECONDS_PER_DAY;
 use crate::tools::{OpenCode, Reviewer};
@@ -663,7 +663,12 @@ impl Runner<'_> {
                         }
                         // The review is blocked on the first of these; the
                         // chunks after it are still collected.
-                        Err(AgentError::Invalid(error) | AgentError::OutOfTime(error)) => {
+                        Err(
+                            error @ (AgentError::Invalid(_)
+                            | AgentError::OutOfTime(_)
+                            | AgentError::NonceMissing),
+                        ) => {
+                            let error = error.into_error();
                             stopped.get_or_insert_with(|| error.to_string());
                             failed += 1;
                             invalid = invalid.or(Some((request.chunk, error)));
@@ -750,7 +755,9 @@ impl Runner<'_> {
 }
 
 fn not_attempted(reason: &str) -> AgentOutcome {
-    AgentOutcome::Unavailable(Error::Refused(format!("{NOT_ATTEMPTED}: {reason}")))
+    AgentOutcome::NotAttempted {
+        reason: reason.to_owned(),
+    }
 }
 
 /// The error of the first chunk whose reply was invalid, for the report:
@@ -794,18 +801,22 @@ fn review_with_retry(
         // A reply that missed this run's nonce is asked for once more: a
         // model now and then drops it, and the next reply must carry its
         // own new nonce.
-        Err(AgentError::Invalid(error)) if error.to_string().ends_with(agent::NONCE_MISSING) => {
-            (review(), Some(error.to_string()))
-        }
+        Err(AgentError::NonceMissing) => (
+            review(),
+            Some(AgentError::NonceMissing.into_error().to_string()),
+        ),
         result => (result, None),
     }
 }
 
 fn is_retryable(error: &Error) -> bool {
     match error {
-        Error::ToolFailed { detail, .. } => detail != "timed out",
-        Error::Spawn { .. } => false,
-        _ => true,
+        Error::TimedOut { .. } | Error::Spawn { .. } => false,
+        Error::Io { .. }
+        | Error::ToolFailed { .. }
+        | Error::OutputTooLarge { .. }
+        | Error::Parse { .. }
+        | Error::Refused(_) => true,
     }
 }
 
