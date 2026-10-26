@@ -30,7 +30,7 @@ const MAX_ALERTS: usize = 20;
 
 /// Environment variables that load code into, or change the programs of,
 /// whatever is started with them.
-const LOADING_VARIABLES: &[&str] = &[
+pub(super) const LOADING_VARIABLES: &[&str] = &[
     "LD_PRELOAD",
     "LD_AUDIT",
     "LD_LIBRARY_PATH",

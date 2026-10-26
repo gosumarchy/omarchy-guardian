@@ -39,6 +39,13 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+impl ParseError {
+    /// What is wrong, without where.
+    pub(crate) fn message(&self) -> &'static str {
+        self.message
+    }
+}
+
 impl Json {
     /// Parses exactly one JSON value surrounded by optional whitespace.
     pub(crate) fn parse(text: &str) -> Result<Self, ParseError> {

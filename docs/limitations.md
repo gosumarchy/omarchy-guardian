@@ -59,7 +59,12 @@ matter most:
   vouches for are looked through for what they start, three deep, not scripts
   of other interpreters, and inside a script only a program named by a path in
   the place of a command ([System
-  sweep](system-sweep.md#where-following-stops)).
+  sweep](system-sweep.md#where-following-stops)). An AI coding
+  agent's hooks and MCP servers are read from your own configuration, not from
+  a project's in a repository; a configuration file that is a link is not
+  followed and is said as not checked; the code of an OpenCode npm plugin and
+  what a Claude Code plugin holds besides its hooks and servers are not read
+  ([System sweep](system-sweep.md#ai-coding-agents)).
 - **Packages:** only scriptlets, auto-run files and the text files those name
   are reviewed, not the rest of the payload; a removal is not reviewed; a unit
   you enable yourself later is not reviewed then; front ends that call libalpm
@@ -77,10 +82,11 @@ matter most:
   under `local-only`, and except the files kept from the AI by name or kind
   (SSH and git files in a home, package-manager settings that hold registry
   tokens, an editor's `settings.json`, fish's saved variables, `/etc/hosts`,
-  `at` jobs). A file whose path marks it as holding secrets is never sent, by
-  any gate or by the sweep, whatever runs it; where something runs it, the
-  sweep says so in a finding (`kept-from-review`) and only the local rules
-  have read it, unless every line of it only keeps an opaque value in a
+  `at` jobs, and an AI coding agent's configuration, of which only what each
+  entry starts is sent). A file whose path marks it as holding secrets is never
+  sent, by any gate or by the sweep, whatever runs it; where something runs
+  it, the sweep says so in a finding (`kept-from-review`) and only the local
+  rules have read it, unless every line of it only keeps an opaque value in a
   secret-named or plainly inert variable. A secret under a name Guardian does
   not recognise, with a blank or punctuation in it, in YAML or JSON form, as a
   command-line argument, or a key block in a file whose path gives no hint,

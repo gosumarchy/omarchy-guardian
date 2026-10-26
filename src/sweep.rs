@@ -13,8 +13,11 @@
 //!   review; `output` shows it.
 //! - `extensions` lists the browser extensions of the home's profiles.
 //! - `root` is the read-only root collector behind `sweep --root`.
+//! - `agents` reads what AI coding agents start on their own (hooks, MCP
+//!   servers, plugins) out of their configuration, entry by entry.
 
 mod access;
+mod agents;
 mod boot;
 pub(crate) mod collect;
 mod commands;
