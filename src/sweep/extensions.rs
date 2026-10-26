@@ -38,6 +38,7 @@ use crate::autorun::Category;
 use crate::error::{Error, IoContext as _};
 use crate::files::read_small_file;
 use crate::json::Json;
+use crate::paths::file_name;
 use crate::rules::RuleId;
 use crate::sha256::Sha256;
 
@@ -120,10 +121,17 @@ const UNPACKED: &[u64] = &[4, 8];
 /// Firefox's locations for the add-ons that ship with it.
 const BUILT_IN: &[&str] = &["app-builtin", "app-system-defaults", "app-system-addons"];
 
-/// Firefox's locations for add-ons installed for every user of the system
-/// (`/usr/lib/mozilla/extensions`, `/usr/share/mozilla/extensions`), which
-/// a package can ship.
+/// Firefox's locations for add-ons installed for every user of the system,
+/// which a package can ship.
 const SYSTEM_WIDE: &[&str] = &["app-system-share", "app-global"];
+
+/// The directories those add-ons load from, relative to the root: an
+/// add-on named elsewhere is trusted for no package's file.
+const SYSTEM_WIDE_DIRECTORIES: &[&str] = &[
+    "usr/lib/mozilla/extensions/",
+    "usr/share/mozilla/extensions/",
+    "usr/lib/firefox/browser/extensions/",
+];
 
 /// The largest preferences file read (arbitrary: profiles seen are under
 /// one MiB), and the largest manifest or message catalogue.
@@ -396,6 +404,7 @@ fn chromium_extension(
     // preferences can fill, it is listed like any other.
     let in_profile = directory
         .as_deref()
+        .and_then(|directory| read::normalize(Path::new(directory)))
         .is_some_and(|directory| directory.starts_with(&format!("{profile}/")));
     if location.is_some_and(|location| COMPONENT.contains(&location)) && !in_profile {
         return None;
@@ -654,6 +663,20 @@ fn packaged(scope: &Scope<'_>, path: &str) -> Option<Tier> {
     Some(least)
 }
 
+/// Whether `path` is where Firefox loads the add-on `id` installed for
+/// every user from: in one of `SYSTEM_WIDE_DIRECTORIES`, named `id` (a
+/// directory) or `id.xpi`.
+fn is_system_wide(path: &str, id: &str) -> bool {
+    let Some(path) = read::normalize(Path::new(path)) else {
+        return false;
+    };
+    let name = file_name(&path);
+    SYSTEM_WIDE_DIRECTORIES
+        .iter()
+        .any(|directory| path.starts_with(directory))
+        && (name == id || name.strip_suffix(".xpi") == Some(id))
+}
+
 /// What the sweep remembers of `extension`: its id, where it came from
 /// and what it was granted, one per line; not its name or version.
 fn text(extension: &Extension) -> String {
@@ -711,7 +734,10 @@ fn item(scope: &Scope<'_>, extension: &Extension) -> Item {
             )),
         },
         Source::Unsigned => alerts.push("not signed by Mozilla".into()),
-        Source::SystemWide(path) => match packaged(scope, path) {
+        Source::SystemWide(path) => match is_system_wide(path, &extension.id)
+            .then(|| packaged(scope, path))
+            .flatten()
+        {
             Some(packaged) => {
                 tier = packaged;
                 notes.push(format!(

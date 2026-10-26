@@ -583,6 +583,22 @@ fn more_programs_than_are_compared_and_unreadable_ones_are_said() {
         "{:?}",
         boot.notes
     );
+    // Run as root, the sweep is incomplete and says why, naming the file
+    // once.
+    let as_root = check(&Scope {
+        origin: Origin::Root,
+        ..scope
+    });
+    let said = as_root
+        .unchecked
+        .iter()
+        .find(|sentence| sentence.contains("tool00.efi"))
+        .unwrap();
+    assert!(
+        said.ends_with("boot/EFI/tools/tool00.efi: Permission denied (os error 13); not compared"),
+        "{said}"
+    );
+    assert_eq!(said.matches("tool00.efi").count(), 1, "{said}");
     fs::set_permissions(&closed, fs::Permissions::from_mode(0o644)).unwrap();
 }
 

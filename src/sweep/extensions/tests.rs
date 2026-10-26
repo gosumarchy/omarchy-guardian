@@ -666,15 +666,24 @@ fn a_firefox_extension_for_every_user_is_trusted_only_as_a_package_installed_it(
         "usr/lib/mozilla/extensions/{ec8030f7-c20a-464f-9b0e-13a3a9e97384}/shipped@example.xpi";
     let dropped =
         "usr/lib/mozilla/extensions/{ec8030f7-c20a-464f-9b0e-13a3a9e97384}/dropped@example.xpi";
+    // Packaged, but not where Firefox loads such an add-on from, or under
+    // another add-on's name.
+    let elsewhere = "usr/share/doc/firefox-extension/elsewhere@example.xpi";
+    let renamed =
+        "usr/lib/mozilla/extensions/{ec8030f7-c20a-464f-9b0e-13a3a9e97384}/shipped@example.xpi";
     write(root, shipped, "an add-on");
     write(root, dropped, "another add-on");
+    write(root, elsewhere, "an add-on");
     let mut index = PackageIndex::with_foreign(HashSet::new());
+    let line = |path: &str| {
+        format!(
+            "./{path} type=file mode=644 sha256digest={}\n",
+            Sha256::digest(b"an add-on")
+        )
+    };
     index.add_for_test(
         "firefox-extension",
-        &format!(
-            "./{shipped} type=file mode=644 sha256digest={}\n",
-            Sha256::digest(b"an add-on")
-        ),
+        &format!("{}{}", line(shipped), line(elsewhere)),
         &[],
     );
     let addon = |id: &str, path: &str| {
@@ -686,9 +695,11 @@ fn a_firefox_extension_for_every_user_is_trusted_only_as_a_package_installed_it(
         root,
         "home/u/.mozilla/firefox/abc.default/extensions.json",
         &format!(
-            r#"{{"addons":[{},{}]}}"#,
+            r#"{{"addons":[{},{},{},{}]}}"#,
             addon("shipped@example", shipped),
-            addon("dropped@example", dropped)
+            addon("dropped@example", dropped),
+            addon("elsewhere@example", elsewhere),
+            addon("renamed@example", renamed)
         ),
     );
     let scope = Scope {
@@ -701,12 +712,37 @@ fn a_firefox_extension_for_every_user_is_trusted_only_as_a_package_installed_it(
     let shipped_item = by_id(&items, "shipped@example").unwrap();
     assert!(shipped_item.alerts.is_empty(), "{:?}", shipped_item.alerts);
     assert_eq!(shipped_item.tier, Tier::Vendor);
-    let dropped_item = by_id(&items, "dropped@example").unwrap();
+    for id in ["dropped@example", "elsewhere@example", "renamed@example"] {
+        let alerts = &by_id(&items, id).unwrap().alerts;
+        assert!(
+            alerts[0]
+                .1
+                .starts_with("installed from outside the addons.mozilla.org: for every user"),
+            "{id}: {alerts:?}"
+        );
+    }
+}
+
+#[test]
+fn an_empty_unpacked_path_is_alerted() {
+    let dir = TempDir::new("sweep-extensions-empty-path");
+    let root = dir.path();
+    write(
+        root,
+        "home/u/.mozilla/firefox/abc.default/extensions.json",
+        r#"{"addons":[{"id":"empty@example","type":"extension","location":"app-temporary","path":""}]}"#,
+    );
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: Some(HOME),
+        index: &index,
+        origin: Origin::System,
+    };
+    let (items, _) = found(&scope);
     assert!(
-        dropped_item.alerts[0]
-            .1
-            .starts_with("installed from outside the addons.mozilla.org: for every user"),
+        items[0].alerts[0].1.starts_with("loaded unpacked from / ("),
         "{:?}",
-        dropped_item.alerts
+        items[0].alerts
     );
 }

@@ -33,7 +33,7 @@ mod pe;
 
 use std::borrow::Cow;
 use std::fs::{self, OpenOptions};
-use std::io::Read as _;
+use std::io::{self, Read as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::Path;
 
@@ -202,7 +202,7 @@ pub(super) fn compare(scope: &Scope<'_>, files: &[String], kernels: &[Digest], b
             } => match whole(&scope.root.join(path), *sha256, *size, head) {
                 Ok(bytes) => verdict(path, &bytes, &packaged),
                 Err(error) => {
-                    unread(scope, boot, path, &error.to_string());
+                    unread(scope, boot, path, &error);
                     continue;
                 }
             },
@@ -211,8 +211,8 @@ pub(super) fn compare(scope: &Scope<'_>, files: &[String], kernels: &[Digest], b
                 continue;
             }
             Found::Other => continue,
-            Found::Unreadable(reason) => {
-                unread(scope, boot, path, reason);
+            Found::Unreadable(_) => {
+                unread(scope, boot, path, &open_error(&scope.root.join(path)));
                 continue;
             }
         };
@@ -291,16 +291,35 @@ fn link(scope: &Scope<'_>, boot: &mut Boot, path: &str, target: &str) {
     }
 }
 
-/// Says that the program at `path` could not be read, for `reason`.
-fn unread(scope: &Scope<'_>, boot: &mut Boot, path: &str, reason: &str) {
-    if scope.origin == Origin::Root {
-        boot.unchecked.push(format!(
-            "/{path}: could not be read ({reason}); not compared"
-        ));
-    } else {
+/// Says that the program at `path` could not be read, for `error` (which
+/// names the file): a user who may not read it leaves it to the root
+/// checks, any other reason is said as it is.
+fn unread(scope: &Scope<'_>, boot: &mut Boot, path: &str, error: &Error) {
+    let denied = matches!(
+        error,
+        Error::Io { source, .. } if source.kind() == io::ErrorKind::PermissionDenied
+    );
+    if denied && scope.origin != Origin::Root {
         boot.notes.push(format!(
             "/{path} cannot be read as this user; the root checks compare it with the packaged EFI programs"
         ));
+    } else {
+        not_checked(scope, boot, format!("{error}; not compared"));
+    }
+}
+
+/// Why the file at `path`, which `look` could not read, cannot be read:
+/// opened again (without following a link or waiting on it) for an error
+/// that says what kind of failure it is.
+fn open_error(path: &Path) -> Error {
+    match OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+        .open(path)
+        .at(path)
+    {
+        Err(error) => error,
+        Ok(_) => Error::Message(format!("{}: could not be read", path.display())),
     }
 }
 

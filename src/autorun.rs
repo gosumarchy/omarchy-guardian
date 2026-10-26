@@ -875,6 +875,8 @@ pub(crate) const SYSTEM_SWEEP: &[Location] = &[
     location("boot/grub/grub.cfg", Kind::File, Category::Boot),
     location("boot/startup.nsh", Kind::File, Category::Boot),
     location("boot/EFI/BOOT/startup.nsh", Kind::File, Category::Boot),
+    // Matched by name as listed, so a `REFIND.CONF` on FAT is missed: a
+    // limit the docs state (`docs/limitations.md`).
     location("boot/EFI/*/refind.conf", Kind::Glob, Category::Boot),
     location("etc/default/limine", Kind::File, Category::Boot),
     location("etc/default/grub", Kind::File, Category::Boot),
