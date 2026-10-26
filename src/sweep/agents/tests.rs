@@ -90,7 +90,7 @@ fn claude_settings_give_an_item_for_each_hook_status_line_and_helper() {
     write(
         root,
         "home/u/.claude/settings.local.json",
-        r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "echo hi"}]}]}}"#,
+        r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "echo ${CLAUDE_PLUGIN_ROOT:-$HOME}"}]}]}}"#,
     );
     let found = found_in(root);
     assert_eq!(found.unchecked, Vec::<String>::new());
@@ -118,10 +118,12 @@ fn claude_settings_give_an_item_for_each_hook_status_line_and_helper() {
     at(&found, "home/u/.claude/settings.json#hooks/PreToolUse/1/0");
     at(&found, "home/u/.claude/settings.json#statusLine");
     at(&found, "home/u/.claude/settings.json#apiKeyHelper");
-    at(
+    // Outside a plugin the plugin's variable names no plugin script.
+    let local = at(
         &found,
         "home/u/.claude/settings.local.json#hooks/SessionStart/0/0",
     );
+    assert!(!collect::is_capped(local), "{:?}", local.notes);
 
     // A web hook is its scheme and host, and an alert.
     let web = at(&found, "home/u/.claude/settings.json#hooks/Stop/0/0");
@@ -279,7 +281,7 @@ fn a_plugin_is_read_through_its_install_and_its_scripts_are_followed() {
         root,
         &format!("{cache}/hooks/hooks.json"),
         r#"{"description": "d", "hooks": {"SessionStart": [{"hooks": [
-            {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X"},
+            {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X ${CLAUDE_PLUGIN_ROOT_X}"},
             {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT:-.}/hooks/shims.sh\""},
             {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT:-$HOME}/hooks/x.sh\""}
         ]}]}}"#,
@@ -306,12 +308,12 @@ fn a_plugin_is_read_through_its_install_and_its_scripts_are_followed() {
     // The text is the line as written: the line may change the variable.
     assert_eq!(
         text(start),
-        "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X\n"
+        "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X ${CLAUDE_PLUGIN_ROOT_X}\n"
     );
     assert_eq!(
         start.runs,
         [format!(
-            "bash \"/{cache}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X"
+            "bash \"/{cache}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X ${{CLAUDE_PLUGIN_ROOT_X}}"
         )]
     );
     let shims = at(

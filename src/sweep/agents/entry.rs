@@ -227,12 +227,9 @@ fn item(scope: &Scope<'_>, source: &Source<'_>, entry: Entry) -> Item {
     let mut notes: Vec<String> = source.note.iter().cloned().collect();
     // A form `plugin_root_readings` leaves as written names no file, so
     // the script it runs is not read; the sweep says so.
-    if runs
-        .iter()
-        .any(|run| run.contains(&format!("${{{PLUGIN_ROOT}")))
-    {
+    if source.plugin_root.is_some() && runs.iter().any(|run| names_braced_plugin_root(run)) {
         notes.push(format!(
-            "{NOT_ALL_FOLLOWED}a plugin's directory named with a default that is not a plain path"
+            "{NOT_ALL_FOLLOWED}a form of ${{{PLUGIN_ROOT}}} that is neither plain nor a path default"
         ));
     }
     Item {
@@ -445,6 +442,15 @@ pub(super) fn plugin_root_readings(line: &str, root: Option<&str>) -> Vec<String
     } else {
         vec![set, unset]
     }
+}
+
+/// Whether `run` still holds `${CLAUDE_PLUGIN_ROOT…}`, which no reading
+/// wrote in; `${CLAUDE_PLUGIN_ROOT_X}` is another variable.
+fn names_braced_plugin_root(run: &str) -> bool {
+    let open = format!("${{{PLUGIN_ROOT}");
+    run.match_indices(&open).any(|(at, _)| {
+        !run[at + open.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+    })
 }
 
 /// How a default form of the plugin's variable is read.
