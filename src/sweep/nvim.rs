@@ -44,6 +44,7 @@ use super::lua::{self, Build, Spec};
 use super::read::{self, Found};
 use super::tier::Tier;
 use crate::autorun::Category;
+use crate::error::Error;
 use crate::json::Json;
 use crate::paths::file_name;
 use crate::rules::RuleId;
@@ -316,16 +317,17 @@ fn is_shipped_spec(path: &str) -> bool {
 
 /// The text of the spec file at `path`, or why it was not read: it is not
 /// a file within the text review limit.
-fn spec_text(root: &Path, path: &str) -> Result<String, String> {
-    match read::look(root, path) {
+fn spec_text(root: &Path, path: &str) -> Result<String, Error> {
+    let why = match read::look(root, path) {
         Found::File { size, head, .. } if size <= MAX_TEXT_FILE_SIZE => {
-            Ok(String::from_utf8_lossy(&head).into_owned())
+            return Ok(String::from_utf8_lossy(&head).into_owned());
         }
-        Found::File { .. } => Err("larger than the text review limit".into()),
-        Found::Link(_) => Err("a link, which is not followed".into()),
-        Found::Other => Err("not a file".into()),
-        Found::Unreadable(reason) => Err(format!("could not be read ({reason})")),
-    }
+        Found::File { .. } => "larger than the text review limit".into(),
+        Found::Link(_) => "a link, which is not followed".into(),
+        Found::Other => "not a file".into(),
+        Found::Unreadable(reason) => format!("could not be read ({reason})"),
+    };
+    Err(Error::Message(why))
 }
 
 /// The commit `lazy-lock.json` in `config` pins for each plugin. One that
