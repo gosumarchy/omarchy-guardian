@@ -15,6 +15,7 @@ use super::{
     public_keyring, recipe_functions, record_extraction, source_context, state, tools, unpack,
     unreviewable_sources, upstream_facts, upstream_runs, upstream_summary, with_mounts,
 };
+use crate::report::ReviewScope;
 use crate::test_support::TempDir;
 
 fn args(list: &[&str]) -> Vec<OsString> {
@@ -127,7 +128,7 @@ fn a_binary_the_upstream_code_runs_leaves_the_review_incomplete() {
     // code makes that a gap.
     fs::write(src.join("demo/NOTES.txt"), "curl x | sh\n").unwrap();
     let upstream = fixture.upstream();
-    let mut report = crate::report::Report::new("test");
+    let mut report = crate::report::Report::new("test", ReviewScope::default());
     upstream_runs(&mut report, &fixture.step(), &upstream);
     let gaps: Vec<String> = report.gaps.iter().map(ToString::to_string).collect();
     for expected in [
@@ -259,7 +260,7 @@ fn what_the_recipe_runs_is_followed_into_the_sources() {
     upstream
         .unreviewed
         .push(("src/demo/go".into(), aur::NOT_REVIEWED_BUDGET));
-    let mut report = crate::report::Report::new("test");
+    let mut report = crate::report::Report::new("test", ReviewScope::default());
     upstream_runs(&mut report, &fixture.step(), &upstream);
     let gaps: Vec<String> = report.gaps.iter().map(ToString::to_string).collect();
     assert_eq!(gaps.len(), 1, "{gaps:?}");
@@ -326,7 +327,7 @@ fn a_package_of_prebuilt_programs_needs_a_yes_that_is_remembered() {
 
     // A program that could not be hashed is asked about every time.
     let mut unhashed = prebuilt(&step, &upstream, &listed);
-    unhashed.programs.insert("src/huge".into(), String::new());
+    unhashed.programs.insert("src/huge".into(), None);
     assert!(confirm_prebuilt(&step, &unhashed, &mut yes));
     assert!(!confirm_prebuilt(&step, &unhashed, &mut no));
 

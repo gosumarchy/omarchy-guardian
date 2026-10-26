@@ -12,6 +12,7 @@ use crate::error::Error;
 use crate::osv::Audit;
 use crate::rules::{RuleId, Scheme};
 use crate::scan::Snapshot;
+use crate::sha256::Digest;
 
 pub(crate) mod html;
 mod terminal;
@@ -301,25 +302,15 @@ pub(crate) struct Report {
     pub(crate) network: Vec<NetworkRequest>,
     pub(crate) agent_input: Vec<SourceFile>,
     pub(crate) agent_input_overflowed: bool,
-    /// Classes whose policy has `ai = off`: their files are never queued for
-    /// the AI provider, so AI-input gaps do not apply to them either. Files
-    /// are matched through `class_of`, so `file_classes` must be set before
-    /// a file is analyzed.
-    pub(crate) ai_off_classes: Vec<SourceClass>,
-    /// Classes whose policy shows the low findings of a clear AI verdict as
-    /// remarks (`Policy::ai_remarks`, see `review::remark_classes`). Empty
-    /// unless whoever builds the report sets it: every AI finding is then
-    /// a finding, as the system sweep has it in every profile.
-    pub(crate) remark_classes: Vec<SourceClass>,
+    /// What the files are reviewed under, fixed when the report is made.
+    scope: ReviewScope,
     pub(crate) dependencies: Inventory,
     pub(crate) audit: Option<Audit>,
-    /// Class of every file not listed in `file_classes`.
-    pub(crate) class: SourceClass,
     /// Per-file classes when one report spans several (pacman transactions).
+    /// Files are matched through `class_of`, so a file's class must be set
+    /// before the file is analyzed.
     pub(crate) file_classes: HashMap<String, SourceClass>,
     pub(crate) agent_runs: Vec<AgentRun>,
-    /// Profile name shown next to AI verdicts.
-    pub(crate) profile: String,
     /// Review-memory lines: the upgrade summary and store problems. Never gaps.
     pub(crate) notes: Vec<String>,
     /// Facts Guardian established for the AI review (see `Request::context`).
@@ -335,9 +326,31 @@ pub(crate) struct Report {
     /// with the SHA-256 of its bytes: what the audit trail records and a
     /// permit is bound to.
     pub(crate) archives: Vec<ReviewedArchive>,
-    /// The permit of the user's that overrules this report's decision
-    /// (see `permit`): it is printed as PERMITTED.
-    pub(crate) permit: Option<String>,
+}
+
+/// What a report's files are reviewed under: their class and the policy of
+/// the profile in force. It is given when the report is made, so no file
+/// is analyzed before it is set (see `review::scope`).
+#[derive(Debug, Default)]
+pub(crate) struct ReviewScope {
+    /// Class of every file not listed in `Report::file_classes`.
+    pub(crate) class: SourceClass,
+    /// Profile name shown next to AI verdicts.
+    pub(crate) profile: String,
+    /// Classes whose policy has `ai = off`: their files are never queued for
+    /// the AI provider, so AI-input gaps do not apply to them either.
+    pub(crate) ai_off_classes: Vec<SourceClass>,
+    /// Classes whose policy shows the low findings of a clear AI verdict as
+    /// remarks (`Policy::ai_remarks`). Where it is empty, every AI finding
+    /// is a finding, as the system sweep has it in every profile.
+    pub(crate) remark_classes: Vec<SourceClass>,
+}
+
+/// Whether a printed report lists the SHA-256 of every file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Hashes {
+    Shown,
+    Hidden,
 }
 
 /// One archive of a reviewed pacman transaction.
@@ -347,8 +360,8 @@ pub(crate) struct ReviewedArchive {
     /// and architecture.
     pub(crate) name: String,
     pub(crate) class: SourceClass,
-    /// Hex SHA-256 of the archive's bytes.
-    pub(crate) sha256: String,
+    /// SHA-256 of the archive's bytes.
+    pub(crate) sha256: Digest,
 }
 
 /// A file one reviewed file runs or reads in as code.
@@ -399,15 +412,34 @@ impl Tally {
 }
 
 impl Report {
-    pub(crate) fn new(subject: impl Into<String>) -> Self {
+    pub(crate) fn new(subject: impl Into<String>, scope: ReviewScope) -> Self {
         Self {
             subject: subject.into(),
+            scope,
             ..Self::default()
         }
     }
 
+    /// The class of every file not given one of its own.
+    pub(crate) const fn class(&self) -> SourceClass {
+        self.scope.class
+    }
+
     pub(crate) fn class_of(&self, path: &str) -> SourceClass {
-        self.file_classes.get(path).copied().unwrap_or(self.class)
+        self.file_classes
+            .get(path)
+            .copied()
+            .unwrap_or(self.scope.class)
+    }
+
+    /// Whether the file at `path` is of a class whose policy has `ai = off`.
+    pub(crate) fn is_ai_off(&self, path: &str) -> bool {
+        self.scope.ai_off_classes.contains(&self.class_of(path))
+    }
+
+    /// The name of the profile the review ran under.
+    pub(crate) fn profile(&self) -> &str {
+        &self.scope.profile
     }
 
     fn run_classes(&self, run: &AgentRun) -> Vec<SourceClass> {
@@ -416,7 +448,7 @@ impl Report {
         classes.sort();
         classes.dedup();
         if classes.is_empty() {
-            classes.push(self.class);
+            classes.push(self.scope.class);
         }
         classes
     }
@@ -455,7 +487,7 @@ impl Report {
                         .iter()
                         .map(|finding| self.class_of(&finding.file)),
                 )
-                .all(|class| self.remark_classes.contains(&class))
+                .all(|class| self.scope.remark_classes.contains(&class))
             && !self.findings.iter().any(|local| {
                 run.files.contains(&local.path)
                     || review
@@ -531,7 +563,7 @@ impl Report {
             .as_ref()
             .is_some_and(|audit| !audit.advisories.is_empty())
         {
-            tally.apply(policy_for(self.class).on_findings);
+            tally.apply(policy_for(self.scope.class).on_findings);
         }
 
         if tally.ai_unavailable {

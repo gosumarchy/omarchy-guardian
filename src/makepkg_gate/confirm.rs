@@ -9,7 +9,7 @@ use crate::aur::recipe::{self, Sources};
 use crate::aur::{self, Upstream};
 use crate::cli::Confirm;
 use crate::paths::file_name;
-use crate::sha256::Sha256;
+use crate::sha256::{Digest, Sha256};
 
 /// What reading the recipe's text says about a listing of it.
 #[derive(Debug, PartialEq, Eq)]
@@ -133,8 +133,8 @@ fn remember(step: &UpstreamStep<'_>, asked: &str) {
 /// one reviewed them, and no one can.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct Prebuilt {
-    /// The programs, with their hashes.
-    pub(super) programs: BTreeMap<String, String>,
+    /// The programs, with their hashes where they could be hashed.
+    pub(super) programs: BTreeMap<String, Option<Digest>>,
     /// Those the recipe's functions or install scripts run.
     pub(super) run: Vec<String>,
     /// Where the sources were downloaded from.
@@ -167,12 +167,14 @@ impl Prebuilt {
     /// `None` when one of them could not be hashed: it could be anything
     /// next time.
     fn asked(&self) -> Option<String> {
-        if self.programs.values().any(String::is_empty) {
-            return None;
-        }
+        let digests: Vec<(&str, String)> = self
+            .programs
+            .iter()
+            .map(|(path, digest)| Some((path.as_str(), digest.as_ref()?.to_string())))
+            .collect::<Option<_>>()?;
         let mut parts: Vec<&str> = Vec::new();
-        for (path, digest) in &self.programs {
-            parts.extend([path.as_str(), digest.as_str()]);
+        for (path, digest) in &digests {
+            parts.extend([*path, digest.as_str()]);
         }
         parts.push("from");
         parts.extend(self.hosts.iter().map(String::as_str));
@@ -215,14 +217,14 @@ pub(super) fn prebuilt(
         let name = file_name(path);
         upstream.is_unpacked(path) || (name.len() >= 5 && functions.written.contains(name))
     };
-    let mut programs: BTreeMap<String, String> = upstream
+    let mut programs: BTreeMap<String, Option<Digest>> = upstream
         .programs
         .iter()
         .filter(|(path, _)| !builds || named(path) || run.contains(*path))
-        .map(|(path, digest)| (path.clone(), digest.clone()))
+        .map(|(path, digest)| (path.clone(), *digest))
         .collect();
     for path in &run {
-        let digest = upstream.unread.get(path).cloned().unwrap_or_default();
+        let digest = upstream.unread.get(path).copied().flatten();
         programs.entry(path.clone()).or_insert(digest);
     }
     let mut hosts: Vec<String> = sources
@@ -326,13 +328,13 @@ pub(super) fn binary_changes(step: &UpstreamStep<'_>, upstream: &Upstream) -> Op
 }
 
 /// Every binary among the sources that is not reviewed, with its hash.
-pub(super) fn all_binaries(upstream: &Upstream) -> BTreeMap<String, String> {
+pub(super) fn all_binaries(upstream: &Upstream) -> BTreeMap<String, Option<Digest>> {
     let mut binaries = upstream.unread.clone();
     binaries.extend(
         upstream
             .programs
             .iter()
-            .map(|(path, digest)| (path.clone(), digest.clone())),
+            .map(|(path, digest)| (path.clone(), *digest)),
     );
     binaries
 }

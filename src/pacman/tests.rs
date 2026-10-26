@@ -12,7 +12,7 @@ use crate::agent::{AgentReview, Status};
 use crate::config::Settings;
 use crate::config::file::PartialConfig;
 use crate::config::model::SourceClass;
-use crate::report::{AgentOutcome, AgentRun, Blocked, Decision, Report};
+use crate::report::{AgentOutcome, AgentRun, Blocked, Decision, Report, ReviewScope};
 use crate::review::analyze_text;
 use crate::rules::RuleId;
 use crate::test_support::{TempDir, tool_available};
@@ -234,8 +234,13 @@ fn mixed_transaction_uses_each_targets_policy() {
     let settings = Settings::from_parts(PartialConfig::default(), PartialConfig::default());
     let policy = |class| settings.policy(class);
 
-    let mut report = Report::new("pacman transaction");
-    report.class = SourceClass::ThirdPartyRepo;
+    let mut report = Report::new(
+        "pacman transaction",
+        ReviewScope {
+            class: SourceClass::ThirdPartyRepo,
+            ..ReviewScope::default()
+        },
+    );
     report
         .file_classes
         .insert("core-pkg/a/.INSTALL".into(), SourceClass::Official);
@@ -260,8 +265,13 @@ fn mixed_transaction_uses_each_targets_policy() {
     ]));
     assert_eq!(report.decide(&policy), Decision::Warned);
 
-    let mut flagged = Report::new("pacman transaction");
-    flagged.class = SourceClass::ThirdPartyRepo;
+    let mut flagged = Report::new(
+        "pacman transaction",
+        ReviewScope {
+            class: SourceClass::ThirdPartyRepo,
+            ..ReviewScope::default()
+        },
+    );
     flagged
         .file_classes
         .insert("core-pkg/a/.INSTALL".into(), SourceClass::Official);
@@ -403,7 +413,7 @@ fn a_file_installed_setuid_root_is_a_finding() {
         .unwrap();
     assert!(status.success());
 
-    let mut report = Report::new("test");
+    let mut report = Report::new("test", ReviewScope::default());
     scan_package(
         &archive,
         "sample",
@@ -487,7 +497,7 @@ fn a_link_to_a_file_the_package_does_not_ship_is_reviewed_as_that_file() {
             crate::payload::InArchive::Absent
         }
     };
-    let mut report = Report::new("test");
+    let mut report = Report::new("test", ReviewScope::default());
     scan_package(
         &archive,
         "sample",
@@ -639,7 +649,7 @@ fn install_scripts_are_reviewed_through_the_archive_model() {
     let dir = TempDir::new("pacman-install");
     let archive = build_package(dir.path(), Some("post_install() { rm -rf /; }\n"));
 
-    let mut report = Report::new("test");
+    let mut report = Report::new("test", ReviewScope::default());
     let (scriptlet, _, _) = scan_package(
         &archive,
         "sample",
@@ -679,7 +689,7 @@ fn install_scripts_are_reviewed_through_the_archive_model() {
         .status()
         .unwrap();
     assert!(status.success());
-    let mut report = Report::new("test");
+    let mut report = Report::new("test", ReviewScope::default());
     assert!(
         scan_package(
             &archive,
@@ -939,7 +949,7 @@ fn what_a_link_on_the_system_leads_to_is_reviewed_when_a_package_replaces_it() {
     lead("tool", "usr/local/bin/tool");
     lead("complete", "usr/share/bash-completion/completions/b");
     let scan = |class| {
-        let mut report = Report::new("test");
+        let mut report = Report::new("test", ReviewScope::default());
         let (_, summary, _) = scan_package(
             &archive,
             "b",
@@ -990,7 +1000,7 @@ fn what_a_link_on_the_system_leads_to_is_reviewed_when_a_package_replaces_it() {
     assert_eq!(report.agent_input.len(), 1);
 
     // Without such links nothing of this package is looked at.
-    let mut report = Report::new("test");
+    let mut report = Report::new("test", ReviewScope::default());
     scan_package(
         &archive,
         "b",
@@ -1043,7 +1053,7 @@ fn named_files_misplaced_files_and_a_changed_archive_reach_the_report() {
         ],
     );
     let scan = |class| {
-        let mut report = Report::new("test");
+        let mut report = Report::new("test", ReviewScope::default());
         let scanned = scan_package(
             &archive,
             "sample",
@@ -1173,7 +1183,7 @@ fn only_a_line_about_guardians_own_is_let_off() {
 
     let script = "pre_remove() {\n  systemctl disable --now omarchy-guardian-sweep.timer\n  systemctl disable ufw # omarchy-guardian\n  systemctl stop apparmor omarchy-guardian-sweep.timer\n  systemctl disable \\\n    omarchy-guardian-sweep.timer ufw\n}\n";
     let findings = |target: &str| {
-        let mut report = Report::new("test");
+        let mut report = Report::new("test", ReviewScope::default());
         analyze_text(&mut report, "x/.INSTALL", script, false);
         super::own_removal_is_no_attack(&mut report, target, "x/.INSTALL", script);
         let mut lines: Vec<usize> = report
@@ -1209,7 +1219,7 @@ fn what_was_not_read_inside_a_fingerprinted_archive_can_be_permitted() {
     let mut big = b"#!/bin/sh\n".to_vec();
     big.resize(2 * 1024 * 1024 + 1, b'#');
     let scan = |archive: &Path, name: &str| {
-        let mut report = Report::new("test");
+        let mut report = Report::new("test", ReviewScope::default());
         let scanned = scan_package(
             archive,
             name,

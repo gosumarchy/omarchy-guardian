@@ -19,6 +19,7 @@ use crate::config::model::{AgentSettings, AiRequirement, Profile, SourceClass};
 use crate::engine::baseline::{self, Identity, Unit};
 use crate::engine::store::Store;
 use crate::permit::Standing;
+use crate::report::Hashes;
 use crate::report::{Blocked, Decision};
 use crate::scan::ScanConfig;
 use crate::test_support::{TempDir, mock_opencode, mock_opencode_findings};
@@ -116,7 +117,7 @@ fn sandbox_always_reviews_generated_directories() {
 fn target(dir: &TempDir) -> Target {
     Target {
         config: ScanConfig::new(dir.path()),
-        show_hashes: false,
+        hashes: Hashes::Hidden,
         class: SourceClass::Source,
         profile: None,
         units: Vec::new(),

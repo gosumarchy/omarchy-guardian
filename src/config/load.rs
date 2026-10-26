@@ -43,9 +43,10 @@ pub(crate) struct Settings {
     user_status: FileStatus,
     profile_override: Option<Profile>,
     privileged_block: Option<String>,
-    system_block: Option<String>,
-    system_unverified: bool,
-    user_block: Option<String>,
+    /// Why no user-level review runs, and what to tell the user. A broken
+    /// system file is the cause even when the user file is broken too: it
+    /// is the one root has to fix.
+    user_block: Option<(UserBlock, String)>,
     warnings: Vec<String>,
 }
 
@@ -258,10 +259,15 @@ impl Settings {
                     "{}: {reason}; fix it (see `omarchy-guardian config check`) before pacman transactions can be reviewed",
                     system_path.display()
                 ));
-                settings.system_unverified = unverified(owner);
-                let block = system_block_text(system_path, &reason, settings.system_unverified);
+                let unverified = unverified(owner);
+                let block = system_block_text(system_path, &reason, unverified);
                 settings.warnings.push(block.clone());
-                settings.system_block = Some(block);
+                let cause = if unverified {
+                    UserBlock::Unverified
+                } else {
+                    UserBlock::SystemFile
+                };
+                settings.user_block = Some((cause, block));
                 settings.system_status = FileStatus::Invalid(reason);
             }
         }
@@ -299,7 +305,9 @@ impl Settings {
                         "{named}; fix it (see `omarchy-guardian config check`) before AUR builds, themes, plugins, scans and the sweep can be reviewed"
                     );
                     settings.warnings.push(block.clone());
-                    settings.user_block = Some(block);
+                    settings
+                        .user_block
+                        .get_or_insert((UserBlock::UserFile, block));
                     settings.user_status = FileStatus::Invalid(reason);
                 }
             }
@@ -317,8 +325,6 @@ impl Settings {
             user_status: FileStatus::Missing,
             profile_override: None,
             privileged_block: None,
-            system_block: None,
-            system_unverified: false,
             user_block: None,
             warnings: Vec::new(),
         }
@@ -462,21 +468,13 @@ impl Settings {
     /// invalid or insecure, or the user file is there and does not parse.
     /// The system file's reason comes first: it is the one root has to fix.
     pub(crate) fn user_block(&self) -> Option<&str> {
-        self.system_block.as_deref().or(self.user_block.as_deref())
+        self.user_block.as_ref().map(|(_, text)| text.as_str())
     }
 
     /// Which file stops the reviews for the user, and whether it is the
     /// namespace this runs in that makes the system file unusable.
     pub(crate) fn user_block_cause(&self) -> Option<UserBlock> {
-        if self.system_block.is_some() {
-            Some(if self.system_unverified {
-                UserBlock::Unverified
-            } else {
-                UserBlock::SystemFile
-            })
-        } else {
-            self.user_block.as_ref().map(|_| UserBlock::UserFile)
-        }
+        self.user_block.as_ref().map(|(cause, _)| *cause)
     }
 
     /// The weaker settings accepted in the root-owned system file.
@@ -602,7 +600,6 @@ mod tests {
         // User-level classes are not reviewed at the built-in standard
         // profile instead: they are blocked too.
         let block = settings.user_block().unwrap();
-        assert_eq!(settings.system_block.as_deref(), Some(block));
         assert_eq!(settings.user_block_cause(), Some(UserBlock::SystemFile));
         assert_eq!(settings.warnings(), [block.to_string()]);
 
@@ -736,7 +733,6 @@ mod tests {
             block.contains(&format!("{}:3:", system.display())),
             "{block}"
         );
-        assert_eq!(settings.system_block.as_deref(), Some(block));
         assert_eq!(settings.user_status(), &FileStatus::Loaded);
         assert_eq!(settings.user_block_cause(), Some(UserBlock::SystemFile));
 
@@ -746,11 +742,11 @@ mod tests {
         assert_eq!(both.warnings().len(), 2);
         assert!(both.user_block().unwrap().contains("as root"));
         assert!(both.warnings()[1].contains(&user.display().to_string()));
+        assert_eq!(both.user_block_cause(), Some(UserBlock::SystemFile));
 
         // Not there: the built-in defaults, and nothing blocked by it.
         let missing = Settings::load_from(&dir.path().join("none.toml"), Some(&user), &secure);
         assert_eq!(missing.system_status(), &FileStatus::Missing);
-        assert_eq!(missing.system_block.as_deref(), None);
         assert_eq!(missing.privileged_block(), None);
         assert!(missing.user_block().unwrap().contains("user.toml"));
         assert_eq!(missing.user_block_cause(), Some(UserBlock::UserFile));
@@ -760,7 +756,6 @@ mod tests {
         fs::write(&user, "").unwrap();
         let valid = Settings::load_from(&system, Some(&user), &secure);
         assert_eq!(valid.user_block(), None);
-        assert_eq!(valid.system_block.as_deref(), None);
         assert_eq!(valid.user_block_cause(), None);
         assert_eq!(valid.privileged_block(), None);
         assert!(valid.warnings().is_empty());

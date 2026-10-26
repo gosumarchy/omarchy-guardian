@@ -14,7 +14,7 @@ use crate::config::Settings;
 use crate::config::file::PartialConfig;
 use crate::config::model::{Profile, SourceClass};
 use crate::error::Error;
-use crate::report::{Blocked, Decision, Gap, Report};
+use crate::report::{Blocked, Decision, Gap, Report, ReviewScope};
 use crate::test_support::{NOBODY, TempDir, give};
 use crate::user::real_uid as current_uid;
 
@@ -284,7 +284,7 @@ fn ended_permits_are_cleared_and_a_user_holds_only_so_many() {
 }
 
 fn blocked_report() -> Report {
-    let mut report = Report::new("theme:demo");
+    let mut report = Report::new("theme:demo", ReviewScope::default());
     report.gaps.push(Gap::Undecodable("install.sh".into()));
     report
 }
@@ -360,7 +360,7 @@ fn a_block_is_offered_a_permit_and_a_permit_lets_it_through() {
     assert_eq!(
         ask(
             std::slice::from_ref(&content),
-            &Report::new("x"),
+            &Report::new("x", ReviewScope::default()),
             Decision::Clear,
             &settings
         ),

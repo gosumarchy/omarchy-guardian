@@ -41,7 +41,7 @@ use crate::config::model::{RootConsent, SourceClass};
 use crate::engine::store::Store;
 use crate::error::Error;
 use crate::notify;
-use crate::report::{AgentOutcome, Blocked, Decision, Gap, Report};
+use crate::report::{AgentOutcome, Blocked, Decision, Gap, Hashes, Report};
 use crate::review::ReviewContext;
 use crate::time::now;
 use crate::tools::OpenCode;
@@ -853,7 +853,7 @@ fn show(options: Options, shown: &Shown<'_>) {
         );
     }
     output::print_notes(shown.notes);
-    shown.report.print(false, shown.decision);
+    shown.report.print(shown.decision, Hashes::Hidden, None);
     if options.report {
         save_report(shown.collection, shown.decision);
     }
@@ -1112,7 +1112,6 @@ mod tests {
                     &std::collections::HashSet::new(),
                 );
                 let case = format!("{profile:?} again={again}: {:?}", report.notes);
-                assert!(report.remark_classes.is_empty(), "{case}");
                 assert_eq!(report.remark_count(), 0, "{case}");
 
                 // How the sweep ends: with findings, exit 1.
@@ -1169,7 +1168,7 @@ mod tests {
             &context,
             &std::collections::HashSet::new(),
         );
-        assert!(report.remark_classes.is_empty() && report.agent_runs.is_empty());
+        assert!(report.agent_runs.is_empty());
     }
 
     #[test]

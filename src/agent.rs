@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::fs::{self, DirBuilder, File};
 use std::io::Read;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -276,13 +276,28 @@ pub(crate) enum AgentError {
     NonceMissing,
 }
 
+impl fmt::Display for AgentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable(error) | Self::Invalid(error) | Self::OutOfTime(error) => {
+                error.fmt(f)
+            }
+            Self::NonceMissing => nonce_missing().fmt(f),
+        }
+    }
+}
+
 impl AgentError {
     pub(crate) fn into_error(self) -> Error {
         match self {
             Self::Unavailable(error) | Self::Invalid(error) | Self::OutOfTime(error) => error,
-            Self::NonceMissing => Error::parse(REPORT, NONCE_MISSING),
+            Self::NonceMissing => nonce_missing(),
         }
     }
+}
+
+fn nonce_missing() -> Error {
+    Error::parse(REPORT, NONCE_MISSING)
 }
 
 /// Runs one review with `binary`, the CLI that `settings.model` selects

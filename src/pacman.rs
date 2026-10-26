@@ -139,13 +139,12 @@ pub(crate) fn review_transaction(args: &HookArgs, settings: &Settings) -> Result
         operands,
     } = parse_transaction(&argv)?;
 
-    let mut report = Report::new("pacman transaction");
     // Untagged files (a class-lookup miss) are judged as the strictest
-    // pacman class.
-    report.class = SourceClass::ThirdPartyRepo;
-    report.profile = settings.system_profile().name().to_string();
-    report.ai_off_classes = review::ai_off_classes(settings, &PRIVILEGED);
-    report.remark_classes = review::remark_classes(settings, &PRIVILEGED);
+    // pacman class, whose profile is the system's.
+    let mut report = Report::new(
+        "pacman transaction",
+        review::scope(settings, SourceClass::ThirdPartyRepo, &PRIVILEGED),
+    );
 
     let trusted = settings.trusted_reviewer_packages();
     let (archives, classes) = match operation {
@@ -211,7 +210,7 @@ pub(crate) fn review_transaction(args: &HookArgs, settings: &Settings) -> Result
                             report.archives.push(ReviewedArchive {
                                 name: fingerprint.name(),
                                 class,
-                                sha256: fingerprint.digest().to_string(),
+                                sha256: *fingerprint.digest(),
                             });
                             fingerprints.push(fingerprint);
                         }

@@ -4,13 +4,18 @@ use std::collections::BTreeMap;
 use std::fs;
 
 use super::{State, forget, forget_all};
+use crate::sha256::Digest;
 use crate::test_support::TempDir;
 
 #[test]
 fn forgetting_a_package_takes_its_records_and_leaves_the_others() {
     let dir = TempDir::new("gate-forget");
     let root = dir.path().join("state");
-    let binaries: BTreeMap<String, String> = [("src/demo/tool".to_string(), "a".repeat(64))].into();
+    let binaries: BTreeMap<String, Option<Digest>> = [(
+        "src/demo/tool".to_string(),
+        Digest::from_hex(&"a".repeat(64)),
+    )]
+    .into();
     for key in ["demo", "other"] {
         let state = State::open(Some(&root), key);
         state.remember_confirmed("sources abc").unwrap();
