@@ -673,7 +673,7 @@ all followed. So does a command that changes the variable itself
 (`CLAUDE_PLUGIN_ROOT=/x`, `unset`, `env -u`, with the name quoted or not): what
 it then runs is not looked for. Not caught: a name built as the command runs
 (`unset $v`) and a command that clears the whole environment (`env -i`,
-`sudo`). A `file://` plugin of OpenCode is followed to its file.
+`exec -c`, `sudo`). A `file://` plugin of OpenCode is followed to its file.
 
 What is a finding:
 

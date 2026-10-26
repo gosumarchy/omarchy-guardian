@@ -468,13 +468,19 @@ fn plugin_root_not_followed(line: &str, runs: &[String]) -> Option<String> {
 fn changes_plugin_root(line: &str) -> bool {
     // The shell takes quotes and backslashes out before `unset` or `env -u`
     // sees a name (`unset CLAUDE_PLUGIN_RO""OT`), so they are matched
-    // without them. Taking them out can join a `$` to the name
-    // (`'$'CLAUDE_PLUGIN_ROOT`), but such a word is text, not a name any
-    // command changes.
-    let line: String = line
-        .chars()
-        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
-        .collect();
+    // without them. `$'…'` and `$"…"` are quotes too, so the `$` that
+    // opens one goes with it; otherwise `unset $'CLAUDE_PLUGIN_ROOT'` would
+    // read as an expansion. Text such as `"$"CLAUDE_PLUGIN_ROOT` then gets
+    // a note it does not need, which errs toward saying more.
+    let mut kept = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        let opens_quote = c == '$' && matches!(chars.peek(), Some('\'' | '"'));
+        if !opens_quote && !matches!(c, '\'' | '"' | '\\') {
+            kept.push(c);
+        }
+    }
+    let line = kept;
     let is_name = |c: char| c.is_ascii_alphanumeric() || c == '_';
     line.match_indices(PLUGIN_ROOT).any(|(at, _)| {
         let before = &line[..at];

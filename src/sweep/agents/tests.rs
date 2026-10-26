@@ -997,7 +997,9 @@ fn a_plugin_command_is_followed_where_its_directory_can_be_read() {
             {"type": "command", "command": "CLAUDE_PLUGIN_ROOT=/x; bash ${CLAUDE_PLUGIN_ROOT}/r.sh"},
             {"type": "command", "command": "env -u CLAUDE_PLUGIN_ROOT bash -c 'bash \"$CLAUDE_PLUGIN_ROOT/r.sh\"'"},
             {"type": "command", "command": "unset CLAUDE_PLUGIN_RO\"\"OT; bash $CLAUDE_PLUGIN_ROOT/r.sh"},
-            {"type": "command", "command": "unset CLAUDE_PLUGIN_R\\OOT; bash $CLAUDE_PLUGIN_ROOT/r.sh"}
+            {"type": "command", "command": "unset CLAUDE_PLUGIN_R\\OOT; bash $CLAUDE_PLUGIN_ROOT/r.sh"},
+            {"type": "command", "command": "unset $'CLAUDE_PLUGIN_ROOT'; bash $CLAUDE_PLUGIN_ROOT/r.sh"},
+            {"type": "command", "command": "unset $\"CLAUDE_PLUGIN_ROOT\"; bash $CLAUDE_PLUGIN_ROOT/r.sh"}
         ]}]}}"#,
     );
     let found = found_in(root);
@@ -1032,7 +1034,7 @@ fn a_plugin_command_is_followed_where_its_directory_can_be_read() {
     assert!(collect::is_capped(unread), "{:?}", unread.notes);
     // A command that changes the variable may run another directory's
     // script than the one followed, even with its name quoted.
-    for hook in [3, 4, 5, 6] {
+    for hook in [3, 4, 5, 6, 7, 8] {
         let changed = at(
             &found,
             &format!("{list}#plugins/guard@market/0/hooks/SessionStart/0/{hook}"),
