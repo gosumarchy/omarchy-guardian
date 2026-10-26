@@ -15,7 +15,7 @@
 //! What cannot be read or asked about is said as not checked: a lookup that
 //! failed is never a clear one. An item stands for one malicious package
 //! where it is installed, named by its manifest, ecosystem and name; its
-//! text is the version, so a new version is a changed item.
+//! text names the version, so a new version is a changed item.
 
 mod config;
 mod inventory;
@@ -40,12 +40,12 @@ const ECOSYSTEMS: [Ecosystem; 3] = [Ecosystem::Npm, Ecosystem::PyPi, Ecosystem::
 /// machine, said once (see `sweep::FACTS`).
 pub(super) const INSTALL_SCRIPTS: &str = "npm runs install scripts";
 
-/// Asks OSV about one batch of one ecosystem's packages: `osv::query`, or a
-/// fake in tests.
+/// Asks OSV about one ecosystem's packages (in batches of its own):
+/// `osv::query`, or a fake in tests.
 type Lookup<'a> = &'a dyn Fn(&[Dependency]) -> Result<Audit, Error>;
 
-/// The IDs of the known-malicious advisories OSV listed for each package
-/// it was asked about; a package it was not asked about is not in it.
+/// The IDs of the known-malicious advisories OSV listed, for each package
+/// that has one.
 type Malicious = BTreeMap<Package, Vec<String>>;
 
 /// What the check found.
@@ -93,34 +93,38 @@ fn look_up(inventory: Inventory, home: Option<&str>, lookup: Lookup<'_>) -> Pack
             .copied()
             .filter(|package| package.ecosystem == ecosystem)
             .collect();
-        for batch in of_ecosystem.chunks(osv::BATCH_SIZE) {
-            ask(batch, lookup, &mut malicious, &mut packages.unchecked);
+        if !of_ecosystem.is_empty() {
+            ask(
+                ecosystem,
+                &of_ecosystem,
+                lookup,
+                &mut malicious,
+                &mut packages.unchecked,
+            );
         }
     }
 
     for installed in &inventory.installed {
-        if let Some(ids) = malicious.get(&installed.package)
-            && !ids.is_empty()
-        {
+        if let Some(ids) = malicious.get(&installed.package) {
             packages.items.push(item(installed, ids, home));
         }
     }
     packages
 }
 
-/// Asks `lookup` about `batch`, packages of one ecosystem, and puts what it
-/// says in `malicious`. Within one ecosystem a name and version name one
-/// package, which is how OSV's advisories are matched to them.
+/// Asks `lookup` about `batch`, the packages of `ecosystem`, and puts what
+/// it says in `malicious`. Within one ecosystem a name and version name one
+/// package, which is how OSV's advisories are matched to them. A failed
+/// lookup leaves every one of them not checked: `osv::query` gives no
+/// answer for the batches before the one that failed.
 fn ask(
+    ecosystem: Ecosystem,
     batch: &[&Package],
     lookup: Lookup<'_>,
     malicious: &mut Malicious,
     unchecked: &mut Vec<String>,
 ) {
-    let Some(first) = batch.first() else {
-        return;
-    };
-    let ecosystem = first.ecosystem.osv_name();
+    let ecosystem = ecosystem.osv_name();
     let query: Vec<Dependency> = batch
         .iter()
         .map(|package| Dependency {
@@ -160,10 +164,9 @@ fn ask(
             .push(advisory.id.clone());
     }
     for package in batch {
-        let ids = by_package
-            .remove(&(package.name.as_str(), package.version.as_str()))
-            .unwrap_or_default();
-        malicious.insert((*package).clone(), ids);
+        if let Some(ids) = by_package.remove(&(package.name.as_str(), package.version.as_str())) {
+            malicious.insert((*package).clone(), ids);
+        }
     }
 }
 

@@ -1,9 +1,12 @@
 //! Which language packages are installed outside pacman, read from the
 //! files their tools leave behind: `package.json` in a global
 //! `node_modules`, `*.dist-info/METADATA` in a Python environment, and
-//! cargo's `.crates2.json`. No tool is run and no link is followed: a
-//! linked package directory (what `npm link` makes) or environment is
-//! said, not read.
+//! cargo's `.crates2.json`. No tool is run, and no link below a starting
+//! place is followed: a linked package directory (what `npm link` makes),
+//! environment, `lib`, `node_modules` or `site-packages` is said, not
+//! read. A link among the parts of a starting place itself (npm's prefix,
+//! `CARGO_HOME`, mise's and pipx's homes, a home kept on another disk) is
+//! followed, as the tool that installed there follows it.
 //!
 //! A package that came from somewhere other than the public registry
 //! (see `config`) is not taken: its name may be private, and it goes to no
@@ -15,7 +18,7 @@ use std::io;
 use std::path::Path;
 use std::rc::Rc;
 
-use super::config::{self, NpmConfig, Places};
+use super::config::{self, NpmConfig, PipConfig, Places};
 use crate::deps::Ecosystem;
 use crate::files::read_small_file;
 use crate::json::Json;
@@ -81,8 +84,7 @@ pub(super) struct Inventory {
     /// that may be private, each as a sentence: those packages are not
     /// checked.
     pub(super) unchecked: Vec<String>,
-    /// What is left out by design, each as a sentence: a link, a mise tool
-    /// whose backend OSV has no ecosystem for.
+    /// What is left out by design, each as a sentence: a link.
     pub(super) notes: Vec<String>,
     /// npm is installed and its configuration lets packages run their
     /// install scripts.
@@ -92,8 +94,8 @@ pub(super) struct Inventory {
 /// Reads what is installed under `root` in `places`.
 pub(super) fn collect(root: &Path, places: &Places) -> Inventory {
     let npm = NpmConfig::read(root, places);
-    let pip_other_index = config::pip_uses_other_index(root, places);
-    let mut walk = Walk::new(root, &npm, pip_other_index);
+    let pip = PipConfig::read(root, places);
+    let mut walk = Walk::new(root, &npm, pip.other_index);
 
     let mut global = vec!["usr/lib/node_modules".to_string()];
     global.extend(
@@ -117,7 +119,21 @@ pub(super) fn collect(root: &Path, places: &Places) -> Inventory {
         .is_some_and(|mise| walk.mise(&format!("{mise}/installs")));
 
     let npm_installed = mise_node || fs::symlink_metadata(root.join("usr/bin/npm")).is_ok();
-    walk.finish(npm_installed && !npm.ignore_scripts)
+    let mut inventory = walk.finish(npm_installed && !npm.ignore_scripts);
+    // Only the path is said: these files hold registry tokens.
+    for file in &npm.unreadable {
+        inventory.unchecked.push(format!(
+            "{} could not be read (a link, closed, or too large): packages under an npm prefix it may set were not looked up in OSV",
+            text::shown(&format!("/{file}"))
+        ));
+    }
+    for file in &pip.unreadable {
+        inventory.unchecked.push(format!(
+            "{} could not be read (a link, closed, or too large): it may name a private index, so no Python package was looked up in OSV",
+            text::shown(&format!("/{file}"))
+        ));
+    }
+    inventory
 }
 
 /// What a directory entry is, without following a link.
@@ -197,8 +213,6 @@ struct Walk<'a> {
     linked: Vec<String>,
     /// Packages from somewhere other than the public registry.
     elsewhere: Vec<String>,
-    /// mise tools whose backend OSV has no ecosystem for.
-    skipped: Vec<String>,
 }
 
 impl<'a> Walk<'a> {
@@ -214,14 +228,20 @@ impl<'a> Walk<'a> {
             unreadable: Vec::new(),
             linked: Vec::new(),
             elsewhere: Vec::new(),
-            skipped: Vec::new(),
         }
     }
 
     /// What is at `rel`, without following a link; `None` when nothing is.
-    /// A link is said.
+    /// A link is said, and so is a path that cannot be looked at.
     fn entry(&mut self, rel: &str) -> Option<Entry> {
-        let metadata = fs::symlink_metadata(self.root.join(rel)).ok()?;
+        let metadata = match fs::symlink_metadata(self.root.join(rel)) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+            Err(_) => {
+                self.unreadable.push(rel.to_string());
+                return None;
+            }
+        };
         Some(if metadata.file_type().is_symlink() {
             self.linked.push(rel.to_string());
             Entry::Link
@@ -567,8 +587,9 @@ impl<'a> Walk<'a> {
             if kind != Entry::Directory {
                 continue;
             }
+            // The other backends leave no name and version of a
+            // registry's behind (`go:` keeps only the program it built).
             let Some(backend) = Backend::of(&tool) else {
-                self.skipped.push(tool);
                 continue;
             };
             let directory = format!("{installs}/{tool}");
@@ -603,12 +624,22 @@ impl<'a> Walk<'a> {
                 self.crates(&file);
                 there
             }
+            // mise points pipx's home (`venvs/<package>`) or uv's tool
+            // directory (`<package>`) at the install directory.
             Backend::Pipx => {
-                let venvs = format!("{directory}/venvs");
-                let mut found = self.pipx_venv(directory);
-                for (venv, kind) in self.list(&venvs) {
-                    if kind == Entry::Directory {
-                        found |= self.pipx_venv(&format!("{venvs}/{venv}"));
+                let mut found = false;
+                for (name, kind) in self.list(directory) {
+                    let path = format!("{directory}/{name}");
+                    match (name.as_str(), kind) {
+                        ("bin", _) | (_, Entry::Link | Entry::Other) => {}
+                        ("venvs", Entry::Directory) => {
+                            for (venv, kind) in self.list(&path) {
+                                if kind == Entry::Directory {
+                                    found |= self.pipx_venv(&format!("{path}/{venv}"));
+                                }
+                            }
+                        }
+                        (_, Entry::Directory) => found |= self.pipx_venv(&path),
                     }
                 }
                 found
@@ -660,13 +691,6 @@ impl<'a> Walk<'a> {
                 "{} linked language package director(ies) or environment(s) were not followed or looked up in OSV (what `npm link` installs is a project of your own): {}",
                 self.linked.len(),
                 named(&self.linked, "/")
-            ));
-        }
-        if !self.skipped.is_empty() {
-            inventory.notes.push(format!(
-                "{} mise tool(s) installed through a backend OSV has no ecosystem for are not looked up: {}",
-                self.skipped.len(),
-                named(&self.skipped, "")
             ));
         }
         self.inventory

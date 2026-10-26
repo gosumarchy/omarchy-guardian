@@ -17,8 +17,7 @@ use crate::tools::{self, Limits};
 
 const QUERY_BATCH_URL: &str = "https://api.osv.dev/v1/querybatch";
 const VULNERABILITY_URL: &str = "https://api.osv.dev/v1/vulns/";
-/// The most packages one `/v1/querybatch` request asks about.
-pub(crate) const BATCH_SIZE: usize = 500;
+const BATCH_SIZE: usize = 500;
 const MAX_PACKAGES: usize = 20_000;
 const MAX_DETAILED: usize = 50;
 const LIMITS: Limits = Limits {

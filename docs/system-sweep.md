@@ -429,9 +429,11 @@ What is read, never run, and never followed through a link:
   `CARGO_HOME`), for crates from crates.io;
 - what mise installed (`~/.local/share/mise/installs`, or under
   `MISE_DATA_DIR`) as node or python itself, or through its `npm:`, `pipx:`
-  and `cargo:` backends, read as above. Tools of other backends (`aqua:`,
-  `ubi:`, `go:`, core tools such as Go) have no ecosystem in OSV: a note names
-  them.
+  (with pipx or uv) and `cargo:` backends, read as above. Tools of other
+  backends are not covered: `aqua:`, `ubi:` and core tools such as Go are
+  programs, not packages of a registry OSV knows, and a `go:` tool leaves
+  only the program it built, with no module path and version beside it,
+  although OSV has a Go ecosystem.
 
 The variables are read from the sweep's own environment: the daily timer's
 sweep gets them only where they are set for your systemd user session.
@@ -471,9 +473,16 @@ cannot be read or names no package and version, an environment with no
 `site-packages`, more than 20,000 packages or 100,000 directory entries, npm
 packages nested deeper than 8 levels, a package OSV listed more advisories for
 than one answer holds, and a request to OSV that failed (offline, OSV down),
-whose packages are each said as not checked, never as clear. A link on the way
-to a package (a package directory `npm link` made, a linked environment,
-`site-packages` or `node_modules`) is not followed, and a note names it. An
+whose packages are each said as not checked, never as clear: one failed
+lookup leaves every package of its ecosystem not checked. An npm or pip
+configuration file that is there and cannot be read (a link, closed, or over
+1 MiB) is said as well, by its path alone: the npm prefix it may set is not
+looked at, and no Python package is looked up, since it may name a private
+index. A link below where the tools keep their packages (a package directory
+`npm link` made, a linked environment, `lib`, `site-packages` or
+`node_modules`) is not followed, and a note names it; a link among the parts
+of such a place itself (an npm prefix, `CARGO_HOME`, mise's or pipx's home, a
+home kept on another disk) is followed, as the tool follows it. An
 `*.egg-info` package is not read.
 
 When npm is installed (`/usr/bin/npm`, or a node of mise's) and npm's

@@ -9,6 +9,8 @@
 //! `index-url`, `extra-index-url` and `find-links` decide that.
 
 use std::env;
+use std::fs;
+use std::io;
 use std::path::{Component, Path};
 
 use crate::files::read_small_file;
@@ -166,6 +168,9 @@ pub(super) struct NpmConfig {
     registry: Option<String>,
     /// The registry of each scope that has its own (`@scope:registry`).
     scoped: Vec<(String, String)>,
+    /// The files that are there and could not be read (a link, closed, or
+    /// too large), relative to the root: what they set is not known.
+    pub(super) unreadable: Vec<String>,
 }
 
 impl NpmConfig {
@@ -178,8 +183,13 @@ impl NpmConfig {
             .map(|file| (*file).to_string())
             .chain(places.npmrc.clone());
         for file in files {
-            let Some(text) = read_small_file(&root.join(file), MAX_CONFIG_BYTES) else {
-                continue;
+            let text = match read_config(root, &file) {
+                ConfigFile::Absent => continue,
+                ConfigFile::Unreadable => {
+                    config.unreadable.push(file);
+                    continue;
+                }
+                ConfigFile::Text(text) => text,
             };
             for (key, value) in text.lines().filter_map(|line| setting(line, &['='])) {
                 config.set(key, value, places.home.as_deref());
@@ -226,32 +236,70 @@ impl NpmConfig {
     }
 }
 
-/// Whether pip's configuration (files and environment) brings packages
-/// from somewhere other than the Python Package Index: then what pip installed may be of a
-/// private index, and none of it is looked up.
-pub(super) fn pip_uses_other_index(root: &Path, places: &Places) -> bool {
-    let files = GLOBAL_PIP
-        .iter()
-        .map(|file| (*file).to_string())
-        .chain(places.pip.iter().cloned());
-    let mut settings: Vec<(String, String)> = Vec::new();
-    for file in files {
-        if let Some(text) = read_small_file(&root.join(file), MAX_CONFIG_BYTES) {
-            settings.extend(text.lines().filter_map(|line| {
-                let (key, value) = setting(line, &['=', ':'])?;
-                Some((
-                    key.to_ascii_lowercase().replace('_', "-"),
-                    value.to_string(),
-                ))
-            }));
+/// What pip's configuration (files and environment) says of where
+/// packages come from.
+#[derive(Debug)]
+pub(super) struct PipConfig {
+    /// It brings packages from somewhere other than the Python Package
+    /// Index, or a file of it could not be read: then what pip installed
+    /// may be of a private index, and none of it is looked up.
+    pub(super) other_index: bool,
+    /// The files that are there and could not be read, relative to the
+    /// root.
+    pub(super) unreadable: Vec<String>,
+}
+
+impl PipConfig {
+    pub(super) fn read(root: &Path, places: &Places) -> Self {
+        let files = GLOBAL_PIP
+            .iter()
+            .map(|file| (*file).to_string())
+            .chain(places.pip.iter().cloned());
+        let mut settings: Vec<(String, String)> = Vec::new();
+        let mut unreadable = Vec::new();
+        for file in files {
+            match read_config(root, &file) {
+                ConfigFile::Absent => {}
+                ConfigFile::Unreadable => unreadable.push(file),
+                ConfigFile::Text(text) => settings.extend(text.lines().filter_map(|line| {
+                    let (key, value) = setting(line, &['=', ':'])?;
+                    Some((
+                        key.to_ascii_lowercase().replace('_', "-"),
+                        value.to_string(),
+                    ))
+                })),
+            }
+        }
+        settings.extend(places.pip_env.iter().cloned());
+        let other_index = !unreadable.is_empty()
+            || settings.iter().any(|(key, value)| match key.as_str() {
+                "index-url" => !is_on(value, PYPI_HOSTS),
+                "extra-index-url" | "find-links" => !value.is_empty(),
+                _ => false,
+            });
+        Self {
+            other_index,
+            unreadable,
         }
     }
-    settings.extend(places.pip_env.iter().cloned());
-    settings.iter().any(|(key, value)| match key.as_str() {
-        "index-url" => !is_on(value, PYPI_HOSTS),
-        "extra-index-url" | "find-links" => !value.is_empty(),
-        _ => false,
-    })
+}
+
+/// What reading one configuration file gave.
+enum ConfigFile {
+    Absent,
+    /// There, and a link, closed, or larger than `MAX_CONFIG_BYTES`.
+    Unreadable,
+    Text(String),
+}
+
+fn read_config(root: &Path, file: &str) -> ConfigFile {
+    let path = root.join(file);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => ConfigFile::Absent,
+        Err(_) => ConfigFile::Unreadable,
+        Ok(_) => read_small_file(&path, MAX_CONFIG_BYTES)
+            .map_or(ConfigFile::Unreadable, ConfigFile::Text),
+    }
 }
 
 /// Whether pip arguments, as pipx records them for an environment, bring

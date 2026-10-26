@@ -314,12 +314,8 @@ fn pipx_cargo_mise_and_an_npm_prefix_are_read() {
             (Ecosystem::PyPi, "ruff", "0.4.0"),
         ]
     );
-    let notes = inventory.notes.join("\n");
-    assert!(
-        notes.contains("1 mise tool(s)") && notes.contains("go"),
-        "{notes}"
-    );
-    assert!(!notes.contains("secret"), "{notes}");
+    // mise's Go leaves no package behind, and is not named every sweep.
+    assert!(inventory.notes.is_empty(), "{:?}", inventory.notes);
     let unchecked = inventory.unchecked.join("\n");
     assert!(
         unchecked.contains("/home/u/.local/share/pipx/venvs/empty"),
@@ -431,8 +427,8 @@ fn only_malicious_advisories_are_findings() {
 }
 
 #[test]
-fn every_package_is_asked_about_in_batches_and_a_failed_one_is_not_checked() {
-    let installed: Vec<_> = (0..1001)
+fn a_failed_lookup_leaves_its_ecosystem_not_checked() {
+    let mut installed: Vec<_> = (0..1001)
         .map(|index| {
             installed_at(
                 &format!("usr/lib/node_modules/p{index:04}/package.json"),
@@ -440,29 +436,31 @@ fn every_package_is_asked_about_in_batches_and_a_failed_one_is_not_checked() {
             )
         })
         .collect();
+    installed.push(installed_at(
+        "home/u/.cargo/.crates2.json",
+        package(Ecosystem::CratesIo, "evil", "1.0.0"),
+    ));
     let mut osv = FakeOsv::new(vec![
         advisory("MAL-2025-1", "p0000", "1.0.0"),
-        advisory("MAL-2025-2", "p0999", "1.0.0"),
+        advisory("MAL-2025-2", "evil", "1.0.0"),
     ]);
-    osv.failing = vec![1];
+    osv.failing = vec![0];
 
     let packages = run(&osv, inventory_of(installed));
 
+    // One lookup per ecosystem, which batches on its own.
     let sizes: Vec<usize> = osv.asked().iter().map(Vec::len).collect();
-    assert_eq!(sizes, [500, 500, 1]);
-    // `p0999` sorts into the second batch, which failed: not listed, and
-    // said as not checked; the other batches' answers stand.
+    assert_eq!(sizes, [1001, 1]);
+    // The npm lookup failed: nothing of it is listed, every one of its
+    // packages is said as not checked, and the crates' answer stands.
     let labels: Vec<&str> = packages
         .items
         .iter()
         .map(|item| item.path.as_str())
         .collect();
-    assert_eq!(
-        labels,
-        ["usr/lib/node_modules/p0000/package.json#npm:p0000"]
-    );
+    assert_eq!(labels, ["home/u/.cargo/.crates2.json#crates.io:evil"]);
     assert_eq!(packages.unchecked.len(), 1, "{:?}", packages.unchecked);
-    assert!(packages.unchecked[0].starts_with("500 npm package version(s) were not looked up"));
+    assert!(packages.unchecked[0].starts_with("1001 npm package version(s) were not looked up"));
     assert!(packages.unchecked[0].contains("could not resolve host"));
 }
 
@@ -683,4 +681,89 @@ fn mises_python_and_private_sources_are_told_apart() {
             .iter()
             .all(|(ecosystem, ..)| *ecosystem == Ecosystem::Npm)
     );
+}
+
+#[test]
+fn a_linked_lib_is_not_followed() {
+    let root = TempDir::new("packages-linked-lib");
+    let root = root.path();
+    python(
+        root,
+        "elsewhere/python3.12/site-packages",
+        "planted",
+        "1.0.0",
+    );
+    let venv = "home/u/.local/share/pipx/venvs/tool";
+    fs::create_dir_all(root.join(venv)).unwrap();
+    symlink(root.join("elsewhere"), root.join(format!("{venv}/lib"))).unwrap();
+
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+
+    assert_eq!(found(&inventory), []);
+    assert!(
+        inventory
+            .notes
+            .join("\n")
+            .contains("/home/u/.local/share/pipx/venvs/tool/lib"),
+        "{:?}",
+        inventory.notes
+    );
+}
+
+#[test]
+fn an_npmrc_that_cannot_be_read_is_said_by_its_path_alone() {
+    let root = TempDir::new("packages-npmrc-link");
+    let root = root.path();
+    write(
+        root,
+        "dotfiles/npmrc",
+        "prefix=/opt/g\n//r.example/:_authToken=secret\n",
+    );
+    npm(root, "opt/g/lib/node_modules/hidden", "hidden", "1.0.0");
+    fs::create_dir_all(root.join("home/u")).unwrap();
+    symlink(root.join("dotfiles/npmrc"), root.join("home/u/.npmrc")).unwrap();
+
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+
+    assert_eq!(found(&inventory), []);
+    let unchecked = inventory.unchecked.join("\n");
+    assert!(
+        unchecked.contains("/home/u/.npmrc could not be read") && unchecked.contains("npm prefix"),
+        "{unchecked}"
+    );
+    assert!(!unchecked.contains("secret") && !unchecked.contains("/opt/g"));
+
+    fs::remove_file(root.join("home/u/.npmrc")).unwrap();
+    write(
+        root,
+        "home/u/.npmrc",
+        &format!("prefix=/opt/g\n{}", " ".repeat(2 * 1024 * 1024)),
+    );
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    assert_eq!(found(&inventory), []);
+    assert!(
+        inventory
+            .unchecked
+            .join("\n")
+            .contains("/home/u/.npmrc could not be read")
+    );
+}
+
+#[test]
+fn mises_pipx_tools_are_read_in_uvs_layout_too() {
+    let root = TempDir::new("packages-uv");
+    let root = root.path();
+    let install = "home/u/.local/share/mise/installs/pipx-black/24.1.0";
+    python(
+        root,
+        &format!("{install}/black/lib/python3.12/site-packages"),
+        "black",
+        "24.1.0",
+    );
+    fs::create_dir_all(root.join(format!("{install}/bin"))).unwrap();
+
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+
+    assert_eq!(found(&inventory), [(Ecosystem::PyPi, "black", "24.1.0")]);
+    assert!(inventory.unchecked.is_empty(), "{:?}", inventory.unchecked);
 }
