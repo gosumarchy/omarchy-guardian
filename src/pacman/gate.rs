@@ -4,6 +4,7 @@ use std::process::ExitCode;
 
 use super::{HookArgs, review_transaction};
 use crate::audit::{self, Gate};
+use crate::cli::FAILED;
 use crate::config::Settings;
 use crate::engine::store::Store;
 use crate::notify;
@@ -34,8 +35,8 @@ pub(crate) fn run(hook: &HookArgs, settings: &Settings, started_by: StartedBy) -
         errln!(
             "Guardian blocked the pacman transaction: --opencode-from-path is for tests and is refused for a pacman run by root."
         );
-        audit::refused(Gate::Pacman, "a reviewer from PATH was asked for", 2);
-        return ExitCode::from(2);
+        audit::refused(Gate::Pacman, "a reviewer from PATH was asked for", FAILED);
+        return ExitCode::from(FAILED);
     }
     match review_transaction(hook, settings) {
         Ok(report) => {
@@ -90,13 +91,13 @@ pub(crate) fn run(hook: &HookArgs, settings: &Settings, started_by: StartedBy) -
         }
         Err(error) => {
             errln!("Guardian blocked the pacman transaction: {error}");
-            audit::refused(Gate::Pacman, &error.to_string(), 2);
+            audit::refused(Gate::Pacman, &error.to_string(), FAILED);
             notify::blocked(
                 "a pacman transaction",
                 &error.to_string(),
                 notify::Ran::Nothing,
             );
-            ExitCode::from(2)
+            ExitCode::from(FAILED)
         }
     }
 }
@@ -114,6 +115,7 @@ mod tests {
     use std::process::ExitCode;
 
     use super::{StartedBy, run};
+    use crate::cli::FAILED;
     use crate::config::Settings;
     use crate::config::file::PartialConfig;
     use crate::pacman::HookArgs;
@@ -135,7 +137,7 @@ mod tests {
                     &Settings::from_parts(PartialConfig::default(), PartialConfig::default()),
                     StartedBy::Pacman,
                 ),
-                ExitCode::from(2)
+                ExitCode::from(FAILED)
             );
         }
     }

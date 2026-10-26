@@ -23,6 +23,7 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
+use crate::cli::FAILED;
 use crate::config::Settings;
 use crate::error::Error;
 use crate::gatewatch;
@@ -217,13 +218,13 @@ pub(crate) fn after_sweep(scheduled: bool, settings: &Settings) {
 pub(crate) fn command() -> ExitCode {
     let Some(installed) = Version::installed() else {
         errln!("omarchy-guardian update: this build has no release number");
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     };
     let latest = match ask() {
         Ok(latest) => latest,
         Err(reason) => {
             errln!("omarchy-guardian update: {reason}");
-            return ExitCode::from(2);
+            return ExitCode::from(FAILED);
         }
     };
     // Asked for by the user: recorded for the bar, and no notification.

@@ -22,6 +22,7 @@ use super::{
     AI, CLASS, DECISION, DIGEST, EVENT, EXIT, Event, FINDINGS, FOR_UID, FROM, GATE, IDENTIFIER,
     OFFERED, OVERRULED, PERMIT, PROFILE, SUBJECT, TEST, VERSION,
 };
+use crate::cli::FAILED;
 use crate::error::Error;
 use crate::json::Json;
 use crate::text::shown;
@@ -349,7 +350,7 @@ pub(crate) fn command(options: &Options) -> ExitCode {
         Ok(read) => read,
         Err(reason) => {
             errln!("omarchy-guardian log: cannot read the journal: {reason}");
-            return ExitCode::from(2);
+            return ExitCode::from(FAILED);
         }
     };
     let lines = lines(&output, user::real_uid());

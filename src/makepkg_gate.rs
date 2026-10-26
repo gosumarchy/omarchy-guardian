@@ -62,7 +62,9 @@ use self::upstream::{review_upstream_files, unreviewable_sources};
 use crate::audit::{self, Gate};
 use crate::aur::recipe::{self, Sources};
 use crate::aur::{self, Roots, Upstream};
-use crate::cli::{Confirm, GateReview, Target, TtyConfirm, Verdict, passed, review_and_decide};
+use crate::cli::{
+    Confirm, FAILED, GateReview, Target, TtyConfirm, Verdict, passed, review_and_decide,
+};
 use crate::config::Settings;
 use crate::config::model::SourceClass;
 use crate::engine::baseline::{Identity, Unit};
@@ -223,25 +225,25 @@ pub(crate) fn run(command: &[OsString], settings: &Settings) -> ExitCode {
     crate::output::leave_stdout_to_the_command();
     let Some((makepkg, arguments)) = command.split_first() else {
         errln!("omarchy-guardian makepkg-gate: no makepkg command was given");
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     };
     let mirrored = match mirrored_arguments(arguments) {
         Ok(mirrored) => mirrored,
         Err(message) => {
             errln!("Guardian makepkg gate: {message}");
-            return ExitCode::from(2);
+            return ExitCode::from(FAILED);
         }
     };
     let build_dir = match env::current_dir().and_then(|dir| dir.canonicalize()) {
         Ok(dir) => dir,
         Err(error) => {
             errln!("omarchy-guardian makepkg-gate: cannot use the working directory: {error}");
-            return ExitCode::from(2);
+            return ExitCode::from(FAILED);
         }
     };
     let Ok(recipe) = fs::read_to_string(build_dir.join("PKGBUILD")) else {
         errln!("Guardian makepkg gate requires a readable PKGBUILD in the working directory.");
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     };
     remove_stale_copies(&build_dir);
     let directory_name = build_dir
@@ -259,7 +261,7 @@ pub(crate) fn run(command: &[OsString], settings: &Settings) -> ExitCode {
     let facts = aur_facts(base.as_deref(), &directory_name, &recipe);
     let key = base.clone().unwrap_or_else(|| local_key(&build_dir));
     let Some(state) = open_records(arguments, &key, &directory_name) else {
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     };
 
     // 2. The recipe.
@@ -282,7 +284,7 @@ pub(crate) fn run(command: &[OsString], settings: &Settings) -> ExitCode {
         let read = Configured::read();
         let Ok(configured) = read.map_err(|error| errln!("Guardian blocked makepkg: {error}."))
         else {
-            return ExitCode::from(2);
+            return ExitCode::from(FAILED);
         };
         let functions = recipe_functions(&build_dir, &recipe);
         let step = UpstreamStep {
@@ -318,9 +320,9 @@ pub(crate) fn run(command: &[OsString], settings: &Settings) -> ExitCode {
         } else {
             Ran::Nothing
         };
-        audit::refused(Gate::Aur, &format!("{}: {error}", target.subject()), 2);
+        audit::refused(Gate::Aur, &format!("{}: {error}", target.subject()), FAILED);
         notify::blocked(&subject(&directory_name), &error.to_string(), ran);
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     }
     errln!(
         "Guardian: {}; starting {}",
@@ -381,9 +383,9 @@ fn review_recipe(
     }
     if let Err(error) = scan::verify_unchanged(&target.config, &verdict.report.snapshot) {
         errln!("Guardian blocked makepkg because {error}.");
-        audit::refused(Gate::Aur, &format!("{}: {error}", target.subject()), 2);
+        audit::refused(Gate::Aur, &format!("{}: {error}", target.subject()), FAILED);
         notify::blocked(&subject(name), &error.to_string(), Ran::Nothing);
-        return Err(ExitCode::from(2));
+        return Err(ExitCode::from(FAILED));
     }
     Ok(verdict)
 }
@@ -456,7 +458,7 @@ fn start_build(
     }
     let error = build.exec();
     errln!("Could not start {}: {error}", makepkg.display());
-    ExitCode::from(2)
+    ExitCode::from(FAILED)
 }
 
 fn recipe_target(build_dir: &Path, key: &str, aur: bool) -> Target {
@@ -938,7 +940,7 @@ fn open_records(arguments: &[OsString], key: &str, name: &str) -> Option<State> 
         return Some(state);
     };
     errln!("Guardian blocked makepkg: {}", refused.message);
-    audit::refused(Gate::Aur, &format!("aur:{key}: {}", refused.why), 2);
+    audit::refused(Gate::Aur, &format!("aur:{key}: {}", refused.why), FAILED);
     notify::blocked(&subject(name), refused.why, Ran::Nothing);
     None
 }
@@ -1094,7 +1096,7 @@ fn list_sources(step: &UpstreamStep<'_>, confirm: &mut dyn Confirm) -> Result<Li
             step,
             format!("could not read the source list ({error})."),
             "the source list could not be read",
-            2,
+            FAILED,
         )
     };
     let srcinfo = probe(step).map_err(|error| unreadable(error.to_string()))?;
@@ -1112,7 +1114,7 @@ fn list_sources(step: &UpstreamStep<'_>, confirm: &mut dyn Confirm) -> Result<Li
                     "listing the recipe gave another {array} than it writes out; what it builds with cannot be known."
                 ),
                 "the recipe lists other sources than it writes out",
-                2,
+                FAILED,
             ));
         }
         Followed::No(reasons) => {
@@ -1154,7 +1156,7 @@ fn collect_sources(
     let mut collected = aur::walk_upstream(&srcdir, &roots, &step.functions.written, &noextract);
     // Kept until the files are chosen: the unpacked ones are read from it.
     let scratch = unpack_archives(step, &srcdir, &roots, &mut collected);
-    let not_held = |refused: NotHeld| block(step, &refused.message, refused.why, 2);
+    let not_held = |refused: NotHeld| block(step, &refused.message, refused.why, FAILED);
     if step.extract {
         record_extraction(step, &srcdir, &collected).map_err(not_held)?;
     } else if collected.upstream().found {
@@ -1180,6 +1182,36 @@ fn upstream_step(
     outcome
 }
 
+/// What the reviewer of the upstream sources is told besides the files:
+/// the review's scope, how the sources were followed, whether the test
+/// suite runs, how each source is fetched, and `facts`. A source that can
+/// be replaced in transit blocks the build.
+fn upstream_context(
+    step: &UpstreamStep<'_>,
+    listed: &Listed,
+    facts: Vec<String>,
+) -> Result<Vec<String>, ExitCode> {
+    let mut context = vec![aur::UPSTREAM_SCOPE.to_string()];
+    context.extend(listed.fact.map(str::to_string));
+    context.push(if aur::runs_tests(step.recipe) {
+        "The recipe defines check(), so the upstream test suite runs during this build.".into()
+    } else {
+        "The recipe defines no check(), so the upstream test suite does not run during this build."
+            .into()
+    });
+    let checked = source_context(&listed.sources, step.uses_sources).map_err(|()| {
+        block(
+            step,
+            "a source can be replaced in transit.",
+            "a source can be replaced in transit",
+            1,
+        )
+    })?;
+    context.extend(checked);
+    context.extend(facts);
+    Ok(context)
+}
+
 /// Returns why makepkg must not start, as an exit code.
 fn review_upstream(
     step: &UpstreamStep<'_>,
@@ -1194,28 +1226,17 @@ fn review_upstream(
         return Err(block(step, &message, why, 1));
     }
 
-    let mut context = vec![aur::UPSTREAM_SCOPE.to_string()];
-    context.extend(listed.fact.map(str::to_string));
-    context.push(if aur::runs_tests(step.recipe) {
-        "The recipe defines check(), so the upstream test suite runs during this build.".into()
-    } else {
-        "The recipe defines no check(), so the upstream test suite does not run during this build."
-            .into()
-    });
-    let checked = source_context(sources, step.uses_sources).map_err(|()| {
-        block(
-            step,
-            "a source can be replaced in transit.",
-            "a source can be replaced in transit",
-            1,
-        )
-    })?;
-    context.extend(checked);
-    context.extend(facts);
+    let mut context = upstream_context(step, &listed, facts)?;
 
     if step.extract {
-        pre_extract(step, &dirs, &listed.fetch)
-            .map_err(|message| block(step, message, "fetching the sources for review failed", 2))?;
+        pre_extract(step, &dirs, &listed.fetch).map_err(|message| {
+            block(
+                step,
+                message,
+                "fetching the sources for review failed",
+                FAILED,
+            )
+        })?;
     }
 
     let budget = upstream_budget(settings);
@@ -1235,7 +1256,7 @@ fn review_upstream(
                 dirs.srcdir().display()
             ),
             "the extracted sources could not be found for review",
-            2,
+            FAILED,
         ));
     }
     let mut upstream = upstream;

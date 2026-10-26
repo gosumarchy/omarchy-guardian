@@ -5,6 +5,7 @@ use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 
 use super::{SUDO, installed};
+use crate::cli::FAILED;
 use crate::error::Error;
 use crate::sweep::state::{self, Remembered};
 use crate::user;
@@ -141,7 +142,7 @@ fn changes_asked(arguments: &[String]) -> String {
 pub(crate) fn system_allow_command(arguments: &[String]) -> ExitCode {
     if !user::effective_uid().is_ok_and(|uid| uid == 0) {
         errln!("omarchy-guardian sweep-allow-system: only `sweep allow` runs this, as root");
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     }
     let invoker = std::env::var("SUDO_UID")
         .ok()
@@ -150,12 +151,12 @@ pub(crate) fn system_allow_command(arguments: &[String]) -> ExitCode {
     let path = Path::new(state::SYSTEM_ALLOWED);
     if let Err(error) = state::move_legacy_allowed(path, Path::new(state::LEGACY_SYSTEM_ALLOWED)) {
         errln!("omarchy-guardian sweep-allow-system: {error}");
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     }
     let mut allowed = state::system_allowed(path);
     if let Err(reason) = change_allowed(&mut allowed, arguments, invoker) {
         errln!("omarchy-guardian sweep-allow-system: {reason}");
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     }
     match state::save_system_allowed(path, &allowed) {
         Ok(()) => {
@@ -164,7 +165,7 @@ pub(crate) fn system_allow_command(arguments: &[String]) -> ExitCode {
         }
         Err(error) => {
             errln!("omarchy-guardian sweep-allow-system: {error}");
-            ExitCode::from(2)
+            ExitCode::from(FAILED)
         }
     }
 }

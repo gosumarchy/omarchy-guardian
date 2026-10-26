@@ -29,6 +29,7 @@ use super::collect::{self, Body, Collection, Item, Origin, Scope};
 use super::index::{self, LOCAL_DB, PackageIndex};
 use super::state;
 use super::{live, own};
+use crate::cli::FAILED;
 use crate::error::{Error, IoContext};
 use crate::json::Json;
 use crate::user;
@@ -189,7 +190,7 @@ pub(crate) fn collect_command(to: CollectTo, settings: &crate::config::Settings)
         errln!(
             "omarchy-guardian sweep-collect: only `sweep --root` and its timer run this, as root"
         );
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     }
     // The list of allowed items an older Guardian kept beside the results
     // moves to where every user can read it. Not being able to is no reason
@@ -208,7 +209,7 @@ pub(crate) fn collect_command(to: CollectTo, settings: &crate::config::Settings)
             errln!(
                 "omarchy-guardian sweep-collect: no valid [sweep] group in the system configuration"
             );
-            return ExitCode::from(2);
+            return ExitCode::from(FAILED);
         };
         Some(gid)
     } else {
@@ -220,7 +221,7 @@ pub(crate) fn collect_command(to: CollectTo, settings: &crate::config::Settings)
         Ok(index) => index,
         Err(error) => {
             errln!("omarchy-guardian sweep-collect: cannot read the package database: {error}");
-            return ExitCode::from(2);
+            return ExitCode::from(FAILED);
         }
     };
     let scope = Scope {
@@ -276,7 +277,7 @@ pub(crate) fn collect_command(to: CollectTo, settings: &crate::config::Settings)
         // with a hidden character must stay the path it is.
         None => match writeln!(std::io::stdout(), "{json}") {
             Ok(()) => ExitCode::SUCCESS,
-            Err(_) => ExitCode::from(2),
+            Err(_) => ExitCode::from(FAILED),
         },
         Some(gid) => match write_results(Path::new(RESULTS), &json, gid).and_then(|()| {
             state::write_text_mode(Path::new(TRUST_SEEN), &trust_seen_json(&seen), 0o600)
@@ -284,7 +285,7 @@ pub(crate) fn collect_command(to: CollectTo, settings: &crate::config::Settings)
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 errln!("omarchy-guardian sweep-collect: {error}");
-                ExitCode::from(2)
+                ExitCode::from(FAILED)
             }
         },
     }

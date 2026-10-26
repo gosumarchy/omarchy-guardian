@@ -13,6 +13,7 @@ use super::{
 };
 use crate::agent::SourceFile;
 use crate::audit::{self, Gate};
+use crate::cli::FAILED;
 use crate::config::Settings;
 use crate::config::file::{PartialConfig, PartialPolicy};
 use crate::config::load::Insecure;
@@ -321,7 +322,7 @@ fn guard_blocks_when_the_agent_is_unavailable() {
         &mut confirm,
         &mut |_| panic!("launched without a review"),
     );
-    assert_eq!(status, ExitCode::from(2));
+    assert_eq!(status, ExitCode::from(FAILED));
 }
 
 #[test]
@@ -340,8 +341,8 @@ fn guard_never_returns_success_without_starting_the_command() {
         &mut confirm,
         &mut |_| panic!("launched with nothing reviewed"),
     );
-    assert_eq!(status, ExitCode::from(2));
-    assert_eq!(not_started(Decision::Limited), ExitCode::from(2));
+    assert_eq!(status, ExitCode::from(FAILED));
+    assert_eq!(not_started(Decision::Limited), ExitCode::from(FAILED));
     assert_eq!(
         not_started(Decision::Blocked(Blocked::Findings)),
         ExitCode::from(1)
@@ -531,7 +532,7 @@ fn confirmation_without_a_terminal_blocks() {
         &mut no_terminal,
         &mut |_| panic!("launched without confirmation"),
     );
-    assert_eq!(status, ExitCode::from(2));
+    assert_eq!(status, ExitCode::from(FAILED));
 }
 
 #[test]
@@ -593,7 +594,7 @@ fn guard_under_local_only_with_a_declined_confirm_is_not_confirmed() {
         &mut declined,
         &mut |_| panic!("launched without confirmation"),
     );
-    assert_eq!(status, ExitCode::from(2));
+    assert_eq!(status, ExitCode::from(FAILED));
 }
 
 #[test]
@@ -839,7 +840,7 @@ fn forget_removes_baselines() {
         ExitCode::SUCCESS
     );
     assert!(!record("other").exists());
-    assert_eq!(forget_command(&Forget::All, None), ExitCode::from(2));
+    assert_eq!(forget_command(&Forget::All, None), ExitCode::from(FAILED));
 }
 
 #[test]

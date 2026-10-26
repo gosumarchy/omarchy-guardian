@@ -20,7 +20,7 @@ use crate::sandbox;
 use crate::scan::{self, ScanConfig};
 use crate::tools::OpenCode;
 
-use super::{USAGE_ERROR, settings_for};
+use super::{FAILED, settings_for};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Target {
@@ -123,7 +123,7 @@ pub(super) fn tree_content(gate: Gate, target: &Target, report: &Report) -> Vec<
 const fn not_started_status(decision: Decision) -> u8 {
     match decision {
         Decision::Blocked(_) => decision.exit_status(),
-        Decision::Clear | Decision::Warned | Decision::Limited => 2,
+        Decision::Clear | Decision::Warned | Decision::Limited => FAILED,
     }
 }
 
@@ -293,9 +293,9 @@ pub(super) fn guard_command(
     }
     if let Err(error) = scan::verify_unchanged(&target.config, &verdict.report.snapshot) {
         errln!("Guardian blocked the command because {error}.");
-        audit::refused(gate, &format!("{}: {error}", target.subject()), 2);
+        audit::refused(gate, &format!("{}: {error}", target.subject()), FAILED);
         notify::blocked(&target.subject(), &format!("{error}"), notify::Ran::Nothing);
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     }
 
     errln!(
@@ -317,7 +317,7 @@ pub(super) fn not_started(decision: Decision) -> ExitCode {
 /// signal behaviour are exactly the command's own.
 pub(super) fn exec_command(command: &[OsString]) -> ExitCode {
     let Some((program, arguments)) = command.split_first() else {
-        return ExitCode::from(USAGE_ERROR);
+        return ExitCode::from(FAILED);
     };
     // Nothing more can be reported if stdout is already gone.
     drop(io::stdout().flush());
@@ -327,7 +327,7 @@ pub(super) fn exec_command(command: &[OsString]) -> ExitCode {
         "Could not start guarded command {}: {error}",
         program.to_string_lossy()
     );
-    ExitCode::from(2)
+    ExitCode::from(FAILED)
 }
 
 pub(super) fn sandbox_command(
@@ -367,8 +367,12 @@ pub(super) fn sandbox_command(
         Ok(code) => code,
         Err(error) => {
             errln!("Guardian blocked the sandbox run because {error}.");
-            audit::refused(Gate::Sandbox, &format!("{}: {error}", target.subject()), 2);
-            ExitCode::from(2)
+            audit::refused(
+                Gate::Sandbox,
+                &format!("{}: {error}", target.subject()),
+                FAILED,
+            );
+            ExitCode::from(FAILED)
         }
     }
 }

@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::audit::Gate;
+use crate::cli::FAILED;
 use crate::config::Settings;
 use crate::config::model::{Named, Profile, SourceClass};
 use crate::engine::store::Store;
@@ -805,7 +806,7 @@ pub(crate) fn command(command: &Command, settings: &Settings) -> ExitCode {
         }
         Err(message) => {
             errln!("omarchy-guardian permit: {message}");
-            ExitCode::from(2)
+            ExitCode::from(FAILED)
         }
     }
 }

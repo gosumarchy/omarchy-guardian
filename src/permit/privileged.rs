@@ -7,6 +7,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use crate::audit::{self, Entry, Event, Gate};
+use crate::cli::FAILED;
 use crate::config::Settings;
 use crate::error::{Error, IoContext};
 use crate::json::Json;
@@ -169,13 +170,13 @@ fn system_change(arguments: &[String]) -> Result<(), Error> {
 pub(crate) fn system_command(arguments: &[String]) -> ExitCode {
     if !user::effective_uid().is_ok_and(|uid| uid == 0) {
         errln!("omarchy-guardian permit-system: only `permit` runs this, as root");
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     }
     match system_change(arguments) {
         Ok(()) => ExitCode::SUCCESS,
         Err(reason) => {
             errln!("omarchy-guardian permit-system: {reason}");
-            ExitCode::from(2)
+            ExitCode::from(FAILED)
         }
     }
 }
@@ -187,15 +188,15 @@ pub(crate) fn system_command(arguments: &[String]) -> ExitCode {
 pub(crate) fn hook_result_command(arguments: &[String]) -> ExitCode {
     if !user::effective_uid().is_ok_and(|uid| uid == 0) {
         errln!("omarchy-guardian pacman-hook-result: only the pacman hook runs this, as root");
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     }
     let [uid, status] = arguments else {
         errln!("usage: omarchy-guardian pacman-hook-result UID STATUS");
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     };
     let (Ok(uid), Ok(status)) = (uid.parse::<u32>(), status.parse::<u8>()) else {
         errln!("usage: omarchy-guardian pacman-hook-result UID STATUS");
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     };
     let permitted = status == PERMITTED_EXIT;
     if permitted {

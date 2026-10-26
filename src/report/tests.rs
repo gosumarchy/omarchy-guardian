@@ -2,6 +2,7 @@
 
 use super::{AgentOutcome, AgentRun, Blocked, Decision, Gap, LocalFinding, Report, ReviewScope};
 use crate::agent::{AgentFinding, AgentReview, Status};
+use crate::cli::FAILED;
 use crate::config::model::{Profile, SourceClass, builtin};
 use crate::error::Error;
 use crate::layout::Painter;
@@ -482,7 +483,10 @@ fn decisions_map_to_exit_codes() {
         Blocked::AiUnavailable,
         Blocked::NotConfirmed,
     ] {
-        assert_eq!(Decision::Blocked(blocked).exit_code(), ExitCode::from(2));
+        assert_eq!(
+            Decision::Blocked(blocked).exit_code(),
+            ExitCode::from(FAILED)
+        );
     }
     assert!(Decision::Warned.allows_running());
     assert!(!Decision::Limited.allows_running());

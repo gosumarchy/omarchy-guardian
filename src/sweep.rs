@@ -36,6 +36,7 @@ use std::env;
 use std::path::Path;
 use std::process::ExitCode;
 
+use crate::cli::FAILED;
 use crate::config::Settings;
 use crate::config::model::{RootConsent, SourceClass};
 use crate::engine::store::Store;
@@ -105,7 +106,7 @@ fn not_as_root(command: &Command) -> &'static str {
 pub(crate) fn command(command: &Command, settings: &Settings) -> ExitCode {
     if user::effective_uid().is_ok_and(|uid| uid == 0) {
         errln!("omarchy-guardian sweep: {}", not_as_root(command));
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     }
     let result = match command {
         Command::Run(options) => return run(*options, settings),
@@ -120,7 +121,7 @@ pub(crate) fn command(command: &Command, settings: &Settings) -> ExitCode {
         }
         Err(message) => {
             errln!("omarchy-guardian sweep: {message}");
-            ExitCode::from(2)
+            ExitCode::from(FAILED)
         }
     }
 }
@@ -695,7 +696,7 @@ fn could_not_run(options: Options, settings: &Settings, message: &str) -> ExitCo
     }
     // A sweep that cannot run may be what a newer release repairs.
     crate::update::after_sweep(options.scheduled, settings);
-    ExitCode::from(2)
+    ExitCode::from(FAILED)
 }
 
 /// Records how a scheduled sweep ended, and tells the desktop what it has

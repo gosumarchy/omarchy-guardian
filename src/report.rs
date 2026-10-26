@@ -6,6 +6,7 @@ use std::fmt::{self, Write as _};
 use std::process::ExitCode;
 
 use crate::agent::{AgentFinding, AgentReview, SourceFile, Status};
+use crate::cli::FAILED;
 use crate::config::model::{Action, AiRequirement, Policy, SourceClass};
 use crate::deps::Inventory;
 use crate::error::Error;
@@ -217,7 +218,7 @@ impl Decision {
             Self::Clear | Self::Warned | Self::Limited => 0,
             Self::Blocked(Blocked::Findings) => 1,
             Self::Blocked(Blocked::Incomplete | Blocked::AiUnavailable | Blocked::NotConfirmed) => {
-                2
+                FAILED
             }
         }
     }

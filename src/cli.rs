@@ -34,7 +34,21 @@ pub(crate) use gate::{
 use gate::{exec_command, guard_command, sandbox_command};
 use parse::{ConfigCommand, Forget, Invocation, Protection, SetupScope, StatusMode, USAGE, parse};
 
-const USAGE_ERROR: u8 = 2;
+/// The exit code of a command that could not do what it was asked, or was
+/// asked wrongly: the `2` an incomplete review gives too (see the exit
+/// codes in docs/commands.md).
+pub(crate) const FAILED: u8 = 2;
+
+/// Says why `command` failed, if it did, and gives its exit code.
+fn finish(command: &str, result: Result<(), Error>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            errln!("omarchy-guardian {command}: {error}");
+            ExitCode::from(FAILED)
+        }
+    }
+}
 
 pub(crate) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
     let args: Vec<OsString> = args.collect();
@@ -42,7 +56,7 @@ pub(crate) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
         Ok(invocation) => invocation,
         Err(message) => {
             errln!("omarchy-guardian: {message}\n\n{USAGE}");
-            return ExitCode::from(USAGE_ERROR);
+            return ExitCode::from(FAILED);
         }
     };
 
@@ -60,7 +74,7 @@ pub(crate) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
     }
     if let Some(refusal) = refusal(&invocation, &settings) {
         errln!("omarchy-guardian: {refusal}");
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     }
 
     match invocation {
@@ -95,18 +109,17 @@ pub(crate) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
         Invocation::HookPreflight => preflight_command(&settings),
         Invocation::Config(command) => config_command(&command, &settings),
         Invocation::Forget(forget) => forget_command(&forget, Store::default_root()),
-        Invocation::Setup(scope) => match match scope {
-            SetupScope::Gate(ask) => {
-                setup::run_gate(&mut setup::TtyTerminal, &setup::RealEnvironment, ask)
-            }
-            SetupScope::Everything => setup::run(&mut setup::TtyTerminal, &setup::RealEnvironment),
-        } {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(message) => {
-                errln!("omarchy-guardian setup: {message}");
-                ExitCode::from(2)
-            }
-        },
+        Invocation::Setup(scope) => {
+            let result = match scope {
+                SetupScope::Gate(ask) => {
+                    setup::run_gate(&mut setup::TtyTerminal, &setup::RealEnvironment, ask)
+                }
+                SetupScope::Everything => {
+                    setup::run(&mut setup::TtyTerminal, &setup::RealEnvironment)
+                }
+            };
+            finish("setup", result)
+        }
         Invocation::Protect(protection, consent) => protect_command(protection, consent),
         Invocation::Test => {
             outln!("Testing the reviewer with a malicious and a harmless sample...");
@@ -125,15 +138,9 @@ pub(crate) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
         Invocation::Update => crate::update::command(),
         Invocation::Ask(target) => {
             errln!("omarchy-guardian ask: {}", ask::run(&target, &settings));
-            ExitCode::from(2)
+            ExitCode::from(FAILED)
         }
-        Invocation::Tui(mode) => match tui::run(mode) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(message) => {
-                errln!("omarchy-guardian tui: {message}");
-                ExitCode::from(2)
-            }
-        },
+        Invocation::Tui(mode) => finish("tui", tui::run(mode)),
     }
 }
 
@@ -146,7 +153,7 @@ fn preflight_command(settings: &Settings) -> ExitCode {
         }
         Err(reason) => {
             errln!("omarchy-guardian: {reason}");
-            ExitCode::from(2)
+            ExitCode::from(FAILED)
         }
     }
 }
@@ -169,7 +176,7 @@ fn protect_command(protection: Protection, consent: Consent) -> ExitCode {
         }
         Err(message) => {
             errln!("omarchy-guardian protect: {message}");
-            ExitCode::from(2)
+            ExitCode::from(FAILED)
         }
     }
 }
@@ -255,13 +262,7 @@ fn status_command(mode: StatusMode) -> ExitCode {
         StatusMode::Dismiss => status::dismiss(),
         StatusMode::OpenReport => status::open_report(),
     };
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
-            errln!("omarchy-guardian status: {message}");
-            ExitCode::from(2)
-        }
-    }
+    finish("status", result)
 }
 
 /// `config acknowledge`: writes the weaker-than-the-level settings of the
@@ -326,7 +327,7 @@ fn config_command(command: &ConfigCommand, settings: &Settings) -> ExitCode {
             if valid {
                 ExitCode::SUCCESS
             } else {
-                ExitCode::from(2)
+                ExitCode::from(FAILED)
             }
         }
         ConfigCommand::Acknowledge => match acknowledge_command(settings, &mut TtyConfirm) {
@@ -336,7 +337,7 @@ fn config_command(command: &ConfigCommand, settings: &Settings) -> ExitCode {
             }
             Err(message) => {
                 errln!("omarchy-guardian config acknowledge: {message}");
-                ExitCode::from(2)
+                ExitCode::from(FAILED)
             }
         },
         ConfigCommand::Path => {
@@ -356,7 +357,7 @@ fn config_command(command: &ConfigCommand, settings: &Settings) -> ExitCode {
 fn forget_command(forget: &Forget, root: Option<PathBuf>) -> ExitCode {
     let Some(root) = root else {
         errln!("omarchy-guardian: no state directory (set HOME or XDG_STATE_HOME)");
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     };
     if !root.is_dir() {
         outln!("Nothing to forget: {} does not exist.", root.display());
@@ -366,7 +367,7 @@ fn forget_command(forget: &Forget, root: Option<PathBuf>) -> ExitCode {
         Ok(store) => store,
         Err(reason) => {
             errln!("omarchy-guardian: {reason}");
-            return ExitCode::from(2);
+            return ExitCode::from(FAILED);
         }
     };
     match forget_in(forget, &store) {
@@ -384,7 +385,7 @@ fn forget_command(forget: &Forget, root: Option<PathBuf>) -> ExitCode {
                 Ok(count) => outln!("Forgot {count} record(s) of the AUR gate."),
                 Err(reason) => {
                     errln!("omarchy-guardian: {reason}");
-                    return ExitCode::from(2);
+                    return ExitCode::from(FAILED);
                 }
             }
             audit::forgot(&what);
@@ -392,7 +393,7 @@ fn forget_command(forget: &Forget, root: Option<PathBuf>) -> ExitCode {
         }
         Err(error) => {
             errln!("omarchy-guardian: {error}");
-            ExitCode::from(2)
+            ExitCode::from(FAILED)
         }
     }
 }
