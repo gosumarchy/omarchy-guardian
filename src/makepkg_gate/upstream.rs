@@ -243,7 +243,7 @@ pub(super) fn review_upstream_files(
     }
     review::analyze_payload(&mut report, "upstream-summary", &upstream_summary(review));
     for gap in &upstream.gaps {
-        report.gaps.push(Gap::Package(Error::Refused(gap.clone())));
+        report.gaps.push(Gap::Package(Error::Message(gap.clone())));
     }
     upstream_runs(&mut report, step, upstream);
     report.unread.clone_from(&upstream.unread);

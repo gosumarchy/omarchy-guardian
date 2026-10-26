@@ -24,10 +24,12 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use crate::config::Settings;
+use crate::error::Error;
 use crate::gatewatch;
 use crate::json::Json;
 use crate::notify;
 use crate::osv::curl_args;
+use crate::report::FAILED;
 use crate::time::now;
 use crate::tools::{self, Limits};
 
@@ -95,13 +97,17 @@ fn newest(listing: &[u8]) -> Option<Version> {
 }
 
 /// Asks the repository for its newest release.
-fn ask() -> Result<Version, String> {
+fn ask() -> Result<Version, Error> {
     let mut args = curl_args();
     args.push(OsString::from(TAGS_URL));
     let listing = tools::run(Path::new(tools::CURL), &args, None, &[], LIMITS)
         .and_then(tools::Captured::into_success)
-        .map_err(|error| format!("the list of releases could not be fetched: {error}"))?;
-    newest(&listing).ok_or_else(|| "the repository lists no release".to_string())
+        .map_err(|error| {
+            Error::Message(format!(
+                "the list of releases could not be fetched: {error}"
+            ))
+        })?;
+    newest(&listing).ok_or_else(|| Error::Message("the repository lists no release".into()))
 }
 
 /// What is known of the newest release.
@@ -212,13 +218,13 @@ pub(crate) fn after_sweep(scheduled: bool, settings: &Settings) {
 pub(crate) fn command() -> ExitCode {
     let Some(installed) = Version::installed() else {
         errln!("omarchy-guardian update: this build has no release number");
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     };
     let latest = match ask() {
         Ok(latest) => latest,
         Err(reason) => {
             errln!("omarchy-guardian update: {reason}");
-            return ExitCode::from(2);
+            return ExitCode::from(FAILED);
         }
     };
     // Asked for by the user: recorded for the bar, and no notification.

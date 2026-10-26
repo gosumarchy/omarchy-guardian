@@ -67,7 +67,7 @@ pub(crate) fn audit(packages: &[Dependency]) -> Result<Audit, Error> {
 /// or when OSV's answer cannot be read.
 pub(crate) fn query(packages: &[Dependency]) -> Result<Audit, Error> {
     if packages.len() > MAX_PACKAGES {
-        return Err(Error::Refused(format!(
+        return Err(Error::Message(format!(
             "dependency inventory exceeds the {MAX_PACKAGES}-package audit limit"
         )));
     }

@@ -32,15 +32,16 @@ use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 
-use self::model::{Attribute, attributes_in_tar, parse_model};
+use self::model::{Attribute, attributes_in_tar, heads_in_stream, parse_model};
 pub(crate) use self::model::{
     OWNED_BY_OTHER, SETGID_OTHER, SETUID_OTHER, WITH_ACL, WITH_CAPABILITIES, WRITABLE_BY_ALL,
     WRITABLE_BY_GROUP, already_granted, unescape,
 };
 pub(crate) use self::review::{GUARDIAN_PACKAGE, PayloadFile, annotated, review};
 use crate::autorun::named_words;
-use crate::content::{self, PROBE_SIZE, Prefix};
+use crate::content::{self, Prefix};
 use crate::error::{Error, IoContext};
 use crate::files::{O_NOFOLLOW, O_NONBLOCK};
 use crate::sandbox::Workspace;
@@ -226,7 +227,7 @@ impl Fingerprint {
     /// bytes.
     pub(crate) fn verify(&self) -> Result<(), Error> {
         let changed = || {
-            Error::Refused(format!(
+            Error::Message(format!(
                 "{} changed while it was being reviewed",
                 self.path.display()
             ))
@@ -294,7 +295,7 @@ impl Archive {
             .at(path)?;
         let metadata = file.metadata().at(path)?;
         if !metadata.is_file() {
-            return Err(Error::Refused(format!(
+            return Err(Error::Message(format!(
                 "{} is not a regular file",
                 path.display()
             )));
@@ -321,7 +322,7 @@ impl Archive {
             &String::from_utf8_lossy(&names),
             &String::from_utf8_lossy(&details),
         )
-        .map_err(|reason| Error::Refused(format!("{}: {reason}", path.display())))?;
+        .map_err(|reason| Error::Message(format!("{}: {reason}", path.display())))?;
         archive.index = archive
             .entries
             .iter()
@@ -332,7 +333,7 @@ impl Archive {
         // control lists, which libalpm restores with the file.
         for (path, what, capability) in archive.attributes()? {
             let index = archive.index.get(&path).copied().ok_or_else(|| {
-                Error::Refused(format!(
+                Error::Message(format!(
                     "{}: its attributes name {path:?}, which its listing does not",
                     archive.path.display()
                 ))
@@ -366,27 +367,22 @@ impl Archive {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .map_err(|source| Error::Spawn {
-                tool: "bsdtar".into(),
-                source,
-            })?;
-        let found = child
-            .stdout
-            .take()
-            .ok_or_else(|| failed("no output".into()))
-            .and_then(|stdout| {
-                attributes_in_tar(io::BufReader::with_capacity(1 << 16, stdout)).map_err(failed)
-            });
-        let status = child
-            .wait()
-            .map_err(|error| failed(format!("could not wait for exit: {error}")))?;
-        let found = found?;
-        if !status.success() {
-            return Err(failed(
-                "could not be read through for its attributes".into(),
-            ));
+            .spawning("bsdtar")?;
+        let Some(stdout) = child.stdout.take() else {
+            return Err(failed("no output".into()));
+        };
+        let mut stream = io::BufReader::with_capacity(1 << 16, stdout);
+        let found = attributes_in_tar(&mut stream);
+        if found.is_err() {
+            drain(&mut stream);
         }
-        Ok(found)
+        // bsdtar must not block on a full pipe while it is waited for.
+        drop(stream);
+        let status = child.wait().spawning("bsdtar")?;
+        // Before what was read: a bsdtar that was stopped or failed ends
+        // its stream early, which reads as a cut-short archive.
+        read_through(status, "attributes").map_err(failed)?;
+        found.map_err(|error| Error::Message(format!("{}: {error}", self.path.display())))
     }
 
     /// Runs bsdtar on the opened file (a fresh descriptor each time, so each
@@ -441,47 +437,25 @@ impl Archive {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .map_err(|source| Error::Spawn {
-                tool: "bsdtar".into(),
-                source,
-            })?;
-        let heads = child
-            .stdout
-            .take()
-            .ok_or_else(|| "no output".to_string())
-            .and_then(|stdout| {
-                let mut stream = io::BufReader::with_capacity(1 << 16, stdout);
-                let mut heads = HashMap::new();
-                for (index, path) in &ordered {
-                    let size = self.entries[*index].size;
-                    let mut head = Vec::new();
-                    let kept = (&mut stream)
-                        .take(size.min(PROBE_SIZE as u64))
-                        .read_to_end(&mut head)
-                        .map_err(|error| error.to_string())?;
-                    let skipped =
-                        io::copy(&mut (&mut stream).take(size - kept as u64), &mut io::sink())
-                            .map_err(|error| error.to_string())?;
-                    if kept as u64 + skipped != size {
-                        return Err(format!("/{path} is shorter than listed"));
-                    }
-                    heads.insert((*path).clone(), head);
-                }
-                // Anything more is a file the model does not know.
-                let mut more = [0_u8; 1];
-                match stream.read(&mut more) {
-                    Ok(0) => Ok(heads),
-                    _ => Err("more was extracted than the listing names".to_string()),
-                }
-            });
-        let status = child
-            .wait()
-            .map_err(|error| failed(format!("could not wait for exit: {error}")))?;
-        let heads = heads.map_err(failed)?;
-        if !status.success() {
-            return Err(failed("could not be read through for its files".into()));
+            .spawning("bsdtar")?;
+        let Some(stdout) = child.stdout.take() else {
+            return Err(failed("no output".into()));
+        };
+        let mut stream = io::BufReader::with_capacity(1 << 16, stdout);
+        let files: Vec<(&String, u64)> = ordered
+            .iter()
+            .map(|(index, path)| (*path, self.entries[*index].size))
+            .collect();
+        let heads = heads_in_stream(&mut stream, &files);
+        if heads.is_err() {
+            drain(&mut stream);
         }
-        Ok(heads)
+        // bsdtar must not block on a full pipe while it is waited for.
+        drop(stream);
+        let status = child.wait().spawning("bsdtar")?;
+        // Before what was read, as in `attributes`.
+        read_through(status, "files").map_err(failed)?;
+        heads.map_err(|detail| Error::Message(format!("{}: {detail}", self.path.display())))
     }
 
     /// The archive as it is now, to compare with once the review is over.
@@ -662,7 +636,7 @@ impl Archive {
         if current.is_file() && Identity::of(&current) == self.identity {
             Ok(())
         } else {
-            Err(Error::Refused(format!(
+            Err(Error::Message(format!(
                 "{} changed while it was being reviewed",
                 self.path.display()
             )))
@@ -683,7 +657,7 @@ impl Archive {
     }
 
     /// Resolves the symbolic link at `link` with `target` inside the model.
-    fn resolve(&self, link: &str, target: &str) -> Result<Resolution, String> {
+    fn resolve(&self, link: &str, target: &str) -> Result<Resolution, Error> {
         let mut link = link.to_string();
         let mut target = target.to_string();
         for _ in 0..MAX_HOPS {
@@ -701,7 +675,9 @@ impl Archive {
                     "" | "." => {}
                     ".." => {
                         if parts.pop().is_none() {
-                            return Err(format!("{link} links above the root of the package"));
+                            return Err(Error::Message(format!(
+                                "{link} links above the root of the package"
+                            )));
                         }
                     }
                     name => {
@@ -740,12 +716,14 @@ impl Archive {
                         let here = parts.join("/");
                         match self.entry(&here).map(|entry| &entry.kind) {
                             Some(Kind::Symlink(_)) if !last => {
-                                return Err(format!(
+                                return Err(Error::Message(format!(
                                     "{link} links through {here}, which is a symbolic link"
-                                ));
+                                )));
                             }
                             Some(Kind::File | Kind::HardLink(_)) if !last => {
-                                return Err(format!("{link} links through the file {here}"));
+                                return Err(Error::Message(format!(
+                                    "{link} links through the file {here}"
+                                )));
                             }
                             None => outside = true,
                             _ => {}
@@ -763,7 +741,9 @@ impl Archive {
                     return Ok(Resolution::Regular(original.clone()));
                 }
                 Some(Kind::Directory) => {
-                    return Err(format!("{link} links to the directory /{resolved}"));
+                    return Err(Error::Message(format!(
+                        "{link} links to the directory /{resolved}"
+                    )));
                 }
                 Some(Kind::Symlink(next)) => {
                     link = resolved;
@@ -772,7 +752,7 @@ impl Archive {
                 None => return Ok(Resolution::Outside(format!("/{resolved}"))),
             }
         }
-        Err(format!("{link}: too many symbolic links"))
+        Err(Error::Message(format!("{link}: too many symbolic links")))
     }
 
     /// The paths of everything this archive ships (no leading `/`).
@@ -822,9 +802,9 @@ impl Archive {
         for path in paths {
             let expected = self.entry(path).map_or(0, |entry| entry.size);
             let bytes = read_extracted(workspace.path(), path)
-                .map_err(|error| Error::Refused(format!("/{path}: {error}")))?;
+                .map_err(|error| Error::Message(format!("/{path}: {error}")))?;
             if bytes.len() as u64 != expected {
-                return Err(Error::Refused(format!(
+                return Err(Error::Message(format!(
                     "/{path} was extracted with a different size than listed"
                 )));
             }
@@ -869,6 +849,31 @@ fn read_extracted(root: &Path, rel: &str) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     file.take(MAX_TEXT_FILE_SIZE + 1).read_to_end(&mut bytes)?;
     Ok(bytes)
+}
+
+/// Reads the rest of a stream Guardian stopped parsing, so bsdtar's exit
+/// is its own and not a SIGPIPE from the reader leaving early. bsdtar's
+/// time limit (`timeout --kill-after`) bounds the wait. If the drain
+/// itself fails, a bsdtar still writing dies of SIGPIPE once the reader
+/// is dropped, and that exit is reported instead of the parse error.
+fn drain(stream: &mut impl Read) {
+    drop(io::copy(stream, &mut io::sink()));
+}
+
+/// How a bsdtar pass that read the archive through for its `what` ended,
+/// as the detail of its failure.
+fn read_through(status: ExitStatus, what: &str) -> Result<(), String> {
+    if status.success() {
+        return Ok(());
+    }
+    // GNU timeout exits 124 when it had to stop the command.
+    if status.code() == Some(124) {
+        Err(format!("timed out reading it for its {what}"))
+    } else {
+        Err(format!(
+            "could not be read through for its {what} ({status})"
+        ))
+    }
 }
 
 #[cfg(test)]

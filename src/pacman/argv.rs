@@ -19,14 +19,14 @@ pub(super) fn read_targets(input: impl BufRead) -> Result<Vec<String>, Error> {
             continue;
         }
         if !is_valid_package_name(target) {
-            return Err(Error::Refused(format!(
+            return Err(Error::Message(format!(
                 "invalid package target from pacman: {target:?}"
             )));
         }
         targets.push(target.to_string());
     }
     if targets.is_empty() {
-        return Err(Error::Refused(
+        return Err(Error::Message(
             "pacman hook received no package targets".into(),
         ));
     }
@@ -47,7 +47,7 @@ pub(super) fn pacman_argv(pid: u32) -> Result<Vec<String>, Error> {
     let comm_path = PathBuf::from(format!("/proc/{pid}/comm"));
     let comm = fs::read_to_string(&comm_path).at(&comm_path)?;
     if comm.trim_end() != "pacman" {
-        return Err(Error::Refused(format!(
+        return Err(Error::Message(format!(
             "the hook's parent process is {:?}, not pacman",
             comm.trim_end()
         )));
@@ -63,7 +63,7 @@ pub(super) fn split_cmdline(cmdline: &[u8]) -> Result<Vec<String>, Error> {
     body.split(|byte| *byte == 0)
         .map(|argument| {
             String::from_utf8(argument.to_vec())
-                .map_err(|_| Error::Refused("pacman was given a non-UTF-8 argument".into()))
+                .map_err(|_| Error::Message("pacman was given a non-UTF-8 argument".into()))
         })
         .collect()
 }
@@ -110,7 +110,7 @@ pub(super) fn parse_transaction(argv: &[String]) -> Result<Transaction, Error> {
     };
     let program = usize::from(!named(0) && named(1));
     let redirects = |option: &str| {
-        Error::Refused(format!(
+        Error::Message(format!(
             "pacman was given {option}, which points it at another system, database, cache or configuration than the one Guardian reviews against"
         ))
     };
@@ -169,7 +169,7 @@ pub(super) fn parse_transaction(argv: &[String]) -> Result<Transaction, Error> {
             operands,
         })
         .ok_or_else(|| {
-            Error::Refused(
+            Error::Message(
                 "only pacman sync (-S) and upgrade (-U) transactions are supported".into(),
             )
         })

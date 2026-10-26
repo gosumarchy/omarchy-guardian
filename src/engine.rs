@@ -16,7 +16,7 @@ use std::sync::{Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
-use crate::agent::{self, AgentError, AgentReview, SourceFile};
+use crate::agent::{self, AgentError, AgentReview, ReviewerConfig, SourceFile};
 use crate::config::Settings;
 use crate::config::model::{AgentSettings, AiRequirement, Remarks, SourceClass, Toggle};
 use crate::engine::baseline::{Approved, Unit, Unread};
@@ -541,7 +541,9 @@ fn upgrade_note(manifest: &[ManifestEntry]) -> String {
     )
 }
 
-/// How many chunk reviews run at once, after the first.
+/// How many chunk reviews run at once, after the first. Arbitrary: more
+/// finish a large source sooner, and put more requests to the provider at
+/// the same moment.
 const PARALLEL_REVIEWS: usize = 3;
 
 /// The pause before retrying a review that found the AI unavailable.
@@ -606,13 +608,13 @@ impl Runner<'_> {
                 }
                 Ok(binary) => {
                     let settings = self.group.settings;
-                    let isolated = matches!(self.opencode, OpenCode::SystemOnly);
-                    let probe = review_with_retry(&binary, &requests[first], settings, isolated);
+                    let config = self.opencode.reviewer_config();
+                    let probe = review_with_retry(&binary, &requests[first], settings, config);
                     let proceed = probe.0.is_ok();
                     results[first] = Some(probe);
                     if proceed {
                         for (index, result) in
-                            review_parallel(&binary, requests, rest, settings, isolated)
+                            review_parallel(&binary, requests, rest, settings, config)
                         {
                             results[index] = Some(result);
                         }
@@ -727,7 +729,7 @@ impl Runner<'_> {
         };
         notes.extend(exposure.notes);
         match exposure.refusal {
-            Some(reason) => Err(Error::Refused(reason)),
+            Some(reason) => Err(Error::Message(reason)),
             None => self.opencode.resolve_reviewer(reviewer),
         }
     }
@@ -766,7 +768,7 @@ fn chunk_error((index, count): (usize, usize), more: usize, error: Error) -> Err
     } else {
         String::new()
     };
-    Error::Refused(format!("chunk {index}/{count}{others}: {error}"))
+    Error::Message(format!("chunk {index}/{count}{others}: {error}"))
 }
 
 /// One review, retried once after a short pause when the AI was unavailable
@@ -776,14 +778,14 @@ fn review_with_retry(
     binary: &Path,
     request: &Request,
     settings: &AgentSettings,
-    isolated: bool,
+    config: ReviewerConfig,
 ) -> Live {
     let review = || {
         agent::review(
             binary,
             &|nonce: &str| request.render(nonce),
             settings,
-            isolated,
+            config,
         )
     };
     match review() {
@@ -804,12 +806,12 @@ fn review_with_retry(
 
 fn is_retryable(error: &Error) -> bool {
     match error {
-        Error::TimedOut { .. } | Error::Spawn { .. } => false,
+        Error::TimedOut { .. } | Error::Spawn { .. } | Error::Config(_) => false,
         Error::Io { .. }
         | Error::ToolFailed { .. }
         | Error::OutputTooLarge { .. }
         | Error::Parse { .. }
-        | Error::Refused(_) => true,
+        | Error::Message(_) => true,
     }
 }
 
@@ -821,21 +823,25 @@ fn review_parallel(
     requests: &[Request],
     indexes: &[usize],
     settings: &AgentSettings,
-    isolated: bool,
+    config: ReviewerConfig,
 ) -> Vec<(usize, Live)> {
+    // Relaxed throughout: `next` only hands out each index once, which
+    // `fetch_add` does under any ordering, and `stop` guards no data (the
+    // results go through the mutex). A worker that misses a `stop` just set
+    // starts one more review, as it would had it started a moment sooner.
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
     let results = Mutex::new(Vec::new());
     thread::scope(|scope| {
         for _ in 0..PARALLEL_REVIEWS.min(indexes.len()) {
             scope.spawn(|| {
-                while !stop.load(Ordering::SeqCst) {
-                    let Some(&index) = indexes.get(next.fetch_add(1, Ordering::SeqCst)) else {
+                while !stop.load(Ordering::Relaxed) {
+                    let Some(&index) = indexes.get(next.fetch_add(1, Ordering::Relaxed)) else {
                         break;
                     };
-                    let live = review_with_retry(binary, &requests[index], settings, isolated);
+                    let live = review_with_retry(binary, &requests[index], settings, config);
                     if live.0.is_err() {
-                        stop.store(true, Ordering::SeqCst);
+                        stop.store(true, Ordering::Relaxed);
                     }
                     results
                         .lock()

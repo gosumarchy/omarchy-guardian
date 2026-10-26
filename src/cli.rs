@@ -16,11 +16,10 @@ use crate::engine::baseline;
 use crate::engine::store::Store;
 use crate::error::Error;
 use crate::makepkg_gate;
-use crate::notify;
-use crate::pacman::{self, HookArgs};
-use crate::permit::{self, Content};
-use crate::protect;
-use crate::report::{Decision, Hashes};
+use crate::pacman;
+use crate::permit;
+use crate::protect::{self, Consent};
+use crate::report::FAILED;
 use crate::setup;
 use crate::status;
 use crate::sweep;
@@ -30,11 +29,22 @@ use crate::tui;
 mod gate;
 mod parse;
 
-pub(crate) use gate::{Confirm, Target, TtyConfirm, Verdict, passed, review_and_decide};
+pub(crate) use gate::{
+    Confirm, GateReview, Target, TtyConfirm, Verdict, passed, review_and_decide,
+};
 use gate::{exec_command, guard_command, sandbox_command};
-use parse::{ConfigCommand, Forget, Invocation, StatusMode, USAGE, parse};
+use parse::{ConfigCommand, Forget, Invocation, Protection, SetupScope, StatusMode, USAGE, parse};
 
-const USAGE_ERROR: u8 = 2;
+/// Says why `command` failed, if it did, and gives its exit code.
+fn finish(command: &str, result: Result<(), Error>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            errln!("omarchy-guardian {command}: {error}");
+            ExitCode::from(FAILED)
+        }
+    }
+}
 
 pub(crate) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
     let args: Vec<OsString> = args.collect();
@@ -42,7 +52,7 @@ pub(crate) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
         Ok(invocation) => invocation,
         Err(message) => {
             errln!("omarchy-guardian: {message}\n\n{USAGE}");
-            return ExitCode::from(USAGE_ERROR);
+            return ExitCode::from(FAILED);
         }
     };
 
@@ -60,7 +70,7 @@ pub(crate) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
     }
     if let Some(refusal) = refusal(&invocation, &settings) {
         errln!("omarchy-guardian: {refusal}");
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     }
 
     match invocation {
@@ -79,11 +89,14 @@ pub(crate) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
             &settings,
             &mut TtyConfirm,
         ),
-        Invocation::PacmanHook(hook) => pacman_hook_command(
-            &hook,
-            &settings,
-            std::env::var_os(permit::ROOT_HOOK).is_some(),
-        ),
+        Invocation::PacmanHook(hook) => {
+            let started_by = if std::env::var_os(permit::ROOT_HOOK).is_some() {
+                pacman::gate::StartedBy::RootHook
+            } else {
+                pacman::gate::StartedBy::Pacman
+            };
+            pacman::gate::run(&hook, &settings, started_by)
+        }
         Invocation::Permit(command) => permit::command(&command, &settings),
         Invocation::PermitSystem(arguments) => permit::system_command(&arguments),
         Invocation::HookResult(arguments) => permit::hook_result_command(&arguments),
@@ -92,18 +105,18 @@ pub(crate) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
         Invocation::HookPreflight => preflight_command(&settings),
         Invocation::Config(command) => config_command(&command, &settings),
         Invocation::Forget(forget) => forget_command(&forget, Store::default_root()),
-        Invocation::Setup { gate, if_needed } => match if gate {
-            setup::run_gate(&mut setup::TtyTerminal, &setup::RealEnvironment, if_needed)
-        } else {
-            setup::run(&mut setup::TtyTerminal, &setup::RealEnvironment)
-        } {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(message) => {
-                errln!("omarchy-guardian setup: {message}");
-                ExitCode::from(2)
-            }
-        },
-        Invocation::Protect { yes, off } => protect_command(yes, off),
+        Invocation::Setup(scope) => {
+            let result = match scope {
+                SetupScope::Gate(ask) => {
+                    setup::run_gate(&mut setup::TtyTerminal, &setup::RealEnvironment, ask)
+                }
+                SetupScope::Everything => {
+                    setup::run(&mut setup::TtyTerminal, &setup::RealEnvironment)
+                }
+            };
+            finish("setup", result)
+        }
+        Invocation::Protect(protection, consent) => protect_command(protection, consent),
         Invocation::Test => {
             outln!("Testing the reviewer with a malicious and a harmless sample...");
             let (report, passed) = protect::test();
@@ -115,21 +128,15 @@ pub(crate) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
             }
         }
         Invocation::Sweep(command) => sweep::command(&command, &settings),
-        Invocation::SweepCollect { out } => sweep::root::collect_command(out, &settings),
+        Invocation::SweepCollect(to) => sweep::root::collect_command(to, &settings),
         Invocation::SweepAllowSystem(arguments) => sweep::root::system_allow_command(&arguments),
         Invocation::Status(mode) => status_command(mode),
         Invocation::Update => crate::update::command(),
         Invocation::Ask(target) => {
             errln!("omarchy-guardian ask: {}", ask::run(&target, &settings));
-            ExitCode::from(2)
+            ExitCode::from(FAILED)
         }
-        Invocation::Tui { expert } => match tui::run(expert) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(message) => {
-                errln!("omarchy-guardian tui: {message}");
-                ExitCode::from(2)
-            }
-        },
+        Invocation::Tui(mode) => finish("tui", tui::run(mode)),
     }
 }
 
@@ -142,28 +149,30 @@ fn preflight_command(settings: &Settings) -> ExitCode {
         }
         Err(reason) => {
             errln!("omarchy-guardian: {reason}");
-            ExitCode::from(2)
+            ExitCode::from(FAILED)
         }
     }
 }
 
 /// `protect [--off]`: every gate on, or the install gates off; what came of
 /// it goes into the audit trail.
-fn protect_command(yes: bool, off: bool) -> ExitCode {
-    let outcome = if off {
-        protect::unprotect(yes, &mut TtyConfirm)
-    } else {
-        protect::protect(yes, &mut TtyConfirm)
+fn protect_command(protection: Protection, consent: Consent) -> ExitCode {
+    let (outcome, command) = match protection {
+        Protection::On => (protect::protect(consent, &mut TtyConfirm), "protect"),
+        Protection::Off => (
+            protect::unprotect(consent, &mut TtyConfirm),
+            "protect --off",
+        ),
     };
     match outcome {
         Ok(message) => {
-            audit::gate_changed(if off { "protect --off" } else { "protect" }, "", &message);
+            audit::gate_changed(command, "", &message);
             outln!("{message}");
             ExitCode::SUCCESS
         }
         Err(message) => {
             errln!("omarchy-guardian protect: {message}");
-            ExitCode::from(2)
+            ExitCode::from(FAILED)
         }
     }
 }
@@ -223,15 +232,15 @@ fn with_state_root(mut target: Target) -> Target {
 
 fn scan_command(target: &Target, settings: &Settings) -> ExitCode {
     let settings = settings_for(target, settings);
-    review_and_decide(
+    review_and_decide(GateReview {
+        gate: Gate::Scan,
         target,
-        &settings,
-        &OpenCode::UserPath,
-        None,
-        &[],
-        Gate::Scan,
-        None,
-    )
+        settings: &settings,
+        opencode: &OpenCode::UserPath,
+        context: &[],
+        confirm: None,
+        content: None,
+    })
     .decision
     .exit_code()
 }
@@ -240,9 +249,8 @@ fn status_command(mode: StatusMode) -> ExitCode {
     let result = match mode {
         // Written as it is: the terminal-safe output would rewrite a
         // hidden character inside a string into something that is no JSON.
-        StatusMode::Shell => {
-            writeln!(io::stdout(), "{}", status::json()).map_err(|error| error.to_string())
-        }
+        StatusMode::Shell => writeln!(io::stdout(), "{}", status::json())
+            .map_err(|error| Error::Message(format!("cannot write to standard output: {error}"))),
         StatusMode::Waybar => {
             outln!("{}", status::waybar());
             Ok(())
@@ -250,109 +258,18 @@ fn status_command(mode: StatusMode) -> ExitCode {
         StatusMode::Dismiss => status::dismiss(),
         StatusMode::OpenReport => status::open_report(),
     };
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
-            errln!("omarchy-guardian status: {message}");
-            ExitCode::from(2)
-        }
-    }
-}
-
-/// The pacman gate. `root_hook` says the hook script's root half started
-/// this review and takes a used permit away: it is told by the exit code
-/// (see `permit::PERMITTED_EXIT`), which the script turns into 0.
-fn pacman_hook_command(hook: &HookArgs, settings: &Settings, root_hook: bool) -> ExitCode {
-    // A reviewer from PATH is for the end-to-end tests, whose pacman is a
-    // script of the user's. In front of a real transaction (pacman runs as
-    // root) it is refused, however it came to be asked for.
-    if hook.opencode == OpenCode::UserPath
-        && process_owner(hook.pacman_pid).is_none_or(|owner| owner == 0)
-    {
-        errln!(
-            "Guardian blocked the pacman transaction: --opencode-from-path is for tests and is refused for a pacman run by root."
-        );
-        audit::refused(Gate::Pacman, "a reviewer from PATH was asked for", 2);
-        return ExitCode::from(2);
-    }
-    match pacman::review_transaction(hook, settings) {
-        Ok(report) => {
-            let decision = report.decide(&|class| settings.policy(class));
-            let contents: Vec<Content> = pacman::reviewed_content(&report).into_iter().collect();
-            let standing = permit::standing(
-                &contents,
-                &report,
-                decision,
-                settings,
-                Store::default_root().as_deref(),
-            );
-            report.print(decision, Hashes::Hidden, standing.permitted());
-            let exit = match (standing.permitted(), root_hook) {
-                (Some(_), true) => permit::PERMITTED_EXIT,
-                (Some(_), false) => 0,
-                (None, _) => decision.exit_status(),
-            };
-            audit::review(
-                &audit::Reviewed {
-                    gate: Gate::Pacman,
-                    class: &pacman::reviewed_classes(&report),
-                    subject: &pacman::reviewed_names(&report),
-                    digest: &pacman::reviewed_digests(&report),
-                    decision,
-                    permit: standing.permitted(),
-                    offered: standing.offered(),
-                    // What pacman is told: a permitted transaction goes on.
-                    exit: if standing.permitted().is_some() {
-                        0
-                    } else {
-                        exit
-                    },
-                },
-                &report,
-            )
-            .record();
-            if let Some(permit) = standing.permitted() {
-                errln!(
-                    "Guardian: your permit {permit} overrules {}; the transaction goes on.",
-                    report.decision_name(decision)
-                );
-            } else if let Decision::Blocked(blocked) = decision {
-                standing.say();
-                notify::blocked(
-                    "a pacman transaction",
-                    notify::reason(blocked),
-                    notify::Ran::Nothing,
-                );
-            }
-            ExitCode::from(exit)
-        }
-        Err(error) => {
-            errln!("Guardian blocked the pacman transaction: {error}");
-            audit::refused(Gate::Pacman, &error.to_string(), 2);
-            notify::blocked(
-                "a pacman transaction",
-                &error.to_string(),
-                notify::Ran::Nothing,
-            );
-            ExitCode::from(2)
-        }
-    }
-}
-
-/// The user a process runs as, from the owner of its `/proc` entry.
-fn process_owner(pid: u32) -> Option<u32> {
-    std::fs::metadata(format!("/proc/{pid}"))
-        .ok()
-        .map(|metadata| std::os::unix::fs::MetadataExt::uid(&metadata))
+    finish("status", result)
 }
 
 /// `config acknowledge`: writes the weaker-than-the-level settings of the
 /// user file into the system file's `[acknowledged]` list, after showing
 /// them and the change, with sudo. Only root can write that file, so a
 /// program running as the user cannot accept its own weakening.
-fn acknowledge_command(settings: &Settings, confirm: &mut dyn Confirm) -> Result<String, String> {
+fn acknowledge_command(settings: &Settings, confirm: &mut dyn Confirm) -> Result<String, Error> {
     if settings.user_block().is_some() || settings.privileged_block().is_some() {
-        return Err("fix the settings files first (see `omarchy-guardian config check`)".into());
+        return Err(Error::Message(
+            "fix the settings files first (see `omarchy-guardian config check`)".into(),
+        ));
     }
     let keys = weaker::to_acknowledge(settings);
     if keys == settings.acknowledged_weaker() {
@@ -378,7 +295,7 @@ fn acknowledge_command(settings: &Settings, confirm: &mut dyn Confirm) -> Result
     outln!("\nSystem file {}:", settings.system_path().display());
     outln!("{}", setup::line_diff(&existing, &text));
     if !confirm.confirm("Accept these weaker settings and install the file with sudo?") {
-        return Err("nothing was changed".into());
+        return Err(Error::Message("nothing was changed".into()));
     }
     setup::install_accepted(&text)?;
     audit::settings_changed(&format!(
@@ -406,7 +323,7 @@ fn config_command(command: &ConfigCommand, settings: &Settings) -> ExitCode {
             if valid {
                 ExitCode::SUCCESS
             } else {
-                ExitCode::from(2)
+                ExitCode::from(FAILED)
             }
         }
         ConfigCommand::Acknowledge => match acknowledge_command(settings, &mut TtyConfirm) {
@@ -416,7 +333,7 @@ fn config_command(command: &ConfigCommand, settings: &Settings) -> ExitCode {
             }
             Err(message) => {
                 errln!("omarchy-guardian config acknowledge: {message}");
-                ExitCode::from(2)
+                ExitCode::from(FAILED)
             }
         },
         ConfigCommand::Path => {
@@ -436,7 +353,7 @@ fn config_command(command: &ConfigCommand, settings: &Settings) -> ExitCode {
 fn forget_command(forget: &Forget, root: Option<PathBuf>) -> ExitCode {
     let Some(root) = root else {
         errln!("omarchy-guardian: no state directory (set HOME or XDG_STATE_HOME)");
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     };
     if !root.is_dir() {
         outln!("Nothing to forget: {} does not exist.", root.display());
@@ -446,7 +363,7 @@ fn forget_command(forget: &Forget, root: Option<PathBuf>) -> ExitCode {
         Ok(store) => store,
         Err(reason) => {
             errln!("omarchy-guardian: {reason}");
-            return ExitCode::from(2);
+            return ExitCode::from(FAILED);
         }
     };
     match forget_in(forget, &store) {
@@ -464,7 +381,7 @@ fn forget_command(forget: &Forget, root: Option<PathBuf>) -> ExitCode {
                 Ok(count) => outln!("Forgot {count} record(s) of the AUR gate."),
                 Err(reason) => {
                     errln!("omarchy-guardian: {reason}");
-                    return ExitCode::from(2);
+                    return ExitCode::from(FAILED);
                 }
             }
             audit::forgot(&what);
@@ -472,7 +389,7 @@ fn forget_command(forget: &Forget, root: Option<PathBuf>) -> ExitCode {
         }
         Err(error) => {
             errln!("omarchy-guardian: {error}");
-            ExitCode::from(2)
+            ExitCode::from(FAILED)
         }
     }
 }

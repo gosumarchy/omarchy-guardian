@@ -966,7 +966,11 @@ pkgdesc=\"file=${BUILDFILE##*/} named=$(env | grep -ci '^[a-z_]*guardian') dest=
 source=(a.tar)\nsha256sums=(SKIP)\n";
     let fixture = Fixture::new("gate-jail", recipe);
     let listing = super::probe(&fixture.step()).unwrap();
-    assert_eq!(aur::check_listing(&listing), Ok(()), "{listing}");
+    assert_eq!(
+        aur::check_listing(&listing).map_err(|error| error.to_string()),
+        Ok(()),
+        "{listing}"
+    );
     assert!(listing.starts_with("pkgbase = demo\n"), "{listing}");
     assert!(
         listing.contains("\tpkgdesc = file=PKGBUILD named=0 dest=packages first=PKGBUILD\n"),

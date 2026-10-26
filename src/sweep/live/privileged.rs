@@ -11,6 +11,7 @@ use std::process::ExitStatus;
 
 use super::{Found, packaged};
 use crate::autorun::Category;
+use crate::error::Error;
 use crate::rules::RuleId;
 use crate::sweep::collect::{self, Body, Origin, Scope};
 use crate::sweep::read::{self, View};
@@ -561,7 +562,7 @@ pub(super) fn getcap_failure(status: ExitStatus) -> Option<String> {
 }
 
 /// Files with capabilities, from `getcap -r` (on the real system only).
-fn capability_files(scope: &Scope<'_>) -> Result<Vec<(String, String)>, String> {
+fn capability_files(scope: &Scope<'_>) -> Result<Vec<(String, String)>, Error> {
     if scope.root != Path::new("/") {
         return Ok(Vec::new());
     }
@@ -579,9 +580,12 @@ fn capability_files(scope: &Scope<'_>) -> Result<Vec<(String, String)>, String> 
 pub(super) fn capabilities_below(
     getcap: &Path,
     roots: &[OsString],
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Vec<(String, String)>, Error> {
     if !getcap.is_file() {
-        return Err(format!("{} is not installed", getcap.display()));
+        return Err(Error::Message(format!(
+            "{} is not installed",
+            getcap.display()
+        )));
     }
     let mut args = vec![OsString::from("-r")];
     args.extend(roots.iter().cloned());
@@ -594,10 +598,9 @@ pub(super) fn capabilities_below(
             timeout_secs: 300,
             max_output: 4 * 1024 * 1024,
         },
-    )
-    .map_err(|error| error.to_string())?;
+    )?;
     if let Some(failure) = getcap_failure(captured.status) {
-        return Err(failure);
+        return Err(Error::Message(failure));
     }
     Ok(parse_getcap(&String::from_utf8_lossy(&captured.stdout)))
 }

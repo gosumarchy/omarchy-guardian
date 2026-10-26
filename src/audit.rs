@@ -324,7 +324,7 @@ fn send(text: &str) -> Result<(), Error> {
 #[cfg(test)]
 fn send(text: &str) -> Result<(), Error> {
     if REFUSING.with(std::cell::Cell::get) {
-        return Err(Error::Refused("no journal in this test".into()));
+        return Err(Error::Message("no journal in this test".into()));
     }
     SENT.with(|sent| sent.borrow_mut().push(text.to_string()));
     Ok(())

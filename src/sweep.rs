@@ -44,6 +44,7 @@ use crate::config::model::{RootConsent, SourceClass};
 use crate::engine::store::Store;
 use crate::error::Error;
 use crate::notify;
+use crate::report::FAILED;
 use crate::report::{AgentOutcome, Blocked, Decision, Gap, Hashes, Report};
 use crate::review::ReviewContext;
 use crate::time::now;
@@ -108,7 +109,7 @@ fn not_as_root(command: &Command) -> &'static str {
 pub(crate) fn command(command: &Command, settings: &Settings) -> ExitCode {
     if user::effective_uid().is_ok_and(|uid| uid == 0) {
         errln!("omarchy-guardian sweep: {}", not_as_root(command));
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     }
     let result = match command {
         Command::Run(options) => return run(*options, settings),
@@ -123,7 +124,7 @@ pub(crate) fn command(command: &Command, settings: &Settings) -> ExitCode {
         }
         Err(message) => {
             errln!("omarchy-guardian sweep: {message}");
-            ExitCode::from(2)
+            ExitCode::from(FAILED)
         }
     }
 }
@@ -146,7 +147,7 @@ fn home() -> Option<String> {
 fn collect_here(home: Option<&str>) -> Result<(Collection, PackageIndex, Vec<String>), Error> {
     let index = index::foreign_packages()
         .and_then(|foreign| PackageIndex::load(Path::new(LOCAL_DB), foreign))
-        .map_err(|error| Error::Refused(format!("cannot read the package database: {error}")))?;
+        .map_err(|error| Error::Message(format!("cannot read the package database: {error}")))?;
     let scope = Scope {
         root: Path::new("/"),
         home,
@@ -183,7 +184,7 @@ fn collect_here(home: Option<&str>) -> Result<(Collection, PackageIndex, Vec<Str
 
 fn state_directory() -> Result<std::path::PathBuf, Error> {
     let root = Store::default_root()
-        .ok_or_else(|| Error::Refused("no state directory (set HOME or XDG_STATE_HOME)".into()))?;
+        .ok_or_else(|| Error::Message("no state directory (set HOME or XDG_STATE_HOME)".into()))?;
     state::directory(&root)
 }
 
@@ -204,7 +205,7 @@ fn allow(label: &str, settings: &Settings) -> Result<String, Error> {
         .iter()
         .find(|item| judge::label(item, home.as_deref()) == label)
         .ok_or_else(|| {
-            Error::Refused(format!(
+            Error::Message(format!(
                 "{label} is not something the sweep lists; use the path as it shows it"
             ))
         })?;
@@ -215,12 +216,12 @@ fn allow(label: &str, settings: &Settings) -> Result<String, Error> {
         ));
     }
     if let Some(reason) = state::not_allowable(item) {
-        return Err(Error::Refused(format!(
+        return Err(Error::Message(format!(
             "{label} cannot be allowed: {reason}"
         )));
     }
     if item.sha256.is_none() && !matches!(item.body, collect::Body::Link(_)) {
-        return Err(Error::Refused(format!(
+        return Err(Error::Message(format!(
             "{label} cannot be read, so it cannot be allowed as it is"
         )));
     }
@@ -267,7 +268,7 @@ fn since_last_sweep(before: Option<&str>, now: &str) -> Option<String> {
 fn confirm_changed(difference: &str) -> Result<(), Error> {
     use std::io::IsTerminal as _;
     if !std::io::stdin().is_terminal() {
-        return Err(Error::Refused(format!(
+        return Err(Error::Message(format!(
             "{difference}; run `omarchy-guardian sweep` to see it as it is, or allow it from a terminal"
         )));
     }
@@ -275,11 +276,11 @@ fn confirm_changed(difference: &str) -> Result<(), Error> {
     let mut answer = String::new();
     std::io::stdin()
         .read_line(&mut answer)
-        .map_err(|error| Error::Refused(format!("cannot read the answer: {error}")))?;
+        .map_err(|error| Error::Message(format!("cannot read the answer: {error}")))?;
     if matches!(answer.trim(), "y" | "Y" | "yes") {
         Ok(())
     } else {
-        Err(Error::Refused("nothing was allowed".into()))
+        Err(Error::Message("nothing was allowed".into()))
     }
 }
 
@@ -316,7 +317,7 @@ fn migrate(settings: &Settings) -> Result<String, Error> {
     // The old list was the user's own to write, so any program running as
     // them could have added to it: nothing moves without a yes.
     if !std::io::stdin().is_terminal() {
-        return Err(Error::Refused(
+        return Err(Error::Message(
             "these are only moved after you looked at them: run `sweep allow --migrate` in a terminal".into(),
         ));
     }
@@ -327,7 +328,7 @@ fn migrate(settings: &Settings) -> Result<String, Error> {
     let mut answer = String::new();
     std::io::stdin()
         .read_line(&mut answer)
-        .map_err(|error| Error::Refused(format!("cannot read the answer: {error}")))?;
+        .map_err(|error| Error::Message(format!("cannot read the answer: {error}")))?;
     if !matches!(answer.trim(), "y" | "Y" | "yes") {
         return Ok("Nothing moved.".into());
     }
@@ -396,7 +397,7 @@ fn forget(label: Option<&str>) -> Result<String, Error> {
     if allowed.contains_key(label) {
         root::system_allow(&["--remove", label])?;
     } else if !stale {
-        return Err(Error::Refused(format!(
+        return Err(Error::Message(format!(
             "{label} is not in the list of allowed items"
         )));
     }
@@ -702,7 +703,7 @@ fn could_not_run(options: Options, settings: &Settings, message: &str) -> ExitCo
     }
     // A sweep that cannot run may be what a newer release repairs.
     crate::update::after_sweep(options.scheduled, settings);
-    ExitCode::from(2)
+    ExitCode::from(FAILED)
 }
 
 /// Records how a scheduled sweep ended, and tells the desktop what it has

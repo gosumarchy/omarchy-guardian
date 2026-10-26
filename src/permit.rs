@@ -44,6 +44,7 @@ use crate::engine::store::Store;
 use crate::error::{Error, IoContext};
 use crate::json::Json;
 use crate::paths;
+use crate::report::FAILED;
 use crate::report::{Decision, Report};
 use crate::sha256::Sha256;
 use crate::sweep::{root, state};
@@ -583,26 +584,26 @@ pub(crate) enum Command {
     Revoke(String),
 }
 
-pub(crate) fn parse(args: &[std::ffi::OsString]) -> Result<Command, String> {
+pub(crate) fn parse(args: &[std::ffi::OsString]) -> Result<Command, Error> {
     const USAGE: &str = "usage: omarchy-guardian permit [ID | --revoke ID]";
     let words: Vec<&str> = args
         .iter()
-        .map(|arg| arg.to_str().ok_or(USAGE))
+        .map(|arg| arg.to_str().ok_or_else(|| Error::Message(USAGE.into())))
         .collect::<Result<_, _>>()?;
     let id = |text: &str| {
         if is_hex(text, ID_CHARS) {
             Ok(text.to_string())
         } else {
-            Err(format!(
+            Err(Error::Message(format!(
                 "{text:?} is not a permit ID ({ID_CHARS} hex characters, as a blocked gate prints it)"
-            ))
+            )))
         }
     };
     match words.as_slice() {
         [] => Ok(Command::List),
         ["--revoke", text] => id(text).map(Command::Revoke),
         [text] if !text.starts_with('-') => id(text).map(Command::Grant),
-        _ => Err(USAGE.into()),
+        _ => Err(Error::Message(USAGE.into())),
     }
 }
 
@@ -690,21 +691,21 @@ fn grant(
         .into_iter()
         .find(|block| block.content.id() == id)
         .ok_or_else(|| {
-            Error::Refused(format!(
+            Error::Message(format!(
                 "no blocked install is kept under {id}; `omarchy-guardian permit` lists them"
             ))
         })?;
     let content = &block.content;
     if !enabled(settings, &content.class) {
-        return Err(Error::Refused(
+        return Err(Error::Message(
             "permits are off under the strict level; the system file's [permit] strict = \"allowed\" turns them on"
                 .into(),
         ));
     }
     let uid =
-        user::real_uid().ok_or_else(|| Error::Refused("cannot tell which user this is".into()))?;
+        user::real_uid().ok_or_else(|| Error::Message("cannot tell which user this is".into()))?;
     if uid == 0 {
-        return Err(Error::Refused(
+        return Err(Error::Message(
             "a permit is given by the user who was blocked, not by root".into(),
         ));
     }
@@ -714,10 +715,10 @@ fn grant(
             "Type {WORD} to overrule the review, anything else to leave it: "
         ))
         .ok_or_else(|| {
-            Error::Refused("a permit is given on a terminal, by you: there is none here".into())
+            Error::Message("a permit is given on a terminal, by you: there is none here".into())
         })?;
     if answer != WORD {
-        return Err(Error::Refused("nothing was permitted".into()));
+        return Err(Error::Message("nothing was permitted".into()));
     }
     as_root(&["--add", content.gate.name(), &content.class, &content.key()])?;
     drop_pending(state_root, id);
@@ -792,7 +793,7 @@ pub(crate) fn command(command: &Command, settings: &Settings) -> ExitCode {
         }
         Command::Grant(id) => match state_root.as_deref() {
             Some(root) => grant(id, settings, root, &mut TtyTyped, &system),
-            None => Err(Error::Refused(
+            None => Err(Error::Message(
                 "no state directory (set HOME or XDG_STATE_HOME)".into(),
             )),
         },
@@ -805,7 +806,7 @@ pub(crate) fn command(command: &Command, settings: &Settings) -> ExitCode {
         }
         Err(message) => {
             errln!("omarchy-guardian permit: {message}");
-            ExitCode::from(2)
+            ExitCode::from(FAILED)
         }
     }
 }
