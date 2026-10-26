@@ -446,8 +446,9 @@ pub(super) fn plugin_root_readings(line: &str, root: Option<&str>) -> Vec<String
 /// `unset`, `export`, `env -u`); or a form was left as written and names
 /// no file. Following the new value would take a shell's parser, so the
 /// line is reviewed as written and the gap is said. Not caught: a name
-/// built as it runs (`$'\x43…'`, `unset ${v}ROOT`, `unset $v`), and a
-/// command that clears the whole environment (`env -i`, `exec -c`, `sudo`).
+/// built as it runs (`unset $v`, `$'\x43…'`, `unset CLAUDE_PLUGIN_{ROOT,X}`),
+/// and a command that clears the whole environment (`env -i`, `exec -c`,
+/// `sudo`).
 fn plugin_root_not_followed(line: &str, runs: &[String]) -> Option<String> {
     if changes_plugin_root(line) {
         Some(format!(
@@ -463,33 +464,40 @@ fn plugin_root_not_followed(line: &str, runs: &[String]) -> Option<String> {
 }
 
 /// Whether `line` names the plugin's variable other than to expand it, as
-/// an assignment or an argument does: `CLAUDE_PLUGIN_ROOT` not after `$`
-/// or `${`, and not part of a longer name.
+/// an assignment or an argument does: `CLAUDE_PLUGIN_ROOT` not right after
+/// `$` or `${`. A longer name that holds it (`MY_CLAUDE_PLUGIN_ROOT`,
+/// `CLAUDE_PLUGIN_ROOTS`) counts too: telling it apart is what let an
+/// option with the name attached (`env -uCLAUDE_PLUGIN_ROOT`, `printf
+/// -vCLAUDE_PLUGIN_ROOT`) through, and such a name only adds a note.
 fn changes_plugin_root(line: &str) -> bool {
-    // The shell takes quotes and backslashes out before `unset` or `env -u`
-    // sees a name (`unset CLAUDE_PLUGIN_RO""OT`), so they are matched
-    // without them. `$'…'` and `$"…"` are quotes too, so the `$` that
-    // opens one goes with it; otherwise `unset $'CLAUDE_PLUGIN_ROOT'` would
-    // read as an expansion. Text such as `"$"CLAUDE_PLUGIN_ROOT` then gets
-    // a note it does not need, which errs toward saying more.
+    let line = without_quoting(line);
+    line.match_indices(PLUGIN_ROOT).any(|(at, _)| {
+        let before = &line[..at];
+        !before.ends_with('$') && !before.ends_with("${")
+    })
+}
+
+/// `line` with what the shell takes out before a command sees its words:
+/// quotes, a backslash, and a backslash-newline pair
+/// (`unset CLAUDE_PLUGIN_RO""OT` unsets the variable). `$'…'` and `$"…"`
+/// are quotes too, so the `$` that opens one goes with it; otherwise
+/// `unset $'CLAUDE_PLUGIN_ROOT'` would read as an expansion. Text such as
+/// `"$"CLAUDE_PLUGIN_ROOT`, or a pair inside single quotes, then gets a
+/// note it does not need, which errs toward saying more.
+fn without_quoting(line: &str) -> String {
     let mut kept = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&'\n') {
+            chars.next();
+            continue;
+        }
         let opens_quote = c == '$' && matches!(chars.peek(), Some('\'' | '"'));
         if !opens_quote && !matches!(c, '\'' | '"' | '\\') {
             kept.push(c);
         }
     }
-    let line = kept;
-    let is_name = |c: char| c.is_ascii_alphanumeric() || c == '_';
-    line.match_indices(PLUGIN_ROOT).any(|(at, _)| {
-        let before = &line[..at];
-        let after = &line[at + PLUGIN_ROOT.len()..];
-        !before.ends_with('$')
-            && !before.ends_with("${")
-            && !before.ends_with(is_name)
-            && !after.starts_with(is_name)
-    })
+    kept
 }
 
 /// Whether `run` still holds `${CLAUDE_PLUGIN_ROOT…}`, which no reading
