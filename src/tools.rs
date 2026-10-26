@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::thread;
 
+use crate::agent::ReviewerConfig;
 use crate::error::{Error, IoContext};
 use crate::user;
 
@@ -88,6 +89,19 @@ pub(crate) enum OpenCode {
     /// An exact binary, so tests never reach a real provider.
     #[cfg(test)]
     At(PathBuf),
+}
+
+impl OpenCode {
+    /// The configuration a review with this policy's OpenCode runs with:
+    /// a gate in front of a root action never takes the user's own.
+    pub(crate) fn reviewer_config(&self) -> ReviewerConfig {
+        match self {
+            Self::SystemOnly => ReviewerConfig::Isolated,
+            Self::UserPath => ReviewerConfig::User,
+            #[cfg(test)]
+            Self::At(_) => ReviewerConfig::User,
+        }
+    }
 }
 
 impl OpenCode {

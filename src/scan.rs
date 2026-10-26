@@ -15,7 +15,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use crate::content::{self, Content, Format, Prefix};
+use crate::content::{self, Content, Format, Prefix, Reading};
 use crate::error::Error;
 use crate::files::{O_NONBLOCK, read_small_file};
 use crate::git_state;
@@ -795,7 +795,7 @@ fn read_classified(file: &mut File, rel: &str, executable: bool) -> io::Result<(
 
     if head.len() as u64 <= MAX_TEXT_FILE_SIZE {
         let digest = hasher.finalize();
-        let contents = match content::classify(rel, executable, false, &head) {
+        let contents = match content::classify(rel, executable, Reading::ByName, &head) {
             Content::Text(text) => Contents::Text(text, false),
             Content::Lossy { text, .. } => Contents::Text(text, true),
             Content::Binary(format) => Contents::Binary(format),

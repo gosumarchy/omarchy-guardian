@@ -12,7 +12,7 @@ use crate::autorun::{
     sweep_only_location,
 };
 use crate::config::model::SourceClass;
-use crate::content::{self, Content, Prefix};
+use crate::content::{self, Content, Prefix, Reading};
 use crate::error::Error;
 use crate::rules;
 use crate::scan::MAX_TEXT_FILE_SIZE;
@@ -418,7 +418,7 @@ pub(crate) fn review(
 
     let install = read
         .get(".INSTALL")
-        .map(|bytes| content::classify(".INSTALL", false, true, bytes));
+        .map(|bytes| content::classify(".INSTALL", false, Reading::AsCode, bytes));
     let mut files = payload_files(&sources, &read);
     files.extend(named);
     files.sort_by(|left, right| left.path.cmp(&right.path));
@@ -694,7 +694,7 @@ fn named_files(
         naming.clear();
         for path in texts {
             let bytes = read.get(&path).cloned().unwrap_or_default();
-            let content = content::classify(&path, false, false, &bytes);
+            let content = content::classify(&path, false, Reading::ByName, &bytes);
             if matches!(content, Content::Text(_) | Content::Lossy { .. }) {
                 naming.push((path.clone(), path.clone()));
             }

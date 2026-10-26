@@ -94,25 +94,32 @@ const USER_CLASSES: [SourceClass; 5] = [
 const PRIVILEGED_COMMUNITY: [SourceClass; 2] =
     [SourceClass::ThirdPartyRepo, SourceClass::LocalPackage];
 
+/// Which settings file setup writes.
+#[derive(Debug, Clone, Copy)]
+enum SettingsFile {
+    User,
+    System,
+}
+
 /// Sets in `config` the keys setup asks about, to exactly what was chosen
 /// (a choice left on its default removes the key), and nothing else:
 /// `profile`, `[agent] model`, the whole `[agent.variants]` table (only the
-/// level the test run proved is mapped), the thinking level of `classes`
-/// and, for the `system` file, `[class.official] model`. The system file
-/// takes the gate's models, the user file the review model.
-fn apply_choice(
-    config: &mut PartialConfig,
-    choice: &Choice,
-    classes: &[SourceClass],
-    system: bool,
-) {
+/// level the test run proved is mapped), the thinking level of the classes
+/// that file holds and, for the system file, `[class.official] model`. The
+/// system file takes the gate's models, the user file the review model.
+fn apply_choice(config: &mut PartialConfig, choice: &Choice, file: SettingsFile) {
     config.profile = Some(choice.profile);
     config.agent.variants = tested_variants(choice);
-    if system {
-        apply_gate(config, choice);
-    } else {
-        config.agent.model.clone_from(&choice.model);
-    }
+    let classes: &[SourceClass] = match file {
+        SettingsFile::User => {
+            config.agent.model.clone_from(&choice.model);
+            &USER_CLASSES
+        }
+        SettingsFile::System => {
+            apply_gate(config, choice);
+            &PRIVILEGED_COMMUNITY
+        }
+    };
     let thinking = (choice.profile != Profile::LocalOnly).then_some(choice.thinking);
     for class in classes {
         config.class_mut(*class).thinking = thinking;
@@ -148,7 +155,7 @@ fn tested_variant(choice: &Choice) -> Option<Thinking> {
 
 fn render_user(choice: &Choice) -> String {
     let mut config = PartialConfig::default();
-    apply_choice(&mut config, choice, &USER_CLASSES, false);
+    apply_choice(&mut config, choice, SettingsFile::User);
     write::render(&config, HEADER)
 }
 
@@ -156,7 +163,7 @@ fn render_user(choice: &Choice) -> String {
 /// none) with the keys setup asks about set from `choice`. Everything else
 /// the file sets is carried over unchanged.
 fn system_config(choice: &Choice, mut existing: PartialConfig) -> PartialConfig {
-    apply_choice(&mut existing, choice, &PRIVILEGED_COMMUNITY, true);
+    apply_choice(&mut existing, choice, SettingsFile::System);
     existing
 }
 
@@ -1135,11 +1142,11 @@ impl Environment for RealEnvironment {
     }
 
     fn test_review(&self, settings: &AgentSettings) -> Result<Duration, Error> {
-        test_samples(&OpenCode::UserPath, settings, false)
+        test_samples(&OpenCode::UserPath, settings)
     }
 
     fn test_gate_review(&self, settings: &AgentSettings) -> Result<Duration, Error> {
-        test_samples(&OpenCode::SystemOnly, settings, true)
+        test_samples(&OpenCode::SystemOnly, settings)
     }
 
     fn user_config(&self) -> PartialConfig {
@@ -1188,13 +1195,9 @@ impl Environment for RealEnvironment {
 }
 
 /// The two-sample test: the reviewer `policy` finds for the model must flag
-/// the malicious sample and pass the clean one, reviewing `isolated` as the
-/// pacman gate does or not.
-fn test_samples(
-    policy: &OpenCode,
-    settings: &AgentSettings,
-    isolated: bool,
-) -> Result<Duration, Error> {
+/// the malicious sample and pass the clean one, with the configuration a
+/// review under that policy runs with.
+fn test_samples(policy: &OpenCode, settings: &AgentSettings) -> Result<Duration, Error> {
     let binary = policy.resolve_reviewer(Reviewer::for_model(settings.model.as_deref()))?;
     let started = Instant::now();
 
@@ -1209,7 +1212,7 @@ fn test_samples(
         &binary,
         &|nonce: &str| bad_request.render(nonce),
         settings,
-        isolated,
+        policy.reviewer_config(),
     )
     .map_err(AgentError::into_error)?;
     if bad.status != Status::Suspicious && bad.findings.is_empty() {
@@ -1229,7 +1232,7 @@ fn test_samples(
         &binary,
         &|nonce: &str| clean_request.render(nonce),
         settings,
-        isolated,
+        policy.reviewer_config(),
     )
     .map_err(AgentError::into_error)?;
     if clean.status != Status::Clear || !clean.findings.is_empty() {
