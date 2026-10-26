@@ -16,8 +16,10 @@
 //! is compared with the packaged one (see `pe::is_built_from`) and its
 //! kernel with the packaged kernels; its initramfs and command line cannot
 //! be compared. One built from the packaged stub around another kernel is
-//! listed with a note (Limine with snapper keeps older kernels), and one
-//! whose stub is not the packaged one is told like any unknown program.
+//! a finding where systemd-boot finds it (`EFI/Linux`) or where it says it
+//! is the running release, as a kernel image is (see `kernel_images`), and
+//! listed with a note elsewhere; one whose stub is not the packaged one is
+//! told like any unknown program.
 //! `grub-install` builds GRUB's program on this machine: where the grub
 //! package is installed, a `grub*.efi` is listed with a note.
 //!
@@ -104,6 +106,9 @@ enum Verdict {
     PackagedKernel,
     /// Cannot be compared, for the reason given.
     NotComparable(&'static str),
+    /// A UKI built from the packaged stub around a kernel no package ships,
+    /// that this system starts.
+    StartedKernel,
     /// No installed package ships it.
     Unknown,
 }
@@ -125,7 +130,12 @@ struct Packaged<'a> {
     kernels: &'a [Digest],
     /// Whether the grub package is installed.
     grub: bool,
+    /// The release of the running kernel, where it is known.
+    running: Option<String>,
 }
+
+/// Where systemd-boot finds UKIs, in lower case (FAT ignores case).
+const UKI_DIRECTORY: &str = "boot/efi/linux/";
 
 /// Compares the EFI programs among `files` (everything under `/boot`)
 /// with the packaged ones; `kernels` are the digests of the packaged
@@ -153,6 +163,7 @@ pub(super) fn compare(scope: &Scope<'_>, files: &[String], kernels: &[Digest], b
             .index
             .owner(GRUB_MODULES)
             .is_some_and(|owned| scope.index.package(owned) == "grub"),
+        running: super::running_release(scope),
     };
     let mut packaged_kernels = 0;
     for path in programs.into_iter().take(MAX_PROGRAMS) {
@@ -195,6 +206,10 @@ pub(super) fn compare(scope: &Scope<'_>, files: &[String], kernels: &[Digest], b
                 continue;
             }
             Verdict::NotComparable(reason) => item.notes.push(reason.into()),
+            Verdict::StartedKernel => item.alerts.push((
+                RuleId::BootTampering,
+                "a unified kernel image this system starts, built around a kernel no installed kernel package ships".into(),
+            )),
             Verdict::Unknown if is_started(path) => item.alerts.push((
                 RuleId::BootTampering,
                 "not an EFI program any installed package ships, in a directory the boot loader starts from".into(),
@@ -240,23 +255,27 @@ fn is_started(path: &str) -> bool {
 }
 
 /// The packaged files `pattern` matches whose name ends in `extension`,
-/// each with what was looked at of it, where it is still what its package
-/// shipped.
-fn intact(scope: &Scope<'_>, pattern: &str, extension: &str) -> Vec<(Digest, u64, Vec<u8>)> {
+/// each with its digest and, where they could all be read, its bytes,
+/// where it is still what its package shipped.
+fn intact(scope: &Scope<'_>, pattern: &str, extension: &str) -> Vec<(Digest, Option<Vec<u8>>)> {
     read::matching(scope.root, pattern)
         .files
         .into_iter()
         .filter(|path| read::has_extension(file_name(path), extension))
         .filter_map(|path| {
             let found = collect::look(scope, Category::Boot, &path, None);
-            let item = collect::item_of(scope, Category::Boot, path, None, &found);
+            let item = collect::item_of(scope, Category::Boot, path.clone(), None, &found);
             let Found::File {
                 sha256, size, head, ..
             } = found
             else {
                 return None;
             };
-            matches!(item.tier, Tier::Vendor | Tier::UserBuilt).then_some((sha256, size, head))
+            if !matches!(item.tier, Tier::Vendor | Tier::UserBuilt) {
+                return None;
+            }
+            let bytes = whole(&scope.root.join(&path), sha256, size, &head).map(Cow::into_owned);
+            Some((sha256, bytes))
         })
         .collect()
 }
@@ -266,11 +285,9 @@ fn references(scope: &Scope<'_>) -> Vec<Reference> {
     PACKAGED
         .iter()
         .flat_map(|pattern| intact(scope, pattern, "efi"))
-        .map(|(sha256, size, head)| Reference {
+        .map(|(sha256, bytes)| Reference {
             sha256,
-            normalized: (head.len() as u64 == size)
-                .then(|| pe::normalized(&head))
-                .flatten(),
+            normalized: bytes.as_deref().and_then(pe::normalized),
         })
         .collect()
 }
@@ -279,8 +296,7 @@ fn references(scope: &Scope<'_>) -> Vec<Reference> {
 fn stubs(scope: &Scope<'_>) -> Vec<Vec<u8>> {
     intact(scope, STUBS, "stub")
         .into_iter()
-        .filter(|(_, size, head)| head.len() as u64 == *size)
-        .map(|(_, _, head)| head)
+        .filter_map(|(_, bytes)| bytes)
         .collect()
 }
 
@@ -295,7 +311,12 @@ fn whole<'a>(path: &Path, sha256: Digest, size: u64, head: &'a [u8]) -> Option<C
     if size > MAX_PROGRAM_SIZE {
         return None;
     }
+    // Checked before opening, so that a device or a pipe put in its place
+    // is never opened.
     let before = fs::symlink_metadata(path).ok()?;
+    if !before.is_file() {
+        return None;
+    }
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(O_NOFOLLOW | O_NONBLOCK)
@@ -327,7 +348,7 @@ fn verdict(path: &str, bytes: &[u8], packaged: &Packaged<'_>) -> Verdict {
     if same {
         return Verdict::Packaged;
     }
-    if let Some(verdict) = unified(bytes, packaged) {
+    if let Some(verdict) = unified(path, bytes, packaged) {
         return verdict;
     }
     if packaged.grub && file_name(path).to_ascii_lowercase().starts_with("grub") {
@@ -336,8 +357,9 @@ fn verdict(path: &str, bytes: &[u8], packaged: &Packaged<'_>) -> Verdict {
     Verdict::Unknown
 }
 
-/// What the program `bytes` is as a UKI, if it is one (it holds a kernel).
-fn unified(bytes: &[u8], packaged: &Packaged<'_>) -> Option<Verdict> {
+/// What the program at `path` with content `bytes` is as a UKI, if it is
+/// one (it holds a kernel).
+fn unified(path: &str, bytes: &[u8], packaged: &Packaged<'_>) -> Option<Verdict> {
     let header = pe::header(bytes)?;
     let kernel = pe::section(bytes, &header, b".linux")?;
     if packaged.stubs.is_empty() {
@@ -350,11 +372,22 @@ fn unified(bytes: &[u8], packaged: &Packaged<'_>) -> Option<Verdict> {
     {
         return Some(Verdict::Unknown);
     }
-    Some(if packaged.kernels.contains(&Sha256::digest(kernel)) {
-        Verdict::PackagedKernel
-    } else {
-        Verdict::NotComparable(OTHER_KERNEL)
-    })
+    if packaged.kernels.contains(&Sha256::digest(kernel)) {
+        return Some(Verdict::PackagedKernel);
+    }
+    // `.uname` is the release of the kernel inside, as `uname -r` gives it.
+    let release = pe::section(bytes, &header, b".uname");
+    let running = packaged
+        .running
+        .as_deref()
+        .is_some_and(|running| release == Some(running.as_bytes()));
+    Some(
+        if running || path.to_ascii_lowercase().starts_with(UKI_DIRECTORY) {
+            Verdict::StartedKernel
+        } else {
+            Verdict::NotComparable(OTHER_KERNEL)
+        },
+    )
 }
 
 #[cfg(test)]

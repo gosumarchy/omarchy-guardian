@@ -67,6 +67,17 @@ const CONFIGURED: &[&str] = &[
 /// Directories of boot entries, one file each.
 const CONFIGURED_DIRECTORIES: &[&str] = &["boot/loader/entries", "etc/cmdline.d"];
 
+/// Whether `path` is a boot loader's configuration the command line is
+/// compared with: of what is in `/boot`, the only text the AI reviews
+/// (see `judge::is_local_only`).
+pub(super) fn is_configuration(path: &str) -> bool {
+    CONFIGURED.contains(&path)
+        || CONFIGURED_DIRECTORIES.iter().any(|directory| {
+            path.strip_prefix(directory)
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
+}
+
 /// The running kernel's command line, relative to the root.
 const COMMAND_LINE: &str = "proc/cmdline";
 
@@ -254,15 +265,20 @@ fn is_started(scope: &Scope<'_>, path: &str, defaults: &[String]) -> bool {
     if defaults.iter().any(|default| default == name) {
         return true;
     }
-    let running = fs::read_to_string(scope.root.join("proc/sys/kernel/osrelease"))
-        .map(|release| release.trim().to_string())
-        .unwrap_or_default();
+    let Some(running) = running_release(scope) else {
+        return false;
+    };
     match collect::look(scope, Category::Boot, path, None) {
-        Found::File { head, .. } => {
-            image_release(&head).is_some_and(|release| !running.is_empty() && release == running)
-        }
+        Found::File { head, .. } => image_release(&head).is_some_and(|release| release == running),
         _ => false,
     }
+}
+
+/// The release of the running kernel (`6.12.1-arch1-1`), where it is known.
+fn running_release(scope: &Scope<'_>) -> Option<String> {
+    let release = fs::read_to_string(scope.root.join("proc/sys/kernel/osrelease")).ok()?;
+    let release = release.trim();
+    (!release.is_empty()).then(|| release.to_string())
 }
 
 /// The digests of the kernel images the installed kernel packages ship,

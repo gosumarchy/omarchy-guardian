@@ -152,6 +152,26 @@ pub(super) fn uki(kernel: &[u8]) -> Vec<u8> {
     build(PE32_PLUS, 0x1000, &parts)
 }
 
+/// A UKI around a kernel no package ships, that says it is `release`.
+fn uki_of_release(release: &'static [u8]) -> Vec<u8> {
+    let mut parts = stub_parts();
+    parts.extend([
+        Part {
+            name: ".linux",
+            data: b"another kernel",
+            address: 0x20000,
+            flags: DATA,
+        },
+        Part {
+            name: ".uname",
+            data: release,
+            address: 0x30000,
+            flags: DATA,
+        },
+    ]);
+    build(PE32_PLUS, 0x1000, &parts)
+}
+
 /// `bytes` as `sbsign` leaves them: padded to 8 bytes, the certificate
 /// table appended and pointed at, and the checksum set.
 pub(super) fn signed(bytes: &[u8]) -> Vec<u8> {
@@ -257,6 +277,7 @@ fn efi_programs_are_compared_with_the_packaged_ones() {
     );
     write(root, STUB, &stub());
     write(root, "usr/lib/modules/6.1-arch/vmlinuz", b"kernel");
+    write(root, "proc/sys/kernel/osrelease", b"6.0-arch\n");
     let mut index = packages(&systemd_boot);
 
     let mut patched_stub = uki(b"kernel");
@@ -281,6 +302,11 @@ fn efi_programs_are_compared_with_the_packaged_ones() {
         ),
         ("boot/EFI/Linux/arch-linux.efi", signed(&uki(b"kernel"))),
         ("boot/EFI/Linux/arch-old.efi", uki(b"older kernel")),
+        ("boot/EFI/snapshots/arch-old.efi", uki(b"older kernel")),
+        (
+            "boot/EFI/snapshots/arch-running.efi",
+            uki_of_release(b"6.0-arch"),
+        ),
         ("boot/EFI/Linux/arch-patched.efi", patched_stub),
         ("boot/EFI/BOOT/grubx64.efi", program(&[(".text", b"grub")])),
         ("boot/limine_x64.bak", b"not an EFI program".to_vec()),
@@ -299,13 +325,15 @@ fn efi_programs_are_compared_with_the_packaged_ones() {
         |path: &str, alert, note: Option<&str>| (path.to_string(), alert, note.map(str::to_string));
     let expected = [
         item("boot/EFI/BOOT/grubx64.efi", tampered, None),
-        item("boot/EFI/Linux/arch-old.efi", None, Some(OTHER_KERNEL)),
+        item("boot/EFI/Linux/arch-old.efi", tampered, None),
         item("boot/EFI/Linux/arch-patched.efi", tampered, None),
         item(
             "boot/EFI/Microsoft/Boot/bootmgfw.efi",
             None,
             Some(ELSEWHERE),
         ),
+        item("boot/EFI/snapshots/arch-old.efi", None, Some(OTHER_KERNEL)),
+        item("boot/EFI/snapshots/arch-running.efi", tampered, None),
         item("boot/EFI/systemd/systemd-bootx64.efi", tampered, None),
     ];
     assert_eq!(found(&scope), expected);
@@ -398,6 +426,59 @@ fn more_programs_than_are_compared_and_unreadable_ones_are_said() {
         boot.notes
     );
     fs::set_permissions(&closed, fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+/// Nothing of `/boot` goes to the AI, not even a program or kernel image
+/// whose bytes read as text.
+#[test]
+fn nothing_in_boot_is_sent_to_the_review() {
+    use crate::config::Settings;
+    use crate::config::file::PartialConfig;
+    use crate::config::model::{Profile, SourceClass};
+    use crate::review::ReviewContext;
+    use crate::sweep::collect::{Body, Collection};
+    use crate::test_support::mock_opencode_findings;
+    use crate::tools::OpenCode;
+
+    let dir = TempDir::new("sweep-efi-judge");
+    let root = dir.path();
+    write(root, "boot/EFI/BOOT/BOOTX64.EFI", b"echo a text file\n");
+    write(root, "boot/vmlinuz-linux", b"#!/bin/sh\necho a kernel\n");
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: None,
+        index: &index,
+        origin: Origin::Root,
+    };
+    let items = check(&scope).items;
+    assert_eq!(items.len(), 2, "{items:?}");
+    assert!(
+        items.iter().all(|item| matches!(item.body, Body::Text(_))),
+        "{items:?}"
+    );
+    let collection = Collection {
+        items,
+        ..Collection::default()
+    };
+    let bin = TempDir::new("sweep-efi-judge-bin");
+    let opencode = OpenCode::At(mock_opencode_findings(bin.path(), "clear", &[]));
+    let settings = Settings::from_parts(PartialConfig::default(), PartialConfig::default())
+        .with_profile(Profile::Standard);
+    let context = ReviewContext {
+        settings: &settings,
+        class: SourceClass::System,
+        opencode: &opencode,
+        units: &[],
+        state_root: None,
+        context: &[],
+    };
+    let report = crate::sweep::judge::judge(&collection, None, &context, &HashSet::new());
+    assert!(report.agent_runs.is_empty() && report.agent_input.is_empty());
+    let rules: Vec<RuleId> = report.findings.iter().map(|finding| finding.rule).collect();
+    // The program is in a directory the boot loader starts from; the kernel
+    // image goes by no installed kernel's name, so it is only listed.
+    assert_eq!(rules, [RuleId::BootTampering]);
 }
 
 #[test]

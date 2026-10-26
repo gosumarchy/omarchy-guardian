@@ -749,7 +749,8 @@ bytes.
 | --- | --- |
 | A packaged program, as shipped, signed since, or with the configuration hash enrolled | trusted, only counted |
 | A unified kernel image (UKI) built from systemd's packaged stub around a kernel a kernel package ships | one note; the initramfs and command line inside are built on this machine and are not comparable |
-| A UKI built from the packaged stub around a kernel no installed package ships | listed with a note and no alert, like an older kernel image |
+| A UKI built from the packaged stub around a kernel no installed package ships, in `/boot/EFI/Linux` (where systemd-boot finds UKIs) or whose `.uname` is the running release | a high finding (`boot-tampering`), like a kernel image the machine starts |
+| Such a UKI anywhere else | listed with a note and no alert, like an older kernel image |
 | A UKI where no packaged stub is installed to compare it with | listed with a note: not comparable |
 | GRUB's program (`grub*.efi`) where the grub package is installed, which `grub-install` builds on this machine | listed with a note: not comparable |
 | Any other program in `/boot/EFI/BOOT`, `/boot/EFI/limine`, `/boot/EFI/systemd` or `/boot/EFI/Linux` | a high finding (`boot-tampering`) |
@@ -759,7 +760,9 @@ A UKI counts as built from the stub when it starts where the stub does, has
 the stub's data directories (but the certificate table), holds every section
 of the stub at the same address with the same flags and bytes (`.sbat`, into
 which `ukify` merges the kernel's entries, may have grown), lists no section
-twice, has no two sections over the same addresses, and adds only the
+twice (and no more than 96), has no two sections over the same addresses
+(a section's extent is the larger of its virtual and raw sizes, as a loader
+copies the raw size where the virtual size is 0), and adds only the
 sections the UKI format defines, none of which can be run. A UKI that is not,
 or a `grub*.efi` where the grub package is not installed, is told like any
 other program: in the directories above, a finding. A program larger than the
@@ -768,7 +771,10 @@ be the file that was hashed; one that cannot be is not compared, and for the
 root checks the sweep is incomplete.
 
 A listed program can be allowed as it is. Nothing from `/boot` goes to the AI
-review: these are hashed binaries, judged by these local rules alone.
+review: kernel images and EFI programs are judged by these local rules alone,
+even one whose bytes read as text. The one exception is the boot loader's
+configuration (`/boot/limine.conf` and the others the command line is compared
+with), which is reviewed as a file like any other.
 
 What this machine shows, as Omarchy sets it up: Limine is the boot loader,
 `limine-install` copies `/usr/share/limine/BOOTX64.EFI` to

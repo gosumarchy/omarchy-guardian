@@ -54,6 +54,11 @@ fn files_that_hold_tokens_and_plain_facts_stay_here() {
         ("etc/hosts", Category::Trust, true),
         ("etc/passwd#u", Category::Account, true),
         ("home/u/.ssh/authorized_keys2", Category::Ssh, true),
+        ("boot/EFI/BOOT/BOOTX64.EFI", Category::Boot, true),
+        ("boot/vmlinuz-linux", Category::Boot, true),
+        ("boot/limine.conf", Category::Boot, false),
+        ("boot/loader/entries/arch.conf", Category::Boot, false),
+        ("proc/cmdline", Category::Boot, false),
         (
             "home/u/.config/chromium-flags.conf",
             Category::Browser,

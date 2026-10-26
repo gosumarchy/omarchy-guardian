@@ -9,8 +9,8 @@ mod variables;
 use std::fmt::Write as _;
 
 use super::collect::{self, Body, Collection, Item};
-use super::commands;
 use super::tier::Tier;
+use super::{boot, commands};
 use crate::autorun::Category;
 use crate::engine::baseline::{Identity, Unit};
 use crate::engine::plan::HashOnly;
@@ -253,6 +253,12 @@ fn is_local_only(item: &Item, home: Option<&str>) -> bool {
         // rules (see `extensions`); its code and the profile it came from
         // hold personal data and are never sent.
         Category::Account | Category::BrowserExtension => true,
+        // Kernel images and EFI programs are compared with the packaged ones
+        // (see `boot`), and one whose bytes read as text is still one of
+        // them: nothing in `/boot` but the boot loader's configuration, which
+        // holds no personal data and whose kernel parameters only the review
+        // reads, goes to the AI.
+        Category::Boot => path.starts_with("boot/") && !boot::is_configuration(path),
         Category::Trust => named,
         Category::Toolchain => {
             named
