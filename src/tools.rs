@@ -7,6 +7,7 @@
 
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -312,23 +313,49 @@ impl Captured {
         if self.status.success() {
             return Ok(self.stdout);
         }
-        Err(Error::ToolFailed {
-            detail: self.failure_detail(),
-            tool: self.tool,
-        })
+        Err(self.failure().into_error(self.tool))
     }
 
-    pub(crate) fn failure_detail(&self) -> String {
+    /// How the run ended when it did not succeed.
+    pub(crate) fn failure(&self) -> Failure {
         // GNU timeout exits 124 when it had to stop the command.
         if self.status.code() == Some(124) {
-            return "timed out".to_string();
+            return Failure::TimedOut;
         }
         let stderr = String::from_utf8_lossy(&self.stderr);
         let stderr = stderr.trim();
         if stderr.is_empty() {
-            format!("exited with {}", self.status)
+            Failure::Failed(format!("exited with {}", self.status))
         } else {
-            stderr.chars().take(500).collect()
+            Failure::Failed(stderr.chars().take(500).collect())
+        }
+    }
+}
+
+/// How a run that did not succeed ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Failure {
+    /// `timeout` stopped it.
+    TimedOut,
+    /// It failed on its own: the start of its stderr, or its exit status
+    /// when it wrote nothing there.
+    Failed(String),
+}
+
+impl Failure {
+    pub(crate) fn into_error(self, tool: String) -> Error {
+        match self {
+            Self::TimedOut => Error::TimedOut { tool },
+            Self::Failed(detail) => Error::ToolFailed { tool, detail },
+        }
+    }
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TimedOut => f.write_str("timed out"),
+            Self::Failed(detail) => f.write_str(detail),
         }
     }
 }
@@ -576,7 +603,7 @@ mod tests {
     use std::path::Path;
     use std::process::{ExitCode, ExitStatus};
 
-    use super::{Limits, exit_code_of, find_in_path, run};
+    use super::{Failure, Limits, exit_code_of, find_in_path, run};
     use crate::error::Error;
     use crate::test_support::{TempDir, write_script};
 
@@ -632,7 +659,7 @@ mod tests {
             LIMITS,
         )
         .unwrap();
-        assert_eq!(failed.failure_detail(), "broken");
+        assert_eq!(failed.failure(), Failure::Failed("broken".into()));
 
         let slow = run(
             Path::new("/bin/sh"),
@@ -645,7 +672,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(slow.failure_detail(), "timed out");
+        assert_eq!(slow.failure(), Failure::TimedOut);
+        assert!(matches!(slow.into_success(), Err(Error::TimedOut { .. })));
     }
 
     #[test]

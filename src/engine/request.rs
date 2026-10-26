@@ -302,6 +302,12 @@ fn manifest_json(entry: &ManifestEntry) -> Json {
     Json::object(members)
 }
 
+/// The bytes `finding` takes in a request's `local_findings`, as written
+/// there (escapes included), with the comma after it.
+pub(super) fn finding_bytes(finding: &LocalFinding) -> usize {
+    finding_json(finding).to_string().len() + 1
+}
+
 fn finding_json(finding: &LocalFinding) -> Json {
     Json::object([
         ("file", Json::from(finding.path.as_str())),
@@ -367,12 +373,29 @@ fn item_json(item: &Item) -> Json {
 
 #[cfg(test)]
 mod tests {
-    use super::Request;
+    use super::{Request, finding_bytes};
     use crate::agent::SourceFile;
     use crate::config::model::{Named, SourceClass};
     use crate::engine::plan::{Item, ManifestEntry, Sent};
     use crate::report::LocalFinding;
     use crate::rules::RuleId;
+
+    #[test]
+    fn a_finding_is_charged_what_its_escaped_text_takes() {
+        let finding = LocalFinding {
+            path: "a.sh".into(),
+            line: 1,
+            rule: RuleId::PrivilegeEscalation,
+            // Each control character is written as six bytes.
+            excerpt: "\u{1}".repeat(100),
+        };
+        let mut request = Request::for_files(SourceClass::Source, &[]);
+        let empty = request.render("n").len();
+        request.findings = vec![finding.clone()];
+        let grown = request.render("n").len() - empty;
+        assert!(finding_bytes(&finding) >= grown, "{grown}");
+        assert!(finding_bytes(&finding) > 600);
+    }
 
     #[test]
     fn request_carries_the_nonce_and_escaped_files() {

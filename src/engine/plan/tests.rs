@@ -795,3 +795,47 @@ fn hash_only_files_are_named_and_media_grouped_per_directory() {
             .any(|entry| entry.path == "lib/loaded.so")
     );
 }
+
+#[test]
+fn a_path_is_charged_what_its_escaped_text_takes() {
+    // Each control character is written as six bytes in the request.
+    let item = Item::Whole {
+        path: "\u{1}".repeat(10),
+        content: "x".into(),
+    };
+    assert_eq!(item.cost(), 61);
+}
+
+#[test]
+fn a_path_of_control_characters_is_measured_as_it_is_sent() {
+    let line = format!("{}\n", "x".repeat(49));
+    let content = line.repeat(5);
+    let controls = "\u{1}".repeat(10);
+    for max_input in (150..700).step_by(5) {
+        // An entry point goes whole or is refused, never in pieces.
+        let files = [file(&format!("{controls}a.install"), &content)];
+        if let Ok(plan) = plan(&files, None, max_input, 8) {
+            assert!(
+                plan.chunks
+                    .iter()
+                    .flatten()
+                    .all(|item| matches!(item, Item::Whole { .. })),
+                "{max_input}"
+            );
+        }
+        // Pieces of any other file each fit what the request has room for
+        // beside the file's manifest row: its escaped path (60 bytes for
+        // the controls, 7 for the rest) and the row's 32 bytes of overhead.
+        let path = format!("lib/{controls}.js");
+        let manifest_row = 60 + 7 + 32;
+        let files = [file(&path, &content)];
+        if let Ok(plan) = plan(&files, None, max_input, 8) {
+            assert!(
+                plan.chunks.iter().all(|chunk| {
+                    chunk.iter().map(Item::cost).sum::<usize>() + manifest_row <= max_input
+                }),
+                "{max_input}"
+            );
+        }
+    }
+}

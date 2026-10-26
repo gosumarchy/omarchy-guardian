@@ -3,9 +3,6 @@
 
 use crate::error::Error;
 
-/// What a run stopped by the timeout reports as its failure.
-pub(super) const TIMED_OUT: &str = "timed out";
-
 pub(super) fn out_of_time() -> Error {
     Error::Refused(
         "the AI saw the source and ran out of time reviewing it; retry, or raise timeout_secs"

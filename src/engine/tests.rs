@@ -157,10 +157,9 @@ fn an_invalid_chunk_blocks_and_caches_nothing() {
     assert!(matches!(review.runs[0].outcome, AgentOutcome::Reviewed(_)));
     assert!(review.runs.len() <= 2, "{:?}", review.runs);
     assert!(
-        review.runs[1..].iter().all(|run| matches!(
-            &run.outcome,
-            AgentOutcome::Unavailable(error) if error.to_string().contains("not attempted")
-        )),
+        review.runs[1..]
+            .iter()
+            .all(|run| matches!(&run.outcome, AgentOutcome::NotAttempted { .. })),
         "{:?}",
         review.runs
     );
@@ -184,7 +183,7 @@ fn chunks_and_findings(runs: &[crate::report::AgentRun]) -> Vec<(usize, Option<u
         .map(|run| {
             let findings = match &run.outcome {
                 AgentOutcome::Reviewed(review) => Some(review.findings.len()),
-                AgentOutcome::Unavailable(_) => None,
+                AgentOutcome::Unavailable(_) | AgentOutcome::NotAttempted { .. } => None,
             };
             (run.chunk.map_or(0, |(index, _)| index), findings)
         })
@@ -371,15 +370,13 @@ fn an_unavailable_first_chunk_is_retried_once_and_stops_later_calls() {
 
     assert!(review.invalid.is_none());
     assert_eq!(review.runs.len(), 3);
-    assert!(
-        review
-            .runs
-            .iter()
-            .all(|run| matches!(run.outcome, AgentOutcome::Unavailable(_)))
-    );
+    assert!(review.runs.iter().all(|run| matches!(
+        run.outcome,
+        AgentOutcome::Unavailable(_) | AgentOutcome::NotAttempted { .. }
+    )));
     assert!(matches!(
         &review.runs[2].outcome,
-        AgentOutcome::Unavailable(error) if error.to_string().contains("not attempted")
+        AgentOutcome::NotAttempted { .. }
     ));
     assert_eq!(
         fs::read_to_string(bin.path().join("count")).unwrap().trim(),
@@ -463,6 +460,27 @@ printf '{"type":"text","part":{"type":"text","text":"%s"}}\n' "$escaped""#;
 }
 
 #[test]
+fn a_second_reply_without_the_nonce_blocks_even_for_official_packages() {
+    let bin = TempDir::new("engine-nonce-twice");
+    let always_wrong = r#"reply='{"nonce":"wrong","status":"clear","summary":"mock","findings":[]}'
+escaped=$(printf '%s' "$reply" | sed 's/"/\\"/g')
+printf '{"type":"text","part":{"type":"text","text":"%s"}}\n' "$escaped""#;
+    let opencode = OpenCode::At(mock_opencode_counting(bin.path(), 0, always_wrong));
+    let settings = AgentSettings::default();
+    let files = [file("install.sh", "echo hi\n")];
+    let official = Group {
+        class: SourceClass::Official,
+        ..group(&settings, &files)
+    };
+    let review = review_group(&official, &opencode, None);
+    assert!(review.invalid.is_some(), "{:?}", review.runs);
+    assert_eq!(
+        fs::read_to_string(bin.path().join("count")).unwrap().trim(),
+        "2"
+    );
+}
+
+#[test]
 fn running_out_of_time_on_the_source_blocks_except_for_official_packages() {
     let bin = TempDir::new("engine-out-of-time");
     let opencode = OpenCode::At(mock_opencode_counting(
@@ -491,16 +509,21 @@ fn running_out_of_time_on_the_source_blocks_except_for_official_packages() {
 
 #[test]
 fn a_timeout_is_not_retried() {
-    let timeout = Error::ToolFailed {
+    let timeout = Error::TimedOut {
         tool: "opencode".into(),
-        detail: "timed out".into(),
     };
     let provider = Error::ToolFailed {
         tool: "opencode".into(),
         detail: "rate limited".into(),
     };
+    // What a reviewer prints is its own text, not the time limit.
+    let says_timed_out = Error::ToolFailed {
+        tool: "opencode".into(),
+        detail: "timed out".into(),
+    };
     assert!(!is_retryable(&timeout));
     assert!(is_retryable(&provider));
+    assert!(is_retryable(&says_timed_out));
 }
 
 #[test]

@@ -170,7 +170,7 @@ fn one_run_with_more_than_remarks_blocks_and_the_others_keep_theirs() {
         ));
         let alerts = match &other.outcome {
             AgentOutcome::Reviewed(review) => review.findings.len(),
-            AgentOutcome::Unavailable(_) => 0,
+            AgentOutcome::Unavailable(_) | AgentOutcome::NotAttempted { .. } => 0,
         };
         report.agent_runs.push(other);
         assert_eq!(

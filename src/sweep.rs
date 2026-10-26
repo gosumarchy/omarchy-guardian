@@ -724,10 +724,7 @@ fn remember_run(
                 report
                     .agent_runs
                     .iter()
-                    .filter_map(|run| match &run.outcome {
-                        AgentOutcome::Unavailable(error) => Some(error.to_string()),
-                        AgentOutcome::Reviewed(_) => None,
-                    }),
+                    .filter_map(|run| run.outcome.problem()),
             )
             .chain(report.gaps.iter().map(ToString::to_string))
             .collect(),

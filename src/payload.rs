@@ -400,7 +400,7 @@ impl Archive {
         } else {
             Err(Error::ToolFailed {
                 tool: "bsdtar".into(),
-                detail: format!("{}: {}", self.path.display(), captured.failure_detail()),
+                detail: format!("{}: {}", self.path.display(), captured.failure()),
             })
         }
     }

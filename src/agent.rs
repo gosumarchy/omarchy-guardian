@@ -270,12 +270,17 @@ pub(crate) enum AgentError {
     /// official repositories, whose content is not chosen by whoever could
     /// write such a source.
     OutOfTime(Error),
+    /// A reply that does not echo this run's nonce. Invalid like any other
+    /// wrong reply, but the engine asks once more: a model now and then
+    /// drops it, and the next reply must carry its own new nonce.
+    NonceMissing,
 }
 
 impl AgentError {
     pub(crate) fn into_error(self) -> Error {
         match self {
             Self::Unavailable(error) | Self::Invalid(error) | Self::OutOfTime(error) => error,
+            Self::NonceMissing => Error::parse(REPORT, NONCE_MISSING),
         }
     }
 }
@@ -375,7 +380,7 @@ fn opencode_review(
     // The whole event stream is judged before the exit status: a model that
     // tried a tool or answered and then failed is invalid, not absent.
     let mut events = scan_events(&String::from_utf8_lossy(&captured.stdout));
-    let failure = (!captured.status.success()).then(|| captured.failure_detail());
+    let failure = (!captured.status.success()).then(|| captured.failure());
     if cli == OpenCodeCli::Two {
         events.settle_opencode_2_delivery(failure.is_some() || events.error.is_some());
     }
@@ -500,7 +505,7 @@ fn claude_review(
         Error::OutputTooLarge { .. } => AgentError::Invalid(error),
         other => AgentError::Unavailable(other),
     })?;
-    let failure = (!captured.status.success()).then(|| captured.failure_detail());
+    let failure = (!captured.status.success()).then(|| captured.failure());
     claude_verdict(&String::from_utf8_lossy(&captured.stdout), failure, nonce)
 }
 
@@ -612,9 +617,11 @@ fn locked_config<'a>(
     Json::object(members)
 }
 
-/// Why a reply without this run's nonce is refused; the engine asks once
-/// more when it sees it.
-pub(crate) const NONCE_MISSING: &str =
+/// What the reviewer's reply is called when it cannot be read, from either CLI.
+const REPORT: &str = "the reviewer's security report";
+
+/// Why a reply without this run's nonce is refused.
+const NONCE_MISSING: &str =
     "the reply does not echo this run's nonce, so it was not based on the supplied source";
 
 /// The optional reply field a model sets when the reviewed content speaks

@@ -446,7 +446,7 @@ fn reviews_json(report: &Report) -> Json {
                     ),
                 ),
             ])),
-            AgentOutcome::Unavailable(_) => None,
+            AgentOutcome::Unavailable(_) | AgentOutcome::NotAttempted { .. } => None,
         });
     Json::Array(reviews.collect())
 }

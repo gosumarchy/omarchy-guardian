@@ -12,13 +12,14 @@ use super::{
 use crate::config::model::SourceClass;
 use crate::config::model::{AgentSettings, Thinking};
 use crate::engine::request::Request;
+use crate::error::Error;
 use crate::json::Json;
 use crate::report::Severity;
 use crate::test_support::{
     TempDir, mock_opencode, mock_opencode_failing, mock_opencode_output, mock_opencode_then,
     mock_opencode2, write_script,
 };
-use crate::tools::Reviewer;
+use crate::tools::{Failure, Reviewer};
 
 /// A stream-json transcript: `blocks` are the assistant's content blocks
 /// before the result.
@@ -85,25 +86,70 @@ fn claude_code_results_are_judged_like_opencode_ones() {
         Err(AgentError::Unavailable(_))
     ));
     assert!(matches!(
-        claude_verdict("", Some("exited with 1".into()), "n1"),
+        claude_verdict("", Some(Failure::Failed("exited with 1".into())), "n1"),
         Err(AgentError::Unavailable(_))
     ));
     // A run cut short after the model used a tool, or after it began
     // to answer, is no absent reviewer.
     let tool = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#;
     assert!(matches!(
-        claude_verdict(tool, Some("timed out".into()), "n1"),
+        claude_verdict(tool, Some(Failure::TimedOut), "n1"),
         Err(AgentError::Invalid(_))
     ));
     let began = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"{"}]}}"#;
     assert!(matches!(
-        claude_verdict(began, Some("timed out".into()), "n1"),
+        claude_verdict(began, Some(Failure::TimedOut), "n1"),
         Err(AgentError::OutOfTime(_))
+    ));
+    // Only Guardian's own time limit is a timeout; the CLI saying so is a
+    // failure like any other.
+    assert!(matches!(
+        claude_verdict(began, Some(Failure::Failed("timed out".into())), "n1"),
+        Err(AgentError::Invalid(_))
+    ));
+    let started = scan_events(r#"{"type":"step_start","part":{}}"#);
+    assert!(matches!(
+        verdict(started, Some(Failure::Failed("timed out".into())), "n1"),
+        Err(AgentError::Unavailable(Error::ToolFailed { .. }))
     ));
     // The nonce must be echoed.
     assert!(matches!(
         claude_verdict(&claude_result(THINKING, "[]", false, reply), None, "other"),
+        Err(AgentError::NonceMissing)
+    ));
+}
+
+#[test]
+fn a_line_that_does_not_parse_hides_nothing_around_it() {
+    let reply = r#"{"nonce":"n1","status":"clear","summary":"ok","findings":[]}"#;
+    let tool = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#;
+    // A tool attempt, then a line cut off as the run failed.
+    let cut = format!("{tool}\n{{\"type\":\"assis\n");
+    assert!(matches!(
+        claude_verdict(&cut, Some(Failure::Failed("exited with 1".into())), "n1"),
         Err(AgentError::Invalid(_))
+    ));
+    // A result beside a line that is not an event.
+    let extra = format!("{}not json\n", claude_result(THINKING, "[]", false, reply));
+    assert!(matches!(
+        claude_verdict(&extra, None, "n1"),
+        Err(AgentError::Invalid(_))
+    ));
+    // A notice beside an error result the model never saw.
+    let notice = "Update available\n\
+        {\"type\":\"result\",\"is_error\":true,\"permission_denials\":[],\"result\":\"\"}\n";
+    assert!(matches!(
+        claude_verdict(notice, Some(Failure::Failed("exited with 1".into())), "n1"),
+        Err(AgentError::Unavailable(_))
+    ));
+    // Nothing reached the model: a failed start stays an absent reviewer.
+    assert!(matches!(
+        claude_verdict(
+            "Error: not logged in\n",
+            Some(Failure::Failed("exited with 1".into())),
+            "n1"
+        ),
+        Err(AgentError::Unavailable(_))
     ));
 }
 
@@ -179,13 +225,13 @@ fn rejects_tool_calls_errors_and_empty_replies() {
     assert!(matches!(
         verdict(
             scan_events(r#"{"type":"step_start"}"#),
-            Some("timed out".into()),
+            Some(Failure::TimedOut),
             "n"
         ),
         Err(AgentError::OutOfTime(_))
     ));
     assert!(matches!(
-        verdict(scan_events(""), Some("timed out".into()), "n"),
+        verdict(scan_events(""), Some(Failure::TimedOut), "n"),
         Err(AgentError::Unavailable(_))
     ));
     // A request the model cannot take is the source's doing, not an
@@ -586,7 +632,7 @@ fn bad_replies_are_invalid() {
     }];
     assert!(matches!(
         review(&binary, &render(&files), &AgentSettings::default(), false),
-        Err(AgentError::Invalid(_))
+        Err(AgentError::NonceMissing)
     ));
     assert!(matches!(
         verdict(scan_events(r#"{"type":"tool_use","part":{}}"#), None, "n"),
@@ -1063,7 +1109,11 @@ fn a_provider_that_refuses_the_source_is_no_absent_reviewer() {
         // As the reason a run failed, without an error event.
         assert!(
             matches!(
-                verdict(scan_events(""), Some(refused.to_string()), "n"),
+                verdict(
+                    scan_events(""),
+                    Some(Failure::Failed(refused.to_string())),
+                    "n"
+                ),
                 Err(AgentError::Invalid(_))
             ),
             "{refused}"
@@ -1106,7 +1156,11 @@ fn a_provider_that_refuses_the_source_is_no_absent_reviewer() {
         );
         assert!(
             matches!(
-                verdict(scan_events(""), Some(absent.to_string()), "n"),
+                verdict(
+                    scan_events(""),
+                    Some(Failure::Failed(absent.to_string())),
+                    "n"
+                ),
                 Err(AgentError::Unavailable(_))
             ),
             "{absent}"

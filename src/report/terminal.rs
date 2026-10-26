@@ -301,10 +301,10 @@ impl Report {
                         Span::plain(shown(&review.summary)),
                     ]
                 }
-                AgentOutcome::Unavailable(error) => vec![
+                AgentOutcome::Unavailable(_) | AgentOutcome::NotAttempted { .. } => vec![
                     Span::new("! UNAVAILABLE", "33;1"),
                     about,
-                    Span::plain(shown(&error.to_string())),
+                    Span::plain(shown(&run.outcome.problem().unwrap_or_default())),
                 ],
             };
             rows.push(("AI review", spans));

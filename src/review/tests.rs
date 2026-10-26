@@ -1274,7 +1274,7 @@ fn verdicts(report: &Report) -> Vec<(usize, Vec<&str>)> {
                     .map(|finding| finding.title.as_str())
                     .collect(),
             )),
-            AgentOutcome::Unavailable(_) => None,
+            AgentOutcome::Unavailable(_) | AgentOutcome::NotAttempted { .. } => None,
         })
         .collect()
 }
@@ -1389,7 +1389,7 @@ fn a_clear_review_with_low_remarks_is_clear_and_remembered_with_them() {
             .iter()
             .flat_map(|run| match &run.outcome {
                 AgentOutcome::Reviewed(review) => review.findings.clone(),
-                AgentOutcome::Unavailable(_) => Vec::new(),
+                AgentOutcome::Unavailable(_) | AgentOutcome::NotAttempted { .. } => Vec::new(),
             })
             .map(|finding| format!("{} {}", finding.severity.label(), finding.title))
             .collect()
