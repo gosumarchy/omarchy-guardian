@@ -261,7 +261,7 @@ impl Specs {
     /// of a plugin, so a build in either counts.
     fn builds(&self, name: &str) -> Vec<Build> {
         let mut builds: Vec<Build> = Vec::new();
-        for build in self.of(name).iter().filter_map(|spec| spec.build.as_ref()) {
+        for build in self.of(name).iter().flat_map(|spec| &spec.builds) {
             if !builds.contains(build) {
                 builds.push(build.clone());
             }

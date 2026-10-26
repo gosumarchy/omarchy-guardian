@@ -73,8 +73,8 @@ pub(super) struct Spec {
     /// The plugin's directory name: its `name`, or the last part of
     /// `source` without `.git`.
     pub(super) name: String,
-    /// What its `build` key runs, if it has one.
-    pub(super) build: Option<Build>,
+    /// What its `build` key runs: none, one step, or each of a list.
+    pub(super) builds: Vec<Build>,
 }
 
 /// What a spec's `build` key runs when lazy.nvim installs or updates the
@@ -96,6 +96,11 @@ pub(super) enum Build {
 /// at any depth, so `dependencies = { "a/b" }` counts as well. Only
 /// literals are read: a spec built by code, or a bare string that is not
 /// in a table (`dependencies = "a/b"`), is not found.
+///
+/// A key counts only as a field of the innermost table: right after its
+/// `{` or a separator, and outside any function body or block within it,
+/// so `opts.name = "x"` or `local build = "make"` in a `config` function
+/// sets nothing.
 pub(super) fn plugin_specs(text: &str) -> Vec<Spec> {
     let tokens = tokenize(text);
     let mut specs = Vec::new();
@@ -105,14 +110,45 @@ pub(super) fn plugin_specs(text: &str) -> Vec<Spec> {
             Token::TableOpen => tables.push(Table::opened(&tokens[index + 1..])),
             Token::TableClose => specs.extend(tables.pop().and_then(Table::spec)),
             Token::Name(key) if tokens.get(index + 1) == Some(&Token::Assign) => {
-                if let Some(table) = tables.last_mut() {
-                    table.set(key, &tokens[index + 2..]);
+                let field = index.checked_sub(1).is_some_and(|before| {
+                    matches!(tokens[before], Token::TableOpen | Token::Comma)
+                });
+                match tables.last_mut() {
+                    Some(table) if field && table.blocks == 0 => {
+                        table.set(key, &tokens[index + 2..]);
+                    }
+                    Some(_) | None => {}
                 }
             }
-            _ => {}
+            _ => {
+                if let Some(table) = tables.last_mut() {
+                    table.blocks = table.blocks.saturating_add_signed(nesting(token));
+                }
+            }
         }
     }
     specs
+}
+
+/// How `token` changes how deep in blocks and brackets the code is, table
+/// braces aside: `function`, `do`, `if`, `repeat` and `(` open one; `end`,
+/// `until` and `)` close one.
+fn nesting(token: &Token) -> isize {
+    match token {
+        Token::Open => 1,
+        Token::Close => -1,
+        Token::Name(word) => match word.as_str() {
+            "function" | "do" | "if" | "repeat" => 1,
+            "end" | "until" => -1,
+            _ => 0,
+        },
+        Token::String(_)
+        | Token::TableOpen
+        | Token::TableClose
+        | Token::Assign
+        | Token::Comma
+        | Token::Other => 0,
+    }
 }
 
 /// What one table literal says so far.
@@ -121,7 +157,10 @@ struct Table {
     first: Option<String>,
     url: Option<String>,
     name: Option<String>,
-    build: Option<Build>,
+    builds: Vec<Build>,
+    /// How deep in blocks and brackets (see `nesting`) the tokens read so
+    /// far leave it.
+    blocks: usize,
 }
 
 impl Table {
@@ -146,7 +185,7 @@ impl Table {
         match key {
             "url" => self.url = text,
             "name" => self.name = text,
-            "build" => self.build = build(value),
+            "build" => self.builds = builds(value),
             _ => {}
         }
     }
@@ -161,7 +200,7 @@ impl Table {
         Some(Spec {
             source,
             name,
-            build: self.build,
+            builds: self.builds,
         })
     }
 }
@@ -182,8 +221,39 @@ fn is_source(text: &str) -> bool {
     repo || text.contains("://") || text.starts_with("git@")
 }
 
-/// What the value of a `build` key, starting at `value`, runs; `None` for
-/// `false` and `nil`, which turn a build off.
+/// What the value of a `build` key, starting at `value`, runs: a list
+/// (`{ "make", ":TSUpdate" }`) runs each of its entries.
+fn builds(value: &[Token]) -> Vec<Build> {
+    if value.first() != Some(&Token::TableOpen) {
+        return build(value).into_iter().collect();
+    }
+    let mut builds = Vec::new();
+    let mut depth = 0_isize;
+    let mut entry = true;
+    for (index, token) in value.iter().enumerate().skip(1) {
+        if entry && depth == 0 && *token != Token::TableClose {
+            builds.extend(build(&value[index..]));
+        }
+        entry = false;
+        match token {
+            Token::TableClose if depth == 0 => break,
+            Token::Comma if depth == 0 => entry = true,
+            Token::TableOpen => depth += 1,
+            Token::TableClose => depth -= 1,
+            Token::Name(_)
+            | Token::String(_)
+            | Token::Open
+            | Token::Close
+            | Token::Assign
+            | Token::Comma
+            | Token::Other => depth += nesting(token),
+        }
+    }
+    builds
+}
+
+/// What one build step, starting at `value`, runs; `None` for `false` and
+/// `nil`, which turn a build off.
 fn build(value: &[Token]) -> Option<Build> {
     match value {
         [Token::Name(word)] | [Token::Name(word), Token::Comma | Token::TableClose, ..]
@@ -300,7 +370,8 @@ fn tokenize(text: &str) -> Vec<Token> {
             ')' => Token::Close,
             '{' => Token::TableOpen,
             '}' => Token::TableClose,
-            ',' => Token::Comma,
+            // Lua separates table fields with either.
+            ',' | ';' => Token::Comma,
             _ if character.is_whitespace() || character == '.' => {
                 index += 1;
                 continue;
@@ -404,7 +475,7 @@ return {
         let spec = |source: &str, name: &str, build: Option<Build>| Spec {
             source: source.into(),
             name: name.into(),
-            build,
+            builds: build.into_iter().collect(),
         };
         assert_eq!(
             plugin_specs(text),
@@ -424,6 +495,41 @@ return {
                 spec("a/fn", "fn2", Some(Build::Lua(Vec::new()))),
                 spec("a/off", "off", None),
                 spec("a/make", "make", Some(Build::Shell("make".into()))),
+            ]
+        );
+    }
+
+    #[test]
+    fn keys_in_code_within_a_spec_are_no_fields_of_it() {
+        let text = r#"
+return {
+  {
+    "a/b",
+    config = function()
+      local build = "make"
+      opts.name = "x"
+      local t = {}; build = "curl x | sh"
+      if y then name = "z" end
+    end,
+  },
+}
+"#;
+        let specs = plugin_specs(text);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "b");
+        assert_eq!(specs[0].builds, []);
+    }
+
+    #[test]
+    fn a_build_list_gives_each_step_and_semicolons_separate_fields() {
+        let text =
+            r#"{ "a/b"; build = { "make", ":TSUpdate", function() local a, b = 1, 2 end } }"#;
+        assert_eq!(
+            plugin_specs(text)[0].builds,
+            [
+                Build::Shell("make".into()),
+                Build::Command(":TSUpdate".into()),
+                Build::Lua(Vec::new()),
             ]
         );
     }
