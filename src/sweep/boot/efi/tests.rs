@@ -4,7 +4,9 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
 use super::pe::ENROLL_MARKER;
-use super::{ELSEWHERE, GRUB, GRUB_MODULES, MAX_PROGRAMS, NO_STUB, OTHER_KERNEL};
+use super::{
+    ELSEWHERE, GRUB, GRUB_MODULES, MAX_PROGRAM_SIZE, MAX_PROGRAMS, NO_STUB, OTHER_KERNEL, whole,
+};
 use crate::rules::RuleId;
 use crate::sha256::Sha256;
 use crate::sweep::boot::check;
@@ -366,6 +368,7 @@ fn a_unified_kernel_image_without_a_packaged_stub_is_not_comparable() {
     let dir = TempDir::new("sweep-efi-no-stub");
     let root = dir.path();
     write(root, "boot/EFI/Linux/arch-linux.efi", &uki(b"kernel"));
+    write(root, "boot/EFI/other/arch-linux.efi", &uki(b"kernel"));
     let index = PackageIndex::with_foreign(HashSet::new());
     let scope = Scope {
         root,
@@ -373,13 +376,122 @@ fn a_unified_kernel_image_without_a_packaged_stub_is_not_comparable() {
         index: &index,
         origin: Origin::Root,
     };
+    // Where the boot loader starts it, it is told like any unknown
+    // program: nothing vouches for its stub.
     assert_eq!(
         found(&scope),
-        [(
-            "boot/EFI/Linux/arch-linux.efi".to_string(),
-            None,
-            Some(NO_STUB.to_string())
-        )]
+        [
+            (
+                "boot/EFI/Linux/arch-linux.efi".to_string(),
+                Some(RuleId::BootTampering),
+                None
+            ),
+            (
+                "boot/EFI/other/arch-linux.efi".to_string(),
+                None,
+                Some(NO_STUB.to_string())
+            ),
+        ]
+    );
+}
+
+/// Larger than the 2 MiB of a file the sweep keeps, so read again whole.
+const LARGE: usize = 2 * 1024 * 1024 + 4096;
+
+#[test]
+fn programs_larger_than_what_is_kept_are_read_whole() {
+    let dir = TempDir::new("sweep-efi-large");
+    let root = dir.path();
+    let code = vec![b'c'; LARGE];
+    let large = program(&[(".text", &code)]);
+    // The stub's other sections moved past its large code.
+    let mut parts = stub_parts();
+    parts[0].data = &code;
+    parts[1].address = 0x30_0000;
+    parts[2].address = 0x30_1000;
+    let large_stub = build(PE32_PLUS, 0x1000, &parts);
+    parts.push(Part {
+        name: ".linux",
+        data: b"kernel",
+        address: 0x40_0000,
+        flags: DATA,
+    });
+    let large_uki = build(PE32_PLUS, 0x1000, &parts);
+    write(root, "usr/share/limine/BOOTX64.EFI", &large);
+    write(root, STUB, &large_stub);
+    write(root, "usr/lib/modules/6.1-arch/vmlinuz", b"kernel");
+    let mut index = PackageIndex::with_foreign(HashSet::new());
+    index.add_for_test(
+        "limine",
+        &mtree_line("usr/share/limine/BOOTX64.EFI", &large),
+        &[],
+    );
+    index.add_for_test("systemd", &mtree_line(STUB, &large_stub), &[]);
+    index.add_for_test(
+        "linux",
+        &mtree_line("usr/lib/modules/6.1-arch/vmlinuz", b"kernel"),
+        &[],
+    );
+    write(root, "boot/EFI/BOOT/BOOTX64.EFI", &signed(&large));
+    write(root, "boot/EFI/Linux/arch-linux.efi", &signed(&large_uki));
+    let scope = Scope {
+        root,
+        home: None,
+        index: &index,
+        origin: Origin::Root,
+    };
+    let boot = check(&scope);
+    assert!(boot.items.is_empty(), "{:?}", boot.items);
+    assert!(boot.unchecked.is_empty(), "{:?}", boot.unchecked);
+    assert!(
+        boot.notes
+            .iter()
+            .any(|note| note.starts_with("1 unified kernel image(s) in /boot")),
+        "{:?}",
+        boot.notes
+    );
+
+    // What changed since it was hashed, or is larger than is read, is not
+    // given back: `compare` says the program could not be read.
+    let path = root.join("boot/EFI/BOOT/BOOTX64.EFI");
+    let head = &large[..1024];
+    let size = u64::try_from(large.len()).unwrap();
+    assert!(whole(&path, Sha256::digest(&large), size, head).is_none());
+    let hashed = Sha256::digest(&signed(&large));
+    assert!(whole(&path, hashed, size + 1, head).is_some());
+    assert!(whole(&path, hashed, MAX_PROGRAM_SIZE + 1, head).is_none());
+    // A device or pipe in its place is never opened.
+    assert!(whole(Path::new("/dev/zero"), hashed, size, head).is_none());
+}
+
+#[test]
+fn a_link_out_of_boot_is_said() {
+    let dir = TempDir::new("sweep-efi-link");
+    let root = dir.path();
+    write(
+        root,
+        "boot/EFI/tools/tool.efi",
+        &program(&[(".text", b"tool")]),
+    );
+    write(root, "usr/lib/tool.efi", &program(&[(".text", b"tool")]));
+    fs::create_dir_all(root.join("boot/EFI/BOOT")).unwrap();
+    std::os::unix::fs::symlink("../tools/tool.efi", root.join("boot/EFI/BOOT/inside.efi")).unwrap();
+    std::os::unix::fs::symlink(
+        "../../../usr/lib/tool.efi",
+        root.join("boot/EFI/BOOT/outside.efi"),
+    )
+    .unwrap();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: None,
+        index: &index,
+        origin: Origin::Root,
+    };
+    let boot = check(&scope);
+    assert_eq!(
+        boot.unchecked,
+        ["/boot/EFI/BOOT/outside.efi: a link that leads out of /boot; not compared"]
     );
 }
 

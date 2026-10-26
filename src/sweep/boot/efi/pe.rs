@@ -223,7 +223,7 @@ pub(super) fn is_same_program(program: &[u8], packaged: &[u8]) -> bool {
 /// stub's (but the certificate table, which a signature changes), every
 /// section of the stub is in it at the same address with the same flags
 /// and bytes (`.sbat` may have grown), and every other section is one the
-/// UKI format adds and cannot be run. What runs is then the stub's code;
+/// UKI format adds and is not marked executable. What runs is then the stub's code;
 /// the rest is data the stub reads, which the module docs say is compared
 /// only for the kernel.
 pub(super) fn is_built_from(uki: &[u8], stub: &[u8]) -> bool {

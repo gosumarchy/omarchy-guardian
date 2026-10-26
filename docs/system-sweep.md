@@ -754,9 +754,9 @@ bytes.
 | --- | --- |
 | A packaged program, as shipped, signed since, or with the configuration hash enrolled | trusted, only counted |
 | A unified kernel image (UKI) built from systemd's packaged stub around a kernel a kernel package ships | one note; the initramfs and command line inside are built on this machine and are not comparable |
-| A UKI built from the packaged stub around a kernel no installed package ships, in `/boot/EFI/Linux` (where systemd-boot finds UKIs) or whose `.uname` is the running release | a high finding (`boot-tampering`), like a kernel image the machine starts |
+| A UKI built from the packaged stub around a kernel no installed package ships, in one of the directories the boot loaders start from (below) or whose `.uname` is the running release | a high finding (`boot-tampering`), like a kernel image the machine starts |
 | Such a UKI anywhere else | listed with a note and no alert, like an older kernel image |
-| A UKI where no packaged stub is installed to compare it with | listed with a note: not comparable |
+| A UKI where no packaged stub is installed to compare it with | in those directories a high finding (`boot-tampering`); elsewhere listed with a note: not comparable |
 | GRUB's program (`grub*.efi`) where the grub package is installed, which `grub-install` builds on this machine | listed with a note: not comparable |
 | Any other program in `/boot/EFI/BOOT`, `/boot/EFI/limine`, `/boot/EFI/systemd` or `/boot/EFI/Linux` | a high finding (`boot-tampering`) |
 | Any other program elsewhere (another system's boot loader on a shared ESP, a firmware tool) | listed with a note and no alert |
@@ -768,12 +768,13 @@ which `ukify` merges the kernel's entries, may have grown), lists no section
 twice (and no more than 96), has no two sections over the same addresses
 (a section's extent is the larger of its virtual and raw sizes, as a loader
 copies the raw size where the virtual size is 0), and adds only the
-sections the UKI format defines, none of which can be run. A UKI that is not,
+sections the UKI format defines, none of them marked executable. A UKI that is not,
 or a `grub*.efi` where the grub package is not installed, is told like any
 other program: in the directories above, a finding. A program larger than the
 2 MiB kept of every file is read again whole (up to 256 MiB) and checked to
 be the file that was hashed; one that cannot be is not compared, and for the
-root checks the sweep is incomplete.
+root checks the sweep is incomplete. So is a link in `/boot` that leads out of
+it: an ESP has none, and the file it leads to is not compared.
 
 A listed program can be allowed as it is. Nothing from `/boot` goes to the AI
 review: kernel images and EFI programs are judged by these local rules alone,

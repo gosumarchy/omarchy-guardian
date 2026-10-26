@@ -417,7 +417,11 @@ fn an_unread_manifest_is_said_and_only_the_store_mark_keeps_it_from_an_alert() {
     );
     let entry =
         |id: &str, extra: &str| format!(r#""{id}":{{"location":1,"path":"{id}/1"{extra}}}"#);
+    // An unpacked one updates from nowhere: its unread manifest changes
+    // nothing of what is said of it.
+    fs::create_dir_all(root.join("home/u/dev/ext/manifest.json")).unwrap();
     let settings = [
+        format!(r#""{UNPACKED_ID}":{{"location":4,"path":"/home/u/dev/ext"}}"#),
         entry(STORE_ID, r#","from_webstore":true"#),
         entry(PACKAGED_ID, ""),
         entry(ELSEWHERE_ID, ""),
@@ -452,6 +456,11 @@ fn an_unread_manifest_is_said_and_only_the_store_mark_keeps_it_from_an_alert() {
         "{unchecked:?}"
     );
     assert_eq!(unchecked.len(), 2, "{unchecked:?}");
+    assert!(
+        by_id(&items, UNPACKED_ID).unwrap().alerts[0]
+            .1
+            .starts_with("loaded unpacked from /home/u/dev/ext")
+    );
 
     // Marked as from the store: a note, no alert.
     let marked = by_id(&items, STORE_ID).unwrap();

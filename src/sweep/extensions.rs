@@ -221,7 +221,10 @@ pub(super) fn check(scope: &Scope<'_>) -> Extensions {
                 ));
             }
             for extension in extensions.iter().take(MAX_EXTENSIONS) {
-                if let Some(reason) = &extension.unread {
+                // An unpacked one updates from nowhere: its directory is
+                // what is reported.
+                let unpacked = matches!(extension.source, Source::Unpacked(_));
+                if let (Some(reason), false) = (&extension.unread, unpacked) {
                     found.unchecked.push(format!(
                         "{reason}; where /{profile}#extension:{} updates from was not checked",
                         extension.id

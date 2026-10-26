@@ -16,10 +16,11 @@
 //! is compared with the packaged one (see `pe::is_built_from`) and its
 //! kernel with the packaged kernels; its initramfs and command line cannot
 //! be compared. One built from the packaged stub around another kernel is
-//! a finding where systemd-boot finds it (`EFI/Linux`) or where it says it
-//! is the running release, as a kernel image is (see `kernel_images`), and
-//! listed with a note elsewhere; one whose stub is not the packaged one is
-//! told like any unknown program.
+//! a finding in the directories the boot loaders start from or where it
+//! says it is the running release, as a kernel image is (see
+//! `kernel_images`), and listed with a note elsewhere; one whose stub is
+//! not the packaged one, or that no packaged stub is installed to compare
+//! with, is told like any unknown program there.
 //! `grub-install` builds GRUB's program on this machine: where the grub
 //! package is installed, a `grub*.efi` is listed with a note.
 //!
@@ -134,9 +135,6 @@ struct Packaged<'a> {
     running: Option<String>,
 }
 
-/// Where systemd-boot finds UKIs, in lower case (FAT ignores case).
-const UKI_DIRECTORY: &str = "boot/efi/linux/";
-
 /// Compares the EFI programs among `files` (everything under `/boot`)
 /// with the packaged ones; `kernels` are the digests of the packaged
 /// kernel images, for what is inside a UKI.
@@ -190,10 +188,23 @@ pub(super) fn compare(scope: &Scope<'_>, files: &[String], kernels: &[Digest], b
                 };
                 verdict(path, &bytes, &packaged)
             }
-            // FAT, which an ESP is, has no links; one elsewhere in `/boot`
-            // is the boot loader's to follow, and its target is a file of
-            // its own here.
-            Found::Link(_) | Found::Other => continue,
+            // FAT, which an ESP is, has no links. One elsewhere in `/boot`
+            // that leads to a file in `/boot` needs no look: that file is
+            // compared as one of its own. One that leads out of `/boot`,
+            // or nowhere, is not compared, and the sweep says so.
+            Found::Link(target) => {
+                let lands =
+                    read::resolve_where(path, target, &|hop| read::plain_hop(scope.root, hop));
+                if !lands.is_some_and(|lands| lands.starts_with("boot/")) {
+                    not_checked(
+                        scope,
+                        boot,
+                        format!("/{path}: a link that leads out of /boot; not compared"),
+                    );
+                }
+                continue;
+            }
+            Found::Other => continue,
             Found::Unreadable(_) => {
                 unread(scope, boot, path);
                 continue;
@@ -363,7 +374,11 @@ fn unified(path: &str, bytes: &[u8], packaged: &Packaged<'_>) -> Option<Verdict>
     let header = pe::header(bytes)?;
     let kernel = pe::section(bytes, &header, b".linux")?;
     if packaged.stubs.is_empty() {
-        return Some(Verdict::NotComparable(NO_STUB));
+        return Some(if is_started(path) {
+            Verdict::Unknown
+        } else {
+            Verdict::NotComparable(NO_STUB)
+        });
     }
     if !packaged
         .stubs
@@ -381,13 +396,11 @@ fn unified(path: &str, bytes: &[u8], packaged: &Packaged<'_>) -> Option<Verdict>
         .running
         .as_deref()
         .is_some_and(|running| release == Some(running.as_bytes()));
-    Some(
-        if running || path.to_ascii_lowercase().starts_with(UKI_DIRECTORY) {
-            Verdict::StartedKernel
-        } else {
-            Verdict::NotComparable(OTHER_KERNEL)
-        },
-    )
+    Some(if running || is_started(path) {
+        Verdict::StartedKernel
+    } else {
+        Verdict::NotComparable(OTHER_KERNEL)
+    })
 }
 
 #[cfg(test)]

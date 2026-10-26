@@ -255,9 +255,11 @@ fn is_local_only(item: &Item, home: Option<&str>) -> bool {
         Category::Account | Category::BrowserExtension => true,
         // Kernel images and EFI programs are compared with the packaged ones
         // (see `boot`), and one whose bytes read as text is still one of
-        // them: nothing in `/boot` but the boot loader's configuration, which
-        // holds no personal data and whose kernel parameters only the review
-        // reads, goes to the AI.
+        // them: nothing in `/boot` goes to the AI but the boot loader's
+        // configuration. That stays reviewed on purpose: it holds no personal
+        // data, and the local command line check takes whatever it says as
+        // configured, so a parameter planted in `limine.conf` (`init=`,
+        // `rd.shell`) is seen only by the review.
         Category::Boot => path.starts_with("boot/") && !boot::is_configuration(path),
         Category::Trust => named,
         Category::Toolchain => {
