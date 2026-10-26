@@ -779,7 +779,12 @@ fn upstream_follows_makepkg_links_and_never_drops_build_files_silently() {
     let unread: Vec<(&str, String)> = upstream
         .unread
         .iter()
-        .map(|(path, digest)| (path.as_str(), digest.clone()))
+        .map(|(path, digest)| {
+            (
+                path.as_str(),
+                digest.map(|digest| digest.to_string()).unwrap_or_default(),
+            )
+        })
         .collect();
     assert_eq!(
         unread,
@@ -842,11 +847,11 @@ fn an_upstream_image_is_passed_over_only_away_from_where_files_run() {
         srcdest: None,
     };
     let upstream = collect_upstream(&src, &roots, "", 1024 * 1024);
-    let digest = crate::sha256::Sha256::digest(GIF).to_string();
+    let digest = crate::sha256::Sha256::digest(GIF);
     let unread: Vec<&str> = upstream
         .unread
         .iter()
-        .filter(|(_, found)| **found == digest)
+        .filter(|(_, found)| **found == Some(digest))
         .map(|(path, _)| path.as_str())
         .collect();
     assert_eq!(

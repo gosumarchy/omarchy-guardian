@@ -12,6 +12,7 @@ use crate::engine::baseline::{self, Identity, Unit, Unread};
 use crate::engine::store::{Store, VERDICTS};
 use crate::error::Error;
 use crate::report::AgentOutcome;
+use crate::sha256::Digest;
 use crate::test_support::{
     TempDir, mock_opencode, mock_opencode_counting, reviewer_by_content, write_script,
 };
@@ -1012,7 +1013,7 @@ fn a_unit_without_a_baseline_does_not_undo_another_units() {
     let unread = |entries: &[&str]| -> Unread {
         entries
             .iter()
-            .map(|path| ((*path).to_string(), "a".repeat(64)))
+            .map(|path| ((*path).to_string(), Digest::from_hex(&"a".repeat(64))))
             .collect()
     };
     let state = TempDir::new("engine-two-units");
@@ -1070,7 +1071,7 @@ fn a_unit_without_a_baseline_does_not_undo_another_units() {
 
 #[test]
 fn a_new_or_changed_binary_makes_an_upgrade_a_full_review() {
-    let digest = |fill: &str| fill.repeat(64);
+    let digest = |fill: &str| Digest::from_hex(&fill.repeat(64));
     let unread = |entries: &[(&str, &str)]| -> Unread {
         entries
             .iter()

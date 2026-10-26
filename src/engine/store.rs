@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, IoContext};
 use crate::paths::{self, Accept};
-use crate::sha256::Sha256;
+use crate::sha256::{Digest, Sha256};
 use crate::user;
 
 pub(super) const BLOBS: &str = "blobs";
@@ -204,39 +204,30 @@ impl Store {
         Ok(total)
     }
 
-    /// Stores `bytes` under their SHA-256 and returns the hex digest.
-    pub(super) fn put_blob(&self, bytes: &[u8]) -> Result<String, Error> {
-        let digest = Sha256::digest(bytes).to_string();
-        if !self.path(BLOBS, &digest).exists() {
-            self.write(BLOBS, &digest, bytes)?;
+    /// Stores `bytes` under their SHA-256 and returns it.
+    pub(super) fn put_blob(&self, bytes: &[u8]) -> Result<Digest, Error> {
+        let digest = Sha256::digest(bytes);
+        let name = digest.to_string();
+        if !self.path(BLOBS, &name).exists() {
+            self.write(BLOBS, &name, bytes)?;
         }
         Ok(digest)
     }
 
     /// The blob with this digest, or `None` when it is missing or no longer
     /// matches its digest; a corrupt blob is deleted.
-    pub(super) fn get_blob(&self, digest: &str) -> Result<Option<Vec<u8>>, Error> {
-        if !is_hex_digest(digest) {
-            return Ok(None);
-        }
-        let Some(bytes) = self.read(BLOBS, digest)? else {
+    pub(super) fn get_blob(&self, digest: Digest) -> Result<Option<Vec<u8>>, Error> {
+        let name = digest.to_string();
+        let Some(bytes) = self.read(BLOBS, &name)? else {
             return Ok(None);
         };
-        if Sha256::digest(&bytes).to_string() == digest {
+        if Sha256::digest(&bytes) == digest {
             Ok(Some(bytes))
         } else {
-            self.remove(BLOBS, digest)?;
+            self.remove(BLOBS, &name)?;
             Ok(None)
         }
     }
-}
-
-/// A lowercase hex SHA-256 digest, the only names blobs and verdicts use.
-pub(super) fn is_hex_digest(text: &str) -> bool {
-    text.len() == 64
-        && text
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// A read-only summary for `config show`: the number of baselines and the
@@ -267,7 +258,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
-    use super::{BASELINES, BLOBS, Store, TEMP_PREFIX, VERDICTS, is_hex_digest, summary};
+    use super::{BASELINES, BLOBS, Store, TEMP_PREFIX, VERDICTS, summary};
     use crate::test_support::TempDir;
 
     #[test]
@@ -408,22 +399,22 @@ mod tests {
         let store = Store::open(dir.path().join("store")).unwrap();
 
         let digest = store.put_blob(b"hello\n").unwrap();
-        assert!(is_hex_digest(&digest));
         assert_eq!(store.put_blob(b"hello\n").unwrap(), digest);
         assert_eq!(
-            store.get_blob(&digest).unwrap().as_deref(),
+            store.get_blob(digest).unwrap().as_deref(),
             Some(&b"hello\n"[..])
         );
 
         fs::write(
-            dir.path().join("store").join(BLOBS).join(&digest),
+            dir.path()
+                .join("store")
+                .join(BLOBS)
+                .join(digest.to_string()),
             "tampered",
         )
         .unwrap();
-        assert_eq!(store.get_blob(&digest).unwrap(), None);
+        assert_eq!(store.get_blob(digest).unwrap(), None);
         assert!(store.list(BLOBS).unwrap().is_empty());
-
-        assert_eq!(store.get_blob("../../etc/passwd").unwrap(), None);
     }
 
     #[test]

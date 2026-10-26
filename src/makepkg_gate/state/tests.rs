@@ -5,12 +5,22 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
 use super::{Drift, Extraction, Kept, State, binary_changes, identity};
+use crate::sha256::Digest;
 use crate::test_support::TempDir;
 
 fn map(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
     entries
         .iter()
         .map(|(path, digest)| ((*path).to_string(), (*digest).to_string()))
+        .collect()
+}
+
+/// Paths with digests made of `fill` repeated; an empty fill stands for a
+/// file that could not be hashed.
+fn hashed(entries: &[(&str, &str)]) -> BTreeMap<String, Option<Digest>> {
+    entries
+        .iter()
+        .map(|(path, fill)| ((*path).to_string(), Digest::from_hex(&fill.repeat(32))))
         .collect()
 }
 
@@ -63,7 +73,7 @@ fn binaries_and_extractions_round_trip() {
     let dir = TempDir::new("gate-state-files");
     let state = State::open(Some(&dir.path().join("state")), "demo");
     assert_eq!(state.binaries(), None);
-    let binaries = map(&[
+    let binaries = hashed(&[
         ("src/a b/tool", "11"),
         ("src/odd\nname", ""),
         ("src/x", "22"),
@@ -74,7 +84,7 @@ fn binaries_and_extractions_round_trip() {
     assert_eq!(binary_changes(&known, &binaries).1, Vec::<String>::new());
     // A file without a hash always counts as changed.
     assert_eq!(binary_changes(&known, &binaries).0, ["src/odd\\nname"]);
-    let now = map(&[("src/a b/tool", "99"), ("src/new", "33")]);
+    let now = hashed(&[("src/a b/tool", "99"), ("src/new", "33")]);
     let (changed, gone) = binary_changes(&known, &now);
     assert_eq!(changed, ["src/a b/tool", "src/new"]);
     assert_eq!(gone, ["src/odd\\nname", "src/x"]);

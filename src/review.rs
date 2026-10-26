@@ -116,14 +116,14 @@ pub(crate) fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> R
         .files()
         .iter()
         .filter(|file| !is_plain_image_among(&config.root, file, &surroundings))
-        .map(|file| (file.path.clone(), file.sha256.to_string()))
+        .map(|file| (file.path.clone(), Some(file.sha256)))
         // Nobody hashed a skipped directory: without a digest it is never
         // recorded, so a tree with one is always reviewed in full.
         .chain(
             snapshot
                 .skipped()
                 .iter()
-                .map(|skipped| (format!("{}/", skipped.path), String::new())),
+                .map(|skipped| (format!("{}/", skipped.path), None)),
         )
         .collect();
     let unread: Vec<(String, String)> = report

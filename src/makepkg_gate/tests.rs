@@ -327,7 +327,7 @@ fn a_package_of_prebuilt_programs_needs_a_yes_that_is_remembered() {
 
     // A program that could not be hashed is asked about every time.
     let mut unhashed = prebuilt(&step, &upstream, &listed);
-    unhashed.programs.insert("src/huge".into(), String::new());
+    unhashed.programs.insert("src/huge".into(), None);
     assert!(confirm_prebuilt(&step, &unhashed, &mut yes));
     assert!(!confirm_prebuilt(&step, &unhashed, &mut no));
 

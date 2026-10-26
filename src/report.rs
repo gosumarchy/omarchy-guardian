@@ -12,6 +12,7 @@ use crate::error::Error;
 use crate::osv::Audit;
 use crate::rules::{RuleId, Scheme};
 use crate::scan::Snapshot;
+use crate::sha256::Digest;
 
 pub(crate) mod html;
 mod terminal;
@@ -359,8 +360,8 @@ pub(crate) struct ReviewedArchive {
     /// and architecture.
     pub(crate) name: String,
     pub(crate) class: SourceClass,
-    /// Hex SHA-256 of the archive's bytes.
-    pub(crate) sha256: String,
+    /// SHA-256 of the archive's bytes.
+    pub(crate) sha256: Digest,
 }
 
 /// A file one reviewed file runs or reads in as code.

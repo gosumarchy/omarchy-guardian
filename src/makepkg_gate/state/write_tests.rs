@@ -20,6 +20,7 @@ use super::record_tests::{Tree, usable, with_step};
 use super::{Kept, NotKept, State, forget};
 use crate::cli::Confirm;
 use crate::error::Error;
+use crate::sha256::Digest;
 
 const NOT_WRITTEN: &str = "the record of what Guardian extracted could not be written";
 const IN_THE_WAY: &str = "a directory is in the place of the record of what Guardian extracted";
@@ -260,7 +261,9 @@ fn an_answer_that_cannot_be_remembered_is_asked_for_again() {
 
     let reasons = ["line 2: source is set under a condition".to_string()];
     let mut prebuilt = Prebuilt::default();
-    prebuilt.programs.insert("src/tool".into(), "a".repeat(64));
+    prebuilt
+        .programs
+        .insert("src/tool".into(), Digest::from_hex(&"a".repeat(64)));
     let mut yes = Yes(0);
     with_step(&tree, &[], |step| {
         // The yes stands for this build, and is asked for at the next.
@@ -291,7 +294,7 @@ fn binaries_that_cannot_be_recorded_leave_the_earlier_record() {
     let upstream = |tree: &Tree| tree.collected().select(1 << 20);
     with_step(&tree, &[], |step| {
         let first = upstream(&tree);
-        let known: BTreeMap<String, String> = all_binaries(&first);
+        let known: BTreeMap<String, Option<Digest>> = all_binaries(&first);
         assert!(!known.is_empty());
 
         // No earlier record: there is none after, as at a first build.

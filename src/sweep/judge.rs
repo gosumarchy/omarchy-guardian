@@ -182,10 +182,7 @@ fn examine(
             Body::Binary(format) => {
                 // One without a hash is never recorded as approved, so
                 // every sweep that finds it is reviewed in full.
-                let digest = item.sha256.as_ref().map(ToString::to_string);
-                report
-                    .unread
-                    .insert(label.clone(), digest.unwrap_or_default());
+                report.unread.insert(label.clone(), item.sha256);
                 report.hash_only.push(HashOnly {
                     path: label,
                     bytes: 0,

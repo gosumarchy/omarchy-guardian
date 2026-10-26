@@ -22,7 +22,7 @@ use std::time::UNIX_EPOCH;
 
 use crate::error::{Error, IoContext};
 use crate::files::{AtomicWrite, write_atomic};
-use crate::sha256::Sha256;
+use crate::sha256::{Digest, Sha256};
 use crate::user;
 
 mod place;
@@ -289,12 +289,15 @@ impl Extraction {
 
 /// The paths as the record of the binaries keeps them: written so that
 /// each stays one line.
-fn one_line(entries: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+fn one_line(entries: &BTreeMap<String, Option<Digest>>) -> BTreeMap<String, Option<Digest>> {
     entries
         .iter()
-        .map(|(path, digest)| (path.escape_default().to_string(), digest.clone()))
+        .map(|(path, digest)| (path.escape_default().to_string(), *digest))
         .collect()
 }
+
+/// What the record of the binaries holds for one that could not be hashed.
+const UNHASHED: &str = "-";
 
 /// The gate's memory of one package. Without a directory (`Missing`) every
 /// read of an answer or of the binaries is empty, every write is an error,
@@ -384,12 +387,16 @@ impl State {
     }
 
     /// The binaries the sources held at the last build that passed.
-    pub(super) fn binaries(&self) -> Option<BTreeMap<String, String>> {
+    pub(super) fn binaries(&self) -> Option<BTreeMap<String, Option<Digest>>> {
         let text = self.read("binaries")?;
         text.lines()
             .map(|line| {
                 let (digest, path) = line.split_once(' ')?;
-                Some((path.to_string(), digest.to_string()))
+                let digest = match digest {
+                    UNHASHED => None,
+                    hex => Some(Digest::from_hex(hex)?),
+                };
+                Some((path.to_string(), digest))
             })
             .collect()
     }
@@ -397,11 +404,16 @@ impl State {
     /// Keeps the binaries of a build that passed. Where they cannot be
     /// written the record of an earlier build stays, or none: the next
     /// build is then compared with that one, or with none.
-    pub(super) fn record_binaries(&self, binaries: &BTreeMap<String, String>) -> Result<(), Error> {
+    pub(super) fn record_binaries(
+        &self,
+        binaries: &BTreeMap<String, Option<Digest>>,
+    ) -> Result<(), Error> {
         let mut text = String::new();
         for (path, digest) in one_line(binaries) {
-            let digest = if digest.is_empty() { "-" } else { &digest };
-            let _ = writeln!(text, "{digest} {path}");
+            match digest {
+                Some(digest) => _ = writeln!(text, "{digest} {path}"),
+                None => _ = writeln!(text, "{UNHASHED} {path}"),
+            }
         }
         self.write("binaries", &text)
     }
@@ -554,20 +566,15 @@ pub(super) fn forget_all(root: &Path) -> Result<usize, Error> {
 /// How the binaries now differ from the ones remembered, as names for the
 /// user: `(new or changed, gone)`.
 pub(super) fn binary_changes(
-    known: &BTreeMap<String, String>,
-    now: &BTreeMap<String, String>,
+    known: &BTreeMap<String, Option<Digest>>,
+    now: &BTreeMap<String, Option<Digest>>,
 ) -> (Vec<String>, Vec<String>) {
     let now = one_line(now);
+    // A binary that could not be hashed may be anything: it always counts
+    // as changed.
     let changed = now
         .iter()
-        .filter(|(path, digest)| {
-            let digest = if digest.is_empty() {
-                "-"
-            } else {
-                digest.as_str()
-            };
-            digest == "-" || known.get(*path).map(String::as_str) != Some(digest)
-        })
+        .filter(|(path, digest)| digest.is_none() || known.get(*path) != Some(*digest))
         .map(|(path, _)| path.clone())
         .collect();
     let gone = known

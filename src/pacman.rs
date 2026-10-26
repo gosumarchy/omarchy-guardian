@@ -210,7 +210,7 @@ pub(crate) fn review_transaction(args: &HookArgs, settings: &Settings) -> Result
                             report.archives.push(ReviewedArchive {
                                 name: fingerprint.name(),
                                 class,
-                                sha256: fingerprint.digest().to_string(),
+                                sha256: *fingerprint.digest(),
                             });
                             fingerprints.push(fingerprint);
                         }

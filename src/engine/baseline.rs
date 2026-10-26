@@ -15,9 +15,9 @@ use crate::config::model::{AgentSettings, Named, SourceClass};
 use crate::engine::cache;
 use crate::engine::plan::Previous;
 use crate::engine::request::{PROMPT_VERSION, Request};
-use crate::engine::store::{BASELINES, BLOBS, Store, VERDICTS, is_hex_digest};
+use crate::engine::store::{BASELINES, BLOBS, Store, VERDICTS};
 use crate::error::Error;
-use crate::sha256::Sha256;
+use crate::sha256::{Digest, Sha256};
 use crate::time::SECONDS_PER_DAY;
 
 const FORMAT: &str = "omarchy-guardian-baseline 3";
@@ -54,7 +54,8 @@ pub(crate) struct Unit {
 /// What a review did not read (binaries, links, anything that is neither
 /// reviewed text nor a plain image: see `review::is_plain_image`), by path
 /// with its hex SHA-256. An entry without a digest is never recorded.
-pub(crate) type Unread = BTreeMap<String, String>;
+/// `None` stands for a directory that was skipped and so never hashed.
+pub(crate) type Unread = BTreeMap<String, Option<Digest>>;
 
 /// The most paths `unread_changes` names, and the most characters of each.
 const MAX_NAMED_CHANGES: usize = 20;
@@ -73,7 +74,7 @@ pub(super) fn unread_changes(approved: &Approved, current: &Unread) -> Option<St
     let approved = &approved.unread;
     let mut changes: Vec<String> = covered
         .filter_map(|(path, digest)| match approved.get(path) {
-            Some(known) if known == digest && !digest.is_empty() => None,
+            Some(known) if known.is_some() && known == digest => None,
             Some(_) => Some(named(path, "changed")),
             None => Some(named(path, "new")),
         })
@@ -118,13 +119,13 @@ impl Approved {
     }
 }
 
-type Entries = Vec<(String, String)>;
+type Entries = Vec<(Digest, String)>;
 
 struct Manifest {
     identity: String,
     prompt: u32,
     /// `fingerprint` of the agent settings the files were approved under.
-    settings: String,
+    settings: Digest,
     recorded: u64,
     /// When this source last passed a review of all of it, and how many
     /// changed versions were approved as diffs since. A manifest written
@@ -173,7 +174,7 @@ fn due(manifest: &Manifest, now: u64) -> Option<String> {
 /// same ones `cache::key` hashes) and the wording of the prompts and of a
 /// request of `class`, as a hex SHA-256. A prompt changed without a new
 /// `PROMPT_VERSION` still retires the baselines approved under the old one.
-fn fingerprint(settings: &AgentSettings, class: SourceClass) -> String {
+fn fingerprint(settings: &AgentSettings, class: SourceClass) -> Digest {
     let text = format!(
         "omarchy-guardian-baseline-settings\0{}\0{}\0{}\0{}\0",
         settings.model.as_deref().unwrap_or_default(),
@@ -181,7 +182,7 @@ fn fingerprint(settings: &AgentSettings, class: SourceClass) -> String {
         settings.thinking.name(),
         cache::prompt_digest(&Request::fixed_text(class))
     );
-    Sha256::digest(text.as_bytes()).to_string()
+    Sha256::digest(text.as_bytes())
 }
 
 fn manifest_name(class: SourceClass, identity: &Identity) -> String {
@@ -199,11 +200,7 @@ fn parse_manifest(text: &str) -> Option<Manifest> {
     }
     let identity = lines.next()?.strip_prefix("identity ")?.to_string();
     let prompt = lines.next()?.strip_prefix("prompt ")?.parse().ok()?;
-    let settings = lines.next()?.strip_prefix("settings ")?;
-    if !is_hex_digest(settings) {
-        return None;
-    }
-    let settings = settings.to_string();
+    let settings = Digest::from_hex(lines.next()?.strip_prefix("settings ")?)?;
     let recorded = lines.next()?.strip_prefix("recorded ")?.parse().ok()?;
     let mut full = None;
     let mut diffs = None;
@@ -236,10 +233,10 @@ fn parse_manifest(text: &str) -> Option<Manifest> {
             }
             (&mut files, digest, fields.next()?)
         };
-        if !is_hex_digest(digest) || path.is_empty() {
+        if path.is_empty() {
             return None;
         }
-        list.push((digest.to_string(), path.to_string()));
+        list.push((Digest::from_hex(digest)?, path.to_string()));
     }
     Some(Manifest {
         identity,
@@ -327,7 +324,7 @@ fn load_with(
         if store.read(BASELINES, &name)?.is_none() {
             continue;
         }
-        match load_unit(store, &name, unit, &expected, now)? {
+        match load_unit(store, &name, unit, expected, now)? {
             UnitBaseline::Approved { remarks: true, .. } if remarks_are_findings => {
                 loaded.due.push(format!(
                     "the approved version of {} was approved with low AI remarks, which are findings under this profile",
@@ -360,8 +357,8 @@ enum UnitBaseline {
     /// Its files and unread files, by path in the reviewed tree, and
     /// whether it was approved with remarks (see `Manifest::remarks`).
     Approved {
-        files: Entries,
-        unread: Entries,
+        files: Vec<(String, String)>,
+        unread: Unread,
         remarks: bool,
     },
     /// Unreadable, another identity's, or approved under another prompt or
@@ -375,7 +372,7 @@ fn load_unit(
     store: &Store,
     name: &str,
     unit: &Unit,
-    fingerprint: &str,
+    fingerprint: Digest,
     now: Option<u64>,
 ) -> Result<UnitBaseline, Error> {
     let Some(manifest) = read_manifest(store, name)? else {
@@ -394,7 +391,7 @@ fn load_unit(
     let mut files = Vec::with_capacity(manifest.files.len());
     for (digest, path) in manifest.files {
         let Some(content) = store
-            .get_blob(&digest)?
+            .get_blob(digest)?
             .and_then(|bytes| String::from_utf8(bytes).ok())
         else {
             return Ok(UnitBaseline::Stale);
@@ -404,7 +401,7 @@ fn load_unit(
     let unread = manifest
         .unread
         .into_iter()
-        .map(|(digest, path)| (format!("{}{path}", unit.prefix), digest))
+        .map(|(digest, path)| (format!("{}{path}", unit.prefix), Some(digest)))
         .collect();
     Ok(UnitBaseline::Approved {
         files,
@@ -500,15 +497,14 @@ pub(super) fn record_version(
             let Some(path) = path.strip_prefix(unit.prefix.as_str()) else {
                 continue;
             };
-            if path.is_empty()
-                || path.contains('\n')
-                || path.contains('\r')
-                || !is_hex_digest(digest)
-            {
+            let Some(digest) = digest else {
+                continue;
+            };
+            if path.is_empty() || path.contains('\n') || path.contains('\r') {
                 continue;
             }
             let _ = writeln!(entries, "unread {digest} {path}");
-            kept_unread.push((digest.clone(), path.to_string()));
+            kept_unread.push((*digest, path.to_string()));
         }
 
         let name = manifest_name(class, &unit.identity);
@@ -582,7 +578,7 @@ pub(super) fn collect_garbage(store: &Store, max_bytes: u64, now: u64) -> Result
             let digests = manifest
                 .files
                 .into_iter()
-                .map(|(digest, _)| digest)
+                .map(|(digest, _)| digest.to_string())
                 .collect();
             manifests.push((manifest.recorded, name, digests));
         } else {
@@ -619,6 +615,7 @@ mod tests {
     use crate::engine::request::PROMPT_VERSION;
     use crate::engine::store::{BASELINES, BLOBS, Store, VERDICTS};
     use crate::error::Error;
+    use crate::sha256::Digest;
     use crate::test_support::TempDir;
 
     /// The approved text alone, as most tests here need it.
@@ -790,7 +787,7 @@ mod tests {
 
     #[test]
     fn unread_changes_are_named_for_the_review() {
-        let digest = |fill: &str| fill.repeat(64);
+        let digest = |fill: &str| Digest::from_hex(&fill.repeat(64));
         let whole_tree = |unread: Unread| super::Approved {
             unread,
             prefixes: vec![String::new()],
@@ -799,7 +796,7 @@ mod tests {
         let approved = whole_tree(Unread::from([
             ("lib/a.so".to_string(), digest("a")),
             ("lib/b.so".to_string(), digest("b")),
-            ("node_modules/".to_string(), String::new()),
+            ("node_modules/".to_string(), None),
         ]));
         let same = Unread::from([("lib/a.so".to_string(), digest("a"))]);
         assert_eq!(
@@ -813,13 +810,13 @@ mod tests {
         };
         let beside = Unread::from([
             ("lib/a.so".to_string(), digest("a")),
-            ("other/x.so".to_string(), digest("x")),
+            ("other/x.so".to_string(), digest("e")),
         ]);
         assert_eq!(super::unread_changes(&one_unit, &beside), None);
         let current = Unread::from([
             ("lib/a.so".to_string(), digest("c")),
             ("lib/n\"ew.so".to_string(), digest("d")),
-            ("node_modules/".to_string(), String::new()),
+            ("node_modules/".to_string(), None),
         ]);
         let fact = super::unread_changes(&approved, &current).unwrap();
         assert!(fact.contains(
@@ -843,12 +840,12 @@ mod tests {
         let dir = TempDir::new("baseline-unread");
         let store = store(&dir);
         let good = [unit("good/", "theme:good")];
-        let digest = "a".repeat(64);
+        let digest = Digest::from_hex(&"a".repeat(64));
         let unread = Unread::from([
-            ("good/lib/helper.so".to_string(), digest.clone()),
-            ("bad/x.so".to_string(), digest.clone()),
-            ("good/odd\nname".to_string(), digest.clone()),
-            ("good/node_modules/".to_string(), String::new()),
+            ("good/lib/helper.so".to_string(), digest),
+            ("bad/x.so".to_string(), digest),
+            ("good/odd\nname".to_string(), digest),
+            ("good/node_modules/".to_string(), None),
         ]);
         super::record(
             &store,
@@ -1087,7 +1084,10 @@ mod tests {
         .unwrap();
         let name = store.list(BASELINES).unwrap().remove(0);
         let text = String::from_utf8(store.read(BASELINES, &name).unwrap().unwrap()).unwrap();
-        let reworded = text.replace(&aur, &fingerprint(&settings(), SourceClass::Theme));
+        let reworded = text.replace(
+            &aur.to_string(),
+            &fingerprint(&settings(), SourceClass::Theme).to_string(),
+        );
         assert_ne!(reworded, text);
         store.write(BASELINES, &name, reworded.as_bytes()).unwrap();
         assert_eq!(
@@ -1176,7 +1176,7 @@ mod tests {
         );
         assert_eq!(fresh(&store, &units, 700), (true, Vec::new()));
         // A file Guardian does not read that changed is a new version.
-        let unread = Unread::from([("lib.so".to_string(), "a".repeat(64))]);
+        let unread = Unread::from([("lib.so".to_string(), Digest::from_hex(&"a".repeat(64)))]);
         super::record(
             &store,
             SourceClass::Aur,
