@@ -367,10 +367,35 @@ fn python_runs_fetched(command: &Command) -> bool {
         "pipx" => after(command, &["run"]),
         _ => None,
     };
-    run.and_then(|run| run.iter().find(|word| !word.starts_with('-')))
-        .is_some_and(|package| {
-            is_remote_package(package) || (is_unpinned(package) && !package.contains("=="))
-        })
+    run.and_then(fetched_package).is_some_and(|package| {
+        is_remote_package(package) || (is_unpinned(package) && !package.contains("=="))
+    })
+}
+
+/// The package `uvx`, `uv tool run` or `pipx run` fetches out of what
+/// follows it: the value of `--from` (or `--spec`) where it is given,
+/// else the first word that is no flag. The values of the flags that take
+/// one (`--python 3.12`, `--with x`) are not the package.
+fn fetched_package(run: &[String]) -> Option<&str> {
+    let mut words = run.iter();
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "--from" | "--spec" => return words.next().map(String::as_str),
+            "--python" | "-p" | "--with" | "--index" | "--index-url" => {
+                words.next();
+            }
+            flag if flag.starts_with('-') => {
+                if let Some(package) = ["--from=", "--spec="]
+                    .iter()
+                    .find_map(|prefix| flag.strip_prefix(prefix))
+                {
+                    return Some(package);
+                }
+            }
+            package => return Some(package),
+        }
+    }
+    None
 }
 
 /// `go run` or `go install` of a module on another host at whatever its
@@ -550,6 +575,10 @@ mod tests {
             "bunx some-tool",
             "uvx some-tool",
             "uvx --from git+https://x.example/a/b tool",
+            "uvx --from=some-pkg tool",
+            "uvx --python 3.12 some-tool",
+            "uvx -p 3.12.1 --with rich==13.0.0 some-tool",
+            "pipx run --spec some-pkg tool",
             "uv tool run some-tool@latest",
             "pipx run some-tool",
             "go run x.example/a/b/cmd/tool@latest",
@@ -579,6 +608,9 @@ mod tests {
             "pnpm dlx some-tool@3.1.0",
             "uvx some-tool@1.2.3",
             "uvx some-tool==1.2.3 --help",
+            "uvx --python 3.12 some-tool@1.2.3",
+            "uvx --with rich some-tool==1.2.3",
+            "uvx --from some-tool==1.2.3 tool",
             "uv tool install some-tool",
             "uv run pytest",
             "pipx run some-tool==2.0",
