@@ -47,9 +47,12 @@ it shows on hover:
   kept from the AI; where something runs it, that is a finding of its own,
   unless the file only keeps opaque values in secret-named or plainly inert
   variables. The sweep also checks SSH and git files in a home,
-  package-manager configuration and account files locally only, sends a file
-  it found running only where it is plainly a script, and takes plainly
-  written secret values and URL passwords out of what it sends. A secret
+  package-manager configuration, account files and browser extensions (read
+  from the browser profiles' preferences) locally only, sends a file
+  it found running only where it is plainly a script, keeps boot
+  configuration with any boot secret it cannot mask from the AI, and takes
+  plainly written secret values, URL passwords and GRUB password hashes out
+  of what it sends. A secret
   anywhere else goes with its file. Package names and versions from lockfiles
   go to the OSV API (`api.osv.dev`), and an AUR package's name goes to the
   AUR. The `local-only` level sends nothing to an AI; the OSV and AUR lookups
@@ -325,10 +328,12 @@ under [Limitations](docs/limitations.md):
   can rewrite, and the pacman gate reviews as the user who called `sudo`, with
   that user's reviewer login
   ([Limitations](docs/limitations.md#the-limits-that-matter-most)).
-- System sweep: the EFI programs and the inside of the initramfs image are
-  not looked at, and other mounted filesystems are not searched for setuid
-  files; as a user only your own processes can be looked at; without root
-  checks every sweep is incomplete ([System sweep](docs/system-sweep.md)).
+- System sweep: the inside of the initramfs image, and of a unified kernel
+  image except its stub and kernel, is not compared, browser extensions are
+  judged by where they came from and what they were granted, not by their
+  code, and other mounted filesystems are not searched for setuid files; as a
+  user only your own processes can be looked at; without root checks every
+  sweep is incomplete ([System sweep](docs/system-sweep.md)).
 - System sweep: an AI coding agent's hooks and MCP servers are read from your
   own configuration, not from a project's (`.claude/settings.json`,
   `.mcp.json` in a repository), and a configuration file that is a link is

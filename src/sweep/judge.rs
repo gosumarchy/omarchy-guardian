@@ -9,8 +9,8 @@ mod variables;
 use std::fmt::Write as _;
 
 use super::collect::{self, Body, Collection, Item};
-use super::commands;
 use super::tier::Tier;
+use super::{boot, commands};
 use crate::autorun::Category;
 use crate::engine::baseline::{Identity, Unit};
 use crate::engine::plan::HashOnly;
@@ -20,7 +20,7 @@ use crate::report::{Gap, LocalFinding, Report, ReviewScope};
 use crate::review::{self, ReviewContext};
 use crate::rules::RuleId;
 use crate::text::shown;
-use secrets::without_secrets;
+use secrets::{has_boot_secret, without_secrets};
 use variables::sets_only_variables;
 
 #[cfg(test)]
@@ -249,7 +249,23 @@ fn is_local_only(item: &Item, home: Option<&str>) -> bool {
         // The login script is code, not configuration: it is reviewed.
         Category::Ssh if commands::is_ssh_rc(path) => false,
         Category::Ssh | Category::Git => in_home && named,
-        Category::Account => true,
+        // What an extension was granted is checked by the collector's
+        // rules (see `extensions`); its code and the profile it came from
+        // hold personal data and are never sent.
+        Category::Account | Category::BrowserExtension => true,
+        // Kernel images and EFI programs are compared with the packaged ones
+        // (see `boot`), and one whose bytes read as text is still one of
+        // them: nothing in `/boot` goes to the AI but the boot configuration
+        // the catalogue collects (the boot loaders' files, `startup.nsh`,
+        // `refind.conf`). That stays reviewed on purpose: the local command
+        // line check takes whatever it says as configured, so a parameter
+        // planted in `limine.conf` (`init=`, `rd.shell`), or an entry that
+        // starts another program, is seen only by the review. The secret it
+        // can hold is a boot password: a GRUB hash on its exact line is
+        // taken out before it is sent (`without_secrets`), and a file with
+        // any boot secret that rule cannot mask is not sent at all (see
+        // `reading`).
+        Category::Boot => path.starts_with("boot/") && !boot::is_configuration(path),
         Category::Trust => named,
         Category::Toolchain => {
             named
@@ -271,7 +287,8 @@ enum Reading {
     /// Settings that hold tokens, hosts and names: by the rules for that
     /// kind of file, here (see `is_local_only`).
     Settings,
-    /// A file whose path marks it as holding secrets: by the local rules,
+    /// A file whose path marks it as holding secrets, or boot configuration
+    /// with a secret the exact hash rule cannot mask: by the local rules,
     /// here. Nothing lifts this: not that something runs the file, not its
     /// first line. What it starts is followed all the same.
     Secrets,
@@ -290,7 +307,7 @@ impl Reading {
                 "checked locally only and kept from the AI: settings that may hold tokens, hosts or names",
             ),
             Self::Secrets => Some(
-                "checked by the local rules only and kept from the AI: its path marks it as holding secrets",
+                "checked by the local rules only and kept from the AI: it holds secrets (by its path or a boot password)",
             ),
             Self::Unsure => Some(
                 "checked by the local rules only and kept from the AI: nothing says it is a script",
@@ -338,6 +355,11 @@ fn reading(item: &Item, home: Option<&str>, text: &str) -> Reading {
     }
     if is_local_only(item, home) {
         return Reading::Settings;
+    }
+    let is_boot =
+        item.category == Category::Boot || boot::is_configuration(collect::stands_for(item));
+    if is_boot && has_boot_secret(text) {
+        return Reading::Secrets;
     }
     let file = collect::file_of(item);
     if [file, collect::stands_for(item)]
@@ -394,9 +416,14 @@ fn is_run(item: &Item, text: &str) -> bool {
 
 /// Says on each item that is kept from the AI that it is, and why.
 pub(super) fn note_kept(items: &mut [Item], home: Option<&str>) {
-    // An account, a key or a certificate authority is a fact with no text
-    // to send: nothing to say of those.
-    let fact = |item: &Item| matches!(item.category, Category::Account | Category::Trust);
+    // An account, a key, a certificate authority or an extension is a fact
+    // with no text to send: nothing to say of those.
+    let fact = |item: &Item| {
+        matches!(
+            item.category,
+            Category::Account | Category::Trust | Category::BrowserExtension
+        )
+    };
     for item in items
         .iter_mut()
         .filter(|item| !item.is_trusted() && !fact(item))

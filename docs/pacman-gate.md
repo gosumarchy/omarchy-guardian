@@ -176,7 +176,8 @@ an official repository and brings a new file into one of them gets the same
 finding, which says what a file there does: a PAM module in
 `usr/lib/security`, a library in `usr/lib/glibc-hwcaps`, the boot loader's
 configuration and the kernel command line (`etc/default/limine`,
-`etc/kernel/cmdline`, `boot/limine.conf`), the tables the system is set up by
+`etc/default/grub`, `etc/kernel/cmdline`, `boot/limine.conf`,
+`boot/loader/entries`, `boot/grub/grub.cfg` and the others), the tables the system is set up by
 (`etc/fstab`, `etc/crypttab`, `etc/hosts`), a certificate authority in
 `usr/local/share/ca-certificates`, a Podman quadlet in
 `etc/containers/systemd` (it becomes a unit at boot), a system-wide Flatpak

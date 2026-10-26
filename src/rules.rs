@@ -423,7 +423,7 @@ impl RuleId {
         ),
         (
             Self::RiskyConfiguration,
-            "A configuration file redirects where programs, packages or web pages come from, or loads code into a program at every start.",
+            "A configuration file redirects where programs, packages or web pages come from, or loads code into a program at every start; or a browser extension was loaded unpacked, installed from outside the browser's store, or is not signed.",
         ),
         (
             Self::UnexpectedCapability,
@@ -451,7 +451,7 @@ impl RuleId {
         ),
         (
             Self::KeptFromReview,
-            "Something runs this file, or a shell reads it in, and it holds more than opaque values kept in secret-named or plainly inert variables; its path marks it as holding secrets, so the AI review did not read it: only the local rules did. Read it yourself; `sweep allow` records that you did.",
+            "Something runs this file, or a shell reads it in, and it holds more than opaque values kept in secret-named or plainly inert variables; it holds secrets (by its path or a boot password), so the AI review did not read it: only the local rules did. Read it yourself; `sweep allow` records that you did.",
         ),
         (
             Self::RemoteCodeInstall,
