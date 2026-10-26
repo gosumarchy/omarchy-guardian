@@ -249,6 +249,7 @@ impl Places {
             .collect();
         config_dirs.extend(
             variable("XDG_CONFIG_DIRS")
+                .filter(|dirs| !dirs.is_empty())
                 .into_iter()
                 .flat_map(|dirs| dirs.split(':'))
                 .map(|directory| ("XDG_CONFIG_DIRS", directory)),
@@ -1111,6 +1112,10 @@ mod tests {
         // A relative tool home is not replaced by the default.
         assert_eq!(places.cargo, None);
         assert_eq!(places.unfound, [("CARGO_HOME", "cargo".to_string())]);
+
+        // Set to nothing, XDG_CONFIG_DIRS is unset.
+        let empty = [("XDG_CONFIG_DIRS".to_string(), String::new())];
+        assert_eq!(Places::from_variables(Some("home/u"), &empty).unfound, []);
     }
 
     #[test]

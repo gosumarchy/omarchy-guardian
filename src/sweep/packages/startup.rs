@@ -97,14 +97,24 @@ impl Startup {
 
         let mut startup = Self::default();
         let shell = path::start_up_files(scope, &path::start_up_patterns(scope));
-        startup.take(shell, false);
-        startup.take(path::start_up_files(scope, &mise), true);
+        startup.take(shell);
+        let mise = path::start_up_files(scope, &mise);
+        for (file, text) in &mise.files {
+            let text = text.to_ascii_lowercase();
+            if MISE_ENV_FILES
+                .iter()
+                .any(|directive| text.contains(directive))
+            {
+                startup.unreadable.push(format!("/{file}"));
+            }
+        }
+        startup.take(mise);
         startup
     }
 
     /// Notes what `start_up` read and could not read, leaving out what is
     /// not a start-up file.
-    fn take(&mut self, start_up: path::StartUp, is_mise: bool) {
+    fn take(&mut self, start_up: path::StartUp) {
         self.unreadable.extend(
             start_up
                 .unreadable
@@ -113,7 +123,7 @@ impl Startup {
         );
         for (file, text) in &start_up.files {
             if is_start_up(file) {
-                self.scan(file, text, is_mise);
+                self.scan(file, text);
             }
         }
     }
@@ -134,15 +144,8 @@ impl Startup {
     }
 
     /// Notes which tools' variables `file` names.
-    fn scan(&mut self, file: &str, text: &str, is_mise: bool) {
+    fn scan(&mut self, file: &str, text: &str) {
         let text = text.to_ascii_lowercase();
-        if is_mise
-            && MISE_ENV_FILES
-                .iter()
-                .any(|directive| text.contains(directive))
-        {
-            self.unreadable.push(format!("/{file}"));
-        }
         for (variables, files) in [
             (PIP_VARIABLES, &mut self.pip),
             (UV_VARIABLES, &mut self.uv),

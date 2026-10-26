@@ -12,6 +12,7 @@ mod statement;
 use statement::assignments;
 pub(super) use statement::{opaque, unsafe_entries};
 
+use std::collections::VecDeque;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -25,6 +26,7 @@ use super::commands;
 use super::read::{self, Found, View};
 use super::tier::Tier;
 use crate::autorun::Category;
+use crate::files::read_small_file;
 use crate::rules::RuleId;
 use crate::scan::MAX_TEXT_FILE_SIZE;
 use crate::tools::{self, Limits};
@@ -82,8 +84,10 @@ const MANAGED: &[&str] = &[
 ];
 
 /// The start-up files, relative to the home and to the root, whose `PATH`
-/// lines are read and which the language package check searches: what a login, a shell of any kind, the user manager, the session
-/// and Hyprland read. A `*` stands for any run of characters in a name.
+/// lines are read and which the language package check searches: what a
+/// login, a shell of any kind, the user manager, the session and Hyprland
+/// read. A `*` stands for any run of characters in a name. Hyprland's
+/// `source =` lines are not followed.
 const HOME_FILES: &[&str] = &[
     ".profile",
     ".bash_profile",
@@ -244,12 +248,18 @@ pub(super) struct StartUp {
 /// The files `patterns` match (in each name, `*` stands for any run of
 /// characters), and the files those read in with `source` or `.`, which
 /// run as part of them. A link is followed, as the shell follows it. A
-/// file read in by a path with a variable other than the home's in it is
-/// not known, and not read.
+/// file read in by a path with a variable in it other than the home and
+/// `OMARCHY_PATH` is not known, and not read.
+///
+/// The walk is breadth first, so each file is read at the shallowest depth
+/// anything reaches it (Omarchy's `.bash_profile` sources `.bashrc`, which
+/// the shell reads on its own too); a file is counted once, when it is
+/// taken from the queue.
 pub(super) fn start_up_files(scope: &Scope<'_>, patterns: &[String]) -> StartUp {
     let home = scope.home.unwrap_or("root");
+    let omarchy = omarchy_path(scope.root);
     let mut start_up = StartUp::default();
-    let mut pending: Vec<(String, Option<String>, usize)> = Vec::new();
+    let mut pending: VecDeque<(String, Option<String>, usize)> = VecDeque::new();
     for pattern in patterns {
         if pattern.contains('*') {
             let matched = read::matching(scope.root, pattern);
@@ -265,12 +275,11 @@ pub(super) fn start_up_files(scope: &Scope<'_>, patterns: &[String]) -> StartUp 
             );
             pending.extend(matched.files.into_iter().map(|file| (file, None, 0)));
         } else {
-            pending.push((pattern.clone(), None, 0));
+            pending.push_back((pattern.clone(), None, 0));
         }
     }
-    pending.reverse();
     let mut seen: Vec<String> = Vec::new();
-    while let Some((file, by, depth)) = pending.pop() {
+    while let Some((file, by, depth)) = pending.pop_front() {
         if seen.contains(&file) {
             continue;
         }
@@ -286,25 +295,50 @@ pub(super) fn start_up_files(scope: &Scope<'_>, patterns: &[String]) -> StartUp 
         {
             continue;
         }
+        if depth > MAX_SOURCED_DEPTH {
+            start_up.unreadable.push(format!("/{file}"));
+            continue;
+        }
         let Some(text) = start_up_text(scope, &file, by.as_deref()) else {
             start_up.unreadable.push(format!("/{file}"));
             continue;
         };
         for sourced in commands::sourced_files(&text) {
+            let sourced = match omarchy {
+                Some(omarchy) => sourced
+                    .replace("${OMARCHY_PATH}", omarchy)
+                    .replace("$OMARCHY_PATH", omarchy),
+                None if sourced.contains("OMARCHY_PATH") => {
+                    start_up.unreadable.push(sourced);
+                    continue;
+                }
+                None => sourced,
+            };
             let expanded = commands::expand(home, &sourced);
             if let Some(path) = expanded.strip_prefix('/')
                 && !path.contains(['$', '`', '*'])
             {
-                if depth < MAX_SOURCED_DEPTH {
-                    pending.push((path.to_string(), Some(file.clone()), depth + 1));
-                } else {
-                    start_up.unreadable.push(format!("/{path}"));
-                }
+                pending.push_back((path.to_string(), Some(file.clone()), depth + 1));
             }
         }
         start_up.files.push((file, text));
     }
     start_up
+}
+
+/// Where Omarchy is, for a file read in through `$OMARCHY_PATH`: the
+/// default its start-up files set (`: "${OMARCHY_PATH:=/usr/share/omarchy}"`
+/// in `default/bash/rc` and `env-bootstrap`), unless `/etc/omarchy.conf`
+/// names the variable, or is there and cannot be read, and so may move it.
+fn omarchy_path(root: &Path) -> Option<&'static str> {
+    const DEFAULT: &str = "/usr/share/omarchy";
+    let conf = root.join("etc/omarchy.conf");
+    if fs::symlink_metadata(&conf).is_err_and(|error| error.kind() == io::ErrorKind::NotFound) {
+        return Some(DEFAULT);
+    }
+    read_small_file(&conf, MAX_TEXT_FILE_SIZE)
+        .filter(|text| !text.contains("OMARCHY_PATH"))
+        .map(|_| DEFAULT)
 }
 
 /// The text of one start-up file, past a link to it; `None` where it is

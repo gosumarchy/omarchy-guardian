@@ -32,7 +32,8 @@
 //!     pipx environment too old to have a record;
 //!   - a setting exported in a way the start-up files do not show: by
 //!     another program, by a file read in through a path with a variable
-//!     other than the home's in it, or by a project's own `mise.toml`;
+//!     other than the home and `OMARCHY_PATH` in it, by a file Hyprland
+//!     reads with `source =`, or by a project's own `mise.toml`;
 //!   - settings given on a tool's command line, such as `cargo install
 //!     --config 'source.crates-io.replace-with=...'`.
 //! - `sweep allow` on a package item runs the OSV lookup again: the item

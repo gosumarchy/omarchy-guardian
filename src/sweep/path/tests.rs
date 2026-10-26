@@ -571,3 +571,57 @@ fn a_linked_start_up_file_is_read_and_one_that_cannot_be_is_said() {
             .contains(&"home/u/linked/bin".to_string())
     );
 }
+
+#[test]
+fn each_start_up_file_is_read_at_its_shallowest_depth_and_omarchys_path_is_known() {
+    let dir = TempDir::new("sweep-path-depth");
+    let root = dir.path();
+    let write = |path: &str, text: &str| {
+        fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+        fs::write(root.join(path), text).unwrap();
+    };
+    // `.bashrc` is a start-up file of its own as well as read in by
+    // `.bash_profile`: the chain below it is three deep from it.
+    write("home/u/.bash_profile", "source ~/.bashrc\n");
+    write(
+        "home/u/.bashrc",
+        "source ~/a.sh\nsource \"$OMARCHY_PATH/default/bash/rc\"\n",
+    );
+    write("home/u/a.sh", "source ~/b.sh\n");
+    write("home/u/b.sh", "source ~/c.sh\n");
+    write("home/u/c.sh", "true\n");
+    write(
+        "usr/share/omarchy/default/bash/rc",
+        "export PATH=\"$HOME/omarchy-rc/bin:$PATH\"\n",
+    );
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::System,
+    };
+    let read = || super::start_up_files(&scope, &super::start_up_patterns(&scope));
+
+    let start_up = read();
+    let files: Vec<&str> = start_up
+        .files
+        .iter()
+        .map(|(file, _)| file.as_str())
+        .collect();
+    assert!(files.contains(&"home/u/c.sh"), "{files:?}");
+    assert!(
+        files.contains(&"usr/share/omarchy/default/bash/rc"),
+        "{files:?}"
+    );
+    assert!(start_up.unreadable.is_empty(), "{:?}", start_up.unreadable);
+    assert!(
+        search(&scope)
+            .directories
+            .contains(&"home/u/omarchy-rc/bin".to_string())
+    );
+
+    // Where Omarchy's own configuration may move it, it is not known.
+    write("etc/omarchy.conf", "OMARCHY_PATH=/opt/omarchy\n");
+    assert_eq!(read().unreadable, ["$OMARCHY_PATH/default/bash/rc"]);
+}

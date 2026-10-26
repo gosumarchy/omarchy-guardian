@@ -241,11 +241,13 @@ its name is typed.
 `PATH`s: the one the sweep runs with, the systemd user manager's (`systemctl
 --user show-environment`), and the `PATH` lines of everything a login, a shell
 or the session reads: your shell start-up files and the files they `source`
-(three levels deep, 256 files in all, a linked file followed as the shell
-follows it), `/etc/profile` and `/etc/profile.d`,
+(three levels deep from the shallowest file that reaches them, 256 files in
+all, a linked file followed as the shell follows it, and `$OMARCHY_PATH` read
+as `/usr/share/omarchy`, the default Omarchy's own files set, unless
+`/etc/omarchy.conf` names it), `/etc/profile` and `/etc/profile.d`,
 fish's `conf.d`, `environment.d` (yours and the system's),
 `~/.pam_environment`, uwsm's `env` files and Hyprland's `env` lines (Omarchy's
-own included). A line counts wherever on it the statement stands (`[ -d ~/.x ]
+own included). Hyprland's `source =` lines are not followed. A line counts wherever on it the statement stands (`[ -d ~/.x ]
 && export PATH=~/.x:$PATH`, inside an `if`, after `declare -x` or `typeset
 -x`, among other assignments), in the bash, zsh, fish and csh forms. A line
 that sets `PATH` from a command (`PATH=$(…)`) cannot be followed: the file's
@@ -725,7 +727,8 @@ same files the `PATH` check reads
 `/etc/environment`, `environment.d`, `/etc/profile` and `profile.d`, the bash,
 zsh and fish files, uwsm's environment files, Hyprland's `.conf` and `.lua`
 files and Omarchy's defaults for them), the files those read in with `source`
-or `.` (three deep, following links), and mise's configuration, whose `[env]`
+or `.` (as the `PATH` check reads them; Hyprland's `source =` lines are not
+followed), and mise's configuration, whose `[env]`
 mise sets in every shell it is turned on for (`~/.config/mise/config.toml`,
 `config.*.toml` and `conf.d/*.toml` beside it, `~/.config/mise.toml`,
 `~/.mise.toml`, `~/.mise.*.toml`, `~/mise.toml`, `~/mise.*.toml`, and
@@ -832,8 +835,8 @@ package:
   `pipx_metadata.json`;
 - a setting exported in a way the files above do not show: by another
   program, by a file read in through a path with a variable other than the
-  home's in it (such as `source "$OMARCHY_PATH/default/bash/rc"`), or by a
-  project's own `mise.toml` outside the home;
+  home and `OMARCHY_PATH` in it, by a file Hyprland reads with `source =`,
+  or by a project's own `mise.toml` outside the home;
 - a setting given on a tool's command line, such as `cargo install --config
   'source.crates-io.replace-with=...'`.
 
