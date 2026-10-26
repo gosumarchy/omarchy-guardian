@@ -366,21 +366,13 @@ impl Archive {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .map_err(|source| Error::Spawn {
-                tool: "bsdtar".into(),
-                source,
-            })?;
+            .spawning("bsdtar")?;
         let found = child
             .stdout
             .take()
             .ok_or_else(|| failed("no output".into()))
-            .and_then(|stdout| {
-                attributes_in_tar(io::BufReader::with_capacity(1 << 16, stdout))
-                    .map_err(|error| failed(error.to_string()))
-            });
-        let status = child
-            .wait()
-            .map_err(|error| failed(format!("could not wait for exit: {error}")))?;
+            .and_then(|stdout| attributes_in_tar(io::BufReader::with_capacity(1 << 16, stdout)));
+        let status = child.wait().spawning("bsdtar")?;
         let found = found?;
         if !status.success() {
             return Err(failed(
@@ -475,9 +467,7 @@ impl Archive {
                     _ => Err("more was extracted than the listing names".to_string()),
                 }
             });
-        let status = child
-            .wait()
-            .map_err(|error| failed(format!("could not wait for exit: {error}")))?;
+        let status = child.wait().spawning("bsdtar")?;
         let heads = heads.map_err(failed)?;
         if !status.success() {
             return Err(failed("could not be read through for its files".into()));

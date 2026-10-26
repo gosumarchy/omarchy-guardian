@@ -123,6 +123,19 @@ pub(crate) fn already_granted(what: &str, installed: &Metadata) -> bool {
     }
 }
 
+/// A failed read of the tar stream: one that ends inside an entry is cut
+/// short, anything else is bsdtar's output failing to arrive.
+fn unreadable(error: &io::Error) -> Error {
+    if error.kind() == io::ErrorKind::UnexpectedEof {
+        Error::parse("the package's tar stream", "it ends inside an entry")
+    } else {
+        Error::ToolFailed {
+            tool: "bsdtar".into(),
+            detail: format!("its output could not be read: {error}"),
+        }
+    }
+}
+
 /// The entries of an uncompressed pax tar stream whose extended header
 /// carries a `security.*` or `trusted.*` attribute (file capabilities:
 /// root-like rights for whoever runs the file) or an access control list
@@ -139,7 +152,7 @@ pub(super) fn attributes_in_tar(mut stream: impl Read) -> Result<Vec<Attribute>,
             return if error.kind() == io::ErrorKind::UnexpectedEof {
                 Ok(found)
             } else {
-                Err(broken(&error))
+                Err(unreadable(&error))
             };
         }
         if header.iter().all(|byte| *byte == 0) {
@@ -173,7 +186,7 @@ pub(super) fn attributes_in_tar(mut stream: impl Read) -> Result<Vec<Attribute>,
             ];
             stream
                 .read_exact(&mut data)
-                .map_err(|error| broken(&error))?;
+                .map_err(|error| unreadable(&error))?;
             data.truncate(
                 usize::try_from(size)
                     .map_err(|_| broken(&"an entry size too large for this machine"))?,
@@ -204,7 +217,7 @@ pub(super) fn attributes_in_tar(mut stream: impl Read) -> Result<Vec<Attribute>,
             let take = usize::try_from(left.min(8192)).unwrap_or(8192);
             stream
                 .read_exact(&mut sink[..take])
-                .map_err(|error| broken(&error))?;
+                .map_err(|error| unreadable(&error))?;
             left -= take as u64;
         }
     }

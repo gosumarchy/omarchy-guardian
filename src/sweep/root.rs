@@ -480,7 +480,10 @@ pub(super) fn from_root() -> Result<RootPart, Error> {
         .take(MAX_OUTPUT)
         .read_to_string(&mut output);
     let status = child.wait().spawning("sudo")?;
-    read.map_err(|error| Error::parse("the root collector's output", error))?;
+    read.map_err(|error| Error::ToolFailed {
+        tool: "the root collector".into(),
+        detail: format!("its output could not be read: {error}"),
+    })?;
     if !status.success() {
         return Err(Error::Message(format!(
             "the root collector exited with {status}"
