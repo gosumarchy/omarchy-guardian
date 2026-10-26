@@ -2,15 +2,16 @@
 //! content-addressed blobs, baseline manifests and cached verdicts. Only
 //! user-level classes use it; the root pacman gate never opens it.
 
-use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::fs::{self, DirBuilder};
+use std::io;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, IoContext};
+use crate::files::{AtomicWrite, write_atomic};
 use crate::paths::{self, Accept};
 use crate::sha256::{Digest, Sha256};
 use crate::user;
@@ -20,11 +21,6 @@ pub(super) const BASELINES: &str = "baselines";
 pub(super) const VERDICTS: &str = "verdicts";
 
 const TEMP_PREFIX: &str = ".tmp-";
-
-/// Temp file names this many attempts old before `write` gives up: a
-/// leftover from a killed run sharing this pid must not block writes
-/// forever, but a directory that keeps colliding is a sign of real trouble.
-const MAX_TEMP_ATTEMPTS: u32 = 16;
 
 /// Age in seconds beyond which a leftover `.tmp-*` file is swept: a run
 /// killed between opening its temp file and renaming it into place
@@ -84,43 +80,16 @@ impl Store {
     /// renames it into place, so a reader never sees half a file.
     pub(super) fn write(&self, dir: &str, name: &str, bytes: &[u8]) -> Result<(), Error> {
         let target = self.path(dir, name);
-        let (temp, mut file) = self.open_temp(dir)?;
-        let written = file.write_all(bytes).and_then(|()| file.sync_all());
-        drop(file);
-        if let Err(source) = written.and_then(|()| fs::rename(&temp, &target)) {
-            drop(fs::remove_file(&temp));
-            return Err(Error::Io {
-                path: target,
-                source,
-            });
-        }
-        Ok(())
-    }
-
-    /// Opens a fresh, exclusively-created temp file in `dir`. A name already
-    /// taken (a leftover from a past run that reused this pid) is retried
-    /// under the next counter value, bounded so a directory that keeps
-    /// colliding cannot loop forever.
-    fn open_temp(&self, dir: &str) -> Result<(PathBuf, fs::File), Error> {
-        let pid = process::id();
-        let mut attempts = 0u32;
-        loop {
-            let counter = self.temp_counter.fetch_add(1, Ordering::Relaxed);
-            let temp = self.path(dir, &format!("{TEMP_PREFIX}{pid}-{counter}"));
-            attempts += 1;
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&temp)
-            {
-                Ok(file) => return Ok((temp, file)),
-                Err(source)
-                    if source.kind() == io::ErrorKind::AlreadyExists
-                        && attempts < MAX_TEMP_ATTEMPTS => {}
-                Err(source) => return Err(Error::Io { path: temp, source }),
-            }
-        }
+        // Unique to this process and this write, so whatever is under it
+        // was left by a killed run that had this pid: `write_atomic`
+        // removes it first.
+        let counter = self.temp_counter.fetch_add(1, Ordering::Relaxed);
+        let temporary = self.path(dir, &format!("{TEMP_PREFIX}{}-{counter}", process::id()));
+        let options = AtomicWrite {
+            sync: true,
+            ..AtomicWrite::private(temporary)
+        };
+        write_atomic(&target, bytes, &options).at(&target)
     }
 
     /// Deletes `.tmp-*` files older than an hour from every store directory:
@@ -387,10 +356,9 @@ mod tests {
             store.read(VERDICTS, "k").unwrap().as_deref(),
             Some(&b"value"[..])
         );
-        // write() retries under the next counter value; it never touches
-        // the colliding leftover itself (only the garbage-collection sweep
-        // does, once it is old enough).
-        assert!(colliding.exists());
+        // The leftover was this process's name for this write: it was
+        // replaced, and nothing is left under it.
+        assert!(!colliding.exists());
     }
 
     #[test]

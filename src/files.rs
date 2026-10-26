@@ -4,7 +4,7 @@
 
 use std::fs::{self, OpenOptions, Permissions};
 use std::io::{self, Read, Write as _};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt as _, chown};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt as _, fchown};
 use std::path::{Path, PathBuf};
 
 /// `O_NOFOLLOW`, `O_DIRECTORY` and `O_NONBLOCK`. The generic Linux ABI
@@ -84,14 +84,33 @@ impl AtomicWrite {
 /// file beside it, which is then moved over it, so a reader never sees half.
 /// The new file is made new, never written through a link left under its
 /// name, and does not stay behind where any step fails.
+/// With `sync`, the directory is synced after the move too, so the new
+/// name survives a crash as well as the bytes.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8], options: &AtomicWrite) -> io::Result<()> {
     let temporary = &options.temporary;
     drop(fs::remove_file(temporary));
     let written = fill(bytes, options).and_then(|()| fs::rename(temporary, path));
     if written.is_err() {
         drop(fs::remove_file(temporary));
+        return written;
     }
-    written
+    match path.parent() {
+        Some(directory) if options.sync => sync_directory(directory),
+        _ => Ok(()),
+    }
+}
+
+fn sync_directory(directory: &Path) -> io::Result<()> {
+    let directory = if directory.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        directory
+    };
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(O_DIRECTORY)
+        .open(directory)?
+        .sync_all()
 }
 
 fn fill(bytes: &[u8], options: &AtomicWrite) -> io::Result<()> {
@@ -105,13 +124,13 @@ fn fill(bytes: &[u8], options: &AtomicWrite) -> io::Result<()> {
         file.set_permissions(Permissions::from_mode(options.mode))?;
     }
     file.write_all(bytes)?;
+    // On the open file, not by name: the name could be another file by now.
+    if let Some(owner) = &options.owner {
+        fchown(&file, Some(owner.uid), Some(owner.gid))?;
+        file.set_permissions(Permissions::from_mode(owner.mode))?;
+    }
     if options.sync {
         file.sync_all()?;
-    }
-    drop(file);
-    if let Some(owner) = &options.owner {
-        chown(temporary, Some(owner.uid), Some(owner.gid))?;
-        fs::set_permissions(temporary, Permissions::from_mode(owner.mode))?;
     }
     Ok(())
 }
