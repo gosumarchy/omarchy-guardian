@@ -236,7 +236,8 @@ pub(super) fn start_up_patterns(scope: &Scope<'_>) -> Vec<String> {
 #[derive(Debug, Default)]
 pub(super) struct StartUp {
     /// Each file read, relative to the root, with its text, in the order
-    /// read.
+    /// read: of one larger than `MAX_TEXT_FILE_SIZE`, its head, and the file
+    /// is in `unreadable` too.
     pub(super) files: Vec<(String, String)>,
     /// What is there and could not be read, each as said to the user: a
     /// file closed to the sweep, not a regular file or a link to one, too
@@ -299,9 +300,18 @@ pub(super) fn start_up_files(scope: &Scope<'_>, patterns: &[String]) -> StartUp 
             start_up.unreadable.push(format!("/{file}"));
             continue;
         }
-        let Some(text) = start_up_text(scope, &file, by.as_deref()) else {
-            start_up.unreadable.push(format!("/{file}"));
-            continue;
+        let text = match start_up_text(scope, &file, by.as_deref()) {
+            Some(StartUpText::Whole(text)) => text,
+            // Its head is still read for `PATH` lines; what lies past it
+            // is not known.
+            Some(StartUpText::Head(text)) => {
+                start_up.unreadable.push(format!("/{file}"));
+                text
+            }
+            None => {
+                start_up.unreadable.push(format!("/{file}"));
+                continue;
+            }
         };
         for sourced in commands::sourced_files(&text) {
             let sourced = match omarchy {
@@ -330,6 +340,9 @@ pub(super) fn start_up_files(scope: &Scope<'_>, patterns: &[String]) -> StartUp 
 /// default its start-up files set (`: "${OMARCHY_PATH:=/usr/share/omarchy}"`
 /// in `default/bash/rc` and `env-bootstrap`), unless `/etc/omarchy.conf`
 /// names the variable, or is there and cannot be read, and so may move it.
+/// Only `$OMARCHY_PATH` and `${OMARCHY_PATH}` are read as Omarchy's path;
+/// other forms of the variable are not followed. A conf that sets it
+/// without naming it (through another file it reads) is not seen.
 fn omarchy_path(root: &Path) -> Option<&'static str> {
     const DEFAULT: &str = "/usr/share/omarchy";
     let conf = root.join("etc/omarchy.conf");
@@ -341,9 +354,16 @@ fn omarchy_path(root: &Path) -> Option<&'static str> {
         .map(|_| DEFAULT)
 }
 
+/// What one start-up file holds, as far as it is read.
+enum StartUpText {
+    Whole(String),
+    /// The first `MAX_TEXT_FILE_SIZE` bytes and one more of a larger file.
+    Head(String),
+}
+
 /// The text of one start-up file, past a link to it; `None` where it is
-/// not a regular file within the size the review reads, or cannot be read.
-fn start_up_text(scope: &Scope<'_>, file: &str, by: Option<&str>) -> Option<String> {
+/// not a regular file or cannot be read.
+fn start_up_text(scope: &Scope<'_>, file: &str, by: Option<&str>) -> Option<StartUpText> {
     // A file another one reads in is named by that file: root looks at it
     // as it looks at anything a file leads to.
     let found = match collect::look(scope, Category::Shell, file, by) {
@@ -353,12 +373,15 @@ fn start_up_text(scope: &Scope<'_>, file: &str, by: Option<&str>) -> Option<Stri
         }
         found => found,
     };
-    match found {
-        Found::File { size, head, .. } if size <= MAX_TEXT_FILE_SIZE => {
-            Some(String::from_utf8_lossy(&head).into_owned())
-        }
-        Found::File { .. } | Found::Link(_) | Found::Other | Found::Unreadable(_) => None,
-    }
+    let Found::File { size, head, .. } = found else {
+        return None;
+    };
+    let text = String::from_utf8_lossy(&head).into_owned();
+    Some(if size <= MAX_TEXT_FILE_SIZE {
+        StartUpText::Whole(text)
+    } else {
+        StartUpText::Head(text)
+    })
 }
 
 /// Whether mise is installed where it usually is.

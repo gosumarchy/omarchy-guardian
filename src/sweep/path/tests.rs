@@ -625,3 +625,29 @@ fn each_start_up_file_is_read_at_its_shallowest_depth_and_omarchys_path_is_known
     write("etc/omarchy.conf", "OMARCHY_PATH=/opt/omarchy\n");
     assert_eq!(read().unreadable, ["$OMARCHY_PATH/default/bash/rc"]);
 }
+
+#[test]
+fn an_oversize_start_up_file_is_read_in_part_and_said() {
+    let dir = TempDir::new("sweep-path-oversize");
+    let root = dir.path();
+    let mut text = "export PATH=\"$HOME/big/bin:$PATH\"\n".to_string();
+    text.push_str(&"#".repeat(3 * 1024 * 1024));
+    fs::create_dir_all(root.join("home/u")).unwrap();
+    fs::write(root.join("home/u/.bashrc"), text).unwrap();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::System,
+    };
+
+    let start_up = super::start_up_files(&scope, &super::start_up_patterns(&scope));
+
+    assert_eq!(start_up.unreadable, ["/home/u/.bashrc"]);
+    assert!(
+        search(&scope)
+            .directories
+            .contains(&"home/u/big/bin".to_string())
+    );
+}

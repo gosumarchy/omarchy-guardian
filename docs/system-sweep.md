@@ -248,7 +248,11 @@ as `/usr/share/omarchy`, the default Omarchy's own files set, unless
 `/etc/omarchy.conf` names it), `/etc/profile` and `/etc/profile.d`,
 fish's `conf.d`, `environment.d` (yours and the system's),
 `~/.pam_environment`, uwsm's `env` files and Hyprland's `env` lines (Omarchy's
-own included). Hyprland's `source =` lines are not followed. A line counts wherever on it the statement stands (`[ -d ~/.x ]
+own included). Only `$OMARCHY_PATH` and `${OMARCHY_PATH}` are read as Omarchy's
+path; other forms of the variable are not followed, and a conf that sets it
+some other way is not seen. Hyprland's `source =` lines are not followed. Of a
+file over 2 MiB the first 2 MiB are read. A line counts wherever on it the
+statement stands (`[ -d ~/.x ]
 && export PATH=~/.x:$PATH`, inside an `if`, after `declare -x` or `typeset
 -x`, among other assignments), in the bash, zsh, fish and csh forms. A line
 that sets `PATH` from a command (`PATH=$(…)`) cannot be followed: the file's
