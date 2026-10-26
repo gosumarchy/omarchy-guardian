@@ -465,7 +465,8 @@ fn plugin_root_not_followed(line: &str, runs: &[String]) -> Option<String> {
 
 /// Whether `line` names the plugin's variable other than to expand it, as
 /// an assignment or an argument does: `CLAUDE_PLUGIN_ROOT` not right after
-/// `$` or `${`. A longer name that holds it (`MY_CLAUDE_PLUGIN_ROOT`,
+/// `$` or `${`, or after `${` with `:=` or `=`, which assigns the default
+/// once the variable is unset. A longer name that holds it (`MY_CLAUDE_PLUGIN_ROOT`,
 /// `CLAUDE_PLUGIN_ROOTS`) counts too: telling it apart is what let an
 /// option with the name attached (`env -uCLAUDE_PLUGIN_ROOT`, `printf
 /// -vCLAUDE_PLUGIN_ROOT`) through, and such a name only adds a note.
@@ -473,17 +474,21 @@ fn changes_plugin_root(line: &str) -> bool {
     let line = without_quoting(line);
     line.match_indices(PLUGIN_ROOT).any(|(at, _)| {
         let before = &line[..at];
-        !before.ends_with('$') && !before.ends_with("${")
+        let after = &line[at + PLUGIN_ROOT.len()..];
+        let assigns = after.starts_with(":=") || after.starts_with('=');
+        !(before.ends_with('$') || (before.ends_with("${") && !assigns))
     })
 }
 
 /// `line` with what the shell takes out before a command sees its words:
 /// quotes, a backslash, and a backslash-newline pair
-/// (`unset CLAUDE_PLUGIN_RO""OT` unsets the variable). `$'…'` and `$"…"`
-/// are quotes too, so the `$` that opens one goes with it; otherwise
-/// `unset $'CLAUDE_PLUGIN_ROOT'` would read as an expansion. Text such as
-/// `"$"CLAUDE_PLUGIN_ROOT`, or a pair inside single quotes, then gets a
-/// note it does not need, which errs toward saying more.
+/// (`unset CLAUDE_PLUGIN_RO""OT` unsets the variable). A `$` that does
+/// not start `$name` or `${` in the line as written goes too: it may open
+/// `$'…'` or `$"…"`, also after a backslash or under `eval`
+/// (`eval unset \$\"CLAUDE_PLUGIN_ROOT\"`), and kept, it would make the
+/// name read as an expansion. Text such as `"$"CLAUDE_PLUGIN_ROOT`, or a
+/// pair inside single quotes, then gets a note it does not need, which
+/// errs toward saying more.
 fn without_quoting(line: &str) -> String {
     let mut kept = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
@@ -492,8 +497,11 @@ fn without_quoting(line: &str) -> String {
             chars.next();
             continue;
         }
-        let opens_quote = c == '$' && matches!(chars.peek(), Some('\'' | '"'));
-        if !opens_quote && !matches!(c, '\'' | '"' | '\\') {
+        let expands = c == '$'
+            && chars
+                .peek()
+                .is_some_and(|&next| next == '{' || next == '_' || next.is_ascii_alphabetic());
+        if (c != '$' || expands) && !matches!(c, '\'' | '"' | '\\') {
             kept.push(c);
         }
     }
