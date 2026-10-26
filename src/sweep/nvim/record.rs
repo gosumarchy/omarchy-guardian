@@ -149,6 +149,15 @@ pub(crate) fn plan(
         };
         plugin.review = match &recorded {
             Ok(Some(files)) => changes(root, &path, plugin, files.get(&plugin.name)),
+            // Trust on first use, the owner's decision: the first sweep
+            // runs neither the text rules nor the AI on plugin code that
+            // is already there. On a stock LazyVim install (51 plugins,
+            // some 3,500 code files) the local text rules alone gave 57
+            // findings in 13 plugins, matching what plugins do as a rule
+            // (start shells, fetch from the network), and an AI review of
+            // all that code would be one very large review. The build,
+            // origin and git checks still run on every sweep, and what
+            // changes after this goes to the review.
             Ok(None) => {
                 item.notes.push(FIRST_SIGHT.into());
                 Review::Baseline
