@@ -18,7 +18,7 @@ use std::io;
 use std::path::Path;
 use std::rc::Rc;
 
-use super::config::{self, NpmConfig, PipConfig, Places};
+use super::config::{self, IndexConfig, NpmConfig, Places};
 use crate::deps::Ecosystem;
 use crate::files::read_small_file;
 use crate::json::Json;
@@ -94,8 +94,14 @@ pub(super) struct Inventory {
 /// Reads what is installed under `root` in `places`.
 pub(super) fn collect(root: &Path, places: &Places) -> Inventory {
     let npm = NpmConfig::read(root, places);
-    let pip = PipConfig::read(root, places);
-    let mut walk = Walk::new(root, &npm, pip.other_index);
+    let pip = IndexConfig::pip(root, places);
+    let uv = IndexConfig::uv(root, places);
+    let mut walk = Walk::new(
+        root,
+        &npm,
+        Source::configured(&pip),
+        Source::configured(&uv),
+    );
 
     let mut global = vec!["usr/lib/node_modules".to_string()];
     global.extend(
@@ -133,6 +139,12 @@ pub(super) fn collect(root: &Path, places: &Places) -> Inventory {
             text::shown(&format!("/{file}"))
         ));
     }
+    for file in &uv.unreadable {
+        inventory.unchecked.push(format!(
+            "{} could not be read (a link, closed, too large, or not TOML): it may name a private index, so no Python package mise installed through uv was looked up in OSV",
+            text::shown(&format!("/{file}"))
+        ));
+    }
     inventory
 }
 
@@ -151,6 +163,17 @@ enum Source {
     /// Another registry or index, an address, git or a local path: its
     /// name may be private.
     Elsewhere,
+}
+
+impl Source {
+    /// Where what pip or uv installs comes from, by its configuration.
+    fn configured(config: &IndexConfig) -> Self {
+        if config.other_index {
+            Self::Elsewhere
+        } else {
+            Self::Public
+        }
+    }
 }
 
 /// How mise installed a tool, by the name of its directory under
@@ -185,20 +208,34 @@ impl Backend {
 }
 
 /// What an npm hidden lockfile (`node_modules/.package-lock.json`)
-/// records of the address each package below it came from, by its path
-/// relative to `base`, the directory that holds that `node_modules`.
+/// records of where each package below it came from, by its path relative
+/// to `base`, the directory that holds that `node_modules`. A path it does
+/// not hold came from no registry it knows of (a link, git, a tarball of
+/// its own), as far as the walk can tell.
 #[derive(Debug)]
 struct Lock {
     base: String,
-    resolved: HashMap<String, String>,
+    recorded: HashMap<String, Recorded>,
+}
+
+/// Where a lockfile says a package came from.
+#[derive(Debug)]
+enum Recorded {
+    /// The address it was fetched from.
+    At(String),
+    /// Inside the tarball of the package above it (`inBundle`), which
+    /// records no address of its own.
+    Bundled,
 }
 
 /// A walk over the places packages are kept, within the limits.
 struct Walk<'a> {
     root: &'a Path,
     npm: &'a NpmConfig,
-    /// pip's configuration names an index other than the Python Package Index.
-    pip_other_index: bool,
+    /// Where what pip installs comes from, by its configuration.
+    pip: Source,
+    /// The same for uv.
+    uv: Source,
     inventory: Inventory,
     entries: usize,
     /// A limit was reached: nothing more is read.
@@ -216,11 +253,12 @@ struct Walk<'a> {
 }
 
 impl<'a> Walk<'a> {
-    fn new(root: &'a Path, npm: &'a NpmConfig, pip_other_index: bool) -> Self {
+    fn new(root: &'a Path, npm: &'a NpmConfig, pip: Source, uv: Source) -> Self {
         Self {
             root,
             npm,
-            pip_other_index,
+            pip,
+            uv,
             inventory: Inventory::default(),
             entries: 0,
             full: false,
@@ -360,13 +398,19 @@ impl<'a> Walk<'a> {
             MAX_LIST_BYTES,
         )?;
         let json = Json::parse(&text).ok()?;
-        let resolved = json
+        let recorded = json
             .get("packages")?
             .as_object()?
             .iter()
             .filter_map(|(path, entry)| {
-                let resolved = entry.get("resolved")?.as_str()?;
-                Some((path.clone(), resolved.to_string()))
+                let recorded = match entry.get("resolved").and_then(Json::as_str) {
+                    Some(resolved) => Recorded::At(resolved.to_string()),
+                    None if entry.get("inBundle").and_then(Json::as_bool) == Some(true) => {
+                        Recorded::Bundled
+                    }
+                    None => return None,
+                };
+                Some((path.clone(), recorded))
             })
             .collect();
         let base = node_modules
@@ -374,7 +418,7 @@ impl<'a> Walk<'a> {
             .unwrap_or(node_modules);
         Some(Lock {
             base: base.to_string(),
-            resolved,
+            recorded,
         })
     }
 
@@ -417,14 +461,30 @@ impl<'a> Walk<'a> {
                 .and_then(Json::as_str)
                 .map(str::to_string)
         };
-        let from_lock = lock.and_then(|lock| {
-            let path = directory.strip_prefix(&format!("{}/", lock.base))?;
-            lock.resolved.get(path).cloned()
-        });
-        let resolved = from_lock.or_else(|| field("_resolved"));
         match (field("name"), field("version")) {
             (Some(name), Some(version)) => {
-                let source = if self.npm.is_public(&name, resolved.as_deref()) {
+                let public = match lock {
+                    Some(lock) => {
+                        let path = directory
+                            .strip_prefix(&format!("{}/", lock.base))
+                            .unwrap_or(directory);
+                        match lock.recorded.get(path) {
+                            Some(Recorded::At(resolved)) => {
+                                self.npm.is_public(&name, Some(resolved))
+                            }
+                            Some(Recorded::Bundled) => self.npm.is_public(&name, None),
+                            // A lockfile records every package directly in
+                            // its own `node_modules`; one deeper down may
+                            // have a lockfile of its own that was not read.
+                            None if is_top_level(path) => false,
+                            None => self.npm.is_public(&name, field("_resolved").as_deref()),
+                        }
+                    }
+                    // npm 7 and later write `_resolved` no more: without
+                    // a lockfile, the registry npm is set to use decides.
+                    None => self.npm.is_public(&name, field("_resolved").as_deref()),
+                };
+                let source = if public {
                     Source::Public
                 } else {
                     Source::Elsewhere
@@ -450,7 +510,9 @@ impl<'a> Walk<'a> {
             }
             let path = format!("{venvs}/{venv}");
             match kind {
-                Entry::Directory if !self.pipx_venv(&path) => self.unreadable.push(path),
+                Entry::Directory if !self.pipx_venv(&path) && !self.full => {
+                    self.unreadable.push(path);
+                }
                 Entry::Link => self.linked.push(path),
                 Entry::Directory | Entry::Other => {}
             }
@@ -459,12 +521,29 @@ impl<'a> Walk<'a> {
 
     /// One pipx environment; returns whether it had a `site-packages`.
     fn pipx_venv(&mut self, venv: &str) -> bool {
-        let source = if self.pip_other_index || self.pipx_other_index(venv) {
+        let source = if self.pipx_other_index(venv) {
             Source::Elsewhere
         } else {
-            Source::Public
+            self.pip
         };
         self.pythons(venv, source)
+    }
+
+    /// One environment uv installed a tool in; returns whether it had a
+    /// `site-packages`.
+    fn uv_tool(&mut self, env: &str) -> bool {
+        let receipt = self.root.join(format!("{env}/uv-receipt.toml"));
+        let recorded_elsewhere = match fs::symlink_metadata(&receipt) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            _ => read_small_file(&receipt, MAX_MANIFEST_BYTES)
+                .is_none_or(|text| config::uv_receipt_other_index(&text)),
+        };
+        let source = if recorded_elsewhere {
+            Source::Elsewhere
+        } else {
+            self.uv
+        };
+        self.pythons(env, source)
     }
 
     /// Whether pipx installed the environment `venv` with pip arguments
@@ -541,11 +620,17 @@ impl<'a> Walk<'a> {
         }
     }
 
-    /// Every crate cargo recorded in `file` (a `.crates2.json`), if there
-    /// is one.
-    fn crates(&mut self, file: &str) {
-        if self.entry(file).is_none() {
-            return;
+    /// Every crate cargo recorded in `file` (a `.crates2.json`); returns
+    /// whether anything is at that path (a link is said, not read).
+    fn crates(&mut self, file: &str) -> bool {
+        match self.entry(file) {
+            None => return false,
+            Some(Entry::Link) => return true,
+            Some(Entry::Directory) => {
+                self.unreadable.push(file.to_string());
+                return true;
+            }
+            Some(Entry::Other) => {}
         }
         let json = read_small_file(&self.root.join(file), MAX_LIST_BYTES)
             .and_then(|text| Json::parse(&text).ok());
@@ -555,14 +640,15 @@ impl<'a> Walk<'a> {
             .and_then(Json::as_object)
         else {
             self.unreadable.push(file.to_string());
-            return;
+            return true;
         };
+        let mut odd = false;
         for (key, _) in installs {
             if self.full {
-                return;
+                break;
             }
             let Some((name, version, source)) = crate_key(key) else {
-                self.unreadable.push(file.to_string());
+                odd = true;
                 continue;
             };
             let package = Package {
@@ -577,6 +663,10 @@ impl<'a> Walk<'a> {
             };
             self.add(package, file, source);
         }
+        if odd {
+            self.unreadable.push(file.to_string());
+        }
+        true
     }
 
     /// What mise installed under `installs` through a backend OSV has an
@@ -618,12 +708,7 @@ impl<'a> Walk<'a> {
                 }
                 true
             }
-            Backend::Cargo => {
-                let file = format!("{directory}/.crates2.json");
-                let there = self.entry(&file).is_some();
-                self.crates(&file);
-                there
-            }
+            Backend::Cargo => self.crates(&format!("{directory}/.crates2.json")),
             // mise points pipx's home (`venvs/<package>`) or uv's tool
             // directory (`<package>`) at the install directory.
             Backend::Pipx => {
@@ -639,19 +724,12 @@ impl<'a> Walk<'a> {
                                 }
                             }
                         }
-                        (_, Entry::Directory) => found |= self.pipx_venv(&path),
+                        (_, Entry::Directory) => found |= self.uv_tool(&path),
                     }
                 }
                 found
             }
-            Backend::Python => {
-                let source = if self.pip_other_index {
-                    Source::Elsewhere
-                } else {
-                    Source::Public
-                };
-                self.pythons(directory, source)
-            }
+            Backend::Python => self.pythons(directory, self.pip),
         };
         if !found && !self.full {
             self.unreadable.push(directory.to_string());
@@ -695,6 +773,16 @@ impl<'a> Walk<'a> {
         }
         self.inventory
     }
+}
+
+/// Whether `path`, relative to a lockfile's base, is a package directly in
+/// its `node_modules` (`node_modules/a`, `node_modules/@scope/a`).
+fn is_top_level(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("node_modules/") else {
+        return false;
+    };
+    let depth = if rest.starts_with('@') { 2 } else { 1 };
+    rest.split('/').count() == depth
 }
 
 /// The first `NAMED` of `names`, each after `before`, and whether there are

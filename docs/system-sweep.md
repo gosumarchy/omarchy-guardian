@@ -416,7 +416,7 @@ looked up in [OSV](https://osv.dev), and a version OSV lists as malicious (an
 advisory whose id starts with `MAL-`) is a high finding. Other advisories
 (known vulnerabilities) are not reported here.
 
-What is read, never run, and never followed through a link:
+What is read (no tool is run; for links, see below):
 
 - global npm packages: `/usr/lib/node_modules`, the `lib/node_modules` under
   the `prefix` your npm configuration sets, and each node mise installed, with
@@ -442,16 +442,31 @@ A package whose name may be private is not sent anywhere. Only packages from
 the public registry go to OSV: npm packages from `registry.npmjs.org` (or
 Yarn's copy of it), Python packages from PyPI, crates from crates.io. Where an
 npm package came from is read from npm's hidden lockfile
-(`node_modules/.package-lock.json`), from `_resolved` in its `package.json`,
-or else from the `registry` (or the scope's own `@scope:registry`) npm is set
-to use. A Python package installed from an address or a local directory (it
-has a `direct_url.json`), every package of a pipx environment installed with
-another index (`--index-url`, `--extra-index-url`, `--find-links`, as pipx
-records them), and every Python package at all where pip's configuration
-(`/etc/pip.conf`, `~/.config/pip/pip.conf`, `~/.pip/pip.conf`,
-`PIP_CONFIG_FILE`, `PIP_INDEX_URL` and the like) names an index other than
-PyPI or any extra index, are left out; so are crates from git, a path or
-another registry. What is left out this way is said as not checked, so a
+(`node_modules/.package-lock.json`); a package directly in a `node_modules`
+whose lockfile records no address for it is left out. Where there is no
+lockfile, or for a package deeper down that the lockfile does not record
+(it may have a lockfile of its own, which is not read), `_resolved` in its
+`package.json` decides, or else the `registry` (or the scope's own
+`@scope:registry`) npm is set to use; npm 7 and later write no `_resolved`,
+so a package without a lockfile entry installed from git or a tarball under
+an unscoped name can still be sent. A Python package installed from an
+address or a local directory (it has a `direct_url.json`), every package of
+a pipx environment installed with another index (`--index-url`,
+`--extra-index-url`, `--find-links`, as pipx records them), and every
+Python package at all where pip's configuration (`/etc/pip.conf`,
+`/etc/xdg/pip/pip.conf`, `~/.config/pip/pip.conf`, `~/.pip/pip.conf`, the
+`pip/pip.conf` under `XDG_CONFIG_HOME` and each of `XDG_CONFIG_DIRS`,
+`PIP_CONFIG_FILE`, `PIP_INDEX_URL` and the like) sets `index-url`,
+`extra-index-url` or `find-links` to anything but PyPI, are left out. For
+what mise installed through uv, uv's settings decide instead: any index
+setting in `uv.toml` (`/etc/uv/uv.toml`, `/etc/xdg/uv/uv.toml`,
+`~/.config/uv/uv.toml`, the `uv/uv.toml` under the XDG directories,
+`UV_CONFIG_FILE`) or the environment (`UV_INDEX`, `UV_DEFAULT_INDEX`,
+`UV_INDEX_URL`, `UV_EXTRA_INDEX_URL`, `UV_FIND_LINKS`), PyPI named as one
+included, leaves them all out, and a tool whose `uv-receipt.toml` records a
+git, address, path or index source is left out. A `uv.toml` in the directory
+mise ran uv from is not known and not read. Crates from git, a path or
+another registry are left out too. What is left out this way is said as not checked, so a
 machine with such packages has an incomplete sweep.
 
 At every sweep the rest of the inventory goes to OSV: the ecosystem, the name
@@ -474,11 +489,11 @@ cannot be read or names no package and version, an environment with no
 packages nested deeper than 8 levels, a package OSV listed more advisories for
 than one answer holds, and a request to OSV that failed (offline, OSV down),
 whose packages are each said as not checked, never as clear: one failed
-lookup leaves every package of its ecosystem not checked. An npm or pip
-configuration file that is there and cannot be read (a link, closed, or over
-1 MiB) is said as well, by its path alone: the npm prefix it may set is not
-looked at, and no Python package is looked up, since it may name a private
-index. A link below where the tools keep their packages (a package directory
+lookup leaves every package of its ecosystem not checked. An npm, pip or uv
+configuration file that is there and cannot be read (a link, closed, over
+1 MiB, or for uv not TOML) is said as well, by its path alone: the npm prefix
+it may set is not looked at, and no Python package pip (or uv) installed is
+looked up, since it may name a private index. A link below where the tools keep their packages (a package directory
 `npm link` made, a linked environment, `lib`, `site-packages` or
 `node_modules`) is not followed, and a note names it; a link among the parts
 of such a place itself (an npm prefix, `CARGO_HOME`, mise's or pipx's home, a
@@ -494,7 +509,7 @@ installs, which is how most malicious npm packages act, and how to turn them
 off (`npm config set ignore-scripts true`). It is said once, and again should
 it stop and come back. Only `prefix`, `ignore-scripts`, `registry` and the
 scopes' registries are taken from npm's files, and only the index settings
-from pip's; these files hold registry tokens, and nothing of them is shown or
+from pip's and uv's; these files hold registry tokens, and nothing of them is shown or
 sent.
 
 ### Guardian's own units

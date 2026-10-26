@@ -621,6 +621,13 @@ fn mises_python_and_private_sources_are_told_apart() {
         "corp-dep",
         "1.0.0",
     );
+    // The lockfile records no address for it, as for one from a git host.
+    npm(
+        root,
+        &format!("{top}/tool/node_modules/unrecorded"),
+        "unrecorded",
+        "1.0.0",
+    );
     write(
         root,
         &format!("{top}/tool/node_modules/.package-lock.json"),
@@ -665,7 +672,7 @@ fn mises_python_and_private_sources_are_told_apart() {
     );
     let unchecked = inventory.unchecked.join("\n");
     assert!(
-        unchecked.starts_with("5 language package(s) are from a private registry"),
+        unchecked.starts_with("6 language package(s) are from a private registry"),
         "{unchecked}"
     );
 
@@ -681,6 +688,21 @@ fn mises_python_and_private_sources_are_told_apart() {
             .iter()
             .all(|(ecosystem, ..)| *ecosystem == Ecosystem::Npm)
     );
+
+    // So does one written on the line after its key, which reads as empty.
+    for conf in [
+        "[global]\nextra-index-url =\n    https://pypi.corp.example/simple\n",
+        "[global]\nfind-links =\n    /srv/wheels\n",
+    ] {
+        write(root, "home/u/.config/pip/pip.conf", conf);
+        let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+        assert!(
+            found(&inventory)
+                .iter()
+                .all(|(ecosystem, ..)| *ecosystem == Ecosystem::Npm),
+            "{conf}"
+        );
+    }
 }
 
 #[test]
@@ -766,4 +788,82 @@ fn mises_pipx_tools_are_read_in_uvs_layout_too() {
 
     assert_eq!(found(&inventory), [(Ecosystem::PyPi, "black", "24.1.0")]);
     assert!(inventory.unchecked.is_empty(), "{:?}", inventory.unchecked);
+}
+
+#[test]
+fn uvs_index_settings_keep_what_mise_installed_through_uv_out() {
+    let root = TempDir::new("packages-uv-index");
+    let root = root.path();
+    let installs = "home/u/.local/share/mise/installs";
+    for name in ["black", "inhouse"] {
+        python(
+            root,
+            &format!("{installs}/pipx-{name}/1.0.0/{name}/lib/python3.12/site-packages"),
+            name,
+            "1.0.0",
+        );
+    }
+    write(
+        root,
+        &format!("{installs}/pipx-inhouse/1.0.0/inhouse/uv-receipt.toml"),
+        "[tool]\nrequirements = [{ name = \"inhouse\", git = \"https://git.example/x\" }]\n",
+    );
+
+    let places = Places::defaults(Some(HOME));
+    let inventory = inventory::collect(root, &places);
+    assert_eq!(found(&inventory), [(Ecosystem::PyPi, "black", "1.0.0")]);
+    assert!(
+        inventory.unchecked[0].starts_with("1 language package(s) are from a private registry"),
+        "{:?}",
+        inventory.unchecked
+    );
+
+    let mut with_variable = Places::defaults(Some(HOME));
+    with_variable.uv_env = vec!["UV_INDEX_URL".to_string()];
+    assert_eq!(found(&inventory::collect(root, &with_variable)), []);
+
+    write(
+        root,
+        "home/u/.config/uv/uv.toml",
+        "[[index]]\nurl = \"https://pypi.corp.example/simple\"\n",
+    );
+    assert_eq!(found(&inventory::collect(root, &places)), []);
+
+    write(root, "home/u/.config/uv/uv.toml", "[index\n");
+    let inventory = inventory::collect(root, &places);
+    assert_eq!(found(&inventory), []);
+    assert!(
+        inventory
+            .unchecked
+            .join("\n")
+            .contains("/home/u/.config/uv/uv.toml could not be read"),
+        "{:?}",
+        inventory.unchecked
+    );
+}
+
+#[test]
+fn a_linked_crates_list_is_said_once_and_not_as_unreadable() {
+    let root = TempDir::new("packages-crates-link");
+    let root = root.path();
+    write(root, "elsewhere/crates2.json", r#"{"installs":{}}"#);
+    let mise_cargo = "home/u/.local/share/mise/installs/cargo-ripgrep/14.1.0";
+    for cargo in ["home/u/.cargo", mise_cargo] {
+        fs::create_dir_all(root.join(cargo)).unwrap();
+        symlink(
+            root.join("elsewhere/crates2.json"),
+            root.join(format!("{cargo}/.crates2.json")),
+        )
+        .unwrap();
+    }
+
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+
+    assert_eq!(found(&inventory), []);
+    assert!(inventory.unchecked.is_empty(), "{:?}", inventory.unchecked);
+    assert!(
+        inventory.notes.join("\n").starts_with("2 linked"),
+        "{:?}",
+        inventory.notes
+    );
 }

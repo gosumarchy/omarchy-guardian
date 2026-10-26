@@ -1,12 +1,13 @@
-//! What npm's and pip's configuration say about where packages come from,
-//! read locally only. These files hold registry tokens and index passwords:
-//! only the keys named here are taken, and nothing of them is shown or
-//! sent.
+//! What npm's, pip's and uv's configuration say about where packages come
+//! from, read locally only. These files hold registry tokens and index
+//! passwords: only the keys named here are taken, and nothing of them is
+//! shown or sent.
 //!
 //! A package from a registry other than the public one may have a private
 //! name, which must not go to OSV: npm's `registry` (or a scope's own),
-//! the address a hidden lockfile or `package.json` records, and pip's
-//! `index-url`, `extra-index-url` and `find-links` decide that.
+//! the address a hidden lockfile or `package.json` records, pip's
+//! `index-url`, `extra-index-url` and `find-links`, and uv's index settings
+//! (for what mise installs through uv) decide that.
 
 use std::env;
 use std::fs;
@@ -14,6 +15,7 @@ use std::io;
 use std::path::{Component, Path};
 
 use crate::files::read_small_file;
+use crate::tomlish;
 
 /// The largest configuration file read. Arbitrary: such a file holds a few
 /// lines.
@@ -26,6 +28,28 @@ const GLOBAL_NPMRC: &[&str] = &["usr/etc/npmrc", "etc/npmrc"];
 
 /// pip's global configuration files, read before the user's.
 const GLOBAL_PIP: &[&str] = &["etc/xdg/pip/pip.conf", "etc/pip.conf"];
+
+/// uv's global configuration files, read with the user's. uv reads the
+/// first of the XDG ones; all are read here, which can only leave more out.
+const GLOBAL_UV: &[&str] = &["etc/xdg/uv/uv.toml", "etc/uv/uv.toml"];
+
+/// The keys of `uv.toml` that bring packages from somewhere other than the
+/// Python Package Index, at the top or under `[pip]`; `index` is the
+/// `[[index]]` table.
+const UV_INDEX_KEYS: &[&str] = &["index", "index-url", "extra-index-url", "find-links"];
+
+/// The keys of a requirement in uv's record of a tool that leave it on the
+/// Python Package Index.
+const UV_REQUIREMENT_KEYS: &[&str] = &["name", "specifier", "extras", "marker"];
+
+/// The environment variables that do the same for uv.
+const UV_INDEX_VARIABLES: &[&str] = &[
+    "UV_INDEX",
+    "UV_DEFAULT_INDEX",
+    "UV_INDEX_URL",
+    "UV_EXTRA_INDEX_URL",
+    "UV_FIND_LINKS",
+];
 
 /// The hosts of npm's public registry. Yarn's serves the same packages
 /// under the same names.
@@ -58,8 +82,12 @@ pub(super) struct Places {
     pub(super) pipx: Option<String>,
     /// The user's npm configuration (`npm_config_userconfig`).
     pub(super) npmrc: Option<String>,
-    /// pip's configuration files of the user, and `PIP_CONFIG_FILE`.
+    /// pip's configuration files other than the global ones: the user's,
+    /// those under `XDG_CONFIG_DIRS`, and `PIP_CONFIG_FILE`.
     pub(super) pip: Vec<String>,
+    /// uv's the same way: the user's, those under `XDG_CONFIG_DIRS`, and
+    /// `UV_CONFIG_FILE`.
+    pub(super) uv: Vec<String>,
     /// The home directory, which `~` in npm's `prefix` stands for.
     pub(super) home: Option<String>,
     /// npm settings the environment gives (`npm_config_*`, in any case),
@@ -68,6 +96,9 @@ pub(super) struct Places {
     /// pip's index settings the environment gives (`PIP_INDEX_URL` and the
     /// like), as a file would write them.
     pub(super) pip_env: Vec<(String, String)>,
+    /// The uv index variables the environment sets (`UV_INDEX_URL` and the
+    /// like), by name.
+    pub(super) uv_env: Vec<String>,
 }
 
 impl Places {
@@ -83,20 +114,26 @@ impl Places {
                 .into_iter()
                 .flatten()
                 .collect(),
+            uv: under(".config/uv/uv.toml").into_iter().collect(),
             home: home.map(str::to_string),
             npm_env: Vec::new(),
             pip_env: Vec::new(),
+            uv_env: Vec::new(),
         }
     }
 
     /// The defaults, with what the environment changes. A variable that
     /// names a place and is not an absolute path without `..` is ignored.
     pub(super) fn from_env(home: Option<&str>) -> Self {
-        let mut places = Self::defaults(home);
         let variables: Vec<(String, String)> = env::vars_os()
             .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
             .collect();
-        for (name, value) in &variables {
+        Self::from_variables(home, &variables)
+    }
+
+    fn from_variables(home: Option<&str>, variables: &[(String, String)]) -> Self {
+        let mut places = Self::defaults(home);
+        for (name, value) in variables {
             let place = match name.as_str() {
                 "MISE_DATA_DIR" => &mut places.mise,
                 "CARGO_HOME" => &mut places.cargo,
@@ -107,14 +144,46 @@ impl Places {
                 *place = Some(path);
             }
         }
-        places.npm_env = npm_variables(&variables);
-        places.pip_env = pip_variables(&variables);
+        places.npm_env = npm_variables(variables);
+        places.pip_env = pip_variables(variables);
         if let Some((_, file)) = places.npm_env.iter().find(|(key, _)| key == "userconfig") {
             places.npmrc = from_root(file);
         }
-        if let Some((_, file)) = variables.iter().find(|(name, _)| name == "PIP_CONFIG_FILE") {
-            places.pip.extend(from_root(file));
+        places.uv_env = variables
+            .iter()
+            .filter(|(name, value)| {
+                UV_INDEX_VARIABLES.contains(&name.as_str()) && !value.is_empty()
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        // pip and uv read their files under the XDG directories too; the
+        // defaults stay, as pip also reads its older places.
+        let variable = |wanted: &str| {
+            variables
+                .iter()
+                .find(|(name, _)| name == wanted)
+                .map(|(_, value)| value.as_str())
+        };
+        let mut config_dirs: Vec<&str> = variable("XDG_CONFIG_HOME").into_iter().collect();
+        config_dirs.extend(
+            variable("XDG_CONFIG_DIRS")
+                .into_iter()
+                .flat_map(|dirs| dirs.split(':')),
+        );
+        for directory in config_dirs {
+            places
+                .pip
+                .extend(from_root(&format!("{directory}/pip/pip.conf")));
+            places
+                .uv
+                .extend(from_root(&format!("{directory}/uv/uv.toml")));
         }
+        places
+            .pip
+            .extend(variable("PIP_CONFIG_FILE").and_then(from_root));
+        places
+            .uv
+            .extend(variable("UV_CONFIG_FILE").and_then(from_root));
         places
     }
 }
@@ -236,21 +305,21 @@ impl NpmConfig {
     }
 }
 
-/// What pip's configuration (files and environment) says of where
+/// What pip's or uv's configuration (files and environment) says of where
 /// packages come from.
 #[derive(Debug)]
-pub(super) struct PipConfig {
+pub(super) struct IndexConfig {
     /// It brings packages from somewhere other than the Python Package
-    /// Index, or a file of it could not be read: then what pip installed
-    /// may be of a private index, and none of it is looked up.
+    /// Index, or a file of it could not be read: then what the tool
+    /// installed may be of a private index, and none of it is looked up.
     pub(super) other_index: bool,
     /// The files that are there and could not be read, relative to the
     /// root.
     pub(super) unreadable: Vec<String>,
 }
 
-impl PipConfig {
-    pub(super) fn read(root: &Path, places: &Places) -> Self {
+impl IndexConfig {
+    pub(super) fn pip(root: &Path, places: &Places) -> Self {
         let files = GLOBAL_PIP
             .iter()
             .map(|file| (*file).to_string())
@@ -271,17 +340,82 @@ impl PipConfig {
             }
         }
         settings.extend(places.pip_env.iter().cloned());
+        // A value pip writes on the lines after its key reads here as an
+        // empty one, so an empty value counts as another index too.
         let other_index = !unreadable.is_empty()
-            || settings.iter().any(|(key, value)| match key.as_str() {
-                "index-url" => !is_on(value, PYPI_HOSTS),
-                "extra-index-url" | "find-links" => !value.is_empty(),
-                _ => false,
+            || settings.iter().any(|(key, value)| {
+                PIP_INDEX_KEYS.contains(&key.as_str()) && !is_on(value, PYPI_HOSTS)
             });
         Self {
             other_index,
             unreadable,
         }
     }
+
+    /// uv's configuration. Any index setting counts, the Python Package
+    /// Index named as one included: telling them apart in `[[index]]`
+    /// tables is not worth the risk of a miss. A file uv would reject
+    /// counts as unreadable.
+    pub(super) fn uv(root: &Path, places: &Places) -> Self {
+        let files = GLOBAL_UV
+            .iter()
+            .map(|file| (*file).to_string())
+            .chain(places.uv.iter().cloned());
+        let mut other_index = !places.uv_env.is_empty();
+        let mut unreadable = Vec::new();
+        for file in files {
+            let entries = match read_config(root, &file) {
+                ConfigFile::Absent => continue,
+                ConfigFile::Unreadable => Err(()),
+                ConfigFile::Text(text) => tomlish::entries(&text).map_err(drop),
+            };
+            match entries {
+                Ok(entries) => {
+                    other_index |= entries.iter().any(|entry| is_uv_index(&entry.full_path()));
+                }
+                Err(()) => unreadable.push(file),
+            }
+        }
+        Self {
+            other_index: other_index || !unreadable.is_empty(),
+            unreadable,
+        }
+    }
+}
+
+/// Whether a `uv.toml` entry at `path` (table, then key) is an index
+/// setting.
+fn is_uv_index(path: &[&str]) -> bool {
+    let (["pip", key, ..] | [key, ..]) = path else {
+        return false;
+    };
+    UV_INDEX_KEYS.contains(key)
+}
+
+/// Whether uv's record of one tool (`uv-receipt.toml`) says it came from
+/// somewhere other than the Python Package Index: an index among its
+/// options, or a requirement with anything beyond a name, a version and
+/// extras (a git, url, path or index source). Text it cannot read counts.
+pub(super) fn uv_receipt_other_index(text: &str) -> bool {
+    let Ok(entries) = tomlish::entries(text) else {
+        return true;
+    };
+    entries.iter().any(|entry| {
+        let path = entry.full_path();
+        if path.iter().any(|part| UV_INDEX_KEYS.contains(part)) {
+            return true;
+        }
+        // Splitting the inline tables at every delimiter finds every key; a
+        // delimiter inside a string can only add a key that is not allowed.
+        path == ["tool", "requirements"]
+            && entry
+                .value
+                .split([',', '{', '}', '[', ']'])
+                .filter_map(|part| part.split_once('='))
+                .any(|(key, _)| {
+                    !UV_REQUIREMENT_KEYS.contains(&key.trim().trim_matches(['"', '\'']))
+                })
+    })
 }
 
 /// What reading one configuration file gave.
@@ -360,7 +494,7 @@ fn is_on(url: &str, hosts: &[&str]) -> bool {
 mod tests {
     use super::{
         NpmConfig, Places, from_root, has_index_argument, is_on, npm_prefix, npm_variables,
-        pip_variables, setting,
+        pip_variables, setting, uv_receipt_other_index,
     };
 
     #[test]
@@ -467,5 +601,55 @@ mod tests {
         assert!(has_index_argument(["--extra-index-url=https://x"]));
         assert!(has_index_argument(["-ihttps://x"]));
         assert!(!has_index_argument(["--no-cache-dir", "--index-urlx"]));
+    }
+
+    #[test]
+    fn pip_and_uv_files_are_also_read_under_the_xdg_directories() {
+        let variables = [
+            ("XDG_CONFIG_HOME", "/home/u/conf"),
+            ("XDG_CONFIG_DIRS", "/opt/xdg:relative"),
+            ("PIP_CONFIG_FILE", "/srv/pip.conf"),
+            ("UV_CONFIG_FILE", "/srv/uv.toml"),
+            ("UV_INDEX_URL", "https://pypi.corp.example/simple"),
+            ("UV_FIND_LINKS", ""),
+        ]
+        .map(|(name, value)| (name.to_string(), value.to_string()));
+
+        let places = Places::from_variables(Some("home/u"), &variables);
+
+        assert_eq!(
+            places.pip,
+            [
+                "home/u/.config/pip/pip.conf",
+                "home/u/.pip/pip.conf",
+                "home/u/conf/pip/pip.conf",
+                "opt/xdg/pip/pip.conf",
+                "srv/pip.conf",
+            ]
+        );
+        assert_eq!(
+            places.uv,
+            [
+                "home/u/.config/uv/uv.toml",
+                "home/u/conf/uv/uv.toml",
+                "opt/xdg/uv/uv.toml",
+                "srv/uv.toml",
+            ]
+        );
+        assert_eq!(places.uv_env, ["UV_INDEX_URL"]);
+    }
+
+    #[test]
+    fn a_uv_receipt_says_a_tool_from_elsewhere() {
+        let public = "[tool]\nrequirements = [{ name = \"black\", specifier = \">=24\" }]\n";
+        assert!(!uv_receipt_other_index(public));
+        for elsewhere in [
+            "[tool]\nrequirements = [{ name = \"inhouse\", git = \"https://git.example/x\" }]\n",
+            "[tool]\nrequirements = [{ name = \"x\", index = \"https://pypi.corp.example\" }]\n",
+            "[tool]\nrequirements = [{ name = \"x\" }]\n[tool.options]\nindex-url = \"https://a\"\n",
+            "[tool\n",
+        ] {
+            assert!(uv_receipt_other_index(elsewhere), "{elsewhere}");
+        }
     }
 }
