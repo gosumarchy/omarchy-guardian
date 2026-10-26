@@ -278,7 +278,9 @@ fn each_key(text: &str, mut visit: impl FnMut(usize, &str, Option<&str>, &str, &
         }
         for (reading_index, reading) in readings.into_iter().enumerate() {
             let mut line = reading.trim();
-            if let Some(header) = line.strip_prefix('[') {
+            // git reads headers one after another on one line
+            // (`[x] [core] hooksPath = …`): the last one opens the section.
+            while let Some(header) = line.strip_prefix('[') {
                 let (header, rest) = split_header(header);
                 let header = header.trim();
                 let found = if let Some((name, sub)) = header.split_once(char::is_whitespace) {
@@ -565,6 +567,24 @@ mod tests {
         assert_eq!(
             values(text, "remote", Some("origin"), "url"),
             [(5, "x\ty".to_string(), Reading::Sure)]
+        );
+        // Several headers on one line: the last one holds the key.
+        assert_eq!(
+            executing_keys("[x] [core] hooksPath = /tmp/evil-hooks\n"),
+            [(1, "core.hookspath = /tmp/evil-hooks".to_string())]
+        );
+        assert_eq!(
+            values("[x][core]hooksPath=/a\n", "core", None, "hookspath"),
+            [(1, "/a".to_string(), Reading::Sure)]
+        );
+        assert_eq!(
+            values(
+                "[y] [remote \"origin\"] url = https://evil/x\n",
+                "remote",
+                Some("origin"),
+                "url"
+            ),
+            [(1, "https://evil/x".to_string(), Reading::Sure)]
         );
         // An old-style subsection is lowercased, a quoted one decoded, and
         // a continued line is one of several readings.
