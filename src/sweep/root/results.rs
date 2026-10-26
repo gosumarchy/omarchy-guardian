@@ -158,8 +158,9 @@ fn item_json(item: &Item) -> Json {
             ("kind", Json::from("unreadable")),
             ("reason", Json::from(reason.as_str())),
         ]),
-        // Root does not collect plugins (they are a home's, which the
-        // user's own sweep reads); a kind nothing reads back drops one.
+        // Root never collects Neovim plugins: they belong to a home, and
+        // the user's own sweep reads them. Nothing reads this kind back, so
+        // writing only the kind loses nothing.
         Body::Plugin(_) => Json::object([("kind", Json::from("plugin"))]),
     };
     let strings = |values: &[String]| {
