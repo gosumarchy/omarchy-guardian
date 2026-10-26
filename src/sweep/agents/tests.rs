@@ -878,6 +878,8 @@ fn only_a_value_that_is_a_secret_is_taken_out() {
             r#"curl -H"Authorization: Bearer abc123" https://x/y"#,
             r#"curl -H"Authorization: Bearer <redacted-by-guardian>" https://x/y"#,
         ),
+        // A `--no-` flag takes no value.
+        ("npx --no-auth evil-pkg", "npx --no-auth evil-pkg"),
         // A flag is never a value.
         (
             "npx --token --package=evil-pkg cmd",

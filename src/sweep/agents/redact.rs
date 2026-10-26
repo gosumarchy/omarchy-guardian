@@ -21,6 +21,14 @@
 //! (`--authorization v`), a header inside a JSON array or object
 //! (`'["-H","Authorization: Bearer abc"]'`), and all but the first word of
 //! a quoted value of several words (`--token "a b"` sends `b`).
+//!
+//! A flag that is named for a secret but takes no value (`--skip-auth pkg`)
+//! has the word after it taken out where that word is token-shaped, so a
+//! package named there is hidden from the item's text. A script file named
+//! there is still followed and reviewed as its own item, since the line is
+//! followed before it is masked; a package a runner fetches is not, since
+//! only files on this machine are followed. A `--no-` flag is known to take
+//! no value, and the word after it is sent.
 
 use crate::sweep::judge::secrets::{REDACTED, is_secret_name, without_secrets};
 
@@ -112,7 +120,11 @@ fn redacted_word(word: &str, next: &mut Next) -> String {
         }
     } else {
         let core = without_login(core);
-        if core.starts_with('-') && !core.contains('=') && is_secret_named(&core) {
+        if core.starts_with('-')
+            && !core.starts_with("--no-")
+            && !core.contains('=')
+            && is_secret_named(&core)
+        {
             *next = Next::Value;
             core
         } else {

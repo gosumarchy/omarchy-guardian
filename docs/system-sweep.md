@@ -504,7 +504,13 @@ Not covered, and sent as written: a secret in a header other than
 flag named for authorization rather than for a secret (`--authorization v`),
 a header inside a JSON array or object
 (`'["-H","Authorization: Bearer abc"]'`), and all but the first word of a
-quoted value of several words.
+quoted value of several words. A flag that is named for a secret but takes
+no value (`--skip-auth pkg`) has the word after it taken out where that word
+is token-shaped, so a package named there is hidden from the item's text. A
+script file named there is still followed and reviewed as its own item,
+since the line is followed before it is masked; a package a runner fetches
+is not, since only files on this machine are followed. A `--no-` flag
+(`--no-auth`) is known to take no value, and the word after it is sent.
 
 A change to that text (a new hook, a changed command, a new variable name) is
 a change to the item: it shows in `--diff`, in the daily notification, and
