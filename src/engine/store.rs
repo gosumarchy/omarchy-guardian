@@ -27,12 +27,14 @@ const TEMP_PREFIX: &str = ".tmp-";
 /// otherwise leaves that file behind forever.
 const STALE_TEMP_SECS: u64 = 3_600;
 
+/// Numbers this process's temp names. One counter for the whole process,
+/// not one per `Store`: `write_atomic` removes whatever is under its temp
+/// name first, so two stores on one root with their own counters would
+/// delete each other's half-written files.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) struct Store {
     root: PathBuf,
-    /// Per-instance so a fresh `Store::open` (once per Guardian run) starts
-    /// its temp names at 0 again; only `process::id()` needs to disambiguate
-    /// two processes, not two counters in the same one.
-    temp_counter: AtomicU64,
 }
 
 impl Store {
@@ -66,10 +68,7 @@ impl Store {
                 )));
             }
         }
-        Ok(Self {
-            root,
-            temp_counter: AtomicU64::new(0),
-        })
+        Ok(Self { root })
     }
 
     fn path(&self, dir: &str, name: &str) -> PathBuf {
@@ -83,7 +82,7 @@ impl Store {
         // Unique to this process and this write, so whatever is under it
         // was left by a killed run that had this pid: `write_atomic`
         // removes it first.
-        let counter = self.temp_counter.fetch_add(1, Ordering::Relaxed);
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let temporary = self.path(dir, &format!("{TEMP_PREFIX}{}-{counter}", process::id()));
         let options = AtomicWrite {
             sync: true,
@@ -207,7 +206,6 @@ pub(crate) fn summary(root: &Path) -> Option<(usize, u64)> {
     }
     let store = Store {
         root: root.to_path_buf(),
-        temp_counter: AtomicU64::new(0),
     };
     Some((
         store.list(BASELINES).map_or(0, |names| names.len()),
@@ -227,7 +225,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
-    use super::{BASELINES, BLOBS, Store, TEMP_PREFIX, VERDICTS, summary};
+    use super::{BASELINES, BLOBS, Store, VERDICTS, summary};
     use crate::test_support::TempDir;
 
     #[test]
@@ -337,28 +335,26 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_same_pid_temp_file_does_not_block_the_next_write() {
-        let dir = TempDir::new("store-temp-retry");
+    fn two_stores_on_one_root_do_not_remove_each_others_writes() {
+        let dir = TempDir::new("store-two");
         let root = dir.path().join("store");
-        let store = Store::open(root.clone()).unwrap();
+        let stores = [Store::open(root.clone()).unwrap(), Store::open(root).unwrap()];
 
-        // A fresh store's temp counter starts at 0, so this is the exact
-        // name write()'s first attempt will try; a leftover from a run that
-        // was killed after opening it (and reused this pid) collides here.
-        let colliding = root
-            .join(VERDICTS)
-            .join(format!("{TEMP_PREFIX}{}-0", std::process::id()));
-        fs::write(&colliding, b"stale").unwrap();
-
-        store.write(VERDICTS, "k", b"value").unwrap();
-
-        assert_eq!(
-            store.read(VERDICTS, "k").unwrap().as_deref(),
-            Some(&b"value"[..])
-        );
-        // The leftover was this process's name for this write: it was
-        // replaced, and nothing is left under it.
-        assert!(!colliding.exists());
+        // Each write first removes whatever is under its temp name; with a
+        // counter per store, both would use the same names and one could
+        // remove the other's file before its rename.
+        std::thread::scope(|scope| {
+            for (index, store) in stores.iter().enumerate() {
+                scope.spawn(move || {
+                    for round in 0..1000 {
+                        store
+                            .write(VERDICTS, &format!("{index}-{round}"), b"value")
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(stores[0].list(VERDICTS).unwrap().len(), 2000);
     }
 
     #[test]
