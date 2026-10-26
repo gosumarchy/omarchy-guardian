@@ -275,7 +275,7 @@ fn read_mtree(path: &Path) -> Result<String, Error> {
         },
     )?;
     let bytes = captured.into_success()?;
-    String::from_utf8(bytes).map_err(|_| Error::Refused(format!("{}: not UTF-8", path.display())))
+    String::from_utf8(bytes).map_err(|_| Error::Message(format!("{}: not UTF-8", path.display())))
 }
 
 /// The packages no configured repository carries by name (`pacman -Qmq`);

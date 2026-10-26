@@ -228,7 +228,7 @@ fn a_verdict_reached_beside_an_invalid_chunk_is_kept() {
 
 #[test]
 fn the_error_names_the_failed_chunk_and_counts_the_others() {
-    let error = || Error::Refused("no reply".into());
+    let error = || Error::Message("no reply".into());
     // A review in one request has no chunk to name.
     assert_eq!(chunk_error((1, 1), 0, error()).to_string(), "no reply");
     assert_eq!(

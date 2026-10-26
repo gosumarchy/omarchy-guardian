@@ -28,12 +28,12 @@ const MAX_IDENTITY_BYTES: usize = 512;
 pub(crate) struct Identity(String);
 
 impl Identity {
-    pub(crate) fn parse(text: &str) -> Result<Self, String> {
+    pub(crate) fn parse(text: &str) -> Result<Self, Error> {
         if text.is_empty() || text.len() > MAX_IDENTITY_BYTES || text.chars().any(char::is_control)
         {
-            return Err(format!(
+            return Err(Error::Message(format!(
                 "an identity is 1 to {MAX_IDENTITY_BYTES} bytes without control characters (got {text:?})"
-            ));
+            )));
         }
         Ok(Self(text.to_string()))
     }

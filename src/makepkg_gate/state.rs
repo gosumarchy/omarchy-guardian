@@ -354,7 +354,7 @@ impl State {
     fn write(&self, what: &str, text: &str) -> Result<(), Error> {
         let path = match &self.place {
             Ok(directory) => directory.join(format!("{}.{what}", self.name)),
-            Err(missing) => return Err(Error::Refused(missing.reason())),
+            Err(missing) => return Err(Error::Message(missing.reason())),
         };
         let temporary = path.with_extension(format!("{what}.{}.tmp", std::process::id()));
         let options = AtomicWrite::private(temporary.clone());
@@ -529,7 +529,7 @@ pub(super) fn forget(root: &Path, key: &str) -> Result<usize, Error> {
     if left.is_empty() {
         return Ok(removed);
     }
-    Err(Error::Refused(format!(
+    Err(Error::Message(format!(
         "{removed} record(s) of the AUR gate were forgotten, and {} directory(ies) where it keeps a record of this package could not be removed: {}. Guardian does not remove what is in a directory it did not make: remove them yourself, then run this again.",
         left.len(),
         left.join(", ")
@@ -544,7 +544,7 @@ pub(super) fn forget_all(root: &Path) -> Result<usize, Error> {
     match fs::symlink_metadata(&directory) {
         Ok(metadata) if metadata.is_dir() => {}
         Ok(_) => {
-            return Err(Error::Refused(format!(
+            return Err(Error::Message(format!(
                 "{} is not a directory",
                 directory.display()
             )));

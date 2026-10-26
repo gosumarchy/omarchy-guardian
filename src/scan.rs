@@ -15,7 +15,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use crate::content::{self, Content, Format, Prefix};
+use crate::content::{self, Content, Format, Prefix, Reading};
 use crate::error::Error;
 use crate::files::{O_NONBLOCK, read_small_file};
 use crate::git_state;
@@ -251,12 +251,12 @@ pub(crate) fn walk(
 pub(crate) fn verify_unchanged(config: &ScanConfig, expected: &Snapshot) -> Result<(), Error> {
     let (current, gaps) = walk(config, &mut |_| {});
     if !gaps.is_empty() {
-        return Err(Error::Refused(
+        return Err(Error::Message(
             "the source tree changed or became unreadable after review".into(),
         ));
     }
     if current != *expected {
-        return Err(Error::Refused(
+        return Err(Error::Message(
             "the scanned file set or file contents changed after review".into(),
         ));
     }
@@ -276,7 +276,7 @@ pub(crate) fn verify_copy(config: &ScanConfig, expected: &Snapshot) -> Result<()
             .collect()
     };
     if !gaps.is_empty() || kept(&current) != kept(expected) || current.skipped != expected.skipped {
-        return Err(Error::Refused(
+        return Err(Error::Message(
             "the sandbox copy does not match the reviewed source".into(),
         ));
     }
@@ -795,7 +795,7 @@ fn read_classified(file: &mut File, rel: &str, executable: bool) -> io::Result<(
 
     if head.len() as u64 <= MAX_TEXT_FILE_SIZE {
         let digest = hasher.finalize();
-        let contents = match content::classify(rel, executable, false, &head) {
+        let contents = match content::classify(rel, executable, Reading::ByName, &head) {
             Content::Text(text) => Contents::Text(text, false),
             Content::Lossy { text, .. } => Contents::Text(text, true),
             Content::Binary(format) => Contents::Binary(format),

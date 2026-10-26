@@ -135,9 +135,20 @@ fn preflight_needs_a_system_opencode_only_when_a_class_requires_ai() {
         [SourceClass::ThirdPartyRepo, SourceClass::LocalPackage]
     );
     let error = preflight(&standard, false).unwrap_err();
-    assert!(error.contains("third-party-repo, local-package"), "{error}");
-    assert!(error.contains("sudo pacman -S extra/opencode"), "{error}");
-    assert_eq!(preflight(&standard, true), Ok(()));
+    assert!(
+        error
+            .to_string()
+            .contains("third-party-repo, local-package"),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("sudo pacman -S extra/opencode"),
+        "{error}"
+    );
+    assert_eq!(
+        preflight(&standard, true).map_err(|error| error.to_string()),
+        Ok(())
+    );
 
     let private = Settings::from_parts(
         PartialConfig {
@@ -146,7 +157,10 @@ fn preflight_needs_a_system_opencode_only_when_a_class_requires_ai() {
         },
         PartialConfig::default(),
     );
-    assert_eq!(preflight(&private, false), Ok(()));
+    assert_eq!(
+        preflight(&private, false).map_err(|error| error.to_string()),
+        Ok(())
+    );
 }
 
 #[test]
@@ -626,7 +640,8 @@ fn a_link_chain_ends_at_what_the_transaction_puts_there() {
         }
     };
     assert_eq!(
-        super::linked_file(Path::new("/"), "/etc/localtime", &others),
+        super::linked_file(Path::new("/"), "/etc/localtime", &others)
+            .map_err(|error| error.to_string()),
         Ok(Some((
             "another package of this transaction ships it",
             b"TZif-new".to_vec()

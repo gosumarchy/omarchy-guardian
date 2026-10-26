@@ -32,13 +32,13 @@ pub(super) fn local_archives(operands: &[String], cwd: &Path) -> Result<Archives
     for argument in operands {
         // pacman reads `-` as "archives named on standard input".
         if argument == "-" {
-            return Err(Error::Refused(
+            return Err(Error::Message(
                 "package archives named on standard input are not supported; name them as arguments"
                     .into(),
             ));
         }
         if argument.contains("://") {
-            return Err(Error::Refused(format!(
+            return Err(Error::Message(format!(
                 "remote package URLs are not supported: {argument}"
             )));
         }
@@ -48,7 +48,7 @@ pub(super) fn local_archives(operands: &[String], cwd: &Path) -> Result<Archives
             Err(error)
                 if error.kind() == io::ErrorKind::NotFound && Path::new(argument).is_relative() =>
             {
-                return Err(Error::Refused(format!(
+                return Err(Error::Message(format!(
                     "cannot find {argument} relative to pacman's working directory ({}); run pacman -U with an absolute path",
                     cwd.display()
                 )));
@@ -56,7 +56,7 @@ pub(super) fn local_archives(operands: &[String], cwd: &Path) -> Result<Archives
             other => other.at(&path)?,
         };
         if !metadata.is_file() {
-            return Err(Error::Refused(format!(
+            return Err(Error::Message(format!(
                 "not a regular package archive: {}",
                 path.display()
             )));
@@ -70,7 +70,7 @@ pub(super) fn local_archives(operands: &[String], cwd: &Path) -> Result<Archives
     }
 
     if archives.is_empty() {
-        return Err(Error::Refused(
+        return Err(Error::Message(
             "the upgrade did not name a readable package archive".into(),
         ));
     }
@@ -149,7 +149,7 @@ pub(super) fn sync_archives(
         for path in &found {
             let name = package_name(path)?;
             if name != *target {
-                return Err(Error::Refused(format!(
+                return Err(Error::Message(format!(
                     "{} contains {name}, not {target}",
                     path.display()
                 )));
@@ -322,7 +322,7 @@ pub(super) fn check_private(path: &Path, uid: Option<u32>) -> Result<(), Error> 
         let foreign_owner = user::is_foreign_owner(metadata.uid(), uid);
         let shared = metadata.mode() & 0o022 != 0 && !sticky;
         if foreign_owner || shared {
-            return Err(Error::Refused(format!(
+            return Err(Error::Message(format!(
                 "{} can be changed by another user ({}), so the archive pacman installs may not be the one reviewed; move it to a directory only you can write",
                 path.display(),
                 here.display()
@@ -340,7 +340,7 @@ fn check_cache_directory(directory: &Path) -> Result<(), Error> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).at(directory),
         Ok(metadata) if metadata.uid() == 0 && metadata.mode() & 0o022 == 0 => Ok(()),
-        Ok(_) => Err(Error::Refused(format!(
+        Ok(_) => Err(Error::Message(format!(
             "the pacman cache directory {} is not root's alone",
             directory.display()
         ))),
@@ -403,7 +403,7 @@ fn package_name(archive: &Path) -> Result<String, Error> {
     if is_valid_package_name(&name) {
         Ok(name)
     } else {
-        Err(Error::Refused(format!(
+        Err(Error::Message(format!(
             "pacman reported an invalid package name for {}",
             archive.display()
         )))

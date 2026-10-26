@@ -18,6 +18,7 @@ use crate::config::model::{
     Thinking, Toggle,
 };
 use crate::config::write::render;
+use crate::error::Error;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Scope {
@@ -266,7 +267,7 @@ impl Field {
     /// Sets (or with `None`, clears) the field in `config`. The whole file
     /// is then checked with the real parser, so a value the config file
     /// would reject is refused here with the parser's own message.
-    pub(super) fn set(self, config: &mut PartialConfig, value: Option<&str>) -> Result<(), String> {
+    pub(super) fn set(self, config: &mut PartialConfig, value: Option<&str>) -> Result<(), Error> {
         let mut changed = config.clone();
         self.assign(&mut changed, value.map(str::trim))?;
         validate(&changed)?;
@@ -281,38 +282,41 @@ impl Field {
         drop(self.assign(config, None));
     }
 
-    fn assign(self, config: &mut PartialConfig, value: Option<&str>) -> Result<(), String> {
-        fn named<T: Named>(value: Option<&str>) -> Result<Option<T>, String> {
+    fn assign(self, config: &mut PartialConfig, value: Option<&str>) -> Result<(), Error> {
+        fn named<T: Named>(value: Option<&str>) -> Result<Option<T>, Error> {
             value
                 .map(|text| {
-                    T::parse(text)
-                        .ok_or_else(|| format!("expected one of: {}", names::<T>().join(", ")))
+                    T::parse(text).ok_or_else(|| {
+                        Error::Message(format!("expected one of: {}", names::<T>().join(", ")))
+                    })
                 })
                 .transpose()
         }
-        fn number(value: Option<&str>, range: &RangeInclusive<u32>) -> Result<Option<u32>, String> {
+        fn number(value: Option<&str>, range: &RangeInclusive<u32>) -> Result<Option<u32>, Error> {
             value
                 .map(|text| {
                     text.parse::<u32>()
                         .ok()
                         .filter(|number| range.contains(number))
                         .ok_or_else(|| {
-                            format!(
+                            Error::Message(format!(
                                 "expected a whole number from {} to {}",
                                 range.start(),
                                 range.end()
-                            )
+                            ))
                         })
                 })
                 .transpose()
         }
-        fn model(value: Option<&str>) -> Result<Option<String>, String> {
+        fn model(value: Option<&str>) -> Result<Option<String>, Error> {
             value
                 .map(|text| {
                     if is_model_name(text) && !text.contains(['"', '\\']) {
                         Ok(text.to_string())
                     } else {
-                        Err("expected provider/model, for example anthropic/claude-sonnet-5".into())
+                        Err(Error::Message(
+                            "expected provider/model, for example anthropic/claude-sonnet-5".into(),
+                        ))
                     }
                 })
                 .transpose()
@@ -350,7 +354,7 @@ impl Field {
                             .map(|text| match text {
                                 "true" => Ok(true),
                                 "false" => Ok(false),
-                                _ => Err("expected true or false".to_string()),
+                                _ => Err(Error::Message("expected true or false".to_string())),
                             })
                             .transpose()?;
                     }
@@ -429,11 +433,13 @@ pub(super) const HEADER: &str =
     "# Written by `omarchy-guardian tui`. See `omarchy-guardian config show`.\n";
 
 /// The file text for `config`, checked with the real parser.
-pub(super) fn validate(config: &PartialConfig) -> Result<String, String> {
+pub(super) fn validate(config: &PartialConfig) -> Result<String, Error> {
     let text = render(config, HEADER);
     parse(Path::new("config"), &text)
         .map(|_| text)
-        .map_err(|error| error.to_string().trim_start_matches("config:").to_string())
+        .map_err(|error| {
+            Error::Message(error.to_string().trim_start_matches("config:").to_string())
+        })
 }
 
 #[cfg(test)]

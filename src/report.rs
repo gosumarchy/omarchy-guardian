@@ -197,6 +197,11 @@ pub(crate) enum Blocked {
     NotConfirmed,
 }
 
+/// The exit code of a command that could not do what it was asked, or was
+/// asked wrongly: the `2` an incomplete review gives too (see the exit
+/// codes in docs/commands.md).
+pub(crate) const FAILED: u8 = 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Decision {
     Clear,
@@ -217,7 +222,7 @@ impl Decision {
             Self::Clear | Self::Warned | Self::Limited => 0,
             Self::Blocked(Blocked::Findings) => 1,
             Self::Blocked(Blocked::Incomplete | Blocked::AiUnavailable | Blocked::NotConfirmed) => {
-                2
+                FAILED
             }
         }
     }

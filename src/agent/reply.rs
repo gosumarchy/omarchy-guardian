@@ -63,13 +63,13 @@ pub(super) fn claude_verdict(
         // after it had started to answer, is not an absent reviewer: content
         // crafted to break the run must not turn a review into a warning.
         if tool_use {
-            return Err(AgentError::Invalid(Error::Refused(
+            return Err(AgentError::Invalid(Error::Message(
                 "the Claude Code CLI attempted to use a tool during source review".into(),
             )));
         }
         return Err(match failure {
             Some(Failure::TimedOut) if delivered => AgentError::OutOfTime(out_of_time()),
-            Some(failure) if delivered => AgentError::Invalid(Error::Refused(format!(
+            Some(failure) if delivered => AgentError::Invalid(Error::Message(format!(
                 "the AI saw the source and the review then failed ({failure}); retry"
             ))),
             Some(failure) => unavailable(failure),
@@ -83,7 +83,7 @@ pub(super) fn claude_verdict(
         .and_then(Json::as_array)
         .is_some_and(|denials| !denials.is_empty());
     if tool_use || denials {
-        return Err(AgentError::Invalid(Error::Refused(
+        return Err(AgentError::Invalid(Error::Message(
             "the Claude Code CLI attempted to use a tool during source review".into(),
         )));
     }
@@ -108,11 +108,11 @@ pub(super) fn claude_verdict(
                 .and_then(Json::as_u64)
                 .is_some_and(|tokens| tokens > 0);
         return Err(if delivered {
-            AgentError::Invalid(Error::Refused(format!(
+            AgentError::Invalid(Error::Message(format!(
                 "the AI saw the source and then declined or failed to review it ({detail}); retry"
             )))
         } else if rejects_input(&detail) {
-            AgentError::Invalid(Error::Refused(format!(
+            AgentError::Invalid(Error::Message(format!(
                 "the AI could not take this source in one request ({detail}); lower max_input_kib or use a model with a larger context"
             )))
         } else if rejects_content(&detail) {
@@ -128,7 +128,7 @@ pub(super) fn claude_verdict(
         return Err(AgentError::Invalid(error));
     }
     if text.is_empty() {
-        return Err(AgentError::Invalid(Error::Refused(
+        return Err(AgentError::Invalid(Error::Message(
             "the Claude Code CLI returned no review text".into(),
         )));
     }
@@ -219,7 +219,7 @@ pub(super) fn verdict(
     nonce: &str,
 ) -> Result<AgentReview, AgentError> {
     if events.tool_use {
-        return Err(AgentError::Invalid(Error::Refused(
+        return Err(AgentError::Invalid(Error::Message(
             "OpenCode attempted to use a tool during source review".into(),
         )));
     }
@@ -240,7 +240,7 @@ pub(super) fn verdict(
     if events.delivered
         && let Some(message) = &events.error
     {
-        return Err(AgentError::Invalid(Error::Refused(format!(
+        return Err(AgentError::Invalid(Error::Message(format!(
             "the AI saw the source and then declined or failed to review it ({message}); retry"
         ))));
     }
@@ -255,7 +255,7 @@ pub(super) fn verdict(
         .flatten()
         .find(|message| rejects_input(message))
     {
-        return Err(AgentError::Invalid(Error::Refused(format!(
+        return Err(AgentError::Invalid(Error::Message(format!(
             "the AI could not take this source in one request ({message}); lower max_input_kib or use a model with a larger context"
         ))));
     }
@@ -272,7 +272,7 @@ pub(super) fn verdict(
             failure.into_error("opencode".into()),
         ));
     }
-    Err(AgentError::Invalid(Error::Refused(
+    Err(AgentError::Invalid(Error::Message(
         "OpenCode returned no review text".into(),
     )))
 }

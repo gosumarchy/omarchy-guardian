@@ -41,7 +41,7 @@ mod upstream;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 use std::os::unix::process::CommandExt;
@@ -62,14 +62,14 @@ use self::upstream::{review_upstream_files, unreviewable_sources};
 use crate::audit::{self, Gate};
 use crate::aur::recipe::{self, Sources};
 use crate::aur::{self, Roots, Upstream};
-use crate::cli::{Confirm, Target, TtyConfirm, Verdict, passed, review_and_decide};
+use crate::cli::{Confirm, GateReview, Target, TtyConfirm, Verdict, passed, review_and_decide};
 use crate::config::Settings;
 use crate::config::model::SourceClass;
 use crate::engine::baseline::{Identity, Unit};
 use crate::engine::store::Store;
-use crate::error::Error;
+use crate::error::{Error, IoContext};
 use crate::notify::{self, Ran};
-use crate::report::{Blocked, Decision, Hashes};
+use crate::report::{Blocked, Decision, FAILED, Hashes};
 use crate::rules;
 use crate::sandbox::{self, FetchJail};
 use crate::scan::{self, ScanConfig, Snapshot};
@@ -223,25 +223,25 @@ pub(crate) fn run(command: &[OsString], settings: &Settings) -> ExitCode {
     crate::output::leave_stdout_to_the_command();
     let Some((makepkg, arguments)) = command.split_first() else {
         errln!("omarchy-guardian makepkg-gate: no makepkg command was given");
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     };
     let mirrored = match mirrored_arguments(arguments) {
         Ok(mirrored) => mirrored,
         Err(message) => {
             errln!("Guardian makepkg gate: {message}");
-            return ExitCode::from(2);
+            return ExitCode::from(FAILED);
         }
     };
     let build_dir = match env::current_dir().and_then(|dir| dir.canonicalize()) {
         Ok(dir) => dir,
         Err(error) => {
             errln!("omarchy-guardian makepkg-gate: cannot use the working directory: {error}");
-            return ExitCode::from(2);
+            return ExitCode::from(FAILED);
         }
     };
     let Ok(recipe) = fs::read_to_string(build_dir.join("PKGBUILD")) else {
         errln!("Guardian makepkg gate requires a readable PKGBUILD in the working directory.");
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     };
     remove_stale_copies(&build_dir);
     let directory_name = build_dir
@@ -259,7 +259,7 @@ pub(crate) fn run(command: &[OsString], settings: &Settings) -> ExitCode {
     let facts = aur_facts(base.as_deref(), &directory_name, &recipe);
     let key = base.clone().unwrap_or_else(|| local_key(&build_dir));
     let Some(state) = open_records(arguments, &key, &directory_name) else {
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     };
 
     // 2. The recipe.
@@ -282,7 +282,7 @@ pub(crate) fn run(command: &[OsString], settings: &Settings) -> ExitCode {
         let read = Configured::read();
         let Ok(configured) = read.map_err(|error| errln!("Guardian blocked makepkg: {error}."))
         else {
-            return ExitCode::from(2);
+            return ExitCode::from(FAILED);
         };
         let functions = recipe_functions(&build_dir, &recipe);
         let step = UpstreamStep {
@@ -318,9 +318,9 @@ pub(crate) fn run(command: &[OsString], settings: &Settings) -> ExitCode {
         } else {
             Ran::Nothing
         };
-        audit::refused(Gate::Aur, &format!("{}: {error}", target.subject()), 2);
+        audit::refused(Gate::Aur, &format!("{}: {error}", target.subject()), FAILED);
         notify::blocked(&subject(&directory_name), &error.to_string(), ran);
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     }
     errln!(
         "Guardian: {}; starting {}",
@@ -363,15 +363,15 @@ fn review_recipe(
         .file_name()
         .and_then(OsStr::to_str)
         .unwrap_or_default();
-    let verdict = review_and_decide(
+    let verdict = review_and_decide(GateReview {
+        gate: Gate::Aur,
         target,
         settings,
-        &OpenCode::UserPath,
-        Some(terminal),
+        opencode: &OpenCode::UserPath,
         context,
-        Gate::Aur,
-        Some(&|report| recipe_contents(target, &report.snapshot, recipe)),
-    );
+        confirm: Some(terminal),
+        content: Some(&|report| recipe_contents(target, &report.snapshot, recipe)),
+    });
     if !verdict.allows_running() {
         errln!("Guardian blocked makepkg because the review of the recipe did not allow it.");
         verdict.standing.say();
@@ -381,9 +381,9 @@ fn review_recipe(
     }
     if let Err(error) = scan::verify_unchanged(&target.config, &verdict.report.snapshot) {
         errln!("Guardian blocked makepkg because {error}.");
-        audit::refused(Gate::Aur, &format!("{}: {error}", target.subject()), 2);
+        audit::refused(Gate::Aur, &format!("{}: {error}", target.subject()), FAILED);
         notify::blocked(&subject(name), &error.to_string(), Ran::Nothing);
-        return Err(ExitCode::from(2));
+        return Err(ExitCode::from(FAILED));
     }
     Ok(verdict)
 }
@@ -456,7 +456,7 @@ fn start_build(
     }
     let error = build.exec();
     errln!("Could not start {}: {error}", makepkg.display());
-    ExitCode::from(2)
+    ExitCode::from(FAILED)
 }
 
 fn recipe_target(build_dir: &Path, key: &str, aur: bool) -> Target {
@@ -506,23 +506,27 @@ fn is_abbreviated(text: &str) -> bool {
 /// `MIRRORED_FLAGS` (also out of short clusters like `-fCA`), `--config
 /// <file>`, and makepkg's trailing `NAME=value` settings. A call that picks
 /// another recipe or directory (`-p`, `-D`) is refused.
-fn mirrored_arguments(arguments: &[OsString]) -> Result<Vec<OsString>, String> {
+fn mirrored_arguments(arguments: &[OsString]) -> Result<Vec<OsString>, Error> {
     let unsupported = |text: &str| {
-        format!("{text} is not supported: the gate reviews the PKGBUILD in the working directory")
+        Error::Message(format!(
+            "{text} is not supported: the gate reviews the PKGBUILD in the working directory"
+        ))
     };
     let mut mirrored = Vec::new();
     let mut iter = arguments.iter();
     while let Some(arg) = iter.next() {
         let Some(text) = arg.to_str() else {
-            return Err(format!(
+            return Err(Error::Message(format!(
                 "an argument is not UTF-8: {}",
                 arg.to_string_lossy()
-            ));
+            )));
         };
         match text {
             "-p" | "--file" | "-D" | "--dir" => return Err(unsupported(text)),
             "--config" => {
-                let file = iter.next().ok_or("--config needs a file")?;
+                let file = iter
+                    .next()
+                    .ok_or_else(|| Error::Message("--config needs a file".into()))?;
                 mirrored.extend(["--config".into(), file.clone()]);
             }
             _ if text.starts_with("--config=") || MIRRORED_FLAGS.contains(&text) => {
@@ -711,7 +715,7 @@ impl Configured {
         )?
         .into_success()?;
         Self::parse(&output)
-            .ok_or_else(|| Error::Refused("makepkg's configuration could not be read".into()))
+            .ok_or_else(|| Error::Message("makepkg's configuration could not be read".into()))
     }
 
     fn parse(output: &[u8]) -> Option<Self> {
@@ -794,7 +798,7 @@ fn unpack_archives(
                     );
                     collected.add_unpacked(&archive, &directory, roots, &step.functions.written);
                 }
-                Err(why) => collected.not_unpacked(&archive, &why),
+                Err(why) => collected.not_unpacked(&archive, &why.to_string()),
             }
         }
     }
@@ -805,17 +809,17 @@ fn unpack_one(
     srcdir: &Path,
     archive: &Path,
     scratch: &mut Option<unpack::Scratch>,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, Error> {
     if scratch.is_none() {
         let beside = srcdir.parent().unwrap_or(srcdir);
         *scratch = Some(unpack::Scratch::create(beside)?);
     }
     let into = scratch
         .as_mut()
-        .ok_or("no directory to unpack into")?
+        .ok_or_else(|| Error::Message("no directory to unpack into".into()))?
         .next()?;
-    let home = home().map_err(|error| error.to_string())?;
-    let archive = fs::canonicalize(archive).map_err(|error| error.to_string())?;
+    let home = home()?;
+    let archive = fs::canonicalize(archive).at(archive)?;
     let mut jail: Vec<OsString> = vec![tools::BWRAP.into()];
     jail.extend(sandbox::fetch_jail(&FetchJail {
         home: &home,
@@ -934,7 +938,7 @@ fn open_records(arguments: &[OsString], key: &str, name: &str) -> Option<State> 
         return Some(state);
     };
     errln!("Guardian blocked makepkg: {}", refused.message);
-    audit::refused(Gate::Aur, &format!("aur:{key}: {}", refused.why), 2);
+    audit::refused(Gate::Aur, &format!("aur:{key}: {}", refused.why), FAILED);
     notify::blocked(&subject(name), refused.why, Ran::Nothing);
     None
 }
@@ -1058,7 +1062,7 @@ fn dependency_facts(upstream: &Upstream) -> Vec<String> {
 /// A block of the upstream step: said, notified, and turned into the exit
 /// code. It notes that the recipe ran: makepkg sources it, in the jail, to
 /// list the sources.
-fn block(step: &UpstreamStep<'_>, message: &str, why: &str, code: u8) -> ExitCode {
+fn block(step: &UpstreamStep<'_>, message: impl fmt::Display, why: &str, code: u8) -> ExitCode {
     errln!("Guardian blocked makepkg: {message}");
     audit::refused(Gate::Aur, &format!("aur:{}: {why}", step.key), code);
     notify::blocked(&subject(step.name), why, Ran::RecipeToFetch);
@@ -1088,9 +1092,9 @@ fn list_sources(step: &UpstreamStep<'_>, confirm: &mut dyn Confirm) -> Result<Li
     let unreadable = |error: String| {
         block(
             step,
-            &format!("could not read the source list ({error})."),
+            format!("could not read the source list ({error})."),
             "the source list could not be read",
-            2,
+            FAILED,
         )
     };
     let srcinfo = probe(step).map_err(|error| unreadable(error.to_string()))?;
@@ -1104,11 +1108,11 @@ fn list_sources(step: &UpstreamStep<'_>, confirm: &mut dyn Confirm) -> Result<Li
         Followed::Differs(array) => {
             return Err(block(
                 step,
-                &format!(
+                format!(
                     "listing the recipe gave another {array} than it writes out; what it builds with cannot be known."
                 ),
                 "the recipe lists other sources than it writes out",
-                2,
+                FAILED,
             ));
         }
         Followed::No(reasons) => {
@@ -1150,7 +1154,7 @@ fn collect_sources(
     let mut collected = aur::walk_upstream(&srcdir, &roots, &step.functions.written, &noextract);
     // Kept until the files are chosen: the unpacked ones are read from it.
     let scratch = unpack_archives(step, &srcdir, &roots, &mut collected);
-    let not_held = |refused: NotHeld| block(step, &refused.message, refused.why, 2);
+    let not_held = |refused: NotHeld| block(step, &refused.message, refused.why, FAILED);
     if step.extract {
         record_extraction(step, &srcdir, &collected).map_err(not_held)?;
     } else if collected.upstream().found {
@@ -1176,6 +1180,36 @@ fn upstream_step(
     outcome
 }
 
+/// What the reviewer of the upstream sources is told besides the files:
+/// the review's scope, how the sources were followed, whether the test
+/// suite runs, how each source is fetched, and `facts`. A source that can
+/// be replaced in transit blocks the build.
+fn upstream_context(
+    step: &UpstreamStep<'_>,
+    listed: &Listed,
+    facts: Vec<String>,
+) -> Result<Vec<String>, ExitCode> {
+    let mut context = vec![aur::UPSTREAM_SCOPE.to_string()];
+    context.extend(listed.fact.map(str::to_string));
+    context.push(if aur::runs_tests(step.recipe) {
+        "The recipe defines check(), so the upstream test suite runs during this build.".into()
+    } else {
+        "The recipe defines no check(), so the upstream test suite does not run during this build."
+            .into()
+    });
+    let checked = source_context(&listed.sources, step.uses_sources).map_err(|()| {
+        block(
+            step,
+            "a source can be replaced in transit.",
+            "a source can be replaced in transit",
+            1,
+        )
+    })?;
+    context.extend(checked);
+    context.extend(facts);
+    Ok(context)
+}
+
 /// Returns why makepkg must not start, as an exit code.
 fn review_upstream(
     step: &UpstreamStep<'_>,
@@ -1190,28 +1224,16 @@ fn review_upstream(
         return Err(block(step, &message, why, 1));
     }
 
-    let mut context = vec![aur::UPSTREAM_SCOPE.to_string()];
-    context.extend(listed.fact.map(str::to_string));
-    context.push(if aur::runs_tests(step.recipe) {
-        "The recipe defines check(), so the upstream test suite runs during this build.".into()
-    } else {
-        "The recipe defines no check(), so the upstream test suite does not run during this build."
-            .into()
-    });
-    let checked = source_context(sources, step.uses_sources).map_err(|()| {
-        block(
-            step,
-            "a source can be replaced in transit.",
-            "a source can be replaced in transit",
-            1,
-        )
-    })?;
-    context.extend(checked);
-    context.extend(facts);
+    let mut context = upstream_context(step, &listed, facts)?;
 
     if step.extract {
         pre_extract(step, &dirs, &listed.fetch).map_err(|message| {
-            block(step, &message, "fetching the sources for review failed", 2)
+            block(
+                step,
+                message,
+                "fetching the sources for review failed",
+                FAILED,
+            )
         })?;
     }
 
@@ -1227,12 +1249,12 @@ fn review_upstream(
     if !sources.is_empty() && !upstream.found {
         return Err(block(
             step,
-            &format!(
+            format!(
                 "the extracted sources were not found where makepkg put them ({}).",
                 dirs.srcdir().display()
             ),
             "the extracted sources could not be found for review",
-            2,
+            FAILED,
         ));
     }
     let mut upstream = upstream;
@@ -1320,7 +1342,7 @@ fn verify_recipe(
     };
     let (current, gaps) = scan::walk(&config, &mut |_| {});
     if !gaps.is_empty() {
-        return Err(Error::Refused(
+        return Err(Error::Message(
             "the recipe became unreadable after review".into(),
         ));
     }
@@ -1337,7 +1359,7 @@ fn verify_recipe(
     if now == then {
         Ok(())
     } else {
-        Err(Error::Refused("the recipe changed after review".into()))
+        Err(Error::Message("the recipe changed after review".into()))
     }
 }
 
@@ -1393,10 +1415,12 @@ fn print_warnings(title: &str, warnings: &[String]) {
 }
 
 /// Parses `makepkg-gate -- <makepkg> [args...]`.
-pub(crate) fn parse(args: &[OsString]) -> Result<Vec<OsString>, String> {
+pub(crate) fn parse(args: &[OsString]) -> Result<Vec<OsString>, Error> {
     match args.split_first() {
         Some((separator, rest)) if separator == "--" && !rest.is_empty() => Ok(rest.to_vec()),
-        _ => Err("usage: omarchy-guardian makepkg-gate -- <makepkg> [args...]".into()),
+        _ => Err(Error::Message(
+            "usage: omarchy-guardian makepkg-gate -- <makepkg> [args...]".into(),
+        )),
     }
 }
 
