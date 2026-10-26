@@ -11,7 +11,7 @@ use crate::json::Json;
 use crate::report::Gap;
 use crate::tomlish::{self, Entry};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Ecosystem {
     CratesIo,
     Npm,

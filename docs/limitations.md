@@ -45,7 +45,10 @@ matter most:
   not seen; and only shell scripts no package vouches for are looked through
   for what they start, three deep, not scripts of other interpreters, and
   inside a script only a program named by a path in the place of a command
-  ([System sweep](system-sweep.md#where-following-stops)).
+  ([System sweep](system-sweep.md#where-following-stops)). Installed
+  language packages are looked up only for OSV's known-malicious advisories,
+  and a linked package directory is not looked up
+  ([Language packages](system-sweep.md#language-packages)).
 - **Packages:** only scriptlets, auto-run files and the text files those name
   are reviewed, not the rest of the payload; a removal is not reviewed; a unit
   you enable yourself later is not reviewed then; front ends that call libalpm
@@ -73,7 +76,9 @@ matter most:
   still goes with its file ([System
   sweep](system-sweep.md#what-is-taken-out-of-a-file-that-is-sent)). Under
   `local-only` no source is sent to an AI, but lockfile package names and
-  versions still go to the OSV API (`api.osv.dev`), and an AUR package's name
+  versions, and the ecosystem, name and version of each language package the
+  sweep finds installed, still go to the OSV API (`api.osv.dev`), and an AUR
+  package's name
   (and the names in its PKGBUILD's `pkgname=` lines) to the AUR. The daily
   check for a newer release asks GitHub for the project's tags under every
   level, until it is turned off ([Hearing of a new

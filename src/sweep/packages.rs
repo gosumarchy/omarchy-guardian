@@ -1,0 +1,207 @@
+//! Language packages installed outside pacman: global npm packages (the
+//! system's and each node mise installed), pipx's environments, crates
+//! `cargo install` put in place, and what mise installed through its npm,
+//! pipx and cargo backends (see `inventory`). Each installed name and
+//! version is looked up in OSV, and only a known-malicious advisory (an ID
+//! starting `MAL-`) is a finding: every other advisory is a vulnerability,
+//! which is not this check's to report.
+//!
+//! What goes to OSV is the ecosystem, name and version of every installed
+//! package, at every sweep, and nothing else. Nothing is kept between
+//! sweeps: a package is often found malicious only after it was installed,
+//! and asking about all of them each time tells of it the next day. The
+//! lookup costs no AI call.
+//!
+//! What cannot be read or asked about is said as not checked: a lookup that
+//! failed is never a clear one. An item stands for one malicious package
+//! where it is installed, named by its manifest, ecosystem and name; its
+//! text is the version, so a new version is a changed item.
+
+mod inventory;
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use super::collect::{Body, Item, Origin, Scope};
+use super::tier::Tier;
+use crate::autorun::Category;
+use crate::deps::{Dependency, Ecosystem};
+use crate::error::Error;
+use crate::osv::{self, Audit};
+use crate::rules::RuleId;
+use crate::sha256::Sha256;
+use inventory::{Installed, Inventory, Package, Places};
+
+/// The ecosystems the inventory reads, each asked about on its own.
+const ECOSYSTEMS: [Ecosystem; 3] = [Ecosystem::Npm, Ecosystem::PyPi, Ecosystem::CratesIo];
+
+/// How the note starts that npm runs install scripts: a fact about the
+/// machine, said once (see `sweep::FACTS`).
+pub(super) const INSTALL_SCRIPTS: &str = "npm runs install scripts";
+
+/// Asks OSV about one batch of one ecosystem's packages: `osv::query`, or a
+/// fake in tests.
+type Lookup<'a> = &'a dyn Fn(&[Dependency]) -> Result<Audit, Error>;
+
+/// The IDs of the known-malicious advisories OSV listed for each package
+/// it was asked about; a package it was not asked about is not in it.
+type Malicious = BTreeMap<Package, Vec<String>>;
+
+/// What the check found.
+#[derive(Debug, Default)]
+pub(super) struct Packages {
+    /// One item for each malicious package where it is installed.
+    pub(super) items: Vec<Item>,
+    pub(super) notes: Vec<String>,
+    /// What was not checked, each as a sentence (see
+    /// `Collection::truncated`).
+    pub(super) unchecked: Vec<String>,
+}
+
+/// Reads the language packages installed under `scope` and asks OSV about
+/// every one of them. Waits on the network for as long as OSV takes.
+pub(super) fn check(scope: &Scope<'_>) -> Packages {
+    let places = Places::from_env(scope.home);
+    let inventory = inventory::collect(scope.root, &places);
+    look_up(inventory, scope.home, &osv::query)
+}
+
+/// Asks `lookup` about the packages of `inventory`, and makes an item of
+/// each malicious one.
+fn look_up(inventory: Inventory, home: Option<&str>, lookup: Lookup<'_>) -> Packages {
+    let mut packages = Packages {
+        items: Vec::new(),
+        notes: inventory.notes,
+        unchecked: inventory.unchecked,
+    };
+    if inventory.npm_runs_scripts {
+        packages.notes.push(format!(
+            "{INSTALL_SCRIPTS} for every package it installs, as you and with your files in reach, which is how most malicious npm packages act: `npm config set ignore-scripts true` turns them off (a package that builds native code then needs `npm rebuild <name>`)"
+        ));
+    }
+
+    let installed: BTreeSet<&Package> = inventory
+        .installed
+        .iter()
+        .map(|installed| &installed.package)
+        .collect();
+    let mut malicious = Malicious::new();
+    for ecosystem in ECOSYSTEMS {
+        let of_ecosystem: Vec<&Package> = installed
+            .iter()
+            .copied()
+            .filter(|package| package.ecosystem == ecosystem)
+            .collect();
+        for batch in of_ecosystem.chunks(osv::BATCH_SIZE) {
+            ask(batch, lookup, &mut malicious, &mut packages.unchecked);
+        }
+    }
+
+    for installed in &inventory.installed {
+        if let Some(ids) = malicious.get(&installed.package)
+            && !ids.is_empty()
+        {
+            packages.items.push(item(installed, ids, home));
+        }
+    }
+    packages
+}
+
+/// Asks `lookup` about `batch`, packages of one ecosystem, and puts what it
+/// says in `malicious`. Within one ecosystem a name and version name one
+/// package, which is how OSV's advisories are matched to them.
+fn ask(
+    batch: &[&Package],
+    lookup: Lookup<'_>,
+    malicious: &mut Malicious,
+    unchecked: &mut Vec<String>,
+) {
+    let Some(first) = batch.first() else {
+        return;
+    };
+    let ecosystem = first.ecosystem.osv_name();
+    let query: Vec<Dependency> = batch
+        .iter()
+        .map(|package| Dependency {
+            ecosystem: package.ecosystem,
+            name: package.name.clone(),
+            version: package.version.clone(),
+            lockfile: String::new(),
+        })
+        .collect();
+    let audit = match lookup(&query) {
+        Ok(audit) => audit,
+        Err(error) => {
+            unchecked.push(format!(
+                "{} {ecosystem} package version(s) were not looked up in OSV ({error}), so whether they are known to be malicious is not checked",
+                batch.len()
+            ));
+            return;
+        }
+    };
+    if audit.truncated {
+        unchecked.push(format!(
+            "OSV listed more advisories for some {ecosystem} packages than one answer holds: the rest were not checked"
+        ));
+    }
+    for package in batch {
+        let ids = audit
+            .advisories
+            .iter()
+            .filter(|advisory| {
+                advisory.package == package.name
+                    && advisory.version == package.version
+                    && is_malicious_id(&advisory.id)
+            })
+            .map(|advisory| advisory.id.clone())
+            .collect();
+        malicious.insert((*package).clone(), ids);
+    }
+}
+
+/// Whether `id` is a known-malicious advisory's: OSV gives those IDs that
+/// start with `MAL-` (the malicious-packages database of the Open Source
+/// Security Foundation).
+fn is_malicious_id(id: &str) -> bool {
+    id.strip_prefix("MAL-").is_some_and(|rest| !rest.is_empty())
+}
+
+/// The item of `installed`, which OSV lists as malicious in `ids`.
+fn item(installed: &Installed, ids: &[String], home: Option<&str>) -> Item {
+    let Package {
+        ecosystem,
+        name,
+        version,
+    } = &installed.package;
+    let ecosystem = ecosystem.osv_name();
+    let text = format!("{ecosystem} {name} {version}");
+    let in_home = home.is_some_and(|home| installed.manifest.starts_with(&format!("{home}/")));
+    Item {
+        origin: if in_home {
+            Origin::User
+        } else {
+            Origin::System
+        },
+        category: Category::Package,
+        path: format!("{}#{ecosystem}:{name}", installed.manifest),
+        tier: Tier::Unknown,
+        sha256: Some(Sha256::digest(text.as_bytes())),
+        body: Body::Text(text),
+        runs: Vec::new(),
+        run_by: None,
+        file: None,
+        notes: vec![format!(
+            "{ecosystem} package {name} {version}, read from /{}",
+            installed.manifest
+        )],
+        alerts: vec![(
+            RuleId::MaliciousPackage,
+            format!(
+                "OSV lists {name} {version} as malicious: {}",
+                ids.join(", ")
+            ),
+        )],
+    }
+}
+
+#[cfg(test)]
+mod tests;

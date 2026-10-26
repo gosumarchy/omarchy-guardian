@@ -56,10 +56,13 @@ pub(crate) enum Category {
     /// The system's own program directory, which the sweep compares with
     /// the packages: a changed or unowned file there.
     Program,
+    /// A language package installed outside pacman (npm, pipx, cargo,
+    /// mise) that OSV lists as malicious.
+    Package,
 }
 
 impl Category {
-    const ALL: [Self; 38] = [
+    const ALL: [Self; 39] = [
         Self::Autostart,
         Self::Boot,
         Self::BootConfig,
@@ -98,6 +101,7 @@ impl Category {
         Self::Terminal,
         Self::Toolchain,
         Self::Program,
+        Self::Package,
     ];
 
     /// A stable machine name (`pam`, `systemd-generator`).
@@ -141,6 +145,7 @@ impl Category {
             Self::Terminal => "terminal",
             Self::Toolchain => "toolchain",
             Self::Program => "program",
+            Self::Package => "package",
         }
     }
 
@@ -204,6 +209,7 @@ impl Category {
             Self::Terminal => "Terminal and prompt configuration",
             Self::Toolchain => "Developer tool configuration (npm, pip, cargo, mise)",
             Self::Program => "The system's own programs",
+            Self::Package => "Language packages (npm, pipx, cargo, mise)",
         }
     }
 
@@ -243,6 +249,7 @@ impl Category {
             Self::Terminal => "runs in every terminal",
             Self::Toolchain => "decides what builds and installs run and fetch",
             Self::Program => "runs when anything starts it by name",
+            Self::Package => "runs when a tool that uses it starts",
         }
     }
 }

@@ -86,6 +86,7 @@ pub(crate) enum RuleId {
     KernelTap,
     KeptFromReview,
     RemoteCodeInstall,
+    MaliciousPackage,
 }
 
 /// How a rule decides whether a lowercased line matches.
@@ -121,7 +122,7 @@ const SHELL_EXECUTION: &[&str] = &[
 ];
 
 impl RuleId {
-    const ALL: [Self; 45] = [
+    const ALL: [Self; 46] = [
         Self::DownloadAndExecute,
         Self::EncodedCommandExecution,
         Self::CredentialFileAccess,
@@ -167,6 +168,7 @@ impl RuleId {
         Self::KernelTap,
         Self::KeptFromReview,
         Self::RemoteCodeInstall,
+        Self::MaliciousPackage,
     ];
 
     pub(crate) fn from_name(name: &str) -> Option<Self> {
@@ -220,6 +222,7 @@ impl RuleId {
             Self::KernelTap => "kernel-tap",
             Self::KeptFromReview => "kept-from-review",
             Self::RemoteCodeInstall => "remote-code-install",
+            Self::MaliciousPackage => "malicious-package",
         }
     }
 
@@ -246,7 +249,8 @@ impl RuleId {
             | Self::PrivilegedAccount
             | Self::BootTampering
             | Self::RootkitSign
-            | Self::TracedSecrets => Severity::High,
+            | Self::TracedSecrets
+            | Self::MaliciousPackage => Severity::High,
             Self::NetworkListener => Severity::Low,
             Self::CredentialFileAccess
             | Self::PersistenceModification
@@ -276,7 +280,7 @@ impl RuleId {
     /// What each rule reports, in the order of `ALL`. A table rather than a
     /// match so that it stays one item however many rules there are; the
     /// test below holds it to `ALL`.
-    const DESCRIPTIONS: [(Self, &'static str); 45] = [
+    const DESCRIPTIONS: [(Self, &'static str); 46] = [
         (
             Self::DownloadAndExecute,
             "Fetches code from the network and runs it without it being reviewed: piped into a shell or an interpreter, run from a substitution, or saved and then run.",
@@ -457,6 +461,10 @@ impl RuleId {
             Self::RemoteCodeInstall,
             "Installs and runs code from an address, not from this source: a package manager is given a URL or a repository, or told to fetch and run a package at whatever its newest version is.",
         ),
+        (
+            Self::MaliciousPackage,
+            "An installed language package (npm, PyPI, crates.io) is a version OSV lists as malicious (an advisory whose id starts with MAL-).",
+        ),
     ];
 
     pub(crate) const fn description(self) -> &'static str {
@@ -510,7 +518,8 @@ impl RuleId {
             | Self::TracedProcess
             | Self::TracedSecrets
             | Self::KernelTap
-            | Self::KeptFromReview => Matcher::Reported,
+            | Self::KeptFromReview
+            | Self::MaliciousPackage => Matcher::Reported,
             Self::DisabledTlsVerification => Matcher::Custom(disables_tls_verification),
             Self::RemoteShell => Matcher::Custom(is_remote_shell),
             Self::CryptoMiner => Matcher::Custom(is_crypto_mining),
@@ -571,7 +580,8 @@ impl RuleId {
             | Self::TracedProcess
             | Self::TracedSecrets
             | Self::KernelTap
-            | Self::KeptFromReview => false,
+            | Self::KeptFromReview
+            | Self::MaliciousPackage => false,
         }
     }
 

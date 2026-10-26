@@ -36,8 +36,10 @@ profile for your own sources and for pacman alike:
 | Private | `local-only` | no AI: no source is sent to an AI provider; you confirm installs of your own sources (AUR builds, themes, plugins, scans) |
 
 Under `local-only` two lookups still go out: package names and versions from
-lockfiles go to the OSV API (`api.osv.dev`), and an AUR package's name goes to
-the AUR (`aur.archlinux.org`). No file content is sent. An AUR build still
+lockfiles, and of the language packages the sweep finds installed (see
+[Language packages](system-sweep.md#language-packages)), go to the OSV API
+(`api.osv.dev`), and an AUR package's name goes to the AUR
+(`aur.archlinux.org`). No file content is sent. An AUR build still
 downloads its sources.
 
 You can also pick the model used for your own sources and for pacman (Claude

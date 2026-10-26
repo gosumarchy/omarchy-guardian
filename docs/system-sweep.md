@@ -16,6 +16,7 @@ described.
   - [Programs ahead of the system's own](#programs-ahead-of-the-systems-own)
   - [More that decides what runs](#more-that-decides-what-runs)
   - [Accounts, keys and trust anchors](#accounts-keys-and-trust-anchors)
+  - [Language packages](#language-packages)
   - [Guardian's own units](#guardians-own-units)
 - [What runs now](#what-runs-now)
   - [Programs with no file, or from a temporary directory](#programs-with-no-file-or-from-a-temporary-directory)
@@ -407,6 +408,63 @@ label into it ahead of time. The collector's very first run has no record to
 compare with and says so by sending no list; for that one run your sweep's own
 memory stands in. A machine that runs the root checks only with `sweep --root`
 never has that record: there your sweep's own memory stands in every time.
+
+### Language packages
+
+Packages installed with a language's own package manager, outside pacman, are
+looked up in [OSV](https://osv.dev), and a version OSV lists as malicious (an
+advisory whose id starts with `MAL-`) is a high finding. Other advisories
+(known vulnerabilities) are not reported here.
+
+What is read, never run, and never followed through a link:
+
+- global npm packages: `/usr/lib/node_modules`, the `lib/node_modules` under
+  the `prefix` your npm configuration sets, and each node mise installed, with
+  scoped packages and each package's own `node_modules` (8 levels deep), by
+  their `package.json`;
+- pipx's environments (`~/.local/share/pipx/venvs`, or under `PIPX_HOME`), by
+  the `*.dist-info/METADATA` of each package in them, the main package and its
+  dependencies alike;
+- what `cargo install` recorded in `~/.cargo/.crates2.json` (or under
+  `CARGO_HOME`), for crates from crates.io;
+- what mise installed (`~/.local/share/mise/installs`, or under
+  `MISE_DATA_DIR`) as node or python itself, or through its `npm:`, `pipx:`
+  and `cargo:` backends, read as above. Tools of other backends (`aqua:`,
+  `ubi:`, `go:`, core tools such as Go) have no ecosystem in OSV: a note names
+  them.
+
+The variables are read from the sweep's own environment: the daily timer's
+sweep gets them only where they are set for your systemd user session.
+
+At every sweep the whole inventory goes to OSV: the ecosystem, the name and
+the version of each installed package, in requests of up to 500 packages per
+ecosystem (`api.osv.dev/v1/querybatch`, the lookup the gate uses for
+lockfiles), and nothing else. Nothing goes to the AI, the lookup costs no AI
+call, and there is no setting to turn it off, as there is none for the gate's.
+Nothing of OSV's answers is kept, so a package found malicious after it was
+installed is told at the next sweep.
+
+Each malicious package is an item where it is installed, named by its manifest,
+ecosystem and name (`/usr/lib/node_modules/x/package.json#npm:x`), with its
+version as what is remembered: a new version of it is a changed item, and an
+allow covers the version allowed.
+
+What is not checked makes the sweep incomplete: a manifest that cannot be read
+or names no package and version, an environment with no `site-packages`, more
+than 20,000 packages or 100,000 directory entries, npm packages nested deeper
+than 8 levels, and a request to OSV that failed (offline, OSV down), whose
+packages are each said as not checked, never as clear. A linked package directory (what `npm link` makes), a crate from
+git, a path or another registry, and an `*.egg-info` package are not looked up;
+the first two are named in a note.
+
+When npm is installed (`/usr/bin/npm`, or a node of mise's) and neither your
+`~/.npmrc` (or the file `NPM_CONFIG_USERCONFIG` names) nor `/etc/npmrc` or
+`/usr/etc/npmrc` sets `ignore-scripts=true`, a note says that npm runs the
+install scripts of every package it installs, which is how most malicious npm
+packages act, and how to turn them off (`npm config set ignore-scripts true`).
+It is said once, and again should it stop and come back. Only the `prefix` and
+`ignore-scripts` keys are taken from these files, which hold registry tokens;
+nothing of them is shown or sent.
 
 ### Guardian's own units
 
@@ -1239,6 +1297,7 @@ reviews as well, are listed under [Local rules](local-rules.md#rule-ids).
 | `privileged-account` | high | An account has rights no ordinary system gives it: a second account with user id 0, or a system account someone can log in to. |
 | `boot-tampering` | high | The running kernel was started with a parameter that turns off a defence or replaces init and that the reviewed boot configuration does not hold, or a kernel image in `/boot` is not the one its package ships. |
 | `rootkit-sign` | high | The kernel's own lists disagree (a process, module or socket that exists is not listed), or a program wears a kernel thread's name: what something hiding itself looks like. |
+| `malicious-package` | high | An installed language package (npm, PyPI, crates.io) is a version OSV lists as malicious (an advisory whose id starts with `MAL-`). |
 | `traced-secrets` | high | A process is attached, the way a debugger is, to a program that holds secrets (a shell, SSH, sudo, a key agent, a browser, a password manager). |
 | `ssh-command` | medium | An SSH file runs a command or loads a library (a `ProxyCommand`, a `Match exec`, a provider library), or a key carries a `command=` or `environment=` option. |
 | `running-from-temp` | medium | A program runs from a temporary or cache directory, where downloads land. |

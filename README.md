@@ -39,8 +39,10 @@ it shows on hover:
   it found running only where it is plainly a script, and takes plainly
   written secret values and URL passwords out of what it sends. A secret
   anywhere else goes with its file. Package names and versions from lockfiles
-  go to the OSV API (`api.osv.dev`), and an AUR package's name goes to the
-  AUR. The `local-only` level sends nothing to an AI; the OSV and AUR lookups
+  go to the OSV API (`api.osv.dev`), and so do the ecosystem, name and version
+  of each npm, pipx and cargo package the sweep finds installed outside pacman
+  ([Language packages](docs/system-sweep.md#language-packages)); an AUR
+  package's name goes to the AUR. The `local-only` level sends nothing to an AI; the OSV and AUR lookups
   remain. Once a day the sweep asks the project's repository on GitHub for
   its release tags, sending nothing about your machine (`[update] check =
   "off"` turns that off).
@@ -317,12 +319,15 @@ under [Limitations](docs/limitations.md):
   not looked at, and other mounted filesystems are not searched for setuid
   files; as a user only your own processes can be looked at; without root
   checks every sweep is incomplete ([System sweep](docs/system-sweep.md)).
+  Installed language packages are looked up only for OSV's known-malicious
+  advisories, not for vulnerabilities ([Language
+  packages](docs/system-sweep.md#language-packages)).
 - Source leaves the machine through the AI provider you configured, except
   under `local-only` and except the files kept from the AI by name or kind; a
   secret under a name Guardian does not recognise still goes with its file.
   Under `local-only` no source is sent, but lockfile package names and
-  versions still go to the OSV API and an AUR package's name to the AUR
-  ([Limitations](docs/limitations.md#the-limits-that-matter-most), [System
+  versions, and those of installed language packages, still go to the OSV
+  API and an AUR package's name to the AUR ([Limitations](docs/limitations.md#the-limits-that-matter-most), [System
   sweep](docs/system-sweep.md#what-goes-to-the-review)).
 - A block's report is passed to your AI agent on its command line, which other
   local users can read ([After a block](docs/permits.md#the-report)).
