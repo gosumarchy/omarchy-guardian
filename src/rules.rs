@@ -21,6 +21,7 @@ mod run;
 mod shell;
 
 use destructive::is_destructive_operation;
+pub(crate) use fetch::RUNNER_VALUE_FLAGS;
 use matchers::{
     CREDENTIAL_FILES, disables_protection, disables_tls_verification, is_crypto_mining,
     is_download_piped_to_shell, is_encoded_command_execution, is_privilege_escalation,

@@ -372,6 +372,65 @@ fn python_runs_fetched(command: &Command) -> bool {
     })
 }
 
+/// The flags of `uv tool run` (from uv's CLI reference, checked
+/// 2026-10-26) and `pipx run` that take a value as the next word.
+pub(crate) const RUNNER_VALUE_FLAGS: &[&str] = &[
+    "--allow-insecure-host",
+    "--trusted-host",
+    "--build-constraints",
+    "--build-constraint",
+    "-b",
+    "--cache-dir",
+    "--color",
+    "--config-file",
+    "--config-setting",
+    "--config-settings",
+    "-C",
+    "--config-settings-package",
+    "--constraints",
+    "--constraint",
+    "-c",
+    "--default-index",
+    "--directory",
+    "--env-file",
+    "--exclude-newer",
+    "--exclude-newer-package",
+    "--extra-index-url",
+    "--find-links",
+    "-f",
+    "--fork-strategy",
+    "--index",
+    "--index-strategy",
+    "--index-url",
+    "-i",
+    "--keyring-provider",
+    "--link-mode",
+    "--no-binary-package",
+    "--no-build-isolation-package",
+    "--no-build-package",
+    "--no-sources-package",
+    "--overrides",
+    "--override",
+    "--pip-args",
+    "--prerelease",
+    "--prerelease-package",
+    "--project",
+    "--python",
+    "-p",
+    "--python-platform",
+    "--refresh-package",
+    "--reinstall-package",
+    "--resolution",
+    "--torch-backend",
+    "--upgrade-group",
+    "--upgrade-package",
+    "-P",
+    "--with",
+    "-w",
+    "--with-editable",
+    "--with-requirements",
+];
+
 /// The package `uvx`, `uv tool run` or `pipx run` fetches out of what
 /// follows it: the value of `--from` (or `--spec`) where it is given,
 /// else the first word that is no flag. The values of the flags that take
@@ -381,19 +440,7 @@ fn fetched_package(run: &[String]) -> Option<&str> {
     while let Some(word) = words.next() {
         match word.as_str() {
             "--from" | "--spec" => return words.next().map(String::as_str),
-            "--python"
-            | "-p"
-            | "--with"
-            | "--with-editable"
-            | "--with-requirements"
-            | "--index"
-            | "--index-url"
-            | "-i"
-            | "--extra-index-url"
-            | "-f"
-            | "-c"
-            | "--exclude-newer"
-            | "--index-strategy" => {
+            flag if RUNNER_VALUE_FLAGS.contains(&flag) => {
                 words.next();
             }
             flag if flag.starts_with('-') => {
@@ -591,6 +638,7 @@ mod tests {
             "uvx --python 3.12 some-tool",
             "uvx -p 3.12.1 --with rich==13.0.0 some-tool",
             "uvx --with-requirements pinned==1.0.0 some-tool",
+            "uvx -w rich==13.0.0 some-tool",
             "uvx -c constraints==1.0.0 --exclude-newer 2024-01-01 some-tool",
             "pipx run --spec some-pkg tool",
             "uv tool run some-tool@latest",

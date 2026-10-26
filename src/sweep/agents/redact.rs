@@ -12,6 +12,7 @@
 //! after a flag named for authorization rather than a secret
 //! (`--authorization v`), and a quoted value of several words.
 
+use crate::rules::RUNNER_VALUE_FLAGS;
 use crate::sweep::judge::secrets::{REDACTED, is_secret_name};
 
 /// The beginnings of tokens that say what they are by themselves: Anthropic
@@ -56,6 +57,15 @@ enum Next {
     Word,
     /// It is the value of a flag or header named for a secret.
     Value,
+    /// It is the program a command runs.
+    Program,
+    /// It is the verb after `pipx`.
+    PipxVerb,
+    /// It is the package `npx`, `bunx`, `uvx` or `pipx run` fetches and
+    /// runs, or a flag before it.
+    Package,
+    /// It is the value of a flag before such a package (`--python 3.12`).
+    PackageFlagValue,
 }
 
 /// `line` with the secrets in it taken out, as `REDACTED`:
@@ -66,13 +76,14 @@ enum Next {
 /// - the value of `NAME=value` where a name before an `=` is named for a
 ///   secret (`GITHUB_TOKEN=x`, `--env=API_KEY=x`, `--token=x`);
 /// - the word after a flag named for a secret (`--api-key x`);
-/// - a word that is a token by its look (see `is_token`).
+/// - a word that is a token by its look (see `is_token`), but for the
+///   program a command runs and the package `npx` and the like run.
 ///
 /// Each only where it is token-shaped. The line is read word by word, as
 /// blanks split it; quotes around a word stay where they are.
 pub(super) fn redacted(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
-    let mut next = Next::Word;
+    let mut next = Next::Program;
     let mut word_start = None;
     for (index, character) in line.char_indices() {
         match (character.is_whitespace(), word_start) {
@@ -127,11 +138,48 @@ fn redacted_word(word: &str, next: &mut Next) -> String {
         if core.starts_with('-') && !core.contains('=') && is_secret_name(&core) {
             *next = Next::Value;
             core
+        } else if let Some(assigned) = without_assigned_secret(&core) {
+            assigned
+        } else if !matches!(asked, Next::Program | Next::Package) && is_token(&core) {
+            // What runs is never taken out by its look: a program or
+            // package named like a token (`sk-helper`) is what the review
+            // must see.
+            REDACTED.to_string()
         } else {
-            without_assigned_secret(&core)
+            core
         }
     };
+    if *next == Next::Word {
+        *next = following(asked, &lower);
+    }
     format!("{before}{core}{after}")
+}
+
+/// What the word `lower`, itself what `asked` says, makes of the next one:
+/// a shell separator, a prefix such as `sudo`, an assignment before a
+/// program, or a flag of such a prefix (`env -i`) leads to a program; `npx`, `bunx`, `uvx` and `pipx run` to the
+/// package they run.
+fn following(asked: Next, lower: &str) -> Next {
+    let program = lower.rsplit('/').next().unwrap_or(lower);
+    match asked {
+        _ if lower.ends_with([';', '|', '&']) => Next::Program,
+        Next::Program if matches!(program, "npx" | "bunx" | "uvx") => Next::Package,
+        Next::Program if program == "pipx" => Next::PipxVerb,
+        Next::PipxVerb if lower == "run" => Next::Package,
+        Next::Program
+            if matches!(
+                program,
+                "sudo" | "env" | "exec" | "nohup" | "command" | "time"
+            ) || lower.contains('=')
+                || lower.starts_with('-') =>
+        {
+            Next::Program
+        }
+        Next::Package if RUNNER_VALUE_FLAGS.contains(&lower) => Next::PackageFlagValue,
+        Next::Package if lower.starts_with('-') => Next::Package,
+        Next::PackageFlagValue => Next::Package,
+        Next::Word | Next::Value | Next::Program | Next::PipxVerb | Next::Package => Next::Word,
+    }
 }
 
 /// Whether `lower` is the scheme of an `Authorization` header, which says
@@ -163,9 +211,9 @@ fn value(word: &str) -> &str {
 }
 
 /// `word` with the value after the first name before an `=` that is named
-/// for a secret taken out (`--env=API_KEY=x`), or the word itself where it
-/// is a token by its look.
-fn without_assigned_secret(word: &str) -> String {
+/// for a secret taken out (`--env=API_KEY=x`); `None` where no such name
+/// is in it.
+fn without_assigned_secret(word: &str) -> Option<String> {
     let mut name_end = 0;
     for part in word.split('=') {
         let value_start = name_end + part.len() + 1;
@@ -173,19 +221,15 @@ fn without_assigned_secret(word: &str) -> String {
             break;
         }
         if is_secret_name(part) {
-            return format!(
+            return Some(format!(
                 "{}={}",
                 &word[..value_start - 1],
                 value(&word[value_start..])
-            );
+            ));
         }
         name_end = value_start;
     }
-    if is_token(word) {
-        REDACTED.to_string()
-    } else {
-        word.to_string()
-    }
+    None
 }
 
 /// `word` with who each address in it logs in as taken out, where that is

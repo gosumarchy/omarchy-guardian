@@ -173,8 +173,8 @@ pub(super) fn add(scope: &Scope<'_>, source: &Source<'_>, entries: Entries, foun
 ///   and host of those that are addresses;
 ///
 /// and before it, on a comment line, the names of the variables it is
-/// started with. What it runs, which is followed, is that command line,
-/// with a plugin's directory written in.
+/// started with. What it runs, which is followed, is the command line as
+/// written, with a plugin's directory written in.
 fn item(scope: &Scope<'_>, source: &Source<'_>, entry: Entry) -> Item {
     let Entry {
         key,
@@ -186,11 +186,11 @@ fn item(scope: &Scope<'_>, source: &Source<'_>, entry: Entry) -> Item {
     let mut alerts = Vec::new();
     let started = match launch {
         Launch::Command(line) => {
-            // What runs is shown in the sweep's output and saved reports,
-            // so it is the line without its secrets too.
-            let line = redacted(&line);
+            // Followed as written: a program named like a token is still
+            // found. The collector takes the secrets out of it once it has
+            // been followed (see `hide_secrets_in_runs`).
             runs.push(with_plugin_root(&line, source.plugin_root));
-            line
+            redacted(&line)
         }
         Launch::Remote { scheme, host } => {
             alerts.extend(remote_alert(&host));
@@ -269,7 +269,11 @@ fn environment_text(set: &[Variable]) -> String {
 fn environment_alerts(variable: &Variable) -> Vec<(RuleId, String)> {
     let mut alerts = Vec::new();
     let name = &variable.name;
-    if LOADING_VARIABLES.contains(&name.as_str()) {
+    let upper = name.to_ascii_uppercase();
+    // A proxy is honoured in either case (`https_proxy`); the loader's
+    // variables only as written.
+    let proxy = upper.ends_with("_PROXY") && LOADING_VARIABLES.contains(&upper.as_str());
+    if LOADING_VARIABLES.contains(&name.as_str()) || proxy {
         alerts.push((
             RuleId::RiskyConfiguration,
             format!(
@@ -277,8 +281,16 @@ fn environment_alerts(variable: &Variable) -> Vec<(RuleId, String)> {
             ),
         ));
     }
+    if upper == "NODE_EXTRA_CA_CERTS" {
+        alerts.push((
+            RuleId::RiskyConfiguration,
+            format!(
+                "sets {name}: the agent trusts the certificates it names, so whoever holds one can read and change what it sends"
+            ),
+        ));
+    }
     if let Some((_, host)) = &variable.address
-        && name.to_ascii_uppercase().ends_with("_BASE_URL")
+        && upper.ends_with("_BASE_URL")
     {
         let bare = without_port(host);
         if !is_provider_host(bare) && !is_local_host(bare) {

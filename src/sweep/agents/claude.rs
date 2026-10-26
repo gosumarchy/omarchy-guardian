@@ -248,8 +248,9 @@ fn plugins(scope: &Scope<'_>, claude: &str, found: &mut Found) {
                 file: &file,
                 plugin_root: Some(&root),
                 note: Some(format!(
-                    "of the Claude Code plugin {name} (version {})",
-                    version.unwrap_or("unknown")
+                    "of the Claude Code plugin {} (version {})",
+                    name.escape_debug(),
+                    version.unwrap_or("unknown").escape_debug()
                 )),
             };
             let key = format!("plugins/{}/{index}", key_part(name));

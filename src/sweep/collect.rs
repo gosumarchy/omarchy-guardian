@@ -356,6 +356,8 @@ pub(super) fn collect(scope: &Scope<'_>) -> Collection {
             own::mark(item);
         }
     }
+    // Followed from the lines as written; shown and saved without secrets.
+    agents::hide_secrets_in_runs(&mut collection.items);
     collection
         .items
         .sort_by(|left, right| left.path.cmp(&right.path));
