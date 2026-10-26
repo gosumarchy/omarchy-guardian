@@ -107,6 +107,10 @@ package() {
     for wrapper in omarchy omarchy-theme-install omarchy-theme-update omarchy-plugin-add omarchy-plugin-update; do
         install -Dm755 "integrations/omarchy/bin/$wrapper" "$lib/bin/$wrapper"
     done
+    # Which source this package was built from: install.sh builds again
+    # when the checkout's differs, even with the same version number.
+    bash packaging/source-id.sh "$_root" | install -Dm644 /dev/stdin \
+        "$pkgdir/usr/share/omarchy-guardian/source-id"
     # The upgrade check that does not rely on the checkout it is given: it
     # has to be the installed copy, so it is run from here, never from a
     # checkout.

@@ -383,9 +383,23 @@ else
 fi
 
 ###############################################################################
-if [[ $installed == "$version" ]] && ((!REINSTALL)); then
-    step "Skipping the build: omarchy-guardian $version is already installed (--reinstall to redo it)"
+# The same version number does not mean the same source: a checkout of main
+# between releases keeps the last release's number. The package records the
+# source it was built from, so the build is skipped only when both match.
+# A Guardian built before it recorded that is built again.
+same_source() {
+    local recorded=/usr/share/omarchy-guardian/source-id checkout
+    [[ -r $recorded ]] || return 1
+    checkout=$(bash "$ROOT/packaging/source-id.sh" "$ROOT") || return 1
+    [[ $(<"$recorded") == "$checkout" ]]
+}
+
+if [[ $installed == "$version" ]] && ((!REINSTALL)) && same_source; then
+    step "Skipping the build: omarchy-guardian $version is already installed from this source (--reinstall to redo it)"
 else
+    if [[ $installed == "$version" ]] && ((!REINSTALL)); then
+        note "omarchy-guardian $version is installed, but not built from this checkout as it is now; building it again."
+    fi
     step "Building omarchy-guardian $version"
     ###########################################################################
     log=${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-guardian/install-build.log
