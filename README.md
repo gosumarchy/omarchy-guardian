@@ -35,7 +35,8 @@ it shows on hover:
   kept from the AI; where something runs it, that is a finding of its own,
   unless the file only keeps opaque values in secret-named or plainly inert
   variables. The sweep also checks SSH and git files in a home,
-  package-manager configuration and account files locally only, sends a file
+  package-manager configuration, account files and browser extensions (read
+  from the browser profiles' preferences) locally only, sends a file
   it found running only where it is plainly a script, and takes plainly
   written secret values and URL passwords out of what it sends. A secret
   anywhere else goes with its file. Package names and versions from lockfiles
@@ -314,9 +315,11 @@ under [Limitations](docs/limitations.md):
   that user's reviewer login
   ([Limitations](docs/limitations.md#the-limits-that-matter-most)).
 - System sweep: the inside of the initramfs image, and of a unified kernel
-  image except its kernel, is not compared, and other mounted filesystems are
-  not searched for setuid files; as a user only your own processes can be
-  looked at; without root checks every sweep is incomplete ([System sweep](docs/system-sweep.md)).
+  image except its kernel, is not compared, browser extensions are judged by
+  where they came from and what they were granted, not by their code, and
+  other mounted filesystems are not searched for setuid files; as a user only
+  your own processes can be looked at; without root checks every sweep is
+  incomplete ([System sweep](docs/system-sweep.md)).
 - Source leaves the machine through the AI provider you configured, except
   under `local-only` and except the files kept from the AI by name or kind; a
   secret under a name Guardian does not recognise still goes with its file.

@@ -423,7 +423,7 @@ impl RuleId {
         ),
         (
             Self::RiskyConfiguration,
-            "A configuration file redirects where programs, packages or web pages come from, or loads code into a program at every start.",
+            "A configuration file redirects where programs, packages or web pages come from, or loads code into a program at every start; or a browser extension was loaded unpacked, installed from outside the browser's store, or is not signed.",
         ),
         (
             Self::UnexpectedCapability,

@@ -15,6 +15,7 @@ described.
   - [Where following stops](#where-following-stops)
   - [Programs ahead of the system's own](#programs-ahead-of-the-systems-own)
   - [More that decides what runs](#more-that-decides-what-runs)
+  - [Browser extensions](#browser-extensions)
   - [Accounts, keys and trust anchors](#accounts-keys-and-trust-anchors)
   - [Guardian's own units](#guardians-own-units)
 - [What runs now](#what-runs-now)
@@ -363,6 +364,47 @@ and git files they are checked locally and never sent to the AI (mise's and
 cargo's are reviewed, with secret-looking values taken out), and what is shown
 is the key and, for an address, its host, never the rest of the value; so are
 an editor's `settings.json` and fish's saved variables.
+
+### Browser extensions
+
+An extension runs inside the browser, in every page its granted hosts cover,
+and no file of an auto-run location says it is there. For each profile
+(`Default`, `Profile N`) of Chromium, Brave and Google Chrome
+(`~/.config/chromium`, `~/.config/BraveSoftware/Brave-Browser`,
+`~/.config/google-chrome`) the sweep reads the extensions listed in
+`Preferences` and `Secure Preferences` (the latter wins where both list one),
+with each extension's `manifest.json` for its name, version and update URL.
+For Firefox (`~/.mozilla/firefox`, `~/.config/mozilla/firefox`) and Zen
+(`~/.zen`) it reads each profile's `extensions.json`. The browsers' own
+extensions (Chromium's component extensions, Firefox's built-in add-ons) and
+Firefox themes, dictionaries and language packs are not listed.
+
+Each extension is an item of its own, named by its profile and id
+(`~/.config/chromium/Default#extension:<id>`), with its name and version in
+a note:
+
+| What it is | How it is shown |
+| --- | --- |
+| From the Chrome Web Store (its update URL is the store's) or addons.mozilla.org | listed, no alert |
+| Installed from anywhere else (another update URL, or none) | `risky-configuration`, with the host it updates from |
+| Loaded unpacked (developer mode, `--load-extension`, a temporary add-on) | `risky-configuration`, with the directory |
+| Loaded unpacked from a directory whose every file a package installed, unchanged | trusted, only counted (Omarchy loads its own extensions this way) |
+| Installed in Firefox without Mozilla's signature | `risky-configuration` |
+
+What the sweep remembers of an extension is its id, where it came from and the
+permissions and hosts it was granted, not its version: an update that grants
+nothing new is no change, an extension installed since the last sweep is new,
+and one granted more (or less) is changed, in `--diff` and the daily
+notification like any item. Allow the ones you know with `sweep allow`; one
+that is granted more after that shows again.
+
+These are local rules only. The preferences files hold your browsing data:
+they are read on this machine, and only what makes the item (id, name,
+version, source, granted permissions and hosts) is kept from them. Nothing of
+an extension is sent to the AI, its code is not reviewed, and the extension
+data directories are not read. A preferences file that cannot be read or
+parsed leaves that profile not checked, and the sweep incomplete. It costs no
+AI call.
 
 ### Accounts, keys and trust anchors
 
@@ -789,8 +831,9 @@ memory, so a repeated sweep of an unchanged system makes no AI call.
 ### What is kept from the AI
 
 Four kinds of file are read on this machine only. Each says so in a note on
-its item (accounts, keys and certificate authorities do not: they are facts
-with no text to send), and being kept makes no sweep incomplete.
+its item (accounts, keys, certificate authorities and browser extensions do
+not: they are facts with no text to send), and being kept makes no sweep
+incomplete.
 
 - **A file whose path marks it as holding secrets** is never sent, whether or
   not something runs it and whatever its first line: anything under `.ssh`,
@@ -859,7 +902,8 @@ with no text to send), and being kept makes no sweep incomplete.
 - **Settings that hold tokens**: the package-manager settings, an editor's
   `settings.json`, fish's saved variables, accounts, keys, certificate
   authorities and `/etc/hosts`, each checked by the rules for its kind (see
-  [More that decides what runs](#more-that-decides-what-runs)).
+  [More that decides what runs](#more-that-decides-what-runs)), and browser
+  extensions ([Browser extensions](#browser-extensions)).
 - **A file a live check names that nothing says is a script.** The live checks
   go by a process's arguments, and an argument may as well be a data file
   (`node --env-file …`). Its text is sent only where it starts with `#!` or
@@ -1279,7 +1323,7 @@ reviews as well, are listed under [Local rules](local-rules.md#rule-ids).
 | `ssh-command` | medium | An SSH file runs a command or loads a library (a `ProxyCommand`, a `Match exec`, a provider library), or a key carries a `command=` or `environment=` option. |
 | `running-from-temp` | medium | A program runs from a temporary or cache directory, where downloads land. |
 | `keyboard-reader` | medium | A program no package installed reads the keyboard device directly. |
-| `risky-configuration` | medium | A configuration file redirects where programs, packages or web pages come from, or loads code into a program at every start. |
+| `risky-configuration` | medium | A configuration file redirects where programs, packages or web pages come from, or loads code into a program at every start; or a browser extension was loaded unpacked, installed from outside the browser's store, or is not signed. |
 | `unexpected-capability` | medium | A packaged program holds file capabilities its package does not set (pacman does not record them, so the file itself is unchanged). |
 | `network-relay` | medium | A tool that runs or forwards what it is told over the network (netcat, socat, a tunnel) listens or is connected. |
 | `traced-process` | medium | Another process is attached to this one the way a debugger is, and can read and change its memory. |

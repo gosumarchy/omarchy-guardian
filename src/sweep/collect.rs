@@ -20,7 +20,7 @@ use std::path::Path;
 use super::index::PackageIndex;
 use super::read::{self, View};
 use super::tier::Tier;
-use super::{access, boot, commands, own, path};
+use super::{access, boot, commands, extensions, own, path};
 use crate::autorun::{Category, Kind, Location, SYSTEM, SYSTEM_SWEEP, USER};
 use crate::paths::file_name;
 use crate::rules::RuleId;
@@ -448,7 +448,7 @@ impl Walk {
 }
 
 /// Adds what is no file of an auto-run location: who may log in and
-/// administer, and how the machine was started.
+/// administer, how the machine was started, and the browser extensions.
 fn add_facts(scope: &Scope<'_>, collection: &mut Collection) {
     let (facts, left_out) = access::items(scope);
     merge(collection, facts);
@@ -465,6 +465,9 @@ fn add_facts(scope: &Scope<'_>, collection: &mut Collection) {
     merge(collection, boot.items);
     collection.truncated.extend(boot.unchecked);
     collection.notes.extend(boot.notes);
+    let extensions = extensions::check(scope);
+    merge(collection, extensions.items);
+    collection.truncated.extend(extensions.unchecked);
 }
 
 /// Puts on each item the notes that say how it was reached: as

@@ -18,6 +18,9 @@ pub(crate) enum Category {
     Boot,
     BootConfig,
     Browser,
+    /// The extensions in a home's browser profiles, checked by the sweep's
+    /// own rules only (see `sweep::extensions`).
+    BrowserExtension,
     Cron,
     Dbus,
     Desktop,
@@ -59,11 +62,12 @@ pub(crate) enum Category {
 }
 
 impl Category {
-    const ALL: [Self; 38] = [
+    const ALL: [Self; 39] = [
         Self::Autostart,
         Self::Boot,
         Self::BootConfig,
         Self::Browser,
+        Self::BrowserExtension,
         Self::Cron,
         Self::Dbus,
         Self::Desktop,
@@ -107,6 +111,7 @@ impl Category {
             Self::Boot => "boot",
             Self::BootConfig => "boot-config",
             Self::Browser => "browser",
+            Self::BrowserExtension => "browser-extension",
             Self::Cron => "cron",
             Self::Dbus => "dbus",
             Self::Desktop => "desktop",
@@ -201,6 +206,7 @@ impl Category {
             Self::Setuid => "Programs with extra privileges",
             Self::Account => "Accounts and who may log in",
             Self::Browser => "Browser flags, policies and native hosts",
+            Self::BrowserExtension => "Browser extensions",
             Self::Terminal => "Terminal and prompt configuration",
             Self::Toolchain => "Developer tool configuration (npm, pip, cargo, mise)",
             Self::Program => "The system's own programs",
@@ -214,6 +220,7 @@ impl Category {
             Self::Boot => "runs before the system starts",
             Self::BootConfig | Self::SystemdGenerator => "runs at every boot",
             Self::Browser => "applies to every browser started",
+            Self::BrowserExtension => "runs in the browser, in the pages it may reach",
             Self::Cron => "runs on a schedule",
             Self::Dbus => "runs when a program asks for it over D-Bus",
             Self::Desktop => "runs when you open the app",

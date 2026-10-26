@@ -249,7 +249,10 @@ fn is_local_only(item: &Item, home: Option<&str>) -> bool {
         // The login script is code, not configuration: it is reviewed.
         Category::Ssh if commands::is_ssh_rc(path) => false,
         Category::Ssh | Category::Git => in_home && named,
-        Category::Account => true,
+        // What an extension was granted is checked by the collector's
+        // rules (see `extensions`); its code and the profile it came from
+        // hold personal data and are never sent.
+        Category::Account | Category::BrowserExtension => true,
         Category::Trust => named,
         Category::Toolchain => {
             named
@@ -369,9 +372,14 @@ fn is_run(item: &Item, text: &str) -> bool {
 
 /// Says on each item that is kept from the AI that it is, and why.
 pub(super) fn note_kept(items: &mut [Item], home: Option<&str>) {
-    // An account, a key or a certificate authority is a fact with no text
-    // to send: nothing to say of those.
-    let fact = |item: &Item| matches!(item.category, Category::Account | Category::Trust);
+    // An account, a key, a certificate authority or an extension is a fact
+    // with no text to send: nothing to say of those.
+    let fact = |item: &Item| {
+        matches!(
+            item.category,
+            Category::Account | Category::Trust | Category::BrowserExtension
+        )
+    };
     for item in items
         .iter_mut()
         .filter(|item| !item.is_trusted() && !fact(item))
