@@ -7,7 +7,7 @@ use super::{Found, MAX_ENTRIES};
 use crate::autorun::Category;
 use crate::rules::{RuleId, is_local_host};
 use crate::sha256::Sha256;
-use crate::sweep::collect::{self, Body, Item, Scope};
+use crate::sweep::collect::{self, Body, Item, NOT_ALL_FOLLOWED, Scope};
 use crate::sweep::tier::Tier;
 use crate::sweep::tools::LOADING_VARIABLES;
 
@@ -173,9 +173,10 @@ pub(super) fn add(scope: &Scope<'_>, source: &Source<'_>, entries: Entries, foun
 ///   and host of those that are addresses;
 ///
 /// and before it, on a comment line, the names of the variables it is
-/// started with. What it runs, which is followed, is the command line as
-/// written, with a plugin's directory written in; the text is that line
-/// without its secrets.
+/// started with. What it runs, which is followed, is each reading of the
+/// command line with a plugin's directory written in (see
+/// `plugin_root_readings`); the text is the line as written, without its
+/// secrets.
 fn item(scope: &Scope<'_>, source: &Source<'_>, entry: Entry) -> Item {
     let Entry {
         key,
@@ -187,14 +188,12 @@ fn item(scope: &Scope<'_>, source: &Source<'_>, entry: Entry) -> Item {
     let mut alerts = Vec::new();
     let started = match launch {
         Launch::Command(line) => {
-            // Followed as written: a script passed as the value of a
+            // Followed with its secrets: a script passed as the value of a
             // secret-named flag is still found. The collector takes the
             // secrets out once it has been followed (see
-            // `hide_secrets_in_runs`), which makes it this same text.
-            let line = with_plugin_root(&line, source.plugin_root);
-            let text = redacted(&line);
-            runs.push(line);
-            text
+            // `hide_secrets_in_runs`).
+            runs.extend(plugin_root_readings(&line, source.plugin_root));
+            redacted(&line)
         }
         Launch::Remote { scheme, host } => {
             alerts.extend(remote_alert(&host));
@@ -225,6 +224,14 @@ fn item(scope: &Scope<'_>, source: &Source<'_>, entry: Entry) -> Item {
             variables.join(" ")
         )
     };
+    let mut notes: Vec<String> = source.note.iter().cloned().collect();
+    // A form `plugin_root_readings` leaves as written names no file, so
+    // the script it runs is not read; the sweep says so.
+    if source.plugin_root.is_some() && runs.iter().any(|run| names_braced_plugin_root(run)) {
+        notes.push(format!(
+            "{NOT_ALL_FOLLOWED}a form of ${{{PLUGIN_ROOT}}} that is neither plain nor a path default"
+        ));
+    }
     Item {
         file: None,
         origin: collect::origin(scope, &path),
@@ -234,7 +241,7 @@ fn item(scope: &Scope<'_>, source: &Source<'_>, entry: Entry) -> Item {
         body: Body::Text(text),
         runs,
         run_by: None,
-        notes: source.note.iter().cloned().collect(),
+        notes,
         alerts,
         path,
     }
@@ -413,15 +420,55 @@ pub(super) fn quoted(word: &str) -> String {
 /// The variable a plugin's commands name its own directory by.
 const PLUGIN_ROOT: &str = "CLAUDE_PLUGIN_ROOT";
 
-/// `line` with the plugin's directory (`root`, relative to the root)
-/// written in for `${CLAUDE_PLUGIN_ROOT}` and `$CLAUDE_PLUGIN_ROOT`, so the
-/// scripts it names are followed and the review sees which they are.
-pub(super) fn with_plugin_root(line: &str, root: Option<&str>) -> String {
+/// The readings of `line` that are followed, with the plugin's directory
+/// (`root`, relative to the root) written in for `${CLAUDE_PLUGIN_ROOT}`
+/// and `$CLAUDE_PLUGIN_ROOT`: as Claude Code runs it, with the variable
+/// set, and, when the line has a form with a default
+/// (`${CLAUDE_PLUGIN_ROOT:-.}`, as trailofbits' modern-python writes its
+/// hook), with each default taken. Only a default of path characters is
+/// read either way; any other (`$(…)`, another variable, quotes) stays as
+/// written in both, since its closing brace cannot be found without a
+/// shell's parser. None of these is the text reviewed: the line itself may
+/// unset or change the variable, so that text is the line as written.
+pub(super) fn plugin_root_readings(line: &str, root: Option<&str>) -> Vec<String> {
     let Some(root) = root else {
-        return line.to_string();
+        return vec![line.to_string()];
     };
     let directory = format!("/{root}");
-    let line = line.replace(&format!("${{{PLUGIN_ROOT}}}"), &directory);
+    let set = with_plugin_root(line, &directory, Reading::Set);
+    let unset = with_plugin_root(line, &directory, Reading::Unset);
+    if unset == set {
+        vec![set]
+    } else {
+        vec![set, unset]
+    }
+}
+
+/// Whether `run` still holds `${CLAUDE_PLUGIN_ROOT…}`, which no reading
+/// wrote in; `${CLAUDE_PLUGIN_ROOT_X}` is another variable.
+fn names_braced_plugin_root(run: &str) -> bool {
+    let open = format!("${{{PLUGIN_ROOT}");
+    run.match_indices(&open).any(|(at, _)| {
+        !run[at + open.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// How a default form of the plugin's variable is read.
+#[derive(Debug, Clone, Copy)]
+enum Reading {
+    /// Claude Code sets the variable for a plugin's commands.
+    Set,
+    /// The variable is unset, or empty for the `:` forms. The plain forms
+    /// keep the directory: written in empty, they would add a reading of
+    /// every plugin command, naming a script that is not there, and the
+    /// text reviewed shows them as written anyway.
+    Unset,
+}
+
+/// `line` with `directory` written in for `${CLAUDE_PLUGIN_ROOT}` and
+/// `$CLAUDE_PLUGIN_ROOT`, and each default form read as `reading` says.
+fn with_plugin_root(line: &str, directory: &str, reading: Reading) -> String {
+    let line = with_braced_plugin_root(line, directory, reading);
     let bare = format!("${PLUGIN_ROOT}");
     let mut out = String::with_capacity(line.len());
     let mut rest = line.as_str();
@@ -432,9 +479,50 @@ pub(super) fn with_plugin_root(line: &str, root: Option<&str>) -> String {
         if after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
             out.push_str(&bare);
         } else {
-            out.push_str(&directory);
+            out.push_str(directory);
         }
         rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `line` with `directory` written in for `${CLAUDE_PLUGIN_ROOT}`, and each
+/// form whose default is a plain path (`:-`, `-`, `:=`, `=`) read as
+/// `reading` says. `:+`, `:?` and any other default are left as written.
+fn with_braced_plugin_root(line: &str, directory: &str, reading: Reading) -> String {
+    let open = format!("${{{PLUGIN_ROOT}");
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(at) = rest.find(&open) {
+        let after = &rest[at + open.len()..];
+        out.push_str(&rest[..at]);
+        // With the default held to path characters, the first `}` is the
+        // one that closes the expansion: none can be quoted or escaped.
+        let written = after.find('}').and_then(|end| {
+            let word = &after[..end];
+            let default = [":-", ":=", "-", "="]
+                .iter()
+                .find_map(|form| word.strip_prefix(form))
+                .filter(|default| {
+                    default
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c))
+                });
+            let written = match (word.is_empty(), default, reading) {
+                (true, _, _) | (false, Some(_), Reading::Set) => directory,
+                (false, Some(default), Reading::Unset) => default,
+                (false, None, _) => return None,
+            };
+            Some((written, end))
+        });
+        if let Some((written, end)) = written {
+            out.push_str(written);
+            rest = &after[end + 1..];
+        } else {
+            out.push_str(&open);
+            rest = after;
+        }
     }
     out.push_str(rest);
     out
