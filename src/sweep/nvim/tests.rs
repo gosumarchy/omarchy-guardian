@@ -515,7 +515,7 @@ fn the_first_sweep_takes_plugins_as_they_are() {
     let temp = TempDir::new("nvim-first");
     let root = temp.path();
     plugin(root, "p", "https://github.com/o/p", &[("lua/p.lua", "x")]);
-    let (items, lost) = planned(root, &Record::Kept(Files::new()), false);
+    let (items, lost) = planned(root, &Record::Absent, false);
     assert_eq!(lost, None);
     assert_eq!(plugin_of(&items[0]).review, Review::Baseline);
     assert!(
@@ -525,12 +525,7 @@ fn the_first_sweep_takes_plugins_as_they_are() {
             .any(|note| note.contains("first sweep"))
     );
     // The record then holds it as it is.
-    let settled = settle(
-        &items,
-        &Record::Kept(Files::new()),
-        &Report::new("t"),
-        &label,
-    );
+    let settled = settle(&items, &Record::Absent, &Report::new("t"), &label);
     assert_eq!(settled["p"]["lua/p.lua"], digest("x"));
 }
 
@@ -543,7 +538,7 @@ fn a_lost_record_takes_plugins_as_they_are_and_says_so() {
     assert_eq!(plugin_of(&items[0]).review, Review::Baseline);
     assert!(lost.is_some_and(|sentence| sentence.contains("unreadable")));
     // Gone while the last sweep listed a plugin: deleted, not new.
-    let (_, lost) = planned(root, &Record::Kept(Files::new()), true);
+    let (_, lost) = planned(root, &Record::Absent, true);
     assert!(lost.is_some_and(|sentence| sentence.contains("is gone")));
 }
 
@@ -704,6 +699,26 @@ fn a_new_plugin_whose_review_did_not_finish_stays_new() {
 }
 
 #[test]
+fn an_empty_record_is_compared_so_new_plugins_after_it_are_reviewed() {
+    let temp = TempDir::new("nvim-empty-record");
+    let root = temp.path();
+    plugin(root, "p", "https://github.com/o/p", &[("lua/p.lua", "x")]);
+    // Every plugin the record held was removed, and the new one's review
+    // did not finish: the record keeps nothing.
+    let before = record("gone", &[("lua/g.lua", "g")]);
+    let (items, _) = planned(root, &before, true);
+    let mut report = Report::new("t");
+    let down = AgentOutcome::Unavailable(Error::Refused("down".into()));
+    report.agent_runs.push(run(&[FILE], down));
+    let settled = settle(&items, &before, &report, &label);
+    assert!(settled.is_empty());
+    // The next sweep still reviews it, and does not take it on trust.
+    let (items, lost) = planned(root, &Record::Kept(settled), true);
+    assert_eq!(lost, None);
+    assert!(matches!(&plugin_of(&items[0]).review, Review::New(sent) if sent.len() == 1));
+}
+
+#[test]
 fn the_record_is_read_back_as_written_and_a_bad_one_is_lost() {
     let temp = TempDir::new("nvim-record");
     let directory = temp.path();
@@ -711,7 +726,7 @@ fn the_record_is_read_back_as_written_and_a_bad_one_is_lost() {
         Record::load(None),
         Record::Lost("nothing is remembered between sweeps".into())
     );
-    assert_eq!(Record::load(Some(directory)), Record::Kept(Files::new()));
+    assert_eq!(Record::load(Some(directory)), Record::Absent);
     let Record::Kept(files) = record("p", &[("lua/p.lua", "x"), ("plugin/p.vim", "y")]) else {
         unreachable!("record builds a kept record");
     };

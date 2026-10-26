@@ -423,8 +423,9 @@ not reviewed again until it changes.
 The record (`nvim-plugins.json` in the sweep's directory of the review store)
 holds each plugin's code files and their hashes. A plugin's entry moves on
 only when its changed files were reviewed without a finding and every review
-of them finished; otherwise they are sent again at the next sweep. It is your
-own file: one that is gone while the last sweep listed plugins, or that
+of them finished; otherwise they are sent again at the next sweep. A record
+that holds no plugin still counts: a plugin installed after the first sweep is
+new and reviewed, never taken as it is. It is your own file: one that is gone while the last sweep listed plugins, or that
 cannot be read, makes that sweep incomplete, and the plugins are taken as
 they are.
 

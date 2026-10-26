@@ -58,7 +58,10 @@ pub(crate) type Files = BTreeMap<String, BTreeMap<String, Digest>>;
 /// The record as this sweep found it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Record {
-    /// What the last sweep recorded; empty before any sweep saw plugins.
+    /// There is none: no sweep has kept one yet.
+    Absent,
+    /// What the last sweep recorded; empty when it saw no plugins, or
+    /// none that moved on, and then every plugin is new.
     Kept(Files),
     /// It cannot stand for the last sweep, for this reason.
     Lost(String),
@@ -72,7 +75,7 @@ impl Record {
             return Self::Lost("nothing is remembered between sweeps".into());
         };
         if fs::symlink_metadata(directory.join(RECORD)).is_err() {
-            return Self::Kept(Files::new());
+            return Self::Absent;
         }
         match read::look(directory, RECORD) {
             Found::File { size, head, .. } if size <= MAX_RECORD_BYTES => {
@@ -118,7 +121,7 @@ fn parse(text: &str) -> Option<Files> {
 /// Decides for each plugin among `items` that is not trusted what this
 /// sweep sends of it to the review (see `Review`), against `record`, and
 /// reads those files again under `root`. `listed` says whether the last
-/// sweep listed an item: a record that is empty while it listed plugins
+/// sweep listed an item: a record that is absent while it listed plugins
 /// is gone, not new.
 ///
 /// Returns what to report as not checked where the record could not stand
@@ -131,10 +134,11 @@ pub(crate) fn plan(
 ) -> Option<String> {
     let plugins = || items.iter().filter(|item| is_plugin(item));
     let recorded = match record {
-        Record::Kept(files) if files.is_empty() && plugins().any(listed) => Err(format!(
+        Record::Absent if plugins().any(listed) => Err(format!(
             "{RECORD} is gone, though the last sweep listed Neovim plugins"
         )),
-        Record::Kept(files) => Ok(files),
+        Record::Absent => Ok(None),
+        Record::Kept(files) => Ok(Some(files)),
         Record::Lost(reason) => Err(reason.clone()),
     };
     let mut taken = false;
@@ -144,8 +148,8 @@ pub(crate) fn plan(
             continue;
         };
         plugin.review = match &recorded {
-            Ok(files) if !files.is_empty() => changes(root, &path, plugin, files.get(&plugin.name)),
-            Ok(_) => {
+            Ok(Some(files)) => changes(root, &path, plugin, files.get(&plugin.name)),
+            Ok(None) => {
                 item.notes.push(FIRST_SIGHT.into());
                 Review::Baseline
             }
@@ -231,7 +235,7 @@ pub(crate) fn settle(
 ) -> Files {
     let before = |plugin: &Plugin| match record {
         Record::Kept(files) => files.get(&plugin.name).cloned(),
-        Record::Lost(_) => None,
+        Record::Absent | Record::Lost(_) => None,
     };
     items
         .iter()
