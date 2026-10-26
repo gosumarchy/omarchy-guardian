@@ -255,7 +255,9 @@ fn walk(
                         entries.push((relative, Entry::File { sha256, mode }));
                     }
                     Found::Link(target) => entries.push((relative, Entry::Link(target))),
-                    Found::Other => {}
+                    Found::Other => unchecked.push(format!(
+                        "/{path}/{relative}: neither a file, a directory nor a link (a FIFO or a device), so it was not looked at"
+                    )),
                     Found::Unreadable(reason) => {
                         unchecked.push(format!("/{path}/{relative}: could not be read ({reason})"));
                     }
@@ -759,7 +761,9 @@ fn hooks(
                 found.push((format!("{hooks}/{name}"), Entry::File { sha256, mode }));
             }
             Found::Link(target) => found.push((format!("{hooks}/{name}"), Entry::Link(target))),
-            Found::Other => {}
+            Found::Other => unchecked.push(format!(
+                "/{path}/{name}: neither a file, a directory nor a link (a FIFO or a device), so it was not looked at"
+            )),
             Found::Unreadable(reason) => {
                 unchecked.push(format!("/{path}/{name}: could not be read ({reason})"));
             }

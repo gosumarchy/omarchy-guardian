@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::net::UnixListener;
 use std::path::Path;
 
 use super::checkout::{Remote, origin, same_place, without_userinfo};
@@ -491,6 +492,36 @@ fn other_remotes_and_a_worktree_origin_are_findings() {
         "{:?}",
         collected.unchecked
     );
+}
+
+#[test]
+fn an_entry_that_is_no_file_directory_or_link_is_not_checked() {
+    let temp = TempDir::new("nvim-socket");
+    let root = temp.path();
+    plugin(
+        root,
+        "p",
+        "https://github.com/o/p",
+        &[("lua/x.lua", "return 1")],
+    );
+    // A socket stands in for a FIFO or a device: std can make one. It is
+    // made at the top and moved, as a socket's path is at most 107 bytes.
+    let _listeners = ["lua/socket", ".git/hooks/post-merge"].map(|path| {
+        let short = root.join("socket");
+        let listener = UnixListener::bind(&short).unwrap();
+        fs::rename(&short, root.join(LAZY).join("p").join(path)).unwrap();
+        listener
+    });
+    let unchecked = collected(root).unchecked;
+    for path in [
+        "/p/lua/socket: neither",
+        "/p/.git/hooks/post-merge: neither",
+    ] {
+        assert!(
+            unchecked.iter().any(|sentence| sentence.contains(path)),
+            "{path}: {unchecked:?}"
+        );
+    }
 }
 
 #[test]
