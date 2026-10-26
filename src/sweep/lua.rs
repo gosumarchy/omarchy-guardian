@@ -1,9 +1,14 @@
-//! Finds the commands a Hyprland Lua configuration starts with Hyprland:
-//! string arguments of `exec_on_start`, `launch_on_start`, `exec_cmd`,
-//! `shell_succeeds`, `os.execute` and `io.popen`. Only literal strings are
-//! read (concatenations are joined); anything computed is listed as such.
-//! The whole file still goes to the AI review, so this only explains what
-//! runs; it does not decide anything.
+//! Reads Lua without running it, for two things.
+//!
+//! - The commands a Hyprland Lua configuration starts with Hyprland:
+//!   string arguments of `exec_on_start`, `launch_on_start`, `exec_cmd`,
+//!   `shell_succeeds`, `os.execute` and `io.popen`. Only literal strings are
+//!   read (concatenations are joined); anything computed is listed as such.
+//!   The whole file still goes to the AI review, so this only explains what
+//!   runs; it does not decide anything.
+//! - The plugin specs of lazy.nvim (`{ "owner/repo", build = "make" }`):
+//!   where each plugin comes from and what it builds, as far as table
+//!   literals say it (see `plugin_specs`).
 
 const STARTUP: &[&str] = &[
     "exec_on_start",
@@ -42,7 +47,11 @@ pub(super) fn startup_commands(text: &str) -> Vec<String> {
                 Token::Comma if depth == 1 => break,
                 Token::String(text) => command.push_str(text),
                 Token::Name(_) => computed = true,
-                Token::Comma | Token::Other => {}
+                Token::Comma
+                | Token::TableOpen
+                | Token::TableClose
+                | Token::Assign
+                | Token::Other => {}
             }
         }
         let command = command.trim();
@@ -55,12 +64,170 @@ pub(super) fn startup_commands(text: &str) -> Vec<String> {
     found
 }
 
+/// A plugin spec of lazy.nvim, as far as one table literal says it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Spec {
+    /// Where lazy.nvim fetches the plugin from: its `url`, or the table's
+    /// first entry (`"owner/repo"`, or an address).
+    pub(super) source: String,
+    /// The plugin's directory name: its `name`, or the last part of
+    /// `source` without `.git`.
+    pub(super) name: String,
+    /// What its `build` key runs, if it has one.
+    pub(super) build: Option<Build>,
+}
+
+/// What a spec's `build` key runs when lazy.nvim installs or updates the
+/// plugin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Build {
+    /// A Neovim command (`":TSUpdate"`), run inside Neovim.
+    Command(String),
+    /// A shell command (`"make"`): the whole value is that string.
+    Shell(String),
+    /// A Lua function or expression, with the strings it may give
+    /// (`vim.g.x and "cargo build"` may give `cargo build`): only running
+    /// the Lua tells which of them, if any, runs.
+    Lua(Vec<String>),
+}
+
+/// The plugin specs in `text`: every table literal whose first entry is a
+/// plugin's source (`"owner/repo"` or an address) or that has a `url` key,
+/// at any depth, so `dependencies = { "a/b" }` counts as well. Only
+/// literals are read: a spec built by code, or a bare string that is not
+/// in a table (`dependencies = "a/b"`), is not found.
+pub(super) fn plugin_specs(text: &str) -> Vec<Spec> {
+    let tokens = tokenize(text);
+    let mut specs = Vec::new();
+    let mut tables: Vec<Table> = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            Token::TableOpen => tables.push(Table::opened(&tokens[index + 1..])),
+            Token::TableClose => specs.extend(tables.pop().and_then(Table::spec)),
+            Token::Name(key) if tokens.get(index + 1) == Some(&Token::Assign) => {
+                if let Some(table) = tables.last_mut() {
+                    table.set(key, &tokens[index + 2..]);
+                }
+            }
+            _ => {}
+        }
+    }
+    specs
+}
+
+/// What one table literal says so far.
+#[derive(Debug, Default)]
+struct Table {
+    first: Option<String>,
+    url: Option<String>,
+    name: Option<String>,
+    build: Option<Build>,
+}
+
+impl Table {
+    /// A table whose entries are `after`, the tokens after its `{`.
+    fn opened(after: &[Token]) -> Self {
+        let first = match after {
+            [Token::String(first), Token::Comma | Token::TableClose, ..] => Some(first.clone()),
+            _ => None,
+        };
+        Self {
+            first,
+            ..Self::default()
+        }
+    }
+
+    /// Takes in key `key`, whose value starts at `value`.
+    fn set(&mut self, key: &str, value: &[Token]) {
+        let text = match value.first() {
+            Some(Token::String(text)) => Some(text.clone()),
+            _ => None,
+        };
+        match key {
+            "url" => self.url = text,
+            "name" => self.name = text,
+            "build" => self.build = build(value),
+            _ => {}
+        }
+    }
+
+    fn spec(self) -> Option<Spec> {
+        let source = self.url.or(self.first.filter(|first| is_source(first)))?;
+        let name = self.name.unwrap_or_else(|| {
+            let last = source.trim_end_matches('/').rsplit(['/', ':']).next();
+            let last = last.unwrap_or(&source);
+            last.strip_suffix(".git").unwrap_or(last).to_string()
+        });
+        Some(Spec {
+            source,
+            name,
+            build: self.build,
+        })
+    }
+}
+
+/// Whether `text` names where a plugin comes from the way lazy.nvim takes a
+/// spec's first entry: `owner/repo`, or an address.
+fn is_source(text: &str) -> bool {
+    let plain = |part: &str| {
+        !part.is_empty()
+            && !part.starts_with('.')
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    };
+    let repo = text
+        .split_once('/')
+        .is_some_and(|(owner, repo)| plain(owner) && plain(repo));
+    repo || text.contains("://") || text.starts_with("git@")
+}
+
+/// What the value of a `build` key, starting at `value`, runs; `None` for
+/// `false` and `nil`, which turn a build off.
+fn build(value: &[Token]) -> Option<Build> {
+    match value {
+        [Token::Name(word)] | [Token::Name(word), Token::Comma | Token::TableClose, ..]
+            if matches!(word.as_str(), "false" | "nil") =>
+        {
+            return None;
+        }
+        [Token::String(text)] | [Token::String(text), Token::Comma | Token::TableClose, ..] => {
+            return Some(if text.starts_with(':') {
+                Build::Command(text.clone())
+            } else {
+                Build::Shell(text.clone())
+            });
+        }
+        _ => {}
+    }
+    let mut strings = Vec::new();
+    let mut depth = 0_usize;
+    for token in value {
+        match token {
+            // A function's strings are its code's, not what it gives.
+            Token::Name(word) if word == "function" => break,
+            Token::Open | Token::TableOpen => depth += 1,
+            Token::Close | Token::TableClose | Token::Comma if depth == 0 => break,
+            Token::Close | Token::TableClose => depth -= 1,
+            Token::String(text) => strings.push(text.clone()),
+            _ => {}
+        }
+    }
+    Some(Build::Lua(strings))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Token {
     Name(String),
     String(String),
     Open,
     Close,
+    /// `{`
+    TableOpen,
+    /// `}`
+    TableClose,
+    /// A lone `=`; `==`, `~=`, `<=` and `>=` are `Other`.
+    Assign,
     Comma,
     Other,
 }
@@ -116,9 +283,23 @@ fn tokenize(text: &str) -> Vec<Token> {
             tokens.push(Token::Name(chars[start..index].iter().collect()));
             continue;
         }
+        if matches!(character, '=' | '~' | '<' | '>') {
+            let start = index;
+            while index < chars.len() && matches!(chars[index], '=' | '~' | '<' | '>') {
+                index += 1;
+            }
+            tokens.push(if index - start == 1 && character == '=' {
+                Token::Assign
+            } else {
+                Token::Other
+            });
+            continue;
+        }
         tokens.push(match character {
             '(' => Token::Open,
             ')' => Token::Close,
+            '{' => Token::TableOpen,
+            '}' => Token::TableClose,
             ',' => Token::Comma,
             _ if character.is_whitespace() || character == '.' => {
                 index += 1;
@@ -166,7 +347,7 @@ fn long_bracket(chars: &[char], start: usize) -> Option<(String, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::startup_commands;
+    use super::{Build, Spec, plugin_specs, startup_commands};
 
     #[test]
     fn startup_calls_are_found_and_comments_ignored() {
@@ -197,5 +378,66 @@ o.bind("SUPER, Return", "Terminal", o.launch("alacritty"))
                 "long one"
             ]
         );
+    }
+
+    #[test]
+    fn plugin_specs_are_read_from_table_literals() {
+        let text = r#"
+local lazyrepo = "https://github.com/folke/lazy.nvim.git"
+return {
+  -- { "commented/out" },
+  { "folke/snacks.nvim", opts = { enabled = x == "a/b" } },
+  {
+    "bjarneo/aether.nvim",
+    name = "aether",
+    dependencies = { "nvim-lua/plenary.nvim", "MunifTanjim/nui.nvim" },
+    build = ":TSUpdate",
+  },
+  { url = "https://gitlab.com/o/r.git", build = vim.g.x and "cargo build" or "make" },
+  { "a/fn", build = function() local a, b = 1, 2 os.execute("x") end, name = "fn2" },
+  { "a/off", build = false },
+  { "a/make", build = "make" },
+  { "BufReadPost", "BufNewFile" },
+  { import = "plugins" },
+}
+"#;
+        let spec = |source: &str, name: &str, build: Option<Build>| Spec {
+            source: source.into(),
+            name: name.into(),
+            build,
+        };
+        assert_eq!(
+            plugin_specs(text),
+            [
+                spec("folke/snacks.nvim", "snacks.nvim", None),
+                spec("nvim-lua/plenary.nvim", "plenary.nvim", None),
+                spec(
+                    "bjarneo/aether.nvim",
+                    "aether",
+                    Some(Build::Command(":TSUpdate".into()))
+                ),
+                spec(
+                    "https://gitlab.com/o/r.git",
+                    "r",
+                    Some(Build::Lua(vec!["cargo build".into(), "make".into()]))
+                ),
+                spec("a/fn", "fn2", Some(Build::Lua(Vec::new()))),
+                spec("a/off", "off", None),
+                spec("a/make", "make", Some(Build::Shell("make".into()))),
+            ]
+        );
+    }
+
+    #[test]
+    fn broken_lua_gives_what_it_can_and_no_panic() {
+        for text in [
+            "{ \"a/b\", build = ",
+            "}}}{ \"a/b\"",
+            "{ [[a/b",
+            "{ \"a/b\" ,",
+        ] {
+            drop(plugin_specs(text));
+        }
+        assert_eq!(plugin_specs("{ \"a/b\" }")[0].name, "b");
     }
 }

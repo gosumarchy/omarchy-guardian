@@ -15,6 +15,7 @@ described.
   - [Where following stops](#where-following-stops)
   - [Programs ahead of the system's own](#programs-ahead-of-the-systems-own)
   - [More that decides what runs](#more-that-decides-what-runs)
+  - [Neovim plugins](#neovim-plugins)
   - [Accounts, keys and trust anchors](#accounts-keys-and-trust-anchors)
   - [Guardian's own units](#guardians-own-units)
 - [What runs now](#what-runs-now)
@@ -363,6 +364,80 @@ and git files they are checked locally and never sent to the AI (mise's and
 cargo's are reviewed, with secret-looking values taken out), and what is shown
 is the key and, for an address, its host, never the rest of the value; so are
 an editor's `settings.json` and fish's saved variables.
+
+### Neovim plugins
+
+LazyVim, Omarchy's editor setup, installs its plugins with lazy.nvim, which
+keeps each as a git checkout in `~/.local/share/nvim/lazy/<name>`
+(`$XDG_DATA_HOME/nvim/lazy` when that is set) and updates them from GitHub.
+Neovim runs that code at every start. The sweep lists each plugin as one item,
+under its directory, whose hash covers every file of it outside `.git`, the
+address it was cloned from and the commit it is at: a plugin that is updated,
+edited or moved to another address is changed, shows in `--diff` and in the
+daily notification, and an allow covers it as a whole until it changes.
+
+What is read, all as files, without running git: the origin from
+`.git/config` (with any user and password taken out of the address), the
+commit from `.git/HEAD` and the refs (`packed-refs` too), the hooks in
+`.git/hooks`, `lazy-lock.json` in `~/.config/nvim` (`$XDG_CONFIG_HOME/nvim`),
+and the plugin specs in the Lua files of your configuration and in those
+plugins ship where lazy.nvim reads them (`lua/<module>/plugins/`, as LazyVim
+does, and `lazy.lua`). Only table literals of a spec are read
+(`{ "owner/repo", name = …, url = …, build = … }`).
+
+What is a finding, on every sweep:
+
+- `plugin-source`: a plugin directory that is no git checkout, or a link; a
+  checkout that names no origin; an origin that is not where any spec has
+  lazy.nvim fetch the plugin from (`owner/repo` is GitHub's, an address is
+  taken as written; scheme, user, case and `.git` do not count). A plugin no
+  spec names gets a note, not a finding: a spec built by code is not read;
+- `plugin-build`: a spec whose `build` is a shell command (`build = "make"`),
+  which lazy.nvim runs at install and update, and any git hook in the
+  checkout, which git runs when lazy.nvim updates it;
+- `git-config-command`: a key of the checkout's `.git/config` that runs a
+  command (`core.fsmonitor` and the like) on the git commands lazy.nvim runs.
+
+A build step that is a Neovim command (`":TSUpdate"`), a Lua function or a
+Lua expression that picks a command (`vim.g.x and "cargo build"`) is noted on
+the item, not a finding, and so is a top-level `build.lua`, which lazy.nvim
+runs; a commit other than the one `lazy-lock.json` pins, and a plugin it does
+not name, are noted too.
+
+What goes to the review. The first sweep that finds plugins and no record of
+them takes them as they are: their files are hashed and recorded, and none is
+read by the text rules or sent to the AI, which on a LazyVim install would be
+some 3,500 Lua files and tens of local findings in ordinary plugin code. That
+sweep costs no AI call for plugins. After it, the Lua, Vimscript, shell and
+build files (`Makefile`, `*.rockspec`) of a plugin that are new or changed
+since the record go through the local rules and the AI review like any other
+text the sweep reviews, with what Guardian established about the plugin
+(origin, commit, build step); a plugin new since the record sends all of
+them. So a later sweep costs one review's share per plugin that changed, and
+none when nothing did. A file whose path marks it as holding secrets is read
+by the local rules only and raises `kept-from-review`. At most 1,500 files or
+4 MiB of one plugin are sent in one sweep; past that the sweep is incomplete
+and says so: read the plugin yourself and allow it. A plugin you allowed is
+not reviewed again until it changes.
+
+The record (`nvim-plugins.json` in the sweep's directory of the review store)
+holds each plugin's code files and their hashes. A plugin's entry moves on
+only when its changed files were reviewed without a finding and every review
+of them finished; otherwise they are sent again at the next sweep. It is your
+own file: one that is gone while the last sweep listed plugins, or that
+cannot be read, makes that sweep incomplete, and the plugins are taken as
+they are.
+
+After the upgrade that adds plugins to the sweep, each plugin shows once as
+new, in `--diff` and in the daily notification; that sweep takes them as they
+are.
+
+Not covered: plugins of other managers (packer, vim-plug, Neovim's own
+`pack/*/start` under your data directory), a lazy.nvim `root` other than the
+default, specs built by code, other files of a plugin (data, documentation,
+compiled libraries, Python or Node remote plugins), which count for whether it
+changed but are not sent, and what lazy.nvim fetches when a plugin is
+installed or updated: the sweep sees a plugin once it is on disk.
 
 ### Accounts, keys and trust anchors
 
@@ -1248,9 +1323,12 @@ reviews as well, are listed under [Local rules](local-rules.md#rule-ids).
 | `network-relay` | medium | A tool that runs or forwards what it is told over the network (netcat, socat, a tunnel) listens or is connected. |
 | `traced-process` | medium | Another process is attached to this one the way a debugger is, and can read and change its memory. |
 | `kernel-tap` | medium | Something no package explains taps the kernel's network or tracing path: a raw packet socket, or a pinned eBPF object. |
+| `plugin-source` | medium | An editor plugin is not a git checkout of where its plugin manager fetches it from: its origin is not the address its spec names, it names no origin, or it is no checkout at all. |
+| `plugin-build` | medium | An editor plugin runs a program when its plugin manager installs or updates it: a shell command as its build step, or a git hook in its checkout. |
 | `kept-from-review` | medium | Something runs this file, or a shell reads it in, and it holds more than opaque values kept in secret-named or plainly inert variables; its path marks it as holding secrets, so the AI review did not read it: only the local rules did. Read it yourself; `sweep allow` records that you did. |
 | `network-listener` | low | A program listens on the network that nothing installed accounts for: an interpreter (Python, a shell, Node), or a packaged program no packaged service runs. |
 
 `git-config-command` and `remote-shell` are reported by the sweep as well as
-by source reviews: the first for a git key in a home that runs a command, the
+by source reviews: the first for a git key in a home or a Neovim plugin's
+checkout that runs a command, the
 second for a running shell or interpreter on a network connection.

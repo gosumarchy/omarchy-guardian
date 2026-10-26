@@ -158,6 +158,9 @@ fn item_json(item: &Item) -> Json {
             ("kind", Json::from("unreadable")),
             ("reason", Json::from(reason.as_str())),
         ]),
+        // Root does not collect plugins (they are a home's, which the
+        // user's own sweep reads); a kind nothing reads back drops one.
+        Body::Plugin(_) => Json::object([("kind", Json::from("plugin"))]),
     };
     let strings = |values: &[String]| {
         Json::Array(

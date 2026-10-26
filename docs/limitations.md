@@ -127,7 +127,9 @@ The full text of each limit is on the page of its part, not repeated here:
   what the bar's reading of `~/.bashrc` does not see ([The Bash
   interceptor](themes-and-plugins.md#the-bash-interceptor)).
 - System sweep: what is and is not followed ([What it
-  reads](system-sweep.md#what-it-reads)), what the live checks miss ([What
+  reads](system-sweep.md#what-it-reads)), Neovim plugins taken as they are at
+  the first sweep and the plugin managers not covered ([Neovim
+  plugins](system-sweep.md#neovim-plugins)), what the live checks miss ([What
   runs now](system-sweep.md#what-runs-now)), the EFI programs and the
   initramfs ([How the machine was
   started](system-sweep.md#how-the-machine-was-started)), pacman's records
