@@ -573,21 +573,29 @@ fn notes(checkout: &Checkout, plugin: &Plugin, specs: &Specs, unlocked: bool) ->
     notes
 }
 
-/// The code files and the files that run unread among `files`, with their
-/// hashes, and the paths of those that run unread.
+/// The code files and the files and links that run unread among `files`,
+/// with their hashes (a link's is that of its target), and the paths of
+/// those that run unread.
 fn code_files(files: &[(String, Entry)]) -> (BTreeMap<String, Digest>, BTreeSet<String>) {
     let mut code = BTreeMap::new();
     let mut unread = BTreeSet::new();
     for (path, entry) in files {
-        let Entry::File { sha256, mode } = entry else {
-            continue;
-        };
-        if runs_unread(path, *mode) {
-            unread.insert(path.clone());
-        } else if !is_code(path) {
-            continue;
+        match entry {
+            // A link may stand where a Lua file belongs, and Neovim runs
+            // what it leads to, which the sweep does not follow.
+            Entry::Link(target) => {
+                unread.insert(path.clone());
+                let digest = Sha256::digest(format!("link\0{target}").as_bytes());
+                code.insert(path.clone(), digest);
+            }
+            Entry::File { sha256, mode } if runs_unread(path, *mode) || is_code(path) => {
+                if runs_unread(path, *mode) {
+                    unread.insert(path.clone());
+                }
+                code.insert(path.clone(), *sha256);
+            }
+            Entry::File { .. } => {}
         }
-        code.insert(path.clone(), *sha256);
     }
     (code, unread)
 }

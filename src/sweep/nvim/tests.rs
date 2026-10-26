@@ -706,6 +706,24 @@ fn only_new_or_changed_code_files_are_sent() {
 }
 
 #[test]
+fn a_lua_file_turned_into_a_link_is_reported_not_skipped() {
+    let temp = TempDir::new("nvim-link-code");
+    let root = temp.path();
+    plugin(root, "p", "https://github.com/o/p", &[("lua/a.lua", "a")]);
+    let before = record("p", &[("lua/a.lua", "a")]);
+    let path = root.join(LAZY).join("p/lua/a.lua");
+    fs::remove_file(&path).unwrap();
+    symlink("/tmp/elsewhere.lua", &path).unwrap();
+    let (items, _) = planned(root, &before, true);
+    let Review::Changed(sent) = &plugin_of(&items[0]).review else {
+        panic!("{:?}", plugin_of(&items[0]).review);
+    };
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].path, "lua/a.lua");
+    assert!(sent[0].sha256.is_none() && matches!(sent[0].body, Body::Binary(_)));
+}
+
+#[test]
 fn changed_code_that_runs_unread_is_reported_not_sent() {
     let temp = TempDir::new("nvim-unread-code");
     let root = temp.path();
