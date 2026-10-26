@@ -373,7 +373,9 @@ and no file of an auto-run location says it is there. For each profile
 (`~/.config/chromium`, `~/.config/BraveSoftware/Brave-Browser`,
 `~/.config/google-chrome`) the sweep reads the extensions listed in
 `Preferences` and `Secure Preferences` (the latter wins where both list one),
-with each extension's `manifest.json` for its name, version and update URL.
+with each extension's `manifest.json` for its name, version and update URL
+(the one on disk, which the browser loads; a copy in the preferences counts
+only where there is no directory).
 For Firefox (`~/.mozilla/firefox`, `~/.config/mozilla/firefox`) and Zen
 (`~/.zen`) it reads each profile's `extensions.json`. The browsers' own
 extensions (Chromium's component extensions, Firefox's built-in add-ons) and
@@ -390,7 +392,8 @@ a note:
 | Loaded unpacked (developer mode, `--load-extension`, a temporary add-on) | `risky-configuration`, with the directory |
 | Loaded unpacked from a directory whose every file a package installed, unchanged | trusted, only counted (Omarchy loads its own extensions this way) |
 | Installed in Firefox without Mozilla's signature | `risky-configuration` |
-| Its manifest cannot be read, so where it updates from is not known | listed with a note that says so, no alert |
+| Its manifest cannot be read, and the browser marks it as from its store | listed with a note, no alert; the sweep is incomplete |
+| Its manifest cannot be read, and the browser does not mark it as from its store | `risky-configuration`; the sweep is incomplete |
 
 What the sweep remembers of an extension is its id, where it came from and the
 permissions and hosts it was granted, not its version: an update that grants
@@ -404,7 +407,9 @@ they are read on this machine, and only what makes the item (id, name,
 version, source, granted permissions and hosts) is kept from them. Nothing of
 an extension is sent to the AI, its code is not reviewed, and the extension
 data directories are not read. A preferences file that cannot be read or
-parsed leaves that profile not checked, and the sweep incomplete. At most 32
+parsed leaves that profile not checked, and the sweep incomplete; so does a
+profile directory whose name is not UTF-8, and an extension listed under an
+id the browser does not make is counted as not checked. At most 32
 profiles of a browser and 500 extensions of a profile are checked; past that the
 sweep says what was left out and is incomplete. It costs no AI call.
 

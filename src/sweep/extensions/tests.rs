@@ -126,7 +126,13 @@ fn chromium_extensions_are_judged_by_where_they_came_from() {
         origin: Origin::System,
     };
     let (items, unchecked) = found(&scope);
-    assert!(unchecked.is_empty(), "{unchecked:?}");
+    // `../x`, and a 33-letter id.
+    assert_eq!(
+        unchecked,
+        [format!(
+            "/{CHROMIUM}/Default: 2 extension(s) listed under an id the browser does not make; not checked"
+        )]
+    );
     assert_eq!(items.len(), 4, "{items:?}");
     assert!(by_id(&items, COMPONENT_ID).is_none());
     for item in &items {
@@ -187,6 +193,7 @@ fn what_is_remembered_is_what_was_granted_not_the_version() {
         permissions: BTreeSet::from(["storage".to_string()]),
         hosts: hosts.iter().map(|host| (*host).to_string()).collect(),
         notes: Vec::new(),
+        unread: None,
     };
     let before = text(&extension("1.0", &["https://a/*"]));
     assert_eq!(before, text(&extension("1.1", &["https://a/*"])));
@@ -226,7 +233,12 @@ fn firefox_extensions_are_judged_by_signature_and_source() {
         origin: Origin::System,
     };
     let (items, unchecked) = found(&scope);
-    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert_eq!(
+        unchecked,
+        [
+            "/home/u/.mozilla/firefox/abc.default-release: 1 extension(s) listed under an id the browser does not make; not checked"
+        ]
+    );
     let seen: Vec<(&str, Option<&str>)> = items
         .iter()
         .map(|item| {
@@ -287,14 +299,15 @@ fn what_cannot_be_read_is_said_and_the_rest_still_checked() {
     };
     let (items, unchecked) = found(&scope);
     assert_eq!(items.len(), 4);
-    assert_eq!(unchecked.len(), 2, "{unchecked:?}");
-    assert!(unchecked[0].starts_with("could not parse "));
-    assert!(unchecked[0].contains("Profile 1/Preferences: "));
+    // The first is the ids of `chromium_profile` the browser does not make.
+    assert_eq!(unchecked.len(), 3, "{unchecked:?}");
+    assert!(unchecked[1].starts_with("could not parse "));
+    assert!(unchecked[1].contains("Profile 1/Preferences: "));
     assert!(
-        unchecked[0]
+        unchecked[1]
             .ends_with("the extensions of /home/u/.config/chromium/Profile 1 were not checked")
     );
-    assert!(unchecked[1].contains("Profile 3/Preferences: not a file that can be read"));
+    assert!(unchecked[2].contains("Profile 3/Preferences: not a file that can be read"));
 
     // A file past the limit is not read.
     let large = read_text(root, &format!("{CHROMIUM}/Default/Preferences"), 10);
@@ -374,15 +387,18 @@ fn what_is_past_the_limits_is_said() {
 }
 
 #[test]
-fn an_unread_manifest_is_said_not_taken_for_an_outside_install() {
+fn an_unread_manifest_is_said_and_only_the_store_mark_keeps_it_from_an_alert() {
     let dir = TempDir::new("sweep-extensions-manifest");
     let root = dir.path();
     let profile = format!("{CHROMIUM}/Default");
-    fs::create_dir_all(
-        root.join(&profile)
-            .join(format!("Extensions/{STORE_ID}/1/manifest.json")),
-    )
-    .unwrap();
+    // A manifest that is a directory cannot be read.
+    for id in [STORE_ID, PACKAGED_ID] {
+        fs::create_dir_all(
+            root.join(&profile)
+                .join(format!("Extensions/{id}/1/manifest.json")),
+        )
+        .unwrap();
+    }
     write(
         root,
         &format!("{profile}/Extensions/{ELSEWHERE_ID}/1/manifest.json"),
@@ -392,11 +408,30 @@ fn an_unread_manifest_is_said_not_taken_for_an_outside_install() {
         "Extensions/{ELSEWHERE_ID}/1/_locales/en/messages.json"
     )))
     .unwrap();
+    // The copy in the preferences names the store; the manifest the browser
+    // loads names another host.
+    write(
+        root,
+        &format!("{profile}/Extensions/{COMPONENT_ID}/1/manifest.json"),
+        r#"{"update_url":"https://updates.example/crx"}"#,
+    );
+    let entry =
+        |id: &str, extra: &str| format!(r#""{id}":{{"location":1,"path":"{id}/1"{extra}}}"#);
+    let settings = [
+        entry(STORE_ID, r#","from_webstore":true"#),
+        entry(PACKAGED_ID, ""),
+        entry(ELSEWHERE_ID, ""),
+        entry(
+            COMPONENT_ID,
+            r#","manifest":{"update_url":"https://clients2.google.com/service/update2/crx"}"#,
+        ),
+    ];
     write(
         root,
         &format!("{profile}/Preferences"),
         &format!(
-            r#"{{"extensions":{{"settings":{{"{STORE_ID}":{{"location":1,"path":"{STORE_ID}/1"}},"{ELSEWHERE_ID}":{{"location":1,"path":"{ELSEWHERE_ID}/1"}}}}}}}}"#
+            r#"{{"extensions":{{"settings":{{{}}}}}}}"#,
+            settings.join(",")
         ),
     );
     let index = PackageIndex::with_foreign(HashSet::new());
@@ -407,16 +442,30 @@ fn an_unread_manifest_is_said_not_taken_for_an_outside_install() {
         origin: Origin::System,
     };
     let (items, unchecked) = found(&scope);
-    assert!(unchecked.is_empty(), "{unchecked:?}");
-
-    let unread = by_id(&items, STORE_ID).unwrap();
-    assert!(unread.alerts.is_empty(), "{:?}", unread.alerts);
-    assert_eq!(unread.tier, Tier::Unknown);
+    let not_checked = |id: &str| {
+        unchecked.iter().any(|sentence| {
+            sentence.contains(&format!("{id}/1/manifest.json: not a file that can be read; where /{profile}#extension:{id} updates from was not checked"))
+        })
+    };
     assert!(
-        unread.notes[1].starts_with("its manifest could not be read (")
-            && unread.notes[1].ends_with("): where it updates from was not checked"),
-        "{:?}",
-        unread.notes
+        not_checked(STORE_ID) && not_checked(PACKAGED_ID),
+        "{unchecked:?}"
+    );
+    assert_eq!(unchecked.len(), 2, "{unchecked:?}");
+
+    // Marked as from the store: a note, no alert.
+    let marked = by_id(&items, STORE_ID).unwrap();
+    assert!(marked.alerts.is_empty(), "{:?}", marked.alerts);
+    assert_eq!(marked.tier, Tier::Unknown);
+    assert_eq!(
+        marked.notes[1],
+        "marked as from the Chrome Web Store, but its manifest could not be read: where it updates from was not checked"
+    );
+    // Without the mark, an unread manifest is no reason to trust it.
+    let unmarked = by_id(&items, PACKAGED_ID).unwrap();
+    assert_eq!(
+        unmarked.alerts[0].1,
+        "installed from outside the Chrome Web Store"
     );
 
     // The catalogue only names it: the store's update URL still counts.
@@ -430,6 +479,38 @@ fn an_unread_manifest_is_said_not_taken_for_an_outside_install() {
         unnamed.notes[1].starts_with("its message catalogue could not be read ("),
         "{:?}",
         unnamed.notes
+    );
+
+    let copied = by_id(&items, COMPONENT_ID).unwrap();
+    assert_eq!(
+        copied.alerts[0].1,
+        "installed from outside the Chrome Web Store (from updates.example)"
+    );
+}
+
+#[test]
+fn a_profile_whose_name_is_not_utf8_is_said() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let dir = TempDir::new("sweep-extensions-names");
+    let root = dir.path();
+    let firefox = root.join("home/u/.mozilla/firefox");
+    fs::create_dir_all(firefox.join(OsStr::from_bytes(b"bad\xff"))).unwrap();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: Some(HOME),
+        index: &index,
+        origin: Origin::System,
+    };
+    let (items, unchecked) = found(&scope);
+    assert!(items.is_empty());
+    assert_eq!(
+        unchecked,
+        [
+            "/home/u/.mozilla/firefox/bad\u{fffd}: a name that is not UTF-8; its extensions were not checked"
+        ]
     );
 }
 

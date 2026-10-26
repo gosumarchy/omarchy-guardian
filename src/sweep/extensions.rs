@@ -145,9 +145,9 @@ enum Source {
     Unpacked(String),
     /// Installed in Firefox without Mozilla's signature.
     Unsigned,
-    /// Not known: the manifest, which names where it updates from, could
-    /// not be read, for the reason given.
-    Unread(String),
+    /// Marked by the browser as from its store, where the manifest that
+    /// names where it updates from could not be read.
+    Unread,
 }
 
 /// One extension of one profile.
@@ -164,6 +164,8 @@ struct Extension {
     hosts: BTreeSet<String>,
     /// What could not be read of it, as notes for its item.
     notes: Vec<String>,
+    /// Why its manifest could not be read, where it could not.
+    unread: Option<String>,
 }
 
 /// What the extension checks found.
@@ -182,7 +184,8 @@ pub(super) fn check(scope: &Scope<'_>) -> Extensions {
     };
     for browser in BROWSERS {
         let directory = format!("{home}/{}", browser.directory);
-        let profiles = match profiles(scope.root, &directory, browser.family) {
+        let profiles = match profiles(scope.root, &directory, browser.family, &mut found.unchecked)
+        {
             Ok(profiles) => profiles,
             Err(error) => {
                 found
@@ -198,8 +201,8 @@ pub(super) fn check(scope: &Scope<'_>) -> Extensions {
         }
         for profile in profiles.into_iter().take(MAX_PROFILES) {
             let listed = match browser.family {
-                Family::Chromium => chromium(scope.root, browser, &profile),
-                Family::Firefox => firefox(scope.root, browser, &profile),
+                Family::Chromium => chromium(scope.root, browser, &profile, &mut found.unchecked),
+                Family::Firefox => firefox(scope.root, browser, &profile, &mut found.unchecked),
             };
             let extensions = match listed {
                 Ok(extensions) => extensions,
@@ -217,12 +220,15 @@ pub(super) fn check(scope: &Scope<'_>) -> Extensions {
                     "/{profile}: more than {MAX_EXTENSIONS} extensions; the rest were not checked"
                 ));
             }
-            found.items.extend(
-                extensions
-                    .iter()
-                    .take(MAX_EXTENSIONS)
-                    .map(|extension| item(scope, extension)),
-            );
+            for extension in extensions.iter().take(MAX_EXTENSIONS) {
+                if let Some(reason) = &extension.unread {
+                    found.unchecked.push(format!(
+                        "{reason}; where /{profile}#extension:{} updates from was not checked",
+                        extension.id
+                    ));
+                }
+                found.items.push(item(scope, extension));
+            }
         }
     }
     found
@@ -230,27 +236,63 @@ pub(super) fn check(scope: &Scope<'_>) -> Extensions {
 
 /// The profile directories under `directory` (relative to `root`), sorted;
 /// none when the browser was never started. A link is no profile the
-/// browser made, and is passed over.
-fn profiles(root: &Path, directory: &str, family: Family) -> Result<Vec<String>, Error> {
+/// browser made, and is passed over. An entry that cannot be read, or
+/// whose name is not UTF-8, is added to `unchecked`.
+fn profiles(
+    root: &Path,
+    directory: &str,
+    family: Family,
+    unchecked: &mut Vec<String>,
+) -> Result<Vec<String>, Error> {
     let full = root.join(directory);
     let entries = match fs::read_dir(&full) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         entries => entries.at(&full)?,
     };
-    let mut profiles: Vec<String> = entries
-        .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| match family {
-            Family::Chromium => name == "Default" || name.starts_with("Profile "),
+    let mut profiles = Vec::new();
+    for entry in entries {
+        let Ok((entry, kind)) = entry.and_then(|entry| {
+            let kind = entry.file_type()?;
+            Ok((entry, kind))
+        }) else {
+            unchecked.push(format!(
+                "/{directory}: an entry could not be read; whether it is a profile was not checked"
+            ));
+            continue;
+        };
+        let name = entry.file_name();
+        let is_profile = match family {
+            Family::Chromium => {
+                let name = name.to_string_lossy();
+                name == "Default" || name.starts_with("Profile ")
+            }
             // A Firefox profile has any name; one without `extensions.json`
             // lists nothing.
             Family::Firefox => true,
-        })
-        .map(|name| format!("{directory}/{name}"))
-        .collect();
+        };
+        if !kind.is_dir() || !is_profile {
+            continue;
+        }
+        match name.into_string() {
+            Ok(name) => profiles.push(format!("{directory}/{name}")),
+            Err(name) => unchecked.push(format!(
+                "/{directory}/{}: a name that is not UTF-8; its extensions were not checked",
+                name.to_string_lossy()
+            )),
+        }
+    }
     profiles.sort();
     Ok(profiles)
+}
+
+/// Says in `unchecked` that `count` entries of `profile` were passed over
+/// for an id the browser does not make.
+fn malformed(profile: &str, count: usize, unchecked: &mut Vec<String>) {
+    if count > 0 {
+        unchecked.push(format!(
+            "/{profile}: {count} extension(s) listed under an id the browser does not make; not checked"
+        ));
+    }
 }
 
 /// The text of the file at `path` (relative to `root`), of at most `max`
@@ -289,6 +331,7 @@ fn chromium(
     root: &Path,
     browser: &'static Browser,
     profile: &str,
+    unchecked: &mut Vec<String>,
 ) -> Result<Vec<Extension>, Error> {
     let mut settings: BTreeMap<String, Json> = BTreeMap::new();
     for file in ["Secure Preferences", "Preferences"] {
@@ -305,14 +348,19 @@ fn chromium(
             settings.entry(id.clone()).or_insert_with(|| entry.clone());
         }
     }
-    Ok(settings
-        .iter()
+    // Chromium's ids are 32 letters from `a` to `p`.
+    let (valid, invalid): (Vec<_>, Vec<_>) = settings.iter().partition(|(id, _)| {
+        id.len() == 32 && id.bytes().all(|byte| (b'a'..=b'p').contains(&byte))
+    });
+    malformed(profile, invalid.len(), unchecked);
+    Ok(valid
+        .into_iter()
         .filter_map(|(id, entry)| chromium_extension(root, browser, profile, id, entry))
         .collect())
 }
 
-/// The extension `id` of a Chromium profile, from its entry in the
-/// preferences and its manifest; `None` for the browser's own.
+/// The extension `id`, a valid one, of a Chromium profile, from its entry
+/// in the preferences and its manifest; `None` for the browser's own.
 fn chromium_extension(
     root: &Path,
     browser: &'static Browser,
@@ -320,10 +368,6 @@ fn chromium_extension(
     id: &str,
     entry: &Json,
 ) -> Option<Extension> {
-    // Chromium's ids are 32 letters from `a` to `p`.
-    if id.len() != 32 || !id.bytes().all(|byte| (b'a'..=b'p').contains(&byte)) {
-        return None;
-    }
     let location = entry.get("location").and_then(Json::as_u64);
     if location.is_some_and(|location| COMPONENT.contains(&location)) {
         return None;
@@ -339,12 +383,14 @@ fn chromium_extension(
                 Some(absolute) => absolute.to_string(),
                 None => format!("{profile}/Extensions/{path}"),
             });
-    // Older Chromium keeps the manifest in the preferences.
-    let manifest = match (entry.get("manifest"), directory.as_deref()) {
-        (Some(manifest), _) => Ok(Some(manifest.clone())),
-        (None, Some(directory)) => {
+    // The manifest the browser loads is the one on disk; older Chromium
+    // kept a copy in the preferences, which only stands where there is no
+    // directory to read.
+    let manifest = match (directory.as_deref(), entry.get("manifest")) {
+        (Some(directory), _) => {
             read_json(root, &format!("{directory}/manifest.json"), MAX_MANIFEST)
         }
+        (None, Some(manifest)) => Ok(Some(manifest.clone())),
         (None, None) => Ok(None),
     };
     let (manifest, unread) = match manifest {
@@ -356,15 +402,18 @@ fn chromium_extension(
         .and_then(|manifest| manifest.get("update_url"))
         .and_then(Json::as_str);
     let from_store = entry.get("from_webstore").and_then(Json::as_bool) == Some(true);
-    let source = match (&directory, update, unread) {
+    // Without the manifest, only the browser's own mark says it is from
+    // the store; one without the mark is taken as from elsewhere.
+    let source = match (&directory, update, unread.is_some()) {
         (Some(directory), _, _) if unpacked => Source::Unpacked(directory.clone()),
         (None, _, _) if unpacked => Source::Elsewhere(None),
-        (_, _, Some(reason)) => Source::Unread(reason),
-        (_, Some(update), None) if WEB_STORE.contains(&update.trim_end_matches('/')) => {
+        (_, _, true) if from_store => Source::Unread,
+        (_, _, true) => Source::Elsewhere(None),
+        (_, Some(update), false) if WEB_STORE.contains(&update.trim_end_matches('/')) => {
             Source::Store
         }
-        (_, None, None) if from_store => Source::Store,
-        (_, update, None) => Source::Elsewhere(update.and_then(host)),
+        (_, None, false) if from_store => Source::Store,
+        (_, update, false) => Source::Elsewhere(update.and_then(host)),
     };
     let (name, notes) = match manifest
         .as_ref()
@@ -394,6 +443,7 @@ fn chromium_extension(
         permissions: strings(granted, &["api", "manifest_permissions"]),
         hosts: strings(granted, &["explicit_host", "scriptable_host"]),
         notes,
+        unread,
     })
 }
 
@@ -452,7 +502,12 @@ fn strings(granted: Option<&Json>, keys: &[&str]) -> BTreeSet<String> {
 
 /// The extensions a Firefox profile lists, but the browser's own add-ons
 /// and what is no extension (themes, dictionaries, language packs).
-fn firefox(root: &Path, browser: &'static Browser, profile: &str) -> Result<Vec<Extension>, Error> {
+fn firefox(
+    root: &Path,
+    browser: &'static Browser,
+    profile: &str,
+    unchecked: &mut Vec<String>,
+) -> Result<Vec<Extension>, Error> {
     let Some(listed) = read_json(root, &format!("{profile}/extensions.json"), MAX_PREFERENCES)?
     else {
         return Ok(Vec::new());
@@ -461,7 +516,7 @@ fn firefox(root: &Path, browser: &'static Browser, profile: &str) -> Result<Vec<
         .get("addons")
         .and_then(Json::as_array)
         .unwrap_or_default();
-    Ok(addons
+    let extensions: Vec<&Json> = addons
         .iter()
         .filter(|addon| addon.get("type").and_then(Json::as_str) == Some("extension"))
         .filter(|addon| {
@@ -470,16 +525,23 @@ fn firefox(root: &Path, browser: &'static Browser, profile: &str) -> Result<Vec<
                 .and_then(Json::as_str)
                 .is_some_and(|location| BUILT_IN.contains(&location))
         })
+        .collect();
+    let listed: Vec<Extension> = extensions
+        .iter()
         .filter_map(|addon| firefox_extension(browser, profile, addon))
-        .collect())
+        .collect();
+    malformed(profile, extensions.len() - listed.len(), unchecked);
+    Ok(listed)
 }
 
-/// One extension of a Firefox profile, from its entry in `extensions.json`.
+/// One extension of a Firefox profile, from its entry in `extensions.json`;
+/// `None` where its id is not one Mozilla makes.
 fn firefox_extension(browser: &'static Browser, profile: &str, addon: &Json) -> Option<Extension> {
     let text = |key: &str| addon.get(key).and_then(Json::as_str);
     // The id goes into the item's label, which the sweep shows and `sweep
     // allow` takes: Mozilla's ids are an email-like name or a UUID in
-    // braces, and anything else is not listed as written.
+    // braces. Any other is not listed, and `firefox` says how many were
+    // not.
     let id = text("id").filter(|id| {
         !id.is_empty()
             && id
@@ -519,6 +581,7 @@ fn firefox_extension(browser: &'static Browser, profile: &str, addon: &Json) -> 
         permissions: strings(granted, &["permissions"]),
         hosts: strings(granted, &["origins"]),
         notes: Vec::new(),
+        unread: None,
     })
 }
 
@@ -568,7 +631,7 @@ fn text(extension: &Extension) -> String {
         Source::Elsewhere(host) => format!("from elsewhere: {}", host.as_deref().unwrap_or("")),
         Source::Unpacked(directory) => format!("unpacked from /{directory}"),
         Source::Unsigned => "unsigned".to_string(),
-        Source::Unread(_) => "from where not known".to_string(),
+        Source::Unread => "from where not known".to_string(),
     };
     let joined = |listed: &BTreeSet<String>| {
         listed
@@ -616,8 +679,8 @@ fn item(scope: &Scope<'_>, extension: &Extension) -> Item {
             )),
         },
         Source::Unsigned => alerts.push("not signed by Mozilla".into()),
-        Source::Unread(reason) => notes.push(format!(
-            "its manifest could not be read ({reason}): where it updates from was not checked"
+        Source::Unread => notes.push(format!(
+            "marked as from the {store}, but its manifest could not be read: where it updates from was not checked"
         )),
     }
     notes.extend(extension.notes.iter().cloned());
