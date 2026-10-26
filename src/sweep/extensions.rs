@@ -145,6 +145,9 @@ enum Source {
     Unpacked(String),
     /// Installed in Firefox without Mozilla's signature.
     Unsigned,
+    /// Not known: the manifest, which names where it updates from, could
+    /// not be read, for the reason given.
+    Unread(String),
 }
 
 /// One extension of one profile.
@@ -159,6 +162,8 @@ struct Extension {
     source: Source,
     permissions: BTreeSet<String>,
     hosts: BTreeSet<String>,
+    /// What could not be read of it, as notes for its item.
+    notes: Vec<String>,
 }
 
 /// What the extension checks found.
@@ -196,14 +201,28 @@ pub(super) fn check(scope: &Scope<'_>) -> Extensions {
                 Family::Chromium => chromium(scope.root, browser, &profile),
                 Family::Firefox => firefox(scope.root, browser, &profile),
             };
-            match listed {
-                Ok(extensions) => found
-                    .items
-                    .extend(extensions.iter().map(|extension| item(scope, extension))),
-                Err(error) => found.unchecked.push(format!(
-                    "{error}; the extensions of /{profile} were not checked"
-                )),
+            let extensions = match listed {
+                Ok(extensions) => extensions,
+                Err(error) => {
+                    found.unchecked.push(format!(
+                        "{error}; the extensions of /{profile} were not checked"
+                    ));
+                    continue;
+                }
+            };
+            // Chromium's are in the order of their ids, which whoever writes
+            // the preferences picks: what is left out is said.
+            if extensions.len() > MAX_EXTENSIONS {
+                found.unchecked.push(format!(
+                    "/{profile}: more than {MAX_EXTENSIONS} extensions; the rest were not checked"
+                ));
             }
+            found.items.extend(
+                extensions
+                    .iter()
+                    .take(MAX_EXTENSIONS)
+                    .map(|extension| item(scope, extension)),
+            );
         }
     }
     found
@@ -289,7 +308,6 @@ fn chromium(
     Ok(settings
         .iter()
         .filter_map(|(id, entry)| chromium_extension(root, browser, profile, id, entry))
-        .take(MAX_EXTENSIONS)
         .collect())
 }
 
@@ -303,7 +321,7 @@ fn chromium_extension(
     entry: &Json,
 ) -> Option<Extension> {
     // Chromium's ids are 32 letters from `a` to `p`.
-    if id.is_empty() || !id.bytes().all(|byte| (b'a'..=b'p').contains(&byte)) {
+    if id.len() != 32 || !id.bytes().all(|byte| (b'a'..=b'p').contains(&byte)) {
         return None;
     }
     let location = entry.get("location").and_then(Json::as_u64);
@@ -321,23 +339,45 @@ fn chromium_extension(
                 Some(absolute) => absolute.to_string(),
                 None => format!("{profile}/Extensions/{path}"),
             });
-    let manifest = entry.get("manifest").cloned().or_else(|| {
-        let directory = directory.as_deref()?;
-        read_json(root, &format!("{directory}/manifest.json"), MAX_MANIFEST)
-            .ok()
-            .flatten()
-    });
+    // Older Chromium keeps the manifest in the preferences.
+    let manifest = match (entry.get("manifest"), directory.as_deref()) {
+        (Some(manifest), _) => Ok(Some(manifest.clone())),
+        (None, Some(directory)) => {
+            read_json(root, &format!("{directory}/manifest.json"), MAX_MANIFEST)
+        }
+        (None, None) => Ok(None),
+    };
+    let (manifest, unread) = match manifest {
+        Ok(manifest) => (manifest, None),
+        Err(error) => (None, Some(error.to_string())),
+    };
     let update = manifest
         .as_ref()
         .and_then(|manifest| manifest.get("update_url"))
         .and_then(Json::as_str);
     let from_store = entry.get("from_webstore").and_then(Json::as_bool) == Some(true);
-    let source = match (&directory, update) {
-        (Some(directory), _) if unpacked => Source::Unpacked(directory.clone()),
-        (None, _) if unpacked => Source::Elsewhere(None),
-        (_, Some(update)) if WEB_STORE.contains(&update.trim_end_matches('/')) => Source::Store,
-        (_, None) if from_store => Source::Store,
-        (_, update) => Source::Elsewhere(update.and_then(host)),
+    let source = match (&directory, update, unread) {
+        (Some(directory), _, _) if unpacked => Source::Unpacked(directory.clone()),
+        (None, _, _) if unpacked => Source::Elsewhere(None),
+        (_, _, Some(reason)) => Source::Unread(reason),
+        (_, Some(update), None) if WEB_STORE.contains(&update.trim_end_matches('/')) => {
+            Source::Store
+        }
+        (_, None, None) if from_store => Source::Store,
+        (_, update, None) => Source::Elsewhere(update.and_then(host)),
+    };
+    let (name, notes) = match manifest
+        .as_ref()
+        .map(|manifest| chromium_name(root, manifest, directory.as_deref()))
+    {
+        None => (None, Vec::new()),
+        Some(Ok(name)) => (name, Vec::new()),
+        Some(Err(error)) => (
+            None,
+            vec![format!(
+                "its message catalogue could not be read ({error}): its name is not known"
+            )],
+        ),
     };
     let granted = entry
         .get("granted_permissions")
@@ -346,44 +386,52 @@ fn chromium_extension(
         browser,
         profile: profile.to_string(),
         id: id.to_string(),
-        name: manifest
-            .as_ref()
-            .and_then(|manifest| chromium_name(root, manifest, directory.as_deref())),
+        name,
         version: manifest
             .as_ref()
             .and_then(|manifest| manifest.get("version")?.as_str().map(str::to_string)),
         source,
         permissions: strings(granted, &["api", "manifest_permissions"]),
         hosts: strings(granted, &["explicit_host", "scriptable_host"]),
+        notes,
     })
 }
 
 /// An extension's name: the manifest's, or where that is a message
-/// (`__MSG_appName__`), the message in the default locale's catalogue.
-fn chromium_name(root: &Path, manifest: &Json, directory: Option<&str>) -> Option<String> {
-    let name = manifest.get("name")?.as_str()?;
+/// (`__MSG_appName__`), the message in the default locale's catalogue;
+/// `Err` when the catalogue is there and cannot be read.
+fn chromium_name(
+    root: &Path,
+    manifest: &Json,
+    directory: Option<&str>,
+) -> Result<Option<String>, Error> {
+    let Some(name) = manifest.get("name").and_then(Json::as_str) else {
+        return Ok(None);
+    };
     let Some(key) = name
         .strip_prefix("__MSG_")
         .and_then(|rest| rest.strip_suffix("__"))
     else {
-        return Some(name.to_string());
+        return Ok(Some(name.to_string()));
     };
-    let locale = manifest.get("default_locale")?.as_str()?;
+    let locale = manifest.get("default_locale").and_then(Json::as_str);
+    let (Some(locale), Some(directory)) = (locale, directory) else {
+        return Ok(None);
+    };
     if locale.contains(['/', '.']) {
-        return None;
+        return Ok(None);
     }
-    let catalogue = read_json(
-        root,
-        &format!("{}/_locales/{locale}/messages.json", directory?),
-        MAX_MANIFEST,
-    )
-    .ok()??;
+    let path = format!("{directory}/_locales/{locale}/messages.json");
+    let Some(catalogue) = read_json(root, &path, MAX_MANIFEST)? else {
+        return Ok(None);
+    };
     // Message names are matched without regard to case.
-    catalogue
-        .as_object()?
+    Ok(catalogue
+        .as_object()
+        .unwrap_or_default()
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(key))
-        .and_then(|(_, message)| message.get("message")?.as_str().map(str::to_string))
+        .and_then(|(_, message)| message.get("message")?.as_str().map(str::to_string)))
 }
 
 /// The strings listed under `keys` of `granted`; a permission written as
@@ -423,7 +471,6 @@ fn firefox(root: &Path, browser: &'static Browser, profile: &str) -> Result<Vec<
                 .is_some_and(|location| BUILT_IN.contains(&location))
         })
         .filter_map(|addon| firefox_extension(browser, profile, addon))
-        .take(MAX_EXTENSIONS)
         .collect())
 }
 
@@ -439,8 +486,10 @@ fn firefox_extension(browser: &'static Browser, profile: &str, addon: &Json) -> 
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "@._-+{}".contains(c))
     })?;
-    // Firefox writes the states below 1 (missing, broken, unknown) as zero
-    // or negative numbers, which are no `u64`.
+    // Firefox's signed states are 1 and above (preliminary, signed, system,
+    // privileged); 0 is a missing signature and the negative ones broken or
+    // unknown (which `as_u64` gives as `None`), so all of those, and a
+    // state not written at all, count as unsigned.
     let signed = addon
         .get("signedState")
         .and_then(Json::as_u64)
@@ -469,6 +518,7 @@ fn firefox_extension(browser: &'static Browser, profile: &str, addon: &Json) -> 
         source,
         permissions: strings(granted, &["permissions"]),
         hosts: strings(granted, &["origins"]),
+        notes: Vec::new(),
     })
 }
 
@@ -518,6 +568,7 @@ fn text(extension: &Extension) -> String {
         Source::Elsewhere(host) => format!("from elsewhere: {}", host.as_deref().unwrap_or("")),
         Source::Unpacked(directory) => format!("unpacked from /{directory}"),
         Source::Unsigned => "unsigned".to_string(),
+        Source::Unread(_) => "from where not known".to_string(),
     };
     let joined = |listed: &BTreeSet<String>| {
         listed
@@ -565,7 +616,11 @@ fn item(scope: &Scope<'_>, extension: &Extension) -> Item {
             )),
         },
         Source::Unsigned => alerts.push("not signed by Mozilla".into()),
+        Source::Unread(reason) => notes.push(format!(
+            "its manifest could not be read ({reason}): where it updates from was not checked"
+        )),
     }
+    notes.extend(extension.notes.iter().cloned());
     notes.push(LOCAL_ONLY.into());
     let text = text(extension);
     Item {

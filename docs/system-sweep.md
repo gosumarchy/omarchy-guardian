@@ -390,6 +390,7 @@ a note:
 | Loaded unpacked (developer mode, `--load-extension`, a temporary add-on) | `risky-configuration`, with the directory |
 | Loaded unpacked from a directory whose every file a package installed, unchanged | trusted, only counted (Omarchy loads its own extensions this way) |
 | Installed in Firefox without Mozilla's signature | `risky-configuration` |
+| Its manifest cannot be read, so where it updates from is not known | listed with a note that says so, no alert |
 
 What the sweep remembers of an extension is its id, where it came from and the
 permissions and hosts it was granted, not its version: an update that grants
@@ -403,8 +404,9 @@ they are read on this machine, and only what makes the item (id, name,
 version, source, granted permissions and hosts) is kept from them. Nothing of
 an extension is sent to the AI, its code is not reviewed, and the extension
 data directories are not read. A preferences file that cannot be read or
-parsed leaves that profile not checked, and the sweep incomplete. It costs no
-AI call.
+parsed leaves that profile not checked, and the sweep incomplete. At most 32
+profiles of a browser and 500 extensions of a profile are checked; past that the
+sweep says what was left out and is incomplete. It costs no AI call.
 
 ### Accounts, keys and trust anchors
 

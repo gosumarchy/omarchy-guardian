@@ -3,7 +3,9 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
 
-use super::{BROWSERS, Extension, Source, check, host, read_text, text};
+use super::{
+    BROWSERS, Extension, MAX_EXTENSIONS, MAX_PROFILES, Source, check, host, read_text, text,
+};
 use crate::autorun::Category;
 use crate::rules::RuleId;
 use crate::sha256::Sha256;
@@ -86,12 +88,13 @@ fn chromium_profile(root: &Path) -> PackageIndex {
         root,
         &format!("{profile}/Preferences"),
         &format!(
-            r#"{{"extensions":{{"settings":{{"{STORE_ID}":{},"{ELSEWHERE_ID}":{},"{UNPACKED_ID}":{},"{PACKAGED_ID}":{},"{COMPONENT_ID}":{},"../x":{}}}}},"browser":{{"history":"private"}}}}"#,
+            r#"{{"extensions":{{"settings":{{"{STORE_ID}":{},"{ELSEWHERE_ID}":{},"{UNPACKED_ID}":{},"{PACKAGED_ID}":{},"{COMPONENT_ID}":{},"../x":{},"{STORE_ID}a":{}}}}},"browser":{{"history":"private"}}}}"#,
             entry(1, &format!("{STORE_ID}/1.0_0"), r#""storage""#),
             entry(1, &format!("{ELSEWHERE_ID}/2.0_0"), ""),
             entry(4, "/home/u/dev/ext", ""),
             entry(8, "/usr/share/omarchy/ext", r#""nativeMessaging""#),
             entry(5, "/usr/lib/chromium/resources/pdf", ""),
+            entry(1, "x", ""),
             entry(1, "x", ""),
         ),
     );
@@ -183,6 +186,7 @@ fn what_is_remembered_is_what_was_granted_not_the_version() {
         source: Source::Store,
         permissions: BTreeSet::from(["storage".to_string()]),
         hosts: hosts.iter().map(|host| (*host).to_string()).collect(),
+        notes: Vec::new(),
     };
     let before = text(&extension("1.0", &["https://a/*"]));
     assert_eq!(before, text(&extension("1.1", &["https://a/*"])));
@@ -307,6 +311,161 @@ fn what_cannot_be_read_is_said_and_the_rest_still_checked() {
         ..scope
     });
     assert!(homeless.items.is_empty() && homeless.unchecked.is_empty());
+}
+
+/// A Chromium extension id: `n` in hexadecimal, its digits shifted to
+/// the letters `a` to `p`.
+fn chromium_id(n: usize) -> String {
+    format!("{n:032x}")
+        .bytes()
+        .map(|digit| {
+            let value = char::from(digit).to_digit(16).unwrap();
+            char::from(b'a' + u8::try_from(value).unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn what_is_past_the_limits_is_said() {
+    let dir = TempDir::new("sweep-extensions-limits");
+    let root = dir.path();
+    // Installed from the store, as Chromium marks it, with no update URL to
+    // look at.
+    let settings: Vec<String> = (0..=MAX_EXTENSIONS)
+        .map(|n| {
+            format!(
+                r#""{}":{{"location":1,"from_webstore":true}}"#,
+                chromium_id(n)
+            )
+        })
+        .collect();
+    write(
+        root,
+        &format!("{CHROMIUM}/Default/Preferences"),
+        &format!(
+            r#"{{"extensions":{{"settings":{{{}}}}}}}"#,
+            settings.join(",")
+        ),
+    );
+    for n in 1..=MAX_PROFILES {
+        write(root, &format!("{CHROMIUM}/Profile {n}/Preferences"), "{}");
+    }
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: Some(HOME),
+        index: &index,
+        origin: Origin::System,
+    };
+    let (items, unchecked) = found(&scope);
+    assert_eq!(items.len(), MAX_EXTENSIONS);
+    assert!(items.iter().all(|item| item.alerts.is_empty()), "{items:?}");
+    assert_eq!(
+        unchecked,
+        [
+            format!(
+                "/{CHROMIUM}: more than {MAX_PROFILES} profiles; the extensions of the rest were not checked"
+            ),
+            format!(
+                "/{CHROMIUM}/Default: more than {MAX_EXTENSIONS} extensions; the rest were not checked"
+            ),
+        ]
+    );
+}
+
+#[test]
+fn an_unread_manifest_is_said_not_taken_for_an_outside_install() {
+    let dir = TempDir::new("sweep-extensions-manifest");
+    let root = dir.path();
+    let profile = format!("{CHROMIUM}/Default");
+    fs::create_dir_all(
+        root.join(&profile)
+            .join(format!("Extensions/{STORE_ID}/1/manifest.json")),
+    )
+    .unwrap();
+    write(
+        root,
+        &format!("{profile}/Extensions/{ELSEWHERE_ID}/1/manifest.json"),
+        r#"{"name":"__MSG_name__","default_locale":"en","update_url":"https://clients2.google.com/service/update2/crx"}"#,
+    );
+    fs::create_dir_all(root.join(&profile).join(format!(
+        "Extensions/{ELSEWHERE_ID}/1/_locales/en/messages.json"
+    )))
+    .unwrap();
+    write(
+        root,
+        &format!("{profile}/Preferences"),
+        &format!(
+            r#"{{"extensions":{{"settings":{{"{STORE_ID}":{{"location":1,"path":"{STORE_ID}/1"}},"{ELSEWHERE_ID}":{{"location":1,"path":"{ELSEWHERE_ID}/1"}}}}}}}}"#
+        ),
+    );
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: Some(HOME),
+        index: &index,
+        origin: Origin::System,
+    };
+    let (items, unchecked) = found(&scope);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+
+    let unread = by_id(&items, STORE_ID).unwrap();
+    assert!(unread.alerts.is_empty(), "{:?}", unread.alerts);
+    assert_eq!(unread.tier, Tier::Unknown);
+    assert!(
+        unread.notes[1].starts_with("its manifest could not be read (")
+            && unread.notes[1].ends_with("): where it updates from was not checked"),
+        "{:?}",
+        unread.notes
+    );
+
+    // The catalogue only names it: the store's update URL still counts.
+    let unnamed = by_id(&items, ELSEWHERE_ID).unwrap();
+    assert!(unnamed.alerts.is_empty(), "{:?}", unnamed.alerts);
+    assert_eq!(
+        unnamed.notes[0],
+        "Chromium extension (no name found) (no version found)"
+    );
+    assert!(
+        unnamed.notes[1].starts_with("its message catalogue could not be read ("),
+        "{:?}",
+        unnamed.notes
+    );
+}
+
+#[test]
+fn a_firefox_extension_without_a_signature_state_is_unsigned() {
+    let dir = TempDir::new("sweep-extensions-signed");
+    let root = dir.path();
+    write(
+        root,
+        "home/u/.mozilla/firefox/abc.default/extensions.json",
+        r#"{"addons":[
+            {"id":"missing@example","type":"extension","location":"app-profile","sourceURI":"https://addons.mozilla.org/x.xpi"},
+            {"id":"zero@example","type":"extension","location":"app-profile","signedState":0,"sourceURI":"https://addons.mozilla.org/x.xpi"},
+            {"id":"signed@example","type":"extension","location":"app-profile","signedState":1,"sourceURI":"https://addons.mozilla.org/x.xpi"}
+        ]}"#,
+    );
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: Some(HOME),
+        index: &index,
+        origin: Origin::System,
+    };
+    let (items, _) = found(&scope);
+    let alerts: Vec<Option<&str>> = items
+        .iter()
+        .map(|item| item.alerts.first().map(|(_, seen)| seen.as_str()))
+        .collect();
+    assert_eq!(
+        alerts,
+        [
+            Some("not signed by Mozilla"),
+            Some("not signed by Mozilla"),
+            None
+        ]
+    );
 }
 
 #[test]
