@@ -47,7 +47,9 @@ matter most:
   `/boot/efi` an unknown one is only listed with a note, and an ESP at `/efi`
   is not looked at; only files named `.efi` are compared, and the firmware's
   boot entries (NVRAM) are not read; rEFInd's configuration is found only as
-  `refind.conf` in lower case, though FAT ignores case; browser
+  `refind.conf` in lower case, though FAT ignores case; files rEFInd
+  `include`s or GRUB `source`s or `configfile`s, other than
+  `/boot/grub/custom.cfg`, are not collected; browser
   extensions are judged by where they came from and what they were granted,
   not by their code, and only Chromium's, Brave's, Chrome's, Firefox's and
   Zen's; other mounted filesystems (`/mnt`, `/media`, `/run/media`) are not

@@ -331,7 +331,9 @@ fn reading(item: &Item, home: Option<&str>, text: &str) -> Reading {
     if is_local_only(item, home) {
         return Reading::Settings;
     }
-    if item.category == Category::Boot && has_boot_secret(text) {
+    let is_boot =
+        item.category == Category::Boot || boot::is_configuration(collect::stands_for(item));
+    if is_boot && has_boot_secret(text) {
         return Reading::Secrets;
     }
     let file = collect::file_of(item);

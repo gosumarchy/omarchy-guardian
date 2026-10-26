@@ -35,8 +35,10 @@ pub(super) const REDACTED: &str = "<redacted-by-guardian>";
 pub(super) fn without_secrets(text: &str) -> String {
     text.split_inclusive('\n')
         .map(|line| {
-            let line = redact_line(line)
-                .or_else(|| without_grub_hash(line))
+            // The hash first: a user name with `KEY=` in it would
+            // otherwise take the line, and leave the hash in it.
+            let line = without_grub_hash(line)
+                .or_else(|| redact_line(line))
                 .unwrap_or_else(|| line.to_string());
             without_url_passwords(&line)
         })
@@ -82,14 +84,21 @@ fn without_grub_hash(line: &str) -> Option<String> {
 /// - a password hash, `grub.pbkdf2.` or `grub.argon2.`, wherever it is;
 /// - `GRUB_USERS`, which `/etc/default/grub` sets to
 ///   `name;access;plain|pbkdf2|argon2;secret` entries;
-/// - `cryptomount` given a passphrase (`-p`, `--password`).
+/// - an assignment to a name that says secret (`GRUB_PASSWORD=…`, see
+///   `is_secret_name`), whatever the value, quoted or not; a dotted name
+///   (`rd.luks.key=`) is a kernel parameter, which `/proc/cmdline` shows
+///   to every user, and is passed over;
+/// - in a file that runs `cryptomount` anywhere, a word that starts with
+///   `-p` or `--password` on any line, as its options may go on after a
+///   `\` on the next.
 ///
 /// The text is read as written, split at blanks and `;{}()"'`, not as
 /// GRUB or the shell parses it: a word joined from quoted parts
-/// (`pass"word"`) is not seen. Such a file is read by the local rules
+/// (`pass"word"`) or split by a `\` at the end of a line is not seen. Such a file is read by the local rules
 /// only, as the secret wins over the review; this fails closed, so a
 /// comment that names a password keeps the file from the review too.
 pub(super) fn has_boot_secret(text: &str) -> bool {
+    let cryptomount = text.contains("cryptomount");
     text.lines().any(|line| {
         if without_grub_hash(line).is_some() {
             return false;
@@ -98,14 +107,32 @@ pub(super) fn has_boot_secret(text: &str) -> bool {
             .split(|c: char| c.is_whitespace() || ";{}()\"'".contains(c))
             .filter(|word| !word.is_empty())
             .collect();
-        let passphrase = words.contains(&"cryptomount")
+        let passphrase = cryptomount
             && words
                 .iter()
                 .any(|word| word.starts_with("-p") || word.starts_with("--password"));
         let hash = ["grub.pbkdf2.", "grub.argon2.", "GRUB_USERS"]
             .iter()
             .any(|marker| line.contains(marker));
-        hash || words.iter().any(|word| word.starts_with("password")) || passphrase
+        hash || words.iter().any(|word| word.starts_with("password"))
+            || passphrase
+            || assigns_secret(line)
+    })
+}
+
+/// Whether `line` assigns to a name that says secret, but a dotted one
+/// (see `has_boot_secret`).
+fn assigns_secret(line: &str) -> bool {
+    line.match_indices('=').any(|(at, _)| {
+        let named = line[..at].trim_end_matches([' ', '\t']);
+        let start = named.len()
+            - named
+                .bytes()
+                .rev()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                .count();
+        let dotted = named[..start].ends_with('.');
+        start < named.len() && !dotted && is_secret_name(&named[start..])
     })
 }
 

@@ -1346,6 +1346,11 @@ fn only_an_exact_grub_password_hash_is_taken_out() {
         without_secrets(same),
         "password_pbkdf2 grub.pbkdf2.sha512.1.AA.BB <redacted-by-guardian>\n"
     );
+    // A user name that looks like an assignment does not keep the hash.
+    assert_eq!(
+        without_secrets(&format!("password_pbkdf2 API_KEY=abcdefgh123 {hash}\n")),
+        "password_pbkdf2 API_KEY=abcdefgh123 <redacted-by-guardian>\n"
+    );
     for kept in [
         format!("password_pbkdf2 root {hash} ; insmod payload\n"),
         format!("password_pbkdf2 root {hash}$(run)\n"),
@@ -1374,6 +1379,10 @@ fn only_an_exact_grub_password_hash_is_taken_out() {
         "x=grub.argon2.id.AAAA\n",
         "GRUB_USERS=\"root;0;plain;hunter2\"\n",
         "cryptomount --password hunter2\n",
+        "GRUB_PASSWORD=hunter2\n",
+        "export GRUB_PASSWORD=\"two words\"\n",
+        // Options that go on after a `\` on the next line.
+        "cryptomount -u 0123abcd \\\n  -p hunter2\n",
     ] {
         assert!(has_boot_secret(secret), "{secret}");
     }
@@ -1382,6 +1391,8 @@ fn only_an_exact_grub_password_hash_is_taken_out() {
         "cryptomount -u 0123abcd\n",
         "set superusers=root\n",
         "linux /vmlinuz-linux root=UUID=1 rw\n",
+        "linux /vmlinuz-linux rd.luks.key=/crypto_keyfile.bin\n",
+        "GRUB_CMDLINE_LINUX_DEFAULT=\"quiet\"\n",
     ] {
         assert!(!has_boot_secret(plain), "{plain}");
     }

@@ -956,10 +956,14 @@ incomplete.
   `password_pbkdf2` or `password_argon2` in any shape but the exact one
   below, also inside a `menuentry` or after `then`, or a comment that names
   one), a GRUB password hash (`grub.pbkdf2.`, `grub.argon2.`) anywhere else,
-  a line that names `GRUB_USERS` (whose entries end in a password), or
-  `cryptomount` given a passphrase (`-p`, `--password`). The text is read as
-  written, not as GRUB parses it: a word joined from quoted parts is not
-  seen. This fails closed: a file kept this way that something runs raises
+  a line that names `GRUB_USERS` (whose entries end in a password), an
+  assignment to a name that says secret (`GRUB_PASSWORD=…`, as for masking
+  below, whatever the value; a dotted kernel parameter such as
+  `rd.luks.key=` is passed over, as `/proc/cmdline` shows it to every user),
+  or, in a file that runs `cryptomount`, a word that starts with `-p` or
+  `--password` on any line (its options may go on after a `\`). The text is
+  read as written, not as GRUB parses it: a word joined from quoted parts, or
+  split by a `\` at the end of a line, is not seen. This fails closed: a file kept this way that something runs raises
   `kept-from-review`. Where the only secret is a hash on an exact line, the
   hash is taken out (below) and the rest of the file is reviewed. So a
   modified `/etc/grub.d/00_header`, which writes GRUB's password lines, goes
