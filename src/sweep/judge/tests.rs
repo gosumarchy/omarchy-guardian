@@ -1357,6 +1357,19 @@ fn a_changed_plugin_sends_its_changed_files_and_keeps_secret_named_ones() {
 }
 
 #[test]
+fn plugin_code_is_sent_with_only_url_passwords_masked() {
+    let label = "~/.local/share/nvim/lazy/p";
+    let text = "local TOKEN = \"cGF5bG9hZA==\"\nlocal u = \"https://me:hunter2@x.test/a\"\n";
+    let review = Review::New(vec![sent("lua/p.lua", Body::Text(text.into()))]);
+    let plugin = nvim::Plugin::with_review("p", review);
+    let mut report = Report::new("t");
+    plugin_files(&mut report, &plugin, label);
+    let sent = &report.agent_input[0].content;
+    assert!(sent.contains("cGF5bG9hZA=="), "{sent}");
+    assert!(!sent.contains("hunter2"), "{sent}");
+}
+
+#[test]
 fn a_plugin_taken_as_it_is_sends_nothing_and_one_not_compared_is_a_gap() {
     let label = "~/.local/share/nvim/lazy/p";
     for review in [Review::Baseline, Review::Unchanged] {

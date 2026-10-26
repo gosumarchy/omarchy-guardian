@@ -21,7 +21,7 @@ use crate::report::{Gap, LocalFinding, Report};
 use crate::review::{self, ReviewContext};
 use crate::rules::RuleId;
 use crate::text::shown;
-use secrets::without_secrets;
+use secrets::{without_secrets, without_url_passwords};
 use variables::sets_only_variables;
 
 #[cfg(test)]
@@ -231,12 +231,17 @@ fn plugin_files(report: &mut Report, plugin: &nvim::Plugin, label: &str) -> Opti
             // Whoever writes a plugin picks its file names: code a secret
             // name keeps from the AI must not pass unseen for that.
             Body::Text(text) if crate::rules::is_sensitive_path(&shown) => {
-                review::analyze_text_locally(report, &shown, &without_secrets(text));
+                review::analyze_text_locally(report, &shown, &without_url_passwords(text));
                 report
                     .findings
                     .push(finding(&shown, 1, RuleId::KeptFromReview, ""));
             }
-            Body::Text(text) => review::analyze_text(report, &shown, &without_secrets(text), false),
+            // Plugin code is not configuration: blanking what looks like a
+            // secret assignment would let a plugin hide code from the AI
+            // behind a name like TOKEN. Only URL passwords are masked.
+            Body::Text(text) => {
+                review::analyze_text(report, &shown, &without_url_passwords(text), false);
+            }
             Body::Oversized => report.gaps.push(Gap::OversizedText(shown)),
             Body::Undecodable => report.gaps.push(Gap::Undecodable(shown)),
             Body::Unreadable(reason) => report

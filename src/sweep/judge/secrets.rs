@@ -52,7 +52,7 @@ fn is_plain_password(password: &str) -> bool {
 /// `line` with the password of each `scheme://user:password@host` taken
 /// out. The user and the host stay: where something goes is what a review
 /// needs to see. A password that is an expansion is no secret itself.
-fn without_url_passwords(line: &str) -> String {
+pub(super) fn without_url_passwords(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
     while let Some(at) = rest.find("://") {
