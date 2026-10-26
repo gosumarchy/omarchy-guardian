@@ -11,14 +11,12 @@
 //! A package that came from somewhere other than the public registry
 //! (see `config`) is not taken: its name may be private, and it goes to no
 //! one. It is said as not checked. Where the files keep no record of a
-//! source (pip given `--index-url` on its command line), the package is
-//! taken.
+//! source (a global npm package installed from git, pip given
+//! `--index-url` on its command line), the package is taken.
 
-use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::rc::Rc;
 
 use super::config::{self, IndexConfig, NpmConfig, Places};
 use crate::deps::Ecosystem;
@@ -44,7 +42,7 @@ const MAX_NODE_DEPTH: usize = 8;
 /// 2 MiB is arbitrary and far above what packages ship.
 const MAX_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
 
-/// The largest `.crates2.json` or npm hidden lockfile read: about 1 KiB
+/// The largest `.crates2.json` read: about 1 KiB
 /// per package, so 8 MiB is arbitrary room for thousands.
 const MAX_LIST_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -131,20 +129,20 @@ pub(super) fn collect(root: &Path, places: &Places) -> Inventory {
     // Only the path is said: these files hold registry tokens.
     for file in &npm.unreadable {
         inventory.unchecked.push(format!(
-            "{} could not be read (a link, closed, or too large): packages under an npm prefix it may set were not looked up in OSV",
-            text::shown(&format!("/{file}"))
+            "{} could not be read (a link, closed, too large, or not found): it may name a private registry, so no npm package was looked up in OSV, and packages under an npm prefix it may set were not read",
+            text::shown(file)
         ));
     }
     for file in &pip.unreadable {
         inventory.unchecked.push(format!(
-            "{} could not be read (a link, closed, or too large): it may name a private index, so no Python package was looked up in OSV",
-            text::shown(&format!("/{file}"))
+            "{} could not be read (a link, closed, too large, or not found): it may name a private index, so no Python package pip installed was looked up in OSV",
+            text::shown(file)
         ));
     }
     for file in &uv.unreadable {
         inventory.unchecked.push(format!(
-            "{} could not be read (a link, closed, too large, or not TOML): it may name a private index, so no Python package mise installed through uv was looked up in OSV",
-            text::shown(&format!("/{file}"))
+            "{} could not be read (a link, closed, too large, not TOML, or not found): it may name a private index, so no Python package mise installed through uv was looked up in OSV",
+            text::shown(file)
         ));
     }
     inventory
@@ -207,27 +205,6 @@ impl Backend {
             _ => None,
         }
     }
-}
-
-/// What an npm hidden lockfile (`node_modules/.package-lock.json`)
-/// records of where each package below it came from, by its path relative
-/// to `base`, the directory that holds that `node_modules`. A path it does
-/// not hold came from no registry it knows of (a link, git, a tarball of
-/// its own), as far as the walk can tell.
-#[derive(Debug)]
-struct Lock {
-    base: String,
-    recorded: HashMap<String, Recorded>,
-}
-
-/// Where a lockfile says a package came from.
-#[derive(Debug)]
-enum Recorded {
-    /// The address it was fetched from.
-    At(String),
-    /// Inside the tarball of the package above it (`inBundle`), which
-    /// records no address of its own.
-    Bundled,
 }
 
 /// A walk over the places packages are kept, within the limits.
@@ -373,67 +350,22 @@ impl<'a> Walk<'a> {
     /// Every package in the `node_modules` directory `top`, and in their
     /// own `node_modules` below them.
     fn node_modules(&mut self, top: &str) {
-        // Each directory carries the lockfile above it and the source of
-        // the package it belongs to, which a bundled package shares.
-        let mut pending: Vec<(String, usize, Option<Rc<Lock>>, Source)> =
-            vec![(top.to_string(), 0, None, Source::Public)];
-        while let Some((directory, depth, inherited, parent)) = pending.pop() {
-            let lock = self.lock(&directory).map(Rc::new).or(inherited);
+        let mut pending = vec![(top.to_string(), 0)];
+        while let Some((directory, depth)) = pending.pop() {
             for package in self.packages_in(&directory) {
                 if self.full {
                     return;
                 }
-                let Some((nested, source)) = self.npm_package(&package, lock.as_deref(), parent)
-                else {
+                let Some(nested) = self.npm_package(&package) else {
                     continue;
                 };
                 if depth + 1 < MAX_NODE_DEPTH {
-                    pending.push((nested, depth + 1, lock.clone(), source));
+                    pending.push((nested, depth + 1));
                 } else {
                     self.too_deep = true;
                 }
             }
         }
-    }
-
-    /// The hidden lockfile npm keeps in `node_modules`, if there is one.
-    /// One that cannot be used (a link, too large, not npm's) is said, and
-    /// records nothing: every package it covers is left out.
-    fn lock(&mut self, node_modules: &str) -> Option<Lock> {
-        let file = format!("{node_modules}/.package-lock.json");
-        let path = self.root.join(&file);
-        if fs::symlink_metadata(&path).is_err_and(|error| error.kind() == io::ErrorKind::NotFound) {
-            return None;
-        }
-        let base = node_modules
-            .strip_suffix("/node_modules")
-            .unwrap_or(node_modules)
-            .to_string();
-        let json = read_small_file(&path, MAX_LIST_BYTES).and_then(|text| Json::parse(&text).ok());
-        let Some(packages) = json
-            .as_ref()
-            .and_then(|json| json.get("packages")?.as_object())
-        else {
-            self.unreadable.push(file);
-            return Some(Lock {
-                base,
-                recorded: HashMap::new(),
-            });
-        };
-        let recorded = packages
-            .iter()
-            .filter_map(|(path, entry)| {
-                let recorded = match entry.get("resolved").and_then(Json::as_str) {
-                    Some(resolved) => Recorded::At(resolved.to_string()),
-                    None if entry.get("inBundle").and_then(Json::as_bool) == Some(true) => {
-                        Recorded::Bundled
-                    }
-                    None => return None,
-                };
-                Some((path.clone(), recorded))
-            })
-            .collect();
-        Some(Lock { base, recorded })
     }
 
     /// The package directories in the `node_modules` directory
@@ -463,15 +395,9 @@ impl<'a> Walk<'a> {
         packages
     }
 
-    /// Reads the npm package in `directory`, which `lock` may record and
-    /// whose `parent` package came from where it says; returns its own
-    /// `node_modules`, if it has one, and where it came from.
-    fn npm_package(
-        &mut self,
-        directory: &str,
-        lock: Option<&Lock>,
-        parent: Source,
-    ) -> Option<(String, Source)> {
+    /// Reads the npm package in `directory`; returns its own
+    /// `node_modules`, if it has one.
+    fn npm_package(&mut self, directory: &str) -> Option<String> {
         let manifest = format!("{directory}/package.json");
         let json = read_small_file(&self.root.join(&manifest), MAX_MANIFEST_BYTES)
             .and_then(|text| Json::parse(&text).ok());
@@ -481,47 +407,27 @@ impl<'a> Walk<'a> {
                 .and_then(Json::as_str)
                 .map(str::to_string)
         };
-        let source = if let (Some(name), Some(version)) = (field("name"), field("version")) {
-            let public = match lock {
-                Some(lock) => {
-                    let path = directory
-                        .strip_prefix(&format!("{}/", lock.base))
-                        .unwrap_or(directory);
-                    match lock.recorded.get(path) {
-                        Some(Recorded::At(resolved)) => self.npm.is_public(&name, Some(resolved)),
-                        // It ships inside its parent's tarball, so its
-                        // name is as public as the parent's.
-                        Some(Recorded::Bundled) => parent == Source::Public,
-                        // npm records every package it installed from
-                        // a registry; one it does not came from a link,
-                        // git, or a tarball of its own.
-                        None => false,
-                    }
-                }
-                // npm 7 and later write `_resolved` no more: without
-                // a lockfile, the registry npm is set to use decides.
-                None => self.npm.is_public(&name, field("_resolved").as_deref()),
-            };
-            let source = if public {
-                Source::Public
-            } else {
-                Source::Elsewhere
-            };
-            let package = Package {
-                ecosystem: Ecosystem::Npm,
-                name,
-                version,
-            };
-            self.add(package, &manifest, source);
-            source
-        } else {
-            // Its own packages are still read; where a bundled one came
-            // from is not known.
-            self.unreadable.push(manifest);
-            Source::Elsewhere
-        };
+        match (field("name"), field("version")) {
+            (Some(name), Some(version)) => {
+                // npm keeps no hidden lockfile for a global install, and npm
+                // 7 and later write `_resolved` no more: where there is none,
+                // the registry npm is set to use decides.
+                let source = if self.npm.is_public(&name, field("_resolved").as_deref()) {
+                    Source::Public
+                } else {
+                    Source::Elsewhere
+                };
+                let package = Package {
+                    ecosystem: Ecosystem::Npm,
+                    name,
+                    version,
+                };
+                self.add(package, &manifest, source);
+            }
+            _ => self.unreadable.push(manifest),
+        }
         let nested = format!("{directory}/node_modules");
-        (self.entry(&nested) == Some(Entry::Directory)).then_some((nested, source))
+        (self.entry(&nested) == Some(Entry::Directory)).then_some(nested)
     }
 
     /// Every pipx environment under `venvs`.
@@ -579,13 +485,17 @@ impl<'a> Walk<'a> {
 
     /// Whether the file `rel`, a record of where packages came from, says
     /// they came from somewhere else. One that is not there says nothing;
-    /// one that is there and cannot be read counts.
-    fn records_elsewhere(&self, rel: &str, elsewhere: fn(&str) -> bool) -> bool {
+    /// one that is there and cannot be read counts, and is said.
+    fn records_elsewhere(&mut self, rel: &str, elsewhere: fn(&str) -> bool) -> bool {
         let path = self.root.join(rel);
         if fs::symlink_metadata(&path).is_err_and(|error| error.kind() == io::ErrorKind::NotFound) {
             return false;
         }
-        read_small_file(&path, MAX_MANIFEST_BYTES).is_none_or(|text| elsewhere(&text))
+        let Some(text) = read_small_file(&path, MAX_MANIFEST_BYTES) else {
+            self.unreadable.push(rel.to_string());
+            return true;
+        };
+        elsewhere(&text)
     }
 
     /// Every `lib/python*/site-packages` of `environment`, whose packages
@@ -720,12 +630,15 @@ impl<'a> Walk<'a> {
     /// One version of one tool mise installed, in `directory`.
     fn mise_tool(&mut self, backend: Backend, directory: &str) {
         let found = match backend {
+            // Newer mise installs `npm:` tools with aube, in pnpm's layout,
+            // with no `lib`: such a tool is said as not read.
             Backend::Node | Backend::Npm => {
                 let lib = format!("{directory}/lib");
-                if self.entry(&lib) == Some(Entry::Directory) {
+                let there = self.entry(&lib) == Some(Entry::Directory);
+                if there {
                     self.node_modules(&format!("{lib}/node_modules"));
                 }
-                true
+                there
             }
             Backend::Cargo => self.crates(&format!("{directory}/.crates2.json")),
             // mise points pipx's home (`venvs/<package>`) or uv's tool

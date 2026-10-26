@@ -429,7 +429,9 @@ What is read (no tool is run; for links, see below):
   `CARGO_HOME`), for crates from crates.io;
 - what mise installed (`~/.local/share/mise/installs`, or under
   `MISE_DATA_DIR`) as node or python itself, or through its `npm:`, `pipx:`
-  (with pipx or uv) and `cargo:` backends, read as above. Tools of other
+  (with pipx or uv) and `cargo:` backends, read as above. Newer mise
+  installs `npm:` tools with aube, in pnpm's layout (no `lib`): such a tool
+  is not read, and is said as not checked. Tools of other
   backends are not covered: `aqua:`, `ubi:` and core tools such as Go are
   programs, not packages of a registry OSV knows, and a `go:` tool leaves
   only the program it built, with no module path and version beside it,
@@ -443,16 +445,13 @@ the tools leave behind tell. Only packages from the public registry go to OSV:
 npm packages from `registry.npmjs.org` (or Yarn's copy of it), Python packages
 from PyPI, crates from crates.io.
 
-- npm: where a package came from is read from npm's hidden lockfile
-  (`node_modules/.package-lock.json`). A package the lockfile records no
-  address for is left out, a bundled one (`inBundle`) goes with the package
-  it ships in, and a lockfile that is there and cannot be used (a link, over
-  8 MiB, not npm's) is said and leaves every package under it out. Where
-  there is no lockfile, `_resolved` in the package's `package.json` decides,
-  or else the `registry` (or the scope's own `@scope:registry`) npm is set to
-  use. npm 7 and later write no `_resolved`, so a package installed from git
-  or a tarball where npm kept no lockfile is sent when that registry is the
-  public one.
+- npm: npm keeps no record of where a global package came from (no hidden
+  lockfile, and npm 7 and later write no `_resolved` in its `package.json`),
+  so the `registry` (or the scope's own `@scope:registry`) npm is set to use
+  decides, or `_resolved` where an older npm wrote one. A global package
+  installed from git or a tarball under a name whose registry is the public
+  one is sent like any other. Where an npm configuration file is there and
+  cannot be read, no npm package is sent: it may set a private registry.
 - pip: a package installed from an address or a local directory (it has a
   `direct_url.json`) is left out. So is every package of a pipx environment
   installed with another index or a requirements or constraints file
@@ -465,15 +464,16 @@ from PyPI, crates from crates.io.
   `~/.pip/pip.conf`, the `pip/pip.conf` under `XDG_CONFIG_HOME` and each of
   `XDG_CONFIG_DIRS`, `PIP_CONFIG_FILE`, `PIP_INDEX_URL` and the like) sets
   `index-url`, `extra-index-url` or `find-links` to anything but PyPI, an
-  indented line continuing a value included. A `PIP_CONFIG_FILE` that is not
-  an absolute path counts as such a setting. pip keeps no record of an index
+  a line indented deeper than its key continuing a value included. A
+  `PIP_CONFIG_FILE` that is not an absolute path counts as a file that
+  cannot be read. pip keeps no record of an index
   given on its command line: a package installed with `pip install
   --index-url` into a Python mise installed, or into a pipx environment old
   enough to have no `pipx_metadata.json`, is sent like any other.
 - uv, for what mise installed through it: any index setting in `uv.toml`
   (`/etc/uv/uv.toml`, `/etc/xdg/uv/uv.toml`, `~/.config/uv/uv.toml`, the
-  `uv/uv.toml` under the XDG directories, `UV_CONFIG_FILE`, which counts when
-  it is not an absolute path) or the environment (`UV_INDEX`,
+  `uv/uv.toml` under the XDG directories, `UV_CONFIG_FILE`, which counts as a
+  file that cannot be read when it is not an absolute path) or the environment (`UV_INDEX`,
   `UV_DEFAULT_INDEX`, `UV_INDEX_URL`, `UV_EXTRA_INDEX_URL`, `UV_FIND_LINKS`),
   PyPI named as one included, leaves them all out, and a tool whose
   `uv-receipt.toml` records an index, or a requirement with a git, address,
@@ -483,7 +483,7 @@ from PyPI, crates from crates.io.
 
 What is left out this way is said as not checked, so a machine with such
 packages has an incomplete sweep. An `npm_config_userconfig` that is not an
-absolute path is taken as setting a registry other than the public one.
+absolute path counts as a file that cannot be read.
 
 At every sweep the rest of the inventory goes to OSV: the ecosystem, the name
 and the version of each package, in requests of up to 500 packages per
@@ -507,9 +507,12 @@ than one answer holds, and a request to OSV that failed (offline, OSV down),
 whose packages are each said as not checked, never as clear: one failed
 lookup leaves every package of its ecosystem not checked. An npm, pip or uv
 configuration file that is there and cannot be read (a link, closed, over
-1 MiB, or for uv not TOML) is said as well, by its path alone: the npm prefix
-it may set is not looked at, and no Python package pip (or uv) installed is
-looked up, since it may name a private index. A link below where the tools keep their packages (a package directory
+1 MiB, or for uv not TOML) is said as well, by its path alone: no npm package
+is looked up and the npm prefix it may set is not read, or no Python package
+pip (or uv) installed is looked up, since it may name a private registry or
+index. A `pipx_metadata.json`, `pip.conf` or `uv-receipt.toml` inside an
+environment that cannot be read is said too, and that environment is left
+out. A link below where the tools keep their packages (a package directory
 `npm link` made, a linked environment, `lib`, `site-packages` or
 `node_modules`) is not followed, and a note names it; a link among the parts
 of such a place itself (an npm prefix, `CARGO_HOME`, mise's or pipx's home, a

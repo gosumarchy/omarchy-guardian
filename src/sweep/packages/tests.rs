@@ -176,18 +176,7 @@ fn global_npm_packages_are_read_with_their_own_dependencies() {
     npm(root, &format!("{top}/a"), "a", "1.0.0");
     npm(root, &format!("{top}/a/node_modules/b"), "b", "2.0.0");
     npm(root, &format!("{top}/@scope/c"), "@scope/c", "3.0.0");
-    let registry = "https://registry.npmjs.org";
-    write(
-        root,
-        &format!("{top}/.package-lock.json"),
-        &format!(
-            r#"{{"packages":{{
-                "node_modules/a":{{"resolved":"{registry}/a/-/a-1.0.0.tgz"}},
-                "node_modules/a/node_modules/b":{{"resolved":"{registry}/b/-/b-2.0.0.tgz"}},
-                "node_modules/@scope/c":{{"resolved":"{registry}/@scope/c/-/c-3.0.0.tgz"}}
-            }}}}"#
-        ),
-    );
+    write(root, &format!("{top}/.package-lock.json"), "{}");
     fs::create_dir_all(root.join(format!("{top}/.bin"))).unwrap();
     symlink("/home/u/project", root.join(format!("{top}/linked"))).unwrap();
     write(root, &format!("{top}/broken/package.json"), "{not json");
@@ -620,33 +609,6 @@ fn mises_python_and_private_sources_are_told_apart() {
     );
     let top = "usr/lib/node_modules";
     npm(root, &format!("{top}/tool"), "tool", "1.0.0");
-    npm(
-        root,
-        &format!("{top}/tool/node_modules/dep"),
-        "dep",
-        "1.0.0",
-    );
-    npm(
-        root,
-        &format!("{top}/tool/node_modules/corp-dep"),
-        "corp-dep",
-        "1.0.0",
-    );
-    // The lockfile records no address for it, as for one from a git host.
-    npm(
-        root,
-        &format!("{top}/tool/node_modules/unrecorded"),
-        "unrecorded",
-        "1.0.0",
-    );
-    write(
-        root,
-        &format!("{top}/tool/node_modules/.package-lock.json"),
-        r#"{"packages":{
-            "node_modules/dep":{"resolved":"https://registry.npmjs.org/dep/-/dep-1.0.0.tgz"},
-            "node_modules/corp-dep":{"resolved":"https://npm.corp.example/corp-dep-1.0.0.tgz"}
-        }}"#,
-    );
     write(
         root,
         &format!("{top}/old/package.json"),
@@ -676,14 +638,13 @@ fn mises_python_and_private_sources_are_told_apart() {
     assert_eq!(
         found(&inventory),
         [
-            (Ecosystem::Npm, "dep", "1.0.0"),
             (Ecosystem::Npm, "tool", "1.0.0"),
             (Ecosystem::PyPi, "requests", "2.31.0"),
         ]
     );
     let unchecked = inventory.unchecked.join("\n");
     assert!(
-        unchecked.starts_with("6 language package(s) are from a private registry"),
+        unchecked.starts_with("4 language package(s) are from a private registry"),
         "{unchecked}"
     );
 
@@ -753,6 +714,8 @@ fn an_npmrc_that_cannot_be_read_is_said_by_its_path_alone() {
         "prefix=/opt/g\n//r.example/:_authToken=secret\n",
     );
     npm(root, "opt/g/lib/node_modules/hidden", "hidden", "1.0.0");
+    // It may set a private registry, so no npm package is taken at all.
+    npm(root, "usr/lib/node_modules/system", "system", "1.0.0");
     fs::create_dir_all(root.join("home/u")).unwrap();
     symlink(root.join("dotfiles/npmrc"), root.join("home/u/.npmrc")).unwrap();
 
@@ -761,7 +724,8 @@ fn an_npmrc_that_cannot_be_read_is_said_by_its_path_alone() {
     assert_eq!(found(&inventory), []);
     let unchecked = inventory.unchecked.join("\n");
     assert!(
-        unchecked.contains("/home/u/.npmrc could not be read") && unchecked.contains("npm prefix"),
+        unchecked.contains("/home/u/.npmrc could not be read")
+            && unchecked.contains("no npm package was looked up"),
         "{unchecked}"
     );
     assert!(!unchecked.contains("secret") && !unchecked.contains("/opt/g"));
@@ -880,62 +844,6 @@ fn a_linked_crates_list_is_said_once_and_not_as_unreadable() {
 }
 
 #[test]
-fn what_npm_records_decides_and_a_broken_lockfile_leaves_its_packages_out() {
-    let root = TempDir::new("packages-npm-lock");
-    let root = root.path();
-    let top = "usr/lib/node_modules";
-    let registry = "https://registry.npmjs.org";
-    for (directory, name) in [
-        ("public", "public"),
-        ("public/node_modules/inside", "inside"),
-        ("public/node_modules/unrecorded", "unrecorded"),
-        ("fromgit", "fromgit"),
-        ("fromgit/node_modules/carried", "carried"),
-    ] {
-        npm(root, &format!("{top}/{directory}"), name, "1.0.0");
-    }
-    write(
-        root,
-        &format!("{top}/.package-lock.json"),
-        &format!(
-            r#"{{"packages":{{
-                "node_modules/public":{{"resolved":"{registry}/public/-/public-1.0.0.tgz"}},
-                "node_modules/public/node_modules/inside":{{"inBundle":true}},
-                "node_modules/fromgit":{{"resolved":"git+ssh://git@git.example/fromgit.git"}},
-                "node_modules/fromgit/node_modules/carried":{{"inBundle":true}}
-            }}}}"#
-        ),
-    );
-
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
-
-    assert_eq!(
-        found(&inventory),
-        [
-            (Ecosystem::Npm, "inside", "1.0.0"),
-            (Ecosystem::Npm, "public", "1.0.0"),
-        ]
-    );
-    assert!(
-        inventory.unchecked[0].starts_with("3 language package(s) are from a private registry"),
-        "{:?}",
-        inventory.unchecked
-    );
-
-    write(root, &format!("{top}/.package-lock.json"), "{not json");
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
-    assert_eq!(found(&inventory), []);
-    assert!(
-        inventory
-            .unchecked
-            .join("\n")
-            .contains("/usr/lib/node_modules/.package-lock.json"),
-        "{:?}",
-        inventory.unchecked
-    );
-}
-
-#[test]
 fn records_in_python_environments_that_name_another_index_leave_them_out() {
     let root = TempDir::new("packages-python-records");
     let root = root.path();
@@ -981,4 +889,41 @@ fn records_in_python_environments_that_name_another_index_leave_them_out() {
     );
     let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
     assert_eq!(found(&inventory), [(Ecosystem::PyPi, "plain", "1.0.0")]);
+
+    // A record that is there and cannot be read is said by its path.
+    symlink(
+        root.join(format!("{venvs}/siteconf/pip.conf")),
+        root.join(format!("{venvs}/plain/pip.conf")),
+    )
+    .unwrap();
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    assert_eq!(found(&inventory), []);
+    assert!(
+        inventory
+            .unchecked
+            .join("\n")
+            .contains(&format!("/{venvs}/plain/pip.conf")),
+        "{:?}",
+        inventory.unchecked
+    );
+}
+
+#[test]
+fn a_mise_npm_tool_in_pnpms_layout_is_said_as_not_read() {
+    let root = TempDir::new("packages-mise-aube");
+    let root = root.path();
+    let install = "home/u/.local/share/mise/installs/npm-x/1.0.0";
+    npm(root, &format!("{install}/node_modules/x"), "x", "1.0.0");
+
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+
+    assert_eq!(found(&inventory), []);
+    assert!(
+        inventory
+            .unchecked
+            .join("\n")
+            .contains(&format!("/{install}")),
+        "{:?}",
+        inventory.unchecked
+    );
 }

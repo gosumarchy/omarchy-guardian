@@ -102,9 +102,12 @@ pub(super) struct Places {
     /// like), as a file would write them.
     pub(super) pip_env: Vec<(String, String)>,
     /// The uv index variables the environment sets (`UV_INDEX_URL` and the
-    /// like), by name, and `UV_CONFIG_FILE` when it names a file that
-    /// cannot be found.
+    /// like), by name.
     pub(super) uv_env: Vec<String>,
+    /// The variables that name a configuration file by a path that is not
+    /// absolute (`npm_config_userconfig`, `PIP_CONFIG_FILE`,
+    /// `UV_CONFIG_FILE`), with their value: the file is not found here.
+    pub(super) unfound: Vec<(&'static str, String)>,
 }
 
 impl Places {
@@ -125,11 +128,14 @@ impl Places {
             npm_env: Vec::new(),
             pip_env: Vec::new(),
             uv_env: Vec::new(),
+            unfound: Vec::new(),
         }
     }
 
     /// The defaults, with what the environment changes. A variable that
-    /// names a place and is not an absolute path without `..` is ignored.
+    /// names a place and is not an absolute path without `..` is ignored,
+    /// except one that names a configuration file, which is kept in
+    /// `unfound`.
     pub(super) fn from_env(home: Option<&str>) -> Self {
         let variables: Vec<(String, String)> = env::vars_os()
             .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
@@ -154,13 +160,8 @@ impl Places {
         places.pip_env = pip_variables(variables);
         if let Some((_, file)) = places.npm_env.iter().find(|(key, _)| key == "userconfig") {
             places.npmrc = from_root(file);
-            // A file that is not found here may set a private registry:
-            // an empty one counts as not public, and the environment's own
-            // setting, after it, still wins.
             if places.npmrc.is_none() {
-                places
-                    .npm_env
-                    .insert(0, ("registry".to_string(), String::new()));
+                places.unfound.push(("npm_config_userconfig", file.clone()));
             }
         }
         places.uv_env = variables
@@ -192,20 +193,15 @@ impl Places {
                 .uv
                 .extend(from_root(&format!("{directory}/uv/uv.toml")));
         }
-        // A file named by a path that is not absolute is not found here,
-        // and what it sets is not known: it counts as another index.
-        if let Some(file) = variable("PIP_CONFIG_FILE") {
-            match from_root(file) {
-                Some(path) => places.pip.push(path),
-                None => places
-                    .pip_env
-                    .push(("index-url".to_string(), String::new())),
-            }
-        }
-        if let Some(file) = variable("UV_CONFIG_FILE") {
-            match from_root(file) {
-                Some(path) => places.uv.push(path),
-                None => places.uv_env.push("UV_CONFIG_FILE".to_string()),
+        for (name, files) in [
+            ("PIP_CONFIG_FILE", &mut places.pip),
+            ("UV_CONFIG_FILE", &mut places.uv),
+        ] {
+            if let Some(file) = variable(name) {
+                match from_root(file) {
+                    Some(path) => files.push(path),
+                    None => places.unfound.push((name, file.to_string())),
+                }
             }
         }
         places
@@ -262,7 +258,8 @@ pub(super) struct NpmConfig {
     /// The registry of each scope that has its own (`@scope:registry`).
     scoped: Vec<(String, String)>,
     /// The files that are there and could not be read (a link, closed, or
-    /// too large), relative to the root: what they set is not known.
+    /// too large), or cannot be found, as said to the user: what they set
+    /// is not known, so no package counts as public.
     pub(super) unreadable: Vec<String>,
 }
 
@@ -270,7 +267,10 @@ impl NpmConfig {
     /// Reads the global files, then the user's, then the environment, each
     /// setting winning over the one before.
     pub(super) fn read(root: &Path, places: &Places) -> Self {
-        let mut config = Self::default();
+        let mut config = Self {
+            unreadable: unfound(places, "npm_config_userconfig"),
+            ..Self::default()
+        };
         let files = GLOBAL_NPMRC
             .iter()
             .map(|file| (*file).to_string())
@@ -279,7 +279,7 @@ impl NpmConfig {
             let text = match read_config(root, &file) {
                 ConfigFile::Absent => continue,
                 ConfigFile::Unreadable => {
-                    config.unreadable.push(file);
+                    config.unreadable.push(format!("/{file}"));
                     continue;
                 }
                 ConfigFile::Text(text) => text,
@@ -314,6 +314,11 @@ impl NpmConfig {
     /// Whether the npm package `name`, installed from the address
     /// `resolved` where one is recorded, came from npm's public registry.
     pub(super) fn is_public(&self, name: &str, resolved: Option<&str>) -> bool {
+        // A file it could not read may set a private registry for any
+        // scope, and npm follows a link to it.
+        if !self.unreadable.is_empty() {
+            return false;
+        }
         if let Some(resolved) = resolved {
             return is_on(resolved, NPM_REGISTRIES);
         }
@@ -337,8 +342,8 @@ pub(super) struct IndexConfig {
     /// Index, or a file of it could not be read: then what the tool
     /// installed may be of a private index, and none of it is looked up.
     pub(super) other_index: bool,
-    /// The files that are there and could not be read, relative to the
-    /// root.
+    /// The files that are there and could not be read, or cannot be
+    /// found, as said to the user.
     pub(super) unreadable: Vec<String>,
 }
 
@@ -352,11 +357,11 @@ impl IndexConfig {
             .pip_env
             .iter()
             .any(|(_, value)| is_other_pip_index(value));
-        let mut unreadable = Vec::new();
+        let mut unreadable = unfound(places, "PIP_CONFIG_FILE");
         for file in files {
             match read_config(root, &file) {
                 ConfigFile::Absent => {}
-                ConfigFile::Unreadable => unreadable.push(file),
+                ConfigFile::Unreadable => unreadable.push(format!("/{file}")),
                 ConfigFile::Text(text) => other_index |= pip_file_other_index(&text),
             }
         }
@@ -376,7 +381,7 @@ impl IndexConfig {
             .map(|file| (*file).to_string())
             .chain(places.uv.iter().cloned());
         let mut other_index = !places.uv_env.is_empty();
-        let mut unreadable = Vec::new();
+        let mut unreadable = unfound(places, "UV_CONFIG_FILE");
         for file in files {
             let entries = match read_config(root, &file) {
                 ConfigFile::Absent => continue,
@@ -390,7 +395,7 @@ impl IndexConfig {
                             || inline_keys(&entry.value).any(|key| UV_INDEX_KEYS.contains(&key))
                     });
                 }
-                Err(()) => unreadable.push(file),
+                Err(()) => unreadable.push(format!("/{file}")),
             }
         }
         Self {
@@ -398,6 +403,17 @@ impl IndexConfig {
             unreadable,
         }
     }
+}
+
+/// The configuration file the variable `name` names where it cannot be
+/// found, as said to the user.
+fn unfound(places: &Places, name: &str) -> Vec<String> {
+    places
+        .unfound
+        .iter()
+        .filter(|(variable, _)| *variable == name)
+        .map(|(variable, value)| format!("the file {variable} names ({value})"))
+        .collect()
 }
 
 /// Whether a `uv.toml` entry at `path` (table, then key) is an index
@@ -436,35 +452,61 @@ pub(super) fn uv_receipt_other_index(text: &str) -> bool {
 
 /// The keys of the inline tables in a TOML value, unquoted. Splitting at
 /// every delimiter finds every key; a delimiter inside a string can only
-/// add a key that is not one, which leaves more out, never less.
+/// add a part that is not one. Those that cannot be a key are dropped (the
+/// `<` of `">=1,<2"`); one that can is kept, which leaves more out, never
+/// less.
 fn inline_keys(value: &str) -> impl Iterator<Item = &str> {
     value
         .split([',', '{', '}', '[', ']'])
         .filter_map(|part| part.split_once('='))
         .map(|(key, _)| key.trim().trim_matches(['"', '\'']))
+        .filter(|key| {
+            !key.is_empty()
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        })
 }
 
 /// Whether the text of a pip configuration file sets an index other than
-/// the Python Package Index. configparser joins an indented line to the
-/// value above it, which `setting` does not do: one counts, whatever the
-/// key above it.
+/// the Python Package Index. configparser joins to a value each line
+/// indented deeper than its key, which `setting` does not do.
 pub(super) fn pip_file_other_index(text: &str) -> bool {
-    text.lines().any(|line| {
+    // The setting being read: its key's indent, whether it is an index
+    // key, and its value with the lines joined to it.
+    let mut current: Option<(usize, bool, String)> = None;
+    let mut other = false;
+    for line in text.lines() {
         let trimmed = line.trim();
-        if line.starts_with([' ', '\t']) && !trimmed.is_empty() && !trimmed.starts_with(['#', ';'])
-        {
-            return true;
+        if trimmed.is_empty() || trimmed.starts_with(['#', ';']) {
+            continue;
         }
-        setting(line, &['=', ':']).is_some_and(|(key, value)| {
+        let indent = line.len() - line.trim_start().len();
+        if let Some((key_indent, _, value)) = &mut current
+            && indent > *key_indent
+        {
+            value.push(' ');
+            value.push_str(trimmed);
+            continue;
+        }
+        other |= current
+            .take()
+            .is_some_and(|(_, index, value)| index && is_other_pip_index(&value));
+        current = setting(line, &['=', ':']).map(|(key, value)| {
             let key = key.to_ascii_lowercase().replace('_', "-");
-            PIP_INDEX_KEYS.contains(&key.as_str()) && is_other_pip_index(value)
-        })
-    })
+            (
+                indent,
+                PIP_INDEX_KEYS.contains(&key.as_str()),
+                value.to_string(),
+            )
+        });
+    }
+    other || current.is_some_and(|(_, index, value)| index && is_other_pip_index(&value))
 }
 
 /// Whether the value of a pip index setting names anything but the Python
-/// Package Index. pip splits it on whitespace; an empty one is continued
-/// on the next line.
+/// Package Index. pip splits it on whitespace. An empty one counts: what
+/// pip makes of it is not worth a guess.
 fn is_other_pip_index(value: &str) -> bool {
     value.is_empty() || !value.split_whitespace().all(|url| is_on(url, PYPI_HOSTS))
 }
@@ -700,6 +742,8 @@ mod tests {
             "[global]\nindex-url = https://pypi.org/simple\ntimeout = 60\n",
             "[global]\nextra-index-url = https://pypi.org/simple https://pypi.python.org/simple\n",
             "[global]\n    # an indented comment\n",
+            "[global]\n    timeout = 60\n    retries = 3\n",
+            "[global]\nextra-index-url =\n    https://pypi.org/simple\n",
         ] {
             assert!(!pip_file_other_index(public), "{public}");
         }
@@ -764,17 +808,21 @@ mod tests {
         .map(|(name, value)| (name.to_string(), value.to_string()));
 
         let places = Places::from_variables(Some("home/u"), &variables);
+        let root = std::path::Path::new("/nonexistent");
 
-        assert!(
-            places
-                .pip_env
-                .contains(&("index-url".to_string(), String::new()))
+        let npm = NpmConfig::read(root, &places);
+        assert_eq!(
+            npm.unreadable,
+            ["the file npm_config_userconfig names (npmrc)"]
         );
-        assert_eq!(places.uv_env, ["UV_CONFIG_FILE"]);
-        assert_eq!(places.npmrc, None);
-        assert!(
-            !NpmConfig::read(std::path::Path::new("/nonexistent"), &places).is_public("x", None)
+        assert!(!npm.is_public("x", Some("https://registry.npmjs.org/x/-/x-1.tgz")));
+        let pip = IndexConfig::pip(root, &places);
+        assert!(pip.other_index);
+        assert_eq!(
+            pip.unreadable,
+            ["the file PIP_CONFIG_FILE names (pip.conf)"]
         );
+        assert!(IndexConfig::uv(root, &places).other_index);
     }
 
     #[test]
@@ -815,7 +863,7 @@ mod tests {
 
     #[test]
     fn a_uv_receipt_says_a_tool_from_elsewhere() {
-        let public = "[tool]\nrequirements = [{ name = \"black\", specifier = \">=24\" }]\nentrypoints = [{ name = \"black\", install-path = \"/b\" }]\n";
+        let public = "[tool]\nrequirements = [{ name = \"black\", specifier = \">=24,!=24.1\" }]\nentrypoints = [{ name = \"black\", install-path = \"/b\" }]\n";
         assert!(!uv_receipt_other_index(public));
         for elsewhere in [
             "[tool]\nrequirements = [{ name = \"inhouse\", git = \"https://git.example/x\" }]\n",
