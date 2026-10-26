@@ -4,7 +4,7 @@ use std::fs;
 
 use super::{commands, targets, targets_where};
 use crate::autorun::Category;
-use crate::test_support::TempDir;
+use crate::test_support::{CpuInstant, TempDir};
 
 #[test]
 fn a_shell_script_is_told_by_its_first_line_or_its_name() {
@@ -471,9 +471,9 @@ fn what_a_start_up_file_or_a_command_line_names_is_found() {
     let many = "$(/x1 $(/x2 ".repeat(100);
     assert_eq!(commands(Category::Shell, "home/u/.bashrc", &many).len(), 2);
     let long = "$(/x ".repeat(400_000);
-    let started = std::time::Instant::now();
+    let started = CpuInstant::now();
     assert!(commands(Category::Shell, "home/u/.bashrc", &long).is_empty());
-    assert!(started.elapsed().as_secs() < 10);
+    assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
     let exists = |candidate: &str| {
         [
             "home/u/.cargo/bin/tool",
