@@ -664,8 +664,9 @@ fn a_boot_directory_that_cannot_be_listed_is_said() {
         origin: Origin::Root,
         ..scope
     });
-    assert_eq!(
-        as_root.unchecked,
-        ["/boot: could not be listed; the kernel images and EFI programs were not compared"]
+    assert_eq!(as_root.unchecked.len(), 1, "{:?}", as_root.unchecked);
+    assert!(as_root.unchecked[0].starts_with("/boot: could not be listed ("));
+    assert!(
+        as_root.unchecked[0].ends_with("); the kernel images and EFI programs were not compared")
     );
 }

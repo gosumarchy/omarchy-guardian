@@ -307,14 +307,14 @@ fn read_text(root: &Path, path: &str, max: u64) -> Result<Option<String>, Error>
         metadata => metadata.at(&full)?,
     };
     if metadata.len() > max {
-        return Err(Error::Refused(format!(
+        return Err(Error::Message(format!(
             "{}: larger than {max} bytes",
             full.display()
         )));
     }
     read_small_file(&full, max)
         .map(Some)
-        .ok_or_else(|| Error::Refused(format!("{}: not a file that can be read", full.display())))
+        .ok_or_else(|| Error::Message(format!("{}: not a file that can be read", full.display())))
 }
 
 /// The JSON document at `path`, if it is there.

@@ -18,6 +18,7 @@ use super::collect::{self, Body, Item, Scope};
 use super::read::{self, Found};
 use super::tier::Tier;
 use crate::autorun::Category;
+use crate::error::{Error, IoContext as _};
 use crate::paths::file_name;
 use crate::rules::RuleId;
 use crate::sha256::{Digest, Sha256};
@@ -190,17 +191,16 @@ fn command_line(scope: &Scope<'_>, boot: &mut Boot) {
 
 /// Every file under `/boot`, as paths relative to the root (none when
 /// there is no `/boot`); `Err` when it cannot be listed.
-fn listing(scope: &Scope<'_>) -> Result<Vec<String>, ()> {
-    match fs::read_dir(scope.root.join("boot")) {
+fn listing(scope: &Scope<'_>) -> Result<Vec<String>, Error> {
+    let boot = scope.root.join("boot");
+    match fs::read_dir(&boot) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(_) => return Err(()),
-        Ok(_) => {}
-    }
+        listed => listed.at(&boot)?,
+    };
     let listing = read::entries(scope.root, "boot");
-    if listing.unreadable.is_empty() {
-        Ok(listing.files)
-    } else {
-        Err(())
+    match listing.unreadable.first() {
+        None => Ok(listing.files),
+        Some(directory) => Err(Error::Message(format!("/{directory} cannot be listed"))),
     }
 }
 
@@ -298,12 +298,11 @@ fn shipped_kernels(scope: &Scope<'_>) -> Vec<Digest> {
 
 /// Says that `/boot` could not be listed: for root the sweep is
 /// incomplete, a user's sweep leaves it to the root checks.
-fn unlisted(scope: &Scope<'_>, boot: &mut Boot) {
+fn unlisted(scope: &Scope<'_>, boot: &mut Boot, error: &Error) {
     if scope.origin == collect::Origin::Root {
-        boot.unchecked.push(
-            "/boot: could not be listed; the kernel images and EFI programs were not compared"
-                .into(),
-        );
+        boot.unchecked.push(format!(
+            "/boot: could not be listed ({error}); the kernel images and EFI programs were not compared"
+        ));
     } else {
         boot.notes.push(
             "the kernel images and EFI programs in /boot cannot be read as this user; the root checks compare them with the packaged ones".into(),
@@ -395,7 +394,7 @@ pub(super) fn check(scope: &Scope<'_>) -> Boot {
             kernel_images(scope, &files, &shipped, &mut boot);
             efi::compare(scope, &files, &shipped, &mut boot);
         }
-        Err(()) => unlisted(scope, &mut boot),
+        Err(error) => unlisted(scope, &mut boot, &error),
     }
     secure_boot(scope, &mut boot);
     boot
