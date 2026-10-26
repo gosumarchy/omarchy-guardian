@@ -50,6 +50,8 @@ pub(super) fn startup_commands(text: &str) -> Vec<String> {
                 Token::Comma
                 | Token::TableOpen
                 | Token::TableClose
+                | Token::IndexOpen
+                | Token::IndexClose
                 | Token::Assign
                 | Token::Other => {}
             }
@@ -97,10 +99,10 @@ pub(super) enum Build {
 /// literals are read: a spec built by code, or a bare string that is not
 /// in a table (`dependencies = "a/b"`), is not found.
 ///
-/// A key counts only as a field of the innermost table: right after its
-/// `{` or a separator, and outside any function body or block within it,
-/// so `opts.name = "x"` or `local build = "make"` in a `config` function
-/// sets nothing.
+/// A key (`build = …` or `["build"] = …`) counts only as a field of the
+/// innermost table: right after its `{` or a separator, and outside any
+/// function body or block within it, so `opts.name = "x"` or
+/// `local build = "make"` in a `config` function sets nothing.
 pub(super) fn plugin_specs(text: &str) -> Vec<Spec> {
     let tokens = tokenize(text);
     let mut specs = Vec::new();
@@ -109,34 +111,50 @@ pub(super) fn plugin_specs(text: &str) -> Vec<Spec> {
         match token {
             Token::TableOpen => tables.push(Table::opened(&tokens[index + 1..])),
             Token::TableClose => specs.extend(tables.pop().and_then(Table::spec)),
-            Token::Name(key) if tokens.get(index + 1) == Some(&Token::Assign) => {
-                let field = index.checked_sub(1).is_some_and(|before| {
-                    matches!(tokens[before], Token::TableOpen | Token::Comma)
-                });
-                match tables.last_mut() {
-                    Some(table) if field && table.blocks == 0 => {
-                        table.set(key, &tokens[index + 2..]);
-                    }
-                    Some(_) | None => {}
-                }
-            }
             _ => {
-                if let Some(table) = tables.last_mut() {
-                    table.blocks = table.blocks.saturating_add_signed(nesting(token));
+                let Some(table) = tables.last_mut() else {
+                    continue;
+                };
+                if table.blocks == 0
+                    && let Some((key, value)) = field(&tokens, index)
+                {
+                    table.set(key, value);
                 }
+                table.blocks = table.blocks.saturating_add_signed(nesting(token));
             }
         }
     }
     specs
 }
 
+/// The key of the table field that starts at `tokens[index]`, and the
+/// tokens from its value on: `key = …` or `["key"] = …`, right after a `{`
+/// or a separator.
+fn field(tokens: &[Token], index: usize) -> Option<(&str, &[Token])> {
+    let before = tokens.get(index.checked_sub(1)?)?;
+    if !matches!(before, Token::TableOpen | Token::Comma) {
+        return None;
+    }
+    match &tokens[index..] {
+        [Token::Name(key), Token::Assign, ..] => Some((key, &tokens[index + 2..])),
+        [
+            Token::IndexOpen,
+            Token::String(key),
+            Token::IndexClose,
+            Token::Assign,
+            ..,
+        ] => Some((key, &tokens[index + 4..])),
+        _ => None,
+    }
+}
+
 /// How `token` changes how deep in blocks and brackets the code is, table
-/// braces aside: `function`, `do`, `if`, `repeat` and `(` open one; `end`,
-/// `until` and `)` close one.
+/// braces aside: `function`, `do`, `if`, `repeat`, `(` and `[` open one;
+/// `end`, `until`, `)` and `]` close one.
 fn nesting(token: &Token) -> isize {
     match token {
-        Token::Open => 1,
-        Token::Close => -1,
+        Token::Open | Token::IndexOpen => 1,
+        Token::Close | Token::IndexClose => -1,
         Token::Name(word) => match word.as_str() {
             "function" | "do" | "if" | "repeat" => 1,
             "end" | "until" => -1,
@@ -244,6 +262,8 @@ fn builds(value: &[Token]) -> Vec<Build> {
             | Token::String(_)
             | Token::Open
             | Token::Close
+            | Token::IndexOpen
+            | Token::IndexClose
             | Token::Assign
             | Token::Comma
             | Token::Other => depth += nesting(token),
@@ -261,21 +281,26 @@ fn build(value: &[Token]) -> Option<Build> {
         {
             return None;
         }
-        [Token::String(text)] | [Token::String(text), Token::Comma | Token::TableClose, ..] => {
-            return Some(if text.starts_with(':') {
-                Build::Command(text.clone())
-            } else {
-                Build::Shell(text.clone())
-            });
-        }
         _ => {}
+    }
+    if let Some(text) = literal(value) {
+        return Some(if text.starts_with(':') {
+            Build::Command(text)
+        } else {
+            Build::Shell(text)
+        });
     }
     let mut strings = Vec::new();
     let mut depth = 0_usize;
+    let mut body = 0_isize;
     for token in value {
+        // A function's strings are its code's, not what it gives; what
+        // follows its `end` is the expression's again.
+        if body > 0 || matches!(token, Token::Name(word) if word == "function") {
+            body += nesting(token);
+            continue;
+        }
         match token {
-            // A function's strings are its code's, not what it gives.
-            Token::Name(word) if word == "function" => break,
             Token::Open | Token::TableOpen => depth += 1,
             Token::Close | Token::TableClose | Token::Comma if depth == 0 => break,
             Token::Close | Token::TableClose => depth -= 1,
@@ -284,6 +309,28 @@ fn build(value: &[Token]) -> Option<Build> {
         }
     }
     Some(Build::Lua(strings))
+}
+
+/// The string the value starting at `value` is, up to its end, when it is
+/// nothing but strings and parentheses: `"make"`, `("make")` or
+/// `"a" .. "b"` (`..` is no token). `None` for anything computed.
+fn literal(value: &[Token]) -> Option<String> {
+    let mut text = String::new();
+    let mut strings = 0_usize;
+    let mut depth = 0_usize;
+    for token in value {
+        match token {
+            Token::String(part) => {
+                text.push_str(part);
+                strings += 1;
+            }
+            Token::Open => depth += 1,
+            Token::Close if depth > 0 => depth -= 1,
+            Token::Comma | Token::TableClose | Token::Close if depth == 0 => break,
+            _ => return None,
+        }
+    }
+    (strings > 0).then_some(text)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -296,6 +343,10 @@ enum Token {
     TableOpen,
     /// `}`
     TableClose,
+    /// `[` that opens no long string.
+    IndexOpen,
+    /// `]`
+    IndexClose,
     /// A lone `=`; `==`, `~=`, `<=` and `>=` are `Other`.
     Assign,
     Comma,
@@ -370,6 +421,8 @@ fn tokenize(text: &str) -> Vec<Token> {
             ')' => Token::Close,
             '{' => Token::TableOpen,
             '}' => Token::TableClose,
+            '[' => Token::IndexOpen,
+            ']' => Token::IndexClose,
             // Lua separates table fields with either.
             ',' | ';' => Token::Comma,
             _ if character.is_whitespace() || character == '.' => {
@@ -531,6 +584,35 @@ return {
                 Build::Command(":TSUpdate".into()),
                 Build::Lua(Vec::new()),
             ]
+        );
+    }
+
+    #[test]
+    fn a_literal_build_is_a_shell_step_however_it_is_written() {
+        let builds = |text: &str| plugin_specs(text)[0].builds.clone();
+        let shell = |text: &str| vec![Build::Shell(text.into())];
+        assert_eq!(builds(r#"{ "a/b", ["build"] = "make" }"#), shell("make"));
+        assert_eq!(
+            builds(r#"{ "a/b", build = ("curl x | sh") }"#),
+            shell("curl x | sh")
+        );
+        assert_eq!(
+            builds(r#"{ "a/b", build = "curl x" .. " | sh" }"#),
+            shell("curl x | sh")
+        );
+        assert_eq!(
+            builds(r#"{ "a/b", build = (":TS" .. "Update") }"#),
+            [Build::Command(":TSUpdate".into())]
+        );
+        // A string after a function is still one the expression may give.
+        assert_eq!(
+            builds(r#"{ "a/b", build = c and function() return "no" end or "curl|sh" }"#),
+            [Build::Lua(vec!["curl|sh".into()])]
+        );
+        // Anything computed stays Lua.
+        assert_eq!(
+            builds(r#"{ "a/b", build = "make " .. target }"#),
+            [Build::Lua(vec!["make ".into()])]
         );
     }
 
