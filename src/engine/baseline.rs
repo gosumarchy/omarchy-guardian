@@ -53,8 +53,9 @@ pub(crate) struct Unit {
 
 /// What a review did not read (binaries, links, anything that is neither
 /// reviewed text nor a plain image: see `review::is_plain_image`), by path
-/// with its hex SHA-256. An entry without a digest is never recorded.
-/// `None` stands for a directory that was skipped and so never hashed.
+/// with its SHA-256. `None` is an entry nobody hashed (a skipped directory,
+/// or a binary that could not be read): it is never recorded and never
+/// matches an approved entry.
 pub(crate) type Unread = BTreeMap<String, Option<Digest>>;
 
 /// The most paths `unread_changes` names, and the most characters of each.
@@ -172,7 +173,7 @@ fn due(manifest: &Manifest, now: u64) -> Option<String> {
 
 /// What a verdict depends on besides the source: the agent settings (the
 /// same ones `cache::key` hashes) and the wording of the prompts and of a
-/// request of `class`, as a hex SHA-256. A prompt changed without a new
+/// request of `class`, as its SHA-256. A prompt changed without a new
 /// `PROMPT_VERSION` still retires the baselines approved under the old one.
 fn fingerprint(settings: &AgentSettings, class: SourceClass) -> Digest {
     let text = format!(

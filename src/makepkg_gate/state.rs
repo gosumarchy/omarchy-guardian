@@ -386,17 +386,17 @@ impl State {
         self.write("confirmed", &(lines[from..].join("\n") + "\n"))
     }
 
-    /// The binaries the sources held at the last build that passed.
+    /// The binaries the sources held at the last build that passed. A
+    /// digest that does not parse (`UNHASHED` or a damaged line) reads as
+    /// unhashed, so that binary always counts as changed; dropping the
+    /// whole record instead would read as "no earlier build" and skip the
+    /// comparison.
     pub(super) fn binaries(&self) -> Option<BTreeMap<String, Option<Digest>>> {
         let text = self.read("binaries")?;
         text.lines()
             .map(|line| {
                 let (digest, path) = line.split_once(' ')?;
-                let digest = match digest {
-                    UNHASHED => None,
-                    hex => Some(Digest::from_hex(hex)?),
-                };
-                Some((path.to_string(), digest))
+                Some((path.to_string(), Digest::from_hex(digest)))
             })
             .collect()
     }

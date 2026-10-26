@@ -69,6 +69,22 @@ fn confirmations_are_kept_per_package_and_only_in_a_private_directory() {
 }
 
 #[test]
+fn a_damaged_digest_in_the_binaries_record_counts_as_changed() {
+    let dir = TempDir::new("gate-state-damaged");
+    let state = State::open(Some(&dir.path().join("state")), "demo");
+    let good = "22".repeat(32);
+    state
+        .write("binaries", &format!("zz src/x\n{good} src/y\n"))
+        .unwrap();
+    let known = state.binaries().expect("the record is still read");
+    let now = hashed(&[("src/x", "11"), ("src/y", "22")]);
+    assert_eq!(
+        binary_changes(&known, &now),
+        (vec!["src/x".to_string()], Vec::new())
+    );
+}
+
+#[test]
 fn binaries_and_extractions_round_trip() {
     let dir = TempDir::new("gate-state-files");
     let state = State::open(Some(&dir.path().join("state")), "demo");
