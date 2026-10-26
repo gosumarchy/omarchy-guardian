@@ -372,8 +372,9 @@ keeps each as a git checkout in `~/.local/share/nvim/lazy/<name>`
 (`$XDG_DATA_HOME/nvim/lazy` when that is set) and updates them from GitHub.
 Neovim runs that code at every start. The sweep lists each plugin as one item,
 under its directory, whose hash covers every file of it outside `.git`, the
-address it was cloned from and the commit it is at: a plugin that is updated,
-edited or moved to another address is changed, shows in `--diff` and in the
+address it was cloned from, the commit it is at, its git hooks and the keys of
+its `.git/config` that run commands: a plugin that is updated, edited, moved
+to another address or given a hook is changed, shows in `--diff` and in the
 daily notification, and an allow covers it as a whole until it changes.
 
 What is read, all as files, without running git: the origin from

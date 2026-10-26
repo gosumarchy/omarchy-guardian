@@ -66,8 +66,9 @@ pub(super) struct Git {
     /// The keys of `.git/config` that run a command on later git commands,
     /// as (line, `key = value` with URL credentials masked).
     pub(super) runs: Vec<(usize, String)>,
-    /// The git hooks it holds (every name in `hooks/` but `*.sample`).
-    pub(super) hooks: Vec<String>,
+    /// The git hooks it holds (every file or link in `hooks/` but
+    /// `*.sample`), by name, sorted.
+    pub(super) hooks: Vec<(String, Entry)>,
 }
 
 /// Where a checkout fetches from (`remote.origin.url`).
@@ -302,9 +303,9 @@ fn is_hash(text: &str) -> bool {
     matches!(text.len(), 40 | 64) && text.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// The hooks in the git directory `directory`: every name in `hooks/` but
-/// the `*.sample` files git puts there, which never run.
-fn hooks(root: &Path, directory: &str, unchecked: &mut Vec<String>) -> Vec<String> {
+/// The hooks in the git directory `directory`: every file or link in
+/// `hooks/` but the `*.sample` files git puts there, which never run.
+fn hooks(root: &Path, directory: &str, unchecked: &mut Vec<String>) -> Vec<(String, Entry)> {
     let path = format!("{directory}/hooks");
     let listing = match fs::read_dir(root.join(&path)) {
         Ok(listing) => listing,
@@ -314,12 +315,26 @@ fn hooks(root: &Path, directory: &str, unchecked: &mut Vec<String>) -> Vec<Strin
             return Vec::new();
         }
     };
-    let mut hooks: Vec<String> = listing
-        .filter_map(Result::ok)
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| !name.ends_with(".sample"))
-        .collect();
-    hooks.sort();
+    let mut hooks = Vec::new();
+    for entry in listing {
+        let Ok(entry) = entry else {
+            unchecked.push(format!("/{path}: could not be listed in full"));
+            break;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".sample") {
+            continue;
+        }
+        match read::look(root, &format!("{path}/{name}")) {
+            Found::File { sha256, .. } => hooks.push((name, Entry::File(sha256))),
+            Found::Link(target) => hooks.push((name, Entry::Link(target))),
+            Found::Other => {}
+            Found::Unreadable(reason) => {
+                unchecked.push(format!("/{path}/{name}: could not be read ({reason})"));
+            }
+        }
+    }
+    hooks.sort_by(|left, right| left.0.cmp(&right.0));
     hooks
 }
 

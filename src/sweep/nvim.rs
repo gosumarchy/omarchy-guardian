@@ -3,9 +3,12 @@
 //! every start, which lazy.nvim updates from GitHub without a review.
 //!
 //! Each plugin is one item, listed under its directory. Its content hash
-//! covers every file of it outside `.git`, the address it was cloned from
-//! and the commit it is at, so the sweep's record of what is new or
-//! changed, its notifications and `sweep allow` take a plugin as a whole.
+//! covers every file of it outside `.git`, the address it was cloned from,
+//! the commit it is at, its git hooks and the keys of its `.git/config`
+//! that run commands: what of a checkout runs, or decides what runs. So
+//! the sweep's record of what is new or changed, its notifications and
+//! `sweep allow` see a change to any of them. The rest of `.git` (objects,
+//! the index, logs) changes with every update and runs nothing.
 //! What a checkout says is read as files and never by running git: the
 //! origin from `.git/config`, the commit from `.git/HEAD` and the refs,
 //! and the commit `lazy-lock.json` pins.
@@ -443,7 +446,7 @@ fn git_alerts(name: &str, git: &Git, specs: &Specs, alerts: &mut Vec<(RuleId, St
             ),
         ));
     }
-    for hook in &git.hooks {
+    for (hook, _) in &git.hooks {
         alerts.push((
             RuleId::PluginBuild,
             format!(
@@ -547,11 +550,14 @@ fn is_code(path: &str) -> bool {
             .any(|extension| read::has_extension(name, extension))
 }
 
-/// The content hash of `checkout`: every entry outside `.git`, its origin
-/// and its commit. Fields are separated by NUL, which no path, address or
-/// hash holds.
+/// The content hash of `checkout` (see the module docs). Fields are
+/// separated by NUL, which no path holds.
 fn digest(checkout: &Checkout) -> Digest {
     let mut hasher = Sha256::new();
+    let entry = |entry: &Entry| match entry {
+        Entry::File(digest) => format!("file\0{digest}"),
+        Entry::Link(target) => format!("link\0{target}"),
+    };
     match &checkout.shape {
         Shape::Link(target) => hasher.update(format!("link\0{target}").as_bytes()),
         Shape::Tree { git, files } => {
@@ -562,13 +568,15 @@ fn digest(checkout: &Checkout) -> Digest {
                 if let Some(commit) = &git.commit {
                     hasher.update(format!("commit\0{commit}\0").as_bytes());
                 }
+                for (line, key) in &git.runs {
+                    hasher.update(format!("runs\0{line}\0{key}\0").as_bytes());
+                }
+                for (name, hook) in &git.hooks {
+                    hasher.update(format!("hook\0{name}\0{}\0", entry(hook)).as_bytes());
+                }
             }
-            for (path, entry) in files {
-                let entry = match entry {
-                    Entry::File(digest) => format!("file\0{digest}"),
-                    Entry::Link(target) => format!("link\0{target}"),
-                };
-                hasher.update(format!("{path}\0{entry}\0").as_bytes());
+            for (path, file) in files {
+                hasher.update(format!("{path}\0{}\0", entry(file)).as_bytes());
             }
         }
     }

