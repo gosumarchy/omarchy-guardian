@@ -40,7 +40,12 @@ matter most:
   without root checks every sweep is incomplete. The inside of the initramfs
   image, and of a unified kernel image except its stub and kernel, is not
   compared, as it is built on the machine; GRUB's EFI program is listed as not
-  comparable; a signature on an EFI program is put back, not checked; browser
+  comparable; a signature on an EFI program, and Limine's enrolled
+  configuration hash, are put back before comparing, not checked (the hash not
+  against `limine.conf`); EFI programs are judged as the boot loader's only
+  where the ESP is mounted at `/boot` (as on Omarchy): under an ESP at
+  `/boot/efi` an unknown one is only listed with a note, and an ESP at `/efi`
+  is not looked at; browser
   extensions are judged by where they came from and what they were granted,
   not by their code, and only Chromium's, Brave's, Chrome's, Firefox's and
   Zen's; other mounted filesystems (`/mnt`, `/media`, `/run/media`) are not

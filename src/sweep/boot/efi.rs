@@ -48,7 +48,10 @@ use crate::sweep::read::{self, Found};
 use crate::sweep::tier::Tier;
 
 /// Where packages ship the EFI programs that boot loader tools copy into
-/// `/boot`: Limine, systemd-boot, fwupd, shim, rEFInd and the UEFI shell.
+/// `/boot`: Limine, systemd-boot, fwupd, shim and rEFInd. A packaged
+/// program counts wherever it sits, so the UEFI shell is deliberately left
+/// out: copied to the firmware's default path it would run `startup.nsh`
+/// at every boot, and no boot loader tool puts it there.
 const PACKAGED: &[&str] = &[
     "usr/share/limine/*",
     "usr/lib/systemd/boot/efi/*",
@@ -56,7 +59,6 @@ const PACKAGED: &[&str] = &[
     "usr/share/shim-signed/*",
     "usr/share/refind/*",
     "usr/share/refind/drivers_*/*",
-    "usr/share/edk2-shell/*/*",
 ];
 
 /// Where systemd ships the stubs UKIs are built from.
@@ -179,6 +181,14 @@ pub(super) fn compare(scope: &Scope<'_>, files: &[String], kernels: &[Digest], b
             {
                 Verdict::Packaged
             }
+            Found::File { size, .. } if *size > MAX_PROGRAM_SIZE => {
+                not_checked(
+                    scope,
+                    boot,
+                    format!("/{path}: larger than {MAX_PROGRAM_SIZE} bytes; not compared"),
+                );
+                continue;
+            }
             Found::File {
                 sha256, size, head, ..
             } => {
@@ -188,20 +198,8 @@ pub(super) fn compare(scope: &Scope<'_>, files: &[String], kernels: &[Digest], b
                 };
                 verdict(path, &bytes, &packaged)
             }
-            // FAT, which an ESP is, has no links. One elsewhere in `/boot`
-            // that leads to a file in `/boot` needs no look: that file is
-            // compared as one of its own. One that leads out of `/boot`,
-            // or nowhere, is not compared, and the sweep says so.
             Found::Link(target) => {
-                let lands =
-                    read::resolve_where(path, target, &|hop| read::plain_hop(scope.root, hop));
-                if !lands.is_some_and(|lands| lands.starts_with("boot/")) {
-                    not_checked(
-                        scope,
-                        boot,
-                        format!("/{path}: a link that leads out of /boot; not compared"),
-                    );
-                }
+                link(scope, boot, path, target);
                 continue;
             }
             Found::Other => continue,
@@ -243,6 +241,26 @@ fn not_checked(scope: &Scope<'_>, boot: &mut Boot, sentence: String) {
         boot.unchecked.push(sentence);
     } else {
         boot.notes.push(sentence);
+    }
+}
+
+/// Checks the link at `path`, named as an EFI program, with text `target`.
+/// FAT, which an ESP is, has no links. One elsewhere in `/boot` that leads
+/// to a `.efi` file in `/boot` needs no look: that file is compared as one
+/// of its own. Any other target (out of `/boot`, nowhere, or a file not
+/// named `.efi`, which is not compared) is not checked, and the sweep says
+/// so.
+fn link(scope: &Scope<'_>, boot: &mut Boot, path: &str, target: &str) {
+    let lands = read::resolve_where(path, target, &|hop| read::plain_hop(scope.root, hop));
+    let compared = lands.is_some_and(|lands| {
+        lands.starts_with("boot/") && read::has_extension(file_name(&lands), "efi")
+    });
+    if !compared {
+        not_checked(
+            scope,
+            boot,
+            format!("/{path}: a link to a file that is not compared; not checked"),
+        );
     }
 }
 

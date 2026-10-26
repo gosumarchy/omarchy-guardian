@@ -740,19 +740,22 @@ to do, and your own sweep says so in a note.
 Every EFI program under `/boot` (a `.efi` file; the first 64, more is said)
 is compared by SHA-256 with the ones packages ship for a boot loader tool to
 copy there: Limine (`/usr/share/limine`), systemd-boot and its UKI stub
-(`/usr/lib/systemd/boot/efi`), fwupd, shim, rEFInd and the UEFI shell, each
-only while it is still what its package shipped. Some tools change the copy
+(`/usr/lib/systemd/boot/efi`), fwupd, shim and rEFInd, each only while it is
+still what its package shipped. The UEFI shell is left out on purpose: a
+packaged program counts wherever it is, and the shell copied to the
+firmware's default path would run `startup.nsh` at every boot. Some tools change the copy
 after install in known ways, and those changes are put back before the
 comparison, so a program that differs only by them counts as packaged: a
 signature `sbctl` or `sbsign` added (the certificate table at the end, the
 header entry that points at it, the header checksum and the alignment
 padding), and the hash of `limine.conf` that `limine enroll-config` writes
-into Limine. Everything the firmware loads must still be the package's
+into Limine (put back before comparing, not checked against `limine.conf`).
+Everything the firmware loads must still be the package's
 bytes.
 
 | What it is | How it is shown |
 | --- | --- |
-| A packaged program, as shipped, signed since, or with the configuration hash enrolled | trusted, only counted |
+| A packaged program, as shipped, signed since, or with the configuration hash enrolled | trusted, not listed |
 | A unified kernel image (UKI) built from systemd's packaged stub around a kernel a kernel package ships | one note; the initramfs and command line inside are built on this machine and are not comparable |
 | A UKI built from the packaged stub around a kernel no installed package ships, in one of the directories the boot loaders start from (below) or whose `.uname` is the running release | a high finding (`boot-tampering`), like a kernel image the machine starts |
 | Such a UKI anywhere else | listed with a note and no alert, like an older kernel image |
@@ -773,8 +776,9 @@ or a `grub*.efi` where the grub package is not installed, is told like any
 other program: in the directories above, a finding. A program larger than the
 2 MiB kept of every file is read again whole (up to 256 MiB) and checked to
 be the file that was hashed; one that cannot be is not compared, and for the
-root checks the sweep is incomplete. So is a link in `/boot` that leads out of
-it: an ESP has none, and the file it leads to is not compared.
+root checks the sweep is incomplete. So is one larger than that, and a `.efi`
+link in `/boot` that leads anywhere but to another `.efi` file in `/boot`: an
+ESP has no links, and the file it leads to is not compared.
 
 A listed program can be allowed as it is. Nothing from `/boot` goes to the AI
 review: kernel images and EFI programs are judged by these local rules alone,
@@ -789,7 +793,10 @@ firmware's default `/boot/EFI/BOOT/BOOTX64.EFI`, and snapper keeps older
 kernels for its snapshot entries. Unified kernel images are off by default
 (`ENABLE_UKI=no` in `/etc/limine-entry-tool.conf`) and so is enrolling the
 configuration hash; both are told apart when they are turned on, and so is a
-signature once `sbctl` is set up.
+signature once `sbctl` is set up. The directories above assume the ESP is
+mounted at `/boot`, as Omarchy mounts it: under an ESP at `/boot/efi` an
+unknown program is only listed with a note, and an ESP at `/efi` is not looked
+at.
 
 A note also says whether Secure Boot is on; that it is off is said once, and
 after that only with `--all`, until it changes. What is inside the initramfs

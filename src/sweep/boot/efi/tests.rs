@@ -304,6 +304,7 @@ fn efi_programs_are_compared_with_the_packaged_ones() {
         ),
         ("boot/EFI/Linux/arch-linux.efi", signed(&uki(b"kernel"))),
         ("boot/EFI/Linux/arch-old.efi", uki(b"older kernel")),
+        ("boot/EFI/limine/arch-old.efi", uki(b"older kernel")),
         ("boot/EFI/snapshots/arch-old.efi", uki(b"older kernel")),
         (
             "boot/EFI/snapshots/arch-running.efi",
@@ -334,6 +335,7 @@ fn efi_programs_are_compared_with_the_packaged_ones() {
             None,
             Some(ELSEWHERE),
         ),
+        item("boot/EFI/limine/arch-old.efi", tampered, None),
         item("boot/EFI/snapshots/arch-old.efi", None, Some(OTHER_KERNEL)),
         item("boot/EFI/snapshots/arch-running.efi", tampered, None),
         item("boot/EFI/systemd/systemd-bootx64.efi", tampered, None),
@@ -481,6 +483,10 @@ fn a_link_out_of_boot_is_said() {
         root.join("boot/EFI/BOOT/outside.efi"),
     )
     .unwrap();
+    // In `/boot`, but to a file not named `.efi`, which is not compared.
+    write(root, "boot/payload.bin", &program(&[(".text", b"payload")]));
+    std::os::unix::fs::symlink("../../payload.bin", root.join("boot/EFI/BOOT/renamed.efi"))
+        .unwrap();
     let index = PackageIndex::with_foreign(HashSet::new());
     let scope = Scope {
         root,
@@ -491,7 +497,46 @@ fn a_link_out_of_boot_is_said() {
     let boot = check(&scope);
     assert_eq!(
         boot.unchecked,
-        ["/boot/EFI/BOOT/outside.efi: a link that leads out of /boot; not compared"]
+        [
+            "/boot/EFI/BOOT/outside.efi: a link to a file that is not compared; not checked",
+            "/boot/EFI/BOOT/renamed.efi: a link to a file that is not compared; not checked",
+        ]
+    );
+}
+
+/// The packaged UEFI shell vouches for nothing: in the firmware's default
+/// path it would run `startup.nsh` at every boot.
+#[test]
+fn the_packaged_uefi_shell_is_not_trusted_in_boot() {
+    let dir = TempDir::new("sweep-efi-shell");
+    let root = dir.path();
+    let shell = program(&[(".text", b"uefi shell")]);
+    let packaged = "usr/share/edk2-shell/x64/Shell_Full.efi";
+    write(root, packaged, &shell);
+    let mut index = PackageIndex::with_foreign(HashSet::new());
+    index.add_for_test("edk2-shell", &mtree_line(packaged, &shell), &[]);
+    write(root, "boot/EFI/BOOT/BOOTX64.EFI", &shell);
+    write(root, "boot/shellx64.efi", &shell);
+    let scope = Scope {
+        root,
+        home: None,
+        index: &index,
+        origin: Origin::Root,
+    };
+    assert_eq!(
+        found(&scope),
+        [
+            (
+                "boot/EFI/BOOT/BOOTX64.EFI".to_string(),
+                Some(RuleId::BootTampering),
+                None
+            ),
+            (
+                "boot/shellx64.efi".to_string(),
+                None,
+                Some(ELSEWHERE.to_string())
+            ),
+        ]
     );
 }
 
