@@ -354,6 +354,25 @@ fn node_installs_address(command: &Command) -> bool {
         })
 }
 
+/// uv and pipx running a Python package fetched for the occasion, at
+/// whatever version is newest: `uvx pkg`, `uv tool run pkg`, `pipx run
+/// pkg`. Neither asks first, like `bunx`.
+fn python_runs_fetched(command: &Command) -> bool {
+    let run = match unversioned(&command.program) {
+        "uvx" => Some(&command.arguments[..]),
+        "uv" => after(command, &["tool"])
+            .and_then(|rest| rest.split_first())
+            .filter(|(verb, _)| *verb == "run")
+            .map(|(_, rest)| rest),
+        "pipx" => after(command, &["run"]),
+        _ => None,
+    };
+    run.and_then(|run| run.iter().find(|word| !word.starts_with('-')))
+        .is_some_and(|package| {
+            is_remote_package(package) || (is_unpinned(package) && !package.contains("=="))
+        })
+}
+
 /// `go run` or `go install` of a module on another host at whatever its
 /// newest version is, and `cargo install --git`.
 fn builds_from_address(command: &Command) -> bool {
@@ -380,7 +399,7 @@ fn builds_from_address(command: &Command) -> bool {
 /// rather than from this source or a registry by name.
 pub(super) fn installs_remote_code(line: &str) -> bool {
     if ![
-        "pip", "uv ", "npm ", "npx ", "pnpm ", "yarn ", "bun", "go ", "cargo ",
+        "pip", "uv ", "uvx", "npm ", "npx ", "pnpm ", "yarn ", "bun", "go ", "cargo ",
     ]
     .iter()
     .any(|word| line.contains(word))
@@ -396,6 +415,7 @@ pub(super) fn installs_remote_code(line: &str) -> bool {
             let fed_by_fetch = at > 0 && fetches(parts[at - 1]);
             pip_installs_address(&command, fed_by_fetch)
                 || node_installs_address(&command)
+                || python_runs_fetched(&command)
                 || builds_from_address(&command)
         })
     })
@@ -528,6 +548,10 @@ mod tests {
             "npx github:someone/pkg",
             "pnpm dlx some-tool",
             "bunx some-tool",
+            "uvx some-tool",
+            "uvx --from git+https://x.example/a/b tool",
+            "uv tool run some-tool@latest",
+            "pipx run some-tool",
             "go run x.example/a/b/cmd/tool@latest",
             "go install x.example/a/tool@latest",
             "cargo install --git https://x.example/a/b tool",
@@ -553,6 +577,11 @@ mod tests {
             "npx --yes some-tool@1.2.3",
             "npx -y @scope/tool@2.0.0 build",
             "pnpm dlx some-tool@3.1.0",
+            "uvx some-tool@1.2.3",
+            "uvx some-tool==1.2.3 --help",
+            "uv tool install some-tool",
+            "uv run pytest",
+            "pipx run some-tool==2.0",
             "go build ./...",
             "go install ./cmd/tool",
             "go install x.example/a/tool@v1.2.3",

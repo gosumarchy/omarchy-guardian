@@ -119,9 +119,11 @@ pub(super) fn follow(
         // own program. Other lines (a unit's `ExecStart=`) are not shell:
         // there only ` ; ` separates commands, and a long line is taken
         // whole.
+        // An agent runs a hook's command through a shell, and the
+        // collector writes a server's command and arguments as such a line.
         let shell_line = matches!(
             item.category,
-            Category::Cron | Category::Shell | Category::Hyprland
+            Category::Cron | Category::Shell | Category::Hyprland | Category::Agent
         ) || is_read_script(item);
         let lookup = commands::Lookup {
             home,

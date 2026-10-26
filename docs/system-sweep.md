@@ -15,6 +15,7 @@ described.
   - [Where following stops](#where-following-stops)
   - [Programs ahead of the system's own](#programs-ahead-of-the-systems-own)
   - [More that decides what runs](#more-that-decides-what-runs)
+  - [AI coding agents](#ai-coding-agents)
   - [Accounts, keys and trust anchors](#accounts-keys-and-trust-anchors)
   - [Guardian's own units](#guardians-own-units)
 - [What runs now](#what-runs-now)
@@ -363,6 +364,111 @@ and git files they are checked locally and never sent to the AI (mise's and
 cargo's are reviewed, with secret-looking values taken out), and what is shown
 is the key and, for an address, its host, never the rest of the value; so are
 an editor's `settings.json` and fish's saved variables.
+
+### AI coding agents
+
+Claude Code, OpenCode and Codex start programs on their own: a hook on every
+tool call or at every start, a status line on every refresh, an MCP server
+when a session opens, a plugin's hooks and servers. A theme, a plugin or a
+program run once can add one. Their configuration files also hold tokens,
+account data and the path and history of every project, so the sweep never
+makes an item of those files and never sends them. It reads them here and
+makes one item of each entry that starts something.
+
+What is read (paths in your home unless absolute):
+
+| Agent | File | What becomes an item |
+| --- | --- | --- |
+| Claude Code | `~/.claude/settings.json`, `~/.claude/settings.local.json` | every `hooks` command and web hook, `statusLine.command`, `apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`, `otelHeadersHelper` |
+| Claude Code | `~/.claude.json` | `mcpServers`, and the `mcpServers` of each entry of `projects`; nothing else of the file |
+| Claude Code | `/etc/claude-code/managed-settings.json`, `/etc/claude-code/managed-mcp.json` | the same keys, for every user |
+| Claude Code | `~/.claude/plugins/installed_plugins.json` | for each installed plugin: the hooks and servers of its `hooks/hooks.json`, its `.mcp.json`, and what its `.claude-plugin/plugin.json` holds or names |
+| OpenCode | `~/.config/opencode/opencode.json` and `opencode.jsonc` (comments allowed) | each `mcp` server and each `plugin` |
+| OpenCode | `~/.config/opencode/plugin/*.js`, `*.ts`, and the same in `plugins/` | each file, as the code it is |
+| Codex | `~/.codex/config.toml` | each `[mcp_servers.*]` and `notify` |
+
+`CLAUDE_CONFIG_DIR` (which then holds `.claude.json` too), `XDG_CONFIG_HOME`,
+`OPENCODE_CONFIG` (read besides the usual file) and `CODEX_HOME` move these
+the way they move them for the agents, when the sweep runs in your own session
+(its `HOME` is the home being swept). The root checks read root's own files at
+the default places.
+
+An item is named by its file and its key in that file:
+`~/.claude/settings.json#hooks/PreToolUse/0/1` (the event, the group, the
+hook), `~/.claude.json#mcpServers/github`, `~/.codex/config.toml#notify`. A
+plugin's entries are named by the plugin, not by the directory of its version
+(`~/.claude/plugins/installed_plugins.json#name@market/hooks/hooks.json/SessionStart/0/0`),
+so an update shows as a change. A project's servers are named by the first 12
+hex digits of the SHA-256 of the project's path
+(`~/.claude.json#projects/~3f1a…/mcpServers/db`), and only a note shown on
+this machine gives the path. A key that is not a plain name (it has a `/`, a
+blank, a leading `.`) is named the same way.
+
+The text of each item, which is all the review sees of it, is what the entry
+starts and nothing else:
+
+- a hook, the status line and a helper: the command line as written;
+- an MCP server run as a program: the program and its arguments as one line,
+  each word quoted where a shell would split it. The value that follows a flag
+  named for a secret (`--api-key x`, `--token=x`, any flag with `token`,
+  `secret`, `password`, `pass`, `key`, `apikey`, `auth`, `credential`, `pat`
+  or `bearer` as a word of its name), the value of an argument such as
+  `GITHUB_TOKEN=x`, and the user and password of an address are replaced by
+  `<value-not-read>`;
+- the variables it is started with (`env`, `environment`): their names only,
+  on a comment line. Their values are never read, so a changed value is no
+  change;
+- a remote MCP server or a web hook: the scheme and host of its address
+  (`https://mcp.example.com`); the path, query, headers and login are left
+  out;
+- an OpenCode plugin from npm: `npm package` and its name as written.
+
+A change to that text (a new hook, a changed command, a new variable name) is
+a change to the item: it shows in `--diff`, in the daily notification, and
+goes to the review again. An unchanged entry costs no AI call, like any item.
+
+What is followed: each command is followed like any other, so a script a hook
+or server names (an absolute path, `~`, a program on `PATH`) is read and
+reviewed as a program, and what it starts after it. In a plugin's commands
+`${CLAUDE_PLUGIN_ROOT}` is the plugin's directory. A `file://` plugin of
+OpenCode is followed to its file.
+
+What is a finding:
+
+- a remote MCP server or a web hook on another machine: `risky-configuration`
+  (medium). The agent sends it what it works on and acts on what it answers.
+  `localhost` is not one;
+- an npm plugin of OpenCode without one fixed version (`opencode-x`,
+  `opencode-x@latest`): `remote-code-install` (medium), since whatever is
+  published next is installed and run;
+- what the local rules find in a command line, as in any script: `npx -y` or
+  `bunx` of an unpinned package, `uvx`, `uv tool run` or `pipx run` of a
+  package with no version fixed (`remote-code-install`), `curl … | sh`
+  (`download-and-execute`).
+
+Guardian's own hooks are items like any other.
+
+What is not checked, and says so in the sweep's list of what was not checked:
+a configuration file that is a link (it is not followed), one that is not a
+regular file, larger than 16 MiB, not JSON (or not TOML Guardian can read),
+more than 500 entries of one file, a plugin whose directory is not under
+`~/.claude/plugins/`, and a file a plugin's manifest names outside the plugin.
+
+What is not covered:
+
+- a project's own `.claude/settings.json`, `.mcp.json`, `opencode.json` or
+  `.codex/config.toml`, which live in each repository: the sweep does not
+  search for repositories;
+- the `env` of Claude Code's settings (which can set `NODE_OPTIONS` for Claude
+  Code itself), whose values are not read;
+- what a plugin holds besides the hooks and servers it declares (skills,
+  agents, commands are instructions to a model, not programs), a plugin whose
+  hooks only its marketplace entry declares, and the code of an npm plugin of
+  OpenCode, which lives in its cache;
+- the modules a script imports, as for any script.
+
+Each entry is a few lines of text: a first sweep reviews them all, with each
+script they name and each OpenCode plugin file, once.
 
 ### Accounts, keys and trust anchors
 
@@ -753,7 +859,7 @@ memory, so a repeated sweep of an unchanged system makes no AI call.
 
 ### What is kept from the AI
 
-Four kinds of file are read on this machine only. Each says so in a note on
+Five kinds of file are read on this machine only. Each says so in a note on
 its item (accounts, keys and certificate authorities do not: they are facts
 with no text to send), and being kept makes no sweep incomplete.
 
@@ -825,6 +931,10 @@ with no text to send), and being kept makes no sweep incomplete.
   `settings.json`, fish's saved variables, accounts, keys, certificate
   authorities and `/etc/hosts`, each checked by the rules for its kind (see
   [More that decides what runs](#more-that-decides-what-runs)).
+- **An AI coding agent's configuration files** (`~/.claude.json`, Claude
+  Code's settings, OpenCode's and Codex's): never sent, and no item of their
+  own. Only the entries that start something are items, with only what they
+  start as their text (see [AI coding agents](#ai-coding-agents)).
 - **A file a live check names that nothing says is a script.** The live checks
   go by a process's arguments, and an argument may as well be a data file
   (`node --env-file …`). Its text is sent only where it starts with `#!` or

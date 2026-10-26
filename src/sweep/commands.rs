@@ -40,6 +40,13 @@ pub(super) fn commands(category: Category, path: &str, text: &str) -> Vec<String
     if path.starts_with("etc/logrotate") {
         return Vec::new();
     }
+    // An agent's hooks and servers are items the collector made from its
+    // configuration, with what they run already set (see `agents`); any
+    // other file of the kind is a plugin's code, reviewed as the text it
+    // is, or a script read as one where a shell is handed it.
+    if category == Category::Agent {
+        return Vec::new();
+    }
     if category == Category::Cron {
         return crontab(path, text);
     }

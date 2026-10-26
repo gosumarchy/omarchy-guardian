@@ -27,7 +27,11 @@ it shows on hover:
   package install scriptlets and auto-run files, AUR recipes and their
   sources, themes, plugins, what you `scan`, and for the daily sweep the
   start-up files on this machine that no package vouches for, with the scripts
-  they run. A file whose name or path marks it as holding keys or tokens
+  they run. Of an AI coding agent's configuration (Claude Code, OpenCode,
+  Codex) only what each hook, MCP server or plugin starts is sent: its command
+  line with secret-named values taken out, the names of its variables, or a
+  remote server's host; never the files themselves, which hold tokens and
+  project history. A file whose name or path marks it as holding keys or tokens
   (`.env`, `*.pem`, `*.key`, `id_ed25519`, anything under `.ssh` or `secrets`,
   and the like) is not sent, by any gate or by the sweep, whatever runs it. In
   a gate the review is then incomplete, not clear. In the sweep such a file is
@@ -317,6 +321,10 @@ under [Limitations](docs/limitations.md):
   not looked at, and other mounted filesystems are not searched for setuid
   files; as a user only your own processes can be looked at; without root
   checks every sweep is incomplete ([System sweep](docs/system-sweep.md)).
+- System sweep: an AI coding agent's hooks and MCP servers are read from your
+  own configuration, not from a project's (`.claude/settings.json`,
+  `.mcp.json` in a repository), and a configuration file that is a link is
+  not followed ([System sweep](docs/system-sweep.md#ai-coding-agents)).
 - Source leaves the machine through the AI provider you configured, except
   under `local-only` and except the files kept from the AI by name or kind; a
   secret under a name Guardian does not recognise still goes with its file.

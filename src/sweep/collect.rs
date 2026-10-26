@@ -7,7 +7,7 @@ mod follow;
 mod item;
 mod sight;
 
-pub(super) use item::{item, item_of};
+pub(super) use item::{item, item_of, origin};
 use sight::is_there;
 pub(super) use sight::{holds, is_file_there, look, packaged_item, packaged_out_of_sight};
 
@@ -20,7 +20,7 @@ use std::path::Path;
 use super::index::PackageIndex;
 use super::read::{self, View};
 use super::tier::Tier;
-use super::{access, boot, commands, own, path};
+use super::{access, agents, boot, commands, own, path};
 use crate::autorun::{Category, Kind, Location, SYSTEM, SYSTEM_SWEEP, USER};
 use crate::paths::file_name;
 use crate::rules::RuleId;
@@ -294,6 +294,15 @@ pub(super) fn collect(scope: &Scope<'_>) -> Collection {
             .collect(),
         ..Walk::default()
     };
+    // What AI coding agents start, as items made from their configuration
+    // and followed like any other (see `agents`).
+    let agents = agents::collect(scope);
+    collection.truncated.extend(agents.unchecked);
+    for item in agents.items {
+        if walk.seen.insert(item.path.clone()) {
+            walk.pending.push((0, item));
+        }
+    }
     let omarchy = omarchy_paths(scope.root);
     while let Some((reading, mut item)) = walk.pending.pop() {
         // A script that was read again since this reading of it was

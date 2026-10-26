@@ -157,6 +157,35 @@ pub(crate) fn is_empty_container(raw: &str) -> bool {
     })
 }
 
+/// The keys of an inline table value (`{ A = "x", "B.c" = 1 }` gives `A`
+/// and `B.c`), without reading their values; `None` when the value is no
+/// inline table or cannot be delimited. A dotted key is given joined by
+/// `.` as it was written.
+pub(crate) fn inline_table_keys(raw: &str) -> Option<Vec<String>> {
+    let inner = raw.strip_prefix('{')?.strip_suffix('}')?;
+    let mut reader = Reader {
+        bytes: inner.as_bytes(),
+        position: 0,
+        counted: Cell::new((0, 1)),
+    };
+    let mut keys = Vec::new();
+    loop {
+        reader.skip_blank_lines();
+        if reader.peek().is_none() {
+            return Some(keys);
+        }
+        keys.push(reader.key_path().ok()?.join("."));
+        reader.expect(b'=', "expected '=' after key").ok()?;
+        reader.skip_inline_value().ok()?;
+        reader.skip_blank_lines();
+        match reader.peek() {
+            None => return Some(keys),
+            Some(b',') => reader.position += 1,
+            Some(_) => return None,
+        }
+    }
+}
+
 /// A typed value in Guardian's own config file. Only the forms the config
 /// uses are supported; anything else is `None` and becomes a config error.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -476,6 +505,38 @@ impl Reader<'_> {
         Ok(value.to_string())
     }
 
+    /// Moves past one value inside an inline table: up to the blank, `,` or
+    /// end that follows it outside strings, arrays and nested tables. A
+    /// date and time written with a blank in it is not read.
+    fn skip_inline_value(&mut self) -> Result<(), ParseError> {
+        self.skip_spaces();
+        let start = self.position;
+        let mut depth = 0_usize;
+        let mut ignored = Vec::new();
+        loop {
+            match self.peek() {
+                None | Some(b',' | b' ' | b'\t' | b'\n' | b'\r') if depth == 0 => break,
+                None => return Err(self.error("unterminated array or inline table")),
+                Some(b'"' | b'\'') => self.copy_string(&mut ignored)?,
+                Some(b'[' | b'{') => {
+                    depth += 1;
+                    self.position += 1;
+                }
+                Some(b']' | b'}') => {
+                    depth = depth
+                        .checked_sub(1)
+                        .ok_or_else(|| self.error("unbalanced bracket in value"))?;
+                    self.position += 1;
+                }
+                Some(_) => self.position += 1,
+            }
+        }
+        if self.bytes[start..self.position].trim_ascii().is_empty() {
+            return Err(self.error("missing value"));
+        }
+        Ok(())
+    }
+
     fn copy_string(&mut self, output: &mut Vec<u8>) -> Result<(), ParseError> {
         let rest = self.rest();
         let (delimiter, multiline): (&[u8], bool) = if rest.starts_with(b"\"\"\"") {
@@ -520,8 +581,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        Value, array_table_items, entries, is_empty_container, string_field, string_value,
-        typed_value,
+        Value, array_table_items, entries, inline_table_keys, is_empty_container, string_field,
+        string_value, typed_value,
     };
     use crate::config::file::{PartialConfig, PartialPolicy, parse};
     use crate::config::model::{Named, SourceClass};
@@ -1093,5 +1154,28 @@ multi "line" ]
             refused += 1;
         }
         assert!(refused > 2_000, "{refused}");
+    }
+
+    #[test]
+    fn inline_table_keys_are_read_without_their_values() {
+        let document = r#"env = { TOKEN = "a, b = c", "DOTTED.NAME" = 'x', nested = { y = [1, "]"] }, a.b = 2 }"#;
+        let parsed = entries(document).unwrap();
+        assert_eq!(
+            inline_table_keys(&parsed[0].value).unwrap(),
+            ["TOKEN", "DOTTED.NAME", "nested", "a.b"]
+        );
+        assert_eq!(inline_table_keys("{}").unwrap(), Vec::<String>::new());
+        assert_eq!(inline_table_keys("{ A = 1, }").unwrap(), ["A"]);
+        for odd in [
+            "[1]",
+            "\"x\"",
+            "{ A }",
+            "{ A = }",
+            "{ A = 1 B = 2 }",
+            "{ = 1 }",
+            "{ A = \"x }",
+        ] {
+            assert_eq!(inline_table_keys(odd), None, "{odd}");
+        }
     }
 }
