@@ -466,10 +466,11 @@ fn plugin_root_not_followed(line: &str, runs: &[String]) -> Option<String> {
 /// Whether `line` names the plugin's variable other than to expand it, as
 /// an assignment or an argument does: `CLAUDE_PLUGIN_ROOT` not right after
 /// `$` or `${`, or after `${` with `:=` or `=`, which assigns a value when
-/// the variable is unset (or, for `:=`, empty). A longer name that holds it (`MY_CLAUDE_PLUGIN_ROOT`,
-/// `CLAUDE_PLUGIN_ROOTS`) counts too: telling it apart is what let an
-/// option with the name attached (`env -uCLAUDE_PLUGIN_ROOT`, `printf
-/// -vCLAUDE_PLUGIN_ROOT`) through, and such a name only adds a note.
+/// the variable is unset (or, for `:=`, empty). A longer name that
+/// holds it (`MY_CLAUDE_PLUGIN_ROOT`, `CLAUDE_PLUGIN_ROOTS`) counts too:
+/// telling it apart is what let an option with the name attached (`env
+/// -uCLAUDE_PLUGIN_ROOT`, `printf -vCLAUDE_PLUGIN_ROOT`) through, and
+/// such a name only adds a note.
 fn changes_plugin_root(line: &str) -> bool {
     let line = without_quoting(line);
     line.match_indices(PLUGIN_ROOT).any(|(at, _)| {
