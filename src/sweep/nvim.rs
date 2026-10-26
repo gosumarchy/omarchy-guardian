@@ -483,15 +483,16 @@ fn git_alerts(name: &str, git: &Git, specs: &Specs, alerts: &mut Vec<(RuleId, St
         // Said as not checked where it was read.
         Remote::Unread => {}
     }
-    for (file, line, key) in &git.runs {
-        alerts.push((
-            RuleId::GitConfigCommand,
-            format!(
+    for run in &git.runs {
+        let alert = match run.line {
+            Some(line) => format!(
                 "line {line}: {} runs a command on the git commands lazy.nvim runs: {}",
-                shown(file),
-                shown(key)
+                shown(&run.file),
+                shown(&run.what)
             ),
-        ));
+            None => format!("{}: {}", shown(&run.file), shown(&run.what)),
+        };
+        alerts.push((RuleId::GitConfigCommand, alert));
     }
     for (hook, _) in &git.hooks {
         alerts.push((
@@ -653,8 +654,11 @@ fn digest(checkout: &Checkout) -> Digest {
                 if let Some(commit) = &git.commit {
                     hasher.update(format!("commit\0{commit}\0").as_bytes());
                 }
-                for (file, line, key) in &git.runs {
-                    hasher.update(format!("runs\0{file}\0{line}\0{key}\0").as_bytes());
+                for run in &git.runs {
+                    let content = run.entry.as_ref().map(entry).unwrap_or_default();
+                    let line = run.line.map(|line| line.to_string()).unwrap_or_default();
+                    let fields = [run.file.as_str(), &line, &run.what, &content];
+                    hasher.update(format!("runs\0{}\0", fields.join("\0")).as_bytes());
                 }
                 for (name, hook) in &git.hooks {
                     hasher.update(format!("hook\0{name}\0{}\0", entry(hook)).as_bytes());

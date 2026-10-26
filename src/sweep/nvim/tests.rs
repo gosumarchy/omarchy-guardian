@@ -6,7 +6,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 
-use super::checkout::{origin, same_place, without_userinfo};
+use super::checkout::{Remote, origin, same_place, without_userinfo};
 use super::record::Files;
 use super::{Build, Dirs, Plugin, Record, Review, collect, plan, settle};
 use crate::agent::{AgentFinding, AgentReview, Status};
@@ -466,6 +466,74 @@ fn a_field_with_a_computed_key_is_a_build_finding() {
 }
 
 #[test]
+fn anything_in_a_git_directory_beyond_plain_data_is_a_finding() {
+    let temp = TempDir::new("nvim-git-layout");
+    let root = temp.path();
+    plugin(
+        root,
+        "p",
+        "https://github.com/o/p",
+        &[("sub/.git", "gitdir: /elsewhere")],
+    );
+    let git = format!("{LAZY}/p/.git");
+    write(root, &format!("{git}/commondir"), "/home/u/other/.git");
+    write(root, &format!("{git}/info/exclude"), "");
+    write(root, &format!("{git}/info/attributes"), "* filter=x");
+    write(root, &format!("{git}/objects/pack/x.pack"), "");
+    write(root, &format!("{git}/modules/dep/config"), "");
+    write(root, &format!("{git}/modules/dep/gitdir"), "../../../dep");
+    let item = &collected(root).items[0];
+    let flagged = |file: &str| {
+        item.alerts.iter().any(|(rule, text)| {
+            *rule == RuleId::GitConfigCommand && text.starts_with(&format!("{file}:"))
+        })
+    };
+    for file in [
+        ".git/commondir",
+        ".git/info/attributes",
+        ".git/modules/dep/gitdir",
+        "sub/.git",
+    ] {
+        assert!(flagged(file), "{file}: {:?}", item.alerts);
+    }
+    for file in [
+        ".git/info/exclude",
+        ".git/objects",
+        ".git/HEAD",
+        ".git/hooks",
+    ] {
+        assert!(!flagged(file), "{file}: {:?}", item.alerts);
+    }
+    // What commondir says counts for the content hash.
+    let before = item.sha256;
+    write(root, &format!("{git}/commondir"), "/home/u/third/.git");
+    assert_ne!(before, collected(root).items[0].sha256);
+}
+
+#[test]
+fn submodule_directories_are_never_followed_through_links_or_without_end() {
+    let temp = TempDir::new("nvim-git-module-loop");
+    let root = temp.path();
+    plugin(root, "p", "https://github.com/o/p", &[]);
+    let modules = root.join(LAZY).join("p/.git/modules");
+    fs::create_dir_all(&modules).unwrap();
+    symlink("..", modules.join("loop")).unwrap();
+    for index in 0..=super::checkout::MAX_MODULE_DIRECTORIES {
+        fs::create_dir(modules.join(format!("d{index}"))).unwrap();
+    }
+    let unchecked = collected(root).unchecked;
+    let said = |text: &str| unchecked.iter().any(|sentence| sentence.contains(text));
+    assert!(
+        said("modules/loop: a link, which was not followed"),
+        "{unchecked:?}"
+    );
+    assert!(
+        said("directories; the rest were not looked at"),
+        "{unchecked:?}"
+    );
+}
+
+#[test]
 fn submodules_are_read_like_the_checkout() {
     let temp = TempDir::new("nvim-git-modules");
     let root = temp.path();
@@ -652,11 +720,28 @@ fn moved_configuration_is_collected_as_editor_start_up_files() {
 #[test]
 fn checkout_metadata_is_read_without_git() {
     let config = "[core]\n[Remote \"upstream\"]\n\turl = https://a/b\n[remote \"origin\"]\n\tURL = \"https://github.com/o/r.git\"\n\turl = https://second\n";
-    assert_eq!(
-        origin(config).as_deref(),
-        Some("https://github.com/o/r.git")
+    assert!(matches!(origin(config), Remote::Url(url) if url == "https://github.com/o/r.git"));
+    assert!(matches!(
+        origin("[remote \"upstream\"]\nurl = x\n"),
+        Remote::Unnamed
+    ));
+    // Read as git reads it: an old-style header is lowercased, a quoted
+    // subsection has its escapes decoded.
+    assert!(
+        matches!(origin("[remote.ORIGIN]\nurl = https://a/b\n"), Remote::Url(url) if url == "https://a/b")
     );
-    assert_eq!(origin("[remote \"upstream\"]\nurl = x\n"), None);
+    assert!(
+        matches!(origin("[remote \"or\\igin\"]\nurl = https://a/c\n"), Remote::Url(url) if url == "https://a/c")
+    );
+    // A url that continues, or that may be the rest of another line, is
+    // not one git reads one way only.
+    for config in [
+        "[remote \"origin\"]\nurl = https://a/\\\nb\n",
+        "[remote \"origin\"]\nx = y\\\nurl = https://evil/x\n",
+        "[remote \"x\"]\nurl = a \\\n[remote \"origin\"]\nurl = https://a/d\n",
+    ] {
+        assert!(matches!(origin(config), Remote::Unread), "{config}");
+    }
     assert_eq!(
         without_userinfo("https://user:tok@en@github.com/o/r"),
         "https://github.com/o/r"

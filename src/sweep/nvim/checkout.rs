@@ -6,7 +6,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use crate::git_state::{self, without_url_credentials};
+use crate::git_state::{self, Reading, without_url_credentials};
 use crate::scan::MAX_TEXT_FILE_SIZE;
 use crate::sha256::Digest;
 use crate::sweep::collect;
@@ -67,15 +67,31 @@ pub(super) struct Git {
     pub(super) remote: Remote,
     /// The commit `HEAD` is at.
     pub(super) commit: Option<String>,
-    /// The keys of its configuration and its submodules' that run a
-    /// command on later git commands, every `core.hooksPath` among them,
-    /// as (file relative to the plugin, line, `key = value` with URL
-    /// credentials masked).
-    pub(super) runs: Vec<(String, usize, String)>,
+    /// What may make git run something that is not a hook: the keys of
+    /// its configuration and its submodules' that run a command, every
+    /// `core.hooksPath` among them, every entry of a git directory that is
+    /// not plain data (see `PLAIN_DATA`), and every git directory or
+    /// pointer below the checkout.
+    pub(super) runs: Vec<Run>,
     /// The git hooks it holds (every file or link but `*.sample` in
     /// `.git/hooks`, in a `core.hooksPath` within the checkout, and in the
     /// `hooks` of each submodule), by path relative to the plugin, sorted.
     pub(super) hooks: Vec<(String, Entry)>,
+}
+
+/// Something in a checkout's git files that may make git run a program.
+#[derive(Debug)]
+pub(super) struct Run {
+    /// Relative to the plugin.
+    pub(super) file: String,
+    /// The line of a configuration key; `None` for a file or directory.
+    pub(super) line: Option<usize>,
+    /// The key as `key = value` (URL credentials masked), or what the file
+    /// or directory is.
+    pub(super) what: String,
+    /// The file's content, for the content hash; `None` for a key, whose
+    /// text is `what`, and for a directory.
+    pub(super) entry: Option<Entry>,
 }
 
 /// Where a checkout fetches from (`remote.origin.url`).
@@ -85,9 +101,38 @@ pub(super) enum Remote {
     Url(String),
     /// `.git/config` names no origin.
     Unnamed,
-    /// `.git/config` could not be read; said as not checked.
+    /// `.git/config` could not be read, or can be read more than one way
+    /// where it names the origin; said as not checked.
     Unread,
 }
+
+/// The entries of a git directory that are data git reads and never runs,
+/// from gitrepository-layout(5) (permalink:
+/// <https://github.com/git/git/blob/v2.47.0/Documentation/gitrepository-layout.txt>).
+/// `config`, `config.worktree`, `hooks`, `modules` and `info` are read on
+/// their own. Anything else (`commondir`, `gitdir`, `worktrees`,
+/// `remotes`, `branches`, a name git may give meaning to later) is a
+/// finding: it may point git at another repository, or change what runs.
+const PLAIN_DATA: &[&str] = &[
+    "objects",
+    "refs",
+    "HEAD",
+    "index",
+    "packed-refs",
+    "logs",
+    "description",
+    "FETCH_HEAD",
+    "ORIG_HEAD",
+    "shallow",
+];
+
+/// The entries of `info/` that are plain data: patterns, and the list of
+/// refs for dumb transports.
+const PLAIN_INFO: &[&str] = &["exclude", "refs", "sparse-checkout"];
+
+/// The most directories looked at under one plugin's `.git/modules`.
+/// Arbitrary: submodules nest rarely, and a loop must end.
+pub(super) const MAX_MODULE_DIRECTORIES: usize = 256;
 
 /// Every plugin directory under `lazy` (relative to `root`), sorted by
 /// name. What cannot be looked at is said in `unchecked`.
@@ -141,17 +186,29 @@ fn checkout(root: &Path, lazy: &str, name: String, unchecked: &mut Vec<String>) 
             ));
             Shape::Link(target)
         }
-        Found::File { .. } | Found::Other | Found::Unreadable(_) => Shape::Tree {
-            git: git(root, &path, unchecked),
-            files: walk(root, &path, unchecked),
-        },
+        Found::File { .. } | Found::Other | Found::Unreadable(_) => {
+            let mut inner = Vec::new();
+            let files = walk(root, &path, &mut inner, unchecked);
+            Shape::Tree {
+                git: git(root, &path, inner, unchecked),
+                files,
+            }
+        }
     };
     Checkout { name, path, shape }
 }
 
 /// Every entry under the directory `path` but its top-level `.git`, with no
-/// link followed, sorted by path relative to `path`.
-fn walk(root: &Path, path: &str, unchecked: &mut Vec<String>) -> Vec<(String, Entry)> {
+/// link followed, sorted by path relative to `path`. A `.git` deeper down
+/// (a directory, or a file pointing at one) is walked like the rest, and
+/// its path is added to `inner`: git may take configuration and hooks from
+/// it.
+fn walk(
+    root: &Path,
+    path: &str,
+    inner: &mut Vec<String>,
+    unchecked: &mut Vec<String>,
+) -> Vec<(String, Entry)> {
     let mut entries = Vec::new();
     let mut truncated = false;
     let mut pending = vec![(String::new(), 0_usize)];
@@ -183,6 +240,9 @@ fn walk(root: &Path, path: &str, unchecked: &mut Vec<String>) -> Vec<(String, En
             if relative == ".git" {
                 continue;
             }
+            if relative.ends_with("/.git") {
+                inner.push(relative.clone());
+            }
             let is_directory = entry.file_type().is_ok_and(|kind| kind.is_dir());
             if is_directory && depth + 1 < MAX_DEPTH {
                 pending.push((relative, depth + 1));
@@ -212,43 +272,60 @@ fn walk(root: &Path, path: &str, unchecked: &mut Vec<String>) -> Vec<(String, En
 
 /// What the `.git` directory of the plugin at `path` says; `None` when it
 /// has none (a `.git` file or link is no directory lazy.nvim made).
+/// `inner` are the git directories and pointers found below the checkout
+/// (see `walk`).
 ///
-/// Besides the origin and the commit, that is what git may run when
-/// lazy.nvim fetches or checks out: the keys that run commands in the
-/// configuration of the checkout and of each submodule (`.git/modules`),
-/// and their hooks. The rest of `.git` (objects, refs, the index, logs)
-/// is data git reads, not commands it runs.
-fn git(root: &Path, path: &str, unchecked: &mut Vec<String>) -> Option<Git> {
+/// Besides the origin and the commit, that is what may make git run a
+/// program when lazy.nvim fetches or checks out: hooks, the keys that run
+/// commands in the configuration of the checkout and of each submodule
+/// (`.git/modules`), and every entry of those git directories that is not
+/// plain data (see `PLAIN_DATA`).
+fn git(root: &Path, path: &str, inner: Vec<String>, unchecked: &mut Vec<String>) -> Option<Git> {
     let directory = format!("{path}/.git");
     if !fs::symlink_metadata(root.join(&directory)).is_ok_and(|metadata| metadata.is_dir()) {
         return None;
     }
     let config = text(root, &format!("{directory}/config"), MAX_GIT_FILE);
-    let remote = if let Some(config) = &config {
-        origin(config).map_or(Remote::Unnamed, |url| Remote::Url(without_userinfo(&url)))
-    } else {
-        unchecked.push(format!(
-            "/{directory}/config: could not be read, so where the plugin is fetched from and what it has git run were not checked"
-        ));
-        Remote::Unread
+    let remote = match config.as_deref().map(origin) {
+        Some(Remote::Unread) => {
+            unchecked.push(format!(
+                "/{directory}/config: the origin can be read more than one way (a continued line), so where the plugin is fetched from was not checked"
+            ));
+            Remote::Unread
+        }
+        Some(remote) => remote,
+        None => {
+            unchecked.push(format!(
+                "/{directory}/config: could not be read, so where the plugin is fetched from and what it has git run were not checked"
+            ));
+            Remote::Unread
+        }
     };
     let mut gits = Gits {
         root,
         plugin: path,
         runs: Vec::new(),
-        hooks: hooks(root, path, ".git/hooks", unchecked),
+        hooks: Vec::new(),
+        visited: 0,
         unchecked,
     };
-    let hooks_path = gits.settings(".git", config.as_deref());
+    let hooks_path = gits.git_directory(".git", config.as_deref());
     // A hooks directory within the checkout: git runs its hooks instead.
     if let Some(hooks_path) = hooks_path.filter(|value| git_state::is_in_tree(value)) {
-        let found = hooks(root, path, hooks_path.trim_end_matches('/'), gits.unchecked);
-        gits.hooks.extend(found);
+        gits.hooks(hooks_path.trim_end_matches('/'));
     }
     gits.modules(".git/modules", 0);
     let Gits {
-        runs, mut hooks, ..
+        mut runs,
+        mut hooks,
+        ..
     } = gits;
+    runs.extend(inner.into_iter().map(|file| Run {
+        file,
+        line: None,
+        what: "a git directory or pointer below the checkout; git may run its configuration and hooks".into(),
+        entry: None,
+    }));
     hooks.sort_by(|left, right| left.0.cmp(&right.0));
     Some(Git {
         remote,
@@ -264,17 +341,110 @@ struct Gits<'a> {
     /// The plugin's directory, relative to the root; every other path here
     /// is relative to it.
     plugin: &'a str,
-    runs: Vec<(String, usize, String)>,
+    runs: Vec<Run>,
     hooks: Vec<(String, Entry)>,
+    /// How many directories under `.git/modules` were looked at.
+    visited: usize,
     unchecked: &'a mut Vec<String>,
 }
 
 impl Gits<'_> {
+    /// Takes in the git directory `git`, whose `config` is `config`
+    /// (`None` when it could not be read, which is said already): its
+    /// command keys, its hooks, and its entries that are not plain data.
+    /// Returns the `core.hooksPath` git uses, if any.
+    fn git_directory(&mut self, git: &str, config: Option<&str>) -> Option<String> {
+        self.layout(git);
+        self.hooks(&format!("{git}/hooks"));
+        self.settings(git, config)
+    }
+
+    /// Takes in every entry of the git directory `git` that is not plain
+    /// data git reads (see `PLAIN_DATA`), or that is of a kind it should
+    /// not be, as a run.
+    fn layout(&mut self, git: &str) {
+        let full = format!("{}/{git}", self.plugin);
+        let Ok(listing) = fs::read_dir(self.root.join(&full)) else {
+            self.unchecked.push(format!("/{full}: could not be listed"));
+            return;
+        };
+        for entry in listing {
+            let Ok(entry) = entry else {
+                self.unchecked
+                    .push(format!("/{full}: could not be listed in full"));
+                break;
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let kind = entry.file_type().ok();
+            let is_dir = kind.is_some_and(|kind| kind.is_dir());
+            let is_file = kind.is_some_and(|kind| kind.is_file());
+            let expected = match name.as_str() {
+                "config" | "config.worktree" => is_file,
+                "hooks" | "modules" => is_dir,
+                "info" if is_dir => {
+                    self.info(&format!("{git}/info"));
+                    true
+                }
+                name => PLAIN_DATA.contains(&name),
+            };
+            if !expected {
+                self.unknown(&format!("{git}/{name}"));
+            }
+        }
+    }
+
+    /// Takes in every entry of `info` but the plain data (`PLAIN_INFO`).
+    fn info(&mut self, info: &str) {
+        let full = format!("{}/{info}", self.plugin);
+        let Ok(listing) = fs::read_dir(self.root.join(&full)) else {
+            self.unchecked.push(format!("/{full}: could not be listed"));
+            return;
+        };
+        for entry in listing {
+            let Ok(entry) = entry else {
+                self.unchecked
+                    .push(format!("/{full}: could not be listed in full"));
+                break;
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_file = entry.file_type().is_ok_and(|kind| kind.is_file());
+            if !(is_file && PLAIN_INFO.contains(&name.as_str())) {
+                self.unknown(&format!("{info}/{name}"));
+            }
+        }
+    }
+
+    /// Takes in `file`, an entry of a git directory that is not plain data,
+    /// as a run, with its content where it is a file or a link.
+    fn unknown(&mut self, file: &str) {
+        let full = format!("{}/{file}", self.plugin);
+        let (what, entry) = match read::look(self.root, &full) {
+            Found::File { sha256, mode, .. } => ("a file", Some(Entry::File { sha256, mode })),
+            Found::Link(target) => ("a link", Some(Entry::Link(target))),
+            Found::Other => ("a directory or special file", None),
+            Found::Unreadable(_) => ("an entry that could not be read", None),
+        };
+        self.runs.push(Run {
+            file: file.to_string(),
+            line: None,
+            what: format!(
+                "{what} git may take configuration, hooks or another repository from (not plain data in a git directory)"
+            ),
+            entry,
+        });
+    }
+
+    /// Takes in the hooks in `directory` (see the free `hooks`).
+    fn hooks(&mut self, directory: &str) {
+        let found = hooks(self.root, self.plugin, directory, self.unchecked);
+        self.hooks.extend(found);
+    }
+
     /// Takes in the command keys of the git directory `git`: its `config`
     /// (`config`, `None` when it could not be read, which is said already)
     /// and its `config.worktree`, which git reads once
     /// `extensions.worktreeConfig` is set and which is read whenever it is
-    /// there. Returns the `core.hooksPath` git uses, if any.
+    /// there. Returns the `core.hooksPath` git uses, if it reads one way.
     fn settings(&mut self, git: &str, config: Option<&str>) -> Option<String> {
         let worktree = format!("{git}/config.worktree");
         let full = format!("{}/{worktree}", self.plugin);
@@ -301,29 +471,62 @@ impl Gits<'_> {
             // files are reviewed only once they change.
             let keys = git_state::executing_keys(text).into_iter();
             let keys = keys.filter(|(_, key)| !key.starts_with("core.hookspath "));
-            self.runs
-                .extend(keys.map(|(line, key)| (file.clone(), line, key)));
-            for (line, value) in git_state::values(text, "core", None, "hookspath") {
-                let key = format!("core.hookspath = {}", without_url_credentials(&value));
-                self.runs.push((file.clone(), line, key));
-                hooks_path = Some(value);
+            self.runs.extend(keys.map(|(line, what)| Run {
+                file: file.clone(),
+                line: Some(line),
+                what,
+                entry: None,
+            }));
+            for (line, value, reading) in git_state::values(text, "core", None, "hookspath") {
+                self.runs.push(Run {
+                    file: file.clone(),
+                    line: Some(line),
+                    what: format!("core.hookspath = {}", without_url_credentials(&value)),
+                    entry: None,
+                });
+                hooks_path = match reading {
+                    Reading::Sure => Some(value),
+                    Reading::OneOfSeveral => None,
+                };
             }
         }
         hooks_path
     }
 
     /// Takes in the submodule git directories under `modules`, `depth`
-    /// directories below `.git/modules`: their command keys and hooks, and
-    /// those of the submodules they hold in turn.
+    /// directories below `.git/modules`: what they say, and what the
+    /// submodules they hold in turn say. No link is followed, and at most
+    /// `MAX_MODULE_DIRECTORIES` directories are looked at.
     fn modules(&mut self, modules: &str, depth: usize) {
         let full = format!("{}/{modules}", self.plugin);
-        let listing = match fs::read_dir(self.root.join(&full)) {
-            Ok(listing) => listing,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
-            Err(_) => {
-                self.unchecked.push(format!("/{full}: could not be listed"));
+        match fs::symlink_metadata(self.root.join(&full)) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                self.unchecked.push(format!(
+                    "/{full}: not a directory, so it was not looked into"
+                ));
                 return;
             }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+            Err(error) => {
+                self.unchecked
+                    .push(format!("/{full}: could not be read ({error})"));
+                return;
+            }
+        }
+        self.visited += 1;
+        if self.visited > MAX_MODULE_DIRECTORIES {
+            if self.visited == MAX_MODULE_DIRECTORIES + 1 {
+                self.unchecked.push(format!(
+                    "/{}/.git/modules: more than {MAX_MODULE_DIRECTORIES} directories; the rest were not looked at",
+                    self.plugin
+                ));
+            }
+            return;
+        }
+        let Ok(listing) = fs::read_dir(self.root.join(&full)) else {
+            self.unchecked.push(format!("/{full}: could not be listed"));
+            return;
         };
         for entry in listing {
             let Ok(entry) = entry else {
@@ -336,10 +539,21 @@ impl Gits<'_> {
                 self.unchecked.push(collect::not_utf8(&shown));
                 continue;
             };
-            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                continue;
-            }
             let git = format!("{modules}/{name}");
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => {}
+                Ok(kind) if kind.is_symlink() => {
+                    self.unchecked.push(format!(
+                        "/{}/{git}: a link, which was not followed",
+                        self.plugin
+                    ));
+                    continue;
+                }
+                Ok(_) | Err(_) => {
+                    self.unknown(&git);
+                    continue;
+                }
+            }
             if depth + 1 >= MAX_DEPTH {
                 self.unchecked.push(format!(
                     "/{}/{git}: deeper than submodules are looked into",
@@ -368,14 +582,7 @@ impl Gits<'_> {
         }
         // A submodule's hooks path is relative to its own working tree,
         // which is not looked for: the key is in `runs`, as a finding.
-        self.settings(git, text.as_deref());
-        let found = hooks(
-            self.root,
-            self.plugin,
-            &format!("{git}/hooks"),
-            self.unchecked,
-        );
-        self.hooks.extend(found);
+        self.git_directory(git, text.as_deref());
         self.modules(&format!("{git}/modules"), depth);
     }
 }
@@ -391,11 +598,21 @@ fn text(root: &Path, path: &str, limit: u64) -> Option<String> {
     }
 }
 
-/// `remote.origin.url` of a git configuration: the first, which is where
-/// git fetches from.
-pub(super) fn origin(config: &str) -> Option<String> {
+/// Where a git configuration says to fetch from: the first
+/// `remote.origin.url`, which is where git fetches from. Unread where any
+/// reading of it is one of several (a continued line): which one git
+/// takes depends on quoting rules this does not repeat.
+pub(super) fn origin(config: &str) -> Remote {
     let urls = git_state::values(config, "remote", Some("origin"), "url");
-    urls.into_iter().next().map(|(_, url)| url)
+    if urls
+        .iter()
+        .any(|(_, _, reading)| *reading == Reading::OneOfSeveral)
+    {
+        return Remote::Unread;
+    }
+    urls.first().map_or(Remote::Unnamed, |(_, url, _)| {
+        Remote::Url(without_userinfo(url))
+    })
 }
 
 /// The commit the git directory `directory` has checked out: `HEAD` itself
@@ -445,6 +662,12 @@ fn hooks(
     unchecked: &mut Vec<String>,
 ) -> Vec<(String, Entry)> {
     let path = format!("{plugin}/{hooks}");
+    if fs::symlink_metadata(root.join(&path)).is_ok_and(|metadata| !metadata.is_dir()) {
+        unchecked.push(format!(
+            "/{path}: not a directory (a link is not followed), so the hooks in it were not checked"
+        ));
+        return Vec::new();
+    }
     let listing = match fs::read_dir(root.join(&path)) {
         Ok(listing) => listing,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Vec::new(),
