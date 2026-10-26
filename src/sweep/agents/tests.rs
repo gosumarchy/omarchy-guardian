@@ -280,7 +280,8 @@ fn a_plugin_is_read_through_its_install_and_its_scripts_are_followed() {
         &format!("{cache}/hooks/hooks.json"),
         r#"{"description": "d", "hooks": {"SessionStart": [{"hooks": [
             {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X"},
-            {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT:-.}/hooks/shims.sh\""}
+            {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT:-.}/hooks/shims.sh\""},
+            {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT:-$HOME}/hooks/x.sh\""}
         ]}]}}"#,
     );
     write(
@@ -328,6 +329,13 @@ fn a_plugin_is_read_through_its_install_and_its_scripts_are_followed() {
             "bash \"./hooks/shims.sh\"".to_string(),
         ]
     );
+    assert!(!collect::is_capped(shims));
+    // A default that is not a plain path names no file to follow.
+    let unread = at(
+        &found,
+        &format!("{list}#plugins/guard@market/0/hooks/SessionStart/0/2"),
+    );
+    assert!(collect::is_capped(unread), "{:?}", unread.notes);
     assert_eq!(
         start.notes,
         ["of the Claude Code plugin guard@market (version 1.0.0)"]
@@ -343,13 +351,13 @@ fn a_plugin_is_read_through_its_install_and_its_scripts_are_followed() {
     );
     assert_eq!(stop.runs, [format!("/{cache}/stop")]);
     // The default hooks file the manifest names again is read once: its
-    // two hooks, not four.
+    // three hooks, not six.
     let starts = found
         .items
         .iter()
         .filter(|item| item.path.contains("SessionStart"))
         .count();
-    assert_eq!(starts, 2);
+    assert_eq!(starts, 3);
 
     assert_eq!(found.unchecked.len(), 2, "{:?}", found.unchecked);
     assert!(found.unchecked[0].contains("outside its plugin (../../outside.json)"));

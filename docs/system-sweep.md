@@ -668,7 +668,8 @@ reviewed as a program, and what it starts after it. In a plugin's commands
 is reviewed as written, since it may unset or change the variable first. A form
 whose default is a plain path (`${CLAUDE_PLUGIN_ROOT:-.}`) is followed both with
 the plugin's directory and with the default. Any other default (`$(…)`, another
-variable) is only reviewed as written. A `file://` plugin of OpenCode is followed to its file.
+variable) is reviewed as written, and the item says that what it runs was not
+all followed. A `file://` plugin of OpenCode is followed to its file.
 
 What is a finding:
 

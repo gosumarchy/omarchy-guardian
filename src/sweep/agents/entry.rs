@@ -7,7 +7,7 @@ use super::{Found, MAX_ENTRIES};
 use crate::autorun::Category;
 use crate::rules::{RuleId, is_local_host};
 use crate::sha256::Sha256;
-use crate::sweep::collect::{self, Body, Item, Scope};
+use crate::sweep::collect::{self, Body, Item, NOT_ALL_FOLLOWED, Scope};
 use crate::sweep::tier::Tier;
 use crate::sweep::tools::LOADING_VARIABLES;
 
@@ -224,6 +224,17 @@ fn item(scope: &Scope<'_>, source: &Source<'_>, entry: Entry) -> Item {
             variables.join(" ")
         )
     };
+    let mut notes: Vec<String> = source.note.iter().cloned().collect();
+    // A form `plugin_root_readings` leaves as written names no file, so
+    // the script it runs is not read; the sweep says so.
+    if runs
+        .iter()
+        .any(|run| run.contains(&format!("${{{PLUGIN_ROOT}")))
+    {
+        notes.push(format!(
+            "{NOT_ALL_FOLLOWED}a plugin's directory named with a default that is not a plain path"
+        ));
+    }
     Item {
         file: None,
         origin: collect::origin(scope, &path),
@@ -233,7 +244,7 @@ fn item(scope: &Scope<'_>, source: &Source<'_>, entry: Entry) -> Item {
         body: Body::Text(text),
         runs,
         run_by: None,
-        notes: source.note.iter().cloned().collect(),
+        notes,
         alerts,
         path,
     }
@@ -441,10 +452,10 @@ pub(super) fn plugin_root_readings(line: &str, root: Option<&str>) -> Vec<String
 enum Reading {
     /// Claude Code sets the variable for a plugin's commands.
     Set,
-    /// The line unset it first. The plain forms keep the directory: written
-    /// in empty, they would add a reading of every plugin command, naming a
-    /// script that is not there, and the text reviewed shows them as
-    /// written anyway.
+    /// The variable is unset, or empty for the `:` forms. The plain forms
+    /// keep the directory: written in empty, they would add a reading of
+    /// every plugin command, naming a script that is not there, and the
+    /// text reviewed shows them as written anyway.
     Unset,
 }
 
