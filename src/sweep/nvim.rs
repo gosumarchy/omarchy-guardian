@@ -33,7 +33,7 @@ mod record;
 
 pub(super) use record::{Files, Record, plan, settle};
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -120,6 +120,9 @@ pub(crate) struct Plugin {
     /// directory, with their hashes: what the record keeps, and what is
     /// reviewed, or reported, once it changes.
     code: BTreeMap<String, Digest>,
+    /// The paths among `code` that run unread: reported when they change,
+    /// never read or sent.
+    unread: BTreeSet<String>,
     /// The build steps its specs give.
     builds: Vec<Build>,
     /// What this sweep sends of it to the review (see `plan`).
@@ -137,6 +140,7 @@ impl Plugin {
             commit: None,
             locked: None,
             code: BTreeMap::new(),
+            unread: BTreeSet::new(),
             builds: Vec::new(),
             review,
         }
@@ -363,7 +367,7 @@ fn pins(json: &Json) -> Option<HashMap<String, String>> {
 fn item(checkout: Checkout, specs: &Specs, lock: &HashMap<String, String>) -> Item {
     let builds = specs.builds(&checkout.name);
     let alerts = alerts(&checkout, specs, &builds);
-    let (origin, commit, code) = match &checkout.shape {
+    let (origin, commit, (code, unread)) = match &checkout.shape {
         Shape::Tree { git, files } => (
             git.as_ref().and_then(|git| match &git.remote {
                 Remote::Url(url) => Some(url.clone()),
@@ -372,7 +376,7 @@ fn item(checkout: Checkout, specs: &Specs, lock: &HashMap<String, String>) -> It
             git.as_ref().and_then(|git| git.commit.clone()),
             code_files(files),
         ),
-        Shape::Link(_) => (None, None, BTreeMap::new()),
+        Shape::Link(_) => (None, None, (BTreeMap::new(), BTreeSet::new())),
     };
     let plugin = Plugin {
         locked: lock.get(&checkout.name).cloned(),
@@ -380,6 +384,7 @@ fn item(checkout: Checkout, specs: &Specs, lock: &HashMap<String, String>) -> It
         origin,
         commit,
         code,
+        unread,
         builds,
         review: Review::Unplanned,
     };
@@ -557,25 +562,42 @@ fn notes(checkout: &Checkout, plugin: &Plugin, specs: &Specs, unlocked: bool) ->
     notes
 }
 
-/// The code files among `files`, with their hashes.
-fn code_files(files: &[(String, Entry)]) -> BTreeMap<String, Digest> {
-    files
-        .iter()
-        .filter_map(|(path, entry)| match entry {
-            Entry::File(digest) if is_code(path) || runs_unread(path) => {
-                Some((path.clone(), *digest))
-            }
-            Entry::File(_) | Entry::Link(_) => None,
-        })
-        .collect()
+/// The code files and the files that run unread among `files`, with their
+/// hashes, and the paths of those that run unread.
+fn code_files(files: &[(String, Entry)]) -> (BTreeMap<String, Digest>, BTreeSet<String>) {
+    let mut code = BTreeMap::new();
+    let mut unread = BTreeSet::new();
+    for (path, entry) in files {
+        let Entry::File { sha256, mode } = entry else {
+            continue;
+        };
+        if runs_unread(path, *mode) {
+            unread.insert(path.clone());
+        } else if !is_code(path) {
+            continue;
+        }
+        code.insert(path.clone(), *sha256);
+    }
+    (code, unread)
 }
 
-/// Whether the file at `path` of a plugin is code Neovim runs that the
-/// review cannot read: a native library (a Lua C module, a fuzzy matcher
-/// built at install) or a file of a remote plugin (`rplugin/`, run by a
-/// Python or Node host). A change to one is reported, never sent.
-pub(super) fn runs_unread(path: &str) -> bool {
-    !is_code(path) && (read::has_extension(path, "so") || path.starts_with("rplugin/"))
+/// File name endings of scripts a plugin may run through another program:
+/// Python (`pythonx/`, `python3/`, remote plugins), Node and Deno, Perl and
+/// Ruby.
+const SCRIPT_EXTENSIONS: &[&str] = &["py", "js", "mjs", "cjs", "ts", "pl", "rb"];
+
+/// Whether the file at `path` of a plugin, with permission bits `mode`, is
+/// code that may run and that the review does not read: a native library
+/// (a Lua C module, a fuzzy matcher built at install), a file of a remote
+/// plugin (`rplugin/`), a script in another language, or any executable
+/// file (`bin/`). A change to one is reported, never sent.
+fn runs_unread(path: &str, mode: u32) -> bool {
+    !is_code(path)
+        && (mode & 0o111 != 0
+            || path.starts_with("rplugin/")
+            || std::iter::once("so")
+                .chain(SCRIPT_EXTENSIONS.iter().copied())
+                .any(|extension| read::has_extension(path, extension)))
 }
 
 /// File name endings of the code files reviewed: Lua, Vimscript, shell and
@@ -597,7 +619,7 @@ fn is_code(path: &str) -> bool {
 fn digest(checkout: &Checkout) -> Digest {
     let mut hasher = Sha256::new();
     let entry = |entry: &Entry| match entry {
-        Entry::File(digest) => format!("file\0{digest}"),
+        Entry::File { sha256, mode } => format!("file\0{sha256}\0{mode:o}"),
         Entry::Link(target) => format!("link\0{target}"),
     };
     match &checkout.shape {

@@ -701,7 +701,7 @@ fn only_new_or_changed_code_files_are_sent() {
 }
 
 #[test]
-fn a_changed_native_library_or_remote_plugin_is_reported_not_sent() {
+fn changed_code_that_runs_unread_is_reported_not_sent() {
     let temp = TempDir::new("nvim-unread-code");
     let root = temp.path();
     plugin(
@@ -712,9 +712,14 @@ fn a_changed_native_library_or_remote_plugin_is_reported_not_sent() {
             ("lua/p.lua", "same"),
             ("lua/fuzzy.so", "\x7fELF new"),
             ("rplugin/python3/p.py", "import os"),
+            ("pythonx/p.py", "import os"),
+            ("deno/p.ts", "Deno.run()"),
+            ("bin/tool", "#!/bin/sh"),
             ("doc/p.txt", "help"),
         ],
     );
+    let tool = root.join(LAZY).join("p/bin/tool");
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
     let before = record(
         "p",
         &[("lua/p.lua", "same"), ("lua/fuzzy.so", "\x7fELF old")],
@@ -724,7 +729,16 @@ fn a_changed_native_library_or_remote_plugin_is_reported_not_sent() {
         panic!("{:?}", plugin_of(&items[0]).review);
     };
     let paths: Vec<&str> = sent.iter().map(|file| file.path.as_str()).collect();
-    assert_eq!(paths, ["lua/fuzzy.so", "rplugin/python3/p.py"]);
+    assert_eq!(
+        paths,
+        [
+            "bin/tool",
+            "deno/p.ts",
+            "lua/fuzzy.so",
+            "pythonx/p.py",
+            "rplugin/python3/p.py"
+        ]
+    );
     assert!(
         sent.iter()
             .all(|file| file.sha256.is_none() && matches!(file.body, Body::Binary(_)))

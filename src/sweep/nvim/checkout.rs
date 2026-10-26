@@ -53,7 +53,11 @@ pub(super) enum Shape {
 /// An entry of a plugin's directory.
 #[derive(Debug)]
 pub(super) enum Entry {
-    File(Digest),
+    File {
+        sha256: Digest,
+        /// Permission bits including set-id bits.
+        mode: u32,
+    },
     Link(String),
 }
 
@@ -186,7 +190,9 @@ fn walk(root: &Path, path: &str, unchecked: &mut Vec<String>) -> Vec<(String, En
             } else {
                 let found = read::look(root, &format!("{path}/{relative}"));
                 match found {
-                    Found::File { sha256, .. } => entries.push((relative, Entry::File(sha256))),
+                    Found::File { sha256, mode, .. } => {
+                        entries.push((relative, Entry::File { sha256, mode }));
+                    }
                     Found::Link(target) => entries.push((relative, Entry::Link(target))),
                     Found::Other => {}
                     Found::Unreadable(reason) => {
@@ -380,8 +386,8 @@ fn hooks(
             continue;
         }
         match read::look(root, &format!("{path}/{name}")) {
-            Found::File { sha256, .. } => {
-                found.push((format!("{hooks}/{name}"), Entry::File(sha256)));
+            Found::File { sha256, mode, .. } => {
+                found.push((format!("{hooks}/{name}"), Entry::File { sha256, mode }));
             }
             Found::Link(target) => found.push((format!("{hooks}/{name}"), Entry::Link(target))),
             Found::Other => {}

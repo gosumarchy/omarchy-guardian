@@ -373,19 +373,19 @@ keeps each as a git checkout in `~/.local/share/nvim/lazy/<name>`
 Neovim runs that code at every start. The sweep lists each plugin as one item,
 under its directory, whose hash covers every file of it outside `.git`, the
 address it was cloned from, the commit it is at, its git hooks and the keys of
-its `.git/config` that run commands: a plugin that is updated, edited, moved
-to another address or given a hook is changed, shows in `--diff` and in the
-daily notification, and an allow covers it as a whole until it changes.
+its `.git/config` that run commands: a plugin that is updated, edited, moved to
+another address or given a hook is changed, shows in `--diff` and in the daily
+notification, and an allow covers it as a whole until it changes.
 
-What is read, all as files, without running git: the origin from
-`.git/config` (with any user and password taken out of the address), the
-commit from `.git/HEAD` and the refs (`packed-refs` too), the keys that run
-commands in `.git/config` and `.git/config.worktree`, the hooks in
-`.git/hooks` and in a `core.hooksPath` within the checkout, `lazy-lock.json` in `~/.config/nvim` (`$XDG_CONFIG_HOME/nvim`),
-and the plugin specs in the Lua files of your configuration and in those
-plugins ship where lazy.nvim reads them (`lua/<module>/plugins/`, as LazyVim
-does, and `lazy.lua`). Only table literals of a spec are read
-(`{ "owner/repo", name = …, url = …, build = … }`).
+What is read, all as files, without running git: the origin from `.git/config`
+(with any user and password taken out of the address), the commit from
+`.git/HEAD` and the refs (`packed-refs` too), the keys that run commands in
+`.git/config` and `.git/config.worktree`, the hooks in `.git/hooks` and in a
+`core.hooksPath` within the checkout, `lazy-lock.json` in `~/.config/nvim`
+(`$XDG_CONFIG_HOME/nvim`), and the plugin specs in the Lua files of your
+configuration and in those plugins ship where lazy.nvim reads them
+(`lua/<module>/plugins/`, as LazyVim does, and `lazy.lua`). Only table literals
+of a spec are read (`{ "owner/repo", name = …, url = …, build = … }`).
 
 What is a finding, on every sweep:
 
@@ -394,17 +394,19 @@ What is a finding, on every sweep:
   lazy.nvim fetch the plugin from (`owner/repo` is GitHub's, an address is
   taken as written; scheme, user, case and `.git` do not count). A plugin no
   spec names gets a note, not a finding: a spec built by code is not read;
-- `plugin-build`: a spec whose `build` is a shell command (`build = "make"`),
-  which lazy.nvim runs at install and update, and any git hook in the
-  checkout, which git runs when lazy.nvim updates it;
-- `git-config-command`: a key of the checkout's `.git/config` that runs a
-  command (`core.fsmonitor` and the like) on the git commands lazy.nvim runs.
+- `plugin-build`: a spec whose `build` is a literal shell command, or a list
+  holding one (`build = "make"`, `["build"] = ("make")`, `"a" .. "b"`), which
+  lazy.nvim runs at install and update, and any git hook in the checkout,
+  which git runs when lazy.nvim updates it;
+- `git-config-command`: a key of the checkout's `.git/config` or
+  `.git/config.worktree` that runs a command (`core.fsmonitor` and the like)
+  on the git commands lazy.nvim runs.
 
-A build step that is a Neovim command (`":TSUpdate"`), a Lua function or a
-Lua expression that picks a command (`vim.g.x and "cargo build"`) is noted on
-the item, not a finding, and so is a top-level `build.lua`, which lazy.nvim
-runs; a commit other than the one `lazy-lock.json` pins, and a plugin it does
-not name, are noted too.
+A build step that is a Neovim command (`":TSUpdate"`), a Lua function or a Lua
+expression that picks a command (`vim.g.x and "cargo build"`) is noted on the
+item, not a finding, and so is a top-level `build.lua`, which lazy.nvim runs; a
+commit other than the one `lazy-lock.json` pins, and a plugin it does not name,
+are noted too.
 
 What goes to the review. The first sweep that finds plugins and no record of
 them takes them as they are: their files are hashed and recorded, and none is
@@ -414,25 +416,27 @@ sweep costs no AI call for plugins. After it, the Lua, Vimscript, shell and
 build files (`Makefile`, `*.rockspec`) of a plugin that are new or changed
 since the record go through the local rules and the AI review like any other
 text the sweep reviews, with what Guardian established about the plugin
-(origin, commit, build step); a plugin new since the record sends all of
-them. So a later sweep costs one review's share per plugin that changed, and
-none when nothing did. A file whose path marks it as holding secrets is read
-by the local rules only and raises `kept-from-review`. At most 1,500 files or
-4 MiB of one plugin are sent in one sweep; past that the sweep is incomplete
-and says so: read the plugin yourself and allow it. A native library (`*.so`)
-or a file of a remote plugin (`rplugin/`) that is new or changed since the
-record is code Neovim runs that the review cannot read: the sweep is
-incomplete and names it, until you check the plugin and allow it. A plugin
-you allowed is not reviewed again until it changes.
+(origin, commit, build step); a plugin new since the record sends all of them.
+So a later sweep costs one review's share per plugin that changed, and none
+when nothing did. A file whose path marks it as holding secrets is read by the
+local rules only and raises `kept-from-review`. At most 1,500 files or 4 MiB of
+one plugin are sent in one sweep; past that the sweep is incomplete and says
+so: read the plugin yourself and allow it. Code that may run but that the
+review does not read, if new or changed since the record, makes the sweep
+incomplete and is named, until you check the plugin and allow it: a native
+library (`*.so`), a file of a remote plugin (`rplugin/`), a script in another
+language (`*.py`, `*.js`, `*.mjs`, `*.cjs`, `*.ts`, `*.pl`, `*.rb`: Python
+under `pythonx/` or `python3/`, Node and Deno scripts), and any executable file
+(`bin/`). A plugin you allowed is not reviewed again until it changes.
 
 The record (`nvim-plugins.json` in the sweep's directory of the review store)
-holds each plugin's code files and their hashes. A plugin's entry moves on
-only when its changed files were reviewed without a finding and every review
-of them finished; otherwise they are sent again at the next sweep. A record
-that holds no plugin still counts: a plugin installed after the first sweep is
-new and reviewed, never taken as it is. It is your own file: one that is gone while the last sweep listed plugins, or that
-cannot be read, makes that sweep incomplete, and the plugins are taken as
-they are.
+holds each plugin's code files and their hashes. A plugin's entry moves on only
+when its changed files were reviewed without a finding and every review of them
+finished; otherwise they are sent again at the next sweep. A record that holds
+no plugin still counts: a plugin installed after the first sweep is new and
+reviewed, never taken as it is. It is your own file: one that is gone while the
+last sweep listed plugins, or that cannot be read, makes that sweep incomplete,
+and the plugins are taken as they are.
 
 After the upgrade that adds plugins to the sweep, each plugin shows once as
 new, in `--diff` and in the daily notification; that sweep takes them as they
@@ -440,9 +444,10 @@ are.
 
 Not covered: plugins of other managers (packer, vim-plug, Neovim's own
 `pack/*/start` under your data directory), a lazy.nvim `root` other than the
-default, specs built by code, other files of a plugin (data, documentation), which
-count for whether it changed but are neither sent nor reported, and what lazy.nvim fetches when a plugin is
-installed or updated: the sweep sees a plugin once it is on disk.
+default, specs built by code, the other files of a plugin (data, documentation,
+anything not executable and not named above), which count for whether it
+changed but are neither sent nor reported, and what lazy.nvim fetches when a
+plugin is installed or updated: the sweep sees a plugin once it is on disk.
 
 ### Accounts, keys and trust anchors
 

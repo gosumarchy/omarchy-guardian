@@ -198,7 +198,7 @@ fn changes(
     let mut bytes = 0;
     let mut sent = Vec::new();
     for file in changed {
-        if super::runs_unread(file) {
+        if plugin.unread.contains(file.as_str()) {
             // Not read: the review cannot judge it. A binary body is what
             // the judge reports as code that runs unread, and no hash
             // keeps the record from moving on until the plugin is allowed.
