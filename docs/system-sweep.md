@@ -404,9 +404,11 @@ What is a finding, on every sweep:
 
 A build step that is a Neovim command (`":TSUpdate"`), a Lua function or a Lua
 expression that picks a command (`vim.g.x and "cargo build"`) is noted on the
-item, not a finding, and so is a top-level `build.lua`, which lazy.nvim runs; a
-commit other than the one `lazy-lock.json` pins, and a plugin it does not name,
-are noted too.
+item, not a finding, and so is a field of a spec whose key code computes
+(`[("build")] = …`), which may be a build step, and a top-level `build.lua`,
+which lazy.nvim runs; a commit other than the one `lazy-lock.json` pins, and a
+plugin it does not name, are noted too. Escapes in strings (`"\99url"`) are
+decoded as Lua decodes them.
 
 What goes to the review. The first sweep that finds plugins and no record of
 them takes them as they are: their files are hashed and recorded, and none is

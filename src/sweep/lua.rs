@@ -91,6 +91,9 @@ pub(super) enum Build {
     /// (`vim.g.x and "cargo build"` may give `cargo build`): only running
     /// the Lua tells which of them, if any, runs.
     Lua(Vec<String>),
+    /// The value of a field whose key code computes (`[("build")] = …`),
+    /// with the strings it may give: it may be a build step.
+    Computed(Vec<String>),
 }
 
 /// The plugin specs in `text`: every table literal whose first entry is a
@@ -102,7 +105,9 @@ pub(super) enum Build {
 /// A key (`build = …` or `["build"] = …`) counts only as a field of the
 /// innermost table: right after its `{` or a separator, and outside any
 /// function body or block within it, so `opts.name = "x"` or
-/// `local build = "make"` in a `config` function sets nothing.
+/// `local build = "make"` in a `config` function sets nothing. A key that
+/// code computes (`[("build")] = …`) may be any of them, so its value is
+/// taken as a build step that is not read (`Build::Computed`).
 pub(super) fn plugin_specs(text: &str) -> Vec<Spec> {
     let tokens = tokenize(text);
     let mut specs = Vec::new();
@@ -115,10 +120,12 @@ pub(super) fn plugin_specs(text: &str) -> Vec<Spec> {
                 let Some(table) = tables.last_mut() else {
                     continue;
                 };
-                if table.blocks == 0
-                    && let Some((key, value)) = field(&tokens, index)
-                {
-                    table.set(key, value);
+                if table.blocks == 0 {
+                    match field(&tokens, index) {
+                        Some((Key::Named(key), value)) => table.set(key, value),
+                        Some((Key::Computed, value)) => table.builds.push(computed(value)),
+                        None => {}
+                    }
                 }
                 table.blocks = table.blocks.saturating_add_signed(nesting(token));
             }
@@ -127,25 +134,62 @@ pub(super) fn plugin_specs(text: &str) -> Vec<Spec> {
     specs
 }
 
+/// The key of a table field.
+#[derive(Debug)]
+enum Key<'a> {
+    /// `key = …` or `["key"] = …`.
+    Named(&'a str),
+    /// `[<code>] = …`: what key it is, only running the code tells.
+    Computed,
+}
+
 /// The key of the table field that starts at `tokens[index]`, and the
-/// tokens from its value on: `key = …` or `["key"] = …`, right after a `{`
-/// or a separator.
-fn field(tokens: &[Token], index: usize) -> Option<(&str, &[Token])> {
+/// tokens from its value on, right after a `{` or a separator.
+fn field(tokens: &[Token], index: usize) -> Option<(Key<'_>, &[Token])> {
     let before = tokens.get(index.checked_sub(1)?)?;
     if !matches!(before, Token::TableOpen | Token::Comma) {
         return None;
     }
     match &tokens[index..] {
-        [Token::Name(key), Token::Assign, ..] => Some((key, &tokens[index + 2..])),
+        [Token::Name(key), Token::Assign, ..] => Some((Key::Named(key), &tokens[index + 2..])),
         [
             Token::IndexOpen,
             Token::String(key),
             Token::IndexClose,
             Token::Assign,
             ..,
-        ] => Some((key, &tokens[index + 4..])),
+        ] => Some((Key::Named(key), &tokens[index + 4..])),
+        [Token::IndexOpen, ..] => Some((Key::Computed, bracketed_value(tokens, index)?)),
         _ => None,
     }
+}
+
+/// The tokens from the value on of the `[<key>] = …` field whose `[` is
+/// `tokens[index]`; `None` when no `=` follows its `]`.
+fn bracketed_value(tokens: &[Token], index: usize) -> Option<&[Token]> {
+    let mut depth = 0_usize;
+    for (at, token) in tokens.iter().enumerate().skip(index) {
+        match token {
+            Token::IndexOpen => depth += 1,
+            Token::IndexClose if depth == 1 => {
+                return (tokens.get(at + 1) == Some(&Token::Assign)).then(|| &tokens[at + 2..]);
+            }
+            Token::IndexClose => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The value starting at `value` of a field whose key code computes, as a
+/// build step that is not read, with the strings it may run.
+fn computed(value: &[Token]) -> Build {
+    let strings = match build(value) {
+        Some(Build::Command(text) | Build::Shell(text)) => vec![text],
+        Some(Build::Lua(strings) | Build::Computed(strings)) => strings,
+        None => Vec::new(),
+    };
+    Build::Computed(strings)
 }
 
 /// How `token` changes how deep in blocks and brackets the code is, table
@@ -203,7 +247,8 @@ impl Table {
         match key {
             "url" => self.url = text,
             "name" => self.name = text,
-            "build" => self.builds = builds(value),
+            // Every build key counts: a second one may be what runs.
+            "build" => self.builds.extend(builds(value)),
             _ => {}
         }
     }
@@ -250,7 +295,13 @@ fn builds(value: &[Token]) -> Vec<Build> {
     let mut entry = true;
     for (index, token) in value.iter().enumerate().skip(1) {
         if entry && depth == 0 && *token != Token::TableClose {
-            builds.extend(build(&value[index..]));
+            // `[2] = "x"` is a list entry too, whatever its index says.
+            let entry = match field(value, index) {
+                Some((Key::Named(_), _)) => None,
+                Some((Key::Computed, value)) => Some(computed(value)),
+                None => build(&value[index..]),
+            };
+            builds.extend(entry);
         }
         entry = false;
         match token {
@@ -377,23 +428,9 @@ fn tokenize(text: &str) -> Vec<Token> {
             continue;
         }
         if character == '"' || character == '\'' {
-            let mut value = String::new();
-            index += 1;
-            while index < chars.len() && chars[index] != character && chars[index] != '\n' {
-                if chars[index] == '\\' && index + 1 < chars.len() {
-                    index += 1;
-                    value.push(match chars[index] {
-                        'n' => '\n',
-                        't' => '\t',
-                        other => other,
-                    });
-                } else {
-                    value.push(chars[index]);
-                }
-                index += 1;
-            }
+            let (value, end) = short_string(&chars, index);
             tokens.push(Token::String(value));
-            index += 1;
+            index = end;
             continue;
         }
         if character.is_alphabetic() || character == '_' {
@@ -434,6 +471,72 @@ fn tokenize(text: &str) -> Vec<Token> {
         index += 1;
     }
     tokens
+}
+
+/// The quoted string starting at `start` (its quote): its value, with
+/// escapes decoded as Lua decodes them, and the index after it.
+fn short_string(chars: &[char], start: usize) -> (String, usize) {
+    let quote = chars[start];
+    let mut value = String::new();
+    let mut index = start + 1;
+    while index < chars.len() && chars[index] != quote && chars[index] != '\n' {
+        if chars[index] == '\\' && index + 1 < chars.len() {
+            index = escape(chars, index + 1, &mut value);
+        } else {
+            value.push(chars[index]);
+            index += 1;
+        }
+    }
+    (value, index + 1)
+}
+
+/// Decodes the escape whose first character after the backslash is at
+/// `start` into `value`, and returns the index after it: `\ddd` (decimal),
+/// `\xXX`, `\u{XXX}`, `\z` (skips the blanks after it) and the one-letter
+/// ones.
+fn escape(chars: &[char], start: usize, value: &mut String) -> usize {
+    let digits = |from: usize, radix: u32, most: usize| {
+        let end = (from..chars.len().min(from + most))
+            .find(|&at| !chars[at].is_digit(radix))
+            .unwrap_or(chars.len().min(from + most));
+        let text: String = chars[from..end].iter().collect();
+        (u32::from_str_radix(&text, radix).ok(), end)
+    };
+    let (decoded, end) = match chars[start] {
+        'n' => (Some('\n'), start + 1),
+        't' => (Some('\t'), start + 1),
+        'r' => (Some('\r'), start + 1),
+        'a' => (Some('\u{7}'), start + 1),
+        'b' => (Some('\u{8}'), start + 1),
+        'f' => (Some('\u{c}'), start + 1),
+        'v' => (Some('\u{b}'), start + 1),
+        'z' => {
+            let end = (start + 1..chars.len())
+                .find(|&at| !chars[at].is_whitespace())
+                .unwrap_or(chars.len());
+            (None, end)
+        }
+        'x' => {
+            let (code, end) = digits(start + 1, 16, 2);
+            (code.and_then(char::from_u32), end)
+        }
+        'u' if chars.get(start + 1) == Some(&'{') => {
+            let (code, end) = digits(start + 2, 16, 8);
+            let end = if chars.get(end) == Some(&'}') {
+                end + 1
+            } else {
+                end
+            };
+            (code.and_then(char::from_u32), end)
+        }
+        digit if digit.is_ascii_digit() => {
+            let (code, end) = digits(start, 10, 3);
+            (code.and_then(char::from_u32), end)
+        }
+        other => (Some(other), start + 1),
+    };
+    value.extend(decoded);
+    end
 }
 
 /// A long bracket (`[[…]]`, `[==[…]==]`) starting at `start`: its content
@@ -614,6 +717,32 @@ return {
             builds(r#"{ "a/b", build = "make " .. target }"#),
             [Build::Lua(vec!["make ".into()])]
         );
+        // Escapes are decoded as Lua decodes them.
+        assert_eq!(builds(r#"{ "a/b", ["\98uild"] = "make" }"#), shell("make"));
+        assert_eq!(
+            builds(
+                r#"{ "a/b", build = "\99url\x20x|\z
+                sh\u{21}" }"#
+            ),
+            shell("curl x|sh!")
+        );
+        // A key code computes may be `build`: its value is kept, unread.
+        let computed = |text: &str| vec![Build::Computed(vec![text.into()])];
+        assert_eq!(
+            builds(r#"{ "a/b", [("build")] = "make" }"#),
+            computed("make")
+        );
+        assert_eq!(
+            builds(r#"{ "a/b", ["bu".."ild"] = "make" }"#),
+            computed("make")
+        );
+        assert_eq!(
+            builds(r#"{ "a/b", build = { "make", [2] = "curl|sh" } }"#),
+            [
+                Build::Shell("make".into()),
+                Build::Computed(vec!["curl|sh".into()])
+            ]
+        );
     }
 
     #[test]
@@ -623,6 +752,11 @@ return {
             "}}}{ \"a/b\"",
             "{ [[a/b",
             "{ \"a/b\" ,",
+            "{ \"a/b\", build = \"\\",
+            "{ \"a/b\", build = \"\\u{",
+            "{ \"a/b\", build = \"\\u{ffffffffff}\\x\\999\\z",
+            "{ \"a/b\", [[[\"build\"] = 1",
+            "{ \"a/b\", [",
         ] {
             drop(plugin_specs(text));
         }

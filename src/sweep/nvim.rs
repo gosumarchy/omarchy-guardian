@@ -396,7 +396,7 @@ fn item(checkout: Checkout, specs: &Specs, lock: &HashMap<String, String>) -> It
         .iter()
         .filter_map(|build| match build {
             Build::Shell(command) => Some(command.clone()),
-            Build::Command(_) | Build::Lua(_) => None,
+            Build::Command(_) | Build::Lua(_) | Build::Computed(_) => None,
         })
         .collect();
     Item {
@@ -553,6 +553,15 @@ fn notes(checkout: &Checkout, plugin: &Plugin, specs: &Specs, unlocked: bool) ->
                 "its spec's build step is Lua code that may run {}",
                 quoted(strings)
             )),
+            Build::Computed(strings) => {
+                let mut note = String::from(
+                    "its spec has a field whose key is computed by code, which was not read: it may be a build step",
+                );
+                if !strings.is_empty() {
+                    let _ = write!(note, " that runs {}", quoted(strings));
+                }
+                notes.push(note);
+            }
             Build::Shell(_) => {}
         }
     }
@@ -726,15 +735,30 @@ pub(super) fn fact(plugin: &Plugin, label: &str, news: News) -> String {
             Build::Lua(strings) => write!(
                 text,
                 " Its spec's build step is Lua code that may run {} when lazy.nvim installs or updates it.",
-                strings
-                    .iter()
-                    .map(|string| format!("{:?}", shown(string).as_ref()))
-                    .collect::<Vec<_>>()
-                    .join(" or ")
+                literals(strings)
+            ),
+            Build::Computed(strings) if strings.is_empty() => write!(
+                text,
+                " Its spec has a field whose key is computed by code: it may be a build step."
+            ),
+            Build::Computed(strings) => write!(
+                text,
+                " Its spec has a field whose key is computed by code: it may be a build step that runs {}.",
+                literals(strings)
             ),
         };
     }
     text
+}
+
+/// `strings` as the facts the AI reads say them: each as a string literal,
+/// joined by "or".
+fn literals(strings: &[String]) -> String {
+    strings
+        .iter()
+        .map(|string| format!("{:?}", shown(string).as_ref()))
+        .collect::<Vec<_>>()
+        .join(" or ")
 }
 
 #[cfg(test)]
