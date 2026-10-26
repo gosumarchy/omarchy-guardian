@@ -298,11 +298,7 @@ pub(super) fn collect(scope: &Scope<'_>) -> Collection {
     // and followed like any other (see `agents`).
     let agents = agents::collect(scope);
     collection.truncated.extend(agents.unchecked);
-    for item in agents.items {
-        if walk.seen.insert(item.path.clone()) {
-            walk.pending.push((0, item));
-        }
-    }
+    queue_entries(&mut walk, agents.items, &mut collection.truncated);
     let omarchy = omarchy_paths(scope.root);
     while let Some((reading, mut item)) = walk.pending.pop() {
         // A script that was read again since this reading of it was
@@ -365,6 +361,23 @@ pub(super) fn collect(scope: &Scope<'_>) -> Collection {
         .sort_by(|left, right| left.path.cmp(&right.path));
     add_facts(scope, &mut collection);
     collection
+}
+
+/// Queues `items`, the entries of agents' configuration, to be followed.
+/// One whose name is an item already is said in `truncated`: an entry of a
+/// configuration file has no other item, so it would go unchecked. A
+/// plugin file another collector holds is reviewed there.
+fn queue_entries(walk: &mut Walk, items: Vec<Item>, truncated: &mut Vec<String>) {
+    for item in items {
+        if walk.seen.insert(item.path.clone()) {
+            walk.pending.push((0, item));
+        } else if item.path.contains('#') {
+            truncated.push(format!(
+                "/{}: two entries share this name; not checked",
+                item.path.escape_debug()
+            ));
+        }
+    }
 }
 
 /// What following the collected items has reached so far.

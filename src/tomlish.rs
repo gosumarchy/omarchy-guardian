@@ -157,29 +157,30 @@ pub(crate) fn is_empty_container(raw: &str) -> bool {
     })
 }
 
-/// The keys of an inline table value (`{ A = "x", "B.c" = 1 }` gives `A`
-/// and `B.c`), without reading their values; `None` when the value is no
-/// inline table or cannot be delimited. A dotted key is given joined by
-/// `.` as it was written.
-pub(crate) fn inline_table_keys(raw: &str) -> Option<Vec<String>> {
+/// The entries of an inline table value (`{ A = "x", b.c = [1] }` gives
+/// `A` with `"x"` and `b`, `c` with `[1]`), each value as its source text;
+/// `None` when the value is no inline table or cannot be delimited. A date
+/// and time written with a blank in it is not read.
+pub(crate) fn inline_table_entries(raw: &str) -> Option<Vec<(Vec<String>, String)>> {
     let inner = raw.strip_prefix('{')?.strip_suffix('}')?;
     let mut reader = Reader {
         bytes: inner.as_bytes(),
         position: 0,
         counted: Cell::new((0, 1)),
     };
-    let mut keys = Vec::new();
+    let mut entries = Vec::new();
     loop {
         reader.skip_blank_lines();
         if reader.peek().is_none() {
-            return Some(keys);
+            return Some(entries);
         }
-        keys.push(reader.key_path().ok()?.join("."));
+        let key = reader.key_path().ok()?;
         reader.expect(b'=', "expected '=' after key").ok()?;
-        reader.skip_inline_value().ok()?;
+        let value = reader.inline_value().ok()?;
+        entries.push((key, value));
         reader.skip_blank_lines();
         match reader.peek() {
-            None => return Some(keys),
+            None => return Some(entries),
             Some(b',') => reader.position += 1,
             Some(_) => return None,
         }
@@ -505,10 +506,10 @@ impl Reader<'_> {
         Ok(value.to_string())
     }
 
-    /// Moves past one value inside an inline table: up to the blank, `,` or
-    /// end that follows it outside strings, arrays and nested tables. A
-    /// date and time written with a blank in it is not read.
-    fn skip_inline_value(&mut self) -> Result<(), ParseError> {
+    /// One value inside an inline table, as its source text: up to the
+    /// blank, `,` or end that follows it outside strings, arrays and nested
+    /// tables.
+    fn inline_value(&mut self) -> Result<String, ParseError> {
         self.skip_spaces();
         let start = self.position;
         let mut depth = 0_usize;
@@ -531,10 +532,12 @@ impl Reader<'_> {
                 Some(_) => self.position += 1,
             }
         }
-        if self.bytes[start..self.position].trim_ascii().is_empty() {
+        let value = String::from_utf8(self.bytes[start..self.position].to_vec())
+            .map_err(|_| self.error("invalid UTF-8"))?;
+        if value.is_empty() {
             return Err(self.error("missing value"));
         }
-        Ok(())
+        Ok(value)
     }
 
     fn copy_string(&mut self, output: &mut Vec<u8>) -> Result<(), ParseError> {
@@ -581,7 +584,7 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        Value, array_table_items, entries, inline_table_keys, is_empty_container, string_field,
+        Value, array_table_items, entries, inline_table_entries, is_empty_container, string_field,
         string_value, typed_value,
     };
     use crate::config::file::{PartialConfig, PartialPolicy, parse};
@@ -1157,15 +1160,16 @@ multi "line" ]
     }
 
     #[test]
-    fn inline_table_keys_are_read_without_their_values() {
+    fn inline_table_entries_keep_each_value_as_written() {
         let document = r#"env = { TOKEN = "a, b = c", "DOTTED.NAME" = 'x', nested = { y = [1, "]"] }, a.b = 2 }"#;
         let parsed = entries(document).unwrap();
-        assert_eq!(
-            inline_table_keys(&parsed[0].value).unwrap(),
-            ["TOKEN", "DOTTED.NAME", "nested", "a.b"]
-        );
-        assert_eq!(inline_table_keys("{}").unwrap(), Vec::<String>::new());
-        assert_eq!(inline_table_keys("{ A = 1, }").unwrap(), ["A"]);
+        let found = inline_table_entries(&parsed[0].value).unwrap();
+        let keys: Vec<String> = found.iter().map(|(key, _)| key.join("|")).collect();
+        assert_eq!(keys, ["TOKEN", "DOTTED.NAME", "nested", "a|b"]);
+        let values: Vec<&str> = found.iter().map(|(_, value)| value.as_str()).collect();
+        assert_eq!(values, [r#""a, b = c""#, "'x'", r#"{ y = [1, "]"] }"#, "2"]);
+        assert_eq!(inline_table_entries("{}").unwrap(), Vec::new());
+        assert_eq!(inline_table_entries("{ A = 1, }").unwrap().len(), 1);
         for odd in [
             "[1]",
             "\"x\"",
@@ -1175,7 +1179,7 @@ multi "line" ]
             "{ = 1 }",
             "{ A = \"x }",
         ] {
-            assert_eq!(inline_table_keys(odd), None, "{odd}");
+            assert_eq!(inline_table_entries(odd), None, "{odd}");
         }
     }
 }

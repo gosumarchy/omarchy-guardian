@@ -1,39 +1,52 @@
 //! What AI coding agents start on their own: Claude Code's hooks, status
-//! line, helpers, MCP servers and plugins, OpenCode's MCP servers and
-//! plugins, and Codex's MCP servers and `notify` program. An agent runs
-//! these on every tool call, at every start or on every refresh of its
-//! status line, and a theme, a plugin or a program run once can add one.
+//! line, helpers, environment, MCP servers and plugins, OpenCode's MCP
+//! servers and plugins, and Codex's MCP servers and `notify` program. An
+//! agent runs these on every tool call, at every start or on every refresh
+//! of its status line, and a theme, a plugin or a program run once can add
+//! one.
 //!
 //! The files these live in hold far more than what runs: tokens, account
 //! data, the paths of every project opened and its history. None of them
 //! becomes an item, and nothing of them is sent anywhere. Each entry that
 //! starts something becomes an item of its own instead, named by its file
 //! and its key in it (`~/.claude/settings.json#hooks/PreToolUse/0/0`),
-//! whose text is only what it starts: a command line, the names of the
-//! variables it is started with (never their values), an npm package, or
-//! for a remote server the scheme and host of its address. That text is
-//! what the review sees, and its digest what tells a changed entry from an
+//! whose text is only what it starts (see `entry::item`). That text is what
+//! the review sees, and its digest what tells a changed entry from an
 //! unchanged one. The collector follows each command like any other, so a
 //! script a hook names is read and reviewed as a program.
 //!
-//! What is there and cannot be read (a link, a file too large, text that is
-//! not JSON or TOML) is said as not checked, never passed over.
+//! # Invariants
+//!
+//! - **Names are collision-free.** Every part of a key the configuration
+//!   chose is one `key_part`, which never holds a `/`, and every kind of
+//!   entry has its own fixed layout of parts, so two entries share a name
+//!   only where one file is read twice. The collector still reports a name
+//!   it already holds as not checked rather than drop it.
+//! - **Nothing of a project's path reaches an item's text or name.** A
+//!   project is named by a digest keyed with a secret kept in Guardian's
+//!   private state, or by its position where there is no key.
+//! - **Fail closed.** A file, field or variable that is there and cannot be
+//!   read is said as not checked, never passed over. Only an entry with
+//!   neither a program nor an address, which starts nothing, is silent.
 
 mod claude;
 mod codex;
+mod entry;
 mod opencode;
+mod redact;
 
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Read as _};
+use std::path::Path;
 
-use super::collect::{self, Body, Item, Scope};
-use super::tier::Tier;
-use crate::autorun::Category;
-use crate::files::read_small_file;
+use super::collect::{Item, Scope};
+use super::state;
+use crate::engine::store::Store;
+use crate::files::{self, AtomicWrite, read_small_file};
 use crate::json::Json;
-use crate::rules::RuleId;
-use crate::sha256::Sha256;
+use crate::sha256::{self, Digest, Sha256};
+use entry::{Entries, Entry, Launch, Source, add, command_line};
 
 /// The largest configuration file read: `~/.claude.json` grows with every
 /// project opened. Arbitrary, far above the sizes seen (under 1 MiB).
@@ -43,26 +56,9 @@ const MAX_CONFIG: u64 = 16 * 1024 * 1024;
 /// any real configuration; past it the rest is said as not checked.
 const MAX_ENTRIES: usize = 500;
 
-/// What stands where the value of a flag or variable named for a secret
-/// was taken out of a server's arguments.
-const VALUE_NOT_READ: &str = "<value-not-read>";
-
-/// Words that mark a flag or variable as holding a secret
-/// (`--api-key`, `GITHUB_TOKEN=`).
-const SECRET_WORDS: &[&str] = &[
-    "token",
-    "secret",
-    "password",
-    "passwd",
-    "pass",
-    "key",
-    "apikey",
-    "auth",
-    "credential",
-    "credentials",
-    "pat",
-    "bearer",
-];
+/// The file in the sweep's private state directory that holds the key a
+/// project's path is named by.
+const PROJECT_KEY: &str = "agent-project-key";
 
 /// What the agents' configuration gave.
 #[derive(Debug, Default)]
@@ -83,107 +79,49 @@ impl Found {
     }
 }
 
-/// What one entry of an agent's configuration starts.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Launch {
-    /// A command line, as a shell is given it.
-    Command(String),
-    /// A server or web hook reached over the network, by the scheme and
-    /// host (with its port) of its address: the rest of an address may
-    /// carry a token.
-    Remote { scheme: String, host: String },
-    /// A package the agent installs from npm and loads (`opencode-x@1.2`).
-    Package(String),
-}
+/// The key a project's path is named by: 32 random bytes kept in the
+/// sweep's private state directory, so that the name of an item tells
+/// nobody without the key which project it is, and stays the same from one
+/// sweep to the next.
+#[derive(Debug, PartialEq, Eq)]
+struct ProjectKey(Digest);
 
-/// One entry that starts something.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Entry {
-    /// Where in its file it is (`hooks/PreToolUse/0/0`).
-    key: String,
-    launch: Launch,
-    /// The names of the variables it is started with.
-    variables: Vec<String>,
-}
-
-impl Entry {
-    fn command(key: impl Into<String>, line: &str) -> Self {
-        Self {
-            key: key.into(),
-            launch: Launch::Command(line.to_string()),
-            variables: Vec::new(),
-        }
+impl ProjectKey {
+    /// The name of the project at `path`: its keyed digest in hex.
+    fn name(&self, path: &str) -> String {
+        sha256::hmac(&self.0, path.as_bytes()).to_string()
     }
-}
 
-/// An MCP server as the agents describe one: a program with arguments and
-/// variables, or an address.
-#[derive(Debug, Default)]
-struct Server {
-    command: Option<String>,
-    args: Vec<String>,
-    url: Option<String>,
-    variables: Vec<String>,
-}
-
-impl Server {
-    /// A server of Claude Code (`command`, `args`, `env`, `url`) or OpenCode
-    /// (`command` as an array, `environment`, `url`).
-    fn from_json(server: &Json) -> Self {
-        let mut words: Vec<String> = match server.get("command") {
-            Some(Json::String(command)) => vec![command.clone()],
-            Some(command) => strings(command),
-            None => Vec::new(),
+    /// The key in the sweep's state directory, made there if there is none.
+    /// `None` where there is no such directory or it cannot be written: a
+    /// project is then named by its position. Two sweeps that each make a
+    /// key write their own and the last one stays; the names the other gave
+    /// show as new once.
+    fn kept() -> Option<Self> {
+        let directory = state::directory(&Store::default_root()?).ok()?;
+        let path = directory.join(PROJECT_KEY);
+        if let Some(key) = read_small_file(&path, 128)
+            .and_then(|text| Digest::from_hex(text.trim()))
+            .map(Self)
+        {
+            return Some(key);
+        }
+        let random = Path::new("/dev/urandom");
+        let mut bytes = [0_u8; 32];
+        fs::File::open(random)
+            .and_then(|mut file| file.read_exact(&mut bytes))
+            .ok()?;
+        // The digest of random bytes is as random, and has a hex form.
+        let key = Sha256::digest(&bytes);
+        let options = AtomicWrite {
+            temporary: directory.join(format!(".{PROJECT_KEY}.new")),
+            mode: 0o600,
+            exact_mode: true,
+            owner: None,
+            sync: true,
         };
-        words.extend(server.get("args").map(strings).unwrap_or_default());
-        let mut words = words.into_iter();
-        Self {
-            command: words.next(),
-            args: words.collect(),
-            url: server.get("url").and_then(Json::as_str).map(str::to_string),
-            variables: ["env", "environment"]
-                .iter()
-                .filter_map(|key| server.get(key).and_then(Json::as_object))
-                .flatten()
-                .map(|(name, _)| name.clone())
-                .collect(),
-        }
-    }
-
-    /// The entry at `key`; `None` for a server with neither a program nor
-    /// an address, which starts nothing.
-    fn into_entry(self, key: String) -> Option<Entry> {
-        let launch = match (self.command, self.url) {
-            (Some(command), _) => Launch::Command(command_line(&command, &self.args)),
-            (None, Some(url)) => remote(&url),
-            (None, None) => return None,
-        };
-        Some(Entry {
-            key,
-            launch,
-            variables: self.variables,
-        })
-    }
-}
-
-/// Where the entries of one file were found, for their items.
-struct Source<'a> {
-    /// The configuration file, relative to the root.
-    file: &'a str,
-    /// What `${CLAUDE_PLUGIN_ROOT}` stands for in a plugin's entries,
-    /// relative to the root.
-    plugin_root: Option<&'a str>,
-    /// What is said of each item (whose plugin or project it is).
-    note: Option<String>,
-}
-
-impl<'a> Source<'a> {
-    fn of(file: &'a str) -> Self {
-        Self {
-            file,
-            plugin_root: None,
-            note: None,
-        }
+        files::write_atomic(&path, key.to_string().as_bytes(), &options).ok()?;
+        Some(Self(key))
     }
 }
 
@@ -193,17 +131,32 @@ struct Dirs {
     claude: String,
     claude_json: String,
     opencode: String,
-    /// The file `OPENCODE_CONFIG` names, read besides the usual one.
+    /// The directory `OPENCODE_CONFIG_DIR` names, read besides the usual one.
+    opencode_extra: Option<String>,
+    /// The file `OPENCODE_CONFIG` names, read besides the usual ones.
     opencode_config: Option<String>,
     codex: String,
+    project_key: Option<ProjectKey>,
 }
+
+/// The environment variables that move an agent's directory.
+const DIRECTORY_VARIABLES: &[&str] = &[
+    "CLAUDE_CONFIG_DIR",
+    "XDG_CONFIG_HOME",
+    "OPENCODE_CONFIG_DIR",
+    "OPENCODE_CONFIG",
+    "CODEX_HOME",
+];
 
 impl Dirs {
     /// The directories of the home at `home`, where `variable` gives the
-    /// value of an environment variable, relative to the root, that moves
-    /// one: `CLAUDE_CONFIG_DIR` (which holds `.claude.json` too),
-    /// `XDG_CONFIG_HOME`, `OPENCODE_CONFIG` and `CODEX_HOME`.
-    fn new(home: &str, variable: &dyn Fn(&str) -> Option<String>) -> Self {
+    /// value, relative to the root, of one of `DIRECTORY_VARIABLES` that is
+    /// set: `CLAUDE_CONFIG_DIR` holds `.claude.json` too.
+    fn new(
+        home: &str,
+        variable: &dyn Fn(&str) -> Option<String>,
+        project_key: Option<ProjectKey>,
+    ) -> Self {
         let claude = variable("CLAUDE_CONFIG_DIR");
         Self {
             claude_json: claude.as_ref().map_or_else(
@@ -215,24 +168,53 @@ impl Dirs {
                 || format!("{home}/.config/opencode"),
                 |config| format!("{config}/opencode"),
             ),
+            opencode_extra: variable("OPENCODE_CONFIG_DIR"),
             opencode_config: variable("OPENCODE_CONFIG"),
             codex: variable("CODEX_HOME").unwrap_or_else(|| format!("{home}/.codex")),
+            project_key,
         }
     }
 
-    /// The directories of `scope`'s home. The environment says where they
-    /// are only when it is that home's own (its `HOME` is that home): the
-    /// root collector, and a sweep of another tree, take the defaults.
-    fn of(scope: &Scope<'_>) -> Option<Self> {
+    /// The directories of `scope`'s home. The environment, and the key a
+    /// project is named by, belong to the home of the user running the
+    /// sweep (its `HOME`); for any other home (a test tree, or a `HOME`
+    /// that is not the one swept) the defaults stand and a project is named
+    /// by its position. A variable set to what is no plain absolute path is
+    /// said in `found`, and the default stands for it.
+    fn of(scope: &Scope<'_>, found: &mut Found) -> Option<Self> {
         let home = scope.home?;
         let own = env::var("HOME").is_ok_and(|value| value.trim_matches('/') == home);
-        let variable = |name: &str| {
-            env::var(name)
-                .ok()
-                .filter(|_| own)
-                .and_then(|value| relative(&value))
-        };
-        Some(Self::new(home, &variable))
+        if !own {
+            return Some(Self::new(home, &|_| None, None));
+        }
+        let lookup = |name: &str| env::var_os(name).map(|value| value.into_string().ok());
+        let variable = resolved(&lookup, found);
+        Some(Self::new(home, &variable, ProjectKey::kept()))
+    }
+}
+
+/// How each of `DIRECTORY_VARIABLES` that `lookup` finds set (`Some(None)`
+/// for a value that is not UTF-8) reads as a path relative to the root; one
+/// that is no plain absolute path is said in `found` and left out.
+fn resolved(
+    lookup: &dyn Fn(&str) -> Option<Option<String>>,
+    found: &mut Found,
+) -> impl Fn(&str) -> Option<String> + use<> {
+    let mut values = Vec::new();
+    for name in DIRECTORY_VARIABLES {
+        match lookup(name).map(|value| value.as_deref().and_then(relative)) {
+            None => {}
+            Some(Some(path)) => values.push((*name, path)),
+            Some(None) => found.unchecked.push(format!(
+                "{name} is set to what is no plain absolute path: the default was read in its place, and what the agent reads there was not checked"
+            )),
+        }
+    }
+    move |name: &str| {
+        values
+            .iter()
+            .find(|(set, _)| *set == name)
+            .map(|(_, path)| path.clone())
     }
 }
 
@@ -247,7 +229,7 @@ fn relative(path: &str) -> Option<String> {
 /// managed Claude Code settings, and with a home, each agent's own.
 pub(super) fn collect(scope: &Scope<'_>) -> Found {
     let mut found = Found::default();
-    let dirs = Dirs::of(scope);
+    let dirs = Dirs::of(scope, &mut found);
     claude::collect(scope, dirs.as_ref(), &mut found);
     if let Some(dirs) = &dirs {
         opencode::collect(scope, dirs, &mut found);
@@ -265,7 +247,9 @@ fn read(scope: &Scope<'_>, file: &str, found: &mut Found) -> Option<String> {
         Err(error) => error.to_string(),
         Ok(metadata) if metadata.is_symlink() => "a link, which is not followed".into(),
         Ok(metadata) if !metadata.is_file() => "not a regular file".into(),
-        Ok(metadata) if metadata.len() > MAX_CONFIG => "larger than 16 MiB".into(),
+        Ok(metadata) if metadata.len() > MAX_CONFIG => {
+            format!("larger than {} MiB", MAX_CONFIG / 1024 / 1024)
+        }
         Ok(_) => match read_small_file(&path, MAX_CONFIG) {
             Some(text) => return Some(text),
             None => "could not be read".into(),
@@ -335,236 +319,116 @@ fn without_comments(text: &str) -> String {
     out
 }
 
-/// The entries of a table of MCP servers by name, at `prefix` and the name.
-fn server_entries(servers: &Json, prefix: &str, entries: &mut Vec<Entry>) {
-    for (name, server) in servers.as_object().unwrap_or_default() {
-        let key = format!("{prefix}{}", key_part(name));
-        entries.extend(Server::from_json(server).into_entry(key));
-    }
-}
-
-/// The strings of a JSON array; anything else in it is left out.
-fn strings(value: &Json) -> Vec<String> {
+/// The strings of a JSON array; `None` for anything else, or an array that
+/// holds anything but strings.
+fn string_list(value: &Json) -> Option<Vec<String>> {
     value
-        .as_array()
-        .unwrap_or_default()
+        .as_array()?
         .iter()
-        .filter_map(Json::as_str)
-        .map(str::to_string)
+        .map(|word| word.as_str().map(str::to_string))
         .collect()
 }
 
-/// Makes items of `entries`, found in `source`, at most `MAX_ENTRIES`.
-fn add(scope: &Scope<'_>, source: &Source<'_>, entries: Vec<Entry>, found: &mut Found) {
-    if entries.len() > MAX_ENTRIES {
-        found.unchecked(
-            source.file,
-            &format!("more than {MAX_ENTRIES} entries that start something"),
-        );
-    }
-    for entry in entries.into_iter().take(MAX_ENTRIES) {
-        found.items.push(item(scope, source, entry));
-    }
+/// An MCP server as the agents describe one: a program with arguments and
+/// variables, or an address, and a program that makes its headers.
+#[derive(Debug, Default)]
+struct Server {
+    command: Option<String>,
+    args: Vec<String>,
+    url: Option<String>,
+    headers_helper: Option<String>,
+    variables: Vec<String>,
+    /// The fields that are there and could not be read (`command`).
+    unread: Vec<&'static str>,
 }
 
-/// The item of `entry`: its text is what it starts (see the module docs).
-fn item(scope: &Scope<'_>, source: &Source<'_>, entry: Entry) -> Item {
-    let Entry {
-        key,
-        launch,
-        variables,
-    } = entry;
-    let path = format!("{}#{key}", source.file);
-    let mut runs = Vec::new();
-    let mut alerts = Vec::new();
-    let started = match launch {
-        Launch::Command(line) => {
-            runs.push(with_plugin_root(&line, source.plugin_root));
-            line
-        }
-        Launch::Remote { scheme, host } => {
-            if !crate::rules::is_local_host(without_port(&host)) {
-                alerts.push((
-                    RuleId::RiskyConfiguration,
-                    format!(
-                        "talks to a remote server at {host}: the agent sends it what it works on, and acts on what it answers"
-                    ),
-                ));
-            }
-            format!("{scheme}://{host}")
-        }
-        Launch::Package(package) => {
-            if !is_pinned(&package) {
-                alerts.push((
-                    RuleId::RemoteCodeInstall,
-                    format!(
-                        "{package}: installed from npm and run with no version fixed, so whatever is published next runs"
-                    ),
-                ));
-            }
-            format!("npm package {package}")
-        }
-    };
-    let text = if variables.is_empty() {
-        format!("{started}\n")
-    } else {
-        format!(
-            "# started with these variables set (values not read): {}\n{started}\n",
-            variables.join(" ")
-        )
-    };
-    Item {
-        file: None,
-        origin: collect::origin(scope, &path),
-        category: Category::Agent,
-        tier: Tier::Unknown,
-        sha256: Some(Sha256::digest(text.as_bytes())),
-        body: Body::Text(text),
-        runs,
-        run_by: None,
-        notes: source.note.iter().cloned().collect(),
-        alerts,
-        path,
-    }
-}
-
-/// `host` without a port (`localhost:3000`, `[::1]:8080`).
-fn without_port(host: &str) -> &str {
-    host.rsplit_once(':')
-        .filter(|(name, port)| {
-            !port.is_empty()
-                && port.chars().all(|c| c.is_ascii_digit())
-                && (!name.contains(':') || name.ends_with(']'))
-        })
-        .map_or(host, |(name, _)| name)
-}
-
-/// Whether an npm package names the one version it installs
-/// (`pkg@1.2.3`, `@scope/pkg@1.2.3-rc.1`), not a tag or a range.
-fn is_pinned(package: &str) -> bool {
-    package
-        .get(1..)
-        .and_then(|rest| rest.rsplit_once('@'))
-        .is_some_and(|(_, version)| {
-            version.starts_with(|c: char| c.is_ascii_digit())
-                && version
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
-        })
-}
-
-/// The address `url` as the scheme and host it reaches; who it logs in as
-/// and the rest of the address are left out.
-fn remote(url: &str) -> Launch {
-    let url = url.trim();
-    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
-    let authority = rest
-        .split(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
-        .next()
-        .unwrap_or_default();
-    let host = authority.rsplit('@').next().unwrap_or_default();
-    Launch::Remote {
-        scheme: scheme.to_ascii_lowercase(),
-        host: host.to_ascii_lowercase(),
-    }
-}
-
-/// `program` and `args` as one shell line, each word quoted where a shell
-/// would split it. The value a flag or variable named for a secret takes,
-/// and who an address logs in as, are taken out: a server's arguments are
-/// where a token is written when it is not in a variable.
-fn command_line(program: &str, args: &[String]) -> String {
-    let mut words = vec![quoted(program)];
-    let mut secret_next = false;
-    for arg in args {
-        let word = if secret_next {
-            VALUE_NOT_READ.to_string()
-        } else {
-            without_secret(arg)
+impl Server {
+    /// A server of Claude Code (`command`, `args`, `env`, `url`,
+    /// `headersHelper`) or OpenCode (`command` as an array, `environment`,
+    /// `url`).
+    fn from_json(server: &Json) -> Self {
+        let mut this = Self::default();
+        let mut words = match server.get("command") {
+            None => Vec::new(),
+            Some(Json::String(command)) => vec![command.clone()],
+            Some(command) => this.list(command, "command"),
         };
-        secret_next = arg.starts_with('-') && !arg.contains('=') && names_a_secret(arg);
-        words.push(quoted(&word));
-    }
-    words.join(" ")
-}
-
-/// `arg` with a secret value taken out: of `--token=x`, of `API_KEY=x`,
-/// and the login of `scheme://user:password@host`.
-fn without_secret(arg: &str) -> String {
-    if let Some((name, _)) = arg.split_once('=')
-        && names_a_secret(name)
-        && !name.contains("://")
-    {
-        return format!("{name}={VALUE_NOT_READ}");
-    }
-    match arg.split_once("://") {
-        Some((scheme, rest)) => {
-            let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-            match rest[..end].rsplit_once('@') {
-                Some((_, host)) => format!("{scheme}://{host}{}", &rest[end..]),
-                None => arg.to_string(),
+        if let Some(args) = server.get("args") {
+            words.extend(this.list(args, "args"));
+        }
+        let mut words = words.into_iter();
+        this.command = words.next();
+        this.args = words.collect();
+        this.url = this.string(server.get("url"), "url");
+        this.headers_helper = this.string(server.get("headersHelper"), "headersHelper");
+        for field in ["env", "environment"] {
+            match server.get(field).map(Json::as_object) {
+                None => {}
+                Some(Some(variables)) => this
+                    .variables
+                    .extend(variables.iter().map(|(name, _)| name.clone())),
+                Some(None) => this.unread.push(field),
             }
         }
-        None => arg.to_string(),
+        this
     }
-}
 
-/// Whether a flag or variable name (`--api-key`, `GITHUB_TOKEN`) is named
-/// for a secret.
-fn names_a_secret(name: &str) -> bool {
-    name.split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|word| SECRET_WORDS.contains(&word.to_ascii_lowercase().as_str()))
-}
-
-/// `word` as a shell reads it back as one word. `$` and braces stay as
-/// they are: an agent fills in `${VAR}` in a server's arguments itself.
-fn quoted(word: &str) -> String {
-    let plain = !word.is_empty()
-        && word
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "@%+=:,./_~-${}".contains(c));
-    if plain {
-        word.to_string()
-    } else {
-        format!("'{}'", word.replace('\'', r"'\''"))
+    fn list(&mut self, value: &Json, field: &'static str) -> Vec<String> {
+        string_list(value).unwrap_or_else(|| {
+            self.unread.push(field);
+            Vec::new()
+        })
     }
-}
 
-/// The variable a plugin's commands name its own directory by.
-const PLUGIN_ROOT: &str = "CLAUDE_PLUGIN_ROOT";
-
-/// `line` with the plugin's directory (`root`, relative to the root)
-/// written in for `${CLAUDE_PLUGIN_ROOT}` and `$CLAUDE_PLUGIN_ROOT`, so the
-/// scripts it names are followed. The item's text keeps the line as
-/// written.
-fn with_plugin_root(line: &str, root: Option<&str>) -> String {
-    let Some(root) = root else {
-        return line.to_string();
-    };
-    let directory = format!("/{root}");
-    let line = line.replace(&format!("${{{PLUGIN_ROOT}}}"), &directory);
-    let bare = format!("${PLUGIN_ROOT}");
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line.as_str();
-    while let Some(at) = rest.find(&bare) {
-        let after = &rest[at + bare.len()..];
-        out.push_str(&rest[..at]);
-        // `$CLAUDE_PLUGIN_ROOT_X` is another variable.
-        if after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
-            out.push_str(&bare);
-        } else {
-            out.push_str(&directory);
+    fn string(&mut self, value: Option<&Json>, field: &'static str) -> Option<String> {
+        match value {
+            None => None,
+            Some(Json::String(text)) => Some(text.clone()),
+            Some(_) => {
+                self.unread.push(field);
+                None
+            }
         }
-        rest = after;
     }
-    out.push_str(rest);
-    out
+
+    /// Adds the entries of the server at `key` to `entries`: the server
+    /// itself, and its `headersHelper` at `key/headersHelper`. A server
+    /// with neither a program nor an address starts nothing; a field that
+    /// could not be read is said as not checked.
+    fn add_to(self, key: &str, entries: &mut Entries) {
+        for field in &self.unread {
+            entries.unread(key, field);
+        }
+        if let Some(helper) = &self.headers_helper {
+            entries.push(Entry::command(format!("{key}/headersHelper"), helper));
+        }
+        let launch = match (self.command, self.url) {
+            (Some(command), _) => Launch::Command(command_line(&command, &self.args)),
+            (None, Some(url)) => entry::remote(&url),
+            (None, None) => return,
+        };
+        entries.push(Entry {
+            key: key.to_string(),
+            launch,
+            variables: self.variables,
+        });
+    }
 }
 
-/// `name` (a key the configuration chose: an event, a server, a plugin, a
-/// project's path) as one part of an item's name: as it is where it is
-/// plain, else as `~` and the start of its digest, so that no name reads as
-/// more than one part and no two keys share one.
+/// The entries of a table of MCP servers by name, at `prefix` and the name.
+fn server_entries(servers: &Json, prefix: &str, entries: &mut Entries) {
+    let Some(servers) = servers.as_object() else {
+        entries.unread(prefix.trim_end_matches('/'), "table of servers");
+        return;
+    };
+    for (name, server) in servers {
+        Server::from_json(server).add_to(&format!("{prefix}{}", key_part(name)), entries);
+    }
+}
+
+/// `name` (a key the configuration chose: an event, a server, a plugin) as
+/// one part of an item's name: as it is where it is plain, else as `~` and
+/// its whole digest, so that no part holds a `/` and no two keys share one.
 fn key_part(name: &str) -> String {
     let plain = !name.is_empty()
         && name.len() <= 64
@@ -575,8 +439,7 @@ fn key_part(name: &str) -> String {
     if plain {
         name.to_string()
     } else {
-        let digest = Sha256::digest(name.as_bytes()).to_string();
-        format!("~{}", &digest[..12])
+        format!("~{}", Sha256::digest(name.as_bytes()))
     }
 }
 

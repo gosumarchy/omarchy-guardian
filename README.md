@@ -28,10 +28,13 @@ it shows on hover:
   sources, themes, plugins, what you `scan`, and for the daily sweep the
   start-up files on this machine that no package vouches for, with the scripts
   they run. Of an AI coding agent's configuration (Claude Code, OpenCode,
-  Codex) only what each hook, MCP server or plugin starts is sent: its command
-  line with secret-named values taken out, the names of its variables, or a
-  remote server's host; never the files themselves, which hold tokens and
-  project history. A file whose name or path marks it as holding keys or tokens
+  Codex) only what each hook, helper, MCP server or plugin starts is sent: its
+  command line with secrets taken out (logins in addresses, `Authorization`
+  values, values after secret-named flags or names, words that look like
+  tokens), the names of its variables, or a remote server's host; of Claude
+  Code's `env`, only the variable names and the host of a base address or
+  proxy. Never the files themselves, which hold tokens and project history,
+  and nothing derived from a project's path. A file whose name or path marks it as holding keys or tokens
   (`.env`, `*.pem`, `*.key`, `id_ed25519`, anything under `.ssh` or `secrets`,
   and the like) is not sent, by any gate or by the sweep, whatever runs it. In
   a gate the review is then incomplete, not clear. In the sweep such a file is

@@ -379,49 +379,91 @@ What is read (paths in your home unless absolute):
 
 | Agent | File | What becomes an item |
 | --- | --- | --- |
-| Claude Code | `~/.claude/settings.json`, `~/.claude/settings.local.json` | every `hooks` command and web hook, `statusLine.command`, `apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`, `otelHeadersHelper` |
+| Claude Code | `~/.claude/settings.json`, `~/.claude/settings.local.json` | every `hooks` command and web hook, `statusLine.command`, `apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`, `otelHeadersHelper`, and `env` as one item |
 | Claude Code | `~/.claude.json` | `mcpServers`, and the `mcpServers` of each entry of `projects`; nothing else of the file |
 | Claude Code | `/etc/claude-code/managed-settings.json`, `/etc/claude-code/managed-mcp.json` | the same keys, for every user |
 | Claude Code | `~/.claude/plugins/installed_plugins.json` | for each installed plugin: the hooks and servers of its `hooks/hooks.json`, its `.mcp.json`, and what its `.claude-plugin/plugin.json` holds or names |
 | OpenCode | `~/.config/opencode/opencode.json` and `opencode.jsonc` (comments allowed) | each `mcp` server and each `plugin` |
 | OpenCode | `~/.config/opencode/plugin/*.js`, `*.ts`, and the same in `plugins/` | each file, as the code it is |
-| Codex | `~/.codex/config.toml` | each `[mcp_servers.*]` and `notify` |
+| Codex | `~/.codex/config.toml` | each server of `mcp_servers` (as a table or an inline table) and `notify` |
+
+An MCP server of Claude Code with a `headersHelper` gives a second item: that
+command, which Claude Code runs on its own to make the server's headers.
 
 `CLAUDE_CONFIG_DIR` (which then holds `.claude.json` too), `XDG_CONFIG_HOME`,
-`OPENCODE_CONFIG` (read besides the usual file) and `CODEX_HOME` move these
-the way they move them for the agents, when the sweep runs in your own session
-(its `HOME` is the home being swept). The root checks read root's own files at
-the default places.
+`OPENCODE_CONFIG_DIR` (a second OpenCode directory, read besides the usual
+one), `OPENCODE_CONFIG` (a file read besides the usual ones) and `CODEX_HOME`
+move these the way they move them for the agents, when the sweep runs in your
+own session (its `HOME` is the home being swept). One that is set to anything
+but a plain absolute path is listed as not checked, and the default place is
+read in its stead. The root checks read root's own files at the default
+places.
 
 An item is named by its file and its key in that file:
 `~/.claude/settings.json#hooks/PreToolUse/0/1` (the event, the group, the
 hook), `~/.claude.json#mcpServers/github`, `~/.codex/config.toml#notify`. A
-plugin's entries are named by the plugin, not by the directory of its version
-(`~/.claude/plugins/installed_plugins.json#name@market/hooks/hooks.json/SessionStart/0/0`),
-so an update shows as a change. A project's servers are named by the first 12
-hex digits of the SHA-256 of the project's path
-(`~/.claude.json#projects/~3f1a…/mcpServers/db`), and only a note shown on
-this machine gives the path. A key that is not a plain name (it has a `/`, a
-blank, a leading `.`) is named the same way.
+plugin's entries are named by the plugin and the position of its install, not
+by the directory of its version, so an update shows as a change:
+`~/.claude/plugins/installed_plugins.json#plugins/name@market/0/hooks/SessionStart/0/0`.
+After the install come where the entry was found (`hooks` and `mcp` for the
+two default files, `manifest-hooks` and `manifest-mcp` for what the manifest
+holds, `hooks-file-1` for the second file its `hooks` list names) and the
+entry. A key that is not a plain name (it has a `/`, a blank, a leading `.`,
+or is longer than 64 characters) is written as `~` and its whole SHA-256, so
+no two keys share a name. Two items that still end up with one name (one file
+read twice) are listed as not checked rather than one dropped.
+
+Nothing derived from a project's path is sent. A project's servers are named
+by an HMAC-SHA256 of the project's path, keyed with 32 random bytes Guardian
+makes once and keeps in its private state directory
+(`agent-project-key`, mode 0600), so the name stays the same from one sweep to
+the next and tells nobody without the key which project it is:
+`~/.claude.json#projects/3f1a…/mcpServers/db`. Where there is no such
+directory, a project is named by its position in the file instead. Only a note
+shown on this machine gives the path.
 
 The text of each item, which is all the review sees of it, is what the entry
 starts and nothing else:
 
-- a hook, the status line and a helper: the command line as written;
+- a hook, the status line, a helper and a `headersHelper`: the command line as
+  written, with its secrets taken out (below);
 - an MCP server run as a program: the program and its arguments as one line,
-  each word quoted where a shell would split it. The value that follows a flag
-  named for a secret (`--api-key x`, `--token=x`, any flag with `token`,
-  `secret`, `password`, `pass`, `key`, `apikey`, `auth`, `credential`, `pat`
-  or `bearer` as a word of its name), the value of an argument such as
-  `GITHUB_TOKEN=x`, and the user and password of an address are replaced by
-  `<value-not-read>`;
+  each word quoted where a shell would split it, with its secrets taken out;
 - the variables it is started with (`env`, `environment`): their names only,
   on a comment line. Their values are never read, so a changed value is no
   change;
 - a remote MCP server or a web hook: the scheme and host of its address
   (`https://mcp.example.com`); the path, query, headers and login are left
-  out;
-- an OpenCode plugin from npm: `npm package` and its name as written.
+  out. A scheme that is not a plain word (a letter, then letters, digits,
+  `+`, `.` or `-`) is left out too;
+- an OpenCode plugin from npm: `npm package` and its name as written, with its
+  secrets taken out;
+- Claude Code's `env`: the name of each variable, one a line. The value is
+  never read, but for a variable named `*_BASE_URL` or `*_PROXY`, of which the
+  scheme and host are given (`ANTHROPIC_BASE_URL=https://relay.example`).
+
+Taking secrets out of a line removes, and puts `<value-not-read>` in place of:
+
+- the login of an address, all of it (`https://user:password@host` is
+  `https://host`; here the login is removed, not replaced);
+- the value of an `Authorization:` header, after its scheme where it has one
+  (`Bearer`, `Basic`, `token`), and the word after `Bearer` or `Basic`;
+- the value after a flag named for a secret (`--api-key x`, `--authToken x`,
+  `--clientSecret x`), and after `=` where a name before it is named for a
+  secret (`--token=x`, `GITHUB_TOKEN=x`, `--env=API_KEY=x`). A name is named
+  for a secret where a word of it (split at anything but a letter or digit,
+  and between a lower-case letter or digit and an upper-case letter) is `key`, `token`,
+  `secret`, `password`, `auth`, `credential`, `bearer` or a like word; this is
+  the same list the review's own secret removal uses;
+- a word that is a token by its look: one that starts as known tokens do
+  (`sk-`, `ghp_`, `github_pat_`, `glpat-`, `xoxb-`, `AKIA`, `AIza`, `npm_`,
+  `pypi-` and others) and is at least 16 characters long, or one of at least 32
+  characters that mixes upper and lower case and digits.
+
+A value that is a variable (`$TOKEN`) or a path (`/`, `~`, `.`) is kept: it
+holds no secret itself and is what a review needs to see. Only the item's text
+loses these; what is followed is the command as written, read on this machine
+only.
 
 A change to that text (a new hook, a changed command, a new variable name) is
 a change to the item: it shows in `--diff`, in the daily notification, and
@@ -438,9 +480,16 @@ What is a finding:
 - a remote MCP server or a web hook on another machine: `risky-configuration`
   (medium). The agent sends it what it works on and acts on what it answers.
   `localhost` is not one;
-- an npm plugin of OpenCode without one fixed version (`opencode-x`,
-  `opencode-x@latest`): `remote-code-install` (medium), since whatever is
-  published next is installed and run;
+- an npm plugin of OpenCode without one whole version (`opencode-x`,
+  `opencode-x@latest`, `opencode-x@1`, `opencode-x@1.x`): `remote-code-install`
+  (medium), since whatever is published next is installed and run;
+- in Claude Code's `env`, a variable that changes what is loaded, run or
+  connected through (`NODE_OPTIONS`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `PATH`,
+  a proxy, and the rest of the list an editor's terminal settings are held
+  to), and a `*_BASE_URL` whose host is neither the provider's own
+  (`anthropic.com`, `claude.ai`, `claude.com`, `openai.com`, `amazonaws.com`,
+  `googleapis.com`, `azure.com`, and their subdomains) nor this machine:
+  `risky-configuration` (medium), as for an editor's terminal settings;
 - what the local rules find in a command line, as in any script: `npx -y` or
   `bunx` of an unpinned package, `uvx`, `uv tool run` or `pipx run` of a
   package with no version fixed (`remote-code-install`), `curl … | sh`
@@ -450,17 +499,24 @@ Guardian's own hooks are items like any other.
 
 What is not checked, and says so in the sweep's list of what was not checked:
 a configuration file that is a link (it is not followed), one that is not a
-regular file, larger than 16 MiB, not JSON (or not TOML Guardian can read),
-more than 500 entries of one file, a plugin whose directory is not under
+regular file, larger than 16 MiB, not JSON (or not TOML Guardian can read);
+a field that is there and cannot be read (a `command` that is not a string, a
+table of servers that is not a table, a Codex entry under `mcp_servers` of a
+shape Guardian does not understand, a hook of a type Guardian does not know);
+more than 500 entries of one file; a plugin directory that cannot be listed or
+holds more than 500 files of one kind; a plugin whose directory is not under
 `~/.claude/plugins/`, and a file a plugin's manifest names outside the plugin.
+Only an entry with neither a program nor an address, which starts nothing, is
+passed over without a word.
 
 What is not covered:
 
 - a project's own `.claude/settings.json`, `.mcp.json`, `opencode.json` or
   `.codex/config.toml`, which live in each repository: the sweep does not
   search for repositories;
-- the `env` of Claude Code's settings (which can set `NODE_OPTIONS` for Claude
-  Code itself), whose values are not read;
+- a stdio server whose `command` is a whole line with blanks (`"npx -y x"`):
+  it is quoted as one word, as Claude Code documents `command` as the program
+  alone;
 - what a plugin holds besides the hooks and servers it declares (skills,
   agents, commands are instructions to a model, not programs), a plugin whose
   hooks only its marketplace entry declares, and the code of an npm plugin of
