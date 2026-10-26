@@ -1,5 +1,6 @@
 //! Keeping secrets out of what is sent to the review: the values of
-//! variables that hold a credential, and the passwords in URLs.
+//! variables that hold a credential, the passwords in URLs, and GRUB's
+//! password hashes.
 
 /// Names that hold a secret: an assignment to one has its value taken out
 /// before the file is reviewed.
@@ -34,10 +35,45 @@ pub(super) const REDACTED: &str = "<redacted-by-guardian>";
 pub(super) fn without_secrets(text: &str) -> String {
     text.split_inclusive('\n')
         .map(|line| {
-            let line = redact_line(line).unwrap_or_else(|| line.to_string());
+            let line = redact_line(line)
+                .or_else(|| without_grub_hash(line))
+                .unwrap_or_else(|| line.to_string());
             without_url_passwords(&line)
         })
         .collect()
+}
+
+/// `line` with the hash taken out, where it is exactly GRUB's
+/// `password_pbkdf2 <user> grub.pbkdf2.sha512.<rounds>.<salt>.<hash>` and
+/// nothing else. A hash in that shape is digits and hexadecimal only and
+/// can carry no code, so taking it out hides nothing a review needs (see
+/// the masking rule in this module's callers); a line of any other shape
+/// is left as it is.
+fn without_grub_hash(line: &str) -> Option<String> {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let [command, _user, hash] = words[..] else {
+        return None;
+    };
+    let fields: Vec<&str> = hash
+        .strip_prefix("grub.pbkdf2.sha512.")?
+        .split('.')
+        .collect();
+    let is_hex = |field: &str| !field.is_empty() && field.bytes().all(|b| b.is_ascii_hexdigit());
+    let shaped = command == "password_pbkdf2"
+        && matches!(fields[..], [rounds, salt, digest]
+            if !rounds.is_empty()
+                && rounds.bytes().all(|b| b.is_ascii_digit())
+                && is_hex(salt)
+                && is_hex(digest));
+    shaped.then(|| line.replacen(hash, REDACTED, 1))
+}
+
+/// Whether `text`, a boot loader's configuration, sets a password in
+/// plain text (GRUB's `password <user> <password>`): such a file is read by
+/// the local rules only, as the secret wins over the review.
+pub(super) fn has_plain_boot_password(text: &str) -> bool {
+    text.lines()
+        .any(|line| line.split_whitespace().next() == Some("password"))
 }
 
 /// A password written out as it is: nothing a shell would expand or run

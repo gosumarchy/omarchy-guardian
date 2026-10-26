@@ -20,7 +20,7 @@ use crate::report::{Gap, LocalFinding, Report, ReviewScope};
 use crate::review::{self, ReviewContext};
 use crate::rules::RuleId;
 use crate::text::shown;
-use secrets::without_secrets;
+use secrets::{has_plain_boot_password, without_secrets};
 use variables::sets_only_variables;
 
 #[cfg(test)]
@@ -257,11 +257,13 @@ fn is_local_only(item: &Item, home: Option<&str>) -> bool {
         // (see `boot`), and one whose bytes read as text is still one of
         // them: nothing in `/boot` goes to the AI but the boot configuration
         // the catalogue collects (the boot loaders' files, `startup.nsh`,
-        // `refind.conf`). That stays reviewed on purpose: it holds no
-        // personal data, and the local command line check takes whatever it
-        // says as configured, so a parameter planted in `limine.conf`
-        // (`init=`, `rd.shell`), or an entry that starts another program,
-        // is seen only by the review.
+        // `refind.conf`). That stays reviewed on purpose: the local command
+        // line check takes whatever it says as configured, so a parameter
+        // planted in `limine.conf` (`init=`, `rd.shell`), or an entry that
+        // starts another program, is seen only by the review. The secret it
+        // can hold is a boot password: a GRUB hash is taken out before it
+        // is sent (`without_secrets`), and a file with a plain-text password
+        // is not sent at all (see `reading`).
         Category::Boot => path.starts_with("boot/") && !boot::is_configuration(path),
         Category::Trust => named,
         Category::Toolchain => {
@@ -326,6 +328,9 @@ const SCRIPT_EXTENSIONS: &[&str] = &[
 fn reading(item: &Item, home: Option<&str>, text: &str) -> Reading {
     if is_local_only(item, home) {
         return Reading::Settings;
+    }
+    if item.category == Category::Boot && has_plain_boot_password(text) {
+        return Reading::Secrets;
     }
     let file = collect::file_of(item);
     if [file, collect::stands_for(item)]

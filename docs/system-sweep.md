@@ -870,7 +870,7 @@ memory, so a repeated sweep of an unchanged system makes no AI call.
 
 ### What is kept from the AI
 
-Four kinds of file are read on this machine only. Each says so in a note on
+Five kinds of file are read on this machine only. Each says so in a note on
 its item (accounts, keys, certificate authorities and browser extensions do
 not: they are facts with no text to send), and being kept makes no sweep
 incomplete.
@@ -949,6 +949,11 @@ incomplete.
   (`node --env-file …`). Its text is sent only where it starts with `#!` or
   has a script's name (`.sh`, `.py`, `.js` and the like), and is under no
   secret path; anything else is hashed, listed and read by the local rules.
+- **A boot loader configuration with a plain-text password** (a line that
+  starts with `password`, as GRUB's `password <user> <password>` does) is
+  read like a file whose path marks it as holding secrets (above): the secret
+  wins over the review. GRUB's hashed passwords are taken out instead (below),
+  and the rest of the file is reviewed.
 
 A file an SSH `Include` names by its full path or with `~` is followed and
 checked the same way, one with `*` in its last part to the files it matches. A
@@ -990,8 +995,8 @@ never run or uploaded.
 
 ### What is taken out of a file that is sent
 
-Before a file is reviewed, two things are taken out of its text, for the local
-rules and the AI alike:
+Before a file is reviewed, three things are taken out of its text, for the
+local rules and the AI alike:
 
 - the value of an assignment whose name says secret: a part of it between
   `_` is `KEY`, `APIKEY`, `TOKEN`, `AUTHTOKEN`, `PAT`, `SECRET`, `PASSWORD`,
@@ -1002,7 +1007,11 @@ rules and the AI alike:
   with or without quotes around it. The forms read are shell, `NAME=value`
   (with or without blanks around the `=`), unit `Environment=` and fish `set`;
 - the password of an address (`https://user:password@…`), where it is plain
-  characters, the user and host staying.
+  characters, the user and host staying;
+- the hash of a GRUB password, on a line that is exactly `password_pbkdf2
+  <user> grub.pbkdf2.sha512.<rounds>.<salt>.<hash>` (digits and hexadecimal,
+  nothing else on the line). Such a hash can carry no code; a line of any
+  other shape stays whole.
 
 Start-up files are where exported keys live, and the sweep runs on a timer.
 The rule is kept this narrow on purpose: what is taken out is hidden from the

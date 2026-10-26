@@ -1324,3 +1324,75 @@ fn facts_quote_the_path_and_say_what_guardian_knows() {
             .starts_with(r#""/etc/x\" is trusted" is installed by no package"#)
     );
 }
+
+/// GRUB's password hash is taken out only where the line is exactly that
+/// and nothing else: a hash in that shape carries no code.
+#[test]
+fn only_an_exact_grub_password_hash_is_taken_out() {
+    use super::without_secrets;
+
+    let hash = "grub.pbkdf2.sha512.10000.0A1B2C3D.4E5F6A7B8C9D";
+    let line = format!("  password_pbkdf2 root {hash}\n");
+    assert_eq!(
+        without_secrets(&line),
+        "  password_pbkdf2 root <redacted-by-guardian>\n"
+    );
+    for kept in [
+        format!("password_pbkdf2 root {hash} ; insmod payload\n"),
+        format!("password_pbkdf2 root {hash}$(run)\n"),
+        "password_pbkdf2 root grub.pbkdf2.sha512.10000.0A1B.zz\n".to_string(),
+        "password_pbkdf2 root grub.pbkdf2.sha512.x.0A1B.0A1B\n".to_string(),
+        format!("echo root {hash}\n"),
+    ] {
+        assert_eq!(without_secrets(&kept), kept);
+    }
+}
+
+/// A boot configuration with a plain-text password is read here, never
+/// sent: the secret wins over the review.
+#[test]
+fn a_boot_configuration_with_a_plain_password_is_kept_from_the_review() {
+    use crate::config::Settings;
+    use crate::config::file::PartialConfig;
+    use crate::config::model::{Profile, SourceClass};
+    use crate::review::ReviewContext;
+    use crate::test_support::mock_opencode_findings;
+    use crate::tools::OpenCode;
+
+    let config = |text: &str| Item {
+        origin: Origin::Root,
+        body: Body::Text(text.into()),
+        ..item("boot/grub/grub.cfg", Category::Boot, Tier::Unknown)
+    };
+    let bin = TempDir::new("sweep-judge-grub-bin");
+    let opencode = OpenCode::At(mock_opencode_findings(bin.path(), "clear", &[]));
+    let settings = Settings::from_parts(PartialConfig::default(), PartialConfig::default())
+        .with_profile(Profile::Standard);
+    let context = ReviewContext {
+        settings: &settings,
+        class: SourceClass::System,
+        opencode: &opencode,
+        units: &[],
+        state_root: None,
+        context: &[],
+    };
+    let judged = |text: &str| {
+        let collection = Collection {
+            items: vec![config(text)],
+            ..Collection::default()
+        };
+        super::judge(&collection, None, &context, &HashSet::new())
+    };
+    let plain = judged("set superusers=root\n  password root hunter2\nmenuentry x {}\n");
+    assert!(plain.agent_input.is_empty(), "{:?}", plain.agent_input);
+    // Without one, the configuration is reviewed, its hash taken out.
+    let hashed = judged("password_pbkdf2 root grub.pbkdf2.sha512.10000.0A1B.2C3D\n");
+    assert_eq!(hashed.agent_input.len(), 1);
+    assert!(
+        hashed.agent_input[0]
+            .content
+            .contains("password_pbkdf2 root <redacted-by-guardian>"),
+        "{:?}",
+        hashed.agent_input
+    );
+}
