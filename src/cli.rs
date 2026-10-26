@@ -16,11 +16,9 @@ use crate::engine::baseline;
 use crate::engine::store::Store;
 use crate::error::Error;
 use crate::makepkg_gate;
-use crate::notify;
-use crate::pacman::{self, HookArgs};
-use crate::permit::{self, Content};
+use crate::pacman;
+use crate::permit;
 use crate::protect::{self, Consent};
-use crate::report::{Decision, Hashes};
 use crate::setup;
 use crate::status;
 use crate::sweep;
@@ -81,11 +79,14 @@ pub(crate) fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
             &settings,
             &mut TtyConfirm,
         ),
-        Invocation::PacmanHook(hook) => pacman_hook_command(
-            &hook,
-            &settings,
-            std::env::var_os(permit::ROOT_HOOK).is_some(),
-        ),
+        Invocation::PacmanHook(hook) => {
+            let started_by = if std::env::var_os(permit::ROOT_HOOK).is_some() {
+                pacman::gate::StartedBy::RootHook
+            } else {
+                pacman::gate::StartedBy::Pacman
+            };
+            pacman::gate::run(&hook, &settings, started_by)
+        }
         Invocation::Permit(command) => permit::command(&command, &settings),
         Invocation::PermitSystem(arguments) => permit::system_command(&arguments),
         Invocation::HookResult(arguments) => permit::hook_result_command(&arguments),
@@ -261,93 +262,6 @@ fn status_command(mode: StatusMode) -> ExitCode {
             ExitCode::from(2)
         }
     }
-}
-
-/// The pacman gate. `root_hook` says the hook script's root half started
-/// this review and takes a used permit away: it is told by the exit code
-/// (see `permit::PERMITTED_EXIT`), which the script turns into 0.
-fn pacman_hook_command(hook: &HookArgs, settings: &Settings, root_hook: bool) -> ExitCode {
-    // A reviewer from PATH is for the end-to-end tests, whose pacman is a
-    // script of the user's. In front of a real transaction (pacman runs as
-    // root) it is refused, however it came to be asked for.
-    if hook.opencode == OpenCode::UserPath
-        && process_owner(hook.pacman_pid).is_none_or(|owner| owner == 0)
-    {
-        errln!(
-            "Guardian blocked the pacman transaction: --opencode-from-path is for tests and is refused for a pacman run by root."
-        );
-        audit::refused(Gate::Pacman, "a reviewer from PATH was asked for", 2);
-        return ExitCode::from(2);
-    }
-    match pacman::review_transaction(hook, settings) {
-        Ok(report) => {
-            let decision = report.decide(&|class| settings.policy(class));
-            let contents: Vec<Content> = pacman::reviewed_content(&report).into_iter().collect();
-            let standing = permit::standing(
-                &contents,
-                &report,
-                decision,
-                settings,
-                Store::default_root().as_deref(),
-            );
-            report.print(decision, Hashes::Hidden, standing.permitted());
-            let exit = match (standing.permitted(), root_hook) {
-                (Some(_), true) => permit::PERMITTED_EXIT,
-                (Some(_), false) => 0,
-                (None, _) => decision.exit_status(),
-            };
-            audit::review(
-                &audit::Reviewed {
-                    gate: Gate::Pacman,
-                    class: &pacman::reviewed_classes(&report),
-                    subject: &pacman::reviewed_names(&report),
-                    digest: &pacman::reviewed_digests(&report),
-                    decision,
-                    permit: standing.permitted(),
-                    offered: standing.offered(),
-                    // What pacman is told: a permitted transaction goes on.
-                    exit: if standing.permitted().is_some() {
-                        0
-                    } else {
-                        exit
-                    },
-                },
-                &report,
-            )
-            .record();
-            if let Some(permit) = standing.permitted() {
-                errln!(
-                    "Guardian: your permit {permit} overrules {}; the transaction goes on.",
-                    report.decision_name(decision)
-                );
-            } else if let Decision::Blocked(blocked) = decision {
-                standing.say();
-                notify::blocked(
-                    "a pacman transaction",
-                    notify::reason(blocked),
-                    notify::Ran::Nothing,
-                );
-            }
-            ExitCode::from(exit)
-        }
-        Err(error) => {
-            errln!("Guardian blocked the pacman transaction: {error}");
-            audit::refused(Gate::Pacman, &error.to_string(), 2);
-            notify::blocked(
-                "a pacman transaction",
-                &error.to_string(),
-                notify::Ran::Nothing,
-            );
-            ExitCode::from(2)
-        }
-    }
-}
-
-/// The user a process runs as, from the owner of its `/proc` entry.
-fn process_owner(pid: u32) -> Option<u32> {
-    std::fs::metadata(format!("/proc/{pid}"))
-        .ok()
-        .map(|metadata| std::os::unix::fs::MetadataExt::uid(&metadata))
 }
 
 /// `config acknowledge`: writes the weaker-than-the-level settings of the

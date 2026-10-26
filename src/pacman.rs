@@ -9,6 +9,7 @@
 
 mod archives;
 mod argv;
+pub(crate) mod gate;
 mod links;
 
 use std::cell::RefCell;

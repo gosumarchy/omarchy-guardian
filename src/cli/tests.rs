@@ -9,7 +9,7 @@ use super::gate::{not_started, tree_content};
 use super::parse::{Protection, SetupScope};
 use super::{
     ConfigCommand, Confirm, Forget, GateReview, Invocation, Target, forget_command, forget_in,
-    guard_command, pacman_hook_command, parse, refusal, review_and_decide, reviews_for_the_user,
+    guard_command, parse, refusal, review_and_decide, reviews_for_the_user,
 };
 use crate::agent::SourceFile;
 use crate::audit::{self, Gate};
@@ -482,24 +482,6 @@ fn a_broken_system_file_stops_every_review_for_the_user() {
             said.as_deref(),
             reviews.then_some("nothing was reviewed or run: the user settings file is invalid."),
             "{line:?}"
-        );
-    }
-}
-
-#[test]
-fn a_reviewer_from_path_is_refused_for_a_pacman_run_by_root() {
-    use crate::pacman::HookArgs;
-    // Process 1 is root's, as a real pacman is; one that is not there
-    // cannot be shown to be the user's.
-    for pacman_pid in [1, u32::MAX] {
-        let hook = HookArgs {
-            pacman_pid,
-            cwd: PathBuf::from("/"),
-            opencode: OpenCode::UserPath,
-        };
-        assert_eq!(
-            pacman_hook_command(&hook, &default_settings(), false),
-            ExitCode::from(2)
         );
     }
 }
