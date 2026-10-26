@@ -208,8 +208,9 @@ fn examine(
 /// any other item; returns what Guardian established about the plugin
 /// where any of it is reviewed.
 fn plugin_files(report: &mut Report, plugin: &nvim::Plugin, label: &str) -> Option<String> {
-    let sent = match &plugin.review {
-        Review::New(sent) | Review::Changed(sent) => sent,
+    let (sent, news) = match &plugin.review {
+        Review::New(sent) => (sent, nvim::News::New),
+        Review::Changed(sent) => (sent, nvim::News::Changed),
         Review::Baseline | Review::Unchanged => return None,
         Review::Unplanned => {
             report.gaps.push(Gap::Sweep(format!(
@@ -247,7 +248,7 @@ fn plugin_files(report: &mut Report, plugin: &nvim::Plugin, label: &str) -> Opti
             Body::Link(_) | Body::Plugin(_) => report.gaps.push(Gap::RunsUnread(shown)),
         }
     }
-    Some(nvim::fact(plugin, label))
+    Some(nvim::fact(plugin, label, news))
 }
 
 /// Developer tool configuration that holds no tokens as a rule, and whose

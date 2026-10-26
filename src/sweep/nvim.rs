@@ -647,10 +647,19 @@ fn config_items(scope: &Scope<'_>, config: &str, unchecked: &mut Vec<String>) ->
         .collect()
 }
 
+/// Why a plugin's files go to the review.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum News {
+    /// It is new since the record: all its code files go.
+    New,
+    /// It changed since the record: its new or changed code files go.
+    Changed,
+}
+
 /// What Guardian established about `plugin`, listed as `label`, for the AI
-/// review of its files. Strings that come from the plugin are quoted, so a
-/// crafted one cannot pose as Guardian's words.
-pub(super) fn fact(plugin: &Plugin, label: &str) -> String {
+/// review of its files, which go for `news`. Strings that come from the
+/// plugin are quoted, so a crafted one cannot pose as Guardian's words.
+pub(super) fn fact(plugin: &Plugin, label: &str, news: News) -> String {
     let mut text = format!(
         "{:?} is a Neovim plugin lazy.nvim installed",
         shown(label).as_ref()
@@ -662,15 +671,11 @@ pub(super) fn fact(plugin: &Plugin, label: &str) -> String {
         let _ = write!(text, " at commit {:?}", shown(commit).as_ref());
     }
     text.push_str("; Neovim runs it when the editor starts.");
-    text.push_str(match plugin.review {
-        Review::New(_) => {
+    text.push_str(match news {
+        News::New => {
             " It is new since the last sweep: all its Lua, Vimscript, shell and build files are sent."
         }
-        Review::Unplanned
-        | Review::Baseline
-        | Review::Unchanged
-        | Review::Changed(_)
-        | Review::TooLarge { .. } => {
+        News::Changed => {
             " Only its Lua, Vimscript, shell and build files that are new or changed since the last review are sent; the rest of it was there before."
         }
     });
