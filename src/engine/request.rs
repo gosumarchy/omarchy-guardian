@@ -302,6 +302,12 @@ fn manifest_json(entry: &ManifestEntry) -> Json {
     Json::object(members)
 }
 
+/// The bytes `entry` takes in a request's `manifest`, as written there
+/// (escapes included), with the comma after it.
+pub(super) fn manifest_entry_bytes(entry: &ManifestEntry) -> usize {
+    manifest_json(entry).to_string().len() + 1
+}
+
 /// The bytes `finding` takes in a request's `local_findings`, as written
 /// there (escapes included), with the comma after it.
 pub(super) fn finding_bytes(finding: &LocalFinding) -> usize {
