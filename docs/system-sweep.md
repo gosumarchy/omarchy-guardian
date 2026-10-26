@@ -664,9 +664,10 @@ goes to the review again. An unchanged entry costs no AI call, like any item.
 What is followed: each command is followed like any other, so a script a hook
 or server names (an absolute path, `~`, a program on `PATH`) is read and
 reviewed as a program, and what it starts after it. In a plugin's commands
-`${CLAUDE_PLUGIN_ROOT}` is the plugin's directory, and so is the form with a
-default (`${CLAUDE_PLUGIN_ROOT:-.}`), since Claude Code sets the variable. A
-`file://` plugin of OpenCode is followed to its file.
+`${CLAUDE_PLUGIN_ROOT}` is the plugin's directory, and so is a form whose
+default is a plain path (`${CLAUDE_PLUGIN_ROOT:-.}`), since Claude Code sets the
+variable. A default that could run something (`$(…)`, another variable) is
+reviewed as written. A `file://` plugin of OpenCode is followed to its file.
 
 What is a finding:
 

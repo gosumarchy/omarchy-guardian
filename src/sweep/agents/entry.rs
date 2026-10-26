@@ -441,10 +441,13 @@ pub(super) fn with_plugin_root(line: &str, root: Option<&str>) -> String {
 }
 
 /// `line` with `directory` written in for `${CLAUDE_PLUGIN_ROOT}` and for
-/// the forms with a default (`${CLAUDE_PLUGIN_ROOT:-.}`, `-`, `:=`, `=`).
-/// Claude Code sets the variable for a plugin's commands, so the default
-/// is never used and each stands for the directory. Other forms (`:+`, a
-/// default holding a brace) are left as written.
+/// the forms whose default is a plain path (`${CLAUDE_PLUGIN_ROOT:-.}`,
+/// `-`, `:=`, `=`), as trailofbits' modern-python writes its hook. Claude
+/// Code sets the variable for a plugin's commands, so such a default names
+/// at most another directory. A default that could run anything (`$(…)`,
+/// another variable, quotes) is left as written: the line itself may unset
+/// the variable first, and the rewritten line is the text reviewed, so
+/// dropping that default would hide code that runs. `:+` is left too.
 fn with_braced_plugin_root(line: &str, directory: &str) -> String {
     let open = format!("${{{PLUGIN_ROOT}");
     let mut out = String::with_capacity(line.len());
@@ -452,16 +455,20 @@ fn with_braced_plugin_root(line: &str, directory: &str) -> String {
     while let Some(at) = rest.find(&open) {
         let after = &rest[at + open.len()..];
         out.push_str(&rest[..at]);
-        let end = after
-            .find('}')
-            .filter(|&end| !after[..end].contains('{'))
-            .filter(|&end| {
-                let operator = &after[..end];
-                operator.is_empty()
-                    || [":-", ":=", "-", "="]
-                        .iter()
-                        .any(|form| operator.starts_with(form))
-            });
+        // With the default held to path characters, the first `}` is the
+        // one that closes the expansion: none can be quoted or escaped.
+        let end = after.find('}').filter(|&end| {
+            let word = &after[..end];
+            let default = [":-", ":=", "-", "="]
+                .iter()
+                .find_map(|form| word.strip_prefix(form));
+            word.is_empty()
+                || default.is_some_and(|default| {
+                    default
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c))
+                })
+        });
         if let Some(end) = end {
             out.push_str(directory);
             rest = &after[end + 1..];

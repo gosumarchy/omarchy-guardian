@@ -537,6 +537,8 @@ fi
 sweep_timer=omarchy-guardian-sweep.timer
 if systemctl --user is-enabled -q "$sweep_timer" 2>/dev/null &&
     ! systemctl --user is-active -q "$sweep_timer" 2>/dev/null; then
+    # The user manager may still hold the unit as not found from login.
+    systemctl --user daemon-reload || true
     if systemctl --user start "$sweep_timer"; then
         ok "Started the daily sweep's timer"
     else
