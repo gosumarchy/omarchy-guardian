@@ -3,17 +3,21 @@
 //! every start, which lazy.nvim updates from GitHub without a review.
 //!
 //! Each plugin is one item, listed under its directory. Its content hash
-//! covers every file of it outside `.git`, the address it was cloned from,
-//! the commit it is at, and what git may run in it: the hooks and the keys
-//! that run commands of the checkout and of each submodule under
-//! `.git/modules` (`config`, `config.worktree`, `core.hooksPath`). So the
-//! sweep's record of what is new or changed, its notifications and
-//! `sweep allow` see a change to any of them. The rest of `.git` (objects,
-//! refs, the index, logs) changes with every update and is data git reads,
-//! not commands it runs; what git does with it is not checked.
+//! covers every file of it outside `.git` (a `.git` deeper in the tree
+//! included), the address it was cloned from, the commit it is at, and
+//! what may make git run something in it, in the checkout and in each
+//! submodule under `.git/modules`: the hooks, a `core.hooksPath`, the keys
+//! of `config` and `config.worktree` that run a command or point a fetch
+//! at a remote other than origin, and every entry of those git directories
+//! that is not plain data. So the sweep's record of what is new or
+//! changed, its notifications and `sweep allow` see a change to any of
+//! them. Plain data (objects, refs, the index, logs and the other names in
+//! `checkout::PLAIN_DATA`) changes with every update and is only read by
+//! git; anything else in a git directory, an entry there of a kind it
+//! should not be, and a `.git` below the top of the checkout are findings.
 //! What a checkout says is read as files and never by running git: the
-//! origin from `.git/config`, the commit from `.git/HEAD` and the refs,
-//! and the commit `lazy-lock.json` pins.
+//! origin from `.git/config` and `.git/config.worktree`, the commit from
+//! `.git/HEAD` and the refs, and the commit `lazy-lock.json` pins.
 //!
 //! Trust on first use. A `LazyVim` install holds some 3,500 Lua files: an AI
 //! review of all of them on the first sweep would be one very large review,

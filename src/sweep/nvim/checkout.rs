@@ -90,7 +90,9 @@ pub(super) struct Run {
     /// or directory is.
     pub(super) what: String,
     /// The file's content, for the content hash; `None` for a key, whose
-    /// text is `what`, and for a directory.
+    /// text is `what`, for a directory, and for a `.git` below the top of
+    /// the checkout, file or directory, whose content the walk of the tree
+    /// hashes already.
     pub(super) entry: Option<Entry>,
 }
 
