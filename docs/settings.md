@@ -339,11 +339,30 @@ are listed under [How the reviewer is run](review.md#how-the-reviewer-is-run).
 
 ## Settings commands
 
-- `omarchy-guardian setup`: an interactive wizard that detects OpenCode and
-  Claude Code (suggesting Claude Sonnet when `claude` is installed), lets you
-  choose a profile, model(s) and thinking level, runs a two-sample test
-  review, then writes the user file and (with confirmation) the root-owned
-  system file.
+- `omarchy-guardian setup`: an interactive wizard. It first shows what it
+  found: OpenCode (with its version) and Claude Code, for your own reviews and
+  for the pacman gate, which only runs a root-owned reviewer
+  (`/usr/bin/claude`, `/usr/bin/opencode` or `/usr/local/bin/opencode`), and
+  says when OpenCode lists only its free, rate-limited `opencode/` models. It
+  lets you choose a profile, model(s) and thinking level (suggesting Claude
+  Sonnet when `claude` is installed) and runs a two-sample test review. Then it
+  asks which reviewer the pacman gate uses, offering only those the gate can
+  run: the review model when it can, Claude Code's models (or, when
+  `claude-code` is in a repository but not installed, installing it with
+  `sudo pacman` first), and OpenCode's models. The choice is tested the way
+  the gate runs a review. Last it writes the user file and (with
+  confirmation) the root-owned system file.
+  If the gate's test fails and you choose nothing else, setup still finishes
+  and the gate gets the review model, as before.
+- `omarchy-guardian setup --gate [--if-needed]`: only the pacman gate's
+  question, changing only the gate's model and the official-package model
+  (dropped when the gate cannot run it) in the system file, with
+  confirmation; `[agent.variants]` is kept, and the test uses it. With
+  `--if-needed` it asks nothing unless the gate cannot run its model, or runs
+  OpenCode's default or a free `opencode/` model, and there is something
+  better to offer; nor when your own file chose local-only and the system file
+  names no profile. The installer runs it that way when it keeps existing
+  settings.
 - `omarchy-guardian config show [--class NAME]`: the effective policy per class,
   each value tagged `profile`, `system` or `user`, plus any ignored user
   values and why. It also prints what the profile makes of low AI remarks,

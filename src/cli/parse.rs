@@ -30,7 +30,9 @@ Usage:
   omarchy-guardian permit [ID | --revoke ID]        (let one blocked install through; lists them without ID)
   omarchy-guardian log [--since TIME] [-n N] [--json]
                                                     (what Guardian decided, from the system journal)
-  omarchy-guardian setup
+  omarchy-guardian setup [--gate [--if-needed]]
+                                                    (--gate: choose only the pacman gate's reviewer;
+                                                    --if-needed: only when it has none it can run)
   omarchy-guardian protect [--off] [--yes]          (turn every gate on, or the install gates and the sweep off)
   omarchy-guardian test                             (test the saved reviewer with two samples)
   omarchy-guardian sweep [--all] [--json] [--root] [--diff] [--report] | allow PATH|--migrate | forget PATH|--all
@@ -62,7 +64,12 @@ pub(super) enum Invocation {
     MakepkgGate(Vec<OsString>),
     Config(ConfigCommand),
     Forget(Forget),
-    Setup,
+    /// `setup`; with `gate`, only the pacman gate's reviewer, and with
+    /// `if_needed` only when the system file names none the gate can run.
+    Setup {
+        gate: bool,
+        if_needed: bool,
+    },
     /// `protect [--yes]`: turn on every gate that is off.
     Protect {
         yes: bool,
@@ -223,7 +230,7 @@ pub(super) fn parse(args: &[OsString]) -> Result<Invocation, String> {
         Some("pacman-hook-result") => {
             utf8_arguments("pacman-hook-result", rest).map(Invocation::HookResult)
         }
-        Some("setup") if rest.is_empty() => Ok(Invocation::Setup),
+        Some("setup") => parse_setup(rest),
         Some("protect") => {
             let mut yes = false;
             let mut off = false;
@@ -277,6 +284,28 @@ pub(super) fn parse(args: &[OsString]) -> Result<Invocation, String> {
             _ => Err("usage: omarchy-guardian tui [--expert]".into()),
         },
         _ => Err(format!("unknown command {:?}", command.to_string_lossy())),
+    }
+}
+
+/// `setup [--gate [--if-needed]]`.
+fn parse_setup(rest: &[OsString]) -> Result<Invocation, String> {
+    let flags: Vec<Option<&str>> = rest.iter().map(|flag| flag.to_str()).collect();
+    match flags.as_slice() {
+        [] => Ok(Invocation::Setup {
+            gate: false,
+            if_needed: false,
+        }),
+        [Some("--gate")] => Ok(Invocation::Setup {
+            gate: true,
+            if_needed: false,
+        }),
+        [Some("--gate"), Some("--if-needed")] | [Some("--if-needed"), Some("--gate")] => {
+            Ok(Invocation::Setup {
+                gate: true,
+                if_needed: true,
+            })
+        }
+        _ => Err("usage: omarchy-guardian setup [--gate [--if-needed]]".into()),
     }
 }
 
