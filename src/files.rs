@@ -85,7 +85,8 @@ impl AtomicWrite {
 /// The new file is made new, never written through a link left under its
 /// name, and does not stay behind where any step fails.
 /// With `sync`, the directory is synced after the move too, so the new
-/// name survives a crash as well as the bytes.
+/// name survives a crash as well as the bytes. That sync comes after the
+/// move, so when it fails the new file is already in place.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8], options: &AtomicWrite) -> io::Result<()> {
     let temporary = &options.temporary;
     drop(fs::remove_file(temporary));

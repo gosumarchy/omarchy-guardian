@@ -153,9 +153,10 @@ pub(crate) enum Consent {
 }
 
 /// `omarchy-guardian protect`: turns on every gate that is off, after
-/// showing each step and, unless the user's consent was `Given` (`--yes`), asking. The pacman hook is left off
-/// when the pacman gate could not review with the current settings, since it
-/// would refuse every such install.
+/// showing each step and, unless the user's consent was `Given` (`--yes`),
+/// asking. The pacman hook is left off when the pacman gate could not
+/// review with the current settings, since it would refuse every such
+/// install.
 pub(crate) fn protect(consent: Consent, confirm: &mut dyn Confirm) -> Result<String, Error> {
     let yes = consent == Consent::Given;
     status::watched();
