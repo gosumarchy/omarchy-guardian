@@ -129,19 +129,19 @@ pub(super) fn collect(root: &Path, places: &Places) -> Inventory {
     // Only the path is said: these files hold registry tokens.
     for file in &npm.unreadable {
         inventory.unchecked.push(format!(
-            "{} could not be read (a link, closed, too large, or not found): it may name a private registry, so no npm package was looked up in OSV, and packages under an npm prefix it may set were not read",
+            "{} could not be read (not a regular file, closed, too large, or not found): it may name a private registry, so no npm package was looked up in OSV, and packages under an npm prefix it may set were not read",
             text::shown(file)
         ));
     }
     for file in &pip.unreadable {
         inventory.unchecked.push(format!(
-            "{} could not be read (a link, closed, too large, or not found): it may name a private index, so no Python package pip installed was looked up in OSV",
+            "{} could not be read (not a regular file, closed, too large, or not found): it may name a private index, so no Python package pip installed was looked up in OSV",
             text::shown(file)
         ));
     }
     for file in &uv.unreadable {
         inventory.unchecked.push(format!(
-            "{} could not be read (a link, closed, too large, not TOML, or not found): it may name a private index, so no Python package mise installed through uv was looked up in OSV",
+            "{} could not be read (not a regular file, closed, too large, not TOML, or not found): it may name a private index, so no Python package mise installed through uv was looked up in OSV",
             text::shown(file)
         ));
     }

@@ -416,7 +416,7 @@ looked up in [OSV](https://osv.dev), and a version OSV lists as malicious (an
 advisory whose id starts with `MAL-`) is a high finding. Other advisories
 (known vulnerabilities) are not reported here.
 
-What is read (no tool is run; for links, see below):
+What is read and never run (links below these places are not followed, see below):
 
 - global npm packages: `/usr/lib/node_modules`, the `lib/node_modules` under
   the `prefix` your npm configuration sets, and each node mise installed, with
@@ -506,13 +506,14 @@ packages nested deeper than 8 levels, a package OSV listed more advisories for
 than one answer holds, and a request to OSV that failed (offline, OSV down),
 whose packages are each said as not checked, never as clear: one failed
 lookup leaves every package of its ecosystem not checked. An npm, pip or uv
-configuration file that is there and cannot be read (a link, closed, over
-1 MiB, or for uv not TOML) is said as well, by its path alone: no npm package
+configuration file that is there and cannot be read (a broken link, not a
+regular file, closed, over 1 MiB, or for uv not TOML) is said as well, by its path alone: no npm package
 is looked up and the npm prefix it may set is not read, or no Python package
 pip (or uv) installed is looked up, since it may name a private registry or
 index. A `pipx_metadata.json`, `pip.conf` or `uv-receipt.toml` inside an
 environment that cannot be read is said too, and that environment is left
-out. A link below where the tools keep their packages (a package directory
+out. A linked npm, pip or uv configuration file is followed, as the tool
+follows it (dotfile managers place them so). A link below where the tools keep their packages (a package directory
 `npm link` made, a linked environment, `lib`, `site-packages` or
 `node_modules`) is not followed, and a note names it; a link among the parts
 of such a place itself (an npm prefix, `CARGO_HOME`, mise's or pipx's home, a

@@ -257,7 +257,7 @@ pub(super) struct NpmConfig {
     registry: Option<String>,
     /// The registry of each scope that has its own (`@scope:registry`).
     scoped: Vec<(String, String)>,
-    /// The files that are there and could not be read (a link, closed, or
+    /// The files that are there and could not be read (not a regular file, closed, or
     /// too large), or cannot be found, as said to the user: what they set
     /// is not known, so no package counts as public.
     pub(super) unreadable: Vec<String>,
@@ -536,25 +536,37 @@ pub(super) fn pipx_metadata_other_index(text: &str) -> bool {
 /// What reading one configuration file gave.
 enum ConfigFile {
     Absent,
-    /// There, and a link, closed, or larger than `MAX_CONFIG_BYTES`.
+    /// There, and a broken link, not a regular file, closed, or larger
+    /// than `MAX_CONFIG_BYTES`.
     Unreadable,
     Text(String),
 }
 
+/// Reads a configuration file, following a link to it: dotfile managers
+/// link these files, and the tool follows the link too. The target must
+/// still be a regular file within the size limit.
 fn read_config(root: &Path, file: &str) -> ConfigFile {
     let path = root.join(file);
-    match fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => ConfigFile::Absent,
-        Err(_) => ConfigFile::Unreadable,
-        Ok(_) => read_small_file(&path, MAX_CONFIG_BYTES)
-            .map_or(ConfigFile::Unreadable, ConfigFile::Text),
+    if let Err(error) = fs::symlink_metadata(&path) {
+        return match error.kind() {
+            io::ErrorKind::NotFound => ConfigFile::Absent,
+            _ => ConfigFile::Unreadable,
+        };
     }
+    fs::canonicalize(&path)
+        .ok()
+        .and_then(|target| read_small_file(&target, MAX_CONFIG_BYTES))
+        .map_or(ConfigFile::Unreadable, ConfigFile::Text)
 }
 
 /// Whether pip arguments, as pipx records them for an environment, bring
 /// packages from somewhere other than the Python Package Index.
 fn has_index_argument<'a>(arguments: impl IntoIterator<Item = &'a str>) -> bool {
     arguments.into_iter().any(|argument| {
+        // Any mention of an index fails closed, whatever the spelling.
+        if argument.contains("index") || argument.contains("find-link") {
+            return true;
+        }
         let name = argument.split_once('=').map_or(argument, |(name, _)| name);
         match name.strip_prefix("--") {
             // optparse takes any unambiguous start of a long option. One
@@ -721,7 +733,12 @@ mod tests {
         assert!(has_index_argument(["--index-url", "https://x"]));
         assert!(has_index_argument(["--extra-index-url=https://x"]));
         assert!(has_index_argument(["-ihttps://x"]));
-        assert!(!has_index_argument(["--no-cache-dir", "--index-urlx"]));
+        assert!(!has_index_argument(["--no-cache-dir", "-U"]));
+        assert!(has_index_argument(["--index-urlx"]));
+        assert!(has_index_argument([
+            "--trusted-host=x",
+            "--find-links-somewhere"
+        ]));
         for abbreviated in [
             "--extra-index=https://x",
             "--find",

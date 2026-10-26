@@ -705,7 +705,7 @@ fn a_linked_lib_is_not_followed() {
 }
 
 #[test]
-fn an_npmrc_that_cannot_be_read_is_said_by_its_path_alone() {
+fn a_linked_npmrc_is_followed_and_one_that_cannot_be_read_is_said_by_its_path_alone() {
     let root = TempDir::new("packages-npmrc-link");
     let root = root.path();
     write(
@@ -714,13 +714,25 @@ fn an_npmrc_that_cannot_be_read_is_said_by_its_path_alone() {
         "prefix=/opt/g\n//r.example/:_authToken=secret\n",
     );
     npm(root, "opt/g/lib/node_modules/hidden", "hidden", "1.0.0");
-    // It may set a private registry, so no npm package is taken at all.
     npm(root, "usr/lib/node_modules/system", "system", "1.0.0");
     fs::create_dir_all(root.join("home/u")).unwrap();
     symlink(root.join("dotfiles/npmrc"), root.join("home/u/.npmrc")).unwrap();
 
+    // A dotfile manager's link is followed, as npm follows it.
     let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    assert_eq!(
+        found(&inventory),
+        [
+            (Ecosystem::Npm, "hidden", "1.0.0"),
+            (Ecosystem::Npm, "system", "1.0.0"),
+        ]
+    );
 
+    // One that leads to no regular file may set a private registry, so no
+    // npm package is taken at all.
+    fs::remove_file(root.join("home/u/.npmrc")).unwrap();
+    symlink(root.join("dotfiles"), root.join("home/u/.npmrc")).unwrap();
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
     assert_eq!(found(&inventory), []);
     let unchecked = inventory.unchecked.join("\n");
     assert!(
