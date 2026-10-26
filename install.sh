@@ -530,6 +530,19 @@ if has_command protect; then
 else
     note "This Guardian version cannot do it from here; open omarchy-guardian tui and choose Protect everything."
 fi
+# A timer enabled before this install is started by systemd at login only
+# when its unit was there then: one enabled earlier (a home kept across a
+# reinstall of the system) whose package came back after this login stays
+# stopped until the next one, and `protect` counts it as on.
+sweep_timer=omarchy-guardian-sweep.timer
+if systemctl --user is-enabled -q "$sweep_timer" 2>/dev/null &&
+    ! systemctl --user is-active -q "$sweep_timer" 2>/dev/null; then
+    if systemctl --user start "$sweep_timer"; then
+        ok "Started the daily sweep's timer"
+    else
+        note "The daily sweep's timer is on but not running; start it with: systemctl --user start $sweep_timer"
+    fi
+fi
 
 ###############################################################################
 if grep -qs '^profile = "local-only"' "$user_config"; then

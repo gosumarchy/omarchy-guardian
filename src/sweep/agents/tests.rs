@@ -948,6 +948,20 @@ fn the_plugin_directory_is_written_in_only_for_its_own_variable() {
         "/home/u/p/a /home/u/p/b $CLAUDE_PLUGIN_ROOTS"
     );
     assert_eq!(with_plugin_root("$CLAUDE_PLUGIN_ROOT", root), "/home/u/p");
+    // With a default, as trailofbits' modern-python writes its hook: the
+    // variable is set, so the default never applies.
+    assert_eq!(
+        with_plugin_root(
+            r#"bash "${CLAUDE_PLUGIN_ROOT:-.}/hooks/a.sh" ${CLAUDE_PLUGIN_ROOT-x}/b ${CLAUDE_PLUGIN_ROOT:=y}/c"#,
+            root
+        ),
+        r#"bash "/home/u/p/hooks/a.sh" /home/u/p/b /home/u/p/c"#
+    );
+    // `:+` gives its word, not the directory; a nested default is not read.
+    assert_eq!(
+        with_plugin_root("${CLAUDE_PLUGIN_ROOT:+a} ${CLAUDE_PLUGIN_ROOT:-${X}}", root),
+        "${CLAUDE_PLUGIN_ROOT:+a} ${CLAUDE_PLUGIN_ROOT:-${X}}"
+    );
     assert_eq!(
         with_plugin_root("${CLAUDE_PLUGIN_ROOT}/a", None),
         "${CLAUDE_PLUGIN_ROOT}/a"

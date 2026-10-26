@@ -421,7 +421,7 @@ pub(super) fn with_plugin_root(line: &str, root: Option<&str>) -> String {
         return line.to_string();
     };
     let directory = format!("/{root}");
-    let line = line.replace(&format!("${{{PLUGIN_ROOT}}}"), &directory);
+    let line = with_braced_plugin_root(line, &directory);
     let bare = format!("${PLUGIN_ROOT}");
     let mut out = String::with_capacity(line.len());
     let mut rest = line.as_str();
@@ -435,6 +435,40 @@ pub(super) fn with_plugin_root(line: &str, root: Option<&str>) -> String {
             out.push_str(&directory);
         }
         rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `line` with `directory` written in for `${CLAUDE_PLUGIN_ROOT}` and for
+/// the forms with a default (`${CLAUDE_PLUGIN_ROOT:-.}`, `-`, `:=`, `=`).
+/// Claude Code sets the variable for a plugin's commands, so the default
+/// is never used and each stands for the directory. Other forms (`:+`, a
+/// default holding a brace) are left as written.
+fn with_braced_plugin_root(line: &str, directory: &str) -> String {
+    let open = format!("${{{PLUGIN_ROOT}");
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(at) = rest.find(&open) {
+        let after = &rest[at + open.len()..];
+        out.push_str(&rest[..at]);
+        let end = after
+            .find('}')
+            .filter(|&end| !after[..end].contains('{'))
+            .filter(|&end| {
+                let operator = &after[..end];
+                operator.is_empty()
+                    || [":-", ":=", "-", "="]
+                        .iter()
+                        .any(|form| operator.starts_with(form))
+            });
+        if let Some(end) = end {
+            out.push_str(directory);
+            rest = &after[end + 1..];
+        } else {
+            out.push_str(&open);
+            rest = after;
+        }
     }
     out.push_str(rest);
     out
