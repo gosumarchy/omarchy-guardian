@@ -541,7 +541,9 @@ fn upgrade_note(manifest: &[ManifestEntry]) -> String {
     )
 }
 
-/// How many chunk reviews run at once, after the first.
+/// How many chunk reviews run at once, after the first. Arbitrary: more
+/// finish a large source sooner, and put more requests to the provider at
+/// the same moment.
 const PARALLEL_REVIEWS: usize = 3;
 
 /// The pause before retrying a review that found the AI unavailable.
@@ -823,19 +825,23 @@ fn review_parallel(
     settings: &AgentSettings,
     config: ReviewerConfig,
 ) -> Vec<(usize, Live)> {
+    // Relaxed throughout: `next` only hands out each index once, which
+    // `fetch_add` does under any ordering, and `stop` guards no data (the
+    // results go through the mutex). A worker that misses a `stop` just set
+    // starts one more review, as it would had it started a moment sooner.
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
     let results = Mutex::new(Vec::new());
     thread::scope(|scope| {
         for _ in 0..PARALLEL_REVIEWS.min(indexes.len()) {
             scope.spawn(|| {
-                while !stop.load(Ordering::SeqCst) {
-                    let Some(&index) = indexes.get(next.fetch_add(1, Ordering::SeqCst)) else {
+                while !stop.load(Ordering::Relaxed) {
+                    let Some(&index) = indexes.get(next.fetch_add(1, Ordering::Relaxed)) else {
                         break;
                     };
                     let live = review_with_retry(binary, &requests[index], settings, config);
                     if live.0.is_err() {
-                        stop.store(true, Ordering::SeqCst);
+                        stop.store(true, Ordering::Relaxed);
                     }
                     results
                         .lock()
