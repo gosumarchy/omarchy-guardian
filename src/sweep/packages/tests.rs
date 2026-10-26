@@ -1009,7 +1009,7 @@ fn npms_global_file_under_each_prefix_decides_too() {
         inventory
             .unchecked
             .join("\n")
-            .contains("the file npm's globalconfig names (npmrc)"),
+            .contains("the path npm's globalconfig names (npmrc)"),
         "{:?}",
         inventory.unchecked
     );
@@ -1068,4 +1068,137 @@ fn cargo_source_replacement_leaves_every_crate_out() {
         "{:?}",
         inventory.unchecked
     );
+}
+
+#[test]
+fn a_nodes_builtin_npmrc_and_prefix_variable_decide_too() {
+    let root = TempDir::new("packages-npm-builtin");
+    let root = root.path();
+    let node = "home/u/.local/share/mise/installs/node/22.1.0";
+    let builtin = format!("{node}/lib/node_modules/npm/npmrc");
+    npm(
+        root,
+        &format!("{node}/lib/node_modules/npm"),
+        "npm",
+        "10.0.0",
+    );
+    npm(root, "opt/b/lib/node_modules/fromb", "fromb", "1.0.0");
+    let places = Places::defaults(Some(HOME));
+
+    write(root, &builtin, "prefix=/opt/b\n");
+    assert_eq!(found(&inventory::collect(root, &places)).len(), 2);
+
+    write(root, &builtin, "registry=https://npm.corp.example/\n");
+    assert_eq!(found(&inventory::collect(root, &places)), []);
+
+    write(root, &builtin, "globalconfig=/srv/npmrc\n");
+    write(root, "srv/npmrc", "registry=https://npm.corp.example/\n");
+    assert_eq!(found(&inventory::collect(root, &places)), []);
+    fs::remove_file(root.join("srv/npmrc")).unwrap();
+    assert_eq!(found(&inventory::collect(root, &places)).len(), 1);
+
+    // PREFIX is npm's prefix where none is set: its packages are read, and
+    // its global file too.
+    fs::remove_file(root.join(&builtin)).unwrap();
+    let with_prefix = Places {
+        npm_global_prefix: Some("/opt/b".to_string()),
+        ..Places::defaults(Some(HOME))
+    };
+    assert_eq!(found(&inventory::collect(root, &with_prefix)).len(), 2);
+    write(
+        root,
+        "opt/b/etc/npmrc",
+        "registry=https://npm.corp.example/\n",
+    );
+    assert_eq!(found(&inventory::collect(root, &with_prefix)), []);
+}
+
+#[test]
+fn etc_npmrc_cannot_make_a_private_registry_public() {
+    let root = TempDir::new("packages-etc-npmrc");
+    let root = root.path();
+    npm(root, "usr/lib/node_modules/system", "system", "1.0.0");
+    let places = Places::defaults(Some(HOME));
+    write(
+        root,
+        "usr/etc/npmrc",
+        "registry=https://npm.corp.example/\n",
+    );
+    write(root, "etc/npmrc", "registry=https://registry.npmjs.org/\n");
+    assert_eq!(found(&inventory::collect(root, &places)), []);
+
+    write(
+        root,
+        "usr/etc/npmrc",
+        "registry=https://registry.npmjs.org/\n",
+    );
+    write(root, "etc/npmrc", "registry=https://npm.corp.example/\n");
+    assert_eq!(found(&inventory::collect(root, &places)), []);
+}
+
+#[test]
+fn a_shared_unreadable_file_is_said_once_and_an_absent_npm_runs_no_scripts() {
+    let root = TempDir::new("packages-npm-once");
+    let root = root.path();
+    let installs = "home/u/.local/share/mise/installs/node";
+    for version in ["20.1.0", "22.1.0"] {
+        write(
+            root,
+            &format!("{installs}/{version}/lib/node_modules/npm/npmrc"),
+            "ignore-scripts=true\n",
+        );
+    }
+    let places = Places::defaults(Some(HOME));
+    // No npm of the system's: only the nodes' npm, which runs none.
+    assert!(!inventory::collect(root, &places).npm_runs_scripts);
+
+    fs::create_dir_all(root.join("srv/npmrc")).unwrap();
+    write(root, "home/u/.npmrc", "globalconfig=/srv/npmrc\n");
+    let inventory = inventory::collect(root, &places);
+    let said = inventory
+        .unchecked
+        .iter()
+        .filter(|sentence| sentence.contains("/srv/npmrc could not be read"))
+        .count();
+    assert_eq!(said, 1, "{:?}", inventory.unchecked);
+}
+
+#[test]
+fn crates_from_another_sparse_registry_and_cargo_config_elsewhere_are_left_out() {
+    let root = TempDir::new("packages-cargo-more");
+    let root = root.path();
+    crates(
+        root,
+        "home/u/.cargo/.crates2.json",
+        &[
+            "inhouse 1.0.0 (sparse+https://cargo.corp.example/)",
+            "ripgrep 14.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+        ],
+    );
+    let places = Places::defaults(Some(HOME));
+    assert_eq!(
+        found(&inventory::collect(root, &places)),
+        [(Ecosystem::CratesIo, "ripgrep", "14.1.0")]
+    );
+
+    // The root's `.cargo`, and the home's when CARGO_HOME is elsewhere.
+    let moved = Places {
+        cargo: Some("opt/cargo".to_string()),
+        ..Places::defaults(Some(HOME))
+    };
+    crates(
+        root,
+        "opt/cargo/.crates2.json",
+        &["ripgrep 14.1.0 (registry+https://github.com/rust-lang/crates.io-index)"],
+    );
+    assert_eq!(found(&inventory::collect(root, &moved)).len(), 1);
+    for file in ["home/u/.cargo/config.toml", ".cargo/config"] {
+        write(
+            root,
+            file,
+            "[source.crates-io]\nreplace-with = \"mirror\"\n",
+        );
+        assert_eq!(found(&inventory::collect(root, &moved)), [], "{file}");
+        fs::remove_file(root.join(file)).unwrap();
+    }
 }

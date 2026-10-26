@@ -101,7 +101,16 @@ pub(super) fn collect(root: &Path, places: &Places) -> Inventory {
     nodes.extend(places.mise.as_ref().map_or_else(Vec::new, |mise| {
         mise_nodes(root, &format!("{mise}/installs/node"))
     }));
-    let npm = NpmConfig::read(root, places, &nodes);
+    let too_many_nodes = nodes.len() > MAX_NODES + 1;
+    nodes.truncate(MAX_NODES + 1);
+    let mut npm = NpmConfig::read(root, places, &nodes);
+    if too_many_nodes {
+        // A node whose configuration was not read may take packages from a
+        // private registry: it counts as a file that could not be read.
+        npm.unreadable.push(format!(
+            "the npm configuration of the nodes mise installed past the first {MAX_NODES}"
+        ));
+    }
     let pip = IndexConfig::pip(root, places);
     let uv = IndexConfig::uv(root, places);
     let cargo = IndexConfig::cargo(root, places);
@@ -133,7 +142,7 @@ pub(super) fn collect(root: &Path, places: &Places) -> Inventory {
     // Only the path is said: these files hold registry tokens.
     for file in &npm.unreadable {
         inventory.unchecked.push(format!(
-            "{} could not be read (not a regular file, closed, too large, or not found): it may name a private registry, so no npm package was looked up in OSV, and packages under an npm prefix it may set were not read",
+            "{} could not be read (not a regular file, closed, too large, not found, or past a limit): it may name a private registry, so no npm package was looked up in OSV, and packages under an npm prefix it may set were not read",
             text::shown(file)
         ));
     }
@@ -165,7 +174,7 @@ pub(super) fn collect(root: &Path, places: &Places) -> Inventory {
 
 /// The directories of the nodes mise installed under `node`, relative to
 /// the root. A link is one of mise's short versions, read under the full
-/// one. At most `MAX_NODES` are taken.
+/// one. One more than `MAX_NODES` is taken, to tell that there are more.
 fn mise_nodes(root: &Path, node: &str) -> Vec<String> {
     let path = root.join(node);
     if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
@@ -178,7 +187,7 @@ fn mise_nodes(root: &Path, node: &str) -> Vec<String> {
         .flatten()
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .filter_map(|entry| entry.file_name().into_string().ok())
-        .take(MAX_NODES)
+        .take(MAX_NODES + 1)
         .map(|version| format!("{node}/{version}"))
         .collect()
 }

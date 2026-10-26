@@ -451,15 +451,20 @@ from PyPI, crates from crates.io.
   decides, or `_resolved` where an older npm wrote one. A global package
   installed from git or a tarball under a name whose registry is the public
   one is sent like any other. npm's configuration is read as each node's
-  npm reads it, the system's (`/usr`) and each one mise installed: its
-  built-in `npmrc`, its global file (`etc/npmrc` under the `prefix` in
-  effect, which is the node's own directory unless one is set, or the file
-  `globalconfig` names; `/etc/npmrc` too for the system's), your
-  `~/.npmrc` and the environment. A package is sent only when every node's
-  npm takes it from the public registry. Where an npm configuration file
-  is there and cannot be read, or `globalconfig` or
-  `npm_config_userconfig` names one by a path that is not absolute, no npm
-  package is sent: it may set a private registry.
+  npm reads it, the system's (`/usr`) and each one mise installed (up to
+  100): its built-in `npmrc`, its global file (`etc/npmrc` under the
+  `prefix` in effect, which is `PREFIX` or else the node's own directory
+  unless one is set, or the file `globalconfig` names), your `~/.npmrc` and
+  the `npm_config_*` variables that are not empty. npm's `DESTDIR` is not
+  read. For the system's npm, `/etc/npmrc` is read before the global file
+  and must on its own take packages from the public registry too: where
+  Arch's npm reads it from is not known. A package is sent only when every
+  node's npm takes it from the public registry. Where an npm configuration
+  file is there and cannot be read, a `prefix` or `globalconfig` is a path
+  npm would resolve against its working directory (relative, or with a
+  variable other than `~/` or `${HOME}/`), `npm_config_userconfig` or
+  `PREFIX` is not absolute, or more than 100 nodes are installed, no npm
+  package is sent: a private registry may be set where it was not read.
 - pip: a package installed from an address or a local directory (it has a
   `direct_url.json`) is left out. So is every package of a pipx environment
   installed with another index or a requirements or constraints file
@@ -491,10 +496,11 @@ from PyPI, crates from crates.io.
 - cargo: crates from git, a path or another registry are left out. A crate
   from a source that replaces crates.io (`[source.crates-io] replace-with`)
   is still recorded as from crates.io, so every crate is left out, and the
-  reason said, where cargo's `config.toml` or `config` under `CARGO_HOME`
-  has any `[source]` table or an `include`, or cannot be read or parsed.
-  cargo takes neither from the environment. A `.cargo/config.toml` in the
-  directory `cargo install` ran from is not known and not read.
+  reason said, where cargo's `config.toml` or `config` under `CARGO_HOME`,
+  `~/.cargo` or `/.cargo` has any `[source]` table or an `include`, or
+  cannot be read or parsed. cargo takes neither from the environment. The
+  `.cargo` of other directories above where `cargo install` ran is not
+  known and not read.
 
 What is left out this way is said as not checked, so a machine with such
 packages has an incomplete sweep.
@@ -535,7 +541,7 @@ home kept on another disk) is followed, as the tool follows it. An
 `*.egg-info` package is not read.
 
 When npm is installed (`/usr/bin/npm`, or a node of mise's) and the
-configuration of any node's npm, read in the order above with each file
+configuration of any installed node's npm, read in the order above with each file
 winning over the one before (your `~/.npmrc` or the file
 `npm_config_userconfig` names over the global files, and
 `npm_config_ignore_scripts` in the environment over all), does not set
