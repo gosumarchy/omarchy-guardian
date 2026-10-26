@@ -483,8 +483,12 @@ fn git_alerts(name: &str, git: &Git, specs: &Specs, alerts: &mut Vec<(RuleId, St
             RuleId::PluginSource,
             "its checkout names no origin to fetch from".into(),
         )),
-        // Said as not checked where it was read.
-        Remote::Unread => {}
+        // Also said as not checked where it was read, with why.
+        Remote::Unread => alerts.push((
+            RuleId::PluginSource,
+            "where its checkout is fetched from could not be read one way, so it was not checked"
+                .into(),
+        )),
     }
     for run in &git.runs {
         let alert = match run.line {

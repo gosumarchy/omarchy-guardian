@@ -472,9 +472,15 @@ impl Gits<'_> {
         worktree: Option<&str>,
     ) -> Option<String> {
         let mut hooks_path = None;
-        for (file, text) in [
-            (format!("{git}/config"), config),
-            (format!("{git}/config.worktree"), worktree),
+        // git fetches from the first url of origin; a clone writes one.
+        let mut origin_urls = 0;
+        for (file, kind, text) in [
+            (format!("{git}/config"), ConfigFile::Config, config),
+            (
+                format!("{git}/config.worktree"),
+                ConfigFile::Worktree,
+                worktree,
+            ),
         ] {
             let Some(text) = text else {
                 continue;
@@ -486,7 +492,12 @@ impl Gits<'_> {
             // here, in the tree or not: a plugin's files are reviewed only
             // once they change.
             for found in git_state::keys(text) {
-                if cloned(git, &found, self.gitmodules.as_deref()) {
+                let is_origin_url = (found.section.as_str(), found.subsection.as_deref())
+                    == ("remote", Some("origin"))
+                    && found.key == "url";
+                origin_urls += usize::from(is_origin_url);
+                let extra_url = is_origin_url && origin_urls > 1;
+                if !extra_url && cloned(git, kind, &found, self.gitmodules.as_deref()) {
                     continue;
                 }
                 let what = match &found.subsection {
@@ -606,15 +617,34 @@ impl Gits<'_> {
     }
 }
 
-/// Whether `found`, a key of the configuration of the git directory `git`
-/// (`.git`, or a submodule's under `.git/modules`), is one that `git
-/// clone`, `git submodule` and lazy.nvim write, with a value they write:
-/// the keys of lazy.nvim's checkouts and their sparse checkout, as found
-/// in a stock `LazyVim` install, and those of a partial clone and a
-/// submodule.
-fn cloned(git: &str, found: &git_state::ConfigKey, gitmodules: Option<&str>) -> bool {
+/// Which configuration file of a git directory a key is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigFile {
+    Config,
+    /// `config.worktree`, where lazy.nvim writes its sparse checkout.
+    Worktree,
+}
+
+/// Whether `found`, a key of the configuration file `file` of the git
+/// directory `git` (`.git`, or a submodule's under `.git/modules`), is one
+/// that `git clone`, `git submodule` and lazy.nvim write, in that file and
+/// with a value they write: the keys of lazy.nvim's checkouts and their
+/// sparse checkout, as found in a stock `LazyVim` install, and those of a
+/// partial clone and a submodule. `gitmodules` is the checkout's
+/// `.gitmodules`.
+fn cloned(
+    git: &str,
+    file: ConfigFile,
+    found: &git_state::ConfigKey,
+    gitmodules: Option<&str>,
+) -> bool {
     let value = found.value.as_str();
     let origin = found.subsection.as_deref() == Some("origin");
+    let sparse = found.section == "core"
+        && matches!(found.key.as_str(), "sparsecheckout" | "sparsecheckoutcone");
+    if sparse != (file == ConfigFile::Worktree) {
+        return false;
+    }
     match (found.section.as_str(), found.key.as_str()) {
         ("core", "repositoryformatversion") => matches!(value, "0" | "1"),
         ("core", "filemode") => matches!(value, "true" | "false"),
@@ -624,8 +654,21 @@ fn cloned(git: &str, found: &git_state::ConfigKey, gitmodules: Option<&str>) -> 
         }
         ("core", "sparsecheckoutcone") => matches!(value, "true" | "false"),
         ("core", "worktree") => git != ".git" && is_own_worktree(git, value),
+        // Where the checkout comes from is compared with its specs; where a
+        // submodule comes from, with `.gitmodules`, as `git submodule`
+        // copies it from there. The name of a submodule's own submodule
+        // is not told apart from the path it is under, so that stays a
+        // finding.
+        ("remote", "url") => match git.strip_prefix(".git/modules/") {
+            None => origin,
+            Some(name) => {
+                origin
+                    && !name.contains("/modules/")
+                    && gitmodules_url(gitmodules, name).is_some_and(|url| url == value)
+            }
+        },
         // A filter only tells the server what to leave out.
-        ("remote", "url" | "partialclonefilter") => origin,
+        ("remote", "partialclonefilter") => origin,
         ("remote", "fetch") => origin && is_origin_refspec(value),
         ("remote", "promisor") => origin && value == "true",
         ("remote", "tagopt") => origin && value == "--no-tags",
@@ -634,10 +677,9 @@ fn cloned(git: &str, found: &git_state::ConfigKey, gitmodules: Option<&str>) -> 
         // `git submodule init` copies it from `.gitmodules`, which is in
         // the working tree and so hashed and reviewed when it changes. A
         // submodule's own submodules are not matched against theirs.
-        ("submodule", "url") => match (&found.subsection, gitmodules) {
-            (Some(name), Some(gitmodules)) if git == ".git" => {
-                let urls = git_state::values(gitmodules, "submodule", Some(name), "url");
-                matches!(urls.as_slice(), [(_, url, Reading::Sure)] if *url == found.value)
+        ("submodule", "url") => match &found.subsection {
+            Some(name) if git == ".git" => {
+                gitmodules_url(gitmodules, name).is_some_and(|url| url == value)
             }
             _ => false,
         },
@@ -648,6 +690,16 @@ fn cloned(git: &str, found: &git_state::ConfigKey, gitmodules: Option<&str>) -> 
         ("extensions", "partialclone") => value == "origin",
         ("extensions", "objectformat") => matches!(value, "sha1" | "sha256"),
         _ => false,
+    }
+}
+
+/// The url `.gitmodules` gives the submodule `name`, if it gives one, read
+/// one way.
+fn gitmodules_url(gitmodules: Option<&str>, name: &str) -> Option<String> {
+    let urls = git_state::values(gitmodules?, "submodule", Some(name), "url");
+    match <[_; 1]>::try_from(urls) {
+        Ok([(_, url, Reading::Sure)]) => Some(url),
+        Ok([(_, _, Reading::OneOfSeveral)]) | Err(_) => None,
     }
 }
 

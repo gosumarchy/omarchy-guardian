@@ -484,6 +484,16 @@ fn other_remotes_and_a_worktree_origin_are_findings() {
     );
     let collected = self::collected(root);
     assert_eq!(plugin_of(&collected.items[0]).origin, None);
+    // An origin not read one way is a finding, not only a note.
+    assert!(
+        collected.items[0]
+            .alerts
+            .iter()
+            .any(|(rule, message)| *rule == RuleId::PluginSource
+                && message.contains("could not be read one way")),
+        "{:?}",
+        collected.items[0].alerts
+    );
     assert!(
         collected
             .unchecked
@@ -641,6 +651,71 @@ fn a_submodule_url_is_allowed_only_as_gitmodules_gives_it() {
         "[submodule \"same\"]\n\turl = https://github.com/o/same\n\turl = https://github.com/o/same\n",
     );
     assert_eq!(runs(root).len(), 4);
+}
+
+#[test]
+fn a_submodule_fetches_only_from_where_gitmodules_says() {
+    let temp = TempDir::new("nvim-module-origin");
+    let root = temp.path();
+    plugin(root, "p", "https://github.com/o/p", &[]);
+    write(
+        root,
+        &format!("{LAZY}/p/.gitmodules"),
+        "[submodule \"same\"]\n\tpath = same\n\turl = https://github.com/o/same\n\
+         [submodule \"other\"]\n\tpath = other\n\turl = https://github.com/o/other\n\
+         [submodule \"same/modules/inner\"]\n\tpath = inner\n\turl = https://github.com/o/same\n",
+    );
+    let modules = format!("{LAZY}/p/.git/modules");
+    for (git, url) in [
+        ("same", "https://github.com/o/same"),
+        ("other", "https://evil/other"),
+        ("same/modules/inner", "https://github.com/o/same"),
+    ] {
+        write(
+            root,
+            &format!("{modules}/{git}/config"),
+            &format!("[remote \"origin\"]\n\turl = {url}\n"),
+        );
+    }
+    let item = &collected(root).items[0];
+    let mut runs: Vec<&str> = item
+        .alerts
+        .iter()
+        .filter(|(rule, _)| *rule == RuleId::GitConfigCommand)
+        .map(|(_, message)| message.as_str())
+        .collect();
+    runs.sort_unstable();
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert!(runs[0].contains("modules/other/config") && runs[0].contains("https://evil/other"));
+    // A submodule's own submodule is not matched by name, even where the
+    // checkout's `.gitmodules` has an entry by that path.
+    assert!(runs[1].contains("modules/same/modules/inner/config"));
+}
+
+#[test]
+fn every_origin_url_after_the_first_is_a_finding() {
+    let one = "[remote \"origin\"]\n\turl = https://github.com/folke/flash.nvim.git\n";
+    let twice = format!("{CLONE_CONFIG}{one}");
+    let alerts = config_alerts(&twice, CLONE_WORKTREE);
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert!(alerts[0].contains("line 18: ") && alerts[0].contains(".git/config "));
+
+    let alerts = config_alerts(CLONE_CONFIG, &format!("{CLONE_WORKTREE}{one}"));
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert!(alerts[0].contains("line 5: ") && alerts[0].contains(".git/config.worktree"));
+}
+
+#[test]
+fn a_key_counts_only_in_the_file_a_clone_writes_it_to() {
+    let alerts = config_alerts(&format!("{CLONE_CONFIG}{CLONE_WORKTREE}"), CLONE_WORKTREE);
+    assert_eq!(alerts.len(), 2, "{alerts:?}");
+    assert!(alerts.iter().all(|alert| alert.contains(".git/config ")));
+    let alerts = config_alerts(
+        CLONE_CONFIG,
+        &format!("{CLONE_WORKTREE}[core]\n\tbare = false\n"),
+    );
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert!(alerts[0].contains("config.worktree") && alerts[0].contains("core.bare"));
 }
 
 #[test]

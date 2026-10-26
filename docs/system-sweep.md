@@ -392,8 +392,8 @@ repository and is a finding.
 What is read, all as files, without running git: the origin from `.git/config`
 and `.git/config.worktree` (with any user and password taken out of the
 address; an origin that is not exactly one address read one way, through a
-continued line or several `url` keys, is not checked, and says so; an empty
-`url` clears those before it, as git 2.46 and later does),
+continued line or several `url` keys, is not checked, and is a finding; an
+empty `url` clears those before it, as git 2.46 and later does),
 the commit from `.git/HEAD` and the refs (`packed-refs` too), every key of
 `.git/config` and `.git/config.worktree`, and of those of each submodule, read
 the way git reads them, the hooks in `.git/hooks`, in a
@@ -409,7 +409,8 @@ at; what is left is said as not checked.
 What is a finding, on every sweep:
 
 - `plugin-source`: a plugin directory that is no git checkout, or a link; a
-  checkout that names no origin; an origin that is not where any spec has
+  checkout that names no origin, or whose origin cannot be read one way; an
+  origin that is not where any spec has
   lazy.nvim fetch the plugin from (`owner/repo` is GitHub's, an address is
   taken as written; scheme, user, case and `.git` do not count). A plugin no
   spec names gets a note, not a finding: a spec built by code is not read;
@@ -421,25 +422,28 @@ What is a finding, on every sweep:
   a submodule, which git runs when lazy.nvim updates it;
 - `git-config-command`: any key of the configuration of the checkout or of a
   submodule (`config`, `config.worktree`) that `git clone`, `git submodule`
-  and lazy.nvim do not write, or with a value they do not write. They write
-  `core.repositoryformatversion`, `filemode`, `bare = false`,
-  `logallrefupdates = true`, `autocrlf = false`, `sparseCheckout` and
-  `sparseCheckoutCone`; a submodule's `core.worktree` that stays in the
-  checkout; `remote.origin.url`, its `fetch` into `refs/remotes/origin/`,
-  `promisor`, `partialclonefilter` and `tagopt = --no-tags`;
-  `branch.<name>.remote = origin` and `merge`; `submodule.active = .`,
-  `submodule.<name>.active = true` and, in the checkout's own `config`,
-  `submodule.<name>.url` when it is the one url the checkout's `.gitmodules`
-  gives that name (a file of the plugin, reviewed when it changes); and
-  `extensions.worktreeConfig`, `partialClone = origin` and `objectFormat`. Anything else is a finding,
-  as it may make the git commands lazy.nvim runs run a program or fetch from
-  elsewhere: a command key such as `core.fsmonitor`, `core.hooksPath`, a
-  proxy, `http.sslVerify`, another remote, `include.path`, a submodule url
-  that `.gitmodules` does not give (a relative one there, `./x` or `../x`,
-  which git writes into `config` as a full address, stays a finding until
-  you allow the plugin). So is any entry of a
-  git directory that is not plain data, and any `.git` directory or file
-  below the top of the checkout, whose configuration and hooks git may run.
+  and lazy.nvim do not write, in that file, or with a value they do not
+  write. In `config.worktree` they write `core.sparseCheckout` and
+  `sparseCheckoutCone`. In `config` they write `core.repositoryformatversion`,
+  `filemode`, `bare = false`, `logallrefupdates = true`, `autocrlf = false`, a
+  submodule's `core.worktree` that stays in the checkout; one
+  `remote.origin.url` (every one after the first is a finding: git fetches
+  from the first), which for a submodule must be the one url the checkout's
+  `.gitmodules` gives it, its `fetch` into `refs/remotes/origin/`, `promisor`,
+  `partialclonefilter` and `tagopt = --no-tags`; `branch.<name>.remote =
+  origin` and `merge`; `submodule.active = .`, `submodule.<name>.active =
+  true` and, in the checkout's own `config`, `submodule.<name>.url` when it is
+  the one url `.gitmodules` gives that name (a file of the plugin, reviewed
+  when it changes); and `extensions.worktreeConfig`, `partialClone = origin`
+  and `objectFormat`. Anything else is a finding, as it may make the git
+  commands lazy.nvim runs run a program or fetch from elsewhere: a command key
+  such as `core.fsmonitor`, `core.hooksPath`, a proxy, `http.sslVerify`,
+  another remote, `include.path`, a submodule url that `.gitmodules` does not
+  give (a relative one there, `./x` or `../x`, which git writes into `config`
+  as a full address, stays a finding until you allow the plugin), and the
+  url of a submodule's own submodule. So is any entry of a git directory that
+  is not plain data, and any `.git` directory or file below the top of the
+  checkout, whose configuration and hooks git may run.
 
 A build step that is a Neovim command (`":TSUpdate"`), a Lua function or a Lua
 expression that picks a command (`vim.g.x and "cargo build"`) is noted on the
