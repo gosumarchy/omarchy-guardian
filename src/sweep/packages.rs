@@ -7,7 +7,8 @@
 //! which is not this check's to report.
 //!
 //! What goes to OSV is the ecosystem, name and version of every installed
-//! package, at every sweep, and nothing else. Nothing is kept between
+//! package from a public registry, as far as the files tell (see
+//! `inventory`), at every sweep, and nothing else. Nothing is kept between
 //! sweeps: a package is often found malicious only after it was installed,
 //! and asking about all of them each time tells of it the next day. The
 //! lookup costs no AI call.

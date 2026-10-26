@@ -15,6 +15,7 @@ use std::io;
 use std::path::{Component, Path};
 
 use crate::files::read_small_file;
+use crate::json::Json;
 use crate::tomlish;
 
 /// The largest configuration file read. Arbitrary: such a file holds a few
@@ -61,14 +62,18 @@ const PYPI_HOSTS: &[&str] = &["pypi.org", "pypi.python.org", "files.pythonhosted
 /// The pip settings that bring packages from somewhere other than the Python Package Index.
 const PIP_INDEX_KEYS: &[&str] = &["index-url", "extra-index-url", "find-links"];
 
-/// The pip arguments that do the same, as pipx records them.
-const PIP_INDEX_ARGUMENTS: &[&str] = &[
-    "--index-url",
-    "--extra-index-url",
-    "--find-links",
-    "-i",
-    "-f",
+/// pip's long options that do the same, as pipx records them, with those
+/// that name a requirements or constraints file, which can set an index.
+const PIP_INDEX_OPTIONS: &[&str] = &[
+    "index-url",
+    "extra-index-url",
+    "find-links",
+    "requirement",
+    "constraint",
 ];
+
+/// Their short forms: `-i`, `-f`, `-r` and `-c`.
+const PIP_INDEX_SHORT_OPTIONS: &[char] = &['i', 'f', 'r', 'c'];
 
 /// Where the tools keep what they installed and their configuration,
 /// relative to the root, with the settings the environment gives.
@@ -97,7 +102,8 @@ pub(super) struct Places {
     /// like), as a file would write them.
     pub(super) pip_env: Vec<(String, String)>,
     /// The uv index variables the environment sets (`UV_INDEX_URL` and the
-    /// like), by name.
+    /// like), by name, and `UV_CONFIG_FILE` when it names a file that
+    /// cannot be found.
     pub(super) uv_env: Vec<String>,
 }
 
@@ -148,6 +154,14 @@ impl Places {
         places.pip_env = pip_variables(variables);
         if let Some((_, file)) = places.npm_env.iter().find(|(key, _)| key == "userconfig") {
             places.npmrc = from_root(file);
+            // A file that is not found here may set a private registry:
+            // an empty one counts as not public, and the environment's own
+            // setting, after it, still wins.
+            if places.npmrc.is_none() {
+                places
+                    .npm_env
+                    .insert(0, ("registry".to_string(), String::new()));
+            }
         }
         places.uv_env = variables
             .iter()
@@ -178,12 +192,22 @@ impl Places {
                 .uv
                 .extend(from_root(&format!("{directory}/uv/uv.toml")));
         }
-        places
-            .pip
-            .extend(variable("PIP_CONFIG_FILE").and_then(from_root));
-        places
-            .uv
-            .extend(variable("UV_CONFIG_FILE").and_then(from_root));
+        // A file named by a path that is not absolute is not found here,
+        // and what it sets is not known: it counts as another index.
+        if let Some(file) = variable("PIP_CONFIG_FILE") {
+            match from_root(file) {
+                Some(path) => places.pip.push(path),
+                None => places
+                    .pip_env
+                    .push(("index-url".to_string(), String::new())),
+            }
+        }
+        if let Some(file) = variable("UV_CONFIG_FILE") {
+            match from_root(file) {
+                Some(path) => places.uv.push(path),
+                None => places.uv_env.push("UV_CONFIG_FILE".to_string()),
+            }
+        }
         places
     }
 }
@@ -324,30 +348,20 @@ impl IndexConfig {
             .iter()
             .map(|file| (*file).to_string())
             .chain(places.pip.iter().cloned());
-        let mut settings: Vec<(String, String)> = Vec::new();
+        let mut other_index = places
+            .pip_env
+            .iter()
+            .any(|(_, value)| is_other_pip_index(value));
         let mut unreadable = Vec::new();
         for file in files {
             match read_config(root, &file) {
                 ConfigFile::Absent => {}
                 ConfigFile::Unreadable => unreadable.push(file),
-                ConfigFile::Text(text) => settings.extend(text.lines().filter_map(|line| {
-                    let (key, value) = setting(line, &['=', ':'])?;
-                    Some((
-                        key.to_ascii_lowercase().replace('_', "-"),
-                        value.to_string(),
-                    ))
-                })),
+                ConfigFile::Text(text) => other_index |= pip_file_other_index(&text),
             }
         }
-        settings.extend(places.pip_env.iter().cloned());
-        // A value pip writes on the lines after its key reads here as an
-        // empty one, so an empty value counts as another index too.
-        let other_index = !unreadable.is_empty()
-            || settings.iter().any(|(key, value)| {
-                PIP_INDEX_KEYS.contains(&key.as_str()) && !is_on(value, PYPI_HOSTS)
-            });
         Self {
-            other_index,
+            other_index: other_index || !unreadable.is_empty(),
             unreadable,
         }
     }
@@ -371,7 +385,10 @@ impl IndexConfig {
             };
             match entries {
                 Ok(entries) => {
-                    other_index |= entries.iter().any(|entry| is_uv_index(&entry.full_path()));
+                    other_index |= entries.iter().any(|entry| {
+                        is_uv_index(&entry.full_path())
+                            || inline_keys(&entry.value).any(|key| UV_INDEX_KEYS.contains(&key))
+                    });
                 }
                 Err(()) => unreadable.push(file),
             }
@@ -394,28 +411,82 @@ fn is_uv_index(path: &[&str]) -> bool {
 
 /// Whether uv's record of one tool (`uv-receipt.toml`) says it came from
 /// somewhere other than the Python Package Index: an index among its
-/// options, or a requirement with anything beyond a name, a version and
-/// extras (a git, url, path or index source). Text it cannot read counts.
+/// options, or a requirement (or constraint, or override) with anything
+/// beyond a name, a version and extras (a git, url, path or index source).
+/// Text it cannot read counts.
 pub(super) fn uv_receipt_other_index(text: &str) -> bool {
     let Ok(entries) = tomlish::entries(text) else {
         return true;
     };
     entries.iter().any(|entry| {
         let path = entry.full_path();
-        if path.iter().any(|part| UV_INDEX_KEYS.contains(part)) {
+        let mut keys = inline_keys(&entry.value);
+        if path.iter().any(|part| UV_INDEX_KEYS.contains(part))
+            || keys.any(|key| UV_INDEX_KEYS.contains(&key))
+        {
             return true;
         }
-        // Splitting the inline tables at every delimiter finds every key; a
-        // delimiter inside a string can only add a key that is not allowed.
-        path == ["tool", "requirements"]
-            && entry
-                .value
-                .split([',', '{', '}', '[', ']'])
-                .filter_map(|part| part.split_once('='))
-                .any(|(key, _)| {
-                    !UV_REQUIREMENT_KEYS.contains(&key.trim().trim_matches(['"', '\'']))
-                })
+        // Every list of requirements under `[tool]`; the entry points
+        // name the programs installed, not where they came from.
+        matches!(path.as_slice(), ["tool", list] if *list != "entrypoints")
+            && entry.value.starts_with('[')
+            && inline_keys(&entry.value).any(|key| !UV_REQUIREMENT_KEYS.contains(&key))
     })
+}
+
+/// The keys of the inline tables in a TOML value, unquoted. Splitting at
+/// every delimiter finds every key; a delimiter inside a string can only
+/// add a key that is not one, which leaves more out, never less.
+fn inline_keys(value: &str) -> impl Iterator<Item = &str> {
+    value
+        .split([',', '{', '}', '[', ']'])
+        .filter_map(|part| part.split_once('='))
+        .map(|(key, _)| key.trim().trim_matches(['"', '\'']))
+}
+
+/// Whether the text of a pip configuration file sets an index other than
+/// the Python Package Index. configparser joins an indented line to the
+/// value above it, which `setting` does not do: one counts, whatever the
+/// key above it.
+pub(super) fn pip_file_other_index(text: &str) -> bool {
+    text.lines().any(|line| {
+        let trimmed = line.trim();
+        if line.starts_with([' ', '\t']) && !trimmed.is_empty() && !trimmed.starts_with(['#', ';'])
+        {
+            return true;
+        }
+        setting(line, &['=', ':']).is_some_and(|(key, value)| {
+            let key = key.to_ascii_lowercase().replace('_', "-");
+            PIP_INDEX_KEYS.contains(&key.as_str()) && is_other_pip_index(value)
+        })
+    })
+}
+
+/// Whether the value of a pip index setting names anything but the Python
+/// Package Index. pip splits it on whitespace; an empty one is continued
+/// on the next line.
+fn is_other_pip_index(value: &str) -> bool {
+    value.is_empty() || !value.split_whitespace().all(|url| is_on(url, PYPI_HOSTS))
+}
+
+/// Whether pipx's record of an environment (`pipx_metadata.json`) says
+/// that a package in it was installed with another index. Text it cannot
+/// read counts.
+pub(super) fn pipx_metadata_other_index(text: &str) -> bool {
+    let Ok(json) = Json::parse(text) else {
+        return true;
+    };
+    let injected = json
+        .get("injected_packages")
+        .and_then(Json::as_object)
+        .unwrap_or_default()
+        .iter()
+        .map(|(_, package)| package);
+    json.get("main_package")
+        .into_iter()
+        .chain(injected)
+        .filter_map(|package| package.get("pip_args")?.as_array())
+        .any(|arguments| has_index_argument(arguments.iter().filter_map(Json::as_str)))
 }
 
 /// What reading one configuration file gave.
@@ -438,14 +509,23 @@ fn read_config(root: &Path, file: &str) -> ConfigFile {
 
 /// Whether pip arguments, as pipx records them for an environment, bring
 /// packages from somewhere other than the Python Package Index.
-pub(super) fn has_index_argument<'a>(arguments: impl IntoIterator<Item = &'a str>) -> bool {
+fn has_index_argument<'a>(arguments: impl IntoIterator<Item = &'a str>) -> bool {
     arguments.into_iter().any(|argument| {
-        PIP_INDEX_ARGUMENTS.iter().any(|option| {
-            argument == *option
-                || argument
-                    .strip_prefix(option)
-                    .is_some_and(|rest| rest.starts_with('=') || !option.starts_with("--"))
-        })
+        let name = argument.split_once('=').map_or(argument, |(name, _)| name);
+        match name.strip_prefix("--") {
+            // optparse takes any unambiguous start of a long option. One
+            // that is ambiguous fails pip, so counting it costs nothing.
+            Some(long) => {
+                !long.is_empty()
+                    && PIP_INDEX_OPTIONS
+                        .iter()
+                        .any(|option| option.starts_with(long))
+            }
+            // Short options cluster (`-Ui`) and take their value attached.
+            None => argument
+                .strip_prefix('-')
+                .is_some_and(|short| short.contains(PIP_INDEX_SHORT_OPTIONS)),
+        }
     })
 }
 
@@ -493,8 +573,9 @@ fn is_on(url: &str, hosts: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        NpmConfig, Places, from_root, has_index_argument, is_on, npm_prefix, npm_variables,
-        pip_variables, setting, uv_receipt_other_index,
+        IndexConfig, NpmConfig, Places, from_root, has_index_argument, is_on, is_uv_index,
+        npm_prefix, npm_variables, pip_file_other_index, pip_variables, pipx_metadata_other_index,
+        setting, uv_receipt_other_index,
     };
 
     #[test]
@@ -601,6 +682,99 @@ mod tests {
         assert!(has_index_argument(["--extra-index-url=https://x"]));
         assert!(has_index_argument(["-ihttps://x"]));
         assert!(!has_index_argument(["--no-cache-dir", "--index-urlx"]));
+        for abbreviated in [
+            "--extra-index=https://x",
+            "--find",
+            "-Ui",
+            "-r",
+            "--requirement=r.txt",
+        ] {
+            assert!(has_index_argument([abbreviated]), "{abbreviated}");
+        }
+        assert!(!has_index_argument(["-U", "--pre", "--"]));
+    }
+
+    #[test]
+    fn pip_files_count_every_index_but_pypi() {
+        for public in [
+            "[global]\nindex-url = https://pypi.org/simple\ntimeout = 60\n",
+            "[global]\nextra-index-url = https://pypi.org/simple https://pypi.python.org/simple\n",
+            "[global]\n    # an indented comment\n",
+        ] {
+            assert!(!pip_file_other_index(public), "{public}");
+        }
+        for other in [
+            "[global]\nextra-index-url = https://pypi.org/simple https://pypi.corp.example/simple\n",
+            "[global]\nextra-index-url = https://pypi.org/simple\n    https://pypi.corp.example/simple\n",
+            "[global]\nextra-index-url =\n    https://pypi.corp.example/simple\n",
+            "[install]\nfind_links: /srv/wheels\n",
+        ] {
+            assert!(pip_file_other_index(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn a_pipx_record_says_an_index_or_counts_when_it_cannot_be_read() {
+        let with = |arguments: &str| {
+            format!(r#"{{"main_package":{{"pip_args":{arguments}}},"injected_packages":{{}}}}"#)
+        };
+        assert!(!pipx_metadata_other_index(&with("[]")));
+        assert!(pipx_metadata_other_index(&with(
+            r#"["-i","https://pypi.corp.example"]"#
+        )));
+        assert!(pipx_metadata_other_index("{not json"));
+    }
+
+    #[test]
+    fn uv_index_settings_are_found_in_tables_and_inline() {
+        assert!(is_uv_index(&["pip", "index-url"]));
+        assert!(is_uv_index(&["index", "url"]));
+        assert!(!is_uv_index(&["pip", "compile-bytecode"]));
+        let places = Places::defaults(Some("home/u"));
+        let root = crate::test_support::TempDir::new("packages-uv-config");
+        for (text, other) in [
+            (
+                "[pip]\nindex-url = \"https://pypi.corp.example/simple\"\n",
+                true,
+            ),
+            (
+                "pip = { extra-index-url = [\"https://pypi.corp.example/simple\"] }\n",
+                true,
+            ),
+            ("[pip]\ncompile-bytecode = true\n", false),
+        ] {
+            let file = root.path().join("home/u/.config/uv/uv.toml");
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, text).unwrap();
+            assert_eq!(
+                IndexConfig::uv(root.path(), &places).other_index,
+                other,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_files_that_cannot_be_found_fail_closed() {
+        let variables = [
+            ("PIP_CONFIG_FILE", "pip.conf"),
+            ("UV_CONFIG_FILE", "../uv.toml"),
+            ("npm_config_userconfig", "npmrc"),
+        ]
+        .map(|(name, value)| (name.to_string(), value.to_string()));
+
+        let places = Places::from_variables(Some("home/u"), &variables);
+
+        assert!(
+            places
+                .pip_env
+                .contains(&("index-url".to_string(), String::new()))
+        );
+        assert_eq!(places.uv_env, ["UV_CONFIG_FILE"]);
+        assert_eq!(places.npmrc, None);
+        assert!(
+            !NpmConfig::read(std::path::Path::new("/nonexistent"), &places).is_public("x", None)
+        );
     }
 
     #[test]
@@ -641,12 +815,14 @@ mod tests {
 
     #[test]
     fn a_uv_receipt_says_a_tool_from_elsewhere() {
-        let public = "[tool]\nrequirements = [{ name = \"black\", specifier = \">=24\" }]\n";
+        let public = "[tool]\nrequirements = [{ name = \"black\", specifier = \">=24\" }]\nentrypoints = [{ name = \"black\", install-path = \"/b\" }]\n";
         assert!(!uv_receipt_other_index(public));
         for elsewhere in [
             "[tool]\nrequirements = [{ name = \"inhouse\", git = \"https://git.example/x\" }]\n",
             "[tool]\nrequirements = [{ name = \"x\", index = \"https://pypi.corp.example\" }]\n",
             "[tool]\nrequirements = [{ name = \"x\" }]\n[tool.options]\nindex-url = \"https://a\"\n",
+            "[tool]\nrequirements = [{ name = \"x\" }]\noptions = { index = [\"https://a\"] }\n",
+            "[tool]\nrequirements = [{ name = \"x\" }]\nconstraints = [{ name = \"y\", url = \"https://a/y.whl\" }]\n",
             "[tool\n",
         ] {
             assert!(uv_receipt_other_index(elsewhere), "{elsewhere}");

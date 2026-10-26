@@ -438,36 +438,52 @@ What is read (no tool is run; for links, see below):
 The variables are read from the sweep's own environment: the daily timer's
 sweep gets them only where they are set for your systemd user session.
 
-A package whose name may be private is not sent anywhere. Only packages from
-the public registry go to OSV: npm packages from `registry.npmjs.org` (or
-Yarn's copy of it), Python packages from PyPI, crates from crates.io. Where an
-npm package came from is read from npm's hidden lockfile
-(`node_modules/.package-lock.json`); a package directly in a `node_modules`
-whose lockfile records no address for it is left out. Where there is no
-lockfile, or for a package deeper down that the lockfile does not record
-(it may have a lockfile of its own, which is not read), `_resolved` in its
-`package.json` decides, or else the `registry` (or the scope's own
-`@scope:registry`) npm is set to use; npm 7 and later write no `_resolved`,
-so a package without a lockfile entry installed from git or a tarball under
-an unscoped name can still be sent. A Python package installed from an
-address or a local directory (it has a `direct_url.json`), every package of
-a pipx environment installed with another index (`--index-url`,
-`--extra-index-url`, `--find-links`, as pipx records them), and every
-Python package at all where pip's configuration (`/etc/pip.conf`,
-`/etc/xdg/pip/pip.conf`, `~/.config/pip/pip.conf`, `~/.pip/pip.conf`, the
-`pip/pip.conf` under `XDG_CONFIG_HOME` and each of `XDG_CONFIG_DIRS`,
-`PIP_CONFIG_FILE`, `PIP_INDEX_URL` and the like) sets `index-url`,
-`extra-index-url` or `find-links` to anything but PyPI, are left out. For
-what mise installed through uv, uv's settings decide instead: any index
-setting in `uv.toml` (`/etc/uv/uv.toml`, `/etc/xdg/uv/uv.toml`,
-`~/.config/uv/uv.toml`, the `uv/uv.toml` under the XDG directories,
-`UV_CONFIG_FILE`) or the environment (`UV_INDEX`, `UV_DEFAULT_INDEX`,
-`UV_INDEX_URL`, `UV_EXTRA_INDEX_URL`, `UV_FIND_LINKS`), PyPI named as one
-included, leaves them all out, and a tool whose `uv-receipt.toml` records a
-git, address, path or index source is left out. A `uv.toml` in the directory
-mise ran uv from is not known and not read. Crates from git, a path or
-another registry are left out too. What is left out this way is said as not checked, so a
-machine with such packages has an incomplete sweep.
+A package whose name may be private is not sent anywhere, as far as the files
+the tools leave behind tell. Only packages from the public registry go to OSV:
+npm packages from `registry.npmjs.org` (or Yarn's copy of it), Python packages
+from PyPI, crates from crates.io.
+
+- npm: where a package came from is read from npm's hidden lockfile
+  (`node_modules/.package-lock.json`). A package the lockfile records no
+  address for is left out, a bundled one (`inBundle`) goes with the package
+  it ships in, and a lockfile that is there and cannot be used (a link, over
+  8 MiB, not npm's) is said and leaves every package under it out. Where
+  there is no lockfile, `_resolved` in the package's `package.json` decides,
+  or else the `registry` (or the scope's own `@scope:registry`) npm is set to
+  use. npm 7 and later write no `_resolved`, so a package installed from git
+  or a tarball where npm kept no lockfile is sent when that registry is the
+  public one.
+- pip: a package installed from an address or a local directory (it has a
+  `direct_url.json`) is left out. So is every package of a pipx environment
+  installed with another index or a requirements or constraints file
+  (`--index-url`, `--extra-index-url`, `--find-links`, `-r`, `-c`, or a
+  shortened form, as pipx records them in `pipx_metadata.json`; a record
+  that cannot be read counts), or whose own `pip.conf` sets one, and every
+  package in a Python mise installed whose own `pip.conf` sets one. Every
+  Python package pip installed at all is left out where pip's configuration
+  (`/etc/pip.conf`, `/etc/xdg/pip/pip.conf`, `~/.config/pip/pip.conf`,
+  `~/.pip/pip.conf`, the `pip/pip.conf` under `XDG_CONFIG_HOME` and each of
+  `XDG_CONFIG_DIRS`, `PIP_CONFIG_FILE`, `PIP_INDEX_URL` and the like) sets
+  `index-url`, `extra-index-url` or `find-links` to anything but PyPI, an
+  indented line continuing a value included. A `PIP_CONFIG_FILE` that is not
+  an absolute path counts as such a setting. pip keeps no record of an index
+  given on its command line: a package installed with `pip install
+  --index-url` into a Python mise installed, or into a pipx environment old
+  enough to have no `pipx_metadata.json`, is sent like any other.
+- uv, for what mise installed through it: any index setting in `uv.toml`
+  (`/etc/uv/uv.toml`, `/etc/xdg/uv/uv.toml`, `~/.config/uv/uv.toml`, the
+  `uv/uv.toml` under the XDG directories, `UV_CONFIG_FILE`, which counts when
+  it is not an absolute path) or the environment (`UV_INDEX`,
+  `UV_DEFAULT_INDEX`, `UV_INDEX_URL`, `UV_EXTRA_INDEX_URL`, `UV_FIND_LINKS`),
+  PyPI named as one included, leaves them all out, and a tool whose
+  `uv-receipt.toml` records an index, or a requirement with a git, address,
+  path or index source, is left out. A `uv.toml` in the directory mise ran uv
+  from is not known and not read.
+- cargo: crates from git, a path or another registry are left out.
+
+What is left out this way is said as not checked, so a machine with such
+packages has an incomplete sweep. An `npm_config_userconfig` that is not an
+absolute path is taken as setting a registry other than the public one.
 
 At every sweep the rest of the inventory goes to OSV: the ecosystem, the name
 and the version of each package, in requests of up to 500 packages per

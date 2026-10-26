@@ -176,7 +176,18 @@ fn global_npm_packages_are_read_with_their_own_dependencies() {
     npm(root, &format!("{top}/a"), "a", "1.0.0");
     npm(root, &format!("{top}/a/node_modules/b"), "b", "2.0.0");
     npm(root, &format!("{top}/@scope/c"), "@scope/c", "3.0.0");
-    write(root, &format!("{top}/.package-lock.json"), "{}");
+    let registry = "https://registry.npmjs.org";
+    write(
+        root,
+        &format!("{top}/.package-lock.json"),
+        &format!(
+            r#"{{"packages":{{
+                "node_modules/a":{{"resolved":"{registry}/a/-/a-1.0.0.tgz"}},
+                "node_modules/a/node_modules/b":{{"resolved":"{registry}/b/-/b-2.0.0.tgz"}},
+                "node_modules/@scope/c":{{"resolved":"{registry}/@scope/c/-/c-3.0.0.tgz"}}
+            }}}}"#
+        ),
+    );
     fs::create_dir_all(root.join(format!("{top}/.bin"))).unwrap();
     symlink("/home/u/project", root.join(format!("{top}/linked"))).unwrap();
     write(root, &format!("{top}/broken/package.json"), "{not json");
@@ -866,4 +877,108 @@ fn a_linked_crates_list_is_said_once_and_not_as_unreadable() {
         "{:?}",
         inventory.notes
     );
+}
+
+#[test]
+fn what_npm_records_decides_and_a_broken_lockfile_leaves_its_packages_out() {
+    let root = TempDir::new("packages-npm-lock");
+    let root = root.path();
+    let top = "usr/lib/node_modules";
+    let registry = "https://registry.npmjs.org";
+    for (directory, name) in [
+        ("public", "public"),
+        ("public/node_modules/inside", "inside"),
+        ("public/node_modules/unrecorded", "unrecorded"),
+        ("fromgit", "fromgit"),
+        ("fromgit/node_modules/carried", "carried"),
+    ] {
+        npm(root, &format!("{top}/{directory}"), name, "1.0.0");
+    }
+    write(
+        root,
+        &format!("{top}/.package-lock.json"),
+        &format!(
+            r#"{{"packages":{{
+                "node_modules/public":{{"resolved":"{registry}/public/-/public-1.0.0.tgz"}},
+                "node_modules/public/node_modules/inside":{{"inBundle":true}},
+                "node_modules/fromgit":{{"resolved":"git+ssh://git@git.example/fromgit.git"}},
+                "node_modules/fromgit/node_modules/carried":{{"inBundle":true}}
+            }}}}"#
+        ),
+    );
+
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+
+    assert_eq!(
+        found(&inventory),
+        [
+            (Ecosystem::Npm, "inside", "1.0.0"),
+            (Ecosystem::Npm, "public", "1.0.0"),
+        ]
+    );
+    assert!(
+        inventory.unchecked[0].starts_with("3 language package(s) are from a private registry"),
+        "{:?}",
+        inventory.unchecked
+    );
+
+    write(root, &format!("{top}/.package-lock.json"), "{not json");
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    assert_eq!(found(&inventory), []);
+    assert!(
+        inventory
+            .unchecked
+            .join("\n")
+            .contains("/usr/lib/node_modules/.package-lock.json"),
+        "{:?}",
+        inventory.unchecked
+    );
+}
+
+#[test]
+fn records_in_python_environments_that_name_another_index_leave_them_out() {
+    let root = TempDir::new("packages-python-records");
+    let root = root.path();
+    let venvs = "home/u/.local/share/pipx/venvs";
+    let python_dir = "home/u/.local/share/mise/installs/python/3.12.1";
+    for (environment, name) in [
+        (format!("{venvs}/plain"), "plain"),
+        (format!("{venvs}/unreadable"), "unreadable"),
+        (format!("{venvs}/siteconf"), "siteconf"),
+        (python_dir.to_string(), "requests"),
+    ] {
+        python(
+            root,
+            &format!("{environment}/lib/python3.12/site-packages"),
+            name,
+            "1.0.0",
+        );
+    }
+    write(
+        root,
+        &format!("{venvs}/unreadable/pipx_metadata.json"),
+        "{not json",
+    );
+    write(
+        root,
+        &format!("{venvs}/siteconf/pip.conf"),
+        "[global]\nindex-url = https://pypi.corp.example/simple\n",
+    );
+
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    assert_eq!(
+        found(&inventory),
+        [
+            (Ecosystem::PyPi, "plain", "1.0.0"),
+            (Ecosystem::PyPi, "requests", "1.0.0")
+        ]
+    );
+
+    write(
+        root,
+        &format!("{python_dir}/pip.conf"),
+        "[global]\nextra-index-url = https://pypi.corp.example/simple\n",
+    );
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    assert_eq!(found(&inventory), [(Ecosystem::PyPi, "plain", "1.0.0")]);
 }
