@@ -379,8 +379,9 @@ daily notification, and an allow covers it as a whole until it changes.
 
 What is read, all as files, without running git: the origin from
 `.git/config` (with any user and password taken out of the address), the
-commit from `.git/HEAD` and the refs (`packed-refs` too), the hooks in
-`.git/hooks`, `lazy-lock.json` in `~/.config/nvim` (`$XDG_CONFIG_HOME/nvim`),
+commit from `.git/HEAD` and the refs (`packed-refs` too), the keys that run
+commands in `.git/config` and `.git/config.worktree`, the hooks in
+`.git/hooks` and in a `core.hooksPath` within the checkout, `lazy-lock.json` in `~/.config/nvim` (`$XDG_CONFIG_HOME/nvim`),
 and the plugin specs in the Lua files of your configuration and in those
 plugins ship where lazy.nvim reads them (`lua/<module>/plugins/`, as LazyVim
 does, and `lazy.lua`). Only table literals of a spec are read

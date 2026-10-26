@@ -385,6 +385,57 @@ fn the_lock_file_is_compared_and_a_bad_one_said() {
 }
 
 #[test]
+fn the_worktree_config_and_an_in_tree_hooks_path_are_read() {
+    let temp = TempDir::new("nvim-git-more");
+    let root = temp.path();
+    plugin(
+        root,
+        "p",
+        "https://github.com/o/p",
+        &[("githooks/post-merge", "id")],
+    );
+    write(
+        root,
+        &format!("{LAZY}/p/.git/config"),
+        "[remote \"origin\"]\n\turl = https://github.com/o/p\n[core]\n\thooksPath = githooks/\n",
+    );
+    write(
+        root,
+        &format!("{LAZY}/p/.git/config.worktree"),
+        "[core]\n\tfsmonitor = sh x\n",
+    );
+    let collected = collected(root);
+    let item = &collected.items[0];
+    let said = |rule: RuleId, text: &str| {
+        item.alerts
+            .iter()
+            .any(|(found, message)| *found == rule && message.contains(text))
+    };
+    assert!(
+        said(RuleId::GitConfigCommand, ".git/config.worktree"),
+        "{:?}",
+        item.alerts
+    );
+    assert!(
+        said(RuleId::PluginBuild, "githooks/post-merge"),
+        "{:?}",
+        item.alerts
+    );
+
+    // A worktree configuration that cannot be read is not checked.
+    let worktree = root.join(LAZY).join("p/.git/config.worktree");
+    fs::remove_file(&worktree).unwrap();
+    symlink("/elsewhere", &worktree).unwrap();
+    let unchecked = self::collected(root).unchecked;
+    assert!(
+        unchecked
+            .iter()
+            .any(|sentence| sentence.contains("config.worktree: could not be read")),
+        "{unchecked:?}"
+    );
+}
+
+#[test]
 fn what_cannot_be_read_is_not_checked() {
     let temp = TempDir::new("nvim-unread");
     let root = temp.path();

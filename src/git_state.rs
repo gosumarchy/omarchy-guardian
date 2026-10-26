@@ -319,7 +319,7 @@ fn runs_command(section: &str, has_subsection: bool, key: &str, value: &str) -> 
 
 /// A relative path that stays inside the working tree, and outside the
 /// git directory, whose files the walk reads only in part.
-fn is_in_tree(path: &str) -> bool {
+pub(crate) fn is_in_tree(path: &str) -> bool {
     !path.is_empty()
         && !path.starts_with(['/', '~'])
         && !path.contains('$')

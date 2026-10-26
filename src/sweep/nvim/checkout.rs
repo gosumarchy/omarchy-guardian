@@ -63,11 +63,13 @@ pub(super) struct Git {
     pub(super) remote: Remote,
     /// The commit `HEAD` is at.
     pub(super) commit: Option<String>,
-    /// The keys of `.git/config` that run a command on later git commands,
-    /// as (line, `key = value` with URL credentials masked).
-    pub(super) runs: Vec<(usize, String)>,
-    /// The git hooks it holds (every file or link in `hooks/` but
-    /// `*.sample`), by name, sorted.
+    /// The keys of its configuration that run a command on later git
+    /// commands, as (file in `.git`, line, `key = value` with URL
+    /// credentials masked).
+    pub(super) runs: Vec<(&'static str, usize, String)>,
+    /// The git hooks it holds (every file or link but `*.sample` in
+    /// `.git/hooks`, and in a `core.hooksPath` within the checkout), by
+    /// path relative to the plugin, sorted.
     pub(super) hooks: Vec<(String, Entry)>,
 }
 
@@ -208,6 +210,7 @@ fn git(root: &Path, path: &str, unchecked: &mut Vec<String>) -> Option<Git> {
     if !fs::symlink_metadata(root.join(&directory)).is_ok_and(|metadata| metadata.is_dir()) {
         return None;
     }
+    let mut hooks = hooks(root, path, ".git/hooks", unchecked);
     let Some(config) = text(root, &format!("{directory}/config"), MAX_GIT_FILE) else {
         unchecked.push(format!(
             "/{directory}/config: could not be read, so where the plugin is fetched from was not checked"
@@ -216,15 +219,48 @@ fn git(root: &Path, path: &str, unchecked: &mut Vec<String>) -> Option<Git> {
             remote: Remote::Unread,
             commit: commit(root, &directory),
             runs: Vec::new(),
-            hooks: hooks(root, &directory, unchecked),
+            hooks,
         });
     };
     let remote = origin(&config).map_or(Remote::Unnamed, |url| Remote::Url(without_userinfo(&url)));
+    let mut runs: Vec<_> = git_state::executing_keys(&config)
+        .into_iter()
+        .map(|(line, key)| ("config", line, key))
+        .collect();
+    let mut hooks_path = value(&config, "core", "hookspath");
+    // git reads this file too, once `extensions.worktreeConfig` is set; it
+    // is read whenever it is there, so a key in it is never missed.
+    let worktree = format!("{directory}/config.worktree");
+    if fs::symlink_metadata(root.join(&worktree)).is_ok() {
+        match text(root, &worktree, MAX_GIT_FILE) {
+            Some(config) => {
+                let keys = git_state::executing_keys(&config).into_iter();
+                runs.extend(keys.map(|(line, key)| ("config.worktree", line, key)));
+                hooks_path = value(&config, "core", "hookspath").or(hooks_path);
+            }
+            None => unchecked.push(format!(
+                "/{worktree}: could not be read, so the commands it may have git run were not checked"
+            )),
+        }
+    }
+    // A hooks directory within the checkout is no key `executing_keys`
+    // reports: at home its hooks are files the walk reviews. A plugin's
+    // files are reviewed only once they change, so its hooks are listed
+    // here as hooks.
+    if let Some(hooks_path) = hooks_path.filter(|value| git_state::is_in_tree(value)) {
+        hooks.extend(self::hooks(
+            root,
+            path,
+            hooks_path.trim_end_matches('/'),
+            unchecked,
+        ));
+        hooks.sort_by(|left, right| left.0.cmp(&right.0));
+    }
     Some(Git {
         remote,
         commit: commit(root, &directory),
-        runs: git_state::executing_keys(&config),
-        hooks: hooks(root, &directory, unchecked),
+        runs,
+        hooks,
     })
 }
 
@@ -240,29 +276,42 @@ fn text(root: &Path, path: &str, limit: u64) -> Option<String> {
 }
 
 /// `remote.origin.url` of a git configuration: the first, which is where
-/// git fetches from. Section and key names are case-insensitive in git,
-/// the subsection is not.
+/// git fetches from.
 pub(super) fn origin(config: &str) -> Option<String> {
-    let mut in_origin = false;
-    for line in config.lines() {
+    values(config, "remote", "origin", "url").next()
+}
+
+/// The value of `section.key` (no subsection) in a git configuration: the
+/// last, which is the one git uses.
+fn value(config: &str, section: &str, key: &str) -> Option<String> {
+    values(config, section, "", key).last()
+}
+
+/// Every value of `key` in `[section "subsection"]` of a git
+/// configuration, in order. Section and key names are case-insensitive in
+/// git, the subsection is not.
+fn values<'a>(
+    config: &'a str,
+    section: &'a str,
+    subsection: &'a str,
+    key: &'a str,
+) -> impl Iterator<Item = String> + 'a {
+    let mut inside = false;
+    config.lines().filter_map(move |line| {
         let line = line.trim();
         if let Some(header) = line.strip_prefix('[') {
             let header = header.split(']').next().unwrap_or_default().trim();
-            let (section, subsection) = header
+            let (name, sub) = header
                 .split_once(char::is_whitespace)
                 .unwrap_or((header, ""));
-            in_origin = section.eq_ignore_ascii_case("remote")
-                && subsection.trim().trim_matches('"') == "origin";
-            continue;
+            inside =
+                name.eq_ignore_ascii_case(section) && sub.trim().trim_matches('"') == subsection;
+            return None;
         }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if in_origin && key.trim().eq_ignore_ascii_case("url") {
-            return Some(value.trim().trim_matches('"').to_string());
-        }
-    }
-    None
+        let (name, value) = line.split_once('=')?;
+        (inside && name.trim().eq_ignore_ascii_case(key))
+            .then(|| value.trim().trim_matches('"').to_string())
+    })
 }
 
 /// The commit the git directory `directory` has checked out: `HEAD` itself
@@ -302,10 +351,16 @@ fn is_hash(text: &str) -> bool {
     matches!(text.len(), 40 | 64) && text.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// The hooks in the git directory `directory`: every file or link in
-/// `hooks/` but the `*.sample` files git puts there, which never run.
-fn hooks(root: &Path, directory: &str, unchecked: &mut Vec<String>) -> Vec<(String, Entry)> {
-    let path = format!("{directory}/hooks");
+/// The hooks in `hooks`, a directory relative to the plugin at `plugin`:
+/// every file or link but the `*.sample` files git puts there, which never
+/// run, by path relative to the plugin.
+fn hooks(
+    root: &Path,
+    plugin: &str,
+    hooks: &str,
+    unchecked: &mut Vec<String>,
+) -> Vec<(String, Entry)> {
+    let path = format!("{plugin}/{hooks}");
     let listing = match fs::read_dir(root.join(&path)) {
         Ok(listing) => listing,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Vec::new(),
@@ -314,7 +369,7 @@ fn hooks(root: &Path, directory: &str, unchecked: &mut Vec<String>) -> Vec<(Stri
             return Vec::new();
         }
     };
-    let mut hooks = Vec::new();
+    let mut found = Vec::new();
     for entry in listing {
         let Ok(entry) = entry else {
             unchecked.push(format!("/{path}: could not be listed in full"));
@@ -325,16 +380,18 @@ fn hooks(root: &Path, directory: &str, unchecked: &mut Vec<String>) -> Vec<(Stri
             continue;
         }
         match read::look(root, &format!("{path}/{name}")) {
-            Found::File { sha256, .. } => hooks.push((name, Entry::File(sha256))),
-            Found::Link(target) => hooks.push((name, Entry::Link(target))),
+            Found::File { sha256, .. } => {
+                found.push((format!("{hooks}/{name}"), Entry::File(sha256)));
+            }
+            Found::Link(target) => found.push((format!("{hooks}/{name}"), Entry::Link(target))),
             Found::Other => {}
             Found::Unreadable(reason) => {
                 unchecked.push(format!("/{path}/{name}: could not be read ({reason})"));
             }
         }
     }
-    hooks.sort_by(|left, right| left.0.cmp(&right.0));
-    hooks
+    found.sort_by(|left, right| left.0.cmp(&right.0));
+    found
 }
 
 /// `url` without the user and password of an address
