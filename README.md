@@ -202,12 +202,13 @@ release](docs/install.md#hearing-of-a-new-release).
 | `log` | shows what Guardian decided, from the system journal |
 | `ask REPORT-ID` | opens your AI agent on a saved report, with every tool switched off |
 | `status` | prints the gates, the problems and the last block as JSON, which the bar reads; `--dismiss` marks them seen, `--open-report` opens the last report |
-| `tui` | opens the settings app (`--expert` for every setting) |
+| `tui` (or `settings`) | opens the settings app (`--expert` for every setting) |
 | `protect [--off] [--yes]` | turns every gate on, or the install gates and the sweep off |
 | `setup` | guided setup: reviewer, profile, model, and a test review |
 | `config …` | `show`, `check`, `path`, and `acknowledge` for weaker settings |
 | `forget ID`, `forget --all` | drops a source's approved baselines, or the whole review memory |
 | `test` | tests the reviewer with a malicious and a harmless sample |
+| `update` | asks the project's repository now whether a newer release is out |
 
 Each is run as `omarchy-guardian COMMAND`. The options and the details are
 under [Commands](docs/commands.md) and [Settings](docs/settings.md).
