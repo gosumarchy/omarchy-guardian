@@ -11,7 +11,7 @@ use super::record::Files;
 use super::{Build, Dirs, Plugin, Record, Review, collect, plan, settle};
 use crate::agent::{AgentFinding, AgentReview, Status};
 use crate::error::Error;
-use crate::report::{AgentOutcome, AgentRun, LocalFinding, Report, Severity};
+use crate::report::{AgentOutcome, AgentRun, LocalFinding, Report, ReviewScope, Severity};
 use crate::rules::RuleId;
 use crate::sha256::{Digest, Sha256};
 use crate::sweep::collect::{Body, Item, Origin, Scope};
@@ -652,7 +652,12 @@ fn the_first_sweep_takes_plugins_as_they_are() {
             .any(|note| note.contains("first sweep"))
     );
     // The record then holds it as it is.
-    let settled = settle(&items, &Record::Absent, &Report::new("t"), &label);
+    let settled = settle(
+        &items,
+        &Record::Absent,
+        &Report::new("t", ReviewScope::default()),
+        &label,
+    );
     assert_eq!(settled["p"]["lua/p.lua"], digest("x"));
 }
 
@@ -744,7 +749,12 @@ fn changed_code_that_runs_unread_is_reported_not_sent() {
             .all(|file| file.sha256.is_none() && matches!(file.body, Body::Binary(_)))
     );
     // Nothing of it was read, so the record keeps what it had.
-    let settled = settle(&items, &before, &Report::new("t"), &label);
+    let settled = settle(
+        &items,
+        &before,
+        &Report::new("t", ReviewScope::default()),
+        &label,
+    );
     assert_eq!(
         settled["p"].get("lua/fuzzy.so"),
         Some(&digest("\x7fELF old"))
@@ -788,7 +798,12 @@ fn trusted_plugins_are_not_planned_and_keep_their_code_recorded() {
     let before = record("p", &[("lua/p.lua", "then")]);
     plan(&mut items, &before, root, &|_| true);
     assert_eq!(plugin_of(&items[0]).review, Review::Unplanned);
-    let settled = settle(&items, &before, &Report::new("t"), &label);
+    let settled = settle(
+        &items,
+        &before,
+        &Report::new("t", ReviewScope::default()),
+        &label,
+    );
     assert_eq!(settled["p"]["lua/p.lua"], digest("now"));
 }
 
@@ -836,15 +851,15 @@ fn a_review_moves_the_record_on_only_when_it_finished_clear() {
     let moved = digest("now");
     let kept = digest("then");
 
-    let mut report = Report::new("t");
+    let mut report = Report::new("t", ReviewScope::default());
     report
         .agent_runs
         .push(run(&[FILE], reviewed(Status::Clear, &[])));
     assert_eq!(settled(&report), moved);
     // Nothing sent (the review memory had approved it, or no AI is used).
-    assert_eq!(settled(&Report::new("t")), moved);
+    assert_eq!(settled(&Report::new("t", ReviewScope::default())), moved);
 
-    let mut finding = Report::new("t");
+    let mut finding = Report::new("t", ReviewScope::default());
     finding.findings.push(LocalFinding {
         path: FILE.into(),
         line: 1,
@@ -852,20 +867,20 @@ fn a_review_moves_the_record_on_only_when_it_finished_clear() {
         excerpt: String::new(),
     });
     assert_eq!(settled(&finding), kept);
-    let mut flagged = Report::new("t");
+    let mut flagged = Report::new("t", ReviewScope::default());
     flagged
         .agent_runs
         .push(run(&[FILE, "/x"], reviewed(Status::Suspicious, &["/x"])));
     assert_eq!(settled(&flagged), kept);
-    let mut unavailable = Report::new("t");
-    let down = AgentOutcome::Unavailable(Error::Refused("down".into()));
+    let mut unavailable = Report::new("t", ReviewScope::default());
+    let down = AgentOutcome::Unavailable(Error::Message("down".into()));
     unavailable.agent_runs.push(run(&[FILE], down));
     assert_eq!(settled(&unavailable), kept);
-    let mut too_large = Report::new("t");
+    let mut too_large = Report::new("t", ReviewScope::default());
     too_large.gaps.push(crate::report::Gap::AgentInputTooLarge);
     assert_eq!(settled(&too_large), kept);
     // Another plugin's finding is not this one's.
-    let mut other = Report::new("t");
+    let mut other = Report::new("t", ReviewScope::default());
     other.findings.push(LocalFinding {
         path: "~/.local/share/nvim/lazy/pp/lua/p.lua".into(),
         line: 1,
@@ -882,8 +897,8 @@ fn a_new_plugin_whose_review_did_not_finish_stays_new() {
     plugin(root, "p", "https://github.com/o/p", &[("lua/p.lua", "x")]);
     let before = record("other", &[("lua/o.lua", "o")]);
     let (items, _) = planned(root, &before, true);
-    let mut report = Report::new("t");
-    let down = AgentOutcome::Unavailable(Error::Refused("down".into()));
+    let mut report = Report::new("t", ReviewScope::default());
+    let down = AgentOutcome::Unavailable(Error::Message("down".into()));
     report.agent_runs.push(run(&[FILE], down));
     let settled = settle(&items, &before, &report, &label);
     assert!(!settled.contains_key("p"));
@@ -900,8 +915,8 @@ fn an_empty_record_is_compared_so_new_plugins_after_it_are_reviewed() {
     // did not finish: the record keeps nothing.
     let before = record("gone", &[("lua/g.lua", "g")]);
     let (items, _) = planned(root, &before, true);
-    let mut report = Report::new("t");
-    let down = AgentOutcome::Unavailable(Error::Refused("down".into()));
+    let mut report = Report::new("t", ReviewScope::default());
+    let down = AgentOutcome::Unavailable(Error::Message("down".into()));
     report.agent_runs.push(run(&[FILE], down));
     let settled = settle(&items, &before, &report, &label);
     assert!(settled.is_empty());
