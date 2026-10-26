@@ -29,12 +29,14 @@ it shows on hover:
   start-up files on this machine that no package vouches for, with the scripts
   they run. Of an AI coding agent's configuration (Claude Code, OpenCode, Codex)
   only what each hook, helper, MCP server or plugin starts is sent: its
-  command line with token-shaped secrets taken out (logins in addresses,
-  `Authorization` values, values after secret-named flags or names, words that
-  start like known tokens), the names of its variables, or a remote server's
-  host; of Claude Code's `env`, only the variable names and the host of a base
-  address or proxy. Never the files themselves, which hold tokens and project history,
-  and nothing derived from a project's path. A file whose name or path marks
+  command line with secrets taken out only where they are the token-shaped
+  value of a secret-named setting, flag or `Authorization` header, or the
+  login in an address (a token written anywhere else is sent, since masking
+  what could name the program would hide code from the review), the names of
+  its variables, or a remote server's host; of Claude Code's `env`, only the
+  variable names and the host of a base address or proxy. Never the files
+  themselves, which hold tokens and project history, and nothing derived from
+  a project's path. A file whose name or path marks
   it as holding keys or tokens (`.env`, `*.pem`, `*.key`, `id_ed25519`,
   anything under `.ssh` or `secrets`, and the like) is not sent, by any gate
   or by the sweep, whatever runs it. In

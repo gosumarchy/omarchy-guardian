@@ -174,7 +174,8 @@ pub(super) fn add(scope: &Scope<'_>, source: &Source<'_>, entries: Entries, foun
 ///
 /// and before it, on a comment line, the names of the variables it is
 /// started with. What it runs, which is followed, is the command line as
-/// written, with a plugin's directory written in.
+/// written, with a plugin's directory written in; the text is that line
+/// without its secrets.
 fn item(scope: &Scope<'_>, source: &Source<'_>, entry: Entry) -> Item {
     let Entry {
         key,
@@ -186,11 +187,14 @@ fn item(scope: &Scope<'_>, source: &Source<'_>, entry: Entry) -> Item {
     let mut alerts = Vec::new();
     let started = match launch {
         Launch::Command(line) => {
-            // Followed as written: a program named like a token is still
-            // found. The collector takes the secrets out of it once it has
-            // been followed (see `hide_secrets_in_runs`).
-            runs.push(with_plugin_root(&line, source.plugin_root));
-            redacted(&line)
+            // Followed as written: a script passed as the value of a
+            // secret-named flag is still found. The collector takes the
+            // secrets out once it has been followed (see
+            // `hide_secrets_in_runs`), which makes it this same text.
+            let line = with_plugin_root(&line, source.plugin_root);
+            let text = redacted(&line);
+            runs.push(line);
+            text
         }
         Launch::Remote { scheme, host } => {
             alerts.extend(remote_alert(&host));
@@ -411,8 +415,7 @@ const PLUGIN_ROOT: &str = "CLAUDE_PLUGIN_ROOT";
 
 /// `line` with the plugin's directory (`root`, relative to the root)
 /// written in for `${CLAUDE_PLUGIN_ROOT}` and `$CLAUDE_PLUGIN_ROOT`, so the
-/// scripts it names are followed. The item's text keeps the line as
-/// written.
+/// scripts it names are followed and the review sees which they are.
 pub(super) fn with_plugin_root(line: &str, root: Option<&str>) -> String {
     let Some(root) = root else {
         return line.to_string();

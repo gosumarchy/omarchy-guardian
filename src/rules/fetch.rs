@@ -374,7 +374,7 @@ fn python_runs_fetched(command: &Command) -> bool {
 
 /// The flags of `uv tool run` (from uv's CLI reference, checked
 /// 2026-10-26) and `pipx run` that take a value as the next word.
-pub(crate) const RUNNER_VALUE_FLAGS: &[&str] = &[
+const RUNNER_VALUE_FLAGS: &[&str] = &[
     "--allow-insecure-host",
     "--trusted-host",
     "--build-constraints",

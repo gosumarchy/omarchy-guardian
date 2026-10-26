@@ -469,16 +469,6 @@ place of, each of these where it is token-shaped:
   and between a lower-case letter or digit and an upper-case letter) is
   `key`, `token`, `secret`, `password`, `auth`, `credential`, `bearer` or a
   like word; this is the same list the review's own secret removal uses;
-- a token by its look, anywhere in a word (`$(echo sk-…)`, `--key=sk-…;`):
-  a run of letters, digits, `_`, `.` and `-` that starts as a known kind of
-  token does (`sk-`, `ghp_`, `github_pat_`, `glpat-`, `xoxb-`, `AKIA`,
-  `AIza`, `npm_`, `pypi-` and others) and is at least 16 characters long.
-  Only a known beginning counts: a long run of mixed case and digits looks
-  just like a base64 payload (`echo … | base64 -d | sh`), and taking it out
-  would hide the payload. A program named like a token is taken out too
-  (it is still followed, as written); the package `npx`, `bunx`, `uvx` or
-  `pipx run` fetches, after their flags and the values of those, never is,
-  since it is what runs;
 - what the review's own removal takes out of any text it sends
   (`export API_KEY=…`).
 
@@ -490,11 +480,15 @@ secret itself and is what a review needs to see. What is followed is the line
 as written, so whatever it names is found; what the sweep's output and saved
 reports show the entry runs is the very text sent to the review.
 
-Which word a command runs is told past `sudo`, `env`, `nice`, `xargs`,
-`time`, `exec`, `nohup` and `command`, their flags and the values of the
-flags that take one (`sudo -u build`, `env -u NAME`, `nice -n 5`,
-`xargs -I {}`, from their manual pages), and past assignments
-(`FOO=x cmd`).
+Nothing else is taken out. A token written anywhere but as the value of a
+secret-named setting, flag or header, or in an address's login, reaches the
+AI as written (`"apiKeyHelper": "sk-ant-…"`, `echo sk-ant-…`). A word is
+never taken out by its look: one that looks like a token may also be the
+package a runner fetches (`pnpm dlx`, `npm exec`, `uv tool run` and every
+other spelling), a host (`https://sk-mirror.example`), a path or a file
+name, and masking anything that could name what runs would hide code from
+the review. A leaked token is the lesser harm next to a payload no one
+reviewed; keep tokens in variables (`$TOKEN`), whose names alone are sent.
 
 Not covered, and sent as written: a secret in a header other than
 `Authorization` (`X-Api-Key: …`), `curl -u user:password`, the word after a
