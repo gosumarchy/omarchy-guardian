@@ -38,18 +38,19 @@ matter most:
   with that user's reviewer login.
 - **System sweep:** as a user only your own processes can be looked at, and
   without root checks every sweep is incomplete. The inside of the initramfs
-  image, and of a unified kernel image except its kernel, is not compared, as
-  it is built on the machine; GRUB's EFI program is listed as not comparable;
-  a signature on an EFI program is put back, not checked; browser extensions
-  are judged by where they came from and what they were granted, not by their
-  code, and only Chromium's, Brave's, Chrome's, Firefox's and Zen's; other
-  mounted filesystems (`/mnt`, `/media`, `/run/media`) are not searched for
-  setuid files; the running kernel's modules are not checked between a kernel
-  update and the next boot; what a process does to its own environment after
-  it started is not seen; and only shell scripts no package vouches for are
-  looked through for what they start, three deep, not scripts of other
-  interpreters, and inside a script only a program named by a path in the
-  place of a command ([System sweep](system-sweep.md#where-following-stops)).
+  image, and of a unified kernel image except its stub and kernel, is not
+  compared, as it is built on the machine; GRUB's EFI program is listed as not
+  comparable; a signature on an EFI program is put back, not checked; browser
+  extensions are judged by where they came from and what they were granted,
+  not by their code, and only Chromium's, Brave's, Chrome's, Firefox's and
+  Zen's; other mounted filesystems (`/mnt`, `/media`, `/run/media`) are not
+  searched for setuid files; the running kernel's modules are not checked
+  between a kernel update and the next boot; what a process does to its own
+  environment after it started is not seen; and only shell scripts no package
+  vouches for are looked through for what they start, three deep, not scripts
+  of other interpreters, and inside a script only a program named by a path in
+  the place of a command ([System
+  sweep](system-sweep.md#where-following-stops)).
 - **Packages:** only scriptlets, auto-run files and the text files those name
   are reviewed, not the rest of the payload; a removal is not reviewed; a unit
   you enable yourself later is not reviewed then; front ends that call libalpm

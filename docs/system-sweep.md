@@ -746,11 +746,24 @@ bytes.
 | What it is | How it is shown |
 | --- | --- |
 | A packaged program, as shipped, signed since, or with the configuration hash enrolled | trusted, only counted |
-| A unified kernel image (UKI) whose kernel is what a kernel package ships | one note; the initramfs and command line inside are built on this machine and are not comparable |
-| A UKI whose kernel no installed package ships | listed with a note and no alert, like an older kernel image |
-| GRUB's program (`grub*.efi`), which `grub-install` builds on this machine | listed with a note: not comparable |
+| A unified kernel image (UKI) built from systemd's packaged stub around a kernel a kernel package ships | one note; the initramfs and command line inside are built on this machine and are not comparable |
+| A UKI built from the packaged stub around a kernel no installed package ships | listed with a note and no alert, like an older kernel image |
+| A UKI where no packaged stub is installed to compare it with | listed with a note: not comparable |
+| GRUB's program (`grub*.efi`) where the grub package is installed, which `grub-install` builds on this machine | listed with a note: not comparable |
 | Any other program in `/boot/EFI/BOOT`, `/boot/EFI/limine`, `/boot/EFI/systemd` or `/boot/EFI/Linux` | a high finding (`boot-tampering`) |
 | Any other program elsewhere (another system's boot loader on a shared ESP, a firmware tool) | listed with a note and no alert |
+
+A UKI counts as built from the stub when it starts where the stub does, has
+the stub's data directories (but the certificate table), holds every section
+of the stub at the same address with the same flags and bytes (`.sbat`, into
+which `ukify` merges the kernel's entries, may have grown), lists no section
+twice, has no two sections over the same addresses, and adds only the
+sections the UKI format defines, none of which can be run. A UKI that is not,
+or a `grub*.efi` where the grub package is not installed, is told like any
+other program: in the directories above, a finding. A program larger than the
+2 MiB kept of every file is read again whole (up to 256 MiB) and checked to
+be the file that was hashed; one that cannot be is not compared, and for the
+root checks the sweep is incomplete.
 
 A listed program can be allowed as it is. Nothing from `/boot` goes to the AI
 review: these are hashed binaries, judged by these local rules alone.
