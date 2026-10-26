@@ -67,13 +67,27 @@ impl Report {
             _ => recommendation(decision),
         };
         outln!("\n{}", painter.paint(advice, "2"));
-        html::collect(self, decision);
+        html::collect(self, decision, permit);
     }
 
-    /// The one-line verdict and its terminal colour.
-    pub(super) fn headline(&self, decision: Decision) -> (String, &'static str) {
+    /// The one-line verdict and its terminal colour, as overruled by the
+    /// user's `permit` when there is one.
+    pub(super) fn headline(
+        &self,
+        decision: Decision,
+        permit: Option<&str>,
+    ) -> (String, &'static str) {
         let counts = self.counts();
         let total = counts.total();
+        if let (Some(permit), Decision::Blocked(_)) = (permit, decision) {
+            return (
+                format!(
+                    "! PERMITTED — your permit {permit} overrules {} for exactly this content",
+                    self.decision_name(decision)
+                ),
+                "33;1",
+            );
+        }
         match decision {
             Decision::Clear if self.remark_count() > 0 => (
                 format!(
@@ -125,16 +139,7 @@ impl Report {
         painter: Painter,
     ) -> String {
         let counts = self.counts();
-        let (headline, color) = match (permit, decision) {
-            (Some(permit), Decision::Blocked(_)) => (
-                format!(
-                    "! PERMITTED — your permit {permit} overrules {} for exactly this content",
-                    self.decision_name(decision)
-                ),
-                "33;1",
-            ),
-            _ => self.headline(decision),
-        };
+        let (headline, color) = self.headline(decision, permit);
         let mut lines = vec![Span::new(headline, color)];
         if counts.total() > 0 {
             lines.push(Span::plain(format!(

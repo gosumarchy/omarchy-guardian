@@ -787,11 +787,9 @@ const fn recommendation(decision: Decision) -> &'static str {
         Decision::Blocked(Blocked::NotConfirmed) => "Not confirmed; nothing was run.",
         Decision::Warned => "Proceeding with warnings; read them above.",
         Decision::Limited => {
-            "ReviewScope: install scriptlets and new or changed auto-run files are reviewed; the rest of each package's payload is not."
+            "Scope: install scriptlets and new or changed auto-run files are reviewed; the rest of each package's payload is not."
         }
-        Decision::Clear => {
-            "ReviewScope: this is a heuristic source review, not a safety guarantee."
-        }
+        Decision::Clear => "Scope: this is a heuristic source review, not a safety guarantee.",
     }
 }
 

@@ -148,7 +148,7 @@ fn a_report_nobody_gave_remark_classes_counts_every_finding() {
     );
     assert!(
         report
-            .headline(FINDINGS)
+            .headline(FINDINGS, None)
             .0
             .starts_with("! REVIEW REQUIRED — 2 alert(s)")
     );
@@ -190,7 +190,7 @@ fn one_run_with_more_than_remarks_blocks_and_the_others_keep_theirs() {
         assert_eq!(shown.contains("AI findings"), alerts > 0, "{shown}");
         // The remarks say where they are from, and nothing calls a review
         // clear that another chunk stopped. The page agrees.
-        let page = html::section(&report, FINDINGS);
+        let page = html::section(&report, FINDINGS, None);
         for expected in [
             "Remarks: 2 low · from parts the AI review judged clear; they did not decide this",
             "From the parts the AI review judged clear. They did not decide this review.",
@@ -330,7 +330,7 @@ fn a_low_finding_where_a_local_rule_matched_is_no_remark() {
         .push(run_with(Status::Clear, &["b/.INSTALL"], &lows));
     assert_eq!(apart.decide(&standard), Decision::Warned);
     assert_eq!((apart.remark_count(), apart.counts().total()), (2, 1));
-    let (headline, _) = apart.headline(Decision::Warned);
+    let (headline, _) = apart.headline(Decision::Warned, None);
     assert!(headline.starts_with("! WARNED — 1 alert(s)"), "{headline}");
     let boxed = apart.verdict_box(Decision::Warned, None, 120, Painter::plain());
     assert!(
@@ -576,7 +576,7 @@ fn a_clear_review_with_remarks_reads_as_clear() {
     assert!(!advice.contains("do not install"), "{advice}");
 
     // The saved page says the same.
-    let page = html::section(&report, decision);
+    let page = html::section(&report, decision, None);
     for expected in [
         r#"<span class="word green">CLEAR</span>"#,
         "0 HIGH · 0 MEDIUM · 0 LOW · 2 AI REMARK(S) · ",
@@ -619,7 +619,7 @@ fn under_strict_the_same_review_blocks_as_before() {
         assert!(shown.contains(expected), "{expected}\n{shown}");
     }
     assert!(!shown.contains("emark"), "{shown}");
-    let page = html::section(&report, decision);
+    let page = html::section(&report, decision, None);
     assert!(page.contains("REVIEW REQUIRED") && page.contains("<h3>Findings</h3>"));
     assert!(!page.contains("REMARK"), "{page}");
 }

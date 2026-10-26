@@ -22,8 +22,8 @@ const KNIGHT: &str = include_str!("../../integrations/icons/omarchy-guardian-ale
 static SECTIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Remembers `report` for the page.
-pub(super) fn collect(report: &Report, decision: Decision) {
-    let section = section(report, decision);
+pub(super) fn collect(report: &Report, decision: Decision, permit: Option<&str>) {
+    let section = section(report, decision, permit);
     SECTIONS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -194,9 +194,9 @@ fn verdict_word(report: &Report, decision: Decision) -> &'static str {
     }
 }
 
-pub(super) fn section(report: &Report, decision: Decision) -> String {
+pub(super) fn section(report: &Report, decision: Decision, permit: Option<&str>) -> String {
     let mut html = String::new();
-    let (_, color) = report.headline(decision);
+    let (_, color) = report.headline(decision, permit);
     let counts = report.counts();
     let _ = write!(
         html,

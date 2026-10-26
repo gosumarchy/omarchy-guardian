@@ -18,7 +18,7 @@ fn a_permitted_report_says_so_and_names_what_it_overruled() {
     let mut report = Report::new("theme:demo", ReviewScope::default());
     report.gaps.push(Gap::Undecodable("install.sh".into()));
     let blocked = Decision::Blocked(Blocked::Incomplete);
-    assert!(report.headline(blocked).0.contains("INCOMPLETE"));
+    assert!(report.headline(blocked, None).0.contains("INCOMPLETE"));
     assert_eq!(blocked.exit_status(), 2);
 
     let headline = report.verdict_box(blocked, Some("0123456789abcdef"), 100, Painter::plain());
@@ -28,9 +28,43 @@ fn a_permitted_report_says_so_and_names_what_it_overruled() {
         "{headline}"
     );
     // A permit says nothing about a review that passed on its own.
-    assert!(report.headline(Decision::Clear).0.contains("CLEAR"));
+    assert!(report.headline(Decision::Clear, None).0.contains("CLEAR"));
     // The decision itself is what it was: only the gate goes on.
     assert_eq!(report.decision_name(blocked), "INCOMPLETE");
+}
+
+#[test]
+fn a_permitted_high_risk_report_is_amber_on_the_terminal_and_the_page() {
+    let mut report = Report::new("theme:demo", ReviewScope::default());
+    let mut run = reviewed(Status::Suspicious, &["install.sh"]);
+    if let AgentOutcome::Reviewed(review) = &mut run.outcome {
+        review.findings.push(AgentFinding {
+            severity: Severity::High,
+            file: "install.sh".into(),
+            line: None,
+            title: "runs a download".into(),
+            reason: "mock".into(),
+        });
+    }
+    report.agent_runs.push(run);
+    assert!(report.counts().high > 0);
+    let blocked = Decision::Blocked(Blocked::Findings);
+    assert_eq!(report.headline(blocked, None).1, "31;1");
+
+    let (headline, color) = report.headline(blocked, Some("0123456789abcdef"));
+    assert!(headline.starts_with("! PERMITTED"), "{headline}");
+    assert_eq!(color, "33;1");
+    let page = super::html::section(&report, blocked, Some("0123456789abcdef"));
+    assert!(page.contains(r#"class="word amber""#), "{page}");
+}
+
+#[test]
+fn the_advice_after_a_passing_review_names_its_scope() {
+    assert_eq!(
+        super::recommendation(Decision::Clear),
+        "Scope: this is a heuristic source review, not a safety guarantee."
+    );
+    assert!(super::recommendation(Decision::Limited).starts_with("Scope: install scriptlets"));
 }
 
 #[test]
