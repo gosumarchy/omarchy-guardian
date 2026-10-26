@@ -17,6 +17,16 @@
 //! failed is never a clear one. An item stands for one malicious package
 //! where it is installed, named by its manifest, ecosystem and name; its
 //! text names the version, so a new version is a changed item.
+//!
+//! Two decisions of the owner's (2026-10-26) govern this module:
+//! - A package that may have a private name (from another registry or
+//!   index, installed from git, an address or a local path, a crate not
+//!   from crates.io, anything under a pip or uv extra index) is never sent
+//!   to OSV, and every sweep says it as not checked. Coverage gives way to
+//!   the rule that nothing private leaves the machine.
+//! - `sweep allow` on a package item runs the OSV lookup again: the item
+//!   exists only as a result of a lookup, and nothing of OSV's answers is
+//!   kept to find it from.
 
 mod config;
 mod inventory;
@@ -61,7 +71,8 @@ pub(super) struct Packages {
 }
 
 /// Reads the language packages installed under `scope` and asks OSV about
-/// every one of them. Waits on the network for as long as OSV takes.
+/// every one of them. Waits on the network for as long as OSV takes; this
+/// runs for `sweep allow` too (see the module docs).
 pub(super) fn check(scope: &Scope<'_>) -> Packages {
     let places = Places::from_env(scope.home);
     let inventory = inventory::collect(scope.root, &places);
