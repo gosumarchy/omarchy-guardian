@@ -338,7 +338,10 @@ mod tests {
     fn two_stores_on_one_root_do_not_remove_each_others_writes() {
         let dir = TempDir::new("store-two");
         let root = dir.path().join("store");
-        let stores = [Store::open(root.clone()).unwrap(), Store::open(root).unwrap()];
+        let stores = [
+            Store::open(root.clone()).unwrap(),
+            Store::open(root).unwrap(),
+        ];
 
         // Each write first removes whatever is under its temp name; with a
         // counter per store, both would use the same names and one could
