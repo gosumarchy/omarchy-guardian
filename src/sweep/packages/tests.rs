@@ -322,7 +322,7 @@ fn pipx_cargo_mise_and_an_npm_prefix_are_read() {
         "{unchecked}"
     );
     assert!(
-        unchecked.contains("1 language package(s) are from a private registry")
+        unchecked.contains("1 language package(s) are, or may be, from a private registry")
             && unchecked.contains("mine"),
         "{unchecked}"
     );
@@ -644,7 +644,7 @@ fn mises_python_and_private_sources_are_told_apart() {
     );
     let unchecked = inventory.unchecked.join("\n");
     assert!(
-        unchecked.starts_with("4 language package(s) are from a private registry"),
+        unchecked.starts_with("4 language package(s) are, or may be, from a private registry"),
         "{unchecked}"
     );
 
@@ -788,7 +788,8 @@ fn uvs_index_settings_keep_what_mise_installed_through_uv_out() {
     let inventory = inventory::collect(root, &places);
     assert_eq!(found(&inventory), [(Ecosystem::PyPi, "black", "1.0.0")]);
     assert!(
-        inventory.unchecked[0].starts_with("1 language package(s) are from a private registry"),
+        inventory.unchecked[0]
+            .starts_with("1 language package(s) are, or may be, from a private registry"),
         "{:?}",
         inventory.unchecked
     );

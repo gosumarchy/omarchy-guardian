@@ -694,7 +694,7 @@ impl<'a> Walk<'a> {
         }
         if !self.elsewhere.is_empty() {
             inventory.unchecked.push(format!(
-                "{} language package(s) are from a private registry or another index than the public one, an address, git or a local path, so they were not looked up in OSV (their names may be private) and are not checked: {}",
+                "{} language package(s) are, or may be, from a private registry or another index than the public one, an address, git or a local path, so they were not looked up in OSV (their names may be private) and are not checked: {}",
                 self.elsewhere.len(),
                 named(&self.elsewhere, "")
             ));

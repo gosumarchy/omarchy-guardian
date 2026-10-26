@@ -5,7 +5,7 @@
 //!
 //! A package from a registry other than the public one may have a private
 //! name, which must not go to OSV: npm's `registry` (or a scope's own),
-//! the address a hidden lockfile or `package.json` records, pip's
+//! the `_resolved` an older npm wrote in `package.json`, pip's
 //! `index-url`, `extra-index-url` and `find-links`, and uv's index settings
 //! (for what mise installs through uv) decide that.
 
@@ -284,7 +284,7 @@ impl NpmConfig {
                 }
                 ConfigFile::Text(text) => text,
             };
-            for (key, value) in text.lines().filter_map(|line| setting(line, &['='])) {
+            for (key, value) in text.lines().filter_map(setting) {
                 config.set(key, value, places.home.as_deref());
             }
         }
@@ -470,7 +470,8 @@ fn inline_keys(value: &str) -> impl Iterator<Item = &str> {
 
 /// Whether the text of a pip configuration file sets an index other than
 /// the Python Package Index. configparser joins to a value each line
-/// indented deeper than its key, which `setting` does not do.
+/// indented deeper than its key, and keeps quotes and `#` in it: values
+/// are taken raw here, not through `setting`, which reads npm's way.
 pub(super) fn pip_file_other_index(text: &str) -> bool {
     // The setting being read: its key's indent, whether it is an index
     // key, and its value with the lines joined to it.
@@ -492,14 +493,15 @@ pub(super) fn pip_file_other_index(text: &str) -> bool {
         other |= current
             .take()
             .is_some_and(|(_, index, value)| index && is_other_pip_index(&value));
-        current = setting(line, &['=', ':']).map(|(key, value)| {
-            let key = key.to_ascii_lowercase().replace('_', "-");
-            (
-                indent,
-                PIP_INDEX_KEYS.contains(&key.as_str()),
-                value.to_string(),
-            )
-        });
+        current = if trimmed.starts_with('[') {
+            None
+        } else {
+            trimmed.split_once(['=', ':']).map(|(key, value)| {
+                let key = key.trim().to_ascii_lowercase().replace('_', "-");
+                let index = PIP_INDEX_KEYS.contains(&key.as_str());
+                (indent, index, value.trim().to_string())
+            })
+        };
     }
     other || current.is_some_and(|(_, index, value)| index && is_other_pip_index(&value))
 }
@@ -571,15 +573,15 @@ fn has_index_argument<'a>(arguments: impl IntoIterator<Item = &'a str>) -> bool 
     })
 }
 
-/// The key and value of one line of an INI file: `key = value`, `;` and
-/// `#` starting a comment, which also ends an unquoted value; a quoted
-/// value is taken whole.
-fn setting<'a>(line: &'a str, separators: &[char]) -> Option<(&'a str, &'a str)> {
+/// The key and value of one line of an npm configuration file: `key =
+/// value`, `;` and `#` starting a comment, which also ends an unquoted
+/// value; a quoted value is taken whole.
+fn setting(line: &str) -> Option<(&str, &str)> {
     let line = line.trim();
     if line.starts_with([';', '#', '[']) {
         return None;
     }
-    let at = line.find(separators)?;
+    let at = line.find('=')?;
     let (key, value) = (line[..at].trim(), line[at + 1..].trim());
     let value = match value.chars().next() {
         Some(quote @ ('"' | '\'')) => value[1..].split(quote).next().unwrap_or_default(),
@@ -621,23 +623,19 @@ mod tests {
     };
 
     #[test]
-    fn ini_lines_are_read_as_npm_and_pip_read_them() {
+    fn npmrc_lines_are_read_as_npm_reads_them() {
         assert_eq!(
-            setting(" ignore-scripts = \"true\" ", &['=']),
+            setting(" ignore-scripts = \"true\" "),
             Some(("ignore-scripts", "true"))
         );
         assert_eq!(
-            setting("ignore-scripts=true ; why", &['=']),
+            setting("ignore-scripts=true ; why"),
             Some(("ignore-scripts", "true"))
         );
-        assert_eq!(setting("prefix = '/a;b'", &['=']), Some(("prefix", "/a;b")));
-        assert_eq!(setting("; ignore-scripts=true", &['=']), None);
-        assert_eq!(setting("# ignore-scripts=true", &['=']), None);
-        assert_eq!(setting("[global]", &['=', ':']), None);
-        assert_eq!(
-            setting("index-url: https://x.example/simple", &['=', ':']),
-            Some(("index-url", "https://x.example/simple"))
-        );
+        assert_eq!(setting("prefix = '/a;b'"), Some(("prefix", "/a;b")));
+        assert_eq!(setting("; ignore-scripts=true"), None);
+        assert_eq!(setting("# ignore-scripts=true"), None);
+        assert_eq!(setting("[section]"), None);
     }
 
     #[test]
@@ -744,6 +742,7 @@ mod tests {
             "[global]\n    # an indented comment\n",
             "[global]\n    timeout = 60\n    retries = 3\n",
             "[global]\nextra-index-url =\n    https://pypi.org/simple\n",
+            "[global]\ntimeout =\n    index-url = https://pypi.corp.example\n",
         ] {
             assert!(!pip_file_other_index(public), "{public}");
         }
@@ -752,6 +751,9 @@ mod tests {
             "[global]\nextra-index-url = https://pypi.org/simple\n    https://pypi.corp.example/simple\n",
             "[global]\nextra-index-url =\n    https://pypi.corp.example/simple\n",
             "[install]\nfind_links: /srv/wheels\n",
+            "[global]\n  index-url =\n      https://pypi.corp.example/simple\n",
+            "[global]\nextra-index-url = https://pypi.org/simple#x https://pypi.corp.example/simple\n",
+            "[global]\nindex-url = \"https://pypi.org/simple\" https://pypi.corp.example/simple\n",
         ] {
             assert!(pip_file_other_index(other), "{other}");
         }
