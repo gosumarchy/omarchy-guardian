@@ -1386,6 +1386,18 @@ fn only_an_exact_grub_password_hash_is_taken_out() {
         // A dotted name can hold a secret too.
         "linux /vmlinuz-linux foo.password=x\n",
         "linux /vmlinuz-linux cifs.password=hunter2\n",
+        // The user and password of an address, with a scheme or without.
+        "linux /vmlinuz-linux netroot=cifs://alice:p&ss@nas/share\n",
+        "linux /vmlinuz-linux netroot=iscsi:user:password@server::3260::iqn.x\n",
+        // The UEFI shell's `set`, with or without flags.
+        "set -v PASSWORD hunter2\n",
+        "set TOKEN abc\n",
+        // An assignment in other shapes.
+        "${LUKS_PASSWORD}=x\n",
+        "GRUB_PASSWORD+=x\n",
+        "X_PASSWORD[0]=x\n",
+        // A word that starts with `password` in any case.
+        "# Password: hunter2\n",
     ] {
         assert!(has_boot_secret(secret), "{secret}");
     }
@@ -1398,6 +1410,10 @@ fn only_an_exact_grub_password_hash_is_taken_out() {
         "linux /vmlinuz-linux rd.luks.key=/crypto_keyfile.bin\n",
         "linux /vmlinuz-linux luks.key=/etc/key:UUID=0123\n",
         "GRUB_CMDLINE_LINUX_DEFAULT=\"quiet\"\n",
+        // An `@` with no `:` before it is no address's password.
+        "linux /vmlinuz-linux root=UUID=1 rootflags=subvol=@ rw\n",
+        "linux /vmlinuz-linux systemd.wants=getty@tty1.service\n",
+        "set -v pager 1\n",
     ] {
         assert!(!has_boot_secret(plain), "{plain}");
     }
@@ -1445,6 +1461,8 @@ fn a_boot_configuration_with_a_plain_password_is_kept_from_the_review() {
         "password_argon2 root grub.argon2.id.v19.AAAA.BBBB\n",
         "GRUB_USERS=\"root;0;plain;hunter2\"\n",
         "linux /vmlinuz-linux foo.password=x\n",
+        "linux /vmlinuz-linux netroot=cifs://alice:p&ss@nas/share\n",
+        "linux /vmlinuz-linux netroot=iscsi:user:password@server::3260::iqn.x\n",
     ] {
         let kept = judged(text);
         assert!(kept.agent_input.is_empty(), "{:?}", kept.agent_input);
@@ -1455,6 +1473,14 @@ fn a_boot_configuration_with_a_plain_password_is_kept_from_the_review() {
     // Where a key file is, the configuration is reviewed.
     let key_file = judged("linux /vmlinuz-linux rd.luks.key=/crypto_keyfile.bin\n");
     assert_eq!(key_file.agent_input.len(), 1, "{:?}", key_file.agent_input);
+    // So is a Btrfs subvolume named `@`.
+    let subvolume = judged("linux /vmlinuz-linux root=UUID=1 rootflags=subvol=@ rw\n");
+    assert_eq!(
+        subvolume.agent_input.len(),
+        1,
+        "{:?}",
+        subvolume.agent_input
+    );
     // Without one, the configuration is reviewed, its hash taken out.
     let hashed = judged("password_pbkdf2 root grub.pbkdf2.sha512.10000.0A1B.2C3D\n");
     assert_eq!(hashed.agent_input.len(), 1);

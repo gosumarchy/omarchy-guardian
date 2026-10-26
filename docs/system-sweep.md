@@ -952,20 +952,26 @@ incomplete.
 - **Boot configuration that holds a secret the exact rule below cannot take
   out** is read like a file whose path marks it as holding secrets (above):
   the secret wins over the review. That is a line with a word that starts
-  with `password` (GRUB's plain `password <user> <password>`,
+  with `password` in any case (GRUB's plain `password <user> <password>`,
   `password_pbkdf2` or `password_argon2` in any shape but the exact one
   below, also inside a `menuentry` or after `then`, or a comment that names
-  one), a GRUB password hash (`grub.pbkdf2.`, `grub.argon2.`) anywhere else,
-  a line that names `GRUB_USERS` (whose entries end in a password), an
-  assignment to a name that says secret (`GRUB_PASSWORD=…`, as for masking
-  below, whatever the value, also as the last part of a dotted name such as
-  `cifs.password=`; only systemd-cryptsetup's `rd.luks.key=` and `luks.key=`
-  are passed over, as their value is where a key file is, never the key),
-  or, in a file that runs `cryptomount`, a word that starts with `-p` or
-  `--password` on any line (its options may go on after a `\`). The text is
-  read as written, not as GRUB parses it: a word joined from quoted parts, or
-  split by a `\` at the end of a line, is not seen. This fails closed: a file kept this way that something runs raises
-  `kept-from-review`. Where the only secret is a hash on an exact line, the
+  one, `# Password: …`), a GRUB password hash (`grub.pbkdf2.`,
+  `grub.argon2.`) anywhere else, a line that names `GRUB_USERS` (whose
+  entries end in a password), a word with a `:` before an `@` (the user and
+  password of an address, with a scheme as in `cifs://alice:secret@nas` or
+  without one as in dracut's `netroot=iscsi:user:password@server…`; a
+  `subvol=@` or `getty@tty1` has none), an assignment to a name that says
+  secret (`GRUB_PASSWORD=…`, `GRUB_PASSWORD+=…`, `X_PASSWORD[0]=…`,
+  `${LUKS_PASSWORD}=…`, as for masking below, whatever the value, also as
+  the last part of a dotted name such as `cifs.password=`; only
+  systemd-cryptsetup's `rd.luks.key=` and `luks.key=` are passed over, as
+  their value is where a key file is, never the key), `set [-flags] NAME
+  value` with such a name (the UEFI shell's form in `startup.nsh`), or, in a
+  file that runs `cryptomount`, a word that starts with `-p` or `--password`
+  on any line (its options may go on after a `\`). The text is read as
+  written, not as GRUB parses it: a word joined from quoted parts, or split
+  by a `\` at the end of a line, is not seen. This fails closed: a file kept
+  this way that something runs raises `kept-from-review`. Where the only secret is a hash on an exact line, the
   hash is taken out (below) and the rest of the file is reviewed. So a
   modified `/etc/grub.d/00_header`, which writes GRUB's password lines, goes
   to the local rules only (a modified package file, and `kept-from-review`),

@@ -77,25 +77,33 @@ fn without_grub_hash(line: &str) -> Option<String> {
 /// does not take out. On any line but the exact `password_pbkdf2` one
 /// that is masked, that is:
 ///
-/// - a word that starts with `password`: GRUB's plain `password <user>
-///   <password>`, `password_pbkdf2` and `password_argon2` in any other
-///   shape (quoted, followed by a comment or a `;`, inside a `menuentry
-///   { }` or after `then`), and an option such as `--password`;
+/// - a word that starts with `password`, in any case: GRUB's plain
+///   `password <user> <password>`, `password_pbkdf2` and `password_argon2`
+///   in any other shape (quoted, followed by a comment or a `;`, inside a
+///   `menuentry { }` or after `then`), an option such as `--password`,
+///   and a comment that names one (`# Password: …`);
 /// - a password hash, `grub.pbkdf2.` or `grub.argon2.`, wherever it is;
 /// - `GRUB_USERS`, which `/etc/default/grub` sets to
 ///   `name;access;plain|pbkdf2|argon2;secret` entries;
+/// - a word with a `:` before an `@`: the user and password of an address,
+///   with a scheme (`cifs://alice:p&ss@nas`) or without (dracut's
+///   `netroot=iscsi:user:password@server…`), which masking cannot take
+///   out whole (`without_url_passwords` needs `://` and plain characters);
 /// - an assignment to a name that says secret (`GRUB_PASSWORD=…`, see
 ///   `is_secret_name`, on the last part of a dotted name), whatever the
-///   value, quoted or not, but the kernel parameters in `KEY_FILE_PARAMETERS`;
+///   value, quoted or not, but the kernel parameters in
+///   `KEY_FILE_PARAMETERS`; and `set [-flags] NAME value` with such a name
+///   (the UEFI shell's form in `startup.nsh`, and GRUB's);
 /// - in a file that runs `cryptomount` anywhere, a word that starts with
 ///   `-p` or `--password` on any line, as its options may go on after a
 ///   `\` on the next.
 ///
 /// The text is read as written, split at blanks and `;{}()"'`, not as
 /// GRUB or the shell parses it: a word joined from quoted parts
-/// (`pass"word"`) or split by a `\` at the end of a line is not seen. Such a file is read by the local rules
-/// only, as the secret wins over the review; this fails closed, so a
-/// comment that names a password keeps the file from the review too.
+/// (`pass"word"`) or split by a `\` at the end of a line is not seen.
+/// Such a file is read by the local rules only, as the secret wins over
+/// the review; this fails closed, so a comment that names a password
+/// keeps the file from the review too.
 pub(super) fn has_boot_secret(text: &str) -> bool {
     let cryptomount = text.contains("cryptomount");
     text.lines().any(|line| {
@@ -113,10 +121,28 @@ pub(super) fn has_boot_secret(text: &str) -> bool {
         let hash = ["grub.pbkdf2.", "grub.argon2.", "GRUB_USERS"]
             .iter()
             .any(|marker| line.contains(marker));
-        hash || words.iter().any(|word| word.starts_with("password"))
-            || passphrase
-            || assigns_secret(line)
+        let password = words
+            .iter()
+            .any(|word| word.to_ascii_lowercase().starts_with("password"));
+        // `rootflags=subvol=@` and `getty@tty1` have no `:` before the `@`.
+        let userinfo = words.iter().any(|word| {
+            word.split_once('@')
+                .is_some_and(|(before, _)| before.contains(':'))
+        });
+        hash || password || userinfo || passphrase || assigns_secret(line) || sets_secret(&words)
     })
+}
+
+/// Whether `words`, one line, are `set [-flags] NAME value` with a name
+/// that says secret (`set -v PASSWORD hunter2`, `set TOKEN abc`).
+fn sets_secret(words: &[&str]) -> bool {
+    if words.first() != Some(&"set") {
+        return false;
+    }
+    words[1..]
+        .iter()
+        .find(|word| !word.starts_with('-'))
+        .is_some_and(|name| is_secret_name(name.split('=').next().unwrap_or_default()))
 }
 
 /// Kernel parameters whose name says key but whose value is where a key
@@ -128,10 +154,17 @@ pub(super) fn has_boot_secret(text: &str) -> bool {
 const KEY_FILE_PARAMETERS: &[&str] = &["rd.luks.key", "luks.key"];
 
 /// Whether `line` assigns to a name that says secret, but one of
-/// `KEY_FILE_PARAMETERS` (see `has_boot_secret`).
+/// `KEY_FILE_PARAMETERS` (see `has_boot_secret`). What may stand between
+/// the name and the `=` is passed over first: a `+` (`NAME+=`), a
+/// subscript (`NAME[0]=`) and the brace of `${NAME}`.
 fn assigns_secret(line: &str) -> bool {
     line.match_indices('=').any(|(at, _)| {
-        let named = line[..at].trim_end_matches([' ', '\t']);
+        let named = line[..at].trim_end_matches([' ', '\t', '+']);
+        let named = match named.strip_suffix(']') {
+            Some(subscripted) => subscripted.rsplit_once('[').map_or(named, |(name, _)| name),
+            None => named,
+        };
+        let named = named.trim_end_matches('}');
         let length = |dots: bool| {
             named
                 .bytes()
