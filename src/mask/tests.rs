@@ -1,6 +1,7 @@
 //! Tests for `mask`.
 
 use super::lines;
+use crate::test_support::CpuInstant;
 
 fn code(rel: &str, text: &str) -> Vec<String> {
     lines(rel, text)
@@ -129,7 +130,7 @@ fn printed_heredocs_are_quiet_and_others_are_not() {
 #[test]
 fn many_heredocs_on_one_line_stay_linear() {
     let text = "cat ".to_string() + &"<<E ".repeat(500_000);
-    let started = std::time::Instant::now();
+    let started = CpuInstant::now();
     assert_eq!(lines("x.sh", &text).len(), 1);
     assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
 }
@@ -267,9 +268,9 @@ fn comments_stay_comments_and_own_output_is_followed() {
     long.push('\n');
     long.push_str(&">|".repeat(100_000));
     long.push('\n');
-    let started = std::time::Instant::now();
+    let started = CpuInstant::now();
     assert_eq!(lines("x.sh", &long).len(), 40_005);
-    assert!(started.elapsed().as_secs() < 30);
+    assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
     // Whatever the file is called: a shell runs a `.txt` as well.
     for rest in ["gen \"$@\" 2>&1 | tee build.log\n", "gen > usage.txt\n"] {
         let text = format!("gen() {{\n  echo 'sudo a'\n}}\n{rest}");
