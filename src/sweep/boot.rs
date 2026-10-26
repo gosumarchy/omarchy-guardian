@@ -1,13 +1,16 @@
 //! What the machine was started with: the kernel's command line as it is
-//! now, the kernel images in `/boot` against the ones the kernel packages
-//! ship, and whether Secure Boot is on.
+//! now, the kernel images and EFI programs in `/boot` against the ones
+//! packages ship (see `efi`), and whether Secure Boot is on.
 //!
 //! The boot loader's configuration is reviewed as a file. A parameter
-//! typed at the boot menu, or a kernel image swapped in `/boot`, is in no
-//! file the sweep reviews, so both are compared here. `/boot` is usually
-//! root's alone, so most of this is the root collector's to do. The EFI
-//! programs (the boot loader itself) and what is inside the initramfs
-//! image are not looked at.
+//! typed at the boot menu, or a kernel image or boot loader swapped in
+//! `/boot`, is in no file the sweep reviews, so these are compared here.
+//! `/boot` is usually root's alone, so most of this is the root
+//! collector's to do. What is inside the initramfs image is not looked at:
+//! mkinitcpio builds it on this machine, so no package has a copy to
+//! compare it with.
+
+mod efi;
 
 use std::fs;
 
@@ -17,7 +20,7 @@ use super::tier::Tier;
 use crate::autorun::Category;
 use crate::paths::file_name;
 use crate::rules::RuleId;
-use crate::sha256::Sha256;
+use crate::sha256::{Digest, Sha256};
 
 /// Kernel parameters that replace what starts first, open a root shell or
 /// turn a defence off. One ending in `=` matches any value.
@@ -174,26 +177,29 @@ fn command_line(scope: &Scope<'_>, boot: &mut Boot) {
     });
 }
 
-/// The kernel images under `/boot`, as paths relative to the root: files
-/// whose name starts with `vmlinuz`, up to three directories down (Limine's
-/// entry tool keeps them in a directory for each machine and kernel); and
-/// whether there were more than are compared. `Err` when `/boot` cannot be
-/// listed.
-fn images(scope: &Scope<'_>) -> Result<(Vec<String>, bool), ()> {
+/// Every file under `/boot`, as paths relative to the root (none when
+/// there is no `/boot`); `Err` when it cannot be listed.
+fn listing(scope: &Scope<'_>) -> Result<Vec<String>, ()> {
     match fs::read_dir(scope.root.join("boot")) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((Vec::new(), false));
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(_) => return Err(()),
         Ok(_) => {}
     }
     let listing = read::entries(scope.root, "boot");
-    if !listing.unreadable.is_empty() {
-        return Err(());
+    if listing.unreadable.is_empty() {
+        Ok(listing.files)
+    } else {
+        Err(())
     }
-    let mut images: Vec<String> = listing
-        .files
-        .into_iter()
+}
+
+/// The kernel images among `files`: those whose name starts with
+/// `vmlinuz`, up to three directories down (Limine's entry tool keeps them
+/// in a directory for each machine and kernel); and whether there were
+/// more than are compared.
+fn images(files: &[String]) -> (Vec<String>, bool) {
+    let mut images: Vec<String> = files
+        .iter()
         .filter(|path| {
             path.matches('/').count() <= 4
                 && path
@@ -201,10 +207,11 @@ fn images(scope: &Scope<'_>) -> Result<(Vec<String>, bool), ()> {
                     .next()
                     .is_some_and(|name| name.starts_with("vmlinuz"))
         })
+        .cloned()
         .collect();
     let more = images.len() > MAX_IMAGES;
     images.truncate(MAX_IMAGES);
-    Ok((images, more))
+    (images, more)
 }
 
 /// The release a kernel image says it is (`6.12.1-arch1-1`), from the
@@ -258,19 +265,39 @@ fn is_started(scope: &Scope<'_>, path: &str, defaults: &[String]) -> bool {
     }
 }
 
-fn kernel_images(scope: &Scope<'_>, boot: &mut Boot) {
+/// The digests of the kernel images the installed kernel packages ship,
+/// where they are still what those packages shipped.
+fn shipped_kernels(scope: &Scope<'_>) -> Vec<Digest> {
+    read::matching(scope.root, "usr/lib/modules/*/vmlinuz")
+        .files
+        .into_iter()
+        .filter_map(|path| {
+            let item = collect::item(scope, Category::Boot, path, None);
+            matches!(item.tier, Tier::Vendor | Tier::UserBuilt)
+                .then_some(item.sha256)
+                .flatten()
+        })
+        .collect()
+}
+
+/// Says that `/boot` could not be listed: for root the sweep is
+/// incomplete, a user's sweep leaves it to the root checks.
+fn unlisted(scope: &Scope<'_>, boot: &mut Boot) {
+    if scope.origin == collect::Origin::Root {
+        boot.unchecked.push(
+            "/boot: could not be listed; the kernel images and EFI programs were not compared"
+                .into(),
+        );
+    } else {
+        boot.notes.push(
+            "the kernel images and EFI programs in /boot cannot be read as this user; the root checks compare them with the packaged ones".into(),
+        );
+    }
+}
+
+fn kernel_images(scope: &Scope<'_>, files: &[String], shipped: &[Digest], boot: &mut Boot) {
     let as_root = scope.origin == collect::Origin::Root;
-    let Ok((images, more)) = images(scope) else {
-        if as_root {
-            boot.unchecked
-                .push("/boot: could not be listed; the kernel images were not compared".into());
-        } else {
-            boot.notes.push(
-                "the kernel images in /boot cannot be read as this user; the root checks compare them with the packaged ones".into(),
-            );
-        }
-        return;
-    };
+    let (images, more) = images(files);
     if images.is_empty() {
         return;
     }
@@ -284,17 +311,6 @@ fn kernel_images(scope: &Scope<'_>, boot: &mut Boot) {
         }
     }
     let defaults = default_names(scope);
-    // What the kernel packages ship, where it is still what they shipped.
-    let shipped: Vec<_> = read::matching(scope.root, "usr/lib/modules/*/vmlinuz")
-        .files
-        .into_iter()
-        .filter_map(|path| {
-            let item = collect::item(scope, Category::Boot, path, None);
-            matches!(item.tier, Tier::Vendor | Tier::UserBuilt)
-                .then_some(item.sha256)
-                .flatten()
-        })
-        .collect();
     for path in images {
         let mut item = collect::item(scope, Category::Boot, path, None);
         match (&item.body, item.sha256) {
@@ -357,7 +373,14 @@ fn secure_boot(scope: &Scope<'_>, boot: &mut Boot) {
 pub(super) fn check(scope: &Scope<'_>) -> Boot {
     let mut boot = Boot::default();
     command_line(scope, &mut boot);
-    kernel_images(scope, &mut boot);
+    match listing(scope) {
+        Ok(files) => {
+            let shipped = shipped_kernels(scope);
+            kernel_images(scope, &files, &shipped, &mut boot);
+            efi::compare(scope, &files, &shipped, &mut boot);
+        }
+        Err(()) => unlisted(scope, &mut boot),
+    }
     secure_boot(scope, &mut boot);
     boot
 }

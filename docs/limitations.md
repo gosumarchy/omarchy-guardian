@@ -37,11 +37,13 @@ matter most:
   root can rewrite, and the pacman gate reviews as the user who called `sudo`,
   with that user's reviewer login.
 - **System sweep:** as a user only your own processes can be looked at, and
-  without root checks every sweep is incomplete. The EFI programs and the
-  inside of the initramfs image are not looked at; other mounted filesystems
-  (`/mnt`, `/media`, `/run/media`) are not searched for setuid files; the
-  running kernel's modules are not checked between a kernel update and the
-  next boot; what a process does to its own environment after it started is
+  without root checks every sweep is incomplete. The inside of the initramfs
+  image, and of a unified kernel image except its kernel, is not compared, as
+  it is built on the machine; GRUB's EFI program is listed as not comparable;
+  a signature on an EFI program is put back, not checked; other mounted
+  filesystems (`/mnt`, `/media`, `/run/media`) are not searched for setuid
+  files; the running kernel's modules are not checked between a kernel update
+  and the next boot; what a process does to its own environment after it started is
   not seen; and only shell scripts no package vouches for are looked through
   for what they start, three deep, not scripts of other interpreters, and
   inside a script only a program named by a path in the place of a command
@@ -128,8 +130,8 @@ The full text of each limit is on the page of its part, not repeated here:
   interceptor](themes-and-plugins.md#the-bash-interceptor)).
 - System sweep: what is and is not followed ([What it
   reads](system-sweep.md#what-it-reads)), what the live checks miss ([What
-  runs now](system-sweep.md#what-runs-now)), the EFI programs and the
-  initramfs ([How the machine was
+  runs now](system-sweep.md#what-runs-now)), the initramfs and what else in
+  `/boot` is built on the machine ([How the machine was
   started](system-sweep.md#how-the-machine-was-started)), pacman's records
   taken as intact ([How each item is
   judged](system-sweep.md#how-each-item-is-judged)), secrets that still go
