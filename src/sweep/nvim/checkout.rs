@@ -67,11 +67,12 @@ pub(super) struct Git {
     pub(super) remote: Remote,
     /// The commit `HEAD` is at.
     pub(super) commit: Option<String>,
-    /// What may make git run something that is not a hook: the keys of
-    /// its configuration and its submodules' that run a command, every
-    /// `core.hooksPath` among them, every entry of a git directory that is
-    /// not plain data (see `PLAIN_DATA`), and every git directory or
-    /// pointer below the checkout.
+    /// What may make git run a program that is not a hook, or fetch from
+    /// elsewhere or through someone else: every key of the configuration
+    /// of the checkout and of its submodules that a clone does not write
+    /// (see `cloned`), every entry of a git directory that is not plain
+    /// data (see `PLAIN_DATA`), and every git directory or pointer below
+    /// the checkout.
     pub(super) runs: Vec<Run>,
     /// The git hooks it holds (every file or link but `*.sample` in
     /// `.git/hooks`, in a `core.hooksPath` within the checkout, and in the
@@ -79,7 +80,9 @@ pub(super) struct Git {
     pub(super) hooks: Vec<(String, Entry)>,
 }
 
-/// Something in a checkout's git files that may make git run a program.
+/// Something in a checkout's git files that may make git run a program or
+/// fetch from elsewhere: a configuration key a clone does not write, or a
+/// file or directory git does not only read.
 #[derive(Debug)]
 pub(super) struct Run {
     /// Relative to the plugin.
@@ -280,10 +283,10 @@ fn walk(
 /// (see `walk`).
 ///
 /// Besides the origin and the commit, that is what may make git run a
-/// program when lazy.nvim fetches or checks out: hooks, the keys that run
-/// commands in the configuration of the checkout and of each submodule
-/// (`.git/modules`), and every entry of those git directories that is not
-/// plain data (see `PLAIN_DATA`).
+/// program, or fetch from elsewhere, when lazy.nvim fetches or checks out:
+/// hooks, the keys of the configuration of the checkout and of each
+/// submodule (`.git/modules`) that a clone does not write, and every entry
+/// of those git directories that is not plain data (see `PLAIN_DATA`).
 fn git(root: &Path, path: &str, inner: Vec<String>, unchecked: &mut Vec<String>) -> Option<Git> {
     let directory = format!("{path}/.git");
     if !fs::symlink_metadata(root.join(&directory)).is_ok_and(|metadata| metadata.is_dir()) {
@@ -472,69 +475,35 @@ impl Gits<'_> {
             let Some(text) = text else {
                 continue;
             };
-            // Every hooks path counts here, in the tree or not: a plugin's
-            // files are reviewed only once they change.
-            let keys = git_state::executing_keys(text).into_iter();
-            let keys = keys.filter(|(_, key)| !key.starts_with("core.hookspath "));
-            self.runs.extend(keys.map(|(line, what)| Run {
-                file: file.clone(),
-                line: Some(line),
-                what,
-                entry: None,
-            }));
-            for (line, value, reading) in git_state::values(text, "core", None, "hookspath") {
+            // Anything a clone did not write is a finding, whatever it
+            // does: a list of the keys that run a command or reach the
+            // network would miss the next one (`http.proxy` with
+            // `http.sslVerify = false` was one). Every hooks path counts
+            // here, in the tree or not: a plugin's files are reviewed only
+            // once they change.
+            for found in git_state::keys(text) {
+                if cloned(git, &found) {
+                    continue;
+                }
+                let what = match &found.subsection {
+                    Some(sub) => format!("{}.{sub}.{}", found.section, found.key),
+                    None => format!("{}.{}", found.section, found.key),
+                };
                 self.runs.push(Run {
                     file: file.clone(),
-                    line: Some(line),
-                    what: format!("core.hookspath = {}", without_url_credentials(&value)),
+                    line: Some(found.line),
+                    what: format!("{what} = {}", without_url_credentials(&found.value)),
                     entry: None,
                 });
+            }
+            for (_, value, reading) in git_state::values(text, "core", None, "hookspath") {
                 hooks_path = match reading {
                     Reading::Sure => Some(value),
                     Reading::OneOfSeveral => None,
                 };
             }
-            self.other_remotes(&file, text);
         }
         hooks_path
-    }
-
-    /// Takes in, from the configuration `text` of `file`, what may make a
-    /// bare `git fetch` (which lazy.nvim runs) fetch from elsewhere than
-    /// origin, or move origin's refs: every key of a remote other than
-    /// origin, and every `branch.*.remote` other than origin.
-    fn other_remotes(&mut self, file: &str, text: &str) {
-        let remotes = git_state::section_keys(text, "remote")
-            .into_iter()
-            .filter(|key| key.subsection.as_deref() != Some("origin"));
-        let branches = git_state::section_keys(text, "branch")
-            .into_iter()
-            .filter(|key| key.key == "remote" && key.value != "origin");
-        for found in remotes.chain(branches) {
-            let section = if found.key == "remote" {
-                "branch"
-            } else {
-                "remote"
-            };
-            let name = found.subsection.as_deref().unwrap_or_default();
-            let what = format!(
-                "{section}.{name}.{} = {} (a bare git fetch may use it)",
-                found.key,
-                without_url_credentials(&found.value)
-            );
-            let duplicate = self
-                .runs
-                .iter()
-                .any(|run| run.file == file && run.line == Some(found.line));
-            if !duplicate {
-                self.runs.push(Run {
-                    file: file.to_string(),
-                    line: Some(found.line),
-                    what,
-                    entry: None,
-                });
-            }
-        }
     }
 
     /// Takes in the submodule git directories under `modules`, `depth`
@@ -631,6 +600,66 @@ impl Gits<'_> {
         self.git_directory(git, text.as_deref(), worktree.as_deref());
         self.modules(&format!("{git}/modules"), depth);
     }
+}
+
+/// Whether `found`, a key of the configuration of the git directory `git`
+/// (`.git`, or a submodule's under `.git/modules`), is one that `git
+/// clone`, `git submodule` and lazy.nvim write, with a value they write:
+/// the keys of lazy.nvim's checkouts and their sparse checkout, as found
+/// in a stock `LazyVim` install, and those of a partial clone and a
+/// submodule.
+fn cloned(git: &str, found: &git_state::ConfigKey) -> bool {
+    let value = found.value.as_str();
+    let origin = found.subsection.as_deref() == Some("origin");
+    match (found.section.as_str(), found.key.as_str()) {
+        ("core", "repositoryformatversion") => matches!(value, "0" | "1"),
+        ("core", "filemode") => matches!(value, "true" | "false"),
+        ("core", "bare" | "autocrlf") => value == "false",
+        ("core", "logallrefupdates" | "sparsecheckout") | ("extensions", "worktreeconfig") => {
+            value == "true"
+        }
+        ("core", "sparsecheckoutcone") => matches!(value, "true" | "false"),
+        ("core", "worktree") => git != ".git" && is_own_worktree(git, value),
+        // A filter only tells the server what to leave out.
+        ("remote", "url" | "partialclonefilter") => origin,
+        ("remote", "fetch") => origin && is_origin_refspec(value),
+        ("remote", "promisor") => origin && value == "true",
+        ("remote", "tagopt") => origin && value == "--no-tags",
+        ("branch", "remote") => found.subsection.is_some() && value == "origin",
+        ("branch", "merge") => found.subsection.is_some() && value.starts_with("refs/heads/"),
+        ("submodule", "active") => match found.subsection {
+            None => value == ".",
+            Some(_) => value == "true",
+        },
+        ("extensions", "partialclone") => value == "origin",
+        ("extensions", "objectformat") => matches!(value, "sha1" | "sha256"),
+        _ => false,
+    }
+}
+
+/// Whether `value` is the refspec a clone gives origin:
+/// `+refs/heads/*:refs/remotes/origin/*`, or the same for one branch.
+fn is_origin_refspec(value: &str) -> bool {
+    let Some((source, target)) = value.split_once(':') else {
+        return false;
+    };
+    let source = source.strip_prefix("+refs/heads/");
+    let target = target.strip_prefix("refs/remotes/origin/");
+    matches!((source, target), (Some(source), Some(target)) if source == target && !source.is_empty())
+}
+
+/// Whether `value` is the `core.worktree` `git submodule` writes for the
+/// submodule git directory `git`: back up to the top of the checkout, then
+/// down a path within it but outside `.git`. Anything else would have git
+/// check files out elsewhere.
+fn is_own_worktree(git: &str, value: &str) -> bool {
+    let up = "../".repeat(git.split('/').count());
+    let Some(path) = value.strip_prefix(&up) else {
+        return false;
+    };
+    !path.starts_with(".git/")
+        && path != ".git"
+        && path.split('/').all(|part| !matches!(part, "" | "." | ".."))
 }
 
 /// The text of the file at `path`, if it is a plain file of at most

@@ -221,10 +221,12 @@ pub(crate) fn values(
     found
 }
 
-/// One key of a git configuration, as `section_keys` gives it.
+/// One key of a git configuration, as `keys` gives it.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct SectionKey {
+pub(crate) struct ConfigKey {
     pub(crate) line: usize,
+    /// Lowercase.
+    pub(crate) section: String,
     pub(crate) subsection: Option<String>,
     /// Lowercase.
     pub(crate) key: String,
@@ -232,18 +234,18 @@ pub(crate) struct SectionKey {
     pub(crate) value: String,
 }
 
-/// Every key of `section` (lowercase) in `text`, whatever its subsection,
-/// in every reading of its line.
-pub(crate) fn section_keys(text: &str, section: &str) -> Vec<SectionKey> {
-    let mut found: Vec<SectionKey> = Vec::new();
-    each_key(text, |line, at, subsection, key, value, _| {
-        let entry = SectionKey {
+/// Every key of `text`, in every reading of its line (see `each_key`).
+pub(crate) fn keys(text: &str) -> Vec<ConfigKey> {
+    let mut found: Vec<ConfigKey> = Vec::new();
+    each_key(text, |line, section, subsection, key, value, _| {
+        let entry = ConfigKey {
             line,
+            section: section.to_string(),
             subsection: subsection.map(str::to_string),
             key: key.to_string(),
             value: unquoted(value),
         };
-        if at == section && !found.contains(&entry) {
+        if !found.contains(&entry) {
             found.push(entry);
         }
     });

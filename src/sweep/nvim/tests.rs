@@ -494,6 +494,141 @@ fn other_remotes_and_a_worktree_origin_are_findings() {
     );
 }
 
+/// The `GitConfigCommand` alerts of the plugin `p` once its `.git/config`
+/// is `config` and its `.git/config.worktree` is `worktree`.
+fn config_alerts(config: &str, worktree: &str) -> Vec<String> {
+    let temp = TempDir::new("nvim-allowed-keys");
+    let root = temp.path();
+    plugin(root, "p", "https://github.com/folke/flash.nvim", &[]);
+    write(root, &format!("{LAZY}/p/.git/config"), config);
+    write(root, &format!("{LAZY}/p/.git/config.worktree"), worktree);
+    collected(root).items[0]
+        .alerts
+        .iter()
+        .filter(|(rule, _)| *rule == RuleId::GitConfigCommand)
+        .map(|(_, message)| message.clone())
+        .collect()
+}
+
+// A lazy.nvim clone, as written on a stock LazyVim install.
+const CLONE_CONFIG: &str = "[core]
+\trepositoryformatversion = 1
+\tfilemode = true
+\tbare = false
+\tlogallrefupdates = true
+\tautocrlf = false
+[submodule]
+\tactive = .
+[remote \"origin\"]
+\turl = https://github.com/folke/flash.nvim.git
+\tfetch = +refs/heads/*:refs/remotes/origin/*
+[branch \"main\"]
+\tremote = origin
+\tmerge = refs/heads/main
+[extensions]
+\tworktreeConfig = true
+";
+const CLONE_WORKTREE: &str = "[core]
+\tsparseCheckout = true
+\tsparseCheckoutCone = false
+";
+
+#[test]
+fn only_the_keys_a_clone_writes_are_no_finding() {
+    assert_eq!(
+        config_alerts(CLONE_CONFIG, CLONE_WORKTREE),
+        Vec::<String>::new()
+    );
+
+    // A proxy with certificate checks off routes the fetch through someone
+    // else, and runs nothing: still a finding, as is anything else.
+    let proxy = format!(
+        "{CLONE_CONFIG}[http]\n\tproxy = http://user:pw@attacker:8080\n\tsslVerify = false\n"
+    );
+    let alerts = config_alerts(&proxy, CLONE_WORKTREE);
+    assert_eq!(alerts.len(), 2, "{alerts:?}");
+    assert!(
+        alerts[0].contains("line 18: ")
+            && alerts[0].contains("http.proxy = http://***@attacker:8080")
+    );
+    assert!(alerts[1].contains("http.sslverify = false"));
+    assert!(!alerts.iter().any(|alert| alert.contains("pw")));
+
+    for (config, worktree, expected) in [
+        (
+            format!("{CLONE_CONFIG}[http \"https://github.com/\"]\n\tsslCAInfo = /tmp/ca\n"),
+            CLONE_WORKTREE,
+            "http.https://github.com/.sslcainfo = /tmp/ca",
+        ),
+        (
+            format!("{CLONE_CONFIG}[remote \"origin\"]\n\tproxy = http://attacker\n"),
+            CLONE_WORKTREE,
+            "remote.origin.proxy = http://attacker",
+        ),
+        (
+            CLONE_CONFIG.replace("bare = false", "bare = true"),
+            CLONE_WORKTREE,
+            "core.bare = true",
+        ),
+        (
+            CLONE_CONFIG.replace("refs/remotes/origin/*", "refs/heads/*"),
+            CLONE_WORKTREE,
+            "remote.origin.fetch = +refs/heads/*:refs/heads/*",
+        ),
+        (
+            CLONE_CONFIG.to_string(),
+            "[core]\n\tsshCommand = sh x\n",
+            "core.sshcommand = sh x",
+        ),
+        (
+            format!("{CLONE_CONFIG}[include]\n\tpath = /elsewhere\n"),
+            CLONE_WORKTREE,
+            "include.path = /elsewhere",
+        ),
+    ] {
+        let alerts = config_alerts(&config, worktree);
+        assert!(
+            alerts.len() == 1 && alerts[0].contains(expected),
+            "{expected}: {alerts:?}"
+        );
+    }
+}
+
+#[test]
+fn a_submodule_may_name_its_own_working_tree_only() {
+    let temp = TempDir::new("nvim-module-worktree");
+    let root = temp.path();
+    plugin(root, "p", "https://github.com/o/p", &[]);
+    let modules = format!("{LAZY}/p/.git/modules");
+    for (name, worktree) in [
+        ("own", "../../../deps/own"),
+        ("up", "../../../../elsewhere"),
+        ("git", "../../../.git/hooks"),
+    ] {
+        write(
+            root,
+            &format!("{modules}/{name}/config"),
+            &format!("[core]\n\tbare = false\n\tworktree = {worktree}\n"),
+        );
+        write(
+            root,
+            &format!("{modules}/{name}/HEAD"),
+            &format!("{COMMIT}\n"),
+        );
+    }
+    let item = &collected(root).items[0];
+    let mut runs: Vec<&str> = item
+        .alerts
+        .iter()
+        .filter(|(rule, _)| *rule == RuleId::GitConfigCommand)
+        .map(|(_, message)| message.as_str())
+        .collect();
+    runs.sort_unstable();
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert!(runs[0].contains("modules/git/config") && runs[0].contains(".git/hooks"));
+    assert!(runs[1].contains("modules/up/config") && runs[1].contains("elsewhere"));
+}
+
 #[test]
 fn an_entry_that_is_no_file_directory_or_link_is_not_checked() {
     let temp = TempDir::new("nvim-socket");

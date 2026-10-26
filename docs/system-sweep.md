@@ -375,10 +375,10 @@ keeps each as a git checkout in `~/.local/share/nvim/lazy/<name>`
 Neovim runs that code at every start. The sweep lists each plugin as one item,
 under its directory, whose hash covers every file of it outside `.git` (a
 file's mode included), the address it was cloned from, the commit it is at, and
-what may make git run a program in it: the hooks and the keys that run commands
-of the checkout and of each submodule under `.git/modules`, the keys that point
-a fetch at a remote other than `origin`, and every entry of those git
-directories that is not plain data. A plugin that is updated, edited,
+what may make git run a program in it or fetch from elsewhere: the hooks and the
+configuration keys that a clone does not write, of the checkout and of each
+submodule under `.git/modules`, and every entry of those git directories that
+is not plain data. A plugin that is updated, edited,
 moved to another address or given a hook is changed, shows in `--diff` and in
 the daily notification, and an allow covers it as a whole until it changes.
 Plain data is what git only reads: `objects`, `refs`, `HEAD`, `index`,
@@ -392,9 +392,9 @@ and `.git/config.worktree` (with any user and password taken out of the
 address; an origin that is not exactly one address read one way, through a
 continued line or several `url` keys, is not checked, and says so; an empty
 `url` clears those before it, as git 2.46 and later does),
-the commit from `.git/HEAD` and the refs (`packed-refs` too), the keys that run
-commands in `.git/config` and `.git/config.worktree`, and in those of each
-submodule, read the way git reads them, the hooks in `.git/hooks`, in a
+the commit from `.git/HEAD` and the refs (`packed-refs` too), every key of
+`.git/config` and `.git/config.worktree`, and of those of each submodule, read
+the way git reads them, the hooks in `.git/hooks`, in a
 `core.hooksPath` within the checkout and in each submodule's `hooks`, the names
 in each git directory, `lazy-lock.json` in `~/.config/nvim`
 (`$XDG_CONFIG_HOME/nvim`), and the plugin specs in the Lua files of your
@@ -417,14 +417,23 @@ What is a finding, on every sweep:
   a spec whose key code computes (`[("build")] = …`), which may be such a build
   step, and code that was not read decides; and any git hook in the checkout or
   a submodule, which git runs when lazy.nvim updates it;
-- `git-config-command`: a key of the configuration of the checkout or of a
-  submodule (`config`, `config.worktree`) that runs a command (`core.fsmonitor`
-  and the like) on the git commands lazy.nvim runs, any `core.hooksPath`, in
-  the checkout or not, any key of a remote other than `origin` and any
-  `branch.<name>.remote` other than `origin`, which a bare `git fetch` may use,
-  any entry of a git directory that is not plain data, and
-  any `.git` directory or file below the top of the checkout, whose
-  configuration and hooks git may run.
+- `git-config-command`: any key of the configuration of the checkout or of a
+  submodule (`config`, `config.worktree`) that `git clone`, `git submodule`
+  and lazy.nvim do not write, or with a value they do not write. They write
+  `core.repositoryformatversion`, `filemode`, `bare = false`,
+  `logallrefupdates = true`, `autocrlf = false`, `sparseCheckout` and
+  `sparseCheckoutCone`; a submodule's `core.worktree` that stays in the
+  checkout; `remote.origin.url`, its `fetch` into `refs/remotes/origin/`,
+  `promisor`, `partialclonefilter` and `tagopt = --no-tags`;
+  `branch.<name>.remote = origin` and `merge`; `submodule.active = .` and
+  `submodule.<name>.active = true`; and `extensions.worktreeConfig`,
+  `partialClone = origin` and `objectFormat`. Anything else is a finding,
+  as it may make the git commands lazy.nvim runs run a program or fetch from
+  elsewhere: a command key such as `core.fsmonitor`, `core.hooksPath`, a
+  proxy, `http.sslVerify`, another remote, `include.path`, and also the
+  `submodule.<name>.url` git copies from `.gitmodules`. So is any entry of a
+  git directory that is not plain data, and any `.git` directory or file
+  below the top of the checkout, whose configuration and hooks git may run.
 
 A build step that is a Neovim command (`":TSUpdate"`), a Lua function or a Lua
 expression that picks a command (`vim.g.x and "cargo build"`) is noted on the
@@ -466,6 +475,10 @@ and the plugins are taken as they are.
 After the upgrade that adds plugins to the sweep, each plugin shows once as
 new, in `--diff` and in the daily notification; that sweep takes them as they
 are.
+
+Of a package under `site/pack/*/start/`, only the files directly in its
+`plugin/` directory are read; its subdirectories, `ftdetect/` and
+`after/plugin/` are not.
 
 Not covered here: plugins of other managers (packer, vim-plug, Neovim's own
 `pack/*/start` under your data directory, whose `plugin/` files the
@@ -1366,6 +1379,6 @@ reviews as well, are listed under [Local rules](local-rules.md#rule-ids).
 | `network-listener` | low | A program listens on the network that nothing installed accounts for: an interpreter (Python, a shell, Node), or a packaged program no packaged service runs. |
 
 `git-config-command` and `remote-shell` are reported by the sweep as well as
-by source reviews: the first for a git key in a home or a Neovim plugin's
-checkout that runs a command, the
+by source reviews: the first for a git key in a home that runs a command or
+one in a Neovim plugin's checkout that a clone does not write, the
 second for a running shell or interpreter on a network connection.

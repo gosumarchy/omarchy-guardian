@@ -6,10 +6,9 @@
 //! covers every file of it outside `.git` (a `.git` deeper in the tree
 //! included), the address it was cloned from, the commit it is at, and
 //! what may make git run something in it, in the checkout and in each
-//! submodule under `.git/modules`: the hooks, a `core.hooksPath`, the keys
-//! of `config` and `config.worktree` that run a command or point a fetch
-//! at a remote other than origin, and every entry of those git directories
-//! that is not plain data. So the sweep's record of what is new or
+//! submodule under `.git/modules`: the hooks, the keys of `config` and
+//! `config.worktree` that a clone does not write (`checkout::cloned`), and
+//! every entry of those git directories that is not plain data. So the sweep's record of what is new or
 //! changed, its notifications and `sweep allow` see a change to any of
 //! them. Plain data (objects, refs, the index, logs and the other names in
 //! `checkout::PLAIN_DATA`) changes with every update and is only read by
@@ -32,7 +31,7 @@
 //! that is no git checkout, whose origin is not where its spec says
 //! lazy.nvim fetches it from, or that runs a program when lazy.nvim
 //! installs or updates it (a shell build step, a git hook, a git key that
-//! runs a command).
+//! a clone does not write).
 
 mod checkout;
 mod record;
