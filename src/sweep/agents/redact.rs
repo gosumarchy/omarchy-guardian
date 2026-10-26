@@ -35,7 +35,7 @@ enum Next {
 ///
 /// - who an address logs in as (`scheme://user:password@`, the whole of it);
 /// - the value of an `Authorization:` header, after its scheme where it has
-///   one (`Bearer`, `token`), and the word after `Bearer` or `Basic`;
+///   one (`Bearer`, `token`), within the quotes the header opened;
 /// - the value of `NAME=value` where a name before an `=` is named for a
 ///   secret (`GITHUB_TOKEN=x`, `--env=API_KEY=x`, `--token=x`);
 /// - the word after a flag named for a secret (`--api-key x`);
@@ -86,11 +86,17 @@ fn redacted_word(word: &str, next: &mut Next) -> String {
     let (before, after) = (&word[..at], &word[at + core.len()..]);
     let asked = std::mem::replace(next, Next::Word);
     let lower = core.to_ascii_lowercase();
-    let core = if matches!(lower.as_str(), "bearer" | "basic")
-        || (asked == Next::Value && is_auth_scheme(&lower))
-        || lower.ends_with("authorization:")
+    // A header's value goes on only inside the quotes it opened
+    // (`"Authorization: Bearer x"`): a word after the closing quote, or
+    // after a bare `Authorization:`, is another argument, such as the
+    // address a download comes from, and is sent as written.
+    let header_open = !before.is_empty() && after.is_empty();
+    let core = if (asked == Next::Value && is_auth_scheme(&lower))
+        || (lower.ends_with("authorization:") && header_open)
     {
-        *next = Next::Value;
+        if after.is_empty() {
+            *next = Next::Value;
+        }
         core.to_string()
     } else if asked == Next::Value {
         value(core).to_string()
@@ -100,7 +106,9 @@ fn redacted_word(word: &str, next: &mut Next) -> String {
     {
         let name_end = header.len() + "authorization:".len();
         if is_auth_scheme(rest) {
-            *next = Next::Value;
+            if header_open {
+                *next = Next::Value;
+            }
             core.to_string()
         } else {
             format!("{}{}", &core[..name_end], value(&core[name_end..]))
@@ -124,15 +132,18 @@ fn is_auth_scheme(lower: &str) -> bool {
 }
 
 /// Whether `word` can be nothing but a value: token characters only
-/// (letters, digits and `._~%+=:/-_`), and not a path or an expansion.
+/// (letters, digits and `._~%+=:-`), and not a path or an expansion.
 /// Anything with a shell character in it (`x;curl${IFS}evil|sh`) may be
-/// code, and taking it out would hide it from the review.
+/// code, and taking it out would hide it from the review. `/` is no token
+/// character, so an address or a path (`--auth-url https://…`,
+/// `--password-command bin/x.sh`) is always sent: a token of base64 with a
+/// `/` in it is then sent too, the lesser harm next to hiding what runs.
 fn is_token_shaped(word: &str) -> bool {
     !word.is_empty()
-        && !word.starts_with(['$', '/', '~', '.'])
+        && !word.starts_with(['~', '.'])
         && word
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "._~%+=:/-_".contains(c))
+            .all(|c| c.is_ascii_alphanumeric() || "._~%+=:-".contains(c))
 }
 
 /// `word` as the value of something named for a secret: taken out where it
@@ -170,7 +181,7 @@ fn without_assigned_secret(word: &str) -> Option<String> {
 /// `word` with who each address in it logs in as taken out, where that is
 /// token-shaped: `git+https://ghp_x@github.com/r` is
 /// `git+https://github.com/r`.
-pub(super) fn without_login(word: &str) -> String {
+fn without_login(word: &str) -> String {
     let mut out = String::with_capacity(word.len());
     let mut rest = word;
     while let Some(at) = rest.find("://") {
