@@ -425,13 +425,15 @@ What is a finding, on every sweep:
   `sparseCheckoutCone`; a submodule's `core.worktree` that stays in the
   checkout; `remote.origin.url`, its `fetch` into `refs/remotes/origin/`,
   `promisor`, `partialclonefilter` and `tagopt = --no-tags`;
-  `branch.<name>.remote = origin` and `merge`; `submodule.active = .` and
-  `submodule.<name>.active = true`; and `extensions.worktreeConfig`,
+  `branch.<name>.remote = origin` and `merge`; `submodule.active = .`,
+  `submodule.<name>.active = true` and, in the checkout's own `config`,
+  `submodule.<name>.url` when it is the one url the checkout's `.gitmodules`
+  gives that name (a file of the plugin, reviewed when it changes); and `extensions.worktreeConfig`,
   `partialClone = origin` and `objectFormat`. Anything else is a finding,
   as it may make the git commands lazy.nvim runs run a program or fetch from
   elsewhere: a command key such as `core.fsmonitor`, `core.hooksPath`, a
-  proxy, `http.sslVerify`, another remote, `include.path`, and also the
-  `submodule.<name>.url` git copies from `.gitmodules`. So is any entry of a
+  proxy, `http.sslVerify`, another remote, `include.path`, a submodule url
+  that `.gitmodules` does not give. So is any entry of a
   git directory that is not plain data, and any `.git` directory or file
   below the top of the checkout, whose configuration and hooks git may run.
 

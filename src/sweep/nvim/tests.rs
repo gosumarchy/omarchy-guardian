@@ -595,6 +595,55 @@ fn only_the_keys_a_clone_writes_are_no_finding() {
 }
 
 #[test]
+fn a_submodule_url_is_allowed_only_as_gitmodules_gives_it() {
+    let submodules = "[submodule \"same\"]\n\tactive = true\n\turl = https://github.com/o/same\n\
+                      [submodule \"other\"]\n\turl = https://evil/other\n\
+                      [submodule \"missing\"]\n\turl = https://evil/missing\n";
+    let config = format!("{CLONE_CONFIG}{submodules}");
+    let temp = TempDir::new("nvim-gitmodules");
+    let root = temp.path();
+    plugin(root, "p", "https://github.com/folke/flash.nvim", &[]);
+    write(root, &format!("{LAZY}/p/.git/config"), &config);
+    write(
+        root,
+        &format!("{LAZY}/p/.gitmodules"),
+        "[submodule \"same\"]\n\tpath = same\n\turl = https://github.com/o/same\n\
+         [submodule \"other\"]\n\tpath = other\n\turl = https://github.com/o/other\n",
+    );
+    let runs = |root: &Path| -> Vec<String> {
+        collected(root).items[0]
+            .alerts
+            .iter()
+            .filter(|(rule, _)| *rule == RuleId::GitConfigCommand)
+            .map(|(_, message)| message.clone())
+            .collect()
+    };
+    // A submodule's own configuration is not matched against the
+    // checkout's `.gitmodules`.
+    write(
+        root,
+        &format!("{LAZY}/p/.git/modules/same/config"),
+        "[submodule \"same\"]\n\turl = https://github.com/o/same\n",
+    );
+    let found = runs(root);
+    assert_eq!(found.len(), 3, "{found:?}");
+    assert!(found[0].contains("submodule.other.url = https://evil/other"));
+    assert!(found[1].contains("submodule.missing.url = https://evil/missing"));
+    assert!(found[2].contains(".git/modules/same/config"));
+
+    // Without a `.gitmodules` to match, every url is a finding.
+    fs::remove_file(root.join(LAZY).join("p/.gitmodules")).unwrap();
+    assert_eq!(runs(root).len(), 4);
+    // Nor with several urls for one name.
+    write(
+        root,
+        &format!("{LAZY}/p/.gitmodules"),
+        "[submodule \"same\"]\n\turl = https://github.com/o/same\n\turl = https://github.com/o/same\n",
+    );
+    assert_eq!(runs(root).len(), 4);
+}
+
+#[test]
 fn a_submodule_may_name_its_own_working_tree_only() {
     let temp = TempDir::new("nvim-module-worktree");
     let root = temp.path();

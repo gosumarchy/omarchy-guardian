@@ -318,6 +318,7 @@ fn git(root: &Path, path: &str, inner: Vec<String>, unchecked: &mut Vec<String>)
         runs: Vec::new(),
         hooks: Vec::new(),
         visited: 0,
+        gitmodules: text(root, &format!("{path}/.gitmodules"), MAX_GIT_FILE),
         unchecked,
     };
     let hooks_path = gits.git_directory(".git", config.as_deref(), worktree.as_deref());
@@ -356,6 +357,9 @@ struct Gits<'a> {
     hooks: Vec<(String, Entry)>,
     /// How many directories under `.git/modules` were looked at.
     visited: usize,
+    /// The checkout's `.gitmodules`, if it is a file that could be read:
+    /// the submodule urls the checkout's configuration may hold.
+    gitmodules: Option<String>,
     unchecked: &'a mut Vec<String>,
 }
 
@@ -482,7 +486,7 @@ impl Gits<'_> {
             // here, in the tree or not: a plugin's files are reviewed only
             // once they change.
             for found in git_state::keys(text) {
-                if cloned(git, &found) {
+                if cloned(git, &found, self.gitmodules.as_deref()) {
                     continue;
                 }
                 let what = match &found.subsection {
@@ -608,7 +612,7 @@ impl Gits<'_> {
 /// the keys of lazy.nvim's checkouts and their sparse checkout, as found
 /// in a stock `LazyVim` install, and those of a partial clone and a
 /// submodule.
-fn cloned(git: &str, found: &git_state::ConfigKey) -> bool {
+fn cloned(git: &str, found: &git_state::ConfigKey, gitmodules: Option<&str>) -> bool {
     let value = found.value.as_str();
     let origin = found.subsection.as_deref() == Some("origin");
     match (found.section.as_str(), found.key.as_str()) {
@@ -627,6 +631,16 @@ fn cloned(git: &str, found: &git_state::ConfigKey) -> bool {
         ("remote", "tagopt") => origin && value == "--no-tags",
         ("branch", "remote") => found.subsection.is_some() && value == "origin",
         ("branch", "merge") => found.subsection.is_some() && value.starts_with("refs/heads/"),
+        // `git submodule init` copies it from `.gitmodules`, which is in
+        // the working tree and so hashed and reviewed when it changes. A
+        // submodule's own submodules are not matched against theirs.
+        ("submodule", "url") => match (&found.subsection, gitmodules) {
+            (Some(name), Some(gitmodules)) if git == ".git" => {
+                let urls = git_state::values(gitmodules, "submodule", Some(name), "url");
+                matches!(urls.as_slice(), [(_, url, Reading::Sure)] if *url == found.value)
+            }
+            _ => false,
+        },
         ("submodule", "active") => match found.subsection {
             None => value == ".",
             Some(_) => value == "true",
