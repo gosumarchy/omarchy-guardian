@@ -6,6 +6,7 @@ use super::{
     RuleId, Scheme, extract_network_destinations, is_documentation, is_download_piped_to_shell,
     is_ip_host, is_sensitive_path, line_rules, looks_like_credential_exfiltration,
 };
+use crate::test_support::CpuInstant;
 
 fn rules_for(line: &str) -> Vec<RuleId> {
     let lowered = line.to_lowercase();
@@ -234,9 +235,9 @@ fn what_a_line_runs_is_named() {
     }
     // Many pipes cost one pass.
     let long = "a|".repeat(200_000);
-    let started = std::time::Instant::now();
+    let started = CpuInstant::now();
     assert!(run_targets(&long).is_empty());
-    assert!(started.elapsed().as_secs() < 10);
+    assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
     assert_eq!(run_targets("nohup sh ./x.sh &"), ["x.sh"]);
     for line in [
         "sh -c 'echo hi'",
@@ -770,7 +771,7 @@ fn network_inventory_redacts_url_paths_and_credentials() {
         ]
     );
     let many = "http://a ".repeat(250_000);
-    let started = std::time::Instant::now();
+    let started = CpuInstant::now();
     assert_eq!(extract_network_destinations(&many).len(), 1);
     assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
     assert!(
@@ -1021,7 +1022,7 @@ fn a_long_line_costs_each_reader_one_pass() {
     use super::destructive::formats_filesystem;
     use super::matchers::program_short_flag;
     use super::{pipes_into_shell, run_globs, run_targets};
-    let started = std::time::Instant::now();
+    let started = CpuInstant::now();
     // Many commands, many wrappers, a group never closed.
     assert!(!program_short_flag(
         &"curl -a;".repeat(50_000),
