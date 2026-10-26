@@ -57,8 +57,14 @@ reviewer with a malicious and a harmless sample. If it has to install the
 reviewer, it stops there: log in once (run `claude`, or set up a provider in
 `opencode`), then run the installer again. It asks for sudo only for the steps
 that need it, and skips what is already done: when the version of this
-checkout is the one already installed, it does not build or install again and
-goes on with the reviewer, the settings and `protect`.
+checkout is the one already installed and was built from this checkout's
+source as it is now, it does not build or install again and goes on with the
+reviewer, the settings and `protect`. The package records the source it was
+built from (`/usr/share/omarchy-guardian/source-id`: the hash
+`packaging/source-id.sh` prints of every file git tracks or would track, taken
+before the build), so a checkout of `main` that changed since the last install
+is built again even though its version number is the same. A Guardian built
+before it recorded its source is built again once.
 `./install.sh --reinstall` builds and installs it anyway (after changing the
 source without a new version, say). With the pacman hook on, the installed
 Guardian reviews the new package like any other local archive before pacman

@@ -31,6 +31,20 @@ _root="$startdir/../.."
 
 prepare() {
     cd "$_root"
+    # The source as it is before the build, not after it: an edit made
+    # while cargo runs is then not recorded as built. install.sh passes the
+    # hash it compared; by hand it is taken here. Without one the package
+    # records nothing, and install.sh builds it again next time.
+    local id=${OMARCHY_GUARDIAN_SOURCE_ID:-}
+    if [[ -z $id ]]; then
+        id=$(bash packaging/source-id.sh "$_root") || id=''
+    fi
+    if [[ $id =~ ^[0-9a-f]{64}$ ]]; then
+        printf '%s\n' "$id" >"$srcdir/source-id"
+    else
+        warning "Could not hash the source; the package will not record it."
+        rm -f "$srcdir/source-id"
+    fi
     export RUSTUP_TOOLCHAIN=stable
     cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
 }
@@ -107,6 +121,12 @@ package() {
     for wrapper in omarchy omarchy-theme-install omarchy-theme-update omarchy-plugin-add omarchy-plugin-update; do
         install -Dm755 "integrations/omarchy/bin/$wrapper" "$lib/bin/$wrapper"
     done
+    # Which source this package was built from, taken in prepare():
+    # install.sh builds again when the checkout's differs, even with the
+    # same version number.
+    if [[ -s "$srcdir/source-id" ]]; then
+        install -Dm644 "$srcdir/source-id" "$pkgdir/usr/share/omarchy-guardian/source-id"
+    fi
     # The upgrade check that does not rely on the checkout it is given: it
     # has to be the installed copy, so it is run from here, never from a
     # checkout.

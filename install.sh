@@ -383,8 +383,28 @@ else
 fi
 
 ###############################################################################
+# The same version number does not mean the same source: a checkout of main
+# between releases keeps the last release's number. The package records the
+# hash of the source it was built from, so the build is skipped only when
+# both match. The hash is taken once, here, before the build, and passed to
+# makepkg, so what is recorded is what was compared.
+source_id=$(bash "$ROOT/packaging/source-id.sh" "$ROOT" 2>/dev/null) || source_id=''
+recorded_id=$(cat /usr/share/omarchy-guardian/source-id 2>/dev/null || true)
+skip=0
 if [[ $installed == "$version" ]] && ((!REINSTALL)); then
-    step "Skipping the build: omarchy-guardian $version is already installed (--reinstall to redo it)"
+    if [[ -z $source_id ]]; then
+        note "Could not hash this checkout (packaging/source-id.sh failed); building omarchy-guardian $version again."
+    elif [[ -z $recorded_id ]]; then
+        note "The installed omarchy-guardian $version does not record the source it was built from (built before it did); building it again."
+    elif [[ $recorded_id != "$source_id" ]]; then
+        note "omarchy-guardian $version is installed, but this checkout changed since it was built; building it again."
+    else
+        skip=1
+    fi
+fi
+
+if ((skip)); then
+    step "Skipping the build: omarchy-guardian $version is already installed from this source (--reinstall to redo it)"
 else
     step "Building omarchy-guardian $version"
     ###########################################################################
@@ -396,7 +416,7 @@ else
     # target directory in it included. That directory is one the check above
     # passes over, and cargo would link what it found there with a fresh
     # enough date instead of building it.
-    if ! (cd "$PKG_DIR" && makepkg --cleanbuild --force --nodeps --noconfirm) >"$log" 2>&1; then
+    if ! (cd "$PKG_DIR" && OMARCHY_GUARDIAN_SOURCE_ID=$source_id makepkg --cleanbuild --force --nodeps --noconfirm) >"$log" 2>&1; then
         tail -n 20 "$log" >&2
         fail "The build failed; the full log is in $log"
     fi
