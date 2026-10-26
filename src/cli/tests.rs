@@ -8,8 +8,8 @@ use std::process::ExitCode;
 use super::gate::{not_started, tree_content};
 use super::parse::{Protection, SetupScope};
 use super::{
-    ConfigCommand, Confirm, Forget, Invocation, Target, forget_command, forget_in, guard_command,
-    pacman_hook_command, parse, refusal, review_and_decide, reviews_for_the_user,
+    ConfigCommand, Confirm, Forget, GateReview, Invocation, Target, forget_command, forget_in,
+    guard_command, pacman_hook_command, parse, refusal, review_and_decide, reviews_for_the_user,
 };
 use crate::agent::SourceFile;
 use crate::audit::{self, Gate};
@@ -193,15 +193,15 @@ fn a_blocked_guard_offers_a_permit_for_the_bytes_wherever_they_lie() {
             ..target(&dir)
         };
         audit::taken();
-        let verdict = review_and_decide(
-            &target,
-            &settings,
-            &opencode,
-            None,
-            &[],
-            Gate::Theme,
-            Some(&|report| tree_content(Gate::Theme, &target, report)),
-        );
+        let verdict = review_and_decide(GateReview {
+            gate: Gate::Theme,
+            target: &target,
+            settings: &settings,
+            opencode: &opencode,
+            context: &[],
+            confirm: None,
+            content: Some(&|report| tree_content(Gate::Theme, &target, report)),
+        });
         assert_eq!(verdict.decision, Decision::Blocked(Blocked::Findings));
         assert!(!verdict.allows_running());
         (verdict.standing, audit::taken())
@@ -242,15 +242,15 @@ fn a_scan_is_recorded_and_has_nothing_to_permit() {
     .unwrap();
     let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
     audit::taken();
-    let verdict = review_and_decide(
-        &target(&dir),
-        &default_settings(),
-        &opencode,
-        None,
-        &[],
-        Gate::Scan,
-        None,
-    );
+    let verdict = review_and_decide(GateReview {
+        gate: Gate::Scan,
+        target: &target(&dir),
+        settings: &default_settings(),
+        opencode: &opencode,
+        context: &[],
+        confirm: None,
+        content: None,
+    });
     assert_eq!(verdict.standing, Standing::None);
     let entries = audit::taken();
     assert_eq!(entries.len(), 1);
@@ -590,15 +590,15 @@ fn guard_under_local_only_with_a_declined_confirm_is_not_confirmed() {
     let settings = local_only();
 
     let mut declined = Scripted(Some(false), Vec::new());
-    let decision = review_and_decide(
-        &target,
-        &settings,
-        &unavailable(),
-        Some(&mut declined),
-        &[],
-        Gate::Theme,
-        None,
-    )
+    let decision = review_and_decide(GateReview {
+        gate: Gate::Theme,
+        target: &target,
+        settings: &settings,
+        opencode: &unavailable(),
+        context: &[],
+        confirm: Some(&mut declined),
+        content: None,
+    })
     .decision;
     assert_eq!(decision, Decision::Blocked(Blocked::NotConfirmed));
 
@@ -644,15 +644,15 @@ fn confirm_is_ignored_unless_ai_is_off() {
 
     let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
     let mut confirm = Scripted(Some(true), Vec::new());
-    let decision = review_and_decide(
-        &target,
-        &settings,
-        &opencode,
-        Some(&mut confirm),
-        &[],
-        Gate::Theme,
-        None,
-    )
+    let decision = review_and_decide(GateReview {
+        gate: Gate::Theme,
+        target: &target,
+        settings: &settings,
+        opencode: &opencode,
+        context: &[],
+        confirm: Some(&mut confirm),
+        content: None,
+    })
     .decision;
 
     assert_eq!(decision, Decision::Clear);
@@ -929,15 +929,15 @@ fn remarks_of_a_clear_review_stop_no_gate_and_are_findings_under_strict() {
 
     // A scan of it ends with success, and nothing is offered.
     audit::taken();
-    let verdict = review_and_decide(
-        &target,
-        &standard,
-        &opencode,
-        None,
-        &[],
-        Gate::Scan,
-        Some(&|report| tree_content(Gate::Scan, &target, report)),
-    );
+    let verdict = review_and_decide(GateReview {
+        gate: Gate::Scan,
+        target: &target,
+        settings: &standard,
+        opencode: &opencode,
+        context: &[],
+        confirm: None,
+        content: Some(&|report| tree_content(Gate::Scan, &target, report)),
+    });
     assert_eq!(verdict.decision, Decision::Clear);
     assert_eq!(verdict.decision.exit_status(), 0);
     assert_eq!(verdict.standing, Standing::None);

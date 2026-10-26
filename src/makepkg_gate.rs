@@ -62,7 +62,7 @@ use self::upstream::{review_upstream_files, unreviewable_sources};
 use crate::audit::{self, Gate};
 use crate::aur::recipe::{self, Sources};
 use crate::aur::{self, Roots, Upstream};
-use crate::cli::{Confirm, Target, TtyConfirm, Verdict, passed, review_and_decide};
+use crate::cli::{Confirm, GateReview, Target, TtyConfirm, Verdict, passed, review_and_decide};
 use crate::config::Settings;
 use crate::config::model::SourceClass;
 use crate::engine::baseline::{Identity, Unit};
@@ -363,15 +363,15 @@ fn review_recipe(
         .file_name()
         .and_then(OsStr::to_str)
         .unwrap_or_default();
-    let verdict = review_and_decide(
+    let verdict = review_and_decide(GateReview {
+        gate: Gate::Aur,
         target,
         settings,
-        &OpenCode::UserPath,
-        Some(terminal),
+        opencode: &OpenCode::UserPath,
         context,
-        Gate::Aur,
-        Some(&|report| recipe_contents(target, &report.snapshot, recipe)),
-    );
+        confirm: Some(terminal),
+        content: Some(&|report| recipe_contents(target, &report.snapshot, recipe)),
+    });
     if !verdict.allows_running() {
         errln!("Guardian blocked makepkg because the review of the recipe did not allow it.");
         verdict.standing.say();

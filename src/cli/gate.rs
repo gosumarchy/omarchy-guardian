@@ -127,19 +127,35 @@ const fn not_started_status(decision: Decision) -> u8 {
     }
 }
 
+/// One gate's review of a target, as `review_and_decide` runs it.
+pub(crate) struct GateReview<'a> {
+    pub(crate) gate: Gate,
+    pub(crate) target: &'a Target,
+    pub(crate) settings: &'a Settings,
+    pub(crate) opencode: &'a OpenCode,
+    /// What the reviewer is told besides the files (see `ReviewContext`).
+    pub(crate) context: &'a [String],
+    /// Who is asked before a class reviewed with `ai = off` runs; nobody
+    /// for a plain scan, which runs nothing.
+    pub(crate) confirm: Option<&'a mut dyn Confirm>,
+    /// What a permit may stand for; nothing for a plain scan, which runs
+    /// nothing, so nothing is permitted.
+    pub(crate) content: Option<ContentOf<'a>>,
+}
+
 /// Reviews a target, applies confirmation and the user's permits, then
 /// prints the report once with the final decision — never a stale
-/// pre-confirmation headline — and records it in the audit trail. A plain
-/// scan has no `content`: nothing runs after it, so nothing is permitted.
-pub(crate) fn review_and_decide(
-    target: &Target,
-    settings: &Settings,
-    opencode: &OpenCode,
-    confirm: Option<&mut dyn Confirm>,
-    context: &[String],
-    gate: Gate,
-    content: Option<ContentOf<'_>>,
-) -> Verdict {
+/// pre-confirmation headline — and records it in the audit trail.
+pub(crate) fn review_and_decide(review: GateReview<'_>) -> Verdict {
+    let GateReview {
+        gate,
+        target,
+        settings,
+        opencode,
+        context,
+        confirm,
+        content,
+    } = review;
     let report = review::review_tree(
         &target.config,
         &ReviewContext {
@@ -245,15 +261,15 @@ pub(super) fn guard_command(
 ) -> ExitCode {
     let settings = settings_for(target, settings);
     let gate = Gate::of_guard(target.class);
-    let verdict = review_and_decide(
-        target,
-        &settings,
-        opencode,
-        Some(confirm),
-        &[],
+    let verdict = review_and_decide(GateReview {
         gate,
-        Some(&|report| tree_content(gate, target, report)),
-    );
+        target,
+        settings: &settings,
+        opencode,
+        context: &[],
+        confirm: Some(confirm),
+        content: Some(&|report| tree_content(gate, target, report)),
+    });
     let decision = verdict.decision;
 
     if !verdict.allows_running() {
@@ -321,15 +337,15 @@ pub(super) fn sandbox_command(
     confirm: &mut dyn Confirm,
 ) -> ExitCode {
     let settings = settings_for(target, settings);
-    let verdict = review_and_decide(
+    let verdict = review_and_decide(GateReview {
+        gate: Gate::Sandbox,
         target,
-        &settings,
-        &OpenCode::UserPath,
-        Some(confirm),
-        &[],
-        Gate::Sandbox,
-        Some(&|report| tree_content(Gate::Sandbox, target, report)),
-    );
+        settings: &settings,
+        opencode: &OpenCode::UserPath,
+        context: &[],
+        confirm: Some(confirm),
+        content: Some(&|report| tree_content(Gate::Sandbox, target, report)),
+    });
     let decision = verdict.decision;
 
     if !verdict.allows_running() {

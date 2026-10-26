@@ -30,7 +30,9 @@ use crate::tui;
 mod gate;
 mod parse;
 
-pub(crate) use gate::{Confirm, Target, TtyConfirm, Verdict, passed, review_and_decide};
+pub(crate) use gate::{
+    Confirm, GateReview, Target, TtyConfirm, Verdict, passed, review_and_decide,
+};
 use gate::{exec_command, guard_command, sandbox_command};
 use parse::{ConfigCommand, Forget, Invocation, Protection, SetupScope, StatusMode, USAGE, parse};
 
@@ -226,15 +228,15 @@ fn with_state_root(mut target: Target) -> Target {
 
 fn scan_command(target: &Target, settings: &Settings) -> ExitCode {
     let settings = settings_for(target, settings);
-    review_and_decide(
+    review_and_decide(GateReview {
+        gate: Gate::Scan,
         target,
-        &settings,
-        &OpenCode::UserPath,
-        None,
-        &[],
-        Gate::Scan,
-        None,
-    )
+        settings: &settings,
+        opencode: &OpenCode::UserPath,
+        context: &[],
+        confirm: None,
+        content: None,
+    })
     .decision
     .exit_code()
 }
