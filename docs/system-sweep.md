@@ -82,7 +82,7 @@ them into `/etc/skel`).
 | Kernel modules and parameters | `sysctl.d`, `modules-load.d`, `binfmt.d` and `modprobe.d` under `/usr/lib` and `/etc` | | gate and sweep |
 | udev rules | `/usr/lib/udev/rules.d`, `/etc/udev/rules.d`, `/usr/local/lib/udev/rules.d` | | gate and sweep |
 | Boot loader: what entries and the kernel command line are built from | `/usr/share/limine-entry-tool.d`, `/etc/limine-entry-tool.d`, `/etc/cmdline.d` | | gate and sweep |
-| Boot loader: its own configuration | Limine's (`/boot/limine.conf`, `/boot/limine/limine.conf`, `/boot/EFI/limine/limine.conf`, `/etc/default/limine`), systemd-boot's (`/boot/loader/loader.conf`, `/boot/loader/entries/`), GRUB's (`/boot/grub/grub.cfg`, `/etc/default/grub`, the scripts in `/etc/grub.d/`), `/etc/kernel/cmdline`, the UEFI shell's `startup.nsh` (`/boot`, `/boot/EFI/BOOT`), rEFInd's `/boot/EFI/*/refind.conf` | | sweep only |
+| Boot loader: its own configuration | Limine's (`/boot/limine.conf`, `/boot/limine/limine.conf`, `/boot/EFI/limine/limine.conf`, `/etc/default/limine`), systemd-boot's (`/boot/loader/loader.conf`, `/boot/loader/entries/`), GRUB's (`/boot/grub/grub.cfg`, `/boot/grub/custom.cfg`, `/etc/default/grub`, the scripts in `/etc/grub.d/`), `/etc/kernel/cmdline`, the UEFI shell's `startup.nsh` (`/boot`, `/boot/EFI/BOOT`), rEFInd's `/boot/EFI/*/refind.conf` | | sweep only |
 | Initramfs and kernel install hooks | initcpio (`/usr/lib/initcpio/hooks`, `install` and `post`, `/etc/initcpio`), `/etc/mkinitcpio.conf`, `/etc/mkinitcpio.conf.d`, `/etc/mkinitcpio.d`, `kernel/install.d` under `/usr/lib` and `/etc`, DKMS build configuration (`/usr/src/*/dkms.conf`) | | gate and sweep |
 | Dynamic linker and Python start-up | `/etc/ld.so.preload`, `/etc/ld.so.conf`, `/etc/ld.so.conf.d`, `/etc/nsswitch.conf`; Python's `.pth`, `sitecustomize.py` and `usercustomize.py` files in `/usr/lib/python*/site-packages` and `/usr/lib/python*/sitecustomize.py`, which every Python program runs at start | Your own `.pth`, `sitecustomize.py` and `usercustomize.py` in `~/.local/lib/python*/site-packages` | gate and sweep |
 | Preferred libraries | Libraries in `/usr/lib/glibc-hwcaps` | | sweep only |
@@ -951,14 +951,20 @@ incomplete.
   secret path; anything else is hashed, listed and read by the local rules.
 - **Boot configuration that holds a secret the exact rule below cannot take
   out** is read like a file whose path marks it as holding secrets (above):
-  the secret wins over the review. That is a line with a word `password` in
-  it (GRUB's plain `password <user> <password>`, also inside a `menuentry`
-  or after `then`, or a comment that names one), a GRUB password hash on a
-  line of any other shape than the exact one (quoted, followed by a comment
-  or a `;`), or `cryptomount` given a passphrase (`-p`, `--password`). This
-  fails closed: a file kept this way that something runs raises
+  the secret wins over the review. That is a line with a word that starts
+  with `password` (GRUB's plain `password <user> <password>`,
+  `password_pbkdf2` or `password_argon2` in any shape but the exact one
+  below, also inside a `menuentry` or after `then`, or a comment that names
+  one), a GRUB password hash (`grub.pbkdf2.`, `grub.argon2.`) anywhere else,
+  a line that names `GRUB_USERS` (whose entries end in a password), or
+  `cryptomount` given a passphrase (`-p`, `--password`). The text is read as
+  written, not as GRUB parses it: a word joined from quoted parts is not
+  seen. This fails closed: a file kept this way that something runs raises
   `kept-from-review`. Where the only secret is a hash on an exact line, the
-  hash is taken out (below) and the rest of the file is reviewed.
+  hash is taken out (below) and the rest of the file is reviewed. So a
+  modified `/etc/grub.d/00_header`, which writes GRUB's password lines, goes
+  to the local rules only (a modified package file, and `kept-from-review`),
+  not to the AI.
 
 A file an SSH `Include` names by its full path or with `~` is followed and
 checked the same way, one with `*` in its last part to the files it matches. A

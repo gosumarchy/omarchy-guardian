@@ -37,10 +37,10 @@ it shows on hover:
   variables. The sweep also checks SSH and git files in a home,
   package-manager configuration, account files and browser extensions (read
   from the browser profiles' preferences) locally only, sends a file
-  it found running only where it is plainly a script, keeps a boot loader
-  configuration with a plain-text password from the AI, and takes plainly
-  written secret values, URL passwords and GRUB password hashes out of what
-  it sends. A secret
+  it found running only where it is plainly a script, keeps boot
+  configuration with any boot secret it cannot mask from the AI, and takes
+  plainly written secret values, URL passwords and GRUB password hashes out
+  of what it sends. A secret
   anywhere else goes with its file. Package names and versions from lockfiles
   go to the OSV API (`api.osv.dev`), and an AUR package's name goes to the
   AUR. The `local-only` level sends nothing to an AI; the OSV and AUR lookups

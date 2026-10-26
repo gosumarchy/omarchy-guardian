@@ -873,6 +873,8 @@ pub(crate) const SYSTEM_SWEEP: &[Location] = &[
     location("boot/loader/loader.conf", Kind::File, Category::Boot),
     location("boot/loader/entries/", Kind::Directory, Category::Boot),
     location("boot/grub/grub.cfg", Kind::File, Category::Boot),
+    // Read in at boot by the stock `41_custom`.
+    location("boot/grub/custom.cfg", Kind::File, Category::Boot),
     location("boot/startup.nsh", Kind::File, Category::Boot),
     location("boot/EFI/BOOT/startup.nsh", Kind::File, Category::Boot),
     // Matched by name as listed, so a `REFIND.CONF` on FAT is missed: a

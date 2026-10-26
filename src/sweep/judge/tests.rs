@@ -1369,6 +1369,11 @@ fn only_an_exact_grub_password_hash_is_taken_out() {
         "cryptomount -p hunter2 hd0,gpt2\n",
         "cryptomount --password=hunter2 -u 0123\n",
         "# the password is on a note\n",
+        "password_argon2 root grub.argon2.id.v19.m65536.t3.p4.AAAA.BBBB\n",
+        "  echo password_argon2 \"${user}\" \"${hash}\"\n",
+        "x=grub.argon2.id.AAAA\n",
+        "GRUB_USERS=\"root;0;plain;hunter2\"\n",
+        "cryptomount --password hunter2\n",
     ] {
         assert!(has_boot_secret(secret), "{secret}");
     }
@@ -1421,6 +1426,8 @@ fn a_boot_configuration_with_a_plain_password_is_kept_from_the_review() {
         "set superusers=root\n  password root hunter2\nmenuentry x {}\n",
         "menuentry x {\n  cryptomount -p hunter2 hd0,gpt2\n}\n",
         "password_pbkdf2 root \"grub.pbkdf2.sha512.1.AA.BB\"\n",
+        "password_argon2 root grub.argon2.id.v19.AAAA.BBBB\n",
+        "GRUB_USERS=\"root;0;plain;hunter2\"\n",
     ] {
         let kept = judged(text);
         assert!(kept.agent_input.is_empty(), "{:?}", kept.agent_input);

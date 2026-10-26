@@ -261,9 +261,10 @@ fn is_local_only(item: &Item, home: Option<&str>) -> bool {
         // line check takes whatever it says as configured, so a parameter
         // planted in `limine.conf` (`init=`, `rd.shell`), or an entry that
         // starts another program, is seen only by the review. The secret it
-        // can hold is a boot password: a GRUB hash is taken out before it
-        // is sent (`without_secrets`), and a file with a plain-text password
-        // is not sent at all (see `reading`).
+        // can hold is a boot password: a GRUB hash on its exact line is
+        // taken out before it is sent (`without_secrets`), and a file with
+        // any boot secret that rule cannot mask is not sent at all (see
+        // `reading`).
         Category::Boot => path.starts_with("boot/") && !boot::is_configuration(path),
         Category::Trust => named,
         Category::Toolchain => {
@@ -286,7 +287,8 @@ enum Reading {
     /// Settings that hold tokens, hosts and names: by the rules for that
     /// kind of file, here (see `is_local_only`).
     Settings,
-    /// A file whose path marks it as holding secrets: by the local rules,
+    /// A file whose path marks it as holding secrets, or boot configuration
+    /// with a secret the exact hash rule cannot mask: by the local rules,
     /// here. Nothing lifts this: not that something runs the file, not its
     /// first line. What it starts is followed all the same.
     Secrets,

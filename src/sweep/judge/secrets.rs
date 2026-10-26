@@ -72,13 +72,23 @@ fn without_grub_hash(line: &str) -> Option<String> {
 }
 
 /// Whether `text`, boot configuration, holds a secret `without_secrets`
-/// does not take out: a password hash on a line of any other shape than
-/// the exact one (quoted, followed by a comment or a `;`), a word
-/// `password` anywhere (GRUB's plain `password <user> <password>`, also
-/// inside a `menuentry { }` or after `then`), or `cryptomount` given a
-/// passphrase (`-p`, `--password`). Such a file is read by the local
-/// rules only, as the secret wins over the review; this fails closed, so
-/// a comment that names a password keeps the file from the review too.
+/// does not take out. On any line but the exact `password_pbkdf2` one
+/// that is masked, that is:
+///
+/// - a word that starts with `password`: GRUB's plain `password <user>
+///   <password>`, `password_pbkdf2` and `password_argon2` in any other
+///   shape (quoted, followed by a comment or a `;`, inside a `menuentry
+///   { }` or after `then`), and an option such as `--password`;
+/// - a password hash, `grub.pbkdf2.` or `grub.argon2.`, wherever it is;
+/// - `GRUB_USERS`, which `/etc/default/grub` sets to
+///   `name;access;plain|pbkdf2|argon2;secret` entries;
+/// - `cryptomount` given a passphrase (`-p`, `--password`).
+///
+/// The text is read as written, split at blanks and `;{}()"'`, not as
+/// GRUB or the shell parses it: a word joined from quoted parts
+/// (`pass"word"`) is not seen. Such a file is read by the local rules
+/// only, as the secret wins over the review; this fails closed, so a
+/// comment that names a password keeps the file from the review too.
 pub(super) fn has_boot_secret(text: &str) -> bool {
     text.lines().any(|line| {
         if without_grub_hash(line).is_some() {
@@ -92,7 +102,10 @@ pub(super) fn has_boot_secret(text: &str) -> bool {
             && words
                 .iter()
                 .any(|word| word.starts_with("-p") || word.starts_with("--password"));
-        line.contains("grub.pbkdf2.") || words.contains(&"password") || passphrase
+        let hash = ["grub.pbkdf2.", "grub.argon2.", "GRUB_USERS"]
+            .iter()
+            .any(|marker| line.contains(marker));
+        hash || words.iter().any(|word| word.starts_with("password")) || passphrase
     })
 }
 
