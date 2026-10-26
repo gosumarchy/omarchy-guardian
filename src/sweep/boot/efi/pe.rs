@@ -20,9 +20,13 @@ const MAX_PADDING: usize = 7;
 const CERTIFICATE_DIRECTORY: usize = 4;
 const DIRECTORY_SIZE: usize = 8;
 
-/// The size of a section table entry, and the most sections the PE format
-/// allows.
+/// The size of a section table entry.
 const SECTION_SIZE: usize = 40;
+
+/// The most sections a program read here may have (arbitrary: the Windows
+/// loader's limit, which the format itself does not set; stubs and UKIs
+/// have about twenty). One with more is refused, so it is not comparable
+/// rather than compared on part of its table.
 const MAX_SECTIONS: usize = 96;
 
 /// A section flag: its contents can be run.
@@ -79,6 +83,7 @@ struct Section<'a> {
     /// Without the zeros that pad it to eight bytes.
     name: &'a [u8],
     virtual_size: u32,
+    raw_size: u32,
     address: u32,
     flags: u32,
     /// Where its bytes lie in the file: without the padding to the file
@@ -131,9 +136,13 @@ pub(super) fn header(bytes: &[u8]) -> Option<Header> {
     })
 }
 
-/// The sections of the program, or `None` where the table does not fit.
+/// The sections of the program, or `None` where the table does not fit
+/// or lists more than `MAX_SECTIONS`.
 fn sections<'a>(bytes: &'a [u8], header: &Header) -> Option<Vec<Section<'a>>> {
-    (0..header.count.min(MAX_SECTIONS))
+    if header.count > MAX_SECTIONS {
+        return None;
+    }
+    (0..header.count)
         .map(|index| {
             let entry = header.sections + index * SECTION_SIZE;
             let named = bytes.get(entry..entry + 8)?;
@@ -147,6 +156,7 @@ fn sections<'a>(bytes: &'a [u8], header: &Header) -> Option<Vec<Section<'a>>> {
             Some(Section {
                 name: named.split(|byte| *byte == 0).next()?,
                 virtual_size,
+                raw_size,
                 address: u32_at(bytes, entry + 12)?,
                 flags: u32_at(bytes, entry + 36)?,
                 start: usize::try_from(u32_at(bytes, entry + 20)?).ok()?,
@@ -262,9 +272,13 @@ fn built_from(uki: &[u8], stub: &[u8]) -> Option<bool> {
     }
     // A name the UKI lists twice would let a second `.text` pass as the
     // stub's; a section over another's addresses (an added one, or a grown
-    // `.sbat`) would be loaded over the stub's code.
+    // `.sbat`) would be loaded over the stub's code. A loader copies the
+    // raw size where the virtual size is 0 (EDK2 does), and maps the
+    // virtual size otherwise, so the larger of the two is what a section
+    // can cover.
     let range = |section: &Section<'_>| {
-        u64::from(section.address)..u64::from(section.address) + u64::from(section.virtual_size)
+        let extent = section.virtual_size.max(section.raw_size);
+        u64::from(section.address)..u64::from(section.address) + u64::from(extent)
     };
     let apart = uki_sections.iter().enumerate().all(|(index, section)| {
         uki_sections[index + 1..].iter().all(|later| {

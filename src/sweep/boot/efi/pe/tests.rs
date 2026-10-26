@@ -1,7 +1,7 @@
-use super::{header, is_built_from, is_same_program, normalized, section};
+use super::{MAX_SECTIONS, header, is_built_from, is_same_program, normalized, section};
 use crate::sweep::boot::efi::tests::{
-    CERTIFICATES, CODE, DATA, PE, PE32, PE32_PLUS, Part, build, enrolled, le32, limine, signed,
-    stub, stub_parts, uki,
+    CERTIFICATES, CODE, DATA, PE, PE32, PE32_PLUS, Part, build, enrolled, le32, limine, program,
+    signed, stub, stub_parts, uki,
 };
 
 #[test]
@@ -143,6 +143,58 @@ fn a_unified_kernel_image_is_built_from_the_stub_only_where_its_code_is_the_stub
     relocations[PE + 24 + 112 + 5 * 8] = 0x10;
     assert!(!is_built_from(&relocations, &stub));
     assert!(!is_built_from(b"not a program", &stub));
+}
+
+/// `bytes`, a PE32+ program, with section `index` given a virtual size
+/// of 0, so that a loader copies its raw size instead.
+fn without_virtual_size(mut bytes: Vec<u8>, index: usize) -> Vec<u8> {
+    let entry = PE + 24 + 112 + 16 * 8 + 40 * index;
+    bytes[entry + 8..entry + 12].fill(0);
+    bytes
+}
+
+#[test]
+fn a_section_without_a_virtual_size_covers_its_raw_size() {
+    let stub = stub();
+    // An added splash, and a grown `.sbat`, each reaching over the next
+    // section once its raw size is what is loaded.
+    let splash = changed_uki(|parts| {
+        parts.push(Part {
+            name: ".splash",
+            data: &[b'p'; 0x1000],
+            address: 0x800,
+            flags: DATA,
+        });
+    });
+    let sbat = changed_uki(|parts| parts[1].data = &[b's'; 0x1800]);
+    for (index, built) in [(4, splash), (1, sbat)] {
+        assert!(!is_built_from(&without_virtual_size(built, index), &stub));
+    }
+    // Where it fits, a section without a virtual size is fine.
+    let fits = changed_uki(|parts| {
+        parts.push(Part {
+            name: ".splash",
+            data: b"picture",
+            address: 0x30000,
+            flags: DATA,
+        });
+    });
+    assert!(is_built_from(&without_virtual_size(fits, 4), &stub));
+}
+
+#[test]
+fn a_program_with_more_sections_than_are_read_is_refused() {
+    let names: Vec<String> = (0..=MAX_SECTIONS).map(|n| format!(".s{n}")).collect();
+    let sections: Vec<(&str, &[u8])> = names
+        .iter()
+        .map(|name| (name.as_str(), b"code".as_slice()))
+        .collect();
+    let many = program(&sections);
+    let read = header(&many).unwrap();
+    assert_eq!(section(&many, &read, b".s0"), None);
+    let fewer = program(&sections[..MAX_SECTIONS]);
+    let read = header(&fewer).unwrap();
+    assert_eq!(section(&fewer, &read, b".s0"), Some(b"code".as_slice()));
 }
 
 /// The readers take bytes anyone may have written: none of them panics on
