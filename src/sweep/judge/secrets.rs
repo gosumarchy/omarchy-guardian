@@ -23,7 +23,7 @@ const SECRET_NAMES: &[&str] = &[
 ];
 
 /// What stands where a value was taken out.
-pub(super) const REDACTED: &str = "<redacted-by-guardian>";
+pub(in crate::sweep) const REDACTED: &str = "<redacted-by-guardian>";
 
 /// `text` with the values of assignments that look like secrets
 /// (`export API_KEY=…`, `Environment=TOKEN=…`, fish's `set -gx TOKEN …`)

@@ -11,16 +11,27 @@ use crate::sweep::collect::{self, Body, Item, Scope};
 use crate::sweep::tier::Tier;
 use crate::sweep::tools::LOADING_VARIABLES;
 
-/// The hosts of the providers an agent talks to: a base address elsewhere
-/// sends what the agent works on to someone else.
+/// The API hosts of the providers an agent talks to: a base address
+/// elsewhere sends what the agent works on to someone else. Exact hosts,
+/// not the shared cloud domains, where anyone can run a server. Checked on
+/// 2026-10-26 against the Claude Code docs for Amazon Bedrock, Google
+/// Cloud's Agent Platform and Microsoft Foundry, and the hosts of the
+/// Anthropic, `OpenAI` and Azure `OpenAI` APIs.
 const PROVIDER_HOSTS: &[&str] = &[
-    "anthropic.com",
-    "claude.ai",
-    "claude.com",
-    "amazonaws.com",
-    "googleapis.com",
-    "openai.com",
-    "azure.com",
+    "api.anthropic.com",
+    "api.openai.com",
+    "aiplatform.googleapis.com",
+    "aiplatform.eu.rep.googleapis.com",
+    "aiplatform.us.rep.googleapis.com",
+];
+
+/// The provider hosts with one name of the user's choice in them (a region,
+/// a resource), as the text before and after it.
+const PROVIDER_PATTERNS: &[(&str, &str)] = &[
+    ("bedrock-runtime.", ".amazonaws.com"),
+    ("", "-aiplatform.googleapis.com"),
+    ("", ".openai.azure.com"),
+    ("", ".services.ai.azure.com"),
 ];
 
 /// What one entry of an agent's configuration starts.
@@ -47,15 +58,31 @@ pub(super) struct Variable {
 }
 
 impl Variable {
-    /// The variable `name` set to `value`.
+    /// The variable `name` set to `value`. An address without a host
+    /// (empty) gives none.
     pub(super) fn of(name: &str, value: &str) -> Self {
-        let upper = name.to_ascii_uppercase();
-        let address = (upper.ends_with("_BASE_URL") || upper.ends_with("_PROXY"))
-            .then(|| scheme_and_host(value));
+        let address = Self::is_address(name)
+            .then(|| scheme_and_host(value))
+            .filter(|(_, host)| !host.is_empty());
         Self {
             name: name.to_string(),
             address,
         }
+    }
+
+    /// The variable `name`, whose value is not read.
+    pub(super) fn named(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            address: None,
+        }
+    }
+
+    /// Whether the value of `name` is an address, of which the host is
+    /// read.
+    pub(super) fn is_address(name: &str) -> bool {
+        let upper = name.to_ascii_uppercase();
+        upper.ends_with("_BASE_URL") || upper.ends_with("_PROXY")
     }
 }
 
@@ -146,8 +173,8 @@ pub(super) fn add(scope: &Scope<'_>, source: &Source<'_>, entries: Entries, foun
 ///   and host of those that are addresses;
 ///
 /// and before it, on a comment line, the names of the variables it is
-/// started with. What it runs, which is followed, is the command as
-/// written, with a plugin's directory written in.
+/// started with. What it runs, which is followed, is that command line,
+/// with a plugin's directory written in.
 fn item(scope: &Scope<'_>, source: &Source<'_>, entry: Entry) -> Item {
     let Entry {
         key,
@@ -159,8 +186,11 @@ fn item(scope: &Scope<'_>, source: &Source<'_>, entry: Entry) -> Item {
     let mut alerts = Vec::new();
     let started = match launch {
         Launch::Command(line) => {
+            // What runs is shown in the sweep's output and saved reports,
+            // so it is the line without its secrets too.
+            let line = redacted(&line);
             runs.push(with_plugin_root(&line, source.plugin_root));
-            redacted(&line)
+            line
         }
         Launch::Remote { scheme, host } => {
             alerts.extend(remote_alert(&host));
@@ -251,10 +281,7 @@ fn environment_alerts(variable: &Variable) -> Vec<(RuleId, String)> {
         && name.to_ascii_uppercase().ends_with("_BASE_URL")
     {
         let bare = without_port(host);
-        let provider = PROVIDER_HOSTS
-            .iter()
-            .any(|provider| bare == *provider || bare.ends_with(&format!(".{provider}")));
-        if !provider && !is_local_host(bare) {
+        if !is_provider_host(bare) && !is_local_host(bare) {
             alerts.push((
                 RuleId::RiskyConfiguration,
                 format!(
@@ -264,6 +291,20 @@ fn environment_alerts(variable: &Variable) -> Vec<(RuleId, String)> {
         }
     }
     alerts
+}
+
+/// Whether `host` is one of `PROVIDER_HOSTS`, or of `PROVIDER_PATTERNS`
+/// with one DNS name part (letters, digits, `-`) in the middle.
+fn is_provider_host(host: &str) -> bool {
+    let is_label = |name: &str| {
+        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    };
+    PROVIDER_HOSTS.contains(&host)
+        || PROVIDER_PATTERNS.iter().any(|(before, after)| {
+            host.strip_prefix(before)
+                .and_then(|rest| rest.strip_suffix(after))
+                .is_some_and(is_label)
+        })
 }
 
 /// `host` without a port (`localhost:3000`, `[::1]:8080`).

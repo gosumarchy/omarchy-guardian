@@ -69,10 +69,10 @@ matter most:
   (SSH and git files in a home, package-manager settings that hold registry
   tokens, an editor's `settings.json`, fish's saved variables, `/etc/hosts`,
   `at` jobs, and an AI coding agent's configuration, of which only what each
-  entry starts is sent). A file whose path marks it as holding secrets is never sent, by
-  any gate or by the sweep, whatever runs it; where something runs it, the
-  sweep says so in a finding (`kept-from-review`) and only the local rules
-  have read it, unless every line of it only keeps an opaque value in a
+  entry starts is sent). A file whose path marks it as holding secrets is never
+  sent, by any gate or by the sweep, whatever runs it; where something runs
+  it, the sweep says so in a finding (`kept-from-review`) and only the local
+  rules have read it, unless every line of it only keeps an opaque value in a
   secret-named or plainly inert variable. A secret under a name Guardian does
   not recognise, with a blank or punctuation in it, in YAML or JSON form, as a
   command-line argument, or a key block in a file whose path gives no hint,
