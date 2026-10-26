@@ -134,11 +134,6 @@ pub(super) enum Forget {
     One(Identity),
 }
 
-/// A usage line as the error a command gives when it is called wrongly.
-fn usage(text: &str) -> Error {
-    Error::Message(text.to_string())
-}
-
 fn parse_sweep(args: &[OsString]) -> Result<sweep::Command, Error> {
     const USAGE: &str = "usage: omarchy-guardian sweep [--all] [--json] [--root] [--diff] [--report] | allow PATH | allow --migrate | forget PATH | forget --all";
     let text: Vec<&str> = args
@@ -153,7 +148,7 @@ fn parse_sweep(args: &[OsString]) -> Result<sweep::Command, Error> {
         ["allow", path] => return Ok(sweep::Command::Allow((*path).to_string())),
         ["forget", "--all"] => return Ok(sweep::Command::Forget(None)),
         ["forget", path] => return Ok(sweep::Command::Forget(Some((*path).to_string()))),
-        ["allow" | "forget", ..] => return Err(usage(USAGE)),
+        ["allow" | "forget", ..] => return Err(Error::Message(USAGE.into())),
         _ => {}
     }
     let mut options = sweep::Options::default();
@@ -166,7 +161,7 @@ fn parse_sweep(args: &[OsString]) -> Result<sweep::Command, Error> {
             "--report" => options.report = true,
             // Run by the user timer.
             "--scheduled" => options.scheduled = true,
-            _ => return Err(usage(USAGE)),
+            _ => return Err(Error::Message(USAGE.into())),
         }
     }
     if options.report && options.view == sweep::View::Json {
@@ -176,7 +171,7 @@ fn parse_sweep(args: &[OsString]) -> Result<sweep::Command, Error> {
     }
     // The timer's run saves its own page when it notifies.
     if options.report && options.scheduled {
-        return Err(usage(USAGE));
+        return Err(Error::Message(USAGE.into()));
     }
     Ok(sweep::Command::Run(options))
 }
@@ -258,7 +253,9 @@ pub(super) fn parse(args: &[OsString]) -> Result<Invocation, Error> {
             [flag] if flag == "--out" => {
                 Ok(Invocation::SweepCollect(sweep::root::CollectTo::Results))
             }
-            _ => Err(usage("usage: omarchy-guardian sweep-collect [--out]")),
+            _ => Err(Error::Message(
+                "usage: omarchy-guardian sweep-collect [--out]".into(),
+            )),
         },
         // Run as root by `sweep allow` and `sweep forget`; not listed.
         Some("sweep-allow-system") => {
@@ -270,27 +267,31 @@ pub(super) fn parse(args: &[OsString]) -> Result<Invocation, Error> {
                 Some("--waybar") => Ok(Invocation::Status(StatusMode::Waybar)),
                 Some("--dismiss") => Ok(Invocation::Status(StatusMode::Dismiss)),
                 Some("--open-report") => Ok(Invocation::Status(StatusMode::OpenReport)),
-                _ => Err(usage(
-                    "usage: omarchy-guardian status [--waybar | --dismiss | --open-report]",
+                _ => Err(Error::Message(
+                    "usage: omarchy-guardian status [--waybar | --dismiss | --open-report]".into(),
                 )),
             },
-            _ => Err(usage(
-                "usage: omarchy-guardian status [--waybar | --dismiss | --open-report]",
+            _ => Err(Error::Message(
+                "usage: omarchy-guardian status [--waybar | --dismiss | --open-report]".into(),
             )),
         },
         Some("update") if rest.is_empty() => Ok(Invocation::Update),
-        Some("update") => Err(usage("usage: omarchy-guardian update")),
+        Some("update") => Err(Error::Message("usage: omarchy-guardian update".into())),
         Some("ask") => match rest {
             [target] => target
                 .to_str()
                 .map(|target| Invocation::Ask(target.to_string()))
                 .ok_or_else(|| Error::Message("the report id must be UTF-8".into())),
-            _ => Err(usage("usage: omarchy-guardian ask <report-id>")),
+            _ => Err(Error::Message(
+                "usage: omarchy-guardian ask <report-id>".into(),
+            )),
         },
         Some("tui" | "settings") => match rest {
             [] => Ok(Invocation::Tui(tui::Mode::Simple)),
             [flag] if flag == "--expert" => Ok(Invocation::Tui(tui::Mode::Expert)),
-            _ => Err(usage("usage: omarchy-guardian tui [--expert]")),
+            _ => Err(Error::Message(
+                "usage: omarchy-guardian tui [--expert]".into(),
+            )),
         },
         _ => Err(Error::Message(format!(
             "unknown command {:?}",
@@ -308,7 +309,9 @@ fn parse_protect(rest: &[OsString]) -> Result<Invocation, Error> {
             Some("--yes" | "-y") => consent = Consent::Given,
             Some("--off") => protection = Protection::Off,
             _ => {
-                return Err(usage("usage: omarchy-guardian protect [--off] [--yes]"));
+                return Err(Error::Message(
+                    "usage: omarchy-guardian protect [--off] [--yes]".into(),
+                ));
             }
         }
     }
@@ -324,8 +327,8 @@ fn parse_setup(rest: &[OsString]) -> Result<Invocation, Error> {
         [Some("--gate"), Some("--if-needed")] | [Some("--if-needed"), Some("--gate")] => {
             Ok(Invocation::Setup(SetupScope::Gate(GateAsk::IfNeeded)))
         }
-        _ => Err(usage(
-            "usage: omarchy-guardian setup [--gate [--if-needed]]",
+        _ => Err(Error::Message(
+            "usage: omarchy-guardian setup [--gate [--if-needed]]".into(),
         )),
     }
 }
