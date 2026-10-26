@@ -108,8 +108,9 @@ pub(super) struct Inventory {
     pub(super) npm_runs_scripts: bool,
 }
 
-/// Reads what is installed under `root` in `places`.
-pub(super) fn collect(root: &Path, places: &Places) -> Inventory {
+/// Reads what is installed under `root` in `places`, with what the
+/// start-up files set.
+pub(super) fn collect(root: &Path, places: &Places, startup: &Startup) -> Inventory {
     let mut nodes = vec!["usr".to_string()];
     nodes.extend(places.mise.as_ref().map_or_else(Vec::new, |mise| {
         mise_nodes(root, &format!("{mise}/installs/node"))
@@ -124,7 +125,6 @@ pub(super) fn collect(root: &Path, places: &Places) -> Inventory {
             "the npm configuration of the nodes mise installed past the first {MAX_NODES}"
         ));
     }
-    let startup = Startup::read(root, places.home.as_deref());
     npm.set_at_start_up = startup.sets_npm();
     let mut pip = IndexConfig::pip(root, places);
     pip.other_index |= startup.sets_pip();
@@ -188,7 +188,7 @@ pub(super) fn collect(root: &Path, places: &Places) -> Inventory {
             "cargo's configuration replaces a source or includes other files (`[source]` or `include` in its config.toml), so installed crates may come from a mirror or a private registry and none was looked up in OSV".to_string(),
         );
     }
-    say_startup(&startup, &mut inventory.unchecked);
+    say_startup(startup, &mut inventory.unchecked);
     for file in &uv.unreadable {
         inventory.unchecked.push(format!(
             "{} could not be read (not a regular file, closed, too large, not TOML, or not found): it may name a private index, so no Python package mise installed through uv was looked up in OSV",

@@ -30,9 +30,9 @@
 //!   - `pip install --index-url` given on the command line, directly or in
 //!     a requirements file named there, into a Python mise installed or a
 //!     pipx environment too old to have a record;
-//!   - a setting exported in a way the start-up files do not name: by
-//!     another program, or by a file the shell reads that is not in the
-//!     autorun catalog;
+//!   - a setting exported in a way the start-up files do not show: by
+//!     another program, by a file read in through a path with a variable
+//!     other than the home's in it, or by a project's own `mise.toml`;
 //!   - settings given on a tool's command line, such as `cargo install
 //!     --config 'source.crates-io.replace-with=...'`.
 //! - `sweep allow` on a package item runs the OSV lookup again: the item
@@ -55,6 +55,7 @@ use crate::rules::RuleId;
 use crate::sha256::Sha256;
 use config::Places;
 use inventory::{Installed, Inventory, Package};
+use startup::Startup;
 
 /// The ecosystems the inventory reads, each asked about on its own.
 const ECOSYSTEMS: [Ecosystem; 3] = [Ecosystem::Npm, Ecosystem::PyPi, Ecosystem::CratesIo];
@@ -87,7 +88,8 @@ pub(super) struct Packages {
 /// runs for `sweep allow` too (see the module docs).
 pub(super) fn check(scope: &Scope<'_>) -> Packages {
     let places = Places::from_env(scope.home);
-    let inventory = inventory::collect(scope.root, &places);
+    let startup = Startup::read(scope);
+    let inventory = inventory::collect(scope.root, &places, &startup);
     look_up(inventory, scope.home, &osv::query)
 }
 

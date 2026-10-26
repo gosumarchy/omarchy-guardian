@@ -26,6 +26,7 @@ use super::read::{self, Found, View};
 use super::tier::Tier;
 use crate::autorun::Category;
 use crate::rules::RuleId;
+use crate::scan::MAX_TEXT_FILE_SIZE;
 use crate::tools::{self, Limits};
 
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
@@ -80,8 +81,8 @@ const MANAGED: &[&str] = &[
     ".cargo/bin/",
 ];
 
-/// The files whose `PATH` lines are read, relative to the home and to the
-/// root: what a login, a shell of any kind, the user manager, the session
+/// The start-up files, relative to the home and to the root, whose `PATH`
+/// lines are read and which the language package check searches: what a login, a shell of any kind, the user manager, the session
 /// and Hyprland read. A `*` stands for any run of characters in a name.
 const HOME_FILES: &[&str] = &[
     ".profile",
@@ -118,8 +119,8 @@ const SYSTEM_FILES: &[&str] = &[
     "usr/share/omarchy/default/hypr/*.conf",
 ];
 
-/// The most files read for their `PATH` lines, those a start-up file
-/// reads in (`source`) included, and how far such a chain is followed.
+/// The most start-up files read, those a start-up file reads in (`source`)
+/// included, and how far such a chain is followed.
 const MAX_FILES: usize = 256;
 const MAX_SOURCED_DEPTH: usize = 3;
 
@@ -214,52 +215,116 @@ fn others_can_write(root: &Path, directory: &str) -> bool {
     })
 }
 
-/// The text of every file whose `PATH` lines count (`HOME_FILES`,
-/// `SYSTEM_FILES`), and of the files those read in with `source` or `.`,
-/// which run as part of them.
-fn start_up_texts(scope: &Scope<'_>, home: &str) -> Vec<String> {
-    let patterns = scope
+/// The shell start-up and session files a login, a shell of any kind, the
+/// user manager, the session and Hyprland read (`HOME_FILES` under the
+/// home, `SYSTEM_FILES`), relative to the root, as patterns for
+/// `start_up_files`.
+pub(super) fn start_up_patterns(scope: &Scope<'_>) -> Vec<String> {
+    scope
         .home
         .into_iter()
         .flat_map(|home| HOME_FILES.iter().map(move |file| format!("{home}/{file}")))
-        .chain(SYSTEM_FILES.iter().map(|file| (*file).to_string()));
+        .chain(SYSTEM_FILES.iter().map(|file| (*file).to_string()))
+        .collect()
+}
+
+/// The start-up files read, and what could not be.
+#[derive(Debug, Default)]
+pub(super) struct StartUp {
+    /// Each file read, relative to the root, with its text, in the order
+    /// read.
+    pub(super) files: Vec<(String, String)>,
+    /// What is there and could not be read, each as said to the user: a
+    /// file closed to the sweep, not a regular file or a link to one, too
+    /// large, read in (`source`) deeper than `MAX_SOURCED_DEPTH`, or past
+    /// `MAX_FILES`, and a directory a pattern could not list.
+    pub(super) unreadable: Vec<String>,
+}
+
+/// The files `patterns` match (in each name, `*` stands for any run of
+/// characters), and the files those read in with `source` or `.`, which
+/// run as part of them. A link is followed, as the shell follows it. A
+/// file read in by a path with a variable other than the home's in it is
+/// not known, and not read.
+pub(super) fn start_up_files(scope: &Scope<'_>, patterns: &[String]) -> StartUp {
+    let home = scope.home.unwrap_or("root");
+    let mut start_up = StartUp::default();
     let mut pending: Vec<(String, Option<String>, usize)> = Vec::new();
     for pattern in patterns {
         if pattern.contains('*') {
-            let matched = read::matching(scope.root, &pattern).files;
-            pending.extend(matched.into_iter().map(|file| (file, None, 0)));
+            let matched = read::matching(scope.root, pattern);
+            if matched.truncated {
+                start_up.unreadable.push(format!("/{pattern}"));
+            }
+            start_up.unreadable.extend(
+                matched
+                    .unreadable
+                    .iter()
+                    .chain(&matched.unnamed)
+                    .map(|path| format!("/{path}")),
+            );
+            pending.extend(matched.files.into_iter().map(|file| (file, None, 0)));
         } else {
-            pending.push((pattern, None, 0));
+            pending.push((pattern.clone(), None, 0));
         }
     }
     pending.reverse();
     let mut seen: Vec<String> = Vec::new();
-    let mut texts = Vec::new();
     while let Some((file, by, depth)) = pending.pop() {
-        if seen.contains(&file) || seen.len() >= MAX_FILES {
+        if seen.contains(&file) {
             continue;
         }
+        if seen.len() >= MAX_FILES {
+            start_up
+                .unreadable
+                .push(format!("the start-up files past the first {MAX_FILES}"));
+            break;
+        }
         seen.push(file.clone());
-        // A file another one reads in is named by that file: root looks
-        // at it as it looks at anything a file leads to.
-        let Found::File { head, .. } = collect::look(scope, Category::Shell, &file, by.as_deref())
-        else {
+        if fs::symlink_metadata(scope.root.join(&file))
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+        {
+            continue;
+        }
+        let Some(text) = start_up_text(scope, &file, by.as_deref()) else {
+            start_up.unreadable.push(format!("/{file}"));
             continue;
         };
-        let text = String::from_utf8_lossy(&head).into_owned();
-        if depth < MAX_SOURCED_DEPTH {
-            for sourced in commands::sourced_files(&text) {
-                let expanded = commands::expand(home, &sourced);
-                if let Some(path) = expanded.strip_prefix('/')
-                    && !path.contains(['$', '`', '*'])
-                {
+        for sourced in commands::sourced_files(&text) {
+            let expanded = commands::expand(home, &sourced);
+            if let Some(path) = expanded.strip_prefix('/')
+                && !path.contains(['$', '`', '*'])
+            {
+                if depth < MAX_SOURCED_DEPTH {
                     pending.push((path.to_string(), Some(file.clone()), depth + 1));
+                } else {
+                    start_up.unreadable.push(format!("/{path}"));
                 }
             }
         }
-        texts.push(text);
+        start_up.files.push((file, text));
     }
-    texts
+    start_up
+}
+
+/// The text of one start-up file, past a link to it; `None` where it is
+/// not a regular file within the size the review reads, or cannot be read.
+fn start_up_text(scope: &Scope<'_>, file: &str, by: Option<&str>) -> Option<String> {
+    // A file another one reads in is named by that file: root looks at it
+    // as it looks at anything a file leads to.
+    let found = match collect::look(scope, Category::Shell, file, by) {
+        Found::Link(target) => {
+            let resolved = read::resolve_where(file, &target, &|next| collect::hop(scope, next))?;
+            collect::look_past_link(scope, &resolved)
+        }
+        found => found,
+    };
+    match found {
+        Found::File { size, head, .. } if size <= MAX_TEXT_FILE_SIZE => {
+            Some(String::from_utf8_lossy(&head).into_owned())
+        }
+        Found::File { .. } | Found::Link(_) | Found::Other | Found::Unreadable(_) => None,
+    }
 }
 
 /// Whether mise is installed where it usually is.
@@ -343,7 +408,8 @@ pub(super) fn search(scope: &Scope<'_>) -> Search {
         }
     }
     let mut mise = false;
-    for text in start_up_texts(scope, home) {
+    let start_up = start_up_files(scope, &start_up_patterns(scope));
+    for (_, text) in start_up.files {
         mise = mise || activates_mise(&text);
         for (_, value) in assignments(&text) {
             sources.push(entries(home, &value));

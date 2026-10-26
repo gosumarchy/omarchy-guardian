@@ -530,3 +530,44 @@ fn a_directory_ahead_that_cannot_be_listed_is_said() {
         assert_eq!(found, (vec!["home/u/closed/sudo".to_string()], vec![]));
     }
 }
+
+#[test]
+fn a_linked_start_up_file_is_read_and_one_that_cannot_be_is_said() {
+    let dir = TempDir::new("sweep-path-linked");
+    let root = dir.path();
+    let write = |path: &str, text: &str| {
+        fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+        fs::write(root.join(path), text).unwrap();
+    };
+    write(
+        "home/u/dotfiles/bashrc",
+        "export PATH=\"$HOME/linked/bin:$PATH\"\n",
+    );
+    symlink("/home/u/dotfiles/bashrc", root.join("home/u/.bashrc")).unwrap();
+    fs::create_dir_all(root.join("etc/profile.d")).unwrap();
+    symlink(".", root.join("etc/profile.d/loop")).unwrap();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::System,
+    };
+
+    let start_up = super::start_up_files(&scope, &super::start_up_patterns(&scope));
+
+    assert_eq!(
+        start_up
+            .files
+            .iter()
+            .map(|(file, _)| file.as_str())
+            .collect::<Vec<_>>(),
+        ["home/u/.bashrc"]
+    );
+    assert_eq!(start_up.unreadable, ["/etc/profile.d/loop"]);
+    assert!(
+        search(&scope)
+            .directories
+            .contains(&"home/u/linked/bin".to_string())
+    );
+}

@@ -9,7 +9,9 @@ mod sight;
 
 pub(super) use item::{item, item_of, origin};
 use sight::is_there;
-pub(super) use sight::{holds, is_file_there, look, packaged_item, packaged_out_of_sight};
+pub(super) use sight::{
+    holds, hop, is_file_there, look, look_past_link, packaged_item, packaged_out_of_sight,
+};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;

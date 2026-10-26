@@ -2,22 +2,37 @@
 //! OSV.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
 
 use super::config::Places;
 use super::inventory::{self, Inventory, Package};
+use super::startup::Startup;
 use super::{INSTALL_SCRIPTS, Packages, look_up};
 use crate::autorun::Category;
 use crate::deps::{Dependency, Ecosystem};
 use crate::error::Error;
 use crate::osv::{Advisory, Audit};
 use crate::rules::RuleId;
-use crate::sweep::collect::{Body, Origin};
+use crate::sweep::collect::{Body, Origin, Scope};
+use crate::sweep::index::PackageIndex;
 use crate::test_support::TempDir;
 
 const HOME: &str = "home/u";
+
+/// The inventory under `root`, with what its start-up files set.
+fn collect(root: &Path, places: &Places) -> Inventory {
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: places.home.as_deref(),
+        index: &index,
+        origin: Origin::System,
+    };
+    inventory::collect(root, places, &Startup::read(&scope))
+}
 
 fn write(root: &Path, path: &str, text: &str) {
     fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
@@ -193,7 +208,7 @@ fn global_npm_packages_are_read_with_their_own_dependencies() {
     )
     .unwrap();
 
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
 
     assert_eq!(
         found(&inventory),
@@ -233,7 +248,7 @@ fn nesting_past_the_limit_is_said() {
         directory.push_str("/node_modules");
     }
 
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
 
     assert_eq!(inventory.installed.len(), 8);
     assert!(
@@ -299,7 +314,7 @@ fn pipx_cargo_mise_and_an_npm_prefix_are_read() {
     );
     npm(root, "home/u/.npm-global/lib/node_modules/d", "d", "4.0.0");
 
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
 
     assert_eq!(
         found(&inventory),
@@ -337,7 +352,7 @@ fn the_user_npm_configuration_decides_about_install_scripts() {
     let root = root.path();
     write(root, "usr/bin/npm", "");
     let places = Places::defaults(Some(HOME));
-    let runs = || inventory::collect(root, &places).npm_runs_scripts;
+    let runs = || collect(root, &places).npm_runs_scripts;
     assert!(runs());
 
     write(root, "home/u/.npmrc", "ignore-scripts = true\n");
@@ -356,16 +371,16 @@ fn the_user_npm_configuration_decides_about_install_scripts() {
     };
     fs::remove_file(root.join("etc/npmrc")).unwrap();
     write(root, "home/u/elsewhere/npmrc", "ignore-scripts=true\n");
-    assert!(!inventory::collect(root, &moved).npm_runs_scripts);
+    assert!(!collect(root, &moved).npm_runs_scripts);
 
     // The environment wins over every file.
     let from_env = |value: &str| Places {
         npm_env: vec![("ignore-scripts".into(), value.into())],
         ..Places::defaults(Some(HOME))
     };
-    assert!(inventory::collect(root, &from_env("false")).npm_runs_scripts);
+    assert!(collect(root, &from_env("false")).npm_runs_scripts);
     write(root, "home/u/.npmrc", "ignore-scripts=false\n");
-    assert!(!inventory::collect(root, &from_env("true")).npm_runs_scripts);
+    assert!(!collect(root, &from_env("true")).npm_runs_scripts);
 }
 
 #[test]
@@ -529,7 +544,7 @@ fn links_on_the_way_to_packages_are_said_and_not_followed() {
     )
     .unwrap();
 
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
 
     assert_eq!(found(&inventory), []);
     let notes = inventory.notes.join("\n");
@@ -555,7 +570,7 @@ fn a_directory_that_cannot_be_listed_is_not_checked() {
     // Root reads what it likes: there is nothing to test as root.
     let readable = fs::read_dir(&nested).is_ok();
 
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
     fs::set_permissions(&nested, fs::Permissions::from_mode(0o755)).unwrap();
 
     if readable {
@@ -581,7 +596,7 @@ fn more_packages_than_the_limit_are_said() {
     let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
     crates(root, "home/u/.cargo/.crates2.json", &keys);
 
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
 
     assert_eq!(inventory.installed.len(), 20_000);
     assert!(
@@ -633,7 +648,7 @@ fn mises_python_and_private_sources_are_told_apart() {
         r#"{"main_package":{"pip_args":["--index-url","https://pypi.corp.example/simple"]}}"#,
     );
 
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
 
     assert_eq!(
         found(&inventory),
@@ -654,7 +669,7 @@ fn mises_python_and_private_sources_are_told_apart() {
         "home/u/.config/pip/pip.conf",
         "[global]\nindex-url = https://pypi.corp.example/simple\n",
     );
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
     assert!(
         found(&inventory)
             .iter()
@@ -667,7 +682,7 @@ fn mises_python_and_private_sources_are_told_apart() {
         "[global]\nfind-links =\n    /srv/wheels\n",
     ] {
         write(root, "home/u/.config/pip/pip.conf", conf);
-        let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+        let inventory = collect(root, &Places::defaults(Some(HOME)));
         assert!(
             found(&inventory)
                 .iter()
@@ -691,7 +706,7 @@ fn a_linked_lib_is_not_followed() {
     fs::create_dir_all(root.join(venv)).unwrap();
     symlink(root.join("elsewhere"), root.join(format!("{venv}/lib"))).unwrap();
 
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
 
     assert_eq!(found(&inventory), []);
     assert!(
@@ -719,7 +734,7 @@ fn a_linked_npmrc_is_followed_and_one_that_cannot_be_read_is_said_by_its_path_al
     symlink(root.join("dotfiles/npmrc"), root.join("home/u/.npmrc")).unwrap();
 
     // A dotfile manager's link is followed, as npm follows it.
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
     assert_eq!(
         found(&inventory),
         [
@@ -732,7 +747,7 @@ fn a_linked_npmrc_is_followed_and_one_that_cannot_be_read_is_said_by_its_path_al
     // npm package is taken at all.
     fs::remove_file(root.join("home/u/.npmrc")).unwrap();
     symlink(root.join("dotfiles"), root.join("home/u/.npmrc")).unwrap();
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
     assert_eq!(found(&inventory), []);
     let unchecked = inventory.unchecked.join("\n");
     assert!(
@@ -748,7 +763,7 @@ fn a_linked_npmrc_is_followed_and_one_that_cannot_be_read_is_said_by_its_path_al
         "home/u/.npmrc",
         &format!("prefix=/opt/g\n{}", " ".repeat(2 * 1024 * 1024)),
     );
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
     assert_eq!(found(&inventory), []);
     assert!(
         inventory
@@ -771,7 +786,7 @@ fn mises_pipx_tools_are_read_in_uvs_layout_too() {
     );
     fs::create_dir_all(root.join(format!("{install}/bin"))).unwrap();
 
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
 
     assert_eq!(found(&inventory), [(Ecosystem::PyPi, "black", "24.1.0")]);
     assert!(inventory.unchecked.is_empty(), "{:?}", inventory.unchecked);
@@ -797,7 +812,7 @@ fn uvs_index_settings_keep_what_mise_installed_through_uv_out() {
     );
 
     let places = Places::defaults(Some(HOME));
-    let inventory = inventory::collect(root, &places);
+    let inventory = collect(root, &places);
     assert_eq!(found(&inventory), [(Ecosystem::PyPi, "black", "1.0.0")]);
     assert!(
         inventory.unchecked[0]
@@ -808,17 +823,17 @@ fn uvs_index_settings_keep_what_mise_installed_through_uv_out() {
 
     let mut with_variable = Places::defaults(Some(HOME));
     with_variable.uv_env = vec!["UV_INDEX_URL".to_string()];
-    assert_eq!(found(&inventory::collect(root, &with_variable)), []);
+    assert_eq!(found(&collect(root, &with_variable)), []);
 
     write(
         root,
         "home/u/.config/uv/uv.toml",
         "[[index]]\nurl = \"https://pypi.corp.example/simple\"\n",
     );
-    assert_eq!(found(&inventory::collect(root, &places)), []);
+    assert_eq!(found(&collect(root, &places)), []);
 
     write(root, "home/u/.config/uv/uv.toml", "[index\n");
-    let inventory = inventory::collect(root, &places);
+    let inventory = collect(root, &places);
     assert_eq!(found(&inventory), []);
     assert!(
         inventory
@@ -845,7 +860,7 @@ fn a_linked_crates_list_is_said_once_and_not_as_unreadable() {
         .unwrap();
     }
 
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
 
     assert_eq!(found(&inventory), []);
     assert!(inventory.unchecked.is_empty(), "{:?}", inventory.unchecked);
@@ -886,7 +901,7 @@ fn records_in_python_environments_that_name_another_index_leave_them_out() {
         "[global]\nindex-url = https://pypi.corp.example/simple\n",
     );
 
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
     assert_eq!(
         found(&inventory),
         [
@@ -900,7 +915,7 @@ fn records_in_python_environments_that_name_another_index_leave_them_out() {
         &format!("{python_dir}/pip.conf"),
         "[global]\nextra-index-url = https://pypi.corp.example/simple\n",
     );
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
     assert_eq!(found(&inventory), [(Ecosystem::PyPi, "plain", "1.0.0")]);
 
     // A linked record is followed, as pip follows it.
@@ -909,7 +924,7 @@ fn records_in_python_environments_that_name_another_index_leave_them_out() {
         root.join(format!("{venvs}/plain/pip.conf")),
     )
     .unwrap();
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
     assert_eq!(found(&inventory), []);
     let unchecked = inventory.unchecked.join("\n");
     assert!(!unchecked.contains("could not be read"), "{unchecked}");
@@ -921,7 +936,7 @@ fn records_in_python_environments_that_name_another_index_leave_them_out() {
         root.join(format!("{venvs}/plain/pip.conf")),
     )
     .unwrap();
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
     assert_eq!(found(&inventory), []);
     assert!(
         inventory
@@ -940,7 +955,7 @@ fn a_mise_npm_tool_in_pnpms_layout_is_said_as_not_read() {
     let install = "home/u/.local/share/mise/installs/npm-x/1.0.0";
     npm(root, &format!("{install}/node_modules/x"), "x", "1.0.0");
 
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
 
     assert_eq!(found(&inventory), []);
     assert!(
@@ -963,7 +978,7 @@ fn a_mise_npm_tool_bun_installed_into_lib_is_said_as_not_read() {
     let by_npm = "home/u/.local/share/mise/installs/npm-y/2.0.0";
     npm(root, &format!("{by_npm}/lib/node_modules/y"), "y", "2.0.0");
 
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
 
     assert_eq!(found(&inventory), [(Ecosystem::Npm, "y", "2.0.0")]);
     assert!(
@@ -988,7 +1003,7 @@ fn npms_global_file_under_each_prefix_decides_too() {
     );
     let places = Places::defaults(Some(HOME));
     write(root, "home/u/.npmrc", "prefix=/opt/g\n");
-    assert_eq!(found(&inventory::collect(root, &places)).len(), 3);
+    assert_eq!(found(&collect(root, &places)).len(), 3);
 
     // `npm config set -g registry ...` writes `{prefix}/etc/npmrc`; the
     // prefix comes from the user's file.
@@ -998,19 +1013,19 @@ fn npms_global_file_under_each_prefix_decides_too() {
         "opt/g/etc/npmrc",
         "registry=https://npm.corp.example/\n",
     );
-    let inventory = inventory::collect(root, &places);
+    let inventory = collect(root, &places);
     assert_eq!(found(&inventory), []);
     assert!(!inventory.unchecked.join("\n").contains("could not be read"));
 
     // Without a prefix, a node's own directory is its prefix.
     fs::remove_file(root.join("home/u/.npmrc")).unwrap();
-    assert_eq!(found(&inventory::collect(root, &places)).len(), 2);
+    assert_eq!(found(&collect(root, &places)).len(), 2);
     write(
         root,
         &format!("{node}/etc/npmrc"),
         "registry=https://npm.corp.example/\n",
     );
-    assert_eq!(found(&inventory::collect(root, &places)), []);
+    assert_eq!(found(&collect(root, &places)), []);
 
     // `globalconfig` names the global file in its place; one it names by
     // a path that is not absolute cannot be found, and leaves npm out.
@@ -1021,9 +1036,9 @@ fn npms_global_file_under_each_prefix_decides_too() {
         "srv/npmrc",
         "@x:registry=https://npm.corp.example/\nregistry=https://npm.corp.example/\n",
     );
-    assert_eq!(found(&inventory::collect(root, &places)), []);
+    assert_eq!(found(&collect(root, &places)), []);
     write(root, "home/u/.npmrc", "globalconfig=npmrc\n");
-    let inventory = inventory::collect(root, &places);
+    let inventory = collect(root, &places);
     assert_eq!(found(&inventory), []);
     assert!(
         inventory
@@ -1047,7 +1062,7 @@ fn cargo_source_replacement_leaves_every_crate_out() {
     let places = Places::defaults(Some(HOME));
     write(root, "home/u/.cargo/config.toml", "[net]\nretry = 3\n");
     assert_eq!(
-        found(&inventory::collect(root, &places)),
+        found(&collect(root, &places)),
         [(Ecosystem::CratesIo, "ripgrep", "14.1.0")]
     );
 
@@ -1065,7 +1080,7 @@ fn cargo_source_replacement_leaves_every_crate_out() {
         fs::remove_file(root.join("home/u/.cargo/config.toml")).ok();
         fs::remove_file(root.join("home/u/.cargo/config")).ok();
         write(root, file, text);
-        let inventory = inventory::collect(root, &places);
+        let inventory = collect(root, &places);
         assert_eq!(found(&inventory), [], "{text}");
         assert!(
             inventory
@@ -1078,7 +1093,7 @@ fn cargo_source_replacement_leaves_every_crate_out() {
     }
 
     write(root, "home/u/.cargo/config.toml", "[source\n");
-    let inventory = inventory::collect(root, &places);
+    let inventory = collect(root, &places);
     assert_eq!(found(&inventory), []);
     assert!(
         inventory
@@ -1106,16 +1121,16 @@ fn a_nodes_builtin_npmrc_and_prefix_variable_decide_too() {
     let places = Places::defaults(Some(HOME));
 
     write(root, &builtin, "prefix=/opt/b\n");
-    assert_eq!(found(&inventory::collect(root, &places)).len(), 2);
+    assert_eq!(found(&collect(root, &places)).len(), 2);
 
     write(root, &builtin, "registry=https://npm.corp.example/\n");
-    assert_eq!(found(&inventory::collect(root, &places)), []);
+    assert_eq!(found(&collect(root, &places)), []);
 
     write(root, &builtin, "globalconfig=/srv/npmrc\n");
     write(root, "srv/npmrc", "registry=https://npm.corp.example/\n");
-    assert_eq!(found(&inventory::collect(root, &places)), []);
+    assert_eq!(found(&collect(root, &places)), []);
     fs::remove_file(root.join("srv/npmrc")).unwrap();
-    assert_eq!(found(&inventory::collect(root, &places)).len(), 1);
+    assert_eq!(found(&collect(root, &places)).len(), 1);
 
     // PREFIX is npm's prefix where none is set: its packages are read, and
     // its global file too.
@@ -1124,13 +1139,13 @@ fn a_nodes_builtin_npmrc_and_prefix_variable_decide_too() {
         npm_global_prefix: Some("/opt/b".to_string()),
         ..Places::defaults(Some(HOME))
     };
-    assert_eq!(found(&inventory::collect(root, &with_prefix)).len(), 2);
+    assert_eq!(found(&collect(root, &with_prefix)).len(), 2);
     write(
         root,
         "opt/b/etc/npmrc",
         "registry=https://npm.corp.example/\n",
     );
-    assert_eq!(found(&inventory::collect(root, &with_prefix)), []);
+    assert_eq!(found(&collect(root, &with_prefix)), []);
 }
 
 #[test]
@@ -1145,7 +1160,7 @@ fn etc_npmrc_cannot_make_a_private_registry_public() {
         "registry=https://npm.corp.example/\n",
     );
     write(root, "etc/npmrc", "registry=https://registry.npmjs.org/\n");
-    assert_eq!(found(&inventory::collect(root, &places)), []);
+    assert_eq!(found(&collect(root, &places)), []);
 
     write(
         root,
@@ -1153,7 +1168,7 @@ fn etc_npmrc_cannot_make_a_private_registry_public() {
         "registry=https://registry.npmjs.org/\n",
     );
     write(root, "etc/npmrc", "registry=https://npm.corp.example/\n");
-    assert_eq!(found(&inventory::collect(root, &places)), []);
+    assert_eq!(found(&collect(root, &places)), []);
 }
 
 #[test]
@@ -1170,11 +1185,11 @@ fn a_shared_unreadable_file_is_said_once_and_an_absent_npm_runs_no_scripts() {
     }
     let places = Places::defaults(Some(HOME));
     // No npm of the system's: only the nodes' npm, which runs none.
-    assert!(!inventory::collect(root, &places).npm_runs_scripts);
+    assert!(!collect(root, &places).npm_runs_scripts);
 
     fs::create_dir_all(root.join("srv/npmrc")).unwrap();
     write(root, "home/u/.npmrc", "globalconfig=/srv/npmrc\n");
-    let inventory = inventory::collect(root, &places);
+    let inventory = collect(root, &places);
     let said = inventory
         .unchecked
         .iter()
@@ -1197,7 +1212,7 @@ fn crates_from_another_sparse_registry_and_cargo_config_elsewhere_are_left_out()
     );
     let places = Places::defaults(Some(HOME));
     assert_eq!(
-        found(&inventory::collect(root, &places)),
+        found(&collect(root, &places)),
         [(Ecosystem::CratesIo, "ripgrep", "14.1.0")]
     );
 
@@ -1211,14 +1226,14 @@ fn crates_from_another_sparse_registry_and_cargo_config_elsewhere_are_left_out()
         "opt/cargo/.crates2.json",
         &["ripgrep 14.1.0 (registry+https://github.com/rust-lang/crates.io-index)"],
     );
-    assert_eq!(found(&inventory::collect(root, &moved)).len(), 1);
+    assert_eq!(found(&collect(root, &moved)).len(), 1);
     for file in ["home/u/.cargo/config.toml", ".cargo/config"] {
         write(
             root,
             file,
             "[source.crates-io]\nreplace-with = \"mirror\"\n",
         );
-        assert_eq!(found(&inventory::collect(root, &moved)), [], "{file}");
+        assert_eq!(found(&collect(root, &moved)), [], "{file}");
         fs::remove_file(root.join(file)).unwrap();
     }
 }
@@ -1229,7 +1244,7 @@ fn what_npm_would_find_elsewhere_leaves_npm_packages_out() {
     let root = root.path();
     npm(root, "usr/lib/node_modules/system", "system", "1.0.0");
     assert_eq!(
-        found(&inventory::collect(root, &Places::defaults(Some(HOME)))).len(),
+        found(&collect(root, &Places::defaults(Some(HOME)))).len(),
         1
     );
 
@@ -1238,7 +1253,7 @@ fn what_npm_would_find_elsewhere_leaves_npm_packages_out() {
         npm_global_prefix: Some("relative/prefix".to_string()),
         ..Places::defaults(Some(HOME))
     };
-    let inventory = inventory::collect(root, &relative);
+    let inventory = collect(root, &relative);
     assert_eq!(found(&inventory), []);
     assert!(
         inventory
@@ -1255,7 +1270,7 @@ fn what_npm_would_find_elsewhere_leaves_npm_packages_out() {
         "home/u/.npmrc",
         "${SCOPE}:registry=https://npm.corp.example/\n",
     );
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
     assert_eq!(found(&inventory), []);
     assert!(
         inventory
@@ -1275,10 +1290,10 @@ fn more_than_a_hundred_mise_nodes_leave_npm_packages_out() {
         fs::create_dir_all(root.join(format!("{installs}/22.{minor}.0"))).unwrap();
     }
     let places = Places::defaults(Some(HOME));
-    assert_eq!(found(&inventory::collect(root, &places)).len(), 1);
+    assert_eq!(found(&collect(root, &places)).len(), 1);
 
     fs::create_dir_all(root.join(format!("{installs}/22.100.0"))).unwrap();
-    let inventory = inventory::collect(root, &places);
+    let inventory = collect(root, &places);
     assert_eq!(found(&inventory), []);
     assert!(
         inventory
@@ -1307,7 +1322,7 @@ fn a_relative_tool_home_and_a_linked_mise_tool_are_said() {
         ..Places::defaults(Some(HOME))
     };
 
-    let inventory = inventory::collect(root, &places);
+    let inventory = collect(root, &places);
 
     assert!(
         inventory
@@ -1350,7 +1365,7 @@ fn a_start_up_file_that_names_an_index_variable_leaves_its_packages_out() {
     // A start-up file that names none changes nothing.
     write(root, "home/u/.bashrc", "export PATH=\"$HOME/bin:$PATH\"\n");
     write(root, "etc/profile.d/locale.sh", "export LANG=C.UTF-8\n");
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
     assert_eq!((npms(&inventory), pythons(&inventory)), (1, 1));
     assert!(
         !inventory.unchecked.join("\n").contains("start-up"),
@@ -1364,7 +1379,7 @@ fn a_start_up_file_that_names_an_index_variable_leaves_its_packages_out() {
         "home/u/.bashrc",
         "export pip_index_url=https://pypi.corp.example/simple\n",
     );
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
     assert_eq!((npms(&inventory), pythons(&inventory)), (1, 0));
     assert!(
         inventory
@@ -1382,7 +1397,7 @@ fn a_start_up_file_that_names_an_index_variable_leaves_its_packages_out() {
         "etc/fish/conf.d/npm.fish",
         "set -gx NPM_CONFIG_REGISTRY https://npm.corp.example/\n",
     );
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
     assert_eq!((npms(&inventory), pythons(&inventory)), (0, 1));
     assert!(
         inventory
@@ -1402,7 +1417,7 @@ fn a_start_up_file_that_names_an_index_variable_leaves_its_packages_out() {
         "usr/share/bash-completion/completions/uv",
         "UV_INDEX_URL PIP_INDEX_URL npm_config_registry\n",
     );
-    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
     assert_eq!((npms(&inventory), pythons(&inventory)), (0, 0));
     let unchecked = inventory.unchecked.join("\n");
     assert!(
@@ -1410,4 +1425,124 @@ fn a_start_up_file_that_names_an_index_variable_leaves_its_packages_out() {
         "{unchecked}"
     );
     assert!(!unchecked.contains("completions"), "{unchecked}");
+}
+
+/// How many npm and Python packages `inventory` found.
+fn counts(inventory: &Inventory) -> (usize, usize) {
+    let of = |wanted: Ecosystem| {
+        found(inventory)
+            .iter()
+            .filter(|(ecosystem, ..)| *ecosystem == wanted)
+            .count()
+    };
+    (of(Ecosystem::Npm), of(Ecosystem::PyPi))
+}
+
+/// A root with one global npm package and one Python package mise
+/// installed.
+fn npm_and_python() -> TempDir {
+    let dir = TempDir::new("packages-session");
+    let root = dir.path();
+    npm(root, "usr/lib/node_modules/tool", "tool", "1.0.0");
+    let site = "home/u/.local/share/mise/installs/python/3.12.1/lib/python3.12/site-packages";
+    python(root, site, "requests", "2.31.0");
+    dir
+}
+
+#[test]
+fn hyprland_mise_and_sourced_files_are_searched_too() {
+    let places = Places::defaults(Some(HOME));
+    for (file, text, expected) in [
+        (
+            "home/u/.config/hypr/envs.conf",
+            "env = NPM_CONFIG_REGISTRY,https://npm.corp.example/\n",
+            (0, 1),
+        ),
+        (
+            "home/u/.config/hypr/envs.lua",
+            "hl.env(\"PIP_INDEX_URL\", \"https://pypi.corp.example/simple\")\n",
+            (1, 0),
+        ),
+        (
+            "usr/share/omarchy/default/hypr/envs.conf",
+            "env = PIP_EXTRA_INDEX_URL,https://pypi.corp.example/simple\n",
+            (1, 0),
+        ),
+        (
+            "home/u/.config/mise/config.toml",
+            "[env]\nNPM_CONFIG_REGISTRY = \"https://npm.corp.example/\"\n",
+            (0, 1),
+        ),
+        (
+            "etc/mise/conf.d/corp.toml",
+            "[env]\nPIP_INDEX_URL = \"https://pypi.corp.example/simple\"\n",
+            (1, 0),
+        ),
+        // Variables mise loads from another file are not known.
+        ("home/u/.mise.toml", "[env]\n_.file = \".env\"\n", (0, 0)),
+    ] {
+        let dir = npm_and_python();
+        let root = dir.path();
+        write(root, file, text);
+        let inventory = collect(root, &places);
+        assert_eq!(counts(&inventory), expected, "{file}");
+        assert!(
+            inventory.unchecked.join("\n").contains(&format!("/{file}")),
+            "{file}: {:?}",
+            inventory.unchecked
+        );
+    }
+
+    // A file a start-up file reads in, but not a completion file.
+    let dir = npm_and_python();
+    let root = dir.path();
+    write(
+        root,
+        "home/u/.bashrc",
+        "source ~/.config/corp.sh\nsource /usr/share/bash-completion/bash_completion\n",
+    );
+    write(
+        root,
+        "home/u/.config/corp.sh",
+        "export PIP_FIND_LINKS=/srv\n",
+    );
+    write(
+        root,
+        "usr/share/bash-completion/bash_completion",
+        "npm_config_registry\n",
+    );
+    let inventory = collect(root, &places);
+    assert_eq!(counts(&inventory), (1, 0));
+    let unchecked = inventory.unchecked.join("\n");
+    assert!(unchecked.contains("/home/u/.config/corp.sh"), "{unchecked}");
+    assert!(!unchecked.contains("completion"), "{unchecked}");
+}
+
+#[test]
+fn a_link_loop_or_too_many_start_up_files_leave_all_out() {
+    let places = Places::defaults(Some(HOME));
+    let dir = npm_and_python();
+    let root = dir.path();
+    fs::create_dir_all(root.join("etc/profile.d")).unwrap();
+    symlink(".", root.join("etc/profile.d/loop")).unwrap();
+    let inventory = collect(root, &places);
+    assert_eq!(counts(&inventory), (0, 0));
+    let unchecked = inventory.unchecked.join("\n");
+    assert!(
+        unchecked.contains("could not be read") && unchecked.contains("/etc/profile.d/loop"),
+        "{unchecked}"
+    );
+
+    let dir = npm_and_python();
+    let root = dir.path();
+    for number in 0..=256 {
+        write(root, &format!("etc/profile.d/{number:03}.sh"), "true\n");
+    }
+    let inventory = collect(root, &places);
+    assert_eq!(counts(&inventory), (0, 0));
+    let unchecked = inventory.unchecked.join("\n");
+    assert!(
+        unchecked.contains("the start-up files past the first 256"),
+        "{unchecked}"
+    );
 }

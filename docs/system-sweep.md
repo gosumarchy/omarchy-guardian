@@ -241,7 +241,8 @@ its name is typed.
 `PATH`s: the one the sweep runs with, the systemd user manager's (`systemctl
 --user show-environment`), and the `PATH` lines of everything a login, a shell
 or the session reads: your shell start-up files and the files they `source`
-(three levels deep, 256 files in all), `/etc/profile` and `/etc/profile.d`,
+(three levels deep, 256 files in all, a linked file followed as the shell
+follows it), `/etc/profile` and `/etc/profile.d`,
 fish's `conf.d`, `environment.d` (yours and the system's),
 `~/.pam_environment`, uwsm's `env` files and Hyprland's `env` lines (Omarchy's
 own included). A line counts wherever on it the statement stands (`[ -d ~/.x ]
@@ -718,22 +719,31 @@ environment: the daily timer's sweep gets them only where they are set for
 your systemd user session.
 
 The tools may have run from a shell with settings the sweep does not see, so
-the shell start-up and environment files of the
-[auto-run locations](#auto-run-locations) (`/etc/environment`,
-`environment.d`, `/etc/profile` and `profile.d`, the bash, zsh and fish files,
-uwsm's environment files) are searched, in any case, for the names of the
-variables that set an index or registry: `PIP_INDEX_URL`,
-`PIP_EXTRA_INDEX_URL`, `PIP_FIND_LINKS`, `PIP_REQUIREMENT`,
-`PIP_CONSTRAINT`, `PIP_CONFIG_FILE`; `UV_INDEX*`, `UV_DEFAULT_INDEX`,
-`UV_EXTRA_INDEX_URL`, `UV_FIND_LINKS`, `UV_CONFIG_FILE`; and
-`npm_config_registry`, a scope's `npm_config_@scope:registry`,
-`npm_config_userconfig` and `npm_config_globalconfig`. A file that names
-one, whatever it sets it to, leaves out every package of that tool (for npm,
-as an npm file that cannot be read does), and is said. One that is there and
-cannot be read, a directory that cannot be listed or is nested more than 4
-deep, and files past the first 2,000 leave out the packages of all three.
-Completion, function, makepkg, readline and logout files are not searched:
-they do not set the environment the tools run in.
+the files a login, a shell, the session and Hyprland read are searched: the
+same files the `PATH` check reads
+([Programs ahead of the system's own](#programs-ahead-of-the-systems-own):
+`/etc/environment`, `environment.d`, `/etc/profile` and `profile.d`, the bash,
+zsh and fish files, uwsm's environment files, Hyprland's `.conf` and `.lua`
+files and Omarchy's defaults for them), the files those read in with `source`
+or `.` (three deep, following links), and mise's configuration, whose `[env]`
+mise sets in every shell it is turned on for (`~/.config/mise/config.toml`,
+`config.*.toml` and `conf.d/*.toml` beside it, `~/.config/mise.toml`,
+`~/.mise.toml`, `~/.mise.*.toml`, `~/mise.toml`, `~/mise.*.toml`, and
+`/etc/mise/config.toml`, `config.*.toml` and `conf.d/*.toml`). They are
+searched, in any case, for the names of the variables that set an index or
+registry: `PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL`, `PIP_FIND_LINKS`,
+`PIP_REQUIREMENT`, `PIP_CONSTRAINT`, `PIP_CONFIG_FILE`; `UV_INDEX*`,
+`UV_DEFAULT_INDEX`, `UV_EXTRA_INDEX_URL`, `UV_FIND_LINKS`, `UV_CONFIG_FILE`;
+and `npm_config_registry`, a scope's `npm_config_@scope:registry`,
+`npm_config_userconfig` and `npm_config_globalconfig`. A file that names one,
+whatever it sets it to, leaves out every package of that tool (for npm, as an
+npm file that cannot be read does), and is said. One that is there and cannot
+be read (closed, not a regular file or a link to one, a link loop, over 2
+MiB), one read in more than three deep, a directory a pattern cannot list,
+files past the first 256, and a mise file that loads variables from another
+file (`_.file`, `_.source`) leave out the packages of all three. Completion,
+function, makepkg, readline and logout files are not searched: they do not
+set the environment the tools run in.
 
 A package whose name may be private is not sent anywhere, as far as the files
 the tools leave behind tell. Only packages from the public registry go to OSV:
@@ -820,8 +830,10 @@ package:
   command line, directly or in a requirements file named there, into a
   Python mise installed or a pipx environment too old to have a
   `pipx_metadata.json`;
-- a setting exported in a way the start-up files above do not name: by
-  another program, or by a file the shell reads that is not among them;
+- a setting exported in a way the files above do not show: by another
+  program, by a file read in through a path with a variable other than the
+  home's in it (such as `source "$OMARCHY_PATH/default/bash/rc"`), or by a
+  project's own `mise.toml` outside the home;
 - a setting given on a tool's command line, such as `cargo install --config
   'source.crates-io.replace-with=...'`.
 

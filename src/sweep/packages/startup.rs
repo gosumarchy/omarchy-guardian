@@ -1,31 +1,46 @@
-//! The shell start-up and environment files that may give npm, pip or uv a
-//! registry or index the sweep's own environment does not show: the sweep
-//! may run from a timer or another session, while the tools ran from the
-//! user's shell. The files are the autorun catalog's shell and environment
-//! entries. A file is not parsed: any mention of a variable's name counts,
-//! and so does a file that cannot be read, so a miss leaves packages out
-//! rather than sending a private name.
+//! The shell start-up, session and mise files that may give npm, pip or uv
+//! a registry or index the sweep's own environment does not show: the
+//! sweep may run from a timer or another session, while the tools ran
+//! from the user's shell. The start-up files are the ones the `PATH` check
+//! reads (`path::start_up_files`), with what they read in; mise's own
+//! configuration is added, since mise sets its `[env]` in every shell it is
+//! turned on for. A file is not parsed: any mention of a variable's name
+//! counts, and so does a file that cannot be read, so a miss leaves
+//! packages out rather than sending a private name.
 
-use std::fs;
-use std::io;
-use std::path::Path;
+use crate::sweep::collect::Scope;
+use crate::sweep::path;
 
-use super::config::{ConfigFile, read_config};
-use crate::autorun::{self, Category, Kind, Location};
+/// mise's configuration files that apply in every directory under the
+/// home, relative to it, and the system's, relative to the root; `*`
+/// stands for any run of characters (`config.local.toml`, a profile's
+/// `config.<env>.toml`).
+const MISE_HOME_FILES: &[&str] = &[
+    ".config/mise/config.toml",
+    ".config/mise/config.*.toml",
+    ".config/mise/conf.d/*.toml",
+    ".config/mise.toml",
+    ".mise.toml",
+    ".mise.*.toml",
+    "mise.toml",
+    "mise.*.toml",
+];
+const MISE_SYSTEM_FILES: &[&str] = &[
+    "etc/mise/config.toml",
+    "etc/mise/config.*.toml",
+    "etc/mise/conf.d/*.toml",
+];
 
-/// The most files read. Arbitrary: well above the few dozen of a system
-/// with every shell installed; past it, the rest count as unreadable.
-const MAX_FILES: usize = 2_000;
+/// The `[env]` directives with which mise loads variables from other
+/// files (dotenv files, scripts), which are not read: a mise file that
+/// names one counts as one that cannot be read.
+const MISE_ENV_FILES: &[&str] = &["_.file", "_.source"];
 
-/// How deep a catalogued directory is read. Arbitrary: `/etc/fish/conf.d`
-/// is one below its location; a link back up is cut off here.
-const MAX_DEPTH: usize = 4;
-
-/// The parts of a catalogued path that mark files the shell reads only to
-/// complete a command, define a function that runs when called, build a
-/// package, edit a line, or log out: none sets the environment the tools
-/// later run in. The completion files are many, and generated ones name
-/// every variable a tool reads in their help text.
+/// The parts of a path that mark files the shell reads only to complete a
+/// command, define a function that runs when called, build a package, edit
+/// a line, or log out: none sets the environment the tools later run in.
+/// Generated completions name every variable a tool reads in their help
+/// text.
 const NOT_START_UP: &[&str] = &["completion", "functions", "makepkg", "inputrc", "logout"];
 
 /// pip's variables that set an index or a file that can, lowercased.
@@ -63,48 +78,44 @@ pub(super) struct Startup {
     pub(super) pip: Vec<String>,
     pub(super) uv: Vec<String>,
     pub(super) npm: Vec<String>,
-    /// What is there and could not be read or listed, or is past
-    /// `MAX_FILES`: it may name any of them.
+    /// What is there and could not be read or listed, or was not reached:
+    /// it may name any of them.
     pub(super) unreadable: Vec<String>,
 }
 
 impl Startup {
-    /// Reads the system's start-up files and, with a `home` (relative to
-    /// the root), the user's.
-    pub(super) fn read(root: &Path, home: Option<&str>) -> Self {
+    /// Reads the system's start-up and mise files and, with a home, the
+    /// user's.
+    pub(super) fn read(scope: &Scope<'_>) -> Self {
+        let mise_home = scope.home.into_iter().flat_map(|home| {
+            MISE_HOME_FILES
+                .iter()
+                .map(move |file| format!("{home}/{file}"))
+        });
+        let mise_system = MISE_SYSTEM_FILES.iter().map(|file| (*file).to_string());
+        let mise: Vec<String> = mise_home.chain(mise_system).collect();
+
         let mut startup = Self::default();
-        let mut files = Vec::new();
-        let user = home.map(|home| (format!("{home}/"), autorun::USER));
-        let catalog = [
-            (String::new(), autorun::SYSTEM),
-            (String::new(), autorun::SYSTEM_SWEEP),
-        ]
-        .into_iter()
-        .chain(user);
-        for (prefix, locations) in catalog {
-            for location in locations.iter().filter(|location| is_start_up(location)) {
-                let path = format!("{prefix}{}", location.path.trim_end_matches('/'));
-                match location.kind {
-                    Kind::File => files.push(path),
-                    Kind::Directory => startup.list(root, &path, 0, &mut files),
-                    // None of the shell's entries is one of these; one
-                    // added later is not read, and that is said.
-                    Kind::Units | Kind::Manager | Kind::Glob => {
-                        startup.unreadable.push(format!("/{path}"));
-                    }
-                }
+        let shell = path::start_up_files(scope, &path::start_up_patterns(scope));
+        startup.take(shell, false);
+        startup.take(path::start_up_files(scope, &mise), true);
+        startup
+    }
+
+    /// Notes what `start_up` read and could not read, leaving out what is
+    /// not a start-up file.
+    fn take(&mut self, start_up: path::StartUp, is_mise: bool) {
+        self.unreadable.extend(
+            start_up
+                .unreadable
+                .into_iter()
+                .filter(|path| is_start_up(path)),
+        );
+        for (file, text) in &start_up.files {
+            if is_start_up(file) {
+                self.scan(file, text, is_mise);
             }
         }
-        if files.len() > MAX_FILES {
-            files.truncate(MAX_FILES);
-            startup.unreadable.push(format!(
-                "the shell start-up and environment files past the first {MAX_FILES}"
-            ));
-        }
-        for file in files {
-            startup.scan(root, &file);
-        }
-        startup
     }
 
     /// Whether pip may be set to another index by a start-up file.
@@ -122,56 +133,16 @@ impl Startup {
         !self.npm.is_empty() || !self.unreadable.is_empty()
     }
 
-    /// Adds the files under `directory`, following links as the shell
-    /// does.
-    fn list(&mut self, root: &Path, directory: &str, depth: usize, files: &mut Vec<String>) {
-        if files.len() > MAX_FILES {
-            return;
-        }
-        let path = root.join(directory);
-        match fs::metadata(&path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
-            Ok(metadata) if !metadata.is_dir() => {
-                files.push(directory.to_string());
-                return;
-            }
-            Ok(_) if depth < MAX_DEPTH => {}
-            Ok(_) | Err(_) => {
-                self.unreadable.push(format!("/{directory}"));
-                return;
-            }
-        }
-        let Ok(listing) = fs::read_dir(&path) else {
-            self.unreadable.push(format!("/{directory}"));
-            return;
-        };
-        let mut names = Vec::new();
-        let mut whole = true;
-        for entry in listing {
-            match entry.map(|entry| entry.file_name().into_string()) {
-                Ok(Ok(name)) => names.push(name),
-                Ok(Err(_)) | Err(_) => whole = false,
-            }
-        }
-        if !whole {
-            self.unreadable.push(format!("/{directory}"));
-        }
-        names.sort();
-        for name in names {
-            self.list(root, &format!("{directory}/{name}"), depth + 1, files);
-        }
-    }
-
     /// Notes which tools' variables `file` names.
-    fn scan(&mut self, root: &Path, file: &str) {
-        let text = match read_config(root, file) {
-            ConfigFile::Absent => return,
-            ConfigFile::Unreadable => {
-                self.unreadable.push(format!("/{file}"));
-                return;
-            }
-            ConfigFile::Text(text) => text.to_ascii_lowercase(),
-        };
+    fn scan(&mut self, file: &str, text: &str, is_mise: bool) {
+        let text = text.to_ascii_lowercase();
+        if is_mise
+            && MISE_ENV_FILES
+                .iter()
+                .any(|directive| text.contains(directive))
+        {
+            self.unreadable.push(format!("/{file}"));
+        }
         for (variables, files) in [
             (PIP_VARIABLES, &mut self.pip),
             (UV_VARIABLES, &mut self.uv),
@@ -184,9 +155,8 @@ impl Startup {
     }
 }
 
-/// Whether a catalogued location is one the shell or the session reads
-/// before the tools run.
-fn is_start_up(location: &Location) -> bool {
-    matches!(location.category, Category::Shell | Category::Environment)
-        && !NOT_START_UP.iter().any(|part| location.path.contains(part))
+/// Whether a path read is one the shell or the session reads before the
+/// tools run.
+fn is_start_up(path: &str) -> bool {
+    !NOT_START_UP.iter().any(|part| path.contains(part))
 }

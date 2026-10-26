@@ -182,8 +182,9 @@ impl Places {
     /// The defaults, with what the environment changes. A variable that
     /// names a tool's directory, a configuration file or an XDG directory
     /// by a path that is not absolute without `..` is kept in `unfound`,
-    /// and nothing is read in its place. An empty `CARGO_HOME` or XDG
-    /// directory is unset, as cargo and pip take it; an empty `PIPX_HOME`
+    /// and nothing is read in its place, and so is an empty entry of
+    /// `XDG_CONFIG_DIRS`. An empty `CARGO_HOME` or `XDG_CONFIG_HOME` is
+    /// unset, as cargo and pip take it; an empty `PIPX_HOME`
     /// or `MISE_DATA_DIR` is said as not absolute, since their manuals on
     /// this machine do not say how they take it.
     pub(super) fn from_env(home: Option<&str>) -> Self {
@@ -261,10 +262,11 @@ impl Places {
                 files.push(file);
             }
         };
-        // An empty one is unset; a relative one, which pip and uv would
-        // resolve against where they ran, is said.
+        // An empty XDG_CONFIG_HOME is unset. A relative directory, or an
+        // empty entry of XDG_CONFIG_DIRS, which pip and uv would resolve
+        // against where they ran, is said.
         for (name, directory) in config_dirs {
-            if directory.is_empty() {
+            if name == "XDG_CONFIG_HOME" && directory.is_empty() {
                 continue;
             }
             if from_root(directory).is_none() {
@@ -1131,13 +1133,22 @@ mod tests {
                 "etc/corp/pip/pip.conf"
             ]
         );
-        assert_eq!(places.unfound, [("XDG_CONFIG_DIRS", "conf".to_string())]);
+        assert_eq!(
+            places.unfound,
+            [
+                ("XDG_CONFIG_DIRS", "conf".to_string()),
+                ("XDG_CONFIG_DIRS", String::new())
+            ]
+        );
         let root = TempDir::new("xdg-relative");
         let pip = IndexConfig::pip(root.path(), &places);
         assert!(pip.other_index);
         assert_eq!(
             pip.unreadable,
-            ["the pip.conf under the directory XDG_CONFIG_DIRS names (conf)"]
+            [
+                "the pip.conf under the directory XDG_CONFIG_DIRS names (conf)",
+                "the pip.conf under the directory XDG_CONFIG_DIRS names ()"
+            ]
         );
     }
 
