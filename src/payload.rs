@@ -32,6 +32,7 @@ use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 
 use self::model::{Attribute, attributes_in_tar, parse_model};
 pub(crate) use self::model::{
@@ -367,19 +368,18 @@ impl Archive {
             .stderr(std::process::Stdio::null())
             .spawn()
             .spawning("bsdtar")?;
-        let found = child
-            .stdout
-            .take()
-            .ok_or_else(|| failed("no output".into()))
-            .and_then(|stdout| attributes_in_tar(io::BufReader::with_capacity(1 << 16, stdout)));
+        let Some(stdout) = child.stdout.take() else {
+            return Err(failed("no output".into()));
+        };
+        let mut stream = io::BufReader::with_capacity(1 << 16, stdout);
+        let found = attributes_in_tar(&mut stream);
+        if found.is_err() {
+            drain(&mut stream);
+        }
         let status = child.wait().spawning("bsdtar")?;
         // Before what was read: a bsdtar that was stopped or failed ends
         // its stream early, which reads as a cut-short archive.
-        if !status.success() {
-            return Err(failed(
-                "could not be read through for its attributes".into(),
-            ));
-        }
+        read_through(status, "attributes").map_err(failed)?;
         found.map_err(|error| Error::Message(format!("{}: {error}", self.path.display())))
     }
 
@@ -435,45 +435,42 @@ impl Archive {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .map_err(|source| Error::Spawn {
-                tool: "bsdtar".into(),
-                source,
-            })?;
-        let heads = child
-            .stdout
-            .take()
-            .ok_or_else(|| "no output".to_string())
-            .and_then(|stdout| {
-                let mut stream = io::BufReader::with_capacity(1 << 16, stdout);
-                let mut heads = HashMap::new();
-                for (index, path) in &ordered {
-                    let size = self.entries[*index].size;
-                    let mut head = Vec::new();
-                    let kept = (&mut stream)
-                        .take(size.min(PROBE_SIZE as u64))
-                        .read_to_end(&mut head)
+            .spawning("bsdtar")?;
+        let Some(stdout) = child.stdout.take() else {
+            return Err(failed("no output".into()));
+        };
+        let mut stream = io::BufReader::with_capacity(1 << 16, stdout);
+        let heads = (|| {
+            let mut heads = HashMap::new();
+            for (index, path) in &ordered {
+                let size = self.entries[*index].size;
+                let mut head = Vec::new();
+                let kept = (&mut stream)
+                    .take(size.min(PROBE_SIZE as u64))
+                    .read_to_end(&mut head)
+                    .map_err(|error| error.to_string())?;
+                let skipped =
+                    io::copy(&mut (&mut stream).take(size - kept as u64), &mut io::sink())
                         .map_err(|error| error.to_string())?;
-                    let skipped =
-                        io::copy(&mut (&mut stream).take(size - kept as u64), &mut io::sink())
-                            .map_err(|error| error.to_string())?;
-                    if kept as u64 + skipped != size {
-                        return Err(format!("/{path} is shorter than listed"));
-                    }
-                    heads.insert((*path).clone(), head);
+                if kept as u64 + skipped != size {
+                    return Err(format!("/{path} is shorter than listed"));
                 }
-                // Anything more is a file the model does not know.
-                let mut more = [0_u8; 1];
-                match stream.read(&mut more) {
-                    Ok(0) => Ok(heads),
-                    _ => Err("more was extracted than the listing names".to_string()),
-                }
-            });
-        let status = child.wait().spawning("bsdtar")?;
-        let heads = heads.map_err(failed)?;
-        if !status.success() {
-            return Err(failed("could not be read through for its files".into()));
+                heads.insert((*path).clone(), head);
+            }
+            // Anything more is a file the model does not know.
+            let mut more = [0_u8; 1];
+            match stream.read(&mut more) {
+                Ok(0) => Ok(heads),
+                _ => Err("more was extracted than the listing names".to_string()),
+            }
+        })();
+        if heads.is_err() {
+            drain(&mut stream);
         }
-        Ok(heads)
+        let status = child.wait().spawning("bsdtar")?;
+        // Before what was read, as in `attributes`.
+        read_through(status, "files").map_err(failed)?;
+        heads.map_err(failed)
     }
 
     /// The archive as it is now, to compare with once the review is over.
@@ -867,6 +864,25 @@ fn read_extracted(root: &Path, rel: &str) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     file.take(MAX_TEXT_FILE_SIZE + 1).read_to_end(&mut bytes)?;
     Ok(bytes)
+}
+
+/// Reads the rest of a stream Guardian stopped parsing, so bsdtar's exit
+/// is its own and not a SIGPIPE from the reader leaving early. Its time
+/// limit bounds the wait; a failed read here changes nothing, as the
+/// parse error is what is reported.
+fn drain(stream: &mut impl Read) {
+    drop(io::copy(stream, &mut io::sink()));
+}
+
+/// How a bsdtar pass that read the archive through for its `what` ended,
+/// as the detail of its failure.
+fn read_through(status: ExitStatus, what: &str) -> Result<(), String> {
+    // GNU timeout exits 124 when it had to stop the command.
+    match status.code() {
+        _ if status.success() => Ok(()),
+        Some(124) => Err(format!("timed out reading it for its {what}")),
+        _ => Err(format!("could not be read through for its {what}")),
+    }
 }
 
 #[cfg(test)]
