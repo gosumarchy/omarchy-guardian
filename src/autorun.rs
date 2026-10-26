@@ -18,6 +18,9 @@ pub(crate) enum Category {
     Boot,
     BootConfig,
     Browser,
+    /// The extensions in a home's browser profiles, checked by the sweep's
+    /// own rules only (see `sweep::extensions`).
+    BrowserExtension,
     Cron,
     Dbus,
     Desktop,
@@ -59,11 +62,12 @@ pub(crate) enum Category {
 }
 
 impl Category {
-    const ALL: [Self; 38] = [
+    const ALL: [Self; 39] = [
         Self::Autostart,
         Self::Boot,
         Self::BootConfig,
         Self::Browser,
+        Self::BrowserExtension,
         Self::Cron,
         Self::Dbus,
         Self::Desktop,
@@ -107,6 +111,7 @@ impl Category {
             Self::Boot => "boot",
             Self::BootConfig => "boot-config",
             Self::Browser => "browser",
+            Self::BrowserExtension => "browser-extension",
             Self::Cron => "cron",
             Self::Dbus => "dbus",
             Self::Desktop => "desktop",
@@ -201,6 +206,7 @@ impl Category {
             Self::Setuid => "Programs with extra privileges",
             Self::Account => "Accounts and who may log in",
             Self::Browser => "Browser flags, policies and native hosts",
+            Self::BrowserExtension => "Browser extensions",
             Self::Terminal => "Terminal and prompt configuration",
             Self::Toolchain => "Developer tool configuration (npm, pip, cargo, mise)",
             Self::Program => "The system's own programs",
@@ -214,6 +220,7 @@ impl Category {
             Self::Boot => "runs before the system starts",
             Self::BootConfig | Self::SystemdGenerator => "runs at every boot",
             Self::Browser => "applies to every browser started",
+            Self::BrowserExtension => "runs in the browser, in the pages it may reach",
             Self::Cron => "runs on a schedule",
             Self::Dbus => "runs when a program asks for it over D-Bus",
             Self::Desktop => "runs when you open the app",
@@ -857,8 +864,27 @@ const UNOFFICIAL_ONLY: &[&str] = &[
 pub(crate) const SYSTEM_SWEEP: &[Location] = &[
     // PAM modules: a `.so` every login loads.
     location("usr/lib/security/", Kind::Directory, Category::Pam),
+    // The boot loaders' configuration, each place the command line is
+    // compared with (see `sweep::boot`), and what the firmware's shell and
+    // rEFInd read: what they start and with which parameters.
     location("boot/limine.conf", Kind::File, Category::Boot),
+    location("boot/limine/limine.conf", Kind::File, Category::Boot),
+    location("boot/EFI/limine/limine.conf", Kind::File, Category::Boot),
+    location("boot/loader/loader.conf", Kind::File, Category::Boot),
+    location("boot/loader/entries/", Kind::Directory, Category::Boot),
+    location("boot/grub/grub.cfg", Kind::File, Category::Boot),
+    // Read in at boot by the stock `41_custom`.
+    location("boot/grub/custom.cfg", Kind::File, Category::Boot),
+    location("boot/startup.nsh", Kind::File, Category::Boot),
+    location("boot/EFI/BOOT/startup.nsh", Kind::File, Category::Boot),
+    // Matched by name as listed, so a `REFIND.CONF` on FAT is missed: a
+    // limit the docs state (`docs/limitations.md`).
+    location("boot/EFI/*/refind.conf", Kind::Glob, Category::Boot),
     location("etc/default/limine", Kind::File, Category::Boot),
+    location("etc/default/grub", Kind::File, Category::Boot),
+    // The scripts `grub-mkconfig` runs to write `grub.cfg` (`40_custom`
+    // holds entries and passwords written by hand).
+    location("etc/grub.d/", Kind::Directory, Category::Boot),
     location("etc/kernel/cmdline", Kind::File, Category::Boot),
     // Libraries the dynamic linker prefers over the ones in `/usr/lib`.
     location("usr/lib/glibc-hwcaps/", Kind::Directory, Category::Linker),
