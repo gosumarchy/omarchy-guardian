@@ -6,9 +6,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use super::gate::{not_started, tree_content};
+use super::parse::{Protection, SetupScope};
 use super::{
-    ConfigCommand, Confirm, Forget, Invocation, Target, forget_command, forget_in, guard_command,
-    pacman_hook_command, parse, refusal, review_and_decide, reviews_for_the_user,
+    ConfigCommand, Confirm, Forget, GateReview, Invocation, Target, forget_command, forget_in,
+    guard_command, parse, refusal, review_and_decide, reviews_for_the_user,
 };
 use crate::agent::SourceFile;
 use crate::audit::{self, Gate};
@@ -19,10 +20,15 @@ use crate::config::model::{AgentSettings, AiRequirement, Profile, SourceClass};
 use crate::engine::baseline::{self, Identity, Unit};
 use crate::engine::store::Store;
 use crate::permit::Standing;
+use crate::protect::Consent;
+use crate::report::FAILED;
+use crate::report::Hashes;
 use crate::report::{Blocked, Decision};
 use crate::scan::ScanConfig;
+use crate::setup::GateAsk;
 use crate::test_support::{TempDir, mock_opencode, mock_opencode_findings};
 use crate::tools::OpenCode;
+use crate::tui;
 
 fn args(values: &[&str]) -> Vec<OsString> {
     values.iter().map(OsString::from).collect()
@@ -116,7 +122,7 @@ fn sandbox_always_reviews_generated_directories() {
 fn target(dir: &TempDir) -> Target {
     Target {
         config: ScanConfig::new(dir.path()),
-        show_hashes: false,
+        hashes: Hashes::Hidden,
         class: SourceClass::Source,
         profile: None,
         units: Vec::new(),
@@ -188,15 +194,15 @@ fn a_blocked_guard_offers_a_permit_for_the_bytes_wherever_they_lie() {
             ..target(&dir)
         };
         audit::taken();
-        let verdict = review_and_decide(
-            &target,
-            &settings,
-            &opencode,
-            None,
-            &[],
-            Gate::Theme,
-            Some(&|report| tree_content(Gate::Theme, &target, report)),
-        );
+        let verdict = review_and_decide(GateReview {
+            gate: Gate::Theme,
+            target: &target,
+            settings: &settings,
+            opencode: &opencode,
+            context: &[],
+            confirm: None,
+            content: Some(&|report| tree_content(Gate::Theme, &target, report)),
+        });
         assert_eq!(verdict.decision, Decision::Blocked(Blocked::Findings));
         assert!(!verdict.allows_running());
         (verdict.standing, audit::taken())
@@ -237,15 +243,15 @@ fn a_scan_is_recorded_and_has_nothing_to_permit() {
     .unwrap();
     let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
     audit::taken();
-    let verdict = review_and_decide(
-        &target(&dir),
-        &default_settings(),
-        &opencode,
-        None,
-        &[],
-        Gate::Scan,
-        None,
-    );
+    let verdict = review_and_decide(GateReview {
+        gate: Gate::Scan,
+        target: &target(&dir),
+        settings: &default_settings(),
+        opencode: &opencode,
+        context: &[],
+        confirm: None,
+        content: None,
+    });
     assert_eq!(verdict.standing, Standing::None);
     let entries = audit::taken();
     assert_eq!(entries.len(), 1);
@@ -316,7 +322,7 @@ fn guard_blocks_when_the_agent_is_unavailable() {
         &mut confirm,
         &mut |_| panic!("launched without a review"),
     );
-    assert_eq!(status, ExitCode::from(2));
+    assert_eq!(status, ExitCode::from(FAILED));
 }
 
 #[test]
@@ -335,8 +341,8 @@ fn guard_never_returns_success_without_starting_the_command() {
         &mut confirm,
         &mut |_| panic!("launched with nothing reviewed"),
     );
-    assert_eq!(status, ExitCode::from(2));
-    assert_eq!(not_started(Decision::Limited), ExitCode::from(2));
+    assert_eq!(status, ExitCode::from(FAILED));
+    assert_eq!(not_started(Decision::Limited), ExitCode::from(FAILED));
     assert_eq!(
         not_started(Decision::Blocked(Blocked::Findings)),
         ExitCode::from(1)
@@ -482,24 +488,6 @@ fn a_broken_system_file_stops_every_review_for_the_user() {
 }
 
 #[test]
-fn a_reviewer_from_path_is_refused_for_a_pacman_run_by_root() {
-    use crate::pacman::HookArgs;
-    // Process 1 is root's, as a real pacman is; one that is not there
-    // cannot be shown to be the user's.
-    for pacman_pid in [1, u32::MAX] {
-        let hook = HookArgs {
-            pacman_pid,
-            cwd: PathBuf::from("/"),
-            opencode: OpenCode::UserPath,
-        };
-        assert_eq!(
-            pacman_hook_command(&hook, &default_settings(), false),
-            ExitCode::from(2)
-        );
-    }
-}
-
-#[test]
 fn local_only_asks_before_running() {
     let dir = TempDir::new("confirm-yes");
     fs::write(dir.path().join("theme.conf"), "name = \"good\"\n").unwrap();
@@ -544,7 +532,7 @@ fn confirmation_without_a_terminal_blocks() {
         &mut no_terminal,
         &mut |_| panic!("launched without confirmation"),
     );
-    assert_eq!(status, ExitCode::from(2));
+    assert_eq!(status, ExitCode::from(FAILED));
 }
 
 #[test]
@@ -585,15 +573,15 @@ fn guard_under_local_only_with_a_declined_confirm_is_not_confirmed() {
     let settings = local_only();
 
     let mut declined = Scripted(Some(false), Vec::new());
-    let decision = review_and_decide(
-        &target,
-        &settings,
-        &unavailable(),
-        Some(&mut declined),
-        &[],
-        Gate::Theme,
-        None,
-    )
+    let decision = review_and_decide(GateReview {
+        gate: Gate::Theme,
+        target: &target,
+        settings: &settings,
+        opencode: &unavailable(),
+        context: &[],
+        confirm: Some(&mut declined),
+        content: None,
+    })
     .decision;
     assert_eq!(decision, Decision::Blocked(Blocked::NotConfirmed));
 
@@ -606,7 +594,7 @@ fn guard_under_local_only_with_a_declined_confirm_is_not_confirmed() {
         &mut declined,
         &mut |_| panic!("launched without confirmation"),
     );
-    assert_eq!(status, ExitCode::from(2));
+    assert_eq!(status, ExitCode::from(FAILED));
 }
 
 #[test]
@@ -639,15 +627,15 @@ fn confirm_is_ignored_unless_ai_is_off() {
 
     let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
     let mut confirm = Scripted(Some(true), Vec::new());
-    let decision = review_and_decide(
-        &target,
-        &settings,
-        &opencode,
-        Some(&mut confirm),
-        &[],
-        Gate::Theme,
-        None,
-    )
+    let decision = review_and_decide(GateReview {
+        gate: Gate::Theme,
+        target: &target,
+        settings: &settings,
+        opencode: &opencode,
+        context: &[],
+        confirm: Some(&mut confirm),
+        content: None,
+    })
     .decision;
 
     assert_eq!(decision, Decision::Clear);
@@ -681,50 +669,35 @@ fn parses_config_subcommands() {
 fn parses_setup() {
     assert_eq!(
         parse(&args(&["setup"])).unwrap(),
-        Invocation::Setup {
-            gate: false,
-            if_needed: false
-        }
+        Invocation::Setup(SetupScope::Everything)
     );
     assert_eq!(
         parse(&args(&["setup", "--gate"])).unwrap(),
-        Invocation::Setup {
-            gate: true,
-            if_needed: false
-        }
+        Invocation::Setup(SetupScope::Gate(GateAsk::Always))
     );
     assert_eq!(
         parse(&args(&["setup", "--gate", "--if-needed"])).unwrap(),
-        Invocation::Setup {
-            gate: true,
-            if_needed: true
-        }
+        Invocation::Setup(SetupScope::Gate(GateAsk::IfNeeded))
     );
     assert!(parse(&args(&["setup", "extra"])).is_err());
     assert!(parse(&args(&["setup", "--if-needed"])).is_err());
     assert_eq!(
         parse(&args(&["protect"])).unwrap(),
-        Invocation::Protect {
-            yes: false,
-            off: false
-        }
+        Invocation::Protect(Protection::On, Consent::Ask)
     );
     assert_eq!(
         parse(&args(&["protect", "--off", "--yes"])).unwrap(),
-        Invocation::Protect {
-            yes: true,
-            off: true
-        }
+        Invocation::Protect(Protection::Off, Consent::Given)
     );
     assert!(parse(&args(&["protect", "--all"])).is_err());
     assert_eq!(parse(&args(&["test"])).unwrap(), Invocation::Test);
     assert_eq!(
         parse(&args(&["tui"])).unwrap(),
-        Invocation::Tui { expert: false }
+        Invocation::Tui(tui::Mode::Simple)
     );
     assert_eq!(
         parse(&args(&["settings", "--expert"])).unwrap(),
-        Invocation::Tui { expert: true }
+        Invocation::Tui(tui::Mode::Expert)
     );
     assert!(parse(&args(&["tui", "extra"])).is_err());
     assert_eq!(
@@ -867,7 +840,7 @@ fn forget_removes_baselines() {
         ExitCode::SUCCESS
     );
     assert!(!record("other").exists());
-    assert_eq!(forget_command(&Forget::All, None), ExitCode::from(2));
+    assert_eq!(forget_command(&Forget::All, None), ExitCode::from(FAILED));
 }
 
 #[test]
@@ -939,15 +912,15 @@ fn remarks_of_a_clear_review_stop_no_gate_and_are_findings_under_strict() {
 
     // A scan of it ends with success, and nothing is offered.
     audit::taken();
-    let verdict = review_and_decide(
-        &target,
-        &standard,
-        &opencode,
-        None,
-        &[],
-        Gate::Scan,
-        Some(&|report| tree_content(Gate::Scan, &target, report)),
-    );
+    let verdict = review_and_decide(GateReview {
+        gate: Gate::Scan,
+        target: &target,
+        settings: &standard,
+        opencode: &opencode,
+        context: &[],
+        confirm: None,
+        content: Some(&|report| tree_content(Gate::Scan, &target, report)),
+    });
     assert_eq!(verdict.decision, Decision::Clear);
     assert_eq!(verdict.decision.exit_status(), 0);
     assert_eq!(verdict.standing, Standing::None);

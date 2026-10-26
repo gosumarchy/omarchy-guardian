@@ -2,17 +2,18 @@
 //! content-addressed blobs, baseline manifests and cached verdicts. Only
 //! user-level classes use it; the root pacman gate never opens it.
 
-use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::fs::{self, DirBuilder};
+use std::io;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, IoContext};
+use crate::files::{AtomicWrite, write_atomic};
 use crate::paths::{self, Accept};
-use crate::sha256::Sha256;
+use crate::sha256::{Digest, Sha256};
 use crate::user;
 
 pub(super) const BLOBS: &str = "blobs";
@@ -21,22 +22,19 @@ pub(super) const VERDICTS: &str = "verdicts";
 
 const TEMP_PREFIX: &str = ".tmp-";
 
-/// Temp file names this many attempts old before `write` gives up: a
-/// leftover from a killed run sharing this pid must not block writes
-/// forever, but a directory that keeps colliding is a sign of real trouble.
-const MAX_TEMP_ATTEMPTS: u32 = 16;
-
 /// Age in seconds beyond which a leftover `.tmp-*` file is swept: a run
 /// killed between opening its temp file and renaming it into place
 /// otherwise leaves that file behind forever.
 const STALE_TEMP_SECS: u64 = 3_600;
 
+/// Numbers this process's temp names. One counter for the whole process,
+/// not one per `Store`: `write_atomic` removes whatever is under its temp
+/// name first, so two stores on one root with their own counters would
+/// delete each other's half-written files.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) struct Store {
     root: PathBuf,
-    /// Per-instance so a fresh `Store::open` (once per Guardian run) starts
-    /// its temp names at 0 again; only `process::id()` needs to disambiguate
-    /// two processes, not two counters in the same one.
-    temp_counter: AtomicU64,
 }
 
 impl Store {
@@ -64,16 +62,13 @@ impl Store {
                 Err(source) => return Err(Error::Io { path, source }),
             }
             if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
-                return Err(Error::Refused(format!(
+                return Err(Error::Message(format!(
                     "{} is not a directory",
                     path.display()
                 )));
             }
         }
-        Ok(Self {
-            root,
-            temp_counter: AtomicU64::new(0),
-        })
+        Ok(Self { root })
     }
 
     fn path(&self, dir: &str, name: &str) -> PathBuf {
@@ -84,43 +79,16 @@ impl Store {
     /// renames it into place, so a reader never sees half a file.
     pub(super) fn write(&self, dir: &str, name: &str, bytes: &[u8]) -> Result<(), Error> {
         let target = self.path(dir, name);
-        let (temp, mut file) = self.open_temp(dir)?;
-        let written = file.write_all(bytes).and_then(|()| file.sync_all());
-        drop(file);
-        if let Err(source) = written.and_then(|()| fs::rename(&temp, &target)) {
-            drop(fs::remove_file(&temp));
-            return Err(Error::Io {
-                path: target,
-                source,
-            });
-        }
-        Ok(())
-    }
-
-    /// Opens a fresh, exclusively-created temp file in `dir`. A name already
-    /// taken (a leftover from a past run that reused this pid) is retried
-    /// under the next counter value, bounded so a directory that keeps
-    /// colliding cannot loop forever.
-    fn open_temp(&self, dir: &str) -> Result<(PathBuf, fs::File), Error> {
-        let pid = process::id();
-        let mut attempts = 0u32;
-        loop {
-            let counter = self.temp_counter.fetch_add(1, Ordering::Relaxed);
-            let temp = self.path(dir, &format!("{TEMP_PREFIX}{pid}-{counter}"));
-            attempts += 1;
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&temp)
-            {
-                Ok(file) => return Ok((temp, file)),
-                Err(source)
-                    if source.kind() == io::ErrorKind::AlreadyExists
-                        && attempts < MAX_TEMP_ATTEMPTS => {}
-                Err(source) => return Err(Error::Io { path: temp, source }),
-            }
-        }
+        // Unique to this process and this write, so whatever is under it
+        // was left by a killed run that had this pid: `write_atomic`
+        // removes it first.
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temporary = self.path(dir, &format!("{TEMP_PREFIX}{}-{counter}", process::id()));
+        let options = AtomicWrite {
+            sync: true,
+            ..AtomicWrite::private(temporary)
+        };
+        write_atomic(&target, bytes, &options).at(&target)
     }
 
     /// Deletes `.tmp-*` files older than an hour from every store directory:
@@ -204,39 +172,30 @@ impl Store {
         Ok(total)
     }
 
-    /// Stores `bytes` under their SHA-256 and returns the hex digest.
-    pub(super) fn put_blob(&self, bytes: &[u8]) -> Result<String, Error> {
-        let digest = Sha256::digest(bytes).to_string();
-        if !self.path(BLOBS, &digest).exists() {
-            self.write(BLOBS, &digest, bytes)?;
+    /// Stores `bytes` under their SHA-256 and returns it.
+    pub(super) fn put_blob(&self, bytes: &[u8]) -> Result<Digest, Error> {
+        let digest = Sha256::digest(bytes);
+        let name = digest.to_string();
+        if !self.path(BLOBS, &name).exists() {
+            self.write(BLOBS, &name, bytes)?;
         }
         Ok(digest)
     }
 
     /// The blob with this digest, or `None` when it is missing or no longer
     /// matches its digest; a corrupt blob is deleted.
-    pub(super) fn get_blob(&self, digest: &str) -> Result<Option<Vec<u8>>, Error> {
-        if !is_hex_digest(digest) {
-            return Ok(None);
-        }
-        let Some(bytes) = self.read(BLOBS, digest)? else {
+    pub(super) fn get_blob(&self, digest: Digest) -> Result<Option<Vec<u8>>, Error> {
+        let name = digest.to_string();
+        let Some(bytes) = self.read(BLOBS, &name)? else {
             return Ok(None);
         };
-        if Sha256::digest(&bytes).to_string() == digest {
+        if Sha256::digest(&bytes) == digest {
             Ok(Some(bytes))
         } else {
-            self.remove(BLOBS, digest)?;
+            self.remove(BLOBS, &name)?;
             Ok(None)
         }
     }
-}
-
-/// A lowercase hex SHA-256 digest, the only names blobs and verdicts use.
-pub(super) fn is_hex_digest(text: &str) -> bool {
-    text.len() == 64
-        && text
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// A read-only summary for `config show`: the number of baselines and the
@@ -247,7 +206,6 @@ pub(crate) fn summary(root: &Path) -> Option<(usize, u64)> {
     }
     let store = Store {
         root: root.to_path_buf(),
-        temp_counter: AtomicU64::new(0),
     };
     Some((
         store.list(BASELINES).map_or(0, |names| names.len()),
@@ -267,7 +225,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
-    use super::{BASELINES, BLOBS, Store, TEMP_PREFIX, VERDICTS, is_hex_digest, summary};
+    use super::{BASELINES, BLOBS, Store, VERDICTS, summary};
     use crate::test_support::TempDir;
 
     #[test]
@@ -377,29 +335,29 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_same_pid_temp_file_does_not_block_the_next_write() {
-        let dir = TempDir::new("store-temp-retry");
+    fn two_stores_on_one_root_do_not_remove_each_others_writes() {
+        let dir = TempDir::new("store-two");
         let root = dir.path().join("store");
-        let store = Store::open(root.clone()).unwrap();
+        let stores = [
+            Store::open(root.clone()).unwrap(),
+            Store::open(root).unwrap(),
+        ];
 
-        // A fresh store's temp counter starts at 0, so this is the exact
-        // name write()'s first attempt will try; a leftover from a run that
-        // was killed after opening it (and reused this pid) collides here.
-        let colliding = root
-            .join(VERDICTS)
-            .join(format!("{TEMP_PREFIX}{}-0", std::process::id()));
-        fs::write(&colliding, b"stale").unwrap();
-
-        store.write(VERDICTS, "k", b"value").unwrap();
-
-        assert_eq!(
-            store.read(VERDICTS, "k").unwrap().as_deref(),
-            Some(&b"value"[..])
-        );
-        // write() retries under the next counter value; it never touches
-        // the colliding leftover itself (only the garbage-collection sweep
-        // does, once it is old enough).
-        assert!(colliding.exists());
+        // Each write first removes whatever is under its temp name; with a
+        // counter per store, both would use the same names and one could
+        // remove the other's file before its rename.
+        std::thread::scope(|scope| {
+            for (index, store) in stores.iter().enumerate() {
+                scope.spawn(move || {
+                    for round in 0..1000 {
+                        store
+                            .write(VERDICTS, &format!("{index}-{round}"), b"value")
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(stores[0].list(VERDICTS).unwrap().len(), 2000);
     }
 
     #[test]
@@ -408,22 +366,22 @@ mod tests {
         let store = Store::open(dir.path().join("store")).unwrap();
 
         let digest = store.put_blob(b"hello\n").unwrap();
-        assert!(is_hex_digest(&digest));
         assert_eq!(store.put_blob(b"hello\n").unwrap(), digest);
         assert_eq!(
-            store.get_blob(&digest).unwrap().as_deref(),
+            store.get_blob(digest).unwrap().as_deref(),
             Some(&b"hello\n"[..])
         );
 
         fs::write(
-            dir.path().join("store").join(BLOBS).join(&digest),
+            dir.path()
+                .join("store")
+                .join(BLOBS)
+                .join(digest.to_string()),
             "tampered",
         )
         .unwrap();
-        assert_eq!(store.get_blob(&digest).unwrap(), None);
+        assert_eq!(store.get_blob(digest).unwrap(), None);
         assert!(store.list(BLOBS).unwrap().is_empty());
-
-        assert_eq!(store.get_blob("../../etc/passwd").unwrap(), None);
     }
 
     #[test]

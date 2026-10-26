@@ -1,11 +1,12 @@
 //! Tests for `report`.
 
-use super::{AgentOutcome, AgentRun, Blocked, Decision, Gap, LocalFinding, Report};
+use super::{AgentOutcome, AgentRun, Blocked, Decision, Gap, LocalFinding, Report, ReviewScope};
 use crate::agent::{AgentFinding, AgentReview, Status};
 use crate::config::model::{Profile, SourceClass, builtin};
 use crate::error::Error;
 use crate::layout::Painter;
 use crate::osv::{Advisory, Audit};
+use crate::report::FAILED;
 use crate::report::Severity;
 use crate::rules::RuleId;
 
@@ -15,28 +16,61 @@ fn standard(class: SourceClass) -> crate::config::model::Policy {
 
 #[test]
 fn a_permitted_report_says_so_and_names_what_it_overruled() {
-    let mut report = Report::new("theme:demo");
+    let mut report = Report::new("theme:demo", ReviewScope::default());
     report.gaps.push(Gap::Undecodable("install.sh".into()));
     let blocked = Decision::Blocked(Blocked::Incomplete);
-    assert!(report.headline(blocked).0.contains("INCOMPLETE"));
+    assert!(report.headline(blocked, None).0.contains("INCOMPLETE"));
     assert_eq!(blocked.exit_status(), 2);
 
-    report.permit = Some("0123456789abcdef".into());
-    let (headline, _) = report.headline(blocked);
+    let headline = report.verdict_box(blocked, Some("0123456789abcdef"), 100, Painter::plain());
     assert!(headline.contains("PERMITTED"), "{headline}");
     assert!(
         headline.contains("permit 0123456789abcdef overrules INCOMPLETE"),
         "{headline}"
     );
     // A permit says nothing about a review that passed on its own.
-    assert!(report.headline(Decision::Clear).0.contains("CLEAR"));
+    assert!(report.headline(Decision::Clear, None).0.contains("CLEAR"));
     // The decision itself is what it was: only the gate goes on.
     assert_eq!(report.decision_name(blocked), "INCOMPLETE");
 }
 
 #[test]
+fn a_permitted_high_risk_report_is_amber_on_the_terminal_and_the_page() {
+    let mut report = Report::new("theme:demo", ReviewScope::default());
+    let mut run = reviewed(Status::Suspicious, &["install.sh"]);
+    if let AgentOutcome::Reviewed(review) = &mut run.outcome {
+        review.findings.push(AgentFinding {
+            severity: Severity::High,
+            file: "install.sh".into(),
+            line: None,
+            title: "runs a download".into(),
+            reason: "mock".into(),
+        });
+    }
+    report.agent_runs.push(run);
+    assert!(report.counts().high > 0);
+    let blocked = Decision::Blocked(Blocked::Findings);
+    assert_eq!(report.headline(blocked, None).1, "31;1");
+
+    let (headline, color) = report.headline(blocked, Some("0123456789abcdef"));
+    assert!(headline.starts_with("! PERMITTED"), "{headline}");
+    assert_eq!(color, "33;1");
+    let page = super::html::section(&report, blocked, Some("0123456789abcdef"));
+    assert!(page.contains(r#"class="word amber""#), "{page}");
+}
+
+#[test]
+fn the_advice_after_a_passing_review_names_its_scope() {
+    assert_eq!(
+        super::recommendation(Decision::Clear),
+        "Scope: this is a heuristic source review, not a safety guarantee."
+    );
+    assert!(super::recommendation(Decision::Limited).starts_with("Scope: install scriptlets"));
+}
+
+#[test]
 fn a_permit_needs_every_gap_to_be_about_hashed_content() {
-    let refused = || Error::Refused("x".into());
+    let refused = || Error::Message("x".into());
     for gap in [
         Gap::OversizedText("x".into()),
         Gap::UnresolvedLfs("x".into()),
@@ -65,7 +99,7 @@ fn a_permit_needs_every_gap_to_be_about_hashed_content() {
         Gap::Package(refused()),
     ] {
         assert!(!gap.content_hashed(), "{gap}");
-        let mut report = Report::new("x");
+        let mut report = Report::new("x", ReviewScope::default());
         report.gaps.push(Gap::NoReviewableFiles);
         assert!(report.content_hashed());
         report.gaps.push(gap);
@@ -75,7 +109,7 @@ fn a_permit_needs_every_gap_to_be_about_hashed_content() {
 
 #[test]
 fn the_audit_trail_gets_numbers_and_the_user_gets_the_reasons() {
-    let mut report = Report::new("x");
+    let mut report = Report::new("x", ReviewScope::default());
     assert_eq!(report.audit_ai(), "none");
     assert_eq!(
         report.audit_findings(),
@@ -90,7 +124,7 @@ fn the_audit_trail_gets_numbers_and_the_user_gets_the_reasons() {
         label: "m · high".into(),
         chunk: None,
         cached: None,
-        outcome: AgentOutcome::Unavailable(Error::Refused("no network".into())),
+        outcome: AgentOutcome::Unavailable(Error::Message("no network".into())),
     });
     assert_eq!(
         report.audit_ai(),
@@ -145,11 +179,11 @@ fn not_attempted(chunk: (usize, usize)) -> AgentRun {
 #[test]
 fn the_summary_keeps_why_the_review_is_incomplete_whatever_else_there_is() {
     // More alerts than the summary has lines for, and a gap.
-    let mut report = Report::new("x");
+    let mut report = Report::new("x", ReviewScope::default());
     report.findings = local_findings(20);
     report
         .gaps
-        .push(Gap::Agent(Error::Refused("no reply".into())));
+        .push(Gap::Agent(Error::Message("no reply".into())));
     let summary = report.overruled_summary(16);
     assert_eq!(summary[0], "not reviewed: AI review failed: no reply");
     assert_eq!(summary.len(), 17);
@@ -157,12 +191,12 @@ fn the_summary_keeps_why_the_review_is_incomplete_whatever_else_there_is() {
 
     // The first of eight chunks failed, so seven were never sent, beside
     // nine local findings: one line for the seven.
-    let mut report = Report::new("x");
+    let mut report = Report::new("x", ReviewScope::default());
     report.findings = local_findings(9);
     report.agent_runs = (2..=8).map(|index| not_attempted((index, 8))).collect();
     report
         .gaps
-        .push(Gap::Agent(Error::Refused("chunk 1/8: no reply".into())));
+        .push(Gap::Agent(Error::Message("chunk 1/8: no reply".into())));
     let summary = report.overruled_summary(16);
     assert_eq!(
         summary[0],
@@ -180,7 +214,7 @@ fn the_summary_keeps_why_the_review_is_incomplete_whatever_else_there_is() {
 
     // The second of four chunks failed and the two after it found sixteen
     // things between them.
-    let mut report = Report::new("x");
+    let mut report = Report::new("x", ReviewScope::default());
     report.agent_runs.push(reviewed(Status::Clear, &["a"]));
     for file in ["c", "d"] {
         let mut run = reviewed(Status::Suspicious, &[file]);
@@ -199,7 +233,7 @@ fn the_summary_keeps_why_the_review_is_incomplete_whatever_else_there_is() {
     }
     report
         .gaps
-        .push(Gap::Agent(Error::Refused("chunk 2/4: no reply".into())));
+        .push(Gap::Agent(Error::Message("chunk 2/4: no reply".into())));
     let summary = report.overruled_summary(16);
     assert_eq!(
         summary[0],
@@ -228,7 +262,7 @@ fn unavailable(files: &[&str]) -> AgentRun {
         label: "m · high".into(),
         chunk: None,
         cached: None,
-        outcome: AgentOutcome::Unavailable(Error::Refused("provider down".into())),
+        outcome: AgentOutcome::Unavailable(Error::Message("provider down".into())),
     }
 }
 
@@ -243,7 +277,10 @@ fn finding(path: &str) -> LocalFinding {
 
 fn report(class: SourceClass) -> Report {
     Report {
-        class,
+        scope: ReviewScope {
+            class,
+            ..ReviewScope::default()
+        },
         text_files_reviewed: 1,
         ..Report::default()
     }
@@ -446,7 +483,10 @@ fn decisions_map_to_exit_codes() {
         Blocked::AiUnavailable,
         Blocked::NotConfirmed,
     ] {
-        assert_eq!(Decision::Blocked(blocked).exit_code(), ExitCode::from(2));
+        assert_eq!(
+            Decision::Blocked(blocked).exit_code(),
+            ExitCode::from(FAILED)
+        );
     }
     assert!(Decision::Warned.allows_running());
     assert!(!Decision::Limited.allows_running());

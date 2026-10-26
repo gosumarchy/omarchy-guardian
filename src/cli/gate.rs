@@ -14,18 +14,18 @@ use crate::config::model::{AiRequirement, Named, Profile, SourceClass};
 use crate::engine::baseline::Unit;
 use crate::notify;
 use crate::permit::{self, Content, Standing};
-use crate::report::{Blocked, Decision, Report};
+use crate::report::{Blocked, Decision, Hashes, Report};
 use crate::review::{self, ReviewContext};
 use crate::sandbox;
 use crate::scan::{self, ScanConfig};
 use crate::tools::OpenCode;
 
-use super::{USAGE_ERROR, settings_for};
+use super::{FAILED, settings_for};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Target {
     pub(crate) config: ScanConfig,
-    pub(crate) show_hashes: bool,
+    pub(crate) hashes: Hashes,
     pub(crate) class: SourceClass,
     pub(crate) profile: Option<Profile>,
     pub(crate) units: Vec<Unit>,
@@ -123,24 +123,40 @@ pub(super) fn tree_content(gate: Gate, target: &Target, report: &Report) -> Vec<
 const fn not_started_status(decision: Decision) -> u8 {
     match decision {
         Decision::Blocked(_) => decision.exit_status(),
-        Decision::Clear | Decision::Warned | Decision::Limited => 2,
+        Decision::Clear | Decision::Warned | Decision::Limited => FAILED,
     }
+}
+
+/// One gate's review of a target, as `review_and_decide` runs it.
+pub(crate) struct GateReview<'a> {
+    pub(crate) gate: Gate,
+    pub(crate) target: &'a Target,
+    pub(crate) settings: &'a Settings,
+    pub(crate) opencode: &'a OpenCode,
+    /// What the reviewer is told besides the files (see `ReviewContext`).
+    pub(crate) context: &'a [String],
+    /// Who is asked before a class reviewed with `ai = off` runs; nobody
+    /// for a plain scan, which runs nothing.
+    pub(crate) confirm: Option<&'a mut dyn Confirm>,
+    /// What a permit may stand for; nothing for a plain scan, which runs
+    /// nothing, so nothing is permitted.
+    pub(crate) content: Option<ContentOf<'a>>,
 }
 
 /// Reviews a target, applies confirmation and the user's permits, then
 /// prints the report once with the final decision — never a stale
-/// pre-confirmation headline — and records it in the audit trail. A plain
-/// scan has no `content`: nothing runs after it, so nothing is permitted.
-pub(crate) fn review_and_decide(
-    target: &Target,
-    settings: &Settings,
-    opencode: &OpenCode,
-    confirm: Option<&mut dyn Confirm>,
-    context: &[String],
-    gate: Gate,
-    content: Option<ContentOf<'_>>,
-) -> Verdict {
-    let mut report = review::review_tree(
+/// pre-confirmation headline — and records it in the audit trail.
+pub(crate) fn review_and_decide(review: GateReview<'_>) -> Verdict {
+    let GateReview {
+        gate,
+        target,
+        settings,
+        opencode,
+        context,
+        confirm,
+        content,
+    } = review;
+    let report = review::review_tree(
         &target.config,
         &ReviewContext {
             settings,
@@ -183,8 +199,7 @@ pub(crate) fn review_and_decide(
         settings,
         target.state_root.as_deref(),
     );
-    report.permit = standing.permitted().map(str::to_string);
-    report.print(target.show_hashes, decision);
+    report.print(decision, target.hashes, standing.permitted());
 
     let verdict = Verdict {
         report,
@@ -246,15 +261,15 @@ pub(super) fn guard_command(
 ) -> ExitCode {
     let settings = settings_for(target, settings);
     let gate = Gate::of_guard(target.class);
-    let verdict = review_and_decide(
-        target,
-        &settings,
-        opencode,
-        Some(confirm),
-        &[],
+    let verdict = review_and_decide(GateReview {
         gate,
-        Some(&|report| tree_content(gate, target, report)),
-    );
+        target,
+        settings: &settings,
+        opencode,
+        context: &[],
+        confirm: Some(confirm),
+        content: Some(&|report| tree_content(gate, target, report)),
+    });
     let decision = verdict.decision;
 
     if !verdict.allows_running() {
@@ -278,9 +293,9 @@ pub(super) fn guard_command(
     }
     if let Err(error) = scan::verify_unchanged(&target.config, &verdict.report.snapshot) {
         errln!("Guardian blocked the command because {error}.");
-        audit::refused(gate, &format!("{}: {error}", target.subject()), 2);
+        audit::refused(gate, &format!("{}: {error}", target.subject()), FAILED);
         notify::blocked(&target.subject(), &format!("{error}"), notify::Ran::Nothing);
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     }
 
     errln!(
@@ -302,7 +317,7 @@ pub(super) fn not_started(decision: Decision) -> ExitCode {
 /// signal behaviour are exactly the command's own.
 pub(super) fn exec_command(command: &[OsString]) -> ExitCode {
     let Some((program, arguments)) = command.split_first() else {
-        return ExitCode::from(USAGE_ERROR);
+        return ExitCode::from(FAILED);
     };
     // Nothing more can be reported if stdout is already gone.
     drop(io::stdout().flush());
@@ -312,7 +327,7 @@ pub(super) fn exec_command(command: &[OsString]) -> ExitCode {
         "Could not start guarded command {}: {error}",
         program.to_string_lossy()
     );
-    ExitCode::from(2)
+    ExitCode::from(FAILED)
 }
 
 pub(super) fn sandbox_command(
@@ -322,15 +337,15 @@ pub(super) fn sandbox_command(
     confirm: &mut dyn Confirm,
 ) -> ExitCode {
     let settings = settings_for(target, settings);
-    let verdict = review_and_decide(
+    let verdict = review_and_decide(GateReview {
+        gate: Gate::Sandbox,
         target,
-        &settings,
-        &OpenCode::UserPath,
-        Some(confirm),
-        &[],
-        Gate::Sandbox,
-        Some(&|report| tree_content(Gate::Sandbox, target, report)),
-    );
+        settings: &settings,
+        opencode: &OpenCode::UserPath,
+        context: &[],
+        confirm: Some(confirm),
+        content: Some(&|report| tree_content(Gate::Sandbox, target, report)),
+    });
     let decision = verdict.decision;
 
     if !verdict.allows_running() {
@@ -352,8 +367,12 @@ pub(super) fn sandbox_command(
         Ok(code) => code,
         Err(error) => {
             errln!("Guardian blocked the sandbox run because {error}.");
-            audit::refused(Gate::Sandbox, &format!("{}: {error}", target.subject()), 2);
-            ExitCode::from(2)
+            audit::refused(
+                Gate::Sandbox,
+                &format!("{}: {error}", target.subject()),
+                FAILED,
+            );
+            ExitCode::from(FAILED)
         }
     }
 }

@@ -3,7 +3,7 @@
 use super::{fact, is_local_only, label, local_checks, located, plugin_files};
 use crate::autorun::Category;
 use crate::report::LocalFinding;
-use crate::report::Report;
+use crate::report::{Report, ReviewScope};
 use crate::rules::RuleId;
 use crate::sweep::nvim::{self, Review};
 use std::collections::HashSet;
@@ -74,7 +74,7 @@ fn files_that_hold_tokens_and_plain_facts_stay_here() {
     assert!(!is_local_only(&run, home));
     // Their local checks are the alerts they were collected with: the
     // SSH rules do not read an npm file as an SSH one.
-    let mut report = Report::new("t");
+    let mut report = Report::new("t", ReviewScope::default());
     local_checks(
         &mut report,
         &item("home/u/.npmrc", Category::Toolchain, Tier::Unknown),
@@ -159,7 +159,7 @@ fn a_script_an_ssh_or_git_file_runs_is_reviewed_and_what_it_includes_is_not_sent
         assert!(!is_local_only(found(path), home), "{path}");
     }
 
-    let mut report = Report::new("t");
+    let mut report = Report::new("t", ReviewScope::default());
     super::examine(&mut report, &collection, home, &HashSet::new());
     let sent: Vec<&str> = report
         .agent_input
@@ -257,7 +257,7 @@ fn a_linked_token_file_stays_here_like_the_file_it_stands_for() {
     // What such a file runs is a program.
     assert!(!is_local_only(found("home/u/bin/npm-shell.sh"), home));
 
-    let mut report = Report::new("t");
+    let mut report = Report::new("t", ReviewScope::default());
     super::examine(&mut report, &collection, home, &HashSet::new());
     let sent: Vec<&str> = report
         .agent_input
@@ -305,7 +305,7 @@ fn planted(name: &str, files: &[(&str, &str)], links: &[(&str, &str)]) -> TempDi
 
 /// The paths queued for the AI and the findings of one examination.
 fn examined(collection: &Collection) -> (Vec<String>, Vec<(String, RuleId)>) {
-    let mut report = Report::new("t");
+    let mut report = Report::new("t", ReviewScope::default());
     super::examine(&mut report, collection, Some("home/u"), &HashSet::new());
     (
         report
@@ -513,7 +513,7 @@ fn the_login_script_and_scripts_under_a_secret_path_are_read_here_and_not_sent()
     let kept = |note: &String| note.contains("kept from the AI");
     assert!(rc.notes.iter().any(kept), "{:?}", rc.notes);
 
-    let mut report = Report::new("t");
+    let mut report = Report::new("t", ReviewScope::default());
     super::examine(&mut report, &collection, home, &HashSet::new());
     let sent: Vec<&str> = report
         .agent_input
@@ -614,7 +614,7 @@ fn a_file_a_live_check_names_is_sent_only_where_it_is_a_script_and_no_secret() {
         live.push(collect::item_named(&scope, Category::Process, path, path));
     }
     collect::merge(&mut collection, live);
-    let mut report = Report::new("t");
+    let mut report = Report::new("t", ReviewScope::default());
     super::examine(&mut report, &collection, home, &HashSet::new());
     let mut sent: Vec<&str> = report
         .agent_input
@@ -1022,7 +1022,7 @@ fn ssh_and_git_files_at_home_are_checked_locally_only() {
         home
     ));
 
-    let mut report = Report::new("t");
+    let mut report = Report::new("t", ReviewScope::default());
     local_checks(
         &mut report,
         &keys,
@@ -1035,7 +1035,7 @@ fn ssh_and_git_files_at_home_are_checked_locally_only() {
     assert!(!report.findings[0].excerpt.contains("AAAA"));
 
     let git = item("home/u/.gitconfig", Category::Git, Tier::Unknown);
-    let mut report = Report::new("t");
+    let mut report = Report::new("t", ReviewScope::default());
     local_checks(
         &mut report,
         &git,
@@ -1051,7 +1051,7 @@ fn ssh_and_git_files_at_home_are_checked_locally_only() {
     // SSH: the forms that run or load something, with `=` or blanks,
     // and an Include from outside the SSH directories.
     let config = item("home/u/.ssh/config", Category::Ssh, Tier::Unknown);
-    let mut report = Report::new("t");
+    let mut report = Report::new("t", ReviewScope::default());
     local_checks(
         &mut report,
         &config,
@@ -1074,7 +1074,7 @@ fn ssh_and_git_files_at_home_are_checked_locally_only() {
     );
 
     // An option after one whose value holds a blank is still seen.
-    let mut report = Report::new("t");
+    let mut report = Report::new("t", ReviewScope::default());
     local_checks(
         &mut report,
         &keys,

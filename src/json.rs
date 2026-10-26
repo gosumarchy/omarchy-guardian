@@ -8,6 +8,9 @@
 use std::collections::HashSet;
 use std::fmt::{self, Write as _};
 
+/// The deepest nesting a document may have. The parser recurses once per
+/// level, so this bounds its stack on hostile input (a reviewer's reply);
+/// 128 is arbitrary, far deeper than any document Guardian reads.
 const MAX_DEPTH: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

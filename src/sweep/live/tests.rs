@@ -2930,7 +2930,7 @@ fn a_getcap_that_is_missing_or_does_not_finish_is_not_an_empty_answer() {
     let dir = TempDir::new("live-getcap");
     let getcap = dir.path().join("getcap");
     assert_eq!(
-        super::capabilities_below(&getcap, &[]),
+        super::capabilities_below(&getcap, &[]).map_err(|error| error.to_string()),
         Err(format!("{} is not installed", getcap.display()))
     );
     if !crate::test_support::tool_available("/usr/bin/timeout")
@@ -2942,12 +2942,12 @@ fn a_getcap_that_is_missing_or_does_not_finish_is_not_an_empty_answer() {
     let listing = "#!/bin/sh\necho '/usr/bin/x cap_setuid=ep'\n";
     crate::test_support::write_script(&getcap, &format!("{listing}exit 1\n"));
     assert_eq!(
-        super::capabilities_below(&getcap, &[]),
+        super::capabilities_below(&getcap, &[]).map_err(|error| error.to_string()),
         Err("getcap failed: exit status: 1".to_string())
     );
     crate::test_support::write_script(&getcap, listing);
     assert_eq!(
-        super::capabilities_below(&getcap, &[]),
+        super::capabilities_below(&getcap, &[]).map_err(|error| error.to_string()),
         Ok(vec![("usr/bin/x".to_string(), "cap_setuid=ep".to_string())])
     );
 }

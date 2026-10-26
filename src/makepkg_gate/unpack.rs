@@ -18,6 +18,7 @@ use std::io::Read as _;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use crate::error::{Error, IoContext};
 use crate::tools::{self, Limits};
 
 /// The most one archive may unpack to.
@@ -49,32 +50,26 @@ pub(super) struct Scratch {
 impl Scratch {
     /// Creates it in `parent`, for the user alone. It is on disk beside
     /// the sources, not in the temporary directory, which is memory.
-    pub(super) fn create(parent: &Path) -> Result<Self, String> {
+    pub(super) fn create(parent: &Path) -> Result<Self, Error> {
         remove_stale(parent);
         let mut bytes = [0_u8; 8];
         fs::File::open("/dev/urandom")
             .and_then(|mut random| random.read_exact(&mut bytes))
-            .map_err(|error| format!("/dev/urandom: {error}"))?;
+            .map_err(|error| Error::Message(format!("/dev/urandom: {error}")))?;
         let suffix = bytes.iter().fold(String::new(), |mut text, byte| {
             let _ = write!(text, "{byte:02x}");
             text
         });
         let path = parent.join(format!("{SCRATCH_PREFIX}{suffix}"));
-        DirBuilder::new()
-            .mode(0o700)
-            .create(&path)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+        DirBuilder::new().mode(0o700).create(&path).at(&path)?;
         Ok(Self { path, used: 0 })
     }
 
     /// A new empty directory in it.
-    pub(super) fn next(&mut self) -> Result<PathBuf, String> {
+    pub(super) fn next(&mut self) -> Result<PathBuf, Error> {
         let path = self.path.join(self.used.to_string());
         self.used += 1;
-        DirBuilder::new()
-            .mode(0o700)
-            .create(&path)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+        DirBuilder::new().mode(0o700).create(&path).at(&path)?;
         Ok(path)
     }
 }
@@ -106,7 +101,7 @@ pub(super) fn remove_stale(parent: &Path) {
 
 /// Checks `bsdtar -tv --numeric-owner` output: only files, directories and
 /// links, within the limits. Returns the entries and bytes it lists.
-fn check_listing(listing: &str) -> Result<(usize, u64), String> {
+fn check_listing(listing: &str) -> Result<(usize, u64), Error> {
     let mut entries = 0_usize;
     let mut bytes = 0_u64;
     for line in listing.lines().filter(|line| !line.is_empty()) {
@@ -115,25 +110,29 @@ fn check_listing(listing: &str) -> Result<(usize, u64), String> {
         match mode.chars().next() {
             Some('-' | 'd' | 'l' | 'h') => {}
             Some('b' | 'c' | 'p' | 's') => {
-                return Err("it holds a device file, a pipe or a socket".into());
+                return Err(Error::Message(
+                    "it holds a device file, a pipe or a socket".into(),
+                ));
             }
-            _ => return Err("its listing cannot be read".into()),
+            _ => return Err(Error::Message("its listing cannot be read".into())),
         }
         // Links, owner and group (as numbers), then the size.
         let size = fields
             .nth(3)
             .and_then(|size| size.parse::<u64>().ok())
-            .ok_or("its listing cannot be read")?;
+            .ok_or_else(|| Error::Message("its listing cannot be read".into()))?;
         entries += 1;
         bytes = bytes.saturating_add(size);
         if entries > MAX_ENTRIES {
-            return Err(format!("it holds more than {MAX_ENTRIES} entries"));
+            return Err(Error::Message(format!(
+                "it holds more than {MAX_ENTRIES} entries"
+            )));
         }
         if bytes > MAX_BYTES {
-            return Err(format!(
+            return Err(Error::Message(format!(
                 "it unpacks to more than {} MiB",
                 MAX_BYTES / (1024 * 1024)
-            ));
+            )));
         }
     }
     Ok((entries, bytes))
@@ -167,12 +166,12 @@ fn make_readable(root: &Path, entries: &mut usize, bytes: &mut u64) -> std::io::
 /// Unpacks `archive` into the empty directory `into`. `jail` is the command
 /// that runs a program confined (Bubblewrap's arguments up to `--`, see
 /// `sandbox::fetch_jail`), with `archive` readable and `into` writable.
-pub(super) fn unpack(jail: &[OsString], archive: &Path, into: &Path) -> Result<(), String> {
-    let run = |arguments: Vec<OsString>, limits: Limits| -> Result<Vec<u8>, String> {
+pub(super) fn unpack(jail: &[OsString], archive: &Path, into: &Path) -> Result<(), Error> {
+    let run = |arguments: Vec<OsString>, limits: Limits| -> Result<Vec<u8>, Error> {
         let mut command = jail.to_vec();
         command.extend(arguments);
         let Some((program, arguments)) = command.split_first() else {
-            return Err("no command to run".into());
+            return Err(Error::Message("no command to run".into()));
         };
         tools::run_in(
             Path::new(program),
@@ -182,7 +181,7 @@ pub(super) fn unpack(jail: &[OsString], archive: &Path, into: &Path) -> Result<(
             limits,
         )
         .and_then(tools::Captured::into_success)
-        .map_err(|error| format!("bsdtar could not read it: {error}"))
+        .map_err(|error| Error::Message(format!("bsdtar could not read it: {error}")))
     };
     let listing = run(
         vec![
@@ -215,9 +214,11 @@ pub(super) fn unpack(jail: &[OsString], archive: &Path, into: &Path) -> Result<(
     )?;
     let (mut entries, mut bytes) = (0, 0);
     make_readable(into, &mut entries, &mut bytes)
-        .map_err(|error| format!("what it unpacked to cannot be read: {error}"))?;
+        .map_err(|error| Error::Message(format!("what it unpacked to cannot be read: {error}")))?;
     if entries > MAX_ENTRIES || bytes > MAX_BYTES {
-        return Err("it unpacked to more than its listing said".into());
+        return Err(Error::Message(
+            "it unpacked to more than its listing said".into(),
+        ));
     }
     Ok(())
 }
@@ -238,7 +239,10 @@ mod tests {
 drwxr-xr-x  0 0      0           0 Jan  1  2024 demo/\n\
 lrwxrwxrwx  0 0      0           0 Jan  1  2024 demo/link -> a b.txt\n\
 hrw-r--r--  0 0      0           0 Jan  1  2024 demo/hard link to demo/a b.txt\n";
-        assert_eq!(check_listing(plain), Ok((4, 12)));
+        assert_eq!(
+            check_listing(plain).map_err(|error| error.to_string()),
+            Ok((4, 12))
+        );
         for (listing, why) in [
             (
                 "crw-r--r--  0 0      0      1,3 Jan  1  2024 dev/null\n",
@@ -260,10 +264,15 @@ hrw-r--r--  0 0      0           0 Jan  1  2024 demo/hard link to demo/a b.txt\n
             ("garbage\n", "cannot be read"),
         ] {
             let refused = check_listing(listing).unwrap_err();
-            assert!(refused.contains(why), "{listing}: {refused}");
+            assert!(refused.to_string().contains(why), "{listing}: {refused}");
         }
         let many = "-rw-r--r--  0 0 0 1 Jan  1  2024 x\n".repeat(100_001);
-        assert!(check_listing(&many).unwrap_err().contains("entries"));
+        assert!(
+            check_listing(&many)
+                .unwrap_err()
+                .to_string()
+                .contains("entries")
+        );
     }
 
     #[test]

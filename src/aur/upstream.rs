@@ -10,7 +10,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use super::lockfile;
-use crate::content::{self, Content};
+use crate::content::{self, Content, Reading};
 use crate::engine::baseline::Unread;
 use crate::git_state;
 use crate::image;
@@ -221,8 +221,9 @@ pub(crate) struct Upstream {
     /// and documentation, and code past the budget. A reviewed line that
     /// runs or reads one in makes the review incomplete.
     pub(crate) unreviewed: Vec<(String, &'static str)>,
-    /// Every program among the binaries (ELF and the like), with its hash.
-    pub(crate) programs: BTreeMap<String, String>,
+    /// Every program among the binaries (ELF and the like), with its hash
+    /// where it could be hashed.
+    pub(crate) programs: BTreeMap<String, Option<Digest>>,
     /// Every file the walk read, with its hash: what the sources were when
     /// Guardian looked.
     pub(crate) seen: BTreeMap<String, String>,
@@ -325,7 +326,7 @@ struct Walk<'a> {
     /// Where files are run in the sources (see `Collected::surroundings`).
     surroundings: image::Surroundings,
     /// The whole images, with their hashes (see `Collected::images`).
-    images: Vec<(String, String)>,
+    images: Vec<(String, Option<Digest>)>,
 }
 
 impl Walk<'_> {
@@ -443,7 +444,7 @@ impl Walk<'_> {
                 .push((child.to_string(), "unreadable"));
             return;
         };
-        let text = match content::classify(child, executable, false, &bytes) {
+        let text = match content::classify(child, executable, Reading::ByName, &bytes) {
             Content::Text(text) | Content::Lossy { text, .. } => text,
             Content::Binary(format) => {
                 return self.binary(child, format, executable, read_from, Some(&bytes));
@@ -546,7 +547,6 @@ impl Walk<'_> {
             });
         }
         self.note(child, read_from, digest.as_ref());
-        let digest = digest.map(|digest| digest.to_string()).unwrap_or_default();
         // A download makepkg unpacks is reviewed as what comes out of it.
         let packaged = name
             .rsplit_once('.')
@@ -556,7 +556,7 @@ impl Walk<'_> {
         if format.executable() || (carries_code(name) && !unpacked_by_makepkg) {
             self.upstream
                 .programs
-                .insert(format!("src/{child}"), digest.clone());
+                .insert(format!("src/{child}"), digest);
         }
         if image && !archive {
             // Whether it is passed over is known once the walk has seen
@@ -1168,7 +1168,7 @@ pub(crate) struct Collected {
     /// The images that are whole by their own bytes, with their hashes:
     /// kept until every walk is done, since a script beside one may be
     /// read after it.
-    images: Vec<(String, String)>,
+    images: Vec<(String, Option<Digest>)>,
 }
 
 impl Collected {
@@ -1293,12 +1293,12 @@ impl Collected {
             let text = is_named(&data.child, &included)
                 .then(|| fs::read(&data.read_from).ok())
                 .flatten()
-                .and_then(
-                    |bytes| match content::classify(&data.child, false, false, &bytes) {
+                .and_then(|bytes| {
+                    match content::classify(&data.child, false, Reading::ByName, &bytes) {
                         Content::Text(text) | Content::Lossy { text, .. } => Some(text),
                         _ => None,
-                    },
-                );
+                    }
+                });
             match text {
                 Some(text) => {
                     self.upstream.data_files -= 1;

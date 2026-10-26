@@ -9,6 +9,7 @@
 
 mod archives;
 mod argv;
+pub(crate) mod gate;
 mod links;
 
 use std::cell::RefCell;
@@ -107,9 +108,9 @@ pub(crate) fn system_reviewer_is_opencode(settings: &Settings) -> bool {
 /// Without a root-owned OpenCode, every transaction with a target whose
 /// class requires the AI review is refused; this says so before the hook
 /// is turned on rather than on the next install.
-pub(crate) fn preflight(settings: &Settings, opencode_ready: bool) -> Result<(), String> {
+pub(crate) fn preflight(settings: &Settings, opencode_ready: bool) -> Result<(), Error> {
     if let Some(reason) = settings.privileged_block() {
-        return Err(reason.to_string());
+        return Err(Error::Message(reason.to_string()));
     }
     let requiring = classes_requiring_ai(settings);
     if requiring.is_empty() || opencode_ready {
@@ -121,15 +122,15 @@ pub(crate) fn preflight(settings: &Settings, opencode_ready: bool) -> Result<(),
     } else {
         "the model set for them runs through the Claude Code CLI, and there is no root-owned `claude` at /usr/bin/claude or /usr/local/bin/claude. Install it with: sudo pacman -S claude-code"
     };
-    Err(format!(
+    Err(Error::Message(format!(
         "{} packages require an AI review, so pacman would refuse every such install (including AUR packages yay installs with pacman -U): {fix}",
         names.join(", ")
-    ))
+    )))
 }
 
 pub(crate) fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report, Error> {
     if let Some(reason) = settings.privileged_block() {
-        return Err(Error::Refused(reason.to_string()));
+        return Err(Error::Message(reason.to_string()));
     }
 
     let targets = read_targets(io::stdin().lock())?;
@@ -139,13 +140,12 @@ pub(crate) fn review_transaction(args: &HookArgs, settings: &Settings) -> Result
         operands,
     } = parse_transaction(&argv)?;
 
-    let mut report = Report::new("pacman transaction");
     // Untagged files (a class-lookup miss) are judged as the strictest
-    // pacman class.
-    report.class = SourceClass::ThirdPartyRepo;
-    report.profile = settings.system_profile().name().to_string();
-    report.ai_off_classes = review::ai_off_classes(settings, &PRIVILEGED);
-    report.remark_classes = review::remark_classes(settings, &PRIVILEGED);
+    // pacman class, whose profile is the system's.
+    let mut report = Report::new(
+        "pacman transaction",
+        review::scope(settings, SourceClass::ThirdPartyRepo, &PRIVILEGED),
+    );
 
     let trusted = settings.trusted_reviewer_packages();
     let (archives, classes) = match operation {
@@ -211,7 +211,7 @@ pub(crate) fn review_transaction(args: &HookArgs, settings: &Settings) -> Result
                             report.archives.push(ReviewedArchive {
                                 name: fingerprint.name(),
                                 class,
-                                sha256: fingerprint.digest().to_string(),
+                                sha256: *fingerprint.digest(),
                             });
                             fingerprints.push(fingerprint);
                         }
@@ -221,8 +221,8 @@ pub(crate) fn review_transaction(args: &HookArgs, settings: &Settings) -> Result
             }
             Some(Err(reason)) => report
                 .gaps
-                .push(Gap::Package(Error::Refused(format!("{target}: {reason}")))),
-            None => report.gaps.push(Gap::Package(Error::Refused(format!(
+                .push(Gap::Package(Error::Message(format!("{target}: {reason}")))),
+            None => report.gaps.push(Gap::Package(Error::Message(format!(
                 "no package archive matched transaction target {target}"
             )))),
         }
@@ -259,7 +259,7 @@ fn system_links(shipped: &Shipped<'_>, report: &mut Report) -> InstalledLinks {
         )
     }));
     for reason in unseen {
-        report.gaps.push(Gap::Package(Error::Refused(reason)));
+        report.gaps.push(Gap::Package(Error::Message(reason)));
     }
     links
 }
@@ -671,7 +671,7 @@ fn review_led(
         // A link out of the package, or an archive that could not be
         // read: nothing the archive's digest stands for.
         Some(payload::Replacement::Unreadable(reason)) => {
-            report.gaps.push(Gap::Package(Error::Refused(format!(
+            report.gaps.push(Gap::Package(Error::Message(format!(
                 "/{path}, which /{link} on this system links to, {reason}: what the link will hold cannot be reviewed"
             ))));
         }
@@ -906,7 +906,7 @@ fn follow_outside_link(
             true
         }
         Err(reason) => {
-            report.gaps.push(Gap::Package(Error::Refused(format!(
+            report.gaps.push(Gap::Package(Error::Message(format!(
                 "/{} links to {leads}, which {reason}: what it holds cannot be reviewed",
                 file.path
             ))));
@@ -946,7 +946,7 @@ fn linked_file(
     root: &Path,
     leads: &str,
     others: &dyn Fn(&str) -> payload::InArchive,
-) -> Result<Option<(&'static str, Vec<u8>)>, String> {
+) -> Result<Option<(&'static str, Vec<u8>)>, Error> {
     let mut rel = leads.trim_start_matches('/').to_string();
     // Devices and the kernel's own files, which hold nothing to read; not
     // what anyone may write under /dev (`shm`, `mqueue`, `pts`), which is
@@ -974,30 +974,36 @@ fn linked_file(
                 )));
             }
             payload::InArchive::Other => {
-                return Err(
+                return Err(Error::Message(
                     "this transaction puts there as something other than a file that can be read"
                         .into(),
-                );
+                ));
             }
             payload::InArchive::Absent => {}
         }
-        let seen = read::seen(root, &rel, View::Pinned).ok_or("is not on this system")?;
+        let seen = read::seen(root, &rel, View::Pinned)
+            .ok_or_else(|| Error::Message("is not on this system".into()))?;
         if !seen.kept {
-            return Err("lies where someone other than root can change it".into());
+            return Err(Error::Message(
+                "lies where someone other than root can change it".into(),
+            ));
         }
         match seen.what {
             Public::File(file) => {
-                let unreadable = |error: io::Error| format!("cannot be read ({error})");
+                let unreadable =
+                    |error: io::Error| Error::Message(format!("cannot be read ({error})"));
                 let metadata = file.metadata().map_err(unreadable)?;
                 if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-                    return Err("is a file someone other than root can change".into());
+                    return Err(Error::Message(
+                        "is a file someone other than root can change".into(),
+                    ));
                 }
                 let mut bytes = Vec::new();
                 file.take(MAX_TEXT_FILE_SIZE + 1)
                     .read_to_end(&mut bytes)
                     .map_err(unreadable)?;
                 if bytes.len() as u64 > MAX_TEXT_FILE_SIZE {
-                    return Err("is too large to review".into());
+                    return Err(Error::Message("is too large to review".into()));
                 }
                 return Ok(Some(("it is on this system now", bytes)));
             }
@@ -1011,13 +1017,14 @@ fn linked_file(
                 } else {
                     base.join(&target)
                 };
-                rel = read::normalize(&next).ok_or("leads out of the system's root")?;
+                rel = read::normalize(&next)
+                    .ok_or_else(|| Error::Message("leads out of the system's root".into()))?;
             }
             Public::Other => return Ok(None),
-            Public::Directory(_) => return Err("is a directory".into()),
+            Public::Directory(_) => return Err(Error::Message("is a directory".into())),
         }
     }
-    Err("is behind too many links".into())
+    Err(Error::Message("is behind too many links".into()))
 }
 
 #[cfg(test)]

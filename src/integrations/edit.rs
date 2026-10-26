@@ -6,6 +6,7 @@ use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+use crate::error::{Error, IoContext};
 use crate::json::Json;
 
 use super::plan::Step;
@@ -29,10 +30,10 @@ const WAYBAR_SELECTOR: &str = "#image.omarchy-guardian";
 
 impl Paths {
     /// Applies one file-editing step.
-    pub(crate) fn edit(&self, step: &Step) -> Result<(), String> {
+    pub(crate) fn edit(&self, step: &Step) -> Result<(), Error> {
         match step {
             Step::RemoveInterceptor => {
-                let text = fs::read_to_string(&self.bashrc).map_err(|error| error.to_string())?;
+                let text = fs::read_to_string(&self.bashrc).at(&self.bashrc)?;
                 // The file a symlinked ~/.bashrc names is replaced, so the
                 // link stays one.
                 edit_file(&self.bashrc, &without_interceptor(&text))
@@ -58,13 +59,13 @@ impl Paths {
                 line.contains(THEME_GATE) && THEME_OVERRIDES.iter().any(|(id, _)| line.contains(id))
             }),
             Step::InstallBarWidget => {
-                fs::create_dir_all(&self.widget_target).map_err(|error| error.to_string())?;
+                fs::create_dir_all(&self.widget_target).at(&self.widget_target)?;
                 for name in widget_files(&self.widget_source) {
                     fs::copy(
                         self.widget_source.join(&name),
                         self.widget_target.join(&name),
                     )
-                    .map_err(|error| format!("{name}: {error}"))?;
+                    .map_err(|error| Error::Message(format!("{name}: {error}")))?;
                 }
                 Ok(())
             }
@@ -78,11 +79,10 @@ impl Paths {
                 if !ours {
                     return Ok(());
                 }
-                fs::remove_dir_all(&self.widget_target).map_err(|error| error.to_string())
+                fs::remove_dir_all(&self.widget_target).at(&self.widget_target)
             }
             Step::AddWaybarModule => {
-                let config =
-                    fs::read_to_string(&self.waybar_config).map_err(|error| error.to_string())?;
+                let config = fs::read_to_string(&self.waybar_config).at(&self.waybar_config)?;
                 edit_file(&self.waybar_config, &with_waybar_module(&config)?)?;
                 let style = without_waybar_style(
                     &fs::read_to_string(&self.waybar_style).unwrap_or_default(),
@@ -108,7 +108,7 @@ impl Paths {
             }
             Step::AddSessionPath => {
                 if let Some(directory) = self.session_env.parent() {
-                    fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+                    fs::create_dir_all(directory).at(directory)?;
                 }
                 replace_file(&self.session_env, SESSION_ENV)?;
                 // A line where it runs is left where it is; one that does
@@ -128,7 +128,7 @@ impl Paths {
                 if fs::read_to_string(&self.session_env)
                     .is_ok_and(|text| text.contains(SESSION_ENV_LINE))
                 {
-                    fs::remove_file(&self.session_env).map_err(|error| error.to_string())?;
+                    fs::remove_file(&self.session_env).at(&self.session_env)?;
                 }
                 match fs::read_to_string(&self.hypr_config) {
                     Ok(text) if without_hypr_line(&text) != text => {
@@ -141,7 +141,7 @@ impl Paths {
         }
     }
 
-    fn add_menu_lines(&self, entries: &[&str]) -> Result<(), String> {
+    fn add_menu_lines(&self, entries: &[&str]) -> Result<(), Error> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -149,15 +149,15 @@ impl Paths {
             with_menu_entries(&text, entries)?
         } else {
             if let Some(directory) = self.menu.parent() {
-                fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+                fs::create_dir_all(directory).at(directory)?;
             }
             with_menu_entries("{\n}\n", entries)?
         };
         edit_file(&self.menu, &text)
     }
 
-    fn remove_menu_lines(&self, remove: &dyn Fn(&str) -> bool) -> Result<(), String> {
-        let text = fs::read_to_string(&self.menu).map_err(|error| error.to_string())?;
+    fn remove_menu_lines(&self, remove: &dyn Fn(&str) -> bool) -> Result<(), Error> {
+        let text = fs::read_to_string(&self.menu).at(&self.menu)?;
         let kept: Vec<&str> = text.lines().filter(|line| !remove(line)).collect();
         edit_file(&self.menu, &(kept.join("\n") + "\n"))
     }
@@ -167,17 +167,19 @@ impl Paths {
 /// `config` with the Guardian module defined (one line after the opening
 /// brace) and placed first in `modules-right`. Written in place, keeping every
 /// other line (and any comments) as it was.
-pub(super) fn with_waybar_module(config: &str) -> Result<String, String> {
+pub(super) fn with_waybar_module(config: &str) -> Result<String, Error> {
     let config = without_waybar_module(config);
     let mut lines: Vec<String> = config.lines().map(str::to_string).collect();
     let opening = lines
         .iter()
         .position(|line| line.trim() == "{")
-        .ok_or("the Waybar config does not start with a single object")?;
+        .ok_or_else(|| {
+            Error::Message("the Waybar config does not start with a single object".into())
+        })?;
     let modules = lines
         .iter()
         .position(|line| names(line, "\"modules-right\"") && line.contains('['))
-        .ok_or("the Waybar config has no \"modules-right\" list")?;
+        .ok_or_else(|| Error::Message("the Waybar config has no \"modules-right\" list".into()))?;
     let line = &lines[modules];
     let at = line.find('[').map_or(line.len(), |index| index + 1);
     let rest = line[at..].trim_start();
@@ -212,7 +214,7 @@ fn list_ends(mut text: &str) -> bool {
 /// Waybar config), keeping a copy of it as it was before Guardian's first
 /// edit beside it, as `<name>.guardian-bak`. Later edits leave that copy
 /// alone: it is the way back to the file as the user had it.
-fn edit_file(path: &Path, text: &str) -> Result<(), String> {
+fn edit_file(path: &Path, text: &str) -> Result<(), Error> {
     if let Ok(real) = fs::canonicalize(path)
         && let Ok(before) = fs::read(&real)
     {
@@ -226,9 +228,12 @@ fn edit_file(path: &Path, text: &str) -> Result<(), String> {
             .mode(0o600)
             .open(PathBuf::from(name))
         {
-            backup
-                .write_all(&before)
-                .map_err(|error| format!("could not keep a copy of {}: {error}", path.display()))?;
+            backup.write_all(&before).map_err(|error| {
+                Error::Message(format!(
+                    "could not keep a copy of {}: {error}",
+                    path.display()
+                ))
+            })?;
         }
     }
     replace_file(path, text)
@@ -238,14 +243,17 @@ fn edit_file(path: &Path, text: &str) -> Result<(), String> {
 /// written and a failed write leaves the old one. A link is followed to
 /// the file it names, which is what is replaced: the link stays a link.
 /// Where a new file cannot be made beside it, it is written in place.
-pub(super) fn replace_file(path: &Path, text: &str) -> Result<(), String> {
-    let in_place = |target: &Path| fs::write(target, text).map_err(|error| error.to_string());
+pub(super) fn replace_file(path: &Path, text: &str) -> Result<(), Error> {
+    let in_place = |target: &Path| fs::write(target, text).at(target);
     // A link that leads nowhere yet: writing through it makes its file.
     let Ok(real) = fs::canonicalize(path) else {
         return in_place(path);
     };
     let (Some(directory), Some(name)) = (real.parent(), real.file_name()) else {
-        return Err(format!("{}: not a file path", path.display()));
+        return Err(Error::Message(format!(
+            "{}: not a file path",
+            path.display()
+        )));
     };
     let temporary = directory.join(format!(
         ".{}.{}.guardian-tmp",
@@ -271,7 +279,7 @@ pub(super) fn replace_file(path: &Path, text: &str) -> Result<(), String> {
     // left as it is.
     if let Err(error) = written {
         drop(fs::remove_file(&temporary));
-        return Err(error.to_string());
+        return Err(error).at(&real);
     }
     // A file that cannot be moved over (a bind mount, say) is written as
     // before.
@@ -434,13 +442,17 @@ fn with_hypr_line(text: &str) -> String {
 
 /// The menu file with `entries` added before its final `}`. A comma is
 /// added after the previous entry when it has none.
-pub(super) fn with_menu_entries(text: &str, entries: &[&str]) -> Result<String, String> {
+pub(super) fn with_menu_entries(text: &str, entries: &[&str]) -> Result<String, Error> {
     let lines: Vec<&str> = text.lines().collect();
     let closing = lines
         .iter()
         .rposition(|line| !line.trim().is_empty())
         .filter(|index| lines[*index].trim() == "}")
-        .ok_or("the menu file does not end with a lone `}`; add the entry by hand")?;
+        .ok_or_else(|| {
+            Error::Message(
+                "the menu file does not end with a lone `}`; add the entry by hand".into(),
+            )
+        })?;
 
     let mut out: Vec<String> = lines.iter().map(ToString::to_string).collect();
     if let Some(previous) = (0..closing).rev().find(|index| {

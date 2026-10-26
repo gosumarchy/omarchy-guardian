@@ -14,7 +14,7 @@ use crate::config::Settings;
 use crate::config::file::PartialConfig;
 use crate::config::model::{Profile, SourceClass};
 use crate::error::Error;
-use crate::report::{Blocked, Decision, Gap, Report};
+use crate::report::{Blocked, Decision, Gap, Report, ReviewScope};
 use crate::test_support::{NOBODY, TempDir, give};
 use crate::user::real_uid as current_uid;
 
@@ -284,7 +284,7 @@ fn ended_permits_are_cleared_and_a_user_holds_only_so_many() {
 }
 
 fn blocked_report() -> Report {
-    let mut report = Report::new("theme:demo");
+    let mut report = Report::new("theme:demo", ReviewScope::default());
     report.gaps.push(Gap::Undecodable("install.sh".into()));
     report
 }
@@ -360,7 +360,7 @@ fn a_block_is_offered_a_permit_and_a_permit_lets_it_through() {
     assert_eq!(
         ask(
             std::slice::from_ref(&content),
-            &Report::new("x"),
+            &Report::new("x", ReviewScope::default()),
             Decision::Clear,
             &settings
         ),
@@ -404,10 +404,10 @@ fn what_has_no_digest_or_was_refused_is_never_permitted() {
     // A refused package, a file that could not be read, a link that
     // leads elsewhere: the permit is ignored and none is offered.
     for gap in [
-        Gap::Package(Error::Refused(
+        Gap::Package(Error::Message(
             "demo ships /usr/bin/omarchy-guardian".into(),
         )),
-        Gap::Io(Error::Refused("x: permission denied".into())),
+        Gap::Io(Error::Message("x: permission denied".into())),
         Gap::Symlink("x".into()),
         Gap::HashLimit("x".into()),
         Gap::TreeTooLarge { files: 1, bytes: 1 },
@@ -590,13 +590,17 @@ fn the_command_takes_an_id_as_a_gate_prints_it() {
     let args = |words: &[&str]| -> Vec<std::ffi::OsString> {
         words.iter().map(std::ffi::OsString::from).collect()
     };
-    assert_eq!(parse(&args(&[])), Ok(Command::List));
     assert_eq!(
-        parse(&args(&["0123456789abcdef0123456789abcdef"])),
+        parse(&args(&[])).map_err(|error| error.to_string()),
+        Ok(Command::List)
+    );
+    assert_eq!(
+        parse(&args(&["0123456789abcdef0123456789abcdef"])).map_err(|error| error.to_string()),
         Ok(Command::Grant("0123456789abcdef0123456789abcdef".into()))
     );
     assert_eq!(
-        parse(&args(&["--revoke", "0123456789abcdef0123456789abcdef"])),
+        parse(&args(&["--revoke", "0123456789abcdef0123456789abcdef"]))
+            .map_err(|error| error.to_string()),
         Ok(Command::Revoke("0123456789abcdef0123456789abcdef".into()))
     );
     for bad in [

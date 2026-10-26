@@ -2,17 +2,18 @@
 
 use super::{reviewed_classes, reviewed_content, reviewed_digests, reviewed_names};
 use crate::config::model::SourceClass;
-use crate::report::{Report, ReviewedArchive};
+use crate::report::{Report, ReviewScope, ReviewedArchive};
+use crate::sha256::Digest;
 
 #[test]
 fn a_transaction_is_named_by_every_archive_it_was_reviewed_from() {
-    let mut report = Report::new("pacman transaction");
+    let mut report = Report::new("pacman transaction", ReviewScope::default());
     // Nothing was read: nothing a permit could stand for.
     assert!(reviewed_content(&report).is_none());
     let archive = |name: &str, class, byte: &str| ReviewedArchive {
         name: name.to_string(),
         class,
-        sha256: byte.repeat(64),
+        sha256: Digest::from_hex(&byte.repeat(64)).unwrap(),
     };
     report.archives = vec![
         archive("demo-1-1-any", SourceClass::LocalPackage, "b"),
@@ -35,9 +36,9 @@ fn a_transaction_is_named_by_every_archive_it_was_reviewed_from() {
     report.archives[0].name = "renamed".into();
     assert_eq!(reviewed_content(&report).unwrap().key(), key);
     // Other bytes, or the same bytes as another kind of package, do.
-    report.archives[0].sha256 = "c".repeat(64);
+    report.archives[0].sha256 = Digest::from_hex(&"c".repeat(64)).unwrap();
     assert_ne!(reviewed_content(&report).unwrap().key(), key);
-    report.archives[0].sha256 = "a".repeat(64);
+    report.archives[0].sha256 = Digest::from_hex(&"a".repeat(64)).unwrap();
     assert_eq!(reviewed_content(&report).unwrap().key(), key);
     report.archives[0].class = SourceClass::ThirdPartyRepo;
     assert_ne!(reviewed_content(&report).unwrap().key(), key);

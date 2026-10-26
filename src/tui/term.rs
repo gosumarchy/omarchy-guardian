@@ -6,7 +6,10 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
+
+use crate::error::{Error, IoContext};
 
 const STTY: &str = "/usr/bin/stty";
 
@@ -79,6 +82,9 @@ fn parse_keys(bytes: &[u8]) -> Vec<Key> {
     keys
 }
 
+/// The device every `Terminal` operation reads or writes.
+const TTY: &str = "/dev/tty";
+
 /// The terminal in raw mode on the alternate screen. Dropping it restores
 /// the saved mode and the main screen.
 pub(super) struct Terminal {
@@ -88,8 +94,12 @@ pub(super) struct Terminal {
 }
 
 impl Terminal {
-    pub(super) fn open() -> io::Result<Self> {
-        let tty = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
+    pub(super) fn open() -> Result<Self, Error> {
+        let tty = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(TTY)
+            .at(Path::new(TTY))?;
         let saved = stty(&tty, &["-g"])?;
         let mut terminal = Self {
             tty,
@@ -101,28 +111,26 @@ impl Terminal {
     }
 
     /// Raw input, alternate screen, hidden cursor.
-    pub(super) fn resume(&mut self) -> io::Result<()> {
+    pub(super) fn resume(&mut self) -> Result<(), Error> {
         stty(
             &self.tty,
             &[
                 "-icanon", "-echo", "-isig", "-ixon", "-iexten", "min", "0", "time", "2",
             ],
         )?;
-        self.tty.write_all(b"\x1b[?1049h\x1b[?25l\x1b[2J")?;
-        self.tty.flush()?;
+        self.write(b"\x1b[?1049h\x1b[?25l\x1b[2J")?;
         self.active = true;
         Ok(())
     }
 
     /// Back to the main screen in the saved mode, for running a command
     /// that uses the terminal itself (sudo, an editor, the setup wizard).
-    pub(super) fn suspend(&mut self) -> io::Result<()> {
+    pub(super) fn suspend(&mut self) -> Result<(), Error> {
         if !self.active {
             return Ok(());
         }
         self.active = false;
-        self.tty.write_all(b"\x1b[0m\x1b[?25h\x1b[?1049l")?;
-        self.tty.flush()?;
+        self.write(b"\x1b[0m\x1b[?25h\x1b[?1049l")?;
         stty(&self.tty, &[&self.saved]).map(drop)
     }
 
@@ -141,15 +149,21 @@ impl Terminal {
     }
 
     /// The keys pressed since the last call; empty after a 200 ms timeout.
-    pub(super) fn keys(&mut self) -> io::Result<Vec<Key>> {
+    pub(super) fn keys(&mut self) -> Result<Vec<Key>, Error> {
         let mut buffer = [0_u8; 64];
-        let count = self.tty.read(&mut buffer)?;
+        let count = self.tty.read(&mut buffer).at(Path::new(TTY))?;
         Ok(parse_keys(&buffer[..count]))
     }
 
-    pub(super) fn draw(&mut self, frame: &str) -> io::Result<()> {
-        self.tty.write_all(frame.as_bytes())?;
-        self.tty.flush()
+    pub(super) fn draw(&mut self, frame: &str) -> Result<(), Error> {
+        self.write(frame.as_bytes())
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.tty
+            .write_all(bytes)
+            .and_then(|()| self.tty.flush())
+            .at(Path::new(TTY))
     }
 
     /// Waits for Enter after an external command, so its output can be read
@@ -169,16 +183,20 @@ impl Drop for Terminal {
     }
 }
 
-fn stty(tty: &File, args: &[&str]) -> io::Result<String> {
+fn stty(tty: &File, args: &[&str]) -> Result<String, Error> {
     let output = Command::new(STTY)
         .args(args)
-        .stdin(Stdio::from(tty.try_clone()?))
+        .stdin(Stdio::from(tty.try_clone().at(Path::new(TTY))?))
         .stderr(Stdio::null())
-        .output()?;
+        .output()
+        .spawning(STTY)?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
-        Err(io::Error::other(format!("stty {} failed", args.join(" "))))
+        Err(Error::ToolFailed {
+            tool: STTY.to_string(),
+            detail: format!("{} exited with {}", args.join(" "), output.status),
+        })
     }
 }
 

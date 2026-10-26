@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::fs::{self, DirBuilder, File};
 use std::io::Read;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -276,19 +276,43 @@ pub(crate) enum AgentError {
     NonceMissing,
 }
 
+impl fmt::Display for AgentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable(error) | Self::Invalid(error) | Self::OutOfTime(error) => {
+                error.fmt(f)
+            }
+            Self::NonceMissing => nonce_missing().fmt(f),
+        }
+    }
+}
+
 impl AgentError {
     pub(crate) fn into_error(self) -> Error {
         match self {
             Self::Unavailable(error) | Self::Invalid(error) | Self::OutOfTime(error) => error,
-            Self::NonceMissing => Error::parse(REPORT, NONCE_MISSING),
+            Self::NonceMissing => nonce_missing(),
         }
     }
+}
+
+fn nonce_missing() -> Error {
+    Error::parse(REPORT, NONCE_MISSING)
+}
+
+/// Whose OpenCode configuration a review runs with (see `review`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReviewerConfig {
+    /// The invoking user's own.
+    User,
+    /// Private, empty configuration and cache directories.
+    Isolated,
 }
 
 /// Runs one review with `binary`, the CLI that `settings.model` selects
 /// (see `Reviewer::for_model`), from a new, empty, private directory and
 /// without the variables in `REMOVED_VARIABLES`.
-/// With `isolated` (the pacman gate), OpenCode runs with private, empty
+/// With `ReviewerConfig::Isolated` (the pacman gate), OpenCode runs with private, empty
 /// configuration and cache directories: the user's own OpenCode settings
 /// (a provider `baseURL`, plugins) do not shape the review of a root
 /// transaction. Its credentials still come from the OpenCode data
@@ -302,12 +326,12 @@ pub(crate) fn review(
     binary: &Path,
     render: &dyn Fn(&str) -> String,
     settings: &AgentSettings,
-    isolated: bool,
+    config: ReviewerConfig,
 ) -> Result<AgentReview, AgentError> {
     let nonce = random_nonce().map_err(AgentError::Unavailable)?;
     let request = render(&nonce);
     match Reviewer::for_model(settings.model.as_deref()) {
-        Reviewer::OpenCode => opencode_review(binary, &request, &nonce, settings, isolated),
+        Reviewer::OpenCode => opencode_review(binary, &request, &nonce, settings, config),
         Reviewer::ClaudeCode => claude_review(binary, &request, &nonce, settings),
     }
 }
@@ -317,8 +341,9 @@ fn opencode_review(
     request: &str,
     nonce: &str,
     settings: &AgentSettings,
-    isolated: bool,
+    reviewer_config: ReviewerConfig,
 ) -> Result<AgentReview, AgentError> {
+    let isolated = reviewer_config == ReviewerConfig::Isolated;
     let config = opencode_config().to_string();
     // Its own empty directory, as for Claude Code. It used to be /usr,
     // which every package can write under, and OpenCode reads instruction
@@ -434,7 +459,7 @@ fn opencode_args(
                 }
                 (Some(model), None) => args.extend(["--model".into(), OsString::from(model)]),
                 (None, Some(_)) => {
-                    return Err(AgentError::Unavailable(Error::Refused(
+                    return Err(AgentError::Unavailable(Error::Message(
                         "OpenCode 2 takes a variant only after a model (provider/model#variant): \
                          set model as well as variant"
                             .into(),

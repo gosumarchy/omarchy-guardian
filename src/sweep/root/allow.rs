@@ -5,7 +5,8 @@ use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 
 use super::{SUDO, installed};
-use crate::error::Error;
+use crate::error::{Error, IoContext};
+use crate::report::FAILED;
 use crate::sweep::state::{self, Remembered};
 use crate::user;
 
@@ -23,11 +24,11 @@ pub(crate) fn as_root(command: &str, arguments: &[&str], what: &str) -> Result<(
         .args(arguments)
         .stdin(Stdio::inherit())
         .status()
-        .map_err(|error| Error::Refused(format!("cannot start sudo: {error}")))?;
+        .spawning("sudo")?;
     if status.success() {
         Ok(())
     } else {
-        Err(Error::Refused(format!(
+        Err(Error::Message(format!(
             "{what} failed ({status}); nothing was changed. If the installed Guardian is older than this one, run ./install.sh"
         )))
     }
@@ -58,21 +59,25 @@ pub(super) fn change_allowed(
     allowed: &mut Remembered,
     arguments: &[String],
     invoker: Option<u32>,
-) -> Result<(), String> {
-    let key = |label: &str| -> Result<String, String> {
+) -> Result<(), Error> {
+    let key = |label: &str| -> Result<String, Error> {
         let plain = label.len() <= MAX_LABEL && !label.chars().any(char::is_control);
         if state::is_home_label(label) && plain {
             invoker.map(|uid| state::system_key(label, uid)).ok_or_else(|| {
-                "an item in a home is allowed for the user who asks: run `sweep allow` as that user".to_string()
+                Error::Message(
+                    "an item in a home is allowed for the user who asks: run `sweep allow` as that user".into(),
+                )
             })
         } else if label.starts_with('/') && plain {
             Ok(label.to_string())
         } else {
-            Err(format!("{label:?} is not a label the sweep shows"))
+            Err(Error::Message(format!(
+                "{label:?} is not a label the sweep shows"
+            )))
         }
     };
     if arguments.is_empty() {
-        return Err(ALLOW_USAGE.into());
+        return Err(Error::Message(ALLOW_USAGE.into()));
     }
     let mut rest = arguments;
     while let Some((flag, tail)) = rest.split_first() {
@@ -82,7 +87,7 @@ pub(super) fn change_allowed(
                     || fingerprint.len() > MAX_FINGERPRINT
                     || fingerprint.chars().any(char::is_control)
                 {
-                    return Err(format!("{label}: not a fingerprint"));
+                    return Err(Error::Message(format!("{label}: not a fingerprint")));
                 }
                 allowed.insert(key(label)?, fingerprint.clone());
                 tail
@@ -100,7 +105,7 @@ pub(super) fn change_allowed(
                 });
                 tail
             }
-            _ => return Err(ALLOW_USAGE.into()),
+            _ => return Err(Error::Message(ALLOW_USAGE.into())),
         };
     }
     Ok(())
@@ -137,7 +142,7 @@ fn changes_asked(arguments: &[String]) -> String {
 pub(crate) fn system_allow_command(arguments: &[String]) -> ExitCode {
     if !user::effective_uid().is_ok_and(|uid| uid == 0) {
         errln!("omarchy-guardian sweep-allow-system: only `sweep allow` runs this, as root");
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     }
     let invoker = std::env::var("SUDO_UID")
         .ok()
@@ -146,12 +151,12 @@ pub(crate) fn system_allow_command(arguments: &[String]) -> ExitCode {
     let path = Path::new(state::SYSTEM_ALLOWED);
     if let Err(error) = state::move_legacy_allowed(path, Path::new(state::LEGACY_SYSTEM_ALLOWED)) {
         errln!("omarchy-guardian sweep-allow-system: {error}");
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     }
     let mut allowed = state::system_allowed(path);
     if let Err(reason) = change_allowed(&mut allowed, arguments, invoker) {
         errln!("omarchy-guardian sweep-allow-system: {reason}");
-        return ExitCode::from(2);
+        return ExitCode::from(FAILED);
     }
     match state::save_system_allowed(path, &allowed) {
         Ok(()) => {
@@ -160,7 +165,7 @@ pub(crate) fn system_allow_command(arguments: &[String]) -> ExitCode {
         }
         Err(error) => {
             errln!("omarchy-guardian sweep-allow-system: {error}");
-            ExitCode::from(2)
+            ExitCode::from(FAILED)
         }
     }
 }

@@ -8,7 +8,7 @@ use crate::layout::{self, Painter, Span, Table};
 use crate::scan::FileKind;
 use crate::text::shown;
 
-use super::{AgentOutcome, Blocked, Decision, Report, Severity, html, recommendation};
+use super::{AgentOutcome, Blocked, Decision, Hashes, Report, Severity, html, recommendation};
 
 /// What the remarks are, after their count in the verdict box: for a
 /// review that is clear, and for one that is not (something else decided
@@ -35,12 +35,14 @@ pub(super) const fn remarks_note(decision: Decision) -> &'static str {
 }
 
 impl Report {
-    pub(crate) fn print(&self, show_hashes: bool, decision: Decision) {
+    /// Prints the report under `decision`, as overruled by the user's
+    /// `permit` when there is one (see `permit`).
+    pub(crate) fn print(&self, decision: Decision, hashes: Hashes, permit: Option<&str>) {
         let painter = Painter::for_stdout();
         let width = layout::width();
 
         outln!();
-        outln!("{}", self.verdict_box(decision, width, painter));
+        outln!("{}", self.verdict_box(decision, permit, width, painter));
         let mut rows = Vec::new();
         self.coverage_fields(&mut rows);
         for note in &self.notes {
@@ -52,7 +54,7 @@ impl Report {
             rows.push(("Local checks", vec![Span::new("no matches", "32")]));
         }
         outln!("{}", layout::fields(&rows, width, painter));
-        if show_hashes {
+        if hashes == Hashes::Shown {
             self.print_hashes();
         }
         out!("{}", self.findings_text(decision, width, painter));
@@ -60,19 +62,24 @@ impl Report {
         for gap in &self.gaps {
             crate::output::stderr_line(format_args!("  ! {}", shown(&gap.to_string())));
         }
-        let advice = match (&self.permit, decision) {
+        let advice = match (permit, decision) {
             (Some(_), Decision::Blocked(_)) => PERMITTED_ADVICE,
             _ => recommendation(decision),
         };
         outln!("\n{}", painter.paint(advice, "2"));
-        html::collect(self, decision);
+        html::collect(self, decision, permit);
     }
 
-    /// The one-line verdict and its terminal colour.
-    pub(super) fn headline(&self, decision: Decision) -> (String, &'static str) {
+    /// The one-line verdict and its terminal colour, as overruled by the
+    /// user's `permit` when there is one.
+    pub(super) fn headline(
+        &self,
+        decision: Decision,
+        permit: Option<&str>,
+    ) -> (String, &'static str) {
         let counts = self.counts();
         let total = counts.total();
-        if let (Some(permit), Decision::Blocked(_)) = (&self.permit, decision) {
+        if let (Some(permit), Decision::Blocked(_)) = (permit, decision) {
             return (
                 format!(
                     "! PERMITTED — your permit {permit} overrules {} for exactly this content",
@@ -124,9 +131,15 @@ impl Report {
 
     /// The verdict, and the counts of alerts and of remarks when there are
     /// any, in a box the verdict's colour.
-    pub(super) fn verdict_box(&self, decision: Decision, width: usize, painter: Painter) -> String {
+    pub(super) fn verdict_box(
+        &self,
+        decision: Decision,
+        permit: Option<&str>,
+        width: usize,
+        painter: Painter,
+    ) -> String {
         let counts = self.counts();
-        let (headline, color) = self.headline(decision);
+        let (headline, color) = self.headline(decision, permit);
         let mut lines = vec![Span::new(headline, color)];
         if counts.total() > 0 {
             lines.push(Span::plain(format!(
@@ -285,7 +298,7 @@ impl Report {
                 let _ = write!(context, " · {note}");
             }
             let about = Span::new(
-                format!("{}{context} · profile {}", run.label, self.profile),
+                format!("{}{context} · profile {}", run.label, self.profile()),
                 "2",
             );
             let spans = match &run.outcome {

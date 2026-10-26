@@ -10,7 +10,7 @@ use crate::config::Settings;
 use crate::config::model::{Named, SourceClass};
 use crate::engine::store::Store;
 use crate::permit::{self, Content, Standing};
-use crate::report::{Blocked, Decision, Report};
+use crate::report::{Blocked, Decision, Hashes, Report, ReviewScope};
 use crate::scan::Snapshot;
 use crate::sha256::Sha256;
 
@@ -179,8 +179,12 @@ pub(super) fn settle_upstream(
 ) -> (Standing, Decision) {
     let (report, reviewed) = reviewed;
     let printed = report.is_some();
-    let mut report =
-        report.unwrap_or_else(|| Report::new(format!("{} · upstream sources", step.name)));
+    let report = report.unwrap_or_else(|| {
+        Report::new(
+            format!("{} · upstream sources", step.name),
+            ReviewScope::default(),
+        )
+    });
     let contents: Vec<Content> = content.into_iter().collect();
     let mut standing = permit::standing(
         permittable(reviewed, &contents),
@@ -195,9 +199,8 @@ pub(super) fn settle_upstream(
         // Declined: the run is not one the permit let through.
         standing = Standing::None;
     }
-    report.permit = standing.permitted().map(str::to_string);
     if printed {
-        report.print(false, decision);
+        report.print(decision, Hashes::Hidden, standing.permitted());
     }
     let permitted = standing.permitted().is_some();
     audit::review(

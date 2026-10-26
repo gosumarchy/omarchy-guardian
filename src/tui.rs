@@ -22,21 +22,20 @@ use crate::config::model::{Named, SourceClass};
 use crate::config::show::{render_check, render_memory, render_show};
 use crate::engine::baseline;
 use crate::engine::store::Store;
-use crate::error::Error;
+use crate::error::{Error, IoContext};
 use crate::integrations::Plan;
 use crate::protect::{paths, run_plan, test_reviewer};
 use crate::setup::{self, Environment as _};
 use crate::status;
 
-use app::{App, Effect, Loaded, Mode, Task};
+pub(crate) use app::Mode;
+use app::{App, Effect, Loaded, Task};
 use canvas::Canvas;
 use fields::{HEADER, Scope};
 use term::Terminal;
 
-pub(crate) fn run(expert: bool) -> Result<(), String> {
-    let mut terminal =
-        Terminal::open().map_err(|error| format!("cannot use the terminal: {error}"))?;
-    let mode = if expert { Mode::Expert } else { Mode::Simple };
+pub(crate) fn run(mode: Mode) -> Result<(), Error> {
+    let mut terminal = Terminal::open()?;
     status::watched();
     let mut app = App::new(load_files(), mode);
     let mut size = (0, 0);
@@ -49,7 +48,7 @@ pub(crate) fn run(expert: bool) -> Result<(), String> {
             draw(&mut terminal, &mut app, size)?;
             dirty = false;
         }
-        let keys = terminal.keys().map_err(|error| error.to_string())?;
+        let keys = terminal.keys()?;
         if keys.is_empty() && app.tick() {
             dirty = true;
         }
@@ -78,12 +77,10 @@ fn draw(
     terminal: &mut Terminal,
     app: &mut App,
     (width, height): (usize, usize),
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let mut canvas = Canvas::new(width, height);
     app.draw(&mut canvas);
-    terminal
-        .draw(&canvas.render())
-        .map_err(|error| error.to_string())
+    terminal.draw(&canvas.render())
 }
 
 fn load_files() -> Loaded {
@@ -92,7 +89,7 @@ fn load_files() -> Loaded {
     Loaded::from_settings(&settings, system_text, paths(&settings))
 }
 
-fn perform(terminal: &mut Terminal, effect: &Effect) -> Result<String, String> {
+fn perform(terminal: &mut Terminal, effect: &Effect) -> Result<String, Error> {
     match effect {
         Effect::SaveUser(text) => save_user(text),
         Effect::SaveSystem(text) => on_terminal(terminal, false, || {
@@ -119,9 +116,9 @@ fn perform(terminal: &mut Terminal, effect: &Effect) -> Result<String, String> {
 fn on_terminal(
     terminal: &mut Terminal,
     pause: bool,
-    work: impl FnOnce() -> Result<String, String>,
-) -> Result<String, String> {
-    terminal.suspend().map_err(|error| error.to_string())?;
+    work: impl FnOnce() -> Result<String, Error>,
+) -> Result<String, Error> {
+    terminal.suspend()?;
     let outcome = work();
     if let Err(error) = &outcome {
         errln!("\n{error}");
@@ -129,14 +126,15 @@ fn on_terminal(
     if pause || outcome.is_err() {
         terminal.pause("Press Enter to return to Guardian.");
     }
-    terminal.resume().map_err(|error| error.to_string())?;
+    terminal.resume()?;
     outcome
 }
 
 /// Writes the user file atomically. A hand-written file is kept as
 /// `config.toml.bak` first, since rewriting drops its comments.
-fn save_user(text: &str) -> Result<String, String> {
-    let path = load::user_config_path().ok_or("cannot find the user config directory")?;
+fn save_user(text: &str) -> Result<String, Error> {
+    let path = load::user_config_path()
+        .ok_or_else(|| Error::Message("cannot find the user config directory".into()))?;
     if let Ok(existing) = fs::read_to_string(&path)
         && !existing.starts_with(HEADER)
     {
@@ -150,14 +148,14 @@ fn save_user(text: &str) -> Result<String, String> {
             .mode(0o600)
             .open(&backup)
             .and_then(|mut file| file.write_all(existing.as_bytes()))
-            .map_err(|error| error.to_string())?;
+            .at(&backup)?;
     }
     let written = setup::RealEnvironment.write_user(text)?;
     Ok(format!("Saved {}.", written.display()))
 }
 
-fn integration(terminal: &mut Terminal, plan: &Plan) -> Result<String, String> {
-    let paths = paths(&Settings::load()).ok_or("HOME is not set")?;
+fn integration(terminal: &mut Terminal, plan: &Plan) -> Result<String, Error> {
+    let paths = paths(&Settings::load()).ok_or_else(|| Error::Message("HOME is not set".into()))?;
     let done = if plan.needs_terminal() {
         on_terminal(terminal, false, || run_plan(&paths, plan))
     } else {
@@ -181,8 +179,9 @@ fn report(task: Task) -> String {
     }
 }
 
-fn forget_memory() -> Result<String, String> {
-    let root = Store::default_root().ok_or("no state directory (set HOME or XDG_STATE_HOME)")?;
+fn forget_memory() -> Result<String, Error> {
+    let root = Store::default_root()
+        .ok_or_else(|| Error::Message("no state directory (set HOME or XDG_STATE_HOME)".into()))?;
     if !root.is_dir() {
         return Ok("The review memory is already empty.".into());
     }
@@ -194,7 +193,7 @@ fn forget_memory() -> Result<String, String> {
         crate::makepkg_gate::forget_all(&root)?;
         Ok(count)
     };
-    let count = forget().map_err(|error| error.to_string())?;
+    let count = forget()?;
     crate::audit::forgot("everything (settings app)");
     Ok(format!(
         "Forgot {count} approved baseline(s) and every cached verdict."
@@ -211,27 +210,28 @@ fn editor() -> String {
 /// Opens a config file in the user's editor: the user file directly, the
 /// system file through `sudoedit`. Both are re-read (and re-validated)
 /// afterwards.
-fn edit(terminal: &mut Terminal, scope: Scope) -> Result<String, String> {
+fn edit(terminal: &mut Terminal, scope: Scope) -> Result<String, Error> {
     on_terminal(terminal, false, || match scope {
         Scope::User => {
-            let path = load::user_config_path().ok_or("cannot find the user config directory")?;
+            let path = load::user_config_path()
+                .ok_or_else(|| Error::Message("cannot find the user config directory".into()))?;
             ensure_user_file(&path)?;
             let editor = editor();
             let status = Command::new("/bin/sh")
                 .args(["-c", "exec $0 \"$1\"", &editor])
                 .arg(&path)
                 .status()
-                .map_err(|error| error.to_string())?;
+                .spawning(&editor)?;
             if status.success() {
                 Ok(format!("Edited {}; reloaded.", path.display()))
             } else {
-                Err(format!("{editor} exited with {status}"))
+                Err(Error::Message(format!("{editor} exited with {status}")))
             }
         }
         Scope::System => {
             let directory = Path::new(SYSTEM_PATH)
                 .parent()
-                .ok_or("invalid system path")?;
+                .ok_or_else(|| Error::Message("invalid system path".into()))?;
             let status = Command::new("/usr/bin/sudo")
                 .args([
                     "/usr/bin/install",
@@ -255,33 +255,33 @@ fn edit(terminal: &mut Terminal, scope: Scope) -> Result<String, String> {
                         Ok(status)
                     }
                 })
-                .map_err(|error| error.to_string())?;
+                .spawning("sudo")?;
             if status.success() {
                 crate::audit::settings_changed("the system settings file was edited");
                 Ok(format!("Edited {SYSTEM_PATH}; reloaded."))
             } else {
-                Err(format!("sudoedit exited with {status}"))
+                Err(Error::Message(format!("sudoedit exited with {status}")))
             }
         }
     })
 }
 
-fn ensure_user_file(path: &PathBuf) -> Result<(), String> {
+fn ensure_user_file(path: &PathBuf) -> Result<(), Error> {
     if path.exists() {
         return Ok(());
     }
     if let Some(directory) = path.parent() {
-        fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+        fs::create_dir_all(directory).at(directory)?;
     }
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
-        .map_err(|error| error.to_string())?;
+        .at(path)?;
     let example = SourceClass::Aur.name();
     write!(
         file,
         "{HEADER}\n# [class.{example}]\n# on_findings = \"block\"\n"
     )
-    .map_err(|error| error.to_string())
+    .at(path)
 }

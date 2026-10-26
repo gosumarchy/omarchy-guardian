@@ -40,7 +40,7 @@ fn run_with(status: Status, files: &[&str], severities: &[Severity]) -> AgentRun
 fn report_under(profile: Profile, class: SourceClass) -> Report {
     let mut report = report(class);
     if builtin(profile, class).ai_remarks == Remarks::Shown {
-        report.remark_classes.push(class);
+        report.scope.remark_classes.push(class);
     }
     report
 }
@@ -148,7 +148,7 @@ fn a_report_nobody_gave_remark_classes_counts_every_finding() {
     );
     assert!(
         report
-            .headline(FINDINGS)
+            .headline(FINDINGS, None)
             .0
             .starts_with("! REVIEW REQUIRED — 2 alert(s)")
     );
@@ -183,14 +183,14 @@ fn one_run_with_more_than_remarks_blocks_and_the_others_keep_theirs() {
         assert_eq!(report.counts().total(), alerts);
         let shown = format!(
             "{}\n{}",
-            report.verdict_box(FINDINGS, 100, Painter::plain()),
+            report.verdict_box(FINDINGS, None, 100, Painter::plain()),
             report.findings_text(FINDINGS, 100, Painter::plain())
         );
         assert!(shown.contains("AI remarks"), "{shown}");
         assert_eq!(shown.contains("AI findings"), alerts > 0, "{shown}");
         // The remarks say where they are from, and nothing calls a review
         // clear that another chunk stopped. The page agrees.
-        let page = html::section(&report, FINDINGS);
+        let page = html::section(&report, FINDINGS, None);
         for expected in [
             "Remarks: 2 low · from parts the AI review judged clear; they did not decide this",
             "From the parts the AI review judged clear. They did not decide this review.",
@@ -330,9 +330,9 @@ fn a_low_finding_where_a_local_rule_matched_is_no_remark() {
         .push(run_with(Status::Clear, &["b/.INSTALL"], &lows));
     assert_eq!(apart.decide(&standard), Decision::Warned);
     assert_eq!((apart.remark_count(), apart.counts().total()), (2, 1));
-    let (headline, _) = apart.headline(Decision::Warned);
+    let (headline, _) = apart.headline(Decision::Warned, None);
     assert!(headline.starts_with("! WARNED — 1 alert(s)"), "{headline}");
-    let boxed = apart.verdict_box(Decision::Warned, 120, Painter::plain());
+    let boxed = apart.verdict_box(Decision::Warned, None, 120, Painter::plain());
     assert!(
         boxed.contains("Remarks: 2 low · from parts the AI review judged clear"),
         "{boxed}"
@@ -400,7 +400,7 @@ fn every_class_a_run_touches_must_show_remarks() {
         report
             .file_classes
             .insert(files[1].into(), SourceClass::ThirdPartyRepo);
-        report.remark_classes = remark_classes.to_vec();
+        report.scope.remark_classes = remark_classes.to_vec();
         report
     };
     let standard = |class| builtin(Profile::Standard, class);
@@ -494,7 +494,7 @@ fn content_that_speaks_to_the_reviewer_is_never_a_remark() {
 fn three_clear_chunks_with_two_remarks(profile: Profile) -> Report {
     let mut report = report_under(profile, SourceClass::Aur);
     report.subject = "demo · upstream sources".into();
-    report.profile = "standard".into();
+    report.scope.profile = "standard".into();
     report.text_files_reviewed = 3;
     for (index, file) in ["build.sh", "fetch.sh", "warn.sh"].iter().enumerate() {
         let mut run = reviewed(Status::Clear, &[file]);
@@ -546,7 +546,7 @@ fn a_clear_review_with_remarks_reads_as_clear() {
     assert!(report.overruled_summary(10).is_empty());
 
     let plain = Painter::plain();
-    let banner = report.verdict_box(decision, 100, plain);
+    let banner = report.verdict_box(decision, None, 100, plain);
     let tables = report.findings_text(decision, 100, plain);
     let shown = format!("{banner}\n{tables}");
     for expected in [
@@ -576,7 +576,7 @@ fn a_clear_review_with_remarks_reads_as_clear() {
     assert!(!advice.contains("do not install"), "{advice}");
 
     // The saved page says the same.
-    let page = html::section(&report, decision);
+    let page = html::section(&report, decision, None);
     for expected in [
         r#"<span class="word green">CLEAR</span>"#,
         "0 HIGH · 0 MEDIUM · 0 LOW · 2 AI REMARK(S) · ",
@@ -608,7 +608,7 @@ fn under_strict_the_same_review_blocks_as_before() {
     let plain = Painter::plain();
     let shown = format!(
         "{}\n{}",
-        report.verdict_box(decision, 100, plain),
+        report.verdict_box(decision, None, 100, plain),
         report.findings_text(decision, 100, plain)
     );
     for expected in [
@@ -619,7 +619,7 @@ fn under_strict_the_same_review_blocks_as_before() {
         assert!(shown.contains(expected), "{expected}\n{shown}");
     }
     assert!(!shown.contains("emark"), "{shown}");
-    let page = html::section(&report, decision);
+    let page = html::section(&report, decision, None);
     assert!(page.contains("REVIEW REQUIRED") && page.contains("<h3>Findings</h3>"));
     assert!(!page.contains("REMARK"), "{page}");
 }

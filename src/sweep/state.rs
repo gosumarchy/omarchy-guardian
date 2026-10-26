@@ -315,7 +315,7 @@ pub(super) fn save_system_allowed(path: &Path, allowed: &Remembered) -> Result<(
     )
     .to_string();
     if json.len() as u64 > MAX_SYSTEM_LIST_BYTES {
-        return Err(Error::Refused(
+        return Err(Error::Message(
             "the list of allowed items is full; forget some first".into(),
         ));
     }

@@ -24,6 +24,7 @@ use super::{
 };
 use crate::error::Error;
 use crate::json::Json;
+use crate::report::FAILED;
 use crate::text::shown;
 use crate::time::utc;
 use crate::tools::{self, Limits};
@@ -59,35 +60,38 @@ fn is_time(text: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || " :-+.".contains(character))
 }
 
-pub(crate) fn parse(args: &[OsString]) -> Result<Options, String> {
+pub(crate) fn parse(args: &[OsString]) -> Result<Options, Error> {
     let mut options = Options {
         since: None,
         entries: DEFAULT_ENTRIES,
         json: false,
     };
-    let mut args = args.iter().map(|arg| arg.to_str().ok_or(USAGE));
+    let usage = || Error::Message(USAGE.into());
+    let mut args = args.iter().map(|arg| arg.to_str().ok_or_else(usage));
     while let Some(arg) = args.next() {
         match arg? {
             "--json" => options.json = true,
             "--since" => {
-                let time = args.next().ok_or(USAGE)??;
+                let time = args.next().ok_or_else(usage)??;
                 if !is_time(time) {
-                    return Err(format!(
+                    return Err(Error::Message(format!(
                         "--since takes a time as journalctl does (yesterday, 2026-01-31, -2h), not {time:?}"
-                    ));
+                    )));
                 }
                 options.since = Some(time.to_string());
             }
             "-n" => {
                 options.entries = args
                     .next()
-                    .ok_or(USAGE)??
+                    .ok_or_else(usage)??
                     .parse::<usize>()
                     .ok()
                     .filter(|count| (1..=MAX_ENTRIES).contains(count))
-                    .ok_or_else(|| format!("-n takes a number from 1 to {MAX_ENTRIES}"))?;
+                    .ok_or_else(|| {
+                        Error::Message(format!("-n takes a number from 1 to {MAX_ENTRIES}"))
+                    })?;
             }
-            _ => return Err(USAGE.into()),
+            _ => return Err(usage()),
         }
     }
     Ok(options)
@@ -346,7 +350,7 @@ pub(crate) fn command(options: &Options) -> ExitCode {
         Ok(read) => read,
         Err(reason) => {
             errln!("omarchy-guardian log: cannot read the journal: {reason}");
-            return ExitCode::from(2);
+            return ExitCode::from(FAILED);
         }
     };
     let lines = lines(&output, user::real_uid());
