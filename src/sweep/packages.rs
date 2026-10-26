@@ -22,8 +22,15 @@
 //! - A package that may have a private name (from another registry or
 //!   index, installed from git, an address or a local path, a crate not
 //!   from crates.io, anything under a pip or uv extra index) is never sent
-//!   to OSV, and every sweep says it as not checked. Coverage gives way to
-//!   the rule that nothing private leaves the machine.
+//!   to OSV, as far as the files the tools leave behind tell, and every
+//!   sweep says it as not checked. Coverage gives way to that rule. The
+//!   files cannot tell these, which are sent like any other package:
+//!   - `npm i -g` of git or a tarball, under a name whose registry is the
+//!     public one (npm records no source for a global install);
+//!   - `pip install --index-url` given on the command line, into a Python
+//!     mise installed or a pipx environment too old to have a record;
+//!   - settings given on a tool's command line, such as `cargo install
+//!     --config 'source.crates-io.replace-with=...'`.
 //! - `sweep allow` on a package item runs the OSV lookup again: the item
 //!   exists only as a result of a lookup, and nothing of OSV's answers is
 //!   kept to find it from.

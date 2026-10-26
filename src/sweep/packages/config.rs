@@ -11,6 +11,7 @@
 //! decide that.
 
 use std::env;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Component, Path};
@@ -52,6 +53,16 @@ const UV_INDEX_VARIABLES: &[&str] = &[
     "UV_FIND_LINKS",
 ];
 
+/// The npm settings the inventory reads, besides each scope's
+/// `@scope:registry`.
+const NPM_KEYS: &[&str] = &[
+    "prefix",
+    "globalconfig",
+    "userconfig",
+    "ignore-scripts",
+    "registry",
+];
+
 /// The hosts of npm's public registry. Yarn's serves the same packages
 /// under the same names.
 const NPM_REGISTRIES: &[&str] = &["registry.npmjs.org", "registry.yarnpkg.com"];
@@ -59,8 +70,16 @@ const NPM_REGISTRIES: &[&str] = &["registry.npmjs.org", "registry.yarnpkg.com"];
 /// The hosts of the Python Package Index.
 const PYPI_HOSTS: &[&str] = &["pypi.org", "pypi.python.org", "files.pythonhosted.org"];
 
-/// The pip settings that bring packages from somewhere other than the Python Package Index.
-const PIP_INDEX_KEYS: &[&str] = &["index-url", "extra-index-url", "find-links"];
+/// The pip settings that bring packages from somewhere other than the
+/// Python Package Index, with those that name a requirements or
+/// constraints file, which can set an index.
+const PIP_INDEX_KEYS: &[&str] = &[
+    "index-url",
+    "extra-index-url",
+    "find-links",
+    "requirement",
+    "constraint",
+];
 
 /// pip's long options that do the same, as pipx records them, with those
 /// that name a requirements or constraints file, which can set an index.
@@ -77,7 +96,6 @@ const PIP_INDEX_SHORT_OPTIONS: &[char] = &['i', 'f', 'r', 'c'];
 
 /// Where the tools keep what they installed and their configuration,
 /// relative to the root, with the settings the environment gives.
-#[derive(Debug)]
 pub(super) struct Places {
     /// mise's data directory (`MISE_DATA_DIR`).
     pub(super) mise: Option<String>,
@@ -106,10 +124,35 @@ pub(super) struct Places {
     pub(super) uv_env: Vec<String>,
     /// npm's default global prefix where no `prefix` is set (`PREFIX`).
     pub(super) npm_global_prefix: Option<String>,
-    /// The variables that name a configuration file by a path that is not
-    /// absolute (`npm_config_userconfig`, `PIP_CONFIG_FILE`,
-    /// `UV_CONFIG_FILE`), with their value: the file is not found here.
+    /// The variables that name a configuration file or a tool's directory
+    /// by a path that is not absolute (`npm_config_userconfig`,
+    /// `PIP_CONFIG_FILE`, `UV_CONFIG_FILE`, `CARGO_HOME`, `PIPX_HOME`,
+    /// `MISE_DATA_DIR`), with their value: it is not found here.
     pub(super) unfound: Vec<(&'static str, String)>,
+}
+
+impl fmt::Debug for Places {
+    /// Names the environment's settings without their values, which may be
+    /// addresses that hold a password.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let keys = |settings: &[(String, String)]| -> Vec<String> {
+            settings.iter().map(|(key, _)| key.clone()).collect()
+        };
+        f.debug_struct("Places")
+            .field("mise", &self.mise)
+            .field("cargo", &self.cargo)
+            .field("pipx", &self.pipx)
+            .field("npmrc", &self.npmrc)
+            .field("pip", &self.pip)
+            .field("uv", &self.uv)
+            .field("home", &self.home)
+            .field("npm_env", &keys(&self.npm_env))
+            .field("pip_env", &keys(&self.pip_env))
+            .field("uv_env", &self.uv_env)
+            .field("npm_global_prefix", &self.npm_global_prefix)
+            .field("unfound", &self.unfound)
+            .finish()
+    }
 }
 
 impl Places {
@@ -149,14 +192,17 @@ impl Places {
     fn from_variables(home: Option<&str>, variables: &[(String, String)]) -> Self {
         let mut places = Self::defaults(home);
         for (name, value) in variables {
-            let place = match name.as_str() {
-                "MISE_DATA_DIR" => &mut places.mise,
-                "CARGO_HOME" => &mut places.cargo,
-                "PIPX_HOME" => &mut places.pipx,
+            let (name, place) = match name.as_str() {
+                "MISE_DATA_DIR" => ("MISE_DATA_DIR", &mut places.mise),
+                "CARGO_HOME" => ("CARGO_HOME", &mut places.cargo),
+                "PIPX_HOME" => ("PIPX_HOME", &mut places.pipx),
                 _ => continue,
             };
-            if let Some(path) = from_root(value) {
-                *place = Some(path);
+            // The tool would resolve a relative path against where it ran,
+            // which is not known: nothing is read there, and that is said.
+            *place = from_root(value);
+            if place.is_none() {
+                places.unfound.push((name, value.clone()));
             }
         }
         places.npm_env = npm_variables(variables);
@@ -165,7 +211,13 @@ impl Places {
             .find(|(name, value)| name == "PREFIX" && !value.is_empty())
             .map(|(_, value)| value.clone());
         places.pip_env = pip_variables(variables);
-        if let Some((_, file)) = places.npm_env.iter().find(|(key, _)| key == "userconfig") {
+        // npm takes the last of several spellings of one variable.
+        if let Some((_, file)) = places
+            .npm_env
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "userconfig")
+        {
             places.npmrc = from_root(file);
             if places.npmrc.is_none() {
                 places.unfound.push(("npm_config_userconfig", file.clone()));
@@ -192,13 +244,20 @@ impl Places {
                 .into_iter()
                 .flat_map(|dirs| dirs.split(':')),
         );
+        // A file already read (a default, or a global one) is read once.
+        let add = |files: &mut Vec<String>, globals: &[&str], file: Option<String>| {
+            if let Some(file) = file
+                && !files.contains(&file)
+                && !globals.contains(&file.as_str())
+            {
+                files.push(file);
+            }
+        };
         for directory in config_dirs {
-            places
-                .pip
-                .extend(from_root(&format!("{directory}/pip/pip.conf")));
-            places
-                .uv
-                .extend(from_root(&format!("{directory}/uv/uv.toml")));
+            let pip = from_root(&format!("{directory}/pip/pip.conf"));
+            add(&mut places.pip, GLOBAL_PIP, pip);
+            let uv = from_root(&format!("{directory}/uv/uv.toml"));
+            add(&mut places.uv, GLOBAL_UV, uv);
         }
         for (name, files) in [
             ("PIP_CONFIG_FILE", &mut places.pip),
@@ -223,8 +282,10 @@ fn npm_variables(variables: &[(String, String)]) -> Vec<(String, String)> {
         .filter_map(|(name, value)| {
             let lowered = name.to_ascii_lowercase();
             let key = lowered.strip_prefix("npm_config_")?.replace('_', "-");
-            // npm skips a variable set to nothing.
-            (!value.is_empty()).then(|| (key, value.clone()))
+            // npm skips a variable set to nothing. Only the keys read here
+            // are kept: the others include registry tokens.
+            let used = NPM_KEYS.contains(&key.as_str()) || key.ends_with(":registry");
+            (used && !value.is_empty()).then(|| (key, value.clone()))
         })
         .collect()
 }
@@ -283,10 +344,11 @@ enum Scripts {
 /// The registries one node's npm is set to use.
 #[derive(Debug, Default)]
 struct NpmRegistries {
-    /// The registry packages come from, where one is set.
-    registry: Option<String>,
-    /// The registry of each scope that has its own (`@scope:registry`).
-    scoped: Vec<(String, String)>,
+    /// Whether the registry packages come from is a public one, where one
+    /// is set. Only that is kept: an address may hold a password.
+    registry: Option<bool>,
+    /// The same for each scope that has its own (`@scope:registry`).
+    scoped: Vec<(String, bool)>,
 }
 
 impl NpmConfig {
@@ -398,11 +460,10 @@ impl NpmConfig {
                 self.not_read(format!("/{file}"));
                 Vec::new()
             }
-            ConfigFile::Text(text) => text
-                .lines()
-                .filter_map(setting)
-                .map(|(key, value)| (key.to_string(), value.to_string()))
-                .collect(),
+            ConfigFile::Text(text) => npm_settings(&text).unwrap_or_else(|| {
+                self.not_read(format!("/{file}"));
+                Vec::new()
+            }),
         }
     }
 
@@ -422,14 +483,16 @@ impl NpmConfig {
             match key.as_str() {
                 "prefix" => prefix = Some(value.clone()),
                 "ignore-scripts" => ignore_scripts = value == "true",
-                "registry" => registries.registry = Some(value.clone()),
+                "registry" => registries.registry = Some(is_on(value, NPM_REGISTRIES)),
                 _ => {
                     if let Some(scope) = key
                         .strip_suffix(":registry")
                         .filter(|scope| scope.starts_with('@'))
                     {
                         registries.scoped.retain(|(known, _)| known != scope);
-                        registries.scoped.push((scope.to_string(), value.clone()));
+                        registries
+                            .scoped
+                            .push((scope.to_string(), is_on(value, NPM_REGISTRIES)));
                     }
                 }
             }
@@ -464,11 +527,11 @@ impl NpmConfig {
             .map(|(scope, _)| scope)
             .filter(|scope| scope.starts_with('@'));
         self.nodes.iter().all(|node| {
-            let registry = scope
+            scope
                 .and_then(|scope| node.scoped.iter().find(|(known, _)| known == scope))
-                .map(|(_, registry)| registry)
-                .or(node.registry.as_ref());
-            registry.is_none_or(|registry| is_on(registry, NPM_REGISTRIES))
+                .map(|(_, public)| *public)
+                .or(node.registry)
+                .unwrap_or(true)
         })
     }
 }
@@ -682,8 +745,10 @@ pub(super) fn pip_file_other_index(text: &str) -> bool {
             None
         } else {
             trimmed.split_once(['=', ':']).map(|(key, value)| {
+                // pip takes an option's name with or without its `--`.
                 let key = key.trim().to_ascii_lowercase().replace('_', "-");
-                let index = PIP_INDEX_KEYS.contains(&key.as_str());
+                let key = key.strip_prefix("--").unwrap_or(&key);
+                let index = PIP_INDEX_KEYS.contains(&key);
                 (indent, index, value.trim().to_string())
             })
         };
@@ -783,12 +848,38 @@ fn setting(line: &str) -> Option<(&str, &str)> {
         return None;
     }
     let at = line.find('=')?;
-    let (key, value) = (line[..at].trim(), line[at + 1..].trim());
-    let value = match value.chars().next() {
-        Some(quote @ ('"' | '\'')) => value[1..].split(quote).next().unwrap_or_default(),
-        _ => value.split([';', '#']).next().unwrap_or_default().trim(),
-    };
-    Some((key, value))
+    Some((unquoted(&line[..at]), unquoted(&line[at + 1..])))
+}
+
+/// A key or value of an npm configuration file as npm's `ini` reads it: a
+/// quoted one taken whole, else up to a `;` or `#`.
+fn unquoted(text: &str) -> &str {
+    let text = text.trim();
+    match text.chars().next() {
+        Some(quote @ ('"' | '\'')) => text[1..].split(quote).next().unwrap_or_default(),
+        _ => text.split([';', '#']).next().unwrap_or_default().trim(),
+    }
+}
+
+/// The top-level settings of an npm configuration file, or `None` where
+/// npm would read a key that is not known here. A key under a `[section]`
+/// is not one of npm's settings, so reading stops at the first. npm
+/// expands `${...}` in a key from its own environment.
+fn npm_settings(text: &str) -> Option<Vec<(String, String)>> {
+    let mut settings = Vec::new();
+    for line in text.lines() {
+        if line.trim().starts_with('[') {
+            break;
+        }
+        let Some((key, value)) = setting(line) else {
+            continue;
+        };
+        if key.contains("${") {
+            return None;
+        }
+        settings.push((key.to_string(), value.to_string()));
+    }
+    Some(settings)
 }
 
 /// A path npm's configuration gives (`prefix`, `globalconfig`), relative
@@ -826,8 +917,8 @@ fn is_on(url: &str, hosts: &[&str]) -> bool {
 mod tests {
     use super::{
         IndexConfig, NpmConfig, Places, Scripts, from_root, has_index_argument, is_on, is_uv_index,
-        npm_prefix, npm_variables, pip_file_other_index, pip_variables, pipx_metadata_other_index,
-        setting, uv_receipt_other_index,
+        npm_prefix, npm_settings, npm_variables, pip_file_other_index, pip_variables,
+        pipx_metadata_other_index, setting, uv_receipt_other_index,
     };
 
     #[test]
@@ -882,6 +973,12 @@ mod tests {
         .map(|(name, value)| (name.to_string(), value.to_string()));
         let mut with_empty = variables.to_vec();
         with_empty.push(("npm_config_registry".to_string(), String::new()));
+        // Settings not read here, tokens among them, are not kept.
+        with_empty.push(("npm_config__auth".to_string(), "secret".to_string()));
+        with_empty.push((
+            "npm_config_//r.example/:_authToken".to_string(),
+            "secret".to_string(),
+        ));
         assert_eq!(
             npm_variables(&with_empty),
             [
@@ -896,6 +993,50 @@ mod tests {
                 "https://pypi.example/simple".to_string()
             )]
         );
+        let requirement = [("PIP_REQUIREMENT".to_string(), "/srv/r.txt".to_string())];
+        assert_eq!(pip_variables(&requirement).len(), 1);
+    }
+
+    #[test]
+    fn npm_files_are_read_only_to_their_first_section_and_fail_closed() {
+        assert_eq!(setting("\"registry\" = x"), Some(("registry", "x")));
+        assert_eq!(
+            npm_settings("registry=a\n[corp]\nregistry=b\n"),
+            Some(vec![("registry".to_string(), "a".to_string())])
+        );
+        assert_eq!(
+            npm_settings("${SCOPE}:registry=https://npm.corp.example/\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_environment_is_kept_without_its_values_in_debug_output() {
+        let variables = [
+            ("PIP_INDEX_URL", "https://user:pw@pypi.corp.example/simple"),
+            ("npm_config_registry", "https://user:pw@npm.corp.example/"),
+            ("npm_config_userconfig", "/a/npmrc"),
+            ("NPM_CONFIG_USERCONFIG", "/b/npmrc"),
+            ("XDG_CONFIG_HOME", "/home/u/.config"),
+            ("XDG_CONFIG_DIRS", "/etc/xdg"),
+            ("CARGO_HOME", "cargo"),
+        ]
+        .map(|(name, value)| (name.to_string(), value.to_string()));
+
+        let places = Places::from_variables(Some("home/u"), &variables);
+
+        assert!(!format!("{places:?}").contains("pw@"));
+        // npm takes the last spelling of a variable.
+        assert_eq!(places.npmrc.as_deref(), Some("b/npmrc"));
+        // XDG paths that repeat a default or global one are read once.
+        assert_eq!(
+            places.pip,
+            ["home/u/.config/pip/pip.conf", "home/u/.pip/pip.conf"]
+        );
+        assert_eq!(places.uv, ["home/u/.config/uv/uv.toml"]);
+        // A relative tool home is not replaced by the default.
+        assert_eq!(places.cargo, None);
+        assert_eq!(places.unfound, [("CARGO_HOME", "cargo".to_string())]);
     }
 
     #[test]
@@ -993,6 +1134,8 @@ mod tests {
             "[global]\nextra-index-url =\n    https://pypi.corp.example/simple\n",
             "[install]\nfind_links: /srv/wheels\n",
             "[global]\n  index-url =\n      https://pypi.corp.example/simple\n",
+            "[global]\n--index-url = https://pypi.corp.example/simple\n",
+            "[install]\nrequirement = /srv/requirements.txt\n",
             "[global]\nextra-index-url = https://pypi.org/simple#x https://pypi.corp.example/simple\n",
             "[global]\nindex-url = \"https://pypi.org/simple\" https://pypi.corp.example/simple\n",
         ] {

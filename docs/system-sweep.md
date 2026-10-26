@@ -437,7 +437,8 @@ What is read and never run (links below these places are not followed, see below
   only the program it built, with no module path and version beside it,
   although OSV has a Go ecosystem.
 
-The variables are read from the sweep's own environment: the daily timer's
+A `CARGO_HOME`, `PIPX_HOME` or `MISE_DATA_DIR` that is not an absolute
+path is said, and nothing is read in its place. The variables are read from the sweep's own environment: the daily timer's
 sweep gets them only where they are set for your systemd user session.
 
 A package whose name may be private is not sent anywhere, as far as the files
@@ -463,8 +464,10 @@ from PyPI, crates from crates.io.
   file is there and cannot be read, a `prefix` or `globalconfig` is a path
   npm would resolve against its working directory (relative, or with a
   variable other than `~/` or `${HOME}/`), `npm_config_userconfig` or
-  `PREFIX` is not absolute, or more than 100 nodes are installed, no npm
-  package is sent: a private registry may be set where it was not read.
+  `PREFIX` is not absolute, a file has a `${...}` in a key, or more than 100
+  nodes are installed, no npm package is sent: a private registry may be
+  set where it was not read. Settings under a `[section]` of a file are not
+  npm's own and are not read, and keys may be quoted, as in npm.
 - pip: a package installed from an address or a local directory (it has a
   `direct_url.json`) is left out. So is every package of a pipx environment
   installed with another index or a requirements or constraints file
@@ -478,7 +481,9 @@ from PyPI, crates from crates.io.
   `XDG_CONFIG_DIRS`, `PIP_CONFIG_FILE`, `PIP_INDEX_URL` and the like) sets
   `index-url`, `extra-index-url` or `find-links` to anything but PyPI (an
   empty value, and a value continued on lines indented deeper than its key,
-  included). A
+  included; a key may be written with its `--`), or sets `requirement` or
+  `constraint` at all (`PIP_REQUIREMENT`, `PIP_CONSTRAINT`), since such a
+  file can name an index. A
   `PIP_CONFIG_FILE` that is not an absolute path counts as a file that
   cannot be read. pip keeps no record of an index
   given on its command line: a package installed with `pip install
@@ -503,7 +508,17 @@ from PyPI, crates from crates.io.
   known and not read.
 
 What is left out this way is said as not checked, so a machine with such
-packages has an incomplete sweep.
+packages has an incomplete sweep. This holds as far as the files the tools
+leave behind tell. They cannot tell these, which are sent like any other
+package:
+
+- a global npm package installed from git or a tarball (`npm i -g
+  git+...`) under a name whose registry is the public one;
+- a Python package installed with `pip install --index-url` given on the
+  command line, into a Python mise installed or a pipx environment too old
+  to have a `pipx_metadata.json`;
+- a setting given on a tool's command line, such as `cargo install --config
+  'source.crates-io.replace-with=...'`.
 
 At every sweep the rest of the inventory goes to OSV: the ecosystem, the name
 and the version of each package, in requests of up to 500 packages per
@@ -549,10 +564,10 @@ winning over the one before (your `~/.npmrc` or the file
 installs, which is how most malicious npm packages act, and how to turn them
 off (`npm config set ignore-scripts true`). It is said once, and again should
 it stop and come back. Only `prefix`, `globalconfig`, `ignore-scripts`, `registry` and the
-scopes' registries are taken from npm's files, only the index settings
-from pip's and uv's, and only the `[source]` and `include` keys from
-cargo's; these files hold registry tokens, and nothing of them is shown or
-sent.
+scopes' registries are taken from npm's files and `npm_config_*`
+variables, only the index settings from pip's and uv's, and only the
+`[source]` and `include` keys from cargo's; these hold registry tokens,
+and nothing of them is shown or sent.
 
 ### Guardian's own units
 

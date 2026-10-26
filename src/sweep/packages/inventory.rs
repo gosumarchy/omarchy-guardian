@@ -139,6 +139,14 @@ pub(super) fn collect(root: &Path, places: &Places) -> Inventory {
 
     let npm_installed = mise_node || fs::symlink_metadata(root.join("usr/bin/npm")).is_ok();
     let mut inventory = walk.finish(npm_installed && !npm.ignore_scripts);
+    for (name, value) in &places.unfound {
+        if ["CARGO_HOME", "PIPX_HOME", "MISE_DATA_DIR"].contains(name) {
+            inventory.unchecked.push(format!(
+                "{name} is not an absolute path ({}), so what is installed there was not read",
+                text::shown(value)
+            ));
+        }
+    }
     // Only the path is said: these files hold registry tokens.
     for file in &npm.unreadable {
         inventory.unchecked.push(format!(
@@ -660,15 +668,20 @@ impl<'a> Walk<'a> {
     fn mise(&mut self, installs: &str) -> bool {
         let mut node = false;
         for (tool, kind) in self.list(installs) {
-            if kind != Entry::Directory {
-                continue;
-            }
             // The other backends leave no name and version of a
             // registry's behind (`go:` keeps only the program it built).
             let Some(backend) = Backend::of(&tool) else {
                 continue;
             };
             let directory = format!("{installs}/{tool}");
+            match kind {
+                Entry::Directory => {}
+                Entry::Link => {
+                    self.linked.push(directory);
+                    continue;
+                }
+                Entry::Other => continue,
+            }
             // mise links the short versions (`22`, `latest`) to a full
             // one, which is read under its own name.
             for (version, kind) in self.list(&directory) {

@@ -1202,3 +1202,107 @@ fn crates_from_another_sparse_registry_and_cargo_config_elsewhere_are_left_out()
         fs::remove_file(root.join(file)).unwrap();
     }
 }
+
+#[test]
+fn what_npm_would_find_elsewhere_leaves_npm_packages_out() {
+    let root = TempDir::new("packages-npm-unknown");
+    let root = root.path();
+    npm(root, "usr/lib/node_modules/system", "system", "1.0.0");
+    assert_eq!(
+        found(&inventory::collect(root, &Places::defaults(Some(HOME)))).len(),
+        1
+    );
+
+    // A PREFIX npm would resolve against where it runs.
+    let relative = Places {
+        npm_global_prefix: Some("relative/prefix".to_string()),
+        ..Places::defaults(Some(HOME))
+    };
+    let inventory = inventory::collect(root, &relative);
+    assert_eq!(found(&inventory), []);
+    assert!(
+        inventory
+            .unchecked
+            .join("\n")
+            .contains("the prefix PREFIX names (relative/prefix)"),
+        "{:?}",
+        inventory.unchecked
+    );
+
+    // A key npm would expand from its own environment.
+    write(
+        root,
+        "home/u/.npmrc",
+        "${SCOPE}:registry=https://npm.corp.example/\n",
+    );
+    let inventory = inventory::collect(root, &Places::defaults(Some(HOME)));
+    assert_eq!(found(&inventory), []);
+    assert!(
+        inventory
+            .unchecked
+            .join("\n")
+            .contains("/home/u/.npmrc could not be read")
+    );
+}
+
+#[test]
+fn more_than_a_hundred_mise_nodes_leave_npm_packages_out() {
+    let root = TempDir::new("packages-many-nodes");
+    let root = root.path();
+    npm(root, "usr/lib/node_modules/system", "system", "1.0.0");
+    let installs = "home/u/.local/share/mise/installs/node";
+    for minor in 0..100 {
+        fs::create_dir_all(root.join(format!("{installs}/22.{minor}.0"))).unwrap();
+    }
+    let places = Places::defaults(Some(HOME));
+    assert_eq!(found(&inventory::collect(root, &places)).len(), 1);
+
+    fs::create_dir_all(root.join(format!("{installs}/22.100.0"))).unwrap();
+    let inventory = inventory::collect(root, &places);
+    assert_eq!(found(&inventory), []);
+    assert!(
+        inventory
+            .unchecked
+            .join("\n")
+            .contains("the nodes mise installed past the first 100"),
+        "{:?}",
+        inventory.unchecked
+    );
+}
+
+#[test]
+fn a_relative_tool_home_and_a_linked_mise_tool_are_said() {
+    let root = TempDir::new("packages-homes");
+    let root = root.path();
+    fs::create_dir_all(root.join("elsewhere/ruff")).unwrap();
+    fs::create_dir_all(root.join("home/u/.local/share/mise/installs")).unwrap();
+    symlink(
+        root.join("elsewhere/ruff"),
+        root.join("home/u/.local/share/mise/installs/pipx-ruff"),
+    )
+    .unwrap();
+    let places = Places {
+        cargo: None,
+        unfound: vec![("CARGO_HOME", "cargo".to_string())],
+        ..Places::defaults(Some(HOME))
+    };
+
+    let inventory = inventory::collect(root, &places);
+
+    assert!(
+        inventory
+            .unchecked
+            .join("\n")
+            .contains("CARGO_HOME is not an absolute path (cargo)"),
+        "{:?}",
+        inventory.unchecked
+    );
+    assert!(
+        inventory
+            .notes
+            .join("\n")
+            .contains("/home/u/.local/share/mise/installs/pipx-ruff"),
+        "{:?}",
+        inventory.notes
+    );
+}
