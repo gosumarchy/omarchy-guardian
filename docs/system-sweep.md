@@ -301,7 +301,9 @@ reviewed too, except where it is kept from the AI, which is said below.
 - **Flatpak.** Flatpak overrides that open the sandbox to the home or the
   host, or let an app talk to `org.freedesktop.Flatpak`.
 - **Editor.** Editor start-up files (`~/.config/nvim/init.lua` and `init.vim`,
-  `plugin/`, `after/plugin/` and `lua/`, `~/.vimrc`, `~/.vim/plugin`), and in
+  `plugin/`, `after/plugin/` and `lua/`, `~/.local/share/nvim/site/plugin/`,
+  `after/plugin/`, `ftdetect/` and `pack/*/start/*/plugin/`, `~/.vimrc`,
+  `~/.vim/plugin`), and in
   the `settings.json` of VS Code and its forks (Code - OSS, VSCodium, Cursor)
   the settings that run a folder's tasks unasked, the environment and shell of
   its terminal (`terminal.integrated.env.*` with `LD_PRELOAD`, `PATH` and the
@@ -464,8 +466,10 @@ After the upgrade that adds plugins to the sweep, each plugin shows once as
 new, in `--diff` and in the daily notification; that sweep takes them as they
 are.
 
-Not covered: plugins of other managers (packer, vim-plug, Neovim's own
-`pack/*/start` under your data directory), a lazy.nvim `root` other than the
+Not covered here: plugins of other managers (packer, vim-plug, Neovim's own
+`pack/*/start` under your data directory, whose `plugin/` files the
+Editor start-up files cover, see [More that decides what
+runs](#more-that-decides-what-runs)), a lazy.nvim `root` other than the
 default, specs built by code, the other files of a plugin (data, documentation,
 anything not executable and not named above), which count for whether it
 changed but are neither sent nor reported, and what lazy.nvim fetches when a
