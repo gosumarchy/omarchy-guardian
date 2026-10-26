@@ -378,7 +378,8 @@ with each extension's `manifest.json` for its name, version and update URL
 only where there is no directory).
 For Firefox (`~/.mozilla/firefox`, `~/.config/mozilla/firefox`) and Zen
 (`~/.zen`) it reads each profile's `extensions.json`. The browsers' own
-extensions (Chromium's component extensions, Firefox's built-in add-ons) and
+extensions (Chromium's component extensions, unless the preferences say one
+loads from the profile, and Firefox's built-in add-ons) and
 Firefox themes, dictionaries and language packs are not listed.
 
 Each extension is an item of its own, named by its profile and id
@@ -392,6 +393,8 @@ a note:
 | Loaded unpacked (developer mode, `--load-extension`, a temporary add-on) | `risky-configuration`, with the directory |
 | Loaded unpacked from a directory whose every file a package installed, unchanged | trusted, only counted (Omarchy loads its own extensions this way) |
 | Installed in Firefox without Mozilla's signature | `risky-configuration` |
+| Installed in Firefox for every user (`/usr/lib/mozilla/extensions` and the like) with no source, from a file a package installed, unchanged | trusted, only counted |
+| The same, from a file no package installed as it is | `risky-configuration` |
 | Its manifest cannot be read, and the browser marks it as from its store | listed with a note, no alert; the sweep is incomplete |
 | Its manifest cannot be read, and the browser does not mark it as from its store | `risky-configuration`; the sweep is incomplete |
 

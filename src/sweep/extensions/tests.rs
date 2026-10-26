@@ -610,3 +610,103 @@ fn extensions_are_kept_from_the_review() {
         [RuleId::RiskyConfiguration, RuleId::RiskyConfiguration]
     );
 }
+
+#[test]
+fn a_browser_extension_loaded_from_the_profile_or_the_whole_root_is_alerted() {
+    let dir = TempDir::new("sweep-extensions-component");
+    let root = dir.path();
+    let profile = format!("{CHROMIUM}/Default");
+    write(
+        root,
+        &format!("{profile}/Extensions/{COMPONENT_ID}/1/manifest.json"),
+        r#"{"name":"Not the browser's"}"#,
+    );
+    let settings = [
+        // Marked as the browser's own, but loaded from the profile.
+        format!(r#""{COMPONENT_ID}":{{"location":5,"path":"{COMPONENT_ID}/1"}}"#),
+        // The browser's own, from its install directory.
+        format!(r#""{PACKAGED_ID}":{{"location":10,"path":"/usr/lib/chromium/resources/x"}}"#),
+        // Unpacked from the whole root.
+        format!(r#""{UNPACKED_ID}":{{"location":4,"path":"/"}}"#),
+    ];
+    write(
+        root,
+        &format!("{profile}/Preferences"),
+        &format!(
+            r#"{{"extensions":{{"settings":{{{}}}}}}}"#,
+            settings.join(",")
+        ),
+    );
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: Some(HOME),
+        index: &index,
+        origin: Origin::System,
+    };
+    let (items, unchecked) = found(&scope);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert_eq!(items.len(), 2, "{items:?}");
+    assert_eq!(
+        by_id(&items, COMPONENT_ID).unwrap().alerts[0].1,
+        "installed from outside the Chrome Web Store"
+    );
+    assert!(
+        by_id(&items, UNPACKED_ID).unwrap().alerts[0]
+            .1
+            .starts_with("loaded unpacked from / (")
+    );
+}
+
+#[test]
+fn a_firefox_extension_for_every_user_is_trusted_only_as_a_package_installed_it() {
+    let dir = TempDir::new("sweep-extensions-system-wide");
+    let root = dir.path();
+    let shipped =
+        "usr/lib/mozilla/extensions/{ec8030f7-c20a-464f-9b0e-13a3a9e97384}/shipped@example.xpi";
+    let dropped =
+        "usr/lib/mozilla/extensions/{ec8030f7-c20a-464f-9b0e-13a3a9e97384}/dropped@example.xpi";
+    write(root, shipped, "an add-on");
+    write(root, dropped, "another add-on");
+    let mut index = PackageIndex::with_foreign(HashSet::new());
+    index.add_for_test(
+        "firefox-extension",
+        &format!(
+            "./{shipped} type=file mode=644 sha256digest={}\n",
+            Sha256::digest(b"an add-on")
+        ),
+        &[],
+    );
+    let addon = |id: &str, path: &str| {
+        format!(
+            r#"{{"id":"{id}","type":"extension","location":"app-system-share","signedState":2,"path":"/{path}"}}"#
+        )
+    };
+    write(
+        root,
+        "home/u/.mozilla/firefox/abc.default/extensions.json",
+        &format!(
+            r#"{{"addons":[{},{}]}}"#,
+            addon("shipped@example", shipped),
+            addon("dropped@example", dropped)
+        ),
+    );
+    let scope = Scope {
+        root,
+        home: Some(HOME),
+        index: &index,
+        origin: Origin::System,
+    };
+    let (items, _) = found(&scope);
+    let shipped_item = by_id(&items, "shipped@example").unwrap();
+    assert!(shipped_item.alerts.is_empty(), "{:?}", shipped_item.alerts);
+    assert_eq!(shipped_item.tier, Tier::Vendor);
+    let dropped_item = by_id(&items, "dropped@example").unwrap();
+    assert!(
+        dropped_item.alerts[0]
+            .1
+            .starts_with("installed from outside the addons.mozilla.org: for every user"),
+        "{:?}",
+        dropped_item.alerts
+    );
+}

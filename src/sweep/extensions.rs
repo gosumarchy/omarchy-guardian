@@ -120,6 +120,11 @@ const UNPACKED: &[u64] = &[4, 8];
 /// Firefox's locations for the add-ons that ship with it.
 const BUILT_IN: &[&str] = &["app-builtin", "app-system-defaults", "app-system-addons"];
 
+/// Firefox's locations for add-ons installed for every user of the system
+/// (`/usr/lib/mozilla/extensions`, `/usr/share/mozilla/extensions`), which
+/// a package can ship.
+const SYSTEM_WIDE: &[&str] = &["app-system-share", "app-global"];
+
 /// The largest preferences file read (arbitrary: profiles seen are under
 /// one MiB), and the largest manifest or message catalogue.
 const MAX_PREFERENCES: u64 = 32 * 1024 * 1024;
@@ -148,6 +153,9 @@ enum Source {
     /// Marked by the browser as from its store, where the manifest that
     /// names where it updates from could not be read.
     Unread,
+    /// Installed in Firefox for every user, from the file or directory
+    /// given (relative to the root), with no source it came from.
+    SystemWide(String),
 }
 
 /// One extension of one profile.
@@ -165,7 +173,7 @@ struct Extension {
     /// What could not be read of it, as notes for its item.
     notes: Vec<String>,
     /// Why its manifest could not be read, where it could not.
-    unread: Option<String>,
+    unread: Option<Error>,
 }
 
 /// What the extension checks found.
@@ -224,9 +232,9 @@ pub(super) fn check(scope: &Scope<'_>) -> Extensions {
                 // An unpacked one updates from nowhere: its directory is
                 // what is reported.
                 let unpacked = matches!(extension.source, Source::Unpacked(_));
-                if let (Some(reason), false) = (&extension.unread, unpacked) {
+                if let (Some(error), false) = (&extension.unread, unpacked) {
                     found.unchecked.push(format!(
-                        "{reason}; where /{profile}#extension:{} updates from was not checked",
+                        "{error}; where /{profile}#extension:{} updates from was not checked",
                         extension.id
                     ));
                 }
@@ -372,9 +380,6 @@ fn chromium_extension(
     entry: &Json,
 ) -> Option<Extension> {
     let location = entry.get("location").and_then(Json::as_u64);
-    if location.is_some_and(|location| COMPONENT.contains(&location)) {
-        return None;
-    }
     let unpacked = location.is_some_and(|location| UNPACKED.contains(&location));
     // An unpacked extension's path is the directory it was loaded from; an
     // installed one's is `<id>/<version>` under the profile.
@@ -386,6 +391,15 @@ fn chromium_extension(
                 Some(absolute) => absolute.to_string(),
                 None => format!("{profile}/Extensions/{path}"),
             });
+    // The browser's own extensions load from its install directory. Marked
+    // as one but loaded from the profile, which anyone who can write the
+    // preferences can fill, it is listed like any other.
+    let in_profile = directory
+        .as_deref()
+        .is_some_and(|directory| directory.starts_with(&format!("{profile}/")));
+    if location.is_some_and(|location| COMPONENT.contains(&location)) && !in_profile {
+        return None;
+    }
     // The manifest the browser loads is the one on disk; older Chromium
     // kept a copy in the preferences, which only stands where there is no
     // directory to read.
@@ -398,7 +412,7 @@ fn chromium_extension(
     };
     let (manifest, unread) = match manifest {
         Ok(manifest) => (manifest, None),
-        Err(error) => (None, Some(error.to_string())),
+        Err(error) => (None, Some(error)),
     };
     let update = manifest
         .as_ref()
@@ -564,6 +578,11 @@ fn firefox_extension(browser: &'static Browser, profile: &str, addon: &Json) -> 
         Source::Unpacked(directory.trim_start_matches('/').to_string())
     } else if !signed {
         Source::Unsigned
+    } else if text("location").is_some_and(|location| SYSTEM_WIDE.contains(&location))
+        && text("sourceURI").is_none()
+    {
+        let path = text("path").unwrap_or_default();
+        Source::SystemWide(path.trim_start_matches('/').to_string())
     } else {
         match text("sourceURI").and_then(host) {
             Some(host) if host == "addons.mozilla.org" => Source::Store,
@@ -597,12 +616,21 @@ fn host(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
-/// Whether every file under `directory` is one a package installed and
-/// that still matches, and if so the least trusted of their tiers:
-/// `Vendor`, or `UserBuilt` where a package from no configured repository
-/// installed any of them.
-fn packaged(scope: &Scope<'_>, directory: &str) -> Option<Tier> {
-    let listing = read::entries(scope.root, directory);
+/// Whether `path`, a file or every file under the directory `path`, is
+/// one a package installed and that still matches, and if so the least
+/// trusted of their tiers: `Vendor`, or `UserBuilt` where a package from
+/// no configured repository installed any of them.
+fn packaged(scope: &Scope<'_>, path: &str) -> Option<Tier> {
+    // An empty path, or `/`, is the whole root: no package installed all
+    // of it, and walking it would take the sweep's time for nothing.
+    if read::normalize(Path::new(path)).is_none_or(|path| path.is_empty()) {
+        return None;
+    }
+    if fs::symlink_metadata(scope.root.join(path)).is_ok_and(|metadata| metadata.is_file()) {
+        let item = collect::item(scope, Category::BrowserExtension, path.to_string(), None);
+        return matches!(item.tier, Tier::Vendor | Tier::UserBuilt).then_some(item.tier);
+    }
+    let listing = read::entries(scope.root, path);
     if listing.files.is_empty()
         || listing.truncated
         || !listing.unreadable.is_empty()
@@ -633,6 +661,7 @@ fn text(extension: &Extension) -> String {
         Source::Store => format!("from the {}", extension.browser.family.store()),
         Source::Elsewhere(host) => format!("from elsewhere: {}", host.as_deref().unwrap_or("")),
         Source::Unpacked(directory) => format!("unpacked from /{directory}"),
+        Source::SystemWide(path) => format!("system-wide from /{path}"),
         Source::Unsigned => "unsigned".to_string(),
         Source::Unread => "from where not known".to_string(),
     };
@@ -682,6 +711,17 @@ fn item(scope: &Scope<'_>, extension: &Extension) -> Item {
             )),
         },
         Source::Unsigned => alerts.push("not signed by Mozilla".into()),
+        Source::SystemWide(path) => match packaged(scope, path) {
+            Some(packaged) => {
+                tier = packaged;
+                notes.push(format!(
+                    "installed for every user from /{path}, which a package installed and still matches"
+                ));
+            }
+            None => alerts.push(format!(
+                "installed from outside the {store}: for every user, from /{path}, which no package installed as it is"
+            )),
+        },
         Source::Unread => notes.push(format!(
             "marked as from the {store}, but its manifest could not be read: where it updates from was not checked"
         )),
