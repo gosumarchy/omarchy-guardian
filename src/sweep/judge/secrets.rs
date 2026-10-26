@@ -65,15 +65,35 @@ fn without_grub_hash(line: &str) -> Option<String> {
                 && rounds.bytes().all(|b| b.is_ascii_digit())
                 && is_hex(salt)
                 && is_hex(digest));
-    shaped.then(|| line.replacen(hash, REDACTED, 1))
+    // The hash is cut out where it stands: a `replacen` would take the
+    // first equal text, which may be the user's name.
+    let at = hash.as_ptr().addr() - line.as_ptr().addr();
+    shaped.then(|| format!("{}{REDACTED}{}", &line[..at], &line[at + hash.len()..]))
 }
 
-/// Whether `text`, a boot loader's configuration, sets a password in
-/// plain text (GRUB's `password <user> <password>`): such a file is read by
-/// the local rules only, as the secret wins over the review.
-pub(super) fn has_plain_boot_password(text: &str) -> bool {
-    text.lines()
-        .any(|line| line.split_whitespace().next() == Some("password"))
+/// Whether `text`, boot configuration, holds a secret `without_secrets`
+/// does not take out: a password hash on a line of any other shape than
+/// the exact one (quoted, followed by a comment or a `;`), a word
+/// `password` anywhere (GRUB's plain `password <user> <password>`, also
+/// inside a `menuentry { }` or after `then`), or `cryptomount` given a
+/// passphrase (`-p`, `--password`). Such a file is read by the local
+/// rules only, as the secret wins over the review; this fails closed, so
+/// a comment that names a password keeps the file from the review too.
+pub(super) fn has_boot_secret(text: &str) -> bool {
+    text.lines().any(|line| {
+        if without_grub_hash(line).is_some() {
+            return false;
+        }
+        let words: Vec<&str> = line
+            .split(|c: char| c.is_whitespace() || ";{}()\"'".contains(c))
+            .filter(|word| !word.is_empty())
+            .collect();
+        let passphrase = words.contains(&"cryptomount")
+            && words
+                .iter()
+                .any(|word| word.starts_with("-p") || word.starts_with("--password"));
+        line.contains("grub.pbkdf2.") || words.contains(&"password") || passphrase
+    })
 }
 
 /// A password written out as it is: nothing a shell would expand or run

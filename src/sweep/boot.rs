@@ -427,6 +427,12 @@ mod tests {
             );
         }
         assert!(!super::is_configuration("boot/EFI/BOOT/BOOTX64.EFI"));
+        // `grub-mkconfig`'s scripts are boot configuration too, read under
+        // the same secret rules.
+        assert_eq!(
+            crate::autorun::sweep_only_location("etc/grub.d/40_custom").map(|found| found.category),
+            Some(crate::autorun::Category::Boot)
+        );
     }
 
     #[test]

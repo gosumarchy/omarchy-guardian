@@ -1326,9 +1326,11 @@ fn facts_quote_the_path_and_say_what_guardian_knows() {
 }
 
 /// GRUB's password hash is taken out only where the line is exactly that
-/// and nothing else: a hash in that shape carries no code.
+/// and nothing else: a hash in that shape carries no code. A line of any
+/// other shape that holds a secret keeps the whole file from the review.
 #[test]
 fn only_an_exact_grub_password_hash_is_taken_out() {
+    use super::secrets::has_boot_secret;
     use super::without_secrets;
 
     let hash = "grub.pbkdf2.sha512.10000.0A1B2C3D.4E5F6A7B8C9D";
@@ -1337,14 +1339,46 @@ fn only_an_exact_grub_password_hash_is_taken_out() {
         without_secrets(&line),
         "  password_pbkdf2 root <redacted-by-guardian>\n"
     );
+    assert!(!has_boot_secret(&line));
+    // The hash is cut where it stands, not where equal text first is.
+    let same = "password_pbkdf2 grub.pbkdf2.sha512.1.AA.BB grub.pbkdf2.sha512.1.AA.BB\n";
+    assert_eq!(
+        without_secrets(same),
+        "password_pbkdf2 grub.pbkdf2.sha512.1.AA.BB <redacted-by-guardian>\n"
+    );
     for kept in [
         format!("password_pbkdf2 root {hash} ; insmod payload\n"),
         format!("password_pbkdf2 root {hash}$(run)\n"),
+        format!("password_pbkdf2 root {hash} # comment\n"),
+        format!("password_pbkdf2 root {hash};\n"),
+        format!("password_pbkdf2 root \"{hash}\"\n"),
+        format!("menuentry x {{ password_pbkdf2 root {hash} }}\n"),
+        format!("if true; then password_pbkdf2 root {hash}; fi\n"),
         "password_pbkdf2 root grub.pbkdf2.sha512.10000.0A1B.zz\n".to_string(),
         "password_pbkdf2 root grub.pbkdf2.sha512.x.0A1B.0A1B\n".to_string(),
         format!("echo root {hash}\n"),
     ] {
         assert_eq!(without_secrets(&kept), kept);
+        assert!(has_boot_secret(&kept), "{kept}");
+    }
+    for secret in [
+        "  password root hunter2\n",
+        "menuentry x { password root hunter2 }\n",
+        "if true; then password root hunter2; fi\n",
+        "set superusers=root; password root hunter2\n",
+        "cryptomount -p hunter2 hd0,gpt2\n",
+        "cryptomount --password=hunter2 -u 0123\n",
+        "# the password is on a note\n",
+    ] {
+        assert!(has_boot_secret(secret), "{secret}");
+    }
+    for plain in [
+        "menuentry 'Arch' {\n",
+        "cryptomount -u 0123abcd\n",
+        "set superusers=root\n",
+        "linux /vmlinuz-linux root=UUID=1 rw\n",
+    ] {
+        assert!(!has_boot_secret(plain), "{plain}");
     }
 }
 
@@ -1383,8 +1417,17 @@ fn a_boot_configuration_with_a_plain_password_is_kept_from_the_review() {
         };
         super::judge(&collection, None, &context, &HashSet::new())
     };
-    let plain = judged("set superusers=root\n  password root hunter2\nmenuentry x {}\n");
-    assert!(plain.agent_input.is_empty(), "{:?}", plain.agent_input);
+    for text in [
+        "set superusers=root\n  password root hunter2\nmenuentry x {}\n",
+        "menuentry x {\n  cryptomount -p hunter2 hd0,gpt2\n}\n",
+        "password_pbkdf2 root \"grub.pbkdf2.sha512.1.AA.BB\"\n",
+    ] {
+        let kept = judged(text);
+        assert!(kept.agent_input.is_empty(), "{:?}", kept.agent_input);
+        // Nothing is hidden by it: the file is said to be kept.
+        let rules: Vec<RuleId> = kept.findings.iter().map(|finding| finding.rule).collect();
+        assert!(rules.contains(&RuleId::KeptFromReview), "{rules:?}");
+    }
     // Without one, the configuration is reviewed, its hash taken out.
     let hashed = judged("password_pbkdf2 root grub.pbkdf2.sha512.10000.0A1B.2C3D\n");
     assert_eq!(hashed.agent_input.len(), 1);

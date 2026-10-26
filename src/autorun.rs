@@ -880,6 +880,9 @@ pub(crate) const SYSTEM_SWEEP: &[Location] = &[
     location("boot/EFI/*/refind.conf", Kind::Glob, Category::Boot),
     location("etc/default/limine", Kind::File, Category::Boot),
     location("etc/default/grub", Kind::File, Category::Boot),
+    // The scripts `grub-mkconfig` runs to write `grub.cfg` (`40_custom`
+    // holds entries and passwords written by hand).
+    location("etc/grub.d/", Kind::Directory, Category::Boot),
     location("etc/kernel/cmdline", Kind::File, Category::Boot),
     // Libraries the dynamic linker prefers over the ones in `/usr/lib`.
     location("usr/lib/glibc-hwcaps/", Kind::Directory, Category::Linker),

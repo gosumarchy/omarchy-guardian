@@ -399,14 +399,17 @@ fn chromium_extension(
                 Some(absolute) => absolute.to_string(),
                 None => format!("{profile}/Extensions/{path}"),
             });
-    // The browser's own extensions load from its install directory. Marked
-    // as one but loaded from the profile, which anyone who can write the
-    // preferences can fill, it is listed like any other.
-    let in_profile = directory
+    // The browser's own extensions load from its install directory, which
+    // only a package or root writes. One marked as the browser's own but
+    // loading from anywhere else (the profile, a home, or no path at all)
+    // could be put there by whoever writes the preferences: it is listed
+    // like any other. The path is normalized first, so `usr/../home` is
+    // where it leads.
+    let installed = directory
         .as_deref()
         .and_then(|directory| read::normalize(Path::new(directory)))
-        .is_some_and(|directory| directory.starts_with(&format!("{profile}/")));
-    if location.is_some_and(|location| COMPONENT.contains(&location)) && !in_profile {
+        .is_some_and(|directory| directory.starts_with("usr/") || directory.starts_with("opt/"));
+    if location.is_some_and(|location| COMPONENT.contains(&location)) && installed {
         return None;
     }
     // The manifest the browser loads is the one on disk; older Chromium

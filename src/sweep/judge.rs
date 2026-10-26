@@ -20,7 +20,7 @@ use crate::report::{Gap, LocalFinding, Report, ReviewScope};
 use crate::review::{self, ReviewContext};
 use crate::rules::RuleId;
 use crate::text::shown;
-use secrets::{has_plain_boot_password, without_secrets};
+use secrets::{has_boot_secret, without_secrets};
 use variables::sets_only_variables;
 
 #[cfg(test)]
@@ -305,7 +305,7 @@ impl Reading {
                 "checked locally only and kept from the AI: settings that may hold tokens, hosts or names",
             ),
             Self::Secrets => Some(
-                "checked by the local rules only and kept from the AI: its path marks it as holding secrets",
+                "checked by the local rules only and kept from the AI: it holds secrets (by its path or a boot password)",
             ),
             Self::Unsure => Some(
                 "checked by the local rules only and kept from the AI: nothing says it is a script",
@@ -329,7 +329,7 @@ fn reading(item: &Item, home: Option<&str>, text: &str) -> Reading {
     if is_local_only(item, home) {
         return Reading::Settings;
     }
-    if item.category == Category::Boot && has_plain_boot_password(text) {
+    if item.category == Category::Boot && has_boot_secret(text) {
         return Reading::Secrets;
     }
     let file = collect::file_of(item);

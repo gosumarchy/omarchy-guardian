@@ -626,6 +626,11 @@ fn a_browser_extension_loaded_from_the_profile_or_the_whole_root_is_alerted() {
         format!(r#""{COMPONENT_ID}":{{"location":5,"path":"{COMPONENT_ID}/1"}}"#),
         // The browser's own, from its install directory.
         format!(r#""{PACKAGED_ID}":{{"location":10,"path":"/usr/lib/chromium/resources/x"}}"#),
+        // Marked as the browser's own, from its install directory only by
+        // its first words.
+        format!(
+            r#""{STORE_ID}":{{"location":5,"path":"/usr/lib/chromium/../../../home/u/.config/chromium/Default/x"}}"#
+        ),
         // Unpacked from the whole root.
         format!(r#""{UNPACKED_ID}":{{"location":4,"path":"/"}}"#),
     ];
@@ -646,7 +651,8 @@ fn a_browser_extension_loaded_from_the_profile_or_the_whole_root_is_alerted() {
     };
     let (items, unchecked) = found(&scope);
     assert!(unchecked.is_empty(), "{unchecked:?}");
-    assert_eq!(items.len(), 2, "{items:?}");
+    assert_eq!(items.len(), 3, "{items:?}");
+    assert!(by_id(&items, STORE_ID).is_some());
     assert_eq!(
         by_id(&items, COMPONENT_ID).unwrap().alerts[0].1,
         "installed from outside the Chrome Web Store"
