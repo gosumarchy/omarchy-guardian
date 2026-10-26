@@ -195,7 +195,7 @@ fn stty(tty: &File, args: &[&str]) -> Result<String, Error> {
     } else {
         Err(Error::ToolFailed {
             tool: STTY.to_string(),
-            detail: format!("stty {} exited with {}", args.join(" "), output.status),
+            detail: format!("{} exited with {}", args.join(" "), output.status),
         })
     }
 }

@@ -124,15 +124,14 @@ pub(crate) fn already_granted(what: &str, installed: &Metadata) -> bool {
 }
 
 /// A failed read of the tar stream: one that ends inside an entry is cut
-/// short, anything else is bsdtar's output failing to arrive.
+/// short, anything else is the stream failing to arrive.
 fn unreadable(error: &io::Error) -> Error {
     if error.kind() == io::ErrorKind::UnexpectedEof {
         Error::parse("the package's tar stream", "it ends inside an entry")
     } else {
-        Error::ToolFailed {
-            tool: "bsdtar".into(),
-            detail: format!("its output could not be read: {error}"),
-        }
+        Error::Message(format!(
+            "the package's tar stream could not be read: {error}"
+        ))
     }
 }
 

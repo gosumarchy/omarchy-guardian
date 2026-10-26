@@ -24,7 +24,7 @@ pub(crate) fn as_root(command: &str, arguments: &[&str], what: &str) -> Result<(
         .args(arguments)
         .stdin(Stdio::inherit())
         .status()
-        .spawning(SUDO)?;
+        .spawning("sudo")?;
     if status.success() {
         Ok(())
     } else {

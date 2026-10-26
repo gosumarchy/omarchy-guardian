@@ -373,13 +373,14 @@ impl Archive {
             .ok_or_else(|| failed("no output".into()))
             .and_then(|stdout| attributes_in_tar(io::BufReader::with_capacity(1 << 16, stdout)));
         let status = child.wait().spawning("bsdtar")?;
-        let found = found?;
+        // Before what was read: a bsdtar that was stopped or failed ends
+        // its stream early, which reads as a cut-short archive.
         if !status.success() {
             return Err(failed(
                 "could not be read through for its attributes".into(),
             ));
         }
-        Ok(found)
+        found.map_err(|error| Error::Message(format!("{}: {error}", self.path.display())))
     }
 
     /// Runs bsdtar on the opened file (a fresh descriptor each time, so each

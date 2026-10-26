@@ -11,6 +11,7 @@ use super::{
 };
 use crate::config::model::SourceClass;
 use crate::content::Content;
+use crate::error::Error;
 use crate::test_support::{TempDir, tool_available};
 
 #[test]
@@ -754,7 +755,10 @@ fn capabilities_and_access_lists_are_read_from_the_archive_headers() {
     );
     // A stream that ends inside an entry is refused, not half read.
     let cut = &tar[..700];
-    assert!(super::attributes_in_tar(cut).is_err());
+    assert!(matches!(
+        super::attributes_in_tar(cut),
+        Err(Error::Parse { .. })
+    ));
 }
 
 /// A package archive `name` (owned by root) with `info` after its name
