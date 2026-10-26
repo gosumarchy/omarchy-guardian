@@ -17,11 +17,13 @@ const MANAGED: &[&str] = &[
 ];
 
 /// Settings whose value is a command Claude Code runs on its own: to get an
-/// API key or cloud credentials, and the headers of its telemetry.
+/// API key or AWS or Google Cloud credentials, and the headers of its
+/// telemetry.
 const HELPERS: &[&str] = &[
     "apiKeyHelper",
     "awsAuthRefresh",
     "awsCredentialExport",
+    "gcpAuthRefresh",
     "otelHeadersHelper",
 ];
 
@@ -92,7 +94,7 @@ fn config_file(scope: &Scope<'_>, file: &str, key: Option<&ProjectKey>, found: &
 /// The servers of each project of `.claude.json`. Nothing derived from a
 /// project's path is in an item's name or text, which the review sees: a
 /// project is named by its path's digest keyed with `key`, or without one
-/// by its position. Only the user is told the path, in the item's note.
+/// by its position. The path itself is in no item.
 fn project_entries(
     scope: &Scope<'_>,
     file: &str,
@@ -114,7 +116,7 @@ fn project_entries(
         let source = Source {
             file,
             plugin_root: None,
-            note: Some(format!("an MCP server of the project {project}")),
+            note: Some("an MCP server of one of Claude Code's projects".into()),
         };
         add(scope, &source, entries, found);
     }
@@ -131,7 +133,7 @@ fn command_entry(value: Option<&Json>, key: &str, entries: &mut Entries) {
 
 /// The variables of `env`, which Claude Code sets for itself and for all it
 /// starts, as one entry: their names, and the host of those that are
-/// addresses. A value that is no string has no host to give.
+/// addresses. An address that is no string is said as not checked.
 fn environment_entry(env: &Json, entries: &mut Entries) {
     let Some(variables) = env.as_object() else {
         entries.unread("env", "table");
@@ -140,10 +142,18 @@ fn environment_entry(env: &Json, entries: &mut Entries) {
     if variables.is_empty() {
         return;
     }
-    let set = variables
-        .iter()
-        .map(|(name, value)| Variable::of(name, value.as_str().unwrap_or_default()))
-        .collect();
+    let mut set = Vec::new();
+    for (name, value) in variables {
+        let Some(value) = value.as_str() else {
+            // Only an address's value is read, and this one cannot be.
+            if Variable::is_address(name) {
+                entries.unread(&format!("env/{}", key_part(name)), "value");
+            }
+            set.push(Variable::named(name));
+            continue;
+        };
+        set.push(Variable::of(name, value));
+    }
     entries.push(Entry {
         key: "env".into(),
         launch: Launch::Environment(set),

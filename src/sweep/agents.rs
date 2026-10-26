@@ -36,11 +36,12 @@ mod opencode;
 mod redact;
 
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read as _};
 use std::path::Path;
 
-use super::collect::{Item, Scope};
+use super::collect::{Item, Origin, Scope};
 use super::state;
 use crate::engine::store::Store;
 use crate::files::{self, AtomicWrite, read_small_file};
@@ -139,82 +140,91 @@ struct Dirs {
     project_key: Option<ProjectKey>,
 }
 
-/// The environment variables that move an agent's directory.
-const DIRECTORY_VARIABLES: &[&str] = &[
-    "CLAUDE_CONFIG_DIR",
-    "XDG_CONFIG_HOME",
-    "OPENCODE_CONFIG_DIR",
-    "OPENCODE_CONFIG",
-    "CODEX_HOME",
-];
+/// The environment variables that move an agent's directory, each as a
+/// path relative to the root, where it is set to a plain absolute path.
+#[derive(Debug, Default)]
+struct Variables {
+    claude_config_dir: Option<String>,
+    xdg_config_home: Option<String>,
+    opencode_config_dir: Option<String>,
+    opencode_config: Option<String>,
+    codex_home: Option<String>,
+}
+
+impl Variables {
+    /// The variables of the running process. One set to what is no plain
+    /// absolute path is said in `found` and left out.
+    fn of_process(found: &mut Found) -> Self {
+        Self {
+            claude_config_dir: checked(
+                "CLAUDE_CONFIG_DIR",
+                env::var_os("CLAUDE_CONFIG_DIR"),
+                found,
+            ),
+            xdg_config_home: checked("XDG_CONFIG_HOME", env::var_os("XDG_CONFIG_HOME"), found),
+            opencode_config_dir: checked(
+                "OPENCODE_CONFIG_DIR",
+                env::var_os("OPENCODE_CONFIG_DIR"),
+                found,
+            ),
+            opencode_config: checked("OPENCODE_CONFIG", env::var_os("OPENCODE_CONFIG"), found),
+            codex_home: checked("CODEX_HOME", env::var_os("CODEX_HOME"), found),
+        }
+    }
+}
+
+/// The `value` of the variable `name`, if it is set, as a path relative to
+/// the root; one that is no plain absolute path (or not UTF-8) is said in
+/// `found` and gives `None`.
+fn checked(name: &str, value: Option<OsString>, found: &mut Found) -> Option<String> {
+    let path = value?.to_str().and_then(relative);
+    if path.is_none() {
+        found.unchecked.push(format!(
+            "{name} is set to what is no plain absolute path: the default was read in its place, and what the agent reads there was not checked"
+        ));
+    }
+    path
+}
 
 impl Dirs {
-    /// The directories of the home at `home`, where `variable` gives the
-    /// value, relative to the root, of one of `DIRECTORY_VARIABLES` that is
-    /// set: `CLAUDE_CONFIG_DIR` holds `.claude.json` too.
-    fn new(
-        home: &str,
-        variable: &dyn Fn(&str) -> Option<String>,
-        project_key: Option<ProjectKey>,
-    ) -> Self {
-        let claude = variable("CLAUDE_CONFIG_DIR");
+    /// The directories of the home at `home`, moved by `variables`:
+    /// `CLAUDE_CONFIG_DIR` holds `.claude.json` too.
+    fn new(home: &str, variables: &Variables, project_key: Option<ProjectKey>) -> Self {
+        let claude = variables.claude_config_dir.clone();
         Self {
             claude_json: claude.as_ref().map_or_else(
                 || format!("{home}/.claude.json"),
                 |claude| format!("{claude}/.claude.json"),
             ),
             claude: claude.unwrap_or_else(|| format!("{home}/.claude")),
-            opencode: variable("XDG_CONFIG_HOME").map_or_else(
+            opencode: variables.xdg_config_home.as_ref().map_or_else(
                 || format!("{home}/.config/opencode"),
                 |config| format!("{config}/opencode"),
             ),
-            opencode_extra: variable("OPENCODE_CONFIG_DIR"),
-            opencode_config: variable("OPENCODE_CONFIG"),
-            codex: variable("CODEX_HOME").unwrap_or_else(|| format!("{home}/.codex")),
+            opencode_extra: variables.opencode_config_dir.clone(),
+            opencode_config: variables.opencode_config.clone(),
+            codex: variables
+                .codex_home
+                .clone()
+                .unwrap_or_else(|| format!("{home}/.codex")),
             project_key,
         }
     }
 
     /// The directories of `scope`'s home. The environment, and the key a
     /// project is named by, belong to the home of the user running the
-    /// sweep (its `HOME`); for any other home (a test tree, or a `HOME`
-    /// that is not the one swept) the defaults stand and a project is named
-    /// by its position. A variable set to what is no plain absolute path is
-    /// said in `found`, and the default stands for it.
+    /// sweep (its `HOME`). For any other home (a test tree, or a `HOME`
+    /// that is not the one swept), and for the root checks, which write
+    /// nothing and read root's own files, the defaults stand and a project
+    /// is named by its position.
     fn of(scope: &Scope<'_>, found: &mut Found) -> Option<Self> {
         let home = scope.home?;
         let own = env::var("HOME").is_ok_and(|value| value.trim_matches('/') == home);
-        if !own {
-            return Some(Self::new(home, &|_| None, None));
+        if scope.origin == Origin::Root || !own {
+            return Some(Self::new(home, &Variables::default(), None));
         }
-        let lookup = |name: &str| env::var_os(name).map(|value| value.into_string().ok());
-        let variable = resolved(&lookup, found);
-        Some(Self::new(home, &variable, ProjectKey::kept()))
-    }
-}
-
-/// How each of `DIRECTORY_VARIABLES` that `lookup` finds set (`Some(None)`
-/// for a value that is not UTF-8) reads as a path relative to the root; one
-/// that is no plain absolute path is said in `found` and left out.
-fn resolved(
-    lookup: &dyn Fn(&str) -> Option<Option<String>>,
-    found: &mut Found,
-) -> impl Fn(&str) -> Option<String> + use<> {
-    let mut values = Vec::new();
-    for name in DIRECTORY_VARIABLES {
-        match lookup(name).map(|value| value.as_deref().and_then(relative)) {
-            None => {}
-            Some(Some(path)) => values.push((*name, path)),
-            Some(None) => found.unchecked.push(format!(
-                "{name} is set to what is no plain absolute path: the default was read in its place, and what the agent reads there was not checked"
-            )),
-        }
-    }
-    move |name: &str| {
-        values
-            .iter()
-            .find(|(set, _)| *set == name)
-            .map(|(_, path)| path.clone())
+        let variables = Variables::of_process(found);
+        Some(Self::new(home, &variables, ProjectKey::kept()))
     }
 }
 
@@ -353,7 +363,8 @@ impl Server {
             Some(Json::String(command)) => vec![command.clone()],
             Some(command) => this.list(command, "command"),
         };
-        if let Some(args) = server.get("args") {
+        // Arguments without a program start nothing.
+        if let Some(args) = server.get("args").filter(|_| !words.is_empty()) {
             words.extend(this.list(args, "args"));
         }
         let mut words = words.into_iter();
@@ -422,7 +433,11 @@ fn server_entries(servers: &Json, prefix: &str, entries: &mut Entries) {
         return;
     };
     for (name, server) in servers {
-        Server::from_json(server).add_to(&format!("{prefix}{}", key_part(name)), entries);
+        let key = format!("{prefix}{}", key_part(name));
+        match server {
+            Json::Object(_) => Server::from_json(server).add_to(&key, entries),
+            _ => entries.unread(&key, "table"),
+        }
     }
 }
 

