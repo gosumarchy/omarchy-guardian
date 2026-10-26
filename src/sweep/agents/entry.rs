@@ -186,6 +186,7 @@ fn item(scope: &Scope<'_>, source: &Source<'_>, entry: Entry) -> Item {
     let path = format!("{}#{key}", source.file);
     let mut runs = Vec::new();
     let mut alerts = Vec::new();
+    let mut notes: Vec<String> = source.note.iter().cloned().collect();
     let started = match launch {
         Launch::Command(line) => {
             // Followed with its secrets: a script passed as the value of a
@@ -193,6 +194,9 @@ fn item(scope: &Scope<'_>, source: &Source<'_>, entry: Entry) -> Item {
             // secrets out once it has been followed (see
             // `hide_secrets_in_runs`).
             runs.extend(plugin_root_readings(&line, source.plugin_root));
+            if source.plugin_root.is_some() {
+                notes.extend(plugin_root_not_followed(&line, &runs));
+            }
             redacted(&line)
         }
         Launch::Remote { scheme, host } => {
@@ -224,14 +228,6 @@ fn item(scope: &Scope<'_>, source: &Source<'_>, entry: Entry) -> Item {
             variables.join(" ")
         )
     };
-    let mut notes: Vec<String> = source.note.iter().cloned().collect();
-    // A form `plugin_root_readings` leaves as written names no file, so
-    // the script it runs is not read; the sweep says so.
-    if source.plugin_root.is_some() && runs.iter().any(|run| names_braced_plugin_root(run)) {
-        notes.push(format!(
-            "{NOT_ALL_FOLLOWED}a form of ${{{PLUGIN_ROOT}}} that is neither plain nor a path default"
-        ));
-    }
     Item {
         file: None,
         origin: collect::origin(scope, &path),
@@ -442,6 +438,42 @@ pub(super) fn plugin_root_readings(line: &str, root: Option<&str>) -> Vec<String
     } else {
         vec![set, unset]
     }
+}
+
+/// Why the readings of a plugin's command `line`, `runs`, may not reach
+/// what it runs, as a note: the line changes the variable, so the
+/// directory written in may not be its value (`CLAUDE_PLUGIN_ROOT=/x`,
+/// `unset`, `export`, `env -u`); or a form was left as written and names
+/// no file. Following the new value would take a shell's parser, and
+/// `env -i` or an indirect `unset $v` changes it without naming it, so
+/// the line is reviewed as written and the gap is said.
+fn plugin_root_not_followed(line: &str, runs: &[String]) -> Option<String> {
+    if changes_plugin_root(line) {
+        Some(format!(
+            "{NOT_ALL_FOLLOWED}a command that changes ${PLUGIN_ROOT}"
+        ))
+    } else if runs.iter().any(|run| names_braced_plugin_root(run)) {
+        Some(format!(
+            "{NOT_ALL_FOLLOWED}a form of ${{{PLUGIN_ROOT}}} that is neither plain nor a path default"
+        ))
+    } else {
+        None
+    }
+}
+
+/// Whether `line` names the plugin's variable other than to expand it, as
+/// an assignment or an argument does: `CLAUDE_PLUGIN_ROOT` not after `$`
+/// or `${`, and not part of a longer name.
+fn changes_plugin_root(line: &str) -> bool {
+    let is_name = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    line.match_indices(PLUGIN_ROOT).any(|(at, _)| {
+        let before = &line[..at];
+        let after = &line[at + PLUGIN_ROOT.len()..];
+        !before.ends_with('$')
+            && !before.ends_with("${")
+            && !before.ends_with(is_name)
+            && !after.starts_with(is_name)
+    })
 }
 
 /// Whether `run` still holds `${CLAUDE_PLUGIN_ROOT…}`, which no reading

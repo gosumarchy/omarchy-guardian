@@ -281,9 +281,7 @@ fn a_plugin_is_read_through_its_install_and_its_scripts_are_followed() {
         root,
         &format!("{cache}/hooks/hooks.json"),
         r#"{"description": "d", "hooks": {"SessionStart": [{"hooks": [
-            {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X ${CLAUDE_PLUGIN_ROOT_X}"},
-            {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT:-.}/hooks/shims.sh\""},
-            {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT:-$HOME}/hooks/x.sh\""}
+            {"type": "command", "command": "MY_CLAUDE_PLUGIN_ROOT=1 bash \"${CLAUDE_PLUGIN_ROOT}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X ${CLAUDE_PLUGIN_ROOT_X}"}
         ]}]}}"#,
     );
     write(
@@ -308,36 +306,14 @@ fn a_plugin_is_read_through_its_install_and_its_scripts_are_followed() {
     // The text is the line as written: the line may change the variable.
     assert_eq!(
         text(start),
-        "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X ${CLAUDE_PLUGIN_ROOT_X}\n"
+        "MY_CLAUDE_PLUGIN_ROOT=1 bash \"${CLAUDE_PLUGIN_ROOT}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X ${CLAUDE_PLUGIN_ROOT_X}\n"
     );
     assert_eq!(
         start.runs,
         [format!(
-            "bash \"/{cache}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X ${{CLAUDE_PLUGIN_ROOT_X}}"
+            "MY_CLAUDE_PLUGIN_ROOT=1 bash \"/{cache}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X ${{CLAUDE_PLUGIN_ROOT_X}}"
         )]
     );
-    let shims = at(
-        &found,
-        &format!("{list}#plugins/guard@market/0/hooks/SessionStart/0/1"),
-    );
-    assert_eq!(
-        text(shims),
-        "bash \"${CLAUDE_PLUGIN_ROOT:-.}/hooks/shims.sh\"\n"
-    );
-    assert_eq!(
-        shims.runs,
-        [
-            format!("bash \"/{cache}/hooks/shims.sh\""),
-            "bash \"./hooks/shims.sh\"".to_string(),
-        ]
-    );
-    assert!(!collect::is_capped(shims));
-    // A default that is not a plain path names no file to follow.
-    let unread = at(
-        &found,
-        &format!("{list}#plugins/guard@market/0/hooks/SessionStart/0/2"),
-    );
-    assert!(collect::is_capped(unread), "{:?}", unread.notes);
     assert_eq!(
         start.notes,
         ["of the Claude Code plugin guard@market (version 1.0.0)"]
@@ -353,13 +329,13 @@ fn a_plugin_is_read_through_its_install_and_its_scripts_are_followed() {
     );
     assert_eq!(stop.runs, [format!("/{cache}/stop")]);
     // The default hooks file the manifest names again is read once: its
-    // three hooks, not six.
+    // one hook, not two.
     let starts = found
         .items
         .iter()
         .filter(|item| item.path.contains("SessionStart"))
         .count();
-    assert_eq!(starts, 3);
+    assert_eq!(starts, 1);
 
     assert_eq!(found.unchecked.len(), 2, "{:?}", found.unchecked);
     assert!(found.unchecked[0].contains("outside its plugin (../../outside.json)"));
@@ -995,6 +971,77 @@ fn the_plugin_directory_is_written_in_only_for_its_own_variable() {
         plugin_root_readings("${CLAUDE_PLUGIN_ROOT}/a", None),
         ["${CLAUDE_PLUGIN_ROOT}/a"]
     );
+}
+
+#[test]
+fn a_plugin_command_is_followed_where_its_directory_can_be_read() {
+    let dir = TempDir::new("agents-plugin-root");
+    let root = dir.path();
+    let cache = "home/u/.claude/plugins/cache/market/guard/1.0.0";
+    write(
+        root,
+        "home/u/.claude/plugins/installed_plugins.json",
+        &format!(
+            r#"{{"version": 2, "plugins": {{
+              "guard@market": [{{"installPath": "/{cache}", "version": "1.0.0"}}]
+            }}}}"#
+        ),
+    );
+    write(
+        root,
+        &format!("{cache}/hooks/hooks.json"),
+        r#"{"hooks": {"SessionStart": [{"hooks": [
+            {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/start.sh\""},
+            {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT:-.}/hooks/shims.sh\""},
+            {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT:-$HOME}/hooks/x.sh\""},
+            {"type": "command", "command": "CLAUDE_PLUGIN_ROOT=/x; bash ${CLAUDE_PLUGIN_ROOT}/r.sh"},
+            {"type": "command", "command": "env -u CLAUDE_PLUGIN_ROOT bash \"$CLAUDE_PLUGIN_ROOT/r.sh\""}
+        ]}]}}"#,
+    );
+    let found = found_in(root);
+    let list = "home/u/.claude/plugins/installed_plugins.json";
+
+    let start = at(
+        &found,
+        &format!("{list}#plugins/guard@market/0/hooks/SessionStart/0/0"),
+    );
+    assert!(!collect::is_capped(start), "{:?}", start.notes);
+    let shims = at(
+        &found,
+        &format!("{list}#plugins/guard@market/0/hooks/SessionStart/0/1"),
+    );
+    assert_eq!(
+        text(shims),
+        "bash \"${CLAUDE_PLUGIN_ROOT:-.}/hooks/shims.sh\"\n"
+    );
+    assert_eq!(
+        shims.runs,
+        [
+            format!("bash \"/{cache}/hooks/shims.sh\""),
+            "bash \"./hooks/shims.sh\"".to_string(),
+        ]
+    );
+    assert!(!collect::is_capped(shims));
+    // A default that is not a plain path names no file to follow.
+    let unread = at(
+        &found,
+        &format!("{list}#plugins/guard@market/0/hooks/SessionStart/0/2"),
+    );
+    assert!(collect::is_capped(unread), "{:?}", unread.notes);
+    // A command that changes the variable may run another directory's
+    // script than the one followed.
+    for hook in [3, 4] {
+        let changed = at(
+            &found,
+            &format!("{list}#plugins/guard@market/0/hooks/SessionStart/0/{hook}"),
+        );
+        assert_eq!(
+            changed.notes.last().map(String::as_str),
+            Some(
+                "not all of what it runs was followed: a command that changes $CLAUDE_PLUGIN_ROOT"
+            )
+        );
+    }
 }
 
 #[test]
