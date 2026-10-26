@@ -433,7 +433,7 @@ fn build_with(input: &PlanInput<'_>, extras: bool) -> Result<Plan, TooLarge> {
             // Measured as it is packed: an entry point runs as a whole,
             // so it is not reviewed in pieces.
             Choice::Whole
-                if file.path.len() + weight(&file.content) > capacity
+                if weight(&file.path) + weight(&file.content) > capacity
                     && is_entry_point(&file.path, &file.content, input.unit_prefixes) =>
             {
                 return Err(TooLarge {
@@ -517,7 +517,7 @@ fn send_what_a_change_names(
         if !matches!(choice, Choice::Unchanged) || !mentions.names(&file.path) {
             continue;
         }
-        let cost = file.path.len() + weight(&file.content);
+        let cost = weight(&file.path) + weight(&file.content);
         if cost <= room {
             room -= cost;
             *choice = Choice::Named;
@@ -550,7 +550,7 @@ fn choose(
     }
     // Whole only where it is seen whole: split into pieces, it would be
     // judged piece by piece, and a diff shows the change better.
-    let cost = file.path.len() + weight(&file.content);
+    let cost = weight(&file.path) + weight(&file.content);
     if file.content.len() <= WHOLE_ON_UPGRADE && cost <= capacity {
         return Choice::Whole;
     }
@@ -560,7 +560,8 @@ fn choose(
     }
     match diff::unified(old, &file.content, DIFF_CONTEXT) {
         Some(diff)
-            if diff.len() < file.content.len() && file.path.len() + weight(&diff) <= capacity =>
+            if diff.len() < file.content.len()
+                && weight(&file.path) + weight(&diff) <= capacity =>
         {
             Choice::Diff(diff)
         }
@@ -793,7 +794,7 @@ fn split(item: Item, capacity: usize) -> Result<Vec<Item>, TooLarge> {
         return Err(TooLarge::INPUT);
     };
     let room = capacity
-        .checked_sub(path.len())
+        .checked_sub(weight(&path))
         .filter(|room| *room >= MIN_PIECE)
         .ok_or(TooLarge::INPUT)?;
 

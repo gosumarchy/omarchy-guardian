@@ -805,3 +805,33 @@ fn a_path_is_charged_what_its_escaped_text_takes() {
     };
     assert_eq!(item.cost(), 61);
 }
+
+#[test]
+fn a_path_of_control_characters_is_measured_as_it_is_sent() {
+    let line = format!("{}\n", "x".repeat(49));
+    let content = line.repeat(5);
+    let controls = "\u{1}".repeat(10);
+    for max_input in (150..700).step_by(5) {
+        // An entry point goes whole or is refused, never in pieces.
+        let files = [file(&format!("{controls}a.install"), &content)];
+        if let Ok(plan) = plan(&files, None, max_input, 8) {
+            assert!(
+                plan.chunks
+                    .iter()
+                    .flatten()
+                    .all(|item| matches!(item, Item::Whole { .. })),
+                "{max_input}"
+            );
+        }
+        // Pieces of any other file each fit a request.
+        let files = [file(&format!("lib/{controls}.js"), &content)];
+        if let Ok(plan) = plan(&files, None, max_input, 8) {
+            assert!(
+                plan.chunks
+                    .iter()
+                    .all(|chunk| chunk.iter().map(Item::cost).sum::<usize>() <= max_input),
+                "{max_input}"
+            );
+        }
+    }
+}
