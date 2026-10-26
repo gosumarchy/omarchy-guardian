@@ -281,7 +281,7 @@ fn a_plugin_is_read_through_its_install_and_its_scripts_are_followed() {
         root,
         &format!("{cache}/hooks/hooks.json"),
         r#"{"description": "d", "hooks": {"SessionStart": [{"hooks": [
-            {"type": "command", "command": "MY_CLAUDE_PLUGIN_ROOT=1 bash \"${CLAUDE_PLUGIN_ROOT}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X ${CLAUDE_PLUGIN_ROOT_X}"}
+            {"type": "command", "command": "MY_CLAUDE_PLUGIN_ROOT=1 CLAUDE_PLUGIN_ROOTS=1 bash \"${CLAUDE_PLUGIN_ROOT}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X ${CLAUDE_PLUGIN_ROOT_X}"}
         ]}]}}"#,
     );
     write(
@@ -306,12 +306,12 @@ fn a_plugin_is_read_through_its_install_and_its_scripts_are_followed() {
     // The text is the line as written: the line may change the variable.
     assert_eq!(
         text(start),
-        "MY_CLAUDE_PLUGIN_ROOT=1 bash \"${CLAUDE_PLUGIN_ROOT}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X ${CLAUDE_PLUGIN_ROOT_X}\n"
+        "MY_CLAUDE_PLUGIN_ROOT=1 CLAUDE_PLUGIN_ROOTS=1 bash \"${CLAUDE_PLUGIN_ROOT}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X ${CLAUDE_PLUGIN_ROOT_X}\n"
     );
     assert_eq!(
         start.runs,
         [format!(
-            "MY_CLAUDE_PLUGIN_ROOT=1 bash \"/{cache}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X ${{CLAUDE_PLUGIN_ROOT_X}}"
+            "MY_CLAUDE_PLUGIN_ROOT=1 CLAUDE_PLUGIN_ROOTS=1 bash \"/{cache}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X ${{CLAUDE_PLUGIN_ROOT_X}}"
         )]
     );
     assert_eq!(
@@ -995,7 +995,9 @@ fn a_plugin_command_is_followed_where_its_directory_can_be_read() {
             {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT:-.}/hooks/shims.sh\""},
             {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT:-$HOME}/hooks/x.sh\""},
             {"type": "command", "command": "CLAUDE_PLUGIN_ROOT=/x; bash ${CLAUDE_PLUGIN_ROOT}/r.sh"},
-            {"type": "command", "command": "env -u CLAUDE_PLUGIN_ROOT bash \"$CLAUDE_PLUGIN_ROOT/r.sh\""}
+            {"type": "command", "command": "env -u CLAUDE_PLUGIN_ROOT bash -c 'bash \"$CLAUDE_PLUGIN_ROOT/r.sh\"'"},
+            {"type": "command", "command": "unset CLAUDE_PLUGIN_RO\"\"OT; bash $CLAUDE_PLUGIN_ROOT/r.sh"},
+            {"type": "command", "command": "unset CLAUDE_PLUGIN_R\\OOT; bash $CLAUDE_PLUGIN_ROOT/r.sh"}
         ]}]}}"#,
     );
     let found = found_in(root);
@@ -1029,8 +1031,8 @@ fn a_plugin_command_is_followed_where_its_directory_can_be_read() {
     );
     assert!(collect::is_capped(unread), "{:?}", unread.notes);
     // A command that changes the variable may run another directory's
-    // script than the one followed.
-    for hook in [3, 4] {
+    // script than the one followed, even with its name quoted.
+    for hook in [3, 4, 5, 6] {
         let changed = at(
             &found,
             &format!("{list}#plugins/guard@market/0/hooks/SessionStart/0/{hook}"),

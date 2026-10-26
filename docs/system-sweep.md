@@ -670,9 +670,10 @@ whose default is a plain path (`${CLAUDE_PLUGIN_ROOT:-.}`) is followed both with
 the plugin's directory and with the default. Any other default (`$(…)`, another
 variable) is reviewed as written, and the item says that what it runs was not
 all followed. So does a command that changes the variable itself
-(`CLAUDE_PLUGIN_ROOT=/x`, `unset`, `env -u`): what it then runs is not looked
-for. A command that clears it without naming it (`env -i`) is not caught. A
-`file://` plugin of OpenCode is followed to its file.
+(`CLAUDE_PLUGIN_ROOT=/x`, `unset`, `env -u`, with the name quoted or not): what
+it then runs is not looked for. Not caught: a name built as the command runs
+(`unset $v`) and a command that clears the whole environment (`env -i`,
+`sudo`). A `file://` plugin of OpenCode is followed to its file.
 
 What is a finding:
 

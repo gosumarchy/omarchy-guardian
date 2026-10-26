@@ -444,9 +444,10 @@ pub(super) fn plugin_root_readings(line: &str, root: Option<&str>) -> Vec<String
 /// what it runs, as a note: the line changes the variable, so the
 /// directory written in may not be its value (`CLAUDE_PLUGIN_ROOT=/x`,
 /// `unset`, `export`, `env -u`); or a form was left as written and names
-/// no file. Following the new value would take a shell's parser, and
-/// `env -i` or an indirect `unset $v` changes it without naming it, so
-/// the line is reviewed as written and the gap is said.
+/// no file. Following the new value would take a shell's parser, so the
+/// line is reviewed as written and the gap is said. Not caught: a name
+/// built as it runs (`$'\x43…'`, `unset ${v}ROOT`, `unset $v`), and a
+/// command that clears the whole environment (`env -i`, `exec -c`, `sudo`).
 fn plugin_root_not_followed(line: &str, runs: &[String]) -> Option<String> {
     if changes_plugin_root(line) {
         Some(format!(
@@ -465,6 +466,15 @@ fn plugin_root_not_followed(line: &str, runs: &[String]) -> Option<String> {
 /// an assignment or an argument does: `CLAUDE_PLUGIN_ROOT` not after `$`
 /// or `${`, and not part of a longer name.
 fn changes_plugin_root(line: &str) -> bool {
+    // The shell takes quotes and backslashes out before `unset` or `env -u`
+    // sees a name (`unset CLAUDE_PLUGIN_RO""OT`), so they are matched
+    // without them. Taking them out can join a `$` to the name
+    // (`'$'CLAUDE_PLUGIN_ROOT`), but such a word is text, not a name any
+    // command changes.
+    let line: String = line
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .collect();
     let is_name = |c: char| c.is_ascii_alphanumeric() || c == '_';
     line.match_indices(PLUGIN_ROOT).any(|(at, _)| {
         let before = &line[..at];
