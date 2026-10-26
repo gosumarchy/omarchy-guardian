@@ -957,25 +957,31 @@ incomplete.
   below, also inside a `menuentry` or after `then`, or a comment that names
   one, `# Password: …`), a GRUB password hash (`grub.pbkdf2.`,
   `grub.argon2.`) anywhere else, a line that names `GRUB_USERS` (whose
-  entries end in a password), a word with a `:` before an `@` (the user and
-  password of an address, with a scheme as in `cifs://alice:secret@nas` or
-  without one as in dracut's `netroot=iscsi:user:password@server…`; a
-  `subvol=@` or `getty@tty1` has none), an assignment to a name that says
-  secret (`GRUB_PASSWORD=…`, `GRUB_PASSWORD+=…`, `X_PASSWORD[0]=…`,
+  entries end in a password), a word between blanks with a `:` before an
+  `@` (the user and password of an address, with a scheme as in
+  `cifs://alice:p;ss@nas` or without one as in dracut's
+  `netroot=iscsi:user:password@server…`; a `subvol=@` or `getty@tty1` has
+  none) or with an `@` and an odd number of one kind of quote (a quoted
+  password with a blank in it, so a quoted string with an `@` and a blank
+  keeps the file too), an assignment to a name that says secret
+  (`GRUB_PASSWORD=…`, `GRUB_PASSWORD+=…`, `X_PASSWORD[0]=…`,
   `${LUKS_PASSWORD}=…`, as for masking below, whatever the value, also as
   the last part of a dotted name such as `cifs.password=`; only
   systemd-cryptsetup's `rd.luks.key=` and `luks.key=` are passed over, as
-  their value is where a key file is, never the key), `set [-flags] NAME
-  value` with such a name (the UEFI shell's form in `startup.nsh`), or, in a
-  file that runs `cryptomount`, a word that starts with `-p` or `--password`
-  on any line (its options may go on after a `\`). The text is read as
-  written, not as GRUB parses it: a word joined from quoted parts, or split
-  by a `\` at the end of a line, is not seen. This fails closed: a file kept
-  this way that something runs raises `kept-from-review`. Where the only secret is a hash on an exact line, the
-  hash is taken out (below) and the rest of the file is reviewed. So a
-  modified `/etc/grub.d/00_header`, which writes GRUB's password lines, goes
-  to the local rules only (a modified package file, and `kept-from-review`),
-  not to the AI.
+  their value is where a key file is, never the key) or to dracut's
+  `cifspass=`, `set [-flags] NAME value` with such a name (the UEFI shell's
+  form in `startup.nsh`, in any case and after an `@`), or, in a file that
+  runs `cryptomount`, a word that starts with `-p` or `--password` on any
+  line (its options may go on after a `\`). The text is read as written,
+  not as GRUB parses it: a word joined from quoted parts, or split by a `\`
+  at the end of a line, is not seen. This fails closed: a file kept this
+  way that something runs raises `kept-from-review`. Where the only secret
+  is a hash on an exact line, the hash is taken out (below) and the rest of
+  the file is reviewed. So a modified `/etc/grub.d/00_header`, which writes
+  GRUB's password lines, goes to the local rules only (a modified package
+  file, and `kept-from-review`), not to the AI. So does a modified
+  `/etc/grub.d/31_efi_bootnext`: its stock `ACTIVE_PAT='\*'` is an
+  assignment to a name that ends in `PAT`, which reads as a token's.
 
 A file an SSH `Include` names by its full path or with `~` is followed and
 checked the same way, one with `*` in its last part to the files it matches. A

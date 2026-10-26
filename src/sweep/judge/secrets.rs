@@ -85,15 +85,19 @@ fn without_grub_hash(line: &str) -> Option<String> {
 /// - a password hash, `grub.pbkdf2.` or `grub.argon2.`, wherever it is;
 /// - `GRUB_USERS`, which `/etc/default/grub` sets to
 ///   `name;access;plain|pbkdf2|argon2;secret` entries;
-/// - a word with a `:` before an `@`: the user and password of an address,
-///   with a scheme (`cifs://alice:p&ss@nas`) or without (dracut's
-///   `netroot=iscsi:user:password@server…`), which masking cannot take
-///   out whole (`without_url_passwords` needs `://` and plain characters);
+/// - a word between blanks with a `:` before an `@`: the user and
+///   password of an address, with a scheme (`cifs://alice:p;ss@nas`) or
+///   without (dracut's `netroot=iscsi:user:password@server…`), which
+///   masking cannot take out whole (`without_url_passwords` needs `://`
+///   and plain characters); and a word with an `@` and an odd number of
+///   one kind of quote, as a quoted password may hold a blank
+///   (`"netroot=cifs://u:p ss@h"`);
 /// - an assignment to a name that says secret (`GRUB_PASSWORD=…`, see
 ///   `is_secret_name`, on the last part of a dotted name), whatever the
 ///   value, quoted or not, but the kernel parameters in
-///   `KEY_FILE_PARAMETERS`; and `set [-flags] NAME value` with such a name
-///   (the UEFI shell's form in `startup.nsh`, and GRUB's);
+///   `KEY_FILE_PARAMETERS`, and to one of `SECRET_PARAMETERS`; and
+///   `set [-flags] NAME value` with such a name (the UEFI shell's form in
+///   `startup.nsh`, in any case and after an `@`, and GRUB's);
 /// - in a file that runs `cryptomount` anywhere, a word that starts with
 ///   `-p` or `--password` on any line, as its options may go on after a
 ///   `\` on the next.
@@ -124,10 +128,12 @@ pub(super) fn has_boot_secret(text: &str) -> bool {
         let password = words
             .iter()
             .any(|word| word.to_ascii_lowercase().starts_with("password"));
+        // Split at blanks only: a password may hold any other character.
         // `rootflags=subvol=@` and `getty@tty1` have no `:` before the `@`.
-        let userinfo = words.iter().any(|word| {
+        let userinfo = line.split_whitespace().any(|word| {
+            let odd = |quote: char| word.matches(quote).count() % 2 == 1;
             word.split_once('@')
-                .is_some_and(|(before, _)| before.contains(':'))
+                .is_some_and(|(before, _)| before.contains(':') || odd('"') || odd('\''))
         });
         hash || password || userinfo || passphrase || assigns_secret(line) || sets_secret(&words)
     })
@@ -136,7 +142,7 @@ pub(super) fn has_boot_secret(text: &str) -> bool {
 /// Whether `words`, one line, are `set [-flags] NAME value` with a name
 /// that says secret (`set -v PASSWORD hunter2`, `set TOKEN abc`).
 fn sets_secret(words: &[&str]) -> bool {
-    if words.first() != Some(&"set") {
+    if !words.first().is_some_and(|command| is_set(command)) {
         return false;
     }
     words[1..]
@@ -144,6 +150,18 @@ fn sets_secret(words: &[&str]) -> bool {
         .find(|word| !word.starts_with('-'))
         .is_some_and(|name| is_secret_name(name.split('=').next().unwrap_or_default()))
 }
+
+/// Whether `command` is `set`. The UEFI shell reads its commands in any
+/// case, and a leading `@` only stops it from echoing the line.
+fn is_set(command: &str) -> bool {
+    command.trim_start_matches('@').eq_ignore_ascii_case("set")
+}
+
+/// Kernel parameters whose value is a secret but whose name does not say so
+/// to `is_secret_name`: dracut's CIFS password, as dracut.cmdline(7)
+/// documents it (`cifsuser=`, `cifspass=`). Matched on the whole name.
+/// `PASS` is not one of `SECRET_ENDINGS`, as `BYPASS` and `COMPASS` end so.
+const SECRET_PARAMETERS: &[&str] = &["cifspass"];
 
 /// Kernel parameters whose name says key but whose value is where a key
 /// file is (`<path>[:<device>]`), never the key: systemd-cryptsetup's, as
@@ -154,9 +172,10 @@ fn sets_secret(words: &[&str]) -> bool {
 const KEY_FILE_PARAMETERS: &[&str] = &["rd.luks.key", "luks.key"];
 
 /// Whether `line` assigns to a name that says secret, but one of
-/// `KEY_FILE_PARAMETERS` (see `has_boot_secret`). What may stand between
-/// the name and the `=` is passed over first: a `+` (`NAME+=`), a
-/// subscript (`NAME[0]=`) and the brace of `${NAME}`.
+/// `KEY_FILE_PARAMETERS`, or to one of `SECRET_PARAMETERS` (see
+/// `has_boot_secret`). What may stand between the name and the `=` is
+/// passed over first: a `+` (`NAME+=`), a subscript (`NAME[0]=`) and the
+/// brace of `${NAME}`.
 fn assigns_secret(line: &str) -> bool {
     line.match_indices('=').any(|(at, _)| {
         let named = line[..at].trim_end_matches([' ', '\t', '+']);
@@ -176,7 +195,8 @@ fn assigns_secret(line: &str) -> bool {
         };
         let last = &named[named.len() - length(false)..];
         let whole = &named[named.len() - length(true)..];
-        !last.is_empty() && !KEY_FILE_PARAMETERS.contains(&whole) && is_secret_name(last)
+        SECRET_PARAMETERS.contains(&whole)
+            || (!last.is_empty() && !KEY_FILE_PARAMETERS.contains(&whole) && is_secret_name(last))
     })
 }
 
@@ -222,9 +242,9 @@ fn without_url_passwords(line: &str) -> String {
 }
 
 fn redact_line(line: &str) -> Option<String> {
-    // fish: `set [-flags] NAME value`.
+    // fish, and the UEFI shell: `set [-flags] NAME value`.
     let words: Vec<&str> = line.split_whitespace().collect();
-    if words.first() == Some(&"set")
+    if words.first().is_some_and(|command| is_set(command))
         && let Some(name_at) = words.iter().skip(1).position(|word| !word.starts_with('-'))
         && let (Some(name), Some(value)) = (words.get(name_at + 1), words.get(name_at + 2))
         && is_secret_name(name)

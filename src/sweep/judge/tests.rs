@@ -1297,6 +1297,11 @@ fn values_that_look_like_secrets_are_taken_out_before_review() {
         assert!(out.contains(kept), "{kept}\n{out}");
     }
     assert_eq!(out.lines().count(), text.lines().count());
+    // The UEFI shell's `set`, in any case and after an `@`.
+    assert_eq!(
+        without_secrets("@SET -v API_TOKEN abcdefgh1234\n"),
+        "@SET -v API_TOKEN <redacted-by-guardian>\n"
+    );
 
     // A password inside an address, wherever on the line it is.
     let urls = "ExecStart=/usr/bin/curl https://bot:s3cr3tpass@x.example/hook?a=1 -o /tmp/x\nurl = \"ftp://u:${PASS}@h.example/\"\nsee https://x.example:8443/a and git@x.example:r.git\n";
@@ -1398,6 +1403,20 @@ fn only_an_exact_grub_password_hash_is_taken_out() {
         "X_PASSWORD[0]=x\n",
         // A word that starts with `password` in any case.
         "# Password: hunter2\n",
+        // A password may hold what splits other words.
+        "linux /vmlinuz-linux root=cifs://alice:pa;ss@nas/share\n",
+        "linux /vmlinuz-linux netroot=cifs://alice:p(ss@nas/share\n",
+        "linux /vmlinuz-linux netroot=iscsi:alice:p'ss@10.0.0.1::3260::iqn.x\n",
+        // Or a blank, inside quotes.
+        "linux /vmlinuz-linux \"netroot=cifs://u:p ss@h\"\n",
+        // dracut's CIFS password, whose name says no secret.
+        "linux /vmlinuz-linux cifsuser=alice cifspass=hunter2\n",
+        // The UEFI shell reads `set` in any case, and after an `@`.
+        "SET TOKEN abc\n",
+        "@set -v TOKEN abc\n",
+        "Set -v Secret x\n",
+        // Stock in grub's 31_efi_bootnext: a name that ends in `PAT`.
+        "ACTIVE_PAT='\\*'\n",
     ] {
         assert!(has_boot_secret(secret), "{secret}");
     }
@@ -1414,6 +1433,8 @@ fn only_an_exact_grub_password_hash_is_taken_out() {
         "linux /vmlinuz-linux root=UUID=1 rootflags=subvol=@ rw\n",
         "linux /vmlinuz-linux systemd.wants=getty@tty1.service\n",
         "set -v pager 1\n",
+        "linux /vmlinuz-linux cryptdevice=PARTUUID=0123:root root=/dev/mapper/root rootflags=subvol=@\n",
+        "linux /vmlinuz-linux bypass=1\n",
     ] {
         assert!(!has_boot_secret(plain), "{plain}");
     }
@@ -1463,6 +1484,8 @@ fn a_boot_configuration_with_a_plain_password_is_kept_from_the_review() {
         "linux /vmlinuz-linux foo.password=x\n",
         "linux /vmlinuz-linux netroot=cifs://alice:p&ss@nas/share\n",
         "linux /vmlinuz-linux netroot=iscsi:user:password@server::3260::iqn.x\n",
+        "linux /vmlinuz-linux root=cifs://alice:pa;ss@nas/share\n",
+        "linux /vmlinuz-linux cifsuser=alice cifspass=hunter2\n",
     ] {
         let kept = judged(text);
         assert!(kept.agent_input.is_empty(), "{:?}", kept.agent_input);
