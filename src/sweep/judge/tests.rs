@@ -1383,6 +1383,9 @@ fn only_an_exact_grub_password_hash_is_taken_out() {
         "export GRUB_PASSWORD=\"two words\"\n",
         // Options that go on after a `\` on the next line.
         "cryptomount -u 0123abcd \\\n  -p hunter2\n",
+        // A dotted name can hold a secret too.
+        "linux /vmlinuz-linux foo.password=x\n",
+        "linux /vmlinuz-linux cifs.password=hunter2\n",
     ] {
         assert!(has_boot_secret(secret), "{secret}");
     }
@@ -1391,7 +1394,9 @@ fn only_an_exact_grub_password_hash_is_taken_out() {
         "cryptomount -u 0123abcd\n",
         "set superusers=root\n",
         "linux /vmlinuz-linux root=UUID=1 rw\n",
+        // Where a key file is, never the key.
         "linux /vmlinuz-linux rd.luks.key=/crypto_keyfile.bin\n",
+        "linux /vmlinuz-linux luks.key=/etc/key:UUID=0123\n",
         "GRUB_CMDLINE_LINUX_DEFAULT=\"quiet\"\n",
     ] {
         assert!(!has_boot_secret(plain), "{plain}");
@@ -1439,6 +1444,7 @@ fn a_boot_configuration_with_a_plain_password_is_kept_from_the_review() {
         "password_pbkdf2 root \"grub.pbkdf2.sha512.1.AA.BB\"\n",
         "password_argon2 root grub.argon2.id.v19.AAAA.BBBB\n",
         "GRUB_USERS=\"root;0;plain;hunter2\"\n",
+        "linux /vmlinuz-linux foo.password=x\n",
     ] {
         let kept = judged(text);
         assert!(kept.agent_input.is_empty(), "{:?}", kept.agent_input);
@@ -1446,6 +1452,9 @@ fn a_boot_configuration_with_a_plain_password_is_kept_from_the_review() {
         let rules: Vec<RuleId> = kept.findings.iter().map(|finding| finding.rule).collect();
         assert!(rules.contains(&RuleId::KeptFromReview), "{rules:?}");
     }
+    // Where a key file is, the configuration is reviewed.
+    let key_file = judged("linux /vmlinuz-linux rd.luks.key=/crypto_keyfile.bin\n");
+    assert_eq!(key_file.agent_input.len(), 1, "{:?}", key_file.agent_input);
     // Without one, the configuration is reviewed, its hash taken out.
     let hashed = judged("password_pbkdf2 root grub.pbkdf2.sha512.10000.0A1B.2C3D\n");
     assert_eq!(hashed.agent_input.len(), 1);

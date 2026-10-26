@@ -85,9 +85,8 @@ fn without_grub_hash(line: &str) -> Option<String> {
 /// - `GRUB_USERS`, which `/etc/default/grub` sets to
 ///   `name;access;plain|pbkdf2|argon2;secret` entries;
 /// - an assignment to a name that says secret (`GRUB_PASSWORD=…`, see
-///   `is_secret_name`), whatever the value, quoted or not; a dotted name
-///   (`rd.luks.key=`) is a kernel parameter, which `/proc/cmdline` shows
-///   to every user, and is passed over;
+///   `is_secret_name`, on the last part of a dotted name), whatever the
+///   value, quoted or not, but the kernel parameters in `KEY_FILE_PARAMETERS`;
 /// - in a file that runs `cryptomount` anywhere, a word that starts with
 ///   `-p` or `--password` on any line, as its options may go on after a
 ///   `\` on the next.
@@ -120,19 +119,31 @@ pub(super) fn has_boot_secret(text: &str) -> bool {
     })
 }
 
-/// Whether `line` assigns to a name that says secret, but a dotted one
-/// (see `has_boot_secret`).
+/// Kernel parameters whose name says key but whose value is where a key
+/// file is (`<path>[:<device>]`), never the key: systemd-cryptsetup's, as
+/// systemd-cryptsetup-generator(8) documents them. Only these are passed
+/// over; any other dotted name that says secret (`cifs.password=`, a
+/// hook's `*.passphrase=`) can hold one, and sending it to the AI provider
+/// is a leak whoever else on the machine can read `/proc/cmdline`.
+const KEY_FILE_PARAMETERS: &[&str] = &["rd.luks.key", "luks.key"];
+
+/// Whether `line` assigns to a name that says secret, but one of
+/// `KEY_FILE_PARAMETERS` (see `has_boot_secret`).
 fn assigns_secret(line: &str) -> bool {
     line.match_indices('=').any(|(at, _)| {
         let named = line[..at].trim_end_matches([' ', '\t']);
-        let start = named.len()
-            - named
+        let length = |dots: bool| {
+            named
                 .bytes()
                 .rev()
-                .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-                .count();
-        let dotted = named[..start].ends_with('.');
-        start < named.len() && !dotted && is_secret_name(&named[start..])
+                .take_while(|byte| {
+                    byte.is_ascii_alphanumeric() || *byte == b'_' || (dots && *byte == b'.')
+                })
+                .count()
+        };
+        let last = &named[named.len() - length(false)..];
+        let whole = &named[named.len() - length(true)..];
+        !last.is_empty() && !KEY_FILE_PARAMETERS.contains(&whole) && is_secret_name(last)
     })
 }
 

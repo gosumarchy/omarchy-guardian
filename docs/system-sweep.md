@@ -958,8 +958,9 @@ incomplete.
   one), a GRUB password hash (`grub.pbkdf2.`, `grub.argon2.`) anywhere else,
   a line that names `GRUB_USERS` (whose entries end in a password), an
   assignment to a name that says secret (`GRUB_PASSWORD=…`, as for masking
-  below, whatever the value; a dotted kernel parameter such as
-  `rd.luks.key=` is passed over, as `/proc/cmdline` shows it to every user),
+  below, whatever the value, also as the last part of a dotted name such as
+  `cifs.password=`; only systemd-cryptsetup's `rd.luks.key=` and `luks.key=`
+  are passed over, as their value is where a key file is, never the key),
   or, in a file that runs `cryptomount`, a word that starts with `-p` or
   `--password` on any line (its options may go on after a `\`). The text is
   read as written, not as GRUB parses it: a word joined from quoted parts, or
