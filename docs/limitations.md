@@ -64,7 +64,10 @@ matter most:
   a project's in a repository; a configuration file that is a link is not
   followed and is said as not checked; the code of an OpenCode npm plugin and
   what a Claude Code plugin holds besides its hooks and servers are not read
-  ([System sweep](system-sweep.md#ai-coding-agents)).
+  ([System sweep](system-sweep.md#ai-coding-agents)). Installed language
+  packages are looked up only for OSV's known-malicious advisories, and a
+  linked package directory is not looked up
+  ([Language packages](system-sweep.md#language-packages)).
 - **Packages:** only scriptlets, auto-run files and the text files those name
   are reviewed, not the rest of the payload; a removal is not reviewed; a unit
   you enable yourself later is not reviewed then; front ends that call libalpm
@@ -93,7 +96,9 @@ matter most:
   still goes with its file ([System
   sweep](system-sweep.md#what-is-taken-out-of-a-file-that-is-sent)). Under
   `local-only` no source is sent to an AI, but lockfile package names and
-  versions still go to the OSV API (`api.osv.dev`), and an AUR package's name
+  versions, and the ecosystem, name and version of each language package the
+  sweep finds installed, still go to the OSV API (`api.osv.dev`), and an AUR
+  package's name
   (and the names in its PKGBUILD's `pkgname=` lines) to the AUR. The daily
   check for a newer release asks GitHub for the project's tags under every
   level, until it is turned off ([Hearing of a new

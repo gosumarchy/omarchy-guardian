@@ -270,8 +270,9 @@ const REVIEWED_TOOL_FILES: &[&str] = &[
 /// here and never sent to the AI: SSH files and git configuration in the
 /// home directory, package-manager configuration (`~/.npmrc`, pip, gem,
 /// yarn, bun and Go keep registry tokens there), an editor's settings and
-/// fish's saved variables. Accounts, keys, trust anchors and `/etc/hosts`
-/// are facts the local checks cover; there is nothing in them to review.
+/// fish's saved variables. Accounts, keys, trust anchors, `/etc/hosts` and
+/// malicious language packages are facts the local checks cover; there is
+/// nothing in them to review.
 ///
 /// A program one of these files runs is no such file: it is reviewed like
 /// any other, by the local rules and the AI. For the SSH and git files
@@ -307,7 +308,7 @@ fn is_local_only(item: &Item, home: Option<&str>) -> bool {
         // What an extension was granted is checked by the collector's
         // rules (see `extensions`); its code and the profile it came from
         // hold personal data and are never sent.
-        Category::Account | Category::BrowserExtension => true,
+        Category::Account | Category::BrowserExtension | Category::Package => true,
         // Kernel images and EFI programs are compared with the packaged ones
         // (see `boot`), and one whose bytes read as text is still one of
         // them: nothing in `/boot` goes to the AI but the boot configuration
@@ -471,12 +472,13 @@ fn is_run(item: &Item, text: &str) -> bool {
 
 /// Says on each item that is kept from the AI that it is, and why.
 pub(super) fn note_kept(items: &mut [Item], home: Option<&str>) {
-    // An account, a key, a certificate authority or an extension is a fact
-    // with no text to send: nothing to say of those.
+    // An account, a key, a certificate authority, an extension or a
+    // package OSV named is a fact with no text to send: nothing to say of
+    // those.
     let fact = |item: &Item| {
         matches!(
             item.category,
-            Category::Account | Category::Trust | Category::BrowserExtension
+            Category::Account | Category::Trust | Category::BrowserExtension | Category::Package
         )
     };
     for item in items

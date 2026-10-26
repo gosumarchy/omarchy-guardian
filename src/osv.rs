@@ -39,11 +39,33 @@ pub(crate) struct Advisory {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Audit {
     pub(crate) advisories: Vec<Advisory>,
-    /// OSV had more advisories for some package than one response lists.
-    pub(crate) truncated: bool,
+    /// The packages OSV had more advisories for than one response lists.
+    pub(crate) truncated: Vec<Dependency>,
 }
 
+/// Looks `packages` up in OSV and fetches the details of what it lists.
 pub(crate) fn audit(packages: &[Dependency]) -> Result<Audit, Error> {
+    let mut audit = query(packages)?;
+    if let Ok(details) = fetch_details(&audit.advisories) {
+        for advisory in &mut audit.advisories {
+            if let Some((severity, summary)) = details.get(&advisory.id) {
+                advisory.severity = *severity;
+                advisory.summary.clone_from(summary);
+            }
+        }
+    }
+    Ok(audit)
+}
+
+/// Asks OSV which advisories cover each of `packages`, by ecosystem, name
+/// and version only, in batches of `BATCH_SIZE`. The advisories carry no
+/// severity or summary: those take a fetch per advisory (see `audit`).
+///
+/// # Errors
+///
+/// When there are more than `MAX_PACKAGES`, when `curl` fails or times out,
+/// or when OSV's answer cannot be read.
+pub(crate) fn query(packages: &[Dependency]) -> Result<Audit, Error> {
     if packages.len() > MAX_PACKAGES {
         return Err(Error::Message(format!(
             "dependency inventory exceeds the {MAX_PACKAGES}-package audit limit"
@@ -54,15 +76,6 @@ pub(crate) fn audit(packages: &[Dependency]) -> Result<Audit, Error> {
     for batch in packages.chunks(BATCH_SIZE) {
         let response = post(QUERY_BATCH_URL, &batch_query(batch))?;
         collect_batch(&response, batch, &mut audit)?;
-    }
-
-    if let Ok(details) = fetch_details(&audit.advisories) {
-        for advisory in &mut audit.advisories {
-            if let Some((severity, summary)) = details.get(&advisory.id) {
-                advisory.severity = *severity;
-                advisory.summary.clone_from(summary);
-            }
-        }
     }
     Ok(audit)
 }
@@ -99,7 +112,9 @@ fn collect_batch(response: &Json, batch: &[Dependency], audit: &mut Audit) -> Re
     }
 
     for (dependency, result) in batch.iter().zip(results) {
-        audit.truncated |= result.get("next_page_token").is_some();
+        if result.get("next_page_token").is_some() {
+            audit.truncated.push(dependency.clone());
+        }
         let vulnerabilities = result
             .get("vulns")
             .and_then(Json::as_array)
@@ -276,7 +291,7 @@ mod tests {
         collect_batch(&response, &batch, &mut audit).unwrap();
         assert_eq!(audit.advisories.len(), 1);
         assert_eq!(audit.advisories[0].package, "a");
-        assert!(audit.truncated);
+        assert_eq!(audit.truncated, [dependency("a")]);
     }
 
     #[test]

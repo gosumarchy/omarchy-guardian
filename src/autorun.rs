@@ -62,10 +62,13 @@ pub(crate) enum Category {
     /// The hooks, plugins and MCP servers AI coding agents (Claude Code,
     /// OpenCode, Codex) start on their own, read from their configuration.
     Agent,
+    /// A language package installed outside pacman (npm, pipx, cargo,
+    /// mise) that OSV lists as malicious.
+    Package,
 }
 
 impl Category {
-    const ALL: [Self; 40] = [
+    const ALL: [Self; 41] = [
         Self::Autostart,
         Self::Boot,
         Self::BootConfig,
@@ -106,6 +109,7 @@ impl Category {
         Self::Toolchain,
         Self::Program,
         Self::Agent,
+        Self::Package,
     ];
 
     /// A stable machine name (`pam`, `systemd-generator`).
@@ -151,6 +155,7 @@ impl Category {
             Self::Toolchain => "toolchain",
             Self::Program => "program",
             Self::Agent => "agent",
+            Self::Package => "package",
         }
     }
 
@@ -216,6 +221,7 @@ impl Category {
             Self::Toolchain => "Developer tool configuration (npm, pip, cargo, mise)",
             Self::Program => "The system's own programs",
             Self::Agent => "AI coding agent hooks, plugins and MCP servers",
+            Self::Package => "Language packages (npm, pipx, cargo, mise)",
         }
     }
 
@@ -257,6 +263,7 @@ impl Category {
             Self::Toolchain => "decides what builds and installs run and fetch",
             Self::Program => "runs when anything starts it by name",
             Self::Agent => "runs when an AI coding agent starts, or as it works",
+            Self::Package => "runs when a tool that uses it starts",
         }
     }
 }

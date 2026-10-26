@@ -54,6 +54,11 @@ fn files_that_hold_tokens_and_plain_facts_stay_here() {
         ("home/u/.config/fish/config.fish", Category::Shell, false),
         ("etc/hosts", Category::Trust, true),
         ("etc/passwd#u", Category::Account, true),
+        (
+            "usr/lib/node_modules/x/package.json#npm:x",
+            Category::Package,
+            true,
+        ),
         ("home/u/.ssh/authorized_keys2", Category::Ssh, true),
         ("boot/EFI/BOOT/BOOTX64.EFI", Category::Boot, true),
         ("boot/vmlinuz-linux", Category::Boot, true),

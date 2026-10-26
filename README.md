@@ -56,8 +56,10 @@ it shows on hover:
   plainly written secret values, URL passwords and GRUB password hashes out
   of what it sends (only URL passwords for Neovim plugin code). A secret
   anywhere else goes with its file. Package names and versions from lockfiles
-  go to the OSV API (`api.osv.dev`), and an AUR package's name goes to the
-  AUR. The `local-only` level sends nothing to an AI; the OSV and AUR lookups
+  go to the OSV API (`api.osv.dev`), and so do the ecosystem, name and version
+  of each npm, pipx and cargo package from the public registries the sweep
+  finds installed outside pacman ([Language packages](docs/system-sweep.md#language-packages)); an AUR
+  package's name goes to the AUR. The `local-only` level sends nothing to an AI; the OSV and AUR lookups
   remain. Once a day the sweep asks the project's repository on GitHub for
   its release tags, sending nothing about your machine (`[update] check =
   "off"` turns that off).
@@ -335,7 +337,10 @@ under [Limitations](docs/limitations.md):
   judged by where they came from and what they were granted, not by their
   code, and other mounted filesystems are not searched for setuid files; as a
   user only your own processes can be looked at; without root checks every
-  sweep is incomplete ([System sweep](docs/system-sweep.md)).
+  sweep is incomplete ([System sweep](docs/system-sweep.md)). Installed
+  language packages are looked up only for OSV's known-malicious advisories,
+  not for vulnerabilities ([Language
+  packages](docs/system-sweep.md#language-packages)).
 - System sweep: the Neovim plugins the first sweep finds are taken as they
   are and reviewed only once they change, and only lazy.nvim's plugins are
   covered ([System sweep](docs/system-sweep.md#neovim-plugins)).
@@ -347,8 +352,8 @@ under [Limitations](docs/limitations.md):
   under `local-only` and except the files kept from the AI by name or kind; a
   secret under a name Guardian does not recognise still goes with its file.
   Under `local-only` no source is sent, but lockfile package names and
-  versions still go to the OSV API and an AUR package's name to the AUR
-  ([Limitations](docs/limitations.md#the-limits-that-matter-most), [System
+  versions, and those of installed language packages, still go to the OSV
+  API and an AUR package's name to the AUR ([Limitations](docs/limitations.md#the-limits-that-matter-most), [System
   sweep](docs/system-sweep.md#what-goes-to-the-review)).
 - A block's report is passed to your AI agent on its command line, which other
   local users can read ([After a block](docs/permits.md#the-report)).

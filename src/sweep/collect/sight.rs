@@ -127,7 +127,7 @@ pub(super) fn names_a_file(scope: &Scope<'_>, path: &str, run_by: Option<&str>) 
 
 /// How the collector sees the hops of a link chain. As root, a link leads
 /// where its owner says, so every hop is seen as everyone sees it.
-pub(super) fn hop(scope: &Scope<'_>, path: &str) -> read::Hop {
+pub(crate) fn hop(scope: &Scope<'_>, path: &str) -> read::Hop {
     if scope.origin == Origin::Root {
         read::public_hop(scope.root, path)
     } else {
@@ -136,7 +136,7 @@ pub(super) fn hop(scope: &Scope<'_>, path: &str) -> read::Hop {
 }
 
 /// `read::look` at where a link led.
-pub(super) fn look_past_link(scope: &Scope<'_>, path: &str) -> Found {
+pub(crate) fn look_past_link(scope: &Scope<'_>, path: &str) -> Found {
     if scope.origin == Origin::Root {
         read::look_as(scope.root, path, View::Everyone)
             .unwrap_or_else(|| Found::Unreadable(NOT_LOOKED_AT.into()))

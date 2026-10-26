@@ -530,3 +530,124 @@ fn a_directory_ahead_that_cannot_be_listed_is_said() {
         assert_eq!(found, (vec!["home/u/closed/sudo".to_string()], vec![]));
     }
 }
+
+#[test]
+fn a_linked_start_up_file_is_read_and_one_that_cannot_be_is_said() {
+    let dir = TempDir::new("sweep-path-linked");
+    let root = dir.path();
+    let write = |path: &str, text: &str| {
+        fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+        fs::write(root.join(path), text).unwrap();
+    };
+    write(
+        "home/u/dotfiles/bashrc",
+        "export PATH=\"$HOME/linked/bin:$PATH\"\n",
+    );
+    symlink("/home/u/dotfiles/bashrc", root.join("home/u/.bashrc")).unwrap();
+    fs::create_dir_all(root.join("etc/profile.d")).unwrap();
+    symlink(".", root.join("etc/profile.d/loop")).unwrap();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::System,
+    };
+
+    let start_up = super::start_up_files(&scope, &super::start_up_patterns(&scope));
+
+    assert_eq!(
+        start_up
+            .files
+            .iter()
+            .map(|(file, _)| file.as_str())
+            .collect::<Vec<_>>(),
+        ["home/u/.bashrc"]
+    );
+    assert_eq!(start_up.unreadable, ["/etc/profile.d/loop"]);
+    assert!(
+        search(&scope)
+            .directories
+            .contains(&"home/u/linked/bin".to_string())
+    );
+}
+
+#[test]
+fn each_start_up_file_is_read_at_its_shallowest_depth_and_omarchys_path_is_known() {
+    let dir = TempDir::new("sweep-path-depth");
+    let root = dir.path();
+    let write = |path: &str, text: &str| {
+        fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+        fs::write(root.join(path), text).unwrap();
+    };
+    // `.bashrc` is a start-up file of its own as well as read in by
+    // `.bash_profile`: the chain below it is three deep from it.
+    write("home/u/.bash_profile", "source ~/.bashrc\n");
+    write(
+        "home/u/.bashrc",
+        "source ~/a.sh\nsource \"$OMARCHY_PATH/default/bash/rc\"\n",
+    );
+    write("home/u/a.sh", "source ~/b.sh\n");
+    write("home/u/b.sh", "source ~/c.sh\n");
+    write("home/u/c.sh", "true\n");
+    write(
+        "usr/share/omarchy/default/bash/rc",
+        "export PATH=\"$HOME/omarchy-rc/bin:$PATH\"\n",
+    );
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::System,
+    };
+    let read = || super::start_up_files(&scope, &super::start_up_patterns(&scope));
+
+    let start_up = read();
+    let files: Vec<&str> = start_up
+        .files
+        .iter()
+        .map(|(file, _)| file.as_str())
+        .collect();
+    assert!(files.contains(&"home/u/c.sh"), "{files:?}");
+    assert!(
+        files.contains(&"usr/share/omarchy/default/bash/rc"),
+        "{files:?}"
+    );
+    assert!(start_up.unreadable.is_empty(), "{:?}", start_up.unreadable);
+    assert!(
+        search(&scope)
+            .directories
+            .contains(&"home/u/omarchy-rc/bin".to_string())
+    );
+
+    // Where Omarchy's own configuration may move it, it is not known.
+    write("etc/omarchy.conf", "OMARCHY_PATH=/opt/omarchy\n");
+    assert_eq!(read().unreadable, ["$OMARCHY_PATH/default/bash/rc"]);
+}
+
+#[test]
+fn an_oversize_start_up_file_is_read_in_part_and_said() {
+    let dir = TempDir::new("sweep-path-oversize");
+    let root = dir.path();
+    let mut text = "export PATH=\"$HOME/big/bin:$PATH\"\n".to_string();
+    text.push_str(&"#".repeat(3 * 1024 * 1024));
+    fs::create_dir_all(root.join("home/u")).unwrap();
+    fs::write(root.join("home/u/.bashrc"), text).unwrap();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::System,
+    };
+
+    let start_up = super::start_up_files(&scope, &super::start_up_patterns(&scope));
+
+    assert_eq!(start_up.unreadable, ["/home/u/.bashrc"]);
+    assert!(
+        search(&scope)
+            .directories
+            .contains(&"home/u/big/bin".to_string())
+    );
+}

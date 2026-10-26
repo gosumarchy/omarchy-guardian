@@ -19,6 +19,7 @@ described.
   - [AI coding agents](#ai-coding-agents)
   - [Browser extensions](#browser-extensions)
   - [Accounts, keys and trust anchors](#accounts-keys-and-trust-anchors)
+  - [Language packages](#language-packages)
   - [Guardian's own units](#guardians-own-units)
 - [What runs now](#what-runs-now)
   - [Programs with no file, or from a temporary directory](#programs-with-no-file-or-from-a-temporary-directory)
@@ -241,10 +242,17 @@ its name is typed.
 `PATH`s: the one the sweep runs with, the systemd user manager's (`systemctl
 --user show-environment`), and the `PATH` lines of everything a login, a shell
 or the session reads: your shell start-up files and the files they `source`
-(three levels deep, 256 files in all), `/etc/profile` and `/etc/profile.d`,
+(three levels deep from the shallowest file that reaches them, 256 files in
+all, a linked file followed as the shell follows it, and `$OMARCHY_PATH` read
+as `/usr/share/omarchy`, the default Omarchy's own files set, unless
+`/etc/omarchy.conf` names it), `/etc/profile` and `/etc/profile.d`,
 fish's `conf.d`, `environment.d` (yours and the system's),
 `~/.pam_environment`, uwsm's `env` files and Hyprland's `env` lines (Omarchy's
-own included). A line counts wherever on it the statement stands (`[ -d ~/.x ]
+own included). Only `$OMARCHY_PATH` and `${OMARCHY_PATH}` are read as Omarchy's
+path; other forms of the variable are not followed, and a conf that sets it
+some other way is not seen. Hyprland's `source =` lines are not followed. Of a
+file over 2 MiB the first 2 MiB are read. A line counts wherever on it the
+statement stands (`[ -d ~/.x ]
 && export PATH=~/.x:$PATH`, inside an `if`, after `declare -x` or `typeset
 -x`, among other assignments), in the bash, zsh, fish and csh forms. A line
 that sets `PATH` from a command (`PATH=$(…)`) cannot be followed: the file's
@@ -811,6 +819,215 @@ label into it ahead of time. The collector's very first run has no record to
 compare with and says so by sending no list; for that one run your sweep's own
 memory stands in. A machine that runs the root checks only with `sweep --root`
 never has that record: there your sweep's own memory stands in every time.
+
+### Language packages
+
+Packages installed with a language's own package manager, outside pacman, are
+looked up in [OSV](https://osv.dev), and a version OSV lists as malicious (an
+advisory whose id starts with `MAL-`) is a high finding. Other advisories
+(known vulnerabilities) are not reported here.
+
+What is read and never run (links below these places are not followed, see below):
+
+- global npm packages: `/usr/lib/node_modules`, the `lib/node_modules` under
+  the `prefix` your npm configuration sets, and each node mise installed, with
+  scoped packages and each package's own `node_modules` (8 levels deep), by
+  their `package.json`;
+- pipx's environments (`~/.local/share/pipx/venvs`, or under `PIPX_HOME`), by
+  the `*.dist-info/METADATA` of each package in them, the main package and its
+  dependencies alike;
+- what `cargo install` recorded in `~/.cargo/.crates2.json` (or under
+  `CARGO_HOME`), for crates from crates.io;
+- what mise installed (`~/.local/share/mise/installs`, or under
+  `MISE_DATA_DIR`) as node or python itself, or through its `npm:`, `pipx:`
+  (with pipx or uv) and `cargo:` backends, read as above. Newer mise
+  installs `npm:` tools with aube, in pnpm's layout (no `lib`): such a tool
+  is not read, and is said as not checked. So is an `npm:` tool with a file
+  bun, pnpm or aube leaves (`package.json`, `bun.lock`, `bun.lockb`,
+  `pnpm-lock.yaml`, `aube-lock.yaml` or `node_modules/.pnpm`) in its
+  directory or its `lib`, as when mise's `npm.package_manager` is bun or
+  pnpm: their own configuration (`bunfig.toml`, `BUN_CONFIG_REGISTRY`) is
+  not read. Tools of other
+  backends are not covered: `aqua:`, `ubi:` and core tools such as Go are
+  programs, not packages of a registry OSV knows, and a `go:` tool leaves
+  only the program it built, with no module path and version beside it,
+  although OSV has a Go ecosystem.
+
+A `CARGO_HOME`, `PIPX_HOME`, `MISE_DATA_DIR`, `XDG_CONFIG_HOME` or
+`XDG_CONFIG_DIRS` entry that is not an absolute path is said, and nothing is
+read in its place. An empty `CARGO_HOME` or XDG directory counts as unset;
+an empty `PIPX_HOME` or `MISE_DATA_DIR` is said as not absolute. The variables are read from the sweep's own
+environment: the daily timer's sweep gets them only where they are set for
+your systemd user session.
+
+The tools may have run from a shell with settings the sweep does not see, so
+the files a login, a shell, the session and Hyprland read are searched: the
+same files the `PATH` check reads
+([Programs ahead of the system's own](#programs-ahead-of-the-systems-own):
+`/etc/environment`, `environment.d`, `/etc/profile` and `profile.d`, the bash,
+zsh and fish files, uwsm's environment files, Hyprland's `.conf` and `.lua`
+files and Omarchy's defaults for them), the files those read in with `source`
+or `.` (as the `PATH` check reads them; Hyprland's `source =` lines are not
+followed), and mise's configuration, whose `[env]`
+mise sets in every shell it is turned on for (`~/.config/mise/config.toml`,
+`config.*.toml` and `conf.d/*.toml` beside it, `~/.config/mise.toml`,
+`~/.mise.toml`, `~/.mise.*.toml`, `~/mise.toml`, `~/mise.*.toml`, and
+`/etc/mise/config.toml`, `config.*.toml` and `conf.d/*.toml`). They are
+searched, in any case, for the names of the variables that set an index or
+registry: `PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL`, `PIP_FIND_LINKS`,
+`PIP_REQUIREMENT`, `PIP_CONSTRAINT`, `PIP_CONFIG_FILE`; `UV_INDEX*`,
+`UV_DEFAULT_INDEX`, `UV_EXTRA_INDEX_URL`, `UV_FIND_LINKS`, `UV_CONFIG_FILE`;
+and `npm_config_registry`, a scope's `npm_config_@scope:registry`,
+`npm_config_userconfig` and `npm_config_globalconfig`. A file that names one,
+whatever it sets it to, leaves out every package of that tool (for npm, as an
+npm file that cannot be read does), and is said. One that is there and cannot
+be read (closed, not a regular file or a link to one, a link loop, over 2
+MiB), one read in more than three deep, a directory a pattern cannot list,
+files past the first 256, and a mise file that loads variables from another
+file (`_.file`, `_.source`) leave out the packages of all three. Completion,
+function, makepkg, readline and logout files are not searched: they do not
+set the environment the tools run in.
+
+A package whose name may be private is not sent anywhere, as far as the files
+the tools leave behind tell. Only packages from the public registry go to OSV:
+npm packages from `registry.npmjs.org` (or Yarn's copy of it), Python packages
+from PyPI, crates from crates.io.
+
+- npm: npm keeps no record of where a global package came from (no hidden
+  lockfile, and npm 7 and later write no `_resolved` in its `package.json`),
+  so the `registry` (or the scope's own `@scope:registry`) npm is set to use
+  decides, or `_resolved` where an older npm wrote one. A global package
+  installed from git or a tarball under a name whose registry is the public
+  one is sent like any other. npm's configuration is read as each node's
+  npm reads it, the system's (`/usr`) and each one mise installed (up to
+  100): its built-in `npmrc`, its global file (`etc/npmrc` under the
+  `prefix` in effect, which is `PREFIX` or else the node's own directory
+  unless one is set, or the file `globalconfig` names), your `~/.npmrc` and
+  the `npm_config_*` variables that are not empty. npm's `DESTDIR` is not
+  read. For the system's npm, `/etc/npmrc` is read before the global file
+  and must on its own take packages from the public registry too: where
+  Arch's npm reads it from is not known. A package is sent only when every
+  node's npm takes it from the public registry. Where an npm configuration
+  file is there and cannot be read, a `prefix` or `globalconfig` is a path
+  npm would resolve against its working directory (relative, or with a
+  variable other than `~/` or `${HOME}/`), `npm_config_userconfig` or
+  `PREFIX` is not absolute, a file has a `${...}` in a key, or more than 100
+  nodes are installed, no npm package is sent: a private registry may be
+  set where it was not read. Settings under a `[section]` of a file are not
+  npm's own and are not read, and keys may be quoted, as in npm; a section
+  is a line that starts with `[` in its first column and ends with `]`, and
+  lines end at a CR or LF, as npm splits them. A double-quoted key with an
+  escape in it (npm decodes it as JSON) and a list key such as
+  `registry[]` are not read as npm reads them: the file counts as one that
+  cannot be read when such a key may be one read here. Only `prefix`,
+  `globalconfig`, `userconfig`, `ignore-scripts`, `registry` and each
+  scope's registry are taken from a file; the rest, tokens included, are
+  not kept.
+- pip: a package installed from an address or a local directory (it has a
+  `direct_url.json`) is left out. So is every package of a pipx environment
+  installed with another index or a requirements or constraints file
+  (`--index-url`, `--extra-index-url`, `--find-links`, `-r`, `-c`, or a
+  shortened form, as pipx records them in `pipx_metadata.json`; a record
+  that cannot be read counts), or whose own `pip.conf` sets one, and every
+  package in a Python mise installed whose own `pip.conf` sets one. Every
+  Python package pip installed at all is left out where pip's configuration
+  (`/etc/pip.conf`, `/etc/xdg/pip/pip.conf`, `~/.config/pip/pip.conf`,
+  `~/.pip/pip.conf`, the `pip/pip.conf` under `XDG_CONFIG_HOME` and each of
+  `XDG_CONFIG_DIRS`, `PIP_CONFIG_FILE`, `PIP_INDEX_URL` and the like) sets
+  `index-url`, `extra-index-url` or `find-links` to anything but PyPI (an
+  empty value, and a value continued on lines indented deeper than its key,
+  included; a key may be written with its `--`), or sets `requirement` or
+  `constraint` at all (`PIP_REQUIREMENT`, `PIP_CONSTRAINT`), since such a
+  file can name an index. A
+  `PIP_CONFIG_FILE` that is not an absolute path counts as a file that
+  cannot be read. pip keeps no record of an index
+  given on its command line: a package installed with `pip install
+  --index-url` into a Python mise installed, or into a pipx environment old
+  enough to have no `pipx_metadata.json`, is sent like any other.
+- uv, for what mise installed through it: any index setting in `uv.toml`
+  (`/etc/uv/uv.toml`, `/etc/xdg/uv/uv.toml`, `~/.config/uv/uv.toml`, the
+  `uv/uv.toml` under the XDG directories, `UV_CONFIG_FILE`, which counts as a
+  file that cannot be read when it is not an absolute path) or the environment (`UV_INDEX`,
+  `UV_DEFAULT_INDEX`, `UV_INDEX_URL`, `UV_EXTRA_INDEX_URL`, `UV_FIND_LINKS`),
+  PyPI named as one included, leaves them all out, and a tool whose
+  `uv-receipt.toml` records an index, or a requirement with a git, address,
+  path or index source, is left out. A `uv.toml` in the directory mise ran uv
+  from is not known and not read.
+- cargo: crates from git, a path or another registry are left out. A crate
+  from a source that replaces crates.io (`[source.crates-io] replace-with`)
+  is still recorded as from crates.io, so every crate is left out, and the
+  reason said, where cargo's `config.toml` or `config` under `CARGO_HOME`,
+  `~/.cargo` or `/.cargo` has any `[source]` table or an `include`, or
+  cannot be read or parsed. cargo takes neither from the environment. The
+  `.cargo` of other directories above where `cargo install` ran is not
+  known and not read.
+
+What is left out this way is said as not checked, so a machine with such
+packages has an incomplete sweep. This holds as far as the files the tools
+leave behind tell. They cannot tell these, which are sent like any other
+package:
+
+- a global npm package installed from git or a tarball (`npm i -g
+  git+...`) under a name whose registry is the public one;
+- a Python package installed with `pip install --index-url` given on the
+  command line, directly or in a requirements file named there, into a
+  Python mise installed or a pipx environment too old to have a
+  `pipx_metadata.json`;
+- a setting exported in a way the files above do not show: by another
+  program, by a file read in through a path with a variable other than the
+  home and `OMARCHY_PATH` in it, by a file Hyprland reads with `source =`,
+  or by a project's own `mise.toml` outside the home;
+- a setting given on a tool's command line, such as `cargo install --config
+  'source.crates-io.replace-with=...'`.
+
+At every sweep the rest of the inventory goes to OSV: the ecosystem, the name
+and the version of each package, in requests of up to 500 packages per
+ecosystem (`api.osv.dev/v1/querybatch`, the lookup the gate uses for
+lockfiles), and nothing else. Nothing goes to the AI, the lookup costs no AI
+call, and there is no setting to turn it off: no profile, `local-only`
+included, stops the gate's OSV lookup either. Nothing of OSV's answers is
+kept, so a package found malicious after it was installed is told at the next
+sweep. `sweep allow` asks OSV again, to find the item it is told to allow.
+
+Each malicious package is an item where it is installed, named by its manifest,
+ecosystem and name (`/usr/lib/node_modules/x/package.json#npm:x`), with its
+version as what is remembered: a new version of it is a changed item, and an
+allow covers the version allowed.
+
+What is not checked makes the sweep incomplete: a manifest or directory that
+cannot be read or names no package and version, an environment with no
+`site-packages`, more than 20,000 packages or 100,000 directory entries, npm
+packages nested deeper than 8 levels, a package OSV listed more advisories for
+than one answer holds, and a request to OSV that failed (offline, OSV down),
+whose packages are each said as not checked, never as clear: one failed
+lookup leaves every package of its ecosystem not checked. An npm, pip or uv
+configuration file that is there and cannot be read (a broken link, not a
+regular file, closed, over 1 MiB, or for uv not TOML) is said as well, by its path alone: no npm package
+is looked up and the npm prefix it may set is not read, or no Python package
+pip (or uv) installed is looked up, since it may name a private registry or
+index. A `pipx_metadata.json`, `pip.conf` or `uv-receipt.toml` inside an
+environment that cannot be read is said too, and that environment is left
+out. A linked npm, pip or uv configuration file is followed, as the tool
+follows it (dotfile managers place them so). A link below where the tools keep their packages (a package directory
+`npm link` made, a linked environment, `lib`, `site-packages` or
+`node_modules`) is not followed, and a note names it; a link among the parts
+of such a place itself (an npm prefix, `CARGO_HOME`, mise's or pipx's home, a
+home kept on another disk) is followed, as the tool follows it. An
+`*.egg-info` package is not read.
+
+When npm is installed (`/usr/bin/npm`, or a node of mise's) and the
+configuration of any installed node's npm, read in the order above with each file
+winning over the one before (your `~/.npmrc` or the file
+`npm_config_userconfig` names over the global files, and
+`npm_config_ignore_scripts` in the environment over all), does not set
+`ignore-scripts=true`, a note says that npm runs the install scripts of every package it
+installs, which is how most malicious npm packages act, and how to turn them
+off (`npm config set ignore-scripts true`). It is said once, and again should
+it stop and come back. Only `prefix`, `globalconfig`, `ignore-scripts`, `registry` and the
+scopes' registries are taken from npm's files and `npm_config_*`
+variables, only the index settings from pip's and uv's, and only the
+`[source]` and `include` keys from cargo's; these hold registry tokens,
+and nothing of them is shown or sent.
 
 ### Guardian's own units
 
@@ -1755,6 +1972,7 @@ reviews as well, are listed under [Local rules](local-rules.md#rule-ids).
 | `privileged-account` | high | An account has rights no ordinary system gives it: a second account with user id 0, or a system account someone can log in to. |
 | `boot-tampering` | high | The running kernel was started with a parameter that turns off a defence or replaces init and that the reviewed boot configuration does not hold, or a kernel image or EFI program in `/boot` is not the one its package ships. |
 | `rootkit-sign` | high | The kernel's own lists disagree (a process, module or socket that exists is not listed), or a program wears a kernel thread's name: what something hiding itself looks like. |
+| `malicious-package` | high | An installed language package (npm, PyPI, crates.io) is a version OSV lists as malicious (an advisory whose id starts with `MAL-`). |
 | `traced-secrets` | high | A process is attached, the way a debugger is, to a program that holds secrets (a shell, SSH, sudo, a key agent, a browser, a password manager). |
 | `ssh-command` | medium | An SSH file runs a command or loads a library (a `ProxyCommand`, a `Match exec`, a provider library), or a key carries a `command=` or `environment=` option. |
 | `running-from-temp` | medium | A program runs from a temporary or cache directory, where downloads land. |

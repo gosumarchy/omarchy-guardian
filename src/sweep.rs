@@ -17,6 +17,8 @@
 //! - `root` is the read-only root collector behind `sweep --root`.
 //! - `agents` reads what AI coding agents start on their own (hooks, MCP
 //!   servers, plugins) out of their configuration, entry by entry.
+//! - `packages` looks the language packages installed outside pacman up
+//!   in OSV's list of malicious ones.
 
 mod access;
 mod agents;
@@ -32,6 +34,7 @@ mod lua;
 mod nvim;
 mod output;
 pub(crate) mod own;
+mod packages;
 mod path;
 mod programs;
 pub(crate) mod read;
@@ -146,9 +149,9 @@ fn home() -> Option<String> {
         })
 }
 
-/// Collects this system and the user's home.
-/// Collects this system and the user's home, and runs the live checks;
-/// returns the live checks' notes too.
+/// Collects this system and the user's home, runs the live checks and
+/// looks the language packages up in OSV (which waits on the network);
+/// returns the notes of those checks too.
 fn collect_here(home: Option<&str>) -> Result<(Collection, PackageIndex, Vec<String>), Error> {
     let index = index::foreign_packages()
         .and_then(|foreign| PackageIndex::load(Path::new(LOCAL_DB), foreign))
@@ -171,6 +174,10 @@ fn collect_here(home: Option<&str>) -> Result<(Collection, PackageIndex, Vec<Str
     collection.truncated.extend(live.unchecked);
     let mut notes = live.notes;
     notes.append(&mut collection.notes);
+    let packages = packages::check(&scope);
+    collect::merge(&mut collection, packages.items);
+    collection.truncated.extend(packages.unchecked);
+    notes.extend(packages.notes);
     // Guardian itself is installed that way, and says so nowhere else.
     let by_hand: Vec<&str> = index
         .unverified
@@ -897,9 +904,16 @@ fn show(options: Options, shown: &Shown<'_>) {
 
 /// Notes that state a fact about the machine rather than something that
 /// happened, by how they start, and what the sweep remembers once it has
-/// said one. Secure Boot is off on every default install: said at each
-/// sweep, it is noise that trains the eye to skip the notes.
-const FACTS: &[(&str, &str)] = &[("Secure Boot is off", "guardian:said-secure-boot-off")];
+/// said one. Secure Boot is off, and npm runs install scripts, on every
+/// default install: said at each sweep, that is noise that trains the eye
+/// to skip the notes.
+const FACTS: &[(&str, &str)] = &[
+    ("Secure Boot is off", "guardian:said-secure-boot-off"),
+    (
+        packages::INSTALL_SCRIPTS,
+        "guardian:said-npm-install-scripts",
+    ),
+];
 
 /// Takes out of `notes` the facts the sweep before already said (they stay
 /// with `all`, which shows everything), and returns what to remember: the
