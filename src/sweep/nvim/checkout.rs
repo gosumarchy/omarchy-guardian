@@ -288,7 +288,12 @@ fn walk(
 /// hooks, the keys of the configuration of the checkout and of each
 /// submodule (`.git/modules`) that a clone does not write, and every entry
 /// of those git directories that is not plain data (see `PLAIN_DATA`).
-fn git(root: &Path, path: &str, inner: Vec<String>, unchecked: &mut Vec<String>) -> Option<Git> {
+fn git(
+    root: &Path,
+    path: &str,
+    mut inner: Vec<String>,
+    unchecked: &mut Vec<String>,
+) -> Option<Git> {
     let directory = format!("{path}/.git");
     if !fs::symlink_metadata(root.join(&directory)).is_ok_and(|metadata| metadata.is_dir()) {
         return None;
@@ -334,6 +339,9 @@ fn git(root: &Path, path: &str, inner: Vec<String>, unchecked: &mut Vec<String>)
         gitmodules,
         ..
     } = gits;
+    // In path order, not the order directories list them in: the runs
+    // are hashed.
+    inner.sort_unstable();
     let inner = inner
         .into_iter()
         .filter(|file| !is_submodule_pointer(root, path, file, gitmodules.as_deref()));
