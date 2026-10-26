@@ -1206,7 +1206,7 @@ fn test_samples(
         settings,
         isolated,
     )
-    .map_err(|error| error.into_error().to_string())?;
+    .map_err(|error| error.to_string())?;
     if bad.status != Status::Suspicious && bad.findings.is_empty() {
         return Err("the model did not flag the malicious sample".into());
     }
@@ -1224,7 +1224,7 @@ fn test_samples(
         settings,
         isolated,
     )
-    .map_err(|error| error.into_error().to_string())?;
+    .map_err(|error| error.to_string())?;
     if clean.status != Status::Clear || !clean.findings.is_empty() {
         return Err("the model flagged a harmless sample".into());
     }

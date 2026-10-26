@@ -47,18 +47,10 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io { source, .. } | Self::Spawn { source, .. } => Some(source),
-            Self::TimedOut { .. }
-            | Self::ToolFailed { .. }
-            | Self::OutputTooLarge { .. }
-            | Self::Parse { .. }
-            | Self::Refused(_) => None,
-        }
-    }
-}
+// No `source()`: `Display` already shows the I/O error an `Io` or `Spawn`
+// carries, because the CLI prints only the top-level message, and a chain
+// walk would show it twice.
+impl std::error::Error for Error {}
 
 /// Attaches the path an I/O operation was acting on.
 pub(crate) trait IoContext<T> {

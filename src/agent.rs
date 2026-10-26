@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::fs::{self, DirBuilder, File};
 use std::io::Read;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -275,6 +275,19 @@ pub(crate) enum AgentError {
     /// drops it, and the next reply must carry its own new nonce.
     NonceMissing,
 }
+
+impl fmt::Display for AgentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable(error) | Self::Invalid(error) | Self::OutOfTime(error) => {
+                error.fmt(f)
+            }
+            Self::NonceMissing => Error::parse(REPORT, NONCE_MISSING).fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for AgentError {}
 
 impl AgentError {
     pub(crate) fn into_error(self) -> Error {
