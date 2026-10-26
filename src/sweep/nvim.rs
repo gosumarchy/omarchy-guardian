@@ -4,11 +4,13 @@
 //!
 //! Each plugin is one item, listed under its directory. Its content hash
 //! covers every file of it outside `.git`, the address it was cloned from,
-//! the commit it is at, its git hooks and the keys of its `.git/config`
-//! that run commands: what of a checkout runs, or decides what runs. So
-//! the sweep's record of what is new or changed, its notifications and
+//! the commit it is at, and what git may run in it: the hooks and the keys
+//! that run commands of the checkout and of each submodule under
+//! `.git/modules` (`config`, `config.worktree`, `core.hooksPath`). So the
+//! sweep's record of what is new or changed, its notifications and
 //! `sweep allow` see a change to any of them. The rest of `.git` (objects,
-//! the index, logs) changes with every update and runs nothing.
+//! refs, the index, logs) changes with every update and is data git reads,
+//! not commands it runs; what git does with it is not checked.
 //! What a checkout says is read as files and never by running git: the
 //! origin from `.git/config`, the commit from `.git/HEAD` and the refs,
 //! and the commit `lazy-lock.json` pins.
@@ -477,7 +479,8 @@ fn git_alerts(name: &str, git: &Git, specs: &Specs, alerts: &mut Vec<(RuleId, St
         alerts.push((
             RuleId::GitConfigCommand,
             format!(
-                "line {line}: .git/{file} runs a command on the git commands lazy.nvim runs: {}",
+                "line {line}: {} runs a command on the git commands lazy.nvim runs: {}",
+                shown(file),
                 shown(key)
             ),
         ));

