@@ -496,7 +496,10 @@ fn fetched_from(spec: &Spec) -> String {
     }
 }
 
-/// `commands` as they are said: each in backquotes, joined by "or".
+/// `commands` as a report note or alert says them: each in backquotes,
+/// joined by "or". Never for the facts the AI reads, where a backquote in
+/// a command would end the quote and let the rest pass for Guardian's
+/// words (see `fact`).
 fn quoted(commands: &[String]) -> String {
     commands
         .iter()
@@ -657,8 +660,9 @@ pub(super) enum News {
 }
 
 /// What Guardian established about `plugin`, listed as `label`, for the AI
-/// review of its files, which go for `news`. Strings that come from the
-/// plugin are quoted, so a crafted one cannot pose as Guardian's words.
+/// review of its files, which go for `news`. Every string that comes from
+/// the plugin is written as a Rust string literal (`{:?}`), which escapes
+/// any quote in it, so a crafted one cannot pose as Guardian's words.
 pub(super) fn fact(plugin: &Plugin, label: &str, news: News) -> String {
     let mut text = format!(
         "{:?} is a Neovim plugin lazy.nvim installed",
@@ -684,8 +688,8 @@ pub(super) fn fact(plugin: &Plugin, label: &str, news: News) -> String {
         let _ = match build {
             Build::Shell(command) => write!(
                 text,
-                " Its spec's build step runs {} in a shell when lazy.nvim installs or updates it.",
-                quoted(std::slice::from_ref(command))
+                " Its spec's build step runs {:?} in a shell when lazy.nvim installs or updates it.",
+                shown(command).as_ref()
             ),
             Build::Command(command) => write!(
                 text,
@@ -698,7 +702,11 @@ pub(super) fn fact(plugin: &Plugin, label: &str, news: News) -> String {
             Build::Lua(strings) => write!(
                 text,
                 " Its spec's build step is Lua code that may run {} when lazy.nvim installs or updates it.",
-                quoted(strings)
+                strings
+                    .iter()
+                    .map(|string| format!("{:?}", shown(string).as_ref()))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
             ),
         };
     }
