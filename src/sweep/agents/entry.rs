@@ -175,7 +175,8 @@ pub(super) fn add(scope: &Scope<'_>, source: &Source<'_>, entries: Entries, foun
 /// and before it, on a comment line, the names of the variables it is
 /// started with. What it runs, which is followed, is each reading of the
 /// command line with a plugin's directory written in (see
-/// `plugin_root_readings`); the text is the first without its secrets.
+/// `plugin_root_readings`); the text is the line as written, without its
+/// secrets.
 fn item(scope: &Scope<'_>, source: &Source<'_>, entry: Entry) -> Item {
     let Entry {
         key,
@@ -187,14 +188,12 @@ fn item(scope: &Scope<'_>, source: &Source<'_>, entry: Entry) -> Item {
     let mut alerts = Vec::new();
     let started = match launch {
         Launch::Command(line) => {
-            // Followed as written: a script passed as the value of a
+            // Followed with its secrets: a script passed as the value of a
             // secret-named flag is still found. The collector takes the
             // secrets out once it has been followed (see
-            // `hide_secrets_in_runs`), which makes it this same text.
-            let mut readings = plugin_root_readings(&line, source.plugin_root);
-            let text = redacted(&readings[0]);
-            runs.append(&mut readings);
-            text
+            // `hide_secrets_in_runs`).
+            runs.extend(plugin_root_readings(&line, source.plugin_root));
+            redacted(&line)
         }
         Launch::Remote { scheme, host } => {
             alerts.extend(remote_alert(&host));
@@ -415,37 +414,37 @@ const PLUGIN_ROOT: &str = "CLAUDE_PLUGIN_ROOT";
 
 /// The readings of `line` that are followed, with the plugin's directory
 /// (`root`, relative to the root) written in for `${CLAUDE_PLUGIN_ROOT}`
-/// and `$CLAUDE_PLUGIN_ROOT`. The first is also the text reviewed, so it
-/// keeps each default form as written (`${CLAUDE_PLUGIN_ROOT:-.}`, as
-/// trailofbits' modern-python writes its hook): the line may unset the
-/// variable first, and the default then names what runs. When the line has
-/// such a form, it is also read with the variable set and with each default
-/// taken. Only a default of path characters is read either way; any other
-/// (`$(…)`, another variable, quotes) stays as written in every reading,
-/// since its closing brace cannot be found without a shell's parser.
+/// and `$CLAUDE_PLUGIN_ROOT`: as Claude Code runs it, with the variable
+/// set, and, when the line has a form with a default
+/// (`${CLAUDE_PLUGIN_ROOT:-.}`, as trailofbits' modern-python writes its
+/// hook), with each default taken. Only a default of path characters is
+/// read either way; any other (`$(…)`, another variable, quotes) stays as
+/// written in both, since its closing brace cannot be found without a
+/// shell's parser. None of these is the text reviewed: the line itself may
+/// unset or change the variable, so that text is the line as written.
 pub(super) fn plugin_root_readings(line: &str, root: Option<&str>) -> Vec<String> {
     let Some(root) = root else {
         return vec![line.to_string()];
     };
     let directory = format!("/{root}");
-    let mut readings: Vec<String> = Vec::new();
-    for reading in [Reading::AsWritten, Reading::Set, Reading::Unset] {
-        let read = with_plugin_root(line, &directory, reading);
-        if !readings.contains(&read) {
-            readings.push(read);
-        }
+    let set = with_plugin_root(line, &directory, Reading::Set);
+    let unset = with_plugin_root(line, &directory, Reading::Unset);
+    if unset == set {
+        vec![set]
+    } else {
+        vec![set, unset]
     }
-    readings
 }
 
 /// How a default form of the plugin's variable is read.
 #[derive(Debug, Clone, Copy)]
 enum Reading {
-    AsWritten,
     /// Claude Code sets the variable for a plugin's commands.
     Set,
-    /// The line unset it first. The plain forms keep the directory, which
-    /// at worst follows a script that does not run.
+    /// The line unset it first. The plain forms keep the directory: written
+    /// in empty, they would add a reading of every plugin command, naming a
+    /// script that is not there, and the text reviewed shows them as
+    /// written anyway.
     Unset,
 }
 
@@ -496,7 +495,7 @@ fn with_braced_plugin_root(line: &str, directory: &str, reading: Reading) -> Str
             let written = match (word.is_empty(), default, reading) {
                 (true, _, _) | (false, Some(_), Reading::Set) => directory,
                 (false, Some(default), Reading::Unset) => default,
-                (false, Some(_), Reading::AsWritten) | (false, None, _) => return None,
+                (false, None, _) => return None,
             };
             Some((written, end))
         });

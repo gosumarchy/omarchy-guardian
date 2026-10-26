@@ -279,7 +279,8 @@ fn a_plugin_is_read_through_its_install_and_its_scripts_are_followed() {
         root,
         &format!("{cache}/hooks/hooks.json"),
         r#"{"description": "d", "hooks": {"SessionStart": [{"hooks": [
-            {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X"}
+            {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X"},
+            {"type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT:-.}/hooks/shims.sh\""}
         ]}]}}"#,
     );
     write(
@@ -301,9 +302,32 @@ fn a_plugin_is_read_through_its_install_and_its_scripts_are_followed() {
         &found,
         &format!("{list}#plugins/guard@market/0/hooks/SessionStart/0/0"),
     );
-    let started = format!("bash \"/{cache}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X");
-    assert_eq!(text(start), format!("{started}\n"));
-    assert_eq!(start.runs, [started]);
+    // The text is the line as written: the line may change the variable.
+    assert_eq!(
+        text(start),
+        "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X\n"
+    );
+    assert_eq!(
+        start.runs,
+        [format!(
+            "bash \"/{cache}/hooks/start.sh\" $CLAUDE_PLUGIN_ROOT_X"
+        )]
+    );
+    let shims = at(
+        &found,
+        &format!("{list}#plugins/guard@market/0/hooks/SessionStart/0/1"),
+    );
+    assert_eq!(
+        text(shims),
+        "bash \"${CLAUDE_PLUGIN_ROOT:-.}/hooks/shims.sh\"\n"
+    );
+    assert_eq!(
+        shims.runs,
+        [
+            format!("bash \"/{cache}/hooks/shims.sh\""),
+            "bash \"./hooks/shims.sh\"".to_string(),
+        ]
+    );
     assert_eq!(
         start.notes,
         ["of the Claude Code plugin guard@market (version 1.0.0)"]
@@ -318,13 +342,14 @@ fn a_plugin_is_read_through_its_install_and_its_scripts_are_followed() {
         &format!("{list}#plugins/guard@market/0/hooks-file-2/Stop/0/0"),
     );
     assert_eq!(stop.runs, [format!("/{cache}/stop")]);
-    // The default hooks file the manifest names again is read once.
+    // The default hooks file the manifest names again is read once: its
+    // two hooks, not four.
     let starts = found
         .items
         .iter()
         .filter(|item| item.path.contains("SessionStart"))
         .count();
-    assert_eq!(starts, 1);
+    assert_eq!(starts, 2);
 
     assert_eq!(found.unchecked.len(), 2, "{:?}", found.unchecked);
     assert!(found.unchecked[0].contains("outside its plugin (../../outside.json)"));
@@ -963,18 +988,14 @@ fn the_plugin_directory_is_written_in_only_for_its_own_variable() {
 }
 
 #[test]
-fn a_plugin_directory_default_stays_in_the_text_and_both_readings_are_followed() {
+fn a_plugin_directory_default_is_followed_both_set_and_taken() {
     let root = Some("home/u/p");
-    // As trailofbits' modern-python writes its hook: Claude Code sets the
-    // variable, but the line may unset it first, and the default then
-    // names what runs.
     assert_eq!(
         plugin_root_readings(
             r#"bash "${CLAUDE_PLUGIN_ROOT:-.}/hooks/a.sh" ${CLAUDE_PLUGIN_ROOT-x}/b ${CLAUDE_PLUGIN_ROOT:=y}/c"#,
             root
         ),
         [
-            r#"bash "${CLAUDE_PLUGIN_ROOT:-.}/hooks/a.sh" ${CLAUDE_PLUGIN_ROOT-x}/b ${CLAUDE_PLUGIN_ROOT:=y}/c"#,
             r#"bash "/home/u/p/hooks/a.sh" /home/u/p/b /home/u/p/c"#,
             r#"bash "./hooks/a.sh" x/b y/c"#,
         ]
@@ -985,7 +1006,6 @@ fn a_plugin_directory_default_stays_in_the_text_and_both_readings_are_followed()
             root
         ),
         [
-            "unset CLAUDE_PLUGIN_ROOT; bash ${CLAUDE_PLUGIN_ROOT:-/x}/r.sh /home/u/p/s",
             "unset CLAUDE_PLUGIN_ROOT; bash /home/u/p/r.sh /home/u/p/s",
             "unset CLAUDE_PLUGIN_ROOT; bash /x/r.sh /home/u/p/s",
         ]
