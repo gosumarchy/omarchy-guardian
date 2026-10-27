@@ -48,11 +48,12 @@ and severities are listed [at the end of this page](#rule-ids).
 
 Shell execution reports every Python `subprocess` call, but grades it: a call
 that passes no shell runs one program and no shell parses its arguments, so it
-is low. One that passes `shell` any value but `False` on the same line
+is low. One whose line gives the `shell=` keyword any value but `False`
 (`shell=True`, `shell=1`, `shell=use_shell`) stays medium, as does a line that
 also matches another shell-execution pattern (`os.system(`, `eval(`, ...). A
-call written over several lines with `shell=True` on a later one is rated low;
-it is still reported.
+call written over several lines with `shell=True` on a later one, or that
+passes `shell` through `**kwargs` or a dictionary, is rated low; it is still
+reported.
 
 Download-to-shell also covers a fetch piped into another interpreter (`|
 python`, `| perl`, `| node`, ...), behind a wrapper (`| timeout 5 sh`, `|

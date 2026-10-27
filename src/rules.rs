@@ -242,13 +242,14 @@ impl RuleId {
     /// shell low.
     pub(crate) fn severity_on(self, lowered: &str) -> Severity {
         // The owner's decision: a `subprocess` call is still reported, but
-        // at low unless the same line passes it a shell. Given a list of
-        // arguments and no shell it runs one program, and no shell parses
-        // what it is given; a real sweep reported 17 such calls in harmless
-        // Python hooks (`subprocess.run(["git", ...])`) at medium. Not
-        // reporting them at all was rejected, since a payload can still
+        // at low unless the same line gives it the `shell=` keyword. Given a
+        // list of arguments and no shell it runs one program, and no shell
+        // parses what it is given; a real sweep reported 17 such calls in
+        // harmless Python hooks (`subprocess.run(["git", ...])`) at medium.
+        // Not reporting them at all was rejected, since a payload can still
         // hide behind one. Accepted downside: a call written over several
-        // lines with `shell=True` on a later one is rated low instead of
+        // lines with `shell=True` on a later one, or that passes `shell`
+        // through `**kwargs` or a dictionary, is rated low instead of
         // medium; it is still reported, so nothing is hidden.
         let subprocess_without_shell = self == Self::ShellCommandExecution
             && contains_any(lowered, SUBPROCESS_CALLS)
