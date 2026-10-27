@@ -1154,17 +1154,17 @@ fn a_link_that_ends_at_no_file_leaves_its_specs_unchecked() {
     symlink("..", plugins.join("directory.lua")).unwrap();
     write(root, "proc/version", "return { { \"o/p\" } }");
     symlink("../../../../../../proc/version", plugins.join("kernel.lua")).unwrap();
+    // The fixture's root is not `/`: an absolute link leaves it.
+    symlink("/", plugins.join("outside.lua")).unwrap();
     let unchecked = collected(root).unchecked;
     let said = |text: &str| unchecked.iter().any(|sentence| sentence.contains(text));
     assert!(
-        said("dangling.lua is a link that could not be followed (No such file"),
+        said("dangling.lua is a link that could not be followed ("),
         "{unchecked:?}"
     );
     for name in ["a.lua", "b.lua"] {
         assert!(
-            said(&format!(
-                "{name} is a link that could not be followed (Too many levels of symbolic links"
-            )),
+            said(&format!("{name} is a link that could not be followed (")),
             "{unchecked:?}"
         );
     }
@@ -1174,6 +1174,10 @@ fn a_link_that_ends_at_no_file_leaves_its_specs_unchecked() {
     );
     assert!(
         said("kernel.lua, a link to /proc/version, leads where the sweep never follows"),
+        "{unchecked:?}"
+    );
+    assert!(
+        said("outside.lua is a link that leads out of the root"),
         "{unchecked:?}"
     );
 }

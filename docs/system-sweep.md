@@ -213,7 +213,7 @@ extra look at the program it names. The limits:
 | Files one pattern stands for | 1024 |
 | A line of a start-up file looked through for programs | 64 KB |
 | One command line split into its commands (a longer one is taken as a single command) | 64 KB |
-| Links in a chain (one among Neovim's spec files: as the kernel follows them, see [Neovim plugins](#neovim-plugins)) | 8 |
+| Links in a chain (40 for one among Neovim's spec files, as the kernel follows them: see [Neovim plugins](#neovim-plugins)) | 8 |
 | Scripts in a chain, each started by the one before | 3 |
 
 Where one of these limits is reached, the item says so in its notes and

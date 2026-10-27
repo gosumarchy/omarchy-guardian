@@ -392,10 +392,14 @@ fn spec_text(root: &Path, path: &str, placed: Placed) -> Result<String, String> 
 fn followed(root: &Path, path: &str) -> Result<String, String> {
     let real = fs::canonicalize(root.join(path))
         .map_err(|error| format!(" is a link that could not be followed ({error})"))?;
-    let end = fs::canonicalize(root)
-        .ok()
-        .and_then(|root| Some(real.strip_prefix(root).ok()?.to_str()?.to_string()))
-        .ok_or_else(|| " is a link that leads out of the root".to_string())?;
+    let root = fs::canonicalize(root)
+        .map_err(|error| format!(" could not be followed: the root ({error})"))?;
+    let end = real
+        .strip_prefix(&root)
+        .map_err(|_| " is a link that leads out of the root".to_string())?
+        .to_str()
+        .ok_or(" is a link to a path that is not UTF-8")?
+        .to_string();
     if crate::rules::is_sensitive_path(&end) {
         return Err(format!(
             ", a link to /{end}, leads to a file whose name says it holds secrets, so it is not read"
