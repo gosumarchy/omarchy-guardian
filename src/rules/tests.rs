@@ -686,6 +686,9 @@ fn a_subprocess_call_is_low_unless_it_passes_a_shell() {
         "subprocess.run(cmd, use_shell=True)",
         "subprocess.run(cmd, env={\"SHELL\": \"/bin/zsh\"})",
         "if shell == True: subprocess.run(args)",
+        // The accepted downside: `shell=True` on a later line of the call
+        // is not seen, so the call is rated low (and still reported).
+        "subprocess.run(",
     ] {
         assert_eq!(severity(line), Severity::Low, "{line}");
     }
@@ -704,6 +707,11 @@ fn a_subprocess_call_is_low_unless_it_passes_a_shell() {
     ] {
         assert_eq!(severity(line), Severity::Medium, "{line}");
     }
+    // A line without a `subprocess` call is not graded down.
+    assert_eq!(
+        RuleId::ShellCommandExecution.severity_on("no call here"),
+        Severity::Medium
+    );
     // Every other rule keeps its own severity on any line.
     assert_eq!(
         RuleId::DownloadAndExecute.severity_on("subprocess.run([\"x\"])"),

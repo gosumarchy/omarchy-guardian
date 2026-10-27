@@ -412,8 +412,7 @@ fn push_finding(report: &mut Report, rel: &str, number: usize, line: &str, rule:
     report.findings.push(finding(rel, number, line, rule));
 }
 
-/// A finding at the rule's own severity; a line rule's match is graded by
-/// the line instead (see `RuleId::severity_on`).
+/// A finding at the rule's own severity.
 fn finding(rel: &str, number: usize, line: &str, rule: RuleId) -> LocalFinding {
     LocalFinding {
         path: rel.to_string(),

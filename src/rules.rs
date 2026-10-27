@@ -236,10 +236,10 @@ impl RuleId {
         }
     }
 
-    /// The severity of this rule's match on `lowered`, the lowercased line
-    /// it matched. The same as `severity` for every rule but
-    /// `shell-command-execution`, which rates a `subprocess` call that
-    /// passes no shell low.
+    /// The severity of this rule on `lowered`, a lowercased line. The same
+    /// as `severity` for every rule but `shell-command-execution`, which
+    /// rates a line whose only match is a `subprocess` call that passes no
+    /// shell low.
     pub(crate) fn severity_on(self, lowered: &str) -> Severity {
         // The owner's decision: a `subprocess` call is still reported, but
         // at low unless the same line passes it a shell. Given a list of
@@ -251,6 +251,7 @@ impl RuleId {
         // lines with `shell=True` on a later one is rated low instead of
         // medium; it is still reported, so nothing is hidden.
         let subprocess_without_shell = self == Self::ShellCommandExecution
+            && contains_any(lowered, SUBPROCESS_CALLS)
             && !contains_any(lowered, SHELL_EXECUTION)
             && !passes_shell(lowered);
         if subprocess_without_shell {
