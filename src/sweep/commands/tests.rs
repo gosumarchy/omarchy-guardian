@@ -409,6 +409,7 @@ fn a_line_of_commands_splits_where_a_shell_would() {
         search: &[],
         exists: &|_| false,
         capped: std::cell::Cell::new(false),
+        unwritten: std::cell::Cell::new(false),
         shell_scripts: std::cell::RefCell::default(),
     };
     lookup.targets(&nested);
@@ -466,10 +467,24 @@ fn what_a_start_up_file_or_a_command_line_names_is_found() {
         "{:?}",
         commands(Category::Shell, "etc/profile.d/debuginfod.sh", debuginfod)
     );
+    // An empty substitution leaves the next word as the command: both are
+    // kept.
+    for line in [
+        "$( true ) /opt/evil",
+        "X=$(a $(b)x c) /opt/evil",
+        "\"$(a)\"b /opt/evil",
+    ] {
+        let runs = commands(Category::Shell, "home/u/.bashrc", line);
+        assert!(runs.contains(&"/opt/evil".to_string()), "{line}: {runs:?}");
+    }
     // A line of nothing but substitutions is read once, not once per
-    // substitution.
+    // substitution: `/x1`, `/x2`, and what `/x1` prints, which the line
+    // runs as its command.
     let many = "$(/x1 $(/x2 ".repeat(100);
-    assert_eq!(commands(Category::Shell, "home/u/.bashrc", &many).len(), 2);
+    assert_eq!(
+        commands(Category::Shell, "home/u/.bashrc", &many),
+        ["$(/x1", "/x1", "/x2"]
+    );
     let long = "$(/x ".repeat(400_000);
     let started = CpuInstant::now();
     assert!(commands(Category::Shell, "home/u/.bashrc", &long).is_empty());
@@ -513,6 +528,7 @@ fn what_a_start_up_file_or_a_command_line_names_is_found() {
             ["home/u/.local/share/mise/shims/sh", "usr/bin/sh"].contains(&candidate)
         },
         capped: std::cell::Cell::new(false),
+        unwritten: std::cell::Cell::new(false),
         shell_scripts: std::cell::RefCell::default(),
     };
     assert_eq!(
@@ -589,6 +605,7 @@ fn the_script_is_found_for_every_interpreter_and_past_its_options() {
         search: &super::default_search("home/u"),
         exists: &exists,
         capped: std::cell::Cell::new(false),
+        unwritten: std::cell::Cell::new(false),
         shell_scripts: std::cell::RefCell::default(),
     };
     // Interpreters the live checks knew and this one did not.
@@ -831,5 +848,203 @@ fn what_runs_is_found_past_wrappers_and_in_files_that_are_read_in() {
             runs,
             "{line}"
         );
+    }
+}
+
+#[test]
+fn a_script_names_its_own_directory_in_the_ways_scripts_do() {
+    use super::with_script_directory;
+    let path = "home/u/w/s/x.sh";
+    let runs = |first: &str, line: &str| {
+        let text = format!("{first}\n{line}\n");
+        commands(
+            Category::Shell,
+            path,
+            &with_script_directory(&text, path, path),
+        )
+    };
+    for line in [
+        r#". "$(dirname "$0")/c.sh""#,
+        ". $(dirname $0)/c.sh",
+        r#". "${0%/*}/c.sh""#,
+        r#". "$(dirname "$(readlink -f "$0")")/c.sh""#,
+        r#". "$(dirname "$(realpath -- "$0")")/c.sh""#,
+        r#"source "$(dirname "${BASH_SOURCE[0]}")/c.sh""#,
+        r#". "${BASH_SOURCE%/*}/c.sh""#,
+        r#". "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)/c.sh""#,
+        "D=\"$(cd \"$(dirname \"$0\")\" && pwd -P)\"\n. \"$D/c.sh\"",
+    ] {
+        assert_eq!(runs("#!/bin/bash", line), ["/home/u/w/s/c.sh"], "{line}");
+    }
+    // Another file's directory, a `cd` that goes on to do more or prints
+    // nothing, the text `'$0'`, a quote left open around the `)`, and
+    // `$BASH_SOURCE` where no bash sets it are not the script's own. Each
+    // is kept as written, sourced or run, so following says it is unknown.
+    for (first, line) in [
+        ("#!/bin/bash", r#". "$(dirname "$1")/c.sh""#),
+        ("#!/bin/bash", r#""$(dirname "$1")/c.sh" a"#),
+        ("#!/bin/bash", r#""$(pwd)/c.sh""#),
+        ("#!/bin/bash", r#""$1/c.sh" a"#),
+        (
+            "#!/bin/bash",
+            r#". "$(cd "$(dirname "$0")" && git rev-parse --show-toplevel)/c.sh""#,
+        ),
+        (
+            "#!/bin/bash",
+            r#". "$(cd "$(dirname "$0")" && pwd >/dev/null)/c.sh""#,
+        ),
+        ("#!/bin/bash", r#". "$(cd "$(dirname "$0")" pwd)/c.sh""#),
+        (
+            "#!/bin/bash",
+            r#". "$(cd "$(dirname "$0")" /dev/null && pwd)/c.sh""#,
+        ),
+        (
+            "#!/bin/bash",
+            r#". "$(cd "$(dirname "$0")" -P && pwd)/c.sh""#,
+        ),
+        ("#!/bin/bash", ". \"$(dirname '$0')/c.sh\""),
+        ("#!/bin/bash", r#". $(dirname "$0)/../o")/c.sh"#),
+        ("#!/bin/sh", r#". "$(dirname "${BASH_SOURCE[0]}")/c.sh""#),
+        ("#!/bin/sh", r#""$(dirname "${BASH_SOURCE[0]}")/c.sh" a"#),
+        ("#!/bin/sh", r#". "${BASH_SOURCE%/*}/c.sh""#),
+    ] {
+        let runs = runs(first, line);
+        assert!(
+            runs.iter().all(|run| !run.starts_with("/home/u/w/s/"))
+                && runs.iter().any(|run| run.contains('$')),
+            "{line}: {runs:?}"
+        );
+    }
+}
+
+#[test]
+fn a_script_in_a_directory_a_shell_would_split_keeps_its_own_directory_unwritten() {
+    use super::with_script_directory;
+    for directory in ["x\"y", "q'r", "a b", "$(z", "b`c", "s;t", "a&b", "p|q"] {
+        let path = format!("home/u/{directory}/x.sh");
+        for line in [
+            r#"X="$(dirname "$0")" /opt/evil"#,
+            r#"X=$(dirname "$0") /opt/evil"#,
+        ] {
+            let text = format!("#!/bin/sh\n{line}\n");
+            let written = with_script_directory(&text, &path, &path);
+            assert_eq!(written, text, "{directory}");
+            let runs = commands(Category::Shell, &path, &written);
+            assert!(
+                runs.contains(&"/opt/evil".to_string()),
+                "{directory}: {runs:?}"
+            );
+        }
+        // Sourced, the substitution is kept for the lookup to say so.
+        let text = "#!/bin/sh\n. \"$(dirname \"$0\")/c.sh\"\n";
+        let runs = commands(
+            Category::Shell,
+            &path,
+            &with_script_directory(text, &path, &path),
+        );
+        assert!(
+            runs.iter().any(|run| run.contains("$(")),
+            "{directory}: {runs:?}"
+        );
+    }
+    // A plain link to a file in such a directory: `readlink -f` would
+    // write the real file in.
+    let text = "#!/bin/sh\nX=\"$(readlink -f \"$0\")\" /opt/evil\n";
+    let written = with_script_directory(text, "home/u/link.sh", "home/u/a b/x.sh");
+    assert_eq!(written, text);
+    let runs = commands(Category::Shell, "home/u/link.sh", &written);
+    assert!(runs.contains(&"/opt/evil".to_string()), "{runs:?}");
+}
+
+#[test]
+fn a_line_that_would_grow_long_keeps_its_own_directory_unwritten() {
+    use super::{MAX_STARTED_LINE, with_script_directory};
+    let path = "home/u/a/rather/deep/directory/x.sh";
+    let line = "${0%/*}/c ".repeat(MAX_STARTED_LINE / 10 - 1);
+    let text = format!("#!/bin/sh\n{line}\n");
+    assert!(line.len() <= MAX_STARTED_LINE);
+    assert_eq!(with_script_directory(&text, path, path), text);
+    // Left as written, each `${0%/*}/c` is a program no one can tell.
+    assert!(commands(Category::Shell, path, &text).contains(&"${0%/*}/c".to_string()));
+}
+
+#[test]
+fn writing_in_a_scripts_directory_takes_time_in_proportion_to_the_line() {
+    use super::with_script_directory;
+    // Each `$(` here holds another up to the one `)` at the end.
+    let line = format!("dirname {})", "$(".repeat(30_000));
+    let text = format!("#!/bin/bash\n{line}\n");
+    let start = CpuInstant::now();
+    with_script_directory(&text, "home/u/x.sh", "home/u/x.sh");
+    let spent = start.elapsed();
+    // Arbitrary, and generous: linear work on 60 KB takes well under a
+    // millisecond; the quadratic scan this guards against took seconds.
+    assert!(spent.as_millis() < 500, "{spent:?}");
+}
+
+#[test]
+fn a_statement_after_quotes_is_still_one() {
+    let runs = |line: &str| {
+        commands(
+            Category::Shell,
+            "home/u/x.sh",
+            &format!("#!/bin/sh\n{line}\n"),
+        )
+    };
+    for line in [
+        r"echo \'; /opt/evil",
+        r#"echo "a\"'"; /opt/evil"#,
+        r"echo $'\''; /opt/evil",
+        "eval 'cd /x; /opt/evil'",
+        "trap 'rm f; /opt/evil' EXIT",
+        "sh -c 'cd /x; /opt/evil'",
+    ] {
+        // `trap`'s quote, cut at the `;`, joins `EXIT` to the program's
+        // word; the lookup takes the program from it all the same.
+        let found = runs(line);
+        assert!(
+            found.iter().any(|run| run.starts_with("/opt/evil")),
+            "{line}: {found:?}"
+        );
+    }
+    // A quoted jq filter's `//` is no program.
+    assert!(runs(r#"X=$(echo "$I" | jq -r '(.a | .b) // ""')"#).is_empty());
+}
+
+#[test]
+fn a_program_named_through_a_variable_is_said_to_be_unknown() {
+    let lookup = super::Lookup {
+        home: "home/u",
+        search: &[],
+        exists: &|_| false,
+        capped: std::cell::Cell::new(false),
+        unwritten: std::cell::Cell::new(false),
+        shell_scripts: std::cell::RefCell::default(),
+    };
+    for command in [
+        "$TOOLS/x.sh",
+        "bash \"$X/y.sh\"",
+        "$(dirname",
+        "`pwd`/x",
+        "$HOMEBREW_PREFIX/bin/brew",
+        "/opt/$V/run",
+        "~/.config/$X/init.sh",
+    ] {
+        lookup.unwritten.set(false);
+        lookup.targets(command);
+        assert!(lookup.unwritten.get(), "{command}");
+    }
+    for command in [
+        "$HOME/x.sh",
+        "${HOME}/x.sh",
+        "$XDG_CONFIG_HOME/x.sh",
+        "/bin/x",
+        "bash /x/y.sh",
+        "x $FOO",
+        "echo $(date)",
+    ] {
+        lookup.unwritten.set(false);
+        lookup.targets(command);
+        assert!(!lookup.unwritten.get(), "{command}");
     }
 }

@@ -10,7 +10,7 @@ use super::{lua, read};
 use crate::autorun::Category;
 use crate::paths::file_name;
 
-pub(super) use shell::{is_shell_script, sourced_files};
+pub(super) use shell::{is_shell_script, sourced_files, with_script_directory};
 use shell::{path_variables, sourced, started, without_case_patterns, zdotdir};
 use targets::split;
 pub(super) use targets::{

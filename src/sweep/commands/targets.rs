@@ -193,6 +193,7 @@ pub(super) fn targets_where(
         search: &default_search(home),
         exists,
         capped: std::cell::Cell::new(false),
+        unwritten: std::cell::Cell::new(false),
         shell_scripts: std::cell::RefCell::default(),
     }
     .targets(command)
@@ -210,6 +211,9 @@ pub(crate) struct Lookup<'a> {
     pub(crate) exists: &'a dyn Fn(&str) -> bool,
     /// Set when a line held more commands than are looked up.
     pub(crate) capped: std::cell::Cell<bool>,
+    /// Set when a command names its program or script through a variable
+    /// or a substitution that is not written in (see `is_unwritten`).
+    pub(crate) unwritten: std::cell::Cell<bool>,
     /// The files a shell was handed as its script (`sh /x/run`): that a
     /// shell runs a file is what says it is a shell script, whatever its
     /// name and first line.
@@ -289,6 +293,9 @@ fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
     let Some(program) = words.next() else {
         return found;
     };
+    if is_unwritten(lookup.home, program) {
+        lookup.unwritten.set(true);
+    }
     found.extend(locate(lookup, program));
     let mut name = file_name(program);
     // `busybox sh script`: the shell is the applet it is asked to be.
@@ -343,6 +350,9 @@ fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
             if argument == Argument::Option {
                 continue;
             }
+            if is_unwritten(lookup.home, word) {
+                lookup.unwritten.set(true);
+            }
             if word.contains('/') {
                 let script = locate(lookup, word);
                 if shell {
@@ -367,6 +377,15 @@ fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
         }
     }
     found
+}
+
+/// Whether `word`, a program or a script, is named through a variable or
+/// a substitution that nothing wrote in (`$SCRIPT_DIR/x`, `/opt/$V/run`,
+/// `$(dirname`, `` `pwd`/x ``), so the file that runs is not known here.
+/// What `expand` writes in (`~`, `$HOME`, the XDG directories at their
+/// default places) is known; `$HOMEBREW_PREFIX` is not.
+fn is_unwritten(home: &str, word: &str) -> bool {
+    expand(home, word).contains(['$', '`'])
 }
 
 /// The most values of options that are looked at on the way to a script.

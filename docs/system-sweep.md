@@ -152,9 +152,28 @@ A unit's command that runs over several lines (ending in `\`) is read as one,
 and `%h`, `%E`, `%S`, `%C` and `%L` (and `%t` in a system unit) are written
 out. `~`, `$HOME`, `$XDG_CONFIG_HOME` and `$XDG_DATA_HOME` at their default
 places and a path a start-up file puts in a variable of its own
-(`TOOLS=~/opt/tools`, then `$TOOLS/run`) are understood, other variables are
-not. A Hyprland `source` with `*` or `?` in its last part is followed to the
-files it matches (up to 1024).
+(`TOOLS=~/opt/tools`, then `$TOOLS/run`) are understood.
+
+So is a script's own directory, as scripts find the helpers beside them, in a
+script that is run (not in a start-up file a shell reads in, where `$0` names
+the shell): `$(dirname "$0")`, `${0%/*}`, `$(dirname "$(readlink -f "$0")")`
+or `realpath` in its place, and `$(cd "…" && pwd)` around one
+(`SCRIPT_DIR=…`, then `$SCRIPT_DIR/helper.sh`). Under bash (a first line naming
+it) `$(dirname "${BASH_SOURCE[0]}")` and `${BASH_SOURCE%/*}` count too. For a
+script started through a link, `$0` names the link's directory, which may hold
+other files, while `readlink -f` and `realpath` name the real file, and
+`dirname` of that its directory. Only a word that is bare or in one pair of
+double quotes counts, and only `cd DIR && pwd` (with `-P` or `-L`, and `cd`'s
+output sent nowhere) as the `cd` form. A line that would grow past 64 KB is
+left as written, and so is a script whose path holds anything but letters,
+digits and `/._-+@%,:` (a quote, a space, `;`, `$`), which a shell would read
+as more than one word.
+
+Other variables are not understood: a program or script whose path holds one
+anywhere (`$PREFIX/bin/x`, `/opt/$V/run`, `"$1/x"`), or a substitution
+(`"$(dirname "$1")/x"`, sourced or run), is not followed, and the item says
+that what it runs was not all followed. A Hyprland `source` with `*` or
+`?` in its last part is followed to the files it matches (up to 1024).
 
 A bare command name in an auto-run file is looked for along the list of
 directories described under [Programs ahead of the system's
