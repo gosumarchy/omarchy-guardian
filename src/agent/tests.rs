@@ -1302,8 +1302,16 @@ fn a_failed_login_after_the_hand_over_says_to_log_in_and_still_blocks() {
     );
     let said = message(verdict(events, None, "n1"));
     assert!(said.contains("could not log in"), "{said}");
-    // Any other failure keeps saying the AI saw the source.
-    let refused = "{\"type\":\"assistant\",\"message\":{\"content\":[]}}\n{\"type\":\"result\",\"is_error\":true,\"result\":\"API Error: 500\"}\n";
-    let said = message(claude_verdict(refused, None, "n1"));
-    assert!(said.contains("saw the source"), "{said}");
+    // Any other failure keeps saying the AI saw the source, a refusal that
+    // mentions a login too.
+    for result in [
+        "API Error: 500",
+        "this OAuth code violates our Usage Policy",
+    ] {
+        let failed = format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"content\":[]}}}}\n{{\"type\":\"result\",\"is_error\":true,\"result\":\"{result}\"}}\n"
+        );
+        let said = message(claude_verdict(&failed, None, "n1"));
+        assert!(said.contains("saw the source"), "{said}");
+    }
 }

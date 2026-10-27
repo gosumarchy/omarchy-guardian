@@ -18,9 +18,10 @@ use super::{
 /// blocks: content can be written to make a model decline. Claude Code
 /// also writes its own error, a failed login among them, as an assistant
 /// turn, which reads as handed over; a login failure is named as such so
-/// the fix is plain, and blocks all the same.
+/// the fix is plain, and blocks all the same. A refusal keeps its own
+/// wording even if it mentions a login.
 fn failed_after_delivery(detail: &str) -> Error {
-    if is_login_failure(detail) {
+    if is_login_failure(detail) && !rejects_content(detail) {
         Error::Message(format!(
             "the AI reviewer could not log in ({detail}); log in to it again, then retry"
         ))

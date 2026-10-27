@@ -1,5 +1,5 @@
 //! Reading a provider's errors: out of time, input or content rejected,
-//! asked to slow down.
+//! asked to slow down, not logged in.
 
 use crate::error::Error;
 
