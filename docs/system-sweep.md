@@ -1970,9 +1970,15 @@ omarchy-guardian status --dismiss                      # clear the bar's alert
 ```
 
 A sweep prints one box with the verdict, the alerts and how much of the
-system is trusted, then up to 10 files the review raised alerts on (worst
-first, one line each, with how many alerts each has) and up to 3 reasons the
-review is incomplete, and the notes on what the sweep could not check.
+system is trusted. The verdict leads with what was found: `✓ NOTHING TO LOOK
+AT`, `! 3 TO LOOK AT — 1 medium · 2 low`, or `✗` when one is high. What
+could not be checked (places that could not be read, AI reviews that did not
+run) is a line of its own, `Not fully checked: …`, and the box is then never
+green. The exit status is the same as before: a sweep that could not check
+everything still exits as incomplete. Below the box come up to 10 files the
+review raised alerts on (worst first, one line each, with how many alerts
+each has), up to 3 reasons the check is not complete, and the notes on what
+the sweep could not check.
 Everything else, the review's fields, the findings and the table of items for
 each area, goes to the full report:
 `sweep details` shows it, through `less` in a terminal. It is one file,

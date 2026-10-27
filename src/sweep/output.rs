@@ -206,13 +206,68 @@ fn attention(report: &Report, painter: Painter) -> String {
     text
 }
 
+/// The sweep's verdict lines and their colour. What was found comes first;
+/// what could not be checked is a line of its own, so a sweep that found
+/// alerts says so even when a place could not be read. The decision and
+/// the exit status are the report's, as for every gate; only the words
+/// differ from the install gates' ("INCOMPLETE" led and hid the alerts).
+fn verdict_lines(report: &Report) -> (Vec<Span>, &'static str) {
+    let (mut high, mut medium, mut low) = (0, 0, 0);
+    for (_, severity, _) in report.alerts() {
+        match severity {
+            Severity::High => high += 1,
+            Severity::Medium => medium += 1,
+            Severity::Low => low += 1,
+        }
+    }
+    let total = high + medium + low;
+    let gaps = report.gaps.len();
+    let unreviewed = report
+        .agent_runs
+        .iter()
+        .filter(|run| run.outcome.problem().is_some())
+        .count();
+    let (headline, color) = match (total, high) {
+        (0, _) if gaps + unreviewed == 0 => ("✓ NOTHING TO LOOK AT".to_string(), "32"),
+        (0, _) => ("✓ NOTHING FOUND".to_string(), "32"),
+        (_, 0) => (
+            format!("! {total} TO LOOK AT — {medium} medium · {low} low"),
+            "33;1",
+        ),
+        _ => (
+            format!("✗ {total} TO LOOK AT — {high} high · {medium} medium · {low} low"),
+            "31;1",
+        ),
+    };
+    let mut lines = vec![Span::new(headline, color)];
+    let mut unchecked = Vec::new();
+    if gaps > 0 {
+        unchecked.push(format!("{gaps} place(s) could not be read"));
+    }
+    if unreviewed > 0 {
+        unchecked.push(format!("{unreviewed} AI review(s) did not run"));
+    }
+    if !unchecked.is_empty() {
+        lines.push(Span::new(
+            format!("Not fully checked: {}", unchecked.join("; ")),
+            "33",
+        ));
+    }
+    let remarks = report.remark_count();
+    if remarks > 0 {
+        lines.push(Span::plain(format!("Remarks: {remarks} low · not alerts")));
+    }
+    // Not fully checked is never all clear: the edge says so too.
+    let edge = if unchecked.is_empty() { color } else { "33" };
+    (lines, edge)
+}
+
 /// The top of a sweep: the verdict with how much is trusted in one box,
 /// then what needs a look and what was not reviewed. `changes` is how many
 /// items changed since the last sweep, when that is asked for.
 pub(super) fn summary(
     collection: &Collection,
     report: &Report,
-    decision: Decision,
     home: Option<&str>,
     changes: Option<usize>,
 ) -> String {
@@ -224,7 +279,8 @@ pub(super) fn summary(
         .iter()
         .filter(|item| !item.is_trusted() && flagged_paths.contains(&label(item, home)))
         .count();
-    let mut lines = trust_lines(collection, flagged);
+    let (mut lines, color) = verdict_lines(report);
+    lines.extend(trust_lines(collection, flagged));
     match changes {
         Some(0) => lines.push(Span::new(
             "✓ nothing new or changed since the last sweep",
@@ -236,7 +292,9 @@ pub(super) fn summary(
         )),
         None => {}
     }
-    let boxed = report.verdict_box_with(decision, None, &lines, width, painter);
+    let title = format!("Omarchy Guardian · {}", shown(&report.subject));
+    let edge = color.split(';').next().unwrap_or(color);
+    let boxed = layout::boxed(&title, &lines, width, edge, painter);
     format!("{boxed}\n{}", attention(report, painter))
 }
 
@@ -602,7 +660,9 @@ fn reviews_json(report: &Report) -> Json {
 mod tests {
     use std::collections::{BTreeMap, HashSet};
 
-    use super::{SHOWN_CONCERNS, attention, concerns, findings_json, items_html, not_reviewed};
+    use super::{
+        SHOWN_CONCERNS, attention, concerns, findings_json, items_html, not_reviewed, verdict_lines,
+    };
     use crate::agent::{AgentFinding, AgentReview, Status};
     use crate::autorun::Category;
     use crate::error::Error;
@@ -712,6 +772,64 @@ mod tests {
         assert!(text.contains("… 2 more"), "{text}");
         assert!(!text.contains("Not reviewed"), "{text}");
         assert_eq!(attention(&Report::default(), Painter::plain()), "");
+    }
+
+    fn headline(report: &Report) -> (Vec<String>, &'static str) {
+        let (lines, edge) = verdict_lines(report);
+        let text = lines.iter().map(|line| format!("{line:?}")).collect();
+        (text, edge)
+    }
+
+    #[test]
+    fn the_verdict_leads_with_what_was_found_and_says_apart_what_was_not_checked() {
+        let (lines, edge) = headline(&Report::default());
+        assert!(
+            lines[0].contains("✓ NOTHING TO LOOK AT") && lines.len() == 1,
+            "{lines:?}"
+        );
+        assert_eq!(edge, "32");
+
+        let mut unread = Report::default();
+        unread
+            .gaps
+            .push(Gap::Sweep("/boot/EFI: could not be listed".into()));
+        let (lines, edge) = headline(&unread);
+        assert!(lines[0].contains("✓ NOTHING FOUND"), "{lines:?}");
+        assert!(lines[1].contains("Not fully checked: 1 place(s) could not be read"));
+        assert_eq!(edge, "33", "not fully checked is never an all-clear edge");
+
+        let mut found = unread;
+        found.findings.push(LocalFinding {
+            severity: Severity::Low,
+            ..local("~/a", RuleId::ShellCommandExecution)
+        });
+        found
+            .agent_runs
+            .push(suspicious(vec![ai("~/b", Severity::Medium, "odd")]));
+        found
+            .agent_runs
+            .push(run(AgentOutcome::Unavailable(Error::Message(
+                "no network".into(),
+            ))));
+        let (lines, _) = headline(&found);
+        assert!(
+            lines[0].contains("! 2 TO LOOK AT — 1 medium · 1 low"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].contains("1 place(s) could not be read; 1 AI review(s) did not run"),
+            "{lines:?}"
+        );
+
+        found
+            .agent_runs
+            .push(suspicious(vec![ai("~/c", Severity::High, "bad")]));
+        let (lines, edge) = headline(&found);
+        assert!(
+            lines[0].contains("✗ 3 TO LOOK AT — 1 high · 1 medium · 1 low"),
+            "{lines:?}"
+        );
+        assert_eq!(edge, "33");
     }
 
     #[test]
