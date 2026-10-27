@@ -14,6 +14,8 @@
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub(super) struct Locked {
     pub(super) name: String,
+    /// The key's text after its last `@`: a version, or for
+    /// [`Resolution::Elsewhere`] possibly an address or a path.
     pub(super) version: String,
     pub(super) resolution: Resolution,
 }

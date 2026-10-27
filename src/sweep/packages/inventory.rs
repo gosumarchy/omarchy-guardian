@@ -182,11 +182,13 @@ pub(super) fn collect(root: &Path, places: &Places, startup: &Startup) -> Invent
         ));
     }
     // Said only where it left packages out.
-    for file in npm.aube_unreadable.iter().filter(|_| aube_tool) {
-        inventory.unchecked.push(format!(
-            "{} could not be read (not a regular file, closed, too large, or with a key that is not read here): it may name a private registry, so no npm package mise installed with aube was looked up in OSV",
-            text::shown(file)
-        ));
+    if aube_tool {
+        for file in &npm.aube_unreadable {
+            inventory.unchecked.push(format!(
+                "{} could not be read (not a regular file, closed, too large, or with a key that is not read here): it may name a private registry, so no npm package mise installed with aube was looked up in OSV",
+                text::shown(file)
+            ));
+        }
     }
     for file in &pip.unreadable {
         inventory.unchecked.push(format!(

@@ -990,10 +990,10 @@ from PyPI, crates from crates.io.
   is set, or the tool's directory has a `.npmrc`, no package aube installed
   is sent, and an `auth.ini` that cannot be read is said where an aube tool
   is installed. aube takes no registry from its workspace file, its
-  `config.toml` or other `AUBE_*` variables. A package whose lockfile entry records the public registry's
-  address for its own name and version is sent even where npm's settings
-  name another registry, and one from git, a local path or another address
-  is not.
+  `config.toml` or other `AUBE_*` variables. A package whose lockfile
+  entry records the public registry's address for its own name and version
+  is sent even where npm's settings name another registry, and one from
+  git, a local path or another address is not.
 - pip: a package installed from an address or a local directory (it has a
   `direct_url.json`) is left out. So is every package of a pipx environment
   installed with another index or a requirements or constraints file
