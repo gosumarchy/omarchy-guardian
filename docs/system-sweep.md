@@ -164,7 +164,9 @@ script started through a link, `$0` names the link's directory, which may hold
 other files, while `readlink -f` and `realpath` name the real file, and
 `dirname` of that its directory. Only a word that is bare or in one pair of
 double quotes counts, and only `cd DIR && pwd` (with `-P` or `-L`, and `cd`'s
-output sent nowhere) as the `cd` form. A line that would grow past 64 KB is left as written.
+output sent nowhere) as the `cd` form. A line that would grow past 64 KB is left as written, and so is a script whose
+path holds anything but letters, digits and `/._-+@%,:` (a quote, a space, `;`,
+`$`), which a shell would read as more than one word.
 
 Other variables are not understood: a program or script whose path holds one
 anywhere (`$PREFIX/bin/x`, `/opt/$V/run`, `"$1/x"`), or a substitution

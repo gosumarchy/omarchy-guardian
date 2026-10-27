@@ -918,6 +918,38 @@ fn a_script_names_its_own_directory_in_the_ways_scripts_do() {
 }
 
 #[test]
+fn a_script_in_a_directory_a_shell_would_split_keeps_its_own_directory_unwritten() {
+    use super::with_script_directory;
+    for directory in ["x\"y", "q'r", "a b", "$(z", "b`c", "s;t", "a&b", "p|q"] {
+        let path = format!("home/u/{directory}/x.sh");
+        for line in [
+            r#"X="$(dirname "$0")" /opt/evil"#,
+            r#"X=$(dirname "$0") /opt/evil"#,
+        ] {
+            let text = format!("#!/bin/sh\n{line}\n");
+            let written = with_script_directory(&text, &path, &path);
+            assert_eq!(written, text, "{directory}");
+            let runs = commands(Category::Shell, &path, &written);
+            assert!(
+                runs.contains(&"/opt/evil".to_string()),
+                "{directory}: {runs:?}"
+            );
+        }
+        // Sourced, the substitution is kept for the lookup to say so.
+        let text = "#!/bin/sh\n. \"$(dirname \"$0\")/c.sh\"\n";
+        let runs = commands(
+            Category::Shell,
+            &path,
+            &with_script_directory(text, &path, &path),
+        );
+        assert!(
+            runs.iter().any(|run| run.contains("$(")),
+            "{directory}: {runs:?}"
+        );
+    }
+}
+
+#[test]
 fn a_line_that_would_grow_long_keeps_its_own_directory_unwritten() {
     use super::{MAX_STARTED_LINE, with_script_directory};
     let path = "home/u/a/rather/deep/directory/x.sh";

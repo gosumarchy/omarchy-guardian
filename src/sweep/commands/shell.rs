@@ -93,7 +93,19 @@ pub(super) fn zdotdir(line: &str) -> Vec<String> {
 /// written in; one handed to `sh` despite that line is read as if bash ran
 /// it. A line that is long, or that would grow long, is left as written:
 /// its `$(dirname` then names no file, and following says so.
+///
+/// Nothing is written in for a path a shell would read as more than a
+/// word: whoever plants a script picks its directory, and one holding a
+/// quote, a space, `;` or `$(` would split the line around it into other
+/// statements, hiding a program that follows.
 pub(crate) fn with_script_directory(text: &str, started: &str, file: &str) -> String {
+    let plain = |path: &str| {
+        path.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+@%,:".contains(c))
+    };
+    if !plain(started) || !plain(file) {
+        return text.to_string();
+    }
     let bash = text
         .lines()
         .next()
