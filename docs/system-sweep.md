@@ -176,9 +176,9 @@ that what it runs was not all followed. In a shell script, a command named
 that way is only taken from a line that starts statements: not from the
 arguments on a line after one ending in `\`, the text of a here-document, a
 `[[ … ]]` test or `(( … ))` arithmetic, where such a word is an argument far
-more often than a command. A `<<` whose word never comes again, or a line
-ending in `\` before the command, turns this off for the lines after it; a
-path is still followed there. A Hyprland `source` with `*` or
+more often than a command. A `<<` whose word never comes again turns this
+off for the rest of the file, and a line ending in `\` for the line after it;
+a path is still followed there. A Hyprland `source` with `*` or
 `?` in its last part is followed to the files it matches (up to 1024).
 
 A bare command name in an auto-run file is looked for along the list of

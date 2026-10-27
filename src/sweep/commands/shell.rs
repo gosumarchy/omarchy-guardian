@@ -566,8 +566,9 @@ fn here_document_end(line: &str) -> Option<String> {
 /// is far more often an argument than a command. Anything else is read
 /// the same on every line.
 ///
-/// So a script can turn that note off for what follows: a `<<` whose word
-/// never comes again, or a line ending in `\` before the command. That
+/// So a script can turn that note off: for the rest of the file with a
+/// `<<` whose word never comes again, and for the next line with a line
+/// ending in `\` before the command. That
 /// only takes it back to how a script was read before the note existed;
 /// telling every such line apart needs quotes followed across lines.
 pub(super) fn started(line: &str, start: LineStart) -> Vec<String> {
