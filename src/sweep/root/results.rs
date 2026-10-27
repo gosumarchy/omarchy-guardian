@@ -94,7 +94,7 @@ pub(crate) fn results_problem(path: &Path, now: u64) -> Option<String> {
 
 pub(super) fn to_json(collection: &Collection, notes: &[String], news: Option<&[String]>) -> Json {
     let untrusted = || in_keeping_order(&collection.items);
-    let mut truncated = collection.truncated.clone();
+    let mut truncated = collection.not_looked_at();
     let left_out = untrusted().count().saturating_sub(MAX_ITEMS);
     if left_out > 0 {
         truncated.push(format!(
@@ -126,6 +126,7 @@ pub(super) fn to_json(collection: &Collection, notes: &[String], news: Option<&[
                     .collect(),
             ),
         ),
+        ("listed", listed_json(&collection.listed)),
         (
             "notes",
             Json::Array(
@@ -137,6 +138,23 @@ pub(super) fn to_json(collection: &Collection, notes: &[String], news: Option<&[
         ),
     ]);
     Json::object(members)
+}
+
+/// The directories root listed for the auto-run patterns, each once, at
+/// most `MAX_ITEMS`: the user's sweep takes one it could not list as
+/// covered only when it is here, so one left out is a gap there, not a
+/// directory wrongly taken as looked at.
+fn listed_json(listed: &[String]) -> Json {
+    let mut listed = listed.to_vec();
+    listed.sort();
+    listed.dedup();
+    Json::Array(
+        listed
+            .iter()
+            .take(MAX_ITEMS)
+            .map(|directory| Json::from(directory.as_str()))
+            .collect(),
+    )
 }
 
 fn item_json(item: &Item) -> Json {
@@ -304,7 +322,7 @@ pub(super) fn from_json(text: &str) -> Result<RootPart, Error> {
     // But it is said: what root found and this sweep could not read is
     // something that was not checked.
     let unread = listed.len() - items.len();
-    let sentences = |key: &str| -> Vec<String> {
+    let strings = |key: &str| -> Vec<String> {
         json.get(key)
             .and_then(Json::as_array)
             .map(|list| {
@@ -314,7 +332,7 @@ pub(super) fn from_json(text: &str) -> Result<RootPart, Error> {
             })
             .unwrap_or_default()
     };
-    let mut truncated = sentences("truncated");
+    let mut truncated = strings("truncated");
     if unread > 0 {
         truncated.push(format!(
             "{unread} item(s) of the root checks could not be read and were left out"
@@ -323,10 +341,13 @@ pub(super) fn from_json(text: &str) -> Result<RootPart, Error> {
     Ok(RootPart {
         items,
         truncated,
-        notes: collect::bounded(sentences("notes"))
+        notes: collect::bounded(strings("notes"))
             .into_iter()
             .map(|note| note.chars().take(MAX_NOTE_CHARS).collect())
             .collect(),
+        // Results from before the collector said what it listed cover no
+        // directory the user's sweep could not list.
+        listed: strings("listed").into_iter().take(MAX_ITEMS).collect(),
         outdated: version != Some(VERSION),
         news: json.get("new_trust").and_then(Json::as_array).map(|list| {
             list.iter()

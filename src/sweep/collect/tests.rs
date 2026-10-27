@@ -1051,3 +1051,48 @@ fn a_script_handed_to_an_interpreter_is_followed() {
     let other = at("home/u/bin/other.sh");
     assert!(super::is_capped(other), "{:?}", other.notes);
 }
+
+#[test]
+fn a_directory_a_pattern_passes_through_is_said_listed_or_unlisted() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("sweep-collect-unlisted");
+    let root = dir.path();
+    write(root, "boot/EFI/refind/refind.conf", "timeout 5\n");
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: None,
+        index: &index,
+        origin: Origin::System,
+    };
+
+    let open = collect(&scope);
+    assert!(open.listed.iter().any(|directory| directory == "boot/EFI"));
+    assert!(open.unlisted.is_empty(), "{:?}", open.unlisted);
+    assert!(
+        open.items
+            .iter()
+            .any(|item| item.path == "boot/EFI/refind/refind.conf")
+    );
+
+    let efi = root.join("boot/EFI");
+    fs::set_permissions(&efi, fs::Permissions::from_mode(0o000)).unwrap();
+    let listable = fs::read_dir(&efi).is_ok();
+    let closed = collect(&scope);
+    fs::set_permissions(&efi, fs::Permissions::from_mode(0o755)).unwrap();
+    // A test run as root lists any directory.
+    if !listable {
+        assert_eq!(closed.unlisted, ["boot/EFI"]);
+        assert!(
+            !closed
+                .listed
+                .iter()
+                .any(|directory| directory == "boot/EFI")
+        );
+        assert!(
+            closed
+                .not_looked_at()
+                .contains(&"/boot/EFI: could not be listed".to_string())
+        );
+    }
+}

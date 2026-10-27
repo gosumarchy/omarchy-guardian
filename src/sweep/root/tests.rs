@@ -275,8 +275,11 @@ fn items_round_trip_and_trusted_ones_stay_behind() {
             ),
         ],
         truncated: vec!["/etc/x".into()],
-        notes: Vec::new(),
-        root_news: None,
+        // What root could not list is a gap of root's own; what it listed
+        // travels, each once.
+        unlisted: vec!["root/.local/lib".into()],
+        listed: vec!["boot/EFI".into(), "usr/lib".into(), "boot/EFI".into()],
+        ..Collection::default()
     };
     let mut collection = collection;
     // The drop-in is in the catalog itself: its content travels.
@@ -288,7 +291,11 @@ fn items_round_trip_and_trusted_ones_stay_behind() {
     let part = from_json(&to_json(&collection, &noted, None).to_string()).unwrap();
     assert_eq!(part.notes, noted);
     assert_eq!(part.items, collection.items[..2]);
-    assert_eq!(part.truncated, ["/etc/x"]);
+    assert_eq!(
+        part.truncated,
+        ["/etc/x", "/root/.local/lib: could not be listed"]
+    );
+    assert_eq!(part.listed, ["boot/EFI", "usr/lib"]);
 }
 
 #[test]
@@ -564,4 +571,74 @@ fn the_collector_tells_what_is_new_from_its_own_record() {
         merged.root_news,
         Some(vec!["root/.ssh/authorized_keys#b".to_string()])
     );
+}
+
+#[test]
+fn a_directory_the_user_could_not_list_is_covered_only_where_root_listed_it() {
+    let gap = "/boot/EFI: could not be listed";
+    let unlisted = || Collection {
+        unlisted: vec!["boot/EFI".into()],
+        ..Collection::default()
+    };
+    let merged = |part: super::RootPart| {
+        let mut collection = unlisted();
+        merge(&mut collection, part);
+        collection.not_looked_at()
+    };
+    // No results from root to merge (missing, stale or unreadable): the
+    // directory was not looked at.
+    assert_eq!(unlisted().not_looked_at(), [gap]);
+    // Root listed it.
+    assert!(
+        merged(super::RootPart {
+            listed: vec!["boot".into(), "boot/EFI".into()],
+            ..super::RootPart::default()
+        })
+        .is_empty()
+    );
+    // Root ran, but listed only what is around it.
+    assert_eq!(
+        merged(super::RootPart {
+            listed: vec!["boot".into(), "boot/EFI/limine".into()],
+            ..super::RootPart::default()
+        }),
+        [gap]
+    );
+    // A collector that does not say what it listed covers nothing.
+    let older = from_json(r#"{"version":3,"items":[],"truncated":[]}"#).unwrap();
+    assert!(older.listed.is_empty());
+    assert_eq!(merged(older), [gap]);
+}
+
+#[test]
+fn missing_or_stale_results_are_not_used() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = crate::test_support::TempDir::new("root-results-age");
+    let path = dir.path().join("sweep/root.json");
+    assert!(super::from_results(&path, 0).is_err());
+
+    let collection = Collection {
+        listed: vec!["boot/EFI".into()],
+        ..Collection::default()
+    };
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, to_json(&collection, &[], None).to_string()).unwrap();
+    let metadata = std::fs::metadata(&path).unwrap();
+    let written = u64::try_from(metadata.mtime()).unwrap();
+    let two_days_later = written + 48 * 60 * 60;
+    let stale = super::from_results(&path, two_days_later);
+    // Only results root owns are used at all; a test run by root (as in
+    // CI) gets past that check and is refused for their age.
+    if metadata.uid() == 0 {
+        assert_eq!(
+            super::from_results(&path, written).unwrap().listed,
+            ["boot/EFI"]
+        );
+        assert_eq!(
+            stale.unwrap_err().to_string(),
+            "the daily root check has not run for more than 36 hours"
+        );
+    } else {
+        assert!(stale.is_err());
+    }
 }

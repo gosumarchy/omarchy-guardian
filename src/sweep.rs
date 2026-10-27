@@ -1110,7 +1110,7 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
             .map(|problem| Gap::Sweep(format!("package record {problem}"))),
     );
     report.gaps.extend(
-        collect::bounded(collection.truncated.clone())
+        collect::bounded(collection.not_looked_at())
             .into_iter()
             .map(Gap::Sweep),
     );
@@ -1290,9 +1290,7 @@ mod tests {
                 Category::Shell,
                 "export EDITOR=vi\n",
             )],
-            truncated: Vec::new(),
-            notes: Vec::new(),
-            root_news: None,
+            ..Collection::default()
         };
         let label = |item: &Item| super::judge::label(item, HOME);
         for profile in [Profile::Standard, Profile::Strict] {
