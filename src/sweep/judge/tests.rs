@@ -1774,3 +1774,47 @@ fn what_an_agents_entry_runs_is_shown_as_it_is_sent() {
         sent.content
     );
 }
+
+#[test]
+fn a_link_handed_beside_a_wrapper_to_a_key_is_not_sent() {
+    let dir = planted(
+        "sweep-beside-key",
+        &[
+            (
+                "home/u/.config/systemd/user/w.service",
+                "[Service]\nExecStart=/usr/bin/bash %h/p/wrap.sh %h/p/hook.py %h/p/key.py\n",
+            ),
+            ("home/u/p/wrap.sh", "exec python3 \"$@\"\n"),
+            ("home/u/p/hook.py", "print(1)\n"),
+            (
+                "home/u/.ssh/id_ed25519",
+                "-----BEGIN OPENSSH PRIVATE KEY-----\nabcdefgh12345678\n",
+            ),
+        ],
+        &[("home/u/p/key.py", "../.ssh/id_ed25519")],
+    );
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root: dir.path(),
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::System,
+    };
+    let mut collection = collect::collect(&scope);
+    super::note_kept(&mut collection.items, Some("home/u"));
+    // The link is followed to the key, and the key is read here only.
+    assert!(
+        collection
+            .items
+            .iter()
+            .any(|item| item.path == "home/u/.ssh/id_ed25519")
+    );
+    let (sent, _) = examined(&collection);
+    assert!(sent.contains(&"~/p/hook.py".to_string()), "{sent:?}");
+    assert!(
+        !sent
+            .iter()
+            .any(|path| path.contains("id_ed25519") || path.contains("key.py")),
+        "{sent:?}"
+    );
+}

@@ -391,12 +391,6 @@ fn checked_path(item: &Item) -> &str {
     }
 }
 
-/// File name endings of scripts.
-const SCRIPT_EXTENSIONS: &[&str] = &[
-    "sh", "bash", "zsh", "ksh", "dash", "fish", "py", "pl", "rb", "js", "mjs", "cjs", "ts", "lua",
-    "php", "tcl", "awk",
-];
-
 /// How the text of `item` is read (see `Reading`). What a path says is
 /// asked of the path the content was read from and of the name a link
 /// gives it (`~/.ssh/rc` kept in a dotfiles directory is still a file of
@@ -441,7 +435,7 @@ fn reading(item: &Item, home: Option<&str>, text: &str) -> Reading {
 fn is_script(file: &str, text: &str) -> bool {
     let name = file_name(file);
     text.trim_start_matches('\u{feff}').starts_with("#!")
-        || SCRIPT_EXTENSIONS
+        || crate::sweep::programs::SCRIPT_EXTENSIONS
             .iter()
             .any(|extension| crate::sweep::read::has_extension(name, extension))
 }

@@ -599,7 +599,9 @@ fn a_star_on_a_command_line_does_not_stop_its_program_being_followed() {
     assert!(!followed.targets.contains(&"etc/second".to_string()));
     assert_eq!(
         followed.unfollowed,
-        ["only the first 1024 commands of a line"]
+        [
+            "only the first 1024 commands of a line, 8 option values on the way to a script, or 8 scripts handed beside one"
+        ]
     );
     write(
         root,

@@ -526,31 +526,41 @@ fn is_command(word: &str) -> bool {
 }
 
 /// The command line of a statement whose command, `words[0]`, is an
-/// interpreter named bare and handed a path (`bash "$DIR/x.sh"`, `perl
-/// ./helper.pl`), for following to find its script as on any command
-/// line, or to say it is unknown. awk is left out: its first operand is
-/// its program (`'{print $1}'`), and the paths after that are what it
-/// reads. A word no quote can hold leaves the statement as it was.
+/// interpreter (or `env`) handed a path (`bash "$DIR/x.sh"`,
+/// `/usr/bin/env python3 /opt/x/check.py`), for following to find its
+/// script as on any command line, or to say it is unknown. awk is left
+/// out: its first operand is its program (`'{print $1}'`), and the paths
+/// after that are what it reads. A word no quote can hold ends the line
+/// past the first path; before it, the statement is left as it was.
 fn handed_script(words: &[String]) -> Option<String> {
     let (interpreter, arguments) = words.split_first()?;
-    let handed = !interpreter.contains('/')
-        && runs_a_script(interpreter)
-        && !matches!(interpreter.as_str(), "awk" | "gawk" | "mawk")
-        && arguments.iter().any(|word| word.contains('/'));
+    let name = file_name(interpreter);
+    let handed = (runs_a_script(name) || name == "env") && !matches!(name, "awk" | "gawk" | "mawk");
+    let first_path = arguments.iter().position(|word| word.contains('/'))? + 1;
     if !handed {
         return None;
     }
-    let quoted = |word: &String| {
-        if !word.contains([' ', '\t', '\'', '"']) {
-            Some(word.clone())
-        } else if !word.contains('\'') {
-            Some(format!("'{word}'"))
-        } else {
-            (!word.contains('"')).then(|| format!("\"{word}\""))
+    let mut line = Vec::new();
+    for (at, word) in words.iter().enumerate() {
+        match quoted(word) {
+            Some(word) => line.push(word),
+            None if at > first_path => break,
+            None => return None,
         }
-    };
-    let words: Option<Vec<String>> = words.iter().map(quoted).collect();
-    words.map(|words| words.join(" "))
+    }
+    Some(line.join(" "))
+}
+
+/// `word` as one word of a command line `split` reads back: as it is, or
+/// in the quotes it does not hold.
+fn quoted(word: &str) -> Option<String> {
+    if !word.contains([' ', '\t', '\'', '"']) {
+        Some(word.to_string())
+    } else if !word.contains('\'') {
+        Some(format!("'{word}'"))
+    } else {
+        (!word.contains('"')).then(|| format!("\"{word}\""))
+    }
 }
 
 /// Whether `word` names a command under a variable's directory
@@ -629,6 +639,10 @@ fn here_document_end(line: &str) -> Option<String> {
 /// inside a substitution (`eval "$(~/bin/tool init)"`). A bare name is not
 /// looked up: it is a shell builtin or an ordinary command far more often
 /// than not. A very long line is left to the review of the file's text.
+///
+/// A statement or substitution whose command is an interpreter handed a
+/// path (`bash "$D/x.sh"`) is returned whole (see `handed_script`), so
+/// following finds its script or says it is unknown.
 ///
 /// A command named through a variable (`"$TOOLS/x"`) or a substitution
 /// (`"$(dirname "$1")/x"`) is kept for following to say it is unknown,
@@ -728,7 +742,9 @@ pub(super) fn started(line: &str, start: LineStart) -> Vec<String> {
             // `$(perl "$DIR/check.pl")`: an interpreter is handed its script
             // inside one too, and a substitution runs on any line. Each is
             // read up to its first `)` or backtick, at most
-            // `MAX_SUBSTITUTIONS` times a line.
+            // `MAX_SUBSTITUTIONS` times a line, so one inside it ends it
+            // early (`$(python3 "$(pwd)/x.py")` names no path); the
+            // script's own directory is written in before this.
             let inner = &line[at + opener.len()..];
             let inner = &inner[..inner.find([')', '`']).unwrap_or(inner.len())];
             if let Some(command) = handed_script(&split(inner))

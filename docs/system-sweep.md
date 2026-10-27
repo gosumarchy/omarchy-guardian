@@ -140,11 +140,11 @@ follows:
   first 1024 of each;
 - into the files a shell start-up file reads in with `source` or `.` and the
   programs its statements start by a path (on lines up to 64 KB), and the
-  script it hands an interpreter named bare (`bash "$DIR/x.sh"`, `perl
-  /opt/x/check.pl`, also inside `$(…)`; not awk, whose first operand is its
+  script it hands an interpreter (`bash "$DIR/x.sh"`, `/usr/bin/env python3
+  /opt/x/check.py`, also inside `$(…)`; not awk, whose first operand is its
   program);
 - into the scripts a wrapper is handed beside the script it runs (`bash
-  hooks/wrap.sh hooks/hook.py`): only files in that same directory with a
+  ~/p/wrap.sh ~/p/hook.py`): only files in that same directory with a
   script's extension (`.sh`, `.py`, `.js`, `.pl`, `.rb`, `.lua`, `.php` and
   the like), the first 8, since any other argument may be a key or a log;
 - the start-up files zsh reads from the directory a `ZDOTDIR=` line names;

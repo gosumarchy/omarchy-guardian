@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use crate::paths::file_name;
-use crate::sweep::programs::{self, Argument, ScriptArguments, is_script_shell};
+use crate::sweep::programs::{self, Argument, SCRIPT_EXTENSIONS, ScriptArguments, is_script_shell};
 use crate::sweep::read::has_extension;
 
 /// A wrapper that runs the command after it: its name, its options that
@@ -310,6 +310,14 @@ fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
         let mut arguments = ScriptArguments::of(name);
         let mut values = 0;
         while let Some(word) = words.next() {
+            // `bash 2>/dev/null script`: a redirection is no argument, and
+            // one whose file is the next word (`2> /dev/null`) takes it.
+            if let Some(file) = redirected_to(word) {
+                if file.is_empty() {
+                    words.next();
+                }
+                continue;
+            }
             // `sh -c "command line"` (also `-lc`, `-ic`) runs that line:
             // each command in it is found the same way, wrappers and
             // all. What `/usr/bin` holds is not listed again.
@@ -381,9 +389,19 @@ fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
     found
 }
 
+/// The file `word` redirects to, if it is a redirection (`2>/dev/null`,
+/// `>&2`, `&>log`, `<in`): empty where the file is the next word (`2>`).
+fn redirected_to(word: &str) -> Option<&str> {
+    let operator = word.trim_start_matches(|c: char| c.is_ascii_digit());
+    let operator = operator.strip_prefix('&').unwrap_or(operator);
+    operator
+        .starts_with(['>', '<'])
+        .then(|| operator.trim_start_matches(['>', '<', '&']))
+}
+
 /// The scripts among `arguments` that lie in the directory of `script`,
 /// the one an interpreter was handed: a wrapper often runs the script it
-/// is given beside it (`bash hooks/sg-python.sh hooks/reminder.py`). Only
+/// is given beside it (`bash ~/p/hooks/wrap.sh ~/p/hooks/hook.py`). Only
 /// a file with a script's extension in that same directory: any other
 /// argument may be a key, a log or a document, which the review has no
 /// business reading.
@@ -404,7 +422,7 @@ fn scripts_beside<'a>(
                     .any(|extension| has_extension(name, extension))
         })
     });
-    for argument in beside.by_ref().take(MAX_OPTION_VALUES) {
+    for argument in beside.by_ref().take(MAX_SCRIPTS_BESIDE) {
         found.extend(locate(lookup, argument));
     }
     if beside.next().is_some() {
@@ -413,12 +431,9 @@ fn scripts_beside<'a>(
     found
 }
 
-/// What a script handed to a wrapper beside it is named (`scripts_beside`):
-/// the languages of `programs::LANGUAGES` that are run from a file and the
-/// shells. Arbitrary beyond that.
-const SCRIPT_EXTENSIONS: &[&str] = &[
-    "sh", "bash", "zsh", "py", "pl", "rb", "js", "mjs", "cjs", "ts", "lua", "php",
-];
+/// The most scripts handed beside a script that are followed
+/// (`scripts_beside`); arbitrary, as `MAX_OPTION_VALUES`.
+pub(crate) const MAX_SCRIPTS_BESIDE: usize = 8;
 
 /// Whether `word`, a program or a script, is named through a variable or
 /// a substitution that nothing wrote in (`$SCRIPT_DIR/x`, `/opt/$V/run`,
@@ -430,7 +445,7 @@ fn is_unwritten(home: &str, word: &str) -> bool {
 }
 
 /// The most values of options that are looked at on the way to a script.
-const MAX_OPTION_VALUES: usize = 8;
+pub(crate) const MAX_OPTION_VALUES: usize = 8;
 
 /// The most commands of one line a shell runs that are looked up.
 pub(crate) const MAX_INNER_COMMANDS: usize = 1024;

@@ -6,6 +6,12 @@
 //! The sets are built from the lists below; a check that needs fewer
 //! programs than all of a kind has a predicate of its own that says why.
 
+/// File name endings of scripts.
+pub(super) const SCRIPT_EXTENSIONS: &[&str] = &[
+    "sh", "bash", "zsh", "ksh", "dash", "fish", "py", "pl", "rb", "js", "mjs", "cjs", "ts", "lua",
+    "php", "tcl", "awk",
+];
+
 /// Shells of the Bourne family. Only their scripts are looked through for
 /// what they start (`commands::is_shell_script`): the others below are
 /// written in a syntax of their own. They are matched by their exact name,

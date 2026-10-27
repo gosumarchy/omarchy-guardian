@@ -1100,6 +1100,13 @@ fn a_script_handed_to_a_wrapper_beside_it_is_followed() {
         lookup.targets("bash /home/u/p/wrap.sh /home/u/p/hook.py"),
         ["home/u/p/wrap.sh", "home/u/p/hook.py"]
     );
+    // A redirection before the script is no script.
+    for command in [
+        "bash 2>/dev/null /home/u/p/wrap.sh",
+        "bash 2> /dev/null /home/u/p/wrap.sh",
+    ] {
+        assert_eq!(lookup.targets(command), ["home/u/p/wrap.sh"], "{command}");
+    }
     // Another directory, or a file that is no script, is no business of
     // the review: a key or a log may be handed to a script too.
     for command in [
@@ -1133,6 +1140,25 @@ fn a_script_an_interpreter_is_handed_by_name_is_found() {
     assert_eq!(
         runs("x \\\n  \"$(python3 /opt/y/z.py)\"\n"),
         ["python3 /opt/y/z.py"]
+    );
+    // An interpreter named by its path, or through `env`, too.
+    for (text, run) in [
+        (
+            "/usr/bin/env python3 \"$X/y.py\"\n",
+            "/usr/bin/env python3 $X/y.py",
+        ),
+        ("/bin/bash \"$X/y.sh\"\n", "/bin/bash $X/y.sh"),
+    ] {
+        assert!(
+            runs(text).contains(&run.to_string()),
+            "{text}: {:?}",
+            runs(text)
+        );
+    }
+    // A word no quote can hold ends the line past the script.
+    assert_eq!(
+        runs("python3 /opt/x.py 'a\"b'\"c'd\"\n"),
+        ["python3 /opt/x.py"]
     );
     // A word with a blank keeps its quotes.
     assert_eq!(runs("sh '/opt/a b/c.sh'\n"), ["sh '/opt/a b/c.sh'"]);
