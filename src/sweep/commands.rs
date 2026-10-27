@@ -81,8 +81,8 @@ pub(super) fn commands(category: Category, path: &str, text: &str) -> Vec<String
     let mut cases = Vec::new();
     let mut starts = LineStarts::default();
     for line in text.lines() {
-        let line = line.trim();
         let start = starts.next(line);
+        let line = line.trim();
         if line.starts_with('#') {
             continue;
         }

@@ -1078,6 +1078,10 @@ fn a_line_that_goes_on_from_the_one_before_starts_no_command() {
     ] {
         assert_eq!(runs(text), ["$X/run"], "{text}");
     }
+    // An escaped blank at the end is no `\` that goes on, and a test ends
+    // at its `]]`.
+    assert_eq!(runs("echo hi \\ \n\"$X/run\"\n"), ["$X/run"]);
+    assert_eq!(runs("[[ -f x ]] && \"$X/run\"\n"), ["$X/run"]);
     // A here-string takes no lines.
     assert_eq!(runs("read -r a <<< \"$b\"\n\"$X/run\"\n"), ["$X/run"]);
 }

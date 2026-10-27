@@ -510,15 +510,17 @@ pub(super) struct LineStarts {
 }
 
 impl LineStarts {
-    /// How `line` (trimmed) starts, given the lines before it.
-    pub(super) fn next(&mut self, line: &str) -> LineStart {
+    /// How `raw` starts, given the lines before it. Untrimmed: `echo \ `
+    /// ends in an escaped blank, not in a `\` that goes on.
+    pub(super) fn next(&mut self, raw: &str) -> LineStart {
         let start = if self.continued || self.here_document.is_some() {
             LineStart::Argument
         } else {
             LineStart::Command
         };
+        let line = raw.trim();
         let comment = line.starts_with('#');
-        self.continued = !comment && continues(line);
+        self.continued = !comment && continues(raw);
         match &self.here_document {
             Some(end) if line == end => self.here_document = None,
             None if !comment => self.here_document = here_document_end(line),
@@ -561,7 +563,13 @@ fn here_document_end(line: &str) -> Option<String> {
 /// (`"$(dirname "$1")/x"`) is kept for following to say it is unknown,
 /// but only on a line that starts statements (`LineStart::Command`) and
 /// not in a `[[ … ]]` test or `(( … ))` arithmetic: elsewhere such a word
-/// is far more often an argument than a command. Anything else is read the same on every line.
+/// is far more often an argument than a command. Anything else is read
+/// the same on every line.
+///
+/// So a script can turn that note off for what follows: a `<<` whose word
+/// never comes again, or a line ending in `\` before the command. That
+/// only takes it back to how a script was read before the note existed;
+/// telling every such line apart needs quotes followed across lines.
 pub(super) fn started(line: &str, start: LineStart) -> Vec<String> {
     if line.len() > MAX_STARTED_LINE {
         return Vec::new();
