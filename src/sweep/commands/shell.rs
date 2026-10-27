@@ -2,7 +2,7 @@
 //! files it sources, the programs its lines name, and the variables and
 //! `case` patterns on the way to them.
 
-use super::{MAX_STARTED_LINE, MAX_SUBSTITUTIONS, split};
+use super::{MAX_STARTED_LINE, MAX_SUBSTITUTIONS, has_expansion, split};
 use crate::paths::file_name;
 use crate::sweep::programs::{SCRIPT_SHELLS, is_script_shell, runs_a_script};
 use crate::sweep::read;
@@ -526,8 +526,8 @@ fn is_command(word: &str) -> bool {
 }
 
 /// The command line of a statement whose command, `words[0]`, is an
-/// interpreter (or `env`) handed a path (`bash "$DIR/x.sh"`,
-/// `/usr/bin/env python3 /opt/x/check.py`), for following to find its
+/// interpreter (or `env`) handed a path (`bash "$DIR/x.sh"`, `/usr/bin/env
+/// python3 /opt/x/check.py`; see `is_path_like`), for following to find its
 /// script as on any command line, or to say it is unknown. awk is left
 /// out: its first operand is its program (`'{print $1}'`), and the paths
 /// after that are what it reads.
@@ -544,7 +544,7 @@ fn handed_script(words: &[String]) -> Option<String> {
     }
     let handed = runs_a_script(program)
         && !matches!(program, "awk" | "gawk" | "mawk")
-        && arguments.iter().any(|word| word.contains('/'));
+        && arguments.iter().any(|word| is_path_like(word));
     handed.then(|| {
         words
             .iter()
@@ -566,14 +566,24 @@ fn quoted(word: &str) -> String {
     }
 }
 
-/// Whether `word` names a command under a variable's directory
-/// (`"$TOOLS/x"`, `$1/x`): where it leads is not known, and following says
-/// so.
+/// Whether `word` names a file under a variable's directory or a
+/// substitution's (`"$TOOLS/x"`, `$1/x`, `$(dirname $0)/x`): where it
+/// leads is not known, and following says so.
 fn is_under_variable(word: &str) -> bool {
-    word.contains('/')
-        && word.strip_prefix('$').is_some_and(|name| {
-            name.starts_with(|c: char| c == '{' || c == '_' || c.is_ascii_alphanumeric())
-        })
+    word.starts_with('$') && word.contains('/') && has_expansion(word)
+}
+
+/// Whether `word` reads as a path: from the root, the home directory or
+/// the current one (`/x`, `~/x`, `./x`, `../x`), or one with a variable or
+/// a substitution anywhere in it (`$D/x`, `${D}/x`, `x$D/y`, `` `pwd`/x ``,
+/// `~alice/x`), which following says is unknown. An argument with a `/`
+/// and nothing a shell writes in (perl's `'s/a/b/'`, a URL) is no script
+/// handed over.
+fn is_path_like(word: &str) -> bool {
+    is_path(word)
+        || word.starts_with("./")
+        || word.starts_with("../")
+        || (word.contains('/') && has_expansion(word))
 }
 
 /// Whether a line of a shell script starts statements, or goes on with

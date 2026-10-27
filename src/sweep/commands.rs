@@ -12,11 +12,11 @@ use crate::paths::file_name;
 
 use shell::{LineStarts, path_variables, sourced, started, without_case_patterns, zdotdir};
 pub(super) use shell::{is_shell_script, sourced_files, with_script_directory};
-use targets::split;
 pub(super) use targets::{
     Lookup, MAX_GLOB, MAX_INNER_COMMANDS, MAX_OPTION_VALUES, MAX_SCRIPTS_BESIDE, default_search,
     expand, glob_targets, split_commands,
 };
+use targets::{has_expansion, split};
 #[cfg(test)]
 use targets::{inner_commands, targets, targets_where};
 
