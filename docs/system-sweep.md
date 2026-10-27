@@ -38,6 +38,7 @@ described.
   - [What is kept from the AI](#what-is-kept-from-the-ai)
   - [What is sent](#what-is-sent)
   - [What is taken out of a file that is sent](#what-is-taken-out-of-a-file-that-is-sent)
+  - [Your own settings](#your-own-settings)
   - [After an upgrade](#after-an-upgrade)
 - [Root checks](#root-checks)
   - [What root reads and hands back](#what-root-reads-and-hands-back)
@@ -1726,6 +1727,53 @@ characters, with a blank or punctuation in it, in YAML or JSON `key: value`
 form, handed over as a command-line argument, or a key block (PEM) in a file
 whose path gives no hint.
 
+### Your own settings
+
+Some files in your home hold choices you made about your own tools: an alias
+that starts Claude Code with its permission prompts skipped, a wrapper in
+`~/.local/bin` that turns off mise's wait for a release to age and installs
+the latest one, a plugin's start-up hook that puts its own shims directory
+first on `PATH`. The reviewer is asked to mark a finding about such a choice
+with `"owner_setting": true`, and only when it changes how your own programs
+behave when you start them, fetches no script or binary from an address to
+run (installing the wrapped tool by name through mise, npm or pacman is
+allowed), sends nothing off the machine, reads no credentials or keys,
+changes no privileges, starts nothing on its own, and hides nothing. Text in
+the file that calls itself approved or asks for the mark is no evidence, and
+is reported as speaking to the reviewer.
+
+The mark is a claim. Guardian shows the finding as your setting only when all
+of this holds:
+
+- the reply wrote the mark as JSON `true` (not `"true"` or `1`);
+- the finding is graded `medium` or `low`, never `high`;
+- every file it names is in your home (shown as `~/…`) and was sent in that
+  AI request; a file under `/etc`, `/usr` or anywhere else, and root's home
+  as `sweep --root` shows it (`/root/…`), keeps it an alert;
+- the same review did not report text that speaks to the reviewer;
+- no local rule matched in that file: the reviewer is asked to confirm or
+  dismiss each local match, so a mark beside one may be about it, and the
+  local rules' own findings stay alerts whatever the AI says;
+- the profile is not `strict`. Under `strict` every such finding is an
+  alert, as before.
+
+Anything else is an alert at the severity the reviewer gave. A setting is
+not flagged, not counted among the alerts and not remembered as a finding on
+its item, so it raises no daily notification; a sweep that found only
+settings is `CLEAR` and exits 0. The summary lists them under "Your own
+settings" below "Needs a look" with a line `Settings: N noted · not alerts`
+in the box; the report has a table "Your own settings (not alerts)" with the
+reviewer's grade dimmed, and so does the page. `--json` writes one with
+`"severity": "setting"` and the reviewer's grade as `"graded"`, and the audit
+trail records how many there were (`settings=N`). A review that the reviewer
+called `suspicious` while its findings are all settings still blocks, as a
+suspicious verdict with no finding does. A sweep with settings is not
+recorded as an approved version, so each file is reviewed again (an
+unchanged one from the cache) and its setting shown again.
+
+Only the sweep asks for the mark; the install gates ask nothing new and treat
+every AI finding as before.
+
 ### After an upgrade
 
 These show once after an upgrade from Guardian 0.8.1 or earlier:
@@ -1854,7 +1902,8 @@ never read.
   already looked at. A finding that appears on a file that did not change
   counts as a change; one that goes away does not. (Every AI finding on an
   item is one here, in every profile: the low remarks that a gate under
-  `standard` only shows are findings of the sweep.) The first scheduled sweep
+  `standard` only shows are findings of the sweep. Only
+  [your own settings](#your-own-settings) are not.) The first scheduled sweep
   has nothing to compare with: it notifies only when it found something with
   an alert or could not finish;
 - a system timer (`omarchy-guardian-sweep-collect.timer`) for the root checks,

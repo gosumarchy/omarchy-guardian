@@ -32,7 +32,7 @@ profile for your own sources and for pacman alike:
 | Level | Profile | What it does |
 | --- | --- | --- |
 | Balanced | `standard` | AI review for everything; required for AUR builds, themes, plugins, third-party and local packages, your scans and the sweep. For official packages an unavailable AI or a local-rule finding only warns |
-| Maximum | `strict` | AI review for everything; any finding blocks, the AI's low remarks beside a clear verdict included |
+| Maximum | `strict` | AI review for everything; any finding blocks, the AI's low remarks beside a clear verdict included, and in the sweep the findings it marks as [your own settings](system-sweep.md#your-own-settings) are alerts |
 | Private | `local-only` | no AI: no source is sent to an AI provider; you confirm installs of your own sources (AUR builds, themes, plugins, scans) |
 
 Under `local-only` two lookups still go out: package names and versions from

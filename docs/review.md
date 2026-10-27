@@ -122,7 +122,11 @@ were (`remarks=N`).
 
 The [system sweep](system-sweep.md) is not a gate and lists what there is to
 look at: there every AI finding on an item is a finding in every profile, the
-low ones of a clear verdict included.
+low ones of a clear verdict included. The one exception is a finding the
+reviewer marks as the owner's own setting and Guardian checks to be one (in
+the home, below `high`, outside `strict`; see
+[Your own settings](system-sweep.md#your-own-settings)): the sweep shows it
+apart and does not count it. The gates do not ask for that mark.
 
 ## What is read, and what makes a review incomplete
 
