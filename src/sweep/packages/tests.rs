@@ -1142,6 +1142,20 @@ fn what_aube_reads_besides_npms_files_can_keep_its_packages_out() {
         &inventory,
         "/home/u/.config/pnpm/auth.ini could not be read"
     ));
+    // Without a tool aube installed, it left nothing out and is not said.
+    fs::remove_dir_all(root.join(AUBE_TOOL)).unwrap();
+    let inventory = collect(root, &places);
+    assert!(!said(&inventory, "auth.ini"), "{:?}", inventory.unchecked);
+    fs::remove_dir_all(root.join("home/u/.config/pnpm/auth.ini")).unwrap();
+
+    // A shell that names the variable for that file.
+    aube_tool(root);
+    write(
+        root,
+        "home/u/.bashrc",
+        "export AUBE_NPMRC_AUTH_FILE=/run/secrets/npmrc\n",
+    );
+    assert!(elsewhere(&collect(root, &places)));
 }
 
 #[test]

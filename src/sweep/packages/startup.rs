@@ -63,12 +63,16 @@ const UV_VARIABLES: &[&str] = &[
 ];
 
 /// npm's the same way; `npm_config_@` starts a scope's own registry. npm
-/// reads `npm_config_*` in any case.
+/// reads `npm_config_*` in any case. `npmrc_auth_file` is aube's, in
+/// `npm_config_npmrc_auth_file` and `AUBE_NPMRC_AUTH_FILE`: it names one
+/// more file aube reads, and counts for npm as a whole, which can only
+/// leave more out.
 const NPM_VARIABLES: &[&str] = &[
     "npm_config_registry",
     "npm_config_userconfig",
     "npm_config_globalconfig",
     "npm_config_@",
+    "npmrc_auth_file",
 ];
 
 /// The start-up files that name each tool's variables, and those that

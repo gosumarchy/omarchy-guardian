@@ -7,10 +7,11 @@
 //!
 //! This is not a YAML parser. It reads only that layout and fails closed:
 //! a file in any other shape is not read at all, and an entry it cannot
-//! read is counted, so the caller can say the file was not read in full.
+//! read marks the file as read in part, so the caller can say so.
 
 /// One package the lockfile names.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(super) struct Locked {
     pub(super) name: String,
     pub(super) version: String,
@@ -18,7 +19,8 @@ pub(super) struct Locked {
 }
 
 /// Where a locked package was fetched from, by its `resolution`.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(super) enum Resolution {
     /// Only an integrity hash: from the registry aube was set to use, which
     /// the lockfile does not name.
@@ -36,8 +38,8 @@ pub(super) enum Resolution {
 #[derive(Debug, Default)]
 pub(super) struct Lock {
     pub(super) packages: Vec<Locked>,
-    /// Entries under `packages:` that could not be read.
-    pub(super) unread: usize,
+    /// An entry under `packages:` could not be read.
+    pub(super) partial: bool,
 }
 
 /// An entry under `packages:` as it is read: its key line, and its
@@ -101,10 +103,10 @@ pub(super) fn read(text: &str) -> Option<Lock> {
                         entry.repeated |= entry.resolution.is_some();
                         entry.resolution = Some(value);
                     }
-                    None => lock.unread += 1,
+                    None => lock.partial = true,
                 }
             }
-            1 | 3 => lock.unread += 1,
+            1 | 3 => lock.partial = true,
             _ => {}
         }
     }
@@ -112,19 +114,26 @@ pub(super) fn read(text: &str) -> Option<Lock> {
     (seen_packages && !lock.packages.is_empty()).then_some(lock)
 }
 
-/// The key of a top-level line, `key:` or `key: {}` (an empty section).
+/// The key of a top-level line: `key:` opening a section, or `key: value`
+/// (pnpm's format has top-level checksums such as `pnpmfileChecksum`).
+/// `packages` takes no value but `{}`, an empty section: any other would
+/// hold packages in a form not read here.
 fn top_level_key(line: &str) -> Option<&str> {
-    let key = line
-        .strip_suffix(':')
-        .or_else(|| line.strip_suffix(": {}"))?;
-    (!key.is_empty()
+    let (key, value) = if let Some(key) = line.strip_suffix(':') {
+        (key, None)
+    } else {
+        let (key, value) = line.split_once(": ")?;
+        (key, Some(value))
+    };
+    let plain = !key.is_empty()
         && key
             .chars()
-            .all(|character| character.is_ascii_alphanumeric()))
-    .then_some(key)
+            .all(|character| character.is_ascii_alphanumeric());
+    let packages_in_another_form = key == "packages" && !matches!(value, None | Some("{}"));
+    (plain && !packages_in_another_form).then_some(key)
 }
 
-/// Takes in `entry`, or counts it as unread.
+/// Takes in `entry`, or marks the lock as read in part.
 fn finish(entry: Option<Entry<'_>>, lock: &mut Lock) {
     let Some(entry) = entry else {
         return;
@@ -135,7 +144,7 @@ fn finish(entry: Option<Entry<'_>>, lock: &mut Lock) {
         .and_then(|resolution| locked(entry.key, resolution));
     match locked {
         Some(locked) => lock.packages.push(locked),
-        None => lock.unread += 1,
+        None => lock.partial = true,
     }
 }
 
@@ -261,6 +270,8 @@ mod tests {
 settings:
   autoInstallPeers: true
 
+pnpmfileChecksum: sha256-abc
+
 importers:
 
   .:
@@ -336,7 +347,7 @@ snapshots:
                 ("pinned", "3.0.0", &Resolution::Elsewhere),
             ]
         );
-        assert_eq!(lock.unread, 0);
+        assert!(!lock.partial);
     }
 
     #[test]
@@ -353,6 +364,8 @@ snapshots:
             // No package at all.
             "lockfileVersion: '9.0'\n\npackages: {}\n",
             "lockfileVersion: '9.0'\n\nimporters:\n  .: {}\n",
+            // Packages in another form than a section.
+            "lockfileVersion: '9.0'\npackages: [a@1.0.0]\n",
         ] {
             assert!(read(text).is_none(), "{text:?}");
         }
@@ -383,7 +396,7 @@ snapshots:
         ] {
             let lock = read(&LOCK.replacen(&from, &to, 1)).unwrap();
 
-            assert!(lock.unread >= 1, "{from:?} -> {to:?}");
+            assert!(lock.partial, "{from:?} -> {to:?}");
             assert!(
                 names(&lock).iter().all(|(name, ..)| *name != "@acme/tool"),
                 "{from:?} -> {to:?}"
@@ -461,7 +474,7 @@ snapshots:
             let lock = read(&text).unwrap();
 
             assert_eq!(lock.packages, expected, "{text}");
-            assert_eq!(lock.unread, 0, "{text}");
+            assert!(!lock.partial, "{text}");
         }
     }
 

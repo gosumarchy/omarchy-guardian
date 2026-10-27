@@ -934,7 +934,8 @@ registry: `PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL`, `PIP_FIND_LINKS`,
 `PIP_REQUIREMENT`, `PIP_CONSTRAINT`, `PIP_CONFIG_FILE`; `UV_INDEX*`,
 `UV_DEFAULT_INDEX`, `UV_EXTRA_INDEX_URL`, `UV_FIND_LINKS`, `UV_CONFIG_FILE`;
 and `npm_config_registry`, a scope's `npm_config_@scope:registry`,
-`npm_config_userconfig` and `npm_config_globalconfig`. A file that names one,
+`npm_config_userconfig`, `npm_config_globalconfig` and aube's
+`npm_config_npmrc_auth_file` and `AUBE_NPMRC_AUTH_FILE`. A file that names one,
 whatever it sets it to, leaves out every package of that tool (for npm, as an
 npm file that cannot be read does), and is said. One that is there and cannot
 be read (closed, not a regular file or a link to one, a link loop, over 2
@@ -984,10 +985,12 @@ from PyPI, crates from crates.io.
   decide, as aube reads them too. aube also reads pnpm's `auth.ini`
   (`~/.config/pnpm/auth.ini`, or under `XDG_CONFIG_HOME`), the file
   `npmrc-auth-file` names and a `.npmrc` in the tool's directory, which npm
-  does not: where `auth.ini` sets one of the keys above, an npm file or
-  variable names `npmrc-auth-file`, or the tool's directory has a `.npmrc`,
-  no package aube installed is sent, and an `auth.ini` that cannot be read
-  is said. A package whose lockfile entry records the public registry's
+  does not: where `auth.ini` sets one of the keys above, an npm file names
+  `npmrc-auth-file`, `npm_config_npmrc_auth_file` or `AUBE_NPMRC_AUTH_FILE`
+  is set, or the tool's directory has a `.npmrc`, no package aube installed
+  is sent, and an `auth.ini` that cannot be read is said where an aube tool
+  is installed. aube takes no registry from its workspace file, its
+  `config.toml` or other `AUBE_*` variables. A package whose lockfile entry records the public registry's
   address for its own name and version is sent even where npm's settings
   name another registry, and one from git, a local path or another address
   is not.
