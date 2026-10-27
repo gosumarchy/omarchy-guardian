@@ -1085,3 +1085,96 @@ fn a_line_that_goes_on_from_the_one_before_starts_no_command() {
     // A here-string takes no lines.
     assert_eq!(runs("read -r a <<< \"$b\"\n\"$X/run\"\n"), ["$X/run"]);
 }
+
+#[test]
+fn a_script_handed_to_a_wrapper_beside_it_is_followed() {
+    let lookup = super::Lookup {
+        home: "home/u",
+        search: &[],
+        exists: &|path| path.starts_with("home/u/"),
+        capped: std::cell::Cell::new(false),
+        unwritten: std::cell::Cell::new(false),
+        shell_scripts: std::cell::RefCell::default(),
+    };
+    assert_eq!(
+        lookup.targets("bash /home/u/p/wrap.sh /home/u/p/hook.py"),
+        ["home/u/p/wrap.sh", "home/u/p/hook.py"]
+    );
+    // A redirection before the script is no script.
+    for command in [
+        "bash 2>/dev/null /home/u/p/wrap.sh",
+        "bash 2> /dev/null /home/u/p/wrap.sh",
+    ] {
+        assert_eq!(lookup.targets(command), ["home/u/p/wrap.sh"], "{command}");
+    }
+    // Another directory, or a file that is no script, is no business of
+    // the review: a key or a log may be handed to a script too.
+    for command in [
+        "bash /home/u/p/wrap.sh /home/u/q/hook.py",
+        "bash /home/u/p/wrap.sh /home/u/p/id_ed25519",
+        "bash /home/u/p/wrap.sh /home/u/p/notes.txt",
+    ] {
+        assert_eq!(lookup.targets(command), ["home/u/p/wrap.sh"], "{command}");
+    }
+    // A line handing it more than are looked at says so.
+    let many: Vec<String> = (0..9).map(|n| format!("/home/u/p/h{n}.py")).collect();
+    lookup.capped.set(false);
+    let found = lookup.targets(&format!("bash /home/u/p/wrap.sh {}", many.join(" ")));
+    assert_eq!(found.len(), 9);
+    assert!(lookup.capped.get());
+}
+
+#[test]
+fn a_script_an_interpreter_is_handed_by_name_is_found() {
+    let runs = |text: &str| commands(Category::Shell, "home/u/x.sh", text);
+    // As a statement's command, or inside a substitution on any line.
+    assert_eq!(
+        runs("  bash \"$D/run-clippy.sh\" \"$w\" 2>&1 || true\n"),
+        ["bash $D/run-clippy.sh $w 2> 1"]
+    );
+    assert_eq!(runs("perl /opt/x/check.pl\n"), ["perl /opt/x/check.pl"]);
+    assert_eq!(
+        runs("house=\"$(perl \"$D/house-check.pl\" \"${f[@]}\" 2>/dev/null)\" || c=$?\n"),
+        ["perl $D/house-check.pl ${f[@]} 2>/dev/null"]
+    );
+    assert_eq!(
+        runs("x \\\n  \"$(python3 /opt/y/z.py)\"\n"),
+        ["python3 /opt/y/z.py"]
+    );
+    // An interpreter named by its path, or through `env`, too.
+    for (text, run) in [
+        (
+            "/usr/bin/env python3 \"$X/y.py\"\n",
+            "/usr/bin/env python3 $X/y.py",
+        ),
+        ("/bin/bash \"$X/y.sh\"\n", "/bin/bash $X/y.sh"),
+    ] {
+        assert!(
+            runs(text).contains(&run.to_string()),
+            "{text}: {:?}",
+            runs(text)
+        );
+    }
+    // A word holding both quotes is quoted so that it reads back whole.
+    assert_eq!(
+        runs("python3 'a\"b'\"c'd\" /opt/x.py\n"),
+        [r#"python3 'a"bc'"'"'d' /opt/x.py"#]
+    );
+    // What env starts must run a script too.
+    assert_eq!(
+        runs("/usr/bin/env mytool --conf /etc/x\n"),
+        ["/usr/bin/env"]
+    );
+    // A word with a blank keeps its quotes.
+    assert_eq!(runs("sh '/opt/a b/c.sh'\n"), ["sh '/opt/a b/c.sh'"]);
+    // awk's first operand is its program; a script named bare, or no path
+    // at all, is left as before; so is a line after one ending in `\`.
+    for text in [
+        "awk -F: '{print $1}' /etc/passwd\n",
+        "bash run.sh\n",
+        "bash -c 'echo hi'\n",
+        "x \\\n  bash \"$X/y.sh\"\n",
+    ] {
+        assert_eq!(runs(text), Vec::<String>::new(), "{text}");
+    }
+}

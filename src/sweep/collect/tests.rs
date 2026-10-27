@@ -599,7 +599,9 @@ fn a_star_on_a_command_line_does_not_stop_its_program_being_followed() {
     assert!(!followed.targets.contains(&"etc/second".to_string()));
     assert_eq!(
         followed.unfollowed,
-        ["only the first 1024 commands of a line"]
+        [
+            "only the first 1024 commands of a line, 8 option values on the way to a script, or 8 scripts handed beside one"
+        ]
     );
     write(
         root,
@@ -984,4 +986,68 @@ fn an_agents_entry_whose_name_is_taken_is_said_as_not_checked() {
         truncated,
         ["/home/u/a.json#x: two entries share this name; not checked"]
     );
+}
+
+#[test]
+fn a_script_handed_to_an_interpreter_is_followed() {
+    let dir = TempDir::new("sweep-interpreter");
+    let root = dir.path();
+    write(
+        root,
+        "etc/systemd/system/a.service",
+        "[Service]\nExecStart=/home/u/bin/run.sh\nExecStartPost=/usr/bin/bash /home/u/p/wrap.sh /home/u/p/hook.py\n",
+    );
+    write(
+        root,
+        "home/u/bin/run.sh",
+        concat!(
+            "#!/bin/bash\n",
+            "D=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n",
+            "bash \"$D/helper.sh\" \"$1\"\n",
+            "out=\"$(python3 \"$D/check.py\")\"\n",
+        ),
+    );
+    write(root, "home/u/bin/helper.sh", "true\n");
+    write(root, "home/u/bin/check.py", "print(1)\n");
+    write(root, "home/u/p/wrap.sh", "exec python3 \"$@\"\n");
+    write(root, "home/u/p/hook.py", "print(2)\n");
+    // A helper in a directory nothing here can tell is said to be unknown.
+    write(
+        root,
+        "home/u/bin/other.sh",
+        "#!/bin/sh\nperl \"$HOOKS/check.pl\"\n",
+    );
+    write(
+        root,
+        "etc/systemd/system/b.service",
+        "[Service]\nExecStart=/home/u/bin/other.sh\n",
+    );
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::System,
+    };
+    let collection = collect(&scope);
+    let at = |path: &str| {
+        collection
+            .items
+            .iter()
+            .find(|item| item.path == path)
+            .unwrap_or_else(|| panic!("{path} was not collected"))
+    };
+
+    let run = at("home/u/bin/run.sh");
+    assert!(!super::is_capped(run), "{:?}", run.notes);
+    for path in [
+        "home/u/bin/helper.sh",
+        "home/u/bin/check.py",
+        "home/u/p/wrap.sh",
+        "home/u/p/hook.py",
+    ] {
+        at(path);
+    }
+    let other = at("home/u/bin/other.sh");
+    assert!(super::is_capped(other), "{:?}", other.notes);
 }

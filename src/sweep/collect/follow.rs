@@ -229,8 +229,10 @@ fn lookup_limits(lookup: &commands::Lookup<'_>) -> Vec<String> {
     let mut reached = Vec::new();
     if lookup.capped.get() {
         reached.push(format!(
-            "only the first {} commands of a line",
-            commands::MAX_INNER_COMMANDS
+            "only the first {} commands of a line, {} option values on the way to a script, or {} scripts handed beside one",
+            commands::MAX_INNER_COMMANDS,
+            commands::MAX_OPTION_VALUES,
+            commands::MAX_SCRIPTS_BESIDE
         ));
     }
     if lookup.unwritten.get() {
