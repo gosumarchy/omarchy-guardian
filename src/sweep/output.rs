@@ -252,19 +252,23 @@ fn verdict_lines(report: &Report, decision: Decision) -> (Vec<Span>, &'static st
             "33",
         ));
     }
-    if total == 0
-        && matches!(
-            decision,
-            Decision::Blocked(Blocked::Findings) | Decision::Warned
-        )
-    {
+    let unnamed = report.agent_runs.iter().any(|run| {
+        matches!(&run.outcome, AgentOutcome::Reviewed(review)
+            if review.status == Status::Suspicious && review.findings.is_empty())
+    });
+    if unnamed {
         lines.push(Span::new(
             "The AI review found something suspicious; see sweep details",
             "33",
         ));
     }
+    if decision == Decision::Warned {
+        lines.push(Span::new("Allowed by policy for this source", "2"));
+    }
+    // Clear means no alerts, so its headline is green; the edge takes a
+    // plain colour code.
     let edge = match decision {
-        Decision::Clear => color,
+        Decision::Clear => "32",
         _ if counts.high > 0 => "31",
         _ => "33",
     };
@@ -301,7 +305,7 @@ pub(super) fn summary(
         .iter()
         .filter(|item| !item.is_trusted() && flagged_paths.contains(&label(item, home)))
         .count();
-    let (mut lines, color) = verdict_lines(report, decision);
+    let (mut lines, edge) = verdict_lines(report, decision);
     lines.extend(trust_lines(collection, flagged));
     match changes {
         Some(0) => lines.push(Span::new(
@@ -315,7 +319,6 @@ pub(super) fn summary(
         None => {}
     }
     let title = format!("Omarchy Guardian · {}", shown(&report.subject));
-    let edge = color.split(';').next().unwrap_or(color);
     let boxed = layout::boxed(&title, &lines, width, edge, painter);
     format!("{boxed}\n{}", attention(report, painter))
 }
@@ -687,10 +690,12 @@ mod tests {
     };
     use crate::agent::{AgentFinding, AgentReview, Status};
     use crate::autorun::Category;
-    use crate::config::model::{Profile, builtin};
+    use crate::config::model::{AiRequirement, Profile, builtin};
     use crate::error::Error;
     use crate::layout::Painter;
-    use crate::report::{AgentOutcome, AgentRun, Gap, LocalFinding, Report, ReviewScope, Severity};
+    use crate::report::{
+        AgentOutcome, AgentRun, Decision, Gap, LocalFinding, Report, ReviewScope, Severity,
+    };
     use crate::review::analyze_text_locally;
     use crate::rules::RuleId;
     use crate::sweep::collect::{Body, Item, Origin};
@@ -877,6 +882,31 @@ mod tests {
         );
         assert!(
             not_reviewed(&inconclusive)[0].contains("AI review: inconclusive: unsure"),
+            "{lines:?}"
+        );
+
+        // With the AI optional, a review that did not run warns: nothing
+        // was found suspicious, and the box must not say so.
+        let mut optional = Report::default();
+        optional
+            .agent_runs
+            .push(run(AgentOutcome::Unavailable(Error::Message(
+                "no network".into(),
+            ))));
+        let decision = optional.decide(&|class| {
+            let mut policy = builtin(Profile::Standard, class);
+            policy.ai = AiRequirement::Optional;
+            policy
+        });
+        assert_eq!(decision, Decision::Warned);
+        let (lines, _) = verdict_lines(&optional, decision);
+        let lines: Vec<String> = lines.iter().map(|line| format!("{line:?}")).collect();
+        assert!(
+            !lines.iter().any(|line| line.contains("suspicious")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("Allowed by policy")),
             "{lines:?}"
         );
 

@@ -1974,8 +1974,11 @@ system is trusted. The verdict leads with the alerts: `✓ NO ALERTS`,
 `! 3 ALERT(S) — 1 medium · 2 low`, or `✗` when one is high. What could not be
 checked (parts not checked, AI requests that failed, were not sent or came
 back inconclusive) is a line of its own, `Not fully checked: …`. The box is
-green only when the sweep is clear. A sweep that could not check everything
-exits with status 2 (incomplete), whatever the box says first. Below the box come up to 10 files the
+green only when the sweep is clear. A sweep with a part not checked, or an AI
+review it requires that did not complete, exits with status 2 (incomplete),
+whatever the box says first; where the configuration only warns (`ai =
+"optional"`, or `on_findings = "warn"`), the box adds "Allowed by policy for
+this source" and the sweep exits 0. Below the box come up to 10 files the
 review raised alerts on (worst first, one line each, with how many alerts
 each has), up to 3 reasons the check is not complete, and the notes on what
 the sweep could not check.
