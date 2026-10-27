@@ -1518,6 +1518,7 @@ fn a_review_moves_the_record_on_only_when_it_finished_clear() {
         path: FILE.into(),
         line: 1,
         rule: RuleId::ShellCommandExecution,
+        severity: RuleId::ShellCommandExecution.severity(),
         excerpt: String::new(),
     });
     assert_eq!(settled(&finding), kept);
@@ -1539,6 +1540,7 @@ fn a_review_moves_the_record_on_only_when_it_finished_clear() {
         path: "~/.local/share/nvim/lazy/pp/lua/p.lua".into(),
         line: 1,
         rule: RuleId::ShellCommandExecution,
+        severity: RuleId::ShellCommandExecution.severity(),
         excerpt: String::new(),
     });
     assert_eq!(settled(&other), moved);

@@ -481,6 +481,7 @@ fn content_that_speaks_to_the_reviewer_is_never_a_remark() {
     let mut local = report_under(Profile::Standard, SourceClass::Aur);
     local.findings.push(crate::report::LocalFinding {
         rule: crate::rules::RuleId::ReviewerInstruction,
+        severity: crate::rules::RuleId::ReviewerInstruction.severity(),
         ..finding("PKGBUILD")
     });
     local

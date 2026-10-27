@@ -280,6 +280,9 @@ pub(crate) struct LocalFinding {
     pub(crate) path: String,
     pub(crate) line: usize,
     pub(crate) rule: RuleId,
+    /// The rule's severity, or lower where the rule grades its matches by
+    /// the line (see `RuleId::severity_on`).
+    pub(crate) severity: Severity,
     pub(crate) excerpt: String,
 }
 
@@ -687,7 +690,7 @@ impl Report {
         lines.extend(self.findings.iter().map(|finding| {
             format!(
                 "{} {}:{} {}",
-                finding.rule.severity().label(),
+                finding.severity.label(),
                 finding.path,
                 finding.line,
                 finding.rule.name()
@@ -751,7 +754,7 @@ impl Report {
     fn counts(&self) -> Counts {
         let mut counts = Counts::default();
         for finding in &self.findings {
-            counts.add(finding.rule.severity());
+            counts.add(finding.severity);
         }
         for finding in self.agent_findings(false) {
             counts.add(finding.severity);

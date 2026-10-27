@@ -402,7 +402,7 @@ fn findings_json(report: &Report) -> Json {
             ("rule", Json::from(finding.rule.name())),
             (
                 "severity",
-                Json::from(finding.rule.severity().label().to_ascii_lowercase()),
+                Json::from(finding.severity.label().to_ascii_lowercase()),
             ),
         ])
     });
@@ -455,10 +455,31 @@ fn reviews_json(report: &Report) -> Json {
 mod tests {
     use std::collections::{BTreeMap, HashSet};
 
-    use super::items_html;
+    use super::{findings_json, items_html};
     use crate::autorun::Category;
+    use crate::report::{Report, ReviewScope};
+    use crate::review::analyze_text_locally;
     use crate::sweep::collect::{Body, Item, Origin};
     use crate::sweep::tier::Tier;
+
+    #[test]
+    fn a_finding_carries_the_severity_of_its_match() {
+        let mut report = Report::new("sweep", ReviewScope::default());
+        analyze_text_locally(
+            &mut report,
+            "~/.config/hooks/hook.py",
+            "subprocess.run([\"git\", \"status\"])\nsubprocess.run(cmd, shell=True)\n",
+        );
+        let json = findings_json(&report);
+        let severities: Vec<&str> = json
+            .as_array()
+            .expect("findings_json returns an array")
+            .iter()
+            .map(|finding| finding.get("severity").and_then(|value| value.as_str()))
+            .collect::<Option<_>>()
+            .expect("every finding has a severity");
+        assert_eq!(severities, ["low", "medium"]);
+    }
 
     #[test]
     fn the_page_escapes_what_it_lists() {

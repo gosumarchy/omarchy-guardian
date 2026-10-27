@@ -46,6 +46,14 @@ headline (`HIGH RISK` with a high finding, `REVIEW REQUIRED` otherwise);
 whether a finding blocks or warns follows the class's `on_findings`. The ids
 and severities are listed [at the end of this page](#rule-ids).
 
+Shell execution reports every Python `subprocess` call, but grades it: a call
+that passes no shell runs one program and no shell parses its arguments, so it
+is low. One that passes `shell` any value but `False` on the same line
+(`shell=True`, `shell=1`, `shell=use_shell`) stays medium, as does a line that
+also matches another shell-execution pattern (`os.system(`, `eval(`, ...). A
+call written over several lines with `shell=True` on a later one is rated low;
+it is still reported.
+
 Download-to-shell also covers a fetch piped into another interpreter (`|
 python`, `| perl`, `| node`, ...), behind a wrapper (`| timeout 5 sh`, `|
 xargs sh -c`) or grouped (`| { sh; }`), a fetch run from a substitution or a
@@ -238,7 +246,7 @@ sweep](system-sweep.md).
 | `credential-file-access` | medium | References a commonly sensitive credential or private-key file; inspect how it is used. |
 | `destructive-system-operation` | high | Contains a command associated with destructive disk or filesystem changes. |
 | `persistence-modification` | medium | May install persistence: writes a startup, scheduled-task or SSH authorization file, runs a command on its own from a temporary or cache directory, or arranges for something to keep running. |
-| `shell-command-execution` | medium | Starts a shell or dynamically evaluates a command; review how input is constructed. |
+| `shell-command-execution` | medium; low for a Python `subprocess` call that passes no shell on its line | Starts a shell or dynamically evaluates a command; review how input is constructed. |
 | `privilege-escalation` | medium | Requests elevated privileges or changes privilege-related system configuration. |
 | `credential-exfiltration` | high | Combines access to sensitive data with an outbound network request. |
 | `cleartext-network-request` | medium | Sends a network request over unencrypted HTTP. |

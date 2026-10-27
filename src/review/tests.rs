@@ -9,7 +9,9 @@ use crate::agent::Status;
 use crate::config::Settings;
 use crate::config::file::{AgentDefaults, PartialConfig, PartialPolicy};
 use crate::config::model::{AiRequirement, Named, Profile, SourceClass, builtin};
-use crate::report::{AgentOutcome, AgentRun, Blocked, Decision, Gap, Report, ReviewScope};
+use crate::report::{
+    AgentOutcome, AgentRun, Blocked, Decision, Gap, Report, ReviewScope, Severity,
+};
 use crate::rules::RuleId;
 use crate::scan::ScanConfig;
 use crate::test_support::{
@@ -543,6 +545,70 @@ fn a_tree_under_a_secrets_directory_is_not_withheld() {
 }
 
 #[test]
+fn a_subprocess_call_without_a_shell_is_low_and_still_decides() {
+    let dir = TempDir::new("subprocess-hook");
+    let bin = TempDir::new("subprocess-hook-bin");
+    fs::write(
+        dir.path().join("hook.py"),
+        "import os, subprocess\n\
+         subprocess.run([\"git\", \"status\"], check=True)\n\
+         subprocess.run(cmd, shell=True)\n\
+         os.system(cmd)\n",
+    )
+    .unwrap();
+    let opencode = clear_opencode(&bin);
+    let settings = default_settings();
+
+    let report = review_tree(
+        &ScanConfig::new(dir.path()),
+        &context(&settings, SourceClass::Source, &opencode),
+    );
+
+    let graded: Vec<(usize, RuleId, Severity)> = report
+        .findings
+        .iter()
+        .map(|finding| (finding.line, finding.rule, finding.severity))
+        .collect();
+    assert_eq!(
+        graded,
+        [
+            (2, RuleId::ShellCommandExecution, Severity::Low),
+            (3, RuleId::ShellCommandExecution, Severity::Medium),
+            (4, RuleId::ShellCommandExecution, Severity::Medium),
+        ]
+    );
+    assert!(
+        report.overruled_summary(10)[0].starts_with("LOW hook.py:2 "),
+        "{:?}",
+        report.overruled_summary(10)
+    );
+
+    // A low local finding decides as any local finding does: it is shown,
+    // and the class's `on_findings` applies to it.
+    let mut low = Report::new("hook", ReviewScope::default());
+    analyze_text(
+        &mut low,
+        "hook.py",
+        "subprocess.run([\"git\", \"status\"])\n",
+        false,
+    );
+    assert_eq!(low.findings[0].severity, Severity::Low);
+    let blocked = Decision::Blocked(Blocked::Findings);
+    for profile in [Profile::Standard, Profile::Strict, Profile::LocalOnly] {
+        assert_eq!(
+            low.decide(&|class| builtin(profile, class)),
+            blocked,
+            "{profile:?}"
+        );
+    }
+    assert_eq!(low.decision_name(blocked), "REVIEW REQUIRED");
+    assert_eq!(
+        low.decide(&|_| builtin(Profile::Standard, SourceClass::Official)),
+        Decision::Warned
+    );
+}
+
+#[test]
 fn local_only_never_calls_the_agent() {
     let dir = TempDir::new("local-only");
     let bin = TempDir::new("local-only-bin");
@@ -675,8 +741,8 @@ fn upstream_code_is_read_by_the_high_rules_where_the_ai_is_off() {
     assert!(report.findings.is_empty(), "{:?}", report.findings);
     assert_eq!(report.agent_input.len(), 1);
 
-    // With it off, the high rules read the file; the medium ones, which
-    // ordinary code matches, do not block it.
+    // With it off, the high rules read the file; the medium and low ones,
+    // which ordinary code matches, do not block it.
     let mut report = Report::new(
         "upstream",
         ReviewScope {

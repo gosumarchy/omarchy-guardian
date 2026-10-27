@@ -93,34 +93,38 @@ pub(crate) enum RuleId {
 
 /// How a rule decides whether a lowercased line matches.
 enum Matcher {
-    /// Any of these patterns, respecting identifier boundaries (see
-    /// `contains_pattern`).
-    Patterns(&'static [&'static str]),
     Custom(fn(&str) -> bool),
     /// Reported by a dedicated check (the network destination inventory, the
     /// git config check) instead of per line.
     Reported,
 }
 
+/// What `shell-command-execution` matches besides `SUBPROCESS_CALLS`,
+/// respecting identifier boundaries (see `contains_pattern`).
 const SHELL_EXECUTION: &[&str] = &[
     "os.system(",
     "os.execute(",
     "io.popen(",
-    "subprocess.popen(",
-    "subprocess.run(",
     "child_process.exec(",
     "child_process.execsync(",
     "command::new(\"sh\")",
     "command::new(\"bash\")",
     "eval(",
     "os.popen(",
-    "subprocess.call(",
-    "subprocess.check_call(",
-    "subprocess.check_output(",
     "__import__('os').system(",
     "__import__(\"os\").system(",
     "child_process').exec(",
     "child_process\").exec(",
+];
+
+/// Python's `subprocess` calls, also matched by `shell-command-execution`
+/// but graded by whether they pass a shell (see `RuleId::severity_on`).
+const SUBPROCESS_CALLS: &[&str] = &[
+    "subprocess.popen(",
+    "subprocess.run(",
+    "subprocess.call(",
+    "subprocess.check_call(",
+    "subprocess.check_output(",
 ];
 
 impl RuleId {
@@ -229,6 +233,30 @@ impl RuleId {
             Self::PluginSource => "plugin-source",
             Self::PluginBuild => "plugin-build",
             Self::MaliciousPackage => "malicious-package",
+        }
+    }
+
+    /// The severity of this rule's match on `lowered`, the lowercased line
+    /// it matched. The same as `severity` for every rule but
+    /// `shell-command-execution`, which rates a `subprocess` call that
+    /// passes no shell low.
+    pub(crate) fn severity_on(self, lowered: &str) -> Severity {
+        // The owner's decision: a `subprocess` call is still reported, but
+        // at low unless the same line passes it a shell. Given a list of
+        // arguments and no shell it runs one program, and no shell parses
+        // what it is given; a real sweep reported 17 such calls in harmless
+        // Python hooks (`subprocess.run(["git", ...])`) at medium. Not
+        // reporting them at all was rejected, since a payload can still
+        // hide behind one. Accepted downside: a call written over several
+        // lines with `shell=True` on a later one is rated low instead of
+        // medium; it is still reported, so nothing is hidden.
+        let subprocess_without_shell = self == Self::ShellCommandExecution
+            && !contains_any(lowered, SHELL_EXECUTION)
+            && !passes_shell(lowered);
+        if subprocess_without_shell {
+            Severity::Low
+        } else {
+            self.severity()
         }
     }
 
@@ -501,7 +529,7 @@ impl RuleId {
             Self::CredentialFileAccess => Matcher::Custom(references_credential),
             Self::DestructiveSystemOperation => Matcher::Custom(is_destructive_operation),
             Self::PersistenceModification => Matcher::Custom(is_persistence),
-            Self::ShellCommandExecution => Matcher::Patterns(SHELL_EXECUTION),
+            Self::ShellCommandExecution => Matcher::Custom(runs_shell_command),
             Self::PrivilegeEscalation => Matcher::Custom(is_privilege_escalation),
             Self::CredentialExfiltration => Matcher::Custom(looks_like_credential_exfiltration),
             Self::CleartextNetworkRequest
@@ -607,7 +635,6 @@ impl RuleId {
 
     fn matches_line(self, lowered: &str) -> bool {
         match self.matcher() {
-            Matcher::Patterns(patterns) => contains_any(lowered, patterns),
             Matcher::Custom(matches) => matches(lowered),
             Matcher::Reported => false,
         }
@@ -654,6 +681,33 @@ fn contains_any(haystack: &str, patterns: &[&str]) -> bool {
     patterns
         .iter()
         .any(|pattern| contains_pattern(haystack, pattern))
+}
+
+fn runs_shell_command(lowered: &str) -> bool {
+    contains_any(lowered, SHELL_EXECUTION) || contains_any(lowered, SUBPROCESS_CALLS)
+}
+
+/// Whether `lowered` passes Python's `shell` keyword any value but `False`.
+/// `shell=1` or `shell=use_shell` run a shell just as `shell=True` does, so
+/// only `False` counts as no shell. The line is lowercased, so `shell=FALSE`
+/// reads as `False` too: Python has no such name, so that line names a
+/// variable of its own, and it is rated low but still reported.
+fn passes_shell(lowered: &str) -> bool {
+    pattern_starts(lowered, "shell").any(|start| {
+        let rest = lowered[start + "shell".len()..].trim_start();
+        let Some(value) = rest.strip_prefix('=') else {
+            return false;
+        };
+        // `shell == x` compares; it passes nothing.
+        if value.starts_with('=') {
+            return false;
+        }
+        let is_false = value
+            .trim_start()
+            .strip_prefix("false")
+            .is_some_and(|after| !after.bytes().next().is_some_and(is_identifier_byte));
+        !is_false
+    })
 }
 
 /// Programs that fetch from the network.

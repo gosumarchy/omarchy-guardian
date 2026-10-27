@@ -907,6 +907,7 @@ fn each_chunk_is_told_what_the_rules_matched_in_the_others() {
         path: "b.c".into(),
         line: 3,
         rule: RuleId::PrivilegeEscalation,
+        severity: RuleId::PrivilegeEscalation.severity(),
         excerpt: "sudo x".into(),
     }];
     let group = Group {
