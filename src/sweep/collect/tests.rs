@@ -341,6 +341,60 @@ fn a_long_way_to_a_script_does_not_stand_for_the_short_one() {
 }
 
 #[test]
+fn a_script_is_followed_to_the_helpers_beside_it() {
+    let dir = TempDir::new("sweep-beside");
+    let root = dir.path();
+    write(
+        root,
+        "etc/systemd/system/a.service",
+        "[Service]\nExecStart=/home/u/bin/run.sh\nExecStartPost=/home/u/bin/other.sh\n",
+    );
+    write(
+        root,
+        "home/u/bin/run.sh",
+        concat!(
+            "#!/bin/bash\n",
+            "SCRIPT_DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\"\n",
+            "source \"$(dirname \"$0\")/common.sh\"\n",
+            "\"$SCRIPT_DIR/helper.sh\" \"warp://x\"\n",
+            "X=$(echo \"$I\" | jq -r '(.a | .b) // \"\"')\n",
+        ),
+    );
+    write(root, "home/u/bin/common.sh", "#!/bin/sh\ntrue\n");
+    write(root, "home/u/bin/helper.sh", "#!/bin/sh\ntrue\n");
+    // A directory nothing here can tell is not followed, and says so.
+    write(root, "home/u/bin/other.sh", "#!/bin/sh\n\"$TOOLS/x.sh\"\n");
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::System,
+    };
+    let collection = collect(&scope);
+    let at = |path: &str| {
+        collection
+            .items
+            .iter()
+            .find(|item| item.path == path)
+            .unwrap_or_else(|| panic!("{path} was not collected"))
+    };
+
+    let run = at("home/u/bin/run.sh");
+    assert_eq!(
+        run.runs,
+        ["/home/u/bin/common.sh", "/home/u/bin/helper.sh"],
+        "{:?}",
+        run.runs
+    );
+    assert!(!super::is_capped(run), "{:?}", run.notes);
+    at("home/u/bin/common.sh");
+    at("home/u/bin/helper.sh");
+    let other = at("home/u/bin/other.sh");
+    assert!(super::is_capped(other), "{:?}", other.notes);
+}
+
+#[test]
 fn a_file_a_shell_is_handed_is_a_shell_script_whatever_it_is_called() {
     let dir = TempDir::new("sweep-handed");
     let root = dir.path();

@@ -152,9 +152,15 @@ A unit's command that runs over several lines (ending in `\`) is read as one,
 and `%h`, `%E`, `%S`, `%C` and `%L` (and `%t` in a system unit) are written
 out. `~`, `$HOME`, `$XDG_CONFIG_HOME` and `$XDG_DATA_HOME` at their default
 places and a path a start-up file puts in a variable of its own
-(`TOOLS=~/opt/tools`, then `$TOOLS/run`) are understood, other variables are
-not. A Hyprland `source` with `*` or `?` in its last part is followed to the
-files it matches (up to 1024).
+(`TOOLS=~/opt/tools`, then `$TOOLS/run`) are understood. So is a script's own
+directory, as scripts find the helpers beside them: `$(dirname "$0")`,
+`$(dirname "${BASH_SOURCE[0]}")`, `${BASH_SOURCE%/*}`, and
+`$(cd "…" && pwd)` around one (`SCRIPT_DIR=…`, then `$SCRIPT_DIR/helper.sh`);
+for a script started through a link, `$0` names the link's directory, which
+may hold other files. Other variables are not understood: a program or script
+named through one, or through a substitution, is not followed, and the item
+says that what it runs was not all followed. A Hyprland `source` with `*` or
+`?` in its last part is followed to the files it matches (up to 1024).
 
 A bare command name in an auto-run file is looked for along the list of
 directories described under [Programs ahead of the system's

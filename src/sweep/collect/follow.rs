@@ -130,6 +130,7 @@ pub(super) fn follow(
             search: &search.directories,
             exists: &|candidate| is_there(scope, candidate, by),
             capped: std::cell::Cell::new(false),
+            unwritten: std::cell::Cell::new(false),
             shell_scripts: std::cell::RefCell::default(),
         };
         let (parts, long) = parts_of(command, shell_line);
@@ -152,11 +153,8 @@ pub(super) fn follow(
                 }
             }
         }
-        if lookup.capped.get() {
-            limit(format!(
-                "only the first {} commands of a line",
-                commands::MAX_INNER_COMMANDS
-            ));
+        for sentence in lookup_limits(&lookup) {
+            limit(sentence);
         }
     }
     let kinds = Kinds {
@@ -224,6 +222,21 @@ fn parts_of(command: &str, shell_line: bool) -> ((Vec<String>, bool), bool) {
             false,
         )
     }
+}
+
+/// The limits `lookup` reached while it looked for what commands run.
+fn lookup_limits(lookup: &commands::Lookup<'_>) -> Vec<String> {
+    let mut reached = Vec::new();
+    if lookup.capped.get() {
+        reached.push(format!(
+            "only the first {} commands of a line",
+            commands::MAX_INNER_COMMANDS
+        ));
+    }
+    if lookup.unwritten.get() {
+        reached.push("a program or script named through a variable or a substitution".to_string());
+    }
+    reached
 }
 
 /// How the targets of an item were reached, by the paths as written.

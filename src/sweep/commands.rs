@@ -11,7 +11,9 @@ use crate::autorun::Category;
 use crate::paths::file_name;
 
 pub(super) use shell::{is_shell_script, sourced_files};
-use shell::{path_variables, sourced, started, without_case_patterns, zdotdir};
+use shell::{
+    path_variables, sourced, started, with_script_directory, without_case_patterns, zdotdir,
+};
 use targets::split;
 pub(super) use targets::{
     Lookup, MAX_GLOB, MAX_INNER_COMMANDS, default_search, expand, glob_targets, split_commands,
@@ -64,6 +66,13 @@ pub(super) fn commands(category: Category, path: &str, text: &str) -> Vec<String
     if category == Category::Sudo {
         return sudoers(path, text);
     }
+    let beside;
+    let text = if category == Category::Shell {
+        beside = with_script_directory(text, path);
+        beside.as_str()
+    } else {
+        text
+    };
     let variables = if category == Category::Shell {
         path_variables(text)
     } else {

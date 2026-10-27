@@ -409,6 +409,7 @@ fn a_line_of_commands_splits_where_a_shell_would() {
         search: &[],
         exists: &|_| false,
         capped: std::cell::Cell::new(false),
+        unwritten: std::cell::Cell::new(false),
         shell_scripts: std::cell::RefCell::default(),
     };
     lookup.targets(&nested);
@@ -513,6 +514,7 @@ fn what_a_start_up_file_or_a_command_line_names_is_found() {
             ["home/u/.local/share/mise/shims/sh", "usr/bin/sh"].contains(&candidate)
         },
         capped: std::cell::Cell::new(false),
+        unwritten: std::cell::Cell::new(false),
         shell_scripts: std::cell::RefCell::default(),
     };
     assert_eq!(
@@ -589,6 +591,7 @@ fn the_script_is_found_for_every_interpreter_and_past_its_options() {
         search: &super::default_search("home/u"),
         exists: &exists,
         capped: std::cell::Cell::new(false),
+        unwritten: std::cell::Cell::new(false),
         shell_scripts: std::cell::RefCell::default(),
     };
     // Interpreters the live checks knew and this one did not.
@@ -831,5 +834,76 @@ fn what_runs_is_found_past_wrappers_and_in_files_that_are_read_in() {
             runs,
             "{line}"
         );
+    }
+}
+
+#[test]
+fn a_script_names_its_own_directory_in_the_ways_scripts_do() {
+    let path = "home/u/w/s/x.sh";
+    let runs = |line: &str| commands(Category::Shell, path, &format!("#!/bin/bash\n{line}\n"));
+    for line in [
+        r#"source "$(dirname "${BASH_SOURCE[0]}")/c.sh""#,
+        r#". "$(dirname "$0")/c.sh""#,
+        ". $(dirname $0)/c.sh",
+        r#". "${BASH_SOURCE%/*}/c.sh""#,
+        r#". "${0%/*}/c.sh""#,
+        r#". "$(dirname "$(readlink -f "$0")")/c.sh""#,
+        r#". "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)/c.sh""#,
+        "D=\"$(cd \"$(dirname \"$0\")\" && pwd -P)\"\n. \"$D/c.sh\"",
+    ] {
+        assert_eq!(runs(line), ["/home/u/w/s/c.sh"], "{line}");
+    }
+    // Another file's directory, or a `cd` that goes on to do more, is not
+    // the script's own.
+    for line in [
+        r#". "$(dirname "$1")/c.sh""#,
+        r#". "$(cd "$(dirname "$0")" && git rev-parse --show-toplevel)/c.sh""#,
+    ] {
+        assert_ne!(runs(line), ["/home/u/w/s/c.sh"], "{line}");
+    }
+}
+
+#[test]
+fn a_separator_inside_single_quotes_starts_no_statement() {
+    let runs = commands(
+        Category::Shell,
+        "home/u/x.sh",
+        "#!/bin/sh\nX=$(echo \"$I\" | jq -r '(.a | .b) // \"\"; /bin/y')\n",
+    );
+    assert!(runs.is_empty(), "{runs:?}");
+    // In double quotes they still end one, as inside `"$(a && /bin/b)"`.
+    let runs = commands(
+        Category::Shell,
+        "home/u/x.sh",
+        "#!/bin/sh\nX=\"$(cd /tmp && /home/u/bin/b)\"\n",
+    );
+    assert_eq!(runs, ["/home/u/bin/b"]);
+}
+
+#[test]
+fn a_program_named_through_a_variable_is_said_to_be_unknown() {
+    let lookup = super::Lookup {
+        home: "home/u",
+        search: &[],
+        exists: &|_| false,
+        capped: std::cell::Cell::new(false),
+        unwritten: std::cell::Cell::new(false),
+        shell_scripts: std::cell::RefCell::default(),
+    };
+    for command in ["$TOOLS/x.sh", "bash \"$X/y.sh\"", "$(dirname", "`pwd`/x"] {
+        lookup.unwritten.set(false);
+        lookup.targets(command);
+        assert!(lookup.unwritten.get(), "{command}");
+    }
+    for command in [
+        "$HOME/x.sh",
+        "/bin/x",
+        "bash /x/y.sh",
+        "x $FOO",
+        "echo $(date)",
+    ] {
+        lookup.unwritten.set(false);
+        lookup.targets(command);
+        assert!(!lookup.unwritten.get(), "{command}");
     }
 }
