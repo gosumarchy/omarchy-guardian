@@ -125,6 +125,26 @@ fn is_marked_slow_down(message: &str) -> bool {
         || has_status("529")
 }
 
+/// Whether a provider's or CLI's error says the reviewer is not logged in:
+/// an expired OAuth session, a bad API key. It names the fix; it decides
+/// nothing about whether the run blocks.
+pub(super) fn is_login_failure(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "failed to authenticate",
+        "authentication_error",
+        "authentication failed",
+        "oauth",
+        "invalid api key",
+        "invalid x-api-key",
+        "please run /login",
+        "not logged in",
+        "token has expired",
+    ]
+    .iter()
+    .any(|sign| message.contains(sign))
+}
+
 pub(super) fn content_rejected(detail: &str) -> Error {
     Error::Message(format!(
         "the AI provider refused this source ({detail}); a source can be written to be refused, so this is not an absent reviewer"

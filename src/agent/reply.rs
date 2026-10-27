@@ -6,11 +6,30 @@ use crate::json::Json;
 use crate::report::Severity;
 use crate::tools::Failure;
 
-use super::provider::{content_rejected, out_of_time, rejects_content, rejects_input};
+use super::provider::{
+    content_rejected, is_login_failure, out_of_time, rejects_content, rejects_input,
+};
 use super::{
     ADDRESSED_FIELD, ADDRESSED_FILE, ADDRESSED_TITLE, AgentError, AgentFinding, AgentReview,
     REPORT, Status,
 };
+
+/// The error of a run that failed after the source was handed over. It
+/// blocks: content can be written to make a model decline. Claude Code
+/// also writes its own error, a failed login among them, as an assistant
+/// turn, which reads as handed over; a login failure is named as such so
+/// the fix is plain, and blocks all the same.
+fn failed_after_delivery(detail: &str) -> Error {
+    if is_login_failure(detail) {
+        Error::Message(format!(
+            "the AI reviewer could not log in ({detail}); log in to it again, then retry"
+        ))
+    } else {
+        Error::Message(format!(
+            "the AI saw the source and then declined or failed to review it ({detail}); retry"
+        ))
+    }
+}
 
 /// Classifies a Claude Code `--output-format stream-json` transcript. A
 /// `tool_use` block in any assistant message, or a permission denial, means
@@ -69,9 +88,9 @@ pub(super) fn claude_verdict(
         }
         return Err(match failure {
             Some(Failure::TimedOut) if delivered => AgentError::OutOfTime(out_of_time()),
-            Some(failure) if delivered => AgentError::Invalid(Error::Message(format!(
-                "the AI saw the source and the review then failed ({failure}); retry"
-            ))),
+            Some(failure) if delivered => {
+                AgentError::Invalid(failed_after_delivery(&failure.to_string()))
+            }
             Some(failure) => unavailable(failure),
             None => {
                 AgentError::Invalid(Error::parse("the Claude Code result", "not a JSON result"))
@@ -108,9 +127,7 @@ pub(super) fn claude_verdict(
                 .and_then(Json::as_u64)
                 .is_some_and(|tokens| tokens > 0);
         return Err(if delivered {
-            AgentError::Invalid(Error::Message(format!(
-                "the AI saw the source and then declined or failed to review it ({detail}); retry"
-            )))
+            AgentError::Invalid(failed_after_delivery(&detail))
         } else if rejects_input(&detail) {
             AgentError::Invalid(Error::Message(format!(
                 "the AI could not take this source in one request ({detail}); lower max_input_kib or use a model with a larger context"
@@ -240,9 +257,7 @@ pub(super) fn verdict(
     if events.delivered
         && let Some(message) = &events.error
     {
-        return Err(AgentError::Invalid(Error::Message(format!(
-            "the AI saw the source and then declined or failed to review it ({message}); retry"
-        ))));
+        return Err(AgentError::Invalid(failed_after_delivery(message)));
     }
     if events.delivered && failure == Some(Failure::TimedOut) {
         return Err(AgentError::OutOfTime(out_of_time()));

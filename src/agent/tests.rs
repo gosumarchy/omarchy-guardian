@@ -1281,3 +1281,29 @@ fn content_that_addresses_the_reviewer_is_never_clear() {
     .unwrap();
     assert_eq!(inconclusive.status, Status::Inconclusive);
 }
+
+#[test]
+fn a_failed_login_after_the_hand_over_says_to_log_in_and_still_blocks() {
+    let message = |result: Result<super::AgentReview, AgentError>| match result {
+        Err(AgentError::Invalid(error)) => error.to_string(),
+        other => panic!("not a blocking error: {other:?}"),
+    };
+    // Claude Code writes its own error as a turn of the model's.
+    let expired = concat!(
+        "{\"type\":\"assistant\",\"message\":{\"model\":\"<synthetic>\",\"content\":[",
+        "{\"type\":\"text\",\"text\":\"Failed to authenticate\"}]}}\n",
+        "{\"type\":\"result\",\"is_error\":true,\"result\":",
+        "\"Failed to authenticate: OAuth session expired and could not be refreshed\"}\n",
+    );
+    let said = message(claude_verdict(expired, None, "n1"));
+    assert!(said.contains("could not log in"), "{said}");
+    let events = scan_events(
+        "{\"type\":\"step_start\"}\n{\"type\":\"error\",\"error\":{\"data\":{\"message\":\"Invalid API key\"}}}\n",
+    );
+    let said = message(verdict(events, None, "n1"));
+    assert!(said.contains("could not log in"), "{said}");
+    // Any other failure keeps saying the AI saw the source.
+    let refused = "{\"type\":\"assistant\",\"message\":{\"content\":[]}}\n{\"type\":\"result\",\"is_error\":true,\"result\":\"API Error: 500\"}\n";
+    let said = message(claude_verdict(refused, None, "n1"));
+    assert!(said.contains("saw the source"), "{said}");
+}
