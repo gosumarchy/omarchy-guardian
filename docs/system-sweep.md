@@ -213,7 +213,7 @@ extra look at the program it names. The limits:
 | Files one pattern stands for | 1024 |
 | A line of a start-up file looked through for programs | 64 KB |
 | One command line split into its commands (a longer one is taken as a single command) | 64 KB |
-| Links in a chain | 8 |
+| Links in a chain (one among Neovim's spec files: as the kernel follows them, see [Neovim plugins](#neovim-plugins)) | 8 |
 | Scripts in a chain, each started by the one before | 3 |
 
 Where one of these limits is reached, the item says so in its notes and
@@ -456,17 +456,20 @@ under `.git/modules` is followed, and at most 256 directories there are looked
 at; what is left is said as not checked.
 
 A spec file of your configuration that is a link is read as the file it leads
-to, through up to 8 links and any linked directory on the way: Omarchy's
-`~/.config/nvim/lua/plugins/theme.lua` links to the current theme's
-`neovim.lua`, through `~/.local/state/omarchy/current`. What is said of such a
-file names the link and the file it leads to. It is not read, and its specs are
-said as not checked, when the chain leads to nothing, goes in a circle or is
-longer, ends at no regular file (a directory, a device, a pipe) or under
-`/dev`, `/proc` or `/sys`, or ends at a file whose name or real path marks it
-as holding secrets (`~/.ssh/id_ed25519`): a spec's build step goes to the AI
-with what Guardian established about the plugin, and such a file's text never
-does. A link among the spec files a plugin ships is not followed: it points at
-a file the plugin does not ship.
+to, resolved by the kernel as when Neovim opens it, every link and linked
+directory on the way included (a theme's own links too: its author writes the
+spec text it ends at anyway): Omarchy's `~/.config/nvim/lua/plugins/theme.lua`
+links to the current theme's `neovim.lua`, through
+`~/.local/state/omarchy/current`. What is said of such a file names the link
+and the real path of the file it leads to. A spec file is not read, and its
+specs are said as not checked, when its name marks it as holding secrets
+(`lua/plugins/secrets.lua`), or when it is a link that leads to nothing or
+through more links than the kernel follows (40, a circle included), to no
+regular file (a directory, a device, a pipe), under `/dev`, `/proc` or `/sys`,
+or to a file whose real path marks it as holding secrets (`~/.ssh/id_ed25519`):
+a spec's build step goes to the AI with what Guardian established about the
+plugin, and such a file's text never does. A link among the spec files a
+plugin ships is not followed: it points at a file the plugin does not ship.
 
 What is a finding, on every sweep:
 

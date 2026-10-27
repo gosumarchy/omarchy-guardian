@@ -1153,17 +1153,17 @@ fn a_link_that_ends_at_no_file_leaves_its_specs_unchecked() {
     symlink("a.lua", plugins.join("b.lua")).unwrap();
     symlink("..", plugins.join("directory.lua")).unwrap();
     write(root, "proc/version", "return { { \"o/p\" } }");
-    symlink("/proc/version", plugins.join("kernel.lua")).unwrap();
+    symlink("../../../../../../proc/version", plugins.join("kernel.lua")).unwrap();
     let unchecked = collected(root).unchecked;
     let said = |text: &str| unchecked.iter().any(|sentence| sentence.contains(text));
     assert!(
-        said("dangling.lua is a link that leads to nothing, so the plugin specs"),
+        said("dangling.lua is a link that could not be followed (No such file"),
         "{unchecked:?}"
     );
     for name in ["a.lua", "b.lua"] {
         assert!(
             said(&format!(
-                "{name} is a link through more than 8 links, or in a circle"
+                "{name} is a link that could not be followed (Too many levels of symbolic links"
             )),
             "{unchecked:?}"
         );
@@ -1206,6 +1206,22 @@ fn a_link_to_a_secret_named_file_is_not_read_for_specs() {
         root.join(CONFIG).join("lua/plugins/through.lua"),
     )
     .unwrap();
+    // Named for a secret where lazy.nvim reads it, whatever it leads to.
+    write(
+        root,
+        &format!("{CONFIG}/lua/plugins/secrets.lua"),
+        "return { { \"o/p\", build = \"make SECRETBUILD\" } }",
+    );
+    write(
+        root,
+        "home/u/dot/plain.lua",
+        "return { { \"o/p\", build = \"make SECRETBUILD\" } }",
+    );
+    symlink(
+        "../../../../dot/plain.lua",
+        root.join(CONFIG).join("lua/plugins/token.lua"),
+    )
+    .unwrap();
     let collected = collected(root);
     let said = |text: &str| {
         collected
@@ -1223,6 +1239,13 @@ fn a_link_to_a_secret_named_file_is_not_read_for_specs() {
         "{:?}",
         collected.unchecked
     );
+    for name in ["secrets.lua", "token.lua"] {
+        assert!(
+            said(&format!("{name} has a name that says it holds secrets")),
+            "{:?}",
+            collected.unchecked
+        );
+    }
     // Its build step would reach the AI as a fact of the plugin.
     let p = found(&collected.items, "p");
     assert!(plugin_of(p).builds.is_empty(), "{:?}", plugin_of(p).builds);

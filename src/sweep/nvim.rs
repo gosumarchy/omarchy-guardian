@@ -50,7 +50,6 @@ use super::lua::{self, Build, Spec};
 use super::read::{self, Found};
 use super::tier::Tier;
 use crate::autorun::Category;
-use crate::error::Error;
 use crate::json::Json;
 use crate::paths::file_name;
 use crate::rules::RuleId;
@@ -134,6 +133,15 @@ pub(crate) struct Plugin {
     builds: Vec<Build>,
     /// What this sweep sends of it to the review (see `plan`).
     pub(crate) review: Review,
+}
+
+#[cfg(test)]
+impl Dirs {
+    /// The directories for `home` with no XDG variable set, for the tests
+    /// outside this module that collect plugins.
+    pub(super) fn in_home(home: &str) -> Self {
+        Self::new(home, None, None)
+    }
 }
 
 #[cfg(test)]
@@ -329,7 +337,9 @@ enum Placed {
     /// The user's configuration. A link there is the user's own, or
     /// Omarchy's: its `lua/plugins/theme.lua` links to the current theme's
     /// `neovim.lua` on every install, and refusing it would leave every
-    /// sweep incomplete.
+    /// sweep incomplete. The chain is followed to its end, through links
+    /// a theme's author may have put in the theme's directory: that author
+    /// writes the spec text it ends at anyway.
     ByUser,
     /// A plugin's checkout. A link there points at a file the plugin does
     /// not ship, which the plugin's author chose; it is not followed.
@@ -337,18 +347,24 @@ enum Placed {
 }
 
 /// The text of the spec file at `path`, placed as `placed`, or why it was
-/// not read, said after the path: it is not a file within the text review
-/// limit, or a link that does not end at one (see `followed`).
-fn spec_text(root: &Path, path: &str, placed: Placed) -> Result<String, Error> {
+/// not read, said after the path: its name says it holds secrets, it is
+/// not a file within the text review limit, or it is a link that does not
+/// end at one (see `followed`).
+///
+/// The text is only parsed here, but the build steps found in it go to the
+/// AI review as facts (see `fact`): a file the judge would keep from the AI
+/// for its name is not read.
+fn spec_text(root: &Path, path: &str, placed: Placed) -> Result<String, String> {
+    if crate::rules::is_sensitive_path(path) {
+        return Err(" has a name that says it holds secrets, so it is not read".into());
+    }
     let (found, subject) = match (read::look(root, path), placed) {
-        (Found::Link(target), Placed::ByUser) => {
-            let end = followed(root, path, &target).map_err(Error::Message)?;
+        (Found::Link(_), Placed::ByUser) => {
+            let end = followed(root, path)?;
             (read::look(root, &end), format!(", a link to /{end},"))
         }
         (Found::Link(_), Placed::ByPlugin) => {
-            return Err(Error::Message(
-                " is a link in a plugin, which is not followed".into(),
-            ));
+            return Err(" is a link in a plugin, which is not followed".into());
         }
         (found, _) => (found, String::new()),
     };
@@ -357,40 +373,32 @@ fn spec_text(root: &Path, path: &str, placed: Placed) -> Result<String, Error> {
             return Ok(String::from_utf8_lossy(&head).into_owned());
         }
         Found::File { .. } => "is larger than the text review limit".into(),
-        // `followed` ends a chain only where no link is left.
+        // `followed` returns a path with no link left in it.
         Found::Link(_) | Found::Other => "is not a file".into(),
         Found::Unreadable(reason) => format!("could not be read ({reason})"),
     };
-    Err(Error::Message(format!("{subject} {why}")))
+    Err(format!("{subject} {why}"))
 }
 
-/// Where the link at `path` with text `target` ends, with every directory
-/// link on the way resolved too, so the path is the file's real one; or why
-/// it is not followed, said after `path`.
+/// The real path, relative to `root`, of the file the link at `path` leads
+/// to, or why it is not followed, said after `path`.
 ///
-/// The text of a spec file is only parsed here, but the build steps found
-/// in it go to the AI review as facts (see `fact`). So a link to a file
-/// whose name says it holds secrets is not read, under either the name the
-/// chain ends at or the real one, as the judge keeps such a file's text
-/// from the AI; nor is one into `/dev`, `/proc` or `/sys`, which the sweep
-/// never follows.
-fn followed(root: &Path, path: &str, target: &str) -> Result<String, String> {
-    let hop = |next: &str| read::plain_hop(root, next);
-    if read::chain_too_long(path, target, &hop) {
+/// The kernel resolves it, as it does when Neovim opens the link: a `..`
+/// after a linked directory climbs from where that directory really is,
+/// which resolving the link texts by hand would get wrong. The kernel stops
+/// a chain of more than 40 links (`ELOOP`), a circle included. A real path
+/// whose name says it holds secrets is not read (see `spec_text`), nor is
+/// one into `/dev`, `/proc` or `/sys`, which the sweep never follows.
+fn followed(root: &Path, path: &str) -> Result<String, String> {
+    let real = fs::canonicalize(root.join(path))
+        .map_err(|error| format!(" is a link that could not be followed ({error})"))?;
+    let end = fs::canonicalize(root)
+        .ok()
+        .and_then(|root| Some(real.strip_prefix(root).ok()?.to_str()?.to_string()))
+        .ok_or_else(|| " is a link that leads out of the root".to_string())?;
+    if crate::rules::is_sensitive_path(&end) {
         return Err(format!(
-            " is a link through more than {} links, or in a circle, which is not followed",
-            read::MAX_HOPS
-        ));
-    }
-    let dangling = || " is a link that leads to nothing".to_string();
-    let chain_end = read::resolve_where(path, target, &hop).ok_or_else(dangling)?;
-    let end = read::canonical(root, &chain_end).ok_or_else(dangling)?;
-    if [&chain_end, &end]
-        .iter()
-        .any(|end| crate::rules::is_sensitive_path(end))
-    {
-        return Err(format!(
-            ", a link to /{end}, leads to a file whose name says it holds secrets, which is not read"
+            ", a link to /{end}, leads to a file whose name says it holds secrets, so it is not read"
         ));
     }
     if ["dev/", "proc/", "sys/"]
