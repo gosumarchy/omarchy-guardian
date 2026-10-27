@@ -30,7 +30,7 @@ static HELD: Mutex<Option<Held>> = Mutex::new(None);
 /// What `held` kept from the terminal: each write with the stream it was
 /// meant for, in order.
 #[derive(Debug, Default)]
-pub(crate) struct Held(pub(crate) Vec<(Stream, String)>);
+pub(crate) struct Held(Vec<(Stream, String)>);
 
 impl Held {
     /// Everything held, both streams, in the order it was written.
@@ -41,7 +41,7 @@ impl Held {
 
 /// The stream a write was meant for.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum Stream {
+enum Stream {
     Stdout,
     Stderr,
 }

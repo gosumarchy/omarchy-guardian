@@ -933,7 +933,7 @@ fn show(options: Options, shown: &Shown<'_>) {
             );
         }
     });
-    match keep_details(shown.directory, &top, &details) {
+    match keep_details(shown.directory, &top, &details.text()) {
         Ok(()) => {
             if options.view == View::All {
                 crate::output::release(&details);
@@ -959,13 +959,9 @@ fn show(options: Options, shown: &Shown<'_>) {
 
 /// Keeps what was shown on top and the full report, as plain text, for
 /// `sweep details`.
-fn keep_details(
-    directory: Option<&Path>,
-    top: &str,
-    details: &crate::output::Held,
-) -> Result<(), Error> {
+fn keep_details(directory: Option<&Path>, top: &str, details: &str) -> Result<(), Error> {
     let directory = directory.ok_or_else(|| Error::Message("no state directory".into()))?;
-    let text = crate::report::html::strip_ansi(&format!("{top}{}", details.text()));
+    let text = crate::report::html::strip_ansi(&format!("{top}{details}"));
     state::write_text(&directory.join(LAST_REPORT), &text)
 }
 
@@ -1206,15 +1202,15 @@ mod tests {
     fn the_full_report_is_kept_as_plain_text_only_the_user_reads() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        use crate::output::{Held, Stream};
         use crate::test_support::TempDir;
 
         let dir = TempDir::new("details");
-        let details = Held(vec![
-            (Stream::Stdout, "the rest\n".into()),
-            (Stream::Stderr, "  ! a gap\n".into()),
-        ]);
-        super::keep_details(Some(dir.path()), "\x1b[32m✓ CLEAR\x1b[0m\n", &details).unwrap();
+        super::keep_details(
+            Some(dir.path()),
+            "\x1b[32m✓ CLEAR\x1b[0m\n",
+            "the rest\n  ! a gap\n",
+        )
+        .unwrap();
         let path = dir.path().join(super::LAST_REPORT);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -1223,7 +1219,7 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
 
-        assert!(super::keep_details(None, "x", &details).is_err());
+        assert!(super::keep_details(None, "x", "").is_err());
     }
 
     #[test]
