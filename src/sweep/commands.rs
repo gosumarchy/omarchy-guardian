@@ -10,8 +10,8 @@ use super::{lua, read};
 use crate::autorun::Category;
 use crate::paths::file_name;
 
+use shell::{LineStarts, path_variables, sourced, started, without_case_patterns, zdotdir};
 pub(super) use shell::{is_shell_script, sourced_files, with_script_directory};
-use shell::{path_variables, sourced, started, without_case_patterns, zdotdir};
 use targets::split;
 pub(super) use targets::{
     Lookup, MAX_GLOB, MAX_INNER_COMMANDS, default_search, expand, glob_targets, split_commands,
@@ -79,7 +79,9 @@ pub(super) fn commands(category: Category, path: &str, text: &str) -> Vec<String
     };
     let mut found = Vec::new();
     let mut cases = Vec::new();
+    let mut starts = LineStarts::default();
     for line in text.lines() {
+        let start = starts.next(line);
         let line = line.trim();
         if line.starts_with('#') {
             continue;
@@ -113,7 +115,7 @@ pub(super) fn commands(category: Category, path: &str, text: &str) -> Vec<String
             Category::Ssh => ssh(line).map(|(_, value)| value).into_iter().collect(),
             Category::Shell => {
                 let mut runs = sourced(line);
-                runs.extend(started(line));
+                runs.extend(started(line, start));
                 runs.extend(zdotdir(line));
                 runs
             }

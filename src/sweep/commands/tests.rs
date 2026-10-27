@@ -1048,3 +1048,40 @@ fn a_program_named_through_a_variable_is_said_to_be_unknown() {
         assert!(!lookup.unwritten.get(), "{command}");
     }
 }
+
+#[test]
+fn a_line_that_goes_on_from_the_one_before_starts_no_command() {
+    let runs = |text: &str| commands(Category::Shell, "home/u/x.sh", text);
+    // Arguments on a line after `\`, a here-document's text and a `[[ … ]]`
+    // test name nothing unknown.
+    for text in [
+        "git merge-tree \\\n  \"$(tree_commit a)\" >o ||\n  true\n",
+        "x=\"$(sed -n p \\\n  \"$dir/Cargo.toml\" | head -n 1)\"\n",
+        "while read -r c; do :; done <<EOF\n$(type -ap \"$name\")\nEOF\n",
+        "cat <<-'END'\n\t\"$X/run\"\nEND\n",
+        "if [[ -z \"$c\" || ! -f \"$c/src/lib.rs\" ]]; then :; fi\n",
+        "if (($(git log -1 --format=%at) < since)); then :; fi\n",
+    ] {
+        assert_eq!(runs(text), Vec::<String>::new(), "{text}");
+    }
+    // What a path names is followed on every line, as before.
+    assert_eq!(runs("exec \\\n  /opt/evil\n"), ["/opt/evil"]);
+    assert_eq!(runs("cat <<EOF\n/opt/evil\nEOF\n"), ["/opt/evil"]);
+    // Past the end of a here-document, after an even number of
+    // backslashes, and after a comment that only looks like one, a line
+    // starts statements again.
+    for text in [
+        "cat <<EOF\nx\nEOF\n\"$X/run\"\n",
+        "echo a\\\\\n\"$X/run\"\n",
+        "# cat <<EOF\n\"$X/run\"\n",
+        "# a \\\n\"$X/run\"\n",
+    ] {
+        assert_eq!(runs(text), ["$X/run"], "{text}");
+    }
+    // An escaped blank at the end is no `\` that goes on, and a test ends
+    // at its `]]`.
+    assert_eq!(runs("echo hi \\ \n\"$X/run\"\n"), ["$X/run"]);
+    assert_eq!(runs("[[ -f x ]] && \"$X/run\"\n"), ["$X/run"]);
+    // A here-string takes no lines.
+    assert_eq!(runs("read -r a <<< \"$b\"\n\"$X/run\"\n"), ["$X/run"]);
+}
