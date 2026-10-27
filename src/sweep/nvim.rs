@@ -262,11 +262,12 @@ impl Specs {
                 .filter(|(path, _)| is_shipped_spec(path))
                 .map(|(path, _)| format!("{}/{path}", checkout.path))
         });
-        let mut paths: Vec<String> = init
+        let mut paths: Vec<(String, Placed)> = init
             .into_iter()
             .chain(listing.files)
             .filter(|path| read::has_extension(path, "lua"))
-            .chain(shipped)
+            .map(|path| (path, Placed::ByUser))
+            .chain(shipped.map(|path| (path, Placed::ByPlugin)))
             .collect();
         if paths.len() > MAX_SPEC_FILES {
             unchecked.push(format!(
@@ -275,12 +276,12 @@ impl Specs {
             paths.truncate(MAX_SPEC_FILES);
         }
         let mut specs = Self::default();
-        for path in &paths {
-            let text = match spec_text(root, path) {
+        for (path, placed) in &paths {
+            let text = match spec_text(root, path, *placed) {
                 Ok(text) => text,
-                Err(reason) => {
+                Err(why) => {
                     unchecked.push(format!(
-                        "/{path}: {reason}, so the plugin specs in it were not checked"
+                        "/{path}{why}, so the plugin specs in it were not checked"
                     ));
                     continue;
                 }
@@ -321,19 +322,86 @@ fn is_shipped_spec(path: &str) -> bool {
             && read::has_extension(path, "lua"))
 }
 
-/// The text of the spec file at `path`, or why it was not read: it is not
-/// a file within the text review limit.
-fn spec_text(root: &Path, path: &str) -> Result<String, Error> {
-    let why = match read::look(root, path) {
+/// Who put a spec file where lazy.nvim reads it, which decides whether a
+/// link there is followed.
+#[derive(Debug, Clone, Copy)]
+enum Placed {
+    /// The user's configuration. A link there is the user's own, or
+    /// Omarchy's: its `lua/plugins/theme.lua` links to the current theme's
+    /// `neovim.lua` on every install, and refusing it would leave every
+    /// sweep incomplete.
+    ByUser,
+    /// A plugin's checkout. A link there points at a file the plugin does
+    /// not ship, which the plugin's author chose; it is not followed.
+    ByPlugin,
+}
+
+/// The text of the spec file at `path`, placed as `placed`, or why it was
+/// not read, said after the path: it is not a file within the text review
+/// limit, or a link that does not end at one (see `followed`).
+fn spec_text(root: &Path, path: &str, placed: Placed) -> Result<String, Error> {
+    let (found, subject) = match (read::look(root, path), placed) {
+        (Found::Link(target), Placed::ByUser) => {
+            let end = followed(root, path, &target).map_err(Error::Message)?;
+            (read::look(root, &end), format!(", a link to /{end},"))
+        }
+        (Found::Link(_), Placed::ByPlugin) => {
+            return Err(Error::Message(
+                " is a link in a plugin, which is not followed".into(),
+            ));
+        }
+        (found, _) => (found, String::new()),
+    };
+    let why = match found {
         Found::File { size, head, .. } if size <= MAX_TEXT_FILE_SIZE => {
             return Ok(String::from_utf8_lossy(&head).into_owned());
         }
-        Found::File { .. } => "larger than the text review limit".into(),
-        Found::Link(_) => "a link, which is not followed".into(),
-        Found::Other => "not a file".into(),
+        Found::File { .. } => "is larger than the text review limit".into(),
+        // `followed` ends a chain only where no link is left.
+        Found::Link(_) | Found::Other => "is not a file".into(),
         Found::Unreadable(reason) => format!("could not be read ({reason})"),
     };
-    Err(Error::Message(why))
+    Err(Error::Message(format!("{subject} {why}")))
+}
+
+/// Where the link at `path` with text `target` ends, with every directory
+/// link on the way resolved too, so the path is the file's real one; or why
+/// it is not followed, said after `path`.
+///
+/// The text of a spec file is only parsed here, but the build steps found
+/// in it go to the AI review as facts (see `fact`). So a link to a file
+/// whose name says it holds secrets is not read, under either the name the
+/// chain ends at or the real one, as the judge keeps such a file's text
+/// from the AI; nor is one into `/dev`, `/proc` or `/sys`, which the sweep
+/// never follows.
+fn followed(root: &Path, path: &str, target: &str) -> Result<String, String> {
+    let hop = |next: &str| read::plain_hop(root, next);
+    if read::chain_too_long(path, target, &hop) {
+        return Err(format!(
+            " is a link through more than {} links, or in a circle, which is not followed",
+            read::MAX_HOPS
+        ));
+    }
+    let dangling = || " is a link that leads to nothing".to_string();
+    let chain_end = read::resolve_where(path, target, &hop).ok_or_else(dangling)?;
+    let end = read::canonical(root, &chain_end).ok_or_else(dangling)?;
+    if [&chain_end, &end]
+        .iter()
+        .any(|end| crate::rules::is_sensitive_path(end))
+    {
+        return Err(format!(
+            ", a link to /{end}, leads to a file whose name says it holds secrets, which is not read"
+        ));
+    }
+    if ["dev/", "proc/", "sys/"]
+        .iter()
+        .any(|kernel| end.starts_with(kernel))
+    {
+        return Err(format!(
+            ", a link to /{end}, leads where the sweep never follows"
+        ));
+    }
+    Ok(end)
 }
 
 /// The commit `lazy-lock.json` in `config` pins for each plugin. One that

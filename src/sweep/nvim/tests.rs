@@ -1088,15 +1088,145 @@ fn spec_files_that_cannot_be_read_are_not_checked() {
     let said = |text: &str| unchecked.iter().any(|sentence| sentence.contains(text));
     assert!(said("not UTF-8"), "{unchecked:?}");
     assert!(
-        said("p/lazy.lua: a link, which is not followed, so the plugin specs"),
+        said("p/lazy.lua is a link in a plugin, which is not followed, so the plugin specs"),
         "{unchecked:?}"
     );
     // Root reads every file whatever its mode.
     if crate::user::effective_uid().is_ok_and(|uid| uid != 0) {
-        assert!(said("closed.lua: could not be read"), "{unchecked:?}");
+        assert!(said("closed.lua could not be read"), "{unchecked:?}");
     }
     // No init.lua is no spec file left unread.
     assert!(!said("init.lua"), "{unchecked:?}");
+}
+
+#[test]
+fn a_link_in_the_configuration_is_read_as_the_file_it_leads_to() {
+    let temp = TempDir::new("nvim-linked-specs");
+    let root = temp.path();
+    plugin(root, "p", "https://github.com/evil/p", &[]);
+    plugin(root, "theme", "https://github.com/evil/theme", &[]);
+    write(root, "home/u/dotfiles/p.lua", "return { { \"o/p\" } }");
+    fs::create_dir_all(root.join(CONFIG).join("lua/plugins")).unwrap();
+    symlink(
+        "../../../../dotfiles/p.lua",
+        root.join(CONFIG).join("lua/plugins/p.lua"),
+    )
+    .unwrap();
+    // As Omarchy links its theme: through `current`, itself a link to the
+    // theme's directory.
+    write(
+        root,
+        "home/u/.local/share/omarchy/themes/t/neovim.lua",
+        "return { { \"o/theme\" } }",
+    );
+    fs::create_dir_all(root.join("home/u/.local/state/omarchy")).unwrap();
+    symlink(
+        "../../share/omarchy/themes/t",
+        root.join("home/u/.local/state/omarchy/current"),
+    )
+    .unwrap();
+    symlink(
+        "../../../../.local/state/omarchy/current/neovim.lua",
+        root.join(CONFIG).join("lua/plugins/theme.lua"),
+    )
+    .unwrap();
+    let collected = collected(root);
+    assert!(collected.unchecked.is_empty(), "{:?}", collected.unchecked);
+    // Each origin is compared with the spec read through the link.
+    for name in ["p", "theme"] {
+        assert_eq!(
+            rules(found(&collected.items, name)),
+            [RuleId::PluginSource],
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_link_that_ends_at_no_file_leaves_its_specs_unchecked() {
+    let temp = TempDir::new("nvim-unfollowed-specs");
+    let root = temp.path();
+    let plugins = root.join(CONFIG).join("lua/plugins");
+    fs::create_dir_all(&plugins).unwrap();
+    symlink("gone.lua", plugins.join("dangling.lua")).unwrap();
+    symlink("b.lua", plugins.join("a.lua")).unwrap();
+    symlink("a.lua", plugins.join("b.lua")).unwrap();
+    symlink("..", plugins.join("directory.lua")).unwrap();
+    write(root, "proc/version", "return { { \"o/p\" } }");
+    symlink("/proc/version", plugins.join("kernel.lua")).unwrap();
+    let unchecked = collected(root).unchecked;
+    let said = |text: &str| unchecked.iter().any(|sentence| sentence.contains(text));
+    assert!(
+        said("dangling.lua is a link that leads to nothing, so the plugin specs"),
+        "{unchecked:?}"
+    );
+    for name in ["a.lua", "b.lua"] {
+        assert!(
+            said(&format!(
+                "{name} is a link through more than 8 links, or in a circle"
+            )),
+            "{unchecked:?}"
+        );
+    }
+    assert!(
+        said("directory.lua, a link to /home/u/.config/nvim/lua, is not a file"),
+        "{unchecked:?}"
+    );
+    assert!(
+        said("kernel.lua, a link to /proc/version, leads where the sweep never follows"),
+        "{unchecked:?}"
+    );
+}
+
+#[test]
+fn a_link_to_a_secret_named_file_is_not_read_for_specs() {
+    let temp = TempDir::new("nvim-secret-spec");
+    let root = temp.path();
+    plugin(root, "p", "https://github.com/o/p", &[]);
+    write(
+        root,
+        "home/u/.ssh/id_ed25519",
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nreturn { { \"o/p\", build = \"make SECRETBUILD\" } }\n",
+    );
+    fs::create_dir_all(root.join(CONFIG).join("lua/plugins")).unwrap();
+    symlink(
+        "../../../../.ssh/id_ed25519",
+        root.join(CONFIG).join("lua/plugins/key.lua"),
+    )
+    .unwrap();
+    // Named for a key only through a linked directory.
+    symlink(".ssh", root.join("home/u/keys")).unwrap();
+    write(
+        root,
+        "home/u/.ssh/spec.lua",
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nreturn { { \"o/p\", build = \"make SECRETBUILD\" } }\n",
+    );
+    symlink(
+        "../../../../keys/spec.lua",
+        root.join(CONFIG).join("lua/plugins/through.lua"),
+    )
+    .unwrap();
+    let collected = collected(root);
+    let said = |text: &str| {
+        collected
+            .unchecked
+            .iter()
+            .any(|sentence| sentence.contains(text))
+    };
+    assert!(
+        said("key.lua, a link to /home/u/.ssh/id_ed25519, leads to a file whose name says"),
+        "{:?}",
+        collected.unchecked
+    );
+    assert!(
+        said("through.lua, a link to /home/u/.ssh/spec.lua, leads to a file whose name says"),
+        "{:?}",
+        collected.unchecked
+    );
+    // Its build step would reach the AI as a fact of the plugin.
+    let p = found(&collected.items, "p");
+    assert!(plugin_of(p).builds.is_empty(), "{:?}", plugin_of(p).builds);
+    assert!(p.runs.is_empty(), "{:?}", p.runs);
 }
 
 #[test]

@@ -1776,6 +1776,45 @@ fn what_an_agents_entry_runs_is_shown_as_it_is_sent() {
 }
 
 #[test]
+fn a_neovim_spec_linked_to_a_key_is_not_sent() {
+    let dir = planted(
+        "sweep-nvim-key",
+        &[(
+            "home/u/.ssh/id_ed25519",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nreturn { { \"o/p\", build = \"make SECRETBUILD\" } }\n",
+        )],
+        &[(
+            "home/u/.config/nvim/lua/plugins/key.lua",
+            "../../../../.ssh/id_ed25519",
+        )],
+    );
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root: dir.path(),
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::User,
+    };
+    let mut collection = collect::collect(&scope);
+    super::note_kept(&mut collection.items, Some("home/u"));
+    // The link in the catalogued directory is followed to the key, which is
+    // read here only.
+    assert!(
+        collection
+            .items
+            .iter()
+            .any(|item| item.path == "home/u/.ssh/id_ed25519")
+    );
+    let (sent, _) = examined(&collection);
+    assert!(
+        !sent
+            .iter()
+            .any(|path| path.contains("id_ed25519") || path.contains("key.lua")),
+        "{sent:?}"
+    );
+}
+
+#[test]
 fn a_link_handed_beside_a_wrapper_to_a_key_is_not_sent() {
     let dir = planted(
         "sweep-beside-key",

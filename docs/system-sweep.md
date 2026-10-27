@@ -455,6 +455,19 @@ of a spec are read (`{ "owner/repo", name = …, url = …, build = … }`). No 
 under `.git/modules` is followed, and at most 256 directories there are looked
 at; what is left is said as not checked.
 
+A spec file of your configuration that is a link is read as the file it leads
+to, through up to 8 links and any linked directory on the way: Omarchy's
+`~/.config/nvim/lua/plugins/theme.lua` links to the current theme's
+`neovim.lua`, through `~/.local/state/omarchy/current`. What is said of such a
+file names the link and the file it leads to. It is not read, and its specs are
+said as not checked, when the chain leads to nothing, goes in a circle or is
+longer, ends at no regular file (a directory, a device, a pipe) or under
+`/dev`, `/proc` or `/sys`, or ends at a file whose name or real path marks it
+as holding secrets (`~/.ssh/id_ed25519`): a spec's build step goes to the AI
+with what Guardian established about the plugin, and such a file's text never
+does. A link among the spec files a plugin ships is not followed: it points at
+a file the plugin does not ship.
+
 What is a finding, on every sweep:
 
 - `plugin-source`: a plugin directory that is no git checkout, or a link; a
