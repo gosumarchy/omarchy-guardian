@@ -947,6 +947,13 @@ fn a_script_in_a_directory_a_shell_would_split_keeps_its_own_directory_unwritten
             "{directory}: {runs:?}"
         );
     }
+    // A plain link to a file in such a directory: `readlink -f` would
+    // write the real file in.
+    let text = "#!/bin/sh\nX=\"$(readlink -f \"$0\")\" /opt/evil\n";
+    let written = with_script_directory(text, "home/u/link.sh", "home/u/a b/x.sh");
+    assert_eq!(written, text);
+    let runs = commands(Category::Shell, "home/u/link.sh", &written);
+    assert!(runs.contains(&"/opt/evil".to_string()), "{runs:?}");
 }
 
 #[test]
