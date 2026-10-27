@@ -34,6 +34,11 @@ pub(super) const fn remarks_note(decision: Decision) -> &'static str {
     }
 }
 
+/// Said above the owner's own settings (see `Report::is_owner_setting`).
+pub(super) const SETTINGS_NOTE: &str = "The AI review judged these your own choices about your own \
+tools, and Guardian checked they are in your home and graded below high. They are not alerts; \
+the strict profile shows them as alerts.";
+
 impl Report {
     /// Prints the report under `decision`, as overruled by the user's
     /// `permit` when there is one (see `permit`).
@@ -334,7 +339,8 @@ impl Report {
     }
 
     /// The tables of what was found: the local checks, the AI's findings,
-    /// its remarks and the dependency advisories, each under its title.
+    /// its remarks, the owner's own settings and the dependency advisories,
+    /// each under its title.
     pub(super) fn findings_text(
         &self,
         decision: Decision,
@@ -399,6 +405,8 @@ impl Report {
             }
         }
 
+        text.push_str(&self.settings_text(width, painter));
+
         if let Some(audit) = self
             .audit
             .as_ref()
@@ -437,6 +445,36 @@ impl Report {
             }
         }
         text
+    }
+
+    /// The owner's own settings (see `Report::is_owner_setting`) in a table
+    /// of their own, with the reviewer's grade dimmed: none of them is an
+    /// alert. Empty when there are none.
+    fn settings_text(&self, width: usize, painter: Painter) -> String {
+        if self.owner_settings().next().is_none() {
+            return String::new();
+        }
+        let mut table = Table::new(vec!["Graded", "Where", "Your setting"]);
+        for finding in self.owner_settings() {
+            let line = finding
+                .line
+                .map(|line| format!(":{line}"))
+                .unwrap_or_default();
+            table.row(vec![
+                vec![Span::new(finding.severity.label(), "2")],
+                vec![Span::plain(format!("{}{line}", shown(&finding.file)))],
+                vec![
+                    Span::new(shown(&finding.title), "1"),
+                    Span::plain(shown(&finding.reason)),
+                ],
+            ]);
+        }
+        format!(
+            "\n{}\n  {}\n{}\n",
+            painter.paint("  Your own settings (not alerts)", "1"),
+            painter.paint(SETTINGS_NOTE, "2"),
+            table.render(width, 2, painter)
+        )
     }
 }
 

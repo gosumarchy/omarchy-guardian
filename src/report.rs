@@ -1,7 +1,7 @@
 //! Review results, the decision derived from them against a per-class
 //! policy, and their terminal rendering.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use std::process::ExitCode;
 
@@ -352,6 +352,10 @@ pub(crate) struct ReviewScope {
     /// remarks (`Policy::ai_remarks`). Where it is empty, every AI finding
     /// is a finding, as the system sweep has it in every profile.
     pub(crate) remark_classes: Vec<SourceClass>,
+    /// Classes whose AI findings may be the owner's own settings (see
+    /// `Report::is_owner_setting`). Only the system sweep fills it, and not
+    /// under the strict profile.
+    pub(crate) setting_classes: Vec<SourceClass>,
 }
 
 /// Whether a printed report lists the SHA-256 of every file.
@@ -480,12 +484,15 @@ impl Report {
         let AgentOutcome::Reviewed(review) = &run.outcome else {
             return false;
         };
+        // A finding the reviewer calls the owner's setting counts as more
+        // than low here, whether or not Guardian believes it: settings
+        // never widen what counts as a remark.
         review.status == Status::Clear
             && !review.findings.is_empty()
             && review
                 .findings
                 .iter()
-                .all(|finding| finding.severity == Severity::Low)
+                .all(|finding| finding.severity == Severity::Low && !finding.owner_setting)
             && self
                 .run_classes(run)
                 .into_iter()
@@ -508,6 +515,73 @@ impl Report {
     /// How many remarks the AI review left (see `is_remarks`).
     pub(crate) fn remark_count(&self) -> usize {
         self.agent_findings(true).count()
+    }
+
+    /// Whether `finding`, of `run`, is shown as the owner's own setting
+    /// rather than as an alert. The reviewer's claim alone is not enough;
+    /// all of these must hold:
+    ///
+    /// - the reviewer marked it `owner_setting` and graded it below high;
+    /// - its review did not say the content spoke to the reviewer;
+    /// - every file it names, among all the runs' files, is in the home
+    ///   (labelled `~/`) and of a class in `ReviewScope::setting_classes`,
+    ///   and one of them was sent in `run`;
+    /// - every class of `run` is in `setting_classes`;
+    /// - no local rule matched in a file it names: the reviewer is asked to
+    ///   confirm or dismiss each local finding, and a claim beside one may
+    ///   be about it.
+    ///
+    /// Anything else is an alert at the reviewer's severity.
+    pub(crate) fn is_owner_setting(&self, run: &AgentRun, finding: &AgentFinding) -> bool {
+        let AgentOutcome::Reviewed(review) = &run.outcome else {
+            return false;
+        };
+        if !finding.owner_setting
+            || finding.severity == Severity::High
+            || review.addresses_reviewer()
+        {
+            return false;
+        }
+        let allowed = |class: SourceClass| self.scope.setting_classes.contains(&class);
+        let mut named = self
+            .agent_runs
+            .iter()
+            .flat_map(|run| &run.files)
+            .filter(|path| names(&finding.file, path))
+            .peekable();
+        named.peek().is_some()
+            && named.all(|path| path.starts_with("~/") && allowed(self.class_of(path)))
+            && run.files.iter().any(|path| names(&finding.file, path))
+            && self.run_classes(run).into_iter().all(allowed)
+            && !self
+                .findings
+                .iter()
+                .any(|local| names(&finding.file, &local.path))
+    }
+
+    /// The AI's findings shown as the owner's own settings (see
+    /// `is_owner_setting`), in report order.
+    pub(crate) fn owner_settings(&self) -> impl Iterator<Item = &AgentFinding> {
+        self.reviewed_findings()
+            .filter(|(run, finding)| self.is_owner_setting(run, finding))
+            .map(|(_, finding)| finding)
+    }
+
+    /// The paths the local rules or the AI flagged: every file a local
+    /// finding is in, and every file an AI finding names, the owner's
+    /// settings aside.
+    pub(crate) fn flagged_paths(&self) -> HashSet<String> {
+        let mut paths: HashSet<String> = self
+            .findings
+            .iter()
+            .map(|finding| finding.path.clone())
+            .collect();
+        paths.extend(
+            self.reviewed_findings()
+                .filter(|(run, finding)| !self.is_owner_setting(run, finding))
+                .map(|(_, finding)| finding.file.clone()),
+        );
+        paths
     }
 
     /// Spec §9. Precedence: incomplete, AI unavailable, findings, warned,
@@ -538,6 +612,7 @@ impl Report {
                     let mut flagged: Vec<SourceClass> = review
                         .findings
                         .iter()
+                        .filter(|finding| !self.is_owner_setting(run, finding))
                         .flat_map(|finding| {
                             if run.files.contains(&finding.file) {
                                 vec![self.class_of(&finding.file)]
@@ -553,6 +628,9 @@ impl Report {
                             }
                         })
                         .collect();
+                    // A suspicious review whose findings are all settings
+                    // still decides: the reviewer was asked not to call a
+                    // review suspicious for settings alone.
                     if review.status == Status::Suspicious && flagged.is_empty() {
                         flagged.clone_from(&classes);
                     }
@@ -611,8 +689,8 @@ impl Report {
 
     /// What was found, for the audit trail: the alert counts, the local
     /// rules that matched and how many reasons left the review incomplete,
-    /// and how many remarks the AI left, when it left any (they are not
-    /// among the alerts). Numbers and rule ids only: nothing of the
+    /// and how many remarks and owner's settings the AI left, when it left
+    /// any (they are not among the alerts). Numbers and rule ids only: nothing of the
     /// reviewed text.
     pub(crate) fn audit_findings(&self) -> String {
         let counts = self.counts();
@@ -626,6 +704,10 @@ impl Report {
         let remarks = self.remark_count();
         if remarks > 0 {
             let _ = write!(text, " remarks={remarks}");
+        }
+        let settings = self.owner_settings().count();
+        if settings > 0 {
+            let _ = write!(text, " settings={settings}");
         }
         let mut rules: Vec<&str> = self
             .findings
@@ -679,8 +761,9 @@ impl Report {
     /// by where they are. Shown to the user before they permit. The
     /// reasons the review is incomplete come first, so that the limit cuts
     /// alerts before it cuts them; the chunks never sent after one failed
-    /// are one line together. Remarks are not among them: they block
-    /// nothing, so a permit overrules nothing about them.
+    /// are one line together. Remarks and the owner's settings are not
+    /// among them: they block nothing, so a permit overrules nothing about
+    /// them.
     pub(crate) fn overruled_summary(&self, limit: usize) -> Vec<String> {
         let mut lines: Vec<String> = self
             .gaps
@@ -701,15 +784,22 @@ impl Report {
             match &run.outcome {
                 AgentOutcome::Reviewed(_) if self.is_remarks(run) => {}
                 AgentOutcome::Reviewed(review) => {
-                    lines.extend(review.findings.iter().map(|finding| {
-                        format!(
-                            "{} {} (AI) {}",
-                            finding.severity.label(),
-                            finding.file,
-                            finding.title
-                        )
-                    }));
-                    if review.status != Status::Clear && review.findings.is_empty() {
+                    let before = lines.len();
+                    lines.extend(
+                        review
+                            .findings
+                            .iter()
+                            .filter(|finding| !self.is_owner_setting(run, finding))
+                            .map(|finding| {
+                                format!(
+                                    "{} {} (AI) {}",
+                                    finding.severity.label(),
+                                    finding.file,
+                                    finding.title
+                                )
+                            }),
+                    );
+                    if review.status != Status::Clear && lines.len() == before {
                         lines.push(format!("AI review: {}", review.status.label()));
                     }
                 }
@@ -737,20 +827,31 @@ impl Report {
     }
 
     /// The AI's findings in report order: those that are remarks (see
-    /// `is_remarks`), or those that are not.
+    /// `is_remarks`), or those that are not. The owner's settings are
+    /// neither (see `owner_settings`).
     fn agent_findings(&self, remarks: bool) -> impl Iterator<Item = &AgentFinding> {
-        self.agent_runs
-            .iter()
-            .filter(move |run| self.is_remarks(run) == remarks)
-            .flat_map(|run| match &run.outcome {
+        self.reviewed_findings()
+            .filter(move |(run, finding)| {
+                self.is_remarks(run) == remarks && !self.is_owner_setting(run, finding)
+            })
+            .map(|(_, finding)| finding)
+    }
+
+    /// Every finding of every AI review, with its run, in report order.
+    fn reviewed_findings(&self) -> impl Iterator<Item = (&AgentRun, &AgentFinding)> {
+        self.agent_runs.iter().flat_map(|run| {
+            let findings = match &run.outcome {
                 AgentOutcome::Reviewed(review) => review.findings.as_slice(),
                 AgentOutcome::Unavailable(_) | AgentOutcome::NotAttempted { .. } => &[],
-            })
+            };
+            findings.iter().map(move |finding| (run, finding))
+        })
     }
 
     /// Every alert: the file it is about, its severity and what it is.
     /// Dependency advisories without a known severity count as medium; the
-    /// AI's remarks are no alerts (see `remark_count`).
+    /// AI's remarks (see `remark_count`) and the owner's settings (see
+    /// `owner_settings`) are no alerts.
     pub(crate) fn alerts(&self) -> impl Iterator<Item = (&str, Severity, String)> {
         let local = self.findings.iter().map(|finding| {
             (

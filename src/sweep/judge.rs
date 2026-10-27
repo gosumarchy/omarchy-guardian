@@ -13,6 +13,7 @@ use super::nvim::{self, Review};
 use super::tier::Tier;
 use super::{boot, commands};
 use crate::autorun::Category;
+use crate::config::model::{Profile, SourceClass};
 use crate::engine::baseline::{Identity, Unit};
 use crate::engine::plan::HashOnly;
 use crate::git_state;
@@ -70,8 +71,19 @@ pub(super) fn judge(
     // The sweep lists what is on the system to look at, and a low remark
     // of the AI on an item is one such thing in every profile: it stays a
     // finding here, listed, counted, remembered and told as one.
+    //
+    // The AI may mark a finding in the home as the owner's own setting
+    // (see `Report::is_owner_setting`). The owner chose that this applies
+    // to the sweep alone, and that the strict profile keeps every such
+    // finding an alert.
+    let strict = context.settings.profile_for(context.class) == Profile::Strict;
     let scope = ReviewScope {
         remark_classes: Vec::new(),
+        setting_classes: if strict {
+            Vec::new()
+        } else {
+            vec![SourceClass::System]
+        },
         ..review::scope(context.settings, context.class, &[context.class])
     };
     let mut report = Report::new("system sweep", scope);

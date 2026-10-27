@@ -169,6 +169,7 @@ pub(crate) fn scope(
         profile: settings.profile_for(class).name().to_string(),
         ai_off_classes: ai_off_classes(settings, classes),
         remark_classes: remark_classes(settings, classes),
+        setting_classes: Vec::new(),
     }
 }
 
@@ -528,9 +529,13 @@ fn default_units(class: SourceClass, root: &Path) -> Vec<Unit> {
 /// A baseline is recorded only when every chunk got a clear AI verdict, the
 /// report has no gaps, and the decision is clear. Remarks under a clear
 /// verdict (see `Report::is_remarks`) leave the decision clear, so such a
-/// review is approved like any clear one.
+/// review is approved like any clear one. One with the owner's settings
+/// (see `Report::is_owner_setting`) is not: a later review against that
+/// version would not send the unchanged file again, so the setting would
+/// no longer be shown, nor become an alert where settings are alerts.
 fn is_approved(report: &Report, settings: &Settings) -> bool {
     report.gaps.is_empty()
+        && report.owner_settings().next().is_none()
         && !report.agent_runs.is_empty()
         && report.agent_runs.iter().all(|run| {
             matches!(&run.outcome, AgentOutcome::Reviewed(review) if review.status == Status::Clear)

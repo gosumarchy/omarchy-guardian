@@ -190,6 +190,20 @@ pub(crate) fn mock_opencode_findings(
     mock_opencode_reply(dir, status, &findings.join(","), true, "")
 }
 
+/// [`mock_opencode`] whose reply carries one finding the reviewer marks
+/// as the owner's own setting: its severity as written, the file it names
+/// and its title.
+pub(crate) fn mock_opencode_owner_setting(
+    dir: &Path,
+    status: &str,
+    (severity, file, title): (&str, &str, &str),
+) -> PathBuf {
+    let finding = format!(
+        r#"{{\"severity\":\"{severity}\",\"file\":\"{file}\",\"title\":\"{title}\",\"reason\":\"mock reason\",\"owner_setting\":true}}"#
+    );
+    mock_opencode_reply(dir, status, &finding, true, "")
+}
+
 /// `findings` is the inside of the reply's list, as the script's shell
 /// reads it between double quotes.
 fn mock_opencode_reply(

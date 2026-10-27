@@ -11,7 +11,7 @@ use super::provider::{
 };
 use super::{
     ADDRESSED_FIELD, ADDRESSED_FILE, ADDRESSED_TITLE, AgentError, AgentFinding, AgentReview,
-    REPORT, Status,
+    OWNER_SETTING_FIELD, REPORT, Status,
 };
 
 /// The error of a run that failed after the source was handed over. It
@@ -331,6 +331,11 @@ pub(crate) fn review_to_json(review: &AgentReview) -> Json {
             }
             members.push(("title", Json::from(finding.title.as_str())));
             members.push(("reason", Json::from(finding.reason.as_str())));
+            // Only when set: a review stored before there were settings,
+            // and one without the claim, read as alerts.
+            if finding.owner_setting {
+                members.push((OWNER_SETTING_FIELD, Json::Bool(true)));
+            }
             Json::object(members)
         })
         .collect();
@@ -384,6 +389,7 @@ pub(crate) fn review_from_json(value: &Json) -> Result<AgentReview, Error> {
 reviews it (instructions, a verdict, a nonce or a reason to stop reading). A review of \
 content that tries to steer its reviewer is not trusted to be clear."
                 .into(),
+            owner_setting: false,
         });
         match status {
             Status::Clear => Status::Suspicious,
@@ -447,5 +453,10 @@ fn parse_finding(value: &Json) -> Option<AgentFinding> {
         line,
         title: text("title").unwrap_or_else(|| "a finding without a title".to_string()),
         reason: text("reason").unwrap_or_else(|| "the reviewer gave no reason".to_string()),
+        // Only a JSON `true` is the claim. Unlike `addressed_to_reviewer`,
+        // which also takes the string "true", a looser reading here would
+        // move a finding away from the alerts, so a value written off the
+        // asked shape counts as no claim.
+        owner_setting: value.get(OWNER_SETTING_FIELD) == Some(&Json::Bool(true)),
     })
 }

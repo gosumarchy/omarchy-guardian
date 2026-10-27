@@ -1283,6 +1283,44 @@ fn content_that_addresses_the_reviewer_is_never_clear() {
 }
 
 #[test]
+fn only_a_json_true_claims_an_owners_setting() {
+    let reply = |extra: &str| {
+        format!(
+            r#"{{"nonce":"n","status":"clear","summary":"s","findings":[{{"severity":"medium","file":"~/.bashrc","title":"t","reason":"r"{extra}}}]}}"#
+        )
+    };
+    let claim = |extra: &str| parse_review(&reply(extra), "n").unwrap().findings[0].owner_setting;
+    assert!(claim(r#","owner_setting":true"#));
+    // Anything else is no claim: written off the asked shape, it must not
+    // move a finding away from the alerts.
+    for extra in [
+        "",
+        r#","owner_setting":false"#,
+        r#","owner_setting":"true""#,
+        r#","owner_setting":1"#,
+        r#","owner_setting":null"#,
+        r#","owner_setting":[true]"#,
+    ] {
+        assert!(!claim(extra), "{extra}");
+    }
+}
+
+#[test]
+fn an_owners_setting_is_kept_through_the_cache_and_written_only_when_claimed() {
+    let reply = r#"{"nonce":"n","status":"clear","summary":"s","findings":[
+ {"severity":"medium","file":"~/.bashrc","title":"t","reason":"r","owner_setting":true},
+ {"severity":"low","file":"~/.profile","title":"u","reason":"r"}]}"#;
+    let review = parse_review(reply, "n").unwrap();
+    assert!(review.findings[0].owner_setting);
+    let stored = review_to_json(&review);
+    assert_eq!(review_from_json(&stored).unwrap(), review);
+    // A finding without the claim is stored as it was before there were
+    // settings, so a stored review from before reads as alerts.
+    let text = stored.to_string();
+    assert_eq!(text.matches("owner_setting").count(), 1, "{text}");
+}
+
+#[test]
 fn a_failed_login_after_the_hand_over_says_to_log_in_and_still_blocks() {
     let message = |result: Result<super::AgentReview, AgentError>| match result {
         Err(AgentError::Invalid(error)) => error.to_string(),

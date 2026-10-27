@@ -1659,6 +1659,7 @@ fn reviewed(status: Status, flagged: &[&str]) -> AgentOutcome {
                 line: None,
                 title: "t".into(),
                 reason: "r".into(),
+                owner_setting: false,
             })
             .collect(),
     })
