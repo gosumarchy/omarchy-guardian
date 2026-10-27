@@ -1156,6 +1156,15 @@ fn a_link_that_ends_at_no_file_leaves_its_specs_unchecked() {
     symlink("../../../../../../proc/version", plugins.join("kernel.lua")).unwrap();
     // The fixture's root is not `/`: an absolute link leaves it.
     symlink("/", plugins.join("outside.lua")).unwrap();
+    // A link's own text must be UTF-8 to be read; a directory link on the
+    // way may lead to any name.
+    let odd = root
+        .join("home/u")
+        .join(std::ffi::OsStr::from_bytes(b"t\xff"));
+    fs::create_dir_all(&odd).unwrap();
+    fs::write(odd.join("x.lua"), "").unwrap();
+    symlink(&odd, root.join("home/u/odd")).unwrap();
+    symlink("../../../../odd/x.lua", plugins.join("odd.lua")).unwrap();
     let unchecked = collected(root).unchecked;
     let said = |text: &str| unchecked.iter().any(|sentence| sentence.contains(text));
     assert!(
@@ -1178,6 +1187,10 @@ fn a_link_that_ends_at_no_file_leaves_its_specs_unchecked() {
     );
     assert!(
         said("outside.lua is a link that leads out of the root"),
+        "{unchecked:?}"
+    );
+    assert!(
+        said("odd.lua is a link to a path that is not UTF-8"),
         "{unchecked:?}"
     );
 }
