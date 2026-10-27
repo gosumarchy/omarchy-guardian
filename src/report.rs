@@ -42,7 +42,7 @@ impl Severity {
         }
     }
 
-    const fn color(self) -> &'static str {
+    pub(crate) const fn color(self) -> &'static str {
         match self {
             Self::High => "31;1",
             Self::Medium => "33;1",
@@ -748,19 +748,46 @@ impl Report {
             })
     }
 
-    /// The alerts by severity. Dependency advisories without a known
-    /// severity count as medium; the AI's remarks are counted apart (see
-    /// `remark_count`).
+    /// Every alert: the file it is about, its severity and what it is.
+    /// Dependency advisories without a known severity count as medium; the
+    /// AI's remarks are no alerts (see `remark_count`).
+    pub(crate) fn alerts(&self) -> impl Iterator<Item = (&str, Severity, String)> {
+        let local = self.findings.iter().map(|finding| {
+            (
+                finding.path.as_str(),
+                finding.severity,
+                format!("local check {}", finding.rule.name()),
+            )
+        });
+        let ai = self.agent_findings(false).map(|finding| {
+            (
+                finding.file.as_str(),
+                finding.severity,
+                format!("AI: {}", finding.title),
+            )
+        });
+        let advisories = self
+            .audit
+            .iter()
+            .flat_map(|audit| &audit.advisories)
+            .map(|advisory| {
+                (
+                    advisory.lockfile.as_str(),
+                    advisory.severity.unwrap_or(Severity::Medium),
+                    format!(
+                        "{} in {} {}",
+                        advisory.id, advisory.package, advisory.version
+                    ),
+                )
+            });
+        local.chain(ai).chain(advisories)
+    }
+
+    /// The alerts by severity.
     fn counts(&self) -> Counts {
         let mut counts = Counts::default();
-        for finding in &self.findings {
-            counts.add(finding.severity);
-        }
-        for finding in self.agent_findings(false) {
-            counts.add(finding.severity);
-        }
-        for advisory in self.audit.iter().flat_map(|audit| &audit.advisories) {
-            counts.add(advisory.severity.unwrap_or(Severity::Medium));
+        for (_, severity, _) in self.alerts() {
+            counts.add(severity);
         }
         counts
     }

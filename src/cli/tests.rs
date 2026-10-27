@@ -68,6 +68,15 @@ fn sweep_report_parses_but_not_with_json() {
 }
 
 #[test]
+fn sweep_details_parses_alone() {
+    assert!(matches!(
+        parse(&args(&["sweep", "details"])),
+        Ok(Invocation::Sweep(crate::sweep::Command::Details))
+    ));
+    assert!(parse(&args(&["sweep", "details", "--all"])).is_err());
+}
+
+#[test]
 fn parses_guard_with_exclusions() {
     let parsed = parse(&args(&[
         "guard",

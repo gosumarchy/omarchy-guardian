@@ -11,7 +11,7 @@ use crate::agent::Status;
 use crate::json::Json;
 use crate::layout::{self, Painter, Span, Table};
 use crate::report::html::{self, esc};
-use crate::report::{AgentOutcome, Decision, Report};
+use crate::report::{AgentOutcome, Decision, Report, Severity};
 use crate::text::shown;
 
 /// A tier's word in the list and its colour.
@@ -57,33 +57,178 @@ fn flagged(report: &Report) -> HashSet<String> {
     paths
 }
 
-/// The summary card: how much is trusted, and what the rest is.
-fn summary(shown_items: &[&Item], total: usize, trusted: usize, flagged: usize) -> Vec<Span> {
-    let width = 40;
-    let (filled, empty) = layout::bar(trusted, total, width);
+/// How many items the summary lists by name; the rest are in the full
+/// report. Arbitrary: about what one screen shows below the box.
+const SHOWN_CONCERNS: usize = 10;
+
+/// How many reasons the review is incomplete the summary lists.
+/// Arbitrary, like `SHOWN_CONCERNS`.
+const SHOWN_GAPS: usize = 3;
+
+/// The trust bar and the item counts, for the verdict box.
+fn trust_lines(collection: &Collection, flagged: usize) -> Vec<Span> {
+    let total = collection.items.len();
+    let trusted = collection
+        .items
+        .iter()
+        .filter(|item| item.is_trusted())
+        .count();
+    let (filled, empty) = layout::bar(trusted, total, 40);
     let percent = (trusted * 100).checked_div(total).unwrap_or(100);
-    let mut lines = vec![
+    vec![
+        Span::plain(""),
         Span::new(format!("{filled}{empty}  {percent}% trusted"), "32"),
         Span::plain(format!(
             "{total} item(s) checked · {trusted} trusted · {} to look at · {flagged} flagged",
             total - trusted
         )),
-    ];
+    ]
+}
+
+/// The legend of the listed items: how many of each tier, and what the
+/// tier means.
+fn tier_legend(shown_items: &[&Item]) -> Vec<Span> {
     let mut by_tier: BTreeMap<Tier, usize> = BTreeMap::new();
     for item in shown_items {
         *by_tier.entry(item.tier).or_default() += 1;
     }
-    if !by_tier.is_empty() {
-        lines.push(Span::plain(""));
+    by_tier
+        .into_iter()
+        .map(|(tier, count)| {
+            let (word, color) = tier_style(tier);
+            Span::new(
+                format!("{count:>4}  {word:<10}  {}", tier_meaning(tier)),
+                color,
+            )
+        })
+        .collect()
+}
+
+/// What the review raised about one file: its worst alert, and how many
+/// alerts there are in all.
+#[derive(Debug)]
+struct Concern {
+    severity: Severity,
+    why: String,
+    alerts: usize,
+}
+
+/// The files the review raised alerts on (see `Report::alerts`), worst
+/// first, one entry per file.
+fn concerns(report: &Report) -> Vec<(String, Concern)> {
+    let mut by_file: BTreeMap<String, Concern> = BTreeMap::new();
+    for (file, severity, why) in report.alerts() {
+        let concern = by_file.entry(file.to_string()).or_insert(Concern {
+            severity,
+            why: why.clone(),
+            alerts: 0,
+        });
+        concern.alerts += 1;
+        if severity < concern.severity {
+            concern.severity = severity;
+            concern.why = why;
+        }
     }
-    for (tier, count) in by_tier {
-        let (word, color) = tier_style(tier);
-        lines.push(Span::new(
-            format!("{count:>4}  {word:<10}  {}", tier_meaning(tier)),
-            color,
-        ));
-    }
+    let mut concerns: Vec<(String, Concern)> = by_file.into_iter().collect();
+    concerns.sort_by_key(|(_, concern)| concern.severity);
+    concerns
+}
+
+/// Why the review is incomplete, one line each: what it could not read and
+/// the AI reviews that did not run.
+fn not_reviewed(report: &Report) -> Vec<String> {
+    let mut lines: Vec<String> = report.gaps.iter().map(ToString::to_string).collect();
+    lines.extend(
+        report
+            .agent_runs
+            .iter()
+            .filter_map(|run| run.outcome.problem())
+            .map(|problem| format!("AI review: {problem}")),
+    );
+    lines.dedup();
     lines
+}
+
+/// The list below the verdict box: what needs a look, then why the review
+/// is incomplete, each cut short with a count of the rest.
+fn attention(report: &Report, painter: Painter) -> String {
+    let mut text = String::new();
+    let concerns = concerns(report);
+    if !concerns.is_empty() {
+        let _ = writeln!(text, "\n{}", painter.paint("Needs a look", "1"));
+        // One plain line each: a table's borders and cut paths cost more
+        // lines and hide the file name, which is what the reader needs.
+        for (file, concern) in concerns.iter().take(SHOWN_CONCERNS) {
+            let mut why = shown(&concern.why).into_owned();
+            if concern.alerts > 1 {
+                let _ = write!(why, " ({} alerts)", concern.alerts);
+            }
+            let _ = writeln!(
+                text,
+                "  {}  {}  {}",
+                painter.paint(
+                    &format!("{:<6}", concern.severity.label()),
+                    concern.severity.color()
+                ),
+                shown(file),
+                painter.paint(&why, "2")
+            );
+        }
+        if concerns.len() > SHOWN_CONCERNS {
+            let rest = concerns.len() - SHOWN_CONCERNS;
+            let _ = writeln!(text, "  {}", painter.paint(&format!("… {rest} more"), "2"));
+        }
+    }
+    let gaps = not_reviewed(report);
+    if !gaps.is_empty() {
+        let _ = writeln!(text, "\n{}", painter.paint("Not reviewed", "1"));
+        for gap in gaps.iter().take(SHOWN_GAPS) {
+            let _ = writeln!(
+                text,
+                "  {}",
+                painter.paint(&format!("! {}", shown(gap)), "33")
+            );
+        }
+        if gaps.len() > SHOWN_GAPS {
+            let rest = gaps.len() - SHOWN_GAPS;
+            let _ = writeln!(text, "  {}", painter.paint(&format!("… {rest} more"), "2"));
+        }
+    }
+    text
+}
+
+/// The top of a sweep: the verdict with how much is trusted in one box,
+/// then what needs a look and what was not reviewed. `changes` is how many
+/// items changed since the last sweep, when that is asked for.
+pub(super) fn summary(
+    collection: &Collection,
+    report: &Report,
+    decision: Decision,
+    home: Option<&str>,
+    changes: Option<usize>,
+) -> String {
+    let painter = Painter::for_stdout();
+    let width = layout::width();
+    let flagged_paths = flagged(report);
+    let flagged = collection
+        .items
+        .iter()
+        .filter(|item| !item.is_trusted() && flagged_paths.contains(&label(item, home)))
+        .count();
+    let mut lines = trust_lines(collection, flagged);
+    match changes {
+        Some(0) => lines.push(Span::new(
+            "✓ nothing new or changed since the last sweep",
+            "32",
+        )),
+        Some(count) => lines.push(Span::new(
+            format!("{count} change(s) since the last sweep"),
+            "33;1",
+        )),
+        None => {}
+    }
+    let boxed = report.verdict_box_with(decision, None, &lines, width, painter);
+    format!("{boxed}\n{}", attention(report, painter))
 }
 
 /// A tier's colour on the report page.
@@ -187,7 +332,8 @@ fn item_row(item: &Item, home: Option<&str>, flagged: &HashSet<String>) -> Vec<V
     vec![status, vec![Span::plain(shown(&label))], details]
 }
 
-/// The summary card, then a table of items for each area.
+/// The legend, then a table of items for each area: what isn't trusted,
+/// or with `all` every item.
 pub(super) fn print(collection: &Collection, report: &Report, home: Option<&str>, all: bool) {
     let painter = Painter::for_stdout();
     let width = layout::width();
@@ -196,21 +342,12 @@ pub(super) fn print(collection: &Collection, report: &Report, home: Option<&str>
         .iter()
         .filter(|item| all || !item.is_trusted())
         .collect();
-    let trusted = collection
-        .items
-        .iter()
-        .filter(|item| item.is_trusted())
-        .count();
     let flagged = flagged(report);
-    let flagged_count = shown_items
-        .iter()
-        .filter(|item| flagged.contains(&label(item, home)))
-        .count();
-    let lines = summary(&shown_items, collection.items.len(), trusted, flagged_count);
-    outln!(
-        "{}",
-        layout::boxed("Guardian sweep", &lines, width, "36", painter)
-    );
+    let legend = tier_legend(&shown_items);
+    if !legend.is_empty() {
+        outln!();
+        outln!("{}", layout::fields(&[("Listed", legend)], width, painter));
+    }
 
     let mut groups: BTreeMap<&'static str, Vec<&Item>> = BTreeMap::new();
     for item in shown_items {
@@ -243,46 +380,44 @@ pub(super) fn print(collection: &Collection, report: &Report, home: Option<&str>
     }
 }
 
-/// Notes on what the sweep could not check, as a list.
-pub(super) fn print_notes(notes: &[String]) {
+/// Notes on what the sweep could not check, as a list; empty when there
+/// are none.
+pub(super) fn notes_text(notes: &[String]) -> String {
     if notes.is_empty() {
-        return;
+        return String::new();
     }
-    let painter = Painter::for_stdout();
     let spans: Vec<Span> = notes
         .iter()
         .map(|note| Span::new(format!("• {}", shown(note)), "33"))
         .collect();
-    outln!();
-    outln!(
-        "{}",
-        layout::fields(&[("Notes", spans)], layout::width(), painter)
-    );
+    let fields = layout::fields(&[("Notes", spans)], layout::width(), Painter::for_stdout());
+    format!("\n{fields}\n")
 }
 
-/// What changed since the last sweep, in a table.
+/// What changed since the last sweep, in a box with a table below.
 pub(super) fn print_changes(changes: &[(super::state::Change, String)]) {
     let painter = Painter::for_stdout();
     let width = layout::width();
-    if changes.is_empty() {
-        let lines = [Span::new(
-            "✓ nothing new or changed since the last sweep",
-            "32",
-        )];
-        outln!(
-            "{}",
-            layout::boxed("Guardian sweep", &lines, width, "36", painter)
-        );
-        return;
-    }
-    let lines = [Span::new(
-        format!("{} change(s) since the last sweep", changes.len()),
-        "33;1",
-    )];
+    let line = if changes.is_empty() {
+        Span::new("✓ nothing new or changed since the last sweep", "32")
+    } else {
+        Span::new(
+            format!("{} change(s) since the last sweep", changes.len()),
+            "33;1",
+        )
+    };
     outln!(
         "{}",
-        layout::boxed("Guardian sweep", &lines, width, "36", painter)
+        layout::boxed("Guardian sweep", &[line], width, "36", painter)
     );
+    print_changes_table(changes);
+}
+
+/// What changed since the last sweep, as a table; nothing when nothing did.
+pub(super) fn print_changes_table(changes: &[(super::state::Change, String)]) {
+    if changes.is_empty() {
+        return;
+    }
     let mut page = String::from(
         "<section><hr><h3>What changed since the last sweep</h3><table><tr><th>Change</th><th>Item</th></tr>",
     );
@@ -304,7 +439,10 @@ pub(super) fn print_changes(changes: &[(super::state::Change, String)]) {
             vec![Span::plain(shown(label))],
         ]);
     }
-    outln!("{}", table.render(width, 2, painter));
+    outln!(
+        "{}",
+        table.render(layout::width(), 2, Painter::for_stdout())
+    );
 }
 
 /// The sweep as one JSON document.
@@ -455,12 +593,140 @@ fn reviews_json(report: &Report) -> Json {
 mod tests {
     use std::collections::{BTreeMap, HashSet};
 
-    use super::{findings_json, items_html};
+    use super::{SHOWN_CONCERNS, attention, concerns, findings_json, items_html, not_reviewed};
+    use crate::agent::{AgentFinding, AgentReview, Status};
     use crate::autorun::Category;
-    use crate::report::{Report, ReviewScope};
+    use crate::error::Error;
+    use crate::layout::Painter;
+    use crate::report::{AgentOutcome, AgentRun, Gap, LocalFinding, Report, ReviewScope, Severity};
     use crate::review::analyze_text_locally;
+    use crate::rules::RuleId;
     use crate::sweep::collect::{Body, Item, Origin};
     use crate::sweep::tier::Tier;
+
+    fn local(path: &str, rule: RuleId) -> LocalFinding {
+        LocalFinding {
+            path: path.into(),
+            line: 1,
+            rule,
+            severity: rule.severity(),
+            excerpt: String::new(),
+        }
+    }
+
+    fn ai(file: &str, severity: Severity, title: &str) -> AgentFinding {
+        AgentFinding {
+            severity,
+            file: file.into(),
+            line: None,
+            title: title.into(),
+            reason: String::new(),
+        }
+    }
+
+    fn run(outcome: AgentOutcome) -> AgentRun {
+        AgentRun {
+            files: vec!["~/a".into()],
+            label: "m".into(),
+            chunk: None,
+            cached: None,
+            outcome,
+        }
+    }
+
+    fn suspicious(findings: Vec<AgentFinding>) -> AgentRun {
+        run(AgentOutcome::Reviewed(AgentReview {
+            status: Status::Suspicious,
+            summary: String::new(),
+            findings,
+        }))
+    }
+
+    #[test]
+    fn each_file_is_one_concern_under_its_worst_alert_and_the_worst_come_first() {
+        let mut report = Report::default();
+        // The match's own severity counts, not the rule's (see
+        // `RuleId::severity_on`).
+        let graded_low = LocalFinding {
+            severity: Severity::Low,
+            ..local("~/b", RuleId::ShellCommandExecution)
+        };
+        report.findings = vec![
+            local("~/a", RuleId::ShellCommandExecution),
+            local("~/a", RuleId::ShellCommandExecution),
+            graded_low,
+        ];
+        report.agent_runs.push(suspicious(vec![
+            ai("~/a", Severity::High, "fetches and runs a script"),
+            ai("~/0", Severity::Low, "turns a cooldown off"),
+        ]));
+
+        let concerns = concerns(&report);
+        let shown: Vec<(&str, Severity, &str, usize)> = concerns
+            .iter()
+            .map(|(file, concern)| {
+                (
+                    file.as_str(),
+                    concern.severity,
+                    concern.why.as_str(),
+                    concern.alerts,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("~/a", Severity::High, "AI: fetches and runs a script", 3),
+                ("~/0", Severity::Low, "AI: turns a cooldown off", 1),
+                (
+                    "~/b",
+                    Severity::Low,
+                    "local check shell-command-execution",
+                    1
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_summary_names_a_few_concerns_and_counts_the_rest() {
+        let mut report = Report::default();
+        report.agent_runs.push(suspicious(
+            (0..SHOWN_CONCERNS + 2)
+                .map(|index| ai(&format!("~/f{index:02}"), Severity::Medium, "odd"))
+                .collect(),
+        ));
+        let text = attention(&report, Painter::plain());
+        assert!(text.contains("Needs a look"), "{text}");
+        assert!(text.contains("~/f00") && text.contains("~/f09"), "{text}");
+        assert!(!text.contains("~/f10"), "{text}");
+        assert!(text.contains("… 2 more"), "{text}");
+        assert!(!text.contains("Not reviewed"), "{text}");
+        assert_eq!(attention(&Report::default(), Painter::plain()), "");
+    }
+
+    #[test]
+    fn the_summary_says_why_the_review_is_incomplete() {
+        let mut report = Report::default();
+        report
+            .gaps
+            .push(Gap::Sweep("/boot/EFI could not be listed".into()));
+        report
+            .agent_runs
+            .push(run(AgentOutcome::Unavailable(Error::Message(
+                "no network".into(),
+            ))));
+        let lines = not_reviewed(&report);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("/boot/EFI could not be listed"));
+        assert!(lines[1].starts_with("AI review: ") && lines[1].contains("no network"));
+
+        let text = attention(&report, Painter::plain());
+        assert!(
+            text.contains("Not reviewed") && text.contains("! AI review: "),
+            "{text}"
+        );
+    }
 
     #[test]
     fn a_finding_carries_the_severity_of_its_match() {

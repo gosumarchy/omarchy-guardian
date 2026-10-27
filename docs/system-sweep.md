@@ -1908,18 +1908,32 @@ purpose: a wrapper in `~/.local/bin`, a keybinding that starts your own tool,
 an alias. Look at each one, then either fix it or tell Guardian you know it:
 
 ```sh
-omarchy-guardian sweep                                 # what is flagged, and why
+omarchy-guardian sweep                                 # the verdict and what needs a look
+omarchy-guardian sweep details                         # the full report of the last sweep
 omarchy-guardian sweep --root                          # also what only root can read, now
 omarchy-guardian sweep --diff                          # only what changed since the last sweep
 omarchy-guardian sweep --json                          # one JSON document
 omarchy-guardian sweep allow '~/.local/bin/claude'     # trust it as it is now (asks for sudo)
 omarchy-guardian sweep allow /root/.local/bin/claude   # root's items too
-omarchy-guardian sweep --all                           # allowed items show as "allowed"
+omarchy-guardian sweep --all                           # the full report, allowed items too
 omarchy-guardian sweep forget '~/.local/bin/claude'    # stop trusting it (or: forget --all)
 omarchy-guardian sweep allow --migrate                 # move what an older Guardian allowed
 omarchy-guardian sweep --report                        # save the report page and open it
 omarchy-guardian status --dismiss                      # clear the bar's alert
 ```
+
+A sweep prints one box with the verdict, the alerts and how much of the
+system is trusted, then up to 10 files the review raised alerts on (worst
+first, one line each, with how many alerts each has) and up to 3 reasons the
+review is incomplete, and the notes on what the sweep could not check.
+Everything else, the review's fields, the findings and the table of items for
+each area, goes to the full report:
+`sweep details` shows it, through `less` in a terminal. It is one file,
+`last-report.txt` in the sweep's state directory (readable only by you),
+replaced at each sweep run in a terminal; the daily timer's sweep leaves it
+alone. `--all` prints the full report as well, and lists the trusted items
+in it. When the file cannot be written, the sweep prints the full report
+instead, so nothing it found is left out.
 
 `sweep --report` saves the same page a notification opens, with the items
 listed by area and an **Ask your AI agent** button, and prints the

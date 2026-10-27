@@ -91,7 +91,7 @@ fn write(path: &Path, remembered: &Remembered) -> Result<(), Error> {
     write_text(path, &json.to_string())
 }
 
-fn write_text(path: &Path, text: &str) -> Result<(), Error> {
+pub(super) fn write_text(path: &Path, text: &str) -> Result<(), Error> {
     write_text_mode(path, text, 0o600)
 }
 

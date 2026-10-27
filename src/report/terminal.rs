@@ -38,11 +38,20 @@ impl Report {
     /// Prints the report under `decision`, as overruled by the user's
     /// `permit` when there is one (see `permit`).
     pub(crate) fn print(&self, decision: Decision, hashes: Hashes, permit: Option<&str>) {
+        outln!();
+        outln!(
+            "{}",
+            self.verdict_box(decision, permit, layout::width(), Painter::for_stdout())
+        );
+        self.print_details(decision, hashes, permit);
+    }
+
+    /// Prints everything of the report but its verdict box, for a caller
+    /// that shows the verdict its own way (the sweep's summary).
+    pub(crate) fn print_details(&self, decision: Decision, hashes: Hashes, permit: Option<&str>) {
         let painter = Painter::for_stdout();
         let width = layout::width();
 
-        outln!();
-        outln!("{}", self.verdict_box(decision, permit, width, painter));
         let mut rows = Vec::new();
         self.coverage_fields(&mut rows);
         for note in &self.notes {
@@ -138,6 +147,18 @@ impl Report {
         width: usize,
         painter: Painter,
     ) -> String {
+        self.verdict_box_with(decision, permit, &[], width, painter)
+    }
+
+    /// The verdict box with `extra` lines below the verdict and the counts.
+    pub(crate) fn verdict_box_with(
+        &self,
+        decision: Decision,
+        permit: Option<&str>,
+        extra: &[Span],
+        width: usize,
+        painter: Painter,
+    ) -> String {
         let counts = self.counts();
         let (headline, color) = self.headline(decision, permit);
         let mut lines = vec![Span::new(headline, color)];
@@ -154,6 +175,7 @@ impl Report {
                 remarks_are(decision)
             )));
         }
+        lines.extend_from_slice(extra);
         let title = format!("Omarchy Guardian · {}", shown(&self.subject));
         let edge = color.split(';').next().unwrap_or(color);
         layout::boxed(&title, &lines, width, edge, painter)

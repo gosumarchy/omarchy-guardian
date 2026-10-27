@@ -444,8 +444,20 @@ changes_and_allow() {
     printf '=== changes and allow ===\n'
     # The program that ran from the cache has stopped, so only removals.
     sweep omarchy-guardian sweep --diff >"$E2E/diff.txt" 2>"$E2E/sweep.err"
-    grep -q 'Guardian sweep' "$E2E/diff.txt" && ! grep -qE '[+~] (new|changed) ' "$E2E/diff.txt"
+    grep -q 'Omarchy Guardian' "$E2E/diff.txt" && ! grep -qE '[+~] (new|changed) ' "$E2E/diff.txt"
     expect 'a second sweep finds nothing new or changed' "$?"
+
+    # The terminal gets the verdict and what needs a look; the area tables
+    # wait in the full report.
+    sweep omarchy-guardian sweep >"$E2E/summary.txt" 2>"$E2E/sweep.err"
+    grep -q 'Needs a look' "$E2E/summary.txt" &&
+        grep -q 'Full report: omarchy-guardian sweep details' "$E2E/summary.txt" &&
+        ! grep -q '▌' "$E2E/summary.txt"
+    expect 'a sweep prints a summary, not the area tables' "$?"
+    sweep omarchy-guardian sweep details >"$E2E/details.txt" 2>"$E2E/sweep.err"
+    grep -q 'Needs a look' "$E2E/details.txt" && grep -q '▌' "$E2E/details.txt" &&
+        grep -q '/usr/local/bin/evil-run' "$E2E/details.txt"
+    expect 'sweep details shows the summary and the full report' "$?"
 
     plant "$HOME/.config/autostart/later.desktop" 644 $'[Desktop Entry]\nExec=/usr/local/bin/evil-run\n'
     sweep omarchy-guardian sweep --diff >"$E2E/diff.txt" 2>"$E2E/sweep.err"

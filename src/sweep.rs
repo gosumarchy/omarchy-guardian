@@ -91,6 +91,8 @@ pub(crate) struct Options {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Command {
     Run(Options),
+    /// Show the full report of the last sweep run in a terminal.
+    Details,
     /// Trust one item as it is now (its label, as the sweep shows it).
     Allow(String),
     /// Move what an older Guardian kept in the user's own list of allowed
@@ -105,7 +107,7 @@ pub(crate) enum Command {
 /// is nobody's home: an allow run as root could never take effect.
 fn not_as_root(command: &Command) -> &'static str {
     match command {
-        Command::Run(_) => {
+        Command::Run(_) | Command::Details => {
             "run it as your user; `sweep --root` asks for root for the parts that need it"
         }
         Command::Allow(_) | Command::Migrate | Command::Forget(_) => {
@@ -121,6 +123,7 @@ pub(crate) fn command(command: &Command, settings: &Settings) -> ExitCode {
     }
     let result = match command {
         Command::Run(options) => return run(*options, settings),
+        Command::Details => return details(),
         Command::Allow(label) => allow(label, settings),
         Command::Migrate => migrate(settings),
         Command::Forget(label) => forget(label.as_deref()),
@@ -868,7 +871,16 @@ struct Shown<'a> {
     home: Option<&'a str>,
     notes: &'a [String],
     changes: &'a [(Change, String)],
+    /// Where the full report is kept for `sweep details`.
+    directory: Option<&'a Path>,
 }
+
+/// The file in the sweep's state directory that holds the full report of
+/// the last sweep run in a terminal. One file, replaced at each sweep: the
+/// reports directory keeps only the newest few reports and the bar shows
+/// the newest, so a sweep saved there each time would push out the report
+/// of a blocked install.
+const LAST_REPORT: &str = "last-report.txt";
 
 /// Shows a sweep the way `options` ask for.
 fn show(options: Options, shown: &Shown<'_>) {
@@ -885,21 +897,134 @@ fn show(options: Options, shown: &Shown<'_>) {
         );
         return;
     }
-    if options.view == View::Changes || options.scheduled {
+    if options.scheduled {
         output::print_changes(shown.changes);
-    } else {
-        output::print(
-            shown.collection,
-            shown.report,
-            shown.home,
-            options.view == View::All,
-        );
+        out!("{}", output::notes_text(shown.notes));
+        shown.report.print(shown.decision, Hashes::Hidden, None);
+        return;
     }
-    output::print_notes(shown.notes);
-    shown.report.print(shown.decision, Hashes::Hidden, None);
+    let changes = (options.view == View::Changes).then_some(shown.changes.len());
+    let summary = output::summary(
+        shown.collection,
+        shown.report,
+        shown.decision,
+        shown.home,
+        changes,
+    );
+    // The notes stay on screen: they say what the sweep could not check,
+    // and a fact said once (see `said_once`) is not said at the next sweep.
+    let top = format!("{summary}{}", output::notes_text(shown.notes));
+    out!("{top}");
+    if options.view == View::Changes {
+        output::print_changes_table(shown.changes);
+    }
+    // The full report is kept for `sweep details` and shown only with
+    // `--all`: printed each time, its hundreds of lines buried the verdict.
+    let details = crate::output::held(|| {
+        shown
+            .report
+            .print_details(shown.decision, Hashes::Hidden, None);
+        if options.view != View::Changes {
+            output::print(
+                shown.collection,
+                shown.report,
+                shown.home,
+                options.view == View::All,
+            );
+        }
+    });
+    match keep_details(shown.directory, &top, &details.text()) {
+        Ok(()) => {
+            if options.view == View::All {
+                crate::output::release(&details);
+            }
+            outln!("\nFull report: omarchy-guardian sweep details");
+            if !matches!(shown.decision, Decision::Clear) {
+                outln!("Allow an item you know: omarchy-guardian sweep allow PATH");
+            }
+        }
+        // Nowhere to read it later, so it is shown now: the summary alone
+        // would hide what it leaves out.
+        Err(reason) => {
+            crate::output::release(&details);
+            errln!(
+                "omarchy-guardian sweep: the full report is printed above, as it could not be kept ({reason})"
+            );
+        }
+    }
     if options.report {
         save_report(shown.collection, shown.decision);
     }
+}
+
+/// Keeps what was shown on top and the full report, as plain text, for
+/// `sweep details`.
+fn keep_details(directory: Option<&Path>, top: &str, details: &str) -> Result<(), Error> {
+    let directory = directory.ok_or_else(|| Error::Message("no state directory".into()))?;
+    let text = crate::report::html::strip_ansi(&format!("{top}{details}"));
+    state::write_text(&directory.join(LAST_REPORT), &text)
+}
+
+/// `omarchy-guardian sweep details`: the full report of the last sweep,
+/// through `less` when a person reads it in a terminal.
+fn details() -> ExitCode {
+    let text = state_directory().and_then(|directory| {
+        let path = directory.join(LAST_REPORT);
+        std::fs::read_to_string(&path).map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => Error::Message(
+                "no sweep has kept a report yet; run `omarchy-guardian sweep`".into(),
+            ),
+            _ => Error::Message(format!("cannot read {}: {error}", path.display())),
+        })
+    });
+    match text {
+        Ok(text) => {
+            show_paged(&text);
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            errln!("omarchy-guardian sweep details: {message}");
+            ExitCode::from(FAILED)
+        }
+    }
+}
+
+/// The system's pager, by its full path: one found through `PATH` could be
+/// any program ahead of it, which is what the sweep looks for.
+const LESS: &str = "/usr/bin/less";
+
+/// Shows `text` through `less` when standard output is a terminal; prints
+/// it when `less` cannot start or fails. A reader who quits early ends
+/// `less` with success, so only a failure prints the text again.
+fn show_paged(text: &str) {
+    use std::io::{IsTerminal as _, Write as _};
+    use std::process::{Command as Process, Stdio};
+
+    let safe = crate::text::terminal_safe(text);
+    if std::io::stdout().is_terminal() {
+        // -F leaves at once when it fits one screen, -X keeps it on the
+        // screen after. LESSSECURE without LESSSECURE_ALLOW, and no
+        // LESSOPEN or LESSCLOSE, so the environment cannot make less run a
+        // program of its choosing.
+        let child = Process::new(LESS)
+            .args(["-F", "-X"])
+            .env("LESSSECURE", "1")
+            .env_remove("LESSSECURE_ALLOW")
+            .env_remove("LESSOPEN")
+            .env_remove("LESSCLOSE")
+            .stdin(Stdio::piped())
+            .spawn();
+        if let Ok(mut child) = child {
+            if let Some(mut input) = child.stdin.take() {
+                // Quitting early closes the pipe; the exit status says the rest.
+                drop(input.write_all(safe.as_bytes()));
+            }
+            if child.wait().is_ok_and(|status| status.success()) {
+                return;
+            }
+        }
+    }
+    out!("{safe}");
 }
 
 /// Notes that state a fact about the machine rather than something that
@@ -1015,6 +1140,7 @@ fn run(options: Options, settings: &Settings) -> ExitCode {
         home: home.as_deref(),
         notes: &notes,
         changes: &changes,
+        directory: directory.as_deref(),
     };
     show(options, &shown);
     let settled = nvim::settle(&collection.items, &plugins, &report, &label);
@@ -1070,6 +1196,30 @@ mod tests {
             notes: Vec::new(),
             alerts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_full_report_is_kept_as_plain_text_only_the_user_reads() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use crate::test_support::TempDir;
+
+        let dir = TempDir::new("details");
+        super::keep_details(
+            Some(dir.path()),
+            "\x1b[32m✓ CLEAR\x1b[0m\n",
+            "the rest\n  ! a gap\n",
+        )
+        .unwrap();
+        let path = dir.path().join(super::LAST_REPORT);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "✓ CLEAR\nthe rest\n  ! a gap\n"
+        );
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        assert!(super::keep_details(None, "x", "").is_err());
     }
 
     #[test]

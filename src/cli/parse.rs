@@ -40,7 +40,7 @@ Usage:
                                                     --if-needed: only when it has none it can run)
   omarchy-guardian protect [--off] [--yes]          (turn every gate on, or the install gates and the sweep off)
   omarchy-guardian test                             (test the saved reviewer with two samples)
-  omarchy-guardian sweep [--all] [--json] [--root] [--diff] [--report] | allow PATH|--migrate | forget PATH|--all
+  omarchy-guardian sweep [--all] [--json] [--root] [--diff] [--report] | details | allow PATH|--migrate | forget PATH|--all
                                                     (check what already runs on its own on this system)
   omarchy-guardian ask <report-id>                  (open your AI agent on a saved report)
   omarchy-guardian status [--waybar | --dismiss | --open-report]
@@ -135,7 +135,7 @@ pub(super) enum Forget {
 }
 
 fn parse_sweep(args: &[OsString]) -> Result<sweep::Command, Error> {
-    const USAGE: &str = "usage: omarchy-guardian sweep [--all] [--json] [--root] [--diff] [--report] | allow PATH | allow --migrate | forget PATH | forget --all";
+    const USAGE: &str = "usage: omarchy-guardian sweep [--all] [--json] [--root] [--diff] [--report] | details | allow PATH | allow --migrate | forget PATH | forget --all";
     let text: Vec<&str> = args
         .iter()
         .map(|arg| {
@@ -144,11 +144,12 @@ fn parse_sweep(args: &[OsString]) -> Result<sweep::Command, Error> {
         })
         .collect::<Result<_, _>>()?;
     match text.as_slice() {
+        ["details"] => return Ok(sweep::Command::Details),
         ["allow", "--migrate"] => return Ok(sweep::Command::Migrate),
         ["allow", path] => return Ok(sweep::Command::Allow((*path).to_string())),
         ["forget", "--all"] => return Ok(sweep::Command::Forget(None)),
         ["forget", path] => return Ok(sweep::Command::Forget(Some((*path).to_string()))),
-        ["allow" | "forget", ..] => return Err(Error::Message(USAGE.into())),
+        ["details" | "allow" | "forget", ..] => return Err(Error::Message(USAGE.into())),
         _ => {}
     }
     let mut options = sweep::Options::default();

@@ -24,6 +24,28 @@ static DIVERTED: AtomicBool = AtomicBool::new(false);
 /// report can be saved for the notification to open.
 static CAPTURED: Mutex<String> = Mutex::new(String::new());
 
+/// What is written while `held` runs: kept here, not shown.
+static HELD: Mutex<Option<Held>> = Mutex::new(None);
+
+/// What `held` kept from the terminal: each write with the stream it was
+/// meant for, in order.
+#[derive(Debug, Default)]
+pub(crate) struct Held(Vec<(Stream, String)>);
+
+impl Held {
+    /// Everything held, both streams, in the order it was written.
+    pub(crate) fn text(&self) -> String {
+        self.0.iter().map(|(_, text)| text.as_str()).collect()
+    }
+}
+
+/// The stream a write was meant for.
+#[derive(Debug, Clone, Copy)]
+enum Stream {
+    Stdout,
+    Stderr,
+}
+
 /// At most this much output is kept; a report is far smaller.
 const MAX_CAPTURED: usize = 1024 * 1024;
 
@@ -43,13 +65,54 @@ pub(crate) fn captured() -> String {
         .clone()
 }
 
+/// Runs `print` with what it writes to stdout, and through `stderr_line`,
+/// kept from the terminal, and returns that text. It is captured all the
+/// same, so a report saved afterwards holds it. Must not be nested.
+pub(crate) fn held(print: impl FnOnce()) -> Held {
+    let previous = HELD
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .replace(Held::default());
+    assert!(previous.is_none(), "output::held must not be nested");
+    print();
+    HELD.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+        .unwrap_or_default()
+}
+
+/// Shows on the terminal what `held` returned, each part on the stream it
+/// was written to. It was captured when it was written, so it is not again.
+pub(crate) fn release(held: &Held) {
+    for (stream, text) in &held.0 {
+        match stream {
+            Stream::Stdout => write_stdout(text),
+            // A failed write to stderr has nowhere to be reported.
+            Stream::Stderr => drop(io::stderr().lock().write_all(text.as_bytes())),
+        }
+    }
+}
+
+/// Keeps `text` for `held` when it runs; returns whether it did.
+fn hold(stream: Stream, text: &str) -> bool {
+    let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(held) = held.as_mut() else {
+        return false;
+    };
+    held.0.push((stream, text.to_string()));
+    true
+}
+
 /// Like `eprintln!`, and kept with the captured output.
 pub(crate) fn stderr_line(args: fmt::Arguments) {
     let line = format!("{args}\n");
     let safe = crate::text::terminal_safe(&line);
+    capture(format_args!("{safe}"));
+    if hold(Stream::Stderr, &safe) {
+        return;
+    }
     // A failed write to stderr has nowhere to be reported.
     let _ = io::stderr().lock().write_all(safe.as_bytes());
-    capture(format_args!("{safe}"));
 }
 
 /// Like `eprint!`, with terminal control sequences shown as codes.
@@ -100,6 +163,13 @@ pub(crate) fn stdout(args: fmt::Arguments) {
     let text = args.to_string();
     let safe = crate::text::terminal_safe(&text);
     capture(format_args!("{safe}"));
+    if hold(Stream::Stdout, &safe) {
+        return;
+    }
+    write_stdout(&safe);
+}
+
+fn write_stdout(safe: &str) {
     if DIVERTED.load(Ordering::Relaxed) {
         // A failed write to stderr has nowhere to be reported.
         let _ = io::stderr().lock().write_all(safe.as_bytes());
@@ -125,7 +195,7 @@ fn write_ignoring_broken_pipe(writer: &mut impl Write, args: fmt::Arguments) -> 
 mod tests {
     use std::io::{self, ErrorKind, Write};
 
-    use super::write_ignoring_broken_pipe;
+    use super::{held, write_ignoring_broken_pipe};
 
     struct Failing(ErrorKind);
 
@@ -153,5 +223,21 @@ mod tests {
         let mut buffer = Vec::new();
         write_ignoring_broken_pipe(&mut buffer, format_args!("{}-{}", 1, 2)).unwrap();
         assert_eq!(buffer, b"1-2");
+    }
+
+    /// `HELD` is global, so other tests printing meanwhile may land in it
+    /// too; none checks what it prints, so only containment is asserted.
+    #[test]
+    fn held_output_is_returned_in_order_and_not_shown() {
+        let kept = held(|| {
+            outln!("to stdout");
+            super::stderr_line(format_args!("to stderr"));
+        });
+        let text = kept.text();
+        let stdout = text.find("to stdout\n").expect("stdout is held");
+        let stderr = text.find("to stderr\n").expect("stderr is held");
+        assert!(stdout < stderr, "held in the order written: {text}");
+        assert!(super::captured().contains("to stdout\n"));
+        assert!(super::HELD.lock().unwrap().is_none());
     }
 }
