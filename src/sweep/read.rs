@@ -395,7 +395,7 @@ pub(crate) struct Matches {
     pub(super) unnamed: Vec<String>,
     /// Directories that exist but could not be listed.
     pub(crate) unreadable: Vec<String>,
-    /// Directories that were listed to look for a match, sorted.
+    /// Directories that were listed to look for a match.
     pub(super) listed: Vec<String>,
 }
 
@@ -456,7 +456,6 @@ pub(crate) fn matching(root: &Path, pattern: &str) -> Matches {
     bases.retain(|path| fs::symlink_metadata(root.join(path)).is_ok());
     bases.sort();
     found.unnamed.sort();
-    found.listed.sort();
     found.files = bases;
     found
 }
