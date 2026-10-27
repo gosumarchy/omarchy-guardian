@@ -1155,10 +1155,15 @@ fn a_script_an_interpreter_is_handed_by_name_is_found() {
             runs(text)
         );
     }
-    // A word no quote can hold ends the line past the script.
+    // A word holding both quotes is quoted so that it reads back whole.
     assert_eq!(
-        runs("python3 /opt/x.py 'a\"b'\"c'd\"\n"),
-        ["python3 /opt/x.py"]
+        runs("python3 'a\"b'\"c'd\" /opt/x.py\n"),
+        [r#"python3 'a"bc'"'"'d' /opt/x.py"#]
+    );
+    // What env starts must run a script too.
+    assert_eq!(
+        runs("/usr/bin/env mytool --conf /etc/x\n"),
+        ["/usr/bin/env"]
     );
     // A word with a blank keeps its quotes.
     assert_eq!(runs("sh '/opt/a b/c.sh'\n"), ["sh '/opt/a b/c.sh'"]);

@@ -1809,8 +1809,20 @@ fn a_link_handed_beside_a_wrapper_to_a_key_is_not_sent() {
             .iter()
             .any(|item| item.path == "home/u/.ssh/id_ed25519")
     );
-    let (sent, _) = examined(&collection);
-    assert!(sent.contains(&"~/p/hook.py".to_string()), "{sent:?}");
+    let mut report = Report::new("t", ReviewScope::default());
+    super::examine(&mut report, &collection, Some("home/u"), &HashSet::new());
+    let sent: Vec<&str> = report
+        .agent_input
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+    assert!(sent.contains(&"~/p/hook.py"), "{sent:?}");
+    assert!(
+        !report
+            .agent_input
+            .iter()
+            .any(|file| file.content.contains("PRIVATE KEY"))
+    );
     assert!(
         !sent
             .iter()

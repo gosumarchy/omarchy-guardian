@@ -530,36 +530,39 @@ fn is_command(word: &str) -> bool {
 /// `/usr/bin/env python3 /opt/x/check.py`), for following to find its
 /// script as on any command line, or to say it is unknown. awk is left
 /// out: its first operand is its program (`'{print $1}'`), and the paths
-/// after that are what it reads. A word no quote can hold ends the line
-/// past the first path; before it, the statement is left as it was.
+/// after that are what it reads.
 fn handed_script(words: &[String]) -> Option<String> {
     let (interpreter, arguments) = words.split_first()?;
-    let name = file_name(interpreter);
-    let handed = (runs_a_script(name) || name == "env") && !matches!(name, "awk" | "gawk" | "mawk");
-    let first_path = arguments.iter().position(|word| word.contains('/'))? + 1;
-    if !handed {
-        return None;
+    let mut program = file_name(interpreter);
+    // `/usr/bin/env python3 …`: what env starts, past its options and the
+    // variables it sets.
+    if program == "env" {
+        program = arguments
+            .iter()
+            .find(|word| !word.starts_with('-') && !word.contains('='))
+            .map(|word| file_name(word))?;
     }
-    let mut line = Vec::new();
-    for (at, word) in words.iter().enumerate() {
-        match quoted(word) {
-            Some(word) => line.push(word),
-            None if at > first_path => break,
-            None => return None,
-        }
-    }
-    Some(line.join(" "))
+    let handed = runs_a_script(program)
+        && !matches!(program, "awk" | "gawk" | "mawk")
+        && arguments.iter().any(|word| word.contains('/'));
+    handed.then(|| {
+        words
+            .iter()
+            .map(|word| quoted(word))
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
 }
 
-/// `word` as one word of a command line `split` reads back: as it is, or
-/// in the quotes it does not hold.
-fn quoted(word: &str) -> Option<String> {
-    if !word.contains([' ', '\t', '\'', '"']) {
-        Some(word.to_string())
-    } else if !word.contains('\'') {
-        Some(format!("'{word}'"))
+/// `word` as one word of a command line `split` reads back: in single
+/// quotes where it holds a blank or a quote, with each `'` in it closed,
+/// given in double quotes and opened again (`'"'"'`), as `split` joins
+/// quoted pieces that touch.
+fn quoted(word: &str) -> String {
+    if word.contains([' ', '\t', '\'', '"']) {
+        format!("'{}'", word.replace('\'', r#"'"'"'"#))
     } else {
-        (!word.contains('"')).then(|| format!("\"{word}\""))
+        word.to_string()
     }
 }
 
