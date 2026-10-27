@@ -263,7 +263,7 @@ fn verdict_lines(report: &Report, decision: Decision) -> (Vec<Span>, &'static st
         ));
     }
     if decision == Decision::Warned {
-        lines.push(Span::new("Allowed by policy for this source", "2"));
+        lines.push(Span::new("Allowed by policy", "2"));
     }
     // Clear means no alerts, so its headline is green; the edge takes a
     // plain colour code.
