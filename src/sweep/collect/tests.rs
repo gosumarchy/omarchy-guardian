@@ -395,6 +395,60 @@ fn a_script_is_followed_to_the_helpers_beside_it() {
 }
 
 #[test]
+fn a_script_started_through_a_link_finds_its_helpers_beside_the_link() {
+    let dir = TempDir::new("sweep-beside-link");
+    let root = dir.path();
+    write(
+        root,
+        "etc/systemd/system/a.service",
+        "[Service]\nExecStart=/home/u/bin/run\n",
+    );
+    write(
+        root,
+        "home/u/w/run.sh",
+        "#!/bin/sh\n. \"$(dirname \"$0\")/common.sh\"\n",
+    );
+    write(root, "home/u/bin/common.sh", "#!/bin/sh\ntrue\n");
+    symlink("../w/run.sh", root.join("home/u/bin/run")).unwrap();
+    // Handed to a shell, as an agent's hook is (`bash ~/.claude/x.sh`):
+    // no first line or name says it is a script.
+    write(
+        root,
+        "etc/systemd/system/b.service",
+        "[Service]\nExecStart=/usr/bin/bash /home/u/w/hand\n",
+    );
+    write(root, "home/u/w/hand", ". \"$(dirname \"$0\")/helper.sh\"\n");
+    write(root, "home/u/w/helper.sh", "#!/bin/sh\ntrue\n");
+    write(root, "home/u/w/common.sh", "#!/bin/sh\ntrue\n");
+    // In a file a shell sources, `$0` is the shell: nothing is written in.
+    write(root, "home/u/.bashrc", ". \"$(dirname \"$0\")/x.sh\"\n");
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::System,
+    };
+    let collection = collect(&scope);
+    let at = |path: &str| {
+        collection
+            .items
+            .iter()
+            .find(|item| item.path == path)
+            .unwrap_or_else(|| panic!("{path} was not collected"))
+    };
+
+    let run = at("home/u/w/run.sh");
+    assert_eq!(run.runs, ["/home/u/bin/common.sh"]);
+    assert!(!super::is_capped(run), "{:?}", run.notes);
+    let hand = at("home/u/w/hand");
+    assert_eq!(hand.runs, ["/home/u/w/helper.sh"]);
+    assert!(!super::is_capped(hand), "{:?}", hand.notes);
+    let bashrc = at("home/u/.bashrc");
+    assert!(super::is_capped(bashrc), "{:?}", bashrc.notes);
+}
+
+#[test]
 fn a_file_a_shell_is_handed_is_a_shell_script_whatever_it_is_called() {
     let dir = TempDir::new("sweep-handed");
     let root = dir.path();

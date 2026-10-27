@@ -293,7 +293,7 @@ fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
     let Some(program) = words.next() else {
         return found;
     };
-    if is_unwritten(program) {
+    if is_unwritten(lookup.home, program) {
         lookup.unwritten.set(true);
     }
     found.extend(locate(lookup, program));
@@ -350,7 +350,7 @@ fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
             if argument == Argument::Option {
                 continue;
             }
-            if is_unwritten(word) {
+            if is_unwritten(lookup.home, word) {
                 lookup.unwritten.set(true);
             }
             if word.contains('/') {
@@ -380,12 +380,12 @@ fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
 }
 
 /// Whether `word`, a program or a script, is named through a variable or
-/// a substitution that nothing wrote in (`$SCRIPT_DIR/x`, `$(dirname`,
-/// `` `pwd`/x ``), so the file that runs is not known here. `$HOME` is
-/// written in when the path is looked for.
-fn is_unwritten(word: &str) -> bool {
-    let home = word.starts_with("$HOME") || word.starts_with("${HOME}");
-    (word.starts_with('$') && !home) || word.starts_with('`')
+/// a substitution that nothing wrote in (`$SCRIPT_DIR/x`, `/opt/$V/run`,
+/// `$(dirname`, `` `pwd`/x ``), so the file that runs is not known here.
+/// What `expand` writes in (`~`, `$HOME`, the XDG directories at their
+/// default places) is known; `$HOMEBREW_PREFIX` is not.
+fn is_unwritten(home: &str, word: &str) -> bool {
+    expand(home, word).contains(['$', '`'])
 }
 
 /// The most values of options that are looked at on the way to a script.

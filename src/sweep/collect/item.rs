@@ -117,6 +117,7 @@ pub(crate) fn item_of(
     };
     let reader = reader(category, &path, run_by, tier, &body);
     let runs = match &body {
+        // Reached through a link, it is read again as the link (`read_as`).
         Body::Text(text) => runs_of(category, reader, &path, text),
         _ => Vec::new(),
     };

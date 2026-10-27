@@ -621,9 +621,14 @@ fn reader(
 /// (`reader`), what a script of that text starts and sources as well. A
 /// first line of `#!/bin/sh` is a comment to systemd, udev, cron and SSH:
 /// it never takes the place of how the file is really read.
+/// Such a script's `$0` names `path` (see
+/// `commands::with_script_directory`): the file, or the link that led to it.
 fn runs_of(category: Category, reader: Category, path: &str, text: &str) -> Vec<String> {
     let mut runs = commands::commands(category, path, text);
     if reader != category {
+        let beside =
+            (reader == Category::Shell).then(|| commands::with_script_directory(text, path));
+        let text = beside.as_deref().unwrap_or(text);
         for run in commands::commands(reader, path, text) {
             if !runs.contains(&run) {
                 runs.push(run);
@@ -667,6 +672,7 @@ fn read_as(scope: &Scope<'_>, item: &mut Item, link: &str) {
         return;
     };
     let reader = reader(item.category, link, None, item.tier, &item.body);
+    // Started through the link, a script's `$0` names the link.
     item.runs = runs_of(item.category, reader, link, text);
     for alert in settings_alerts(scope, item.category, link, item.tier, &item.body) {
         if !item.alerts.contains(&alert) {

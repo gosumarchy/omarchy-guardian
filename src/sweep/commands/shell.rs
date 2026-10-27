@@ -76,124 +76,176 @@ pub(super) fn zdotdir(line: &str) -> Vec<String> {
         .collect()
 }
 
-/// `text` of the shell script at `path` (relative to the root) with the
-/// script's own directory written in where it names it, as scripts find
-/// the helpers that lie beside them: `$(dirname "$0")`,
-/// `$(dirname "${BASH_SOURCE[0]}")`, `${BASH_SOURCE%/*}`, the file itself
-/// for `$(readlink -f "$0")` and `$(realpath "$0")`, and `$(cd "…" && pwd)`
+/// `text` of a shell script someone runs, started as `started` (relative
+/// to the root), with the script's own directory written in where it names
+/// it, as scripts find the helpers that lie beside them:
+/// `$(dirname "$0")`, `${0%/*}`, under bash also `$(dirname
+/// "${BASH_SOURCE[0]}")` and `${BASH_SOURCE%/*}`, the file itself for
+/// `$(readlink -f "$0")` and `$(realpath "$0")`, and `$(cd "…" && pwd)`
 /// around such a directory. `SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"`
 /// then sets a path variable like any other.
 ///
-/// `$0` and `$BASH_SOURCE` name the script as it was started, which for a
-/// link is the link's directory, and in a file a shell sources (a start-up
-/// file) `$0` is the shell itself; there the directory written in may not
-/// be the one that runs. The text is reviewed as written either way.
-pub(super) fn with_script_directory(text: &str, path: &str) -> String {
-    if !text.contains("dirname")
-        && !text.contains("BASH_SOURCE")
-        && !text.contains("${0%")
-        && !text.contains("readlink")
-        && !text.contains("realpath")
-    {
-        return text.to_string();
+/// `$0` is the path the script was started by, so `started` is the link
+/// that led to it where one did; in a file a shell sources it is the shell,
+/// which is why a start-up file never comes here. `$BASH_SOURCE` is only
+/// set under bash, so only a script whose first line names bash has it
+/// written in; one handed to `sh` despite that line is read as if bash ran
+/// it. A line that is long, or that would grow long, is left as written:
+/// its `$(dirname` then names no file, and following says so.
+pub(crate) fn with_script_directory(text: &str, started: &str) -> String {
+    let bash = text
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("#!"))
+        .and_then(shebang_shell)
+        == Some("bash");
+    let own = OwnPath {
+        file: format!("/{started}"),
+        directory: started
+            .rsplit_once('/')
+            .map_or_else(|| "/".to_string(), |(directory, _)| format!("/{directory}")),
+        bash,
+    };
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let written = (line.len() <= MAX_STARTED_LINE)
+            .then(|| own.written_in(line))
+            .filter(|written| written.len() <= MAX_STARTED_LINE);
+        out.push_str(written.as_deref().unwrap_or(line));
     }
-    let file = format!("/{path}");
-    let directory = path
-        .rsplit_once('/')
-        .map_or_else(|| "/".to_string(), |(directory, _)| format!("/{directory}"));
-    let mut text = text.to_string();
-    for trimmed in ["${0%/*}", "${BASH_SOURCE%/*}", "${BASH_SOURCE[0]%/*}"] {
-        text = text.replace(trimmed, &directory);
+    out
+}
+
+/// What a script someone runs names itself by: `$0` as a file and as a
+/// directory, and whether `$BASH_SOURCE` is set (it runs under bash).
+struct OwnPath {
+    file: String,
+    directory: String,
+    bash: bool,
+}
+
+impl OwnPath {
+    /// `line` with the script's own file and directory written in (see
+    /// `with_script_directory`).
+    fn written_in(&self, line: &str) -> String {
+        if !line.contains("dirname")
+            && !line.contains("${0%")
+            && !line.contains("BASH_SOURCE")
+            && !line.contains("readlink")
+            && !line.contains("realpath")
+        {
+            return line.to_string();
+        }
+        let mut line = line.replace("${0%/*}", &self.directory);
+        if self.bash {
+            for trimmed in ["${BASH_SOURCE%/*}", "${BASH_SOURCE[0]%/*}"] {
+                line = line.replace(trimmed, &self.directory);
+            }
+        }
+        // Inner substitutions first: each pass writes in those that hold
+        // no other, so `$(cd "$(dirname "$0")" && pwd)` takes two.
+        for _ in 0..MAX_NESTED_SUBSTITUTIONS {
+            let (written, changed) = self.substitutions_written(&line);
+            line = written;
+            if !changed {
+                break;
+            }
+        }
+        line
     }
-    // Inner substitutions first: each pass writes in those that hold no
-    // other, so `$(cd "$(dirname "$0")" && pwd)` takes two.
-    for _ in 0..MAX_NESTED_SUBSTITUTIONS {
-        let (written, changed) = with_substitutions_written(&text, &file, &directory);
-        text = written;
-        if !changed {
-            break;
+
+    /// `line` with each `$(…)` that holds no other and that `call` knows
+    /// written in, and whether any was. Linear in the line: where a `$(`
+    /// holds another, the scan goes on from the last one inside it, so no
+    /// stretch of the line is searched for its `)` twice.
+    fn substitutions_written(&self, line: &str) -> (String, bool) {
+        let mut out = String::with_capacity(line.len());
+        let mut changed = false;
+        let mut rest = line;
+        while let Some(at) = rest.find("$(") {
+            out.push_str(&rest[..at]);
+            let inner = &rest[at + 2..];
+            let Some(end) = inner.find(')') else {
+                rest = &rest[at..];
+                break;
+            };
+            if let Some(nested) = inner[..end].rfind("$(") {
+                out.push_str("$(");
+                out.push_str(&inner[..nested]);
+                rest = &inner[nested..];
+            } else if let Some(written) = self.call(&inner[..end]) {
+                out.push_str(written);
+                changed = true;
+                rest = &inner[end + 1..];
+            } else {
+                out.push_str("$(");
+                rest = inner;
+            }
+        }
+        out.push_str(rest);
+        (out, changed)
+    }
+
+    /// What the command `call` inside `$(…)` prints when it asks for the
+    /// script's own file or directory: the file for `readlink -f` or
+    /// `realpath` of the script, the directory for its `dirname`, and for
+    /// `cd` into the directory and `pwd`. Only double quotes are taken off:
+    /// `'$0'` is the text `$0`, not the script.
+    fn call(&self, call: &str) -> Option<&str> {
+        let words: Vec<&str> = call
+            .split_whitespace()
+            .map(|word| word.trim_matches('"'))
+            .filter(|word| *word != "--")
+            .collect();
+        let is_script = |word: &str| {
+            word == self.file
+                || matches!(word, "$0" | "${0}")
+                || (self.bash
+                    && matches!(
+                        word,
+                        "$BASH_SOURCE" | "${BASH_SOURCE}" | "${BASH_SOURCE[0]}"
+                    ))
+        };
+        match words.as_slice() {
+            ["readlink", "-f", script] | ["realpath", script] if is_script(script) => {
+                Some(&self.file)
+            }
+            ["dirname", script] if is_script(script) => Some(&self.directory),
+            ["cd", "-P" | "-L", there, rest @ ..] | ["cd", there, rest @ ..]
+                if *there == self.directory && is_pwd(rest) =>
+            {
+                Some(&self.directory)
+            }
+            _ => None,
         }
     }
-    text
+}
+
+/// Whether `rest`, the words after `cd DIR`, only print where that left
+/// the shell: `&& pwd`, with its own `-P` and output sent nowhere.
+fn is_pwd(rest: &[&str]) -> bool {
+    rest.contains(&"pwd")
+        && rest.iter().all(|word| {
+            matches!(
+                *word,
+                "pwd"
+                    | "-P"
+                    | "&&"
+                    | ";"
+                    | "&>"
+                    | ">"
+                    | "/dev/null"
+                    | ">/dev/null"
+                    | "&>/dev/null"
+                    | "2>&1"
+                    | "2>/dev/null"
+            )
+        })
 }
 
 /// How deep `$(…)` inside `$(…)` is written in; three covers
 /// `$(cd "$(dirname "$(readlink -f "$0")")" && pwd)`.
 const MAX_NESTED_SUBSTITUTIONS: usize = 3;
-
-/// `text` with each `$(…)` that holds no other and that
-/// `script_directory_call` knows written in, and whether any was.
-fn with_substitutions_written(text: &str, file: &str, directory: &str) -> (String, bool) {
-    let mut out = String::with_capacity(text.len());
-    let mut changed = false;
-    let mut rest = text;
-    while let Some(at) = rest.find("$(") {
-        let inner = &rest[at + 2..];
-        let Some(end) = inner.find(')') else {
-            break;
-        };
-        out.push_str(&rest[..at]);
-        let written = Some(&inner[..end])
-            .filter(|call| !call.contains("$("))
-            .and_then(|call| script_directory_call(call, file, directory));
-        if let Some(written) = written {
-            out.push_str(written);
-            changed = true;
-            rest = &inner[end + 1..];
-        } else {
-            out.push_str("$(");
-            rest = inner;
-        }
-    }
-    out.push_str(rest);
-    (out, changed)
-}
-
-/// What the command `call` inside `$(…)` prints when it asks for the
-/// script's own file or directory: `file` for `readlink -f` or `realpath`
-/// of the script, `directory` for its `dirname`, and for `cd` into the
-/// directory and `pwd`.
-fn script_directory_call<'a>(call: &str, file: &'a str, directory: &'a str) -> Option<&'a str> {
-    let words: Vec<&str> = call
-        .split_whitespace()
-        .map(|word| word.trim_matches(['"', '\'']))
-        .filter(|word| *word != "--")
-        .collect();
-    let is_script = |word: &str| {
-        word == file
-            || matches!(
-                word,
-                "$0" | "${0}" | "$BASH_SOURCE" | "${BASH_SOURCE}" | "${BASH_SOURCE[0]}"
-            )
-    };
-    match words.as_slice() {
-        ["readlink", "-f", script] | ["realpath", script] if is_script(script) => Some(file),
-        ["dirname", script] if is_script(script) => Some(directory),
-        ["cd", "-P" | "-L", there, rest @ ..] | ["cd", there, rest @ ..]
-            if *there == directory
-                && rest.contains(&"pwd")
-                && rest.iter().all(|word| {
-                    matches!(
-                        *word,
-                        "pwd"
-                            | "-P"
-                            | "&&"
-                            | ";"
-                            | "&>"
-                            | ">"
-                            | "/dev/null"
-                            | ">/dev/null"
-                            | "&>/dev/null"
-                            | "2>&1"
-                            | "2>/dev/null"
-                    )
-                }) =>
-        {
-            Some(directory)
-        }
-        _ => None,
-    }
-}
 
 /// Variables a shell start-up file sets to a path (`TOOLS=~/opt/tools`,
 /// `export BIN="$HOME/bin"`), so `$TOOLS/run` is looked at as that path.
@@ -393,25 +445,6 @@ fn case_pattern_end(branch: &str) -> Option<usize> {
     plain.then_some(close + 1)
 }
 
-/// `line` with `;`, `|` and `&` inside single quotes made blanks: there
-/// they are text, as in `jq '.a | .b // ""'`, and end no statement. A
-/// single quote inside double quotes is text too. Double quotes are kept
-/// whole: a `$(…)` inside them holds statements of its own.
-fn without_quoted_separators(line: &str) -> String {
-    let mut quote = None;
-    line.chars()
-        .map(|c| {
-            match (quote, c) {
-                (None, '\'' | '"') => quote = Some(c),
-                (Some(open), _) if c == open => quote = None,
-                (Some('\''), ';' | '|' | '&') => return ' ',
-                _ => {}
-            }
-            c
-        })
-        .collect()
-}
-
 /// The programs a line of a shell start-up file names by a path, as the
 /// command of a statement (`~/bin/agent &`, `cd x && exec /opt/x/run`) or
 /// inside a substitution (`eval "$(~/bin/tool init)"`). A bare name is not
@@ -421,10 +454,14 @@ pub(super) fn started(line: &str) -> Vec<String> {
     if line.len() > MAX_STARTED_LINE {
         return Vec::new();
     }
+    // A word of slashes alone is no program: `//` is jq's operator in a
+    // quoted filter (`jq '.a | .b // ""'`), cut out where the line is split
+    // at the `|` inside it.
     let is_path = |word: &str| {
         ["/", "~/", "$HOME/", "${HOME}/"]
             .iter()
             .any(|start| word.starts_with(start))
+            && !word.chars().all(|c| c == '/')
     };
     let clean = |word: &str| {
         word.trim_matches(['"', '\'', ';', '&', ')', '(', '`'])
@@ -432,7 +469,7 @@ pub(super) fn started(line: &str) -> Vec<String> {
     };
     let mut found = Vec::new();
     // `>&` and `&>` are redirections, not the end of a statement.
-    let statements = without_quoted_separators(line)
+    let statements = line
         .replace("&&", ";")
         .replace("||", ";")
         .replace(">&", "> ")

@@ -839,45 +839,93 @@ fn what_runs_is_found_past_wrappers_and_in_files_that_are_read_in() {
 
 #[test]
 fn a_script_names_its_own_directory_in_the_ways_scripts_do() {
+    use super::with_script_directory;
     let path = "home/u/w/s/x.sh";
-    let runs = |line: &str| commands(Category::Shell, path, &format!("#!/bin/bash\n{line}\n"));
+    let runs = |first: &str, line: &str| {
+        let text = format!("{first}\n{line}\n");
+        commands(Category::Shell, path, &with_script_directory(&text, path))
+    };
     for line in [
-        r#"source "$(dirname "${BASH_SOURCE[0]}")/c.sh""#,
         r#". "$(dirname "$0")/c.sh""#,
         ". $(dirname $0)/c.sh",
-        r#". "${BASH_SOURCE%/*}/c.sh""#,
         r#". "${0%/*}/c.sh""#,
         r#". "$(dirname "$(readlink -f "$0")")/c.sh""#,
+        r#". "$(dirname "$(realpath -- "$0")")/c.sh""#,
+        r#"source "$(dirname "${BASH_SOURCE[0]}")/c.sh""#,
+        r#". "${BASH_SOURCE%/*}/c.sh""#,
         r#". "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)/c.sh""#,
         "D=\"$(cd \"$(dirname \"$0\")\" && pwd -P)\"\n. \"$D/c.sh\"",
     ] {
-        assert_eq!(runs(line), ["/home/u/w/s/c.sh"], "{line}");
+        assert_eq!(runs("#!/bin/bash", line), ["/home/u/w/s/c.sh"], "{line}");
     }
-    // Another file's directory, or a `cd` that goes on to do more, is not
-    // the script's own.
-    for line in [
-        r#". "$(dirname "$1")/c.sh""#,
-        r#". "$(cd "$(dirname "$0")" && git rev-parse --show-toplevel)/c.sh""#,
+    // Another file's directory, a `cd` that goes on to do more, the text
+    // `'$0'`, and `$BASH_SOURCE` where no bash sets it are not the
+    // script's own.
+    for (first, line) in [
+        ("#!/bin/bash", r#". "$(dirname "$1")/c.sh""#),
+        (
+            "#!/bin/bash",
+            r#". "$(cd "$(dirname "$0")" && git rev-parse --show-toplevel)/c.sh""#,
+        ),
+        ("#!/bin/bash", ". \"$(dirname '$0')/c.sh\""),
+        ("#!/bin/sh", r#". "$(dirname "${BASH_SOURCE[0]}")/c.sh""#),
+        ("#!/bin/sh", r#". "${BASH_SOURCE%/*}/c.sh""#),
     ] {
-        assert_ne!(runs(line), ["/home/u/w/s/c.sh"], "{line}");
+        assert_ne!(runs(first, line), ["/home/u/w/s/c.sh"], "{line}");
     }
 }
 
 #[test]
-fn a_separator_inside_single_quotes_starts_no_statement() {
-    let runs = commands(
-        Category::Shell,
-        "home/u/x.sh",
-        "#!/bin/sh\nX=$(echo \"$I\" | jq -r '(.a | .b) // \"\"; /bin/y')\n",
-    );
-    assert!(runs.is_empty(), "{runs:?}");
-    // In double quotes they still end one, as inside `"$(a && /bin/b)"`.
-    let runs = commands(
-        Category::Shell,
-        "home/u/x.sh",
-        "#!/bin/sh\nX=\"$(cd /tmp && /home/u/bin/b)\"\n",
-    );
-    assert_eq!(runs, ["/home/u/bin/b"]);
+fn a_line_that_would_grow_long_keeps_its_own_directory_unwritten() {
+    use super::{MAX_STARTED_LINE, with_script_directory};
+    let path = "home/u/a/rather/deep/directory/x.sh";
+    let line = "${0%/*}/c ".repeat(MAX_STARTED_LINE / 10 - 1);
+    let text = format!("#!/bin/sh\n{line}\n");
+    assert!(line.len() <= MAX_STARTED_LINE);
+    assert_eq!(with_script_directory(&text, path), text);
+}
+
+#[test]
+fn writing_in_a_scripts_directory_takes_time_in_proportion_to_the_line() {
+    use super::with_script_directory;
+    // Each `$(` here holds another up to the one `)` at the end.
+    let line = format!("dirname {})", "$(".repeat(30_000));
+    let text = format!("#!/bin/bash\n{line}\n");
+    let start = CpuInstant::now();
+    with_script_directory(&text, "home/u/x.sh");
+    let spent = start.elapsed();
+    // Arbitrary, and generous: linear work on 60 KB takes well under a
+    // millisecond; the quadratic scan this guards against took seconds.
+    assert!(spent.as_millis() < 500, "{spent:?}");
+}
+
+#[test]
+fn a_statement_after_quotes_is_still_one() {
+    let runs = |line: &str| {
+        commands(
+            Category::Shell,
+            "home/u/x.sh",
+            &format!("#!/bin/sh\n{line}\n"),
+        )
+    };
+    for line in [
+        r"echo \'; /opt/evil",
+        r#"echo "a\"'"; /opt/evil"#,
+        r"echo $'\''; /opt/evil",
+        "eval 'cd /x; /opt/evil'",
+        "trap 'rm f; /opt/evil' EXIT",
+        "sh -c 'cd /x; /opt/evil'",
+    ] {
+        // `trap`'s quote, cut at the `;`, joins `EXIT` to the program's
+        // word; the lookup takes the program from it all the same.
+        let found = runs(line);
+        assert!(
+            found.iter().any(|run| run.starts_with("/opt/evil")),
+            "{line}: {found:?}"
+        );
+    }
+    // A quoted jq filter's `//` is no program.
+    assert!(runs(r#"X=$(echo "$I" | jq -r '(.a | .b) // ""')"#).is_empty());
 }
 
 #[test]
@@ -890,13 +938,23 @@ fn a_program_named_through_a_variable_is_said_to_be_unknown() {
         unwritten: std::cell::Cell::new(false),
         shell_scripts: std::cell::RefCell::default(),
     };
-    for command in ["$TOOLS/x.sh", "bash \"$X/y.sh\"", "$(dirname", "`pwd`/x"] {
+    for command in [
+        "$TOOLS/x.sh",
+        "bash \"$X/y.sh\"",
+        "$(dirname",
+        "`pwd`/x",
+        "$HOMEBREW_PREFIX/bin/brew",
+        "/opt/$V/run",
+        "~/.config/$X/init.sh",
+    ] {
         lookup.unwritten.set(false);
         lookup.targets(command);
         assert!(lookup.unwritten.get(), "{command}");
     }
     for command in [
         "$HOME/x.sh",
+        "${HOME}/x.sh",
+        "$XDG_CONFIG_HOME/x.sh",
         "/bin/x",
         "bash /x/y.sh",
         "x $FOO",
