@@ -645,10 +645,16 @@ mod tests {
     #[test]
     fn each_file_is_one_concern_under_its_worst_alert_and_the_worst_come_first() {
         let mut report = Report::default();
+        // The match's own severity counts, not the rule's (see
+        // `RuleId::severity_on`).
+        let graded_low = LocalFinding {
+            severity: Severity::Low,
+            ..local("~/b", RuleId::ShellCommandExecution)
+        };
         report.findings = vec![
             local("~/a", RuleId::ShellCommandExecution),
             local("~/a", RuleId::ShellCommandExecution),
-            local("~/b", RuleId::ShellCommandExecution),
+            graded_low,
         ];
         report.agent_runs.push(suspicious(vec![
             ai("~/a", Severity::High, "fetches and runs a script"),
@@ -671,13 +677,13 @@ mod tests {
             shown,
             [
                 ("~/a", Severity::High, "AI: fetches and runs a script", 3),
+                ("~/0", Severity::Low, "AI: turns a cooldown off", 1),
                 (
                     "~/b",
-                    RuleId::ShellCommandExecution.severity(),
+                    Severity::Low,
                     "local check shell-command-execution",
                     1
                 ),
-                ("~/0", Severity::Low, "AI: turns a cooldown off", 1),
             ]
         );
     }

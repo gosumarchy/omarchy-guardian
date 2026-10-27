@@ -965,8 +965,7 @@ fn keep_details(
     details: &crate::output::Held,
 ) -> Result<(), Error> {
     let directory = directory.ok_or_else(|| Error::Message("no state directory".into()))?;
-    let text =
-        crate::report::html::strip_ansi(&format!("{top}{}{}", details.stdout, details.stderr));
+    let text = crate::report::html::strip_ansi(&format!("{top}{}", details.text()));
     state::write_text(&directory.join(LAST_REPORT), &text)
 }
 
@@ -1008,11 +1007,13 @@ fn show_paged(text: &str) {
     let safe = crate::text::terminal_safe(text);
     if std::io::stdout().is_terminal() {
         // -F leaves at once when it fits one screen, -X keeps it on the
-        // screen after. LESSSECURE and no LESSOPEN or LESSCLOSE, so the
-        // environment cannot make less run a program of its choosing.
+        // screen after. LESSSECURE without LESSSECURE_ALLOW, and no
+        // LESSOPEN or LESSCLOSE, so the environment cannot make less run a
+        // program of its choosing.
         let child = Process::new(LESS)
             .args(["-F", "-X"])
             .env("LESSSECURE", "1")
+            .env_remove("LESSSECURE_ALLOW")
             .env_remove("LESSOPEN")
             .env_remove("LESSCLOSE")
             .stdin(Stdio::piped())
@@ -1205,13 +1206,14 @@ mod tests {
     fn the_full_report_is_kept_as_plain_text_only_the_user_reads() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        use crate::output::{Held, Stream};
         use crate::test_support::TempDir;
 
         let dir = TempDir::new("details");
-        let details = crate::output::Held {
-            stdout: "the rest\n".into(),
-            stderr: "  ! a gap\n".into(),
-        };
+        let details = Held(vec![
+            (Stream::Stdout, "the rest\n".into()),
+            (Stream::Stderr, "  ! a gap\n".into()),
+        ]);
         super::keep_details(Some(dir.path()), "\x1b[32m✓ CLEAR\x1b[0m\n", &details).unwrap();
         let path = dir.path().join(super::LAST_REPORT);
         assert_eq!(

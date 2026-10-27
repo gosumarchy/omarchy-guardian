@@ -27,16 +27,21 @@ static CAPTURED: Mutex<String> = Mutex::new(String::new());
 /// What is written while `held` runs: kept here, not shown.
 static HELD: Mutex<Option<Held>> = Mutex::new(None);
 
-/// What `held` kept from the terminal, by the stream it was written to.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct Held {
-    pub(crate) stdout: String,
-    pub(crate) stderr: String,
+/// What `held` kept from the terminal: each write with the stream it was
+/// meant for, in order.
+#[derive(Debug, Default)]
+pub(crate) struct Held(pub(crate) Vec<(Stream, String)>);
+
+impl Held {
+    /// Everything held, both streams, in the order it was written.
+    pub(crate) fn text(&self) -> String {
+        self.0.iter().map(|(_, text)| text.as_str()).collect()
+    }
 }
 
 /// The stream a write was meant for.
-#[derive(Clone, Copy)]
-enum Stream {
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Stream {
     Stdout,
     Stderr,
 }
@@ -79,9 +84,13 @@ pub(crate) fn held(print: impl FnOnce()) -> Held {
 /// Shows on the terminal what `held` returned, each part on the stream it
 /// was written to. It was captured when it was written, so it is not again.
 pub(crate) fn release(held: &Held) {
-    write_stdout(&held.stdout);
-    // A failed write to stderr has nowhere to be reported.
-    let _ = io::stderr().lock().write_all(held.stderr.as_bytes());
+    for (stream, text) in &held.0 {
+        match stream {
+            Stream::Stdout => write_stdout(text),
+            // A failed write to stderr has nowhere to be reported.
+            Stream::Stderr => drop(io::stderr().lock().write_all(text.as_bytes())),
+        }
+    }
 }
 
 /// Keeps `text` for `held` when it runs; returns whether it did.
@@ -90,10 +99,7 @@ fn hold(stream: Stream, text: &str) -> bool {
     let Some(held) = held.as_mut() else {
         return false;
     };
-    match stream {
-        Stream::Stdout => held.stdout.push_str(text),
-        Stream::Stderr => held.stderr.push_str(text),
-    }
+    held.0.push((stream, text.to_string()));
     true
 }
 
@@ -222,14 +228,15 @@ mod tests {
     /// `HELD` is global, so other tests printing meanwhile may land in it
     /// too; none checks what it prints, so only containment is asserted.
     #[test]
-    fn held_output_is_returned_by_stream_and_not_shown() {
+    fn held_output_is_returned_in_order_and_not_shown() {
         let kept = held(|| {
             outln!("to stdout");
             super::stderr_line(format_args!("to stderr"));
         });
-        assert!(kept.stdout.contains("to stdout\n"));
-        assert!(kept.stderr.contains("to stderr\n"));
-        assert!(!kept.stdout.contains("to stderr"));
+        let text = kept.text();
+        let stdout = text.find("to stdout\n").expect("stdout is held");
+        let stderr = text.find("to stderr\n").expect("stderr is held");
+        assert!(stdout < stderr, "held in the order written: {text}");
         assert!(super::captured().contains("to stdout\n"));
         assert!(super::HELD.lock().unwrap().is_none());
     }
