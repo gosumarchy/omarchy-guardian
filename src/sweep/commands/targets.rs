@@ -441,7 +441,23 @@ pub(crate) const MAX_SCRIPTS_BESIDE: usize = 8;
 /// What `expand` writes in (`~`, `$HOME`, the XDG directories at their
 /// default places) is known; `$HOMEBREW_PREFIX` is not.
 fn is_unwritten(home: &str, word: &str) -> bool {
-    expand(home, word).contains(['$', '`'])
+    let expanded = expand(home, word);
+    expanded.contains('`')
+        || expanded
+            .match_indices('$')
+            .any(|(at, _)| starts_expansion(&expanded[at + 1..]))
+}
+
+/// Whether a `$` followed by `after` starts an expansion: a name (`$X`,
+/// `$_x`), `${`, `$(`, a positional parameter (`$1`) or a special one
+/// (`$@`, `$*`, `$#`, `$?`, `$-`, `$$`, `$!`). Any other `$` is text a
+/// shell leaves as it is, as a regex's end anchor (`'s|/x$||'`,
+/// `'\.toml)$'`). The special parameters rarely hold a path, but they
+/// count, so that a `$` which may name one is never passed over. Quotes
+/// are gone by the time a word gets here, so a `$X` that was in single
+/// quotes counts too.
+pub(super) fn starts_expansion(after: &str) -> bool {
+    after.starts_with(|c: char| c.is_ascii_alphanumeric() || "_{(@*#?-$!".contains(c))
 }
 
 /// The most values of options that are looked at on the way to a script.

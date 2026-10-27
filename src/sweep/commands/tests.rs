@@ -1178,3 +1178,91 @@ fn a_script_an_interpreter_is_handed_by_name_is_found() {
         assert_eq!(runs(text), Vec::<String>::new(), "{text}");
     }
 }
+
+#[test]
+fn a_dollar_that_starts_no_expansion_names_no_variable() {
+    let lookup = super::Lookup {
+        home: "home/u",
+        search: &[],
+        exists: &|_| false,
+        capped: std::cell::Cell::new(false),
+        unwritten: std::cell::Cell::new(false),
+        shell_scripts: std::cell::RefCell::default(),
+    };
+    // Each word is where perl's script would be, so it is looked at.
+    for word in [
+        "$1/x", "${X}/x", "$(cmd)/x", "$@", "$_x/y", "a$?", "$$", "`pwd`/x",
+    ] {
+        let command = format!("perl -w '{word}'");
+        lookup.unwritten.set(false);
+        lookup.targets(&command);
+        assert!(lookup.unwritten.get(), "{command}");
+    }
+    // A regex's end anchor, or a `$` before a closing bracket, a slash or
+    // a quote, is no variable.
+    for word in [
+        "s|/[^/]*$||",
+        "/Cargo\\.toml)$",
+        "x$",
+        "a$)",
+        "[$]",
+        "$/x",
+        "a$\"b",
+    ] {
+        let command = format!("perl -w '{word}'");
+        lookup.unwritten.set(false);
+        lookup.targets(&command);
+        assert!(!lookup.unwritten.get(), "{command}");
+    }
+}
+
+#[test]
+fn code_handed_to_perl_is_no_script() {
+    let lookup = super::Lookup {
+        home: "home/u",
+        search: &[],
+        exists: &|path| path.starts_with("home/u/"),
+        capped: std::cell::Cell::new(false),
+        unwritten: std::cell::Cell::new(false),
+        shell_scripts: std::cell::RefCell::default(),
+    };
+    // The code after `-pe` names no variable, and the file after it is
+    // what the code reads.
+    assert!(lookup.targets("perl -pe 's/$x/y/' ~/notes.txt").is_empty());
+    assert!(!lookup.unwritten.get());
+    // A module whose name ends in `e` is no code: the script still runs.
+    assert_eq!(lookup.targets("perl -Mautodie ~/x.pl"), ["home/u/x.pl"]);
+}
+
+#[test]
+fn an_interpreter_is_handed_a_script_only_by_a_path() {
+    let runs = |text: &str| commands(Category::Shell, "home/u/x.sh", text);
+    // An argument with a `/` in it that reads as no path is no script.
+    for text in [
+        "perl -pe 's/(a)/b/'\n",
+        "perl -pe 's/a/b/' notes.txt\n",
+        "python3 -c 'print(1/2)'\n",
+        "bash x/y.sh\n",
+    ] {
+        assert_eq!(runs(text), Vec::<String>::new(), "{text}");
+    }
+    for (text, run) in [
+        ("perl ~/x.pl\n", "perl ~/x.pl"),
+        ("bash \"$DIR/x.sh\"\n", "bash $DIR/x.sh"),
+        ("bash \"${DIR}\"/x.sh\n", "bash ${DIR}/x.sh"),
+        ("bash ./x.sh\n", "bash ./x.sh"),
+        ("bash ../x.sh\n", "bash ../x.sh"),
+        ("bash \"$1/x.sh\"\n", "bash $1/x.sh"),
+        (
+            "bash \"$(dirname \"$0\")/x.sh\"\n",
+            "bash '$(dirname $0)/x.sh'",
+        ),
+    ] {
+        assert_eq!(runs(text), [run], "{text}");
+    }
+    let ticked = runs("bash \"`pwd`/x.sh\"\n");
+    assert!(
+        ticked.iter().any(|run| run == "bash `pwd`/x.sh"),
+        "{ticked:?}"
+    );
+}

@@ -142,7 +142,11 @@ follows:
   programs its statements start by a path (on lines up to 64 KB), and the
   script it hands an interpreter (`bash "$DIR/x.sh"`, `/usr/bin/env python3
   /opt/x/check.py`, also inside `$(…)`; not awk, whose first operand is its
-  program);
+  program). The script must read as a path: starting with `/`, `~/`, `./`,
+  `../`, or a variable or substitution before a `/` (`$DIR/x`, `${DIR}/x`);
+  an argument that only holds a `/` (perl's `'s/a/b/'`) is no script, and
+  nothing after code given on the command line (perl's `-e`, `-pe`, `-lne`)
+  is taken as one;
 - into the scripts a wrapper is handed beside the script it runs (`bash
   ~/p/wrap.sh ~/p/hook.py`): only files in that same directory with a
   script's extension (`.sh`, `.py`, `.js`, `.pl`, `.rb`, `.lua`, `.php` and
@@ -179,7 +183,10 @@ as more than one word.
 Other variables are not understood: a program or script whose path holds one
 anywhere (`$PREFIX/bin/x`, `/opt/$V/run`, `"$1/x"`), or a substitution
 (`"$(dirname "$1")/x"`, sourced or run), is not followed, and the item says
-that what it runs was not all followed. In a shell script, a command named
+that what it runs was not all followed. A `$` counts only where it starts an
+expansion: before a letter, a digit, `_`, `{`, `(` or one of `@*#?-$!`. A
+regex's end anchor (`'s|/x$||'`, `'\.toml)$'`) is no variable. In a shell
+script, a command named
 that way is only taken from a line that starts statements: not from the
 arguments on a line after one ending in `\`, the text of a here-document, a
 `[[ … ]]` test or `(( … ))` arithmetic, where such a word is an argument far

@@ -12,13 +12,13 @@ use crate::paths::file_name;
 
 use shell::{LineStarts, path_variables, sourced, started, without_case_patterns, zdotdir};
 pub(super) use shell::{is_shell_script, sourced_files, with_script_directory};
-use targets::split;
 pub(super) use targets::{
     Lookup, MAX_GLOB, MAX_INNER_COMMANDS, MAX_OPTION_VALUES, MAX_SCRIPTS_BESIDE, default_search,
     expand, glob_targets, split_commands,
 };
 #[cfg(test)]
 use targets::{inner_commands, targets, targets_where};
+use targets::{split, starts_expansion};
 
 /// Whether `path` (relative to the root) is the script the SSH server runs
 /// at every login: `~/.ssh/rc` or `/etc/ssh/sshrc`. It is a shell script,

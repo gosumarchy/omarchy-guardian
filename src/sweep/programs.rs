@@ -219,7 +219,13 @@ pub(super) fn takes_code(name: &str, option: &str) -> bool {
     } else if is(&["node", "bun", "deno"]) {
         matches!(option, "-e" | "-p" | "--eval" | "--print")
     } else if is(&["perl"]) {
-        matches!(option, "-e" | "-E")
+        // `-e` may close a cluster of switches (`-pe`, `-lne`, `-lane`).
+        // Only switches that take no value count: in `-Mautodie` the `e`
+        // ends a module's name, and a script may follow.
+        option
+            .strip_prefix('-')
+            .and_then(|switches| switches.strip_suffix(['e', 'E']))
+            .is_some_and(|before| before.chars().all(|c| "alnpw".contains(c)))
     } else if is(&["awk", "gawk", "mawk"]) {
         matches!(option, "-e" | "--source")
     } else {
@@ -520,6 +526,12 @@ mod tests {
             ("node", "--eval", true),
             ("node", "-p", true),
             ("gawk", "--source", true),
+            ("perl", "-pe", true),
+            ("perl", "-lane", true),
+            ("perl", "-wE", true),
+            ("perl", "-Mautodie", false),
+            ("perl", "-i.bake", false),
+            ("perl", "-w", false),
             ("ruby", "-e", true),
             ("bash", "-e", false),
             ("tcsh", "-e", false),
