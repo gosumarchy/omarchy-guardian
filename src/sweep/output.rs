@@ -113,12 +113,11 @@ struct Concern {
     alerts: usize,
 }
 
-/// The files the review raised alerts on, worst first: the local checks,
-/// the AI's findings (not its remarks, which are no alerts) and the
-/// dependency advisories, one entry per file.
+/// The files the review raised alerts on (see `Report::alerts`), worst
+/// first, one entry per file.
 fn concerns(report: &Report) -> Vec<(String, Concern)> {
     let mut by_file: BTreeMap<String, Concern> = BTreeMap::new();
-    let mut add = |file: &str, severity: Severity, why: String| {
+    for (file, severity, why) in report.alerts() {
         let concern = by_file.entry(file.to_string()).or_insert(Concern {
             severity,
             why: why.clone(),
@@ -129,30 +128,6 @@ fn concerns(report: &Report) -> Vec<(String, Concern)> {
             concern.severity = severity;
             concern.why = why;
         }
-    };
-    for finding in &report.findings {
-        add(
-            &finding.path,
-            finding.rule.severity(),
-            format!("local check {}", finding.rule.name()),
-        );
-    }
-    for finding in report.agent_findings(false) {
-        add(
-            &finding.file,
-            finding.severity,
-            format!("AI: {}", finding.title),
-        );
-    }
-    for advisory in report.audit.iter().flat_map(|audit| &audit.advisories) {
-        add(
-            &advisory.lockfile,
-            advisory.severity.unwrap_or(Severity::Medium),
-            format!(
-                "{} in {} {}",
-                advisory.id, advisory.package, advisory.version
-            ),
-        );
     }
     let mut concerns: Vec<(String, Concern)> = by_file.into_iter().collect();
     concerns.sort_by_key(|(_, concern)| concern.severity);
@@ -405,21 +380,18 @@ pub(super) fn print(collection: &Collection, report: &Report, home: Option<&str>
     }
 }
 
-/// Notes on what the sweep could not check, as a list.
-pub(super) fn print_notes(notes: &[String]) {
+/// Notes on what the sweep could not check, as a list; empty when there
+/// are none.
+pub(super) fn notes_text(notes: &[String]) -> String {
     if notes.is_empty() {
-        return;
+        return String::new();
     }
-    let painter = Painter::for_stdout();
     let spans: Vec<Span> = notes
         .iter()
         .map(|note| Span::new(format!("• {}", shown(note)), "33"))
         .collect();
-    outln!();
-    outln!(
-        "{}",
-        layout::fields(&[("Notes", spans)], layout::width(), painter)
-    );
+    let fields = layout::fields(&[("Notes", spans)], layout::width(), Painter::for_stdout());
+    format!("\n{fields}\n")
 }
 
 /// What changed since the last sweep, in a box with a table below.
@@ -568,7 +540,7 @@ fn findings_json(report: &Report) -> Json {
             ("rule", Json::from(finding.rule.name())),
             (
                 "severity",
-                Json::from(finding.rule.severity().label().to_ascii_lowercase()),
+                Json::from(finding.severity.label().to_ascii_lowercase()),
             ),
         ])
     });
@@ -621,12 +593,13 @@ fn reviews_json(report: &Report) -> Json {
 mod tests {
     use std::collections::{BTreeMap, HashSet};
 
-    use super::{SHOWN_CONCERNS, attention, concerns, items_html, not_reviewed};
+    use super::{SHOWN_CONCERNS, attention, concerns, findings_json, items_html, not_reviewed};
     use crate::agent::{AgentFinding, AgentReview, Status};
     use crate::autorun::Category;
     use crate::error::Error;
     use crate::layout::Painter;
-    use crate::report::{AgentOutcome, AgentRun, Gap, LocalFinding, Report, Severity};
+    use crate::report::{AgentOutcome, AgentRun, Gap, LocalFinding, Report, ReviewScope, Severity};
+    use crate::review::analyze_text_locally;
     use crate::rules::RuleId;
     use crate::sweep::collect::{Body, Item, Origin};
     use crate::sweep::tier::Tier;
@@ -636,6 +609,7 @@ mod tests {
             path: path.into(),
             line: 1,
             rule,
+            severity: rule.severity(),
             excerpt: String::new(),
         }
     }
@@ -746,6 +720,25 @@ mod tests {
             text.contains("Not reviewed") && text.contains("! AI review: "),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_finding_carries_the_severity_of_its_match() {
+        let mut report = Report::new("sweep", ReviewScope::default());
+        analyze_text_locally(
+            &mut report,
+            "~/.config/hooks/hook.py",
+            "subprocess.run([\"git\", \"status\"])\nsubprocess.run(cmd, shell=True)\n",
+        );
+        let json = findings_json(&report);
+        let severities: Vec<&str> = json
+            .as_array()
+            .expect("findings_json returns an array")
+            .iter()
+            .map(|finding| finding.get("severity").and_then(|value| value.as_str()))
+            .collect::<Option<_>>()
+            .expect("every finding has a severity");
+        assert_eq!(severities, ["low", "medium"]);
     }
 
     #[test]

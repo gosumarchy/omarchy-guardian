@@ -25,7 +25,21 @@ static DIVERTED: AtomicBool = AtomicBool::new(false);
 static CAPTURED: Mutex<String> = Mutex::new(String::new());
 
 /// What is written while `held` runs: kept here, not shown.
-static HELD: Mutex<Option<String>> = Mutex::new(None);
+static HELD: Mutex<Option<Held>> = Mutex::new(None);
+
+/// What `held` kept from the terminal, by the stream it was written to.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Held {
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+}
+
+/// The stream a write was meant for.
+#[derive(Clone, Copy)]
+enum Stream {
+    Stdout,
+    Stderr,
+}
 
 /// At most this much output is kept; a report is far smaller.
 const MAX_CAPTURED: usize = 1024 * 1024;
@@ -48,10 +62,13 @@ pub(crate) fn captured() -> String {
 
 /// Runs `print` with what it writes to stdout, and through `stderr_line`,
 /// kept from the terminal, and returns that text. It is captured all the
-/// same, so a report saved afterwards holds it. Not nested: a `held` inside
-/// another returns its text to the outer one's.
-pub(crate) fn held(print: impl FnOnce()) -> String {
-    *HELD.lock().unwrap_or_else(PoisonError::into_inner) = Some(String::new());
+/// same, so a report saved afterwards holds it. Must not be nested.
+pub(crate) fn held(print: impl FnOnce()) -> Held {
+    let previous = HELD
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .replace(Held::default());
+    assert!(previous.is_none(), "output::held must not be nested");
     print();
     HELD.lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -59,15 +76,25 @@ pub(crate) fn held(print: impl FnOnce()) -> String {
         .unwrap_or_default()
 }
 
+/// Shows on the terminal what `held` returned, each part on the stream it
+/// was written to. It was captured when it was written, so it is not again.
+pub(crate) fn release(held: &Held) {
+    write_stdout(&held.stdout);
+    // A failed write to stderr has nowhere to be reported.
+    let _ = io::stderr().lock().write_all(held.stderr.as_bytes());
+}
+
 /// Keeps `text` for `held` when it runs; returns whether it did.
-fn hold(text: &str) -> bool {
-    match HELD.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
-        Some(held) => {
-            held.push_str(text);
-            true
-        }
-        None => false,
+fn hold(stream: Stream, text: &str) -> bool {
+    let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(held) = held.as_mut() else {
+        return false;
+    };
+    match stream {
+        Stream::Stdout => held.stdout.push_str(text),
+        Stream::Stderr => held.stderr.push_str(text),
     }
+    true
 }
 
 /// Like `eprintln!`, and kept with the captured output.
@@ -75,7 +102,7 @@ pub(crate) fn stderr_line(args: fmt::Arguments) {
     let line = format!("{args}\n");
     let safe = crate::text::terminal_safe(&line);
     capture(format_args!("{safe}"));
-    if hold(&safe) {
+    if hold(Stream::Stderr, &safe) {
         return;
     }
     // A failed write to stderr has nowhere to be reported.
@@ -130,16 +157,10 @@ pub(crate) fn stdout(args: fmt::Arguments) {
     let text = args.to_string();
     let safe = crate::text::terminal_safe(&text);
     capture(format_args!("{safe}"));
-    if hold(&safe) {
+    if hold(Stream::Stdout, &safe) {
         return;
     }
     write_stdout(&safe);
-}
-
-/// Shows on the terminal what `held` returned. It was captured when it was
-/// written, so it is not again.
-pub(crate) fn release(held: &str) {
-    write_stdout(held);
 }
 
 fn write_stdout(safe: &str) {
@@ -168,7 +189,7 @@ fn write_ignoring_broken_pipe(writer: &mut impl Write, args: fmt::Arguments) -> 
 mod tests {
     use std::io::{self, ErrorKind, Write};
 
-    use super::write_ignoring_broken_pipe;
+    use super::{held, write_ignoring_broken_pipe};
 
     struct Failing(ErrorKind);
 
@@ -196,5 +217,20 @@ mod tests {
         let mut buffer = Vec::new();
         write_ignoring_broken_pipe(&mut buffer, format_args!("{}-{}", 1, 2)).unwrap();
         assert_eq!(buffer, b"1-2");
+    }
+
+    /// `HELD` is global, so other tests printing meanwhile may land in it
+    /// too; none checks what it prints, so only containment is asserted.
+    #[test]
+    fn held_output_is_returned_by_stream_and_not_shown() {
+        let kept = held(|| {
+            outln!("to stdout");
+            super::stderr_line(format_args!("to stderr"));
+        });
+        assert!(kept.stdout.contains("to stdout\n"));
+        assert!(kept.stderr.contains("to stderr\n"));
+        assert!(!kept.stdout.contains("to stderr"));
+        assert!(super::captured().contains("to stdout\n"));
+        assert!(super::HELD.lock().unwrap().is_none());
     }
 }

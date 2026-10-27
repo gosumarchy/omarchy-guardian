@@ -367,7 +367,7 @@ impl Report {
                     what.push(Span::new(shown(&finding.excerpt), "2"));
                 }
                 table.row(vec![
-                    severity(finding.rule.severity()),
+                    severity(finding.severity),
                     vec![Span::plain(format!(
                         "{}:{}",
                         shown(&finding.path),

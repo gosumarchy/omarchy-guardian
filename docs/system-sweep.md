@@ -1925,8 +1925,9 @@ omarchy-guardian status --dismiss                      # clear the bar's alert
 A sweep prints one box with the verdict, the alerts and how much of the
 system is trusted, then up to 10 files the review raised alerts on (worst
 first, one line each, with how many alerts each has) and up to 3 reasons the
-review is incomplete. Everything else, the review's fields, the findings, the
-table of items for each area and the notes, goes to the full report:
+review is incomplete, and the notes on what the sweep could not check.
+Everything else, the review's fields, the findings and the table of items for
+each area, goes to the full report:
 `sweep details` shows it, through `less` in a terminal. It is one file,
 `last-report.txt` in the sweep's state directory (readable only by you),
 replaced at each sweep run in a terminal; the daily timer's sweep leaves it

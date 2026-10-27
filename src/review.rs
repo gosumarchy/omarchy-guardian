@@ -269,6 +269,7 @@ fn git_config_findings(report: &mut Report, rel: &str, text: &str) {
             path: rel.to_string(),
             line,
             rule: RuleId::GitConfigCommand,
+            severity: RuleId::GitConfigCommand.severity(),
             excerpt: self::excerpt(&excerpt),
         });
     }
@@ -322,6 +323,7 @@ fn analyze_reviewer_text(report: &mut Report, rel: &str, text: &str) {
             path: rel.to_string(),
             line,
             rule: RuleId::ReviewerInstruction,
+            severity: RuleId::ReviewerInstruction.severity(),
             excerpt: self::excerpt(&excerpt),
         });
     }
@@ -335,6 +337,7 @@ fn analyze_hidden_characters(report: &mut Report, rel: &str, text: &str) {
             path: rel.to_string(),
             line: found.line,
             rule: found.rule,
+            severity: found.rule.severity(),
             excerpt: excerpt(&found.excerpt),
         });
     }
@@ -387,7 +390,7 @@ pub(crate) fn analyze_upstream(report: &mut Report, rel: &str, text: &str) -> bo
         apply_rules(report, rel, text, false);
     }
     let mut found = report.findings.split_off(before);
-    found.retain(|finding| finding.rule.severity() == crate::report::Severity::High);
+    found.retain(|finding| finding.severity == crate::report::Severity::High);
     report.findings.append(&mut found);
     false
 }

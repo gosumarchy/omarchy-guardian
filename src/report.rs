@@ -280,6 +280,9 @@ pub(crate) struct LocalFinding {
     pub(crate) path: String,
     pub(crate) line: usize,
     pub(crate) rule: RuleId,
+    /// The rule's severity, or lower where the rule grades its matches by
+    /// the line (see `RuleId::severity_on`).
+    pub(crate) severity: Severity,
     pub(crate) excerpt: String,
 }
 
@@ -687,7 +690,7 @@ impl Report {
         lines.extend(self.findings.iter().map(|finding| {
             format!(
                 "{} {}:{} {}",
-                finding.rule.severity().label(),
+                finding.severity.label(),
                 finding.path,
                 finding.line,
                 finding.rule.name()
@@ -735,7 +738,7 @@ impl Report {
 
     /// The AI's findings in report order: those that are remarks (see
     /// `is_remarks`), or those that are not.
-    pub(crate) fn agent_findings(&self, remarks: bool) -> impl Iterator<Item = &AgentFinding> {
+    fn agent_findings(&self, remarks: bool) -> impl Iterator<Item = &AgentFinding> {
         self.agent_runs
             .iter()
             .filter(move |run| self.is_remarks(run) == remarks)
@@ -745,19 +748,46 @@ impl Report {
             })
     }
 
-    /// The alerts by severity. Dependency advisories without a known
-    /// severity count as medium; the AI's remarks are counted apart (see
-    /// `remark_count`).
+    /// Every alert: the file it is about, its severity and what it is.
+    /// Dependency advisories without a known severity count as medium; the
+    /// AI's remarks are no alerts (see `remark_count`).
+    pub(crate) fn alerts(&self) -> impl Iterator<Item = (&str, Severity, String)> {
+        let local = self.findings.iter().map(|finding| {
+            (
+                finding.path.as_str(),
+                finding.severity,
+                format!("local check {}", finding.rule.name()),
+            )
+        });
+        let ai = self.agent_findings(false).map(|finding| {
+            (
+                finding.file.as_str(),
+                finding.severity,
+                format!("AI: {}", finding.title),
+            )
+        });
+        let advisories = self
+            .audit
+            .iter()
+            .flat_map(|audit| &audit.advisories)
+            .map(|advisory| {
+                (
+                    advisory.lockfile.as_str(),
+                    advisory.severity.unwrap_or(Severity::Medium),
+                    format!(
+                        "{} in {} {}",
+                        advisory.id, advisory.package, advisory.version
+                    ),
+                )
+            });
+        local.chain(ai).chain(advisories)
+    }
+
+    /// The alerts by severity.
     fn counts(&self) -> Counts {
         let mut counts = Counts::default();
-        for finding in &self.findings {
-            counts.add(finding.rule.severity());
-        }
-        for finding in self.agent_findings(false) {
-            counts.add(finding.severity);
-        }
-        for advisory in self.audit.iter().flat_map(|audit| &audit.advisories) {
-            counts.add(advisory.severity.unwrap_or(Severity::Medium));
+        for (_, severity, _) in self.alerts() {
+            counts.add(severity);
         }
         counts
     }

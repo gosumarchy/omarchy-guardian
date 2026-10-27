@@ -899,7 +899,7 @@ fn show(options: Options, shown: &Shown<'_>) {
     }
     if options.scheduled {
         output::print_changes(shown.changes);
-        output::print_notes(shown.notes);
+        out!("{}", output::notes_text(shown.notes));
         shown.report.print(shown.decision, Hashes::Hidden, None);
         return;
     }
@@ -911,7 +911,10 @@ fn show(options: Options, shown: &Shown<'_>) {
         shown.home,
         changes,
     );
-    out!("{summary}");
+    // The notes stay on screen: they say what the sweep could not check,
+    // and a fact said once (see `said_once`) is not said at the next sweep.
+    let top = format!("{summary}{}", output::notes_text(shown.notes));
+    out!("{top}");
     if options.view == View::Changes {
         output::print_changes_table(shown.changes);
     }
@@ -929,9 +932,8 @@ fn show(options: Options, shown: &Shown<'_>) {
                 options.view == View::All,
             );
         }
-        output::print_notes(shown.notes);
     });
-    match keep_details(shown.directory, &summary, &details) {
+    match keep_details(shown.directory, &top, &details) {
         Ok(()) => {
             if options.view == View::All {
                 crate::output::release(&details);
@@ -955,11 +957,16 @@ fn show(options: Options, shown: &Shown<'_>) {
     }
 }
 
-/// Keeps the summary and the full report, as plain text, for `sweep
-/// details`.
-fn keep_details(directory: Option<&Path>, summary: &str, details: &str) -> Result<(), Error> {
+/// Keeps what was shown on top and the full report, as plain text, for
+/// `sweep details`.
+fn keep_details(
+    directory: Option<&Path>,
+    top: &str,
+    details: &crate::output::Held,
+) -> Result<(), Error> {
     let directory = directory.ok_or_else(|| Error::Message("no state directory".into()))?;
-    let text = crate::report::html::strip_ansi(&format!("{summary}{details}"));
+    let text =
+        crate::report::html::strip_ansi(&format!("{top}{}{}", details.stdout, details.stderr));
     state::write_text(&directory.join(LAST_REPORT), &text)
 }
 
@@ -991,8 +998,9 @@ fn details() -> ExitCode {
 /// any program ahead of it, which is what the sweep looks for.
 const LESS: &str = "/usr/bin/less";
 
-/// Shows `text` through `less` when standard output is a terminal and
-/// `less` runs; prints it otherwise.
+/// Shows `text` through `less` when standard output is a terminal; prints
+/// it when `less` cannot start or fails. A reader who quits early ends
+/// `less` with success, so only a failure prints the text again.
 fn show_paged(text: &str) {
     use std::io::{IsTerminal as _, Write as _};
     use std::process::{Command as Process, Stdio};
@@ -1000,18 +1008,23 @@ fn show_paged(text: &str) {
     let safe = crate::text::terminal_safe(text);
     if std::io::stdout().is_terminal() {
         // -F leaves at once when it fits one screen, -X keeps it on the
-        // screen after.
+        // screen after. LESSSECURE and no LESSOPEN or LESSCLOSE, so the
+        // environment cannot make less run a program of its choosing.
         let child = Process::new(LESS)
             .args(["-F", "-X"])
+            .env("LESSSECURE", "1")
+            .env_remove("LESSOPEN")
+            .env_remove("LESSCLOSE")
             .stdin(Stdio::piped())
             .spawn();
         if let Ok(mut child) = child {
             if let Some(mut input) = child.stdin.take() {
-                // The reader quitting early closes the pipe; that is no error.
+                // Quitting early closes the pipe; the exit status says the rest.
                 drop(input.write_all(safe.as_bytes()));
             }
-            drop(child.wait());
-            return;
+            if child.wait().is_ok_and(|status| status.success()) {
+                return;
+            }
         }
     }
     out!("{safe}");
@@ -1195,16 +1208,20 @@ mod tests {
         use crate::test_support::TempDir;
 
         let dir = TempDir::new("details");
-        super::keep_details(Some(dir.path()), "\x1b[32m✓ CLEAR\x1b[0m\n", "the rest\n").unwrap();
+        let details = crate::output::Held {
+            stdout: "the rest\n".into(),
+            stderr: "  ! a gap\n".into(),
+        };
+        super::keep_details(Some(dir.path()), "\x1b[32m✓ CLEAR\x1b[0m\n", &details).unwrap();
         let path = dir.path().join(super::LAST_REPORT);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "✓ CLEAR\nthe rest\n"
+            "✓ CLEAR\nthe rest\n  ! a gap\n"
         );
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
 
-        assert!(super::keep_details(None, "x", "y").is_err());
+        assert!(super::keep_details(None, "x", &details).is_err());
     }
 
     #[test]

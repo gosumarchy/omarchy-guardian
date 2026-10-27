@@ -6,6 +6,7 @@ use super::{
     RuleId, Scheme, extract_network_destinations, is_documentation, is_download_piped_to_shell,
     is_ip_host, is_sensitive_path, line_rules, looks_like_credential_exfiltration,
 };
+use crate::report::Severity;
 use crate::test_support::CpuInstant;
 
 fn rules_for(line: &str) -> Vec<RuleId> {
@@ -666,6 +667,56 @@ fn packaged_startup_files_are_not_persistence() {
             "{persistence}"
         );
     }
+}
+
+#[test]
+fn a_subprocess_call_is_low_unless_it_passes_a_shell() {
+    let severity = |line: &str| {
+        assert!(
+            rules_for(line).contains(&RuleId::ShellCommandExecution),
+            "{line}"
+        );
+        RuleId::ShellCommandExecution.severity_on(&line.to_lowercase())
+    };
+    for line in [
+        "subprocess.run([\"git\", \"status\"], check=True)",
+        "out = subprocess.check_output([\"hyprctl\", \"-j\", \"monitors\"])",
+        "subprocess.Popen(args, shell=False)",
+        "subprocess.call(cmd, shell = False, cwd=root)",
+        "subprocess.run(cmd, use_shell=True)",
+        "subprocess.run(cmd, env={\"SHELL\": \"/bin/zsh\"})",
+        "if shell == True: subprocess.run(args)",
+        // The accepted downside: `shell=True` on a later line of the call
+        // is not seen, so the call is rated low (and still reported).
+        "subprocess.run(",
+    ] {
+        assert_eq!(severity(line), Severity::Low, "{line}");
+    }
+    for line in [
+        "subprocess.run(cmd, shell=True)",
+        "subprocess.check_call(cmd, shell = True)",
+        "subprocess.Popen(cmd, shell=1)",
+        "subprocess.run(cmd, shell=use_shell)",
+        "subprocess.run(cmd, shell=False_ish)",
+        // Another of the rule's patterns on the line keeps the rule's own
+        // severity.
+        "subprocess.run([\"ls\"]); os.system(cmd)",
+        "os.system(cmd)",
+        "os.popen(cmd)",
+        "eval(payload)",
+    ] {
+        assert_eq!(severity(line), Severity::Medium, "{line}");
+    }
+    // A line without a `subprocess` call is not graded down.
+    assert_eq!(
+        RuleId::ShellCommandExecution.severity_on("no call here"),
+        Severity::Medium
+    );
+    // Every other rule keeps its own severity on any line.
+    assert_eq!(
+        RuleId::DownloadAndExecute.severity_on("subprocess.run([\"x\"])"),
+        Severity::High
+    );
 }
 
 #[test]
