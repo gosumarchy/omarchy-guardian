@@ -42,7 +42,7 @@ impl Severity {
         }
     }
 
-    const fn color(self) -> &'static str {
+    pub(crate) const fn color(self) -> &'static str {
         match self {
             Self::High => "31;1",
             Self::Medium => "33;1",
@@ -735,7 +735,7 @@ impl Report {
 
     /// The AI's findings in report order: those that are remarks (see
     /// `is_remarks`), or those that are not.
-    fn agent_findings(&self, remarks: bool) -> impl Iterator<Item = &AgentFinding> {
+    pub(crate) fn agent_findings(&self, remarks: bool) -> impl Iterator<Item = &AgentFinding> {
         self.agent_runs
             .iter()
             .filter(move |run| self.is_remarks(run) == remarks)

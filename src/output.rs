@@ -24,6 +24,9 @@ static DIVERTED: AtomicBool = AtomicBool::new(false);
 /// report can be saved for the notification to open.
 static CAPTURED: Mutex<String> = Mutex::new(String::new());
 
+/// What is written while `held` runs: kept here, not shown.
+static HELD: Mutex<Option<String>> = Mutex::new(None);
+
 /// At most this much output is kept; a report is far smaller.
 const MAX_CAPTURED: usize = 1024 * 1024;
 
@@ -43,13 +46,40 @@ pub(crate) fn captured() -> String {
         .clone()
 }
 
+/// Runs `print` with what it writes to stdout, and through `stderr_line`,
+/// kept from the terminal, and returns that text. It is captured all the
+/// same, so a report saved afterwards holds it. Not nested: a `held` inside
+/// another returns its text to the outer one's.
+pub(crate) fn held(print: impl FnOnce()) -> String {
+    *HELD.lock().unwrap_or_else(PoisonError::into_inner) = Some(String::new());
+    print();
+    HELD.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+        .unwrap_or_default()
+}
+
+/// Keeps `text` for `held` when it runs; returns whether it did.
+fn hold(text: &str) -> bool {
+    match HELD.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
+        Some(held) => {
+            held.push_str(text);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Like `eprintln!`, and kept with the captured output.
 pub(crate) fn stderr_line(args: fmt::Arguments) {
     let line = format!("{args}\n");
     let safe = crate::text::terminal_safe(&line);
+    capture(format_args!("{safe}"));
+    if hold(&safe) {
+        return;
+    }
     // A failed write to stderr has nowhere to be reported.
     let _ = io::stderr().lock().write_all(safe.as_bytes());
-    capture(format_args!("{safe}"));
 }
 
 /// Like `eprint!`, with terminal control sequences shown as codes.
@@ -100,6 +130,19 @@ pub(crate) fn stdout(args: fmt::Arguments) {
     let text = args.to_string();
     let safe = crate::text::terminal_safe(&text);
     capture(format_args!("{safe}"));
+    if hold(&safe) {
+        return;
+    }
+    write_stdout(&safe);
+}
+
+/// Shows on the terminal what `held` returned. It was captured when it was
+/// written, so it is not again.
+pub(crate) fn release(held: &str) {
+    write_stdout(held);
+}
+
+fn write_stdout(safe: &str) {
     if DIVERTED.load(Ordering::Relaxed) {
         // A failed write to stderr has nowhere to be reported.
         let _ = io::stderr().lock().write_all(safe.as_bytes());
