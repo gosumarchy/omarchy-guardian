@@ -395,6 +395,8 @@ pub(crate) struct Matches {
     pub(super) unnamed: Vec<String>,
     /// Directories that exist but could not be listed.
     pub(crate) unreadable: Vec<String>,
+    /// Directories that were listed to look for a match.
+    pub(super) listed: Vec<String>,
 }
 
 /// The most paths one pattern may match.
@@ -430,6 +432,7 @@ pub(crate) fn matching(root: &Path, pattern: &str) -> Matches {
                     continue;
                 }
             };
+            found.listed.push(base.clone());
             for entry in listing.filter_map(Result::ok) {
                 let Some(entry_name) = entry.file_name().to_str().map(str::to_string) else {
                     found

@@ -272,7 +272,11 @@ shells, udev and pacman read such names all the same: the sweep says so and is
 catalogue matches more than 500 files, when there are more than 2,000,000
 files to look through for setuid programs, when `getcap` is missing, fails
 (any exit but 0, or a signal) or times out, when a package's record cannot be
-read, and when the root checks found more than 5,000 items.
+read, and when the root checks found more than 5,000 items. A directory a
+pattern of the catalogue passes through that cannot be listed (`/boot/EFI`,
+mounted for root alone, for `/boot/EFI/*/refind.conf`) makes it incomplete
+too, unless the root checks' results are in and say root listed that
+directory (see [Root checks](#root-checks)).
 
 ### Programs ahead of the system's own
 
@@ -1724,6 +1728,13 @@ Of the auto-run files, root's view only fills in what your own sweep could not
 read (root's results may be a day old); of what runs now, it adds what it saw
 of every account's processes.
 
+Root's results also name each directory root listed for a pattern of the
+catalogue. A directory your own sweep could not list is taken as looked at
+only when it is among them: root looked there for every match and handed back
+each one no package vouches for. Root having run is not enough, since it may
+not have listed that directory either, and then its results say so as a gap
+of their own. At most 5,000 directories are named; one left out stays a gap.
+
 ### Paths a user can point root at
 
 Where a user decides what is named (a crontab or other file that is not root's
@@ -1870,7 +1881,8 @@ Guardian left there):
 Results written by an older Guardian are still read, but count for less: what
 your own sweep leaves to the root checks stays marked as not covered, with a
 note, until the collector has run again. Results written before the collector compared the
-EFI programs in `/boot` count as such. Results of a version this Guardian
+EFI programs in `/boot` count as such. Results written before the collector named the
+directories it listed cover none that your sweep could not list. Results of a version this Guardian
 does not know are not read at all, and the sweep says to reinstall.
 
 The results file makes the root-only items it lists (a sudoers drop-in no

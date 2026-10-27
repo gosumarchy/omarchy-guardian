@@ -54,6 +54,9 @@ pub(crate) struct RootPart {
     /// What the live checks say of the system as a whole (a tainted
     /// kernel, modules no package installed).
     pub(crate) notes: Vec<String>,
+    /// The directories the collector listed for the auto-run patterns
+    /// (see `Collection::listed`).
+    pub(crate) listed: Vec<String>,
     /// Written by an older collector, which did not run every check this
     /// one does: what the user's own sweep leaves to the root checks is not
     /// covered by these results.
@@ -503,6 +506,19 @@ pub(super) fn merge(collection: &mut Collection, part: RootPart) {
             || !matches!(item.body, Body::Unreadable(_))
     });
     collect::merge(collection, part.items);
+    // A directory the user could not list is looked at when root listed
+    // it: root looked there for every pattern match, and its results hold
+    // each one no package vouches for. Root having run is not enough; it
+    // may not have been able to list it either. The results name the
+    // directory, not the pattern it was listed for: the collector runs the
+    // same catalogue as this sweep, and only results written before an
+    // update that added a pattern through a directory the user cannot list
+    // could stand for a pattern root did not run. That lasts only until the
+    // collector runs again (results are used for 36 hours at most), so the
+    // pattern is not named as well.
+    collection
+        .unlisted
+        .retain(|directory| !part.listed.contains(directory));
     collection.truncated.extend(part.truncated);
     collection.root_news = part.news;
 }

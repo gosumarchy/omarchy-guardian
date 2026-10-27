@@ -240,12 +240,31 @@ pub(super) struct Collection {
     /// What was not looked at, each as a sentence: a location with more
     /// entries than the limit, a name that cannot be read.
     pub(super) truncated: Vec<String>,
+    /// Directories an auto-run pattern passes through that exist but could
+    /// not be listed (`boot/EFI` for a user): not looked at either, unless
+    /// root's results cover them (see `root::merge`).
+    pub(super) unlisted: Vec<String>,
+    /// Directories an auto-run pattern passes through that were listed:
+    /// what root's results say they cover.
+    pub(super) listed: Vec<String>,
     /// What is said of the system as a whole (Secure Boot is off).
     pub(super) notes: Vec<String>,
     /// The paths of root's accounts, members, keys and trust anchors that
     /// the root collector says are new, when it kept track itself (see
     /// `root::news`); `None` when it did not.
     pub(super) root_news: Option<Vec<String>>,
+}
+
+impl Collection {
+    /// What was not looked at, each as a sentence: `truncated`, and each
+    /// directory in `unlisted`.
+    pub(super) fn not_looked_at(&self) -> Vec<String> {
+        let unlisted = self
+            .unlisted
+            .iter()
+            .map(|directory| format!("/{directory}: could not be listed"));
+        self.truncated.iter().cloned().chain(unlisted).collect()
+    }
 }
 
 /// What a collection runs against.
@@ -262,7 +281,7 @@ pub(super) fn collect(scope: &Scope<'_>) -> Collection {
     let mut paths: BTreeMap<String, Category> = BTreeMap::new();
     let mut collection = Collection::default();
     for location in SYSTEM.iter().chain(SYSTEM_SWEEP) {
-        add_location(scope, location, "", &mut paths, &mut collection.truncated);
+        add_location(scope, location, "", &mut paths, &mut collection);
     }
     if let Some(home) = scope.home {
         for location in USER {
@@ -271,7 +290,7 @@ pub(super) fn collect(scope: &Scope<'_>) -> Collection {
                 location,
                 &format!("{home}/"),
                 &mut paths,
-                &mut collection.truncated,
+                &mut collection,
             );
         }
     }
@@ -769,21 +788,18 @@ fn add_location(
     location: &Location,
     prefix: &str,
     paths: &mut BTreeMap<String, Category>,
-    truncated: &mut Vec<String>,
+    collection: &mut Collection,
 ) {
     let base = format!("{prefix}{}", location.path);
+    let truncated = &mut collection.truncated;
     let candidates = if location.kind == Kind::Glob {
         let matches = read::matching(scope.root, &base);
         if matches.truncated {
             truncated.push(format!("/{base}: more matches than were looked at"));
         }
         truncated.extend(matches.unnamed.iter().map(|name| not_utf8(name)));
-        truncated.extend(
-            matches
-                .unreadable
-                .iter()
-                .map(|directory| format!("/{directory}: could not be listed")),
-        );
+        collection.unlisted.extend(matches.unreadable);
+        collection.listed.extend(matches.listed);
         matches.files
     } else if location.kind == Kind::File {
         // A file behind a directory only root can list is still looked at,
