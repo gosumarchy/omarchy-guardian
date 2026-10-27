@@ -40,6 +40,7 @@
 //!   exists only as a result of a lookup, and nothing of OSV's answers is
 //!   kept to find it from.
 
+mod aube;
 mod config;
 mod inventory;
 mod startup;
