@@ -1978,8 +1978,8 @@ green only when the sweep is clear. A sweep with a part not checked, or an
 AI review that came back inconclusive, exits with status 2 (incomplete),
 whatever the box says first. An AI review that failed or was not sent does
 the same unless `ai = "optional"`; then, as with `on_findings = "warn"` or
-`on_ai_suspicious = "warn"`, the box adds "Allowed by policy" and the sweep
-exits 0. Below the box come up to 10 files the
+`on_ai_suspicious = "warn"`, the box adds "Allowed by policy" and, unless
+something else blocks, the sweep exits 0. Below the box come up to 10 files the
 review raised alerts on (worst first, one line each, with how many alerts
 each has), up to 3 reasons the check is not complete, and the notes on what
 the sweep could not check.
