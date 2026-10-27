@@ -294,7 +294,7 @@ fn findings(html: &mut String, report: &Report, decision: Decision) {
         for finding in &report.findings {
             finding_card(
                 html,
-                finding.rule.severity(),
+                finding.severity,
                 "Local rule",
                 finding.rule.name(),
                 &format!("{}:{}", finding.path, finding.line),

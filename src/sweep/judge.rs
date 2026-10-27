@@ -609,6 +609,7 @@ fn finding(path: &str, line: usize, rule: RuleId, excerpt: &str) -> LocalFinding
         path: path.to_string(),
         line,
         rule,
+        severity: rule.severity(),
         excerpt: excerpt.to_string(),
     }
 }

@@ -134,6 +134,7 @@ fn the_audit_trail_gets_numbers_and_the_user_gets_the_reasons() {
         path: "install.sh".into(),
         line: 3,
         rule: RuleId::DownloadAndExecute,
+        severity: RuleId::DownloadAndExecute.severity(),
         excerpt: "curl x | sh".into(),
     });
     report.gaps.push(Gap::Undecodable("blob".into()));
@@ -161,6 +162,7 @@ fn local_findings(count: usize) -> Vec<LocalFinding> {
             path: "install.sh".into(),
             line,
             rule: RuleId::DownloadAndExecute,
+            severity: RuleId::DownloadAndExecute.severity(),
             excerpt: "curl x | sh".into(),
         })
         .collect()
@@ -271,6 +273,7 @@ fn finding(path: &str) -> LocalFinding {
         path: path.into(),
         line: 1,
         rule: RuleId::PrivilegeEscalation,
+        severity: RuleId::PrivilegeEscalation.severity(),
         excerpt: String::new(),
     }
 }

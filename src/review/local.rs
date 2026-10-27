@@ -77,7 +77,10 @@ pub(super) fn apply_rules(report: &mut Report, rel: &str, text: &str, inventory_
         let quiet =
             rules::with_variables(&view.quiet.to_lowercase().replace('\t', " "), &variables);
         for rule in rules::line_rules(&code, &quiet) {
-            push_finding(report, rel, number, line, rule);
+            report.findings.push(LocalFinding {
+                severity: rule.severity_on(&code),
+                ..finding(rel, number, line, rule)
+            });
         }
         views.push((code, quiet));
         written.push(as_written);
@@ -145,7 +148,10 @@ fn apply_command_groups(
             for rule in rules::line_rules(&code, &quiet) {
                 if !found.contains(&rule) {
                     found.push(rule);
-                    push_finding(report, rel, start + 1, lines[start], rule);
+                    report.findings.push(LocalFinding {
+                        severity: rule.severity_on(&code),
+                        ..finding(rel, start + 1, lines[start], rule)
+                    });
                 }
             }
         }
@@ -315,6 +321,7 @@ pub(crate) fn check_runs(report: &mut Report, unread: &[(String, String)]) {
                 path: run.rel.clone(),
                 line: run.line,
                 rule: RuleId::DownloadAndExecute,
+                severity: RuleId::DownloadAndExecute.severity(),
                 // A run recorded elsewhere (the AUR gate's upstream files)
                 // holds the line as written.
                 excerpt: excerpt(&run.excerpt),
@@ -402,10 +409,16 @@ fn run_paths(rel: &str, target: &str) -> Vec<String> {
 }
 
 fn push_finding(report: &mut Report, rel: &str, number: usize, line: &str, rule: RuleId) {
-    report.findings.push(LocalFinding {
+    report.findings.push(finding(rel, number, line, rule));
+}
+
+/// A finding at the rule's own severity.
+fn finding(rel: &str, number: usize, line: &str, rule: RuleId) -> LocalFinding {
+    LocalFinding {
         path: rel.to_string(),
         line: number,
         rule,
+        severity: rule.severity(),
         excerpt: excerpt(line),
-    });
+    }
 }
