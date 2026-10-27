@@ -11,7 +11,7 @@ use crate::agent::Status;
 use crate::json::Json;
 use crate::layout::{self, Painter, Span, Table};
 use crate::report::html::{self, esc};
-use crate::report::{AgentOutcome, Decision, Gap, Report, Severity};
+use crate::report::{AgentOutcome, AgentRun, Blocked, Decision, Gap, Report, Severity};
 use crate::text::shown;
 
 /// A tier's word in the list and its colour.
@@ -151,7 +151,7 @@ fn not_reviewed(report: &Report) -> Vec<String> {
         report
             .agent_runs
             .iter()
-            .filter_map(|run| run.outcome.problem())
+            .filter_map(unfinished)
             .map(|problem| format!("AI review: {problem}")),
     );
     lines.dedup();
@@ -206,6 +206,87 @@ fn attention(report: &Report, painter: Painter) -> String {
     text
 }
 
+/// The sweep's verdict lines and their colour. The alerts come first;
+/// what could not be checked is a line of its own, so a sweep that found
+/// alerts says so even when a part could not be checked. `decision` is the
+/// report's, as for every gate, and alone decides whether the box is green:
+/// an inconclusive AI review, or a suspicious one that names no finding,
+/// has no alert to count and must not read as clear.
+fn verdict_lines(report: &Report, decision: Decision) -> (Vec<Span>, &'static str) {
+    let counts = report.counts();
+    let total = counts.total();
+    let (headline, color) = match (total, counts.high) {
+        (0, _) if decision == Decision::Clear => ("✓ NO ALERTS".to_string(), "32"),
+        (0, _) => ("! NO ALERTS COUNTED".to_string(), "33;1"),
+        (_, 0) => (
+            format!(
+                "! {total} ALERT(S) — {} medium · {} low",
+                counts.medium, counts.low
+            ),
+            "33;1",
+        ),
+        (_, high) => (
+            format!(
+                "✗ {total} ALERT(S) — {high} high · {} medium · {} low",
+                counts.medium, counts.low
+            ),
+            "31;1",
+        ),
+    };
+    let mut lines = vec![Span::new(headline, color)];
+    let mut unchecked = Vec::new();
+    if !report.gaps.is_empty() {
+        unchecked.push(format!("{} part(s) not checked", report.gaps.len()));
+    }
+    let incomplete = report
+        .agent_runs
+        .iter()
+        .filter(|run| unfinished(run).is_some())
+        .count();
+    if incomplete > 0 {
+        unchecked.push(format!("{incomplete} AI request(s) did not complete"));
+    }
+    if !unchecked.is_empty() {
+        lines.push(Span::new(
+            format!("Not fully checked: {}", unchecked.join("; ")),
+            "33",
+        ));
+    }
+    let unnamed = report.agent_runs.iter().any(|run| {
+        matches!(&run.outcome, AgentOutcome::Reviewed(review)
+            if review.status == Status::Suspicious && review.findings.is_empty())
+    });
+    if unnamed {
+        lines.push(Span::new(
+            "The AI review found something suspicious; see sweep details",
+            "33",
+        ));
+    }
+    if decision == Decision::Warned {
+        lines.push(Span::new("Allowed by policy", "2"));
+    }
+    // Clear means no alerts, so its headline is green; the edge takes a
+    // plain colour code.
+    let edge = match decision {
+        Decision::Clear => "32",
+        _ if counts.high > 0 => "31",
+        _ => "33",
+    };
+    (lines, edge)
+}
+
+/// Why an AI request gave no full answer, for a run that gave none: it
+/// failed, was never sent, or came back inconclusive.
+fn unfinished(run: &AgentRun) -> Option<String> {
+    match &run.outcome {
+        AgentOutcome::Reviewed(review) if review.status == Status::Inconclusive => {
+            Some(format!("inconclusive: {}", review.summary))
+        }
+        AgentOutcome::Reviewed(_) => None,
+        outcome => outcome.problem(),
+    }
+}
+
 /// The top of a sweep: the verdict with how much is trusted in one box,
 /// then what needs a look and what was not reviewed. `changes` is how many
 /// items changed since the last sweep, when that is asked for.
@@ -224,7 +305,8 @@ pub(super) fn summary(
         .iter()
         .filter(|item| !item.is_trusted() && flagged_paths.contains(&label(item, home)))
         .count();
-    let mut lines = trust_lines(collection, flagged);
+    let (mut lines, edge) = verdict_lines(report, decision);
+    lines.extend(trust_lines(collection, flagged));
     match changes {
         Some(0) => lines.push(Span::new(
             "✓ nothing new or changed since the last sweep",
@@ -236,7 +318,8 @@ pub(super) fn summary(
         )),
         None => {}
     }
-    let boxed = report.verdict_box_with(decision, None, &lines, width, painter);
+    let title = format!("Omarchy Guardian · {}", shown(&report.subject));
+    let boxed = layout::boxed(&title, &lines, width, edge, painter);
     format!("{boxed}\n{}", attention(report, painter))
 }
 
@@ -532,7 +615,7 @@ const fn decision_name(decision: Decision) -> &'static str {
     match decision {
         Decision::Clear | Decision::Limited => "clear",
         Decision::Warned => "warned",
-        Decision::Blocked(crate::report::Blocked::Findings) => "findings",
+        Decision::Blocked(Blocked::Findings) => "findings",
         Decision::Blocked(_) => "incomplete",
     }
 }
@@ -602,12 +685,17 @@ fn reviews_json(report: &Report) -> Json {
 mod tests {
     use std::collections::{BTreeMap, HashSet};
 
-    use super::{SHOWN_CONCERNS, attention, concerns, findings_json, items_html, not_reviewed};
+    use super::{
+        SHOWN_CONCERNS, attention, concerns, findings_json, items_html, not_reviewed, verdict_lines,
+    };
     use crate::agent::{AgentFinding, AgentReview, Status};
     use crate::autorun::Category;
+    use crate::config::model::{AiRequirement, Profile, builtin};
     use crate::error::Error;
     use crate::layout::Painter;
-    use crate::report::{AgentOutcome, AgentRun, Gap, LocalFinding, Report, ReviewScope, Severity};
+    use crate::report::{
+        AgentOutcome, AgentRun, Decision, Gap, LocalFinding, Report, ReviewScope, Severity,
+    };
     use crate::review::analyze_text_locally;
     use crate::rules::RuleId;
     use crate::sweep::collect::{Body, Item, Origin};
@@ -644,11 +732,7 @@ mod tests {
     }
 
     fn suspicious(findings: Vec<AgentFinding>) -> AgentRun {
-        run(AgentOutcome::Reviewed(AgentReview {
-            status: Status::Suspicious,
-            summary: String::new(),
-            findings,
-        }))
+        reviewed(Status::Suspicious, findings)
     }
 
     #[test]
@@ -712,6 +796,132 @@ mod tests {
         assert!(text.contains("… 2 more"), "{text}");
         assert!(!text.contains("Not reviewed"), "{text}");
         assert_eq!(attention(&Report::default(), Painter::plain()), "");
+    }
+
+    fn headline(report: &Report) -> (Vec<String>, &'static str) {
+        let decision = report.decide(&|class| builtin(Profile::Standard, class));
+        let (lines, edge) = verdict_lines(report, decision);
+        let text = lines.iter().map(|line| format!("{line:?}")).collect();
+        (text, edge)
+    }
+
+    fn reviewed(status: Status, findings: Vec<AgentFinding>) -> AgentRun {
+        run(AgentOutcome::Reviewed(AgentReview {
+            status,
+            summary: "unsure".into(),
+            findings,
+        }))
+    }
+
+    #[test]
+    fn the_verdict_leads_with_the_alerts_and_says_apart_what_was_not_checked() {
+        let mut clear = Report::default();
+        clear.agent_runs.push(reviewed(Status::Clear, Vec::new()));
+        let (lines, edge) = headline(&clear);
+        assert!(
+            lines[0].contains("✓ NO ALERTS") && lines.len() == 1,
+            "{lines:?}"
+        );
+        assert_eq!(edge, "32");
+
+        let mut unread = clear;
+        unread
+            .gaps
+            .push(Gap::Sweep("/boot/EFI: could not be listed".into()));
+        let (lines, edge) = headline(&unread);
+        assert!(lines[0].contains("! NO ALERTS COUNTED"), "{lines:?}");
+        assert!(lines[1].contains("Not fully checked: 1 part(s) not checked"));
+        assert_eq!(edge, "33", "not fully checked is never green");
+
+        let mut found = unread;
+        found.findings.push(LocalFinding {
+            severity: Severity::Low,
+            ..local("~/a", RuleId::ShellCommandExecution)
+        });
+        found
+            .agent_runs
+            .push(suspicious(vec![ai("~/b", Severity::Medium, "odd")]));
+        found
+            .agent_runs
+            .push(run(AgentOutcome::Unavailable(Error::Message(
+                "no network".into(),
+            ))));
+        let (lines, _) = headline(&found);
+        assert!(
+            lines[0].contains("! 2 ALERT(S) — 1 medium · 1 low"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].contains("1 part(s) not checked; 1 AI request(s) did not complete"),
+            "{lines:?}"
+        );
+
+        found
+            .agent_runs
+            .push(suspicious(vec![ai("~/c", Severity::High, "bad")]));
+        let (lines, edge) = headline(&found);
+        assert!(
+            lines[0].contains("✗ 3 ALERT(S) — 1 high · 1 medium · 1 low"),
+            "{lines:?}"
+        );
+        assert_eq!(edge, "31");
+    }
+
+    /// Runs that block with no alert to count are never shown as clear.
+    #[test]
+    fn a_review_that_blocks_without_an_alert_is_not_green() {
+        let mut inconclusive = Report::default();
+        inconclusive
+            .agent_runs
+            .push(reviewed(Status::Inconclusive, Vec::new()));
+        let (lines, edge) = headline(&inconclusive);
+        assert_eq!(edge, "33", "{lines:?}");
+        assert!(
+            lines[1].contains("1 AI request(s) did not complete"),
+            "{lines:?}"
+        );
+        assert!(
+            not_reviewed(&inconclusive)[0].contains("AI review: inconclusive: unsure"),
+            "{lines:?}"
+        );
+
+        // With the AI optional, a review that did not run warns: nothing
+        // was found suspicious, and the box must not say so.
+        let mut optional = Report::default();
+        optional
+            .agent_runs
+            .push(run(AgentOutcome::Unavailable(Error::Message(
+                "no network".into(),
+            ))));
+        let decision = optional.decide(&|class| {
+            let mut policy = builtin(Profile::Standard, class);
+            policy.ai = AiRequirement::Optional;
+            policy
+        });
+        assert_eq!(decision, Decision::Warned);
+        let (lines, _) = verdict_lines(&optional, decision);
+        let lines: Vec<String> = lines.iter().map(|line| format!("{line:?}")).collect();
+        assert!(
+            !lines.iter().any(|line| line.contains("suspicious")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("Allowed by policy")),
+            "{lines:?}"
+        );
+
+        let mut suspicious = Report::default();
+        suspicious
+            .agent_runs
+            .push(reviewed(Status::Suspicious, Vec::new()));
+        let (lines, edge) = headline(&suspicious);
+        assert_eq!(edge, "33", "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("found something suspicious")),
+            "{lines:?}"
+        );
     }
 
     #[test]

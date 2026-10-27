@@ -383,10 +383,10 @@ pub(crate) struct RunRef {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Counts {
-    high: usize,
-    medium: usize,
-    low: usize,
+pub(crate) struct Counts {
+    pub(crate) high: usize,
+    pub(crate) medium: usize,
+    pub(crate) low: usize,
 }
 
 impl Counts {
@@ -398,7 +398,7 @@ impl Counts {
         }
     }
 
-    const fn total(self) -> usize {
+    pub(crate) const fn total(self) -> usize {
         self.high + self.medium + self.low
     }
 }
@@ -784,7 +784,7 @@ impl Report {
     }
 
     /// The alerts by severity.
-    fn counts(&self) -> Counts {
+    pub(crate) fn counts(&self) -> Counts {
         let mut counts = Counts::default();
         for (_, severity, _) in self.alerts() {
             counts.add(severity);

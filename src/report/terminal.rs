@@ -147,18 +147,6 @@ impl Report {
         width: usize,
         painter: Painter,
     ) -> String {
-        self.verdict_box_with(decision, permit, &[], width, painter)
-    }
-
-    /// The verdict box with `extra` lines below the verdict and the counts.
-    pub(crate) fn verdict_box_with(
-        &self,
-        decision: Decision,
-        permit: Option<&str>,
-        extra: &[Span],
-        width: usize,
-        painter: Painter,
-    ) -> String {
         let counts = self.counts();
         let (headline, color) = self.headline(decision, permit);
         let mut lines = vec![Span::new(headline, color)];
@@ -175,7 +163,6 @@ impl Report {
                 remarks_are(decision)
             )));
         }
-        lines.extend_from_slice(extra);
         let title = format!("Omarchy Guardian · {}", shown(&self.subject));
         let edge = color.split(';').next().unwrap_or(color);
         layout::boxed(&title, &lines, width, edge, painter)
