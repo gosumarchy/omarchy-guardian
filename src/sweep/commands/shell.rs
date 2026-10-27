@@ -568,9 +568,9 @@ fn here_document_end(line: &str) -> Option<String> {
 ///
 /// So a script can turn that note off: for the rest of the file with a
 /// `<<` whose word never comes again, and for the next line with a line
-/// ending in `\` before the command. That
-/// only takes it back to how a script was read before the note existed;
-/// telling every such line apart needs quotes followed across lines.
+/// ending in `\` before the command. That only takes it back to how a
+/// script was read before the note existed; telling every such line apart
+/// needs quotes followed across lines.
 pub(super) fn started(line: &str, start: LineStart) -> Vec<String> {
     if line.len() > MAX_STARTED_LINE {
         return Vec::new();
