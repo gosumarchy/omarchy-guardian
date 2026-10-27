@@ -904,7 +904,13 @@ fn show(options: Options, shown: &Shown<'_>) {
         return;
     }
     let changes = (options.view == View::Changes).then_some(shown.changes.len());
-    let summary = output::summary(shown.collection, shown.report, shown.home, changes);
+    let summary = output::summary(
+        shown.collection,
+        shown.report,
+        shown.decision,
+        shown.home,
+        changes,
+    );
     // The notes stay on screen: they say what the sweep could not check,
     // and a fact said once (see `said_once`) is not said at the next sweep.
     let top = format!("{summary}{}", output::notes_text(shown.notes));
