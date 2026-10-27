@@ -124,15 +124,21 @@ const SETTING_CATEGORIES: [Category; 3] = [Category::Shell, Category::LocalBin, 
 /// `SETTING_CATEGORIES` that the catalogue found itself. A file reached by
 /// following what another runs or sources is left out: it takes the kind
 /// of whatever reached it first, so a payload anywhere in the home that a
-/// start-up file runs would count as a start-up file. So is a file that an
-/// item of any other kind also stands for.
+/// start-up file runs would count as a start-up file. So is a program
+/// under a name Guardian watches on `PATH` (`sudo`, `ssh`, `git`,
+/// `omarchy-…`): a fake `sudo` in the home is how a password is taken, and
+/// the reviewer's grade alone must not clear it. So is a file that an item
+/// of any other kind also stands for.
 fn setting_paths(collection: &Collection, home: Option<&str>) -> HashSet<String> {
     let mut allowed = HashSet::new();
     let mut refused = HashSet::new();
     for item in &collection.items {
         let path = shown_path(checked_path(item), home);
+        let watched =
+            item.category == Category::LocalBin && super::path::is_watched(file_name(&item.path));
         if path.starts_with("~/")
             && item.run_by.is_none()
+            && !watched
             && SETTING_CATEGORIES.contains(&item.category)
         {
             allowed.insert(path);

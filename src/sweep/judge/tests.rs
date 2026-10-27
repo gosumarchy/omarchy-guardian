@@ -1930,6 +1930,13 @@ fn only_shell_files_programs_and_agent_entries_in_the_home_may_hold_settings() {
             item("etc/bash.bashrc", Category::Shell, Tier::Unknown),
             item("root/.bashrc", Category::Shell, Tier::Unknown),
             item("usr/local/bin/claude", Category::LocalBin, Tier::Unknown),
+            // A program under a name Guardian watches on PATH.
+            item("home/u/.local/bin/sudo", Category::LocalBin, Tier::Unknown),
+            item(
+                "home/u/.local/bin/omarchy-update",
+                Category::LocalBin,
+                Tier::Unknown,
+            ),
             // What a start-up file runs takes its kind, and is not one.
             Item {
                 run_by: Some("home/u/.bashrc".into()),

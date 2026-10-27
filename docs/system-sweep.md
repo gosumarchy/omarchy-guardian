@@ -1751,7 +1751,11 @@ of this holds:
   request, and is a shell start-up file, a program in a directory of your
   `PATH` (`~/.local/bin` and the like), or an entry an AI coding agent starts
   (a Claude Code hook, a plugin's hook), as the sweep finds it itself: a
-  script one of these runs or sources is not one. A file under `/etc`, `/usr` or
+  script one of these runs or sources is not one, nor is a start-up file that
+  is a link into a dotfiles directory (the sweep reaches its target by
+  following the link), nor a program under a name Guardian watches on
+  `PATH` (`sudo`, `ssh`, `git`, `omarchy-…`), where a fake one is how a
+  password is taken. A file under `/etc`, `/usr` or
   anywhere else, root's home as `sweep --root` shows it (`/root/…`), and
   every other kind of file in your home keeps it an alert: autostart
   entries, user units, Hyprland's `exec` lines, cron jobs, Omarchy hooks and
