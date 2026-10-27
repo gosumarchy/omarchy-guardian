@@ -482,12 +482,87 @@ fn case_pattern_end(branch: &str) -> Option<usize> {
     plain.then_some(close + 1)
 }
 
+/// Whether `word` names a command under a variable's directory
+/// (`"$TOOLS/x"`, `$1/x`): where it leads is not known, and following says
+/// so.
+fn is_under_variable(word: &str) -> bool {
+    word.contains('/')
+        && word.strip_prefix('$').is_some_and(|name| {
+            name.starts_with(|c: char| c == '{' || c == '_' || c.is_ascii_alphanumeric())
+        })
+}
+
+/// Whether a line of a shell script starts statements, or goes on with
+/// something begun before it: the arguments of a command whose line ended
+/// in `\`, or the text of a here-document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LineStart {
+    Command,
+    Argument,
+}
+
+/// Where a shell script's lines stand: inside a command whose line ended
+/// with `\`, or inside a here-document until the word that ends it.
+#[derive(Debug, Default)]
+pub(super) struct LineStarts {
+    continued: bool,
+    here_document: Option<String>,
+}
+
+impl LineStarts {
+    /// How `line` (trimmed) starts, given the lines before it.
+    pub(super) fn next(&mut self, line: &str) -> LineStart {
+        let start = if self.continued || self.here_document.is_some() {
+            LineStart::Argument
+        } else {
+            LineStart::Command
+        };
+        let comment = line.starts_with('#');
+        self.continued = !comment && continues(line);
+        match &self.here_document {
+            Some(end) if line == end => self.here_document = None,
+            None if !comment => self.here_document = here_document_end(line),
+            Some(_) | None => {}
+        }
+        start
+    }
+}
+
+/// Whether `line` goes on into the next one: it ends in an odd number of
+/// backslashes (an even number is that many escaped backslashes).
+fn continues(line: &str) -> bool {
+    let trailing = line.len() - line.trim_end_matches('\\').len();
+    trailing % 2 == 1
+}
+
+/// The word that ends a here-document `line` opens (`cat <<EOF`,
+/// `<<-'END'`), if it opens one. A here-string (`<<<`) names no word, as
+/// the word stops at a `<`. A shift (`$((x << 2))`) is taken for one too:
+/// the lines after it are then read as arguments, which only leaves out
+/// what `LineStart::Command` adds.
+fn here_document_end(line: &str) -> Option<String> {
+    let at = line.find("<<")?;
+    let rest = line[at + 2..].trim_start_matches('-').trim_start();
+    let word: String = rest
+        .chars()
+        .take_while(|c| !c.is_whitespace() && !matches!(c, ';' | '&' | '|' | '<' | '>' | ')'))
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .collect();
+    (!word.is_empty()).then_some(word)
+}
+
 /// The programs a line of a shell start-up file names by a path, as the
 /// command of a statement (`~/bin/agent &`, `cd x && exec /opt/x/run`) or
 /// inside a substitution (`eval "$(~/bin/tool init)"`). A bare name is not
 /// looked up: it is a shell builtin or an ordinary command far more often
 /// than not. A very long line is left to the review of the file's text.
-pub(super) fn started(line: &str) -> Vec<String> {
+///
+/// A command named through a variable (`"$TOOLS/x"`) or a substitution
+/// (`"$(dirname "$1")/x"`) is kept for following to say it is unknown,
+/// but only on a line that starts statements (`LineStart::Command`) and
+/// not in a `[[ … ]]` test or `(( … ))` arithmetic: elsewhere such a word
+/// is far more often an argument than a command. Anything else is read the same on every line.
+pub(super) fn started(line: &str, start: LineStart) -> Vec<String> {
     if line.len() > MAX_STARTED_LINE {
         return Vec::new();
     }
@@ -548,8 +623,12 @@ pub(super) fn started(line: &str) -> Vec<String> {
         // so. The statement is still read below, since an empty
         // substitution leaves the next word as the command
         // (`$(true) /opt/x`).
-        if let Some(word) = words.iter().find(|word| is_command(word))
+        let unknown_kept =
+            start == LineStart::Command && words.last().is_none_or(|word| word != "]]");
+        if unknown_kept
+            && let Some(word) = words.iter().find(|word| is_command(word))
             && (word.contains("$(") || word.contains('`'))
+            && !word.starts_with("((")
         {
             let word = clean(word);
             if !found.contains(&word) {
@@ -577,17 +656,9 @@ pub(super) fn started(line: &str) -> Vec<String> {
             })
             .collect();
         let first = words.into_iter().find(|word| is_command(word));
-        // A command under a variable's directory (`"$TOOLS/x"`) is kept
-        // too: where it leads is not known, and following says so.
-        let under_variable = |word: &str| {
-            word.contains('/')
-                && word.strip_prefix('$').is_some_and(|name| {
-                    name.starts_with(|c: char| c == '{' || c == '_' || c.is_ascii_alphanumeric())
-                })
-        };
         if let Some(word) = first
             .map(|word| clean(&word))
-            .filter(|word| is_path(word) || under_variable(word))
+            .filter(|word| is_path(word) || (unknown_kept && is_under_variable(word)))
             && !found.contains(&word)
         {
             found.push(word);
