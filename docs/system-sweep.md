@@ -914,12 +914,16 @@ What is read and never run (links below these places are not followed, see below
   `MISE_DATA_DIR`) as node or python itself, or through its `npm:`, `pipx:`
   (with pipx or uv) and `cargo:` backends, read as above. Newer mise
   installs `npm:` tools with aube, in pnpm's layout (no `lib`): such a tool
-  is not read, and is said as not checked. So is an `npm:` tool with a file
-  bun, pnpm or aube leaves (`package.json`, `bun.lock`, `bun.lockb`,
-  `pnpm-lock.yaml`, `aube-lock.yaml` or `node_modules/.pnpm`) in its
-  directory or its `lib`, as when mise's `npm.package_manager` is bun or
-  pnpm: their own configuration (`bunfig.toml`, `BUN_CONFIG_REGISTRY`) is
-  not read. Tools of other
+  is read from the `aube-lock.yaml` in its directory, every package it
+  names (pnpm's v9 format, up to 8 MiB). A lockfile in another shape is not
+  read, and one with an entry that cannot be read is read for the rest;
+  both are said as not checked. A tool in pnpm's layout without that
+  lockfile is not read, and is said as not checked. So is an `npm:` tool
+  with a file bun or pnpm leaves (`bun.lock`, `bun.lockb`,
+  `pnpm-lock.yaml` or `node_modules/.pnpm`) in its directory or its `lib`,
+  or with a `lib` beside aube's lockfile or `package.json`, as when mise's
+  `npm.package_manager` is bun or pnpm: their own configuration
+  (`bunfig.toml`, `BUN_CONFIG_REGISTRY`) is not read. Tools of other
   backends are not covered: `aqua:`, `ubi:` and core tools such as Go are
   programs, not packages of a registry OSV knows, and a `go:` tool leaves
   only the program it built, with no module path and version beside it,
@@ -950,7 +954,8 @@ registry: `PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL`, `PIP_FIND_LINKS`,
 `PIP_REQUIREMENT`, `PIP_CONSTRAINT`, `PIP_CONFIG_FILE`; `UV_INDEX*`,
 `UV_DEFAULT_INDEX`, `UV_EXTRA_INDEX_URL`, `UV_FIND_LINKS`, `UV_CONFIG_FILE`;
 and `npm_config_registry`, a scope's `npm_config_@scope:registry`,
-`npm_config_userconfig` and `npm_config_globalconfig`. A file that names one,
+`npm_config_userconfig`, `npm_config_globalconfig` and aube's
+`npm_config_npmrc_auth_file` and `AUBE_NPMRC_AUTH_FILE`. A file that names one,
 whatever it sets it to, leaves out every package of that tool (for npm, as an
 npm file that cannot be read does), and is said. One that is there and cannot
 be read (closed, not a regular file or a link to one, a link loop, over 2
@@ -992,9 +997,23 @@ from PyPI, crates from crates.io.
   escape in it (npm decodes it as JSON) and a list key such as
   `registry[]` are not read as npm reads them: the file counts as one that
   cannot be read when such a key may be one read here. Only `prefix`,
-  `globalconfig`, `userconfig`, `ignore-scripts`, `registry` and each
-  scope's registry are taken from a file; the rest, tokens included, are
-  not kept.
+  `globalconfig`, `userconfig`, `ignore-scripts`, `registry`, each
+  scope's registry and `npmrc-auth-file` (`npmrcAuthFile`) are taken from
+  a file; the rest, tokens included, are not kept.
+- npm packages mise installed with aube: aube's lockfile names no registry
+  for a package from the one it was set to use, so npm's settings above
+  decide, as aube reads them too. aube also reads pnpm's `auth.ini`
+  (`~/.config/pnpm/auth.ini`, or under `XDG_CONFIG_HOME`), the file
+  `npmrc-auth-file` names and a `.npmrc` in the tool's directory, which npm
+  does not: where `auth.ini` sets one of the keys above, an npm file names
+  `npmrc-auth-file`, `npm_config_npmrc_auth_file` or `AUBE_NPMRC_AUTH_FILE`
+  is set, or the tool's directory has a `.npmrc`, no package aube installed
+  is sent, and an `auth.ini` that cannot be read is said where an aube tool
+  is installed. aube takes no registry from its workspace file, its
+  `config.toml` or other `AUBE_*` variables. A package whose lockfile
+  entry records the public registry's address for its own name and version
+  is sent even where npm's settings name another registry, and one from
+  git, a local path or another address is not.
 - pip: a package installed from an address or a local directory (it has a
   `direct_url.json`) is left out. So is every package of a pipx environment
   installed with another index or a requirements or constraints file

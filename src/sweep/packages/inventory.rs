@@ -1,7 +1,8 @@
 //! Which language packages are installed outside pacman, read from the
 //! files their tools leave behind: `package.json` in a global
-//! `node_modules`, `*.dist-info/METADATA` in a Python environment, and
-//! cargo's `.crates2.json`. No tool is run, and no link below a starting
+//! `node_modules`, the `aube-lock.yaml` of a tool mise installed with aube,
+//! `*.dist-info/METADATA` in a Python environment, and cargo's
+//! `.crates2.json`. No tool is run, and no link below a starting
 //! place is followed: a linked package directory (what `npm link` makes),
 //! environment, `lib`, `node_modules` or `site-packages` is said, not
 //! read. A link among the parts of a starting place itself (npm's prefix,
@@ -18,6 +19,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use super::aube::{self, Resolution};
 use super::config::{self, ConfigFile, IndexConfig, NpmConfig, Places};
 use super::startup::Startup;
 use crate::deps::Ecosystem;
@@ -51,9 +53,16 @@ const OTHER_NPM_MANAGER_FILES: &[&str] = &[
     "bun.lock",
     "bun.lockb",
     "pnpm-lock.yaml",
-    "aube-lock.yaml",
+    AUBE_LOCK,
     "node_modules/.pnpm",
 ];
+
+/// aube's lockfile, in the directory of a tool it installed.
+const AUBE_LOCK: &str = "aube-lock.yaml";
+
+/// The largest `aube-lock.yaml` read: a few hundred bytes per package, so
+/// 8 MiB is arbitrary room for thousands.
+const MAX_LOCK_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The most nodes of mise's whose npm configuration is read. Arbitrary:
 /// far more than anyone keeps installed.
@@ -155,6 +164,7 @@ pub(super) fn collect(root: &Path, places: &Places, startup: &Startup) -> Invent
         .is_some_and(|mise| walk.mise(&format!("{mise}/installs")));
 
     let npm_installed = mise_node || fs::symlink_metadata(root.join("usr/bin/npm")).is_ok();
+    let aube_tool = walk.aube_tool;
     let mut inventory = walk.finish(npm_installed && !npm.ignore_scripts);
     for (name, value) in &places.unfound {
         if ["CARGO_HOME", "PIPX_HOME", "MISE_DATA_DIR"].contains(name) {
@@ -170,6 +180,15 @@ pub(super) fn collect(root: &Path, places: &Places, startup: &Startup) -> Invent
             "{} could not be read (not a regular file, closed, too large, not found, or past a limit): it may name a private registry, so no npm package was looked up in OSV, and packages under an npm prefix it may set were not read",
             text::shown(file)
         ));
+    }
+    // Said only where it left packages out.
+    if aube_tool {
+        for file in &npm.aube_unreadable {
+            inventory.unchecked.push(format!(
+                "{} could not be read (not a regular file, closed, too large, or with a key that is not read here): it may name a private registry, so no npm package mise installed with aube was looked up in OSV",
+                text::shown(file)
+            ));
+        }
     }
     for file in &pip.unreadable {
         inventory.unchecked.push(format!(
@@ -338,6 +357,8 @@ struct Walk<'a> {
     full: bool,
     /// A `node_modules` lay deeper than `MAX_NODE_DEPTH`.
     too_deep: bool,
+    /// A tool mise installed with aube was read.
+    aube_tool: bool,
     /// Manifests, directories and environments that could not be read or
     /// named no package.
     unreadable: Vec<String>,
@@ -361,6 +382,7 @@ impl<'a> Walk<'a> {
             entries: 0,
             full: false,
             too_deep: false,
+            aube_tool: false,
             unreadable: Vec::new(),
             linked: Vec::new(),
             elsewhere: Vec::new(),
@@ -755,12 +777,17 @@ impl<'a> Walk<'a> {
     fn mise_tool(&mut self, backend: Backend, directory: &str) {
         let found = match backend {
             // Newer mise installs `npm:` tools with aube, in pnpm's layout,
-            // with no `lib`: such a tool is said as not read. With
-            // `npm.package_manager` set to bun or pnpm, mise points their
-            // global directory at the tool's, and where it lands is not
-            // documented: a `lib/node_modules` beside their files is not
-            // npm's, and their own configuration is not parsed, so the
-            // tool is said as not read too.
+            // with no `lib`: its lockfile is read instead.
+            Backend::Npm if self.is_aube_install(directory) => {
+                self.aube_lock(directory);
+                true
+            }
+            // With `npm.package_manager` set to bun or pnpm, mise points
+            // their global directory at the tool's, and where it lands is
+            // not documented: a `lib/node_modules` beside their files is
+            // not npm's, and their own configuration is not parsed, so the
+            // tool is said as not read. So is one with aube's lockfile and
+            // anything else of theirs.
             Backend::Node | Backend::Npm => {
                 let lib = format!("{directory}/lib");
                 let there = self.entry(&lib) == Some(Entry::Directory)
@@ -821,6 +848,64 @@ impl<'a> Walk<'a> {
                     .iter()
                     .any(|file| self.entry(&format!("{place}/{file}")).is_some())
             })
+    }
+
+    /// Whether the tool in `directory` is one aube installed and nothing
+    /// else: its lockfile is a regular file, and no `lib` and no file bun
+    /// or pnpm leave is there. Nothing is said here; a tool that is not is
+    /// looked at as npm's.
+    fn is_aube_install(&self, directory: &str) -> bool {
+        let at = |rel: &str| fs::symlink_metadata(self.root.join(format!("{directory}/{rel}")));
+        let absent =
+            |rel: &str| at(rel).is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
+        at(AUBE_LOCK).is_ok_and(|metadata| metadata.is_file())
+            && absent("lib")
+            && OTHER_NPM_MANAGER_FILES
+                .iter()
+                .filter(|file| !matches!(**file, "package.json" | AUBE_LOCK))
+                .all(|file| absent(file))
+    }
+
+    /// Every package in the lockfile of the tool aube installed in
+    /// `directory`. A lockfile that is not read in full is said.
+    fn aube_lock(&mut self, directory: &str) {
+        self.aube_tool = true;
+        let file = format!("{directory}/{AUBE_LOCK}");
+        let Some(lock) = read_small_file(&self.root.join(&file), MAX_LOCK_BYTES)
+            .and_then(|text| aube::read(&text))
+        else {
+            self.unreadable.push(file);
+            return;
+        };
+        // aube reads a `.npmrc` in the directory it installs in, and npm
+        // does not.
+        let own_npmrc = !fs::symlink_metadata(self.root.join(format!("{directory}/.npmrc")))
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
+        for locked in lock.packages {
+            if self.full {
+                return;
+            }
+            let public = !own_npmrc
+                && match &locked.resolution {
+                    Resolution::Registry => self.npm.is_public_to_aube(&locked.name),
+                    Resolution::Tarball(url) => self.npm.is_public(&locked.name, Some(url)),
+                    Resolution::Elsewhere => false,
+                };
+            let package = Package {
+                ecosystem: Ecosystem::Npm,
+                name: locked.name,
+                version: locked.version,
+            };
+            let source = if public {
+                Source::Public
+            } else {
+                Source::Elsewhere
+            };
+            self.add(package, &file, source);
+        }
+        if lock.partial {
+            self.unreadable.push(file);
+        }
     }
 
     /// The inventory, with what was left out said.

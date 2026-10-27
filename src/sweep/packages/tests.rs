@@ -968,6 +968,223 @@ fn a_mise_npm_tool_in_pnpms_layout_is_said_as_not_read() {
     );
 }
 
+/// Where the aube tests install a tool, and its lockfile.
+const AUBE_TOOL: &str = "home/u/.local/share/mise/installs/npm-acme-tool/1.2.3";
+const AUBE_LOCK: &str = "home/u/.local/share/mise/installs/npm-acme-tool/1.2.3/aube-lock.yaml";
+
+/// A tool as mise installs it with aube: its lockfile, the manifest mise
+/// writes, and pnpm's layout under `node_modules`. The names are made up.
+fn aube_tool(root: &Path) {
+    write(
+        root,
+        AUBE_LOCK,
+        "lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    dependencies:
+      '@acme/tool':
+        specifier: 1.2.3
+        version: 1.2.3
+
+packages:
+
+  '@acme/tool@1.2.3':
+    resolution: {integrity: sha512-AAAA==}
+    hasBin: true
+
+  acme-dep@0.4.0:
+    resolution: {integrity: sha512-BBBB==}
+
+snapshots:
+
+  '@acme/tool@1.2.3':
+    dependencies:
+      acme-dep: 0.4.0
+
+  acme-dep@0.4.0: {}
+",
+    );
+    write(
+        root,
+        &format!("{AUBE_TOOL}/package.json"),
+        r#"{"name":"mise-npm-install","private":true,"dependencies":{"@acme/tool":"1.2.3"}}"#,
+    );
+    write(
+        root,
+        &format!("{AUBE_TOOL}/aube-workspace.yaml"),
+        "packages:\n  - .\n",
+    );
+    npm(
+        root,
+        &format!("{AUBE_TOOL}/node_modules/.mise/@acme+tool@1.2.3/node_modules/@acme/tool"),
+        "@acme/tool",
+        "1.2.3",
+    );
+}
+
+fn said(inventory: &Inventory, text: &str) -> bool {
+    inventory.unchecked.join("\n").contains(text)
+}
+
+#[test]
+fn a_mise_npm_tool_aube_installed_is_read_from_its_lockfile() {
+    let root = TempDir::new("packages-aube");
+    let root = root.path();
+    aube_tool(root);
+
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
+
+    assert_eq!(
+        found(&inventory),
+        [
+            (Ecosystem::Npm, "@acme/tool", "1.2.3"),
+            (Ecosystem::Npm, "acme-dep", "0.4.0"),
+        ]
+    );
+    assert!(
+        inventory
+            .installed
+            .iter()
+            .all(|installed| installed.manifest == AUBE_LOCK)
+    );
+    assert_eq!(inventory.unchecked, Vec::<String>::new());
+}
+
+#[test]
+fn an_aube_lockfile_that_cannot_be_read_in_full_is_said() {
+    let root = TempDir::new("packages-aube-broken");
+    let root = root.path();
+    aube_tool(root);
+    let places = Places::defaults(Some(HOME));
+    let lock = fs::read_to_string(root.join(AUBE_LOCK)).unwrap();
+
+    for broken in ["", "not: a lockfile\n", &lock.replace("'9.0'", "'5.4'")] {
+        write(root, AUBE_LOCK, broken);
+        let inventory = collect(root, &places);
+        assert_eq!(found(&inventory), [], "{broken:?}");
+        assert!(said(&inventory, &format!("/{AUBE_LOCK}")), "{broken:?}");
+    }
+
+    // One entry it cannot read leaves the rest taken and the file said.
+    write(
+        root,
+        AUBE_LOCK,
+        &lock.replace("{integrity: sha512-BBBB==}", "{integrity: x, odd: 1}"),
+    );
+    let inventory = collect(root, &places);
+    assert_eq!(found(&inventory), [(Ecosystem::Npm, "@acme/tool", "1.2.3")]);
+    assert!(said(&inventory, &format!("/{AUBE_LOCK}")));
+
+    // Beside a `lib`, the lockfile does not tell the whole tool.
+    write(root, AUBE_LOCK, &lock);
+    npm(
+        root,
+        &format!("{AUBE_TOOL}/lib/node_modules/y"),
+        "y",
+        "2.0.0",
+    );
+    let inventory = collect(root, &places);
+    assert_eq!(found(&inventory), []);
+    assert!(said(&inventory, &format!("/{AUBE_TOOL}")));
+}
+
+#[test]
+fn what_aube_reads_besides_npms_files_can_keep_its_packages_out() {
+    let root = TempDir::new("packages-aube-registry");
+    let root = root.path();
+    aube_tool(root);
+    let places = Places::defaults(Some(HOME));
+    let elsewhere = |inventory: &Inventory| {
+        found(inventory).is_empty() && said(inventory, "@acme/tool") && said(inventory, "acme-dep")
+    };
+    assert_eq!(found(&collect(root, &places)).len(), 2);
+
+    // npm's own setting, which aube reads too.
+    write(
+        root,
+        "home/u/.npmrc",
+        "@acme:registry=https://npm.corp.example/\n",
+    );
+    let inventory = collect(root, &places);
+    assert_eq!(found(&inventory), [(Ecosystem::Npm, "acme-dep", "0.4.0")]);
+    fs::remove_file(root.join("home/u/.npmrc")).unwrap();
+
+    for (file, text) in [
+        ("home/u/.npmrc", "npmrc-auth-file=/run/secrets/npmrc\n"),
+        ("home/u/.npmrc", "npmrcAuthFile = ~/auth\n"),
+        (
+            "home/u/.config/pnpm/auth.ini",
+            "registry=https://npm.corp.example/\n",
+        ),
+        (&format!("{AUBE_TOOL}/.npmrc"), "\n"),
+    ] {
+        write(root, file, text);
+        assert!(elsewhere(&collect(root, &places)), "{file}: {text:?}");
+        fs::remove_file(root.join(file)).unwrap();
+    }
+
+    // Tokens alone in pnpm's file change nothing.
+    write(
+        root,
+        "home/u/.config/pnpm/auth.ini",
+        "//npm.corp.example/:_authToken=secret\n",
+    );
+    assert_eq!(found(&collect(root, &places)).len(), 2);
+
+    // One that cannot be read is said by its path.
+    fs::remove_file(root.join("home/u/.config/pnpm/auth.ini")).unwrap();
+    fs::create_dir_all(root.join("home/u/.config/pnpm/auth.ini")).unwrap();
+    let inventory = collect(root, &places);
+    assert!(elsewhere(&inventory), "{:?}", inventory.unchecked);
+    assert!(said(
+        &inventory,
+        "/home/u/.config/pnpm/auth.ini could not be read"
+    ));
+    // Without a tool aube installed, it left nothing out and is not said.
+    fs::remove_dir_all(root.join(AUBE_TOOL)).unwrap();
+    let inventory = collect(root, &places);
+    assert!(!said(&inventory, "auth.ini"), "{:?}", inventory.unchecked);
+    fs::remove_dir_all(root.join("home/u/.config/pnpm/auth.ini")).unwrap();
+
+    // A shell that names the variable for that file.
+    aube_tool(root);
+    write(
+        root,
+        "home/u/.bashrc",
+        "export AUBE_NPMRC_AUTH_FILE=/run/secrets/npmrc\n",
+    );
+    assert!(elsewhere(&collect(root, &places)));
+}
+
+#[test]
+fn an_aube_tarball_address_names_its_registry() {
+    let root = TempDir::new("packages-aube-tarball");
+    let root = root.path();
+    aube_tool(root);
+    let lock = fs::read_to_string(root.join(AUBE_LOCK)).unwrap();
+    write(
+        root,
+        AUBE_LOCK,
+        &lock.replace(
+            "{integrity: sha512-BBBB==}",
+            "{integrity: sha512-BBBB==, tarball: https://registry.npmjs.org/acme-dep/-/acme-dep-0.4.0.tgz}",
+        ),
+    );
+    // The default registry is private; the address is the public one's.
+    write(
+        root,
+        "home/u/.npmrc",
+        "registry=https://npm.corp.example/\n",
+    );
+
+    let inventory = collect(root, &Places::defaults(Some(HOME)));
+
+    assert_eq!(found(&inventory), [(Ecosystem::Npm, "acme-dep", "0.4.0")]);
+    assert!(said(&inventory, "@acme/tool"));
+}
+
 #[test]
 fn a_mise_npm_tool_bun_installed_into_lib_is_said_as_not_read() {
     let root = TempDir::new("packages-mise-bun");

@@ -61,6 +61,11 @@ const NPM_KEYS: &[&str] = &[
     "userconfig",
     "ignore-scripts",
     "registry",
+    // aube reads one more npm file, named by this key in a file in either
+    // spelling, or by `npm_config_npmrc_auth_file` or
+    // `AUBE_NPMRC_AUTH_FILE` (see `NpmConfig::is_public_to_aube`).
+    "npmrc-auth-file",
+    "npmrcAuthFile",
 ];
 
 /// The hosts of npm's public registry. Yarn's serves the same packages
@@ -105,6 +110,11 @@ pub(super) struct Places {
     pub(super) pipx: Option<String>,
     /// The user's npm configuration (`npm_config_userconfig`).
     pub(super) npmrc: Option<String>,
+    /// pnpm's `auth.ini` under the home's `.config` and under
+    /// `XDG_CONFIG_HOME`, which aube reads after the user's npm file. aube
+    /// reads only the second where `XDG_CONFIG_HOME` is set; both are read
+    /// here, which can only leave more out.
+    pub(super) pnpm_auth: Vec<String>,
     /// pip's configuration files other than the global ones: the user's,
     /// those under `XDG_CONFIG_DIRS`, and `PIP_CONFIG_FILE`.
     pub(super) pip: Vec<String>,
@@ -144,6 +154,7 @@ impl fmt::Debug for Places {
             .field("cargo", &self.cargo)
             .field("pipx", &self.pipx)
             .field("npmrc", &self.npmrc)
+            .field("pnpm_auth", &self.pnpm_auth)
             .field("pip", &self.pip)
             .field("uv", &self.uv)
             .field("home", &self.home)
@@ -165,6 +176,7 @@ impl Places {
             cargo: under(".cargo"),
             pipx: under(".local/share/pipx"),
             npmrc: under(".npmrc"),
+            pnpm_auth: under(".config/pnpm/auth.ini").into_iter().collect(),
             pip: [under(".config/pip/pip.conf"), under(".pip/pip.conf")]
                 .into_iter()
                 .flatten()
@@ -278,6 +290,10 @@ impl Places {
             add(&mut places.pip, GLOBAL_PIP, pip);
             let uv = from_root(&format!("{directory}/uv/uv.toml"));
             add(&mut places.uv, GLOBAL_UV, uv);
+            if name == "XDG_CONFIG_HOME" {
+                let auth = from_root(&format!("{directory}/pnpm/auth.ini"));
+                add(&mut places.pnpm_auth, &[], auth);
+            }
         }
         for (name, files) in [
             ("PIP_CONFIG_FILE", &mut places.pip),
@@ -295,13 +311,18 @@ impl Places {
 }
 
 /// The npm settings among `variables`: npm reads `npm_config_<key>` in any
-/// case, with `_` for `-` in the key.
+/// case, with `_` for `-` in the key. aube's `AUBE_NPMRC_AUTH_FILE` is
+/// taken as `npmrc-auth-file`.
 fn npm_variables(variables: &[(String, String)]) -> Vec<(String, String)> {
     variables
         .iter()
         .filter_map(|(name, value)| {
             let lowered = name.to_ascii_lowercase();
-            let key = lowered.strip_prefix("npm_config_")?.replace('_', "-");
+            let key = match lowered.strip_prefix("npm_config_") {
+                Some(key) => key.replace('_', "-"),
+                None if name == "AUBE_NPMRC_AUTH_FILE" => "npmrc-auth-file".to_string(),
+                None => return None,
+            };
             // npm skips a variable set to nothing. Only the keys read here
             // are kept: the others include registry tokens.
             let used = NPM_KEYS.contains(&key.as_str()) || key.ends_with(":registry");
@@ -355,6 +376,13 @@ pub(super) struct NpmConfig {
     /// configuration files where npm runs, and no package counts as
     /// public.
     pub(super) set_at_start_up: bool,
+    /// aube reads a file that npm does not and that may set a registry:
+    /// pnpm's `auth.ini` keeps a setting read here, or an npm file or
+    /// variable names `npmrc-auth-file`.
+    aube_other: bool,
+    /// The files aube reads and npm does not that are there and could not
+    /// be read, as said to the user.
+    pub(super) aube_unreadable: Vec<String>,
 }
 
 /// Whether a node's npm counts for the install-scripts note: one that is
@@ -452,7 +480,29 @@ impl NpmConfig {
                 config.apply(arch.iter(), home, None, Scripts::Uncounted);
             }
         }
+        for file in &places.pnpm_auth {
+            config.read_pnpm_auth(root, file);
+        }
         config
+    }
+
+    /// Reads pnpm's `auth.ini` at `file` as aube does: as an npm file,
+    /// after the user's, whose `registry` it may set
+    /// (aube-registry's `load_npmrc_entries_tagged_with_globalconfig`,
+    /// <https://github.com/aubepkg/aube/blob/4c8884d2d60499757e703b9d1285c36bb3ebfcb1/crates/aube-registry/src/config/load.rs>).
+    fn read_pnpm_auth(&mut self, root: &Path, file: &str) {
+        let settings = match read_config(root, file) {
+            ConfigFile::Absent => return,
+            ConfigFile::Unreadable => None,
+            ConfigFile::Text(text) => npm_settings(&text),
+        };
+        match settings {
+            None => self.aube_unreadable.push(format!("/{file}")),
+            // pnpm keeps registry tokens here, which `npm_settings` drops.
+            // Any key it keeps counts, a registry and also keys aube does
+            // not use (`prefix`), which can only leave more out.
+            Some(settings) => self.aube_other |= !settings.is_empty(),
+        }
     }
 
     /// Says something npm reads that could not be read, once.
@@ -508,6 +558,7 @@ impl NpmConfig {
                 "prefix" => prefix = Some(value.clone()),
                 "ignore-scripts" => ignore_scripts = value == "true",
                 "registry" => registries.registry = Some(is_on(value, NPM_REGISTRIES)),
+                "npmrc-auth-file" | "npmrcAuthFile" => self.aube_other = true,
                 _ => {
                     if let Some(scope) = key
                         .strip_suffix(":registry")
@@ -557,6 +608,29 @@ impl NpmConfig {
                 .or(node.registry)
                 .unwrap_or(true)
         })
+    }
+
+    /// Whether the npm package `name`, which aube installed from the
+    /// registry it was set to use (its lockfile does not name it), came
+    /// from npm's public registry.
+    ///
+    /// aube reads npm's settings from the file `npm_config_globalconfig`
+    /// names, the user's file, pnpm's `auth.ini`, the file
+    /// `npmrc-auth-file` names, a `.npmrc` in the project, and the
+    /// `npm_config_*` variables
+    /// (<https://github.com/aubepkg/aube/blob/4c8884d2d60499757e703b9d1285c36bb3ebfcb1/crates/aube-registry/src/config/load.rs>).
+    /// npm reads all of those but `auth.ini`, the named file and the
+    /// project's (checked by the caller), and more, so npm's answer is
+    /// taken where neither of the other two files is in play. aube takes
+    /// its registries from those files and variables alone, not from its
+    /// workspace file, `config.toml` or other `AUBE_*` variables (the
+    /// `registries` setting's sources,
+    /// <https://github.com/aubepkg/aube/blob/4c8884d2d60499757e703b9d1285c36bb3ebfcb1/crates/aube-settings/settings.toml>).
+    /// The file `npmrc-auth-file` names is also given by
+    /// `npm_config_npmrc_auth_file` and `AUBE_NPMRC_AUTH_FILE` there, both
+    /// counted; a camel-case variable is not among its sources.
+    pub(super) fn is_public_to_aube(&self, name: &str) -> bool {
+        !self.aube_other && self.aube_unreadable.is_empty() && self.is_public(name, None)
     }
 }
 
@@ -1053,6 +1127,21 @@ mod tests {
         );
         let requirement = [("PIP_REQUIREMENT".to_string(), "/srv/r.txt".to_string())];
         assert_eq!(pip_variables(&requirement).len(), 1);
+
+        // aube's variables that name one more file it reads.
+        let aube = [
+            ("AUBE_NPMRC_AUTH_FILE", "/run/a"),
+            ("NPM_CONFIG_NPMRC_AUTH_FILE", "/run/b"),
+            ("AUBE_REGISTRY", "https://r.example/"),
+        ]
+        .map(|(name, value)| (name.to_string(), value.to_string()));
+        assert_eq!(
+            npm_variables(&aube),
+            [
+                ("npmrc-auth-file".to_string(), "/run/a".to_string()),
+                ("npmrc-auth-file".to_string(), "/run/b".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -1363,6 +1452,11 @@ mod tests {
             ]
         );
         assert_eq!(places.uv_env, ["UV_INDEX_URL"]);
+        // aube reads pnpm's file under XDG_CONFIG_HOME, never XDG_CONFIG_DIRS.
+        assert_eq!(
+            places.pnpm_auth,
+            ["home/u/.config/pnpm/auth.ini", "home/u/conf/pnpm/auth.ini"]
+        );
     }
 
     #[test]
