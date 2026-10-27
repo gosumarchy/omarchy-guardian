@@ -441,23 +441,31 @@ pub(crate) const MAX_SCRIPTS_BESIDE: usize = 8;
 /// What `expand` writes in (`~`, `$HOME`, the XDG directories at their
 /// default places) is known; `$HOMEBREW_PREFIX` is not.
 fn is_unwritten(home: &str, word: &str) -> bool {
-    let expanded = expand(home, word);
-    expanded.contains('`')
-        || expanded
-            .match_indices('$')
-            .any(|(at, _)| starts_expansion(&expanded[at + 1..]))
+    has_expansion(&expand(home, word))
 }
 
-/// Whether a `$` followed by `after` starts an expansion: a name (`$X`,
-/// `$_x`), `${`, `$(`, a positional parameter (`$1`) or a special one
-/// (`$@`, `$*`, `$#`, `$?`, `$-`, `$$`, `$!`). Any other `$` is text a
-/// shell leaves as it is, as a regex's end anchor (`'s|/x$||'`,
-/// `'\.toml)$'`). The special parameters rarely hold a path, but they
-/// count, so that a `$` which may name one is never passed over. Quotes
-/// are gone by the time a word gets here, so a `$X` that was in single
-/// quotes counts too.
-pub(super) fn starts_expansion(after: &str) -> bool {
-    after.starts_with(|c: char| c.is_ascii_alphanumeric() || "_{(@*#?-$!".contains(c))
+/// Whether `word`, quotes removed, holds something a shell writes in:
+/// a `$` that may start an expansion (see `starts_expansion`), a
+/// substitution in backticks, or a `~` that names another user's home
+/// (`~alice/x`), which `expand` does not write in.
+pub(super) fn has_expansion(word: &str) -> bool {
+    word.contains('`')
+        || (word.starts_with('~') && !word.starts_with("~/"))
+        || word
+            .match_indices('$')
+            .any(|(at, _)| starts_expansion(&word[at + 1..]))
+}
+
+/// Whether a `$` followed by `after` may start an expansion. A `$` at the
+/// end of a word, or before `/`, `)`, `|`, `]`, `.` or a quote, is text
+/// every shell leaves as it is: a regex's end anchor (`'s|/x$||'`,
+/// `'\.toml)$'`). Anything else counts, even where it is no expansion
+/// (`'a$\|b'`), so that the forms not listed here, bash's `$'\x2f'` (which
+/// arrives as `$\x2f`) and `$[…]` or zsh's `$=x`, are never passed over.
+/// Quotes are gone by the time a word gets here, so a `$X` that was in
+/// single quotes counts too.
+fn starts_expansion(after: &str) -> bool {
+    !(after.is_empty() || after.starts_with(['/', ')', '|', ']', '.', '\'', '"']))
 }
 
 /// The most values of options that are looked at on the way to a script.

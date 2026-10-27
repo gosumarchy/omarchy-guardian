@@ -16,9 +16,9 @@ pub(super) use targets::{
     Lookup, MAX_GLOB, MAX_INNER_COMMANDS, MAX_OPTION_VALUES, MAX_SCRIPTS_BESIDE, default_search,
     expand, glob_targets, split_commands,
 };
+use targets::{has_expansion, split};
 #[cfg(test)]
 use targets::{inner_commands, targets, targets_where};
-use targets::{split, starts_expansion};
 
 /// Whether `path` (relative to the root) is the script the SSH server runs
 /// at every login: `~/.ssh/rc` or `/etc/ssh/sshrc`. It is a shell script,

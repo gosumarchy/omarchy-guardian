@@ -1190,14 +1190,29 @@ fn a_dollar_that_starts_no_expansion_names_no_variable() {
         shell_scripts: std::cell::RefCell::default(),
     };
     // Each word is where perl's script would be, so it is looked at.
+    // So are the forms a shell expands that no list here names: bash's
+    // `$'…'` and `$[…]`, zsh's `$=x`, another user's `~alice`.
     for word in [
-        "$1/x", "${X}/x", "$(cmd)/x", "$@", "$_x/y", "a$?", "$$", "`pwd`/x",
+        "$1/x",
+        "${X}/x",
+        "$(cmd)/x",
+        "$@",
+        "$_x/y",
+        "a$?",
+        "$$",
+        "`pwd`/x",
+        "/opt/$[1]/x",
+        "/opt/$=V/x",
+        "~alice/x",
     ] {
         let command = format!("perl -w '{word}'");
         lookup.unwritten.set(false);
         lookup.targets(&command);
         assert!(lookup.unwritten.get(), "{command}");
     }
+    lookup.unwritten.set(false);
+    lookup.targets(r"bash $'\x2fopt'/x.sh");
+    assert!(lookup.unwritten.get());
     // A regex's end anchor, or a `$` before a closing bracket, a slash or
     // a quote, is no variable.
     for word in [
@@ -1253,6 +1268,8 @@ fn an_interpreter_is_handed_a_script_only_by_a_path() {
         ("bash ./x.sh\n", "bash ./x.sh"),
         ("bash ../x.sh\n", "bash ../x.sh"),
         ("bash \"$1/x.sh\"\n", "bash $1/x.sh"),
+        ("bash x\"$D\"/y.sh\n", "bash x$D/y.sh"),
+        ("bash ~alice/x.sh\n", "bash ~alice/x.sh"),
         (
             "bash \"$(dirname \"$0\")/x.sh\"\n",
             "bash '$(dirname $0)/x.sh'",
