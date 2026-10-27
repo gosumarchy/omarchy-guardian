@@ -1,6 +1,6 @@
 //! Tests of judging what the sweep collected.
 
-use super::{fact, is_local_only, label, local_checks, located, plugin_files};
+use super::{fact, is_local_only, label, local_checks, located, plugin_files, setting_paths};
 use crate::autorun::Category;
 use crate::report::LocalFinding;
 use crate::report::{Report, ReviewScope};
@@ -1887,5 +1887,64 @@ fn a_link_handed_beside_a_wrapper_to_a_key_is_not_sent() {
             .iter()
             .any(|path| path.contains("id_ed25519") || path.contains("key.py")),
         "{sent:?}"
+    );
+}
+#[test]
+fn only_shell_files_programs_and_agent_entries_in_the_home_may_hold_settings() {
+    let home = Some("home/u");
+    let collection = Collection {
+        items: vec![
+            item("home/u/.bashrc", Category::Shell, Tier::Unknown),
+            item(
+                "home/u/.local/bin/claude",
+                Category::LocalBin,
+                Tier::Unknown,
+            ),
+            item(
+                "home/u/.claude/settings.json#hooks/SessionStart/0/0",
+                Category::Agent,
+                Tier::Unknown,
+            ),
+            // Where persistence lives: alerts whatever the reviewer says.
+            item(
+                "home/u/.config/autostart/sync.desktop",
+                Category::Autostart,
+                Tier::Unknown,
+            ),
+            item(
+                "home/u/.config/systemd/user/sync.service",
+                Category::Systemd,
+                Tier::Unknown,
+            ),
+            item(
+                "home/u/.config/hypr/autostart.lua",
+                Category::Hyprland,
+                Tier::Unknown,
+            ),
+            item(
+                "home/u/.config/omarchy/hooks/post-boot",
+                Category::OmarchyHook,
+                Tier::Unknown,
+            ),
+            // Outside the home, and root's home as `sweep --root` has it.
+            item("etc/bash.bashrc", Category::Shell, Tier::Unknown),
+            item("root/.bashrc", Category::Shell, Tier::Unknown),
+            item("usr/local/bin/claude", Category::LocalBin, Tier::Unknown),
+            // One file two items stand for, one of them of a kind that may
+            // not hold settings.
+            item("home/u/.profile", Category::Shell, Tier::Unknown),
+            item("home/u/.profile", Category::Environment, Tier::Unknown),
+        ],
+        ..Collection::default()
+    };
+    let mut paths: Vec<String> = setting_paths(&collection, home).into_iter().collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        [
+            "~/.bashrc",
+            "~/.claude/settings.json",
+            "~/.local/bin/claude"
+        ]
     );
 }

@@ -1476,6 +1476,55 @@ mod tests {
         assert!(!summary.contains("Your own settings"), "{summary}");
     }
 
+    /// A user unit is where persistence lives: the same claim on one is an
+    /// alert in every profile.
+    #[test]
+    fn an_owners_setting_claimed_on_a_user_unit_is_an_alert() {
+        use crate::config::Settings;
+        use crate::config::file::PartialConfig;
+        use crate::config::model::{Profile, SourceClass};
+        use crate::report::{Blocked, Decision};
+        use crate::review::ReviewContext;
+        use crate::test_support::{TempDir, mock_opencode_owner_setting};
+        use crate::tools::OpenCode;
+
+        const HOME: Option<&str> = Some("home/u");
+        let unit_bin = TempDir::new("sweep-settings-unit-bin");
+        let unit = Collection {
+            items: vec![item(
+                "home/u/.config/systemd/user/sync.service",
+                Category::Systemd,
+                "[Service]\nExecStart=/usr/bin/true\n",
+            )],
+            ..Collection::default()
+        };
+        let settings = Settings::from_parts(PartialConfig::default(), PartialConfig::default())
+            .with_profile(Profile::Standard);
+        let opencode = OpenCode::At(mock_opencode_owner_setting(
+            unit_bin.path(),
+            "clear",
+            (
+                "medium",
+                "~/.config/systemd/user/sync.service",
+                "Starts on login",
+            ),
+        ));
+        let context = ReviewContext {
+            settings: &settings,
+            class: SourceClass::System,
+            opencode: &opencode,
+            units: &[],
+            state_root: None,
+            context: &[],
+        };
+        let report = super::judge::judge(&unit, HOME, &context, &std::collections::HashSet::new());
+        assert_eq!(report.owner_settings().count(), 0);
+        assert_eq!(
+            report.decide(&|class| settings.policy(class)),
+            Decision::Blocked(Blocked::Findings)
+        );
+    }
+
     #[test]
     fn a_key_or_member_that_was_not_there_before_is_news_once_such_things_were_looked_at() {
         let label = |item: &Item| format!("/{}", item.path);

@@ -352,10 +352,11 @@ pub(crate) struct ReviewScope {
     /// remarks (`Policy::ai_remarks`). Where it is empty, every AI finding
     /// is a finding, as the system sweep has it in every profile.
     pub(crate) remark_classes: Vec<SourceClass>,
-    /// Classes whose AI findings may be the owner's own settings (see
-    /// `Report::is_owner_setting`). Only the system sweep fills it, and not
-    /// under the strict profile.
-    pub(crate) setting_classes: Vec<SourceClass>,
+    /// The files, as sent to the AI, that may hold the owner's own settings
+    /// (see `Report::is_owner_setting`). Only the system sweep fills it
+    /// (see `sweep::judge::setting_paths`), and not under the strict
+    /// profile.
+    pub(crate) setting_paths: HashSet<String>,
 }
 
 /// Whether a printed report lists the SHA-256 of every file.
@@ -525,11 +526,8 @@ impl Report {
     /// - its review is clear (the reviewer is told settings alone never
     ///   make a review suspicious, so a claim beside any other verdict is
     ///   not believed) and did not say the content spoke to the reviewer;
-    /// - every file it names, among all the runs' files, is in the home
-    ///   (labelled `~/`, as `sweep::judge::label` names a file there) and
-    ///   of a class in `ReviewScope::setting_classes`, and one of them was
-    ///   sent in `run`;
-    /// - every class of `run` is in `setting_classes`;
+    /// - every file it names, among all the runs' files, is in
+    ///   `ReviewScope::setting_paths`, and one of them was sent in `run`;
     /// - no local rule matched in a file it names: the reviewer is asked to
     ///   confirm or dismiss each local finding, and a claim beside one may
     ///   be about it.
@@ -546,7 +544,6 @@ impl Report {
         {
             return false;
         }
-        let allowed = |class: SourceClass| self.scope.setting_classes.contains(&class);
         let mut named = self
             .agent_runs
             .iter()
@@ -554,9 +551,8 @@ impl Report {
             .filter(|path| names(&finding.file, path))
             .peekable();
         named.peek().is_some()
-            && named.all(|path| path.starts_with("~/") && allowed(self.class_of(path)))
+            && named.all(|path| self.scope.setting_paths.contains(path))
             && run.files.iter().any(|path| names(&finding.file, path))
-            && self.run_classes(run).into_iter().all(allowed)
             && !self
                 .findings
                 .iter()

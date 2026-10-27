@@ -1747,9 +1747,15 @@ of this holds:
 
 - the reply wrote the mark as JSON `true` (not `"true"` or `1`);
 - the finding is graded `medium` or `low`, never `high`;
-- every file it names is in your home (shown as `~/…`) and was sent in that
-  AI request; a file under `/etc`, `/usr` or anywhere else, and root's home
-  as `sweep --root` shows it (`/root/…`), keeps it an alert;
+- every file it names is in your home (shown as `~/…`), was sent in that AI
+  request, and is a shell start-up file, a program in a directory of your
+  `PATH` (`~/.local/bin` and the like), or an entry an AI coding agent starts
+  (a Claude Code hook, a plugin's hook). A file under `/etc`, `/usr` or
+  anywhere else, root's home as `sweep --root` shows it (`/root/…`), and
+  every other kind of file in your home keeps it an alert: autostart
+  entries, user units, Hyprland's `exec` lines, cron jobs, Omarchy hooks and
+  the rest are where persistence lives, and one claim graded medium must
+  never turn such a finding into a clear sweep;
 - the review's verdict is `clear` (settings alone never make a review
   suspicious, so a claim beside another verdict is not believed) and it did
   not report text that speaks to the reviewer;

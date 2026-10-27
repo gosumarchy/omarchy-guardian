@@ -169,7 +169,7 @@ pub(crate) fn scope(
         profile: settings.profile_for(class).name().to_string(),
         ai_off_classes: ai_off_classes(settings, classes),
         remark_classes: remark_classes(settings, classes),
-        setting_classes: Vec::new(),
+        setting_paths: HashSet::new(),
     }
 }
 

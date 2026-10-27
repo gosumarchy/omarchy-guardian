@@ -16,10 +16,11 @@ fn standard(class: SourceClass) -> crate::config::model::Policy {
     builtin(Profile::Standard, class)
 }
 
-/// A system sweep's report as `sweep::judge` makes it outside strict.
+/// A system sweep's report as `sweep::judge` makes it outside strict,
+/// where `~/.bashrc` and `~/.profile` may hold settings.
 fn sweep() -> Report {
     let mut report = report(SourceClass::System);
-    report.scope.setting_classes.push(SourceClass::System);
+    report.scope.setting_paths = [BASHRC, "~/.profile"].map(String::from).into();
     report
 }
 
@@ -109,23 +110,15 @@ fn each_condition_alone_keeps_the_finding_an_alert() {
         with(&[BASHRC], &claimed("clear", BASHRC, "minor")),
     );
     refused(
-        "outside the home",
-        "/etc/bash.bashrc",
+        "a file the sweep does not let hold settings",
+        "~/.config/autostart/sync.desktop",
         with(
-            &["/etc/bash.bashrc"],
-            &claimed("clear", "/etc/bash.bashrc", "medium"),
+            &["~/.config/autostart/sync.desktop"],
+            &claimed("clear", "~/.config/autostart/sync.desktop", "medium"),
         ),
     );
     refused(
-        "root's home, as `sweep --root` labels it",
-        "/root/.bashrc",
-        with(
-            &["/root/.bashrc"],
-            &claimed("clear", "/root/.bashrc", "medium"),
-        ),
-    );
-    refused(
-        "a name that is also a file outside the home",
+        "a name that is also a file that may not hold settings",
         ".bashrc",
         with(
             &[BASHRC, "/etc/skel/.bashrc"],
@@ -137,11 +130,15 @@ fn each_condition_alone_keeps_the_finding_an_alert() {
         report.agent_runs.push(reviewed(Status::Clear, &[BASHRC]));
         report
     });
-    refused("strict: no class may hold settings", BASHRC, {
-        let mut report = alias_sweep();
-        report.scope.setting_classes.clear();
-        report
-    });
+    refused(
+        "strict, or not the sweep: no file may hold settings",
+        BASHRC,
+        {
+            let mut report = alias_sweep();
+            report.scope.setting_paths.clear();
+            report
+        },
+    );
     refused(
         "the review said the content spoke to the reviewer",
         BASHRC,
@@ -151,18 +148,6 @@ fn each_condition_alone_keeps_the_finding_an_alert() {
                 .replace(r#"{"status""#, r#"{"addressed_to_reviewer":true,"status""#),
         ),
     );
-    refused("a class other than the sweep's", BASHRC, {
-        let mut report = alias_sweep();
-        report.scope.class = SourceClass::Aur;
-        report
-    });
-    refused("a run that also holds a file of another class", BASHRC, {
-        let mut report = with(&[BASHRC, "PKGBUILD"], &claimed("clear", BASHRC, "medium"));
-        report
-            .file_classes
-            .insert("PKGBUILD".into(), SourceClass::Aur);
-        report
-    });
     refused("a local rule matched in the file", BASHRC, {
         let mut report = alias_sweep();
         report.findings.push(finding(BASHRC));

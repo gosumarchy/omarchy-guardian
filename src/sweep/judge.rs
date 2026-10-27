@@ -6,6 +6,7 @@
 pub(super) mod secrets;
 mod variables;
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 
 use super::collect::{self, Body, Collection, Item};
@@ -13,7 +14,7 @@ use super::nvim::{self, Review};
 use super::tier::Tier;
 use super::{boot, commands};
 use crate::autorun::Category;
-use crate::config::model::{Profile, SourceClass};
+use crate::config::model::Profile;
 use crate::engine::baseline::{Identity, Unit};
 use crate::engine::plan::HashOnly;
 use crate::git_state;
@@ -66,23 +67,23 @@ pub(super) fn judge(
     collection: &Collection,
     home: Option<&str>,
     context: &ReviewContext<'_>,
-    news: &std::collections::HashSet<String>,
+    news: &HashSet<String>,
 ) -> Report {
     // The sweep lists what is on the system to look at, and a low remark
     // of the AI on an item is one such thing in every profile: it stays a
     // finding here, listed, counted, remembered and told as one.
     //
-    // The AI may mark a finding in the home as the owner's own setting
-    // (see `Report::is_owner_setting`). The owner chose that this applies
-    // to the sweep alone, and that the strict profile keeps every such
+    // The AI may mark a finding as the owner's own setting (see
+    // `Report::is_owner_setting`). The owner chose that this applies to
+    // the sweep alone, and that the strict profile keeps every such
     // finding an alert.
     let strict = context.settings.profile_for(context.class) == Profile::Strict;
     let scope = ReviewScope {
         remark_classes: Vec::new(),
-        setting_classes: if strict {
-            Vec::new()
+        setting_paths: if strict {
+            HashSet::new()
         } else {
-            vec![SourceClass::System]
+            setting_paths(collection, home)
         },
         ..review::scope(context.settings, context.class, &[context.class])
     };
@@ -103,6 +104,35 @@ pub(super) fn judge(
     review::review_collected(report, &context, &units)
 }
 
+/// The kinds of item whose AI findings may be the owner's own settings:
+/// shell start-up files, programs in a directory of the home's `PATH` and
+/// what AI coding agents start (an alias, a wrapper, a plugin's hook).
+/// The owner chose these three. Every other kind stays an alert whatever
+/// the reviewer says: autostart entries, user units, Hyprland's `exec`
+/// lines, cron jobs, Omarchy hooks and the rest are where persistence
+/// lives, and one claim graded medium must never turn such a finding into
+/// a clear sweep.
+const SETTING_CATEGORIES: [Category; 3] = [Category::Shell, Category::LocalBin, Category::Agent];
+
+/// The files, by the path the AI is sent them under, that may hold the
+/// owner's own settings: in the home, and of an item of a kind in
+/// `SETTING_CATEGORIES`. A file that another item of any other kind also
+/// stands for is left out.
+fn setting_paths(collection: &Collection, home: Option<&str>) -> HashSet<String> {
+    let mut allowed = HashSet::new();
+    let mut refused = HashSet::new();
+    for item in &collection.items {
+        let path = shown_path(checked_path(item), home);
+        if path.starts_with("~/") && SETTING_CATEGORIES.contains(&item.category) {
+            allowed.insert(path);
+        } else {
+            refused.insert(path);
+        }
+    }
+    allowed.retain(|path| !refused.contains(path));
+    allowed
+}
+
 /// Puts what the local checks say of `collection` into `report`, queues
 /// for the AI review the text that goes to it, and returns what Guardian
 /// established about each such item (see `fact`).
@@ -110,7 +140,7 @@ fn examine(
     report: &mut Report,
     collection: &Collection,
     home: Option<&str>,
-    news: &std::collections::HashSet<String>,
+    news: &HashSet<String>,
 ) -> Vec<String> {
     let mut facts = Vec::new();
     for item in collection.items.iter().filter(|item| !item.is_trusted()) {
