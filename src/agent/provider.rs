@@ -1,5 +1,5 @@
 //! Reading a provider's errors: out of time, input or content rejected,
-//! asked to slow down.
+//! asked to slow down, not logged in.
 
 use crate::error::Error;
 
@@ -123,6 +123,26 @@ fn is_marked_slow_down(message: &str) -> bool {
         || message.contains("overloaded_error")
         || has_status("429")
         || has_status("529")
+}
+
+/// Whether a provider's or CLI's error says the reviewer is not logged in:
+/// an expired OAuth session, a bad API key. It names the fix; it decides
+/// nothing about whether the run blocks.
+pub(super) fn is_login_failure(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "failed to authenticate",
+        "authentication_error",
+        "authentication failed",
+        "oauth",
+        "invalid api key",
+        "invalid x-api-key",
+        "please run /login",
+        "not logged in",
+        "token has expired",
+    ]
+    .iter()
+    .any(|sign| message.contains(sign))
 }
 
 pub(super) fn content_rejected(detail: &str) -> Error {
