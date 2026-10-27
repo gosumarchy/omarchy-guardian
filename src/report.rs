@@ -355,7 +355,9 @@ pub(crate) struct ReviewScope {
     /// The files, as sent to the AI, that may hold the owner's own settings
     /// (see `Report::is_owner_setting`). Only the system sweep fills it
     /// (see `sweep::judge::setting_paths`), and not under the strict
-    /// profile.
+    /// profile. Every path in it is of the sweep's one class, so
+    /// `is_owner_setting` does not check a run's classes: a caller that
+    /// fills it for a review spanning several classes must add that check.
     pub(crate) setting_paths: HashSet<String>,
 }
 

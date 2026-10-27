@@ -1750,12 +1750,14 @@ of this holds:
 - every file it names is in your home (shown as `~/…`), was sent in that AI
   request, and is a shell start-up file, a program in a directory of your
   `PATH` (`~/.local/bin` and the like), or an entry an AI coding agent starts
-  (a Claude Code hook, a plugin's hook). A file under `/etc`, `/usr` or
+  (a Claude Code hook, a plugin's hook), as the sweep finds it itself: a
+  script one of these runs or sources is not one. A file under `/etc`, `/usr` or
   anywhere else, root's home as `sweep --root` shows it (`/root/…`), and
   every other kind of file in your home keeps it an alert: autostart
   entries, user units, Hyprland's `exec` lines, cron jobs, Omarchy hooks and
   the rest are where persistence lives, and one claim graded medium must
-  never turn such a finding into a clear sweep;
+  never turn such a finding into a clear sweep. An agent's hook runs on its
+  own too; that risk was accepted for the plugin hooks settings came up in;
 - the review's verdict is `clear` (settings alone never make a review
   suspicious, so a claim beside another verdict is not believed) and it did
   not report text that speaks to the reviewer;

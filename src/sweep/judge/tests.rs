@@ -1930,6 +1930,11 @@ fn only_shell_files_programs_and_agent_entries_in_the_home_may_hold_settings() {
             item("etc/bash.bashrc", Category::Shell, Tier::Unknown),
             item("root/.bashrc", Category::Shell, Tier::Unknown),
             item("usr/local/bin/claude", Category::LocalBin, Tier::Unknown),
+            // What a start-up file runs takes its kind, and is not one.
+            Item {
+                run_by: Some("home/u/.bashrc".into()),
+                ..item("home/u/.cache/.x/run.sh", Category::Shell, Tier::Unknown)
+            },
             // One file two items stand for, one of them of a kind that may
             // not hold settings.
             item("home/u/.profile", Category::Shell, Tier::Unknown),

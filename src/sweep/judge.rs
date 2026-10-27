@@ -106,24 +106,35 @@ pub(super) fn judge(
 
 /// The kinds of item whose AI findings may be the owner's own settings:
 /// shell start-up files, programs in a directory of the home's `PATH` and
-/// what AI coding agents start (an alias, a wrapper, a plugin's hook).
-/// The owner chose these three. Every other kind stays an alert whatever
-/// the reviewer says: autostart entries, user units, Hyprland's `exec`
-/// lines, cron jobs, Omarchy hooks and the rest are where persistence
-/// lives, and one claim graded medium must never turn such a finding into
-/// a clear sweep.
+/// the entries AI coding agents start (an alias, a wrapper, a plugin's
+/// hook). The owner chose these three. Every other kind stays an alert
+/// whatever the reviewer says: autostart entries, user units, Hyprland's
+/// `exec` lines, cron jobs, Omarchy hooks and the rest are where
+/// persistence lives, and one claim graded medium must never turn such a
+/// finding into a clear sweep.
+///
+/// An agent's hook runs on its own too, at every start or tool call, and
+/// every entry of one configuration file is sent under that file's path.
+/// The owner accepted that risk for the plugin hooks the settings came up
+/// in; the other checks of `Report::is_owner_setting` still apply.
 const SETTING_CATEGORIES: [Category; 3] = [Category::Shell, Category::LocalBin, Category::Agent];
 
 /// The files, by the path the AI is sent them under, that may hold the
 /// owner's own settings: in the home, and of an item of a kind in
-/// `SETTING_CATEGORIES`. A file that another item of any other kind also
-/// stands for is left out.
+/// `SETTING_CATEGORIES` that the catalogue found itself. A file reached by
+/// following what another runs or sources is left out: it takes the kind
+/// of whatever reached it first, so a payload anywhere in the home that a
+/// start-up file runs would count as a start-up file. So is a file that an
+/// item of any other kind also stands for.
 fn setting_paths(collection: &Collection, home: Option<&str>) -> HashSet<String> {
     let mut allowed = HashSet::new();
     let mut refused = HashSet::new();
     for item in &collection.items {
         let path = shown_path(checked_path(item), home);
-        if path.starts_with("~/") && SETTING_CATEGORIES.contains(&item.category) {
+        if path.starts_with("~/")
+            && item.run_by.is_none()
+            && SETTING_CATEGORIES.contains(&item.category)
+        {
             allowed.insert(path);
         } else {
             refused.insert(path);
