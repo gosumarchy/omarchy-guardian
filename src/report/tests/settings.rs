@@ -176,15 +176,31 @@ fn each_condition_alone_keeps_the_finding_an_alert() {
 }
 
 #[test]
-fn a_suspicious_review_with_only_settings_still_blocks() {
+fn a_claim_in_a_review_that_is_not_clear_is_not_believed() {
+    // Suspicious: the claimed finding is the alert that blocks.
     let mut report = sweep();
     report
         .agent_runs
         .push(run(&[BASHRC], &claimed("suspicious", BASHRC, "low")));
-    assert_eq!(report.owner_settings().count(), 1);
-    assert_eq!(report.counts().total(), 0);
+    assert_eq!(report.owner_settings().count(), 0);
+    assert_eq!(report.counts().low, 1);
     assert_eq!(report.decide(&standard), FINDINGS);
-    assert_eq!(report.overruled_summary(10), ["AI review: SUSPICIOUS"]);
+    assert_eq!(
+        report.overruled_summary(10),
+        ["LOW ~/.bashrc (AI) skips permission prompts"]
+    );
+
+    // Inconclusive: incomplete, and nothing is shown as a setting.
+    let mut report = sweep();
+    report
+        .agent_runs
+        .push(run(&[BASHRC], &claimed("inconclusive", BASHRC, "medium")));
+    assert_eq!(report.owner_settings().count(), 0);
+    assert!(report.flagged_paths().contains(BASHRC));
+    assert_eq!(
+        report.decide(&standard),
+        Decision::Blocked(Blocked::Incomplete)
+    );
 }
 
 #[test]

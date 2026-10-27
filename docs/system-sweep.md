@@ -1750,7 +1750,9 @@ of this holds:
 - every file it names is in your home (shown as `~/…`) and was sent in that
   AI request; a file under `/etc`, `/usr` or anywhere else, and root's home
   as `sweep --root` shows it (`/root/…`), keeps it an alert;
-- the same review did not report text that speaks to the reviewer;
+- the review's verdict is `clear` (settings alone never make a review
+  suspicious, so a claim beside another verdict is not believed) and it did
+  not report text that speaks to the reviewer;
 - no local rule matched in that file: the reviewer is asked to confirm or
   dismiss each local match, so a mark beside one may be about it, and the
   local rules' own findings stay alerts whatever the AI says;
@@ -1765,9 +1767,7 @@ settings" below "Needs a look" with a line `Settings: N noted · not alerts`
 in the box; the report has a table "Your own settings (not alerts)" with the
 reviewer's grade dimmed, and so does the page. `--json` writes one with
 `"severity": "setting"` and the reviewer's grade as `"graded"`, and the audit
-trail records how many there were (`settings=N`). A review that the reviewer
-called `suspicious` while its findings are all settings still blocks, as a
-suspicious verdict with no finding does. A sweep with settings is not
+trail records how many there were (`settings=N`). A sweep with settings is not
 recorded as an approved version, so each file is reviewed again (an
 unchanged one from the cache) and its setting shown again.
 

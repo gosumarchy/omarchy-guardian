@@ -522,10 +522,13 @@ impl Report {
     /// all of these must hold:
     ///
     /// - the reviewer marked it `owner_setting` and graded it below high;
-    /// - its review did not say the content spoke to the reviewer;
+    /// - its review is clear (the reviewer is told settings alone never
+    ///   make a review suspicious, so a claim beside any other verdict is
+    ///   not believed) and did not say the content spoke to the reviewer;
     /// - every file it names, among all the runs' files, is in the home
-    ///   (labelled `~/`) and of a class in `ReviewScope::setting_classes`,
-    ///   and one of them was sent in `run`;
+    ///   (labelled `~/`, as `sweep::judge::label` names a file there) and
+    ///   of a class in `ReviewScope::setting_classes`, and one of them was
+    ///   sent in `run`;
     /// - every class of `run` is in `setting_classes`;
     /// - no local rule matched in a file it names: the reviewer is asked to
     ///   confirm or dismiss each local finding, and a claim beside one may
@@ -537,6 +540,7 @@ impl Report {
             return false;
         };
         if !finding.owner_setting
+            || review.status != Status::Clear
             || finding.severity == Severity::High
             || review.addresses_reviewer()
         {
@@ -628,9 +632,6 @@ impl Report {
                             }
                         })
                         .collect();
-                    // A suspicious review whose findings are all settings
-                    // still decides: the reviewer was asked not to call a
-                    // review suspicious for settings alone.
                     if review.status == Status::Suspicious && flagged.is_empty() {
                         flagged.clone_from(&classes);
                     }
@@ -784,7 +785,6 @@ impl Report {
             match &run.outcome {
                 AgentOutcome::Reviewed(_) if self.is_remarks(run) => {}
                 AgentOutcome::Reviewed(review) => {
-                    let before = lines.len();
                     lines.extend(
                         review
                             .findings
@@ -799,7 +799,7 @@ impl Report {
                                 )
                             }),
                     );
-                    if review.status != Status::Clear && lines.len() == before {
+                    if review.status != Status::Clear && review.findings.is_empty() {
                         lines.push(format!("AI review: {}", review.status.label()));
                     }
                 }

@@ -262,12 +262,9 @@ fn verdict_lines(report: &Report, decision: Decision) -> (Vec<Span>, &'static st
             "2",
         ));
     }
-    // Suspicious with no alert of its own: none named, or only the
-    // owner's settings, which do not count.
     let unnamed = report.agent_runs.iter().any(|run| {
         matches!(&run.outcome, AgentOutcome::Reviewed(review)
-            if review.status == Status::Suspicious
-                && review.findings.iter().all(|finding| report.is_owner_setting(run, finding)))
+            if review.status == Status::Suspicious && review.findings.is_empty())
     });
     if unnamed {
         lines.push(Span::new(
