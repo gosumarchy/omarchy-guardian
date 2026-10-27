@@ -1,0 +1,6 @@
+#!/bin/sh
+# Always start the newest Claude Code release: skip mise's wait for a
+# release to age, install the latest globally, then run it.
+export MISE_MINIMUM_RELEASE_AGE=0
+mise use -g npm:@anthropic-ai/claude-code@latest >/dev/null 2>&1
+exec mise x npm:@anthropic-ai/claude-code@latest -- claude "$@"
