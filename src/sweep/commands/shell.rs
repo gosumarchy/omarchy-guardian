@@ -246,19 +246,26 @@ fn unquoted(word: &str) -> Option<&str> {
 }
 
 /// Whether `rest`, the words after `cd DIR`, only print where that left
-/// the shell: `cd`'s output sent nowhere, then `&& pwd` or `; pwd`, with
-/// `-P` or `-L` and nothing after it.
+/// the shell: `cd`'s output sent nowhere, then `&& pwd`, or `; pwd` with
+/// the `;` a word of its own, with `-P` or `-L` and nothing after it. A
+/// `/dev/null` not after a redirection is a second argument, which makes
+/// `cd` fail.
 fn is_pwd(rest: &[&str]) -> bool {
     let Some(at) = rest.iter().position(|word| matches!(*word, "&&" | ";")) else {
         return false;
     };
-    let quiet = rest[..at].iter().all(|word| {
-        matches!(
-            *word,
-            "&>" | ">" | "/dev/null" | ">/dev/null" | "&>/dev/null" | "2>&1" | "2>/dev/null"
-        )
-    });
-    quiet && matches!(rest[at + 1..], ["pwd"] | ["pwd", "-P" | "-L"])
+    let mut words = rest[..at].iter();
+    while let Some(word) = words.next() {
+        let quiet = match *word {
+            ">/dev/null" | "&>/dev/null" | "2>/dev/null" | "2>&1" => true,
+            ">" | "&>" | "2>" => words.next() == Some(&"/dev/null"),
+            _ => false,
+        };
+        if !quiet {
+            return false;
+        }
+    }
+    matches!(rest[at + 1..], ["pwd"] | ["pwd", "-P" | "-L"])
 }
 
 /// How deep `$(…)` inside `$(…)` is written in; three covers
@@ -526,7 +533,9 @@ pub(super) fn started(line: &str) -> Vec<String> {
         let words = split(statement);
         // A command that is itself a substitution (`"$(dirname "$1")/x"`)
         // names a program no one can tell: kept as written, following says
-        // so.
+        // so. The statement is still read below, since an empty
+        // substitution leaves the next word as the command
+        // (`$(true) /opt/x`).
         if let Some(word) = words.iter().find(|word| is_command(word))
             && (word.contains("$(") || word.contains('`'))
         {
@@ -534,7 +543,6 @@ pub(super) fn started(line: &str) -> Vec<String> {
             if !found.contains(&word) {
                 found.push(word);
             }
-            continue;
         }
         // The words inside a substitution (`X=$(find /etc/x)`) are not the
         // statement's command: the substitution is read below. What comes

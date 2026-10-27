@@ -467,6 +467,16 @@ fn what_a_start_up_file_or_a_command_line_names_is_found() {
         "{:?}",
         commands(Category::Shell, "etc/profile.d/debuginfod.sh", debuginfod)
     );
+    // An empty substitution leaves the next word as the command: both are
+    // kept.
+    for line in [
+        "$( true ) /opt/evil",
+        "X=$(a $(b)x c) /opt/evil",
+        "\"$(a)\"b /opt/evil",
+    ] {
+        let runs = commands(Category::Shell, "home/u/.bashrc", line);
+        assert!(runs.contains(&"/opt/evil".to_string()), "{line}: {runs:?}");
+    }
     // A line of nothing but substitutions is read once, not once per
     // substitution: `/x1`, `/x2`, and what `/x1` prints, which the line
     // runs as its command.
@@ -884,6 +894,10 @@ fn a_script_names_its_own_directory_in_the_ways_scripts_do() {
             r#". "$(cd "$(dirname "$0")" && pwd >/dev/null)/c.sh""#,
         ),
         ("#!/bin/bash", r#". "$(cd "$(dirname "$0")" pwd)/c.sh""#),
+        (
+            "#!/bin/bash",
+            r#". "$(cd "$(dirname "$0")" /dev/null && pwd)/c.sh""#,
+        ),
         (
             "#!/bin/bash",
             r#". "$(cd "$(dirname "$0")" -P && pwd)/c.sh""#,
