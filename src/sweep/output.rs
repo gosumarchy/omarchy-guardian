@@ -11,7 +11,7 @@ use crate::agent::Status;
 use crate::json::Json;
 use crate::layout::{self, Painter, Span, Table};
 use crate::report::html::{self, esc};
-use crate::report::{AgentOutcome, Decision, Report, Severity};
+use crate::report::{AgentOutcome, Decision, Gap, Report, Severity};
 use crate::text::shown;
 
 /// A tier's word in the list and its colour.
@@ -137,7 +137,16 @@ fn concerns(report: &Report) -> Vec<(String, Concern)> {
 /// Why the review is incomplete, one line each: what it could not read and
 /// the AI reviews that did not run.
 fn not_reviewed(report: &Report) -> Vec<String> {
-    let mut lines: Vec<String> = report.gaps.iter().map(ToString::to_string).collect();
+    // A gap of the sweep's own is said without the "sweep: " its `Display`
+    // starts with: under the sweep's summary that repeats what is said.
+    let mut lines: Vec<String> = report
+        .gaps
+        .iter()
+        .map(|gap| match gap {
+            Gap::Sweep(text) => text.clone(),
+            gap => gap.to_string(),
+        })
+        .collect();
     lines.extend(
         report
             .agent_runs
@@ -718,12 +727,14 @@ mod tests {
             ))));
         let lines = not_reviewed(&report);
         assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(lines[0].contains("/boot/EFI could not be listed"));
+        assert_eq!(lines[0], "/boot/EFI could not be listed");
         assert!(lines[1].starts_with("AI review: ") && lines[1].contains("no network"));
 
         let text = attention(&report, Painter::plain());
         assert!(
-            text.contains("Not reviewed") && text.contains("! AI review: "),
+            text.contains("Not reviewed")
+                && text.contains("! /boot/EFI could not be listed")
+                && text.contains("! AI review: "),
             "{text}"
         );
     }
