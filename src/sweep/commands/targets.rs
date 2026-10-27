@@ -6,6 +6,7 @@ use std::path::Path;
 
 use crate::paths::file_name;
 use crate::sweep::programs::{self, Argument, ScriptArguments, is_script_shell};
+use crate::sweep::read::has_extension;
 
 /// A wrapper that runs the command after it: its name, its options that
 /// take the next word as their value, and how many words of its own come
@@ -365,6 +366,7 @@ fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
             }
             // A shell's options that take a value are the ones above.
             if shell || argument == Argument::Script {
+                found.extend(scripts_beside(lookup, word, words));
                 break;
             }
             // Each word after an option that takes a value is looked at;
@@ -378,6 +380,45 @@ fn targets_of(lookup: &Lookup<'_>, command: &str) -> Vec<String> {
     }
     found
 }
+
+/// The scripts among `arguments` that lie in the directory of `script`,
+/// the one an interpreter was handed: a wrapper often runs the script it
+/// is given beside it (`bash hooks/sg-python.sh hooks/reminder.py`). Only
+/// a file with a script's extension in that same directory: any other
+/// argument may be a key, a log or a document, which the review has no
+/// business reading.
+fn scripts_beside<'a>(
+    lookup: &Lookup<'_>,
+    script: &str,
+    arguments: impl Iterator<Item = &'a str>,
+) -> Vec<String> {
+    let Some((directory, _)) = script.rsplit_once('/') else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let mut beside = arguments.filter(|argument| {
+        argument.rsplit_once('/').is_some_and(|(folder, name)| {
+            folder == directory
+                && SCRIPT_EXTENSIONS
+                    .iter()
+                    .any(|extension| has_extension(name, extension))
+        })
+    });
+    for argument in beside.by_ref().take(MAX_OPTION_VALUES) {
+        found.extend(locate(lookup, argument));
+    }
+    if beside.next().is_some() {
+        lookup.capped.set(true);
+    }
+    found
+}
+
+/// What a script handed to a wrapper beside it is named (`scripts_beside`):
+/// the languages of `programs::LANGUAGES` that are run from a file and the
+/// shells. Arbitrary beyond that.
+const SCRIPT_EXTENSIONS: &[&str] = &[
+    "sh", "bash", "zsh", "py", "pl", "rb", "js", "mjs", "cjs", "ts", "lua", "php",
+];
 
 /// Whether `word`, a program or a script, is named through a variable or
 /// a substitution that nothing wrote in (`$SCRIPT_DIR/x`, `/opt/$V/run`,

@@ -4,7 +4,7 @@
 
 use super::{MAX_STARTED_LINE, MAX_SUBSTITUTIONS, split};
 use crate::paths::file_name;
-use crate::sweep::programs::{SCRIPT_SHELLS, is_script_shell};
+use crate::sweep::programs::{SCRIPT_SHELLS, is_script_shell, runs_a_script};
 use crate::sweep::read;
 
 /// The shell a `#!` line (without the `#!`) runs, if it runs one: the
@@ -482,6 +482,77 @@ fn case_pattern_end(branch: &str) -> Option<usize> {
     plain.then_some(close + 1)
 }
 
+/// Whether `word` names a program by a path.
+///
+/// A word of slashes alone is no program: `//` is jq's operator in a
+/// quoted filter (`jq '.a | .b // ""'`), cut out where the line is split
+/// at the `|` inside it.
+fn is_path(word: &str) -> bool {
+    ["/", "~/", "$HOME/", "${HOME}/"]
+        .iter()
+        .any(|start| word.starts_with(start))
+        && !word.chars().all(|c| c == '/')
+}
+
+/// Whether `word` is a statement's command, not what comes before it:
+/// keywords, wrappers that run it, assignments, a `case` pattern.
+fn is_command(word: &str) -> bool {
+    !(matches!(
+        word,
+        "exec"
+            | "nohup"
+            | "command"
+            | "setsid"
+            | "env"
+            | "nice"
+            | "time"
+            | "sudo"
+            | "doas"
+            | "if"
+            | "elif"
+            | "while"
+            | "until"
+            | "then"
+            | "do"
+            | "else"
+            | "!"
+            | "{"
+            | "("
+    ) || (word.contains('=') && !is_path(word))
+        // A `case` pattern (`x)`), not a subshell's last program.
+        || (word.ends_with(')') && !is_path(word.trim_end_matches(')')))
+        || word.starts_with(['>', '<'])
+        || word.starts_with('-'))
+}
+
+/// The command line of a statement whose command, `words[0]`, is an
+/// interpreter named bare and handed a path (`bash "$DIR/x.sh"`, `perl
+/// ./helper.pl`), for following to find its script as on any command
+/// line, or to say it is unknown. awk is left out: its first operand is
+/// its program (`'{print $1}'`), and the paths after that are what it
+/// reads. A word no quote can hold leaves the statement as it was.
+fn handed_script(words: &[String]) -> Option<String> {
+    let (interpreter, arguments) = words.split_first()?;
+    let handed = !interpreter.contains('/')
+        && runs_a_script(interpreter)
+        && !matches!(interpreter.as_str(), "awk" | "gawk" | "mawk")
+        && arguments.iter().any(|word| word.contains('/'));
+    if !handed {
+        return None;
+    }
+    let quoted = |word: &String| {
+        if !word.contains([' ', '\t', '\'', '"']) {
+            Some(word.clone())
+        } else if !word.contains('\'') {
+            Some(format!("'{word}'"))
+        } else {
+            (!word.contains('"')).then(|| format!("\"{word}\""))
+        }
+    };
+    let words: Option<Vec<String>> = words.iter().map(quoted).collect();
+    words.map(|words| words.join(" "))
+}
+
 /// Whether `word` names a command under a variable's directory
 /// (`"$TOOLS/x"`, `$1/x`): where it leads is not known, and following says
 /// so.
@@ -575,15 +646,6 @@ pub(super) fn started(line: &str, start: LineStart) -> Vec<String> {
     if line.len() > MAX_STARTED_LINE {
         return Vec::new();
     }
-    // A word of slashes alone is no program: `//` is jq's operator in a
-    // quoted filter (`jq '.a | .b // ""'`), cut out where the line is split
-    // at the `|` inside it.
-    let is_path = |word: &str| {
-        ["/", "~/", "$HOME/", "${HOME}/"]
-            .iter()
-            .any(|start| word.starts_with(start))
-            && !word.chars().all(|c| c == '/')
-    };
     let clean = |word: &str| {
         word.trim_matches(['"', '\'', ';', '&', ')', '(', '`'])
             .to_string()
@@ -596,37 +658,11 @@ pub(super) fn started(line: &str, start: LineStart) -> Vec<String> {
         .replace(">&", "> ")
         .replace("&>", " >");
     for statement in statements.split([';', '|', '&']) {
-        // Past what comes before a command: keywords, wrappers that run
-        // it, assignments, a `case` pattern.
-        let is_command = |word: &String| {
-            !(matches!(
-                word.as_str(),
-                "exec"
-                    | "nohup"
-                    | "command"
-                    | "setsid"
-                    | "env"
-                    | "nice"
-                    | "time"
-                    | "sudo"
-                    | "doas"
-                    | "if"
-                    | "elif"
-                    | "while"
-                    | "until"
-                    | "then"
-                    | "do"
-                    | "else"
-                    | "!"
-                    | "{"
-                    | "("
-            ) || (word.contains('=') && !is_path(word))
-                // A `case` pattern (`x)`), not a subshell's last program.
-                || (word.ends_with(')') && !is_path(word.trim_end_matches(')')))
-                || word.starts_with(['>', '<'])
-                || word.starts_with('-'))
-        };
         let words = split(statement);
+        let handed = words
+            .iter()
+            .position(|word| is_command(word))
+            .and_then(|at| handed_script(&words[at..]));
         // A command that is itself a substitution (`"$(dirname "$1")/x"`)
         // names a program no one can tell: kept as written, following says
         // so. The statement is still read below, since an empty
@@ -664,6 +700,12 @@ pub(super) fn started(line: &str, start: LineStart) -> Vec<String> {
                 !inside
             })
             .collect();
+        if unknown_kept
+            && let Some(command) = handed
+            && !found.contains(&command)
+        {
+            found.push(command);
+        }
         let first = words.into_iter().find(|word| is_command(word));
         if let Some(word) = first
             .map(|word| clean(&word))
@@ -682,6 +724,17 @@ pub(super) fn started(line: &str, start: LineStart) -> Vec<String> {
                 .unwrap_or_default();
             if is_path(&word) && !found.contains(&word) {
                 found.push(word);
+            }
+            // `$(perl "$DIR/check.pl")`: an interpreter is handed its script
+            // inside one too, and a substitution runs on any line. Each is
+            // read up to its first `)` or backtick, at most
+            // `MAX_SUBSTITUTIONS` times a line.
+            let inner = &line[at + opener.len()..];
+            let inner = &inner[..inner.find([')', '`']).unwrap_or(inner.len())];
+            if let Some(command) = handed_script(&split(inner))
+                && !found.contains(&command)
+            {
+                found.push(command);
             }
         }
     }
