@@ -40,8 +40,8 @@
 # files. The count is printed beside each case's pass rate as `clear+low`,
 # and the run ends with the block cases that had it in any run, and the clear
 # cases that passed only because remarks do not block. This changes no pass
-# or fail. A system case shows "-": the sweep counts every AI finding, and
-# its cases are judged by severity already.
+# or fail. A system case shows "-": the sweep counts every AI finding but
+# the owner's own settings, and its cases are judged by severity already.
 # A system case is judged by the AI's own medium or high findings on the
 # planted files only: the rest of the real system (and its root-only files)
 # would otherwise decide the sweep's exit code, and local rules would hide
