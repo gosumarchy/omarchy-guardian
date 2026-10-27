@@ -161,11 +161,15 @@ or `realpath` in its place, and `$(cd "…" && pwd)` around one
 (`SCRIPT_DIR=…`, then `$SCRIPT_DIR/helper.sh`). Under bash (a first line naming
 it) `$(dirname "${BASH_SOURCE[0]}")` and `${BASH_SOURCE%/*}` count too. For a
 script started through a link, `$0` names the link's directory, which may hold
-other files. A line that would grow past 64 KB is left as written.
+other files, while `readlink -f` and `realpath` name the real file, and
+`dirname` of that its directory. Only a word that is bare or in one pair of
+double quotes counts, and only `cd DIR && pwd` (with `-P` or `-L`, and `cd`'s
+output sent nowhere) as the `cd` form. A line that would grow past 64 KB is left as written.
 
 Other variables are not understood: a program or script whose path holds one
-anywhere (`$PREFIX/bin/x`, `/opt/$V/run`), or a substitution, is not followed,
-and the item says that what it runs was not all followed. A Hyprland `source` with `*` or
+anywhere (`$PREFIX/bin/x`, `/opt/$V/run`, `"$1/x"`), or a substitution
+(`"$(dirname "$1")/x"`, sourced or run), is not followed, and the item says
+that what it runs was not all followed. A Hyprland `source` with `*` or
 `?` in its last part is followed to the files it matches (up to 1024).
 
 A bare command name in an auto-run file is looked for along the list of

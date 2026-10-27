@@ -468,9 +468,13 @@ fn what_a_start_up_file_or_a_command_line_names_is_found() {
         commands(Category::Shell, "etc/profile.d/debuginfod.sh", debuginfod)
     );
     // A line of nothing but substitutions is read once, not once per
-    // substitution.
+    // substitution: `/x1`, `/x2`, and what `/x1` prints, which the line
+    // runs as its command.
     let many = "$(/x1 $(/x2 ".repeat(100);
-    assert_eq!(commands(Category::Shell, "home/u/.bashrc", &many).len(), 2);
+    assert_eq!(
+        commands(Category::Shell, "home/u/.bashrc", &many),
+        ["$(/x1", "/x1", "/x2"]
+    );
     let long = "$(/x ".repeat(400_000);
     let started = CpuInstant::now();
     assert!(commands(Category::Shell, "home/u/.bashrc", &long).is_empty());
@@ -843,7 +847,11 @@ fn a_script_names_its_own_directory_in_the_ways_scripts_do() {
     let path = "home/u/w/s/x.sh";
     let runs = |first: &str, line: &str| {
         let text = format!("{first}\n{line}\n");
-        commands(Category::Shell, path, &with_script_directory(&text, path))
+        commands(
+            Category::Shell,
+            path,
+            &with_script_directory(&text, path, path),
+        )
     };
     for line in [
         r#". "$(dirname "$0")/c.sh""#,
@@ -858,20 +866,40 @@ fn a_script_names_its_own_directory_in_the_ways_scripts_do() {
     ] {
         assert_eq!(runs("#!/bin/bash", line), ["/home/u/w/s/c.sh"], "{line}");
     }
-    // Another file's directory, a `cd` that goes on to do more, the text
-    // `'$0'`, and `$BASH_SOURCE` where no bash sets it are not the
-    // script's own.
+    // Another file's directory, a `cd` that goes on to do more or prints
+    // nothing, the text `'$0'`, a quote left open around the `)`, and
+    // `$BASH_SOURCE` where no bash sets it are not the script's own. Each
+    // is kept as written, sourced or run, so following says it is unknown.
     for (first, line) in [
         ("#!/bin/bash", r#". "$(dirname "$1")/c.sh""#),
+        ("#!/bin/bash", r#""$(dirname "$1")/c.sh" a"#),
+        ("#!/bin/bash", r#""$(pwd)/c.sh""#),
+        ("#!/bin/bash", r#""$1/c.sh" a"#),
         (
             "#!/bin/bash",
             r#". "$(cd "$(dirname "$0")" && git rev-parse --show-toplevel)/c.sh""#,
         ),
+        (
+            "#!/bin/bash",
+            r#". "$(cd "$(dirname "$0")" && pwd >/dev/null)/c.sh""#,
+        ),
+        ("#!/bin/bash", r#". "$(cd "$(dirname "$0")" pwd)/c.sh""#),
+        (
+            "#!/bin/bash",
+            r#". "$(cd "$(dirname "$0")" -P && pwd)/c.sh""#,
+        ),
         ("#!/bin/bash", ". \"$(dirname '$0')/c.sh\""),
+        ("#!/bin/bash", r#". $(dirname "$0)/../o")/c.sh"#),
         ("#!/bin/sh", r#". "$(dirname "${BASH_SOURCE[0]}")/c.sh""#),
+        ("#!/bin/sh", r#""$(dirname "${BASH_SOURCE[0]}")/c.sh" a"#),
         ("#!/bin/sh", r#". "${BASH_SOURCE%/*}/c.sh""#),
     ] {
-        assert_ne!(runs(first, line), ["/home/u/w/s/c.sh"], "{line}");
+        let runs = runs(first, line);
+        assert!(
+            runs.iter().all(|run| !run.starts_with("/home/u/w/s/"))
+                && runs.iter().any(|run| run.contains('$')),
+            "{line}: {runs:?}"
+        );
     }
 }
 
@@ -882,7 +910,9 @@ fn a_line_that_would_grow_long_keeps_its_own_directory_unwritten() {
     let line = "${0%/*}/c ".repeat(MAX_STARTED_LINE / 10 - 1);
     let text = format!("#!/bin/sh\n{line}\n");
     assert!(line.len() <= MAX_STARTED_LINE);
-    assert_eq!(with_script_directory(&text, path), text);
+    assert_eq!(with_script_directory(&text, path, path), text);
+    // Left as written, each `${0%/*}/c` is a program no one can tell.
+    assert!(commands(Category::Shell, path, &text).contains(&"${0%/*}/c".to_string()));
 }
 
 #[test]
@@ -892,7 +922,7 @@ fn writing_in_a_scripts_directory_takes_time_in_proportion_to_the_line() {
     let line = format!("dirname {})", "$(".repeat(30_000));
     let text = format!("#!/bin/bash\n{line}\n");
     let start = CpuInstant::now();
-    with_script_directory(&text, "home/u/x.sh");
+    with_script_directory(&text, "home/u/x.sh", "home/u/x.sh");
     let spent = start.elapsed();
     // Arbitrary, and generous: linear work on 60 KB takes well under a
     // millisecond; the quadratic scan this guards against took seconds.

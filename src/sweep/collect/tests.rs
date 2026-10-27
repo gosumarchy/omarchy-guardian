@@ -347,7 +347,7 @@ fn a_script_is_followed_to_the_helpers_beside_it() {
     write(
         root,
         "etc/systemd/system/a.service",
-        "[Service]\nExecStart=/home/u/bin/run.sh\nExecStartPost=/home/u/bin/other.sh\n",
+        "[Service]\nExecStart=/home/u/bin/run.sh\nExecStartPost=/home/u/bin/other.sh\nExecStop=/home/u/bin/third.sh\n",
     );
     write(
         root,
@@ -364,6 +364,11 @@ fn a_script_is_followed_to_the_helpers_beside_it() {
     write(root, "home/u/bin/helper.sh", "#!/bin/sh\ntrue\n");
     // A directory nothing here can tell is not followed, and says so.
     write(root, "home/u/bin/other.sh", "#!/bin/sh\n\"$TOOLS/x.sh\"\n");
+    write(
+        root,
+        "home/u/bin/third.sh",
+        "#!/bin/sh\n\"$(dirname \"$1\")/x.sh\" a\n",
+    );
     let index = PackageIndex::with_foreign(HashSet::new());
     let scope = Scope {
         root,
@@ -390,8 +395,10 @@ fn a_script_is_followed_to_the_helpers_beside_it() {
     assert!(!super::is_capped(run), "{:?}", run.notes);
     at("home/u/bin/common.sh");
     at("home/u/bin/helper.sh");
-    let other = at("home/u/bin/other.sh");
-    assert!(super::is_capped(other), "{:?}", other.notes);
+    for unknown in ["home/u/bin/other.sh", "home/u/bin/third.sh"] {
+        let unknown = at(unknown);
+        assert!(super::is_capped(unknown), "{:?}", unknown.notes);
+    }
 }
 
 #[test]
@@ -406,9 +413,15 @@ fn a_script_started_through_a_link_finds_its_helpers_beside_the_link() {
     write(
         root,
         "home/u/w/run.sh",
-        "#!/bin/sh\n. \"$(dirname \"$0\")/common.sh\"\n",
+        concat!(
+            "#!/bin/sh\n",
+            ". \"$(dirname \"$0\")/common.sh\"\n",
+            ". \"$(dirname \"$(readlink -f \"$0\")\")/real.sh\"\n",
+        ),
     );
     write(root, "home/u/bin/common.sh", "#!/bin/sh\ntrue\n");
+    // `readlink -f` resolves the link: what lies beside the real file.
+    write(root, "home/u/w/real.sh", "#!/bin/sh\ntrue\n");
     symlink("../w/run.sh", root.join("home/u/bin/run")).unwrap();
     // Handed to a shell, as an agent's hook is (`bash ~/.claude/x.sh`):
     // no first line or name says it is a script.
@@ -439,7 +452,7 @@ fn a_script_started_through_a_link_finds_its_helpers_beside_the_link() {
     };
 
     let run = at("home/u/w/run.sh");
-    assert_eq!(run.runs, ["/home/u/bin/common.sh"]);
+    assert_eq!(run.runs, ["/home/u/bin/common.sh", "/home/u/w/real.sh"]);
     assert!(!super::is_capped(run), "{:?}", run.notes);
     let hand = at("home/u/w/hand");
     assert_eq!(hand.runs, ["/home/u/w/helper.sh"]);

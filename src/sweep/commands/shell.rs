@@ -80,30 +80,35 @@ pub(super) fn zdotdir(line: &str) -> Vec<String> {
 /// to the root), with the script's own directory written in where it names
 /// it, as scripts find the helpers that lie beside them:
 /// `$(dirname "$0")`, `${0%/*}`, under bash also `$(dirname
-/// "${BASH_SOURCE[0]}")` and `${BASH_SOURCE%/*}`, the file itself for
-/// `$(readlink -f "$0")` and `$(realpath "$0")`, and `$(cd "…" && pwd)`
-/// around such a directory. `SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"`
-/// then sets a path variable like any other.
+/// "${BASH_SOURCE[0]}")` and `${BASH_SOURCE%/*}`, the real `file` for
+/// `$(readlink -f "$0")` and `$(realpath "$0")` (and its directory for
+/// `dirname` of that), and `$(cd "…" && pwd)` around such a directory.
+/// `SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"` then sets a path variable
+/// like any other.
 ///
 /// `$0` is the path the script was started by, so `started` is the link
-/// that led to it where one did; in a file a shell sources it is the shell,
+/// that led to `file` where one did; in a file a shell sources it is the shell,
 /// which is why a start-up file never comes here. `$BASH_SOURCE` is only
 /// set under bash, so only a script whose first line names bash has it
 /// written in; one handed to `sh` despite that line is read as if bash ran
 /// it. A line that is long, or that would grow long, is left as written:
 /// its `$(dirname` then names no file, and following says so.
-pub(crate) fn with_script_directory(text: &str, started: &str) -> String {
+pub(crate) fn with_script_directory(text: &str, started: &str, file: &str) -> String {
     let bash = text
         .lines()
         .next()
         .and_then(|line| line.strip_prefix("#!"))
         .and_then(shebang_shell)
         == Some("bash");
+    let directory = |path: &str| {
+        path.rsplit_once('/')
+            .map_or_else(|| "/".to_string(), |(directory, _)| format!("/{directory}"))
+    };
     let own = OwnPath {
-        file: format!("/{started}"),
-        directory: started
-            .rsplit_once('/')
-            .map_or_else(|| "/".to_string(), |(directory, _)| format!("/{directory}")),
+        started: format!("/{started}"),
+        directory: directory(started),
+        file: format!("/{file}"),
+        file_directory: directory(file),
         bash,
     };
     let mut out = String::with_capacity(text.len());
@@ -116,11 +121,14 @@ pub(crate) fn with_script_directory(text: &str, started: &str) -> String {
     out
 }
 
-/// What a script someone runs names itself by: `$0` as a file and as a
-/// directory, and whether `$BASH_SOURCE` is set (it runs under bash).
+/// What a script someone runs names itself by: `$0` and its directory,
+/// the real file a link to it resolves to and that file's directory, and
+/// whether `$BASH_SOURCE` is set (it runs under bash).
 struct OwnPath {
-    file: String,
+    started: String,
     directory: String,
+    file: String,
+    file_directory: String,
     bash: bool,
 }
 
@@ -187,18 +195,19 @@ impl OwnPath {
     }
 
     /// What the command `call` inside `$(…)` prints when it asks for the
-    /// script's own file or directory: the file for `readlink -f` or
-    /// `realpath` of the script, the directory for its `dirname`, and for
-    /// `cd` into the directory and `pwd`. Only double quotes are taken off:
-    /// `'$0'` is the text `$0`, not the script.
+    /// script's own file or directory: the real file for `readlink -f` or
+    /// `realpath` of the script, the directory for `dirname` of either, and
+    /// for `cd` into such a directory and `pwd`. A word is bare or wrapped
+    /// in one pair of double quotes, nothing else: `'$0'` is the text `$0`,
+    /// and a quote left open (`"$0)/x"`) means the `)` was not the end.
     fn call(&self, call: &str) -> Option<&str> {
         let words: Vec<&str> = call
             .split_whitespace()
-            .map(|word| word.trim_matches('"'))
-            .filter(|word| *word != "--")
-            .collect();
+            .map(unquoted)
+            .filter(|word| *word != Some("--"))
+            .collect::<Option<_>>()?;
         let is_script = |word: &str| {
-            word == self.file
+            word == self.started
                 || matches!(word, "$0" | "${0}")
                 || (self.bash
                     && matches!(
@@ -211,36 +220,45 @@ impl OwnPath {
                 Some(&self.file)
             }
             ["dirname", script] if is_script(script) => Some(&self.directory),
-            ["cd", "-P" | "-L", there, rest @ ..] | ["cd", there, rest @ ..]
-                if *there == self.directory && is_pwd(rest) =>
-            {
-                Some(&self.directory)
+            ["dirname", file] if *file == self.file => Some(&self.file_directory),
+            ["cd", "-P" | "-L", there, rest @ ..] | ["cd", there, rest @ ..] if is_pwd(rest) => {
+                [&self.directory, &self.file_directory]
+                    .into_iter()
+                    .find(|directory| *there == directory.as_str())
+                    .map(String::as_str)
             }
             _ => None,
         }
     }
 }
 
+/// `word` without the one pair of double quotes around it, if it has
+/// them; `None` for any other quote in it.
+fn unquoted(word: &str) -> Option<&str> {
+    match word
+        .strip_prefix('"')
+        .and_then(|word| word.strip_suffix('"'))
+    {
+        Some(inner) if !inner.contains('"') => Some(inner),
+        Some(_) => None,
+        None => (!word.contains(['"', '\''])).then_some(word),
+    }
+}
+
 /// Whether `rest`, the words after `cd DIR`, only print where that left
-/// the shell: `&& pwd`, with its own `-P` and output sent nowhere.
+/// the shell: `cd`'s output sent nowhere, then `&& pwd` or `; pwd`, with
+/// `-P` or `-L` and nothing after it.
 fn is_pwd(rest: &[&str]) -> bool {
-    rest.contains(&"pwd")
-        && rest.iter().all(|word| {
-            matches!(
-                *word,
-                "pwd"
-                    | "-P"
-                    | "&&"
-                    | ";"
-                    | "&>"
-                    | ">"
-                    | "/dev/null"
-                    | ">/dev/null"
-                    | "&>/dev/null"
-                    | "2>&1"
-                    | "2>/dev/null"
-            )
-        })
+    let Some(at) = rest.iter().position(|word| matches!(*word, "&&" | ";")) else {
+        return false;
+    };
+    let quiet = rest[..at].iter().all(|word| {
+        matches!(
+            *word,
+            "&>" | ">" | "/dev/null" | ">/dev/null" | "&>/dev/null" | "2>&1" | "2>/dev/null"
+        )
+    });
+    quiet && matches!(rest[at + 1..], ["pwd"] | ["pwd", "-P" | "-L"])
 }
 
 /// How deep `$(…)` inside `$(…)` is written in; three covers
@@ -477,27 +495,7 @@ pub(super) fn started(line: &str) -> Vec<String> {
     for statement in statements.split([';', '|', '&']) {
         // Past what comes before a command: keywords, wrappers that run
         // it, assignments, a `case` pattern.
-        // The words inside a substitution (`X=$(find /etc/x)`) are not the
-        // statement's command: the substitution is read below. What comes
-        // after it (`X=$(date) ~/bin/y`) still is.
-        let mut depth = 0_usize;
-        let mut ticked = false;
-        let words: Vec<String> = split(statement)
-            .into_iter()
-            .filter(|word| {
-                let opens = word.contains("$(");
-                let inside = depth > 0 || ticked || opens || word.contains('`');
-                // Only a substitution's own brackets count: a subshell
-                // `( ~/bin/y )` hides nothing.
-                if depth > 0 || opens {
-                    depth = (depth + word.matches('(').count())
-                        .saturating_sub(word.matches(')').count());
-                }
-                ticked ^= word.matches('`').count() % 2 == 1;
-                !inside
-            })
-            .collect();
-        let first = words.into_iter().find(|word| {
+        let is_command = |word: &String| {
             !(matches!(
                 word.as_str(),
                 "exec"
@@ -524,13 +522,47 @@ pub(super) fn started(line: &str) -> Vec<String> {
                 || (word.ends_with(')') && !is_path(word.trim_end_matches(')')))
                 || word.starts_with(['>', '<'])
                 || word.starts_with('-'))
-        });
+        };
+        let words = split(statement);
+        // A command that is itself a substitution (`"$(dirname "$1")/x"`)
+        // names a program no one can tell: kept as written, following says
+        // so.
+        if let Some(word) = words.iter().find(|word| is_command(word))
+            && (word.contains("$(") || word.contains('`'))
+        {
+            let word = clean(word);
+            if !found.contains(&word) {
+                found.push(word);
+            }
+            continue;
+        }
+        // The words inside a substitution (`X=$(find /etc/x)`) are not the
+        // statement's command: the substitution is read below. What comes
+        // after it (`X=$(date) ~/bin/y`) still is.
+        let mut depth = 0_usize;
+        let mut ticked = false;
+        let words: Vec<String> = words
+            .into_iter()
+            .filter(|word| {
+                let opens = word.contains("$(");
+                let inside = depth > 0 || ticked || opens || word.contains('`');
+                // Only a substitution's own brackets count: a subshell
+                // `( ~/bin/y )` hides nothing.
+                if depth > 0 || opens {
+                    depth = (depth + word.matches('(').count())
+                        .saturating_sub(word.matches(')').count());
+                }
+                ticked ^= word.matches('`').count() % 2 == 1;
+                !inside
+            })
+            .collect();
+        let first = words.into_iter().find(|word| is_command(word));
         // A command under a variable's directory (`"$TOOLS/x"`) is kept
         // too: where it leads is not known, and following says so.
         let under_variable = |word: &str| {
             word.contains('/')
                 && word.strip_prefix('$').is_some_and(|name| {
-                    name.starts_with(|c: char| c == '{' || c == '_' || c.is_ascii_alphabetic())
+                    name.starts_with(|c: char| c == '{' || c == '_' || c.is_ascii_alphanumeric())
                 })
         };
         if let Some(word) = first
