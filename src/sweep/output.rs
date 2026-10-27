@@ -719,7 +719,7 @@ mod tests {
         let mut report = Report::default();
         report
             .gaps
-            .push(Gap::Sweep("/boot/EFI could not be listed".into()));
+            .push(Gap::Sweep("/boot/EFI: could not be listed".into()));
         report
             .agent_runs
             .push(run(AgentOutcome::Unavailable(Error::Message(
@@ -727,13 +727,13 @@ mod tests {
             ))));
         let lines = not_reviewed(&report);
         assert_eq!(lines.len(), 2, "{lines:?}");
-        assert_eq!(lines[0], "/boot/EFI could not be listed");
+        assert_eq!(lines[0], "/boot/EFI: could not be listed");
         assert!(lines[1].starts_with("AI review: ") && lines[1].contains("no network"));
 
         let text = attention(&report, Painter::plain());
         assert!(
             text.contains("Not reviewed")
-                && text.contains("! /boot/EFI could not be listed")
+                && text.contains("! /boot/EFI: could not be listed")
                 && text.contains("! AI review: "),
             "{text}"
         );
