@@ -143,6 +143,15 @@ fn not_reviewed(report: &Report) -> Vec<String> {
     lines
 }
 
+/// A line that says how many of `listed` were not shown, after the first
+/// `shown`; nothing when every one was.
+fn more(text: &mut String, listed: usize, shown: usize, painter: Painter) {
+    if listed > shown {
+        let rest = listed - shown;
+        let _ = writeln!(text, "  {}", painter.paint(&format!("… {rest} more"), "2"));
+    }
+}
+
 /// The list below the verdict box: what needs a look, the owner's own
 /// settings, then why the review is incomplete, each cut short with a
 /// count of the rest.
@@ -169,10 +178,7 @@ fn attention(report: &Report, painter: Painter) -> String {
                 painter.paint(&why, "2")
             );
         }
-        if concerns.len() > SHOWN_CONCERNS {
-            let rest = concerns.len() - SHOWN_CONCERNS;
-            let _ = writeln!(text, "  {}", painter.paint(&format!("… {rest} more"), "2"));
-        }
+        more(&mut text, concerns.len(), SHOWN_CONCERNS, painter);
     }
     let settings: Vec<_> = report.owner_settings().collect();
     if !settings.is_empty() {
@@ -186,10 +192,7 @@ fn attention(report: &Report, painter: Painter) -> String {
                 painter.paint(&shown(&finding.title), "2")
             );
         }
-        if settings.len() > SHOWN_CONCERNS {
-            let rest = settings.len() - SHOWN_CONCERNS;
-            let _ = writeln!(text, "  {}", painter.paint(&format!("… {rest} more"), "2"));
-        }
+        more(&mut text, settings.len(), SHOWN_CONCERNS, painter);
     }
     let gaps = not_reviewed(report);
     if !gaps.is_empty() {
@@ -201,10 +204,7 @@ fn attention(report: &Report, painter: Painter) -> String {
                 painter.paint(&format!("! {}", shown(gap)), "33")
             );
         }
-        if gaps.len() > SHOWN_GAPS {
-            let rest = gaps.len() - SHOWN_GAPS;
-            let _ = writeln!(text, "  {}", painter.paint(&format!("… {rest} more"), "2"));
-        }
+        more(&mut text, gaps.len(), SHOWN_GAPS, painter);
     }
     text
 }

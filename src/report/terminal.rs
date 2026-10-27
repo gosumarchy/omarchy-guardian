@@ -3,7 +3,7 @@
 
 use std::fmt::Write as _;
 
-use crate::agent::Status;
+use crate::agent::{AgentFinding, Status};
 use crate::layout::{self, Painter, Span, Table};
 use crate::scan::FileKind;
 use crate::text::shown;
@@ -373,39 +373,7 @@ impl Report {
             let _ = writeln!(text, "{}", table.render(width, 2, painter));
         }
 
-        // The remarks of a clear verdict have a table of their own, so
-        // that none reads as an alert.
-        for (remarks, title, column) in [
-            (false, "  AI findings", "AI finding"),
-            (true, "  AI remarks", "AI remark"),
-        ] {
-            let mut table = Table::new(vec!["Severity", "Where", column]);
-            let mut any = false;
-            for finding in self.agent_findings(remarks) {
-                any = true;
-                let line = finding
-                    .line
-                    .map(|line| format!(":{line}"))
-                    .unwrap_or_default();
-                table.row(vec![
-                    severity(finding.severity),
-                    vec![Span::plain(format!("{}{line}", shown(&finding.file)))],
-                    vec![
-                        Span::new(shown(&finding.title), "1"),
-                        Span::plain(shown(&finding.reason)),
-                    ],
-                ]);
-            }
-            if any {
-                let _ = writeln!(text, "\n{}", painter.paint(title, "1"));
-                if remarks {
-                    let _ = writeln!(text, "  {}", painter.paint(remarks_note(decision), "2"));
-                }
-                let _ = writeln!(text, "{}", table.render(width, 2, painter));
-            }
-        }
-
-        text.push_str(&self.settings_text(width, painter));
+        text.push_str(&self.ai_tables(decision, width, painter));
 
         if let Some(audit) = self
             .audit
@@ -447,35 +415,72 @@ impl Report {
         text
     }
 
-    /// The owner's own settings (see `Report::is_owner_setting`) in a table
-    /// of their own, with the reviewer's grade dimmed: none of them is an
-    /// alert. Empty when there are none.
-    fn settings_text(&self, width: usize, painter: Painter) -> String {
-        if self.owner_settings().next().is_none() {
-            return String::new();
+    /// The AI's findings, its remarks and the owner's own settings, a table
+    /// each so that no remark or setting reads as an alert; a setting's
+    /// grade is dimmed. A table with nothing in it is left out.
+    fn ai_tables(&self, decision: Decision, width: usize, painter: Painter) -> String {
+        let tables = [
+            AiTable {
+                title: "  AI findings",
+                columns: ["Severity", "AI finding"],
+                note: None,
+                grade_color: Severity::color,
+                findings: self.agent_findings(false).collect(),
+            },
+            AiTable {
+                title: "  AI remarks",
+                columns: ["Severity", "AI remark"],
+                note: Some(remarks_note(decision)),
+                grade_color: Severity::color,
+                findings: self.agent_findings(true).collect(),
+            },
+            AiTable {
+                title: "  Your own settings (not alerts)",
+                columns: ["Graded", "Your setting"],
+                note: Some(SETTINGS_NOTE),
+                grade_color: |_| "2",
+                findings: self.owner_settings().collect(),
+            },
+        ];
+        let mut text = String::new();
+        for shown_as in tables.iter().filter(|table| !table.findings.is_empty()) {
+            let [graded, column] = shown_as.columns;
+            let mut table = Table::new(vec![graded, "Where", column]);
+            for finding in &shown_as.findings {
+                let line = finding
+                    .line
+                    .map(|line| format!(":{line}"))
+                    .unwrap_or_default();
+                let color = (shown_as.grade_color)(finding.severity);
+                table.row(vec![
+                    vec![Span::new(finding.severity.label(), color)],
+                    vec![Span::plain(format!("{}{line}", shown(&finding.file)))],
+                    vec![
+                        Span::new(shown(&finding.title), "1"),
+                        Span::plain(shown(&finding.reason)),
+                    ],
+                ]);
+            }
+            let _ = writeln!(text, "\n{}", painter.paint(shown_as.title, "1"));
+            if let Some(note) = shown_as.note {
+                let _ = writeln!(text, "  {}", painter.paint(note, "2"));
+            }
+            let _ = writeln!(text, "{}", table.render(width, 2, painter));
         }
-        let mut table = Table::new(vec!["Graded", "Where", "Your setting"]);
-        for finding in self.owner_settings() {
-            let line = finding
-                .line
-                .map(|line| format!(":{line}"))
-                .unwrap_or_default();
-            table.row(vec![
-                vec![Span::new(finding.severity.label(), "2")],
-                vec![Span::plain(format!("{}{line}", shown(&finding.file)))],
-                vec![
-                    Span::new(shown(&finding.title), "1"),
-                    Span::plain(shown(&finding.reason)),
-                ],
-            ]);
-        }
-        format!(
-            "\n{}\n  {}\n{}\n",
-            painter.paint("  Your own settings (not alerts)", "1"),
-            painter.paint(SETTINGS_NOTE, "2"),
-            table.render(width, 2, painter)
-        )
+        text
     }
+}
+
+/// One table of `Report::ai_tables`.
+#[derive(Debug)]
+struct AiTable<'a> {
+    title: &'static str,
+    /// The headers of the grade and the finding columns.
+    columns: [&'static str; 2],
+    /// Said under the title.
+    note: Option<&'static str>,
+    grade_color: fn(Severity) -> &'static str,
+    findings: Vec<&'a AgentFinding>,
 }
 
 /// Said under a report that a permit let through.
