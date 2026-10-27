@@ -1776,6 +1776,65 @@ fn what_an_agents_entry_runs_is_shown_as_it_is_sent() {
 }
 
 #[test]
+fn a_neovim_spec_linked_to_a_key_is_not_sent() {
+    let spec = "return { { \"o/p\", build = \"make SECRETBUILD\" } }\n";
+    let key = format!("-----BEGIN OPENSSH PRIVATE KEY-----\n{spec}");
+    let lazy = "home/u/.local/share/nvim/lazy/p";
+    let dir = planted(
+        "sweep-nvim-key",
+        &[
+            ("home/u/.ssh/id_ed25519", key.as_str()),
+            (
+                &format!("{lazy}/.git/config"),
+                "[remote \"origin\"]\n\turl = https://github.com/o/p\n",
+            ),
+            (&format!("{lazy}/lua/p.lua"), "return {}\n"),
+        ],
+        &[(
+            "home/u/.config/nvim/lua/plugins/key.lua",
+            "../../../../.ssh/id_ed25519",
+        )],
+    );
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root: dir.path(),
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::User,
+    };
+    let mut collection = collect::collect(&scope);
+    let neovim = nvim::collect(&scope, &nvim::Dirs::in_home("home/u"));
+    collect::merge(&mut collection, neovim.items);
+    // A record without the plugin makes it new, so its facts are sent.
+    let record = nvim::Record::Kept(nvim::Files::new());
+    nvim::plan(&mut collection.items, &record, dir.path(), &|_| true);
+    super::note_kept(&mut collection.items, Some("home/u"));
+    let mut report = Report::new("t", ReviewScope::default());
+    let facts = super::examine(&mut report, &collection, Some("home/u"), &HashSet::new());
+    // The plugin is reviewed, and the key's text reaches the AI nowhere.
+    assert!(
+        report
+            .agent_input
+            .iter()
+            .any(|file| file.path == "~/.local/share/nvim/lazy/p/lua/p.lua"),
+        "{:?}",
+        report.agent_input
+    );
+    assert!(!facts.is_empty());
+    let sent = report
+        .agent_input
+        .iter()
+        .map(|file| file.content.as_str())
+        .chain(facts.iter().map(String::as_str));
+    for text in sent {
+        assert!(
+            !text.contains("SECRETBUILD") && !text.contains("PRIVATE KEY"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
 fn a_link_handed_beside_a_wrapper_to_a_key_is_not_sent() {
     let dir = planted(
         "sweep-beside-key",

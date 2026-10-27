@@ -50,7 +50,6 @@ use super::lua::{self, Build, Spec};
 use super::read::{self, Found};
 use super::tier::Tier;
 use crate::autorun::Category;
-use crate::error::Error;
 use crate::json::Json;
 use crate::paths::file_name;
 use crate::rules::RuleId;
@@ -134,6 +133,15 @@ pub(crate) struct Plugin {
     builds: Vec<Build>,
     /// What this sweep sends of it to the review (see `plan`).
     pub(crate) review: Review,
+}
+
+#[cfg(test)]
+impl Dirs {
+    /// The directories for `home` with no XDG variable set, for the tests
+    /// outside this module that collect plugins.
+    pub(super) fn in_home(home: &str) -> Self {
+        Self::new(home, None, None)
+    }
 }
 
 #[cfg(test)]
@@ -262,11 +270,12 @@ impl Specs {
                 .filter(|(path, _)| is_shipped_spec(path))
                 .map(|(path, _)| format!("{}/{path}", checkout.path))
         });
-        let mut paths: Vec<String> = init
+        let mut paths: Vec<(String, Placed)> = init
             .into_iter()
             .chain(listing.files)
             .filter(|path| read::has_extension(path, "lua"))
-            .chain(shipped)
+            .map(|path| (path, Placed::ByUser))
+            .chain(shipped.map(|path| (path, Placed::ByPlugin)))
             .collect();
         if paths.len() > MAX_SPEC_FILES {
             unchecked.push(format!(
@@ -275,12 +284,12 @@ impl Specs {
             paths.truncate(MAX_SPEC_FILES);
         }
         let mut specs = Self::default();
-        for path in &paths {
-            let text = match spec_text(root, path) {
+        for (path, placed) in &paths {
+            let text = match spec_text(root, path, *placed) {
                 Ok(text) => text,
-                Err(reason) => {
+                Err(why) => {
                     unchecked.push(format!(
-                        "/{path}: {reason}, so the plugin specs in it were not checked"
+                        "/{path}{why}, so the plugin specs in it were not checked"
                     ));
                     continue;
                 }
@@ -321,19 +330,90 @@ fn is_shipped_spec(path: &str) -> bool {
             && read::has_extension(path, "lua"))
 }
 
-/// The text of the spec file at `path`, or why it was not read: it is not
-/// a file within the text review limit.
-fn spec_text(root: &Path, path: &str) -> Result<String, Error> {
-    let why = match read::look(root, path) {
+/// Who put a spec file where lazy.nvim reads it, which decides whether a
+/// link there is followed.
+#[derive(Debug, Clone, Copy)]
+enum Placed {
+    /// The user's configuration. A link there is the user's own, or
+    /// Omarchy's: its `lua/plugins/theme.lua` links to the current theme's
+    /// `neovim.lua` on every install, and refusing it would leave every
+    /// sweep incomplete. The chain is followed to its end, through links
+    /// a theme's author may have put in the theme's directory: that author
+    /// writes the spec text it ends at anyway.
+    ByUser,
+    /// A plugin's checkout. A link there points at a file the plugin does
+    /// not ship, which the plugin's author chose; it is not followed.
+    ByPlugin,
+}
+
+/// The text of the spec file at `path`, placed as `placed`, or why it was
+/// not read, said after the path: its name says it holds secrets, it is
+/// not a file within the text review limit, or it is a link that does not
+/// end at one (see `followed`).
+///
+/// The text is only parsed here, but the build steps found in it go to the
+/// AI review as facts (see `fact`): a file the judge would keep from the AI
+/// for its name is not read.
+fn spec_text(root: &Path, path: &str, placed: Placed) -> Result<String, String> {
+    if crate::rules::is_sensitive_path(path) {
+        return Err(" has a name that says it holds secrets, so it is not read".into());
+    }
+    let (found, subject) = match (read::look(root, path), placed) {
+        (Found::Link(_), Placed::ByUser) => {
+            let end = followed(root, path)?;
+            (read::look(root, &end), format!(", a link to /{end},"))
+        }
+        (Found::Link(_), Placed::ByPlugin) => {
+            return Err(" is a link in a plugin, which is not followed".into());
+        }
+        (found, _) => (found, String::new()),
+    };
+    let why = match found {
         Found::File { size, head, .. } if size <= MAX_TEXT_FILE_SIZE => {
             return Ok(String::from_utf8_lossy(&head).into_owned());
         }
-        Found::File { .. } => "larger than the text review limit".into(),
-        Found::Link(_) => "a link, which is not followed".into(),
-        Found::Other => "not a file".into(),
+        Found::File { .. } => "is larger than the text review limit".into(),
+        // `followed` returns a path with no link left in it.
+        Found::Link(_) | Found::Other => "is not a file".into(),
         Found::Unreadable(reason) => format!("could not be read ({reason})"),
     };
-    Err(Error::Message(why))
+    Err(format!("{subject} {why}"))
+}
+
+/// The real path, relative to `root`, of the file the link at `path` leads
+/// to, or why it is not followed, said after `path`.
+///
+/// The kernel resolves it, as it does when Neovim opens the link: a `..`
+/// after a linked directory climbs from where that directory really is,
+/// which resolving the link texts by hand would get wrong. The kernel stops
+/// a chain of more than 40 links (`ELOOP`), a circle included. A real path
+/// whose name says it holds secrets is not read (see `spec_text`), nor is
+/// one into `/dev`, `/proc` or `/sys`, which the sweep never follows.
+fn followed(root: &Path, path: &str) -> Result<String, String> {
+    let real = fs::canonicalize(root.join(path))
+        .map_err(|error| format!(" is a link that could not be followed ({error})"))?;
+    let root = fs::canonicalize(root)
+        .map_err(|error| format!(" could not be followed: the root ({error})"))?;
+    let end = real
+        .strip_prefix(&root)
+        .map_err(|_| " is a link that leads out of the root".to_string())?
+        .to_str()
+        .ok_or(" is a link to a path that is not UTF-8")?
+        .to_string();
+    if crate::rules::is_sensitive_path(&end) {
+        return Err(format!(
+            ", a link to /{end}, leads to a file whose name says it holds secrets, so it is not read"
+        ));
+    }
+    if ["dev/", "proc/", "sys/"]
+        .iter()
+        .any(|kernel| end.starts_with(kernel))
+    {
+        return Err(format!(
+            ", a link to /{end}, leads where the sweep never follows"
+        ));
+    }
+    Ok(end)
 }
 
 /// The commit `lazy-lock.json` in `config` pins for each plugin. One that
