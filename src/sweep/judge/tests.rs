@@ -1946,18 +1946,6 @@ fn only_shell_files_programs_and_agent_entries_in_the_home_may_hold_settings() {
             // not hold settings.
             item("home/u/.profile", Category::Shell, Tier::Unknown),
             item("home/u/.profile", Category::Environment, Tier::Unknown),
-            // A wrapper that runs a binary an AUR package installed: no
-            // local rule flags that binary, so its launcher stays an alert.
-            item(
-                "home/u/.local/bin/aurtool",
-                Category::LocalBin,
-                Tier::Unknown,
-            ),
-            Item {
-                run_by: Some("home/u/.local/bin/aurtool".into()),
-                body: Body::Binary("ELF"),
-                ..item("usr/bin/aurtool-bin", Category::LocalBin, Tier::UserBuilt)
-            },
         ],
         ..Collection::default()
     };
@@ -1971,6 +1959,78 @@ fn only_shell_files_programs_and_agent_entries_in_the_home_may_hold_settings() {
             "~/.local/bin/claude"
         ]
     );
+}
+
+#[test]
+fn a_launcher_of_a_binary_only_the_reviewer_flags_is_not_a_setting() {
+    let home = Some("home/u");
+    let collection = Collection {
+        items: vec![
+            // A wrapper that runs a binary an AUR package installed: no
+            // local rule flags that binary, so its launcher stays an alert.
+            item(
+                "home/u/.local/bin/aurtool",
+                Category::LocalBin,
+                Tier::Unknown,
+            ),
+            Item {
+                run_by: Some("home/u/.local/bin/aurtool".into()),
+                body: Body::Binary("ELF"),
+                ..item("usr/bin/aurtool-bin", Category::LocalBin, Tier::UserBuilt)
+            },
+            // The same through an agent's hook, matched by the entry's path.
+            item(
+                "home/u/.gemini/settings.json#hooks/SessionStart/0/0",
+                Category::Agent,
+                Tier::Unknown,
+            ),
+            Item {
+                run_by: Some("home/u/.gemini/settings.json#hooks/SessionStart/0/0".into()),
+                body: Body::Binary("ELF"),
+                ..item("usr/bin/hooktool", Category::Agent, Tier::UserBuilt)
+            },
+            // And through a script the wrapper runs: every launcher up the
+            // chain stays an alert.
+            item(
+                "home/u/.local/bin/chained",
+                Category::LocalBin,
+                Tier::Unknown,
+            ),
+            Item {
+                run_by: Some("home/u/.local/bin/chained".into()),
+                ..item(
+                    "home/u/.local/share/chained/run.sh",
+                    Category::LocalBin,
+                    Tier::Unknown,
+                )
+            },
+            Item {
+                run_by: Some("home/u/.local/share/chained/run.sh".into()),
+                body: Body::Binary("ELF"),
+                ..item("usr/bin/chained-bin", Category::LocalBin, Tier::UserBuilt)
+            },
+            // A wrapper of a binary a version manager installed has its own
+            // local alert on that binary, so the wrapper may be a setting.
+            item(
+                "home/u/.local/bin/nodetool",
+                Category::LocalBin,
+                Tier::Unknown,
+            ),
+            Item {
+                run_by: Some("home/u/.local/bin/nodetool".into()),
+                body: Body::Binary("ELF"),
+                notes: vec!["installed by a version manager, not by a package".into()],
+                ..item(
+                    "home/u/.local/share/mise/installs/node/bin/node",
+                    Category::LocalBin,
+                    Tier::UserBuilt,
+                )
+            },
+        ],
+        ..Collection::default()
+    };
+    let paths: Vec<String> = setting_paths(&collection, home).into_iter().collect();
+    assert_eq!(paths, ["~/.local/bin/nodetool"]);
 }
 
 #[test]

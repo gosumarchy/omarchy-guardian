@@ -6,7 +6,7 @@
 pub(super) mod secrets;
 mod variables;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use super::collect::{self, Body, Collection, Item};
@@ -128,23 +128,20 @@ const SETTING_CATEGORIES: [Category; 3] = [Category::Shell, Category::LocalBin, 
 /// under a name Guardian watches on `PATH` (`sudo`, `ssh`, `git`,
 /// `omarchy-…`): a fake `sudo` in the home is how a password is taken, and
 /// the reviewer's grade alone must not clear it. So is a file that an item
-/// of any other kind also stands for. So, last, is a file that runs a
-/// binary only the reviewer's word flags (see `flagged_by_word_alone`).
+/// of any other kind also stands for. So, last, is a file that leads to a
+/// binary only the reviewer's word flags (see `launchers_of_word_alone`).
 fn setting_paths(collection: &Collection, home: Option<&str>) -> HashSet<String> {
+    let launchers = launchers_of_word_alone(collection);
     let mut allowed = HashSet::new();
     let mut refused = HashSet::new();
     for item in &collection.items {
-        if flagged_by_word_alone(item)
-            && let Some(by) = &item.run_by
-        {
-            refused.insert(shown_path(by, home));
-        }
         let path = shown_path(checked_path(item), home);
         let watched =
             item.category == Category::LocalBin && super::path::is_watched(file_name(&item.path));
         if path.starts_with("~/")
             && item.run_by.is_none()
             && !watched
+            && !launchers.contains(item.path.as_str())
             && SETTING_CATEGORIES.contains(&item.category)
         {
             allowed.insert(path);
@@ -154,6 +151,34 @@ fn setting_paths(collection: &Collection, home: Option<&str>) -> HashSet<String>
     }
     allowed.retain(|path| !refused.contains(path));
     allowed
+}
+
+/// The paths of the items that lead to a binary for which
+/// `flagged_by_word_alone` holds: the one that runs it, what runs that, and
+/// so on to the item the catalogue found. They are matched by item path,
+/// not by the path the AI is sent, because `run_by` holds the launcher's
+/// item path (an agent entry's has its `#hooks/...` suffix).
+fn launchers_of_word_alone(collection: &Collection) -> HashSet<&str> {
+    let runner: HashMap<&str, &str> = collection
+        .items
+        .iter()
+        .filter_map(|item| Some((item.path.as_str(), item.run_by.as_deref()?)))
+        .collect();
+    let mut launchers = HashSet::new();
+    for item in collection
+        .items
+        .iter()
+        .filter(|item| flagged_by_word_alone(item))
+    {
+        let mut next = item.run_by.as_deref();
+        // `insert` returning false stops a cycle of `run_by` links.
+        while let Some(path) = next
+            && launchers.insert(path)
+        {
+            next = runner.get(path).copied();
+        }
+    }
+    launchers
 }
 
 /// Whether `item` is a binary Guardian could not vouch for that no local
