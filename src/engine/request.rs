@@ -109,9 +109,9 @@ file that launches one Guardian could not vouch for gets a finding at that file:
 high where how it is launched adds to the concern (as root, or from a temporary directory); \
 launching one a repository package installed unchanged is no concern by itself. A hashed \
 binary does not make the status inconclusive by itself: judge the other supplied files as \
-usual, and return inconclusive only if what a supplied file itself does cannot be determined. Some files \
-in the home directory (paths starting with ~/) hold choices the owner made about their own \
-tools: an alias or wrapper that turns off a tool's confirmation prompts or its update \
+usual, and return inconclusive only if what a supplied file itself does cannot be determined. \
+Some files in the home directory (paths starting with ~/) hold choices the owner made about their \
+own tools: an alias or wrapper that turns off a tool's confirmation prompts or its update \
 safeguards, or puts a tool's own directory on PATH. Mark a finding about such a choice with \
 \"owner_setting\":true only if all of this holds: it changes only how the owner's own programs \
 behave when the owner starts them; it fetches no script or binary from an address to run \

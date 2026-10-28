@@ -1946,6 +1946,18 @@ fn only_shell_files_programs_and_agent_entries_in_the_home_may_hold_settings() {
             // not hold settings.
             item("home/u/.profile", Category::Shell, Tier::Unknown),
             item("home/u/.profile", Category::Environment, Tier::Unknown),
+            // A wrapper that runs a binary an AUR package installed: no
+            // local rule flags that binary, so its launcher stays an alert.
+            item(
+                "home/u/.local/bin/aurtool",
+                Category::LocalBin,
+                Tier::Unknown,
+            ),
+            Item {
+                run_by: Some("home/u/.local/bin/aurtool".into()),
+                body: Body::Binary("ELF"),
+                ..item("usr/bin/aurtool-bin", Category::LocalBin, Tier::UserBuilt)
+            },
         ],
         ..Collection::default()
     };

@@ -128,11 +128,17 @@ const SETTING_CATEGORIES: [Category; 3] = [Category::Shell, Category::LocalBin, 
 /// under a name Guardian watches on `PATH` (`sudo`, `ssh`, `git`,
 /// `omarchy-…`): a fake `sudo` in the home is how a password is taken, and
 /// the reviewer's grade alone must not clear it. So is a file that an item
-/// of any other kind also stands for.
+/// of any other kind also stands for. So, last, is a file that runs a
+/// binary only the reviewer's word flags (see `flagged_by_word_alone`).
 fn setting_paths(collection: &Collection, home: Option<&str>) -> HashSet<String> {
     let mut allowed = HashSet::new();
     let mut refused = HashSet::new();
     for item in &collection.items {
+        if flagged_by_word_alone(item)
+            && let Some(by) = &item.run_by
+        {
+            refused.insert(shown_path(by, home));
+        }
         let path = shown_path(checked_path(item), home);
         let watched =
             item.category == Category::LocalBin && super::path::is_watched(file_name(&item.path));
@@ -148,6 +154,18 @@ fn setting_paths(collection: &Collection, home: Option<&str>) -> HashSet<String>
     }
     allowed.retain(|path| !refused.contains(path));
     allowed
+}
+
+/// Whether `item` is a binary Guardian could not vouch for that no local
+/// rule raises an alert on: one an AUR or `pacman -U` package installed
+/// (`hashed` flags those no package installed, or a version manager did,
+/// and a changed package file has its own rule). The reviewer's finding on
+/// its launcher is then the only alert, so that launcher may not be shown
+/// as the owner's setting: the claim would leave the binary with none.
+fn flagged_by_word_alone(item: &Item) -> bool {
+    matches!(item.body, Body::Binary(_))
+        && item.tier == Tier::UserBuilt
+        && !is_version_managed(item)
 }
 
 /// Puts what the local checks say of `collection` into `report`, queues
