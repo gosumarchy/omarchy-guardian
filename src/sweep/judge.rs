@@ -102,8 +102,8 @@ fn examine(
     news: &std::collections::HashSet<String>,
 ) -> Vec<String> {
     let mut facts = Vec::new();
-    // What Guardian established about each binary listed by its hash; the
-    // first `MAX_BINARY_FACTS` are told.
+    // What Guardian established about each binary listed by its hash, and
+    // whether nothing runs it; `MAX_BINARY_FACTS` of them are told.
     let mut binaries = Vec::new();
     for item in collection.items.iter().filter(|item| !item.is_trusted()) {
         let label = label(item, home);
@@ -184,7 +184,10 @@ fn examine(
                 // file (`.bash_profile` sourcing `.bashrc`) is not news.
                 drop_rule(report, before.0, RuleId::PersistenceModification);
             }
-            Body::Binary(format) => binaries.push(hashed(report, item, label, format, home)),
+            Body::Binary(format) => {
+                let fact = hashed(report, item, label, format, home);
+                binaries.push((item.run_by.is_none(), fact));
+            }
             Body::Undecodable => report.gaps.push(Gap::Undecodable(label)),
             Body::Oversized => report.gaps.push(Gap::OversizedText(label)),
             Body::Unreadable(_) => report.gaps.push(Gap::RootOnly(label)),
@@ -193,11 +196,20 @@ fn examine(
             Body::Plugin(plugin) => facts.extend(plugin_files(report, plugin, &label)),
         }
     }
+    // A binary something runs first: its fact is what the reviewer judges
+    // the file that launches it by. The sort is stable, so the rest keep
+    // the collection's order.
+    binaries.sort_by_key(|(unrun, _)| *unrun);
     let more = binaries.len().saturating_sub(MAX_BINARY_FACTS);
-    facts.extend(binaries.into_iter().take(MAX_BINARY_FACTS));
+    facts.extend(
+        binaries
+            .into_iter()
+            .take(MAX_BINARY_FACTS)
+            .map(|(_, fact)| fact),
+    );
     if more > 0 {
         facts.push(format!(
-            "{more} more binaries Guardian hashed are not described here."
+            "Guardian hashed {more} binaries it does not describe here."
         ));
     }
     facts
@@ -681,7 +693,13 @@ fn fact(item: &Item, label: &str, home: Option<&str>) -> String {
             "installed by a package but changed since (it is not what the package shipped)"
         }
         Tier::Unknown => "installed by no package",
-        Tier::Vendor | Tier::Inert | Tier::Copied | Tier::Allowed => "trusted",
+        // These three reach here only with an alert of a live check, and
+        // an allowed item never does (see `Item::is_trusted`): the fact
+        // says what installed it, and the alert is a finding of its own.
+        Tier::Vendor => "installed unchanged by a package from a configured repository",
+        Tier::Copied => "an unchanged copy of a file a repository package ships",
+        Tier::Inert => "an empty file or a link to /dev/null",
+        Tier::Allowed => "allowed by the user as it is",
     };
     let mut text = format!(
         "{:?} is {what}; it {}.",

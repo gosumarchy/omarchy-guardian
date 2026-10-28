@@ -1970,9 +1970,15 @@ fn only_a_binary_no_package_installed_that_something_runs_is_flagged() {
     managed
         .notes
         .push("installed by a version manager, not by a package".into());
+    // A packaged program a live check raised an alert on is listed too.
+    let mut listening = binary("usr/bin/server", Tier::Vendor, by);
+    listening
+        .alerts
+        .push((RuleId::NetworkListener, "port 8080".into()));
     let collection = Collection {
         items: vec![
             binary("home/u/.cargo/bin/run", Tier::Unknown, by),
+            listening,
             managed,
             binary("usr/bin/aur-tool", Tier::UserBuilt, by),
             binary("usr/bin/changed", Tier::Modified, by),
@@ -1998,8 +2004,12 @@ fn only_a_binary_no_package_installed_that_something_runs_is_flagged() {
     );
     // Every binary that is not trusted is told to the AI with what
     // installed it and what runs it; an allowed one is only counted.
-    assert_eq!(facts.len(), 5, "{facts:?}");
+    assert_eq!(facts.len(), 6, "{facts:?}");
     for (path, what) in [
+        (
+            "/usr/bin/server",
+            "installed unchanged by a package from a configured repository",
+        ),
         (
             "/usr/bin/aur-tool",
             "installed by a package from no configured repository",
@@ -2026,7 +2036,7 @@ fn only_a_binary_no_package_installed_that_something_runs_is_flagged() {
 
 #[test]
 fn past_the_cap_hashed_binaries_are_counted_not_described() {
-    let items = (0..super::MAX_BINARY_FACTS + 2)
+    let mut items: Vec<Item> = (0..=super::MAX_BINARY_FACTS)
         .map(|index| Item {
             body: Body::Binary("ELF executable"),
             ..item(
@@ -2036,6 +2046,12 @@ fn past_the_cap_hashed_binaries_are_counted_not_described() {
             )
         })
         .collect();
+    // Last in the collection, but run by a launcher: described first.
+    items.push(Item {
+        body: Body::Binary("ELF executable"),
+        run_by: Some("home/u/x.conf".into()),
+        ..item("home/u/.local/bin/run", Category::Program, Tier::Unknown)
+    });
     let collection = Collection {
         items,
         ..Collection::default()
@@ -2043,9 +2059,10 @@ fn past_the_cap_hashed_binaries_are_counted_not_described() {
     let mut report = Report::new("t", ReviewScope::default());
     let facts = super::examine(&mut report, &collection, Some("home/u"), &HashSet::new());
     assert_eq!(facts.len(), super::MAX_BINARY_FACTS + 1);
+    assert!(facts[0].starts_with(r#""~/.local/bin/run""#), "{facts:?}");
     assert_eq!(
         facts.last().map(String::as_str),
-        Some("2 more binaries Guardian hashed are not described here.")
+        Some("Guardian hashed 2 binaries it does not describe here.")
     );
     // Every one is still listed by its hash.
     assert_eq!(report.hash_only.len(), super::MAX_BINARY_FACTS + 2);

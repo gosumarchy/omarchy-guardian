@@ -1689,14 +1689,17 @@ Binaries no package vouches for are named to the AI by format and hash but
 never run or uploaded. With each one goes what Guardian established about it,
 as a fact outside the untrusted data: what installed it (no package, a version
 manager, a package of no configured repository, or a package whose file it no
-longer is) and what runs it. The first 64 are described; past that, one fact
-says how many more there are (facts go to every chunk). A binary a repository
-package installed unchanged is trusted and never listed, so each listed one is
-a binary Guardian could not vouch for. The reviewer is told:
+longer is) and what runs it. At most 64 are described, those something runs
+first; past that, one fact says how many more there are (facts go to every
+chunk). A binary a repository package installed unchanged is trusted and not
+listed, unless a live check raised an alert on it (a packaged program
+listening where nothing packaged starts it); its fact then says what installed
+it, and the alert is its own finding. The reviewer is told:
 
-- a sent file that launches one gets a finding at that file: medium, or high
-  where how it is launched adds to the concern (as root, from a temporary
-  directory);
+- a sent file that launches a binary Guardian could not vouch for gets a
+  finding at that file: medium, or high where how it is launched adds to the
+  concern (as root, from a temporary directory). Launching one a repository
+  package installed unchanged is no concern by itself;
 - a hashed binary does not make the chunk inconclusive by itself. The rest of
   the chunk keeps its verdict; `inconclusive` is left for a sent file whose own
   behaviour cannot be told.
