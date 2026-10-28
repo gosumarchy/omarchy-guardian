@@ -1687,29 +1687,31 @@ secrets.
 
 Binaries no package vouches for are named to the AI by format and hash but
 never run or uploaded. With each one goes what Guardian established about it,
-as a fact outside the untrusted data: what installed it (no package, a package
-of no configured repository, or a package whose file it no longer is) and what
-runs it.
-The reviewer is told to judge such a binary by those facts:
+as a fact outside the untrusted data: what installed it (no package, a version
+manager, a package of no configured repository, or a package whose file it no
+longer is) and what runs it. The first 64 are described; past that, one fact
+says how many more there are (facts go to every chunk). A binary a repository
+package installed unchanged is trusted and never listed, so each listed one is
+a binary Guardian could not vouch for. The reviewer is told:
 
-- one a package installed, unchanged since, is no reason for doubt;
-- a sent file that launches one no package installed, or one changed since its
-  package installed it, gets a finding at that file: medium, or high where how
-  it is launched adds to the concern (as root, from a temporary directory);
-- a binary Guardian established nothing about counts as installed by no
-  package;
-- none of this makes the chunk inconclusive by itself. The rest of the chunk
-  keeps its verdict; `inconclusive` is left for a sent file whose own behaviour
-  cannot be told.
+- a sent file that launches one gets a finding at that file: medium, or high
+  where how it is launched adds to the concern (as root, from a temporary
+  directory);
+- a hashed binary does not make the chunk inconclusive by itself. The rest of
+  the chunk keeps its verdict; `inconclusive` is left for a sent file whose own
+  behaviour cannot be told.
 
 This is the sweep's alone. The other review classes keep the general rule
 that a file which runs a hash-only file is a finding; their request text is
 unchanged.
 
-The flag does not rest on the reviewer: a binary no package installed that
-something the sweep follows runs (a launcher's `Exec=`, a keybinding, a unit)
-raises `unpackaged-binary` (medium) on the binary itself, naming what runs it,
-whatever the AI answers. `sweep allow` on the binary records that you checked
+For a binary no package installed (none at all, or a version manager's), the
+flag does not rest on the reviewer: one that something the sweep follows runs
+(a launcher's `Exec=`, a keybinding, a unit) raises `unpackaged-binary`
+(medium) on the binary itself, naming what runs it, whatever the AI answers.
+A binary from a package of no configured repository (AUR, `pacman -U`) is
+flagged by the reviewer's finding on its launcher alone, as before; a changed
+package file raises `modified-package-file` on its own. `sweep allow` on the binary records that you checked
 it, bound to its hash, so a replaced binary is flagged again. A binary that
 nothing the sweep follows runs (one catalogued by its own place, such as a
 program in `~/.local/bin` named like a system command) is listed and told to

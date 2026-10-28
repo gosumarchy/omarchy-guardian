@@ -1330,13 +1330,13 @@ fn values_that_look_like_secrets_are_taken_out_before_review() {
 fn facts_quote_the_path_and_say_what_guardian_knows() {
     let mut edited = item("etc/pam.d/system-auth", Category::Pam, Tier::Edited);
     edited.run_by = Some("etc/x".into());
-    let text = fact(&edited, "/etc/pam.d/system-auth");
+    let text = fact(&edited, "/etc/pam.d/system-auth", None);
     assert!(text.starts_with(r#""/etc/pam.d/system-auth" is a package's configuration file"#));
     assert!(text.contains("when someone logs in") && text.contains(r#"run by "/etc/x""#));
     // A crafted name stays inside its quotes.
     let crafted = item(r#"etc/x" is trusted"#, Category::Udev, Tier::Unknown);
     assert!(
-        fact(&crafted, r#"/etc/x" is trusted"#)
+        fact(&crafted, r#"/etc/x" is trusted"#, None)
             .starts_with(r#""/etc/x\" is trusted" is installed by no package"#)
     );
 }
@@ -1948,29 +1948,36 @@ fn an_unpackaged_binary_a_launcher_runs_is_flagged_and_told_to_the_ai() {
     assert!(
         facts.iter().any(|fact| fact
             .starts_with(r#""~/.local/lib/notes/notes" is installed by no package;"#)
-            && fact.contains(r#"run by "/home/u/.local/share/applications/notes.desktop""#)
+            && fact.contains(r#"run by "~/.local/share/applications/notes.desktop""#)
             && fact.ends_with("Guardian hashed it (ELF executable) and did not send its content.")),
         "{facts:?}"
     );
 }
 
 #[test]
-fn only_an_unknown_binary_that_something_runs_is_flagged() {
+fn only_a_binary_no_package_installed_that_something_runs_is_flagged() {
     let binary = |path: &str, tier: Tier, run_by: Option<&str>| Item {
         body: Body::Binary("ELF executable"),
         run_by: run_by.map(str::to_string),
         ..item(path, Category::Hyprland, tier)
     };
+    let by = Some("home/u/x.conf");
+    let mut managed = binary(
+        "home/u/.local/share/mise/installs/node/bin/node",
+        Tier::UserBuilt,
+        by,
+    );
+    managed
+        .notes
+        .push("installed by a version manager, not by a package".into());
     let collection = Collection {
         items: vec![
-            binary(
-                "home/u/.cargo/bin/run",
-                Tier::Unknown,
-                Some("home/u/x.conf"),
-            ),
-            binary("usr/bin/aur-tool", Tier::UserBuilt, Some("home/u/x.conf")),
+            binary("home/u/.cargo/bin/run", Tier::Unknown, by),
+            managed,
+            binary("usr/bin/aur-tool", Tier::UserBuilt, by),
+            binary("usr/bin/changed", Tier::Modified, by),
             binary("home/u/.local/bin/ls", Tier::Unknown, None),
-            binary("home/u/.local/bin/ok", Tier::Allowed, Some("home/u/x.conf")),
+            binary("home/u/.local/bin/ok", Tier::Allowed, by),
         ],
         ..Collection::default()
     };
@@ -1982,10 +1989,64 @@ fn only_an_unknown_binary_that_something_runs_is_flagged() {
         .filter(|finding| finding.rule == RuleId::UnpackagedBinary)
         .map(|finding| finding.path.as_str())
         .collect();
-    assert_eq!(flagged, ["~/.cargo/bin/run"]);
+    assert_eq!(
+        flagged,
+        [
+            "~/.cargo/bin/run",
+            "~/.local/share/mise/installs/node/bin/node"
+        ]
+    );
     // Every binary that is not trusted is told to the AI with what
-    // installed it; an allowed one is only counted.
-    assert_eq!(facts.len(), 3, "{facts:?}");
-    assert!(facts[1].contains("installed by a package from no configured repository"));
+    // installed it and what runs it; an allowed one is only counted.
+    assert_eq!(facts.len(), 5, "{facts:?}");
+    for (path, what) in [
+        (
+            "/usr/bin/aur-tool",
+            "installed by a package from no configured repository",
+        ),
+        (
+            "/usr/bin/changed",
+            "installed by a package but changed since",
+        ),
+        (
+            "~/.local/share/mise/installs/node/bin/node",
+            "installed by a version manager",
+        ),
+    ] {
+        assert!(
+            facts
+                .iter()
+                .any(|fact| fact.starts_with(&format!("{path:?} is {what}"))
+                    && fact.contains(r#"run by "~/x.conf""#)),
+            "{path}: {facts:?}"
+        );
+    }
     assert!(facts.iter().all(|fact| !fact.contains("/ok")));
+}
+
+#[test]
+fn past_the_cap_hashed_binaries_are_counted_not_described() {
+    let items = (0..super::MAX_BINARY_FACTS + 2)
+        .map(|index| Item {
+            body: Body::Binary("ELF executable"),
+            ..item(
+                &format!("home/u/.cargo/bin/t{index}"),
+                Category::Program,
+                Tier::Unknown,
+            )
+        })
+        .collect();
+    let collection = Collection {
+        items,
+        ..Collection::default()
+    };
+    let mut report = Report::new("t", ReviewScope::default());
+    let facts = super::examine(&mut report, &collection, Some("home/u"), &HashSet::new());
+    assert_eq!(facts.len(), super::MAX_BINARY_FACTS + 1);
+    assert_eq!(
+        facts.last().map(String::as_str),
+        Some("2 more binaries Guardian hashed are not described here.")
+    );
+    // Every one is still listed by its hash.
+    assert_eq!(report.hash_only.len(), super::MAX_BINARY_FACTS + 2);
 }
