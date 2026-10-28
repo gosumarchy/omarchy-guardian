@@ -76,9 +76,8 @@ that runs, sources or loads one of those files with that in mind.";
 /// finding. Every other one is from a package of no configured repository
 /// (AUR, `pacman -U`), a version manager, a changed package file or no
 /// package, and none of those is cleared on the reviewer's word. The
-/// general rule in
-/// `INSTRUCTIONS` is left as it is for the other classes, whose request
-/// bytes this does not change. For a binary no package installed, failing
+/// general rule in `INSTRUCTIONS` is left as it is for the other classes,
+/// whose request bytes this does not change. For a binary no package installed, failing
 /// closed does not rest on this text either: the sweep flags it itself when
 /// something runs it (`unpackaged-binary`), whatever the reviewer answers.
 const SYSTEM_SCOPE: &str = " These files are already on this machine and run on their own: \
@@ -102,9 +101,8 @@ not vouch for unless its fact says a repository package installed it unchanged. 
 file that launches one Guardian could not vouch for gets a finding at that file: medium, or \
 high where how it is launched adds to the concern (as root, or from a temporary directory); \
 launching one a repository package installed unchanged is no concern by itself. A hashed \
-binary does not make the status inconclusive by \
-itself: judge the other supplied files as usual, and return inconclusive only if what a \
-supplied file itself does cannot be determined.";
+binary does not make the status inconclusive by itself: judge the other supplied files as \
+usual, and return inconclusive only if what a supplied file itself does cannot be determined.";
 
 /// For the pacman classes only the install scriptlets, the payload files
 /// that act on their own and the package's text files those name are

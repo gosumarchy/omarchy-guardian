@@ -693,9 +693,9 @@ fn fact(item: &Item, label: &str, home: Option<&str>) -> String {
             "installed by a package but changed since (it is not what the package shipped)"
         }
         Tier::Unknown => "installed by no package",
-        // These three reach here only with an alert of a live check, and
-        // an allowed item never does (see `Item::is_trusted`): the fact
-        // says what installed it, and the alert is a finding of its own.
+        // These three reach here only with an alert on the item, and an
+        // allowed item never does (see `Item::is_trusted`): the fact says
+        // what installed it, and the alert is a finding of its own.
         Tier::Vendor => "installed unchanged by a package from a configured repository",
         Tier::Copied => "an unchanged copy of a file a repository package ships",
         Tier::Inert => "an empty file or a link to /dev/null",
