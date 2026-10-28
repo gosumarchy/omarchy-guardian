@@ -255,7 +255,8 @@ pub(super) struct Collection {
     pub(super) root_news: Option<Vec<String>>,
     /// Every item path that leads to each followed path, not only the
     /// first that `run_by` keeps: a second wrapper of the same program
-    /// leaves no `run_by` of its own.
+    /// leaves no `run_by` of its own. Root's items add only their `run_by`
+    /// (see `root::merge`).
     pub(super) runners: HashMap<String, Vec<String>>,
 }
 

@@ -505,6 +505,17 @@ pub(super) fn merge(collection: &mut Collection, part: RootPart) {
             || !item.alerts.is_empty()
             || !matches!(item.body, Body::Unreadable(_))
     });
+    // Root's walk is not carried over, only the first launcher each of its
+    // items keeps: an extra edge only refuses more owner settings.
+    for item in &part.items {
+        if let Some(by) = &item.run_by {
+            collection
+                .runners
+                .entry(item.path.clone())
+                .or_default()
+                .push(by.clone());
+        }
+    }
     collect::merge(collection, part.items);
     // A directory the user could not list is looked at when root listed
     // it: root looked there for every pattern match, and its results hold
