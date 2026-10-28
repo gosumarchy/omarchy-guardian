@@ -93,7 +93,8 @@ pub(super) fn judge(
 
 /// Puts what the local checks say of `collection` into `report`, queues
 /// for the AI review the text that goes to it, and returns what Guardian
-/// established about each such item (see `fact`).
+/// established about each such item and each binary it lists by its hash
+/// (see `fact`).
 fn examine(
     report: &mut Report,
     collection: &Collection,
@@ -184,6 +185,23 @@ fn examine(
                 // One without a hash is never recorded as approved, so
                 // every sweep that finds it is reviewed in full.
                 report.unread.insert(label.clone(), item.sha256);
+                // The reviewer is told what Guardian knows of a program it
+                // was not sent, so a file that launches one is judged by
+                // that, not taken as a reason to call its whole chunk
+                // inconclusive (see `SYSTEM_SCOPE`). One no package
+                // installed is also flagged here, so the file is never
+                // passed on the model's word alone; the finding is on the
+                // binary, so `sweep allow` binds it to the binary's hash
+                // and a replaced binary is flagged again.
+                facts.push(hashed_fact(item, &label, format));
+                if item.tier == Tier::Unknown
+                    && let Some(by) = &item.run_by
+                {
+                    let by = format!("run by {}", shown_path(by, home));
+                    report
+                        .findings
+                        .push(finding(&label, 1, RuleId::UnpackagedBinary, &by));
+                }
                 report.hash_only.push(HashOnly {
                     path: label,
                     bytes: 0,
@@ -671,6 +689,15 @@ fn fact(item: &Item, label: &str) -> String {
         );
     }
     text
+}
+
+/// What Guardian established about `item`, a binary of `format` listed as
+/// `label`, for the AI, which is sent its hash and never its content.
+fn hashed_fact(item: &Item, label: &str, format: &str) -> String {
+    format!(
+        "{} Guardian hashed it ({format}) and did not send its content.",
+        fact(item, label)
+    )
 }
 
 #[cfg(test)]

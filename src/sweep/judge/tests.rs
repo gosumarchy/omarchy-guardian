@@ -1889,3 +1889,103 @@ fn a_link_handed_beside_a_wrapper_to_a_key_is_not_sent() {
         "{sent:?}"
     );
 }
+
+#[test]
+fn an_unpackaged_binary_a_launcher_runs_is_flagged_and_told_to_the_ai() {
+    let dir = planted(
+        "sweep-unpackaged-binary",
+        &[
+            (
+                "home/u/.config/mimeapps.list",
+                "[Default Applications]\nx-scheme-handler/notes=notes.desktop\n",
+            ),
+            (
+                "home/u/.local/share/applications/notes.desktop",
+                "[Desktop Entry]\nType=Application\nName=Notes\nExec=~/.local/lib/notes/notes %u\n",
+            ),
+        ],
+        &[],
+    );
+    let program = dir.path().join("home/u/.local/lib/notes/notes");
+    std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+    std::fs::write(&program, b"\x7fELF\x02\x01\x01\0\0\0notes").unwrap();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root: dir.path(),
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::User,
+    };
+    let collection = collect::collect(&scope);
+    let mut report = Report::new("t", ReviewScope::default());
+    let facts = super::examine(&mut report, &collection, Some("home/u"), &HashSet::new());
+
+    // Flagged on the binary, naming what runs it, whatever the AI says of
+    // the launcher.
+    let flagged: Vec<(&str, &str)> = report
+        .findings
+        .iter()
+        .filter(|finding| finding.rule == RuleId::UnpackagedBinary)
+        .map(|finding| (finding.path.as_str(), finding.excerpt.as_str()))
+        .collect();
+    assert_eq!(
+        flagged,
+        [(
+            "~/.local/lib/notes/notes",
+            "run by ~/.local/share/applications/notes.desktop"
+        )],
+        "{:?}",
+        report.findings
+    );
+    // The AI is sent the launcher and told what Guardian knows of the
+    // binary it runs.
+    assert!(
+        report
+            .agent_input
+            .iter()
+            .any(|file| file.path == "~/.local/share/applications/notes.desktop")
+    );
+    assert!(
+        facts.iter().any(|fact| fact
+            .starts_with(r#""~/.local/lib/notes/notes" is installed by no package;"#)
+            && fact.contains(r#"run by "/home/u/.local/share/applications/notes.desktop""#)
+            && fact.ends_with("Guardian hashed it (ELF executable) and did not send its content.")),
+        "{facts:?}"
+    );
+}
+
+#[test]
+fn only_an_unknown_binary_that_something_runs_is_flagged() {
+    let binary = |path: &str, tier: Tier, run_by: Option<&str>| Item {
+        body: Body::Binary("ELF executable"),
+        run_by: run_by.map(str::to_string),
+        ..item(path, Category::Hyprland, tier)
+    };
+    let collection = Collection {
+        items: vec![
+            binary(
+                "home/u/.cargo/bin/run",
+                Tier::Unknown,
+                Some("home/u/x.conf"),
+            ),
+            binary("usr/bin/aur-tool", Tier::UserBuilt, Some("home/u/x.conf")),
+            binary("home/u/.local/bin/ls", Tier::Unknown, None),
+            binary("home/u/.local/bin/ok", Tier::Allowed, Some("home/u/x.conf")),
+        ],
+        ..Collection::default()
+    };
+    let mut report = Report::new("t", ReviewScope::default());
+    let facts = super::examine(&mut report, &collection, Some("home/u"), &HashSet::new());
+    let flagged: Vec<&str> = report
+        .findings
+        .iter()
+        .filter(|finding| finding.rule == RuleId::UnpackagedBinary)
+        .map(|finding| finding.path.as_str())
+        .collect();
+    assert_eq!(flagged, ["~/.cargo/bin/run"]);
+    // Every binary that is not trusted is told to the AI with what
+    // installed it; an allowed one is only counted.
+    assert_eq!(facts.len(), 3, "{facts:?}");
+    assert!(facts[1].contains("installed by a package from no configured repository"));
+    assert!(facts.iter().all(|fact| !fact.contains("/ok")));
+}

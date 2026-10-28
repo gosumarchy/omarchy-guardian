@@ -1686,7 +1686,34 @@ and sent like the start-up file itself, unless its path marks it as holding
 secrets.
 
 Binaries no package vouches for are named to the AI by format and hash but
-never run or uploaded.
+never run or uploaded. With each one goes what Guardian established about it,
+as a fact outside the untrusted data: what installed it (no package, a package
+of no configured repository, or a package whose file it no longer is) and what
+runs it.
+The reviewer is told to judge such a binary by those facts:
+
+- one a package installed, unchanged since, is no reason for doubt;
+- a sent file that launches one no package installed, or one changed since its
+  package installed it, gets a finding at that file: medium, or high where how
+  it is launched adds to the concern (as root, from a temporary directory);
+- a binary Guardian established nothing about counts as installed by no
+  package;
+- none of this makes the chunk inconclusive by itself. The rest of the chunk
+  keeps its verdict; `inconclusive` is left for a sent file whose own behaviour
+  cannot be told.
+
+This is the sweep's alone. The other review classes keep the general rule
+that a file which runs a hash-only file is a finding; their request text is
+unchanged.
+
+The flag does not rest on the reviewer: a binary no package installed that
+something the sweep follows runs (a launcher's `Exec=`, a keybinding, a unit)
+raises `unpackaged-binary` (medium) on the binary itself, naming what runs it,
+whatever the AI answers. `sweep allow` on the binary records that you checked
+it, bound to its hash, so a replaced binary is flagged again. A binary that
+nothing the sweep follows runs (one catalogued by its own place, such as a
+program in `~/.local/bin` named like a system command) is listed and told to
+the AI but raises no such finding.
 
 ### What is taken out of a file that is sent
 
@@ -2108,6 +2135,7 @@ reviews as well, are listed under [Local rules](local-rules.md#rule-ids).
 | `plugin-source` | medium | An editor plugin is not a git checkout of where its plugin manager fetches it from: its origin is not the address its spec names, it names no origin, or it is no checkout at all. |
 | `plugin-build` | medium | An editor plugin runs a program when its plugin manager installs or updates it: a shell command as its build step, a field whose key code computes and that may be one, or a git hook in its checkout. |
 | `kept-from-review` | medium | Something runs this file, or a shell reads it in, and it holds more than opaque values kept in secret-named or plainly inert variables; it holds secrets (by its path or a boot password), so the AI review did not read it: only the local rules did. Read it yourself; `sweep allow` records that you did. |
+| `unpackaged-binary` | medium | Something the sweep follows runs this binary file, and no package installed it: Guardian only hashed it, so neither the local rules nor the AI read it. Check where it came from; `sweep allow` records that you did, bound to its hash. |
 | `network-listener` | low | A program listens on the network that nothing installed accounts for: an interpreter (Python, a shell, Node), or a packaged program no packaged service runs. |
 
 `git-config-command` and `remote-shell` are reported by the sweep as well as
