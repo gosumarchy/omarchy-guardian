@@ -253,6 +253,10 @@ pub(super) struct Collection {
     /// the root collector says are new, when it kept track itself (see
     /// `root::news`); `None` when it did not.
     pub(super) root_news: Option<Vec<String>>,
+    /// Every item path that leads to each followed path, not only the
+    /// first that `run_by` keeps: a second wrapper of the same program
+    /// leaves no `run_by` of its own.
+    pub(super) runners: HashMap<String, Vec<String>>,
 }
 
 impl Collection {
@@ -367,6 +371,7 @@ pub(super) fn collect(scope: &Scope<'_>) -> Collection {
     });
     path::mark(scope, &search, &mut collection.items);
     mark_reach(&mut collection.items, &walk);
+    collection.runners = walk.runners;
     for item in &mut collection.items {
         // The package's own directory, and the one for shared data, may
         // hold a drop-in a repository package ships for every unit;
@@ -434,6 +439,8 @@ struct Walk {
     /// any other way.
     environment: HashSet<String>,
     otherwise: HashSet<String>,
+    /// See `Collection::runners`.
+    runners: HashMap<String, Vec<String>>,
 }
 
 impl Walk {
@@ -447,6 +454,10 @@ impl Walk {
         root: Option<&str>,
         target: &String,
     ) {
+        self.runners
+            .entry(target.clone())
+            .or_default()
+            .push(item.path.clone());
         match root {
             Some(root) if followed.configuration.contains(target) => {
                 self.roots

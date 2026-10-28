@@ -1096,3 +1096,33 @@ fn a_directory_a_pattern_passes_through_is_said_listed_or_unlisted() {
         );
     }
 }
+
+#[test]
+fn every_file_that_runs_a_program_is_kept_as_its_runner() {
+    let dir = TempDir::new("sweep-runners");
+    let root = dir.path();
+    for unit in ["a", "b"] {
+        write(
+            root,
+            &format!("etc/systemd/system/{unit}.service"),
+            "[Service]\nExecStart=/home/u/bin/tool\n",
+        );
+    }
+    write(root, "home/u/bin/tool", "true\n");
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let collection = collect(&Scope {
+        root,
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::System,
+    });
+    let mut runners = collection.runners["home/u/bin/tool"].clone();
+    runners.sort();
+    assert_eq!(
+        runners,
+        [
+            "etc/systemd/system/a.service",
+            "etc/systemd/system/b.service"
+        ]
+    );
+}

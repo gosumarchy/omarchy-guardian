@@ -1964,7 +1964,7 @@ fn only_shell_files_programs_and_agent_entries_in_the_home_may_hold_settings() {
 #[test]
 fn a_launcher_of_a_binary_only_the_reviewer_flags_is_not_a_setting() {
     let home = Some("home/u");
-    let collection = Collection {
+    let mut collection = Collection {
         items: vec![
             // A wrapper that runs a binary an AUR package installed: no
             // local rule flags that binary, so its launcher stays an alert.
@@ -2026,9 +2026,26 @@ fn a_launcher_of_a_binary_only_the_reviewer_flags_is_not_a_setting() {
                     Tier::UserBuilt,
                 )
             },
+            // A second wrapper of the AUR binary, which `run_by` cannot
+            // hold: only `runners` has it.
+            item(
+                "home/u/.local/bin/aurtool-alt",
+                Category::LocalBin,
+                Tier::Unknown,
+            ),
         ],
         ..Collection::default()
     };
+    collection.runners = collection
+        .items
+        .iter()
+        .filter_map(|item| Some((item.path.clone(), vec![item.run_by.clone()?])))
+        .collect();
+    collection
+        .runners
+        .get_mut("usr/bin/aurtool-bin")
+        .expect("the AUR binary has a runner")
+        .push("home/u/.local/bin/aurtool-alt".into());
     let paths: Vec<String> = setting_paths(&collection, home).into_iter().collect();
     assert_eq!(paths, ["~/.local/bin/nodetool"]);
 }

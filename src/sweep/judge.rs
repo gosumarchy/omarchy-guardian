@@ -6,7 +6,7 @@
 pub(super) mod secrets;
 mod variables;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::Write as _;
 
 use super::collect::{self, Body, Collection, Item};
@@ -154,28 +154,25 @@ fn setting_paths(collection: &Collection, home: Option<&str>) -> HashSet<String>
 }
 
 /// The paths of the items that lead to a binary for which
-/// `flagged_by_word_alone` holds: the one that runs it, what runs that, and
-/// so on to the item the catalogue found. They are matched by item path,
-/// not by the path the AI is sent, because `run_by` holds the launcher's
-/// item path (an agent entry's has its `#hooks/...` suffix).
+/// `flagged_by_word_alone` holds: every one that runs it, what runs those,
+/// and so on to the items the catalogue found. They are item paths, as
+/// `Collection::runners` holds them (an agent entry's keeps its
+/// `#hooks/...` suffix), not the paths the AI is sent.
 fn launchers_of_word_alone(collection: &Collection) -> HashSet<&str> {
-    let runner: HashMap<&str, &str> = collection
-        .items
-        .iter()
-        .filter_map(|item| Some((item.path.as_str(), item.run_by.as_deref()?)))
-        .collect();
     let mut launchers = HashSet::new();
-    for item in collection
+    let mut next: Vec<&str> = collection
         .items
         .iter()
         .filter(|item| flagged_by_word_alone(item))
-    {
-        let mut next = item.run_by.as_deref();
-        // `insert` returning false stops a cycle of `run_by` links.
-        while let Some(path) = next
-            && launchers.insert(path)
-        {
-            next = runner.get(path).copied();
+        .map(|item| item.path.as_str())
+        .collect();
+    while let Some(path) = next.pop() {
+        for runner in collection.runners.get(path).into_iter().flatten() {
+            // A path already in `launchers` was walked from there, by this
+            // binary (a cycle) or another.
+            if launchers.insert(runner.as_str()) {
+                next.push(runner);
+            }
         }
     }
     launchers
@@ -185,8 +182,9 @@ fn launchers_of_word_alone(collection: &Collection) -> HashSet<&str> {
 /// rule raises an alert on: one an AUR or `pacman -U` package installed
 /// (`hashed` flags those no package installed, or a version manager did,
 /// and a changed package file has its own rule). The reviewer's finding on
-/// its launcher is then the only alert, so that launcher may not be shown
-/// as the owner's setting: the claim would leave the binary with none.
+/// what launches it is then the only alert, so no launcher up to the
+/// catalogued item may be shown as the owner's setting: the claim would
+/// leave the binary with none.
 fn flagged_by_word_alone(item: &Item) -> bool {
     matches!(item.body, Body::Binary(_))
         && item.tier == Tier::UserBuilt
