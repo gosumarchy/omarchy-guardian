@@ -524,10 +524,16 @@ impl Report {
     /// rather than as an alert. The reviewer's claim alone is not enough;
     /// all of these must hold:
     ///
-    /// - the reviewer marked it `owner_setting` and graded it below high;
-    /// - its review is clear (the reviewer is told settings alone never
-    ///   make a review suspicious, so a claim beside any other verdict is
-    ///   not believed) and did not say the content spoke to the reviewer;
+    /// - the reviewer marked it `owner_setting` and graded it low;
+    /// - its review is clear or suspicious, not inconclusive, and did not
+    ///   say the content spoke to the reviewer. The owner chose to accept a
+    ///   suspicious review on 2026-10-29: a real machine nearly always has
+    ///   an unvouched program in the chunk that holds the shell files, so
+    ///   requiring a clear review left no setting ever shown. The findings
+    ///   that made it suspicious stay alerts, and a suspicious review whose
+    ///   findings are all settings has no alert to show and does not pass
+    ///   (see `Report::decide`);
+    /// - no medium or high AI finding, of any run, names a file it names;
     /// - every file it names, among all the runs' files, is in
     ///   `ReviewScope::setting_paths`, and one of them was sent in `run`;
     /// - no local rule matched in a file it names: the reviewer is asked to
@@ -540,10 +546,20 @@ impl Report {
             return false;
         };
         if !finding.owner_setting
-            || review.status != Status::Clear
-            || finding.severity == Severity::High
+            || review.status == Status::Inconclusive
+            || finding.severity != Severity::Low
             || review.addresses_reviewer()
         {
+            return false;
+        }
+        // Two findings name the same file when both name one of the files
+        // sent: each may carry a line number or a shortened path.
+        let sent = || self.agent_runs.iter().flat_map(|run| &run.files);
+        let graver = self.reviewed_findings().any(|(_, other)| {
+            other.severity != Severity::Low
+                && sent().any(|path| names(&finding.file, path) && names(&other.file, path))
+        });
+        if graver {
             return false;
         }
         let mut named = self

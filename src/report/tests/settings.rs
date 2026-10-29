@@ -40,12 +40,12 @@ fn claimed(status: &str, file: &str, severity: &str) -> String {
 }
 
 /// The sweep the change was made for: a clear review of `~/.bashrc` whose
-/// one finding, an alias, is claimed as the owner's setting.
+/// one finding, a low alias, is claimed as the owner's setting.
 fn alias_sweep() -> Report {
     let mut report = sweep();
     report
         .agent_runs
-        .push(run(&[BASHRC], &claimed("clear", BASHRC, "medium")));
+        .push(run(&[BASHRC], &claimed("clear", BASHRC, "low")));
     report
 }
 
@@ -96,13 +96,31 @@ fn each_condition_alone_keeps_the_finding_an_alert() {
         BASHRC,
         with(
             &[BASHRC],
-            &claimed("clear", BASHRC, "medium").replace(r#","owner_setting":true"#, ""),
+            &claimed("clear", BASHRC, "low").replace(r#","owner_setting":true"#, ""),
         ),
+    );
+    refused(
+        "graded medium",
+        BASHRC,
+        with(&[BASHRC], &claimed("clear", BASHRC, "medium")),
     );
     refused(
         "graded high",
         BASHRC,
         with(&[BASHRC], &claimed("clear", BASHRC, "high")),
+    );
+    refused(
+        "a medium finding of another run names the same file",
+        BASHRC,
+        {
+            let mut report = alias_sweep();
+            report.agent_runs.push(run(
+                &["~/.profile"],
+                &claimed("suspicious", "~/.bashrc:3", "medium")
+                    .replace(r#","owner_setting":true"#, ""),
+            ));
+            report
+        },
     );
     refused(
         "a severity that cannot be read counts as high",
@@ -114,7 +132,7 @@ fn each_condition_alone_keeps_the_finding_an_alert() {
         "~/.config/autostart/sync.desktop",
         with(
             &["~/.config/autostart/sync.desktop"],
-            &claimed("clear", "~/.config/autostart/sync.desktop", "medium"),
+            &claimed("clear", "~/.config/autostart/sync.desktop", "low"),
         ),
     );
     refused(
@@ -122,11 +140,11 @@ fn each_condition_alone_keeps_the_finding_an_alert() {
         ".bashrc",
         with(
             &[BASHRC, "/etc/skel/.bashrc"],
-            &claimed("clear", ".bashrc", "medium"),
+            &claimed("clear", ".bashrc", "low"),
         ),
     );
     refused("not sent in that run", BASHRC, {
-        let mut report = with(&["~/.profile"], &claimed("clear", BASHRC, "medium"));
+        let mut report = with(&["~/.profile"], &claimed("clear", BASHRC, "low"));
         report.agent_runs.push(reviewed(Status::Clear, &[BASHRC]));
         report
     });
@@ -144,7 +162,7 @@ fn each_condition_alone_keeps_the_finding_an_alert() {
         BASHRC,
         with(
             &[BASHRC],
-            &claimed("clear", BASHRC, "medium")
+            &claimed("clear", BASHRC, "low")
                 .replace(r#"{"status""#, r#"{"addressed_to_reviewer":true,"status""#),
         ),
     );
@@ -161,25 +179,36 @@ fn each_condition_alone_keeps_the_finding_an_alert() {
 }
 
 #[test]
-fn a_claim_in_a_review_that_is_not_clear_is_not_believed() {
-    // Suspicious: the claimed finding is the alert that blocks.
+fn a_claim_in_a_suspicious_review_is_believed_beside_its_other_alerts() {
+    // The finding that made the review suspicious names another file: it
+    // stays the alert that blocks, and the claim is a setting.
+    let reply = r#"{"status":"suspicious","summary":"s","findings":[
+        {"severity":"medium","file":"~/.config/hypr/bindings.lua:28","title":"runs an unvouched binary","reason":"r"},
+        {"severity":"low","file":"~/.bashrc:22","title":"skips permission prompts","reason":"alias","owner_setting":true}]}"#;
+    let mut report = sweep();
+    report
+        .agent_runs
+        .push(run(&[BASHRC, "~/.config/hypr/bindings.lua"], reply));
+    assert_eq!(report.owner_settings().count(), 1);
+    assert_eq!(report.counts().medium, 1);
+    assert_eq!(report.counts().low, 0);
+    assert_eq!(report.decide(&standard), FINDINGS);
+
+    // Suspicious with only the claim: no alert to show, and still blocked.
     let mut report = sweep();
     report
         .agent_runs
         .push(run(&[BASHRC], &claimed("suspicious", BASHRC, "low")));
-    assert_eq!(report.owner_settings().count(), 0);
-    assert_eq!(report.counts().low, 1);
+    assert_eq!(report.owner_settings().count(), 1);
     assert_eq!(report.decide(&standard), FINDINGS);
-    assert_eq!(
-        report.overruled_summary(10),
-        ["LOW ~/.bashrc (AI) skips permission prompts"]
-    );
+}
 
-    // Inconclusive: incomplete, and nothing is shown as a setting.
+#[test]
+fn a_claim_in_an_inconclusive_review_is_not_believed() {
     let mut report = sweep();
     report
         .agent_runs
-        .push(run(&[BASHRC], &claimed("inconclusive", BASHRC, "medium")));
+        .push(run(&[BASHRC], &claimed("inconclusive", BASHRC, "low")));
     assert_eq!(report.owner_settings().count(), 0);
     assert!(report.flagged_paths().contains(BASHRC));
     assert_eq!(

@@ -1386,7 +1386,7 @@ mod tests {
         let opencode = OpenCode::At(mock_opencode_owner_setting(
             bin.path(),
             "clear",
-            ("medium", "~/.bashrc", "Skips permission prompts"),
+            ("low", "~/.bashrc", "Skips permission prompts"),
         ));
         let bashrc = item(
             "home/u/.bashrc",
@@ -1431,7 +1431,7 @@ mod tests {
         for expected in [
             r#""decision":"clear""#,
             r#""flagged":false"#,
-            r#""severity":"setting","graded":"medium","title":"Skips permission prompts""#,
+            r#""severity":"setting","graded":"low","title":"Skips permission prompts""#,
         ] {
             assert!(json.contains(expected), "{expected}\n{json}");
         }
@@ -1469,7 +1469,7 @@ mod tests {
         let current = super::remembered(&collection, &report, None, label);
         assert!(current["~/.bashrc"].ends_with(state::FLAGGED));
         assert!(
-            json.contains(r#""severity":"medium","title":"Skips permission prompts""#),
+            json.contains(r#""severity":"low","title":"Skips permission prompts""#),
             "{json}"
         );
         assert!(summary.contains("Needs a look"), "{summary}");
