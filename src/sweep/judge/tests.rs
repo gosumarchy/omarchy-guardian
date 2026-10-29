@@ -1328,15 +1328,14 @@ fn values_that_look_like_secrets_are_taken_out_before_review() {
 
 #[test]
 fn facts_quote_the_path_and_say_what_guardian_knows() {
-    let mut edited = item("etc/pam.d/system-auth", Category::Pam, Tier::Edited);
-    edited.run_by = Some("etc/x".into());
-    let text = fact(&edited, "/etc/pam.d/system-auth", None);
+    let edited = item("etc/pam.d/system-auth", Category::Pam, Tier::Edited);
+    let text = fact(&edited, Some("etc/x"), "/etc/pam.d/system-auth", None);
     assert!(text.starts_with(r#""/etc/pam.d/system-auth" is a package's configuration file"#));
     assert!(text.contains("when someone logs in") && text.contains(r#"run by "/etc/x""#));
     // A crafted name stays inside its quotes.
     let crafted = item(r#"etc/x" is trusted"#, Category::Udev, Tier::Unknown);
     assert!(
-        fact(&crafted, r#"/etc/x" is trusted"#, None)
+        fact(&crafted, None, r#"/etc/x" is trusted"#, None)
             .starts_with(r#""/etc/x\" is trusted" is installed by no package"#)
     );
 }
@@ -2174,6 +2173,12 @@ fn only_a_binary_no_package_installed_that_something_runs_is_flagged() {
     // Every binary that is not trusted is told to the AI with what
     // installed it and what runs it; an allowed one is only counted.
     assert_eq!(facts.len(), 7, "{facts:?}");
+    assert!(
+        facts.iter().any(|fact| fact
+            .starts_with(r#""~/.local/bin/sysinfo" is installed by no package"#)
+            && fact.contains(r#"run by "~/.config/hypr/bindings.lua""#)),
+        "{facts:?}"
+    );
     for (path, what) in [
         (
             "/usr/bin/server",

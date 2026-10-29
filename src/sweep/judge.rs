@@ -254,7 +254,7 @@ fn examine(
                 let file = shown_path(checked_path(item), home);
                 if reading == Some(Reading::Reviewed) {
                     review::analyze_text(report, &file, &text, false);
-                    facts.push(fact(item, &label, home));
+                    facts.push(fact(item, item.run_by.as_deref(), &label, home));
                 } else {
                     review::analyze_text_locally(report, &file, &text);
                 }
@@ -344,7 +344,7 @@ fn hashed(
             .findings
             .push(finding(&label, 1, RuleId::UnpackagedBinary, &by));
     }
-    let fact = hashed_fact(item, &label, format, home);
+    let fact = hashed_fact(item, runner, &label, format, home);
     report.hash_only.push(HashOnly {
         path: label,
         bytes: 0,
@@ -776,11 +776,12 @@ fn is_version_managed(item: &Item) -> bool {
             .any(|note| note.contains("version manager"))
 }
 
-/// What Guardian established about an item, for the AI. The paths are
+/// What Guardian established about an item that `runner` runs, for the
+/// AI. The paths are
 /// quoted, so a crafted name cannot pose as Guardian's words, and written
 /// as the files sent are (`~/` for the home), so the model can tell which
 /// sent file runs it.
-fn fact(item: &Item, label: &str, home: Option<&str>) -> String {
+fn fact(item: &Item, runner: Option<&str>, label: &str, home: Option<&str>) -> String {
     let what = match item.tier {
         Tier::Edited => {
             "a package's configuration file, edited after install (normal for configuration)"
@@ -808,7 +809,7 @@ fn fact(item: &Item, label: &str, home: Option<&str>) -> String {
         shown(label).as_ref(),
         item.category.when()
     );
-    if let Some(by) = &item.run_by {
+    if let Some(by) = runner {
         let _ = write!(
             text,
             " It is run by {:?}.",
@@ -839,11 +840,18 @@ fn fact(item: &Item, label: &str, home: Option<&str>) -> String {
 }
 
 /// What Guardian established about `item`, a binary of `format` listed as
-/// `label`, for the AI, which is sent its hash and never its content.
-fn hashed_fact(item: &Item, label: &str, format: &str, home: Option<&str>) -> String {
+/// `label` that `runner` runs, for the AI, which is sent its hash and
+/// never its content.
+fn hashed_fact(
+    item: &Item,
+    runner: Option<&str>,
+    label: &str,
+    format: &str,
+    home: Option<&str>,
+) -> String {
     format!(
         "{} Guardian hashed it ({format}) and did not send its content.",
-        fact(item, label, home)
+        fact(item, runner, label, home)
     )
 }
 

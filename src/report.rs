@@ -530,9 +530,8 @@ impl Report {
     ///   suspicious review on 2026-10-29: a real machine nearly always has
     ///   an unvouched program in the chunk that holds the shell files, so
     ///   requiring a clear review left no setting ever shown. The findings
-    ///   that made it suspicious stay alerts, and a suspicious review whose
-    ///   findings are all settings has no alert to show and does not pass
-    ///   (see `Report::decide`);
+    ///   that made it suspicious stay alerts. A suspicious review whose
+    ///   findings are all claims has none, so its claims stay alerts;
     /// - no medium or high AI finding, of any run, names a file it names;
     /// - every file it names, among all the runs' files, is in
     ///   `ReviewScope::setting_paths`, and one of them was sent in `run`;
@@ -559,7 +558,11 @@ impl Report {
             other.severity != Severity::Low
                 && sent().any(|path| names(&finding.file, path) && names(&other.file, path))
         });
-        if graver {
+        // The reviewer is told settings alone never make a review
+        // suspicious, so a suspicious review with nothing but claims
+        // contradicts itself: its claims are its alerts.
+        let only_claims = review.findings.iter().all(|other| other.owner_setting);
+        if graver || (review.status == Status::Suspicious && only_claims) {
             return false;
         }
         let mut named = self

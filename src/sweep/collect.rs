@@ -263,7 +263,9 @@ pub(super) struct Collection {
 impl Collection {
     /// What runs `item`: its `run_by`, or else the first item that leads
     /// to it. A program the catalogue lists itself (one on `PATH`) has no
-    /// `run_by`, but a key binding may still run it.
+    /// `run_by`, but a key binding may still run it. A lead may only read
+    /// a file (configuration, a list of variables), but a binary is not
+    /// read that way, so for a binary a lead is a runner.
     pub(super) fn runner_of<'a>(&'a self, item: &'a Item) -> Option<&'a str> {
         item.run_by
             .as_deref()

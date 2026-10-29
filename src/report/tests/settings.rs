@@ -194,13 +194,32 @@ fn a_claim_in_a_suspicious_review_is_believed_beside_its_other_alerts() {
     assert_eq!(report.counts().low, 0);
     assert_eq!(report.decide(&standard), FINDINGS);
 
-    // Suspicious with only the claim: no alert to show, and still blocked.
+    // Suspicious with only the claim: the claim is the alert that blocks.
     let mut report = sweep();
     report
         .agent_runs
         .push(run(&[BASHRC], &claimed("suspicious", BASHRC, "low")));
-    assert_eq!(report.owner_settings().count(), 1);
+    assert_eq!(report.owner_settings().count(), 0);
+    assert_eq!(report.counts().low, 1);
+    assert!(report.flagged_paths().contains(BASHRC));
     assert_eq!(report.decide(&standard), FINDINGS);
+}
+
+#[test]
+fn a_graver_finding_on_the_claimed_file_keeps_the_claim_an_alert() {
+    // A payload in the same file as the claim, from the same review, in
+    // each form a reviewer may name the file by.
+    for (grade, named) in [("medium", "~/.bashrc:5"), ("high", ".bashrc")] {
+        let reply = format!(
+            r#"{{"status":"suspicious","summary":"s","findings":[
+                {{"severity":"{grade}","file":"{named}","title":"curl | sh","reason":"r"}},
+                {{"severity":"low","file":"~/.bashrc:22","title":"skips permission prompts","reason":"alias","owner_setting":true}}]}}"#
+        );
+        let mut report = sweep();
+        report.agent_runs.push(run(&[BASHRC], &reply));
+        assert_eq!(report.owner_settings().count(), 0, "{grade}");
+        assert_eq!(report.counts().low, 1, "{grade}");
+    }
 }
 
 #[test]
