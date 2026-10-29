@@ -777,10 +777,9 @@ fn is_version_managed(item: &Item) -> bool {
 }
 
 /// What Guardian established about an item that `runner` runs, for the
-/// AI. The paths are
-/// quoted, so a crafted name cannot pose as Guardian's words, and written
-/// as the files sent are (`~/` for the home), so the model can tell which
-/// sent file runs it.
+/// AI. The paths are quoted, so a crafted name cannot pose as Guardian's
+/// words, and written as the files sent are (`~/` for the home), so the
+/// model can tell which sent file runs it.
 fn fact(item: &Item, runner: Option<&str>, label: &str, home: Option<&str>) -> String {
     let what = match item.tier {
         Tier::Edited => {
