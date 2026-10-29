@@ -261,6 +261,15 @@ pub(super) struct Collection {
 }
 
 impl Collection {
+    /// What runs `item`: its `run_by`, or else the first item that leads
+    /// to it. A program the catalogue lists itself (one on `PATH`) has no
+    /// `run_by`, but a key binding may still run it.
+    pub(super) fn runner_of<'a>(&'a self, item: &'a Item) -> Option<&'a str> {
+        item.run_by
+            .as_deref()
+            .or_else(|| self.runners.get(&item.path)?.first().map(String::as_str))
+    }
+
     /// What was not looked at, each as a sentence: `truncated`, and each
     /// directory in `unlisted`.
     pub(super) fn not_looked_at(&self) -> Vec<String> {

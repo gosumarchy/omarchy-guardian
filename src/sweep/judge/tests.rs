@@ -2143,8 +2143,16 @@ fn only_a_binary_no_package_installed_that_something_runs_is_flagged() {
             binary("usr/bin/aur-tool", Tier::UserBuilt, by),
             binary("usr/bin/changed", Tier::Modified, by),
             binary("home/u/.local/bin/ls", Tier::Unknown, None),
+            // Listed by the catalogue itself, so no `run_by`, but a key
+            // binding runs it.
+            binary("home/u/.local/bin/sysinfo", Tier::Unknown, None),
             binary("home/u/.local/bin/ok", Tier::Allowed, by),
         ],
+        runners: [(
+            "home/u/.local/bin/sysinfo".to_string(),
+            vec!["home/u/.config/hypr/bindings.lua".to_string()],
+        )]
+        .into(),
         ..Collection::default()
     };
     let mut report = Report::new("t", ReviewScope::default());
@@ -2159,12 +2167,13 @@ fn only_a_binary_no_package_installed_that_something_runs_is_flagged() {
         flagged,
         [
             "~/.cargo/bin/run",
-            "~/.local/share/mise/installs/node/bin/node"
+            "~/.local/share/mise/installs/node/bin/node",
+            "~/.local/bin/sysinfo"
         ]
     );
     // Every binary that is not trusted is told to the AI with what
     // installed it and what runs it; an allowed one is only counted.
-    assert_eq!(facts.len(), 6, "{facts:?}");
+    assert_eq!(facts.len(), 7, "{facts:?}");
     for (path, what) in [
         (
             "/usr/bin/server",

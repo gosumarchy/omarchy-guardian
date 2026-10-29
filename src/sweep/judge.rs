@@ -285,8 +285,9 @@ fn examine(
                 drop_rule(report, before.0, RuleId::PersistenceModification);
             }
             Body::Binary(format) => {
-                let fact = hashed(report, item, label, format, home);
-                binaries.push((item.run_by.is_none(), fact));
+                let runner = collection.runner_of(item);
+                let fact = hashed(report, item, runner, label, format, home);
+                binaries.push((runner.is_none(), fact));
             }
             Body::Undecodable => report.gaps.push(Gap::Undecodable(label)),
             Body::Oversized => report.gaps.push(Gap::OversizedText(label)),
@@ -316,7 +317,7 @@ fn examine(
 }
 
 /// Lists `item`, a binary of `format` shown as `label`, by its hash, flags
-/// it where no package installed it and something runs it, and returns
+/// it where no package installed it and `runner` runs it, and returns
 /// what Guardian established about it.
 ///
 /// The reviewer is told what Guardian knows of a program it was not sent,
@@ -328,6 +329,7 @@ fn examine(
 fn hashed(
     report: &mut Report,
     item: &Item,
+    runner: Option<&str>,
     label: String,
     format: &'static str,
     home: Option<&str>,
@@ -336,7 +338,7 @@ fn hashed(
     // that finds it is reviewed in full.
     report.unread.insert(label.clone(), item.sha256);
     let unpackaged = item.tier == Tier::Unknown || is_version_managed(item);
-    if unpackaged && let Some(by) = &item.run_by {
+    if unpackaged && let Some(by) = runner {
         let by = format!("run by {}", shown_path(by, home));
         report
             .findings
