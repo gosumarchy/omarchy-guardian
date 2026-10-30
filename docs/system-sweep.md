@@ -1787,9 +1787,9 @@ of this holds:
   (a Claude Code hook, a plugin's hook), as the sweep finds it itself: a
   script one of these runs or sources is not one, nor is a start-up file that
   is a link into a dotfiles directory (the sweep reaches its target by
-  following the link), nor a program under a name Guardian watches on
-  `PATH` (`sudo`, `ssh`, `git`, `omarchy-…`), where a fake one is how a
-  password is taken. A file under `/etc`, `/usr` or
+  following the link), nor a program or fish function under a name
+  Guardian watches on `PATH` (`sudo`, `ssh`, `git`, `omarchy-…`), where a
+  fake one is how a password is taken. A file under `/etc`, `/usr` or
   anywhere else, root's home as `sweep --root` shows it (`/root/…`), and
   every other kind of file in your home keeps it an alert: autostart
   entries, user units, Hyprland's `exec` lines, cron jobs, Omarchy hooks and
@@ -1803,9 +1803,12 @@ of this holds:
   (`sweep allow` records one you know). The start-up files uwsm sources
   (`~/.config/uwsm/`) and makepkg's (`~/.makepkg.conf`,
   `~/.config/pacman/makepkg.conf`) are read without a shell being opened, and
-  stay alerts too. When the sweep stopped following a chain of scripts
-  before its end, what that chain starts is not known, and no file is shown
-  as a setting in that sweep;
+  stay alerts too. When a file Guardian cannot vouch for, among those other
+  kinds or what they start, names a program through a variable or runs more
+  than the sweep follows, what it starts is not known, and no file is shown
+  as a setting in that sweep. Files a repository package ships unchanged are
+  left out of that rule: they name programs through variables on every
+  machine;
 - the file does not lead to a program an AUR or `pacman -U` package
   installed, directly, through a script, or as a second wrapper of it: no
   local rule flags such a program, so the mark would leave it with no alert;

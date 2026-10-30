@@ -8,9 +8,7 @@ use crate::rules::RuleId;
 use crate::sweep::nvim::{self, Review};
 use std::collections::{HashMap, HashSet};
 
-use crate::sweep::collect::{
-    self, Body, CHAIN_CAPPED, Collection, Item, NOT_ALL_FOLLOWED, Origin, Scope,
-};
+use crate::sweep::collect::{self, Body, Collection, Item, NOT_ALL_FOLLOWED, Origin, Scope};
 use crate::sweep::index::PackageIndex;
 use crate::sweep::tier::Tier;
 use crate::test_support::TempDir;
@@ -2281,6 +2279,17 @@ fn a_program_that_starts_on_its_own_is_not_a_setting() {
             // Start-up files no shell the owner opens reads.
             item("home/u/.config/uwsm/env", Category::Shell, Tier::Unknown),
             item("home/u/.makepkg.conf", Category::Shell, Tier::Unknown),
+            // A fish function named for a command Guardian watches.
+            item(
+                "home/u/.config/fish/functions/sudo.fish",
+                Category::Shell,
+                Tier::Unknown,
+            ),
+            item(
+                "home/u/.config/fish/functions/greet.fish",
+                Category::Shell,
+                Tier::Unknown,
+            ),
         ],
         runners: [
             ("sync-helper", "home/u/.config/systemd/user/sync.service"),
@@ -2303,23 +2312,56 @@ fn a_program_that_starts_on_its_own_is_not_a_setting() {
     };
     let mut paths: Vec<String> = setting_paths(&collection, home).into_iter().collect();
     paths.sort();
-    assert_eq!(paths, ["~/.bashrc", "~/.local/bin/aliased"]);
+    assert_eq!(
+        paths,
+        [
+            "~/.bashrc",
+            "~/.config/fish/functions/greet.fish",
+            "~/.local/bin/aliased"
+        ]
+    );
 }
 
 #[test]
-fn a_chain_not_followed_to_its_end_leaves_no_setting() {
-    // What the capped script starts is not known: it may be any file in
-    // the home, so none is shown as a setting.
-    let mut capped = item("home/u/.cache/s4", Category::Systemd, Tier::Unknown);
-    capped
-        .notes
-        .push(format!("{NOT_ALL_FOLLOWED}{CHAIN_CAPPED}"));
-    let collection = Collection {
+fn what_a_started_file_runs_unseen_leaves_no_setting() {
+    // A user unit starts a script in the home that names what it runs
+    // through a variable: that may be any file in the home, so none is
+    // shown as a setting.
+    let home = Some("home/u");
+    let unit = "home/u/.config/systemd/user/sync.service";
+    let script = |tier: Tier| {
+        let mut script = item("home/u/.cache/s", Category::Shell, tier);
+        script.run_by = Some(unit.into());
+        script.notes.push(format!(
+            "{NOT_ALL_FOLLOWED}a program or script named through a variable"
+        ));
+        script
+    };
+    let collection = |tier: Tier| Collection {
         items: vec![
             item("home/u/.bashrc", Category::Shell, Tier::Unknown),
-            capped,
+            item(unit, Category::Systemd, Tier::Unknown),
+            script(tier),
         ],
+        runners: [("home/u/.cache/s".to_string(), vec![unit.to_string()])].into(),
         ..Collection::default()
     };
-    assert!(setting_paths(&collection, Some("home/u")).is_empty());
+    assert!(setting_paths(&collection(Tier::Unknown), home).is_empty());
+    // A packaged file names its programs through variables on every
+    // machine, and is what the package ships.
+    assert_eq!(
+        setting_paths(&collection(Tier::Vendor), home),
+        ["~/.bashrc".to_string()].into()
+    );
+    // What only a start-up file in the home runs is not started on its own.
+    let mut quiet = collection(Tier::Unknown);
+    quiet.runners = [(
+        "home/u/.cache/s".to_string(),
+        vec!["home/u/.bashrc".to_string()],
+    )]
+    .into();
+    assert_eq!(
+        setting_paths(&quiet, home),
+        ["~/.bashrc".to_string()].into()
+    );
 }

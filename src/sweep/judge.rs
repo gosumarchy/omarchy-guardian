@@ -9,7 +9,7 @@ mod variables;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
-use super::collect::{self, Body, CHAIN_CAPPED, Collection, Item, NOT_ALL_FOLLOWED};
+use super::collect::{self, Body, Collection, Item};
 use super::nvim::{self, Review};
 use super::tier::Tier;
 use super::{boot, commands};
@@ -153,8 +153,16 @@ fn setting_paths(collection: &Collection, home: Option<&str>) -> HashSet<String>
     let mut refused = HashSet::new();
     for item in &collection.items {
         let path = shown_path(checked_path(item), home);
-        let watched =
-            item.category == Category::LocalBin && super::path::is_watched(file_name(&item.path));
+        // A fish function takes over the command it is named for, as a
+        // program on `PATH` does.
+        let watched = match item.category {
+            Category::LocalBin => super::path::is_watched(file_name(&item.path)),
+            Category::Shell => path
+                .strip_prefix("~/.config/fish/functions/")
+                .and_then(|name| name.strip_suffix(".fish"))
+                .is_some_and(super::path::is_watched),
+            _ => false,
+        };
         let sourced_unasked = NOT_SOURCED_BY_A_SHELL.iter().any(|place| {
             path.strip_prefix("~/")
                 .is_some_and(|rest| rest.starts_with(place))
@@ -189,9 +197,16 @@ fn setting_paths(collection: &Collection, home: Option<&str>) -> HashSet<String>
 /// crontab or `/etc/profile.d` may run a home program, and root's results
 /// keep only the first launcher of each item (see `root::merge`).
 ///
-/// `None` when the walk reaches a script `bound_scripts` did not look
-/// through: what that script starts is not known, so any file in the
-/// home may be one of them.
+/// `None` when the walk reaches an item Guardian does not vouch for that
+/// it did not follow to the end (a program named through a variable, a
+/// chain of more scripts than it looks through, and the other limits of
+/// `collect::NOT_ALL_FOLLOWED`): what that item starts is not known, so
+/// any file in the home may be one of them. A trusted item is left out:
+/// what a repository package ships names what the package means to run,
+/// and packaged files (`/etc/profile`, every bash completion) name
+/// programs through variables on every machine, so counting them would
+/// leave no setting anywhere. A planted way to a home program needs a file
+/// Guardian cannot vouch for.
 fn started_by_other_kinds<'a>(
     collection: &'a Collection,
     home: Option<&str>,
@@ -222,14 +237,12 @@ fn started_by_other_kinds<'a>(
             }
         }
     }
-    let capped = collection.items.iter().any(|item| {
+    let unknown = collection.items.iter().any(|item| {
         (started.contains(item.path.as_str()) || seeds.contains(item.path.as_str()))
-            && item
-                .notes
-                .iter()
-                .any(|note| note.strip_prefix(NOT_ALL_FOLLOWED) == Some(CHAIN_CAPPED))
+            && !item.is_trusted()
+            && collect::is_capped(item)
     });
-    (!capped).then_some(started)
+    (!unknown).then_some(started)
 }
 
 /// The paths of the items that lead to a binary for which
@@ -321,7 +334,7 @@ fn examine(
             report.gaps.extend(
                 item.notes
                     .iter()
-                    .filter_map(|note| note.strip_prefix(NOT_ALL_FOLLOWED))
+                    .filter_map(|note| note.strip_prefix(collect::NOT_ALL_FOLLOWED))
                     .map(|limit| Gap::Sweep(format!("{label}: not followed past {limit}"))),
             );
         }

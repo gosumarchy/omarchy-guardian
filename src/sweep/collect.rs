@@ -83,10 +83,6 @@ pub(super) const CLOSED: &str = "its package installs it readable by everyone, a
 /// commands nobody followed), and where its text is not reviewed either,
 /// the sweep counts as incomplete.
 pub(super) const NOT_ALL_FOLLOWED: &str = "not all of what it runs was followed: ";
-/// The limit of a script `bound_scripts` did not look through: what it
-/// starts is not in `Collection::runners`.
-pub(super) const CHAIN_CAPPED: &str = "a chain of more than 3 scripts";
-const _: () = assert!(MAX_SCRIPT_DEPTH == 3, "CHAIN_CAPPED names the limit");
 
 /// How the note starts on an item that is read as more of a catalogued
 /// file's configuration and that nothing runs: where a link in an auto-run
@@ -577,9 +573,9 @@ fn bound_scripts(depth: usize, reached: &mut Item, depths: &mut HashMap<String, 
     depths.insert(reached.path.clone(), depth);
     if depth > MAX_SCRIPT_DEPTH && !reached.runs.is_empty() {
         reached.runs.clear();
-        reached
-            .notes
-            .push(format!("{NOT_ALL_FOLLOWED}{CHAIN_CAPPED}"));
+        reached.notes.push(format!(
+            "{NOT_ALL_FOLLOWED}a chain of more than {MAX_SCRIPT_DEPTH} scripts"
+        ));
     }
 }
 
