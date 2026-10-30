@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Notes Sync
+Exec=~/.local/lib/notes-sync/notes-sync --open %u
+MimeType=x-scheme-handler/notes;
+NoDisplay=true

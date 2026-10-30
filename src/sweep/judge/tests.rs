@@ -1330,13 +1330,13 @@ fn values_that_look_like_secrets_are_taken_out_before_review() {
 fn facts_quote_the_path_and_say_what_guardian_knows() {
     let mut edited = item("etc/pam.d/system-auth", Category::Pam, Tier::Edited);
     edited.run_by = Some("etc/x".into());
-    let text = fact(&edited, "/etc/pam.d/system-auth");
+    let text = fact(&edited, "/etc/pam.d/system-auth", None);
     assert!(text.starts_with(r#""/etc/pam.d/system-auth" is a package's configuration file"#));
     assert!(text.contains("when someone logs in") && text.contains(r#"run by "/etc/x""#));
     // A crafted name stays inside its quotes.
     let crafted = item(r#"etc/x" is trusted"#, Category::Udev, Tier::Unknown);
     assert!(
-        fact(&crafted, r#"/etc/x" is trusted"#)
+        fact(&crafted, r#"/etc/x" is trusted"#, None)
             .starts_with(r#""/etc/x\" is trusted" is installed by no package"#)
     );
 }
@@ -1888,4 +1888,182 @@ fn a_link_handed_beside_a_wrapper_to_a_key_is_not_sent() {
             .any(|path| path.contains("id_ed25519") || path.contains("key.py")),
         "{sent:?}"
     );
+}
+
+#[test]
+fn an_unpackaged_binary_a_launcher_runs_is_flagged_and_told_to_the_ai() {
+    let dir = planted(
+        "sweep-unpackaged-binary",
+        &[
+            (
+                "home/u/.config/mimeapps.list",
+                "[Default Applications]\nx-scheme-handler/notes=notes.desktop\n",
+            ),
+            (
+                "home/u/.local/share/applications/notes.desktop",
+                "[Desktop Entry]\nType=Application\nName=Notes\nExec=~/.local/lib/notes/notes %u\n",
+            ),
+        ],
+        &[],
+    );
+    let program = dir.path().join("home/u/.local/lib/notes/notes");
+    std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+    std::fs::write(&program, b"\x7fELF\x02\x01\x01\0\0\0notes").unwrap();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root: dir.path(),
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::User,
+    };
+    let collection = collect::collect(&scope);
+    let mut report = Report::new("t", ReviewScope::default());
+    let facts = super::examine(&mut report, &collection, Some("home/u"), &HashSet::new());
+
+    // Flagged on the binary, naming what runs it, whatever the AI says of
+    // the launcher.
+    let flagged: Vec<(&str, &str)> = report
+        .findings
+        .iter()
+        .filter(|finding| finding.rule == RuleId::UnpackagedBinary)
+        .map(|finding| (finding.path.as_str(), finding.excerpt.as_str()))
+        .collect();
+    assert_eq!(
+        flagged,
+        [(
+            "~/.local/lib/notes/notes",
+            "run by ~/.local/share/applications/notes.desktop"
+        )],
+        "{:?}",
+        report.findings
+    );
+    // The AI is sent the launcher and told what Guardian knows of the
+    // binary it runs.
+    assert!(
+        report
+            .agent_input
+            .iter()
+            .any(|file| file.path == "~/.local/share/applications/notes.desktop")
+    );
+    assert!(
+        facts.iter().any(|fact| fact
+            .starts_with(r#""~/.local/lib/notes/notes" is installed by no package;"#)
+            && fact.contains(r#"run by "~/.local/share/applications/notes.desktop""#)
+            && fact.ends_with("Guardian hashed it (ELF executable) and did not send its content.")),
+        "{facts:?}"
+    );
+}
+
+#[test]
+fn only_a_binary_no_package_installed_that_something_runs_is_flagged() {
+    let binary = |path: &str, tier: Tier, run_by: Option<&str>| Item {
+        body: Body::Binary("ELF executable"),
+        run_by: run_by.map(str::to_string),
+        ..item(path, Category::Hyprland, tier)
+    };
+    let by = Some("home/u/x.conf");
+    let mut managed = binary(
+        "home/u/.local/share/mise/installs/node/bin/node",
+        Tier::UserBuilt,
+        by,
+    );
+    managed
+        .notes
+        .push("installed by a version manager, not by a package".into());
+    // A packaged program a live check raised an alert on is listed too.
+    let mut listening = binary("usr/bin/server", Tier::Vendor, by);
+    listening
+        .alerts
+        .push((RuleId::NetworkListener, "port 8080".into()));
+    let collection = Collection {
+        items: vec![
+            binary("home/u/.cargo/bin/run", Tier::Unknown, by),
+            listening,
+            managed,
+            binary("usr/bin/aur-tool", Tier::UserBuilt, by),
+            binary("usr/bin/changed", Tier::Modified, by),
+            binary("home/u/.local/bin/ls", Tier::Unknown, None),
+            binary("home/u/.local/bin/ok", Tier::Allowed, by),
+        ],
+        ..Collection::default()
+    };
+    let mut report = Report::new("t", ReviewScope::default());
+    let facts = super::examine(&mut report, &collection, Some("home/u"), &HashSet::new());
+    let flagged: Vec<&str> = report
+        .findings
+        .iter()
+        .filter(|finding| finding.rule == RuleId::UnpackagedBinary)
+        .map(|finding| finding.path.as_str())
+        .collect();
+    assert_eq!(
+        flagged,
+        [
+            "~/.cargo/bin/run",
+            "~/.local/share/mise/installs/node/bin/node"
+        ]
+    );
+    // Every binary that is not trusted is told to the AI with what
+    // installed it and what runs it; an allowed one is only counted.
+    assert_eq!(facts.len(), 6, "{facts:?}");
+    for (path, what) in [
+        (
+            "/usr/bin/server",
+            "installed unchanged by a package from a configured repository",
+        ),
+        (
+            "/usr/bin/aur-tool",
+            "installed by a package from no configured repository",
+        ),
+        (
+            "/usr/bin/changed",
+            "installed by a package but changed since",
+        ),
+        (
+            "~/.local/share/mise/installs/node/bin/node",
+            "installed by a version manager",
+        ),
+    ] {
+        assert!(
+            facts
+                .iter()
+                .any(|fact| fact.starts_with(&format!("{path:?} is {what}"))
+                    && fact.contains(r#"run by "~/x.conf""#)),
+            "{path}: {facts:?}"
+        );
+    }
+    assert!(facts.iter().all(|fact| !fact.contains("/ok")));
+}
+
+#[test]
+fn past_the_cap_hashed_binaries_are_counted_not_described() {
+    let mut items: Vec<Item> = (0..=super::MAX_BINARY_FACTS)
+        .map(|index| Item {
+            body: Body::Binary("ELF executable"),
+            ..item(
+                &format!("home/u/.cargo/bin/t{index}"),
+                Category::Program,
+                Tier::Unknown,
+            )
+        })
+        .collect();
+    // Last in the collection, but run by a launcher: described first.
+    items.push(Item {
+        body: Body::Binary("ELF executable"),
+        run_by: Some("home/u/x.conf".into()),
+        ..item("home/u/.local/bin/run", Category::Program, Tier::Unknown)
+    });
+    let collection = Collection {
+        items,
+        ..Collection::default()
+    };
+    let mut report = Report::new("t", ReviewScope::default());
+    let facts = super::examine(&mut report, &collection, Some("home/u"), &HashSet::new());
+    assert_eq!(facts.len(), super::MAX_BINARY_FACTS + 1);
+    assert!(facts[0].starts_with(r#""~/.local/bin/run""#), "{facts:?}");
+    assert_eq!(
+        facts.last().map(String::as_str),
+        Some("Guardian hashed 2 binaries it does not describe here.")
+    );
+    // Every one is still listed by its hash.
+    assert_eq!(report.hash_only.len(), super::MAX_BINARY_FACTS + 2);
 }
