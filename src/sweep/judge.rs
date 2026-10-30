@@ -6,6 +6,7 @@
 pub(super) mod secrets;
 mod variables;
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 
 use super::collect::{self, Body, Collection, Item};
@@ -13,6 +14,7 @@ use super::nvim::{self, Review};
 use super::tier::Tier;
 use super::{boot, commands};
 use crate::autorun::Category;
+use crate::config::model::Profile;
 use crate::engine::baseline::{Identity, Unit};
 use crate::engine::plan::HashOnly;
 use crate::git_state;
@@ -65,13 +67,24 @@ pub(super) fn judge(
     collection: &Collection,
     home: Option<&str>,
     context: &ReviewContext<'_>,
-    news: &std::collections::HashSet<String>,
+    news: &HashSet<String>,
 ) -> Report {
     // The sweep lists what is on the system to look at, and a low remark
     // of the AI on an item is one such thing in every profile: it stays a
     // finding here, listed, counted, remembered and told as one.
+    //
+    // The AI may mark a finding as the owner's own setting (see
+    // `Report::is_owner_setting`). The owner chose that this applies to
+    // the sweep alone, and that the strict profile keeps every such
+    // finding an alert.
+    let strict = context.settings.profile_for(context.class) == Profile::Strict;
     let scope = ReviewScope {
         remark_classes: Vec::new(),
+        setting_paths: if strict {
+            HashSet::new()
+        } else {
+            setting_paths(collection, home)
+        },
         ..review::scope(context.settings, context.class, &[context.class])
     };
     let mut report = Report::new("system sweep", scope);
@@ -91,6 +104,154 @@ pub(super) fn judge(
     review::review_collected(report, &context, &units)
 }
 
+/// The kinds of item whose AI findings may be the owner's own settings:
+/// shell start-up files and the entries AI coding agents start (an alias,
+/// a plugin's hook). Every other kind stays an alert whatever the reviewer
+/// says: autostart entries, user units, Hyprland's `exec` lines, cron jobs,
+/// Omarchy hooks and the rest are where persistence lives, and one claim
+/// must never turn such a finding into a clear sweep.
+///
+/// Programs in a directory of the home's `PATH` (`Category::LocalBin`) are
+/// left out. The owner chose this on 2026-10-30 after three review rounds
+/// each found a new way for a planted program there to pass: any program
+/// can start any other (`systemd-inhibit`, `xargs`, a variable), so whether
+/// a persistence entry starts one cannot be told, and a wrapper there stays
+/// an alert until `sweep allow` records it. A start-up file is run by every
+/// shell the owner opens, so what else starts it changes nothing; the Shell
+/// files no shell reads at start are refused (`NOT_SOURCED_BY_A_SHELL`).
+///
+/// An agent's hook runs on its own too, at every start or tool call, and
+/// every entry of one configuration file is sent under that file's path.
+/// The owner accepted that risk for the plugin hooks the settings came up
+/// in; the other checks of `Report::is_owner_setting` still apply.
+const SETTING_CATEGORIES: [Category; 2] = [Category::Shell, Category::Agent];
+
+/// Files of the kind `Category::Shell` that a shell the owner opens does
+/// not read when it starts or exits: uwsm sources these when the session
+/// starts, makepkg on every package build, and fish loads a function or
+/// completion file only when its command runs or is completed, so anything
+/// may start one, as with a program on `PATH`. They are never settings. A
+/// logout file (`.bash_logout`) is read only by the shell itself, so it is
+/// not one of them.
+const NOT_SOURCED_BY_A_SHELL: [&str; 5] = [
+    ".config/uwsm/",
+    ".makepkg.conf",
+    ".config/pacman/makepkg.conf",
+    ".config/fish/functions/",
+    ".config/fish/completions/",
+];
+
+/// The files, by the path the AI is sent them under, that may hold the
+/// owner's own settings: in the home, and of an item of a kind in
+/// `SETTING_CATEGORIES` that the catalogue found itself. A file reached by
+/// following what another runs or sources is left out: it takes the kind
+/// of whatever reached it first, so a payload anywhere in the home that a
+/// start-up file runs would count as a start-up file. So is a start-up
+/// file in `NOT_SOURCED_BY_A_SHELL`, and one that takes over a command
+/// Guardian watches (see `takes_over_watched`): a fake `sudo` is how a
+/// password is taken, and the reviewer's grade alone must not clear it. So
+/// is a file that an item of any other kind also stands for. So, last, is
+/// a file that leads to a binary only the reviewer's word flags (see
+/// `launchers_of_word_alone`).
+fn setting_paths(collection: &Collection, home: Option<&str>) -> HashSet<String> {
+    let launchers = launchers_of_word_alone(collection);
+    let mut allowed = HashSet::new();
+    let mut refused = HashSet::new();
+    for item in &collection.items {
+        let path = shown_path(checked_path(item), home);
+        let sourced_unasked = NOT_SOURCED_BY_A_SHELL.iter().any(|place| {
+            path.strip_prefix("~/")
+                .is_some_and(|rest| rest.starts_with(place))
+        });
+        if path.starts_with("~/")
+            && item.run_by.is_none()
+            && !sourced_unasked
+            && !takes_over_watched(item)
+            && !launchers.contains(item.path.as_str())
+            && SETTING_CATEGORIES.contains(&item.category)
+        {
+            allowed.insert(path);
+        } else {
+            refused.insert(path);
+        }
+    }
+    allowed.retain(|path| !refused.contains(path));
+    allowed
+}
+
+/// Whether `item`, a start-up file, has a line that begins by defining a
+/// command under a name Guardian watches on `PATH`
+/// (`super::path::is_watched`): `sudo() {`, `function sudo`, `alias git=`.
+/// The local rule `takes-over-shell` sees aliases of only four names. Other
+/// forms (`alias -- sudo=`, a guarded line) are left to the reviewer, which
+/// reads the whole file.
+fn takes_over_watched(item: &Item) -> bool {
+    let Body::Text(text) = &item.body else {
+        return false;
+    };
+    text.lines().any(|line| {
+        let line = line.trim_start();
+        let (keyword, name) = match ["function ", "alias "]
+            .iter()
+            .find_map(|keyword| Some((true, line.strip_prefix(keyword)?.trim_start())))
+        {
+            Some(found) => found,
+            None => (false, line),
+        };
+        let end = name
+            .find(|c: char| c.is_whitespace() || "(;{=".contains(c))
+            .unwrap_or(name.len());
+        let defines = keyword || name[end..].trim_start().starts_with("()");
+        defines && super::path::is_watched(&name[..end])
+    })
+}
+
+/// The paths of the items that lead to a binary for which
+/// `flagged_by_word_alone` holds: every one that runs it, what runs those,
+/// and so on to the items the catalogue found. They are item paths, as
+/// `Collection::runners` holds them (an agent entry's keeps its
+/// `#hooks/...` suffix), not the paths the AI is sent.
+fn launchers_of_word_alone(collection: &Collection) -> HashSet<&str> {
+    let mut launchers = HashSet::new();
+    let mut next: Vec<&str> = collection
+        .items
+        .iter()
+        .filter(|item| flagged_by_word_alone(item))
+        .map(|item| item.path.as_str())
+        .collect();
+    while let Some(path) = next.pop() {
+        for runner in collection.runners.get(path).into_iter().flatten() {
+            // A path already in `launchers` was walked from there, by this
+            // binary (a cycle) or another.
+            if launchers.insert(runner.as_str()) {
+                next.push(runner);
+            }
+        }
+    }
+    launchers
+}
+
+/// Whether `item` is a binary Guardian could not vouch for that no local
+/// rule raises an alert on: one an AUR or `pacman -U` package installed
+/// (`hashed` flags those no package installed, or a version manager did,
+/// when it sees what runs them, and a changed package file has its own
+/// rule). The reviewer's finding on what launches it is then the only
+/// alert, so no launcher up to the catalogued item may be shown as the
+/// owner's setting: the claim would leave the binary with none.
+///
+/// A version-managed binary that nothing Guardian follows runs is left
+/// out on purpose: a wrapper that calls `mise x claude` resolves it only
+/// when it runs, so the wrapper's claim leaves that binary with no alert.
+/// The owner accepted this on 2026-10-30 over flagging every binary a
+/// version manager put ahead of a system command: a wrapper that updates
+/// on every launch gives it a new hash each time, and the alert would come
+/// back after each `sweep allow`.
+fn flagged_by_word_alone(item: &Item) -> bool {
+    matches!(item.body, Body::Binary(_))
+        && item.tier == Tier::UserBuilt
+        && !is_version_managed(item)
+}
+
 /// Puts what the local checks say of `collection` into `report`, queues
 /// for the AI review the text that goes to it, and returns what Guardian
 /// established about each such item and each binary it lists by its hash
@@ -99,7 +260,7 @@ fn examine(
     report: &mut Report,
     collection: &Collection,
     home: Option<&str>,
-    news: &std::collections::HashSet<String>,
+    news: &HashSet<String>,
 ) -> Vec<String> {
     let mut facts = Vec::new();
     // What Guardian established about each binary listed by its hash, and
@@ -154,7 +315,7 @@ fn examine(
                 let file = shown_path(checked_path(item), home);
                 if reading == Some(Reading::Reviewed) {
                     review::analyze_text(report, &file, &text, false);
-                    facts.push(fact(item, &label, home));
+                    facts.push(fact(item, item.run_by.as_deref(), &label, home));
                 } else {
                     review::analyze_text_locally(report, &file, &text);
                 }
@@ -185,8 +346,9 @@ fn examine(
                 drop_rule(report, before.0, RuleId::PersistenceModification);
             }
             Body::Binary(format) => {
-                let fact = hashed(report, item, label, format, home);
-                binaries.push((item.run_by.is_none(), fact));
+                let runner = collection.runner_of(item);
+                let fact = hashed(report, item, runner, label, format, home);
+                binaries.push((runner.is_none(), fact));
             }
             Body::Undecodable => report.gaps.push(Gap::Undecodable(label)),
             Body::Oversized => report.gaps.push(Gap::OversizedText(label)),
@@ -216,7 +378,7 @@ fn examine(
 }
 
 /// Lists `item`, a binary of `format` shown as `label`, by its hash, flags
-/// it where no package installed it and something runs it, and returns
+/// it where no package installed it and `runner` runs it, and returns
 /// what Guardian established about it.
 ///
 /// The reviewer is told what Guardian knows of a program it was not sent,
@@ -228,6 +390,7 @@ fn examine(
 fn hashed(
     report: &mut Report,
     item: &Item,
+    runner: Option<&str>,
     label: String,
     format: &'static str,
     home: Option<&str>,
@@ -236,13 +399,13 @@ fn hashed(
     // that finds it is reviewed in full.
     report.unread.insert(label.clone(), item.sha256);
     let unpackaged = item.tier == Tier::Unknown || is_version_managed(item);
-    if unpackaged && let Some(by) = &item.run_by {
+    if unpackaged && let Some(by) = runner {
         let by = format!("run by {}", shown_path(by, home));
         report
             .findings
             .push(finding(&label, 1, RuleId::UnpackagedBinary, &by));
     }
-    let fact = hashed_fact(item, &label, format, home);
+    let fact = hashed_fact(item, runner, &label, format, home);
     report.hash_only.push(HashOnly {
         path: label,
         bytes: 0,
@@ -674,11 +837,11 @@ fn is_version_managed(item: &Item) -> bool {
             .any(|note| note.contains("version manager"))
 }
 
-/// What Guardian established about an item, for the AI. The paths are
-/// quoted, so a crafted name cannot pose as Guardian's words, and written
-/// as the files sent are (`~/` for the home), so the model can tell which
-/// sent file runs it.
-fn fact(item: &Item, label: &str, home: Option<&str>) -> String {
+/// What Guardian established about an item that `runner` runs, for the
+/// AI. The paths are quoted, so a crafted name cannot pose as Guardian's
+/// words, and written as the files sent are (`~/` for the home), so the
+/// model can tell which sent file runs it.
+fn fact(item: &Item, runner: Option<&str>, label: &str, home: Option<&str>) -> String {
     let what = match item.tier {
         Tier::Edited => {
             "a package's configuration file, edited after install (normal for configuration)"
@@ -706,7 +869,7 @@ fn fact(item: &Item, label: &str, home: Option<&str>) -> String {
         shown(label).as_ref(),
         item.category.when()
     );
-    if let Some(by) = &item.run_by {
+    if let Some(by) = runner {
         let _ = write!(
             text,
             " It is run by {:?}.",
@@ -737,11 +900,18 @@ fn fact(item: &Item, label: &str, home: Option<&str>) -> String {
 }
 
 /// What Guardian established about `item`, a binary of `format` listed as
-/// `label`, for the AI, which is sent its hash and never its content.
-fn hashed_fact(item: &Item, label: &str, format: &str, home: Option<&str>) -> String {
+/// `label` that `runner` runs, for the AI, which is sent its hash and
+/// never its content.
+fn hashed_fact(
+    item: &Item,
+    runner: Option<&str>,
+    label: &str,
+    format: &str,
+    home: Option<&str>,
+) -> String {
     format!(
         "{} Guardian hashed it ({format}) and did not send its content.",
-        fact(item, label, home)
+        fact(item, runner, label, home)
     )
 }
 

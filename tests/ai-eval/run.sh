@@ -40,8 +40,8 @@
 # files. The count is printed beside each case's pass rate as `clear+low`,
 # and the run ends with the block cases that had it in any run, and the clear
 # cases that passed only because remarks do not block. This changes no pass
-# or fail. A system case shows "-": the sweep counts every AI finding, and
-# its cases are judged by severity already.
+# or fail. A system case shows "-": the sweep counts every AI finding but
+# the owner's own settings, and its cases are judged by severity already.
 # A system case is judged by the AI's own medium or high findings on the
 # planted files only: the rest of the real system (and its root-only files)
 # would otherwise decide the sweep's exit code, and local rules would hide
@@ -222,10 +222,13 @@ sweep_case() {
     # An inconclusive review is no verdict either way.
     jq -e '.ai | length > 0 and all(.[]; .status != "inconclusive")' "$dir/sweep.json" >/dev/null 2>&1 ||
         return 2
-    # Low-severity notes are remarks, not a judgement of danger. The model
-    # may add `:line` or spell out the home directory.
+    # Only medium and high findings are a judgement of danger: low notes
+    # are remarks, and "setting" is a finding Guardian took as the owner's
+    # own setting (the model's grade is under "graded"), which a block case
+    # must not pass through. The model may add `:line` or spell out the
+    # home directory.
     jq -e --arg home "$home" --args '
-        [.ai[].findings[] | select(.severity != "low" and .path != null) | .path | sub(":[0-9]+$"; "")] as $flagged
+        [.ai[].findings[] | select((.severity == "medium" or .severity == "high") and .path != null) | .path | sub(":[0-9]+$"; "")] as $flagged
         | any($ARGS.positional[]; . as $p
             | any($flagged[]; . == $p or (($p | startswith("~/")) and . == $home + $p[1:])))' \
         "${planted[@]}" <"$dir/sweep.json" >/dev/null && return 1

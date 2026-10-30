@@ -53,7 +53,7 @@ use crate::engine::store::Store;
 use crate::error::Error;
 use crate::notify;
 use crate::report::FAILED;
-use crate::report::{AgentOutcome, Blocked, Decision, Gap, Hashes, Report};
+use crate::report::{Blocked, Decision, Gap, Hashes, Report};
 use crate::review::ReviewContext;
 use crate::time::now;
 use crate::tools::OpenCode;
@@ -580,16 +580,9 @@ fn remembered(
     // A finding on a file is part of what is remembered about it: one that
     // appears later on a file that did not change (the AI was unavailable
     // the day it arrived) is then news.
-    let mut flagged: std::collections::HashSet<&str> = report
-        .findings
-        .iter()
-        .map(|finding| finding.path.as_str())
-        .collect();
-    for run in &report.agent_runs {
-        if let AgentOutcome::Reviewed(review) = &run.outcome {
-            flagged.extend(review.findings.iter().map(|finding| finding.file.as_str()));
-        }
-    }
+    // The owner's settings are not findings here (see
+    // `Report::flagged_paths`).
+    let flagged = report.flagged_paths();
     collection
         .items
         .iter()
@@ -601,7 +594,7 @@ fn remembered(
                 && let Some(known) = previous.and_then(|previous| previous.get(&label))
             {
                 fingerprint.clone_from(known);
-            } else if flagged.contains(label.as_str()) && !fingerprint.ends_with(state::FLAGGED) {
+            } else if flagged.contains(&label) && !fingerprint.ends_with(state::FLAGGED) {
                 fingerprint.push_str(state::FLAGGED);
             }
             (label, fingerprint)
@@ -1370,6 +1363,166 @@ mod tests {
             &std::collections::HashSet::new(),
         );
         assert!(report.agent_runs.is_empty());
+    }
+
+    /// A finding the reviewer marks as the owner's own setting, on a file
+    /// in the home: outside strict the sweep is clear, exits 0, lists it
+    /// under the settings and does not remember the item as flagged; under
+    /// strict it is the alert it was.
+    #[test]
+    fn an_owners_setting_in_the_home_is_no_alert_of_the_sweep_but_under_strict() {
+        use crate::config::Settings;
+        use crate::config::file::PartialConfig;
+        use crate::config::model::{Profile, SourceClass};
+        use crate::report::{Blocked, Decision};
+        use crate::review::ReviewContext;
+        use crate::test_support::{TempDir, mock_opencode_owner_setting};
+        use crate::tools::OpenCode;
+
+        const HOME: Option<&str> = Some("home/u");
+        let bin = TempDir::new("sweep-settings-bin");
+        let state = TempDir::new("sweep-settings-state");
+        let root = state.path().join("state");
+        let opencode = OpenCode::At(mock_opencode_owner_setting(
+            bin.path(),
+            "clear",
+            ("low", "~/.bashrc", "Skips permission prompts"),
+        ));
+        let bashrc = item(
+            "home/u/.bashrc",
+            Category::Shell,
+            "alias cc='claude --dangerously-skip-permissions'\n",
+        );
+        let collection = Collection {
+            items: vec![bashrc.clone()],
+            ..Collection::default()
+        };
+        let label = |item: &Item| super::judge::label(item, HOME);
+        let sweep = |collection: &Collection, profile: Profile| {
+            let settings = Settings::from_parts(PartialConfig::default(), PartialConfig::default())
+                .with_profile(profile);
+            let context = ReviewContext {
+                settings: &settings,
+                class: SourceClass::System,
+                opencode: &opencode,
+                units: &[],
+                state_root: Some(&root),
+                context: &[],
+            };
+            let report = super::judge::judge(
+                collection,
+                HOME,
+                &context,
+                &std::collections::HashSet::new(),
+            );
+            let decision = report.decide(&|class| settings.policy(class));
+            let json = super::output::json(collection, &report, decision, HOME, &[]).to_string();
+            let summary = super::output::summary(collection, &report, decision, HOME, None);
+            (report, decision, json, summary)
+        };
+
+        let (report, decision, json, summary) = sweep(&collection, Profile::Standard);
+        assert_eq!(decision, Decision::Clear, "{:?}", report.notes);
+        assert_eq!(decision.exit_status(), 0);
+        assert_eq!(report.owner_settings().count(), 1);
+        assert_eq!(report.counts().total(), 0);
+        let current = super::remembered(&collection, &report, None, label);
+        assert!(!current["~/.bashrc"].ends_with(state::FLAGGED));
+        for expected in [
+            r#""decision":"clear""#,
+            r#""flagged":false"#,
+            r#""severity":"setting","graded":"low","title":"Skips permission prompts""#,
+        ] {
+            assert!(json.contains(expected), "{expected}\n{json}");
+        }
+        for expected in [
+            "NO ALERTS",
+            "Settings: 1 noted · not alerts",
+            "Your own settings",
+        ] {
+            assert!(summary.contains(expected), "{expected}\n{summary}");
+        }
+        assert!(!summary.contains("Needs a look"), "{summary}");
+
+        // Not approved: the next sweep, after another file changed, reviews
+        // `~/.bashrc` again and shows the setting again, where a review
+        // against an approved version would not send the unchanged file.
+        let changed = Collection {
+            items: vec![
+                bashrc,
+                item("home/u/.profile", Category::Shell, "export EDITOR=vi\n"),
+            ],
+            ..Collection::default()
+        };
+        let (again, _, _, _) = sweep(&changed, Profile::Standard);
+        assert_eq!(again.owner_settings().count(), 1, "{:?}", again.notes);
+        assert!(
+            !again.notes.iter().any(|note| note.contains("upgrade")),
+            "{:?}",
+            again.notes
+        );
+
+        let (report, decision, json, summary) = sweep(&collection, Profile::Strict);
+        assert_eq!(decision, Decision::Blocked(Blocked::Findings));
+        assert_eq!(decision.exit_status(), 1);
+        assert_eq!(report.owner_settings().count(), 0);
+        let current = super::remembered(&collection, &report, None, label);
+        assert!(current["~/.bashrc"].ends_with(state::FLAGGED));
+        assert!(
+            json.contains(r#""severity":"low","title":"Skips permission prompts""#),
+            "{json}"
+        );
+        assert!(summary.contains("Needs a look"), "{summary}");
+        assert!(!summary.contains("Your own settings"), "{summary}");
+    }
+
+    /// A user unit is where persistence lives: the same claim on one is an
+    /// alert in every profile.
+    #[test]
+    fn an_owners_setting_claimed_on_a_user_unit_is_an_alert() {
+        use crate::config::Settings;
+        use crate::config::file::PartialConfig;
+        use crate::config::model::{Profile, SourceClass};
+        use crate::report::{Blocked, Decision};
+        use crate::review::ReviewContext;
+        use crate::test_support::{TempDir, mock_opencode_owner_setting};
+        use crate::tools::OpenCode;
+
+        const HOME: Option<&str> = Some("home/u");
+        let unit_bin = TempDir::new("sweep-settings-unit-bin");
+        let unit = Collection {
+            items: vec![item(
+                "home/u/.config/systemd/user/sync.service",
+                Category::Systemd,
+                "[Service]\nExecStart=/usr/bin/true\n",
+            )],
+            ..Collection::default()
+        };
+        let settings = Settings::from_parts(PartialConfig::default(), PartialConfig::default())
+            .with_profile(Profile::Standard);
+        let opencode = OpenCode::At(mock_opencode_owner_setting(
+            unit_bin.path(),
+            "clear",
+            (
+                "medium",
+                "~/.config/systemd/user/sync.service",
+                "Starts on login",
+            ),
+        ));
+        let context = ReviewContext {
+            settings: &settings,
+            class: SourceClass::System,
+            opencode: &opencode,
+            units: &[],
+            state_root: None,
+            context: &[],
+        };
+        let report = super::judge::judge(&unit, HOME, &context, &std::collections::HashSet::new());
+        assert_eq!(report.owner_settings().count(), 0);
+        assert_eq!(
+            report.decide(&|class| settings.policy(class)),
+            Decision::Blocked(Blocked::Findings)
+        );
     }
 
     #[test]

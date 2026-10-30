@@ -253,9 +253,25 @@ pub(super) struct Collection {
     /// the root collector says are new, when it kept track itself (see
     /// `root::news`); `None` when it did not.
     pub(super) root_news: Option<Vec<String>>,
+    /// Every item path that leads to each followed path, not only the
+    /// first that `run_by` keeps: a second wrapper of the same program
+    /// leaves no `run_by` of its own. Root's items add only their `run_by`
+    /// (see `root::merge`).
+    pub(super) runners: HashMap<String, Vec<String>>,
 }
 
 impl Collection {
+    /// What runs `item`: its `run_by`, or else the first item that leads
+    /// to it. A program the catalogue lists itself (one on `PATH`) has no
+    /// `run_by`, but a key binding may still run it. A lead may only read
+    /// a file (configuration, a list of variables), but a binary is not
+    /// read that way, so for a binary a lead is a runner.
+    pub(super) fn runner_of<'a>(&'a self, item: &'a Item) -> Option<&'a str> {
+        item.run_by
+            .as_deref()
+            .or_else(|| self.runners.get(&item.path)?.first().map(String::as_str))
+    }
+
     /// What was not looked at, each as a sentence: `truncated`, and each
     /// directory in `unlisted`.
     pub(super) fn not_looked_at(&self) -> Vec<String> {
@@ -367,6 +383,7 @@ pub(super) fn collect(scope: &Scope<'_>) -> Collection {
     });
     path::mark(scope, &search, &mut collection.items);
     mark_reach(&mut collection.items, &walk);
+    collection.runners = walk.runners;
     for item in &mut collection.items {
         // The package's own directory, and the one for shared data, may
         // hold a drop-in a repository package ships for every unit;
@@ -434,6 +451,8 @@ struct Walk {
     /// any other way.
     environment: HashSet<String>,
     otherwise: HashSet<String>,
+    /// See `Collection::runners`.
+    runners: HashMap<String, Vec<String>>,
 }
 
 impl Walk {
@@ -447,6 +466,10 @@ impl Walk {
         root: Option<&str>,
         target: &String,
     ) {
+        self.runners
+            .entry(target.clone())
+            .or_default()
+            .push(item.path.clone());
         match root {
             Some(root) if followed.configuration.contains(target) => {
                 self.roots

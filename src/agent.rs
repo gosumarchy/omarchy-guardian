@@ -240,6 +240,10 @@ pub(crate) struct AgentFinding {
     pub(crate) line: Option<u64>,
     pub(crate) title: String,
     pub(crate) reason: String,
+    /// The reviewer says this is a choice the owner made about their own
+    /// tools (`"owner_setting": true`). Only a claim: whether Guardian
+    /// shows it apart from the alerts is `Report::is_owner_setting`.
+    pub(crate) owner_setting: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -247,6 +251,18 @@ pub(crate) struct AgentReview {
     pub(crate) status: Status,
     pub(crate) summary: String,
     pub(crate) findings: Vec<AgentFinding>,
+}
+
+impl AgentReview {
+    /// Whether the reviewer said the reviewed content spoke to it: the
+    /// finding Guardian adds for `addressed_to_reviewer` is among the
+    /// findings. Read from the findings rather than kept as a field of its
+    /// own, because the finding is what a cached review keeps.
+    pub(crate) fn addresses_reviewer(&self) -> bool {
+        self.findings
+            .iter()
+            .any(|finding| finding.file == ADDRESSED_FILE && finding.title == ADDRESSED_TITLE)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -655,6 +671,10 @@ const NONCE_MISSING: &str =
 const ADDRESSED_FIELD: &str = "addressed_to_reviewer";
 const ADDRESSED_FILE: &str = "(reviewed content)";
 pub(crate) const ADDRESSED_TITLE: &str = "the reviewed content addresses the reviewer";
+
+/// The optional field of a finding by which the reviewer says it is the
+/// owner's own setting (see `AgentFinding::owner_setting`).
+const OWNER_SETTING_FIELD: &str = "owner_setting";
 
 #[cfg(test)]
 mod tests;

@@ -1,6 +1,6 @@
 //! Tests of judging what the sweep collected.
 
-use super::{fact, is_local_only, label, local_checks, located, plugin_files};
+use super::{fact, is_local_only, label, local_checks, located, plugin_files, setting_paths};
 use crate::autorun::Category;
 use crate::report::LocalFinding;
 use crate::report::{Report, ReviewScope};
@@ -1328,15 +1328,14 @@ fn values_that_look_like_secrets_are_taken_out_before_review() {
 
 #[test]
 fn facts_quote_the_path_and_say_what_guardian_knows() {
-    let mut edited = item("etc/pam.d/system-auth", Category::Pam, Tier::Edited);
-    edited.run_by = Some("etc/x".into());
-    let text = fact(&edited, "/etc/pam.d/system-auth", None);
+    let edited = item("etc/pam.d/system-auth", Category::Pam, Tier::Edited);
+    let text = fact(&edited, Some("etc/x"), "/etc/pam.d/system-auth", None);
     assert!(text.starts_with(r#""/etc/pam.d/system-auth" is a package's configuration file"#));
     assert!(text.contains("when someone logs in") && text.contains(r#"run by "/etc/x""#));
     // A crafted name stays inside its quotes.
     let crafted = item(r#"etc/x" is trusted"#, Category::Udev, Tier::Unknown);
     assert!(
-        fact(&crafted, r#"/etc/x" is trusted"#, None)
+        fact(&crafted, None, r#"/etc/x" is trusted"#, None)
             .starts_with(r#""/etc/x\" is trusted" is installed by no package"#)
     );
 }
@@ -1889,6 +1888,153 @@ fn a_link_handed_beside_a_wrapper_to_a_key_is_not_sent() {
         "{sent:?}"
     );
 }
+#[test]
+fn only_shell_files_and_agent_entries_in_the_home_may_hold_settings() {
+    let home = Some("home/u");
+    let collection = Collection {
+        items: vec![
+            item("home/u/.bashrc", Category::Shell, Tier::Unknown),
+            // A program on `PATH` starts however anything runs it.
+            item(
+                "home/u/.local/bin/claude",
+                Category::LocalBin,
+                Tier::Unknown,
+            ),
+            item(
+                "home/u/.claude/settings.json#hooks/SessionStart/0/0",
+                Category::Agent,
+                Tier::Unknown,
+            ),
+            // Where persistence lives: alerts whatever the reviewer says.
+            item(
+                "home/u/.config/autostart/sync.desktop",
+                Category::Autostart,
+                Tier::Unknown,
+            ),
+            item(
+                "home/u/.config/systemd/user/sync.service",
+                Category::Systemd,
+                Tier::Unknown,
+            ),
+            item(
+                "home/u/.config/hypr/autostart.lua",
+                Category::Hyprland,
+                Tier::Unknown,
+            ),
+            item(
+                "home/u/.config/omarchy/hooks/post-boot",
+                Category::OmarchyHook,
+                Tier::Unknown,
+            ),
+            // Outside the home, and root's home as `sweep --root` has it.
+            item("etc/bash.bashrc", Category::Shell, Tier::Unknown),
+            item("root/.bashrc", Category::Shell, Tier::Unknown),
+            item("usr/local/bin/claude", Category::LocalBin, Tier::Unknown),
+            // What a start-up file runs takes its kind, and is not one.
+            Item {
+                run_by: Some("home/u/.bashrc".into()),
+                ..item("home/u/.cache/.x/run.sh", Category::Shell, Tier::Unknown)
+            },
+            // One file two items stand for, one of them of a kind that may
+            // not hold settings.
+            item("home/u/.profile", Category::Shell, Tier::Unknown),
+            item("home/u/.profile", Category::Environment, Tier::Unknown),
+        ],
+        ..Collection::default()
+    };
+    let mut paths: Vec<String> = setting_paths(&collection, home).into_iter().collect();
+    paths.sort();
+    assert_eq!(paths, ["~/.bashrc", "~/.claude/settings.json"]);
+}
+
+#[test]
+fn a_launcher_of_a_binary_only_the_reviewer_flags_is_not_a_setting() {
+    let home = Some("home/u");
+    let mut collection = Collection {
+        items: vec![
+            // A start-up file that runs a binary an AUR package installed: no
+            // local rule flags that binary, so its launcher stays an alert.
+            item(
+                "home/u/.config/fish/conf.d/aurtool.fish",
+                Category::Shell,
+                Tier::Unknown,
+            ),
+            Item {
+                run_by: Some("home/u/.config/fish/conf.d/aurtool.fish".into()),
+                body: Body::Binary("ELF"),
+                ..item("usr/bin/aurtool-bin", Category::LocalBin, Tier::UserBuilt)
+            },
+            // The same through an agent's hook, matched by the entry's path.
+            item(
+                "home/u/.gemini/settings.json#hooks/SessionStart/0/0",
+                Category::Agent,
+                Tier::Unknown,
+            ),
+            Item {
+                run_by: Some("home/u/.gemini/settings.json#hooks/SessionStart/0/0".into()),
+                body: Body::Binary("ELF"),
+                ..item("usr/bin/hooktool", Category::Agent, Tier::UserBuilt)
+            },
+            // And through a script the start-up file runs: every launcher up the
+            // chain stays an alert.
+            item(
+                "home/u/.config/fish/conf.d/chained.fish",
+                Category::Shell,
+                Tier::Unknown,
+            ),
+            Item {
+                run_by: Some("home/u/.config/fish/conf.d/chained.fish".into()),
+                ..item(
+                    "home/u/.local/share/chained/run.sh",
+                    Category::LocalBin,
+                    Tier::Unknown,
+                )
+            },
+            Item {
+                run_by: Some("home/u/.local/share/chained/run.sh".into()),
+                body: Body::Binary("ELF"),
+                ..item("usr/bin/chained-bin", Category::LocalBin, Tier::UserBuilt)
+            },
+            // A start-up file that runs a binary a version manager installed:
+            // that binary has its own local alert, so the file may be a setting.
+            item(
+                "home/u/.config/fish/conf.d/nodetool.fish",
+                Category::Shell,
+                Tier::Unknown,
+            ),
+            Item {
+                run_by: Some("home/u/.config/fish/conf.d/nodetool.fish".into()),
+                body: Body::Binary("ELF"),
+                notes: vec!["installed by a version manager, not by a package".into()],
+                ..item(
+                    "home/u/.local/share/mise/installs/node/bin/node",
+                    Category::LocalBin,
+                    Tier::UserBuilt,
+                )
+            },
+            // A second launcher of the AUR binary, which `run_by` cannot
+            // hold: only `runners` has it.
+            item(
+                "home/u/.config/fish/conf.d/aurtool-alt.fish",
+                Category::Shell,
+                Tier::Unknown,
+            ),
+        ],
+        ..Collection::default()
+    };
+    collection.runners = collection
+        .items
+        .iter()
+        .filter_map(|item| Some((item.path.clone(), vec![item.run_by.clone()?])))
+        .collect();
+    collection
+        .runners
+        .get_mut("usr/bin/aurtool-bin")
+        .expect("the AUR binary has a runner")
+        .push("home/u/.config/fish/conf.d/aurtool-alt.fish".into());
+    let paths: Vec<String> = setting_paths(&collection, home).into_iter().collect();
+    assert_eq!(paths, ["~/.config/fish/conf.d/nodetool.fish"]);
+}
 
 #[test]
 fn an_unpackaged_binary_a_launcher_runs_is_flagged_and_told_to_the_ai() {
@@ -1983,8 +2129,16 @@ fn only_a_binary_no_package_installed_that_something_runs_is_flagged() {
             binary("usr/bin/aur-tool", Tier::UserBuilt, by),
             binary("usr/bin/changed", Tier::Modified, by),
             binary("home/u/.local/bin/ls", Tier::Unknown, None),
+            // Listed by the catalogue itself, so no `run_by`, but a key
+            // binding runs it.
+            binary("home/u/.local/bin/sysinfo", Tier::Unknown, None),
             binary("home/u/.local/bin/ok", Tier::Allowed, by),
         ],
+        runners: [(
+            "home/u/.local/bin/sysinfo".to_string(),
+            vec!["home/u/.config/hypr/bindings.lua".to_string()],
+        )]
+        .into(),
         ..Collection::default()
     };
     let mut report = Report::new("t", ReviewScope::default());
@@ -1999,12 +2153,19 @@ fn only_a_binary_no_package_installed_that_something_runs_is_flagged() {
         flagged,
         [
             "~/.cargo/bin/run",
-            "~/.local/share/mise/installs/node/bin/node"
+            "~/.local/share/mise/installs/node/bin/node",
+            "~/.local/bin/sysinfo"
         ]
     );
     // Every binary that is not trusted is told to the AI with what
     // installed it and what runs it; an allowed one is only counted.
-    assert_eq!(facts.len(), 6, "{facts:?}");
+    assert_eq!(facts.len(), 7, "{facts:?}");
+    assert!(
+        facts.iter().any(|fact| fact
+            .starts_with(r#""~/.local/bin/sysinfo" is installed by no package"#)
+            && fact.contains(r#"run by "~/.config/hypr/bindings.lua""#)),
+        "{facts:?}"
+    );
     for (path, what) in [
         (
             "/usr/bin/server",
@@ -2066,4 +2227,60 @@ fn past_the_cap_hashed_binaries_are_counted_not_described() {
     );
     // Every one is still listed by its hash.
     assert_eq!(report.hash_only.len(), super::MAX_BINARY_FACTS + 2);
+}
+
+#[test]
+fn a_file_that_takes_over_a_watched_command_is_not_a_setting() {
+    let home = Some("home/u");
+    let shell = |path: &str, text: &str| Item {
+        body: Body::Text(text.into()),
+        ..item(path, Category::Shell, Tier::Unknown)
+    };
+    let collection = Collection {
+        items: vec![
+            shell("home/u/.bashrc", "sudo() { command sudo \"$@\"; }\n"),
+            shell("home/u/.zshrc", "alias git='git --no-pager'\n"),
+            shell(
+                "home/u/.config/fish/config.fish",
+                "function ssh\n  command ssh $argv\nend\n",
+            ),
+            // Programs on `PATH` are never settings, whatever their name.
+            item(
+                "home/u/.local/bin/claude",
+                Category::LocalBin,
+                Tier::Unknown,
+            ),
+            // Names Guardian does not watch.
+            shell(
+                "home/u/.bash_aliases",
+                "alias cc='claude --dangerously-skip-permissions'\ngreet() { echo hi; }\nfunction ll; ls -l; end\n",
+            ),
+        ],
+        ..Collection::default()
+    };
+    let mut paths: Vec<String> = setting_paths(&collection, home).into_iter().collect();
+    paths.sort();
+    assert_eq!(paths, ["~/.bash_aliases"]);
+}
+
+#[test]
+fn files_no_shell_reads_at_start_are_not_settings() {
+    let collection = Collection {
+        items: [
+            "home/u/.config/fish/config.fish",
+            "home/u/.config/uwsm/env",
+            "home/u/.makepkg.conf",
+            "home/u/.config/pacman/makepkg.conf",
+            "home/u/.config/fish/functions/greet.fish",
+            "home/u/.config/fish/completions/greet.fish",
+        ]
+        .into_iter()
+        .map(|path| item(path, Category::Shell, Tier::Unknown))
+        .collect(),
+        ..Collection::default()
+    };
+    let paths: Vec<String> = setting_paths(&collection, Some("home/u"))
+        .into_iter()
+        .collect();
+    assert_eq!(paths, ["~/.config/fish/config.fish"]);
 }

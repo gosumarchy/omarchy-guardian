@@ -38,6 +38,7 @@ described.
   - [What is kept from the AI](#what-is-kept-from-the-ai)
   - [What is sent](#what-is-sent)
   - [What is taken out of a file that is sent](#what-is-taken-out-of-a-file-that-is-sent)
+  - [Your own settings](#your-own-settings)
   - [After an upgrade](#after-an-upgrade)
 - [Root checks](#root-checks)
   - [What root reads and hands back](#what-root-reads-and-hands-back)
@@ -1758,6 +1759,81 @@ characters, with a blank or punctuation in it, in YAML or JSON `key: value`
 form, handed over as a command-line argument, or a key block (PEM) in a file
 whose path gives no hint.
 
+### Your own settings
+
+Some files in your home hold choices you made about your own tools: an alias
+that starts Claude Code with its permission prompts skipped, a wrapper in
+`~/.local/bin` that turns off mise's wait for a release to age and installs
+the latest one (which stays an alert, see below), a plugin's start-up hook that puts its own shims directory
+first on `PATH`. The reviewer is asked to mark a finding about such a choice
+with `"owner_setting": true`, and only when it changes how your own programs
+behave when you start them, fetches no script or binary from an address to
+run (installing the wrapped tool by name through mise, npm or pacman is
+allowed), sends nothing off the machine, reads no credentials or keys,
+changes no privileges, starts nothing on its own, and hides nothing. Text in
+the file that calls itself approved or asks for the mark is no evidence, and
+is reported as speaking to the reviewer.
+
+The mark is a claim. Guardian shows the finding as your setting only when all
+of this holds:
+
+- the reply wrote the mark as JSON `true` (not `"true"` or `1`);
+- the finding is graded `low`;
+- no `medium` or `high` finding, from any part of the review, names the same
+  file;
+- every file it names is in your home (shown as `~/…`), at least one of them
+  was sent in that AI request, and each is a shell start-up file or an entry
+  an AI coding agent starts (a Claude Code hook, a plugin's hook), as the
+  sweep finds it itself: a script one of these runs or sources is not one,
+  nor is a start-up file that is a link into a dotfiles directory (the sweep
+  reaches its target by following the link), nor one with a line that
+  begins by defining a command under a name Guardian watches on `PATH`
+  (`sudo() {`, `function ssh`, `alias git=`; also `omarchy-…`), where a fake
+  one is how a password is taken. The start-up files uwsm sources
+  (`~/.config/uwsm/`) and makepkg's (`~/.makepkg.conf`,
+  `~/.config/pacman/makepkg.conf`) are read without a shell being opened, and
+  fish loads a file in `~/.config/fish/functions/` or
+  `~/.config/fish/completions/` whenever its command runs or is completed,
+  so these stay alerts. A program in a directory of your `PATH` (`~/.local/bin` and
+  the like) keeps it an alert too: anything may start such a program, at
+  login or from a link, in ways the sweep cannot always see, so a wrapper
+  you wrote there is cleared with `sweep allow` instead. A file under
+  `/etc`, `/usr` or anywhere else, root's home as `sweep --root` shows it
+  (`/root/…`), and every other kind of file in your home keeps it an alert:
+  autostart entries, user units, Hyprland's `exec` lines, cron jobs, Omarchy
+  hooks and the rest are where persistence lives, and one claim must never
+  turn such a finding into a clear sweep. An agent's hook runs on its own
+  too; that risk was accepted for the plugin hooks settings came up in;
+- the file does not lead to a program an AUR or `pacman -U` package
+  installed, directly, through a script, or as a second launcher of it: no
+  local rule flags such a program, so the mark would leave it with no alert;
+- the review's verdict is `clear`, or `suspicious` with at least one finding
+  that is not marked (settings alone never make a review suspicious, so a
+  suspicious review with only marked findings keeps them as alerts); an
+  `inconclusive` review's marks are not believed; and the review did not
+  report text that speaks to the reviewer. The findings that made a review
+  suspicious stay alerts;
+- no local rule matched in that file: the reviewer is asked to confirm or
+  dismiss each local match, so a mark beside one may be about it, and the
+  local rules' own findings stay alerts whatever the AI says;
+- the profile is not `strict`. Under `strict` every such finding is an
+  alert, as before.
+
+Anything else is an alert at the severity the reviewer gave. A setting is
+not flagged, not counted among the alerts and not remembered as a finding on
+its item, so it raises no daily notification; a sweep that found only
+settings is `CLEAR` and exits 0. The summary lists them under "Your own
+settings" below "Needs a look" with a line `Settings: N noted · not alerts`
+in the box; the report has a table "Your own settings (not alerts)" with the
+reviewer's grade dimmed, and so does the page. `--json` writes one with
+`"severity": "setting"` and the reviewer's grade as `"graded"`, and the audit
+trail records how many there were (`settings=N`). A sweep with settings is not
+recorded as an approved version, so each file is reviewed again (an
+unchanged one from the cache) and its setting shown again.
+
+Only the sweep asks for the mark; the install gates ask nothing new and treat
+every AI finding as before.
+
 ### After an upgrade
 
 These show once after an upgrade from Guardian 0.8.1 or earlier:
@@ -1886,7 +1962,8 @@ never read.
   already looked at. A finding that appears on a file that did not change
   counts as a change; one that goes away does not. (Every AI finding on an
   item is one here, in every profile: the low remarks that a gate under
-  `standard` only shows are findings of the sweep.) The first scheduled sweep
+  `standard` only shows are findings of the sweep. Only
+  [your own settings](#your-own-settings) are not.) The first scheduled sweep
   has nothing to compare with: it notifies only when it found something with
   an alert or could not finish;
 - a system timer (`omarchy-guardian-sweep-collect.timer`) for the root checks,

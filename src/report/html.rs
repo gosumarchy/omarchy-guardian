@@ -8,9 +8,9 @@
 use std::fmt::Write as _;
 use std::sync::{Mutex, PoisonError};
 
-use super::terminal::remarks_note;
+use super::terminal::{SETTINGS_NOTE, remarks_note};
 use super::{AgentOutcome, Blocked, Decision, Report, Severity, recommendation};
-use crate::agent::Status;
+use crate::agent::{AgentFinding, Status};
 use crate::notify::Ran;
 use crate::paths::{self, Accept};
 use crate::scan::FileKind;
@@ -273,18 +273,11 @@ fn ai_reviews(html: &mut String, report: &Report) {
 fn findings(html: &mut String, report: &Report, decision: Decision) {
     let ai_cards = |html: &mut String, remarks: bool| {
         for finding in report.agent_findings(remarks) {
-            let location = finding.line.map_or_else(
-                || finding.file.clone(),
-                |line| format!("{}:{line}", finding.file),
-            );
-            finding_card(
+            ai_card(
                 html,
-                finding.severity,
+                graded(finding.severity),
                 if remarks { "AI remark" } else { "AI" },
-                &finding.title,
-                &location,
-                &finding.reason,
-                None,
+                finding,
             );
         }
     };
@@ -294,7 +287,7 @@ fn findings(html: &mut String, report: &Report, decision: Decision) {
         for finding in &report.findings {
             finding_card(
                 html,
-                finding.severity,
+                graded(finding.severity),
                 "Local rule",
                 finding.rule.name(),
                 &format!("{}:{}", finding.path, finding.line),
@@ -312,26 +305,64 @@ fn findings(html: &mut String, report: &Report, decision: Decision) {
         );
         ai_cards(html, true);
     }
+    // The owner's own settings, apart again and with the reviewer's grade
+    // dimmed: none of them is an alert.
+    if report.owner_settings().next().is_some() {
+        let _ = write!(
+            html,
+            r#"<h3>Your own settings</h3><p class="dim">{}</p>"#,
+            esc(SETTINGS_NOTE)
+        );
+        for finding in report.owner_settings() {
+            ai_card(
+                html,
+                (finding.severity.label(), "dim"),
+                "AI · your setting",
+                finding,
+            );
+        }
+    }
+}
+
+/// A severity's word and its tone on the page.
+const fn graded(severity: Severity) -> (&'static str, &'static str) {
+    let tone = match severity {
+        Severity::High => "red",
+        Severity::Medium => "amber",
+        Severity::Low => "cyan",
+    };
+    (severity.label(), tone)
+}
+
+fn ai_card(html: &mut String, grade: (&str, &str), source: &str, finding: &AgentFinding) {
+    let location = finding.line.map_or_else(
+        || finding.file.clone(),
+        |line| format!("{}:{line}", finding.file),
+    );
+    finding_card(
+        html,
+        grade,
+        source,
+        &finding.title,
+        &location,
+        &finding.reason,
+        None,
+    );
 }
 
 fn finding_card(
     html: &mut String,
-    severity: Severity,
+    (label, tone): (&str, &str),
     source: &str,
     title: &str,
     location: &str,
     reason: &str,
     excerpt: Option<&String>,
 ) {
-    let tone = match severity {
-        Severity::High => "red",
-        Severity::Medium => "amber",
-        Severity::Low => "cyan",
-    };
     let _ = write!(
         html,
         r#"<div class="item"><div class="row"><span class="strong">{title}</span><span class="word {tone}">{sev}</span></div><div class="meta">{source} · {location}</div><p>{reason}</p>"#,
-        sev = severity.label(),
+        sev = label,
         source = esc(&source.to_uppercase()),
         location = esc(location),
         title = esc(title),

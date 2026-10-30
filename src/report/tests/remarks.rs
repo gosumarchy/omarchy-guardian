@@ -25,6 +25,7 @@ fn run_naming(status: Status, files: &[&str], named: &str, severities: &[Severit
                 line: None,
                 title: format!("noticed {index}"),
                 reason: "upstream code quality".into(),
+                owner_setting: false,
             })
             .collect();
     }
@@ -526,6 +527,7 @@ fn three_clear_chunks_with_two_remarks(profile: Profile) -> Report {
                 line: Some(line),
                 title: title.into(),
                 reason: reason.into(),
+                owner_setting: false,
             });
         }
     }

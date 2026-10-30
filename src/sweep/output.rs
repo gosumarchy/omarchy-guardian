@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use super::collect::{Body, Collection, Item, Origin};
 use super::judge::label;
 use super::tier::Tier;
-use crate::agent::Status;
+use crate::agent::{AgentFinding, Status};
 use crate::json::Json;
 use crate::layout::{self, Painter, Span, Table};
 use crate::report::html::{self, esc};
@@ -40,21 +40,6 @@ const fn tier_meaning(tier: Tier) -> &'static str {
         Tier::Allowed => "you allowed it as it is",
         Tier::Unknown => "no package installed it",
     }
-}
-
-/// The paths the local rules or the AI flagged.
-fn flagged(report: &Report) -> HashSet<String> {
-    let mut paths: HashSet<String> = report
-        .findings
-        .iter()
-        .map(|finding| finding.path.clone())
-        .collect();
-    for run in &report.agent_runs {
-        if let AgentOutcome::Reviewed(review) = &run.outcome {
-            paths.extend(review.findings.iter().map(|finding| finding.file.clone()));
-        }
-    }
-    paths
 }
 
 /// How many items the summary lists by name; the rest are in the full
@@ -158,8 +143,18 @@ fn not_reviewed(report: &Report) -> Vec<String> {
     lines
 }
 
-/// The list below the verdict box: what needs a look, then why the review
-/// is incomplete, each cut short with a count of the rest.
+/// A line that says how many of `listed` were not shown, after the first
+/// `shown`; nothing when every one was.
+fn more(text: &mut String, listed: usize, shown: usize, painter: Painter) {
+    if listed > shown {
+        let rest = listed - shown;
+        let _ = writeln!(text, "  {}", painter.paint(&format!("… {rest} more"), "2"));
+    }
+}
+
+/// The list below the verdict box: what needs a look, the owner's own
+/// settings, then why the review is incomplete, each cut short with a
+/// count of the rest.
 fn attention(report: &Report, painter: Painter) -> String {
     let mut text = String::new();
     let concerns = concerns(report);
@@ -183,10 +178,21 @@ fn attention(report: &Report, painter: Painter) -> String {
                 painter.paint(&why, "2")
             );
         }
-        if concerns.len() > SHOWN_CONCERNS {
-            let rest = concerns.len() - SHOWN_CONCERNS;
-            let _ = writeln!(text, "  {}", painter.paint(&format!("… {rest} more"), "2"));
+        more(&mut text, concerns.len(), SHOWN_CONCERNS, painter);
+    }
+    let settings: Vec<_> = report.owner_settings().collect();
+    if !settings.is_empty() {
+        let _ = writeln!(text, "\n{}", painter.paint("Your own settings", "1"));
+        for finding in settings.iter().take(SHOWN_CONCERNS) {
+            let _ = writeln!(
+                text,
+                "  {}  {}  {}",
+                painter.paint(&format!("{:<6}", finding.severity.label()), "2"),
+                shown(&finding.file),
+                painter.paint(&shown(&finding.title), "2")
+            );
         }
+        more(&mut text, settings.len(), SHOWN_CONCERNS, painter);
     }
     let gaps = not_reviewed(report);
     if !gaps.is_empty() {
@@ -198,10 +204,7 @@ fn attention(report: &Report, painter: Painter) -> String {
                 painter.paint(&format!("! {}", shown(gap)), "33")
             );
         }
-        if gaps.len() > SHOWN_GAPS {
-            let rest = gaps.len() - SHOWN_GAPS;
-            let _ = writeln!(text, "  {}", painter.paint(&format!("… {rest} more"), "2"));
-        }
+        more(&mut text, gaps.len(), SHOWN_GAPS, painter);
     }
     text
 }
@@ -252,6 +255,13 @@ fn verdict_lines(report: &Report, decision: Decision) -> (Vec<Span>, &'static st
             "33",
         ));
     }
+    let settings = report.owner_settings().count();
+    if settings > 0 {
+        lines.push(Span::new(
+            format!("Settings: {settings} noted · not alerts"),
+            "2",
+        ));
+    }
     let unnamed = report.agent_runs.iter().any(|run| {
         matches!(&run.outcome, AgentOutcome::Reviewed(review)
             if review.status == Status::Suspicious && review.findings.is_empty())
@@ -299,7 +309,7 @@ pub(super) fn summary(
 ) -> String {
     let painter = Painter::for_stdout();
     let width = layout::width();
-    let flagged_paths = flagged(report);
+    let flagged_paths = report.flagged_paths();
     let flagged = collection
         .items
         .iter()
@@ -434,7 +444,7 @@ pub(super) fn print(collection: &Collection, report: &Report, home: Option<&str>
         .iter()
         .filter(|item| all || !item.is_trusted())
         .collect();
-    let flagged = flagged(report);
+    let flagged = report.flagged_paths();
     let legend = tier_legend(&shown_items);
     if !legend.is_empty() {
         outln!();
@@ -545,7 +555,7 @@ pub(super) fn json(
     home: Option<&str>,
     notes: &[String],
 ) -> Json {
-    let flagged = flagged(report);
+    let flagged = report.flagged_paths();
     let items = collection.items.iter().map(|item| {
         let label = label(item, home);
         let mut members = vec![
@@ -639,6 +649,23 @@ fn findings_json(report: &Report) -> Json {
     Json::Array(findings.collect())
 }
 
+/// One AI finding. An owner's setting Guardian honoured (see
+/// `Report::is_owner_setting`) has the severity `setting` and the model's
+/// grade as `graded`; a claim it did not honour shows as any finding.
+fn ai_finding_json(report: &Report, run: &AgentRun, finding: &AgentFinding) -> Json {
+    let graded = Json::from(finding.severity.label().to_ascii_lowercase());
+    let mut members = vec![("path", Json::from(finding.file.as_str()))];
+    if report.is_owner_setting(run, finding) {
+        members.push(("severity", Json::from("setting")));
+        members.push(("graded", graded));
+    } else {
+        members.push(("severity", graded));
+    }
+    members.push(("title", Json::from(finding.title.as_str())));
+    members.push(("reason", Json::from(finding.reason.as_str())));
+    Json::object(members)
+}
+
 /// The AI reviews.
 fn reviews_json(report: &Report) -> Json {
     let reviews = report
@@ -661,17 +688,7 @@ fn reviews_json(report: &Report) -> Json {
                         review
                             .findings
                             .iter()
-                            .map(|finding| {
-                                Json::object([
-                                    ("path", Json::from(finding.file.as_str())),
-                                    (
-                                        "severity",
-                                        Json::from(finding.severity.label().to_ascii_lowercase()),
-                                    ),
-                                    ("title", Json::from(finding.title.as_str())),
-                                    ("reason", Json::from(finding.reason.as_str())),
-                                ])
-                            })
+                            .map(|finding| ai_finding_json(report, run, finding))
                             .collect(),
                     ),
                 ),
@@ -718,6 +735,7 @@ mod tests {
             line: None,
             title: title.into(),
             reason: String::new(),
+            owner_setting: false,
         }
     }
 

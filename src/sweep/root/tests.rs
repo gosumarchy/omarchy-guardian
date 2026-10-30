@@ -642,3 +642,31 @@ fn missing_or_stale_results_are_not_used() {
         assert!(stale.is_err());
     }
 }
+
+#[test]
+fn what_runs_each_of_roots_items_is_kept_as_its_runner() {
+    let tool = Item {
+        run_by: Some("home/u/.bashrc".into()),
+        ..item(
+            "home/u/bin/tool",
+            Origin::Root,
+            Tier::Unknown,
+            Body::Text("true\n".into()),
+        )
+    };
+    let part = super::RootPart {
+        items: vec![tool],
+        ..super::RootPart::default()
+    };
+    // What the user's own walk found stays beside it.
+    let mut collection = Collection::default();
+    collection.runners.insert(
+        "home/u/bin/tool".into(),
+        vec!["etc/systemd/system/a.service".into()],
+    );
+    merge(&mut collection, part);
+    assert_eq!(
+        collection.runners["home/u/bin/tool"],
+        ["etc/systemd/system/a.service", "home/u/.bashrc"]
+    );
+}

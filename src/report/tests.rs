@@ -45,6 +45,7 @@ fn a_permitted_high_risk_report_is_amber_on_the_terminal_and_the_page() {
             line: None,
             title: "runs a download".into(),
             reason: "mock".into(),
+            owner_setting: false,
         });
     }
     report.agent_runs.push(run);
@@ -228,6 +229,7 @@ fn the_summary_keeps_why_the_review_is_incomplete_whatever_else_there_is() {
                     line: None,
                     title: "runs a download".into(),
                     reason: "mock".into(),
+                    owner_setting: false,
                 })
                 .collect();
         }
@@ -388,6 +390,7 @@ fn findings_are_attributed_to_their_files_class() {
             line: None,
             title: "t".into(),
             reason: "r".into(),
+            owner_setting: false,
         });
     }
     mixed.agent_runs.push(run);
@@ -430,6 +433,7 @@ fn a_finding_naming_another_chunks_file_applies_that_files_class_too() {
             line: None,
             title: "t".into(),
             reason: "r".into(),
+            owner_setting: false,
         });
     }
     mixed.agent_runs.push(run);
@@ -505,3 +509,4 @@ fn colors_can_be_disabled() {
 }
 
 mod remarks;
+mod settings;

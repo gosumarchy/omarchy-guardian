@@ -595,17 +595,17 @@ pub(super) fn shadowing_programs(scope: &Scope<'_>, search: &Search) -> (Vec<Str
         paths.extend(
             listed
                 .into_iter()
-                .filter(|name| {
-                    is_watched(name) || name.starts_with("omarchy-") || shadows(scope, name)
-                })
+                .filter(|name| is_watched(name) || shadows(scope, name))
                 .map(|name| format!("{directory}/{name}")),
         );
     }
     (paths, unchecked)
 }
 
-fn is_watched(name: &str) -> bool {
-    ALWAYS_WATCHED.contains(&name)
+/// Whether a program called `name` ahead of `/usr/bin` is looked at
+/// whatever is there: one of `ALWAYS_WATCHED`, or Omarchy's own.
+pub(super) fn is_watched(name: &str) -> bool {
+    ALWAYS_WATCHED.contains(&name) || name.starts_with("omarchy-")
 }
 
 /// Whether `path` is where a version manager keeps what it installed.
