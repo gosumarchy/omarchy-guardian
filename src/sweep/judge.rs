@@ -127,10 +127,12 @@ pub(super) fn judge(
 const SETTING_CATEGORIES: [Category; 2] = [Category::Shell, Category::Agent];
 
 /// Files of the kind `Category::Shell` that a shell the owner opens does
-/// not read at start: uwsm sources these when the session starts, makepkg
-/// on every package build, and fish loads a function or completion file
-/// only when its command runs or is completed, so anything may start one,
-/// as with a program on `PATH`. They are never settings.
+/// not read when it starts or exits: uwsm sources these when the session
+/// starts, makepkg on every package build, and fish loads a function or
+/// completion file only when its command runs or is completed, so anything
+/// may start one, as with a program on `PATH`. They are never settings. A
+/// logout file (`.bash_logout`) is read only by the shell itself, so it is
+/// not one of them.
 const NOT_SOURCED_BY_A_SHELL: [&str; 5] = [
     ".config/uwsm/",
     ".makepkg.conf",
