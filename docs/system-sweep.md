@@ -1786,13 +1786,14 @@ of this holds:
   an AI coding agent starts (a Claude Code hook, a plugin's hook), as the
   sweep finds it itself: a script one of these runs or sources is not one,
   nor is a start-up file that is a link into a dotfiles directory (the sweep
-  reaches its target by following the link), nor one that defines a
-  command under a name Guardian watches on `PATH` (`sudo`, `ssh`, `git`,
-  `omarchy-…`) as a function, a fish function file or an alias, where a fake
+  reaches its target by following the link), nor one with a line that
+  begins by defining a command under a name Guardian watches on `PATH`
+  (`sudo() {`, `function ssh`, `alias git=`; also `omarchy-…`), where a fake
   one is how a password is taken. The start-up files uwsm sources
   (`~/.config/uwsm/`) and makepkg's (`~/.makepkg.conf`,
   `~/.config/pacman/makepkg.conf`) are read without a shell being opened, and
-  stay alerts. A program in a directory of your `PATH` (`~/.local/bin` and
+  fish loads a file in `~/.config/fish/functions/` whenever its command runs,
+  so these stay alerts. A program in a directory of your `PATH` (`~/.local/bin` and
   the like) keeps it an alert too: anything may start such a program, at
   login or from a link, in ways the sweep cannot always see, so a wrapper
   you wrote there is cleared with `sweep allow` instead. A file under

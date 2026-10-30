@@ -125,14 +125,16 @@ pub(super) fn judge(
 /// in; the other checks of `Report::is_owner_setting` still apply.
 const SETTING_CATEGORIES: [Category; 2] = [Category::Shell, Category::Agent];
 
-/// Start-up files of the kind `Category::Shell` that no shell the owner
-/// opens reads: uwsm sources these when the session starts, and makepkg on
-/// every package build. Like the other kinds that start on their own, they
-/// are never settings.
-const NOT_SOURCED_BY_A_SHELL: [&str; 3] = [
+/// Files of the kind `Category::Shell` that a shell the owner opens does
+/// not read at start: uwsm sources these when the session starts, makepkg
+/// on every package build, and fish loads a function file only when a
+/// command of its name runs, so anything may start one, as with a program
+/// on `PATH`. They are never settings.
+const NOT_SOURCED_BY_A_SHELL: [&str; 4] = [
     ".config/uwsm/",
     ".makepkg.conf",
     ".config/pacman/makepkg.conf",
+    ".config/fish/functions/",
 ];
 
 /// The files, by the path the AI is sent them under, that may hold the
@@ -160,7 +162,7 @@ fn setting_paths(collection: &Collection, home: Option<&str>) -> HashSet<String>
         if path.starts_with("~/")
             && item.run_by.is_none()
             && !sourced_unasked
-            && !takes_over_watched(item, &path)
+            && !takes_over_watched(item)
             && !launchers.contains(item.path.as_str())
             && SETTING_CATEGORIES.contains(&item.category)
         {
@@ -173,18 +175,13 @@ fn setting_paths(collection: &Collection, home: Option<&str>) -> HashSet<String>
     allowed
 }
 
-/// Whether `item`, a start-up file shown as `path`, defines a command
-/// under a name Guardian watches on `PATH` (`super::path::is_watched`): a
-/// fish function file named for it, or a function or alias of that name
-/// (`sudo() {`, `function sudo`, `alias git=`). The local rule
-/// `takes-over-shell` sees aliases of only four names.
-fn takes_over_watched(item: &Item, path: &str) -> bool {
-    let file = path
-        .strip_prefix("~/.config/fish/functions/")
-        .and_then(|name| name.strip_suffix(".fish"));
-    if file.is_some_and(super::path::is_watched) {
-        return true;
-    }
+/// Whether `item`, a start-up file, has a line that begins by defining a
+/// command under a name Guardian watches on `PATH`
+/// (`super::path::is_watched`): `sudo() {`, `function sudo`, `alias git=`.
+/// The local rule `takes-over-shell` sees aliases of only four names. Other
+/// forms (`alias -- sudo=`, a guarded line) are left to the reviewer, which
+/// reads the whole file.
+fn takes_over_watched(item: &Item) -> bool {
     let Body::Text(text) = &item.body else {
         return false;
     };

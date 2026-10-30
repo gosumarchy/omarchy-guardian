@@ -2244,7 +2244,6 @@ fn a_file_that_takes_over_a_watched_command_is_not_a_setting() {
                 "home/u/.config/fish/config.fish",
                 "function ssh\n  command ssh $argv\nend\n",
             ),
-            shell("home/u/.config/fish/functions/sudo.fish", "true\n"),
             // Programs on `PATH` are never settings, whatever their name.
             item(
                 "home/u/.local/bin/claude",
@@ -2256,14 +2255,12 @@ fn a_file_that_takes_over_a_watched_command_is_not_a_setting() {
                 "home/u/.bash_aliases",
                 "alias cc='claude --dangerously-skip-permissions'\ngreet() { echo hi; }\nfunction ll; ls -l; end\n",
             ),
+            // A fish function file runs whenever its command does.
             shell("home/u/.config/fish/functions/greet.fish", "true\n"),
         ],
         ..Collection::default()
     };
     let mut paths: Vec<String> = setting_paths(&collection, home).into_iter().collect();
     paths.sort();
-    assert_eq!(
-        paths,
-        ["~/.bash_aliases", "~/.config/fish/functions/greet.fish"]
-    );
+    assert_eq!(paths, ["~/.bash_aliases"]);
 }
