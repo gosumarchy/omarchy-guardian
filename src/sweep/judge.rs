@@ -117,7 +117,8 @@ pub(super) fn judge(
 /// can start any other (`systemd-inhibit`, `xargs`, a variable), so whether
 /// a persistence entry starts one cannot be told, and a wrapper there stays
 /// an alert until `sweep allow` records it. A start-up file is run by every
-/// shell the owner opens, so what else starts it changes nothing.
+/// shell the owner opens, so what else starts it changes nothing; the Shell
+/// files no shell reads at start are refused (`NOT_SOURCED_BY_A_SHELL`).
 ///
 /// An agent's hook runs on its own too, at every start or tool call, and
 /// every entry of one configuration file is sent under that file's path.
@@ -127,14 +128,15 @@ const SETTING_CATEGORIES: [Category; 2] = [Category::Shell, Category::Agent];
 
 /// Files of the kind `Category::Shell` that a shell the owner opens does
 /// not read at start: uwsm sources these when the session starts, makepkg
-/// on every package build, and fish loads a function file only when a
-/// command of its name runs, so anything may start one, as with a program
-/// on `PATH`. They are never settings.
-const NOT_SOURCED_BY_A_SHELL: [&str; 4] = [
+/// on every package build, and fish loads a function or completion file
+/// only when its command runs or is completed, so anything may start one,
+/// as with a program on `PATH`. They are never settings.
+const NOT_SOURCED_BY_A_SHELL: [&str; 5] = [
     ".config/uwsm/",
     ".makepkg.conf",
     ".config/pacman/makepkg.conf",
     ".config/fish/functions/",
+    ".config/fish/completions/",
 ];
 
 /// The files, by the path the AI is sent them under, that may hold the

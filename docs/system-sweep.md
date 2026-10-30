@@ -1792,7 +1792,8 @@ of this holds:
   one is how a password is taken. The start-up files uwsm sources
   (`~/.config/uwsm/`) and makepkg's (`~/.makepkg.conf`,
   `~/.config/pacman/makepkg.conf`) are read without a shell being opened, and
-  fish loads a file in `~/.config/fish/functions/` whenever its command runs,
+  fish loads a file in `~/.config/fish/functions/` or
+  `~/.config/fish/completions/` whenever its command runs or is completed,
   so these stay alerts. A program in a directory of your `PATH` (`~/.local/bin` and
   the like) keeps it an alert too: anything may start such a program, at
   login or from a link, in ways the sweep cannot always see, so a wrapper

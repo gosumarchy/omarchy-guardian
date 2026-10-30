@@ -2255,12 +2255,32 @@ fn a_file_that_takes_over_a_watched_command_is_not_a_setting() {
                 "home/u/.bash_aliases",
                 "alias cc='claude --dangerously-skip-permissions'\ngreet() { echo hi; }\nfunction ll; ls -l; end\n",
             ),
-            // A fish function file runs whenever its command does.
-            shell("home/u/.config/fish/functions/greet.fish", "true\n"),
         ],
         ..Collection::default()
     };
     let mut paths: Vec<String> = setting_paths(&collection, home).into_iter().collect();
     paths.sort();
     assert_eq!(paths, ["~/.bash_aliases"]);
+}
+
+#[test]
+fn files_no_shell_reads_at_start_are_not_settings() {
+    let collection = Collection {
+        items: [
+            "home/u/.config/fish/config.fish",
+            "home/u/.config/uwsm/env",
+            "home/u/.makepkg.conf",
+            "home/u/.config/pacman/makepkg.conf",
+            "home/u/.config/fish/functions/greet.fish",
+            "home/u/.config/fish/completions/greet.fish",
+        ]
+        .into_iter()
+        .map(|path| item(path, Category::Shell, Tier::Unknown))
+        .collect(),
+        ..Collection::default()
+    };
+    let paths: Vec<String> = setting_paths(&collection, Some("home/u"))
+        .into_iter()
+        .collect();
+    assert_eq!(paths, ["~/.config/fish/config.fish"]);
 }
