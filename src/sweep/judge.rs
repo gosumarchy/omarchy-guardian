@@ -181,10 +181,18 @@ fn launchers_of_word_alone(collection: &Collection) -> HashSet<&str> {
 /// Whether `item` is a binary Guardian could not vouch for that no local
 /// rule raises an alert on: one an AUR or `pacman -U` package installed
 /// (`hashed` flags those no package installed, or a version manager did,
-/// and a changed package file has its own rule). The reviewer's finding on
-/// what launches it is then the only alert, so no launcher up to the
-/// catalogued item may be shown as the owner's setting: the claim would
-/// leave the binary with none.
+/// when it sees what runs them, and a changed package file has its own
+/// rule). The reviewer's finding on what launches it is then the only
+/// alert, so no launcher up to the catalogued item may be shown as the
+/// owner's setting: the claim would leave the binary with none.
+///
+/// A version-managed binary that nothing Guardian follows runs is left
+/// out on purpose: a wrapper that calls `mise x claude` resolves it only
+/// when it runs, so the wrapper's claim leaves that binary with no alert.
+/// The owner accepted this on 2026-10-30 over flagging every binary a
+/// version manager put ahead of a system command: a wrapper that updates
+/// on every launch gives it a new hash each time, and the alert would come
+/// back after each `sweep allow`.
 fn flagged_by_word_alone(item: &Item) -> bool {
     matches!(item.body, Body::Binary(_))
         && item.tier == Tier::UserBuilt
