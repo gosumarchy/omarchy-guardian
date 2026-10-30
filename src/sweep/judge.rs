@@ -6,7 +6,7 @@
 pub(super) mod secrets;
 mod variables;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use super::collect::{self, Body, Collection, Item};
@@ -110,8 +110,8 @@ pub(super) fn judge(
 /// hook). The owner chose these three. Every other kind stays an alert
 /// whatever the reviewer says: autostart entries, user units, Hyprland's
 /// `exec` lines, cron jobs, Omarchy hooks and the rest are where
-/// persistence lives, and one claim graded medium must never turn such a
-/// finding into a clear sweep.
+/// persistence lives, and one claim must never turn such a finding into a
+/// clear sweep.
 ///
 /// An agent's hook runs on its own too, at every start or tool call, and
 /// every entry of one configuration file is sent under that file's path.
@@ -128,10 +128,13 @@ const SETTING_CATEGORIES: [Category; 3] = [Category::Shell, Category::LocalBin, 
 /// under a name Guardian watches on `PATH` (`sudo`, `ssh`, `git`,
 /// `omarchy-…`): a fake `sudo` in the home is how a password is taken, and
 /// the reviewer's grade alone must not clear it. So is a file that an item
-/// of any other kind also stands for. So, last, is a file that leads to a
+/// of any other kind also stands for. So is a file that leads to a
 /// binary only the reviewer's word flags (see `launchers_of_word_alone`).
+/// So, last, is a file an item of any other kind starts, directly or
+/// through others (see `started_by_other_kinds`).
 fn setting_paths(collection: &Collection, home: Option<&str>) -> HashSet<String> {
     let launchers = launchers_of_word_alone(collection);
+    let started = started_by_other_kinds(collection);
     let mut allowed = HashSet::new();
     let mut refused = HashSet::new();
     for item in &collection.items {
@@ -142,6 +145,7 @@ fn setting_paths(collection: &Collection, home: Option<&str>) -> HashSet<String>
             && item.run_by.is_none()
             && !watched
             && !launchers.contains(item.path.as_str())
+            && !started.contains(item.path.as_str())
             && SETTING_CATEGORIES.contains(&item.category)
         {
             allowed.insert(path);
@@ -151,6 +155,43 @@ fn setting_paths(collection: &Collection, home: Option<&str>) -> HashSet<String>
     }
     allowed.retain(|path| !refused.contains(path));
     allowed
+}
+
+/// The paths of the items that an item of a kind outside
+/// `SETTING_CATEGORIES` leads to: what it runs, what that runs, and so on.
+/// The catalogue lists `~/.local/bin` itself, so a program there has no
+/// `run_by` even when a user unit or a Hyprland `exec-once` line starts it
+/// at login; only `Collection::runners` holds that. Such a program starts
+/// on its own and is never a setting, even one an owner wrote: on
+/// 2026-10-30 the owner chose this over sparing what a desktop URL handler
+/// runs, so `~/.local/bin/claude`, which `claude-cli://` links start,
+/// stays an alert until `sweep allow` records it.
+fn started_by_other_kinds(collection: &Collection) -> HashSet<&str> {
+    let mut leads: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (target, runners) in &collection.runners {
+        for runner in runners {
+            leads
+                .entry(runner.as_str())
+                .or_default()
+                .push(target.as_str());
+        }
+    }
+    let mut started = HashSet::new();
+    let mut next: Vec<&str> = collection
+        .items
+        .iter()
+        .filter(|item| !SETTING_CATEGORIES.contains(&item.category))
+        .map(|item| item.path.as_str())
+        .collect();
+    while let Some(path) = next.pop() {
+        for target in leads.get(path).into_iter().flatten() {
+            // A path already in `started` was walked from there.
+            if started.insert(*target) {
+                next.push(target);
+            }
+        }
+    }
+    started
 }
 
 /// The paths of the items that lead to a binary for which

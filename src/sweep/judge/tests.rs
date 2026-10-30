@@ -2241,3 +2241,50 @@ fn past_the_cap_hashed_binaries_are_counted_not_described() {
     // Every one is still listed by its hash.
     assert_eq!(report.hash_only.len(), super::MAX_BINARY_FACTS + 2);
 }
+
+#[test]
+fn a_program_that_starts_on_its_own_is_not_a_setting() {
+    let home = Some("home/u");
+    let bin = |name: &str| {
+        item(
+            &format!("home/u/.local/bin/{name}"),
+            Category::LocalBin,
+            Tier::Unknown,
+        )
+    };
+    let collection = Collection {
+        items: vec![
+            item("home/u/.bashrc", Category::Shell, Tier::Unknown),
+            item(
+                "home/u/.config/systemd/user/sync.service",
+                Category::Systemd,
+                Tier::Unknown,
+            ),
+            item(
+                "home/u/.config/hypr/autostart.lua",
+                Category::Hyprland,
+                Tier::Unknown,
+            ),
+            // A user unit starts it at login.
+            bin("sync-helper"),
+            // Hyprland starts `outer`, which runs `inner`.
+            bin("outer"),
+            bin("inner"),
+            // Only an alias in a start-up file runs it.
+            bin("aliased"),
+        ],
+        runners: [
+            ("sync-helper", "home/u/.config/systemd/user/sync.service"),
+            ("outer", "home/u/.config/hypr/autostart.lua"),
+            ("inner", "home/u/.local/bin/outer"),
+            ("aliased", "home/u/.bashrc"),
+        ]
+        .into_iter()
+        .map(|(name, by)| (format!("home/u/.local/bin/{name}"), vec![by.to_string()]))
+        .collect(),
+        ..Collection::default()
+    };
+    let mut paths: Vec<String> = setting_paths(&collection, home).into_iter().collect();
+    paths.sort();
+    assert_eq!(paths, ["~/.bashrc", "~/.local/bin/aliased"]);
+}

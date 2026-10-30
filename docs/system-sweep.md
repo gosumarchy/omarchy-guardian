@@ -1778,7 +1778,9 @@ The mark is a claim. Guardian shows the finding as your setting only when all
 of this holds:
 
 - the reply wrote the mark as JSON `true` (not `"true"` or `1`);
-- the finding is graded `medium` or `low`, never `high`;
+- the finding is graded `low`;
+- no `medium` or `high` finding, from any part of the review, names the same
+  file;
 - every file it names is in your home (shown as `~/…`), was sent in that AI
   request, and is a shell start-up file, a program in a directory of your
   `PATH` (`~/.local/bin` and the like), or an entry an AI coding agent starts
@@ -1791,12 +1793,22 @@ of this holds:
   anywhere else, root's home as `sweep --root` shows it (`/root/…`), and
   every other kind of file in your home keeps it an alert: autostart
   entries, user units, Hyprland's `exec` lines, cron jobs, Omarchy hooks and
-  the rest are where persistence lives, and one claim graded medium must
-  never turn such a finding into a clear sweep. An agent's hook runs on its
-  own too; that risk was accepted for the plugin hooks settings came up in;
-- the review's verdict is `clear` (settings alone never make a review
-  suspicious, so a claim beside another verdict is not believed) and it did
-  not report text that speaks to the reviewer;
+  the rest are where persistence lives, and one claim must never turn such a
+  finding into a clear sweep. An agent's hook runs on its own too; that risk
+  was accepted for the plugin hooks settings came up in;
+- nothing of those other kinds starts the file, directly or through another
+  file: a program in `~/.local/bin` that a user unit, an autostart entry, a
+  Hyprland line or a desktop URL handler runs starts without you typing it,
+  so it stays an alert (`sweep allow` records one you know);
+- the file does not lead to a program an AUR or `pacman -U` package
+  installed, directly, through a script, or as a second wrapper of it: no
+  local rule flags such a program, so the mark would leave it with no alert;
+- the review's verdict is `clear`, or `suspicious` with at least one finding
+  that is not marked (settings alone never make a review suspicious, so a
+  suspicious review with only marked findings keeps them as alerts); an
+  `inconclusive` review's marks are not believed; and the review did not
+  report text that speaks to the reviewer. The findings that made a review
+  suspicious stay alerts;
 - no local rule matched in that file: the reviewer is asked to confirm or
   dismiss each local match, so a mark beside one may be about it, and the
   local rules' own findings stay alerts whatever the AI says;

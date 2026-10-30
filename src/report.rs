@@ -551,12 +551,17 @@ impl Report {
         {
             return false;
         }
-        // Two findings name the same file when both name one of the files
-        // sent: each may carry a line number or a shortened path.
-        let sent = || self.agent_runs.iter().flat_map(|run| &run.files);
+        // The sent files the claim names: two findings name the same file
+        // when both name one of these, as each may carry a line number or
+        // a shortened path.
+        let named: Vec<&String> = self
+            .agent_runs
+            .iter()
+            .flat_map(|run| &run.files)
+            .filter(|path| names(&finding.file, path))
+            .collect();
         let graver = self.reviewed_findings().any(|(_, other)| {
-            other.severity != Severity::Low
-                && sent().any(|path| names(&finding.file, path) && names(&other.file, path))
+            other.severity != Severity::Low && named.iter().any(|path| names(&other.file, path))
         });
         // The reviewer is told settings alone never make a review
         // suspicious, so a suspicious review with nothing but claims
@@ -565,14 +570,10 @@ impl Report {
         if graver || (review.status == Status::Suspicious && only_claims) {
             return false;
         }
-        let mut named = self
-            .agent_runs
-            .iter()
-            .flat_map(|run| &run.files)
-            .filter(|path| names(&finding.file, path))
-            .peekable();
-        named.peek().is_some()
-            && named.all(|path| self.scope.setting_paths.contains(path))
+        !named.is_empty()
+            && named
+                .iter()
+                .all(|path| self.scope.setting_paths.contains(*path))
             && run.files.iter().any(|path| names(&finding.file, path))
             && !self
                 .findings
