@@ -1764,7 +1764,7 @@ whose path gives no hint.
 Some files in your home hold choices you made about your own tools: an alias
 that starts Claude Code with its permission prompts skipped, a wrapper in
 `~/.local/bin` that turns off mise's wait for a release to age and installs
-the latest one, a plugin's start-up hook that puts its own shims directory
+the latest one (which stays an alert, see below), a plugin's start-up hook that puts its own shims directory
 first on `PATH`. The reviewer is asked to mark a finding about such a choice
 with `"owner_setting": true`, and only when it changes how your own programs
 behave when you start them, fetches no script or binary from an address to
@@ -1782,35 +1782,28 @@ of this holds:
 - no `medium` or `high` finding, from any part of the review, names the same
   file;
 - every file it names is in your home (shown as `~/…`), at least one of them
-  was sent in that AI request, and each is a shell start-up file, a program in a directory of your
-  `PATH` (`~/.local/bin` and the like), or an entry an AI coding agent starts
-  (a Claude Code hook, a plugin's hook), as the sweep finds it itself: a
-  script one of these runs or sources is not one, nor is a start-up file that
-  is a link into a dotfiles directory (the sweep reaches its target by
-  following the link), nor a program or fish function under a name
-  Guardian watches on `PATH` (`sudo`, `ssh`, `git`, `omarchy-…`), where a
-  fake one is how a password is taken. A file under `/etc`, `/usr` or
-  anywhere else, root's home as `sweep --root` shows it (`/root/…`), and
-  every other kind of file in your home keeps it an alert: autostart
-  entries, user units, Hyprland's `exec` lines, cron jobs, Omarchy hooks and
-  the rest are where persistence lives, and one claim must never turn such a
-  finding into a clear sweep. An agent's hook runs on its own too; that risk
-  was accepted for the plugin hooks settings came up in;
-- nothing of those other kinds, and nothing outside your home, starts the
-  file, directly or through another file: a program in `~/.local/bin` that a
-  user unit, an autostart entry, a Hyprland line, a desktop URL handler or
-  root's crontab runs starts without you typing it, so it stays an alert
-  (`sweep allow` records one you know). The start-up files uwsm sources
+  was sent in that AI request, and each is a shell start-up file or an entry
+  an AI coding agent starts (a Claude Code hook, a plugin's hook), as the
+  sweep finds it itself: a script one of these runs or sources is not one,
+  nor is a start-up file that is a link into a dotfiles directory (the sweep
+  reaches its target by following the link), nor one that defines a
+  command under a name Guardian watches on `PATH` (`sudo`, `ssh`, `git`,
+  `omarchy-…`) as a function, a fish function file or an alias, where a fake
+  one is how a password is taken. The start-up files uwsm sources
   (`~/.config/uwsm/`) and makepkg's (`~/.makepkg.conf`,
   `~/.config/pacman/makepkg.conf`) are read without a shell being opened, and
-  stay alerts too. When a file Guardian cannot vouch for, among those other
-  kinds or what they start, names a program through a variable or runs more
-  than the sweep follows, what it starts is not known, and no file is shown
-  as a setting in that sweep. Files a repository package ships unchanged are
-  left out of that rule: they name programs through variables on every
-  machine;
+  stay alerts. A program in a directory of your `PATH` (`~/.local/bin` and
+  the like) keeps it an alert too: anything may start such a program, at
+  login or from a link, in ways the sweep cannot always see, so a wrapper
+  you wrote there is cleared with `sweep allow` instead. A file under
+  `/etc`, `/usr` or anywhere else, root's home as `sweep --root` shows it
+  (`/root/…`), and every other kind of file in your home keeps it an alert:
+  autostart entries, user units, Hyprland's `exec` lines, cron jobs, Omarchy
+  hooks and the rest are where persistence lives, and one claim must never
+  turn such a finding into a clear sweep. An agent's hook runs on its own
+  too; that risk was accepted for the plugin hooks settings came up in;
 - the file does not lead to a program an AUR or `pacman -U` package
-  installed, directly, through a script, or as a second wrapper of it: no
+  installed, directly, through a script, or as a second launcher of it: no
   local rule flags such a program, so the mark would leave it with no alert;
 - the review's verdict is `clear`, or `suspicious` with at least one finding
   that is not marked (settings alone never make a review suspicious, so a

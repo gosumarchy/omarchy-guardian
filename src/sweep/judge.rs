@@ -6,7 +6,7 @@
 pub(super) mod secrets;
 mod variables;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::Write as _;
 
 use super::collect::{self, Body, Collection, Item};
@@ -105,19 +105,25 @@ pub(super) fn judge(
 }
 
 /// The kinds of item whose AI findings may be the owner's own settings:
-/// shell start-up files, programs in a directory of the home's `PATH` and
-/// the entries AI coding agents start (an alias, a wrapper, a plugin's
-/// hook). The owner chose these three. Every other kind stays an alert
-/// whatever the reviewer says: autostart entries, user units, Hyprland's
-/// `exec` lines, cron jobs, Omarchy hooks and the rest are where
-/// persistence lives, and one claim must never turn such a finding into a
-/// clear sweep.
+/// shell start-up files and the entries AI coding agents start (an alias,
+/// a plugin's hook). Every other kind stays an alert whatever the reviewer
+/// says: autostart entries, user units, Hyprland's `exec` lines, cron jobs,
+/// Omarchy hooks and the rest are where persistence lives, and one claim
+/// must never turn such a finding into a clear sweep.
+///
+/// Programs in a directory of the home's `PATH` (`Category::LocalBin`) are
+/// left out. The owner chose this on 2026-10-30 after three review rounds
+/// each found a new way for a planted program there to pass: any program
+/// can start any other (`systemd-inhibit`, `xargs`, a variable), so whether
+/// a persistence entry starts one cannot be told, and a wrapper there stays
+/// an alert until `sweep allow` records it. A start-up file is run by every
+/// shell the owner opens, so what else starts it changes nothing.
 ///
 /// An agent's hook runs on its own too, at every start or tool call, and
 /// every entry of one configuration file is sent under that file's path.
 /// The owner accepted that risk for the plugin hooks the settings came up
 /// in; the other checks of `Report::is_owner_setting` still apply.
-const SETTING_CATEGORIES: [Category; 3] = [Category::Shell, Category::LocalBin, Category::Agent];
+const SETTING_CATEGORIES: [Category; 2] = [Category::Shell, Category::Agent];
 
 /// Start-up files of the kind `Category::Shell` that no shell the owner
 /// opens reads: uwsm sources these when the session starts, and makepkg on
@@ -134,45 +140,28 @@ const NOT_SOURCED_BY_A_SHELL: [&str; 3] = [
 /// `SETTING_CATEGORIES` that the catalogue found itself. A file reached by
 /// following what another runs or sources is left out: it takes the kind
 /// of whatever reached it first, so a payload anywhere in the home that a
-/// start-up file runs would count as a start-up file. So is a program
-/// under a name Guardian watches on `PATH` (`sudo`, `ssh`, `git`,
-/// `omarchy-…`): a fake `sudo` in the home is how a password is taken, and
-/// the reviewer's grade alone must not clear it. So is a file that an item
-/// of any other kind also stands for, and a start-up file in
-/// `NOT_SOURCED_BY_A_SHELL`. So is a file that leads to a binary only the
-/// reviewer's word flags (see `launchers_of_word_alone`). So, last, is a
-/// file an item of any other kind starts, directly or through others (see
-/// `started_by_other_kinds`); when that cannot be told, no file is a
-/// setting.
+/// start-up file runs would count as a start-up file. So is a start-up
+/// file in `NOT_SOURCED_BY_A_SHELL`, and one that takes over a command
+/// Guardian watches (see `takes_over_watched`): a fake `sudo` is how a
+/// password is taken, and the reviewer's grade alone must not clear it. So
+/// is a file that an item of any other kind also stands for. So, last, is
+/// a file that leads to a binary only the reviewer's word flags (see
+/// `launchers_of_word_alone`).
 fn setting_paths(collection: &Collection, home: Option<&str>) -> HashSet<String> {
-    let Some(started) = started_by_other_kinds(collection, home) else {
-        return HashSet::new();
-    };
     let launchers = launchers_of_word_alone(collection);
     let mut allowed = HashSet::new();
     let mut refused = HashSet::new();
     for item in &collection.items {
         let path = shown_path(checked_path(item), home);
-        // A fish function takes over the command it is named for, as a
-        // program on `PATH` does.
-        let watched = match item.category {
-            Category::LocalBin => super::path::is_watched(file_name(&item.path)),
-            Category::Shell => path
-                .strip_prefix("~/.config/fish/functions/")
-                .and_then(|name| name.strip_suffix(".fish"))
-                .is_some_and(super::path::is_watched),
-            _ => false,
-        };
         let sourced_unasked = NOT_SOURCED_BY_A_SHELL.iter().any(|place| {
             path.strip_prefix("~/")
                 .is_some_and(|rest| rest.starts_with(place))
         });
         if path.starts_with("~/")
             && item.run_by.is_none()
-            && !watched
             && !sourced_unasked
+            && !takes_over_watched(item, &path)
             && !launchers.contains(item.path.as_str())
-            && !started.contains(item.path.as_str())
             && SETTING_CATEGORIES.contains(&item.category)
         {
             allowed.insert(path);
@@ -184,65 +173,36 @@ fn setting_paths(collection: &Collection, home: Option<&str>) -> HashSet<String>
     allowed
 }
 
-/// The paths of the items that an item of a kind outside
-/// `SETTING_CATEGORIES`, or any item outside the home, leads to: what it
-/// runs, what that runs, and so on. The catalogue lists `~/.local/bin`
-/// itself, so a program there has no `run_by` even when a user unit or a
-/// Hyprland `exec-once` line starts it at login; only `Collection::runners`
-/// holds that. Such a program starts on its own and is never a setting,
-/// even one an owner wrote: on 2026-10-30 the owner chose this over
-/// sparing what a desktop URL handler runs, so `~/.local/bin/claude`, which
-/// `claude-cli://` links start, stays an alert until `sweep allow` records
-/// it. Every item outside the home counts, whatever its kind: root's
-/// crontab or `/etc/profile.d` may run a home program, and root's results
-/// keep only the first launcher of each item (see `root::merge`).
-///
-/// `None` when the walk reaches an item Guardian does not vouch for that
-/// it did not follow to the end (a program named through a variable, a
-/// chain of more scripts than it looks through, and the other limits of
-/// `collect::NOT_ALL_FOLLOWED`): what that item starts is not known, so
-/// any file in the home may be one of them. A trusted item is left out:
-/// what a repository package ships names what the package means to run,
-/// and packaged files (`/etc/profile`, every bash completion) name
-/// programs through variables on every machine, so counting them would
-/// leave no setting anywhere. A planted way to a home program needs a file
-/// Guardian cannot vouch for.
-fn started_by_other_kinds<'a>(
-    collection: &'a Collection,
-    home: Option<&str>,
-) -> Option<HashSet<&'a str>> {
-    let mut leads: HashMap<&str, Vec<&str>> = HashMap::new();
-    for (target, runners) in &collection.runners {
-        for runner in runners {
-            leads
-                .entry(runner.as_str())
-                .or_default()
-                .push(target.as_str());
-        }
+/// Whether `item`, a start-up file shown as `path`, defines a command
+/// under a name Guardian watches on `PATH` (`super::path::is_watched`): a
+/// fish function file named for it, or a function or alias of that name
+/// (`sudo() {`, `function sudo`, `alias git=`). The local rule
+/// `takes-over-shell` sees aliases of only four names.
+fn takes_over_watched(item: &Item, path: &str) -> bool {
+    let file = path
+        .strip_prefix("~/.config/fish/functions/")
+        .and_then(|name| name.strip_suffix(".fish"));
+    if file.is_some_and(super::path::is_watched) {
+        return true;
     }
-    let in_home = |path: &str| home.is_some_and(|home| path.starts_with(&format!("{home}/")));
-    let seeds: HashSet<&str> = collection
-        .items
-        .iter()
-        .filter(|item| !SETTING_CATEGORIES.contains(&item.category) || !in_home(&item.path))
-        .map(|item| item.path.as_str())
-        .collect();
-    let mut started: HashSet<&str> = HashSet::new();
-    let mut next: Vec<&str> = seeds.iter().copied().collect();
-    while let Some(path) = next.pop() {
-        for target in leads.get(path).into_iter().flatten() {
-            // A path already in `started` was walked from there.
-            if started.insert(*target) {
-                next.push(target);
-            }
-        }
-    }
-    let unknown = collection.items.iter().any(|item| {
-        (started.contains(item.path.as_str()) || seeds.contains(item.path.as_str()))
-            && !item.is_trusted()
-            && collect::is_capped(item)
-    });
-    (!unknown).then_some(started)
+    let Body::Text(text) = &item.body else {
+        return false;
+    };
+    text.lines().any(|line| {
+        let line = line.trim_start();
+        let (keyword, name) = match ["function ", "alias "]
+            .iter()
+            .find_map(|keyword| Some((true, line.strip_prefix(keyword)?.trim_start())))
+        {
+            Some(found) => found,
+            None => (false, line),
+        };
+        let end = name
+            .find(|c: char| c.is_whitespace() || "(;{=".contains(c))
+            .unwrap_or(name.len());
+        let defines = keyword || name[end..].trim_start().starts_with("()");
+        defines && super::path::is_watched(&name[..end])
+    })
 }
 
 /// The paths of the items that lead to a binary for which

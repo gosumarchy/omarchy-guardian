@@ -6,9 +6,9 @@ use crate::report::LocalFinding;
 use crate::report::{Report, ReviewScope};
 use crate::rules::RuleId;
 use crate::sweep::nvim::{self, Review};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use crate::sweep::collect::{self, Body, Collection, Item, NOT_ALL_FOLLOWED, Origin, Scope};
+use crate::sweep::collect::{self, Body, Collection, Item, Origin, Scope};
 use crate::sweep::index::PackageIndex;
 use crate::sweep::tier::Tier;
 use crate::test_support::TempDir;
@@ -1889,11 +1889,12 @@ fn a_link_handed_beside_a_wrapper_to_a_key_is_not_sent() {
     );
 }
 #[test]
-fn only_shell_files_programs_and_agent_entries_in_the_home_may_hold_settings() {
+fn only_shell_files_and_agent_entries_in_the_home_may_hold_settings() {
     let home = Some("home/u");
     let collection = Collection {
         items: vec![
             item("home/u/.bashrc", Category::Shell, Tier::Unknown),
+            // A program on `PATH` starts however anything runs it.
             item(
                 "home/u/.local/bin/claude",
                 Category::LocalBin,
@@ -1929,13 +1930,6 @@ fn only_shell_files_programs_and_agent_entries_in_the_home_may_hold_settings() {
             item("etc/bash.bashrc", Category::Shell, Tier::Unknown),
             item("root/.bashrc", Category::Shell, Tier::Unknown),
             item("usr/local/bin/claude", Category::LocalBin, Tier::Unknown),
-            // A program under a name Guardian watches on PATH.
-            item("home/u/.local/bin/sudo", Category::LocalBin, Tier::Unknown),
-            item(
-                "home/u/.local/bin/omarchy-update",
-                Category::LocalBin,
-                Tier::Unknown,
-            ),
             // What a start-up file runs takes its kind, and is not one.
             Item {
                 run_by: Some("home/u/.bashrc".into()),
@@ -1950,14 +1944,7 @@ fn only_shell_files_programs_and_agent_entries_in_the_home_may_hold_settings() {
     };
     let mut paths: Vec<String> = setting_paths(&collection, home).into_iter().collect();
     paths.sort();
-    assert_eq!(
-        paths,
-        [
-            "~/.bashrc",
-            "~/.claude/settings.json",
-            "~/.local/bin/claude"
-        ]
-    );
+    assert_eq!(paths, ["~/.bashrc", "~/.claude/settings.json"]);
 }
 
 #[test]
@@ -1965,15 +1952,15 @@ fn a_launcher_of_a_binary_only_the_reviewer_flags_is_not_a_setting() {
     let home = Some("home/u");
     let mut collection = Collection {
         items: vec![
-            // A wrapper that runs a binary an AUR package installed: no
+            // A start-up file that runs a binary an AUR package installed: no
             // local rule flags that binary, so its launcher stays an alert.
             item(
-                "home/u/.local/bin/aurtool",
-                Category::LocalBin,
+                "home/u/.config/fish/conf.d/aurtool.fish",
+                Category::Shell,
                 Tier::Unknown,
             ),
             Item {
-                run_by: Some("home/u/.local/bin/aurtool".into()),
+                run_by: Some("home/u/.config/fish/conf.d/aurtool.fish".into()),
                 body: Body::Binary("ELF"),
                 ..item("usr/bin/aurtool-bin", Category::LocalBin, Tier::UserBuilt)
             },
@@ -1988,15 +1975,15 @@ fn a_launcher_of_a_binary_only_the_reviewer_flags_is_not_a_setting() {
                 body: Body::Binary("ELF"),
                 ..item("usr/bin/hooktool", Category::Agent, Tier::UserBuilt)
             },
-            // And through a script the wrapper runs: every launcher up the
+            // And through a script the start-up file runs: every launcher up the
             // chain stays an alert.
             item(
-                "home/u/.local/bin/chained",
-                Category::LocalBin,
+                "home/u/.config/fish/conf.d/chained.fish",
+                Category::Shell,
                 Tier::Unknown,
             ),
             Item {
-                run_by: Some("home/u/.local/bin/chained".into()),
+                run_by: Some("home/u/.config/fish/conf.d/chained.fish".into()),
                 ..item(
                     "home/u/.local/share/chained/run.sh",
                     Category::LocalBin,
@@ -2008,15 +1995,15 @@ fn a_launcher_of_a_binary_only_the_reviewer_flags_is_not_a_setting() {
                 body: Body::Binary("ELF"),
                 ..item("usr/bin/chained-bin", Category::LocalBin, Tier::UserBuilt)
             },
-            // A wrapper of a binary a version manager installed has its own
-            // local alert on that binary, so the wrapper may be a setting.
+            // A start-up file that runs a binary a version manager installed:
+            // that binary has its own local alert, so the file may be a setting.
             item(
-                "home/u/.local/bin/nodetool",
-                Category::LocalBin,
+                "home/u/.config/fish/conf.d/nodetool.fish",
+                Category::Shell,
                 Tier::Unknown,
             ),
             Item {
-                run_by: Some("home/u/.local/bin/nodetool".into()),
+                run_by: Some("home/u/.config/fish/conf.d/nodetool.fish".into()),
                 body: Body::Binary("ELF"),
                 notes: vec!["installed by a version manager, not by a package".into()],
                 ..item(
@@ -2025,11 +2012,11 @@ fn a_launcher_of_a_binary_only_the_reviewer_flags_is_not_a_setting() {
                     Tier::UserBuilt,
                 )
             },
-            // A second wrapper of the AUR binary, which `run_by` cannot
+            // A second launcher of the AUR binary, which `run_by` cannot
             // hold: only `runners` has it.
             item(
-                "home/u/.local/bin/aurtool-alt",
-                Category::LocalBin,
+                "home/u/.config/fish/conf.d/aurtool-alt.fish",
+                Category::Shell,
                 Tier::Unknown,
             ),
         ],
@@ -2044,9 +2031,9 @@ fn a_launcher_of_a_binary_only_the_reviewer_flags_is_not_a_setting() {
         .runners
         .get_mut("usr/bin/aurtool-bin")
         .expect("the AUR binary has a runner")
-        .push("home/u/.local/bin/aurtool-alt".into());
+        .push("home/u/.config/fish/conf.d/aurtool-alt.fish".into());
     let paths: Vec<String> = setting_paths(&collection, home).into_iter().collect();
-    assert_eq!(paths, ["~/.local/bin/nodetool"]);
+    assert_eq!(paths, ["~/.config/fish/conf.d/nodetool.fish"]);
 }
 
 #[test]
@@ -2243,125 +2230,40 @@ fn past_the_cap_hashed_binaries_are_counted_not_described() {
 }
 
 #[test]
-fn a_program_that_starts_on_its_own_is_not_a_setting() {
+fn a_file_that_takes_over_a_watched_command_is_not_a_setting() {
     let home = Some("home/u");
-    let bin = |name: &str| {
-        item(
-            &format!("home/u/.local/bin/{name}"),
-            Category::LocalBin,
-            Tier::Unknown,
-        )
+    let shell = |path: &str, text: &str| Item {
+        body: Body::Text(text.into()),
+        ..item(path, Category::Shell, Tier::Unknown)
     };
     let collection = Collection {
         items: vec![
-            item("home/u/.bashrc", Category::Shell, Tier::Unknown),
+            shell("home/u/.bashrc", "sudo() { command sudo \"$@\"; }\n"),
+            shell("home/u/.zshrc", "alias git='git --no-pager'\n"),
+            shell(
+                "home/u/.config/fish/config.fish",
+                "function ssh\n  command ssh $argv\nend\n",
+            ),
+            shell("home/u/.config/fish/functions/sudo.fish", "true\n"),
+            // Programs on `PATH` are never settings, whatever their name.
             item(
-                "home/u/.config/systemd/user/sync.service",
-                Category::Systemd,
+                "home/u/.local/bin/claude",
+                Category::LocalBin,
                 Tier::Unknown,
             ),
-            item(
-                "home/u/.config/hypr/autostart.lua",
-                Category::Hyprland,
-                Tier::Unknown,
+            // Names Guardian does not watch.
+            shell(
+                "home/u/.bash_aliases",
+                "alias cc='claude --dangerously-skip-permissions'\ngreet() { echo hi; }\nfunction ll; ls -l; end\n",
             ),
-            // A user unit starts it at login.
-            bin("sync-helper"),
-            // Hyprland starts `outer`, which runs `inner`.
-            bin("outer"),
-            bin("inner"),
-            // Only an alias in a start-up file runs it.
-            bin("aliased"),
-            // A start-up file outside the home runs it: root's, or one
-            // root's results kept as the only launcher.
-            item("root/.bashrc", Category::Shell, Tier::Unknown),
-            bin("rooted"),
-            // Start-up files no shell the owner opens reads.
-            item("home/u/.config/uwsm/env", Category::Shell, Tier::Unknown),
-            item("home/u/.makepkg.conf", Category::Shell, Tier::Unknown),
-            // A fish function named for a command Guardian watches.
-            item(
-                "home/u/.config/fish/functions/sudo.fish",
-                Category::Shell,
-                Tier::Unknown,
-            ),
-            item(
-                "home/u/.config/fish/functions/greet.fish",
-                Category::Shell,
-                Tier::Unknown,
-            ),
+            shell("home/u/.config/fish/functions/greet.fish", "true\n"),
         ],
-        runners: [
-            ("sync-helper", "home/u/.config/systemd/user/sync.service"),
-            ("outer", "home/u/.config/hypr/autostart.lua"),
-            ("inner", "home/u/.local/bin/outer"),
-            // A cycle back: the walk ends, and both stay refused.
-            ("outer", "home/u/.local/bin/inner"),
-            ("aliased", "home/u/.bashrc"),
-            ("rooted", "root/.bashrc"),
-        ]
-        .into_iter()
-        .fold(HashMap::new(), |mut runners, (name, by)| {
-            runners
-                .entry(format!("home/u/.local/bin/{name}"))
-                .or_insert_with(Vec::new)
-                .push(by.to_string());
-            runners
-        }),
         ..Collection::default()
     };
     let mut paths: Vec<String> = setting_paths(&collection, home).into_iter().collect();
     paths.sort();
     assert_eq!(
         paths,
-        [
-            "~/.bashrc",
-            "~/.config/fish/functions/greet.fish",
-            "~/.local/bin/aliased"
-        ]
-    );
-}
-
-#[test]
-fn what_a_started_file_runs_unseen_leaves_no_setting() {
-    // A user unit starts a script in the home that names what it runs
-    // through a variable: that may be any file in the home, so none is
-    // shown as a setting.
-    let home = Some("home/u");
-    let unit = "home/u/.config/systemd/user/sync.service";
-    let script = |tier: Tier| {
-        let mut script = item("home/u/.cache/s", Category::Shell, tier);
-        script.run_by = Some(unit.into());
-        script.notes.push(format!(
-            "{NOT_ALL_FOLLOWED}a program or script named through a variable"
-        ));
-        script
-    };
-    let collection = |tier: Tier| Collection {
-        items: vec![
-            item("home/u/.bashrc", Category::Shell, Tier::Unknown),
-            item(unit, Category::Systemd, Tier::Unknown),
-            script(tier),
-        ],
-        runners: [("home/u/.cache/s".to_string(), vec![unit.to_string()])].into(),
-        ..Collection::default()
-    };
-    assert!(setting_paths(&collection(Tier::Unknown), home).is_empty());
-    // A packaged file names its programs through variables on every
-    // machine, and is what the package ships.
-    assert_eq!(
-        setting_paths(&collection(Tier::Vendor), home),
-        ["~/.bashrc".to_string()].into()
-    );
-    // What only a start-up file in the home runs is not started on its own.
-    let mut quiet = collection(Tier::Unknown);
-    quiet.runners = [(
-        "home/u/.cache/s".to_string(),
-        vec!["home/u/.bashrc".to_string()],
-    )]
-    .into();
-    assert_eq!(
-        setting_paths(&quiet, home),
-        ["~/.bashrc".to_string()].into()
+        ["~/.bash_aliases", "~/.config/fish/functions/greet.fish"]
     );
 }
