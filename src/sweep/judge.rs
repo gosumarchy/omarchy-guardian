@@ -152,7 +152,8 @@ fn setting_paths(collection: &Collection, home: Option<&str>) -> HashSet<String>
 
 /// Puts what the local checks say of `collection` into `report`, queues
 /// for the AI review the text that goes to it, and returns what Guardian
-/// established about each such item (see `fact`).
+/// established about each such item and each binary it lists by its hash
+/// (see `fact`).
 fn examine(
     report: &mut Report,
     collection: &Collection,
@@ -160,6 +161,9 @@ fn examine(
     news: &HashSet<String>,
 ) -> Vec<String> {
     let mut facts = Vec::new();
+    // What Guardian established about each binary listed by its hash, and
+    // whether nothing runs it; `MAX_BINARY_FACTS` of them are told.
+    let mut binaries = Vec::new();
     for item in collection.items.iter().filter(|item| !item.is_trusted()) {
         let label = label(item, home);
         if item.tier == Tier::Modified {
@@ -209,7 +213,7 @@ fn examine(
                 let file = shown_path(checked_path(item), home);
                 if reading == Some(Reading::Reviewed) {
                     review::analyze_text(report, &file, &text, false);
-                    facts.push(fact(item, &label));
+                    facts.push(fact(item, &label, home));
                 } else {
                     review::analyze_text_locally(report, &file, &text);
                 }
@@ -240,16 +244,8 @@ fn examine(
                 drop_rule(report, before.0, RuleId::PersistenceModification);
             }
             Body::Binary(format) => {
-                // One without a hash is never recorded as approved, so
-                // every sweep that finds it is reviewed in full.
-                report.unread.insert(label.clone(), item.sha256);
-                report.hash_only.push(HashOnly {
-                    path: label,
-                    bytes: 0,
-                    label: format,
-                    media: false,
-                    skipped_files: None,
-                });
+                let fact = hashed(report, item, label, format, home);
+                binaries.push((item.run_by.is_none(), fact));
             }
             Body::Undecodable => report.gaps.push(Gap::Undecodable(label)),
             Body::Oversized => report.gaps.push(Gap::OversizedText(label)),
@@ -259,7 +255,61 @@ fn examine(
             Body::Plugin(plugin) => facts.extend(plugin_files(report, plugin, &label)),
         }
     }
+    // A binary something runs first: its fact is what the reviewer judges
+    // the file that launches it by. The sort is stable, so the rest keep
+    // the collection's order.
+    binaries.sort_by_key(|(unrun, _)| *unrun);
+    let more = binaries.len().saturating_sub(MAX_BINARY_FACTS);
+    facts.extend(
+        binaries
+            .into_iter()
+            .take(MAX_BINARY_FACTS)
+            .map(|(_, fact)| fact),
+    );
+    if more > 0 {
+        facts.push(format!(
+            "Guardian hashed {more} binaries it does not describe here."
+        ));
+    }
     facts
+}
+
+/// Lists `item`, a binary of `format` shown as `label`, by its hash, flags
+/// it where no package installed it and something runs it, and returns
+/// what Guardian established about it.
+///
+/// The reviewer is told what Guardian knows of a program it was not sent,
+/// so a file that launches one is judged by that, not taken as a reason to
+/// call its whole chunk inconclusive (see `SYSTEM_SCOPE`). One no package
+/// installed is also flagged here, so it is never passed on the model's
+/// word alone; the finding is on the binary, so `sweep allow` binds it to
+/// the binary's hash and a replaced binary is flagged again.
+fn hashed(
+    report: &mut Report,
+    item: &Item,
+    label: String,
+    format: &'static str,
+    home: Option<&str>,
+) -> String {
+    // One without a hash is never recorded as approved, so every sweep
+    // that finds it is reviewed in full.
+    report.unread.insert(label.clone(), item.sha256);
+    let unpackaged = item.tier == Tier::Unknown || is_version_managed(item);
+    if unpackaged && let Some(by) = &item.run_by {
+        let by = format!("run by {}", shown_path(by, home));
+        report
+            .findings
+            .push(finding(&label, 1, RuleId::UnpackagedBinary, &by));
+    }
+    let fact = hashed_fact(item, &label, format, home);
+    report.hash_only.push(HashOnly {
+        path: label,
+        bytes: 0,
+        label: format,
+        media: false,
+        skipped_files: None,
+    });
+    fact
 }
 
 /// Puts the files of `plugin`, listed as `label`, that this sweep reviews
@@ -673,19 +723,26 @@ fn finding(path: &str, line: usize, rule: RuleId, excerpt: &str) -> LocalFinding
     }
 }
 
-/// What Guardian established about an item, for the AI. The path is quoted,
-/// so a crafted name cannot pose as Guardian's words.
-fn fact(item: &Item, label: &str) -> String {
+/// Whether `item` was put in the home by a version manager (mise), not by a
+/// package: the note `path` gives such an item.
+fn is_version_managed(item: &Item) -> bool {
+    item.tier == Tier::UserBuilt
+        && item
+            .notes
+            .iter()
+            .any(|note| note.contains("version manager"))
+}
+
+/// What Guardian established about an item, for the AI. The paths are
+/// quoted, so a crafted name cannot pose as Guardian's words, and written
+/// as the files sent are (`~/` for the home), so the model can tell which
+/// sent file runs it.
+fn fact(item: &Item, label: &str, home: Option<&str>) -> String {
     let what = match item.tier {
         Tier::Edited => {
             "a package's configuration file, edited after install (normal for configuration)"
         }
-        Tier::UserBuilt
-            if item
-                .notes
-                .iter()
-                .any(|note| note.contains("version manager")) =>
-        {
+        Tier::UserBuilt if is_version_managed(item) => {
             "installed by a version manager in the home directory, not by a package"
         }
         Tier::UserBuilt => {
@@ -695,7 +752,13 @@ fn fact(item: &Item, label: &str) -> String {
             "installed by a package but changed since (it is not what the package shipped)"
         }
         Tier::Unknown => "installed by no package",
-        Tier::Vendor | Tier::Inert | Tier::Copied | Tier::Allowed => "trusted",
+        // These three reach here only with an alert on the item, and an
+        // allowed item never does (see `Item::is_trusted`): the fact says
+        // what installed it, and the alert is a finding of its own.
+        Tier::Vendor => "installed unchanged by a package from a configured repository",
+        Tier::Copied => "an unchanged copy of a file a repository package ships",
+        Tier::Inert => "an empty file or a link to /dev/null",
+        Tier::Allowed => "allowed by the user as it is",
     };
     let mut text = format!(
         "{:?} is {what}; it {}.",
@@ -706,7 +769,7 @@ fn fact(item: &Item, label: &str) -> String {
         let _ = write!(
             text,
             " It is run by {:?}.",
-            shown(&format!("/{by}")).as_ref()
+            shown(&shown_path(by, home)).as_ref()
         );
     }
     if item
@@ -731,6 +794,20 @@ fn fact(item: &Item, label: &str) -> String {
     }
     text
 }
+
+/// What Guardian established about `item`, a binary of `format` listed as
+/// `label`, for the AI, which is sent its hash and never its content.
+fn hashed_fact(item: &Item, label: &str, format: &str, home: Option<&str>) -> String {
+    format!(
+        "{} Guardian hashed it ({format}) and did not send its content.",
+        fact(item, label, home)
+    )
+}
+
+/// The most binaries described by a fact: as many hash-only rows as a
+/// request's manifest names (`MAX_HASH_ONLY_ROWS` in `engine::plan`), as
+/// facts go to every chunk and are not charged to its size.
+const MAX_BINARY_FACTS: usize = 64;
 
 #[cfg(test)]
 mod tests;

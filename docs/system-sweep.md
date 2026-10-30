@@ -1687,7 +1687,39 @@ and sent like the start-up file itself, unless its path marks it as holding
 secrets.
 
 Binaries no package vouches for are named to the AI by format and hash but
-never run or uploaded.
+never run or uploaded. With each one goes what Guardian established about it,
+as a fact outside the untrusted data: what installed it (no package, a version
+manager, a package of no configured repository, or a package whose file it no
+longer is) and what runs it. At most 64 are described, those something runs
+first; past that, one fact says how many more there are (facts go to every
+chunk). A binary a repository package installed unchanged is trusted and not
+listed, unless a live check raised an alert on it (a packaged program
+listening where nothing packaged starts it); its fact then says what installed
+it, and the alert is its own finding. The reviewer is told:
+
+- a sent file that launches a binary Guardian could not vouch for gets a
+  finding at that file: medium, or high where how it is launched adds to the
+  concern (as root, from a temporary directory). Launching one a repository
+  package installed unchanged is no concern by itself;
+- a hashed binary does not make the chunk inconclusive by itself. The rest of
+  the chunk keeps its verdict; `inconclusive` is left for a sent file whose own
+  behaviour cannot be told.
+
+This is the sweep's alone. The other review classes keep the general rule
+that a file which runs a hash-only file is a finding; their request text is
+unchanged.
+
+For a binary no package installed (none at all, or a version manager's), the
+flag does not rest on the reviewer: one that something the sweep follows runs
+(a launcher's `Exec=`, a keybinding, a unit) raises `unpackaged-binary`
+(medium) on the binary itself, naming what runs it, whatever the AI answers.
+A binary from a package of no configured repository (AUR, `pacman -U`) is
+flagged by the reviewer's finding on its launcher alone, as before; a changed
+package file raises `modified-package-file` on its own. `sweep allow` on the binary records that you checked
+it, bound to its hash, so a replaced binary is flagged again. A binary that
+nothing the sweep follows runs (one catalogued by its own place, such as a
+program in `~/.local/bin` named like a system command) is listed and told to
+the AI but raises no such finding.
 
 ### What is taken out of a file that is sent
 
@@ -2169,6 +2201,7 @@ reviews as well, are listed under [Local rules](local-rules.md#rule-ids).
 | `plugin-source` | medium | An editor plugin is not a git checkout of where its plugin manager fetches it from: its origin is not the address its spec names, it names no origin, or it is no checkout at all. |
 | `plugin-build` | medium | An editor plugin runs a program when its plugin manager installs or updates it: a shell command as its build step, a field whose key code computes and that may be one, or a git hook in its checkout. |
 | `kept-from-review` | medium | Something runs this file, or a shell reads it in, and it holds more than opaque values kept in secret-named or plainly inert variables; it holds secrets (by its path or a boot password), so the AI review did not read it: only the local rules did. Read it yourself; `sweep allow` records that you did. |
+| `unpackaged-binary` | medium | Something the sweep follows runs this binary file, and no package installed it: Guardian only hashed it, so neither the local rules nor the AI read it. Check where it came from; `sweep allow` records that you did, bound to its hash. |
 | `network-listener` | low | A program listens on the network that nothing installed accounts for: an interpreter (Python, a shell, Node), or a packaged program no packaged service runs. |
 
 `git-config-command` and `remote-shell` are reported by the sweep as well as

@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Stream Player
+Exec=/usr/bin/mpv --profile=low-latency %u
+MimeType=x-scheme-handler/rtsp;
+NoDisplay=true
