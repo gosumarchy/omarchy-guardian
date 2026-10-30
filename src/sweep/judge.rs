@@ -9,7 +9,7 @@ mod variables;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
-use super::collect::{self, Body, Collection, Item};
+use super::collect::{self, Body, CHAIN_CAPPED, Collection, Item, NOT_ALL_FOLLOWED};
 use super::nvim::{self, Review};
 use super::tier::Tier;
 use super::{boot, commands};
@@ -119,6 +119,16 @@ pub(super) fn judge(
 /// in; the other checks of `Report::is_owner_setting` still apply.
 const SETTING_CATEGORIES: [Category; 3] = [Category::Shell, Category::LocalBin, Category::Agent];
 
+/// Start-up files of the kind `Category::Shell` that no shell the owner
+/// opens reads: uwsm sources these when the session starts, and makepkg on
+/// every package build. Like the other kinds that start on their own, they
+/// are never settings.
+const NOT_SOURCED_BY_A_SHELL: [&str; 3] = [
+    ".config/uwsm/",
+    ".makepkg.conf",
+    ".config/pacman/makepkg.conf",
+];
+
 /// The files, by the path the AI is sent them under, that may hold the
 /// owner's own settings: in the home, and of an item of a kind in
 /// `SETTING_CATEGORIES` that the catalogue found itself. A file reached by
@@ -128,22 +138,31 @@ const SETTING_CATEGORIES: [Category; 3] = [Category::Shell, Category::LocalBin, 
 /// under a name Guardian watches on `PATH` (`sudo`, `ssh`, `git`,
 /// `omarchy-…`): a fake `sudo` in the home is how a password is taken, and
 /// the reviewer's grade alone must not clear it. So is a file that an item
-/// of any other kind also stands for. So is a file that leads to a
-/// binary only the reviewer's word flags (see `launchers_of_word_alone`).
-/// So, last, is a file an item of any other kind starts, directly or
-/// through others (see `started_by_other_kinds`).
+/// of any other kind also stands for, and a start-up file in
+/// `NOT_SOURCED_BY_A_SHELL`. So is a file that leads to a binary only the
+/// reviewer's word flags (see `launchers_of_word_alone`). So, last, is a
+/// file an item of any other kind starts, directly or through others (see
+/// `started_by_other_kinds`); when that cannot be told, no file is a
+/// setting.
 fn setting_paths(collection: &Collection, home: Option<&str>) -> HashSet<String> {
+    let Some(started) = started_by_other_kinds(collection, home) else {
+        return HashSet::new();
+    };
     let launchers = launchers_of_word_alone(collection);
-    let started = started_by_other_kinds(collection);
     let mut allowed = HashSet::new();
     let mut refused = HashSet::new();
     for item in &collection.items {
         let path = shown_path(checked_path(item), home);
         let watched =
             item.category == Category::LocalBin && super::path::is_watched(file_name(&item.path));
+        let sourced_unasked = NOT_SOURCED_BY_A_SHELL.iter().any(|place| {
+            path.strip_prefix("~/")
+                .is_some_and(|rest| rest.starts_with(place))
+        });
         if path.starts_with("~/")
             && item.run_by.is_none()
             && !watched
+            && !sourced_unasked
             && !launchers.contains(item.path.as_str())
             && !started.contains(item.path.as_str())
             && SETTING_CATEGORIES.contains(&item.category)
@@ -158,15 +177,25 @@ fn setting_paths(collection: &Collection, home: Option<&str>) -> HashSet<String>
 }
 
 /// The paths of the items that an item of a kind outside
-/// `SETTING_CATEGORIES` leads to: what it runs, what that runs, and so on.
-/// The catalogue lists `~/.local/bin` itself, so a program there has no
-/// `run_by` even when a user unit or a Hyprland `exec-once` line starts it
-/// at login; only `Collection::runners` holds that. Such a program starts
-/// on its own and is never a setting, even one an owner wrote: on
-/// 2026-10-30 the owner chose this over sparing what a desktop URL handler
-/// runs, so `~/.local/bin/claude`, which `claude-cli://` links start,
-/// stays an alert until `sweep allow` records it.
-fn started_by_other_kinds(collection: &Collection) -> HashSet<&str> {
+/// `SETTING_CATEGORIES`, or any item outside the home, leads to: what it
+/// runs, what that runs, and so on. The catalogue lists `~/.local/bin`
+/// itself, so a program there has no `run_by` even when a user unit or a
+/// Hyprland `exec-once` line starts it at login; only `Collection::runners`
+/// holds that. Such a program starts on its own and is never a setting,
+/// even one an owner wrote: on 2026-10-30 the owner chose this over
+/// sparing what a desktop URL handler runs, so `~/.local/bin/claude`, which
+/// `claude-cli://` links start, stays an alert until `sweep allow` records
+/// it. Every item outside the home counts, whatever its kind: root's
+/// crontab or `/etc/profile.d` may run a home program, and root's results
+/// keep only the first launcher of each item (see `root::merge`).
+///
+/// `None` when the walk reaches a script `bound_scripts` did not look
+/// through: what that script starts is not known, so any file in the
+/// home may be one of them.
+fn started_by_other_kinds<'a>(
+    collection: &'a Collection,
+    home: Option<&str>,
+) -> Option<HashSet<&'a str>> {
     let mut leads: HashMap<&str, Vec<&str>> = HashMap::new();
     for (target, runners) in &collection.runners {
         for runner in runners {
@@ -176,13 +205,15 @@ fn started_by_other_kinds(collection: &Collection) -> HashSet<&str> {
                 .push(target.as_str());
         }
     }
-    let mut started = HashSet::new();
-    let mut next: Vec<&str> = collection
+    let in_home = |path: &str| home.is_some_and(|home| path.starts_with(&format!("{home}/")));
+    let seeds: HashSet<&str> = collection
         .items
         .iter()
-        .filter(|item| !SETTING_CATEGORIES.contains(&item.category))
+        .filter(|item| !SETTING_CATEGORIES.contains(&item.category) || !in_home(&item.path))
         .map(|item| item.path.as_str())
         .collect();
+    let mut started: HashSet<&str> = HashSet::new();
+    let mut next: Vec<&str> = seeds.iter().copied().collect();
     while let Some(path) = next.pop() {
         for target in leads.get(path).into_iter().flatten() {
             // A path already in `started` was walked from there.
@@ -191,7 +222,14 @@ fn started_by_other_kinds(collection: &Collection) -> HashSet<&str> {
             }
         }
     }
-    started
+    let capped = collection.items.iter().any(|item| {
+        (started.contains(item.path.as_str()) || seeds.contains(item.path.as_str()))
+            && item
+                .notes
+                .iter()
+                .any(|note| note.strip_prefix(NOT_ALL_FOLLOWED) == Some(CHAIN_CAPPED))
+    });
+    (!capped).then_some(started)
 }
 
 /// The paths of the items that lead to a binary for which
@@ -283,7 +321,7 @@ fn examine(
             report.gaps.extend(
                 item.notes
                     .iter()
-                    .filter_map(|note| note.strip_prefix(collect::NOT_ALL_FOLLOWED))
+                    .filter_map(|note| note.strip_prefix(NOT_ALL_FOLLOWED))
                     .map(|limit| Gap::Sweep(format!("{label}: not followed past {limit}"))),
             );
         }

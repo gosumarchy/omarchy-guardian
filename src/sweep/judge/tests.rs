@@ -6,9 +6,11 @@ use crate::report::LocalFinding;
 use crate::report::{Report, ReviewScope};
 use crate::rules::RuleId;
 use crate::sweep::nvim::{self, Review};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use crate::sweep::collect::{self, Body, Collection, Item, Origin, Scope};
+use crate::sweep::collect::{
+    self, Body, CHAIN_CAPPED, Collection, Item, NOT_ALL_FOLLOWED, Origin, Scope,
+};
 use crate::sweep::index::PackageIndex;
 use crate::sweep::tier::Tier;
 use crate::test_support::TempDir;
@@ -2272,19 +2274,52 @@ fn a_program_that_starts_on_its_own_is_not_a_setting() {
             bin("inner"),
             // Only an alias in a start-up file runs it.
             bin("aliased"),
+            // A start-up file outside the home runs it: root's, or one
+            // root's results kept as the only launcher.
+            item("root/.bashrc", Category::Shell, Tier::Unknown),
+            bin("rooted"),
+            // Start-up files no shell the owner opens reads.
+            item("home/u/.config/uwsm/env", Category::Shell, Tier::Unknown),
+            item("home/u/.makepkg.conf", Category::Shell, Tier::Unknown),
         ],
         runners: [
             ("sync-helper", "home/u/.config/systemd/user/sync.service"),
             ("outer", "home/u/.config/hypr/autostart.lua"),
             ("inner", "home/u/.local/bin/outer"),
+            // A cycle back: the walk ends, and both stay refused.
+            ("outer", "home/u/.local/bin/inner"),
             ("aliased", "home/u/.bashrc"),
+            ("rooted", "root/.bashrc"),
         ]
         .into_iter()
-        .map(|(name, by)| (format!("home/u/.local/bin/{name}"), vec![by.to_string()]))
-        .collect(),
+        .fold(HashMap::new(), |mut runners, (name, by)| {
+            runners
+                .entry(format!("home/u/.local/bin/{name}"))
+                .or_insert_with(Vec::new)
+                .push(by.to_string());
+            runners
+        }),
         ..Collection::default()
     };
     let mut paths: Vec<String> = setting_paths(&collection, home).into_iter().collect();
     paths.sort();
     assert_eq!(paths, ["~/.bashrc", "~/.local/bin/aliased"]);
+}
+
+#[test]
+fn a_chain_not_followed_to_its_end_leaves_no_setting() {
+    // What the capped script starts is not known: it may be any file in
+    // the home, so none is shown as a setting.
+    let mut capped = item("home/u/.cache/s4", Category::Systemd, Tier::Unknown);
+    capped
+        .notes
+        .push(format!("{NOT_ALL_FOLLOWED}{CHAIN_CAPPED}"));
+    let collection = Collection {
+        items: vec![
+            item("home/u/.bashrc", Category::Shell, Tier::Unknown),
+            capped,
+        ],
+        ..Collection::default()
+    };
+    assert!(setting_paths(&collection, Some("home/u")).is_empty());
 }

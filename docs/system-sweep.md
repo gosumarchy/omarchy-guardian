@@ -1781,8 +1781,8 @@ of this holds:
 - the finding is graded `low`;
 - no `medium` or `high` finding, from any part of the review, names the same
   file;
-- every file it names is in your home (shown as `~/…`), was sent in that AI
-  request, and is a shell start-up file, a program in a directory of your
+- every file it names is in your home (shown as `~/…`), at least one of them
+  was sent in that AI request, and each is a shell start-up file, a program in a directory of your
   `PATH` (`~/.local/bin` and the like), or an entry an AI coding agent starts
   (a Claude Code hook, a plugin's hook), as the sweep finds it itself: a
   script one of these runs or sources is not one, nor is a start-up file that
@@ -1796,10 +1796,16 @@ of this holds:
   the rest are where persistence lives, and one claim must never turn such a
   finding into a clear sweep. An agent's hook runs on its own too; that risk
   was accepted for the plugin hooks settings came up in;
-- nothing of those other kinds starts the file, directly or through another
-  file: a program in `~/.local/bin` that a user unit, an autostart entry, a
-  Hyprland line or a desktop URL handler runs starts without you typing it,
-  so it stays an alert (`sweep allow` records one you know);
+- nothing of those other kinds, and nothing outside your home, starts the
+  file, directly or through another file: a program in `~/.local/bin` that a
+  user unit, an autostart entry, a Hyprland line, a desktop URL handler or
+  root's crontab runs starts without you typing it, so it stays an alert
+  (`sweep allow` records one you know). The start-up files uwsm sources
+  (`~/.config/uwsm/`) and makepkg's (`~/.makepkg.conf`,
+  `~/.config/pacman/makepkg.conf`) are read without a shell being opened, and
+  stay alerts too. When the sweep stopped following a chain of scripts
+  before its end, what that chain starts is not known, and no file is shown
+  as a setting in that sweep;
 - the file does not lead to a program an AUR or `pacman -U` package
   installed, directly, through a script, or as a second wrapper of it: no
   local rule flags such a program, so the mark would leave it with no alert;
