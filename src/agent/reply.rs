@@ -7,7 +7,8 @@ use crate::report::Severity;
 use crate::tools::Failure;
 
 use super::provider::{
-    content_rejected, is_login_failure, out_of_time, rejects_content, rejects_input,
+    asks_to_slow_down, content_rejected, is_login_failure, out_of_time, rejects_content,
+    rejects_input,
 };
 use super::{
     ADDRESSED_FIELD, ADDRESSED_FILE, ADDRESSED_TITLE, AgentError, AgentFinding, AgentReview,
@@ -89,7 +90,7 @@ pub(super) fn claude_verdict(
         }
         return Err(match failure {
             Some(Failure::TimedOut) if delivered => AgentError::OutOfTime(out_of_time()),
-            Some(failure) if delivered => {
+            Some(failure) if delivered && !asks_to_slow_down(&failure.to_string()) => {
                 AgentError::Invalid(failed_after_delivery(&failure.to_string()))
             }
             Some(failure) => unavailable(failure),
@@ -120,14 +121,16 @@ pub(super) fn claude_verdict(
         let detail = failure.to_string();
         // A model that saw the source and then declined or failed is not an
         // absent reviewer: content crafted to trigger a refusal must not
-        // turn a review into a warning.
+        // turn a review into a warning. A rate, spend or usage limit or an
+        // overload is the provider's or the account's, even when the CLI
+        // wrote it as a turn of the model's.
         let delivered = delivered
             || result
                 .get("usage")
                 .and_then(|usage| usage.get("output_tokens"))
                 .and_then(Json::as_u64)
                 .is_some_and(|tokens| tokens > 0);
-        return Err(if delivered {
+        return Err(if delivered && !asks_to_slow_down(&detail) {
             AgentError::Invalid(failed_after_delivery(&detail))
         } else if rejects_input(&detail) {
             AgentError::Invalid(Error::Message(format!(
@@ -257,6 +260,7 @@ pub(super) fn verdict(
 
     if events.delivered
         && let Some(message) = &events.error
+        && !asks_to_slow_down(message)
     {
         return Err(AgentError::Invalid(failed_after_delivery(message)));
     }
