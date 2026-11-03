@@ -1189,6 +1189,9 @@ fn a_provider_that_refuses_the_source_is_no_absent_reviewer() {
         "rate_limit_error: too many requests to the content filter",
         "Rate limit reached, please try again in 20s",
         "You exceeded your current quota, please check your plan",
+        "You've hit your monthly spend limit · raise it at https://claude.ai/settings/usage?from=cc_cli_limit_message · your weekly limit resets 4am (Europe/Athens)",
+        "You've hit your limit · resets 8pm (Europe/Athens)",
+        "Free usage limit reached",
         "Credit balance is too low",
         "ProviderModelNotFoundError: no such model",
         "API Error: 500 Internal server error",
@@ -1351,5 +1354,112 @@ fn a_failed_login_after_the_hand_over_says_to_log_in_and_still_blocks() {
         );
         let said = message(claude_verdict(&failed, None, "n1"));
         assert!(said.contains("saw the source"), "{said}");
+    }
+}
+
+#[test]
+fn a_spend_or_rate_limit_after_the_hand_over_stays_an_absent_reviewer() {
+    for limit in [
+        "You've hit your monthly spend limit · raise it at https://claude.ai/settings/usage?from=cc_cli_limit_message · your weekly limit resets 4am (Europe/Athens)",
+        "You've hit your limit · resets 8pm (Europe/Athens)",
+        "Free usage limit reached",
+        "Your daily limit has been reached",
+        "Your monthly limit has been reached",
+        "Credit balance is too low",
+        "API Error: 429 rate_limit_error: This request would exceed your rate limit",
+        "API Error: 529 Overloaded",
+        "Rate limit reached, please try again in 20s",
+        "You exceeded your current quota, please check your plan",
+        "Request was throttled",
+        "Too many tokens, please wait",
+        "exceeded model token limit, please wait",
+    ] {
+        assert!(super::provider::asks_to_slow_down(limit), "{limit}");
+        assert!(!super::provider::rejects_input(limit), "{limit}");
+        // Claude Code writes its own limit message as a synthetic turn of
+        // the model's before the error result.
+        let claude = format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"model\":\"<synthetic>\",\"content\":[{{\"type\":\"text\",\"text\":{0}}}]}}}}\n\
+             {{\"type\":\"result\",\"is_error\":true,\"result\":{0}}}\n",
+            Json::from(limit)
+        );
+        assert!(
+            matches!(
+                claude_verdict(&claude, None, "n1"),
+                Err(AgentError::Unavailable(_))
+            ),
+            "{limit}"
+        );
+        // Without a result event, as the failure of a run that printed an
+        // assistant event first.
+        let without_result =
+            "{\"type\":\"assistant\",\"message\":{\"model\":\"<synthetic>\",\"content\":[]}}\n";
+        assert!(
+            matches!(
+                claude_verdict(
+                    without_result,
+                    Some(Failure::Failed(limit.to_string())),
+                    "n1"
+                ),
+                Err(AgentError::Unavailable(_))
+            ),
+            "{limit}"
+        );
+        // OpenCode starts a step before the provider answers with a limit.
+        let opencode = format!(
+            "{{\"type\":\"step_start\"}}\n{{\"type\":\"error\",\"error\":{{\"data\":{{\"message\":{}}}}}}}\n",
+            Json::from(limit)
+        );
+        assert!(
+            matches!(
+                verdict(scan_events(&opencode), None, "n1"),
+                Err(AgentError::Unavailable(_))
+            ),
+            "{limit}"
+        );
+    }
+    // A refusal that speaks of retrying, of waiting, of a quota or of an
+    // overload after the hand-over is still a refusal, never a slow-down.
+    for refused in [
+        "Your prompt was flagged as violating our usage policy. Please try again with a different prompt.",
+        "content_filter: the request was blocked. Please wait and try again later.",
+        "Rejected by our safety system (request 4290 of your quota was not charged)",
+        "The model is overloaded with requests like this one, which violate the content policy",
+    ] {
+        assert!(!super::provider::asks_to_slow_down(refused), "{refused}");
+        let claude = format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"content\":[]}}}}\n{{\"type\":\"result\",\"is_error\":true,\"result\":{}}}\n",
+            Json::from(refused)
+        );
+        assert!(
+            matches!(
+                claude_verdict(&claude, None, "n1"),
+                Err(AgentError::Invalid(_))
+            ),
+            "{refused}"
+        );
+        let without_result = "{\"type\":\"assistant\",\"message\":{\"content\":[]}}\n";
+        assert!(
+            matches!(
+                claude_verdict(
+                    without_result,
+                    Some(Failure::Failed(refused.to_string())),
+                    "n1"
+                ),
+                Err(AgentError::Invalid(_))
+            ),
+            "{refused}"
+        );
+        let opencode = format!(
+            "{{\"type\":\"step_start\"}}\n{{\"type\":\"error\",\"error\":{{\"data\":{{\"message\":{}}}}}}}\n",
+            Json::from(refused)
+        );
+        assert!(
+            matches!(
+                verdict(scan_events(&opencode), None, "n1"),
+                Err(AgentError::Invalid(_))
+            ),
+            "{refused}"
+        );
     }
 }

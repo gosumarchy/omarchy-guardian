@@ -14,11 +14,11 @@ pub(super) fn out_of_time() -> Error {
 /// the model. That is the source's doing, not an absent reviewer: a file
 /// made to overflow the model must not turn a review into a warning.
 pub(super) fn rejects_input(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
     // A provider asking to slow down speaks of tokens too.
-    if asks_to_slow_down(&message) {
+    if asks_to_slow_down(message) {
         return false;
     }
+    let message = message.to_ascii_lowercase();
     [
         "prompt is too long",
         "prompt too long",
@@ -40,12 +40,22 @@ pub(super) fn rejects_input(message: &str) -> bool {
     .any(|sign| message.contains(sign))
 }
 
-/// Whether a lowercased provider error is a rate limit, a quota or an
-/// overload: reasons to come back later, never the source's doing.
-fn asks_to_slow_down(message: &str) -> bool {
-    [
+/// Whether a provider's or CLI's error is a rate, spend or usage limit, a
+/// quota or an overload: reasons to come back later, never the source's
+/// doing. A refusal that also speaks of retrying or of a quota is still a
+/// refusal (see `rejects_content`).
+pub(super) fn asks_to_slow_down(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    ([
         "rate limit",
         "rate_limit",
+        "spend limit",
+        "usage limit",
+        "weekly limit",
+        "daily limit",
+        "monthly limit",
+        "hit your limit",
+        "credit balance",
         "throttl",
         "please wait",
         "try again",
@@ -53,7 +63,9 @@ fn asks_to_slow_down(message: &str) -> bool {
         "overloaded",
     ]
     .iter()
-    .any(|sign| message.contains(sign))
+    .any(|sign| lower.contains(sign))
+        || is_marked_slow_down(&lower))
+        && !rejects_content(message)
 }
 
 /// Whether a provider's error says it refused what it was sent: a safety

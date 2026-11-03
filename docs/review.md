@@ -153,8 +153,8 @@ A provider that answers that the request is too long for the model is not
 unavailable: the review is invalid, which blocks as `INCOMPLETE` in every
 class. So is one that refuses what it was sent (a usage-policy or safety
 refusal, a content filter, a guardrail): a source can be written to be
-refused. A network or login error, a rate limit and an overloaded provider
-stay unavailable. A run that times out before the model starts on the source
+refused. A network or login error, a rate, spend or usage limit and an
+overloaded provider stay unavailable. A run that times out before the model starts on the source
 is unavailable. One that times out after the model had it is not, since a
 source can be written to keep a reviewer busy: that review is invalid too,
 except for the `official` class, whose content nobody writing such a source
