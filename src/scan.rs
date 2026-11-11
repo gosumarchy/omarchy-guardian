@@ -897,7 +897,7 @@ mod tests {
         // than a path may be. Where the kernel still checks each path by
         // its full name (AppArmor in a hosted CI container does), making a
         // directory fails with ENAMETOOLONG near 4096 bytes. The tree then
-        // stops there, which is still past the walk's limit of 256.
+        // stops there, which is still past the walk's depth limit.
         let mut level = fs::File::open(dir.path().join(".git")).unwrap();
         let mut depth = 0;
         while depth < 3000 {
@@ -911,7 +911,10 @@ mod tests {
             };
             depth += 1;
         }
-        assert!(depth * 2 > 256, "only {depth} levels could be made");
+        assert!(
+            depth * 2 > super::MAX_DIRECTORY_DEPTH,
+            "only {depth} levels could be made"
+        );
         let (texts, _, gaps) = walk_texts(&ScanConfig::new(dir.path().to_path_buf()));
         assert!(texts.iter().any(|text| text == "a.sh"), "{texts:?}");
         assert!(

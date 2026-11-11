@@ -4696,10 +4696,10 @@ fn past_a_number_the_accounts_set_id_files_are_counted() {
     for index in 0..1_001 {
         let path = root.join(format!("var/tmp/{index}"));
         setuid_file(&path);
-        // Run as root, the files would be root's own, which are never cut.
+        // Made by root, the files are root's own, which are never cut.
         // Give them to an account (nobody), then set the bits again, since
         // a change of owner clears them.
-        if crate::user::real_uid() == Some(0) {
+        if fs::metadata(&path).unwrap().uid() == 0 {
             std::os::unix::fs::chown(&path, Some(65_534), Some(65_534)).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o4755)).unwrap();
         }
