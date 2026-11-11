@@ -894,14 +894,24 @@ mod tests {
         fs::create_dir(dir.path().join(".git")).unwrap();
         fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         // Built through the open directory: the whole path is far longer
-        // than a path may be.
+        // than a path may be. Where the kernel still checks each path by
+        // its full name (AppArmor in a hosted CI container does), making a
+        // directory fails with ENAMETOOLONG near 4096 bytes. The tree then
+        // stops there, which is still past the walk's limit of 256.
         let mut level = fs::File::open(dir.path().join(".git")).unwrap();
-        for _ in 0..3000 {
+        let mut depth = 0;
+        while depth < 3000 {
             let handle = super::fd_path(&level);
-            fs::create_dir_all(handle.join("modules/a")).unwrap();
-            fs::write(handle.join("modules/a/HEAD"), "").unwrap();
-            level = fs::File::open(handle.join("modules/a")).unwrap();
+            let next = fs::create_dir_all(handle.join("modules/a"))
+                .and_then(|()| fs::write(handle.join("modules/a/HEAD"), ""))
+                .and_then(|()| fs::File::open(handle.join("modules/a")));
+            level = match next {
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidFilename => break,
+                next => next.unwrap(),
+            };
+            depth += 1;
         }
+        assert!(depth * 2 > 256, "only {depth} levels could be made");
         let (texts, _, gaps) = walk_texts(&ScanConfig::new(dir.path().to_path_buf()));
         assert!(texts.iter().any(|text| text == "a.sh"), "{texts:?}");
         assert!(
