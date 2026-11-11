@@ -766,6 +766,9 @@ fn a_line_that_only_sets_a_variable_to_a_literal_is_told_from_a_command() {
         "set -x fish_user_paths x",
         "env = LD_PRELOAD,x.so",
         "https_proxy=10.0.0.1:3128",
+        // A secret word in a name that runs a program for its value.
+        "RESTIC_PASSWORD_COMMAND=helperbin",
+        "SOPS_AGE_KEY_CMD=agehelperbin",
     ] {
         assert!(!sets_a_variable(line), "{line}");
     }
@@ -1137,6 +1140,84 @@ fn only_a_plain_literal_is_taken_out_and_a_command_never_is() {
     ] {
         assert_eq!(without_secrets(line), line);
     }
+}
+
+#[test]
+fn a_variable_that_loads_code_keeps_its_value_whatever_its_name_says() {
+    use super::without_secrets;
+    // `KEY`, `PASSWORD` and `PASS` are in these names, but the values say
+    // which git setting is made or which command runs.
+    for line in [
+        "export GIT_CONFIG_KEY_0=include.path\n",
+        "GIT_CONFIG_KEY_1=core.fsmonitor\n",
+        "Environment=GIT_CONFIG_KEY_0=core.hooksPath\n",
+        "set -gx GIT_CONFIG_KEY_0 core.fsmonitor\n",
+        "export RESTIC_PASSWORD_COMMAND=helperbinary\n",
+        "SOPS_AGE_KEY_CMD=agehelperbin\n",
+        "export PASS_PROXY=proxyhost:3128\n",
+        // Named in camelCase, as in git's and ssh's configuration.
+        "\tdefaultKeyCommand = evilhelper\n",
+        "\taskPass = evilaskpass\n",
+        "SecurityKeyProvider=libevilsk.so\n",
+        "export passwordCommand=evilhelper\n",
+        // A program or a file the tool runs.
+        "export CARGO_REGISTRY_CREDENTIAL_PROVIDER=cargo-credential-evil\n",
+        "export ANSIBLE_VAULT_PASSWORD_FILE=vault-client.py\n",
+        // An assignment inside the value of one that loads code.
+        "export GIT_SSH_COMMAND=\"ssh -oSecurityKeyProvider=libevilsk.so\"\n",
+        "export GIT_CONFIG_PARAMETERS=\"'gpg.ssh.defaultKeyCommand=evilhelper'\"\n",
+        "set -gx GIT_SSH_COMMAND \"ssh -oSecurityKeyProvider=libevilsk.so\"\n",
+        "alias g='git -c core.askPass=evilaskpass'\n",
+        "export PROMPT_COMMAND=\"KEY=payload12 x\"\n",
+        "Environment=\"GIT_SSH_COMMAND=ssh -oSecurityKeyProvider=libevilsk.so\"\n",
+        // A quote left open, and a value at the end of the text.
+        "export PROMPT_COMMAND=\"echo KEY=payload12\n",
+        "export PROMPT_COMMAND=\"KEY=payload12 x\"",
+        // A number after the ending, and endings that name a place or a loader.
+        "export TOKEN_CMD_1=helperbinary\n",
+        "SECRET_LOADER=evilloader\n",
+        "AUTH_PLUGIN=evilplugin\n",
+        "PASSWORD_BIN=evilbinary\n",
+        "CREDENTIALS_DIRECTORY=evildirectory\n",
+        // A value marked as a command, or naming a file.
+        "api_key = \"cmd:evilhelper\"\n",
+        "export API_KEY=EXEC:evilhelper\n",
+        "export SSH_KEY=plugins/evil.so\n",
+        "LoadCredential=token:/etc/evil.sock\n",
+        // An unclosed quote with a character of more than one byte.
+        "export PROMPT_COMMAND=\"\u{e9}\n",
+        "export PROMPT_COMMAND=\"\u{e9}",
+    ] {
+        assert_eq!(without_secrets(line), line);
+    }
+    // After a closed value that loads code, a secret on the same line goes.
+    let masked = without_secrets("PROMPT_COMMAND=\"x\" API_KEY=\"hunter2hunter2\"\n");
+    assert!(masked.starts_with("PROMPT_COMMAND=\"x\""), "{masked}");
+    assert!(!masked.contains("hunter2"), "{masked}");
+    // fish's `set` takes out only a value whose quotes match.
+    for (line, taken) in [
+        ("set -gx API_TOKEN 'abcdefgh12345'\n", true),
+        ("set -gx API_TOKEN 'unclosed12345\n", false),
+    ] {
+        assert_eq!(
+            without_secrets(line).contains(super::REDACTED),
+            taken,
+            "{line}"
+        );
+    }
+    // A name whose last part keeps a value still has it taken out, a
+    // base64 key with a `/` in it too.
+    for line in [
+        "SECRET_KEY_BASE=abcdefgh1234\n",
+        "export githubToken=ghp_abcdefgh\n",
+        "export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n",
+    ] {
+        assert!(without_secrets(line).contains(super::REDACTED), "{line}");
+    }
+    // A secret beside them still goes.
+    let masked = without_secrets("GIT_CONFIG_KEY_0=include.path API_KEY=hunter2hunter2\n");
+    assert!(masked.contains("include.path"), "{masked}");
+    assert!(!masked.contains("hunter2"), "{masked}");
 }
 
 #[test]
@@ -2283,4 +2364,27 @@ fn files_no_shell_reads_at_start_are_not_settings() {
         .into_iter()
         .collect();
     assert_eq!(paths, ["~/.config/fish/config.fish"]);
+}
+
+#[test]
+fn an_item_the_live_checks_left_unread_is_not_sent_to_root() {
+    use crate::sweep::live::NOT_READ_PAST_LIMIT;
+    let unread = |reason: &str| Item {
+        body: Body::Unreadable(reason.into()),
+        ..item("tmp/big", Category::Setuid, Tier::Unknown)
+    };
+    for (reason, said) in [
+        (NOT_READ_PAST_LIMIT, "limit of 256 files was reached"),
+        ("permission denied", "run `omarchy-guardian sweep --root`"),
+    ] {
+        let collection = Collection {
+            items: vec![unread(reason)],
+            ..Collection::default()
+        };
+        let mut report = Report::new("t", ReviewScope::default());
+        super::examine(&mut report, &collection, Some("home/u"), &HashSet::new());
+        let gaps: Vec<String> = report.gaps.iter().map(ToString::to_string).collect();
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(gaps[0].contains(said), "{gaps:?}");
+    }
 }

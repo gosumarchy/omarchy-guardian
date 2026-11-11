@@ -1,6 +1,7 @@
 //! How far an installed file can be trusted, from what pacman recorded.
 
 use super::index::{PackageIndex, Recorded};
+use super::read;
 use crate::integrations::SESSION_ENV;
 use crate::paths::file_name;
 use crate::sha256::{Digest, Sha256};
@@ -139,7 +140,11 @@ pub(super) fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex)
                     && *mode & SECURITY_BITS == actual & SECURITY_BITS
                     && !is_closed(path, actual, index)
             }
-            (Recorded::Link(recorded), Observed::Link { target, .. }) => recorded == target,
+            // The observed text is `read::link_text`'s; pacman records the
+            // target itself.
+            (Recorded::Link(recorded), Observed::Link { target, .. }) => {
+                read::link_path(target).is_some_and(|target| target == *recorded)
+            }
             _ => false,
         };
         return match observed {
@@ -184,9 +189,9 @@ pub(super) fn classify(path: &str, observed: Observed<'_>, index: &PackageIndex)
             target,
             resolved: Some(tier @ (Tier::Vendor | Tier::UserBuilt | Tier::Inert)),
             alias,
-        } if (alias || same_unit(name, target))
-            && enables_a_unit(path, target)
-            && !ROOT_SHELL_UNITS.contains(&name) =>
+        } if read::link_path(target).is_some_and(|target| {
+            (alias || same_unit(name, &target)) && enables_a_unit(path, &target)
+        }) && !ROOT_SHELL_UNITS.contains(&name) =>
         {
             tier
         }
@@ -516,7 +521,7 @@ mod tests {
         let copy = Sha256::digest(b"override");
         let example = Sha256::digest(b"example");
         let mtree = format!(
-            "#mtree\n/set type=file mode=644\n./usr/bin/demo mode=755 sha256digest={abc}\n./usr/bin/su mode=4755 sha256digest={abc}\n./usr/lib/x.so type=link link=x.so.1\n./etc/demo.conf sha256digest={abc}\n./usr/share/demo/demo.conf sha256digest={copy}\n./usr/share/doc/demo/examples/sudoers sha256digest={example}\n./usr/lib/systemd/system/debug-shell.service sha256digest={abc}\n./usr/lib/systemd/system/sshd.service sha256digest={abc}\n./usr/share/libalpm/hooks/demo.hook sha256digest={abc}\n"
+            "#mtree\n/set type=file mode=644\n./usr/bin/demo mode=755 sha256digest={abc}\n./usr/bin/su mode=4755 sha256digest={abc}\n./usr/lib/x.so type=link link=x.so.1\n./usr/lib/b.so type=link link=b\\134x2d.so.1\n./etc/demo.conf sha256digest={abc}\n./usr/share/demo/demo.conf sha256digest={copy}\n./usr/share/doc/demo/examples/sudoers sha256digest={example}\n./usr/lib/systemd/system/debug-shell.service sha256digest={abc}\n./usr/lib/systemd/system/sshd.service sha256digest={abc}\n./usr/share/libalpm/hooks/demo.hook sha256digest={abc}\n"
         );
         let mut index = PackageIndex::with_foreign(HashSet::from(["aur-thing".to_string()]));
         index.add_for_test("demo", &mtree, &["etc/demo.conf"]);
@@ -627,6 +632,13 @@ mod tests {
             alias: false,
         };
         assert_eq!(classify("usr/lib/x.so", same, &index), Tier::Vendor);
+        // A target with a backslash is seen as `read::link_text` writes it.
+        let escaped = Observed::Link {
+            target: "b\\\\x2d.so.1",
+            resolved: None,
+            alias: false,
+        };
+        assert_eq!(classify("usr/lib/b.so", escaped, &index), Tier::Vendor);
     }
 
     #[test]
@@ -728,6 +740,16 @@ mod tests {
             classify(
                 &format!("{wants}/sshd.service"),
                 link("/usr/lib/systemd/system/sshd.service", vendor),
+                &index
+            ),
+            Tier::Vendor
+        );
+        // A unit name with `\x2d` in it, its link's text as
+        // `read::link_text` writes it.
+        assert_eq!(
+            classify(
+                &format!("{wants}/a\\x2db.service"),
+                link("/usr/lib/systemd/system/a\\\\x2db.service", vendor),
                 &index
             ),
             Tier::Vendor

@@ -19,8 +19,9 @@ jobs:
     steps:
       - name: Install toolchain and test tools
         # lua and openssh: the offline suite runs the Hyprland PATH file and
-        # the installer's release check (ssh-keygen) with them.
-        run: pacman -Syu --noconfirm --needed rust git libarchive shellcheck lua openssh
+        # the installer's release check (ssh-keygen) with them; python, a
+        # local web server for the theme and plugin logins.
+        run: pacman -Syu --noconfirm --needed rust git libarchive shellcheck lua openssh python
       # Pinned by commit: a tag can be moved.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

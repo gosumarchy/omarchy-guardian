@@ -419,7 +419,46 @@ impl Walker<'_> {
         true
     }
 
+    /// Whether `rel` is deeper than the walk goes, a gap when it is.
+    /// `git_module` counts the same way: it and `git_directory` call each
+    /// other for `.git/modules/a/modules/a/…`, and nothing else bounds that.
+    fn too_deep(&mut self, logical: &Path, rel: &str) -> bool {
+        let depth = if rel.is_empty() {
+            0
+        } else {
+            rel.matches('/').count() + 1
+        };
+        if depth <= MAX_DIRECTORY_DEPTH {
+            return false;
+        }
+        self.gaps.push(Gap::Io(Error::Message(format!(
+            "{}: more than {MAX_DIRECTORY_DEPTH} directories deep, not walked",
+            logical.display()
+        ))));
+        true
+    }
+
+    /// The names in a git directory's listing. An entry that cannot be
+    /// read and a name that is not UTF-8 are gaps: git reads them.
+    fn git_names(&mut self, listing: fs::ReadDir, logical: &Path) -> Vec<String> {
+        let mut names = Vec::new();
+        for entry in listing {
+            match entry.map(|entry| entry.file_name().into_string()) {
+                Ok(Ok(name)) => names.push(name),
+                Ok(Err(name)) => self
+                    .gaps
+                    .push(Gap::NonUtf8Name(logical.join(name).display().to_string())),
+                Err(error) => self.io_gap(logical, error),
+            }
+        }
+        names.sort();
+        names
+    }
+
     fn directory(&mut self, directory: &File, logical: &Path, rel: &str) {
+        if self.too_deep(logical, rel) {
+            return;
+        }
         let handle = fd_path(directory);
         let listing = match fs::read_dir(&handle) {
             Ok(listing) => listing,
@@ -497,6 +536,9 @@ impl Walker<'_> {
     /// A submodule's git directory under `modules`, or, for a submodule
     /// at a nested path (`vendor/lib`), the directories on the way to it.
     fn git_module(&mut self, access: &Path, logical: &Path, rel: &str, depth: usize) {
+        if self.too_deep(logical, rel) {
+            return;
+        }
         if depth >= MAX_MODULE_DEPTH {
             self.gaps.push(Gap::GitState(format!(
                 "{rel}: submodule directories nested too deep to review"
@@ -518,26 +560,23 @@ impl Walker<'_> {
             Ok(listing) => listing,
             Err(error) => return self.io_gap(logical, error),
         };
-        let mut names: Vec<String> = listing
-            .filter_map(Result::ok)
-            .filter_map(|entry| entry.file_name().into_string().ok())
-            .collect();
-        names.sort();
-        for name in names {
+        for name in self.git_names(listing, logical) {
             let child = access.join(&name);
             if is_git && git_state::OWN_DIRECTORIES.contains(&name.as_str()) {
                 continue;
             }
-            let Ok(metadata) = fs::symlink_metadata(&child) else {
-                continue;
-            };
-            // Git follows a link to a submodule's directory; the walk
-            // does not.
-            if metadata.file_type().is_symlink() {
-                if fs::metadata(&child).is_ok_and(|target| target.is_dir()) {
-                    self.gaps
-                        .push(Gap::Symlink(format!("{rel}/{name} (a linked submodule)")));
+            let metadata = match fs::symlink_metadata(&child) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    self.io_gap(&logical.join(&name), error);
+                    continue;
                 }
+            };
+            // Git follows a link here; the walk does not.
+            if metadata.file_type().is_symlink() {
+                self.gaps.push(Gap::Symlink(format!(
+                    "{rel}/{name} (a link among submodules)"
+                )));
                 continue;
             }
             // A file here is git's own state, not a submodule.
@@ -560,8 +599,9 @@ impl Walker<'_> {
     /// or submodule pointer), a linked `config` and linked hooks or
     /// submodules are gaps: git reads them and the walk cannot.
     fn git_directory(&mut self, access: &Path, logical: &Path, rel: &str) {
-        let Ok(metadata) = fs::symlink_metadata(access) else {
-            return;
+        let metadata = match fs::symlink_metadata(access) {
+            Ok(metadata) => metadata,
+            Err(error) => return self.io_gap(logical, error),
         };
         if !metadata.is_dir() {
             // A `.git` that is a file or a link points git at a directory
@@ -619,17 +659,13 @@ impl Walker<'_> {
                 }
             };
             let child_handle = fd_path(&child);
-            let mut names: Vec<String> = match fs::read_dir(&child_handle) {
-                Ok(listing) => listing
-                    .filter_map(Result::ok)
-                    .filter_map(|entry| entry.file_name().into_string().ok())
-                    .collect(),
+            let names = match fs::read_dir(&child_handle) {
+                Ok(listing) => self.git_names(listing, &logical.join(name)),
                 Err(error) => {
                     self.io_gap(&logical.join(name), error);
                     continue;
                 }
             };
-            names.sort();
             for entry in names {
                 let entry_rel = format!("{rel}/{name}/{entry}");
                 let entry_logical = logical.join(name).join(&entry);
@@ -730,6 +766,13 @@ impl Walker<'_> {
 
 /// How deep under `modules` a submodule's git directory is looked for.
 const MAX_MODULE_DEPTH: usize = 6;
+
+/// The deepest directory walked below the root. Each level holds an open
+/// directory and a few stack frames while the ones below it are walked, so
+/// a tree made thousands of levels deep overflowed the stack (a crash) or
+/// ran out of file descriptors (1024 by default). Arbitrary, and far deeper
+/// than any source tree (`node_modules` nests a few dozen levels).
+const MAX_DIRECTORY_DEPTH: usize = 256;
 
 /// A file with several links, and how its name makes it be read (its
 /// extension, and whether it is one that must be reviewed).
@@ -842,6 +885,97 @@ mod tests {
         let mut texts = Vec::new();
         let (snapshot, gaps) = walk(config, &mut |file| texts.push(file.rel.to_string()));
         (texts, snapshot, gaps)
+    }
+
+    #[test]
+    fn nested_submodule_git_directories_stop_at_the_limit() {
+        let dir = TempDir::new("deep-modules");
+        fs::write(dir.path().join("a.sh"), "echo a\n").unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        // Built through the open directory: the whole path is far longer
+        // than a path may be.
+        let mut level = fs::File::open(dir.path().join(".git")).unwrap();
+        for _ in 0..3000 {
+            let handle = super::fd_path(&level);
+            fs::create_dir_all(handle.join("modules/a")).unwrap();
+            fs::write(handle.join("modules/a/HEAD"), "").unwrap();
+            level = fs::File::open(handle.join("modules/a")).unwrap();
+        }
+        let (texts, _, gaps) = walk_texts(&ScanConfig::new(dir.path().to_path_buf()));
+        assert!(texts.iter().any(|text| text == "a.sh"), "{texts:?}");
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.to_string().contains("directories deep, not walked")),
+            "{gaps:?}"
+        );
+    }
+
+    #[test]
+    fn a_link_among_submodules_is_a_gap_whatever_it_leads_to() {
+        let dir = TempDir::new("module-link");
+        fs::write(dir.path().join("a.sh"), "echo a\n").unwrap();
+        // Inside the directories on the way to a submodule at `vendor/...`.
+        fs::create_dir_all(dir.path().join(".git/modules/vendor")).unwrap();
+        fs::write(dir.path().join("elsewhere"), "").unwrap();
+        symlink(
+            dir.path().join("elsewhere"),
+            dir.path().join(".git/modules/vendor/a"),
+        )
+        .unwrap();
+        symlink(
+            dir.path().join("gone"),
+            dir.path().join(".git/modules/vendor/b"),
+        )
+        .unwrap();
+        let (_, _, gaps) = walk_texts(&ScanConfig::new(dir.path().to_path_buf()));
+        let links = gaps
+            .iter()
+            .filter(|gap| gap.to_string().contains("a link among submodules"))
+            .count();
+        assert_eq!(links, 2, "{gaps:?}");
+    }
+
+    #[test]
+    fn a_git_hook_whose_name_is_not_utf8_is_a_gap() {
+        let dir = TempDir::new("hook-name");
+        fs::write(dir.path().join("a.sh"), "echo a\n").unwrap();
+        fs::create_dir_all(dir.path().join(".git/hooks")).unwrap();
+        let name = OsStr::from_bytes(b"pre-commit\xff");
+        fs::write(dir.path().join(".git/hooks").join(name), "#!/bin/sh\n").unwrap();
+        let (_, _, gaps) = walk_texts(&ScanConfig::new(dir.path().to_path_buf()));
+        assert!(
+            gaps.iter().any(|gap| matches!(gap, Gap::NonUtf8Name(_))),
+            "{gaps:?}"
+        );
+    }
+
+    #[test]
+    fn a_tree_deeper_than_the_limit_is_a_gap_not_a_crash() {
+        let dir = TempDir::new("deep");
+        let mut path = dir.path().to_path_buf();
+        for _ in 0..=super::MAX_DIRECTORY_DEPTH {
+            path.push("d");
+        }
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("x.sh"), "echo deep\n").unwrap();
+        // The deepest level the limit allows is still walked.
+        let mut shallow = dir.path().to_path_buf();
+        for _ in 0..super::MAX_DIRECTORY_DEPTH {
+            shallow.push("d");
+        }
+        fs::write(shallow.join("y.sh"), "echo y\n").unwrap();
+        let (texts, _, gaps) = walk_texts(&ScanConfig::new(dir.path().to_path_buf()));
+        assert!(
+            texts.iter().any(|text| text.ends_with("/y.sh")),
+            "{texts:?}"
+        );
+        assert!(!texts.iter().any(|text| text.ends_with("/x.sh")));
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.to_string().contains("directories deep, not walked")),
+            "{gaps:?}"
+        );
     }
 
     #[test]

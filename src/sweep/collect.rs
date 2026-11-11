@@ -321,7 +321,8 @@ pub(super) fn collect(scope: &Scope<'_>) -> Collection {
     collection.truncated.extend(unlisted);
     // What stands in for Guardian's own units, in the unit directories the
     // catalog does not walk.
-    for path in own::paths(scope) {
+    let (own_paths, own_not_read) = own::paths(scope);
+    for path in own_paths {
         paths.entry(path).or_insert(Category::Systemd);
     }
 
@@ -384,6 +385,7 @@ pub(super) fn collect(scope: &Scope<'_>) -> Collection {
     path::mark(scope, &search, &mut collection.items);
     mark_reach(&mut collection.items, &walk);
     collection.runners = walk.runners;
+    collection.items.extend(own_not_read);
     for item in &mut collection.items {
         // The package's own directory, and the one for shared data, may
         // hold a drop-in a repository package ships for every unit;
@@ -677,8 +679,11 @@ fn runs_of(
         let beside =
             (reader == Category::Shell).then(|| commands::with_script_directory(text, path, file));
         let text = beside.as_deref().unwrap_or(text);
+        // A set, not a search through `runs`: a crontab may have thousands
+        // of lines.
+        let mut known: HashSet<String> = runs.iter().cloned().collect();
         for run in commands::commands(reader, path, text) {
-            if !runs.contains(&run) {
+            if known.insert(run.clone()) {
                 runs.push(run);
             }
         }
@@ -763,7 +768,28 @@ pub(super) fn is_capped(item: &Item) -> bool {
 }
 
 /// Adds `items` to `collection`; an item already there by path gains the
-/// new one's notes and alerts instead of appearing twice.
+/// new one's notes and alerts instead of appearing twice (see `fold`).
+pub(super) fn merge(collection: &mut Collection, items: Vec<Item>) {
+    // Where each path's first item is: the live checks hand in thousands,
+    // and a search through the collection for each would be quadratic.
+    let mut at: HashMap<String, usize> = HashMap::with_capacity(collection.items.len());
+    for (index, item) in collection.items.iter().enumerate() {
+        at.entry(item.path.clone()).or_insert(index);
+    }
+    for item in items {
+        if let Some(&index) = at.get(&item.path) {
+            fold(&mut collection.items[index], item);
+        } else {
+            at.insert(item.path.clone(), collection.items.len());
+            collection.items.push(item);
+        }
+    }
+    collection
+        .items
+        .sort_by(|left, right| left.path.cmp(&right.path));
+}
+
+/// Gives `existing` the notes and alerts of `item`, found at its path.
 ///
 /// An item that was reached as configuration only stays that only while
 /// the new one was too: one another check found by itself (running, or as
@@ -771,37 +797,24 @@ pub(super) fn is_capped(item: &Item) -> bool {
 /// review go. And where a live check found a file whose kind keeps it from
 /// the review (a tool's settings, an SSH file), it is listed as what that
 /// check saw: a file something runs is read as a program.
-pub(super) fn merge(collection: &mut Collection, items: Vec<Item>) {
-    for item in items {
-        if let Some(existing) = collection
-            .items
-            .iter_mut()
-            .find(|existing| existing.path == item.path)
-        {
-            if configuration_of(&item).is_none() {
-                let kept = configuration_of(existing).is_some() || is_kept_by_kind(existing);
-                existing.notes.retain(|note| !is_configuration_note(note));
-                if kept && item.category.is_live() {
-                    existing.category = item.category;
-                }
-            }
-            for note in item.notes {
-                if !existing.notes.contains(&note) {
-                    existing.notes.push(note);
-                }
-            }
-            for alert in item.alerts {
-                if !existing.alerts.contains(&alert) {
-                    existing.alerts.push(alert);
-                }
-            }
-        } else {
-            collection.items.push(item);
+pub(super) fn fold(existing: &mut Item, item: Item) {
+    if configuration_of(&item).is_none() {
+        let kept = configuration_of(existing).is_some() || is_kept_by_kind(existing);
+        existing.notes.retain(|note| !is_configuration_note(note));
+        if kept && item.category.is_live() {
+            existing.category = item.category;
         }
     }
-    collection
-        .items
-        .sort_by(|left, right| left.path.cmp(&right.path));
+    for note in item.notes {
+        if !existing.notes.contains(&note) {
+            existing.notes.push(note);
+        }
+    }
+    for alert in item.alerts {
+        if !existing.alerts.contains(&alert) {
+            existing.alerts.push(alert);
+        }
+    }
 }
 
 /// Adds the files of `location` (under `prefix`, the home for user
@@ -855,6 +868,12 @@ fn add_location(
 pub(super) fn not_utf8(shown: &str) -> String {
     // A name may hold a newline, which would start a line of its own.
     format!("/{}{NOT_UTF8}", shown.escape_debug())
+}
+
+/// `not_utf8` for a path given as its bytes, each byte that is not
+/// printable ASCII escaped.
+pub(super) fn not_utf8_bytes(path: &[u8]) -> String {
+    format!("/{}{NOT_UTF8}", path.escape_ascii())
 }
 
 const NOT_UTF8: &str = ": a name that is not UTF-8 was not checked";

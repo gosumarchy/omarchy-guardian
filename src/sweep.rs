@@ -590,10 +590,13 @@ fn remembered(
         .map(|item| {
             let label = label(item);
             let mut fingerprint = state::fingerprint(item);
+            let known = previous.and_then(|previous| previous.get(&label));
             if fingerprint == state::UNREAD
-                && let Some(known) = previous.and_then(|previous| previous.get(&label))
+                && let Some(known) = known
             {
                 fingerprint.clone_from(known);
+            } else if let Some(kept) = state::past_limit(&fingerprint, known.map(String::as_str)) {
+                fingerprint = kept;
             } else if flagged.contains(&label) && !fingerprint.ends_with(state::FLAGGED) {
                 fingerprint.push_str(state::FLAGGED);
             }
@@ -1167,6 +1170,7 @@ mod tests {
     use super::collect::{Body, Collection, Item, Origin};
     use super::state::{self, Remembered};
     use crate::autorun::Category;
+    use crate::sha256::Sha256;
 
     fn entries(pairs: &[(&str, &str)]) -> Remembered {
         pairs
@@ -1182,13 +1186,38 @@ mod tests {
             category,
             path: path.into(),
             tier: super::tier::Tier::Unknown,
-            sha256: Some(crate::sha256::Sha256::digest(text.as_bytes())),
+            sha256: Some(Sha256::digest(text.as_bytes())),
             body: Body::Text(text.into()),
             runs: Vec::new(),
             run_by: None,
             notes: Vec::new(),
             alerts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn what_was_last_read_is_kept_for_an_item_left_unread_for_the_limit() {
+        let read = item("bin/x", Category::Program, "one");
+        let mut left = read.clone();
+        left.sha256 = None;
+        left.body = Body::Unreadable(super::live::NOT_READ_PAST_LIMIT.into());
+        let report = crate::report::Report::new("test", crate::report::ReviewScope::default());
+        let remember = |item: &Item, previous: Option<&Remembered>| {
+            let collection = Collection {
+                items: vec![item.clone()],
+                ..Collection::default()
+            };
+            super::remembered(&collection, &report, previous, |item| item.path.clone())
+        };
+        let first = remember(&read, None);
+        let second = remember(&left, Some(&first));
+        assert_eq!(
+            second["bin/x"],
+            format!("-limit:{}", Sha256::digest(b"one"))
+        );
+        // Read again with other content, it is told as changed.
+        let swapped = remember(&item("bin/x", Category::Program, "two"), Some(&second));
+        assert_eq!(state::diff(&second, &swapped).len(), 1);
     }
 
     #[test]

@@ -8,51 +8,7 @@ use super::{
     HYPR_LINE, INTERCEPTOR_LINE, Integration, MENU_ENTRY, Part, Paths, SESSION_ENV, State, Step,
     THEME_OVERRIDES, WRAPPED,
 };
-use crate::test_support::TempDir;
-
-fn paths(dir: &TempDir) -> Paths {
-    let root = dir.path();
-    fs::create_dir_all(root.join("share")).unwrap();
-    fs::create_dir_all(root.join("omarchy")).unwrap();
-    fs::write(root.join("share/guardian.hook"), "[Trigger]\n").unwrap();
-    fs::write(root.join("yay"), "").unwrap();
-    fs::write(root.join("installer"), "").unwrap();
-    Paths {
-        hook_source: root.join("share/guardian.hook"),
-        hook_target: root.join("hooks/guardian.hook"),
-        yay: root.join("yay"),
-        yay_config: root.join("yay.json"),
-        interceptor_installer: root.join("installer"),
-        bashrc: root.join("bashrc"),
-        omarchy: root.join("omarchy"),
-        menu: root.join("menu/omarchy-menu.jsonc"),
-        widget_source: root.join("share/bar-widget"),
-        widget_target: root.join("plugins/omarchy-guardian"),
-        shell_config: root.join("shell.json"),
-        waybar_config: root.join("waybar/config"),
-        waybar_style: root.join("waybar/style.css"),
-        opencode_missing: false,
-        sweep_timer: root.join("units/omarchy-guardian-sweep.timer"),
-        sweep_timer_link: root.join("user-wants/omarchy-guardian-sweep.timer"),
-        sweep_root_timer: root.join("units/omarchy-guardian-sweep-collect.timer"),
-        sweep_root_timer_link: root.join("system-wants/omarchy-guardian-sweep-collect.timer"),
-        sweep_consent: None,
-        sweep_group: Some("u".into()),
-        sweep_overrides: Vec::new(),
-        login_shell: Some("bash".into()),
-        makepkg_gate: root.join("guardian-makepkg"),
-        owner: std::os::unix::fs::MetadataExt::uid(&fs::metadata(root).unwrap()),
-        system_bin: root.join("bin"),
-        paru_config: root.join("paru.conf"),
-        shell_startup: vec![root.join("bashrc"), root.join("zshrc")],
-        path_dirs: Vec::new(),
-        manager_path: None,
-        wrappers: root.join("wrappers"),
-        session_env: root.join("uwsm/env.d/90-omarchy-guardian"),
-        hypr_config: root.join("hypr/hyprland.lua"),
-        hypr_path: root.join("hyprland-path.lua"),
-    }
-}
+use crate::test_support::{TempDir, integration_paths as paths};
 
 #[test]
 fn the_system_sweep_needs_its_timer_and_an_answer_about_root() {

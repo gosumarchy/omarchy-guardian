@@ -10,7 +10,11 @@ STAGE_ROOT=""
 PRESERVE_STAGE_ROOT=0
 SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
 
+# The file `shown_after` keeps a command's stderr in, while it runs.
+SHOWN_ERRORS=""
+
 cleanup_staging() {
+    [[ -z $SHOWN_ERRORS ]] || rm -f -- "$SHOWN_ERRORS"
     if [[ -z $STAGE_ROOT || ! -d $STAGE_ROOT ]]; then
         return
     fi
@@ -28,7 +32,8 @@ fail() {
 }
 
 [[ -x $GUARDIAN ]] || fail "Guardian is not installed at $GUARDIAN"
-[[ -x $OMARCHY_BIN_DIR/omarchy-theme-set ]] || fail "Omarchy theme commands are unavailable"
+[[ -x $OMARCHY_BIN_DIR/omarchy-theme-set && -x $OMARCHY_BIN_DIR/omarchy-git-url-check ]] ||
+    fail "Omarchy theme commands are unavailable"
 command -v git >/dev/null || fail "git is required"
 command -v flock >/dev/null || fail "flock is required"
 
@@ -38,8 +43,24 @@ if [[ $MODE != --guardian-commit-install && $MODE != --guardian-commit-update ]]
     flock 9
 fi
 
+# safe_stderr <command...>: runs the command with every byte it prints to
+# stderr outside printable ASCII made `?`. git prints names from the
+# repository (a path it refuses, a ref) and from the server (`remote:`
+# lines), and Omarchy's validator values from a manifest, with every byte
+# from 0x80 up as it is: C1 controls and bidi characters would reach the
+# terminal. A pipe, not a process substitution, so it is shown before the
+# messages after it (but see `stored_url`); pipefail keeps the command's
+# status. With stderr a pipe, git shows no progress while it clones.
+safe_stderr() {
+    { "$@" 2>&1 >&3 3>&- | LC_ALL=C tr -c '\n\t -~' '?' >&2 3>&-; } 3>&1
+}
+
+# No system or global git configuration, so nothing there (hooks, helpers,
+# URL rewrites) takes part in fetching untrusted code. Settings in the
+# caller's environment (`GIT_CONFIG_COUNT`) still apply: they are the
+# user's own.
 safe_git() {
-    env \
+    safe_stderr env \
         GIT_CONFIG_NOSYSTEM=1 \
         GIT_CONFIG_GLOBAL=/dev/null \
         GIT_TERMINAL_PROMPT=0 \
@@ -48,10 +69,323 @@ safe_git() {
         git "$@"
 }
 
-validate_remote() {
+# login_git <url> <git arguments...>: `safe_git` with <arguments...>, in
+# which the URL to fetch is `bare_url <url>`. The login of a web address is
+# handed to git by a credential helper from this one run's environment,
+# never in the URL: a redirect makes git print the URL it asked for whole
+# (`asked for: https://u:secret@host/r/info/refs`), and anyone may read a
+# process's arguments. The helper answers only the URL's own scheme and
+# host, so a redirect to another host is not handed the login. An ftp URL
+# keeps its login: ftp has no redirects, and git hands no helper's login
+# to an ftp server that turns it away.
+login_git() {
     local url=$1
-    /usr/share/omarchy/bin/omarchy-git-url-check "$url"
+    shift
+    local scheme=${url%%://*} rest=${url#*://}
+    local authority=${rest%%[/?#]*}
+    if [[ $url != *://* || ! ${scheme,,} =~ ^https?$ || $authority != *@* ]]; then
+        safe_git "$@"
+        return
+    fi
+    local login=${authority%@*}
+    # Run as `f get` by sh; git writes the scheme and host it asks for on
+    # its stdin, one `key=value` line each, up to an empty line.
+    # shellcheck disable=SC2016 # Expanded by the helper's shell, not here.
+    local helper='!f() { test "$1" = get || return 0; protocol= host=
+        while IFS= read -r line && test -n "$line"; do case $line in
+            protocol=*) protocol=${line#protocol=} ;; host=*) host=${line#host=} ;; esac; done
+        test "$protocol" = "$GUARDIAN_GIT_PROTOCOL" && test "$host" = "$GUARDIAN_GIT_HOST" || return 0
+        printf "username=%s\n" "$GUARDIAN_GIT_USER"
+        printf "password=%s\n" "$GUARDIAN_GIT_PASSWORD"; }; f'
+    (
+        # `without_login` checked that each decodes.
+        GUARDIAN_GIT_PROTOCOL=${scheme,,}
+        GUARDIAN_GIT_HOST=$(decoded "${authority##*@}")
+        GUARDIAN_GIT_USER=$(decoded "${login%%:*}")
+        # A user without a password is handed an empty one. Asked for a
+        # password, git would show the user in its prompt and pass it to an
+        # askpass program, and a token often stands as the user alone.
+        GUARDIAN_GIT_PASSWORD=
+        [[ $login != *:* ]] || GUARDIAN_GIT_PASSWORD=$(decoded "${login#*:}")
+        export GUARDIAN_GIT_PROTOCOL GUARDIAN_GIT_HOST GUARDIAN_GIT_USER GUARDIAN_GIT_PASSWORD
+        safe_git -c credential.helper= -c "credential.helper=$helper" "$@"
+    )
 }
+
+# bare_url <url>: <url> without the login of a web address (see
+# `login_git`).
+bare_url() {
+    local url=$1
+    local scheme=${url%%://*} rest=${url#*://}
+    local authority=${rest%%[/?#]*}
+    if [[ $url != *://* || ! ${scheme,,} =~ ^https?$ || $authority != *@* ]]; then
+        printf '%s' "$url"
+        return
+    fi
+    printf '%s://%s' "$scheme" "${authority##*@}${rest:${#authority}}"
+}
+
+# keep_login <url> <checkout>: makes <url> the origin of <checkout>, cloned
+# from `bare_url <url>`, so that an update logs in as the install did and
+# the identity is the one <url> gives. git takes a setting's value only
+# as an argument: the password is in the arguments of this one short run,
+# not in those of the clone, which runs for as long as the server likes.
+keep_login() {
+    [[ $(bare_url "$1") == "$1" ]] || safe_git -C "$2" config remote.origin.url "$1"
+}
+
+# decoded <text>: <text> with each `%XX` decoded, as git decodes a web
+# URL's login and host for its credential helper; a `%` without two hex
+# digits after it is kept. Fails on a control character (`%00`, `%0d`),
+# which a line of the credential protocol cannot hold.
+decoded() {
+    local text=$1 out="" hex byte
+    while [[ $text == *%* ]]; do
+        out+=${text%%\%*}
+        text=${text#*%}
+        hex=${text:0:2}
+        if [[ $hex == [0-9A-Fa-f][0-9A-Fa-f] ]]; then
+            [[ $hex != 00 ]] || return 1
+            printf -v byte "\\x$hex"
+            out+=$byte
+            text=${text:2}
+        else
+            out+=%
+        fi
+    done
+    out+=$text
+    local LC_ALL=C
+    [[ $out != *[$'\x01'-$'\x1f'$'\x7f']* ]] || return 1
+    printf '%s' "$out"
+}
+
+# stored_url <checkout> <remote>: the URL of <remote> exactly as git
+# stored it. `$(...)` would drop a trailing newline (git clones `src\n`,
+# not `src`), so it is read whole, and a URL that is not printable ASCII
+# fails (status 1, nothing printed).
+stored_url() {
+    local url
+    # Not waited for: an error of git's here may show after the next message.
+    IFS= read -r -d '' url < <(safe_git -C "$1" config -z --get "remote.$2.url") || return 1
+    [[ -n $url ]] && printable "$url" || return 1
+    printf '%s' "$url"
+}
+
+# printable <text>: whether <text> is printable ASCII only. Anything else
+# can move a terminal's cursor or change how the text reads: a C0 or C1
+# control in any encoding, a raw byte a terminal takes as C1, a bidi
+# override. `[[:cntrl:]]` was not enough: under C it misses UTF-8's C1
+# controls, and under no locale does it match the other two. A URL can
+# say any other character percent-encoded.
+printable() {
+    local LC_ALL=C
+    [[ $1 != *[!\ -~]* ]]
+}
+
+# checked_url <what> <url>: fails unless git may be handed <url>: printable
+# ASCII, a login Guardian can cut the password from, and a URL Omarchy
+# accepts. It runs before every clone and fetch, since git prints a URL it
+# fails on, escapes and password included, and ssh prints its user (a
+# control character as `?`).
+# The URL is never shown.
+checked_url() {
+    printable "$2" ||
+        fail "the URL of $1 holds a character other than printable ASCII; percent-encode it in a web or file URL (a path or an ssh address must be ASCII)"
+    without_login "$2" >/dev/null || fail "$(unreadable_login "$1")"
+    # Omarchy's check prints the URL it rejects, which may hold a password.
+    "$OMARCHY_BIN_DIR/omarchy-git-url-check" "$2" 2>/dev/null ||
+        fail "Omarchy rejected the URL of $1: it takes a path, or a URL with the scheme ssh, git, git+ssh, ssh+git, http, https, ftp, ftps or file in lowercase; not one that starts with - or names a helper (x::)"
+}
+
+# unreadable_login <what>: why without_login refuses the URL of <what>.
+unreadable_login() {
+    printf '%s' "the URL of $1 cannot be read as git reads it, or holds a password git would hand ssh or print (an encoded login or host, a user with a \`:\`, or an \`@\`, \`/\`, \`?\` or \`#\` in a web or ftp login, which a web URL can write as %40, %2F, %3F and %23 and an ftp user cannot hold); use a URL without a password (for an installed one: git remote set-url origin <url>)"
+}
+
+# The identity a review is remembered by names the repository as well as
+# the name, so another repository with the same name (a fork, a lookalike)
+# is reviewed in full rather than as an upgrade of the approved one.
+# source_identity <kind:name> <checkout> takes the URL as git stored it
+# when the checkout was cloned (a local path made absolute), so an install
+# and the later update give one identity.
+source_identity() {
+    local url
+    url=$(stored_url "$2" origin) || fail "the checkout of $1 has no origin URL, or one that is not printable ASCII"
+    url_identity "$1" "$url"
+}
+
+# url_identity <kind:name> <url>: the identity of a checkout cloned from
+# <url> as git stored it.
+url_identity() {
+    local stored
+    # The URL is not shown: it may hold a password.
+    stored=$(without_login "$2") || fail "$(unreadable_login "$1")"
+    printf '%s %s' "$1" "$stored"
+}
+
+# without_login <url>: the URL without a password, and without the user of
+# an http or https address too (`https://ghp_x@host/` logs in with a
+# token), since Guardian's memory keeps the identity and prints it. The
+# user of an ssh address names whose repository it is (`ssh://alice@host/~/r`),
+# and is kept, as in `git@host:path`; so is an ftp user, whose home the
+# path is relative to. The authority ends where git ends it, at the
+# first `/`, `?` or `#`: `https://evil.test?@github.com/r` is evil.test's.
+without_login() {
+    local url=$1
+    # `<helper>::<address>` runs a remote helper, as git reads it.
+    [[ ! $url =~ ^[A-Za-z0-9][A-Za-z0-9+.-]*:: ]] || return 1
+    if [[ $url != *://* ]]; then
+        without_scp_password "$url"
+        return
+    fi
+    local scheme=${url%%://*} rest=${url#*://}
+    # omarchy-git-url-check allows only these. A remote helper
+    # (`https::https://token@host`, `gcrypt::ssh://…`) has a login this
+    # does not read, so it is refused here too.
+    case ${scheme,,} in
+        ssh | git+ssh | ssh+git | git | http | https | ftp | ftps | file) ;;
+        *) return 1 ;;
+    esac
+    local authority=${rest%%[/?#]*}
+    # Git ends an ssh or git URL's host at the first `/` only: `?` and `#`
+    # before it belong to the login or the host. Brackets can reach past
+    # that `/`; they are read below.
+    case ${scheme,,} in
+        ssh | git+ssh | ssh+git | git) authority=${rest%%/*} ;;
+    esac
+    # Outside the web schemes, git decodes `%XX` before it splits the
+    # authority, so `%2F` ends the host early and `%3A` is a password's
+    # `:`. Such an authority cannot be read here as git reads it. In an ssh
+    # or git URL the brackets read below reach past the authority, so a
+    # `%` anywhere in it is refused (`ssh://[u/x%3Ap@h]/r` logs in as
+    # `u/x:p`). A web or ftp URL may hold any `%XX` but a line break: git
+    # decodes each part for its credential helper, and on a `%0a` anywhere
+    # it dies printing the URL whole, password and all.
+    case ${scheme,,} in
+        http | https | ftp | ftps) [[ ${rest,,} != *%0a* ]] || return 1 ;;
+        ssh | git+ssh | ssh+git | git) [[ $rest != *%* ]] || return 1 ;;
+        *) [[ $authority != *%* ]] || return 1 ;;
+    esac
+    # A URL with no host (`https:///u:pw@h/r`) is one curl reads past:
+    # it skips the extra `/` and logs in as `u:pw`, where git sees no login
+    # to cut and prints the URL whole.
+    [[ ${scheme,,} == file || $rest != /* ]] || return 1
+    # An `@` after the authority, with a `:` anywhere before it, may end a
+    # login that holds a `/`, `?`, `#` or blank (`https://u:se/cret@h/r`,
+    # `https://a@b:se/cret@h/r`, `https://us/er:pw@h/r`): git cuts no login
+    # there, or only up to the first `@`, and prints the rest of the URL it
+    # fails on. So the URL is refused, and with it a port or an IPv6 host
+    # before an `@` in the path (`https://h:8443/a@b`, `ssh://[::1]/r@x`)
+    # or a path with both (`https://h/a:b@c`), which are rare.
+    [[ ${scheme,,} == file || ${rest:${#authority}} != *@* || ${rest%@*} != *:* ]] ||
+        return 1
+    # git's host_end() takes an ssh or git URL's host from the first `@[`
+    # with a `]` after it, else from a leading `[`, up to that `]` and past
+    # a `/` too. It hands ssh what is before the `@[` and in the brackets,
+    # where ssh takes the user up to the last `@` (`ssh://h/x@[u:p@y]/z`
+    # logs in as `h/x@u:p`, `ssh://[u:p/q@y]/z` as `u:p/q`). A `:` in that
+    # user may be a password; one in the host (`git@[::1]`) is not.
+    case ${scheme,,} in
+        ssh | git+ssh | ssh+git | git)
+            local user="" inside=""
+            if [[ $rest == *@\[*]* ]]; then
+                user=${rest%%@\[*}
+                inside=${rest#*@\[}
+            elif [[ $rest == \[*]* ]]; then
+                inside=${rest#\[}
+            fi
+            inside=${inside%%]*}
+            [[ $inside != *@* ]] || user+=@${inside%@*}
+            [[ $user != *:* ]] || return 1
+            ;;
+    esac
+    if [[ $authority == *@* ]]; then
+        local login=${authority%@*}
+        # git:// has no login: such a URL names no host git can reach. ssh
+        # has no password either: git hands it `u:p` as the user, and where
+        # the login holds a `:` git splits the host from its port, and
+        # takes the host from an `@[`, differently than once the `:` is cut
+        # (`ssh://u:p@h:22/x`, `ssh://git:x@[evil]@github.com/x`).
+        # Web and ftp logins hold no `@`: git, when it prints a URL it
+        # failed on, cuts the login at the first one and shows the rest,
+        # password and all, as the host (`https://a@b:pw@h/r`).
+        case ${scheme,,} in
+            git) return 1 ;;
+            ssh | git+ssh | ssh+git) [[ $login != *:* ]] || return 1 ;;
+            http | https | ftp | ftps) [[ $login != *@* ]] || return 1 ;;
+        esac
+        case ${scheme,,} in
+            # `login_git` hands git the login and host decoded.
+            http | https)
+                decoded "$login" >/dev/null && decoded "${authority##*@}" >/dev/null || return 1
+                login=""
+                ;;
+            # An FTP path is relative to the user's home, so the user names
+            # the repository and is kept. curl decodes a `%` in it, which
+            # can hide a password (`alice%3Asecret`).
+            ftp | ftps)
+                [[ ${login%%:*} != *%* ]] || return 1
+                login="${login%%:*}@"
+                ;;
+            *) login="${login%%:*}@" ;;
+        esac
+        rest=$login${authority##*@}${rest:${#authority}}
+    fi
+    printf '%s://%s' "$scheme" "$rest"
+}
+
+# without_scp_password <url>: an scp-like URL (`host:path`), which fails
+# (status 1, nothing printed) where its login holds a password. The host
+# is what git's host_end() in connect.c hands ssh: the part before the
+# first `@[` and the text in its brackets (`alice:pw@[host]:p`), else the
+# text in a leading `[...]` (`[alice:pw@host]:p`), else the text before
+# the first `:`. ssh takes the login up to the last `@`, and a `:` in it
+# is a password, which ssh takes for the user and prints (`alice:pw@host:
+# Permission denied`), so the URL is refused rather than cut, as an
+# `ssh://` one is. Without brackets (`alice:secret@host:path`) git
+# connects to `alice`, and the rest is the path. A `/` before the first
+# `:` makes the URL a local path to git.
+without_scp_password() {
+    local url=$1 host=""
+    if [[ ${url%%:*} == */* ]]; then
+        printf '%s' "$url"
+        return
+    fi
+    # git takes the first `@[` if there is one, else a leading `[`, and
+    # only where a `]` follows it.
+    local before="" inside=""
+    if [[ $url == *@\[* ]]; then
+        before="${url%%@\[*}@" inside=${url#*@\[}
+    elif [[ $url == \[* ]]; then
+        inside=${url#\[}
+    fi
+    if [[ $inside == *\]* ]]; then
+        host=$before${inside%%\]*}
+    else
+        host=${url%%:*}
+    fi
+    [[ $host != *@* || ${host%@*} != *:* ]] || return 1
+    printf '%s' "$url"
+}
+
+# shown_after <command...>: `safe_stderr` for a command that leaves jobs
+# behind that hold its stderr (omarchy-theme-set sleeps 3 s in one, and
+# plays a theme's intro in another), which a pipe would wait for: its
+# stderr is kept in a file and shown when it ends. What those jobs write
+# later is not shown. Its stdout is not kept: omarchy-theme-set and the
+# Omarchy commands it runs print no text from the theme there, only their
+# own and the theme's name, which is checked.
+shown_after() {
+    local status=0
+    # The exit trap removes it too, should a signal end the script here.
+    SHOWN_ERRORS=$(mktemp) || return 1
+    "$@" 2>"$SHOWN_ERRORS" || status=$?
+    LC_ALL=C tr -c '\n\t -~' '?' <"$SHOWN_ERRORS" >&2
+    rm -f -- "$SHOWN_ERRORS"
+    SHOWN_ERRORS=""
+    return "$status"
+}
+
 
 theme_name_from_url() {
     local repo_path=$1
@@ -82,20 +416,22 @@ clone_theme() {
     local url=$1
     local destination=$2
     local branch=${3:-}
-    validate_remote "$url" || fail "Omarchy rejected the repository URL"
+    checked_url "the repository" "$url"
 
     if [[ -n $branch ]]; then
-        safe_git clone --branch "$branch" --single-branch -- "$url" "$destination" || \
-            fail "could not stage theme repository"
+        login_git "$url" clone --branch "$branch" --single-branch -- "$(bare_url "$url")" \
+            "$destination" || fail "could not stage theme repository"
     else
-        safe_git clone -- "$url" "$destination" || fail "could not stage theme repository"
+        login_git "$url" clone -- "$(bare_url "$url")" "$destination" ||
+            fail "could not stage theme repository"
     fi
+    keep_login "$url" "$destination" || fail "could not stage theme repository"
     check_repo_complete "$destination"
 }
 
 install_theme() {
     local url=${1:-}
-    local name destination staged
+    local name destination staged identity
 
     if (( $# > 1 )); then
         fail "usage: omarchy theme install [git-repo-url]"
@@ -104,7 +440,7 @@ install_theme() {
         command -v gum >/dev/null || fail "provide a theme repository URL"
         url=$(gum input --placeholder="Git repo URL (https or git@host:org/repo.git)" --header="") || exit 1
     fi
-    validate_remote "$url" || fail "Omarchy rejected the repository URL"
+    checked_url "the repository" "$url"
     name=$(theme_name_from_url "$url") || fail "repository URL does not produce a valid theme name"
     destination="$THEMES_DIR/$name"
     [[ ! -L $destination ]] || fail "refusing to replace a symlinked theme directory"
@@ -113,7 +449,8 @@ install_theme() {
     staged="$STAGE_ROOT/repo"
 
     clone_theme "$url" "$staged"
-    if "$GUARDIAN" guard --class theme --identity "theme:$name" --thorough "$staged" -- /usr/bin/bash "$SCRIPT_PATH" \
+    identity=$(source_identity "theme:$name" "$staged")
+    if "$GUARDIAN" guard --class theme --identity "$identity" --thorough "$staged" -- /usr/bin/bash "$SCRIPT_PATH" \
         --guardian-commit-install "$name" "$staged"; then
         return 0
     else
@@ -127,13 +464,14 @@ update_themes() {
     local only_name=""
     if (( $# == 2 )) && [[ $1 == "--only" ]]; then
         only_name=$2
+        printable "$only_name" || fail "a theme name must be printable ASCII"
     elif (( $# != 0 )); then
         fail "usage: omarchy theme update [--only theme-name]"
     fi
 
-    local theme name branch upstream remote remote_url staged status
+    local theme name branch upstream remote remote_url staged status identity
     local found=0
-    local -a theme_names=()
+    local -a theme_names=() unit_args=()
 
     STAGE_ROOT=$(mktemp -d "$THEMES_DIR/.guardian-update.XXXXXX") || fail "could not create staging directory"
     mkdir -p "$STAGE_ROOT/staged" "$STAGE_ROOT/backups"
@@ -142,6 +480,11 @@ update_themes() {
         [[ -d $theme/.git && ! -L $theme && ! -L $theme/.git ]] || continue
         name=${theme##*/}
         [[ -z $only_name || $name == "$only_name" ]] || continue
+        # Every message below names it.
+        if ! printable "$name"; then
+            printf 'omarchy-guardian theme: %s\n' "skipping a theme whose directory name is not printable ASCII" >&2
+            continue
+        fi
         found=1
 
         status=$(safe_git -C "$theme" status --porcelain --ignored --untracked-files=all) || \
@@ -150,16 +493,21 @@ update_themes() {
 
         branch=$(safe_git -C "$theme" symbolic-ref --quiet --short HEAD) || \
             fail "theme $name is detached; refusing an ambiguous update"
+        # git prints a branch's name in its errors, escapes and all.
+        printable "$branch" || fail "theme $name is on a branch whose name is not printable ASCII"
         upstream=$(safe_git -C "$theme" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}') || \
             fail "theme $name has no configured upstream"
         remote=${upstream%%/*}
         branch=${upstream#*/}
-        remote_url=$(safe_git -C "$theme" config --get "remote.$remote.url") || \
+        remote_url=$(stored_url "$theme" "$remote") || \
             fail "theme $name has no usable remote URL"
 
+        printable "$upstream" || fail "theme $name tracks a branch whose name is not printable ASCII"
         staged="$STAGE_ROOT/staged/$name"
         clone_theme "$remote_url" "$staged" "$branch"
         theme_names+=("$name")
+        identity=$(source_identity "theme:$name" "$staged")
+        unit_args+=(--unit "$name" "$identity")
     done
 
     (( found == 1 )) || {
@@ -167,11 +515,6 @@ update_themes() {
         [[ -n $only_name ]] && fail "no Git-installed theme named $only_name was found"
         return 0
     }
-
-    local -a unit_args=()
-    for name in "${theme_names[@]}"; do
-        unit_args+=(--unit "$name" "theme:$name")
-    done
 
     if "$GUARDIAN" guard --class theme --thorough "${unit_args[@]}" "$STAGE_ROOT/staged" -- /usr/bin/bash "$SCRIPT_PATH" \
         --guardian-commit-update "$STAGE_ROOT" "${theme_names[@]}"; then
@@ -203,7 +546,7 @@ commit_install() {
         fi
         fail "could not install the reviewed theme"
     fi
-    if ! "$OMARCHY_BIN_DIR/omarchy-theme-set" "$name"; then
+    if ! shown_after "$OMARCHY_BIN_DIR/omarchy-theme-set" "$name"; then
         rm -rf -- "$destination"
         if [[ -e $backup ]] && ! mv -- "$backup" "$destination"; then
             printf '%s\n' "Could not restore the previous theme; recovery data: $backup" >&2

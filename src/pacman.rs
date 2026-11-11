@@ -718,14 +718,51 @@ fn own_removal_is_no_attack(report: &mut Report, target: &str, rel: &str, text: 
 /// names is one of Guardian's.
 fn only_guardians_own(line: &str) -> bool {
     let line = line.to_lowercase().replace('\t', " ");
+    // Both as written and as a shell reads it (`u''fw disable`).
+    let reads = rules::as_shell_reads(&line);
+    std::iter::once(line.as_str())
+        .chain(reads.iter().map(String::as_str))
+        .all(only_guardians_units)
+}
+
+/// The line with a space around each run of `;`, `|`, `&`, `(`, `)` and
+/// backticks, so a command glued on (`rm -f /etc/omarchy-guardian;ufw
+/// disable`, `…guardian$(ufw disable)`) is a word of its own
+/// and is not dropped with Guardian's name. An `&` after `>` or `<`
+/// (`2>&1`) is left in its word; `&>file` split in two still ends the
+/// command before it.
+fn with_operators_spaced(line: &str) -> String {
+    let is_operator = |c: char| matches!(c, ';' | '|' | '&' | '(' | ')' | '`');
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    for (at, &c) in chars.iter().enumerate() {
+        let before = at.checked_sub(1).map(|at| chars[at]);
+        let after = chars.get(at + 1).copied();
+        let in_redirection = c == '&' && matches!(before, Some('>' | '<'));
+        if !is_operator(c) || in_redirection {
+            out.push(c);
+            continue;
+        }
+        if !before.is_some_and(is_operator) {
+            out.push(' ');
+        }
+        out.push(c);
+        if !after.is_some_and(is_operator) {
+            out.push(' ');
+        }
+    }
+    out
+}
+
+/// `only_guardians_own` of one lowercased reading of a line.
+fn only_guardians_units(line: &str) -> bool {
+    let line = with_operators_spaced(line);
     if !line.contains(payload::GUARDIAN_PACKAGE) {
         return false;
     }
-    let rest: Vec<&str> = line
-        .split(' ')
-        .filter(|word| !word.contains(payload::GUARDIAN_PACKAGE))
-        .collect();
-    let rest = rest.join(" ");
+    // Only Guardian's name is taken out, not the word holding it: what is
+    // glued to it (`ufw disable>/tmp/omarchy-guardian`) is still read.
+    let rest = line.replace(payload::GUARDIAN_PACKAGE, "own");
     if rules::line_rules(&rest, &rest).any(|rule| rule == RuleId::ProtectionDisabled) {
         return false;
     }
@@ -1015,6 +1052,16 @@ fn linked_file(
                 return Ok(Some(("it is on this system now", bytes)));
             }
             Public::Link(target) => {
+                let target = target.to_str().ok_or_else(|| {
+                    Error::Message("is a link to a name that is not UTF-8".into())
+                })?;
+                if read::goes_up_after_a_name(target) {
+                    return Err(Error::Message(
+                        "is a link whose target goes up after a name (`a/..`), which was not \
+                         followed"
+                            .into(),
+                    ));
+                }
                 let base = Path::new(&seen.path)
                     .parent()
                     .map(Path::to_path_buf)
@@ -1022,13 +1069,19 @@ fn linked_file(
                 let next = if target.starts_with('/') {
                     PathBuf::from(target.trim_start_matches('/'))
                 } else {
-                    base.join(&target)
+                    base.join(target)
                 };
                 rel = read::normalize(&next)
                     .ok_or_else(|| Error::Message("leads out of the system's root".into()))?;
             }
             Public::Other => return Ok(None),
             Public::Directory(_) => return Err(Error::Message("is a directory".into())),
+            Public::Unopened(why) => {
+                return Err(Error::Message(format!("cannot be opened ({why})")));
+            }
+            Public::Refused(why) => {
+                return Err(Error::Message(format!("cannot be looked at ({why})")));
+            }
         }
     }
     Err(Error::Message("is behind too many links".into()))

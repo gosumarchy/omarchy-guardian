@@ -552,17 +552,15 @@ fn listing(scope: &Scope<'_>, directory: &str) -> Listing {
     };
     if scope.origin == Origin::Root {
         // Without following a link anybody but root could have put there.
-        match read::seen(scope.root, directory, View::Pinned).map(|seen| seen.what) {
-            Some(read::Public::Directory(handle)) => listed(fs::read_dir(format!(
+        match read::seen_or_why(scope.root, directory, View::Pinned).map(|seen| seen.what) {
+            Ok(read::Public::Directory(handle)) => listed(fs::read_dir(format!(
                 "/proc/self/fd/{}",
                 handle.as_raw_fd()
             ))),
-            Some(_) => Listing::Closed,
-            // The pinned walk does not say why it shows nothing.
-            None => match fs::symlink_metadata(scope.root.join(directory)) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Listing::Gone,
-                _ => Listing::Closed,
-            },
+            // A part on the way swapped for a link is not gone: asked again
+            // by path, a link to nothing would read as gone.
+            Ok(_) | Err(read::Unseen::Through) => Listing::Closed,
+            Err(read::Unseen::Nothing) => Listing::Gone,
         }
     } else {
         listed(fs::read_dir(scope.root.join(directory)))

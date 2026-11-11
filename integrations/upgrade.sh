@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -p
 # Upgrades Omarchy Guardian from a checkout without trusting the checkout.
 # Installed by the package as /usr/lib/omarchy-guardian/upgrade.
 #
@@ -41,6 +41,121 @@
 #                      passed on to the release's install.sh
 set -euo pipefail
 
+# FUNCNEST=1 would stop the check's function call below, and bash goes on
+# after a command it stops; TMOUT would time its `read` out, which counts
+# as not clean, but nothing here wants either.
+unset TMOUT FUNCNEST
+
+# Only these variables of the caller's reach this script, the tools it
+# runs and the installer: the session the installer's own steps need
+# (sudo's terminal, the user's systemd and notifications, rustup's
+# toolchain, a proxy and certificates for cargo's download), the setup's
+# test review (where it is sent, and the login and provider settings
+# `is_kept` adds), the snapshot-boot override, and the test suite's three.
+# The rest is dropped by starting again under `env -i`: BASH_ENV and
+# exported functions would run in every bash the installer starts
+# (makepkg is one), TAR_OPTIONS changes what the export holds, GIT_*
+# redirects git, and LD_PRELOAD loads into every tool started after the
+# restart. The `-p` on this script's first line keeps BASH_ENV and
+# functions out of this shell before the check; run it as a command, not
+# through `bash`.
+#
+# This keeps a stray setting from changing what is verified and built. It
+# is no defence against a program running as you: one that can set your
+# environment can as well wrap this command before it starts (a shell
+# function may be named by a path, and LD_PRELOAD loads into this first
+# shell), and the build runs your toolchain, which the kept PATH, HOME,
+# XDG_CONFIG_HOME, CARGO_HOME and RUSTUP_HOME choose.
+KEPT_VARIABLES=(
+    HOME USER LOGNAME PATH TERM COLORTERM NO_COLOR TMPDIR
+    DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+    XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME
+    CARGO_HOME RUSTUP_HOME
+    http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY
+    SSL_CERT_FILE SSL_CERT_DIR NODE_EXTRA_CA_CERTS
+    CLAUDE_CONFIG_DIR CODEX_HOME OPENCODE_CONFIG OPENCODE_CONFIG_DIR CLOUD_ML_REGION
+    OPENAI_BASE_URL OLLAMA_HOST
+    OMARCHY_GUARDIAN_ALLOW_SNAPSHOT_BOOT
+    GUARDIAN_UPGRADE_TEST_SIGNERS GUARDIAN_UPGRADE_TEST_INSTALLED GUARDIAN_UPGRADE_TEST_AS_ROOT
+)
+# What bash itself sets in a shell it starts, and the mark of a restart:
+# allowed in the environment, never carried over.
+SHELL_VARIABLES=(PWD OLDPWD SHLVL _ GUARDIAN_UPGRADE_RESTARTED)
+
+# Whether the caller's variable `name` is carried over: one of
+# KEPT_VARIABLES, a locale category, or a login or provider setting of the
+# reviewer (`ANTHROPIC_API_KEY`, Bedrock's `AWS_*`, Vertex's `GOOGLE_*`,
+# Claude Code's `CLAUDE_CODE_USE_*`), which only the reviewer reads; and its
+# `value`, where a locale names no path: gettext builds the path of the
+# message catalogs it loads from `LANGUAGE` and the locale (`../..` there
+# reaches any directory). `LOCPATH`, which names where locale data is
+# loaded from, is not kept at all. A name no shell could have assigned
+# (`AWS_a/b`) is not kept either, however it starts.
+is_kept() {
+    local name=$1 value=$2 kept
+    [[ $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    if [[ $name =~ ^LC_[A-Z]+$ || $name == LANG || $name == LANGUAGE ]]; then
+        [[ $value != */* ]]
+        return
+    fi
+    case $name in
+        ANTHROPIC_* | CLAUDE_CODE_USE_* | CLAUDE_CODE_OAUTH_TOKEN | CLAUDE_CODE_SKIP_*_AUTH) return 0 ;;
+        AWS_* | GOOGLE_* | VERTEX_* | AZURE_* | *_API_KEY) return 0 ;;
+    esac
+    for kept in "${KEPT_VARIABLES[@]}"; do
+        [[ $name == "$kept" ]] && return 0
+    done
+    return 1
+}
+
+is_shell_variable() {
+    local name=$1 shell
+    for shell in "${SHELL_VARIABLES[@]}"; do
+        [[ $name == "$shell" ]] && return 0
+    done
+    return 1
+}
+
+# Clean only when every entry was read to the end of the list and `env`
+# listed it whole: a `read` that fails for any other reason than the end,
+# or an `env` that failed (and so listed nothing), is no proof.
+only_kept_variables() {
+    local entry status name
+    while true; do
+        IFS= read -r -d '' entry || {
+            status=$?
+            [[ $status == 1 && -z $entry ]] || return 1
+            break
+        }
+        name=${entry%%=*}
+        is_kept "$name" "${entry#*=}" || is_shell_variable "$name" || return 1
+    done < <(/usr/bin/env -0)
+    wait "$!"
+}
+
+# Clean is what the check has to prove: bash goes on after a command it
+# stops (a function nested too deep), and `if ! check` would then go on as
+# if it had passed.
+clean=0
+only_kept_variables && clean=1
+if ((clean == 0)); then
+    # Once: an environment still not clean after the restart (a wrapper
+    # that adds variables) stops here instead of restarting for ever.
+    if [[ -n ${GUARDIAN_UPGRADE_RESTARTED-} ]]; then
+        printf '%s\n' 'upgrade: the environment still holds variables it does not keep' \
+            'after starting again with only those; run it from a plain shell' >&2
+        exit 1
+    fi
+    # Only what the caller exported: bash sets some kept names itself.
+    mapfile -t names < <(compgen -e)
+    kept=(GUARDIAN_UPGRADE_RESTARTED=1)
+    for name in "${names[@]}"; do
+        is_kept "$name" "${!name}" && kept+=("$name=${!name}")
+    done
+    exec /usr/bin/env -i "${kept[@]}" /usr/bin/bash -p -- "${BASH_SOURCE[0]}" "$@"
+fi
+unset clean kept name names GUARDIAN_UPGRADE_RESTARTED
+
 SELF=$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}")
 # install.sh needs the caller's PATH (rustup's cargo); nothing here does.
 CALLER_PATH=${PATH-}
@@ -48,11 +163,6 @@ CALLER_UMASK=$(umask)
 export PATH=/usr/bin
 export LC_ALL=C
 umask 077
-# Nothing git is told through the environment (GIT_DIR, GIT_EXEC_PATH,
-# GIT_SSH_COMMAND, ...) reaches this script or the installer it starts.
-while IFS= read -r name; do
-    unset "$name"
-done < <(compgen -e GIT_ || true)
 
 SIGNERS=/usr/share/omarchy-guardian/allowed_signers
 PACKAGE=omarchy-guardian

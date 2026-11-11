@@ -142,8 +142,9 @@ another link or into a skipped directory), special files, non-UTF-8 file
 names, text files over 2 MiB, files over 512 MiB, unresolved Git LFS pointers
 and an invalid or inconclusive AI reply all make the review **incomplete**,
 never clear. A tree of more than 200,000 files, 256 MiB of text or 4 GiB in
-all is not walked to its end, and one with no text file to review has nothing
-reviewed: both are incomplete.
+all is not walked to its end, a directory more than 256 levels below the top is
+not walked, and a tree with no text file to review has nothing reviewed: all
+are incomplete.
 
 An *unavailable* AI review (no reviewer CLI, a provider error, a timeout)
 follows the class's `ai` setting instead: `WARNED` where it is `optional`,
@@ -154,11 +155,14 @@ unavailable: the review is invalid, which blocks as `INCOMPLETE` in every
 class. So is one that refuses what it was sent (a usage-policy or safety
 refusal, a content filter, a guardrail): a source can be written to be
 refused. A network or login error, a rate, spend or usage limit and an
-overloaded provider stay unavailable. A run that times out before the model starts on the source
-is unavailable. One that times out after the model had it is not, since a
-source can be written to keep a reviewer busy: that review is invalid too,
-except for the `official` class, whose content nobody writing such a source
-chooses, where it counts as unavailable.
+overloaded provider stay unavailable. A run that times out before the model
+starts on the source is unavailable. One that times out after the model had it
+is not, since a source can be written to keep a reviewer busy: that review is
+invalid too, except for the `official` class, whose content nobody writing such
+a source chooses, where it counts as unavailable. Claude Code says nothing of
+an answer until a whole block of it is written, so with it a run counts as
+having the source once the CLI has started on the request; a provider that
+hangs after that blocks too.
 
 In `.git`, only the `config` (checked locally for keys that make git run a
 command, such as `core.fsmonitor`, filters and `!` aliases, and never sent to
@@ -404,8 +408,41 @@ the memory was not used and the review runs in full:
 The AUR gate remembers a build by its AUR package name (`aur:<package>` for
 the recipe, `aur-src:<package>` for the upstream sources) when the build
 directory is a clone of that package, and any other build directory by a key
-made from its path. The theme handler remembers a theme by its name. Other
-targets are remembered by their class and path. `omarchy-guardian forget ID`
+made from its path. The theme and plugin handlers remember a theme or plugin
+by its name or id and the URL its repository was cloned from (without a
+password, and without the user of an http or https address), so another
+repository with the same name is reviewed in full, not as an upgrade of the
+approved one. An `ssh://` or scp-form (`[user@host]:path`) URL whose user holds
+a `:` is refused: ssh takes no password and prints the user it was given, and
+git reads the host of such a URL differently once the `:` is cut. So is a
+`git://` URL with a login before its host, which names no host git can reach;
+a web or ftp URL whose login holds an `@`, which git would print as the host;
+a URL other than `file:` with an `@` after its host and a `:` before that `@` (a
+login holding a `/`, `?`, `#` or blank), which git would print with the
+password; a URL other than `file:` with no host (`https:///…`), which curl
+reads past to a login git does not cut; a web or ftp URL with `%0a` in it, on
+which git dies printing the URL whole; an
+`ssh://` or
+`git://` URL with a `%` in it, which git decodes before it reads the host and
+user; an `ftp://` or `ftps://` URL with a `%` in its user, which can hide a
+password there; any URL whose host Guardian cannot read as git does; and a URL
+with a character other than printable ASCII (a web or file URL can
+percent-encode it; a path or an ssh address must be ASCII). In a web URL's
+login, write `@`, `/`, `?` and `#` as `%40`, `%2F`, `%3F` and `%23`; an ftp
+user cannot hold them, and its user, password and host must not decode to a
+control character. These checks run before git is handed the URL, since git
+prints a URL it fails on and ssh prints the user it was given. An http or https
+URL's login is not handed to git in the URL at all: git clones and fetches the
+URL without it, and a credential helper gives git the user and password from
+the environment of that one git run, for the URL's own scheme and host only (a
+user alone, often a token, is given an empty password, since git would show
+the user when it asks for one, so a password cannot be typed in for it; and the
+credential helpers you set are not asked for such a URL, nor store its login).
+A
+redirect makes git print the URL it asked for whole, and one to another host
+would otherwise be handed the login. The checkout's remote keeps the URL as
+given, for updates.
+Other targets are remembered by their class and path. `omarchy-guardian forget ID`
 drops that identity's baselines, and for `aur:<pkg>` or `aur-src:<pkg>` also
 what the AUR gate remembers of the package (answered questions, binary hashes,
 what it extracted). Cached verdicts are kept, so an unchanged rebuild can

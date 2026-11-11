@@ -5,7 +5,8 @@ use std::fs;
 use std::os::unix::fs::symlink;
 
 use super::{
-    Search, assignments, entries, mark, opaque, search, shadowing_programs, unsafe_entries,
+    Listing, Search, assignments, entries, listing, mark, opaque, search, shadowing_programs,
+    unsafe_entries,
 };
 use crate::autorun::Category;
 use crate::rules::RuleId;
@@ -650,4 +651,23 @@ fn an_oversize_start_up_file_is_read_in_part_and_said() {
             .directories
             .contains(&"home/u/big/bin".to_string())
     );
+}
+
+#[test]
+fn a_directory_behind_a_link_root_does_not_follow_is_not_gone() {
+    let dir = TempDir::new("path-behind-link");
+    let root = dir.path();
+    fs::create_dir_all(root.join("opt/x")).unwrap();
+    // A link that goes up after a name is not followed, and this one leads
+    // to nothing: asked again by path, the directory would read as gone.
+    symlink("x/../nothing", root.join("opt/l")).unwrap();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let as_root = Scope {
+        root,
+        home: Some("root"),
+        index: &index,
+        origin: Origin::Root,
+    };
+    assert!(matches!(listing(&as_root, "opt/l/bin"), Listing::Closed));
+    assert!(matches!(listing(&as_root, "opt/none/bin"), Listing::Gone));
 }

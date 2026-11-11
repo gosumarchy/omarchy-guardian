@@ -1,6 +1,7 @@
 //! Destructive system operations: formatting a filesystem, writing onto a
 //! device, removing the root or home directory.
 
+use super::removal::removes_root_or_home;
 use super::shell::{program_name, unquoted, unquoted_words};
 use super::{contains_any, shell};
 
@@ -152,47 +153,4 @@ pub(super) fn formats_filesystem(line: &str) -> bool {
                 .is_some_and(|word| word.starts_with('-') && !word.contains('=') && word != "--");
             !handles_file || after_option || before.iter().any(|word| word.contains("mkfs."))
         })
-}
-
-/// Recursive `rm` of `/`, `/*`, `~` or `$HOME` itself. Removing paths below
-/// them (`rm -rf /tmp/build`, `rm -rf "$pkgdir"`) is ordinary build hygiene.
-pub(super) fn removes_root_or_home(line: &str) -> bool {
-    let tokens: Vec<&str> = line.split_whitespace().collect();
-    // Whether what a command at the token looked at would be given holds a
-    // recursive flag, and a root or home target: read from the end, so the
-    // arguments many commands share are read once.
-    let (mut recursive, mut target) = (false, false);
-    for token in tokens.iter().rev() {
-        let command = token.trim_start_matches(['(', '`', '{']);
-        if (command == "rm" || command.ends_with("/rm")) && recursive && target {
-            return true;
-        }
-        // A command's arguments end before a separator, or with a word
-        // that ends in one.
-        if matches!(*token, ";" | "&&" | "||" | "|" | "&") {
-            (recursive, target) = (false, false);
-            continue;
-        }
-        if token.ends_with([';', '&', '|']) {
-            (recursive, target) = (false, false);
-        }
-        recursive = recursive
-            || *token == "--recursive"
-            || token
-                .strip_prefix('-')
-                .is_some_and(|flags| !flags.starts_with('-') && flags.contains('r'));
-        target = target
-            || (!token.starts_with('-')
-                && is_root_or_home(
-                    token
-                        .trim_end_matches([';', ')', '`'])
-                        .trim_matches(['"', '\'']),
-                ));
-    }
-    false
-}
-
-fn is_root_or_home(target: &str) -> bool {
-    let base = target.trim_end_matches(['/', '*']);
-    (target.starts_with('/') && base.is_empty()) || matches!(base, "~" | "$home" | "${home}")
 }

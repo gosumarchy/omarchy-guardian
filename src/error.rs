@@ -5,6 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::config::file::ConfigError;
+use crate::text;
 
 #[derive(Debug)]
 pub(crate) enum Error {
@@ -39,14 +40,27 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
+            // A path can be named by what is reviewed, and a tool's or a
+            // parser's detail can be its output about it (an archive's entry
+            // names): any may hold a newline or an escape that would forge or
+            // hide lines on the terminal, so each is shown as text.
+            Self::Io { path, source } => {
+                write!(f, "{}: {source}", text::shown(&path.to_string_lossy()))
+            }
             Self::Spawn { tool, source } => write!(f, "could not run {tool}: {source}"),
             Self::TimedOut { tool } => write!(f, "{tool} timed out"),
-            Self::ToolFailed { tool, detail } => write!(f, "{tool} failed: {detail}"),
+            Self::ToolFailed { tool, detail } => {
+                write!(f, "{tool} failed: {}", text::shown(detail))
+            }
             Self::OutputTooLarge { tool, limit } => {
                 write!(f, "{tool} output exceeds {limit} bytes")
             }
-            Self::Parse { what, detail } => write!(f, "could not parse {what}: {detail}"),
+            Self::Parse { what, detail } => write!(
+                f,
+                "could not parse {}: {}",
+                text::shown(what),
+                text::shown(detail)
+            ),
             Self::Config(error) => error.fmt(f),
             Self::Message(text) => f.write_str(text),
         }
@@ -85,5 +99,30 @@ impl<T> IoContext<T> for io::Result<T> {
             tool: tool.to_string(),
             source,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_path_or_a_tools_detail_cannot_write_lines_or_escapes() {
+        let io = Error::Io {
+            path: PathBuf::from("x\nomarchy-guardian: CLEAR\x1b[2K"),
+            source: io::Error::from(io::ErrorKind::NotFound),
+        };
+        let failed = Error::ToolFailed {
+            tool: "bsdtar".into(),
+            detail: "a\r\nb\x1b]0;title\x07".into(),
+        };
+        let parse = Error::Parse {
+            what: "x\n.json".into(),
+            detail: "y\x1b[2K".into(),
+        };
+        for shown in [io.to_string(), failed.to_string(), parse.to_string()] {
+            assert!(!shown.contains(['\n', '\r', '\x1b', '\x07']), "{shown:?}");
+        }
+        assert!(io.to_string().starts_with('x'));
     }
 }

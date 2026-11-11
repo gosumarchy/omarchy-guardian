@@ -629,6 +629,8 @@ fn a_pattern_names_files_and_a_case_branch_names_nothing() {
     )
     .unwrap();
     symlink("dir", root.join("home/u/.config/hypr/conf.d/to-dir")).unwrap();
+    // A circle is told as not followed, not dropped.
+    symlink("loop", root.join("home/u/.config/hypr/conf.d/loop")).unwrap();
     write(
         root,
         "home/u/.config/hypr/hyprland.conf",
@@ -656,7 +658,13 @@ fn a_pattern_names_files_and_a_case_branch_names_nothing() {
         let search = crate::sweep::path::search(&scope);
         let conf = "home/u/.config/hypr/hyprland.conf";
         let sourced = super::item(&scope, Category::Hyprland, conf.into(), None);
-        let mut targets = super::follow(&scope, &sourced, &search, true).targets;
+        let followed = super::follow(&scope, &sourced, &search, true);
+        assert_eq!(
+            followed.unfollowed,
+            ["home/u/.config/hypr/conf.d/loop: links not followed to their end"],
+            "{origin:?}"
+        );
+        let mut targets = followed.targets;
         targets.sort();
         assert_eq!(
             targets,
@@ -673,6 +681,193 @@ fn a_pattern_names_files_and_a_case_branch_names_nothing() {
             ["usr/local/bin/tool"]
         );
     }
+}
+
+#[test]
+fn a_pattern_directory_that_is_a_link_is_told_not_taken_for_empty() {
+    use std::os::unix::fs::symlink;
+    let dir = TempDir::new("sweep-pattern-link");
+    let root = dir.path();
+    write(root, "home/u/dotfiles/conf.d/a.conf", "exec-once = x\n");
+    fs::create_dir_all(root.join("home/u/.config/hypr")).unwrap();
+    symlink(
+        "../../dotfiles/conf.d",
+        root.join("home/u/.config/hypr/conf.d"),
+    )
+    .unwrap();
+    write(
+        root,
+        "home/u/.config/hypr/hyprland.conf",
+        "source = ~/.config/hypr/conf.d/*.conf\n",
+    );
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let as_root = Scope {
+        root,
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::Root,
+    };
+    let conf = "home/u/.config/hypr/hyprland.conf";
+    let sourced = super::item(&as_root, Category::Hyprland, conf.into(), None);
+    let followed = super::follow(
+        &as_root,
+        &sourced,
+        &crate::sweep::path::search(&as_root),
+        true,
+    );
+    assert!(
+        followed
+            .unfollowed
+            .iter()
+            .any(|sentence| sentence
+                .starts_with("/home/u/.config/hypr/conf.d: a directory a pattern")),
+        "{:?} {:?}",
+        followed.targets,
+        followed.unfollowed
+    );
+}
+
+#[test]
+fn a_command_under_dev_shm_behind_a_link_root_does_not_follow_is_told() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let dir = TempDir::new("sweep-shm-behind-link");
+    let root = dir.path();
+    write(root, "etc/passwd", "u:x:1000:1000::/home/u:/bin/bash\n");
+    write(root, "var/spool/cron/u", "* * * * * /dev/shm/l/evil\n");
+    write(root, "dev/shm/real/evil", "#!/bin/sh\n");
+    fs::create_dir_all(root.join("dev/shm/x")).unwrap();
+    // As on a real system: anyone may enter `/dev/shm`, where a crontab's
+    // account may put what its command runs.
+    fs::set_permissions(root.join("dev/shm"), fs::Permissions::from_mode(0o1777)).unwrap();
+    // A link that goes up after a name is not followed.
+    symlink("x/../real", root.join("dev/shm/l")).unwrap();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let as_root = Scope {
+        root,
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::Root,
+    };
+    let crontab = super::item(&as_root, Category::Cron, "var/spool/cron/u".into(), None);
+    let followed = super::follow(
+        &as_root,
+        &crontab,
+        &crate::sweep::path::search(&as_root),
+        true,
+    );
+    assert_eq!(followed.targets, ["dev/shm/l/evil"]);
+}
+
+#[test]
+fn a_file_that_would_not_open_is_there() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("sweep-unopened");
+    let root = dir.path();
+    // Its owner may hold a lease on it; here, a mode keeps its owner out.
+    write(root, "etc/unopened", "x\n");
+    fs::set_permissions(root.join("etc/unopened"), fs::Permissions::from_mode(0o004)).unwrap();
+    if fs::File::open(root.join("etc/unopened")).is_ok() {
+        // Root reads past the mode.
+        return;
+    }
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let as_root = Scope {
+        root,
+        home: Some("root"),
+        index: &index,
+        origin: Origin::Root,
+    };
+    assert!(super::is_file_there(&as_root, "etc/unopened", None));
+}
+
+#[test]
+fn a_command_in_a_directory_root_was_kept_out_of_is_told() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("sweep-kept-out");
+    let root = dir.path();
+    write(root, "etc/passwd", "u:x:1000:1000::/home/u:/bin/bash\n");
+    write(
+        root,
+        "var/spool/cron/u",
+        "* * * * * /home/u/.local/bin/evil\n* * * * * tool\n* * * * * /home/u/.local/bin/*.sh\n",
+    );
+    write(root, "home/u/.local/bin/evil", "#!/bin/sh\n");
+    write(root, "home/u/.local/bin/tool", "#!/bin/sh\n");
+    write(root, "usr/bin/tool", "#!/bin/sh\n");
+    // Anyone may enter it by the mode; the reader, its owner here, may not
+    // (as root on an account's FUSE mount, or on NFS with `root_squash`).
+    let bin = root.join("home/u/.local/bin");
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o055)).unwrap();
+    let blocked = fs::read_dir(&bin).is_err();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let as_root = Scope {
+        root,
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::Root,
+    };
+    let crontab = super::item(&as_root, Category::Cron, "var/spool/cron/u".into(), None);
+    let followed = super::follow(
+        &as_root,
+        &crontab,
+        &crate::sweep::path::search(&as_root),
+        true,
+    );
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    if !blocked {
+        // Root reads past the mode.
+        return;
+    }
+    // Named by its path, it is followed, to be told as not read; looked
+    // for by its name, the directory is noted once and the name is still
+    // found where it can be.
+    assert_eq!(followed.targets, ["home/u/.local/bin/evil", "usr/bin/tool"]);
+    assert!(
+        followed
+            .unfollowed
+            .iter()
+            .any(|sentence| sentence.starts_with("/home/u/.local/bin: a directory commands")),
+        "{:?}",
+        followed.unfollowed
+    );
+    // A pattern through it is told too, not taken for one matching nothing.
+    assert!(
+        followed
+            .unfollowed
+            .iter()
+            .any(|sentence| sentence.starts_with("/home/u/.local/bin: a directory a pattern")),
+        "{:?}",
+        followed.unfollowed
+    );
+}
+
+#[test]
+fn a_command_behind_a_link_root_does_not_follow_is_told() {
+    use std::os::unix::fs::symlink;
+    let dir = TempDir::new("sweep-behind-link");
+    let root = dir.path();
+    write(root, "etc/passwd", "u:x:1000:1000::/home/u:/bin/bash\n");
+    write(root, "var/spool/cron/u", "* * * * * /home/u/bin/evil\n");
+    write(root, "home/u/real/evil", "#!/bin/sh\n");
+    fs::create_dir_all(root.join("home/u/x")).unwrap();
+    // A link that goes up after a name is not followed.
+    symlink("x/../real", root.join("home/u/bin")).unwrap();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let as_root = Scope {
+        root,
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::Root,
+    };
+    let crontab = super::item(&as_root, Category::Cron, "var/spool/cron/u".into(), None);
+    let followed = super::follow(
+        &as_root,
+        &crontab,
+        &crate::sweep::path::search(&as_root),
+        true,
+    );
+    // Followed by its path, to be told as not read, not taken for nothing.
+    assert_eq!(followed.targets, ["home/u/bin/evil"]);
 }
 
 #[test]
@@ -778,7 +973,9 @@ fn root_only_looks_where_a_user_points_if_the_user_could_too() {
     ));
     assert!(super::is_file_there(&as_root, "etc/open", None));
     // A command through a link on the way: followed where nobody else
-    // could have put the link, and told by the path really taken.
+    // could have put the link, and told by the path really taken. Through
+    // one anyone could have put there it is not followed: it is kept by its
+    // own name, to be told as not read.
     symlink("etc", root.join("conf")).unwrap();
     fs::create_dir_all(root.join("tmp")).unwrap();
     symlink("../etc", root.join("tmp/conf")).unwrap();
@@ -789,7 +986,9 @@ fn root_only_looks_where_a_user_points_if_the_user_could_too() {
         "* * * * * /conf/open\n* * * * * /tmp/conf/open\n",
     );
     let through = super::item(&as_root, Category::Cron, "var/spool/cron/w".into(), None);
-    assert_eq!(follow_as(&as_root, &through), ["etc/open"]);
+    assert_eq!(follow_as(&as_root, &through), ["etc/open", "tmp/conf/open"]);
+    let behind = super::item(&as_root, Category::Cron, "tmp/conf/open".into(), by);
+    assert!(matches!(behind.body, Body::Unreadable(_)), "{behind:?}");
     assert!(!super::is_there(&as_root, "tmp/conf/open", by));
     assert!(super::user_steered(root, None));
     // A crontab in the spool: its user decides what it names.

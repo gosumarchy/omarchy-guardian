@@ -138,6 +138,10 @@ fn an_override_of_guardians_sweep_or_a_half_followed_item_is_never_allowed() {
     assert_eq!(tiers, [Tier::Unknown, Tier::Unknown, Tier::Allowed]);
     assert!(super::not_allowable(&items[0]).is_some());
     assert!(super::not_allowable(&items[2]).is_none());
+    // Nor is one named by a process's number, which the next may take.
+    assert!(super::not_allowable(&item("proc/1234", "x")).is_some());
+    // The kernel's command line is named by no process.
+    assert!(super::not_allowable(&item("proc/cmdline", "x")).is_none());
     // What the sweep notes for itself is no change to tell.
     let before = Remembered::new();
     let after: Remembered = [(super::TRUST_SEEN.to_string(), "1".to_string())]
@@ -286,4 +290,104 @@ fn the_last_run_is_remembered_with_why_it_did_not_finish() {
     assert_eq!(last_run(&sweep), None);
     // Nor does what a sweep by hand remembered stand in for it.
     assert_eq!(last_run_in(dir.path()), None);
+}
+
+#[test]
+fn a_file_left_unread_for_the_live_checks_limit_is_a_change() {
+    let mut unread = item("a", "one");
+    unread.sha256 = None;
+    unread.body = Body::Unreadable(crate::sweep::live::NOT_READ_PAST_LIMIT.into());
+    let fingerprint = super::fingerprint(&unread);
+    assert_ne!(fingerprint, super::UNREAD);
+    // Read before, left unread now: a swap while the limit is kept full is
+    // told, not hidden behind the old fingerprint.
+    let one = super::fingerprint(&item("a", "one"));
+    let read = Remembered::from([("a".into(), one.clone())]);
+    let kept = super::past_limit(&fingerprint, Some(&one)).unwrap();
+    let left = Remembered::from([("a".into(), kept.clone())]);
+    assert_eq!(diff(&read, &left), [(Change::Changed, "a".to_string())]);
+    // Left unread again it is none, and keeps what was last read.
+    assert_eq!(super::past_limit(&fingerprint, Some(&kept)), Some(kept));
+    assert!(diff(&left, &left).is_empty());
+    // Read again later it is none: which files fall past the limit
+    // depends on the order processes are seen in.
+    assert!(diff(&left, &read).is_empty());
+    // Unless it was swapped while it went unread.
+    let swapped = Remembered::from([("a".into(), super::fingerprint(&item("a", "two")))]);
+    assert_eq!(diff(&left, &swapped), [(Change::Changed, "a".to_string())]);
+    // With nothing read before, nothing is kept.
+    assert_eq!(super::past_limit(&fingerprint, None), None);
+    assert_eq!(super::past_limit(&fingerprint, Some(super::UNREAD)), None);
+    assert_eq!(super::past_limit(&one, Some(&one)), None);
+}
+
+#[test]
+fn a_set_id_file_first_seen_past_the_limit_is_a_change_once_read() {
+    // Past the limit a set-id file is not compared with a package, which
+    // is an alert of its own. Never read before, what is read now was
+    // never looked at.
+    let at = |old: &str, new: &str| {
+        diff(
+            &Remembered::from([("a".into(), old.to_string())]),
+            &Remembered::from([("a".into(), new.to_string())]),
+        )
+    };
+    let unknown = "-limit+unknown-privileged-file";
+    let one = super::fingerprint(&item("a", "one"));
+    assert_eq!(at(unknown, &one).len(), 1);
+    assert_eq!(
+        at(unknown, &format!("{one}+unknown-privileged-file")).len(),
+        1
+    );
+    // Plain unreadable is not past the limit, and is no change once read.
+    assert!(at(super::UNREAD, &one).is_empty());
+    assert_eq!(at(unknown, &format!("{one}+keylogger")).len(), 1);
+    assert_eq!(at(unknown, &format!("{one}+finding")).len(), 1);
+    let kept = super::past_limit(unknown, Some(&one)).unwrap();
+    assert_eq!(kept, format!("-limit:{one}+unknown-privileged-file"));
+    assert!(at(&kept, &one).is_empty());
+    assert_eq!(at(&kept, &super::fingerprint(&item("a", "two"))).len(), 1);
+}
+
+#[test]
+fn the_marks_of_the_last_read_are_kept_past_the_limit() {
+    let at = |old: &str, new: &str| {
+        diff(
+            &Remembered::from([("a".into(), old.to_string())]),
+            &Remembered::from([("a".into(), new.to_string())]),
+        )
+    };
+    let one = super::fingerprint(&item("a", "one"));
+    let read = format!("{one}+keylogger{}", super::FLAGGED);
+    let kept = super::past_limit("-limit+autostart", Some(&read)).unwrap();
+    assert_eq!(
+        kept,
+        format!("-limit:{one}+autostart,keylogger{}", super::FLAGGED)
+    );
+    // Read again with the finding and the alert it had, it is no news.
+    assert!(at(&kept, &read).is_empty());
+    // A mark it never had is.
+    assert_eq!(at(&kept, &format!("{one}+screen-capture")).len(), 1);
+    // Kept again, nothing is lost or doubled.
+    assert_eq!(
+        super::past_limit("-limit+autostart", Some(&kept)),
+        Some(kept)
+    );
+}
+
+#[test]
+fn a_link_target_holding_a_mark_separator_is_not_another_target() {
+    let link = |target: &str| {
+        let mut item = item("a", "");
+        item.sha256 = None;
+        item.body = Body::Link(target.into());
+        super::fingerprint(&item)
+    };
+    let read = link("/home/u/x+y");
+    let kept = super::past_limit("-limit", Some(&read)).unwrap();
+    let swapped = Remembered::from([("a".into(), link("/home/u/x"))]);
+    let left = Remembered::from([("a".into(), kept)]);
+    assert_eq!(diff(&left, &swapped), [(Change::Changed, "a".to_string())]);
+    assert_ne!(link("/a+m"), link("/a+m+m"));
+    assert_ne!(link("/a%2Bm"), link("/a+m"));
 }

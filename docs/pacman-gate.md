@@ -286,8 +286,13 @@ directory rewritten in place during the AI's minutes blocks the transaction.
 Each pass reads the whole archive, so a large one given to `pacman -U` from
 your own directory adds the time it takes to read it twice; an archive in
 pacman's cache is read once. What no hook can close is the moment between the
-hook's exit and pacman opening the file again: keep archives you install with
-`pacman -U` where only you and root can write, which the hook also checks.
+hook's exit and pacman opening the file again. The hook refuses an archive
+that another user could swap (the archive or a directory above it is owned by
+another account, or a group or anyone can write it without the sticky bit),
+but not one in your own directory: a program running as you can replace it in
+that moment, as it can wrap the `sudo pacman` you type. Where that matters, install from a
+directory only root can write (`sudo install -m 0644 -o root x.pkg.tar.zst
+/var/cache/pacman/pkg/`, then `sudo pacman -U` that path).
 
 ## Guardian's own package and the reviewer's
 

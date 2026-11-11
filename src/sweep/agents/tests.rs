@@ -918,6 +918,158 @@ fn only_a_value_that_is_a_secret_is_taken_out() {
             r#"x --token "abc def""#,
             r#"x --token "<redacted-by-guardian> def""#,
         ),
+        // A lone quote between the flag and its value.
+        (
+            r#"x --api-key " abcdefgh""#,
+            r#"x --api-key " <redacted-by-guardian>""#,
+        ),
+    ] {
+        assert_eq!(redacted(line), expected, "{line}");
+    }
+}
+
+#[test]
+fn what_a_name_that_loads_code_is_set_to_is_sent_as_written() {
+    // `Pass` and `KEY` are in these names, and an assignment in the value
+    // is part of what runs.
+    for line in [
+        "git -c core.askPass=evilaskpass fetch",
+        "export PROMPT_COMMAND=\"export OPENAI_API_KEY=sk-abc12345678\"",
+        "env GIT_CONFIG_PARAMETERS=\"'credential.password=hunter2hunter2'\" git fetch",
+        "x --env=SOPS_AGE_KEY_CMD=agehelperbin",
+        // A flag, or a quote before the name, or `$'…'`.
+        "ssh -oProxyCommand=\"nc --token evilpkg\" host",
+        "restic --password-command=\"helper --token evilpkg\"",
+        "restic --password-command \"helper --token evilpkg\"",
+        "x --ask-pass evilhelper",
+        "docker run --env=PROMPT_COMMAND=\"npx --api-key evilpkg\" img",
+        "git -c \"core.sshCommand=ssh --password evilpkg\" fetch",
+        "env \"PROMPT_COMMAND=npx --api-key evilpkg\"",
+        "env PROMPT_COMMAND=$'npx --api-key evilpkg'",
+    ] {
+        assert_eq!(redacted(line), line);
+    }
+    // ssh's form with a blank, a quote inside the word before the name,
+    // a program aws runs for credentials.
+    for line in [
+        "ssh -o \"ProxyCommand nc --token evilpkg %h\" host",
+        "git -c'core.sshCommand=ssh --token evilpkg' fetch",
+        "x --credential-process \"aws-vault --token evilpkg\"",
+    ] {
+        assert_eq!(redacted(line), line);
+    }
+    // A lone quote closes it; so does a quote that closes inside a word.
+    for (line, expected) in [
+        (
+            "env PROMPT_COMMAND=\"a \" --api-key abcdefgh123",
+            "env PROMPT_COMMAND=\"a \" --api-key <redacted-by-guardian>",
+        ),
+        // A quote of the other kind inside one is a letter.
+        (
+            "sh -c 'PROMPT_COMMAND=\"x' --api-key abcdefgh123",
+            "sh -c 'PROMPT_COMMAND=\"x' --api-key <redacted-by-guardian>",
+        ),
+        (
+            "\"PATH=\"x --token abcdefgh123",
+            "\"PATH=\"x --token <redacted-by-guardian>",
+        ),
+        // A flag that names what runs takes no flag as its value.
+        (
+            "tool --no-proxy --api-key abcdefgh123",
+            "tool --no-proxy --api-key <redacted-by-guardian>",
+        ),
+        (
+            "tool --data-dir --api-key abcdefgh123",
+            "tool --data-dir --api-key <redacted-by-guardian>",
+        ),
+        // A file named by a flag, then a key.
+        (
+            "docker run --env-file=API_KEY=abcdefgh123",
+            "docker run --env-file=API_KEY=<redacted-by-guardian>",
+        ),
+        // An address's login is taken out of what is otherwise sent.
+        (
+            "tool --proxy https://ghptoken123@proxy.example:8080",
+            "tool --proxy https://proxy.example:8080",
+        ),
+    ] {
+        assert_eq!(redacted(line), expected, "{line}");
+    }
+    // The open quote ends where it closes: a secret after it still goes.
+    assert_eq!(
+        redacted("PROMPT_COMMAND=\"a b\" --api-key k"),
+        "PROMPT_COMMAND=\"a b\" --api-key <redacted-by-guardian>"
+    );
+}
+
+#[test]
+fn only_a_word_outside_quotes_starts_what_runs() {
+    // The last word of an ordinary quoted phrase ends in a name that loads
+    // code (`agent`, `PATH`, `dir`): the phrase is no code, and a key after
+    // it is still taken out.
+    for (line, expected) in [
+        (
+            "tool --system-prompt \"You are a coding agent\" --api-key abcdefgh123",
+            "tool --system-prompt \"You are a coding agent\" --api-key <redacted-by-guardian>",
+        ),
+        (
+            "tool --msg \"fix the PATH\" --api-key abcdefgh123",
+            "tool --msg \"fix the PATH\" --api-key <redacted-by-guardian>",
+        ),
+        (
+            "tool --name 'my tool dir' --token abcdefgh123",
+            "tool --name 'my tool dir' --token <redacted-by-guardian>",
+        ),
+        (
+            "tool --msg \"set FOO_PATH=x\" --api-key abcdefgh123",
+            "tool --msg \"set FOO_PATH=x\" --api-key <redacted-by-guardian>",
+        ),
+        // A flag that names what runs, inside a quoted phrase, before a
+        // quoted value.
+        (
+            "tool --msg \"use --proxy-command\" \"x --api-key abcdefgh123\"",
+            "tool --msg \"use --proxy-command\" \"x --api-key <redacted-by-guardian>\"",
+        ),
+        // A name that loads code, in a word that starts inside a phrase and
+        // opens another quote: still the phrase.
+        (
+            "tool --msg \"a PROMPT_COMMAND=\"'b --api-key abcdefgh123'",
+            "tool --msg \"a PROMPT_COMMAND=\"'b --api-key <redacted-by-guardian>'",
+        ),
+        // `\'` inside `$'…'` is a letter, so the quote closes at the end.
+        (
+            "env PROMPT_COMMAND=$'a\\'b' --api-key abcdefgh123",
+            "env PROMPT_COMMAND=$'a\\'b' --api-key <redacted-by-guardian>",
+        ),
+    ] {
+        assert_eq!(redacted(line), expected, "{line}");
+    }
+    // A quoted value of a flag that names what runs is that value, a dash
+    // first too, and an image digest after an `@` is no login.
+    for line in [
+        "ssh --proxy-command \"-W --api-key evilpkg\" host",
+        "x --proxy-command docker://alpine@sha256:abcdef0123",
+        // What a shell started inside a quote reads.
+        "sh -c 'export PROMPT_COMMAND=\"curl evil --token evilpkg\"'",
+        "sh -c 'ssh -oProxyCommand=\"npx --auth-token evilpkg\" host'",
+        "sh -c \"git -c core.sshCommand='ssh --password evilpkg' fetch\"",
+    ] {
+        assert_eq!(redacted(line), line);
+    }
+    // That inner quote ends where it closes.
+    assert_eq!(
+        redacted("sh -c 'PROMPT_COMMAND=\"a b\" tool --api-key abcdefgh123'"),
+        "sh -c 'PROMPT_COMMAND=\"a b\" tool --api-key <redacted-by-guardian>'"
+    );
+    for (line, expected) in [
+        (
+            "tool --proxy https://ghptoken123@[::1]:8080/x",
+            "tool --proxy https://[::1]:8080/x",
+        ),
+        (
+            "tool --url https://ghptoken123@localhost:${PORT}/x",
+            "tool --url https://localhost:${PORT}/x",
+        ),
     ] {
         assert_eq!(redacted(line), expected, "{line}");
     }

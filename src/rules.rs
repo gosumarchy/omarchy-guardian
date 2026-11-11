@@ -17,6 +17,7 @@ mod matchers;
 mod net;
 mod paths;
 mod persist;
+mod removal;
 mod run;
 mod shell;
 
@@ -38,6 +39,7 @@ use run::as_file;
 pub(crate) use run::{
     command_variables, fetched_files, run_globs, run_targets, runs_file, with_variables,
 };
+pub(crate) use shell::as_shell_reads;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum RuleId {

@@ -21,7 +21,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
 use super::{
-    Found, Process, Running, Source, is_temporary, is_updated, module_of, packaged, plain,
+    Chooser, Found, Process, Running, Source, is_temporary, is_updated, module_of, packaged, plain,
     replaced_in_own_namespace, source, started_in, subject, told, trusted_program,
 };
 use crate::autorun::Category;
@@ -118,7 +118,7 @@ pub(super) struct Socket {
     remote_port: u16,
     /// A TCP socket waiting for connections.
     listening: bool,
-    inode: String,
+    inode: u64,
 }
 
 impl Socket {
@@ -139,7 +139,7 @@ pub(super) fn socket(line: &str) -> Option<Socket> {
         remote: remote.to_string(),
         remote_port: u16::from_str_radix(remote_port, 16).ok()?,
         listening: fields.get(3) == Some(&"0A"),
-        inode: (*fields.get(9)?).to_string(),
+        inode: fields.get(9)?.parse().ok()?,
     })
 }
 
@@ -184,20 +184,20 @@ pub(super) fn shown(address: &str) -> String {
 /// What a test checks of a parsed socket: its local address as written,
 /// its port, whether it listens and its inode.
 #[cfg(test)]
-pub(super) fn shown_for_test(socket: &Socket) -> (String, u16, bool, String) {
+pub(super) fn shown_for_test(socket: &Socket) -> (String, u16, bool, u64) {
     (
         shown(&socket.local),
         socket.port,
         socket.listening,
-        socket.inode.clone(),
+        socket.inode,
     )
 }
 
 /// The network sockets of one network namespace, by inode.
 #[derive(Default)]
 struct Tables {
-    tcp: HashMap<String, Socket>,
-    udp: HashMap<String, Socket>,
+    tcp: HashMap<u64, Socket>,
+    udp: HashMap<u64, Socket>,
     /// The tables that are there and could not be read, each with why:
     /// their sockets are missing above. One that is not there (`tcp6`
     /// without IPv6) has none.
@@ -209,7 +209,7 @@ impl Tables {
     /// `/proc/<pid>/net` for the namespace it is in).
     fn read(directory: &Path) -> Self {
         let mut unread = Vec::new();
-        let mut table = |names: [&'static str; 2]| -> HashMap<String, Socket> {
+        let mut table = |names: [&'static str; 2]| -> HashMap<u64, Socket> {
             names
                 .into_iter()
                 .filter_map(
@@ -224,8 +224,8 @@ impl Tables {
                 )
                 .flat_map(|text| text.lines().skip(1).filter_map(socket).collect::<Vec<_>>())
                 // Inode 0 is a socket the reader is not told the owner of.
-                .filter(|socket| socket.inode != "0")
-                .map(|socket| (socket.inode.clone(), socket))
+                .filter(|socket| socket.inode != 0)
+                .map(|socket| (socket.inode, socket))
                 .collect()
         };
         let (tcp, udp) = (table(["tcp", "tcp6"]), table(["udp", "udp6"]));
@@ -233,23 +233,14 @@ impl Tables {
     }
 }
 
-/// The inode of a descriptor that is a socket.
-fn socket_inode(target: &str) -> Option<&str> {
-    target.strip_prefix("socket:[")?.strip_suffix(']')
-}
-
-/// Every process that holds each socket. A socket is shared by every
-/// process that inherited it: each one can use it, so each is looked at.
-fn holders(processes: &[Process]) -> HashMap<&str, Vec<&Process>> {
-    let mut holders: HashMap<&str, Vec<&Process>> = HashMap::new();
+/// Every process that holds each socket, by inode. A socket is shared by
+/// every process that inherited it: each one can use it, so each is
+/// looked at. A process names each of its sockets once (`Descriptors::sockets`).
+fn holders(processes: &[Process]) -> HashMap<u64, Vec<&Process>> {
+    let mut holders: HashMap<u64, Vec<&Process>> = HashMap::new();
     for process in processes {
-        for inode in process.fds.iter().filter_map(|(_, fd)| socket_inode(fd)) {
-            // Once per process, however many copies of the socket it
-            // holds.
-            let sharing = holders.entry(inode).or_default();
-            if sharing.last().is_none_or(|last| last.pid != process.pid) {
-                sharing.push(process);
-            }
+        for &(_, inode) in &process.open.sockets {
+            holders.entry(inode).or_default().push(process);
         }
     }
     holders
@@ -284,7 +275,9 @@ pub(super) fn check(scope: &Scope<'_>, running: &Running, found: &mut Found) {
                 tables
             }),
         };
-        connections(scope, process, tables, found);
+        found.through(Chooser::of(process.of_root), |found| {
+            connections(scope, process, tables, found);
+        });
     }
     let closed = others
         .values()
@@ -331,7 +324,7 @@ fn ephemeral(scope: &Scope<'_>) -> (u16, u16) {
 fn listeners(
     scope: &Scope<'_>,
     tables: &Tables,
-    holders: &HashMap<&str, Vec<&Process>>,
+    holders: &HashMap<u64, Vec<&Process>>,
     found: &mut Found,
 ) {
     let range = ephemeral(scope);
@@ -344,7 +337,7 @@ fn listeners(
     sockets.sort_by_key(|socket| socket.port);
     let mut unattributed = Vec::new();
     for socket in sockets {
-        let Some(sharing) = holders.get(socket.inode.as_str()) else {
+        let Some(sharing) = holders.get(&socket.inode) else {
             unattributed.push(socket.port);
             continue;
         };
@@ -356,7 +349,9 @@ fn listeners(
             "listens".to_string()
         };
         for process in sharing {
-            listener(scope, process, ("TCP", socket.port, &port), found);
+            found.through(Chooser::of(process.of_root), |found| {
+                listener(scope, process, ("TCP", socket.port, &port), found);
+            });
         }
     }
     no_process(scope, &unattributed, found);
@@ -372,12 +367,14 @@ fn listeners(
         .collect();
     datagrams.sort_by_key(|socket| socket.port);
     for socket in datagrams {
-        for process in holders.get(socket.inode.as_str()).into_iter().flatten() {
+        for process in holders.get(&socket.inode).into_iter().flatten() {
             // Packaged servers answer on UDP as a matter of course: only
             // what nothing vouches for is worth showing.
             if !vouched(scope, process, found) {
                 let port = format!("udp-{}", socket.port);
-                listener(scope, process, ("UDP", socket.port, &port), found);
+                found.through(Chooser::of(process.of_root), |found| {
+                    listener(scope, process, ("UDP", socket.port, &port), found);
+                });
             }
         }
     }
@@ -409,16 +406,25 @@ fn no_process(scope: &Scope<'_>, ports: &[u16], found: &mut Found) {
         ));
         return;
     }
-    for port in ports {
-        found.add_missing(
-            scope,
-            Category::Listener,
-            &format!("proc/net/tcp:{port}"),
-            "a socket no process holds",
-            format!("TCP port {port} listens from the network, and no process holds its socket"),
-            RuleId::RootkitSign,
-        );
-    }
+    // Any account can leave such a socket listening, as many as it likes:
+    // it hands the socket to itself over a Unix socket and closes its copy.
+    // So these count as an account's, and a hidden process's socket among
+    // them can be cut with them; that is the downside accepted, since as
+    // root's an account could crowd out every root finding after `proc/net`.
+    found.through(Chooser::Account, |found| {
+        for port in ports {
+            found.add_missing(
+                scope,
+                Category::Listener,
+                &format!("proc/net/tcp:{port}"),
+                "a socket no process holds",
+                format!(
+                    "TCP port {port} listens from the network, and no process holds its socket"
+                ),
+                RuleId::RootkitSign,
+            );
+        }
+    });
 }
 
 /// What to say about `process`, which holds a socket listening on a port:
@@ -680,13 +686,13 @@ fn relay(process: &Process) -> Option<&'static str> {
     }
     // A process title may be one string (`sshd: /usr/bin/sshd -D
     // [listener]`).
-    let words: Vec<&str> = process
-        .arguments
+    let arguments = process.arguments();
+    let words: Vec<&str> = arguments
         .iter()
         .flat_map(|argument| argument.split_whitespace())
         .collect();
     match name {
-        "ssh" if !process.on_terminal() && forwards(&words) => {
+        "ssh" if !process.open.on_terminal && forwards(&words) => {
             Some("an SSH client that forwards ports, started from no terminal")
         }
         "sshd" if own_settings(&words) => {
@@ -742,13 +748,15 @@ fn connections(scope: &Scope<'_>, process: &Process, tables: &Tables, found: &mu
     if is_updated(scope, process) && !is_interpreter(process.path()) {
         return;
     }
-    let connection = |fd: &(u32, String)| {
-        socket_inode(&fd.1)
-            .and_then(|inode| tables.tcp.get(inode))
+    let connection = |&(fd, inode): &(u32, u64)| {
+        tables
+            .tcp
+            .get(&inode)
             .filter(|socket| socket.connected())
-            .map(|socket| (fd.0, socket))
+            .map(|socket| (fd, socket))
     };
-    let mut held: Vec<(u32, &Socket)> = process.fds.iter().filter_map(connection).collect();
+    let mut held: Vec<(u32, &Socket)> =
+        process.open.sockets.iter().filter_map(connection).collect();
     if held.is_empty() {
         return;
     }
@@ -834,7 +842,7 @@ fn remote_shell(
 /// Raw packet sockets (`/proc/net/packet`): what a sniffer, or a backdoor
 /// that waits for a magic packet without opening a port, reads the
 /// network through. The programs that run the network hold some too.
-fn packet_sockets(scope: &Scope<'_>, holders: &HashMap<&str, Vec<&Process>>, found: &mut Found) {
+fn packet_sockets(scope: &Scope<'_>, holders: &HashMap<u64, Vec<&Process>>, found: &mut Found) {
     // Not there until the kernel's packet-socket support is loaded.
     let read = fs::read_to_string(scope.root.join("proc/net/packet"));
     let Some(text) = found.read(
@@ -851,40 +859,18 @@ fn packet_sockets(scope: &Scope<'_>, holders: &HashMap<&str, Vec<&Process>>, fou
         .skip(1)
         .filter_map(|line| line.split_whitespace().last())
     {
-        let Some(sharing) = holders.get(inode) else {
+        let Some(sharing) = inode
+            .parse()
+            .ok()
+            .and_then(|inode: u64| holders.get(&inode))
+        else {
             unattributed += 1;
             continue;
         };
         for process in sharing {
-            if PACKET_USERS.contains(&process.name()) && vouched(scope, process, found) {
-                continue;
-            }
-            let note = format!(
-                "process {} ({}) holds a raw packet socket: it can read the traffic of this machine",
-                process.pid,
-                process.started()
-            );
-            let exe = process.path();
-            if exe.starts_with("memfd:") || process.deleted {
-                found.add_missing(
-                    scope,
-                    Category::Process,
-                    exe,
-                    "no file on disk",
-                    note,
-                    RuleId::KernelTap,
-                );
-                continue;
-            }
-            let (path, _) = subject(scope, process, exe);
-            found.add_as(
-                scope,
-                Category::Process,
-                &format!("{path}:packet-socket"),
-                &path,
-                note,
-                Some(RuleId::KernelTap),
-            );
+            found.through(Chooser::of(process.of_root), |found| {
+                packet_socket(scope, process, found);
+            });
         }
     }
     // As a user those are root's programs, which the root checks see.
@@ -898,6 +884,40 @@ fn packet_sockets(scope: &Scope<'_>, holders: &HashMap<&str, Vec<&Process>>, fou
             RuleId::KernelTap,
         );
     }
+}
+
+/// Reports `process`, which holds a raw packet socket, unless it is a
+/// packaged program that runs the network.
+fn packet_socket(scope: &Scope<'_>, process: &Process, found: &mut Found) {
+    if PACKET_USERS.contains(&process.name()) && vouched(scope, process, found) {
+        return;
+    }
+    let note = format!(
+        "process {} ({}) holds a raw packet socket: it can read the traffic of this machine",
+        process.pid,
+        process.started()
+    );
+    let exe = process.path();
+    if exe.starts_with("memfd:") || process.deleted {
+        found.add_missing(
+            scope,
+            Category::Process,
+            exe,
+            "no file on disk",
+            note,
+            RuleId::KernelTap,
+        );
+        return;
+    }
+    let (path, _) = subject(scope, process, exe);
+    found.add_as(
+        scope,
+        Category::Process,
+        &format!("{path}:packet-socket"),
+        &path,
+        note,
+        Some(RuleId::KernelTap),
+    );
 }
 
 /// Interfaces in promiscuous mode, which take in traffic that is not for

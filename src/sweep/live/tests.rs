@@ -3,11 +3,12 @@
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt, symlink};
 use std::path::Path;
 
+use super::capability::Capabilities;
 use super::net::{is_loopback, socket};
-use super::{Preload, check, module_name, parse_getcap, preloaded};
+use super::{Preload, check, module_name, preloaded};
 use crate::autorun::Category;
 use crate::rules::RuleId;
 use crate::sha256::Sha256;
@@ -18,6 +19,15 @@ use crate::test_support::TempDir;
 fn write(root: &Path, path: &str, text: &str) {
     fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
     fs::write(root.join(path), text).unwrap();
+}
+
+/// A host mount table of one mount, `/`, where set-id bits take effect.
+const ONE_MOUNT: &str = "22 1 0:21 / / rw,relatime - ext4 /dev/sda1 rw\n";
+
+/// Writes `ONE_MOUNT` as the host's table, which root's search for set-id
+/// files reads to tell where set-id bits take effect.
+fn host_mounts(root: &Path) {
+    write(root, "proc/1/mountinfo", ONE_MOUNT);
 }
 
 fn process(root: &Path, pid: &str, exe: &str, fds: &[(&str, &str)], environment: &str) {
@@ -46,19 +56,6 @@ fn procfs_fields_are_read() {
             Preload::Searched("libz.so".into())
         ]
     );
-    assert_eq!(
-        parse_getcap(
-            "/usr/bin/a b cap_setuid=ep\n/usr/bin/c =ep [rootid=1000]\n/usr/bin/d cap_net_raw,cap_setgid=ep cap_chown=i\n"
-        ),
-        [
-            ("usr/bin/a b".to_string(), "cap_setuid=ep".to_string()),
-            ("usr/bin/c".to_string(), "=ep [rootid=1000]".to_string()),
-            (
-                "usr/bin/d".to_string(),
-                "cap_net_raw,cap_setgid=ep cap_chown=i".to_string()
-            ),
-        ]
-    );
     assert!(is_loopback("0100007F") && !is_loopback("00000000"));
     assert!(is_loopback("00000000000000000000000001000000"));
     assert!(!is_loopback("00000000000000000000000000000000"));
@@ -66,7 +63,7 @@ fn procfs_fields_are_read() {
     let listening = socket(line).unwrap();
     assert_eq!(
         super::net::shown_for_test(&listening),
-        ("0.0.0.0".to_string(), 8080, true, "4242".to_string())
+        ("0.0.0.0".to_string(), 8080, true, 4242)
     );
 }
 
@@ -319,20 +316,861 @@ fn a_setuid_file_under_a_name_that_is_not_utf8_is_said() {
     )
     .unwrap();
     fs::create_dir(root.join("usr").join(OsStr::from_bytes(b"dir\xff"))).unwrap();
+    // A program without capabilities is no privileged file.
+    let program = root.join("usr/local").join(OsStr::from_bytes(b"run\xff"));
+    fs::write(&program, "program").unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    // Where anyone may write, the names are an account's to choose.
+    fs::create_dir_all(root.join("var/tmp").join(OsStr::from_bytes(b"d\xfe"))).unwrap();
+    let theirs = root.join("var/tmp").join(OsStr::from_bytes(b"sh\xfe"));
+    fs::write(&theirs, "shell").unwrap();
+    fs::set_permissions(&theirs, fs::Permissions::from_mode(0o4755)).unwrap();
+    let their_program = root.join("var/tmp").join(OsStr::from_bytes(b"run\xfe"));
+    fs::write(&their_program, "program").unwrap();
+    fs::set_permissions(&their_program, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(root.join("var/tmp"), fs::Permissions::from_mode(0o1777)).unwrap();
+    write(root, "proc/1/mountinfo", ONE_MOUNT);
     let index = PackageIndex::with_foreign(HashSet::new());
     let mut live = check(&Scope {
         root,
         home: None,
         index: &index,
-        origin: Origin::System,
+        origin: Origin::Root,
     });
     live.unchecked.sort();
     assert_eq!(
         live.unchecked,
         [
-            "/usr/dir\u{fffd}: a name that is not UTF-8 was not checked",
-            "/usr/local/sh\u{fffd}: a name that is not UTF-8 was not checked",
+            "/usr/dir\\xff: a name that is not UTF-8 was not checked",
+            "/usr/local/sh\\xff: a name that is not UTF-8 was not checked",
         ]
+    );
+    assert!(!live.items.iter().any(|item| item.path.contains("run")));
+    let digest = Sha256::digest(b"sh\xfe").to_string();
+    let named = format!("var/tmp#not-utf8-{}", &digest[..12]);
+    assert!(live.items.iter().any(|item| {
+        item.path == named
+            && item.notes.iter().any(|note| note.contains("sh\\xfe"))
+            && item
+                .alerts
+                .iter()
+                .any(|(rule, _)| *rule == RuleId::UnknownPrivilegedFile)
+    }));
+    assert!(live.of_accounts.contains(&named));
+    assert!(
+        live.notes
+            .iter()
+            .any(|note| note.starts_with("1 directory(ies) whose names"))
+    );
+}
+
+/// The alert the set-id walk raises for the accounts' file `name`, in
+/// `directory`, a name that is not UTF-8.
+fn odd_named(directory: &str, name: &[u8]) -> String {
+    let digest = Sha256::digest(name).to_string();
+    format!("{directory}#not-utf8-{}", &digest[..12])
+}
+
+#[test]
+fn a_name_that_is_not_utf8_below_a_place_anyone_writes_is_an_accounts() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let dir = TempDir::new("sweep-live-unnamed-below");
+    let root = dir.path();
+    // A directory root owns and only root may write, but in a place anyone
+    // may write: whoever made it chose what it holds.
+    let theirs = root.join("var/tmp/sub");
+    fs::create_dir_all(&theirs).unwrap();
+    let shell = theirs.join(OsStr::from_bytes(b"sh\xfd"));
+    fs::write(&shell, "shell").unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o4755)).unwrap();
+    fs::set_permissions(&theirs, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(root.join("var/tmp"), fs::Permissions::from_mode(0o1777)).unwrap();
+    // On a mount where set-id bits have no effect, a name is not root's to
+    // vouch for either.
+    fs::create_dir_all(root.join("usr/local")).unwrap();
+    let mounted = root.join("usr/local").join(OsStr::from_bytes(b"sh\xfc"));
+    fs::write(&mounted, "shell").unwrap();
+    fs::set_permissions(&mounted, fs::Permissions::from_mode(0o4755)).unwrap();
+    // The host's table is read as bytes: a mount point that is not UTF-8
+    // spoils no other line.
+    let mut mountinfo = format!("{ONE_MOUNT}40 22 0:40 / /usr/local rw,nosuid - fuse.x x rw\n");
+    mountinfo.push_str("41 22 0:41 / /mnt/");
+    let mut mountinfo = mountinfo.into_bytes();
+    mountinfo.extend_from_slice(b"\xff rw - tmpfs tmpfs rw\n");
+    fs::create_dir_all(root.join("proc/1")).unwrap();
+    fs::write(root.join("proc/1/mountinfo"), mountinfo).unwrap();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let live = check(&Scope {
+        root,
+        home: None,
+        index: &index,
+        origin: Origin::Root,
+    });
+    assert_eq!(live.unchecked, Vec::<String>::new());
+    for named in [
+        odd_named("var/tmp/sub", b"sh\xfd"),
+        odd_named("usr/local", b"sh\xfc"),
+    ] {
+        assert!(
+            live.items.iter().any(|item| item.path == named) && live.of_accounts.contains(&named),
+            "{named}"
+        );
+    }
+}
+
+#[test]
+fn files_where_not_only_root_names_them_do_not_use_up_roots_walk() {
+    use super::capability::capabilities;
+    use super::privileged::{Closed, mounts, privileged_walk};
+    let dir = TempDir::new("sweep-live-walk-budget");
+    let root = dir.path();
+    fs::create_dir_all(root.join("usr/local")).unwrap();
+    // Any account may write a mail spool, as `/var/tmp`.
+    let spool = root.join("var/spool/mail");
+    fs::create_dir_all(&spool).unwrap();
+    for at in 0..10 {
+        fs::write(spool.join(format!("f{at}")), "").unwrap();
+    }
+    fs::set_permissions(&spool, fs::Permissions::from_mode(0o1777)).unwrap();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: None,
+        index: &index,
+        origin: Origin::Root,
+    };
+    let mut closed = Closed {
+        mounts: Some(mounts(ONE_MOUNT)),
+        ..Closed::default()
+    };
+    let mut found = super::Found::default();
+    privileged_walk(&scope, &mut found, &mut closed, files(5), capabilities);
+    assert_eq!(found.unchecked, Vec::<String>::new());
+    assert!(
+        found
+            .notes
+            .iter()
+            .any(|note| note.starts_with("more than 5 files in places accounts may write")),
+        "{:?}",
+        found.notes
+    );
+    // A user's search cannot tell root's places from the others: running
+    // out leaves it incomplete.
+    let scope = Scope {
+        origin: Origin::System,
+        ..scope
+    };
+    let mut found = super::Found::default();
+    privileged_walk(
+        &scope,
+        &mut found,
+        &mut Closed::default(),
+        files(5),
+        capabilities,
+    );
+    assert_eq!(
+        found.unchecked,
+        [
+            "more than 5 files: setuid programs and files with capabilities were not looked for \
+          everywhere"
+        ]
+    );
+}
+
+#[test]
+fn a_place_the_walk_starts_at_that_is_a_link_is_not_walked() {
+    use super::capability::capabilities;
+    use super::privileged::{Closed, mounts, privileged_walk};
+    let dir = TempDir::new("sweep-live-walk-link");
+    let root = dir.path();
+    fs::create_dir_all(root.join("usr")).unwrap();
+    symlink("usr", root.join("srv")).unwrap();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: None,
+        index: &index,
+        origin: Origin::Root,
+    };
+    let mut closed = Closed {
+        mounts: Some(mounts(ONE_MOUNT)),
+        ..Closed::default()
+    };
+    let mut found = super::Found::default();
+    privileged_walk(&scope, &mut found, &mut closed, files(100), capabilities);
+    assert_eq!(
+        found.unchecked,
+        ["/srv is a link: setuid programs were not looked for there"]
+    );
+}
+
+/// Gives the file at `path` `cap_net_raw` for the user namespace of the
+/// user running the tests, as any account can (`unshare -Ur setcap`);
+/// `false` where `unshare` or `setcap` cannot.
+fn namespaced_capability(path: &Path) -> bool {
+    std::process::Command::new("unshare")
+        .args(["-Ur", "setcap", "cap_net_raw+ep"])
+        .arg(path)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// The capabilities getcap's `clauses` give, for clauses that only give
+/// (`=` or `+`): `cap_a,cap_b=ep`, `=ep` for every one, and `41=p` by
+/// number.
+fn given(clauses: &str) -> Capabilities {
+    let mut capabilities = Capabilities {
+        permitted: 0,
+        inheritable: 0,
+        effective: false,
+        root_id: 0,
+    };
+    for clause in clauses.split_whitespace() {
+        let (names, sets) = clause.split_once(['=', '+']).expect("a clause that gives");
+        let bits = if names.is_empty() {
+            (1 << 41) - 1
+        } else {
+            names
+                .split(',')
+                .fold(0, |bits, name| bits | 1 << bit_of(name))
+        };
+        if sets.contains('p') {
+            capabilities.permitted |= bits;
+        }
+        if sets.contains('i') {
+            capabilities.inheritable |= bits;
+        }
+        capabilities.effective |= sets.contains('e');
+    }
+    capabilities
+}
+
+/// The bit of the capability `name`, as `Capabilities::names` names it.
+fn bit_of(name: &str) -> u32 {
+    (0..64)
+        .find(|bit| {
+            let one = Capabilities {
+                permitted: 1 << bit,
+                inheritable: 0,
+                effective: false,
+                root_id: 0,
+            };
+            one.names() == [name]
+        })
+        .expect("a capability's name")
+}
+
+#[test]
+fn the_kernels_capability_data_reads_as_clauses() {
+    use super::capability::decode;
+    let words = |words: &[u32]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
+    let text = |data: &[u8]| decode(data).map(|read| read.map(|read| read.to_string()));
+    // Revision 2, effective: cap_setuid (7) and cap_net_raw (13) permitted,
+    // cap_chown (0) inheritable, and capability 41 permitted.
+    let data = words(&[0x0200_0001, 1 << 7 | 1 << 13, 1, 1 << 9, 0]);
+    assert_eq!(
+        text(&data),
+        Ok(Some(
+            "cap_chown=ei cap_setuid,cap_net_raw,41=ep".to_string()
+        ))
+    );
+    // Revision 3 names whose root the capabilities are for.
+    let data = words(&[0x0300_0000, 1 << 13, 0, 0, 0, 1000]);
+    assert_eq!(
+        text(&data),
+        Ok(Some("cap_net_raw=p [rootid=1000]".to_string()))
+    );
+    assert_eq!(decode(&data).unwrap().unwrap().root_id, 1000);
+    let data = words(&[0x0300_0001, 1 << 13, 0, 0, 0, 0]);
+    assert_eq!(text(&data), Ok(Some("cap_net_raw=ep".to_string())));
+    // Every capability, as setcap writes `=ep`, and with more besides.
+    let data = words(&[0x0200_0001, u32::MAX, 0, 0x1ff, 0]);
+    assert_eq!(text(&data), Ok(Some("=ep".to_string())));
+    let data = words(&[0x0200_0001, u32::MAX, 0, u32::MAX, 0]);
+    assert_eq!(text(&data), Ok(Some("=ep".to_string())));
+    let data = words(&[0x0200_0001, u32::MAX, 0, 0xff, 0]);
+    assert!(text(&data).unwrap().unwrap().ends_with("cap_bpf=ep"));
+    // No capability in any set is none at all.
+    assert_eq!(text(&words(&[0x0200_0001, 0, 0, 0, 0])), Ok(None));
+    // What the kernel would not write is an error, revision 1 among it.
+    assert!(decode(&words(&[0x0100_0001, 1 << 21, 0])).is_err());
+    assert!(decode(&words(&[0x0400_0000, 0, 0])).is_err());
+    assert!(decode(&words(&[0x0200_0000, 0, 0])).is_err());
+    assert!(decode(&words(&[0x0200_0000, 0, 0, 0, 0, 0])).is_err());
+    assert!(decode(&words(&[0x0300_0000, 0, 0, 0, 0])).is_err());
+    assert!(decode(&[1, 2]).is_err());
+    assert!(decode(&[]).is_err());
+}
+
+#[test]
+fn no_capability_data_makes_its_reader_panic() {
+    use super::capability::decode;
+    let mut rng = crate::test_support::Rng::new(0x5ca9);
+    let mut byte = || u8::try_from(rng.below(256)).expect("below 256");
+    for _ in 0..20_000 {
+        let size = [12, 20, 24, usize::from(byte() % 30)][usize::from(byte() % 4)];
+        let mut data: Vec<u8> = (0..size).map(|_| byte()).collect();
+        if let Some(first) = data.get_mut(3) {
+            *first = [1, 2, 3, byte()][usize::from(byte() % 4)];
+        }
+        if let Ok(Some(read)) = decode(&data) {
+            assert!(!read.names().is_empty(), "{read}");
+            assert!(!read.to_string().is_empty(), "{read:?}");
+        }
+    }
+}
+
+/// The entry `name` of `directory`, held as the walk holds it.
+fn held(directory: &fs::File, name: &[u8]) -> std::io::Result<super::pinned::Held> {
+    use std::os::unix::ffi::OsStrExt;
+    let mount = super::pinned::mount_of(directory)?;
+    super::pinned::hold(directory, mount, std::ffi::OsStr::from_bytes(name))
+}
+
+/// The capabilities of the entry `name` of `directory`, on its own mount.
+fn capabilities_of(directory: &fs::File, name: &[u8]) -> Option<Capabilities> {
+    let super::pinned::Held::Here(file) = held(directory, name).unwrap() else {
+        panic!("something is mounted on it");
+    };
+    super::capability::capabilities(&file).unwrap()
+}
+
+#[test]
+fn a_files_capabilities_are_read_through_the_file_held() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let dir = TempDir::new("live-capability-read");
+    let root = dir.path();
+    fs::write(root.join("plain"), "").unwrap();
+    let odd = root.join(OsStr::from_bytes(b"run\xfe"));
+    fs::write(&odd, "").unwrap();
+    let directory = fs::File::open(root).unwrap();
+    assert!(capabilities_of(&directory, b"plain").is_none());
+    assert_eq!(
+        held(&directory, b"gone").unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    assert_eq!(
+        held(&directory, b"a\0b").unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    // A filesystem that keeps no such attribute gives none.
+    let proc = fs::File::open("/proc/self").unwrap();
+    assert!(capabilities_of(&proc, b"status").is_none());
+    if !namespaced_capability(&odd) {
+        errln!("skipped: unshare -Ur setcap is not available");
+        return;
+    }
+    let read = capabilities_of(&directory, b"run\xfe").unwrap();
+    assert_eq!(read.names(), ["cap_net_raw"]);
+    assert_ne!(read.root_id, 0);
+}
+
+#[test]
+fn an_entry_with_something_mounted_on_it_is_told_apart() {
+    use super::pinned::{Held, is_listed, open_directory};
+    use super::privileged::{Asked, askable};
+    let top = fs::File::open("/").unwrap();
+    let mut table = super::mount_table::MountTable::default();
+    // `/proc` is a mount of its own wherever the tests run, root's, of
+    // another filesystem than `/`: it may be asked about, as one on it.
+    assert!(matches!(held(&top, b"proc").unwrap(), Held::Mounted(..)));
+    assert!(matches!(
+        askable(held(&top, b"proc").unwrap(), |id| table.kind(id)),
+        Some(Asked::File(_))
+    ));
+    assert!(matches!(
+        askable(held(&top, b"etc").unwrap(), |id| table.kind(id)),
+        Some(Asked::File(_))
+    ));
+    let dir = TempDir::new("live-pinned");
+    let root = dir.path();
+    fs::create_dir(root.join("d")).unwrap();
+    symlink("d", root.join("link")).unwrap();
+    let directory = fs::File::open(root).unwrap();
+    let Held::Here(d) = held(&directory, b"d").unwrap() else {
+        panic!("a directory on its parent's mount");
+    };
+    let listed = super::pinned::Identity::of(&fs::symlink_metadata(root.join("d")).unwrap());
+    assert!(is_listed(&d, listed).unwrap());
+    assert!(open_directory(&d).is_ok());
+    // A link is held as the link, not as what it leads to.
+    let Held::Here(link) = held(&directory, b"link").unwrap() else {
+        panic!("a link on its directory's mount");
+    };
+    assert!(!is_listed(&link, listed).unwrap());
+}
+
+#[test]
+fn a_deep_chain_of_directories_is_walked_to_a_depth_and_quickly() {
+    let dir = TempDir::new("live-walk-deep");
+    let root = dir.path();
+    let theirs = root.join("var/tmp");
+    let mut deep = theirs.clone();
+    for _ in 0..2_000 {
+        deep.push("d");
+    }
+    fs::create_dir_all(&deep).unwrap();
+    let mut shallow = theirs.clone();
+    for _ in 0..30 {
+        shallow.push("s");
+    }
+    setuid_file(&shallow.join("x"));
+    fs::set_permissions(&theirs, fs::Permissions::from_mode(0o1777)).unwrap();
+    let started = std::time::Instant::now();
+    let found = walk_as_root(root, files(100_000), none_anywhere, ONE_MOUNT);
+    // Walked again from the root for each directory, 64 levels took about
+    // as long as 2,000 do now; it is far under either way.
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    let path = format!("var/tmp/{}x", "s/".repeat(30));
+    assert!(found.items.contains_key(&path), "{:?}", found.items.keys());
+    assert!(
+        found.notes.iter().any(|note| note.starts_with(
+            "1 directory(ies) more than 64 below where the walk starts, in places accounts may write"
+        )),
+        "{:?}",
+        found.notes
+    );
+    assert_eq!(found.unchecked, Vec::<String>::new());
+}
+
+/// The sweep's budget, with `files` files to a run.
+fn files(files: usize) -> super::privileged::Budget {
+    super::privileged::Budget {
+        files,
+        ..super::privileged::Budget::SWEEP
+    }
+}
+
+/// Reads `cap_net_raw=ep` on every file.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the type the walk reads capabilities by"
+)]
+fn net_raw_everywhere(_: &fs::File) -> std::io::Result<Option<Capabilities>> {
+    Ok(Some(given("cap_net_raw=ep")))
+}
+
+/// Reads no capabilities on any file.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the type the walk reads capabilities by"
+)]
+fn none_anywhere(_: &fs::File) -> std::io::Result<Option<Capabilities>> {
+    Ok(None)
+}
+
+/// Root's walk of `root`, with `mountinfo` as the host's mounts.
+fn walk_as_root(
+    root: &Path,
+    budget: super::privileged::Budget,
+    read: super::privileged::ReadCapabilities,
+    mountinfo: &str,
+) -> super::Found {
+    walk_with(
+        root,
+        &PackageIndex::with_foreign(HashSet::new()),
+        budget,
+        read,
+        mountinfo,
+    )
+}
+
+/// `walk_as_root` with the packages of `index`.
+fn walk_with(
+    root: &Path,
+    index: &PackageIndex,
+    budget: super::privileged::Budget,
+    read: super::privileged::ReadCapabilities,
+    mountinfo: &str,
+) -> super::Found {
+    let scope = Scope {
+        root,
+        home: None,
+        index,
+        origin: Origin::Root,
+    };
+    let mut closed = super::Closed {
+        mounts: Some(super::mounts(mountinfo)),
+        ..super::Closed::default()
+    };
+    let mut found = super::Found::default();
+    super::privileged::privileged_walk(&scope, &mut found, &mut closed, budget, read);
+    found
+}
+
+/// Writes a setuid file at `path`.
+fn setuid_file(path: &Path) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, "program").unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o4755)).unwrap();
+}
+
+#[test]
+fn a_privileged_file_is_looked_at_by_one_name() {
+    let dir = TempDir::new("live-walk-hard-links");
+    let root = dir.path();
+    setuid_file(&root.join("usr/local/a"));
+    fs::hard_link(root.join("usr/local/a"), root.join("usr/local/b")).unwrap();
+    fs::hard_link(root.join("usr/local/a"), root.join("usr/local/c")).unwrap();
+    setuid_file(&root.join("usr/local/d"));
+    let found = walk_as_root(root, files(100), none_anywhere, ONE_MOUNT);
+    let names = ["usr/local/a", "usr/local/b", "usr/local/c"];
+    let listed = names.iter().filter(|name| found.items.contains_key(**name));
+    assert_eq!(listed.count(), 1, "{:?}", found.items.keys());
+    assert!(found.items.contains_key("usr/local/d"));
+    assert!(
+        found.notes.iter().any(|note| note.starts_with(
+            "2 more name(s) of setuid files or files with capabilities already looked at"
+        )),
+        "{:?}",
+        found.notes
+    );
+}
+
+#[test]
+fn an_accounts_files_are_hashed_up_to_the_budget_and_roots_always() {
+    let dir = TempDir::new("live-walk-hash-budget");
+    let root = dir.path();
+    for name in ["r1", "r2"] {
+        setuid_file(&root.join("usr/local").join(name));
+    }
+    let theirs = root.join("var/tmp");
+    for name in ["a1", "a2", "a3"] {
+        setuid_file(&theirs.join(name));
+    }
+    fs::set_permissions(&theirs, fs::Permissions::from_mode(0o1777)).unwrap();
+    // Each file is 7 bytes: two of the accounts' are hashed, and root's
+    // are not counted.
+    let budget = super::privileged::Budget {
+        files: 100,
+        hashed: 10,
+    };
+    let found = walk_as_root(root, budget, none_anywhere, ONE_MOUNT);
+    for path in [
+        "usr/local/r1",
+        "usr/local/r2",
+        "var/tmp/a1",
+        "var/tmp/a2",
+        "var/tmp/a3",
+    ] {
+        assert!(found.items.contains_key(path), "{path}");
+    }
+    assert!(
+        found
+            .notes
+            .iter()
+            .any(|note| note.starts_with("1 setuid file(s) or file(s) with capabilities in places")),
+        "{:?}",
+        found.notes
+    );
+}
+
+#[test]
+fn a_packaged_path_past_the_hashing_budget_is_listed() {
+    // A package's file at a path in a place accounts may write.
+    let (dir, index) = system(
+        "live-walk-unhashed-packaged",
+        &[("var/tmp/pkg", "packaged")],
+    );
+    let root = dir.path();
+    setuid_file(&root.join("var/tmp/pkg"));
+    fs::set_permissions(root.join("var/tmp"), fs::Permissions::from_mode(0o1777)).unwrap();
+    let none_hashed = super::privileged::Budget {
+        files: 100,
+        hashed: 0,
+    };
+    let found = walk_with(root, &index, none_hashed, none_anywhere, ONE_MOUNT);
+    assert!(found.items.contains_key("var/tmp/pkg"), "{:?}", found.notes);
+}
+
+#[test]
+fn a_directory_is_skipped_only_where_it_holds_other_systems_files() {
+    let dir = TempDir::new("live-walk-skipped");
+    let root = dir.path();
+    // Not a subvolume: any account can name a directory so.
+    setuid_file(&root.join("usr/local/.snapshots/s"));
+    setuid_file(&root.join("var/cache/x/s"));
+    setuid_file(&root.join("var/cache/pacman/pkg/s"));
+    let found = walk_as_root(root, files(100), none_anywhere, ONE_MOUNT);
+    assert!(found.items.contains_key("usr/local/.snapshots/s"));
+    assert!(found.items.contains_key("var/cache/x/s"));
+    assert!(!found.items.contains_key("var/cache/pacman/pkg/s"));
+}
+
+#[test]
+fn a_file_that_is_a_nosuid_mount_point_is_not_asked_about() {
+    let dir = TempDir::new("live-walk-file-mount");
+    let root = dir.path();
+    fs::create_dir_all(root.join("usr/local")).unwrap();
+    fs::write(root.join("usr/local/tool"), "tool").unwrap();
+    fs::write(root.join("usr/local/other"), "other").unwrap();
+    let mountinfo = format!("{ONE_MOUNT}40 22 0:40 / /usr/local/tool rw,nosuid - fuse.x x rw\n");
+    let found = walk_as_root(root, files(100), net_raw_everywhere, &mountinfo);
+    assert!(found.items.contains_key("usr/local/other"));
+    assert!(!found.items.contains_key("usr/local/tool"));
+}
+
+#[test]
+fn a_name_that_reads_as_a_nosuid_mount_point_is_still_asked_about() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = TempDir::new("live-walk-lossy-mount");
+    let root = dir.path();
+    let theirs = root.join("var/tmp");
+    fs::create_dir_all(&theirs).unwrap();
+    fs::write(theirs.join(OsStr::from_bytes(b"run\xfe")), "program").unwrap();
+    fs::set_permissions(&theirs, fs::Permissions::from_mode(0o1777)).unwrap();
+    // A mount without set-id at a name that is not UTF-8 (`\xff`): the
+    // table is read lossily, as the account's `run\xfe` is, and both read
+    // `run\u{fffd}`. The file is on its directory's mount all the same.
+    let mountinfo =
+        format!("{ONE_MOUNT}40 22 0:40 / /var/tmp/run\u{fffd} rw,nosuid - tmpfs tmpfs rw\n");
+    let found = walk_as_root(root, files(100), net_raw_everywhere, &mountinfo);
+    let named = odd_named("var/tmp", b"run\xfe");
+    assert!(found.items.contains_key(&named), "{:?}", found.items.keys());
+}
+
+/// Takes the set-id bits off the file the walk holds, between its listing
+/// and its look, as an account's swap would; reads no capabilities.
+fn clears_set_id(held: &fs::File) -> std::io::Result<Option<Capabilities>> {
+    use std::os::fd::AsRawFd;
+    let path = format!("/proc/self/fd/{}", held.as_raw_fd());
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+    Ok(None)
+}
+
+#[test]
+fn a_set_id_file_swapped_while_it_is_looked_at_is_told_where_accounts_write() {
+    let dir = TempDir::new("live-walk-swapped");
+    let root = dir.path();
+    setuid_file(&root.join("usr/local/r"));
+    setuid_file(&root.join("var/tmp/a"));
+    fs::set_permissions(root.join("var/tmp"), fs::Permissions::from_mode(0o1777)).unwrap();
+    let found = walk_as_root(root, files(100), clears_set_id, ONE_MOUNT);
+    assert!(found.items.is_empty(), "{:?}", found.items.keys());
+    // Only root changes its own places.
+    assert_eq!(found.unchecked, Vec::<String>::new());
+    assert!(
+        found.notes.iter().any(|note| note.ends_with(
+            "1 place(s) accounts may write that could not be listed (/var/tmp among them)"
+        )),
+        "{:?}",
+        found.notes
+    );
+}
+
+#[test]
+fn an_entry_gone_meanwhile_is_done_with_only_where_root_alone_names_files() {
+    use super::privileged::{Entry, unasked};
+    use std::io::{Error, ErrorKind};
+    let gone = Error::from(ErrorKind::NotFound);
+    assert!(matches!(unasked(&gone, true), Entry::Done));
+    // Anywhere else an account may have moved it away while it was looked at.
+    assert!(matches!(unasked(&gone, false), Entry::Unknown));
+    for kind in [
+        ErrorKind::PermissionDenied,
+        ErrorKind::InvalidData,
+        ErrorKind::Other,
+    ] {
+        assert!(matches!(unasked(&Error::from(kind), true), Entry::Unknown));
+    }
+}
+
+/// `capabilities`, read as if they were the host's: a test cannot give a
+/// file those without being root.
+fn as_hosts(held: &fs::File) -> std::io::Result<Option<Capabilities>> {
+    let read = super::capability::capabilities(held)?;
+    Ok(read.map(|read| Capabilities { root_id: 0, ..read }))
+}
+
+#[test]
+fn a_file_with_capabilities_is_found_by_the_walk() {
+    use super::capability::capabilities;
+    use super::privileged::{Closed, mounts, privileged_walk};
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let dir = TempDir::new("live-capability-walk");
+    let root = dir.path();
+    let theirs = root.join("var/tmp");
+    fs::create_dir_all(&theirs).unwrap();
+    fs::create_dir_all(root.join("usr/local")).unwrap();
+    let tool = root.join("usr/local/tool");
+    fs::write(&tool, "tool").unwrap();
+    let odd = theirs.join(OsStr::from_bytes(b"run\xfe"));
+    fs::write(&odd, "program").unwrap();
+    let rooted = root
+        .join("usr/local")
+        .join(OsStr::from_bytes(b"rooted\xfe"));
+    fs::write(&rooted, "program").unwrap();
+    if ![&tool, &odd, &rooted]
+        .iter()
+        .all(|path| namespaced_capability(path))
+    {
+        errln!("skipped: unshare -Ur setcap is not available");
+        return;
+    }
+    fs::set_permissions(&theirs, fs::Permissions::from_mode(0o1777)).unwrap();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: None,
+        index: &index,
+        origin: Origin::Root,
+    };
+    let mut closed = Closed {
+        mounts: Some(mounts(ONE_MOUNT)),
+        ..Closed::default()
+    };
+    let mut found = super::Found::default();
+    privileged_walk(&scope, &mut found, &mut closed, files(10_000), capabilities);
+    assert!(found.items.is_empty(), "{:?}", found.items);
+    assert_eq!(found.unchecked, Vec::<String>::new());
+    assert!(
+        found
+            .notes
+            .iter()
+            .any(|note| note
+                .starts_with("3 name(s) of files with capabilities for a user namespace")),
+        "{:?}",
+        found.notes
+    );
+    let mut found = super::Found::default();
+    privileged_walk(&scope, &mut found, &mut closed, files(10_000), as_hosts);
+    // Root's: an item; where only root names files, a name that is not
+    // UTF-8 is not checked; anywhere else, the accounts' alert.
+    let item = &found.items["usr/local/tool"];
+    assert!(
+        item.notes
+            .iter()
+            .any(|note| note.contains("cap_net_raw=ep")),
+        "{item:?}"
+    );
+    assert_eq!(
+        found.unchecked,
+        ["/usr/local/rooted\\xfe: a name that is not UTF-8 was not checked"]
+    );
+    let named = odd_named("var/tmp", b"run\xfe");
+    assert!(found.of_accounts.contains(&named));
+    assert!(found.items[&named].notes[0].contains("a file with capabilities (cap_net_raw=ep"));
+    // On a mount where set-id bits have no effect, capabilities have none.
+    let mut closed = Closed {
+        mounts: Some(mounts(&format!(
+            "{ONE_MOUNT}40 22 0:40 / /usr/local rw,nosuid - fuse.x x rw\n"
+        ))),
+        ..Closed::default()
+    };
+    let mut found = super::Found::default();
+    privileged_walk(&scope, &mut found, &mut closed, files(10_000), as_hosts);
+    assert!(!found.items.contains_key("usr/local/tool"));
+    assert_eq!(found.unchecked, Vec::<String>::new());
+}
+
+#[test]
+fn an_account_cannot_make_odd_named_items_without_bound() {
+    use super::capability::capabilities;
+    use super::privileged::{Closed, mounts, privileged_walk};
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let dir = TempDir::new("live-walk-odd-bound");
+    let root = dir.path();
+    let theirs = root.join("var/tmp");
+    fs::create_dir_all(&theirs).unwrap();
+    for at in 0..1_001 {
+        let mut name = format!("s{at}").into_bytes();
+        name.push(0xfe);
+        let path = theirs.join(OsStr::from_bytes(&name));
+        fs::write(&path, "").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o4755)).unwrap();
+    }
+    fs::set_permissions(&theirs, fs::Permissions::from_mode(0o1777)).unwrap();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: None,
+        index: &index,
+        origin: Origin::Root,
+    };
+    let mut closed = Closed {
+        mounts: Some(mounts(ONE_MOUNT)),
+        ..Closed::default()
+    };
+    let mut found = super::Found::default();
+    privileged_walk(&scope, &mut found, &mut closed, files(10_000), capabilities);
+    assert!(
+        found
+            .notes
+            .iter()
+            .any(|note| note.starts_with("1 more setuid file(s) or file(s) with capabilities")),
+        "{:?}",
+        found.notes
+    );
+}
+
+#[test]
+fn a_directory_the_accounts_run_cannot_list_is_a_note() {
+    use super::capability::capabilities;
+    use super::privileged::{Closed, mounts, privileged_walk};
+    let dir = TempDir::new("live-walk-accounts-closed");
+    let root = dir.path();
+    let spool = root.join("var/spool/mail");
+    fs::create_dir_all(spool.join("x")).unwrap();
+    fs::set_permissions(spool.join("x"), fs::Permissions::from_mode(0o000)).unwrap();
+    fs::set_permissions(&spool, fs::Permissions::from_mode(0o1777)).unwrap();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: None,
+        index: &index,
+        origin: Origin::Root,
+    };
+    let mut closed = Closed {
+        mounts: Some(mounts(ONE_MOUNT)),
+        ..Closed::default()
+    };
+    let mut found = super::Found::default();
+    privileged_walk(&scope, &mut found, &mut closed, files(100), capabilities);
+    fs::set_permissions(spool.join("x"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(found.unchecked, Vec::<String>::new());
+    assert!(
+        found.notes.iter().any(|note| note.ends_with(
+            "1 place(s) accounts may write that could not be listed (/var/spool/mail/x among them)"
+        )),
+        "{:?}",
+        found.notes
+    );
+}
+
+#[test]
+fn a_users_sweep_leaves_an_odd_name_where_only_root_names_files_unchecked() {
+    use super::capability::capabilities;
+    use super::privileged::{Closed, privileged_walk};
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let dir = TempDir::new("live-walk-user-odd");
+    let root = dir.path();
+    fs::create_dir_all(root.join("usr/lib").join(OsStr::from_bytes(b"x\xff"))).unwrap();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: None,
+        index: &index,
+        origin: Origin::System,
+    };
+    let mut found = super::Found::default();
+    privileged_walk(
+        &scope,
+        &mut found,
+        &mut Closed::default(),
+        files(100),
+        capabilities,
+    );
+    assert_eq!(
+        found.unchecked,
+        ["/usr/lib/x\\xff: a name that is not UTF-8 was not checked"]
     );
 }
 
@@ -523,12 +1361,10 @@ fn running(exe: &str, arguments: &[&str], cwd: Option<&str>, environment: &str) 
         pid: "7".into(),
         exe: exe.into(),
         exe_id: None,
-        arguments: arguments
-            .iter()
-            .map(|argument| (*argument).to_string())
-            .collect(),
+        cmdline: arguments.join("\0").into_bytes(),
         environment: Some(environment.replace(';', "\0").into_bytes()),
         cwd: cwd.map(str::to_string),
+        cwd_mark: cwd.map(|cwd| super::program::cwd_mark(cwd.as_bytes())),
         ..super::Process::default()
     }
 }
@@ -765,10 +1601,7 @@ fn a_relay_is_named_by_itself_not_by_what_it_runs() {
         pid: "1".into(),
         exe: exe.into(),
         exe_id: None,
-        arguments: arguments
-            .iter()
-            .map(|argument| (*argument).to_string())
-            .collect(),
+        cmdline: arguments.join("\0").into_bytes(),
         ..super::Process::default()
     };
     let ncat = process(
@@ -857,38 +1690,12 @@ fn table(root: &Path, name: &str, sockets: &[(&str, &str, &str, &str)]) {
 
 #[test]
 fn capabilities_a_package_does_not_set_are_said_by_how_far_they_go() {
-    use super::{capability_names, unexpected_capabilities as rule};
-    let names = |clauses: &str| capability_names(clauses);
-    // Every capability, however it is written.
-    assert_eq!(names("=ep"), None);
-    assert_eq!(names("all=eip"), None);
-    assert_eq!(names("=ep [rootid=1000]"), None);
+    let rule = |path: &str, clauses: &str| super::unexpected_capabilities(path, &given(clauses));
     assert_eq!(
-        names("cap_net_raw,cap_setgid=ep cap_chown=i"),
-        Some(vec![
-            "cap_chown".to_string(),
-            "cap_net_raw".to_string(),
-            "cap_setgid".to_string()
-        ])
+        given("cap_net_raw,cap_setgid=ep cap_chown=i").names(),
+        ["cap_chown", "cap_net_raw", "cap_setgid"]
     );
-    // A clause that takes away, or gives no set, gives nothing.
-    assert_eq!(
-        names("cap_net_raw+ep cap_kill-ep cap_chown="),
-        Some(vec!["cap_net_raw".to_string()])
-    );
-    assert_eq!(
-        parse_getcap(
-            "/usr/bin/python3 =ep\n/usr/bin/x 41=ep\n/usr/bin/a b cap_kill+ep cap_chown+i\nno clause here\n"
-        ),
-        [
-            ("usr/bin/python3".to_string(), "=ep".to_string()),
-            ("usr/bin/x".to_string(), "41=ep".to_string()),
-            (
-                "usr/bin/a b".to_string(),
-                "cap_kill+ep cap_chown+i".to_string()
-            ),
-        ]
-    );
+    assert_eq!(given("=ep").to_string(), "=ep");
 
     let high = Some(RuleId::UnknownPrivilegedFile);
     let medium = Some(RuleId::UnexpectedCapability);
@@ -978,7 +1785,7 @@ fn a_packaged_file_with_capabilities_of_its_own_is_listed() {
             path,
             &looked,
             &format!("capabilities {capabilities}"),
-            Some(capabilities),
+            Some(&given(capabilities)),
         );
     }
     let items: Vec<&crate::sweep::collect::Item> = found.items.values().collect();
@@ -1795,6 +2602,8 @@ fn raw_packet_sockets_and_promiscuous_interfaces_are_looked_at() {
             .iter()
             .any(|item| item.path == "proc/net/packet" && item.alerts[0].0 == RuleId::KernelTap)
     );
+    // The sniffer is no process of root's.
+    assert!(live.of_accounts.contains("home/u/sniff:packet-socket"));
 }
 
 #[test]
@@ -1879,7 +2688,7 @@ fn a_name_that_ends_like_a_deleted_one_is_told_from_a_deleted_file() {
     fs::hard_link(&twice, dir.path().join("kept")).unwrap();
     fs::remove_file(&gone).unwrap();
     fs::remove_file(&twice).unwrap();
-    let running = super::processes(Path::new("/proc"));
+    let running = super::processes(Path::new("/"));
     let seen = |pid: u32| {
         running
             .processes
@@ -2380,7 +3189,8 @@ fn every_process_number_is_tried_and_what_was_not_is_said() {
     assert!(suspects.is_empty());
     assert_eq!(not_searched.len(), 1);
     assert!(not_searched[0].contains(&300_500));
-    // The numbers go up to the kernel's limit, whatever is listed.
+    // The numbers go up to the most a kernel hands out, whatever its
+    // limit says: root can lower that after starting a process above it.
     let dir = TempDir::new("live-numbers");
     let root = dir.path();
     let index = PackageIndex::with_foreign(HashSet::new());
@@ -2391,32 +3201,21 @@ fn every_process_number_is_tried_and_what_was_not_is_said() {
         origin,
     };
     process(root, "7", "/usr/bin/x", &[], "");
-    assert_eq!(super::kernel::highest_number(&scope(Origin::System), 7), 7);
-    write(root, "proc/sys/kernel/ns_last_pid", "900\n");
-    assert_eq!(
-        super::kernel::highest_number(&scope(Origin::System), 7),
-        900
-    );
     write(root, "proc/sys/kernel/pid_max", "5000\n");
-    assert_eq!(
-        super::kernel::highest_number(&scope(Origin::System), 7),
-        4999
-    );
-    // Within what is tried nothing is said; past it, a user's sweep
-    // notes it and root's counts it as not checked.
-    let running = super::processes(&root.join("proc"));
+    // Past what is tried, a user's sweep notes it and root's counts it as
+    // not checked.
+    let running = super::processes(root);
     let search = |origin, most| {
         let mut found = super::Found::default();
         super::kernel::hidden_processes(&scope(origin), &running, most, &mut found);
         (found.notes, found.unchecked)
     };
-    assert_eq!(search(Origin::Root, 5000), (vec![], vec![]));
     let (notes, unchecked) = search(Origin::System, 100);
     assert!(unchecked.is_empty());
     assert_eq!(
         notes,
         [
-            "process numbers go up to 4999: only the newest 100 and those the control groups name were tried in the search for hidden processes"
+            "process numbers go up to 65535: only the newest 100 were tried in the search for hidden processes"
         ]
     );
     let (notes, unchecked) = search(Origin::Root, 100);
@@ -2434,9 +3233,111 @@ fn every_process_number_is_tried_and_what_was_not_is_said() {
 }
 
 #[test]
+fn a_list_of_processes_that_shows_none_is_one_finding() {
+    let dir = TempDir::new("live-unlisted");
+    let root = dir.path();
+    host_mounts(root);
+    let index = PackageIndex::with_foreign(HashSet::new());
+    for pid in ["7", "8", "9"] {
+        process(root, pid, "/usr/bin/x", &[], "");
+        detail(
+            root,
+            pid,
+            "status",
+            &format!("Name:\tx\nTgid:\t{pid}\nPid:\t{pid}\n"),
+        );
+    }
+    let scope = Scope {
+        root,
+        home: None,
+        index: &index,
+        origin: Origin::Root,
+    };
+    // A list that shows none, while each process still answers; the list
+    // read again shows them all, and is not believed.
+    let mut found = super::Found::default();
+    super::kernel::hidden_processes(&scope, &super::Running::default(), 65_536, &mut found);
+    let hidden: Vec<_> = found.items.values().collect();
+    assert_eq!(hidden.len(), 1, "{hidden:?}");
+    assert_eq!(found.items.keys().next().unwrap(), "proc#unlisted");
+    assert!(
+        hidden[0].notes[0].contains("3 processes answer"),
+        "{:?}",
+        hidden[0].notes
+    );
+}
+
+#[test]
+fn a_process_shown_only_to_a_later_list_is_hidden_unless_it_started_after_the_first() {
+    let dir = TempDir::new("live-relisted");
+    let root = dir.path();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: None,
+        index: &index,
+        origin: Origin::Root,
+    };
+    // The first list is read at tick 1000 and the second at 2000, and shows
+    // them all: 8 started before the first, 9 and 10 between, 11 after the
+    // second (made up), and 12's start cannot be read.
+    for (pid, started) in [
+        ("7", 10),
+        ("8", 500),
+        ("9", 1000),
+        ("10", 1500),
+        ("11", 2500),
+        ("12", 0),
+    ] {
+        process(root, pid, "/usr/bin/x", &[], "");
+        detail(
+            root,
+            pid,
+            "status",
+            &format!("Name:\tx\nTgid:\t{pid}\nPid:\t{pid}\n"),
+        );
+        let fields = vec!["0"; 18].join(" ");
+        let stat = if pid == "12" {
+            format!("{pid} (x)\n")
+        } else {
+            format!("{pid} (a ) b) S {fields} {started} 0\n")
+        };
+        detail(root, pid, "stat", &stat);
+    }
+    write(root, "proc/uptime", "20.00 5.00\n");
+    let hidden = |listed_at| {
+        let running = super::Running {
+            listed: vec![super::Listed {
+                pid: 7,
+                status: super::Status::default(),
+                started_as: None,
+                kernel_thread: false,
+            }],
+            listed_at,
+            ..super::Running::default()
+        };
+        let mut found = super::Found::default();
+        super::kernel::hidden_processes(&scope, &running, 65_536, &mut found);
+        found.items.into_keys().collect::<Vec<_>>()
+    };
+    assert_eq!(hidden(Some(1000)), ["proc/11", "proc/12", "proc/8"]);
+    // Where the time of the first list is not known, none is new.
+    assert_eq!(hidden(None).len(), 5);
+    assert_eq!(super::processes(root).listed_at, Some(2000));
+    // A name that is not UTF-8 answers all the same.
+    fs::write(
+        root.join("proc/8/status"),
+        b"Name:\t\xff\xfe\nTgid:\t8\nPid:\t8\n",
+    )
+    .unwrap();
+    assert!(hidden(Some(1000)).contains(&"proc/8".to_string()));
+}
+
+#[test]
 fn root_says_when_it_cannot_list_the_pinned_ebpf_objects() {
     let dir = TempDir::new("live-bpf");
     let root = dir.path();
+    host_mounts(root);
     let index = PackageIndex::with_foreign(HashSet::new());
     // No such filesystem: nothing to say.
     assert!(look(root, &index, Origin::Root).unchecked.is_empty());
@@ -2460,8 +3361,8 @@ fn a_process_missing_from_the_list_is_found_by_its_number() {
     use super::Status;
     let listed: HashSet<u32> = [1, 2, 5].into_iter().collect();
     let answers = |pid: u32| match pid {
-        // A process of its own, a thread of process 2, and one the
-        // control groups name.
+        // A process of its own, a thread of process 2, and one named
+        // outside the range.
         3 | 9 => Some(Status {
             name: format!("hidden{pid}"),
             group: pid,
@@ -2490,42 +3391,6 @@ fn a_process_missing_from_the_list_is_found_by_its_number() {
             tracer: 0,
             of_root: true
         }
-    );
-    // The members of every control group are read.
-    let dir = TempDir::new("live-cgroups");
-    let index = PackageIndex::with_foreign(HashSet::new());
-    write(dir.path(), "sys/fs/cgroup/cgroup.procs", "1\n2\n");
-    write(
-        dir.path(),
-        "sys/fs/cgroup/user.slice/a.scope/cgroup.procs",
-        "0\n77\n",
-    );
-    let members = |origin, most| {
-        let scope = Scope {
-            root: dir.path(),
-            home: None,
-            index: &index,
-            origin,
-        };
-        let mut found = super::Found::default();
-        let mut members = super::kernel::members_of_control_groups(&scope, most, &mut found);
-        members.sort_unstable();
-        (members, found.notes, found.unchecked)
-    };
-    assert_eq!(
-        members(Origin::System, 3),
-        (vec![0, 1, 2, 77], vec![], vec![])
-    );
-    // Groups past the bound are said to be left out: a note in a
-    // user's sweep, not checked for root.
-    let left = "more than 2 control groups: the processes the rest name were not tried in the search for hidden processes";
-    assert_eq!(
-        members(Origin::System, 2),
-        (vec![1, 2], vec![left.to_string()], vec![])
-    );
-    assert_eq!(
-        members(Origin::Root, 2),
-        (vec![1, 2], vec![], vec![left.to_string()])
     );
 }
 
@@ -2590,6 +3455,10 @@ fn a_program_named_like_a_kernel_thread_and_an_attached_process_are_said() {
             ("sys/fs/bpf/hook", vec![RuleId::KernelTap]),
         ]
     );
+    // None of these processes is root's, and each item's name holds what
+    // the account chose; what is pinned in the kernel is root's.
+    assert!(live.of_accounts.contains("home/u/spy:attached-to-app"));
+    assert!(!live.of_accounts.contains("sys/fs/bpf/hook"));
     let spy = live
         .items
         .iter()
@@ -2661,63 +3530,6 @@ fn what_an_interpreter_was_told_is_part_of_its_listeners_name() {
     );
 }
 
-#[test]
-fn no_getcap_output_makes_its_reader_panic_and_what_is_read_is_a_path_with_clauses() {
-    use crate::test_support::Rng;
-
-    const PIECES: &[&str] = &[
-        "/usr/bin/demo",
-        "/usr/bin/a b",
-        "/",
-        " ",
-        "  ",
-        "\n",
-        "\r",
-        "=ep",
-        "+ep",
-        "-ep",
-        "cap_net_raw",
-        "cap_kill,cap_chown",
-        "41",
-        "=",
-        "+",
-        "-",
-        "e",
-        "i",
-        "p",
-        ",",
-        " [rootid=1000]",
-        "[rootid=",
-        "]",
-        "é",
-        "\u{1f600}",
-        "\u{0}",
-        "\t",
-        "x",
-    ];
-    let output = "/usr/bin/python3 =ep\n/usr/bin/a b cap_kill+ep cap_chown+i\n/usr/bin/x cap_net_raw=ep [rootid=1000]\nno clause here\n";
-    assert_eq!(parse_getcap(output).len(), 3);
-
-    let check = |text: &str| {
-        let lines = text.lines().count();
-        let found = parse_getcap(text);
-        // At most one file for each line, never one without clauses.
-        assert!(found.len() <= lines, "{text:?}");
-        for (path, capabilities) in found {
-            assert!(!path.contains('\n') && !capabilities.is_empty(), "{text:?}");
-            assert!(
-                capabilities.split(' ').all(super::is_clause),
-                "{text:?}: {capabilities:?}"
-            );
-        }
-    };
-    let mut rng = Rng::new(41);
-    for _ in 0..10_000 {
-        check(&rng.text(PIECES, 14));
-        check(&rng.mutated(output, PIECES));
-    }
-}
-
 /// What a sweep said it could not read, as a user's sweep notes it
 /// and as the root checks leave it unchecked.
 fn unread(root: &Path, index: &PackageIndex) -> (Vec<String>, Vec<String>) {
@@ -2784,6 +3596,7 @@ fn a_kernel_release_or_a_list_of_processes_that_cannot_be_read_is_said() {
     let root = dir.path();
     // A release that names no directory.
     write(root, "proc/sys/kernel/osrelease", "../x\n");
+    host_mounts(root);
     let nameless = "/proc/sys/kernel/osrelease: names no kernel release; loaded kernel modules were not checked";
     assert_eq!(
         look(root, &index, Origin::System).notes,
@@ -2822,10 +3635,16 @@ fn a_kernel_release_or_a_list_of_processes_that_cannot_be_read_is_said() {
     // No list of processes at all, where there is a `/proc`.
     let dir = TempDir::new("live-unread-proc");
     let root = dir.path();
-    assert!(super::processes(&root.join("proc")).unlistable.is_none());
+    assert!(super::processes(root).unlistable.is_none());
     write(root, "proc", "no directory");
-    assert!(super::processes(&root.join("proc")).unlistable.is_some());
-    let (notes, unchecked) = unread(root, &index);
+    assert!(super::processes(root).unlistable.is_some());
+    let (notes, mut unchecked) = unread(root, &index);
+    // Only root's search for set-id files reads the mounts.
+    let mounts = unchecked
+        .iter()
+        .position(|said| said.starts_with("/proc/1/mountinfo could not be read"))
+        .expect("root says the mounts could not be read");
+    unchecked.remove(mounts);
     assert_eq!(notes, unchecked);
     assert!(
         unchecked.iter().any(|said| {
@@ -2885,6 +3704,7 @@ fn directories_the_search_for_setuid_programs_cannot_list_are_said_once() {
     // is nothing to say.
     write(root, "usr/local/bin/x", "x");
     write(root, "etc", "no directory");
+    host_mounts(root);
     fs::create_dir_all(root.join("var/closed/below")).unwrap();
     let walk = |origin| {
         let mut found = super::Found::default();
@@ -2909,57 +3729,14 @@ fn directories_the_search_for_setuid_programs_cannot_list_are_said_once() {
 }
 
 #[test]
-fn a_getcap_that_is_missing_or_does_not_finish_is_not_an_empty_answer() {
-    use std::os::unix::process::ExitStatusExt;
-    use std::process::ExitStatus;
-    // A wait status holds the exit code in its second byte, and the
-    // signal that ended the program in its first.
-    let exited = |code: i32| ExitStatus::from_raw(code << 8);
-    assert_eq!(super::getcap_failure(exited(0)), None);
-    assert_eq!(
-        super::getcap_failure(exited(124)).as_deref(),
-        Some("getcap timed out")
-    );
-    assert_eq!(
-        super::getcap_failure(exited(1)).as_deref(),
-        Some("getcap failed: exit status: 1")
-    );
-    let killed = super::getcap_failure(ExitStatus::from_raw(9)).unwrap();
-    assert!(killed.starts_with("getcap failed: signal: 9"), "{killed:?}");
-
-    let dir = TempDir::new("live-getcap");
-    let getcap = dir.path().join("getcap");
-    assert_eq!(
-        super::capabilities_below(&getcap, &[]).map_err(|error| error.to_string()),
-        Err(format!("{} is not installed", getcap.display()))
-    );
-    if !crate::test_support::tool_available("/usr/bin/timeout")
-        || !crate::test_support::tool_available("/bin/sh")
-    {
-        return;
-    }
-    // What it printed before it failed is not taken for the list.
-    let listing = "#!/bin/sh\necho '/usr/bin/x cap_setuid=ep'\n";
-    crate::test_support::write_script(&getcap, &format!("{listing}exit 1\n"));
-    assert_eq!(
-        super::capabilities_below(&getcap, &[]).map_err(|error| error.to_string()),
-        Err("getcap failed: exit status: 1".to_string())
-    );
-    crate::test_support::write_script(&getcap, listing);
-    assert_eq!(
-        super::capabilities_below(&getcap, &[]).map_err(|error| error.to_string()),
-        Ok(vec![("usr/bin/x".to_string(), "cap_setuid=ep".to_string())])
-    );
-}
-
-#[test]
 fn a_place_closed_on_a_mount_without_set_id_is_told_apart() {
+    use super::privileged::Mount;
     use super::{Closed, mounts};
 
     let mountinfo = "\
 36 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw
 37 36 8:3 / /home rw,nosuid,relatime shared:2 - ext4 /dev/sda3 rw
-90 37 0:50 / /home/u/remote rw,nosuid,nodev,relatime shared:60 - fuse.sshfs host: rw
+90 37 0:50 / /home/u/remote rw,nosuid,nodev,relatime shared:60 - fuse.sshfs host: rw,user_id=1000,group_id=1000
 91 37 0:51 / /home/u/my\\040drive rw,nosuid,nodev - fuse.rclone r: rw
 92 37 8:17 / /home/u/disk rw,nodev - ext4 /dev/sdb1 rw
 93 36 0:52 / /var/x rw,nosuid - tmpfs tmpfs rw
@@ -2967,10 +3744,15 @@ fn a_place_closed_on_a_mount_without_set_id_is_told_apart() {
 ";
     let read = mounts(mountinfo);
     assert_eq!(read.len(), 7);
-    assert!(read.contains(&("home/u/my drive".to_string(), true)));
-    assert!(read.contains(&(String::new(), false)));
+    let mount = |place: &str, nosuid| Mount {
+        place: place.to_string(),
+        nosuid,
+    };
+    assert!(read.contains(&mount("home/u/my drive", true)));
+    assert!(read.contains(&mount("", false)));
+    assert!(read.contains(&mount("home/u/remote", true)));
     let mut closed = Closed {
-        mounts: read,
+        mounts: Some(read),
         ..Closed::default()
     };
     // On a mount without set-id, and below one.
@@ -2996,4 +3778,1499 @@ fn a_place_closed_on_a_mount_without_set_id_is_told_apart() {
     // With no mounts read (a user's search), nothing is told apart.
     assert!(!Closed::default().without_set_id("home/u/remote"));
     assert!(mounts("1 2 3\n").is_empty());
+}
+
+#[test]
+fn what_only_an_accounts_processes_or_files_led_to_is_the_accounts() {
+    let (dir, index) = system("live-chooser", &[("usr/bin/tool", "packaged")]);
+    let root = dir.path();
+    // Changed since its package installed it: root's own comparison finds
+    // it, though only an account's process runs it.
+    write(root, "usr/bin/tool", "changed");
+    let roots = "Name:\tx\nUid:\t0\t0\t0\t0\n";
+    for (pid, exe, of_root) in [
+        ("1", "/tmp/roots", true),
+        ("2", "/tmp/accounts", false),
+        ("3", "/tmp/shared", false),
+        ("4", "/tmp/shared", true),
+        ("5", "/usr/bin/tool", false),
+        ("6", "/opt/kworker", false),
+        ("7", "/usr/bin/unowned", false),
+    ] {
+        // A device the test cannot tell is no keyboard counts as one: what
+        // reads it is said of the same item as what changed.
+        let fds: &[(&str, &str)] = if pid == "5" || pid == "7" {
+            &[("3", "/dev/input/event0")]
+        } else {
+            &[]
+        };
+        process(root, pid, exe, fds, "");
+        if of_root {
+            detail(root, pid, "status", roots);
+        }
+    }
+    // Not on disk: the name is the account's.
+    detail(root, "6", "cmdline", "[kworker/0:1]");
+    // No package's, in a directory root's own look goes through.
+    write(root, "usr/bin/unowned", "x");
+    // Root here is whoever made the test tree. What an account's process
+    // runs from a directory anyone can write is the account's.
+    write(root, "tmp/accounts", "x");
+    fs::set_permissions(root.join("tmp"), fs::Permissions::from_mode(0o1777)).unwrap();
+    // Libraries of root's in a directory only root writes, which an
+    // account's process preloads: by their own path, through a link of the
+    // account's and through one of the system's. Any account can name every
+    // file root has, under as many names as there are links to it.
+    write(root, "usr/local/lib/evil.so", "x");
+    symlink("../usr/local/lib", root.join("tmp/a0")).unwrap();
+    symlink("usr/local/lib", root.join("lib64")).unwrap();
+    process(
+        root,
+        "8",
+        "/opt/other",
+        &[],
+        "LD_PRELOAD=/usr/local/lib/evil.so:/tmp/a0/evil.so:/lib64/evil.so;",
+    );
+    // Set-id files: one in a directory anyone can write, one of root's in
+    // a directory only root writes.
+    for (path, directory_mode) in [("home/u/f", 0o1777), ("usr/local/bin/planted", 0o755)] {
+        write(root, path, "x");
+        fs::set_permissions(root.join(path), fs::Permissions::from_mode(0o4755)).unwrap();
+        let directory = root.join(path).parent().unwrap().to_path_buf();
+        fs::set_permissions(directory, fs::Permissions::from_mode(directory_mode)).unwrap();
+    }
+    host_mounts(root);
+    let live = look(root, &index, Origin::Root);
+    let found: HashSet<&str> = live.items.iter().map(|item| item.path.as_str()).collect();
+    for path in [
+        "tmp/roots",
+        "tmp/accounts",
+        "tmp/shared",
+        "usr/bin/tool",
+        "home/u/f",
+        "opt/kworker",
+        "usr/bin/unowned",
+        "usr/local/lib/evil.so",
+        "tmp/a0/evil.so",
+        "lib64/evil.so",
+        "usr/local/bin/planted",
+    ] {
+        assert!(found.contains(path), "{path} in {found:?}");
+    }
+    let mut of_accounts: Vec<&str> = live.of_accounts.iter().map(String::as_str).collect();
+    of_accounts.sort_unstable();
+    assert_eq!(
+        of_accounts,
+        [
+            "home/u/f",
+            "lib64/evil.so",
+            "opt/kworker",
+            "tmp/a0/evil.so",
+            "tmp/accounts",
+            "usr/local/lib/evil.so",
+        ]
+    );
+    // What root's process runs is root's, wherever it is.
+    assert!(live.of_root.contains("tmp/roots"), "{:?}", live.of_root);
+    assert!(live.of_root.is_disjoint(&live.of_accounts));
+}
+
+#[test]
+fn a_set_id_file_is_roots_alone_only_where_only_root_names_files() {
+    let dir = TempDir::new("live-roots-alone");
+    let root = dir.path();
+    setuid_file(&root.join("usr/lib/real"));
+    // Root's own directory, in one an account may write: the account may
+    // rename it and put its own in its place.
+    setuid_file(&root.join("var/tmp/d/real"));
+    fs::set_permissions(root.join("var/tmp"), fs::Permissions::from_mode(0o1777)).unwrap();
+    // A link is not followed: one file of root's has no second name.
+    symlink("usr/lib", root.join("lib64")).unwrap();
+    symlink("../../usr/lib", root.join("var/tmp/a")).unwrap();
+    let found = walk_as_root(root, files(1_000), none_anywhere, ONE_MOUNT);
+    assert!(
+        found.of_root.contains("usr/lib/real"),
+        "{:?}",
+        found.of_root
+    );
+    assert!(
+        found.of_accounts.contains("var/tmp/d/real"),
+        "{:?}",
+        found.of_accounts
+    );
+    assert_eq!(found.items.len(), 2, "{:?}", found.items.keys());
+    // Not known to be on a mount where set-id bits take effect.
+    let found = walk_as_root(root, files(1_000), none_anywhere, "");
+    assert!(
+        found.of_accounts.contains("usr/lib/real"),
+        "{:?}",
+        found.of_accounts
+    );
+    // Itself on a mount without set-id: a file can be a mount point.
+    let mountinfo = format!("{ONE_MOUNT}40 22 0:40 / /usr/lib/real rw,nosuid - ext4 x rw\n");
+    let found = walk_as_root(root, files(1_000), none_anywhere, &mountinfo);
+    assert!(
+        found.of_accounts.contains("usr/lib/real"),
+        "{:?}",
+        found.of_accounts
+    );
+    // In a directory others can write.
+    fs::set_permissions(root.join("usr/lib"), fs::Permissions::from_mode(0o777)).unwrap();
+    let found = walk_as_root(root, files(1_000), none_anywhere, ONE_MOUNT);
+    assert!(
+        found.of_accounts.contains("usr/lib/real"),
+        "{:?}",
+        found.of_accounts
+    );
+}
+
+#[test]
+fn a_set_id_file_on_a_mount_without_set_id_is_an_accounts() {
+    let dir = TempDir::new("live-nosuid-mount");
+    let root = dir.path();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: None,
+        index: &index,
+        origin: Origin::Root,
+    };
+    for path in ["usr/bin/planted", "usr/local/bin/planted"] {
+        write(root, path, "x");
+        fs::set_permissions(root.join(path), fs::Permissions::from_mode(0o4755)).unwrap();
+    }
+    // The host's table: a user's FUSE mount over `/usr/local`, whose
+    // files show as root's.
+    write(
+        root,
+        "proc/1/mountinfo",
+        "22 1 0:21 / / rw,relatime - ext4 /dev/sda1 rw\n\
+         40 22 0:40 / /usr/local rw,nosuid,nodev - fuse.sshfs u@host: rw\n",
+    );
+    // The collector's own, as systemd makes it for a unit with
+    // `NoNewPrivileges=yes` and `ProtectSystem=strict`: every mount
+    // read-only and `nosuid`. It is not the one that decides.
+    write(
+        root,
+        "proc/self/mountinfo",
+        "22 1 0:21 / / ro,nosuid,relatime - ext4 /dev/sda1 rw\n\
+         40 22 0:40 / /usr/local ro,nosuid,nodev - fuse.sshfs u@host: rw\n",
+    );
+    let mut found = super::Found::default();
+    super::privileged_files(&scope, &mut found);
+    assert!(
+        found.of_root.contains("usr/bin/planted"),
+        "{:?}",
+        found.of_root
+    );
+    assert!(found.of_accounts.contains("usr/local/bin/planted"));
+    assert!(!found.of_root.contains("usr/local/bin/planted"));
+    assert!(found.unchecked.is_empty(), "{:?}", found.unchecked);
+    // A host table that is not there, or cannot be read, is said, and
+    // leaves every set-id file an account's.
+    let said = |found: &super::Found, how: &str| {
+        let start = format!("/proc/1/mountinfo {how}");
+        assert!(
+            found.unchecked.iter().any(|said| said.starts_with(&start)),
+            "{:?}",
+            found.unchecked
+        );
+        assert!(found.of_root.is_empty(), "{:?}", found.of_root);
+        assert!(found.of_accounts.contains("usr/bin/planted"));
+    };
+    fs::remove_file(root.join("proc/1/mountinfo")).unwrap();
+    let mut found = super::Found::default();
+    super::privileged_files(&scope, &mut found);
+    said(&found, "is not there");
+    fs::create_dir(root.join("proc/1/mountinfo")).unwrap();
+    let mut found = super::Found::default();
+    super::privileged_files(&scope, &mut found);
+    said(&found, "could not be read");
+}
+
+#[test]
+fn a_listener_is_the_accounts_whose_process_holds_it() {
+    let (dir, index) = listening_system();
+    // The relay is root's; the rest are the test user's.
+    detail(
+        dir.path(),
+        "22",
+        "status",
+        "Name:\tsocat\nUid:\t0\t0\t0\t0\n",
+    );
+    let live = look(dir.path(), &index, Origin::Root);
+    assert!(!live.of_accounts.contains("usr/bin/socat:tcp-4444"));
+    // Any account can leave a socket listening that no process holds.
+    assert!(live.of_accounts.contains("proc/net/tcp:31337"));
+    for name in [
+        "usr/bin/nginx:tcp-8080",
+        "usr/bin/python3:tcp-8000:http.server",
+    ] {
+        assert!(
+            live.of_accounts.contains(name),
+            "{name}: {:?}",
+            live.of_accounts
+        );
+    }
+}
+
+#[test]
+fn a_tracer_not_shown_to_be_roots_is_an_accounts() {
+    let dir = TempDir::new("live-thread-tracer");
+    let root = dir.path();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    // Two processes attached to by threads, which have no program to read
+    // here: one of an account's, one of root's.
+    for (pid, tracer, ids) in [("80", "90", "1000"), ("81", "91", "0")] {
+        process(root, pid, "/opt/app", &[], "");
+        detail(
+            root,
+            pid,
+            "status",
+            &format!("Name:\tapp\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t1\nTracerPid:\t{tracer}\n"),
+        );
+        detail(
+            root,
+            tracer,
+            "status",
+            &format!("Name:\tt\nUid:\t{ids}\t{ids}\t{ids}\t{ids}\n"),
+        );
+    }
+    let live = look(root, &index, Origin::Root);
+    let names: Vec<&str> = live.items.iter().map(|item| item.path.as_str()).collect();
+    assert!(names.contains(&"proc/90:attached-to-app"), "{names:?}");
+    assert!(live.of_accounts.contains("proc/90:attached-to-app"));
+    assert!(names.contains(&"proc/91:attached-to-app"), "{names:?}");
+    assert!(!live.of_accounts.contains("proc/91:attached-to-app"));
+}
+
+#[test]
+fn a_tracer_is_roots_only_while_it_still_holds_its_target() {
+    let dir = TempDir::new("live-tracer-gone");
+    let root = dir.path();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: None,
+        index: &index,
+        origin: Origin::Root,
+    };
+    // Listed while thread 91 traced it; by the time 91's status is read the
+    // number is root's, and the target has no tracer any more.
+    detail(root, "91", "status", "Name:\tt\nUid:\t0\t0\t0\t0\n");
+    detail(root, "81", "status", "Name:\tapp\nTracerPid:\t0\n");
+    let listed = |tracer| super::Listed {
+        pid: 81,
+        status: super::Status {
+            name: "app".into(),
+            group: 81,
+            parent: 1,
+            tracer,
+            of_root: false,
+        },
+        started_as: None,
+        kernel_thread: false,
+    };
+    let running = super::Running {
+        listed: vec![listed(91)],
+        ..super::Running::default()
+    };
+    let mut found = super::Found::default();
+    super::kernel::check(&scope, &running, &mut found);
+    assert!(found.of_accounts.contains("proc/91:attached-to-app"));
+    assert!(!found.of_root.contains("proc/91:attached-to-app"));
+    // Attached to by another since, or still by the same: root's only then.
+    for (now, of_root) in [("92", false), ("91", true)] {
+        detail(
+            root,
+            "81",
+            "status",
+            &format!("Name:\tapp\nTracerPid:\t{now}\n"),
+        );
+        let mut found = super::Found::default();
+        super::kernel::check(&scope, &running, &mut found);
+        assert_eq!(
+            found.of_root.contains("proc/91:attached-to-app"),
+            of_root,
+            "{now}"
+        );
+    }
+}
+
+#[test]
+fn what_an_environment_names_makes_no_name_or_note_past_a_paths_length() {
+    let dir = TempDir::new("live-long-preload");
+    let root = dir.path();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let long_path = format!("/tmp/{}", "a".repeat(5000));
+    // Control characters, which JSON writes as six bytes each.
+    let long_name = "\u{1}".repeat(20_000);
+    process(
+        root,
+        "8",
+        "/opt/app",
+        &[],
+        &format!("LD_PRELOAD={long_path}:{long_name};"),
+    );
+    let live = look(root, &index, Origin::Root);
+    for item in &live.items {
+        assert!(item.path.len() < 4096, "{}", item.path.len());
+        for note in item
+            .notes
+            .iter()
+            .chain(item.alerts.iter().map(|(_, seen)| seen))
+        {
+            let written = crate::json::Json::from(note.as_str()).to_string().len();
+            // The quotes, and the mark of what was cut.
+            assert!(written <= 10 * 1024 + 2 + '…'.len_utf8(), "{written}");
+        }
+    }
+    let app = live
+        .items
+        .iter()
+        .find(|item| item.path == "opt/app")
+        .unwrap();
+    assert!(
+        app.notes.contains(
+            &"process 8 preloads a path of 5004 bytes, longer than any the kernel opens".into()
+        ),
+        "{:?}",
+        app.notes
+    );
+    assert!(
+        app.alerts
+            .iter()
+            .all(|(rule, _)| *rule == RuleId::PreloadedLibrary)
+    );
+    assert!(app.notes.iter().any(|note| note.ends_with('…')));
+}
+
+#[test]
+fn a_note_is_cut_by_the_bytes_json_writes() {
+    let most = super::MAX_NOTE_BYTES;
+    assert_eq!(super::cut_note("a".repeat(most)), "a".repeat(most));
+    assert_eq!(
+        super::cut_note("a".repeat(most + 1)),
+        format!("{}…", "a".repeat(most))
+    );
+    // Six bytes each.
+    assert_eq!(
+        super::cut_note("\u{1}".repeat(most)),
+        format!("{}…", "\u{1}".repeat(most / 6))
+    );
+}
+
+#[test]
+fn a_first_argument_past_what_is_read_is_kept_cut() {
+    use super::process::MAX_START_BYTES;
+    let dir = TempDir::new("live-cut-argument");
+    let root = dir.path();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    // Named like a kernel thread, with a first argument that runs past
+    // what is read and has no null byte: it is still a program.
+    process(root, "4", "/opt/kworker", &[], "");
+    detail(root, "4", "status", "Name:\t[kworker/0:1]\n");
+    detail(root, "4", "cmdline", &"z".repeat(MAX_START_BYTES * 2));
+    let live = look(root, &index, Origin::Root);
+    let kworker = live
+        .items
+        .iter()
+        .find(|item| item.path == "opt/kworker")
+        .unwrap();
+    assert!(
+        kworker
+            .notes
+            .iter()
+            .any(|note| note.contains("named like a kernel thread")),
+        "{kworker:?}"
+    );
+}
+
+#[test]
+fn what_of_a_process_is_not_utf8_is_told() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    use super::process::not_utf8;
+    assert_eq!(
+        not_utf8(None, b"x\0a.py\0", Some(b"LD_PRELOAD=/a.so\0")),
+        None
+    );
+    let odd = Path::new(OsStr::from_bytes(b"/tmp/\xff"));
+    assert!(not_utf8(Some(odd), b"", None).is_some());
+    assert!(not_utf8(None, b"python3\0/tmp/\xfe.py\0", None).is_some());
+    // A cut in the middle of a character counts too: its argument is left
+    // out as well.
+    assert!(not_utf8(None, b"x\0\xc3", None).is_some());
+    assert!(not_utf8(None, b"", Some(b"A=\xff\0LD_PRELOAD=/\xff.so\0")).is_some());
+    assert!(not_utf8(None, b"", Some(b"LD_AUDIT=/a\xc3\0")).is_some());
+    // Only what names a file counts.
+    assert_eq!(not_utf8(None, b"", Some(b"A=\xff\0")), None);
+
+    // Read lossily, each would name a file named with U+FFFD: a decoy.
+    assert_eq!(preloaded(Some(b"LD_PRELOAD=/tmp/evil\xc3\0")), []);
+    assert_eq!(super::searched(Some(b"LD_LIBRARY_PATH=/tmp/\xff\0")), []);
+}
+
+#[test]
+fn a_process_whose_names_are_not_utf8_is_an_item_of_its_owner() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = TempDir::new("live-not-utf8");
+    let root = dir.path();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    fs::create_dir_all(root.join("tmp")).unwrap();
+    fs::create_dir_all(root.join("home/u")).unwrap();
+    fs::write(root.join("home/u/.evil.so"), "library").unwrap();
+    for decoy in ["tmp/\u{fffd}", "tmp/\u{fffd}.py", "tmp/evil\u{fffd}"] {
+        fs::write(root.join(decoy), "decoy").unwrap();
+    }
+    let program = |pid: &str, exe: &[u8]| {
+        process(root, pid, "/usr/bin/x", &[], "");
+        fs::remove_file(root.join(format!("proc/{pid}/exe"))).unwrap();
+        symlink(OsStr::from_bytes(exe), root.join(format!("proc/{pid}/exe"))).unwrap();
+    };
+    // Root's and an account's, with a program whose path is not UTF-8.
+    program("4", b"/memfd:\xff (deleted)");
+    program("5", b"/tmp/\xff");
+    detail(root, "5", "status", "Name:\tx\nUid:\t0\t0\t0\t0\n");
+    // An account's, with a script named so.
+    process(root, "6", "/usr/bin/python3", &[], "");
+    fs::write(root.join("proc/6/cmdline"), b"python3\0/tmp/\xff.py\0").unwrap();
+    // An account's, run from a temporary directory with a working
+    // directory named so: it is still checked.
+    process(root, "7", "/tmp/run", &[], "");
+    symlink(OsStr::from_bytes(b"/tmp/\xff"), root.join("proc/7/cwd")).unwrap();
+    // Root's, with a working directory named so.
+    process(root, "9", "/usr/bin/x", &[], "");
+    detail(root, "9", "status", "Name:\tx\nUid:\t0\t0\t0\t0\n");
+    symlink(OsStr::from_bytes(b"/tmp/\xff"), root.join("proc/9/cwd")).unwrap();
+    // An account's, preloading two libraries, one named so.
+    process(root, "8", "/usr/bin/x", &[], "");
+    fs::write(
+        root.join("proc/8/environ"),
+        b"LD_PRELOAD=/home/u/.evil.so:/tmp/evil\xc3\0",
+    )
+    .unwrap();
+
+    let live = look(root, &index, Origin::Root);
+    let item = |path: &str| live.items.iter().find(|item| item.path == path);
+    let said = |path: &str, rule: Option<RuleId>, text: &str| {
+        item(path).is_some_and(|item| {
+            item.notes.iter().any(|note| note.contains(text))
+                && rule.is_none_or(|rule| item.alerts.iter().any(|(alert, _)| *alert == rule))
+        })
+    };
+    assert!(said(
+        "proc/4",
+        Some(RuleId::HiddenProgram),
+        "process 4 (/memfd:\\xff (deleted)): the path of its program is not UTF-8"
+    ));
+    assert!(live.of_accounts.contains("proc/4"));
+    assert!(said(
+        "proc/5",
+        Some(RuleId::HiddenProgram),
+        "program is not UTF-8"
+    ));
+    assert!(live.of_root.contains("proc/5"));
+    assert!(said(
+        "proc/6",
+        Some(RuleId::HiddenProgram),
+        "command line is not UTF-8"
+    ));
+    // The note shows the bytes as they are, escaped, not a lossy name.
+    assert!(said("proc/6", None, "python3 /tmp/\\xff.py"));
+    assert!(live.of_accounts.contains("proc/6"));
+    assert!(said(
+        "proc/7",
+        Some(RuleId::HiddenProgram),
+        "working directory is not UTF-8"
+    ));
+    assert!(live.of_accounts.contains("proc/7"));
+    assert!(said(
+        "proc/9",
+        Some(RuleId::HiddenProgram),
+        "working directory is not UTF-8"
+    ));
+    assert!(live.of_root.contains("proc/9"));
+    assert!(item("tmp/run").is_some_and(|item| !item.alerts.is_empty()));
+    assert!(said(
+        "proc/8",
+        Some(RuleId::HiddenProgram),
+        "loader load is not UTF-8"
+    ));
+    assert!(item("home/u/.evil.so").is_some_and(|item| {
+        item.alerts
+            .iter()
+            .any(|(alert, _)| *alert == RuleId::PreloadedLibrary)
+    }));
+    assert!(!live.items.iter().any(|item| item.path.contains('\u{fffd}')));
+    assert!(
+        !live
+            .unchecked
+            .iter()
+            .any(|sentence| sentence.contains("UTF-8")),
+        "{:?}",
+        live.unchecked
+    );
+
+    // Where it was started is still marked, from the bytes of its name.
+    let running = super::process::processes(root);
+    let seven = running.processes.iter().find(|process| process.pid == "7");
+    assert_eq!(
+        seven.and_then(|process| process.cwd_mark.clone()),
+        Some(super::program::cwd_mark(b"tmp/\xff"))
+    );
+}
+
+#[test]
+fn a_script_whose_utf8_name_holds_a_replacement_character_is_checked() {
+    let dir = TempDir::new("live-replacement-character");
+    let root = dir.path();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    fs::create_dir_all(root.join("tmp")).unwrap();
+    fs::write(root.join("tmp/\u{fffd}.py"), "print()").unwrap();
+    process(root, "10", "/usr/bin/python3", &[], "");
+    fs::write(
+        root.join("proc/10/cmdline"),
+        "python3\0/tmp/\u{fffd}.py\0".as_bytes(),
+    )
+    .unwrap();
+
+    let live = look(root, &index, Origin::Root);
+    assert!(
+        live.items.iter().any(|item| item.path == "tmp/\u{fffd}.py"
+            && item
+                .alerts
+                .iter()
+                .any(|(rule, _)| *rule == RuleId::RunningFromTemp)),
+        "{:?}",
+        live.items
+    );
+    assert!(!live.items.iter().any(|item| item.path == "proc/10"));
+}
+
+#[test]
+fn a_program_that_blanks_its_arguments_is_not_taken_for_a_kernel_thread() {
+    let dir = TempDir::new("live-blank-arguments");
+    let root = dir.path();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    // Its arguments blanked, as `memset(argv[0], 0, …)` leaves them; and
+    // one the kernel marks a kernel thread (`PF_KTHREAD`).
+    let fields = |flags: u32| format!("S 1 1 1 0 -1 {flags} 0 0");
+    for (pid, exe, flags) in [
+        ("5", "/opt/blank", 0x0040_0000),
+        ("6", "/opt/kernel", 0x0020_0040),
+    ] {
+        process(root, pid, exe, &[], "");
+        detail(root, pid, "status", "Name:\t[kworker/0:1]\n");
+        detail(root, pid, "cmdline", "\0\0\0\0");
+        detail(
+            root,
+            pid,
+            "stat",
+            &format!("{pid} ([kworker/0:1]) {}\n", fields(flags)),
+        );
+    }
+    let live = look(root, &index, Origin::Root);
+    let posing = |path: &str| {
+        live.items.iter().any(|item| {
+            item.path == path
+                && item
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("named like a kernel thread"))
+        })
+    };
+    assert!(posing("opt/blank"));
+    assert!(!posing("opt/kernel"));
+}
+
+#[test]
+fn an_environment_is_read_no_further_than_exec_can_place_one() {
+    use super::process::{MAX_ENVIRON_BYTES, MAX_START_BYTES};
+    let dir = TempDir::new("live-environ-cap");
+    let root = dir.path();
+    // Entries of the most kept, then one making up the rest, `bytes` in all.
+    let filler = |bytes: usize| {
+        let entry = format!("A={};", "x".repeat(MAX_START_BYTES - 3));
+        let mut text = entry.repeat(bytes / entry.len());
+        let _ = write!(text, "B={};", "x".repeat(bytes % entry.len() - 3));
+        text
+    };
+    let tail = "LD_PRELOAD=/z.so;";
+    let most = usize::try_from(MAX_ENVIRON_BYTES).unwrap();
+    // Longer than `exec` can place, as one pointed at other memory is, with
+    // a variable the checks read past that; and one exactly as long as
+    // that, which is read whole.
+    process(root, "4", "/opt/big", &[], &(filler(most + 3) + tail));
+    process(
+        root,
+        "9",
+        "/opt/big",
+        &[],
+        &(filler(most - tail.len()) + tail),
+    );
+    host_mounts(root);
+    let running = super::processes(root);
+    let of = |pid: &str| running.processes.iter().find(|p| p.pid == pid).unwrap();
+    assert!(of("4").read_in_part);
+    assert_eq!(of("4").environment.as_deref(), Some(&b""[..]));
+    assert!(!of("9").read_in_part);
+    assert_eq!(
+        of("9").environment.as_deref(),
+        Some(&b"LD_PRELOAD=/z.so\0"[..])
+    );
+}
+
+#[test]
+fn a_process_is_read_only_so_far_and_that_is_said() {
+    use super::process::MAX_START_BYTES;
+    let dir = TempDir::new("live-read-in-part");
+    let root = dir.path();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    // Thousands of open files before a keyboard (a device the test cannot
+    // tell is no keyboard counts as one), a socket held twice, and two
+    // cameras, of which the one on the lower descriptor is named.
+    let mut fds: Vec<(String, &str)> = (0..5000).map(|fd| (fd.to_string(), "/dev/null")).collect();
+    fds.extend([
+        ("5000".to_string(), "socket:[77]"),
+        ("5001".to_string(), "/dev/input/event0"),
+        ("5002".to_string(), "socket:[77]"),
+        ("6000".to_string(), "/dev/video2"),
+        ("5003".to_string(), "/dev/video0"),
+    ]);
+    let fds: Vec<(&str, &str)> = fds.iter().map(|(fd, to)| (fd.as_str(), *to)).collect();
+    process(root, "7", "/opt/app", &fds, "");
+    // A variable the checks read after one longer than what is kept,
+    // which is not one they read, and whose part past that looks like one.
+    let padded = format!(
+        "A=1;B={}LD_AUDIT=/tmp/f.so;LD_PRELOAD=/tmp/e.so;",
+        "x".repeat(MAX_START_BYTES - 1)
+    );
+    process(root, "6", "/opt/app", &[], &padded);
+    // One the checks read that is longer than what is kept: it and all
+    // after it are left out.
+    let long = format!(
+        "LD_PRELOAD=/a.so;LD_LIBRARY_PATH={};LD_PRELOAD=/b.so;",
+        "y".repeat(MAX_START_BYTES)
+    );
+    process(root, "5", "/opt/app", &[], &long);
+    // A command line that runs past what is kept, an account's and root's.
+    let arguments = format!("app\0{}\0last\0", "y".repeat(MAX_START_BYTES));
+    for pid in ["8", "3"] {
+        process(root, pid, "/opt/app", &[], "");
+        detail(root, pid, "cmdline", &arguments);
+    }
+    detail(root, "3", "status", "Name:\tapp\nUid:\t0\t0\t0\t0\n");
+    host_mounts(root);
+    let running = super::processes(root);
+    let of = |pid: &str| running.processes.iter().find(|p| p.pid == pid).unwrap();
+    let read_in_part: Vec<&str> = running
+        .processes
+        .iter()
+        .filter(|process| process.read_in_part)
+        .map(|process| process.pid.as_str())
+        .collect();
+    assert_eq!(read_in_part, ["3", "5", "8"]);
+    assert!(of("7").open.keyboard);
+    assert_eq!(of("7").open.sockets, [(5000, 77)]);
+    assert_eq!(of("7").open.camera.as_deref(), Some("/dev/video0"));
+    assert_eq!(
+        of("6").environment.as_deref(),
+        Some(&b"LD_PRELOAD=/tmp/e.so\0"[..])
+    );
+    assert_eq!(
+        of("5").environment.as_deref(),
+        Some(&b"LD_PRELOAD=/a.so\0"[..])
+    );
+    assert_eq!(of("8").arguments(), ["app"]);
+    let live = look(root, &index, Origin::Root);
+    // Root's own leaves root's checks incomplete; an account's is the
+    // account's item.
+    assert_eq!(
+        live.unchecked,
+        [
+            "1 of root's running process(es) were looked at only in part: past 256 KiB of command \
+          line or of the library and Python search variables, or 6 MiB of environment"
+        ]
+    );
+    let app = live
+        .items
+        .iter()
+        .find(|item| item.path == "opt/app")
+        .unwrap();
+    for (pid, started) in [("5", ""), ("8", "app")] {
+        let start = format!("process {pid} ({started}) was looked at only in part");
+        assert!(
+            app.notes.iter().any(|note| note.starts_with(&start)),
+            "{app:?}"
+        );
+    }
+    assert!(
+        app.notes
+            .iter()
+            .any(|note| note.starts_with("process 7 () reads the keyboard")),
+        "{app:?}"
+    );
+    assert!(live.of_accounts.contains("opt/app"));
+    assert!(
+        live.of_accounts.contains("tmp/e.so"),
+        "{:?}",
+        live.of_accounts
+    );
+}
+
+#[test]
+fn a_mount_on_an_entry_is_told_by_the_walks_own_table() {
+    use super::mount_table::{kind_in, kinds_by_id};
+    use super::pinned::MountKind;
+    let kind = |mountinfo: &[u8], mount| kind_in(&kinds_by_id(mountinfo), mount);
+    let mountinfo = b"\
+22 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw
+30 22 8:2 /var/lib/x /var/lib/x rw,nosuid - ext4 /dev/sda2 rw
+31 22 0:50 / /home/u/x rw,nosuid,nodev - fuse.sshfs host: rw,user_id=1000,group_id=1000
+32 22 0:51 / /mnt rw - fuse.x x rw,user_id=0,group_id=0
+33 22 0:52 / /tmp/x rw,nosuid - tmpfs tmpfs rw
+34 22 0:53 / /home/u/a\\040-\\040b rw - fuseblk /dev/sdb1 rw,user_id=1000
+35 22 0:54 / /home/u/\xff rw,nosuid,nodev - fuse.\xff \xff rw,user_id=1000,group_id=1000
+";
+    assert_eq!(kind(mountinfo, 31), MountKind::Accounts);
+    assert_eq!(kind(mountinfo, 34), MountKind::Accounts);
+    // An account's mount named in bytes that are not UTF-8 spoils no line.
+    assert_eq!(kind(mountinfo, 35), MountKind::Accounts);
+    // A bind (as systemd makes for a unit's `StateDirectory=`), root's own
+    // FUSE mount, or another filesystem.
+    assert_eq!(kind(mountinfo, 30), MountKind::Roots);
+    assert_eq!(kind(mountinfo, 32), MountKind::Roots);
+    assert_eq!(kind(mountinfo, 33), MountKind::Roots);
+    // One not in the table: unmounted since it was held.
+    assert_eq!(kind(mountinfo, 99), MountKind::Gone);
+    assert_eq!(kind(b"", 30), MountKind::Gone);
+    assert_eq!(kind(b"30 22 8:2", 30), MountKind::Gone);
+}
+
+#[test]
+fn what_the_walks_own_table_says_of_a_mount_decides_whether_it_is_asked() {
+    use std::io;
+
+    use super::pinned::{Held, MountKind};
+    use super::privileged::{Asked, askable};
+    let ask = |kind: fn() -> io::Result<MountKind>| {
+        askable(Held::Mounted(fs::File::open("/").unwrap(), 30), |_| kind())
+    };
+    // An account's FUSE mount is never asked about; root's always, the
+    // host's table aside: a home root mounts during the sweep is walked.
+    assert!(matches!(
+        ask(|| Ok(MountKind::Accounts)),
+        Some(Asked::Covered)
+    ));
+    assert!(matches!(ask(|| Ok(MountKind::Roots)), Some(Asked::File(_))));
+    // Gone since it was held: held again.
+    assert!(ask(|| Ok(MountKind::Gone)).is_none());
+    // A table the walk could not read tells nothing, and nothing is asked:
+    // the mount may be an account's that never answers.
+    let unread = || Err(io::Error::other("no table"));
+    assert!(matches!(ask(unread), Some(Asked::Unknown)));
+    // On its directory's own mount, no table is read.
+    let here = Held::Here(fs::File::open("/").unwrap());
+    assert!(matches!(
+        askable(here, |_| unreachable!()),
+        Some(Asked::File(_))
+    ));
+}
+
+/// When the walk holds the file `trigger` in `a` or `b`, swaps the other
+/// for a directory of root's holding another set-id file, as a package
+/// upgrade replaces what it installs, or with `gone` removes it; reads no
+/// capabilities. Whichever is walked first, the other is then still to be
+/// walked, listed as it was before.
+fn swaps_the_other(held: &fs::File) -> std::io::Result<Option<Capabilities>> {
+    use std::os::fd::AsRawFd;
+    let path = fs::read_link(format!("/proc/self/fd/{}", held.as_raw_fd()))?;
+    if path.file_name().is_none_or(|name| name != "trigger") {
+        return Ok(None);
+    }
+    let directory = path.parent().unwrap();
+    let top = directory.parent().unwrap();
+    let other = top.join(if directory.ends_with("a") { "b" } else { "a" });
+    if top.join("old").exists() {
+        return Ok(None);
+    }
+    if top.join("gone").exists() {
+        fs::create_dir(top.join("old"))?;
+        fs::remove_dir_all(&other)?;
+    } else {
+        fs::rename(&other, top.join("old"))?;
+        setuid_file(&other.join("new"));
+    }
+    Ok(None)
+}
+
+#[test]
+fn a_directory_root_swaps_during_the_walk_is_walked_as_it_is_now() {
+    let dir = TempDir::new("live-walk-root-swaps");
+    let root = dir.path();
+    for side in ["a", "b"] {
+        fs::create_dir_all(root.join(format!("usr/local/{side}"))).unwrap();
+        fs::write(root.join(format!("usr/local/{side}/trigger")), "").unwrap();
+    }
+    let found = walk_as_root(root, files(100), swaps_the_other, ONE_MOUNT);
+    assert!(
+        ["usr/local/a/new", "usr/local/b/new"]
+            .iter()
+            .any(|new| found.items.contains_key(*new)),
+        "{:?}",
+        found.items.keys()
+    );
+    assert_eq!(found.unchecked, Vec::<String>::new());
+    // One root removes meanwhile holds nothing.
+    let dir = TempDir::new("live-walk-root-removes");
+    let root = dir.path();
+    for side in ["a", "b"] {
+        fs::create_dir_all(root.join(format!("usr/local/{side}"))).unwrap();
+        fs::write(root.join(format!("usr/local/{side}/trigger")), "").unwrap();
+    }
+    fs::write(root.join("usr/local/gone"), "").unwrap();
+    let found = walk_as_root(root, files(100), swaps_the_other, ONE_MOUNT);
+    assert_eq!(found.unchecked, Vec::<String>::new());
+}
+
+#[test]
+fn the_walk_goes_down_to_its_depth_and_counts_what_is_deeper() {
+    let dir = TempDir::new("live-walk-depth");
+    let root = dir.path();
+    let mut deepest = root.join("usr");
+    for _ in 0..64 {
+        deepest.push("d");
+    }
+    // The directory 64 below the start is listed; one below it is not.
+    setuid_file(&deepest.join("s"));
+    let found = walk_as_root(root, files(1_000), none_anywhere, ONE_MOUNT);
+    assert!(found.unchecked.is_empty(), "{:?}", found.unchecked);
+    assert_eq!(found.items.len(), 1, "{:?}", found.items.keys());
+    fs::create_dir(deepest.join("d")).unwrap();
+    let found = walk_as_root(root, files(1_000), none_anywhere, ONE_MOUNT);
+    assert!(
+        found
+            .unchecked
+            .iter()
+            .any(|said| said.starts_with("1 directory(ies) more than 64")),
+        "{:?}",
+        found.unchecked
+    );
+}
+
+#[test]
+fn files_with_the_hosts_capabilities_are_never_cut() {
+    let dir = TempDir::new("live-walk-many-capabilities");
+    let root = dir.path();
+    for index in 0..1_001 {
+        setuid_file(&root.join(format!("var/tmp/{index}")));
+    }
+    fs::set_permissions(root.join("var/tmp"), fs::Permissions::from_mode(0o1777)).unwrap();
+    // No account can give its files the host's capabilities, so they come
+    // without bound only where root gave them.
+    let found = walk_as_root(root, files(10_000), net_raw_everywhere, ONE_MOUNT);
+    assert!(
+        found
+            .notes
+            .iter()
+            .all(|note| !note.contains("were counted, not looked at")),
+        "{:?}",
+        found.notes
+    );
+}
+
+#[test]
+fn past_a_number_the_accounts_set_id_files_are_counted() {
+    let dir = TempDir::new("live-walk-many");
+    let root = dir.path();
+    for index in 0..1_001 {
+        setuid_file(&root.join(format!("var/tmp/{index}")));
+    }
+    fs::set_permissions(root.join("var/tmp"), fs::Permissions::from_mode(0o1777)).unwrap();
+    let found = walk_as_root(root, files(10_000), none_anywhere, ONE_MOUNT);
+    assert_eq!(found.items.len(), 1_000);
+    assert!(
+        found.notes.iter().any(|note| note
+            .starts_with("1 more setuid or setgid file(s) of the accounts' own")
+            && note.ends_with(
+                "past 1000 of one owner's, or of those on mounts where set-id \
+                                   bits have no effect"
+            )),
+        "{:?}",
+        found.notes
+    );
+}
+
+#[test]
+fn the_accounts_set_id_files_count_against_their_owner_only_where_owners_are_real() {
+    use super::privileged::MAX_ACCOUNTS_ITEMS;
+    let dir = TempDir::new("live-walk-owners");
+    let root = dir.path();
+    let theirs = root.join("var/tmp");
+    // On a mount without set-id, owners are what the filesystem says, so
+    // all share one bound; past it, a file on a mount where set-id bits
+    // take effect is still looked at, under its owner's bound.
+    for index in 0..MAX_ACCOUNTS_ITEMS {
+        setuid_file(&theirs.join(format!("n/{index}")));
+    }
+    setuid_file(&theirs.join("s/x"));
+    fs::set_permissions(&theirs, fs::Permissions::from_mode(0o1777)).unwrap();
+    let mountinfo = format!("{ONE_MOUNT}23 22 0:22 / /var/tmp/n rw,nosuid - tmpfs tmpfs rw\n");
+    let found = walk_as_root(root, files(10_000), none_anywhere, &mountinfo);
+    assert!(found.items.contains_key("var/tmp/s/x"));
+    assert!(
+        !found
+            .notes
+            .iter()
+            .any(|note| note.contains("were counted, not looked at")),
+        "{:?}",
+        found.notes
+    );
+}
+
+/// What `privileged_walk` would hold of the entry `name` of `directory`,
+/// for a tree with nothing mounted in it.
+fn held_here(
+    directory: &fs::File,
+    mount: u64,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<super::privileged::Asked> {
+    use super::pinned::Held;
+    use super::privileged::Asked;
+    Ok(match super::pinned::hold(directory, mount, name)? {
+        Held::Here(file) => Asked::File(file),
+        Held::Mounted(..) => Asked::Unknown,
+    })
+}
+
+#[test]
+fn what_the_walk_could_not_ask_about_is_said_by_whose_it_may_be() {
+    use std::collections::HashSet;
+    use std::ffi::OsStr;
+
+    use super::privileged::{Ask, Asked, privileged_walk_asking};
+    let dir = TempDir::new("live-walk-asked");
+    let root = dir.path();
+    for file in ["usr/a/covered", "usr/b/unknown", "usr/c/gone"] {
+        write(root, file, "");
+    }
+    for directory in ["usr/d", "usr/e", "usr/f"] {
+        fs::create_dir_all(root.join(directory)).unwrap();
+    }
+    // Entries named for an answer get it; the directories `d`, `e` and
+    // `f` are held as they are in their listing, and get theirs when held
+    // again to be opened.
+    let mut seen = HashSet::new();
+    let mut entry = |directory: &fs::File, mount: u64, name: &OsStr| {
+        let again = !seen.insert(name.to_os_string());
+        match (name.to_str(), again) {
+            (Some("covered"), _) | (Some("f"), true) => Ok(Asked::Covered),
+            (Some("unknown"), _) | (Some("d"), true) => Ok(Asked::Unknown),
+            (Some("gone"), _) | (Some("e"), true) => Ok(Asked::Gone),
+            _ => held_here(directory, mount, name),
+        }
+    };
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: None,
+        index: &index,
+        origin: Origin::Root,
+    };
+    let mut closed = super::Closed {
+        mounts: Some(super::mounts(ONE_MOUNT)),
+        ..super::Closed::default()
+    };
+    let mut found = super::Found::default();
+    let ask = Ask {
+        capabilities: none_anywhere,
+        entry: &mut entry,
+    };
+    privileged_walk_asking(&scope, &mut found, &mut closed, files(100), ask);
+    // What may be anything leaves root's place not checked: the listing
+    // of `usr/b`, and `usr/d`.
+    assert_eq!(
+        found.unchecked,
+        [
+            "setuid programs were not looked for in 2 place(s) that could not be listed \
+          (/usr/b among them)"
+        ]
+    );
+    // Gone on every hold, only an account mounts there: a note, and the
+    // listing of `usr/c` stays whole.
+    assert!(
+        found.notes.contains(
+            &"setuid programs and files with capabilities were not looked for in 2 place(s) \
+              accounts may write that could not be listed (/usr/c/gone among them)"
+                .to_string()
+        ),
+        "{:?}",
+        found.notes
+    );
+    assert!(
+        found.notes.iter().any(|note| note.starts_with(
+            "2 place(s) on mounts closed to root were not looked into (/usr/a/covered among \
+                 them)"
+        )),
+        "{:?}",
+        found.notes
+    );
+}
+
+#[test]
+fn an_entry_whose_mount_is_gone_is_held_again_up_to_three_times() {
+    use std::ffi::OsStr;
+
+    use super::pinned::{MountKind, mount_of};
+    use super::privileged::{Asked, hold_asked};
+    // `/proc` is a mount of its own wherever the tests run.
+    let top = fs::File::open("/").unwrap();
+    let mount = mount_of(&top).unwrap();
+    let mut looked_up = 0;
+    let mut gone_twice = |_| {
+        looked_up += 1;
+        Ok(if looked_up < 3 {
+            MountKind::Gone
+        } else {
+            MountKind::Roots
+        })
+    };
+    let asked = hold_asked(&top, mount, OsStr::new("proc"), &mut gone_twice).unwrap();
+    assert!(matches!(asked, Asked::File(_)), "{asked:?}");
+    assert_eq!(looked_up, 3);
+    let mut looked_up = 0;
+    let mut gone = |_| {
+        looked_up += 1;
+        Ok(MountKind::Gone)
+    };
+    let asked = hold_asked(&top, mount, OsStr::new("proc"), &mut gone).unwrap();
+    assert!(matches!(asked, Asked::Gone), "{asked:?}");
+    assert_eq!(looked_up, 3);
+}
+
+/// The variable `in_a_mount_namespace_the_walks_own_table_follows_its_mounts`
+/// runs only with, as `the_walks_own_table_is_read_again_after_a_mount_is_made_or_removed`
+/// sets it.
+const IN_A_MOUNT_NAMESPACE: &str = "OMARCHY_GUARDIAN_TEST_IN_A_MOUNT_NAMESPACE";
+
+#[test]
+fn the_walks_own_table_is_read_again_after_a_mount_is_made_or_removed() {
+    use std::process::{Command, Stdio};
+    let unshare = || {
+        let mut unshare = Command::new("unshare");
+        unshare.args(["--map-root-user", "--mount"]);
+        unshare
+    };
+    let can = unshare()
+        .arg("true")
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !can {
+        errln!("skipped: unshare cannot make a mount namespace here");
+        return;
+    }
+    let output = unshare()
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "sweep::live::tests::in_a_mount_namespace_the_walks_own_table_follows_its_mounts",
+            "--ignored",
+        ])
+        .env(IN_A_MOUNT_NAMESPACE, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "mounts: run in a mount namespace of its own by \
+            the_walks_own_table_is_read_again_after_a_mount_is_made_or_removed"]
+fn in_a_mount_namespace_the_walks_own_table_follows_its_mounts() {
+    use std::process::Command;
+
+    use super::mount_table::MountTable;
+    use super::pinned::{Held, MountKind};
+    assert!(
+        std::env::var_os(IN_A_MOUNT_NAMESPACE).is_some(),
+        "mounts on this system: run only in a mount namespace of its own"
+    );
+    let dir = TempDir::new("live-table-namespace");
+    let root = dir.path();
+    fs::create_dir(root.join("m")).unwrap();
+    let directory = fs::File::open(root).unwrap();
+    let mut table = MountTable::default();
+    // Read once before the mount is made.
+    let mount = super::pinned::mount_of(&directory).unwrap();
+    assert_eq!(table.kind(mount).unwrap(), MountKind::Roots);
+    // Asked again with nothing mounted since, it is not read again.
+    assert_eq!(table.kind(mount).unwrap(), MountKind::Roots);
+    assert_eq!(table.reads(), 1);
+    let run = |command: &mut Command| assert!(command.status().unwrap().success());
+    run(Command::new("mount")
+        .args(["-t", "tmpfs", "none"])
+        .arg(root.join("m")));
+    let Held::Mounted(_held, on) = held(&directory, b"m").unwrap() else {
+        panic!("a mount was made on m");
+    };
+    assert_eq!(table.kind(on).unwrap(), MountKind::Roots);
+    assert_eq!(table.reads(), 2);
+    // Read again, the table holds every mount, not only the one made since,
+    // and the change that caused the read is not flagged again.
+    assert_eq!(table.kind(mount).unwrap(), MountKind::Roots);
+    assert_eq!(table.reads(), 2);
+    // Unmounted lazily, its id is the held file's, and in no table.
+    run(Command::new("umount").arg("-l").arg(root.join("m")));
+    assert_eq!(table.kind(on).unwrap(), MountKind::Gone);
+}
+
+#[test]
+fn a_process_cannot_make_the_live_checks_read_without_end() {
+    let dir = TempDir::new("live-preload-flood");
+    let root = dir.path();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::System,
+    };
+
+    // Past the limit the rest are not looked at, and the process has an
+    // alert that says so.
+    let libraries: Vec<String> = (0..40).map(|n| format!("/tmp/lib{n}.so")).collect();
+    for library in &libraries {
+        write(root, &library[1..], "library");
+    }
+    let environment = format!("LD_PRELOAD={};", libraries.join(":"));
+    let flood = running("/tmp/x", &[], None, &environment);
+    let items = said(&scope, &flood, "tmp/x");
+    let preloaded = items
+        .iter()
+        .filter(|(path, ..)| path.starts_with("tmp/lib"))
+        .count();
+    assert_eq!(preloaded, 16, "{items:?}");
+    let (_, alerts, notes) = items
+        .iter()
+        .find(|(path, ..)| path == "tmp/x")
+        .expect("the process's own item");
+    assert!(alerts.contains(&RuleId::PreloadedLibrary), "{alerts:?}");
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("preloads 40 libraries: only the first 16")),
+        "{notes:?}"
+    );
+
+    // Past the files the live checks read, an item is kept with its alert,
+    // unread, and the sweep says so once.
+    let mut found = super::Found::default();
+    for n in 0..300 {
+        let path = format!("tmp/f{n}");
+        write(root, &path, "x");
+        found.add(
+            &scope,
+            Category::Process,
+            &path,
+            "a note".into(),
+            Some(RuleId::RunningFromTemp),
+        );
+    }
+    let unread: Vec<&str> = found
+        .items
+        .values()
+        .filter(
+            |item| matches!(&item.body, Body::Unreadable(reason) if reason.starts_with("not read")),
+        )
+        .map(|item| item.path.as_str())
+        .collect();
+    assert_eq!(unread.len(), 300 - 256, "{unread:?}");
+    assert!(found.items.values().all(|item| {
+        item.alerts
+            .iter()
+            .any(|(rule, _)| *rule == RuleId::RunningFromTemp)
+    }));
+    // As not checked, in a user's sweep too: root's checks have a limit
+    // of their own.
+    let said_once = found
+        .unchecked
+        .iter()
+        .filter(|sentence| sentence.contains("read at most 256 files"))
+        .count();
+    assert_eq!(said_once, 1, "{:?}", found.unchecked);
+    assert!(found.notes.is_empty(), "{:?}", found.notes);
+
+    // Past the limit a name already read is added to, not left unread,
+    // and a new name keeps the file it is about.
+    found.add(&scope, Category::Process, "tmp/f0", "again".into(), None);
+    found.add_as(
+        &scope,
+        Category::Listener,
+        "tmp/f0:tcp-1",
+        "tmp/f0",
+        "listens".into(),
+        None,
+    );
+    assert!(!matches!(found.items["tmp/f0"].body, Body::Unreadable(_)));
+    let listener = &found.items["tmp/f0:tcp-1"];
+    assert!(
+        matches!(&listener.body, Body::Unreadable(reason) if reason == super::NOT_READ_PAST_LIMIT)
+    );
+    assert_eq!(listener.file.as_deref(), Some("tmp/f0"));
+}
+
+#[test]
+fn up_to_sixteen_preloaded_libraries_are_looked_at() {
+    let dir = TempDir::new("live-preload-edge");
+    let root = dir.path();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::System,
+    };
+    // All 16 are looked at; with one more, the process says so.
+    for (count, flagged) in [(16, false), (17, true)] {
+        let libraries: Vec<String> = (0..count).map(|n| format!("/tmp/edge{n}.so")).collect();
+        for library in &libraries {
+            write(root, &library[1..], "library");
+        }
+        let process = running(
+            "/tmp/y",
+            &[],
+            None,
+            &format!("LD_PRELOAD={};", libraries.join(":")),
+        );
+        let items = said(&scope, &process, "tmp/y");
+        let looked = items
+            .iter()
+            .filter(|(path, ..)| path.starts_with("tmp/edge"))
+            .count();
+        assert_eq!(looked, 16, "{items:?}");
+        let (_, _, notes) = items
+            .iter()
+            .find(|(path, ..)| path == "tmp/y")
+            .expect("the process");
+        assert_eq!(
+            notes.iter().any(|note| note.contains("only the first 16")),
+            flagged,
+            "{notes:?}"
+        );
+    }
+}
+
+#[test]
+fn a_program_seen_many_times_is_read_once_and_privileged_files_count_too() {
+    let dir = TempDir::new("live-read-once");
+    let root = dir.path();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::System,
+    };
+    write(root, "tmp/f1", "x");
+
+    // One program seen doing many things is read once.
+    let mut found = super::Found::default();
+    for port in 0..300 {
+        found.add_as(
+            &scope,
+            Category::Listener,
+            &format!("tmp/f1:tcp-{port}"),
+            "tmp/f1",
+            "listens".into(),
+            None,
+        );
+    }
+    assert_eq!(found.looked_at, 1);
+    assert!(
+        found
+            .items
+            .values()
+            .all(|item| !matches!(item.body, Body::Unreadable(_))
+                && item.file.as_deref() == Some("tmp/f1"))
+    );
+
+    // Past the limit, an account's set-id file or file with capabilities
+    // is listed unread and flagged; one already read as a program keeps
+    // that read and is flagged too, since it is not read again.
+    setuid_file(&root.join("home/u/f2"));
+    setuid_file(&root.join("home/u/f3"));
+    write(root, "home/u/cap", "x");
+    // A directory anyone can write: what is in it is an account's.
+    fs::set_permissions(root.join("home/u"), fs::Permissions::from_mode(0o1777)).unwrap();
+    let mut found = super::Found::default();
+    found.add(&scope, Category::Process, "home/u/f2", "runs".into(), None);
+    found.looked_at = 256;
+    walk_into(&scope, &mut found);
+    let unread = |path: &str| {
+        found.items.get(path).is_some_and(|item| {
+            matches!(&item.body, Body::Unreadable(reason) if reason == super::NOT_READ_PAST_LIMIT)
+                && item
+                    .alerts
+                    .iter()
+                    .any(|(rule, _)| *rule == RuleId::UnknownPrivilegedFile)
+        })
+    };
+    // Read again as a set-id file, it is charged again, as is each other
+    // file the walk reads.
+    let mut charged = super::Found::default();
+    charged.add(&scope, Category::Process, "home/u/f2", "runs".into(), None);
+    walk_into(&scope, &mut charged);
+    assert_eq!(charged.looked_at, 4);
+    let program = &found.items["home/u/f2"];
+    assert!(!matches!(program.body, Body::Unreadable(_)));
+    assert!(
+        program
+            .alerts
+            .iter()
+            .any(|(rule, _)| *rule == RuleId::UnknownPrivilegedFile)
+    );
+    assert!(unread("home/u/f3") && unread("home/u/cap"));
+}
+
+/// Gives `cap_net_raw=ep` to each file that is not set-id.
+fn net_raw_unless_set_id(file: &fs::File) -> std::io::Result<Option<Capabilities>> {
+    let set_id = file.metadata()?.mode() & 0o6000 != 0;
+    Ok((!set_id).then(|| given("cap_net_raw=ep")))
+}
+
+/// The set-id walk of `scope` into `found`, on one mount where set-id bits
+/// take effect.
+fn walk_into(scope: &Scope<'_>, found: &mut super::Found) {
+    let mut closed = super::Closed {
+        mounts: Some(super::mounts(ONE_MOUNT)),
+        ..super::Closed::default()
+    };
+    super::privileged::privileged_walk(
+        scope,
+        found,
+        &mut closed,
+        files(1_000),
+        net_raw_unless_set_id,
+    );
+}
+
+#[test]
+fn roots_own_set_id_file_is_read_after_an_account_floods_the_limit() {
+    let dir = TempDir::new("live-limit-roots-own");
+    let root = dir.path();
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let scope = Scope {
+        root,
+        home: None,
+        index: &index,
+        origin: Origin::Root,
+    };
+    // An account's processes run more programs than the live checks read.
+    let mut found = super::Found::default();
+    for n in 0..300 {
+        let path = format!("tmp/p{n}");
+        write(root, &path, "x");
+        found.add(&scope, Category::Process, &path, "runs".into(), None);
+    }
+    assert_eq!(found.looked_at, 256);
+    // Root's own set-id file, in a directory only root writes, and one of
+    // an account's, in a directory anyone can write.
+    setuid_file(&root.join("usr/local/bin/roots"));
+    setuid_file(&root.join("home/u/accounts"));
+    fs::set_permissions(root.join("home/u"), fs::Permissions::from_mode(0o1777)).unwrap();
+    walk_into(&scope, &mut found);
+    let body = |path: &str| &found.items[path].body;
+    assert!(
+        !matches!(body("usr/local/bin/roots"), Body::Unreadable(_)),
+        "{:?}",
+        body("usr/local/bin/roots")
+    );
+    assert!(
+        matches!(body("home/u/accounts"), Body::Unreadable(reason) if reason == super::NOT_READ_PAST_LIMIT)
+    );
+}
+
+#[test]
+fn a_set_id_file_root_cannot_open_is_told() {
+    let dir = TempDir::new("live-set-id-unopened");
+    let root = dir.path();
+    write(root, "home/u/ok", "x");
+    fs::set_permissions(root.join("home/u/ok"), fs::Permissions::from_mode(0o4755)).unwrap();
+    // Setgid with no read bit for its owner: root's open fails, as it does
+    // for a file under a lease or on NFS with `root_squash`.
+    write(root, "home/u/sg", "x");
+    fs::set_permissions(root.join("home/u/sg"), fs::Permissions::from_mode(0o2055)).unwrap();
+    if fs::File::open(root.join("home/u/sg")).is_ok() {
+        // As root, nothing keeps the file from opening.
+        return;
+    }
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let live = check(&Scope {
+        root,
+        home: None,
+        index: &index,
+        origin: Origin::Root,
+    });
+    for path in ["home/u/ok", "home/u/sg"] {
+        assert!(
+            live.items.iter().any(|item| item.path == path
+                && item
+                    .alerts
+                    .iter()
+                    .any(|(rule, _)| *rule == RuleId::UnknownPrivilegedFile)),
+            "{path}: {:?}",
+            live.items
+        );
+    }
+}
+
+#[test]
+fn set_id_files_count_toward_what_the_live_checks_read() {
+    let dir = TempDir::new("live-set-id-flood");
+    let root = dir.path();
+    for n in 0..300 {
+        let path = format!("home/u/s{n}");
+        write(root, &path, "x");
+        fs::set_permissions(root.join(&path), fs::Permissions::from_mode(0o4755)).unwrap();
+    }
+    let index = PackageIndex::with_foreign(HashSet::new());
+    let live = check(&Scope {
+        root,
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::System,
+    });
+    let set_id: Vec<_> = live
+        .items
+        .iter()
+        .filter(|item| item.category == Category::Setuid)
+        .collect();
+    assert_eq!(set_id.len(), 300);
+    let unread = set_id
+        .iter()
+        .filter(|item| matches!(&item.body, Body::Unreadable(reason) if reason == super::NOT_READ_PAST_LIMIT))
+        .count();
+    assert_eq!(unread, 300 - 256);
+    assert!(set_id.iter().all(|item| {
+        item.alerts
+            .iter()
+            .any(|(rule, _)| *rule == RuleId::UnknownPrivilegedFile)
+    }));
+    assert!(
+        live.unchecked
+            .iter()
+            .any(|note| note.contains("read at most 256 files")),
+        "{:?}",
+        live.unchecked
+    );
 }

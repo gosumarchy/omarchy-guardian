@@ -68,16 +68,26 @@ interactive Bash, also in a shell whose PATH was reordered or that was not
 started from the graphical session (SSH, a console). It passes what it does not
 gate to `/usr/share/omarchy/bin/omarchy` by its fixed path; the commands on
 PATH also honour `omarchy dev link`. It counts only as the exact line Guardian
-writes in `~/.bashrc`, at the top level, with no command before it that leaves
-the file, nothing after it that unsets or redefines its functions, and no alias
-of one of their names (or of `source`) anywhere in the file. A `return` or
-`exit` before it counts as leaving, except in the usual "stop unless this shell
-is interactive" line in its common spellings: `[[ $- != *i* ]] && return`, `[[
-$- == *i* ]] || return`, `[ -z "$PS1" ] && return`, `[ -n "$PS1" ] || return`,
-and `case $- in *i*) ;; *) return;; esac`. The words `return` and `exit` in a
-comment, in a quoted string or inside a function or block are not commands;
-`<<` in `$(( ))` or `(( ))` is a shift and `<<<` a here-string, neither starts
-a here-document.
+writes in `~/.bashrc`, at the top level, outside parentheses and quoted text,
+with no command before it that leaves the file or makes one of its functions
+read-only, nothing after it that unsets or redefines its functions or replaces
+the shell (`exec bash`, in a block, a pipeline or behind `&` too, but not in a
+function's body), no hook that does so wherever it is set (a `trap`,
+`PROMPT_COMMAND`, `bind -x`, or a prompt `PS0` to `PS4` through its `${ …; }`,
+which runs in the shell itself, not its `$(…)`), and no alias of one of their
+names (or of `source` or `[[`) anywhere in the file, by `alias` or through
+`BASH_ALIASES`, braces expanded as Bash expands them (a name that expands to
+more than 256 words, or holds a range, is taken to be one of them). A `return`
+or `exit` before it, or an `exec` that runs a program, counts as leaving (also
+behind `&&` or `||`, so `[[ -z $TMUX ]] && exec tmux` before it counts, though
+the shells tmux starts load it), except in the usual "stop unless this shell is
+interactive" line in its common spellings: `[[ $- != *i* ]] && return`, `[[ $-
+== *i* ]] || return`, `[ -z "$PS1" ] && return`, `[ -n "$PS1" ] || return`, and
+`case $- in *i*) ;; *) return;; esac`. The words `return` and `exit` in a
+comment, in a quoted string or inside a function or block are not commands.
+Quoted text can run over several lines, and inside `"…"` a `$(…)` or a backtick
+starts its own quoting, as in Bash. A `<<` in `$(( ))` or `(( ))` is a shift
+and `<<<` a here-string, neither starts a here-document.
 
 Guardian reads `~/.bashrc` line by line, not as a shell would: what a file
 sourced from it does is not seen.
@@ -123,8 +133,8 @@ running as you can remove them, which the bar then shows and notifies about.
 ### How a theme is installed
 
 Themes are cloned to a hidden staging directory and reviewed with `guard
---class theme --identity theme:<name> --thorough`; only the exact reviewed
-checkout is moved into place and applied. Updates stage and review every
+--class theme --identity 'theme:<name> <url>' --thorough`; only the exact
+reviewed checkout is moved into place and applied. Updates stage and review every
 Git-installed theme before replacing any. A theme with submodules is refused,
 and so is an update of a theme with local, untracked or ignored files, a
 detached HEAD or no upstream branch. Git LFS files are not fetched, so a theme
@@ -138,9 +148,9 @@ update` go through `guardian-plugin`:
 
 - **Add:** the repository is cloned to a hidden staging directory and checked
   with Omarchy's own `omarchy-plugin-validate`. It is then reviewed with `guard
-  --class plugin --identity plugin:<id> --thorough`, and only when the review
-  lets it through (or you gave a permit for exactly that content) is the exact
-  reviewed checkout moved into place and, if asked, enabled.
+  --class plugin --identity 'plugin:<id> <url>' --thorough`, and only when the
+  review lets it through (or you gave a permit for exactly that content) is the
+  exact reviewed checkout moved into place and, if asked, enabled.
 - **Update:** each installed plugin's new commits are fetched into a staged
   copy, fast-forwarded and validated, then reviewed as an upgrade of the
   approved version. The installed plugin is fast-forwarded to exactly the

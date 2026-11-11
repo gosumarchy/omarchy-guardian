@@ -31,8 +31,12 @@ matter most:
   like Guardian's own ([What Guardian
   decided](audit-trail.md#what-an-entry-proves-and-what-it-does-not)). The
   pacman gate, the list of allowed sweep items and the accepted weaker
-  settings are root's and are not in its reach. The reviewer's login and, for
-  your own sources, OpenCode's configuration are yours too.
+  settings are root's and are not in its reach, but what you hand the gate
+  is: an archive you install with `pacman -U` from a directory you can write
+  can be swapped by such a program after the review and before pacman reads
+  it again: what no hook can close is that moment ([How archives are
+  located](pacman-gate.md#how-archives-are-located)). The reviewer's login
+  and, for your own sources, OpenCode's configuration are yours too.
 - **Root is trusted.** The sweep judges files by pacman's own records, which
   root can rewrite, and the pacman gate reviews as the user who called `sudo`,
   with that user's reviewer login.

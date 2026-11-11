@@ -11,7 +11,7 @@
 use std::fs;
 
 use super::collect::{self, Body, Item, Origin, Scope};
-use super::read::{self, Found, View};
+use super::read::{self, Found, Hop, View};
 use super::tier::Tier;
 use crate::autorun::Category;
 use crate::encoding::base64_decode;
@@ -49,6 +49,10 @@ const MAX_KEY_FILE: usize = 1024 * 1024;
 /// rest are one item, so an account with thousands of lines cannot crowd
 /// every other account's (and root's own) keys out of the results.
 const MAX_ACCOUNT_KEYS: usize = 200;
+/// Why a key file that is there and would not open is told: its owner can
+/// make every open of it fail and let go of it for the server.
+const UNOPENED_KEY_FILE: &str = "a key file that could not be read: the server may read it, and its keys \
+                        are not listed";
 /// What is seen of a key file too large to read, and of keys past
 /// `MAX_ACCOUNT_KEYS`.
 const TOO_LARGE: &str =
@@ -433,23 +437,24 @@ fn sshd_configuration(scope: &Scope<'_>) -> Vec<String> {
 
 /// What `found` at `path` is, past a link: a key file kept elsewhere under
 /// another name (a dotfiles directory) is the account's key file all the
-/// same, and the server reads it through the link. `look` says what is at
-/// a path as far as the one who chose the link may see: a link to a file
-/// they could not read shows nothing.
+/// same, and the server reads it through the link. `hop` and `look` say
+/// what is at a path as far as the one who chose the link may see: a link
+/// to a file they could not read shows nothing. Only the end is read.
 fn past_link(
     path: &str,
-    found: Option<Found>,
+    found: Found,
+    hop: &dyn Fn(&str) -> Hop,
     look: &dyn Fn(&str) -> Option<Found>,
 ) -> Option<Found> {
-    let Some(Found::Link(target)) = &found else {
-        return found;
+    let Found::Link(target) = &found else {
+        return Some(found);
     };
-    let hop = |next: &str| match look(next) {
-        Some(Found::Link(further)) => Some(Some(further)),
-        Some(_) => Some(None),
-        None => None,
-    };
-    read::resolve_where(path, target, &hop).and_then(|resolved| look(&resolved))
+    match read::walk_links(path, target, hop) {
+        // A chain not followed to its end stays a link, which `key_items`
+        // reports, so the keys behind it are not silently left out.
+        Err(()) => Some(found),
+        Ok(resolved) => resolved.and_then(|resolved| look(&resolved)),
+    }
 }
 
 /// How the key files of an account are looked at.
@@ -476,16 +481,37 @@ fn key_items(
     let mut all: Vec<String> = Vec::new();
     // The keys past `MAX_ACCOUNT_KEYS`, and the files too large to read.
     let mut unlisted: Vec<String> = Vec::new();
-    let mut too_large = 0_usize;
+    // Key files too large to read, or behind links not followed.
+    let mut unread = 0_usize;
     let mut listed = 0_usize;
     for path in files {
-        let Some(Found::File { head, size, .. }) = look(path) else {
-            continue;
+        let (head, size) = match look(path) {
+            Some(Found::File { head, size, .. }) => (head, size),
+            // A key file past what is read is not listed: it was too large
+            // when it was opened, or grew past that while it was read.
+            Some(Found::Unreadable(why)) if why == read::TOO_LARGE => (Vec::new(), u64::MAX),
+            Some(Found::Link(_)) => {
+                unread += 1;
+                if detail == Detail::Keys {
+                    items.push(unfollowed_item(origin, account, path));
+                }
+                continue;
+            }
+            // Anything else there that was not read: the closure gives
+            // `None` where nothing is (see `items` and `keys_of`).
+            Some(Found::Unreadable(_)) => {
+                unread += 1;
+                if detail == Detail::Keys {
+                    items.push(unopened_item(origin, account, path));
+                }
+                continue;
+            }
+            _ => continue,
         };
         // Padding a key file past what is read must not hide its keys:
         // the server reads all of it. Nobody's key file is that size.
         if usize::try_from(size).unwrap_or(usize::MAX) > MAX_KEY_FILE {
-            too_large += 1;
+            unread += 1;
             if detail == Detail::Keys {
                 items.push(too_large_item(origin, account, path));
             }
@@ -538,8 +564,8 @@ fn key_items(
     if !unlisted.is_empty() {
         items.push(unlisted_item(origin, account, unlisted));
     }
-    if detail == Detail::Count && (!all.is_empty() || too_large > 0) {
-        items.push(counted_item(origin, account, all, too_large > 0));
+    if detail == Detail::Count && (!all.is_empty() || unread > 0) {
+        items.push(counted_item(origin, account, all, unread > 0));
     }
     items
 }
@@ -558,6 +584,43 @@ fn too_large_item(origin: Origin, account: &Account, path: &str) -> Item {
     );
     item.alerts
         .push((RuleId::RiskyConfiguration, TOO_LARGE.into()));
+    item
+}
+
+/// The item for a key file of `account` at `path` that is there and would
+/// not open.
+fn unopened_item(origin: Origin, account: &Account, path: &str) -> Item {
+    let mut item = fact(
+        origin,
+        format!("{path}#unopened"),
+        "could not be read".into(),
+        format!(
+            "a key file of {} that is there and could not be read: the keys in it are not listed",
+            account.name
+        ),
+    );
+    item.alerts
+        .push((RuleId::RiskyConfiguration, UNOPENED_KEY_FILE.into()));
+    item
+}
+
+/// The item for a key file of `account` at `path` that is a chain of links
+/// not followed to its end.
+fn unfollowed_item(origin: Origin, account: &Account, path: &str) -> Item {
+    let mut item = fact(
+        origin,
+        format!("{path}#unfollowed"),
+        "a chain of links not followed to its end".into(),
+        format!(
+            "a key file of {} behind a chain of links not followed to its end: the keys in it \
+             are not listed",
+            account.name
+        ),
+    );
+    item.alerts.push((
+        RuleId::RiskyConfiguration,
+        "a chain of links not followed to its end".into(),
+    ));
     item
 }
 
@@ -585,14 +648,16 @@ fn unlisted_item(origin: Origin, account: &Account, mut unlisted: Vec<String>) -
 }
 
 /// The one line told of another account's keys (`all`, by their hashes).
-/// It says so when a file of theirs was too large to count, and no more of
-/// that file than that.
-fn counted_item(origin: Origin, account: &Account, mut all: Vec<String>, too_large: bool) -> Item {
+/// It says so when a file of theirs was not read (too large, or behind a
+/// chain of links not followed to its end), and no more of that file than
+/// that.
+fn counted_item(origin: Origin, account: &Account, mut all: Vec<String>, unread: bool) -> Item {
     all.sort();
-    let (uncounted, beside) = if too_large {
+    let (uncounted, beside) = if unread {
         (
-            ", and a key file too large to read",
-            "; a key file too large to read is not counted",
+            ", and a key file not read",
+            "; a key file too large to read, that could not be read, or behind a chain of links \
+             not followed to its end, is not counted",
         )
     } else {
         ("", "")
@@ -611,9 +676,9 @@ fn counted_item(origin: Origin, account: &Account, mut all: Vec<String>, too_lar
             account.name
         ),
     );
-    if too_large {
+    if unread {
         item.alerts
-            .push((RuleId::RiskyConfiguration, TOO_LARGE.into()));
+            .push((RuleId::RiskyConfiguration, "a key file not read".into()));
     }
     item
 }
@@ -650,63 +715,109 @@ pub(super) fn items(scope: &Scope<'_>) -> (Vec<Item>, Option<String>) {
     let mut items = account_items(scope.origin, &passwd, shadow.as_deref());
     items.extend(member_items(scope.origin, &passwd, &read("etc/group")));
     if let Some(home) = scope.home {
-        let name = passwd
-            .iter()
-            .find(|account| account.home == home)
-            .map_or_else(
-                || file_name(home).to_string(),
-                |account| account.name.clone(),
-            );
-        // The user id is what `%U` in the server's configuration stands
-        // for: the account's, or whose the home is.
-        let uid = passwd
-            .iter()
-            .find(|account| account.home == home)
-            .map(|account| account.uid)
-            .or_else(|| {
-                use std::os::unix::fs::MetadataExt as _;
-                fs::metadata(scope.root.join(home))
-                    .ok()
-                    .map(|metadata| metadata.uid())
-            })
-            .unwrap_or(0);
-        let own = Account {
-            name,
-            password: String::new(),
-            uid,
-            gid: 0,
-            home: home.to_string(),
-            shell: String::new(),
-        };
-        let files = key_files(&sshd_configuration(scope), &own);
-        // A user's sweep reads its own home; the root collector's home is
-        // root's.
-        let origin = if scope.origin == Origin::System {
-            Origin::User
-        } else {
-            scope.origin
-        };
-        // Where a key file is a link: a user's sweep reads what it leads to
-        // as that user; root reads it while the whole way is root's alone,
-        // and past that only what everyone may read.
-        let behind = |path: &str| {
-            if scope.origin == Origin::Root {
-                read::look_as(scope.root, path, View::Trusted)
-            } else {
-                Some(read::look(scope.root, path))
-            }
-        };
-        items.extend(key_items(origin, &own, &files, Detail::Keys, &|path| {
-            let found = collect::look(scope, Category::Ssh, path, None);
-            past_link(path, Some(found), &behind)
-        }));
+        items.extend(own_key_items(scope, &own_account(scope, &passwd, home)));
     }
     bounded(items)
 }
 
+/// The account whose home `scope` sweeps as `home`: by `passwd`, or, for a
+/// home no account names, by the home's name and owner.
+fn own_account(scope: &Scope<'_>, passwd: &[Account], home: &str) -> Account {
+    let name = passwd
+        .iter()
+        .find(|account| account.home == home)
+        .map_or_else(
+            || file_name(home).to_string(),
+            |account| account.name.clone(),
+        );
+    // The user id is what `%U` in the server's configuration stands
+    // for: the account's, or whose the home is.
+    let uid = passwd
+        .iter()
+        .find(|account| account.home == home)
+        .map(|account| account.uid)
+        .or_else(|| {
+            use std::os::unix::fs::MetadataExt as _;
+            fs::metadata(scope.root.join(home))
+                .ok()
+                .map(|metadata| metadata.uid())
+        })
+        .unwrap_or(0);
+    Account {
+        name,
+        password: String::new(),
+        uid,
+        gid: 0,
+        home: home.to_string(),
+        shell: String::new(),
+    }
+}
+
+/// The keys that may log in as `own`, the account of the home `scope`
+/// sweeps.
+fn own_key_items(scope: &Scope<'_>, own: &Account) -> Vec<Item> {
+    let files = key_files(&sshd_configuration(scope), own);
+    // A user's sweep reads its own home; the root collector's home is
+    // root's.
+    let origin = if scope.origin == Origin::System {
+        Origin::User
+    } else {
+        scope.origin
+    };
+    // Where a key file is a link: a user's sweep reads what it leads to
+    // as that user; root reads it while the whole way is root's alone,
+    // and past that only what everyone may read.
+    let as_root = scope.origin == Origin::Root;
+    let hop = |path: &str| {
+        if as_root {
+            read::hop_as(scope.root, path, View::Trusted)
+        } else {
+            read::plain_hop(scope.root, path)
+        }
+    };
+    // As root, no more of a key file is read than of any other account's
+    // (`MAX_KEY_FILE`): a link may lead into somebody else's file.
+    let as_root_sees = |path: &str, view: View| {
+        read::seen(scope.root, path, view)
+            .map(|seen| read::look_pinned_within(seen, MAX_KEY_FILE as u64))
+    };
+    let behind = |path: &str| {
+        if as_root {
+            as_root_sees(path, View::Trusted)
+        } else {
+            Some(read::look(scope.root, path))
+        }
+    };
+    // What could not be read at a path where nothing is there is no key
+    // file; anything else there is one the server may read.
+    // Root asks its walk, not the path again: a part on the way
+    // swapped for a link to nothing would read as nothing there.
+    let there = |path: &str| {
+        if as_root {
+            !matches!(
+                read::seen_or_why(scope.root, path, View::Pinned),
+                Err(read::Unseen::Nothing)
+            )
+        } else {
+            fs::symlink_metadata(scope.root.join(path)).is_ok()
+        }
+    };
+    key_items(origin, own, &files, Detail::Keys, &|path| {
+        let found = if as_root {
+            as_root_sees(path, View::Pinned).unwrap_or_else(|| {
+                Found::Unreadable("behind a link that is not root's alone".into())
+            })
+        } else {
+            read::look(scope.root, path)
+        };
+        past_link(path, found, &hop, &behind)
+            .filter(|found| !matches!(found, Found::Unreadable(_)) || there(path))
+    })
+}
+
 /// The keys of `account`, as the root collector may report them: read as
-/// that account could read them itself, no link followed (a key file that
-/// is a link to a file of root's shows nothing).
+/// that account could read them itself, links followed only as far as it
+/// may see (a key file that is a link to a file of root's shows nothing).
 ///
 /// A key file the server's configuration puts outside the home
 /// (`AuthorizedKeysFile /etc/ssh/keys/%u`) is read as root reads it where
@@ -722,23 +833,40 @@ pub(super) fn keys_of(scope: &Scope<'_>, account: &Account, detail: Detail) -> V
     let files = key_files(&sshd_configuration(scope), account);
     let home = format!("{}/", account.home);
     // A link is the account's to make: what it leads to is read only as
-    // the account could read it, whatever the path says.
-    let as_account = |path: &str| read::look_as(scope.root, path, View::Owner(account.uid));
+    // the account could read it, whatever the path says. The links on the
+    // way are followed too (`~/.ssh` a link into a dotfiles directory), as
+    // the server follows them.
+    let view = View::Owner(account.uid);
+    let hop = |path: &str| read::hop_below(scope.root, path, view);
     key_items(Origin::Root, account, &files, detail, &|path| {
         if !path.starts_with(&home)
             && let Some(seen) = read::seen(scope.root, path, View::Pinned)
             && seen.kept
         {
-            return Some(read::look_pinned(seen));
+            return Some(read::look_pinned_within(seen, MAX_KEY_FILE as u64));
         }
-        past_link(path, as_account(path), &as_account)
+        match read::resolve_path(path, &hop) {
+            // `key_items` tells a link as one not followed to its end.
+            Err(()) => Some(Found::Link(String::new())),
+            Ok(None) => None,
+            // At the root: a directory, which holds no keys (`seen` takes
+            // no empty name).
+            Ok(Some(real)) if real.is_empty() => Some(Found::Other),
+            // Past `MAX_KEY_FILE` nothing of it is listed, so nothing more
+            // is read. Where the way changed since it was walked, it is
+            // told as not followed, not dropped.
+            Ok(Some(real)) => Some(read::seen(scope.root, &real, view).map_or_else(
+                || Found::Link(String::new()),
+                |seen| read::look_pinned_within(seen, MAX_KEY_FILE as u64),
+            )),
+        }
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Account, Detail, account_items, accounts, key_files, key_items, keys, member_items,
+        Account, Detail, Hop, account_items, accounts, key_files, key_items, keys, member_items,
     };
     use crate::rules::RuleId;
     use crate::sha256::Sha256;
@@ -900,8 +1028,41 @@ mod tests {
         assert_eq!(counted.len(), 1);
         assert_eq!(counted[0].path, "home/u/.ssh/authorized_keys#keys");
         assert!(counted[0].notes[0].starts_with("0 key(s) may log in as u"));
-        assert!(counted[0].notes[0].ends_with("too large to read is not counted"));
+        assert!(counted[0].notes[0].ends_with("is not counted"));
         assert_eq!(counted[0].alerts.len(), 1);
+        // So is one past the hash limit, which is not read at all.
+        let huge = |_: &str| Some(Found::Unreadable(super::read::TOO_LARGE.into()));
+        let items = key_items(Origin::Root, &account, &files, Detail::Keys, &huge);
+        assert_eq!(items.len(), files.len());
+        assert!(
+            items[0]
+                .alerts
+                .iter()
+                .any(|(_, why)| why == super::TOO_LARGE)
+        );
+        // A key file behind links not followed to their end is told too.
+        let unfollowed = |_: &str| Some(Found::Link("x".into()));
+        let items = key_items(Origin::Root, &account, &files, Detail::Keys, &unfollowed);
+        assert_eq!(items.len(), files.len());
+        assert_eq!(items[0].path, "home/u/.ssh/authorized_keys#unfollowed");
+        assert_eq!(items[0].alerts[0].0, RuleId::RiskyConfiguration);
+        let counted = key_items(Origin::Root, &account, &files, Detail::Count, &unfollowed);
+        assert!(counted[0].notes[0].ends_with("is not counted"));
+        // So is one that is there and would not open, by whichever way it
+        // was looked at.
+        let unopened = |_: &str| Some(Found::Unreadable(super::read::UNOPENED.into()));
+        let items = key_items(Origin::Root, &account, &files, Detail::Keys, &unopened);
+        assert_eq!(items[0].path, "home/u/.ssh/authorized_keys#unopened");
+        // And one that could not be read for any other reason.
+        let failed = |_: &str| Some(Found::Unreadable("Input/output error (os error 5)".into()));
+        let items = key_items(Origin::Root, &account, &files, Detail::Keys, &failed);
+        assert_eq!(items[0].path, "home/u/.ssh/authorized_keys#unopened");
+        // A link in a circle stays a link past `past_link`, so it is told.
+        let circle = |_: &str| Hop::Link("x".into());
+        assert_eq!(
+            super::past_link("home/u/.ssh/x", Found::Link("x".into()), &circle, &|_| None),
+            Some(Found::Link("x".into()))
+        );
 
         // More keys than become items: the rest are one item, with a hash
         // that moves when they do.
@@ -1065,11 +1226,266 @@ mod tests {
             own.iter()
                 .any(|item| item.path.starts_with("etc/ssh/keys/v#"))
         );
+        // A key file that is not there is no item, though it was not read.
+        assert!(
+            !own.iter()
+                .any(|item| item.path.contains("authorized_keys#")),
+            "{own:?}"
+        );
         // Where somebody else may write the directory, the file is whatever
         // they put there: looked at as the account could, which here is
         // not at all.
         mode("etc/ssh/keys", 0o777);
         assert!(super::keys_of(&as_root, &account, Detail::Keys).is_empty());
         mode("etc/ssh/keys", 0o755);
+
+        // A `~/.ssh` that is a link into a dotfiles directory is followed,
+        // as the server follows it.
+        write(
+            "home/w/dot/ssh/authorized_keys",
+            &format!("ssh-ed25519 {blob} w\n"),
+        );
+        std::os::unix::fs::symlink("dot/ssh", root.join("home/w/.ssh")).unwrap();
+        let account = Account {
+            name: "w".into(),
+            uid,
+            home: "home/w".into(),
+            ..account
+        };
+        let keys = super::keys_of(&as_root, &account, Detail::Keys);
+        assert!(
+            keys.iter()
+                .any(|item| item.path.starts_with("home/w/.ssh/authorized_keys#")),
+            "{keys:?}"
+        );
+        // A key file that is a link to the root is a directory: no keys,
+        // and nothing left unfollowed.
+        std::fs::create_dir_all(root.join("home/x/.ssh")).unwrap();
+        std::os::unix::fs::symlink("/", root.join("home/x/.ssh/authorized_keys")).unwrap();
+        let account = Account {
+            name: "x".into(),
+            home: "home/x".into(),
+            ..account
+        };
+        assert!(super::keys_of(&as_root, &account, Detail::Keys).is_empty());
+    }
+
+    #[test]
+    fn a_home_no_account_names_is_its_owners_for_the_servers_key_files() {
+        use std::os::unix::fs::MetadataExt;
+
+        use crate::sweep::collect::Scope;
+        use crate::sweep::index::PackageIndex;
+        use crate::test_support::TempDir;
+        let dir = TempDir::new("sweep-keys-unnamed-home");
+        let root = dir.path();
+        let uid = std::fs::metadata(root).unwrap().uid();
+        let blob = "AAAAC3NzaC1lZDI1NTE5AAAAIGuardianTestKeyMaterial0123456789abcdefghi";
+        std::fs::create_dir_all(root.join("etc/ssh/keys")).unwrap();
+        std::fs::create_dir_all(root.join("home/u")).unwrap();
+        std::fs::write(
+            root.join("etc/ssh/sshd_config"),
+            "AuthorizedKeysFile /etc/ssh/keys/%U\n",
+        )
+        .unwrap();
+        let keys = format!("etc/ssh/keys/{uid}");
+        std::fs::write(root.join(&keys), format!("ssh-ed25519 {blob} k\n")).unwrap();
+        let index = PackageIndex::with_foreign(std::collections::HashSet::new());
+        // No `/etc/passwd` names the home, so `%U` is whose the home is;
+        // and the user's sweep reports its own home's keys as the user's.
+        let (own, _) = super::items(&Scope {
+            root,
+            home: Some("home/u"),
+            index: &index,
+            origin: Origin::System,
+        });
+        assert!(
+            own.iter()
+                .any(|item| item.path.starts_with(&format!("{keys}#"))
+                    && item.origin == Origin::User),
+            "{own:?}"
+        );
+    }
+
+    #[test]
+    fn the_account_passwd_names_for_a_home_is_its_name_for_the_servers_key_files() {
+        use std::os::unix::fs::MetadataExt;
+
+        use crate::sweep::collect::Scope;
+        use crate::sweep::index::PackageIndex;
+        use crate::test_support::TempDir;
+        let dir = TempDir::new("sweep-keys-named-home");
+        let root = dir.path();
+        let uid = std::fs::metadata(root).unwrap().uid();
+        let blob = "AAAAC3NzaC1lZDI1NTE5AAAAIGuardianTestKeyMaterial0123456789abcdefghi";
+        std::fs::create_dir_all(root.join("etc/ssh/keys")).unwrap();
+        std::fs::create_dir_all(root.join("home/u")).unwrap();
+        std::fs::write(
+            root.join("etc/ssh/sshd_config"),
+            "AuthorizedKeysFile /etc/ssh/keys/%u\n",
+        )
+        .unwrap();
+        // The home's name is not the account's: `%u` is the account's.
+        std::fs::write(
+            root.join("etc/passwd"),
+            format!("alice:x:{uid}:{uid}::/home/u:/bin/bash\n"),
+        )
+        .unwrap();
+        let keys = "etc/ssh/keys/alice";
+        std::fs::write(root.join(keys), format!("ssh-ed25519 {blob} k\n")).unwrap();
+        let index = PackageIndex::with_foreign(std::collections::HashSet::new());
+        let (own, _) = super::items(&Scope {
+            root,
+            home: Some("home/u"),
+            index: &index,
+            origin: Origin::System,
+        });
+        assert!(
+            own.iter()
+                .any(|item| item.path.starts_with(&format!("{keys}#"))),
+            "{own:?}"
+        );
+    }
+
+    #[test]
+    fn a_key_file_root_cannot_read_but_the_server_may_is_told() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        use crate::sweep::collect::Scope;
+        use crate::sweep::index::PackageIndex;
+        use crate::test_support::TempDir;
+        let dir = TempDir::new("sweep-keys-unread");
+        let root = dir.path();
+        let uid = std::fs::metadata(root).unwrap().uid();
+        let write = |path: &str, text: &str| {
+            std::fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            std::fs::write(root.join(path), text).unwrap();
+        };
+        let mode = |path: &str, mode: u32| {
+            std::fs::set_permissions(root.join(path), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        };
+        let blob = "AAAAC3NzaC1lZDI1NTE5AAAAIGuardianTestKeyMaterial0123456789abcdefghi";
+        // Root reads past what the file's mode says (the server is the
+        // account then); these need a test run that the mode binds.
+        if uid == 0 {
+            return;
+        }
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        let index = PackageIndex::with_foreign(std::collections::HashSet::new());
+        let as_root = Scope {
+            root,
+            home: Some("root"),
+            index: &index,
+            origin: Origin::Root,
+        };
+        let told = |home: &str, mark: &str| {
+            let account = Account {
+                name: "y".into(),
+                password: "x".into(),
+                uid: uid + 1,
+                gid: uid + 1,
+                home: home.into(),
+                shell: "/bin/bash".into(),
+            };
+            super::keys_of(&as_root, &account, Detail::Keys)
+                .iter()
+                .any(|item| item.path == format!("{home}/.ssh/authorized_keys#{mark}"))
+        };
+        // A key file the account may read and that would not open.
+        write(
+            "home/y/.ssh/authorized_keys",
+            &format!("ssh-ed25519 {blob} y\n"),
+        );
+        mode("home/y/.ssh/authorized_keys", 0o004);
+        assert!(told("home/y", "unopened"));
+        // A directory the account may enter that root's walk is refused in
+        // (as on a FUSE mount root may not enter): told, not dropped.
+        write(
+            "home/z/.ssh/authorized_keys",
+            &format!("ssh-ed25519 {blob} z\n"),
+        );
+        mode("home/z/.ssh", 0o445);
+        assert!(told("home/z", "unfollowed"));
+        mode("home/z/.ssh", 0o755);
+        // One the account may enter that root may not open (as on NFS with
+        // `root_squash`).
+        write(
+            "home/n/.ssh/authorized_keys",
+            &format!("ssh-ed25519 {blob} n\n"),
+        );
+        mode("home/n/.ssh", 0o055);
+        assert!(told("home/n", "unfollowed"));
+        mode("home/n/.ssh", 0o755);
+        // A key file only its group may read: the account may be in it.
+        write(
+            "home/g/.ssh/authorized_keys",
+            &format!("ssh-ed25519 {blob} g\n"),
+        );
+        mode("home/g/.ssh/authorized_keys", 0o440);
+        assert!(told("home/g", "unopened"));
+        mode("home/g/.ssh/authorized_keys", 0o404);
+        assert!(!told("home/g", "unopened"));
+
+        // The user's own sweep tells a key file of its own it may not read.
+        write(
+            "home/q/.ssh/authorized_keys",
+            &format!("ssh-ed25519 {blob} q\n"),
+        );
+        mode("home/q/.ssh/authorized_keys", 0o000);
+        let (own, _) = super::items(&Scope {
+            home: Some("home/q"),
+            origin: Origin::System,
+            ..as_root
+        });
+        assert!(
+            own.iter()
+                .any(|item| item.path == "home/q/.ssh/authorized_keys#unopened"),
+            "{own:?}"
+        );
+        // Root tells its own key file behind a link the pinned walk does not
+        // follow: a link in a directory others may write.
+        write(
+            "elsewhere/ssh/authorized_keys",
+            &format!("ssh-ed25519 {blob} r\n"),
+        );
+        std::fs::create_dir_all(root.join("root")).unwrap();
+        std::os::unix::fs::symlink("../elsewhere/ssh", root.join("root/.ssh")).unwrap();
+        mode("root", 0o777);
+        let (own, _) = super::items(&as_root);
+        mode("root", 0o700);
+        assert!(
+            own.iter()
+                .any(|item| item.path == "root/.ssh/authorized_keys#unopened"),
+            "{own:?}"
+        );
+    }
+
+    #[test]
+    fn roots_key_file_behind_a_link_its_walk_does_not_follow_is_told() {
+        use crate::sweep::collect::Scope;
+        use crate::sweep::index::PackageIndex;
+        use crate::test_support::TempDir;
+        let dir = TempDir::new("sweep-keys-through");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::create_dir_all(root.join("root/x")).unwrap();
+        // A link that goes up after a name is not followed by the pinned
+        // walk, and this one leads to nothing: asked again by path, the
+        // key file would read as not there.
+        std::os::unix::fs::symlink("x/../nothing", root.join("root/.ssh")).unwrap();
+        let index = PackageIndex::with_foreign(std::collections::HashSet::new());
+        let as_root = Scope {
+            root,
+            home: Some("root"),
+            index: &index,
+            origin: Origin::Root,
+        };
+        let (own, _) = super::items(&as_root);
+        assert!(
+            own.iter()
+                .any(|item| item.path == "root/.ssh/authorized_keys#unopened"),
+            "{own:?}"
+        );
     }
 }

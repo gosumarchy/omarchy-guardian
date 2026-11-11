@@ -884,6 +884,13 @@ pub(crate) fn command_variables(text: &str) -> Vec<(String, String)> {
         let Some((name, value)) = line.split_once('=') else {
             continue;
         };
+        // As a shell reads it, so `F=cu''rl` and `F="cu"rl` keep `curl`.
+        // The first reading only: a second one, of a line that leaves a
+        // `${` open, reads it as letters, which no variable holds.
+        let value = shell::as_shell_reads(value)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| value.to_string());
         let value = value.trim_matches(['"', '\'']);
         let is_name = !name.is_empty()
             && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')

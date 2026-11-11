@@ -37,7 +37,7 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 # The system calls of an ordinary service: files, processes, pipes and
-# timers for itself and the helpers it runs (pacman, gzip, getcap, each
+# timers for itself and the helpers it runs (pacman, gzip, each
 # under timeout), and chown for its results. Reading another process
 # through /proc is a file read, checked against CAP_SYS_PTRACE; the ptrace
 # call itself is not needed and is in none of the groups let through. The
@@ -56,5 +56,15 @@ UMask=0077
 # A sweep takes minutes; one that hangs is stopped, and the bar says the
 # results are old.
 TimeoutStartSec=30min
+# Accounts decide much of what the collector holds: every process at once,
+# each with up to 768 KiB of its command line and of the environment
+# variables the checks read, and 16 bytes per socket it holds (the sweep's
+# docs say more). Forked processes share those at no cost, so about 5,000
+# of one account's reach this. Past it the kernel stops the collector, and
+# the bar says the results are old, rather than an account's processes
+# making it take the machine's memory. The peak systemd reported on a desktop with a
+# thousand packages was 0.6 to 2.6 GiB over 46 runs, most of it cache of
+# the files hashed, which the kernel drops at the limit instead.
+MemoryMax=4G
 Nice=10
 IOSchedulingClass=idle

@@ -82,11 +82,17 @@ pub(super) fn installed_links(root: &Path, db: &Path, limit: usize) -> Installed
             }
         };
         for rel in candidates {
-            if location.contains(&rel)
-                && let Ok(target) = fs::read_link(root.join(&rel))
-                && let Some(target) = target.to_str()
-            {
-                add(&rel, target);
+            if !location.contains(&rel) {
+                continue;
+            }
+            let Ok(target) = fs::read_link(root.join(&rel)) else {
+                continue;
+            };
+            match target.to_str() {
+                Some(target) => add(&rel, target),
+                None => unseen.push(format!(
+                    "/{rel} is a link to a name that is not UTF-8, so where it leads was not compared with the files this transaction replaces"
+                )),
             }
         }
     }

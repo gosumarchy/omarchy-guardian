@@ -104,6 +104,26 @@ Destructive commands also cover `rm -rf "$VAR"/*` where `VAR` is set nowhere
 in the file or only from a command substitution and nothing guards it (no `set
 -u`, no `${VAR:?}`, and not a build directory such as `$pkgdir`/`$srcdir` or a
 `mktemp` path), a redirection onto a whole block device, and `parted mklabel`.
+A recursive `rm` of `/` or a home is read as bash splits the line into
+commands: with a separator, group or substitution glued to it (`:;rm -rf /`,
+`$(:)rm -rf /`, `{ rm -rf /;}`), inside a substitution (`x=$(rm -rf ~)`), past
+a separator that is quoted or inside one (`rm -rf "a;b" $(:) /*`), with a
+redirection glued to the target (`rm -rf /*>/dev/null`), past a `case`
+pattern or a `{ …; }` group inside a substitution, with quotes and escapes
+taken out (`'/'*`, `$'…'`, `$v\rm`), with a variable or positional parameter
+in the command word read as empty (`rm$u`, `$1rm`), with any prefix of
+`--recursive` (`--recu`), with `/./` in the target, and with `$HOME` in a
+spelling that is `$HOME` when it is set (`${HOME:?}`, `${HOME%/}`). A `#`
+starts a comment only at the start of a word, a quoted `*` or `~` is read as
+itself (`"/*"`, `"~"`), and a variable in the target is not read as empty:
+`"$HOME/.cache/$pkg"` is a path below home. A backtick substitution ends at
+the next backtick no backslash escapes, inside quotes too, and is read as a
+line of its own, so one nested in another is read as well; an extglob (`@(…)`,
+and `!(…)` past the command word, as makepkg turns extglob on) is one word.
+Left to the AI review: `$!` and other special parameters glued to the command,
+a target that brace expansion or a glob other than a trailing `*` builds
+(`/{,}`, `/?*`, `/[a-z]*`), a command word a default value holds
+(`${x:-rm} -rf ~`), and a substitution inside a default value.
 
 ## What they pass over
 
@@ -156,10 +176,56 @@ a pipe opening the next line) is also judged as the one line a shell reads,
 and a download saved to a file that the same file later runs or sources counts
 as download-and-run, also when one file downloads and another runs what it
 saved. A fetcher or a shell kept in a variable (`F=curl` … `$F … | $S`) is
-read as what it is.
+read as what it is. A line is also read as a shell reads its words where it is
+spelled to keep one from matching: quotes inside a word with no quoted blank
+in it (`c"u"rl`, `"c"'u'"rl"`, `cu''rl`, `r$''m`), a word that is one quoted
+string where a command stands (`'rm' -rf /`, `sudo -E -u root 'rm'`,
+`timeout 5 'rm'`, `chroot /mnt 'rm'`, `x=1 'rm'`, `>/dev/null 'rm'`,
+`> /dev/null 'rm'`, `runuser -u root -- 'rm'`, `if 'rm'`, `f() { 'rm'`,
+`case … *) 'rm'`, `case x in (a) 'rm'`, `a=() 'rm'`, `x[0]=1 'rm'`,
+`a[x=y]=1 'rm'`, `{fd}>/dev/null 'rm'`, `chrt -f 99 'rm'`, `$(echo env) 'rm'`,
+`x=$(echo a\\) 'rm'`, `x=$(echo y)/bin 'rm'`, `$(case y in y) 'rm'`,
+`case x in *(x)) 'rm'`, `$(time -p case y in y) 'rm'`, `a[']']=1 'rm'`,
+`` `'rm'` ``, `true;'rm'`), a quoted
+flag (`rm "-rf"`), a quoted argument of `ufw`, `nft`, `setenforce`,
+`iptables`, `ip6tables` or `sysctl` (`ufw 'disable'`), a backslash before a
+letter, a digit, `-`, `/` or `.` (`c\url`, `\rm`, `rm \-rf \/`), a backslash
+at the end of a line inside a word (`cu\` then `rl`), `$@` or `$*` touching a
+word, and `$IFS`, `${IFS}` or `${IFS:0:1}` for a blank, or for nothing where
+the part of IFS's default three characters is empty (`${IFS:3}`,
+`${IFS:0:-3}`). A command inside `$(…)`, backticks or `${…}` within double
+quotes (`echo "$('rm' -rf /)"`) is read as text, not as a statement of its
+own, and a lone quote of the other kind in it (`echo "$(echo '"')" ; r''m -rf
+/`, `echo "${v:-'"'}"; 'rm' -rf /`) is read as opening one, which can hide the
+rest of the line too. A bare `case` counts wherever it stands, and no `esac` is
+looked for: a `)` after it on the line reads as a place where a command may
+stand, and so does the word after `]]`. Reading a command's place where bash
+has an argument only adds a match (`echo $(case y in y) ;; esac) 'sudo'` reads
+`sudo`). Inside `${…}` a blank, `;`, `|`, `&` and a bare `(` or `)` are
+letters, while quotes, `$(…)` and backticks there are read as anywhere else; a
+line that leaves a `${` open is read twice, as bash reads it and as if `${`
+were letters, and both readings are matched, which can only add a match.
+`${ …; }` and `${| …; }` hold commands, as in bash 5.3, up to the `}` where a
+command may stand that ends no `{ …; }` inside them, and `$${` is `$$` and a
+`{`. A bare `}` where a command may stand is read as followed by one. What
+touches a closing backtick or `)` is of one word with the substitution, and a
+`;`, `|` or `&` right after it starts a command; so is a quote touching it or
+the `}` of a `${…}` (`$(:)'rm'` and `${v}'rm'` are `rm`). In `$'…'` a backslash keeps the character after it (`$$'…'` and
+`\$'…'` are no `$'…'`), and inside backticks a backtick ends the substitution
+in either quote, as bash reads them. Any other quoted argument stays as
+written: the rules match text, and its quotes are often all that tells data
+(`warning "%s" "sudo"`, `x=("ufw" "disable")`) from a command, so `cmd 'arg'`
+past that list is left to the AI review. What runs, what is fetched and what a
+variable holds are read the same way. A quoted argument with a blank in it
+(`"rm -rf /"`) is text to the shell and is matched as written.
 
 These rules read text, not meaning: a command assembled any other way is left
-to the AI review.
+to the AI review, among them positional parameters (`rm$IFS$9-rf`), a bare
+variable glued before a quoted or escaped command (`$v\curl`, which the
+recursive `rm` rule reads but the others read as one name), `$'\x72m'`,
+brace expansion (`{c,}url`), globs (`c?rl`), a command behind a wrapper
+Guardian does not know, such as `bwrap --bind / / 'rm'`, and a command in a
+string another command runs through a shell (`sg wheel 'rm -rf /'`).
 
 A file a reviewed script runs or reads in (`sh ./data/x.png`, `. ./lib`,
 `python3 tool.py`, `lua x`, `node x`, a make `include`, a `package.json`

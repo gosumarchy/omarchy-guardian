@@ -9,6 +9,7 @@ use std::path::Path;
 
 use super::{Body, COMPARED, Item, NOT_LOOKED_AT, Origin, Scope, item_of};
 use crate::autorun::Category;
+use crate::sweep::commands::Presence;
 use crate::sweep::read::{self, Found, View};
 
 /// Why root did not look at a path nobody chose.
@@ -65,14 +66,33 @@ pub(super) fn view(scope: &Scope<'_>, run_by: Option<&str>) -> Option<View> {
 /// A directory is not: a command that names one (`find /etc/x`) does not
 /// run it.
 pub(super) fn is_there(scope: &Scope<'_>, path: &str, run_by: Option<&str>) -> bool {
+    presence(scope, path, run_by) == Presence::There
+}
+
+/// What is at `path` for `run_by`, as `is_there` tells it, and whether the
+/// walk was kept out of a directory on the way (`Presence::KeptOut`).
+pub(super) fn presence(scope: &Scope<'_>, path: &str, run_by: Option<&str>) -> Presence {
     match view(scope, run_by) {
-        Some(view) => read::seen(scope.root, path, view)
-            .is_some_and(|seen| !matches!(seen.what, read::Public::Directory(_))),
+        Some(view) => match read::seen_or_why(scope.root, path, view).map(|seen| seen.what) {
+            Err(read::Unseen::Nothing) | Ok(read::Public::Directory(_)) => Presence::Absent,
+            // A link on the way that is not followed (an account's `~/bin`
+            // leading elsewhere) keeps the walk out as a refusal does.
+            Err(read::Unseen::Through) | Ok(read::Public::Refused(_)) => Presence::KeptOut,
+            Ok(
+                read::Public::File(_)
+                | read::Public::Link(_)
+                | read::Public::Other
+                | read::Public::Unopened(_),
+            ) => Presence::There,
+        },
         // A link is there, as in the pinned view; where it leads is
         // looked at when it is followed.
-        None => {
-            fs::symlink_metadata(scope.root.join(path)).is_ok_and(|metadata| !metadata.is_dir())
+        None if fs::symlink_metadata(scope.root.join(path))
+            .is_ok_and(|metadata| !metadata.is_dir()) =>
+        {
+            Presence::There
         }
+        None => Presence::Absent,
     }
 }
 
@@ -83,7 +103,9 @@ pub(crate) fn is_file_there(scope: &Scope<'_>, path: &str, run_by: Option<&str>)
     match view(scope, run_by) {
         Some(view) => matches!(
             read::seen(scope.root, path, view).map(|seen| seen.what),
-            Some(read::Public::File(_))
+            // A file whose owner keeps it from opening is there all the
+            // same (see `read::Public::Unopened`).
+            Some(read::Public::File(_) | read::Public::Unopened(_))
         ),
         None => scope.root.join(path).is_file(),
     }
@@ -118,11 +140,20 @@ pub(super) fn names_a_file(scope: &Scope<'_>, path: &str, run_by: Option<&str>) 
     if is_file_there(scope, path, run_by) {
         return true;
     }
-    let Some(Some(link)) = hop(scope, path) else {
+    let read::Hop::Link(link) = hop(scope, path) else {
         return false;
     };
     read::resolve_where(path, &link, &|next| hop(scope, next))
         .is_some_and(|resolved| matches!(look_past_link(scope, &resolved), Found::File { .. }))
+}
+
+/// Whether `path` is a link whose chain was not followed to its end
+/// (`read::chain_too_long`), so what it leads to is not known.
+pub(super) fn unfinished_chain(scope: &Scope<'_>, path: &str) -> bool {
+    let read::Hop::Link(link) = hop(scope, path) else {
+        return false;
+    };
+    read::chain_too_long(path, &link, &|next| hop(scope, next))
 }
 
 /// How the collector sees the hops of a link chain. As root, a link leads

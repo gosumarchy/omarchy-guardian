@@ -1,12 +1,13 @@
 //! The root collector's results: written as JSON for the accounts they go
 //! to, and read back, checked, by the sweep of one of them.
 
+use std::fmt::{self, Write as _};
 use std::fs;
 use std::os::unix::fs::{self as unix_fs, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
-use super::{MAX_ITEMS, MAX_OUTPUT, RootPart, in_keeping_order};
+use super::{Kept, MAX_ITEMS, MAX_OUTPUT, RootPart};
 use crate::autorun::Category;
 use crate::error::{Error, IoContext};
 use crate::files::{AtomicWrite, Owner, write_atomic};
@@ -92,21 +93,32 @@ pub(crate) fn results_problem(path: &Path, now: u64) -> Option<String> {
     (metadata.len() > MAX_OUTPUT).then(|| "the root check's results are too large".into())
 }
 
-pub(super) fn to_json(collection: &Collection, notes: &[String], news: Option<&[String]>) -> Json {
-    let untrusted = || in_keeping_order(&collection.items);
+/// The results of `collection`, whose untrusted items `in_keeping_order`
+/// put in `kept`.
+pub(super) fn to_json(
+    collection: &Collection,
+    kept: &Kept<'_>,
+    notes: &[String],
+    news: Option<&[String]>,
+) -> Json {
     let mut truncated = collection.not_looked_at();
-    let left_out = untrusted().count().saturating_sub(MAX_ITEMS);
+    let left_out = kept.items.len().saturating_sub(MAX_ITEMS);
     if left_out > 0 {
         truncated.push(format!(
             "the root checks found more than {MAX_ITEMS} items: {left_out} were left out"
         ));
     }
+    let (items, too_large) = items_json(kept);
+    if too_large > 0 {
+        truncated.push(format!(
+            "{too_large} item(s) accounts made were left out: root's results carry at most \
+             {} MiB of those",
+            MAX_ACCOUNTS_BYTES / (1024 * 1024)
+        ));
+    }
     let mut members = vec![
         ("version", Json::from(VERSION)),
-        (
-            "items",
-            Json::Array(untrusted().take(MAX_ITEMS).map(item_json).collect()),
-        ),
+        ("items", Json::Array(items)),
     ];
     // Only where the collector kept track: without the list, the sweep
     // that reads this tells what is new from what it remembers itself.
@@ -155,6 +167,102 @@ fn listed_json(listed: &[String]) -> Json {
             .map(|directory| Json::from(directory.as_str()))
             .collect(),
     )
+}
+
+/// The most bytes of JSON of the accounts' items that root's results carry
+/// whole, in keeping order. An account makes as many items as it likes,
+/// each up to 2 MiB (a file in its home that something runs) with a name and
+/// notes it chooses, and the bar reads the results only up to 4 MiB, the
+/// sweep up to `MAX_OUTPUT`: without a bound an account could push them
+/// past either. Arbitrary, and far above what a desktop's accounts keep.
+const MAX_ACCOUNTS_WHOLE: usize = 1024 * 1024;
+
+/// The most bytes of JSON of the accounts' items in all, those cut down to
+/// their name (`cut_down`) included. Arbitrary: the room left by
+/// `MAX_ACCOUNTS_WHOLE` holds a dozen cut items whose paths are as long as
+/// the kernel opens, and thousands with a home's usual ones.
+const MAX_ACCOUNTS_BYTES: usize = 2 * MAX_ACCOUNTS_WHOLE;
+
+/// What an account's item cut down says, as its note and as what each of
+/// its alerts saw.
+const CUT_DOWN: &str = "its content and notes were left out of root's results, \
+                        which carry only so much of what accounts made";
+
+/// The first `MAX_ITEMS` of `kept` as JSON, and how many of the accounts'
+/// were left out. Root's go whole. An account's goes whole within
+/// `MAX_ACCOUNTS_WHOLE`, then cut down (`cut_down`) within
+/// `MAX_ACCOUNTS_BYTES`, then not at all.
+fn items_json(kept: &Kept<'_>) -> (Vec<Json>, usize) {
+    let mut used: usize = 0;
+    let mut left_out = 0;
+    let mut items = Vec::with_capacity(kept.items.len().min(MAX_ITEMS));
+    for &item in kept.items.iter().take(MAX_ITEMS) {
+        if kept.roots.contains(item.path.as_str()) {
+            items.push(item_json(item));
+            continue;
+        }
+        let whole = item_json(item);
+        let size = json_size(&whole);
+        if used.saturating_add(size) <= MAX_ACCOUNTS_WHOLE {
+            used += size;
+            items.push(whole);
+            continue;
+        }
+        let cut = item_json(&cut_down(item));
+        let size = json_size(&cut);
+        if used.saturating_add(size) <= MAX_ACCOUNTS_BYTES {
+            used += size;
+            items.push(cut);
+        } else {
+            left_out += 1;
+        }
+    }
+    (items, left_out)
+}
+
+/// `item` with its name and alerts' rules alone: oversized, which the sweep
+/// that reads it says it could not review, never clean. What is left is
+/// its name, file and runner, paths of a few hundred bytes on a desktop,
+/// and one alert per rule; however long they are, `items_json` leaves out
+/// what does not fit.
+fn cut_down(item: &Item) -> Item {
+    let mut alerts: Vec<(RuleId, String)> = Vec::new();
+    for (rule, _) in &item.alerts {
+        if !alerts.iter().any(|(kept, _)| kept == rule) {
+            alerts.push((*rule, CUT_DOWN.to_string()));
+        }
+    }
+    Item {
+        file: item.file.clone(),
+        origin: item.origin,
+        category: item.category,
+        path: item.path.clone(),
+        tier: item.tier,
+        sha256: None,
+        body: Body::Oversized,
+        runs: Vec::new(),
+        run_by: item.run_by.clone(),
+        notes: vec![CUT_DOWN.to_string()],
+        alerts,
+    }
+}
+
+/// How many bytes `json` takes written out. The count never fails, and the
+/// only other error would be in writing `json` out; one that cannot be
+/// written counts as too large to carry.
+fn json_size(json: &Json) -> usize {
+    struct Counter(usize);
+    impl fmt::Write for Counter {
+        fn write_str(&mut self, text: &str) -> fmt::Result {
+            self.0 += text.len();
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    match write!(counter, "{json}") {
+        Ok(()) => counter.0,
+        Err(fmt::Error) => usize::MAX,
+    }
 }
 
 fn item_json(item: &Item) -> Json {

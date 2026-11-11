@@ -86,7 +86,24 @@ pub(crate) fn base_section(srcinfo: &str) -> impl Iterator<Item = (&str, &str)> 
 /// if it is not. The recipe is loaded by the shell that prints the listing,
 /// so anything it writes to the same output lands in it: a listing with
 /// text before its first line, a second package base, or a line of another
-/// shape was not written by makepkg alone.
+/// shape was not written by makepkg alone. Unless the recipe redefines
+/// makepkg's own functions that print the listing (which `recipe::sources`
+/// reports as not followed), makepkg's own lines are in its output too:
+/// - its `pkgbase = ` line, so a forged listing ending without a newline
+///   carries it inside a later line (`\tpkgdesc = xpkgbase = demo`);
+/// - its `pkgname = ` line, so a forged one written while makepkg prints the
+///   base's section names that package twice;
+/// - the base's sources and checksums, which makepkg prints in no package's
+///   section while its lint runs (it refuses a package function that sets
+///   them), so one there was cut off from the base's by a forged
+///   `pkgname = ` line.
+///
+/// makepkg itself prints a few listings this refuses, none an AUR package
+/// has: `pkgname=(a a)`, a value that holds `pkgbase =` or a control
+/// character, and with its lint turned off (`MAKEPKG_LINT_PKGBUILD=0`), a
+/// package function that sets an architecture's sources or checksums
+/// (`source_x86_64`). A refused listing is not reviewed, which is the safe
+/// side.
 pub(crate) fn check_listing(srcinfo: &str) -> Result<(), Error> {
     let mut lines = srcinfo.lines();
     if !lines
@@ -97,7 +114,7 @@ pub(crate) fn check_listing(srcinfo: &str) -> Result<(), Error> {
             "it does not start with the package base".into(),
         ));
     }
-    let mut packages = 0;
+    let mut packages: Vec<&str> = Vec::new();
     for line in lines {
         if line.is_empty() {
             continue;
@@ -105,8 +122,22 @@ pub(crate) fn check_listing(srcinfo: &str) -> Result<(), Error> {
         if line.chars().any(|c| c.is_control() && c != '\t') {
             return Err(Error::Message("it holds control characters".into()));
         }
-        if line.starts_with("pkgname = ") {
-            packages += 1;
+        // `pkgbase =` with nothing after it is a base too.
+        if line.contains("pkgbase =") {
+            return Err(Error::Message(
+                if line.trim_start().starts_with("pkgbase =") {
+                    "it names more than one package base"
+                } else {
+                    "a line after the first holds a package base"
+                }
+                .into(),
+            ));
+        }
+        if let Some(name) = line.strip_prefix("pkgname = ") {
+            if packages.contains(&name) {
+                return Err(Error::Message("it names a package twice".into()));
+            }
+            packages.push(name);
             continue;
         }
         let entry = line
@@ -119,18 +150,18 @@ pub(crate) fn check_listing(srcinfo: &str) -> Result<(), Error> {
                     .chars()
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         });
-        if !named || entry.is_some_and(|(key, _)| key == "pkgbase") {
+        if !packages.is_empty() && entry.is_some_and(|(key, _)| is_listed_array(key)) {
             return Err(Error::Message(
-                if line.trim_start().starts_with("pkgbase =") {
-                    "it names more than one package base"
-                } else {
-                    "it holds a line makepkg does not print"
-                }
-                .into(),
+                "it lists sources or checksums in a package's section".into(),
+            ));
+        }
+        if !named {
+            return Err(Error::Message(
+                "it holds a line makepkg does not print".into(),
             ));
         }
     }
-    if packages == 0 {
+    if packages.is_empty() {
         return Err(Error::Message("it names no package".into()));
     }
     Ok(())

@@ -1,11 +1,12 @@
 //! Following an item: the paths its link, its commands and the files it
 //! reads in lead to, and which of them are followed.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
-use super::sight::{hop, look_past_link, names_a_file, view};
-use super::{Body, Followed, Item, Scope, is_file_there, is_read_script, is_there, listed};
+use super::sight::{hop, look_past_link, names_a_file, presence, unfinished_chain, view};
+use super::{Body, Followed, Item, Scope, is_file_there, is_read_script, listed};
 use crate::autorun::Category;
 use crate::sweep::commands;
 use crate::sweep::path::Search;
@@ -53,6 +54,9 @@ pub(super) fn follow(
     configuration: bool,
 ) -> Followed {
     let mut targets = Vec::new();
+    // What `targets` holds, so that a line naming many files is not
+    // searched through for each.
+    let mut named: HashSet<String> = HashSet::new();
     let mut unfollowed: Vec<String> = Vec::new();
     let mut limit = |sentence: String| {
         if !unfollowed.contains(&sentence) {
@@ -69,17 +73,19 @@ pub(super) fn follow(
     let mut handed: Vec<String> = Vec::new();
     if let Some(resolved) = link_target(scope, item) {
         read_in.push(resolved.clone());
+        named.insert(resolved.clone());
         targets.push(resolved);
     }
     let included = included_by(item, configuration);
     let variables = variables_of(item);
     let mut environment: Vec<String> = Vec::new();
-    // A file some other line runs under the very same words is run.
-    let times = |list: &[String], command: &str| list.iter().filter(|one| *one == command).count();
+    // A file some other line runs under the very same words is run. The
+    // lines are counted once: a crontab may have thousands.
+    let (runs, included, variables) = (times(&item.runs), times(&included), times(&variables));
     let mut record = |command: &str, target: &str| {
-        let only = |list: &[String]| {
-            let reads = times(list, command);
-            reads > 0 && reads == times(&item.runs, command)
+        let only = |list: &HashMap<&str, usize>| {
+            let reads = list.get(command).copied().unwrap_or(0);
+            reads > 0 && Some(&reads) == runs.get(command)
         };
         if only(&included) {
             read_in.push(target.to_string());
@@ -91,27 +97,18 @@ pub(super) fn follow(
     };
     let home: &str = &home_for(scope, item);
     let view = view(scope, by);
-    let list = |directory: &str| listed(scope, view, directory);
     for command in &item.runs {
         // A pattern alone (a Hyprland `source`) names the files it
         // matches; anything else with a `*` in it (a command line, however
         // it is written) still runs its program.
         if is_pattern(command) {
-            let (matched, more) = commands::glob_targets(home, command, &list);
-            // A directory a pattern matches too (`/*`) is no more run
-            // than one a command names.
-            for target in matched
-                .into_iter()
-                .filter(|target| names_a_file(scope, target, by))
-            {
+            let (files, limits) = pattern_files(scope, view, by, home, command);
+            for target in files {
                 record(command, &target);
                 targets.push(target);
             }
-            if more {
-                limit(format!(
-                    "only the first {} files a pattern names",
-                    commands::MAX_GLOB
-                ));
+            for sentence in limits {
+                limit(sentence);
             }
             continue;
         }
@@ -128,10 +125,11 @@ pub(super) fn follow(
         let lookup = commands::Lookup {
             home,
             search: &search.directories,
-            exists: &|candidate| is_there(scope, candidate, by),
+            exists: &|candidate| presence(scope, candidate, by),
             capped: std::cell::Cell::new(false),
             unwritten: std::cell::Cell::new(false),
             shell_scripts: std::cell::RefCell::default(),
+            kept_out: std::cell::RefCell::default(),
         };
         let (parts, long) = parts_of(command, shell_line);
         if long {
@@ -148,7 +146,7 @@ pub(super) fn follow(
             handed.extend(lookup.shell_scripts.take());
             for target in reached {
                 record(command, &target);
-                if !targets.contains(&target) {
+                if named.insert(target.clone()) {
                     targets.push(target);
                 }
             }
@@ -158,14 +156,67 @@ pub(super) fn follow(
         }
     }
     let kinds = Kinds {
-        read_in: &read_in,
-        started: &started,
-        handed: &handed,
-        environment: &environment,
+        read_in: set(&read_in),
+        started: set(&started),
+        handed: set(&handed),
+        environment: set(&environment),
     };
     let mut followed = settle(scope, view, by, targets, &kinds);
     followed.unfollowed = unfollowed;
     followed
+}
+
+/// The files the pattern `command` names that are followed, and the
+/// limits reached on the way, as sentences.
+fn pattern_files(
+    scope: &Scope<'_>,
+    view: Option<View>,
+    by: Option<&str>,
+    home: &str,
+    command: &str,
+) -> (Vec<String>, Vec<String>) {
+    // A directory a pattern names that the walk was kept out of is told,
+    // not taken for an empty one.
+    let kept_out = std::cell::RefCell::new(Vec::new());
+    // So is one that is a link (`conf.d` linked into a dotfiles
+    // directory), which the program follows and root's view does not.
+    let is_link = |directory: &str| {
+        view.is_some_and(|view| {
+            matches!(
+                read::seen(scope.root, directory, view).map(|seen| seen.what),
+                Some(read::Public::Link(_))
+            )
+        })
+    };
+    let list = |directory: &str| {
+        if presence(scope, directory, by) == commands::Presence::KeptOut || is_link(directory) {
+            kept_out.borrow_mut().push(directory.to_string());
+        }
+        listed(scope, view, directory)
+    };
+    let (matched, more) = commands::glob_targets(home, command, &list);
+    let mut files = Vec::new();
+    let mut limits = Vec::new();
+    // A directory a pattern matches (`/*`) is not run, as one a command names is not.
+    for target in matched {
+        if names_a_file(scope, &target, by) {
+            files.push(target);
+        } else if unfinished_chain(scope, &target) {
+            limits.push(format!("{target}: links not followed to their end"));
+        }
+    }
+    if more {
+        limits.push(format!(
+            "only the first {} files a pattern names",
+            commands::MAX_GLOB
+        ));
+    }
+    for directory in kept_out.take() {
+        limits.push(format!(
+            "/{directory}: a directory a pattern names, which could not be looked into"
+        ));
+    }
+    (files, limits)
 }
 
 /// The regular file the link `item` leads to, if it is a link to one (a
@@ -238,19 +289,38 @@ fn lookup_limits(lookup: &commands::Lookup<'_>) -> Vec<String> {
     if lookup.unwritten.get() {
         reached.push("a program or script named through a variable or a substitution".to_string());
     }
+    for directory in lookup.kept_out.borrow().iter() {
+        reached.push(format!(
+            "/{directory}: a directory commands are looked for in, which could not be looked into"
+        ));
+    }
     reached
+}
+
+/// The paths in `list`, to look up.
+fn set(list: &[String]) -> HashSet<&str> {
+    list.iter().map(String::as_str).collect()
+}
+
+/// How many times each of `lines` is there.
+fn times(lines: &[String]) -> HashMap<&str, usize> {
+    let mut times: HashMap<&str, usize> = HashMap::new();
+    for line in lines {
+        *times.entry(line.as_str()).or_default() += 1;
+    }
+    times
 }
 
 /// How the targets of an item were reached, by the paths as written.
 struct Kinds<'a> {
     /// Read as configuration (a link's target, an SSH `Include`).
-    read_in: &'a [String],
+    read_in: HashSet<&'a str>,
     /// Named by a command.
-    started: &'a [String],
+    started: HashSet<&'a str>,
     /// Handed to a shell as its script.
-    handed: &'a [String],
+    handed: HashSet<&'a str>,
     /// Read by a unit as a list of variables.
-    environment: &'a [String],
+    environment: HashSet<&'a str>,
 }
 
 /// The paths among `targets` that are followed, as the walk reaches them;
@@ -271,7 +341,9 @@ fn settle(
     let mut configuration = Vec::new();
     for target in targets {
         let followed = if under(FILES_ONLY, &target) {
+            // Or kept by its name behind a link not followed, to be told.
             is_file_there(scope, &target, by)
+                || presence(scope, &target, by) == commands::Presence::KeptOut
         } else {
             !under(NOT_FOLLOWED, &target)
         };
@@ -279,20 +351,27 @@ fn settle(
             continue;
         }
         let path = match view {
-            // The path the pinned walk took, not one resolved again.
-            Some(view) => read::seen(scope.root, &target, view).map(|seen| seen.path),
+            // The path the pinned walk took, not one resolved again. One
+            // behind a link the walk does not follow is kept by its own
+            // name, to be told as not read (`presence` took it for kept out).
+            Some(view) => match read::seen_or_why(scope.root, &target, view) {
+                Ok(seen) => Some(seen.path),
+                Err(read::Unseen::Through) => Some(target.clone()),
+                Err(read::Unseen::Nothing) => None,
+            },
             None => read::canonical(scope.root, &target),
         };
         let Some(path) = path else {
             continue;
         };
-        if kinds.read_in.contains(&target) && !kinds.started.contains(&target) {
+        let target = target.as_str();
+        if kinds.read_in.contains(target) && !kinds.started.contains(target) {
             configuration.push(path.clone());
         }
-        if kinds.handed.contains(&target) {
+        if kinds.handed.contains(target) {
             shell_scripts.push(path.clone());
         }
-        if kinds.environment.contains(&target) && !kinds.started.contains(&target) {
+        if kinds.environment.contains(target) && !kinds.started.contains(target) {
             environment.push(path.clone());
         }
         reached.push(path);

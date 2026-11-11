@@ -192,12 +192,31 @@ pub(super) fn targets_where(
     Lookup {
         home,
         search: &default_search(home),
-        exists,
+        exists: &|candidate| {
+            if exists(candidate) {
+                Presence::There
+            } else {
+                Presence::Absent
+            }
+        },
         capped: std::cell::Cell::new(false),
         unwritten: std::cell::Cell::new(false),
         shell_scripts: std::cell::RefCell::default(),
+        kept_out: std::cell::RefCell::default(),
     }
     .targets(command)
+}
+
+/// What the command lookup finds at a candidate path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Presence {
+    /// Something that may be run.
+    There,
+    /// Nothing, or nothing the lookup may lead to (a directory).
+    Absent,
+    /// Not known: the walk was kept out of a directory on the way (an
+    /// account's FUSE mount, NFS with `root_squash`).
+    KeptOut,
 }
 
 /// How the files a command runs are looked for.
@@ -207,9 +226,9 @@ pub(crate) struct Lookup<'a> {
     /// Where a bare command name is looked for, in the order a shell
     /// would, relative to the root.
     pub(crate) search: &'a [String],
-    /// Which candidate paths are there: as root, a path only root can read
+    /// What is at each candidate path: as root, a path only root can read
     /// is not looked for at a user's word.
-    pub(crate) exists: &'a dyn Fn(&str) -> bool,
+    pub(crate) exists: &'a dyn Fn(&str) -> Presence,
     /// Set when a line held more commands than are looked up.
     pub(crate) capped: std::cell::Cell<bool>,
     /// Set when a command names its program or script through a variable
@@ -219,6 +238,9 @@ pub(crate) struct Lookup<'a> {
     /// shell runs a file is what says it is a shell script, whatever its
     /// name and first line.
     pub(crate) shell_scripts: std::cell::RefCell<Vec<String>>,
+    /// The directories of `search` a bare name was not looked for in,
+    /// since the walk was kept out of them.
+    pub(crate) kept_out: std::cell::RefCell<Vec<String>>,
 }
 
 impl Lookup<'_> {
@@ -522,23 +544,36 @@ pub(crate) fn split_commands(code: &str) -> (Vec<String>, bool) {
 /// bare name gives every place on the search list it is found in, first
 /// the one a shell would take: the `PATH` of whatever runs the command
 /// may still differ from the ones the list was made from.
+///
+/// A path the walk was kept out of is followed, to be told as not read.
+/// A search directory it was kept out of is noted once instead: every
+/// name looked for there would be one item each, naming no known file.
 fn locate(lookup: &Lookup<'_>, word: &str) -> Vec<String> {
     let expanded = expand(lookup.home, word);
-    let candidates: Vec<String> = if let Some(absolute) = expanded.strip_prefix('/') {
-        vec![absolute.to_string()]
-    } else if expanded.contains('/') {
+    if let Some(absolute) = expanded.strip_prefix('/') {
+        return match (lookup.exists)(absolute) {
+            Presence::There | Presence::KeptOut => vec![absolute.to_string()],
+            Presence::Absent => Vec::new(),
+        };
+    }
+    if expanded.contains('/') {
         return Vec::new();
-    } else {
-        lookup
-            .search
-            .iter()
-            .map(|directory| format!("{directory}/{expanded}"))
-            .collect()
-    };
-    candidates
-        .into_iter()
-        .filter(|candidate| (lookup.exists)(candidate))
-        .collect()
+    }
+    let mut found = Vec::new();
+    for directory in lookup.search {
+        let candidate = format!("{directory}/{expanded}");
+        match (lookup.exists)(&candidate) {
+            Presence::There => found.push(candidate),
+            Presence::Absent => {}
+            Presence::KeptOut => {
+                let mut kept_out = lookup.kept_out.borrow_mut();
+                if !kept_out.contains(directory) {
+                    kept_out.push(directory.clone());
+                }
+            }
+        }
+    }
+    found
 }
 
 /// `~`, `$HOME`, `${HOME}` and systemd's `%h` as the home directory, and

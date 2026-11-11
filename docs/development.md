@@ -30,7 +30,7 @@ offline gate suite below.
 
 The unit tests include property tests for the hand-written parsers (JSON, the
 TOML subset, the settings file, makepkg's source listing, pacman's mtree
-records, getcap's output): a small deterministic generator feeds them
+records, a file's capability data): a small deterministic generator feeds them
 generated and damaged input, the same on every run. They check that no input
 panics, that what is written is read back as it was, that nesting stops at its
 limit, that a key given twice is refused however it is spelled, and that an

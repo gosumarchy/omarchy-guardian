@@ -25,7 +25,8 @@
 # does not; bwrap with overlays and makepkg, as a
 # user, for the makepkg gate's jail; lua, for the Hyprland PATH file; git
 # and ssh-keygen, for the installer's release check and the installed
-# upgrade check (which also needs tar and vercmp); and an installed
+# upgrade check (which also needs tar and vercmp); python3, for a local web
+# server that the theme and plugin handlers log in to; and an installed
 # omarchy-guardian package plus jq, for the interceptor's presence check. A
 # case whose requirement is missing is reported as skipped. A check that is
 # known to fail today is run and shown as KNOWN with the reason, and counted
@@ -144,6 +145,85 @@ skip() {
     printf 'skip %s\n' "$1"
     SKIPPED=$((SKIPPED + 1))
 }
+
+# web_logins: a web URL's login reaches the server through git's
+# credential helper, and only its own host, and no redirect shows it. A
+# local server answers a request for the repository without a login with
+# 401, and with one with a redirect to a path git cannot use, where git
+# prints the URL it asked for whole; and one for `away` with a redirect to
+# another host, before any login is asked for.
+web_logins() {
+    if [[ ! -x /usr/bin/python3 ]]; then
+        skip 'a web login through a redirect: needs python3, for a local server'
+        return
+    fi
+    local web=$E2E/web server port
+    mkdir -p "$web"
+    cat >"$web/server.py" <<'EOF'
+import http.server
+import sys
+
+log = open(sys.argv[1], "a")
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        login = self.headers.get("Authorization", "-")
+        log.write(f"{self.headers.get('Host')} {self.path} {login}\n")
+        log.flush()
+        if self.path.startswith("/elsewhere"):
+            self.send_response(200)
+        elif self.path.startswith("/away/"):
+            port = self.server.server_address[1]
+            self.send_response(302)
+            self.send_header(
+                "Location", f"http://localhost:{port}/r/info/refs?service=git-upload-pack"
+            )
+        elif login == "-":
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="r"')
+        else:
+            self.send_response(302)
+            self.send_header("Location", "/elsewhere")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *_):
+        pass
+
+
+server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+with open(sys.argv[2] + ".part", "w") as written:
+    written.write(str(server.server_address[1]))
+__import__("os").rename(sys.argv[2] + ".part", sys.argv[2])
+server.serve_forever()
+EOF
+    /usr/bin/python3 -I "$web/server.py" "$web/log" "$web/port" &
+    server=$!
+    for _ in $(seq 50); do
+        [[ -s $web/port ]] && break
+        sleep 0.1
+    done
+    port=$(cat "$web/port")
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add "http://me:secret@127.0.0.1:$port/r"
+    check 'a redirect does not show the password of a plugin URL' \
+        eval '! grep -qF secret "$OUT" && grep -qF "/r/info/refs?service=git-upload-pack Basic bWU6c2VjcmV0" "$web/log"'
+    : >"$web/log"
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" install "http://me:secret@127.0.0.1:$port/r"
+    check 'a redirect does not show the password of a theme URL' \
+        eval '! grep -qF secret "$OUT" && grep -qF "/r/info/refs?service=git-upload-pack Basic bWU6c2VjcmV0" "$web/log"'
+    : >"$web/log"
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add "http://me:secret@127.0.0.1:$port/away/r"
+    check 'a redirect to another host is not handed the login' \
+        eval 'grep -q "^localhost:$port " "$web/log" && ! grep -q "^localhost:$port .* Basic" "$web/log" && ! grep -qF secret "$OUT"'
+    : >"$web/log"
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add "http://TOKENSECRET@127.0.0.1:$port/r"
+    check 'a token that stands as the user alone is not shown' \
+        eval '! grep -qF TOKENSECRET "$OUT" && grep -qF "/r/info/refs?service=git-upload-pack Basic VE9LRU5TRUNSRVQ6" "$web/log"'
+    kill "$server"
+    wait "$server" 2>/dev/null || true
+}
+
 
 # known <label> <why> <command...>: a check that is known to fail today. It
 # is run and shown, and counted apart, so the suite stays usable while the
@@ -869,6 +949,381 @@ theme_commands() {
         test "$(cat "$HOME/.bashrc.guardian-bak" 2>/dev/null)" = '# mine'
 }
 
+# A review is remembered by the source's name and repository, so another
+# repository with the same name is not reviewed as an upgrade of the approved
+# one. The repositories are local, reached through git URL rewrites that only
+# these commands see, and Guardian is a stand-in that records what it was
+# asked and stops there.
+source_identities() {
+    printf '=== theme and plugin identities ===\n'
+    if ! command -v git >/dev/null || ! command -v jq >/dev/null || ! command -v flock >/dev/null; then
+        skip 'theme and plugin identities: needs git, jq and flock'
+        return
+    fi
+    local repos=$E2E/repos asked=$E2E/guardian-asked name
+    mkdir -p "$repos" "$E2E/omarchy-bin"
+    for name in omarchy-theme-set omarchy-git-url-check omarchy-plugin-validate; do
+        printf '#!/bin/sh\nexit 0\n' >"$E2E/omarchy-bin/$name"
+    done
+    # Omarchy's validator names what it refuses, as the manifest spells it.
+    printf '#!/bin/sh\ngrep -q loud "$1/manifest.json" || exit 0\ncat "$1/manifest.json" >&2\nexit 1\n' \
+        >"$E2E/omarchy-bin/omarchy-plugin-validate"
+    printf '#!/bin/sh\necho "[]"\n' >"$E2E/omarchy-bin/omarchy-plugin-catalog"
+    printf '#!/bin/sh\nprintf "%%s\\n" "$@" >%q\nexit 2\n' "$asked" >"$E2E/guardian-stand-in"
+    chmod 755 "$E2E"/omarchy-bin/omarchy-* "$E2E/guardian-stand-in"
+    for name in guardian-theme guardian-plugin; do
+        with_stand_ins "$PROJECT/integrations/omarchy/$name" "$E2E/$name.copy"
+        sed -i "s|^GUARDIAN=/usr/bin/omarchy-guardian$|GUARDIAN=$E2E/guardian-stand-in|" "$E2E/$name.copy"
+    done
+
+    commit() { git -C "$1" -c user.name=e2e -c user.email=e2e@example.test commit -qm "$2"; }
+    for name in nord demo; do
+        git init -q "$repos/$name.git"
+    done
+    printf 'a theme\n' >"$repos/nord.git/colors.toml"
+    printf '{"id":"demo"}\n' >"$repos/demo.git/manifest.json"
+    git -C "$repos/nord.git" add -A && commit "$repos/nord.git" one
+    git -C "$repos/demo.git" add -A && commit "$repos/demo.git" one
+
+    # Every URL form here leads to the local repositories. What Guardian
+    # was asked is cleared first, so a check never reads an earlier call's.
+    rewritten() {
+        : >"$asked"
+        GIT_CONFIG_COUNT=20 \
+            GIT_CONFIG_KEY_0="url.file://$repos/.insteadOf" GIT_CONFIG_VALUE_0=https://me:secret@example.test/ \
+            GIT_CONFIG_KEY_1="url.file://$repos/.insteadOf" GIT_CONFIG_VALUE_1=git@example.test:me/ \
+            GIT_CONFIG_KEY_2="url.file://$repos/.insteadOf" GIT_CONFIG_VALUE_2='https://evil.test?@example.test/' \
+            GIT_CONFIG_KEY_3="url.file://$repos/.insteadOf" GIT_CONFIG_VALUE_3='ssh://alice:secret@example.test/~/' \
+            GIT_CONFIG_KEY_4="url.file://$repos/.insteadOf" GIT_CONFIG_VALUE_4='ssh://al?ce@example.test/~/' \
+            GIT_CONFIG_KEY_5="url.file://$repos/.insteadOf" GIT_CONFIG_VALUE_5='[alice@example.test]:' \
+            GIT_CONFIG_KEY_6="url.file://$repos/.insteadOf" GIT_CONFIG_VALUE_6='[alice:se]cret@example.test]:' \
+            GIT_CONFIG_KEY_7="url.file://$repos/.insteadOf" GIT_CONFIG_VALUE_7='alice:secret@[example.test]:' \
+            GIT_CONFIG_KEY_8="url.file://$repos/.insteadOf" GIT_CONFIG_VALUE_8='[alice:secret@example.test]x:' \
+            GIT_CONFIG_KEY_9="url.file://$repos/.insteadOf" GIT_CONFIG_VALUE_9='evil.test]b:secret@[example.test]:' \
+            GIT_CONFIG_KEY_10="url.file://$repos/.insteadOf" GIT_CONFIG_VALUE_10='ssh://git:secret@evil.test%2F@example.test/' \
+            GIT_CONFIG_KEY_11="url.file://$repos/.insteadOf" GIT_CONFIG_VALUE_11='ssh://git:secret@example.test:2222/' \
+            GIT_CONFIG_KEY_12="url.file://$repos/.insteadOf" GIT_CONFIG_VALUE_12='ssh://alice@example.test/~/' \
+            GIT_CONFIG_KEY_13="url.file://$repos/.insteadOf" GIT_CONFIG_VALUE_13='ssh://git:secret@[evil.test]@example.test/' \
+            GIT_CONFIG_KEY_14="url.file://$repos/.insteadOf" GIT_CONFIG_VALUE_14='ssh://example.test/x@[u:secret@y]/' \
+            GIT_CONFIG_KEY_15="url.file://$repos/.insteadOf" GIT_CONFIG_VALUE_15='ssh://[alice:secret/x@example.test]/' \
+            GIT_CONFIG_KEY_16="url.file://$repos/.insteadOf" GIT_CONFIG_VALUE_16='ssh://[alice/x%3Asecret@example.test]/' \
+            GIT_CONFIG_KEY_17="url.file://$repos/.insteadOf" GIT_CONFIG_VALUE_17='git://me:secret@example.test/' \
+            GIT_CONFIG_KEY_18="url.file://$repos/.insteadOf" GIT_CONFIG_VALUE_18='ftp://alice:secret@example.test/' \
+            GIT_CONFIG_KEY_19="url.file://$repos/.insteadOf" GIT_CONFIG_VALUE_19=https://example.test/ \
+            PATH="$E2E/omarchy-bin:$PATH" "$@" >"$OUT" 2>&1 </dev/null
+    }
+    # A checkout is moved aside, not deleted, before another is cloned.
+    trash_theme() { mv "$HOME/.config/omarchy/themes/nord" "$E2E/nord.$RANDOM"; }
+    # asked_for <argument...>: Guardian was given these arguments in a row.
+    asked_for() {
+        local want
+        want=$(printf '%s\n' "$@")
+        [[ $'\n'$(<"$asked")$'\n' == *$'\n'"$want"$'\n'* ]]
+    }
+    told_no_secret() { [[ -s $asked ]] && ! grep -qF secret "$asked"; }
+    # Refused by the check before the clone, so neither git nor ssh saw it.
+    refused_unshown() {
+        [[ ! -s $asked ]] && grep -qF 'the URL of the repository cannot be read as git reads it' "$OUT" &&
+            ! grep -qF secret "$OUT"
+    }
+    refused_unprintable() { [[ ! -s $asked ]] && grep -qF 'printable ASCII' "$OUT"; }
+    # The identity of a theme installed from a path is that path made whole.
+    asked_for_a_whole_path() { grep -qxF -- --identity "$asked" && grep -q "^theme:nord /" "$asked"; }
+
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" install https://me:secret@example.test/nord.git
+    check 'a theme is remembered by its name and repository' \
+        asked_for --identity 'theme:nord https://example.test/nord.git'
+    check 'without the password in its URL' told_no_secret
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" install git@example.test:me/nord.git
+    check 'a theme from git@host:path keeps that URL' \
+        asked_for --identity 'theme:nord git@example.test:me/nord.git'
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" install 'ssh://alice@example.test/~/nord.git'
+    check 'a theme from ssh:// keeps whose it is' \
+        asked_for --identity 'theme:nord ssh://alice@example.test/~/nord.git'
+    # ssh takes no password: git hands it `alice:secret` as the user.
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" install 'ssh://alice:secret@example.test/~/nord.git'
+    check 'a theme from ssh:// with a password is refused, and not shown' refused_unshown
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" install 'ssh://al?ce@example.test/~/nord.git'
+    check 'an ssh:// login holding ? is still the login' \
+        asked_for --identity 'theme:nord ssh://al?ce@example.test/~/nord.git'
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" install 'https://evil.test?@example.test/nord.git'
+    check "a host before ?@ is the host git fetches from" \
+        asked_for --identity 'theme:nord https://evil.test?@example.test/nord.git'
+    (cd "$repos" && rewritten /usr/bin/bash "$E2E/guardian-theme.copy" install ./nord.git)
+    check 'a theme from a relative path is remembered by the whole path' asked_for_a_whole_path
+
+    rewritten git clone -q https://me:secret@example.test/nord.git "$HOME/.config/omarchy/themes/nord"
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" update
+    check 'an updated theme is remembered by its remote' \
+        asked_for --unit nord 'theme:nord https://example.test/nord.git'
+    check 'without the password in that remote' told_no_secret
+    trash_theme
+    rewritten git clone -q 'ssh://alice@example.test/~/nord.git' "$HOME/.config/omarchy/themes/nord"
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" update
+    check 'an ssh:// theme is updated under the identity it was installed with' \
+        asked_for --unit nord 'theme:nord ssh://alice@example.test/~/nord.git'
+    trash_theme
+    # `$(...)` would drop the newline, and git fetches from `nord.git\n`.
+    rewritten git clone -q https://me:secret@example.test/nord.git "$HOME/.config/omarchy/themes/nord"
+    git -C "$HOME/.config/omarchy/themes/nord" config remote.origin.url $'https://example.test/nord.git\n'
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" update
+    check 'a remote URL with a control character is refused' \
+        eval '[[ ! -s $asked ]] && grep -qF "no usable remote URL" "$OUT"'
+    git -C "$HOME/.config/omarchy/themes/nord" config remote.origin.url $'https://example.test/nord.git\xc2\x9b'
+    LC_ALL=C rewritten /usr/bin/bash "$E2E/guardian-theme.copy" update
+    check 'a theme remote with a C1 control character is refused, whatever the locale' \
+        eval '[[ ! -s $asked ]] && grep -qF "no usable remote URL" "$OUT"'
+    trash_theme
+    rewritten git clone -q https://me:secret@example.test/nord.git "$HOME/.config/omarchy/themes/nord"
+    git -C "$HOME/.config/omarchy/themes/nord" checkout -q -b $'x\xc2\x9b31m'
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" update
+    check 'a theme on a branch whose name is not printable is refused, and not shown' \
+        eval '[[ ! -s $asked ]] && grep -qF "not printable ASCII" "$OUT" && ! grep -qF $'"'"'\xc2\x9b'"'"' "$OUT"'
+    trash_theme
+    # A clone checks out the branch the server's HEAD names; renamed, it
+    # keeps tracking that branch.
+    rewritten git clone -q https://me:secret@example.test/nord.git "$HOME/.config/omarchy/themes/nord"
+    git -C "$HOME/.config/omarchy/themes/nord" update-ref $'refs/remotes/origin/x\xc2\x9by' HEAD
+    git -C "$HOME/.config/omarchy/themes/nord" branch -q -u $'origin/x\xc2\x9by'
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" update
+    check 'a theme tracking a branch whose name is not printable is refused, and not shown' \
+        eval '[[ ! -s $asked ]] && grep -qF "tracks a branch whose name is not printable" "$OUT" && ! grep -qF $'"'"'\xc2\x9b'"'"' "$OUT"'
+    trash_theme
+    mkdir -p "$HOME/.config/omarchy/themes/"$'n\xc2\x9b/.git'
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" update
+    check 'a theme directory whose name is not printable is skipped, and not shown' \
+        eval 'grep -qF "skipping a theme whose directory name" "$OUT" && ! grep -qF $'"'"'\xc2\x9b'"'"' "$OUT"'
+    mv "$HOME/.config/omarchy/themes/"$'n\xc2\x9b' "$E2E/odd.$RANDOM"
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" update --only $'n\xc2\x9b'
+    check 'a theme name to update that is not printable is refused, and not shown' \
+        eval 'grep -qF "a theme name must be printable ASCII" "$OUT" && ! grep -qF $'"'"'\xc2\x9b'"'"' "$OUT"'
+    # After the review: what omarchy-theme-set prints is shown filtered,
+    # and a job it leaves holding stderr is not waited for.
+    local themes=$HOME/.config/omarchy/themes
+    mkdir -p "$themes/.guardian-install.e2e"
+    git clone -q "$repos/nord.git" "$themes/.guardian-install.e2e/repo"
+    printf '#!/bin/sh\nprintf "Ignored: \\302\\233x.lua\\n" >&2\n(sleep 5; printf "\\302\\233late\\n" >&2) &\nexit 0\n' \
+        >"$E2E/omarchy-bin/omarchy-theme-set"
+    local started=$SECONDS
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" --guardian-commit-install nord "$themes/.guardian-install.e2e/repo"
+    check 'what omarchy-theme-set prints is not shown as it is, nor waited for' \
+        eval 'grep -qF "Ignored: ??x.lua" "$OUT" && ! grep -qF $'"'"'\xc2\x9b'"'"' "$OUT" && (( SECONDS - started < 4 ))'
+    # Its stderr's file is removed when the handler is stopped by a signal.
+    trash_theme
+    git clone -q "$repos/nord.git" "$themes/.guardian-install.e2e/repo"
+    printf '#!/bin/sh\nkill -TERM "$PPID"\nsleep 1\n' >"$E2E/omarchy-bin/omarchy-theme-set"
+    mkdir -p "$E2E/signal-tmp"
+    # The shell says the job was terminated, on stderr.
+    TMPDIR=$E2E/signal-tmp rewritten /usr/bin/bash "$E2E/guardian-theme.copy" \
+        --guardian-commit-install nord "$themes/.guardian-install.e2e/repo" 2>/dev/null
+    check 'what omarchy-theme-set prints is not left behind when the handler is stopped' \
+        eval '[[ -z $(ls -A "$E2E/signal-tmp") ]]'
+    printf '#!/bin/sh\nexit 0\n' >"$E2E/omarchy-bin/omarchy-theme-set"
+    [[ ! -e $themes/nord ]] || trash_theme
+    [[ ! -e $themes/.guardian-install.e2e ]] || mv "$themes/.guardian-install.e2e" "$E2E/stage.$RANDOM"
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" install git://me:secret@example.test/nord.git
+    check 'a theme from git:// with a login is refused, and not shown' refused_unshown
+    # An FTP path is relative to the user's home: the user is kept.
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" install ftp://alice:secret@example.test/nord.git
+    check 'a theme from ftp:// keeps its user, not its password' \
+        eval 'asked_for --identity "theme:nord ftp://alice@example.test/nord.git" && told_no_secret'
+    trash_theme
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" install ftp://al%3Asecret@example.test/nord.git
+    check 'a theme from ftp:// with a % in its user is refused, and not shown' refused_unshown
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" install 'https://a@b:secret@example.test/nord.git'
+    check 'a theme from https:// with an @ in its login is refused, and not shown' refused_unshown
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" install 'https://u:se/secret@example.test/nord.git'
+    check 'a theme from https:// with a / in its password is refused, and not shown' refused_unshown
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add 'ssh://u:se/secret@example.test/evil.git'
+    check 'a plugin from ssh:// with a / in its password is refused, and not shown' refused_unshown
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" install 'https://u:se?secret@example.test/nord.git'
+    check 'a theme from https:// with a ? in its password is refused, and not shown' refused_unshown
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" install 'https://user@corp:se/secret@example.test/nord.git'
+    check 'a theme from https:// with an @ and a / in its login is refused, and not shown' refused_unshown
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add 'ftp://user@corp:se/secret@example.test/evil.git'
+    check 'a plugin from ftp:// with an @ and a / in its login is refused, and not shown' refused_unshown
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" install 'https:///u:secret@example.test/nord.git'
+    check 'a theme from https:/// with a login is refused, and not shown' refused_unshown
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add 'https:///secrettoken@example.test/evil.git'
+    check 'a plugin from https:/// with a token is refused, and not shown' refused_unshown
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" install 'https://us/er:secret@example.test/nord.git'
+    check 'a theme from https:// with a / before its login is refused, and not shown' refused_unshown
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" install 'https:///secrettoken@example.test/nord.git'
+    check 'a theme from https:/// with a token is refused, and not shown' refused_unshown
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" install 'https://u:secret@example.test/nord%0a.git'
+    check 'a theme from https:// with %0a in it is refused, and not shown' refused_unshown
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add 'ftp://alice:secret@example.test/evil%0A.git'
+    check 'a plugin from ftp:// with %0A in it is refused, and not shown' refused_unshown
+    # Omarchy's check prints the URL it rejects, password included.
+    printf '#!/bin/sh\ncase $1 in *reject*) echo "'"'"'$1'"'"'" >&2; exit 1 ;; esac\n' \
+        >"$E2E/omarchy-bin/omarchy-git-url-check"
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" install https://me:secret@example.test/reject.git
+    check "what Omarchy's URL check prints of a theme URL is not shown" \
+        eval '[[ ! -s $asked ]] && grep -qF "Omarchy rejected" "$OUT" && ! grep -qF secret "$OUT"'
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add https://me:secret@example.test/reject.git
+    check "what Omarchy's URL check prints of a plugin URL is not shown" \
+        eval '[[ ! -s $asked ]] && grep -qF "Omarchy rejected" "$OUT" && ! grep -qF secret "$OUT"'
+    printf '#!/bin/sh\nexit 0\n' >"$E2E/omarchy-bin/omarchy-git-url-check"
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add $'--x\xc2\x9b'
+    check 'an unknown plugin add option is refused, and not shown' \
+        eval 'grep -qF "unknown add option" "$OUT" && ! grep -qF $'"'"'\xc2\x9b'"'"' "$OUT"'
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" update $'--x\xc2\x9b'
+    check 'an unknown plugin update option is refused, and not shown' \
+        eval 'grep -qF "unknown update option" "$OUT" && ! grep -qF $'"'"'\xc2\x9b'"'"' "$OUT"'
+    # U+202E, which shows the text after it backwards.
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" install $'https://example.test/nord.git\xe2\x80\xae'
+    check 'a typed theme URL with a bidi override is refused before the clone' refused_unprintable
+
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add 'ssh://alice@example.test/~/demo.git'
+    check 'a plugin from ssh:// keeps whose it is' \
+        asked_for --identity 'plugin:demo ssh://alice@example.test/~/demo.git'
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add 'ssh://alice:secret@example.test/~/demo.git'
+    check 'a plugin from ssh:// with a password is refused, and not shown' refused_unshown
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add $'https://example.test/demo.git\x9b'
+    check 'a typed plugin URL with a raw C1 byte is refused before the clone' refused_unprintable
+    # A path git refuses to check out, which it names in its error.
+    git init -q "$repos/evil.git"
+    (
+        cd "$repos/evil.git"
+        blob=$(printf '{"id":"evil"}\n' | git hash-object -w --stdin)
+        inner=$(printf '100644 blob %s\tx\n' "$blob" | git mktree)
+        dot=$(printf '040000 tree %s\t.git\n' "$inner" | git mktree)
+        top=$(printf '100644 blob %s\tmanifest.json\n040000 tree %s\ta\xc2\x9bb\n' "$blob" "$dot" | git mktree)
+        git update-ref HEAD "$(git -c user.name=e2e -c user.email=e2e@example.test commit-tree -m one "$top")"
+    )
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add https://me:secret@example.test/evil.git
+    check "a path git refuses is not shown as it is" \
+        eval '[[ ! -s $asked ]] && grep -qF "invalid path" "$OUT" && ! grep -qF $'"'"'\xc2\x9b'"'"' "$OUT"'
+    rewritten /usr/bin/bash "$E2E/guardian-theme.copy" install https://me:secret@example.test/evil.git
+    check "a path git refuses in a theme is not shown as it is" \
+        eval '[[ ! -s $asked ]] && grep -qF "invalid path" "$OUT" && ! grep -qF $'"'"'\xc2\x9b'"'"' "$OUT"'
+    # The cases above run the URL code through one handler or the other;
+    # it is one block, the same in both.
+    url_code() {
+        awk '/^# safe_stderr /{on=1} on{print} on&&/^without_scp_password\(\) \{/{last=1} last&&/^}$/{exit}' "$1"
+    }
+    # Every function of the block is in what is compared.
+    holds_url_code() {
+        local code name
+        code=$(url_code "$1")
+        for name in safe_stderr safe_git login_git bare_url keep_login decoded stored_url \
+            printable checked_url unreadable_login source_identity url_identity without_login \
+            without_scp_password; do
+            grep -q "^$name() {" <<<"$code" || return 1
+        done
+    }
+    check 'the URL code is the same in the theme and plugin handlers' \
+        eval 'holds_url_code "$PROJECT/integrations/omarchy/guardian-theme" &&
+            cmp -s <(url_code "$PROJECT/integrations/omarchy/guardian-theme") \
+                <(url_code "$PROJECT/integrations/omarchy/guardian-plugin")'
+    # The login a web URL is cloned without, and kept for the updates.
+    url_helpers() {
+        (
+            eval "$(url_code "$PROJECT/integrations/omarchy/guardian-plugin")"
+            git init -q "$E2E/kept"
+            git -C "$E2E/kept" remote add origin https://example.test/r
+            keep_login https://me:secret@example.test/r "$E2E/kept"
+            [[ $(git -C "$E2E/kept" config remote.origin.url) == https://me:secret@example.test/r ]] &&
+                [[ $(bare_url https://me:se%40cret@example.test:8443/r?x#y) == https://example.test:8443/r?x#y ]] &&
+                [[ $(bare_url ftp://alice:secret@example.test/r) == ftp://alice:secret@example.test/r ]] &&
+                [[ $(bare_url git@example.test:r) == git@example.test:r ]] &&
+                [[ $(decoded 'a%41%2f%zz%') == aA/%zz% ]] &&
+                ! decoded 'a%00b' >/dev/null && ! decoded 'a%0Db' >/dev/null && ! decoded 'a%7f' >/dev/null &&
+                ! without_login 'https://me:se%0dcret@example.test/r' >/dev/null &&
+                ! without_login 'https://me@exam%01ple.test/r' >/dev/null
+        )
+    }
+    check 'a web login is cut from the URL git is handed, and kept for updates' url_helpers
+    git init -q "$repos/loud.git"
+    printf '{"id":"loud\xc2\x9b"}\n' >"$repos/loud.git/manifest.json"
+    git -C "$repos/loud.git" add -A && commit "$repos/loud.git" one
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add https://me:secret@example.test/loud.git
+    check "what Omarchy's validator prints of a manifest is not shown as it is" \
+        eval '[[ ! -s $asked ]] && grep -qF "validation failed" "$OUT" && ! grep -qF $'"'"'\xc2\x9b'"'"' "$OUT"'
+    # git connects to evil.test: it takes the host from the first `@[`.
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add 'ssh://git:secret@[evil.test]@example.test/demo.git'
+    check 'an ssh host in brackets inside the login is refused, and not shown' refused_unshown
+    # git hands ssh `example.test/x@u:secret@y`: the user is `example.test/x@u:secret`.
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add 'ssh://example.test/x@[u:secret@y]/demo.git'
+    check 'a password before an @[ in the path is refused, and not shown' refused_unshown
+    # git reads a leading `[` up to its `]`, past the `/`: the user is `alice:secret/x`.
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add 'ssh://[alice:secret/x@example.test]/demo.git'
+    check 'a password in a leading [ is refused, and not shown' refused_unshown
+    # git decodes `%3A` before it reads the brackets: the user is `alice/x:secret`.
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add 'ssh://[alice/x%3Asecret@example.test]/demo.git'
+    check 'an encoded password past the authority is refused, and not shown' refused_unshown
+    # A theme's name cannot be read from this form, so only a plugin
+    # takes it.
+    # ssh would take `alice:secret` for the user, and print it.
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add '[alice:secret@example.test]:demo.git'
+    check 'a plugin from [user:password@host]:path is refused, and not shown' refused_unshown
+    # git connects to `alice:se` here: the `@` past the first `]` is path.
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add '[alice:se]cret@example.test]:demo.git'
+    check 'an @ past the first ] is not taken for a login' \
+        asked_for --identity 'plugin:demo [alice:se]cret@example.test]:demo.git'
+    # git hands ssh `alice:secret@example.test` for both of these.
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add 'alice:secret@[example.test]:demo.git'
+    check 'a plugin from user:password@[host]:path is refused, and not shown' refused_unshown
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add '[alice:secret@example.test]x:demo.git'
+    check 'text between ] and : does not hide the password' refused_unshown
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add '[alice@example.test]:demo.git'
+    check 'a plugin from [user@host]:path keeps it' \
+        asked_for --identity 'plugin:demo [alice@example.test]:demo.git'
+    # Rebuilt as `[evil.test]b@example.test]:`, this would name evil.test.
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add 'evil.test]b:secret@[example.test]:demo.git'
+    check 'a login with ] and a password is refused, and not shown' refused_unshown
+    # git decodes `%2F` first and connects to evil.test, not example.test.
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add 'ssh://git:secret@evil.test%2F@example.test/demo.git'
+    check 'an encoded ssh authority is refused, and not shown' refused_unshown
+    # git splits no port here while the login holds `:`, but would once cut.
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add 'ssh://git:secret@example.test:2222/demo.git'
+    check 'a password with an ssh port is refused, and not shown' refused_unshown
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add 'https://evil.test?@example.test/demo.git'
+    check 'a plugin host before ?@ is the host git fetches from' \
+        asked_for --identity 'plugin:demo https://evil.test?@example.test/demo.git'
+
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add https://me:secret@example.test/demo.git
+    check 'a plugin is remembered by its id and repository' \
+        asked_for --identity 'plugin:demo https://example.test/demo.git'
+    check 'without the password in its URL' told_no_secret
+    web_logins
+
+    mkdir -p "$HOME/.config/omarchy/plugins"
+    rewritten git clone -q https://me:secret@example.test/demo.git "$HOME/.config/omarchy/plugins/demo"
+    printf 'more\n' >"$repos/demo.git/more.qml"
+    git -C "$repos/demo.git" add -A && commit "$repos/demo.git" two
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" update
+    check 'an updated plugin is remembered by its remote' \
+        asked_for --unit demo 'plugin:demo https://example.test/demo.git'
+    check 'without the password in that remote' told_no_secret
+    printf '{"id":"loud\xc2\x9b"}\n' >"$repos/demo.git/manifest.json"
+    git -C "$repos/demo.git" add -A && commit "$repos/demo.git" three
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" update
+    check "what Omarchy's validator prints of an update is not shown as it is" \
+        eval '[[ ! -s $asked ]] && grep -qF "failed Omarchy" "$OUT" && ! grep -qF $'"'"'\xc2\x9b'"'"' "$OUT"'
+    # U+009B, the one-byte escape of a terminal, written in UTF-8.
+    git -C "$HOME/.config/omarchy/plugins/demo" config remote.origin.url $'https://example.test/demo.git\xc2\x9b'
+    LC_ALL=C rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" update
+    check 'a plugin remote with a C1 control character is refused, whatever the locale' \
+        eval '[[ ! -s $asked ]] && grep -qF "not printable ASCII" "$OUT"'
+    mv "$HOME/.config/omarchy/plugins/demo" "$E2E/demo.$RANDOM"
+    mkdir -p "$HOME/.config/omarchy/plugins/"$'n\xc2\x9b/.git'
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" update
+    check 'a plugin directory whose name is not a plugin id is skipped, and not shown' \
+        eval 'grep -qF "skipping a directory whose name is not a plugin id" "$OUT" && ! grep -qF $'"'"'\xc2\x9b'"'"' "$OUT"'
+    rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" add https://example.test/demo.git $'\xc2\x9b'
+    check 'an argument that is not expected is not repeated' \
+        eval '[[ ! -s $asked ]] && grep -qF "unexpected argument after the URL" "$OUT" && ! grep -qF $'"'"'\xc2\x9b'"'"' "$OUT"'
+    # Outside the C locale, [A-Za-z] takes letters such as U+0261.
+    if locale -a 2>/dev/null | grep -qix 'en_US.utf8'; then
+        LC_ALL=en_US.UTF-8 rewritten /usr/bin/bash "$E2E/guardian-plugin.copy" update $'\xc9\xa1ithub'
+        check 'a plugin id with a letter outside ASCII is refused in any locale' \
+            eval 'grep -qF "invalid plugin id" "$OUT"'
+    else
+        skip 'a plugin id in a UTF-8 locale: en_US.UTF-8 is not installed'
+    fi
+}
+
 ###############################################################################
 # The bar's check that the Bash interceptor is really loaded
 ###############################################################################
@@ -982,7 +1437,7 @@ release_check_cases() {
             printf 'pkgver=1\npkgrel=1\n' >"$repo/packaging/arch/PKGBUILD" &&
             # What the upgrade check starts once the release is verified:
             # here it only says how it was started, and from where.
-            printf '#!/bin/bash\n# takes --verified-by-installed\nprintf "installer in %%s without .git: %%s\\n" "$PWD" "$*"\n[[ ! -e .git ]]\n' \
+            printf '#!/bin/bash\n# takes --verified-by-installed\nprintf "installer in %%s without .git: %%s\\n" "$PWD" "$*"\nprintf "given: %%s\\n" "${ANTHROPIC_API_KEY-none} ${STRAY-none} ${LC_TIME-none}"\n[[ ! -e .git ]]\n' \
                 >"$repo/install.sh" &&
             chmod 755 "$repo/install.sh" &&
             "${git[@]}" add .gitignore main.rs install.sh packaging/arch/PKGBUILD &&
@@ -1100,7 +1555,7 @@ release_tampered_cases() {
     up() {
         GUARDIAN_UPGRADE_TEST_SIGNERS=${SIGNERS_FILE-$signers} \
             GUARDIAN_UPGRADE_TEST_INSTALLED=${INSTALLED-0.5.0-1} \
-            GUARDIAN_UPGRADE_TEST_AS_ROOT=1 bash "$upgrade" "$@" >"$OUT" 2>&1
+            GUARDIAN_UPGRADE_TEST_AS_ROOT=1 "$upgrade" "$@" >"$OUT" 2>&1
     }
     # exported <file>: the path of <file> in the export the last `up
     # --check --keep` made.
@@ -1130,7 +1585,7 @@ release_tampered_cases() {
     only_kept() { [[ $(find "$XDG_CACHE_HOME/omarchy-guardian" -maxdepth 1 -name 'upgrade.*' | wc -l) == 1 ]]; }
     check 'the private directory is removed afterwards (one was kept on request)' only_kept
     if ((IS_ROOT)); then
-        GUARDIAN_UPGRADE_TEST_SIGNERS=$signers bash "$upgrade" --check "$clean" >"$OUT" 2>&1
+        GUARDIAN_UPGRADE_TEST_SIGNERS=$signers "$upgrade" --check "$clean" >"$OUT" 2>&1
         expect 'upgrade: refuses to run as root' 1 $?
     fi
     bash "$PROJECT/install.sh" --verified-by-installed=v1 >"$OUT" 2>&1
@@ -1295,6 +1750,46 @@ EOF
     expect 'upgrade: and handed to the signed installer' 0 $?
     check "upgrade: and nothing the checkout's configuration names was run" test ! -e "$canary"
 
+    # A caller's environment that would change what is verified, exported
+    # or run: BASH_ENV and an exported function (in this shell and in the
+    # installer's), TAR_OPTIONS (in the export), GIT_DIR (in git), and
+    # TMOUT and FUNCNEST, which would break the check that drops them; and
+    # beside them a reviewer login that must reach the installer, a stray
+    # variable that must not, and a locale that names a path. Started as a
+    # command, so its own first line is what is tested.
+    printf 'touch %q\n' "$canary" >"$E2E/release/bash-env"
+    hostile() {
+        env BASH_ENV="$E2E/release/bash-env" TAR_OPTIONS=--exclude=main.rs \
+            GIT_DIR="$E2E/release/nowhere" "BASH_FUNC_printf%%=() { touch $canary; }" \
+            GUARDIAN_UPGRADE_TEST_SIGNERS="$signers" GUARDIAN_UPGRADE_TEST_INSTALLED=0.5.0-1 \
+            GUARDIAN_UPGRADE_TEST_AS_ROOT=1 TMOUT=0.001 FUNCNEST=1 \
+            ANTHROPIC_API_KEY=k STRAY=x LC_TIME=/tmp/evil-locale "$@" >"$OUT" 2>&1
+    }
+    hostile "$upgrade" --check --keep "$clean"
+    expect "upgrade: a caller's hostile environment does not change the verified release" 0 $?
+    check 'upgrade: the export still holds what TAR_OPTIONS would leave out' signed_main
+    hostile "$upgrade" "$clean" v1
+    expect 'upgrade: and the release is handed to its installer' 0 $?
+    expect_output 'which runs as it should' 'installer in '
+    expect_output 'given the reviewer login, and no stray variable or locale path' 'given: k none none'
+    check 'upgrade: and neither BASH_ENV nor the function ran, here or in the installer' \
+        test ! -e "$canary"
+    # Started again once at most: a stray variable that is still there after
+    # the restart (as a wrapper adds one) stops it.
+    hostile env GUARDIAN_UPGRADE_RESTARTED=1 "$upgrade" --check --keep "$clean"
+    expect 'upgrade: an environment still not clean after the restart is refused' 1 $?
+    expect_output 'and says so' 'still holds variables it does not keep'
+    # A name no shell could assign is not kept for how it starts.
+    only_kept() {
+        env -i PATH="$PATH" HOME="$HOME" GUARDIAN_UPGRADE_TEST_SIGNERS="$signers" \
+            GUARDIAN_UPGRADE_TEST_INSTALLED=0.5.0-1 GUARDIAN_UPGRADE_TEST_AS_ROOT=1 \
+            GUARDIAN_UPGRADE_RESTARTED=1 "$@" "$upgrade" --check --keep "$clean" >"$OUT" 2>&1
+    }
+    only_kept
+    expect 'upgrade: an environment of kept variables only is clean' 0 $?
+    only_kept 'AWS_a/b=1'
+    expect 'upgrade: a kept prefix on a name no shell assigns is not kept' 1 $?
+
     # An object file that is not what its name says: the signed tree names
     # main.rs by its id, and the file stored under that id holds other
     # content.
@@ -1349,6 +1844,7 @@ pacman_gate
 user_gates
 makepkg_jail
 theme_commands
+source_identities
 interceptor_state
 hyprland_path
 release_check_cases

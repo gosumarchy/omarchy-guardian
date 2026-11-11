@@ -12,7 +12,10 @@ publish = false
 [dependencies]
 
 [lints.rust]
-unsafe_code = "forbid"
+# `deny`, not `forbid`: `sweep/live/capability/xattr.rs` calls getxattr and
+# `sweep/live/mount_table.rs` calls poll, the crate's only unsafe code, each
+# under an `expect` with its reason.
+unsafe_code = "deny"
 unused_qualifications = "warn"
 unreachable_pub = "warn"
 

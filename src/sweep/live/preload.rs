@@ -3,11 +3,16 @@
 //! keyboard or camera it has open.
 
 use std::fs;
+use std::path::Path;
 
 use super::{Found, Process, files, normalize, packaged, scripts, subject};
 use crate::autorun::Category;
 use crate::rules::RuleId;
 use crate::sweep::collect::Scope;
+
+/// The longest path the kernel opens, its NUL included (`PATH_MAX` in
+/// `linux/limits.h`): the dynamic linker cannot load a longer one.
+const PATH_MAX: usize = 4096;
 
 /// Directories downloads and droppers land in.
 const TEMPORARY: &[&str] = &["tmp/", "var/tmp/", "dev/shm/", "run/user/"];
@@ -16,7 +21,7 @@ const TEMPORARY: &[&str] = &["tmp/", "var/tmp/", "dev/shm/", "run/user/"];
 pub(super) fn device_checks(scope: &Scope<'_>, process: &Process, exe: &str, found: &mut Found) {
     let pid = &process.pid;
     let (path, started) = subject(scope, process, exe);
-    if process.fds.iter().any(|(_, fd)| reads_keys(scope, fd)) {
+    if process.open.keyboard {
         found.add(
             scope,
             Category::Input,
@@ -25,11 +30,7 @@ pub(super) fn device_checks(scope: &Scope<'_>, process: &Process, exe: &str, fou
             Some(RuleId::KeyboardReader),
         );
     }
-    if let Some((_, camera)) = process
-        .fds
-        .iter()
-        .find(|(_, fd)| fd.starts_with("/dev/video"))
-    {
+    if let Some(camera) = &process.open.camera {
         found.add(
             scope,
             Category::Camera,
@@ -98,6 +99,12 @@ pub(super) fn temporary_checks(scope: &Scope<'_>, process: &Process, exe: &str, 
     }
 }
 
+/// The most preloaded libraries looked at per process. A program preloads
+/// one or two; any process can name thousands, each a file the checks
+/// would read and an item that would crowd out others. Past this the
+/// process itself has an alert that says so.
+const MAX_PRELOADED: usize = 16;
+
 pub(super) fn preload_checks(scope: &Scope<'_>, process: &Process, exe: &str, found: &mut Found) {
     let pid = &process.pid;
     for directory in searched(process.environment.as_deref()) {
@@ -123,8 +130,32 @@ pub(super) fn preload_checks(scope: &Scope<'_>, process: &Process, exe: &str, fo
             );
         }
     }
-    for library in preloaded(process.environment.as_deref()) {
+    let libraries = preloaded(process.environment.as_deref());
+    if libraries.len() > MAX_PRELOADED {
+        found.add(
+            scope,
+            Category::Process,
+            exe,
+            format!(
+                "process {pid} preloads {} libraries: only the first {MAX_PRELOADED} were looked at",
+                libraries.len()
+            ),
+            Some(RuleId::PreloadedLibrary),
+        );
+    }
+    for library in libraries.into_iter().take(MAX_PRELOADED) {
         match library {
+            // Up to 128 KiB of the environment would become an item's name.
+            Preload::Path(library) if library.len() >= PATH_MAX => found.add(
+                scope,
+                Category::Process,
+                exe,
+                format!(
+                    "process {pid} preloads a path of {} bytes, longer than any the kernel opens",
+                    library.len()
+                ),
+                Some(RuleId::PreloadedLibrary),
+            ),
             // A packaged library is trusted for what its package
             // installed, not for its path.
             Preload::Path(library)
@@ -154,9 +185,10 @@ pub(super) fn preload_checks(scope: &Scope<'_>, process: &Process, exe: &str, fo
     }
 }
 
-/// Whether open file `fd` is an input device with letter keys (a keyboard,
-/// not a game controller). Unknown devices count as keyboards.
-fn reads_keys(scope: &Scope<'_>, fd: &str) -> bool {
+/// Whether open file `fd`, on the system at `root`, is an input device
+/// with letter keys (a keyboard, not a game controller). Unknown devices
+/// count as keyboards.
+pub(super) fn reads_keys(root: &Path, fd: &str) -> bool {
     let Some(event) = fd.strip_prefix("/dev/input/") else {
         return false;
     };
@@ -164,9 +196,7 @@ fn reads_keys(scope: &Scope<'_>, fd: &str) -> bool {
         return false;
     }
     let Ok(bitmap) = fs::read_to_string(
-        scope
-            .root
-            .join("sys/class/input")
+        root.join("sys/class/input")
             .join(event)
             .join("device/capabilities/key"),
     ) else {
@@ -209,8 +239,7 @@ pub(super) fn preloaded(environment: Option<&[u8]>) -> Vec<Preload> {
                 .or_else(|| entry.strip_prefix(b"LD_AUDIT="))
         })
         .flat_map(|value| {
-            String::from_utf8_lossy(value)
-                .split([':', ' '])
+            readable(value, b": ")
                 .filter(|library| !library.is_empty())
                 .filter_map(|library| match library.strip_prefix('/') {
                     Some(path) => normalize(path).map(Preload::Path),
@@ -219,6 +248,17 @@ pub(super) fn preloaded(environment: Option<&[u8]>) -> Vec<Preload> {
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// The entries of a loader variable's `value`, split at any of
+/// `separators`, without those that are not UTF-8: read lossily, each
+/// would name another file. The linker loads the rest all the same, so
+/// they are still checked (see `process::loader_not_utf8`, which tells of
+/// the rest).
+fn readable<'a>(value: &'a [u8], separators: &'a [u8]) -> impl Iterator<Item = &'a str> {
+    value
+        .split(|byte| separators.contains(byte))
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
 }
 
 /// The directories of a process's `LD_LIBRARY_PATH`, relative to `/`;
@@ -234,8 +274,7 @@ pub(super) fn searched(environment: Option<&[u8]>) -> Vec<Option<String>> {
         .split(|byte| *byte == 0)
         .filter_map(|entry| entry.strip_prefix(b"LD_LIBRARY_PATH="))
         .flat_map(|value| {
-            String::from_utf8_lossy(value)
-                .split([':', ';'])
+            readable(value, b":;")
                 .filter(|directory| !directory.is_empty() && *directory != "/")
                 // The linker's own tokens stand for where the program or
                 // its libraries are; with `..` they lead anywhere.

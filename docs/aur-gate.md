@@ -70,7 +70,10 @@ requests, for the local rules, unless they run a command.
 ### Step 3: Sources
 
 This step and the next are skipped for a call that only prints information
-(`--packagelist`, `--printsrcinfo`, `--version`, `--help`). Generating
+(`--packagelist`, `--printsrcinfo`, `--version`, `--help`). makepkg still
+loads the PKGBUILD for one, outside the sandbox, so its top-level code runs:
+only once the recipe is reviewed, and only when it is still the text that
+was reviewed (step 4 holds every call to that). Generating
 checksums (`-g`) downloads the sources, so it is covered. Only now, with the
 recipe reviewed, the gate has makepkg list the sources in a sandbox (described
 under step 4), reads the recipe's text for how it arrives at them, and asks if
@@ -99,10 +102,16 @@ functions; the fetch only when the call extracts the sources:
   yours to write to: the recipe's directory is read-only. makepkg's build and
   download directories are given names made up for the run, and a recipe that
   has changed either by the end of it is refused. What the recipe prints while
-  it loads is kept out of the listing, and a listing that is not shaped as
-  makepkg prints one (text before its first line, a second package base, a
-  line of another form) is refused. Sources are read from the package base's
-  section only. The listing run is not given your proxy settings; the fetch is.
+  it loads is kept out of the listing, though a recipe written to do so can
+  still write to makepkg's own output (a descriptor it inherits, such as fd
+  10). Unless the recipe redefines the makepkg functions that print the
+  listing (which is reported as not followed, and asked about), makepkg's own
+  lines are in that output too, so what a recipe writes there can add to the
+  listing but not replace it. A listing that is not shaped as makepkg prints
+  one is refused: text before its first line, a second package base (also one
+  glued inside a line), a package named twice, sources or checksums in a
+  package's section, a line of another form. Sources are read from the
+  package base's section only. The listing run is not given your proxy settings; the fetch is.
 - *Fetching them.* The PKGBUILD does not run here at all. makepkg is given a
   recipe Guardian writes from that listing: the sources, their checksums, what
   not to extract and the signing keys, each as quoted text, and no code. It

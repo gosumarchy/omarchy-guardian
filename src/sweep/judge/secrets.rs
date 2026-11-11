@@ -2,6 +2,8 @@
 //! variables that hold a credential, the passwords in URLs, and GRUB's
 //! password hashes.
 
+use super::variables::loads_code;
+
 /// Names that hold a secret: an assignment to one has its value taken out
 /// before the file is reviewed.
 const SECRET_NAMES: &[&str] = &[
@@ -249,14 +251,23 @@ pub(super) fn without_url_passwords(line: &str) -> String {
     out
 }
 
+/// Whether an assignment to `name` may have its value taken out: the name
+/// says secret, and it loads nothing. `GIT_CONFIG_KEY_0` has `KEY` in it
+/// and `RESTIC_PASSWORD_COMMAND` has `PASSWORD`, but their values name a
+/// git setting and a command, which taken out would hide what runs from
+/// the local rules and the AI alike.
+fn hides_a_secret(name: &str) -> bool {
+    is_secret_name(name) && !loads_code(name)
+}
+
 fn redact_line(line: &str) -> Option<String> {
     // fish, and the UEFI shell: `set [-flags] NAME value`.
     let words: Vec<&str> = line.split_whitespace().collect();
     if words.first().is_some_and(|command| is_set(command))
         && let Some(name_at) = words.iter().skip(1).position(|word| !word.starts_with('-'))
         && let (Some(name), Some(value)) = (words.get(name_at + 1), words.get(name_at + 2))
-        && is_secret_name(name)
-        && is_literal_secret(value.trim_matches(['"', '\'']))
+        && hides_a_secret(name)
+        && is_literal_secret(unquoted(value))
         && words.len() == name_at + 3
     {
         // Cut where the value stands: a `replacen` would take the first
@@ -303,25 +314,38 @@ fn redact_line(line: &str) -> Option<String> {
                 None,
             ),
         };
+        let closed = quote.is_none_or(|quote| after[1..].contains(quote));
+        // Where the value ends in `after`, with the quotes around it.
+        let value_end = match quote {
+            Some(_) if closed => value.len() + 2,
+            Some(_) => value.len() + 1,
+            None => value.len(),
+        };
         out.push_str(before);
         out.push('=');
         out.push_str(padding);
-        let closed = quote.is_none_or(|quote| after[1..].contains(quote));
         // Quoted or not, only a value of plain characters goes: no blank,
         // no `;`, `|` or `&`. This reads one line at a time and cannot tell
         // a quote that opens a value from one that closes an earlier
         // string, so a value that could hold a command is never taken out.
-        if is_secret_name(name) && is_literal_secret(value) && closed {
+        if hides_a_secret(name) && is_literal_secret(value) && closed {
             changed = true;
             if let Some(quote) = quote {
                 out.push(quote);
                 out.push_str(REDACTED);
                 out.push(quote);
-                rest = &after[value.len() + 2..];
             } else {
                 out.push_str(REDACTED);
-                rest = &after[value.len()..];
             }
+            rest = &after[value_end..];
+        } else if loads_code(name) {
+            // The value of a variable that loads code, as far as this line
+            // and its quote go, is read as it is: an assignment inside it
+            // (`GIT_SSH_COMMAND="ssh -oSecurityKeyProvider=lib.so"`) is part
+            // of what runs.
+            let (whole, after_value) = after.split_at(value_end);
+            out.push_str(whole);
+            rest = after_value;
         } else {
             rest = after;
         }
@@ -349,7 +373,7 @@ pub(in crate::sweep) fn is_secret_name(name: &str) -> bool {
 }
 
 /// The parts of a name, in upper case (see `is_secret_name`).
-fn name_parts(name: &str) -> Vec<String> {
+pub(super) fn name_parts(name: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut previous_lower = false;
@@ -374,12 +398,33 @@ const SECRET_ENDINGS: &[&str] = &["PASSWORD", "PASSWD", "SECRET", "TOKEN", "APIK
 
 /// Whether `value` is a literal long enough to be a secret: no expansion,
 /// no command, and nothing that says where something is (a path, a URL,
-/// a relative file): those are what a review needs to see.
+/// a relative file): those are what a review needs to see. A `/` alone
+/// says no place: base64 keys have it (most AWS secret keys do) and stay
+/// hidden; with a `.` beside it (`plugins/evil.so`, `token:/etc/x.sock`),
+/// which base64 never holds, the value names a file and is sent. A bare
+/// `bin/helper` is still taken out, the accepted limit of a value a later
+/// line runs (`TOKEN=x; $TOKEN`). A value marked as a command (`cmd:…`,
+/// `exec:…`, as some editor plugins read an API key) is sent as well.
 fn is_literal_secret(value: &str) -> bool {
     value.len() >= 8
         && !value.starts_with(['/', '~', '$', '-', '.'])
         && !value.contains("://")
+        && (!value.contains('/') || !value.contains('.'))
+        && !["cmd:", "exec:"].iter().any(|mark| {
+            value
+                .get(..mark.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(mark))
+        })
         && value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "_-./+=:@%,".contains(c))
+}
+
+/// `word` without the quotes around it, where they match (`'abc'`); a word
+/// with an unclosed quote (`'abc`) is kept as it is, and is no literal.
+fn unquoted(word: &str) -> &str {
+    ['"', '\'']
+        .iter()
+        .find_map(|&quote| word.strip_prefix(quote)?.strip_suffix(quote))
+        .unwrap_or(word)
 }

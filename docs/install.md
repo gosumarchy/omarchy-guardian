@@ -140,7 +140,23 @@ nothing.
 
 The upgrade check relies on the installed Guardian and its key list (protected
 by root ownership and by the pacman gate), on `git`, `ssh-keygen` and `tar`
-from the system, and on the release key itself. What it cannot know: a
+from the system, on the release key itself, and on your session and build
+tools: it runs as you and builds with your Rust toolchain, your cargo and
+makepkg configuration, and `sudo` and `pacman` from your `PATH`. It starts
+again with only the variables those steps need (your home, user and login
+names, `PATH`, terminal, locale, display, the user bus, the XDG directories,
+`CARGO_HOME`, `RUSTUP_HOME`, `TMPDIR`, proxy and certificate settings, where
+the AI reviewer is reached and its login and provider settings
+(`ANTHROPIC_*`, `CLAUDE_CODE_USE_*`, `AWS_*`, `GOOGLE_*`, `AZURE_*`,
+`*_API_KEY`), and `OMARCHY_GUARDIAN_ALLOW_SNAPSHOT_BOOT`; the full list is
+`KEPT_VARIABLES` and `is_kept` at the top of `integrations/upgrade.sh`, and a
+locale that names a path is dropped), so a stray
+`BASH_ENV`, exported shell function, `TAR_OPTIONS`, `GIT_*` setting or
+`LD_PRELOAD` does not change what is verified or built. The kept `PATH`, home
+and toolchain variables still choose which build tools run. Run the script as
+a command, not through `bash`: its first line (`bash -p`) is what keeps the
+shell from reading `BASH_ENV` before the check. A program running as you is
+not kept out by any of this. What it cannot know: a
 release newer than the newest tag your checkout has (someone who controls
 where you pull from can withhold a release, though not forge one), and whether
 a first install was genuine.

@@ -1,5 +1,7 @@
 //! Tests of the root part of the sweep.
 
+use std::collections::HashSet;
+
 #[test]
 fn more_accounts_than_are_looked_at_is_said() {
     use super::{MAX_ACCOUNTS, accounts_left_out};
@@ -200,7 +202,7 @@ fn root_reports_on_each_home_as_its_account_could_look_itself() {
     let passwd = format!(
         "root:x:0:0::/root:/bin/bash\nu:x:{uid}:{uid}::/home/u:/bin/bash\nv:x:{uid}:{uid}::/home/v:/bin/bash\nw:x:{uid}:{uid}::/home/w:/bin/bash\nx:x:{uid}:{uid}::/home/x:/bin/bash\nsvc:x:{uid}:{uid}::/srv/svc:/bin/bash\n"
     );
-    let index = crate::sweep::index::PackageIndex::with_foreign(std::collections::HashSet::new());
+    let index = crate::sweep::index::PackageIndex::with_foreign(HashSet::new());
     let scope = crate::sweep::collect::Scope {
         root,
         home: Some("root"),
@@ -219,7 +221,7 @@ fn root_reports_on_each_home_as_its_account_could_look_itself() {
         paths[0],
         "home/u/.config/systemd/user/omarchy-guardian-sweep.service.d/x.conf"
     );
-    assert_eq!(items[0].alerts[0].0, crate::rules::RuleId::GuardianOverride);
+    assert_eq!(items[0].alerts[0].0, RuleId::GuardianOverride);
     assert!(paths[1].starts_with("home/u/.ssh/authorized_keys#"));
     // Another account's: how many keys, and nothing of its units.
     assert_eq!(paths[2], "home/v/.ssh/authorized_keys#keys");
@@ -231,6 +233,7 @@ fn root_reports_on_each_home_as_its_account_could_look_itself() {
 
 use super::{from_json, merge, to_json};
 use crate::autorun::Category;
+use crate::rules::RuleId;
 use crate::sha256::Sha256;
 use crate::sweep::collect::{Body, Collection, Item, Origin};
 use crate::sweep::tier::Tier;
@@ -286,9 +289,18 @@ fn items_round_trip_and_trusted_ones_stay_behind() {
     collection.items[0].run_by = None;
     collection.items[1]
         .alerts
-        .push((crate::rules::RuleId::HiddenProgram, "seen".into()));
+        .push((RuleId::HiddenProgram, "seen".into()));
     let noted = vec!["the kernel is tainted (flags 4096)".to_string()];
-    let part = from_json(&to_json(&collection, &noted, None).to_string()).unwrap();
+    let part = from_json(
+        &to_json(
+            &collection,
+            &super::in_keeping_order(&collection, &HashSet::new(), &HashSet::new()),
+            &noted,
+            None,
+        )
+        .to_string(),
+    )
+    .unwrap();
     assert_eq!(part.notes, noted);
     assert_eq!(part.items, collection.items[..2]);
     assert_eq!(
@@ -309,15 +321,22 @@ fn facts_that_are_no_files_travel_like_any_item() {
     );
     fact.category = Category::Account;
     fact.run_by = None;
-    fact.alerts.push((
-        crate::rules::RuleId::PrivilegedAccount,
-        "toor has user id 0".into(),
-    ));
+    fact.alerts
+        .push((RuleId::PrivilegedAccount, "toor has user id 0".into()));
     let collection = Collection {
         items: vec![fact],
         ..Collection::default()
     };
-    let part = from_json(&to_json(&collection, &[], None).to_string()).unwrap();
+    let part = from_json(
+        &to_json(
+            &collection,
+            &super::in_keeping_order(&collection, &HashSet::new(), &HashSet::new()),
+            &[],
+            None,
+        )
+        .to_string(),
+    )
+    .unwrap();
     assert_eq!(part.items, collection.items);
 }
 
@@ -359,7 +378,7 @@ fn what_root_reached_by_following_keeps_only_its_hash() {
     std::fs::create_dir_all(root.join("etc")).unwrap();
     std::fs::write(root.join("etc/shadow"), "root:$6$hash:\n").unwrap();
     std::fs::write(root.join("var/spool/cron/u"), "* * * * * /etc/shadow\n").unwrap();
-    let index = crate::sweep::index::PackageIndex::with_foreign(std::collections::HashSet::new());
+    let index = crate::sweep::index::PackageIndex::with_foreign(HashSet::new());
     let scope = crate::sweep::collect::Scope {
         root,
         home: Some("root"),
@@ -414,9 +433,7 @@ fn root_findings_replace_what_the_user_could_not_judge() {
         Tier::Unknown,
         Body::Unreadable("runs only in memory".into()),
     );
-    memory
-        .alerts
-        .push((crate::rules::RuleId::HiddenProgram, "seen".into()));
+    memory.alerts.push((RuleId::HiddenProgram, "seen".into()));
     collection.items.push(memory);
     let root = item(
         "etc/sudoers.d/evil",
@@ -445,6 +462,314 @@ fn root_findings_replace_what_the_user_could_not_judge() {
             "memfd:payload"
         ]
     );
+}
+
+#[test]
+fn an_accounts_units_that_turn_the_sweep_off_come_first_but_crowd_out_nothing() {
+    // More drop-ins standing in for the sweep's unit than the results
+    // hold, in one home; root's unit after them.
+    let override_item = |path: String| {
+        let mut unit = item(
+            &path,
+            Origin::Root,
+            Tier::Unknown,
+            Body::Text("[Service]".into()),
+        );
+        unit.run_by = None;
+        unit.alerts
+            .push((RuleId::GuardianOverride, "stands in for the sweep".into()));
+        unit
+    };
+    let mut items: Vec<Item> = (0..super::MAX_ITEMS + 10)
+        .map(|index| {
+            override_item(format!(
+                "home/u/.config/systemd/user/omarchy-guardian-sweep.service.d/{index:05}.conf"
+            ))
+        })
+        .collect();
+    // Another home, and a runtime directory, with more than are kept
+    // first of each.
+    let drop_ins = |directory: &str| -> Vec<Item> {
+        (0..super::MAX_OVERRIDES_OF_AN_ACCOUNT + 4)
+            .map(|index| {
+                override_item(format!(
+                    "{directory}/omarchy-guardian-sweep.service.d/{index:02}.conf"
+                ))
+            })
+            .collect()
+    };
+    items.extend(drop_ins("home/v/.config/systemd/user"));
+    items.extend(drop_ins("run/user/1000/systemd/user"));
+    let mut own = item(
+        "etc/systemd/system/x.service",
+        Origin::Root,
+        Tier::Unknown,
+        Body::Text("x".into()),
+    );
+    own.run_by = None;
+    items.push(own);
+    let collection = Collection {
+        items,
+        ..Collection::default()
+    };
+    let part = from_json(
+        &to_json(
+            &collection,
+            &super::in_keeping_order(&collection, &HashSet::new(), &HashSet::new()),
+            &[],
+            None,
+        )
+        .to_string(),
+    )
+    .unwrap();
+    let first = super::MAX_OVERRIDES_OF_AN_ACCOUNT;
+    // The first of each home's and of the runtime directory's, then
+    // root's, then the rest.
+    let places = |items: &[Item]| {
+        items
+            .iter()
+            .map(|item| item.path.split('/').take(3).collect::<Vec<_>>().join("/"))
+            .collect::<Vec<_>>()
+    };
+    let mut expected = vec!["home/u/.config".to_string(); first];
+    expected.extend(vec!["home/v/.config".to_string(); first]);
+    expected.extend(vec!["run/user/1000".to_string(); first]);
+    assert_eq!(places(&part.items[..3 * first]), expected);
+    assert_eq!(part.items[3 * first].path, "etc/systemd/system/x.service");
+    assert!(
+        part.items[3 * first + 1..]
+            .iter()
+            .all(|item| item.path.starts_with("home/u/"))
+    );
+}
+
+/// An item a live check found, of `category`.
+fn live(path: &str, category: Category) -> Item {
+    let mut found = item(path, Origin::Root, Tier::Unknown, Body::Text("x".into()));
+    found.category = category;
+    found.run_by = None;
+    found
+}
+
+#[test]
+fn the_live_checks_hand_root_at_most_so_many_items_of_a_kind_that_accounts_made() {
+    let limit = super::MAX_LIVE_OF_A_KIND;
+    let made_by = |count: usize| -> (Vec<Item>, HashSet<String>) {
+        let items: Vec<Item> = (0..count)
+            .map(|index| live(&format!("dev/shm/a{index:03}"), Category::Process))
+            .collect();
+        let made = items.iter().map(|item| item.path.clone()).collect();
+        (items, made)
+    };
+    // Exactly as many as are kept: nothing left out, nothing said.
+    let (items, made) = made_by(limit);
+    let mut truncated = Vec::new();
+    assert_eq!(
+        super::within_kind_limit(items, &made, &mut truncated).len(),
+        limit
+    );
+    assert_eq!(truncated, Vec::<String>::new());
+    // One more, and root's own of the same kind on top: all of root's stay.
+    let (mut items, made) = made_by(limit + 1);
+    items.extend((0..limit + 5).map(|pid| live(&format!("proc/{pid}"), Category::Process)));
+    items.push(live("usr/bin/x:tcp-4444", Category::Listener));
+    let kept = super::within_kind_limit(items, &made, &mut truncated);
+    assert_eq!(kept.len(), limit + limit + 5 + 1);
+    assert!(
+        kept.iter()
+            .all(|item| item.path != format!("dev/shm/a{limit:03}"))
+    );
+    assert_eq!(truncated.len(), 1, "{truncated:?}");
+    assert!(
+        truncated[0].starts_with(&format!("the live checks found {} items in", limit + 1)),
+        "{truncated:?}"
+    );
+}
+
+#[test]
+fn what_accounts_make_at_will_does_not_crowd_out_roots_live_items() {
+    // Programs run from `/dev/shm` sort before `proc/`, `memfd:` and
+    // `usr/`, and each set-id file in a home before `usr/local/bin`; more
+    // of them than the results hold, made by one account.
+    let mut collection = Collection {
+        items: vec![live("etc/systemd/system/x.service", Category::Systemd)],
+        ..Collection::default()
+    };
+    let mut items: Vec<Item> = (0..super::MAX_ITEMS + 10)
+        .map(|index| live(&format!("dev/shm/a{index:05}"), Category::Process))
+        .collect();
+    items.extend((0..300).map(|index| live(&format!("home/u/f{index:03}"), Category::Setuid)));
+    let made: HashSet<String> = items
+        .iter()
+        .filter(|item| item.category != Category::Systemd)
+        .map(|item| item.path.clone())
+        .collect();
+    let roots = [
+        ("proc/1", Category::Process),
+        ("proc", Category::Process),
+        ("memfd:payload", Category::Process),
+        ("usr/bin/x:tcp-4444", Category::Listener),
+        ("usr/local/bin/planted", Category::Setuid),
+    ];
+    items.extend(roots.iter().map(|(path, category)| live(path, *category)));
+    let mut truncated = Vec::new();
+    let items = super::within_kind_limit(items, &made, &mut truncated);
+    crate::sweep::collect::merge(&mut collection, items);
+    let part = from_json(
+        &to_json(
+            &collection,
+            &super::in_keeping_order(&collection, &made, &HashSet::new()),
+            &[],
+            None,
+        )
+        .to_string(),
+    )
+    .unwrap();
+    let paths: Vec<&str> = part.items.iter().map(|item| item.path.as_str()).collect();
+    assert_eq!(
+        paths[..6],
+        [
+            "etc/systemd/system/x.service",
+            "memfd:payload",
+            "proc",
+            "proc/1",
+            "usr/bin/x:tcp-4444",
+            "usr/local/bin/planted",
+        ]
+    );
+    // Of what the account made, at most so many of a kind.
+    for place in ["dev/shm/", "home/u/"] {
+        let kept = paths.iter().filter(|path| path.starts_with(place)).count();
+        assert_eq!(kept, super::MAX_LIVE_OF_A_KIND, "{place}");
+    }
+}
+
+#[test]
+fn a_flood_from_an_accounts_crontab_or_at_jobs_leaves_roots_in() {
+    // A crontab and an `at` job of an account each name more files in
+    // `/dev/shm` than the results hold, ahead of `etc/` by path; one of
+    // those files names more. Root's crontab and `at` job name one each.
+    let found = |path: &str, by: Option<&str>| {
+        let mut found = item(path, Origin::Root, Tier::Unknown, Body::Text("x".into()));
+        found.category = Category::Cron;
+        found.run_by = by.map(str::to_string);
+        found
+    };
+    let mut items = vec![
+        found("var/spool/cron/u", None),
+        found("var/spool/atd/a0001", None),
+        found("var/spool/cron/root", None),
+        found("var/spool/atd/a0002", None),
+        found("etc/cron.d/x", None),
+        found("dev/shm/by-root", Some("var/spool/cron/root")),
+        found("dev/shm/by-roots-job", Some("var/spool/atd/a0002")),
+        // The account names it first; root's crontab too.
+        found("dev/shm/both", Some("var/spool/cron/u")),
+        found("dev/shm/deeper", Some("dev/shm/f00000")),
+        // Root's crontab runs a script in the account's home, which names
+        // what it likes.
+        found("home/u/script", Some("var/spool/cron/root")),
+        found("dev/shm/from-home", Some("home/u/script")),
+    ];
+    for index in 0..super::MAX_ITEMS + 10 {
+        items.push(found(
+            &format!("dev/shm/f{index:05}"),
+            Some("var/spool/cron/u"),
+        ));
+        items.push(found(
+            &format!("dev/shm/j{index:05}"),
+            Some("var/spool/atd/a0001"),
+        ));
+    }
+    items.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut collection = Collection {
+        items,
+        ..Collection::default()
+    };
+    collection.runners.insert(
+        "dev/shm/both".into(),
+        vec!["var/spool/cron/u".into(), "var/spool/cron/root".into()],
+    );
+    let made = super::made_by_accounts(&collection, HashSet::new(), &|job| {
+        Some(if job == "var/spool/atd/a0002" {
+            0
+        } else {
+            1000
+        })
+    });
+    assert_eq!(made, HashSet::from(["var/spool/atd/a0001".to_string()]));
+    let kept = super::in_keeping_order(&collection, &made, &HashSet::new());
+    let mut roots: Vec<&str> = kept.roots.iter().copied().collect();
+    roots.sort_unstable();
+    // Root's crontab leads to `dev/shm/both` only through the runners: its
+    // `run_by` is the account's crontab, which reached it first.
+    assert_eq!(
+        roots,
+        [
+            "dev/shm/both",
+            "dev/shm/by-root",
+            "dev/shm/by-roots-job",
+            "etc/cron.d/x",
+            "home/u/script",
+            "var/spool/atd/a0002",
+            "var/spool/cron/root",
+        ]
+    );
+    let part = from_json(&to_json(&collection, &kept, &[], None).to_string()).unwrap();
+    let mut first: Vec<&str> = part.items[..7]
+        .iter()
+        .map(|item| item.path.as_str())
+        .collect();
+    first.sort_unstable();
+    assert_eq!(
+        first,
+        [
+            "dev/shm/both",
+            "dev/shm/by-root",
+            "dev/shm/by-roots-job",
+            "etc/cron.d/x",
+            "home/u/script",
+            "var/spool/atd/a0002",
+            "var/spool/cron/root",
+        ]
+    );
+}
+
+#[test]
+fn what_the_live_checks_found_only_through_an_account_is_the_accounts_unless_collected() {
+    let collection = Collection {
+        items: vec![live("usr/local/bin/tool", Category::LocalBin)],
+        ..Collection::default()
+    };
+    let live = HashSet::from([
+        "usr/local/bin/tool".to_string(),
+        "usr/bin/python3:tcp-8000".to_string(),
+    ]);
+    let made = super::made_by_accounts(&collection, live, &|_| Some(0));
+    assert_eq!(
+        made,
+        HashSet::from(["usr/bin/python3:tcp-8000".to_string()])
+    );
+}
+
+#[test]
+fn an_accounts_runtime_directory_and_what_names_a_file_at_home_are_the_accounts() {
+    let mut served = live("opt/served:tcp-8000", Category::Listener);
+    served.file = Some("home/u/served".into());
+    let collection = Collection {
+        items: vec![
+            served,
+            live("run/user/1000/x", Category::Process),
+            live("zz/root", Category::Process),
+        ],
+        ..Collection::default()
+    };
+    let order: Vec<&str> = super::in_keeping_order(&collection, &HashSet::new(), &HashSet::new())
+        .items
+        .iter()
+        .map(|item| item.path.as_str())
+        .collect();
+    assert_eq!(order, ["zz/root", "opt/served:tcp-8000", "run/user/1000/x"]);
 }
 
 #[test]
@@ -482,7 +807,16 @@ fn an_accounts_flood_of_items_leaves_roots_and_the_systems_in() {
         items,
         ..Collection::default()
     };
-    let part = from_json(&to_json(&collection, &[], None).to_string()).unwrap();
+    let part = from_json(
+        &to_json(
+            &collection,
+            &super::in_keeping_order(&collection, &HashSet::new(), &HashSet::new()),
+            &[],
+            None,
+        )
+        .to_string(),
+    )
+    .unwrap();
     assert_eq!(part.items.len(), super::MAX_ITEMS);
     assert_eq!(part.items[0].path, "root/.ssh/authorized_keys#aa");
     assert_eq!(part.items[1].path, "var/spool/cron/root");
@@ -497,7 +831,11 @@ fn an_accounts_flood_of_items_leaves_roots_and_the_systems_in() {
         part.truncated
     );
     // The collector's record keeps the same order.
-    let (_, seen) = super::news(&collection.items, None, 1);
+    let (_, seen) = super::news(
+        &super::in_keeping_order(&collection, &HashSet::new(), &HashSet::new()).items,
+        None,
+        1,
+    );
     assert!(seen.contains_key("root/.ssh/authorized_keys#aa"));
 }
 
@@ -524,7 +862,7 @@ fn the_collector_tells_what_is_new_from_its_own_record() {
     let hour = 60 * 60;
     // The first look remembers everything and has no list of what is
     // new: the sweep that reads the results goes by its own memory.
-    let (new, seen) = super::news(&[key("a", "one"), unit.clone()], None, 1000);
+    let (new, seen) = super::news(&[&key("a", "one"), &unit], None, 1000);
     assert_eq!(new, None);
     assert_eq!(
         seen.keys().collect::<Vec<_>>(),
@@ -535,7 +873,8 @@ fn the_collector_tells_what_is_new_from_its_own_record() {
     // remember.
     let items = [key("a", "other"), key("b", "two"), unit];
     let news = |items: &[Item], seen, now| {
-        let (new, seen) = super::news(items, Some(seen), now);
+        let kept: Vec<&Item> = items.iter().collect();
+        let (new, seen) = super::news(&kept, Some(seen), now);
         (new.unwrap(), seen)
     };
     let (new, seen) = news(&items, seen, 2000);
@@ -559,11 +898,29 @@ fn the_collector_tells_what_is_new_from_its_own_record() {
         items: items.to_vec(),
         ..Collection::default()
     };
-    let part = from_json(&to_json(&collection, &[], Some(&new)).to_string()).unwrap();
+    let part = from_json(
+        &to_json(
+            &collection,
+            &super::in_keeping_order(&collection, &HashSet::new(), &HashSet::new()),
+            &[],
+            Some(&new),
+        )
+        .to_string(),
+    )
+    .unwrap();
     assert_eq!(part.news, Some(new));
     // Without a record the results carry none, and the reader's own
     // memory stands in.
-    let untracked = from_json(&to_json(&collection, &[], None).to_string()).unwrap();
+    let untracked = from_json(
+        &to_json(
+            &collection,
+            &super::in_keeping_order(&collection, &HashSet::new(), &HashSet::new()),
+            &[],
+            None,
+        )
+        .to_string(),
+    )
+    .unwrap();
     assert_eq!(untracked.news, None);
     let mut merged = Collection::default();
     merge(&mut merged, part);
@@ -622,7 +979,17 @@ fn missing_or_stale_results_are_not_used() {
         ..Collection::default()
     };
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, to_json(&collection, &[], None).to_string()).unwrap();
+    std::fs::write(
+        &path,
+        to_json(
+            &collection,
+            &super::in_keeping_order(&collection, &HashSet::new(), &HashSet::new()),
+            &[],
+            None,
+        )
+        .to_string(),
+    )
+    .unwrap();
     let metadata = std::fs::metadata(&path).unwrap();
     let written = u64::try_from(metadata.mtime()).unwrap();
     let two_days_later = written + 48 * 60 * 60;
@@ -668,5 +1035,436 @@ fn what_runs_each_of_roots_items_is_kept_as_its_runner() {
     assert_eq!(
         collection.runners["home/u/bin/tool"],
         ["etc/systemd/system/a.service", "home/u/.bashrc"]
+    );
+}
+
+#[test]
+fn the_accounts_items_carry_only_so_much_and_roots_all_of_theirs() {
+    let file = |path: &str, size: usize| {
+        let mut file = live(path, Category::Autostart);
+        // Half in what an alert saw, which counts as much as the text.
+        file.body = Body::Text("x".repeat(size / 2));
+        file.alerts = vec![(RuleId::GuardianOverride, "x".repeat(size / 2))];
+        file
+    };
+    let kib = 1024;
+    let autostart = "home/u/.config/autostart";
+    // Names as long as a path can be, of characters the JSON writes as six
+    // bytes each.
+    let long = |index: usize| format!("{autostart}/{}{index}", "\u{1}".repeat(4000));
+    let mut items = vec![
+        file("etc/cron.d/big", 1536 * kib),
+        file(&format!("{autostart}/a1"), 600 * kib),
+        file(&format!("{autostart}/a2"), 600 * kib),
+        file(&format!("{autostart}/a3"), 10),
+    ];
+    items.extend((0..100).map(|index| file(&long(index), 10)));
+    items.push(file(&format!("etc/{}", "\u{1}".repeat(4000)), 10));
+    let collection = Collection {
+        items,
+        ..Collection::default()
+    };
+    let kept = super::in_keeping_order(&collection, &HashSet::new(), &HashSet::new());
+    let json = to_json(&collection, &kept, &[], None).to_string();
+    let part = from_json(&json).unwrap();
+    let find = |path: &str| part.items.iter().find(|item| item.path == path);
+    // Root's whole; the accounts' whole while they fit, then cut down to
+    // their name and alerts while those fit, then left out and counted.
+    for whole in [
+        "etc/cron.d/big".to_string(),
+        format!("{autostart}/a1"),
+        format!("{autostart}/a3"),
+    ] {
+        let item = find(&whole).unwrap();
+        assert!(matches!(item.body, Body::Text(_)), "{whole}");
+        assert_eq!(item.runs.len(), 1, "{whole}");
+    }
+    // In keeping order, so the long names go whole, then cut, then not at
+    // all.
+    let shapes: Vec<&str> = std::iter::once(format!("{autostart}/a2"))
+        .chain((0..100).map(long))
+        .map(|path| match find(&path).map(|item| &item.body) {
+            Some(Body::Text(_)) => "whole",
+            Some(_) => {
+                let item = find(&path).unwrap();
+                assert_eq!(item.body, Body::Oversized);
+                assert!(item.runs.is_empty());
+                assert_eq!(item.notes.len(), 1);
+                assert!(item.notes[0].starts_with("its content and notes were left out"));
+                assert_eq!(item.alerts.len(), 1);
+                assert_eq!(item.alerts[0].0, RuleId::GuardianOverride);
+                assert_eq!(item.alerts[0].1, item.notes[0]);
+                "cut"
+            }
+            None => "left out",
+        })
+        .collect();
+    assert_eq!(shapes[0], "cut");
+    let mut runs = shapes[1..].to_vec();
+    runs.dedup();
+    assert_eq!(runs, ["whole", "cut", "left out"]);
+    let left_out = shapes.iter().filter(|shape| **shape == "left out").count();
+    assert!(
+        part.truncated.contains(&format!(
+            "{left_out} item(s) accounts made were left out: root's results carry at most \
+             2 MiB of those"
+        )),
+        "{:?}",
+        part.truncated
+    );
+    assert!(find(&format!("etc/{}", "\u{1}".repeat(4000))).is_some());
+    // What the accounts' items take stays within the bound: root's two
+    // items are about 1.5 MiB and 24 KiB.
+    assert!(json.len() < 4 * 1024 * 1024, "{}", json.len());
+}
+
+#[test]
+fn a_program_root_runs_from_an_accounts_home_is_roots_whatever_the_account_floods() {
+    let autostart = |index: usize| {
+        // Names long enough that cut down they still pass the bound.
+        let name = format!("home/u/.config/autostart/{}{index:03}", "a".repeat(4000));
+        let mut file = live(&name, Category::Autostart);
+        file.body = Body::Text("x".repeat(10 * 1024));
+        file
+    };
+    let mut items: Vec<Item> = (0..600).map(autostart).collect();
+    items.push(live("home/u/evil", Category::Process));
+    let collection = Collection {
+        items,
+        ..Collection::default()
+    };
+    let live_roots = HashSet::from(["home/u/evil".to_string()]);
+    let kept = super::in_keeping_order(&collection, &HashSet::new(), &live_roots);
+    let part = from_json(&to_json(&collection, &kept, &[], None).to_string()).unwrap();
+    assert_eq!(part.items[0].path, "home/u/evil");
+    assert_eq!(part.items[0].body, Body::Text("x".into()));
+    // The account's own were too many to carry.
+    assert!(
+        part.truncated
+            .iter()
+            .any(|sentence| sentence.contains("item(s) accounts made were left out")),
+        "{:?}",
+        part.truncated
+    );
+}
+
+#[test]
+fn what_the_users_live_checks_left_unread_for_their_limit_stays_unless_root_has_it() {
+    let limit = || {
+        let mut unread = item(
+            "tmp/listener",
+            Origin::System,
+            Tier::Unknown,
+            Body::Unreadable(crate::sweep::live::NOT_READ_PAST_LIMIT.into()),
+        );
+        unread.sha256 = None;
+        unread
+    };
+    let root_only = item(
+        "etc/x",
+        Origin::System,
+        Tier::Unknown,
+        Body::Unreadable("permission denied".into()),
+    );
+    let merged = |part: super::RootPart| {
+        let mut collection = Collection {
+            items: vec![limit(), root_only.clone()],
+            ..Collection::default()
+        };
+        merge(&mut collection, part);
+        collection
+            .items
+            .iter()
+            .map(|item| (item.path.clone(), matches!(item.body, Body::Unreadable(_))))
+            .collect::<Vec<_>>()
+    };
+    // Root never saw it: it stays, unread; what only root can read goes.
+    assert_eq!(
+        merged(super::RootPart::default()),
+        [("tmp/listener".to_string(), true)]
+    );
+    // Root has it: root's stands, whatever alerts the user's has.
+    let read = item(
+        "tmp/listener",
+        Origin::Root,
+        Tier::Unknown,
+        Body::Text("x".into()),
+    );
+    for alerted in [false, true] {
+        let mut collection = Collection {
+            items: vec![limit()],
+            ..Collection::default()
+        };
+        if alerted {
+            collection.items[0]
+                .alerts
+                .push((RuleId::UnknownPrivilegedFile, "not read".into()));
+        }
+        merge(
+            &mut collection,
+            super::RootPart {
+                items: vec![read.clone()],
+                ..super::RootPart::default()
+            },
+        );
+        let bodies: Vec<bool> = collection
+            .items
+            .iter()
+            .map(|item| matches!(item.body, Body::Unreadable(_)))
+            .collect();
+        assert_eq!(bodies, [false], "alerted: {alerted}");
+    }
+}
+
+#[test]
+fn an_accounts_overrides_that_share_a_path_are_both_kept() {
+    let path = "home/u/.config/systemd/user/omarchy-guardian-sweep.service.d/\\xff.conf";
+    let override_of = |body| Item {
+        category: Category::Systemd,
+        run_by: None,
+        ..item(path, Origin::Root, Tier::Unknown, body)
+    };
+    let read = override_of(Body::Text("ExecStart=\n".into()));
+    let not_read = override_of(Body::Unreadable("its name is not UTF-8".into()));
+    let key = "home/u/.ssh/authorized_keys#keys";
+    let mut collection = Collection {
+        items: vec![item(
+            key,
+            Origin::User,
+            Tier::Unknown,
+            Body::Text("k".into()),
+        )],
+        ..Collection::default()
+    };
+    super::add_accounts_items(
+        &mut collection,
+        vec![
+            read,
+            not_read,
+            item(key, Origin::Root, Tier::Unknown, Body::Text("k".into())),
+        ],
+    );
+    let at_path: Vec<&Body> = collection
+        .items
+        .iter()
+        .filter(|item| item.path == path)
+        .map(|item| &item.body)
+        .collect();
+    assert_eq!(at_path.len(), 2, "{:?}", collection.items);
+    assert!(matches!(at_path[1], Body::Unreadable(_)));
+    // A key file is merged into the one already there.
+    assert_eq!(
+        collection
+            .items
+            .iter()
+            .filter(|item| item.path == key)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn an_accounts_overrides_that_share_a_path_both_reach_the_users_sweep() {
+    let path = "home/u/.config/systemd/user/omarchy-guardian-sweep.service.d/\\xff.conf";
+    let override_of = |body| Item {
+        category: Category::Systemd,
+        run_by: None,
+        ..item(path, Origin::Root, Tier::Unknown, body)
+    };
+    let read = override_of(Body::Text("ExecStart=\n".into()));
+    let not_read = Item {
+        sha256: None,
+        ..override_of(Body::Unreadable("its name is not UTF-8".into()))
+    };
+    let mut collection = Collection::default();
+    super::add_accounts_items(&mut collection, vec![read.clone(), not_read]);
+    let at_path = |collection: &Collection| -> Vec<Body> {
+        collection
+            .items
+            .iter()
+            .filter(|item| item.path == path)
+            .map(|item| item.body.clone())
+            .collect()
+    };
+    let results = to_json(
+        &collection,
+        &super::in_keeping_order(&collection, &HashSet::new(), &HashSet::new()),
+        &[],
+        None,
+    )
+    .to_string();
+    let expected = [
+        Body::Text("ExecStart=\n".into()),
+        Body::Unreadable("its name is not UTF-8".into()),
+    ];
+    // A sweep that did not see them itself gets both.
+    let mut users = Collection::default();
+    merge(&mut users, from_json(&results).unwrap());
+    assert_eq!(at_path(&users), expected, "{:?}", users.items);
+    // One that read the same file itself keeps its own, which says the
+    // same as root's and gains its notes, and the one it did not see.
+    let mut users = Collection {
+        items: vec![Item {
+            origin: Origin::User,
+            notes: Vec::new(),
+            ..read.clone()
+        }],
+        ..Collection::default()
+    };
+    merge(&mut users, from_json(&results).unwrap());
+    assert_eq!(at_path(&users), expected, "{:?}", users.items);
+    assert_eq!(users.items[0].origin, Origin::User);
+    assert_eq!(users.items[0].notes, read.notes);
+    // One that read other content there keeps both readings.
+    let mut users = Collection {
+        items: vec![Item {
+            origin: Origin::User,
+            sha256: Some(Sha256::digest(b"other")),
+            ..override_of(Body::Text("other\n".into()))
+        }],
+        ..Collection::default()
+    };
+    merge(&mut users, from_json(&results).unwrap());
+    assert_eq!(at_path(&users).len(), 3, "{:?}", users.items);
+}
+
+#[test]
+fn only_an_accounts_overrides_are_kept_beside_another_reading() {
+    let reading = |path: &str, category, origin, text: &str| Item {
+        category,
+        run_by: None,
+        sha256: Some(Sha256::digest(text.as_bytes())),
+        ..item(path, origin, Tier::Unknown, Body::Text(text.into()))
+    };
+    let system = "etc/systemd/user/omarchy-guardian-sweep.service";
+    let key = "home/u/.ssh/authorized_keys#keys";
+    let unit = "home/u/.config/systemd/user/omarchy-guardian-sweep.service";
+    // A file in a home that a system unit runs is no override.
+    let reached = "home/u/bin/tool";
+    let run = |item: Item| Item {
+        run_by: Some("etc/systemd/system/x.service".into()),
+        ..item
+    };
+    let mut users = Collection {
+        items: vec![
+            reading(system, Category::Systemd, Origin::User, "a"),
+            reading(key, Category::Account, Origin::User, "a"),
+            reading(unit, Category::Systemd, Origin::User, "a"),
+            run(reading(reached, Category::Systemd, Origin::User, "a")),
+        ],
+        ..Collection::default()
+    };
+    let roots = Collection {
+        items: vec![
+            reading(system, Category::Systemd, Origin::Root, "b"),
+            reading(key, Category::Account, Origin::Root, "b"),
+            reading(unit, Category::Systemd, Origin::Root, "b"),
+            run(reading(reached, Category::Systemd, Origin::Root, "b")),
+        ],
+        ..Collection::default()
+    };
+    merge(
+        &mut users,
+        from_json(
+            &to_json(
+                &roots,
+                &super::in_keeping_order(&roots, &HashSet::new(), &HashSet::new()),
+                &[],
+                None,
+            )
+            .to_string(),
+        )
+        .unwrap(),
+    );
+    let count = |path: &str| users.items.iter().filter(|item| item.path == path).count();
+    // Root's view of the system, of an account's keys and of a file a unit
+    // runs folds into the user's, which is newer; an override in a home is
+    // kept beside it.
+    assert_eq!(
+        [count(system), count(key), count(unit), count(reached)],
+        [1, 1, 2, 1],
+        "{:?}",
+        users.items
+    );
+    // The hash tells two readings apart where the body does not, and the
+    // same reading at another path is another item.
+    let oversized = |text: &str| Item {
+        body: Body::Oversized,
+        ..reading(unit, Category::Systemd, Origin::Root, text)
+    };
+    let elsewhere = Item {
+        path: "home/u/.config/systemd/user/omarchy-guardian-sweep.timer".into(),
+        ..oversized("c")
+    };
+    let mut collection = Collection {
+        items: vec![oversized("a"), elsewhere],
+        ..Collection::default()
+    };
+    super::add_overrides(
+        &mut collection,
+        vec![oversized("b"), oversized("a"), oversized("c")],
+    );
+    assert_eq!(collection.items.len(), 4, "{:?}", collection.items);
+    // The body tells two readings apart where no hash does (neither read).
+    let not_read = |why: &str| Item {
+        sha256: None,
+        body: Body::Unreadable(why.into()),
+        ..reading(unit, Category::Systemd, Origin::Root, "")
+    };
+    let mut collection = Collection {
+        items: vec![not_read("a")],
+        ..Collection::default()
+    };
+    super::add_overrides(&mut collection, vec![not_read("b"), not_read("a")]);
+    assert_eq!(collection.items.len(), 2, "{:?}", collection.items);
+}
+
+#[test]
+fn what_an_account_keeps_in_its_runtime_directory_leaves_roots_in() {
+    let drop_in = |index: usize| {
+        format!("run/user/1000/systemd/user/omarchy-guardian-sweep.service.d/{index:06}.conf")
+    };
+    let mut items: Vec<Item> = (0..super::MAX_ITEMS + 10)
+        .map(|index| Item {
+            category: Category::Systemd,
+            run_by: None,
+            ..item(
+                &drop_in(index),
+                Origin::Root,
+                Tier::Unknown,
+                Body::Text("x".into()),
+            )
+        })
+        .collect();
+    // Root's own runtime directory is root's, and sorts after the
+    // account's.
+    let roots_runtime = "run/user/0/systemd/user/omarchy-guardian-sweep.service";
+    for path in [roots_runtime, "var/spool/cron/root"] {
+        items.push(Item {
+            run_by: None,
+            ..item(path, Origin::Root, Tier::Unknown, Body::Text("x".into()))
+        });
+    }
+    let collection = Collection {
+        items,
+        ..Collection::default()
+    };
+    let part = from_json(
+        &to_json(
+            &collection,
+            &super::in_keeping_order(&collection, &HashSet::new(), &HashSet::new()),
+            &[],
+            None,
+        )
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(part.items.len(), super::MAX_ITEMS);
+    let kept: Vec<&str> = part.items.iter().map(|item| item.path.as_str()).collect();
+    assert_eq!(kept[..2], [roots_runtime, "var/spool/cron/root"]);
+    assert!(
+        kept[2..]
+            .iter()
+            .all(|path| path.starts_with("run/user/1000/"))
     );
 }

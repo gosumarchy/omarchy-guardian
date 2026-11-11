@@ -57,7 +57,7 @@ as_root=()
 ((EUID == 0)) && as_root=(GUARDIAN_UPGRADE_TEST_AS_ROOT=1)
 signers=${GUARDIAN_RELEASE_TEST_SIGNERS:-$PWD/packaging/allowed_signers}
 env "${as_root[@]}" GUARDIAN_UPGRADE_TEST_SIGNERS="$signers" GUARDIAN_UPGRADE_TEST_INSTALLED= \
-    bash integrations/upgrade.sh --check . "$tag" || die "the upgrade check refused $tag"
+    bash -p integrations/upgrade.sh --check . "$tag" || die "the upgrade check refused $tag"
 ok "the upgrade check accepts $tag"
 
 in_tag() { git show "$commit:$1" 2>/dev/null; }

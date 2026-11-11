@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::image;
 use crate::mask;
-use crate::report::{Gap, LocalFinding, NetworkRequest, Report, RunRef};
+use crate::report::{Gap, LocalFinding, NetworkRequest, Report, RunRef, Severity};
 use crate::rules::{self, RuleId, Scheme};
 
 use super::{EXCERPT_CHARS, excerpt};
@@ -44,6 +44,39 @@ fn record_network(report: &mut Report, rel: &str, number: usize, line: &str, act
     }
 }
 
+/// The line rules `code` and `quiet` match (see `rules::line_rules`), as
+/// written and as a shell reads their words (see `rules::as_shell_reads`),
+/// each once, at the higher severity of the text it matched in:
+/// `cu''rl … | sh` is the `curl … | sh` a shell runs.
+fn line_findings(code: &str, quiet: &str) -> Vec<(RuleId, Severity)> {
+    let mut found: Vec<(RuleId, Severity)> = rules::line_rules(code, quiet)
+        .map(|rule| (rule, rule.severity_on(code)))
+        .collect();
+    let (reads_code, reads_quiet) = (rules::as_shell_reads(code), rules::as_shell_reads(quiet));
+    // Each reading of `code` with the same reading of `quiet`, or with
+    // `quiet` as written where it reads only one way.
+    for at in 0..reads_code.len().max(reads_quiet.len()) {
+        let code = reads_code.get(at).map_or(code, String::as_str);
+        let quiet = reads_quiet.get(at).map_or(quiet, String::as_str);
+        for rule in rules::line_rules(code, quiet) {
+            let severity = rule.severity_on(code);
+            match found.iter_mut().find(|(known, _)| *known == rule) {
+                // `Severity` orders the gravest first.
+                Some((_, known)) => *known = (*known).min(severity),
+                None => found.push((rule, severity)),
+            }
+        }
+    }
+    found
+}
+
+/// `text` as a shell reads it (see `rules::as_shell_reads`), or as
+/// written where it reads no other way.
+fn shell_readings(text: String) -> Vec<String> {
+    let reads = rules::as_shell_reads(&text);
+    if reads.is_empty() { vec![text] } else { reads }
+}
+
 /// The most downloaded files followed through one file.
 const MAX_FETCHED_FILES: usize = 64;
 
@@ -76,9 +109,9 @@ pub(super) fn apply_rules(report: &mut Report, rel: &str, text: &str, inventory_
         let code = rules::with_variables(&as_written.to_lowercase(), &variables);
         let quiet =
             rules::with_variables(&view.quiet.to_lowercase().replace('\t', " "), &variables);
-        for rule in rules::line_rules(&code, &quiet) {
+        for (rule, severity) in line_findings(&code, &quiet) {
             report.findings.push(LocalFinding {
-                severity: rule.severity_on(&code),
+                severity,
                 ..finding(rel, number, line, rule)
             });
         }
@@ -112,11 +145,22 @@ fn apply_command_groups(
     views: &[(String, String)],
     written: &[String],
 ) {
+    // A backslash and the newline after it are taken out, so the next line
+    // goes on the same word (`cu\` then `rl`); a line that goes on after a
+    // pipe or `&&` ends its word.
     let joined = |parts: &mut dyn Iterator<Item = &String>| {
-        parts
-            .map(|part| part.trim_end().trim_end_matches('\\'))
-            .collect::<Vec<_>>()
-            .join(" ")
+        let mut line = String::new();
+        for part in parts {
+            let part = part.trim_end();
+            if let Some(part) = part.strip_suffix('\\') {
+                line.push_str(part);
+            } else {
+                line.push_str(part);
+                line.push(' ');
+            }
+        }
+        line.truncate(line.trim_end().len());
+        line
     };
     let mut fetched: Vec<String> = Vec::new();
     let mut start = 0;
@@ -141,28 +185,33 @@ fn apply_command_groups(
         let code = joined(&mut group.iter().map(|(code, _)| code));
         let mut found: Vec<RuleId> = group
             .iter()
-            .flat_map(|(code, quiet)| rules::line_rules(code, quiet))
+            .flat_map(|(code, quiet)| line_findings(code, quiet))
+            .map(|(rule, _)| rule)
             .collect();
         if group.len() > 1 {
             let quiet = joined(&mut group.iter().map(|(_, quiet)| quiet));
-            for rule in rules::line_rules(&code, &quiet) {
+            for (rule, severity) in line_findings(&code, &quiet) {
                 if !found.contains(&rule) {
                     found.push(rule);
                     report.findings.push(LocalFinding {
-                        severity: rule.severity_on(&code),
+                        severity,
                         ..finding(rel, start + 1, lines[start], rule)
                     });
                 }
             }
         }
-        let as_written = joined(&mut written[start..end].iter());
-        record_runs(report, rel, start + 1, lines[start], &as_written);
+        // What runs and what is fetched, as a shell reads the words
+        // (`\sh /tmp/x`, `cu''rl -o x`).
+        let as_written = shell_readings(joined(&mut written[start..end].iter()));
+        let code = shell_readings(code);
         // A fetch or a decoder that writes a file: a file run later is
         // download-and-run / encoded execution just as a piped one is.
-        let lowered = as_written.to_lowercase();
-        let brought_in = rules::fetched_files(&as_written)
-            .into_iter()
-            .chain(rules::encoded::decoded_file(&lowered));
+        let mut brought_in = Vec::new();
+        for as_written in &as_written {
+            record_runs(report, rel, start + 1, lines[start], as_written);
+            brought_in.extend(rules::fetched_files(as_written));
+            brought_in.extend(rules::encoded::decoded_file(&as_written.to_lowercase()));
+        }
         for file in brought_in {
             let file = file.to_lowercase();
             if report.fetches.len() < MAX_RUNS {
@@ -180,9 +229,10 @@ fn apply_command_groups(
             }
         }
         if !found.contains(&RuleId::DownloadAndExecute)
-            && fetched
-                .iter()
-                .any(|file| code.contains(file.as_str()) && rules::runs_file(&code, file))
+            && fetched.iter().any(|file| {
+                code.iter()
+                    .any(|code| code.contains(file.as_str()) && rules::runs_file(code, file))
+            })
         {
             push_finding(
                 report,

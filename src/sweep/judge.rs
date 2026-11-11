@@ -4,12 +4,13 @@
 //! costs no AI call on the next sweep.
 
 pub(super) mod secrets;
-mod variables;
+pub(super) mod variables;
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
 
 use super::collect::{self, Body, Collection, Item};
+use super::live::NOT_READ_PAST_LIMIT;
 use super::nvim::{self, Review};
 use super::tier::Tier;
 use super::{boot, commands};
@@ -352,6 +353,11 @@ fn examine(
             }
             Body::Undecodable => report.gaps.push(Gap::Undecodable(label)),
             Body::Oversized => report.gaps.push(Gap::OversizedText(label)),
+            // Left unread by the live checks' limit, not by its owner: root
+            // would not have read it either.
+            Body::Unreadable(reason) if reason == NOT_READ_PAST_LIMIT => {
+                report.gaps.push(Gap::Sweep(format!("{label}: {reason}")));
+            }
             Body::Unreadable(_) => report.gaps.push(Gap::RootOnly(label)),
             // A link is judged by its target, which is its own item.
             Body::Link(_) => {}

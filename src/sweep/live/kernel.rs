@@ -15,7 +15,8 @@ use std::ops::RangeInclusive;
 use std::thread;
 
 use super::{
-    Found, Listed, Process, Running, Status, parse_status, plain, subject, trusted_program,
+    Chooser, Found, Listed, Process, Running, Status, parse_status, plain, proc_text, started_at,
+    subject, ticks_since_boot, trusted_program,
 };
 use crate::autorun::Category;
 use crate::rules::RuleId;
@@ -33,10 +34,18 @@ const MODULE_TAINTS: &[(u32, char, &str)] = &[
 ];
 
 /// The most process numbers tried in the search for hidden processes: as
-/// many as a 64-bit kernel hands out at all. Trying one takes about a
-/// microsecond, so all of them take some seconds of work, shared between a
-/// few threads.
+/// many as a 64-bit kernel hands out at all (numbers below 4,194,304).
+/// Trying one takes a few microseconds, so all of them take some seconds
+/// of work, shared between a few threads. The search tries them in
+/// ascending shares once: root that knows of it can move a hidden process
+/// onto a number already passed, but root that knows of it can also hide
+/// the lookups themselves.
+#[cfg(not(test))]
 const MAX_TRIED: u32 = 4_194_304;
+/// In tests, every sweep of a fixture runs the search, and 4 million
+/// failed opens in each took minutes in all; the logic is the same.
+#[cfg(test)]
+const MAX_TRIED: u32 = 65_536;
 
 /// The most threads that try process numbers at once.
 const MAX_SEARCHERS: u32 = 8;
@@ -47,9 +56,6 @@ const PROPRIETARY_MODULES: &[&str] = &[
     "nvidia", "wl", "zfs", "zcommon", "znvpair", "zunicode", "zavl", "zlua", "zzstd", "icp", "spl",
     "fglrx", "vmmon", "vmnet",
 ];
-
-/// The most control groups whose members are read.
-const MAX_CONTROL_GROUPS: usize = 20_000;
 
 /// Debuggers and tracers a repository package installs.
 const DEBUGGERS: &[&str] = &[
@@ -262,67 +268,18 @@ fn listing(scope: &Scope<'_>) -> HashSet<u32> {
         .unwrap_or_default()
 }
 
-/// The processes the control groups list as their members (every
-/// `cgroup.procs` under `/sys/fs/cgroup`): the kernel's other account of
-/// what runs, which whatever filters the list of processes rarely thinks
-/// of. One outside the sweep's own process namespace is listed as 0. At
-/// most `most` groups are read, and the sweep says when there are more.
-pub(super) fn members_of_control_groups(
-    scope: &Scope<'_>,
-    most: usize,
-    found: &mut Found,
-) -> Vec<u32> {
-    let mut members = Vec::new();
-    let mut pending = vec![scope.root.join("sys/fs/cgroup")];
-    let mut looked_at = 0;
-    while let Some(directory) = pending.pop() {
-        looked_at += 1;
-        if looked_at > most {
-            found.not_checked(
-                scope,
-                format!(
-                    "more than {most} control groups: the processes the rest name were not tried in the search for hidden processes"
-                ),
-            );
-            break;
-        }
-        members.extend(
-            fs::read_to_string(directory.join("cgroup.procs"))
-                .unwrap_or_default()
-                .lines()
-                .filter_map(|line| line.trim().parse::<u32>().ok()),
-        );
-        let Ok(entries) = fs::read_dir(&directory) else {
-            continue;
-        };
-        pending.extend(
-            entries
-                .filter_map(Result::ok)
-                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-                .map(|entry| entry.path()),
-        );
-    }
-    members
-}
-
-/// The highest process number there may be on `scope`'s system: one below
-/// the kernel's limit (numbers start over when it is reached, so a process
-/// may hold any number below it, whatever was handed out last), or without
-/// a limit to read, the last number handed out; and never less than the
-/// highest one listed.
-pub(super) fn highest_number(scope: &Scope<'_>, listed: u32) -> u32 {
-    let read = |name: &str| -> Option<u32> {
-        fs::read_to_string(scope.root.join("proc/sys/kernel").join(name))
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
-    };
-    read("pid_max")
-        .map(|limit| limit.saturating_sub(1))
-        .or_else(|| read("ns_last_pid"))
-        .unwrap_or(0)
-        .max(listed)
+/// The highest process number there may be: one below the most a 64-bit
+/// kernel hands out at all (`PID_MAX_LIMIT` in `include/linux/threads.h`,
+/// which bounds every write to `pid_max`), and never less than the highest
+/// one listed. `pid_max` is not read: root can start a process above it
+/// and lower it after, or mount another file over it, and a search that
+/// stopped there would miss that process. The control groups were read
+/// for such numbers too, and are not: past the cap on how many are read,
+/// whoever hides the process makes it unread. The bound holds while the
+/// kernel's own code does: a module can hand out any number, and hide its
+/// lookups as well.
+fn highest_number(listed: u32) -> u32 {
+    (MAX_TRIED - 1).max(listed)
 }
 
 /// `unlisted` over every number of `range`, shared between a few threads;
@@ -385,26 +342,25 @@ pub(super) fn say_not_searched(
 }
 
 /// Processes that exist (their `status` opens under their number) and are
-/// missing from the list of processes. The numbers tried are those the
-/// control groups name and every number a process may have (see
-/// `highest_number`). Where that is more than `most` numbers, the newest
+/// missing from the list of processes. The numbers tried are every number
+/// a process may have (see `highest_number`). Where that is more than `most` numbers, the newest
 /// `most` are tried and the sweep says the rest were not.
 pub(super) fn hidden_processes(scope: &Scope<'_>, running: &Running, most: u32, found: &mut Found) {
     let listed: HashSet<u32> = running.listed.iter().map(|listed| listed.pid).collect();
-    let Some(highest) = listed.iter().max().copied() else {
-        return;
-    };
+    // An empty list is searched too: a filter that empties it for the
+    // sweep alone would otherwise turn the search off with it.
+    let highest = listed.iter().max().copied().unwrap_or(0);
     let proc = scope.root.join("proc");
     let answers = |pid: u32| {
-        fs::read_to_string(proc.join(pid.to_string()).join("status"))
+        proc_text(&proc.join(pid.to_string()).join("status"))
             .ok()
             .map(|text| parse_status(&text))
     };
-    let top = highest_number(scope, highest);
+    let top = highest_number(highest);
     let first = top.saturating_sub(most.saturating_sub(1)).max(1);
     if first > 1 {
         let sentence = format!(
-            "process numbers go up to {top}: only the newest {most} and those the control groups name were tried in the search for hidden processes"
+            "process numbers go up to {top}: only the newest {most} were tried in the search for hidden processes"
         );
         if scope.origin == Origin::Root {
             found.unchecked.push(sentence);
@@ -412,23 +368,70 @@ pub(super) fn hidden_processes(scope: &Scope<'_>, running: &Running, most: u32, 
             found.notes.push(sentence);
         }
     }
-    let members = members_of_control_groups(scope, MAX_CONTROL_GROUPS, found);
-    let mut suspects = unlisted(&listed, members.into_iter(), &answers);
-    let (among, not_searched) = unlisted_among(&listed, first..=top, &answers);
-    suspects.extend(among);
+    let (mut suspects, not_searched) = unlisted_among(&listed, first..=top, &answers);
     say_not_searched(scope, &not_searched, found);
     if suspects.is_empty() {
         return;
     }
     suspects.sort();
     suspects.dedup();
-    // One that started while the search ran is in the list by now.
+    // One that started while the search ran is in the list by now. That
+    // list alone proves nothing: what hides a process from one read can
+    // show it to the next. So one in it counts as new only if it started
+    // between the first read of the list and now (a start time ahead of
+    // now is made up); where any time is unknown, it was hidden.
     let now = listing(scope);
-    for (pid, name) in suspects {
-        let still = answers(pid).is_some_and(|status| status.group == pid);
-        if now.contains(&pid) || !still {
-            continue;
+    let checked_at = ticks_since_boot(&proc);
+    let started_since_listed = |pid: u32| match (
+        running.listed_at,
+        checked_at,
+        started_at(&proc.join(pid.to_string())),
+    ) {
+        (Some(listed_at), Some(checked_at), Some(started)) => {
+            (listed_at..=checked_at).contains(&started)
         }
+        _ => false,
+    };
+    let hidden: Vec<(u32, String)> = suspects
+        .into_iter()
+        .filter(|(pid, _)| {
+            (!now.contains(pid) || !started_since_listed(*pid))
+                && answers(*pid).is_some_and(|status| status.group == *pid)
+        })
+        .collect();
+    // With nothing listed, every process answers: that is one finding, the
+    // list itself, not one for each process. Its path is its own, so an
+    // allow of another item at `proc` does not cover it.
+    if listed.is_empty() && !hidden.is_empty() {
+        let named: Vec<String> = hidden
+            .iter()
+            .take(5)
+            .map(|(pid, name)| format!("{pid} ({})", name.escape_debug()))
+            .collect();
+        found.add_missing(
+            scope,
+            Category::Process,
+            "proc#unlisted",
+            "the list of processes shows none",
+            format!(
+                "the list of processes is empty or could not be read, and {} answer by their \
+                 number ({}{}): something hides the list",
+                match hidden.len() {
+                    1 => "1 process".to_string(),
+                    count => format!("{count} processes"),
+                },
+                named.join(", "),
+                if hidden.len() > named.len() {
+                    ", …"
+                } else {
+                    ""
+                }
+            ),
+            RuleId::RootkitSign,
+        );
+        return;
+    }
+    for (pid, name) in hidden {
         found.add_missing(
             scope,
             Category::Process,
@@ -457,47 +460,52 @@ fn bracketed(name: &str) -> bool {
 /// named like that means to be overlooked.
 fn posing_as_kernel(scope: &Scope<'_>, running: &Running, found: &mut Found) {
     for listed in &running.listed {
-        let posing =
-            bracketed(&listed.status.name) || listed.started_as.as_deref().is_some_and(bracketed);
-        // A kernel thread was started as nothing.
-        if !posing || listed.started_as.is_none() {
+        // A program may blank its arguments, so what started it does not
+        // tell a kernel thread; the kernel does.
+        if listed.kernel_thread {
             continue;
         }
-        let shown = listed.started_as.as_deref().unwrap_or_default();
+        let shown = String::from_utf8_lossy(listed.started_as.as_deref().unwrap_or_default());
+        if !bracketed(&listed.status.name) && !bracketed(&shown) {
+            continue;
+        }
         let note = format!(
             "process {} is named like a kernel thread ({}), and is a program",
             listed.pid,
             shown.escape_debug()
         );
-        match process_of(running, listed.pid) {
-            Some(process) if !process.deleted && !process.path().starts_with("memfd:") => {
-                found.add(
+        // Any account names its processes what it likes.
+        found.through(Chooser::of(listed.status.of_root), |found| {
+            match process_of(running, listed.pid) {
+                Some(process) if !process.deleted && !process.path().starts_with("memfd:") => {
+                    found.add(
+                        scope,
+                        Category::Process,
+                        process.path(),
+                        note,
+                        Some(RuleId::RootkitSign),
+                    );
+                }
+                Some(process) => found.add_missing(
                     scope,
                     Category::Process,
                     process.path(),
+                    "no file on disk",
                     note,
-                    Some(RuleId::RootkitSign),
-                );
+                    RuleId::RootkitSign,
+                ),
+                // Another user's: the root checks name its program.
+                None if scope.origin != Origin::Root => {}
+                None => found.add_missing(
+                    scope,
+                    Category::Process,
+                    &format!("proc/{}", listed.pid),
+                    "its program could not be read",
+                    note,
+                    RuleId::RootkitSign,
+                ),
             }
-            Some(process) => found.add_missing(
-                scope,
-                Category::Process,
-                process.path(),
-                "no file on disk",
-                note,
-                RuleId::RootkitSign,
-            ),
-            // Another user's: the root checks name its program.
-            None if scope.origin != Origin::Root => {}
-            None => found.add_missing(
-                scope,
-                Category::Process,
-                &format!("proc/{}", listed.pid),
-                "its program could not be read",
-                note,
-                RuleId::RootkitSign,
-            ),
-        }
+        });
     }
 }
 
@@ -573,7 +581,20 @@ fn tracers(scope: &Scope<'_>, running: &Running, found: &mut Found) {
             target.escape_debug()
         );
         let name = format!("attached-to-{}", plain(target));
-        match tracer {
+        // Any account may attach to its own processes, as often as it likes,
+        // and names the item through the target's name. A tracer is a thread
+        // id, and a thread is not in the list of processes: its `status`
+        // is read by its number. One that cannot be shown to be root's is
+        // an account's.
+        let tracer_of_root = match tracer {
+            Some(tracer) => tracer.of_root,
+            None => {
+                status_of(scope, traced.status.tracer).is_some_and(|status| status.of_root)
+                    && still_traced_by(scope, traced)
+            }
+        };
+        let chooser = Chooser::of(tracer_of_root);
+        found.through(chooser, |found| match tracer {
             Some(tracer) if !tracer.deleted && !tracer.path().starts_with("memfd:") => {
                 let (path, _) = subject(scope, tracer, tracer.path());
                 found.add_as(
@@ -603,8 +624,24 @@ fn tracers(scope: &Scope<'_>, running: &Running, found: &mut Found) {
                 note,
                 rule,
             ),
-        }
+        });
     }
+}
+
+/// What the `status` of process or thread `pid` says now.
+fn status_of(scope: &Scope<'_>, pid: u32) -> Option<Status> {
+    let text = proc_text(&scope.root.join(format!("proc/{pid}/status"))).ok()?;
+    Some(parse_status(&text))
+}
+
+/// Whether `traced` still has the tracer it was listed with. The tracer's
+/// number may have gone to another thread, root's say, after the tracer
+/// left. Asked after the tracer's own `status` was read: a tracer that
+/// leaves lets go of its target, and no number is given again while its
+/// thread lives, so the same tracer now means that `status` was its own,
+/// short of the numbers going round twice between the two reads.
+fn still_traced_by(scope: &Scope<'_>, traced: &Listed) -> bool {
+    status_of(scope, traced.pid).is_some_and(|now| now.tracer == traced.status.tracer)
 }
 
 /// Whether `tracer` is a debugger: a packaged one, or one of the debug

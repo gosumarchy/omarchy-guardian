@@ -11,6 +11,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use super::collect::Item;
+use super::live::NOT_READ_PAST_LIMIT;
 use super::tier::Tier;
 use crate::error::{Error, IoContext};
 use crate::files::{AtomicWrite, write_atomic};
@@ -43,7 +44,18 @@ pub(super) fn directory(store_root: &Path) -> Result<PathBuf, Error> {
 pub(super) fn fingerprint(item: &Item) -> String {
     let content = match (&item.sha256, &item.body) {
         (Some(digest), _) => digest.to_string(),
-        (None, super::collect::Body::Link(target)) => format!("link:{target}"),
+        // `+` and `,` part a fingerprint's marks, so a target holding one
+        // could pass for another target with a mark.
+        (None, super::collect::Body::Link(target)) => format!(
+            "link:{}",
+            target
+                .replace('%', "%25")
+                .replace('+', "%2B")
+                .replace(',', "%2C")
+        ),
+        (None, super::collect::Body::Unreadable(reason)) if reason == NOT_READ_PAST_LIMIT => {
+            UNREAD_PAST_LIMIT.into()
+        }
         (None, _) => UNREAD.into(),
     };
     // What the live checks saw is part of it: allowing a program that
@@ -64,6 +76,62 @@ pub(super) const FLAGGED: &str = "+finding";
 /// The fingerprint of an item that could not be read (and raised no
 /// alert): only this one carries over a previous fingerprint.
 pub(super) const UNREAD: &str = "-";
+
+/// The fingerprint of an item the live checks left unread for their limit.
+/// It is a change from what was read before: a file swapped while someone
+/// keeps the limit full is told as changed. What was last read is kept in
+/// it (`-limit:<content>`, see `past_limit`), so read again later it is a
+/// change only where that content differs: which files fall past the limit
+/// depends on the order processes are seen in, and a swap made while the
+/// file went unread is still told.
+const UNREAD_PAST_LIMIT: &str = "-limit";
+
+/// What to remember of an item left unread for the live checks' limit,
+/// whose fingerprint now is `fingerprint`, where `known` was remembered
+/// before: the content last read and its marks, kept from `known`, with
+/// the alerts of now. Keeping the marks means a finding or an alert the
+/// file had when last read is no news when it is read again. `None` for
+/// an item that was read, or with nothing read to keep.
+pub(super) fn past_limit(fingerprint: &str, known: Option<&str>) -> Option<String> {
+    let alerts = fingerprint.strip_prefix(UNREAD_PAST_LIMIT)?;
+    let known = known?;
+    let last = last_read(known)?;
+    let flagged = known.ends_with(FLAGGED);
+    let mut marks: Vec<&str> = marks(known)
+        .chain(marks(alerts))
+        .filter(|mark| Some(*mark) != FLAGGED.strip_prefix('+'))
+        .collect();
+    marks.sort_unstable();
+    marks.dedup();
+    let mut kept = format!("{UNREAD_PAST_LIMIT}:{last}");
+    if !marks.is_empty() {
+        kept.push('+');
+        kept.push_str(&marks.join(","));
+    }
+    if flagged {
+        kept.push_str(FLAGGED);
+    }
+    Some(kept)
+}
+
+/// The alerts and the finding mark of `fingerprint`, after its content.
+fn marks(fingerprint: &str) -> impl Iterator<Item = &str> {
+    fingerprint
+        .split('+')
+        .skip(1)
+        .flat_map(|marks| marks.split(','))
+}
+
+/// The content `fingerprint` says was last read: its own, or the one kept
+/// past the limit. `None` where none was.
+fn last_read(fingerprint: &str) -> Option<&str> {
+    let content = content_of(fingerprint);
+    let content = match content.strip_prefix(UNREAD_PAST_LIMIT) {
+        Some(kept) => kept.strip_prefix(':')?,
+        None => content,
+    };
+    (content != UNREAD).then_some(content)
+}
 
 /// Label to fingerprint.
 pub(super) type Remembered = BTreeMap<String, String>;
@@ -170,6 +238,14 @@ pub(super) fn not_allowable(item: &Item) -> Option<&'static str> {
         // Allowing it would let whatever wrote it quiet the sweep it
         // redirects.
         return Some("it changes Guardian's own sweep, which an allow does not cover; remove it");
+    }
+    if item
+        .path
+        .strip_prefix("proc/")
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+    {
+        // Named by a process's number, which the next process may take.
+        return Some("it is named by a process's number, which another process may take next");
     }
     if super::collect::is_capped(item) {
         // An allow vouches for what the item runs, and nobody looked for
@@ -590,15 +666,7 @@ pub(super) fn diff(previous: &Remembered, current: &Remembered) -> Vec<(Change, 
     for (label, fingerprint) in current {
         match previous.get(label) {
             None => changes.push((Change::New, label.clone())),
-            // What could not be read before is no change once it can be,
-            // unless it now raises an alert. A finding that is gone from
-            // a file that did not change is none either: the AI was not
-            // reached this time, or judged it differently.
-            Some(old)
-                if old != fingerprint
-                    && (old != UNREAD || fingerprint.contains('+'))
-                    && old.strip_suffix(FLAGGED) != Some(fingerprint.as_str()) =>
-            {
+            Some(old) if is_change(old, fingerprint) => {
                 changes.push((Change::Changed, label.clone()));
             }
             Some(_) => {}
@@ -612,6 +680,34 @@ pub(super) fn diff(previous: &Remembered, current: &Remembered) -> Vec<(Change, 
     }
     changes.sort_by(|left, right| left.1.cmp(&right.1));
     changes
+}
+
+/// Whether `new` is a change from `old`, two fingerprints of one item.
+/// What could not be read before is no change once it can be, unless it
+/// now raises an alert or gets a finding it did not have, or its content
+/// is not what was last read before the limit, or it was never read and
+/// only seen past the limit. A finding that is gone from
+/// a file that did not change is none either: the AI was not reached this
+/// time, or judged it differently.
+fn is_change(old: &str, new: &str) -> bool {
+    if old == new || old.strip_suffix(FLAGGED) == Some(new) {
+        return false;
+    }
+    let content = content_of(old);
+    if content != UNREAD && !content.starts_with(UNREAD_PAST_LIMIT) {
+        return true;
+    }
+    let before: Vec<&str> = marks(old).collect();
+    let past_limit = content.starts_with(UNREAD_PAST_LIMIT);
+    marks(new).any(|mark| !before.contains(&mark))
+        || match (last_read(old), last_read(new)) {
+            (Some(last), Some(now)) => now != last,
+            // Never read before, only seen past the limit: what is read
+            // now was never looked at, so allowing the item then does not
+            // allow it.
+            (None, Some(_)) => past_limit,
+            (_, None) => false,
+        }
 }
 
 #[cfg(test)]

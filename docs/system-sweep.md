@@ -201,7 +201,14 @@ a path is still followed there. A Hyprland `source` with `*` or
 A bare command name in an auto-run file is looked for along the list of
 directories described under [Programs ahead of the system's
 own](#programs-ahead-of-the-systems-own), first where a shell would look
-first, and every place it is found in is judged.
+first, and every place it is found in is judged. A directory on that list the
+root checks were kept out of (an account's FUSE mount, a home on NFS with
+`root_squash`) is named once among the limits reached, and so is a directory
+a pattern names (`~/.config/hypr/conf.d/*`) that they could not look into or
+that is a link. A
+program named by its path in such a directory, or behind a link the root checks
+do not follow (an account's `~/bin` leading elsewhere), is reported by that
+path as not read.
 
 ### Where following stops
 
@@ -215,6 +222,7 @@ extra look at the program it names. The limits:
 | A line of a start-up file looked through for programs | 64 KB |
 | One command line split into its commands (a longer one is taken as a single command) | 64 KB |
 | Links in a chain (40 for one among Neovim's spec files, as the kernel follows them: see [Neovim plugins](#neovim-plugins)) | 8 |
+| Parts of the paths looked at while following one chain, each `..` after a link following that link's chain too | 256 |
 | Scripts in a chain, each started by the one before | 3 |
 
 Where one of these limits is reached, the item says so in its notes and
@@ -271,9 +279,11 @@ shells, udev and pacman read such names all the same: the sweep says so and is
 **incomplete** (exit 2). It is incomplete too when a location holds more than
 20,000 files or goes more than six directories deep, when a pattern of the
 catalogue matches more than 500 files, when there are more than 2,000,000
-files to look through for setuid programs, when `getcap` is missing, fails
-(any exit but 0, or a signal) or times out, when a package's record cannot be
-read, and when the root checks found more than 5,000 items. A directory a
+files to look through for setuid programs and files with capabilities in
+directories only root names files in (the others, such as `/home/u`, `/var/tmp`
+and `/var/spool/mail`, are walked last with 2,000,000 of their own, and running
+out there, or a directory there that cannot be listed, is a note naming where),
+when a package's record cannot be read, and when the root checks found more than 5,000 items. A directory a
 pattern of the catalogue passes through that cannot be listed (`/boot/EFI`,
 mounted for root alone, for `/boot/EFI/*/refind.conf`) makes it incomplete
 too, unless the root checks' results are in and say root listed that
@@ -871,8 +881,16 @@ The files `TrustedUserCAKeys` and `AuthorizedPrincipalsFile` name are followed
 like a command. Past 200 keys of one account the rest are one item ("N more
 keys", with a hash that moves when they do), and a key file over 1 MiB, which
 the SSH server reads all the same, is an item saying its keys are not listed:
-both are findings, since neither is how a key file looks. A line of a key file
-that is no key is counted in an item of its own.
+both are findings, since neither is how a key file looks. So is a key file
+behind a chain of links not followed to its end (too many links, links whose
+paths look at more than 256 path parts in all, a directory on the way the
+kernel would not show root or let root open, such as a FUSE mount of the
+account's or a home on NFS with `root_squash`, one swapped for another
+directory, a link or a file while it was walked, or one only its group may
+enter), and a key file that is there and could not be read (its owner can keep
+it from opening, and let go of it for the server; or only its group may read
+it, since who is in a group is not asked). A line of a key file that is no key
+is counted in an item of its own.
 
 At most 500 accounts, members and keys become items in one sweep. Where there
 are more, your own sweep says in a note how many were not listed; the root
@@ -1165,6 +1183,22 @@ kernel's release, `/proc/modules`, `/sys/module`, the socket tables
 `/proc/net/packet`. For the root checks that is something not checked, and the
 sweep is **incomplete**; in your own sweep it is a note.
 
+Of each process, every open file is read, but only what the checks use of
+them is kept: its sockets, whether its input is a terminal, a keyboard and a
+camera. Of its environment only the variables the checks read are kept
+(`LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`, `PYTHONPATH`, `PYTHONHOME`,
+`VIRTUAL_ENV`), and of those and of its command line the first 256 KiB each
+(an argument or variable cut there is left out). No more than 6 MiB of an
+environment is read, the most a program can start with: a process can point
+its environment at any memory it maps, which would otherwise hold the sweep up
+for as long as it likes. A process with more is looked at that far. For root's own processes one sentence, like those above, says how
+many there were; an account's such process is an item of the account's, which
+says so, since an account must not be able to leave the root checks
+incomplete. Of what the collector keeps of each process, a forked process
+costs an account nothing, so about 5,000 processes of one account with the
+most of all that make the collector reach its memory limit (4 GiB); it is then
+stopped, and the bar says the results are old.
+
 ### Programs with no file, or from a temporary directory
 
 A running program with no file on disk (deleted, or only in memory), or
@@ -1202,6 +1236,29 @@ preload given by a bare name, found through the library search path, is
 flagged on the program. Steam's overlay library is noted, not flagged. This is
 what the process was started with: one that rewrites its own environment
 afterwards is not caught by it.
+
+The first 16 preloaded libraries of a process are looked at; a process that
+names more is flagged for it. In all, the live checks read at most 256 files
+in one sweep (what processes run and preload, listeners, kernel modules, and
+the setuid and setgid files and files with capabilities they find), a program
+once however many ports or names it is seen with: any process chooses the
+first, any user can mark a file of their own setuid or give it capabilities in
+a user namespace, and each could be a large sparse file that takes long to
+read. The
+comparisons with what packages recorded have limits of their own, in bytes
+(see below). Past the 256, the rest are listed with their alerts, unread, the
+sweep is marked not whole, and each one says it was left unread by that limit.
+A setuid or setgid file, or one with capabilities, left unread is flagged,
+since no package can vouch for a file that was not read; a file read before
+and left unread now is told as changed. What it was when last read is
+remembered with its alerts and findings, so once it is read again it is told
+as changed only if it is not that any more, or raises an alert or gets a
+finding it did not have then. A file first seen past the limit, never read, is
+told as changed the first time it is read: allowing it unread did not allow
+what it holds. A packaged program left unread cannot be compared with its
+package, so it is listed as new while unread and as gone once a later sweep
+reads it and finds it is what its package installed. A desktop's live checks
+read a few dozen files.
 
 ### Packaged files compared with their package
 
@@ -1328,12 +1385,43 @@ load or a live patch.
 ### What hides
 
 A process that answers under its number and is missing from the list of
-processes is listed. The numbers the control groups name are tried, and every
-number a process may have, up to the kernel's limit (numbers start over when
-it is reached, so the last one handed out says little); were there ever more
-than can be tried, the newest are and the sweep says so, as it does of a share
-of the numbers its search did not get through and of control groups past the
-20,000 it reads.
+processes is listed. One a later read of the list shows is left out only if it
+started between the first read and that one: what hides a process from one read
+can show it to the next. A process whose name is not UTF-8 is searched for too.
+
+Read lossily, a name that is not UTF-8 stands for another file (`\xff` for one
+named U+FFFD), so the live checks never follow one. A process whose program's
+path is not UTF-8 is not checked. One whose working directory, command line,
+`LD_PRELOAD`, `LD_AUDIT` or `LD_LIBRARY_PATH` is not UTF-8 is checked, but not
+the script, library or directory that name points to; the other libraries in
+the same variable still are. Either way the process is an alert (A running
+program has no file on disk), named `proc/<number>`, whose note shows the
+names escaped as the kernel keeps them. Such a name can hide what a process
+runs, no packaged program has one, and a folder named so is rare on a UTF-8
+system, so this is always loud. It cannot be allowed: the next process may
+take the number. The item goes to whoever owns the process, so an account
+cannot make root's results incomplete with a name it chose; root's own
+processes get one too, since an account cannot choose what they are called.
+
+The same holds in the walk for setuid files and files with capabilities. A
+directory, set-id file or file with capabilities whose name is not UTF-8, in a
+directory only root names files in, leaves the sweep incomplete, and is shown
+with its bytes escaped. Only root names files in a directory that root owns and
+nobody else may write, as it was opened, with every directory above it the
+same, and (in root's search) on a mount where set-id bits take effect. Anywhere
+else the name is an account's: such a set-id file or file with capabilities is
+an alert of the accounts' (named by a digest of its name; past 1,000 of them
+the rest are counted in a note), and such directories are counted in one note,
+so a file below one is told only by that note.
+
+What can rewrite what `/proc` files say (a kernel module, a file mounted over
+`/proc/uptime`) can hide a process from this search. Every number a process may have is tried, up to the most
+a 64-bit kernel hands out (below 4,194,304), whatever the kernel's limit says:
+root can start a process above that limit and lower it after, or mount another
+file over it. The sweep says which share of the numbers its search did not get
+through, if any. Where the list shows no process at all, or cannot be read, and
+processes answer by their number, that is one finding (`/proc#unlisted`, apart
+from the processes root cannot read): something hides the list.
 
 So is a program named like a kernel thread (`[kworker/0:1]`); and, as root, a
 process root cannot read. Root also says when it cannot list the pinned eBPF
@@ -1365,20 +1453,79 @@ of them (`=ep`) and for those that amount to root (`cap_setuid`,
 `cap_dac_read_search`, `cap_sys_admin`, `cap_net_admin`, `cap_bpf` and the
 like, or one with no name), medium for the rest.
 
-The search for setuid and setgid files leaves out what holds other systems'
-files: container, machine and Flatpak stores under `/var/lib`, `/var/cache`,
-and snapshot directories (`.snapshots`). The search for files with
-capabilities (`getcap -r`) leaves nothing out. Other mounted filesystems
-(`/mnt`, `/media`, `/run/media`) are not looked through at all.
+The search for setuid and setgid files, and for files with capabilities,
+leaves out what holds other systems' files: container, machine and Flatpak
+stores under `/var/lib`, pacman's package cache (`/var/cache/pacman`), and
+snapshot directories (a `.snapshots` that is a btrfs subvolume of root's; one
+an account made is looked through). The same walk finds files with
+capabilities: for each regular file it reads the `security.capability`
+attribute as the kernel keeps it, through the directory it holds open and by
+the bytes of the file's name, without following a link. No `getcap` is run, so
+no account can fail it with files of its own, and no name can forge a line of
+its output. A file on a mount without set-id, where capabilities take no
+effect, is not asked about. An account's FUSE mount could stall a question, so
+each entry is held (`O_PATH`) before anything is asked
+about it, and an entry with something mounted on it is never asked about where
+that is an account's own FUSE mount, which counts as a mount where set-id bits
+have no effect. The walk asks its own table about each mount it meets (read as
+bytes: a mount point or FUSE source may be named in any), and reads it again
+only after a mount was made or removed, which the kernel flags on the open
+table; so a mount made since the host's table was read is told apart too: an
+account mounts only through `fusermount3`, which names the account, and any
+other mount is root's and is looked into (a home activated during the sweep,
+say). Where that table cannot be read, the entry is not looked into and counts
+as not looked at in full. A mount gone from it since the entry was held
+(unmounted lazily) is not asked about: the entry is held again by its name, up
+to three times, which is enough for a mount of root's that expires during the
+walk (autofs). One still gone at every hold takes something mounting and
+unmounting there over and over, which an honest system does not do and an
+account does on a file or directory it may write; it is counted, by its path, in
+the note for places accounts may write, and the place of root's it is in still
+counts as looked at in full. The cost, accepted: a mount of root's made and
+removed that way is only that note too, not a place left unchecked. What is
+under such a mount is not looked at either: that takes a mount call, which the
+collector's sandbox does not allow. Whether set-id bits
+take effect on a file is told by its own place in the host's table; a file
+whose name is not UTF-8 is told by its directory's, since such a name reads
+lossily and an account could pick one that reads as a mount point without
+set-id. In a place accounts may write, a directory gone or swapped between the
+listing and the look counts as not looked at in full too (renamed or exchanged
+in a loop, it would otherwise not be seen at either name); in root's own places it is walked as it is now (a package
+upgrade replaces what it installs). Each directory is opened through the one
+that listed it, each set-id file read through the entry held, and the walk
+goes 64 directories deep below where it starts; deeper ones are counted, in a
+note where accounts may write and as not checked elsewhere.
+Capabilities for a user namespace's root (`[rootid=1000]`), which any account
+can give its own files and which give nothing outside that namespace, are
+counted in a note, not listed. A file with several names (hard links) is
+looked at by the first one met, and the other names are counted in a note. Of
+the setuid files and files with capabilities in places accounts may write, the
+sweep hashes 4 GiB at most; past that each is listed without a hash and a note
+says how many. Past 1,000 setuid or setgid files of one account's own there
+(on a mount where set-id bits take effect, where owners are real; elsewhere all
+share the 1,000), each is counted in a note and not looked at, so one account's
+files cannot crowd out another's, and the files looked at grow by 1,000 with
+each account that owns some; a file of root's or one with the
+host's capabilities there is always looked at, since no account can make those
+without bound. Other mounted filesystems (`/mnt`, `/media`, `/run/media`) are
+not looked through at all.
 
 Directories the search for setuid and setgid files cannot list are counted. In
 your own sweep, which cannot list `/root` and much of `/var`, one note says
 how many and leaves them to the root checks. For the root checks they are not
 checked: one sentence says how many and names one, and the sweep is
-**incomplete**. A place on a filesystem mounted `nosuid` is told apart: the
+**incomplete**. So is a directory the listing showed that is a link or a file
+by the time it is walked, which was swapped meanwhile. A set-id file the root
+checks cannot open (a lease, NFS with `root_squash`) is reported as not read.
+A place on a filesystem mounted `nosuid` is told apart: the
 bits have no effect there, and a user's own FUSE mount (sshfs, rclone) is
 closed to root as well. Such places get a note of their own, which also says
 that what the mount point covers cannot be seen, and the sweep stays whole.
+Which mounts are `nosuid` is read from the system's own mount table, that of
+process 1: in the root collector's own, which its unit's hardening makes, every
+mount is `nosuid`. A table that cannot be read is said, the sweep is
+**incomplete**, and every setuid file and file with capabilities counts as an
+account's.
 
 ## How the machine was started
 
@@ -1731,9 +1878,38 @@ local rules and the AI alike:
   `PASSWD`, `PASSPHRASE`, `PASS`, `PWD`, `PSK`, `AUTH` or `CREDENTIAL(S)` (as
   in `OPENAI_API_KEY`), or the name is one word that ends in `PASSWORD`,
   `PASSWD`, `SECRET`, `TOKEN` or `APIKEY` (`PGPASSWORD`). The value must be a
-  literal of at least 8 plain characters (letters, digits and `_-./+=:@%,`),
-  with or without quotes around it. The forms read are shell, `NAME=value`
-  (with or without blanks around the `=`), unit `Environment=` and fish `set`;
+  literal of at least 8 plain characters (letters, digits and `_-.+=:@%,`),
+  with or without matching quotes around it. A value that names a file (a
+  `/` with a `.` beside it, `plugins/evil.so`) or is marked as a command
+  (`cmd:helper`, `exec:helper`, as some editor plugins read an API key) is
+  sent, since it names what runs; a `/` alone names no file, so a base64 key
+  (most AWS secret keys have a `/`) is still taken out, and so is a bare
+  `bin/helper`. The forms read are shell,
+  `NAME=value` (with or without blanks around the `=`), unit `Environment=`
+  and fish `set`. A name that loads or runs something keeps its value, an
+  assignment inside it included, whatever words are in the name: one that
+  starts with `GIT_CONFIG` (`GIT_CONFIG_KEY_0=include.path`), `LD_` or
+  `DYLD_`, one whose last part (split at `_` and at a change to upper case,
+  a number after it passed over) is `CMD`, `COMMAND`, `PROXY`, `PROVIDER`,
+  `HELPER`, `PROGRAM`, `EXEC`, `SCRIPT`, `HOOK`, `FILE`, `PATH`, `DIR`,
+  `DIRECTORY`, `SOCK`, `ASKPASS`, `LOADER`, `PLUGIN`, `BIN`, `AGENT`,
+  `HANDLER` or `PROCESS`, or that ends in `ask` and `pass` (`RESTIC_PASSWORD_COMMAND`,
+  git's `defaultKeyCommand` and `askPass`, ssh's `SecurityKeyProvider`), and
+  the search paths and start-up variables the sweep treats as loading code
+  (`GIT_SSH_COMMAND`, `PROMPT_COMMAND`). The same holds in the command lines
+  of agent entries, for an assignment, a setting or a flag
+  (`git -c core.askPass=…`, `-oProxyCommand="…"`, `-o "ProxyCommand …"`,
+  `--password-command "…"`, `"core.sshCommand=…"`, `$'…'`), up to the word
+  that closes its quote, read as a shell reads quotes; only the login of an
+  address in it is taken out. A flag's value that is another flag
+  (`--no-proxy --api-key …`) is read as a word of its own. The
+  value is read as far as
+  its line and its first quote go, so a spelling that carries it further (a
+  backslash before a blank, quotes joined together, a quote over several
+  lines, systemd's quote around the whole assignment) can still have a
+  secret-named assignment inside it taken out. Such a variable in a file
+  kept from the AI is also more than a kept value, so it raises
+  `kept-from-review`;
 - the password of an address (`https://user:password@…`), where it is plain
   characters, the user and host staying;
 - the hash of a GRUB password, on a line that is exactly `password_pbkdf2
@@ -1748,7 +1924,7 @@ taken out. A value with a blank, a `;`, `|`, `&`, `$`, a backtick or any other
 punctuation in it stays to be read, quoted or not (`SECRET='p@ss w0rd!'` goes
 with its file); so does anything after the assignment on the same line
 (`PASS=1 curl … | sh` stays whole), and a value that says where something is
-(a path, a URL).
+(a path, a URL, a file name).
 
 A host or a program's name assigned to a secret-named variable
 (`AUTH_HOST=updates.example.org`) is taken out like any other such value, and
@@ -1919,21 +2095,54 @@ whole environment of whoever queued it, so it comes back as a hash only.
 For the accounts the results go to, the collector also looks into their home:
 at what overrides Guardian's user units there (by path and hash, the content
 stays), and at the keys that may log in as them. It looks as that account
-could look itself: no link is followed, every directory on the way must be one
-the account may enter and the file one it may read, as its owner or as anyone,
-so a key file that is a link to a file of root's shows nothing and the account
-learns nothing it could not have read. Two things go past what the account
-could read. An override of Guardian's units that cannot be hashed is reported
-by its path, since that it is there is something the account can see itself.
-And a key file the SSH server's configuration keeps outside the home
-(`AuthorizedKeysFile /etc/ssh/keys/%u`) is read as root where the whole way to
+could look itself (by its owner's and everyone's rights; who is in which group
+is not asked): a link is followed only to what the account may see,
+every directory on the way must be one the account may enter and the file one
+it may read, as its owner or as anyone, so a key file that is a link to a file
+of root's shows nothing and the account learns nothing it could not have read.
+Only the key file is read, and a file on the way is not gone up from (the
+kernel refuses `file/..`). Three things go past what the account could read.
+First, an override of Guardian's units that cannot be hashed, or a unit or
+drop-in directory root could not look into, is reported by its path, since that it is
+there is something the account can see itself, and carries the alert of an
+override. The links on the way to a unit or drop-in directory (a home that is
+a link of root's, `/home/u` to `/data/u`, or `~/.config/systemd` linked into a
+dotfiles directory, as GNU stow does) are followed as the account may follow
+them, as systemd follows them, and each override below is reported and hashed
+by the path systemd reads it at; one not followed to its end (a loop, or past a
+directory root could not look into) is such a directory. A directory is listed
+only where the account may list it, so a link to another account's directory
+that may be entered and not read (mode `0711`) shows none of its names, and is
+one such directory too. A drop-in whose name is not UTF-8, which systemd reads
+and the sweep cannot name, is reported as not read, by its name with each such
+byte written `\xNN`. Where a UTF-8 name reads the same (the four characters
+`\xff`), both are reported by that path: the UTF-8 file by its hash, and the
+other as not read, so neither a decoy beside it nor deleting one hides the
+other; the bar shows the path once. A drop-in directory with more than 64
+names is reported as one item not read, with the alert, rather than by some of
+its names, since which ones would be up to the order the directory lists them
+in; the account's own sweep and the bar do the same. What root does for one
+account's unit directories is bounded: it opens at most 65,536 parts of paths
+(each look walks its path from the root), and hashes at most 1 MiB of one file
+and 16 MiB in all, so links that lead deep, or hard links to one large file
+many times over, cost little. A file over 1 MiB is turned away by its size and
+costs nothing, reported as not read, "larger than the 1 MiB root reads of one
+file". Past a bound, what is left, and a file larger than what is left, is
+reported as not read, "past root's bound for this account", with the alert.
+Second, a file or directory only its
+group may use is reported as not read rather than left out, since the account
+may be in that group. Third, a key file the SSH server's
+configuration keeps outside the home (`AuthorizedKeysFile /etc/ssh/keys/%u`) is
+read as root where the whole way to
 it is root's alone: root wrote the configuration that names it, and what comes
 back is what a home's key file gives.
 
 Of every other account with a home under `/home` only the number of keys comes
 back, with a hash of the list so that a change shows: whose keys they are is
 that account's to see, like its crontab (a key file of theirs too large to
-read is said in that same line, and no more of it). Root's own keys come back
+read, that could not be read, or behind links not followed to their end, is
+said in that same line,
+and no more of it). Root's own keys come back
 one by one. Where there are more items than the results hold, root's own and
 the system's are kept first and what the accounts keep under `/home` after
 them, so an account that fills its home cannot push root's keys out.
@@ -2028,6 +2237,46 @@ note, until the collector has run again. Results written before the collector co
 EFI programs in `/boot` count as such. Results written before the collector named the
 directories it listed cover none that your sweep could not list. Results of a version this Guardian
 does not know are not read at all, and the sweep says to reinstall.
+
+It holds at most 5,000 items, kept by who could have made them, not by path.
+First comes a unit that stands in for one of the sweep's own (it turns the
+sweep off, and the bar looks for it here): at most 16 of each home and 16 of
+each runtime directory under `/run/user`, so 32 of an account with both. Those
+elsewhere (in `/etc`, say) are all kept: only root writes there. Then root's
+own items and the system's: what root found by itself or a root process runs
+or loads, and what one of those leads to, even a file in an account's home
+(root runs it). Last comes what an account can make as often as it likes:
+what is in its home or runtime directory or names a file there, its crontab
+and its `at` jobs (told by who owns the job's file; root's own are root's),
+whatever those name, wherever it is, and what the live checks found only
+through one of its processes or files: a program it runs or a library it
+loads, even one of root's (it can name any file root has: a file root put
+where root's own looks do not reach, such as a library in `/opt` that only
+accounts' programs load, is then cut along with an account's flood of that
+kind), a port it listens on, a setuid file it owns or one in a directory others
+can write or below one, or on a mount without set-id (`nosuid`),
+whose owner is what the mount says (a user's FUSE mount is always `nosuid`). A
+setuid file of root's, in a directory only root can write with every directory
+above it root's alone too, stays root's, and so does a file with capabilities. Root's places are
+walked apart from and before the accounts', so an account's files cannot push
+them out. An account that floods any of
+those crowds out only the accounts' items, never a unit in `/etc`, root's
+crontab or a root process. Of those live items, root's results take at most
+200 of a kind (processes, listeners, setuid files, …), the first by name,
+and say how many were left out; root's own are all kept. One account's can
+crowd out another's. A listening socket that no process holds counts as an
+account's too, since any account can leave one behind; a hidden process's
+socket among a flood of those may be left out.
+
+How large the results are depends on what they list: an item may carry up to
+2 MiB of content, and a note of the live checks up to 10 KiB. Root's results
+carry at most 1 MiB of what accounts made whole, name, notes and all, in the
+order above; past that an account's item is listed with only its name and the
+rules it set off, which the sweep reports as too large to review, never as
+clean, and past 2 MiB in all it is left out, and the results say how many were.
+Root's own items are kept whole, so results can still pass 4 MiB when root's own
+files are large. The bar does not read the results past 4 MiB, and says so,
+since a unit that turns the sweep off is then not looked for there.
 
 The results file makes the root-only items it lists (a sudoers drop-in no
 package installed, say) readable by your group, so it is only used when your
@@ -2141,8 +2390,9 @@ as root stops too and says to use `sweep --root`.
 
 - What cannot be read at all (a program that exists only in memory, a deleted
   file) cannot be allowed; it stays listed while it runs. Nor can what
-  overrides Guardian's own units, or an item whose commands were not all
-  followed.
+  overrides Guardian's own units, an item whose commands were not all
+  followed, or a process named by its number (`proc/<number>`), which the next
+  process may take.
 - Items only root can read (in `/root`, `/etc/sudoers.d`) can be allowed once
   the daily root checks have run (root checks allowed in `protect`); `sweep
   allow` uses their latest results.

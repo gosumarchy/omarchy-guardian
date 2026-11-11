@@ -909,6 +909,26 @@ fn a_listing_must_be_shaped_as_makepkg_prints_it() {
             "pkgbase = demo\n\tpkgbase = other\npkgname = demo\n",
             "more than one",
         ),
+        (
+            "pkgbase = demo\n\tpkgbase =\npkgname = demo\n",
+            "more than one",
+        ),
+        // A forged listing without a final newline: makepkg's own first
+        // line lands inside its last one.
+        (
+            "pkgbase = demo\n\tsource = https://good.example/a.tar\n\npkgname = demo\n\tpkgdesc = xpkgbase = demo\n\tsource = git+https://evil.example/x\n\npkgname = demo\n",
+            "holds a package base",
+        ),
+        // A forged `pkgname = ` line written while makepkg prints the base's
+        // section cuts its sources off from it.
+        (
+            "pkgbase = demo\n\tpkgver = 1\npkgname = demo\n\tpkgrel = 1\n\tsource_x86_64 = https://evil.example/demo-1.tar\n",
+            "in a package's section",
+        ),
+        (
+            "pkgbase = demo\n\tpkgver = 1\npkgname = demo\n\tpkgrel = 1\npkgname = demo\n",
+            "a package twice",
+        ),
         ("pkgbase = demo\nhello\npkgname = demo\n", "does not print"),
         (
             "pkgbase = demo\n\tSource = x\npkgname = demo\n",

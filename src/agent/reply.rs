@@ -33,6 +33,21 @@ fn failed_after_delivery(detail: &str) -> Error {
     }
 }
 
+/// Whether Claude Code had the request: its `init` event came. It writes an
+/// `assistant` event only once a content block is done, so a source written
+/// to keep the model on its first block would time out looking undelivered;
+/// a timeout after `init` counts as out of time. Telling the first token
+/// apart would take `--include-partial-messages`, whose every delta
+/// (thinking too) counts against the output limit. A provider that hangs
+/// after `init` is then out of time too, which blocks where an unavailable
+/// reviewer would only warn: the safe side.
+fn has_started(events: &[Json]) -> bool {
+    events.iter().any(|event| {
+        event.get("type").and_then(Json::as_str) == Some("system")
+            && event.get("subtype").and_then(Json::as_str) == Some("init")
+    })
+}
+
 /// Classifies a Claude Code `--output-format stream-json` transcript. A
 /// `tool_use` block in any assistant message, or a permission denial, means
 /// the model tried to use a tool. Extra turns alone do not: the CLI adds a
@@ -75,6 +90,7 @@ pub(super) fn claude_verdict(
     let delivered = events
         .iter()
         .any(|event| event.get("type").and_then(Json::as_str) == Some("assistant"));
+    let started = has_started(&events);
     let Some(result) = events
         .iter()
         .rev()
@@ -89,7 +105,7 @@ pub(super) fn claude_verdict(
             )));
         }
         return Err(match failure {
-            Some(Failure::TimedOut) if delivered => AgentError::OutOfTime(out_of_time()),
+            Some(Failure::TimedOut) if delivered || started => AgentError::OutOfTime(out_of_time()),
             Some(failure) if delivered && !asks_to_slow_down(&failure.to_string()) => {
                 AgentError::Invalid(failed_after_delivery(&failure.to_string()))
             }

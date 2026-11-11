@@ -35,7 +35,7 @@ pub(crate) struct Target {
 
 impl Target {
     /// What a notification says was blocked: the identities under review
-    /// (such as `theme:tokyo`), else the reviewed directory's name.
+    /// (such as `aur:yay-bin`), else the reviewed directory's name.
     pub(crate) fn subject(&self) -> String {
         let identities: Vec<&str> = self
             .units

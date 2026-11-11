@@ -823,6 +823,20 @@ fn links_in_auto_run_locations_are_found_by_where_they_lead() {
         ]
     );
     assert_eq!(links.len(), 4, "{links:?}");
+
+    // A link to a name that is not UTF-8 is said, not passed over.
+    symlink(
+        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b"/usr/share/b/\xff"),
+        root.join("etc/cron.d/odd"),
+    )
+    .unwrap();
+    let found = super::installed_links(&root, &dir.path().join("no-database"), 20_000);
+    assert_eq!(
+        found.unseen,
+        [
+            "/etc/cron.d/odd is a link to a name that is not UTF-8, so where it leads was not compared with the files this transaction replaces"
+        ]
+    );
 }
 
 #[test]
@@ -1177,6 +1191,7 @@ fn only_a_line_about_guardians_own_is_let_off() {
     for own in [
         "systemctl disable --now omarchy-guardian-sweep-collect.timer >/dev/null 2>&1 || true",
         "    systemctl stop omarchy-guardian-sweep.timer omarchy-guardian-sweep.service",
+        "systemctl stop omarchy-guardian-sweep.timer &>/dev/null",
         "/usr/bin/systemctl --quiet disable 'omarchy-guardian-sweep.timer' 2> /dev/null; true",
         "rm -f /etc/pacman.d/hooks/omarchy-guardian.hook",
     ] {
@@ -1192,6 +1207,16 @@ fn only_a_line_about_guardians_own_is_let_off() {
         "systemctl disable omarchy-guardian-sweep.timer \"$other\"",
         "systemctl disable omarchy-guardian-sweep.timer sshd.service",
         "systemctl mask ufw.service",
+        "systemctl stop omarchy-guardian-sweep.timer; u''fw disable",
+        "rm -f /etc/omarchy-guardian;ufw disable",
+        "echo omarchy-guardian&&ufw disable",
+        "echo omarchy-guardian&ufw disable",
+        "echo omarchy-guardian|ufw disable",
+        "rm -f /etc/omarchy-guardian$(ufw disable)",
+        "rm -f /etc/omarchy-guardian`ufw disable`",
+        "ufw disable>/tmp/omarchy-guardian",
+        "ufw disable${x#omarchy-guardian}",
+        "nft flush ruleset>/omarchy-guardian",
     ] {
         assert!(!super::only_guardians_own(other), "{other}");
     }

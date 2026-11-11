@@ -407,10 +407,11 @@ fn a_line_of_commands_splits_where_a_shell_would() {
     let lookup = super::Lookup {
         home: "home/u",
         search: &[],
-        exists: &|_| false,
+        exists: &|_| super::Presence::Absent,
         capped: std::cell::Cell::new(false),
         unwritten: std::cell::Cell::new(false),
         shell_scripts: std::cell::RefCell::default(),
+        kept_out: std::cell::RefCell::default(),
     };
     lookup.targets(&nested);
     assert!(lookup.capped.get());
@@ -525,11 +526,16 @@ fn what_a_start_up_file_or_a_command_line_names_is_found() {
             "usr/bin".to_string(),
         ],
         exists: &|candidate| {
-            ["home/u/.local/share/mise/shims/sh", "usr/bin/sh"].contains(&candidate)
+            if ["home/u/.local/share/mise/shims/sh", "usr/bin/sh"].contains(&candidate) {
+                super::Presence::There
+            } else {
+                super::Presence::Absent
+            }
         },
         capped: std::cell::Cell::new(false),
         unwritten: std::cell::Cell::new(false),
         shell_scripts: std::cell::RefCell::default(),
+        kept_out: std::cell::RefCell::default(),
     };
     assert_eq!(
         lookup.targets("sh -c true"),
@@ -599,7 +605,13 @@ fn the_script_is_found_for_every_interpreter_and_past_its_options() {
         "home/u/data",
         "run/x.sock",
     ];
-    let exists = |path: &str| there.contains(&path);
+    let exists = |path: &str| {
+        if there.contains(&path) {
+            super::Presence::There
+        } else {
+            super::Presence::Absent
+        }
+    };
     let lookup = super::Lookup {
         home: "home/u",
         search: &super::default_search("home/u"),
@@ -607,6 +619,7 @@ fn the_script_is_found_for_every_interpreter_and_past_its_options() {
         capped: std::cell::Cell::new(false),
         unwritten: std::cell::Cell::new(false),
         shell_scripts: std::cell::RefCell::default(),
+        kept_out: std::cell::RefCell::default(),
     };
     // Interpreters the live checks knew and this one did not.
     assert_eq!(
@@ -1016,10 +1029,11 @@ fn a_program_named_through_a_variable_is_said_to_be_unknown() {
     let lookup = super::Lookup {
         home: "home/u",
         search: &[],
-        exists: &|_| false,
+        exists: &|_| super::Presence::Absent,
         capped: std::cell::Cell::new(false),
         unwritten: std::cell::Cell::new(false),
         shell_scripts: std::cell::RefCell::default(),
+        kept_out: std::cell::RefCell::default(),
     };
     for command in [
         "$TOOLS/x.sh",
@@ -1091,10 +1105,17 @@ fn a_script_handed_to_a_wrapper_beside_it_is_followed() {
     let lookup = super::Lookup {
         home: "home/u",
         search: &[],
-        exists: &|path| path.starts_with("home/u/"),
+        exists: &|path| {
+            if path.starts_with("home/u/") {
+                super::Presence::There
+            } else {
+                super::Presence::Absent
+            }
+        },
         capped: std::cell::Cell::new(false),
         unwritten: std::cell::Cell::new(false),
         shell_scripts: std::cell::RefCell::default(),
+        kept_out: std::cell::RefCell::default(),
     };
     assert_eq!(
         lookup.targets("bash /home/u/p/wrap.sh /home/u/p/hook.py"),
@@ -1184,10 +1205,11 @@ fn a_dollar_that_starts_no_expansion_names_no_variable() {
     let lookup = super::Lookup {
         home: "home/u",
         search: &[],
-        exists: &|_| false,
+        exists: &|_| super::Presence::Absent,
         capped: std::cell::Cell::new(false),
         unwritten: std::cell::Cell::new(false),
         shell_scripts: std::cell::RefCell::default(),
+        kept_out: std::cell::RefCell::default(),
     };
     // Each word is where perl's script would be, so it is looked at.
     // So are the forms a shell expands that no list here names: bash's
@@ -1236,10 +1258,17 @@ fn code_handed_to_perl_is_no_script() {
     let lookup = super::Lookup {
         home: "home/u",
         search: &[],
-        exists: &|path| path.starts_with("home/u/"),
+        exists: &|path| {
+            if path.starts_with("home/u/") {
+                super::Presence::There
+            } else {
+                super::Presence::Absent
+            }
+        },
         capped: std::cell::Cell::new(false),
         unwritten: std::cell::Cell::new(false),
         shell_scripts: std::cell::RefCell::default(),
+        kept_out: std::cell::RefCell::default(),
     };
     // The code after `-pe` names no variable, and the file after it is
     // what the code reads.

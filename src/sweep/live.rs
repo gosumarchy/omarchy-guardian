@@ -27,16 +27,19 @@
 //! - `modules` checks the loaded kernel modules against the packaged ones.
 //! - `privileged` looks for setuid, setgid and capability files.
 
+mod capability;
 mod files;
 mod kernel;
 mod modules;
+mod mount_table;
 mod net;
+mod pinned;
 mod preload;
 mod privileged;
 mod process;
 mod program;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
@@ -48,6 +51,7 @@ use super::programs::is_interpreter;
 use super::programs::script_arguments;
 use super::tier::Tier;
 use crate::autorun::Category;
+use crate::json;
 use crate::paths::file_name;
 use crate::rules::RuleId;
 
@@ -58,17 +62,34 @@ use preload::{device_checks, is_temporary, preload_checks, temporary_checks};
 use privileged::privileged_files;
 #[cfg(test)]
 use privileged::{
-    Closed, EXPECTED_CAPABILITIES, OTHER_CAPABILITIES, ROOT_CAPABILITIES, capabilities_below,
-    capability_names, getcap_failure, is_clause, mounts, parse_getcap, privileged,
+    Closed, EXPECTED_CAPABILITIES, OTHER_CAPABILITIES, ROOT_CAPABILITIES, mounts, privileged,
     unexpected_capabilities,
 };
 #[cfg(test)]
 use process::of_root;
-use process::{parse_status, processes};
+use process::{parse_status, proc_text, processes, started_at, ticks_since_boot};
 use program::{module_of, normalize, scripts, started_in, subject, told};
 
 /// Notes kept per item: one program can run as many processes.
 const MAX_NOTES: usize = 3;
+/// The most bytes of one note as JSON writes it (a control character takes
+/// six). A note names a path or two (each below 4 KiB, the kernel's limit)
+/// and what was seen; past that the text is what an account wrote (a
+/// library name in its environment, up to 128 KiB), and it may land on an
+/// item of root's, which root's results keep whole.
+const MAX_NOTE_BYTES: usize = 10 * 1024;
+
+/// The most files the live checks read and hash in one sweep. Any process
+/// names the files they look at (its program, the libraries it preloads),
+/// any user can mark a file of their own set-id, and each may be a sparse
+/// file of up to `MAX_HASHED_FILE_SIZE` that takes no disk space: at the
+/// 512 MiB limit and about 180 MB/s for the hash (measured on a laptop in
+/// 2026), 256 such files take some 13 minutes, which leaves the rest of the
+/// root collector's 30 for its other bounds (`MAX_VOUCHED`,
+/// `MAX_INSTALLED`) and its walk. A desktop's live checks read a few dozen
+/// programs and set-id files. Past the limit an item is kept with its
+/// alert, unread, and the sweep says files were left unread.
+const MAX_LOOKED_AT: usize = 256;
 
 /// What the live checks found.
 #[derive(Debug, Default)]
@@ -78,6 +99,32 @@ pub(super) struct Live {
     /// What was not looked at, each as a sentence (see
     /// `Collection::truncated`).
     pub(super) unchecked: Vec<String>,
+    /// The names of the items in `items` that only checks of what an
+    /// account chose found (see `Chooser`): an account decides how many of
+    /// those there are and what they are called.
+    pub(super) of_accounts: HashSet<String>,
+    /// The names of the items root's own checks or processes found, which
+    /// are root's wherever they are: root decides how many there are.
+    pub(super) of_root: HashSet<String>,
+}
+
+/// Who chose what a check looks at: root, or an account (its process, a
+/// file it owns or could have put where it is). Any account can start a
+/// process from any path it can write, listen on any free port and name a
+/// program what it likes, so it decides how many items such checks find.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+enum Chooser {
+    #[default]
+    Root,
+    Account,
+}
+
+impl Chooser {
+    /// Who chose what a process is: root only for one that is root's in
+    /// every respect (`Process::of_root`, `Status::of_root`).
+    fn of(of_root: bool) -> Self {
+        if of_root { Self::Root } else { Self::Account }
+    }
 }
 
 /// What a process's `status` says of it.
@@ -95,17 +142,33 @@ struct Status {
     of_root: bool,
 }
 
+/// A process whose program's path is not UTF-8 (see `not_utf8`).
+struct Unnamed {
+    pid: String,
+    /// The path of its program, escaped.
+    program: String,
+    /// Root's own process (see `Process::of_root`).
+    of_root: bool,
+}
+
 /// Every process the kernel lists, whoever it belongs to.
 struct Listed {
     pid: u32,
     status: Status,
     /// The name it was started under (its first argument); none for a
-    /// kernel thread.
-    started_as: Option<String>,
+    /// kernel thread, or a program that blanked its arguments.
+    started_as: Option<Vec<u8>>,
+    /// Whether the kernel marks it a kernel thread (`PF_KTHREAD` in its
+    /// `stat`): a program cannot set that, and it can blank its arguments.
+    kernel_thread: bool,
 }
 
 /// A running process, as far as it can be read.
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each is a separate fact read from /proc, not a state"
+)]
 struct Process {
     pid: String,
     /// The `exe` link's text (`/usr/bin/x`, `/x (deleted)`, `/memfd:y`).
@@ -116,10 +179,21 @@ struct Process {
     /// link's text alone does not say, since a file may be called
     /// `x (deleted)`.
     deleted: bool,
-    arguments: Vec<String>,
-    /// Its open files: each descriptor's number and where it leads.
-    fds: Vec<(u32, String)>,
+    /// Its command line as the kernel keeps it, each argument ended by a
+    /// null byte, cut at `process::MAX_START_BYTES` (see `arguments`).
+    cmdline: Vec<u8>,
+    /// What the checks use of its open files.
+    open: Descriptors,
+    /// The variables of its environment the checks read
+    /// (`process::READ_VARIABLES`), each ended by a null byte.
     environment: Option<Vec<u8>>,
+    /// More of its command line, or of those variables, was there than
+    /// was kept (`process::MAX_START_BYTES`).
+    read_in_part: bool,
+    /// What of it that names a file is not UTF-8 (see `process::not_utf8`).
+    not_utf8: Option<&'static str>,
+    /// The mark of its working directory (see `program::started_in`).
+    cwd_mark: Option<String>,
     /// Its working directory, relative to `/`: what a script given by a
     /// relative name is relative to.
     cwd: Option<String>,
@@ -133,6 +207,21 @@ struct Process {
     cgroup: String,
     /// Its network namespace, where that is not the sweep's own.
     network: Option<String>,
+}
+
+/// What the checks use of a process's open files (see
+/// `process::descriptors`).
+#[derive(Default)]
+struct Descriptors {
+    /// The sockets it holds, each once: the lowest descriptor that holds
+    /// it, and its inode.
+    sockets: Vec<(u32, u64)>,
+    /// Its input (descriptor 0) is a terminal: somebody typed its command.
+    on_terminal: bool,
+    /// It has a keyboard open (see `preload::reads_keys`).
+    keyboard: bool,
+    /// The camera (`/dev/video…`) on the lowest descriptor that holds one.
+    camera: Option<String>,
 }
 
 /// What the kernel appends to the name of a program whose file is gone.
@@ -161,23 +250,14 @@ impl Process {
         self.pid.parse().unwrap_or(0)
     }
 
-    /// Where descriptor `number` leads.
-    fn fd(&self, number: u32) -> Option<&str> {
-        self.fds
-            .iter()
-            .find(|(fd, _)| *fd == number)
-            .map(|(_, target)| target.as_str())
-    }
-
-    /// Whether its input is a terminal: somebody typed its command.
-    fn on_terminal(&self) -> bool {
-        self.fd(0)
-            .is_some_and(|target| target.starts_with("/dev/pts/") || target.starts_with("/dev/tty"))
+    /// Its arguments, its program's name first.
+    fn arguments(&self) -> Vec<String> {
+        process::arguments(&self.cmdline)
     }
 
     /// How it was started, shortened.
     fn started(&self) -> String {
-        self.arguments
+        self.arguments()
             .iter()
             .take(4)
             .map(String::as_str)
@@ -189,7 +269,7 @@ impl Process {
 /// Runs every live check against `scope` (its root holds `proc`).
 pub(super) fn check(scope: &Scope<'_>) -> Live {
     let mut found = Found::default();
-    let running = processes(&scope.root.join("proc"));
+    let running = processes(scope.root);
     if let Some(reason) = &running.unlistable {
         found.not_checked(
             scope,
@@ -216,8 +296,12 @@ pub(super) fn check(scope: &Scope<'_>) -> Live {
             ));
         }
     }
+    read_in_part(scope, &running, &mut found);
+    not_utf8(scope, &running, &mut found);
     for process in &running.processes {
-        program_checks(scope, process, &mut found);
+        found.through(Chooser::of(process.of_root), |found| {
+            program_checks(scope, process, found);
+        });
     }
     net::check(scope, &running, &mut found);
     kernel(scope, &mut found);
@@ -225,10 +309,105 @@ pub(super) fn check(scope: &Scope<'_>) -> Live {
     privileged_files(scope, &mut found);
     files::check(scope, &mut found);
     files::say_what_was_cut(scope, &mut found);
+    // What root's checks found as well is root's, whoever else led to it.
+    let of_root = found.of_root;
+    let mut of_accounts = found.of_accounts;
+    of_accounts.retain(|name| !of_root.contains(name));
     Live {
         items: found.items.into_values().collect(),
         notes: found.notes,
         unchecked: found.unchecked,
+        of_accounts,
+        of_root,
+    }
+}
+
+/// Says which processes held more of what the checks read than was kept
+/// (`process::MAX_START_BYTES`), or more environment than is read
+/// (`process::MAX_ENVIRON_BYTES`). Root's own leave the root checks
+/// incomplete. An account's is an item of the account's: it chose how
+/// much its process holds, and must not be able to mark root's results
+/// incomplete with it.
+fn read_in_part(scope: &Scope<'_>, running: &Running, found: &mut Found) {
+    let most = process::MAX_START_BYTES / 1024;
+    let environ = process::MAX_ENVIRON_BYTES / 1024 / 1024;
+    let (roots, accounts): (Vec<&Process>, Vec<&Process>) = running
+        .processes
+        .iter()
+        .filter(|process| process.read_in_part)
+        .partition(|process| process.of_root);
+    if !roots.is_empty() {
+        found.not_checked(
+            scope,
+            format!(
+                "{} of root's running process(es) were looked at only in part: past {most} KiB \
+                 of command line or of the library and Python search variables, or {environ} MiB \
+                 of environment",
+                roots.len()
+            ),
+        );
+    }
+    for process in accounts {
+        let note = format!(
+            "process {} ({}) was looked at only in part: past {most} KiB of command line or of \
+             the library and Python search variables, or {environ} MiB of environment",
+            process.pid,
+            process.started()
+        );
+        found.through(Chooser::Account, |found| {
+            found.add(scope, Category::Process, process.path(), note, None);
+        });
+    }
+}
+
+/// Says which processes name a file in a way that is not UTF-8, each as
+/// one alert, an item `proc/<number>` of whoever owns the process: like
+/// `read_in_part`, an account must not be able to mark root's results
+/// incomplete with a name it chose, and no item is named after a file such
+/// a name may stand for. A process whose program has such a name is not
+/// checked at all; the others are, but for what those names point to.
+/// Either may hide what it runs behind a name nothing can look up, so it
+/// is always an alert (the owner's decision: no packaged program has such
+/// a name, and a folder named so on a UTF-8 system is rare), and since
+/// the next process may take its number, the item cannot be allowed (see
+/// `state::not_allowable`).
+fn not_utf8(scope: &Scope<'_>, running: &Running, found: &mut Found) {
+    let unnamed = running.unnamed.iter().map(|unnamed| {
+        let note = format!(
+            "process {} ({}): the path of its program is not UTF-8, so it was not checked",
+            unnamed.pid, unnamed.program
+        );
+        (&unnamed.pid, unnamed.of_root, note)
+    });
+    let named = running.processes.iter().filter_map(|process| {
+        let part = process.not_utf8?;
+        // As the kernel keeps it, escaped: read lossily, an argument would
+        // name another file.
+        let started = process
+            .cmdline
+            .split(|byte| *byte == 0)
+            .filter(|argument| !argument.is_empty())
+            .take(4)
+            .map(|argument| argument.escape_ascii().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let note = format!(
+            "process {} ({started}): {part} is not UTF-8, so what it names was not checked",
+            process.pid
+        );
+        Some((&process.pid, process.of_root, note))
+    });
+    for (pid, of_root, note) in unnamed.chain(named) {
+        found.through(Chooser::of(of_root), |found| {
+            found.add_missing(
+                scope,
+                Category::Process,
+                &format!("proc/{pid}"),
+                "names what it runs in a way that is not UTF-8",
+                note,
+                RuleId::HiddenProgram,
+            );
+        });
     }
 }
 
@@ -244,6 +423,24 @@ struct Found {
     /// out to stay within the bound.
     hashed: u64,
     cut_short: bool,
+    /// Who chose what the check under way looks at; set only by `through`.
+    chooser: Chooser,
+    /// The names of the items each side's checks added (see `Chooser`).
+    /// Sets beside `items` rather than a field of `Item`: only the root
+    /// collector asks, once, and `Item` is shared with the user's sweep
+    /// and the results' format. A field would not remove `chooser` either:
+    /// the forty-odd places that add an item would each need it as one
+    /// more parameter (which takes `add_as` past clippy's limit on
+    /// arguments), or read it from here as they do now.
+    of_root: HashSet<String>,
+    of_accounts: HashSet<String>,
+    /// The files read for new items, set-id files and files with
+    /// capabilities, up to `MAX_LOOKED_AT`, and whether the limit was said.
+    looked_at: usize,
+    said_limit: bool,
+    /// What reading each file as each kind gave, so a program seen doing
+    /// many things (listening on many ports) is read once.
+    read: HashMap<(String, Category), Item>,
 }
 
 /// What reading one of the kernel's own files or directories gave.
@@ -266,6 +463,25 @@ fn source<T>(read: io::Result<T>) -> Source<T> {
 }
 
 impl Found {
+    /// Runs `check` on what `chooser` chose: the items it adds count as
+    /// that side's.
+    fn through(&mut self, chooser: Chooser, check: impl FnOnce(&mut Self)) {
+        let outer = std::mem::replace(&mut self.chooser, chooser);
+        check(self);
+        self.chooser = outer;
+    }
+
+    /// Notes that `chooser` added to the item `name`.
+    fn mark(&mut self, chooser: Chooser, name: &str) {
+        let side = match chooser {
+            Chooser::Root => &mut self.of_root,
+            Chooser::Account => &mut self.of_accounts,
+        };
+        if !side.contains(name) {
+            side.insert(name.to_string());
+        }
+    }
+
     /// Says what could not be looked at: for the root checks, which
     /// nothing stands behind, something left unchecked; a note in a user's
     /// sweep.
@@ -300,6 +516,17 @@ impl Found {
         }
     }
 
+    /// Whether one more file may be read, within `MAX_LOOKED_AT`; the first
+    /// time it may not, that is said as not checked, in a user's sweep too:
+    /// root's checks have a limit of their own, and do not stand behind it.
+    fn may_look(&mut self) -> bool {
+        may_look(
+            &mut self.looked_at,
+            &mut self.said_limit,
+            &mut self.unchecked,
+        )
+    }
+
     /// Adds what was seen about the file at `path`; one item per path.
     fn add(
         &mut self,
@@ -326,10 +553,39 @@ impl Found {
         note: String,
         alert: Option<RuleId>,
     ) {
-        let item = self
-            .items
-            .entry(name.to_string())
-            .or_insert_with(|| collect::item_named(scope, category, name, path));
+        let note = cut_note(note);
+        // What an account's process runs or loads is the account's even
+        // when the file is root's: it picks among every file root has (a
+        // program under `/usr/bin` with `LD_LIBRARY_PATH` set, any path in a
+        // mount namespace of its own, any file in `LD_PRELOAD`), far more
+        // than root's results hold. Root's own checks rank such a file
+        // root's where they find it themselves.
+        self.mark(self.chooser, name);
+        let Self {
+            items,
+            read,
+            looked_at,
+            said_limit,
+            unchecked,
+            ..
+        } = self;
+        let item = items.entry(name.to_string()).or_insert_with(|| {
+            let key = (path.to_string(), category);
+            let mut item = if let Some(seen) = read.get(&key) {
+                seen.clone()
+            } else if may_look(looked_at, said_limit, unchecked) {
+                let item = collect::item_named(scope, category, path, path);
+                read.insert(key, item.clone());
+                item
+            } else {
+                unread_item(scope, category, path, NOT_READ_PAST_LIMIT)
+            };
+            if name != path {
+                item.path = name.to_string();
+                item.file = Some(path.to_string());
+            }
+            item
+        });
         push_note(item, note.clone());
         if let Some(rule) = alert
             && !item.alerts.iter().any(|(existing, _)| *existing == rule)
@@ -349,23 +605,70 @@ impl Found {
         note: String,
         rule: RuleId,
     ) {
-        let item = self.items.entry(path.to_string()).or_insert_with(|| Item {
-            file: None,
-            origin: scope.origin,
-            category,
-            path: path.to_string(),
-            tier: Tier::Unknown,
-            sha256: None,
-            body: Body::Unreadable(reason.to_string()),
-            runs: Vec::new(),
-            run_by: None,
-            notes: Vec::new(),
-            alerts: Vec::new(),
-        });
+        let note = cut_note(note);
+        self.mark(self.chooser, path);
+        let item = self
+            .items
+            .entry(path.to_string())
+            .or_insert_with(|| unread_item(scope, category, path, reason));
         push_note(item, note.clone());
         if !item.alerts.iter().any(|(existing, _)| *existing == rule) {
             item.alerts.push((rule, note));
         }
+    }
+}
+
+/// `note` cut to `MAX_NOTE_BYTES` as written in JSON.
+fn cut_note(mut note: String) -> String {
+    let mut written = 0;
+    let end = note.char_indices().find_map(|(index, character)| {
+        written += json::written_len(character);
+        (written > MAX_NOTE_BYTES).then_some(index)
+    });
+    if let Some(end) = end {
+        note.truncate(end);
+        note.push('…');
+    }
+    note
+}
+
+/// Counts one more file read in `looked_at`, within `MAX_LOOKED_AT`; past
+/// it says so once, in `unchecked`.
+fn may_look(looked_at: &mut usize, said_limit: &mut bool, unchecked: &mut Vec<String>) -> bool {
+    if *looked_at < MAX_LOOKED_AT {
+        *looked_at += 1;
+        return true;
+    }
+    if !*said_limit {
+        *said_limit = true;
+        unchecked.push(format!(
+            "the live checks read at most {MAX_LOOKED_AT} files: the rest of the programs, libraries, modules, set-id files and files with capabilities they found are listed unread"
+        ));
+    }
+    false
+}
+
+/// Why an item past `MAX_LOOKED_AT` was not read. The judge tells it from
+/// a file only root can read by this text.
+pub(in crate::sweep) const NOT_READ_PAST_LIMIT: &str =
+    "not read: the live checks' limit of 256 files was reached";
+
+const _: () = assert!(MAX_LOOKED_AT == 256, "NOT_READ_PAST_LIMIT names the limit");
+
+/// An item for `path` that the live checks did not read, for `reason`.
+fn unread_item(scope: &Scope<'_>, category: Category, path: &str, reason: &str) -> Item {
+    Item {
+        file: None,
+        origin: scope.origin,
+        category,
+        path: path.to_string(),
+        tier: Tier::Unknown,
+        sha256: None,
+        body: Body::Unreadable(reason.to_string()),
+        runs: Vec::new(),
+        run_by: None,
+        notes: Vec::new(),
+        alerts: Vec::new(),
     }
 }
 
@@ -417,6 +720,12 @@ struct Running {
     /// Why the list of processes itself could not be read, where it is
     /// there: nothing above says anything of what runs then.
     unlistable: Option<String>,
+    /// Processes not checked: the path of their program is not UTF-8.
+    unnamed: Vec<Unnamed>,
+    /// When the list was read, in ticks since boot (see `ticks_since_boot`):
+    /// a process missing from it that started before then was hidden from
+    /// it, whatever a later list shows.
+    listed_at: Option<u64>,
 }
 
 /// Whether `process` runs a repository package's program and nothing else:

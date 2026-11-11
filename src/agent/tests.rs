@@ -101,6 +101,22 @@ fn claude_code_results_are_judged_like_opencode_ones() {
         claude_verdict(began, Some(Failure::TimedOut), "n1"),
         Err(AgentError::OutOfTime(_))
     ));
+    // Claude Code writes a block only once it is done: a timeout after the
+    // CLI had the request is out of time, one before it is unavailable.
+    let init = "{\"type\":\"system\",\"subtype\":\"init\"}\n";
+    assert!(matches!(
+        claude_verdict(init, Some(Failure::TimedOut), "n1"),
+        Err(AgentError::OutOfTime(_))
+    ));
+    assert!(matches!(
+        claude_verdict("", Some(Failure::TimedOut), "n1"),
+        Err(AgentError::Unavailable(_))
+    ));
+    // Any other failure after `init` stays unavailable.
+    assert!(matches!(
+        claude_verdict(init, Some(Failure::Failed("exited with 1".into())), "n1"),
+        Err(AgentError::Unavailable(_))
+    ));
     // Only Guardian's own time limit is a timeout; the CLI saying so is a
     // failure like any other.
     assert!(matches!(

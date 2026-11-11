@@ -1,7 +1,7 @@
 //! Tests for `rules`.
 
-use super::destructive::removes_root_or_home;
 use super::matchers::is_encoded_data_executed;
+use super::removal::removes_root_or_home;
 use super::{
     RuleId, Scheme, extract_network_destinations, is_documentation, is_download_piped_to_shell,
     is_ip_host, is_sensitive_path, line_rules, looks_like_credential_exfiltration,
@@ -559,8 +559,63 @@ fn recursive_removal_only_matches_root_or_home_itself() {
         "rm -r --no-preserve-root /",
         "rm -rf \"$home\"",
         "rm -rf ${home}/*",
+        "rm -rf ${home}",
         "/usr/bin/rm -rf ~",
         "rm / -rf",
+        // A separator, group or substitution glued to the command or the
+        // target.
+        ":;rm -rf /",
+        "true&&rm -rf /",
+        ":|rm -rf /",
+        "$(:)rm -rf /",
+        "`:`rm -rf /",
+        "${v}rm -rf /",
+        "{ rm -rf /;}",
+        "rm -rf /&",
+        "rm -rf 2>&1 /",
+        // A separator inside quotes, `${…}` or a substitution ends
+        // nothing outside it, and a substitution's words are its own.
+        "rm -rf $(:) /*",
+        "rm -rf `:` /*",
+        "rm -rf \"$(:)\" /*",
+        "rm -rf $(echo x) /*",
+        "rm -rf $(true) ~",
+        "rm -fr -- $(:) ~",
+        "rm -rf \"$(printf x)\" ~/*",
+        "rm -rf \"$srcdir\"/x $(:) ~/",
+        "rm -rf \"a;b\" /*",
+        "rm -rf \"a ; b\" /*",
+        "rm -rf 'a|b' /*",
+        "rm -rf ${x/;/} /*",
+        "rm -rf ${x:-a&b} /*",
+        "rm -rf $((0)) /",
+        "(rm -rf /)",
+        "x=$(rm -rf ~)",
+        "x=`rm -rf ~`",
+        "x=${ rm -rf /; }",
+        "diff <(rm -rf /) x",
+        "rm -rf <(:) /",
+        "rm -rf ${ :; } /",
+        "rm -rf \"a\\\"; b\" /*",
+        // A substitution the next line closes.
+        "x=$(rm -rf /",
+        // Redirections, glued or not.
+        "rm -rf &>/dev/null /*",
+        "rm -rf >|/dev/null /*",
+        "rm -rf /*>/dev/null",
+        "rm -rf /*</dev/null",
+        // Quotes and escapes bash takes out.
+        "rm -rf '/'*",
+        "rm -rf \"/\"*",
+        "rm -rf x\\; /*",
+        "$v\\rm -rf /*",
+        "$v\"rm\" -rf /*",
+        "$v'rm' -rf /*",
+        // `$HOME` in spellings that are `$HOME` when it is set.
+        "rm -rf ${home:?}/",
+        "rm -rf \"${home:?}\"/*",
+        "rm -rf ${home:-/x}",
+        "rm -rf ${home%/}",
     ] {
         assert!(removes_root_or_home(dangerous), "missed {dangerous:?}");
     }
@@ -571,7 +626,174 @@ fn recursive_removal_only_matches_root_or_home_itself() {
         "rm -rf ~/.cache/thing",
         "rm -f /",
         "rm -rf build; ls /",
+        "rm -rf build;ls /",
+        "rm -rf build&ls /",
+        "rm -rf build|ls /",
         "echo rm -rf",
+        "echo x;rm -f /",
+        "rm -rf build # /",
+        "rm -rf build >/",
+        "rm -rf build 2>/",
+        "rm -rf ${homedir}",
+        "rm -rf $homedir",
+        "echo $(rm -f /)",
+        "rm -rf $(echo build) && ls ~",
+        "rm -rf build; ls ~",
+    ] {
+        assert!(!removes_root_or_home(ordinary), "flagged {ordinary:?}");
+    }
+}
+
+#[test]
+fn recursive_removal_reads_targets_and_flags_as_rm_takes_them() {
+    for dangerous in [
+        "rm --recursive ~",
+        "rm --recu ~",
+        "rm --r ~",
+        "rm -rf /./*",
+        "rm -rf ~/./*",
+        "rm -rf $home/./*",
+        "rm -rf /../*",
+        "rm -rf $home*",
+        // Every operation on `$HOME` but `+` and `:+` leaves home when it
+        // is set, and the parameter ends at its own `}`.
+        "rm -rf ${home#x}",
+        "rm -rf \"${home#/nonexistent}\"",
+        "rm -rf ${home:0}",
+        "rm -rf \"${home/x/y}\"",
+        "rm -rf \"${home,,}\"",
+        "rm -rf \"${home^^}\"",
+        "rm -rf \"${home@e}\"",
+        "rm -rf \"${home:-${x}}\"",
+        "rm -rf ${home:-$x}",
+        "rm -rf \"${home:-${pwd}}\"",
+        "rm -rf ${home%${x}}",
+        "rm -rf ${home#{}/",
+    ] {
+        assert!(removes_root_or_home(dangerous), "missed {dangerous:?}");
+    }
+    for ordinary in [
+        // A path below home that ends in a variable.
+        "rm -rf \"$home/.cache/$pkgname\"",
+        "rm -rf $home/.local/share/$app",
+        "rm -rf \"${home}/.config/${name}\"",
+        "rm -rf \"$home\"/.cache/\"$pkg\"",
+        "rm -rf \"${home:?}/.cache/${pkg:?}\"",
+        "rm -rf ${home:+/tmp/x}",
+        "rm -rf ${home+x}",
+        "rm --rf ~",
+        "rm -f -- ~",
+        "rm -rf *",
+        "rm -rf ~*",
+        // `rm` refuses a path that ends in `.` or `..`.
+        "rm -rf /.",
+        "rm -rf /./",
+        "rm -rf ~/..",
+    ] {
+        assert!(!removes_root_or_home(ordinary), "flagged {ordinary:?}");
+    }
+}
+
+#[test]
+fn recursive_removal_reads_quotes_comments_and_compounds_as_bash_does() {
+    for dangerous in [
+        // In `$'…'` a backslash keeps the quote after it.
+        "echo $'a\\'b c'; rm -rf ~",
+        "echo $'\\''; rm -rf /*",
+        "$\"rm\" -rf ~",
+        // A `#` after a quote or substitution, or inside a word, is a
+        // letter.
+        "rm -rf \"\"# /*",
+        "rm -rf ''# ~",
+        "rm -rf $(:)# /*",
+        "rm -rf `:`# ~",
+        "rm -rf ${ :; }# /*",
+        "rm -rf <(:)# /*",
+        "rm -rf x#y ~",
+        // A `case` pattern's `)` and a group's `}` end no substitution.
+        "x=\"$(case a in a) rm -rf ~;; esac)\"",
+        ": ${x:-$(case a in a) rm -rf ~;; esac)}",
+        "x=\"${ { :; }; rm -rf ~; }\"",
+        "x=\"$(if :; then case a in a) rm -rf ~;; esac; fi)\"",
+        "x=\"$(case x in a) :;; esac)\"; rm -rf ~",
+        "x=\"$(case x in case) :;; esac)\"; rm -rf ~",
+        "x=\"$(\\case a in a)\"; rm -rf ~",
+        "x=\"$(case x in a) :;; case) :;; esac)\"; rm -rf ~",
+        "x=\"$(echo case x)\"; rm -rf ~",
+        "x=\"${ { :; }; }\"; rm -rf ~",
+        "echo $(\"esac\") ; rm -rf ~",
+        // Parentheses nested in arithmetic or an extglob.
+        "rm -rf $(( 2*(3+(4)) )) ~",
+        "rm -rf $(( x=((0)) ))/ ~",
+        "rm -rf $(echo $(( 2*(1+(1)) ))) ~",
+        "rm -rf @(a@(b)) ~",
+        // A `}` ends `${ …; }` only where a command may start.
+        "x=\"${ echo }; rm -rf ~; }\"",
+        "x=\"${ x}; rm -rf ~; }\"",
+        "x=${| rm -rf ~; }",
+        "x=\"${\trm -rf ~; }\"",
+        "x=\"${\nrm -rf ~; }\"",
+        "echo \"`rm -rf ~`\"",
+        // A backtick substitution ends at the next backtick no backslash
+        // escapes, whatever quotes, `#` or `$(` stand before it.
+        "x=`echo '`; rm -rf ~",
+        "x=`echo #`; rm -rf /",
+        "rm -rf `echo ${x` ~",
+        "rm -rf `echo $(` ~",
+        "x=\"`echo '`\"; rm -rf ~",
+        "`echo \\`rm -rf ~\\``",
+        "x=`echo \\\"; rm -rf ~`",
+        // Blanks, line breaks and joined lines.
+        "rm\t-rf\t/",
+        "echo x\nrm -rf /",
+        "rm -rf ~\\\n/",
+        "rm -rf /$(echo",
+        // A variable or a positional parameter glued to the command.
+        "$1rm -rf ~",
+        "$9rm -rf /*",
+        "$@rm -rf ~",
+        "\"$@\"rm -rf ~",
+        "rm$u -rf ~",
+        "rm${u} -rf ~",
+        "r${u}m -rf ~",
+        "rm\"$u\" -rf ~",
+        "$v_x\\rm -rf /",
+        // Redirections.
+        "rm -rf 2>/dev/null ~",
+        "rm -rf &>>x ~",
+        // An extglob is one word, and `!(…)` is `!` and a subshell.
+        "rm -rf @(x) /",
+        "a=($(rm -rf /))",
+        "a=(<(rm -rf /))",
+        "a=(>(rm -rf ~) x)",
+        "!(rm -rf /)",
+        // makepkg turns extglob on, so `!(…)` past the command is a pattern.
+        "rm -rf \"$pkgdir\"/usr/share/locale/!(en) ~",
+        "rm -rf -- !(keep) /",
+    ] {
+        assert!(removes_root_or_home(dangerous), "missed {dangerous:?}");
+    }
+}
+
+#[test]
+fn recursive_removal_passes_over_what_bash_does_not_remove() {
+    for ordinary in [
+        "{rm -rf /;}",
+        "rm -rf build > /",
+        "a=(rm -rf /*)",
+        // A `*` or `~` that bash reads as itself.
+        "rm -rf /\\*",
+        "rm -rf \"/*\"",
+        "rm -rf '/*'",
+        "rm -rf \"/\\*\"",
+        "rm -rf \"~\"",
+        "rm -rf ''~",
+        "rm -rf $(:)~",
+        "rm -rf ~$(:)",
+        "rm -rf ~\"/\"",
+        // A function named `rm`, and a `case` pattern.
+        "rm() (ls -r /)",
+        "case $x in rm) ls -r /;; esac",
     ] {
         assert!(!removes_root_or_home(ordinary), "flagged {ordinary:?}");
     }
@@ -1132,8 +1354,8 @@ fn a_long_word_of_startup_files_is_read_once() {
 
 #[test]
 fn commands_that_share_their_arguments_cost_one_pass() {
-    use super::destructive::removes_root_or_home;
     use super::matchers::is_remote_shell;
+    use super::removal::removes_root_or_home;
     let removals = "rm -rf ".repeat(30_000);
     assert!(!removes_root_or_home(&removals));
     assert!(removes_root_or_home(&format!("{removals}/")));
@@ -1153,6 +1375,17 @@ fn commands_that_share_their_arguments_cost_one_pass() {
     ] {
         assert_eq!(removes_root_or_home(line), removes, "{line}");
     }
+    // Each letter of a nested `${…}` goes to its word in one step.
+    let nested = "${x:-".repeat(50_000);
+    assert!(!removes_root_or_home(&format!(
+        "{nested}{}",
+        "a".repeat(50_000)
+    )));
+    assert!(removes_root_or_home(&format!(
+        "{nested}{}rm -rf /",
+        "}".repeat(50_000)
+    )));
+    assert!(!removes_root_or_home(&format!("rm -rf {nested}/")));
     let listeners = "nc ".repeat(50_000);
     assert!(!is_remote_shell(&listeners));
     assert!(is_remote_shell(&format!("{listeners}-e sh")));
@@ -1627,4 +1860,437 @@ fn a_substitution_in_a_quote_is_text_unless_a_shell_is_given_it() {
     ] {
         assert!(fetched_files(line).is_empty(), "{line}");
     }
+}
+
+/// `line` as a shell reads it, its readings one per line, or as written.
+fn read_or_line(line: &str) -> String {
+    let reads = super::as_shell_reads(line);
+    if reads.is_empty() {
+        line.to_string()
+    } else {
+        reads.join("\n")
+    }
+}
+
+#[test]
+fn quoted_data_after_a_nested_quote_stays_data() {
+    // makepkg's own `sudo.sh`: the quotes inside `$(…)` are not followed,
+    // and the `")"` they leave must not start a command.
+    let line = r#"warning "$(gettext "Cannot find the %s binary. Will use %s to acquire root privileges.")" "sudo" "su""#;
+    let read = read_or_line(line);
+    assert!(
+        !rules_for(&read).contains(&RuleId::PrivilegeEscalation),
+        "{read}"
+    );
+}
+
+#[test]
+fn a_line_is_read_as_the_shell_reads_its_words() {
+    use super::as_shell_reads;
+    for (line, read) in [
+        ("cu''rl x", "curl x"),
+        ("c\"u\"rl x", "curl x"),
+        ("c\\url x", "curl x"),
+        ("\\rm -rf /", "rm -rf /"),
+        ("curl${ifs}x", "curl x"),
+        ("curl${IFS}x", "curl x"),
+        ("curl$ifs-x", "curl -x"),
+        ("rm${ifs:0:1}-rf${ifs:0:1}/", "rm -rf /"),
+        ("cu$@rl x", "curl x"),
+        ("cu${*}rl x", "curl x"),
+        ("curl x|$@sh", "curl x|sh"),
+        // Quotes around a part of a word, both of the pair.
+        ("'cu'rl x", "curl x"),
+        ("r\"m\" -rf /", "rm -rf /"),
+        ("\"r\"m -rf /", "rm -rf /"),
+        ("\"c\"'u'\"rl\" x", "curl x"),
+        ("c\"u\"'r'l x", "curl x"),
+        ("''sh x", "sh x"),
+        ("curl'' x", "curl x"),
+        ("\"c\"\"url\" x", "curl x"),
+        ("caf\u{e9}''s", "caf\u{e9}s"),
+        // A quote of the other kind inside one is a letter.
+        ("\"it's\"x y", "it'sx y"),
+        // One quoted string where a command or a flag stands.
+        ("'rm' -rf /", "rm -rf /"),
+        ("rm \"-rf\" /", "rm -rf /"),
+        ("sudo 'rm' -rf /", "sudo rm -rf /"),
+        ("cd x; 'rm' -rf /", "cd x; rm -rf /"),
+    ] {
+        assert_eq!(as_shell_reads(line), [read], "{line}");
+    }
+}
+
+#[test]
+fn a_command_is_read_wherever_one_stands_and_data_stays_data() {
+    use super::as_shell_reads;
+    for (line, read) in [
+        // Wherever a command is still to come, and as what one acts on.
+        ("'sudo' 'rm' -rf /", "sudo rm -rf /"),
+        (
+            "/usr/bin/sudo -u root 'rm' -rf /",
+            "/usr/bin/sudo -u root rm -rf /",
+        ),
+        ("{ 'rm' -rf /; }", "{ rm -rf /; }"),
+        ("if 'rm' -rf /; then", "if rm -rf /; then"),
+        ("timeout 5 'rm' -rf /", "timeout 5 rm -rf /"),
+        ("x=1 'rm' -rf /", "x=1 rm -rf /"),
+        ("`'rm' -rf /`", "`rm -rf /`"),
+        ("ufw 'disable'", "ufw disable"),
+        ("nft flush \"ruleset\"", "nft flush ruleset"),
+        // `$''` is empty, and so is a part of `IFS` past its end.
+        ("r$''m -rf /", "rm -rf /"),
+        ("cu$\"\"rl x", "curl x"),
+        ("r${IFS:3}m -rf /", "rm -rf /"),
+        ("r${IFS:0:0}m -rf /", "rm -rf /"),
+        ("rm${IFS: -1}-rf /", "rm -rf /"),
+        ("r${IFS:0:-3}m -rf /", "rm -rf /"),
+        ("rm${IFS:0:-1}-rf /", "rm -rf /"),
+        ("r${IFS: -5}m -rf /", "rm -rf /"),
+        ("rm${IFS:-3:0}-rf /", "rm -rf /"),
+        ("sudo -E -u root 'rm' -rf /", "sudo -E -u root rm -rf /"),
+        ("chroot /mnt 'rm' -rf /", "chroot /mnt rm -rf /"),
+        ("f() { 'rm' -rf /; }", "f() { rm -rf /; }"),
+        ("function f { 'rm' -rf /; }", "function f { rm -rf /; }"),
+        (
+            "case $x in *) 'rm' -rf / ;; esac",
+            "case $x in *) rm -rf / ;; esac",
+        ),
+        (">/dev/null 'rm' -rf /", ">/dev/null rm -rf /"),
+        ("eval 'rm' -rf /", "eval rm -rf /"),
+        ("pkexec 'rm' -rf /", "pkexec rm -rf /"),
+        ("> /dev/null 'rm' -rf /", "> /dev/null rm -rf /"),
+        ("2> /dev/null 'rm' -rf /", "2> /dev/null rm -rf /"),
+        ("&> /dev/null 'rm' -rf /", "&> /dev/null rm -rf /"),
+        ("a=() 'ufw' disable", "a=() ufw disable"),
+        (
+            "runuser -u root -- 'ufw' 'disable'",
+            "runuser -u root -- ufw disable",
+        ),
+        ("flock /tmp/l 'rm' -rf /", "flock /tmp/l rm -rf /"),
+        ("coproc x { 'rm' -rf /; }", "coproc x { rm -rf /; }"),
+        (
+            "f() while 'rm' -rf /; do break; done",
+            "f() while rm -rf /; do break; done",
+        ),
+        (
+            "case x in (a) 'rm' -rf / ;; esac",
+            "case x in (a) rm -rf / ;; esac",
+        ),
+        ("$(echo env) 'rm' -rf /", "$(echo env) rm -rf /"),
+        ("{fd}>/dev/null 'rm' -rf /", "{fd}>/dev/null rm -rf /"),
+        ("{fd}> /dev/null 'rm' -rf /", "{fd}> /dev/null rm -rf /"),
+        ("chrt -f 99 'rm' -rf /", "chrt -f 99 rm -rf /"),
+        ("x[0]=1 'rm' -rf /", "x[0]=1 rm -rf /"),
+        ("a[x=y]=1 'rm' -rf /", "a[x=y]=1 rm -rf /"),
+        ("a[b[0]]+=1 'rm' -rf /", "a[b[0]]+=1 rm -rf /"),
+        ("a[']']=1 'rm' -rf /", "a[']']=1 rm -rf /"),
+        ("a[\\]]=1 'rm' -rf /", "a[\\]]=1 rm -rf /"),
+        (
+            "case x in *(x)) 'rm' -rf / ;; esac",
+            "case x in *(x)) rm -rf / ;; esac",
+        ),
+        ("case x in @(a|b)) 'rm' -rf /", "case x in @(a|b)) rm -rf /"),
+        ("x=$(echo a\\\\) 'rm' -rf /", "x=$(echo a\\\\) rm -rf /"),
+        ("x=(a\\\\) 'rm' -rf /", "x=(a\\\\) rm -rf /"),
+        (
+            "r${IFS:9223372036854775807:9223372036854775807}m -rf /",
+            "rm -rf /",
+        ),
+        // A backslash before a flag's dash or a path's slash.
+        ("rm \\-rf \\/", "rm -rf /"),
+    ] {
+        assert_eq!(as_shell_reads(line), [read], "{line}");
+    }
+}
+
+#[test]
+fn a_parenthesis_closes_where_it_stands_and_a_case_pattern_closes_none() {
+    use super::as_shell_reads;
+    for (line, read) in [
+        // A `)` inside a word closes its `(` there.
+        ("x=$(echo y)/bin 'rm' -rf /", "x=$(echo y)/bin rm -rf /"),
+        ("x=$(echo y)z 'rm' -rf /", "x=$(echo y)z rm -rf /"),
+        ("x=$(echo y)\"\" 'rm' -rf /", "x=$(echo y) rm -rf /"),
+        (
+            "x=$(echo y)$(echo z) 'rm' -rf /",
+            "x=$(echo y)$(echo z) rm -rf /",
+        ),
+        // A `case` pattern's `)` inside a substitution closes no `(`.
+        (
+            "echo $(case y in y) 'rm' -rf / ;; esac)",
+            "echo $(case y in y) rm -rf / ;; esac)",
+        ),
+        (
+            "echo $(case y in y) ;; esac) 'sudo' x; (case a in *(b)|c) 'rm' -rf /;; esac)",
+            "echo $(case y in y) ;; esac) sudo x; (case a in *(b)|c) rm -rf /;; esac)",
+        ),
+    ] {
+        assert_eq!(as_shell_reads(line), [read], "{line}");
+    }
+    for line in [
+        "echo $(date) 'sudo' x",
+        "echo $(echo y)z 'sudo' x",
+        "echo `date` 'sudo' x",
+        "echo $(a)$(b) 'ufw' disable",
+    ] {
+        assert!(as_shell_reads(line).is_empty(), "{line}");
+    }
+    // `%s(` is no parenthesis bash takes: the quotes around it were misread,
+    // and the arguments after it stay arguments.
+    let line = "msg \"$(gettext \"Run %s()...\")\" \"sudo\" \"ls\"";
+    let read = as_shell_reads(line).join("\n");
+    assert!(read.ends_with(" \"sudo\" \"ls\""), "{read}");
+}
+
+#[test]
+fn a_case_is_never_ended_by_text_bash_may_not_read_as_esac() {
+    use super::as_shell_reads;
+    // Bash runs `rmx` in each: a `case` is read wherever its word stands,
+    // and no `esac` ends one.
+    for line in [
+        "echo $(f() case y in y) 'rm' -rf / ;; esac; f)",
+        "echo $(f() { case y in y) 'rm' -rf / ;; esac; }; f)",
+        "echo $(function f case y in y) 'rm' -rf / ;; esac; f)",
+        "echo $(coproc x { case y in y) 'rm' -rf / ;; esac; })",
+        "echo $(for ((i=0;i<1;i++)) do case y in y) 'rm' -rf / ;; esac; done)",
+        "echo $(if (true) then case y in y) 'rm' -rf / ;; esac; fi)",
+        "echo $(case y in z) `esac` ;; y) 'rm' -rf / ;; esac)",
+        "echo $(case esac in *|esac) 'rm' -rf / ;; esac)",
+        "echo $(case y in z) [[ a || esac ]] ;; y) 'rm' -rf / ;; esac)",
+        "echo $(case y in z) echo >|esac ;; y) 'rm' -rf / ;; esac)",
+        // After `]]` a reserved word, and then a command, may follow.
+        "if [[ -e / ]] then 'rm' -rf /; fi",
+        "while [[ 1 ]] do 'rm' -rf /; done",
+        // Bash ends a backtick substitution inside single quotes too.
+        "echo `echo '`; 'rm' -rf /; : '`'",
+        // ... after it reads an escaped backtick there as a letter, and in
+        // double quotes.
+        "echo `echo '\\`'` ; 'rm' -rf /",
+        "x=`printf '\\`'`; 'rm' -rf /",
+        "echo `echo \"`; 'rm' -rf /",
+        // After `]]` a command may follow, whatever came before it.
+        "if [[ ( -e / ) ]] then 'rm' -rf /; fi",
+        "if [[ -e / && ( -e / ) ]] then 'rm' -rf /; fi",
+        // A `case` right after a `)` is a keyword.
+        "echo $(f()case y in y) 'rm' -rf / ;; esac; f)",
+        // A `(` inside `${…}` opens nothing.
+        "case y in x) echo ${v//(/} ;; y) 'rm' -rf / ;; esac",
+        "x=$(echo ${v:-(}) 'rm' -rf /",
+        // Quotes inside `${…}` are quotes, a bare `{` nests nothing, and
+        // `$(…)` and backticks there are substitutions.
+        "echo ${v:-'}'} ; 'rm' -rf /",
+        "echo ${v:-'}'} ; r''m -rf /",
+        "echo ${v%\"}\"*} ; 'rm' -rf /",
+        "echo ${v:-{} ; 'rm' -rf /",
+        "case y in x) echo ${v:-'}'} ;; y) 'rm' -rf / ;; esac",
+        "echo ${v:-$( 'rm' -rf /)}",
+        "x=${v:-$( 'rm' -rf /)}",
+        "echo ${v:-` 'rm' -rf /`}",
+        // `$${` is `$$` and a `{`; a `${` left open, or one that holds a
+        // `|`, ends at the statement's end.
+        "echo $${ ; 'rm' -rf /",
+        "echo ${v//a|b/} ; 'rm' -rf /",
+        // Bash 5.3 runs what is in `${ …; }` and `${| …; }`.
+        "echo ${ 'rm' -rf /; }",
+        "x=${| 'rm' -rf /; }",
+        "echo ${ echo ')'; } ; 'rm' -rf /",
+        "x=${ echo; } 'rm' -rf /",
+        "x=${| echo; } 'rm' -rf /",
+        "x=$(echo $${ ) 'rm' -rf /",
+        // A `${` left open in one backtick substitution is not open in the
+        // next.
+        "echo `echo ${v:-` ; echo `( 'rm' -rf / )`",
+        // A line that leaves a `${` open (bash reads on to the next line)
+        // is read as if `${` were letters, which hides nothing after it.
+        "x=${v:-a ; ( 'rm' -rf / )",
+        // A blank, `;`, `|` and `&` inside `${…}` are letters.
+        "x=${v// /} 'rm' -rf /",
+        "x=${v:-a b} 'rm' -rf /",
+        "x=${v:- } 'rm' -rf /",
+        "x=${v//a|b} 'rm' -rf /",
+        "x=${v//[;]/} 'rm' -rf /",
+        "x=${v:-a&b} 'rm' -rf /",
+        "x=$(echo ${v//a|x y%(/}) 'rm' -rf /",
+        "echo `x=${v:-a b} 'rm' -rf /`",
+        // A `{ …; }` group, or a `$(case …)`, inside `${ …; }` leaves it
+        // open until its own `}`; a `}` that is an argument ends nothing.
+        "x=${ { echo; }; } 'rm' -rf /",
+        "x='a b'${| { echo; }; } 'rm' -rf /",
+        "x=${ : $(case y in y) echo ;; esac); } 'rm' -rf /",
+        "x=${ echo }; } 'rm' -rf /",
+        // What touches a closing backtick is of one word with it.
+        "x=`:`a 'rm' -rf /",
+        "x=`echo`\"a b\" \"rm\" -rf /",
+        "y=${v/`true`*} 'rm' -rf /",
+        // An escaped `$(` or `<(` inside `${…}` opens nothing.
+        "x=${v:-\\$(} 'rm' -rf /",
+        "x=${v:-\\<(} 'rm' -rf /",
+        // `$$'…'` is `$$` and a plain quote; `\\$'…'` is a backslash and a
+        // `$'…'`; `\$'…'` is a `$` and a plain quote.
+        "echo $$'\\' ; 'rm' -rf /",
+        "echo \\\\$'\\'' ; 'rm' -rf /",
+        "echo \\$'\\' ; 'rm' -rf /",
+        // In `$'…'` a backslash keeps the quote after it.
+        "echo $'\\'' ; 'rm' -rf /",
+    ] {
+        let read = as_shell_reads(line).join("\n");
+        assert!(read.contains(" rm -rf /"), "{line}: {read}");
+    }
+}
+
+#[test]
+fn a_command_after_a_brace_or_a_backtick_is_read_whatever_is_left_open() {
+    use super::as_shell_reads;
+    // Bash 5.3 runs `rm` in each: a `${` left open (a `case` inside it
+    // never ends, or the line ends first), a separator right after a
+    // closing backtick, and a `{` or `}` that is only a word in `${ …; }`.
+    for line in [
+        "x=${v// /} 'rm' -rf /; : ${v:-$(case a in a) ;; esac)}",
+        "x=$(echo ${v:-(}) 'rm' -rf / # ${",
+        "case y in x) echo ${v//(/} ;; y) 'rm' -rf / ;; esac # ${",
+        "echo `:`;x=1 'rm' -rf /",
+        "echo `:`;timeout 5 'rm' -rf /",
+        "echo `:`;if 'rm' -rf /; then :; fi",
+        "echo `:`;{ 'rm' -rf /; }",
+        "echo `:`&&env 'rm' -rf /",
+        "x=${ command {; } 'rm' -rf /",
+        "x=${ a=1 {; } 'rm' -rf /",
+        "x=${ nohup {; } 'rm' -rf /",
+        "x=${ : `{`; } 'rm' -rf /",
+        "x=${ a=1 }; } 'rm' -rf /",
+        "x=${ command }; } 'rm' -rf /",
+        "x=$(echo ${v:-)}) 'rm' -rf /",
+        "case y in x) echo ${v:-)} ;; y) 'rm' -rf / ;; esac",
+        "x=${ echo a}b; } 'rm' -rf /",
+    ] {
+        let read = as_shell_reads(line).join("\n");
+        assert!(
+            read.contains(" rm -rf /") || read.contains(";rm -rf /") || read.contains("&rm -rf /"),
+            "{line}: {read}"
+        );
+        // Only a line that leaves a `${` open is read a second time.
+        let open = line.contains("# ${") || line.contains("esac)}");
+        assert_eq!(read.contains('\n'), open, "{line}: {read}");
+    }
+}
+
+#[test]
+fn a_removal_bash_runs_is_flagged_however_its_words_are_glued() {
+    use super::as_shell_reads;
+    // Bash 5.3 runs `rm -rf /` in each.
+    for line in [
+        ":;'rm' -rf /",
+        ":;\\rm -rf /",
+        "$(:)'rm' -rf /",
+        "${v}'rm' -rf /",
+        "${v:-}'rm' -rf /",
+        "${v#x}'rm' -rf /",
+        "`:`'rm' -rf /",
+        "x=$(: ${ nohup {; }) 'rm' -rf /",
+        "x=$(: ${ a=1 {; }) 'rm' -rf /",
+        "x=$(echo ${ echo `{`; }) 'rm' -rf /",
+        "x=$(: ${ command {; }}) 'rm' -rf /",
+    ] {
+        let read = read_or_line(line);
+        assert!(
+            rules_for(&read).contains(&RuleId::DestructiveSystemOperation),
+            "{line}: {read}"
+        );
+    }
+    // A `}` that is only a word leaves the next one where it stands.
+    assert!(as_shell_reads("echo } 'sudo' x").is_empty());
+    // `$${` is `$$` and a `{`, which holds no command.
+    assert!(as_shell_reads("echo $${ 'rm' -rf /; }").is_empty());
+}
+
+#[test]
+fn a_word_after_a_blank_after_a_backtick_is_its_own() {
+    use super::as_shell_reads;
+    // `a` is the command here, and what follows it its arguments.
+    let read = as_shell_reads("x=`:` a 'rm' -rf /").join("\n");
+    assert!(!read.contains(" rm -rf /"), "{read}");
+}
+
+#[test]
+fn an_esac_bash_runs_as_a_command_ends_no_case() {
+    use super::as_shell_reads;
+    // An `esac` bash runs as a command leaves the `case` open, so the next
+    // pattern's `)` closes no `(`.
+    for esac in [
+        "'esac'",
+        "es''ac",
+        "env esac",
+        "command esac",
+        "sudo esac",
+        "coproc f esac",
+        "time esac",
+        "$( ) esac",
+    ] {
+        let line = format!("echo $(case y in x) {esac};; *) 'rm' -rf /;; esac)");
+        let read = as_shell_reads(&line).join("\n");
+        assert!(read.contains("*) rm -rf /"), "{line}: {read}");
+    }
+    for (line, read) in [
+        (
+            "  x) echo $('case' y); 'esac' ;;  *) 'rm' -rf / ;;",
+            "  x) echo $(case y); esac ;;  *) rm -rf / ;;",
+        ),
+        (
+            "echo $(time -p case y in y) 'rm' -rf /;; esac)",
+            "echo $(time -p case y in y) rm -rf /;; esac)",
+        ),
+        (
+            "echo $(coproc f case y in y) 'rm' -rf /;; esac)",
+            "echo $(coproc f case y in y) rm -rf /;; esac)",
+        ),
+        ("nft `true` 'flush' 'ruleset'", "nft `true` flush ruleset"),
+        (
+            "echo $(if case y in y) 'rm' -rf /;; esac; then :; fi)",
+            "echo $(if case y in y) rm -rf /;; esac; then :; fi)",
+        ),
+    ] {
+        assert_eq!(as_shell_reads(line), [read], "{line}");
+    }
+}
+
+#[test]
+fn data_and_what_a_shell_reads_as_written_stay_as_they_are() {
+    use super::as_shell_reads;
+    // What a shell reads as written is left alone, and so is a word that is
+    // one quoted string: a quoted argument with a blank, an empty argument,
+    // a quote left open, a variable, a backslash before a symbol.
+    for line in [
+        "sh -c \"curl x\"",
+        "echo '' x",
+        "type -p \"sudo\" \"$sudo\"",
+        "x=(\"ufw\" \"disable\")",
+        "echo \"rm\" x",
+        "printf '%s' 'rm' -rf",
+        "[ \"$x\" = 'rm' ]",
+        "arr=( 'rm' -rf / )",
+        "warning \"%s\" \"sudo\" \"su\"",
+        "cmd 2>&1 \"sudo\" x",
+        "log_info \"$x\" $(basename x) 'ufw' 'disable'",
+        "echo a\\) 'rm' -rf /",
+        "(echo a\\) 'rm' -rf /)",
+        "echo a\\\\\\) 'rm' -rf /",
+        "ls @(a|b) 'sudo' x",
+        "ls !(a) 'sudo' x",
+        "a[x]+b=1 'rm' -rf /",
+        "expect_flagged '~/.local/bin/sudo' path-hijack",
+        "echo 'r m",
+        "echo 'rm",
+        "echo r'm",
+        "echo x\"rm -rf /\"",
+        "\"",
+        "echo $ifsx $@",
+        "\\$x",
+        "a\\\"b",
+    ] {
+        assert!(as_shell_reads(line).is_empty(), "{line}");
+    }
+    // A long line of `${IFS:` without a brace is read once.
+    let line = "echo ${ifs:".repeat(100_000);
+    assert!(as_shell_reads(&line).is_empty());
 }

@@ -134,6 +134,7 @@ fn collect() -> Status {
     issues.extend(quiet_weakenings(&settings, paths.as_ref()));
     if let Some(paths) = &paths {
         issues.extend(overrides_issue(&root_overrides(paths)));
+        issues.extend(root_results_unread(paths, Path::new(RESULTS)));
         let enabled = |link: &Path| fs::symlink_metadata(link).is_ok();
         if enabled(&paths.sweep_timer_link) {
             let root_problem = (paths.sweep_consent == Some(RootConsent::Allowed)
@@ -211,9 +212,39 @@ fn snapshot_boot_issue(cmdline: &str) -> Option<String> {
     ))
 }
 
-/// Root's results are a few kilobytes; past this the bar leaves them to
-/// the sweep, which reads them whole.
+/// The most of root's results the bar reads, in bytes; they may be larger,
+/// since one item carries up to 2 MiB. Past this the bar leaves them to the
+/// sweep, which reads them whole, and says it did. Arbitrary.
 const MAX_ROOT_RESULTS: u64 = 4 * 1024 * 1024;
+
+/// Whether root's results at `results` are too large for the bar to look
+/// in for a unit that stands in for the sweep's own, as an issue, where
+/// the root checks are on. Results that large hold a great many items or
+/// a few large ones (two big `at` jobs), and the one unit that turns the
+/// sweep off may be among them.
+fn root_results_unread(paths: &Paths, results: &Path) -> Option<String> {
+    let enabled = |link: &Path| fs::symlink_metadata(link).is_ok();
+    if paths.sweep_consent != Some(RootConsent::Allowed) || !enabled(&paths.sweep_root_timer_link) {
+        return None;
+    }
+    fs::metadata(results)
+        .ok()
+        .and_then(|metadata| too_large_for_the_bar(metadata.len()))
+}
+
+/// What the bar says of root's results of `size` bytes, where it does not
+/// read them.
+fn too_large_for_the_bar(size: u64) -> Option<String> {
+    const MIB: u64 = 1024 * 1024;
+    (size > MAX_ROOT_RESULTS).then(|| {
+        format!(
+            "the root checks' results are {} MiB, more than the bar reads ({} MiB): a unit that \
+             turns the sweep off is not looked for here; run `omarchy-guardian sweep`",
+            size.div_ceil(MIB),
+            MAX_ROOT_RESULTS / MIB
+        )
+    })
+}
 
 /// The files the daily root checks reported standing in for one of the
 /// sweep's own units (a unit or a drop-in in another account-wide or
@@ -819,6 +850,43 @@ mod tests {
 
     use super::{RECENT_SECS, SEEN, age, last_block, mark_seen_unless_waiting, markup_safe};
     use crate::test_support::TempDir;
+
+    #[test]
+    fn root_results_too_large_for_the_bar_are_an_issue() {
+        use super::{MAX_ROOT_RESULTS, too_large_for_the_bar};
+
+        assert_eq!(too_large_for_the_bar(10_000), None);
+        assert_eq!(too_large_for_the_bar(MAX_ROOT_RESULTS), None);
+        let issue = too_large_for_the_bar(MAX_ROOT_RESULTS + 1).expect("past the limit");
+        assert!(
+            issue.contains("are 5 MiB, more than the bar reads (4 MiB)"),
+            "{issue}"
+        );
+    }
+
+    #[test]
+    fn only_root_checks_that_are_on_have_results_too_large_for_the_bar() {
+        use super::{MAX_ROOT_RESULTS, root_results_unread};
+        use crate::config::model::RootConsent;
+
+        let dir = TempDir::new("status-root-results");
+        let mut paths = crate::test_support::integration_paths(&dir);
+        let results = dir.path().join("root.json");
+        fs::File::create(&results)
+            .unwrap()
+            .set_len(MAX_ROOT_RESULTS + 1)
+            .unwrap();
+        // Neither allowed nor on.
+        assert_eq!(root_results_unread(&paths, &results), None);
+        paths.sweep_consent = Some(RootConsent::Allowed);
+        assert_eq!(root_results_unread(&paths, &results), None);
+        fs::create_dir_all(paths.sweep_root_timer_link.parent().unwrap()).unwrap();
+        fs::write(&paths.sweep_root_timer_link, "").unwrap();
+        assert!(root_results_unread(&paths, &results).is_some());
+        // On, but not allowed.
+        paths.sweep_consent = None;
+        assert_eq!(root_results_unread(&paths, &results), None);
+    }
 
     #[test]
     fn a_snapshot_boot_is_a_problem_because_what_is_installed_there_is_lost() {

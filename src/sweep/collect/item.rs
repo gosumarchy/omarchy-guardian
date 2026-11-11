@@ -273,7 +273,8 @@ fn limits(
         && read::chain_too_long(path, target, &|next| hop(scope, next))
     {
         reached.push(format!(
-            "a chain of more than {} links, or one that goes in a circle",
+            "a chain of links not followed to its end: more than {} links, a circle, `..` \
+             steps that look at more paths than one chain may, or a name that is not UTF-8",
             read::MAX_HOPS
         ));
     }

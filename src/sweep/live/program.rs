@@ -17,8 +17,12 @@ pub(super) fn scripts(scope: &Scope<'_>, process: &Process, exe: &str) -> Vec<St
     if !is_interpreter(exe) || relay {
         return Vec::new();
     }
-    script_arguments(&process.arguments)
+    // Read lossily, a command line that is not UTF-8 may name another file
+    // as its script (see `process::not_utf8`; the process is an alert).
+    let lossy = std::str::from_utf8(&process.cmdline).is_err();
+    script_arguments(&process.arguments())
         .into_iter()
+        .filter(|script| !(lossy && script.contains('\u{fffd}')))
         .filter_map(|script| match script.strip_prefix('/') {
             Some(absolute) => normalize(absolute),
             // A relative name is relative to where the process runs.
@@ -55,7 +59,8 @@ pub(super) fn told(process: &Process, exe: &str) -> Option<String> {
     if !is_interpreter(exe) {
         return None;
     }
-    let first = script_arguments(&process.arguments).into_iter().next()?;
+    let arguments = process.arguments();
+    let first = script_arguments(&arguments).into_iter().next()?;
     // Code is long and holds anything: its hash names it.
     let code = first.len() > 40 || first.contains(char::is_whitespace);
     Some(if code {
@@ -112,7 +117,8 @@ pub(super) fn module_of(scope: &Scope<'_>, process: &Process, exe: &str) -> Opti
     {
         return None;
     }
-    let module = module_argument(&process.arguments)?;
+    let arguments = process.arguments();
+    let module = module_argument(&arguments)?;
     let plain_name = !module.is_empty()
         && module.split('.').all(|part| {
             !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -180,9 +186,15 @@ pub(super) fn module_of(scope: &Scope<'_>, process: &Process, exe: &str) -> Opti
 /// A mark of the directory a process was started in, as part of an item's
 /// name: what `python3 -m name` runs depends on it.
 pub(super) fn started_in(process: &Process) -> Option<String> {
-    let cwd = process.cwd.as_deref()?;
-    let digest = crate::sha256::Sha256::digest(cwd.as_bytes()).to_string();
-    Some(format!("cwd-{}", &digest[..12]))
+    process.cwd_mark.clone()
+}
+
+/// The mark `started_in` gives for a working directory, from its bytes
+/// relative to `/`: a digest names no file, so a name that is not UTF-8
+/// is marked as any other.
+pub(super) fn cwd_mark(cwd: &[u8]) -> String {
+    let digest = crate::sha256::Sha256::digest(cwd).to_string();
+    format!("cwd-{}", &digest[..12])
 }
 
 /// `path` without `.`, `..` or empty parts; `None` when it climbs above `/`.

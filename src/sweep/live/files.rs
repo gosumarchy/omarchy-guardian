@@ -135,8 +135,11 @@ pub(super) fn intact(scope: &Scope<'_>, found: &mut Found, category: Category, p
     scope.origin != Origin::Root
 }
 
-/// Keeps `item`, a file that is not what its package installed.
+/// Keeps `item`, a file that is not what its package installed. That is
+/// root's finding whichever process led to the file: no account can change
+/// what a package installed, so none decides how many of these there are.
 fn keep(found: &mut Found, item: Item) {
+    found.of_root.insert(item.path.clone());
     let kept = found.items.entry(item.path.clone()).or_insert(item);
     // An item another check made first is of the same file.
     kept.tier = Tier::Modified;
@@ -225,6 +228,7 @@ pub(super) fn check(scope: &Scope<'_>, found: &mut Found) {
         } else {
             // Its package's content under a rewritten interpreter line:
             // listed as that, with no alert.
+            found.of_root.insert(item.path.clone());
             found.items.entry(item.path.clone()).or_insert(item);
         }
     }
@@ -311,6 +315,9 @@ fn file(
     // the comparison, unless its content was read for it.
     let seen = found.items.get(path).map(|item| item.sha256.is_some());
     let Some(owned) = scope.index.owner(path) else {
+        // Root's own look through a directory only root writes found it,
+        // whichever process led to it first.
+        found.of_root.insert(path.to_string());
         if seen.is_none() {
             found
                 .items

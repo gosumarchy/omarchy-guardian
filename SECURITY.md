@@ -90,7 +90,22 @@ What remains trusted, and is therefore in scope when it can be subverted:
 - `git`, `ssh-keygen` and `tar` as installed on the system (git reads the
   checkout's object files, and a flaw in how it parses them is not
   something the upgrade check can make up for);
-- the maintainer's release key.
+- the maintainer's release key;
+- your session and your build tools: the upgrade check runs as you, from
+  your shell, and builds with your Rust toolchain (rustup's, with your
+  cargo configuration), your makepkg configuration, and `sudo` and `pacman`
+  from your `PATH`. Of your environment it keeps only what those steps need
+  (your home, user and login names, `PATH`, terminal, locale, display, the
+  user bus, the XDG directories, `CARGO_HOME` and `RUSTUP_HOME`, proxy and
+  certificate settings, where the AI reviewer is reached and its login and
+  provider settings, `OMARCHY_GUARDIAN_ALLOW_SNAPSHOT_BOOT`; the full list is
+  at the top of `integrations/upgrade.sh`), so a stray `BASH_ENV`, exported
+  function, `TAR_OPTIONS`, `GIT_*` or `LD_PRELOAD` does not change what is
+  verified or built. The kept `PATH`, home and toolchain variables still
+  choose which build tools run. Run it as a command
+  (`/usr/lib/omarchy-guardian/upgrade`, not through `bash`), since its first
+  line is what keeps this shell from reading `BASH_ENV`. A program running as you is not kept out: it can wrap
+  the command before it starts, or change your toolchain.
 
 Known limits:
 

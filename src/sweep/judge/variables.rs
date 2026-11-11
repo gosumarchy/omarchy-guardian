@@ -1,7 +1,7 @@
 //! Telling a file that only sets variables, and runs nothing, from one that
 //! does more.
 
-use super::secrets::is_secret_name;
+use super::secrets::{is_secret_name, name_parts};
 
 /// Variables that decide what runs or is loaded: setting one, even to a
 /// literal, is more than keeping a value.
@@ -76,6 +76,57 @@ const INERT_ENDINGS: &[&str] = &[
     "_MODEL",
 ];
 
+/// Whether the variable `name` loads or runs something, or redirects
+/// where a program goes: a search path, a preloaded library, git's
+/// configuration (`GIT_CONFIG_KEY_0=core.fsmonitor`), or a name whose last
+/// part says what its value is for, a program or a place
+/// (`RESTIC_PASSWORD_COMMAND`, `SOPS_AGE_KEY_CMD`, git's
+/// `gpg.ssh.defaultKeyCommand` and `core.askPass`, ssh's
+/// `SecurityKeyProvider`, `CARGO_REGISTRY_CREDENTIAL_PROVIDER`,
+/// `ANSIBLE_VAULT_PASSWORD_FILE`). Parts are split as for the names that
+/// say secret, so `defaultKeyCommand` ends in `COMMAND`. Such a value is
+/// never taken out as a secret: it says what runs or where a program goes.
+pub(in crate::sweep) fn loads_code(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    let parts = name_parts(name);
+    LOADING_NAMES.contains(&upper.as_str())
+        || ["LD_", "DYLD_", "GIT_CONFIG"]
+            .iter()
+            .any(|start| upper.starts_with(start))
+        // A number after the ending counts as none (`KEY_COMMAND_2`).
+        || parts
+            .iter()
+            .rfind(|part| !part.bytes().all(|byte| byte.is_ascii_digit()))
+            .is_some_and(|last| LOADING_ENDINGS.contains(&last.as_str()))
+        || parts.ends_with(&["ASK".to_string(), "PASS".to_string()])
+}
+
+/// The last parts of a name whose value is a program to run, something a
+/// program loads, or a place it goes, rather than a value it keeps.
+const LOADING_ENDINGS: &[&str] = &[
+    "CMD",
+    "COMMAND",
+    "PROCESS",
+    "PROXY",
+    "PROVIDER",
+    "HELPER",
+    "PROGRAM",
+    "EXEC",
+    "SCRIPT",
+    "HOOK",
+    "FILE",
+    "PATH",
+    "DIR",
+    "DIRECTORY",
+    "SOCK",
+    "ASKPASS",
+    "LOADER",
+    "PLUGIN",
+    "BIN",
+    "AGENT",
+    "HANDLER",
+];
+
 /// Whether setting the variable `name` to `value` only keeps a value:
 /// the name is one that says secret or is a plainly inert setting, and
 /// the value is an opaque word, not a place or a command (no `/`, no
@@ -86,11 +137,7 @@ fn keeps_a_value(name: &str, value: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     let written = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    let loads = LOADING_NAMES.contains(&upper.as_str())
-        || ["LD_", "DYLD_", "GIT_CONFIG"]
-            .iter()
-            .any(|start| upper.starts_with(start))
-        || upper.ends_with("_PROXY");
+    let loads = loads_code(name);
     // `PWD` says password as a part of a name; alone it is the shell's.
     let secret = upper != "PWD" && is_secret_name(name);
     let inert = INERT_NAMES.contains(&upper.as_str())
