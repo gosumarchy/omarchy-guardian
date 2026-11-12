@@ -894,7 +894,10 @@ fn show(options: Options, shown: &Shown<'_>) {
         return;
     }
     if options.scheduled {
-        output::print_changes(shown.changes);
+        output::print_changes(
+            shown.changes,
+            &shown.report.flagged_paths_but_accounts_set_id(),
+        );
         out!("{}", output::notes_text(shown.notes));
         shown.report.print(shown.decision, Hashes::Hidden, None);
         return;
@@ -912,7 +915,10 @@ fn show(options: Options, shown: &Shown<'_>) {
     let top = format!("{summary}{}", output::notes_text(shown.notes));
     out!("{top}");
     if options.view == View::Changes {
-        output::print_changes_table(shown.changes);
+        output::print_changes_table(
+            shown.changes,
+            &shown.report.flagged_paths_but_accounts_set_id(),
+        );
     }
     // The full report is kept for `sweep details` and shown only with
     // `--all`: printed each time, its hundreds of lines buried the verdict.
