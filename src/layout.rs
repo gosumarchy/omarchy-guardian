@@ -505,14 +505,17 @@ pub(crate) enum Listed<'a, T> {
 }
 
 /// Lists `entries` in order, where `place` gives an entry's kind and path,
-/// or `None` for an entry always shown alone. Once a folder holds more than
+/// or `None` for an entry always shown alone (as is a path with `#` or
+/// without a folder). Once a folder holds more than
 /// `ROWS_PER_FOLDER` entries of one kind, they are one `Folder` row, where
 /// the first of them was. Only the terminal groups: the JSON and the report
 /// page keep every entry.
 ///
-/// Only the path's own folder is counted, so a flood spread over many
-/// folders is still listed in full. That is noise, not a way to hide
-/// anything: every entry is still judged, and the findings are listed apart.
+/// Every entry is still judged and counted, and an entry is grouped only
+/// with entries of the same kind (a finding: the same rule, severity, line
+/// and excerpt), so the row still says what they are, and names the first.
+/// Only the path's own folder is counted: a flood spread over many folders
+/// is still listed in full.
 pub(crate) fn by_folder<'a, T, K>(
     entries: &'a [T],
     place: impl Fn(&'a T) -> Option<(K, &'a str)>,
@@ -520,18 +523,25 @@ pub(crate) fn by_folder<'a, T, K>(
 where
     K: Copy + Eq + Hash,
 {
-    let folder_of = |path: &'a str| path.rsplit_once('/').map_or("", |(folder, _)| folder);
+    // A label with `#` names an entry inside a file (`profile#extension:id`,
+    // `authorized_keys#hash`): its folder is not where it is, and what tells
+    // it apart is after the `#`, so it is always listed alone. So is a path
+    // without a folder.
+    let grouped = |entry: &'a T| {
+        let (kind, path) = place(entry)?;
+        let (folder, _) = path.rsplit_once('/').filter(|_| !path.contains('#'))?;
+        Some((kind, folder))
+    };
     let mut counts: HashMap<(K, &str), usize> = HashMap::new();
-    for (kind, path) in entries.iter().filter_map(&place) {
-        *counts.entry((kind, folder_of(path))).or_default() += 1;
+    for key in entries.iter().filter_map(&grouped) {
+        *counts.entry(key).or_default() += 1;
     }
     let mut listed = Vec::new();
     for entry in entries {
-        let Some((kind, path)) = place(entry) else {
+        let Some((kind, folder)) = grouped(entry) else {
             listed.push(Listed::One(entry));
             continue;
         };
-        let folder = folder_of(path);
         match counts.get_mut(&(kind, folder)) {
             Some(count) if *count > ROWS_PER_FOLDER => {
                 listed.push(Listed::Folder {
@@ -581,6 +591,18 @@ mod tests {
         );
         assert_eq!(listed[13], Listed::One(&entries[23]));
         assert_eq!(listed.len(), 14);
+    }
+
+    #[test]
+    fn an_entry_inside_a_file_or_without_a_folder_is_always_alone() {
+        let mut entries: Vec<String> = (0..11)
+            .map(|index| format!("~/.config/chromium/Default#extension:{index}"))
+            .collect();
+        entries.extend((0..11).map(|index| format!("~/.ssh/authorized_keys#{index:016x}")));
+        entries.extend((0..11).map(|index| format!("name{index}")));
+        let listed = by_folder(&entries, |path| Some(((), path.as_str())));
+        assert_eq!(listed.len(), 33);
+        assert!(listed.iter().all(|row| matches!(row, Listed::One(_))));
     }
 
     #[test]

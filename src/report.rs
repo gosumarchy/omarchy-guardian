@@ -106,11 +106,8 @@ pub(crate) enum Gap {
 
 impl Gap {
     /// Why the sweep could not read or follow the file at `path` in full.
-    pub(crate) fn sweep_file(path: &str, reason: String) -> Self {
-        Self::SweepFile {
-            path: path.to_owned(),
-            reason,
-        }
+    pub(crate) const fn sweep_file(path: String, reason: String) -> Self {
+        Self::SweepFile { path, reason }
     }
 
     /// Whether what the gap is about is still covered by the SHA-256 of

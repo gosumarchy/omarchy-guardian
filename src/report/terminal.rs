@@ -109,13 +109,14 @@ impl Report {
                     folder,
                     count,
                 } => match first {
-                    Gap::SweepFile { reason, .. } => {
-                        format!("sweep: {count} files in {folder}/: {reason}")
+                    Gap::SweepFile { path, reason } => {
+                        format!("sweep: {count} files in {folder}/ (first: {path}): {reason}")
                     }
-                    _ => format!(
-                        "{count} files in {folder}/: only root can read them; \
+                    Gap::RootOnly(path) => format!(
+                        "{count} files in {folder}/ (first: {path}): only root can read them; \
                          run `omarchy-guardian sweep --root` to check them"
                     ),
+                    gap => format!("{count} files in {folder}/, the first: {gap}"),
                 },
             })
             .collect()
@@ -400,7 +401,15 @@ impl Report {
                     first,
                     folder,
                     count,
-                } => (first, format!("{count} files in {}/", shown(folder))),
+                } => (
+                    first,
+                    format!(
+                        "{count} findings in {}/ (first: {}:{})",
+                        shown(folder),
+                        shown(&first.path),
+                        first.line
+                    ),
+                ),
             })
             .collect()
     }

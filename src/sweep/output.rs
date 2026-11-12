@@ -555,10 +555,17 @@ fn change_rows(changes: &[(Change, String)]) -> Vec<(Change, String)> {
         .map(|row| match row {
             Listed::One((change, label)) => (*change, shown(label).into_owned()),
             Listed::Folder {
-                first: (change, _),
+                first: (change, label),
                 folder,
                 count,
-            } => (*change, format!("{count} items in {}/", shown(folder))),
+            } => (
+                *change,
+                format!(
+                    "{count} items in {}/ (first: {})",
+                    shown(folder),
+                    shown(label)
+                ),
+            ),
         })
         .collect()
 }
@@ -966,15 +973,20 @@ mod tests {
         report
             .gaps
             .push(Gap::Sweep("/boot/EFI: could not be listed".into()));
+        report.gaps.push(Gap::sweep_file(
+            "/x".into(),
+            "could not be read (gone)".into(),
+        ));
         report
             .agent_runs
             .push(run(AgentOutcome::Unavailable(Error::Message(
                 "no network".into(),
             ))));
         let lines = not_reviewed(&report);
-        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines.len(), 3, "{lines:?}");
         assert_eq!(lines[0], "/boot/EFI: could not be listed");
-        assert!(lines[1].starts_with("AI review: ") && lines[1].contains("no network"));
+        assert_eq!(lines[1], "/x: could not be read (gone)");
+        assert!(lines[2].starts_with("AI review: ") && lines[2].contains("no network"));
 
         let text = attention(&report, Painter::plain());
         assert!(
@@ -1040,7 +1052,10 @@ mod tests {
             change_rows(&changes),
             [
                 (Change::Changed, "~/.bashrc".to_string()),
-                (Change::New, "966 items in ~/.trash/flood/".to_string()),
+                (
+                    Change::New,
+                    "966 items in ~/.trash/flood/ (first: ~/.trash/flood/s0)".to_string()
+                ),
                 (Change::Removed, "~/.trash/flood/old".to_string()),
             ]
         );
