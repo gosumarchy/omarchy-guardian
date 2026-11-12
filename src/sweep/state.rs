@@ -17,6 +17,7 @@ use crate::error::{Error, IoContext};
 use crate::files::{AtomicWrite, write_atomic};
 use crate::json::Json;
 use crate::paths;
+use crate::rules::RuleId;
 use crate::user;
 
 const BASELINE: &str = "baseline.json";
@@ -60,13 +61,29 @@ pub(super) fn fingerprint(item: &Item) -> String {
     };
     // What the live checks saw is part of it: allowing a program that
     // autostarts does not allow it to start reading the keyboard.
-    let mut alerts: Vec<&str> = item.alerts.iter().map(|(rule, _)| rule.name()).collect();
+    let mut alerts: Vec<&str> = item
+        .alerts
+        .iter()
+        .map(|(rule, _)| remembered_name(*rule))
+        .collect();
     alerts.sort_unstable();
     alerts.dedup();
     if alerts.is_empty() {
         content
     } else {
         format!("{content}+{}", alerts.join(","))
+    }
+}
+
+/// The name a fingerprint remembers an alert by. `AccountsSetIdFile` was
+/// split from `UnknownPrivilegedFile` for how the terminal lists it, not
+/// for what it finds: remembered by its own name, every set-id file an
+/// account owns would read as changed after an upgrade, and each one
+/// allowed with `sweep allow` would be an alert again.
+fn remembered_name(rule: RuleId) -> &'static str {
+    match rule {
+        RuleId::AccountsSetIdFile => RuleId::UnknownPrivilegedFile.name(),
+        rule => rule.name(),
     }
 }
 
@@ -233,7 +250,7 @@ pub(super) fn not_allowable(item: &Item) -> Option<&'static str> {
     if item
         .alerts
         .iter()
-        .any(|(rule, _)| *rule == crate::rules::RuleId::GuardianOverride)
+        .any(|(rule, _)| *rule == RuleId::GuardianOverride)
     {
         // Allowing it would let whatever wrote it quiet the sweep it
         // redirects.
@@ -611,7 +628,7 @@ pub(super) fn save_last_run(directory: &Path, run: &LastRun) -> Result<(), Error
 }
 
 /// How an item changed since the last sweep.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum Change {
     New,
     Changed,

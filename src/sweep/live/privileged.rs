@@ -26,6 +26,11 @@ use crate::sweep::tier::Tier;
 const PRIVILEGED_ROOTS: &[&str] = &["usr", "opt", "etc", "var", "srv", "root", "home"];
 /// Under those, what holds other systems' files (containers, packages
 /// not installed). A snapshot directory is skipped too (`Walk::skipped`).
+///
+/// The Trash (`~/.local/share/Trash`) is not skipped: a file moved there
+/// keeps its set-id bits and capabilities and still runs by its path, and
+/// any program of the account may write there. A folder of many such files
+/// is shown as one row instead (`layout::by_folder`).
 const PRIVILEGED_SKIPPED: &[&str] = &[
     "var/lib/docker",
     "var/lib/containers",
@@ -1034,8 +1039,28 @@ impl Walk<'_> {
                 read::Found::Link(_) | read::Found::Other => true,
             };
         if set_id && !bits_gone {
+            // A setuid file of an account's own uid, with no capabilities:
+            // any account can make as many as it likes, and it runs only as
+            // that account, so the terminal lists only some of them. Not a
+            // setgid one: its group need not be the account's own (`docker`,
+            // `wheel`), and running it gives anyone that group. Nor a file
+            // that says it is root's (uid 0, or the tree's owner in a test),
+            // even where that may be untrue (an account's FUSE mount):
+            // listed in full, it can add rows, never hide one. (`alone`
+            // needs the tree owner's uid, which this rules out; on a system
+            // that owner is uid 0, so the `uid != 0` only states it.)
+            let accounts_own = !bounded
+                && capabilities.is_none()
+                && metadata.mode() & 0o6000 == 0o4000
+                && metadata.uid() != 0
+                && Some(metadata.uid()) != self.owner;
+            let rights = if accounts_own {
+                Rights::AccountsSetId
+            } else {
+                Rights::SetId
+            };
             found.through(chooser, |found| {
-                privileged(scope, found, &path, &looked, "setuid or setgid", None);
+                privileged(scope, found, &path, &looked, "setuid or setgid", rights);
             });
         }
         // An account's file whose bits were cleared while it was read is not
@@ -1045,7 +1070,8 @@ impl Walk<'_> {
         if let Some(capabilities) = &capabilities {
             found.through(chooser, |found| {
                 let what = format!("capabilities {capabilities}");
-                privileged(scope, found, &path, &looked, &what, Some(capabilities));
+                let rights = Rights::Capabilities(capabilities);
+                privileged(scope, found, &path, &looked, &what, rights);
             });
         }
         if unseen { Entry::Unknown } else { Entry::Done }
@@ -1318,6 +1344,19 @@ fn odd_item(scope: &Scope<'_>, found: &mut Found, directory: &str, name: &[u8], 
         );
     });
 }
+/// What gives a privileged file its rights, and so which alert it raises.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Rights<'a> {
+    /// Set-id bits on any file not `AccountsSetId`: root's, one that says
+    /// it is, a setgid file, or one with the host's capabilities.
+    SetId,
+    /// The setuid bit, alone, on a file of an account's own uid that
+    /// `Counts::keep` bounds: any account can make as many as it likes. It
+    /// raises `AccountsSetIdFile`, which the terminal lists only some of.
+    AccountsSetId,
+    Capabilities(&'a Capabilities),
+}
+
 /// Lists the file at `path` as privileged, unless its package vouches for
 /// it and its rights; the caller's chooser (see `Found::through`) ranks it.
 pub(super) fn privileged(
@@ -1326,7 +1365,7 @@ pub(super) fn privileged(
     path: &str,
     looked: &read::Found,
     what: &str,
-    capabilities: Option<&Capabilities>,
+    rights: Rights<'_>,
 ) {
     let item = collect::item_of(scope, Category::Setuid, path.to_string(), None, looked);
     // A package's set-id file only root can read cannot be hashed in a
@@ -1346,6 +1385,10 @@ pub(super) fn privileged(
     // program given some (`setcap cap_setuid+ep python`, or all of them
     // with `=ep`) is only trusted with exactly those its package is known
     // to set.
+    let capabilities = match rights {
+        Rights::Capabilities(capabilities) => Some(capabilities),
+        Rights::SetId | Rights::AccountsSetId => None,
+    };
     let (rule, why) = if vouched {
         match capabilities.and_then(|capabilities| unexpected_capabilities(path, capabilities)) {
             Some(RuleId::UnknownPrivilegedFile) => (
@@ -1355,6 +1398,8 @@ pub(super) fn privileged(
             Some(rule) => (rule, "rights its package does not set"),
             None => return,
         }
+    } else if matches!(rights, Rights::AccountsSetId) {
+        (RuleId::AccountsSetIdFile, "no package vouches for it")
     } else {
         (RuleId::UnknownPrivilegedFile, "no package vouches for it")
     };

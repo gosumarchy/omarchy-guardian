@@ -63,6 +63,7 @@ pub(crate) enum RuleId {
     KeyboardReader,
     UnknownKernelModule,
     UnknownPrivilegedFile,
+    AccountsSetIdFile,
     NetworkListener,
     ReviewerInstruction,
     ReorderedText,
@@ -131,7 +132,7 @@ const SUBPROCESS_CALLS: &[&str] = &[
 ];
 
 impl RuleId {
-    const ALL: [Self; 49] = [
+    const ALL: [Self; 50] = [
         Self::DownloadAndExecute,
         Self::EncodedCommandExecution,
         Self::CredentialFileAccess,
@@ -152,6 +153,7 @@ impl RuleId {
         Self::KeyboardReader,
         Self::UnknownKernelModule,
         Self::UnknownPrivilegedFile,
+        Self::AccountsSetIdFile,
         Self::NetworkListener,
         Self::ReviewerInstruction,
         Self::ReorderedText,
@@ -209,6 +211,7 @@ impl RuleId {
             Self::KeyboardReader => "keyboard-reader",
             Self::UnknownKernelModule => "unknown-kernel-module",
             Self::UnknownPrivilegedFile => "unknown-privileged-file",
+            Self::AccountsSetIdFile => "accounts-set-id-file",
             Self::NetworkListener => "network-listener",
             Self::ReviewerInstruction => "text-addressed-to-reviewer",
             Self::ReorderedText => "reordered-text",
@@ -278,6 +281,7 @@ impl RuleId {
             | Self::PreloadedLibrary
             | Self::UnknownKernelModule
             | Self::UnknownPrivilegedFile
+            | Self::AccountsSetIdFile
             | Self::ReviewerInstruction
             | Self::ReorderedText
             | Self::InvisibleText
@@ -324,7 +328,7 @@ impl RuleId {
     /// What each rule reports, in the order of `ALL`. A table rather than a
     /// match so that it stays one item however many rules there are; the
     /// test below holds it to `ALL`.
-    const DESCRIPTIONS: [(Self, &'static str); 49] = [
+    const DESCRIPTIONS: [(Self, &'static str); 50] = [
         (
             Self::DownloadAndExecute,
             "Fetches code from the network and runs it without it being reviewed: piped into a shell or an interpreter, run from a substitution, or saved and then run.",
@@ -404,6 +408,10 @@ impl RuleId {
         (
             Self::UnknownPrivilegedFile,
             "A file no package vouches for runs with extra rights (setuid, setgid or capabilities).",
+        ),
+        (
+            Self::AccountsSetIdFile,
+            "A file an account owns, which no package vouches for, runs as that account for whoever runs it (setuid).",
         ),
         (
             Self::NetworkListener,
@@ -555,6 +563,7 @@ impl RuleId {
             | Self::KeyboardReader
             | Self::UnknownKernelModule
             | Self::UnknownPrivilegedFile
+            | Self::AccountsSetIdFile
             | Self::NetworkListener
             | Self::ReviewerInstruction
             | Self::ReorderedText
@@ -620,6 +629,7 @@ impl RuleId {
             | Self::KeyboardReader
             | Self::UnknownKernelModule
             | Self::UnknownPrivilegedFile
+            | Self::AccountsSetIdFile
             | Self::NetworkListener
             | Self::ReviewerInstruction
             | Self::ReorderedText

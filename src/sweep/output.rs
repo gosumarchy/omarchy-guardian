@@ -6,12 +6,14 @@ use std::fmt::Write as _;
 
 use super::collect::{Body, Collection, Item, Origin};
 use super::judge::label;
+use super::state::Change;
 use super::tier::Tier;
 use crate::agent::{AgentFinding, Status};
 use crate::json::Json;
-use crate::layout::{self, Painter, Span, Table};
+use crate::layout::{self, Listed, Painter, Span, Table};
 use crate::report::html::{self, esc};
 use crate::report::{AgentOutcome, AgentRun, Blocked, Decision, Gap, Report, Severity};
+use crate::rules::RuleId;
 use crate::text::shown;
 
 /// A tier's word in the list and its colour.
@@ -99,7 +101,10 @@ struct Concern {
 }
 
 /// The files the review raised alerts on (see `Report::alerts`), worst
-/// first, one entry per file.
+/// first, one entry per file. Of one severity, a file only an account's own
+/// setuid file finding flags comes last: any account can make as many of
+/// those as it likes, and they must not push a file of root's out of the
+/// few the summary names.
 fn concerns(report: &Report) -> Vec<(String, Concern)> {
     let mut by_file: BTreeMap<String, Concern> = BTreeMap::new();
     for (file, severity, why) in report.alerts() {
@@ -114,8 +119,17 @@ fn concerns(report: &Report) -> Vec<(String, Concern)> {
             concern.why = why;
         }
     }
+    let others = report.flagged_paths_but_accounts_set_id();
+    let capped: HashSet<&str> = report
+        .findings
+        .iter()
+        .filter(|finding| {
+            finding.rule == RuleId::AccountsSetIdFile && !others.contains(&finding.path)
+        })
+        .map(|finding| finding.path.as_str())
+        .collect();
     let mut concerns: Vec<(String, Concern)> = by_file.into_iter().collect();
-    concerns.sort_by_key(|(_, concern)| concern.severity);
+    concerns.sort_by_key(|(file, concern)| (concern.severity, capped.contains(file.as_str())));
     concerns
 }
 
@@ -129,6 +143,7 @@ fn not_reviewed(report: &Report) -> Vec<String> {
         .iter()
         .map(|gap| match gap {
             Gap::Sweep(text) => text.clone(),
+            Gap::SweepFile { path, reason } => format!("{path}: {reason}"),
             gap => gap.to_string(),
         })
         .collect();
@@ -497,7 +512,9 @@ pub(super) fn notes_text(notes: &[String]) -> String {
 }
 
 /// What changed since the last sweep, in a box with a table below.
-pub(super) fn print_changes(changes: &[(super::state::Change, String)]) {
+/// `flagged` are the paths of the items with a finding
+/// (`flagged_paths_but_accounts_set_id`).
+pub(super) fn print_changes(changes: &[(Change, String)], flagged: &HashSet<String>) {
     let painter = Painter::for_stdout();
     let width = layout::width();
     let line = if changes.is_empty() {
@@ -512,11 +529,11 @@ pub(super) fn print_changes(changes: &[(super::state::Change, String)]) {
         "{}",
         layout::boxed("Guardian sweep", &[line], width, "36", painter)
     );
-    print_changes_table(changes);
+    print_changes_table(changes, flagged);
 }
 
 /// What changed since the last sweep, as a table; nothing when nothing did.
-pub(super) fn print_changes_table(changes: &[(super::state::Change, String)]) {
+pub(super) fn print_changes_table(changes: &[(Change, String)], flagged: &HashSet<String>) {
     if changes.is_empty() {
         return;
     }
@@ -534,17 +551,43 @@ pub(super) fn print_changes_table(changes: &[(super::state::Change, String)]) {
     page.push_str("</table></section>");
     html::collect_section(page);
     let mut table = Table::new(vec!["Change", "Item"]);
-    for (change, label) in changes {
+    for (change, item) in change_rows(changes, flagged) {
         let (word, color) = change.shown();
-        table.row(vec![
-            vec![Span::new(word, color)],
-            vec![Span::plain(shown(label))],
-        ]);
+        table.row(vec![vec![Span::new(word, color)], vec![Span::plain(item)]]);
     }
     outln!(
         "{}",
         table.render(layout::width(), 2, Painter::for_stdout())
     );
+}
+
+/// The rows of the changes table: each change with its item, shown, and a
+/// folder's changes of one kind as one row once there are many (see
+/// `layout::by_folder`). One folder of test files once made 966 rows. A
+/// change of an item in `flagged` is always a row of its own: this table is
+/// where a new item with a finding is noticed, so decoys beside it must
+/// not fold it into theirs.
+fn change_rows(changes: &[(Change, String)], flagged: &HashSet<String>) -> Vec<(Change, String)> {
+    let rows = layout::by_folder(changes, |(change, label)| {
+        (!flagged.contains(label)).then_some((*change, label.as_str()))
+    });
+    rows.into_iter()
+        .map(|row| match row {
+            Listed::One((change, label)) => (*change, shown(label).into_owned()),
+            Listed::Folder {
+                first: (change, label),
+                folder,
+                count,
+            } => (
+                *change,
+                format!(
+                    "{count} items in {}/ (first: {})",
+                    shown(folder),
+                    shown(label)
+                ),
+            ),
+        })
+        .collect()
 }
 
 /// The sweep as one JSON document.
@@ -703,7 +746,8 @@ mod tests {
     use std::collections::{BTreeMap, HashSet};
 
     use super::{
-        SHOWN_CONCERNS, attention, concerns, findings_json, items_html, not_reviewed, verdict_lines,
+        SHOWN_CONCERNS, attention, change_rows, concerns, findings_json, items_html, not_reviewed,
+        verdict_lines,
     };
     use crate::agent::{AgentFinding, AgentReview, Status};
     use crate::autorun::Category;
@@ -716,6 +760,7 @@ mod tests {
     use crate::review::analyze_text_locally;
     use crate::rules::RuleId;
     use crate::sweep::collect::{Body, Item, Origin};
+    use crate::sweep::state::Change;
     use crate::sweep::tier::Tier;
 
     fn local(path: &str, rule: RuleId) -> LocalFinding {
@@ -948,15 +993,20 @@ mod tests {
         report
             .gaps
             .push(Gap::Sweep("/boot/EFI: could not be listed".into()));
+        report.gaps.push(Gap::sweep_file(
+            "/x".into(),
+            "could not be read (gone)".into(),
+        ));
         report
             .agent_runs
             .push(run(AgentOutcome::Unavailable(Error::Message(
                 "no network".into(),
             ))));
         let lines = not_reviewed(&report);
-        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines.len(), 3, "{lines:?}");
         assert_eq!(lines[0], "/boot/EFI: could not be listed");
-        assert!(lines[1].starts_with("AI review: ") && lines[1].contains("no network"));
+        assert_eq!(lines[1], "/x: could not be read (gone)");
+        assert!(lines[2].starts_with("AI review: ") && lines[2].contains("no network"));
 
         let text = attention(&report, Painter::plain());
         assert!(
@@ -1010,6 +1060,42 @@ mod tests {
         assert!(html.contains("read as root") && html.contains("&amp;"));
         assert!(
             items_html(&BTreeMap::new(), None, &HashSet::new()).contains("every item is trusted")
+        );
+    }
+
+    #[test]
+    fn an_accounts_own_setuid_files_come_after_roots_in_the_summary() {
+        let mut report = Report::new("sweep", ReviewScope::default());
+        report.findings = (0..11)
+            .map(|index| local(&format!("/var/tmp/.a{index}"), RuleId::AccountsSetIdFile))
+            .collect();
+        report
+            .findings
+            .push(local("/var/tmp/.x", RuleId::UnknownPrivilegedFile));
+        let concerns = concerns(&report);
+        assert_eq!(concerns[0].0, "/var/tmp/.x");
+        assert_eq!(concerns.len(), 12);
+    }
+
+    #[test]
+    fn a_folder_of_new_files_is_one_row_and_the_rest_stay_listed() {
+        let mut changes = vec![(Change::Changed, "~/.bashrc".to_string())];
+        changes.extend((0..966).map(|index| (Change::New, format!("~/.trash/flood/s{index}"))));
+        changes.push((Change::Removed, "~/.trash/flood/old".to_string()));
+        // One with a finding, among the decoys.
+        changes.push((Change::New, "~/.trash/flood/evil".to_string()));
+        let flagged = HashSet::from(["~/.trash/flood/evil".to_string()]);
+        assert_eq!(
+            change_rows(&changes, &flagged),
+            [
+                (Change::Changed, "~/.bashrc".to_string()),
+                (
+                    Change::New,
+                    "966 items in ~/.trash/flood/ (first: ~/.trash/flood/s0)".to_string()
+                ),
+                (Change::Removed, "~/.trash/flood/old".to_string()),
+                (Change::New, "~/.trash/flood/evil".to_string()),
+            ]
         );
     }
 }

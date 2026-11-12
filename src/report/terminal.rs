@@ -4,11 +4,20 @@
 use std::fmt::Write as _;
 
 use crate::agent::{AgentFinding, Status};
-use crate::layout::{self, Painter, Span, Table};
+use crate::layout::{self, Listed, Painter, Span, Table};
+use crate::rules::RuleId;
 use crate::scan::FileKind;
 use crate::text::shown;
 
-use super::{AgentOutcome, Blocked, Decision, Hashes, Report, Severity, html, recommendation};
+use super::{
+    AgentOutcome, Blocked, Decision, Gap, Hashes, LocalFinding, Report, Severity, html,
+    recommendation,
+};
+
+/// How many findings of an account's own setuid files the terminal lists.
+/// Arbitrary: each account can add up to `MAX_ACCOUNTS_ITEMS` of them, and
+/// one account's once buried the rest of the nightly sweep's report.
+const SHOWN_ACCOUNTS_SET_ID: usize = 50;
 
 /// What the remarks are, after their count in the verdict box: for a
 /// review that is clear, and for one that is not (something else decided
@@ -73,15 +82,50 @@ impl Report {
         }
         out!("{}", self.findings_text(decision, width, painter));
 
-        for gap in &self.gaps {
-            crate::output::stderr_line(format_args!("  ! {}", shown(&gap.to_string())));
-        }
+        self.print_gaps();
         let advice = match (permit, decision) {
             (Some(_), Decision::Blocked(_)) => PERMITTED_ADVICE,
             _ => recommendation(decision),
         };
         outln!("\n{}", painter.paint(advice, "2"));
         html::collect(self, decision, permit);
+    }
+
+    /// Prints why the review is incomplete, one line a reason.
+    fn print_gaps(&self) {
+        for line in self.gap_lines() {
+            crate::output::stderr_line(format_args!("  ! {}", shown(&line)));
+        }
+    }
+
+    /// Why the review is incomplete, one line a reason. A file's reason is
+    /// counted per folder once many files there share it (see
+    /// `layout::by_folder`): one folder of them once filled the log.
+    pub(super) fn gap_lines(&self) -> Vec<String> {
+        let rows = layout::by_folder(&self.gaps, |gap| match gap {
+            Gap::RootOnly(path) => Some((None, path.as_str())),
+            Gap::SweepFile { path, reason } => Some((Some(reason.as_str()), path.as_str())),
+            _ => None,
+        });
+        rows.into_iter()
+            .map(|row| match row {
+                Listed::One(gap) => gap.to_string(),
+                Listed::Folder {
+                    first,
+                    folder,
+                    count,
+                } => match first {
+                    Gap::SweepFile { path, reason } => {
+                        format!("sweep: {count} files in {folder}/ (first: {path}): {reason}")
+                    }
+                    Gap::RootOnly(path) => format!(
+                        "{count} files in {folder}/ (first: {path}): only root can read them; \
+                         run `omarchy-guardian sweep --root` to check them"
+                    ),
+                    gap => format!("{count} files in {folder}/, the first: {gap}"),
+                },
+            })
+            .collect()
     }
 
     /// The one-line verdict and its terminal colour, as overruled by the
@@ -338,6 +382,31 @@ impl Report {
         }
     }
 
+    /// The findings the local-checks table lists, and how many it leaves
+    /// out: past `SHOWN_ACCOUNTS_SET_ID`, an account's own setuid files
+    /// (`RuleId::AccountsSetIdFile`, which the sweep's walk gives only files
+    /// any account can make as many of as it likes) are counted. Every other
+    /// finding is listed, each on a row of its own: a row of like findings
+    /// would let an account's decoys hide a file of root's among them.
+    pub(super) fn listed_findings(&self) -> (Vec<&LocalFinding>, usize) {
+        let mut accounts_set_id = 0;
+        let listed = self
+            .findings
+            .iter()
+            .filter(|finding| {
+                if finding.rule != RuleId::AccountsSetIdFile {
+                    return true;
+                }
+                accounts_set_id += 1;
+                accounts_set_id <= SHOWN_ACCOUNTS_SET_ID
+            })
+            .collect();
+        (
+            listed,
+            accounts_set_id.saturating_sub(SHOWN_ACCOUNTS_SET_ID),
+        )
+    }
+
     /// The tables of what was found: the local checks, the AI's findings,
     /// its remarks, the owner's own settings and the dependency advisories,
     /// each under its title.
@@ -351,7 +420,8 @@ impl Report {
         let severity = |severity: Severity| vec![Span::new(severity.label(), severity.color())];
         if !self.findings.is_empty() {
             let mut table = Table::new(vec!["Severity", "Where", "Local check"]);
-            for finding in &self.findings {
+            let (listed, unlisted) = self.listed_findings();
+            for finding in listed {
                 let mut what = vec![
                     Span::new(finding.rule.name(), "1"),
                     Span::plain(finding.rule.description()),
@@ -371,6 +441,20 @@ impl Report {
             }
             let _ = writeln!(text, "\n{}", painter.paint("  Local checks", "1"));
             let _ = writeln!(text, "{}", table.render(width, 2, painter));
+            if unlisted > 0 {
+                let _ = writeln!(
+                    text,
+                    "  {}",
+                    painter.paint(
+                        &format!(
+                            "{unlisted} more {} finding(s) are not listed here; \
+                             `sweep --json` and the report page list every one",
+                            RuleId::AccountsSetIdFile.name()
+                        ),
+                        "33"
+                    )
+                );
+            }
         }
 
         text.push_str(&self.ai_tables(decision, width, painter));

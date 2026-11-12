@@ -1132,8 +1132,13 @@ fn a_directory_the_accounts_run_cannot_list_is_a_note() {
         ..Closed::default()
     };
     let mut found = super::Found::default();
+    let listable = fs::read_dir(spool.join("x")).is_ok();
     privileged_walk(&scope, &mut found, &mut closed, files(100), capabilities);
     fs::set_permissions(spool.join("x"), fs::Permissions::from_mode(0o700)).unwrap();
+    // Run as root, nothing is closed to the test.
+    if listable {
+        return;
+    }
     assert_eq!(found.unchecked, Vec::<String>::new());
     assert!(
         found.notes.iter().any(|note| note.ends_with(
@@ -1785,7 +1790,7 @@ fn a_packaged_file_with_capabilities_of_its_own_is_listed() {
             path,
             &looked,
             &format!("capabilities {capabilities}"),
-            Some(&given(capabilities)),
+            super::privileged::Rights::Capabilities(&given(capabilities)),
         );
     }
     let items: Vec<&crate::sweep::collect::Item> = found.items.values().collect();
@@ -4689,7 +4694,15 @@ fn past_a_number_the_accounts_set_id_files_are_counted() {
     let dir = TempDir::new("live-walk-many");
     let root = dir.path();
     for index in 0..1_001 {
-        setuid_file(&root.join(format!("var/tmp/{index}")));
+        let path = root.join(format!("var/tmp/{index}"));
+        setuid_file(&path);
+        // Made by root, the files are root's own, which are never cut.
+        // Give them to an account (nobody), then set the bits again, since
+        // a change of owner clears them.
+        if fs::metadata(&path).unwrap().uid() == 0 {
+            std::os::unix::fs::chown(&path, Some(65_534), Some(65_534)).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o4755)).unwrap();
+        }
     }
     fs::set_permissions(root.join("var/tmp"), fs::Permissions::from_mode(0o1777)).unwrap();
     let found = walk_as_root(root, files(10_000), none_anywhere, ONE_MOUNT);
@@ -5273,4 +5286,59 @@ fn set_id_files_count_toward_what_the_live_checks_read() {
         "{:?}",
         live.unchecked
     );
+}
+
+#[test]
+fn an_accounts_own_set_id_file_raises_its_own_rule_and_roots_never_does() {
+    use std::os::unix::fs::{MetadataExt, chown};
+    let dir = TempDir::new("live-walk-accounts-own");
+    let root = dir.path();
+    // Only root can give a file another owner; as any other user, every
+    // file is the tree's owner's, which the walk takes for root's.
+    if fs::metadata(root).unwrap().uid() != 0 {
+        return;
+    }
+    for name in ["theirs", "roots"] {
+        setuid_file(&root.join(format!("var/tmp/{name}")));
+    }
+    let theirs = root.join("var/tmp/theirs");
+    chown(&theirs, Some(65_534), Some(65_534)).unwrap();
+    fs::set_permissions(&theirs, fs::Permissions::from_mode(0o4755)).unwrap();
+    assert_eq!(fs::metadata(&theirs).unwrap().uid(), 65_534);
+    fs::set_permissions(root.join("var/tmp"), fs::Permissions::from_mode(0o1777)).unwrap();
+    let found = walk_as_root(root, files(10_000), none_anywhere, ONE_MOUNT);
+    let rule = |path: &str| found.items[path].alerts[0].0;
+    assert_eq!(rule("var/tmp/theirs"), RuleId::AccountsSetIdFile);
+    // Root's own set-id file, in a place any account may write: an account
+    // can put it there, never make more of it.
+    assert_eq!(rule("var/tmp/roots"), RuleId::UnknownPrivilegedFile);
+}
+
+#[test]
+fn an_accounts_setgid_file_is_listed_in_full() {
+    use std::os::unix::fs::{MetadataExt, chown};
+    let dir = TempDir::new("live-walk-accounts-setgid");
+    let root = dir.path();
+    // As `an_accounts_own_set_id_file_raises_its_own_rule_and_roots_never_does`.
+    if fs::metadata(root).unwrap().uid() != 0 {
+        return;
+    }
+    // Its group need not be the account's: running it gives that group,
+    // with the setuid bit beside it or not.
+    for (name, mode) in [("group", 0o2755), ("both", 0o6755)] {
+        let path = root.join("var/tmp").join(name);
+        setuid_file(&path);
+        chown(&path, Some(65_534), Some(0)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().uid(), 65_534);
+    }
+    fs::set_permissions(root.join("var/tmp"), fs::Permissions::from_mode(0o1777)).unwrap();
+    let found = walk_as_root(root, files(10_000), none_anywhere, ONE_MOUNT);
+    for path in ["var/tmp/group", "var/tmp/both"] {
+        assert_eq!(
+            found.items[path].alerts[0].0,
+            RuleId::UnknownPrivilegedFile,
+            "{path}"
+        );
+    }
 }

@@ -1507,7 +1507,12 @@ share the 1,000), each is counted in a note and not looked at, so one account's
 files cannot crowd out another's, and the files looked at grow by 1,000 with
 each account that owns some; a file of root's or one with the
 host's capabilities there is always looked at, since no account can make those
-without bound. Other mounted filesystems (`/mnt`, `/media`, `/run/media`) are
+without bound. A setuid file of an account's own uid that no package vouches
+for raises `accounts-set-id-file`, not `unknown-privileged-file`: the terminal
+lists the first 50 of those and counts the rest, and names them after the
+others of their severity in its summary. A file of root's (or one that says it is root's), a
+setgid file, whose group need not be the account's, and one with capabilities
+each keep a row of their own. Other mounted filesystems (`/mnt`, `/media`, `/run/media`) are
 not looked through at all.
 
 Directories the search for setuid and setgid files cannot list are counted. In
@@ -2174,7 +2179,13 @@ never read.
   `standard` only shows are findings of the sweep. Only
   [your own settings](#your-own-settings) are not.) The first scheduled sweep
   has nothing to compare with: it notifies only when it found something with
-  an alert or could not finish;
+  an alert or could not finish. In the terminal and the journal, more than 10
+  changes of one kind in one folder are one row with their count and the first
+  of them, and so are more than 10 files there that only root can read or that
+  were left unread for one reason. A change of an item with a finding (other
+  than `accounts-set-id-file`), an entry inside a file (`#`), what a program
+  was seen doing (`:`) and every finding but those past the first 50
+  `accounts-set-id-file` keep a row of their own. `sweep --json` and the report page list every one;
 - a system timer (`omarchy-guardian-sweep-collect.timer`) for the root checks,
   but only after `protect` asks you and you agree.
 
@@ -2348,7 +2359,9 @@ each area, goes to the full report:
 replaced at each sweep run in a terminal; the daily timer's sweep leaves it
 alone. `--all` prints the full report as well, and lists the trusted items
 in it. When the file cannot be written, the sweep prints the full report
-instead, so nothing it found is left out.
+instead, so nothing it found is left out. (Past the first 50
+`accounts-set-id-file` findings, it counts them: `sweep --json` and the report
+page list every one.)
 
 `sweep --report` saves the same page a notification opens, with the items
 listed by area and an **Ask your AI agent** button, and prints the
@@ -2448,6 +2461,7 @@ reviews as well, are listed under [Local rules](local-rules.md#rule-ids).
 | `preloaded-library` | high | A library no package installed is preloaded into a running program (`LD_PRELOAD`). |
 | `unknown-kernel-module` | high | A loaded kernel module was not installed by a package. |
 | `unknown-privileged-file` | high | A file no package vouches for runs with extra rights (setuid, setgid or capabilities). |
+| `accounts-set-id-file` | high | A file an account owns, which no package vouches for, runs as that account for whoever runs it (setuid). |
 | `guardian-override` | high | A unit file or drop-in changes what Guardian's own sweep runs; allowing the file does not quiet this. |
 | `path-hijack` | high | A program or directory a user can write comes ahead of the system's own on `PATH` and takes over a command's name. |
 | `new-trust` | high | Something that was not there at the last sweep may now log in, administer or vouch here: an account, a member of an administrator group, an SSH key or a certificate authority. |

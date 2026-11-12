@@ -510,3 +510,106 @@ fn colors_can_be_disabled() {
 
 mod remarks;
 mod settings;
+
+#[test]
+fn many_files_only_root_can_read_in_one_folder_are_one_line() {
+    let mut report = Report::default();
+    report.gaps.push(Gap::RootOnly("~/a".into()));
+    report
+        .gaps
+        .extend((0..1200).map(|index| Gap::RootOnly(format!("~/.trash/flood/s{index}"))));
+    report
+        .gaps
+        .push(Gap::Undecodable("~/.trash/flood/x".into()));
+    assert_eq!(
+        report.gap_lines(),
+        [
+            "~/a: only root can read it; run `omarchy-guardian sweep --root` to check it",
+            "1200 files in ~/.trash/flood/ (first: ~/.trash/flood/s0): only root can read them; \
+             run `omarchy-guardian sweep --root` to check them",
+            "~/.trash/flood/x: a script, build or config file holds binary data and cannot be reviewed",
+        ]
+    );
+}
+
+#[test]
+fn many_files_left_unread_for_one_reason_in_one_folder_are_one_line() {
+    let limit = "not read: the live checks' limit of 256 files was reached";
+    let mut report = Report::default();
+    report
+        .gaps
+        .extend((0..20).map(|index| Gap::sweep_file(format!("/x/f/{index}"), limit.into())));
+    report.gaps.push(Gap::sweep_file(
+        "/x/f/y".into(),
+        "could not be read (gone)".into(),
+    ));
+    assert_eq!(
+        report.gap_lines(),
+        [
+            format!("sweep: 20 files in /x/f/ (first: /x/f/0): {limit}"),
+            "sweep: /x/f/y: could not be read (gone)".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn past_a_number_an_accounts_own_set_id_files_are_counted_and_the_rest_listed() {
+    let finding = |path: String, rule: RuleId| LocalFinding {
+        path,
+        line: 1,
+        rule,
+        severity: rule.severity(),
+        excerpt: "setuid or setgid; no package vouches for it".into(),
+    };
+    let mut report = Report::default();
+    for index in 0..60 {
+        report.findings.push(finding(
+            format!("/var/tmp/x/{index}"),
+            RuleId::AccountsSetIdFile,
+        ));
+        // Root's, among the decoys: every one is listed.
+        report.findings.push(finding(
+            format!("/var/tmp/x/root{index}"),
+            RuleId::UnknownPrivilegedFile,
+        ));
+    }
+    let (listed, unlisted) = report.listed_findings();
+    assert_eq!(unlisted, 10);
+    let count = |rule| listed.iter().filter(|finding| finding.rule == rule).count();
+    assert_eq!(count(RuleId::AccountsSetIdFile), 50);
+    assert_eq!(count(RuleId::UnknownPrivilegedFile), 60);
+    let text = report.findings_text(Decision::Blocked(Blocked::Findings), 100, Painter::plain());
+    assert!(
+        text.contains("10 more accounts-set-id-file finding(s) are not listed here"),
+        "{text}"
+    );
+    assert!(text.contains("/var/tmp/x/root59:1"), "{text}");
+}
+
+#[test]
+fn a_path_only_an_accounts_own_set_id_finding_flags_is_left_out_of_the_rows() {
+    let finding = |path: &str, rule: RuleId| LocalFinding {
+        path: path.into(),
+        line: 1,
+        rule,
+        severity: rule.severity(),
+        excerpt: String::new(),
+    };
+    let mut report = Report::default();
+    report
+        .findings
+        .push(finding("/t/own", RuleId::AccountsSetIdFile));
+    report
+        .findings
+        .push(finding("/t/both", RuleId::AccountsSetIdFile));
+    report
+        .findings
+        .push(finding("/t/both", RuleId::PersistenceModification));
+    report
+        .findings
+        .push(finding("/t/roots", RuleId::UnknownPrivilegedFile));
+    let rows = report.flagged_paths_but_accounts_set_id();
+    assert!(!rows.contains("/t/own"));
+    assert!(rows.contains("/t/both") && rows.contains("/t/roots"));
+    assert!(report.flagged_paths().contains("/t/own"));
+}
