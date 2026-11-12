@@ -611,7 +611,7 @@ pub(super) fn save_last_run(directory: &Path, run: &LastRun) -> Result<(), Error
 }
 
 /// How an item changed since the last sweep.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum Change {
     New,
     Changed,

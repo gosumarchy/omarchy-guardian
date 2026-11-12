@@ -5,8 +5,10 @@
 //! counted on what the terminal will draw, and colour is added only after
 //! padding, so escape codes never count towards a column.
 
+use std::collections::HashMap;
 use std::env;
 use std::fs::File;
+use std::hash::Hash;
 use std::io::{self, IsTerminal};
 use std::process::{Command, Stdio};
 
@@ -485,9 +487,108 @@ pub(crate) fn bar(part: usize, whole: usize, width: usize) -> (String, String) {
     ("█".repeat(filled), "░".repeat(width - filled.min(width)))
 }
 
+/// How many entries of one kind a folder may have before the terminal shows
+/// them as one row. Arbitrary: few enough that one folder cannot fill a
+/// screen, as a folder of 1,200 test files once filled the sweep's log.
+const ROWS_PER_FOLDER: usize = 10;
+
+/// An entry as the terminal lists it: alone, or standing for every entry
+/// of its kind in its folder.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Listed<'a, T> {
+    One(&'a T),
+    Folder {
+        first: &'a T,
+        folder: &'a str,
+        count: usize,
+    },
+}
+
+/// Lists `entries` in order, where `place` gives an entry's kind and path,
+/// or `None` for an entry always shown alone. Once a folder holds more than
+/// `ROWS_PER_FOLDER` entries of one kind, they are one `Folder` row, where
+/// the first of them was. Only the terminal groups: the JSON and the report
+/// page keep every entry.
+///
+/// Only the path's own folder is counted, so a flood spread over many
+/// folders is still listed in full. That is noise, not a way to hide
+/// anything: every entry is still judged, and the findings are listed apart.
+pub(crate) fn by_folder<'a, T, K>(
+    entries: &'a [T],
+    place: impl Fn(&'a T) -> Option<(K, &'a str)>,
+) -> Vec<Listed<'a, T>>
+where
+    K: Copy + Eq + Hash,
+{
+    let folder_of = |path: &'a str| path.rsplit_once('/').map_or("", |(folder, _)| folder);
+    let mut counts: HashMap<(K, &str), usize> = HashMap::new();
+    for (kind, path) in entries.iter().filter_map(&place) {
+        *counts.entry((kind, folder_of(path))).or_default() += 1;
+    }
+    let mut listed = Vec::new();
+    for entry in entries {
+        let Some((kind, path)) = place(entry) else {
+            listed.push(Listed::One(entry));
+            continue;
+        };
+        let folder = folder_of(path);
+        match counts.get_mut(&(kind, folder)) {
+            Some(count) if *count > ROWS_PER_FOLDER => {
+                listed.push(Listed::Folder {
+                    first: entry,
+                    folder,
+                    count: *count,
+                });
+                // Zero marks the folder's row as made.
+                *count = 0;
+            }
+            Some(0) => {}
+            _ => listed.push(Listed::One(entry)),
+        }
+    }
+    listed
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Painter, Span, Table, bar, boxed, fields, text_width, wrap};
+    use super::{Listed, Painter, Span, Table, bar, boxed, by_folder, fields, text_width, wrap};
+
+    #[test]
+    fn a_folder_past_the_limit_is_one_row_of_its_kind() {
+        let mut entries = vec![(1, "/a/x".to_string())];
+        entries.extend((0..11).map(|index| (1, format!("/t/f/{index}"))));
+        entries.push((2, "/t/f/other".to_string()));
+        entries.extend((0..10).map(|index| (1, format!("/t/g/{index}"))));
+        entries.push((1, "top".to_string()));
+        let listed = by_folder(&entries, |(kind, path)| Some((*kind, path.as_str())));
+
+        assert_eq!(listed[0], Listed::One(&entries[0]));
+        assert_eq!(
+            listed[1],
+            Listed::Folder {
+                first: &entries[1],
+                folder: "/t/f",
+                count: 11
+            }
+        );
+        // Another kind in the same folder, and a folder at the limit, stay
+        // listed one by one; so does a path without a folder.
+        assert_eq!(listed[2], Listed::One(&entries[12]));
+        assert!(
+            listed[3..13]
+                .iter()
+                .all(|row| matches!(row, Listed::One(_)))
+        );
+        assert_eq!(listed[13], Listed::One(&entries[23]));
+        assert_eq!(listed.len(), 14);
+    }
+
+    #[test]
+    fn an_entry_without_a_place_is_always_alone() {
+        let entries: Vec<String> = (0..20).map(|index| format!("/f/{index}")).collect();
+        let listed = by_folder(&entries, |_| None::<((), &str)>);
+        assert_eq!(listed.len(), 20);
+    }
 
     #[test]
     fn wraps_at_spaces_and_breaks_long_words() {

@@ -73,6 +73,11 @@ pub(crate) enum Gap {
     RootOnly(String),
     /// Something else that kept the sweep from seeing everything.
     Sweep(String),
+    /// A file the sweep could not read or follow in full, and why.
+    SweepFile {
+        path: String,
+        reason: String,
+    },
     /// A script, build or config file (or an executable file of unknown
     /// format) that holds binary data.
     Undecodable(String),
@@ -100,6 +105,14 @@ pub(crate) enum Gap {
 }
 
 impl Gap {
+    /// Why the sweep could not read or follow the file at `path` in full.
+    pub(crate) fn sweep_file(path: &str, reason: String) -> Self {
+        Self::SweepFile {
+            path: path.to_owned(),
+            reason,
+        }
+    }
+
     /// Whether what the gap is about is still covered by the SHA-256 of
     /// what was reviewed: the review could not read or judge it, but a
     /// permit bound to that digest is bound to it too. Anything else (a
@@ -127,6 +140,7 @@ impl Gap {
             | Self::GitState(_)
             | Self::RootOnly(_)
             | Self::Sweep(_)
+            | Self::SweepFile { .. }
             | Self::TreeTooLarge { .. }
             | Self::Package(_) => false,
         }
@@ -171,6 +185,7 @@ impl fmt::Display for Gap {
                 f.write_str("source exceeds the AI review input limit (max_input_kib × max_chunks)")
             }
             Self::Sweep(reason) => write!(f, "sweep: {reason}"),
+            Self::SweepFile { path, reason } => write!(f, "sweep: {path}: {reason}"),
             Self::GitState(what) => f.write_str(what),
             Self::RootOnly(path) => write!(
                 f,

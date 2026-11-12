@@ -6,10 +6,11 @@ use std::fmt::Write as _;
 
 use super::collect::{Body, Collection, Item, Origin};
 use super::judge::label;
+use super::state::Change;
 use super::tier::Tier;
 use crate::agent::{AgentFinding, Status};
 use crate::json::Json;
-use crate::layout::{self, Painter, Span, Table};
+use crate::layout::{self, Listed, Painter, Span, Table};
 use crate::report::html::{self, esc};
 use crate::report::{AgentOutcome, AgentRun, Blocked, Decision, Gap, Report, Severity};
 use crate::text::shown;
@@ -129,6 +130,7 @@ fn not_reviewed(report: &Report) -> Vec<String> {
         .iter()
         .map(|gap| match gap {
             Gap::Sweep(text) => text.clone(),
+            Gap::SweepFile { path, reason } => format!("{path}: {reason}"),
             gap => gap.to_string(),
         })
         .collect();
@@ -497,7 +499,7 @@ pub(super) fn notes_text(notes: &[String]) -> String {
 }
 
 /// What changed since the last sweep, in a box with a table below.
-pub(super) fn print_changes(changes: &[(super::state::Change, String)]) {
+pub(super) fn print_changes(changes: &[(Change, String)]) {
     let painter = Painter::for_stdout();
     let width = layout::width();
     let line = if changes.is_empty() {
@@ -516,7 +518,7 @@ pub(super) fn print_changes(changes: &[(super::state::Change, String)]) {
 }
 
 /// What changed since the last sweep, as a table; nothing when nothing did.
-pub(super) fn print_changes_table(changes: &[(super::state::Change, String)]) {
+pub(super) fn print_changes_table(changes: &[(Change, String)]) {
     if changes.is_empty() {
         return;
     }
@@ -534,17 +536,31 @@ pub(super) fn print_changes_table(changes: &[(super::state::Change, String)]) {
     page.push_str("</table></section>");
     html::collect_section(page);
     let mut table = Table::new(vec!["Change", "Item"]);
-    for (change, label) in changes {
+    for (change, item) in change_rows(changes) {
         let (word, color) = change.shown();
-        table.row(vec![
-            vec![Span::new(word, color)],
-            vec![Span::plain(shown(label))],
-        ]);
+        table.row(vec![vec![Span::new(word, color)], vec![Span::plain(item)]]);
     }
     outln!(
         "{}",
         table.render(layout::width(), 2, Painter::for_stdout())
     );
+}
+
+/// The rows of the changes table: each change with its item, shown, and a
+/// folder's changes of one kind as one row once there are many (see
+/// `layout::by_folder`). One folder of test files once made 966 rows.
+fn change_rows(changes: &[(Change, String)]) -> Vec<(Change, String)> {
+    let rows = layout::by_folder(changes, |(change, label)| Some((*change, label.as_str())));
+    rows.into_iter()
+        .map(|row| match row {
+            Listed::One((change, label)) => (*change, shown(label).into_owned()),
+            Listed::Folder {
+                first: (change, _),
+                folder,
+                count,
+            } => (*change, format!("{count} items in {}/", shown(folder))),
+        })
+        .collect()
 }
 
 /// The sweep as one JSON document.
@@ -703,7 +719,8 @@ mod tests {
     use std::collections::{BTreeMap, HashSet};
 
     use super::{
-        SHOWN_CONCERNS, attention, concerns, findings_json, items_html, not_reviewed, verdict_lines,
+        SHOWN_CONCERNS, attention, change_rows, concerns, findings_json, items_html, not_reviewed,
+        verdict_lines,
     };
     use crate::agent::{AgentFinding, AgentReview, Status};
     use crate::autorun::Category;
@@ -716,6 +733,7 @@ mod tests {
     use crate::review::analyze_text_locally;
     use crate::rules::RuleId;
     use crate::sweep::collect::{Body, Item, Origin};
+    use crate::sweep::state::Change;
     use crate::sweep::tier::Tier;
 
     fn local(path: &str, rule: RuleId) -> LocalFinding {
@@ -1010,6 +1028,21 @@ mod tests {
         assert!(html.contains("read as root") && html.contains("&amp;"));
         assert!(
             items_html(&BTreeMap::new(), None, &HashSet::new()).contains("every item is trusted")
+        );
+    }
+
+    #[test]
+    fn a_folder_of_new_files_is_one_row_and_the_rest_stay_listed() {
+        let mut changes = vec![(Change::Changed, "~/.bashrc".to_string())];
+        changes.extend((0..966).map(|index| (Change::New, format!("~/.trash/flood/s{index}"))));
+        changes.push((Change::Removed, "~/.trash/flood/old".to_string()));
+        assert_eq!(
+            change_rows(&changes),
+            [
+                (Change::Changed, "~/.bashrc".to_string()),
+                (Change::New, "966 items in ~/.trash/flood/".to_string()),
+                (Change::Removed, "~/.trash/flood/old".to_string()),
+            ]
         );
     }
 }

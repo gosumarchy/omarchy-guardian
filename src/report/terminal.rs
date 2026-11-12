@@ -4,11 +4,14 @@
 use std::fmt::Write as _;
 
 use crate::agent::{AgentFinding, Status};
-use crate::layout::{self, Painter, Span, Table};
+use crate::layout::{self, Listed, Painter, Span, Table};
 use crate::scan::FileKind;
 use crate::text::shown;
 
-use super::{AgentOutcome, Blocked, Decision, Hashes, Report, Severity, html, recommendation};
+use super::{
+    AgentOutcome, Blocked, Decision, Gap, Hashes, LocalFinding, Report, Severity, html,
+    recommendation,
+};
 
 /// What the remarks are, after their count in the verdict box: for a
 /// review that is clear, and for one that is not (something else decided
@@ -73,15 +76,49 @@ impl Report {
         }
         out!("{}", self.findings_text(decision, width, painter));
 
-        for gap in &self.gaps {
-            crate::output::stderr_line(format_args!("  ! {}", shown(&gap.to_string())));
-        }
+        self.print_gaps();
         let advice = match (permit, decision) {
             (Some(_), Decision::Blocked(_)) => PERMITTED_ADVICE,
             _ => recommendation(decision),
         };
         outln!("\n{}", painter.paint(advice, "2"));
         html::collect(self, decision, permit);
+    }
+
+    /// Prints why the review is incomplete, one line a reason.
+    fn print_gaps(&self) {
+        for line in self.gap_lines() {
+            crate::output::stderr_line(format_args!("  ! {}", shown(&line)));
+        }
+    }
+
+    /// Why the review is incomplete, one line a reason. A file's reason is
+    /// counted per folder once many files there share it (see
+    /// `layout::by_folder`): one folder of them once filled the log.
+    pub(super) fn gap_lines(&self) -> Vec<String> {
+        let rows = layout::by_folder(&self.gaps, |gap| match gap {
+            Gap::RootOnly(path) => Some((None, path.as_str())),
+            Gap::SweepFile { path, reason } => Some((Some(reason.as_str()), path.as_str())),
+            _ => None,
+        });
+        rows.into_iter()
+            .map(|row| match row {
+                Listed::One(gap) => gap.to_string(),
+                Listed::Folder {
+                    first,
+                    folder,
+                    count,
+                } => match first {
+                    Gap::SweepFile { reason, .. } => {
+                        format!("sweep: {count} files in {folder}/: {reason}")
+                    }
+                    _ => format!(
+                        "{count} files in {folder}/: only root can read them; \
+                         run `omarchy-guardian sweep --root` to check them"
+                    ),
+                },
+            })
+            .collect()
     }
 
     /// The one-line verdict and its terminal colour, as overruled by the
@@ -338,6 +375,36 @@ impl Report {
         }
     }
 
+    /// The local checks' findings as the table lists them, each with where
+    /// it is. Findings that say the same (rule, severity, line and excerpt)
+    /// of many files in one folder are one row (see `layout::by_folder`):
+    /// one folder of set-uid test files once made 945 rows of the same
+    /// alert. A finding that says anything different keeps its own row.
+    pub(super) fn finding_rows(&self) -> Vec<(&LocalFinding, String)> {
+        let rows = layout::by_folder(&self.findings, |finding| {
+            let says = (
+                finding.rule,
+                finding.severity,
+                finding.line,
+                finding.excerpt.as_str(),
+            );
+            Some((says, finding.path.as_str()))
+        });
+        rows.into_iter()
+            .map(|row| match row {
+                Listed::One(finding) => (
+                    finding,
+                    format!("{}:{}", shown(&finding.path), finding.line),
+                ),
+                Listed::Folder {
+                    first,
+                    folder,
+                    count,
+                } => (first, format!("{count} files in {}/", shown(folder))),
+            })
+            .collect()
+    }
+
     /// The tables of what was found: the local checks, the AI's findings,
     /// its remarks, the owner's own settings and the dependency advisories,
     /// each under its title.
@@ -351,7 +418,7 @@ impl Report {
         let severity = |severity: Severity| vec![Span::new(severity.label(), severity.color())];
         if !self.findings.is_empty() {
             let mut table = Table::new(vec!["Severity", "Where", "Local check"]);
-            for finding in &self.findings {
+            for (finding, place) in self.finding_rows() {
                 let mut what = vec![
                     Span::new(finding.rule.name(), "1"),
                     Span::plain(finding.rule.description()),
@@ -361,11 +428,7 @@ impl Report {
                 }
                 table.row(vec![
                     severity(finding.severity),
-                    vec![Span::plain(format!(
-                        "{}:{}",
-                        shown(&finding.path),
-                        finding.line
-                    ))],
+                    vec![Span::plain(place)],
                     what,
                 ]);
             }

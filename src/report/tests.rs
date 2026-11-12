@@ -510,3 +510,73 @@ fn colors_can_be_disabled() {
 
 mod remarks;
 mod settings;
+
+#[test]
+fn many_files_only_root_can_read_in_one_folder_are_one_line() {
+    let mut report = Report::default();
+    report.gaps.push(Gap::RootOnly("~/a".into()));
+    report
+        .gaps
+        .extend((0..1200).map(|index| Gap::RootOnly(format!("~/.trash/flood/s{index}"))));
+    report
+        .gaps
+        .push(Gap::Undecodable("~/.trash/flood/x".into()));
+    assert_eq!(
+        report.gap_lines(),
+        [
+            "~/a: only root can read it; run `omarchy-guardian sweep --root` to check it",
+            "1200 files in ~/.trash/flood/: only root can read them; \
+             run `omarchy-guardian sweep --root` to check them",
+            "~/.trash/flood/x: a script, build or config file holds binary data and cannot be reviewed",
+        ]
+    );
+}
+
+#[test]
+fn many_files_left_unread_for_one_reason_in_one_folder_are_one_line() {
+    let limit = "not read: the live checks' limit of 256 files was reached";
+    let mut report = Report::default();
+    report
+        .gaps
+        .extend((0..20).map(|index| Gap::sweep_file(&format!("/x/f/{index}"), limit.into())));
+    report
+        .gaps
+        .push(Gap::sweep_file("/x/f/y", "could not be read (gone)".into()));
+    assert_eq!(
+        report.gap_lines(),
+        [
+            format!("sweep: 20 files in /x/f/: {limit}"),
+            "sweep: /x/f/y: could not be read (gone)".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn findings_that_say_the_same_of_one_folder_are_one_row() {
+    let same = |path: String| LocalFinding {
+        path,
+        line: 1,
+        rule: RuleId::UnknownPrivilegedFile,
+        severity: Severity::High,
+        excerpt: "setuid or setgid; no package vouches for it".into(),
+    };
+    let mut report = Report::default();
+    report
+        .findings
+        .extend((0..945).map(|index| same(format!("/t/flood/s{index}"))));
+    // Another line of a file there says something else: its own row.
+    report.findings.push(LocalFinding {
+        line: 2,
+        ..same("/t/flood/s0".into())
+    });
+    report.findings.push(same("/t/other".into()));
+    let places: Vec<String> = report
+        .finding_rows()
+        .into_iter()
+        .map(|(_, place)| place)
+        .collect();
+    assert_eq!(
+        places,
+        ["945 files in /t/flood/", "/t/flood/s0:2", "/t/other:1"]
+    );
+}

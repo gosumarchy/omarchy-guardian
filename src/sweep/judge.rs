@@ -297,7 +297,7 @@ fn examine(
                 item.notes
                     .iter()
                     .filter_map(|note| note.strip_prefix(collect::NOT_ALL_FOLLOWED))
-                    .map(|limit| Gap::Sweep(format!("{label}: not followed past {limit}"))),
+                    .map(|limit| Gap::sweep_file(&label, format!("not followed past {limit}"))),
             );
         }
         match &item.body {
@@ -356,7 +356,7 @@ fn examine(
             // Left unread by the live checks' limit, not by its owner: root
             // would not have read it either.
             Body::Unreadable(reason) if reason == NOT_READ_PAST_LIMIT => {
-                report.gaps.push(Gap::Sweep(format!("{label}: {reason}")));
+                report.gaps.push(Gap::sweep_file(&label, reason.clone()));
             }
             Body::Unreadable(_) => report.gaps.push(Gap::RootOnly(label)),
             // A link is judged by its target, which is its own item.
@@ -465,7 +465,7 @@ fn plugin_files(report: &mut Report, plugin: &nvim::Plugin, label: &str) -> Opti
             Body::Undecodable => report.gaps.push(Gap::Undecodable(shown)),
             Body::Unreadable(reason) => report
                 .gaps
-                .push(Gap::Sweep(format!("{shown}: could not be read ({reason})"))),
+                .push(Gap::sweep_file(&shown, format!("could not be read ({reason})"))),
             Body::Binary(_) => report.gaps.push(Gap::RunsUnread(format!(
                 "{shown}: new or changed, and Neovim runs it without the review reading it; check it, then `sweep allow` the plugin"
             ))),
