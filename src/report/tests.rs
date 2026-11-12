@@ -551,37 +551,3 @@ fn many_files_left_unread_for_one_reason_in_one_folder_are_one_line() {
         ]
     );
 }
-
-#[test]
-fn findings_that_say_the_same_of_one_folder_are_one_row() {
-    let same = |path: String| LocalFinding {
-        path,
-        line: 1,
-        rule: RuleId::UnknownPrivilegedFile,
-        severity: Severity::High,
-        excerpt: "setuid or setgid; no package vouches for it".into(),
-    };
-    let mut report = Report::default();
-    report
-        .findings
-        .extend((0..945).map(|index| same(format!("/t/flood/s{index}"))));
-    // Another line of a file there says something else: its own row.
-    report.findings.push(LocalFinding {
-        line: 2,
-        ..same("/t/flood/s0".into())
-    });
-    report.findings.push(same("/t/other".into()));
-    let places: Vec<String> = report
-        .finding_rows()
-        .into_iter()
-        .map(|(_, place)| place)
-        .collect();
-    assert_eq!(
-        places,
-        [
-            "945 findings in /t/flood/ (first: /t/flood/s0:1)",
-            "/t/flood/s0:2",
-            "/t/other:1",
-        ]
-    );
-}

@@ -632,10 +632,13 @@ impl Owner {
 /// counted. Kept in all: this many for each owner with files on a mount
 /// where set-id bits take effect (an account makes files only of its own
 /// uid there, so these are as many as the accounts), and this many shared.
-/// Arbitrary, as `MAX_ODD`: well above what is shown of an account's
-/// items, and each holds a path an account can make some 16 KiB long (64
-/// levels of 255-byte names), so they are not kept without bound.
-pub(super) const MAX_ACCOUNTS_ITEMS: usize = 1_000;
+/// Each is a HIGH finding of its own, listed one by one (findings are never
+/// grouped, see `layout::by_folder`), so this bounds how many rows one
+/// account's own files add to a report: 1,000 once buried the rest of the
+/// nightly sweep. Arbitrary otherwise; an account's own set-id file runs
+/// with only that account's rights, and root's are never cut. Each holds a
+/// path an account can make some 16 KiB long (64 levels of 255-byte names).
+pub(super) const MAX_ACCOUNTS_ITEMS: usize = 50;
 
 impl Counts {
     /// Whether one more of the accounts' own set-id files is looked at; one

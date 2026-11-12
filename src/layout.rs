@@ -505,17 +505,15 @@ pub(crate) enum Listed<'a, T> {
 }
 
 /// Lists `entries` in order, where `place` gives an entry's kind and path,
-/// or `None` for an entry always shown alone (as is a path with `#` or
-/// without a folder). Once a folder holds more than
+/// or `None` for an entry always shown alone. Once a folder holds more than
 /// `ROWS_PER_FOLDER` entries of one kind, they are one `Folder` row, where
 /// the first of them was. Only the terminal groups: the JSON and the report
 /// page keep every entry.
 ///
-/// Every entry is still judged and counted, and an entry is grouped only
-/// with entries of the same kind (a finding: the same rule, severity, line
-/// and excerpt), so the row still says what they are, and names the first.
-/// Only the path's own folder is counted: a flood spread over many folders
-/// is still listed in full.
+/// Findings are never passed here: a row of like findings would let an
+/// account's decoys hide a file of root's among them. Only a path's own
+/// folder is counted, so a flood spread over many folders is still listed
+/// in full.
 pub(crate) fn by_folder<'a, T, K>(
     entries: &'a [T],
     place: impl Fn(&'a T) -> Option<(K, &'a str)>,
@@ -524,13 +522,14 @@ where
     K: Copy + Eq + Hash,
 {
     // A label with `#` names an entry inside a file (`profile#extension:id`,
-    // `authorized_keys#hash`): its folder is not where it is, and what tells
-    // it apart is after the `#`, so it is always listed alone. So is a path
-    // without a folder.
+    // `authorized_keys#hash`), and a name with `:` after its last `/` names
+    // one of a program (`/usr/bin/nc:tcp-4444`): what tells them apart is
+    // not the path, so each is always listed alone. So is a path without a
+    // folder.
     let grouped = |entry: &'a T| {
         let (kind, path) = place(entry)?;
-        let (folder, _) = path.rsplit_once('/').filter(|_| !path.contains('#'))?;
-        Some((kind, folder))
+        let (folder, name) = path.rsplit_once('/')?;
+        (!path.contains('#') && !name.contains(':')).then_some((kind, folder))
     };
     let mut counts: HashMap<(K, &str), usize> = HashMap::new();
     for key in entries.iter().filter_map(&grouped) {
@@ -594,14 +593,15 @@ mod tests {
     }
 
     #[test]
-    fn an_entry_inside_a_file_or_without_a_folder_is_always_alone() {
+    fn an_entry_inside_a_file_or_program_or_without_a_folder_is_always_alone() {
         let mut entries: Vec<String> = (0..11)
             .map(|index| format!("~/.config/chromium/Default#extension:{index}"))
             .collect();
         entries.extend((0..11).map(|index| format!("~/.ssh/authorized_keys#{index:016x}")));
         entries.extend((0..11).map(|index| format!("name{index}")));
+        entries.extend((0..11).map(|index| format!("/usr/bin/nc:tcp-{index}")));
         let listed = by_folder(&entries, |path| Some(((), path.as_str())));
-        assert_eq!(listed.len(), 33);
+        assert_eq!(listed.len(), 44);
         assert!(listed.iter().all(|row| matches!(row, Listed::One(_))));
     }
 

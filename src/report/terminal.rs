@@ -8,10 +8,7 @@ use crate::layout::{self, Listed, Painter, Span, Table};
 use crate::scan::FileKind;
 use crate::text::shown;
 
-use super::{
-    AgentOutcome, Blocked, Decision, Gap, Hashes, LocalFinding, Report, Severity, html,
-    recommendation,
-};
+use super::{AgentOutcome, Blocked, Decision, Gap, Hashes, Report, Severity, html, recommendation};
 
 /// What the remarks are, after their count in the verdict box: for a
 /// review that is clear, and for one that is not (something else decided
@@ -376,44 +373,6 @@ impl Report {
         }
     }
 
-    /// The local checks' findings as the table lists them, each with where
-    /// it is. Findings that say the same (rule, severity, line and excerpt)
-    /// of many files in one folder are one row (see `layout::by_folder`):
-    /// one folder of set-uid test files once made 945 rows of the same
-    /// alert. A finding that says anything different keeps its own row.
-    pub(super) fn finding_rows(&self) -> Vec<(&LocalFinding, String)> {
-        let rows = layout::by_folder(&self.findings, |finding| {
-            let says = (
-                finding.rule,
-                finding.severity,
-                finding.line,
-                finding.excerpt.as_str(),
-            );
-            Some((says, finding.path.as_str()))
-        });
-        rows.into_iter()
-            .map(|row| match row {
-                Listed::One(finding) => (
-                    finding,
-                    format!("{}:{}", shown(&finding.path), finding.line),
-                ),
-                Listed::Folder {
-                    first,
-                    folder,
-                    count,
-                } => (
-                    first,
-                    format!(
-                        "{count} findings in {}/ (first: {}:{})",
-                        shown(folder),
-                        shown(&first.path),
-                        first.line
-                    ),
-                ),
-            })
-            .collect()
-    }
-
     /// The tables of what was found: the local checks, the AI's findings,
     /// its remarks, the owner's own settings and the dependency advisories,
     /// each under its title.
@@ -427,7 +386,7 @@ impl Report {
         let severity = |severity: Severity| vec![Span::new(severity.label(), severity.color())];
         if !self.findings.is_empty() {
             let mut table = Table::new(vec!["Severity", "Where", "Local check"]);
-            for (finding, place) in self.finding_rows() {
+            for finding in &self.findings {
                 let mut what = vec![
                     Span::new(finding.rule.name(), "1"),
                     Span::plain(finding.rule.description()),
@@ -437,7 +396,11 @@ impl Report {
                 }
                 table.row(vec![
                     severity(finding.severity),
-                    vec![Span::plain(place)],
+                    vec![Span::plain(format!(
+                        "{}:{}",
+                        shown(&finding.path),
+                        finding.line
+                    ))],
                     what,
                 ]);
             }

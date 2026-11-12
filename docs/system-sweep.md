@@ -1501,11 +1501,11 @@ counted in a note, not listed. A file with several names (hard links) is
 looked at by the first one met, and the other names are counted in a note. Of
 the setuid files and files with capabilities in places accounts may write, the
 sweep hashes 4 GiB at most; past that each is listed without a hash and a note
-says how many. Past 1,000 setuid or setgid files of one account's own there
+says how many. Past 50 setuid or setgid files of one account's own there
 (on a mount where set-id bits take effect, where owners are real; elsewhere all
-share the 1,000), each is counted in a note and not looked at, so one account's
-files cannot crowd out another's, and the files looked at grow by 1,000 with
-each account that owns some; a file of root's or one with the
+share the 50), each is counted in a note and not looked at, so one account's
+files cannot crowd out another's or fill the report, and the files looked at
+grow by 50 with each account that owns some; a file of root's or one with the
 host's capabilities there is always looked at, since no account can make those
 without bound. Other mounted filesystems (`/mnt`, `/media`, `/run/media`) are
 not looked through at all.
