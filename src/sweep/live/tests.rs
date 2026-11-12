@@ -5310,16 +5310,22 @@ fn an_accounts_setgid_file_is_listed_in_full() {
     if fs::metadata(root).unwrap().uid() != 0 {
         return;
     }
-    let path = root.join("var/tmp/group");
-    setuid_file(&path);
-    // Its group need not be the account's: running it gives that group.
-    chown(&path, Some(65_534), Some(0)).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o2755)).unwrap();
-    assert_eq!(fs::metadata(&path).unwrap().uid(), 65_534);
+    // Its group need not be the account's: running it gives that group,
+    // with the setuid bit beside it or not.
+    for (name, mode) in [("group", 0o2755), ("both", 0o6755)] {
+        let path = root.join("var/tmp").join(name);
+        setuid_file(&path);
+        chown(&path, Some(65_534), Some(0)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().uid(), 65_534);
+    }
     fs::set_permissions(root.join("var/tmp"), fs::Permissions::from_mode(0o1777)).unwrap();
     let found = walk_as_root(root, files(10_000), none_anywhere, ONE_MOUNT);
-    assert_eq!(
-        found.items["var/tmp/group"].alerts[0].0,
-        RuleId::UnknownPrivilegedFile
-    );
+    for path in ["var/tmp/group", "var/tmp/both"] {
+        assert_eq!(
+            found.items[path].alerts[0].0,
+            RuleId::UnknownPrivilegedFile,
+            "{path}"
+        );
+    }
 }

@@ -1510,7 +1510,7 @@ host's capabilities there is always looked at, since no account can make those
 without bound. A setuid file of an account's own uid that no package vouches
 for raises `accounts-set-id-file`, not `unknown-privileged-file`: the terminal
 lists the first 50 of those and counts the rest, and names them after the
-others in its summary. A file of root's (or one that says it is root's), a
+others of their severity in its summary. A file of root's (or one that says it is root's), a
 setgid file, whose group need not be the account's, and one with capabilities
 each keep a row of their own. Other mounted filesystems (`/mnt`, `/media`, `/run/media`) are
 not looked through at all.
@@ -2359,7 +2359,9 @@ each area, goes to the full report:
 replaced at each sweep run in a terminal; the daily timer's sweep leaves it
 alone. `--all` prints the full report as well, and lists the trusted items
 in it. When the file cannot be written, the sweep prints the full report
-instead, so nothing it found is left out.
+instead, so nothing it found is left out. (Past the first 50
+`accounts-set-id-file` findings, it counts them: `sweep --json` and the report
+page list every one.)
 
 `sweep --report` saves the same page a notification opens, with the items
 listed by area and an **Ask your AI agent** button, and prints the
