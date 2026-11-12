@@ -411,7 +411,7 @@ impl RuleId {
         ),
         (
             Self::AccountsSetIdFile,
-            "A file an account owns, which no package vouches for, runs as that account or with its group for whoever runs it (setuid or setgid).",
+            "A file an account owns, which no package vouches for, runs as that account for whoever runs it (setuid).",
         ),
         (
             Self::NetworkListener,

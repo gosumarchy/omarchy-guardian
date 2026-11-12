@@ -1507,10 +1507,12 @@ share the 1,000), each is counted in a note and not looked at, so one account's
 files cannot crowd out another's, and the files looked at grow by 1,000 with
 each account that owns some; a file of root's or one with the
 host's capabilities there is always looked at, since no account can make those
-without bound. A setuid or setgid file of an account's own uid that no package
-vouches for raises `accounts-set-id-file`, not `unknown-privileged-file`: the
-terminal lists the first 50 of those and counts the rest, while one of root's
-(or one that says it is root's) is always listed on a row of its own. Other mounted filesystems (`/mnt`, `/media`, `/run/media`) are
+without bound. A setuid file of an account's own uid that no package vouches
+for raises `accounts-set-id-file`, not `unknown-privileged-file`: the terminal
+lists the first 50 of those and counts the rest, and names them after the
+others in its summary. A file of root's (or one that says it is root's), a
+setgid file, whose group need not be the account's, and one with capabilities
+each keep a row of their own. Other mounted filesystems (`/mnt`, `/media`, `/run/media`) are
 not looked through at all.
 
 Directories the search for setuid and setgid files cannot list are counted. In
@@ -2182,7 +2184,8 @@ never read.
   of them, and so are more than 10 files there that only root can read or that
   were left unread for one reason. A change of an item with a finding (other
   than `accounts-set-id-file`), an entry inside a file (`#`), what a program
-  was seen doing (`:`) and every finding keep a row of their own. `sweep --json` and the report page list every one;
+  was seen doing (`:`) and every finding but those past the first 50
+  `accounts-set-id-file` keep a row of their own. `sweep --json` and the report page list every one;
 - a system timer (`omarchy-guardian-sweep-collect.timer`) for the root checks,
   but only after `protect` asks you and you agree.
 
@@ -2456,7 +2459,7 @@ reviews as well, are listed under [Local rules](local-rules.md#rule-ids).
 | `preloaded-library` | high | A library no package installed is preloaded into a running program (`LD_PRELOAD`). |
 | `unknown-kernel-module` | high | A loaded kernel module was not installed by a package. |
 | `unknown-privileged-file` | high | A file no package vouches for runs with extra rights (setuid, setgid or capabilities). |
-| `accounts-set-id-file` | high | A file an account owns, which no package vouches for, runs as that account or with its group for whoever runs it (setuid or setgid). |
+| `accounts-set-id-file` | high | A file an account owns, which no package vouches for, runs as that account for whoever runs it (setuid). |
 | `guardian-override` | high | A unit file or drop-in changes what Guardian's own sweep runs; allowing the file does not quiet this. |
 | `path-hijack` | high | A program or directory a user can write comes ahead of the system's own on `PATH` and takes over a command's name. |
 | `new-trust` | high | Something that was not there at the last sweep may now log in, administer or vouch here: an account, a member of an administrator group, an SSH key or a certificate authority. |

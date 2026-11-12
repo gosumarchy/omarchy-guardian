@@ -391,3 +391,17 @@ fn a_link_target_holding_a_mark_separator_is_not_another_target() {
     assert_ne!(link("/a+m"), link("/a+m+m"));
     assert_ne!(link("/a%2Bm"), link("/a+m"));
 }
+
+#[test]
+fn an_accounts_own_set_id_file_is_remembered_as_before_its_rule_was_split() {
+    let alerted = |rule| Item {
+        alerts: vec![(rule, "setuid; no package vouches for it".into())],
+        ..item("a", "one")
+    };
+    let own = super::fingerprint(&alerted(crate::rules::RuleId::AccountsSetIdFile));
+    assert_eq!(
+        own,
+        super::fingerprint(&alerted(crate::rules::RuleId::UnknownPrivilegedFile))
+    );
+    assert!(own.ends_with("+unknown-privileged-file"), "{own}");
+}

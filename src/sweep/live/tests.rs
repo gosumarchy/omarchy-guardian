@@ -5300,3 +5300,26 @@ fn an_accounts_own_set_id_file_raises_its_own_rule_and_roots_never_does() {
     // can put it there, never make more of it.
     assert_eq!(rule("var/tmp/roots"), RuleId::UnknownPrivilegedFile);
 }
+
+#[test]
+fn an_accounts_setgid_file_is_listed_in_full() {
+    use std::os::unix::fs::{MetadataExt, chown};
+    let dir = TempDir::new("live-walk-accounts-setgid");
+    let root = dir.path();
+    // As `an_accounts_own_set_id_file_raises_its_own_rule_and_roots_never_does`.
+    if fs::metadata(root).unwrap().uid() != 0 {
+        return;
+    }
+    let path = root.join("var/tmp/group");
+    setuid_file(&path);
+    // Its group need not be the account's: running it gives that group.
+    chown(&path, Some(65_534), Some(0)).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o2755)).unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().uid(), 65_534);
+    fs::set_permissions(root.join("var/tmp"), fs::Permissions::from_mode(0o1777)).unwrap();
+    let found = walk_as_root(root, files(10_000), none_anywhere, ONE_MOUNT);
+    assert_eq!(
+        found.items["var/tmp/group"].alerts[0].0,
+        RuleId::UnknownPrivilegedFile
+    );
+}

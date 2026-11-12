@@ -100,7 +100,10 @@ struct Concern {
 }
 
 /// The files the review raised alerts on (see `Report::alerts`), worst
-/// first, one entry per file.
+/// first, one entry per file. Of one severity, a file only an account's own
+/// setuid file finding flags comes last: any account can make as many of
+/// those as it likes, and they must not push a file of root's out of the
+/// few the summary names.
 fn concerns(report: &Report) -> Vec<(String, Concern)> {
     let mut by_file: BTreeMap<String, Concern> = BTreeMap::new();
     for (file, severity, why) in report.alerts() {
@@ -115,8 +118,9 @@ fn concerns(report: &Report) -> Vec<(String, Concern)> {
             concern.why = why;
         }
     }
+    let rows = report.flagged_paths_but_accounts_set_id();
     let mut concerns: Vec<(String, Concern)> = by_file.into_iter().collect();
-    concerns.sort_by_key(|(_, concern)| concern.severity);
+    concerns.sort_by_key(|(file, concern)| (concern.severity, !rows.contains(file)));
     concerns
 }
 
@@ -1048,6 +1052,20 @@ mod tests {
         assert!(
             items_html(&BTreeMap::new(), None, &HashSet::new()).contains("every item is trusted")
         );
+    }
+
+    #[test]
+    fn an_accounts_own_setuid_files_come_after_roots_in_the_summary() {
+        let mut report = Report::new("sweep", ReviewScope::default());
+        report.findings = (0..11)
+            .map(|index| local(&format!("/var/tmp/.a{index}"), RuleId::AccountsSetIdFile))
+            .collect();
+        report
+            .findings
+            .push(local("/var/tmp/.x", RuleId::UnknownPrivilegedFile));
+        let concerns = concerns(&report);
+        assert_eq!(concerns[0].0, "/var/tmp/.x");
+        assert_eq!(concerns.len(), 12);
     }
 
     #[test]

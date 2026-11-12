@@ -1039,14 +1039,20 @@ impl Walk<'_> {
                 read::Found::Link(_) | read::Found::Other => true,
             };
         if set_id && !bits_gone {
-            // Of the files `Counts::keep` bounds, those of an account's own
-            // uid: any account can make as many as it likes, so the terminal
-            // lists only some of them. A file that says it is root's (uid 0,
-            // or the tree's owner in a test) never is one, even where that
-            // may be untrue (an account's FUSE mount): listed in full, it
-            // can add rows, never hide one.
-            let accounts_own =
-                !alone && !bounded && metadata.uid() != 0 && Some(metadata.uid()) != self.owner;
+            // A setuid file of an account's own uid, with no capabilities:
+            // any account can make as many as it likes, and it runs only as
+            // that account, so the terminal lists only some of them. Not a
+            // setgid one: its group need not be the account's own (`docker`,
+            // `wheel`), and running it gives anyone that group. Nor a file
+            // that says it is root's (uid 0, or the tree's owner in a test),
+            // even where that may be untrue (an account's FUSE mount):
+            // listed in full, it can add rows, never hide one. (`alone`
+            // needs the tree owner's uid, which this rules out; on a system
+            // that owner is uid 0, so the `uid != 0` only states it.)
+            let accounts_own = !bounded
+                && metadata.mode() & 0o6000 == 0o4000
+                && metadata.uid() != 0
+                && Some(metadata.uid()) != self.owner;
             let rights = if accounts_own {
                 Rights::AccountsSetId
             } else {
@@ -1340,11 +1346,12 @@ fn odd_item(scope: &Scope<'_>, found: &mut Found, directory: &str, name: &[u8], 
 /// What gives a privileged file its rights, and so which alert it raises.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Rights<'a> {
-    /// Set-id bits on a file of root's, or one that says it is.
+    /// Set-id bits on any file not `AccountsSetId`: root's, one that says
+    /// it is, a setgid file, or one with the host's capabilities.
     SetId,
-    /// Set-id bits on a file of an account's own uid that `Counts::keep`
-    /// bounds: any account can make as many as it likes. It raises
-    /// `AccountsSetIdFile`, which the terminal lists only some of.
+    /// The setuid bit, alone, on a file of an account's own uid that
+    /// `Counts::keep` bounds: any account can make as many as it likes. It
+    /// raises `AccountsSetIdFile`, which the terminal lists only some of.
     AccountsSetId,
     Capabilities(&'a Capabilities),
 }

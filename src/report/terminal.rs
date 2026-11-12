@@ -14,9 +14,9 @@ use super::{
     recommendation,
 };
 
-/// How many findings of an account's own set-id files the terminal lists.
-/// Arbitrary: one account can make up to `MAX_ACCOUNTS_ITEMS` (1,000) of
-/// them, which once buried the rest of the nightly sweep's report.
+/// How many findings of an account's own setuid files the terminal lists.
+/// Arbitrary: each account can add up to `MAX_ACCOUNTS_ITEMS` of them, and
+/// one account's once buried the rest of the nightly sweep's report.
 const SHOWN_ACCOUNTS_SET_ID: usize = 50;
 
 /// What the remarks are, after their count in the verdict box: for a
@@ -383,7 +383,7 @@ impl Report {
     }
 
     /// The findings the local-checks table lists, and how many it leaves
-    /// out: past `SHOWN_ACCOUNTS_SET_ID`, an account's own set-id files
+    /// out: past `SHOWN_ACCOUNTS_SET_ID`, an account's own setuid files
     /// (`RuleId::AccountsSetIdFile`, which the sweep's walk gives only files
     /// any account can make as many of as it likes) are counted. Every other
     /// finding is listed, each on a row of its own: a row of like findings
