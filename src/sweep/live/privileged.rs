@@ -1050,6 +1050,7 @@ impl Walk<'_> {
             // needs the tree owner's uid, which this rules out; on a system
             // that owner is uid 0, so the `uid != 0` only states it.)
             let accounts_own = !bounded
+                && capabilities.is_none()
                 && metadata.mode() & 0o6000 == 0o4000
                 && metadata.uid() != 0
                 && Some(metadata.uid()) != self.owner;

@@ -13,6 +13,7 @@ use crate::json::Json;
 use crate::layout::{self, Listed, Painter, Span, Table};
 use crate::report::html::{self, esc};
 use crate::report::{AgentOutcome, AgentRun, Blocked, Decision, Gap, Report, Severity};
+use crate::rules::RuleId;
 use crate::text::shown;
 
 /// A tier's word in the list and its colour.
@@ -118,9 +119,17 @@ fn concerns(report: &Report) -> Vec<(String, Concern)> {
             concern.why = why;
         }
     }
-    let rows = report.flagged_paths_but_accounts_set_id();
+    let others = report.flagged_paths_but_accounts_set_id();
+    let capped: HashSet<&str> = report
+        .findings
+        .iter()
+        .filter(|finding| {
+            finding.rule == RuleId::AccountsSetIdFile && !others.contains(&finding.path)
+        })
+        .map(|finding| finding.path.as_str())
+        .collect();
     let mut concerns: Vec<(String, Concern)> = by_file.into_iter().collect();
-    concerns.sort_by_key(|(file, concern)| (concern.severity, !rows.contains(file)));
+    concerns.sort_by_key(|(file, concern)| (concern.severity, capped.contains(file.as_str())));
     concerns
 }
 
