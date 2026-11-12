@@ -1132,8 +1132,13 @@ fn a_directory_the_accounts_run_cannot_list_is_a_note() {
         ..Closed::default()
     };
     let mut found = super::Found::default();
+    let listable = fs::read_dir(spool.join("x")).is_ok();
     privileged_walk(&scope, &mut found, &mut closed, files(100), capabilities);
     fs::set_permissions(spool.join("x"), fs::Permissions::from_mode(0o700)).unwrap();
+    // Run as root, nothing is closed to the test.
+    if listable {
+        return;
+    }
     assert_eq!(found.unchecked, Vec::<String>::new());
     assert!(
         found.notes.iter().any(|note| note.ends_with(
@@ -4689,7 +4694,15 @@ fn past_a_number_the_accounts_set_id_files_are_counted() {
     let dir = TempDir::new("live-walk-many");
     let root = dir.path();
     for index in 0..1_001 {
-        setuid_file(&root.join(format!("var/tmp/{index}")));
+        let path = root.join(format!("var/tmp/{index}"));
+        setuid_file(&path);
+        // Made by root, the files are root's own, which are never cut.
+        // Give them to an account (nobody), then set the bits again, since
+        // a change of owner clears them.
+        if fs::metadata(&path).unwrap().uid() == 0 {
+            std::os::unix::fs::chown(&path, Some(65_534), Some(65_534)).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o4755)).unwrap();
+        }
     }
     fs::set_permissions(root.join("var/tmp"), fs::Permissions::from_mode(0o1777)).unwrap();
     let found = walk_as_root(root, files(10_000), none_anywhere, ONE_MOUNT);
