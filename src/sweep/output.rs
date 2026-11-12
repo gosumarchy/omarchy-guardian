@@ -499,7 +499,9 @@ pub(super) fn notes_text(notes: &[String]) -> String {
 }
 
 /// What changed since the last sweep, in a box with a table below.
-pub(super) fn print_changes(changes: &[(Change, String)]) {
+/// `flagged` are the paths of the items with a finding
+/// (`flagged_paths_but_accounts_set_id`).
+pub(super) fn print_changes(changes: &[(Change, String)], flagged: &HashSet<String>) {
     let painter = Painter::for_stdout();
     let width = layout::width();
     let line = if changes.is_empty() {
@@ -514,11 +516,11 @@ pub(super) fn print_changes(changes: &[(Change, String)]) {
         "{}",
         layout::boxed("Guardian sweep", &[line], width, "36", painter)
     );
-    print_changes_table(changes);
+    print_changes_table(changes, flagged);
 }
 
 /// What changed since the last sweep, as a table; nothing when nothing did.
-pub(super) fn print_changes_table(changes: &[(Change, String)]) {
+pub(super) fn print_changes_table(changes: &[(Change, String)], flagged: &HashSet<String>) {
     if changes.is_empty() {
         return;
     }
@@ -536,7 +538,7 @@ pub(super) fn print_changes_table(changes: &[(Change, String)]) {
     page.push_str("</table></section>");
     html::collect_section(page);
     let mut table = Table::new(vec!["Change", "Item"]);
-    for (change, item) in change_rows(changes) {
+    for (change, item) in change_rows(changes, flagged) {
         let (word, color) = change.shown();
         table.row(vec![vec![Span::new(word, color)], vec![Span::plain(item)]]);
     }
@@ -548,9 +550,14 @@ pub(super) fn print_changes_table(changes: &[(Change, String)]) {
 
 /// The rows of the changes table: each change with its item, shown, and a
 /// folder's changes of one kind as one row once there are many (see
-/// `layout::by_folder`). One folder of test files once made 966 rows.
-fn change_rows(changes: &[(Change, String)]) -> Vec<(Change, String)> {
-    let rows = layout::by_folder(changes, |(change, label)| Some((*change, label.as_str())));
+/// `layout::by_folder`). One folder of test files once made 966 rows. A
+/// change of an item in `flagged` is always a row of its own: this table is
+/// where a new item with a finding is noticed, so decoys beside it must
+/// not fold it into theirs.
+fn change_rows(changes: &[(Change, String)], flagged: &HashSet<String>) -> Vec<(Change, String)> {
+    let rows = layout::by_folder(changes, |(change, label)| {
+        (!flagged.contains(label)).then_some((*change, label.as_str()))
+    });
     rows.into_iter()
         .map(|row| match row {
             Listed::One((change, label)) => (*change, shown(label).into_owned()),
@@ -1048,8 +1055,11 @@ mod tests {
         let mut changes = vec![(Change::Changed, "~/.bashrc".to_string())];
         changes.extend((0..966).map(|index| (Change::New, format!("~/.trash/flood/s{index}"))));
         changes.push((Change::Removed, "~/.trash/flood/old".to_string()));
+        // One with a finding, among the decoys.
+        changes.push((Change::New, "~/.trash/flood/evil".to_string()));
+        let flagged = HashSet::from(["~/.trash/flood/evil".to_string()]);
         assert_eq!(
-            change_rows(&changes),
+            change_rows(&changes, &flagged),
             [
                 (Change::Changed, "~/.bashrc".to_string()),
                 (
@@ -1057,6 +1067,7 @@ mod tests {
                     "966 items in ~/.trash/flood/ (first: ~/.trash/flood/s0)".to_string()
                 ),
                 (Change::Removed, "~/.trash/flood/old".to_string()),
+                (Change::New, "~/.trash/flood/evil".to_string()),
             ]
         );
     }

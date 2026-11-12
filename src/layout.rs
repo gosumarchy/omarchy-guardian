@@ -522,14 +522,14 @@ where
     K: Copy + Eq + Hash,
 {
     // A label with `#` names an entry inside a file (`profile#extension:id`,
-    // `authorized_keys#hash`), and a name with `:` after its last `/` names
-    // one of a program (`/usr/bin/nc:tcp-4444`): what tells them apart is
-    // not the path, so each is always listed alone. So is a path without a
-    // folder.
+    // `authorized_keys#hash`), and one with `:` what a program was seen
+    // doing (`/usr/bin/nc:tcp-4444`, whose part after the port may hold a
+    // `/`): what tells them apart is not their folder, so each is always
+    // listed alone. So is a path without a folder.
     let grouped = |entry: &'a T| {
         let (kind, path) = place(entry)?;
-        let (folder, name) = path.rsplit_once('/')?;
-        (!path.contains('#') && !name.contains(':')).then_some((kind, folder))
+        let (folder, _) = path.rsplit_once('/')?;
+        (!path.contains(['#', ':'])).then_some((kind, folder))
     };
     let mut counts: HashMap<(K, &str), usize> = HashMap::new();
     for key in entries.iter().filter_map(&grouped) {
@@ -600,8 +600,9 @@ mod tests {
         entries.extend((0..11).map(|index| format!("~/.ssh/authorized_keys#{index:016x}")));
         entries.extend((0..11).map(|index| format!("name{index}")));
         entries.extend((0..11).map(|index| format!("/usr/bin/nc:tcp-{index}")));
+        entries.extend((0..11).map(|index| format!("/usr/bin/python3:tcp-80{index}:a/x.py")));
         let listed = by_folder(&entries, |path| Some(((), path.as_str())));
-        assert_eq!(listed.len(), 44);
+        assert_eq!(listed.len(), 55);
         assert!(listed.iter().all(|row| matches!(row, Listed::One(_))));
     }
 

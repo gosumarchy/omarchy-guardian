@@ -605,9 +605,22 @@ impl Report {
     /// finding is in, and every file an AI finding names, the owner's
     /// settings aside.
     pub(crate) fn flagged_paths(&self) -> HashSet<String> {
+        self.flagged_paths_but(None)
+    }
+
+    /// Like `flagged_paths`, without the paths only an account's own set-id
+    /// file finding (`RuleId::AccountsSetIdFile`) flags: any account can make
+    /// as many of those as it likes, and the terminal counts them past a
+    /// number, so a change of one is not worth a row of its own.
+    pub(crate) fn flagged_paths_but_accounts_set_id(&self) -> HashSet<String> {
+        self.flagged_paths_but(Some(RuleId::AccountsSetIdFile))
+    }
+
+    fn flagged_paths_but(&self, left_out: Option<RuleId>) -> HashSet<String> {
         let mut paths: HashSet<String> = self
             .findings
             .iter()
+            .filter(|finding| Some(finding.rule) != left_out)
             .map(|finding| finding.path.clone())
             .collect();
         paths.extend(

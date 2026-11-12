@@ -1501,13 +1501,16 @@ counted in a note, not listed. A file with several names (hard links) is
 looked at by the first one met, and the other names are counted in a note. Of
 the setuid files and files with capabilities in places accounts may write, the
 sweep hashes 4 GiB at most; past that each is listed without a hash and a note
-says how many. Past 50 setuid or setgid files of one account's own there
+says how many. Past 1,000 setuid or setgid files of one account's own there
 (on a mount where set-id bits take effect, where owners are real; elsewhere all
-share the 50), each is counted in a note and not looked at, so one account's
-files cannot crowd out another's or fill the report, and the files looked at
-grow by 50 with each account that owns some; a file of root's or one with the
+share the 1,000), each is counted in a note and not looked at, so one account's
+files cannot crowd out another's, and the files looked at grow by 1,000 with
+each account that owns some; a file of root's or one with the
 host's capabilities there is always looked at, since no account can make those
-without bound. Other mounted filesystems (`/mnt`, `/media`, `/run/media`) are
+without bound. A setuid or setgid file of an account's own uid that no package
+vouches for raises `accounts-set-id-file`, not `unknown-privileged-file`: the
+terminal lists the first 50 of those and counts the rest, while one of root's
+(or one that says it is root's) is always listed on a row of its own. Other mounted filesystems (`/mnt`, `/media`, `/run/media`) are
 not looked through at all.
 
 Directories the search for setuid and setgid files cannot list are counted. In
@@ -2174,7 +2177,12 @@ never read.
   `standard` only shows are findings of the sweep. Only
   [your own settings](#your-own-settings) are not.) The first scheduled sweep
   has nothing to compare with: it notifies only when it found something with
-  an alert or could not finish;
+  an alert or could not finish. In the terminal and the journal, more than 10
+  changes of one kind in one folder are one row with their count and the first
+  of them, and so are more than 10 files there that only root can read or that
+  were left unread for one reason. A change of an item with a finding (other
+  than `accounts-set-id-file`), an entry inside a file (`#`), what a program
+  was seen doing (`:`) and every finding keep a row of their own. `sweep --json` and the report page list every one;
 - a system timer (`omarchy-guardian-sweep-collect.timer`) for the root checks,
   but only after `protect` asks you and you agree.
 
@@ -2448,6 +2456,7 @@ reviews as well, are listed under [Local rules](local-rules.md#rule-ids).
 | `preloaded-library` | high | A library no package installed is preloaded into a running program (`LD_PRELOAD`). |
 | `unknown-kernel-module` | high | A loaded kernel module was not installed by a package. |
 | `unknown-privileged-file` | high | A file no package vouches for runs with extra rights (setuid, setgid or capabilities). |
+| `accounts-set-id-file` | high | A file an account owns, which no package vouches for, runs as that account or with its group for whoever runs it (setuid or setgid). |
 | `guardian-override` | high | A unit file or drop-in changes what Guardian's own sweep runs; allowing the file does not quiet this. |
 | `path-hijack` | high | A program or directory a user can write comes ahead of the system's own on `PATH` and takes over a command's name. |
 | `new-trust` | high | Something that was not there at the last sweep may now log in, administer or vouch here: an account, a member of an administrator group, an SSH key or a certificate authority. |

@@ -1785,7 +1785,7 @@ fn a_packaged_file_with_capabilities_of_its_own_is_listed() {
             path,
             &looked,
             &format!("capabilities {capabilities}"),
-            Some(&given(capabilities)),
+            super::privileged::Rights::Capabilities(&given(capabilities)),
         );
     }
     let items: Vec<&crate::sweep::collect::Item> = found.items.values().collect();
@@ -4686,22 +4686,21 @@ fn files_with_the_hosts_capabilities_are_never_cut() {
 
 #[test]
 fn past_a_number_the_accounts_set_id_files_are_counted() {
-    use super::privileged::MAX_ACCOUNTS_ITEMS;
     let dir = TempDir::new("live-walk-many");
     let root = dir.path();
-    for index in 0..=MAX_ACCOUNTS_ITEMS {
+    for index in 0..1_001 {
         setuid_file(&root.join(format!("var/tmp/{index}")));
     }
     fs::set_permissions(root.join("var/tmp"), fs::Permissions::from_mode(0o1777)).unwrap();
     let found = walk_as_root(root, files(10_000), none_anywhere, ONE_MOUNT);
-    assert_eq!(found.items.len(), MAX_ACCOUNTS_ITEMS);
+    assert_eq!(found.items.len(), 1_000);
     assert!(
         found.notes.iter().any(|note| note
             .starts_with("1 more setuid or setgid file(s) of the accounts' own")
-            && note.ends_with(&format!(
-                "past {MAX_ACCOUNTS_ITEMS} of one owner's, or of those on mounts where \
-                     set-id bits have no effect"
-            ))),
+            && note.ends_with(
+                "past 1000 of one owner's, or of those on mounts where set-id \
+                                   bits have no effect"
+            )),
         "{:?}",
         found.notes
     );
@@ -5239,14 +5238,7 @@ fn a_set_id_file_root_cannot_open_is_told() {
 fn set_id_files_count_toward_what_the_live_checks_read() {
     let dir = TempDir::new("live-set-id-flood");
     let root = dir.path();
-    // One account's own set-id files are at most `MAX_ACCOUNTS_ITEMS`, fewer
-    // than the files the live checks read, so programs it runs fill the rest.
-    for n in 0..240 {
-        let path = format!("home/u/.cache/p{n}");
-        write(root, &path, &format!("program {n}"));
-        process(root, &(100 + n).to_string(), &format!("/{path}"), &[], "");
-    }
-    for n in 0..40 {
+    for n in 0..300 {
         let path = format!("home/u/s{n}");
         write(root, &path, "x");
         fs::set_permissions(root.join(&path), fs::Permissions::from_mode(0o4755)).unwrap();
@@ -5263,12 +5255,12 @@ fn set_id_files_count_toward_what_the_live_checks_read() {
         .iter()
         .filter(|item| item.category == Category::Setuid)
         .collect();
-    assert_eq!(set_id.len(), 40);
+    assert_eq!(set_id.len(), 300);
     let unread = set_id
         .iter()
         .filter(|item| matches!(&item.body, Body::Unreadable(reason) if reason == super::NOT_READ_PAST_LIMIT))
         .count();
-    assert_eq!(unread, 240 + 40 - 256);
+    assert_eq!(unread, 300 - 256);
     assert!(set_id.iter().all(|item| {
         item.alerts
             .iter()
@@ -5281,4 +5273,30 @@ fn set_id_files_count_toward_what_the_live_checks_read() {
         "{:?}",
         live.unchecked
     );
+}
+
+#[test]
+fn an_accounts_own_set_id_file_raises_its_own_rule_and_roots_never_does() {
+    use std::os::unix::fs::{MetadataExt, chown};
+    let dir = TempDir::new("live-walk-accounts-own");
+    let root = dir.path();
+    // Only root can give a file another owner; as any other user, every
+    // file is the tree's owner's, which the walk takes for root's.
+    if fs::metadata(root).unwrap().uid() != 0 {
+        return;
+    }
+    for name in ["theirs", "roots"] {
+        setuid_file(&root.join(format!("var/tmp/{name}")));
+    }
+    let theirs = root.join("var/tmp/theirs");
+    chown(&theirs, Some(65_534), Some(65_534)).unwrap();
+    fs::set_permissions(&theirs, fs::Permissions::from_mode(0o4755)).unwrap();
+    assert_eq!(fs::metadata(&theirs).unwrap().uid(), 65_534);
+    fs::set_permissions(root.join("var/tmp"), fs::Permissions::from_mode(0o1777)).unwrap();
+    let found = walk_as_root(root, files(10_000), none_anywhere, ONE_MOUNT);
+    let rule = |path: &str| found.items[path].alerts[0].0;
+    assert_eq!(rule("var/tmp/theirs"), RuleId::AccountsSetIdFile);
+    // Root's own set-id file, in a place any account may write: an account
+    // can put it there, never make more of it.
+    assert_eq!(rule("var/tmp/roots"), RuleId::UnknownPrivilegedFile);
 }

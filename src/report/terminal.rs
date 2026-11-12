@@ -5,10 +5,19 @@ use std::fmt::Write as _;
 
 use crate::agent::{AgentFinding, Status};
 use crate::layout::{self, Listed, Painter, Span, Table};
+use crate::rules::RuleId;
 use crate::scan::FileKind;
 use crate::text::shown;
 
-use super::{AgentOutcome, Blocked, Decision, Gap, Hashes, Report, Severity, html, recommendation};
+use super::{
+    AgentOutcome, Blocked, Decision, Gap, Hashes, LocalFinding, Report, Severity, html,
+    recommendation,
+};
+
+/// How many findings of an account's own set-id files the terminal lists.
+/// Arbitrary: one account can make up to `MAX_ACCOUNTS_ITEMS` (1,000) of
+/// them, which once buried the rest of the nightly sweep's report.
+const SHOWN_ACCOUNTS_SET_ID: usize = 50;
 
 /// What the remarks are, after their count in the verdict box: for a
 /// review that is clear, and for one that is not (something else decided
@@ -373,6 +382,31 @@ impl Report {
         }
     }
 
+    /// The findings the local-checks table lists, and how many it leaves
+    /// out: past `SHOWN_ACCOUNTS_SET_ID`, an account's own set-id files
+    /// (`RuleId::AccountsSetIdFile`, which the sweep's walk gives only files
+    /// any account can make as many of as it likes) are counted. Every other
+    /// finding is listed, each on a row of its own: a row of like findings
+    /// would let an account's decoys hide a file of root's among them.
+    pub(super) fn listed_findings(&self) -> (Vec<&LocalFinding>, usize) {
+        let mut accounts_set_id = 0;
+        let listed = self
+            .findings
+            .iter()
+            .filter(|finding| {
+                if finding.rule != RuleId::AccountsSetIdFile {
+                    return true;
+                }
+                accounts_set_id += 1;
+                accounts_set_id <= SHOWN_ACCOUNTS_SET_ID
+            })
+            .collect();
+        (
+            listed,
+            accounts_set_id.saturating_sub(SHOWN_ACCOUNTS_SET_ID),
+        )
+    }
+
     /// The tables of what was found: the local checks, the AI's findings,
     /// its remarks, the owner's own settings and the dependency advisories,
     /// each under its title.
@@ -386,7 +420,8 @@ impl Report {
         let severity = |severity: Severity| vec![Span::new(severity.label(), severity.color())];
         if !self.findings.is_empty() {
             let mut table = Table::new(vec!["Severity", "Where", "Local check"]);
-            for finding in &self.findings {
+            let (listed, unlisted) = self.listed_findings();
+            for finding in listed {
                 let mut what = vec![
                     Span::new(finding.rule.name(), "1"),
                     Span::plain(finding.rule.description()),
@@ -406,6 +441,20 @@ impl Report {
             }
             let _ = writeln!(text, "\n{}", painter.paint("  Local checks", "1"));
             let _ = writeln!(text, "{}", table.render(width, 2, painter));
+            if unlisted > 0 {
+                let _ = writeln!(
+                    text,
+                    "  {}",
+                    painter.paint(
+                        &format!(
+                            "{unlisted} more {} finding(s) are not listed here; \
+                             `sweep --json` and the report page list every one",
+                            RuleId::AccountsSetIdFile.name()
+                        ),
+                        "33"
+                    )
+                );
+            }
         }
 
         text.push_str(&self.ai_tables(decision, width, painter));
