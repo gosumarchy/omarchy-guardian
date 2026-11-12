@@ -26,6 +26,11 @@ use crate::sweep::tier::Tier;
 const PRIVILEGED_ROOTS: &[&str] = &["usr", "opt", "etc", "var", "srv", "root", "home"];
 /// Under those, what holds other systems' files (containers, packages
 /// not installed). A snapshot directory is skipped too (`Walk::skipped`).
+///
+/// The Trash (`~/.local/share/Trash`) is not skipped: a file moved there
+/// keeps its set-id bits and capabilities and still runs by its path, and
+/// any program of the account may write there. A folder of many such files
+/// is shown as one row instead (`layout::by_folder`).
 const PRIVILEGED_SKIPPED: &[&str] = &[
     "var/lib/docker",
     "var/lib/containers",
