@@ -2395,12 +2395,15 @@ fn an_item_the_live_checks_left_unread_is_not_sent_to_root() {
 /// paths a package installed with the content they have.
 fn packaged_facts_of(name: &str, files: &[(&str, &str)], packaged: &[&str]) -> Vec<String> {
     let dir = planted(name, files, &[]);
-    let mut mtree = String::from("#mtree\n/set type=file mode=644\n");
-    for path in packaged {
-        let text = files.iter().find(|(file, _)| file == path).unwrap().1;
-        let digest = crate::sha256::Sha256::digest(text.as_bytes());
-        mtree.push_str(&format!("./{path} sha256digest={digest}\n"));
-    }
+    let entries: Vec<String> = packaged
+        .iter()
+        .map(|path| {
+            let text = files.iter().find(|(file, _)| file == path).unwrap().1;
+            let digest = crate::sha256::Sha256::digest(text.as_bytes());
+            format!("./{path} sha256digest={digest}\n")
+        })
+        .collect();
+    let mtree = format!("#mtree\n/set type=file mode=644\n{}", entries.concat());
     let mut index = PackageIndex::with_foreign(HashSet::new());
     index.add_for_test("guard", &mtree, &[]);
     let collection = collect::collect(&Scope {
@@ -2498,10 +2501,11 @@ fn past_a_number_packaged_files_are_counted_not_described() {
     let paths: Vec<String> = (0..count)
         .map(|n| format!("usr/lib/guard/p{n}.lua"))
         .collect();
-    let loads: String = paths
+    let loads = paths
         .iter()
-        .map(|path| format!("dofile(\"/{path}\")\n"))
-        .collect();
+        .map(|path| format!("dofile(\"/{path}\")"))
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut files: Vec<(&str, &str)> = paths.iter().map(|path| (path.as_str(), "-- x\n")).collect();
     files.push(("home/u/.config/hypr/hyprland.lua", &loads));
     let packaged: Vec<&str> = paths.iter().map(String::as_str).collect();
