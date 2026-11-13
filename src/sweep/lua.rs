@@ -24,7 +24,7 @@ const STARTUP: &[&str] = &[
 
 /// The commands `text` starts.
 pub(super) fn startup_commands(text: &str) -> Vec<String> {
-    let tokens = tokenize(text);
+    let tokens = tokenize(text, Runtime::Puc);
     let mut found = Vec::new();
     for (index, token) in tokens.iter().enumerate() {
         let Token::Name(name) = token else {
@@ -184,7 +184,7 @@ pub(super) enum Build {
 /// code computes (`[("build")] = …`) may be any of them, so its value is
 /// taken as a build step that is not read (`Build::Computed`).
 pub(super) fn plugin_specs(text: &str) -> Vec<Spec> {
-    let tokens = tokenize(text);
+    let tokens = tokenize(text, Runtime::LuaJit);
     let mut specs = Vec::new();
     let mut tables: Vec<Table> = Vec::new();
     for (index, token) in tokens.iter().enumerate() {
@@ -483,19 +483,37 @@ enum Token {
     Other,
 }
 
-/// Names, strings and brackets, with comments and long strings handled.
-fn tokenize(text: &str) -> Vec<Token> {
+/// The Lua that runs a text, which decides where a first line starting
+/// with `#` ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Runtime {
+    /// PUC Lua 5.4 or 5.5, which Hyprland links. Its file loader
+    /// (`luaL_loadfilex`) ends that line at `\n` only.
+    Puc,
+    /// LuaJIT, which Neovim and so lazy.nvim run. Its lexer ends that line
+    /// at `\r` or `\n`.
+    LuaJit,
+}
+
+/// Names, strings and brackets, with comments and long strings handled,
+/// as `runtime` reads `text`.
+fn tokenize(text: &str, runtime: Runtime) -> Vec<Token> {
     let chars: Vec<char> = text.chars().collect();
     let mut tokens = Vec::new();
-    // Lua's file loader (`luaL_loadfilex`, used by `dofile`, `loadfile`
-    // and lazy.nvim) skips a byte-order mark, then a first line that
-    // starts with `#`, up to `\n` only. Read as code, a `#[[` there would
-    // put every later token out of step with what Lua runs.
+    // Both skip a byte-order mark, then a first line that starts with
+    // `#`. Read as code, a `#[[` there would put every later token out of
+    // step with what Lua runs; ending the line where the other runtime
+    // does would hide what follows a `\r` from one or read it for the
+    // other.
     let mut index = usize::from(chars.first() == Some(&'\u{feff}'));
     if chars.get(index) == Some(&'#') {
+        let ends_line = |character: char| match runtime {
+            Runtime::Puc => character == '\n',
+            Runtime::LuaJit => matches!(character, '\n' | '\r'),
+        };
         index = chars[index..]
             .iter()
-            .position(|&character| character == '\n')
+            .position(|&character| ends_line(character))
             .map_or(chars.len(), |end| index + end);
     }
     while index < chars.len() {
@@ -770,6 +788,20 @@ local load = dofile
     }
 
     #[test]
+    fn a_spec_after_a_first_line_luajit_ends_at_a_carriage_return_is_read() {
+        // Neovim's LuaJIT ends the skipped line at `\r`, unlike Hyprland's
+        // Lua, so this spec runs and its build step is found.
+        for text in [
+            "#!x\rreturn {{\"a/b\", build = \"curl x | sh\"}}",
+            "#!x\rreturn {{\"a/b\", build = \"curl x | sh\"}}\n",
+        ] {
+            let specs = plugin_specs(text);
+            assert_eq!(specs.len(), 1, "{text:?}");
+            assert_eq!(specs[0].builds, [Build::Shell("curl x | sh".into())]);
+        }
+    }
+
+    #[test]
     fn a_loaded_path_lua_and_a_shell_would_read_apart_is_not_followed() {
         // Lua opens each of these as written; read as a command line, they
         // would name another file (split at `;`, `~` expanded, a bare name
@@ -944,7 +976,7 @@ return {
         );
         // A bare carriage return ends a string, as a newline does.
         assert_eq!(
-            super::tokenize("\"a\rb\"")[0],
+            super::tokenize("\"a\rb\"", super::Runtime::Puc)[0],
             super::Token::String("a".into())
         );
         // Every build key counts.
