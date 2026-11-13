@@ -90,7 +90,7 @@ pub(super) fn judge(
     };
     let mut report = Report::new("system sweep", scope);
     let mut facts = examine(&mut report, collection, home, news);
-    facts.extend(packaged_facts(collection, home));
+    facts.extend(packaged_facts(collection, &report, home));
     let context = ReviewContext {
         context: &facts,
         ..*context
@@ -390,39 +390,47 @@ fn examine(
 const MAX_PACKAGED_FACTS: usize = 32;
 
 /// What Guardian established about each packaged text file that a file
-/// sent to the AI runs or loads. Such a file is set aside unread, and
-/// without its fact the reviewer took a Hyprland configuration loading
-/// Guardian's own packaged Lua file for one loading a file whose content
-/// nobody vouched for. A packaged binary gets none: the instructions say
-/// that those were set aside and that launching one is no concern.
-fn packaged_facts(collection: &Collection, home: Option<&str>) -> Vec<String> {
-    let sent: HashSet<&str> = collection
-        .items
+/// `report` sends to the AI runs or loads. Such a file is set aside
+/// unread, and without its fact the reviewer took a Hyprland
+/// configuration loading Guardian's own packaged Lua file for one loading
+/// a file whose content nobody vouched for. A packaged binary gets none:
+/// the instructions say that those were set aside and that launching one
+/// is no concern.
+fn packaged_facts(collection: &Collection, report: &Report, home: Option<&str>) -> Vec<String> {
+    let sent: HashSet<&str> = report
+        .agent_input
         .iter()
-        .filter(|item| {
-            !item.is_trusted()
-                && matches!(&item.body, Body::Text(text) if reading(item, home, text) == Reading::Reviewed)
-        })
-        .map(|item| item.path.as_str())
+        .map(|file| file.path.as_str())
         .collect();
+    // `run_by` names the first file that reached the item; the others are
+    // in `runners`, and any of them may be the one sent.
+    let sent_runner = |item: &Item| {
+        let others = collection.runners.get(&item.path).into_iter().flatten();
+        item.run_by
+            .iter()
+            .chain(others)
+            .find(|runner| sent.contains(shown_path(runner, home).as_str()))
+            .cloned()
+    };
     let mut facts: Vec<String> = collection
         .items
         .iter()
         .filter(|item| {
             item.is_trusted()
                 && matches!(item.tier, Tier::Vendor | Tier::Copied)
-                && !matches!(item.body, Body::Binary(_))
+                && matches!(item.body, Body::Text(_))
         })
         .filter_map(|item| {
-            let runner = item.run_by.as_deref().filter(|by| sent.contains(by))?;
-            Some(fact(item, Some(runner), &label(item, home), home))
+            let runner = sent_runner(item)?;
+            Some(fact(item, Some(&runner), &label(item, home), home))
         })
         .collect();
     let more = facts.len().saturating_sub(MAX_PACKAGED_FACTS);
     facts.truncate(MAX_PACKAGED_FACTS);
     if more > 0 {
+        let files = if more == 1 { "file" } else { "files" };
         facts.push(format!(
-            "Guardian set aside {more} more packaged files that supplied files run, unchanged, without describing them here."
+            "Guardian did not describe {more} more unchanged packaged {files} that sent files run."
         ));
     }
     facts

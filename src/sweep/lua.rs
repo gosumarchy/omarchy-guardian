@@ -73,45 +73,71 @@ pub(super) fn startup_commands(text: &str) -> Vec<String> {
     found
 }
 
-/// The functions that load and run a Lua file, and those that call a
-/// function given as their first argument. `xpcall` takes a handler
-/// before the function's arguments, so a file it loads is `(computed)`.
+/// The functions that load and run a Lua file.
 const LOADERS: &[&str] = &["dofile", "loadfile"];
+
+/// The functions that call the function given as their first argument.
+/// `xpcall` takes a handler before that function's arguments, so a file it
+/// loads is `(computed)`.
 const PROTECTED_CALLS: &[&str] = &["pcall", "xpcall"];
 
-/// The file that the call starting `tokens` loads, as a command line of
-/// one word: `dofile("x")`, `loadfile("x")`, or `pcall(dofile, "x")`.
-/// A path that is not one literal string is `(computed)`; `None` when the
-/// tokens start no such call.
+/// The file that the call starting `tokens` loads: `dofile("x")`,
+/// `dofile "x"`, `loadfile("x")` or `pcall(dofile, "x")`. `(computed)`
+/// when that is not one literal string Guardian can follow (see
+/// `followable`); `None` when the tokens start no such call.
 fn loaded_file(tokens: &[Token]) -> Option<String> {
-    let name = |token: Option<&Token>, names: &[&str]| matches!(token, Some(Token::Name(name)) if names.contains(&name.as_str()));
-    let argument = if name(tokens.first(), LOADERS) && tokens.get(1) == Some(&Token::Open) {
-        &tokens[2..]
-    } else if name(tokens.first(), PROTECTED_CALLS)
-        && tokens.get(1) == Some(&Token::Open)
-        && name(tokens.get(2), LOADERS)
-        && tokens.get(3) == Some(&Token::Comma)
-    {
-        &tokens[4..]
-    } else {
-        return None;
+    let loader = |token| is_name_in(token, LOADERS);
+    let call = |token| is_name_in(token, PROTECTED_CALLS);
+    let file = match tokens {
+        [name, Token::String(file), ..] if loader(name) => file,
+        [
+            name,
+            Token::Open,
+            Token::String(file),
+            Token::Close | Token::Comma,
+            ..,
+        ] if loader(name) => file,
+        [
+            outer,
+            Token::Open,
+            name,
+            Token::Comma,
+            Token::String(file),
+            Token::Close | Token::Comma,
+            ..,
+        ] if call(outer) && loader(name) => file,
+        [name, Token::Open, ..] if loader(name) => return Some("(computed)".to_string()),
+        [outer, Token::Open, name, Token::Comma, ..] if call(outer) && loader(name) => {
+            return Some("(computed)".to_string());
+        }
+        _ => return None,
     };
-    let [Token::String(file), Token::Close | Token::Comma, ..] = argument else {
-        return Some("(computed)".to_string());
-    };
-    // The command line is split into words the way `commands::split`
-    // does: quotes group, and nothing escapes. A path with both kinds of
-    // quote cannot be written for it, and is not followed.
-    let needs_quotes = file.contains([' ', '\t', '"', '\'']);
-    Some(if !needs_quotes {
+    Some(if followable(file) {
         file.clone()
-    } else if !file.contains('"') {
-        format!("\"{file}\"")
-    } else if !file.contains('\'') {
-        format!("'{file}'")
     } else {
         "(computed)".to_string()
     })
+}
+
+/// Whether `file` is followed as the path it is. It goes on as a command
+/// line, which the sweep reads as a shell would: splitting it at `;` or
+/// `|`, expanding `~` and `$HOME`, matching `*` against files, and looking
+/// a bare name up on PATH. Lua does none of that: it opens the string as
+/// it is, a relative one from Hyprland's working directory. So only an
+/// absolute path of characters none of that touches, with no `.` or `..`
+/// part, is followed; anything else would credit a file Lua never opens
+/// (`/home/u/a;/usr/lib/x.lua` would follow the packaged `/usr/lib/x.lua`).
+fn followable(file: &str) -> bool {
+    file.starts_with('/')
+        && file
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "/._+-".contains(character))
+        && !file.split('/').any(|part| part == "." || part == "..")
+}
+
+/// Whether `token` is a name among `names`.
+fn is_name_in(token: &Token, names: &[&str]) -> bool {
+    matches!(token, Token::Name(name) if names.contains(&name.as_str()))
 }
 
 /// A plugin spec of lazy.nvim, as far as one table literal says it.
@@ -689,8 +715,8 @@ dofile((os.getenv("OMARCHY_PATH") or "/usr/share/omarchy") .. "/boot.lua")
 pcall(dofile, "/usr/lib/omarchy-guardian/hyprland-path.lua")
 local chunk = loadfile('/home/u/x.lua')
 xpcall(dofile, debug.traceback, "/home/u/y.lua")
-dofile("/home/u/with space.lua")
-dofile("/home/u/it's.lua")
+dofile "/home/u/bare.lua"
+dofile[[/home/u/long.lua]]
 pcall(dofile, "/home/u/" .. name)
 require("default.hypr.toggles")
 local load = dofile
@@ -702,11 +728,38 @@ local load = dofile
                 "/usr/lib/omarchy-guardian/hyprland-path.lua",
                 "/home/u/x.lua",
                 "(computed)",
-                "\"/home/u/with space.lua\"",
-                "\"/home/u/it's.lua\"",
+                "/home/u/bare.lua",
+                "/home/u/long.lua",
                 "(computed)",
             ]
         );
+    }
+
+    #[test]
+    fn a_loaded_path_lua_and_a_shell_would_read_apart_is_not_followed() {
+        // Lua opens each of these as written; read as a command line, they
+        // would name another file (split at `;`, `~` expanded, a bare name
+        // looked up on PATH, a pattern matched) or a part of a path.
+        for path in [
+            "/home/u/a;/usr/lib/omarchy-guardian/hyprland-path.lua",
+            "/home/u/a|b.lua",
+            "/home/u/a&b.lua",
+            "/home/u/*.lua",
+            "/home/u/with space.lua",
+            "/home/u/it's.lua",
+            "/home/u/$HOME.lua",
+            "/home/u/%h.lua",
+            "/home/u/../../usr/lib/x.lua",
+            "/home/u/./x.lua",
+            "~/x.lua",
+            "$HOME/x.lua",
+            "xdg-open",
+            "conf/x.lua",
+            "",
+        ] {
+            let text = format!("dofile({path:?})\n");
+            assert_eq!(startup_commands(&text), ["(computed)"], "{path}");
+        }
     }
 
     #[test]

@@ -1838,13 +1838,21 @@ A file a start-up file reads in (`source ~/.config/shell/aliases`) is reviewed
 and sent like the start-up file itself, unless its path marks it as holding
 secrets.
 
-A text file that a repository package installed unchanged is not sent, even
-when a sent file runs or loads it (a Hyprland configuration's
-`pcall(dofile, "/usr/lib/omarchy-guardian/hyprland-path.lua")`). For each such
-file, one fact tells the AI that a package installed it unchanged and which
-sent file runs it, so loading it is not taken for loading a file nobody
-vouched for. At most 32 are described; past that, one fact says how many more
-there are.
+A Hyprland Lua configuration's `dofile` and `loadfile` calls are followed like
+a shell's `source`: `dofile("/x.lua")`, `dofile "/x.lua"` and
+`pcall(dofile, "/x.lua")`. Only an absolute path of letters, digits and
+`/._+-` with no `.` or `..` part is followed, because Lua opens the string as
+written while the sweep would read `;`, `~`, `$HOME`, `*` or a bare name the
+way a shell does and follow another file. Any other path, a computed one, an
+`xpcall` or a call through another name is listed as `(computed)` or not at
+all; the whole configuration is sent to the AI either way.
+
+A text file that a repository package installed unchanged, or an unchanged
+copy of one, is not sent, even when a sent file runs or loads it (a Hyprland
+configuration's `pcall(dofile, "/usr/lib/omarchy-guardian/hyprland-path.lua")`).
+For each such file, one fact tells the AI what it is and which sent file runs
+it, so loading it is not taken for loading a file nobody vouched for. At most
+32 are described; past that, one fact says how many more there are.
 
 Binaries no package vouches for are named to the AI by format and hash but
 never run or uploaded. With each one goes what Guardian established about it,

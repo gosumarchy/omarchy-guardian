@@ -2391,55 +2391,124 @@ fn an_item_the_live_checks_left_unread_is_not_sent_to_root() {
     }
 }
 
-#[test]
-fn a_packaged_text_file_a_sent_file_loads_is_described_and_nothing_else_packaged_is() {
-    let path_lua = "-- put Guardian first on PATH\n";
-    let script = "#!/bin/sh\necho packaged\n";
-    let unit = "[Service]\nExecStart=/usr/lib/v/run.sh\n";
-    let dir = planted(
-        "sweep-packaged-facts",
-        &[
-            (
-                "home/u/.config/hypr/hyprland.lua",
-                "pcall(dofile, \"/usr/lib/guard/path.lua\")\no.exec_on_start(\"/usr/bin/tool\")\n",
-            ),
-            ("usr/lib/guard/path.lua", path_lua),
-            ("usr/bin/tool", "\u{7f}ELF\u{2}\u{1}\u{1}\u{0}\u{0}\u{0}\u{0}"),
-            ("usr/lib/systemd/system/v.service", unit),
-            ("usr/lib/v/run.sh", script),
-        ],
-        &[(
-            "etc/systemd/system/multi-user.target.wants/v.service",
-            "/usr/lib/systemd/system/v.service",
-        )],
-    );
-    let digest = |text: &str| crate::sha256::Sha256::digest(text.as_bytes());
+/// The facts about packaged files that `files` give, with `packaged` the
+/// paths a package installed with the content they have.
+fn packaged_facts_of(name: &str, files: &[(&str, &str)], packaged: &[&str]) -> Vec<String> {
+    let dir = planted(name, files, &[]);
+    let mut mtree = String::from("#mtree\n/set type=file mode=644\n");
+    for path in packaged {
+        let text = files.iter().find(|(file, _)| file == path).unwrap().1;
+        let digest = crate::sha256::Sha256::digest(text.as_bytes());
+        mtree.push_str(&format!("./{path} sha256digest={digest}\n"));
+    }
     let mut index = PackageIndex::with_foreign(HashSet::new());
-    index.add_for_test(
-        "guard",
-        &format!(
-            "#mtree\n/set type=file mode=644\n./usr/lib/guard/path.lua sha256digest={}\n./usr/bin/tool sha256digest={}\n./usr/lib/systemd/system/v.service sha256digest={}\n./usr/lib/v/run.sh sha256digest={}\n",
-            digest(path_lua),
-            digest("\u{7f}ELF\u{2}\u{1}\u{1}\u{0}\u{0}\u{0}\u{0}"),
-            digest(unit),
-            digest(script)
-        ),
-        &[],
-    );
+    index.add_for_test("guard", &mtree, &[]);
     let collection = collect::collect(&Scope {
         root: dir.path(),
         home: Some("home/u"),
         index: &index,
         origin: Origin::System,
     });
-    // The packaged binary is covered by the instructions, and the packaged
-    // script is run by a packaged unit that is not sent at all.
-    let facts = packaged_facts(&collection, Some("home/u"));
-    assert_eq!(facts.len(), 1, "{facts:?}");
+    let mut report = Report::new("t", ReviewScope::default());
+    super::examine(&mut report, &collection, Some("home/u"), &HashSet::new());
+    packaged_facts(&collection, &report, Some("home/u"))
+}
+
+#[test]
+fn a_packaged_text_file_a_sent_file_loads_is_described_and_nothing_else_packaged_is() {
+    let elf = "\u{7f}ELF\u{2}\u{1}\u{1}\u{0}\u{0}\u{0}\u{0}";
+    let facts = packaged_facts_of(
+        "sweep-packaged-facts",
+        &[
+            (
+                "home/u/.config/hypr/hyprland.lua",
+                "pcall(dofile, \"/usr/lib/guard/path.lua\")\no.exec_on_start(\"/usr/bin/tool\")\n",
+            ),
+            ("usr/lib/guard/path.lua", "-- put Guardian first on PATH\n"),
+            ("usr/bin/tool", elf),
+            (
+                "home/u/.config/systemd/user/v.service",
+                "[Service]\nExecStart=/usr/lib/v/run.sh\n",
+            ),
+            ("usr/lib/v/run.sh", "#!/bin/sh\necho packaged\n"),
+            (
+                "home/u/.config/systemd/user/w.service",
+                "[Service]\nExecStart=/home/u/bin/run.sh\n",
+            ),
+            ("home/u/bin/run.sh", "#!/bin/sh\necho packaged\n"),
+        ],
+        &["usr/lib/guard/path.lua", "usr/bin/tool", "usr/lib/v/run.sh"],
+    );
+    // The packaged binary is left to the instructions. The packaged script
+    // and the unchanged copy of it are described too: the units that run
+    // them are sent.
+    assert_eq!(facts.len(), 3, "{facts:?}");
+    assert!(
+        facts[0].starts_with(
+            r#""~/bin/run.sh" is an unchanged copy of a file a repository package ships"#
+        ) && facts[0].contains(r#"run by "~/.config/systemd/user/w.service""#),
+        "{facts:?}"
+    );
+    let facts = &facts[1..];
     assert!(
         facts[0].starts_with(
             r#""/usr/lib/guard/path.lua" is installed unchanged by a package from a configured repository"#
         ) && facts[0].contains(r#"run by "~/.config/hypr/hyprland.lua""#),
         "{facts:?}"
+    );
+    assert!(
+        facts[1].starts_with(r#""/usr/lib/v/run.sh" is installed unchanged"#)
+            && facts[1].contains(r#"run by "~/.config/systemd/user/v.service""#),
+        "{facts:?}"
+    );
+}
+
+#[test]
+fn a_packaged_file_only_files_kept_from_the_ai_run_gets_no_fact() {
+    // A copy of a packaged file is trusted and not sent, and a file whose
+    // name marks it as holding secrets is read here only: what they load
+    // is not described.
+    let loads = "pcall(dofile, \"/usr/lib/guard/path.lua\")\n";
+    let kept = [
+        ("home/u/.config/hypr/hyprland.lua", loads),
+        ("usr/share/guard/hyprland.lua", loads),
+        ("home/u/.config/hypr/zz-secret.lua", loads),
+        ("usr/lib/guard/path.lua", "-- put Guardian first on PATH\n"),
+    ];
+    let packaged = ["usr/lib/guard/path.lua", "usr/share/guard/hyprland.lua"];
+    assert_eq!(
+        packaged_facts_of("sweep-packaged-kept", &kept, &packaged),
+        Vec::<String>::new()
+    );
+    // A sent file that loads it too is named, though the walk reached the
+    // packaged file from the secret one first (its `run_by`).
+    let mut sent = kept.to_vec();
+    sent.push(("home/u/.config/hypr/b.lua", loads));
+    let facts = packaged_facts_of("sweep-packaged-sent", &sent, &packaged);
+    assert_eq!(facts.len(), 1, "{facts:?}");
+    assert!(
+        facts[0].contains(r#"run by "~/.config/hypr/b.lua""#),
+        "{facts:?}"
+    );
+}
+
+#[test]
+fn past_a_number_packaged_files_are_counted_not_described() {
+    let count = super::MAX_PACKAGED_FACTS + 1;
+    let paths: Vec<String> = (0..count)
+        .map(|n| format!("usr/lib/guard/p{n}.lua"))
+        .collect();
+    let loads: String = paths
+        .iter()
+        .map(|path| format!("dofile(\"/{path}\")\n"))
+        .collect();
+    let mut files: Vec<(&str, &str)> = paths.iter().map(|path| (path.as_str(), "-- x\n")).collect();
+    files.push(("home/u/.config/hypr/hyprland.lua", &loads));
+    let packaged: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let facts = packaged_facts_of("sweep-packaged-many", &files, &packaged);
+    assert_eq!(facts.len(), super::MAX_PACKAGED_FACTS + 1);
+    assert_eq!(
+        facts.last().unwrap(),
+        "Guardian did not describe 1 more unchanged packaged file that sent files run."
     );
 }
