@@ -2,10 +2,13 @@
 //!
 //! - The commands a Hyprland Lua configuration starts with Hyprland:
 //!   string arguments of `exec_on_start`, `launch_on_start`, `exec_cmd`,
-//!   `shell_succeeds`, `os.execute` and `io.popen`. Only literal strings are
-//!   read (concatenations are joined); anything computed is listed as such.
-//!   The whole file still goes to the AI review, so this only explains what
-//!   runs; it does not decide anything.
+//!   `shell_succeeds`, `os.execute` and `io.popen`, and the files it loads
+//!   with `dofile` or `loadfile` (also through `pcall`). Only
+//!   literal strings are read (concatenations of commands are joined);
+//!   anything computed is listed as such. The whole file still goes to the
+//!   AI review, so this only explains what runs; it does not decide
+//!   anything. `require` is left out: it finds a module through Lua's
+//!   search path, which the file alone does not say.
 //! - The plugin specs of lazy.nvim (`{ "owner/repo", build = "make" }`):
 //!   where each plugin comes from and what it builds, as far as table
 //!   literals say it (see `plugin_specs`).
@@ -27,6 +30,10 @@ pub(super) fn startup_commands(text: &str) -> Vec<String> {
         let Token::Name(name) = token else {
             continue;
         };
+        if let Some(file) = loaded_file(&tokens[index..]) {
+            found.push(file);
+            continue;
+        }
         if !STARTUP.contains(&name.as_str()) || tokens.get(index + 1) != Some(&Token::Open) {
             continue;
         }
@@ -64,6 +71,47 @@ pub(super) fn startup_commands(text: &str) -> Vec<String> {
         }
     }
     found
+}
+
+/// The functions that load and run a Lua file, and those that call a
+/// function given as their first argument. `xpcall` takes a handler
+/// before the function's arguments, so a file it loads is `(computed)`.
+const LOADERS: &[&str] = &["dofile", "loadfile"];
+const PROTECTED_CALLS: &[&str] = &["pcall", "xpcall"];
+
+/// The file that the call starting `tokens` loads, as a command line of
+/// one word: `dofile("x")`, `loadfile("x")`, or `pcall(dofile, "x")`.
+/// A path that is not one literal string is `(computed)`; `None` when the
+/// tokens start no such call.
+fn loaded_file(tokens: &[Token]) -> Option<String> {
+    let name = |token: Option<&Token>, names: &[&str]| matches!(token, Some(Token::Name(name)) if names.contains(&name.as_str()));
+    let argument = if name(tokens.first(), LOADERS) && tokens.get(1) == Some(&Token::Open) {
+        &tokens[2..]
+    } else if name(tokens.first(), PROTECTED_CALLS)
+        && tokens.get(1) == Some(&Token::Open)
+        && name(tokens.get(2), LOADERS)
+        && tokens.get(3) == Some(&Token::Comma)
+    {
+        &tokens[4..]
+    } else {
+        return None;
+    };
+    let [Token::String(file), Token::Close | Token::Comma, ..] = argument else {
+        return Some("(computed)".to_string());
+    };
+    // The command line is split into words the way `commands::split`
+    // does: quotes group, and nothing escapes. A path with both kinds of
+    // quote cannot be written for it, and is not followed.
+    let needs_quotes = file.contains([' ', '\t', '"', '\'']);
+    Some(if !needs_quotes {
+        file.clone()
+    } else if !file.contains('"') {
+        format!("\"{file}\"")
+    } else if !file.contains('\'') {
+        format!("'{file}'")
+    } else {
+        "(computed)".to_string()
+    })
 }
 
 /// A plugin spec of lazy.nvim, as far as one table literal says it.
@@ -630,6 +678,33 @@ o.bind("SUPER, Return", "Terminal", o.launch("alacritty"))
                 "curl -s https://x.test | sh",
                 "id",
                 "long one"
+            ]
+        );
+    }
+
+    #[test]
+    fn files_loaded_by_path_are_found_and_computed_ones_listed_as_such() {
+        let text = r#"
+dofile((os.getenv("OMARCHY_PATH") or "/usr/share/omarchy") .. "/boot.lua")
+pcall(dofile, "/usr/lib/omarchy-guardian/hyprland-path.lua")
+local chunk = loadfile('/home/u/x.lua')
+xpcall(dofile, debug.traceback, "/home/u/y.lua")
+dofile("/home/u/with space.lua")
+dofile("/home/u/it's.lua")
+pcall(dofile, "/home/u/" .. name)
+require("default.hypr.toggles")
+local load = dofile
+"#;
+        assert_eq!(
+            startup_commands(text),
+            [
+                "(computed)",
+                "/usr/lib/omarchy-guardian/hyprland-path.lua",
+                "/home/u/x.lua",
+                "(computed)",
+                "\"/home/u/with space.lua\"",
+                "\"/home/u/it's.lua\"",
+                "(computed)",
             ]
         );
     }
