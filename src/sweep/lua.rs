@@ -625,7 +625,15 @@ fn escape(chars: &[char], start: usize, value: &mut Vec<u8>) -> usize {
             } else {
                 end
             };
-            (code.and_then(char::from_u32), end)
+            // Lua also writes a surrogate or a code past U+10FFFF (up to
+            // 2^31) as bytes. No `char` holds those, and dropping the escape
+            // would leave a different path (`hypr\u{D800}/x.lua` read as
+            // `hypr/x.lua`), so it stands as U+FFFD, which names no file
+            // the sweep follows.
+            let decoded = code
+                .and_then(char::from_u32)
+                .unwrap_or(char::REPLACEMENT_CHARACTER);
+            (Some(decoded), end)
         }
         digit if digit.is_ascii_digit() => {
             let (code, end) = digits(start, 10, 3);
@@ -751,13 +759,15 @@ local load = dofile
             "/home/u/%h.lua",
             "/home/u/../../usr/lib/x.lua",
             "/home/u/./x.lua",
+            "/home/u/.config/hypr\\u{D800}/bindings.lua",
+            "/usr/lib/omarchy-guardian/hyprland-path\\u{110000}.lua",
             "~/x.lua",
             "$HOME/x.lua",
             "xdg-open",
             "conf/x.lua",
             "",
         ] {
-            let text = format!("dofile({path:?})\n");
+            let text = format!("dofile(\"{path}\")\n");
             assert_eq!(startup_commands(&text), ["(computed)"], "{path}");
         }
     }
