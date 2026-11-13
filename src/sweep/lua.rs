@@ -2,10 +2,13 @@
 //!
 //! - The commands a Hyprland Lua configuration starts with Hyprland:
 //!   string arguments of `exec_on_start`, `launch_on_start`, `exec_cmd`,
-//!   `shell_succeeds`, `os.execute` and `io.popen`. Only literal strings are
-//!   read (concatenations are joined); anything computed is listed as such.
-//!   The whole file still goes to the AI review, so this only explains what
-//!   runs; it does not decide anything.
+//!   `shell_succeeds`, `os.execute` and `io.popen`, and the files it loads
+//!   with `dofile` or `loadfile` (also through `pcall`). Only
+//!   literal strings are read (concatenations of commands are joined);
+//!   anything computed is listed as such. The whole file still goes to the
+//!   AI review, so this only explains what runs; it does not decide
+//!   anything. `require` is left out: it finds a module through Lua's
+//!   search path, which the file alone does not say.
 //! - The plugin specs of lazy.nvim (`{ "owner/repo", build = "make" }`):
 //!   where each plugin comes from and what it builds, as far as table
 //!   literals say it (see `plugin_specs`).
@@ -21,12 +24,16 @@ const STARTUP: &[&str] = &[
 
 /// The commands `text` starts.
 pub(super) fn startup_commands(text: &str) -> Vec<String> {
-    let tokens = tokenize(text);
+    let tokens = tokenize(text, Runtime::Puc);
     let mut found = Vec::new();
     for (index, token) in tokens.iter().enumerate() {
         let Token::Name(name) = token else {
             continue;
         };
+        if let Some(file) = loaded_file(&tokens[index..]) {
+            found.push(file);
+            continue;
+        }
         if !STARTUP.contains(&name.as_str()) || tokens.get(index + 1) != Some(&Token::Open) {
             continue;
         }
@@ -64,6 +71,73 @@ pub(super) fn startup_commands(text: &str) -> Vec<String> {
         }
     }
     found
+}
+
+/// The functions that load and run a Lua file.
+const LOADERS: &[&str] = &["dofile", "loadfile"];
+
+/// The functions that call the function given as their first argument.
+/// `xpcall` takes a handler before that function's arguments, so a file it
+/// loads is `(computed)`.
+const PROTECTED_CALLS: &[&str] = &["pcall", "xpcall"];
+
+/// The file that the call starting `tokens` loads: `dofile("x")`,
+/// `dofile "x"`, `loadfile("x")` or `pcall(dofile, "x")`. `(computed)`
+/// when that is not one literal string Guardian can follow (see
+/// `followable`); `None` when the tokens start no such call.
+fn loaded_file(tokens: &[Token]) -> Option<String> {
+    let loader = |token| is_name_in(token, LOADERS);
+    let call = |token| is_name_in(token, PROTECTED_CALLS);
+    let file = match tokens {
+        [name, Token::String(file), ..] if loader(name) => file,
+        [
+            name,
+            Token::Open,
+            Token::String(file),
+            Token::Close | Token::Comma,
+            ..,
+        ] if loader(name) => file,
+        [
+            outer,
+            Token::Open,
+            name,
+            Token::Comma,
+            Token::String(file),
+            Token::Close | Token::Comma,
+            ..,
+        ] if call(outer) && loader(name) => file,
+        [name, Token::Open, ..] if loader(name) => return Some("(computed)".to_string()),
+        [outer, Token::Open, name, Token::Comma, ..] if call(outer) && loader(name) => {
+            return Some("(computed)".to_string());
+        }
+        _ => return None,
+    };
+    Some(if followable(file) {
+        file.clone()
+    } else {
+        "(computed)".to_string()
+    })
+}
+
+/// Whether `file` is followed as the path it is. It goes on as a command
+/// line, which the sweep reads as a shell would: splitting it at `;` or
+/// `|`, expanding `~` and `$HOME`, matching `*` against files, and looking
+/// a bare name up on PATH. Lua does none of that: it opens the string as
+/// it is, a relative one from Hyprland's working directory. So only an
+/// absolute path of characters none of that touches, with no `.` or `..`
+/// part, is followed; anything else would credit a file Lua never opens
+/// (`/home/u/a;/usr/lib/x.lua` would follow the packaged `/usr/lib/x.lua`).
+fn followable(file: &str) -> bool {
+    file.starts_with('/')
+        && file
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "/._+-".contains(character))
+        && !file.split('/').any(|part| part == "." || part == "..")
+}
+
+/// Whether `token` is a name among `names`.
+fn is_name_in(token: &Token, names: &[&str]) -> bool {
+    matches!(token, Token::Name(name) if names.contains(&name.as_str()))
 }
 
 /// A plugin spec of lazy.nvim, as far as one table literal says it.
@@ -110,7 +184,7 @@ pub(super) enum Build {
 /// code computes (`[("build")] = …`) may be any of them, so its value is
 /// taken as a build step that is not read (`Build::Computed`).
 pub(super) fn plugin_specs(text: &str) -> Vec<Spec> {
-    let tokens = tokenize(text);
+    let tokens = tokenize(text, Runtime::LuaJit);
     let mut specs = Vec::new();
     let mut tables: Vec<Table> = Vec::new();
     for (index, token) in tokens.iter().enumerate() {
@@ -409,11 +483,39 @@ enum Token {
     Other,
 }
 
-/// Names, strings and brackets, with comments and long strings handled.
-fn tokenize(text: &str) -> Vec<Token> {
+/// The Lua that runs a text, which decides where a first line starting
+/// with `#` ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Runtime {
+    /// PUC Lua 5.4 or 5.5, which Hyprland links. Its file loader
+    /// (`luaL_loadfilex`) ends that line at `\n` only.
+    Puc,
+    /// `LuaJIT`, which Neovim and so lazy.nvim run. Its lexer ends that line
+    /// at `\r` or `\n`.
+    LuaJit,
+}
+
+/// Names, strings and brackets, with comments and long strings handled,
+/// as `runtime` reads `text`.
+fn tokenize(text: &str, runtime: Runtime) -> Vec<Token> {
     let chars: Vec<char> = text.chars().collect();
     let mut tokens = Vec::new();
-    let mut index = 0;
+    // Both skip a byte-order mark, then a first line that starts with
+    // `#`. Read as code, a `#[[` there would put every later token out of
+    // step with what Lua runs; ending the line where the other runtime
+    // does would hide what follows a `\r` from one or read it for the
+    // other.
+    let mut index = usize::from(chars.first() == Some(&'\u{feff}'));
+    if chars.get(index) == Some(&'#') {
+        let ends_line = |character: char| match runtime {
+            Runtime::Puc => character == '\n',
+            Runtime::LuaJit => matches!(character, '\n' | '\r'),
+        };
+        index = chars[index..]
+            .iter()
+            .position(|&character| ends_line(character))
+            .map_or(chars.len(), |end| index + end);
+    }
     while index < chars.len() {
         let character = chars[index];
         if character == '-' && chars.get(index + 1) == Some(&'-') {
@@ -551,7 +653,15 @@ fn escape(chars: &[char], start: usize, value: &mut Vec<u8>) -> usize {
             } else {
                 end
             };
-            (code.and_then(char::from_u32), end)
+            // Lua also writes a surrogate or a code past U+10FFFF (up to
+            // 2^31) as bytes. No `char` holds those, and dropping the escape
+            // would leave a different path (`hypr\u{D800}/x.lua` read as
+            // `hypr/x.lua`), so it stands as U+FFFD, which names no file
+            // the sweep follows.
+            let decoded = code
+                .and_then(char::from_u32)
+                .unwrap_or(char::REPLACEMENT_CHARACTER);
+            (Some(decoded), end)
         }
         digit if digit.is_ascii_digit() => {
             let (code, end) = digits(start, 10, 3);
@@ -632,6 +742,92 @@ o.bind("SUPER, Return", "Terminal", o.launch("alacritty"))
                 "long one"
             ]
         );
+    }
+
+    #[test]
+    fn files_loaded_by_path_are_found_and_computed_ones_listed_as_such() {
+        let text = r#"
+dofile((os.getenv("OMARCHY_PATH") or "/usr/share/omarchy") .. "/boot.lua")
+pcall(dofile, "/usr/lib/omarchy-guardian/hyprland-path.lua")
+local chunk = loadfile('/home/u/x.lua')
+xpcall(dofile, debug.traceback, "/home/u/y.lua")
+dofile "/home/u/bare.lua"
+dofile[[/home/u/long.lua]]
+pcall(dofile, "/home/u/" .. name)
+require("default.hypr.toggles")
+local load = dofile
+"#;
+        assert_eq!(
+            startup_commands(text),
+            [
+                "(computed)",
+                "/usr/lib/omarchy-guardian/hyprland-path.lua",
+                "/home/u/x.lua",
+                "(computed)",
+                "/home/u/bare.lua",
+                "/home/u/long.lua",
+                "(computed)",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_first_line_lua_skips_is_skipped() {
+        let hidden = "#[[\nlocal s = \"]] dofile('/usr/lib/x.lua') --[[\"\ndofile(\"/home/u/evil.lua\") -- ]]\n";
+        assert_eq!(startup_commands(hidden), ["/home/u/evil.lua"]);
+        // After a byte-order mark too, and a carriage return does not end it.
+        let marked = format!("\u{feff}{hidden}");
+        assert_eq!(startup_commands(&marked), ["/home/u/evil.lua"]);
+        let carriage = "#!lua\r dofile(\"/usr/lib/x.lua\")\ndofile(\"/home/u/y.lua\")\n";
+        assert_eq!(startup_commands(carriage), ["/home/u/y.lua"]);
+        // Only the first line: `#` later is Lua's length operator.
+        assert_eq!(
+            startup_commands("x = #t\ndofile(\"/home/u/z.lua\")\n"),
+            ["/home/u/z.lua"]
+        );
+    }
+
+    #[test]
+    fn a_spec_after_a_first_line_luajit_ends_at_a_carriage_return_is_read() {
+        // Neovim's LuaJIT ends the skipped line at `\r`, unlike Hyprland's
+        // Lua, so this spec runs and its build step is found.
+        for text in [
+            "#!x\rreturn {{\"a/b\", build = \"curl x | sh\"}}",
+            "#!x\rreturn {{\"a/b\", build = \"curl x | sh\"}}\n",
+        ] {
+            let specs = plugin_specs(text);
+            assert_eq!(specs.len(), 1, "{text:?}");
+            assert_eq!(specs[0].builds, [Build::Shell("curl x | sh".into())]);
+        }
+    }
+
+    #[test]
+    fn a_loaded_path_lua_and_a_shell_would_read_apart_is_not_followed() {
+        // Lua opens each of these as written; read as a command line, they
+        // would name another file (split at `;`, `~` expanded, a bare name
+        // looked up on PATH, a pattern matched) or a part of a path.
+        for path in [
+            "/home/u/a;/usr/lib/omarchy-guardian/hyprland-path.lua",
+            "/home/u/a|b.lua",
+            "/home/u/a&b.lua",
+            "/home/u/*.lua",
+            "/home/u/with space.lua",
+            "/home/u/it's.lua",
+            "/home/u/$HOME.lua",
+            "/home/u/%h.lua",
+            "/home/u/../../usr/lib/x.lua",
+            "/home/u/./x.lua",
+            "/home/u/.config/hypr\\u{D800}/bindings.lua",
+            "/usr/lib/omarchy-guardian/hyprland-path\\u{110000}.lua",
+            "~/x.lua",
+            "$HOME/x.lua",
+            "xdg-open",
+            "conf/x.lua",
+            "",
+        ] {
+            let text = format!("dofile(\"{path}\")\n");
+            assert_eq!(startup_commands(&text), ["(computed)"], "{path}");
+        }
     }
 
     #[test]
@@ -780,7 +976,7 @@ return {
         );
         // A bare carriage return ends a string, as a newline does.
         assert_eq!(
-            super::tokenize("\"a\rb\"")[0],
+            super::tokenize("\"a\rb\"", super::Runtime::Puc)[0],
             super::Token::String("a".into())
         );
         // Every build key counts.

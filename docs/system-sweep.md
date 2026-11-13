@@ -103,7 +103,7 @@ them into `/etc/skel`).
 | Network hooks | `NetworkManager/dispatcher.d` under `/usr/lib` and `/etc` | | gate and sweep |
 | SSH | `/etc/ssh/sshd_config`, `/etc/ssh/sshd_config.d`, `/etc/ssh/ssh_config`, `/etc/ssh/ssh_config.d`, `/etc/ssh/sshrc` | `~/.ssh/authorized_keys`, `~/.ssh/authorized_keys2`, `~/.ssh/rc`, `~/.ssh/config`, `~/.ssh/config.d` | gate and sweep |
 | Git | `/etc/gitconfig`, the hooks git copies into every new repository (`/usr/share/git-core/templates/hooks`) | `~/.gitconfig`, `~/.config/git/config` | gate and sweep |
-| Hyprland | | `~/.config/hypr`: the Lua configuration (and what `exec_on_start` starts) and the `.conf` files | |
+| Hyprland | | `~/.config/hypr`: the Lua configuration (and what `exec_on_start` starts and `dofile` loads) and the `.conf` files | |
 | Omarchy hooks | | `~/.config/omarchy/hooks` | |
 | Programs ahead of the system's own | `/usr/local/bin`, `/usr/local/sbin` | `~/.local/bin`, `~/.cargo/bin`, and the other directories [read from `PATH`](#programs-ahead-of-the-systems-own) | gate and sweep |
 | Browser | Policies (`/etc/chromium/policies`, `/etc/opt/chrome/policies`, `/etc/brave/policies`, `/etc/firefox/policies`), native-messaging hosts (`/etc/chromium/native-messaging-hosts`, `/etc/opt/chrome/native-messaging-hosts`, `/usr/lib/mozilla/native-messaging-hosts`), extensions (`/usr/share/chromium/extensions`, `/usr/lib/mozilla/extensions`), Firefox's `distribution` directory (`policies.json`) and default preferences (`/usr/lib/firefox/distribution`, `/usr/lib/firefox/defaults/pref`, `/usr/lib/firefox/browser/defaults/preferences`) | Flags files and native-messaging hosts (see [More that decides what runs](#more-that-decides-what-runs)) | gate and sweep |
@@ -1837,6 +1837,22 @@ where the rules above allow it.
 A file a start-up file reads in (`source ~/.config/shell/aliases`) is reviewed
 and sent like the start-up file itself, unless its path marks it as holding
 secrets.
+
+A Hyprland Lua configuration's `dofile` and `loadfile` calls are followed like
+a shell's `source`: `dofile("/x.lua")`, `dofile "/x.lua"` and
+`pcall(dofile, "/x.lua")`. Only an absolute path of letters, digits and
+`/._+-` with no `.` or `..` part is followed, because Lua opens the string as
+written while the sweep would read `;`, `~`, `$HOME`, `*` or a bare name the
+way a shell does and follow another file. Any other path, a computed one, an
+`xpcall` or a call through another name is listed as `(computed)` or not at
+all; the whole configuration is sent to the AI either way.
+
+A text file that a repository package installed unchanged, or an unchanged
+copy of one, is not sent, even when a sent file runs or loads it (a Hyprland
+configuration's `pcall(dofile, "/usr/lib/omarchy-guardian/hyprland-path.lua")`).
+For each such file, one fact tells the AI what it is and which sent file runs
+it, so loading it is not taken for loading a file nobody vouched for. At most
+32 are described; past that, one fact says how many more there are.
 
 Binaries no package vouches for are named to the AI by format and hash but
 never run or uploaded. With each one goes what Guardian established about it,

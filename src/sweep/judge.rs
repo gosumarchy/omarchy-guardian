@@ -89,7 +89,8 @@ pub(super) fn judge(
         ..review::scope(context.settings, context.class, &[context.class])
     };
     let mut report = Report::new("system sweep", scope);
-    let facts = examine(&mut report, collection, home, news);
+    let mut facts = examine(&mut report, collection, home, news);
+    facts.extend(packaged_facts(collection, &report, home));
     let context = ReviewContext {
         context: &facts,
         ..*context
@@ -378,6 +379,58 @@ fn examine(
     if more > 0 {
         facts.push(format!(
             "Guardian hashed {more} binaries it does not describe here."
+        ));
+    }
+    facts
+}
+
+/// The most packaged files described by a fact (see `packaged_facts`).
+/// Arbitrary: facts go to every chunk, and a file sent rarely names more
+/// than a few of a package's text files.
+const MAX_PACKAGED_FACTS: usize = 32;
+
+/// What Guardian established about each packaged text file that a file
+/// `report` sends to the AI runs or loads. Such a file is set aside
+/// unread, and without its fact the reviewer took a Hyprland
+/// configuration loading Guardian's own packaged Lua file for one loading
+/// a file whose content nobody vouched for. A packaged binary gets none:
+/// the instructions say that those were set aside and that launching one
+/// is no concern.
+fn packaged_facts(collection: &Collection, report: &Report, home: Option<&str>) -> Vec<String> {
+    let sent: HashSet<&str> = report
+        .agent_input
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+    // `run_by` names the first file that reached the item; the others are
+    // in `runners`, and any of them may be the one sent.
+    let sent_runner = |item: &Item| {
+        let others = collection.runners.get(&item.path).into_iter().flatten();
+        item.run_by
+            .iter()
+            .chain(others)
+            .find(|runner| sent.contains(shown_path(runner, home).as_str()))
+            .cloned()
+    };
+    let mut facts: Vec<String> = collection
+        .items
+        .iter()
+        .filter(|item| {
+            item.is_trusted()
+                && matches!(item.tier, Tier::Vendor | Tier::Copied)
+                && matches!(item.body, Body::Text(_))
+        })
+        .filter_map(|item| {
+            let runner = sent_runner(item)?;
+            Some(fact(item, Some(&runner), &label(item, home), home))
+        })
+        .collect();
+    let more = facts.len().saturating_sub(MAX_PACKAGED_FACTS);
+    facts.truncate(MAX_PACKAGED_FACTS);
+    if more > 0 {
+        let files = if more == 1 { "file" } else { "files" };
+        facts.push(format!(
+            "Guardian did not describe {more} more unchanged packaged {files} that sent files run."
         ));
     }
     facts
@@ -862,9 +915,11 @@ fn fact(item: &Item, runner: Option<&str>, label: &str, home: Option<&str>) -> S
             "installed by a package but changed since (it is not what the package shipped)"
         }
         Tier::Unknown => "installed by no package",
-        // These three reach here only with an alert on the item, and an
-        // allowed item never does (see `Item::is_trusted`): the fact says
-        // what installed it, and the alert is a finding of its own.
+        // These reach here with an alert on the item, whose fact says what
+        // installed it while the alert is a finding of its own, and a
+        // packaged or copied text file also when a file sent runs it (see
+        // `packaged_facts`). An allowed item reaches here never (see
+        // `Item::is_trusted`).
         Tier::Vendor => "installed unchanged by a package from a configured repository",
         Tier::Copied => "an unchanged copy of a file a repository package ships",
         Tier::Inert => "an empty file or a link to /dev/null",
