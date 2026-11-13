@@ -487,7 +487,17 @@ enum Token {
 fn tokenize(text: &str) -> Vec<Token> {
     let chars: Vec<char> = text.chars().collect();
     let mut tokens = Vec::new();
-    let mut index = 0;
+    // Lua's file loader (`luaL_loadfilex`, used by `dofile`, `loadfile`
+    // and lazy.nvim) skips a byte-order mark, then a first line that
+    // starts with `#`, up to `\n` only. Read as code, a `#[[` there would
+    // put every later token out of step with what Lua runs.
+    let mut index = usize::from(chars.first() == Some(&'\u{feff}'));
+    if chars.get(index) == Some(&'#') {
+        index = chars[index..]
+            .iter()
+            .position(|&character| character == '\n')
+            .map_or(chars.len(), |end| index + end);
+    }
     while index < chars.len() {
         let character = chars[index];
         if character == '-' && chars.get(index + 1) == Some(&'-') {
@@ -740,6 +750,22 @@ local load = dofile
                 "/home/u/long.lua",
                 "(computed)",
             ]
+        );
+    }
+
+    #[test]
+    fn a_first_line_lua_skips_is_skipped() {
+        let hidden = "#[[\nlocal s = \"]] dofile('/usr/lib/x.lua') --[[\"\ndofile(\"/home/u/evil.lua\") -- ]]\n";
+        assert_eq!(startup_commands(hidden), ["/home/u/evil.lua"]);
+        // After a byte-order mark too, and a carriage return does not end it.
+        let marked = format!("\u{feff}{hidden}");
+        assert_eq!(startup_commands(&marked), ["/home/u/evil.lua"]);
+        let carriage = "#!lua\r dofile(\"/usr/lib/x.lua\")\ndofile(\"/home/u/y.lua\")\n";
+        assert_eq!(startup_commands(carriage), ["/home/u/y.lua"]);
+        // Only the first line: `#` later is Lua's length operator.
+        assert_eq!(
+            startup_commands("x = #t\ndofile(\"/home/u/z.lua\")\n"),
+            ["/home/u/z.lua"]
         );
     }
 
