@@ -490,7 +490,7 @@ enum Runtime {
     /// PUC Lua 5.4 or 5.5, which Hyprland links. Its file loader
     /// (`luaL_loadfilex`) ends that line at `\n` only.
     Puc,
-    /// LuaJIT, which Neovim and so lazy.nvim run. Its lexer ends that line
+    /// `LuaJIT`, which Neovim and so lazy.nvim run. Its lexer ends that line
     /// at `\r` or `\n`.
     LuaJit,
 }
