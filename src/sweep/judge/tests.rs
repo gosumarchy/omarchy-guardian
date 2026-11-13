@@ -1,6 +1,8 @@
 //! Tests of judging what the sweep collected.
 
-use super::{fact, is_local_only, label, local_checks, located, plugin_files, setting_paths};
+use super::{
+    fact, is_local_only, label, local_checks, located, packaged_facts, plugin_files, setting_paths,
+};
 use crate::autorun::Category;
 use crate::report::LocalFinding;
 use crate::report::{Report, ReviewScope};
@@ -2387,4 +2389,57 @@ fn an_item_the_live_checks_left_unread_is_not_sent_to_root() {
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         assert!(gaps[0].contains(said), "{gaps:?}");
     }
+}
+
+#[test]
+fn a_packaged_text_file_a_sent_file_loads_is_described_and_nothing_else_packaged_is() {
+    let path_lua = "-- put Guardian first on PATH\n";
+    let script = "#!/bin/sh\necho packaged\n";
+    let unit = "[Service]\nExecStart=/usr/lib/v/run.sh\n";
+    let dir = planted(
+        "sweep-packaged-facts",
+        &[
+            (
+                "home/u/.config/hypr/hyprland.lua",
+                "pcall(dofile, \"/usr/lib/guard/path.lua\")\no.exec_on_start(\"/usr/bin/tool\")\n",
+            ),
+            ("usr/lib/guard/path.lua", path_lua),
+            ("usr/bin/tool", "\u{7f}ELF\u{2}\u{1}\u{1}\u{0}\u{0}\u{0}\u{0}"),
+            ("usr/lib/systemd/system/v.service", unit),
+            ("usr/lib/v/run.sh", script),
+        ],
+        &[(
+            "etc/systemd/system/multi-user.target.wants/v.service",
+            "/usr/lib/systemd/system/v.service",
+        )],
+    );
+    let digest = |text: &str| crate::sha256::Sha256::digest(text.as_bytes());
+    let mut index = PackageIndex::with_foreign(HashSet::new());
+    index.add_for_test(
+        "guard",
+        &format!(
+            "#mtree\n/set type=file mode=644\n./usr/lib/guard/path.lua sha256digest={}\n./usr/bin/tool sha256digest={}\n./usr/lib/systemd/system/v.service sha256digest={}\n./usr/lib/v/run.sh sha256digest={}\n",
+            digest(path_lua),
+            digest("\u{7f}ELF\u{2}\u{1}\u{1}\u{0}\u{0}\u{0}\u{0}"),
+            digest(unit),
+            digest(script)
+        ),
+        &[],
+    );
+    let collection = collect::collect(&Scope {
+        root: dir.path(),
+        home: Some("home/u"),
+        index: &index,
+        origin: Origin::System,
+    });
+    // The packaged binary is covered by the instructions, and the packaged
+    // script is run by a packaged unit that is not sent at all.
+    let facts = packaged_facts(&collection, Some("home/u"));
+    assert_eq!(facts.len(), 1, "{facts:?}");
+    assert!(
+        facts[0].starts_with(
+            r#""/usr/lib/guard/path.lua" is installed unchanged by a package from a configured repository"#
+        ) && facts[0].contains(r#"run by "~/.config/hypr/hyprland.lua""#),
+        "{facts:?}"
+    );
 }
